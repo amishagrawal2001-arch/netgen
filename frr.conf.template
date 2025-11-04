@@ -1,0 +1,126 @@
+# Comprehensive FRR Configuration Template for OSTG
+# This template enables all available FRR features and daemons
+
+frr version 8.5
+frr defaults traditional
+hostname {{DEVICE_NAME}}
+
+# Enable all available daemons
+zebra=yes
+bgpd=yes
+ospfd=yes
+ospf6d=yes
+ripd=yes
+ripngd=yes
+isisd=yes
+pimd=yes
+pim6d=yes
+ldpd=yes
+nhrpd=yes
+eigrpd=yes
+babeld=yes
+bfdd=yes
+fabricd=yes
+vrrpd=yes
+pathd=yes
+pbrd=yes
+staticd=yes
+
+# Zebra configuration (core routing daemon)
+zebra=yes
+ip forwarding
+ipv6 forwarding
+ipv6 nd suppress-ra
+
+# BGP Configuration
+router bgp {{LOCAL_ASN}}
+ bgp router-id {{ROUTER_ID}}
+ bgp log-neighbor-changes
+ bgp graceful-restart
+ bgp graceful-restart restart-time 120
+ bgp graceful-restart stalepath-time 360
+ 
+ # Network configuration
+ network {{NETWORK}}/{{NETMASK}}
+ 
+ # Neighbor configuration (will be added dynamically)
+ # neighbor {{NEIGHBOR_IP}} remote-as {{NEIGHBOR_ASN}}
+ # neighbor {{NEIGHBOR_IP}} update-source {{UPDATE_SOURCE}}
+ # neighbor {{NEIGHBOR_IP}} graceful-restart
+
+# OSPF Configuration
+router ospf
+ ospf router-id {{ROUTER_ID}}
+ network {{NETWORK}}/{{NETMASK}} area 0
+
+# OSPFv6 Configuration
+router ospf6
+ ospf6 router-id {{ROUTER_ID}}
+ interface {{INTERFACE}} area 0.0.0.0
+
+# RIP Configuration
+router rip
+ network {{INTERFACE}}
+ version 2
+ no auto-summary
+
+# IS-IS Configuration
+router isis
+ net 49.0001.{{ROUTER_ID}}.00
+ is-type level-1-2
+ interface {{INTERFACE}}
+  ip router isis
+
+# PIM Configuration
+ip pim rp 224.0.0.0/4
+ip pim ssm prefix-list SSM_RANGE
+
+# LDP Configuration
+mpls ldp
+ router-id {{ROUTER_ID}}
+ address-family ipv4
+  discovery transport-address {{ROUTER_ID}}
+
+# Interface configuration
+interface {{INTERFACE}}
+ ip address {{IP_ADDRESS}}/{{IP_MASK}}
+ ip ospf hello-interval 10
+ ip ospf dead-interval 40
+ ip ospf priority 1
+ ipv6 ospf6 hello-interval 10
+ ipv6 ospf6 dead-interval 40
+ ipv6 ospf6 priority 1
+ ip pim
+ ipv6 pim6
+
+# Logging configuration
+log syslog informational
+log file /var/log/frr/frr.log
+log timestamp precision 6
+log commands
+
+# SNMP configuration
+snmp agent
+snmp-server community public ro
+snmp-server community private rw
+
+# FPM configuration
+fpm connection ip 127.0.0.1 port 2620
+
+# Static routes (if needed)
+# ip route {{DESTINATION}} {{NEXT_HOP}}
+# ipv6 route {{DESTINATION}} {{NEXT_HOP}}
+
+# Access lists
+ip access-list standard PERMIT_ALL
+ permit any
+
+ipv6 access-list PERMIT_ALL_V6
+ permit any
+
+# Route maps
+route-map PERMIT_ALL permit 10
+ match ip address PERMIT_ALL
+
+route-map PERMIT_ALL_V6 permit 10
+ match ipv6 address PERMIT_ALL_V6

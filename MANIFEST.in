@@ -1,0 +1,17 @@
+include requirements.txt
+include README.md
+include INSTALLATION.md
+include install_docker.sh
+include install_ostg_complete.py
+include Dockerfile.frr
+include start-frr.sh
+include frr.conf.template
+include systemd/*.service
+include systemd/*.timer
+
+# Exclude backup folder and temporary files
+exclude backup/
+exclude backup/**
+exclude *.backup.*
+exclude *.tmp
+exclude *.temp

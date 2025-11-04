@@ -1,0 +1,4 @@
+[console_scripts]
+ostg-client = run_tgen_client:main
+ostg-docker-install = setup_docker:main
+ostg-server = ostg.server:main

@@ -1,0 +1,50 @@
+# FRR BGP Configuration Example
+# This is what you would type in the vtysh shell
+
+# First, check current status
+show daemons
+show bgp summary
+
+# If bgpd is not running, you can still configure it
+# The configuration will be saved and bgpd will start when needed
+
+# Enter configuration mode
+configure terminal
+
+# Configure BGP router
+router bgp 65001
+ router-id 192.168.1.100
+ neighbor 192.168.1.1 remote-as 65002
+ neighbor 192.168.1.1 description "Upstream Provider"
+ neighbor 192.168.1.1 update-source 192.168.1.100
+ neighbor 192.168.1.1 timers 30 90
+ neighbor 192.168.1.1 send-community
+ 
+ # Advertise networks
+ network 192.168.1.0/24
+ network 10.0.0.0/8
+ 
+ # Set maximum paths for load balancing
+ maximum-paths 4
+
+# Exit configuration mode
+end
+
+# Save the configuration
+write
+
+# Now check if bgpd started
+show daemons
+show bgp summary
+show bgp neighbors
+
+# If bgpd is still not running, try to start it manually
+# (This would be done outside vtysh)
+# /usr/lib/frr/bgpd -d -F traditional
+
+# Verify the configuration
+show running-config
+show bgp summary
+show bgp neighbors
+show ip route bgp
+

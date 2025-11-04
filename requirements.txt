@@ -1,0 +1,59 @@
+# Core web framework
+Flask>=2.3.0
+Flask-Cors>=3.0.0
+
+# Network packet manipulation
+scapy>=2.5.0
+
+# GUI framework
+# Note: PyQt5 platform plugin fix for macOS is automatically handled in run_tgen_client.py
+# If GUI issues persist, ensure QT_PLUGIN_PATH points to PyQt5/Qt5/plugins directory
+PyQt5>=5.15.0
+
+# HTTP client and utilities
+requests>=2.31.0
+
+# Configuration and data handling
+PyYAML>=6.0.0
+
+# System monitoring
+psutil>=5.9.8
+
+# Additional networking utilities
+ipaddress>=1.0.23
+
+# Docker support for FRR containers
+docker>=7.0.0
+
+# Build tools and packaging
+setuptools>=65.0.0
+wheel>=0.40.0
+build>=0.10.0
+
+# macOS app building (PyInstaller and dependencies)
+PyInstaller>=6.0.0
+Pillow>=10.0.0
+
+# Development and testing (optional)
+pytest>=7.0.0
+pytest-cov>=4.0.0
+
+# =============================================================================
+# INSTALLATION NOTES AND TROUBLESHOOTING
+# =============================================================================
+
+# macOS Qt Platform Plugin Fix:
+# The run_tgen_client.py automatically sets QT_PLUGIN_PATH for macOS to resolve
+# the "Could not find the Qt platform plugin 'cocoa'" error.
+#
+# If you encounter Qt platform plugin issues:
+# 1. Ensure PyQt5 is installed from Qt's official wheels (not source)
+# 2. Check that QT_PLUGIN_PATH points to: <venv>/lib/python3.x/site-packages/PyQt5/Qt5/plugins
+# 3. Alternative: Use the ostg_client_wrapper.sh script which sets the environment variable
+#
+# Installation command for PyQt5 with proper macOS support:
+# pip install --find-links https://download.qt.io/snapshots/ci/pyqt5/5.15/wheels/ PyQt5
+#
+# Alternative GUI frameworks (if PyQt5 issues persist):
+# - PyQt6: pip install PyQt6 (requires code changes from PyQt5 to PyQt6)
+# - PySide6: pip install PySide6 (requires code changes from PyQt5 to PySide6)

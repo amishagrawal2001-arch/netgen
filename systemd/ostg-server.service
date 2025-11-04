@@ -1,0 +1,60 @@
+[Unit]
+Description=OSTG Traffic Generator Server
+Documentation=https://github.com/your-repo/ostg
+After=network.target network-online.target frr.service
+Wants=network-online.target frr.service
+Requires=network.target
+
+[Service]
+Type=simple
+User=ostg
+Group=ostg
+WorkingDirectory=/opt/ostg
+Environment=PATH=/opt/ostg/venv/bin:/usr/local/bin:/usr/bin:/bin
+Environment=OSTG_SERVER_URL=http://localhost:5050
+Environment=OSTG_LOG_LEVEL=INFO
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=OSTG_DB_PATH=/opt/OSTG/device_database.db
+Environment=OSTG_DB_BACKUP_ENABLED=true
+
+# Main service command
+ExecStart=/opt/ostg/venv/bin/ostg-server --host 0.0.0.0 --port 5050
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Restart policy
+Restart=always
+RestartSec=10
+StartLimitInterval=60
+StartLimitBurst=3
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ostg-server
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/ostg /opt/OSTG /var/log/ostg /tmp
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+RemoveIPC=true
+PrivateDevices=true
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# Kill settings
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,51 @@
+# Comprehensive FRR Docker Image for OSTG with Full Features
+FROM alpine:3.18
+
+# Install FRR with full features and required packages
+RUN apk add --no-cache \
+    frr \
+    frr-doc \
+    iproute2 \
+    iptables \
+    net-tools \
+    bash \
+    curl \
+    tini \
+    iputils \
+    tcpdump \
+    netcat-openbsd \
+    bind-tools \
+    openssh-client \
+    vim \
+    nano \
+    less \
+    procps \
+    htop
+
+# Create directories and set permissions
+RUN mkdir -p /var/run/frr /etc/frr /var/log/frr && \
+    chown -R frr:frr /var/run/frr /etc/frr /var/log/frr
+
+# Copy FRR configuration template
+COPY frr.conf.template /etc/frr/frr.conf.template
+
+# Create vtysh configuration
+RUN echo "service integrated-vtysh-config" > /etc/frr/vtysh.conf
+
+# Create startup script
+COPY start-frr.sh /usr/local/bin/start-frr.sh
+RUN chmod +x /usr/local/bin/start-frr.sh
+
+# Keep root user for FRR daemons (they need elevated privileges)
+# USER frr
+
+# Expose BGP port
+EXPOSE 179
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+    CMD vtysh -c "show version" || exit 1
+
+# Use tini as init system and start FRR
+ENTRYPOINT ["/sbin/tini", "--"]
+CMD ["/usr/local/bin/start-frr.sh"]

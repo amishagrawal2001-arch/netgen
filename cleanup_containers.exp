@@ -1,0 +1,61 @@
+#!/usr/bin/expect -f
+# cleanup_containers.exp
+# Script to clean up OSTG FRR containers from remote server
+
+set timeout 30
+set host "svl-hp-ai-srv04"
+set user "root"
+set password "Embe1mpls.."
+
+# Connect to the server
+spawn ssh -o StrictHostKeyChecking=no $user@$host
+
+# Handle password prompt
+expect {
+    "password:" {
+        send "$password\r"
+        exp_continue
+    }
+    "Password:" {
+        send "$password\r"
+        exp_continue
+    }
+    "$ " {
+        # Successfully connected
+    }
+    timeout {
+        puts "Connection timed out"
+        exit 1
+    }
+}
+
+# List current containers
+send "docker ps -a | grep ostg-frr\r"
+expect "$ "
+
+# Stop and remove the specific containers
+send "docker stop e07d4d70c799 3e33532f0320\r"
+expect "$ "
+
+send "docker rm e07d4d70c799 3e33532f0320\r"
+expect "$ "
+
+# Verify containers are removed
+send "docker ps -a | grep ostg-frr\r"
+expect "$ "
+
+# Clean up any unused images
+send "docker image prune -f\r"
+expect "$ "
+
+# Clean up any unused volumes
+send "docker volume prune -f\r"
+expect "$ "
+
+# Clean up any unused networks
+send "docker network prune -f\r"
+expect "$ "
+
+send "exit\r"
+expect eof
+

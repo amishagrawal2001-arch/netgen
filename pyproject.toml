@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=77", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ostg-trafficgen"
+version = "0.1.52"
+description = "OSTG Traffic Generator - Advanced Network Traffic Generation with BGP/OSPF Support"
+readme = "README.md"
+requires-python = ">=3.9"
+authors = [{ name = "Suraj Sharma", email = "suraj.sharma@example.com" }]
+license = {text = "MIT"}
+keywords = ["network", "traffic", "generator", "bgp", "ospf", "scapy", "flask", "gui"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Intended Audience :: System Administrators",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: System :: Networking",
+    "Topic :: Software Development :: Testing",
+]
+dynamic = ["dependencies"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
+
+[project.scripts]
+ostg-client = "run_tgen_client:main"
+ostg-server = "ostg.server:main"
+ostg-docker-install = "setup_docker:main"
+
+[tool.setuptools]
+packages.find = { exclude = ["backup*", "*.backup.*", "*.tmp", "*.temp"] }
+py-modules = ["multithreaded_traffic_gen", "run_tgen_client", "run_tgen_server", "capture_client", "setup_docker"]
+
+[tool.setuptools.package-data]
+"resources" = ["**/*"]
+"resources.icons" = ["**/*"]
+"resources.dpdk" = ["**/*"]
+"ostg_docker" = ["**/*"]

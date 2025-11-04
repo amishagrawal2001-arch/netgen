@@ -1,0 +1,23 @@
+[Unit]
+Description=OSTG Cleanup Service
+Documentation=https://github.com/your-repo/ostg
+After=ostg-server.service
+
+[Service]
+Type=oneshot
+User=ostg
+Group=ostg
+WorkingDirectory=/opt/ostg
+Environment=PATH=/opt/ostg/venv/bin:/usr/local/bin:/usr/bin:/bin
+Environment=OSTG_LOG_LEVEL=INFO
+
+# Cleanup command
+ExecStart=/opt/ostg/venv/bin/python -c "from utils.bgp import cleanup_all_bgp_routes; cleanup_all_bgp_routes()"
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ostg-cleanup
+
+[Install]
+WantedBy=multi-user.target

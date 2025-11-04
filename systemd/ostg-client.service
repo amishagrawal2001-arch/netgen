@@ -1,0 +1,59 @@
+[Unit]
+Description=OSTG Traffic Generator Client
+Documentation=https://github.com/your-repo/ostg
+After=network.target network-online.target ostg-server.service
+Wants=network-online.target ostg-server.service
+Requires=network.target
+
+[Service]
+Type=simple
+User=ostg
+Group=ostg
+WorkingDirectory=/opt/ostg
+Environment=PATH=/opt/ostg/venv/bin:/usr/local/bin:/usr/bin:/bin
+Environment=OSTG_SERVER_URL=http://localhost:5050
+Environment=OSTG_LOG_LEVEL=INFO
+Environment=PYTHONUNBUFFERED=1
+Environment=PYTHONDONTWRITEBYTECODE=1
+Environment=DISPLAY=:0
+
+# Main service command
+ExecStart=/opt/ostg/venv/bin/ostg-client --server-url http://localhost:5050
+ExecReload=/bin/kill -HUP $MAINPID
+
+# Restart policy
+Restart=always
+RestartSec=10
+StartLimitInterval=60
+StartLimitBurst=3
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=ostg-client
+
+# Security settings (less restrictive for GUI)
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=false
+ProtectHome=false
+ReadWritePaths=/opt/ostg /var/log/ostg /tmp /home
+ProtectKernelTunables=false
+ProtectKernelModules=false
+ProtectControlGroups=false
+RestrictRealtime=false
+RestrictSUIDSGID=false
+RemoveIPC=false
+PrivateDevices=false
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# Kill settings
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

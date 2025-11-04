@@ -1,0 +1,24 @@
+OSTG Wheel Rebuild Information
+=============================
+Build Date: Sun Nov  2 19:19:48 PST 2025
+Wheel File: ostg_trafficgen-0.1.52-py3-none-any.whl
+Version: 0.1.52
+Python Version: Python 3.9.6
+Build Directory: /Users/surajsharma/Library/CloudStorage/OneDrive-JuniperNetworks,Inc/OSTG
+
+Files Modified (BGP Timer Fixes):
+- utils/frr_docker.py: Fixed command generation for BGP timers
+- utils/bgp.py: Fixed missing remove_result assignment
+- run_tgen_server.py: Added timer mapping in BGP configuration
+
+Deployment Commands:
+1. Copy wheel to server: scp ostg_trafficgen-0.1.52-py3-none-any.whl root@svl-hp-ai-srv02:/root/OSTG/
+2. SSH to server: ssh root@svl-hp-ai-srv02
+3. Install wheel: pip3 install ostg_trafficgen-0.1.52-py3-none-any.whl --force-reinstall
+4. Start server: python3 run_tgen_server.py &
+
+Testing BGP Timer Configuration:
+1. Configure BGP with custom timers (Keepalive: 20, Hold-time: 40)
+2. Click "Apply BGP" in OSTG client
+3. Check logs for timer values
+4. Verify in FRR container: docker exec -it <container> vtysh -c "show running-config" | grep timers
