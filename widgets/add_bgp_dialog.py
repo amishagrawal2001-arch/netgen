@@ -141,6 +141,11 @@ class AddBgpDialog(QDialog):
         self.bgp_update_source_ipv4_input = QLineEdit(source_ipv4_default)
         self.ipv4_bgp_layout.addRow("Source IPv4:", self.bgp_update_source_ipv4_input)
         
+        # IPv4 Remote ASN
+        self.bgp_remote_asn_ipv4_input = QLineEdit("65001")
+        self.bgp_remote_asn_ipv4_input.setValidator(QIntValidator(1, 2147483647))
+        self.ipv4_bgp_layout.addRow("Remote ASN IPv4:", self.bgp_remote_asn_ipv4_input)
+        
         # Connect IPv4 increment checkbox
         self.ipv4_increment_checkbox.toggled.connect(self.toggle_ipv4_increment)
 
@@ -179,6 +184,11 @@ class AddBgpDialog(QDialog):
         source_ipv6_default = self.device_ipv6 if self.device_ipv6 else "2001:db8::2"
         self.bgp_update_source_ipv6_input = QLineEdit(source_ipv6_default)
         self.ipv6_bgp_layout.addRow("Source IPv6:", self.bgp_update_source_ipv6_input)
+        
+        # IPv6 Remote ASN
+        self.bgp_remote_asn_ipv6_input = QLineEdit("65001")
+        self.bgp_remote_asn_ipv6_input.setValidator(QIntValidator(1, 2147483647))
+        self.ipv6_bgp_layout.addRow("Remote ASN IPv6:", self.bgp_remote_asn_ipv6_input)
         
         # Connect IPv6 increment checkbox
         self.ipv6_increment_checkbox.toggled.connect(self.toggle_ipv6_increment)
@@ -224,7 +234,7 @@ class AddBgpDialog(QDialog):
         config = {
             "bgp_mode": self.bgp_mode_combo.currentText(),
             "bgp_asn": self.bgp_asn_input.text().strip(),
-            "bgp_remote_asn": self.bgp_remote_asn_input.text().strip(),
+            "bgp_remote_asn": self.bgp_remote_asn_input.text().strip(),  # Keep for backward compatibility
             "bgp_keepalive": str(self.bgp_keepalive_input.value()),
             "bgp_hold_time": str(self.bgp_hold_time_input.value()),
             "ipv4_enabled": self.ipv4_enabled.isChecked(),
@@ -240,9 +250,11 @@ class AddBgpDialog(QDialog):
             else:
                 config["bgp_neighbor_ipv4"] = self.bgp_neighbor_ipv4_input.text().strip()
             config["bgp_update_source_ipv4"] = self.bgp_update_source_ipv4_input.text().strip()
+            config["bgp_remote_asn_ipv4"] = self.bgp_remote_asn_ipv4_input.text().strip()
         else:
             config["bgp_neighbor_ipv4"] = ""
             config["bgp_update_source_ipv4"] = ""
+            config["bgp_remote_asn_ipv4"] = ""
         
         # Only include IPv6 configuration if enabled
         if self.ipv6_enabled.isChecked():
@@ -253,9 +265,11 @@ class AddBgpDialog(QDialog):
             else:
                 config["bgp_neighbor_ipv6"] = self.bgp_neighbor_ipv6_input.text().strip()
             config["bgp_update_source_ipv6"] = self.bgp_update_source_ipv6_input.text().strip()
+            config["bgp_remote_asn_ipv6"] = self.bgp_remote_asn_ipv6_input.text().strip()
         else:
             config["bgp_neighbor_ipv6"] = ""
             config["bgp_update_source_ipv6"] = ""
+            config["bgp_remote_asn_ipv6"] = ""
         
         return config
 

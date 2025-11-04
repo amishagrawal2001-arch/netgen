@@ -2548,8 +2548,9 @@ class DevicesTab(QWidget):
                                 # Local AS (column 5)
                                 self.bgp_table.setItem(row, 5, QTableWidgetItem(bgp_config.get("bgp_asn", "")))
                                 
-                                # Remote AS (column 6)
-                                self.bgp_table.setItem(row, 6, QTableWidgetItem(bgp_config.get("bgp_remote_asn", "")))
+                                # Remote AS (column 6) - use IPv4-specific remote ASN if available
+                                remote_asn_ipv4 = bgp_config.get("bgp_remote_asn_ipv4") or bgp_config.get("bgp_remote_asn", "")
+                                self.bgp_table.setItem(row, 6, QTableWidgetItem(remote_asn_ipv4))
                                 
                                 # State (column 7) - get real BGP state
                                 self.bgp_table.setItem(row, 7, QTableWidgetItem(bgp_state))
@@ -2619,8 +2620,9 @@ class DevicesTab(QWidget):
                                 # Local AS (column 5)
                                 self.bgp_table.setItem(row, 5, QTableWidgetItem(bgp_config.get("bgp_asn", "")))
                                 
-                                # Remote AS (column 6)
-                                self.bgp_table.setItem(row, 6, QTableWidgetItem(bgp_config.get("bgp_remote_asn", "")))
+                                # Remote AS (column 6) - use IPv6-specific remote ASN if available
+                                remote_asn_ipv6 = bgp_config.get("bgp_remote_asn_ipv6") or bgp_config.get("bgp_remote_asn", "")
+                                self.bgp_table.setItem(row, 6, QTableWidgetItem(remote_asn_ipv6))
                                 
                                 # State (column 7) - get real BGP state
                                 self.bgp_table.setItem(row, 7, QTableWidgetItem(bgp_state))
@@ -4145,6 +4147,7 @@ class DevicesTab(QWidget):
                     "protocols": self._convert_protocols_to_array(device_info.get("Protocols", "")),
                     "bgp_config": device_info.get("bgp_config", {}),
                     "ospf_config": device_info.get("ospf_config", {}),
+                    "isis_config": device_info.get("isis_config", {}) or device_info.get("is_is_config", {}),
                 }
                 
                 resp = requests.post(f"{server_url}/api/device/apply", json=payload, timeout=30)
@@ -4226,11 +4229,13 @@ class DevicesTab(QWidget):
                 "protocols": device_info.get("protocols", []),
                 "bgp_config": device_info.get("bgp_config", {}),
                 "ospf_config": device_info.get("ospf_config", {}),
+                "isis_config": device_info.get("isis_config", {}) or device_info.get("is_is_config", {}),
             }
             
             print(f"[DEBUG APPLY DEVICE] Payload protocols: {payload['protocols']}")
             print(f"[DEBUG APPLY DEVICE] Payload BGP config: {payload['bgp_config']}")
             print(f"[DEBUG APPLY DEVICE] Payload OSPF config: {payload['ospf_config']}")
+            print(f"[DEBUG APPLY DEVICE] Payload ISIS config: {payload['isis_config']}")
             
             # Create and start background worker
             query_data = {
@@ -4285,6 +4290,7 @@ class DevicesTab(QWidget):
                 "protocols": device_info.get("protocols", []),
                 "bgp_config": device_info.get("bgp_config", {}),
                 "ospf_config": device_info.get("ospf_config", {}),
+                "isis_config": device_info.get("isis_config", {}) or device_info.get("is_is_config", {}),
             }
             
             # Apply basic device configuration
@@ -4325,6 +4331,20 @@ class DevicesTab(QWidget):
                 print(f"[SUCCESS] OSPF configured for device {device_name}")
             else:
                 print(f"[DEBUG DEVICE APPLY] OSPF not configured - protocols: {protocols}, ospf_config: {ospf_config}")
+            
+            # Step 4: Configure ISIS if enabled
+            isis_config = device_info.get("isis_config", {}) or device_info.get("is_is_config", {})
+            
+            print(f"[DEBUG DEVICE APPLY] Checking ISIS - protocols: {protocols}, isis_config: {isis_config}")
+            if ("IS-IS" in protocols or "ISIS" in protocols) and isis_config:
+                print(f"[INFO] Configuring ISIS for device {device_name}")
+                isis_success = self._apply_isis_to_server_sync(server_url, device_info)
+                if not isis_success:
+                    print(f"[ERROR] Failed to configure ISIS for device {device_name}")
+                    return False
+                print(f"[SUCCESS] ISIS configured for device {device_name}")
+            else:
+                print(f"[DEBUG DEVICE APPLY] ISIS not configured - protocols: {protocols}, isis_config: {isis_config}")
             
             return True
                 
@@ -4416,6 +4436,45 @@ class DevicesTab(QWidget):
             print(f"[ERROR] Exception in sync OSPF apply for '{device_name}': {e}")
             return False
     
+    def _apply_isis_to_server_sync(self, server_url, device_info):
+        """Apply ISIS configuration synchronously (for use in background workers)."""
+        import requests
+        
+        try:
+            device_name = device_info.get("Device Name", "")
+            device_id = device_info.get("device_id", "")
+            
+            # Get ISIS config - handle both old dict format and new separate config format
+            isis_config = device_info.get("isis_config", {}) or device_info.get("is_is_config", {})
+            if not isis_config:
+                # Try old format for backward compatibility
+                protocols = device_info.get("protocols", {})
+                if isinstance(protocols, dict):
+                    isis_config = protocols.get("IS-IS", {}) or protocols.get("ISIS", {})
+            
+            if not isis_config:
+                return True  # No ISIS config to apply
+            
+            # Prepare ISIS payload using the configure endpoint
+            isis_payload = {
+                "device_id": device_id,
+                "device_name": device_name,
+                "interface": device_info.get("Interface", ""),
+                "vlan": device_info.get("VLAN", "0"),
+                "ipv4": device_info.get("IPv4", ""),
+                "ipv6": device_info.get("IPv6", ""),
+                "ipv4_gateway": device_info.get("IPv4 Gateway", ""),
+                "ipv6_gateway": device_info.get("IPv6 Gateway", ""),
+                "isis_config": isis_config
+            }
+            
+            # Make synchronous request to the configure endpoint
+            response = requests.post(f"{server_url}/api/device/isis/configure", json=isis_payload, timeout=30)
+            return response.status_code == 200
+                
+        except Exception as e:
+            print(f"[ERROR] Exception in sync ISIS apply for '{device_name}': {e}")
+            return False
     
     def _remove_device_from_data_structure(self, device_info):
         """Remove device from all_devices data structure."""
@@ -4657,10 +4716,14 @@ class DevicesTab(QWidget):
                     # Create a copy of ISIS config and update it based on incremented values
                     incremented_isis_config = isis_config.copy()
                     
-                    # Update interface in ISIS config if VLAN was incremented
-                    if incr_vlan and i > 0:
-                        if current_vlan and current_vlan != "0":
-                            incremented_isis_config["interface"] = f"vlan{current_vlan}"
+                    # Always update interface in ISIS config based on current VLAN
+                    if current_vlan and current_vlan != "0":
+                        incremented_isis_config["interface"] = f"vlan{current_vlan}"
+                    else:
+                        # If no VLAN, use the normalized interface name (extract physical interface from label)
+                        iface_label = device_data.get("Interface", iface)
+                        iface_norm = self._normalize_iface_label(iface_label)
+                        incremented_isis_config["interface"] = iface_norm
                     
                     # Update IPv4/IPv6 enabled flags based on incremented addresses
                     incremented_isis_config["ipv4_enabled"] = bool(current_ipv4)
@@ -4724,12 +4787,23 @@ class DevicesTab(QWidget):
             print(f"[DEBUG ADD DEVICE] Single device ISIS config: {isis_config}")
             if isis_config:
                 print(f"[DEBUG ADD DEVICE] Adding ISIS to single device {unique_name}")
+                # Create a copy of ISIS config and update interface based on VLAN
+                updated_isis_config = isis_config.copy()
+                
+                # Always update interface in ISIS config based on VLAN
+                if vlan and vlan != "0":
+                    updated_isis_config["interface"] = f"vlan{vlan}"
+                else:
+                    # If no VLAN, use the normalized interface name (extract physical interface from label)
+                    iface_norm = self._normalize_iface_label(iface)
+                    updated_isis_config["interface"] = iface_norm
+                
                 # Initialize protocols as list and isis_config as separate field
                 device_data["protocols"] = device_data.get("protocols", [])
                 if "IS-IS" not in device_data["protocols"]:
                     device_data["protocols"].append("IS-IS")
-                device_data["is_is_config"] = isis_config  # Use is_is_config for consistency with database
-                device_data["isis_config"] = isis_config   # Also store as isis_config for compatibility
+                device_data["is_is_config"] = updated_isis_config  # Use is_is_config for consistency with database
+                device_data["isis_config"] = updated_isis_config   # Also store as isis_config for compatibility
                 print(f"[DEBUG ADD DEVICE] ISIS added to single device {unique_name}: {device_data['is_is_config']}")
             else:
                 print(f"[DEBUG ADD DEVICE] ISIS NOT enabled for single device")
@@ -6350,11 +6424,17 @@ class DevicesTab(QWidget):
         if has_ipv4:
             dialog.bgp_neighbor_ipv4_input.setText(current_bgp.get("bgp_neighbor_ipv4", ""))
             dialog.bgp_update_source_ipv4_input.setText(current_bgp.get("bgp_update_source_ipv4", ""))
+            # Use IPv4-specific remote ASN if available, otherwise fall back to general remote ASN
+            remote_asn_ipv4 = current_bgp.get("bgp_remote_asn_ipv4", current_bgp.get("bgp_remote_asn", ""))
+            dialog.bgp_remote_asn_ipv4_input.setText(remote_asn_ipv4)
         
         # Pre-populate IPv6 fields - combine all IPv6 neighbor IPs
         if has_ipv6:
             dialog.bgp_neighbor_ipv6_input.setText(current_bgp.get("bgp_neighbor_ipv6", ""))
             dialog.bgp_update_source_ipv6_input.setText(current_bgp.get("bgp_update_source_ipv6", ""))
+            # Use IPv6-specific remote ASN if available, otherwise fall back to general remote ASN
+            remote_asn_ipv6 = current_bgp.get("bgp_remote_asn_ipv6", current_bgp.get("bgp_remote_asn", ""))
+            dialog.bgp_remote_asn_ipv6_input.setText(remote_asn_ipv6)
         
         if dialog.exec_() != dialog.Accepted:
             return
@@ -6659,6 +6739,11 @@ class DevicesTab(QWidget):
                             ipv6_ips.append(neighbor_ip)
                         
                         bgp_config["bgp_neighbor_ipv6"] = ",".join(ipv6_ips)
+                    
+                    # Ensure both bgp_config locations are updated (for old and new format compatibility)
+                    if isinstance(device_info.get("protocols"), dict):
+                        device_info["protocols"]["BGP"] = bgp_config
+                    device_info["bgp_config"] = bgp_config
             
             elif column == 4:  # Source IP changed (column 4 after adding BGP Status)
                 source_ip_item = self.bgp_table.item(row, 4)
@@ -6692,6 +6777,11 @@ class DevicesTab(QWidget):
                         bgp_config["bgp_update_source_ipv4"] = source_ip
                     elif neighbor_type == "IPv6":
                         bgp_config["bgp_update_source_ipv6"] = source_ip
+                    
+                    # Ensure both bgp_config locations are updated (for old and new format compatibility)
+                    if isinstance(device_info.get("protocols"), dict):
+                        device_info["protocols"]["BGP"] = bgp_config
+                    device_info["bgp_config"] = bgp_config
             
             elif column == 5:  # Local AS changed (column 5 after adding BGP Status)
                 local_as_item = self.bgp_table.item(row, 5)
@@ -6713,11 +6803,19 @@ class DevicesTab(QWidget):
                         return
                     
                     bgp_config["bgp_asn"] = local_as
+                    
+                    # Ensure both bgp_config locations are updated (for old and new format compatibility)
+                    if isinstance(device_info.get("protocols"), dict):
+                        device_info["protocols"]["BGP"] = bgp_config
+                    device_info["bgp_config"] = bgp_config
             
             elif column == 6:  # Remote AS changed (column 6 after adding BGP Status)
                 remote_as_item = self.bgp_table.item(row, 6)
-                if remote_as_item:
+                neighbor_type_item = self.bgp_table.item(row, 2)
+                
+                if remote_as_item and neighbor_type_item:
                     remote_as = remote_as_item.text().strip()
+                    neighbor_type = neighbor_type_item.text()
                     
                     # Validate AS number
                     try:
@@ -6728,12 +6826,30 @@ class DevicesTab(QWidget):
                     except ValueError:
                         QMessageBox.warning(self, "Invalid Remote AS Number", 
                                           f"'{remote_as}' is not a valid AS number (must be 1-4294967295).")
-                        # Revert to original value
-                        original_remote_asn = bgp_config.get("bgp_remote_asn", "")
+                        # Revert to original value based on neighbor type
+                        if neighbor_type == "IPv4":
+                            original_remote_asn = bgp_config.get("bgp_remote_asn_ipv4") or bgp_config.get("bgp_remote_asn", "")
+                        else:  # IPv6
+                            original_remote_asn = bgp_config.get("bgp_remote_asn_ipv6") or bgp_config.get("bgp_remote_asn", "")
                         remote_as_item.setText(original_remote_asn)
                         return
                     
-                    bgp_config["bgp_remote_asn"] = remote_as
+                    # Update the appropriate remote ASN field based on neighbor type
+                    if neighbor_type == "IPv4":
+                        bgp_config["bgp_remote_asn_ipv4"] = remote_as
+                        # Also update general remote ASN for backward compatibility if not set separately
+                        if "bgp_remote_asn_ipv6" not in bgp_config:
+                            bgp_config["bgp_remote_asn"] = remote_as
+                    elif neighbor_type == "IPv6":
+                        bgp_config["bgp_remote_asn_ipv6"] = remote_as
+                        # Also update general remote ASN for backward compatibility if not set separately
+                        if "bgp_remote_asn_ipv4" not in bgp_config:
+                            bgp_config["bgp_remote_asn"] = remote_as
+                    
+                    # Ensure both bgp_config locations are updated (for old and new format compatibility)
+                    if isinstance(device_info.get("protocols"), dict):
+                        device_info["protocols"]["BGP"] = bgp_config
+                    device_info["bgp_config"] = bgp_config
             
             elif column == 10:  # Keepalive timer changed (column 10)
                 keepalive_item = self.bgp_table.item(row, 10)
@@ -6755,6 +6871,11 @@ class DevicesTab(QWidget):
                         return
                     
                     bgp_config["bgp_keepalive"] = keepalive
+                    
+                    # Ensure both bgp_config locations are updated (for old and new format compatibility)
+                    if isinstance(device_info.get("protocols"), dict):
+                        device_info["protocols"]["BGP"] = bgp_config
+                    device_info["bgp_config"] = bgp_config
             
             elif column == 11:  # Hold-time timer changed (column 11)
                 hold_time_item = self.bgp_table.item(row, 11)
@@ -6776,6 +6897,11 @@ class DevicesTab(QWidget):
                         return
                     
                     bgp_config["bgp_hold_time"] = hold_time
+                    
+                    # Ensure both bgp_config locations are updated (for old and new format compatibility)
+                    if isinstance(device_info.get("protocols"), dict):
+                        device_info["protocols"]["BGP"] = bgp_config
+                    device_info["bgp_config"] = bgp_config
             
             # Save session
             if hasattr(self.main_window, "save_session"):
@@ -8064,7 +8190,7 @@ class DevicesTab(QWidget):
                 
                 # Send BGP configuration to server
                 response = requests.post(f"{server_url}/api/device/bgp/configure", 
-                                       json=payload, timeout=10)
+                                       json=payload, timeout=30)
                 
                 if response.status_code == 200:
                     success_count += 1
@@ -8087,7 +8213,7 @@ class DevicesTab(QWidget):
                         }
                         
                         start_response = requests.post(f"{server_url}/api/device/start", 
-                                                    json=start_payload, timeout=10)
+                                                    json=start_payload, timeout=30)
                         
                         if start_response.status_code == 200:
                             print(f"✅ BGP service started for {device_name}")

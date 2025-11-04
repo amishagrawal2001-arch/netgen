@@ -395,6 +395,7 @@ class DeviceDatabase:
                     'protocols': json.dumps(device_data.get("protocols", [])),
                     'bgp_config': json.dumps(device_data.get("bgp_config", {})),
                     'ospf_config': json.dumps(device_data.get("ospf_config", {})),
+                    'isis_config': json.dumps(device_data.get("isis_config", {})),
                     'status': device_data.get("status", "Stopped"),
                     'created_at': datetime.now(timezone.utc).isoformat(),
                     'updated_at': datetime.now(timezone.utc).isoformat()
@@ -405,8 +406,8 @@ class DeviceDatabase:
                     INSERT INTO devices (
                         device_id, device_name, interface, server_interface, vlan, ipv4_address, ipv4_mask,
                         ipv6_address, ipv6_mask, ipv4_gateway, ipv6_gateway, mac_address,
-                        protocols, bgp_config, ospf_config, status, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        protocols, bgp_config, ospf_config, isis_config, status, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, tuple(device_info.values()))
                 
                 conn.commit()

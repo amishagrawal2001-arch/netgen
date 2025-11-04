@@ -1491,17 +1491,54 @@ def configure_isis():
         except Exception as e:
             logging.warning(f"[ISIS CONFIGURE] Failed to save route pool attachments: {e}")
         
-        # Check if IPv4 was previously configured but now disabled - need to remove IPv4 ISIS
+        # Save device to database if it doesn't exist, or update ISIS config for existing device
         try:
+            from datetime import datetime, timezone
             existing_device = device_db.get_device(device_id)
-            if existing_device:
-                existing_ipv4 = existing_device.get("ipv4_address", "")
-                # If IPv4 was previously configured but now empty, remove IPv4 ISIS
-                if existing_ipv4 and not ipv4:
-                    logging.info(f"[ISIS CONFIGURE] IPv4 was configured but now disabled - removing IPv4 ISIS configuration")
+            if not existing_device:
+                logging.info(f"[ISIS CONFIGURE] Device {device_id} not found in database, adding it")
+                device_data = {
+                    "device_id": device_id,
+                    "device_name": device_name,
+                    "interface": data.get("interface", "ens4np0"),
+                    "vlan": data.get("vlan", "0"),
+                    "ipv4_address": ipv4,
+                    "ipv6_address": ipv6,
+                    "ipv4_mask": data.get("ipv4_mask", "24"),
+                    "ipv6_mask": data.get("ipv6_mask", "64"),
+                    "ipv4_gateway": data.get("ipv4_gateway", ""),
+                    "ipv6_gateway": data.get("ipv6_gateway", ""),
+                    "protocols": ["IS-IS"],  # Add IS-IS protocol to the device
+                    "isis_config": isis_config,  # Save ISIS configuration
+                    "status": "Running",
+                    "created_at": datetime.now(timezone.utc).isoformat(),
+                    "updated_at": datetime.now(timezone.utc).isoformat()
+                }
+                
+                if device_db.add_device(device_data):
+                    logging.info(f"[ISIS CONFIGURE] Successfully added device {device_name} to database")
+                else:
+                    logging.warning(f"[ISIS CONFIGURE] Failed to add device {device_name} to database")
+            else:
+                logging.info(f"[ISIS CONFIGURE] Device {device_id} already exists in database")
+                
+                # IMPORTANT: Check for IPv4/IPv6 removal BEFORE updating database
+                # Get existing ISIS config before it's overwritten
+                existing_isis_config = existing_device.get("isis_config", {})
+                if isinstance(existing_isis_config, str):
+                    import json
                     try:
-                        from utils.frr_docker import FRRDockerManager
-                        frr_manager = FRRDockerManager()
+                        existing_isis_config = json.loads(existing_isis_config)
+                    except:
+                        existing_isis_config = {}
+                
+                # Check if IPv4 was previously enabled but now disabled - remove IPv4 ISIS
+                existing_ipv4_enabled = existing_isis_config.get("ipv4_enabled", False)
+                ipv4_enabled = isis_config.get("ipv4_enabled", False)
+                
+                if existing_ipv4_enabled and not ipv4_enabled:
+                    logging.info(f"[ISIS CONFIGURE] IPv4 was enabled but now disabled - removing IPv4 ISIS configuration")
+                    try:
                         container_name = frr_manager._get_container_name(device_id, device_name)
                         container = frr_manager.client.containers.get(container_name)
                         
@@ -1533,20 +1570,14 @@ def configure_isis():
                             logging.warning(f"[ISIS CONFIGURE] Failed to remove IPv4 ISIS configuration: {output_str}")
                     except Exception as e:
                         logging.warning(f"[ISIS CONFIGURE] Failed to remove IPv4 ISIS configuration: {e}")
-        except Exception as e:
-            logging.warning(f"[ISIS CONFIGURE] Error checking for existing IPv4 ISIS removal: {e}")
-        
-        # Check if IPv6 was previously configured but now disabled - need to remove IPv6 ISIS
-        try:
-            existing_device = device_db.get_device(device_id)
-            if existing_device:
-                existing_ipv6 = existing_device.get("ipv6_address", "")
-                # If IPv6 was previously configured but now empty, remove IPv6 ISIS
-                if existing_ipv6 and not ipv6:
-                    logging.info(f"[ISIS CONFIGURE] IPv6 was configured but now disabled - removing IPv6 ISIS configuration")
+                
+                # Check if IPv6 was previously enabled but now disabled - remove IPv6 ISIS
+                existing_ipv6_enabled = existing_isis_config.get("ipv6_enabled", False)
+                ipv6_enabled = isis_config.get("ipv6_enabled", False)
+                
+                if existing_ipv6_enabled and not ipv6_enabled:
+                    logging.info(f"[ISIS CONFIGURE] IPv6 was enabled but now disabled - removing IPv6 ISIS configuration")
                     try:
-                        from utils.frr_docker import FRRDockerManager
-                        frr_manager = FRRDockerManager()
                         container_name = frr_manager._get_container_name(device_id, device_name)
                         container = frr_manager.client.containers.get(container_name)
                         
@@ -1578,8 +1609,22 @@ def configure_isis():
                             logging.warning(f"[ISIS CONFIGURE] Failed to remove IPv6 ISIS configuration: {output_str}")
                     except Exception as e:
                         logging.warning(f"[ISIS CONFIGURE] Failed to remove IPv6 ISIS configuration: {e}")
+                
+                # Update device with IS-IS protocol and configuration
+                existing_protocols = existing_device.get("protocols", [])
+                if "IS-IS" not in existing_protocols and "ISIS" not in existing_protocols:
+                    existing_protocols.append("IS-IS")
+                    logging.info(f"[ISIS CONFIGURE] Adding IS-IS protocol to device {device_name}")
+                
+                # Update ISIS configuration
+                device_db.update_device(device_id, {
+                    "protocols": existing_protocols,
+                    "isis_config": isis_config,
+                    "updated_at": datetime.now(timezone.utc).isoformat()
+                })
+                logging.info(f"[ISIS CONFIGURE] Updated device {device_name} with ISIS configuration in database")
         except Exception as e:
-            logging.warning(f"[ISIS CONFIGURE] Error checking for existing IPv6 ISIS removal: {e}")
+            logging.warning(f"[ISIS CONFIGURE] Error checking/adding device to database: {e}")
         
         # Configure ISIS neighbor
         success = configure_isis_neighbor(device_id, isis_config, device_name, ipv4=ipv4, ipv6=ipv6)
@@ -4721,9 +4766,11 @@ def configure_bgp():
             
             # Configure each IPv4 neighbor individually
             for neighbor_ip in ipv4_neighbors_list:
+                # Use IPv4-specific remote ASN if available, otherwise fall back to general remote ASN
+                neighbor_as_ipv4 = bgp_config.get("bgp_remote_asn_ipv4") or bgp_config.get("bgp_neighbor_asn") or bgp_config.get("bgp_remote_asn", "")
                 neighbor_config_ipv4 = {
                     "neighbor_ip": neighbor_ip,
-                    "neighbor_as": bgp_config.get("bgp_neighbor_asn") or bgp_config.get("bgp_remote_asn", ""),
+                    "neighbor_as": neighbor_as_ipv4,
                     "local_as": bgp_config.get("bgp_asn", 65001),
                     "update_source": bgp_config.get("bgp_update_source_ipv4", ipv4),
                     "keepalive": bgp_config.get("bgp_keepalive", "30"),
@@ -4748,9 +4795,11 @@ def configure_bgp():
             
             # Configure each IPv6 neighbor individually
             for neighbor_ip in ipv6_neighbors_list:
+                # Use IPv6-specific remote ASN if available, otherwise fall back to general remote ASN
+                neighbor_as_ipv6 = bgp_config.get("bgp_remote_asn_ipv6") or bgp_config.get("bgp_neighbor_asn") or bgp_config.get("bgp_remote_asn", "")
                 neighbor_config_ipv6 = {
                     "neighbor_ip": neighbor_ip,
-                    "neighbor_as": bgp_config.get("bgp_neighbor_asn") or bgp_config.get("bgp_remote_asn", ""),
+                    "neighbor_as": neighbor_as_ipv6,
                     "local_as": bgp_config.get("bgp_asn", 65001),
                     "update_source": bgp_config.get("bgp_update_source_ipv6", ipv6),
                     "keepalive": bgp_config.get("bgp_keepalive", "30"),
