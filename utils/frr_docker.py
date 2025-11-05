@@ -171,7 +171,9 @@ class FRRDockerManager:
             
             # Build BGP configuration commands
             local_as = bgp_config.get('bgp_asn', 65000)
-            neighbor_as = bgp_config.get('bgp_remote_asn', 65001)
+            # Use separate remote ASN for IPv4 and IPv6 if available, otherwise fall back to general remote ASN
+            neighbor_as_ipv4 = bgp_config.get('bgp_remote_asn_ipv4') or bgp_config.get('bgp_remote_asn', 65001)
+            neighbor_as_ipv6 = bgp_config.get('bgp_remote_asn_ipv6') or bgp_config.get('bgp_remote_asn', 65001)
             keepalive = bgp_config.get('bgp_keepalive', 30)
             hold_time = bgp_config.get('bgp_hold_time', 90)
             
@@ -197,9 +199,9 @@ class FRRDockerManager:
             update_source_ipv4 = bgp_config.get('bgp_update_source_ipv4', ipv4.split('/')[0] if ipv4 else None)
             
             if neighbor_ipv4 and update_source_ipv4:
-                logger.info(f"[FRR] Configuring IPv4 BGP neighbor {neighbor_ipv4} with update-source {update_source_ipv4}")
+                logger.info(f"[FRR] Configuring IPv4 BGP neighbor {neighbor_ipv4} with update-source {update_source_ipv4} and remote AS {neighbor_as_ipv4}")
                 commands.extend([
-                    f"neighbor {neighbor_ipv4} remote-as {neighbor_as}",
+                    f"neighbor {neighbor_ipv4} remote-as {neighbor_as_ipv4}",
                     f"neighbor {neighbor_ipv4} update-source {update_source_ipv4}",
                     f"neighbor {neighbor_ipv4} timers {keepalive} {hold_time}",
                 ])
@@ -209,9 +211,9 @@ class FRRDockerManager:
             update_source_ipv6 = bgp_config.get('bgp_update_source_ipv6', ipv6.split('/')[0] if ipv6 else None)
             
             if neighbor_ipv6 and update_source_ipv6:
-                logger.info(f"[FRR] Configuring IPv6 BGP neighbor {neighbor_ipv6} with update-source {update_source_ipv6}")
+                logger.info(f"[FRR] Configuring IPv6 BGP neighbor {neighbor_ipv6} with update-source {update_source_ipv6} and remote AS {neighbor_as_ipv6}")
                 commands.extend([
-                    f"neighbor {neighbor_ipv6} remote-as {neighbor_as}",
+                    f"neighbor {neighbor_ipv6} remote-as {neighbor_as_ipv6}",
                     f"neighbor {neighbor_ipv6} update-source {update_source_ipv6}",
                     f"neighbor {neighbor_ipv6} timers {keepalive} {hold_time}",
                 ])
@@ -321,24 +323,450 @@ class FRRDockerManager:
                 else:
                     logger.error(f"[FRR] BGP configuration failed after {max_retries} attempts due to exceptions")
     
-    def stop_frr_container(self, device_id: str, device_name: str = None) -> bool:
-        """Stop FRR container"""
+    def stop_frr_container(self, device_id: str, device_name: str = None, protocols: list = None, bgp_config: dict = None, ospf_config: dict = None, isis_config: dict = None, interface: str = None, vlan: str = None) -> bool:
+        """
+        Stop FRR protocols and shutdown interface inside container, but keep container running.
+        
+        Args:
+            device_id: Device ID
+            device_name: Device name
+            protocols: List of protocols (BGP, OSPF, ISIS)
+            bgp_config: BGP configuration dict
+            ospf_config: OSPF configuration dict
+            isis_config: ISIS configuration dict
+            interface: Physical interface name
+            vlan: VLAN ID (if applicable)
+        
+        Returns:
+            True if successful, False otherwise
+        """
         try:
             container_name = self._get_container_name(device_id, device_name)
             
-            # Stop and remove container
+            # Check if container exists
             try:
                 container = self.client.containers.get(container_name)
-                container.stop()
-                container.remove()
-                logger.info(f"[FRR] Stopped and removed container {container_name}")
             except docker.errors.NotFound:
-                logger.info(f"[FRR] Container {container_name} not found")
+                logger.info(f"[FRR STOP] Container {container_name} not found - nothing to stop")
+                return True  # Container doesn't exist, consider it successful
+            
+            # Check if container is running, if not start it temporarily
+            if container.status != "running":
+                logger.info(f"[FRR STOP] Container {container_name} is not running, starting it temporarily...")
+                container.start()
+                time.sleep(3)  # Wait for container to be ready
+            
+            logger.info(f"[FRR STOP] Keeping container {container_name} running, shutting down protocols and interface")
+            
+            # Determine interface name (with VLAN if applicable)
+            iface_name = f"vlan{vlan}" if (vlan and vlan != "0") else (interface or "eth0")
+            logger.info(f"[FRR STOP] Using interface: {iface_name}")
+            
+            # Build vtysh commands to shutdown protocols and interface
+            vtysh_commands = ["configure terminal"]
+            
+            # Shutdown BGP if configured
+            if bgp_config:
+                bgp_asn = bgp_config.get("bgp_asn", "65000")
+                neighbor_ipv4 = bgp_config.get("bgp_neighbor_ipv4", "")
+                neighbor_ipv6 = bgp_config.get("bgp_neighbor_ipv6", "")
+                
+                # Shutdown IPv4 BGP neighbors
+                if neighbor_ipv4:
+                    neighbors_ipv4 = [n.strip() for n in neighbor_ipv4.split(",") if n.strip()]
+                    vtysh_commands.append(f"router bgp {bgp_asn}")
+                    for neighbor_ip in neighbors_ipv4:
+                        vtysh_commands.append(f"neighbor {neighbor_ip} shutdown")
+                        logger.info(f"[FRR STOP] Shutting down BGP IPv4 neighbor: {neighbor_ip}")
+                    vtysh_commands.append("exit")
+                
+                # Shutdown IPv6 BGP neighbors
+                if neighbor_ipv6:
+                    neighbors_ipv6 = [n.strip() for n in neighbor_ipv6.split(",") if n.strip()]
+                    if not neighbor_ipv4:  # Only enter router bgp if not already there
+                        vtysh_commands.append(f"router bgp {bgp_asn}")
+                    for neighbor_ip in neighbors_ipv6:
+                        vtysh_commands.append(f"neighbor {neighbor_ip} shutdown")
+                        logger.info(f"[FRR STOP] Shutting down BGP IPv6 neighbor: {neighbor_ip}")
+                    if not neighbor_ipv4:
+                        vtysh_commands.append("exit")
+                
+            # Shutdown OSPF if configured
+            if ospf_config:
+                area_id = ospf_config.get("area_id", "0.0.0.0")
+                ipv4_enabled = ospf_config.get("ipv4_enabled", False)
+                ipv6_enabled = ospf_config.get("ipv6_enabled", False)
+                
+                # Try to get device IP from database to calculate network
+                ipv4_network = None
+                if ipv4_enabled:
+                    try:
+                        from utils.device_database import DeviceDatabase
+                        device_db = DeviceDatabase()
+                        device_data = device_db.get_device(device_id)
+                        if device_data and device_data.get("ipv4_address"):
+                            import ipaddress
+                            ipv4_addr = device_data["ipv4_address"]
+                            ipv4_mask = device_data.get("ipv4_mask", "24")
+                            network = ipaddress.IPv4Network(f"{ipv4_addr}/{ipv4_mask}", strict=False)
+                            ipv4_network = str(network)
+                            logger.info(f"[FRR STOP] Calculated IPv4 network from database: {ipv4_network}")
+                    except Exception as e:
+                        logger.warning(f"[FRR STOP] Failed to get network from database: {e}")
+                
+                # Shutdown IPv4 OSPF - remove network and shutdown router
+                if ipv4_enabled:
+                    vtysh_commands.extend([
+                        "router ospf",
+                    ])
+                    if ipv4_network:
+                        vtysh_commands.append(f"no network {ipv4_network} area {area_id}")
+                        logger.info(f"[FRR STOP] Removing network {ipv4_network} from OSPF area {area_id}")
+                    vtysh_commands.extend([
+                        "shutdown",
+                        "exit"
+                    ])
+                    logger.info(f"[FRR STOP] Shutting down OSPF IPv4")
+                
+                # Shutdown IPv6 OSPF - remove interface from area and shutdown router
+                if ipv6_enabled:
+                    vtysh_commands.extend([
+                        "router ospf6",
+                        "shutdown",
+                        "exit",
+                        f"interface {iface_name}",
+                        f"no ipv6 ospf6 area {area_id}",
+                        "exit"
+                    ])
+                    logger.info(f"[FRR STOP] Shutting down OSPF IPv6 and removing interface from area")
+            
+            # Shutdown ISIS if configured
+            if isis_config:
+                ipv4_enabled = isis_config.get("ipv4_enabled", False)
+                ipv6_enabled = isis_config.get("ipv6_enabled", False)
+                
+                # Remove ISIS from interface first
+                vtysh_commands.append(f"interface {iface_name}")
+                if ipv4_enabled:
+                    vtysh_commands.append("no ip router isis CORE")
+                    logger.info(f"[FRR STOP] Removing IPv4 ISIS from interface {iface_name}")
+                if ipv6_enabled:
+                    vtysh_commands.append("no ipv6 router isis CORE")
+                    logger.info(f"[FRR STOP] Removing IPv6 ISIS from interface {iface_name}")
+                vtysh_commands.append("exit")
+                
+                # Shutdown ISIS router process (always shutdown if ISIS is configured)
+                vtysh_commands.extend([
+                    "router isis CORE",
+                    "shutdown",
+                    "exit"
+                ])
+                logger.info(f"[FRR STOP] Shutting down ISIS process")
+            
+            # Shutdown interface inside container
+            vtysh_commands.extend([
+                f"interface {iface_name}",
+                "shutdown",  # Shutdown interface in FRR
+                "exit",
+                "end",
+                "write"
+            ])
+            logger.info(f"[FRR STOP] Shutting down interface {iface_name} inside container")
+            
+            # Also bring down interface using ip command (redundant but ensures it's down)
+            try:
+                container.exec_run(["ip", "link", "set", iface_name, "down"])
+                logger.info(f"[FRR STOP] Brought down interface {iface_name} using ip command")
+            except Exception as e:
+                logger.warning(f"[FRR STOP] Failed to bring down interface using ip command: {e}")
+            
+            # Execute vtysh commands
+            config_commands = "\n".join(vtysh_commands)
+            exec_cmd = f"vtysh << 'EOF'\n{config_commands}\nEOF"
+            
+            logger.info(f"[FRR STOP] Executing protocol shutdown commands:\n{config_commands}")
+            result = container.exec_run(["bash", "-c", exec_cmd])
+            
+            if result.exit_code == 0:
+                logger.info(f"[FRR STOP] Successfully shut down protocols and interface in container {container_name}")
+                logger.info(f"[FRR STOP] Container {container_name} remains running (not removed)")
+            else:
+                output_str = result.output.decode('utf-8') if isinstance(result.output, bytes) else str(result.output)
+                logger.warning(f"[FRR STOP] Some commands failed (exit code {result.exit_code}): {output_str}")
+                # Still return True as long as container is running
+            
+            # Clear BGP sessions separately (exec-level command, not config-level)
+            if bgp_config:
+                neighbor_ipv4 = bgp_config.get("bgp_neighbor_ipv4", "")
+                neighbor_ipv6 = bgp_config.get("bgp_neighbor_ipv6", "")
+                neighbors_to_clear = []
+                if neighbor_ipv4:
+                    neighbors_to_clear.extend([n.strip() for n in neighbor_ipv4.split(",") if n.strip()])
+                if neighbor_ipv6:
+                    neighbors_to_clear.extend([n.strip() for n in neighbor_ipv6.split(",") if n.strip()])
+                
+                # Clear BGP sessions after shutdown
+                for neighbor_ip in neighbors_to_clear:
+                    try:
+                        clear_result = container.exec_run(["vtysh", "-c", f"clear ip bgp {neighbor_ip}"])
+                        if clear_result.exit_code == 0:
+                            logger.info(f"[FRR STOP] Cleared BGP session with {neighbor_ip}")
+                        else:
+                            clear_output = clear_result.output.decode('utf-8') if isinstance(clear_result.output, bytes) else str(clear_result.output)
+                            logger.warning(f"[FRR STOP] Failed to clear BGP session with {neighbor_ip}: {clear_output}")
+                    except Exception as e:
+                        logger.warning(f"[FRR STOP] Exception clearing BGP session with {neighbor_ip}: {e}")
+            
+            # Verify container is still running
+            container.reload()
+            if container.status == "running":
+                logger.info(f"[FRR STOP] ✅ Container {container_name} is still running (as intended)")
+            else:
+                logger.warning(f"[FRR STOP] ⚠️ Container {container_name} status is {container.status} (expected: running)")
             
             return True
             
         except Exception as e:
-            logger.error(f"[FRR] Failed to stop FRR container for device {device_id}: {e}")
+            logger.error(f"[FRR STOP] Failed to stop FRR protocols for device {device_id}: {e}")
+            import traceback
+            logger.error(f"[FRR STOP] Traceback: {traceback.format_exc()}")
+            return False
+    
+    def restore_frr_container(self, container_name: str, bgp_config: dict = None, ospf_config: dict = None, isis_config: dict = None, interface: str = None, vlan: str = None, ipv4: str = None, ipv6: str = None) -> bool:
+        """
+        Restore FRR protocols and bring up interface inside container (revert stop changes).
+        
+        This method reverts the changes made by stop_frr_container:
+        - Brings up interface inside container
+        - Removes BGP neighbor shutdown commands (no shutdown)
+        - Restores OSPF (no shutdown)
+        - Restores ISIS (re-add to interface)
+        
+        Args:
+            container_name: Container name
+            bgp_config: BGP configuration dict
+            ospf_config: OSPF configuration dict
+            isis_config: ISIS configuration dict
+            interface: Physical interface name
+            vlan: VLAN ID (if applicable)
+            ipv4: IPv4 address with mask (e.g., "192.168.0.2/24")
+            ipv6: IPv6 address with mask (e.g., "2001:db8::2/64")
+        
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            container = self.client.containers.get(container_name)
+            
+            # Check if container is running, if not start it
+            if container.status != "running":
+                logger.info(f"[FRR RESTORE] Container {container_name} is not running, starting it...")
+                container.start()
+                time.sleep(3)  # Wait for container to be ready
+            
+            logger.info(f"[FRR RESTORE] Restoring protocols and interface in container {container_name}")
+            
+            # Determine interface name (with VLAN if applicable)
+            iface_name = f"vlan{vlan}" if (vlan and vlan != "0") else (interface or "eth0")
+            logger.info(f"[FRR RESTORE] Using interface: {iface_name}")
+            
+            # Build vtysh commands to restore protocols and interface
+            vtysh_commands = ["configure terminal"]
+            
+            # Restore BGP if configured (remove shutdown commands)
+            if bgp_config:
+                bgp_asn = bgp_config.get("bgp_asn", "65000")
+                neighbor_ipv4 = bgp_config.get("bgp_neighbor_ipv4", "")
+                neighbor_ipv6 = bgp_config.get("bgp_neighbor_ipv6", "")
+                
+                # Remove shutdown for IPv4 BGP neighbors
+                if neighbor_ipv4:
+                    neighbors_ipv4 = [n.strip() for n in neighbor_ipv4.split(",") if n.strip()]
+                    vtysh_commands.append(f"router bgp {bgp_asn}")
+                    for neighbor_ip in neighbors_ipv4:
+                        vtysh_commands.append(f"no neighbor {neighbor_ip} shutdown")
+                        logger.info(f"[FRR RESTORE] Removing shutdown for BGP IPv4 neighbor: {neighbor_ip}")
+                    vtysh_commands.append("exit")
+                
+                # Remove shutdown for IPv6 BGP neighbors
+                if neighbor_ipv6:
+                    neighbors_ipv6 = [n.strip() for n in neighbor_ipv6.split(",") if n.strip()]
+                    if not neighbor_ipv4:  # Only enter router bgp if not already there
+                        vtysh_commands.append(f"router bgp {bgp_asn}")
+                    for neighbor_ip in neighbors_ipv6:
+                        vtysh_commands.append(f"no neighbor {neighbor_ip} shutdown")
+                        logger.info(f"[FRR RESTORE] Removing shutdown for BGP IPv6 neighbor: {neighbor_ip}")
+                    if not neighbor_ipv4:
+                        vtysh_commands.append("exit")
+            
+            # Restore OSPF if configured (re-add network and remove shutdown)
+            if ospf_config:
+                area_id = ospf_config.get("area_id", "0.0.0.0")
+                ipv4_enabled = ospf_config.get("ipv4_enabled", False)
+                ipv6_enabled = ospf_config.get("ipv6_enabled", False)
+                
+                # Try to get device IP from database to calculate network for IPv4 OSPF
+                ipv4_network = None
+                if ipv4_enabled:
+                    try:
+                        # Extract device_id from container_name (format: ostg-frr-{device_id})
+                        device_id = None
+                        if container_name.startswith(self.container_prefix + "-"):
+                            device_id = container_name[len(self.container_prefix + "-"):]
+                        
+                        if device_id:
+                            from utils.device_database import DeviceDatabase
+                            device_db = DeviceDatabase()
+                            device_data = device_db.get_device(device_id)
+                            if device_data and device_data.get("ipv4_address"):
+                                import ipaddress
+                                ipv4_addr = device_data["ipv4_address"]
+                                ipv4_mask = device_data.get("ipv4_mask", "24")
+                                network = ipaddress.IPv4Network(f"{ipv4_addr}/{ipv4_mask}", strict=False)
+                                ipv4_network = str(network)
+                                logger.info(f"[FRR RESTORE] Calculated IPv4 network from database: {ipv4_network}")
+                        elif ipv4:
+                            # Fallback: try to extract network from ipv4 parameter (format: "192.168.0.2/24")
+                            try:
+                                import ipaddress
+                                if "/" in ipv4:
+                                    network = ipaddress.IPv4Network(ipv4, strict=False)
+                                    ipv4_network = str(network)
+                                    logger.info(f"[FRR RESTORE] Calculated IPv4 network from ipv4 parameter: {ipv4_network}")
+                            except Exception as e:
+                                logger.warning(f"[FRR RESTORE] Failed to calculate network from ipv4 parameter: {e}")
+                    except Exception as e:
+                        logger.warning(f"[FRR RESTORE] Failed to get network from database: {e}")
+                
+                # Restore IPv4 OSPF - re-add network and remove shutdown
+                if ipv4_enabled:
+                    vtysh_commands.extend([
+                        "router ospf",
+                    ])
+                    if ipv4_network:
+                        vtysh_commands.append(f"network {ipv4_network} area {area_id}")
+                        logger.info(f"[FRR RESTORE] Re-adding network {ipv4_network} to OSPF area {area_id}")
+                    vtysh_commands.extend([
+                        "no shutdown",
+                        "exit"
+                    ])
+                    logger.info(f"[FRR RESTORE] Restoring OSPF IPv4 (re-added network and removed shutdown)")
+                
+                # Restore IPv6 OSPF - re-add interface area binding and remove shutdown
+                if ipv6_enabled:
+                    # First add interface area binding, then remove shutdown
+                    vtysh_commands.extend([
+                        f"interface {iface_name}",
+                        f"ipv6 ospf6 area {area_id}",
+                        "exit",
+                        "router ospf6",
+                        "no shutdown",
+                        "exit"
+                    ])
+                    logger.info(f"[FRR RESTORE] Restoring OSPF IPv6 (re-added interface area binding and removed shutdown)")
+            
+            # Bring up interface inside container first (before restoring ISIS)
+            vtysh_commands.extend([
+                f"interface {iface_name}",
+                "no shutdown",  # Bring up interface in FRR
+            ])
+            logger.info(f"[FRR RESTORE] Bringing up interface {iface_name} inside container")
+            
+            # Restore ISIS if configured (re-add to interface after bringing it up)
+            if isis_config:
+                ipv4_enabled = isis_config.get("ipv4_enabled", False)
+                ipv6_enabled = isis_config.get("ipv6_enabled", False)
+                
+                if ipv4_enabled:
+                    vtysh_commands.append("ip router isis CORE")
+                    logger.info(f"[FRR RESTORE] Restoring IPv4 ISIS on interface {iface_name}")
+                if ipv6_enabled:
+                    vtysh_commands.append("ipv6 router isis CORE")
+                    logger.info(f"[FRR RESTORE] Restoring IPv6 ISIS on interface {iface_name}")
+            
+            # Exit interface configuration
+            vtysh_commands.extend([
+                "exit",
+                "end",
+                "write"
+            ])
+            
+            # Also bring up interface using ip command (redundant but ensures it's up)
+            try:
+                container.exec_run(["ip", "link", "set", iface_name, "up"])
+                logger.info(f"[FRR RESTORE] Brought up interface {iface_name} using ip command")
+            except Exception as e:
+                logger.warning(f"[FRR RESTORE] Failed to bring up interface using ip command: {e}")
+            
+            # Execute vtysh commands
+            config_commands = "\n".join(vtysh_commands)
+            exec_cmd = f"vtysh << 'EOF'\n{config_commands}\nEOF"
+            
+            logger.info(f"[FRR RESTORE] Executing protocol restore commands:\n{config_commands}")
+            result = container.exec_run(["bash", "-c", exec_cmd])
+            
+            if result.exit_code == 0:
+                logger.info(f"[FRR RESTORE] Successfully restored protocols and interface in container {container_name}")
+            else:
+                output_str = result.output.decode('utf-8') if isinstance(result.output, bytes) else str(result.output)
+                logger.warning(f"[FRR RESTORE] Some commands failed (exit code {result.exit_code}): {output_str}")
+                # Still return True if interface was brought up
+            
+            # Verify container is still running
+            container.reload()
+            if container.status == "running":
+                logger.info(f"[FRR RESTORE] ✅ Container {container_name} is running and protocols restored")
+            else:
+                logger.warning(f"[FRR RESTORE] ⚠️ Container {container_name} status is {container.status} (expected: running)")
+            
+            return True
+            
+        except Exception as e:
+            logger.error(f"[FRR RESTORE] Failed to restore FRR protocols for container {container_name}: {e}")
+            import traceback
+            logger.error(f"[FRR RESTORE] Traceback: {traceback.format_exc()}")
+            return False
+    
+    def remove_frr_container(self, device_id: str, device_name: str = None) -> bool:
+        """
+        Stop and remove FRR Docker container for a device.
+        
+        This method actually stops and removes the container (unlike stop_frr_container which keeps it running).
+        
+        Args:
+            device_id: Device ID
+            device_name: Device name (optional)
+        
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            container_name = self._get_container_name(device_id, device_name)
+            
+            # Try to get and remove container
+            try:
+                container = self.client.containers.get(container_name)
+                
+                # Stop container if it's running
+                if container.status == "running":
+                    logger.info(f"[FRR REMOVE] Stopping container {container_name}...")
+                    container.stop()
+                    logger.info(f"[FRR REMOVE] Container {container_name} stopped")
+                
+                # Remove container
+                logger.info(f"[FRR REMOVE] Removing container {container_name}...")
+                container.remove(force=True)
+                logger.info(f"[FRR REMOVE] ✅ Successfully removed container {container_name}")
+                return True
+                
+            except docker.errors.NotFound:
+                logger.info(f"[FRR REMOVE] Container {container_name} not found (already removed)")
+                return True  # Container doesn't exist, consider it successful
+                
+        except Exception as e:
+            logger.error(f"[FRR REMOVE] Failed to remove FRR container for device {device_id}: {e}")
+            import traceback
+            logger.error(f"[FRR REMOVE] Traceback: {traceback.format_exc()}")
             return False
 
 # Global instance
@@ -352,9 +780,13 @@ def start_frr_container(device_id: str, device_config: Dict) -> Optional[str]:
     """Start FRR container for device."""
     return frr_manager.start_frr_container(device_id, device_config)
 
-def stop_frr_container(device_id: str, device_name: str = None) -> bool:
-    """Stop FRR container for device."""
-    return frr_manager.stop_frr_container(device_id, device_name)
+def stop_frr_container(device_id: str, device_name: str = None, protocols: list = None, bgp_config: dict = None, ospf_config: dict = None, isis_config: dict = None, interface: str = None, vlan: str = None) -> bool:
+    """Stop FRR protocols and shutdown interface (keep container running)."""
+    return frr_manager.stop_frr_container(device_id, device_name, protocols, bgp_config, ospf_config, isis_config, interface, vlan)
+
+def remove_frr_container(device_id: str, device_name: str = None) -> bool:
+    """Stop and remove FRR container for device."""
+    return frr_manager.remove_frr_container(device_id, device_name)
 
 def configure_bgp_neighbor(device_id: str, neighbor_config: Dict, device_name: str = None) -> bool:
     """Configure BGP neighbor in FRR container."""

@@ -579,21 +579,17 @@ def start_device():
                                 import time
                                 time.sleep(5)
                             else:
-                                logging.info(f"[DEVICE START] Container {container_name} is already running, reconfiguring protocols with updated configs")
+                                logging.info(f"[DEVICE START] Container {container_name} is already running, restoring protocols and interface")
                             
-                            # Always configure protocols with latest configs from payload (or database)
-                            # This ensures that after device edit, protocols are updated even if container was already running
                             # Get protocol configs from payload first (if provided), otherwise from database
                             import json
                             
                             # BGP config: prefer payload, fallback to database
-                            # Check if bgp_config is in payload (even if empty dict, we should check explicitly)
                             bgp_config = None
                             if "bgp_config" in data:
-                                bgp_config = data.get("bgp_config")  # Use directly, could be dict or empty dict
+                                bgp_config = data.get("bgp_config")
                                 logging.info(f"[DEVICE START] Using BGP config from payload: {bgp_config is not None}, has content: {bool(bgp_config)}")
                             if bgp_config is None:
-                                # Fallback to database
                                 bgp_config_raw = device_data.get("bgp_config", {})
                                 if isinstance(bgp_config_raw, str) and bgp_config_raw:
                                     try:
@@ -607,10 +603,9 @@ def start_device():
                             # OSPF config: prefer payload, fallback to database
                             ospf_config = None
                             if "ospf_config" in data:
-                                ospf_config = data.get("ospf_config")  # Use directly, could be dict or empty dict
+                                ospf_config = data.get("ospf_config")
                                 logging.info(f"[DEVICE START] Using OSPF config from payload: {ospf_config is not None}, has content: {bool(ospf_config)}")
                             if ospf_config is None:
-                                # Fallback to database
                                 ospf_config_raw = device_data.get("ospf_config", {})
                                 if isinstance(ospf_config_raw, str) and ospf_config_raw:
                                     try:
@@ -624,10 +619,9 @@ def start_device():
                             # ISIS config: prefer payload, fallback to database
                             isis_config = None
                             if "isis_config" in data:
-                                isis_config = data.get("isis_config")  # Use directly, could be dict or empty dict
+                                isis_config = data.get("isis_config")
                                 logging.info(f"[DEVICE START] Using ISIS config from payload: {isis_config is not None}, has content: {bool(isis_config)}")
                             if isis_config is None:
-                                # Fallback to database
                                 isis_config_raw = device_data.get("isis_config", {})
                                 if isinstance(isis_config_raw, str) and isis_config_raw:
                                     try:
@@ -638,7 +632,6 @@ def start_device():
                                     isis_config = isis_config_raw if isis_config_raw else {}
                                 logging.info(f"[DEVICE START] Using ISIS config from database: {bool(isis_config)}")
                             
-                            # Configure protocols in the container
                             # Use IP addresses from payload (latest from client) or fallback to database
                             ipv4_for_config = ipv4 if ipv4 else device_data.get('ipv4_address', '')
                             ipv4_mask_for_config = ipv4_mask if ipv4_mask else device_data.get('ipv4_mask', '24')
@@ -648,78 +641,53 @@ def start_device():
                             ipv6_mask_for_config = ipv6_mask if ipv6_mask else device_data.get('ipv6_mask', '64')
                             ipv6_full = f"{ipv6_for_config}/{ipv6_mask_for_config}" if ipv6_for_config else ""
                             
-                            if bgp_config:
-                                logging.info(f"[DEVICE START] Configuring BGP in container")
-                                frr_manager._configure_bgp_in_container_with_retry(container_name, bgp_config, ipv4_full, ipv6_full)
-                            if ospf_config:
-                                logging.info(f"[DEVICE START] Configuring OSPF in container")
-                                frr_manager._configure_ospf_in_container(container_name, ospf_config, ipv4_full, ipv6_full)
-                            if isis_config:
-                                logging.info(f"[DEVICE START] Configuring ISIS in container")
-                                isis_success = frr_manager._configure_isis_in_container(container_name, isis_config, ipv4_full, ipv6_full)
-                                if not isis_success:
-                                    logging.error(f"[DEVICE START] Failed to configure ISIS in container {container_name} for device {device_name}")
-                        except Exception:
-                            logging.info(f"[DEVICE START] Container {container_name} does not exist, creating it...")
-                            # Create container with device configuration
-                            device_config = {
-                                "device_name": device_name,
-                                "ipv4": ipv4,
-                                "ipv6": ipv6,
-                                "interface": iface,
-                                "vlan": vlan
-                            }
+                            # Restore protocols and interface (revert stop changes)
+                            logging.info(f"[DEVICE START] Restoring protocols and interface in container {container_name}")
+                            success = frr_manager.restore_frr_container(
+                                container_name=container_name,
+                                bgp_config=bgp_config,
+                                ospf_config=ospf_config,
+                                isis_config=isis_config,
+                                interface=iface,
+                                vlan=vlan,
+                                ipv4=ipv4_full,
+                                ipv6=ipv6_full
+                            )
                             
-                            # Get protocol configs from payload first (if provided), otherwise from database
-                            import json
-                            
-                            # BGP config: prefer payload, fallback to database
-                            bgp_config = data.get("bgp_config")
-                            if not bgp_config:
-                                bgp_config_raw = device_data.get("bgp_config", {})
-                                if isinstance(bgp_config_raw, str) and bgp_config_raw:
-                                    try:
-                                        bgp_config = json.loads(bgp_config_raw)
-                                    except:
-                                        bgp_config = {}
-                                else:
-                                    bgp_config = bgp_config_raw if bgp_config_raw else {}
-                            device_config["bgp_config"] = bgp_config
-                            
-                            # OSPF config: prefer payload, fallback to database
-                            ospf_config = data.get("ospf_config")
-                            if not ospf_config:
-                                ospf_config_raw = device_data.get("ospf_config", {})
-                                if isinstance(ospf_config_raw, str) and ospf_config_raw:
-                                    try:
-                                        ospf_config = json.loads(ospf_config_raw)
-                                    except:
-                                        ospf_config = {}
-                                else:
-                                    ospf_config = ospf_config_raw if ospf_config_raw else {}
-                            device_config["ospf_config"] = ospf_config
-                            
-                            # ISIS config: prefer payload, fallback to database
-                            isis_config = data.get("isis_config")
-                            if not isis_config:
-                                isis_config_raw = device_data.get("isis_config", {})
-                                if isinstance(isis_config_raw, str) and isis_config_raw:
-                                    try:
-                                        isis_config = json.loads(isis_config_raw)
-                                    except:
-                                        isis_config = {}
-                                else:
-                                    isis_config = isis_config_raw if isis_config_raw else {}
-                            device_config["isis_config"] = isis_config
-                            
-                            container_name = frr_manager.start_frr_container(device_id, device_config)
-                            if container_name:
-                                logging.info(f"[DEVICE START] Successfully created FRR container: {container_name}")
-                                # Wait for container to be ready
-                                import time
-                                time.sleep(5)
+                            if success:
+                                logging.info(f"[DEVICE START] Successfully restored protocols and interface for {device_name}")
+                                
+                                # Clear manual override flags so monitors can immediately update status
+                                try:
+                                    now = datetime.now(timezone.utc).isoformat()
+                                    clear_override_data = {
+                                        'bgp_manual_override': False,
+                                        'bgp_manual_override_time': None,
+                                        'ospf_manual_override': False,
+                                        'ospf_manual_override_time': None,
+                                        'isis_manual_override': False,
+                                        'isis_manual_override_time': None,
+                                    }
+                                    device_db.update_device(device_id, clear_override_data)
+                                    logging.info(f"[DEVICE START] Cleared manual override flags for {device_name} to allow immediate monitor updates")
+                                except Exception as e:
+                                    logging.warning(f"[DEVICE START] Failed to clear manual override flags: {e}")
                             else:
-                                logging.warning(f"[DEVICE START] Failed to create FRR container for device {device_name}")
+                                logging.warning(f"[DEVICE START] Failed to restore some protocols for {device_name}")
+                        except Exception as container_error:
+                            # Check if it's a NotFound error (container doesn't exist)
+                            error_str = str(container_error).lower()
+                            error_type = type(container_error).__name__
+                            
+                            if "notfound" in error_str or "not found" in error_str or "NotFound" in error_type:
+                                logging.error(f"[DEVICE START] Container {container_name} does not exist - cannot start device without existing container")
+                                return jsonify({"error": f"Container not found for device {device_name}. Device must be applied first."}), 404
+                            
+                            # Log and re-raise other exceptions
+                            logging.error(f"[DEVICE START] Error restoring protocols for {device_name}: {container_error}")
+                            import traceback
+                            logging.error(f"[DEVICE START] Traceback: {traceback.format_exc()}")
+                            raise
         except Exception as e:
             logging.error(f"[DEVICE START] Failed to auto-restore protocols: {e}")
             import traceback
@@ -2408,22 +2376,90 @@ def stop_device():
             "interface": interface,
         }
         
-        # Stop FRR container (this stops all protocols automatically)
+        # Stop FRR protocols and shutdown interface (keep container running)
         try:
             from utils.frr_docker import FRRDockerManager
+            import json
+            
+            # First, check if device exists in database
+            device_info = device_db.get_device(device_id)
+            if not device_info:
+                logging.warning(f"[DEVICE STOP] Device {device_id} not found in database")
+                return jsonify({"error": "Device not found"}), 404
             
             frr_manager = FRRDockerManager()
             container_name = frr_manager._get_container_name(device_id, device_name)
             
-            logging.info(f"[DEVICE STOP] Stopping FRR container {container_name} for device {device_name}")
+            logging.info(f"[DEVICE STOP] Shutting down protocols and interface for device {device_name} (container: {container_name})")
             
-            container_stopped = frr_manager.stop_frr_container(device_id, device_name)
+            # Get protocol configs from payload first (if provided), otherwise from database
+            bgp_config = data.get("bgp_config")
+            ospf_config = data.get("ospf_config")
+            isis_config = data.get("isis_config")
+            
+            # Parse BGP config if from database
+            if not bgp_config:
+                bgp_config_raw = device_info.get("bgp_config", {})
+                if isinstance(bgp_config_raw, str) and bgp_config_raw:
+                    try:
+                        bgp_config = json.loads(bgp_config_raw)
+                    except:
+                        bgp_config = {}
+                else:
+                    bgp_config = bgp_config_raw if bgp_config_raw else {}
+            
+            # Parse OSPF config if from database
+            if not ospf_config:
+                ospf_config_raw = device_info.get("ospf_config", {})
+                if isinstance(ospf_config_raw, str) and ospf_config_raw:
+                    try:
+                        ospf_config = json.loads(ospf_config_raw)
+                    except:
+                        ospf_config = {}
+                else:
+                    ospf_config = ospf_config_raw if ospf_config_raw else {}
+            
+            # Parse ISIS config if from database
+            if not isis_config:
+                isis_config_raw = device_info.get("isis_config", {})
+                if isinstance(isis_config_raw, str) and isis_config_raw:
+                    try:
+                        isis_config = json.loads(isis_config_raw)
+                    except:
+                        isis_config = {}
+                else:
+                    isis_config = isis_config_raw if isis_config_raw else {}
+            
+            # Only include configs that are not empty
+            if bgp_config and not bgp_config.get("bgp_neighbor_ipv4") and not bgp_config.get("bgp_neighbor_ipv6"):
+                bgp_config = None
+            if ospf_config and not ospf_config.get("area_id"):
+                ospf_config = None
+            if isis_config and not isis_config.get("area_id"):
+                isis_config = None
+            
+            logging.info(f"[DEVICE STOP] Protocol configs - BGP: {bool(bgp_config)}, OSPF: {bool(ospf_config)}, ISIS: {bool(isis_config)}")
+            
+            # Stop protocols and shutdown interface (keep container running)
+            container_stopped = frr_manager.stop_frr_container(
+                device_id=device_id,
+                device_name=device_name,
+                protocols=protocols,
+                bgp_config=bgp_config,
+                ospf_config=ospf_config,
+                isis_config=isis_config,
+                interface=interface,
+                vlan=vlan
+            )
+            
             if container_stopped:
-                logging.info(f"[DEVICE STOP] Successfully stopped FRR container for {device_name}")
+                logging.info(f"[DEVICE STOP] Successfully shut down protocols and interface for {device_name}")
                 result["container_stopped"] = True
+                result["protocols_shutdown"] = True
                 
-                # Update all protocol statuses in database to reflect container stop
+                # Update all protocol statuses in database to reflect protocols stopped
                 try:
+                    now = datetime.now(timezone.utc).isoformat()
                     update_data = {
                         # BGP status
                         'bgp_established': False,
@@ -2431,6 +2467,8 @@ def stop_device():
                         'bgp_ipv4_state': 'Idle',
                         'bgp_ipv6_established': False,
                         'bgp_ipv6_state': 'Idle',
+                        'bgp_manual_override': True,  # Prevent monitor from overriding
+                        'bgp_manual_override_time': now,
                         # OSPF status
                         'ospf_established': False,
                         'ospf_state': 'Down',
@@ -2439,59 +2477,40 @@ def stop_device():
                         'ospf_ipv6_running': False,
                         'ospf_ipv6_established': False,
                         'ospf_neighbors': None,
+                        'ospf_manual_override': True,  # Prevent monitor from overriding
+                        'ospf_manual_override_time': now,
                         # ISIS status
                         'isis_running': False,
                         'isis_state': 'Down',
                         'isis_established': False,
                         'isis_neighbors': None,
+                        'isis_manual_override': True,  # Prevent monitor from overriding
+                        'isis_manual_override_time': now,
                         # Update timestamps
-                        'last_bgp_check': datetime.now(timezone.utc).isoformat(),
-                        'last_ospf_check': datetime.now(timezone.utc).isoformat(),
-                        'last_isis_check': datetime.now(timezone.utc).isoformat(),
+                        'last_bgp_check': now,
+                        'last_ospf_check': now,
+                        'last_isis_check': now,
                     }
                     device_db.update_device(device_id, update_data)
-                    logging.info(f"[DEVICE STOP] Updated all protocol statuses to stopped in database for {device_name}")
+                    logging.info(f"[DEVICE STOP] Updated all protocol statuses to stopped in database for {device_name} with manual override flags")
                 except Exception as e:
                     logging.warning(f"[DEVICE STOP] Failed to update protocol statuses in database: {e}")
             else:
-                logging.warning(f"[DEVICE STOP] Failed to stop FRR container for {device_name}")
+                logging.warning(f"[DEVICE STOP] Failed to shutdown protocols for {device_name}")
                 result["container_stopped"] = False
+                result["protocols_shutdown"] = False
         except Exception as e:
-            logging.error(f"[DEVICE STOP] Error stopping FRR container for {device_name}: {e}")
+            logging.error(f"[DEVICE STOP] Error shutting down protocols for {device_name}: {e}")
+            import traceback
+            logging.error(f"[DEVICE STOP] Traceback: {traceback.format_exc()}")
             result["container_stopped"] = False
+            result["protocols_shutdown"] = False
         
-        # Shutdown the associated interface (bring interface down)
-        try:
-            # Build interface name (with VLAN if applicable)
-            if vlan and vlan != "0":
-                iface_name = f"vlan{vlan}"
-            else:
-                iface_name = interface
-            
-            if iface_name:
-                # Bring interface down using ip link set down
-                shutdown_result = subprocess.run(
-                    ["ip", "link", "set", iface_name, "down"],
-                    capture_output=True,
-                    text=True,
-                    timeout=5
-                )
-                
-                if shutdown_result.returncode == 0:
-                    logging.info(f"[DEVICE STOP] Interface {iface_name} shut down for device {device_name}")
-                    result["interface_shutdown"] = True
-                else:
-                    logging.warning(f"[DEVICE STOP] Failed to shutdown interface {iface_name}: {shutdown_result.stderr}")
-                    result["interface_shutdown"] = False
-            else:
-                logging.warning(f"[DEVICE STOP] No interface specified for device {device_name}")
-                result["interface_shutdown"] = False
-                
-        except Exception as e:
-            logging.warning(f"[DEVICE STOP] Failed to shutdown interface for {device_name}: {e}")
-            result["interface_shutdown"] = False
-        
-        logging.info(f"[DEVICE STOP] Device {device_name} stopped (interface down, protocols stopped)")
+        # Note: We do NOT shutdown the interface on the host, as this would affect other devices
+        # using the same physical interface with different VLANs. The interface shutdown inside
+        # the container is sufficient to stop the device's operation.
+        logging.info(f"[DEVICE STOP] Device {device_name} stopped (protocols stopped, interface down inside container)")
+        result["interface_shutdown"] = True  # Interface is shut down inside container, not on host
         
         # Update device status in database and ensure all protocol statuses are cleared
         try:
@@ -2499,6 +2518,7 @@ def stop_device():
             device_db.update_device_status(device_id, "Stopped")
             
             # Then ensure all protocol statuses are cleared (in case container wasn't running)
+            now = datetime.now(timezone.utc).isoformat()
             update_data = {
                 # BGP status
                 'bgp_established': False,
@@ -2506,6 +2526,8 @@ def stop_device():
                 'bgp_ipv4_state': 'Idle',
                 'bgp_ipv6_established': False,
                 'bgp_ipv6_state': 'Idle',
+                'bgp_manual_override': True,  # Prevent monitor from overriding
+                'bgp_manual_override_time': now,
                 # OSPF status
                 'ospf_established': False,
                 'ospf_state': 'Down',
@@ -2514,18 +2536,22 @@ def stop_device():
                 'ospf_ipv6_running': False,
                 'ospf_ipv6_established': False,
                 'ospf_neighbors': None,
+                'ospf_manual_override': True,  # Prevent monitor from overriding
+                'ospf_manual_override_time': now,
                 # ISIS status
                 'isis_running': False,
                 'isis_state': 'Down',
                 'isis_established': False,
                 'isis_neighbors': None,
+                'isis_manual_override': True,  # Prevent monitor from overriding
+                'isis_manual_override_time': now,
                 # Update timestamps
-                'last_bgp_check': datetime.now(timezone.utc).isoformat(),
-                'last_ospf_check': datetime.now(timezone.utc).isoformat(),
-                'last_isis_check': datetime.now(timezone.utc).isoformat(),
+                'last_bgp_check': now,
+                'last_ospf_check': now,
+                'last_isis_check': now,
             }
             device_db.update_device(device_id, update_data)
-            logging.info(f"[DEVICE DB] Device {device_id} status updated to Stopped and all protocol statuses cleared")
+            logging.info(f"[DEVICE DB] Device {device_id} status updated to Stopped and all protocol statuses cleared with manual override flags")
         except Exception as e:
             logging.warning(f"[DEVICE DB] Failed to update device {device_id} status: {e}")
             # Don't fail device stop if database operation fails
@@ -2561,9 +2587,9 @@ def remove_device():
         # Stop and remove FRR Docker container for this device
         container_removed = False
         try:
-            from utils.frr_docker import stop_frr_container
+            from utils.frr_docker import remove_frr_container
             
-            success = stop_frr_container(device_id, device_name)
+            success = remove_frr_container(device_id, device_name)
             if success:
                 logging.info(f"[DEVICE REMOVE] FRR container stopped and removed for {device_name} ({device_id})")
                 container_removed = True

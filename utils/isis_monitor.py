@@ -7,23 +7,26 @@ Monitors ISIS status and updates the database periodically.
 import logging
 import json
 import time
-from typing import Dict, List, Any
+from typing import Dict, List, Any, Optional
 from datetime import datetime, timezone
 from threading import Thread, Event
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 logger = logging.getLogger(__name__)
 
 class ISISMonitor:
     """ISIS status monitor that runs in background."""
     
-    def __init__(self, device_db):
+    def __init__(self, device_db, max_workers: int = 5):
         """
         Initialize ISIS monitor.
         
         Args:
             device_db: DeviceDatabase instance
+            max_workers: Maximum number of worker threads for parallel checking
         """
         self.device_db = device_db
+        self.max_workers = max_workers
         self.monitoring_active = False
         self.monitor_thread = None
         self.stop_event = Event()
@@ -74,74 +77,37 @@ class ISISMonitor:
         
         while not self.stop_event.is_set():
             try:
-                # Get all devices with ISIS configured
-                devices = self.device_db.get_all_devices()
-                isis_devices = []
+                # Get all devices with ISIS configured using helper method
+                devices = self._get_isis_devices()
                 
-                for device in devices:
-                    # Check if device has ISIS in protocols list OR has ISIS config
-                    protocols = device.get("protocols", [])
-                    if isinstance(protocols, str):
-                        import json
-                        try:
-                            protocols = json.loads(protocols)
-                        except:
-                            protocols = []
-                    
-                    has_isis_protocol = isinstance(protocols, list) and any(
-                        p.upper() in ["IS-IS", "ISIS", "ISIS"] for p in protocols
-                    )
-                    
-                    # Check if device has ISIS configuration
-                    isis_config = device.get("isis_config") or device.get("is_is_config")
-                    has_isis_config = False
-                    if isis_config and isis_config != '{}':
-                        try:
-                            # Try to parse as JSON if it's a string
-                            if isinstance(isis_config, str):
-                                import json
-                                isis_config = json.loads(isis_config)
-                            # If it's a non-empty dict, mark as having config
-                            if isis_config and isinstance(isis_config, dict):
-                                has_isis_config = True
-                        except:
-                            # If parsing fails but there's a value, still mark as having config
-                            if isis_config:
-                                has_isis_config = True
-                    
-                    # Include device if it has ISIS protocol or ISIS config
-                    # This ensures we check devices with ISIS enabled, even if config is empty
-                    # and can clear stale status from database
-                    if has_isis_protocol or has_isis_config:
-                        isis_devices.append(device)
-                
-                if isis_devices:
-                    logger.info(f"[ISIS MONITOR] Checking ISIS status for {len(isis_devices)} devices")
-                    
-                    for device in isis_devices:
-                        if self.stop_event.is_set():
-                            break
-                            
-                        device_id = device.get("device_id")
-                        device_name = device.get("device_name") or device.get("Device Name", "Unknown")
-                        
-                        if device_id:
-                            self._check_device_isis_status(device_id, device_name)
-                
-                logger.info(f"[ISIS MONITOR] Periodic ISIS status check completed for {len(isis_devices)} devices")
+                if devices:
+                    logger.info(f"[ISIS MONITOR] Checking ISIS status for {len(devices)} devices")
+                    self._check_isis_status_batch(devices)
+                    logger.info(f"[ISIS MONITOR] Periodic ISIS status check completed for {len(devices)} devices")
                 
             except Exception as e:
                 logger.error(f"[ISIS MONITOR] Error in monitoring loop: {e}")
+                # Wait a bit before retrying on error
+                if self.stop_event.wait(5):
+                    break
+                continue
             
-            # Wait for next check
-            self.stop_event.wait(interval)
+            # Wait for next check interval (after checking, like OSPF/BGP)
+            if self.stop_event.wait(interval):
+                break
         
         logger.info("[ISIS MONITOR] Monitoring loop stopped")
     
-    def _check_device_isis_status(self, device_id: str, device_name: str):
-        """Check ISIS status for a specific device."""
+    def _check_single_device_isis_status(self, device: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Check ISIS status for a single device."""
+        device_id = device.get("device_id")
+        device_name = device.get("device_name") or device.get("Device Name", "Unknown")
+        
+        if not device_id:
+            return None
+        
         try:
-            # Check if there's a manual override in place
+            # Check if there's a manual override in place (before making API calls)
             device_data = self.device_db.get_device(device_id)
             if device_data:
                 manual_override = device_data.get('isis_manual_override', False)
@@ -156,7 +122,7 @@ class ISISMonitor:
                         
                         if time_diff < 120:  # 2 minutes
                             logger.info(f"[ISIS MONITOR] Skipping update for device {device_id} - manual override active ({time_diff:.1f}s ago)")
-                            return
+                            return None
                         else:
                             logger.info(f"[ISIS MONITOR] Manual override expired for device {device_id} ({time_diff:.1f}s ago), proceeding with update")
                     except Exception as e:
@@ -176,8 +142,8 @@ class ISISMonitor:
                 container = frr_manager.client.containers.get(container_name)
                 if container.status != "running":
                     logger.warning(f"[ISIS MONITOR] Container {container_name} exists but not running, ISIS cannot be running")
-                    # Clear ISIS status in database
-                    isis_status = {
+                    # Return error status
+                    return {
                         "isis_running": False,
                         "isis_established": False,
                         "isis_state": "Down",
@@ -187,12 +153,10 @@ class ISISMonitor:
                         "net": "",
                         "uptime": None
                     }
-                    self._update_device_isis_status(device_id, isis_status)
-                    return
             except docker.errors.NotFound:
                 logger.warning(f"[ISIS MONITOR] Container {container_name} not found, ISIS cannot be running")
-                # Clear ISIS status in database
-                isis_status = {
+                # Return error status
+                return {
                     "isis_running": False,
                     "isis_established": False,
                     "isis_state": "Down",
@@ -202,20 +166,48 @@ class ISISMonitor:
                     "net": "",
                     "uptime": None
                 }
-                self._update_device_isis_status(device_id, isis_status)
-                return
             except Exception as e:
                 logger.error(f"[ISIS MONITOR] Error checking container {container_name}: {e}")
                 # Still try to get ISIS status, but it will likely fail and return error state
             
             # Get ISIS status from FRR
             isis_status = get_isis_status(device_id, device_name, container_name)
-            
-            # Update database
-            self._update_device_isis_status(device_id, isis_status)
+            return isis_status
             
         except Exception as e:
             logger.error(f"[ISIS MONITOR] Error checking ISIS status for device {device_id}: {e}")
+            return None
+    
+    def _check_isis_status_batch(self, devices: List[Dict[str, Any]]):
+        """Check ISIS status for multiple devices in parallel."""
+        try:
+            logger.info(f"[ISIS MONITOR] Starting batch ISIS status check for {len(devices)} devices")
+            
+            with ThreadPoolExecutor(max_workers=self.max_workers) as executor:
+                # Submit all ISIS status check tasks
+                future_to_device = {
+                    executor.submit(self._check_single_device_isis_status, device): device
+                    for device in devices
+                }
+                
+                logger.info(f"[ISIS MONITOR] Submitted {len(future_to_device)} ISIS status check tasks")
+                
+                # Process completed tasks
+                for future in as_completed(future_to_device):
+                    device = future_to_device[future]
+                    device_id = device.get("device_id", "unknown")
+                    try:
+                        isis_status = future.result()
+                        if isis_status:
+                            logger.info(f"[ISIS MONITOR] Got ISIS status for device {device_id}")
+                            self._update_device_isis_status(device_id, isis_status)
+                        else:
+                            logger.info(f"[ISIS MONITOR] No ISIS status returned for device {device_id}")
+                    except Exception as e:
+                        logger.error(f"[ISIS MONITOR] Error checking ISIS status for device {device_id}: {e}")
+                        
+        except Exception as e:
+            logger.error(f"[ISIS MONITOR] Error in batch ISIS status check: {e}")
     
     def _update_device_isis_status(self, device_id: str, isis_status: Dict[str, Any]):
         """Update ISIS status in database for a device."""
@@ -309,18 +301,17 @@ class ISISMonitor:
             import traceback
             logger.error(f"[ISIS MONITOR] Traceback: {traceback.format_exc()}")
     
-    def force_check(self):
-        """Force an immediate ISIS status check for all devices with ISIS configured."""
-        if not self.monitoring_active:
-            logger.warning("[ISIS MONITOR] Monitor is not active, cannot force check")
-            return
-        
+    def _get_isis_devices(self) -> List[Dict[str, Any]]:
+        """Get all devices with ISIS configured (only running devices, like BGP/OSPF)."""
         try:
-            # Get all devices with ISIS configured
             devices = self.device_db.get_all_devices()
             isis_devices = []
             
             for device in devices:
+                # Only check running devices (like BGP monitor does)
+                if device.get('status') != 'Running':
+                    continue
+                
                 # Check if device has ISIS in protocols list OR has ISIS config
                 protocols = device.get("protocols", [])
                 if isinstance(protocols, str):
@@ -349,20 +340,23 @@ class ISISMonitor:
                 if has_isis_protocol or has_isis_config:
                     isis_devices.append(device)
             
-            if isis_devices:
-                logger.info(f"[ISIS MONITOR] Force checking ISIS status for {len(isis_devices)} devices")
-                for device in isis_devices:
-                    device_id = device.get("device_id")
-                    device_name = device.get("device_name") or device.get("Device Name", "Unknown")
-                    if device_id:
-                        self._check_device_isis_status(device_id, device_name)
-                logger.info(f"[ISIS MONITOR] Force check completed for {len(isis_devices)} devices")
-            else:
-                logger.info("[ISIS MONITOR] No ISIS devices found for force check")
+            return isis_devices
         except Exception as e:
-            logger.error(f"[ISIS MONITOR] Error in force check: {e}")
-            import traceback
-            logger.error(f"[ISIS MONITOR] Traceback: {traceback.format_exc()}")
+            logger.error(f"[ISIS MONITOR] Error getting ISIS devices: {e}")
+            return []
+    
+    def force_check(self):
+        """Force an immediate ISIS status check for all devices with ISIS configured."""
+        if not self.monitoring_active:
+            logger.warning("[ISIS MONITOR] Monitor is not active, cannot force check")
+            return
+        
+        devices = self._get_isis_devices()
+        if devices:
+            logger.info(f"[ISIS MONITOR] Force checking ISIS status for {len(devices)} devices")
+            self._check_isis_status_batch(devices)
+        else:
+            logger.info("[ISIS MONITOR] No ISIS devices found for force check")
     
     def check_existing_containers(self):
         """Check all existing FRR containers and sync ISIS status with database."""
@@ -463,7 +457,14 @@ class ISISMonitor:
                             # Check container status
                             if container.status == "running":
                                 # Check ISIS status
-                                self._check_device_isis_status(device_id, device_name)
+                                # Use batch checking for consistency
+                                device_dict = {
+                                    "device_id": device_id,
+                                    "device_name": device_name
+                                }
+                                isis_status = self._check_single_device_isis_status(device_dict)
+                                if isis_status:
+                                    self._update_device_isis_status(device_id, isis_status)
                             else:
                                 logger.info(f"[ISIS MONITOR] Container {container_name} exists but not running - clearing ISIS status")
                                 # Clear ISIS status in database

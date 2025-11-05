@@ -787,8 +787,21 @@ def get_ospf_status(device_id: str) -> Optional[Dict[str, Any]]:
         logging.info(f"[OSPF STATUS] IPv4 OSPF uptime: {ospf_ipv4_uptime}")
         
         # Determine overall OSPF status for IPv4 and IPv6
-        ospf_ipv4_established = len([n for n in neighbors if n.get('type') == 'IPv4']) > 0 and any('Full' in n['state'] for n in neighbors if n.get('type') == 'IPv4')
-        ospf_ipv6_established = len([n for n in neighbors if n.get('type') == 'IPv6']) > 0 and any('Full' in n['state'] for n in neighbors if n.get('type') == 'IPv6')
+        # OSPF is considered "Established" if it has neighbors in any active state
+        # Active states include: Full, 2-Way, ExStart, Exchange, Loading
+        # We exclude: Down, Init, Attempt (these are not active)
+        active_states = ['Full', '2-Way', 'ExStart', 'Exchange', 'Loading']
+        ipv4_neighbors = [n for n in neighbors if n.get('type') == 'IPv4']
+        ipv6_neighbors = [n for n in neighbors if n.get('type') == 'IPv6']
+        
+        ospf_ipv4_established = len(ipv4_neighbors) > 0 and any(
+            any(active_state in n.get('state', '') for active_state in active_states)
+            for n in ipv4_neighbors
+        )
+        ospf_ipv6_established = len(ipv6_neighbors) > 0 and any(
+            any(active_state in n.get('state', '') for active_state in active_states)
+            for n in ipv6_neighbors
+        )
         
         # Check if OSPF is running even without neighbors
         ospf_ipv4_running = 'OSPF Routing Process' in ospf_ipv4_summary

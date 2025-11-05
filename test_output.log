@@ -1,0 +1,64 @@
+/Users/surajsharma/Library/Python/3.9/lib/python/site-packages/urllib3/__init__.py:35: NotOpenSSLWarning: urllib3 v2 only supports OpenSSL 1.1.1+, currently the 'ssl' module is compiled with 'LibreSSL 2.8.3'. See: https://github.com/urllib3/urllib3/issues/3020
+  warnings.warn(
+Testing device stop/start functionality
+Server: http://svl-hp-ai-srv04:5051
+Device: device1
+
+================================================================================
+Device Stop/Start Functionality Test
+================================================================================
+Server URL: http://svl-hp-ai-srv04:5051
+Test Device: device1
+
+Step 1: Fetching device information from database...
+✅ Found device: device1 (ID: 15cf6c60-cfde-464c-8cb1-2e09d6e6a3a2)
+   Protocols: ['OSPF', 'BGP', 'IS-IS']
+   BGP Config: True
+   OSPF Config: True
+   ISIS Config: True
+
+Step 2: Checking current device status...
+   Current Status: Running
+   BGP IPv4 State: Unknown
+   BGP IPv6 State: Unknown
+   OSPF State: Not Established
+   ISIS State: Running
+
+Step 3: Stopping device...
+   Stop Payload: protocols=['OSPF', 'BGP', 'IS-IS'], bgp_config=present, ospf_config=present, isis_config=present
+✅ Device stopped successfully
+   Container stopped: True
+
+   Waiting 3 seconds for container to stop...
+
+Step 4: Verifying device is stopped...
+   Device Status: Stopped
+✅ Device status confirmed as Stopped
+
+Step 5: Starting device...
+   Start Payload: protocols=['OSPF', 'BGP', 'IS-IS'], bgp_config=present, ospf_config=present, isis_config=present
+✅ Device started successfully
+   Details: {'device': 'device1', 'device_id': '15cf6c60-cfde-464c-8cb1-2e09d6e6a3a2', 'interface': 'ens4np0', 'interface_up': True, 'ipv4_configured': True, 'ipv6_configured': True}
+
+   Waiting 10 seconds for protocols to start (checking every 2 seconds)...
+   Check 1/5: BGP(v4:Unknown,v6:Unknown) OSPF:Not Established ISIS:Running
+   Check 2/5: BGP(v4:Unknown,v6:Unknown) OSPF:Not Established ISIS:Running
+   Check 3/5: BGP(v4:Unknown,v6:Unknown) OSPF:Not Established ISIS:Running
+   Check 4/5: BGP(v4:Unknown,v6:Unknown) OSPF:Not Established ISIS:Running
+   Check 5/5: BGP(v4:Unknown,v6:Unknown) OSPF:Not Established ISIS:Running
+
+Step 6: Verifying protocols are started...
+   Device Status: Running
+   BGP IPv4 State: Unknown
+   BGP IPv6 State: Unknown
+   OSPF State: Not Established
+   ISIS State: Running
+
+✅ Protocols started: ISIS
+❌ Protocols failed to start: BGP, OSPF
+
+================================================================================
+⚠️  TEST PARTIALLY PASSED: Some protocols did not start
+================================================================================
+
+❌ Test failed
