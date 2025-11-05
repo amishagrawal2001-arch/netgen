@@ -2147,6 +2147,9 @@ def configure_ospf():
             
             logging.info(f"[OSPF CONFIGURE] Successfully created FRR container: {created_container_name}")
         
+        # Initialize old_ospf_config_for_area_change to None (will be set if device exists)
+        old_ospf_config_for_area_change = None
+        
         # Save device to database if it doesn't exist
         try:
             from datetime import datetime, timezone
@@ -2187,6 +2190,14 @@ def configure_ospf():
                         existing_ospf_config = json.loads(existing_ospf_config)
                     except:
                         existing_ospf_config = {}
+                
+                # Store old config for area ID change detection (will be passed to configure_ospf_neighbor)
+                old_ospf_config_for_area_change = existing_ospf_config.copy() if existing_ospf_config else None
+                logging.info(f"[OSPF CONFIGURE] Old OSPF config for area change detection: {old_ospf_config_for_area_change}")
+                if old_ospf_config_for_area_change:
+                    old_area = old_ospf_config_for_area_change.get("area_id")
+                    new_area = ospf_config.get("area_id", "0.0.0.0")
+                    logging.info(f"[OSPF CONFIGURE] Area ID comparison - Old: {old_area}, New: {new_area}, Changed: {old_area != new_area if old_area else False}")
                 
                 # Check if IPv4 was previously enabled but now disabled - remove IPv4 OSPF
                 existing_ipv4_enabled = existing_ospf_config.get("ipv4_enabled", False)
@@ -2265,7 +2276,9 @@ def configure_ospf():
         # Configure OSPF neighbor
         try:
             logging.info(f"[OSPF CONFIGURE] Configuring OSPF for device {device_name}")
-            success = configure_ospf_neighbor(device_id, ospf_config, device_name)
+            # Pass old_ospf_config if available (for area ID change detection)
+            logging.info(f"[OSPF CONFIGURE] Passing old_ospf_config to configure_ospf_neighbor: {old_ospf_config_for_area_change}")
+            success = configure_ospf_neighbor(device_id, ospf_config, device_name, old_ospf_config=old_ospf_config_for_area_change)
             
             if success:
                 logging.info(f"[OSPF CONFIGURE] Successfully configured OSPF for device {device_name}")

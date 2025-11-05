@@ -313,7 +313,7 @@ class MultiDeviceApplyWorker(QThread):
     # Signals for communication with main thread
     device_applied = pyqtSignal(str, bool, str)  # (device_name, success, message)
     progress = pyqtSignal(str, str)  # (device_name, status_message)
-    finished = pyqtSignal(list, int, int)  # (results, successful_count, failed_count)
+    finished = pyqtSignal(list, int, int, list)  # (results, successful_count, failed_count, successful_device_names)
     
     def __init__(self, devices_to_apply, server_url, parent_tab):
         super().__init__()
@@ -331,6 +331,7 @@ class MultiDeviceApplyWorker(QThread):
         results = []
         successful_count = 0
         failed_count = 0
+        successful_device_names = []  # Track successfully applied device names
         
         for row, device_info in self.devices_to_apply:
             if self._should_stop:
@@ -348,6 +349,7 @@ class MultiDeviceApplyWorker(QThread):
                     device_info["_is_new"] = False
                     device_info["_needs_apply"] = False
                     device_info["Status"] = "Running"
+                    successful_device_names.append(device_name)  # Track successful device
                     
                     # Protocol configuration is now handled in _apply_device_to_server_sync
                     # No need for duplicate calls here
@@ -359,8 +361,8 @@ class MultiDeviceApplyWorker(QThread):
                 else:
                     message = f"❌ {device_name}: Failed to apply to server"
                     results.append(message)
-                failed_count += 1
-                self.device_applied.emit(device_name, False, message)
+                    failed_count += 1
+                    self.device_applied.emit(device_name, False, message)
                     
             except Exception as e:
                 message = f"❌ {device_name}: Error - {str(e)}"
@@ -369,8 +371,8 @@ class MultiDeviceApplyWorker(QThread):
                 self.device_applied.emit(device_name, False, message)
                 print(f"[MULTI DEVICE APPLY ERROR] {device_name}: {e}")
         
-        # Emit final results
-        self.finished.emit(results, successful_count, failed_count)
+        # Emit final results with successful device names
+        self.finished.emit(results, successful_count, failed_count, successful_device_names)
     
     def _handle_device_apply(self):
         """Handle device apply operation in background."""
@@ -1701,7 +1703,7 @@ class DevicesTab(QWidget):
         layout = QVBoxLayout(self.ospf_subtab)
         
         # OSPF Neighbors Table
-        ospf_headers = ["Device", "OSPF Status", "Neighbor Type", "Interface", "Neighbor ID", "State", "Priority", "Dead Timer", "Uptime"]
+        ospf_headers = ["Device", "OSPF Status", "Neighbor Type", "Interface", "Area ID", "Neighbor ID", "State", "Priority", "Dead Timer", "Uptime"]
         self.ospf_table = QTableWidget(0, len(ospf_headers))
         self.ospf_table.setHorizontalHeaderLabels(ospf_headers)
         layout.addWidget(QLabel("OSPF Neighbors"))
@@ -1742,6 +1744,13 @@ class DevicesTab(QWidget):
         self.ospf_refresh_button.setToolTip("Refresh OSPF Status")
         self.ospf_refresh_button.clicked.connect(self.refresh_ospf_status)
         
+        # Apply OSPF button
+        self.apply_ospf_button = QPushButton()
+        self.apply_ospf_button.setIcon(load_icon("apply.png"))
+        self.apply_ospf_button.setFixedSize(32, 28)
+        self.apply_ospf_button.setToolTip("Apply OSPF configurations to server")
+        self.apply_ospf_button.clicked.connect(self.apply_ospf_configurations)
+        
         # OSPF Start/Stop buttons
         self.ospf_start_button = QPushButton()
         self.ospf_start_button.setIcon(load_icon("start.png"))
@@ -1760,6 +1769,7 @@ class DevicesTab(QWidget):
         ospf_controls.addWidget(self.add_ospf_button)
         ospf_controls.addWidget(self.edit_ospf_button)
         ospf_controls.addWidget(self.delete_ospf_button)
+        ospf_controls.addWidget(self.apply_ospf_button)
         ospf_controls.addWidget(self.ospf_start_button)
         ospf_controls.addWidget(self.ospf_stop_button)
         ospf_controls.addWidget(self.ospf_refresh_button)
@@ -2831,16 +2841,24 @@ class DevicesTab(QWidget):
                             row = self.ospf_table.rowCount()
                             self.ospf_table.insertRow(row)
                             
+                            # Get Area ID from OSPF config (support both old and new format)
+                            area_id = ospf_config.get("area_id", "N/A") if ospf_config else "N/A"  # Legacy support
+                            if protocol_type == "IPv4":
+                                area_id = ospf_config.get("ipv4_area_id", area_id) if ospf_config else "N/A"
+                            elif protocol_type == "IPv6":
+                                area_id = ospf_config.get("ipv6_area_id", area_id) if ospf_config else "N/A"
+                            
                             self.ospf_table.setItem(row, 0, QTableWidgetItem(device_name))  # Device
                             # Set OSPF status icon instead of text
                             self.set_ospf_status_icon(row, ospf_status, f"OSPF {ospf_status}")
                             self.ospf_table.setItem(row, 2, QTableWidgetItem(protocol_type)) # Neighbor Type
                             self.ospf_table.setItem(row, 3, QTableWidgetItem(ospf_interface)) # Interface
-                            self.ospf_table.setItem(row, 4, QTableWidgetItem(neighbor_id))   # Neighbor ID
-                            self.ospf_table.setItem(row, 5, QTableWidgetItem(state))         # State
-                            self.ospf_table.setItem(row, 6, QTableWidgetItem(priority))     # Priority
-                            self.ospf_table.setItem(row, 7, QTableWidgetItem(dead_timer))   # Dead Timer
-                            self.ospf_table.setItem(row, 8, QTableWidgetItem(uptime))        # Uptime
+                            self.ospf_table.setItem(row, 4, QTableWidgetItem(str(area_id)))  # Area ID
+                            self.ospf_table.setItem(row, 5, QTableWidgetItem(neighbor_id))   # Neighbor ID
+                            self.ospf_table.setItem(row, 6, QTableWidgetItem(state))         # State
+                            self.ospf_table.setItem(row, 7, QTableWidgetItem(priority))     # Priority
+                            self.ospf_table.setItem(row, 8, QTableWidgetItem(dead_timer))   # Dead Timer
+                            self.ospf_table.setItem(row, 9, QTableWidgetItem(uptime))        # Uptime
         except Exception as e:
             print(f"Error updating OSPF table: {e}")
     
@@ -3868,6 +3886,9 @@ class DevicesTab(QWidget):
         self.multi_device_apply_worker.progress.connect(self._on_multi_device_progress)
         self.multi_device_apply_worker.finished.connect(self._on_multi_device_apply_finished)
         self.multi_device_apply_worker.start()
+        
+        # Store successful device names for final refresh
+        self._pending_successful_devices = []
         
         print(f"[MULTI DEVICE APPLY] Started applying {len(devices_to_apply)} devices in background")
     
@@ -5887,7 +5908,7 @@ class DevicesTab(QWidget):
         except Exception as e:
             print(f"[MULTI DEVICE APPLY] Error handling progress: {e}")
     
-    def _on_multi_device_apply_finished(self, results, successful_count, failed_count):
+    def _on_multi_device_apply_finished(self, results, successful_count, failed_count, successful_device_names):
         """Handle completion of multi-device apply worker."""
         try:
             # Print results to console
@@ -5904,6 +5925,32 @@ class DevicesTab(QWidget):
                 print(f"[MULTI DEVICE APPLY] Saving session after successful device application")
                 self.main_window.save_session()
             
+            # Refresh device status for all successfully applied devices
+            if successful_count > 0 and successful_device_names:
+                # Collect all successfully applied device rows using the tracked device names
+                successful_device_rows = []
+                for row in range(self.devices_table.rowCount()):
+                    try:
+                        device_name_item = self.devices_table.item(row, self.COL["Device Name"])
+                        if device_name_item:
+                            device_name = device_name_item.text()
+                            # Check if this device is in the successful devices list
+                            if device_name in successful_device_names:
+                                successful_device_rows.append(row)
+                                print(f"[MULTI DEVICE APPLY] Found successfully applied device: {device_name} at row {row}")
+                    except Exception as e:
+                        print(f"[MULTI DEVICE APPLY] Error checking row {row}: {e}")
+                
+                # Refresh device status from database for all successfully applied devices
+                if successful_device_rows:
+                    print(f"[MULTI DEVICE APPLY] Refreshing device status for {len(successful_device_rows)} devices: {successful_device_names}")
+                    # Wait a moment for devices to fully start before refreshing
+                    QTimer.singleShot(3000, lambda rows=successful_device_rows: self._refresh_device_table_from_database(rows))
+                    # Also refresh protocol tables after a longer delay to allow protocols to establish
+                    QTimer.singleShot(5000, lambda rows=successful_device_rows: self._refresh_protocols_for_selected_devices(rows))
+                else:
+                    print(f"[MULTI DEVICE APPLY] Warning: Could not find table rows for successful devices: {successful_device_names}")
+            
             # Clean up worker reference
             if hasattr(self, 'multi_device_apply_worker'):
                 self.multi_device_apply_worker.deleteLater()
@@ -5912,6 +5959,10 @@ class DevicesTab(QWidget):
             # Clear the operation type flag
             if hasattr(self, '_current_operation_type'):
                 delattr(self, '_current_operation_type')
+            
+            # Clear pending successful devices list
+            if hasattr(self, '_pending_successful_devices'):
+                delattr(self, '_pending_successful_devices')
                 
         except Exception as e:
             print(f"[MULTI DEVICE APPLY FINISHED] Error handling completion: {e}")
@@ -6530,35 +6581,77 @@ class DevicesTab(QWidget):
             QMessageBox.warning(self, "No Selection", "Please select an OSPF configuration to edit.")
             return
 
-        row = selected_items[0].row()
+        # Get unique rows from selection
+        selected_rows = set()
+        for item in selected_items:
+            selected_rows.add(item.row())
+        
+        if len(selected_rows) > 1:
+            QMessageBox.warning(self, "Multiple Selection", "Please select only one OSPF configuration to edit.")
+            return
+        
+        row = list(selected_rows)[0]
         device_name = self.ospf_table.item(row, 0).text()  # Device column
         
-        # Find the device in all_devices
-        device_info = None
-        for iface, devices in self.main_window.all_devices.items():
-            for device in devices:
-                if device.get("Device Name") == device_name:
-                    device_info = device
-                    break
-            if device_info:
-                break
+        # Find the device in all_devices using safe helper
+        device_info = self._find_device_by_name(device_name)
         
         if not device_info:
             QMessageBox.warning(self, "Device Not Found", f"Device '{device_name}' not found.")
             return
         
-        # Get current OSPF configuration
-        current_ospf_config = device_info.get("protocols", {}).get("OSPF", {})
+        # Check if OSPF is configured - handle both list and dict formats
+        has_ospf = False
+        protocols = device_info.get("protocols", [])
+        if isinstance(protocols, list):
+            has_ospf = "OSPF" in protocols
+        elif isinstance(protocols, dict):
+            has_ospf = "OSPF" in protocols
         
-        # Create and show OSPF dialog
+        if not has_ospf and not device_info.get("ospf_config"):
+            QMessageBox.warning(self, "No OSPF Configuration", f"No OSPF configuration found for device '{device_name}'.")
+            return
+        
+        # Get current OSPF configuration - handle both old format (dict) and new format (list)
+        if isinstance(protocols, dict):
+            current_ospf_config = protocols.get("OSPF", {})
+        else:
+            current_ospf_config = device_info.get("ospf_config", {})
+            # Handle string JSON format
+            if isinstance(current_ospf_config, str):
+                try:
+                    import json
+                    current_ospf_config = json.loads(current_ospf_config) if current_ospf_config else {}
+                except:
+                    current_ospf_config = {}
+        
+        # Create and show OSPF dialog in edit mode
         from widgets.add_ospf_dialog import AddOspfDialog
-        dialog = AddOspfDialog(self, current_ospf_config)
+        dialog = AddOspfDialog(self, device_name=device_name, edit_mode=True, ospf_config=current_ospf_config)
         
         if dialog.exec_() == QDialog.Accepted:
             ospf_config = dialog.get_values()
             
+            # Preserve existing interface and IP settings when editing
+            if "interface" in current_ospf_config:
+                ospf_config["interface"] = current_ospf_config["interface"]
+            if "ipv4_enabled" in current_ospf_config:
+                ospf_config["ipv4_enabled"] = current_ospf_config["ipv4_enabled"]
+            if "ipv6_enabled" in current_ospf_config:
+                ospf_config["ipv6_enabled"] = current_ospf_config["ipv6_enabled"]
+            
             # Update the device with OSPF configuration
-            self._update_device_protocol(row, "OSPF", ospf_config)
+            if isinstance(protocols, dict):
+                device_info["protocols"]["OSPF"] = ospf_config
+            else:
+                device_info["ospf_config"] = ospf_config
+            
+            # Update the OSPF table
+            self.update_ospf_table()
+            
+            # Save session
+            if hasattr(self.main_window, "save_session"):
+                self.main_window.save_session()
 
     def prompt_delete_ospf(self):
         """Delete OSPF configuration for selected device."""
@@ -8363,6 +8456,196 @@ class DevicesTab(QWidget):
     def stop_bgp_protocol(self):
         """Stop BGP protocol for selected devices."""
         self._toggle_protocol_action("BGP", starting=False)
+
+    def apply_ospf_configurations(self):
+        """Apply OSPF configurations to the server for selected OSPF table rows."""
+        server_url = self.get_server_url()
+        if not server_url:
+            QMessageBox.critical(self, "No Server", "No server selected.")
+            return
+
+        # Get selected rows from the OSPF table
+        selected_items = self.ospf_table.selectedItems()
+        selected_devices = []
+        
+        if selected_items:
+            # Get unique device names from selected OSPF table rows
+            selected_device_names = set()
+            for item in selected_items:
+                row = item.row()
+                device_name = self.ospf_table.item(row, 0).text()  # Device column
+                selected_device_names.add(device_name)
+            
+            # Find the devices in all_devices
+            for device_name in selected_device_names:
+                for iface, devices in self.main_window.all_devices.items():
+                    for device in devices:
+                        if device.get("Device Name") == device_name:
+                            selected_devices.append(device)
+                            break
+
+        # Handle both OSPF application and removal
+        devices_to_apply_ospf = []  # Devices that need OSPF configuration applied
+        devices_to_remove_ospf = []  # Devices that need OSPF configuration removed
+        
+        if selected_items:
+            # If OSPF table rows are selected, process only those devices
+            selected_device_names = set()
+            for item in selected_items:
+                row = item.row()
+                device_name = self.ospf_table.item(row, 0).text()  # Device column
+                selected_device_names.add(device_name)
+            
+            # Find devices and determine if they need OSPF applied or removed
+            for device_name in selected_device_names:
+                for iface, devices in self.main_window.all_devices.items():
+                    for device in devices:
+                        if device.get("Device Name") == device_name:
+                            # Get OSPF config - handle both old format (dict) and new format (list)
+                            ospf_config = device.get("ospf_config", {})
+                            if not ospf_config:
+                                # Try old format for backward compatibility
+                                protocols = device.get("protocols", {})
+                                if isinstance(protocols, dict):
+                                    ospf_config = protocols.get("OSPF", {})
+                            
+                            if ospf_config:
+                                if ospf_config.get("_marked_for_removal"):
+                                    # Device is marked for OSPF removal
+                                    devices_to_remove_ospf.append(device)
+                                else:
+                                    # Device needs OSPF configuration applied
+                                    devices_to_apply_ospf.append(device)
+                            else:
+                                # Device was in OSPF table but no longer has OSPF config - needs removal
+                                devices_to_remove_ospf.append(device)
+                            break
+        else:
+            # If no OSPF table rows are selected, process all devices with OSPF configurations
+            for iface, devices in self.main_window.all_devices.items():
+                for device in devices:
+                    # Get OSPF config - handle both old format (dict) and new format (list)
+                    ospf_config = device.get("ospf_config", {})
+                    if not ospf_config:
+                        # Try old format for backward compatibility
+                        protocols = device.get("protocols", {})
+                        if isinstance(protocols, dict):
+                            ospf_config = protocols.get("OSPF", {})
+                    
+                    if ospf_config:
+                        if ospf_config.get("_marked_for_removal"):
+                            devices_to_remove_ospf.append(device)
+                        else:
+                            devices_to_apply_ospf.append(device)
+
+        # Check if we have any work to do
+        if not devices_to_apply_ospf and not devices_to_remove_ospf:
+            total_devices = sum(len(devices) for devices in self.main_window.all_devices.values())
+            if total_devices == 0:
+                QMessageBox.information(self, "No Devices", 
+                                      "No devices found to apply OSPF configuration to.")
+                return
+            else:
+                QMessageBox.information(self, "No OSPF Configuration", 
+                                      "No devices have OSPF configuration to apply or remove.")
+                return
+
+        # Apply OSPF configurations
+        success_count = 0
+        failed_devices = []
+        
+        for device_info in devices_to_apply_ospf:
+            device_name = device_info.get("Device Name", "Unknown")
+            device_id = device_info.get("device_id")
+            
+            if not device_id:
+                failed_devices.append(f"{device_name}: Missing device ID")
+                continue
+                
+            try:
+                # Apply OSPF configuration using the existing sync function
+                success = self._apply_ospf_to_server_sync(server_url, device_info)
+                
+                if success:
+                    success_count += 1
+                    print(f"✅ OSPF configuration applied for {device_name}")
+                else:
+                    failed_devices.append(f"{device_name}: Failed to apply OSPF configuration")
+                    print(f"❌ Failed to apply OSPF for {device_name}")
+                    
+            except Exception as e:
+                failed_devices.append(f"{device_name}: {str(e)}")
+                print(f"❌ Error applying OSPF for {device_name}: {str(e)}")
+
+        # Handle OSPF removal
+        removal_success_count = 0
+        removal_failed_devices = []
+        
+        for device_info in devices_to_remove_ospf:
+            device_name = device_info.get("Device Name", "Unknown")
+            device_id = device_info.get("device_id")
+            
+            if not device_id:
+                removal_failed_devices.append(f"{device_name}: Missing device ID")
+                continue
+                
+            try:
+                # Call OSPF cleanup endpoint to remove OSPF configuration
+                import requests
+                response = requests.post(f"{server_url}/api/device/ospf/stop", 
+                                       json={"device_id": device_id}, 
+                                       timeout=10)
+                
+                if response.status_code == 200:
+                    removal_success_count += 1
+                    print(f"✅ OSPF configuration removed for {device_name}")
+                    
+                    # Remove OSPF config from device info
+                    device_info.pop("ospf_config", None)
+                    if isinstance(device_info.get("protocols"), dict):
+                        device_info["protocols"].pop("OSPF", None)
+                    elif isinstance(device_info.get("protocols"), list):
+                        protocols = device_info.get("protocols", [])
+                        if "OSPF" in protocols:
+                            protocols.remove("OSPF")
+                            device_info["protocols"] = protocols
+                else:
+                    error_msg = response.json().get("error", "Unknown error")
+                    removal_failed_devices.append(f"{device_name}: {error_msg}")
+                    print(f"❌ Failed to remove OSPF for {device_name}: {error_msg}")
+                    
+            except Exception as e:
+                removal_failed_devices.append(f"{device_name}: {str(e)}")
+                print(f"❌ Error removing OSPF for {device_name}: {str(e)}")
+
+        # Show results
+        result_message = f"OSPF Configuration Results:\n\n"
+        result_message += f"Applied: {success_count}\n"
+        result_message += f"Removed: {removal_success_count}\n"
+        
+        if failed_devices:
+            result_message += f"\nFailed to apply ({len(failed_devices)}):\n"
+            result_message += "\n".join(failed_devices[:10])  # Show first 10 failures
+            if len(failed_devices) > 10:
+                result_message += f"\n... and {len(failed_devices) - 10} more"
+        
+        if removal_failed_devices:
+            result_message += f"\n\nFailed to remove ({len(removal_failed_devices)}):\n"
+            result_message += "\n".join(removal_failed_devices[:10])
+            if len(removal_failed_devices) > 10:
+                result_message += f"\n... and {len(removal_failed_devices) - 10} more"
+        
+        if failed_devices or removal_failed_devices:
+            QMessageBox.warning(self, "OSPF Configuration Results", result_message)
+        else:
+            QMessageBox.information(self, "OSPF Configuration Results", result_message)
+        
+        # Update OSPF table after applying
+        self.update_ospf_table()
+        
+        # Save session
+        if hasattr(self.main_window, "save_session"):
+            self.main_window.save_session()
 
     def start_ospf_protocol(self):
         """Start OSPF protocol for selected devices."""
