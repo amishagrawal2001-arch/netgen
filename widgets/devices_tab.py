@@ -313,7 +313,7 @@ class MultiDeviceApplyWorker(QThread):
     # Signals for communication with main thread
     device_applied = pyqtSignal(str, bool, str)  # (device_name, success, message)
     progress = pyqtSignal(str, str)  # (device_name, status_message)
-    finished = pyqtSignal(list, int, int, list)  # (results, successful_count, failed_count, successful_device_names)
+    finished = pyqtSignal(list, int, int)  # (results, successful_count, failed_count)
     
     def __init__(self, devices_to_apply, server_url, parent_tab):
         super().__init__()
@@ -327,20 +327,19 @@ class MultiDeviceApplyWorker(QThread):
         self._should_stop = True
     
     def run(self):
-        """Apply multiple devices in background thread."""
+        """Apply multiple devices in background thread - parallelized for faster creation."""
         results = []
         successful_count = 0
         failed_count = 0
-        successful_device_names = []  # Track successfully applied device names
         
-        for row, device_info in self.devices_to_apply:
-            if self._should_stop:
-                break
-                
+        def process_single_device(row_device_tuple):
+            """Process a single device's apply operation."""
+            row, device_info = row_device_tuple
             device_name = device_info.get("Device Name", "Unknown")
-            self.progress.emit(device_name, "Applying...")
             
             try:
+                self.progress.emit(device_name, "Applying...")
+                
                 # Apply device to server
                 success = self.parent_tab._apply_device_to_server_sync(self.server_url, device_info)
                 
@@ -349,30 +348,59 @@ class MultiDeviceApplyWorker(QThread):
                     device_info["_is_new"] = False
                     device_info["_needs_apply"] = False
                     device_info["Status"] = "Running"
-                    successful_device_names.append(device_name)  # Track successful device
                     
                     # Protocol configuration is now handled in _apply_device_to_server_sync
                     # No need for duplicate calls here
                     
                     message = f"✅ {device_name}: Device applied successfully"
-                    results.append(message)
-                    successful_count += 1
                     self.device_applied.emit(device_name, True, message)
+                    return (message, True)
                 else:
                     message = f"❌ {device_name}: Failed to apply to server"
-                    results.append(message)
-                    failed_count += 1
                     self.device_applied.emit(device_name, False, message)
+                    return (message, False)
                     
             except Exception as e:
                 message = f"❌ {device_name}: Error - {str(e)}"
-                results.append(message)
-                failed_count += 1
                 self.device_applied.emit(device_name, False, message)
                 print(f"[MULTI DEVICE APPLY ERROR] {device_name}: {e}")
+                return (message, False)
         
-        # Emit final results with successful device names
-        self.finished.emit(results, successful_count, failed_count, successful_device_names)
+        # Process devices in parallel using ThreadPoolExecutor
+        # Limit to 5 concurrent operations to avoid overwhelming the server
+        max_workers = min(len(self.devices_to_apply), 5)
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            # Submit all device processing tasks
+            future_to_device = {
+                executor.submit(process_single_device, (row, device_info)): (row, device_info)
+                for row, device_info in self.devices_to_apply
+            }
+            
+            # Collect results as they complete
+            for future in as_completed(future_to_device):
+                if self._should_stop:
+                    break
+                    
+                try:
+                    result = future.result()
+                    if result:
+                        message, success = result
+                        results.append(message)
+                        if success:
+                            successful_count += 1
+                        else:
+                            failed_count += 1
+                except Exception as e:
+                    row, device_info = future_to_device[future]
+                    device_name = device_info.get("Device Name", "Unknown")
+                    message = f"❌ {device_name}: Exception - {str(e)}"
+                    results.append(message)
+                    failed_count += 1
+                    self.device_applied.emit(device_name, False, message)
+                    print(f"[MULTI DEVICE APPLY ERROR] {device_name}: {e}")
+        
+        # Emit final results
+        self.finished.emit(results, successful_count, failed_count)
     
     def _handle_device_apply(self):
         """Handle device apply operation in background."""
@@ -1703,9 +1731,17 @@ class DevicesTab(QWidget):
         layout = QVBoxLayout(self.ospf_subtab)
         
         # OSPF Neighbors Table
-        ospf_headers = ["Device", "OSPF Status", "Neighbor Type", "Interface", "Area ID", "Neighbor ID", "State", "Priority", "Dead Timer", "Uptime"]
+        ospf_headers = ["Device", "OSPF Status", "Area ID", "Neighbor Type", "Interface", "Neighbor ID", "State", "Priority", "Dead Timer", "Uptime", "Graceful Restart"]
         self.ospf_table = QTableWidget(0, len(ospf_headers))
         self.ospf_table.setHorizontalHeaderLabels(ospf_headers)
+        
+        # Enable inline editing for the OSPF table
+        self.ospf_table.setEditTriggers(QTableWidget.DoubleClicked | QTableWidget.EditKeyPressed)
+        self.ospf_table.setSelectionBehavior(QTableWidget.SelectRows)
+        
+        # Connect cell changed signal for inline editing
+        self.ospf_table.cellChanged.connect(self.on_ospf_table_cell_changed)
+        
         layout.addWidget(QLabel("OSPF Neighbors"))
         layout.addWidget(self.ospf_table)
         
@@ -1744,13 +1780,6 @@ class DevicesTab(QWidget):
         self.ospf_refresh_button.setToolTip("Refresh OSPF Status")
         self.ospf_refresh_button.clicked.connect(self.refresh_ospf_status)
         
-        # Apply OSPF button
-        self.apply_ospf_button = QPushButton()
-        self.apply_ospf_button.setIcon(load_icon("apply.png"))
-        self.apply_ospf_button.setFixedSize(32, 28)
-        self.apply_ospf_button.setToolTip("Apply OSPF configurations to server")
-        self.apply_ospf_button.clicked.connect(self.apply_ospf_configurations)
-        
         # OSPF Start/Stop buttons
         self.ospf_start_button = QPushButton()
         self.ospf_start_button.setIcon(load_icon("start.png"))
@@ -1765,6 +1794,13 @@ class DevicesTab(QWidget):
         self.ospf_stop_button.setFixedSize(32, 28)
         self.ospf_stop_button.setToolTip("Stop OSPF")
         self.ospf_stop_button.clicked.connect(self.stop_ospf_protocol)
+        
+        self.apply_ospf_button = QPushButton()
+        self.apply_ospf_button.setIcon(load_icon("apply.png"))
+        self.apply_ospf_button.setIconSize(QSize(16, 16))
+        self.apply_ospf_button.setFixedSize(32, 28)
+        self.apply_ospf_button.setToolTip("Apply OSPF Configuration to FRR")
+        self.apply_ospf_button.clicked.connect(self.apply_ospf_configurations)
         
         ospf_controls.addWidget(self.add_ospf_button)
         ospf_controls.addWidget(self.edit_ospf_button)
@@ -1781,7 +1817,7 @@ class DevicesTab(QWidget):
         layout = QVBoxLayout(self.isis_subtab)
         
         # ISIS Neighbors Table with requested columns
-        isis_headers = ["Device", "ISIS Status", "Neighbor Type", "Interface", "ISIS Area", "Level", "ISIS Net"]
+        isis_headers = ["Device", "ISIS Status", "Neighbor Type", "Neighbor Hostname", "Interface", "ISIS Area", "Level", "ISIS Net", "System ID", "Hello Interval", "Multiplier"]
         self.isis_table = QTableWidget(0, len(isis_headers))
         self.isis_table.setHorizontalHeaderLabels(isis_headers)
         
@@ -1789,10 +1825,21 @@ class DevicesTab(QWidget):
         self.isis_table.setColumnWidth(0, 120)  # Device
         self.isis_table.setColumnWidth(1, 100)  # ISIS Status
         self.isis_table.setColumnWidth(2, 120)  # Neighbor Type
-        self.isis_table.setColumnWidth(3, 100)  # Interface
-        self.isis_table.setColumnWidth(4, 120)  # ISIS Area
-        self.isis_table.setColumnWidth(5, 80)   # Level
-        self.isis_table.setColumnWidth(6, 200)  # ISIS Net
+        self.isis_table.setColumnWidth(3, 150)  # Neighbor Hostname
+        self.isis_table.setColumnWidth(4, 100)  # Interface
+        self.isis_table.setColumnWidth(5, 120)  # ISIS Area
+        self.isis_table.setColumnWidth(6, 80)   # Level
+        self.isis_table.setColumnWidth(7, 200)  # ISIS Net
+        self.isis_table.setColumnWidth(8, 120)  # System ID
+        self.isis_table.setColumnWidth(9, 100)  # Hello Interval
+        self.isis_table.setColumnWidth(10, 100)  # Multiplier
+        
+        # Enable inline editing for the ISIS table
+        self.isis_table.setEditTriggers(QTableWidget.DoubleClicked | QTableWidget.EditKeyPressed)
+        self.isis_table.setSelectionBehavior(QTableWidget.SelectRows)
+        
+        # Connect cell changed signal for inline editing
+        self.isis_table.cellChanged.connect(self.on_isis_table_cell_changed)
         
         layout.addWidget(QLabel("ISIS Neighbors"))
         layout.addWidget(self.isis_table)
@@ -1889,15 +1936,24 @@ class DevicesTab(QWidget):
         # Find the device in all_devices using safe helper
         device_info = self._find_device_by_name(device_name)
         
-        if not device_info or "protocols" not in device_info or "IS-IS" not in device_info["protocols"]:
+        # Check if ISIS is configured
+        protocols = device_info.get("protocols", [])
+        is_isis_configured = False
+        if isinstance(protocols, list):
+            # protocols is a list like ["OSPF", "BGP", "ISIS"]
+            is_isis_configured = "ISIS" in protocols or "IS-IS" in protocols
+        elif isinstance(protocols, dict):
+            # Old format: protocols is a dict
+            is_isis_configured = "IS-IS" in protocols or "ISIS" in protocols
+        
+        if not device_info or not is_isis_configured:
             QMessageBox.warning(self, "No ISIS Configuration", f"No ISIS configuration found for device '{device_name}'.")
             return
 
         # Get current ISIS configuration
-        if isinstance(device_info["protocols"], dict):
-            current_isis = device_info["protocols"]["IS-IS"]
-        else:
-            current_isis = device_info.get("is_is_config", {})
+        # protocols is a list (e.g., ["OSPF", "BGP", "ISIS"]), not a dict
+        # ISIS config is stored separately in isis_config or is_is_config
+        current_isis = device_info.get("isis_config", {}) or device_info.get("is_is_config", {})
 
         # Create dialog with current ISIS configuration in edit mode
         dialog = AddIsisDialog(self, device_name, edit_mode=True, isis_config=current_isis)
@@ -2558,9 +2614,8 @@ class DevicesTab(QWidget):
                                 # Local AS (column 5)
                                 self.bgp_table.setItem(row, 5, QTableWidgetItem(bgp_config.get("bgp_asn", "")))
                                 
-                                # Remote AS (column 6) - use IPv4-specific remote ASN if available
-                                remote_asn_ipv4 = bgp_config.get("bgp_remote_asn_ipv4") or bgp_config.get("bgp_remote_asn", "")
-                                self.bgp_table.setItem(row, 6, QTableWidgetItem(remote_asn_ipv4))
+                                # Remote AS (column 6)
+                                self.bgp_table.setItem(row, 6, QTableWidgetItem(bgp_config.get("bgp_remote_asn", "")))
                                 
                                 # State (column 7) - get real BGP state
                                 self.bgp_table.setItem(row, 7, QTableWidgetItem(bgp_state))
@@ -2630,9 +2685,8 @@ class DevicesTab(QWidget):
                                 # Local AS (column 5)
                                 self.bgp_table.setItem(row, 5, QTableWidgetItem(bgp_config.get("bgp_asn", "")))
                                 
-                                # Remote AS (column 6) - use IPv6-specific remote ASN if available
-                                remote_asn_ipv6 = bgp_config.get("bgp_remote_asn_ipv6") or bgp_config.get("bgp_remote_asn", "")
-                                self.bgp_table.setItem(row, 6, QTableWidgetItem(remote_asn_ipv6))
+                                # Remote AS (column 6)
+                                self.bgp_table.setItem(row, 6, QTableWidgetItem(bgp_config.get("bgp_remote_asn", "")))
                                 
                                 # State (column 7) - get real BGP state
                                 self.bgp_table.setItem(row, 7, QTableWidgetItem(bgp_state))
@@ -2759,6 +2813,10 @@ class DevicesTab(QWidget):
                                 if len(iface_parts) >= 2:
                                     ospf_interface = iface_parts[1]  # Get the physical interface name
                         
+                        # Get Area ID from OSPF config
+                        # Support separate area IDs for IPv4 and IPv6, with backward compatibility
+                        area_id = ospf_config.get("area_id", "0.0.0.0") if ospf_config else "0.0.0.0"
+                        
                         # Get OSPF configuration flags
                         ipv4_enabled = ospf_config.get("ipv4_enabled", False) if ospf_config else False
                         ipv6_enabled = ospf_config.get("ipv6_enabled", False) if ospf_config else False
@@ -2841,32 +2899,40 @@ class DevicesTab(QWidget):
                             row = self.ospf_table.rowCount()
                             self.ospf_table.insertRow(row)
                             
-                            # Get Area ID from OSPF config (support both old and new format)
-                            area_id = ospf_config.get("area_id", "N/A") if ospf_config else "N/A"  # Legacy support
-                            if protocol_type == "IPv4":
-                                area_id = ospf_config.get("ipv4_area_id", area_id) if ospf_config else "N/A"
-                            elif protocol_type == "IPv6":
-                                area_id = ospf_config.get("ipv6_area_id", area_id) if ospf_config else "N/A"
+                            # Get the area ID for this specific address family
+                            # Support separate area IDs for IPv4 and IPv6, with backward compatibility
+                            if protocol_type == "IPv6":
+                                display_area_id = ospf_config.get("area_id_ipv6") or area_id
+                            else:
+                                display_area_id = ospf_config.get("area_id_ipv4") or area_id
+                            
+                            # Get graceful restart status for this specific address family
+                            # Support separate graceful restart for IPv4 and IPv6, with backward compatibility
+                            if protocol_type == "IPv6":
+                                graceful_restart = ospf_config.get("graceful_restart_ipv6") or ospf_config.get("graceful_restart", False) if ospf_config else False
+                            else:
+                                graceful_restart = ospf_config.get("graceful_restart_ipv4") or ospf_config.get("graceful_restart", False) if ospf_config else False
+                            graceful_restart_text = "Yes" if graceful_restart else "No"
                             
                             self.ospf_table.setItem(row, 0, QTableWidgetItem(device_name))  # Device
                             # Set OSPF status icon instead of text
                             self.set_ospf_status_icon(row, ospf_status, f"OSPF {ospf_status}")
-                            self.ospf_table.setItem(row, 2, QTableWidgetItem(protocol_type)) # Neighbor Type
-                            self.ospf_table.setItem(row, 3, QTableWidgetItem(ospf_interface)) # Interface
-                            self.ospf_table.setItem(row, 4, QTableWidgetItem(str(area_id)))  # Area ID
+                            self.ospf_table.setItem(row, 2, QTableWidgetItem(display_area_id))      # Area ID
+                            self.ospf_table.setItem(row, 3, QTableWidgetItem(protocol_type)) # Neighbor Type
+                            self.ospf_table.setItem(row, 4, QTableWidgetItem(ospf_interface)) # Interface
                             self.ospf_table.setItem(row, 5, QTableWidgetItem(neighbor_id))   # Neighbor ID
                             self.ospf_table.setItem(row, 6, QTableWidgetItem(state))         # State
                             self.ospf_table.setItem(row, 7, QTableWidgetItem(priority))     # Priority
                             self.ospf_table.setItem(row, 8, QTableWidgetItem(dead_timer))   # Dead Timer
                             self.ospf_table.setItem(row, 9, QTableWidgetItem(uptime))        # Uptime
+                            self.ospf_table.setItem(row, 10, QTableWidgetItem(graceful_restart_text))  # Graceful Restart
         except Exception as e:
             print(f"Error updating OSPF table: {e}")
     
     def update_isis_table(self):
         """Update ISIS table with data from devices and ISIS status from database."""
         try:
-            print(f"DEBUG ISIS TABLE: Starting update_isis_table")
-            print(f"DEBUG ISIS TABLE: all_devices keys: {list(self.main_window.all_devices.keys())}")
+            # Debug logs disabled
             
             # Get selected interfaces from server_tree (same logic as device table)
             selected_interfaces = set()
@@ -2899,9 +2965,10 @@ class DevicesTab(QWidget):
                 for device in devices:
                     # Check if device has IS-IS protocol configured
                     device_protocols = device.get("protocols", [])
-                    if isinstance(device_protocols, list) and "IS-IS" in device_protocols:
+                    if isinstance(device_protocols, list) and ("IS-IS" in device_protocols or "ISIS" in device_protocols):
                         # New format: protocols is a list, config is in separate field
-                        isis_config = device.get("is_is_config", {})
+                        # Check both isis_config and is_is_config for backward compatibility
+                        isis_config = device.get("isis_config", {}) or device.get("is_is_config", {})
                     elif isinstance(device_protocols, dict) and "IS-IS" in device_protocols:
                         # Old format: protocols is a dict
                         isis_config = device_protocols["IS-IS"]
@@ -2914,14 +2981,30 @@ class DevicesTab(QWidget):
                     # Check if ISIS is marked for removal
                     is_marked_for_removal = isinstance(isis_config, dict) and isis_config.get("_marked_for_removal", False)
                     
-                    print(f"DEBUG ISIS TABLE: Device {device_name}, isis_config={isis_config}")
+                    # Debug logs disabled
                     
                     # Get ISIS status from database
                     isis_status_data = self._get_isis_status_from_database(device_id)
                     
                     # Get ISIS configuration flags
-                    ipv4_enabled = isis_config.get("ipv4_enabled", False) if isis_config else False
-                    ipv6_enabled = isis_config.get("ipv6_enabled", False) if isis_config else False
+                    # Default to True if not set, to ensure rows are shown (can be inferred from device IPs)
+                    ipv4_enabled = isis_config.get("ipv4_enabled") if isis_config else None
+                    if ipv4_enabled is None:
+                        # Try to infer from device's IP addresses
+                        if device.get("ipv4_address") or device.get("IPv4 Address"):
+                            ipv4_enabled = True
+                        else:
+                            # Default to True to ensure rows are shown
+                            ipv4_enabled = True
+                    
+                    ipv6_enabled = isis_config.get("ipv6_enabled") if isis_config else None
+                    if ipv6_enabled is None:
+                        # Try to infer from device's IP addresses
+                        if device.get("ipv6_address") or device.get("IPv6 Address"):
+                            ipv6_enabled = True
+                        else:
+                            # Default to True to ensure rows are shown
+                            ipv6_enabled = True
                     
                     # Get device VLAN interface from ISIS config
                     device_interface = isis_config.get("interface", iface)
@@ -2933,7 +3016,7 @@ class DevicesTab(QWidget):
                         else:
                             device_interface = iface
                     
-                    print(f"DEBUG ISIS TABLE: Device {device_name}, isis_config={isis_config}, device_interface={device_interface}, ipv4_enabled={ipv4_enabled}, ipv6_enabled={ipv6_enabled}")
+                    # Debug logs disabled
                     
                     # Create rows for each ISIS neighbor or device status
                     if isis_status_data and isis_status_data.get("neighbors") and not is_marked_for_removal:
@@ -2993,20 +3076,47 @@ class DevicesTab(QWidget):
                             # Neighbor Type (IPv4 or IPv6)
                             self.isis_table.setItem(row, 2, QTableWidgetItem(protocol_type))
                             
+                            # Neighbor Hostname
+                            neighbor_hostname = neighbor.get("system_id", neighbor.get("hostname", "N/A"))
+                            self.isis_table.setItem(row, 3, QTableWidgetItem(neighbor_hostname))
+                            
                             # Interface - show device VLAN interface
-                            self.isis_table.setItem(row, 3, QTableWidgetItem(device_interface))
+                            self.isis_table.setItem(row, 4, QTableWidgetItem(device_interface))
                             
                             # ISIS Area
                             area = neighbor.get("area", isis_config.get("area_id", ""))
-                            self.isis_table.setItem(row, 4, QTableWidgetItem(area))
+                            self.isis_table.setItem(row, 5, QTableWidgetItem(area))
                             
                             # Level
                             level = neighbor.get("level", isis_config.get("level", "Level-2"))
-                            self.isis_table.setItem(row, 5, QTableWidgetItem(level))
+                            self.isis_table.setItem(row, 6, QTableWidgetItem(level))
                             
-                            # ISIS Net
+                            # ISIS Net (editable)
                             isis_net = neighbor.get("net", isis_config.get("area_id", ""))
-                            self.isis_table.setItem(row, 6, QTableWidgetItem(isis_net))
+                            isis_net_item = QTableWidgetItem(isis_net)
+                            isis_net_item.setFlags(isis_net_item.flags() | Qt.ItemIsEditable)  # Ensure editable
+                            self.isis_table.setItem(row, 7, isis_net_item)
+                            
+                            # System ID (editable)
+                            # Always use the device's own System ID from isis_config, not from neighbor data
+                            # The neighbor's system_id field might contain hostname (e.g., "san-q5130e-04")
+                            # which is not in the correct XXXX.XXXX.XXXX format
+                            system_id = isis_config.get("system_id", "")
+                            system_id_item = QTableWidgetItem(system_id)
+                            system_id_item.setFlags(system_id_item.flags() | Qt.ItemIsEditable)  # Ensure editable
+                            self.isis_table.setItem(row, 8, system_id_item)
+                            
+                            # Hello Interval (editable)
+                            hello_interval = neighbor.get("hello_interval", isis_config.get("hello_interval", "10"))
+                            hello_interval_item = QTableWidgetItem(str(hello_interval))
+                            hello_interval_item.setFlags(hello_interval_item.flags() | Qt.ItemIsEditable)  # Ensure editable
+                            self.isis_table.setItem(row, 9, hello_interval_item)
+                            
+                            # Multiplier (editable)
+                            multiplier = neighbor.get("hello_multiplier", isis_config.get("hello_multiplier", "3"))
+                            multiplier_item = QTableWidgetItem(str(multiplier))
+                            multiplier_item.setFlags(multiplier_item.flags() | Qt.ItemIsEditable)  # Ensure editable
+                            self.isis_table.setItem(row, 10, multiplier_item)
                     else:
                         # No neighbors found or marked for removal, show device status
                         row = self.isis_table.rowCount()
@@ -3054,17 +3164,42 @@ class DevicesTab(QWidget):
                                 device_interface = f"vlan{device_vlan}"
                             else:
                                 device_interface = iface
-                        print(f"DEBUG ISIS: Device {device_name}, iface={iface}, device_interface={device_interface}")
-                        self.isis_table.setItem(row, 3, QTableWidgetItem(device_interface))
+                        # Debug logs disabled
+                        
+                        # Neighbor Type (for first row - no neighbor, show N/A)
+                        self.isis_table.setItem(row, 2, QTableWidgetItem("N/A"))
+                        
+                        # Neighbor Hostname (for first row - no neighbor, show N/A)
+                        self.isis_table.setItem(row, 3, QTableWidgetItem("N/A"))
+                        
+                        # Interface (for first row)
+                        self.isis_table.setItem(row, 4, QTableWidgetItem(device_interface))
                         
                         # ISIS Area (for first row)
-                        self.isis_table.setItem(row, 4, QTableWidgetItem(isis_config.get("area_id", "")))
+                        self.isis_table.setItem(row, 5, QTableWidgetItem(isis_config.get("area_id", "")))
                         
                         # Level (for first row)
-                        self.isis_table.setItem(row, 5, QTableWidgetItem(isis_config.get("level", "Level-2")))
+                        self.isis_table.setItem(row, 6, QTableWidgetItem(isis_config.get("level", "Level-2")))
                         
-                        # ISIS Net (for first row)
-                        self.isis_table.setItem(row, 6, QTableWidgetItem(isis_config.get("area_id", "")))
+                        # ISIS Net (for first row) - editable
+                        isis_net_item = QTableWidgetItem(isis_config.get("area_id", ""))
+                        isis_net_item.setFlags(isis_net_item.flags() | Qt.ItemIsEditable)  # Ensure editable
+                        self.isis_table.setItem(row, 7, isis_net_item)
+                        
+                        # System ID (for first row) - editable
+                        system_id_item = QTableWidgetItem(isis_config.get("system_id", ""))
+                        system_id_item.setFlags(system_id_item.flags() | Qt.ItemIsEditable)  # Ensure editable
+                        self.isis_table.setItem(row, 8, system_id_item)
+                        
+                        # Hello Interval (for first row) - editable
+                        hello_interval_item = QTableWidgetItem(str(isis_config.get("hello_interval", "10")))
+                        hello_interval_item.setFlags(hello_interval_item.flags() | Qt.ItemIsEditable)  # Ensure editable
+                        self.isis_table.setItem(row, 9, hello_interval_item)
+                        
+                        # Multiplier (for first row) - editable
+                        multiplier_item = QTableWidgetItem(str(isis_config.get("hello_multiplier", "3")))
+                        multiplier_item.setFlags(multiplier_item.flags() | Qt.ItemIsEditable)  # Ensure editable
+                        self.isis_table.setItem(row, 10, multiplier_item)
                         
                         # If both IPv4 and IPv6 are enabled, create a second row for IPv6
                         if ipv4_enabled and ipv6_enabled and not is_marked_for_removal:
@@ -3081,17 +3216,37 @@ class DevicesTab(QWidget):
                             # Neighbor Type - IPv6
                             self.isis_table.setItem(row, 2, QTableWidgetItem("IPv6"))
                             
+                            # Neighbor Hostname (for IPv6 row - no neighbor, show N/A)
+                            self.isis_table.setItem(row, 3, QTableWidgetItem("N/A"))
+                            
                             # Interface
-                            self.isis_table.setItem(row, 3, QTableWidgetItem(device_interface))
+                            self.isis_table.setItem(row, 4, QTableWidgetItem(device_interface))
                             
                             # ISIS Area
-                            self.isis_table.setItem(row, 4, QTableWidgetItem(isis_config.get("area_id", "")))
+                            self.isis_table.setItem(row, 5, QTableWidgetItem(isis_config.get("area_id", "")))
                             
                             # Level
-                            self.isis_table.setItem(row, 5, QTableWidgetItem(isis_config.get("level", "Level-2")))
+                            self.isis_table.setItem(row, 6, QTableWidgetItem(isis_config.get("level", "Level-2")))
                             
-                            # ISIS Net
-                            self.isis_table.setItem(row, 6, QTableWidgetItem(isis_config.get("area_id", "")))
+                            # ISIS Net - editable
+                            isis_net_item = QTableWidgetItem(isis_config.get("area_id", ""))
+                            isis_net_item.setFlags(isis_net_item.flags() | Qt.ItemIsEditable)  # Ensure editable
+                            self.isis_table.setItem(row, 7, isis_net_item)
+                            
+                            # System ID - editable
+                            system_id_item = QTableWidgetItem(isis_config.get("system_id", ""))
+                            system_id_item.setFlags(system_id_item.flags() | Qt.ItemIsEditable)  # Ensure editable
+                            self.isis_table.setItem(row, 8, system_id_item)
+                            
+                            # Hello Interval - editable
+                            hello_interval_item = QTableWidgetItem(str(isis_config.get("hello_interval", "10")))
+                            hello_interval_item.setFlags(hello_interval_item.flags() | Qt.ItemIsEditable)  # Ensure editable
+                            self.isis_table.setItem(row, 9, hello_interval_item)
+                            
+                            # Multiplier - editable
+                            multiplier_item = QTableWidgetItem(str(isis_config.get("hello_multiplier", "3")))
+                            multiplier_item.setFlags(multiplier_item.flags() | Qt.ItemIsEditable)  # Ensure editable
+                            self.isis_table.setItem(row, 10, multiplier_item)
                     
         except Exception as e:
             print(f"Error updating ISIS table: {e}")
@@ -3119,8 +3274,7 @@ class DevicesTab(QWidget):
             item.setIcon(icon)
             item.setToolTip(tooltip)
             item.setTextAlignment(Qt.AlignCenter)
-            
-            # Set the item in the ISIS Status column (column 1)
+            item.setFlags(item.flags() & ~Qt.ItemIsEditable)  # Make ISIS Status column non-editable
             self.isis_table.setItem(row, 1, item)
             
         except Exception as e:
@@ -3500,7 +3654,7 @@ class DevicesTab(QWidget):
         item.setIcon(icon)
         item.setToolTip(tooltip)
         item.setTextAlignment(Qt.AlignCenter)
-        item.setFlags(Qt.ItemIsEnabled)
+        item.setFlags(item.flags() & ~Qt.ItemIsEditable)  # Make OSPF Status column non-editable
         self.ospf_table.setItem(row, col, item)
 
     def set_status_icon_with_individual_ips(self, row: int, arp_results: dict):
@@ -3887,9 +4041,6 @@ class DevicesTab(QWidget):
         self.multi_device_apply_worker.finished.connect(self._on_multi_device_apply_finished)
         self.multi_device_apply_worker.start()
         
-        # Store successful device names for final refresh
-        self._pending_successful_devices = []
-        
         print(f"[MULTI DEVICE APPLY] Started applying {len(devices_to_apply)} devices in background")
     
     def apply_selected_device_with_arp(self):
@@ -4168,7 +4319,6 @@ class DevicesTab(QWidget):
                     "protocols": self._convert_protocols_to_array(device_info.get("Protocols", "")),
                     "bgp_config": device_info.get("bgp_config", {}),
                     "ospf_config": device_info.get("ospf_config", {}),
-                    "isis_config": device_info.get("isis_config", {}) or device_info.get("is_is_config", {}),
                 }
                 
                 resp = requests.post(f"{server_url}/api/device/apply", json=payload, timeout=30)
@@ -4209,6 +4359,7 @@ class DevicesTab(QWidget):
             print(f"[DEBUG APPLY DEVICE] Protocols: {device_info.get('protocols', [])}")
             print(f"[DEBUG APPLY DEVICE] BGP config: {device_info.get('bgp_config', {})}")
             print(f"[DEBUG APPLY DEVICE] OSPF config: {device_info.get('ospf_config', {})}")
+            print(f"[DEBUG APPLY DEVICE] ISIS config: {device_info.get('isis_config', {})} or {device_info.get('is_is_config', {})}")
             
             # If device has an ID, fetch complete device data from database
             if device_id:
@@ -4224,18 +4375,23 @@ class DevicesTab(QWidget):
                         device_info.update({
                             "protocols": db_device_data.get("protocols", []),
                             "bgp_config": db_device_data.get("bgp_config", {}),
-                            "ospf_config": db_device_data.get("ospf_config", {})
+                            "ospf_config": db_device_data.get("ospf_config", {}),
+                            "isis_config": db_device_data.get("isis_config", {}) or db_device_data.get("is_is_config", {})
                         })
                         
                         print(f"[DEBUG APPLY DEVICE] Updated device info - Protocols: {device_info.get('protocols', [])}")
                         print(f"[DEBUG APPLY DEVICE] Updated device info - BGP config: {device_info.get('bgp_config', {})}")
                         print(f"[DEBUG APPLY DEVICE] Updated device info - OSPF config: {device_info.get('ospf_config', {})}")
+                        print(f"[DEBUG APPLY DEVICE] Updated device info - ISIS config: {device_info.get('isis_config', {})} or {device_info.get('is_is_config', {})}")
                     else:
                         print(f"[DEBUG APPLY DEVICE] Failed to fetch device data from database: {response.status_code}")
                 except Exception as e:
                     print(f"[DEBUG APPLY DEVICE] Error fetching device data from database: {e}")
             
             # Prepare payload for background worker
+            # Get ISIS config - handle both isis_config and is_is_config keys
+            isis_config = device_info.get("isis_config", {}) or device_info.get("is_is_config", {})
+            
             payload = {
                 "device_id": device_id,
                 "device_name": device_name,
@@ -4250,7 +4406,7 @@ class DevicesTab(QWidget):
                 "protocols": device_info.get("protocols", []),
                 "bgp_config": device_info.get("bgp_config", {}),
                 "ospf_config": device_info.get("ospf_config", {}),
-                "isis_config": device_info.get("isis_config", {}) or device_info.get("is_is_config", {}),
+                "isis_config": isis_config,
             }
             
             print(f"[DEBUG APPLY DEVICE] Payload protocols: {payload['protocols']}")
@@ -4293,8 +4449,12 @@ class DevicesTab(QWidget):
             print(f"[DEBUG DEVICE APPLY] Protocols: {device_info.get('protocols', [])}")
             print(f"[DEBUG DEVICE APPLY] BGP config: {device_info.get('bgp_config', {})}")
             print(f"[DEBUG DEVICE APPLY] OSPF config: {device_info.get('ospf_config', {})}")
+            print(f"[DEBUG DEVICE APPLY] ISIS config: {device_info.get('isis_config', {})} or {device_info.get('is_is_config', {})}")
             
             # Step 1: Apply basic device configuration (interface, IP addresses, routes)
+            # Get ISIS config - handle both isis_config and is_is_config keys
+            isis_config = device_info.get("isis_config", {}) or device_info.get("is_is_config", {})
+            
             basic_payload = {
                 "device_id": device_id,
                 "device_name": device_name,
@@ -4311,7 +4471,7 @@ class DevicesTab(QWidget):
                 "protocols": device_info.get("protocols", []),
                 "bgp_config": device_info.get("bgp_config", {}),
                 "ospf_config": device_info.get("ospf_config", {}),
-                "isis_config": device_info.get("isis_config", {}) or device_info.get("is_is_config", {}),
+                "isis_config": isis_config,
             }
             
             # Apply basic device configuration
@@ -4354,10 +4514,11 @@ class DevicesTab(QWidget):
                 print(f"[DEBUG DEVICE APPLY] OSPF not configured - protocols: {protocols}, ospf_config: {ospf_config}")
             
             # Step 4: Configure ISIS if enabled
+            # Get ISIS config - handle both isis_config and is_is_config keys
             isis_config = device_info.get("isis_config", {}) or device_info.get("is_is_config", {})
             
             print(f"[DEBUG DEVICE APPLY] Checking ISIS - protocols: {protocols}, isis_config: {isis_config}")
-            if ("IS-IS" in protocols or "ISIS" in protocols) and isis_config:
+            if "IS-IS" in protocols and isis_config:
                 print(f"[INFO] Configuring ISIS for device {device_name}")
                 isis_success = self._apply_isis_to_server_sync(server_url, device_info)
                 if not isis_success:
@@ -4465,13 +4626,13 @@ class DevicesTab(QWidget):
             device_name = device_info.get("Device Name", "")
             device_id = device_info.get("device_id", "")
             
-            # Get ISIS config - handle both old dict format and new separate config format
+            # Get ISIS config - handle both isis_config and is_is_config keys, and old dict format
             isis_config = device_info.get("isis_config", {}) or device_info.get("is_is_config", {})
             if not isis_config:
                 # Try old format for backward compatibility
                 protocols = device_info.get("protocols", {})
                 if isinstance(protocols, dict):
-                    isis_config = protocols.get("IS-IS", {}) or protocols.get("ISIS", {})
+                    isis_config = protocols.get("ISIS", {}) or protocols.get("IS-IS", {}) or protocols.get("isis", {})
             
             if not isis_config:
                 return True  # No ISIS config to apply
@@ -4496,6 +4657,7 @@ class DevicesTab(QWidget):
         except Exception as e:
             print(f"[ERROR] Exception in sync ISIS apply for '{device_name}': {e}")
             return False
+    
     
     def _remove_device_from_data_structure(self, device_info):
         """Remove device from all_devices data structure."""
@@ -4737,14 +4899,10 @@ class DevicesTab(QWidget):
                     # Create a copy of ISIS config and update it based on incremented values
                     incremented_isis_config = isis_config.copy()
                     
-                    # Always update interface in ISIS config based on current VLAN
-                    if current_vlan and current_vlan != "0":
-                        incremented_isis_config["interface"] = f"vlan{current_vlan}"
-                    else:
-                        # If no VLAN, use the normalized interface name (extract physical interface from label)
-                        iface_label = device_data.get("Interface", iface)
-                        iface_norm = self._normalize_iface_label(iface_label)
-                        incremented_isis_config["interface"] = iface_norm
+                    # Update interface in ISIS config if VLAN was incremented
+                    if incr_vlan and i > 0:
+                        if current_vlan and current_vlan != "0":
+                            incremented_isis_config["interface"] = f"vlan{current_vlan}"
                     
                     # Update IPv4/IPv6 enabled flags based on incremented addresses
                     incremented_isis_config["ipv4_enabled"] = bool(current_ipv4)
@@ -4808,23 +4966,12 @@ class DevicesTab(QWidget):
             print(f"[DEBUG ADD DEVICE] Single device ISIS config: {isis_config}")
             if isis_config:
                 print(f"[DEBUG ADD DEVICE] Adding ISIS to single device {unique_name}")
-                # Create a copy of ISIS config and update interface based on VLAN
-                updated_isis_config = isis_config.copy()
-                
-                # Always update interface in ISIS config based on VLAN
-                if vlan and vlan != "0":
-                    updated_isis_config["interface"] = f"vlan{vlan}"
-                else:
-                    # If no VLAN, use the normalized interface name (extract physical interface from label)
-                    iface_norm = self._normalize_iface_label(iface)
-                    updated_isis_config["interface"] = iface_norm
-                
                 # Initialize protocols as list and isis_config as separate field
                 device_data["protocols"] = device_data.get("protocols", [])
                 if "IS-IS" not in device_data["protocols"]:
                     device_data["protocols"].append("IS-IS")
-                device_data["is_is_config"] = updated_isis_config  # Use is_is_config for consistency with database
-                device_data["isis_config"] = updated_isis_config   # Also store as isis_config for compatibility
+                device_data["is_is_config"] = isis_config  # Use is_is_config for consistency with database
+                device_data["isis_config"] = isis_config   # Also store as isis_config for compatibility
                 print(f"[DEBUG ADD DEVICE] ISIS added to single device {unique_name}: {device_data['is_is_config']}")
             else:
                 print(f"[DEBUG ADD DEVICE] ISIS NOT enabled for single device")
@@ -5908,7 +6055,7 @@ class DevicesTab(QWidget):
         except Exception as e:
             print(f"[MULTI DEVICE APPLY] Error handling progress: {e}")
     
-    def _on_multi_device_apply_finished(self, results, successful_count, failed_count, successful_device_names):
+    def _on_multi_device_apply_finished(self, results, successful_count, failed_count):
         """Handle completion of multi-device apply worker."""
         try:
             # Print results to console
@@ -5925,32 +6072,6 @@ class DevicesTab(QWidget):
                 print(f"[MULTI DEVICE APPLY] Saving session after successful device application")
                 self.main_window.save_session()
             
-            # Refresh device status for all successfully applied devices
-            if successful_count > 0 and successful_device_names:
-                # Collect all successfully applied device rows using the tracked device names
-                successful_device_rows = []
-                for row in range(self.devices_table.rowCount()):
-                    try:
-                        device_name_item = self.devices_table.item(row, self.COL["Device Name"])
-                        if device_name_item:
-                            device_name = device_name_item.text()
-                            # Check if this device is in the successful devices list
-                            if device_name in successful_device_names:
-                                successful_device_rows.append(row)
-                                print(f"[MULTI DEVICE APPLY] Found successfully applied device: {device_name} at row {row}")
-                    except Exception as e:
-                        print(f"[MULTI DEVICE APPLY] Error checking row {row}: {e}")
-                
-                # Refresh device status from database for all successfully applied devices
-                if successful_device_rows:
-                    print(f"[MULTI DEVICE APPLY] Refreshing device status for {len(successful_device_rows)} devices: {successful_device_names}")
-                    # Wait a moment for devices to fully start before refreshing
-                    QTimer.singleShot(3000, lambda rows=successful_device_rows: self._refresh_device_table_from_database(rows))
-                    # Also refresh protocol tables after a longer delay to allow protocols to establish
-                    QTimer.singleShot(5000, lambda rows=successful_device_rows: self._refresh_protocols_for_selected_devices(rows))
-                else:
-                    print(f"[MULTI DEVICE APPLY] Warning: Could not find table rows for successful devices: {successful_device_names}")
-            
             # Clean up worker reference
             if hasattr(self, 'multi_device_apply_worker'):
                 self.multi_device_apply_worker.deleteLater()
@@ -5959,10 +6080,6 @@ class DevicesTab(QWidget):
             # Clear the operation type flag
             if hasattr(self, '_current_operation_type'):
                 delattr(self, '_current_operation_type')
-            
-            # Clear pending successful devices list
-            if hasattr(self, '_pending_successful_devices'):
-                delattr(self, '_pending_successful_devices')
                 
         except Exception as e:
             print(f"[MULTI DEVICE APPLY FINISHED] Error handling completion: {e}")
@@ -6434,6 +6551,15 @@ class DevicesTab(QWidget):
         row = list(selected_rows)[0]
         device_name = self.bgp_table.item(row, 0).text()  # Device column
         
+        # Detect which address family is selected (IPv4 or IPv6)
+        neighbor_type_item = self.bgp_table.item(row, 2)  # Column 2 is "Neighbor Type"
+        if neighbor_type_item:
+            protocol_type = neighbor_type_item.text().strip()
+            is_ipv6 = protocol_type == "IPv6"
+        else:
+            # Fallback: assume IPv4 if not found
+            is_ipv6 = False
+        
         # Find the device in all_devices using safe helper
         device_info = self._find_device_by_name(device_name)
         
@@ -6447,16 +6573,16 @@ class DevicesTab(QWidget):
         gateway_ipv4 = device_info.get("IPv4 Gateway", "")
         gateway_ipv6 = device_info.get("IPv6 Gateway", "")
 
-        # Create dialog with current BGP configuration in edit mode
-        dialog = AddBgpDialog(self, device_name, edit_mode=True, device_ipv4=device_ipv4, device_ipv6=device_ipv6, gateway_ipv4=gateway_ipv4, gateway_ipv6=gateway_ipv6)
-        
         # Handle both old format (dict) and new format (list)
         if isinstance(device_info["protocols"], dict):
             current_bgp = device_info["protocols"]["BGP"]
         else:
             current_bgp = device_info.get("bgp_config", {})
         
-        # Pre-populate the dialog with current values
+        # Create dialog with current BGP configuration in edit mode
+        dialog = AddBgpDialog(self, device_name, edit_mode=True, device_ipv4=device_ipv4, device_ipv6=device_ipv6, gateway_ipv4=gateway_ipv4, gateway_ipv6=gateway_ipv6)
+        
+        # Pre-populate the dialog with current values (common fields)
         dialog.bgp_mode_combo.setCurrentText(current_bgp.get("bgp_mode", "eBGP"))
         dialog.bgp_asn_input.setText(current_bgp.get("bgp_asn", ""))
         dialog.bgp_remote_asn_input.setText(current_bgp.get("bgp_remote_asn", ""))
@@ -6465,27 +6591,49 @@ class DevicesTab(QWidget):
         dialog.bgp_keepalive_input.setValue(int(current_bgp.get("bgp_keepalive", "30")))
         dialog.bgp_hold_time_input.setValue(int(current_bgp.get("bgp_hold_time", "90")))
         
-        # Set protocol checkboxes based on current configuration
-        has_ipv4 = bool(current_bgp.get("bgp_neighbor_ipv4"))
-        has_ipv6 = bool(current_bgp.get("bgp_neighbor_ipv6"))
-        dialog.ipv4_enabled.setChecked(has_ipv4)
-        dialog.ipv6_enabled.setChecked(has_ipv6)
-        
-        # Pre-populate IPv4 fields - combine all IPv4 neighbor IPs
-        if has_ipv4:
-            dialog.bgp_neighbor_ipv4_input.setText(current_bgp.get("bgp_neighbor_ipv4", ""))
-            dialog.bgp_update_source_ipv4_input.setText(current_bgp.get("bgp_update_source_ipv4", ""))
-            # Use IPv4-specific remote ASN if available, otherwise fall back to general remote ASN
-            remote_asn_ipv4 = current_bgp.get("bgp_remote_asn_ipv4", current_bgp.get("bgp_remote_asn", ""))
-            dialog.bgp_remote_asn_ipv4_input.setText(remote_asn_ipv4)
-        
-        # Pre-populate IPv6 fields - combine all IPv6 neighbor IPs
-        if has_ipv6:
-            dialog.bgp_neighbor_ipv6_input.setText(current_bgp.get("bgp_neighbor_ipv6", ""))
-            dialog.bgp_update_source_ipv6_input.setText(current_bgp.get("bgp_update_source_ipv6", ""))
-            # Use IPv6-specific remote ASN if available, otherwise fall back to general remote ASN
-            remote_asn_ipv6 = current_bgp.get("bgp_remote_asn_ipv6", current_bgp.get("bgp_remote_asn", ""))
-            dialog.bgp_remote_asn_ipv6_input.setText(remote_asn_ipv6)
+        # Pre-populate only the selected address family's fields
+        if is_ipv6:
+            # Editing IPv6 row - only show IPv6 fields
+            dialog.ipv4_enabled.setChecked(False)
+            dialog.ipv6_enabled.setChecked(True)
+            
+            # Get the specific IPv6 neighbor IP from the selected row
+            neighbor_ip_item = self.bgp_table.item(row, 3)  # Column 3 is "Neighbor IP"
+            if neighbor_ip_item:
+                selected_neighbor_ipv6 = neighbor_ip_item.text().strip()
+                # Get all IPv6 neighbors and update the selected one
+                all_ipv6_neighbors = [ip.strip() for ip in current_bgp.get("bgp_neighbor_ipv6", "").split(",") if ip.strip()]
+                # Pre-populate with all IPv6 neighbors (the selected one will be updated)
+                dialog.bgp_neighbor_ipv6_input.setText(current_bgp.get("bgp_neighbor_ipv6", ""))
+                dialog.bgp_update_source_ipv6_input.setText(current_bgp.get("bgp_update_source_ipv6", ""))
+            else:
+                dialog.bgp_neighbor_ipv6_input.setText(current_bgp.get("bgp_neighbor_ipv6", ""))
+                dialog.bgp_update_source_ipv6_input.setText(current_bgp.get("bgp_update_source_ipv6", ""))
+            
+            # Clear IPv4 fields
+            dialog.bgp_neighbor_ipv4_input.clear()
+            dialog.bgp_update_source_ipv4_input.clear()
+        else:
+            # Editing IPv4 row - only show IPv4 fields
+            dialog.ipv4_enabled.setChecked(True)
+            dialog.ipv6_enabled.setChecked(False)
+            
+            # Get the specific IPv4 neighbor IP from the selected row
+            neighbor_ip_item = self.bgp_table.item(row, 3)  # Column 3 is "Neighbor IP"
+            if neighbor_ip_item:
+                selected_neighbor_ipv4 = neighbor_ip_item.text().strip()
+                # Get all IPv4 neighbors and update the selected one
+                all_ipv4_neighbors = [ip.strip() for ip in current_bgp.get("bgp_neighbor_ipv4", "").split(",") if ip.strip()]
+                # Pre-populate with all IPv4 neighbors (the selected one will be updated)
+                dialog.bgp_neighbor_ipv4_input.setText(current_bgp.get("bgp_neighbor_ipv4", ""))
+                dialog.bgp_update_source_ipv4_input.setText(current_bgp.get("bgp_update_source_ipv4", ""))
+            else:
+                dialog.bgp_neighbor_ipv4_input.setText(current_bgp.get("bgp_neighbor_ipv4", ""))
+                dialog.bgp_update_source_ipv4_input.setText(current_bgp.get("bgp_update_source_ipv4", ""))
+            
+            # Clear IPv6 fields
+            dialog.bgp_neighbor_ipv6_input.clear()
+            dialog.bgp_update_source_ipv6_input.clear()
         
         if dialog.exec_() != dialog.Accepted:
             return
@@ -6496,11 +6644,44 @@ class DevicesTab(QWidget):
         if "route_pools" in current_bgp:
             new_bgp_config["route_pools"] = current_bgp["route_pools"]
         
-        # Update the device with new BGP configuration
-        if isinstance(device_info["protocols"], dict):
-            device_info["protocols"]["BGP"] = new_bgp_config
+        # Merge with existing BGP config to preserve the other address family
+        merged_bgp_config = current_bgp.copy()
+        
+        # Only update the selected address family's configuration
+        if is_ipv6:
+            # Update IPv6 fields only
+            merged_bgp_config["bgp_neighbor_ipv6"] = new_bgp_config.get("bgp_neighbor_ipv6", "")
+            merged_bgp_config["bgp_update_source_ipv6"] = new_bgp_config.get("bgp_update_source_ipv6", "")
+            merged_bgp_config["ipv6_enabled"] = new_bgp_config.get("ipv6_enabled", True)
+            # Preserve IPv4 fields
+            merged_bgp_config["bgp_neighbor_ipv4"] = current_bgp.get("bgp_neighbor_ipv4", "")
+            merged_bgp_config["bgp_update_source_ipv4"] = current_bgp.get("bgp_update_source_ipv4", "")
+            merged_bgp_config["ipv4_enabled"] = current_bgp.get("ipv4_enabled", False)
         else:
-            device_info["bgp_config"] = new_bgp_config
+            # Update IPv4 fields only
+            merged_bgp_config["bgp_neighbor_ipv4"] = new_bgp_config.get("bgp_neighbor_ipv4", "")
+            merged_bgp_config["bgp_update_source_ipv4"] = new_bgp_config.get("bgp_update_source_ipv4", "")
+            merged_bgp_config["ipv4_enabled"] = new_bgp_config.get("ipv4_enabled", True)
+            # Preserve IPv6 fields
+            merged_bgp_config["bgp_neighbor_ipv6"] = current_bgp.get("bgp_neighbor_ipv6", "")
+            merged_bgp_config["bgp_update_source_ipv6"] = current_bgp.get("bgp_update_source_ipv6", "")
+            merged_bgp_config["ipv6_enabled"] = current_bgp.get("ipv6_enabled", False)
+        
+        # Update common fields (these apply to both families)
+        merged_bgp_config["bgp_mode"] = new_bgp_config.get("bgp_mode", merged_bgp_config.get("bgp_mode", "eBGP"))
+        merged_bgp_config["bgp_asn"] = new_bgp_config.get("bgp_asn", merged_bgp_config.get("bgp_asn", ""))
+        merged_bgp_config["bgp_remote_asn"] = new_bgp_config.get("bgp_remote_asn", merged_bgp_config.get("bgp_remote_asn", ""))
+        merged_bgp_config["bgp_keepalive"] = new_bgp_config.get("bgp_keepalive", merged_bgp_config.get("bgp_keepalive", "30"))
+        merged_bgp_config["bgp_hold_time"] = new_bgp_config.get("bgp_hold_time", merged_bgp_config.get("bgp_hold_time", "90"))
+        
+        # Update the device with merged BGP configuration
+        if isinstance(device_info["protocols"], dict):
+            device_info["protocols"]["BGP"] = merged_bgp_config
+        else:
+            device_info["bgp_config"] = merged_bgp_config
+        
+        # Update the device using the protocol update method
+        self._update_device_protocol(device_name, "BGP", merged_bgp_config)
         
         # Update the BGP table
         self.update_bgp_table()
@@ -6581,77 +6762,148 @@ class DevicesTab(QWidget):
             QMessageBox.warning(self, "No Selection", "Please select an OSPF configuration to edit.")
             return
 
-        # Get unique rows from selection
-        selected_rows = set()
-        for item in selected_items:
-            selected_rows.add(item.row())
+        row = selected_items[0].row()
+        device_name = self.ospf_table.item(row, 0).text()  # Device column
+        protocol_type_item = self.ospf_table.item(row, 3)  # Neighbor Type column (IPv4 or IPv6)
+        protocol_type = protocol_type_item.text() if protocol_type_item else "Unknown"
         
-        if len(selected_rows) > 1:
-            QMessageBox.warning(self, "Multiple Selection", "Please select only one OSPF configuration to edit.")
+        # Verify that we have a valid protocol type
+        if protocol_type not in ["IPv4", "IPv6"]:
+            QMessageBox.warning(self, "Invalid Selection", 
+                              f"Could not determine address family for selected row. Protocol type: {protocol_type}")
             return
         
-        row = list(selected_rows)[0]
-        device_name = self.ospf_table.item(row, 0).text()  # Device column
-        
-        # Find the device in all_devices using safe helper
-        device_info = self._find_device_by_name(device_name)
+        # Find the device in all_devices
+        device_info = None
+        for iface, devices in self.main_window.all_devices.items():
+            for device in devices:
+                if device.get("Device Name") == device_name:
+                    device_info = device
+                    break
+            if device_info:
+                break
         
         if not device_info:
             QMessageBox.warning(self, "Device Not Found", f"Device '{device_name}' not found.")
             return
         
-        # Check if OSPF is configured - handle both list and dict formats
-        has_ospf = False
-        protocols = device_info.get("protocols", [])
-        if isinstance(protocols, list):
-            has_ospf = "OSPF" in protocols
-        elif isinstance(protocols, dict):
-            has_ospf = "OSPF" in protocols
+        # Get current OSPF configuration
+        # protocols is a list (e.g., ["OSPF", "BGP", "ISIS"]), not a dict
+        # OSPF config is stored separately in ospf_config
+        current_ospf_config = device_info.get("ospf_config", {})
         
-        if not has_ospf and not device_info.get("ospf_config"):
-            QMessageBox.warning(self, "No OSPF Configuration", f"No OSPF configuration found for device '{device_name}'.")
-            return
+        # Determine which address family we're editing
+        is_ipv6 = protocol_type == "IPv6"
         
-        # Get current OSPF configuration - handle both old format (dict) and new format (list)
-        if isinstance(protocols, dict):
-            current_ospf_config = protocols.get("OSPF", {})
+        # Get the current area ID for the selected address family
+        # Support both old format (single area_id) and new format (separate area_id_ipv4/area_id_ipv6)
+        if is_ipv6:
+            current_area_id = current_ospf_config.get("area_id_ipv6") or current_ospf_config.get("area_id", "0.0.0.0")
         else:
-            current_ospf_config = device_info.get("ospf_config", {})
-            # Handle string JSON format
-            if isinstance(current_ospf_config, str):
-                try:
-                    import json
-                    current_ospf_config = json.loads(current_ospf_config) if current_ospf_config else {}
-                except:
-                    current_ospf_config = {}
+            current_area_id = current_ospf_config.get("area_id_ipv4") or current_ospf_config.get("area_id", "0.0.0.0")
         
-        # Create and show OSPF dialog in edit mode
+        # Create a temporary config for the dialog with the current area ID and graceful restart for this address family
+        dialog_config = current_ospf_config.copy()
+        dialog_config["area_id"] = current_area_id
+        
+        # Get the current graceful restart for the selected address family
+        # Support separate graceful restart for IPv4 and IPv6, with backward compatibility
+        if is_ipv6:
+            current_graceful_restart = current_ospf_config.get("graceful_restart_ipv6") or current_ospf_config.get("graceful_restart", False)
+        else:
+            current_graceful_restart = current_ospf_config.get("graceful_restart_ipv4") or current_ospf_config.get("graceful_restart", False)
+        
+        dialog_config["graceful_restart"] = current_graceful_restart
+        
+        # Create and show OSPF dialog
         from widgets.add_ospf_dialog import AddOspfDialog
-        dialog = AddOspfDialog(self, device_name=device_name, edit_mode=True, ospf_config=current_ospf_config)
+        dialog = AddOspfDialog(self, device_name, dialog_config)
         
         if dialog.exec_() == QDialog.Accepted:
             ospf_config = dialog.get_values()
+            new_area_id = ospf_config.get("area_id", "0.0.0.0")
+            new_graceful_restart = ospf_config.get("graceful_restart", False)
             
-            # Preserve existing interface and IP settings when editing
-            if "interface" in current_ospf_config:
-                ospf_config["interface"] = current_ospf_config["interface"]
-            if "ipv4_enabled" in current_ospf_config:
-                ospf_config["ipv4_enabled"] = current_ospf_config["ipv4_enabled"]
-            if "ipv6_enabled" in current_ospf_config:
-                ospf_config["ipv6_enabled"] = current_ospf_config["ipv6_enabled"]
+            # Preserve existing OSPF config fields that are not in the dialog
+            # (ipv4_enabled, ipv6_enabled, interface, etc.)
+            if current_ospf_config:
+                ospf_config.setdefault("ipv4_enabled", current_ospf_config.get("ipv4_enabled", False))
+                ospf_config.setdefault("ipv6_enabled", current_ospf_config.get("ipv6_enabled", False))
+                ospf_config.setdefault("interface", current_ospf_config.get("interface", ""))
+                
+                # Update only the area ID for the selected address family
+                # First, preserve or initialize both area IDs from existing config
+                # Get the base area_id from config (for backward compatibility)
+                base_area_id = current_ospf_config.get("area_id", "0.0.0.0")
+                
+                # Preserve or initialize IPv4 area ID
+                if "area_id_ipv4" in current_ospf_config:
+                    ospf_config["area_id_ipv4"] = current_ospf_config["area_id_ipv4"]
+                else:
+                    # If IPv4 area ID doesn't exist, initialize it from base area_id
+                    ospf_config["area_id_ipv4"] = base_area_id
+                
+                # Preserve or initialize IPv6 area ID
+                if "area_id_ipv6" in current_ospf_config:
+                    ospf_config["area_id_ipv6"] = current_ospf_config["area_id_ipv6"]
+                else:
+                    # If IPv6 area ID doesn't exist, initialize it from base area_id
+                    ospf_config["area_id_ipv6"] = base_area_id
+                
+                # Now update only the area ID for the selected address family
+                if is_ipv6:
+                    ospf_config["area_id_ipv6"] = new_area_id
+                    # Keep area_id_ipv4 unchanged (already set above)
+                else:
+                    ospf_config["area_id_ipv4"] = new_area_id
+                    # Keep area_id_ipv6 unchanged (already set above)
+                
+                # Update the old area_id field only if both address families use the same area
+                # Otherwise, keep it for backward compatibility with the last updated one
+                if ospf_config.get("area_id_ipv4") == ospf_config.get("area_id_ipv6"):
+                    ospf_config["area_id"] = ospf_config["area_id_ipv4"]
+                else:
+                    # If they differ, keep area_id as the one that was just updated
+                    ospf_config["area_id"] = new_area_id
+                
+                # Update only the graceful restart for the selected address family
+                # Preserve or initialize both graceful restart flags from existing config
+                # Get the base graceful_restart from config (for backward compatibility)
+                base_graceful_restart = current_ospf_config.get("graceful_restart", False)
+                
+                # Preserve or initialize IPv4 graceful restart
+                if "graceful_restart_ipv4" in current_ospf_config:
+                    ospf_config["graceful_restart_ipv4"] = current_ospf_config["graceful_restart_ipv4"]
+                else:
+                    # If IPv4 graceful restart doesn't exist, initialize it from base graceful_restart
+                    ospf_config["graceful_restart_ipv4"] = base_graceful_restart
+                
+                # Preserve or initialize IPv6 graceful restart
+                if "graceful_restart_ipv6" in current_ospf_config:
+                    ospf_config["graceful_restart_ipv6"] = current_ospf_config["graceful_restart_ipv6"]
+                else:
+                    # If IPv6 graceful restart doesn't exist, initialize it from base graceful_restart
+                    ospf_config["graceful_restart_ipv6"] = base_graceful_restart
+                
+                # Now update only the graceful restart for the selected address family
+                if is_ipv6:
+                    ospf_config["graceful_restart_ipv6"] = new_graceful_restart
+                    # Keep graceful_restart_ipv4 unchanged (already set above)
+                else:
+                    ospf_config["graceful_restart_ipv4"] = new_graceful_restart
+                    # Keep graceful_restart_ipv6 unchanged (already set above)
+                
+                # Update the old graceful_restart field only if both address families use the same setting
+                # Otherwise, keep it for backward compatibility with the last updated one
+                if ospf_config.get("graceful_restart_ipv4") == ospf_config.get("graceful_restart_ipv6"):
+                    ospf_config["graceful_restart"] = ospf_config["graceful_restart_ipv4"]
+                else:
+                    # If they differ, keep graceful_restart as the one that was just updated
+                    ospf_config["graceful_restart"] = new_graceful_restart
             
             # Update the device with OSPF configuration
-            if isinstance(protocols, dict):
-                device_info["protocols"]["OSPF"] = ospf_config
-            else:
-                device_info["ospf_config"] = ospf_config
-            
-            # Update the OSPF table
-            self.update_ospf_table()
-            
-            # Save session
-            if hasattr(self.main_window, "save_session"):
-                self.main_window.save_session()
+            # Pass device_name instead of row since row is from OSPF table, not devices table
+            self._update_device_protocol(device_name, "OSPF", ospf_config)
 
     def prompt_delete_ospf(self):
         """Delete OSPF configuration for selected device."""
@@ -6832,11 +7084,6 @@ class DevicesTab(QWidget):
                             ipv6_ips.append(neighbor_ip)
                         
                         bgp_config["bgp_neighbor_ipv6"] = ",".join(ipv6_ips)
-                    
-                    # Ensure both bgp_config locations are updated (for old and new format compatibility)
-                    if isinstance(device_info.get("protocols"), dict):
-                        device_info["protocols"]["BGP"] = bgp_config
-                    device_info["bgp_config"] = bgp_config
             
             elif column == 4:  # Source IP changed (column 4 after adding BGP Status)
                 source_ip_item = self.bgp_table.item(row, 4)
@@ -6870,11 +7117,6 @@ class DevicesTab(QWidget):
                         bgp_config["bgp_update_source_ipv4"] = source_ip
                     elif neighbor_type == "IPv6":
                         bgp_config["bgp_update_source_ipv6"] = source_ip
-                    
-                    # Ensure both bgp_config locations are updated (for old and new format compatibility)
-                    if isinstance(device_info.get("protocols"), dict):
-                        device_info["protocols"]["BGP"] = bgp_config
-                    device_info["bgp_config"] = bgp_config
             
             elif column == 5:  # Local AS changed (column 5 after adding BGP Status)
                 local_as_item = self.bgp_table.item(row, 5)
@@ -6896,19 +7138,11 @@ class DevicesTab(QWidget):
                         return
                     
                     bgp_config["bgp_asn"] = local_as
-                    
-                    # Ensure both bgp_config locations are updated (for old and new format compatibility)
-                    if isinstance(device_info.get("protocols"), dict):
-                        device_info["protocols"]["BGP"] = bgp_config
-                    device_info["bgp_config"] = bgp_config
             
             elif column == 6:  # Remote AS changed (column 6 after adding BGP Status)
                 remote_as_item = self.bgp_table.item(row, 6)
-                neighbor_type_item = self.bgp_table.item(row, 2)
-                
-                if remote_as_item and neighbor_type_item:
+                if remote_as_item:
                     remote_as = remote_as_item.text().strip()
-                    neighbor_type = neighbor_type_item.text()
                     
                     # Validate AS number
                     try:
@@ -6919,30 +7153,12 @@ class DevicesTab(QWidget):
                     except ValueError:
                         QMessageBox.warning(self, "Invalid Remote AS Number", 
                                           f"'{remote_as}' is not a valid AS number (must be 1-4294967295).")
-                        # Revert to original value based on neighbor type
-                        if neighbor_type == "IPv4":
-                            original_remote_asn = bgp_config.get("bgp_remote_asn_ipv4") or bgp_config.get("bgp_remote_asn", "")
-                        else:  # IPv6
-                            original_remote_asn = bgp_config.get("bgp_remote_asn_ipv6") or bgp_config.get("bgp_remote_asn", "")
+                        # Revert to original value
+                        original_remote_asn = bgp_config.get("bgp_remote_asn", "")
                         remote_as_item.setText(original_remote_asn)
                         return
                     
-                    # Update the appropriate remote ASN field based on neighbor type
-                    if neighbor_type == "IPv4":
-                        bgp_config["bgp_remote_asn_ipv4"] = remote_as
-                        # Also update general remote ASN for backward compatibility if not set separately
-                        if "bgp_remote_asn_ipv6" not in bgp_config:
-                            bgp_config["bgp_remote_asn"] = remote_as
-                    elif neighbor_type == "IPv6":
-                        bgp_config["bgp_remote_asn_ipv6"] = remote_as
-                        # Also update general remote ASN for backward compatibility if not set separately
-                        if "bgp_remote_asn_ipv4" not in bgp_config:
-                            bgp_config["bgp_remote_asn"] = remote_as
-                    
-                    # Ensure both bgp_config locations are updated (for old and new format compatibility)
-                    if isinstance(device_info.get("protocols"), dict):
-                        device_info["protocols"]["BGP"] = bgp_config
-                    device_info["bgp_config"] = bgp_config
+                    bgp_config["bgp_remote_asn"] = remote_as
             
             elif column == 10:  # Keepalive timer changed (column 10)
                 keepalive_item = self.bgp_table.item(row, 10)
@@ -6964,11 +7180,6 @@ class DevicesTab(QWidget):
                         return
                     
                     bgp_config["bgp_keepalive"] = keepalive
-                    
-                    # Ensure both bgp_config locations are updated (for old and new format compatibility)
-                    if isinstance(device_info.get("protocols"), dict):
-                        device_info["protocols"]["BGP"] = bgp_config
-                    device_info["bgp_config"] = bgp_config
             
             elif column == 11:  # Hold-time timer changed (column 11)
                 hold_time_item = self.bgp_table.item(row, 11)
@@ -6990,16 +7201,583 @@ class DevicesTab(QWidget):
                         return
                     
                     bgp_config["bgp_hold_time"] = hold_time
-                    
-                    # Ensure both bgp_config locations are updated (for old and new format compatibility)
-                    if isinstance(device_info.get("protocols"), dict):
-                        device_info["protocols"]["BGP"] = bgp_config
-                    device_info["bgp_config"] = bgp_config
             
             # Save session
             if hasattr(self.main_window, "save_session"):
                 self.main_window.save_session()
 
+    def on_ospf_table_cell_changed(self, row, column):
+        """Handle cell changes in OSPF table - handles inline editing of Area ID and Graceful Restart."""
+        # Only process Area ID (column 2) and Graceful Restart (column 10) columns
+        if column not in [2, 10]:
+            return
+        
+        # Get table items with null checks
+        device_item = self.ospf_table.item(row, 0)
+        if not device_item:
+            return
+        device_name = device_item.text()  # Device name column
+        
+        # Find the device in all_devices
+        device_info = None
+        for iface, devices in self.main_window.all_devices.items():
+            for device in devices:
+                if device.get("Device Name") == device_name:
+                    device_info = device
+                    break
+            if device_info:
+                break
+        
+        if device_info and "protocols" in device_info and "OSPF" in device_info["protocols"]:
+            # Handle both old format (dict) and new format (list)
+            if isinstance(device_info["protocols"], dict):
+                ospf_config = device_info["protocols"]["OSPF"]
+            else:
+                ospf_config = device_info.get("ospf_config", {})
+            
+            # Detect which address family is selected (IPv4 or IPv6)
+            neighbor_type_item = self.ospf_table.item(row, 3)  # Column 3 is "Neighbor Type"
+            if neighbor_type_item:
+                protocol_type = neighbor_type_item.text().strip()
+                is_ipv6 = protocol_type == "IPv6"
+            else:
+                # Fallback: assume IPv4 if not found
+                is_ipv6 = False
+            
+            if column == 2:  # Area ID changed (column 2)
+                area_id_item = self.ospf_table.item(row, 2)
+                
+                if area_id_item:
+                    new_area_id = area_id_item.text().strip()
+                    
+                    # Validate area ID format (supports both decimal and dotted-decimal)
+                    try:
+                        if new_area_id:
+                            # Try to parse as decimal (0-4294967295)
+                            try:
+                                area_decimal = int(new_area_id)
+                                if area_decimal < 0 or area_decimal > 4294967295:
+                                    raise ValueError("Area ID out of range")
+                            except ValueError:
+                                # Try to parse as dotted-decimal (A.B.C.D)
+                                try:
+                                    parts = new_area_id.split(".")
+                                    if len(parts) != 4:
+                                        raise ValueError("Invalid dotted-decimal format")
+                                    for part in parts:
+                                        if not (0 <= int(part) <= 255):
+                                            raise ValueError("Octet out of range")
+                                except (ValueError, AttributeError):
+                                    raise ValueError("Invalid area ID format")
+                    except ValueError as e:
+                        QMessageBox.warning(self, "Invalid Area ID", 
+                                          f"'{new_area_id}' is not a valid OSPF area ID.\n"
+                                          f"Area ID must be:\n"
+                                          f"- Decimal: 0-4294967295\n"
+                                          f"- Dotted-decimal: A.B.C.D (each octet 0-255)")
+                        # Revert to original value
+                        if is_ipv6:
+                            original_area = ospf_config.get("area_id_ipv6") or ospf_config.get("area_id", "0.0.0.0")
+                        else:
+                            original_area = ospf_config.get("area_id_ipv4") or ospf_config.get("area_id", "0.0.0.0")
+                        area_id_item.setText(original_area)
+                        return
+                    
+                    # Update only the selected address family's area ID
+                    if is_ipv6:
+                        ospf_config["area_id_ipv6"] = new_area_id
+                        # Update generic area_id only if both are the same
+                        if ospf_config.get("area_id_ipv4") == new_area_id:
+                            ospf_config["area_id"] = new_area_id
+                    else:
+                        ospf_config["area_id_ipv4"] = new_area_id
+                        # Update generic area_id only if both are the same
+                        if ospf_config.get("area_id_ipv6") == new_area_id:
+                            ospf_config["area_id"] = new_area_id
+            
+            elif column == 10:  # Graceful Restart changed (column 10)
+                graceful_restart_item = self.ospf_table.item(row, 10)
+                
+                if graceful_restart_item:
+                    graceful_restart_text = graceful_restart_item.text().strip().lower()
+                    
+                    # Validate graceful restart value (Yes/No)
+                    if graceful_restart_text not in ["yes", "no", "true", "false", "1", "0", ""]:
+                        QMessageBox.warning(self, "Invalid Graceful Restart Value", 
+                                          f"'{graceful_restart_text}' is not a valid graceful restart value.\n"
+                                          f"Please use: Yes, No, True, False, 1, or 0")
+                        # Revert to original value
+                        if is_ipv6:
+                            original_gr = ospf_config.get("graceful_restart_ipv6", False)
+                        else:
+                            original_gr = ospf_config.get("graceful_restart_ipv4", False)
+                        graceful_restart_item.setText("Yes" if original_gr else "No")
+                        return
+                    
+                    # Convert text to boolean
+                    graceful_restart = graceful_restart_text in ["yes", "true", "1"]
+                    
+                    # Update only the selected address family's graceful restart
+                    if is_ipv6:
+                        ospf_config["graceful_restart_ipv6"] = graceful_restart
+                        # Update generic graceful_restart only if both are the same
+                        if ospf_config.get("graceful_restart_ipv4") == graceful_restart:
+                            ospf_config["graceful_restart"] = graceful_restart
+                    else:
+                        ospf_config["graceful_restart_ipv4"] = graceful_restart
+                        # Update generic graceful_restart only if both are the same
+                        if ospf_config.get("graceful_restart_ipv6") == graceful_restart:
+                            ospf_config["graceful_restart"] = graceful_restart
+            
+            # Update the device using the protocol update method
+            self._update_device_protocol(device_name, "OSPF", ospf_config)
+            
+            # Save session
+            if hasattr(self.main_window, "save_session"):
+                self.main_window.save_session()
+
+    def on_isis_table_cell_changed(self, row, column):
+        """Handle cell changes in ISIS table - handles inline editing of ISIS Net, System ID, Hello Interval, and Multiplier."""
+        # Only process editable columns: ISIS Net (6), System ID (7), Hello Interval (8), Multiplier (9)
+        if column not in [6, 7, 8, 9]:
+            return
+        
+        # Prevent infinite loops by checking if we're already processing a cell change
+        # This can happen when update_isis_table() programmatically updates cells
+        if hasattr(self, '_processing_isis_cell_change') and self._processing_isis_cell_change:
+            return
+        self._processing_isis_cell_change = True
+        
+        try:
+            # Get table items with null checks
+            device_item = self.isis_table.item(row, 0)
+            if not device_item:
+                return
+            device_name = device_item.text()  # Device name column
+            
+            # Find the device in all_devices
+            device_info = None
+            for iface, devices in self.main_window.all_devices.items():
+                for device in devices:
+                    if device.get("Device Name") == device_name:
+                        device_info = device
+                        break
+                if device_info:
+                    break
+            
+            # Check if ISIS is configured
+            protocols = device_info.get("protocols", []) if device_info else []
+            is_isis_configured = False
+            if isinstance(protocols, list):
+                is_isis_configured = "ISIS" in protocols or "IS-IS" in protocols
+            elif isinstance(protocols, dict):
+                is_isis_configured = "IS-IS" in protocols or "ISIS" in protocols
+            
+            if device_info and is_isis_configured:
+                # Handle both old format (dict) and new format (list)
+                if isinstance(protocols, dict):
+                    isis_config = protocols.get("IS-IS", {}) or protocols.get("ISIS", {})
+                else:
+                    # Check both isis_config and is_is_config for backward compatibility
+                    isis_config = device_info.get("isis_config", {}) or device_info.get("is_is_config", {})
+                
+                # Get current ISIS config to preserve all fields
+                # Make a deep copy to preserve all original values, including ipv4_enabled and ipv6_enabled
+                current_isis_config = isis_config.copy() if isis_config else {}
+                
+                # Initialize isis_config to current_isis_config as starting point for updates
+                # This ensures we always have a valid config to update
+                isis_config = current_isis_config.copy()
+                
+                # Ensure we preserve ipv4_enabled and ipv6_enabled from the original config
+                # If they're not in the config, try to infer from device's IP addresses
+                # Default to True if device has IP addresses, to ensure rows are shown
+                if "ipv4_enabled" not in current_isis_config:
+                    # Try to get from device's IPv4 address
+                    if device_info.get("ipv4_address") or device_info.get("IPv4 Address"):
+                        current_isis_config["ipv4_enabled"] = True
+                    else:
+                        # Default to True if we can't determine, to ensure rows are shown
+                        current_isis_config["ipv4_enabled"] = True
+                if "ipv6_enabled" not in current_isis_config:
+                    # Try to get from device's IPv6 address
+                    if device_info.get("ipv6_address") or device_info.get("IPv6 Address"):
+                        current_isis_config["ipv6_enabled"] = True
+                    else:
+                        # Default to True if we can't determine, to ensure rows are shown
+                        current_isis_config["ipv6_enabled"] = True
+                
+                # Detect which address family is selected (IPv4 or IPv6) from the table row
+                neighbor_type_item = self.isis_table.item(row, 2)  # Column 2 is "Neighbor Type"
+                if neighbor_type_item:
+                    protocol_type = neighbor_type_item.text().strip()
+                    is_ipv6 = protocol_type == "IPv6"
+                else:
+                    # Fallback: assume IPv4 if not found
+                    is_ipv6 = False
+                
+                if column == 7:  # ISIS Net changed (column 7, after adding Neighbor Hostname)
+                    isis_net_item = self.isis_table.item(row, 7)
+                    
+                    if isis_net_item:
+                        new_isis_net = isis_net_item.text().strip()
+                        
+                        # Validate ISIS Net format (Network Entity Title format: XX.XXXX.XXXX.XXXX.XXXX.XX)
+                        # Example: 49.0001.0000.0000.0001.00
+                        # Only validate if the field is not empty and seems complete (has 5 dots)
+                        # This allows partial input during typing
+                        if new_isis_net:
+                            # Split by dots
+                            parts = new_isis_net.split(".")
+                            # Only validate if it looks like a complete NET (6 parts)
+                            if len(parts) == 6:
+                                try:
+                                    # Validate each part
+                                    for i, part in enumerate(parts):
+                                        if not part:
+                                            raise ValueError(f"Part {i+1} cannot be empty")
+                                        # Each part should be hexadecimal (0-9, A-F)
+                                        try:
+                                            int(part, 16)
+                                        except ValueError:
+                                            raise ValueError(f"Part {i+1} '{part}' is not valid hexadecimal")
+                                        
+                                        # Validate length (format: XX.XXXX.XXXX.XXXX.XXXX.XX)
+                                        if i == 0 or i == 5:  # First and last parts: 2 hex digits
+                                            if len(part) != 2:
+                                                raise ValueError(f"Part {i+1} '{part}' must be exactly 2 hexadecimal digits")
+                                        else:  # Middle parts: 4 hex digits
+                                            if len(part) != 4:
+                                                raise ValueError(f"Part {i+1} '{part}' must be exactly 4 hexadecimal digits")
+                                    
+                                    # Validation passed - update the config
+                                    # Preserve all existing fields, especially ipv4_enabled and ipv6_enabled
+                                    # Note: isis_config was already initialized from current_isis_config at line 7372
+                                    # So we just need to update the area_id field (don't copy again)
+                                    if "area_id" not in isis_config or isis_config.get("area_id") != new_isis_net:
+                                        isis_config["area_id"] = new_isis_net
+                                        # Debug logs disabled
+                                    
+                                    # Ensure ipv4_enabled and ipv6_enabled are preserved
+                                    if "ipv4_enabled" not in isis_config:
+                                        isis_config["ipv4_enabled"] = current_isis_config.get("ipv4_enabled", True)
+                                    if "ipv6_enabled" not in isis_config:
+                                        isis_config["ipv6_enabled"] = current_isis_config.get("ipv6_enabled", True)
+                                    
+                                    # Debug: Log the update
+                                    # Debug logs disabled
+                                except ValueError as e:
+                                    # Only show error if it's clearly invalid (not just incomplete)
+                                    # Check if it's a partial input (has dots but not 6 parts)
+                                    if len(parts) < 6 and "." in new_isis_net:
+                                        # Partial input - allow it, don't validate yet
+                                        # Preserve all existing fields
+                                        isis_config = current_isis_config.copy()
+                                        isis_config["area_id"] = new_isis_net
+                                        # Ensure ipv4_enabled and ipv6_enabled are preserved
+                                        if "ipv4_enabled" not in isis_config:
+                                            isis_config["ipv4_enabled"] = current_isis_config.get("ipv4_enabled", False)
+                                        if "ipv6_enabled" not in isis_config:
+                                            isis_config["ipv6_enabled"] = current_isis_config.get("ipv6_enabled", False)
+                                    else:
+                                        # Invalid format - show error and revert
+                                        QMessageBox.warning(self, "Invalid ISIS Net Format", 
+                                                          f"'{new_isis_net}' is not a valid ISIS Network Entity Title (NET).\n\n"
+                                                          f"Format: XX.XXXX.XXXX.XXXX.XXXX.XX\n"
+                                                          f"Example: 49.0001.0000.0000.0001.00\n\n"
+                                                          f"Error: {str(e)}")
+                                        # Revert to original value - check if item still exists
+                                        try:
+                                            original_net = current_isis_config.get("area_id", "")
+                                            if isis_net_item:  # Check if item still exists
+                                                isis_net_item.setText(original_net)
+                                        except RuntimeError:
+                                            # Item was deleted, ignore
+                                            pass
+                                        return
+                        else:
+                            # Partial input (doesn't have 6 parts yet) - allow it
+                            # Preserve all existing fields
+                            isis_config = current_isis_config.copy()
+                            isis_config["area_id"] = new_isis_net
+                            # Ensure ipv4_enabled and ipv6_enabled are preserved
+                            if "ipv4_enabled" not in isis_config:
+                                isis_config["ipv4_enabled"] = current_isis_config.get("ipv4_enabled", False)
+                            if "ipv6_enabled" not in isis_config:
+                                isis_config["ipv6_enabled"] = current_isis_config.get("ipv6_enabled", False)
+                    else:
+                        # Empty value - allow it
+                        # Preserve all existing fields
+                        isis_config = current_isis_config.copy()
+                        isis_config["area_id"] = new_isis_net
+                        # Ensure ipv4_enabled and ipv6_enabled are preserved
+                        if "ipv4_enabled" not in isis_config:
+                            isis_config["ipv4_enabled"] = current_isis_config.get("ipv4_enabled", False)
+                        if "ipv6_enabled" not in isis_config:
+                            isis_config["ipv6_enabled"] = current_isis_config.get("ipv6_enabled", False)
+                
+                elif column == 8:  # System ID changed (column 8, after adding Neighbor Hostname)
+                    system_id_item = self.isis_table.item(row, 8)
+                    
+                    if system_id_item:
+                        new_system_id = system_id_item.text().strip()
+                    
+                    # Only validate if the field is not empty and seems complete (has 2 dots)
+                    # This allows partial input during typing
+                    if new_system_id:
+                        # Split by dots
+                        parts = new_system_id.split(".")
+                        # Only validate if it looks like a complete System ID (3 parts)
+                        if len(parts) == 3:
+                            try:
+                                # Validate each part
+                                for i, part in enumerate(parts):
+                                    if not part:
+                                        raise ValueError(f"Part {i+1} cannot be empty")
+                                    
+                                    # Each part must be exactly 4 hexadecimal digits (XXXX format)
+                                    if len(part) != 4:
+                                        raise ValueError(f"Part {i+1} '{part}' must be exactly 4 hexadecimal digits (XXXX format)")
+                                    
+                                    # Each part should be hexadecimal (0-9, A-F, case-insensitive)
+                                    try:
+                                        int(part, 16)
+                                    except ValueError:
+                                        raise ValueError(f"Part {i+1} '{part}' is not valid hexadecimal. Must be 4 hexadecimal digits (0-9, A-F)")
+                                
+                                # Convert to uppercase for consistency (ISIS System ID is typically uppercase)
+                                normalized_system_id = ".".join(part.upper() for part in parts)
+                                if normalized_system_id != new_system_id:
+                                    # Update the table cell with uppercase version
+                                    new_system_id = normalized_system_id
+                                    if system_id_item:
+                                        try:
+                                            system_id_item.setText(normalized_system_id)
+                                        except RuntimeError:
+                                            pass
+                                
+                                # Validation passed - update the config
+                                # Preserve all existing fields, especially ipv4_enabled and ipv6_enabled
+                                # Note: isis_config was already initialized from current_isis_config at line 7372
+                                # So we just need to update the system_id field (don't copy again)
+                                isis_config["system_id"] = normalized_system_id
+                                
+                                # Debug: Log the update
+                                # Debug logs disabled
+                                
+                                # Ensure ipv4_enabled and ipv6_enabled are preserved
+                                if "ipv4_enabled" not in isis_config:
+                                    isis_config["ipv4_enabled"] = current_isis_config.get("ipv4_enabled", True)
+                                if "ipv6_enabled" not in isis_config:
+                                    isis_config["ipv6_enabled"] = current_isis_config.get("ipv6_enabled", True)
+                            except ValueError as e:
+                                # Only show error if it's clearly invalid (not just incomplete)
+                                # Check if it's a partial input (has dots but not 3 parts)
+                                if len(parts) < 3 and "." in new_system_id:
+                                    # Partial input - allow it, don't validate yet
+                                    # Preserve all existing fields
+                                    # Note: isis_config was already initialized from current_isis_config at line 7372
+                                    # So we just need to update the system_id field (don't copy again)
+                                    isis_config["system_id"] = new_system_id
+                                    # Ensure ipv4_enabled and ipv6_enabled are preserved
+                                    if "ipv4_enabled" not in isis_config:
+                                        isis_config["ipv4_enabled"] = current_isis_config.get("ipv4_enabled", True)
+                                    if "ipv6_enabled" not in isis_config:
+                                        isis_config["ipv6_enabled"] = current_isis_config.get("ipv6_enabled", True)
+                                else:
+                                    # Invalid format - show error and revert
+                                    QMessageBox.warning(self, "Invalid System ID Format", 
+                                                      f"'{new_system_id}' is not a valid ISIS System ID.\n\n"
+                                                      f"System ID must be in format: XXXX.XXXX.XXXX\n"
+                                                      f"Where each XXXX is exactly 4 hexadecimal digits (0-9, A-F)\n"
+                                                      f"Example: 0000.0000.0001 or AAAA.BBBB.CCCC\n\n"
+                                                      f"Error: {str(e)}")
+                                    # Revert to original value - check if item still exists
+                                    try:
+                                        original_system_id = current_isis_config.get("system_id", "")
+                                        if system_id_item:  # Check if item still exists
+                                            system_id_item.setText(original_system_id)
+                                    except RuntimeError:
+                                        # Item was deleted, ignore
+                                        pass
+                                    return
+                        else:
+                            # Partial input (doesn't have 3 parts yet) - allow it
+                            # Preserve all existing fields
+                            # Note: isis_config was already initialized from current_isis_config at line 7372
+                            # So we just need to update the system_id field (don't copy again)
+                            isis_config["system_id"] = new_system_id
+                            # Ensure ipv4_enabled and ipv6_enabled are preserved
+                            if "ipv4_enabled" not in isis_config:
+                                isis_config["ipv4_enabled"] = current_isis_config.get("ipv4_enabled", True)
+                            if "ipv6_enabled" not in isis_config:
+                                isis_config["ipv6_enabled"] = current_isis_config.get("ipv6_enabled", True)
+                    else:
+                        # Empty value - allow it
+                        # Preserve all existing fields
+                        # Note: isis_config was already initialized from current_isis_config at line 7372
+                        # So we just need to update the system_id field (don't copy again)
+                        isis_config["system_id"] = new_system_id
+                        # Ensure ipv4_enabled and ipv6_enabled are preserved
+                        if "ipv4_enabled" not in isis_config:
+                            isis_config["ipv4_enabled"] = current_isis_config.get("ipv4_enabled", True)
+                        if "ipv6_enabled" not in isis_config:
+                            isis_config["ipv6_enabled"] = current_isis_config.get("ipv6_enabled", True)
+                
+                elif column == 9:  # Hello Interval changed (column 9, after adding Neighbor Hostname)
+                    hello_interval_item = self.isis_table.item(row, 9)
+                    
+                    if hello_interval_item:
+                        hello_interval = hello_interval_item.text().strip()
+                    
+                    # Validate Hello Interval (1-65535 seconds)
+                    # Allow empty or partial input during typing
+                    if hello_interval:
+                        try:
+                            interval_value = int(hello_interval)
+                            if interval_value < 1 or interval_value > 65535:
+                                raise ValueError("Hello Interval out of range")
+                            # Validation passed - update the config
+                            isis_config["hello_interval"] = hello_interval
+                        except ValueError as e:
+                            # Check if it's a partial number (could be valid once complete)
+                            if hello_interval.isdigit() or (hello_interval.startswith('-') and hello_interval[1:].isdigit()):
+                                # Partial number - allow it, don't validate yet
+                                # Preserve all existing fields
+                                isis_config = current_isis_config.copy()
+                                isis_config["hello_interval"] = hello_interval
+                                # Ensure ipv4_enabled and ipv6_enabled are preserved
+                                if "ipv4_enabled" not in isis_config:
+                                    isis_config["ipv4_enabled"] = current_isis_config.get("ipv4_enabled", False)
+                                if "ipv6_enabled" not in isis_config:
+                                    isis_config["ipv6_enabled"] = current_isis_config.get("ipv6_enabled", False)
+                            else:
+                                # Invalid format - show error and revert
+                                QMessageBox.warning(self, "Invalid Hello Interval", 
+                                                  f"'{hello_interval}' is not a valid Hello Interval.\n"
+                                                  f"Hello Interval must be between 1 and 65535 seconds.")
+                                # Revert to original value - check if item still exists
+                                try:
+                                    original_hello_interval = str(current_isis_config.get("hello_interval", "10"))
+                                    if hello_interval_item:  # Check if item still exists
+                                        hello_interval_item.setText(original_hello_interval)
+                                except RuntimeError:
+                                    # Item was deleted, ignore
+                                    pass
+                                return
+                    else:
+                        # Empty value - allow it
+                        # Preserve all existing fields
+                        isis_config = current_isis_config.copy()
+                        isis_config["hello_interval"] = hello_interval
+                        # Ensure ipv4_enabled and ipv6_enabled are preserved
+                        if "ipv4_enabled" not in isis_config:
+                            isis_config["ipv4_enabled"] = current_isis_config.get("ipv4_enabled", False)
+                        if "ipv6_enabled" not in isis_config:
+                            isis_config["ipv6_enabled"] = current_isis_config.get("ipv6_enabled", False)
+                
+                elif column == 10:  # Multiplier changed (column 10, after adding Neighbor Hostname)
+                    multiplier_item = self.isis_table.item(row, 10)
+                    
+                    if multiplier_item:
+                        multiplier = multiplier_item.text().strip()
+                    
+                    # Validate Multiplier (1-100)
+                    # Allow empty or partial input during typing
+                    if multiplier:
+                        try:
+                            multiplier_value = int(multiplier)
+                            if multiplier_value < 1 or multiplier_value > 100:
+                                raise ValueError("Multiplier out of range")
+                            # Validation passed - update the config
+                            # Preserve all existing fields, especially ipv4_enabled and ipv6_enabled
+                            isis_config = current_isis_config.copy()
+                            isis_config["hello_multiplier"] = multiplier
+                            
+                            # Ensure ipv4_enabled and ipv6_enabled are preserved
+                            if "ipv4_enabled" not in isis_config:
+                                isis_config["ipv4_enabled"] = current_isis_config.get("ipv4_enabled", False)
+                            if "ipv6_enabled" not in isis_config:
+                                isis_config["ipv6_enabled"] = current_isis_config.get("ipv6_enabled", False)
+                        except ValueError as e:
+                            # Check if it's a partial number (could be valid once complete)
+                            if multiplier.isdigit() or (multiplier.startswith('-') and multiplier[1:].isdigit()):
+                                # Partial number - allow it, don't validate yet
+                                # Preserve all existing fields
+                                isis_config = current_isis_config.copy()
+                                isis_config["hello_multiplier"] = multiplier
+                                # Ensure ipv4_enabled and ipv6_enabled are preserved
+                                if "ipv4_enabled" not in isis_config:
+                                    isis_config["ipv4_enabled"] = current_isis_config.get("ipv4_enabled", False)
+                                if "ipv6_enabled" not in isis_config:
+                                    isis_config["ipv6_enabled"] = current_isis_config.get("ipv6_enabled", False)
+                            else:
+                                # Invalid format - show error and revert
+                                QMessageBox.warning(self, "Invalid Multiplier", 
+                                                  f"'{multiplier}' is not a valid Multiplier.\n"
+                                                  f"Multiplier must be between 1 and 100.")
+                                # Revert to original value - check if item still exists
+                                try:
+                                    original_multiplier = str(current_isis_config.get("hello_multiplier", "3"))
+                                    if multiplier_item:  # Check if item still exists
+                                        multiplier_item.setText(original_multiplier)
+                                except RuntimeError:
+                                    # Item was deleted, ignore
+                                    pass
+                                return
+                    else:
+                        # Empty value - allow it
+                        # Preserve all existing fields
+                        isis_config = current_isis_config.copy()
+                        isis_config["hello_multiplier"] = multiplier
+                        # Ensure ipv4_enabled and ipv6_enabled are preserved
+                        if "ipv4_enabled" not in isis_config:
+                            isis_config["ipv4_enabled"] = current_isis_config.get("ipv4_enabled", False)
+                        if "ipv6_enabled" not in isis_config:
+                            isis_config["ipv6_enabled"] = current_isis_config.get("ipv6_enabled", False)
+            
+                # Always ensure ipv4_enabled and ipv6_enabled are set before updating
+                # This prevents them from being lost during updates
+                if "ipv4_enabled" not in isis_config:
+                    isis_config["ipv4_enabled"] = current_isis_config.get("ipv4_enabled", False)
+                if "ipv6_enabled" not in isis_config:
+                    isis_config["ipv6_enabled"] = current_isis_config.get("ipv6_enabled", False)
+                
+                # Ensure isis_config is initialized (should be set by column handlers above)
+                # Only initialize if not already set by column handlers (don't overwrite updates)
+                # Check if area_id was updated by a column handler (e.g., ISIS Net column)
+                area_id_was_updated = False
+                if isis_config and "area_id" in isis_config:
+                    # Check if the area_id in isis_config differs from current_isis_config
+                    if isis_config.get("area_id") != current_isis_config.get("area_id"):
+                        area_id_was_updated = True
+                        # Debug logs disabled
+                
+                if not isis_config:
+                    isis_config = current_isis_config.copy()
+                elif not area_id_was_updated and "area_id" not in isis_config and current_isis_config.get("area_id"):
+                    # Only restore area_id if it wasn't set by a column handler
+                    isis_config["area_id"] = current_isis_config.get("area_id")
+                    # Debug logs disabled
+                
+                # Debug logs disabled
+                
+                # Update the device using the protocol update method
+                # Note: This will update both is_is_config and isis_config for backward compatibility
+                # Use a flag to prevent infinite recursion
+                if not getattr(self, '_updating_isis_protocol', False):
+                    self._updating_isis_protocol = True
+                    try:
+                        self._update_device_protocol(device_name, "IS-IS", isis_config)
+                        # Save session only once, not on every recursive call
+                        if hasattr(self.main_window, "save_session"):
+                            self.main_window.save_session()
+                    finally:
+                        self._updating_isis_protocol = False
+        finally:
+            # Always clear the processing flag, even if there was an error
+            if hasattr(self, '_processing_isis_cell_change'):
+                self._processing_isis_cell_change = False
 
     def prompt_add_ospf(self):
         """Add OSPF configuration to selected device."""
@@ -7058,10 +7836,27 @@ class DevicesTab(QWidget):
         # Update the device with IS-IS configuration
         self._update_device_protocol(row, "IS-IS", isis_config)
 
-    def _update_device_protocol(self, row, protocol, config):
-        """Update device with protocol configuration."""
+    def _update_device_protocol(self, row_or_device_name, protocol, config):
+        """Update device with protocol configuration.
+        
+        Args:
+            row_or_device_name: Either a row index (int) from devices_table or a device_name (str)
+            protocol: Protocol name (e.g., "OSPF", "BGP", "IS-IS")
+            config: Protocol configuration dictionary
+        """
         # Store protocol configuration in device data for protocol-specific tabs
-        device_name = self.devices_table.item(row, self.COL["Device Name"]).text()
+        # Support both row index (int) and device_name (str)
+        if isinstance(row_or_device_name, str):
+            device_name = row_or_device_name
+        else:
+            # It's a row index from devices_table
+            device_name_item = self.devices_table.item(row_or_device_name, self.COL["Device Name"])
+            if device_name_item is None:
+                # If row doesn't exist in devices_table, try to get device_name from protocol tables
+                # This handles the case where we're editing from OSPF/BGP/ISIS tables
+                QMessageBox.warning(self, "Error", f"Could not find device name for row {row_or_device_name}. Please try again.")
+                return
+            device_name = device_name_item.text()
         
         # Find the device in all_devices and update its protocol configuration
         for iface, devices in self.main_window.all_devices.items():
@@ -7076,22 +7871,60 @@ class DevicesTab(QWidget):
                     if isinstance(device["protocols"], list):
                         if protocol not in device["protocols"]:
                             device["protocols"].append(protocol)
-                        # Store the config in a separate field
-                        device[f"{protocol.lower().replace('-', '_')}_config"] = config
+                        # Merge with existing config to preserve fields not in the update
+                        config_key = f"{protocol.lower().replace('-', '_')}_config"
+                        # For ISIS, check both is_is_config and isis_config for backward compatibility
+                        if protocol in ["IS-IS", "ISIS"]:
+                            existing_config = device.get(config_key, {}) or device.get("isis_config", {})
+                        else:
+                            existing_config = device.get(config_key, {})
+                        if existing_config:
+                            # Merge: new values override existing, but preserve missing fields
+                            merged_config = existing_config.copy()
+                            merged_config.update(config)  # Update with new values
+                            # For ISIS config, ensure ipv4_enabled and ipv6_enabled are preserved if not in update
+                            if protocol in ["IS-IS", "ISIS"]:
+                                if "ipv4_enabled" not in config and "ipv4_enabled" in existing_config:
+                                    merged_config["ipv4_enabled"] = existing_config["ipv4_enabled"]
+                                if "ipv6_enabled" not in config and "ipv6_enabled" in existing_config:
+                                    merged_config["ipv6_enabled"] = existing_config["ipv6_enabled"]
+                            device[config_key] = merged_config
+                            # For ISIS, also update isis_config for backward compatibility
+                            if protocol in ["IS-IS", "ISIS"]:
+                                device["isis_config"] = merged_config
+                        else:
+                            # No existing config, use new config as-is
+                            device[config_key] = config
+                            # For ISIS, also update isis_config for backward compatibility
+                            if protocol in ["IS-IS", "ISIS"]:
+                                device["isis_config"] = config
                     else:
                         # If protocols is a dict (old format), store config there
                         device["protocols"][protocol] = config
                     
-                    print(f"[DEBUG PROTOCOL] Added {protocol} config to device '{device_name}'")
+                    # Debug logs disabled
                     break
         
         # Update the protocol-specific tables based on the protocol
+        # Temporarily disconnect cellChanged signals to prevent infinite loops
         if protocol == "BGP":
+            # Temporarily disconnect to prevent infinite loop
+            self.bgp_table.cellChanged.disconnect()
             self.update_bgp_table()
+            # Reconnect after update
+            self.bgp_table.cellChanged.connect(self.on_bgp_table_cell_changed)
         elif protocol == "OSPF":
+            # Temporarily disconnect to prevent infinite loop
+            self.ospf_table.cellChanged.disconnect()
             self.update_ospf_table()
-        elif protocol == "IS-IS":
-            self.update_isis_table()
+            # Reconnect after update
+            self.ospf_table.cellChanged.connect(self.on_ospf_table_cell_changed)
+        elif protocol == "IS-IS" or protocol == "ISIS":
+            # Don't refresh the table immediately after editing - let the user finish
+            # The table will refresh on the next periodic update or when Apply is clicked
+            # This prevents infinite loops and overwriting user edits
+            # Skip table refresh for ISIS to prevent recursion
+            pass
         
         # Save session
         if hasattr(self.main_window, "save_session"):
@@ -8257,6 +9090,22 @@ class DevicesTab(QWidget):
         success_count = 0
         failed_devices = []
         
+        # Track which address families are selected for each device
+        device_address_families = {}  # device_name -> set of address families (IPv4, IPv6)
+        
+        if selected_items:
+            # Track selected address families from BGP table rows
+            for item in selected_items:
+                row = item.row()
+                device_name = self.bgp_table.item(row, 0).text()  # Device column
+                neighbor_type_item = self.bgp_table.item(row, 2)  # Column 2 is "Neighbor Type"
+                
+                if neighbor_type_item:
+                    protocol_type = neighbor_type_item.text().strip()
+                    if device_name not in device_address_families:
+                        device_address_families[device_name] = set()
+                    device_address_families[device_name].add(protocol_type)
+        
         # Handle BGP application
         for device_info in devices_to_apply_bgp:
             device_name = device_info.get("Device Name", "Unknown")
@@ -8268,7 +9117,22 @@ class DevicesTab(QWidget):
                 
             try:
                 # Prepare BGP configuration payload
-                bgp_config = device_info.get("bgp_config", {})
+                bgp_config = device_info.get("bgp_config", {}).copy()
+                
+                # If specific address families were selected, add flag to indicate partial apply
+                if device_name in device_address_families:
+                    selected_families = device_address_families[device_name]
+                    # Convert to list format expected by server
+                    apply_families = []
+                    if "IPv4" in selected_families:
+                        apply_families.append("ipv4")
+                    if "IPv6" in selected_families:
+                        apply_families.append("ipv6")
+                    
+                    if apply_families:
+                        bgp_config["_apply_address_families"] = apply_families
+                        logging.debug(f"[BGP APPLY] Device {device_name}: Applying only selected address families: {apply_families}")
+                
                 payload = {
                     "device_id": device_id,
                     "device_name": device_name,
@@ -8283,7 +9147,7 @@ class DevicesTab(QWidget):
                 
                 # Send BGP configuration to server
                 response = requests.post(f"{server_url}/api/device/bgp/configure", 
-                                       json=payload, timeout=30)
+                                       json=payload, timeout=10)
                 
                 if response.status_code == 200:
                     success_count += 1
@@ -8306,7 +9170,7 @@ class DevicesTab(QWidget):
                         }
                         
                         start_response = requests.post(f"{server_url}/api/device/start", 
-                                                    json=start_payload, timeout=30)
+                                                    json=start_payload, timeout=10)
                         
                         if start_response.status_code == 200:
                             print(f"✅ BGP service started for {device_name}")
@@ -8466,94 +9330,67 @@ class DevicesTab(QWidget):
 
         # Get selected rows from the OSPF table
         selected_items = self.ospf_table.selectedItems()
-        selected_devices = []
         
-        if selected_items:
-            # Get unique device names from selected OSPF table rows
-            selected_device_names = set()
-            for item in selected_items:
-                row = item.row()
-                device_name = self.ospf_table.item(row, 0).text()  # Device column
-                selected_device_names.add(device_name)
-            
-            # Find the devices in all_devices
-            for device_name in selected_device_names:
-                for iface, devices in self.main_window.all_devices.items():
-                    for device in devices:
-                        if device.get("Device Name") == device_name:
-                            selected_devices.append(device)
-                            break
-
         # Handle both OSPF application and removal
         devices_to_apply_ospf = []  # Devices that need OSPF configuration applied
         devices_to_remove_ospf = []  # Devices that need OSPF configuration removed
         
         if selected_items:
             # If OSPF table rows are selected, process only those devices
-            selected_device_names = set()
+            # Track selected rows with their address family (IPv4/IPv6)
+            selected_rows = {}  # {device_name: {row_index, protocol_type}}
             for item in selected_items:
                 row = item.row()
                 device_name = self.ospf_table.item(row, 0).text()  # Device column
-                selected_device_names.add(device_name)
+                protocol_type_item = self.ospf_table.item(row, 3)  # Neighbor Type column (IPv4 or IPv6)
+                protocol_type = protocol_type_item.text() if protocol_type_item else "Unknown"
+                
+                if device_name not in selected_rows:
+                    selected_rows[device_name] = []
+                selected_rows[device_name].append({
+                    "row": row,
+                    "protocol_type": protocol_type
+                })
             
             # Find devices and determine if they need OSPF applied or removed
-            for device_name in selected_device_names:
+            # Group by device and track which address families are selected
+            for device_name, row_info_list in selected_rows.items():
                 for iface, devices in self.main_window.all_devices.items():
                     for device in devices:
                         if device.get("Device Name") == device_name:
-                            # Get OSPF config - handle both old format (dict) and new format (list)
                             ospf_config = device.get("ospf_config", {})
-                            if not ospf_config:
-                                # Try old format for backward compatibility
-                                protocols = device.get("protocols", {})
-                                if isinstance(protocols, dict):
-                                    ospf_config = protocols.get("OSPF", {})
-                            
                             if ospf_config:
                                 if ospf_config.get("_marked_for_removal"):
                                     # Device is marked for OSPF removal
                                     devices_to_remove_ospf.append(device)
                                 else:
-                                    # Device needs OSPF configuration applied
+                                    # Device has normal OSPF config - needs application
+                                    # Store which address families are selected for this device
+                                    # Deduplicate the address families (in case multiple cells in same row are selected)
+                                    selected_afs = list(set([ri["protocol_type"] for ri in row_info_list]))
+                                    device["_selected_address_families"] = selected_afs
                                     devices_to_apply_ospf.append(device)
                             else:
                                 # Device was in OSPF table but no longer has OSPF config - needs removal
                                 devices_to_remove_ospf.append(device)
                             break
         else:
-            # If no OSPF table rows are selected, process all devices with OSPF configurations
-            for iface, devices in self.main_window.all_devices.items():
-                for device in devices:
-                    # Get OSPF config - handle both old format (dict) and new format (list)
-                    ospf_config = device.get("ospf_config", {})
-                    if not ospf_config:
-                        # Try old format for backward compatibility
-                        protocols = device.get("protocols", {})
-                        if isinstance(protocols, dict):
-                            ospf_config = protocols.get("OSPF", {})
-                    
-                    if ospf_config:
-                        if ospf_config.get("_marked_for_removal"):
-                            devices_to_remove_ospf.append(device)
-                        else:
-                            devices_to_apply_ospf.append(device)
+            # If no OSPF table rows selected, show message
+            QMessageBox.information(self, "No Selection", 
+                                  "Please select OSPF table rows to apply configuration.")
+            return
 
         # Check if we have any work to do
         if not devices_to_apply_ospf and not devices_to_remove_ospf:
-            total_devices = sum(len(devices) for devices in self.main_window.all_devices.values())
-            if total_devices == 0:
-                QMessageBox.information(self, "No Devices", 
-                                      "No devices found to apply OSPF configuration to.")
-                return
-            else:
-                QMessageBox.information(self, "No OSPF Configuration", 
-                                      "No devices have OSPF configuration to apply or remove.")
-                return
+            QMessageBox.information(self, "No OSPF Changes", 
+                                  "No OSPF configurations to apply or remove.")
+            return
 
         # Apply OSPF configurations
         success_count = 0
         failed_devices = []
         
+        # Handle OSPF application
         for device_info in devices_to_apply_ospf:
             device_name = device_info.get("Device Name", "Unknown")
             device_id = device_info.get("device_id")
@@ -8563,16 +9400,46 @@ class DevicesTab(QWidget):
                 continue
                 
             try:
-                # Apply OSPF configuration using the existing sync function
-                success = self._apply_ospf_to_server_sync(server_url, device_info)
+                import requests
+                # Prepare OSPF configuration payload
+                ospf_config = device_info.get("ospf_config", {}).copy()
                 
-                if success:
+                # If specific address families are selected, add a flag to indicate which ones to configure
+                # This prevents the server from removing configurations for the other address family
+                selected_address_families = device_info.get("_selected_address_families", [])
+                if selected_address_families:
+                    # Add a flag to indicate which address families should be configured in this apply
+                    # The server will use this to only configure the selected families without removing others
+                    ospf_config["_apply_address_families"] = selected_address_families
+                    # Preserve the existing enabled flags to prevent removal of other address family
+                    # Don't modify ipv4_enabled or ipv6_enabled - keep them as they are
+                
+                payload = {
+                    "device_id": device_id,
+                    "device_name": device_name,
+                    "interface": device_info.get("Interface", ""),
+                    "vlan": device_info.get("VLAN", "0"),
+                    "ipv4": device_info.get("IPv4", ""),
+                    "ipv6": device_info.get("IPv6", ""),
+                    "ospf_config": ospf_config
+                }
+                
+                # Send OSPF configuration to server
+                # Use longer timeout (30s) since OSPF configuration may take time
+                response = requests.post(f"{server_url}/api/device/ospf/configure", 
+                                       json=payload, timeout=30)
+                
+                if response.status_code == 200:
                     success_count += 1
                     print(f"✅ OSPF configuration applied for {device_name}")
                 else:
-                    failed_devices.append(f"{device_name}: Failed to apply OSPF configuration")
-                    print(f"❌ Failed to apply OSPF for {device_name}")
+                    error_msg = response.json().get("error", "Unknown error")
+                    failed_devices.append(f"{device_name}: {error_msg}")
+                    print(f"❌ Failed to apply OSPF for {device_name}: {error_msg}")
                     
+            except requests.exceptions.RequestException as e:
+                failed_devices.append(f"{device_name}: Network error - {str(e)}")
+                print(f"❌ Network error applying OSPF for {device_name}: {str(e)}")
             except Exception as e:
                 failed_devices.append(f"{device_name}: {str(e)}")
                 print(f"❌ Error applying OSPF for {device_name}: {str(e)}")
@@ -8590,62 +9457,104 @@ class DevicesTab(QWidget):
                 continue
                 
             try:
-                # Call OSPF cleanup endpoint to remove OSPF configuration
                 import requests
-                response = requests.post(f"{server_url}/api/device/ospf/stop", 
+                # Call OSPF cleanup endpoint to remove OSPF configuration
+                response = requests.post(f"{server_url}/api/ospf/cleanup", 
                                        json={"device_id": device_id}, 
-                                       timeout=10)
+                                       timeout=30)
                 
                 if response.status_code == 200:
                     removal_success_count += 1
                     print(f"✅ OSPF configuration removed for {device_name}")
                     
-                    # Remove OSPF config from device info
-                    device_info.pop("ospf_config", None)
-                    if isinstance(device_info.get("protocols"), dict):
-                        device_info["protocols"].pop("OSPF", None)
-                    elif isinstance(device_info.get("protocols"), list):
-                        protocols = device_info.get("protocols", [])
-                        if "OSPF" in protocols:
-                            protocols.remove("OSPF")
-                            device_info["protocols"] = protocols
+                    # Remove OSPF configuration from client data after successful server removal
+                    if "protocols" in device_info:
+                        if isinstance(device_info["protocols"], dict):
+                            if device_info["protocols"].get("OSPF", {}).get("_marked_for_removal"):
+                                del device_info["protocols"]["OSPF"]
+                        else:
+                            if device_info.get("ospf_config", {}).get("_marked_for_removal"):
+                                del device_info["ospf_config"]
+                            # If no other protocols, remove the protocols key entirely
+                            if "protocols" in device_info and not device_info["protocols"]:
+                                del device_info["protocols"]
                 else:
                     error_msg = response.json().get("error", "Unknown error")
                     removal_failed_devices.append(f"{device_name}: {error_msg}")
                     print(f"❌ Failed to remove OSPF for {device_name}: {error_msg}")
                     
+            except requests.exceptions.RequestException as e:
+                removal_failed_devices.append(f"{device_name}: Network error - {str(e)}")
+                print(f"❌ Network error removing OSPF for {device_name}: {str(e)}")
             except Exception as e:
                 removal_failed_devices.append(f"{device_name}: {str(e)}")
                 print(f"❌ Error removing OSPF for {device_name}: {str(e)}")
 
-        # Show results
-        result_message = f"OSPF Configuration Results:\n\n"
-        result_message += f"Applied: {success_count}\n"
-        result_message += f"Removed: {removal_success_count}\n"
+        # Show results - combine application and removal results
+        total_success = success_count + removal_success_count
+        total_failed = len(failed_devices) + len(removal_failed_devices)
+        total_operations = len(devices_to_apply_ospf) + len(devices_to_remove_ospf)
         
-        if failed_devices:
-            result_message += f"\nFailed to apply ({len(failed_devices)}):\n"
-            result_message += "\n".join(failed_devices[:10])  # Show first 10 failures
-            if len(failed_devices) > 10:
-                result_message += f"\n... and {len(failed_devices) - 10} more"
+        if total_operations == 0:
+            QMessageBox.information(self, "No OSPF Operations", "No OSPF operations to perform.")
+            return
         
-        if removal_failed_devices:
-            result_message += f"\n\nFailed to remove ({len(removal_failed_devices)}):\n"
-            result_message += "\n".join(removal_failed_devices[:10])
-            if len(removal_failed_devices) > 10:
-                result_message += f"\n... and {len(removal_failed_devices) - 10} more"
+        # Build result messages
+        all_results = []
         
-        if failed_devices or removal_failed_devices:
-            QMessageBox.warning(self, "OSPF Configuration Results", result_message)
+        # Add OSPF application results
+        if devices_to_apply_ospf:
+            for device_info in devices_to_apply_ospf:
+                device_name = device_info.get("Device Name", "Unknown")
+                if device_name not in [f.split(":")[0] for f in failed_devices]:
+                    all_results.append(f"✅ Applied OSPF to {device_name}")
+        
+        # Add OSPF removal results  
+        if devices_to_remove_ospf:
+            for device_info in devices_to_remove_ospf:
+                device_name = device_info.get("Device Name", "Unknown")
+                if device_name not in [f.split(":")[0] for f in removal_failed_devices]:
+                    all_results.append(f"✅ Removed OSPF from {device_name}")
+        
+        # Add failed operations
+        all_results.extend([f"❌ {failed}" for failed in failed_devices])
+        all_results.extend([f"❌ {failed}" for failed in removal_failed_devices])
+        
+        # Show appropriate dialog
+        if total_success == total_operations:
+            # All successful
+            if len(devices_to_apply_ospf) > 0 and len(devices_to_remove_ospf) > 0:
+                title = "OSPF Operations Completed"
+                message = f"Successfully applied OSPF to {success_count} device(s) and removed OSPF from {removal_success_count} device(s)."
+            elif len(devices_to_apply_ospf) > 0:
+                title = "OSPF Applied Successfully"
+                message = f"OSPF configuration applied successfully for {success_count} device(s)."
+            else:
+                title = "OSPF Removed Successfully"
+                message = f"OSPF configuration removed successfully from {removal_success_count} device(s)."
+            
+            QMessageBox.information(self, title, message)
+        elif total_success > 0:
+            # Partial success - use scrollable dialog
+            dialog = MultiDeviceResultsDialog(
+                "OSPF Operations Partially Completed", 
+                f"Completed {total_success} of {total_operations} OSPF operations.",
+                all_results,
+                self
+            )
+            dialog.exec_()
         else:
-            QMessageBox.information(self, "OSPF Configuration Results", result_message)
-        
-        # Update OSPF table after applying
+            # All failed - use scrollable dialog
+            dialog = MultiDeviceResultsDialog(
+                "OSPF Operations Failed", 
+                "Failed to complete any OSPF operations.",
+                all_results,
+                self
+            )
+            dialog.exec_()
+
+        # Update OSPF table to reflect any changes
         self.update_ospf_table()
-        
-        # Save session
-        if hasattr(self.main_window, "save_session"):
-            self.main_window.save_session()
 
     def start_ospf_protocol(self):
         """Start OSPF protocol for selected devices."""
