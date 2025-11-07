@@ -471,11 +471,11 @@ def start_isis_neighbor(device_id: str, device_name: str, container_id: str, isi
             ])
             # Add IPv4 or IPv6 based on configured addresses
             if enable_ipv4:
-                vtysh_commands.append("ip router isis CORE")
+                vtysh_commands.append(" ip router isis CORE")
             if enable_ipv6:
-                vtysh_commands.append("ipv6 router isis CORE")
+                vtysh_commands.append(" ipv6 router isis CORE")
             vtysh_commands.extend([
-                "isis network point-to-point",
+                " isis network point-to-point",
                 "exit",
             ])
         # Remove None entries from optional lines
