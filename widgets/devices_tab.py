@@ -4871,6 +4871,9 @@ class DevicesTab(QWidget):
                                     # Only preserve generic graceful_restart if address-family-specific flags are not being set
                                     if "graceful_restart_ipv4" not in config and "graceful_restart_ipv6" not in config:
                                         merged_config["graceful_restart"] = existing_config["graceful_restart"]
+                                # CRITICAL: Preserve route_pools to prevent accidental removal when editing config
+                                if "route_pools" not in config and "route_pools" in existing_config:
+                                    merged_config["route_pools"] = existing_config["route_pools"]
                             device[config_key] = merged_config
                             # For ISIS, also update isis_config for backward compatibility
                             if protocol in ["IS-IS", "ISIS"]:

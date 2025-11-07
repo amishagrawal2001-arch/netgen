@@ -631,11 +631,14 @@ class OSPFHandler:
             new_graceful_restart = ospf_config.get("graceful_restart", False)
             
             # Preserve existing OSPF config fields that are not in the dialog
-            # (ipv4_enabled, ipv6_enabled, interface, etc.)
+            # (ipv4_enabled, ipv6_enabled, interface, route_pools, etc.)
             if current_ospf_config:
                 ospf_config.setdefault("ipv4_enabled", current_ospf_config.get("ipv4_enabled", False))
                 ospf_config.setdefault("ipv6_enabled", current_ospf_config.get("ipv6_enabled", False))
                 ospf_config.setdefault("interface", current_ospf_config.get("interface", ""))
+                # CRITICAL: Preserve route_pools to prevent accidental removal when editing config
+                if "route_pools" in current_ospf_config:
+                    ospf_config["route_pools"] = current_ospf_config["route_pools"]
                 
                 # Update only the area ID for the selected address family
                 # First, preserve or initialize both area IDs from existing config
