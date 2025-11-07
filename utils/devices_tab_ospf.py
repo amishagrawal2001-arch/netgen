@@ -2035,8 +2035,9 @@ class OSPFHandler:
                             
                             # Always include common fields - CRITICAL: Always include ipv4_enabled and ipv6_enabled
                             # to preserve the other address family's enabled status
+                            # Also include route_pools to preserve route pool attachments when editing config
                             common_fields = ["router_id", "hello_interval", "dead_interval", "interface", 
-                                           "graceful_restart"]
+                                           "graceful_restart", "route_pools"]
                             for field in common_fields:
                                 if field in ospf_config:
                                     filtered_ospf_config[field] = ospf_config[field]
@@ -2065,11 +2066,8 @@ class OSPFHandler:
                                 if "graceful_restart_ipv6" in ospf_config:
                                     filtered_ospf_config["graceful_restart_ipv6"] = ospf_config["graceful_restart_ipv6"]
                             
-                            # Include route pools if present
-                            if "route_pools" in ospf_config:
-                                filtered_ospf_config["route_pools"] = ospf_config["route_pools"]
-                            
                             # Use the filtered config
+                            # Note: route_pools is already included in common_fields above
                             ospf_config = filtered_ospf_config
                             
                             # Add a flag to indicate which address families should be configured in this apply
