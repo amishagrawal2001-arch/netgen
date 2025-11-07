@@ -2474,6 +2474,11 @@ def configure_ospf():
         
         # Save OSPF route pool attachments to database (similar to BGP)
         try:
+            # Check if route_pools was explicitly provided in the payload
+            # CRITICAL: Only update route pools if they are explicitly provided in the payload
+            # If not provided, preserve existing route pools from database to prevent accidental removal
+            route_pools_provided = "route_pools" in ospf_config or "route_pools_per_area" in data
+            
             # Check for route pools in ospf_config first, then in route_pools_per_area payload
             route_pools_data = ospf_config.get("route_pools", [])
             
@@ -2491,32 +2496,37 @@ def configure_ospf():
             
             area_id = ospf_config.get("area_id", "0.0.0.0")
             
-            # Handle both old list format and new dict format (per neighbor type)
-            if isinstance(route_pools_data, dict):
-                # New format: route_pools = {"IPv4": [pools], "IPv6": [pools]}
-                # Store as area_id + neighbor_type (e.g., "0.0.0.0:IPv4")
-                all_route_pools = []
-                for neighbor_type, pools in route_pools_data.items():
-                    if pools:
-                        area_key = f"{area_id}:{neighbor_type}"
-                        device_db.attach_route_pools_to_device(device_id, area_key, pools)
-                        all_route_pools.extend(pools)
-                        logging.info(f"[OSPF CONFIGURE] Saved {len(pools)} route pool attachments for device {device_id}, area {area_id}, type {neighbor_type}")
-                
-                if all_route_pools:
-                    logging.info(f"[OSPF CONFIGURE] Total {len(all_route_pools)} route pool attachments saved for device {device_id}")
+            # Only update route pools if they were explicitly provided in the payload
+            if route_pools_provided:
+                # Handle both old list format and new dict format (per neighbor type)
+                if isinstance(route_pools_data, dict):
+                    # New format: route_pools = {"IPv4": [pools], "IPv6": [pools]}
+                    # Store as area_id + neighbor_type (e.g., "0.0.0.0:IPv4")
+                    all_route_pools = []
+                    for neighbor_type, pools in route_pools_data.items():
+                        if pools:
+                            area_key = f"{area_id}:{neighbor_type}"
+                            device_db.attach_route_pools_to_device(device_id, area_key, pools)
+                            all_route_pools.extend(pools)
+                            logging.info(f"[OSPF CONFIGURE] Saved {len(pools)} route pool attachments for device {device_id}, area {area_id}, type {neighbor_type}")
+                    
+                    if all_route_pools:
+                        logging.info(f"[OSPF CONFIGURE] Total {len(all_route_pools)} route pool attachments saved for device {device_id}")
+                    else:
+                        # Explicitly provided empty dict - remove all attachments for this device/area
+                        device_db.remove_device_route_pools(device_id, area_id)
+                        logging.info(f"[OSPF CONFIGURE] Removed all route pool attachments for device {device_id} and area {area_id} (explicitly empty)")
+                elif isinstance(route_pools_data, list) and len(route_pools_data) > 0:
+                    # Old format: route_pools = [pools]
+                    device_db.attach_route_pools_to_device(device_id, area_id, route_pools_data)
+                    logging.info(f"[OSPF CONFIGURE] Saved {len(route_pools_data)} route pool attachments for device {device_id} and area {area_id} (old format)")
                 else:
-                    # Remove all attachments for this device/area
+                    # Explicitly provided empty list or empty dict - remove all attachments for this device/area
                     device_db.remove_device_route_pools(device_id, area_id)
-                    logging.info(f"[OSPF CONFIGURE] Removed all route pool attachments for device {device_id} and area {area_id}")
-            elif isinstance(route_pools_data, list) and len(route_pools_data) > 0:
-                # Old format: route_pools = [pools]
-                device_db.attach_route_pools_to_device(device_id, area_id, route_pools_data)
-                logging.info(f"[OSPF CONFIGURE] Saved {len(route_pools_data)} route pool attachments for device {device_id} and area {area_id} (old format)")
+                    logging.info(f"[OSPF CONFIGURE] Removed all route pool attachments for device {device_id} and area {area_id} (explicitly empty)")
             else:
-                # No route pools configured - remove all attachments for this device/area
-                device_db.remove_device_route_pools(device_id, area_id)
-                logging.info(f"[OSPF CONFIGURE] Removed all route pool attachments for device {device_id} and area {area_id}")
+                # Route pools not provided - preserve existing attachments from database
+                logging.info(f"[OSPF CONFIGURE] Route pools not provided in payload, preserving existing attachments for device {device_id} and area {area_id}")
         except Exception as e:
             logging.warning(f"[OSPF CONFIGURE] Failed to save route pool attachments: {e}")
         
