@@ -48,3 +48,6 @@ echo "ssh root@$SERVER 'docker logs $CONTAINER_ID | grep -i \"DEVICE START\" | t
 echo "ssh root@$SERVER 'docker logs $CONTAINER_ID | grep -i \"BGP\\|OSPF\\|ISIS\" | tail -30'"
 echo "ssh root@$SERVER 'docker logs $CONTAINER_ID --tail 100 | grep -i \"protocol configs\"'"
 
+
+
+

@@ -186,20 +186,12 @@ def print_protocol_summary(devices: List[Dict]):
                     device_id_key = f"{device_name}:OSPF"  # Create unique key per device+protocol
                     if device_id_key not in devices_seen:
                         devices_seen.add(device_id_key)
-                    
-                    # Support both old format (area_id) and new format (ipv4_area_id, ipv6_area_id)
-                    legacy_area_id = ospf_config.get('area_id', '')
-                    ipv4_area_id = ospf_config.get('ipv4_area_id', legacy_area_id)
-                    ipv6_area_id = ospf_config.get('ipv6_area_id', legacy_area_id)
-                    
                     ospf_neighbors.append({
                         'device': device_name,
                         'device_ipv4': device_ipv4,
                         'device_ipv6': device_ipv6,
                         'interface': ospf_config.get('interface', ''),
-                        'area_id': legacy_area_id,  # Keep for backward compatibility
-                        'ipv4_area_id': ipv4_area_id,
-                        'ipv6_area_id': ipv6_area_id,
+                        'area_id': ospf_config.get('area_id', ''),
                         'router_id': ospf_config.get('router_id', ''),
                         'ipv4_enabled': ospf_config.get('ipv4_enabled', False),
                         'ipv6_enabled': ospf_config.get('ipv6_enabled', False),
@@ -322,14 +314,7 @@ def print_protocol_summary(devices: List[Dict]):
             print(f"   IPv6: {neighbor['device_ipv6']} (OSPF: {ipv6_status})")
             
             print(f"   Interface: {neighbor['interface']}")
-            # Display separate IPv4 and IPv6 area IDs if they're different, otherwise show single area
-            ipv4_area = neighbor.get('ipv4_area_id', neighbor.get('area_id', ''))
-            ipv6_area = neighbor.get('ipv6_area_id', neighbor.get('area_id', ''))
-            if ipv4_area == ipv6_area:
-                print(f"   Area: {ipv4_area}")
-            else:
-                print(f"   IPv4 Area: {ipv4_area}")
-                print(f"   IPv6 Area: {ipv6_area}")
+            print(f"   Area: {neighbor['area_id']}")
             print(f"   Router ID: {neighbor['router_id']}")
             print()
     else:

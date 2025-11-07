@@ -1,126 +1,205 @@
-# Comprehensive FRR Configuration Template for OSTG
-# This template enables all available FRR features and daemons
+##############################################
+# FRR Comprehensive Routing Template - FRR-CORE
+# Supports BGP, OSPFv2/v3, IS-IS, MPLS, PIM, VXLAN/EVPN
+# Includes DHCP Server + Client templates
+# FRR version: 8.5
+##############################################
 
 frr version 8.5
 frr defaults traditional
 hostname {{DEVICE_NAME}}
 
-# Enable all available daemons
+#----------------------------------------------
+# Daemon Enablement
+#----------------------------------------------
 zebra=yes
 bgpd=yes
 ospfd=yes
 ospf6d=yes
-ripd=yes
-ripngd=yes
 isisd=yes
+ldpd=yes
 pimd=yes
 pim6d=yes
-ldpd=yes
-nhrpd=yes
-eigrpd=yes
-babeld=yes
 bfdd=yes
-fabricd=yes
-vrrpd=yes
+staticd=yes
 pathd=yes
 pbrd=yes
-staticd=yes
+vrrpd=yes
+evpn=yes
 
-# Zebra configuration (core routing daemon)
-zebra=yes
+#----------------------------------------------
+# Core Zebra Configuration
+#----------------------------------------------
+service integrated-vtysh-config
 ip forwarding
 ipv6 forwarding
 ipv6 nd suppress-ra
+!
+log syslog informational
+log file /var/log/frr/frr.log
+log timestamp precision 6
+!
+hostname {{DEVICE_NAME}}
+!
 
-# BGP Configuration
-router bgp {{LOCAL_ASN}}
- bgp router-id {{ROUTER_ID}}
- bgp log-neighbor-changes
- bgp graceful-restart
- bgp graceful-restart restart-time 120
- bgp graceful-restart stalepath-time 360
- 
- # Network configuration
- network {{NETWORK}}/{{NETMASK}}
- 
- # Neighbor configuration (will be added dynamically)
- # neighbor {{NEIGHBOR_IP}} remote-as {{NEIGHBOR_ASN}}
- # neighbor {{NEIGHBOR_IP}} update-source {{UPDATE_SOURCE}}
- # neighbor {{NEIGHBOR_IP}} graceful-restart
-
-# OSPF Configuration
-router ospf
- ospf router-id {{ROUTER_ID}}
- network {{NETWORK}}/{{NETMASK}} area 0
-
-# OSPFv6 Configuration
-router ospf6
- ospf6 router-id {{ROUTER_ID}}
- interface {{INTERFACE}} area 0.0.0.0
-
-# RIP Configuration
-router rip
- network {{INTERFACE}}
- version 2
- no auto-summary
-
-# IS-IS Configuration
-router isis
- net 49.0001.{{ROUTER_ID}}.00
- is-type level-1-2
- interface {{INTERFACE}}
-  ip router isis
-
-# PIM Configuration
-ip pim rp 224.0.0.0/4
-ip pim ssm prefix-list SSM_RANGE
-
-# LDP Configuration
-mpls ldp
- router-id {{ROUTER_ID}}
- address-family ipv4
-  discovery transport-address {{ROUTER_ID}}
-
-# Interface configuration
+#----------------------------------------------
+# Interface Configuration
+#----------------------------------------------
 interface {{INTERFACE}}
+ description Uplink-interface
  ip address {{IP_ADDRESS}}/{{IP_MASK}}
+{{IPV6_ADDRESS_LINE}}
+ no shutdown
+!
  ip ospf hello-interval 10
  ip ospf dead-interval 40
  ip ospf priority 1
  ipv6 ospf6 hello-interval 10
  ipv6 ospf6 dead-interval 40
  ipv6 ospf6 priority 1
+!
+ ip router isis FRR-CORE
+ ipv6 router isis FRR-CORE
  ip pim
  ipv6 pim6
+!
+exit
 
-# Logging configuration
-log syslog informational
-log file /var/log/frr/frr.log
-log timestamp precision 6
-log commands
+#----------------------------------------------
+# Loopback Interface
+#----------------------------------------------
+interface lo
+ ip address {{LOOPBACK_IPV4}}/32
+ ipv6 address {{LOOPBACK_IPV6}}/128
+ ip ospf passive
+ ipv6 ospf6 passive
+ ip router isis FRR-CORE
+exit
 
-# SNMP configuration
+#----------------------------------------------
+# VXLAN / EVPN Configuration
+#----------------------------------------------
+{{VXLAN_CONFIG_LINE}}
+
+#----------------------------------------------
+# BGP Configuration (with EVPN)
+#----------------------------------------------
+router bgp {{LOCAL_ASN}}
+ bgp router-id {{ROUTER_ID}}
+ bgp log-neighbor-changes
+ bgp graceful-restart
+ bgp graceful-restart restart-time 120
+ bgp graceful-restart stalepath-time 360
+ timers bgp 30 90
+
+ ! Advertise local networks
+ network {{NETWORK}}/{{NETMASK}}
+ network {{LOOPBACK_IPV4}}/32
+
+{{BGP_NEIGHBOR_CONFIG_LINES}}
+exit
+
+#----------------------------------------------
+# OSPFv2 Configuration
+#----------------------------------------------
+router ospf
+ ospf router-id {{ROUTER_ID}}
+ passive-interface lo
+ network {{NETWORK}}/{{NETMASK}} area 0
+exit
+
+#----------------------------------------------
+# OSPFv3 Configuration
+#----------------------------------------------
+router ospf6
+ ospf6 router-id {{ROUTER_ID}}
+ interface {{INTERFACE}} area 0.0.0.0
+ interface lo area 0.0.0.0
+exit
+
+#----------------------------------------------
+# IS-IS Configuration
+#----------------------------------------------
+router isis FRR-CORE
+ net 49.0001.{{ROUTER_ID_REPLACED_WITH_DOTTED_FORMAT}}.00
+ is-type level-1-2
+ metric-style wide
+ lsp-gen-interval 20
+ lsp-refresh-interval 65000
+ log-adjacency-changes
+exit
+
+#----------------------------------------------
+# MPLS / LDP Configuration
+#----------------------------------------------
+mpls ldp
+ router-id {{ROUTER_ID}}
+ address-family ipv4
+  discovery transport-address {{ROUTER_ID}}
+  interface {{INTERFACE}}
+exit
+
+#----------------------------------------------
+# Multicast / PIM Configuration
+#----------------------------------------------
+ip pim rp 224.0.0.0/4
+ip pim ssm prefix-list SSM_RANGE
+ipv6 pim6 enable
+
+#----------------------------------------------
+# DHCP Server Template
+#----------------------------------------------
+# (Used with isc-dhcp-server)
+# subnet {{DHCP_SUBNET}} netmask {{DHCP_NETMASK}} {
+#     range {{DHCP_RANGE_START}} {{DHCP_RANGE_END}};
+#     option routers {{DHCP_GATEWAY}};
+#     option domain-name-servers {{DNS_SERVER}};
+#     option domain-name "{{DOMAIN_NAME}}";
+# }
+
+#----------------------------------------------
+# DHCP Client Template
+#----------------------------------------------
+# iface {{DHCP_INTERFACE}} inet dhcp
+# OR (systemd-networkd)
+# [Match]
+# Name={{DHCP_INTERFACE}}
+# [Network]
+# DHCP=yes
+
+#----------------------------------------------
+# Route Maps & Access Lists
+#----------------------------------------------
+ip access-list standard PERMIT_ALL
+ permit any
+exit
+
+ipv6 access-list PERMIT_ALL_V6
+ permit any
+exit
+
+route-map PERMIT_ALL permit 10
+ match ip address PERMIT_ALL
+exit
+
+route-map PERMIT_ALL_V6 permit 10
+ match ipv6 address PERMIT_ALL_V6
+exit
+
+#----------------------------------------------
+# Static Routes (Optional)
+#----------------------------------------------
+# ip route {{DESTINATION}} {{NEXT_HOP}}
+# ipv6 route {{DESTINATION}} {{NEXT_HOP}}
+
+#----------------------------------------------
+# SNMP Configuration
+#----------------------------------------------
 snmp agent
 snmp-server community public ro
 snmp-server community private rw
 
-# FPM configuration
+#----------------------------------------------
+# FPM Configuration (for external route consumers)
+#----------------------------------------------
 fpm connection ip 127.0.0.1 port 2620
-
-# Static routes (if needed)
-# ip route {{DESTINATION}} {{NEXT_HOP}}
-# ipv6 route {{DESTINATION}} {{NEXT_HOP}}
-
-# Access lists
-ip access-list standard PERMIT_ALL
- permit any
-
-ipv6 access-list PERMIT_ALL_V6
- permit any
-
-# Route maps
-route-map PERMIT_ALL permit 10
- match ip address PERMIT_ALL
-
-route-map PERMIT_ALL_V6 permit 10
- match ipv6 address PERMIT_ALL_V6

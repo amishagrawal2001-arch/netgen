@@ -144,3 +144,4 @@ class DevicesTab(QWidget):
 - Signal connections should be maintained in the handler classes
 - The modularization maintains backward compatibility by keeping the same method signatures
 
+

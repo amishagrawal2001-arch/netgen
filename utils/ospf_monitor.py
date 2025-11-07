@@ -92,16 +92,12 @@ class OSPFStatusMonitor:
         logger.info("[OSPF MONITOR] Monitoring loop ended")
     
     def _get_ospf_devices(self) -> List[Dict[str, Any]]:
-        """Get all devices that have OSPF configured (only running devices, like BGP/ISIS)."""
+        """Get all devices that have OSPF configured."""
         try:
             devices = self.device_db.get_all_devices()
             ospf_devices = []
             
             for device in devices:
-                # Only check running devices (like BGP/ISIS monitors do)
-                if device.get('status') != 'Running':
-                    continue
-                
                 protocols = device.get("protocols", [])
                 if isinstance(protocols, str):
                     try:

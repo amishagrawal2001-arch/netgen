@@ -45,6 +45,9 @@ class TrafficGeneratorClient(
         self.copied_streams = []  # Initialize copied streams list
         self.all_devices = {}
         self._is_closing = False  # Flag to prevent new operations during shutdown
+        self._pending_force_quit = False  # Track if we are waiting for background tasks before quitting
+        self._force_quit_called = False  # Prevent multiple force_quit executions
+        self._save_worker_finish_connected = False  # Track close-event connection to save worker completion
         
         # Store the server URL for later use (will be added after session is loaded)
         self.server_url = server_url
@@ -145,6 +148,7 @@ class TrafficGeneratorClient(
             return
             
         self._is_closing = True
+        self._pending_force_quit = False
         print("[CLEANUP] Application closing, cleaning up threads...")
         
         # Stop all timers first
@@ -182,27 +186,63 @@ class TrafficGeneratorClient(
         # Save session before closing
         try:
             self.save_session()
-            # CRITICAL: Wait for save worker to finish before closing
-            if hasattr(self, '_save_worker') and self._save_worker is not None:
+            pending_wait_for_save = False
+            save_worker = getattr(self, "_save_worker", None)
+            if save_worker is not None:
                 try:
-                    if self._save_worker.isRunning():
+                    if save_worker.isRunning():
                         print("[CLEANUP] Waiting for save session to complete...")
-                        self._save_worker.wait(2000)  # Wait up to 2 seconds
-                        if self._save_worker.isRunning():
-                            print("[CLEANUP] Save session still running, continuing with cleanup...")
+                        # QThread.wait(timeout) returns True if the thread finished within timeout
+                        finished = save_worker.wait(2000)
+                        if finished:
+                            print("[CLEANUP] Save session completed")
+                            QApplication.processEvents()
+                        else:
+                            # Thread still running after timeout; wait asynchronously for completion
+                            print("[CLEANUP] Save session still running after timeout, will exit after save completes...")
+                            pending_wait_for_save = True
+                            self._pending_force_quit = True
+                            if not getattr(self, "_save_worker_finish_connected", False):
+                                save_worker.finished.connect(self._on_save_worker_finished_cleanup, Qt.QueuedConnection)
+                                self._save_worker_finish_connected = True
+                    else:
+                        print("[CLEANUP] Save session already completed")
+                        QApplication.processEvents()
                 except RuntimeError:
-                    # Object has been deleted, ignore
                     print("[CLEANUP] Save worker already deleted, continuing with cleanup...")
+            if pending_wait_for_save:
+                event.ignore()
+                return
         except Exception as e:
             print(f"[CLEANUP] Failed to save session: {e}")
         
         # Force quit the application after a short delay to allow cleanup
-        print("[CLEANUP] Cleanup completed, forcing application exit...")
-        QTimer.singleShot(100, self.force_quit)
+        self._schedule_force_quit()
         event.ignore()  # Don't accept the event yet, wait for force_quit
+    
+    def _schedule_force_quit(self, delay=100):
+        """Schedule force quit after optional delay, avoiding duplicate scheduling."""
+        if self._force_quit_called:
+            return
+        # Avoid scheduling multiple timers if already pending due to save worker
+        if self._pending_force_quit:
+            return
+        print("[CLEANUP] Cleanup completed, forcing application exit...")
+        QTimer.singleShot(delay, self.force_quit)
+    
+    def _on_save_worker_finished_cleanup(self, success, message):
+        """Callback invoked when save worker finishes during shutdown."""
+        print("[CLEANUP] Save session completed after close request, continuing shutdown...")
+        self._pending_force_quit = False
+        QApplication.processEvents()
+        self._schedule_force_quit()
     
     def force_quit(self):
         """Force quit the application after cleanup."""
+        if self._force_quit_called:
+            return
+        self._force_quit_called = True
+        self._pending_force_quit = False
         print("[CLEANUP] Force quitting application...")
         QApplication.quit()
         

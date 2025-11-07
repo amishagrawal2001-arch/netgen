@@ -884,8 +884,11 @@ class AddDeviceDialog(QDialog):
             else:
                 ospf_interface = base_interface
             
+            area_id = self.ospf_area_id_input.text().strip() or "0.0.0.0"
             ospf_config = {
-                "area_id": self.ospf_area_id_input.text().strip() or "0.0.0.0",
+                "area_id": area_id,
+                "area_id_ipv4": area_id,  # Initialize from area_id
+                "area_id_ipv6": area_id,  # Initialize from area_id
                 "router_id": self.ospf_router_id_input.text().strip(),
                 "hello_interval": self.ospf_hello_interval_input.text().strip() or "10",
                 "dead_interval": self.ospf_dead_interval_input.text().strip() or "40",

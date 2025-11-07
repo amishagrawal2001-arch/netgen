@@ -8,6 +8,7 @@ import logging
 import json
 import re
 import threading
+import subprocess
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timezone
 
@@ -255,10 +256,27 @@ def configure_isis_neighbor(device_id: str, isis_config: Dict[str, Any], device_
         if not interface and device_data:
             interface_from_db = device_data.get("interface", "")
             vlan = device_data.get("vlan", "0")
-            interface = f"vlan{vlan}" if (vlan and vlan != "0") else (interface_from_db if interface_from_db else "eth0")
+            # CRITICAL: Validate interface name when VLAN is not used
+            if vlan and vlan != "0":
+                interface = f"vlan{vlan}"
+            elif interface_from_db:
+                interface = interface_from_db
+            else:
+                # Interface is required - log error and use empty string (will cause configuration to fail gracefully)
+                logging.error(f"[ISIS CONFIGURE] Interface name is required when VLAN is not specified for device {device_id}")
+                interface = ""  # Will cause vtysh commands to fail, but better than silently using wrong interface
         else:
             vlan = device_data.get("vlan", "0") if device_data else "0"
-            interface = f"vlan{vlan}" if (vlan and vlan != "0") else (interface if interface else "eth0")
+            # CRITICAL: Validate interface name when VLAN is not used
+            if vlan and vlan != "0":
+                interface = f"vlan{vlan}"
+            elif interface:
+                # interface already set from config
+                pass
+            else:
+                # Interface is required - log error and use empty string (will cause configuration to fail gracefully)
+                logging.error(f"[ISIS CONFIGURE] Interface name is required when VLAN is not specified for device {device_id}")
+                interface = ""  # Will cause vtysh commands to fail, but better than silently using wrong interface
         
         # Determine address families based on configured IPs
         enable_ipv4 = bool(ipv4 and ipv4.strip())
@@ -499,7 +517,6 @@ def start_isis_neighbor(device_id: str, device_name: str, container_id: str, isi
             return True
         else:
             logger.error(f"[ISIS START] Failed to start ISIS for {device_name}: exit_code={exit_code}")
-            return False
             return False
             
     except subprocess.TimeoutExpired:

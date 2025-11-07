@@ -1,7 +1,7 @@
 #!/bin/bash
 
 # FRR Startup Script for OSTG
-set -e
+# Note: We don't use 'set -e' here because we want to continue even if some daemons fail to start
 
 echo "Starting FRR for device: ${DEVICE_NAME:-unknown}"
 
@@ -28,67 +28,85 @@ fi
 # Start FRR daemons
 echo "Starting FRR daemons..."
 
-# Function to start daemon safely
+# Ensure /var/run/frr exists
+mkdir -p /var/run/frr
+chown frr:frr /var/run/frr 2>/dev/null || true
+
+# Function to start daemon safely with error checking
 start_daemon() {
     local daemon=$1
     local daemon_path="/usr/lib/frr/$daemon"
     
-    if [ -f "$daemon_path" ]; then
-        echo "Starting $daemon..."
-        $daemon_path -d -A 127.0.0.1 -f /etc/frr/frr.conf
-        sleep 1
-    else
+    if [ ! -f "$daemon_path" ]; then
         echo "Warning: $daemon not found at $daemon_path"
+        return 1
+    fi
+    
+    echo "Starting $daemon..."
+    # Start daemon and capture output
+    if $daemon_path -d -A 127.0.0.1 -f /etc/frr/frr.conf 2>&1; then
+        sleep 1
+        # Verify it's actually running
+        if pgrep -f "$daemon" > /dev/null; then
+            echo "✅ $daemon started successfully"
+            return 0
+        else
+            echo "❌ $daemon failed to start (process not found)"
+            return 1
+        fi
+    else
+        echo "❌ $daemon failed to start (exit code: $?)"
+        return 1
     fi
 }
 
 # Start zebra first (required for all other daemons)
-start_daemon "zebra"
+start_daemon "zebra" || echo "CRITICAL: zebra failed to start!"
 
 # Wait for zebra to be ready
-sleep 2
+sleep 3
 
-# Start CRITICAL daemons only (for fast startup)
-start_daemon "staticd"  # MUST be early for static routes!
-start_daemon "bgpd"
+# Start staticd (MUST be early for static routes!)
+start_daemon "staticd" || echo "WARNING: staticd failed to start"
+
+# Start bgpd
+start_daemon "bgpd" || echo "WARNING: bgpd failed to start"
 
 # Wait for critical daemons to initialize
 sleep 2
 
-# Start other routing daemons (on-demand, can be slower)
-start_daemon "ospfd"
-start_daemon "ospf6d"
-start_daemon "isisd"
+# Start OSPF and ISIS daemons (required for routing protocols)
+start_daemon "ospfd" || echo "WARNING: ospfd failed to start"
+start_daemon "ospf6d" || echo "WARNING: ospf6d failed to start"
+start_daemon "isisd" || echo "WARNING: isisd failed to start"
 
-# Optional: Start other daemons in background
-# These are only started if needed by configuration
-# start_daemon "ripd"
-# start_daemon "ripngd"
-# start_daemon "pimd"
-# start_daemon "pim6d"
-# start_daemon "ldpd"
-# start_daemon "nhrpd"
-# start_daemon "eigrpd"
-# start_daemon "babeld"
-# start_daemon "bfdd"
-# start_daemon "fabricd"
-# start_daemon "vrrpd"
-# start_daemon "pathd"
-# start_daemon "pbrd"
+# Wait a bit for all daemons to stabilize
+sleep 2
 
-echo "FRR critical daemons started successfully"
+# Verify critical daemons are running
+echo ""
+echo "=== FRR Daemon Status ==="
+for daemon in zebra staticd bgpd ospfd ospf6d isisd; do
+    if pgrep -f "$daemon" > /dev/null; then
+        echo "✅ $daemon is running (PID: $(pgrep -f "$daemon" | head -1))"
+    else
+        echo "❌ $daemon is NOT running"
+    fi
+done
+echo "========================"
+echo ""
 
 # List of daemons to monitor (only critical ones)
 DAEMONS=("zebra" "staticd" "bgpd" "ospfd" "ospf6d" "isisd")
 
 # Keep container running and monitor daemons
+echo "Monitoring FRR daemons..."
 while true; do
     for daemon in "${DAEMONS[@]}"; do
         if ! pgrep -f "$daemon" > /dev/null; then
-            echo "$daemon daemon died, restarting..."
+            echo "[$(date +'%Y-%m-%d %H:%M:%S')] WARNING: $daemon daemon died, attempting restart..."
             start_daemon "$daemon"
         fi
     done
-    
     sleep 10
 done

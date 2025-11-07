@@ -253,9 +253,14 @@ class TrafficGenClientMenuAction():
         # Create new worker if needed
         if not worker_exists or self._save_worker is None:
             self._save_worker = SaveSessionWorker(self, protocol_data)
-            self._save_worker.finished.connect(self._on_save_finished)
             # CRITICAL: Set parent to ensure proper cleanup
             self._save_worker.setParent(self)
+            # Reset finish connection tracking for this worker
+            self._save_worker_finish_connected = False
+            # CRITICAL: Connect finished signal to deleteLater for automatic cleanup
+            self._save_worker.finished.connect(self._save_worker.deleteLater)
+            # Connect finished signal to our handler
+            self._save_worker.finished.connect(self._on_save_finished)
             self._save_worker.start()
         else:
             # Worker already running, just mark as in progress
@@ -269,18 +274,12 @@ class TrafficGenClientMenuAction():
         else:
             print(f"[SAVE SESSION ERROR] {message}")
         
-        # CRITICAL: Clean up worker thread after it finishes
-        # Schedule for deletion to ensure proper cleanup (thread is finished, safe to delete)
+        # CRITICAL: Don't call deleteLater() here - it's already connected to finished signal
+        # Just clear the reference after a short delay to allow deleteLater() to process
         if hasattr(self, '_save_worker') and self._save_worker is not None:
-            try:
-                # Thread is finished, safe to schedule for deletion
-                self._save_worker.deleteLater()
-                # CRITICAL: Set to None immediately to prevent checking isRunning() on deleted object
-                # deleteLater() will handle the actual deletion in the event loop
-                self._save_worker = None
-            except RuntimeError:
-                # Object already deleted, just clear the reference
-                self._save_worker = None
+            from PyQt5.QtCore import QTimer
+            # Clear reference after a short delay to allow deleteLater() to process
+            QTimer.singleShot(100, lambda: setattr(self, '_save_worker', None))
     
     def _save_session_impl(self, protocol_data=None):
         """Internal implementation of save_session (runs in worker thread).

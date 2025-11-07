@@ -104,6 +104,9 @@ utils/bgp.py
 utils/bgp_monitor.py
 utils/device_database.py
 utils/device_manager.py
+utils/devices_tab_bgp.py
+utils/devices_tab_isis.py
+utils/devices_tab_ospf.py
 utils/dpdk_tx_worker.py
 utils/frr_docker.py
 utils/frr_docker_old.py
@@ -131,4 +134,5 @@ widgets/add_isis_dialog.py
 widgets/add_ospf_dialog.py
 widgets/add_ospf_route_dialog.py
 widgets/devices_tab.py
+widgets/devices_tab_backup.py
 widgets/stream_dialog.py

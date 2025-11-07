@@ -351,6 +351,23 @@ class DeviceDatabase:
                 conn.commit()
                 logger.info("[DEVICE DB] Successfully added increment_type column to route_pools table")
             
+            # Check if loopback_ipv4 and loopback_ipv6 columns exist in devices table
+            # Refresh columns list after potential migrations
+            cursor = conn.execute("PRAGMA table_info(devices)")
+            columns = [column[1] for column in cursor.fetchall()]
+            
+            if 'loopback_ipv4' not in columns:
+                logger.info("[DEVICE DB] Adding loopback_ipv4 column to devices table")
+                conn.execute("ALTER TABLE devices ADD COLUMN loopback_ipv4 TEXT")
+                conn.commit()
+                logger.info("[DEVICE DB] Successfully added loopback_ipv4 column to devices table")
+            
+            if 'loopback_ipv6' not in columns:
+                logger.info("[DEVICE DB] Adding loopback_ipv6 column to devices table")
+                conn.execute("ALTER TABLE devices ADD COLUMN loopback_ipv6 TEXT")
+                conn.commit()
+                logger.info("[DEVICE DB] Successfully added loopback_ipv6 column to devices table")
+            
         except Exception as e:
             logger.error(f"[DEVICE DB] Migration failed: {e}")
             # Don't raise the exception to avoid breaking the database initialization
@@ -392,6 +409,8 @@ class DeviceDatabase:
                     'ipv4_gateway': device_data.get("ipv4_gateway", ""),
                     'ipv6_gateway': device_data.get("ipv6_gateway", ""),
                     'mac_address': device_data.get("mac_address", ""),
+                    'loopback_ipv4': device_data.get("loopback_ipv4"),
+                    'loopback_ipv6': device_data.get("loopback_ipv6"),
                     'protocols': json.dumps(device_data.get("protocols", [])),
                     'bgp_config': json.dumps(device_data.get("bgp_config", {})),
                     'ospf_config': json.dumps(device_data.get("ospf_config", {})),
@@ -406,8 +425,9 @@ class DeviceDatabase:
                     INSERT INTO devices (
                         device_id, device_name, interface, server_interface, vlan, ipv4_address, ipv4_mask,
                         ipv6_address, ipv6_mask, ipv4_gateway, ipv6_gateway, mac_address,
-                        protocols, bgp_config, ospf_config, isis_config, status, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        loopback_ipv4, loopback_ipv6, protocols, bgp_config, ospf_config, isis_config,
+                        status, created_at, updated_at
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """, tuple(device_info.values()))
                 
                 conn.commit()
@@ -458,6 +478,8 @@ class DeviceDatabase:
                     'ipv4_gateway': 'ipv4_gateway',
                     'ipv6_gateway': 'ipv6_gateway',
                     'mac_address': 'mac_address',
+                    'loopback_ipv4': 'loopback_ipv4',
+                    'loopback_ipv6': 'loopback_ipv6',
                     'protocols': 'protocols',
                     'bgp_config': 'bgp_config',
                     'ospf_config': 'ospf_config',

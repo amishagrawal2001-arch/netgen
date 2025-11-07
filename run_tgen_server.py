@@ -464,9 +464,31 @@ def start_device():
         
         logging.info(f"[DEVICE START] Extracted values: device_id={device_id}, iface={iface}, vlan={vlan}, ipv4={ipv4}, ipv6={ipv6}")
 
+        # Normalize interface name (extract base interface from labels like "TG 0 - Port: ens4np0")
+        def normalize_iface(iface_str):
+            """Normalize interface name from UI label format."""
+            if not iface_str:
+                return ""
+            s = iface_str.strip().strip('"').rstrip(",")
+            if " - " in s:
+                s = s.split(" - ", 1)[-1].strip()
+            if ":" in s:
+                s = s.rsplit(":", 1)[-1].strip()
+            parts = s.split()
+            return parts[-1] if parts else ""
+        
+        # Normalize interface name
+        iface_normalized = normalize_iface(iface)
+        
         # Light start: enable interface and configure IP addresses if provided
-        result = {"device_id": device_id, "device": device_name, "interface": iface}
-        iface_name = f"vlan{vlan}" if (vlan and vlan != "0") else iface
+        result = {"device_id": device_id, "device": device_name, "interface": iface_normalized}
+        iface_name = f"vlan{vlan}" if (vlan and vlan != "0") else iface_normalized
+        
+        # CRITICAL: Validate interface name when VLAN is not used
+        if not iface_name:
+            error_msg = "Interface name is required when VLAN is not specified"
+            logging.error(f"[DEVICE START] {error_msg}")
+            return jsonify({"error": error_msg}), 400
         
         # Step 1: Bring up interface
         try:
@@ -651,7 +673,18 @@ def start_device():
                             # Extract device_id and device_name from container_name for consistency
                             # This ensures we use the actual container naming, not the request values
                             device_id = container_name.replace(f"{frr_manager.container_prefix}-", "")
-                            device_name_from_container = container_name.split('-', 3)[-1] if '-' in container_name else device_name
+                            # CRITICAL: device_name_from_container should be extracted from database using device_id
+                            # since container names only contain device_id, not device_name
+                            # Try to get device_name from database, fallback to original device_name from request
+                            device_name_from_container = device_name  # Default to request value
+                            try:
+                                from utils.device_database import DeviceDatabase
+                                device_db = DeviceDatabase()
+                                device_data = device_db.get_device(device_id) if device_id else None
+                                if device_data:
+                                    device_name_from_container = device_data.get('device_name', device_name)
+                            except Exception as e:
+                                logging.debug(f"[DEVICE START] Could not retrieve device_name from database: {e}")
                             
                             # Configure BGP if enabled
                             logging.info(f"[DEVICE START] Checking BGP config (existing container): bgp_config={bgp_config}, has content: {bool(bgp_config)}")
@@ -682,11 +715,12 @@ def start_device():
                         except Exception:
                             logging.info(f"[DEVICE START] Container {container_name} does not exist, creating it...")
                             # Create container with device configuration
+                            # CRITICAL: Use normalized interface name (not the original iface from request)
                             device_config = {
                                 "device_name": device_name,
                                 "ipv4": ipv4,
                                 "ipv6": ipv6,
-                                "interface": iface,
+                                "interface": iface_normalized,  # Use normalized interface name
                                 "vlan": vlan
                             }
                             
@@ -1109,12 +1143,30 @@ def device_isis_start():
             container_id = container.name  # Use container name for consistency
         except docker.errors.NotFound:
             logging.info(f"[ISIS START] Container {container_name} not found, creating it...")
+            # Normalize interface name (extract base interface from labels like "TG 0 - Port: ens4np0")
+            def normalize_iface(iface_str):
+                """Normalize interface name from UI label format."""
+                if not iface_str:
+                    return ""
+                s = iface_str.strip().strip('"').rstrip(",")
+                if " - " in s:
+                    s = s.split(" - ", 1)[-1].strip()
+                if ":" in s:
+                    s = s.rsplit(":", 1)[-1].strip()
+                parts = s.split()
+                return parts[-1] if parts else ""
+            
+            # Get interface from data or device, then normalize it
+            interface_raw = data.get("interface") or device.get("interface", "ens4np0")
+            interface_normalized = normalize_iface(interface_raw)
+            
             # Create container with device configuration
+            # CRITICAL: Use normalized interface name (not the original interface from request)
             device_config = {
                 "device_name": device_name,
                 "ipv4": data.get("ipv4", device.get("ipv4_address", "")),
                 "ipv6": data.get("ipv6", device.get("ipv6_address", "")),
-                "interface": data.get("interface", device.get("interface", "ens4np0")),
+                "interface": interface_normalized,  # Use normalized interface name
                 "vlan": data.get("vlan", str(device.get("vlan", "0")))
             }
             container_name = frr_manager.start_frr_container(device_id, device_config)
@@ -1820,26 +1872,54 @@ def apply_device():
         logging.info(f"[DEVICE APPLY] OSPF Config: {ospf_config}")
         logging.info(f"[DEVICE APPLY] ISIS Config: {isis_config}")
         
+        # Normalize interface name (extract base interface from labels like "TG 0 - Port: ens4np0")
+        def normalize_iface(iface_str):
+            """Normalize interface name from UI label format."""
+            if not iface_str:
+                return ""
+            s = iface_str.strip().strip('"').rstrip(",")
+            if " - " in s:
+                s = s.split(" - ", 1)[-1].strip()
+            if ":" in s:
+                s = s.rsplit(":", 1)[-1].strip()
+            parts = s.split()
+            return parts[-1] if parts else ""
+        
+        # Normalize interface name
+        interface_normalized = normalize_iface(interface)
+        
         result = {
             "device_id": device_id,
             "device": device_name,
-            "interface": interface,
+            "interface": interface_normalized,
             "vlan": vlan
         }
         
         # Determine interface name
-        iface_name = f"vlan{vlan}" if (vlan and vlan != "0") else interface
+        iface_name = f"vlan{vlan}" if (vlan and vlan != "0") else interface_normalized
+        
+        # CRITICAL: Validate interface name when VLAN is not used
+        if not iface_name:
+            error_msg = "Interface name is required when VLAN is not specified"
+            logging.error(f"[DEVICE APPLY] {error_msg}")
+            return jsonify({"error": error_msg}), 400
         
         # Step 1: Create VLAN interface if needed
         if vlan and vlan != "0":
             try:
+                # CRITICAL: Use normalized interface name for VLAN creation
+                if not interface_normalized:
+                    error_msg = "Interface name is required for VLAN creation"
+                    logging.error(f"[DEVICE APPLY] {error_msg}")
+                    return jsonify({"error": error_msg}), 400
+                
                 # Check if VLAN interface exists
                 check_result = subprocess.run(["ip", "link", "show", iface_name], 
                                             capture_output=True, text=True, timeout=5)
                 if check_result.returncode != 0:
-                    # Create VLAN interface
+                    # Create VLAN interface using normalized interface name
                     vlan_result = subprocess.run([
-                        "ip", "link", "add", "link", interface, "name", iface_name, 
+                        "ip", "link", "add", "link", interface_normalized, "name", iface_name, 
                         "type", "vlan", "id", vlan
                     ], capture_output=True, text=True, timeout=5)
                     
@@ -2276,11 +2356,28 @@ def configure_ospf():
         
         if container is None:
             # Create device config for container creation
+            # Normalize interface name (extract base interface from labels like "TG 0 - Port: ens4np0")
+            def normalize_iface(iface_str):
+                """Normalize interface name from UI label format."""
+                if not iface_str:
+                    return ""
+                s = iface_str.strip().strip('"').rstrip(",")
+                if " - " in s:
+                    s = s.split(" - ", 1)[-1].strip()
+                if ":" in s:
+                    s = s.rsplit(":", 1)[-1].strip()
+                parts = s.split()
+                return parts[-1] if parts else ""
+            
+            # Get interface from data, then normalize it
+            interface_raw = data.get("interface", "ens4np0")
+            interface_normalized = normalize_iface(interface_raw)
+            
             device_config = {
                 "device_name": device_name,
                 "ipv4": ipv4,
                 "ipv6": ipv6,
-                "interface": data.get("interface", "ens4np0"),
+                "interface": interface_normalized,  # Use normalized interface name
                 "vlan": data.get("vlan", "0"),
                 "ospf_config": ospf_config
             }
@@ -4660,11 +4757,28 @@ def configure_bgp():
         
         if container is None:
             # Create device config for container creation
+            # Normalize interface name (extract base interface from labels like "TG 0 - Port: ens4np0")
+            def normalize_iface(iface_str):
+                """Normalize interface name from UI label format."""
+                if not iface_str:
+                    return ""
+                s = iface_str.strip().strip('"').rstrip(",")
+                if " - " in s:
+                    s = s.split(" - ", 1)[-1].strip()
+                if ":" in s:
+                    s = s.rsplit(":", 1)[-1].strip()
+                parts = s.split()
+                return parts[-1] if parts else ""
+            
+            # Get interface from data, then normalize it
+            interface_raw = data.get("interface", "ens4np0")
+            interface_normalized = normalize_iface(interface_raw)
+            
             device_config = {
                 "device_name": device_name,
                 "ipv4": ipv4,
                 "ipv6": ipv6,
-                "interface": data.get("interface", "ens4np0"),
+                "interface": interface_normalized,  # Use normalized interface name
                 "vlan": data.get("vlan", "0"),
                 "bgp_config": bgp_config
             }
@@ -5607,7 +5721,18 @@ def start_bgp():
                 from utils.bgp import configure_bgp_for_device
                 # Extract device_id from container_name
                 device_id = container_name.replace(f"{frr_manager.container_prefix}-", "")
-                device_name_from_container = container_name.split('-', 3)[-1] if '-' in container_name else None
+                # CRITICAL: device_name_from_container should be extracted from database using device_id
+                # since container names only contain device_id, not device_name
+                # Try to get device_name from database, fallback to None
+                device_name_from_container = None
+                try:
+                    from utils.device_database import DeviceDatabase
+                    device_db = DeviceDatabase()
+                    device_data = device_db.get_device(device_id) if device_id else None
+                    if device_data:
+                        device_name_from_container = device_data.get('device_name')
+                except Exception as e:
+                    logging.debug(f"[BGP START] Could not retrieve device_name from database: {e}")
                 success = configure_bgp_for_device(device_id, bgp_config, ipv4, ipv6, device_name_from_container)
                 if success:
                     logging.info(f"[BGP START] Successfully reapplied complete BGP configuration")

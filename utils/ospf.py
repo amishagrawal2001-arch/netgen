@@ -174,6 +174,19 @@ def configure_ospf_neighbor(device_id: str, ospf_config: Dict[str, Any], device_
         else:
             graceful_restart_ipv6 = graceful_restart  # Fall back to generic graceful_restart
         
+        # Support separate P2P (point-to-point) network type for IPv4 and IPv6
+        # For IPv4: use p2p_ipv4 if it exists, otherwise fall back to p2p
+        if "p2p_ipv4" in ospf_config:
+            p2p_ipv4 = ospf_config.get("p2p_ipv4", False)
+        else:
+            p2p_ipv4 = ospf_config.get("p2p", False)  # Fall back to generic p2p
+        
+        # For IPv6: use p2p_ipv6 if it exists, otherwise fall back to p2p
+        if "p2p_ipv6" in ospf_config:
+            p2p_ipv6 = ospf_config.get("p2p_ipv6", False)
+        else:
+            p2p_ipv6 = ospf_config.get("p2p", False)  # Fall back to generic p2p
+        
         # Get device IP addresses from database to calculate correct network
         from utils.device_database import DeviceDatabase
         device_db = DeviceDatabase()
@@ -203,7 +216,15 @@ def configure_ospf_neighbor(device_id: str, ospf_config: Dict[str, Any], device_
         if not interface and device_data:
             interface = device_data.get("interface", "")
         vlan = device_data.get("vlan", "0") if device_data else "0"
-        interface = f"vlan{vlan}" if (vlan and vlan != "0") else (interface if interface else "eth0")
+        
+        # CRITICAL: Validate interface name when VLAN is not used
+        # Do not fall back to 'eth0' as it's the container's internal interface, not the host interface
+        if vlan and vlan != "0":
+            interface = f"vlan{vlan}"
+        elif not interface:
+            # Interface is required - log error and use empty string (will cause configuration to fail gracefully)
+            logging.error(f"[OSPF CONFIGURE] Interface name is required when VLAN is not specified for device {device_id}")
+            interface = ""  # Will cause vtysh commands to fail, but better than silently using wrong interface
         
         # Get router-id (must be loopback IPv4)
         # First, try to get loopback IPv4 from database
@@ -250,6 +271,8 @@ def configure_ospf_neighbor(device_id: str, ospf_config: Dict[str, Any], device_
         vtysh_commands = ["configure terminal"]
         
         # Get current OSPF configuration to remove old area configurations
+        show_run_result = None
+        current_config = ""
         try:
             # Get current running config to check for existing area configurations
             # Use timeout wrapper to prevent hanging if container is not ready
@@ -384,8 +407,28 @@ def configure_ospf_neighbor(device_id: str, ospf_config: Dict[str, Any], device_
                 f" ip ospf dead-interval {dead_interval}",
                 f" ip ospf area {area_id_ipv4}",
                 " no ip ospf passive",  # Use modern interface-level command
-                "exit"
             ])
+            
+            # Configure point-to-point network type for IPv4 if enabled
+            if p2p_ipv4:
+                vtysh_commands.append(" ip ospf network point-to-point")
+            else:
+                # Remove point-to-point if it was previously set
+                # Check if point-to-point is currently configured
+                if current_config:
+                    try:
+                        import re
+                        interface_section_pattern = rf'interface\s+{re.escape(interface)}.*?(?=\ninterface|\n!|\nrouter|\Z)'
+                        interface_section_match = re.search(interface_section_pattern, current_config, re.DOTALL)
+                        if interface_section_match:
+                            interface_section = interface_section_match.group(0)
+                            if re.search(r'ip\s+ospf\s+network\s+point-to-point', interface_section, re.IGNORECASE):
+                                logging.info(f"[OSPF CONFIGURE] Removing point-to-point network type from IPv4 interface {interface}")
+                                vtysh_commands.append(" no ip ospf network point-to-point")
+                    except Exception as e:
+                        logging.debug(f"[OSPF CONFIGURE] Could not check for existing point-to-point config: {e}")
+            
+            vtysh_commands.append("exit")
         
         # Configure IPv6 OSPF if enabled
         if ipv6_enabled:
@@ -425,8 +468,28 @@ def configure_ospf_neighbor(device_id: str, ospf_config: Dict[str, Any], device_
                 f" ipv6 ospf6 hello-interval {hello_interval}",
                 f" ipv6 ospf6 dead-interval {dead_interval}",
                 f" ipv6 ospf6 area {area_id_ipv6}",
-                "exit"
             ])
+            
+            # Configure point-to-point network type for IPv6 if enabled
+            if p2p_ipv6:
+                vtysh_commands.append(" ipv6 ospf6 network point-to-point")
+            else:
+                # Remove point-to-point if it was previously set
+                # Check if point-to-point is currently configured
+                if current_config:
+                    try:
+                        import re
+                        interface_section_pattern = rf'interface\s+{re.escape(interface)}.*?(?=\ninterface|\n!|\nrouter|\Z)'
+                        interface_section_match = re.search(interface_section_pattern, current_config, re.DOTALL)
+                        if interface_section_match:
+                            interface_section = interface_section_match.group(0)
+                            if re.search(r'ipv6\s+ospf6\s+network\s+point-to-point', interface_section, re.IGNORECASE):
+                                logging.info(f"[OSPF CONFIGURE] Removing point-to-point network type from IPv6 interface {interface}")
+                                vtysh_commands.append(" no ipv6 ospf6 network point-to-point")
+                    except Exception as e:
+                        logging.debug(f"[OSPF CONFIGURE] Could not check for existing point-to-point config: {e}")
+            
+            vtysh_commands.append("exit")
         
         # Check if we actually have any OSPF commands to execute (beyond "configure terminal")
         if len(vtysh_commands) <= 1:
@@ -517,7 +580,11 @@ def start_ospf_neighbor(device_id: str, ospf_config: Dict[str, Any], device_name
         area_id = ospf_config.get("area_id", "0.0.0.0")
         ipv4_enabled = ospf_config.get("ipv4_enabled", True)
         ipv6_enabled = ospf_config.get("ipv6_enabled", False)
-        interface = ospf_config.get("interface", device_data.get("interface", "eth0"))
+        # CRITICAL: Validate interface name - do not fall back to 'eth0'
+        interface = ospf_config.get("interface") or (device_data.get("interface") if device_data else "")
+        if not interface:
+            logging.error(f"[OSPF START] Interface name is required for device {device_id}")
+            interface = ""  # Will cause vtysh commands to fail, but better than silently using wrong interface
         
         logging.info(f"[OSPF START] Config: af={af}, area_id={area_id}, interface={interface}, ipv4_enabled={ipv4_enabled}, ipv6_enabled={ipv6_enabled}")
         
@@ -697,7 +764,11 @@ def stop_ospf_neighbor(device_id: str, device_name: str = None, af: str = None) 
         area_id = ospf_config.get("area_id", "0.0.0.0")
         ipv4_enabled = ospf_config.get("ipv4_enabled", True)
         ipv6_enabled = ospf_config.get("ipv6_enabled", False)
-        interface = ospf_config.get("interface", device_data.get("interface", "eth0"))
+        # CRITICAL: Validate interface name - do not fall back to 'eth0'
+        interface = ospf_config.get("interface") or (device_data.get("interface") if device_data else "")
+        if not interface:
+            logging.error(f"[OSPF START] Interface name is required for device {device_id}")
+            interface = ""  # Will cause vtysh commands to fail, but better than silently using wrong interface
         
         logging.info(f"[OSPF STOP] Config: af={af}, area_id={area_id}, interface={interface}, ipv4_enabled={ipv4_enabled}, ipv6_enabled={ipv6_enabled}")
         

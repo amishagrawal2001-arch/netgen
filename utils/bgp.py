@@ -13,12 +13,12 @@ BGP_ROUTES = {}  # Store advertised routes per device
 try:
     from .frr_docker import (
         start_frr_container, stop_frr_container, setup_frr_network,
-        configure_bgp_neighbor, get_bgp_status, get_bgp_neighbors, get_bgp_routes
+        configure_bgp_neighbor, get_bgp_status, get_bgp_neighbors
     )
     DOCKER_FRR_AVAILABLE = True
-except ImportError:
+except ImportError as e:
     DOCKER_FRR_AVAILABLE = False
-    logging.warning("[BGP] Docker FRR not available, falling back to system FRR")
+    logging.warning(f"[BGP] Docker FRR not available, falling back to system FRR: {e}")
 
 def check_frr_availability():
     """Check if FRR and vtysh are available."""
@@ -109,14 +109,14 @@ def execute_vtysh_command(device_id, vtysh_commands, timeout=10, device_name=Non
                 logging.warning(f"[BGP] Could not check/remove existing BGP config: {e}")
                 # Continue anyway
         
-        # Build vtysh command string
-        vtysh_cmd = "vtysh"
-        for cmd in vtysh_commands:
-            vtysh_cmd += f" -c '{cmd}'"
+        # Execute commands using here-doc to maintain context
+        config_commands = "\n".join(vtysh_commands)
+        exec_cmd = f"vtysh << 'EOF'\n{config_commands}\nEOF"
         
-        logging.info(f"[BGP] Executing in container {container_name}: {vtysh_cmd}")
+        logging.info(f"[BGP] Executing in container {container_name} via here-doc")
+        logging.debug(f"[BGP] Commands: {vtysh_commands}")
         
-        result = container.exec_run(vtysh_cmd)
+        result = container.exec_run(["bash", "-c", exec_cmd])
         
         if result.exit_code != 0:
             output_str = result.output.decode('utf-8') if isinstance(result.output, bytes) else str(result.output)
@@ -1012,6 +1012,161 @@ def generate_bgp_test_routes(device_id: str, route_count: int = 10,
     }
     
     return advertise_bgp_routes(device_id, route_config)
+
+
+def configure_bgp_for_device(device_id: str, bgp_config: Dict, ipv4: str = None, ipv6: str = None, device_name: str = None) -> bool:
+    """
+    Configure BGP for a device in FRR container.
+    This function configures the full BGP setup including router bgp, router-id, neighbors, and address families.
+    
+    Args:
+        device_id: Device identifier
+        bgp_config: Full BGP configuration dictionary
+        ipv4: Device IPv4 address (optional, for network advertisement)
+        ipv6: Device IPv6 address (optional)
+        device_name: Device name (optional)
+    
+    Returns:
+        True if successful, False otherwise
+    """
+    try:
+        if not DOCKER_FRR_AVAILABLE:
+            logging.error("[BGP] Docker FRR not available, cannot configure BGP")
+            return False
+        
+        from utils.frr_docker import FRRDockerManager
+        frr_manager = FRRDockerManager()
+        container_name = frr_manager._get_container_name(device_id, device_name)
+        container = frr_manager.client.containers.get(container_name)
+        
+        # Get router-id (must be loopback IPv4)
+        # First, try to get loopback IPv4 from database
+        loopback_ipv4 = None
+        try:
+            from utils.device_database import DeviceDatabase
+            device_db = DeviceDatabase()
+            device_data = device_db.get_device(device_id) if device_id else None
+            if device_data:
+                loopback_ipv4 = device_data.get('loopback_ipv4')
+                if loopback_ipv4 and loopback_ipv4.strip():
+                    loopback_ipv4 = loopback_ipv4.strip().split('/')[0]
+        except Exception as e:
+            logging.warning(f"[BGP] Could not retrieve loopback IPv4 from database: {e}")
+        
+        # Router ID must be loopback IPv4
+        if loopback_ipv4:
+            router_id = loopback_ipv4
+            logging.info(f"[BGP] Using loopback IPv4 {router_id} as router-id")
+        else:
+            # Fallback to interface IPv4 if loopback not available
+            if ipv4:
+                router_id = ipv4.split('/')[0]
+                logging.warning(f"[BGP] Loopback IPv4 not found, using interface IPv4 {router_id} as router-id (fallback)")
+            else:
+                router_id = "192.168.0.2"
+                logging.warning(f"[BGP] No IPv4 available, using default router-id {router_id}")
+        
+        # Build BGP configuration commands
+        local_as = bgp_config.get('bgp_asn', 65000)
+        neighbor_as = bgp_config.get('bgp_remote_asn', 65001)
+        keepalive = bgp_config.get('bgp_keepalive', 30)
+        hold_time = bgp_config.get('bgp_hold_time', 90)
+        
+        vtysh_commands = [
+            "configure terminal",
+            f"router bgp {local_as}",
+            f"bgp router-id {router_id}",
+            "bgp log-neighbor-changes",
+            "bgp graceful-restart",
+        ]
+        
+        # Note: Interface IP addresses (IPv4/IPv6) are configured via frr.conf.template
+        # when the container is created, not via vtysh commands here
+        
+        # Configure IPv4 BGP if enabled
+        neighbor_ipv4 = bgp_config.get('bgp_neighbor_ipv4')
+        update_source_ipv4 = bgp_config.get('bgp_update_source_ipv4', ipv4.split('/')[0] if ipv4 else None)
+        
+        if neighbor_ipv4 and update_source_ipv4:
+            logging.info(f"[BGP] Configuring IPv4 BGP neighbor {neighbor_ipv4} with update-source {update_source_ipv4}")
+            vtysh_commands.extend([
+                f"neighbor {neighbor_ipv4} remote-as {neighbor_as}",
+                f"neighbor {neighbor_ipv4} update-source {update_source_ipv4}",
+                f"neighbor {neighbor_ipv4} timers {keepalive} {hold_time}",
+            ])
+        
+        # Configure IPv6 BGP if enabled
+        neighbor_ipv6 = bgp_config.get('bgp_neighbor_ipv6')
+        update_source_ipv6 = bgp_config.get('bgp_update_source_ipv6', ipv6.split('/')[0] if ipv6 else None)
+        
+        if neighbor_ipv6 and update_source_ipv6:
+            logging.info(f"[BGP] Configuring IPv6 BGP neighbor {neighbor_ipv6} with update-source {update_source_ipv6}")
+            vtysh_commands.extend([
+                f"neighbor {neighbor_ipv6} remote-as {neighbor_as}",
+                f"neighbor {neighbor_ipv6} update-source {update_source_ipv6}",
+                f"neighbor {neighbor_ipv6} timers {keepalive} {hold_time}",
+            ])
+        
+        # Check if any BGP neighbors were configured
+        if not neighbor_ipv4 and not neighbor_ipv6:
+            logging.warning(f"[BGP] No BGP neighbors configured for device {device_id}")
+            return False
+        
+        # Configure IPv4 address family if IPv4 neighbor exists
+        if neighbor_ipv4:
+            logging.info(f"[BGP] Configuring IPv4 address family for neighbor {neighbor_ipv4}")
+            vtysh_commands.extend([
+                "address-family ipv4 unicast",
+                f"neighbor {neighbor_ipv4} activate",
+            ])
+            
+            # Add network advertisement if IPv4 network is available
+            if ipv4:
+                # Extract network from IP/mask (e.g., 192.168.0.2/24 -> 192.168.0.0/24)
+                ip_addr = ipv4.split('/')[0]
+                mask = ipv4.split('/')[1] if '/' in ipv4 else '24'
+                # Convert to network address
+                import ipaddress
+                try:
+                    network = ipaddress.IPv4Network(f"{ip_addr}/{mask}", strict=False)
+                    vtysh_commands.append(f"network {network}")
+                    logging.info(f"[BGP] Advertising IPv4 network {network}")
+                except Exception as e:
+                    logging.warning(f"[BGP] Failed to calculate IPv4 network for {ipv4}: {e}")
+            
+            vtysh_commands.append("exit-address-family")
+        
+        # Configure IPv6 address family if IPv6 neighbor exists
+        if neighbor_ipv6:
+            logging.info(f"[BGP] Configuring IPv6 address family for neighbor {neighbor_ipv6}")
+            vtysh_commands.extend([
+                "address-family ipv6 unicast",
+                f"neighbor {neighbor_ipv6} activate",
+                "exit-address-family"
+            ])
+        
+        vtysh_commands.extend([
+            "exit",
+            "exit",
+        ])
+        
+        # Execute commands using here-doc to maintain context
+        logging.info(f"[BGP] Configuring BGP for device {device_id} in container {container_name}")
+        result = execute_vtysh_command(device_id, vtysh_commands, device_name=device_name)
+        
+        if result.exit_code == 0:
+            logging.info(f"[BGP] ✅ Successfully configured BGP for device {device_id} in container {container_name}")
+            return True
+        else:
+            output_str = result.output.decode('utf-8') if isinstance(result.output, bytes) else str(result.output)
+            logging.error(f"[BGP] BGP configuration failed in container {container_name}: {output_str}")
+            return False
+            
+    except Exception as e:
+        logging.error(f"[BGP] Failed to configure BGP for device {device_id}: {e}")
+        import traceback
+        logging.error(f"[BGP] Traceback: {traceback.format_exc()}")
+        return False
 
 
 def get_bgp_route_statistics() -> Dict[str, Any]:

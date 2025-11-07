@@ -1544,8 +1544,10 @@ class ISISHandler:
             
             if isis_devices:
                 print(f"[ISIS MONITORING] Periodic ISIS status check for {len(isis_devices)} devices")
-                # Update ISIS table
-                self.update_isis_table()
+                # Use QTimer.singleShot to defer table update and avoid blocking UI thread
+                # This ensures the periodic check doesn't block the UI during table updates
+                from PyQt5.QtCore import QTimer
+                QTimer.singleShot(0, self.update_isis_table)  # Defer to next event loop iteration
             
         except Exception as e:
             print(f"[ISIS MONITORING ERROR] Error in periodic ISIS status check: {e}")
