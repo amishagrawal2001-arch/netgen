@@ -648,14 +648,16 @@ def start_device():
                             ipv6_mask_for_config = ipv6_mask if ipv6_mask else device_data.get('ipv6_mask', '64')
                             ipv6_full = f"{ipv6_for_config}/{ipv6_mask_for_config}" if ipv6_for_config else ""
                             
+                            # Extract device_id and device_name from container_name for consistency
+                            # This ensures we use the actual container naming, not the request values
+                            device_id = container_name.replace(f"{frr_manager.container_prefix}-", "")
+                            device_name_from_container = container_name.split('-', 3)[-1] if '-' in container_name else device_name
+                            
                             # Configure BGP if enabled
                             logging.info(f"[DEVICE START] Checking BGP config (existing container): bgp_config={bgp_config}, has content: {bool(bgp_config)}")
                             if bgp_config and isinstance(bgp_config, dict) and len(bgp_config) > 0:
                                 logging.info(f"[DEVICE START] Configuring BGP in existing container")
                                 from utils.bgp import configure_bgp_for_device
-                                # Extract device_id from container_name
-                                device_id = container_name.replace(f"{frr_manager.container_prefix}-", "")
-                                device_name_from_container = container_name.split('-', 3)[-1] if '-' in container_name else None
                                 configure_bgp_for_device(device_id, bgp_config, ipv4_full, ipv6_full, device_name_from_container)
                             else:
                                 logging.warning(f"[DEVICE START] BGP config is empty or invalid, skipping BGP configuration")
@@ -665,7 +667,7 @@ def start_device():
                             if ospf_config and isinstance(ospf_config, dict) and len(ospf_config) > 0:
                                 logging.info(f"[DEVICE START] Configuring OSPF in existing container")
                                 from utils.ospf import configure_ospf_neighbor
-                                configure_ospf_neighbor(device_id, ospf_config, device_name)
+                                configure_ospf_neighbor(device_id, ospf_config, device_name_from_container)
                             else:
                                 logging.warning(f"[DEVICE START] OSPF config is empty or invalid, skipping OSPF configuration")
                             
@@ -674,7 +676,7 @@ def start_device():
                             if isis_config and isinstance(isis_config, dict) and len(isis_config) > 0:
                                 logging.info(f"[DEVICE START] Configuring ISIS in existing container")
                                 from utils.isis import configure_isis_neighbor
-                                configure_isis_neighbor(device_id, isis_config, device_name, ipv4_for_config, ipv6_for_config)
+                                configure_isis_neighbor(device_id, isis_config, device_name_from_container, ipv4_for_config, ipv6_for_config)
                             else:
                                 logging.warning(f"[DEVICE START] ISIS config is empty or invalid, skipping ISIS configuration")
                         except Exception:
