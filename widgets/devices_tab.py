@@ -2065,6 +2065,18 @@ class DevicesTab(QWidget):
             # Refresh device table from database for all operations to get current ARP status
             # This ensures ARP status is updated after start/stop/apply operations
             QTimer.singleShot(200, lambda: self._refresh_device_table_from_database(selected_rows))
+
+            operation_type = getattr(self, '_current_operation_type', None)
+            if operation_type == 'start':
+                # Ensure device/status monitoring resumes for started devices
+                self.start_device_status_monitoring()
+                protocols = self._collect_protocols_for_rows(selected_rows)
+                if "BGP" in protocols:
+                    self.start_bgp_monitoring()
+                if "OSPF" in protocols:
+                    self.start_ospf_monitoring()
+                if "IS-IS" in protocols or "ISIS" in protocols:
+                    self.start_isis_monitoring()
         
         # Clear the operation type flag
         if hasattr(self, '_current_operation_type'):
@@ -2211,32 +2223,32 @@ class DevicesTab(QWidget):
         # ARP results are now shown via color indicators in the UI
         # No popup needed since status is visible through colored dots and text
     
-    def _refresh_protocols_for_selected_devices(self, selected_rows):
-        """Refresh protocol tabs (BGP, OSPF, ISIS) for devices in selected rows (optimized, non-blocking)."""
+    def _collect_protocols_for_rows(self, selected_rows):
+        """Collect protocol names for devices in the provided rows."""
+        protocols = set()
         try:
-            # Collect protocols that need refreshing
-            protocols_to_refresh = set()
-            
             for row in selected_rows:
                 name_item = self.devices_table.item(row, self.COL["Device Name"])
                 if not name_item:
                     continue
-                
                 device_name = name_item.text()
-                
-                # Find device in all_devices to check protocols
                 for iface, devices in self.main_window.all_devices.items():
                     for device in devices:
                         if device.get("Device Name") == device_name:
-                            # Check which protocols this device has
-                            if "protocols" in device:
-                                device_protocols = device.get("protocols", {})
-                                if isinstance(device_protocols, dict):
-                                    protocols_to_refresh.update(device_protocols.keys())
+                            device_protocols = device.get("protocols", {})
+                            if isinstance(device_protocols, dict):
+                                protocols.update(device_protocols.keys())
                             break
-            
+        except Exception as e:
+            logging.error(f"[PROTOCOL COLLECT ERROR] {e}")
+        return protocols
+
+    def _refresh_protocols_for_selected_devices(self, selected_rows):
+        """Refresh protocol tabs (BGP, OSPF, ISIS) for devices in selected rows (optimized, non-blocking)."""
+        try:
+            protocols_to_refresh = self._collect_protocols_for_rows(selected_rows)
             if not protocols_to_refresh:
-                return  # Nothing to refresh
+                return
             
             # Refresh protocol tables in parallel using ThreadPoolExecutor (faster)
             with ThreadPoolExecutor(max_workers=3) as executor:
