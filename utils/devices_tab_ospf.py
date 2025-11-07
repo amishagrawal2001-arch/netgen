@@ -33,7 +33,7 @@ class OSPFHandler:
         layout = QVBoxLayout(self.parent.ospf_subtab)
         
         # OSPF Neighbors Table
-        ospf_headers = ["Device", "OSPF Status", "Area ID", "Neighbor Type", "Interface", "Neighbor ID", "State", "Priority", "Dead Timer", "Uptime", "Graceful Restart", "Route Pools"]
+        ospf_headers = ["Device", "OSPF Status", "Area ID", "Neighbor Type", "Interface", "Neighbor ID", "State", "Priority", "Dead Timer", "Uptime", "Graceful Restart", "P2P", "Route Pools"]
         self.parent.ospf_table = QTableWidget(0, len(ospf_headers))
         self.parent.ospf_table.setHorizontalHeaderLabels(ospf_headers)
         
@@ -413,14 +413,6 @@ class OSPFHandler:
                                     # Fall back to generic area_id only if area_id_ipv4 is not set
                                     display_area_id = area_id
                                     
-                            # Get graceful restart status for this specific address family
-                            # Support separate graceful restart for IPv4 and IPv6, with backward compatibility
-                            if protocol_type == "IPv6":
-                                graceful_restart = ospf_config.get("graceful_restart_ipv6") or ospf_config.get("graceful_restart", False) if ospf_config else False
-                            else:
-                                graceful_restart = ospf_config.get("graceful_restart_ipv4") or ospf_config.get("graceful_restart", False) if ospf_config else False
-                            graceful_restart_text = "Yes" if graceful_restart else "No"
-                            
                             self.parent.ospf_table.setItem(row, 0, QTableWidgetItem(device_name))  # Device
                             # Set OSPF status icon instead of text
                             self.set_ospf_status_icon(row, ospf_status, f"OSPF {ospf_status}")
@@ -432,9 +424,55 @@ class OSPFHandler:
                             self.parent.ospf_table.setItem(row, 7, QTableWidgetItem(priority))     # Priority
                             self.parent.ospf_table.setItem(row, 8, QTableWidgetItem(dead_timer))   # Dead Timer
                             self.parent.ospf_table.setItem(row, 9, QTableWidgetItem(uptime))        # Uptime
-                            self.parent.ospf_table.setItem(row, 10, QTableWidgetItem(graceful_restart_text))  # Graceful Restart
                             
-                            # Route Pools (column 11) - Show attached pool names for this specific address family
+                            # Graceful Restart (column 10) - Checkbox for graceful restart
+                            graceful_restart_checkbox = QCheckBox()
+                            # Get graceful restart status for this specific address family
+                            # Support separate graceful restart for IPv4 and IPv6, with backward compatibility
+                            # CRITICAL: Check if key exists first to handle False as a valid value
+                            # Using "or" would incorrectly treat False as falsy and fall back to graceful_restart
+                            if protocol_type == "IPv6":
+                                if "graceful_restart_ipv6" in ospf_config:
+                                    # Key exists, use it directly (even if value is False)
+                                    graceful_restart = ospf_config["graceful_restart_ipv6"]
+                                else:
+                                    # Key doesn't exist, fall back to generic graceful_restart
+                                    graceful_restart = ospf_config.get("graceful_restart", False) if ospf_config else False
+                            else:
+                                if "graceful_restart_ipv4" in ospf_config:
+                                    # Key exists, use it directly (even if value is False)
+                                    graceful_restart = ospf_config["graceful_restart_ipv4"]
+                                else:
+                                    # Key doesn't exist, fall back to generic graceful_restart
+                                    graceful_restart = ospf_config.get("graceful_restart", False) if ospf_config else False
+                            graceful_restart_checkbox.setChecked(graceful_restart)
+                            graceful_restart_checkbox.setToolTip(f"Enable graceful restart for {protocol_type}")
+                            # Store device info in checkbox for later reference
+                            graceful_restart_checkbox.setProperty("device_name", device_name)
+                            graceful_restart_checkbox.setProperty("protocol_type", protocol_type)
+                            graceful_restart_checkbox.setProperty("row", row)
+                            # Connect checkbox state change
+                            graceful_restart_checkbox.stateChanged.connect(lambda state, cb=graceful_restart_checkbox: self.on_graceful_restart_checkbox_changed(cb, state))
+                            self.parent.ospf_table.setCellWidget(row, 10, graceful_restart_checkbox)
+                            
+                            # P2P (column 11) - Checkbox for point-to-point network type
+                            p2p_checkbox = QCheckBox()
+                            # Get P2P setting for this address family
+                            if protocol_type == "IPv6":
+                                p2p_enabled = ospf_config.get("p2p_ipv6", False) if ospf_config else False
+                            else:
+                                p2p_enabled = ospf_config.get("p2p_ipv4", False) or ospf_config.get("p2p", False) if ospf_config else False
+                            p2p_checkbox.setChecked(p2p_enabled)
+                            p2p_checkbox.setToolTip(f"Enable point-to-point network type for {protocol_type}")
+                            # Store device info in checkbox for later reference
+                            p2p_checkbox.setProperty("device_name", device_name)
+                            p2p_checkbox.setProperty("protocol_type", protocol_type)
+                            p2p_checkbox.setProperty("row", row)
+                            # Connect checkbox state change
+                            p2p_checkbox.stateChanged.connect(lambda state, cb=p2p_checkbox: self.on_p2p_checkbox_changed(cb, state))
+                            self.parent.ospf_table.setCellWidget(row, 11, p2p_checkbox)
+                            
+                            # Route Pools (column 12) - Show attached pool names for this specific address family
                             route_pools_str = ""
                             if ospf_config and "route_pools" in ospf_config:
                                 route_pools = ospf_config.get("route_pools", {})
@@ -451,7 +489,7 @@ class OSPFHandler:
                             
                             pool_item = QTableWidgetItem(route_pools_str if route_pools_str else "")
                             pool_item.setToolTip(f"Attached route pools for {protocol_type}: {route_pools_str if route_pools_str else 'None'}")
-                            self.parent.ospf_table.setItem(row, 11, pool_item)  # Route Pools
+                            self.parent.ospf_table.setItem(row, 12, pool_item)  # Route Pools
         except Exception as e:
             print(f"Error updating OSPF table: {e}")
     
@@ -615,9 +653,17 @@ class OSPFHandler:
         # Get the current graceful restart for the selected address family
         # Support separate graceful restart for IPv4 and IPv6, with backward compatibility
         if is_ipv6:
-            current_graceful_restart = current_ospf_config.get("graceful_restart_ipv6") or current_ospf_config.get("graceful_restart", False)
+            # CRITICAL: Check if key exists first to handle False as a valid value
+            if "graceful_restart_ipv6" in current_ospf_config:
+                current_graceful_restart = current_ospf_config["graceful_restart_ipv6"]
+            else:
+                current_graceful_restart = current_ospf_config.get("graceful_restart", False)
         else:
-            current_graceful_restart = current_ospf_config.get("graceful_restart_ipv4") or current_ospf_config.get("graceful_restart", False)
+            # CRITICAL: Check if key exists first to handle False as a valid value
+            if "graceful_restart_ipv4" in current_ospf_config:
+                current_graceful_restart = current_ospf_config["graceful_restart_ipv4"]
+            else:
+                current_graceful_restart = current_ospf_config.get("graceful_restart", False)
         
         dialog_config["graceful_restart"] = current_graceful_restart
         
@@ -639,6 +685,14 @@ class OSPFHandler:
                 # CRITICAL: Preserve route_pools to prevent accidental removal when editing config
                 if "route_pools" in current_ospf_config:
                     ospf_config["route_pools"] = current_ospf_config["route_pools"]
+                
+                # CRITICAL: Preserve P2P settings to prevent accidental removal when editing config
+                if "p2p_ipv4" in current_ospf_config:
+                    ospf_config["p2p_ipv4"] = current_ospf_config["p2p_ipv4"]
+                if "p2p_ipv6" in current_ospf_config:
+                    ospf_config["p2p_ipv6"] = current_ospf_config["p2p_ipv6"]
+                if "p2p" in current_ospf_config:
+                    ospf_config["p2p"] = current_ospf_config["p2p"]  # For backward compatibility
                 
                 # Update only the area ID for the selected address family
                 # First, preserve or initialize both area IDs from existing config
@@ -833,10 +887,114 @@ class OSPFHandler:
         else:
             QMessageBox.warning(self.parent, "No OSPF Configuration", f"No OSPF configuration found for device '{device_name}'.")
     
+    def on_p2p_checkbox_changed(self, checkbox, state):
+        """Handle P2P checkbox state change."""
+        try:
+            device_name = checkbox.property("device_name")
+            protocol_type = checkbox.property("protocol_type")
+            is_ipv6 = (protocol_type == "IPv6")
+            
+            # Find the device in all_devices
+            device_info = None
+            for iface, devices in self.parent.main_window.all_devices.items():
+                for device in devices:
+                    if device.get("Device Name") == device_name:
+                        device_info = device
+                        break
+                if device_info:
+                    break
+            
+            if not device_info:
+                print(f"[OSPF P2P] Device {device_name} not found")
+                return
+            
+            # Get current OSPF config
+            ospf_config = device_info.get("ospf_config", {})
+            if not isinstance(ospf_config, dict):
+                ospf_config = {}
+            
+            # Update P2P setting for the selected address family
+            p2p_enabled = (state == 2)  # Qt.Checked = 2
+            
+            # Update only the selected address family's P2P setting
+            update_dict = {}
+            if is_ipv6:
+                update_dict["p2p_ipv6"] = p2p_enabled
+            else:
+                update_dict["p2p_ipv4"] = p2p_enabled
+            
+            # Update ospf_config
+            ospf_config.update(update_dict)
+            
+            # Update device_info
+            device_info["ospf_config"] = ospf_config
+            device_info["_needs_apply"] = True
+            
+            # Mark as just edited to prevent database reload from overwriting
+            device_info["_ospf_just_edited"] = True
+            
+            print(f"[OSPF P2P] Updated P2P setting for {device_name} ({protocol_type}): {p2p_enabled}")
+            print(f"[OSPF EDIT] OSPF configuration updated in table for {device_name} ({protocol_type}) - click 'Apply OSPF' to save and apply to server")
+            
+        except Exception as e:
+            print(f"[OSPF P2P] Error handling P2P checkbox change: {e}")
+    
+    def on_graceful_restart_checkbox_changed(self, checkbox, state):
+        """Handle Graceful Restart checkbox state change."""
+        try:
+            device_name = checkbox.property("device_name")
+            protocol_type = checkbox.property("protocol_type")
+            is_ipv6 = (protocol_type == "IPv6")
+            
+            # Find the device in all_devices
+            device_info = None
+            for iface, devices in self.parent.main_window.all_devices.items():
+                for device in devices:
+                    if device.get("Device Name") == device_name:
+                        device_info = device
+                        break
+                if device_info:
+                    break
+            
+            if not device_info:
+                print(f"[OSPF GR] Device {device_name} not found")
+                return
+            
+            # Get current OSPF config
+            ospf_config = device_info.get("ospf_config", {})
+            if not isinstance(ospf_config, dict):
+                ospf_config = {}
+            
+            # Update graceful restart setting for the selected address family
+            graceful_restart_enabled = (state == 2)  # Qt.Checked = 2
+            
+            # Update only the selected address family's graceful restart setting
+            update_dict = {}
+            if is_ipv6:
+                update_dict["graceful_restart_ipv6"] = graceful_restart_enabled
+            else:
+                update_dict["graceful_restart_ipv4"] = graceful_restart_enabled
+            
+            # Update ospf_config
+            ospf_config.update(update_dict)
+            
+            # Update device_info
+            device_info["ospf_config"] = ospf_config
+            device_info["_needs_apply"] = True
+            
+            # Mark as just edited to prevent database reload from overwriting
+            device_info["_ospf_just_edited"] = True
+            
+            print(f"[OSPF GR] Updated graceful restart setting for {device_name} ({protocol_type}): {graceful_restart_enabled}")
+            print(f"[OSPF EDIT] OSPF configuration updated in table for {device_name} ({protocol_type}) - click 'Apply OSPF' to save and apply to server")
+            
+        except Exception as e:
+            print(f"[OSPF GR] Error handling graceful restart checkbox change: {e}")
+    
     def on_ospf_table_cell_changed(self, row, column):
-        """Handle cell changes in OSPF table - handles inline editing of Area ID and Graceful Restart."""
-        # Only process Area ID (column 2) and Graceful Restart (column 10) columns
-        if column not in [2, 10]:
+        """Handle cell changes in OSPF table - handles inline editing of Area ID."""
+        # Only process Area ID (column 2) - Graceful Restart is now a checkbox
+        if column != 2:
             return
         
         # Get table items with null checks
@@ -962,45 +1120,6 @@ class OSPFHandler:
                     # The merge logic below will handle preserving other fields from existing_ospf_config
                     ospf_config = update_dict.copy()
             
-            elif column == 10:  # Graceful Restart changed (column 10)
-                graceful_restart_item = self.parent.ospf_table.item(row, 10)
-                
-                if graceful_restart_item:
-                    graceful_restart_text = graceful_restart_item.text().strip().lower()
-                    
-                    # Validate graceful restart value (Yes/No)
-                    if graceful_restart_text not in ["yes", "no", "true", "false", "1", "0", ""]:
-                        QMessageBox.warning(self.parent, "Invalid Graceful Restart Value", 
-                                          f"'{graceful_restart_text}' is not a valid graceful restart value.\n"
-                                          f"Please use: Yes, No, True, False, 1, or 0")
-                        # Revert to original value
-                        if is_ipv6:
-                            original_gr = ospf_config.get("graceful_restart_ipv6", False)
-                        else:
-                            original_gr = ospf_config.get("graceful_restart_ipv4", False)
-                        graceful_restart_item.setText("Yes" if original_gr else "No")
-                        return
-                    
-                    # Convert text to boolean
-                    graceful_restart = graceful_restart_text in ["yes", "true", "1"]
-                    
-                    # Update only the selected address family's graceful restart
-                    # CRITICAL: Only update the specific address family's graceful restart
-                    # Do NOT update the other address family
-                    # IMPORTANT: Do NOT include other fields from ospf_config - only update what we're changing
-                    update_dict = {}
-                    if is_ipv6:
-                        # Only update IPv6 graceful restart - do NOT touch IPv4
-                        update_dict["graceful_restart_ipv6"] = graceful_restart
-                    else:
-                        # Only update IPv4 graceful restart - do NOT touch IPv6
-                        update_dict["graceful_restart_ipv4"] = graceful_restart
-                    
-                    # CRITICAL: Replace ospf_config with ONLY the update_dict
-                    # This ensures we don't accidentally include other fields
-                    # The merge logic below will handle preserving other fields from existing_ospf_config
-                    ospf_config = update_dict.copy()
-            
             # Ensure we have the complete ospf_config with all fields before updating
             # Get the current ospf_config from the device to merge properly
             # We need to get the full config from device_info to ensure we preserve all fields
@@ -1065,23 +1184,6 @@ class OSPFHandler:
                     # Explicitly preserve IPv6 area ID from existing config
                     if existing_ospf_config and "area_id_ipv6" in existing_ospf_config:
                         current_ospf_config_full["area_id_ipv6"] = existing_ospf_config["area_id_ipv6"]
-            elif column == 10:  # Graceful Restart edit
-                # Only update the specific address family's graceful restart
-                if is_ipv6:
-                    if "graceful_restart_ipv6" in ospf_config:
-                        current_ospf_config_full["graceful_restart_ipv6"] = ospf_config["graceful_restart_ipv6"]
-                    # Preserve IPv4 graceful restart
-                    if existing_ospf_config and "graceful_restart_ipv4" in existing_ospf_config:
-                        current_ospf_config_full["graceful_restart_ipv4"] = existing_ospf_config["graceful_restart_ipv4"]
-                else:
-                    if "graceful_restart_ipv4" in ospf_config:
-                        current_ospf_config_full["graceful_restart_ipv4"] = ospf_config["graceful_restart_ipv4"]
-                    # Preserve IPv6 graceful restart
-                    if existing_ospf_config and "graceful_restart_ipv6" in existing_ospf_config:
-                        current_ospf_config_full["graceful_restart_ipv6"] = existing_ospf_config["graceful_restart_ipv6"]
-            else:
-                # For other columns, apply all updates (shouldn't happen for area ID or graceful restart)
-                current_ospf_config_full.update(ospf_config)
             
             # Update the device protocol configuration
             # CRITICAL: Ensure current_ospf_config_full has the correct values before updating
@@ -1089,20 +1191,6 @@ class OSPFHandler:
                 # Double-check that area_id_ipv6 is set correctly
                 if "area_id_ipv6" in ospf_config:
                     current_ospf_config_full["area_id_ipv6"] = ospf_config["area_id_ipv6"]
-            elif column == 10:
-                # CRITICAL: Double-check graceful restart values are set correctly for the specific address family
-                if is_ipv6:
-                    if "graceful_restart_ipv6" in ospf_config:
-                        current_ospf_config_full["graceful_restart_ipv6"] = ospf_config["graceful_restart_ipv6"]
-                    # Explicitly ensure IPv4 graceful restart is NOT affected
-                    if existing_ospf_config and "graceful_restart_ipv4" in existing_ospf_config:
-                        current_ospf_config_full["graceful_restart_ipv4"] = existing_ospf_config["graceful_restart_ipv4"]
-                else:
-                    if "graceful_restart_ipv4" in ospf_config:
-                        current_ospf_config_full["graceful_restart_ipv4"] = ospf_config["graceful_restart_ipv4"]
-                    # Explicitly ensure IPv6 graceful restart is NOT affected
-                    if existing_ospf_config and "graceful_restart_ipv6" in existing_ospf_config:
-                        current_ospf_config_full["graceful_restart_ipv6"] = existing_ospf_config["graceful_restart_ipv6"]
             
             # CRITICAL: Defer heavy operations to prevent UI blocking
             # Use QTimer to defer _update_device_protocol and save_session to next event loop iteration
@@ -2045,6 +2133,14 @@ class OSPFHandler:
                                 if field in ospf_config:
                                     filtered_ospf_config[field] = ospf_config[field]
                             
+                            # Always include P2P settings to preserve when editing config
+                            if "p2p" in ospf_config:
+                                filtered_ospf_config["p2p"] = ospf_config["p2p"]
+                            if "p2p_ipv4" in ospf_config:
+                                filtered_ospf_config["p2p_ipv4"] = ospf_config["p2p_ipv4"]
+                            if "p2p_ipv6" in ospf_config:
+                                filtered_ospf_config["p2p_ipv6"] = ospf_config["p2p_ipv6"]
+                            
                             # CRITICAL: Always include ipv4_enabled and ipv6_enabled to preserve both address families
                             # Load from ospf_config (which may have been updated from database above)
                             if "ipv4_enabled" in ospf_config:
@@ -2055,17 +2151,11 @@ class OSPFHandler:
                             # Include address-family-specific fields only for selected families
                             if "IPv4" in selected_address_families:
                                 # Include IPv4-specific fields
-                                if "area_id_ipv4" in ospf_config:
-                                    filtered_ospf_config["area_id_ipv4"] = ospf_config["area_id_ipv4"]
-                                if "area_id" in ospf_config:
-                                    filtered_ospf_config["area_id"] = ospf_config["area_id"]  # For backward compatibility
                                 if "graceful_restart_ipv4" in ospf_config:
                                     filtered_ospf_config["graceful_restart_ipv4"] = ospf_config["graceful_restart_ipv4"]
                             
                             if "IPv6" in selected_address_families:
                                 # Include IPv6-specific fields
-                                if "area_id_ipv6" in ospf_config:
-                                    filtered_ospf_config["area_id_ipv6"] = ospf_config["area_id_ipv6"]
                                 if "graceful_restart_ipv6" in ospf_config:
                                     filtered_ospf_config["graceful_restart_ipv6"] = ospf_config["graceful_restart_ipv6"]
                             
