@@ -182,6 +182,17 @@ class TrafficGeneratorClient(
         # Save session before closing
         try:
             self.save_session()
+            # CRITICAL: Wait for save worker to finish before closing
+            if hasattr(self, '_save_worker') and self._save_worker is not None:
+                try:
+                    if self._save_worker.isRunning():
+                        print("[CLEANUP] Waiting for save session to complete...")
+                        self._save_worker.wait(2000)  # Wait up to 2 seconds
+                        if self._save_worker.isRunning():
+                            print("[CLEANUP] Save session still running, continuing with cleanup...")
+                except RuntimeError:
+                    # Object has been deleted, ignore
+                    print("[CLEANUP] Save worker already deleted, continuing with cleanup...")
         except Exception as e:
             print(f"[CLEANUP] Failed to save session: {e}")
         

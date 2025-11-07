@@ -177,7 +177,7 @@ class TrafficGenClientMenuAction():
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Could not save server interfaces: {e}")
     def save_session(self):
-        """Save the current session to a JSON file."""
+        """Save the current session to a JSON file (non-blocking, runs in separate thread)."""
         import traceback
         import time
         # Starting save_session()
@@ -194,6 +194,102 @@ class TrafficGenClientMenuAction():
             # Save already in progress
             return
         self._save_in_progress = True
+        
+        # CRITICAL: Extract PyQt widget data in main thread before starting worker
+        # PyQt widgets cannot be accessed from worker threads
+        protocol_data = {}
+        if hasattr(self, "devices_tab") and self.devices_tab is not None:
+            if hasattr(self.devices_tab, "bgp_table"):
+                protocol_data["bgp"] = self._extract_table_data(self.devices_tab.bgp_table)
+            if hasattr(self.devices_tab, "ospf_table"):
+                protocol_data["ospf"] = self._extract_table_data(self.devices_tab.ospf_table)
+            if hasattr(self.devices_tab, "isis_table"):
+                protocol_data["isis"] = self._extract_table_data(self.devices_tab.isis_table)
+        
+        # Run save operation in separate thread to avoid blocking UI
+        from PyQt5.QtCore import QThread, pyqtSignal
+        
+        class SaveSessionWorker(QThread):
+            finished = pyqtSignal(bool, str)  # success, message
+            
+            def __init__(self, main_window, protocol_data):
+                super().__init__()
+                self.main_window = main_window
+                self.protocol_data = protocol_data
+            
+            def run(self):
+                """Run the actual save operation in this thread."""
+                try:
+                    success, message = self.main_window._save_session_impl(self.protocol_data)
+                    self.finished.emit(success, message)
+                except Exception as e:
+                    self.finished.emit(False, str(e))
+        
+        # Start the save worker thread
+        # CRITICAL: Check if worker exists and is valid before checking isRunning()
+        # The worker might have been deleted via deleteLater() but not yet cleaned up
+        worker_exists = hasattr(self, '_save_worker') and self._save_worker is not None
+        worker_running = False
+        
+        if worker_exists:
+            try:
+                # Try to check if worker is running - might fail if object is deleted
+                worker_running = self._save_worker.isRunning()
+            except RuntimeError:
+                # Object has been deleted, treat as not running
+                worker_running = False
+                self._save_worker = None
+        
+        # Clean up previous worker if it exists and is finished
+        if worker_exists and not worker_running:
+            try:
+                # Previous worker finished, clean it up
+                self._save_worker.deleteLater()
+            except RuntimeError:
+                # Object already deleted, ignore
+                pass
+            self._save_worker = None
+        
+        # Create new worker if needed
+        if not worker_exists or self._save_worker is None:
+            self._save_worker = SaveSessionWorker(self, protocol_data)
+            self._save_worker.finished.connect(self._on_save_finished)
+            # CRITICAL: Set parent to ensure proper cleanup
+            self._save_worker.setParent(self)
+            self._save_worker.start()
+        else:
+            # Worker already running, just mark as in progress
+            pass
+    
+    def _on_save_finished(self, success, message):
+        """Handle save completion (called from worker thread via signal)."""
+        self._save_in_progress = False
+        if success:
+            print(f"[SAVE SESSION] {message}")
+        else:
+            print(f"[SAVE SESSION ERROR] {message}")
+        
+        # CRITICAL: Clean up worker thread after it finishes
+        # Schedule for deletion to ensure proper cleanup (thread is finished, safe to delete)
+        if hasattr(self, '_save_worker') and self._save_worker is not None:
+            try:
+                # Thread is finished, safe to schedule for deletion
+                self._save_worker.deleteLater()
+                # CRITICAL: Set to None immediately to prevent checking isRunning() on deleted object
+                # deleteLater() will handle the actual deletion in the event loop
+                self._save_worker = None
+            except RuntimeError:
+                # Object already deleted, just clear the reference
+                self._save_worker = None
+    
+    def _save_session_impl(self, protocol_data=None):
+        """Internal implementation of save_session (runs in worker thread).
+        
+        Args:
+            protocol_data: Pre-extracted protocol table data (extracted in main thread)
+        """
+        import traceback
+        import time
         
         updated_streams = {}
         if hasattr(self, "ensure_unique_stream_ids"):
@@ -222,17 +318,13 @@ class TrafficGenClientMenuAction():
                         # Use device name as key instead of MAC address
                         device_rows[device_name] = device
             
-            # Also save protocol-specific data (BGP, OSPF, ISIS tables)
-            protocol_data = {}
-            if hasattr(self.devices_tab, "bgp_table"):
-                protocol_data["bgp"] = self._extract_table_data(self.devices_tab.bgp_table)
-            if hasattr(self.devices_tab, "ospf_table"):
-                protocol_data["ospf"] = self._extract_table_data(self.devices_tab.ospf_table)
-            if hasattr(self.devices_tab, "isis_table"):
-                protocol_data["isis"] = self._extract_table_data(self.devices_tab.isis_table)
+            # Use pre-extracted protocol data (extracted in main thread to avoid PyQt widget access from worker thread)
+            if protocol_data is None:
+                protocol_data = {}
         else:
             # No devices_tab found
-            pass
+            if protocol_data is None:
+                protocol_data = {}
 
         # Track removed devices for session synchronization
         removed_devices = getattr(self, 'removed_devices', [])
@@ -262,7 +354,7 @@ class TrafficGenClientMenuAction():
             "streams": updated_streams,
             "devices": sanitize_for_json(device_rows),
             "removed_devices": sanitize_for_json(removed_devices),
-            "protocols": sanitize_for_json(protocol_data) if 'protocol_data' in locals() else {},
+            "protocols": sanitize_for_json(protocol_data) if protocol_data else {},
             "bgp_route_pools": sanitize_for_json(bgp_route_pools)  # Save global route pools
         }
         
@@ -276,12 +368,9 @@ class TrafficGenClientMenuAction():
             # Writing to session file
             with open(session_file, "w") as f:
                 json.dump(session_data, f, indent=2)
-            print(f"✅ Session saved successfully")
+            return True, "✅ Session saved successfully"
         except Exception as e:
-            print(f"[❌] Failed to save session: {e}")
-        finally:
-            # Always clear the save lock
-            self._save_in_progress = False
+            return False, f"[❌] Failed to save session: {e}"
 
     def _cleanup_removed_devices_from_server(self, removed_device_ids, all_loaded_devices):
         """Clean up removed devices from server during session loading."""

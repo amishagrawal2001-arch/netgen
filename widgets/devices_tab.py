@@ -474,14 +474,27 @@ class MultiDeviceApplyWorker(QThread):
         
         if self._should_stop:
             return
+        
+        # Check if application is closing (if we have access to main_window)
+        if hasattr(self, 'parent_tab') and hasattr(self.parent_tab, 'main_window'):
+            if hasattr(self.parent_tab.main_window, '_is_closing') and self.parent_tab.main_window._is_closing:
+                print("[SESSION LOAD] Skipping server online check - application is closing")
+                return
             
         results = []
         for server in server_data:
             if self._should_stop:
                 break
+            
+            # Check again if application is closing
+            if hasattr(self, 'parent_tab') and hasattr(self.parent_tab, 'main_window'):
+                if hasattr(self.parent_tab.main_window, '_is_closing') and self.parent_tab.main_window._is_closing:
+                    print("[SESSION LOAD] Stopping server checks - application is closing")
+                    break
                 
             try:
                 address = server.get("address")
+                print(f"[SESSION LOAD] Checking server online status: {address}")
                 # Reduced timeout for server checks
                 response = requests.get(f"{address}/api/interfaces", timeout=3)
                 
@@ -489,13 +502,18 @@ class MultiDeviceApplyWorker(QThread):
                     server["online"] = True
                     server["interfaces"] = response.json()
                     results.append({"server": server, "success": True})
+                    print(f"[SESSION LOAD] ✅ Server {address} is online")
                 else:
                     server["online"] = False
-                    results.append({"server": server, "success": False, "error": f"HTTP {response.status_code}"})
+                    error_msg = f"HTTP {response.status_code}"
+                    results.append({"server": server, "success": False, "error": error_msg})
+                    print(f"[SESSION LOAD] ❌ Server {address} check failed: {error_msg}")
                     
             except Exception as e:
                 server["online"] = False
-                results.append({"server": server, "success": False, "error": str(e)})
+                error_msg = str(e)
+                results.append({"server": server, "success": False, "error": error_msg})
+                print(f"[SESSION LOAD] ❌ Server {address} check error: {error_msg}")
         
         result_data = {
             "success": True,
@@ -4062,6 +4080,12 @@ class DevicesTab(QWidget):
 
     def _check_individual_arp_resolution(self, device_info):
         """Check ARP resolution for individual IPs from database instead of direct server check."""
+        # Check if application is closing
+        if hasattr(self.main_window, '_is_closing') and self.main_window._is_closing:
+            print("[ARP CHECK] Skipping ARP check - application is closing")
+            return {"overall_resolved": False, "overall_status": "Application closing", 
+                    "ipv4_resolved": False, "ipv6_resolved": False, "gateway_resolved": False}
+        
         import requests
         
         device_name = device_info.get("Device Name", "Unknown")
@@ -4827,6 +4851,26 @@ class DevicesTab(QWidget):
                                     merged_config["ipv4_enabled"] = existing_config["ipv4_enabled"]
                                 if "ipv6_enabled" not in config and "ipv6_enabled" in existing_config:
                                     merged_config["ipv6_enabled"] = existing_config["ipv6_enabled"]
+                            # For OSPF config, ensure area_id_ipv4 and area_id_ipv6 are preserved if not in update
+                            elif protocol == "OSPF":
+                                # CRITICAL: Only preserve fields that are NOT being updated
+                                # This ensures that when updating graceful_restart_ipv4, we don't overwrite graceful_restart_ipv6
+                                if "area_id_ipv4" not in config and "area_id_ipv4" in existing_config:
+                                    merged_config["area_id_ipv4"] = existing_config["area_id_ipv4"]
+                                if "area_id_ipv6" not in config and "area_id_ipv6" in existing_config:
+                                    merged_config["area_id_ipv6"] = existing_config["area_id_ipv6"]
+                                # CRITICAL: Preserve graceful_restart_ipv4 and graceful_restart_ipv6 separately
+                                # Only preserve if NOT being updated (not in config)
+                                if "graceful_restart_ipv4" not in config and "graceful_restart_ipv4" in existing_config:
+                                    merged_config["graceful_restart_ipv4"] = existing_config["graceful_restart_ipv4"]
+                                if "graceful_restart_ipv6" not in config and "graceful_restart_ipv6" in existing_config:
+                                    merged_config["graceful_restart_ipv6"] = existing_config["graceful_restart_ipv6"]
+                                # CRITICAL: Also preserve generic graceful_restart if not being updated
+                                # But only if address-family-specific flags are not present
+                                if "graceful_restart" not in config and "graceful_restart" in existing_config:
+                                    # Only preserve generic graceful_restart if address-family-specific flags are not being set
+                                    if "graceful_restart_ipv4" not in config and "graceful_restart_ipv6" not in config:
+                                        merged_config["graceful_restart"] = existing_config["graceful_restart"]
                             device[config_key] = merged_config
                             # For ISIS, also update isis_config for backward compatibility
                             if protocol in ["IS-IS", "ISIS"]:
@@ -4853,11 +4897,12 @@ class DevicesTab(QWidget):
             # Reconnect after update
             self.bgp_table.cellChanged.connect(self.on_bgp_table_cell_changed)
         elif protocol == "OSPF":
-            # Temporarily disconnect to prevent infinite loop
-            self.ospf_table.cellChanged.disconnect()
-            self.update_ospf_table()
-            # Reconnect after update
-            self.ospf_table.cellChanged.connect(self.on_ospf_table_cell_changed)
+            # Don't refresh the table immediately after editing - let the user finish
+            # The table will refresh on the next periodic update or when Apply is clicked
+            # This prevents overwriting user edits and ensures the edit is saved first
+            # Temporarily disconnect to prevent infinite loop (but don't refresh yet)
+            # Just reconnect to prevent issues
+            pass
         elif protocol == "IS-IS" or protocol == "ISIS":
             # Don't refresh the table immediately after editing - let the user finish
             # The table will refresh on the next periodic update or when Apply is clicked
@@ -5436,6 +5481,11 @@ class DevicesTab(QWidget):
 
     def _initialize_arp_status_from_database(self):
         """Initialize ARP status from database for all running devices when client starts up."""
+        # Check if application is closing
+        if hasattr(self.main_window, '_is_closing') and self.main_window._is_closing:
+            print("[ARP INIT] Skipping ARP initialization - application is closing")
+            return
+        
         try:
             # Get all running devices
             running_devices = []
