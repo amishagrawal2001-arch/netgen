@@ -510,12 +510,12 @@ class FRRDockerManager:
         try:
             container_name = self._get_container_name(device_id, device_name)
             
-            # Stop and remove container
+            # Stop container without removing it so configuration/state is preserved
             try:
                 container = self.client.containers.get(container_name)
-                container.stop()
-                container.remove()
-                logger.info(f"[FRR] Stopped and removed container {container_name}")
+                logger.info(f"[FRR] Stopping container {container_name}")
+                container.stop(timeout=10)
+                logger.info(f"[FRR] Container {container_name} stopped successfully (not removed)")
             except docker.errors.NotFound:
                 logger.info(f"[FRR] Container {container_name} not found")
             
