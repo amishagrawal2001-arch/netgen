@@ -8,7 +8,7 @@ from PyQt5.QtWidgets import (
     QTableWidgetItem, QMessageBox, QDialog, QTableWidget, 
     QPushButton, QVBoxLayout, QHBoxLayout, QLabel
 )
-from PyQt5.QtCore import Qt, QSize
+from PyQt5.QtCore import Qt, QSize, QThread, pyqtSignal
 from PyQt5.QtGui import QIcon
 import requests
 import logging
@@ -1514,10 +1514,6 @@ class BGPHandler:
                                   "No BGP configurations to apply or remove.")
             return
 
-        # Apply BGP configurations
-        success_count = 0
-        failed_devices = []
-        
         # Track which address families are selected for each device
         device_address_families = {}  # device_name -> set of address families (IPv4, IPv6)
         
@@ -1534,147 +1530,217 @@ class BGPHandler:
                         device_address_families[device_name] = set()
                     device_address_families[device_name].add(protocol_type)
         
-        # Handle BGP application
-        for device_info in devices_to_apply_bgp:
-            device_name = device_info.get("Device Name", "Unknown")
-            device_id = device_info.get("device_id")
+        # CRITICAL: Run BGP apply operations in background thread to prevent UI blocking
+        # Use QThread to handle blocking network requests asynchronously
+        class ApplyBGPWorker(QThread):
+            finished = pyqtSignal(dict)  # Emit results dict when done
             
-            if not device_id:
-                failed_devices.append(f"{device_name}: Missing device ID")
-                continue
-                
-            try:
-                # Prepare BGP configuration payload
-                bgp_config = device_info.get("bgp_config", {}).copy()
-                
-                # If specific address families were selected, add flag to indicate partial apply
-                if device_name in device_address_families:
-                    selected_families = device_address_families[device_name]
-                    # Convert to list format expected by server
-                    apply_families = []
-                    if "IPv4" in selected_families:
-                        apply_families.append("ipv4")
-                    if "IPv6" in selected_families:
-                        apply_families.append("ipv6")
-                    
-                    if apply_families:
-                        bgp_config["_apply_address_families"] = apply_families
-                        logging.debug(f"[BGP APPLY] Device {device_name}: Applying only selected address families: {apply_families}")
-                
-                payload = {
-                    "device_id": device_id,
-                    "device_name": device_name,
-                    "interface": device_info.get("Interface", ""),
-                    "vlan": device_info.get("VLAN", "0"),
-                    "ipv4": device_info.get("IPv4", ""),
-                    "ipv6": device_info.get("IPv6", ""),
-                    "gateway": device_info.get("Gateway", ""),  # Include gateway for static route
-                    "bgp_config": bgp_config,
-                    "all_route_pools": getattr(self.parent.main_window, 'bgp_route_pools', [])  # Include all route pools for generation
+            def __init__(self, server_url, devices_to_apply_bgp, devices_to_remove_bgp, device_address_families, parent_handler):
+                super().__init__()
+                self.server_url = server_url
+                self.devices_to_apply_bgp = devices_to_apply_bgp
+                self.devices_to_remove_bgp = devices_to_remove_bgp
+                self.device_address_families = device_address_families
+                self.parent_handler = parent_handler
+            
+            def run(self):
+                """Run BGP apply operations in background thread."""
+                results = {
+                    "success_count": 0,
+                    "failed_devices": [],
+                    "removal_success_count": 0,
+                    "removal_failed_devices": []
                 }
                 
-                # Send BGP configuration to server
-                response = requests.post(f"{server_url}/api/device/bgp/configure", 
-                                       json=payload, timeout=10)
-                
-                if response.status_code == 200:
-                    success_count += 1
-                    print(f"✅ BGP configuration applied for {device_name}")
+                # Handle BGP application
+                for device_info in self.devices_to_apply_bgp:
+                    device_name = device_info.get("Device Name", "Unknown")
+                    device_id = device_info.get("device_id")
                     
-                    # After successful BGP configuration, start the BGP service
+                    if not device_id:
+                        results["failed_devices"].append(f"{device_name}: Missing device ID")
+                        continue
+                        
                     try:
-                        start_payload = {
+                        # Prepare BGP configuration payload
+                        bgp_config = device_info.get("bgp_config", {}).copy()
+                        
+                        # If specific address families were selected, add flag to indicate partial apply
+                        if device_name in self.device_address_families:
+                            selected_families = self.device_address_families[device_name]
+                            # Convert to list format expected by server
+                            apply_families = []
+                            if "IPv4" in selected_families:
+                                apply_families.append("ipv4")
+                            if "IPv6" in selected_families:
+                                apply_families.append("ipv6")
+                            
+                            if apply_families:
+                                bgp_config["_apply_address_families"] = apply_families
+                                logging.debug(f"[BGP APPLY] Device {device_name}: Applying only selected address families: {apply_families}")
+                        
+                        payload = {
                             "device_id": device_id,
                             "device_name": device_name,
                             "interface": device_info.get("Interface", ""),
-                            "mac": device_info.get("MAC Address", ""),
                             "vlan": device_info.get("VLAN", "0"),
                             "ipv4": device_info.get("IPv4", ""),
                             "ipv6": device_info.get("IPv6", ""),
-                            "protocols": ["BGP"],
-                            "ipv4_mask": device_info.get("ipv4_mask", "24"),
-                            "ipv6_mask": device_info.get("ipv6_mask", "64"),
-                            "bgp_config": bgp_config
+                            "gateway": device_info.get("Gateway", ""),  # Include gateway for static route
+                            "bgp_config": bgp_config,
+                            "all_route_pools": getattr(self.parent_handler.parent.main_window, 'bgp_route_pools', [])  # Include all route pools for generation
                         }
                         
-                        start_response = requests.post(f"{server_url}/api/device/start", 
-                                                    json=start_payload, timeout=10)
+                        # Send BGP configuration to server
+                        response = requests.post(f"{self.server_url}/api/device/bgp/configure", 
+                                               json=payload, timeout=30)
                         
-                        if start_response.status_code == 200:
-                            print(f"✅ BGP service started for {device_name}")
+                        if response.status_code == 200:
+                            results["success_count"] += 1
+                            print(f"✅ BGP configuration applied for {device_name}")
                             
-                            # Send immediate ARP request after BGP service is started
-                            # DISABLED to prevent QThread crashes - ARP will be manual only
-                            # try:
-                            #     self.parent.send_immediate_arp_request(device_info, server_url)
-                            # except Exception as arp_error:
-                            #     print(f"[BGP ARP] ARP request failed for '{device_name}': {arp_error}")
-                            #     # Don't fail BGP start if ARP request fails
-                            
-                            # Note: BGP monitoring will be started when user clicks "Start BGP" button
+                            # After successful BGP configuration, start the BGP service
+                            try:
+                                start_payload = {
+                                    "device_id": device_id,
+                                    "device_name": device_name,
+                                    "interface": device_info.get("Interface", ""),
+                                    "mac": device_info.get("MAC Address", ""),
+                                    "vlan": device_info.get("VLAN", "0"),
+                                    "ipv4": device_info.get("IPv4", ""),
+                                    "ipv6": device_info.get("IPv6", ""),
+                                    "protocols": ["BGP"],
+                                    "ipv4_mask": device_info.get("ipv4_mask", "24"),
+                                    "ipv6_mask": device_info.get("ipv6_mask", "64"),
+                                    "bgp_config": bgp_config
+                                }
+                                
+                                start_response = requests.post(f"{self.server_url}/api/device/start", 
+                                                            json=start_payload, timeout=30)
+                                
+                                if start_response.status_code == 200:
+                                    print(f"✅ BGP service started for {device_name}")
+                                else:
+                                    print(f"⚠️ BGP configured but failed to start service for {device_name}")
+                                    
+                            except Exception as start_error:
+                                print(f"⚠️ BGP configured but failed to start service for {device_name}: {start_error}")
+                                
                         else:
-                            print(f"⚠️ BGP configured but failed to start service for {device_name}")
+                            error_msg = response.json().get("error", "Unknown error")
+                            results["failed_devices"].append(f"{device_name}: {error_msg}")
+                            print(f"❌ Failed to apply BGP for {device_name}: {error_msg}")
                             
-                    except Exception as start_error:
-                        print(f"⚠️ BGP configured but failed to start service for {device_name}: {start_error}")
-                        
-                else:
-                    error_msg = response.json().get("error", "Unknown error")
-                    failed_devices.append(f"{device_name}: {error_msg}")
-                    print(f"❌ Failed to apply BGP for {device_name}: {error_msg}")
+                    except requests.exceptions.RequestException as e:
+                        results["failed_devices"].append(f"{device_name}: Network error - {str(e)}")
+                        print(f"❌ Network error applying BGP for {device_name}: {str(e)}")
+                    except Exception as e:
+                        results["failed_devices"].append(f"{device_name}: {str(e)}")
+                        print(f"❌ Error applying BGP for {device_name}: {str(e)}")
+                
+                # Handle BGP removal
+                for device_info in self.devices_to_remove_bgp:
+                    device_name = device_info.get("Device Name", "Unknown")
+                    device_id = device_info.get("device_id")
                     
-            except requests.exceptions.RequestException as e:
-                failed_devices.append(f"{device_name}: Network error - {str(e)}")
-                print(f"❌ Network error applying BGP for {device_name}: {str(e)}")
-            except Exception as e:
-                failed_devices.append(f"{device_name}: {str(e)}")
-                print(f"❌ Error applying BGP for {device_name}: {str(e)}")
-
-        # Handle BGP removal
-        removal_success_count = 0
-        removal_failed_devices = []
+                    if not device_id:
+                        results["removal_failed_devices"].append(f"{device_name}: Missing device ID")
+                        continue
+                        
+                    try:
+                        # Call BGP cleanup endpoint to remove BGP configuration
+                        response = requests.post(f"{self.server_url}/api/bgp/cleanup", 
+                                               json={"device_id": device_id}, 
+                                               timeout=30)
+                        
+                        if response.status_code == 200:
+                            results["removal_success_count"] += 1
+                            print(f"✅ BGP configuration removed for {device_name}")
+                            
+                            # Remove BGP configuration from client data after successful server removal
+                            if "protocols" in device_info:
+                                if isinstance(device_info["protocols"], dict):
+                                    if device_info["protocols"].get("BGP", {}).get("_marked_for_removal"):
+                                        del device_info["protocols"]["BGP"]
+                                else:
+                                    if device_info.get("bgp_config", {}).get("_marked_for_removal"):
+                                        del device_info["bgp_config"]
+                                    # If no other protocols, remove the protocols key entirely
+                                    if not device_info["protocols"]:
+                                        del device_info["protocols"]
+                        else:
+                            error_msg = response.json().get("error", "Unknown error")
+                            results["removal_failed_devices"].append(f"{device_name}: {error_msg}")
+                            print(f"❌ Failed to remove BGP for {device_name}: {error_msg}")
+                            
+                    except requests.exceptions.RequestException as e:
+                        results["removal_failed_devices"].append(f"{device_name}: Network error - {str(e)}")
+                        print(f"❌ Network error removing BGP for {device_name}: {str(e)}")
+                    except Exception as e:
+                        results["removal_failed_devices"].append(f"{device_name}: {str(e)}")
+                        print(f"❌ Error removing BGP for {device_name}: {str(e)}")
+                
+                # Emit results when done
+                self.finished.emit(results)
         
-        for device_info in devices_to_remove_bgp:
-            device_name = device_info.get("Device Name", "Unknown")
-            device_id = device_info.get("device_id")
-            
-            if not device_id:
-                removal_failed_devices.append(f"{device_name}: Missing device ID")
-                continue
-                
+        # Show progress dialog while applying
+        from PyQt5.QtWidgets import QProgressDialog
+        progress = QProgressDialog("Applying BGP configurations...", "Cancel", 0, 0, self.parent)
+        progress.setWindowModality(2)  # Qt.WindowModal
+        progress.setCancelButton(None)  # Disable cancel button
+        progress.setMinimumDuration(0)  # Show immediately
+        progress.show()
+        
+        # Create and start worker thread
+        worker = ApplyBGPWorker(server_url, devices_to_apply_bgp, devices_to_remove_bgp, device_address_families, self)
+        # CRITICAL: Set parent to ensure proper cleanup
+        worker.setParent(self.parent)
+        worker.finished.connect(lambda results: self._on_bgp_apply_finished(results, progress, devices_to_apply_bgp, devices_to_remove_bgp))
+        worker.finished.connect(worker.deleteLater)  # Clean up worker when done
+        worker.start()
+        
+        # Store worker reference to prevent garbage collection
+        if not hasattr(self, '_bgp_apply_workers'):
+            self._bgp_apply_workers = []
+        self._bgp_apply_workers.append(worker)
+        
+        # Clean up finished workers
+        # CRITICAL: Wrap isRunning() in try-except to handle deleted workers
+        def is_worker_running(w):
             try:
-                # Call BGP cleanup endpoint to remove BGP configuration
-                response = requests.post(f"{server_url}/api/bgp/cleanup", 
-                                       json={"device_id": device_id}, 
-                                       timeout=10)
-                
-                if response.status_code == 200:
-                    removal_success_count += 1
-                    print(f"✅ BGP configuration removed for {device_name}")
-                    
-                    # Remove BGP configuration from client data after successful server removal
-                    if "protocols" in device_info:
-                        if isinstance(device_info["protocols"], dict):
-                            if device_info["protocols"].get("BGP", {}).get("_marked_for_removal"):
-                                del device_info["protocols"]["BGP"]
-                        else:
-                            if device_info.get("bgp_config", {}).get("_marked_for_removal"):
-                                del device_info["bgp_config"]
-                            # If no other protocols, remove the protocols key entirely
-                            if not device_info["protocols"]:
-                                del device_info["protocols"]
-                else:
-                    error_msg = response.json().get("error", "Unknown error")
-                    removal_failed_devices.append(f"{device_name}: {error_msg}")
-                    print(f"❌ Failed to remove BGP for {device_name}: {error_msg}")
-                    
-            except requests.exceptions.RequestException as e:
-                removal_failed_devices.append(f"{device_name}: Network error - {str(e)}")
-                print(f"❌ Network error removing BGP for {device_name}: {str(e)}")
-            except Exception as e:
-                removal_failed_devices.append(f"{device_name}: {str(e)}")
-                print(f"❌ Error removing BGP for {device_name}: {str(e)}")
-
+                return w.isRunning()
+            except RuntimeError:
+                # Worker has been deleted, treat as not running
+                return False
+        
+        self._bgp_apply_workers = [w for w in self._bgp_apply_workers if is_worker_running(w)]
+        
+        # Return early - results will be handled in _on_bgp_apply_finished
+        return
+    
+    def _on_bgp_apply_finished(self, results, progress, devices_to_apply_bgp, devices_to_remove_bgp):
+        """Handle BGP apply completion (called from worker thread via signal)."""
+        # Close progress dialog
+        progress.close()
+        
+        # Clean up worker reference
+        # CRITICAL: Wrap isRunning() in try-except to handle deleted workers
+        if hasattr(self, '_bgp_apply_workers'):
+            def is_worker_running(w):
+                try:
+                    return w.isRunning()
+                except RuntimeError:
+                    # Worker has been deleted, treat as not running
+                    return False
+            
+            self._bgp_apply_workers = [w for w in self._bgp_apply_workers if is_worker_running(w)]
+        
+        # Extract results
+        success_count = results["success_count"]
+        failed_devices = results["failed_devices"]
+        removal_success_count = results["removal_success_count"]
+        removal_failed_devices = results["removal_failed_devices"]
+        
         # Show results - combine application and removal results
         total_success = success_count + removal_success_count
         total_failed = len(failed_devices) + len(removal_failed_devices)
@@ -1740,8 +1806,10 @@ class BGPHandler:
             )
             dialog.exec_()
 
-        # Update BGP table to reflect any changes
-        self.update_bgp_table()
+        # CRITICAL: Defer table update to prevent UI blocking
+        # Use QTimer to defer table update to next event loop iteration
+        from PyQt5.QtCore import QTimer
+        QTimer.singleShot(0, self.update_bgp_table)
 
 
     def start_bgp_protocol(self):
