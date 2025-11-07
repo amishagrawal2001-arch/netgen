@@ -7,6 +7,7 @@ Handles ISIS configuration, status monitoring, and neighbor management.
 import logging
 import json
 import re
+import threading
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timezone
 
@@ -172,6 +173,62 @@ def configure_isis_neighbor(device_id: str, isis_config: Dict[str, Any], device_
         logger.info(f"[ISIS CONFIGURE] Using container {container_name} for device {device_name} ({device_id})")
         container = frr_manager.client.containers.get(container_name)
         
+        # Wait for container to be ready and daemons to start
+        # Optimized to match BGP performance: fewer retries, faster timeout
+        import time
+        max_retries = 5  # Reduced from 10 to match BGP (faster for ready containers)
+        retry_delay = 2  # Increased from 1 to 2 to match BGP (fewer retries needed)
+        
+        def exec_run_with_timeout(cmd, timeout_sec=3):
+            """Execute container.exec_run with a timeout using threading.
+            Reduced timeout from 5s to 3s for faster checks (matching BGP speed)."""
+            result = [None]
+            exception = [None]
+            
+            def run_exec():
+                try:
+                    result[0] = container.exec_run(cmd)
+                except Exception as e:
+                    exception[0] = e
+            
+            exec_thread = threading.Thread(target=run_exec, daemon=True)
+            exec_thread.start()
+            exec_thread.join(timeout=timeout_sec)
+            
+            if exec_thread.is_alive():
+                # Thread is still running - timeout occurred
+                logger.warning(f"[ISIS CONFIGURE] exec_run timeout after {timeout_sec}s - command may not have completed")
+                return None
+            elif exception[0]:
+                raise exception[0]
+            else:
+                return result[0]
+        
+        isisd_ready = False
+        for attempt in range(max_retries):
+            try:
+                # Check if isisd is ready by running an ISIS-specific command (like BGP does)
+                # This ensures isisd is actually ready to accept configuration commands
+                check_result = exec_run_with_timeout("vtysh -c 'show isis'", timeout_sec=3)
+                check_output = check_result.output.decode('utf-8') if isinstance(check_result.output, bytes) else str(check_result.output) if check_result else ""
+                
+                if check_result and (check_result.exit_code == 0 or "isisd is not running" not in check_output):
+                    isisd_ready = True
+                    logger.info(f"[ISIS CONFIGURE] Container and FRR daemons ready for {device_name} (attempt {attempt + 1})")
+                    break
+                else:
+                    # ISIS daemon not ready yet or timeout
+                    logger.debug(f"[ISIS CONFIGURE] ISIS daemon not ready yet (attempt {attempt + 1}/{max_retries})")
+            except Exception as e:
+                # Container exec failed
+                logger.debug(f"[ISIS CONFIGURE] Container exec failed (attempt {attempt + 1}/{max_retries}): {e}")
+            
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+            else:
+                if not isisd_ready:
+                    logger.warning(f"[ISIS CONFIGURE] ISIS daemon not ready after {max_retries} attempts for {device_name}, proceeding anyway (may fail)")
+        
         # Extract ISIS configuration (handle None values - use default if None)
         area_id = isis_config.get("area_id") or "49.0001.0000.0000.0001.00"
         system_id = isis_config.get("system_id") or "0000.0000.0001"
@@ -189,11 +246,35 @@ def configure_isis_neighbor(device_id: str, isis_config: Dict[str, Any], device_
         }
         frr_level = level_map.get(level, "level-2-only")
         
+        # Get device data to determine interface and address families
+        from utils.device_database import DeviceDatabase
+        device_db = DeviceDatabase()
+        device_data = device_db.get_device(device_id) if device_id else None
+        
+        # Determine interface name (with VLAN if applicable) - prioritize database over config
+        if not interface and device_data:
+            interface_from_db = device_data.get("interface", "")
+            vlan = device_data.get("vlan", "0")
+            interface = f"vlan{vlan}" if (vlan and vlan != "0") else (interface_from_db if interface_from_db else "eth0")
+        else:
+            vlan = device_data.get("vlan", "0") if device_data else "0"
+            interface = f"vlan{vlan}" if (vlan and vlan != "0") else (interface if interface else "eth0")
+        
         # Determine address families based on configured IPs
         enable_ipv4 = bool(ipv4 and ipv4.strip())
         enable_ipv6 = bool(ipv6 and ipv6.strip())
         
+        # If IPs not provided, get from database
+        if not enable_ipv4 and device_data:
+            enable_ipv4 = bool(device_data.get("ipv4_address"))
+        if not enable_ipv6 and device_data:
+            enable_ipv6 = bool(device_data.get("ipv6_address"))
+        
         # Build ISIS configuration commands (configure router first, then interfaces)
+        # Note: Global router-id is configured in frr_docker.py when container is created
+        # Note: Interface IP addresses (IPv4/IPv6) are configured via frr.conf.template
+        # when the container is created, not via vtysh commands here
+        logging.info(f"[ISIS CONFIGURE] About to build ISIS commands - enable_ipv4={enable_ipv4}, enable_ipv6={enable_ipv6}, area_id={area_id}, interface={interface}, frr_level={frr_level}")
         vtysh_commands = [
             "configure terminal",
             # Configure router-level ISIS first
@@ -205,11 +286,11 @@ def configure_isis_neighbor(device_id: str, isis_config: Dict[str, Any], device_
             f"interface {interface}",
         ]
         
-        # Add IPv4 or IPv6 based on configured addresses
+        # Add IPv4 or IPv6 ISIS routing based on configured addresses
         if enable_ipv4:
-            vtysh_commands.append(f"ip router isis CORE")
+            vtysh_commands.append(f" ip router isis CORE")
         if enable_ipv6:
-            vtysh_commands.append(f"ipv6 router isis CORE")
+            vtysh_commands.append(f" ipv6 router isis CORE")
         
         vtysh_commands.extend([
             f"isis network point-to-point",
@@ -222,13 +303,20 @@ def configure_isis_neighbor(device_id: str, isis_config: Dict[str, Any], device_
         vtysh_commands = [c for c in vtysh_commands if c]
         
         # Execute commands using here document
+        logging.info(f"[ISIS CONFIGURE] About to execute commands - vtysh_commands length: {len(vtysh_commands)}")
         config_commands = "\n".join(vtysh_commands)
         exec_cmd = f"vtysh << 'EOF'\n{config_commands}\nEOF"
         logging.info(f"[ISIS CONFIGURE] Executing ISIS configuration commands")
-        logging.debug(f"[ISIS CONFIGURE] Commands list: {vtysh_commands}")
-        logging.debug(f"[ISIS CONFIGURE] Full here-doc command:\n{exec_cmd}")
+        logging.info(f"[ISIS CONFIGURE] Commands list: {vtysh_commands}")
+        logging.info(f"[ISIS CONFIGURE] Full here-doc command:\n{exec_cmd}")
         
-        result = container.exec_run(["bash", "-c", exec_cmd])
+        # Use timeout wrapper to prevent hanging if container is not ready
+        # Use longer timeout (30s) for full configuration execution (ISIS config can take time)
+        result = exec_run_with_timeout(["bash", "-c", exec_cmd], timeout_sec=30)
+        if not result:
+            logging.error(f"[ISIS CONFIGURE] Command timed out or failed (no result) - container may not be ready or command took too long")
+            return False
+        
         logging.info(f"[ISIS CONFIGURE] Command exit code: {result.exit_code}")
         try:
             _out = result.output.decode()
@@ -349,6 +437,7 @@ def start_isis_neighbor(device_id: str, device_name: str, container_id: str, isi
             enable_ipv6 = True
 
         # Ensure router process first, then enable interface (some FRR builds require router before interface attach)
+        # Note: Global router-id is configured in frr_docker.py when container is created
         vtysh_commands = [
             "configure terminal",
             "router isis CORE",

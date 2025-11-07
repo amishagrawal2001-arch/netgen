@@ -579,17 +579,21 @@ def start_device():
                                 import time
                                 time.sleep(5)
                             else:
-                                logging.info(f"[DEVICE START] Container {container_name} is already running, restoring protocols and interface")
+                                logging.info(f"[DEVICE START] Container {container_name} is already running, reconfiguring protocols with updated configs")
                             
+                            # Always configure protocols with latest configs from payload (or database)
+                            # This ensures that after device edit, protocols are updated even if container was already running
                             # Get protocol configs from payload first (if provided), otherwise from database
                             import json
                             
                             # BGP config: prefer payload, fallback to database
+                            # Check if bgp_config is in payload (even if empty dict, we should check explicitly)
                             bgp_config = None
                             if "bgp_config" in data:
-                                bgp_config = data.get("bgp_config")
+                                bgp_config = data.get("bgp_config")  # Use directly, could be dict or empty dict
                                 logging.info(f"[DEVICE START] Using BGP config from payload: {bgp_config is not None}, has content: {bool(bgp_config)}")
                             if bgp_config is None:
+                                # Fallback to database
                                 bgp_config_raw = device_data.get("bgp_config", {})
                                 if isinstance(bgp_config_raw, str) and bgp_config_raw:
                                     try:
@@ -603,9 +607,10 @@ def start_device():
                             # OSPF config: prefer payload, fallback to database
                             ospf_config = None
                             if "ospf_config" in data:
-                                ospf_config = data.get("ospf_config")
+                                ospf_config = data.get("ospf_config")  # Use directly, could be dict or empty dict
                                 logging.info(f"[DEVICE START] Using OSPF config from payload: {ospf_config is not None}, has content: {bool(ospf_config)}")
                             if ospf_config is None:
+                                # Fallback to database
                                 ospf_config_raw = device_data.get("ospf_config", {})
                                 if isinstance(ospf_config_raw, str) and ospf_config_raw:
                                     try:
@@ -619,9 +624,10 @@ def start_device():
                             # ISIS config: prefer payload, fallback to database
                             isis_config = None
                             if "isis_config" in data:
-                                isis_config = data.get("isis_config")
+                                isis_config = data.get("isis_config")  # Use directly, could be dict or empty dict
                                 logging.info(f"[DEVICE START] Using ISIS config from payload: {isis_config is not None}, has content: {bool(isis_config)}")
                             if isis_config is None:
+                                # Fallback to database
                                 isis_config_raw = device_data.get("isis_config", {})
                                 if isinstance(isis_config_raw, str) and isis_config_raw:
                                     try:
@@ -632,6 +638,7 @@ def start_device():
                                     isis_config = isis_config_raw if isis_config_raw else {}
                                 logging.info(f"[DEVICE START] Using ISIS config from database: {bool(isis_config)}")
                             
+                            # Configure protocols in the container
                             # Use IP addresses from payload (latest from client) or fallback to database
                             ipv4_for_config = ipv4 if ipv4 else device_data.get('ipv4_address', '')
                             ipv4_mask_for_config = ipv4_mask if ipv4_mask else device_data.get('ipv4_mask', '24')
@@ -641,53 +648,135 @@ def start_device():
                             ipv6_mask_for_config = ipv6_mask if ipv6_mask else device_data.get('ipv6_mask', '64')
                             ipv6_full = f"{ipv6_for_config}/{ipv6_mask_for_config}" if ipv6_for_config else ""
                             
-                            # Restore protocols and interface (revert stop changes)
-                            logging.info(f"[DEVICE START] Restoring protocols and interface in container {container_name}")
-                            success = frr_manager.restore_frr_container(
-                                container_name=container_name,
-                                bgp_config=bgp_config,
-                                ospf_config=ospf_config,
-                                isis_config=isis_config,
-                                interface=iface,
-                                vlan=vlan,
-                                ipv4=ipv4_full,
-                                ipv6=ipv6_full
-                            )
-                            
-                            if success:
-                                logging.info(f"[DEVICE START] Successfully restored protocols and interface for {device_name}")
-                                
-                                # Clear manual override flags so monitors can immediately update status
-                                try:
-                                    now = datetime.now(timezone.utc).isoformat()
-                                    clear_override_data = {
-                                        'bgp_manual_override': False,
-                                        'bgp_manual_override_time': None,
-                                        'ospf_manual_override': False,
-                                        'ospf_manual_override_time': None,
-                                        'isis_manual_override': False,
-                                        'isis_manual_override_time': None,
-                                    }
-                                    device_db.update_device(device_id, clear_override_data)
-                                    logging.info(f"[DEVICE START] Cleared manual override flags for {device_name} to allow immediate monitor updates")
-                                except Exception as e:
-                                    logging.warning(f"[DEVICE START] Failed to clear manual override flags: {e}")
+                            # Configure BGP if enabled
+                            logging.info(f"[DEVICE START] Checking BGP config (existing container): bgp_config={bgp_config}, has content: {bool(bgp_config)}")
+                            if bgp_config and isinstance(bgp_config, dict) and len(bgp_config) > 0:
+                                logging.info(f"[DEVICE START] Configuring BGP in existing container")
+                                from utils.bgp import configure_bgp_for_device
+                                # Extract device_id from container_name
+                                device_id = container_name.replace(f"{frr_manager.container_prefix}-", "")
+                                device_name_from_container = container_name.split('-', 3)[-1] if '-' in container_name else None
+                                configure_bgp_for_device(device_id, bgp_config, ipv4_full, ipv6_full, device_name_from_container)
                             else:
-                                logging.warning(f"[DEVICE START] Failed to restore some protocols for {device_name}")
-                        except Exception as container_error:
-                            # Check if it's a NotFound error (container doesn't exist)
-                            error_str = str(container_error).lower()
-                            error_type = type(container_error).__name__
+                                logging.warning(f"[DEVICE START] BGP config is empty or invalid, skipping BGP configuration")
                             
-                            if "notfound" in error_str or "not found" in error_str or "NotFound" in error_type:
-                                logging.error(f"[DEVICE START] Container {container_name} does not exist - cannot start device without existing container")
-                                return jsonify({"error": f"Container not found for device {device_name}. Device must be applied first."}), 404
+                            # Configure OSPF if enabled
+                            logging.info(f"[DEVICE START] Checking OSPF config (existing container): ospf_config={ospf_config}, has content: {bool(ospf_config)}")
+                            if ospf_config and isinstance(ospf_config, dict) and len(ospf_config) > 0:
+                                logging.info(f"[DEVICE START] Configuring OSPF in existing container")
+                                from utils.ospf import configure_ospf_neighbor
+                                configure_ospf_neighbor(device_id, ospf_config, device_name)
+                            else:
+                                logging.warning(f"[DEVICE START] OSPF config is empty or invalid, skipping OSPF configuration")
                             
-                            # Log and re-raise other exceptions
-                            logging.error(f"[DEVICE START] Error restoring protocols for {device_name}: {container_error}")
-                            import traceback
-                            logging.error(f"[DEVICE START] Traceback: {traceback.format_exc()}")
-                            raise
+                            # Configure ISIS if enabled
+                            logging.info(f"[DEVICE START] Checking ISIS config (existing container): isis_config={isis_config}, has content: {bool(isis_config)}")
+                            if isis_config and isinstance(isis_config, dict) and len(isis_config) > 0:
+                                logging.info(f"[DEVICE START] Configuring ISIS in existing container")
+                                from utils.isis import configure_isis_neighbor
+                                configure_isis_neighbor(device_id, isis_config, device_name, ipv4_for_config, ipv6_for_config)
+                            else:
+                                logging.warning(f"[DEVICE START] ISIS config is empty or invalid, skipping ISIS configuration")
+                        except Exception:
+                            logging.info(f"[DEVICE START] Container {container_name} does not exist, creating it...")
+                            # Create container with device configuration
+                            device_config = {
+                                "device_name": device_name,
+                                "ipv4": ipv4,
+                                "ipv6": ipv6,
+                                "interface": iface,
+                                "vlan": vlan
+                            }
+                            
+                            # Get protocol configs from payload first (if provided), otherwise from database
+                            import json
+                            
+                            # BGP config: prefer payload, fallback to database
+                            bgp_config = data.get("bgp_config")
+                            if not bgp_config:
+                                bgp_config_raw = device_data.get("bgp_config", {})
+                                if isinstance(bgp_config_raw, str) and bgp_config_raw:
+                                    try:
+                                        bgp_config = json.loads(bgp_config_raw)
+                                    except:
+                                        bgp_config = {}
+                                else:
+                                    bgp_config = bgp_config_raw if bgp_config_raw else {}
+                            device_config["bgp_config"] = bgp_config
+                            
+                            # OSPF config: prefer payload, fallback to database
+                            ospf_config = data.get("ospf_config")
+                            if not ospf_config:
+                                ospf_config_raw = device_data.get("ospf_config", {})
+                                if isinstance(ospf_config_raw, str) and ospf_config_raw:
+                                    try:
+                                        ospf_config = json.loads(ospf_config_raw)
+                                    except:
+                                        ospf_config = {}
+                                else:
+                                    ospf_config = ospf_config_raw if ospf_config_raw else {}
+                            device_config["ospf_config"] = ospf_config
+                            
+                            # ISIS config: prefer payload, fallback to database
+                            isis_config = data.get("isis_config")
+                            if not isis_config:
+                                isis_config_raw = device_data.get("isis_config", {})
+                                if isinstance(isis_config_raw, str) and isis_config_raw:
+                                    try:
+                                        isis_config = json.loads(isis_config_raw)
+                                    except:
+                                        isis_config = {}
+                                else:
+                                    isis_config = isis_config_raw if isis_config_raw else {}
+                            device_config["isis_config"] = isis_config
+                            
+                            container_name = frr_manager.start_frr_container(device_id, device_config)
+                            if container_name:
+                                logging.info(f"[DEVICE START] Successfully created FRR container: {container_name}")
+                                # Wait for container to be ready
+                                # Note: Individual protocol configuration functions also have retry logic
+                                # This initial wait helps, but the protocol functions will retry if needed
+                                import time
+                                time.sleep(3)  # Reduced from 5 to 3 since protocol functions have retry logic
+                                
+                                # Configure protocols in the newly created container
+                                # Use IP addresses from payload (latest from client) or fallback to database
+                                ipv4_for_config = ipv4 if ipv4 else device_data.get('ipv4_address', '')
+                                ipv4_mask_for_config = ipv4_mask if ipv4_mask else device_data.get('ipv4_mask', '24')
+                                ipv4_full = f"{ipv4_for_config}/{ipv4_mask_for_config}" if ipv4_for_config else ""
+                                
+                                ipv6_for_config = ipv6 if ipv6 else device_data.get('ipv6_address', '')
+                                ipv6_mask_for_config = ipv6_mask if ipv6_mask else device_data.get('ipv6_mask', '64')
+                                ipv6_full = f"{ipv6_for_config}/{ipv6_mask_for_config}" if ipv6_for_config else ""
+                                
+                                # Configure BGP if enabled
+                                logging.info(f"[DEVICE START] Checking BGP config: bgp_config={bgp_config}, has content: {bool(bgp_config)}")
+                                if bgp_config and isinstance(bgp_config, dict) and len(bgp_config) > 0:
+                                    logging.info(f"[DEVICE START] Configuring BGP in newly created container")
+                                    from utils.bgp import configure_bgp_for_device
+                                    configure_bgp_for_device(device_id, bgp_config, ipv4_full, ipv6_full, device_name)
+                                else:
+                                    logging.warning(f"[DEVICE START] BGP config is empty or invalid, skipping BGP configuration")
+                                
+                                # Configure OSPF if enabled
+                                logging.info(f"[DEVICE START] Checking OSPF config: ospf_config={ospf_config}, has content: {bool(ospf_config)}")
+                                if ospf_config and isinstance(ospf_config, dict) and len(ospf_config) > 0:
+                                    logging.info(f"[DEVICE START] Configuring OSPF in newly created container")
+                                    from utils.ospf import configure_ospf_neighbor
+                                    configure_ospf_neighbor(device_id, ospf_config, device_name)
+                                else:
+                                    logging.warning(f"[DEVICE START] OSPF config is empty or invalid, skipping OSPF configuration")
+                                
+                                # Configure ISIS if enabled
+                                logging.info(f"[DEVICE START] Checking ISIS config: isis_config={isis_config}, has content: {bool(isis_config)}")
+                                if isis_config and isinstance(isis_config, dict) and len(isis_config) > 0:
+                                    logging.info(f"[DEVICE START] Configuring ISIS in newly created container")
+                                    from utils.isis import configure_isis_neighbor
+                                    configure_isis_neighbor(device_id, isis_config, device_name, ipv4_for_config, ipv6_for_config)
+                                else:
+                                    logging.warning(f"[DEVICE START] ISIS config is empty or invalid, skipping ISIS configuration")
+                            else:
+                                logging.warning(f"[DEVICE START] Failed to create FRR container for device {device_name}")
         except Exception as e:
             logging.error(f"[DEVICE START] Failed to auto-restore protocols: {e}")
             import traceback
@@ -1459,54 +1548,17 @@ def configure_isis():
         except Exception as e:
             logging.warning(f"[ISIS CONFIGURE] Failed to save route pool attachments: {e}")
         
-        # Save device to database if it doesn't exist, or update ISIS config for existing device
+        # Check if IPv4 was previously configured but now disabled - need to remove IPv4 ISIS
         try:
-            from datetime import datetime, timezone
             existing_device = device_db.get_device(device_id)
-            if not existing_device:
-                logging.info(f"[ISIS CONFIGURE] Device {device_id} not found in database, adding it")
-                device_data = {
-                    "device_id": device_id,
-                    "device_name": device_name,
-                    "interface": data.get("interface", "ens4np0"),
-                    "vlan": data.get("vlan", "0"),
-                    "ipv4_address": ipv4,
-                    "ipv6_address": ipv6,
-                    "ipv4_mask": data.get("ipv4_mask", "24"),
-                    "ipv6_mask": data.get("ipv6_mask", "64"),
-                    "ipv4_gateway": data.get("ipv4_gateway", ""),
-                    "ipv6_gateway": data.get("ipv6_gateway", ""),
-                    "protocols": ["IS-IS"],  # Add IS-IS protocol to the device
-                    "isis_config": isis_config,  # Save ISIS configuration
-                    "status": "Running",
-                    "created_at": datetime.now(timezone.utc).isoformat(),
-                    "updated_at": datetime.now(timezone.utc).isoformat()
-                }
-                
-                if device_db.add_device(device_data):
-                    logging.info(f"[ISIS CONFIGURE] Successfully added device {device_name} to database")
-                else:
-                    logging.warning(f"[ISIS CONFIGURE] Failed to add device {device_name} to database")
-            else:
-                logging.info(f"[ISIS CONFIGURE] Device {device_id} already exists in database")
-                
-                # IMPORTANT: Check for IPv4/IPv6 removal BEFORE updating database
-                # Get existing ISIS config before it's overwritten
-                existing_isis_config = existing_device.get("isis_config", {})
-                if isinstance(existing_isis_config, str):
-                    import json
+            if existing_device:
+                existing_ipv4 = existing_device.get("ipv4_address", "")
+                # If IPv4 was previously configured but now empty, remove IPv4 ISIS
+                if existing_ipv4 and not ipv4:
+                    logging.info(f"[ISIS CONFIGURE] IPv4 was configured but now disabled - removing IPv4 ISIS configuration")
                     try:
-                        existing_isis_config = json.loads(existing_isis_config)
-                    except:
-                        existing_isis_config = {}
-                
-                # Check if IPv4 was previously enabled but now disabled - remove IPv4 ISIS
-                existing_ipv4_enabled = existing_isis_config.get("ipv4_enabled", False)
-                ipv4_enabled = isis_config.get("ipv4_enabled", False)
-                
-                if existing_ipv4_enabled and not ipv4_enabled:
-                    logging.info(f"[ISIS CONFIGURE] IPv4 was enabled but now disabled - removing IPv4 ISIS configuration")
-                    try:
+                        from utils.frr_docker import FRRDockerManager
+                        frr_manager = FRRDockerManager()
                         container_name = frr_manager._get_container_name(device_id, device_name)
                         container = frr_manager.client.containers.get(container_name)
                         
@@ -1538,14 +1590,20 @@ def configure_isis():
                             logging.warning(f"[ISIS CONFIGURE] Failed to remove IPv4 ISIS configuration: {output_str}")
                     except Exception as e:
                         logging.warning(f"[ISIS CONFIGURE] Failed to remove IPv4 ISIS configuration: {e}")
-                
-                # Check if IPv6 was previously enabled but now disabled - remove IPv6 ISIS
-                existing_ipv6_enabled = existing_isis_config.get("ipv6_enabled", False)
-                ipv6_enabled = isis_config.get("ipv6_enabled", False)
-                
-                if existing_ipv6_enabled and not ipv6_enabled:
-                    logging.info(f"[ISIS CONFIGURE] IPv6 was enabled but now disabled - removing IPv6 ISIS configuration")
+        except Exception as e:
+            logging.warning(f"[ISIS CONFIGURE] Error checking for existing IPv4 ISIS removal: {e}")
+        
+        # Check if IPv6 was previously configured but now disabled - need to remove IPv6 ISIS
+        try:
+            existing_device = device_db.get_device(device_id)
+            if existing_device:
+                existing_ipv6 = existing_device.get("ipv6_address", "")
+                # If IPv6 was previously configured but now empty, remove IPv6 ISIS
+                if existing_ipv6 and not ipv6:
+                    logging.info(f"[ISIS CONFIGURE] IPv6 was configured but now disabled - removing IPv6 ISIS configuration")
                     try:
+                        from utils.frr_docker import FRRDockerManager
+                        frr_manager = FRRDockerManager()
                         container_name = frr_manager._get_container_name(device_id, device_name)
                         container = frr_manager.client.containers.get(container_name)
                         
@@ -1577,28 +1635,72 @@ def configure_isis():
                             logging.warning(f"[ISIS CONFIGURE] Failed to remove IPv6 ISIS configuration: {output_str}")
                     except Exception as e:
                         logging.warning(f"[ISIS CONFIGURE] Failed to remove IPv6 ISIS configuration: {e}")
-                
-                # Update device with IS-IS protocol and configuration
-                existing_protocols = existing_device.get("protocols", [])
-                if "IS-IS" not in existing_protocols and "ISIS" not in existing_protocols:
-                    existing_protocols.append("IS-IS")
-                    logging.info(f"[ISIS CONFIGURE] Adding IS-IS protocol to device {device_name}")
-                
-                # Update ISIS configuration
-                device_db.update_device(device_id, {
-                    "protocols": existing_protocols,
-                    "isis_config": isis_config,
-                    "updated_at": datetime.now(timezone.utc).isoformat()
-                })
-                logging.info(f"[ISIS CONFIGURE] Updated device {device_name} with ISIS configuration in database")
         except Exception as e:
-            logging.warning(f"[ISIS CONFIGURE] Error checking/adding device to database: {e}")
+            logging.warning(f"[ISIS CONFIGURE] Error checking for existing IPv6 ISIS removal: {e}")
         
         # Configure ISIS neighbor
         success = configure_isis_neighbor(device_id, isis_config, device_name, ipv4=ipv4, ipv6=ipv6)
         
         if success:
             logging.info(f"[ISIS CONFIGURE] Successfully configured ISIS for device {device_name}")
+            
+            # Save full ISIS config to database (merge with existing to preserve all fields)
+            try:
+                from datetime import datetime, timezone
+                existing_device = device_db.get_device(device_id)
+                if existing_device:
+                    existing_isis_config = existing_device.get("isis_config", {})
+                    if isinstance(existing_isis_config, str) and existing_isis_config:
+                        try:
+                            import json
+                            existing_isis_config = json.loads(existing_isis_config)
+                        except:
+                            existing_isis_config = {}
+                    elif not isinstance(existing_isis_config, dict):
+                        existing_isis_config = {}
+                    
+                    # Merge with existing ISIS config to preserve all fields
+                    merged_isis_config = existing_isis_config.copy() if existing_isis_config else {}
+                    merged_isis_config.update(isis_config)  # New values override existing ones
+                    
+                    # Ensure all fields are preserved (area_id, system_id, hello_interval, hello_multiplier, etc.)
+                    # These should already be in isis_config from the client, but ensure they're in the merged config
+                    if "area_id" in isis_config:
+                        merged_isis_config["area_id"] = isis_config["area_id"]
+                    if "system_id" in isis_config:
+                        merged_isis_config["system_id"] = isis_config["system_id"]
+                    if "hello_interval" in isis_config:
+                        merged_isis_config["hello_interval"] = isis_config["hello_interval"]
+                    if "hello_multiplier" in isis_config:
+                        merged_isis_config["hello_multiplier"] = isis_config["hello_multiplier"]
+                    if "level" in isis_config:
+                        merged_isis_config["level"] = isis_config["level"]
+                    if "interface" in isis_config:
+                        merged_isis_config["interface"] = isis_config["interface"]
+                    if "metric" in isis_config:
+                        merged_isis_config["metric"] = isis_config["metric"]
+                    
+                    existing_protocols = existing_device.get("protocols", [])
+                    if isinstance(existing_protocols, str):
+                        try:
+                            existing_protocols = json.loads(existing_protocols)
+                        except:
+                            existing_protocols = []
+                    if not isinstance(existing_protocols, list):
+                        existing_protocols = []
+                    if "ISIS" not in existing_protocols and "IS-IS" not in existing_protocols:
+                        existing_protocols.append("ISIS")
+                    
+                    device_db.update_device(device_id, {
+                        "protocols": existing_protocols,
+                        "isis_config": merged_isis_config,
+                        "updated_at": datetime.now(timezone.utc).isoformat()
+                    })
+                    logging.info(f"[ISIS CONFIGURE] Updated device {device_name} with full ISIS configuration (area_id: {merged_isis_config.get('area_id')}, system_id: {merged_isis_config.get('system_id')}, hello_interval: {merged_isis_config.get('hello_interval')}, hello_multiplier: {merged_isis_config.get('hello_multiplier')})")
+            except Exception as e:
+                logging.warning(f"[ISIS CONFIGURE] Error saving full ISIS config to database: {e}")
+                import traceback
+                logging.warning(traceback.format_exc())
             
             # Trigger ISIS status check after configuration
             try:
@@ -1680,6 +1782,8 @@ def configure_isis():
             
     except Exception as e:
         logging.error(f"[ISIS CONFIGURE ERROR] Error configuring ISIS: {e}")
+        import traceback
+        logging.error(f"[ISIS CONFIGURE ERROR] Traceback: {traceback.format_exc()}")
         return jsonify({"error": str(e)}), 500
 @app.route("/api/device/apply", methods=["POST"])
 def apply_device():
@@ -1869,81 +1973,71 @@ def apply_device():
         except Exception as e:
             logging.warning(f"[DEVICE APPLY] Could not check for FRR container: {e}, will configure loopback on host")
         
-        if loopback_ipv4:
+        # Configure loopback IPs using FRR vtysh commands (if container exists)
+        if loopback_ipv4 or loopback_ipv6:
             try:
                 if container_exists and container:
-                    # Configure loopback inside FRR container
-                    # Remove existing loopback IPv4 address if any (use /32 for host route)
-                    container.exec_run(["ip", "addr", "del", f"{loopback_ipv4}/32", "dev", "lo"], timeout=5)
+                    # Configure loopback inside FRR container using vtysh commands
+                    logging.info(f"[DEVICE APPLY] Configuring loopback IPs via vtysh in container {container_name}")
                     
-                    # Add new loopback IPv4 address inside container
-                    lo_ipv4_result = container.exec_run([
-                        "ip", "addr", "add", f"{loopback_ipv4}/32", "dev", "lo"
-                    ], timeout=5)
+                    # Build vtysh commands for loopback configuration
+                    vtysh_commands = [
+                        "configure terminal",
+                        "interface lo",
+                    ]
                     
-                    if lo_ipv4_result.exit_code == 0:
-                        logging.info(f"[DEVICE APPLY] Configured loopback IPv4 address {loopback_ipv4}/32 on lo inside container {container_name}")
-                        result["loopback_ipv4_configured"] = True
+                    # Configure IPv4 loopback if provided
+                    if loopback_ipv4:
+                        vtysh_commands.append(f" ip address {loopback_ipv4}/32")
+                        logging.info(f"[DEVICE APPLY] Adding loopback IPv4 {loopback_ipv4}/32 via vtysh")
+                    
+                    # Configure IPv6 loopback if provided
+                    if loopback_ipv6:
+                        vtysh_commands.append(f" ipv6 address {loopback_ipv6}/128")
+                        logging.info(f"[DEVICE APPLY] Adding loopback IPv6 {loopback_ipv6}/128 via vtysh")
+                    
+                    vtysh_commands.extend([
+                        "exit",
+                        "exit",
+                        "write memory"
+                    ])
+                    
+                    # Execute commands using here-doc to maintain context
+                    config_commands = "\n".join(vtysh_commands)
+                    exec_cmd = f"vtysh << 'EOF'\n{config_commands}\nEOF"
+                    
+                    logging.info(f"[DEVICE APPLY] Executing loopback configuration via vtysh")
+                    loopback_result = container.exec_run(["bash", "-c", exec_cmd])
+                    
+                    if loopback_result.exit_code == 0:
+                        if loopback_ipv4:
+                            logging.info(f"[DEVICE APPLY] ✅ Configured loopback IPv4 address {loopback_ipv4}/32 via vtysh in container {container_name}")
+                            result["loopback_ipv4_configured"] = True
+                        if loopback_ipv6:
+                            logging.info(f"[DEVICE APPLY] ✅ Configured loopback IPv6 address {loopback_ipv6}/128 via vtysh in container {container_name}")
+                            result["loopback_ipv6_configured"] = True
                     else:
-                        output_str = lo_ipv4_result.output.decode('utf-8') if isinstance(lo_ipv4_result.output, bytes) else str(lo_ipv4_result.output)
-                        logging.warning(f"[DEVICE APPLY] Failed to configure loopback IPv4 address {loopback_ipv4}/32 in container: {output_str}")
-                        result["loopback_ipv4_configured"] = False
+                        output_str = loopback_result.output.decode('utf-8') if isinstance(loopback_result.output, bytes) else str(loopback_result.output)
+                        logging.warning(f"[DEVICE APPLY] Failed to configure loopback IPs via vtysh in container: {output_str}")
+                        if loopback_ipv4:
+                            result["loopback_ipv4_configured"] = False
+                        if loopback_ipv6:
+                            result["loopback_ipv6_configured"] = False
                 else:
-                    # Configure loopback on host (fallback if container doesn't exist)
-                    subprocess.run(["ip", "addr", "del", f"{loopback_ipv4}/32", "dev", "lo"], 
-                                 capture_output=True, text=True, timeout=5)
-                    
-                    lo_ipv4_result = subprocess.run([
-                        "ip", "addr", "add", f"{loopback_ipv4}/32", "dev", "lo"
-                    ], capture_output=True, text=True, timeout=5)
-                    
-                    if lo_ipv4_result.returncode == 0:
-                        logging.info(f"[DEVICE APPLY] Configured loopback IPv4 address {loopback_ipv4}/32 on lo (host)")
-                        result["loopback_ipv4_configured"] = True
-                    else:
-                        logging.warning(f"[DEVICE APPLY] Failed to configure loopback IPv4 address {loopback_ipv4}/32: {lo_ipv4_result.stderr}")
-                        result["loopback_ipv4_configured"] = False
+                    # Container doesn't exist yet - loopback will be configured later during protocol setup
+                    logging.info(f"[DEVICE APPLY] FRR container not available yet, loopback IPs will be configured during protocol setup")
+                    if loopback_ipv4:
+                        result["loopback_ipv4_configured"] = None  # Will be configured later
+                    if loopback_ipv6:
+                        result["loopback_ipv6_configured"] = None  # Will be configured later
             except Exception as e:
-                logging.warning(f"[DEVICE APPLY] Error configuring loopback IPv4 address: {e}")
-                result["loopback_ipv4_configured"] = False
-        
-        if loopback_ipv6:
-            try:
-                if container_exists and container:
-                    # Configure loopback inside FRR container
-                    # Remove existing loopback IPv6 address if any (use /128 for host route)
-                    container.exec_run(["ip", "-6", "addr", "del", f"{loopback_ipv6}/128", "dev", "lo"], timeout=5)
-                    
-                    # Add new loopback IPv6 address inside container
-                    lo_ipv6_result = container.exec_run([
-                        "ip", "-6", "addr", "add", f"{loopback_ipv6}/128", "dev", "lo"
-                    ], timeout=5)
-                    
-                    if lo_ipv6_result.exit_code == 0:
-                        logging.info(f"[DEVICE APPLY] Configured loopback IPv6 address {loopback_ipv6}/128 on lo inside container {container_name}")
-                        result["loopback_ipv6_configured"] = True
-                    else:
-                        output_str = lo_ipv6_result.output.decode('utf-8') if isinstance(lo_ipv6_result.output, bytes) else str(lo_ipv6_result.output)
-                        logging.warning(f"[DEVICE APPLY] Failed to configure loopback IPv6 address {loopback_ipv6}/128 in container: {output_str}")
-                        result["loopback_ipv6_configured"] = False
-                else:
-                    # Configure loopback on host (fallback if container doesn't exist)
-                    subprocess.run(["ip", "-6", "addr", "del", f"{loopback_ipv6}/128", "dev", "lo"], 
-                                 capture_output=True, text=True, timeout=5)
-                    
-                    lo_ipv6_result = subprocess.run([
-                        "ip", "-6", "addr", "add", f"{loopback_ipv6}/128", "dev", "lo"
-                    ], capture_output=True, text=True, timeout=5)
-                    
-                    if lo_ipv6_result.returncode == 0:
-                        logging.info(f"[DEVICE APPLY] Configured loopback IPv6 address {loopback_ipv6}/128 on lo (host)")
-                        result["loopback_ipv6_configured"] = True
-                    else:
-                        logging.warning(f"[DEVICE APPLY] Failed to configure loopback IPv6 address {loopback_ipv6}/128: {lo_ipv6_result.stderr}")
-                        result["loopback_ipv6_configured"] = False
-            except Exception as e:
-                logging.warning(f"[DEVICE APPLY] Error configuring loopback IPv6 address: {e}")
-                result["loopback_ipv6_configured"] = False
+                logging.warning(f"[DEVICE APPLY] Error configuring loopback IPs via vtysh: {e}")
+                import traceback
+                logging.warning(f"[DEVICE APPLY] Traceback: {traceback.format_exc()}")
+                if loopback_ipv4:
+                    result["loopback_ipv4_configured"] = False
+                if loopback_ipv6:
+                    result["loopback_ipv6_configured"] = False
         
         # Update device status in database
         try:
@@ -2057,6 +2151,44 @@ def apply_device():
                     if vlan and vlan != existing_device.get("vlan", "0"):
                         update_data["vlan"] = vlan
                     
+                    # Update protocol configs if provided
+                    if bgp_config:
+                        update_data["bgp_config"] = bgp_config
+                        logging.info(f"[DEVICE APPLY] Updating BGP config for device {device_name}")
+                    if ospf_config:
+                        # Merge with existing OSPF config to preserve fields like graceful_restart
+                        existing_device = device_db.get_device(device_id)
+                        existing_ospf_config = existing_device.get("ospf_config", {}) if existing_device else {}
+                        if isinstance(existing_ospf_config, str):
+                            import json
+                            try:
+                                existing_ospf_config = json.loads(existing_ospf_config)
+                            except:
+                                existing_ospf_config = {}
+                        
+                        merged_ospf_config = existing_ospf_config.copy() if existing_ospf_config else {}
+                        merged_ospf_config.update(ospf_config)  # New values override existing ones
+                        # Ensure graceful_restart fields are preserved if not explicitly set
+                        if "graceful_restart_ipv4" not in ospf_config and "graceful_restart_ipv4" in existing_ospf_config:
+                            merged_ospf_config["graceful_restart_ipv4"] = existing_ospf_config["graceful_restart_ipv4"]
+                        if "graceful_restart_ipv6" not in ospf_config and "graceful_restart_ipv6" in existing_ospf_config:
+                            merged_ospf_config["graceful_restart_ipv6"] = existing_ospf_config["graceful_restart_ipv6"]
+                        # Also preserve graceful_restart for backward compatibility
+                        if "graceful_restart" not in ospf_config and "graceful_restart" in existing_ospf_config:
+                            merged_ospf_config["graceful_restart"] = existing_ospf_config["graceful_restart"]
+                        
+                        update_data["ospf_config"] = merged_ospf_config
+                        logging.info(f"[DEVICE APPLY] Updating OSPF config for device {device_name} (graceful_restart: {merged_ospf_config.get('graceful_restart', False)})")
+                    if isis_config:
+                        update_data["isis_config"] = isis_config
+                        update_data["is_is_config"] = isis_config  # Also update is_is_config for compatibility
+                        logging.info(f"[DEVICE APPLY] Updating ISIS config for device {device_name}")
+                    
+                    # Update protocols list if provided
+                    if protocols:
+                        update_data["protocols"] = protocols
+                        logging.info(f"[DEVICE APPLY] Updating protocols list for device {device_name}: {protocols}")
+                    
                     # Update database if there are changes
                     if update_data:
                         update_data["updated_at"] = datetime.now(timezone.utc).isoformat()
@@ -2105,10 +2237,22 @@ def configure_ospf():
         # Configure OSPF neighbor using FRR Docker
         logging.info(f"OSPF Config Debug: {ospf_config}")
         logging.info(f"OSPF Config Keys: {list(ospf_config.keys())}")
+        logging.info(f"OSPF Area IDs - IPv4: {ospf_config.get('area_id_ipv4')}, IPv6: {ospf_config.get('area_id_ipv6')}, Base: {ospf_config.get('area_id')}")
+        
+        # Check if specific address families are selected for this apply operation
+        # This allows applying only selected address families without affecting others
+        apply_address_families = ospf_config.get("_apply_address_families", [])
+        is_partial_apply = bool(apply_address_families)
         
         # Check if IPv4 and/or IPv6 OSPF is enabled
         ipv4_enabled = ospf_config.get("ipv4_enabled", True)  # Default to True for backward compatibility
         ipv6_enabled = ospf_config.get("ipv6_enabled", False)
+        
+        # If specific address families are selected, only configure those
+        if is_partial_apply:
+            ipv4_enabled = ipv4_enabled and "IPv4" in apply_address_families
+            ipv6_enabled = ipv6_enabled and "IPv6" in apply_address_families
+            logging.info(f"[OSPF CONFIGURE] Partial apply: only configuring {apply_address_families}")
         
         logging.info(f"IPv4 OSPF enabled: {ipv4_enabled}, IPv6 OSPF enabled: {ipv6_enabled}")
         
@@ -2146,9 +2290,11 @@ def configure_ospf():
                 return jsonify({"error": "Failed to create FRR container"}), 500
             
             logging.info(f"[OSPF CONFIGURE] Successfully created FRR container: {created_container_name}")
-        
-        # Initialize old_ospf_config_for_area_change to None (will be set if device exists)
-        old_ospf_config_for_area_change = None
+            # Wait for FRR daemons to be fully initialized before applying configuration
+            # This ensures the container is ready to accept configuration commands (like BGP does)
+            import time
+            logging.info(f"[OSPF CONFIGURE] Waiting 5 seconds for FRR daemons to initialize...")
+            time.sleep(5)
         
         # Save device to database if it doesn't exist
         try:
@@ -2191,57 +2337,156 @@ def configure_ospf():
                     except:
                         existing_ospf_config = {}
                 
-                # Store old config for area ID change detection (will be passed to configure_ospf_neighbor)
-                old_ospf_config_for_area_change = existing_ospf_config.copy() if existing_ospf_config else None
-                logging.info(f"[OSPF CONFIGURE] Old OSPF config for area change detection: {old_ospf_config_for_area_change}")
-                if old_ospf_config_for_area_change:
-                    old_area = old_ospf_config_for_area_change.get("area_id")
-                    new_area = ospf_config.get("area_id", "0.0.0.0")
-                    logging.info(f"[OSPF CONFIGURE] Area ID comparison - Old: {old_area}, New: {new_area}, Changed: {old_area != new_area if old_area else False}")
-                
-                # Check if IPv4 was previously enabled but now disabled - remove IPv4 OSPF
-                existing_ipv4_enabled = existing_ospf_config.get("ipv4_enabled", False)
-                
-                if existing_ipv4_enabled and not ipv4_enabled:
-                    logging.info(f"[OSPF CONFIGURE] IPv4 was enabled but now disabled - removing IPv4 OSPF configuration")
-                    try:
-                        from utils.ospf import stop_ospf_neighbor
-                        # Stop IPv4 OSPF
-                        stop_ospf_neighbor(device_id, device_name, af="IPv4")
-                        logging.info(f"[OSPF CONFIGURE] Successfully removed IPv4 OSPF configuration")
-                    except Exception as e:
-                        logging.warning(f"[OSPF CONFIGURE] Failed to remove IPv4 OSPF configuration: {e}")
-                
-                # Check if IPv6 was previously enabled but now disabled - remove IPv6 OSPF
-                existing_ipv6_enabled = existing_ospf_config.get("ipv6_enabled", False)
-                
-                if existing_ipv6_enabled and not ipv6_enabled:
-                    logging.info(f"[OSPF CONFIGURE] IPv6 was enabled but now disabled - removing IPv6 OSPF configuration")
-                    try:
-                        from utils.ospf import stop_ospf_neighbor
-                        # Stop IPv6 OSPF
-                        stop_ospf_neighbor(device_id, device_name, af="IPv6")
-                        logging.info(f"[OSPF CONFIGURE] Successfully removed IPv6 OSPF configuration")
-                    except Exception as e:
-                        logging.warning(f"[OSPF CONFIGURE] Failed to remove IPv6 OSPF configuration: {e}")
+                # Only check for removal if this is NOT a partial apply (all address families are being updated)
+                # If this is a partial apply, don't remove configurations for unselected address families
+                if not is_partial_apply:
+                    # Check if IPv4 was previously enabled but now disabled - remove IPv4 OSPF
+                    existing_ipv4_enabled = existing_ospf_config.get("ipv4_enabled", False)
+                    
+                    if existing_ipv4_enabled and not ipv4_enabled:
+                        logging.info(f"[OSPF CONFIGURE] IPv4 was enabled but now disabled - removing IPv4 OSPF configuration")
+                        try:
+                            from utils.ospf import stop_ospf_neighbor
+                            # Stop IPv4 OSPF
+                            stop_ospf_neighbor(device_id, device_name, af="IPv4")
+                            logging.info(f"[OSPF CONFIGURE] Successfully removed IPv4 OSPF configuration")
+                        except Exception as e:
+                            logging.warning(f"[OSPF CONFIGURE] Failed to remove IPv4 OSPF configuration: {e}")
+                    
+                    # Check if IPv6 was previously enabled but now disabled - remove IPv6 OSPF
+                    existing_ipv6_enabled = existing_ospf_config.get("ipv6_enabled", False)
+                    
+                    if existing_ipv6_enabled and not ipv6_enabled:
+                        logging.info(f"[OSPF CONFIGURE] IPv6 was enabled but now disabled - removing IPv6 OSPF configuration")
+                        try:
+                            from utils.ospf import stop_ospf_neighbor
+                            # Stop IPv6 OSPF
+                            stop_ospf_neighbor(device_id, device_name, af="IPv6")
+                            logging.info(f"[OSPF CONFIGURE] Successfully removed IPv6 OSPF configuration")
+                        except Exception as e:
+                            logging.warning(f"[OSPF CONFIGURE] Failed to remove IPv6 OSPF configuration: {e}")
+                else:
+                    logging.info(f"[OSPF CONFIGURE] Partial apply detected - skipping removal checks for unselected address families")
                 
                 # Update device with OSPF protocol and configuration
+                # Merge with existing OSPF config to preserve fields like graceful_restart
+                # that might not be explicitly updated
+                merged_ospf_config = existing_ospf_config.copy() if existing_ospf_config else {}
+                
+                # Remove the _apply_address_families flag before saving (it's only for this apply operation)
+                ospf_config_to_save = ospf_config.copy()
+                ospf_config_to_save.pop("_apply_address_families", None)
+                
+                # If this is a partial apply, preserve the enabled flags BEFORE updating
+                # This prevents them from being overwritten by the update() call
+                if is_partial_apply:
+                    preserved_ipv4_enabled = existing_ospf_config.get("ipv4_enabled", False) if existing_ospf_config else False
+                    preserved_ipv6_enabled = existing_ospf_config.get("ipv6_enabled", False) if existing_ospf_config else False
+                    
+                    # Remove enabled flags from config_to_save if they're not in the selected address families
+                    if "IPv4" not in apply_address_families:
+                        # Don't update ipv4_enabled - preserve existing value
+                        ospf_config_to_save.pop("ipv4_enabled", None)
+                    if "IPv6" not in apply_address_families:
+                        # Don't update ipv6_enabled - preserve existing value
+                        ospf_config_to_save.pop("ipv6_enabled", None)
+                
+                merged_ospf_config.update(ospf_config_to_save)  # New values override existing ones
+                
+                # CRITICAL: Preserve area_id_ipv4 and area_id_ipv6 if not explicitly updated
+                # This ensures editing one address family doesn't affect the other
+                # IMPORTANT: Do this BEFORE initialization to preserve existing values
+                # CRITICAL: Check if the key exists in ospf_config_to_save, not just truthiness
+                # This ensures "0.0.0.0" is treated as a valid value, not as missing
+                if "area_id_ipv4" not in ospf_config_to_save and "area_id_ipv4" in existing_ospf_config:
+                    merged_ospf_config["area_id_ipv4"] = existing_ospf_config["area_id_ipv4"]
+                if "area_id_ipv6" not in ospf_config_to_save and "area_id_ipv6" in existing_ospf_config:
+                    merged_ospf_config["area_id_ipv6"] = existing_ospf_config["area_id_ipv6"]
+                # Also preserve area_id for backward compatibility, but only if area_id_ipv4/ipv6 are not being updated
+                # This prevents area_id from overwriting area_id_ipv4/ipv6 when they're explicitly set
+                if "area_id" not in ospf_config_to_save and "area_id" in existing_ospf_config:
+                    # Only preserve area_id if neither area_id_ipv4 nor area_id_ipv6 are being updated
+                    # This prevents area_id from interfering with explicit area_id_ipv4/ipv6 updates
+                    if "area_id_ipv4" not in ospf_config_to_save and "area_id_ipv6" not in ospf_config_to_save:
+                        merged_ospf_config["area_id"] = existing_ospf_config["area_id"]
+                
+                # CRITICAL: Initialize area_id_ipv4 and area_id_ipv6 from area_id ONLY if not explicitly set
+                # This ensures they are always set, even for new devices
+                # IMPORTANT: Only initialize if they don't exist in merged_ospf_config (after preservation above)
+                # This prevents overwriting values that were explicitly set or preserved
+                # CRITICAL: Check if the key exists, not just truthiness, since "0.0.0.0" is a valid value
+                # If area_id_ipv4/ipv6 are in ospf_config_to_save, they were explicitly set and should NOT be overwritten
+                if "area_id_ipv4" not in merged_ospf_config:
+                    # Only initialize if it doesn't exist in merged_ospf_config
+                    # This means it wasn't in ospf_config_to_save AND wasn't preserved from existing_ospf_config
+                    base_area_id = merged_ospf_config.get("area_id", "0.0.0.0")
+                    merged_ospf_config["area_id_ipv4"] = base_area_id
+                elif "area_id_ipv4" in ospf_config_to_save:
+                    # If area_id_ipv4 was explicitly set in ospf_config_to_save, ensure it's preserved
+                    # This handles the case where "0.0.0.0" is explicitly set
+                    merged_ospf_config["area_id_ipv4"] = ospf_config_to_save["area_id_ipv4"]
+                
+                if "area_id_ipv6" not in merged_ospf_config:
+                    # Only initialize if it doesn't exist in merged_ospf_config
+                    # This means it wasn't in ospf_config_to_save AND wasn't preserved from existing_ospf_config
+                    base_area_id = merged_ospf_config.get("area_id", "0.0.0.0")
+                    merged_ospf_config["area_id_ipv6"] = base_area_id
+                elif "area_id_ipv6" in ospf_config_to_save:
+                    # If area_id_ipv6 was explicitly set in ospf_config_to_save, ensure it's preserved
+                    # This handles the case where "0.0.0.0" is explicitly set
+                    merged_ospf_config["area_id_ipv6"] = ospf_config_to_save["area_id_ipv6"]
+                
+                # DEBUG: Log what we're saving to database
+                logging.info(f"[OSPF CONFIGURE] Saving to database for {device_name}: area_id_ipv4={merged_ospf_config.get('area_id_ipv4')}, area_id_ipv6={merged_ospf_config.get('area_id_ipv6')}, area_id={merged_ospf_config.get('area_id')}")
+                
+                # If this is a partial apply, restore the preserved enabled flags for unselected address families
+                if is_partial_apply:
+                    if "IPv4" not in apply_address_families:
+                        # Restore IPv4 enabled flag from existing config
+                        merged_ospf_config["ipv4_enabled"] = preserved_ipv4_enabled
+                    if "IPv6" not in apply_address_families:
+                        # Restore IPv6 enabled flag from existing config
+                        merged_ospf_config["ipv6_enabled"] = preserved_ipv6_enabled
+                
+                # Ensure graceful_restart fields are preserved if not explicitly set
+                if "graceful_restart_ipv4" not in ospf_config_to_save and "graceful_restart_ipv4" in existing_ospf_config:
+                    merged_ospf_config["graceful_restart_ipv4"] = existing_ospf_config["graceful_restart_ipv4"]
+                if "graceful_restart_ipv6" not in ospf_config_to_save and "graceful_restart_ipv6" in existing_ospf_config:
+                    merged_ospf_config["graceful_restart_ipv6"] = existing_ospf_config["graceful_restart_ipv6"]
+                # Also preserve graceful_restart for backward compatibility
+                if "graceful_restart" not in ospf_config_to_save and "graceful_restart" in existing_ospf_config:
+                    merged_ospf_config["graceful_restart"] = existing_ospf_config["graceful_restart"]
+                
                 existing_protocols = existing_device.get("protocols", [])
                 if "OSPF" not in existing_protocols:
                     existing_protocols.append("OSPF")
                 
                 device_db.update_device(device_id, {
                     "protocols": existing_protocols,
-                    "ospf_config": ospf_config,
+                    "ospf_config": merged_ospf_config,
                     "updated_at": datetime.now(timezone.utc).isoformat()
                 })
-                logging.info(f"[OSPF CONFIGURE] Updated device {device_name} with OSPF configuration")
+                logging.info(f"[OSPF CONFIGURE] Updated device {device_name} with OSPF configuration (graceful_restart: {merged_ospf_config.get('graceful_restart', False)})")
         except Exception as e:
             logging.warning(f"[OSPF CONFIGURE] Error checking/adding device to database: {e}")
         
         # Save OSPF route pool attachments to database (similar to BGP)
         try:
+            # Check for route pools in ospf_config first, then in route_pools_per_area payload
             route_pools_data = ospf_config.get("route_pools", [])
+            
+            # If route_pools_per_area is provided in payload, use it (allows per-area assignment)
+            route_pools_per_area = data.get("route_pools_per_area", {})
+            if route_pools_per_area and not route_pools_data:
+                # Extract route pools from route_pools_per_area
+                # For now, use "default" area or first area found
+                if "default" in route_pools_per_area:
+                    route_pools_data = route_pools_per_area["default"]
+                elif route_pools_per_area:
+                    # Use first area's pools
+                    first_area = list(route_pools_per_area.keys())[0]
+                    route_pools_data = route_pools_per_area[first_area]
+            
             area_id = ospf_config.get("area_id", "0.0.0.0")
             
             # Handle both old list format and new dict format (per neighbor type)
@@ -2276,16 +2521,28 @@ def configure_ospf():
         # Configure OSPF neighbor
         try:
             logging.info(f"[OSPF CONFIGURE] Configuring OSPF for device {device_name}")
-            # Pass old_ospf_config if available (for area ID change detection)
-            logging.info(f"[OSPF CONFIGURE] Passing old_ospf_config to configure_ospf_neighbor: {old_ospf_config_for_area_change}")
-            success = configure_ospf_neighbor(device_id, ospf_config, device_name, old_ospf_config=old_ospf_config_for_area_change)
+            success = configure_ospf_neighbor(device_id, ospf_config, device_name)
             
             if success:
                 logging.info(f"[OSPF CONFIGURE] Successfully configured OSPF for device {device_name}")
                 
                 # After configuring OSPF, apply route pool configurations if they exist
                 try:
+                    # Check for route pools in ospf_config first, then in route_pools_per_area payload
                     route_pools_data = ospf_config.get("route_pools", [])
+                    
+                    # If route_pools_per_area is provided in payload, use it (allows per-area assignment)
+                    route_pools_per_area = data.get("route_pools_per_area", {})
+                    if route_pools_per_area and not route_pools_data:
+                        # Extract route pools from route_pools_per_area
+                        # For now, use "default" area or first area found
+                        if "default" in route_pools_per_area:
+                            route_pools_data = route_pools_per_area["default"]
+                        elif route_pools_per_area:
+                            # Use first area's pools
+                            first_area = list(route_pools_per_area.keys())[0]
+                            route_pools_data = route_pools_per_area[first_area]
+                    
                     area_id = ospf_config.get("area_id", "0.0.0.0")
                     
                     # Get all available route pools
@@ -2360,6 +2617,8 @@ def configure_ospf():
                 
         except Exception as e:
             logging.error(f"[OSPF CONFIGURE] Error configuring OSPF for device {device_name}: {e}")
+            import traceback
+            logging.error(f"[OSPF CONFIGURE] Traceback: {traceback.format_exc()}")
             return jsonify({"error": f"OSPF configuration error: {str(e)}"}), 500
             
     except Exception as e:
@@ -2389,90 +2648,22 @@ def stop_device():
             "interface": interface,
         }
         
-        # Stop FRR protocols and shutdown interface (keep container running)
+        # Stop FRR container (this stops all protocols automatically)
         try:
             from utils.frr_docker import FRRDockerManager
-            import json
-            
-            # First, check if device exists in database
-            device_info = device_db.get_device(device_id)
-            if not device_info:
-                logging.warning(f"[DEVICE STOP] Device {device_id} not found in database")
-                return jsonify({"error": "Device not found"}), 404
             
             frr_manager = FRRDockerManager()
             container_name = frr_manager._get_container_name(device_id, device_name)
             
-            logging.info(f"[DEVICE STOP] Shutting down protocols and interface for device {device_name} (container: {container_name})")
+            logging.info(f"[DEVICE STOP] Stopping FRR container {container_name} for device {device_name}")
             
-            # Get protocol configs from payload first (if provided), otherwise from database
-            bgp_config = data.get("bgp_config")
-            ospf_config = data.get("ospf_config")
-            isis_config = data.get("isis_config")
-            
-            # Parse BGP config if from database
-            if not bgp_config:
-                bgp_config_raw = device_info.get("bgp_config", {})
-                if isinstance(bgp_config_raw, str) and bgp_config_raw:
-                    try:
-                        bgp_config = json.loads(bgp_config_raw)
-                    except:
-                        bgp_config = {}
-                else:
-                    bgp_config = bgp_config_raw if bgp_config_raw else {}
-            
-            # Parse OSPF config if from database
-            if not ospf_config:
-                ospf_config_raw = device_info.get("ospf_config", {})
-                if isinstance(ospf_config_raw, str) and ospf_config_raw:
-                    try:
-                        ospf_config = json.loads(ospf_config_raw)
-                    except:
-                        ospf_config = {}
-                else:
-                    ospf_config = ospf_config_raw if ospf_config_raw else {}
-            
-            # Parse ISIS config if from database
-            if not isis_config:
-                isis_config_raw = device_info.get("isis_config", {})
-                if isinstance(isis_config_raw, str) and isis_config_raw:
-                    try:
-                        isis_config = json.loads(isis_config_raw)
-                    except:
-                        isis_config = {}
-                else:
-                    isis_config = isis_config_raw if isis_config_raw else {}
-            
-            # Only include configs that are not empty
-            if bgp_config and not bgp_config.get("bgp_neighbor_ipv4") and not bgp_config.get("bgp_neighbor_ipv6"):
-                bgp_config = None
-            if ospf_config and not ospf_config.get("area_id"):
-                ospf_config = None
-            if isis_config and not isis_config.get("area_id"):
-                isis_config = None
-            
-            logging.info(f"[DEVICE STOP] Protocol configs - BGP: {bool(bgp_config)}, OSPF: {bool(ospf_config)}, ISIS: {bool(isis_config)}")
-            
-            # Stop protocols and shutdown interface (keep container running)
-            container_stopped = frr_manager.stop_frr_container(
-                device_id=device_id,
-                device_name=device_name,
-                protocols=protocols,
-                bgp_config=bgp_config,
-                ospf_config=ospf_config,
-                isis_config=isis_config,
-                interface=interface,
-                vlan=vlan
-            )
-            
+            container_stopped = frr_manager.stop_frr_container(device_id, device_name)
             if container_stopped:
-                logging.info(f"[DEVICE STOP] Successfully shut down protocols and interface for {device_name}")
+                logging.info(f"[DEVICE STOP] Successfully stopped FRR container for {device_name}")
                 result["container_stopped"] = True
-                result["protocols_shutdown"] = True
                 
-                # Update all protocol statuses in database to reflect protocols stopped
+                # Update all protocol statuses in database to reflect container stop
                 try:
-                    now = datetime.now(timezone.utc).isoformat()
                     update_data = {
                         # BGP status
                         'bgp_established': False,
@@ -2480,8 +2671,6 @@ def stop_device():
                         'bgp_ipv4_state': 'Idle',
                         'bgp_ipv6_established': False,
                         'bgp_ipv6_state': 'Idle',
-                        'bgp_manual_override': True,  # Prevent monitor from overriding
-                        'bgp_manual_override_time': now,
                         # OSPF status
                         'ospf_established': False,
                         'ospf_state': 'Down',
@@ -2490,40 +2679,59 @@ def stop_device():
                         'ospf_ipv6_running': False,
                         'ospf_ipv6_established': False,
                         'ospf_neighbors': None,
-                        'ospf_manual_override': True,  # Prevent monitor from overriding
-                        'ospf_manual_override_time': now,
                         # ISIS status
                         'isis_running': False,
                         'isis_state': 'Down',
                         'isis_established': False,
                         'isis_neighbors': None,
-                        'isis_manual_override': True,  # Prevent monitor from overriding
-                        'isis_manual_override_time': now,
                         # Update timestamps
-                        'last_bgp_check': now,
-                        'last_ospf_check': now,
-                        'last_isis_check': now,
+                        'last_bgp_check': datetime.now(timezone.utc).isoformat(),
+                        'last_ospf_check': datetime.now(timezone.utc).isoformat(),
+                        'last_isis_check': datetime.now(timezone.utc).isoformat(),
                     }
                     device_db.update_device(device_id, update_data)
-                    logging.info(f"[DEVICE STOP] Updated all protocol statuses to stopped in database for {device_name} with manual override flags")
+                    logging.info(f"[DEVICE STOP] Updated all protocol statuses to stopped in database for {device_name}")
                 except Exception as e:
                     logging.warning(f"[DEVICE STOP] Failed to update protocol statuses in database: {e}")
             else:
-                logging.warning(f"[DEVICE STOP] Failed to shutdown protocols for {device_name}")
+                logging.warning(f"[DEVICE STOP] Failed to stop FRR container for {device_name}")
                 result["container_stopped"] = False
-                result["protocols_shutdown"] = False
         except Exception as e:
-            logging.error(f"[DEVICE STOP] Error shutting down protocols for {device_name}: {e}")
-            import traceback
-            logging.error(f"[DEVICE STOP] Traceback: {traceback.format_exc()}")
+            logging.error(f"[DEVICE STOP] Error stopping FRR container for {device_name}: {e}")
             result["container_stopped"] = False
-            result["protocols_shutdown"] = False
         
-        # Note: We do NOT shutdown the interface on the host, as this would affect other devices
-        # using the same physical interface with different VLANs. The interface shutdown inside
-        # the container is sufficient to stop the device's operation.
-        logging.info(f"[DEVICE STOP] Device {device_name} stopped (protocols stopped, interface down inside container)")
-        result["interface_shutdown"] = True  # Interface is shut down inside container, not on host
+        # Shutdown the associated interface (bring interface down)
+        try:
+            # Build interface name (with VLAN if applicable)
+            if vlan and vlan != "0":
+                iface_name = f"vlan{vlan}"
+            else:
+                iface_name = interface
+            
+            if iface_name:
+                # Bring interface down using ip link set down
+                shutdown_result = subprocess.run(
+                    ["ip", "link", "set", iface_name, "down"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                
+                if shutdown_result.returncode == 0:
+                    logging.info(f"[DEVICE STOP] Interface {iface_name} shut down for device {device_name}")
+                    result["interface_shutdown"] = True
+                else:
+                    logging.warning(f"[DEVICE STOP] Failed to shutdown interface {iface_name}: {shutdown_result.stderr}")
+                    result["interface_shutdown"] = False
+            else:
+                logging.warning(f"[DEVICE STOP] No interface specified for device {device_name}")
+                result["interface_shutdown"] = False
+                
+        except Exception as e:
+            logging.warning(f"[DEVICE STOP] Failed to shutdown interface for {device_name}: {e}")
+            result["interface_shutdown"] = False
+        
+        logging.info(f"[DEVICE STOP] Device {device_name} stopped (interface down, protocols stopped)")
         
         # Update device status in database and ensure all protocol statuses are cleared
         try:
@@ -2531,7 +2739,6 @@ def stop_device():
             device_db.update_device_status(device_id, "Stopped")
             
             # Then ensure all protocol statuses are cleared (in case container wasn't running)
-            now = datetime.now(timezone.utc).isoformat()
             update_data = {
                 # BGP status
                 'bgp_established': False,
@@ -2539,8 +2746,6 @@ def stop_device():
                 'bgp_ipv4_state': 'Idle',
                 'bgp_ipv6_established': False,
                 'bgp_ipv6_state': 'Idle',
-                'bgp_manual_override': True,  # Prevent monitor from overriding
-                'bgp_manual_override_time': now,
                 # OSPF status
                 'ospf_established': False,
                 'ospf_state': 'Down',
@@ -2549,22 +2754,18 @@ def stop_device():
                 'ospf_ipv6_running': False,
                 'ospf_ipv6_established': False,
                 'ospf_neighbors': None,
-                'ospf_manual_override': True,  # Prevent monitor from overriding
-                'ospf_manual_override_time': now,
                 # ISIS status
                 'isis_running': False,
                 'isis_state': 'Down',
                 'isis_established': False,
                 'isis_neighbors': None,
-                'isis_manual_override': True,  # Prevent monitor from overriding
-                'isis_manual_override_time': now,
                 # Update timestamps
-                'last_bgp_check': now,
-                'last_ospf_check': now,
-                'last_isis_check': now,
+                'last_bgp_check': datetime.now(timezone.utc).isoformat(),
+                'last_ospf_check': datetime.now(timezone.utc).isoformat(),
+                'last_isis_check': datetime.now(timezone.utc).isoformat(),
             }
             device_db.update_device(device_id, update_data)
-            logging.info(f"[DEVICE DB] Device {device_id} status updated to Stopped and all protocol statuses cleared with manual override flags")
+            logging.info(f"[DEVICE DB] Device {device_id} status updated to Stopped and all protocol statuses cleared")
         except Exception as e:
             logging.warning(f"[DEVICE DB] Failed to update device {device_id} status: {e}")
             # Don't fail device stop if database operation fails
@@ -2600,9 +2801,9 @@ def remove_device():
         # Stop and remove FRR Docker container for this device
         container_removed = False
         try:
-            from utils.frr_docker import remove_frr_container
+            from utils.frr_docker import stop_frr_container
             
-            success = remove_frr_container(device_id, device_name)
+            success = stop_frr_container(device_id, device_name)
             if success:
                 logging.info(f"[DEVICE REMOVE] FRR container stopped and removed for {device_name} ({device_id})")
                 container_removed = True
@@ -4394,9 +4595,38 @@ def configure_bgp():
         logging.info(f"BGP Config Debug: {bgp_config}")
         logging.info(f"BGP Config Keys: {list(bgp_config.keys())}")
         
-        # Check if IPv4 and/or IPv6 BGP is enabled
-        ipv4_enabled = bgp_config.get("ipv4_enabled", True)  # Default to True for backward compatibility
-        ipv6_enabled = bgp_config.get("ipv6_enabled", False)
+        # Check if this is a partial apply (only selected address families)
+        apply_address_families = bgp_config.get("_apply_address_families", [])
+        is_partial_apply = bool(apply_address_families)
+        
+        if is_partial_apply:
+            logging.info(f"[BGP CONFIGURE] Partial apply detected for address families: {apply_address_families}")
+            # Get existing BGP config to preserve unselected families
+            existing_device = device_db.get_device(device_id)
+            existing_bgp_config = existing_device.get("bgp_config", {}) if existing_device else {}
+            if isinstance(existing_bgp_config, str):
+                import json
+                try:
+                    existing_bgp_config = json.loads(existing_bgp_config)
+                except:
+                    existing_bgp_config = {}
+            
+            # Adjust enabled flags based on selected families
+            if "ipv4" in apply_address_families:
+                ipv4_enabled = bgp_config.get("ipv4_enabled", True)
+            else:
+                # Preserve existing IPv4 enabled state
+                ipv4_enabled = existing_bgp_config.get("ipv4_enabled", False)
+            
+            if "ipv6" in apply_address_families:
+                ipv6_enabled = bgp_config.get("ipv6_enabled", False)
+            else:
+                # Preserve existing IPv6 enabled state
+                ipv6_enabled = existing_bgp_config.get("ipv6_enabled", False)
+        else:
+            # Full apply - use flags from config
+            ipv4_enabled = bgp_config.get("ipv4_enabled", True)  # Default to True for backward compatibility
+            ipv6_enabled = bgp_config.get("ipv6_enabled", False)
         
         logging.info(f"IPv4 BGP enabled: {ipv4_enabled}, IPv6 BGP enabled: {ipv6_enabled}")
         
@@ -4481,130 +4711,134 @@ def configure_bgp():
                 existing_ipv4_neighbor = existing_bgp_config.get("bgp_neighbor_ipv4", "")
                 
                 # Remove IPv4 neighbors from FRR if IPv4 was enabled but now disabled
-                if existing_ipv4_enabled and existing_ipv4_neighbor and not ipv4_enabled:
-                    logging.info(f"[BGP CONFIGURE] IPv4 was enabled but now disabled - removing IPv4 neighbors {existing_ipv4_neighbor}")
-                    try:
-                        # Remove IPv4 neighbors using FRR commands (handle comma-separated list)
-                        container_name = frr_manager._get_container_name(device_id, device_name)
-                        container = frr_manager.client.containers.get(container_name)
-                        
-                        bgp_asn = bgp_config.get("bgp_asn", existing_bgp_config.get("bgp_asn", 65000))
-                        
-                        # Split comma-separated neighbor list
-                        ipv4_neighbors = [n.strip() for n in existing_ipv4_neighbor.split(",") if n.strip()]
-                        
-                        # Build commands to remove all IPv4 neighbors
-                        remove_commands = [
-                            "configure terminal",
-                            f"router bgp {bgp_asn}",
-                            "address-family ipv4 unicast",
-                        ]
-                        
-                        # Deactivate each IPv4 neighbor
-                        for neighbor_ip in ipv4_neighbors:
-                            remove_commands.append(f" no neighbor {neighbor_ip} activate")
-                        
-                        remove_commands.extend([
-                            "exit-address-family",
-                        ])
-                        
-                        # Remove neighbor configuration
-                        for neighbor_ip in ipv4_neighbors:
-                            remove_commands.append(f"no neighbor {neighbor_ip}")
-                        
-                        remove_commands.extend([
-                            "exit",
-                            "exit",
-                            "write"
-                        ])
-                        
-                        # Execute using here document
-                        config_commands = "\n".join(remove_commands)
-                        exec_cmd = f"vtysh << 'EOF'\n{config_commands}\nEOF"
-                        result = container.exec_run(["bash", "-c", exec_cmd])
-                        
-                        if result.exit_code == 0:
-                            logging.info(f"[BGP CONFIGURE] Successfully removed IPv4 neighbors: {ipv4_neighbors}")
-                            # Update BGP status in database to reflect IPv4 removal
-                            try:
-                                device_db.update_device(device_id, {
-                                    'bgp_ipv4_established': False,
-                                    'bgp_ipv4_state': 'Idle',
-                                    'last_bgp_check': datetime.now(timezone.utc).isoformat()
-                                })
-                                logging.info(f"[BGP CONFIGURE] Updated IPv4 BGP status to Idle in database")
-                            except Exception as db_e:
-                                logging.warning(f"[BGP CONFIGURE] Failed to update IPv4 BGP status in database: {db_e}")
-                        else:
-                            output_str = result.output.decode('utf-8') if isinstance(result.output, bytes) else str(result.output)
-                            logging.warning(f"[BGP CONFIGURE] Failed to remove IPv4 neighbors {ipv4_neighbors}: {output_str}")
-                    except Exception as e:
-                        logging.warning(f"[BGP CONFIGURE] Failed to remove IPv4 neighbors: {e}")
+                # Skip removal check during partial apply if IPv4 is not in selected families
+                if not is_partial_apply or "ipv4" in apply_address_families:
+                    if existing_ipv4_enabled and existing_ipv4_neighbor and not ipv4_enabled:
+                        logging.info(f"[BGP CONFIGURE] IPv4 was enabled but now disabled - removing IPv4 neighbors {existing_ipv4_neighbor}")
+                        try:
+                            # Remove IPv4 neighbors using FRR commands (handle comma-separated list)
+                            container_name = frr_manager._get_container_name(device_id, device_name)
+                            container = frr_manager.client.containers.get(container_name)
+                            
+                            bgp_asn = bgp_config.get("bgp_asn", existing_bgp_config.get("bgp_asn", 65000))
+                            
+                            # Split comma-separated neighbor list
+                            ipv4_neighbors = [n.strip() for n in existing_ipv4_neighbor.split(",") if n.strip()]
+                            
+                            # Build commands to remove all IPv4 neighbors
+                            remove_commands = [
+                                "configure terminal",
+                                f"router bgp {bgp_asn}",
+                                "address-family ipv4 unicast",
+                            ]
+                            
+                            # Deactivate each IPv4 neighbor
+                            for neighbor_ip in ipv4_neighbors:
+                                remove_commands.append(f" no neighbor {neighbor_ip} activate")
+                            
+                            remove_commands.extend([
+                                "exit-address-family",
+                            ])
+                            
+                            # Remove neighbor configuration
+                            for neighbor_ip in ipv4_neighbors:
+                                remove_commands.append(f"no neighbor {neighbor_ip}")
+                            
+                            remove_commands.extend([
+                                "exit",
+                                "exit",
+                                "write"
+                            ])
+                            
+                            # Execute using here document
+                            config_commands = "\n".join(remove_commands)
+                            exec_cmd = f"vtysh << 'EOF'\n{config_commands}\nEOF"
+                            result = container.exec_run(["bash", "-c", exec_cmd])
+                            
+                            if result.exit_code == 0:
+                                logging.info(f"[BGP CONFIGURE] Successfully removed IPv4 neighbors: {ipv4_neighbors}")
+                                # Update BGP status in database to reflect IPv4 removal
+                                try:
+                                    device_db.update_device(device_id, {
+                                        'bgp_ipv4_established': False,
+                                        'bgp_ipv4_state': 'Idle',
+                                        'last_bgp_check': datetime.now(timezone.utc).isoformat()
+                                    })
+                                    logging.info(f"[BGP CONFIGURE] Updated IPv4 BGP status to Idle in database")
+                                except Exception as db_e:
+                                    logging.warning(f"[BGP CONFIGURE] Failed to update IPv4 BGP status in database: {db_e}")
+                            else:
+                                output_str = result.output.decode('utf-8') if isinstance(result.output, bytes) else str(result.output)
+                                logging.warning(f"[BGP CONFIGURE] Failed to remove IPv4 neighbors {ipv4_neighbors}: {output_str}")
+                        except Exception as e:
+                            logging.warning(f"[BGP CONFIGURE] Failed to remove IPv4 neighbors: {e}")
                 
                 # Check if IPv6 was previously enabled but now disabled - need to remove IPv6 neighbors
                 existing_ipv6_enabled = existing_bgp_config.get("ipv6_enabled", False)
                 existing_ipv6_neighbor = existing_bgp_config.get("bgp_neighbor_ipv6", "")
                 
                 # Remove IPv6 neighbors from FRR if IPv6 was enabled but now disabled
-                if existing_ipv6_enabled and existing_ipv6_neighbor and not ipv6_enabled:
-                    logging.info(f"[BGP CONFIGURE] IPv6 was enabled but now disabled - removing IPv6 neighbors {existing_ipv6_neighbor}")
-                    try:
-                        # Remove IPv6 neighbors using FRR commands (handle comma-separated list)
-                        container_name = frr_manager._get_container_name(device_id, device_name)
-                        container = frr_manager.client.containers.get(container_name)
-                        
-                        bgp_asn = bgp_config.get("bgp_asn", existing_bgp_config.get("bgp_asn", 65000))
-                        
-                        # Split comma-separated neighbor list
-                        ipv6_neighbors = [n.strip() for n in existing_ipv6_neighbor.split(",") if n.strip()]
-                        
-                        # Build commands to remove all IPv6 neighbors
-                        remove_commands = [
-                            "configure terminal",
-                            f"router bgp {bgp_asn}",
-                            "address-family ipv6 unicast",
-                        ]
-                        
-                        # Deactivate each IPv6 neighbor
-                        for neighbor_ip in ipv6_neighbors:
-                            remove_commands.append(f" no neighbor {neighbor_ip} activate")
-                        
-                        remove_commands.extend([
-                            "exit-address-family",
-                        ])
-                        
-                        # Remove neighbor configuration
-                        for neighbor_ip in ipv6_neighbors:
-                            remove_commands.append(f"no neighbor {neighbor_ip}")
-                        
-                        remove_commands.extend([
-                            "exit",
-                            "exit",
-                            "write"
-                        ])
-                        
-                        # Execute using here document
-                        config_commands = "\n".join(remove_commands)
-                        exec_cmd = f"vtysh << 'EOF'\n{config_commands}\nEOF"
-                        result = container.exec_run(["bash", "-c", exec_cmd])
-                        
-                        if result.exit_code == 0:
-                            logging.info(f"[BGP CONFIGURE] Successfully removed IPv6 neighbors: {ipv6_neighbors}")
-                            # Update BGP status in database to reflect IPv6 removal
-                            try:
-                                device_db.update_device(device_id, {
-                                    'bgp_ipv6_established': False,
-                                    'bgp_ipv6_state': 'Idle',
-                                    'last_bgp_check': datetime.now(timezone.utc).isoformat()
-                                })
-                                logging.info(f"[BGP CONFIGURE] Updated IPv6 BGP status to Idle in database")
-                            except Exception as db_e:
-                                logging.warning(f"[BGP CONFIGURE] Failed to update IPv6 BGP status in database: {db_e}")
-                        else:
-                            output_str = result.output.decode('utf-8') if isinstance(result.output, bytes) else str(result.output)
-                            logging.warning(f"[BGP CONFIGURE] Failed to remove IPv6 neighbors {ipv6_neighbors}: {output_str}")
-                    except Exception as e:
-                        logging.warning(f"[BGP CONFIGURE] Failed to remove IPv6 neighbors: {e}")
+                # Skip removal check during partial apply if IPv6 is not in selected families
+                if not is_partial_apply or "ipv6" in apply_address_families:
+                    if existing_ipv6_enabled and existing_ipv6_neighbor and not ipv6_enabled:
+                        logging.info(f"[BGP CONFIGURE] IPv6 was enabled but now disabled - removing IPv6 neighbors {existing_ipv6_neighbor}")
+                        try:
+                            # Remove IPv6 neighbors using FRR commands (handle comma-separated list)
+                            container_name = frr_manager._get_container_name(device_id, device_name)
+                            container = frr_manager.client.containers.get(container_name)
+                            
+                            bgp_asn = bgp_config.get("bgp_asn", existing_bgp_config.get("bgp_asn", 65000))
+                            
+                            # Split comma-separated neighbor list
+                            ipv6_neighbors = [n.strip() for n in existing_ipv6_neighbor.split(",") if n.strip()]
+                            
+                            # Build commands to remove all IPv6 neighbors
+                            remove_commands = [
+                                "configure terminal",
+                                f"router bgp {bgp_asn}",
+                                "address-family ipv6 unicast",
+                            ]
+                            
+                            # Deactivate each IPv6 neighbor
+                            for neighbor_ip in ipv6_neighbors:
+                                remove_commands.append(f" no neighbor {neighbor_ip} activate")
+                            
+                            remove_commands.extend([
+                                "exit-address-family",
+                            ])
+                            
+                            # Remove neighbor configuration
+                            for neighbor_ip in ipv6_neighbors:
+                                remove_commands.append(f"no neighbor {neighbor_ip}")
+                            
+                            remove_commands.extend([
+                                "exit",
+                                "exit",
+                                "write"
+                            ])
+                            
+                            # Execute using here document
+                            config_commands = "\n".join(remove_commands)
+                            exec_cmd = f"vtysh << 'EOF'\n{config_commands}\nEOF"
+                            result = container.exec_run(["bash", "-c", exec_cmd])
+                            
+                            if result.exit_code == 0:
+                                logging.info(f"[BGP CONFIGURE] Successfully removed IPv6 neighbors: {ipv6_neighbors}")
+                                # Update BGP status in database to reflect IPv6 removal
+                                try:
+                                    device_db.update_device(device_id, {
+                                        'bgp_ipv6_established': False,
+                                        'bgp_ipv6_state': 'Idle',
+                                        'last_bgp_check': datetime.now(timezone.utc).isoformat()
+                                    })
+                                    logging.info(f"[BGP CONFIGURE] Updated IPv6 BGP status to Idle in database")
+                                except Exception as db_e:
+                                    logging.warning(f"[BGP CONFIGURE] Failed to update IPv6 BGP status in database: {db_e}")
+                            else:
+                                output_str = result.output.decode('utf-8') if isinstance(result.output, bytes) else str(result.output)
+                                logging.warning(f"[BGP CONFIGURE] Failed to remove IPv6 neighbors {ipv6_neighbors}: {output_str}")
+                        except Exception as e:
+                            logging.warning(f"[BGP CONFIGURE] Failed to remove IPv6 neighbors: {e}")
                 
                 # DIFF LOGIC: Compare old vs new neighbors and handle changes
                 # This handles cases where individual neighbors are edited (IP changed, removed, etc.)
@@ -4785,77 +5019,120 @@ def configure_bgp():
                     update_data["protocols"] = existing_protocols
                     logging.info(f"[BGP CONFIGURE] Adding BGP protocol to device {device_name}")
                 
-                # Update BGP configuration
-                update_data["bgp_config"] = bgp_config
-                logging.info(f"[BGP CONFIGURE] Updating BGP configuration for device {device_name}")
+                # Merge BGP configuration to preserve unselected address families during partial apply
+                if is_partial_apply:
+                    # Merge with existing config to preserve unselected families
+                    merged_bgp_config = existing_bgp_config.copy()
+                    merged_bgp_config.update(bgp_config)
+                    
+                    # Preserve enabled flags for unselected address families
+                    if "ipv4" not in apply_address_families:
+                        merged_bgp_config["ipv4_enabled"] = existing_bgp_config.get("ipv4_enabled", False)
+                        # Also preserve IPv4 neighbor config if not being updated
+                        if "bgp_neighbor_ipv4" not in bgp_config:
+                            merged_bgp_config["bgp_neighbor_ipv4"] = existing_bgp_config.get("bgp_neighbor_ipv4", "")
+                        if "bgp_update_source_ipv4" not in bgp_config:
+                            merged_bgp_config["bgp_update_source_ipv4"] = existing_bgp_config.get("bgp_update_source_ipv4", "")
+                    
+                    if "ipv6" not in apply_address_families:
+                        merged_bgp_config["ipv6_enabled"] = existing_bgp_config.get("ipv6_enabled", False)
+                        # Also preserve IPv6 neighbor config if not being updated
+                        if "bgp_neighbor_ipv6" not in bgp_config:
+                            merged_bgp_config["bgp_neighbor_ipv6"] = existing_bgp_config.get("bgp_neighbor_ipv6", "")
+                        if "bgp_update_source_ipv6" not in bgp_config:
+                            merged_bgp_config["bgp_update_source_ipv6"] = existing_bgp_config.get("bgp_update_source_ipv6", "")
+                    
+                    # Remove the _apply_address_families flag before saving
+                    merged_bgp_config.pop("_apply_address_families", None)
+                    
+                    update_data["bgp_config"] = merged_bgp_config
+                    logging.info(f"[BGP CONFIGURE] Updating BGP configuration for device {device_name} (partial apply for {apply_address_families})")
+                else:
+                    # Full apply - use config as-is
+                    bgp_config_to_save = bgp_config.copy()
+                    bgp_config_to_save.pop("_apply_address_families", None)
+                    update_data["bgp_config"] = bgp_config_to_save
+                    logging.info(f"[BGP CONFIGURE] Updating BGP configuration for device {device_name}")
                 
                 if update_data:
                     device_db.update_device(device_id, update_data)
         except Exception as e:
             logging.warning(f"[BGP CONFIGURE] Error checking/adding device to database: {e}")
         
+        # First, configure interface IP addresses and BGP using configure_bgp_for_device
+        # This function configures both the interface IPs and BGP neighbors properly
+        logging.info(f"[BGP CONFIGURE] Configuring interface and BGP for device {device_name}")
+        
+        # Get IP addresses with masks for configure_bgp_for_device
+        ipv4_full = f"{ipv4}/{data.get('ipv4_mask', '24')}" if ipv4 else None
+        ipv6_full = f"{ipv6}/{data.get('ipv6_mask', '64')}" if ipv6 else None
+        
+        from utils.bgp import configure_bgp_for_device
+        bgp_success = configure_bgp_for_device(device_id, bgp_config, ipv4_full, ipv6_full, device_name)
+        
+        if not bgp_success:
+            logging.error(f"[BGP CONFIGURE] Failed to configure BGP for device {device_name}")
+            return jsonify({"error": "Failed to configure BGP"}), 500
+        
+        logging.info(f"[BGP CONFIGURE] Successfully configured interface and BGP for device {device_name}")
+        
+        # Now handle additional neighbor configuration if needed (for comma-separated neighbor lists)
+        # configure_bgp_for_device handles the primary neighbors, but we may need to add additional ones
         success = True
         
-        # Configure IPv4 BGP if enabled - handle each neighbor individually
+        # Configure additional IPv4 BGP neighbors if there are multiple neighbors (comma-separated)
         if ipv4_enabled and bgp_config.get("bgp_neighbor_ipv4"):
-            logging.info(f"Configuring IPv4 BGP for {device_name}")
-            # Parse comma-separated neighbor list
             ipv4_neighbors_str = bgp_config.get("bgp_neighbor_ipv4", "")
             ipv4_neighbors_list = [n.strip() for n in ipv4_neighbors_str.split(",") if n.strip()] if ipv4_neighbors_str else []
             
-            # Configure each IPv4 neighbor individually
-            for neighbor_ip in ipv4_neighbors_list:
-                # Use IPv4-specific remote ASN if available, otherwise fall back to general remote ASN
-                neighbor_as_ipv4 = bgp_config.get("bgp_remote_asn_ipv4") or bgp_config.get("bgp_neighbor_asn") or bgp_config.get("bgp_remote_asn", "")
-                neighbor_config_ipv4 = {
-                    "neighbor_ip": neighbor_ip,
-                    "neighbor_as": neighbor_as_ipv4,
-                    "local_as": bgp_config.get("bgp_asn", 65001),
-                    "update_source": bgp_config.get("bgp_update_source_ipv4", ipv4),
-                    "keepalive": bgp_config.get("bgp_keepalive", "30"),
-                    "hold_time": bgp_config.get("bgp_hold_time", "90"),
-                    "protocol": "ipv4"
-                }
-                logging.info(f"IPv4 Neighbor Config for {neighbor_ip}: {neighbor_config_ipv4}")
+            # If there are multiple neighbors, configure additional ones beyond the first
+            # configure_bgp_for_device already configured the first neighbor, so we only need to add extras
+            if len(ipv4_neighbors_list) > 1:
+                logging.info(f"[BGP CONFIGURE] Configuring additional {len(ipv4_neighbors_list) - 1} IPv4 BGP neighbors")
+                from utils.frr_docker import configure_bgp_neighbor
                 
-                neighbor_success = configure_bgp_neighbor(device_id, neighbor_config_ipv4, device_name)
-                if not neighbor_success:
-                    success = False
-                    logging.error(f"Failed to configure IPv4 BGP neighbor {neighbor_ip} for {device_name}")
-                else:
-                    logging.info(f"Successfully configured IPv4 BGP neighbor {neighbor_ip} for {device_name}")
+                for neighbor_ip in ipv4_neighbors_list[1:]:  # Skip first, already configured
+                    neighbor_config_ipv4 = {
+                        "neighbor_ip": neighbor_ip,
+                        "neighbor_as": bgp_config.get("bgp_neighbor_asn") or bgp_config.get("bgp_remote_asn", ""),
+                        "local_as": bgp_config.get("bgp_asn", 65001),
+                        "update_source": bgp_config.get("bgp_update_source_ipv4", ipv4),
+                        "keepalive": bgp_config.get("bgp_keepalive", "30"),
+                        "hold_time": bgp_config.get("bgp_hold_time", "90"),
+                        "protocol": "ipv4"
+                    }
+                    neighbor_success = configure_bgp_neighbor(device_id, neighbor_config_ipv4, device_name)
+                    if not neighbor_success:
+                        success = False
+                        logging.error(f"[BGP CONFIGURE] Failed to configure additional IPv4 BGP neighbor {neighbor_ip}")
         
-        # Configure IPv6 BGP if enabled - handle each neighbor individually
+        # Configure additional IPv6 BGP neighbors if there are multiple neighbors (comma-separated)
         if ipv6_enabled and bgp_config.get("bgp_neighbor_ipv6"):
-            logging.info(f"Configuring IPv6 BGP for {device_name}")
-            # Parse comma-separated neighbor list
             ipv6_neighbors_str = bgp_config.get("bgp_neighbor_ipv6", "")
             ipv6_neighbors_list = [n.strip() for n in ipv6_neighbors_str.split(",") if n.strip()] if ipv6_neighbors_str else []
             
-            # Configure each IPv6 neighbor individually
-            for neighbor_ip in ipv6_neighbors_list:
-                # Use IPv6-specific remote ASN if available, otherwise fall back to general remote ASN
-                neighbor_as_ipv6 = bgp_config.get("bgp_remote_asn_ipv6") or bgp_config.get("bgp_neighbor_asn") or bgp_config.get("bgp_remote_asn", "")
-                neighbor_config_ipv6 = {
-                    "neighbor_ip": neighbor_ip,
-                    "neighbor_as": neighbor_as_ipv6,
-                    "local_as": bgp_config.get("bgp_asn", 65001),
-                    "update_source": bgp_config.get("bgp_update_source_ipv6", ipv6),
-                    "keepalive": bgp_config.get("bgp_keepalive", "30"),
-                    "hold_time": bgp_config.get("bgp_hold_time", "90"),
-                    "protocol": "ipv6"
-                }
-                logging.info(f"IPv6 Neighbor Config for {neighbor_ip}: {neighbor_config_ipv6}")
+            # If there are multiple neighbors, configure additional ones beyond the first
+            if len(ipv6_neighbors_list) > 1:
+                logging.info(f"[BGP CONFIGURE] Configuring additional {len(ipv6_neighbors_list) - 1} IPv6 BGP neighbors")
+                from utils.frr_docker import configure_bgp_neighbor
                 
-                neighbor_success = configure_bgp_neighbor(device_id, neighbor_config_ipv6, device_name)
-                if not neighbor_success:
-                    success = False
-                    logging.error(f"Failed to configure IPv6 BGP neighbor {neighbor_ip} for {device_name}")
-                else:
-                    logging.info(f"Successfully configured IPv6 BGP neighbor {neighbor_ip} for {device_name}")
+                for neighbor_ip in ipv6_neighbors_list[1:]:  # Skip first, already configured
+                    neighbor_config_ipv6 = {
+                        "neighbor_ip": neighbor_ip,
+                        "neighbor_as": bgp_config.get("bgp_neighbor_asn") or bgp_config.get("bgp_remote_asn", ""),
+                        "local_as": bgp_config.get("bgp_asn", 65001),
+                        "update_source": bgp_config.get("bgp_update_source_ipv6", ipv6),
+                        "keepalive": bgp_config.get("bgp_keepalive", "30"),
+                        "hold_time": bgp_config.get("bgp_hold_time", "90"),
+                        "protocol": "ipv6"
+                    }
+                    neighbor_success = configure_bgp_neighbor(device_id, neighbor_config_ipv6, device_name)
+                    if not neighbor_success:
+                        success = False
+                        logging.error(f"[BGP CONFIGURE] Failed to configure additional IPv6 BGP neighbor {neighbor_ip}")
         
         if not success:
-            return jsonify({"error": "Failed to configure BGP neighbor(s)"}), 500
+            logging.warning(f"[BGP CONFIGURE] Some additional BGP neighbors failed to configure, but primary configuration succeeded")
         
         logging.info(f"[BGP CONFIGURE] Successfully configured BGP for {device_name} ({device_id})")
         
@@ -5315,7 +5592,11 @@ def start_bgp():
                         ipv6 = ipv6_match.group(1)
                 
                 # Reapply BGP configuration
-                success = frr_manager._configure_bgp_in_container(container_name, bgp_config, ipv4, ipv6)
+                from utils.bgp import configure_bgp_for_device
+                # Extract device_id from container_name
+                device_id = container_name.replace(f"{frr_manager.container_prefix}-", "")
+                device_name_from_container = container_name.split('-', 3)[-1] if '-' in container_name else None
+                success = configure_bgp_for_device(device_id, bgp_config, ipv4, ipv6, device_name_from_container)
                 if success:
                     logging.info(f"[BGP START] Successfully reapplied complete BGP configuration")
                 else:

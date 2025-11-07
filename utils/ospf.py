@@ -5,6 +5,62 @@ from typing import Dict, Any, Optional
 
 OSPF_INSTANCES = {}
 
+def normalize_ospf_area_id(area_id: str) -> str:
+    """
+    Normalize OSPF area ID to dotted decimal format for comparison.
+    Accepts both decimal (e.g., '0', '1', '100') and dotted decimal (e.g., '0.0.0.0', '0.0.0.1') formats.
+    Returns normalized dotted decimal format.
+    """
+    if not area_id:
+        return "0.0.0.0"
+    
+    area_id = str(area_id).strip()
+    
+    # If already in dotted decimal format, return as is
+    if '.' in area_id:
+        try:
+            # Validate it's a valid dotted decimal
+            parts = area_id.split('.')
+            if len(parts) == 4:
+                # Validate all parts are integers
+                for part in parts:
+                    int(part)
+                return area_id
+        except (ValueError, AttributeError):
+            pass
+    
+    # Try to parse as decimal number
+    try:
+        area_num = int(area_id)
+        # Convert decimal to dotted decimal format
+        # For values < 256, it's 0.0.0.N
+        # For larger values, convert properly
+        if area_num < 256:
+            return f"0.0.0.{area_num}"
+        elif area_num < 65536:
+            return f"0.0.{area_num >> 8}.{area_num & 0xFF}"
+        elif area_num < 16777216:
+            return f"0.{(area_num >> 16) & 0xFF}.{(area_num >> 8) & 0xFF}.{area_num & 0xFF}"
+        else:
+            return f"{(area_num >> 24) & 0xFF}.{(area_num >> 16) & 0xFF}.{(area_num >> 8) & 0xFF}.{area_num & 0xFF}"
+    except (ValueError, TypeError):
+        # If parsing fails, return original (might be invalid, but we'll let vtysh handle it)
+        return area_id
+
+def ospf_area_ids_equal(area1: str, area2: str) -> bool:
+    """
+    Compare two OSPF area IDs, handling both decimal and dotted decimal formats.
+    Returns True if they represent the same area, False otherwise.
+    """
+    if not area1 or not area2:
+        return area1 == area2
+    
+    # Normalize both to dotted decimal for comparison
+    normalized1 = normalize_ospf_area_id(area1)
+    normalized2 = normalize_ospf_area_id(area2)
+    
+    return normalized1 == normalized2
+
 def safe_vtysh_command(cmd_list, timeout=10, device_id=None, device_name=None):
     """Safely execute vtysh commands with proper error handling."""
     try:
@@ -27,15 +83,8 @@ def safe_vtysh_command(cmd_list, timeout=10, device_id=None, device_name=None):
         logging.error(f"[OSPF VTYSH] vtysh command not found - FRR not installed")
         return False, "FRR not installed"
 
-def configure_ospf_neighbor(device_id: str, ospf_config: Dict[str, Any], device_name: str = None, old_ospf_config: Dict[str, Any] = None) -> bool:
-    """Configure OSPF for a device in FRR container.
-    
-    Args:
-        device_id: Device ID
-        ospf_config: New OSPF configuration
-        device_name: Device name (optional)
-        old_ospf_config: Old OSPF configuration (optional, for area ID change detection)
-    """
+def configure_ospf_neighbor(device_id: str, ospf_config: Dict[str, Any], device_name: str = None) -> bool:
+    """Configure OSPF for a device in FRR container."""
     try:
         from utils.frr_docker import FRRDockerManager
         
@@ -45,185 +94,141 @@ def configure_ospf_neighbor(device_id: str, ospf_config: Dict[str, Any], device_
         container_name = frr_manager._get_container_name(device_id, device_name)
         container = frr_manager.client.containers.get(container_name)
         
+        # Wait for container to be ready and OSPF daemons to start
+        # Optimized to match BGP performance: fewer retries, no double-check, direct exec_run
+        import time
+        max_retries = 5  # Reduced from 20 to match BGP (faster for ready containers)
+        retry_delay = 2  # Increased from 1 to 2 to match BGP (fewer retries needed)
+        ospfd_ready = False
+        
+        def exec_run_with_timeout(cmd, timeout_sec=3):
+            """Execute container.exec_run with a timeout using threading.
+            Reduced timeout from 5s to 3s for faster checks (matching BGP speed)."""
+            result = [None]
+            exception = [None]
+            
+            def run_exec():
+                try:
+                    result[0] = container.exec_run(cmd)
+                except Exception as e:
+                    exception[0] = e
+            
+            exec_thread = threading.Thread(target=run_exec, daemon=True)
+            exec_thread.start()
+            exec_thread.join(timeout=timeout_sec)
+            
+            if exec_thread.is_alive():
+                # Thread is still running - timeout occurred
+                logging.warning(f"[OSPF CONFIGURE] exec_run timeout after {timeout_sec}s - command may not have completed")
+                return None
+            elif exception[0]:
+                raise exception[0]
+            else:
+                return result[0]
+        
+        for attempt in range(max_retries):
+            try:
+                # Check if ospfd is ready by running an OSPF-specific command (like BGP does)
+                # This ensures ospfd is actually ready to accept configuration commands
+                check_result = exec_run_with_timeout("vtysh -c 'show ip ospf'", timeout_sec=3)
+                check_output = check_result.output.decode('utf-8') if isinstance(check_result.output, bytes) else str(check_result.output) if check_result else ""
+                
+                if check_result and (check_result.exit_code == 0 or "ospfd is not running" not in check_output):
+                    ospfd_ready = True
+                    logging.info(f"[OSPF CONFIGURE] Container and FRR daemons ready for {device_name} (attempt {attempt + 1})")
+                    break
+                else:
+                    # OSPF daemon not ready yet or timeout
+                    logging.debug(f"[OSPF CONFIGURE] OSPF daemon not ready yet (attempt {attempt + 1}/{max_retries})")
+            except Exception as e:
+                # Container exec failed
+                logging.debug(f"[OSPF CONFIGURE] Container exec failed (attempt {attempt + 1}/{max_retries}): {e}")
+            
+            if attempt < max_retries - 1:
+                time.sleep(retry_delay)
+            else:
+                if not ospfd_ready:
+                    logging.warning(f"[OSPF CONFIGURE] OSPF daemon not ready after {max_retries} attempts for {device_name}, proceeding anyway (may fail)")
+        
         # Extract OSPF configuration
-        # Support both old format (area_id) and new format (ipv4_area_id, ipv6_area_id)
-        area_id = ospf_config.get("area_id", "0.0.0.0")  # Legacy support
-        ipv4_area_id = ospf_config.get("ipv4_area_id", area_id)  # New format, fallback to area_id
-        ipv6_area_id = ospf_config.get("ipv6_area_id", area_id)  # New format, fallback to area_id
-        router_id = ospf_config.get("router_id", "")
+        # Support separate area IDs for IPv4 and IPv6, with backward compatibility
+        area_id = ospf_config.get("area_id", "0.0.0.0")  # Default/backward compatibility
+        area_id_ipv4 = ospf_config.get("area_id_ipv4") or ospf_config.get("area_id") or "0.0.0.0"
+        area_id_ipv6 = ospf_config.get("area_id_ipv6") or ospf_config.get("area_id") or "0.0.0.0"
+        
+        logging.info(f"[OSPF CONFIGURE] Area IDs - IPv4: {area_id_ipv4}, IPv6: {area_id_ipv6}, Base: {area_id}")
+        router_id_from_config = ospf_config.get("router_id", "")
         hello_interval = ospf_config.get("hello_interval", "10")
         dead_interval = ospf_config.get("dead_interval", "40")
-        graceful_restart = ospf_config.get("graceful_restart", False)
-        interface = ospf_config.get("interface", "eth0")
-        ipv4_enabled = ospf_config.get("ipv4_enabled", True)
-        ipv6_enabled = ospf_config.get("ipv6_enabled", False)
+        # Support separate graceful restart for IPv4 and IPv6, with backward compatibility
+        # CRITICAL: Check if keys exist, not just truthiness, to properly handle False values
+        graceful_restart = ospf_config.get("graceful_restart", False)  # For backward compatibility
+        # For IPv4: use graceful_restart_ipv4 if it exists, otherwise fall back to graceful_restart
+        if "graceful_restart_ipv4" in ospf_config:
+            graceful_restart_ipv4 = ospf_config.get("graceful_restart_ipv4", False)
+        else:
+            graceful_restart_ipv4 = graceful_restart  # Fall back to generic graceful_restart
+        # For IPv6: use graceful_restart_ipv6 if it exists, otherwise fall back to graceful_restart
+        if "graceful_restart_ipv6" in ospf_config:
+            graceful_restart_ipv6 = ospf_config.get("graceful_restart_ipv6", False)
+        else:
+            graceful_restart_ipv6 = graceful_restart  # Fall back to generic graceful_restart
         
         # Get device IP addresses from database to calculate correct network
         from utils.device_database import DeviceDatabase
         device_db = DeviceDatabase()
         device_data = device_db.get_device(device_id)
         
-        logging.info(f"[OSPF CONFIGURE] Database lookup for device {device_id}: {device_data is not None}")
-        if device_data:
-            logging.info(f"[OSPF CONFIGURE] Device data: ipv4_address={device_data.get('ipv4_address')}, ipv4_mask={device_data.get('ipv4_mask')}")
-        
-        # Get old area_id and enabled flags from old_ospf_config (if provided) or from database
-        # Support both old format (area_id) and new format (ipv4_area_id, ipv6_area_id)
-        old_area_id = None  # Legacy support
-        old_ipv4_area_id = None
-        old_ipv6_area_id = None
-        old_ipv4_enabled = False
-        old_ipv6_enabled = False
-        
-        # First, try to read the actual FRR configuration to see what areas are currently configured
-        frr_current_ipv4_area_id = None
-        frr_current_ipv6_area_id = None
-        frr_raw_ipv4_area_format = None  # Store the actual format used in FRR (e.g., "0" vs "0.0.0.0")
-        frr_raw_ipv6_area_format = None
-        try:
-            import re
-            # Query FRR for current IPv4 OSPF area configuration
-            result_ipv4 = container.exec_run("vtysh -c 'show ip ospf'")
-            if result_ipv4.exit_code == 0:
-                output_ipv4 = result_ipv4.output.decode()
-                # Look for "Area ID: X.X.X.X" in the output
-                area_match = re.search(r'Area ID:\s*([0-9.]+)', output_ipv4)
-                if area_match:
-                    frr_current_ipv4_area_id = area_match.group(1)
-                    logging.info(f"[OSPF CONFIGURE] Found current IPv4 area ID in FRR: {frr_current_ipv4_area_id}")
-            
-            # Query FRR for current IPv6 OSPF area configuration
-            result_ipv6 = container.exec_run("vtysh -c 'show ipv6 ospf6'")
-            if result_ipv6.exit_code == 0:
-                output_ipv6 = result_ipv6.output.decode()
-                # Look for "Area X.X.X.X" in the output
-                area_match = re.search(r'Area\s+([0-9.]+)', output_ipv6)
-                if area_match:
-                    frr_current_ipv6_area_id = area_match.group(1)
-                    logging.info(f"[OSPF CONFIGURE] Found current IPv6 area ID in FRR: {frr_current_ipv6_area_id}")
-            
-            # Try to find area from "network X.X.X.X/X area Y" in running config (for IPv4)
-            # and "ipv6 ospf6 area Y" in running config (for IPv6)
-            result_config = container.exec_run("vtysh -c 'show running-config'")
-            if result_config.exit_code == 0:
-                config_output = result_config.output.decode()
-                # Look for "network X.X.X.X/X area Y" pattern - this gives us the exact format FRR uses for IPv4
-                network_area_match = re.search(r'network\s+[\d./]+\s+area\s+([0-9.]+)', config_output)
-                if network_area_match:
-                    frr_raw_ipv4_area_format = network_area_match.group(1)  # Store the exact format
-                    if not frr_current_ipv4_area_id:
-                        frr_current_ipv4_area_id = network_area_match.group(1)
-                    logging.info(f"[OSPF CONFIGURE] Found current IPv4 area ID in FRR running-config: {frr_raw_ipv4_area_format} (raw format)")
-                
-                # Look for "ipv6 ospf6 area Y" pattern - this gives us the exact format FRR uses for IPv6
-                ospf6_area_match = re.search(r'ipv6\s+ospf6\s+area\s+([0-9.]+)', config_output)
-                if ospf6_area_match:
-                    frr_raw_ipv6_area_format = ospf6_area_match.group(1)  # Store the exact format
-                    if not frr_current_ipv6_area_id:
-                        frr_current_ipv6_area_id = ospf6_area_match.group(1)
-                    logging.info(f"[OSPF CONFIGURE] Found current IPv6 area ID in FRR running-config: {frr_raw_ipv6_area_format} (raw format)")
-        except Exception as e:
-            logging.warning(f"[OSPF CONFIGURE] Failed to read FRR current area configuration: {e}")
-        
-        # Prefer FRR's actual configuration, then old_ospf_config parameter, then database lookup
-        if frr_current_ipv4_area_id:
-            # Use FRR's actual IPv4 area ID as the old IPv4 area ID
-            old_ipv4_area_id = frr_current_ipv4_area_id
-            logging.info(f"[OSPF CONFIGURE] Using FRR's actual IPv4 area ID as old_ipv4_area_id: {old_ipv4_area_id}")
-        if frr_current_ipv6_area_id:
-            # Use FRR's actual IPv6 area ID as the old IPv6 area ID
-            old_ipv6_area_id = frr_current_ipv6_area_id
-            logging.info(f"[OSPF CONFIGURE] Using FRR's actual IPv6 area ID as old_ipv6_area_id: {old_ipv6_area_id}")
-        
-        # Get enabled flags from old_ospf_config or database (only if not already set from FRR)
-        if (frr_current_ipv4_area_id or frr_current_ipv6_area_id) and old_ospf_config and isinstance(old_ospf_config, dict) and len(old_ospf_config) > 0:
-            old_ipv4_enabled = old_ospf_config.get("ipv4_enabled", True)
-            old_ipv6_enabled = old_ospf_config.get("ipv6_enabled", False)
-        elif (frr_current_ipv4_area_id or frr_current_ipv6_area_id) and device_data:
-                existing_ospf_config = device_data.get("ospf_config", {})
-                if isinstance(existing_ospf_config, str):
-                    try:
-                        import json
-                        existing_ospf_config = json.loads(existing_ospf_config)
-                    except:
-                        existing_ospf_config = {}
-                if existing_ospf_config and isinstance(existing_ospf_config, dict):
-                    old_ipv4_enabled = existing_ospf_config.get("ipv4_enabled", True)
-                    old_ipv6_enabled = existing_ospf_config.get("ipv6_enabled", False)
-        elif old_ospf_config and isinstance(old_ospf_config, dict) and len(old_ospf_config) > 0:
-            # Fallback to old_ospf_config parameter if FRR query failed
-            old_area_id = old_ospf_config.get("area_id")  # Legacy support
-            # Support both old format (area_id) and new format (ipv4_area_id, ipv6_area_id)
-            old_ipv4_area_id = old_ospf_config.get("ipv4_area_id", old_area_id)
-            old_ipv6_area_id = old_ospf_config.get("ipv6_area_id", old_area_id)
-            old_ipv4_enabled = old_ospf_config.get("ipv4_enabled", True)
-            old_ipv6_enabled = old_ospf_config.get("ipv6_enabled", False)
-            logging.info(f"[OSPF CONFIGURE] Using old_ospf_config - area_id: {old_area_id}, ipv4_area_id: {old_ipv4_area_id}, ipv6_area_id: {old_ipv6_area_id}")
-        elif device_data:
-            # Fallback to database lookup if old_ospf_config not provided
-            existing_ospf_config = device_data.get("ospf_config", {})
-            if isinstance(existing_ospf_config, str):
-                try:
-                    import json
-                    existing_ospf_config = json.loads(existing_ospf_config)
-                except:
-                    existing_ospf_config = {}
-            if existing_ospf_config and isinstance(existing_ospf_config, dict):
-                old_area_id = existing_ospf_config.get("area_id")  # Legacy support
-                # Support both old format (area_id) and new format (ipv4_area_id, ipv6_area_id)
-                old_ipv4_area_id = existing_ospf_config.get("ipv4_area_id", old_area_id)
-                old_ipv6_area_id = existing_ospf_config.get("ipv6_area_id", old_area_id)
-                old_ipv4_enabled = existing_ospf_config.get("ipv4_enabled", True)
-                old_ipv6_enabled = existing_ospf_config.get("ipv6_enabled", False)
-                logging.info(f"[OSPF CONFIGURE] Using database - area_id: {old_area_id}, ipv4_area_id: {old_ipv4_area_id}, ipv6_area_id: {old_ipv6_area_id}")
-        
-        # Normalize area IDs for comparison (handle 0 vs 0.0.0.0, etc.)
-        def normalize_area_id(area):
-            """Normalize OSPF area ID to standard format."""
-            if not area:
-                return None
-            # Handle cases like "0" -> "0.0.0.0", "1" -> "0.0.0.1", etc.
-            parts = area.split('.')
-            if len(parts) == 1:
-                # Single number like "0" or "1"
-                try:
-                    num = int(parts[0])
-                    return f"0.0.0.{num}"
-                except:
-                    return area
-            elif len(parts) == 2:
-                # Two parts like "0.1"
-                try:
-                    return f"0.0.{'.'.join(parts)}"
-                except:
-                    return area
-            elif len(parts) == 3:
-                # Three parts like "0.0.1"
-                try:
-                    return f"0.{'.'.join(parts)}"
-                except:
-                    return area
+        # Default to True for ipv4_enabled if IPv4 address exists, otherwise use config value
+        ipv4_enabled = ospf_config.get("ipv4_enabled")
+        if ipv4_enabled is None:
+            # If not explicitly set, check if device has IPv4 address
+            if device_data and device_data.get("ipv4_address"):
+                ipv4_enabled = True
             else:
-                return area
+                ipv4_enabled = False
+        # Default to False for ipv6_enabled if IPv6 address exists, otherwise use config value
+        ipv6_enabled = ospf_config.get("ipv6_enabled")
+        if ipv6_enabled is None:
+            # If not explicitly set, check if device has IPv6 address
+            if device_data and device_data.get("ipv6_address"):
+                ipv6_enabled = True
+            else:
+                ipv6_enabled = False
         
-        # Normalize area IDs for IPv4 and IPv6 separately
-        normalized_old_ipv4_area = normalize_area_id(old_ipv4_area_id) if old_ipv4_area_id else normalize_area_id(old_area_id) if old_area_id else None
-        normalized_old_ipv6_area = normalize_area_id(old_ipv6_area_id) if old_ipv6_area_id else normalize_area_id(old_area_id) if old_area_id else None
-        normalized_new_ipv4_area = normalize_area_id(ipv4_area_id) if ipv4_area_id else None
-        normalized_new_ipv6_area = normalize_area_id(ipv6_area_id) if ipv6_area_id else None
+        logging.info(f"[OSPF CONFIGURE] Address families - IPv4 enabled: {ipv4_enabled}, IPv6 enabled: {ipv6_enabled}")
         
-        logging.info(f"[OSPF CONFIGURE] IPv4 Area ID comparison - Old (normalized): {normalized_old_ipv4_area}, New (normalized): {normalized_new_ipv4_area}")
-        logging.info(f"[OSPF CONFIGURE] IPv6 Area ID comparison - Old (normalized): {normalized_old_ipv6_area}, New (normalized): {normalized_new_ipv6_area}")
+        # Determine interface name (with VLAN if applicable) - prioritize database over config
+        interface = ospf_config.get("interface", "")
+        if not interface and device_data:
+            interface = device_data.get("interface", "")
+        vlan = device_data.get("vlan", "0") if device_data else "0"
+        interface = f"vlan{vlan}" if (vlan and vlan != "0") else (interface if interface else "eth0")
         
-        # Check if IPv4 area changed
-        ipv4_area_changed = normalized_old_ipv4_area and normalized_old_ipv4_area != normalized_new_ipv4_area
-        # Check if IPv6 area changed
-        ipv6_area_changed = normalized_old_ipv6_area and normalized_old_ipv6_area != normalized_new_ipv6_area
+        # Get router-id (must be loopback IPv4)
+        # First, try to get loopback IPv4 from database
+        loopback_ipv4 = None
+        if device_data:
+            loopback_ipv4 = device_data.get('loopback_ipv4')
+            if loopback_ipv4 and loopback_ipv4.strip():
+                loopback_ipv4 = loopback_ipv4.strip().split('/')[0]
         
-        if ipv4_area_changed:
-            logging.info(f"[OSPF CONFIGURE] IPv4 Area ID changed from {normalized_old_ipv4_area} to {normalized_new_ipv4_area}, will remove old IPv4 area configuration")
-        if ipv6_area_changed:
-            logging.info(f"[OSPF CONFIGURE] IPv6 Area ID changed from {normalized_old_ipv6_area} to {normalized_new_ipv6_area}, will remove old IPv6 area configuration")
+        # Router ID must be loopback IPv4
+        if loopback_ipv4:
+            router_id = loopback_ipv4
+            logging.info(f"[OSPF CONFIGURE] Using loopback IPv4 {router_id} as router-id")
+        elif router_id_from_config:
+            # Use router_id from config if provided
+            router_id = router_id_from_config
+            logging.info(f"[OSPF CONFIGURE] Using router-id from config: {router_id}")
+        else:
+            # Fallback to interface IPv4 if loopback not available
+            if device_data and device_data.get("ipv4_address"):
+                router_id = device_data["ipv4_address"].split('/')[0]
+                logging.warning(f"[OSPF CONFIGURE] Loopback IPv4 not found, using interface IPv4 {router_id} as router-id (fallback)")
+            else:
+                router_id = "192.168.0.2"
+                logging.warning(f"[OSPF CONFIGURE] No IPv4 available, using default router-id {router_id}")
         
         # Calculate IPv4 network from device IP
         ipv4_network = None
@@ -234,7 +239,6 @@ def configure_ospf_neighbor(device_id: str, ospf_config: Dict[str, Any], device_
                 ipv4_mask = device_data.get("ipv4_mask", "24")
                 network = ipaddress.IPv4Network(f"{ipv4_addr}/{ipv4_mask}", strict=False)
                 ipv4_network = str(network)
-                logging.info(f"[OSPF CONFIGURE] Calculated IPv4 network: {ipv4_network}")
             except Exception as e:
                 logging.warning(f"[OSPF CONFIGURE] Failed to calculate IPv4 network: {e}")
                 ipv4_network = "192.168.0.0/24"  # Fallback to default
@@ -245,71 +249,140 @@ def configure_ospf_neighbor(device_id: str, ospf_config: Dict[str, Any], device_
         # Build OSPF configuration commands
         vtysh_commands = ["configure terminal"]
         
-        # Remove old area configuration if area_id changed (separately for IPv4 and IPv6)
-        # Use the exact format from FRR if available (e.g., "0" instead of "0.0.0.0")
-        ipv4_area_for_removal = frr_raw_ipv4_area_format if (frr_raw_ipv4_area_format and ipv4_area_changed) else (normalized_old_ipv4_area if normalized_old_ipv4_area else old_ipv4_area_id)
-        ipv6_area_for_removal = frr_raw_ipv6_area_format if (frr_raw_ipv6_area_format and ipv6_area_changed) else (normalized_old_ipv6_area if normalized_old_ipv6_area else old_ipv6_area_id)
-        
-        # Remove old IPv4 area configuration if IPv4 area changed
-        if ipv4_area_changed and old_ipv4_enabled and ipv4_network and ipv4_area_for_removal:
-            logging.info(f"[OSPF CONFIGURE] Removing old IPv4 area {ipv4_area_for_removal} configuration")
-            vtysh_commands.extend([
-                "router ospf",
-                f" no network {ipv4_network} area {ipv4_area_for_removal}",
-                "exit"
-            ])
-            logging.info(f"[OSPF CONFIGURE] Removing old IPv4 network {ipv4_network} from area {ipv4_area_for_removal}")
-        
-        # Remove old IPv6 area configuration if IPv6 area changed
-        if ipv6_area_changed and old_ipv6_enabled and ipv6_area_for_removal:
-            logging.info(f"[OSPF CONFIGURE] Removing old IPv6 area {ipv6_area_for_removal} configuration")
-        
-        # Remove old interface area configuration (check what was enabled in old config)
-        if (ipv4_area_changed and old_ipv4_enabled) or (ipv6_area_changed and old_ipv6_enabled):
-            vtysh_commands.extend([
-                f"interface {interface}",
-            ])
-            if ipv4_area_changed and old_ipv4_enabled and ipv4_area_for_removal:
-                vtysh_commands.append(f" no ip ospf area {ipv4_area_for_removal}")
-                logging.info(f"[OSPF CONFIGURE] Removing old IPv4 interface area {ipv4_area_for_removal}")
-            if ipv6_area_changed and old_ipv6_enabled and ipv6_area_for_removal:
-                vtysh_commands.append(f" no ipv6 ospf6 area {ipv6_area_for_removal}")
-                logging.info(f"[OSPF CONFIGURE] Removing old IPv6 interface area {ipv6_area_for_removal}")
-            vtysh_commands.append("exit")
+        # Get current OSPF configuration to remove old area configurations
+        try:
+            # Get current running config to check for existing area configurations
+            # Use timeout wrapper to prevent hanging if container is not ready
+            show_run_result = exec_run_with_timeout("vtysh -c 'show running-config'", timeout_sec=5)
+            if show_run_result and show_run_result.exit_code == 0:
+                current_config = show_run_result.output.decode('utf-8') if isinstance(show_run_result.output, bytes) else str(show_run_result.output)
+                
+                # Remove old network statements with different areas
+                import re
+                # Check for graceful-restart in router ospf section (IPv4)
+                # CRITICAL: Only check/remove if IPv4 OSPF is enabled
+                if ipv4_enabled:
+                    router_ospf_pattern = r'router\s+ospf.*?(?=\nrouter|\n!|\Z)'
+                    router_ospf_match = re.search(router_ospf_pattern, current_config, re.DOTALL)
+                    if router_ospf_match:
+                        router_ospf_section = router_ospf_match.group(0)
+                        has_graceful_restart = re.search(r'graceful-restart', router_ospf_section, re.IGNORECASE)
+                        # CRITICAL: Only remove if graceful_restart_ipv4 is explicitly False
+                        # Check if graceful_restart_ipv4 key exists in config to determine if it was explicitly set
+                        graceful_restart_ipv4_explicitly_set = "graceful_restart_ipv4" in ospf_config
+                        # If graceful restart was enabled but now explicitly disabled for IPv4, remove it
+                        if has_graceful_restart and graceful_restart_ipv4_explicitly_set and not graceful_restart_ipv4:
+                            logging.info(f"[OSPF CONFIGURE] Removing graceful-restart from router ospf (IPv4 explicitly disabled)")
+                            vtysh_commands.extend([
+                                "router ospf",
+                                " no graceful-restart",
+                                "exit"
+                            ])
+                
+                # Find all network statements in router ospf
+                network_pattern = r'network\s+(\S+)\s+area\s+(\S+)'
+                for match in re.finditer(network_pattern, current_config):
+                    old_network = match.group(1)
+                    old_area = match.group(2)
+                    # Normalize both areas for comparison (supports decimal and dotted decimal formats)
+                    if not ospf_area_ids_equal(old_area, area_id_ipv4):
+                        logging.info(f"[OSPF CONFIGURE] Removing old network statement: network {old_network} area {old_area} (new area: {area_id_ipv4})")
+                        vtysh_commands.extend([
+                            "router ospf",
+                            f" no network {old_network} area {old_area}",
+                            "exit"
+                        ])
+                
+                # Find current interface area configuration - use multiline pattern
+                # Look for interface section and then ip ospf area within it
+                interface_section_pattern = rf'interface\s+{re.escape(interface)}.*?(?=\ninterface|\n!|\nrouter|\Z)'
+                interface_section_match = re.search(interface_section_pattern, current_config, re.DOTALL)
+                if interface_section_match:
+                    interface_section = interface_section_match.group(0)
+                    # Find ip ospf area in this section
+                    ip_ospf_area_match = re.search(r'ip\s+ospf\s+area\s+(\S+)', interface_section)
+                    if ip_ospf_area_match:
+                        old_interface_area = ip_ospf_area_match.group(1)
+                        # Normalize both areas for comparison (supports decimal and dotted decimal formats)
+                        if not ospf_area_ids_equal(old_interface_area, area_id_ipv4):
+                            logging.info(f"[OSPF CONFIGURE] Removing old IPv4 interface area: ip ospf area {old_interface_area} (new area: {area_id_ipv4})")
+                            vtysh_commands.extend([
+                                f"interface {interface}",
+                                f" no ip ospf area {old_interface_area}",
+                                "exit"
+                            ])
+                    
+                    # Find ipv6 ospf6 area in this section
+                    ipv6_ospf6_area_match = re.search(r'ipv6\s+ospf6\s+area\s+(\S+)', interface_section)
+                    if ipv6_ospf6_area_match:
+                        old_ipv6_interface_area = ipv6_ospf6_area_match.group(1)
+                        # Normalize both areas for comparison (supports decimal and dotted decimal formats)
+                        if not ospf_area_ids_equal(old_ipv6_interface_area, area_id_ipv6):
+                            logging.info(f"[OSPF CONFIGURE] Removing old IPv6 interface area: ipv6 ospf6 area {old_ipv6_interface_area} (new area: {area_id_ipv6})")
+                            vtysh_commands.extend([
+                                f"interface {interface}",
+                                f" no ipv6 ospf6 area {old_ipv6_interface_area}",
+                                "exit"
+                            ])
+                
+                # Check for graceful-restart in router ospf6 section (IPv6)
+                # CRITICAL: Only check/remove if IPv6 OSPF is enabled
+                if ipv6_enabled:
+                    router_ospf6_pattern = r'router\s+ospf6.*?(?=\nrouter|\n!|\Z)'
+                    router_ospf6_match = re.search(router_ospf6_pattern, current_config, re.DOTALL)
+                    if router_ospf6_match:
+                        router_ospf6_section = router_ospf6_match.group(0)
+                        has_graceful_restart = re.search(r'graceful-restart', router_ospf6_section, re.IGNORECASE)
+                        # CRITICAL: Only remove if graceful_restart_ipv6 is explicitly False
+                        # Check if graceful_restart_ipv6 key exists in config to determine if it was explicitly set
+                        graceful_restart_ipv6_explicitly_set = "graceful_restart_ipv6" in ospf_config
+                        # If graceful restart was enabled but now explicitly disabled for IPv6, remove it
+                        if has_graceful_restart and graceful_restart_ipv6_explicitly_set and not graceful_restart_ipv6:
+                            logging.info(f"[OSPF CONFIGURE] Removing graceful-restart from router ospf6 (IPv6 explicitly disabled)")
+                            vtysh_commands.extend([
+                                "router ospf6",
+                                " no graceful-restart",
+                                "exit"
+                            ])
+        except Exception as e:
+            logging.warning(f"[OSPF CONFIGURE] Could not read current config to remove old areas: {e}")
+            # Continue with configuration anyway
         
         # Configure IPv4 OSPF if enabled
         if ipv4_enabled:
+            logging.info(f"[OSPF CONFIGURE] Configuring IPv4 OSPF with area {area_id_ipv4}")
             vtysh_commands.extend([
                 "router ospf",
             ])
             
-            # Set router ID if provided
-            if router_id:
-                vtysh_commands.append(f" ospf router-id {router_id}")
+            # Set router ID (must be loopback IPv4)
+            vtysh_commands.append(f" ospf router-id {router_id}")
             
-            # Configure graceful restart if enabled
-            if graceful_restart:
-                vtysh_commands.append(" capability graceful-restart")
+            # Configure graceful restart for IPv4 if enabled
+            if graceful_restart_ipv4:
+                vtysh_commands.append(" graceful-restart")
             
-            # Configure network using actual device network with IPv4 area_id
+            # Configure network using actual device network
             if ipv4_network:
                 vtysh_commands.extend([
-                    f" network {ipv4_network} area {ipv4_area_id}",
+                    f" network {ipv4_network} area {area_id_ipv4}",
                     "exit"
                 ])
             else:
                 # Fallback if network calculation failed
                 vtysh_commands.extend([
-                    f" network 192.168.0.0/24 area {ipv4_area_id}",
+                    f" network 192.168.0.0/24 area {area_id_ipv4}",
                     "exit"
                 ])
             
-            # Configure interface OSPF settings with IPv4 area_id
+            # Configure interface OSPF settings
+            # Note: Interface IP addresses (IPv4/IPv6) are configured via frr.conf.template
+            # when the container is created, not via vtysh commands here
             vtysh_commands.extend([
                 f"interface {interface}",
                 f" ip ospf hello-interval {hello_interval}",
                 f" ip ospf dead-interval {dead_interval}",
-                f" ip ospf area {ipv4_area_id}",
+                f" ip ospf area {area_id_ipv4}",
                 " no ip ospf passive",  # Use modern interface-level command
                 "exit"
             ])
@@ -320,13 +393,12 @@ def configure_ospf_neighbor(device_id: str, ospf_config: Dict[str, Any], device_
                 "router ospf6",
             ])
             
-            # Set router ID if provided
-            if router_id:
-                vtysh_commands.append(f" ospf6 router-id {router_id}")
+            # Set router ID (must be loopback IPv4)
+            vtysh_commands.append(f" ospf6 router-id {router_id}")
             
-            # Configure graceful restart if enabled
-            if graceful_restart:
-                vtysh_commands.append(" capability graceful-restart")
+            # Configure graceful restart for IPv6 if enabled
+            if graceful_restart_ipv6:
+                vtysh_commands.append(" graceful-restart")
             
             # Calculate IPv6 network from device IP if available
             ipv6_network = None
@@ -337,7 +409,6 @@ def configure_ospf_neighbor(device_id: str, ospf_config: Dict[str, Any], device_
                     ipv6_mask = device_data.get("ipv6_mask", "64")
                     network = ipaddress.IPv6Network(f"{ipv6_addr}/{ipv6_mask}", strict=False)
                     ipv6_network = str(network)
-                    logging.info(f"[OSPF CONFIGURE] Calculated IPv6 network: {ipv6_network}")
                 except Exception as e:
                     logging.warning(f"[OSPF CONFIGURE] Failed to calculate IPv6 network: {e}")
             
@@ -346,107 +417,44 @@ def configure_ospf_neighbor(device_id: str, ospf_config: Dict[str, Any], device_
             # The area range is optional and only needed for route summarization
             vtysh_commands.append("exit")
             
-            # Configure interface OSPF6 settings with IPv6 area_id
-            # Always remove any existing IPv6 area configuration first (to avoid multiple areas)
+            # Configure interface OSPF6 settings
+            # Note: Interface IP addresses (IPv4/IPv6) are configured via frr.conf.template
+            # when the container is created, not via vtysh commands here
             vtysh_commands.extend([
                 f"interface {interface}",
-            ])
-            
-            # Query FRR to find ALL existing IPv6 areas configured on this interface
-            # Use 'show running-config' and parse the interface section (FRR doesn't support 'show running-config interface <name>')
-            existing_ipv6_areas = set()
-            try:
-                result_config = container.exec_run("vtysh -c 'show running-config'")
-                if result_config.exit_code == 0:
-                    config_output = result_config.output.decode()
-                    # Find the interface section for this specific interface
-                    import re
-                    # Look for "interface <interface>" section and extract all "ipv6 ospf6 area X" patterns within it
-                    # Pattern: interface <interface> ... (lines until next interface or ! or end)
-                    interface_pattern = rf'interface\s+{re.escape(interface)}\s*\n(.*?)(?=\n(?:interface|!|\n*$))'
-                    interface_match = re.search(interface_pattern, config_output, re.MULTILINE | re.DOTALL)
-                    if interface_match:
-                        interface_config = interface_match.group(1)
-                        logging.info(f"[OSPF CONFIGURE] Interface {interface} config section found: {interface_config[:300]}")  # Log first 300 chars
-                        # Find all "ipv6 ospf6 area X" patterns in the interface config
-                        area_matches = re.findall(r'ipv6\s+ospf6\s+area\s+([0-9.]+)', interface_config)
-                        existing_ipv6_areas.update(area_matches)
-                        if existing_ipv6_areas:
-                            logging.info(f"[OSPF CONFIGURE] Found existing IPv6 areas on interface {interface}: {existing_ipv6_areas}")
-                        else:
-                            logging.info(f"[OSPF CONFIGURE] No IPv6 areas found in interface {interface} config section")
-                    else:
-                        logging.info(f"[OSPF CONFIGURE] Interface {interface} section not found in running-config")
-                else:
-                    logging.warning(f"[OSPF CONFIGURE] Running-config query failed with exit code {result_config.exit_code}: {result_config.output.decode()[:200]}")
-            except Exception as e:
-                logging.warning(f"[OSPF CONFIGURE] Failed to query existing IPv6 areas from FRR: {e}")
-                import traceback
-                logging.warning(f"[OSPF CONFIGURE] Traceback: {traceback.format_exc()}")
-            
-            # Always remove any existing IPv6 area configurations before adding the new one
-            # This ensures we don't have multiple areas configured on the interface
-            # Normalize both the existing areas and the new area for comparison
-            normalized_new_ipv6_area = normalize_area_id(ipv6_area_id) if ipv6_area_id else None
-            logging.info(f"[OSPF CONFIGURE] New IPv6 area to configure: {ipv6_area_id} (normalized: {normalized_new_ipv6_area})")
-            logging.info(f"[OSPF CONFIGURE] Existing IPv6 areas found on interface: {existing_ipv6_areas}")
-            
-            # Remove all areas found in FRR config (normalize for comparison)
-            # ALWAYS remove all existing areas except the one we're configuring, to ensure clean state
-            for area_to_remove in existing_ipv6_areas:
-                normalized_area_to_remove = normalize_area_id(area_to_remove) if area_to_remove else None
-                # Remove if normalized areas don't match (handles "0" vs "0.0.0.0" differences)
-                if normalized_area_to_remove != normalized_new_ipv6_area:
-                    vtysh_commands.append(f" no ipv6 ospf6 area {area_to_remove}")
-                    logging.info(f"[OSPF CONFIGURE] Removing existing IPv6 area {area_to_remove} (normalized: {normalized_area_to_remove}) before adding new area {ipv6_area_id} (normalized: {normalized_new_ipv6_area})")
-                else:
-                    logging.info(f"[OSPF CONFIGURE] Skipping removal of IPv6 area {area_to_remove} (normalized: {normalized_area_to_remove}) - same as new area {ipv6_area_id} (normalized: {normalized_new_ipv6_area})")
-            
-            # Also remove areas from our detection (in case FRR query missed them)
-            # Normalize for comparison to handle format differences
-            if ipv6_area_for_removal:
-                normalized_for_removal = normalize_area_id(ipv6_area_for_removal) if ipv6_area_for_removal else None
-                # Check if it's already in existing_ipv6_areas (normalized comparison)
-                already_removed = any(normalize_area_id(existing) == normalized_for_removal for existing in existing_ipv6_areas)
-                if normalized_for_removal != normalized_new_ipv6_area and not already_removed:
-                    vtysh_commands.append(f" no ipv6 ospf6 area {ipv6_area_for_removal}")
-                    logging.info(f"[OSPF CONFIGURE] Removing detected IPv6 area {ipv6_area_for_removal} (normalized: {normalized_for_removal}) before adding new area {ipv6_area_id} (normalized: {normalized_new_ipv6_area})")
-            if old_ipv6_area_id:
-                normalized_old_ipv6 = normalize_area_id(old_ipv6_area_id) if old_ipv6_area_id else None
-                # Check if it's already in existing_ipv6_areas or ipv6_area_for_removal (normalized comparison)
-                already_removed = any(normalize_area_id(existing) == normalized_old_ipv6 for existing in existing_ipv6_areas)
-                if normalized_old_ipv6 and normalized_old_ipv6 != normalized_new_ipv6_area and not already_removed:
-                    if ipv6_area_for_removal:
-                        normalized_for_removal = normalize_area_id(ipv6_area_for_removal) if ipv6_area_for_removal else None
-                        already_removed = already_removed or (normalized_old_ipv6 == normalized_for_removal)
-                    if not already_removed:
-                        vtysh_commands.append(f" no ipv6 ospf6 area {old_ipv6_area_id}")
-                        logging.info(f"[OSPF CONFIGURE] Removing old IPv6 area {old_ipv6_area_id} (normalized: {normalized_old_ipv6}) before adding new area {ipv6_area_id} (normalized: {normalized_new_ipv6_area})")
-            
-            # Now add the new IPv6 area configuration
-            vtysh_commands.extend([
                 f" ipv6 ospf6 hello-interval {hello_interval}",
                 f" ipv6 ospf6 dead-interval {dead_interval}",
-                f" ipv6 ospf6 area {ipv6_area_id}",
+                f" ipv6 ospf6 area {area_id_ipv6}",
                 "exit"
             ])
         
-        # Add end command to save configuration
+        # Check if we actually have any OSPF commands to execute (beyond "configure terminal")
+        if len(vtysh_commands) <= 1:
+            # Only "configure terminal" - no OSPF configuration to apply
+            logging.warning(f"[OSPF CONFIGURE] No OSPF configuration to apply (ipv4_enabled={ipv4_enabled}, ipv6_enabled={ipv6_enabled})")
+            if not ipv4_enabled and not ipv6_enabled:
+                logging.error(f"[OSPF CONFIGURE] Both IPv4 and IPv6 OSPF are disabled - nothing to configure")
+                return False
+        
+        # Add end and write commands to save configuration (like ISIS does)
         vtysh_commands.append("end")
+        vtysh_commands.append("write")
         
         # Execute commands using here document
         config_commands = "\n".join(vtysh_commands)
         exec_cmd = f"vtysh << 'EOF'\n{config_commands}\nEOF"
-        logging.info(f"[OSPF CONFIGURE] Executing OSPF configuration commands")
-        logging.info(f"[OSPF CONFIGURE] Commands: {vtysh_commands}")
-        logging.info(f"[OSPF CONFIGURE] Full command: {exec_cmd}")
         
-        result = container.exec_run(["bash", "-c", exec_cmd])
-        logging.info(f"[OSPF CONFIGURE] Command exit code: {result.exit_code}")
-        logging.info(f"[OSPF CONFIGURE] Command output: {result.output.decode()}")
+        logging.info(f"[OSPF CONFIGURE] Executing OSPF configuration commands: {vtysh_commands}")
+        # Use timeout wrapper to prevent hanging if container is not ready
+        # Use longer timeout (30s) for full configuration execution (OSPF config can take time)
+        result = exec_run_with_timeout(["bash", "-c", exec_cmd], timeout_sec=30)
         
-        if result.exit_code != 0:
-            logging.error(f"[OSPF CONFIGURE] Command failed: {result.output.decode()}")
+        if not result:
+            logging.error(f"[OSPF CONFIGURE] Command timed out or failed (no result) - container may not be ready or command took too long")
+            return False
+        elif result.exit_code != 0:
+            output_str = result.output.decode('utf-8') if isinstance(result.output, bytes) else str(result.output)
+            logging.error(f"[OSPF CONFIGURE] Command failed (exit code {result.exit_code}): {output_str}")
             return False
         else:
             logging.info(f"[OSPF CONFIGURE] ✅ OSPF configuration successful")
@@ -498,7 +506,6 @@ def start_ospf_neighbor(device_id: str, ospf_config: Dict[str, Any], device_name
                 ipv4_mask = device_data.get("ipv4_mask", "24")
                 network = ipaddress.IPv4Network(f"{ipv4_addr}/{ipv4_mask}", strict=False)
                 ipv4_network = str(network)
-                logging.info(f"[OSPF START] Calculated IPv4 network: {ipv4_network}")
             except Exception as e:
                 logging.warning(f"[OSPF START] Failed to calculate IPv4 network: {e}")
                 ipv4_network = "192.168.0.0/24"  # Fallback to default
@@ -678,7 +685,6 @@ def stop_ospf_neighbor(device_id: str, device_name: str = None, af: str = None) 
                 ipv4_mask = device_data.get("ipv4_mask", "24")
                 network = ipaddress.IPv4Network(f"{ipv4_addr}/{ipv4_mask}", strict=False)
                 ipv4_network = str(network)
-                logging.info(f"[OSPF STOP] Calculated IPv4 network: {ipv4_network}")
             except Exception as e:
                 logging.warning(f"[OSPF STOP] Failed to calculate IPv4 network: {e}")
                 ipv4_network = "192.168.0.0/24"  # Fallback to default
@@ -1063,21 +1069,8 @@ def get_ospf_status(device_id: str) -> Optional[Dict[str, Any]]:
         logging.info(f"[OSPF STATUS] IPv4 OSPF uptime: {ospf_ipv4_uptime}")
         
         # Determine overall OSPF status for IPv4 and IPv6
-        # OSPF is considered "Established" if it has neighbors in any active state
-        # Active states include: Full, 2-Way, ExStart, Exchange, Loading
-        # We exclude: Down, Init, Attempt (these are not active)
-        active_states = ['Full', '2-Way', 'ExStart', 'Exchange', 'Loading']
-        ipv4_neighbors = [n for n in neighbors if n.get('type') == 'IPv4']
-        ipv6_neighbors = [n for n in neighbors if n.get('type') == 'IPv6']
-        
-        ospf_ipv4_established = len(ipv4_neighbors) > 0 and any(
-            any(active_state in n.get('state', '') for active_state in active_states)
-            for n in ipv4_neighbors
-        )
-        ospf_ipv6_established = len(ipv6_neighbors) > 0 and any(
-            any(active_state in n.get('state', '') for active_state in active_states)
-            for n in ipv6_neighbors
-        )
+        ospf_ipv4_established = len([n for n in neighbors if n.get('type') == 'IPv4']) > 0 and any('Full' in n['state'] for n in neighbors if n.get('type') == 'IPv4')
+        ospf_ipv6_established = len([n for n in neighbors if n.get('type') == 'IPv6']) > 0 and any('Full' in n['state'] for n in neighbors if n.get('type') == 'IPv6')
         
         # Check if OSPF is running even without neighbors
         ospf_ipv4_running = 'OSPF Routing Process' in ospf_ipv4_summary
@@ -1129,7 +1122,7 @@ def build_ospf_cmd(device_id, iface, config):
     ]
 
     if gr:
-        cmds.append("  capability graceful-restart")
+        cmds.append("  graceful-restart")
 
     cmds.extend(["exit", "write"])
 
