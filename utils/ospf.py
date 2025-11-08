@@ -83,7 +83,15 @@ def safe_vtysh_command(cmd_list, timeout=10, device_id=None, device_name=None):
         logging.error(f"[OSPF VTYSH] vtysh command not found - FRR not installed")
         return False, "FRR not installed"
 
-def configure_ospf_neighbor(device_id: str, ospf_config: Dict[str, Any], device_name: str = None) -> bool:
+def configure_ospf_neighbor(
+    device_id: str,
+    ospf_config: Dict[str, Any],
+    device_name: str = None,
+    ipv4: Optional[str] = None,
+    ipv6: Optional[str] = None,
+    ipv4_mask: Optional[str] = None,
+    ipv6_mask: Optional[str] = None,
+) -> bool:
     """Configure OSPF for a device in FRR container."""
     try:
         from utils.frr_docker import FRRDockerManager
@@ -187,6 +195,31 @@ def configure_ospf_neighbor(device_id: str, ospf_config: Dict[str, Any], device_
         else:
             p2p_ipv6 = ospf_config.get("p2p", False)  # Fall back to generic p2p
         
+        # Parse IPv4/IPv6 values supplied directly in the request payload (if any)
+        ipv4_payload_addr = None
+        ipv4_payload_mask = None
+        if ipv4:
+            if "/" in ipv4:
+                ipv4_payload_addr, ipv4_payload_mask = ipv4.split("/", 1)
+            else:
+                ipv4_payload_addr = ipv4
+        if ipv4_mask:
+            ipv4_payload_mask = ipv4_mask
+        if ipv4_payload_addr and not ipv4_payload_mask:
+            ipv4_payload_mask = "24"
+        
+        ipv6_payload_addr = None
+        ipv6_payload_mask = None
+        if ipv6:
+            if "/" in ipv6:
+                ipv6_payload_addr, ipv6_payload_mask = ipv6.split("/", 1)
+            else:
+                ipv6_payload_addr = ipv6
+        if ipv6_mask:
+            ipv6_payload_mask = ipv6_mask
+        if ipv6_payload_addr and not ipv6_payload_mask:
+            ipv6_payload_mask = "64"
+        
         # Get device IP addresses from database to calculate correct network
         from utils.device_database import DeviceDatabase
         device_db = DeviceDatabase()
@@ -198,6 +231,8 @@ def configure_ospf_neighbor(device_id: str, ospf_config: Dict[str, Any], device_
             # If not explicitly set, check if device has IPv4 address
             if device_data and device_data.get("ipv4_address"):
                 ipv4_enabled = True
+            elif ipv4_payload_addr:
+                ipv4_enabled = True
             else:
                 ipv4_enabled = False
         # Default to False for ipv6_enabled if IPv6 address exists, otherwise use config value
@@ -205,6 +240,8 @@ def configure_ospf_neighbor(device_id: str, ospf_config: Dict[str, Any], device_
         if ipv6_enabled is None:
             # If not explicitly set, check if device has IPv6 address
             if device_data and device_data.get("ipv6_address"):
+                ipv6_enabled = True
+            elif ipv6_payload_addr:
                 ipv6_enabled = True
             else:
                 ipv6_enabled = False
@@ -247,6 +284,9 @@ def configure_ospf_neighbor(device_id: str, ospf_config: Dict[str, Any], device_
             if device_data and device_data.get("ipv4_address"):
                 router_id = device_data["ipv4_address"].split('/')[0]
                 logging.warning(f"[OSPF CONFIGURE] Loopback IPv4 not found, using interface IPv4 {router_id} as router-id (fallback)")
+            elif ipv4_payload_addr:
+                router_id = ipv4_payload_addr
+                logging.warning(f"[OSPF CONFIGURE] Loopback IPv4 not found, using payload IPv4 {router_id} as router-id (fallback)")
             else:
                 router_id = "192.168.0.2"
                 logging.warning(f"[OSPF CONFIGURE] No IPv4 available, using default router-id {router_id}")
@@ -263,6 +303,15 @@ def configure_ospf_neighbor(device_id: str, ospf_config: Dict[str, Any], device_
             except Exception as e:
                 logging.warning(f"[OSPF CONFIGURE] Failed to calculate IPv4 network: {e}")
                 ipv4_network = "192.168.0.0/24"  # Fallback to default
+        elif ipv4_payload_addr:
+            try:
+                import ipaddress
+                payload_mask = ipv4_payload_mask or "24"
+                network = ipaddress.IPv4Network(f"{ipv4_payload_addr}/{payload_mask}", strict=False)
+                ipv4_network = str(network)
+            except Exception as e:
+                logging.warning(f"[OSPF CONFIGURE] Failed to calculate IPv4 network from payload: {e}")
+                ipv4_network = "192.168.0.0/24"
         else:
             logging.warning(f"[OSPF CONFIGURE] No device data or IPv4 address found, using fallback network")
             ipv4_network = "192.168.0.0/24"  # Fallback to default

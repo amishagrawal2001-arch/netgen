@@ -60,6 +60,8 @@ class DeviceOperationWorker(QThread):
                 if self.operation_type == 'start':
                     # Start device (light start - just bring up interface)
                     self.progress.emit(device_name, "Starting...")
+                    # Immediately reflect starting state in UI
+                    self.device_status_updated.emit(row, "Starting", "Device Starting...")
                     
                     # Prepare start payload for light start
                     iface_label = device_info.get("Interface", "")
@@ -67,13 +69,25 @@ class DeviceOperationWorker(QThread):
                     vlan = device_info.get("VLAN", "0")
                     device_id = device_info.get("device_id", "")
                     
+                    protocols = []
+                    protocol_data = device_info.get("protocols")
+                    if isinstance(protocol_data, dict):
+                        protocols = list(protocol_data.keys())
+                    elif isinstance(protocol_data, list):
+                        protocols = [str(p) for p in protocol_data if p]
+                    if not protocols:
+                        legacy = device_info.get("Protocols")
+                        if isinstance(legacy, str) and legacy:
+                            protocols = [p.strip() for p in legacy.split(",") if p.strip()]
+                    
                     start_payload = {
                         "device_id": device_id,
                         "device_name": device_name,
                         "interface": iface_norm,
                         "vlan": vlan,
                         "ipv4": device_info.get("IPv4", ""),
-                        "ipv6": device_info.get("IPv6", "")
+                        "ipv6": device_info.get("IPv6", ""),
+                        "protocols": protocols
                     }
                     
                     response = requests.post(
@@ -97,6 +111,8 @@ class DeviceOperationWorker(QThread):
                 elif self.operation_type == 'stop':
                     # Stop device
                     self.progress.emit(device_name, "Stopping...")
+                    # Immediately reflect stopping state in UI
+                    self.device_status_updated.emit(row, "Stopping", "Device Stopping...")
                     
                     # Prepare stop payload
                     iface_label = device_info.get("Interface", "")
@@ -1429,6 +1445,11 @@ class DevicesTab(QWidget):
         self.status_timer.timeout.connect(self.poll_device_status)
         # self.status_timer.start(30000)  # DISABLED - no automatic polling
 
+        # Dedicated timer/flag for lightweight periodic status refreshes triggered after ops
+        self.device_status_timer = QTimer()
+        self.device_status_timer.timeout.connect(self.poll_device_status)
+        self.device_status_monitoring_active = False
+
         self.active_bgp_devices = set()
         self.all_devices = {}
         self.interface_to_device_map = {}
@@ -2067,16 +2088,25 @@ class DevicesTab(QWidget):
             QTimer.singleShot(200, lambda: self._refresh_device_table_from_database(selected_rows))
 
             operation_type = getattr(self, '_current_operation_type', None)
+            protocols = self._collect_protocols_for_rows(selected_rows)
             if operation_type == 'start':
                 # Ensure device/status monitoring resumes for started devices
                 self.start_device_status_monitoring()
-                protocols = self._collect_protocols_for_rows(selected_rows)
                 if "BGP" in protocols:
                     self.start_bgp_monitoring()
                 if "OSPF" in protocols:
                     self.start_ospf_monitoring()
                 if "IS-IS" in protocols or "ISIS" in protocols:
                     self.start_isis_monitoring()
+            elif operation_type == 'stop':
+                # Stop periodic monitoring when device is stopped
+                self.stop_device_status_monitoring()
+                if "BGP" in protocols:
+                    self.stop_bgp_monitoring()
+                if "OSPF" in protocols:
+                    self.stop_ospf_monitoring()
+                if "IS-IS" in protocols or "ISIS" in protocols:
+                    self.stop_isis_monitoring()
         
         # Clear the operation type flag
         if hasattr(self, '_current_operation_type'):
@@ -2232,13 +2262,25 @@ class DevicesTab(QWidget):
                 if not name_item:
                     continue
                 device_name = name_item.text()
+                found = False
                 for iface, devices in self.main_window.all_devices.items():
                     for device in devices:
                         if device.get("Device Name") == device_name:
                             device_protocols = device.get("protocols", {})
                             if isinstance(device_protocols, dict):
                                 protocols.update(device_protocols.keys())
+                                has_protocols = bool(device_protocols)
+                            else:
+                                has_protocols = False
+
+                            if not has_protocols:
+                                legacy = device.get("Protocols")
+                                if isinstance(legacy, str) and legacy:
+                                    protocols.update({p.strip() for p in legacy.split(",") if p.strip()})
+                            found = True
                             break
+                    if found:
+                        break
         except Exception as e:
             logging.error(f"[PROTOCOL COLLECT ERROR] {e}")
         return protocols
@@ -2307,6 +2349,12 @@ class DevicesTab(QWidget):
                 # This provides clear indication that ARP needs attention
                 icon = self.arp_fail
                 tooltip = status_text or "ARP Failed"
+        elif device_status == "Starting":
+            # Device is starting - show yellow/orange icon with status text
+            icon = self.orange_dot
+            tooltip = status_text or "Device Starting..."
+            item.setText("Starting...")
+            item.setData(Qt.UserRole, "Starting")
         else:
             # Unknown or other device status - show orange
             icon = self.orange_dot
@@ -4392,10 +4440,11 @@ class DevicesTab(QWidget):
         if hasattr(self, 'device_status_timer') and self.device_status_timer:
             print("[CLEANUP] Stopping device_status_timer...")
             self.device_status_timer.stop()
+        print("[CLEANUP] Timer stop complete")
         
         # Stop and cleanup ARP check worker
         if hasattr(self, 'arp_check_worker') and self.arp_check_worker:
-            print("[CLEANUP] Stopping arp_check_worker...")
+            print(f"[CLEANUP] Stopping arp_check_worker... isRunning={self.arp_check_worker.isRunning()}")
             try:
                 self.arp_check_worker.stop()  # Request graceful stop
                 self.arp_check_worker.quit()
@@ -4407,6 +4456,7 @@ class DevicesTab(QWidget):
                 print(f"[CLEANUP] Error stopping arp_check_worker: {e}")
             finally:
                 try:
+                    print(f"[CLEANUP] Deleting arp_check_worker... isRunning={self.arp_check_worker.isRunning()}")
                     self.arp_check_worker.deleteLater()
                     delattr(self, 'arp_check_worker')
                 except:
@@ -4414,7 +4464,7 @@ class DevicesTab(QWidget):
         
         # Stop and cleanup bulk ARP worker
         if hasattr(self, 'bulk_arp_worker') and self.bulk_arp_worker:
-            print("[CLEANUP] Stopping bulk_arp_worker...")
+            print(f"[CLEANUP] Stopping bulk_arp_worker... isRunning={self.bulk_arp_worker.isRunning()}")
             try:
                 self.bulk_arp_worker.stop()  # Request graceful stop
                 self.bulk_arp_worker.quit()
@@ -4426,6 +4476,7 @@ class DevicesTab(QWidget):
                 print(f"[CLEANUP] Error stopping bulk_arp_worker: {e}")
             finally:
                 try:
+                    print(f"[CLEANUP] Deleting bulk_arp_worker... isRunning={self.bulk_arp_worker.isRunning()}")
                     self.bulk_arp_worker.deleteLater()
                     delattr(self, 'bulk_arp_worker')
                 except:
@@ -4433,7 +4484,7 @@ class DevicesTab(QWidget):
         
         # Stop and cleanup device operation worker
         if hasattr(self, 'operation_worker') and self.operation_worker:
-            print("[CLEANUP] Stopping operation_worker...")
+            print(f"[CLEANUP] Stopping operation_worker... isRunning={self.operation_worker.isRunning()}")
             try:
                 self.operation_worker.stop()  # Request graceful stop
                 self.operation_worker.quit()
@@ -4445,6 +4496,7 @@ class DevicesTab(QWidget):
                 print(f"[CLEANUP] Error stopping operation_worker: {e}")
             finally:
                 try:
+                    print(f"[CLEANUP] Deleting operation_worker... isRunning={self.operation_worker.isRunning()}")
                     self.operation_worker.deleteLater()
                     delattr(self, 'operation_worker')
                 except:
@@ -4452,7 +4504,7 @@ class DevicesTab(QWidget):
         
         # Stop and cleanup ARP operation worker
         if hasattr(self, 'arp_operation_worker') and self.arp_operation_worker:
-            print("[CLEANUP] Stopping arp_operation_worker...")
+            print(f"[CLEANUP] Stopping arp_operation_worker... isRunning={self.arp_operation_worker.isRunning()}")
             try:
                 self.arp_operation_worker.stop()  # Request graceful stop
                 self.arp_operation_worker.quit()
@@ -4464,6 +4516,7 @@ class DevicesTab(QWidget):
                 print(f"[CLEANUP] Error stopping arp_operation_worker: {e}")
             finally:
                 try:
+                    print(f"[CLEANUP] Deleting arp_operation_worker... isRunning={self.arp_operation_worker.isRunning()}")
                     self.arp_operation_worker.deleteLater()
                     delattr(self, 'arp_operation_worker')
                 except:
@@ -4471,7 +4524,7 @@ class DevicesTab(QWidget):
         
         # Stop and cleanup individual ARP worker
         if hasattr(self, 'individual_arp_worker') and self.individual_arp_worker:
-            print("[CLEANUP] Stopping individual_arp_worker...")
+            print(f"[CLEANUP] Stopping individual_arp_worker... isRunning={self.individual_arp_worker.isRunning()}")
             try:
                 self.individual_arp_worker.stop()  # Request graceful stop
                 self.individual_arp_worker.quit()
@@ -4483,6 +4536,7 @@ class DevicesTab(QWidget):
                 print(f"[CLEANUP] Error stopping individual_arp_worker: {e}")
             finally:
                 try:
+                    print(f"[CLEANUP] Deleting individual_arp_worker... isRunning={self.individual_arp_worker.isRunning()}")
                     self.individual_arp_worker.deleteLater()
                     delattr(self, 'individual_arp_worker')
                 except:

@@ -61,18 +61,18 @@ class ISISHandler:
         # ISIS Controls
         isis_controls = QHBoxLayout()
         
-        # Add ISIS button
         def load_icon(filename: str) -> QIcon:
             from utils.qicon_loader import qicon
             return qicon("resources", f"icons/{filename}")
-        
+
+        # Add ISIS button
         self.parent.add_isis_button = QPushButton()
         self.parent.add_isis_button.setIcon(load_icon("add.png"))
         self.parent.add_isis_button.setIconSize(QSize(16, 16))
         self.parent.add_isis_button.setFixedSize(32, 28)
         self.parent.add_isis_button.setToolTip("Add IS-IS")
         self.parent.add_isis_button.clicked.connect(self.prompt_add_isis)
-        
+
         # Edit ISIS button
         self.parent.edit_isis_button = QPushButton()
         self.parent.edit_isis_button.setIcon(load_icon("edit.png"))
@@ -80,7 +80,7 @@ class ISISHandler:
         self.parent.edit_isis_button.setFixedSize(32, 28)
         self.parent.edit_isis_button.setToolTip("Edit ISIS Configuration")
         self.parent.edit_isis_button.clicked.connect(self.prompt_edit_isis)
-        
+
         # Delete ISIS button
         self.parent.delete_isis_button = QPushButton()
         self.parent.delete_isis_button.setIcon(load_icon("remove.png"))
@@ -88,7 +88,7 @@ class ISISHandler:
         self.parent.delete_isis_button.setFixedSize(32, 28)
         self.parent.delete_isis_button.setToolTip("Delete ISIS Configuration")
         self.parent.delete_isis_button.clicked.connect(self.prompt_delete_isis)
-        
+
         # ISIS refresh button with icon
         self.parent.isis_refresh_button = QPushButton()
         self.parent.isis_refresh_button.setIcon(load_icon("refresh.png"))
@@ -96,14 +96,14 @@ class ISISHandler:
         self.parent.isis_refresh_button.setFixedSize(32, 28)
         self.parent.isis_refresh_button.setToolTip("Refresh ISIS Status")
         self.parent.isis_refresh_button.clicked.connect(self.refresh_isis_status)
-        
+
         # Apply ISIS button
         self.parent.apply_isis_button = QPushButton()
         self.parent.apply_isis_button.setIcon(load_icon("apply.png"))
         self.parent.apply_isis_button.setFixedSize(32, 28)
         self.parent.apply_isis_button.setToolTip("Apply ISIS configurations to server")
         self.parent.apply_isis_button.clicked.connect(self.apply_isis_configurations)
-        
+
         # IS-IS Start/Stop buttons
         self.parent.isis_start_button = QPushButton()
         self.parent.isis_start_button.setIcon(load_icon("start.png"))
@@ -111,14 +111,14 @@ class ISISHandler:
         self.parent.isis_start_button.setFixedSize(32, 28)
         self.parent.isis_start_button.setToolTip("Start IS-IS")
         self.parent.isis_start_button.clicked.connect(self.start_isis_protocol)
-        
+
         self.parent.isis_stop_button = QPushButton()
         self.parent.isis_stop_button.setIcon(load_icon("stop.png"))
         self.parent.isis_stop_button.setIconSize(QSize(16, 16))
         self.parent.isis_stop_button.setFixedSize(32, 28)
         self.parent.isis_stop_button.setToolTip("Stop IS-IS")
         self.parent.isis_stop_button.clicked.connect(self.stop_isis_protocol)
-        
+
         isis_controls.addWidget(self.parent.add_isis_button)
         isis_controls.addWidget(self.parent.edit_isis_button)
         isis_controls.addWidget(self.parent.delete_isis_button)
@@ -684,7 +684,15 @@ class ISISHandler:
                             isis_status = "Marked for Removal"
                             self.parent.set_isis_status_icon(row, "Marked for Removal", "ISIS Marked for Removal")
                         else:
-                            isis_status = "Running" if isis_status_data and isis_status_data.get("isis_running") else "Down"
+                            if isis_status_data:
+                                if isis_status_data.get("isis_established"):
+                                    isis_status = "Established"
+                                elif isis_status_data.get("isis_running"):
+                                    isis_status = "Starting"
+                                else:
+                                    isis_status = "Down"
+                            else:
+                                isis_status = "Unknown"
                             self.parent.set_isis_status_icon(row, isis_status, f"ISIS {isis_status}")
                         
                         # Neighbor Type
@@ -764,7 +772,15 @@ class ISISHandler:
                             self.parent.isis_table.setItem(row, 0, QTableWidgetItem(device_name))
                             
                             # ISIS Status (with icon) - same as IPv4 row
-                            isis_status = "Running" if isis_status_data and isis_status_data.get("isis_running") else "Down"
+                            if isis_status_data:
+                                if isis_status_data.get("isis_established"):
+                                    isis_status = "Established"
+                                elif isis_status_data.get("isis_running"):
+                                    isis_status = "Starting"
+                                else:
+                                    isis_status = "Down"
+                            else:
+                                isis_status = "Unknown"
                             self.parent.set_isis_status_icon(row, isis_status, f"ISIS {isis_status}")
                             
                             # Neighbor Type - IPv6
@@ -812,19 +828,23 @@ class ISISHandler:
             def load_icon(filename: str) -> QIcon:
                 from utils.qicon_loader import qicon
                 return qicon("resources", f"icons/{filename}")
-            
+
             # Determine icon based on ISIS status
-            if status.lower() in ["up", "running", "established"]:
+            status_lower = status.lower()
+
+            if status_lower in ["up", "running", "established"]:
                 icon = load_icon("green_dot.png")
-            elif status.lower() in ["down", "stopped", "idle"]:
-                icon = load_icon("red_dot.png")
-            elif status.lower() in ["stopping"]:
+            elif status_lower in ["starting"]:
                 icon = load_icon("yellow_dot.png")
-            elif status.lower() in ["marked for removal"]:
+            elif status_lower in ["down", "stopped", "idle"]:
+                icon = load_icon("red_dot.png")
+            elif status_lower in ["stopping"]:
+                icon = load_icon("yellow_dot.png")
+            elif status_lower in ["marked for removal"]:
                 icon = load_icon("orange_dot.png")
             else:
                 icon = load_icon("orange_dot.png")
-            
+
             # Create item with icon
             item = QTableWidgetItem()
             item.setIcon(icon)
@@ -832,7 +852,7 @@ class ISISHandler:
             item.setTextAlignment(Qt.AlignCenter)
             item.setFlags(item.flags() & ~Qt.ItemIsEditable)  # Make ISIS Status column non-editable
             self.parent.isis_table.setItem(row, 1, item)
-            
+
         except Exception as e:
             print(f"Error setting ISIS status icon: {e}")
             # Fallback to text

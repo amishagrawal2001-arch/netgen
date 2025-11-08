@@ -524,10 +524,10 @@
     "TG 0 - ens14f1"
   ],
   "removed_servers": [
-    "http://svl-hp-ai-srv01:5050",
-    "http://127.0.0.1:5051",
     "http://svl-hp-ai-srv02:5051",
-    "http://127.0.0.1:5050"
+    "http://127.0.0.1:5050",
+    "http://svl-hp-ai-srv01:5050",
+    "http://127.0.0.1:5051"
   ],
   "selected_servers": [
     "http://svl-hp-ai-srv04:5051"
@@ -536,7 +536,7 @@
   "devices": {
     "device1": {
       "Device Name": "device1",
-      "device_id": "db1f51f3-3681-4856-8ee4-df11324cda08",
+      "device_id": "3b7b44c1-3586-4e12-b5d4-4d07c1f48765",
       "Interface": "TG 0 - ens4np0",
       "MAC Address": "00:11:22:33:44:55",
       "IPv4": "192.168.0.2",
@@ -549,10 +549,28 @@
       "IPv6 Gateway": "2001:db8::1",
       "Loopback IPv4": "192.255.0.1",
       "Loopback IPv6": "2001:ff00::1",
-      "Status": "Stopped",
+      "Status": "Running",
       "protocols": [
-        "BGP"
+        "OSPF",
+        "BGP",
+        "IS-IS"
       ],
+      "ospf_config": {
+        "area_id": "0.0.0.0",
+        "area_id_ipv4": "0.0.0.0",
+        "area_id_ipv6": "0.0.0.0",
+        "dead_interval": "40",
+        "graceful_restart": false,
+        "graceful_restart_ipv4": true,
+        "graceful_restart_ipv6": true,
+        "hello_interval": "10",
+        "interface": "vlan20",
+        "ipv4_enabled": true,
+        "ipv6_enabled": true,
+        "p2p_ipv4": true,
+        "p2p_ipv6": true,
+        "router_id": "192.168.0.2"
+      },
       "bgp_config": {
         "bgp_asn": "65000",
         "bgp_remote_asn": "65001",
@@ -568,12 +586,38 @@
         "bgp_update_source_ipv6": "2001:db8::2"
       },
       "Protocols": "BGP",
+      "is_is_config": {
+        "area_id": "49.0001.0000.0000.0001.00",
+        "system_id": "0000.0000.0001",
+        "level": "Level-2",
+        "hello_interval": "10",
+        "hello_multiplier": "3",
+        "metric": "10",
+        "interface": "vlan20",
+        "ipv4_enabled": true,
+        "ipv6_enabled": true
+      },
+      "isis_config": {
+        "area_id": "49.0001.0000.0000.0001.00",
+        "system_id": "0000.0000.0001",
+        "level": "Level-2",
+        "hello_interval": "10",
+        "hello_multiplier": "3",
+        "metric": "10",
+        "interface": "vlan20",
+        "ipv4_enabled": true,
+        "ipv6_enabled": true
+      },
       "_is_new": false,
-      "_needs_apply": false
+      "_selected_address_families": [
+        "IPv6",
+        "IPv4"
+      ],
+      "_ospf_just_edited": true
     },
     "device2": {
       "Device Name": "device2",
-      "device_id": "c2ee36a4-83b1-482b-a373-156060db50ec",
+      "device_id": "c05944da-35de-4a26-adf6-d0c82454ca0d",
       "Interface": "TG 0 - ens4np0",
       "MAC Address": "00:12:22:33:44:55",
       "IPv4": "192.169.0.2",
@@ -588,8 +632,26 @@
       "Loopback IPv6": "2002:ff00::1",
       "Status": "Stopped",
       "protocols": [
-        "BGP"
+        "OSPF",
+        "BGP",
+        "IS-IS"
       ],
+      "ospf_config": {
+        "area_id": "0.0.0.0",
+        "area_id_ipv4": "0.0.0.0",
+        "area_id_ipv6": "0.0.0.0",
+        "dead_interval": "40",
+        "graceful_restart": false,
+        "graceful_restart_ipv4": true,
+        "graceful_restart_ipv6": true,
+        "hello_interval": "10",
+        "interface": "vlan21",
+        "ipv4_enabled": true,
+        "ipv6_enabled": true,
+        "p2p_ipv4": true,
+        "p2p_ipv6": true,
+        "router_id": "192.169.0.2"
+      },
       "bgp_config": {
         "bgp_asn": "65000",
         "bgp_remote_asn": "65001",
@@ -605,12 +667,38 @@
         "bgp_update_source_ipv6": "2001:db9::2"
       },
       "Protocols": "BGP",
+      "is_is_config": {
+        "area_id": "49.0001.0000.0000.0001.00",
+        "system_id": "0000.0000.0001",
+        "level": "Level-2",
+        "hello_interval": "10",
+        "hello_multiplier": "3",
+        "metric": "10",
+        "interface": "vlan21",
+        "ipv4_enabled": true,
+        "ipv6_enabled": true
+      },
+      "isis_config": {
+        "area_id": "49.0001.0000.0000.0001.00",
+        "system_id": "0000.0000.0001",
+        "level": "Level-2",
+        "hello_interval": "10",
+        "hello_multiplier": "3",
+        "metric": "10",
+        "interface": "vlan21",
+        "ipv4_enabled": true,
+        "ipv6_enabled": true
+      },
       "_is_new": false,
-      "_needs_apply": false
+      "_selected_address_families": [
+        "IPv6",
+        "IPv4"
+      ],
+      "_ospf_just_edited": true
     },
     "device3": {
       "Device Name": "device3",
-      "device_id": "73bc11c7-b0da-452c-a12b-c4dd1129fb23",
+      "device_id": "1177e4ff-72fa-4d11-9f7a-4f50cc780c02",
       "Interface": "TG 0 - ens4np0",
       "MAC Address": "00:13:22:33:44:55",
       "IPv4": "192.170.0.2",
@@ -623,10 +711,28 @@
       "IPv6 Gateway": "2001:dba::1",
       "Loopback IPv4": "194.255.0.1",
       "Loopback IPv6": "2003:ff00::1",
-      "Status": "Stopped",
+      "Status": "Running",
       "protocols": [
-        "BGP"
+        "OSPF",
+        "BGP",
+        "IS-IS"
       ],
+      "ospf_config": {
+        "area_id": "0.0.0.0",
+        "area_id_ipv4": "0.0.0.0",
+        "area_id_ipv6": "0.0.0.0",
+        "dead_interval": "40",
+        "graceful_restart": false,
+        "graceful_restart_ipv4": true,
+        "graceful_restart_ipv6": true,
+        "hello_interval": "10",
+        "interface": "vlan22",
+        "ipv4_enabled": true,
+        "ipv6_enabled": true,
+        "p2p_ipv4": true,
+        "p2p_ipv6": true,
+        "router_id": "192.170.0.2"
+      },
       "bgp_config": {
         "bgp_asn": "65000",
         "bgp_remote_asn": "65001",
@@ -642,8 +748,34 @@
         "bgp_update_source_ipv6": "2001:dba::2"
       },
       "Protocols": "BGP",
+      "is_is_config": {
+        "area_id": "49.0001.0000.0000.0001.00",
+        "system_id": "0000.0000.0001",
+        "level": "Level-2",
+        "hello_interval": "10",
+        "hello_multiplier": "3",
+        "metric": "10",
+        "interface": "vlan22",
+        "ipv4_enabled": true,
+        "ipv6_enabled": true
+      },
+      "isis_config": {
+        "area_id": "49.0001.0000.0000.0001.00",
+        "system_id": "0000.0000.0001",
+        "level": "Level-2",
+        "hello_interval": "10",
+        "hello_multiplier": "3",
+        "metric": "10",
+        "interface": "vlan22",
+        "ipv4_enabled": true,
+        "ipv6_enabled": true
+      },
       "_is_new": false,
-      "_needs_apply": false
+      "_selected_address_families": [
+        "IPv6",
+        "IPv4"
+      ],
+      "_ospf_just_edited": true
     }
   },
   "removed_devices": [],
@@ -652,20 +784,195 @@
       {
         "Device": "device1",
         "BGP Status": "",
-        "Neighbor Type": "",
-        "Neighbor IP": "",
-        "Source IP": "",
-        "BGP Local AS": "",
-        "BGP Remote AS": "",
-        "State": "",
-        "Routes": "",
+        "Neighbor Type": "IPv4",
+        "Neighbor IP": "192.168.0.1",
+        "Source IP": "192.168.0.2",
+        "BGP Local AS": "65000",
+        "BGP Remote AS": "65001",
+        "State": "Established",
+        "Routes": "0",
         "Route Pools": "",
-        "Keepalive": "",
-        "Hold-time": ""
+        "Keepalive": "30",
+        "Hold-time": "90"
+      },
+      {
+        "Device": "device1",
+        "BGP Status": "",
+        "Neighbor Type": "IPv6",
+        "Neighbor IP": "2001:db8::1",
+        "Source IP": "2001:db8::2",
+        "BGP Local AS": "65000",
+        "BGP Remote AS": "65001",
+        "State": "Established",
+        "Routes": "0",
+        "Route Pools": "",
+        "Keepalive": "30",
+        "Hold-time": "90"
+      },
+      {
+        "Device": "device2",
+        "BGP Status": "",
+        "Neighbor Type": "IPv4",
+        "Neighbor IP": "192.169.0.1",
+        "Source IP": "192.169.0.2",
+        "BGP Local AS": "65000",
+        "BGP Remote AS": "65001",
+        "State": "Device Not Started",
+        "Routes": "0",
+        "Route Pools": "",
+        "Keepalive": "30",
+        "Hold-time": "90"
+      },
+      {
+        "Device": "device2",
+        "BGP Status": "",
+        "Neighbor Type": "IPv6",
+        "Neighbor IP": "2001:db9::1",
+        "Source IP": "2001:db9::2",
+        "BGP Local AS": "65000",
+        "BGP Remote AS": "65001",
+        "State": "Device Not Started",
+        "Routes": "0",
+        "Route Pools": "",
+        "Keepalive": "30",
+        "Hold-time": "90"
+      },
+      {
+        "Device": "device3",
+        "BGP Status": "",
+        "Neighbor Type": "IPv4",
+        "Neighbor IP": "192.170.0.1",
+        "Source IP": "192.170.0.2",
+        "BGP Local AS": "65000",
+        "BGP Remote AS": "65001",
+        "State": "Idle",
+        "Routes": "0",
+        "Route Pools": "",
+        "Keepalive": "30",
+        "Hold-time": "90"
+      },
+      {
+        "Device": "device3",
+        "BGP Status": "",
+        "Neighbor Type": "IPv6",
+        "Neighbor IP": "2001:dba::1",
+        "Source IP": "2001:dba::2",
+        "BGP Local AS": "65000",
+        "BGP Remote AS": "65001",
+        "State": "Idle",
+        "Routes": "0",
+        "Route Pools": "",
+        "Keepalive": "30",
+        "Hold-time": "90"
       }
     ],
-    "ospf": [],
-    "isis": []
+    "ospf": [
+      {
+        "Device": "device1",
+        "OSPF Status": "",
+        "Area ID": "0.0.0.0",
+        "Neighbor Type": "IPv4",
+        "Interface": "vlan20",
+        "Neighbor ID": "10.255.0.89",
+        "State": "Full/-",
+        "Priority": "128",
+        "Dead Timer": "36.864s",
+        "Uptime": "7m07s",
+        "Graceful Restart": "",
+        "P2P": "",
+        "Route Pools": ""
+      },
+      {
+        "Device": "device1",
+        "OSPF Status": "",
+        "Area ID": "0.0.0.0",
+        "Neighbor Type": "IPv6",
+        "Interface": "vlan20",
+        "Neighbor ID": "10.255.0.89",
+        "State": "Full/PointToPoint",
+        "Priority": "128",
+        "Dead Timer": "00:00:38",
+        "Uptime": "00:07:17",
+        "Graceful Restart": "",
+        "P2P": "",
+        "Route Pools": ""
+      },
+      {
+        "Device": "device2",
+        "OSPF Status": "",
+        "Area ID": "0.0.0.0",
+        "Neighbor Type": "IPv4",
+        "Interface": "vlan21",
+        "Neighbor ID": "N/A",
+        "State": "No Neighbors",
+        "Priority": "N/A",
+        "Dead Timer": "N/A",
+        "Uptime": "00:46:35",
+        "Graceful Restart": "",
+        "P2P": "",
+        "Route Pools": ""
+      },
+      {
+        "Device": "device2",
+        "OSPF Status": "",
+        "Area ID": "0.0.0.0",
+        "Neighbor Type": "IPv6",
+        "Interface": "vlan21",
+        "Neighbor ID": "N/A",
+        "State": "No Neighbors",
+        "Priority": "N/A",
+        "Dead Timer": "N/A",
+        "Uptime": "00:46:33",
+        "Graceful Restart": "",
+        "P2P": "",
+        "Route Pools": ""
+      },
+      {
+        "Device": "device3",
+        "OSPF Status": "",
+        "Area ID": "0.0.0.0",
+        "Neighbor Type": "IPv4",
+        "Interface": "vlan22",
+        "Neighbor ID": "10.255.0.89",
+        "State": "Full/-",
+        "Priority": "128",
+        "Dead Timer": "34.107s",
+        "Uptime": "47m08s",
+        "Graceful Restart": "",
+        "P2P": "",
+        "Route Pools": ""
+      },
+      {
+        "Device": "device3",
+        "OSPF Status": "",
+        "Area ID": "0.0.0.0",
+        "Neighbor Type": "IPv6",
+        "Interface": "vlan22",
+        "Neighbor ID": "10.255.0.89",
+        "State": "Full/PointToPoint",
+        "Priority": "128",
+        "Dead Timer": "00:00:39",
+        "Uptime": "00:47:08",
+        "Graceful Restart": "",
+        "P2P": "",
+        "Route Pools": ""
+      }
+    ],
+    "isis": [
+      {
+        "Device": "device1",
+        "ISIS Status": "",
+        "Neighbor Type": "IPv4",
+        "Neighbor Hostname": "san-q5130e-04",
+        "Interface": "vlan20",
+        "ISIS Area": "CORE",
+        "Level": "Level-3",
+        "ISIS Net": "",
+        "System ID": "",
+        "Hello Interval": "",
+        "Multiplier": ""
+      }
+    ]
   },
   "bgp_route_pools": [
     {

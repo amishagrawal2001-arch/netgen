@@ -4,6 +4,7 @@ from flask_cors import CORS
 from scapy.all import Ether, Dot1Q, IP, IPv6, TCP, UDP, ICMP, ARP, Raw, sendp, wrpcap, sendpfast, rdpcap, sniff
 from concurrent.futures import ThreadPoolExecutor
 from threading import Event, Lock
+import threading
 import logging
 import psutil
 import time
@@ -452,6 +453,7 @@ def start_device():
 
     try:
         logging.info(f"[DEVICE START] Function entry - starting device processing")
+        global device_db
         device_id = data.get("device_id")
         device_name = data.get("device_name", f"device_{device_id}")
         iface = data.get("interface", "")
@@ -463,6 +465,14 @@ def start_device():
         vlan = data.get("vlan", "0")
         
         logging.info(f"[DEVICE START] Extracted values: device_id={device_id}, iface={iface}, vlan={vlan}, ipv4={ipv4}, ipv6={ipv6}")
+
+        # Mark device as starting to indicate in-progress lifecycle
+        try:
+            if device_id:
+                device_db.update_device_status(device_id, "Starting")
+                logging.info(f"[DEVICE DB] Device {device_id} status updated to Starting")
+        except Exception as e:
+            logging.warning(f"[DEVICE DB] Failed to update device {device_id} status to Starting: {e}")
 
         # Normalize interface name (extract base interface from labels like "TG 0 - Port: ens4np0")
         def normalize_iface(iface_str):
@@ -679,8 +689,8 @@ def start_device():
                             device_name_from_container = device_name  # Default to request value
                             try:
                                 from utils.device_database import DeviceDatabase
-                                device_db = DeviceDatabase()
-                                device_data = device_db.get_device(device_id) if device_id else None
+                                db_lookup = DeviceDatabase()
+                                device_data = db_lookup.get_device(device_id) if device_id else None
                                 if device_data:
                                     device_name_from_container = device_data.get('device_name', device_name)
                             except Exception as e:
@@ -700,7 +710,15 @@ def start_device():
                             if ospf_config and isinstance(ospf_config, dict) and len(ospf_config) > 0:
                                 logging.info(f"[DEVICE START] Configuring OSPF in existing container")
                                 from utils.ospf import configure_ospf_neighbor
-                                configure_ospf_neighbor(device_id, ospf_config, device_name_from_container)
+                                configure_ospf_neighbor(
+                                    device_id,
+                                    ospf_config,
+                                    device_name_from_container,
+                                    ipv4=ipv4_for_config,
+                                    ipv6=ipv6_for_config,
+                                    ipv4_mask=ipv4_mask_for_config,
+                                    ipv6_mask=ipv6_mask_for_config,
+                                )
                             else:
                                 logging.warning(f"[DEVICE START] OSPF config is empty or invalid, skipping OSPF configuration")
                             
@@ -799,7 +817,15 @@ def start_device():
                                 if ospf_config and isinstance(ospf_config, dict) and len(ospf_config) > 0:
                                     logging.info(f"[DEVICE START] Configuring OSPF in newly created container")
                                     from utils.ospf import configure_ospf_neighbor
-                                    configure_ospf_neighbor(device_id, ospf_config, device_name)
+                                    configure_ospf_neighbor(
+                                        device_id,
+                                        ospf_config,
+                                        device_name,
+                                        ipv4=ipv4_for_config,
+                                        ipv6=ipv6_for_config,
+                                        ipv4_mask=ipv4_mask_for_config,
+                                        ipv6_mask=ipv6_mask_for_config,
+                                    )
                                 else:
                                     logging.warning(f"[DEVICE START] OSPF config is empty or invalid, skipping OSPF configuration")
                                 
@@ -818,29 +844,20 @@ def start_device():
             import traceback
             logging.error(traceback.format_exc())
 
-        # Trigger BGP status check for this device after start
-        try:
-            if device_id:
-                logging.info(f"[BGP STATUS] Triggering BGP status check for device {device_id} after start")
-                bgp_monitor.force_check()
-        except Exception as e:
-            logging.warning(f"[BGP STATUS] Failed to trigger BGP status check for device {device_id}: {e}")
-        
-        # Trigger OSPF status check for this device after start
-        try:
-            if device_id:
-                logging.info(f"[OSPF STATUS] Triggering OSPF status check for device {device_id} after start")
-                ospf_monitor.force_check()
-        except Exception as e:
-            logging.warning(f"[OSPF STATUS] Failed to trigger OSPF status check for device {device_id}: {e}")
-        
-        # Trigger ISIS status check for this device after start
-        try:
-            if device_id:
-                logging.info(f"[ISIS STATUS] Triggering ISIS status check for device {device_id} after start")
-                isis_monitor.force_check()
-        except Exception as e:
-            logging.warning(f"[ISIS STATUS] Failed to trigger ISIS status check for device {device_id}: {e}")
+        def _trigger_monitor_async(label: str, check_fn):
+            def _runner():
+                try:
+                    logging.info(f"[{label} STATUS] (async) Triggering status check for device {device_id} after start")
+                    check_fn()
+                except Exception as exc:
+                    logging.warning(f"[{label} STATUS] (async) Failed to trigger status check for device {device_id}: {exc}")
+            threading.Thread(target=_runner, daemon=True).start()
+
+        # Trigger protocol status checks asynchronously after start
+        if device_id:
+            _trigger_monitor_async("BGP", bgp_monitor.force_check)
+            _trigger_monitor_async("OSPF", ospf_monitor.force_check)
+            _trigger_monitor_async("ISIS", isis_monitor.force_check)
         
         return jsonify({"status": "started", "details": result}), 200
     except Exception as e:
@@ -1526,6 +1543,8 @@ def configure_isis():
         interface = data.get("interface")
         ipv4 = data.get("ipv4", "")
         ipv6 = data.get("ipv6", "")
+        ipv4_mask = data.get("ipv4_mask", "24")
+        ipv6_mask = data.get("ipv6_mask", "64")
         isis_config = data.get("isis_config", {})
         
         if not device_id or not isis_config:
@@ -2793,6 +2812,8 @@ def stop_device():
                         'isis_state': 'Down',
                         'isis_established': False,
                         'isis_neighbors': None,
+                        'isis_manual_override': False,
+                        'isis_manual_override_time': None,
                         # Update timestamps
                         'last_bgp_check': datetime.now(timezone.utc).isoformat(),
                         'last_ospf_check': datetime.now(timezone.utc).isoformat(),
@@ -2809,38 +2830,9 @@ def stop_device():
             logging.error(f"[DEVICE STOP] Error stopping FRR container for {device_name}: {e}")
             result["container_stopped"] = False
         
-        # Shutdown the associated interface (bring interface down)
-        try:
-            # Build interface name (with VLAN if applicable)
-            if vlan and vlan != "0":
-                iface_name = f"vlan{vlan}"
-            else:
-                iface_name = interface
-            
-            if iface_name:
-                # Bring interface down using ip link set down
-                shutdown_result = subprocess.run(
-                    ["ip", "link", "set", iface_name, "down"],
-                    capture_output=True,
-                    text=True,
-                    timeout=5
-                )
-                
-                if shutdown_result.returncode == 0:
-                    logging.info(f"[DEVICE STOP] Interface {iface_name} shut down for device {device_name}")
-                    result["interface_shutdown"] = True
-                else:
-                    logging.warning(f"[DEVICE STOP] Failed to shutdown interface {iface_name}: {shutdown_result.stderr}")
-                    result["interface_shutdown"] = False
-            else:
-                logging.warning(f"[DEVICE STOP] No interface specified for device {device_name}")
-                result["interface_shutdown"] = False
-                
-        except Exception as e:
-            logging.warning(f"[DEVICE STOP] Failed to shutdown interface for {device_name}: {e}")
-            result["interface_shutdown"] = False
-        
-        logging.info(f"[DEVICE STOP] Device {device_name} stopped (interface down, protocols stopped)")
+        # Interface shutdown is intentionally skipped; container stop is sufficient for light stop
+        result["interface_shutdown"] = False
+        logging.info(f"[DEVICE STOP] Device {device_name} stopped (container only, interface left up)")
         
         # Update device status in database and ensure all protocol statuses are cleared
         try:
@@ -2868,6 +2860,8 @@ def stop_device():
                 'isis_state': 'Down',
                 'isis_established': False,
                 'isis_neighbors': None,
+                'isis_manual_override': False,
+                'isis_manual_override_time': None,
                 # Update timestamps
                 'last_bgp_check': datetime.now(timezone.utc).isoformat(),
                 'last_ospf_check': datetime.now(timezone.utc).isoformat(),
@@ -2912,7 +2906,7 @@ def remove_device():
         try:
             from utils.frr_docker import stop_frr_container
             
-            success = stop_frr_container(device_id, device_name)
+            success = stop_frr_container(device_id, device_name, remove=True)
             if success:
                 logging.info(f"[DEVICE REMOVE] FRR container stopped and removed for {device_name} ({device_id})")
                 container_removed = True

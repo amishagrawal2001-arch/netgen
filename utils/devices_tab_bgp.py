@@ -796,7 +796,14 @@ class BGPHandler:
             return
         
         # Multiple neighbors selected - show dialog for bulk attachment
-        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QListWidget, QPushButton, QDialogButtonBox, QCheckBox, QGroupBox
+        from PyQt5.QtWidgets import (
+            QDialog,
+            QVBoxLayout,
+            QLabel,
+            QListWidget,
+            QDialogButtonBox,
+            QGroupBox,
+        )
         
         class BulkAttachRoutePoolsDialog(QDialog):
             def __init__(self, parent, selected_neighbors, available_pools):
@@ -1513,7 +1520,7 @@ class BGPHandler:
             QMessageBox.information(self.parent, "No BGP Changes", 
                                   "No BGP configurations to apply or remove.")
             return
-
+        
         # Track which address families are selected for each device
         device_address_families = {}  # device_name -> set of address families (IPv4, IPv6)
         
@@ -1551,7 +1558,7 @@ class BGPHandler:
                     "removal_success_count": 0,
                     "removal_failed_devices": []
                 }
-                
+        
                 # Handle BGP application
                 for device_info in self.devices_to_apply_bgp:
                     device_name = device_info.get("Device Name", "Unknown")
@@ -1560,7 +1567,7 @@ class BGPHandler:
                     if not device_id:
                         results["failed_devices"].append(f"{device_name}: Missing device ID")
                         continue
-                        
+                    
                     try:
                         # Prepare BGP configuration payload
                         bgp_config = device_info.get("bgp_config", {}).copy()
@@ -1588,12 +1595,15 @@ class BGPHandler:
                             "ipv6": device_info.get("IPv6", ""),
                             "gateway": device_info.get("Gateway", ""),  # Include gateway for static route
                             "bgp_config": bgp_config,
-                            "all_route_pools": getattr(self.parent_handler.parent.main_window, 'bgp_route_pools', [])  # Include all route pools for generation
+                            "all_route_pools": getattr(self.parent_handler.parent.main_window, 'bgp_route_pools', []),  # Include all route pools for generation
                         }
                         
                         # Send BGP configuration to server
-                        response = requests.post(f"{self.server_url}/api/device/bgp/configure", 
-                                               json=payload, timeout=30)
+                        response = requests.post(
+                            f"{self.server_url}/api/device/bgp/configure",
+                            json=payload,
+                            timeout=30,
+                        )
                         
                         if response.status_code == 200:
                             results["success_count"] += 1
@@ -1612,11 +1622,14 @@ class BGPHandler:
                                     "protocols": ["BGP"],
                                     "ipv4_mask": device_info.get("ipv4_mask", "24"),
                                     "ipv6_mask": device_info.get("ipv6_mask", "64"),
-                                    "bgp_config": bgp_config
+                                    "bgp_config": bgp_config,
                                 }
                                 
-                                start_response = requests.post(f"{self.server_url}/api/device/start", 
-                                                            json=start_payload, timeout=30)
+                                start_response = requests.post(
+                                    f"{self.server_url}/api/device/start",
+                                    json=start_payload,
+                                    timeout=30,
+                                )
                                 
                                 if start_response.status_code == 200:
                                     print(f"✅ BGP service started for {device_name}")
@@ -1637,7 +1650,7 @@ class BGPHandler:
                     except Exception as e:
                         results["failed_devices"].append(f"{device_name}: {str(e)}")
                         print(f"❌ Error applying BGP for {device_name}: {str(e)}")
-                
+
                 # Handle BGP removal
                 for device_info in self.devices_to_remove_bgp:
                     device_name = device_info.get("Device Name", "Unknown")
@@ -1646,12 +1659,14 @@ class BGPHandler:
                     if not device_id:
                         results["removal_failed_devices"].append(f"{device_name}: Missing device ID")
                         continue
-                        
+                    
                     try:
                         # Call BGP cleanup endpoint to remove BGP configuration
-                        response = requests.post(f"{self.server_url}/api/bgp/cleanup", 
-                                               json={"device_id": device_id}, 
-                                               timeout=30)
+                        response = requests.post(
+                            f"{self.server_url}/api/bgp/cleanup",
+                            json={"device_id": device_id},
+                            timeout=30,
+                        )
                         
                         if response.status_code == 200:
                             results["removal_success_count"] += 1
@@ -1679,6 +1694,8 @@ class BGPHandler:
                     except Exception as e:
                         results["removal_failed_devices"].append(f"{device_name}: {str(e)}")
                         print(f"❌ Error removing BGP for {device_name}: {str(e)}")
+                
+                self.finished.emit(results)
                 
                 # Emit results when done
                 self.finished.emit(results)
@@ -1740,7 +1757,7 @@ class BGPHandler:
         failed_devices = results["failed_devices"]
         removal_success_count = results["removal_success_count"]
         removal_failed_devices = results["removal_failed_devices"]
-        
+
         # Show results - combine application and removal results
         total_success = success_count + removal_success_count
         total_failed = len(failed_devices) + len(removal_failed_devices)

@@ -176,24 +176,42 @@ class TrafficGenClientMenuAction():
             print("Server interfaces saved successfully.")
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Could not save server interfaces: {e}")
-    def save_session(self):
-        """Save the current session to a JSON file (non-blocking, runs in separate thread)."""
+    def save_session(self, blocking: bool = False):
+        """Save the current session to a JSON file.
+
+        Args:
+            blocking: When True, perform the save synchronously on the caller thread.
+                      When False (default), run the save in a background QThread.
+        """
         import traceback
         import time
         # Starting save_session()
         
-        # Check if this is a duplicate save call within a short time window
         current_time = time.time()
-        if hasattr(self, '_last_save_time') and (current_time - self._last_save_time) < 1.0:
-            # Skipping duplicate save call
-            return
-        self._last_save_time = current_time
+        if not blocking:
+            # Check if this is a duplicate save call within a short time window
+            if hasattr(self, '_last_save_time') and (current_time - self._last_save_time) < 1.0:
+                # Skipping duplicate save call
+                return
+            self._last_save_time = current_time
+            # Check if another save is already in progress
+            if hasattr(self, '_save_in_progress') and self._save_in_progress:
+                # Save already in progress
+                return
+        else:
+            # For blocking saves we still update the timestamp so throttling remains accurate
+            self._last_save_time = current_time
         
-        # Check if another save is already in progress
-        if hasattr(self, '_save_in_progress') and self._save_in_progress:
-            # Save already in progress
-            return
-        self._save_in_progress = True
+        # Determine if a worker is already running
+        worker_exists = hasattr(self, '_save_worker') and self._save_worker is not None
+        worker_running = False
+        if worker_exists:
+            try:
+                worker_running = self._save_worker.isRunning()
+            except RuntimeError:
+                worker_running = False
+                self._save_worker = None
+                worker_exists = False
         
         # CRITICAL: Extract PyQt widget data in main thread before starting worker
         # PyQt widgets cannot be accessed from worker threads
@@ -205,6 +223,36 @@ class TrafficGenClientMenuAction():
                 protocol_data["ospf"] = self._extract_table_data(self.devices_tab.ospf_table)
             if hasattr(self.devices_tab, "isis_table"):
                 protocol_data["isis"] = self._extract_table_data(self.devices_tab.isis_table)
+        
+        # If we're running a blocking save during shutdown, wait for any existing worker
+        if blocking:
+            try:
+                if worker_exists and worker_running:
+                    print("[SAVE SESSION] Waiting for existing background save to finish...")
+                    if not self._save_worker.wait(5000):
+                        print("[SAVE SESSION WARNING] Background save did not finish within timeout; forcing termination.")
+                        self._save_worker.terminate()
+                        self._save_worker.wait(1000)
+                if worker_exists and self._save_worker is not None:
+                    try:
+                        self._save_worker.deleteLater()
+                    except RuntimeError:
+                        pass
+                    self._save_worker = None
+                self._save_in_progress = True
+                success, message = self._save_session_impl(protocol_data)
+            except Exception as e:
+                traceback.print_exc()
+                success, message = False, str(e)
+            finally:
+                self._save_in_progress = False
+            if success:
+                print(f"[SAVE SESSION] {message}")
+            else:
+                print(f"[SAVE SESSION ERROR] {message}")
+            return success, message
+        
+        self._save_in_progress = True
         
         # Run save operation in separate thread to avoid blocking UI
         from PyQt5.QtCore import QThread, pyqtSignal
@@ -228,18 +276,6 @@ class TrafficGenClientMenuAction():
         # Start the save worker thread
         # CRITICAL: Check if worker exists and is valid before checking isRunning()
         # The worker might have been deleted via deleteLater() but not yet cleaned up
-        worker_exists = hasattr(self, '_save_worker') and self._save_worker is not None
-        worker_running = False
-        
-        if worker_exists:
-            try:
-                # Try to check if worker is running - might fail if object is deleted
-                worker_running = self._save_worker.isRunning()
-            except RuntimeError:
-                # Object has been deleted, treat as not running
-                worker_running = False
-                self._save_worker = None
-        
         # Clean up previous worker if it exists and is finished
         if worker_exists and not worker_running:
             try:
@@ -256,7 +292,6 @@ class TrafficGenClientMenuAction():
             # CRITICAL: Set parent to ensure proper cleanup
             self._save_worker.setParent(self)
             # Reset finish connection tracking for this worker
-            self._save_worker_finish_connected = False
             # CRITICAL: Connect finished signal to deleteLater for automatic cleanup
             self._save_worker.finished.connect(self._save_worker.deleteLater)
             # Connect finished signal to our handler

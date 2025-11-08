@@ -505,8 +505,8 @@ class FRRDockerManager:
             logger.error(f"[FRR] Traceback: {traceback.format_exc()}")
             return False
     
-    def stop_frr_container(self, device_id: str, device_name: str = None) -> bool:
-        """Stop FRR container"""
+    def stop_frr_container(self, device_id: str, device_name: str = None, remove: bool = False) -> bool:
+        """Stop (and optionally remove) FRR container"""
         try:
             container_name = self._get_container_name(device_id, device_name)
             
@@ -515,7 +515,12 @@ class FRRDockerManager:
                 container = self.client.containers.get(container_name)
                 logger.info(f"[FRR] Stopping container {container_name}")
                 container.stop(timeout=10)
-                logger.info(f"[FRR] Container {container_name} stopped successfully (not removed)")
+                if remove:
+                    logger.info(f"[FRR] Removing container {container_name}")
+                    container.remove(force=True)
+                    logger.info(f"[FRR] Container {container_name} removed successfully")
+                else:
+                    logger.info(f"[FRR] Container {container_name} stopped successfully (not removed)")
             except docker.errors.NotFound:
                 logger.info(f"[FRR] Container {container_name} not found")
             
@@ -536,9 +541,9 @@ def start_frr_container(device_id: str, device_config: Dict) -> Optional[str]:
     """Start FRR container for device."""
     return frr_manager.start_frr_container(device_id, device_config)
 
-def stop_frr_container(device_id: str, device_name: str = None) -> bool:
-    """Stop FRR container for device."""
-    return frr_manager.stop_frr_container(device_id, device_name)
+def stop_frr_container(device_id: str, device_name: str = None, remove: bool = False) -> bool:
+    """Stop (and optionally remove) FRR container for device."""
+    return frr_manager.stop_frr_container(device_id, device_name, remove=remove)
 
 def configure_bgp_neighbor(device_id: str, neighbor_config: Dict, device_name: str = None) -> bool:
     """Configure BGP neighbor in FRR container."""

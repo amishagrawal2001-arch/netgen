@@ -177,7 +177,7 @@ def configure_isis_neighbor(device_id: str, isis_config: Dict[str, Any], device_
         # Wait for container to be ready and daemons to start
         # Optimized to match BGP performance: fewer retries, faster timeout
         import time
-        max_retries = 5  # Reduced from 10 to match BGP (faster for ready containers)
+        max_retries = 10  # Allow additional retries to ensure isisd fully starts after container restart
         retry_delay = 2  # Increased from 1 to 2 to match BGP (fewer retries needed)
         
         def exec_run_with_timeout(cmd, timeout_sec=3):
@@ -212,14 +212,15 @@ def configure_isis_neighbor(device_id: str, isis_config: Dict[str, Any], device_
                 # This ensures isisd is actually ready to accept configuration commands
                 check_result = exec_run_with_timeout("vtysh -c 'show isis'", timeout_sec=3)
                 check_output = check_result.output.decode('utf-8') if isinstance(check_result.output, bytes) else str(check_result.output) if check_result else ""
-                
-                if check_result and (check_result.exit_code == 0 or "isisd is not running" not in check_output):
+                output_lower = check_output.lower() if check_output else ""
+
+                if check_result and check_result.exit_code == 0 and "isisd is not running" not in output_lower:
                     isisd_ready = True
                     logger.info(f"[ISIS CONFIGURE] Container and FRR daemons ready for {device_name} (attempt {attempt + 1})")
                     break
                 else:
                     # ISIS daemon not ready yet or timeout
-                    logger.debug(f"[ISIS CONFIGURE] ISIS daemon not ready yet (attempt {attempt + 1}/{max_retries})")
+                    logger.debug(f"[ISIS CONFIGURE] ISIS daemon not ready yet (attempt {attempt + 1}/{max_retries}) - output: {check_output.strip() if check_output else 'No output'}")
             except Exception as e:
                 # Container exec failed
                 logger.debug(f"[ISIS CONFIGURE] Container exec failed (attempt {attempt + 1}/{max_retries}): {e}")
@@ -342,7 +343,10 @@ def configure_isis_neighbor(device_id: str, isis_config: Dict[str, Any], device_
             _out = str(result.output)
         if _out:
             logging.debug(f"[ISIS CONFIGURE] vtysh output:\n{_out}")
-        
+            if "isisd is not running" in _out.lower():
+                logging.error(f"[ISIS CONFIGURE] Unable to configure ISIS because isisd daemon is not running")
+                return False
+
         if result.exit_code != 0:
             logging.error(f"[ISIS CONFIGURE] Command failed: {result.output.decode()}")
             return False
@@ -368,12 +372,12 @@ def configure_isis_neighbor(device_id: str, isis_config: Dict[str, Any], device_
                 'isis_config': saved_isis_config,  # Save actual ISIS configuration values used
                 'isis_running': True,
                 'isis_established': False,  # Set to False initially - monitor will update when actually established
-                'isis_state': 'Running',
+                'isis_state': 'Starting',
                 'isis_system_id': system_id,
                 'isis_net': area_id,
                 'last_isis_check': datetime.now(timezone.utc).isoformat(),
-                'isis_manual_override': True,  # Flag to prevent monitor from overriding
-                'isis_manual_override_time': datetime.now(timezone.utc).isoformat()
+                'isis_manual_override': False,
+                'isis_manual_override_time': None
             }
             device_db.update_device(device_id, update_data)
             logging.info(f"[ISIS CONFIGURE] Updated ISIS config and status in database for device {device_name}")
@@ -503,11 +507,11 @@ def start_isis_neighbor(device_id: str, device_name: str, container_id: str, isi
                 
                 update_data = {
                     'isis_running': True,
-                    'isis_state': 'Running',
+                    'isis_state': 'Starting',
                     'isis_established': False,  # Will be updated by monitor
                     'last_isis_check': datetime.now(timezone.utc).isoformat(),
-                    'isis_manual_override': True,  # Flag to prevent monitor from overriding
-                    'isis_manual_override_time': datetime.now(timezone.utc).isoformat()
+                    'isis_manual_override': False,
+                    'isis_manual_override_time': None
                 }
                 device_db.update_device(device_id, update_data)
                 logger.info(f"[ISIS START] Updated ISIS status in database for device {device_name}")
@@ -684,8 +688,8 @@ def stop_isis_neighbor(device_id: str, device_name: str = None, container_id: st
                 'isis_net': None,
                 'isis_uptime': None,
                 'last_isis_check': datetime.now(timezone.utc).isoformat(),
-                'isis_manual_override': True,  # Flag to prevent monitor from overriding
-                'isis_manual_override_time': datetime.now(timezone.utc).isoformat()
+                'isis_manual_override': False,
+                'isis_manual_override_time': None
             }
             device_db.update_device(device_id, update_data)
             logger.info(f"[ISIS STOP] Updated ISIS status in database for device {device_name}")
