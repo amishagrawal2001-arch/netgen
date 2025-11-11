@@ -23,6 +23,7 @@ from utils.helpers import increment_ip, increment_ipv6, increment_mac, is_interf
 from utils.device_database import DeviceDatabase
 from utils.bgp_monitor import BGPStatusManager
 from utils.arp_monitor import ARPStatusMonitor
+from utils.dhcp import ensure_dhcp_services, stop_dhcp_services
 
 
 # Initialize Flask app and CORS
@@ -500,6 +501,67 @@ def start_device():
             logging.error(f"[DEVICE START] {error_msg}")
             return jsonify({"error": error_msg}), 400
         
+        # Prepare protocol and DHCP context before manipulating addresses
+        protocols = data.get("protocols", [])
+        if isinstance(protocols, str):
+            try:
+                protocols = json.loads(protocols) if protocols else []
+            except Exception:
+                protocols = [p.strip() for p in protocols.split(",") if p.strip()]
+        elif not isinstance(protocols, list):
+            protocols = []
+        
+        raw_dhcp_config = data.get("dhcp_config")
+        dhcp_config = {}
+        if isinstance(raw_dhcp_config, str):
+            try:
+                dhcp_config = json.loads(raw_dhcp_config) if raw_dhcp_config else {}
+            except Exception:
+                logging.warning(f"[DEVICE START] Failed to parse DHCP config payload: {raw_dhcp_config}")
+                dhcp_config = {}
+        elif isinstance(raw_dhcp_config, dict):
+            dhcp_config = raw_dhcp_config.copy()
+        
+        device_data = None
+        if device_id:
+            try:
+                device_data = device_db.get_device(device_id)
+            except Exception as fetch_exc:
+                logging.warning(f"[DEVICE START] Failed to load device {device_id} from database: {fetch_exc}")
+        
+        if not protocols and device_data:
+            protocols = device_data.get("protocols", []) or []
+        
+        if not dhcp_config and device_data:
+            existing_dhcp_config = device_data.get("dhcp_config") or {}
+            if isinstance(existing_dhcp_config, dict):
+                dhcp_config = existing_dhcp_config.copy()
+        
+        dhcp_mode = (dhcp_config.get("mode") or "").lower() if isinstance(dhcp_config, dict) else ""
+        if dhcp_config and "DHCP" not in protocols:
+            protocols.append("DHCP")
+        if dhcp_mode == "client":
+            protocols = [p for p in protocols if p in ("OSPF", "ISIS", "DHCP")]
+        
+        if device_id and dhcp_mode:
+            try:
+                device_db.update_device(device_id, {
+                    "dhcp_mode": dhcp_config.get("mode"),
+                    "dhcp_config": dhcp_config,
+                    "dhcp_state": "Pending",
+                    "dhcp_running": False,
+                    "last_dhcp_check": datetime.now(timezone.utc).isoformat()
+                })
+            except Exception as pending_exc:
+                logging.warning(f"[DEVICE START] Failed to mark DHCP state Pending for {device_id}: {pending_exc}")
+        
+        # Skip static IP assignment for DHCP client devices
+        if dhcp_mode == "client":
+            ipv4 = ""
+            ipv6 = ""
+            ipv4_mask = ""
+            ipv6_mask = ""
+        
         # Step 1: Bring up interface
         try:
             bringup_result = subprocess.run(["ip", "link", "set", iface_name, "up"], capture_output=True, text=True, timeout=5)
@@ -565,6 +627,30 @@ def start_device():
         except Exception as e:
             logging.warning(f"[DEVICE DB] Failed to update device {device_id} status to Running: {e}")
         
+        dhcp_result = None
+        if device_id and dhcp_mode in ("client", "server") and dhcp_config:
+            try:
+                logging.info(f"[DHCP] Ensuring DHCP {dhcp_mode} services for device {device_id} on {iface_name}")
+                dhcp_result = ensure_dhcp_services(
+                    device_db,
+                    device_id,
+                    iface_name,
+                    dhcp_config,
+                    force_client_restart=(dhcp_mode == "client"),
+                )
+                result["dhcp"] = dhcp_result
+                if dhcp_result.get("success"):
+                    # Refresh device record to pick up lease/server state
+                    try:
+                        device_data = device_db.get_device(device_id)
+                    except Exception as refresh_exc:
+                        logging.warning(f"[DHCP] Failed to refresh device {device_id} after DHCP ensure: {refresh_exc}")
+            except Exception as dhcp_error:
+                logging.warning(f"[DHCP] Failed to configure DHCP services for device {device_id}: {dhcp_error}")
+                result["dhcp"] = {"success": False, "error": str(dhcp_error)}
+        
+        # Recompute protocol context using latest database state (after potential DHCP refresh)
+        dhcp_mode = (dhcp_config.get("mode") or "").lower() if isinstance(dhcp_config, dict) else ""
         # Auto-restore FRR container and protocols if device was previously configured
         try:
             if device_id:
@@ -584,10 +670,20 @@ def start_device():
                         except:
                             protocols = []
                     
+                    dhcp_config = dhcp_config if dhcp_config else (device_data.get("dhcp_config", {}) if device_data else {})
+                    if dhcp_config and "DHCP" not in protocols:
+                        protocols.append("DHCP")
+                    if isinstance(dhcp_config, dict):
+                        dhcp_mode = (dhcp_config.get("mode") or "").lower()
+                        if dhcp_mode == "client":
+                            protocols = [p for p in protocols if p != "BGP"]
+                    
                     # Also check if protocol configs are provided even if protocols list is empty
                     has_bgp_config = bool(data.get("bgp_config") or device_data.get("bgp_config"))
                     has_ospf_config = bool(data.get("ospf_config") or device_data.get("ospf_config"))
                     has_isis_config = bool(data.get("isis_config") or device_data.get("isis_config"))
+                    if dhcp_mode == "client":
+                        has_bgp_config = False
                     
                     if (protocols and (isinstance(protocols, list) and len(protocols) > 0)) or has_bgp_config or has_ospf_config or has_isis_config:
                         if protocols:
@@ -612,6 +708,42 @@ def start_device():
                                 time.sleep(5)
                             else:
                                 logging.info(f"[DEVICE START] Container {container_name} is already running, reconfiguring protocols with updated configs")
+                            
+                            try:
+                                interface_config = {
+                                    "interface": iface_normalized,
+                                    "vlan": vlan,
+                                    "ipv4": ipv4 if dhcp_mode != "client" else "",
+                                    "ipv6": ipv6,
+                                    "loopback_ipv4": device_data.get("loopback_ipv4") if device_data else "",
+                                    "loopback_ipv6": device_data.get("loopback_ipv6") if device_data else "",
+                                    "dhcp_mode": dhcp_mode,
+                                    "bgp_asn": device_data.get("bgp_asn", 65000) if device_data else 65000,
+                                    "router_id": (device_data.get("loopback_ipv4") or device_data.get("ipv4_address", "") if device_data else ""),
+                                }
+                                frr_manager._configure_interfaces(container_name, device_id, interface_config)
+                            except Exception as iface_exc:
+                                logging.warning(f"[DEVICE START] Failed to sync interface config for container {container_name}: {iface_exc}")
+                        
+                            if dhcp_mode in ("client", "server") and dhcp_config:
+                                try:
+                                    dhcp_result = ensure_dhcp_services(
+                                        device_db,
+                                        device_id,
+                                        iface_name,
+                                        dhcp_config,
+                                        container=container,
+                                        force_client_restart=(dhcp_mode == "client"),
+                                    )
+                                    result["dhcp"] = dhcp_result
+                                    if dhcp_result.get("success"):
+                                        try:
+                                            device_data = device_db.get_device(device_id)
+                                        except Exception as refresh_exc:
+                                            logging.warning(f"[DHCP] Failed to refresh device {device_id} after DHCP ensure: {refresh_exc}")
+                                except Exception as dhcp_error:
+                                    logging.warning(f"[DHCP] Failed to configure DHCP services for device {device_id}: {dhcp_error}")
+                                    result["dhcp"] = {"success": False, "error": str(dhcp_error)}
                             
                             # Always configure protocols with latest configs from payload (or database)
                             # This ensures that after device edit, protocols are updated even if container was already running
@@ -671,10 +803,38 @@ def start_device():
                                 logging.info(f"[DEVICE START] Using ISIS config from database: {bool(isis_config)}")
                             
                             # Configure protocols in the container
-                            # Use IP addresses from payload (latest from client) or fallback to database
-                            ipv4_for_config = ipv4 if ipv4 else device_data.get('ipv4_address', '')
-                            ipv4_mask_for_config = ipv4_mask if ipv4_mask else device_data.get('ipv4_mask', '24')
-                            ipv4_full = f"{ipv4_for_config}/{ipv4_mask_for_config}" if ipv4_for_config else ""
+                            # Use IP addresses from payload (latest from client) or fallback to database / DHCP lease
+                            ipv4_for_config = ""
+                            ipv4_mask_for_config = ""
+                            if dhcp_mode == "client":
+                                lease_ip = ""
+                                lease_mask = ""
+                                if device_data:
+                                    lease_ip = (device_data.get("dhcp_lease_ip") or "").strip()
+                                    lease_mask = (device_data.get("dhcp_lease_mask") or "").strip()
+                                    if not lease_ip:
+                                        ipv4_cidr_db = device_data.get("ipv4_address") or ""
+                                        if isinstance(ipv4_cidr_db, str) and "/" in ipv4_cidr_db:
+                                            addr_part, mask_part = ipv4_cidr_db.split("/", 1)
+                                            lease_ip = addr_part.strip()
+                                            lease_mask = lease_mask or mask_part.strip()
+                                ipv4_for_config = lease_ip
+                                ipv4_mask_for_config = lease_mask or (device_data.get("ipv4_mask") if device_data else None) or "24"
+                            else:
+                                if ipv4:
+                                    ipv4_for_config = ipv4
+                                elif device_data:
+                                    ipv4_cidr_db = device_data.get("ipv4_address") or ""
+                                    if isinstance(ipv4_cidr_db, str) and "/" in ipv4_cidr_db:
+                                        addr_part, mask_part = ipv4_cidr_db.split("/", 1)
+                                        ipv4_for_config = addr_part.strip()
+                                        ipv4_mask_for_config = mask_part.strip()
+                                    elif isinstance(ipv4_cidr_db, str) and ipv4_cidr_db:
+                                        ipv4_for_config = ipv4_cidr_db.strip()
+                                if not ipv4_mask_for_config:
+                                    ipv4_mask_for_config = ipv4_mask or (device_data.get("ipv4_mask") if device_data else None) or "24"
+                            
+                            ipv4_full = f"{ipv4_for_config}/{ipv4_mask_for_config}" if ipv4_for_config and ipv4_mask_for_config else ""
                             
                             ipv6_for_config = ipv6 if ipv6 else device_data.get('ipv6_address', '')
                             ipv6_mask_for_config = ipv6_mask if ipv6_mask else device_data.get('ipv6_mask', '64')
@@ -698,7 +858,9 @@ def start_device():
                             
                             # Configure BGP if enabled
                             logging.info(f"[DEVICE START] Checking BGP config (existing container): bgp_config={bgp_config}, has content: {bool(bgp_config)}")
-                            if bgp_config and isinstance(bgp_config, dict) and len(bgp_config) > 0:
+                            if dhcp_mode == "client":
+                                logging.info("[DEVICE START] Skipping BGP configuration because device is in DHCP client mode")
+                            elif bgp_config and isinstance(bgp_config, dict) and len(bgp_config) > 0:
                                 logging.info(f"[DEVICE START] Configuring BGP in existing container")
                                 from utils.bgp import configure_bgp_for_device
                                 configure_bgp_for_device(device_id, bgp_config, ipv4_full, ipv6_full, device_name_from_container)
@@ -739,7 +901,8 @@ def start_device():
                                 "ipv4": ipv4,
                                 "ipv6": ipv6,
                                 "interface": iface_normalized,  # Use normalized interface name
-                                "vlan": vlan
+                                "vlan": vlan,
+                                "dhcp_mode": dhcp_mode,
                             }
                             
                             # Get protocol configs from payload first (if provided), otherwise from database
@@ -756,6 +919,8 @@ def start_device():
                                         bgp_config = {}
                                 else:
                                     bgp_config = bgp_config_raw if bgp_config_raw else {}
+                            if dhcp_mode == "client":
+                                bgp_config = {}
                             device_config["bgp_config"] = bgp_config
                             
                             # OSPF config: prefer payload, fallback to database
@@ -793,11 +958,65 @@ def start_device():
                                 import time
                                 time.sleep(3)  # Reduced from 5 to 3 since protocol functions have retry logic
                                 
+                                try:
+                                    container = frr_manager.client.containers.get(container_name)
+                                except Exception as container_exc:
+                                    logging.warning(f"[DEVICE START] Unable to retrieve container object {container_name}: {container_exc}")
+                                    container = None
+                                
+                                if dhcp_mode in ("client", "server") and dhcp_config:
+                                    try:
+                                        dhcp_result = ensure_dhcp_services(
+                                            device_db,
+                                            device_id,
+                                            iface_name,
+                                            dhcp_config,
+                                            container=container,
+                                            force_client_restart=(dhcp_mode == "client"),
+                                        )
+                                        result["dhcp"] = dhcp_result
+                                        if dhcp_result.get("success"):
+                                            try:
+                                                device_data = device_db.get_device(device_id)
+                                            except Exception as refresh_exc:
+                                                logging.warning(f"[DHCP] Failed to refresh device {device_id} after DHCP ensure: {refresh_exc}")
+                                    except Exception as dhcp_error:
+                                        logging.warning(f"[DHCP] Failed to configure DHCP services for device {device_id}: {dhcp_error}")
+                                        result["dhcp"] = {"success": False, "error": str(dhcp_error)}
+                                
                                 # Configure protocols in the newly created container
-                                # Use IP addresses from payload (latest from client) or fallback to database
-                                ipv4_for_config = ipv4 if ipv4 else device_data.get('ipv4_address', '')
-                                ipv4_mask_for_config = ipv4_mask if ipv4_mask else device_data.get('ipv4_mask', '24')
-                                ipv4_full = f"{ipv4_for_config}/{ipv4_mask_for_config}" if ipv4_for_config else ""
+                                # Use IP addresses from payload (latest from client) or fallback to database / DHCP lease
+                                ipv4_for_config = ""
+                                ipv4_mask_for_config = ""
+                                if dhcp_mode == "client":
+                                    lease_ip = ""
+                                    lease_mask = ""
+                                    if device_data:
+                                        lease_ip = (device_data.get("dhcp_lease_ip") or "").strip()
+                                        lease_mask = (device_data.get("dhcp_lease_mask") or "").strip()
+                                        if not lease_ip:
+                                            ipv4_cidr_db = device_data.get("ipv4_address") or ""
+                                            if isinstance(ipv4_cidr_db, str) and "/" in ipv4_cidr_db:
+                                                addr_part, mask_part = ipv4_cidr_db.split("/", 1)
+                                                lease_ip = addr_part.strip()
+                                                lease_mask = lease_mask or mask_part.strip()
+                                    ipv4_for_config = lease_ip
+                                    ipv4_mask_for_config = lease_mask or (device_data.get("ipv4_mask") if device_data else None) or "24"
+                                else:
+                                    if ipv4:
+                                        ipv4_for_config = ipv4
+                                    elif device_data:
+                                        ipv4_cidr_db = device_data.get("ipv4_address") or ""
+                                        if isinstance(ipv4_cidr_db, str) and "/" in ipv4_cidr_db:
+                                            addr_part, mask_part = ipv4_cidr_db.split("/", 1)
+                                            ipv4_for_config = addr_part.strip()
+                                            ipv4_mask_for_config = mask_part.strip()
+                                        elif isinstance(ipv4_cidr_db, str) and ipv4_cidr_db:
+                                            ipv4_for_config = ipv4_cidr_db.strip()
+                                    if not ipv4_mask_for_config:
+                                        ipv4_mask_for_config = ipv4_mask or (device_data.get("ipv4_mask") if device_data else None) or "24"
+                                
+                                ipv4_full = f"{ipv4_for_config}/{ipv4_mask_for_config}" if ipv4_for_config and ipv4_mask_for_config else ""
                                 
                                 ipv6_for_config = ipv6 if ipv6 else device_data.get('ipv6_address', '')
                                 ipv6_mask_for_config = ipv6_mask if ipv6_mask else device_data.get('ipv6_mask', '64')
@@ -805,7 +1024,9 @@ def start_device():
                                 
                                 # Configure BGP if enabled
                                 logging.info(f"[DEVICE START] Checking BGP config: bgp_config={bgp_config}, has content: {bool(bgp_config)}")
-                                if bgp_config and isinstance(bgp_config, dict) and len(bgp_config) > 0:
+                                if dhcp_mode == "client":
+                                    logging.info("[DEVICE START] Skipping BGP configuration because device is in DHCP client mode")
+                                elif bgp_config and isinstance(bgp_config, dict) and len(bgp_config) > 0:
                                     logging.info(f"[DEVICE START] Configuring BGP in newly created container")
                                     from utils.bgp import configure_bgp_for_device
                                     configure_bgp_for_device(device_id, bgp_config, ipv4_full, ipv6_full, device_name)
@@ -1177,6 +1398,9 @@ def device_isis_start():
             interface_raw = data.get("interface") or device.get("interface", "ens4np0")
             interface_normalized = normalize_iface(interface_raw)
             
+            dhcp_mode = (data.get("dhcp_mode") or device.get("dhcp_mode") or "")
+            dhcp_mode = dhcp_mode.lower() if isinstance(dhcp_mode, str) else ""
+
             # Create container with device configuration
             # CRITICAL: Use normalized interface name (not the original interface from request)
             device_config = {
@@ -1184,7 +1408,8 @@ def device_isis_start():
                 "ipv4": data.get("ipv4", device.get("ipv4_address", "")),
                 "ipv6": data.get("ipv6", device.get("ipv6_address", "")),
                 "interface": interface_normalized,  # Use normalized interface name
-                "vlan": data.get("vlan", str(device.get("vlan", "0")))
+                "vlan": data.get("vlan", str(device.get("vlan", "0"))),
+                "dhcp_mode": dhcp_mode,
             }
             container_name = frr_manager.start_frr_container(device_id, device_config)
             container = frr_manager.client.containers.get(container_name)
@@ -1571,12 +1796,23 @@ def configure_isis():
         except Exception:
             logging.info(f"[ISIS CONFIGURE] Container {container_name} not found, creating it...")
             # Create container with device configuration
+            dhcp_mode = (data.get("dhcp_mode") or "").lower()
+            if not dhcp_mode:
+                try:
+                    from utils.device_database import DeviceDatabase
+                    _db_lookup = DeviceDatabase()
+                    existing = _db_lookup.get_device(device_id)
+                    if existing:
+                        dhcp_mode = (existing.get("dhcp_mode") or "").lower()
+                except Exception:
+                    dhcp_mode = ""
             device_config = {
                 "device_name": device_name,
                 "ipv4": ipv4,
                 "ipv6": ipv6,
                 "interface": data.get("interface", "ens4np0"),
-                "vlan": data.get("vlan", "0")
+                "vlan": data.get("vlan", "0"),
+                "dhcp_mode": dhcp_mode,
             }
             container_name = frr_manager.start_frr_container(device_id, device_config)
             container = frr_manager.client.containers.get(container_name)
@@ -1879,7 +2115,31 @@ def apply_device():
         loopback_ipv4 = data.get("loopback_ipv4", "")
         loopback_ipv6 = data.get("loopback_ipv6", "")
         protocols = data.get("protocols", [])
+        dhcp_config_raw = data.get("dhcp_config", {})
+        if isinstance(protocols, str):
+            protocols = [p.strip() for p in protocols.split(",") if p.strip()]
+        if isinstance(dhcp_config_raw, str):
+            try:
+                dhcp_config = json.loads(dhcp_config_raw) if dhcp_config_raw else {}
+            except json.JSONDecodeError:
+                logging.warning(f"[DEVICE APPLY] Invalid DHCP config JSON: {dhcp_config_raw}")
+                dhcp_config = {}
+        else:
+            dhcp_config = dhcp_config_raw or {}
+        if dhcp_config and "DHCP" not in protocols:
+            protocols.append("DHCP")
         bgp_config = data.get("bgp_config", {})
+        dhcp_mode = (dhcp_config.get("mode") or "").lower() if isinstance(dhcp_config, dict) else ""
+        if dhcp_mode == "client":
+            logging.info(f"[DEVICE APPLY] DHCP client mode detected for device {device_id}; ignoring static IPv4/IPv6 values and BGP configuration")
+            ipv4 = ""
+            ipv6 = ""
+            ipv4_mask = ""
+            ipv6_mask = ""
+            ipv4_gateway = ""
+            ipv6_gateway = ""
+            protocols = [p for p in protocols if p in ("OSPF", "ISIS", "DHCP")]
+            bgp_config = {}
         ospf_config = data.get("ospf_config", {})
         isis_config = data.get("isis_config", {})
         
@@ -1890,6 +2150,7 @@ def apply_device():
         logging.info(f"[DEVICE APPLY] BGP Config: {bgp_config}")
         logging.info(f"[DEVICE APPLY] OSPF Config: {ospf_config}")
         logging.info(f"[DEVICE APPLY] ISIS Config: {isis_config}")
+        logging.info(f"[DEVICE APPLY] DHCP Config: {dhcp_config}")
         
         # Normalize interface name (extract base interface from labels like "TG 0 - Port: ens4np0")
         def normalize_iface(iface_str):
@@ -2171,7 +2432,9 @@ def apply_device():
                         "protocols": protocols,
                         "bgp_config": bgp_config,
                         "ospf_config": ospf_config,
-                        "isis_config": isis_config
+                        "isis_config": isis_config,
+                        "dhcp_config": dhcp_config,
+                        "dhcp_mode": dhcp_config.get("mode") if isinstance(dhcp_config, dict) else ""
                     }
                     
                     if device_db.add_device(device_data):
@@ -2284,6 +2547,15 @@ def apply_device():
                         update_data["isis_config"] = isis_config
                         update_data["is_is_config"] = isis_config  # Also update is_is_config for compatibility
                         logging.info(f"[DEVICE APPLY] Updating ISIS config for device {device_name}")
+                    if dhcp_config:
+                        update_data["dhcp_config"] = dhcp_config
+                        update_data["dhcp_mode"] = dhcp_config.get("mode") if isinstance(dhcp_config, dict) else ""
+                        logging.info(f"[DEVICE APPLY] Updating DHCP config for device {device_name}: mode={dhcp_config.get('mode')}")
+                    elif existing_device.get("dhcp_mode") and ("DHCP" not in protocols):
+                        update_data["dhcp_config"] = {}
+                        update_data["dhcp_mode"] = ""
+                        update_data["dhcp_state"] = "Disabled"
+                        update_data["dhcp_running"] = False
                     
                     # Update protocols list if provided
                     if protocols:
@@ -2301,6 +2573,34 @@ def apply_device():
             logging.warning(f"[DEVICE APPLY] Error checking/adding device to database: {e}")
         
         logging.info(f"[DEVICE APPLY] Device {device_name} configuration applied successfully")
+        
+        # Ensure DHCP services are running immediately after apply if requested
+        dhcp_apply_mode = (dhcp_config.get("mode") or "").lower() if isinstance(dhcp_config, dict) else ""
+        if device_id and dhcp_apply_mode in ("client", "server"):
+            try:
+                logging.info(f"[DHCP] Ensuring DHCP {dhcp_apply_mode} services for device {device_id} during apply on {iface_name}")
+                container_for_dhcp = None
+                try:
+                    from utils.frr_docker import FRRDockerManager
+                    _frr_manager = FRRDockerManager()
+                    _container_name = _frr_manager._get_container_name(device_id, device_name)
+                    container_for_dhcp = _frr_manager.client.containers.get(_container_name)
+                except Exception as container_exc:
+                    logging.debug(f"[DHCP] Unable to retrieve FRR container during apply for {device_id}: {container_exc}")
+                    container_for_dhcp = None
+
+                dhcp_apply_result = ensure_dhcp_services(
+                    device_db,
+                    device_id,
+                    iface_name,
+                    dhcp_config,
+                    container=container_for_dhcp,
+                    force_client_restart=(dhcp_apply_mode == "client"),
+                )
+                result["dhcp"] = dhcp_apply_result
+            except Exception as dhcp_error:
+                logging.warning(f"[DHCP] Failed to start DHCP during apply for device {device_id}: {dhcp_error}")
+                result["dhcp"] = {"success": False, "error": str(dhcp_error)}
         
         return jsonify({
             "status": "applied",
@@ -2392,13 +2692,24 @@ def configure_ospf():
             interface_raw = data.get("interface", "ens4np0")
             interface_normalized = normalize_iface(interface_raw)
             
+            dhcp_mode = (data.get("dhcp_mode") or "").lower()
+            if not dhcp_mode:
+                try:
+                    from utils.device_database import DeviceDatabase
+                    _db_lookup = DeviceDatabase()
+                    existing = _db_lookup.get_device(device_id)
+                    if existing:
+                        dhcp_mode = (existing.get("dhcp_mode") or "").lower()
+                except Exception:
+                    dhcp_mode = ""
             device_config = {
                 "device_name": device_name,
                 "ipv4": ipv4,
                 "ipv6": ipv6,
                 "interface": interface_normalized,  # Use normalized interface name
                 "vlan": data.get("vlan", "0"),
-                "ospf_config": ospf_config
+                "ospf_config": ospf_config,
+                "dhcp_mode": dhcp_mode,
             }
             
             logging.info(f"[OSPF CONFIGURE] Creating FRR container for device {device_name}")
@@ -2770,18 +3081,76 @@ def stop_device():
         
         logging.info(f"[DEVICE STOP] ID={device_id} Name='{device_name}' Interface='{interface}' Protocols={protocols}")
         
+        def normalize_iface(iface_str):
+            if not iface_str:
+                return ""
+            s = iface_str.strip().strip('"').rstrip(",")
+            if " - " in s:
+                s = s.split(" - ", 1)[-1].strip()
+            if ":" in s:
+                s = s.rsplit(":", 1)[-1].strip()
+            parts = s.split()
+            return parts[-1] if parts else ""
+        
+        iface_normalized = normalize_iface(interface)
+        iface_name = f"vlan{vlan}" if (vlan and vlan != "0") else iface_normalized
+        
+        from utils.frr_docker import FRRDockerManager
+        frr_manager = None
+        container_name = None
+        if device_id:
+            try:
+                frr_manager = FRRDockerManager()
+                container_name = frr_manager._get_container_name(device_id, device_name)
+            except Exception as e:
+                logging.debug(f"[DEVICE STOP] Failed to resolve container name: {e}")
+                frr_manager = None
+
+        dhcp_config = data.get("dhcp_config")
+        if isinstance(dhcp_config, str):
+            try:
+                dhcp_config = json.loads(dhcp_config) if dhcp_config else {}
+            except json.JSONDecodeError:
+                dhcp_config = {}
+        if (not dhcp_config) and device_id:
+            try:
+                existing_device = device_db.get_device(device_id)
+                if existing_device:
+                    dhcp_config = existing_device.get("dhcp_config", {}) or {}
+                    if isinstance(dhcp_config, str):
+                        dhcp_config = json.loads(dhcp_config) if dhcp_config else {}
+            except Exception as e:
+                logging.debug(f"[DEVICE STOP] Failed to load DHCP config from database: {e}")
+                dhcp_config = {}
+        dhcp_mode = ""
+        if isinstance(dhcp_config, dict):
+            dhcp_mode = (dhcp_config.get("mode") or "").lower()
+        
         result = {
             "device_id": device_id,
             "device": device_name,
             "interface": interface,
         }
         
+        # Stop DHCP services if configured
+        if dhcp_mode in ("client", "server") and iface_name:
+            try:
+                logging.info(f"[DHCP] Stopping DHCP {dhcp_mode} for device {device_id} on {iface_name}")
+                stop_dhcp_services(
+                    device_db,
+                    device_id,
+                    iface_name,
+                    dhcp_mode,
+                    remove_container=False,
+                )
+            except Exception as dhcp_error:
+                logging.warning(f"[DHCP] Failed to stop DHCP services: {dhcp_error}")
+        
         # Stop FRR container (this stops all protocols automatically)
         try:
-            from utils.frr_docker import FRRDockerManager
-            
-            frr_manager = FRRDockerManager()
-            container_name = frr_manager._get_container_name(device_id, device_name)
+            if not frr_manager:
+                frr_manager = FRRDockerManager()
+                container_name = frr_manager._get_container_name(device_id, device_name)
             
             logging.info(f"[DEVICE STOP] Stopping FRR container {container_name} for device {device_name}")
             
@@ -2818,6 +3187,12 @@ def stop_device():
                         'last_bgp_check': datetime.now(timezone.utc).isoformat(),
                         'last_ospf_check': datetime.now(timezone.utc).isoformat(),
                         'last_isis_check': datetime.now(timezone.utc).isoformat(),
+                        'dhcp_state': 'Stopped',
+                        'dhcp_running': False,
+                        'dhcp_lease_ip': None,
+                        'dhcp_lease_mask': None,
+                        'dhcp_lease_gateway': None,
+                        'last_dhcp_check': datetime.now(timezone.utc).isoformat(),
                     }
                     device_db.update_device(device_id, update_data)
                     logging.info(f"[DEVICE STOP] Updated all protocol statuses to stopped in database for {device_name}")
@@ -2866,6 +3241,12 @@ def stop_device():
                 'last_bgp_check': datetime.now(timezone.utc).isoformat(),
                 'last_ospf_check': datetime.now(timezone.utc).isoformat(),
                 'last_isis_check': datetime.now(timezone.utc).isoformat(),
+                'dhcp_state': 'Stopped',
+                'dhcp_running': False,
+                'dhcp_lease_ip': None,
+                'dhcp_lease_mask': None,
+                'dhcp_lease_gateway': None,
+                'last_dhcp_check': datetime.now(timezone.utc).isoformat(),
             }
             device_db.update_device(device_id, update_data)
             logging.info(f"[DEVICE DB] Device {device_id} status updated to Stopped and all protocol statuses cleared")
@@ -2894,10 +3275,40 @@ def remove_device():
     try:
         # Get device info from database before removing it (needed for cleanup)
         device_info = None
+        container_name = None
+        frr_manager = None
         try:
             device_info = device_db.get_device(device_id)
             if device_info and not device_name:
                 device_name = device_info.get("device_name", "")
+            if device_info:
+                base_iface = device_info.get("interface", "")
+                vlan = str(device_info.get("vlan", "0"))
+                iface_normalized = base_iface
+                if base_iface and " - " in base_iface:
+                    parts = base_iface.split(" - ", 1)
+                    iface_normalized = parts[-1].strip()
+                iface_name = f"vlan{vlan}" if vlan and vlan != "0" else iface_normalized
+                try:
+                    if not frr_manager:
+                        from utils.frr_docker import FRRDockerManager
+                        frr_manager = FRRDockerManager()
+                    container_name = frr_manager._get_container_name(device_id, device_name)
+                except Exception as container_error:
+                    logging.debug(f"[DEVICE REMOVE] Failed to resolve container name: {container_error}")
+                dhcp_mode_remove = (device_info.get("dhcp_mode") or "").lower()
+                if dhcp_mode_remove in ("client", "server") and iface_name:
+                    try:
+                        logging.info(f"[DHCP] Stopping DHCP {dhcp_mode_remove} before removing device {device_id}")
+                        stop_dhcp_services(
+                            device_db,
+                            device_id,
+                            iface_name,
+                            dhcp_mode_remove,
+                            remove_container=True,
+                        )
+                    except Exception as dhcp_error:
+                        logging.warning(f"[DHCP] Failed to stop DHCP during device removal: {dhcp_error}")
         except Exception as e:
             logging.warning(f"[DEVICE REMOVE] Failed to get device info from database: {e}")
         
@@ -2973,6 +3384,38 @@ def remove_device():
 
     except Exception as e:
         logging.error(f"[REMOVE ERROR] {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/device/dhcp/status", methods=["GET"])
+def get_dhcp_status():
+    """Return DHCP status snapshots for all devices."""
+    try:
+        devices = device_db.get_all_devices()
+        rows = []
+        for device in devices:
+            dhcp_mode = (device.get("dhcp_mode") or "").lower()
+            if not dhcp_mode:
+                continue
+            rows.append({
+                "device_id": device.get("device_id"),
+                "device_name": device.get("device_name"),
+                "interface": device.get("interface"),
+                "server_interface": device.get("server_interface"),
+                "vlan": device.get("vlan"),
+                "mode": dhcp_mode,
+                "state": device.get("dhcp_state", "Unknown"),
+                "running": bool(device.get("dhcp_running")),
+                "lease_ip": device.get("dhcp_lease_ip"),
+                "lease_mask": device.get("dhcp_lease_mask"),
+                "lease_gateway": device.get("dhcp_lease_gateway"),
+                "lease_server": device.get("dhcp_lease_server"),
+                "lease_expires": device.get("dhcp_lease_expires"),
+                "last_check": device.get("last_dhcp_check"),
+            })
+        return jsonify({"devices": rows}), 200
+    except Exception as e:
+        logging.error(f"[DHCP STATUS] Failed to gather DHCP status: {e}")
         return jsonify({"error": str(e)}), 500
 
 
@@ -4768,13 +5211,22 @@ def configure_bgp():
             interface_raw = data.get("interface", "ens4np0")
             interface_normalized = normalize_iface(interface_raw)
             
+            dhcp_mode = (data.get("dhcp_mode") or "").lower()
+            if not dhcp_mode:
+                try:
+                    existing = device_db.get_device(device_id)
+                    if existing:
+                        dhcp_mode = (existing.get("dhcp_mode") or "").lower()
+                except Exception:
+                    dhcp_mode = ""
             device_config = {
                 "device_name": device_name,
                 "ipv4": ipv4,
                 "ipv6": ipv6,
                 "interface": interface_normalized,  # Use normalized interface name
                 "vlan": data.get("vlan", "0"),
-                "bgp_config": bgp_config
+                "bgp_config": bgp_config,
+                "dhcp_mode": dhcp_mode,
             }
             
             logging.info(f"[BGP CONFIGURE] Creating FRR container for device {device_name}")
@@ -8087,15 +8539,29 @@ def get_device_arp_status(device_id):
                 arp_results["details"]["ipv4_ping"] = f"error: {e}"
         
         # Check IPv6 NDP
-        if ipv6_address:
+        if ipv6_address or ipv6_gateway:
             try:
                 import subprocess
-                result = subprocess.run(["ping6", "-c", "1", "-W", "1", ipv6_address], 
-                                      capture_output=True, text=True, timeout=5)
+                ipv6_target = ipv6_gateway or ipv6_address
+                ping6_cmd = ["ping6", "-c", "1", "-W", "1", ipv6_target]
+                result = subprocess.run(ping6_cmd, capture_output=True, text=True, timeout=5)
                 arp_results["arp_ipv6_resolved"] = result.returncode == 0
+                arp_results["details"]["ipv6_ping_target"] = ipv6_target
                 arp_results["details"]["ipv6_ping"] = "success" if result.returncode == 0 else "failed"
+                if result.returncode != 0:
+                    try:
+                        neigh_result = subprocess.run(
+                            ["ip", "-6", "neigh", "show", ipv6_target],
+                            capture_output=True,
+                            text=True,
+                            timeout=5
+                        )
+                        arp_results["details"]["ipv6_neigh"] = neigh_result.stdout.strip() or "no entry"
+                    except Exception as neigh_exc:
+                        arp_results["details"]["ipv6_neigh"] = f"error: {neigh_exc}"
             except Exception as e:
                 arp_results["details"]["ipv6_ping"] = f"error: {e}"
+                arp_results["details"]["ipv6_ping_target"] = ipv6_gateway or ipv6_address
         
         # Check gateway connectivity
         if ipv4_gateway:
@@ -8108,10 +8574,37 @@ def get_device_arp_status(device_id):
             except Exception as e:
                 arp_results["details"]["gateway_ping"] = f"error: {e}"
         
-        # Determine overall ARP status
-        arp_results["arp_resolved"] = (arp_results["arp_ipv4_resolved"] or 
-                                      arp_results["arp_ipv6_resolved"] or 
-                                      arp_results["arp_gateway_resolved"])
+        # Determine which address families should be considered mandatory
+        requires_ipv4 = bool(ipv4_address)
+        requires_ipv6 = bool(ipv6_address or ipv6_gateway)
+        try:
+            ospf_cfg = device.get("ospf_config") or {}
+            if isinstance(ospf_cfg, dict):
+                requires_ipv4 = requires_ipv4 or bool(ospf_cfg.get("ipv4_enabled"))
+                requires_ipv6 = requires_ipv6 or bool(ospf_cfg.get("ipv6_enabled"))
+        except Exception:
+            pass
+        try:
+            isis_cfg = device.get("isis_config") or {}
+            if isinstance(isis_cfg, dict):
+                requires_ipv4 = requires_ipv4 or bool(isis_cfg.get("ipv4_enabled"))
+                requires_ipv6 = requires_ipv6 or bool(isis_cfg.get("ipv6_enabled"))
+        except Exception:
+            pass
+        try:
+            bgp_cfg = device.get("bgp_config") or {}
+            if isinstance(bgp_cfg, dict):
+                requires_ipv4 = requires_ipv4 or bool(bgp_cfg.get("ipv4_enabled"))
+                requires_ipv6 = requires_ipv6 or bool(bgp_cfg.get("ipv6_enabled"))
+        except Exception:
+            pass
+
+        # Determine overall ARP status - all required families must succeed
+        overall_ipv4 = (not requires_ipv4) or arp_results["arp_ipv4_resolved"]
+        overall_ipv6 = (not requires_ipv6) or arp_results["arp_ipv6_resolved"]
+        overall_gateway = (not ipv4_gateway) or arp_results["arp_gateway_resolved"]
+
+        arp_results["arp_resolved"] = overall_ipv4 and overall_ipv6 and overall_gateway
         
         if arp_results["arp_resolved"]:
             arp_results["arp_status"] = "Resolved"

@@ -621,6 +621,7 @@ def ensure_dhcp_services(
     interface: str,
     dhcp_config: Optional[Dict],
     container=None,
+    force_client_restart: bool = False,
 ) -> Dict:
     """Ensure DHCP services (client/server) are running as requested."""
     if not dhcp_config:
@@ -640,6 +641,27 @@ def ensure_dhcp_services(
             container=managed_container,
         )
     if mode == "client":
+        if not force_client_restart:
+            ip_info = _parse_ipv4(interface, container=managed_container)
+            if ip_info and ip_info.get("ip"):
+                gateway = _parse_gateway(interface, container=managed_container) or ""
+                lease_payload = {
+                    "dhcp_mode": "client",
+                    "dhcp_state": "Leased",
+                    "dhcp_running": True,
+                    "dhcp_lease_ip": ip_info.get("ip", ""),
+                    "dhcp_lease_mask": ip_info.get("mask", ""),
+                    "dhcp_lease_gateway": gateway,
+                    "dhcp_lease_server": "",
+                    "dhcp_lease_expires": None,
+                    "last_dhcp_check": datetime.now(timezone.utc).isoformat(),
+                    "ipv4_address": f"{ip_info.get('ip')}/{ip_info.get('mask')}" if ip_info.get("ip") and ip_info.get("mask") else ip_info.get("ip", ""),
+                    "ipv4_mask": ip_info.get("mask", ""),
+                    "ipv4_gateway": gateway,
+                }
+                _update_device_db(device_db, device_id, lease_payload)
+                return {"success": True, "ip": ip_info.get("ip"), "mask": ip_info.get("mask"), "gateway": gateway}
+
         return start_dhcp_client(
             device_db,
             device_id,
