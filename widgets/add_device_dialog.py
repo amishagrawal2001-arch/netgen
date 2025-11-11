@@ -233,6 +233,12 @@ class AddDeviceDialog(QDialog):
         enable_layout.addWidget(self.rocev2_enable_checkbox)
         enable_layout.addStretch()
         
+        # Track previous checkbox state for DHCP mode toggling
+        self._dhcp_prev_ipv4_checked = self.ipv4_checkbox.isChecked()
+        self._dhcp_prev_ipv6_checked = self.ipv6_checkbox.isChecked()
+        self._dhcp_prev_bgp_checked = self.bgp_enable_checkbox.isChecked()
+        self._dhcp_suppress_updates = False
+
         # Middle Section: Left (Dropdown) and Right (Configuration)
         middle_section = QWidget()
         middle_layout = QHBoxLayout(middle_section)
@@ -496,6 +502,20 @@ class AddDeviceDialog(QDialog):
         ospf_main_layout.addLayout(ospf_columns_layout)
         ospf_main_layout.addWidget(self.ospf_graceful_restart_checkbox)
 
+        # Address family selection for OSPF
+        ospf_af_layout = QHBoxLayout()
+        ospf_af_layout.setSpacing(8)
+        self.ospf_ipv4_enabled_checkbox = QCheckBox("IPv4")
+        self.ospf_ipv6_enabled_checkbox = QCheckBox("IPv6")
+        self.ospf_ipv4_enabled_checkbox.setChecked(True)
+        self.ospf_ipv6_enabled_checkbox.setChecked(False)
+        self.ospf_ipv4_enabled_checkbox.setEnabled(False)
+        self.ospf_ipv6_enabled_checkbox.setEnabled(False)
+        ospf_af_layout.addWidget(self.ospf_ipv4_enabled_checkbox)
+        ospf_af_layout.addWidget(self.ospf_ipv6_enabled_checkbox)
+        ospf_af_layout.addStretch()
+        ospf_main_layout.addLayout(ospf_af_layout)
+
         # ISIS Configuration Widget with multi-column layout
         self.isis_config_widget = QWidget()
         isis_main_layout = QVBoxLayout(self.isis_config_widget)
@@ -540,6 +560,15 @@ class AddDeviceDialog(QDialog):
         dhcp_main_layout.setSpacing(10)
         dhcp_main_layout.setContentsMargins(0, 0, 0, 0)
 
+        dhcp_mode_layout = QHBoxLayout()
+        self.dhcp_mode_combo = QComboBox()
+        self.dhcp_mode_combo.addItems(["Server", "Client"])
+        self.dhcp_mode_combo.currentTextChanged.connect(self._on_dhcp_mode_changed)
+        dhcp_mode_layout.addWidget(QLabel("Mode:"))
+        dhcp_mode_layout.addWidget(self.dhcp_mode_combo)
+        dhcp_mode_layout.addStretch()
+        dhcp_main_layout.addLayout(dhcp_mode_layout)
+
         # Create two-column layout
         dhcp_columns_layout = QHBoxLayout()
         dhcp_columns_layout.setSpacing(20)
@@ -548,16 +577,20 @@ class AddDeviceDialog(QDialog):
         dhcp_left_layout = QFormLayout()
         dhcp_left_layout.setSpacing(8)
         
-        self.dhcp_pool_start_input = QLineEdit("192.168.1.100")
+        self.dhcp_pool_start_input = QLineEdit("192.168.30.10")
         self.dhcp_pool_start_input.setPlaceholderText("Pool Start")
         self.dhcp_pool_start_input.setEnabled(False)
         dhcp_left_layout.addRow("Pool Start:", self.dhcp_pool_start_input)
+        self.dhcp_gateway_route_input = QLineEdit("192.168.30.0/24")
+        self.dhcp_gateway_route_input.setPlaceholderText("Gateway Route CIDR (e.g. 192.168.30.0/24)")
+        self.dhcp_gateway_route_input.setEnabled(False)
+        dhcp_left_layout.addRow("Gateway Route:", self.dhcp_gateway_route_input)
         
         # Right column
         dhcp_right_layout = QFormLayout()
         dhcp_right_layout.setSpacing(8)
         
-        self.dhcp_pool_end_input = QLineEdit("192.168.1.200")
+        self.dhcp_pool_end_input = QLineEdit("192.168.30.200")
         self.dhcp_pool_end_input.setPlaceholderText("Pool End")
         self.dhcp_pool_end_input.setEnabled(False)
         dhcp_right_layout.addRow("Pool End:", self.dhcp_pool_end_input)
@@ -619,6 +652,13 @@ class AddDeviceDialog(QDialog):
 
     def _on_protocol_enabled_changed(self):
         """Handle protocol enable/disable checkbox changes."""
+        # Remember latest protocol selections when DHCP is in server mode so they can
+        # be restored if the user temporarily switches to client mode.
+        if hasattr(self, "dhcp_mode_combo") and self.dhcp_mode_combo.currentText().lower() != "client":
+            self._dhcp_prev_bgp_checked = self.bgp_enable_checkbox.isChecked()
+            self._dhcp_prev_ipv4_checked = self.ipv4_checkbox.isChecked()
+            self._dhcp_prev_ipv6_checked = self.ipv6_checkbox.isChecked()
+
         # Update dropdown with only enabled protocols
         enabled_protocols = []
         
@@ -650,32 +690,38 @@ class AddDeviceDialog(QDialog):
 
     def _on_protocol_changed(self, protocol):
         """Handle protocol dropdown change."""
+        if getattr(self, "_suppress_protocol_change", False):
+            return
+        self._suppress_protocol_change = True
+        try:
         # Hide all protocol config widgets and disable all fields
-        self.bgp_config_widget.setVisible(False)
-        self.ospf_config_widget.setVisible(False)
-        self.isis_config_widget.setVisible(False)
-        self.dhcp_config_widget.setVisible(False)
-        self.rocev2_config_widget.setVisible(False)
-        
-        # Disable all protocol fields first
-        self._disable_all_protocol_fields()
-        
-        # Show the selected protocol config widget and enable its fields
-        if protocol == "BGP" and self.bgp_enable_checkbox.isChecked():
-            self.bgp_config_widget.setVisible(True)
-            self._enable_bgp_fields()
-        elif protocol == "OSPF" and self.ospf_enable_checkbox.isChecked():
-            self.ospf_config_widget.setVisible(True)
-            self._enable_ospf_fields()
-        elif protocol == "ISIS" and self.isis_enable_checkbox.isChecked():
-            self.isis_config_widget.setVisible(True)
-            self._enable_isis_fields()
-        elif protocol == "DHCP" and self.dhcp_enable_checkbox.isChecked():
-            self.dhcp_config_widget.setVisible(True)
-            self._enable_dhcp_fields()
-        elif protocol == "ROCEv2" and self.rocev2_enable_checkbox.isChecked():
-            self.rocev2_config_widget.setVisible(True)
-            self._enable_rocev2_fields()
+            self.bgp_config_widget.setVisible(False)
+            self.ospf_config_widget.setVisible(False)
+            self.isis_config_widget.setVisible(False)
+            self.dhcp_config_widget.setVisible(False)
+            self.rocev2_config_widget.setVisible(False)
+            
+            # Disable all protocol fields first
+            self._disable_all_protocol_fields()
+            
+            # Show the selected protocol config widget and enable its fields
+            if protocol == "BGP" and self.bgp_enable_checkbox.isChecked():
+                self.bgp_config_widget.setVisible(True)
+                self._enable_bgp_fields()
+            elif protocol == "OSPF" and self.ospf_enable_checkbox.isChecked():
+                self.ospf_config_widget.setVisible(True)
+                self._enable_ospf_fields()
+            elif protocol == "ISIS" and self.isis_enable_checkbox.isChecked():
+                self.isis_config_widget.setVisible(True)
+                self._enable_isis_fields()
+            elif protocol == "DHCP" and self.dhcp_enable_checkbox.isChecked():
+                self.dhcp_config_widget.setVisible(True)
+                self._enable_dhcp_fields()
+            elif protocol == "ROCEv2" and self.rocev2_enable_checkbox.isChecked():
+                self.rocev2_config_widget.setVisible(True)
+                self._enable_rocev2_fields()
+        finally:
+            self._suppress_protocol_change = False
 
     def _toggle_ip_fields(self):
         """Enable/disable IP fields based on checkbox state."""
@@ -687,6 +733,10 @@ class AddDeviceDialog(QDialog):
         self.ipv6_gateway_input.setEnabled(self.ipv6_checkbox.isChecked())
         self.loopback_ipv4_input.setEnabled(self.ipv4_checkbox.isChecked())
         self.loopback_ipv6_input.setEnabled(self.ipv6_checkbox.isChecked())
+        if self.ospf_ipv4_enabled_checkbox.isEnabled():
+            self.ospf_ipv4_enabled_checkbox.setChecked(self.ipv4_checkbox.isChecked())
+        if self.ospf_ipv6_enabled_checkbox.isEnabled() and self.ipv6_checkbox.isEnabled():
+            self.ospf_ipv6_enabled_checkbox.setChecked(self.ipv6_checkbox.isChecked())
 
     def _disable_all_protocol_fields(self):
         """Disable all protocol configuration fields."""
@@ -702,6 +752,8 @@ class AddDeviceDialog(QDialog):
         self.ospf_hello_interval_input.setEnabled(False)
         self.ospf_dead_interval_input.setEnabled(False)
         self.ospf_graceful_restart_checkbox.setEnabled(False)
+        self.ospf_ipv4_enabled_checkbox.setEnabled(False)
+        self.ospf_ipv6_enabled_checkbox.setEnabled(False)
         
         # ISIS fields
         self.isis_area_id_input.setEnabled(False)
@@ -712,6 +764,8 @@ class AddDeviceDialog(QDialog):
         self.dhcp_pool_start_input.setEnabled(False)
         self.dhcp_pool_end_input.setEnabled(False)
         self.dhcp_lease_time_input.setEnabled(False)
+        self.dhcp_gateway_route_input.setEnabled(False)
+        self.dhcp_mode_combo.setEnabled(False)
         
         # ROCEv2 fields
         self.rocev2_priority_input.setEnabled(False)
@@ -732,6 +786,8 @@ class AddDeviceDialog(QDialog):
         self.ospf_hello_interval_input.setEnabled(True)
         self.ospf_dead_interval_input.setEnabled(True)
         self.ospf_graceful_restart_checkbox.setEnabled(True)
+        self.ospf_ipv4_enabled_checkbox.setEnabled(True)
+        self.ospf_ipv6_enabled_checkbox.setEnabled(True)
 
     def _enable_isis_fields(self):
         """Enable ISIS configuration fields."""
@@ -741,9 +797,69 @@ class AddDeviceDialog(QDialog):
 
     def _enable_dhcp_fields(self):
         """Enable DHCP configuration fields."""
-        self.dhcp_pool_start_input.setEnabled(True)
-        self.dhcp_pool_end_input.setEnabled(True)
-        self.dhcp_lease_time_input.setEnabled(True)
+        self.dhcp_mode_combo.setEnabled(True)
+        self._on_dhcp_mode_changed()
+
+    def _on_dhcp_mode_changed(self, mode=None):
+        """Enable or disable DHCP server fields based on selected mode."""
+        if mode is None:
+            mode = self.dhcp_mode_combo.currentText() if hasattr(self, "dhcp_mode_combo") else "Client"
+        is_server = mode.lower() == "server"
+        is_client = mode.lower() == "client"
+        enable_server_fields = is_server and self.dhcp_mode_combo.isEnabled()
+        for widget in (self.dhcp_pool_start_input, self.dhcp_pool_end_input, self.dhcp_lease_time_input, self.dhcp_gateway_route_input):
+            widget.setEnabled(enable_server_fields)
+        if enable_server_fields:
+            if not self.dhcp_pool_start_input.text().strip():
+                self.dhcp_pool_start_input.setText("192.168.30.10")
+            if not self.dhcp_pool_end_input.text().strip():
+                self.dhcp_pool_end_input.setText("192.168.30.200")
+            if not self.dhcp_gateway_route_input.text().strip():
+                self.dhcp_gateway_route_input.setText("192.168.30.0/24")
+            if hasattr(self, "ipv4_gateway_input") and not self.ipv4_gateway_input.text().strip():
+                self.ipv4_gateway_input.setText("192.168.30.1")
+        if hasattr(self, "ipv4_checkbox") and hasattr(self, "ipv6_checkbox"):
+            if is_client and self.dhcp_mode_combo.isEnabled():
+                self._dhcp_prev_ipv4_checked = self.ipv4_checkbox.isChecked()
+                self._dhcp_prev_ipv6_checked = True
+                self._dhcp_prev_bgp_checked = self.bgp_enable_checkbox.isChecked()
+                self.ipv4_checkbox.setChecked(False)
+                self.ipv4_checkbox.setEnabled(False)
+                self.ipv4_input.clear()
+                self.ipv4_mask_input.clear()
+                self.ipv4_gateway_input.clear()
+                self.loopback_ipv4_input.clear()
+                self.ipv6_checkbox.setChecked(False)
+                self.ipv6_checkbox.setEnabled(False)
+                self.ipv6_input.clear()
+                self.ipv6_mask_input.clear()
+                self.ipv6_gateway_input.clear()
+                self.loopback_ipv6_input.clear()
+                if hasattr(self, "ospf_ipv4_enabled_checkbox"):
+                    self.ospf_ipv4_enabled_checkbox.setChecked(getattr(self, "_dhcp_prev_ipv4_checked", True))
+                if hasattr(self, "ospf_ipv6_enabled_checkbox"):
+                    self.ospf_ipv6_enabled_checkbox.setChecked(True)
+                if self.bgp_enable_checkbox.isChecked():
+                    self.bgp_enable_checkbox.setChecked(False)
+                self.bgp_enable_checkbox.setEnabled(False)
+            else:
+                self.ipv4_checkbox.setEnabled(True)
+                self.ipv6_checkbox.setEnabled(True)
+                self.ipv4_checkbox.setChecked(getattr(self, "_dhcp_prev_ipv4_checked", True))
+                self.ipv6_checkbox.setChecked(getattr(self, "_dhcp_prev_ipv6_checked", False))
+                # Restore previously remembered protocol states
+                if hasattr(self, "ospf_ipv4_enabled_checkbox"):
+                    self.ospf_ipv4_enabled_checkbox.setChecked(getattr(self, "_dhcp_prev_ipv4_checked", True))
+                if hasattr(self, "ospf_ipv6_enabled_checkbox"):
+                    self.ospf_ipv6_enabled_checkbox.setChecked(getattr(self, "_dhcp_prev_ipv6_checked", False))
+                self.bgp_enable_checkbox.setEnabled(True)
+                self.bgp_enable_checkbox.setChecked(getattr(self, "_dhcp_prev_bgp_checked", False))
+                self._dhcp_prev_bgp_checked = self.bgp_enable_checkbox.isChecked()
+                self._dhcp_prev_ipv4_checked = self.ipv4_checkbox.isChecked()
+                self._dhcp_prev_ipv6_checked = self.ipv6_checkbox.isChecked()
+        # Update protocol list after any forced toggles
+        if not getattr(self, "_dhcp_suppress_updates", False):
+            self._on_protocol_enabled_changed()
 
     def _enable_rocev2_fields(self):
         """Enable ROCEv2 configuration fields."""
@@ -824,7 +940,14 @@ class AddDeviceDialog(QDialog):
         ospf_config = None
         bgp_config = None
         isis_config = None
-        
+        dhcp_config = None
+        dhcp_mode_text = ""
+        is_dhcp_enabled = self.dhcp_enable_checkbox.isChecked()
+        if is_dhcp_enabled:
+            if hasattr(self, "dhcp_mode_combo"):
+                dhcp_mode_text = self.dhcp_mode_combo.currentText().strip().lower()
+            dhcp_mode_text = dhcp_mode_text or "client"
+
         # Create config for each enabled protocol (can have both BGP, OSPF, and ISIS)
         if self.isis_enable_checkbox.isChecked():
             # Construct VLAN interface name for ISIS configuration (similar to OSPF)
@@ -858,8 +981,8 @@ class AddDeviceDialog(QDialog):
                 "hello_multiplier": "3",  # Default (dialog doesn't have this field)
                 "metric": "10",  # Default (dialog doesn't have this field)
                 "interface": isis_interface,
-                "ipv4_enabled": bool(ipv4),  # Enable IPv4 ISIS if IPv4 is configured
-                "ipv6_enabled": bool(ipv6)  # Enable IPv6 ISIS if IPv6 is configured
+                "ipv4_enabled": self.ospf_ipv4_enabled_checkbox.isChecked(),
+                "ipv6_enabled": self.ospf_ipv6_enabled_checkbox.isChecked()
             }
         
         if self.bgp_enable_checkbox.isChecked():
@@ -894,9 +1017,61 @@ class AddDeviceDialog(QDialog):
                 "dead_interval": self.ospf_dead_interval_input.text().strip() or "40",
                 "graceful_restart": self.ospf_graceful_restart_checkbox.isChecked(),
                 "interface": ospf_interface,
-                "ipv4_enabled": bool(ipv4),  # Enable IPv4 OSPF if IPv4 is configured
-                "ipv6_enabled": bool(ipv6)  # Enable IPv6 OSPF if IPv6 is configured
+                "ipv4_enabled": self.ospf_ipv4_enabled_checkbox.isChecked(),
+                "ipv6_enabled": self.ospf_ipv6_enabled_checkbox.isChecked()
             }
+
+        if is_dhcp_enabled:
+            dhcp_config = {"mode": dhcp_mode_text}
+
+            # Derive interface hint for DHCP helpers
+            base_interface = self.iface_input.text().strip()
+            vlan_id = (self.vlan_input.text().strip() or "0")
+            if base_interface:
+                dhcp_interface = f"vlan{vlan_id}" if vlan_id and vlan_id != "0" else base_interface
+                dhcp_config["interface"] = dhcp_interface
+
+            if dhcp_mode_text == "server":
+                pool_start = self.dhcp_pool_start_input.text().strip()
+                pool_end = self.dhcp_pool_end_input.text().strip()
+                lease_time = self.dhcp_lease_time_input.text().strip()
+                gateway_value = ipv4_gateway or ""
+                gateway_route_value = self.dhcp_gateway_route_input.text().strip()
+
+                if pool_start:
+                    dhcp_config["pool_start"] = pool_start
+                if pool_end:
+                    dhcp_config["pool_end"] = pool_end
+                if pool_start and pool_end:
+                    dhcp_config["pool_range"] = f"{pool_start}-{pool_end}"
+                if lease_time:
+                    dhcp_config["lease_time"] = lease_time
+                if gateway_value:
+                    dhcp_config["gateway"] = gateway_value
+                if gateway_route_value:
+                    dhcp_config["gateway_route"] = gateway_route_value
+            else:
+                # Allow hostname hint for dhclient; fall back to device name
+                hostname = self.device_name_input.text().strip()
+                if hostname:
+                    dhcp_config["hostname"] = hostname
+
+            if dhcp_mode_text == "client":
+                # Ignore user-provided static IP settings when DHCP client mode is selected
+                ipv4 = ""
+                ipv6 = ""
+                ipv4_mask = ""
+                ipv6_mask = ""
+                ipv4_gateway = ""
+                ipv6_gateway = ""
+                bgp_config = {}
+                if ospf_config:
+                    # Preserve intent to run OSPF even though address will arrive via DHCP
+                    ospf_config["ipv4_enabled"] = self.ospf_ipv4_enabled_checkbox.isChecked()
+                    ospf_config["ipv6_enabled"] = self.ospf_ipv6_enabled_checkbox.isChecked()
+                if isis_config:
+                    isis_config["ipv4_enabled"] = self.ospf_ipv4_enabled_checkbox.isChecked()
+                    isis_config["ipv6_enabled"] = self.ospf_ipv6_enabled_checkbox.isChecked()
 
         return (
             self.device_name_input.text().strip(),
@@ -917,6 +1092,7 @@ class AddDeviceDialog(QDialog):
             self.increment_count.value(),
             ospf_config,
             bgp_config,
+            dhcp_config,
             self.ipv4_octet_combo.currentIndex(),    # 0=4th, 1=3rd, 2=2nd, 3=1st
             self.ipv6_hextet_combo.currentIndex(),   # 0=8th, 1=7th, ..., 7=1st
             self.mac_byte_combo.currentIndex(),      # 0=6th, 1=5th, ..., 5=1st
@@ -970,10 +1146,6 @@ class AddDeviceDialog(QDialog):
         
         if not mac:
             QMessageBox.warning(self, "Validation Error", "MAC address is required.")
-            return
-        
-        if not self.ipv4_checkbox.isChecked() and not self.ipv6_checkbox.isChecked():
-            QMessageBox.warning(self, "Validation Error", "At least one IP version (IPv4 or IPv6) must be selected.")
             return
         
         # Get gateway values
