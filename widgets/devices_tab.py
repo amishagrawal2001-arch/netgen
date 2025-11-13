@@ -12,7 +12,7 @@ from PyQt5.QtWidgets import (
 
 from PyQt5.QtGui import QIcon, QPixmap, QFont, QPalette, QColor
 from PyQt5.QtCore import QSize, Qt, QTimer, pyqtSignal, QThread
-import os, json,logging,requests,ipaddress,uuid
+import os, json,logging,requests,ipaddress,uuid,copy
 import subprocess
 from types import SimpleNamespace
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -20,6 +20,7 @@ from utils.qicon_loader import qicon,r_icon
 from utils.devices_tab_bgp import BGPHandler
 from utils.devices_tab_ospf import OSPFHandler
 from utils.devices_tab_isis import ISISHandler
+from utils.devices_tab_dhcp import DHCPHandler
 from .add_device_dialog import AddDeviceDialog
 from .add_bgp_dialog import AddBgpDialog
 from .add_ospf_dialog import AddOspfDialog
@@ -216,6 +217,16 @@ class ArpOperationWorker(QThread):
                 # Emit detailed ARP results for individual IP color updates
                 self.arp_result.emit(row, arp_results, self.operation_id)
                 
+                if arp_results.get("needs_retry"):
+                    waiting_message_raw = arp_results.get("overall_status", "Waiting for device status...")
+                    if isinstance(waiting_message_raw, str) and waiting_message_raw.startswith("__RETRY__|"):
+                        waiting_message = waiting_message_raw.split("|", 1)[1] if "|" in waiting_message_raw else "Waiting for device status..."
+                    else:
+                        waiting_message = waiting_message_raw
+                    # Notify main thread to update UI and schedule retry
+                    self.device_status_updated.emit(row, False, f"__RETRY__|{waiting_message}")
+                    return (waiting_message, None, row, arp_results)
+                
                 # Consider successful if any IP (IPv4, IPv6, or Gateway) resolves
                 if arp_results.get("overall_resolved", False):
                     result = f"✅ {device_name}: ARP resolved - {arp_results.get('overall_status', 'Unknown')}"
@@ -248,9 +259,14 @@ class ArpOperationWorker(QThread):
                 result = future.result()
                 if result:
                     result_text, success, row, arp_results = result
-                    results.append(result_text)
-                    if success:
-                        successful_count += 1
+                    if success is None:
+                        results.append(f"⏳ {result_text}")
+                    else:
+                        results.append(result_text)
+                        if success:
+                            successful_count += 1
+                        else:
+                            failed_count += 1
                 else:
                     failed_count += 1
                     
@@ -641,11 +657,6 @@ class MultiDeviceResultsDialog(QDialog):
         button_box = QDialogButtonBox(QDialogButtonBox.Ok)
         button_box.accepted.connect(self.accept)
         layout.addWidget(button_box)
-
-
-from .add_isis_dialog import AddIsisDialog
-
-
 class BgpRouteManagementDialog(QDialog):
     """Dialog for managing BGP routes for a device."""
     
@@ -997,7 +1008,6 @@ class BgpRouteManagementDialog(QDialog):
         """Refresh all data."""
         self.load_existing_routes()
         self.refresh_statistics()
-
 # AddDeviceDialog is now imported from add_device_dialog.py
 
     # ---------- Page builders ----------
@@ -1289,7 +1299,7 @@ class BgpRouteManagementDialog(QDialog):
 
             return True
 
-        # OSPF/BGP pages don’t need to be strict here; final check below
+        # OSPF/BGP pages don't need to be strict here; final check below
         return True
 
     def _validate_final(self) -> bool:
@@ -1424,8 +1434,6 @@ class StatusCache:
         """Remove a specific key from cache."""
         if key in self.cache:
             del self.cache[key]
-
-
 class DevicesTab(QWidget):
     def __init__(self, main_window=None):
         super().__init__()
@@ -1479,6 +1487,7 @@ class DevicesTab(QWidget):
         self.bgp_handler = BGPHandler(self)
         self.ospf_handler = OSPFHandler(self)
         self.isis_handler = ISISHandler(self)
+        self.dhcp_handler = DHCPHandler(self)
 
         # Create Devices sub-tab
         self.devices_subtab = QWidget()
@@ -1496,11 +1505,16 @@ class DevicesTab(QWidget):
         self.isis_subtab = QWidget()
         self.isis_handler.setup_isis_subtab()
 
+        # Create DHCP sub-tab
+        self.dhcp_subtab = QWidget()
+        self.dhcp_handler.setup_dhcp_subtab()
+
         # Add tabs to tab widget
         self.tab_widget.addTab(self.devices_subtab, "Devices")
         self.tab_widget.addTab(self.bgp_subtab, "BGP")
         self.tab_widget.addTab(self.ospf_subtab, "OSPF")
         self.tab_widget.addTab(self.isis_subtab, "ISIS")
+        self.tab_widget.addTab(self.dhcp_subtab, "DHCP")
 
 
     def setup_devices_subtab(self):
@@ -1994,6 +2008,319 @@ class DevicesTab(QWidget):
     def on_bgp_selection_changed(self):
         """Update attach button tooltip when selection changes."""
         return self.bgp_handler.on_bgp_selection_changed()
+
+    def on_cell_changed(self, row, col):
+        """Handle changes to device table cells."""
+        # Stub method for device table cell changes
+        # Add validation logic here if needed
+        pass
+
+    def on_bgp_table_cell_changed(self, row, col):
+        """Handle changes to BGP table cells."""
+        # Stub method for BGP table cell changes
+        # Add validation logic here if needed
+        pass
+
+    def on_ospf_table_cell_changed(self, row, col):
+        """Handle changes to OSPF table cells."""
+        # Stub method for OSPF table cell changes
+        # Add validation logic here if needed
+        pass
+
+    def on_isis_table_cell_changed(self, row, col):
+        """Handle changes to IS-IS table cells."""
+        # Stub method for IS-IS table cell changes
+        # Add validation logic here if needed
+        pass
+
+    def prompt_add_bgp(self):
+        """Add BGP configuration to the currently selected device."""
+        selected_items = self.devices_table.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "No Selection", "Please select a device to add BGP configuration.")
+            return
+
+        row = selected_items[0].row()
+        device_name = self.devices_table.item(row, self.COL["Device Name"]).text()
+
+        device_ipv4 = self.devices_table.item(row, self.COL["IPv4"]).text() if self.devices_table.item(row, self.COL["IPv4"]) else ""
+        device_ipv6 = self.devices_table.item(row, self.COL["IPv6"]).text() if self.devices_table.item(row, self.COL["IPv6"]) else ""
+        gateway_ipv4 = self.devices_table.item(row, self.COL["IPv4 Gateway"]).text() if self.devices_table.item(row, self.COL["IPv4 Gateway"]) else ""
+        gateway_ipv6 = self.devices_table.item(row, self.COL["IPv6 Gateway"]).text() if self.devices_table.item(row, self.COL["IPv6 Gateway"]) else ""
+
+        dialog = AddBgpDialog(
+            self,
+            device_name,
+            edit_mode=False,
+            device_ipv4=device_ipv4,
+            device_ipv6=device_ipv6,
+            gateway_ipv4=gateway_ipv4,
+            gateway_ipv6=gateway_ipv6,
+        )
+        if dialog.exec_() != dialog.Accepted:
+            return
+
+        bgp_config = dialog.get_values()
+        self._update_device_protocol(row, "BGP", bgp_config)
+
+    def prompt_edit_bgp(self):
+        """Edit BGP configuration for the selected neighbor entry."""
+        selected_items = self.bgp_table.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "No Selection", "Please select a BGP configuration to edit.")
+            return
+
+        selected_rows = {item.row() for item in selected_items}
+        if len(selected_rows) > 1:
+            QMessageBox.warning(self, "Multiple Selection", "Please select only one BGP configuration to edit.")
+            return
+
+        row = next(iter(selected_rows))
+        device_name = self.bgp_table.item(row, 0).text()
+
+        neighbor_type_item = self.bgp_table.item(row, 2)
+        protocol_type = neighbor_type_item.text().strip() if neighbor_type_item else "IPv4"
+        is_ipv6 = protocol_type == "IPv6"
+
+        device_info = self._find_device_by_name(device_name)
+        if not device_info or "BGP" not in device_info.get("protocols", []):
+            QMessageBox.warning(self, "No BGP Configuration", f"No BGP configuration found for device '{device_name}'.")
+            return
+
+        device_ipv4 = device_info.get("IPv4", "")
+        device_ipv6 = device_info.get("IPv6", "")
+        gateway_ipv4 = device_info.get("IPv4 Gateway", "")
+        gateway_ipv6 = device_info.get("IPv6 Gateway", "")
+
+        current_bgp = device_info.get("bgp_config", {})
+
+        dialog = AddBgpDialog(
+            self,
+            device_name,
+            edit_mode=True,
+            device_ipv4=device_ipv4,
+            device_ipv6=device_ipv6,
+            gateway_ipv4=gateway_ipv4,
+            gateway_ipv6=gateway_ipv6,
+        )
+
+        dialog.bgp_mode_combo.setCurrentText(current_bgp.get("bgp_mode", "eBGP"))
+        dialog.bgp_asn_input.setText(current_bgp.get("bgp_asn", ""))
+        dialog.bgp_remote_asn_input.setText(current_bgp.get("bgp_remote_asn", ""))
+        dialog.bgp_keepalive_input.setValue(int(current_bgp.get("bgp_keepalive", "30")))
+        dialog.bgp_hold_time_input.setValue(int(current_bgp.get("bgp_hold_time", "90")))
+
+        if is_ipv6:
+            dialog.ipv4_enabled.setChecked(False)
+            dialog.ipv6_enabled.setChecked(True)
+            dialog.bgp_neighbor_ipv6_input.setText(current_bgp.get("bgp_neighbor_ipv6", ""))
+            dialog.bgp_update_source_ipv6_input.setText(current_bgp.get("bgp_update_source_ipv6", ""))
+            dialog.bgp_neighbor_ipv4_input.clear()
+            dialog.bgp_update_source_ipv4_input.clear()
+        else:
+            dialog.ipv4_enabled.setChecked(True)
+            dialog.ipv6_enabled.setChecked(False)
+            dialog.bgp_neighbor_ipv4_input.setText(current_bgp.get("bgp_neighbor_ipv4", ""))
+            dialog.bgp_update_source_ipv4_input.setText(current_bgp.get("bgp_update_source_ipv4", ""))
+            dialog.bgp_neighbor_ipv6_input.clear()
+            dialog.bgp_update_source_ipv6_input.clear()
+
+        if dialog.exec_() != dialog.Accepted:
+            return
+
+        new_bgp_config = dialog.get_values()
+        merged_config = current_bgp.copy()
+
+        if is_ipv6:
+            merged_config["bgp_neighbor_ipv6"] = new_bgp_config.get("bgp_neighbor_ipv6", "")
+            merged_config["bgp_update_source_ipv6"] = new_bgp_config.get("bgp_update_source_ipv6", "")
+            merged_config["ipv6_enabled"] = new_bgp_config.get("ipv6_enabled", True)
+        else:
+            merged_config["bgp_neighbor_ipv4"] = new_bgp_config.get("bgp_neighbor_ipv4", "")
+            merged_config["bgp_update_source_ipv4"] = new_bgp_config.get("bgp_update_source_ipv4", "")
+            merged_config["ipv4_enabled"] = new_bgp_config.get("ipv4_enabled", True)
+
+        for key in ("bgp_mode", "bgp_asn", "bgp_remote_asn", "bgp_keepalive", "bgp_hold_time"):
+            merged_config[key] = new_bgp_config.get(key, merged_config.get(key))
+
+        if "route_pools" in current_bgp:
+            merged_config["route_pools"] = current_bgp["route_pools"]
+
+        device_info["bgp_config"] = merged_config
+        self._update_device_protocol(device_name, "BGP", merged_config)
+        self.update_bgp_table()
+        if hasattr(self.main_window, "save_session"):
+            self.main_window.save_session()
+
+    def prompt_delete_bgp(self):
+        """Delete BGP configuration for selected device(s)."""
+        selected_items = self.bgp_table.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "No Selection", "Please select a BGP configuration to delete.")
+            return
+
+        row = selected_items[0].row()
+        device_name = self.bgp_table.item(row, 0).text()
+
+        if (
+            QMessageBox.question(
+                self,
+                "Confirm Deletion",
+                f"Are you sure you want to delete BGP configuration for '{device_name}'?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            != QMessageBox.Yes
+        ):
+            return
+
+        device_info = self._find_device_by_name(device_name)
+        if not device_info or "BGP" not in device_info.get("protocols", []):
+            QMessageBox.warning(self, "No BGP Configuration", f"No BGP configuration found for device '{device_name}'.")
+            return
+
+        device_id = device_info.get("device_id")
+        if device_id:
+            server_url = self.get_server_url()
+            if server_url:
+                try:
+                    response = requests.post(
+                        f"{server_url}/api/bgp/cleanup",
+                        json={"device_id": device_id},
+                        timeout=10,
+                    )
+                    if response.status_code == 200:
+                        print(f"✅ BGP configuration removed from server for {device_name}")
+                    else:
+                        error_msg = response.json().get("error", "Unknown error")
+                        print(f"⚠️ Server BGP cleanup failed for {device_name}: {error_msg}")
+                except requests.exceptions.RequestException as exc:
+                    print(f"⚠️ Network error removing BGP from server for {device_name}: {exc}")
+
+        device_info["bgp_config"] = {"_marked_for_removal": True}
+        self.update_bgp_table()
+        if hasattr(self.main_window, "save_session"):
+            self.main_window.save_session()
+        QMessageBox.information(
+            self,
+            "BGP Configuration Marked for Removal",
+            f"BGP configuration for '{device_name}' has been marked for removal. Click 'Apply BGP' to remove it from the server.",
+        )
+    def prompt_attach_route_pools(self):
+        """Attach route pools to the selected BGP neighbors."""
+        selected_items = self.bgp_table.selectedItems()
+        if not selected_items:
+            total_rows = self.bgp_table.rowCount()
+            if total_rows > 0:
+                self.bgp_table.selectAll()
+                print(f"[BGP TABLE] All {total_rows} rows selected")
+            else:
+                QMessageBox.warning(self, "No BGP Neighbors", "No BGP neighbors are configured. Please add BGP neighbors first.")
+            return
+
+        if not hasattr(self.main_window, 'bgp_route_pools'):
+            self.main_window.bgp_route_pools = []
+        available_pools = self.main_window.bgp_route_pools
+
+        if not available_pools:
+            QMessageBox.warning(
+                self,
+                "No Route Pools",
+                "No route pools have been defined.\n\nUse 🗂️ 'Manage Route Pools' on the Devices tab to create pools first.",
+            )
+            return
+
+        selected_neighbors = []
+        processed = set()
+        for item in selected_items:
+            row = item.row()
+            device_name = self.bgp_table.item(row, 0).text()
+            neighbor_ip = self.bgp_table.item(row, 3).text()
+
+            clean_device_name = device_name.split(" (")[0].strip()
+            neighbor_key = f"{clean_device_name}:{neighbor_ip}"
+            if neighbor_key in processed:
+                continue
+            processed.add(neighbor_key)
+
+            device_info = self._find_device_by_name(clean_device_name)
+            if not isinstance(device_info, dict) or "BGP" not in device_info.get("protocols", []):
+                continue
+
+            bgp_config = device_info.get("bgp_config", {})
+            if not bgp_config:
+                continue
+
+            selected_neighbors.append(
+                {
+                    "device_name": clean_device_name,
+                    "neighbor_ip": neighbor_ip,
+                    "device_info": device_info,
+                    "bgp_config": bgp_config,
+                }
+            )
+
+        if not selected_neighbors:
+            QMessageBox.warning(self, "No Valid BGP Neighbors", "No valid BGP neighbors found in the selection.")
+            return
+
+        if len(selected_neighbors) == 1:
+            neighbor = selected_neighbors[0]
+            device_name = neighbor["device_name"]
+            neighbor_ip = neighbor["neighbor_ip"]
+            bgp_config = neighbor["bgp_config"]
+
+            if "route_pools" not in bgp_config:
+                bgp_config["route_pools"] = {}
+            attached_pool_names = bgp_config["route_pools"].get(neighbor_ip, [])
+
+            dialog = AttachRoutePoolsDialog(
+                self,
+                device_name=f"{device_name} → {neighbor_ip}",
+                available_pools=available_pools,
+                attached_pools=attached_pool_names,
+                bgp_config=bgp_config,
+            )
+            if dialog.exec_() != dialog.Accepted:
+                return
+
+            bgp_config["route_pools"][neighbor_ip] = dialog.get_attached_pools()
+            neighbor["device_info"]["_needs_apply"] = True
+            if hasattr(self.main_window, "save_session"):
+                self.main_window.save_session()
+            self.update_bgp_table()
+            return
+
+        # Multiple neighbors selected: use multi-selection dialog
+        dialog = AttachRoutePoolsDialog.multi_select(
+            parent=self,
+            neighbors=selected_neighbors,
+            available_pools=available_pools,
+        )
+        if dialog and dialog.exec_() == dialog.Accepted:
+            updated_configs = dialog.get_updated_configs()
+            for device_name, updates in updated_configs.items():
+                device_info = self._find_device_by_name(device_name)
+                if device_info:
+                    device_info["bgp_config"]["route_pools"].update(updates)
+                    device_info["_needs_apply"] = True
+
+            if hasattr(self.main_window, "save_session"):
+                self.main_window.save_session()
+            self.update_bgp_table()
+
+    def apply_bgp_configurations(self):
+        """Apply (or remove) BGP configurations for the selected BGP neighbors."""
+        return self.bgp_handler.apply_bgp_configurations() if hasattr(self.bgp_handler, "apply_bgp_configurations") else None
+
+    def start_bgp_protocol(self):
+        """Start BGP protocol for selected devices."""
+        self._toggle_protocol_action("BGP", starting=True)
+
+    def stop_bgp_protocol(self):
+        """Stop BGP protocol for selected devices."""
+        self._toggle_protocol_action("BGP", starting=False)
+
     def refresh_ospf_status(self):
         """Refresh OSPF neighbor status from server."""
         return self.ospf_handler.refresh_ospf_status()
@@ -2068,7 +2395,6 @@ class DevicesTab(QWidget):
                 self.set_status_icon(row, resolved=False, status_text=tooltip, device_status=status)
         except Exception as e:
             logging.error(f"[DEVICE STATUS UPDATE ERROR] Row {row}: {e}")
-    
     def _on_device_operation_finished(self, results, successful_count, failed_count, selected_rows):
         """Handle completion of device operation worker."""
         # Print results to console
@@ -2086,6 +2412,8 @@ class DevicesTab(QWidget):
             # Refresh device table from database for all operations to get current ARP status
             # This ensures ARP status is updated after start/stop/apply operations
             QTimer.singleShot(200, lambda: self._refresh_device_table_from_database(selected_rows))
+            if hasattr(self, "dhcp_handler") and self.dhcp_handler:
+                QTimer.singleShot(250, self.dhcp_handler.refresh_dhcp_status)
 
             operation_type = getattr(self, '_current_operation_type', None)
             protocols = self._collect_protocols_for_rows(selected_rows)
@@ -2198,10 +2526,14 @@ class DevicesTab(QWidget):
     def _on_arp_status_updated(self, row, arp_resolved, status):
         """Update device ARP status in table from worker thread."""
         try:
+            if isinstance(status, str) and status.startswith("__RETRY__|"):
+                message = status.split("|", 1)[1] if "|" in status else "Waiting for device status..."
+                self._set_device_status_starting(row, status_text=message)
+                self._schedule_arp_retry({row}, delay=2000)
+                return
             self.update_device_status_icon(row, arp_resolved, status)
         except Exception as e:
             logging.error(f"[ARP STATUS UPDATE ERROR] Row {row}: {e}")
-    
     def _on_arp_operation_finished(self, results, successful_count, failed_count, selected_rows):
         """Handle completion of ARP operation worker."""
         # Print results to console
@@ -2247,8 +2579,11 @@ class DevicesTab(QWidget):
         
         # Clear the pending ARP rows now that the operation is finished
         if hasattr(self, '_pending_arp_rows'):
-            delattr(self, '_pending_arp_rows')
-            print(f"[DEBUG ARP FINISHED] Cleared _pending_arp_rows")
+            if hasattr(self, '_arp_retry_rows') and self._arp_retry_rows:
+                print(f"[DEBUG ARP FINISHED] Pending retries for rows {self._arp_retry_rows} - keeping _pending_arp_rows intact")
+            else:
+                delattr(self, '_pending_arp_rows')
+                print(f"[DEBUG ARP FINISHED] Cleared _pending_arp_rows")
         
         # ARP results are now shown via color indicators in the UI
         # No popup needed since status is visible through colored dots and text
@@ -2291,29 +2626,16 @@ class DevicesTab(QWidget):
             protocols_to_refresh = self._collect_protocols_for_rows(selected_rows)
             if not protocols_to_refresh:
                 return
-            
-            # Refresh protocol tables in parallel using ThreadPoolExecutor (faster)
-            with ThreadPoolExecutor(max_workers=3) as executor:
-                futures = []
-                
-                if "BGP" in protocols_to_refresh:
-                    futures.append(executor.submit(self._safe_update_bgp_table))
-                
-                if "OSPF" in protocols_to_refresh:
-                    futures.append(executor.submit(self._safe_update_ospf_table))
-                
-                if "IS-IS" in protocols_to_refresh:
-                    futures.append(executor.submit(self._safe_update_isis_table))
-                
-                # Wait for all refreshes to complete
-                for future in as_completed(futures):
-                    try:
-                        future.result()  # Will raise exception if refresh failed
-                    except Exception as e:
-                        logging.error(f"[PROTOCOL REFRESH] Error in parallel refresh: {e}")
-            
+
+            if "BGP" in protocols_to_refresh:
+                self._safe_update_bgp_table()
+            if "OSPF" in protocols_to_refresh:
+                self._safe_update_ospf_table()
+            if "IS-IS" in protocols_to_refresh:
+                self._safe_update_isis_table()
+
             print(f"[PROTOCOL REFRESH] Refreshed protocols: {', '.join(protocols_to_refresh)}")
-        
+
         except Exception as e:
             logging.error(f"[PROTOCOL REFRESH ERROR] {e}")
     
@@ -2465,6 +2787,34 @@ class DevicesTab(QWidget):
                                  "Please select a server before starting/stopping devices.")
         return None
 
+    def _get_server_url_from_interface(self, iface_label):
+        """Derive the server URL from an interface label (e.g., 'TG 0 - Port: • ens4np0')."""
+        if not iface_label:
+            return self.get_server_url(silent=True)
+
+        if "TG" in iface_label:
+            tg_part = iface_label.split("-")[0].strip()
+            parts = tg_part.split()
+            tg_id = parts[-1] if parts else None
+
+            if tg_id and hasattr(self.main_window, "server_interfaces"):
+                # Prefer matching online servers
+                for server in self.main_window.server_interfaces:
+                    if str(server.get("tg_id", "")) == tg_id and server.get("online"):
+                        return server.get("address")
+
+                for server in self.main_window.server_interfaces:
+                    if str(server.get("tg_id", "")) == tg_id:
+                        return server.get("address")
+
+        if hasattr(self.main_window, "server_interfaces") and self.main_window.server_interfaces:
+            for server in self.main_window.server_interfaces:
+                if server.get("online"):
+                    return server.get("address")
+            return self.main_window.server_interfaces[0].get("address")
+
+        return self.get_server_url(silent=True)
+
     # ---------- Row creation ----------
 
     def add_device(self, name, mac, ipv4, ipv6, vlan="0", status="Pending", ipv4_mask="24", ipv6_mask="64", ipv4_gateway="", ipv6_gateway="", loopback_ipv4="", loopback_ipv6=""):
@@ -2580,7 +2930,6 @@ class DevicesTab(QWidget):
             logging.error(f"Failed to populate device table: {e}")
 
     # ---------- Dialogs / actions ----------
-
     def apply_selected_device(self):
         """Apply only the selected devices to the server."""
         selected_items = self.devices_table.selectedItems()
@@ -2628,6 +2977,9 @@ class DevicesTab(QWidget):
             # Always check and reconfigure selected devices (regardless of _needs_apply flag)
             # This ensures devices are properly configured after UI restart
             print(f"[DEBUG APPLY] Checking and reconfiguring device '{device_name}' (selected by user)")
+
+            # Update UI to show starting status immediately
+            self._set_device_status_starting(row, device_info, status_text="Starting configuration...")
 
             try:
                 # Use the appropriate method based on whether device is new or existing
@@ -2689,7 +3041,135 @@ class DevicesTab(QWidget):
         if successful_count > 0 and hasattr(self.main_window, "save_session"):
             print(f"[DEBUG APPLY] Saving session after successful device application")
             self.main_window.save_session()
-    
+
+    def ping_selected_device(self):
+        """Ping the selected device(s) after ensuring ARP has been resolved."""
+        selected_items = self.devices_table.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "No Selection", "Please select one or more devices to ping.")
+            return
+
+        selected_rows = {item.row() for item in selected_items}
+        if not selected_rows:
+            QMessageBox.warning(self, "No Selection", "Please select one or more devices to ping.")
+            return
+
+        results = []
+        successful_count = 0
+        failed_count = 0
+        arp_not_resolved_count = 0
+
+        for row in selected_rows:
+            name_item = self.devices_table.item(row, self.COL["Device Name"])
+            if not name_item:
+                continue
+            device_name = name_item.text()
+
+            device_info = self._find_device_by_name(device_name)
+            if not device_info:
+                results.append(f"❌ {device_name}: Device not found in data structure")
+                failed_count += 1
+                continue
+
+            arp_resolved, arp_status = self._check_arp_resolution_sync(device_info)
+            self.update_device_status_icon(row, arp_resolved, arp_status=arp_status)
+
+            if not arp_resolved:
+                results.append(f"⚠️ {device_name}: ARP not resolved - {arp_status}")
+                arp_not_resolved_count += 1
+                continue
+
+            ipv6 = (device_info.get("IPv6") or "").strip()
+            ipv4 = (device_info.get("IPv4") or "").strip()
+            gateway = (device_info.get("IPv4 Gateway") or device_info.get("Gateway") or "").strip()
+
+            ping_target = None
+            target_type = ""
+            ip_version = ""
+
+            if gateway:
+                ping_target = gateway
+                target_type = "Gateway"
+                ip_version = "IPv6" if ":" in gateway else "IPv4"
+            elif ipv6:
+                ping_target = ipv6
+                target_type = "Device IPv6"
+                ip_version = "IPv6"
+            elif ipv4:
+                ping_target = ipv4
+                target_type = "Device IPv4"
+                ip_version = "IPv4"
+            else:
+                results.append(f"❌ {device_name}: No IP address or gateway configured")
+                failed_count += 1
+                continue
+
+            server_url = self._get_server_url_from_interface(device_info.get("Interface", ""))
+            if not server_url:
+                results.append(f"❌ {device_name}: No server URL found for interface")
+                failed_count += 1
+                continue
+
+            try:
+                response = requests.post(
+                    f"{server_url}/api/device/ping",
+                    json={"ip_address": ping_target},
+                    timeout=15,
+                )
+
+                if response.status_code == 200:
+                    payload = response.json()
+                    success = payload.get("success", False)
+                    output = payload.get("output") or ""
+                    error = payload.get("error") or ""
+                else:
+                    success = False
+                    output = ""
+                    error = f"Server error: {response.status_code}"
+
+                if success:
+                    message = output.strip() or "Reachable"
+                    results.append(f"✅ {device_name}: {target_type} '{ping_target}' ({ip_version}) - {message}")
+                    successful_count += 1
+                else:
+                    message = error.strip() or "Not reachable"
+                    results.append(f"❌ {device_name}: {target_type} '{ping_target}' ({ip_version}) - {message}")
+                    failed_count += 1
+            except requests.exceptions.Timeout:
+                results.append(f"⏱️ {device_name}: {target_type} '{ping_target}' ({ip_version}) - Timeout")
+                failed_count += 1
+            except requests.exceptions.RequestException as exc:
+                results.append(f"❌ {device_name}: {target_type} '{ping_target}' ({ip_version}) - Network error: {exc}")
+                failed_count += 1
+            except Exception as exc:
+                results.append(f"❌ {device_name}: {target_type} '{ping_target}' ({ip_version}) - Error: {exc}")
+                failed_count += 1
+
+        total_devices = len(selected_rows)
+        summary = (
+            f"Ping Results ({total_devices} device{'s' if total_devices > 1 else ''}):\n"
+            f"✅ Successful: {successful_count} | ❌ Failed: {failed_count} | ⚠️ ARP Not Resolved: {arp_not_resolved_count}"
+        )
+        if arp_not_resolved_count:
+            results.append("💡 Tip: Refresh ARP after applying configuration to resolve connectivity before pinging.")
+
+        if successful_count == total_devices:
+            title = "All Pings Successful"
+        elif successful_count > 0:
+            title = "Partial Ping Success"
+        else:
+            title = "All Pings Failed"
+
+        dialog = MultiDeviceResultsDialog(title, summary, results, self)
+        dialog.exec_()
+
+    def _on_arp_button_clicked(self):
+        """Refresh ARP status when the ARP button is clicked."""
+        try:
+            self.refresh_arp_selected_device()
+        except Exception as exc:
+            print(f"[ARP REFRESH] Error: {exc}")
+
     def apply_selected_device_silent(self):
         """Apply only the selected devices to the server (silent mode - no dialog)."""
         selected_items = self.devices_table.selectedItems()
@@ -2735,6 +3215,7 @@ class DevicesTab(QWidget):
                     break
             
             if device_info:
+                self._set_device_status_starting(row, device_info, status_text="Starting configuration...")
                 devices_to_apply.append((row, device_info))
                 print(f"[DEBUG APPLY SILENT] Will apply device '{device_name}' (selected by user)")
 
@@ -2776,11 +3257,7 @@ class DevicesTab(QWidget):
         print(f"[APPLY WITH ARP] Setting status to 'Applying...' for {len(selected_rows)} devices")
         for row in selected_rows:
             try:
-                status_item = self.devices_table.item(row, self.COL["Status"])
-                if status_item:
-                    status_item.setText("Applying...")
-                    status_item.setIcon(self.orange_dot)  # Use orange dot to indicate in progress
-                    status_item.setToolTip("Applying device configuration...")
+                self._set_device_status_starting(row, device_info=None, status_text="Starting configuration...")
             except Exception as e:
                 print(f"[APPLY WITH ARP] Exception setting status for row {row}: {e}")
         
@@ -2850,7 +3327,203 @@ class DevicesTab(QWidget):
             
             # Don't clear pending ARP rows here - they will be cleared when ARP operation finishes
             # delattr(self, '_pending_arp_rows')
+
+    def validate_cell_value(self, header_name, value, row=None, column=None):
+        """Validate edited table cell values."""
+        try:
+            if header_name == "Device Name":
+                return 0 < len(value) <= 50
+
+            if header_name == "IPv4":
+                if not value:
+                    return True
+                try:
+                    ipaddress.IPv4Address(value)
+                    return True
+                except ipaddress.AddressValueError:
+                    return False
+
+            if header_name == "IPv6":
+                if not value:
+                    return True
+                try:
+                    ipaddress.IPv6Address(value)
+                    return True
+                except ipaddress.AddressValueError:
+                    return False
+
+            if header_name == "VLAN":
+                if not value:
+                    return True
+                try:
+                    vlan_id = int(value)
+                    return 0 <= vlan_id <= 4094
+                except ValueError:
+                    return False
+
+            if header_name == "IPv4 Mask":
+                if not value:
+                    return True
+                try:
+                    mask = int(value)
+                    return 0 <= mask <= 32
+                except ValueError:
+                    return False
+
+            if header_name == "IPv6 Mask":
+                if not value:
+                    return True
+                try:
+                    mask = int(value)
+                    return 0 <= mask <= 128
+                except ValueError:
+                    return False
+
+            if header_name == "IPv4 Gateway":
+                if not value:
+                    return True
+                try:
+                    gateway_ip = ipaddress.IPv4Address(value)
+                except ipaddress.AddressValueError:
+                    return False
+
+                if row is not None:
+                    ipv4_item = self.devices_table.item(row, self.COL.get("IPv4", -1))
+                    mask_item = self.devices_table.item(row, self.COL.get("IPv4 Mask", -1))
+                    try:
+                        ip_addr = ipaddress.IPv4Address(ipv4_item.text().strip()) if ipv4_item and ipv4_item.text().strip() else None
+                        mask = int(mask_item.text().strip()) if mask_item and mask_item.text().strip() else None
+                        if ip_addr and mask is not None:
+                            network = ipaddress.IPv4Network(f"{ip_addr}/{mask}", strict=False)
+                            if gateway_ip not in network:
+                                return False
+                    except (ipaddress.AddressValueError, ValueError):
+                        return True
+                return True
+
+            if header_name == "IPv6 Gateway":
+                if not value:
+                    return True
+                try:
+                    gateway_ip = ipaddress.IPv6Address(value)
+                except ipaddress.AddressValueError:
+                    return False
+
+                if row is not None:
+                    ipv6_item = self.devices_table.item(row, self.COL.get("IPv6", -1))
+                    mask_item = self.devices_table.item(row, self.COL.get("IPv6 Mask", -1))
+                    try:
+                        ip_addr = ipaddress.IPv6Address(ipv6_item.text().strip()) if ipv6_item and ipv6_item.text().strip() else None
+                        mask = int(mask_item.text().strip()) if mask_item and mask_item.text().strip() else None
+                        if ip_addr and mask is not None:
+                            network = ipaddress.IPv6Network(f"{ip_addr}/{mask}", strict=False)
+                            if gateway_ip not in network:
+                                return False
+                    except (ipaddress.AddressValueError, ValueError):
+                        return True
+                return True
+
+            if header_name == "MAC Address":
+                if not value:
+                    return True
+                import re
+                return bool(re.match(r"^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$", value))
+
+            if header_name == "Status":
+                return False
+
+            return True
+        except Exception as exc:
+            logging.error(f"[validate_cell_value] Error validating {header_name}: {exc}")
+            return False
+
+    def mark_device_for_apply(self, device_id):
+        """Mark device as needing reapply after inline edits."""
+        try:
+            for iface, devices in self.main_window.all_devices.items():
+                for device in devices:
+                    if device.get("device_id") == device_id:
+                        device["_needs_apply"] = True
+                        device["_is_new"] = False
+                        self.update_device_name_indicator(device_id, device.get("Device Name", ""))
+                        return
+        except Exception as exc:
+            logging.error(f"[mark_device_for_apply] Error: {exc}")
+
+    def update_device_name_indicator(self, device_id, device_name):
+        """Add an asterisk to indicate pending apply."""
+        try:
+            for row in range(self.devices_table.rowCount()):
+                name_item = self.devices_table.item(row, self.COL["Device Name"])
+                if name_item and name_item.data(Qt.UserRole) == device_id:
+                    if not device_name.endswith(" *"):
+                        name_item.setText(f"{device_name} *")
+                        name_item.setForeground(QColor(255, 140, 0))
+                    return
+        except Exception as exc:
+            logging.error(f"[update_device_name_indicator] Error: {exc}")
+
+    def highlight_edited_cell(self, row, column):
+        """Temporarily highlight edited cells."""
+        try:
+            item = self.devices_table.item(row, column)
+            if not item:
+                return
+            item.setBackground(QColor(200, 255, 200))
+            QTimer.singleShot(2000, lambda: self.remove_cell_highlight(row, column))
+        except Exception as exc:
+            logging.error(f"[highlight_edited_cell] Error: {exc}")
+
+    def remove_cell_highlight(self, row, column):
+        """Clear temporary highlight."""
+        try:
+            item = self.devices_table.item(row, column)
+            if item:
+                item.setBackground(QColor(255, 255, 255))
+        except Exception as exc:
+            logging.error(f"[remove_cell_highlight] Error: {exc}")
+
     
+    def refresh_arp_selected_device(self):
+        """Refresh ARP status from the database for the selected device(s)."""
+        selected_items = self.devices_table.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "No Selection", "Please select one or more devices to refresh ARP status.")
+            return
+
+        selected_rows = {item.row() for item in selected_items}
+        if not selected_rows:
+            QMessageBox.warning(self, "No Selection", "Please select one or more devices to refresh ARP status.")
+            return
+
+        for row in selected_rows:
+            try:
+                name_item = self.devices_table.item(row, self.COL["Device Name"])
+                if not name_item:
+                    continue
+                device_name = name_item.text()
+                device_info = self._find_device_by_name(device_name)
+                if not device_info:
+                    continue
+
+                arp_results = self._check_individual_arp_resolution(device_info)
+                self.set_status_icon_with_individual_ips(row, arp_results)
+                overall_resolved = arp_results.get("overall_resolved", False)
+                overall_status = arp_results.get("overall_status", "Unknown")
+                device_status = device_info.get("Status", "Unknown")
+                self.set_status_icon(row, resolved=overall_resolved, status_text=overall_status, device_status=device_status)
+                print(f"[ARP REFRESH] {device_name}: {overall_status}")
+            except Exception as exc:
+                print(f"[ARP REFRESH] Error for {device_name}: {exc}")
+
+    def send_immediate_arp_request(self, device_info, server_url):
+        """Compatibility shim - ARP operations are handled by the server-side monitor."""
+        return True, "ARP handled by server monitor"
+
+    def send_arp_request(self, device_info):
+        """Compatibility shim - ARP operations are handled by the server-side monitor."""
+        return True, "ARP handled by server monitor"
+
     def _calculate_changes(self):
         """Calculate changes between current state and last saved session."""
         print(f"[DEBUG CHANGES] Calculating changes since last session")
@@ -2892,7 +3565,6 @@ class DevicesTab(QWidget):
                 print(f"[DEBUG CHANGES] Device to add: '{device_name}'")
         
         return changes
-    
     def _add_device_to_server(self, server_url, device_info, force_reconfigure=False):
         """Add a single device to the server."""
         try:
@@ -3027,10 +3699,16 @@ class DevicesTab(QWidget):
                     "ipv4_address": device_info.get("IPv4", ""),
                     "ipv6_address": device_info.get("IPv6", ""),
                     "mac_address": device_info.get("MAC Address", ""),
-                    # Handle protocols - convert string to array if needed
-                    "protocols": self._convert_protocols_to_array(device_info.get("Protocols", "")),
+                    # Handle protocols - convert string/list to array if needed
+                    "protocols": self._convert_protocols_to_array(
+                        device_info.get("protocols") or device_info.get("Protocols", "")
+                    ),
+                    "protocol_data": device_info.get("protocol_data", {}),
                     "bgp_config": device_info.get("bgp_config", {}),
                     "ospf_config": device_info.get("ospf_config", {}),
+                    "isis_config": device_info.get("isis_config", {}) or device_info.get("is_is_config", {}),
+                    "dhcp_config": device_info.get("dhcp_config", {}),
+                    "dhcp_mode": device_info.get("dhcp_mode", ""),
                 }
                 
                 resp = requests.post(f"{server_url}/api/device/apply", json=payload, timeout=30)
@@ -3083,13 +3761,28 @@ class DevicesTab(QWidget):
                         db_device_data = response.json()
                         print(f"[DEBUG APPLY DEVICE] Database device data keys: {list(db_device_data.keys())}")
                         
-                        # Update device_info with database data
-                        device_info.update({
-                            "protocols": db_device_data.get("protocols", []),
-                            "bgp_config": db_device_data.get("bgp_config", {}),
-                            "ospf_config": db_device_data.get("ospf_config", {}),
-                            "isis_config": db_device_data.get("isis_config", {}) or db_device_data.get("is_is_config", {})
-                        })
+                        db_protocols = self._convert_protocols_to_array(db_device_data.get("protocols", []))
+                        existing_protocols = self._convert_protocols_to_array(device_info.get("protocols", []))
+                        protocols_list = existing_protocols or db_protocols
+
+                        if not device_info.get("bgp_config"):
+                            device_info["bgp_config"] = db_device_data.get("bgp_config", {})
+                        if not device_info.get("ospf_config"):
+                            device_info["ospf_config"] = db_device_data.get("ospf_config", {})
+                        if not device_info.get("isis_config"):
+                            device_info["isis_config"] = db_device_data.get("isis_config", {}) or db_device_data.get("is_is_config", {})
+
+                        existing_dhcp_config = self._normalize_dhcp_config(device_info.get("dhcp_config"))
+                        db_dhcp_config = self._normalize_dhcp_config(db_device_data.get("dhcp_config"))
+                        device_info["dhcp_config"] = self._merge_dhcp_configs(
+                            db_dhcp_config, existing_dhcp_config
+                        )
+
+                        device_info["dhcp_mode"] = (device_info.get("dhcp_mode") or db_device_data.get("dhcp_mode") or "").lower()
+
+                        if device_info.get("dhcp_config") and "DHCP" not in protocols_list:
+                            protocols_list.append("DHCP")
+                        device_info["protocols"] = protocols_list
                         
                         print(f"[DEBUG APPLY DEVICE] Updated device info - Protocols: {device_info.get('protocols', [])}")
                         print(f"[DEBUG APPLY DEVICE] Updated device info - BGP config: {device_info.get('bgp_config', {})}")
@@ -3103,6 +3796,24 @@ class DevicesTab(QWidget):
             # Prepare payload for background worker
             # Get ISIS config - handle both isis_config and is_is_config keys
             isis_config = device_info.get("isis_config", {}) or device_info.get("is_is_config", {})
+            protocols_list = self._convert_protocols_to_array(device_info.get("protocols", []))
+            if device_info.get("dhcp_config") and "DHCP" not in protocols_list:
+                protocols_list.append("DHCP")
+            device_info["protocols"] = protocols_list
+            device_info["dhcp_mode"] = (device_info.get("dhcp_mode") or "").lower()
+
+            dhcp_config = self._normalize_dhcp_config(device_info.get("dhcp_config"))
+            if dhcp_config:
+                vlan_value = str(device_info.get("VLAN", "0") or "0")
+                if vlan_value != "0":
+                    dhcp_config["interface"] = f"vlan{vlan_value}"
+                else:
+                    dhcp_config["interface"] = iface_norm
+                dhcp_config["mode"] = (dhcp_config.get("mode") or device_info.get("dhcp_mode") or "").lower()
+                device_info["dhcp_config"] = dhcp_config
+                device_info["dhcp_mode"] = dhcp_config.get("mode", "")
+            else:
+                device_info["dhcp_config"] = {}
             
             payload = {
                 "device_id": device_id,
@@ -3115,10 +3826,13 @@ class DevicesTab(QWidget):
                 "ipv6_mask": device_info.get("ipv6_mask", "64"),
                 "ipv4_gateway": device_info.get("IPv4 Gateway", ""),
                 "ipv6_gateway": device_info.get("IPv6 Gateway", ""),
-                "protocols": device_info.get("protocols", []),
+                "protocols": self._convert_protocols_to_array(protocols_list),
                 "bgp_config": device_info.get("bgp_config", {}),
                 "ospf_config": device_info.get("ospf_config", {}),
                 "isis_config": isis_config,
+                "dhcp_config": device_info.get("dhcp_config", {}),
+                "dhcp_mode": device_info.get("dhcp_mode", ""),
+                "protocol_data": device_info.get("protocol_data", {}),
             }
             
             print(f"[DEBUG APPLY DEVICE] Payload protocols: {payload['protocols']}")
@@ -3166,6 +3880,24 @@ class DevicesTab(QWidget):
             # Step 1: Apply basic device configuration (interface, IP addresses, routes)
             # Get ISIS config - handle both isis_config and is_is_config keys
             isis_config = device_info.get("isis_config", {}) or device_info.get("is_is_config", {})
+            protocols_list = self._convert_protocols_to_array(device_info.get("protocols", []))
+            if device_info.get("dhcp_config") and "DHCP" not in protocols_list:
+                protocols_list.append("DHCP")
+            device_info["protocols"] = protocols_list
+            device_info["dhcp_mode"] = (device_info.get("dhcp_mode") or "").lower()
+
+            dhcp_config = self._normalize_dhcp_config(device_info.get("dhcp_config"))
+            if dhcp_config:
+                vlan_value = str(device_info.get("VLAN", "0") or "0")
+                if vlan_value != "0":
+                    dhcp_config["interface"] = f"vlan{vlan_value}"
+                else:
+                    dhcp_config["interface"] = iface_norm
+                dhcp_config["mode"] = (dhcp_config.get("mode") or device_info.get("dhcp_mode") or "").lower()
+                device_info["dhcp_config"] = dhcp_config
+                device_info["dhcp_mode"] = dhcp_config.get("mode", "")
+            else:
+                device_info["dhcp_config"] = {}
             
             basic_payload = {
                 "device_id": device_id,
@@ -3180,10 +3912,13 @@ class DevicesTab(QWidget):
                 "ipv6_gateway": device_info.get("IPv6 Gateway", ""),
                 "loopback_ipv4": device_info.get("Loopback IPv4", ""),
                 "loopback_ipv6": device_info.get("Loopback IPv6", ""),
-                "protocols": device_info.get("protocols", []),
+                "protocols": self._convert_protocols_to_array(protocols_list),
                 "bgp_config": device_info.get("bgp_config", {}),
                 "ospf_config": device_info.get("ospf_config", {}),
                 "isis_config": isis_config,
+                "dhcp_config": device_info.get("dhcp_config", {}),
+                "dhcp_mode": device_info.get("dhcp_mode", ""),
+                "protocol_data": device_info.get("protocol_data", {}),
             }
             
             # Apply basic device configuration
@@ -3284,6 +4019,65 @@ class DevicesTab(QWidget):
         except Exception as e:
             print(f"[ERROR] Failed to remove device from data structure: {e}")
 
+    def _remove_device_from_server(self, device_info, device_id, device_name):
+        """Invoke server APIs to clean up a removed device."""
+        try:
+            print(f"[DEBUG REMOVE SERVER] Removing device '{device_name}' from server")
+            
+            server_url = self.get_server_url(silent=True)
+            if not server_url:
+                print("[DEBUG REMOVE SERVER] No server URL available")
+                return
+
+            iface_label = device_info.get("Interface", "")
+            iface_norm = self._normalize_iface_label(iface_label)
+            vlan = device_info.get("VLAN", "0")
+            ipv4 = device_info.get("IPv4", "")
+            ipv6 = device_info.get("IPv6", "")
+
+            cleanup_payload = {
+                "interface": iface_norm,
+                "vlan": vlan,
+                "cleanup_only": True,
+                "device_specific": True,
+                "device_id": device_id,
+                "device_name": device_name,
+            }
+            print(f"[DEBUG REMOVE SERVER] Calling cleanup API with payload: {cleanup_payload}")
+            cleanup_resp = requests.post(f"{server_url}/api/device/cleanup", json=cleanup_payload, timeout=10)
+            if cleanup_resp.status_code == 200:
+                removed_ips = cleanup_resp.json().get("removed_ips", [])
+                print(f"[DEBUG REMOVE SERVER] Successfully cleaned up IPs: {removed_ips}")
+            else:
+                print(f"[DEBUG REMOVE SERVER] Cleanup failed: {cleanup_resp.status_code} - {cleanup_resp.text}")
+
+            protocols = device_info.get("protocols", [])
+            if isinstance(protocols, dict):
+                protocol_list = list(protocols.keys())
+            elif isinstance(protocols, list):
+                protocol_list = protocols
+            else:
+                protocol_list = []
+
+            remove_payload = {
+                "device_id": device_id,
+                "device_name": device_name,
+                "interface": iface_norm,
+                "vlan": vlan,
+                "ipv4": ipv4,
+                "ipv6": ipv6,
+                "protocols": protocol_list,
+            }
+            print(f"[DEBUG REMOVE SERVER] Calling remove API with payload: {remove_payload}")
+            remove_resp = requests.post(f"{server_url}/api/device/remove", json=remove_payload, timeout=10)
+            if remove_resp.status_code == 200:
+                print(f"[DEBUG REMOVE SERVER] Successfully removed device '{device_name}' from server")
+            else:
+                print(f"[DEBUG REMOVE SERVER] Remove API failed: {remove_resp.status_code} - {remove_resp.text}")
+
+        except Exception as exc:
+            print(f"[ERROR] Failed to remove device '{device_name}' from server: {exc}")
+
     def prompt_add_device(self):
         """Open AddDeviceDialog, persist to model, refresh table."""
         selected_items = self.main_window.server_tree.selectedItems()
@@ -3303,7 +4097,8 @@ class DevicesTab(QWidget):
         (
             device_name, iface_name, mac, ipv4, ipv6, ipv4_mask, ipv6_mask,
             vlan, ipv4_gateway, ipv6_gateway, incr_mac, incr_ipv4, incr_ipv6, incr_gateway, incr_vlan, incr_count, ospf_config, bgp_config, 
-            ipv4_octet_index, ipv6_hextet_index, mac_byte_index, gateway_octet_index, incr_loopback, loopback_ipv4_octet_index, loopback_ipv6_hextet_index, loopback_ipv4, loopback_ipv6, isis_config
+            dhcp_config, ipv4_octet_index, ipv6_hextet_index, mac_byte_index, gateway_octet_index, incr_dhcp_pool, dhcp_pool_octet_index,
+            incr_loopback, loopback_ipv4_octet_index, loopback_ipv6_hextet_index, loopback_ipv4, loopback_ipv6, isis_config
         ) = dialog.get_values()
 
         ipv4_mask = ipv4_mask or "24"
@@ -3399,6 +4194,7 @@ class DevicesTab(QWidget):
                     "Loopback IPv4": current_loopback_ipv4 if current_loopback_ipv4 else "",
                     "Loopback IPv6": current_loopback_ipv6 if current_loopback_ipv6 else "",
                     "Status": "Stopped",
+                    "protocols": [],
                 }
                 
                 # Add OSPF protocol if enabled
@@ -3483,7 +4279,6 @@ class DevicesTab(QWidget):
                     if "BGP" not in device_data["protocols"]:
                         device_data["protocols"].append("BGP")
                     device_data["bgp_config"] = bgp_protocol_config
-                    device_data["Protocols"] = "BGP"
                     print(f"[DEBUG ADD DEVICE] BGP added to device {current_name}: {device_data['bgp_config']}")
                 else:
                     print(f"[DEBUG ADD DEVICE] BGP NOT enabled for device {current_name} - bgp_config: {bgp_config}")
@@ -3514,6 +4309,40 @@ class DevicesTab(QWidget):
                 else:
                     print(f"[DEBUG ADD DEVICE] ISIS NOT enabled for device {current_name}")
                 
+                if dhcp_config:
+                    print(f"[DEBUG ADD DEVICE] DHCP config for device {i+1}: {dhcp_config}")
+                    per_device_dhcp = copy.deepcopy(dhcp_config)
+                    dhcp_mode_value = (per_device_dhcp.get("mode") or "client").lower()
+                    per_device_dhcp["mode"] = dhcp_mode_value
+                    if current_vlan and current_vlan != "0":
+                        per_device_dhcp["interface"] = f"vlan{current_vlan}"
+                    elif iface_name:
+                        per_device_dhcp["interface"] = iface_name
+
+                    device_data["protocols"] = device_data.get("protocols", [])
+                    if "DHCP" not in device_data["protocols"]:
+                        device_data["protocols"].append("DHCP")
+
+                    device_data["dhcp_config"] = per_device_dhcp
+                    device_data["dhcp_mode"] = dhcp_mode_value
+                    device_data["dhcp_state"] = "Pending"
+                    device_data["dhcp_running"] = False
+                    device_data["dhcp_lease_ip"] = ""
+                    device_data["dhcp_lease_mask"] = ""
+                    device_data["dhcp_lease_gateway"] = ""
+                    device_data["dhcp_lease_server"] = ""
+                    device_data["dhcp_lease_expires"] = ""
+                    device_data["dhcp_lease_subnet"] = ""
+                    device_data["last_dhcp_check"] = ""
+
+                protocols_list = device_data.get("protocols", [])
+                if protocols_list:
+                    unique_protocols = list(dict.fromkeys(protocols_list))
+                    device_data["protocols"] = unique_protocols
+                    device_data["Protocols"] = ", ".join(unique_protocols)
+                else:
+                    device_data["Protocols"] = ""
+
                 devices_to_create.append(device_data)
         else:
             # Create single device - ensure unique name
@@ -3546,6 +4375,7 @@ class DevicesTab(QWidget):
                 "Loopback IPv4": loopback_ipv4 if loopback_ipv4 else "",
                 "Loopback IPv6": loopback_ipv6 if loopback_ipv6 else "",
                 "Status": "Stopped",
+                "protocols": [],
             }
             
             # Add OSPF protocol if enabled
@@ -3623,11 +4453,44 @@ class DevicesTab(QWidget):
                 if "BGP" not in device_data["protocols"]:
                     device_data["protocols"].append("BGP")
                 device_data["bgp_config"] = bgp_protocol_config
-                device_data["Protocols"] = "BGP"
                 print(f"[DEBUG ADD DEVICE] BGP added to single device {unique_name}: {device_data['bgp_config']}")
             else:
                 print(f"[DEBUG ADD DEVICE] BGP NOT enabled for single device - bgp_config: {bgp_config}")
             
+            if dhcp_config:
+                print(f"[DEBUG ADD DEVICE] DHCP config for single device: {dhcp_config}")
+                per_device_dhcp = copy.deepcopy(dhcp_config)
+                dhcp_mode_value = (per_device_dhcp.get("mode") or "client").lower()
+                per_device_dhcp["mode"] = dhcp_mode_value
+                if vlan and vlan != "0":
+                    per_device_dhcp["interface"] = f"vlan{vlan}"
+                elif iface_name:
+                    per_device_dhcp["interface"] = iface_name
+
+                device_data["protocols"] = device_data.get("protocols", [])
+                if "DHCP" not in device_data["protocols"]:
+                    device_data["protocols"].append("DHCP")
+
+                device_data["dhcp_config"] = per_device_dhcp
+                device_data["dhcp_mode"] = dhcp_mode_value
+                device_data["dhcp_state"] = "Pending"
+                device_data["dhcp_running"] = False
+                device_data["dhcp_lease_ip"] = ""
+                device_data["dhcp_lease_mask"] = ""
+                device_data["dhcp_lease_gateway"] = ""
+                device_data["dhcp_lease_server"] = ""
+                device_data["dhcp_lease_expires"] = ""
+                device_data["dhcp_lease_subnet"] = ""
+                device_data["last_dhcp_check"] = ""
+
+            protocols_list = device_data.get("protocols", [])
+            if protocols_list:
+                unique_protocols = list(dict.fromkeys(protocols_list))
+                device_data["protocols"] = unique_protocols
+                device_data["Protocols"] = ", ".join(unique_protocols)
+            else:
+                device_data["Protocols"] = ""
+
             devices_to_create.append(device_data)
 
         # persist in model
@@ -3675,270 +4538,6 @@ class DevicesTab(QWidget):
         QMessageBox.information(self, "Device Added Locally", 
                                f"Added {len(devices_to_create)} device(s) to the UI.\n\n"
                                f"Click 'Apply' to configure on server and save to session.")
-
-    def prompt_edit_device(self):
-        print(f"[DEBUG EDIT] Starting prompt_edit_device()")
-        selected_items = self.devices_table.selectedItems()
-        if not selected_items:
-            print(f"[DEBUG EDIT] No items selected")
-            return
-
-        row = selected_items[0].row()
-        print(f"[DEBUG EDIT] Selected row: {row}")
-        
-        # Get device name from table
-        name = self.devices_table.item(row, self.COL["Device Name"]).text()
-        print(f"[DEBUG EDIT] Device name from table: '{name}'")
-        
-        # Find device in all_devices data structure
-        print(f"[DEBUG EDIT] Searching for device '{name}' in all_devices")
-        print(f"[DEBUG EDIT] all_devices keys: {list(self.main_window.all_devices.keys())}")
-        device_info = None
-        for iface, devices in self.main_window.all_devices.items():
-            print(f"[DEBUG EDIT] Checking interface '{iface}' with {len(devices)} devices")
-            for device in devices:
-                device_name = device.get("Device Name", "")
-                print(f"[DEBUG EDIT] Found device: '{device_name}'")
-                if device_name == name:
-                    device_info = device
-                    print(f"[DEBUG EDIT] Found matching device: {device_info}")
-                    break
-            if device_info:
-                break
-        
-        if not device_info:
-            print(f"[DEBUG EDIT] Device '{name}' not found in data structure")
-            QMessageBox.warning(self, "Device Not Found", f"Could not find device '{name}' in data structure.")
-            return
-
-        # Extract device information
-        iface = device_info.get("Interface", "")
-        mac = device_info.get("MAC Address", "")
-        vlan = device_info.get("VLAN", "0")
-        ipv4 = device_info.get("IPv4", "")
-        ipv6 = device_info.get("IPv6", "")
-        ipv4_mask = device_info.get("ipv4_mask", "24")
-        ipv6_mask = device_info.get("ipv6_mask", "64")
-
-        print(f"[DEBUG EDIT] Extracted device info:")
-        print(f"[DEBUG EDIT]   Interface: '{iface}'")
-        print(f"[DEBUG EDIT]   MAC: '{mac}'")
-        print(f"[DEBUG EDIT]   VLAN: '{vlan}'")
-        print(f"[DEBUG EDIT]   IPv4: '{ipv4}'")
-        print(f"[DEBUG EDIT]   IPv6: '{ipv6}'")
-        print(f"[DEBUG EDIT]   IPv4 Mask: '{ipv4_mask}'")
-        print(f"[DEBUG EDIT]   IPv6 Mask: '{ipv6_mask}'")
-
-        dialog = AddDeviceDialog(self, default_iface=iface)
-        print(f"[DEBUG EDIT] Created AddDeviceDialog")
-
-        # Pre-fill basics
-        print(f"[DEBUG EDIT] Pre-filling dialog fields")
-        dialog.device_name_input.setText(name)
-        dialog.iface_input.setText(iface)
-        dialog.mac_input.setText(mac)
-        dialog.vlan_input.setText(vlan)
-        dialog.ipv4_input.setText(ipv4)
-        dialog.ipv6_input.setText(ipv6)
-        dialog.ipv4_mask_input.setText(ipv4_mask)
-        dialog.ipv6_mask_input.setText(ipv6_mask)
-        # Set gateway fields - use IPv4 Gateway for the main gateway field
-        dialog.ipv4_gateway_input.setText(device.get("IPv4 Gateway", device.get("Gateway", "")))
-        dialog.ipv6_gateway_input.setText(device.get("IPv6 Gateway", ""))
-        
-        # Set loopback IP fields
-        dialog.loopback_ipv4_input.setText(device.get("Loopback IPv4", ""))
-        dialog.loopback_ipv6_input.setText(device.get("Loopback IPv6", ""))
-
-        # Set checkboxes based on whether fields have values
-        # This enables/disables the input fields
-        dialog.ipv4_checkbox.setChecked(bool(ipv4.strip()))
-        dialog.ipv6_checkbox.setChecked(bool(ipv6.strip()))
-
-        print(f"[DEBUG EDIT] Pre-filled dialog, showing dialog")
-        print(f"[DEBUG EDIT] VLAN field value: '{dialog.vlan_input.text()}'")
-
-        # Note: Protocol-specific configuration is not available in simplified table
-        # Users can configure protocols separately using the protocol tabs
-
-        if dialog.exec_() != dialog.Accepted:
-            print(f"[DEBUG EDIT] Dialog cancelled")
-            return
-        
-        print(f"[DEBUG EDIT] Dialog accepted, getting values")
-
-        # Get updated values from dialog (simplified format)
-        (
-            new_name, iface, mac, ipv4, ipv6, ipv4_mask, ipv6_mask,
-            vlan, ipv4_gateway, ipv6_gateway, inc_mac, inc_ipv4, inc_ipv6, inc_gateway, inc_vlan, count, bgp_config_edit,
-            ipv4_octet_index_edit, ipv6_hextet_index_edit, mac_byte_index_edit, gateway_octet_index_edit, loopback_ipv4, loopback_ipv6
-        ) = dialog.get_values()
-
-        print(f"[DEBUG EDIT] Got values from dialog:")
-        print(f"[DEBUG EDIT]   new_name: '{new_name}'")
-        print(f"[DEBUG EDIT]   iface: '{iface}'")
-        print(f"[DEBUG EDIT]   mac: '{mac}'")
-        print(f"[DEBUG EDIT]   ipv4: '{ipv4}'")
-        print(f"[DEBUG EDIT]   ipv6: '{ipv6}'")
-        print(f"[DEBUG EDIT]   ipv4_mask: '{ipv4_mask}'")
-        print(f"[DEBUG EDIT]   ipv6_mask: '{ipv6_mask}'")
-        print(f"[DEBUG EDIT]   vlan: '{vlan}'")
-
-        # Check if IP addresses or VLAN changed - if so, we need to clean up old configuration first
-        old_ipv4 = device_info.get("IPv4", "")
-        old_ipv6 = device_info.get("IPv6", "")
-        old_vlan = device_info.get("VLAN", "0")
-        old_interface = device_info.get("Interface", "")
-        
-        ip_addresses_changed = (
-            old_ipv4 != ipv4 or 
-            old_ipv6 != ipv6 or 
-            old_vlan != vlan
-        )
-        
-        # If configuration changed, mark device for cleanup before applying
-        if ip_addresses_changed:
-            device_info["_needs_cleanup"] = True
-            print(f"[DEBUG EDIT] Configuration changed - will cleanup old configuration before applying new ones")
-            print(f"[DEBUG EDIT] Old IPv4: '{old_ipv4}' -> New IPv4: '{ipv4}'")
-            print(f"[DEBUG EDIT] Old IPv6: '{old_ipv6}' -> New IPv6: '{ipv6}'")
-            print(f"[DEBUG EDIT] Old VLAN: '{old_vlan}' -> New VLAN: '{vlan}'")
-            
-            # Store old configuration for cleanup
-            device_info["_old_config"] = {
-                "vlan": old_vlan,
-                "interface": old_interface,
-                "ipv4": old_ipv4,
-                "ipv6": old_ipv6
-            }
-            print(f"[DEBUG EDIT] Stored old configuration for cleanup: {device_info['_old_config']}")
-
-        # Update device in data structure
-        device_info.update({
-            "Device Name": new_name or name,
-            "Interface": iface,
-            "MAC Address": mac,
-            "IPv4": ipv4,
-            "IPv6": ipv6,
-            "VLAN": vlan,
-            "Gateway": ipv4_gateway,  # Use IPv4 gateway as primary gateway
-            "IPv4 Gateway": ipv4_gateway,
-            "IPv6 Gateway": ipv6_gateway,
-            "ipv4_mask": ipv4_mask or "24",
-            "ipv6_mask": ipv6_mask or "64",
-            "Loopback IPv4": loopback_ipv4 if loopback_ipv4 else "",
-            "Loopback IPv6": loopback_ipv6 if loopback_ipv6 else "",
-            "_needs_apply": True  # Mark for server update
-        })
-        
-        print(f"[DEBUG EDIT] Updated device_info: {device_info}")
-
-        # Update table display
-        self.devices_table.item(row, self.COL["Device Name"]).setText(new_name or name)
-        self.devices_table.item(row, self.COL["MAC Address"]).setText(mac)
-        
-        # Update IPv4 with mask
-        ipv4_item = self.devices_table.item(row, self.COL["IPv4"])
-        if ipv4_item:
-            ipv4_item.setText(ipv4)
-            ipv4_item.setData(Qt.UserRole + 1, ipv4_mask or "24")
-        
-        # Update IPv6 with mask  
-        ipv6_item = self.devices_table.item(row, self.COL["IPv6"])
-        if ipv6_item:
-            ipv6_item.setText(ipv6)
-            ipv6_item.setData(Qt.UserRole + 1, ipv6_mask or "64")
-        
-        # Update gateways
-        self.devices_table.item(row, self.COL["IPv4 Gateway"]).setText(ipv4_gateway)
-        self.devices_table.item(row, self.COL["IPv6 Gateway"]).setText(ipv6_gateway)
-        
-        # Update mask columns
-        self.devices_table.item(row, self.COL["IPv4 Mask"]).setText(ipv4_mask or "24")
-        self.devices_table.item(row, self.COL["IPv6 Mask"]).setText(ipv6_mask or "64")
-        
-        # Update VLAN column
-        self.devices_table.item(row, self.COL["VLAN"]).setText(vlan)
-        
-        # Update Loopback IP columns
-        if self.devices_table.item(row, self.COL["Loopback IPv4"]):
-            self.devices_table.item(row, self.COL["Loopback IPv4"]).setText(loopback_ipv4 if loopback_ipv4 else "")
-        if self.devices_table.item(row, self.COL["Loopback IPv6"]):
-            self.devices_table.item(row, self.COL["Loopback IPv6"]).setText(loopback_ipv6 if loopback_ipv6 else "")
-
-        # Refresh the entire table to ensure consistency
-        self.update_device_table(self.main_window.all_devices)
-        
-        # Update BGP table if any devices have BGP configured
-        self.update_bgp_table()
-        
-        # Update OSPF table if any devices have OSPF configured
-        self.update_ospf_table()
-
-        QMessageBox.information(self, "Device Updated", 
-                               f"Device '{new_name or name}' updated locally.\n\n"
-                               f"Click 'Apply' to update on server and save to session.")
-
-    def copy_selected_device(self):
-        """Copy the selected device(s) to clipboard for pasting."""
-        selected_items = self.devices_table.selectedItems()
-        if not selected_items:
-            QMessageBox.warning(self, "No Selection", "Please select a device to copy.")
-            return
-
-        # Get unique rows from selected items
-        selected_rows = set()
-        for item in selected_items:
-            selected_rows.add(item.row())
-        
-        copied_devices = []
-        device_names = []
-        
-        # Process each selected row
-        for row in selected_rows:
-            device_name = self.devices_table.item(row, self.COL["Device Name"]).text()
-            
-            # Find device in all_devices data structure
-            device_info = None
-            for iface, devices in self.main_window.all_devices.items():
-                for device in devices:
-                    if device.get("Device Name") == device_name:
-                        device_info = device
-                        break
-                if device_info:
-                    break
-            
-            if device_info:
-                # Store the copied device data (excluding device_id and status)
-                copied_device = {
-                    "Device Name": device_info.get("Device Name", ""),
-                    "MAC Address": device_info.get("MAC Address", ""),
-                    "IPv4": device_info.get("IPv4", ""),
-                    "IPv6": device_info.get("IPv6", ""),
-                    "ipv4_mask": device_info.get("ipv4_mask", "24"),
-                    "ipv6_mask": device_info.get("ipv6_mask", "64"),
-                    "VLAN": device_info.get("VLAN", "0"),
-                    "Interface": device_info.get("Interface", ""),
-                }
-                copied_devices.append(copied_device)
-                device_names.append(device_name)
-            else:
-                QMessageBox.warning(self, "Device Not Found", f"Could not find device '{device_name}' in data structure.")
-                return
-        
-        # Store in main window for access by paste function
-        self.main_window.copied_device = copied_devices
-        
-        if len(copied_devices) == 1:
-            QMessageBox.information(self, "Device Copied", 
-                                   f"Device '{device_names[0]}' has been copied to clipboard.\n\n"
-                                   f"Select a port and use 'Paste Device' to create a copy.")
-        else:
-            QMessageBox.information(self, "Devices Copied", 
-                                   f"{len(copied_devices)} devices have been copied to clipboard:\n"
-                                   f"{', '.join(device_names)}\n\n"
-                                   f"Select a port and use 'Paste Device' to create copies.")
-
     def paste_device_to_interface(self):
         """Paste the copied device(s) to the selected interface."""
         if not hasattr(self.main_window, 'copied_device') or not self.main_window.copied_device:
@@ -3997,7 +4596,8 @@ class DevicesTab(QWidget):
                 "VLAN": copied_device.get("VLAN", "0"),
                 "Status": "Stopped",
                 "_is_new": True,
-                "_needs_apply": True
+                "_needs_apply": True,
+                "protocols": [],
             }
 
             # Add to all_devices data structure
@@ -4031,6 +4631,721 @@ class DevicesTab(QWidget):
                                    f"{len(pasted_devices)} devices have been pasted to {target_interface}:\n"
                                    f"{', '.join(pasted_devices)}\n\n"
                                    f"Click 'Apply' to configure on server and save to session.")
+
+    def get_device_info_by_name(self, device_name):
+        """Get device info by name (wrapper around _find_device_by_name)."""
+        return self._find_device_by_name(device_name)
+
+    def prompt_edit_device(self):
+        """Open AddDeviceDialog with pre-filled values to edit an existing device."""
+        selected_items = self.devices_table.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "No Selection", "Please select a device to edit.")
+            return
+
+        row = selected_items[0].row()
+        name_item = self.devices_table.item(row, self.COL["Device Name"])
+        if not name_item:
+            QMessageBox.warning(self, "Error", "Could not find device name in table.")
+            return
+
+        device_name = name_item.text()
+        device_info = self.get_device_info_by_name(device_name)
+        
+        if not device_info:
+            QMessageBox.warning(self, "Device Not Found", 
+                              f"Could not find device '{device_name}' in data structure.")
+            return
+
+        # Extract device information
+        iface = device_info.get("Interface", "")
+        mac = device_info.get("MAC Address", "")
+        vlan = device_info.get("VLAN", "0")
+        ipv4 = device_info.get("IPv4", "")
+        ipv6 = device_info.get("IPv6", "")
+        ipv4_mask = device_info.get("ipv4_mask", "24")
+        ipv6_mask = device_info.get("ipv6_mask", "64")
+        ipv4_gateway = device_info.get("IPv4 Gateway", device_info.get("Gateway", ""))
+        ipv6_gateway = device_info.get("IPv6 Gateway", "")
+        loopback_ipv4 = device_info.get("Loopback IPv4", "")
+        loopback_ipv6 = device_info.get("Loopback IPv6", "")
+
+        dialog = AddDeviceDialog(self, default_iface=iface)
+        
+        # Pre-fill basics
+        dialog.device_name_input.setText(device_name)
+        dialog.iface_input.setText(iface)
+        dialog.mac_input.setText(mac)
+        dialog.vlan_input.setText(vlan)
+        dialog.ipv4_input.setText(ipv4)
+        dialog.ipv6_input.setText(ipv6)
+        dialog.ipv4_mask_input.setText(ipv4_mask)
+        dialog.ipv6_mask_input.setText(ipv6_mask)
+        dialog.ipv4_gateway_input.setText(ipv4_gateway)
+        dialog.ipv6_gateway_input.setText(ipv6_gateway)
+        dialog.loopback_ipv4_input.setText(loopback_ipv4)
+        dialog.loopback_ipv6_input.setText(loopback_ipv6)
+        
+        # Set checkboxes based on whether fields have values
+        dialog.ipv4_checkbox.setChecked(bool(ipv4.strip()))
+        dialog.ipv6_checkbox.setChecked(bool(ipv6.strip()))
+
+        if dialog.exec_() != dialog.Accepted:
+            return
+
+        # Get updated values from dialog
+        (
+            new_name, iface, mac, ipv4, ipv6, ipv4_mask, ipv6_mask,
+            vlan, ipv4_gateway, ipv6_gateway, inc_mac, inc_ipv4, inc_ipv6, inc_gateway, inc_vlan, count, 
+            ospf_config, bgp_config, dhcp_config, ipv4_octet_index, ipv6_hextet_index, mac_byte_index, 
+            gateway_octet_index, incr_dhcp_pool, dhcp_pool_octet_index, incr_loopback, loopback_ipv4_octet_index, 
+            loopback_ipv6_hextet_index, loopback_ipv4, loopback_ipv6, isis_config
+        ) = dialog.get_values()
+
+        ipv4_mask = ipv4_mask or "24"
+        ipv6_mask = ipv6_mask or "64"
+
+        # Check if IP addresses or VLAN changed - if so, mark for cleanup
+        old_ipv4 = device_info.get("IPv4", "")
+        old_ipv6 = device_info.get("IPv6", "")
+        old_vlan = device_info.get("VLAN", "0")
+        old_interface = device_info.get("Interface", "")
+        
+        ip_addresses_changed = (
+            old_ipv4 != ipv4 or 
+            old_ipv6 != ipv6 or 
+            old_vlan != vlan
+        )
+        
+        if ip_addresses_changed:
+            device_info["_needs_cleanup"] = True
+            device_info["_old_config"] = {
+                "vlan": old_vlan,
+                "interface": old_interface,
+                "ipv4": old_ipv4,
+                "ipv6": old_ipv6
+            }
+
+        # Update device in data structure
+        device_info.update({
+            "Device Name": new_name or device_name,
+            "Interface": iface,
+            "MAC Address": mac,
+            "IPv4": ipv4,
+            "IPv6": ipv6,
+            "VLAN": vlan,
+            "Gateway": ipv4_gateway,  # Use IPv4 gateway as primary gateway
+            "IPv4 Gateway": ipv4_gateway,
+            "IPv6 Gateway": ipv6_gateway,
+            "ipv4_mask": ipv4_mask,
+            "ipv6_mask": ipv6_mask,
+            "Loopback IPv4": loopback_ipv4 if loopback_ipv4 else "",
+            "Loopback IPv6": loopback_ipv6 if loopback_ipv6 else "",
+            "_needs_apply": True  # Mark for server update
+        })
+
+        # Update protocol configs if provided (but don't overwrite existing if not provided)
+        if ospf_config:
+            device_info["ospf_config"] = ospf_config
+            if "OSPF" not in device_info.get("protocols", []):
+                device_info.setdefault("protocols", []).append("OSPF")
+        
+        if bgp_config:
+            device_info["bgp_config"] = bgp_config
+            if "BGP" not in device_info.get("protocols", []):
+                device_info.setdefault("protocols", []).append("BGP")
+        
+        if dhcp_config:
+            device_info["dhcp_config"] = dhcp_config
+            device_info["dhcp_mode"] = (dhcp_config.get("mode") or "client").lower()
+            if "DHCP" not in device_info.get("protocols", []):
+                device_info.setdefault("protocols", []).append("DHCP")
+        
+        if isis_config:
+            device_info["isis_config"] = isis_config
+            device_info["is_is_config"] = isis_config
+            if "IS-IS" not in device_info.get("protocols", []):
+                device_info.setdefault("protocols", []).append("IS-IS")
+
+        # Update table display
+        self.devices_table.item(row, self.COL["Device Name"]).setText(new_name or device_name)
+        self.devices_table.item(row, self.COL["MAC Address"]).setText(mac)
+        
+        # Update IPv4 with mask
+        ipv4_item = self.devices_table.item(row, self.COL["IPv4"])
+        if ipv4_item:
+            ipv4_item.setText(ipv4)
+            ipv4_item.setData(Qt.UserRole + 1, ipv4_mask)
+        
+        # Update IPv6 with mask  
+        ipv6_item = self.devices_table.item(row, self.COL["IPv6"])
+        if ipv6_item:
+            ipv6_item.setText(ipv6)
+            ipv6_item.setData(Qt.UserRole + 1, ipv6_mask)
+        
+        # Update gateways
+        gateway_item = self.devices_table.item(row, self.COL["IPv4 Gateway"])
+        if gateway_item:
+            gateway_item.setText(ipv4_gateway)
+        gateway_item = self.devices_table.item(row, self.COL["IPv6 Gateway"])
+        if gateway_item:
+            gateway_item.setText(ipv6_gateway)
+        
+        # Update mask columns
+        mask_item = self.devices_table.item(row, self.COL["IPv4 Mask"])
+        if mask_item:
+            mask_item.setText(ipv4_mask)
+        mask_item = self.devices_table.item(row, self.COL["IPv6 Mask"])
+        if mask_item:
+            mask_item.setText(ipv6_mask)
+        
+        # Update VLAN column
+        vlan_item = self.devices_table.item(row, self.COL["VLAN"])
+        if vlan_item:
+            vlan_item.setText(vlan)
+        
+        # Update Loopback IP columns
+        loopback_item = self.devices_table.item(row, self.COL["Loopback IPv4"])
+        if loopback_item:
+            loopback_item.setText(loopback_ipv4 if loopback_ipv4 else "")
+        loopback_item = self.devices_table.item(row, self.COL["Loopback IPv6"])
+        if loopback_item:
+            loopback_item.setText(loopback_ipv6 if loopback_ipv6 else "")
+
+        # Refresh protocol tables if needed
+        if hasattr(self, 'bgp_handler') and self.bgp_handler:
+            self.bgp_handler.refresh_bgp_table()
+        if hasattr(self, 'ospf_handler') and self.ospf_handler:
+            self.ospf_handler.refresh_ospf_table()
+        if hasattr(self, 'isis_handler') and self.isis_handler:
+            self.isis_handler.refresh_isis_table()
+
+        QMessageBox.information(self, "Device Updated", 
+                               f"Device '{new_name or device_name}' updated locally.\n\n"
+                               f"Click 'Apply' to update on server and save to session.")
+
+    def copy_selected_device(self):
+        """Copy the selected device(s) so they can be pasted to another interface."""
+        selected_items = self.devices_table.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "No Selection", "Please select a device to copy.")
+            return
+
+        selected_rows = sorted({item.row() for item in selected_items})
+        if not selected_rows:
+            QMessageBox.warning(self, "No Selection", "Please select a device to copy.")
+            return
+
+        copied_devices = []
+        device_names = []
+
+        for row in selected_rows:
+            name_item = self.devices_table.item(row, self.COL.get("Device Name"))
+            if not name_item:
+                continue
+            device_name = name_item.text()
+            device_info = self.get_device_info_by_name(device_name)
+            if not device_info:
+                QMessageBox.warning(self, "Device Not Found", f"Could not find device '{device_name}' in data structure.")
+                return
+
+            copied_devices.append(
+                {
+                    "Device Name": device_info.get("Device Name", ""),
+                    "MAC Address": device_info.get("MAC Address", ""),
+                    "IPv4": device_info.get("IPv4", ""),
+                    "IPv6": device_info.get("IPv6", ""),
+                    "ipv4_mask": device_info.get("ipv4_mask", "24"),
+                    "ipv6_mask": device_info.get("ipv6_mask", "64"),
+                    "VLAN": device_info.get("VLAN", "0"),
+                    "Interface": device_info.get("Interface", ""),
+                }
+            )
+            device_names.append(device_name)
+
+        self.main_window.copied_device = copied_devices
+
+        if len(device_names) == 1:
+            QMessageBox.information(
+                self,
+                "Device Copied",
+                f"Device '{device_names[0]}' has been copied.\n\nSelect a port and use 'Paste Device' to create a copy.",
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "Devices Copied",
+                f"{len(device_names)} devices have been copied:\n"
+                f"{', '.join(device_names)}\n\nSelect a port and use 'Paste Device' to create copies.",
+            )
+
+    def _normalize_dhcp_config(self, dhcp_config):
+        """Ensure DHCP config is a dict with normalized keys and types."""
+        if not dhcp_config:
+            return {}
+
+        config = dhcp_config
+
+        if isinstance(config, str):
+            try:
+                config = json.loads(config)
+            except Exception:
+                return {}
+
+        if not isinstance(config, dict):
+            return {}
+
+        normalized = {}
+        for key, value in config.items():
+            normalized[str(key)] = value
+
+        for numeric_key in ("lease_time", "lease", "lease-time"):
+            if numeric_key in normalized:
+                try:
+                    normalized["lease_time"] = int(normalized.pop(numeric_key))
+                except Exception:
+                    normalized["lease_time"] = normalized.get(numeric_key)
+                break
+
+        mode = normalized.get("mode")
+        if mode:
+            normalized["mode"] = str(mode).lower()
+
+        route_key = "gateway_route_normalized" if "gateway_route_normalized" in normalized else "gateway_route"
+        if route_key in normalized and isinstance(normalized[route_key], str):
+            normalized[route_key] = [r.strip() for r in normalized[route_key].split(",") if r.strip()]
+
+        return normalized
+
+    def _merge_gateway_routes(self, base_routes, override_routes):
+        """Merge gateway_route values preserving uniqueness."""
+        merged = []
+        seen = set()
+
+        for source in (base_routes, override_routes):
+            if not source:
+                continue
+            if isinstance(source, str):
+                source_iter = [source]
+            elif isinstance(source, (list, tuple, set)):
+                source_iter = source
+            else:
+                source_iter = [str(source)]
+
+            for route in source_iter:
+                route_str = str(route).strip()
+                if route_str and route_str not in seen:
+                    seen.add(route_str)
+                    merged.append(route_str)
+        return merged
+
+    def _merge_additional_pool_lists(self, base_list, override_list):
+        """Merge additional_pools lists without dropping server-provided entries."""
+        merged = []
+        seen = set()
+
+        def _pool_identity(pool_entry):
+            if not isinstance(pool_entry, dict):
+                return str(pool_entry)
+            name = pool_entry.get("pool_name")
+            if name:
+                return f"name:{name}"
+            start = pool_entry.get("pool_start")
+            end = pool_entry.get("pool_end")
+            return f"range:{start}-{end}"
+
+        for source in (base_list, override_list):
+            if not source:
+                continue
+            if isinstance(source, str):
+                try:
+                    source = json.loads(source)
+                except Exception:
+                    source = []
+            if not isinstance(source, list):
+                continue
+            for entry in source:
+                if not isinstance(entry, dict):
+                    continue
+                identity = _pool_identity(entry)
+                if identity in seen:
+                    continue
+                seen.add(identity)
+                merged.append(entry)
+        return merged
+
+    def _merge_dhcp_configs(self, db_config: dict, existing_config: dict) -> dict:
+        """Merge DHCP configs while preserving server-provided arrays."""
+        if not db_config and not existing_config:
+            return {}
+        if not db_config:
+            return copy.deepcopy(existing_config) if existing_config else {}
+        if not existing_config:
+            return copy.deepcopy(db_config)
+
+        merged = copy.deepcopy(db_config)
+
+        for key, value in existing_config.items():
+            if key == "additional_pools":
+                merged["additional_pools"] = self._merge_additional_pool_lists(
+                    merged.get("additional_pools"), value
+                )
+            elif key == "pool_names":
+                existing_pool_names = value
+                if isinstance(existing_pool_names, str):
+                    try:
+                        existing_pool_names = json.loads(existing_pool_names)
+                    except Exception:
+                        existing_pool_names = {}
+                if not isinstance(existing_pool_names, dict):
+                    existing_pool_names = {}
+
+                merged_pool_names = merged.get("pool_names", {})
+                if isinstance(merged_pool_names, str):
+                    try:
+                        merged_pool_names = json.loads(merged_pool_names)
+                    except Exception:
+                        merged_pool_names = {}
+                if not isinstance(merged_pool_names, dict):
+                    merged_pool_names = {}
+
+                primary = existing_pool_names.get("primary") or merged_pool_names.get("primary")
+                additional_merged = []
+                seen_additional = set()
+
+                for source in (
+                    merged_pool_names.get("additional"),
+                    existing_pool_names.get("additional"),
+                ):
+                    if not source:
+                        continue
+                    if isinstance(source, str):
+                        source_iter = [source]
+                    elif isinstance(source, (list, tuple, set)):
+                        source_iter = source
+                    else:
+                        source_iter = [str(source)]
+                    for name in source_iter:
+                        name_str = str(name).strip()
+                        if (
+                            name_str
+                            and name_str != primary
+                            and name_str not in seen_additional
+                        ):
+                            seen_additional.add(name_str)
+                            additional_merged.append(name_str)
+
+                merged_pool_names = {
+                    "primary": primary,
+                    "additional": additional_merged,
+                }
+                merged["pool_names"] = merged_pool_names
+            elif key == "gateway_route":
+                merged["gateway_route"] = self._merge_gateway_routes(
+                    merged.get("gateway_route"), value
+                )
+            else:
+                merged[key] = value
+
+        return merged
+
+    def update_device_table(self, all_devices=None):
+        """Rebuild the device table based on selected interfaces."""
+        if all_devices is None:
+            all_devices = getattr(self.main_window, "all_devices", {})
+
+        self.devices_table.setRowCount(0)
+
+        try:
+            selected_interfaces = set()
+            tree = getattr(self.main_window, "server_tree", None)
+            if tree:
+                for item in tree.selectedItems():
+                    parent = item.parent()
+                    if parent:
+                        tg_id = parent.text(0).strip()
+                        port_name = item.text(0).replace("• ", "").strip()
+                        selected_interfaces.add(f"{tg_id} - {port_name}")
+
+            interfaces_to_show = selected_interfaces or list(all_devices.keys())
+            for iface in interfaces_to_show:
+                devices = all_devices.get(iface)
+                if not devices:
+                    legacy_iface = iface.replace(" - ", " - Port: • ")
+                    devices = all_devices.get(legacy_iface, [])
+                if not isinstance(devices, list):
+                    continue
+
+                for device in devices:
+                    row = self.devices_table.rowCount()
+                    self.devices_table.insertRow(row)
+
+                    for header in self.device_headers:
+                        if header == "IPv4 Mask":
+                            value = device.get("ipv4_mask", "24")
+                        elif header == "IPv6 Mask":
+                            value = device.get("ipv6_mask", "64")
+                        elif header == "Loopback IPv4":
+                            value = device.get("Loopback IPv4", "")
+                        elif header == "Loopback IPv6":
+                            value = device.get("Loopback IPv6", "")
+                        else:
+                            value = device.get(header, "")
+
+                        if header == "Status":
+                            item = QTableWidgetItem("")
+                            item.setFlags(Qt.ItemIsEnabled)
+                        else:
+                            item = QTableWidgetItem(str(value))
+
+                        if header == "IPv4":
+                            item.setData(Qt.UserRole + 1, device.get("ipv4_mask", "24"))
+                        elif header == "IPv6":
+                            item.setData(Qt.UserRole + 1, device.get("ipv6_mask", "64"))
+
+                        if header == "Device Name" and device.get("device_id"):
+                            item.setData(Qt.UserRole, device["device_id"])
+
+                        item.setData(Qt.UserRole + 2, str(value))
+                        self.devices_table.setItem(row, self.COL[header], item)
+
+                    status_value = device.get("Status", "Stopped")
+                    resolved = status_value == "Running"
+                    tooltip = "Device Running" if resolved else "Device Stopped"
+                    self.set_status_icon(row, resolved=resolved, status_text=tooltip, device_status=status_value)
+
+        except Exception as exc:
+            logging.error(f"[DEVICE TABLE] Failed to rebuild table: {exc}")
+
+        self._initialize_arp_status_from_database()
+
+    def _initialize_arp_status_from_database(self):
+        """Initialize ARP status icons using database values for running devices."""
+        try:
+            running_devices = []
+            for devices in getattr(self.main_window, "all_devices", {}).values():
+                if not isinstance(devices, list):
+                    continue
+                for device in devices:
+                    if device.get("Status") == "Running":
+                        running_devices.append(device)
+
+            if not running_devices:
+                return
+
+            for device in running_devices:
+                device_name = device.get("Device Name")
+                if not device_name:
+                    continue
+
+                arp_results = self._check_individual_arp_resolution(device)
+
+                target_row = None
+                for row in range(self.devices_table.rowCount()):
+                    name_item = self.devices_table.item(row, self.COL["Device Name"])
+                    if name_item and name_item.text() == device_name:
+                        target_row = row
+                        break
+
+                if target_row is None:
+                    continue
+
+                overall_resolved = arp_results.get("overall_resolved", False)
+                overall_status = arp_results.get("overall_status", "Unknown")
+                self.set_status_icon(target_row, resolved=overall_resolved, status_text=overall_status, device_status=device.get("Status", "Running"))
+
+        except Exception as exc:
+            logging.debug(f"[ARP INIT] Skipped ARP initialization: {exc}")
+
+    def _on_individual_arp_result(self, row, arp_results, operation_id=None):
+        """Hook for ARP worker to update per-IP colors."""
+        try:
+            name_item = self.devices_table.item(row, self.COL.get("Device Name"))
+            device_name = name_item.text() if name_item else "Unknown"
+            print(f"[DEBUG ARP RESULT] Processing ARP result for row {row}, device: {device_name}, operation_id: {operation_id}")
+
+            if hasattr(self, "_pending_arp_rows") and self._pending_arp_rows:
+                if row not in self._pending_arp_rows:
+                    print(f"[DEBUG ARP RESULT] Skipping row {row} ({device_name}) - not pending")
+                    return
+
+            if hasattr(self, "arp_operation_worker") and self.arp_operation_worker:
+                current_id = getattr(self.arp_operation_worker, "operation_id", None)
+                if operation_id and current_id and operation_id != current_id:
+                    print(f"[DEBUG ARP RESULT] Skipping row {row} ({device_name}) - id mismatch {operation_id} != {current_id}")
+                    return
+
+            self.set_status_icon_with_individual_ips(row, arp_results)
+        except Exception as exc:
+            logging.error(f"[INDIVIDUAL ARP RESULT ERROR] Row {row}: {exc}")
+
+    def _on_individual_arp_finished(self):
+        """Cleanup after individual ARP worker completes."""
+        if hasattr(self, "individual_arp_worker"):
+            try:
+                self.individual_arp_worker.deleteLater()
+            except Exception:
+                pass
+            delattr(self, "individual_arp_worker")
+        self._arp_check_in_progress = False
+        print("[ARP INDIVIDUAL] Individual ARP checks completed")
+
+    def start_selected_devices(self):
+        """Start selected devices in background using DeviceOperationWorker."""
+        selected_items = self.devices_table.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "No Selection", "Please select one or more devices to start.")
+            return
+
+        selected_rows = sorted({item.row() for item in selected_items})
+        if not selected_rows:
+            QMessageBox.warning(self, "No Selection", "Please select one or more devices to start.")
+            return
+
+        server_url = self.get_server_url()
+        if not server_url:
+            return
+
+        devices_to_process = []
+        for row in selected_rows:
+            name_item = self.devices_table.item(row, self.COL.get("Device Name"))
+            if not name_item:
+                continue
+            device_name = name_item.text()
+            device_info = self.get_device_info_by_name(device_name)
+            if not device_info:
+                logging.warning(f"[DEVICE START] Device '{device_name}' not found in data model")
+                continue
+            devices_to_process.append((row, device_name, device_info))
+
+        if not devices_to_process:
+            QMessageBox.warning(self, "Error", "No valid devices found to start.")
+            return
+
+        self.operation_worker = DeviceOperationWorker("start", devices_to_process, server_url, self)
+        self._current_operation_type = "start"
+        self.operation_worker.progress.connect(self._on_device_operation_progress)
+        self.operation_worker.device_status_updated.connect(self._on_device_status_updated)
+        self.operation_worker.finished.connect(
+            lambda results, succ, fail: self._on_device_operation_finished(results, succ, fail, selected_rows)
+        )
+        self.operation_worker.start()
+        print(f"[DEVICE START] Starting {len(devices_to_process)} device(s) in background...")
+
+    def stop_selected_devices(self):
+        """Stop selected devices in background using DeviceOperationWorker."""
+        selected_items = self.devices_table.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "No Selection", "Please select one or more devices to stop.")
+            return
+
+        selected_rows = sorted({item.row() for item in selected_items})
+        if not selected_rows:
+            QMessageBox.warning(self, "No Selection", "Please select one or more devices to stop.")
+            return
+
+        server_url = self.get_server_url()
+        if not server_url:
+            return
+
+        devices_to_process = []
+        for row in selected_rows:
+            name_item = self.devices_table.item(row, self.COL.get("Device Name"))
+            if not name_item:
+                continue
+            device_name = name_item.text()
+            device_info = self.get_device_info_by_name(device_name)
+            if not device_info:
+                logging.warning(f"[DEVICE STOP] Device '{device_name}' not found in data model")
+                continue
+            devices_to_process.append((row, device_name, device_info))
+
+        if not devices_to_process:
+            QMessageBox.warning(self, "Error", "No valid devices found to stop.")
+            return
+
+        self.operation_worker = DeviceOperationWorker("stop", devices_to_process, server_url, self)
+        self._current_operation_type = "stop"
+        self.operation_worker.progress.connect(self._on_device_operation_progress)
+        self.operation_worker.device_status_updated.connect(self._on_device_status_updated)
+        self.operation_worker.finished.connect(
+            lambda results, succ, fail: self._on_device_operation_finished(results, succ, fail, selected_rows)
+        )
+        self.operation_worker.start()
+        print(f"[DEVICE STOP] Stopping {len(devices_to_process)} device(s) in background...")
+
+    def remove_selected_device(self):
+        """Remove selected devices from the UI, data structures, and server."""
+        selected_items = self.devices_table.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "No Selection", "Select one or more devices to remove.")
+            return
+
+        unique_rows = sorted({item.row() for item in selected_items}, reverse=True)
+        confirm = QMessageBox.question(
+            self,
+            "Confirm Device Removal",
+            "Are you sure you want to remove the selected device(s)?\n\n"
+            "This will stop protocols, remove containers, and delete the devices from the UI.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        removed_devices = []
+        for row in unique_rows:
+            name_item = self.devices_table.item(row, self.COL.get("Device Name"))
+            if not name_item:
+                continue
+            device_name = name_item.text()
+            device_info = self.get_device_info_by_name(device_name)
+            if not device_info:
+                logging.warning(f"[REMOVE] Device '{device_name}' not found in data model")
+                continue
+
+            device_id = device_info.get("device_id")
+
+            if hasattr(self, "bgp_handler") and self.bgp_handler:
+                try:
+                    self.bgp_handler._cleanup_bgp_table_for_device(device_id, device_name)
+                except Exception as exc:
+                    logging.debug(f"[REMOVE] BGP cleanup failed for {device_name}: {exc}")
+            if hasattr(self, "ospf_handler") and self.ospf_handler:
+                try:
+                    self.ospf_handler._cleanup_ospf_table_for_device(device_id, device_name)
+                except Exception as exc:
+                    logging.debug(f"[REMOVE] OSPF cleanup failed for {device_name}: {exc}")
+            if hasattr(self, "isis_handler") and self.isis_handler:
+                try:
+                    self.isis_handler._cleanup_isis_table_for_device(device_id, device_name)
+                except Exception as exc:
+                    logging.debug(f"[REMOVE] ISIS cleanup failed for {device_name}: {exc}")
+
+            self.devices_table.removeRow(row)
+            self._remove_device_from_data_structure(device_info)
+
+            if hasattr(self.main_window, "removed_devices"):
+                self.main_window.removed_devices.append(device_id)
+            else:
+                self.main_window.removed_devices = [device_id]
+
+            self._remove_device_from_server(device_info, device_id, device_name)
+
+            removed_devices.append(device_name)
+
+        if removed_devices:
+            if hasattr(self, "dhcp_handler") and self.dhcp_handler:
+                QTimer.singleShot(200, self.dhcp_handler.refresh_dhcp_status)
+
+            if hasattr(self.main_window, "save_session"):
+                self.main_window.save_session()
+
+            QMessageBox.information(
+                self,
+                "Device Removed",
+                f"Removed {len(removed_devices)} device(s): {', '.join(removed_devices)}."
+            )
 
     def prompt_manage_route_pools(self):
         """Open dialog to manage BGP route pools (Step 1: Define pools globally)."""
@@ -4175,7 +5490,6 @@ class DevicesTab(QWidget):
                 arp_ipv6_resolved = device_data.get('arp_ipv6_resolved', 0)
                 arp_gateway_resolved = device_data.get('arp_gateway_resolved', 0)
                 arp_status = device_data.get('arp_status', 'Unknown')
-                last_arp_check = device_data.get('last_arp_check', '')
                 
                 # Convert database values to boolean
                 ipv4_resolved = bool(arp_ipv4_resolved)
@@ -4185,32 +5499,56 @@ class DevicesTab(QWidget):
                 # Determine overall status - success if BOTH IPv4 and IPv6 resolve
                 overall_resolved = ipv4_resolved and ipv6_resolved
                 
-                results = {
-                    "ipv4_resolved": ipv4_resolved,
-                    "ipv6_resolved": ipv6_resolved,
-                    "gateway_resolved": gateway_resolved,
-                    "ipv4_status": "Resolved" if ipv4_resolved else "Failed",
-                    "ipv6_status": "Resolved" if ipv6_resolved else "Failed", 
-                    "gateway_status": "Resolved" if gateway_resolved else "Failed",
-                    "overall_status": arp_status,
-                    "last_check": last_arp_check
-                }
-                
-                # Debug info available if needed
+                # Provide more descriptive status message when unresolved
+                if overall_resolved:
+                    status_message = arp_status or "ARP resolved"
+                else:
+                    failed_parts = []
+                    if not ipv4_resolved:
+                        failed_parts.append("IPv4")
+                    if not ipv6_resolved:
+                        failed_parts.append("IPv6")
+                    if not gateway_resolved:
+                        failed_parts.append("Gateway")
+                    status_message = f"ARP pending: {', '.join(failed_parts)}"
                 
                 return {
                     "overall_resolved": overall_resolved,
-                    "overall_status": arp_status,
-                    **results
+                    "overall_status": status_message,
+                    "ipv4_resolved": ipv4_resolved,
+                    "ipv6_resolved": ipv6_resolved,
+                    "gateway_resolved": gateway_resolved,
+                    "needs_retry": False,
                 }
             else:
+                if response.status_code == 404:
+                    return {
+                        "overall_resolved": False,
+                        "overall_status": "__RETRY__|Waiting for device status...",
+                        "ipv4_resolved": False,
+                        "ipv6_resolved": False,
+                        "gateway_resolved": False,
+                        "needs_retry": True,
+                    }
                 print(f"[DEBUG ARP DATABASE] Failed to get device data: {response.status_code}")
-                return {"overall_resolved": False, "overall_status": "Database error", 
-                        "ipv4_resolved": False, "ipv6_resolved": False, "gateway_resolved": False}
+                return {
+                    "overall_resolved": False,
+                    "overall_status": "Database error",
+                    "ipv4_resolved": False,
+                    "ipv6_resolved": False,
+                    "gateway_resolved": False,
+                    "needs_retry": False,
+                }
         except Exception as e:
             print(f"[DEBUG ARP DATABASE] Error getting ARP status from database: {e}")
-            return {"overall_resolved": False, "overall_status": f"Database error: {str(e)}", 
-                    "ipv4_resolved": False, "ipv6_resolved": False, "gateway_resolved": False}
+            return {
+                "overall_resolved": False,
+                "overall_status": f"Database error: {str(e)}",
+                "ipv4_resolved": False,
+                "ipv6_resolved": False,
+                "gateway_resolved": False,
+                "needs_retry": False,
+            }
     
     def check_arp_resolution(self, device_info):
         """Asynchronous ARP resolution check that doesn't block the UI."""
@@ -4254,11 +5592,28 @@ class DevicesTab(QWidget):
     
     def _on_arp_check_result(self, row, resolved, status):
         """Handle ARP check result from worker thread."""
-        # This can be overridden by callers to handle the actual result
-        pass
+        try:
+            if isinstance(status, str) and status.startswith("__RETRY__|"):
+                message = status.split("|", 1)[1] if "|" in status else "Waiting for device status..."
+                self._set_device_status_starting(row, status_text=message)
+                self._schedule_arp_retry({row}, delay=2000)
+                return
+        except Exception as exc:
+            logging.debug(f"[ARP RETRY] Failed to process single retry status for row {row}: {exc}")
+
+        self.set_status_icon(row, resolved=resolved, status_text=status)
     
     def _on_bulk_arp_result(self, row, resolved, status):
         """Handle bulk ARP check result from worker thread."""
+        try:
+            if isinstance(status, str) and status.startswith("__RETRY__|"):
+                message = status.split("|", 1)[1] if "|" in status else "Waiting for device status..."
+                self._set_device_status_starting(row, status_text=message)
+                self._schedule_arp_retry({row}, delay=2000)
+                return
+        except Exception as exc:
+            logging.debug(f"[ARP RETRY] Failed to process retry status for row {row}: {exc}")
+
         # Update the status icon for this row
         self.set_status_icon(row, resolved=resolved, status_text=status)
     
@@ -4268,12 +5623,85 @@ class DevicesTab(QWidget):
         if hasattr(self, 'arp_check_worker'):
             self.arp_check_worker.deleteLater()
             delattr(self, 'arp_check_worker')
+
+    def _set_device_status_starting(self, row: int, device_info: dict = None, status_text: str = "Starting device..."):
+        """Update the status column to show an in-progress state while apply is running."""
+        try:
+            if device_info is None:
+                device_name_item = self.devices_table.item(row, self.COL["Device Name"])
+                if device_name_item:
+                    device_name = device_name_item.text()
+                    for iface, devices in self.main_window.all_devices.items():
+                        for device in devices:
+                            if device.get("Device Name") == device_name:
+                                device_info = device
+                                break
+                        if device_info:
+                            break
+            if isinstance(device_info, dict):
+                device_info["Status"] = "Starting"
+        except Exception as exc:
+            logging.debug(f"[STATUS STARTING] Failed to update device info for row {row}: {exc}")
+
+        try:
+            display_text = status_text or "Starting..."
+            self.set_status_icon(row, resolved=False, status_text=display_text, device_status="Starting")
+        except Exception as exc:
+            logging.debug(f"[STATUS STARTING] Failed to set status icon for row {row}: {exc}")
+
+    def _schedule_arp_retry(self, rows, delay=2000):
+        """Schedule a retry of ARP checks for the specified table rows."""
+        if not rows:
+            return
+
+        rows = {row for row in rows if isinstance(row, int) and row >= 0}
+        if not rows:
+            return
+
+        if not hasattr(self, "_arp_retry_rows"):
+            self._arp_retry_rows = set()
+
+        new_rows = rows - self._arp_retry_rows
+        if not new_rows:
+            return
+
+        self._arp_retry_rows.update(new_rows)
+
+        # Ensure pending ARP rows include the retry rows so we keep tracking them
+        if not hasattr(self, "_pending_arp_rows") or self._pending_arp_rows is None:
+            self._pending_arp_rows = set()
+        self._pending_arp_rows.update(new_rows)
+
+        def retry():
+            try:
+                devices_to_process = []
+                for row in list(new_rows):
+                    if row >= self.devices_table.rowCount():
+                        continue
+                    name_item = self.devices_table.item(row, self.COL["Device Name"])
+                    if not name_item:
+                        continue
+                    device_info = self.get_device_info_by_name(name_item.text())
+                    if device_info:
+                        devices_to_process.append((row, device_info))
+
+                if devices_to_process:
+                    print(f"[ARP RETRY] Retrying ARP check for {len(devices_to_process)} device(s)")
+                    self.check_arp_resolution_bulk_async(devices_to_process)
+            finally:
+                if hasattr(self, "_arp_retry_rows"):
+                    self._arp_retry_rows.difference_update(new_rows)
+
+        QTimer.singleShot(delay, retry)
     
     def _on_device_apply_result(self, operation_type, result_data):
         """Handle successful device apply result from background worker."""
         try:
             device_name = result_data.get("device_name", "Unknown")
             print(f"✅ Successfully applied device configuration for '{device_name}'")
+
+            if hasattr(self, "dhcp_handler") and self.dhcp_handler:
+                QTimer.singleShot(200, self.dhcp_handler.refresh_dhcp_status)
             
             # Trigger BGP status check after successful apply
             if hasattr(self, 'bgp_monitor') and self.bgp_monitor:
@@ -4323,7 +5751,6 @@ class DevicesTab(QWidget):
                 delattr(self, 'db_worker')
         except Exception as e:
             print(f"[DEVICE APPLY FINISHED] Error cleaning up: {e}")
-    
     def _on_multi_device_applied(self, device_name, success, message):
         """Handle individual device apply result from multi-device worker."""
         try:
@@ -4331,6 +5758,8 @@ class DevicesTab(QWidget):
             
             # If device was successfully applied, trigger ARP status check
             if success:
+                if hasattr(self, "dhcp_handler") and self.dhcp_handler:
+                    QTimer.singleShot(200, self.dhcp_handler.refresh_dhcp_status)
                 # Find the device row to update ARP status
                 device_row = None
                 for row in range(self.devices_table.rowCount()):
@@ -4417,454 +5846,62 @@ class DevicesTab(QWidget):
             delattr(self, 'bulk_arp_worker')
 
     def cleanup_threads(self):
-        """Clean up all running threads before application exit."""
+        """Clean up timers and worker threads before application exit."""
         print("[CLEANUP] Cleaning up all worker threads...")
-        
-        # Stop all timers first to prevent new thread creation
-        if hasattr(self, 'status_timer') and self.status_timer:
-            print("[CLEANUP] Stopping status_timer...")
-            self.status_timer.stop()
-        
-        if hasattr(self, 'bgp_monitoring_timer') and self.bgp_monitoring_timer:
-            print("[CLEANUP] Stopping bgp_monitoring_timer...")
-            self.bgp_monitoring_timer.stop()
-        
-        if hasattr(self, 'ospf_monitoring_timer') and self.ospf_monitoring_timer:
-            print("[CLEANUP] Stopping ospf_monitoring_timer...")
-            self.ospf_monitoring_timer.stop()
-        
-        if hasattr(self, 'isis_monitoring_timer') and self.isis_monitoring_timer:
-            print("[CLEANUP] Stopping isis_monitoring_timer...")
-            self.isis_monitoring_timer.stop()
-        
-        if hasattr(self, 'device_status_timer') and self.device_status_timer:
-            print("[CLEANUP] Stopping device_status_timer...")
-            self.device_status_timer.stop()
-        print("[CLEANUP] Timer stop complete")
-        
-        # Stop and cleanup ARP check worker
-        if hasattr(self, 'arp_check_worker') and self.arp_check_worker:
-            print(f"[CLEANUP] Stopping arp_check_worker... isRunning={self.arp_check_worker.isRunning()}")
-            try:
-                self.arp_check_worker.stop()  # Request graceful stop
-                self.arp_check_worker.quit()
-                if not self.arp_check_worker.wait(1000):  # Wait up to 1 second
-                    print("[CLEANUP] Force terminating arp_check_worker...")
-                    self.arp_check_worker.terminate()
-                    self.arp_check_worker.wait(500)
-            except Exception as e:
-                print(f"[CLEANUP] Error stopping arp_check_worker: {e}")
-            finally:
+
+        timer_attrs = [
+            "status_timer",
+            "bgp_monitoring_timer",
+            "ospf_monitoring_timer",
+            "isis_monitoring_timer",
+            "device_status_timer",
+        ]
+        for attr in timer_attrs:
+            timer = getattr(self, attr, None)
+            if timer:
+                print(f"[CLEANUP] Stopping {attr}...")
                 try:
-                    print(f"[CLEANUP] Deleting arp_check_worker... isRunning={self.arp_check_worker.isRunning()}")
-                    self.arp_check_worker.deleteLater()
-                    delattr(self, 'arp_check_worker')
-                except:
-                    pass
-        
-        # Stop and cleanup bulk ARP worker
-        if hasattr(self, 'bulk_arp_worker') and self.bulk_arp_worker:
-            print(f"[CLEANUP] Stopping bulk_arp_worker... isRunning={self.bulk_arp_worker.isRunning()}")
-            try:
-                self.bulk_arp_worker.stop()  # Request graceful stop
-                self.bulk_arp_worker.quit()
-                if not self.bulk_arp_worker.wait(1000):  # Wait up to 1 second
-                    print("[CLEANUP] Force terminating bulk_arp_worker...")
-                    self.bulk_arp_worker.terminate()
-                    self.bulk_arp_worker.wait(500)
-            except Exception as e:
-                print(f"[CLEANUP] Error stopping bulk_arp_worker: {e}")
-            finally:
-                try:
-                    print(f"[CLEANUP] Deleting bulk_arp_worker... isRunning={self.bulk_arp_worker.isRunning()}")
-                    self.bulk_arp_worker.deleteLater()
-                    delattr(self, 'bulk_arp_worker')
-                except:
-                    pass
-        
-        # Stop and cleanup device operation worker
-        if hasattr(self, 'operation_worker') and self.operation_worker:
-            print(f"[CLEANUP] Stopping operation_worker... isRunning={self.operation_worker.isRunning()}")
-            try:
-                self.operation_worker.stop()  # Request graceful stop
-                self.operation_worker.quit()
-                if not self.operation_worker.wait(1000):  # Wait up to 1 second
-                    print("[CLEANUP] Force terminating operation_worker...")
-                    self.operation_worker.terminate()
-                    self.operation_worker.wait(500)
-            except Exception as e:
-                print(f"[CLEANUP] Error stopping operation_worker: {e}")
-            finally:
-                try:
-                    print(f"[CLEANUP] Deleting operation_worker... isRunning={self.operation_worker.isRunning()}")
-                    self.operation_worker.deleteLater()
-                    delattr(self, 'operation_worker')
-                except:
-                    pass
-        
-        # Stop and cleanup ARP operation worker
-        if hasattr(self, 'arp_operation_worker') and self.arp_operation_worker:
-            print(f"[CLEANUP] Stopping arp_operation_worker... isRunning={self.arp_operation_worker.isRunning()}")
-            try:
-                self.arp_operation_worker.stop()  # Request graceful stop
-                self.arp_operation_worker.quit()
-                if not self.arp_operation_worker.wait(1000):  # Wait up to 1 second
-                    print("[CLEANUP] Force terminating arp_operation_worker...")
-                    self.arp_operation_worker.terminate()
-                    self.arp_operation_worker.wait(500)
-            except Exception as e:
-                print(f"[CLEANUP] Error stopping arp_operation_worker: {e}")
-            finally:
-                try:
-                    print(f"[CLEANUP] Deleting arp_operation_worker... isRunning={self.arp_operation_worker.isRunning()}")
-                    self.arp_operation_worker.deleteLater()
-                    delattr(self, 'arp_operation_worker')
-                except:
-                    pass
-        
-        # Stop and cleanup individual ARP worker
-        if hasattr(self, 'individual_arp_worker') and self.individual_arp_worker:
-            print(f"[CLEANUP] Stopping individual_arp_worker... isRunning={self.individual_arp_worker.isRunning()}")
-            try:
-                self.individual_arp_worker.stop()  # Request graceful stop
-                self.individual_arp_worker.quit()
-                if not self.individual_arp_worker.wait(1000):  # Wait up to 1 second
-                    print("[CLEANUP] Force terminating individual_arp_worker...")
-                    self.individual_arp_worker.terminate()
-                    self.individual_arp_worker.wait(500)
-            except Exception as e:
-                print(f"[CLEANUP] Error stopping individual_arp_worker: {e}")
-            finally:
-                try:
-                    print(f"[CLEANUP] Deleting individual_arp_worker... isRunning={self.individual_arp_worker.isRunning()}")
-                    self.individual_arp_worker.deleteLater()
-                    delattr(self, 'individual_arp_worker')
-                except:
-                    pass
-        
-        print("[CLEANUP] Thread cleanup completed")
+                    timer.stop()
+                except Exception as exc:
+                    print(f"[CLEANUP] Failed to stop {attr}: {exc}")
 
-    def closeEvent(self, event):
-        """Handle widget close event - cleanup threads."""
-        print("[CLEANUP] DevicesTab closing, cleaning up threads...")
-        self.cleanup_threads()
-        event.accept()
-
-    def send_immediate_arp_request(self, device_info, server_url):
-        """ARP requests are now handled by the database - this is a no-op for compatibility."""
-        # ARP operations are now handled by the server-side ARP monitor
-        # and status is retrieved from the database
-        return True, "ARP handled by database"
-
-    def send_arp_request(self, device_info):
-        """ARP requests are now handled by the database - this is a no-op for compatibility."""
-        # ARP operations are now handled by the server-side ARP monitor
-        # and status is retrieved from the database
-        return True, "ARP handled by database"
-
-    def update_device_status_icon(self, row, arp_resolved):
-        """Update the device status icon based on ARP resolution."""
-        from PyQt5.QtGui import QIcon, QPixmap, QPainter, QColor
-        from PyQt5.QtCore import Qt
-        
-        # Update status icon (Status column is at index 1)
-        status_item = self.devices_table.item(row, self.COL["Status"])
-        if status_item:
-            if arp_resolved:
-                # Green icon for resolved ARP
-                status_item.setIcon(self.green_dot)
-            else:
-                # Orange icon for unresolved ARP
-                status_item.setIcon(self.orange_dot)
-            # Ensure proper center alignment
-            status_item.setTextAlignment(Qt.AlignCenter)
-
-    def _on_arp_button_clicked(self):
-        """Handle ARP button click - refresh ARP status from database for selected devices."""
-        try:
-            self.refresh_arp_selected_device()
-        except Exception as e:
-            print(f"[ARP REFRESH] Error: {e}")
-
-    def send_arp_selected_device(self):
-        """Send ARP request for the selected device(s) (non-blocking). First applies any pending configurations."""
-        try:
-            print(f"[DEBUG ARP] send_arp_selected_device called")
-            selected_items = self.devices_table.selectedItems()
-            print(f"[DEBUG ARP] Selected items: {len(selected_items)}")
-            if not selected_items:
-                print(f"[DEBUG ARP] No selected items, showing warning")
-                QMessageBox.warning(self, "No Selection", "Please select one or more devices to send ARP request.")
+        def _stop_worker(attr_name):
+            worker = getattr(self, attr_name, None)
+            if not worker:
                 return
-        except Exception as e:
-            print(f"[DEBUG ARP] Exception in send_arp_selected_device: {e}")
-            import traceback
-            traceback.print_exc()
-            return
-
-        # Get unique rows from selected items
-        selected_rows = set()
-        for item in selected_items:
-            selected_rows.add(item.row())
-        
-        if not selected_rows:
-            QMessageBox.warning(self, "No Selection", "Please select one or more devices to send ARP request.")
-            return
-
-        # Store selected rows for later use in ARP operation
-        self._pending_arp_rows = selected_rows
-        
-        # Set status to "Applying..." for selected devices
-        print(f"[DEBUG ARP] About to set status for {len(selected_rows)} rows: {selected_rows}")
-        for row in selected_rows:
+            print(f"[CLEANUP] Stopping {attr_name}...")
             try:
-                status_item = self.devices_table.item(row, self.COL["Status"])
-                print(f"[DEBUG ARP] Row {row}, Status column index: {self.COL['Status']}, Status item: {status_item}")
-                if status_item:
-                    print(f"[DEBUG ARP] Setting status to 'Applying...' for row {row}")
-                    status_item.setText("Applying...")
-                    status_item.setIcon(self.orange_dot)  # Use orange dot to indicate in progress
-                    status_item.setToolTip("Applying device configuration...")
-                    print(f"[DEBUG ARP] Status set successfully for row {row}")
-                else:
-                    print(f"[DEBUG ARP] No status item found for row {row}")
-            except Exception as e:
-                print(f"[DEBUG ARP] Exception setting status for row {row}: {e}")
-                import traceback
-                traceback.print_exc()
-        
-        # First, apply any pending configurations for the selected devices
-        print(f"[ARP OPERATION] First applying configurations for {len(selected_rows)} devices, then running ARP...")
-        self.apply_selected_device_with_arp_chain()
+                if hasattr(worker, "stop"):
+                    worker.stop()
+                worker.quit()
+                if not worker.wait(1000):
+                    print(f"[CLEANUP] Force terminating {attr_name}...")
+                    worker.terminate()
+                    worker.wait(500)
+            except Exception as exc:
+                print(f"[CLEANUP] Error stopping {attr_name}: {exc}")
+            finally:
+                try:
+                    worker.deleteLater()
+                except Exception:
+                    pass
+                try:
+                    delattr(self, attr_name)
+                except Exception:
+                    pass
 
-    def refresh_arp_selected_device(self):
-        """Refresh ARP status from database for the selected device(s)."""
-        try:
-            selected_items = self.devices_table.selectedItems()
-            if not selected_items:
-                QMessageBox.warning(self, "No Selection", "Please select one or more devices to refresh ARP status.")
-                return
-        except Exception as e:
-            print(f"[ARP REFRESH] Error: {e}")
-            return
+        worker_attrs = [
+            "arp_check_worker",
+            "bulk_arp_worker",
+            "operation_worker",
+            "arp_operation_worker",
+            "individual_arp_worker",
+            "multi_device_apply_worker",
+            "multi_device_operation_worker",
+        ]
+        for attr in worker_attrs:
+            _stop_worker(attr)
 
-        # Get unique rows from selected items
-        selected_rows = set()
-        for item in selected_items:
-            selected_rows.add(item.row())
-        
-        if not selected_rows:
-            QMessageBox.warning(self, "No Selection", "Please select one or more devices to refresh ARP status.")
-            return
-
-        print(f"[ARP REFRESH] Refreshing ARP status for {len(selected_rows)} devices...")
-        
-        for row in selected_rows:
-            try:
-                device_name = self.devices_table.item(row, self.COL["Device Name"]).text()
-                
-                # Find device in all_devices data structure
-                device_info = None
-                for iface, devices in self.main_window.all_devices.items():
-                    for device in devices:
-                        if device.get("Device Name") == device_name:
-                            device_info = device
-                            break
-                    if device_info:
-                        break
-                
-                if device_info:
-                    # Get ARP status from database
-                    arp_results = self._check_individual_arp_resolution(device_info)
-                    
-                    # Update individual IP colors based on ARP results
-                    self.set_status_icon_with_individual_ips(row, arp_results)
-                    
-                    # Update overall status icon
-                    overall_resolved = arp_results.get("overall_resolved", False)
-                    device_status = device_info.get("Status", "Unknown")
-                    self.set_status_icon(row, resolved=overall_resolved, status_text=arp_results.get("overall_status", "Unknown"), device_status=device_status)
-                    
-                    print(f"[ARP REFRESH] {device_name}: {arp_results.get('overall_status', 'Unknown')}")
-                    
-            except Exception as e:
-                print(f"[ARP REFRESH] Error for {device_name}: {e}")
-
-    def ping_selected_device(self):
-        """Ping the selected device(s)."""
-        selected_items = self.devices_table.selectedItems()
-        if not selected_items:
-            QMessageBox.warning(self, "No Selection", "Please select one or more devices to ping.")
-            return
-
-        # Get unique rows from selected items
-        selected_rows = set()
-        for item in selected_items:
-            selected_rows.add(item.row())
-        
-        if not selected_rows:
-            QMessageBox.warning(self, "No Selection", "Please select one or more devices to ping.")
-            return
-
-        # Process each selected device
-        results = []
-        successful_count = 0
-        failed_count = 0
-        arp_not_resolved_count = 0
-        
-        for row in selected_rows:
-            device_name = self.devices_table.item(row, self.COL["Device Name"]).text()
-            
-            # Find device in all_devices data structure
-            device_info = None
-            for iface, devices in self.main_window.all_devices.items():
-                for device in devices:
-                    if device.get("Device Name") == device_name:
-                        device_info = device
-                        break
-                if device_info:
-                    break
-            
-            if not device_info:
-                results.append(f"❌ {device_name}: Device not found in data structure")
-                failed_count += 1
-                continue
-
-            # Check ARP resolution first
-            arp_resolved, arp_status = self._check_arp_resolution_sync(device_info)
-            
-            # Update status icon
-            self.update_device_status_icon(row, arp_resolved)
-            
-            if not arp_resolved:
-                results.append(f"⚠️ {device_name}: ARP not resolved - {arp_status}")
-                arp_not_resolved_count += 1
-                continue
-
-            # If ARP is resolved, proceed with ping test
-            import requests
-            
-            # Determine ping target - prefer IPv6 if available, otherwise IPv4
-            ipv6 = device_info.get("IPv6", "").strip()
-            ipv4 = device_info.get("IPv4", "").strip()
-            gateway = device_info.get("Gateway", "").strip()
-            
-            ping_target = None
-            target_type = ""
-            ip_version = ""
-            
-            # Priority: Gateway > IPv6 > IPv4 (Gateway is most important for connectivity)
-            if gateway:
-                ping_target = gateway
-                target_type = "Gateway"
-                # Detect gateway IP version
-                ip_version = "IPv6" if ":" in gateway else "IPv4"
-            elif ipv6:
-                ping_target = ipv6
-                target_type = "Device IPv6"
-                ip_version = "IPv6"
-            elif ipv4:
-                ping_target = ipv4
-                target_type = "Device IPv4"
-                ip_version = "IPv4"
-            else:
-                results.append(f"❌ {device_name}: No IP address or gateway configured")
-                failed_count += 1
-                continue
-            
-            # Get server URL from the interface label
-            iface_label = device_info.get("Interface", "")
-            server_url = self._get_server_url_from_interface(iface_label)
-            if not server_url:
-                results.append(f"❌ {device_name}: No server URL found for interface")
-                failed_count += 1
-                continue
-            
-            try:
-                # Call server-side ping API
-                response = requests.post(f"{server_url}/api/device/ping", 
-                                       json={"ip_address": ping_target}, 
-                                       timeout=15)
-                
-                if response.status_code == 200:
-                    data = response.json()
-                    result = type('Result', (), {
-                        'returncode': 0 if data.get("success", False) else 1,
-                        'stdout': data.get("output", ""),
-                        'stderr': data.get("error", "")
-                    })()
-                else:
-                    result = type('Result', (), {
-                        'returncode': 1,
-                        'stdout': "",
-                        'stderr': f"Server error: {response.status_code}"
-                    })()
-                
-                if result.returncode == 0:
-                    results.append(f"✅ {device_name}: {target_type} '{ping_target}' ({ip_version}) - Reachable")
-                    successful_count += 1
-                else:
-                    results.append(f"❌ {device_name}: {target_type} '{ping_target}' ({ip_version}) - Not reachable")
-                    failed_count += 1
-                    
-            except requests.exceptions.Timeout:
-                results.append(f"⏱️ {device_name}: {target_type} '{ping_target}' ({ip_version}) - Timeout")
-                failed_count += 1
-            except requests.exceptions.RequestException as e:
-                results.append(f"❌ {device_name}: {target_type} '{ping_target}' ({ip_version}) - Network error: {str(e)}")
-                failed_count += 1
-            except Exception as e:
-                results.append(f"❌ {device_name}: {target_type} '{ping_target}' ({ip_version}) - Error: {str(e)}")
-                failed_count += 1
-
-        # Show summary results using custom dialog
-        total_devices = len(selected_rows)
-        summary = f"Ping Results ({total_devices} device{'s' if total_devices > 1 else ''}):\n"
-        summary += f"✅ Successful: {successful_count} | ❌ Failed: {failed_count} | ⚠️ ARP Not Resolved: {arp_not_resolved_count}"
-        
-        if arp_not_resolved_count > 0:
-            results.append("💡 Tip: Use the Send ARP button (→) first to resolve ARP for devices that need it.")
-        
-        if successful_count == total_devices:
-            title = "All Pings Successful"
-        elif successful_count > 0:
-            title = "Partial Ping Success"
-        else:
-            title = "All Pings Failed"
-        
-        dialog = MultiDeviceResultsDialog(title, summary, results, self)
-        dialog.exec_()
-
-    def prompt_add_bgp(self):
-        """Add BGP configuration to selected device."""
-        return self.bgp_handler.prompt_add_bgp()
-    def prompt_edit_bgp(self):
-        """Edit BGP configuration for selected device."""
-        return self.bgp_handler.prompt_edit_bgp()
-    def prompt_delete_bgp(self):
-        """Delete BGP configuration for selected device."""
-        return self.bgp_handler.prompt_delete_bgp()
-    def prompt_edit_ospf(self):
-        """Edit OSPF configuration for selected device."""
-        return self.ospf_handler.prompt_edit_ospf()
-    def prompt_delete_ospf(self):
-        """Delete OSPF configuration for selected device."""
-        return self.ospf_handler.prompt_delete_ospf()
-    def on_bgp_table_cell_changed(self, row, column):
-        """Handle cell changes in BGP table - handles inline editing with separate rows per neighbor."""
-        return self.bgp_handler.on_bgp_table_cell_changed(row, column)
-    def on_ospf_table_cell_changed(self, row, column):
-        """Handle cell changes in OSPF table - handles inline editing of Area ID and Graceful Restart."""
-        return self.ospf_handler.on_ospf_table_cell_changed(row, column)
-    def on_isis_table_cell_changed(self, row, column):
-        """Handle cell changes in ISIS table - handles inline editing of ISIS Net, System ID, Hello Interval, and Multiplier."""
-        return self.isis_handler.on_isis_table_cell_changed(row, column)
-    def prompt_add_ospf(self):
-        """Add OSPF configuration to selected device."""
-        return self.ospf_handler.prompt_add_ospf()
-    def prompt_add_isis(self):
-        """Add IS-IS configuration to selected device."""
-        return self.isis_handler.prompt_add_isis()
     def _update_device_protocol(self, row_or_device_name, protocol, config):
         """Update device with protocol configuration.
         
@@ -5002,7 +6039,6 @@ class DevicesTab(QWidget):
             s = s.rsplit(":", 1)[-1].strip()
         parts = s.split()
         return parts[-1] if parts else ""
-    
     def _convert_protocols_to_array(self, protocols):
         """Convert protocols string to array format for database storage."""
         if not protocols:
@@ -5011,817 +6047,14 @@ class DevicesTab(QWidget):
         if isinstance(protocols, list):
             return protocols
         
+        if isinstance(protocols, dict):
+            return list(sorted(set(protocols.keys())))
+        
         if isinstance(protocols, str):
             # Split by comma and clean up
             return [p.strip() for p in protocols.split(",") if p.strip()]
         
         return []
-    
-    def _get_server_url_from_interface(self, iface_label):
-        """Get server URL from interface label."""
-        # Extract TG ID from interface label like "TG 0 - Port: ● enp180s0np0"
-        if "TG" in iface_label:
-            tg_part = iface_label.split("-")[0].strip()  # "TG 0"
-            tg_id = tg_part.split()[-1]  # "0"
-            
-            # Find server with matching TG ID, prioritizing online servers
-            if hasattr(self.main_window, 'server_interfaces'):
-                # First, try to find an online server with matching TG ID
-                for server in self.main_window.server_interfaces:
-                    if (str(server.get('tg_id', '0')) == tg_id and 
-                        server.get('online', False)):
-                        return server.get('address')
-                
-                # If no online server found, try any server with matching TG ID
-                for server in self.main_window.server_interfaces:
-                    if str(server.get('tg_id', '0')) == tg_id:
-                        return server.get('address')
-        
-        # Fallback: return first online server, then any server
-        if hasattr(self.main_window, 'server_interfaces') and self.main_window.server_interfaces:
-            # Try online servers first
-            for server in self.main_window.server_interfaces:
-                if server.get('online', False):
-                    return server.get('address')
-            
-            # If no online servers, return first available
-            return self.main_window.server_interfaces[0].get('address')
-        
-        return None
-    
-    # Commented out old remove_selected_device method
-    '''def remove_selected_device(self):
-        selected_items = self.devices_table.selectedItems()
-        if not selected_items:
-            QMessageBox.warning(self, "No Selection", "Select one or more devices to remove.")
-            return
-
-        rows = sorted({it.row() for it in selected_items}, reverse=True)
-
-        for row in rows:
-            try:
-                name_item = self.devices_table.item(row, self.COL["Device Name"])
-                iface_item = self.devices_table.item(row, self.COL["Interface"])
-                prot_item = self.devices_table.item(row, self.COL["Protocols"])
-                ipv4_item = self.devices_table.item(row, self.COL["IPv4"])
-                ipv6_item = self.devices_table.item(row, self.COL["IPv6"])
-
-                device_id = name_item.data(Qt.UserRole) if name_item else None
-                name = name_item.text() if name_item else "Unknown"
-                iface = iface_item.text() if iface_item else ""
-                protocol_str = prot_item.text() if prot_item else ""
-                protocols = [p.strip() for p in protocol_str.split(",") if p.strip()]
-                ipv4 = ipv4_item.text() if ipv4_item else ""
-                ipv6 = ipv6_item.text() if ipv6_item else ""
-                ipv4_mask = (ipv4_item.data(Qt.UserRole + 1) if ipv4_item else None) or "24"
-                ipv6_mask = (ipv6_item.data(Qt.UserRole + 1) if ipv6_item else None) or "64"
-
-                logging.debug(f"Remove device: {name} iface={iface} id={device_id}")
-
-                server_url = self.get_server_url(silent=True)
-                if server_url and device_id:
-                    try:
-                        payload = {
-                            "device_id": device_id,
-                            "device_name": name,
-                            "interface": iface,
-                            "protocols": protocols,
-                            "ipv4": ipv4,
-                            "ipv6": ipv6,
-                            "ipv4_mask": ipv4_mask,
-                            "ipv6_mask": ipv6_mask,
-                        }
-                        resp = requests.post(f"{server_url}/api/device/remove", json=payload, timeout=15)
-                        logging.info(f"[REMOVE] {device_id} -> {resp.status_code}")
-                    except Exception as e:
-                        logging.error(f"[REMOVE ERROR] backend: {e}")
-
-                # remove GUI row
-                self.devices_table.removeRow(row)
-
-                # remove from model
-                if hasattr(self.main_window, "all_devices"):
-                    iface_devices = self.main_window.all_devices.get(iface, [])
-                    self.main_window.all_devices[iface] = [
-                        d for d in iface_devices if d.get("device_id") != device_id
-                    ]
-                    if not self.main_window.all_devices[iface]:
-                        del self.main_window.all_devices[iface]
-            except Exception as e:
-                logging.error(f"[REMOVE ERROR] row {row}: {e}")'''
-
-    def start_selected_devices(self):
-        """Start selected devices by applying their configuration (non-blocking)."""
-        selected_items = self.devices_table.selectedItems()
-        if not selected_items:
-            QMessageBox.warning(self, "No Selection", "Please select one or more devices to start.")
-            return
-
-        # Get unique rows from selected items
-        selected_rows = set()
-        for item in selected_items:
-            selected_rows.add(item.row())
-        
-        if not selected_rows:
-            QMessageBox.warning(self, "No Selection", "Please select one or more devices to start.")
-            return
-
-        # Get server URL
-        server_url = self.get_server_url()
-        if not server_url:
-            return
-
-        # Prepare device data for worker thread
-        devices_to_process = []
-        for row in selected_rows:
-            device_name = self.devices_table.item(row, self.COL["Device Name"]).text()
-            
-            # Find device in all_devices data structure
-            device_info = None
-            for iface, devices in self.main_window.all_devices.items():
-                for device in devices:
-                    if device.get("Device Name") == device_name:
-                        device_info = device
-                        break
-                if device_info:
-                    break
-            
-            if device_info:
-                devices_to_process.append((row, device_name, device_info))
-        
-        if not devices_to_process:
-            QMessageBox.warning(self, "Error", "No valid devices found to start.")
-            return
-        
-        # Create and start worker thread
-        self.operation_worker = DeviceOperationWorker('start', devices_to_process, server_url, self)
-        
-        # Set operation type flag for this operation
-        self._current_operation_type = 'start'
-        
-        # Connect signals
-        self.operation_worker.progress.connect(self._on_device_operation_progress)
-        self.operation_worker.device_status_updated.connect(self._on_device_status_updated)
-        self.operation_worker.finished.connect(lambda results, succ, fail: self._on_device_operation_finished(results, succ, fail, selected_rows))
-        
-        # Start the worker (non-blocking)
-        self.operation_worker.start()
-        
-        print(f"[DEVICE START] Starting {len(devices_to_process)} devices in background...")
-    
-    def stop_selected_devices(self):
-        """Stop selected devices by stopping their services without removing them (non-blocking)."""
-        selected_items = self.devices_table.selectedItems()
-        if not selected_items:
-            QMessageBox.warning(self, "No Selection", "Please select one or more devices to stop.")
-            return
-
-        # Get unique rows from selected items
-        selected_rows = set()
-        for item in selected_items:
-            selected_rows.add(item.row())
-        
-        if not selected_rows:
-            QMessageBox.warning(self, "No Selection", "Please select one or more devices to stop.")
-            return
-
-        # Get server URL
-        server_url = self.get_server_url()
-        if not server_url:
-            return
-
-        # Prepare device data for worker thread
-        devices_to_process = []
-        for row in selected_rows:
-            device_name = self.devices_table.item(row, self.COL["Device Name"]).text()
-            
-            # Find device in all_devices data structure
-            device_info = None
-            for iface, devices in self.main_window.all_devices.items():
-                for device in devices:
-                    if device.get("Device Name") == device_name:
-                        device_info = device
-                        break
-                if device_info:
-                    break
-            
-            if device_info:
-                devices_to_process.append((row, device_name, device_info))
-        
-        if not devices_to_process:
-            QMessageBox.warning(self, "Error", "No valid devices found to stop.")
-            return
-        
-        # Create and start worker thread
-        self.operation_worker = DeviceOperationWorker('stop', devices_to_process, server_url, self)
-        
-        # Set operation type flag for this operation
-        self._current_operation_type = 'stop'
-        
-        # Connect signals
-        self.operation_worker.progress.connect(self._on_device_operation_progress)
-        self.operation_worker.device_status_updated.connect(self._on_device_status_updated)
-        self.operation_worker.finished.connect(lambda results, succ, fail: self._on_device_operation_finished(results, succ, fail, selected_rows))
-        
-        # Start the worker (non-blocking)
-        self.operation_worker.start()
-        
-        print(f"[DEVICE STOP] Stopping {len(devices_to_process)} devices in background...")
-
-    def remove_selected_device(self):
-        """Remove selected devices from both server and UI."""
-        print(f"[DEBUG REMOVE] Starting remove_selected_device() - FULL REMOVAL (SERVER + UI)")
-        selected_items = self.devices_table.selectedItems()
-        if not selected_items:
-            QMessageBox.warning(self, "No Selection", "Select one or more devices to remove.")
-            return
-
-        # Confirm removal
-        reply = QMessageBox.question(
-            self, 
-            "Confirm Device Removal", 
-            f"Are you sure you want to remove {len(set(item.row() for item in selected_items))} selected device(s)?\n\nThis will:\n- Stop all protocols (BGP, OSPF, etc.)\n- Remove FRR containers\n- Clean up interface IP addresses\n- Remove devices from the UI",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No
-        )
-        
-        if reply != QMessageBox.Yes:
-            return
-
-        rows = sorted({it.row() for it in selected_items}, reverse=True)
-        print(f"[DEBUG REMOVE] Selected rows: {rows}")
-
-        for row in rows:
-            try:
-                name_item = self.devices_table.item(row, self.COL["Device Name"])
-                ipv4_item = self.devices_table.item(row, self.COL["IPv4"])
-                ipv6_item = self.devices_table.item(row, self.COL["IPv6"])
-
-                device_id = name_item.data(Qt.UserRole) if name_item else None
-                name = name_item.text() if name_item else "Unknown"
-                ipv4 = ipv4_item.text() if ipv4_item else ""
-                ipv6 = ipv6_item.text() if ipv6_item else ""
-                
-                print(f"[DEBUG REMOVE] Processing device: name='{name}', id='{device_id}', ipv4='{ipv4}', ipv6='{ipv6}'")
-
-                # Find the device in all_devices to get interface and protocol info
-                device_info = None
-                device_interface = None
-                for iface, devices in self.main_window.all_devices.items():
-                    for device in devices:
-                        if device.get("device_id") == device_id or device.get("Device Name") == name:
-                            device_info = device
-                            device_interface = iface
-                            break
-                    if device_info:
-                        break
-
-                if not device_info:
-                    print(f"[ERROR] Device {name} not found in all_devices")
-                    continue
-
-                # Get interface info
-                iface_label = device_info.get("Interface", device_interface)
-
-                # Clean up BGP table entries for this device (before removing from all_devices)
-                self._cleanup_bgp_table_for_device(device_id, name)
-                
-                # Clean up OSPF table entries for this device (before removing from all_devices)
-                self._cleanup_ospf_table_for_device(device_id, name)
-                
-                # Clean up ISIS table entries for this device (before removing from all_devices)
-                self._cleanup_isis_table_for_device(device_id, name)
-
-                # Remove from GUI table
-                print(f"[DEBUG REMOVE] Removing device '{name}' from UI")
-                self.devices_table.removeRow(row)
-                print(f"[DEBUG REMOVE] Removed GUI row {row}")
-
-                # Remove from all_devices data structure immediately
-                if device_interface in self.main_window.all_devices:
-                    device_list = self.main_window.all_devices[device_interface]
-                    if isinstance(device_list, list):
-                        # Remove the device from the list
-                        self.main_window.all_devices[device_interface] = [
-                            d for d in device_list 
-                            if d.get("device_id") != device_id and d.get("Device Name") != name
-                        ]
-                        print(f"[DEBUG REMOVE] Removed '{name}' from all_devices data structure")
-                        
-                        # If no devices left on this interface, remove the interface key
-                        if not self.main_window.all_devices[device_interface]:
-                            del self.main_window.all_devices[device_interface]
-                            print(f"[DEBUG REMOVE] Removed empty interface '{device_interface}' from all_devices")
-
-                # Remove from device name mapping
-                if hasattr(self, 'interface_to_device_map'):
-                    if name in self.interface_to_device_map:
-                        del self.interface_to_device_map[name]
-                        print(f"[DEBUG REMOVE] Removed '{name}' from device mapping")
-
-                # Track removed device for session synchronization
-                if not hasattr(self.main_window, 'removed_devices'):
-                    self.main_window.removed_devices = []
-                self.main_window.removed_devices.append(device_id)
-                print(f"[DEBUG REMOVE] Added device ID '{device_id}' to removed_devices list")
-
-                # Remove from server immediately
-                server_url = self.get_server_url()
-                if server_url:
-                    self._remove_device_from_server(device_info, device_id, name)
-                    
-                    # Clean up protocol configurations from server
-                    protocols = device_info.get("protocols", [])
-                    if not isinstance(protocols, list):
-                        protocols = list(protocols.keys()) if isinstance(protocols, dict) else []
-                    
-                    # Clean up BGP configuration from server
-                    if "BGP" in protocols:
-                        try:
-                            response = requests.post(f"{server_url}/api/device/bgp/cleanup", 
-                                                   json={"device_id": device_id}, 
-                                                   timeout=10)
-                            if response.status_code == 200:
-                                print(f"✅ BGP configuration removed from server for {name}")
-                            else:
-                                print(f"⚠️ Server BGP cleanup failed for {name}: {response.status_code}")
-                        except Exception as bgp_e:
-                            print(f"⚠️ Error removing BGP from server for {name}: {str(bgp_e)}")
-                    
-                    # Clean up OSPF configuration from server
-                    if "OSPF" in protocols:
-                        try:
-                            response = requests.post(f"{server_url}/api/ospf/cleanup", 
-                                                   json={"device_id": device_id}, 
-                                                   timeout=10)
-                            if response.status_code == 200:
-                                print(f"✅ OSPF configuration removed from server for {name}")
-                            else:
-                                print(f"⚠️ Server OSPF cleanup failed for {name}: {response.status_code}")
-                        except Exception as ospf_e:
-                            print(f"⚠️ Error removing OSPF from server for {name}: {str(ospf_e)}")
-                    
-                    # Clean up ISIS configuration from server
-                    if "IS-IS" in protocols or "ISIS" in protocols:
-                        try:
-                            response = requests.post(f"{server_url}/api/device/isis/cleanup", 
-                                                   json={"device_id": device_id}, 
-                                                   timeout=10)
-                            if response.status_code == 200:
-                                print(f"✅ ISIS configuration removed from server for {name}")
-                            else:
-                                print(f"⚠️ Server ISIS cleanup failed for {name}: {response.status_code}")
-                        except Exception as isis_e:
-                            print(f"⚠️ Error removing ISIS from server for {name}: {str(isis_e)}")
-
-            except Exception as e:
-                logging.error(f"[REMOVE ERROR] row {row}: {e}")
-        
-        # Update protocol tables after removal
-        self.update_bgp_table()
-        self.update_ospf_table()
-        self.update_isis_table()
-        
-        # Show info message about removal
-        QMessageBox.information(self, "Device Removed", 
-                               f"Removed {len(rows)} device(s) from the UI and server.")
-        
-        # Auto-save session after device removal
-        if hasattr(self.main_window, 'save_session'):
-            print(f"[DEBUG REMOVE] Auto-saving session after device removal")
-            self.main_window.save_session()
-
-    def _remove_device_from_server(self, device_info, device_id, device_name):
-        """Remove a device from the server immediately."""
-        try:
-            print(f"[DEBUG REMOVE SERVER] Removing device '{device_name}' from server")
-            
-            # Get server URL
-            server_url = self.get_server_url(silent=True)
-            if not server_url:
-                print(f"[DEBUG REMOVE SERVER] No server URL available")
-                return
-            
-            # Get device information
-            iface_label = device_info.get("Interface", "")
-            iface_norm = self._normalize_iface_label(iface_label)
-            vlan = device_info.get("VLAN", "0")
-            ipv4 = device_info.get("IPv4", "")
-            ipv6 = device_info.get("IPv6", "")
-            
-            print(f"[DEBUG REMOVE SERVER] Device info: iface='{iface_norm}', vlan='{vlan}', ipv4='{ipv4}', ipv6='{ipv6}'")
-            
-            # Clean up device-specific IPs from server
-            cleanup_payload = {
-                "interface": iface_norm,
-                "vlan": vlan,
-                "cleanup_only": True,
-                "device_specific": True,
-                "device_id": device_id,
-                "device_name": device_name
-            }
-            
-            print(f"[DEBUG REMOVE SERVER] Calling cleanup API with payload: {cleanup_payload}")
-            cleanup_resp = requests.post(f"{server_url}/api/device/cleanup", json=cleanup_payload, timeout=10)
-            
-            if cleanup_resp.status_code == 200:
-                cleanup_data = cleanup_resp.json()
-                removed_ips = cleanup_data.get("removed_ips", [])
-                print(f"[DEBUG REMOVE SERVER] Successfully cleaned up IPs: {removed_ips}")
-            else:
-                print(f"[DEBUG REMOVE SERVER] Cleanup failed: {cleanup_resp.status_code} - {cleanup_resp.text}")
-            
-            # Also call the device remove API for protocol cleanup
-            protocols = device_info.get("protocols", [])
-            if isinstance(protocols, list):
-                protocol_list = protocols
-            elif isinstance(protocols, dict):
-                protocol_list = list(protocols.keys())
-            else:
-                protocol_list = []
-            
-            remove_payload = {
-                "device_id": device_id,
-                "device_name": device_name,
-                "interface": iface_norm,
-                "vlan": vlan,
-                "ipv4": ipv4,
-                "ipv6": ipv6,
-                "protocols": protocol_list
-            }
-            
-            print(f"[DEBUG REMOVE SERVER] Calling remove API with payload: {remove_payload}")
-            remove_resp = requests.post(f"{server_url}/api/device/remove", json=remove_payload, timeout=10)
-            
-            if remove_resp.status_code == 200:
-                print(f"[DEBUG REMOVE SERVER] Successfully removed device '{device_name}' from server")
-            else:
-                print(f"[DEBUG REMOVE SERVER] Remove API failed: {remove_resp.status_code} - {remove_resp.text}")
-                
-        except Exception as e:
-            print(f"[ERROR] Failed to remove device '{device_name}' from server: {e}")
-
-    def _cleanup_bgp_table_for_device(self, device_id, device_name):
-        """Clean up BGP table entries for a removed device."""
-        return self.bgp_handler._cleanup_bgp_table_for_device(device_id, device_name)
-    def _cleanup_ospf_table_for_device(self, device_id, device_name):
-        """Clean up OSPF table entries for a removed device."""
-        return self.ospf_handler._cleanup_ospf_table_for_device(device_id, device_name)
-    def _cleanup_isis_table_for_device(self, device_id, device_name):
-        """Clean up ISIS table entries for a removed device."""
-        return self.isis_handler._cleanup_isis_table_for_device(device_id, device_name)
-    def update_device_table(self, all_devices):
-        """Rebuild table for currently selected interfaces."""
-        self.devices_table.setRowCount(0)
-
-        try:
-            # figure selected interfaces from server_tree
-            selected = set()
-            tree = self.main_window.server_tree
-            for item in tree.selectedItems():
-                parent = item.parent()
-                if parent:
-                    tg_id = parent.text(0).strip()
-                    port_name = item.text(0).replace("• ", "").strip()  # Remove bullet prefix
-                    selected.add(f"{tg_id} - {port_name}")  # Match server tree format
-
-            # fill rows - if no interfaces selected, show devices from all interfaces
-            interfaces_to_show = selected if selected else list(all_devices.keys())
-            for iface in interfaces_to_show:
-                # Check both new format and old format for backward compatibility
-                devices = all_devices.get(iface, [])
-                if not devices:
-                    # Try old format with "Port:" and bullet
-                    old_format = iface.replace(" - ", " - Port: • ")
-                    devices = all_devices.get(old_format, [])
-                
-                for device in devices:
-                    row = self.devices_table.rowCount()
-                    self.devices_table.insertRow(row)
-                    for h in self.device_headers:
-                        # Handle special cases for mask columns
-                        if h == "IPv4 Mask":
-                            val = device.get("ipv4_mask", "24")
-                        elif h == "IPv6 Mask":
-                            val = device.get("ipv6_mask", "64")
-                        elif h == "Loopback IPv4":
-                            val = device.get("Loopback IPv4", "")
-                        elif h == "Loopback IPv6":
-                            val = device.get("Loopback IPv6", "")
-                        else:
-                            val = device.get(h, "")
-                        
-                        # Special handling for Status column - use icon instead of text
-                        if h == "Status":
-                            status_value = device.get("Status", "Stopped")
-                            item = QTableWidgetItem("")  # Empty text, icon only
-                            if status_value == "Running":
-                                item.setIcon(self.green_dot)
-                                item.setToolTip("Device Running")
-                            else:
-                                item.setIcon(self.red_dot)
-                                item.setToolTip("Device Stopped")
-                            item.setFlags(Qt.ItemIsEnabled)  # Read-only
-                        else:
-                            item = QTableWidgetItem(str(val))
-                        
-                        # keep masks on the cells too
-                        if h == "IPv4":
-                            item.setData(Qt.UserRole + 1, device.get("ipv4_mask", "24"))
-                        elif h == "IPv6":
-                            item.setData(Qt.UserRole + 1, device.get("ipv6_mask", "64"))
-                        # store id on name column
-                        if h == "Device Name" and "device_id" in device:
-                            item.setData(Qt.UserRole, device["device_id"])
-                        
-                        # Store initial value for change detection
-                        item.setData(Qt.UserRole + 2, str(val))
-                        
-                        self.devices_table.setItem(row, self.COL[h], item)
-
-                    # Set initial status icon (will be updated by async ARP check if needed)
-                    status_value = device.get("Status", "Stopped")
-                    if status_value == "Running":
-                        # Set initial status icon - will be updated by async ARP check
-                        self.set_status_icon(row, resolved=False, status_text="Checking ARP...")
-
-        except Exception as e:
-            logging.error(f"[update_device_table] {e}")
-
-        # Start async ARP resolution checks for running devices
-        # DISABLED to prevent QThread crashes - use manual refresh instead
-        # self._start_async_arp_checks()
-        
-        # Initialize ARP status from database for all running devices
-        self._initialize_arp_status_from_database()
-
-    def _initialize_arp_status_from_database(self):
-        """Initialize ARP status from database for all running devices when client starts up."""
-        # Check if application is closing
-        if hasattr(self.main_window, '_is_closing') and self.main_window._is_closing:
-            print("[ARP INIT] Skipping ARP initialization - application is closing")
-            return
-        
-        try:
-            # Get all running devices
-            running_devices = []
-            for iface, devices in self.main_window.all_devices.items():
-                for device in devices:
-                    if device.get("Status") == "Running":
-                        running_devices.append(device)
-            
-            if not running_devices:
-                return
-            
-            print(f"[ARP INIT] Initializing ARP status for {len(running_devices)} running devices...")
-            
-            # Check ARP status for each running device
-            for device_info in running_devices:
-                try:
-                    device_name = device_info.get("Device Name", "Unknown")
-                    device_id = device_info.get("device_id", "")
-                    
-                    if not device_id:
-                        continue
-                    
-                    # Get ARP status from database
-                    arp_results = self._check_individual_arp_resolution(device_info)
-                    
-                    # Find the row for this device in the table
-                    device_row = None
-                    for row in range(self.devices_table.rowCount()):
-                        name_item = self.devices_table.item(row, self.COL["Device Name"])
-                        if name_item and name_item.text() == device_name:
-                            device_row = row
-                            break
-                    
-                    if device_row is not None:
-                        # Update the device status icon based on database results
-                        overall_resolved = arp_results.get("overall_resolved", False)
-                        overall_status = arp_results.get("overall_status", "Unknown")
-                        
-                        self.update_device_status_icon(device_row, overall_resolved, overall_status)
-                        
-                        print(f"[ARP INIT] {device_name}: {overall_status}")
-                        
-                except Exception as e:
-                    print(f"[ARP INIT] Error for {device_name}: {e}")
-            
-        except Exception as e:
-            print(f"[ARP INIT] Error initializing ARP status: {e}")
-
-    def get_device_info_by_name(self, device_name):
-        """Get device information by device name from all_devices data structure."""
-        try:
-            for iface, devices in self.main_window.all_devices.items():
-                for device in devices:
-                    if device.get("Device Name") == device_name:
-                        return device
-            return None
-        except Exception as e:
-            logging.error(f"[get_device_info_by_name] Error getting device info for '{device_name}': {e}")
-            return None
-
-    def _start_individual_arp_checks(self):
-        """Start individual ARP checks for all running devices."""
-        try:
-            # Check if application is closing
-            if hasattr(self.main_window, '_is_closing') and self.main_window._is_closing:
-                print("[ARP INDIVIDUAL] Skipping ARP check - application is closing")
-                return
-            
-            # Check if ARP check is already in progress
-            if self._arp_check_in_progress:
-                print("[ARP INDIVIDUAL] ARP check already in progress, skipping")
-                return
-            
-            # Get all running devices
-            devices_to_check = []
-            for row in range(self.devices_table.rowCount()):
-                device_name_item = self.devices_table.item(row, self.COL["Device Name"])
-                if device_name_item:
-                    device_name = device_name_item.text()
-                    device_info = self.get_device_info_by_name(device_name)
-                    
-                    if device_info and device_info.get("Status") == "Running":
-                        devices_to_check.append((row, device_info))
-            
-            # Start individual ARP checking if we have devices to check
-            if devices_to_check:
-                self._arp_check_in_progress = True
-                print(f"[ARP INDIVIDUAL] Starting individual ARP checks for {len(devices_to_check)} running devices")
-                self.check_individual_arp_resolution_bulk_async(devices_to_check)
-            else:
-                print("[ARP INDIVIDUAL] No running devices to check")
-                
-        except Exception as e:
-            logging.error(f"[_start_individual_arp_checks] {e}")
-            self._arp_check_in_progress = False
-    
-    def check_individual_arp_resolution_bulk_async(self, devices_data):
-        """Start individual ARP resolution checks for multiple devices in background."""
-        # devices_data should be a list of (row, device_info) tuples
-        
-        # Check if application is closing
-        if hasattr(self.main_window, '_is_closing') and self.main_window._is_closing:
-            print("[ARP INDIVIDUAL BULK] Skipping ARP check - application is closing")
-            return
-        
-        # Create and start worker
-        self.individual_arp_worker = IndividualArpCheckWorker(devices_data, self)
-        self.individual_arp_worker.arp_result.connect(self._on_individual_arp_result)
-        self.individual_arp_worker.finished.connect(self._on_individual_arp_finished)
-        self.individual_arp_worker.start()
-    
-    def _on_individual_arp_result(self, row, arp_results, operation_id=None):
-        """Handle individual ARP check result from worker thread."""
-        try:
-            # Debug: Check if this device was actually selected
-            device_name = self.devices_table.item(row, self.COL["Device Name"]).text()
-            print(f"[DEBUG ARP RESULT] Processing ARP result for row {row}, device: {device_name}, operation_id: {operation_id}")
-            
-            # Check if this device is in the current pending ARP rows
-            if hasattr(self, '_pending_arp_rows') and self._pending_arp_rows:
-                if row not in self._pending_arp_rows:
-                    print(f"[DEBUG ARP RESULT] Skipping row {row} ({device_name}) - not in current selection: {self._pending_arp_rows}")
-                    return
-                else:
-                    print(f"[DEBUG ARP RESULT] Processing row {row} ({device_name}) - in current selection")
-            else:
-                print(f"[DEBUG ARP RESULT] No pending ARP rows, processing row {row} ({device_name})")
-            
-            # Additional validation: Check if this is from the current ARP operation
-            if hasattr(self, 'arp_operation_worker') and self.arp_operation_worker:
-                current_operation_id = getattr(self.arp_operation_worker, 'operation_id', None)
-                if operation_id and current_operation_id and operation_id != current_operation_id:
-                    print(f"[DEBUG ARP RESULT] Skipping row {row} ({device_name}) - operation_id mismatch: {operation_id} != {current_operation_id}")
-                    return
-            
-            # Update the status icon and individual IP colors
-            self.set_status_icon_with_individual_ips(row, arp_results)
-        except Exception as e:
-            logging.error(f"[INDIVIDUAL ARP RESULT ERROR] Row {row}: {e}")
-    
-    def _on_individual_arp_finished(self):
-        """Handle individual ARP check completion."""
-        # Clean up worker reference
-        if hasattr(self, 'individual_arp_worker'):
-            self.individual_arp_worker.deleteLater()
-            delattr(self, 'individual_arp_worker')
-        
-        # Reset the in-progress flag
-        self._arp_check_in_progress = False
-        print("[ARP INDIVIDUAL] Individual ARP checks completed")
-
-    def _start_async_arp_checks(self):
-        """Start async ARP resolution checks for all running devices."""
-        try:
-            # Check if application is closing
-            if hasattr(self.main_window, '_is_closing') and self.main_window._is_closing:
-                print("[ARP ASYNC] Skipping ARP check - application is closing")
-                return
-            
-            # Check if ARP check is already in progress
-            if self._arp_check_in_progress:
-                print("[ARP ASYNC] Skipping ARP check - already in progress")
-                return
-            
-            devices_to_check = []
-            
-            # Collect all running devices that need ARP checks
-            for row in range(self.devices_table.rowCount()):
-                device_name_item = self.devices_table.item(row, self.COL["Device Name"])
-                if not device_name_item:
-                    continue
-                
-                device_name = device_name_item.text()
-                device_info = self.get_device_info_by_name(device_name)
-                
-                if device_info and device_info.get("Status") == "Running":
-                    devices_to_check.append((row, device_info))
-            
-            # Start async ARP checking if we have devices to check
-            if devices_to_check:
-                self._arp_check_in_progress = True
-                print(f"[ARP ASYNC] Starting async ARP checks for {len(devices_to_check)} running devices")
-                self.check_arp_resolution_bulk_async(devices_to_check)
-            else:
-                print("[ARP ASYNC] No running devices to check")
-                
-        except Exception as e:
-            logging.error(f"[_start_async_arp_checks] {e}")
-            self._arp_check_in_progress = False
-
-    # ---------- Poller ----------
-
-    def poll_device_status(self):
-        """Poll ARP resolution status for all devices in the table using async approach."""
-        try:
-            server_url = self.get_server_url(silent=True)
-            if not server_url:
-                return
-
-            # Count running devices for adaptive polling
-            running_count = 0
-            for iface, devices in self.main_window.all_devices.items():
-                for device in devices:
-                    if device.get("Status") == "Running":
-                        running_count += 1
-            
-            # Adaptive polling: slow down when no devices are running
-            if running_count == 0:
-                # No running devices - check every 60 seconds
-                if self.status_timer.interval() != 60000:
-                    self.status_timer.setInterval(60000)
-                    print("[DEVICE POLL] No running devices - slowing to 60s interval")
-                return  # Skip the actual check
-            else:
-                # Devices running - normal interval (30 seconds)
-                if self.status_timer.interval() != 30000:
-                    self.status_timer.setInterval(30000)
-                    print(f"[DEVICE POLL] {running_count} device(s) running - normal 30s interval")
-
-            # Use the new async ARP checking approach
-            # DISABLED: Automatic ARP polling interferes with manual ARP operations
-            # print(f"[ARP ASYNC POLL] Starting async ARP check for {running_count} running device(s)...")
-            # self._start_async_arp_checks()
-
-        except Exception as e:
-            logging.debug(f"[ARP POLL ERROR] {e}")
-
-    def set_selected_interface(self, iface_name):
-        self.selected_iface_name = iface_name
-
-    def _increment_mac(self, mac, step, byte_index=0):
-        """Increment MAC address by step in the specified byte.
-        
-        Args:
-            mac: MAC address string (e.g., "00:11:22:33:44:55")
-            step: Number to increment by
-            byte_index: Which byte to increment (0=6th/last, 1=5th, ..., 5=1st)
-        """
-        try:
-            mac_parts = mac.split(":")
-            bytes_list = [int(b, 16) for b in mac_parts]
-            incremented = bytes_list[:]
-            
-            # Map byte_index to array index (0=6th -> index 5, 1=5th -> index 4, etc.)
-            target_byte = 5 - byte_index
-            
-            # Increment the specified byte
-            incremented[target_byte] += step
-            
-            # Handle overflow from right to left
-            for j in range(5, -1, -1):
-                if incremented[j] > 255:
-                    incremented[j] -= 256
-                    if j > 0:
-                        incremented[j - 1] += 1
-            
-            return ":".join(f"{b:02x}" for b in incremented)
-        except Exception:
-            return mac
-
     def _increment_ipv4(self, ipv4, step, octet_index=0):
         """Increment IPv4 address by step in the specified octet.
         
@@ -6124,6 +6357,34 @@ class DevicesTab(QWidget):
     def stop_bgp_monitoring(self):
         """Stop periodic BGP status monitoring."""
         return self.bgp_handler.stop_bgp_monitoring()
+    def setup_column_tooltips(self):
+        """Set up header tooltips indicating whether columns are editable."""
+        try:
+            tooltips = {
+                "Device Name": "Editable: Device name (1-50 characters)",
+                "Status": "Read-only: Device lifecycle status",
+                "IPv4": "Editable: IPv4 address (e.g., 192.168.0.2)",
+                "IPv6": "Editable: IPv6 address (e.g., 2001:db8::1)",
+                "VLAN": "Editable: VLAN ID (0-4094, 0 = untagged)",
+                "IPv4 Gateway": "Editable: IPv4 gateway used for static routes",
+                "IPv6 Gateway": "Editable: IPv6 gateway used for static routes",
+                "IPv4 Mask": "Editable: IPv4 mask length (0-32)",
+                "IPv6 Mask": "Editable: IPv6 mask length (0-128)",
+                "MAC Address": "Editable: MAC address (XX:XX:XX:XX:XX:XX)",
+                "Loopback IPv4": "Editable: IPv4 loopback address",
+                "Loopback IPv6": "Editable: IPv6 loopback address",
+            }
+
+            for header, tooltip in tooltips.items():
+                col_index = self.COL.get(header)
+                if col_index is None:
+                    continue
+                header_item = self.devices_table.horizontalHeaderItem(col_index)
+                if header_item and tooltip:
+                    header_item.setToolTip(tooltip)
+        except Exception as e:
+            logging.error(f"[setup_column_tooltips] Error: {e}")
+
     def start_ospf_monitoring(self):
         """Start periodic OSPF status monitoring."""
         return self.ospf_handler.start_ospf_monitoring()
@@ -6184,322 +6445,92 @@ class DevicesTab(QWidget):
         except Exception as e:
             print(f"[DEVICE STATUS ICON] Error updating status icon for row {row}: {e}")
 
-    def on_cell_changed(self, row, column):
-        """Handle cell changes for inline editing."""
-        try:
-            # Get the header name for this column
-            header_name = self.device_headers[column]
-            item = self.devices_table.item(row, column)
-            if not item:
-                return
-            
-            new_value = item.text().strip()
-            old_value = item.data(Qt.UserRole + 2) if item.data(Qt.UserRole + 2) else ""
-            
-            # Skip if value hasn't actually changed
-            if new_value == old_value:
-                return
-            
-            # Get device info
-            device_name_item = self.devices_table.item(row, self.COL["Device Name"])
-            if not device_name_item:
-                return
-            
-            device_id = device_name_item.data(Qt.UserRole)
-            if not device_id:
-                return
-            
-            # Validate the new value based on field type
-            if not self.validate_cell_value(header_name, new_value, row, column):
-                # Revert to old value if validation fails
-                item.setText(old_value)
-                return
-            
-            # Update the device data in memory
-            self.update_device_data_in_memory(device_id, header_name, new_value)
-            
-            # Mark device as needing apply
-            self.mark_device_for_apply(device_id)
-            
-            # Store the new value as the "old" value for next comparison
-            item.setData(Qt.UserRole + 2, new_value)
-            
-            # Visual feedback - change background color temporarily
-            self.highlight_edited_cell(row, column)
-            
-            # Device field updated
-            
-        except Exception as e:
-            logging.error(f"[on_cell_changed] Error: {e}")
-    
-    def validate_cell_value(self, header_name, value, row=None, column=None):
-        """Validate cell values based on field type."""
-        try:
-            if header_name == "Device Name":
-                return len(value) > 0 and len(value) <= 50
-            
-            elif header_name == "IPv4":
-                if not value:  # Empty is allowed
-                    return True
-                try:
-                    ipaddress.IPv4Address(value)
-                    return True
-                except ipaddress.AddressValueError:
-                    return False
-            
-            elif header_name == "IPv6":
-                if not value:  # Empty is allowed
-                    return True
-                try:
-                    ipaddress.IPv6Address(value)
-                    return True
-                except ipaddress.AddressValueError:
-                    return False
-            
-            elif header_name == "VLAN":
-                if not value:  # Empty means no VLAN
-                    return True
-                try:
-                    vlan_id = int(value)
-                    return 0 <= vlan_id <= 4094
-                except ValueError:
-                    return False
-            
-            elif header_name == "Gateway":
-                if not value:  # Empty is allowed
-                    return True
-                try:
-                    # Try IPv4 first
-                    gateway_ip = ipaddress.IPv4Address(value)
-                    
-                    # Get the device's IPv4 address and mask for subnet validation
-                    device_ipv4 = None
-                    device_mask = None
-                    
-                    # Use the provided row if available
-                    if row is not None:
-                        ipv4_item = self.devices_table.item(row, self.COL.get("IPv4", -1))
-                        mask_item = self.devices_table.item(row, self.COL.get("IPv4 Mask", -1))
-                        
-                        if ipv4_item and ipv4_item.text().strip():
-                            try:
-                                device_ipv4 = ipaddress.IPv4Address(ipv4_item.text().strip())
-                            except ipaddress.AddressValueError:
-                                pass
-                        
-                        if mask_item and mask_item.text().strip():
-                            try:
-                                device_mask = int(mask_item.text().strip())
-                            except ValueError:
-                                pass
-                    
-                    # If we have both device IP and mask, validate subnet
-                    if device_ipv4 and device_mask is not None:
-                        try:
-                            device_network = ipaddress.IPv4Network(f"{device_ipv4}/{device_mask}", strict=False)
-                            if gateway_ip not in device_network:
-                                print(f"[VALIDATION] Gateway {gateway_ip} is not in the same subnet as device IP {device_ipv4}/{device_mask}")
-                                return False
-                        except (ipaddress.AddressValueError, ValueError):
-                            pass  # If network calculation fails, just validate IP format
-                    
-                    return True
-                except ipaddress.AddressValueError:
-                    try:
-                        # Try IPv6
-                        gateway_ip = ipaddress.IPv6Address(value)
-                        
-                        # Get the device's IPv6 address and mask for subnet validation
-                        device_ipv6 = None
-                        device_mask = None
-                        
-                        # Use the provided row if available
-                        if row is not None:
-                            ipv6_item = self.devices_table.item(row, self.COL.get("IPv6", -1))
-                            mask_item = self.devices_table.item(row, self.COL.get("IPv6 Mask", -1))
-                            
-                            if ipv6_item and ipv6_item.text().strip():
-                                try:
-                                    device_ipv6 = ipaddress.IPv6Address(ipv6_item.text().strip())
-                                except ipaddress.AddressValueError:
-                                    pass
-                            
-                            if mask_item and mask_item.text().strip():
-                                try:
-                                    device_mask = int(mask_item.text().strip())
-                                except ValueError:
-                                    pass
-                        
-                        # If we have both device IP and mask, validate subnet
-                        if device_ipv6 and device_mask is not None:
-                            try:
-                                device_network = ipaddress.IPv6Network(f"{device_ipv6}/{device_mask}", strict=False)
-                                if gateway_ip not in device_network:
-                                    print(f"[VALIDATION] Gateway {gateway_ip} is not in the same subnet as device IP {device_ipv6}/{device_mask}")
-                                    return False
-                            except (ipaddress.AddressValueError, ValueError):
-                                pass  # If network calculation fails, just validate IP format
-                        
-                        return True
-                    except ipaddress.AddressValueError:
-                        return False
-            
-            elif header_name in ["IPv4 Mask", "IPv6 Mask"]:
-                if not value:  # Empty is allowed
-                    return True
-                try:
-                    mask = int(value)
-                    if header_name == "IPv4 Mask":
-                        return 0 <= mask <= 32
-                    else:  # IPv6 Mask
-                        return 0 <= mask <= 128
-                except ValueError:
-                    return False
-            
-            elif header_name == "MAC Address":
-                if not value:  # Empty is allowed
-                    return True
-                # Basic MAC address validation (XX:XX:XX:XX:XX:XX format)
-                import re
-                mac_pattern = r'^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$'
-                return bool(re.match(mac_pattern, value))
-            
-            elif header_name == "Status":
-                # Status is read-only, shouldn't be editable
-                return False
-            
-            return True  # Default: allow any value
-            
-        except Exception as e:
-            logging.error(f"[validate_cell_value] Error validating {header_name}: {e}")
-            return False
-    
     def update_device_data_in_memory(self, device_id, header_name, new_value):
         """Update device data in the all_devices structure."""
         try:
-            # Find the device in all_devices
+            key_mapping = {
+                "Device Name": "Device Name",
+                "IPv4": "IPv4",
+                "IPv6": "IPv6",
+                "VLAN": "VLAN",
+                "Gateway": "Gateway",
+                "IPv4 Mask": "ipv4_mask",
+                "IPv6 Mask": "ipv6_mask",
+                "MAC Address": "MAC Address",
+            }
+
+            key = key_mapping.get(header_name)
+            if not key:
+                return
+
             for iface, devices in self.main_window.all_devices.items():
                 for device in devices:
                     if device.get("device_id") == device_id:
-                        # Map header names to device data keys
-                        key_mapping = {
-                            "Device Name": "Device Name",
-                            "IPv4": "IPv4",
-                            "IPv6": "IPv6",
-                            "VLAN": "VLAN",
-                            "Gateway": "Gateway",
-                            "IPv4 Mask": "ipv4_mask",
-                            "IPv6 Mask": "ipv6_mask",
-                            "MAC Address": "MAC Address"
-                        }
-                        
-                        key = key_mapping.get(header_name)
-                        if key:
-                            device[key] = new_value
-                            # Device data updated
-                        break
-                else:
-                    continue
-                break
-                
-        except Exception as e:
-            logging.error(f"[update_device_data_in_memory] Error: {e}")
-    
+                        device[key] = new_value
+                        return
+        except Exception as exc:
+            logging.error(f"[update_device_data_in_memory] Error: {exc}")
+
     def mark_device_for_apply(self, device_id):
         """Mark a device as needing to be applied to the server."""
         try:
-            # Find the device in all_devices and mark it for apply
             for iface, devices in self.main_window.all_devices.items():
                 for device in devices:
                     if device.get("device_id") == device_id:
                         device["_needs_apply"] = True
-                        device["_is_new"] = False  # It's an existing device being modified
-                        # Device marked for apply
-                        
-                        # Update the device name in the table to show it needs to be applied
+                        device["_is_new"] = False
                         self.update_device_name_indicator(device_id, device.get("Device Name", ""))
-                        break
-                else:
-                    continue
-                break
-                
-        except Exception as e:
-            logging.error(f"[mark_device_for_apply] Error: {e}")
-    
+                        return
+        except Exception as exc:
+            logging.error(f"[mark_device_for_apply] Error: {exc}")
+
     def update_device_name_indicator(self, device_id, device_name):
         """Update the device name in the table to show it needs to be applied."""
         try:
-            # Find the row with this device_id
             for row in range(self.devices_table.rowCount()):
                 name_item = self.devices_table.item(row, self.COL["Device Name"])
                 if name_item and name_item.data(Qt.UserRole) == device_id:
-                    # Add a visual indicator that the device has been modified
                     if not device_name.endswith(" *"):
                         name_item.setText(device_name + " *")
-                        name_item.setForeground(QColor(255, 140, 0))  # Orange color
-                    break
-        except Exception as e:
-            logging.error(f"[update_device_name_indicator] Error: {e}")
-    
-    def highlight_edited_cell(self, row, column):
-        """Provide visual feedback for edited cells."""
+                        name_item.setForeground(QColor(255, 140, 0))
+                    return
+        except Exception as exc:
+            logging.error(f"[update_device_name_indicator] Error: {exc}")
+
+    def poll_device_status(self):
+        """Periodic status poll invoked by status_timer."""
         try:
-            item = self.devices_table.item(row, column)
-            if item:
-                # Set a light green background to indicate the cell was edited
-                item.setBackground(QColor(200, 255, 200))
-                
-                # Use a timer to remove the highlight after 2 seconds
-                QTimer.singleShot(2000, lambda: self.remove_cell_highlight(row, column))
-                
-        except Exception as e:
-            logging.error(f"[highlight_edited_cell] Error: {e}")
-    
-    def remove_cell_highlight(self, row, column):
-        """Remove the highlight from a cell."""
-        try:
-            item = self.devices_table.item(row, column)
-            if item:
-                item.setBackground(QColor(255, 255, 255))  # White background
-        except Exception as e:
-            logging.error(f"[remove_cell_highlight] Error: {e}")
-    
-    def setup_column_tooltips(self):
-        """Set up tooltips for table columns to indicate which are editable."""
-        try:
-            # Define tooltips for each column
-            tooltips = {
-                "Device Name": "Editable: Device name (1-50 characters)",
-                "IPv4": "Editable: IPv4 address (e.g., 192.168.0.2)",
-                "IPv6": "Editable: IPv6 address (e.g., 2001:db8::1)",
-                "VLAN": "Editable: VLAN ID (0-4094, 0 = no VLAN)",
-                "Gateway": "Editable: Gateway IP address (IPv4 or IPv6)",
-                "Status": "Read-only: Device status",
-                "IPv4 Mask": "Editable: IPv4 subnet mask (0-32)",
-                "IPv6 Mask": "Editable: IPv6 subnet mask (0-128)",
-                "MAC Address": "Editable: MAC address (XX:XX:XX:XX:XX:XX format)"
-            }
-            
-            # Set tooltips for each column header
-            for i, header in enumerate(self.device_headers):
-                tooltip = tooltips.get(header, "")
-                if tooltip:
-                    self.devices_table.horizontalHeaderItem(i).setToolTip(tooltip)
-                    
-        except Exception as e:
-            logging.error(f"[setup_column_tooltips] Error: {e}")
-    
-    def clear_modification_indicators(self):
-        """Clear the modification indicators (*) from device names after they are applied."""
-        try:
+            server_url = self.get_server_url(silent=True)
+            if not server_url:
+                return
+
+            rows_to_refresh = []
+            running_count = 0
             for row in range(self.devices_table.rowCount()):
-                name_item = self.devices_table.item(row, self.COL["Device Name"])
-                if name_item:
-                    current_text = name_item.text()
-                    if current_text.endswith(" *"):
-                        # Remove the asterisk and reset color
-                        clean_name = current_text[:-2]
-                        name_item.setText(clean_name)
-                        name_item.setForeground(QColor(0, 0, 0))  # Black color
-        except Exception as e:
-            logging.error(f"[clear_modification_indicators] Error: {e}")
+                name_item = self.devices_table.item(row, self.COL.get("Device Name"))
+                if not name_item:
+                    continue
+                device_name = name_item.text()
+                device_info = self.get_device_info_by_name(device_name)
+                if not device_info:
+                    continue
+
+                status = device_info.get("Status", "")
+                if status == "Running":
+                    running_count += 1
+                    rows_to_refresh.append(row)
+                elif status == "Starting":
+                    rows_to_refresh.append(row)
+
+            # Adjust polling cadence depending on activity
+            if running_count == 0 and rows_to_refresh:
+                if self.status_timer.interval() != 60000:
+                    self.status_timer.setInterval(60000)
+            else:
+                if self.status_timer.interval() != 30000:
+                    self.status_timer.setInterval(30000)
+
+            if rows_to_refresh:
+                self._refresh_device_table_from_database(rows_to_refresh)
+        except Exception as exc:
+            logging.debug(f"[DEVICE POLL] Error: {exc}")

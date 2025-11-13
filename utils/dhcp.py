@@ -2,6 +2,7 @@
 DHCP client/server lifecycle helpers for OSTG devices.
 """
 
+import json
 import logging
 import os
 import subprocess
@@ -98,6 +99,114 @@ def _normalize_routes(route_values) -> Optional[list]:
     return routes or None
 
 
+def _normalize_gateway_tokens(route_values) -> Optional[list]:
+    """Normalize gateway route values into a list of CIDR strings."""
+    if not route_values:
+        return None
+    tokens = []
+    if isinstance(route_values, str):
+        tokens.extend([part.strip() for part in route_values.replace(";", ",").split(",")])
+    elif isinstance(route_values, (list, tuple, set)):
+        for item in route_values:
+            if isinstance(item, str):
+                tokens.extend([part.strip() for part in item.replace(";", ",").split(",")])
+            else:
+                tokens.append(str(item).strip())
+    else:
+        tokens.append(str(route_values).strip())
+    normalized = [token for token in tokens if token]
+    return normalized or None
+
+
+def _normalize_additional_pools(raw_pools) -> list:
+    """Normalize optional additional DHCP pool definitions into a list of dicts."""
+    if not raw_pools:
+        return []
+
+    pools_input = raw_pools
+    if isinstance(raw_pools, str):
+        try:
+            pools_input = json.loads(raw_pools)
+        except Exception:
+            return []
+    elif isinstance(raw_pools, dict):
+        pools_input = [raw_pools]
+    elif isinstance(raw_pools, (tuple, set)):
+        pools_input = list(raw_pools)
+
+    pools: list = []
+    for item in pools_input:
+        if not isinstance(item, dict):
+            continue
+        start = item.get("pool_start") or item.get("start")
+        end = item.get("pool_end") or item.get("end")
+        if not start or not end:
+            continue
+        normalized = {
+            "pool_start": str(start),
+            "pool_end": str(end),
+        }
+        if item.get("pool_name") or item.get("name"):
+            normalized["pool_name"] = str(item.get("pool_name") or item.get("name")).strip()
+        if item.get("gateway"):
+            normalized["gateway"] = str(item.get("gateway")).strip()
+        if item.get("lease_time"):
+            try:
+                normalized["lease_time"] = int(item.get("lease_time"))
+            except (TypeError, ValueError):
+                normalized["lease_time"] = None
+        gateway_routes = (
+            item.get("gateway_route")
+            or item.get("gateway_routes")
+        )
+        gateway_tokens = _normalize_gateway_tokens(gateway_routes)
+        if gateway_tokens:
+            normalized["gateway_route"] = gateway_tokens
+        pools.append(normalized)
+    return pools
+
+
+def _collect_pool_networks(
+    primary_start: Optional[str], primary_end: Optional[str], additional_pools: list
+):
+    """Gather IPv4Network objects for the base pool plus any additional pools."""
+    networks = []
+    base_networks = _derive_networks_from_pool(primary_start, primary_end)
+    if base_networks:
+        networks.extend(base_networks)
+    for pool in additional_pools:
+        extra = _derive_networks_from_pool(pool.get("pool_start"), pool.get("pool_end"))
+        if extra:
+            networks.extend(extra)
+    return networks
+
+
+def _collect_gateway_routes(dhcp_config: Dict, additional_pools: list) -> list:
+    """Gather normalized gateway routes from primary and additional pool config."""
+    routes = _normalize_routes(
+        dhcp_config.get("gateway_route") or dhcp_config.get("gateway_routes")
+    ) or []
+    for pool in additional_pools:
+        pool_routes = _normalize_routes(
+            pool.get("gateway_route") or pool.get("gateway_routes")
+        )
+        if pool_routes:
+            routes.extend(pool_routes)
+
+    if not routes:
+        return []
+
+    unique = []
+    seen = set()
+    for route in routes:
+        key = str(route)
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(route)
+    return unique
+
+
 def _run_command(cmd, timeout: int = 10, check: bool = False, container=None):
     """Run a subprocess command (optionally inside a container) and capture output."""
     cmd_display = cmd if isinstance(cmd, str) else " ".join(cmd)
@@ -164,6 +273,118 @@ def _parse_gateway(interface: str, container=None) -> Optional[str]:
     return None
 
 
+def _verify_interface_exists(interface: str, container=None) -> bool:
+    """Verify that the interface exists in the container/host."""
+    try:
+        result = _run_command(["ip", "link", "show", interface], timeout=5, container=container)
+        if result.returncode == 0 and interface in result.stdout:
+            logger.debug("[DHCP] Interface %s exists", interface)
+            return True
+        logger.warning("[DHCP] Interface %s not found", interface)
+        return False
+    except Exception as exc:
+        logger.warning("[DHCP] Failed to verify interface %s: %s", interface, exc)
+        return False
+
+
+def _is_dhclient_running(interface: str, container=None) -> bool:
+    """Check whether a dhclient process is running for the given interface."""
+    try:
+        # Prefer pgrep if available; fall back to ps/grep
+        cmd = f"pgrep -f 'dhclient.*{interface}' || ps -eo pid,cmd | grep 'dhclient' | grep -v grep | grep -q '{interface}'"
+        result = _run_command(["/bin/sh", "-c", cmd], timeout=5, container=container)
+        if result.returncode == 0 and result.stdout is not None:
+            return True
+        return result.returncode == 0 and (result.stdout or "").strip() == ""
+    except Exception as exc:
+        logger.debug("[DHCP] Failed to determine dhclient status for %s: %s", interface, exc)
+        return False
+
+
+def get_dhcp_client_snapshot(
+    device_db,
+    device_id: str,
+    interface: str,
+    dhcp_config: Optional[Dict] = None,
+) -> Dict:
+    """
+    Retrieve the current DHCP client status for the specified device/interface without mutating state.
+    """
+    timestamp = datetime.now(timezone.utc).isoformat()
+    snapshot = {
+        "dhcp_mode": "client",
+        "dhcp_state": "Stopped",
+        "dhcp_running": False,
+        "dhcp_lease_ip": "",
+        "dhcp_lease_mask": "",
+        "dhcp_lease_gateway": "",
+        "dhcp_lease_server": "",
+        "dhcp_lease_expires": None,
+        "dhcp_lease_subnet": "",
+        "ipv4_address": "",
+        "ipv4_mask": "",
+        "ipv4_gateway": "",
+        "last_dhcp_check": timestamp,
+    }
+
+    if not device_id or not interface:
+        return snapshot
+
+    container = _get_dhcp_container(device_id, mode="client")
+    if not container:
+        logger.debug("[DHCP] No DHCP client container found for %s", device_id)
+        return snapshot
+
+    try:
+        container.reload()
+    except Exception as exc:
+        logger.debug("[DHCP] Failed to reload container for %s: %s", device_id, exc)
+
+    if getattr(container, "status", None) != "running":
+        logger.debug("[DHCP] DHCP client container %s not running", container.name)
+        return snapshot
+
+    ip_info = _parse_ipv4(interface, container=container)
+    gateway = _parse_gateway(interface, container=container) or ""
+    dhclient_running = _is_dhclient_running(interface, container=container)
+
+    if ip_info:
+        snapshot["dhcp_state"] = "Leased"
+        snapshot["dhcp_running"] = True
+        snapshot["dhcp_lease_ip"] = ip_info.get("ip", "")
+        snapshot["dhcp_lease_mask"] = ip_info.get("mask", "")
+        snapshot["dhcp_lease_gateway"] = gateway
+        try:
+            if snapshot["dhcp_lease_ip"] and snapshot["dhcp_lease_mask"]:
+                snapshot["dhcp_lease_subnet"] = str(
+                    ipaddress.IPv4Interface(f"{snapshot['dhcp_lease_ip']}/{snapshot['dhcp_lease_mask']}").network
+                )
+        except Exception as exc:
+            logger.debug("[DHCP] Failed to derive subnet for %s: %s", interface, exc)
+        snapshot["ipv4_address"] = (
+            f"{snapshot['dhcp_lease_ip']}/{snapshot['dhcp_lease_mask']}"
+            if snapshot["dhcp_lease_ip"] and snapshot["dhcp_lease_mask"]
+            else snapshot["dhcp_lease_ip"]
+        )
+        snapshot["ipv4_mask"] = snapshot["dhcp_lease_mask"]
+        snapshot["ipv4_gateway"] = gateway
+    else:
+        snapshot["dhcp_state"] = "Requesting" if dhclient_running else "No Lease"
+        snapshot["dhcp_running"] = dhclient_running
+        snapshot["dhcp_lease_gateway"] = gateway
+
+    return snapshot
+
+
+def _flush_ipv4(interface: str, container=None) -> None:
+    """Remove all IPv4 addresses from an interface."""
+    try:
+        _run_command(["ip", "-4", "addr", "flush", "dev", interface], timeout=5, container=container)
+        logger.debug("[DHCP] Flushed IPv4 addresses on %s", interface)
+    except Exception as exc:
+        logger.debug("[DHCP] Failed to flush IPv4 addresses on %s: %s", interface, exc)
+
+
 def _update_device_db(device_db, device_id: str, payload: Dict):
     """Wrapper to guard database updates."""
     try:
@@ -199,17 +420,51 @@ def _get_dhcp_container(device_id: str, mode: Optional[str] = None):
 
 def _ensure_dhcp_container(device_id: str, mode: Optional[str] = None):
     """Ensure a dedicated DHCP container exists and is running for the device."""
-    client = docker.from_env()
+    try:
+        client = docker.from_env()
+    except Exception as docker_exc:
+        logger.error("[DHCP] Failed to connect to Docker daemon: %s", docker_exc, exc_info=True)
+        return None
+    
     name = _get_dhcp_container_name(device_id, mode=mode)
+    logger.info(f"[DHCP] Ensuring DHCP container '{name}' for device {device_id} (mode={mode})")
     try:
         container = client.containers.get(name)
         container.reload()
+        logger.info(f"[DHCP] Found existing DHCP container {name} with status: {container.status}")
         if container.status != "running":
             logger.info("[DHCP] Starting existing DHCP container %s", name)
-            container.start()
-            time.sleep(2)
+            try:
+                container.start()
+                time.sleep(2)
+                container.reload()
+                if container.status != "running":
+                    logger.error("[DHCP] Container %s failed to start, status: %s", name, container.status)
+                    # Try to get logs for debugging
+                    try:
+                        logs = container.logs(tail=50).decode('utf-8', errors='ignore')
+                        logger.error("[DHCP] Container %s logs (last 50 lines):\n%s", name, logs)
+                    except Exception:
+                        pass
+                    return None
+                logger.info(f"[DHCP] Container {name} started, new status: {container.status}")
+            except Exception as start_exc:
+                logger.error("[DHCP] Failed to start existing container %s: %s", name, start_exc, exc_info=True)
+                return None
         return container
     except NotFound:
+        # Check if Docker image exists before trying to create container
+        try:
+            logger.info("[DHCP] Checking if Docker image %s exists", DHCP_DOCKER_IMAGE)
+            client.images.get(DHCP_DOCKER_IMAGE)
+            logger.info("[DHCP] Docker image %s found", DHCP_DOCKER_IMAGE)
+        except NotFound:
+            logger.error("[DHCP] Docker image %s not found. Please build the image first.", DHCP_DOCKER_IMAGE)
+            return None
+        except Exception as img_exc:
+            logger.error("[DHCP] Failed to check Docker image %s: %s", DHCP_DOCKER_IMAGE, img_exc, exc_info=True)
+            return None
+        
         try:
             logger.info("[DHCP] Creating DHCP container %s using image %s", name, DHCP_DOCKER_IMAGE)
             container = client.containers.run(
@@ -226,12 +481,29 @@ def _ensure_dhcp_container(device_id: str, mode: Optional[str] = None):
                 detach=True,
             )
             time.sleep(2)
+            container.reload()
+            if container.status != "running":
+                logger.error("[DHCP] Container %s created but not running, status: %s", name, container.status)
+                # Try to get logs for debugging
+                try:
+                    logs = container.logs(tail=50).decode('utf-8', errors='ignore')
+                    logger.error("[DHCP] Container %s logs (last 50 lines):\n%s", name, logs)
+                except Exception:
+                    pass
+                return None
+            logger.info(f"[DHCP] Successfully created DHCP container {name} with status: {container.status}")
             return container
+        except docker.errors.ImageNotFound as img_not_found:
+            logger.error("[DHCP] Docker image %s not found: %s", DHCP_DOCKER_IMAGE, img_not_found)
+            return None
+        except docker.errors.APIError as api_err:
+            logger.error("[DHCP] Docker API error creating container %s: %s", name, api_err, exc_info=True)
+            return None
         except Exception as exc:
-            logger.error("[DHCP] Failed to create DHCP container for device %s: %s", device_id, exc)
+            logger.error("[DHCP] Failed to create DHCP container for device %s: %s", device_id, exc, exc_info=True)
             return None
     except Exception as exc:
-        logger.error("[DHCP] Error ensuring DHCP container for device %s: %s", device_id, exc)
+        logger.error("[DHCP] Error ensuring DHCP container for device %s: %s", device_id, exc, exc_info=True)
         return None
 
 
@@ -265,6 +537,22 @@ def start_dhcp_client(
 
     Returns a status dict with success flag and metadata.
     """
+    # Verify interface exists before proceeding
+    if not _verify_interface_exists(interface, container=container):
+        error_msg = f"Interface {interface} not found in container/host. Cannot start DHCP client."
+        logger.error(f"[DHCP] {error_msg}")
+        _update_device_db(
+            device_db,
+            device_id,
+            {
+                "dhcp_mode": "client",
+                "dhcp_state": "Failed",
+                "dhcp_running": False,
+                "last_dhcp_check": datetime.now(timezone.utc).isoformat(),
+            },
+        )
+        return {"success": False, "error": error_msg}
+    
     _ensure_paths(container=container)
     pidfile = os.path.join(DHCLIENT_PID_DIR, f"dhclient-{interface}.pid")
     leasefile = os.path.join(DHCLIENT_LEASE_DIR, f"dhclient-{interface}.leases")
@@ -329,12 +617,21 @@ def start_dhcp_client(
                 "dhcp_mode": "client",
                 "dhcp_state": "Timeout",
                 "dhcp_running": False,
+                "dhcp_lease_subnet": "",
                 "last_dhcp_check": datetime.now(timezone.utc).isoformat(),
             },
         )
         return {"success": False, "error": "Lease timeout"}
 
     gateway = _parse_gateway(interface, container=container) or ""
+    lease_subnet = ""
+    try:
+        ip_val = ip_info.get("ip")
+        mask_val = ip_info.get("mask")
+        if ip_val and mask_val:
+            lease_subnet = str(ipaddress.IPv4Interface(f"{ip_val}/{mask_val}").network)
+    except Exception as exc:
+        logger.debug("[DHCP] Failed to derive lease subnet for %s: %s", interface, exc)
     lease_info = {
         "dhcp_mode": "client",
         "dhcp_state": "Leased",
@@ -344,6 +641,7 @@ def start_dhcp_client(
         "dhcp_lease_gateway": gateway,
         "dhcp_lease_server": "",
         "dhcp_lease_expires": None,
+        "dhcp_lease_subnet": lease_subnet,
         "last_dhcp_check": datetime.now(timezone.utc).isoformat(),
         # Update primary addressing fields so UI sees live address
         "ipv4_address": f"{ip_info.get('ip')}/{ip_info.get('mask')}",
@@ -361,12 +659,22 @@ def stop_dhcp_client(device_db, device_id: str, interface: str, container=None) 
         _run_command(["dhclient", "-4", "-r", "-pf", pidfile, interface], timeout=5, container=container)
     except Exception as exc:
         logger.debug("[DHCP] dhclient release error: %s", exc)
+    _flush_ipv4(interface, container=container)
     _update_device_db(
         device_db,
         device_id,
         {
             "dhcp_state": "Stopped",
             "dhcp_running": False,
+            "dhcp_lease_ip": "",
+            "dhcp_lease_mask": "",
+            "dhcp_lease_gateway": "",
+            "dhcp_lease_server": "",
+            "dhcp_lease_expires": None,
+            "dhcp_lease_subnet": "",
+            "ipv4_address": "",
+            "ipv4_mask": "",
+            "ipv4_gateway": "",
             "last_dhcp_check": datetime.now(timezone.utc).isoformat(),
         },
     )
@@ -381,15 +689,24 @@ def start_dhcp_server(
     container=None,
 ) -> Dict:
     """Start a dnsmasq DHCP server bound to interface."""
+    # Verify interface exists before proceeding
+    if not _verify_interface_exists(interface, container=container):
+        error_msg = f"Interface {interface} not found in container/host. Cannot start DHCP server."
+        logger.error(f"[DHCP] {error_msg}")
+        return {"success": False, "error": error_msg}
+    
     _ensure_paths(container=container)
     pool_start = dhcp_config.get("pool_start")
     pool_end = dhcp_config.get("pool_end")
     gateway = dhcp_config.get("gateway", "")
     lease_hours = int(dhcp_config.get("lease_time", dhcp_config.get("lease_hours", 24)))
     lease_seconds = max(60, lease_hours * 3600)
+    additional_pools = _normalize_additional_pools(dhcp_config.get("additional_pools"))
+    dhcp_config["additional_pools"] = additional_pools
 
     if not pool_start or not pool_end:
-        return {"success": False, "error": "Pool start/end required for DHCP server"}
+        if not additional_pools:
+            return {"success": False, "error": "Pool start/end required for DHCP server"}
 
     pidfile = os.path.join(DNSMASQ_PID_DIR, f"dnsmasq-{interface}.pid")
     leasefile = os.path.join(DNSMASQ_LEASE_DIR, f"dnsmasq-{interface}.leases")
@@ -401,11 +718,17 @@ def start_dhcp_server(
         f"interface={interface}",
         "bind-interfaces",
         "dhcp-authoritative",
-        f"dhcp-range={pool_start},{pool_end},{lease_seconds}s",
         f"dhcp-leasefile={leasefile}",
         f"pid-file={pidfile}",
         f"log-facility={logfile}",
     ]
+    if pool_start and pool_end:
+        config_lines.append(f"dhcp-range={pool_start},{pool_end},{lease_seconds}s")
+    for pool in additional_pools:
+        extra_start = pool.get("pool_start")
+        extra_end = pool.get("pool_end")
+        if extra_start and extra_end:
+            config_lines.append(f"dhcp-range={extra_start},{extra_end},{lease_seconds}s")
     if gateway:
         config_lines.append(f"dhcp-option=3,{gateway}")  # option 3 = router
     try:
@@ -455,18 +778,63 @@ def start_dhcp_server(
         logger.error("[DHCP] dnsmasq launch error: %s", exc)
         return {"success": False, "error": str(exc)}
 
-    additional_routes = _normalize_routes(dhcp_config.get("gateway_route"))
-    base_networks = _derive_networks_from_pool(pool_start, pool_end) or []
-    if additional_routes:
-        # When explicit routes are provided, honor those and skip the
-        # synthesized pool summarization to avoid dozens of host routes.
-        route_networks = list(additional_routes)
-    else:
-        route_networks = list(base_networks)
+    pool_networks = _collect_pool_networks(pool_start, pool_end, additional_pools)
+    pool_networks_unique = []
+    pool_seen = set()
+    for net in pool_networks or []:
+        if not net:
+            continue
+        key = str(net)
+        if key in pool_seen:
+            continue
+        pool_seen.add(key)
+        pool_networks_unique.append(net)
 
-    # Add static routes toward client pool (and any additional routes) if gateway is specified
-    if gateway and route_networks:
-        for net in route_networks:
+    gateway_routes = _collect_gateway_routes(dhcp_config, additional_pools)
+    route_networks = []
+    route_seen = set()
+    for net in (pool_networks_unique + gateway_routes):
+        if not net:
+            continue
+        key = str(net)
+        if key in route_seen:
+            continue
+        route_seen.add(key)
+        route_networks.append(net)
+
+    # Add static routes for gateway_routes (always create these, even without gateway)
+    if gateway_routes:
+        # First, ensure gateway is reachable on the interface (prevents Linux from adding it to loopback)
+        if gateway and interface:
+            try:
+                # Add host route to gateway on the interface to make it directly reachable
+                gateway_host_route = ["ip", "route", "replace", f"{gateway}/32", "dev", interface]
+                _run_command(gateway_host_route, timeout=5, container=container)
+                logger.debug("[DHCP] Added host route to gateway %s on %s", gateway, interface)
+            except Exception as gateway_route_exc:
+                logger.debug("[DHCP] Could not add host route to gateway (may already exist): %s", gateway_route_exc)
+        
+        for net in gateway_routes:
+            try:
+                if gateway:
+                    route_cmd = ["ip", "route", "replace", str(net), "via", gateway]
+                else:
+                    route_cmd = ["ip", "route", "replace", str(net)]
+                if interface:
+                    route_cmd.extend(["dev", interface])
+                _run_command(route_cmd, timeout=5, container=container)
+                logger.info(
+                    "[DHCP] Added gateway route %s%s%s",
+                    str(net),
+                    f" via {gateway}" if gateway else "",
+                    f" dev {interface}" if interface else "",
+                )
+            except Exception as route_exc:
+                logger.warning("[DHCP] Failed to add gateway route %s: %s", net, route_exc)
+
+    # Add static routes toward client pool networks if gateway is specified
+    if gateway and pool_networks_unique:
+        for net in pool_networks_unique:
             try:
                 route_cmd = ["ip", "route", "replace", str(net), "via", gateway]
                 if interface:
@@ -486,10 +854,14 @@ def start_dhcp_server(
         config_for_db = dict(dhcp_config)
         if pool_start and pool_end:
             config_for_db.setdefault("pool_range", f"{pool_start}-{pool_end}")
-        if base_networks:
-            config_for_db["pool_networks"] = [str(net) for net in base_networks]
-        if additional_routes:
-            config_for_db["gateway_route_normalized"] = [str(net) for net in additional_routes]
+        if pool_networks_unique:
+            config_for_db["pool_networks"] = [str(net) for net in pool_networks_unique]
+        if gateway_routes:
+            config_for_db["gateway_route_normalized"] = [str(net) for net in gateway_routes]
+        if dhcp_config.get("pool_name"):
+            config_for_db["pool_name"] = dhcp_config.get("pool_name")
+        if dhcp_config.get("pool_names"):
+            config_for_db["pool_names"] = dhcp_config.get("pool_names")
         _update_device_db(
             device_db,
             device_id,
@@ -500,6 +872,17 @@ def start_dhcp_server(
     except Exception as exc:
         logger.debug("[DHCP] Unable to persist DHCP pool metadata for %s: %s", device_id, exc)
 
+    lease_subnet = ""
+    lease_sources = [str(net) for net in route_networks] or config_for_db.get("pool_networks", [])
+    if lease_sources:
+        seen_subnets = []
+        seen_keys = set()
+        for subnet in lease_sources:
+            if subnet in seen_keys:
+                continue
+            seen_keys.add(subnet)
+            seen_subnets.append(subnet)
+        lease_subnet = ", ".join(seen_subnets)
     _update_device_db(
         device_db,
         device_id,
@@ -512,6 +895,7 @@ def start_dhcp_server(
             "dhcp_lease_gateway": gateway,
             "dhcp_lease_server": "",
             "dhcp_lease_expires": None,
+            "dhcp_lease_subnet": lease_subnet,
             "last_dhcp_check": datetime.now(timezone.utc).isoformat(),
         },
     )
@@ -529,18 +913,51 @@ def stop_dhcp_server(device_db, device_id: str, interface: str, container=None) 
         device = device_db.get_device(device_id) if device_db else None
         if device:
             dhcp_cfg = device.get("dhcp_config") or {}
+            if isinstance(dhcp_cfg, str):
+                try:
+                    dhcp_cfg = json.loads(dhcp_cfg) if dhcp_cfg else {}
+                except Exception:
+                    dhcp_cfg = {}
             gateway = dhcp_cfg.get("gateway", "")
-            networks = _derive_networks_from_pool(dhcp_cfg.get("pool_start"), dhcp_cfg.get("pool_end")) or []
-            extra_routes = _normalize_routes(dhcp_cfg.get("gateway_route"))
-            if extra_routes:
-                existing = {str(net) for net in networks}
-                for extra in extra_routes:
-                    if str(extra) not in existing:
-                        networks.append(extra)
+            
+            # Try to get routes from stored metadata first (before pools were cleared)
+            stored_pool_networks = dhcp_cfg.get("pool_networks") or []
+            stored_gateway_routes = dhcp_cfg.get("gateway_route_normalized") or []
+            
+            # If stored metadata exists, use it
+            if stored_pool_networks or stored_gateway_routes:
+                networks = []
+                for net_str in stored_pool_networks:
+                    try:
+                        from ipaddress import IPv4Network
+                        networks.append(IPv4Network(net_str))
+                    except Exception:
+                        pass
+                for net_str in stored_gateway_routes:
+                    try:
+                        from ipaddress import IPv4Network
+                        net = IPv4Network(net_str)
+                        if net not in networks:
+                            networks.append(net)
+                    except Exception:
+                        pass
+            else:
+                # Fallback to deriving from current config
+                additional_pools = _normalize_additional_pools(dhcp_cfg.get("additional_pools"))
+                networks = _collect_pool_networks(
+                    dhcp_cfg.get("pool_start"), dhcp_cfg.get("pool_end"), additional_pools
+                ) or []
+                extra_routes = _collect_gateway_routes(dhcp_cfg, additional_pools)
+                if extra_routes:
+                    existing = {str(net) for net in networks}
+                    for extra in extra_routes:
+                        if str(extra) not in existing:
+                            networks.append(extra)
     except Exception as exc:
         logger.debug("[DHCP] Failed to derive routes for cleanup: %s", exc)
     try:
         if container:
+            # Try to kill dnsmasq by PID file first
             pid_read = _run_command(
                 ["/bin/sh", "-c", f"if [ -f {pidfile} ]; then cat {pidfile}; fi"],
                 container=container,
@@ -548,6 +965,12 @@ def stop_dhcp_server(device_db, device_id: str, interface: str, container=None) 
             ).stdout.strip()
             if pid_read:
                 _run_command(["kill", pid_read], timeout=5, container=container)
+            # Also try to kill any dnsmasq process on this interface
+            _run_command(
+                ["/bin/sh", "-c", f"pkill -f 'dnsmasq.*{interface}' || true"],
+                container=container,
+                timeout=5,
+            )
         else:
             if os.path.exists(pidfile):
                 with open(pidfile, "r") as fh:
@@ -558,16 +981,32 @@ def stop_dhcp_server(device_db, device_id: str, interface: str, container=None) 
         logger.debug("[DHCP] Failed to stop dnsmasq: %s", exc)
     try:
         if container:
+            # Remove config file
             _run_command(["rm", "-f", conffile], container=container, timeout=5)
+            # Also remove from dnsmasq.d directory if it exists there
+            _run_command(
+                ["/bin/sh", "-c", f"rm -f /etc/dnsmasq.d/ostg-{interface}.conf || true"],
+                container=container,
+                timeout=5,
+            )
         else:
             if os.path.exists(conffile):
                 os.remove(conffile)
     except Exception as exc:
         logger.debug("[DHCP] Failed to remove dnsmasq config: %s", exc)
 
-    if gateway and networks and container:
+    # Remove routes from container (regardless of gateway, since gateway_routes may not have gateway)
+    if networks and container:
         for net in networks:
             try:
+                # Try to remove route with gateway first (if gateway exists)
+                if gateway:
+                    _run_command(
+                        ["ip", "route", "del", str(net), "via", gateway],
+                        timeout=5,
+                        container=container,
+                    )
+                # Also try without gateway (for routes created without gateway)
                 _run_command(
                     ["ip", "route", "del", str(net)],
                     timeout=5,
@@ -575,7 +1014,24 @@ def stop_dhcp_server(device_db, device_id: str, interface: str, container=None) 
                 )
                 logger.info("[DHCP] Removed static route %s from DHCP container", net)
             except Exception as route_exc:
-                logger.debug("[DHCP] Failed to remove static route %s: %s", net, route_exc)
+                # Try alternative route deletion (route might have been created with dev interface)
+                try:
+                    interface_from_cfg = dhcp_cfg.get("interface") if device else None
+                    if interface_from_cfg:
+                        if gateway:
+                            _run_command(
+                                ["ip", "route", "del", str(net), "via", gateway, "dev", interface_from_cfg],
+                                timeout=5,
+                                container=container,
+                            )
+                        _run_command(
+                            ["ip", "route", "del", str(net), "dev", interface_from_cfg],
+                            timeout=5,
+                            container=container,
+                        )
+                        logger.info("[DHCP] Removed static route %s (with dev) from DHCP container", net)
+                except Exception:
+                    logger.debug("[DHCP] Failed to remove static route %s: %s", net, route_exc)
 
     _update_device_db(
         device_db,
@@ -583,6 +1039,7 @@ def stop_dhcp_server(device_db, device_id: str, interface: str, container=None) 
         {
             "dhcp_state": "Stopped",
             "dhcp_running": False,
+            "dhcp_lease_subnet": "",
             "last_dhcp_check": datetime.now(timezone.utc).isoformat(),
         },
     )
@@ -623,16 +1080,35 @@ def ensure_dhcp_services(
     container=None,
     force_client_restart: bool = False,
 ) -> Dict:
-    """Ensure DHCP services (client/server) are running as requested."""
+    """Ensure DHCP services (client/server) are running as requested.
+    
+    Note: For DHCP server mode, this always creates a separate DHCP container,
+    even if a container is passed. This allows DHCP server devices to have both:
+    - FRR container for routing protocols (BGP, OSPF, ISIS)
+    - Separate DHCP container for DHCP server functionality
+    """
     if not dhcp_config:
         return {"success": False, "error": "No DHCP configuration provided"}
     mode = (dhcp_config.get("mode") or "").lower()
+    
+    # For server mode, always create a separate DHCP container (don't use passed container)
+    # This allows DHCP server devices to have both FRR and DHCP containers
+    # For client mode, use passed container if available, otherwise create one
     managed_container = container
-    if managed_container is None:
-        managed_container = _ensure_dhcp_container(device_id, mode=mode)
-    if managed_container is None:
-        return {"success": False, "error": "Failed to start DHCP container"}
+    
+    # Server mode: always create separate DHCP container (ignore passed container)
     if mode == "server":
+        logger.info(f"[DHCP] Server mode detected for device {device_id}, creating separate DHCP container")
+        managed_container = _ensure_dhcp_container(device_id, mode=mode)
+        if managed_container is None:
+            error_msg = (
+                f"Failed to create/start DHCP container for server mode device {device_id}. "
+                f"Please check: 1) Docker daemon is running, 2) Docker image '{DHCP_DOCKER_IMAGE}' exists, "
+                f"3) Check server logs for detailed error messages."
+            )
+            logger.error(f"[DHCP] {error_msg}")
+            return {"success": False, "error": error_msg}
+        logger.info(f"[DHCP] Successfully created/retrieved DHCP container {managed_container.name} for server mode device {device_id}")
         return start_dhcp_server(
             device_db,
             device_id,
@@ -640,11 +1116,40 @@ def ensure_dhcp_services(
             dhcp_config,
             container=managed_container,
         )
-    if mode == "client":
-        if not force_client_restart:
-            ip_info = _parse_ipv4(interface, container=managed_container)
-            if ip_info and ip_info.get("ip"):
+    
+    # Client mode: use passed container if available, otherwise create one
+    if mode != "client":
+        return {"success": False, "error": f"Unsupported DHCP mode '{mode}'"}
+    
+    # At this point, mode must be "client" (we validated above)
+    if managed_container is None:
+        managed_container = _ensure_dhcp_container(device_id, mode=mode)
+    if managed_container is None:
+        error_msg = (
+            f"Failed to create/start DHCP container for client mode device {device_id}. "
+            f"Please check: 1) Docker daemon is running, 2) Docker image '{DHCP_DOCKER_IMAGE}' exists, "
+            f"3) Check server logs for detailed error messages."
+        )
+        logger.error(f"[DHCP] {error_msg}")
+        return {"success": False, "error": error_msg}
+    
+    # Client mode logic
+    if not force_client_restart:
+        ip_info = _parse_ipv4(interface, container=managed_container)
+        if ip_info and ip_info.get("ip"):
+            existing_device = device_db.get_device(device_id) if device_db else None
+            existing_state = (existing_device or {}).get("dhcp_state")
+            existing_ip = ((existing_device or {}).get("dhcp_lease_ip") or "").strip()
+            if existing_state == "Leased" and existing_ip == ip_info.get("ip"):
                 gateway = _parse_gateway(interface, container=managed_container) or ""
+                lease_subnet = ""
+                try:
+                    ip_val = ip_info.get("ip")
+                    mask_val = ip_info.get("mask")
+                    if ip_val and mask_val:
+                        lease_subnet = str(ipaddress.IPv4Interface(f"{ip_val}/{mask_val}").network)
+                except Exception as exc:
+                    logger.debug("[DHCP] Failed to derive lease subnet for %s: %s", interface, exc)
                 lease_payload = {
                     "dhcp_mode": "client",
                     "dhcp_state": "Leased",
@@ -654,6 +1159,7 @@ def ensure_dhcp_services(
                     "dhcp_lease_gateway": gateway,
                     "dhcp_lease_server": "",
                     "dhcp_lease_expires": None,
+                    "dhcp_lease_subnet": lease_subnet,
                     "last_dhcp_check": datetime.now(timezone.utc).isoformat(),
                     "ipv4_address": f"{ip_info.get('ip')}/{ip_info.get('mask')}" if ip_info.get("ip") and ip_info.get("mask") else ip_info.get("ip", ""),
                     "ipv4_mask": ip_info.get("mask", ""),
@@ -661,13 +1167,21 @@ def ensure_dhcp_services(
                 }
                 _update_device_db(device_db, device_id, lease_payload)
                 return {"success": True, "ip": ip_info.get("ip"), "mask": ip_info.get("mask"), "gateway": gateway}
+            logger.info(
+                "[DHCP] Stale IPv4 address %s detected on %s for device %s; restarting dhclient",
+                ip_info.get("ip"),
+                interface,
+                device_id,
+            )
+            _flush_ipv4(interface, container=managed_container)
+    else:
+        _flush_ipv4(interface, container=managed_container)
 
-        return start_dhcp_client(
-            device_db,
-            device_id,
-            interface,
-            dhcp_config,
-            container=managed_container,
-        )
-    return {"success": False, "error": f"Unsupported DHCP mode '{mode}'"}
+    return start_dhcp_client(
+        device_db,
+        device_id,
+        interface,
+        dhcp_config,
+        container=managed_container,
+    )
 

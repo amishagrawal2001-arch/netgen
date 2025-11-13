@@ -11,6 +11,7 @@ import shutil
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any, Tuple
 from pathlib import Path
+import ipaddress
 
 # Configure logging
 logger = logging.getLogger(__name__)
@@ -30,6 +31,104 @@ class DeviceDatabase:
         self.ensure_db_directory()
         self.init_database()
         logger.info(f"[DEVICE DB] Initialized database at {self.db_path}")
+    
+    @staticmethod
+    def _prepare_dhcp_config(raw_config: Any) -> Dict[str, Any]:
+        """Parse and enrich DHCP config with derived pool metadata."""
+        if not raw_config:
+            return {}
+        config: Dict[str, Any] = {}
+        try:
+            if isinstance(raw_config, str):
+                config = json.loads(raw_config) if raw_config else {}
+                if isinstance(config, str):
+                    config = json.loads(config)
+            elif isinstance(raw_config, dict):
+                config = dict(raw_config)
+            else:
+                config = {}
+        except (json.JSONDecodeError, TypeError):
+            config = {}
+        pool_start = config.get("pool_start")
+        pool_end = config.get("pool_end")
+        if pool_start and pool_end:
+            if "pool_range" not in config:
+                config["pool_range"] = f"{pool_start}-{pool_end}"
+            if "pool_networks" not in config:
+                try:
+                    start_ip = ipaddress.IPv4Address(pool_start)
+                    end_ip = ipaddress.IPv4Address(pool_end)
+                    config["pool_networks"] = [
+                        str(net) for net in ipaddress.summarize_address_range(start_ip, end_ip)
+                    ]
+                except Exception:
+                    # Ignore derivation errors; leave networks unset
+                    pass
+        return config
+    
+    @staticmethod
+    def _normalize_gateway_routes_input(routes: Any) -> List[str]:
+        """Normalize user-provided gateway routes into a list of CIDR strings."""
+        if not routes:
+            return []
+        tokens: List[str] = []
+        if isinstance(routes, str):
+            try:
+                parsed = json.loads(routes)
+                if isinstance(parsed, (list, tuple, set)):
+                    tokens.extend(parsed)
+                elif isinstance(parsed, str):
+                    tokens.append(parsed)
+                else:
+                    tokens.append(routes)
+            except Exception:
+                tokens.extend([part.strip() for part in routes.replace(";", ",").split(",")])
+        elif isinstance(routes, (list, tuple, set)):
+            for item in routes:
+                if isinstance(item, str):
+                    tokens.extend([part.strip() for part in item.replace(";", ",").split(",")])
+                else:
+                    tokens.append(str(item).strip())
+        else:
+            tokens.append(str(routes).strip())
+
+        normalized = []
+        for token in tokens:
+            value = token.strip()
+            if not value:
+                continue
+            normalized.append(value)
+        return normalized
+
+    @staticmethod
+    def _serialize_gateway_routes(routes: Any) -> Optional[str]:
+        """Serialize gateway routes to JSON for storage."""
+        normalized = DeviceDatabase._normalize_gateway_routes_input(routes)
+        if not normalized:
+            return None
+        try:
+            return json.dumps(normalized)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _deserialize_gateway_routes(routes_field: Any) -> List[str]:
+        """Deserialize stored gateway routes JSON/text into list."""
+        if not routes_field:
+            return []
+        if isinstance(routes_field, (list, tuple, set)):
+            return [str(item).strip() for item in routes_field if str(item).strip()]
+        if isinstance(routes_field, str):
+            try:
+                parsed = json.loads(routes_field)
+                if isinstance(parsed, (list, tuple, set)):
+                    return [str(item).strip() for item in parsed if str(item).strip()]
+                if isinstance(parsed, str):
+                    return [parsed.strip()]
+            except Exception:
+                pass
+            return [part.strip() for part in routes_field.replace(";", ",").split(",") if part.strip()]
+        return [str(routes_field).strip()]
     
     def ensure_db_directory(self):
         """Ensure database directory exists with proper permissions."""
@@ -68,6 +167,16 @@ class DeviceDatabase:
                     bgp_config TEXT,  -- JSON object
                     ospf_config TEXT,  -- JSON object
                     isis_config TEXT,  -- JSON object
+                    dhcp_mode TEXT,
+                    dhcp_config TEXT,
+                    dhcp_state TEXT DEFAULT 'Unknown',
+                    dhcp_running BOOLEAN DEFAULT FALSE,
+                    dhcp_lease_ip TEXT,
+                    dhcp_lease_mask TEXT,
+                    dhcp_lease_gateway TEXT,
+                    dhcp_lease_server TEXT,
+                    dhcp_lease_expires TIMESTAMP,
+                    last_dhcp_check TIMESTAMP,
                     status TEXT DEFAULT 'Stopped',
                     created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -157,6 +266,36 @@ class DeviceDatabase:
                 )
             """)
             
+            # Create DHCP pool definitions table
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS dhcp_pools (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    pool_name TEXT UNIQUE NOT NULL,
+                    pool_start TEXT NOT NULL,
+                    pool_end TEXT NOT NULL,
+                    gateway TEXT,
+                    lease_time INTEGER,
+                    gateway_routes TEXT,
+                    description TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # Create device DHCP pool attachments table
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS device_dhcp_pools (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    device_id TEXT NOT NULL,
+                    pool_name TEXT NOT NULL,
+                    is_primary INTEGER NOT NULL DEFAULT 0,
+                    attached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (device_id) REFERENCES devices(device_id) ON DELETE CASCADE,
+                    FOREIGN KEY (pool_name) REFERENCES dhcp_pools(pool_name) ON DELETE CASCADE,
+                    UNIQUE(device_id, pool_name)
+                )
+            """)
+            
             # Create indexes for better performance
             conn.execute("CREATE INDEX IF NOT EXISTS idx_devices_status ON devices(status)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_devices_interface ON devices(interface)")
@@ -169,6 +308,10 @@ class DeviceDatabase:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_device_route_pools_device ON device_route_pools(device_id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_device_route_pools_pool ON device_route_pools(pool_name)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_device_route_pools_neighbor ON device_route_pools(neighbor_ip)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_dhcp_pools_name ON dhcp_pools(pool_name)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_device_dhcp_pools_device ON device_dhcp_pools(device_id)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_device_dhcp_pools_pool ON device_dhcp_pools(pool_name)")
+            conn.execute("CREATE INDEX IF NOT EXISTS idx_device_dhcp_pools_primary ON device_dhcp_pools(device_id, is_primary)")
             
             conn.commit()
             logger.info("[DEVICE DB] Database tables and indexes created successfully")
@@ -351,6 +494,29 @@ class DeviceDatabase:
                 conn.commit()
                 logger.info("[DEVICE DB] Successfully added increment_type column to route_pools table")
             
+            # Ensure dhcp_pools table has required columns
+            cursor = conn.execute("PRAGMA table_info(dhcp_pools)")
+            dhcp_pool_columns = [column[1] for column in cursor.fetchall()]
+            if 'gateway' not in dhcp_pool_columns:
+                logger.info("[DEVICE DB] Adding gateway column to dhcp_pools table")
+                conn.execute("ALTER TABLE dhcp_pools ADD COLUMN gateway TEXT")
+            if 'lease_time' not in dhcp_pool_columns:
+                logger.info("[DEVICE DB] Adding lease_time column to dhcp_pools table")
+                conn.execute("ALTER TABLE dhcp_pools ADD COLUMN lease_time INTEGER")
+            if 'gateway_routes' not in dhcp_pool_columns:
+                logger.info("[DEVICE DB] Adding gateway_routes column to dhcp_pools table")
+                conn.execute("ALTER TABLE dhcp_pools ADD COLUMN gateway_routes TEXT")
+            if 'description' not in dhcp_pool_columns:
+                logger.info("[DEVICE DB] Adding description column to dhcp_pools table")
+                conn.execute("ALTER TABLE dhcp_pools ADD COLUMN description TEXT")
+            if 'created_at' not in dhcp_pool_columns:
+                logger.info("[DEVICE DB] Adding created_at column to dhcp_pools table")
+                conn.execute("ALTER TABLE dhcp_pools ADD COLUMN created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+            if 'updated_at' not in dhcp_pool_columns:
+                logger.info("[DEVICE DB] Adding updated_at column to dhcp_pools table")
+                conn.execute("ALTER TABLE dhcp_pools ADD COLUMN updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP")
+            conn.commit()
+            
             # Check if loopback_ipv4 and loopback_ipv6 columns exist in devices table
             # Refresh columns list after potential migrations
             cursor = conn.execute("PRAGMA table_info(devices)")
@@ -367,6 +533,29 @@ class DeviceDatabase:
                 conn.execute("ALTER TABLE devices ADD COLUMN loopback_ipv6 TEXT")
                 conn.commit()
                 logger.info("[DEVICE DB] Successfully added loopback_ipv6 column to devices table")
+            
+            # DHCP columns
+            if 'dhcp_mode' not in columns:
+                logger.info("[DEVICE DB] Adding DHCP columns to devices table")
+                conn.execute("ALTER TABLE devices ADD COLUMN dhcp_mode TEXT")
+                conn.execute("ALTER TABLE devices ADD COLUMN dhcp_config TEXT")
+                conn.execute("ALTER TABLE devices ADD COLUMN dhcp_state TEXT DEFAULT 'Unknown'")
+                conn.execute("ALTER TABLE devices ADD COLUMN dhcp_running BOOLEAN DEFAULT FALSE")
+                conn.execute("ALTER TABLE devices ADD COLUMN dhcp_lease_ip TEXT")
+                conn.execute("ALTER TABLE devices ADD COLUMN dhcp_lease_mask TEXT")
+                conn.execute("ALTER TABLE devices ADD COLUMN dhcp_lease_gateway TEXT")
+                conn.execute("ALTER TABLE devices ADD COLUMN dhcp_lease_server TEXT")
+                conn.execute("ALTER TABLE devices ADD COLUMN dhcp_lease_expires TIMESTAMP")
+                conn.execute("ALTER TABLE devices ADD COLUMN dhcp_lease_subnet TEXT")
+                conn.execute("ALTER TABLE devices ADD COLUMN last_dhcp_check TIMESTAMP")
+                conn.commit()
+                logger.info("[DEVICE DB] Successfully added DHCP columns to devices table")
+            else:
+                if 'dhcp_lease_subnet' not in columns:
+                    logger.info("[DEVICE DB] Adding dhcp_lease_subnet column to devices table")
+                    conn.execute("ALTER TABLE devices ADD COLUMN dhcp_lease_subnet TEXT")
+                    conn.commit()
+                    logger.info("[DEVICE DB] Successfully added dhcp_lease_subnet column to devices table")
             
         except Exception as e:
             logger.error(f"[DEVICE DB] Migration failed: {e}")
@@ -396,6 +585,19 @@ class DeviceDatabase:
                     return self.update_device(device_id, device_data)
                 
                 # Prepare device data
+                dhcp_config_raw = device_data.get("dhcp_config", {})
+                dhcp_config_obj = self._prepare_dhcp_config(dhcp_config_raw)
+                dhcp_mode = device_data.get("dhcp_mode") or dhcp_config_obj.get("mode", "")
+                dhcp_state = device_data.get("dhcp_state", "Unknown")
+                dhcp_running = device_data.get("dhcp_running", False)
+                dhcp_lease_ip = device_data.get("dhcp_lease_ip", "")
+                dhcp_lease_mask = device_data.get("dhcp_lease_mask", "")
+                dhcp_lease_gateway = device_data.get("dhcp_lease_gateway", "")
+                dhcp_lease_server = device_data.get("dhcp_lease_server", "")
+                dhcp_lease_expires = device_data.get("dhcp_lease_expires")
+                last_dhcp_check = device_data.get("last_dhcp_check")
+                dhcp_lease_subnet = device_data.get("dhcp_lease_subnet", "")
+
                 device_info = {
                     'device_id': device_id,
                     'device_name': device_data.get("device_name", f"device_{device_id}"),
@@ -415,20 +617,29 @@ class DeviceDatabase:
                     'bgp_config': json.dumps(device_data.get("bgp_config", {})),
                     'ospf_config': json.dumps(device_data.get("ospf_config", {})),
                     'isis_config': json.dumps(device_data.get("isis_config", {})),
+                    'dhcp_mode': dhcp_mode,
+                    'dhcp_config': json.dumps(dhcp_config_obj),
+                    'dhcp_state': dhcp_state,
+                    'dhcp_running': int(bool(dhcp_running)),
+                    'dhcp_lease_ip': dhcp_lease_ip,
+                    'dhcp_lease_mask': dhcp_lease_mask,
+                    'dhcp_lease_gateway': dhcp_lease_gateway,
+                    'dhcp_lease_server': dhcp_lease_server,
+                    'dhcp_lease_expires': dhcp_lease_expires,
+                    'dhcp_lease_subnet': dhcp_lease_subnet,
+                    'last_dhcp_check': last_dhcp_check,
                     'status': device_data.get("status", "Stopped"),
                     'created_at': datetime.now(timezone.utc).isoformat(),
                     'updated_at': datetime.now(timezone.utc).isoformat()
                 }
                 
                 # Insert device
-                conn.execute("""
-                    INSERT INTO devices (
-                        device_id, device_name, interface, server_interface, vlan, ipv4_address, ipv4_mask,
-                        ipv6_address, ipv6_mask, ipv4_gateway, ipv6_gateway, mac_address,
-                        loopback_ipv4, loopback_ipv6, protocols, bgp_config, ospf_config, isis_config,
-                        status, created_at, updated_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """, tuple(device_info.values()))
+                columns_sql = ", ".join(device_info.keys())
+                placeholders_sql = ", ".join(["?"] * len(device_info))
+                conn.execute(
+                    f"INSERT INTO devices ({columns_sql}) VALUES ({placeholders_sql})",
+                    tuple(device_info.values()),
+                )
                 
                 conn.commit()
                 logger.info(f"[DEVICE DB] Successfully added device {device_id}")
@@ -484,6 +695,17 @@ class DeviceDatabase:
                     'bgp_config': 'bgp_config',
                     'ospf_config': 'ospf_config',
                     'isis_config': 'isis_config',
+                    'dhcp_mode': 'dhcp_mode',
+                    'dhcp_config': 'dhcp_config',
+                    'dhcp_state': 'dhcp_state',
+                    'dhcp_running': 'dhcp_running',
+                    'dhcp_lease_ip': 'dhcp_lease_ip',
+                    'dhcp_lease_mask': 'dhcp_lease_mask',
+                    'dhcp_lease_gateway': 'dhcp_lease_gateway',
+                    'dhcp_lease_server': 'dhcp_lease_server',
+                    'dhcp_lease_expires': 'dhcp_lease_expires',
+                    'dhcp_lease_subnet': 'dhcp_lease_subnet',
+                    'last_dhcp_check': 'last_dhcp_check',
                     'status': 'status',
                     'bgp_established': 'bgp_established',
                     'bgp_ipv4_established': 'bgp_ipv4_established',
@@ -521,9 +743,16 @@ class DeviceDatabase:
                 
                 for key, db_field in field_mapping.items():
                     if key in device_data:
-                        if key in ['protocols', 'bgp_config', 'ospf_config', 'isis_config']:
+                        if key == 'dhcp_config':
+                            prepared = self._prepare_dhcp_config(device_data[key])
+                            update_fields.append(f"{db_field} = ?")
+                            update_values.append(json.dumps(prepared))
+                        elif key in ['protocols', 'bgp_config', 'ospf_config', 'isis_config']:
                             update_fields.append(f"{db_field} = ?")
                             update_values.append(json.dumps(device_data[key]))
+                        elif key == 'dhcp_running':
+                            update_fields.append(f"{db_field} = ?")
+                            update_values.append(int(bool(device_data[key])))
                         else:
                             update_fields.append(f"{db_field} = ?")
                             update_values.append(device_data[key])
@@ -585,6 +814,8 @@ class DeviceDatabase:
                         device['isis_config'] = isis_config
                     except (json.JSONDecodeError, TypeError):
                         device['isis_config'] = {}
+                    device['dhcp_config'] = self._prepare_dhcp_config(device.get('dhcp_config'))
+                    device['dhcp_running'] = bool(device.get('dhcp_running'))
                     return device
                 else:
                     return None
@@ -629,6 +860,8 @@ class DeviceDatabase:
                         device['isis_config'] = isis_config
                     except (json.JSONDecodeError, TypeError):
                         device['isis_config'] = {}
+                    device['dhcp_config'] = self._prepare_dhcp_config(device.get('dhcp_config'))
+                    device['dhcp_running'] = bool(device.get('dhcp_running'))
                     devices.append(device)
                 
                 return devices
@@ -685,6 +918,8 @@ class DeviceDatabase:
                         device['isis_config'] = isis_config
                     except (json.JSONDecodeError, TypeError):
                         device['isis_config'] = {}
+                    device['dhcp_config'] = self._prepare_dhcp_config(device.get('dhcp_config'))
+                    device['dhcp_running'] = bool(device.get('dhcp_running'))
                     devices.append(device)
                 
                 return devices
@@ -1443,6 +1678,248 @@ class DeviceDatabase:
                 
         except Exception as e:
             logger.error(f"[DEVICE DB] Failed to save route pools batch: {e}")
+            return False
+    
+    # DHCP Pool Management Methods
+    
+    def add_dhcp_pool(self, pool_data: Dict[str, Any]) -> bool:
+        """Add a new DHCP pool definition."""
+        try:
+            pool_name = (pool_data.get("name") or pool_data.get("pool_name") or "").strip()
+            if not pool_name:
+                logger.error("[DEVICE DB] Cannot add DHCP pool without a name")
+                return False
+
+            pool_start = (pool_data.get("pool_start") or pool_data.get("start") or "").strip()
+            pool_end = (pool_data.get("pool_end") or pool_data.get("end") or "").strip()
+            if not pool_start or not pool_end:
+                logger.error("[DEVICE DB] Cannot add DHCP pool without pool_start and pool_end")
+                return False
+
+            gateway = (pool_data.get("gateway") or "").strip() or None
+            lease_time = pool_data.get("lease_time")
+            try:
+                lease_time = int(lease_time) if lease_time not in (None, "", False) else None
+            except (TypeError, ValueError):
+                lease_time = None
+            gateway_routes = self._serialize_gateway_routes(
+                pool_data.get("gateway_routes") or pool_data.get("gateway_route")
+            )
+            description = pool_data.get("description") or ""
+
+            timestamp = datetime.now(timezone.utc).isoformat()
+
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.execute("SELECT id FROM dhcp_pools WHERE pool_name = ?", (pool_name,))
+                if cursor.fetchone():
+                    logger.info(f"[DEVICE DB] DHCP pool '{pool_name}' exists, updating instead of adding")
+                    return self.update_dhcp_pool(pool_name, pool_data)
+
+                conn.execute(
+                    """
+                    INSERT INTO dhcp_pools (
+                        pool_name, pool_start, pool_end, gateway, lease_time,
+                        gateway_routes, description, created_at, updated_at
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        pool_name,
+                        pool_start,
+                        pool_end,
+                        gateway,
+                        lease_time,
+                        gateway_routes,
+                        description,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+                conn.commit()
+                logger.info(f"[DEVICE DB] Added DHCP pool '{pool_name}'")
+                return True
+        except Exception as e:
+            logger.error(f"[DEVICE DB] Failed to add DHCP pool '{pool_data}': {e}")
+            return False
+
+    def update_dhcp_pool(self, pool_name: str, pool_data: Dict[str, Any]) -> bool:
+        """Update an existing DHCP pool definition."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.execute("SELECT id FROM dhcp_pools WHERE pool_name = ?", (pool_name,))
+                if not cursor.fetchone():
+                    logger.warning(f"[DEVICE DB] DHCP pool '{pool_name}' not found for update, creating new")
+                    return self.add_dhcp_pool(pool_data)
+
+                update_fields = []
+                update_values = []
+
+                field_mapping = {
+                    "pool_start": "pool_start",
+                    "pool_end": "pool_end",
+                    "gateway": "gateway",
+                    "lease_time": "lease_time",
+                    "description": "description",
+                }
+
+                for key, column in field_mapping.items():
+                    if key in pool_data and pool_data[key] is not None:
+                        value = pool_data[key]
+                        if key == "lease_time":
+                            try:
+                                value = int(value)
+                            except (TypeError, ValueError):
+                                value = None
+                        if isinstance(value, str):
+                            value = value.strip()
+                        update_fields.append(f"{column} = ?")
+                        update_values.append(value)
+
+                if "gateway_routes" in pool_data or "gateway_route" in pool_data:
+                    serialized_routes = self._serialize_gateway_routes(
+                        pool_data.get("gateway_routes") or pool_data.get("gateway_route")
+                    )
+                    update_fields.append("gateway_routes = ?")
+                    update_values.append(serialized_routes)
+
+                if not update_fields:
+                    logger.warning(f"[DEVICE DB] No fields provided to update for DHCP pool '{pool_name}'")
+                    return True
+
+                update_fields.append("updated_at = ?")
+                update_values.append(datetime.now(timezone.utc).isoformat())
+                update_values.append(pool_name)
+
+                query = f"UPDATE dhcp_pools SET {', '.join(update_fields)} WHERE pool_name = ?"
+                conn.execute(query, update_values)
+                conn.commit()
+                logger.info(f"[DEVICE DB] Updated DHCP pool '{pool_name}'")
+                return True
+        except Exception as e:
+            logger.error(f"[DEVICE DB] Failed to update DHCP pool '{pool_name}': {e}")
+            return False
+
+    def get_dhcp_pool(self, pool_name: str) -> Optional[Dict[str, Any]]:
+        """Get a DHCP pool by name."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.execute("SELECT * FROM dhcp_pools WHERE pool_name = ?", (pool_name,))
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                pool = dict(row)
+                pool["gateway_routes"] = self._deserialize_gateway_routes(pool.get("gateway_routes"))
+                return pool
+        except Exception as e:
+            logger.error(f"[DEVICE DB] Failed to get DHCP pool '{pool_name}': {e}")
+            return None
+
+    def get_all_dhcp_pools(self) -> List[Dict[str, Any]]:
+        """Get all DHCP pools."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.execute("SELECT * FROM dhcp_pools ORDER BY created_at DESC")
+                pools = []
+                for row in cursor.fetchall():
+                    pool = dict(row)
+                    pool["gateway_routes"] = self._deserialize_gateway_routes(pool.get("gateway_routes"))
+                    pools.append(pool)
+                return pools
+        except Exception as e:
+            logger.error(f"[DEVICE DB] Failed to get DHCP pools: {e}")
+            return []
+
+    def remove_dhcp_pool(self, pool_name: str) -> bool:
+        """Remove a DHCP pool definition."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.execute("SELECT id FROM dhcp_pools WHERE pool_name = ?", (pool_name,))
+                if not cursor.fetchone():
+                    logger.warning(f"[DEVICE DB] DHCP pool '{pool_name}' not found for removal")
+                    return False
+                conn.execute("DELETE FROM dhcp_pools WHERE pool_name = ?", (pool_name,))
+                conn.commit()
+                logger.info(f"[DEVICE DB] Removed DHCP pool '{pool_name}'")
+                return True
+        except Exception as e:
+            logger.error(f"[DEVICE DB] Failed to remove DHCP pool '{pool_name}': {e}")
+            return False
+
+    def attach_dhcp_pools_to_device(
+        self,
+        device_id: str,
+        primary_pool: Optional[str],
+        additional_pools: Optional[List[str]] = None,
+    ) -> bool:
+        """Associate DHCP pools with a device."""
+        additional_pools = additional_pools or []
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("DELETE FROM device_dhcp_pools WHERE device_id = ?", (device_id,))
+
+                entries = []
+                timestamp = datetime.now(timezone.utc).isoformat()
+                if primary_pool:
+                    entries.append((device_id, primary_pool, 1, timestamp))
+                for pool_name in additional_pools:
+                    if pool_name == primary_pool:
+                        continue
+                    entries.append((device_id, pool_name, 0, timestamp))
+
+                if entries:
+                    conn.executemany(
+                        """
+                        INSERT OR IGNORE INTO device_dhcp_pools (device_id, pool_name, is_primary, attached_at)
+                        VALUES (?, ?, ?, ?)
+                        """,
+                        entries,
+                    )
+                conn.commit()
+                logger.info(
+                    f"[DEVICE DB] Attached DHCP pools to device {device_id}: primary={primary_pool}, additional={additional_pools}"
+                )
+                return True
+        except Exception as e:
+            logger.error(f"[DEVICE DB] Failed to attach DHCP pools to device {device_id}: {e}")
+            return False
+
+    def get_device_dhcp_pools(self, device_id: str) -> Dict[str, Any]:
+        """Retrieve DHCP pools associated with a device."""
+        result: Dict[str, Any] = {"primary": None, "additional": []}
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                cursor = conn.execute(
+                    """
+                    SELECT pool_name, is_primary
+                    FROM device_dhcp_pools
+                    WHERE device_id = ?
+                    ORDER BY is_primary DESC, attached_at ASC
+                    """,
+                    (device_id,),
+                )
+                for row in cursor.fetchall():
+                    pool_name = row["pool_name"]
+                    if row["is_primary"]:
+                        result["primary"] = pool_name
+                    else:
+                        result.setdefault("additional", []).append(pool_name)
+        except Exception as e:
+            logger.error(f"[DEVICE DB] Failed to get DHCP pools for device {device_id}: {e}")
+        return result
+
+    def remove_device_dhcp_pools(self, device_id: str) -> bool:
+        """Detach all DHCP pools from a device."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.execute("DELETE FROM device_dhcp_pools WHERE device_id = ?", (device_id,))
+                conn.commit()
+                logger.info(f"[DEVICE DB] Detached all DHCP pools from device {device_id}")
+                return True
+        except Exception as e:
+            logger.error(f"[DEVICE DB] Failed to detach DHCP pools for device {device_id}: {e}")
             return False
     
     # Device-Pool Relationship Management Methods
