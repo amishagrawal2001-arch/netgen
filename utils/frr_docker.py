@@ -35,9 +35,20 @@ class FRRDockerManager:
             sanitized = sanitized[:50]
         return sanitized
     
-    def _get_container_name(self, device_id: str, device_name: str = None) -> str:
-        """Get container name from device_id."""
-        return f"{self.container_prefix}-{device_id}"
+    def _get_container_name(self, device_id: str, device_name: str = None, dhcp_mode: Optional[str] = None) -> str:
+        """Get container name from device_id. DHCP clients use a dedicated prefix."""
+        inferred_mode = (dhcp_mode or "").lower()
+        if not inferred_mode and device_id:
+            try:
+                from utils.device_database import DeviceDatabase
+                device_db = DeviceDatabase()
+                record = device_db.get_device(device_id)
+                if record:
+                    inferred_mode = (record.get("dhcp_mode") or "").lower()
+            except Exception:
+                inferred_mode = ""
+        prefix = "dhcp-frr" if inferred_mode == "client" else self.container_prefix
+        return f"{prefix}-{device_id}"
     
     def _get_router_id(self, device_id: str, device_config: Dict = None, ipv4: str = None) -> str:
         """
@@ -51,6 +62,10 @@ class FRRDockerManager:
         Returns:
             Router ID (IPv4 address)
         """
+        dhcp_mode = ""
+        if device_config:
+            dhcp_mode = (device_config.get('dhcp_mode') or '').lower()
+        
         # First, try to get loopback IPv4 from device_config
         if device_config:
             loopback_ipv4 = device_config.get('loopback_ipv4')
@@ -65,6 +80,8 @@ class FRRDockerManager:
             device_db = DeviceDatabase()
             device_data = device_db.get_device(device_id)
             if device_data:
+                if not dhcp_mode:
+                    dhcp_mode = (device_data.get('dhcp_mode') or '').lower()
                 loopback_ipv4 = device_data.get('loopback_ipv4')
                 if loopback_ipv4 and loopback_ipv4.strip():
                     router_id = loopback_ipv4.strip().split('/')[0]
@@ -73,6 +90,10 @@ class FRRDockerManager:
         except Exception as e:
             logger.debug(f"[FRR] Could not retrieve loopback IPv4 from database: {e}")
         
+        if dhcp_mode == "client":
+            logger.info(f"[FRR] DHCP client device {device_id}: deferring router-id configuration until lease acquired")
+            return ""
+        
         # Fallback to interface IPv4
         if ipv4:
             router_id = ipv4.split('/')[0]
@@ -80,8 +101,30 @@ class FRRDockerManager:
             return router_id
         
         # Last resort: default
-        logger.warning(f"[FRR] No IPv4 available, using default router-id")
-        return "192.168.0.2"
+        logger.warning(f"[FRR] No IPv4 available, using derived default router-id")
+        return self._derive_router_id_from_device_id(device_id)
+
+    def _derive_router_id_from_device_id(self, device_id: Optional[str]) -> str:
+        """
+        Generate a deterministic router-id from the device UUID so DHCP clients
+        have unique, but stable, identifiers until a lease arrives.
+        """
+        if not device_id:
+            return "1.1.1.1"
+        cleaned = ''.join(ch for ch in device_id if ch.isalnum())
+        if len(cleaned) < 8:
+            cleaned = cleaned.ljust(8, '0')
+        try:
+            raw = bytes.fromhex(cleaned[:8])
+        except ValueError:
+            return "1.1.1.1"
+        octets = list(raw[:4])
+        # Ensure we have 4 octets
+        while len(octets) < 4:
+            octets.append(1)
+        # Avoid 0.0.0.0 router-ids
+        octets = [octet or 1 for octet in octets]
+        return ".".join(str(octet) for octet in octets)
     
     def setup_network_infrastructure(self):
         """Set up Docker network infrastructure for FRR containers."""
@@ -151,7 +194,8 @@ class FRRDockerManager:
         """Start FRR container with isolated bridge networking"""
         try:
             device_name = device_config.get('device_name', f'device_{device_id}')
-            container_name = self._get_container_name(device_id, device_name)
+            dhcp_mode = (device_config.get('dhcp_mode') or '').lower()
+            container_name = self._get_container_name(device_id, device_name, dhcp_mode=dhcp_mode)
             
             # Check if container already exists
             try:
@@ -185,6 +229,8 @@ class FRRDockerManager:
                 logger.error(f"[FRR] Interface name is required when VLAN is not specified for device {device_id}")
                 return None
             
+            dhcp_mode = (device_config.get('dhcp_mode') or '').lower()
+
             # Get IPv4 and IPv6 addresses from device_config
             ipv4 = device_config.get('ipv4', '')
             ipv6 = device_config.get('ipv6', '')
@@ -196,8 +242,12 @@ class FRRDockerManager:
                 ipv4_addr = ipv4
                 ipv4_mask = '24'
             else:
-                ipv4_addr = '192.168.0.2'
-                ipv4_mask = '24'
+                if dhcp_mode == "client":
+                    ipv4_addr = ''
+                    ipv4_mask = ''
+                else:
+                    ipv4_addr = '192.168.0.2'
+                    ipv4_mask = '24'
             
             # Extract IPv6 address and mask
             ipv6_addr = ''
@@ -237,7 +287,7 @@ class FRRDockerManager:
                 loopback_ipv6 = loopback_ipv6.split('/')[0]
             
             # Calculate network from IPv4
-            network = ipv4_addr.rsplit('.', 1)[0] + '.0' if ipv4_addr else '192.168.0.0'
+            network = ipv4_addr.rsplit('.', 1)[0] + '.0' if ipv4_addr else ''
             
             # Environment variables for FRR template
             env_vars = {
@@ -245,14 +295,17 @@ class FRRDockerManager:
                 'LOCAL_ASN': str(device_config.get('bgp_asn', 65000)),
                 'ROUTER_ID': router_id,  # Use loopback IPv4 if available, otherwise interface IPv4
                 'DEVICE_NAME': device_config.get('device_name', f'device_{device_id}'),
-                'NETWORK': network,
-                'NETMASK': ipv4_mask,
+                'NETWORK': network if dhcp_mode != "client" else '',
+                'NETMASK': (ipv4_mask or '') if dhcp_mode != "client" else '',
                 'INTERFACE': iface_name,  # Use determined interface name (vlan20, etc.)
-                'IP_ADDRESS': ipv4_addr,
-                'IP_MASK': ipv4_mask,
+                'IP_ADDRESS': (ipv4_addr or '') if dhcp_mode != "client" else '',
+                'IP_MASK': (ipv4_mask or '') if dhcp_mode != "client" else '',
                 'LOOPBACK_IPV4': loopback_ipv4,
             }
             
+            # Add DHCP mode for conditional startup logic
+            env_vars['DHCP_MODE'] = dhcp_mode
+
             # Add IPv6 environment variables if IPv6 is configured
             if ipv6_addr:
                 env_vars['IPV6_ADDRESS'] = ipv6_addr
@@ -269,6 +322,9 @@ class FRRDockerManager:
             env_vars['VXLAN_CONFIG_LINE'] = ''
             
             # Start container with host networking
+            device_config['router_id'] = router_id
+            device_config['dhcp_mode'] = dhcp_mode
+
             container = self.client.containers.run(
                 self.image_name,
                 name=container_name,
@@ -334,6 +390,7 @@ class FRRDockerManager:
                 return False
             
             # Get IP addresses
+            dhcp_mode = (device_config.get('dhcp_mode') or '').lower() if device_config else ''
             ipv4 = device_config.get('ipv4', '') if device_config else ''
             ipv6 = device_config.get('ipv6', '') if device_config else ''
             
@@ -344,8 +401,12 @@ class FRRDockerManager:
                 ipv4_addr = ipv4
                 ipv4_mask = '24'
             else:
-                ipv4_addr = '192.168.0.2'
-                ipv4_mask = '24'
+                if dhcp_mode == "client":
+                    ipv4_addr = ''
+                    ipv4_mask = ''
+                else:
+                    ipv4_addr = '192.168.0.2'
+                    ipv4_mask = '24'
             
             # Extract IPv6 address and mask
             ipv6_addr = ''
@@ -376,20 +437,29 @@ class FRRDockerManager:
                     logger.debug(f"[FRR] Could not retrieve loopback IPs from database: {e}")
             
             # Clean loopback IPs
+            router_id = ''
+            if device_config:
+                router_id = (device_config.get('router_id') or '').split('/')[0]
+
             if loopback_ipv4:
                 loopback_ipv4 = loopback_ipv4.split('/')[0]
+            elif ipv4_addr:
+                loopback_ipv4 = ipv4_addr
+            elif router_id:
+                loopback_ipv4 = router_id
             else:
-                loopback_ipv4 = ipv4_addr  # Use interface IPv4 as fallback
+                loopback_ipv4 = '1.1.1.1'
             
             if loopback_ipv6:
                 loopback_ipv6 = loopback_ipv6.split('/')[0]
             
             # Build vtysh commands for interface configuration
-            vtysh_commands = [
-                "configure terminal",
-                f"interface {iface_name}",
-                f" ip address {ipv4_addr}/{ipv4_mask}",
-            ]
+            vtysh_commands = ["configure terminal", f"interface {iface_name}"]
+
+            if ipv4_addr:
+                vtysh_commands.append(f" ip address {ipv4_addr}/{ipv4_mask}")
+            else:
+                vtysh_commands.append(" no ip address")
             
             if ipv6_addr:
                 vtysh_commands.append(f" ipv6 address {ipv6_addr}/{ipv6_mask}")
@@ -463,6 +533,8 @@ class FRRDockerManager:
                 except Exception as e:
                     logger.debug(f"[FRR] Could not retrieve loopback IPv4 from database: {e}")
             
+            dhcp_mode = (device_config.get('dhcp_mode') or '').lower() if device_config else ''
+            
             # Router ID must be loopback IPv4
             if loopback_ipv4:
                 router_id = loopback_ipv4
@@ -473,6 +545,9 @@ class FRRDockerManager:
                 if ipv4:
                     router_id = ipv4.split('/')[0] if '/' in ipv4 else ipv4
                     logger.warning(f"[FRR] Loopback IPv4 not found, using interface IPv4 {router_id} as global router-id (fallback)")
+                elif dhcp_mode == "client":
+                    logger.info(f"[FRR] DHCP client device {device_id}: no router-id configured until lease provides an address")
+                    return True
                 else:
                     router_id = "192.168.0.2"
                     logger.warning(f"[FRR] No IPv4 available, using default router-id {router_id}")
@@ -513,6 +588,61 @@ class FRRDockerManager:
             # Stop container without removing it so configuration/state is preserved
             try:
                 container = self.client.containers.get(container_name)
+                
+                # Before stopping, remove loopback IP addresses if device info is available
+                if remove:
+                    try:
+                        from utils.device_database import DeviceDatabase
+                        device_db = DeviceDatabase()
+                        device_data = device_db.get_device(device_id) if device_id else None
+                        
+                        if device_data:
+                            loopback_ipv4 = device_data.get('loopback_ipv4', '')
+                            loopback_ipv6 = device_data.get('loopback_ipv6', '')
+                            
+                            if loopback_ipv4 or loopback_ipv6:
+                                logger.info(f"[FRR] Removing loopback IPs from container {container_name} before removal")
+                                
+                                # Build vtysh commands to remove loopback IPs
+                                vtysh_commands = [
+                                    "configure terminal",
+                                    "interface lo",
+                                ]
+                                
+                                # Remove IPv4 loopback if configured
+                                if loopback_ipv4:
+                                    loopback_ipv4_clean = loopback_ipv4.split('/')[0] if '/' in loopback_ipv4 else loopback_ipv4
+                                    vtysh_commands.append(f" no ip address {loopback_ipv4_clean}/32")
+                                    logger.info(f"[FRR] Removing loopback IPv4 {loopback_ipv4_clean}/32 from container {container_name}")
+                                
+                                # Remove IPv6 loopback if configured
+                                if loopback_ipv6:
+                                    loopback_ipv6_clean = loopback_ipv6.split('/')[0] if '/' in loopback_ipv6 else loopback_ipv6
+                                    vtysh_commands.append(f" no ipv6 address {loopback_ipv6_clean}/128")
+                                    logger.info(f"[FRR] Removing loopback IPv6 {loopback_ipv6_clean}/128 from container {container_name}")
+                                
+                                vtysh_commands.extend([
+                                    "exit",
+                                    "exit",
+                                ])
+                                
+                                # Execute commands using here-doc to maintain context
+                                config_commands = "\n".join(vtysh_commands)
+                                exec_cmd = f"vtysh << 'EOF'\n{config_commands}\nEOF"
+                                
+                                try:
+                                    loopback_result = container.exec_run(["bash", "-c", exec_cmd], timeout=10)
+                                    if loopback_result.exit_code == 0:
+                                        logger.info(f"[FRR] Successfully removed loopback IPs from container {container_name}")
+                                    else:
+                                        output_str = loopback_result.output.decode('utf-8') if isinstance(loopback_result.output, bytes) else str(loopback_result.output)
+                                        logger.warning(f"[FRR] Failed to remove loopback IPs from container {container_name}: {output_str}")
+                                except Exception as loopback_error:
+                                    logger.warning(f"[FRR] Error removing loopback IPs from container {container_name}: {loopback_error}")
+                    except Exception as cleanup_error:
+                        logger.warning(f"[FRR] Could not remove loopback IPs before container removal: {cleanup_error}")
+                        # Continue with container removal even if loopback cleanup fails
+                
                 logger.info(f"[FRR] Stopping container {container_name}")
                 container.stop(timeout=10)
                 if remove:
@@ -599,15 +729,9 @@ def configure_bgp_neighbor(device_id: str, neighbor_config: Dict, device_name: s
                 router_id = "192.168.0.2"
                 logger.warning(f"[FRR] No IPv4 available, using default router-id {router_id}")
         
-        if not is_ipv6 and router_id:
-            commands.append(f"bgp router-id {router_id}")
-            logger.info(f"[FRR] Setting BGP router-id to {router_id}")
-        
-        # Add essential BGP configuration
-        commands.extend([
-            "bgp log-neighbor-changes",
-            "bgp graceful-restart"
-        ])
+        # Router-id and global knobs are managed by configure_bgp_for_device.
+        # Avoid re-applying them here because FRR treats repeated graceful-restart
+        # statements as config changes that return an error code.
         
         # Configure neighbor
         commands.extend([
