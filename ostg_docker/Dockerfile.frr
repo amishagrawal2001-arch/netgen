@@ -20,10 +20,13 @@ RUN apk add --no-cache \
     nano \
     less \
     procps \
-    htop
+    htop \
+    dhclient \
+    dnsmasq
 
 # Create directories and set permissions
-RUN mkdir -p /var/run/frr /etc/frr /var/log/frr && \
+RUN mkdir -p /var/run/frr /etc/frr /var/log/frr \
+    /var/lib/dhcp /var/lib/misc /etc/dnsmasq.d /var/log/dnsmasq && \
     chown -R frr:frr /var/run/frr /etc/frr /var/log/frr
 
 # Copy FRR configuration template

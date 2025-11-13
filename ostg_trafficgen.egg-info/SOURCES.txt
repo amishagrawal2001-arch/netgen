@@ -105,8 +105,11 @@ utils/bgp_monitor.py
 utils/device_database.py
 utils/device_manager.py
 utils/devices_tab_bgp.py
+utils/devices_tab_dhcp.py
 utils/devices_tab_isis.py
 utils/devices_tab_ospf.py
+utils/dhcp.py
+utils/dhcp_monitor.py
 utils/dpdk_tx_worker.py
 utils/frr_docker.py
 utils/frr_docker_old.py

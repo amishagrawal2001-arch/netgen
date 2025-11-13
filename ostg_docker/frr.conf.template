@@ -8,6 +8,7 @@
 frr version 8.5
 frr defaults traditional
 hostname {{DEVICE_NAME}}
+{{GLOBAL_ROUTER_ID_LINE}}
 
 #----------------------------------------------
 # Daemon Enablement
@@ -47,16 +48,19 @@ hostname {{DEVICE_NAME}}
 #----------------------------------------------
 interface {{INTERFACE}}
  description Uplink-interface
- ip address {{IP_ADDRESS}}/{{IP_MASK}}
+{{INTERFACE_IPV4_LINE}}
 {{IPV6_ADDRESS_LINE}}
  no shutdown
+ ip ospf area 0.0.0.0
 !
  ip ospf hello-interval 10
  ip ospf dead-interval 40
  ip ospf priority 1
+ no ip ospf passive
  ipv6 ospf6 hello-interval 10
  ipv6 ospf6 dead-interval 40
  ipv6 ospf6 priority 1
+ ipv6 ospf6 area 0.0.0.0
 !
  ip router isis FRR-CORE
  ipv6 router isis FRR-CORE
@@ -69,8 +73,8 @@ exit
 # Loopback Interface
 #----------------------------------------------
 interface lo
- ip address {{LOOPBACK_IPV4}}/32
- ipv6 address {{LOOPBACK_IPV6}}/128
+{{LOOPBACK_IPV4_LINE}}
+{{LOOPBACK_IPV6_LINE}}
  ip ospf passive
  ipv6 ospf6 passive
  ip router isis FRR-CORE
@@ -85,16 +89,16 @@ exit
 # BGP Configuration (with EVPN)
 #----------------------------------------------
 router bgp {{LOCAL_ASN}}
- bgp router-id {{ROUTER_ID}}
+{{BGP_ROUTER_ID_LINE}}
  bgp log-neighbor-changes
  bgp graceful-restart
  bgp graceful-restart restart-time 120
  bgp graceful-restart stalepath-time 360
  timers bgp 30 90
-
+ 
  ! Advertise local networks
- network {{NETWORK}}/{{NETMASK}}
- network {{LOOPBACK_IPV4}}/32
+{{BGP_NETWORK_LINE}}
+{{BGP_LOOPBACK_NETWORK_LINE}}
 
 {{BGP_NEIGHBOR_CONFIG_LINES}}
 exit
@@ -103,16 +107,16 @@ exit
 # OSPFv2 Configuration
 #----------------------------------------------
 router ospf
- ospf router-id {{ROUTER_ID}}
+{{OSPF_ROUTER_ID_LINE}}
  passive-interface lo
- network {{NETWORK}}/{{NETMASK}} area 0
+{{OSPF_NETWORK_LINE}}
 exit
 
 #----------------------------------------------
 # OSPFv3 Configuration
 #----------------------------------------------
 router ospf6
- ospf6 router-id {{ROUTER_ID}}
+{{OSPF6_ROUTER_ID_LINE}}
  interface {{INTERFACE}} area 0.0.0.0
  interface lo area 0.0.0.0
 exit
@@ -133,10 +137,10 @@ exit
 # MPLS / LDP Configuration
 #----------------------------------------------
 mpls ldp
- router-id {{ROUTER_ID}}
+{{MPLS_ROUTER_ID_LINE}}
  address-family ipv4
-  discovery transport-address {{ROUTER_ID}}
-  interface {{INTERFACE}}
+{{MPLS_TRANSPORT_LINE}}
+interface {{INTERFACE}}
 exit
 
 #----------------------------------------------

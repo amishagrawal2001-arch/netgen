@@ -520,14 +520,14 @@
     }
   ],
   "removed_interfaces": [
-    "TG 0 - ens14f2",
-    "TG 0 - ens14f1"
+    "TG 0 - ens14f1",
+    "TG 0 - ens14f2"
   ],
   "removed_servers": [
-    "http://svl-hp-ai-srv02:5051",
     "http://127.0.0.1:5050",
-    "http://svl-hp-ai-srv01:5050",
-    "http://127.0.0.1:5051"
+    "http://svl-hp-ai-srv02:5051",
+    "http://127.0.0.1:5051",
+    "http://svl-hp-ai-srv01:5050"
   ],
   "selected_servers": [
     "http://svl-hp-ai-srv04:5051"
@@ -536,7 +536,7 @@
   "devices": {
     "device1": {
       "Device Name": "device1",
-      "device_id": "3b7b44c1-3586-4e12-b5d4-4d07c1f48765",
+      "device_id": "70d26840-00a5-4c9a-a029-905e2cd8e398",
       "Interface": "TG 0 - ens4np0",
       "MAC Address": "00:11:22:33:44:55",
       "IPv4": "192.168.0.2",
@@ -561,14 +561,12 @@
         "area_id_ipv6": "0.0.0.0",
         "dead_interval": "40",
         "graceful_restart": false,
-        "graceful_restart_ipv4": true,
-        "graceful_restart_ipv6": true,
         "hello_interval": "10",
         "interface": "vlan20",
         "ipv4_enabled": true,
         "ipv6_enabled": true,
-        "p2p_ipv4": true,
-        "p2p_ipv6": true,
+        "p2p_ipv4": false,
+        "p2p_ipv6": false,
         "router_id": "192.168.0.2"
       },
       "bgp_config": {
@@ -583,9 +581,11 @@
         "bgp_update_source_ipv4": "192.168.0.2",
         "protocol": "dual-stack",
         "bgp_neighbor_ipv6": "2001:db8::1",
-        "bgp_update_source_ipv6": "2001:db8::2"
+        "bgp_update_source_ipv6": "2001:db8::2",
+        "route_pools": {
+          "192.168.0.1": []
+        }
       },
-      "Protocols": "BGP",
       "is_is_config": {
         "area_id": "49.0001.0000.0000.0001.00",
         "system_id": "0000.0000.0001",
@@ -608,16 +608,20 @@
         "ipv4_enabled": true,
         "ipv6_enabled": true
       },
+      "Protocols": "OSPF, BGP, IS-IS",
       "_is_new": false,
+      "dhcp_mode": "",
+      "dhcp_config": {},
       "_selected_address_families": [
         "IPv6",
         "IPv4"
       ],
+      "_needs_apply": true,
       "_ospf_just_edited": true
     },
     "device2": {
       "Device Name": "device2",
-      "device_id": "c05944da-35de-4a26-adf6-d0c82454ca0d",
+      "device_id": "81f68aea-a9ce-4f8a-9b8c-cd32d22e92f1",
       "Interface": "TG 0 - ens4np0",
       "MAC Address": "00:12:22:33:44:55",
       "IPv4": "192.169.0.2",
@@ -630,7 +634,7 @@
       "IPv6 Gateway": "2001:db9::1",
       "Loopback IPv4": "193.255.0.1",
       "Loopback IPv6": "2002:ff00::1",
-      "Status": "Stopped",
+      "Status": "Running",
       "protocols": [
         "OSPF",
         "BGP",
@@ -642,14 +646,12 @@
         "area_id_ipv6": "0.0.0.0",
         "dead_interval": "40",
         "graceful_restart": false,
-        "graceful_restart_ipv4": true,
-        "graceful_restart_ipv6": true,
         "hello_interval": "10",
         "interface": "vlan21",
         "ipv4_enabled": true,
         "ipv6_enabled": true,
-        "p2p_ipv4": true,
-        "p2p_ipv6": true,
+        "p2p_ipv4": false,
+        "p2p_ipv6": false,
         "router_id": "192.169.0.2"
       },
       "bgp_config": {
@@ -664,9 +666,11 @@
         "bgp_update_source_ipv4": "192.169.0.2",
         "protocol": "dual-stack",
         "bgp_neighbor_ipv6": "2001:db9::1",
-        "bgp_update_source_ipv6": "2001:db9::2"
+        "bgp_update_source_ipv6": "2001:db9::2",
+        "route_pools": {
+          "2001:db9::1": []
+        }
       },
-      "Protocols": "BGP",
       "is_is_config": {
         "area_id": "49.0001.0000.0000.0001.00",
         "system_id": "0000.0000.0001",
@@ -689,49 +693,72 @@
         "ipv4_enabled": true,
         "ipv6_enabled": true
       },
+      "Protocols": "OSPF, BGP, IS-IS",
       "_is_new": false,
+      "dhcp_mode": "",
+      "dhcp_config": {},
       "_selected_address_families": [
         "IPv6",
         "IPv4"
       ],
+      "_needs_apply": true,
       "_ospf_just_edited": true
     },
-    "device3": {
-      "Device Name": "device3",
-      "device_id": "1177e4ff-72fa-4d11-9f7a-4f50cc780c02",
+    "dhcp-server": {
+      "Device Name": "dhcp-server",
+      "device_id": "f034422c-d9d0-4ee2-8995-b03030d8bc0d",
       "Interface": "TG 0 - ens4np0",
-      "MAC Address": "00:13:22:33:44:55",
-      "IPv4": "192.170.0.2",
-      "IPv6": "2001:dba::2",
+      "MAC Address": "00:11:22:33:44:55",
+      "IPv4": "192.168.40.2",
+      "IPv6": "2001:40::2",
       "ipv4_mask": "24",
       "ipv6_mask": "64",
-      "VLAN": "22",
-      "Gateway": "192.170.0.1",
-      "IPv4 Gateway": "192.170.0.1",
-      "IPv6 Gateway": "2001:dba::1",
-      "Loopback IPv4": "194.255.0.1",
-      "Loopback IPv6": "2003:ff00::1",
+      "VLAN": "40",
+      "Gateway": "192.168.40.1",
+      "IPv4 Gateway": "192.168.40.1",
+      "IPv6 Gateway": "2001:40::1",
+      "Loopback IPv4": "192.255.40.1",
+      "Loopback IPv6": "2001:ff00::1",
       "Status": "Running",
       "protocols": [
         "OSPF",
+        "IS-IS",
         "BGP",
-        "IS-IS"
+        "DHCP"
       ],
       "ospf_config": {
         "area_id": "0.0.0.0",
         "area_id_ipv4": "0.0.0.0",
         "area_id_ipv6": "0.0.0.0",
+        "router_id": "",
+        "hello_interval": "10",
         "dead_interval": "40",
         "graceful_restart": false,
-        "graceful_restart_ipv4": true,
-        "graceful_restart_ipv6": true,
-        "hello_interval": "10",
-        "interface": "vlan22",
+        "interface": "vlan40",
         "ipv4_enabled": true,
-        "ipv6_enabled": true,
-        "p2p_ipv4": true,
-        "p2p_ipv6": true,
-        "router_id": "192.170.0.2"
+        "ipv6_enabled": false
+      },
+      "is_is_config": {
+        "area_id": "49.0001.0000.0000.0001.00",
+        "system_id": "0000.0000.0001",
+        "level": "Level-2",
+        "hello_interval": "10",
+        "hello_multiplier": "3",
+        "metric": "10",
+        "interface": "vlan40",
+        "ipv4_enabled": true,
+        "ipv6_enabled": false
+      },
+      "isis_config": {
+        "area_id": "49.0001.0000.0000.0001.00",
+        "system_id": "0000.0000.0001",
+        "level": "Level-2",
+        "hello_interval": "10",
+        "hello_multiplier": "3",
+        "metric": "10",
+        "interface": "vlan40",
+        "ipv4_enabled": true,
+        "ipv6_enabled": false
       },
       "bgp_config": {
         "bgp_asn": "65000",
@@ -741,40 +768,37 @@
         "bgp_hold_time": "90",
         "ipv4_enabled": true,
         "ipv6_enabled": true,
-        "bgp_neighbor_ipv4": "192.170.0.1",
-        "bgp_update_source_ipv4": "192.170.0.2",
+        "bgp_neighbor_ipv4": "192.168.40.1",
+        "bgp_update_source_ipv4": "192.168.40.2",
         "protocol": "dual-stack",
-        "bgp_neighbor_ipv6": "2001:dba::1",
-        "bgp_update_source_ipv6": "2001:dba::2"
+        "bgp_neighbor_ipv6": "2001:40::1",
+        "bgp_update_source_ipv6": "2001:40::2"
       },
-      "Protocols": "BGP",
-      "is_is_config": {
-        "area_id": "49.0001.0000.0000.0001.00",
-        "system_id": "0000.0000.0001",
-        "level": "Level-2",
-        "hello_interval": "10",
-        "hello_multiplier": "3",
-        "metric": "10",
-        "interface": "vlan22",
-        "ipv4_enabled": true,
-        "ipv6_enabled": true
+      "dhcp_config": {
+        "mode": "server",
+        "interface": "vlan40",
+        "pool_start": "192.168.30.10",
+        "pool_end": "192.168.30.200",
+        "pool_range": "192.168.30.10-192.168.30.200",
+        "gateway": "192.168.40.1",
+        "gateway_route": [
+          "192.168.30.0/24"
+        ],
+        "lease_time": 3600
       },
-      "isis_config": {
-        "area_id": "49.0001.0000.0000.0001.00",
-        "system_id": "0000.0000.0001",
-        "level": "Level-2",
-        "hello_interval": "10",
-        "hello_multiplier": "3",
-        "metric": "10",
-        "interface": "vlan22",
-        "ipv4_enabled": true,
-        "ipv6_enabled": true
-      },
+      "dhcp_mode": "server",
+      "dhcp_state": "Pending",
+      "dhcp_running": false,
+      "dhcp_lease_ip": "",
+      "dhcp_lease_mask": "",
+      "dhcp_lease_gateway": "",
+      "dhcp_lease_server": "",
+      "dhcp_lease_expires": "",
+      "dhcp_lease_subnet": "",
+      "last_dhcp_check": "",
+      "Protocols": "OSPF, IS-IS, BGP, DHCP",
       "_is_new": false,
-      "_selected_address_families": [
-        "IPv6",
-        "IPv4"
-      ],
+      "_needs_apply": false,
       "_ospf_just_edited": true
     }
   },
@@ -784,86 +808,16 @@
       {
         "Device": "device1",
         "BGP Status": "",
-        "Neighbor Type": "IPv4",
-        "Neighbor IP": "192.168.0.1",
-        "Source IP": "192.168.0.2",
-        "BGP Local AS": "65000",
-        "BGP Remote AS": "65001",
-        "State": "Established",
-        "Routes": "0",
+        "Neighbor Type": "",
+        "Neighbor IP": "",
+        "Source IP": "",
+        "BGP Local AS": "",
+        "BGP Remote AS": "",
+        "State": "",
+        "Routes": "",
         "Route Pools": "",
-        "Keepalive": "30",
-        "Hold-time": "90"
-      },
-      {
-        "Device": "device1",
-        "BGP Status": "",
-        "Neighbor Type": "IPv6",
-        "Neighbor IP": "2001:db8::1",
-        "Source IP": "2001:db8::2",
-        "BGP Local AS": "65000",
-        "BGP Remote AS": "65001",
-        "State": "Established",
-        "Routes": "0",
-        "Route Pools": "",
-        "Keepalive": "30",
-        "Hold-time": "90"
-      },
-      {
-        "Device": "device2",
-        "BGP Status": "",
-        "Neighbor Type": "IPv4",
-        "Neighbor IP": "192.169.0.1",
-        "Source IP": "192.169.0.2",
-        "BGP Local AS": "65000",
-        "BGP Remote AS": "65001",
-        "State": "Device Not Started",
-        "Routes": "0",
-        "Route Pools": "",
-        "Keepalive": "30",
-        "Hold-time": "90"
-      },
-      {
-        "Device": "device2",
-        "BGP Status": "",
-        "Neighbor Type": "IPv6",
-        "Neighbor IP": "2001:db9::1",
-        "Source IP": "2001:db9::2",
-        "BGP Local AS": "65000",
-        "BGP Remote AS": "65001",
-        "State": "Device Not Started",
-        "Routes": "0",
-        "Route Pools": "",
-        "Keepalive": "30",
-        "Hold-time": "90"
-      },
-      {
-        "Device": "device3",
-        "BGP Status": "",
-        "Neighbor Type": "IPv4",
-        "Neighbor IP": "192.170.0.1",
-        "Source IP": "192.170.0.2",
-        "BGP Local AS": "65000",
-        "BGP Remote AS": "65001",
-        "State": "Idle",
-        "Routes": "0",
-        "Route Pools": "",
-        "Keepalive": "30",
-        "Hold-time": "90"
-      },
-      {
-        "Device": "device3",
-        "BGP Status": "",
-        "Neighbor Type": "IPv6",
-        "Neighbor IP": "2001:dba::1",
-        "Source IP": "2001:dba::2",
-        "BGP Local AS": "65000",
-        "BGP Remote AS": "65001",
-        "State": "Idle",
-        "Routes": "0",
-        "Route Pools": "",
-        "Keepalive": "30",
-        "Hold-time": "90"
+        "Keepalive": "",
+        "Hold-time": ""
       }
     ],
     "ospf": [
@@ -874,10 +828,10 @@
         "Neighbor Type": "IPv4",
         "Interface": "vlan20",
         "Neighbor ID": "10.255.0.89",
-        "State": "Full/-",
+        "State": "Full/DR",
         "Priority": "128",
-        "Dead Timer": "36.864s",
-        "Uptime": "7m07s",
+        "Dead Timer": "38.919s",
+        "Uptime": "8h21m28s",
         "Graceful Restart": "",
         "P2P": "",
         "Route Pools": ""
@@ -889,10 +843,10 @@
         "Neighbor Type": "IPv6",
         "Interface": "vlan20",
         "Neighbor ID": "10.255.0.89",
-        "State": "Full/PointToPoint",
+        "State": "Full/DR",
         "Priority": "128",
-        "Dead Timer": "00:00:38",
-        "Uptime": "00:07:17",
+        "Dead Timer": "00:00:31",
+        "Uptime": "08:21:27",
         "Graceful Restart": "",
         "P2P": "",
         "Route Pools": ""
@@ -903,11 +857,11 @@
         "Area ID": "0.0.0.0",
         "Neighbor Type": "IPv4",
         "Interface": "vlan21",
-        "Neighbor ID": "N/A",
-        "State": "No Neighbors",
-        "Priority": "N/A",
-        "Dead Timer": "N/A",
-        "Uptime": "00:46:35",
+        "Neighbor ID": "10.255.0.89",
+        "State": "Full/DR",
+        "Priority": "128",
+        "Dead Timer": "38.188s",
+        "Uptime": "8h22m08s",
         "Graceful Restart": "",
         "P2P": "",
         "Route Pools": ""
@@ -918,41 +872,26 @@
         "Area ID": "0.0.0.0",
         "Neighbor Type": "IPv6",
         "Interface": "vlan21",
-        "Neighbor ID": "N/A",
-        "State": "No Neighbors",
-        "Priority": "N/A",
-        "Dead Timer": "N/A",
-        "Uptime": "00:46:33",
+        "Neighbor ID": "10.255.0.89",
+        "State": "Full/DR",
+        "Priority": "128",
+        "Dead Timer": "00:00:34",
+        "Uptime": "08:22:08",
         "Graceful Restart": "",
         "P2P": "",
         "Route Pools": ""
       },
       {
-        "Device": "device3",
+        "Device": "dhcp-server",
         "OSPF Status": "",
         "Area ID": "0.0.0.0",
         "Neighbor Type": "IPv4",
-        "Interface": "vlan22",
+        "Interface": "vlan40",
         "Neighbor ID": "10.255.0.89",
-        "State": "Full/-",
+        "State": "Full/DR",
         "Priority": "128",
-        "Dead Timer": "34.107s",
-        "Uptime": "47m08s",
-        "Graceful Restart": "",
-        "P2P": "",
-        "Route Pools": ""
-      },
-      {
-        "Device": "device3",
-        "OSPF Status": "",
-        "Area ID": "0.0.0.0",
-        "Neighbor Type": "IPv6",
-        "Interface": "vlan22",
-        "Neighbor ID": "10.255.0.89",
-        "State": "Full/PointToPoint",
-        "Priority": "128",
-        "Dead Timer": "00:00:39",
-        "Uptime": "00:47:08",
+        "Dead Timer": "39.171s",
+        "Uptime": "20m21s",
         "Graceful Restart": "",
         "P2P": "",
         "Route Pools": ""
@@ -967,10 +906,75 @@
         "Interface": "vlan20",
         "ISIS Area": "CORE",
         "Level": "Level-3",
-        "ISIS Net": "",
-        "System ID": "",
-        "Hello Interval": "",
-        "Multiplier": ""
+        "ISIS Net": "47.0005.80ff.f800.0000.0108.0001",
+        "System ID": "0000.0000.0001",
+        "Hello Interval": "10",
+        "Multiplier": "3"
+      },
+      {
+        "Device": "device1",
+        "ISIS Status": "",
+        "Neighbor Type": "IPv6",
+        "Neighbor Hostname": "san-q5130e-04",
+        "Interface": "vlan20",
+        "ISIS Area": "CORE",
+        "Level": "Level-3",
+        "ISIS Net": "47.0005.80ff.f800.0000.0108.0001",
+        "System ID": "0000.0000.0001",
+        "Hello Interval": "10",
+        "Multiplier": "3"
+      },
+      {
+        "Device": "device2",
+        "ISIS Status": "",
+        "Neighbor Type": "IPv4",
+        "Neighbor Hostname": "san-q5130e-04",
+        "Interface": "vlan21",
+        "ISIS Area": "CORE",
+        "Level": "Level-3",
+        "ISIS Net": "47.0005.80ff.f800.0000.0108.0001",
+        "System ID": "0000.0000.0001",
+        "Hello Interval": "10",
+        "Multiplier": "3"
+      },
+      {
+        "Device": "device2",
+        "ISIS Status": "",
+        "Neighbor Type": "IPv6",
+        "Neighbor Hostname": "san-q5130e-04",
+        "Interface": "vlan21",
+        "ISIS Area": "CORE",
+        "Level": "Level-3",
+        "ISIS Net": "47.0005.80ff.f800.0000.0108.0001",
+        "System ID": "0000.0000.0001",
+        "Hello Interval": "10",
+        "Multiplier": "3"
+      },
+      {
+        "Device": "dhcp-server",
+        "ISIS Status": "",
+        "Neighbor Type": "IPv4",
+        "Neighbor Hostname": "san-q5130e-04",
+        "Interface": "vlan40",
+        "ISIS Area": "CORE",
+        "Level": "Level-3",
+        "ISIS Net": "47.0005.80ff.f800.0000.0108.0001",
+        "System ID": "0000.0000.0001",
+        "Hello Interval": "10",
+        "Multiplier": "3"
+      }
+    ],
+    "dhcp": [
+      {
+        "Device": "dhcp-server",
+        "Interface": "ens4np0",
+        "VLAN": "40",
+        "Mode": "Server",
+        "Pools": "192.168.30.10-192.168.30.200 (default)",
+        "State": "Server Running",
+        "Lease IP": "",
+        "Gateway": "192.168.40.1",
+        "Last Check": "2025-11-13T06:39:32.499239+00:00"
       }
     ]
   },

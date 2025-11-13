@@ -1,0 +1,12 @@
+[Unit]
+Description=OSTG Cleanup Timer
+Documentation=https://github.com/your-repo/ostg
+Requires=ostg-cleanup.service
+
+[Timer]
+# Run cleanup daily at 2 AM
+OnCalendar=daily
+Persistent=true
+
+[Install]
+WantedBy=timers.target

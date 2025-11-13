@@ -346,7 +346,7 @@ def configure_isis_neighbor(device_id: str, isis_config: Dict[str, Any], device_
             if "isisd is not running" in _out.lower():
                 logging.error(f"[ISIS CONFIGURE] Unable to configure ISIS because isisd daemon is not running")
                 return False
-
+        
         if result.exit_code != 0:
             logging.error(f"[ISIS CONFIGURE] Command failed: {result.output.decode()}")
             return False
@@ -451,8 +451,13 @@ def start_isis_neighbor(device_id: str, device_name: str, container_id: str, isi
             from utils.device_database import DeviceDatabase
             device_db = DeviceDatabase()
             device_data = device_db.get_device(device_id)
+            dhcp_mode = ""
+            if device_data:
+                dhcp_mode = (device_data.get("dhcp_mode") or "").lower()
             enable_ipv4 = bool(device_data and device_data.get('ipv4_address'))
             enable_ipv6 = bool(device_data and device_data.get('ipv6_address'))
+            if dhcp_mode == "client":
+                enable_ipv4 = True
         except Exception:
             # Fallback: enable both if unable to determine
             enable_ipv4 = True

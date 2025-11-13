@@ -39,6 +39,29 @@ def print_device_info(device: Dict, detailed: bool = False):
         print(f"   MAC Address: {device.get('mac_address', 'N/A')}")
         print(f"   Protocols: {device.get('protocols', 'N/A')}")
         
+        # DHCP details
+        dhcp_mode = device.get('dhcp_mode')
+        dhcp_config = device.get('dhcp_config')
+        if dhcp_mode or dhcp_config:
+            print(f"   DHCP Mode: {dhcp_mode or 'N/A'}")
+            if isinstance(dhcp_config, str):
+                try:
+                    dhcp_config = json.loads(dhcp_config)
+                except Exception:
+                    pass
+            if isinstance(dhcp_config, dict):
+                if dhcp_config:
+                    print(f"   DHCP Config: {json.dumps(dhcp_config, indent=6)}")
+            else:
+                print(f"   DHCP Config: {dhcp_config}")
+            print(f"   DHCP State: {device.get('dhcp_state', 'Unknown')}")
+            print(f"   DHCP Running: {device.get('dhcp_running', 'N/A')}")
+            print(f"   DHCP Lease IP: {device.get('dhcp_lease_ip', '')}")
+            print(f"   DHCP Lease Gateway: {device.get('dhcp_lease_gateway', '')}")
+            print(f"   DHCP Lease Server: {device.get('dhcp_lease_server', '')}")
+            print(f"   DHCP Lease Expires: {device.get('dhcp_lease_expires', '')}")
+            print(f"   Last DHCP Check: {device.get('last_dhcp_check', '')}")
+        
         # Parse and display BGP config
         bgp_config = device.get('bgp_config')
         if bgp_config and bgp_config != '{}':

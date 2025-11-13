@@ -188,21 +188,51 @@ class TrafficGenClientMenuAction():
         # Starting save_session()
         
         current_time = time.time()
+        # Prevent new async saves while shutting down; blocking saves still allowed
+        if getattr(self, "_is_closing", False) and not blocking:
+            return
         if not blocking:
             # Check if this is a duplicate save call within a short time window
             if hasattr(self, '_last_save_time') and (current_time - self._last_save_time) < 1.0:
                 # Skipping duplicate save call
                 return
             self._last_save_time = current_time
-            # Check if another save is already in progress
-            if hasattr(self, '_save_in_progress') and self._save_in_progress:
-                # Save already in progress
-                return
-        else:
-            # For blocking saves we still update the timestamp so throttling remains accurate
-            self._last_save_time = current_time
+        # Check if another save is already in progress
+        in_progress = getattr(self, '_save_in_progress', False)
+        worker_exists = hasattr(self, '_save_worker') and self._save_worker is not None
+        worker_running = False
+        if worker_exists:
+            try:
+                worker_running = self._save_worker.isRunning()
+            except RuntimeError:
+                worker_running = False
+                self._save_worker = None
+                worker_exists = False
         
-        # Determine if a worker is already running
+        if in_progress:
+            if blocking:
+                # Wait for the existing background worker to finish before proceeding
+                if worker_exists and worker_running:
+                    print("[SAVE SESSION] Waiting for existing background save to finish (blocking request)...")
+                    if not self._save_worker.wait(5000):
+                        print("[SAVE SESSION WARNING] Background save did not finish within timeout; forcing termination.")
+                        self._save_worker.terminate()
+                        self._save_worker.wait(1000)
+                if worker_exists and self._save_worker is not None:
+                    try:
+                        self._save_worker.deleteLater()
+                    except RuntimeError:
+                        pass
+                    self._save_worker = None
+                self._save_in_progress = False
+            else:
+                # Non-blocking call while a save is already in progress – skip
+                return
+        
+        # For blocking saves we still update the timestamp so throttling remains accurate
+        self._last_save_time = current_time
+        
+        # Re-evaluate worker flags after potential cleanup above
         worker_exists = hasattr(self, '_save_worker') and self._save_worker is not None
         worker_running = False
         if worker_exists:
@@ -223,6 +253,8 @@ class TrafficGenClientMenuAction():
                 protocol_data["ospf"] = self._extract_table_data(self.devices_tab.ospf_table)
             if hasattr(self.devices_tab, "isis_table"):
                 protocol_data["isis"] = self._extract_table_data(self.devices_tab.isis_table)
+            if hasattr(self.devices_tab, "dhcp_table"):
+                protocol_data["dhcp"] = self._extract_table_data(self.devices_tab.dhcp_table)
         
         # If we're running a blocking save during shutdown, wait for any existing worker
         if blocking:

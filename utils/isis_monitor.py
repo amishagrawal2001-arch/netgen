@@ -242,7 +242,7 @@ class ISISMonitor:
                         logger.warning(f"[ISIS MONITOR] Error parsing manual override time: {e}")
             
             logger.info(f"[ISIS MONITOR] Updating ISIS status for device {device_id}")
-            logger.info(f"[ISIS MONITOR] ISIS status data: {isis_status}")
+            logger.debug(f"[ISIS MONITOR] ISIS status data: {isis_status}")
             
             # Prepare ISIS status data
             isis_running = isis_status.get('isis_running', False)

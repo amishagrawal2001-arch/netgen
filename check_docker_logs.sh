@@ -52,3 +52,5 @@ echo "ssh root@$SERVER 'docker logs $CONTAINER_ID --tail 100 | grep -i \"protoco
 
 
 
+
+

@@ -17,6 +17,7 @@ import random
 import ipaddress
 from collections import Counter
 import uuid
+from typing import Any, Dict, List, Optional, Tuple, Union
 from multithreaded_traffic_gen import generate_packets, on_stream_stopped, stream_tracker, start_rx_counter
 from utils.device_manager import DeviceManager
 from utils.helpers import increment_ip, increment_ipv6, increment_mac, is_interface_up
@@ -106,6 +107,10 @@ isis_monitor = ISISMonitor(device_db)
 
 # Initialize ARP status monitor
 arp_monitor = ARPStatusMonitor(device_db, server_url="http://localhost:5051")
+
+# Initialize DHCP client monitor
+from utils.dhcp_monitor import DHCPClientMonitor
+dhcp_client_monitor = DHCPClientMonitor(device_db)
 
 # Add request logging middleware
 @app.before_request
@@ -490,7 +495,7 @@ def start_device():
         
         # Normalize interface name
         iface_normalized = normalize_iface(iface)
-        
+
         # Light start: enable interface and configure IP addresses if provided
         result = {"device_id": device_id, "device": device_name, "interface": iface_normalized}
         iface_name = f"vlan{vlan}" if (vlan and vlan != "0") else iface_normalized
@@ -1073,7 +1078,7 @@ def start_device():
                 except Exception as exc:
                     logging.warning(f"[{label} STATUS] (async) Failed to trigger status check for device {device_id}: {exc}")
             threading.Thread(target=_runner, daemon=True).start()
-
+        
         # Trigger protocol status checks asynchronously after start
         if device_id:
             _trigger_monitor_async("BGP", bgp_monitor.force_check)
@@ -2277,6 +2282,14 @@ def apply_device():
         # Step 5: Add default routes if gateways are provided
         if ipv4_gateway:
             try:
+                # First, ensure gateway is reachable on the interface (prevents Linux from adding it to loopback)
+                # Add host route to gateway on the interface to make it directly reachable
+                gateway_host_route = subprocess.run([
+                    "ip", "route", "replace", f"{ipv4_gateway}/32", "dev", iface_name
+                ], capture_output=True, text=True, timeout=5)
+                if gateway_host_route.returncode == 0:
+                    logging.debug(f"[DEVICE APPLY] Added host route to gateway {ipv4_gateway}/32 on {iface_name}")
+                
                 # Remove existing default route if any
                 subprocess.run(["ip", "route", "del", "default", "via", ipv4_gateway], 
                              capture_output=True, text=True, timeout=5)
@@ -2298,6 +2311,14 @@ def apply_device():
         
         if ipv6_gateway:
             try:
+                # First, ensure IPv6 gateway is reachable on the interface (prevents Linux from adding it to loopback)
+                # Add host route to IPv6 gateway on the interface to make it directly reachable
+                gateway6_host_route = subprocess.run([
+                    "ip", "-6", "route", "replace", f"{ipv6_gateway}/128", "dev", iface_name
+                ], capture_output=True, text=True, timeout=5)
+                if gateway6_host_route.returncode == 0:
+                    logging.debug(f"[DEVICE APPLY] Added host route to IPv6 gateway {ipv6_gateway}/128 on {iface_name}")
+                
                 # Remove existing specific route to gateway if any
                 subprocess.run(["ip", "-6", "route", "del", f"{ipv6_gateway}/128", "via", ipv6_gateway], 
                              capture_output=True, text=True, timeout=5)
@@ -2575,20 +2596,69 @@ def apply_device():
         logging.info(f"[DEVICE APPLY] Device {device_name} configuration applied successfully")
         
         # Ensure DHCP services are running immediately after apply if requested
+        # Note: DHCP server devices need BOTH containers:
+        #   - FRR container for routing protocols (BGP, OSPF, ISIS)
+        #   - Separate DHCP container for DHCP server functionality
+        # ensure_dhcp_services will handle creating the separate DHCP container for server mode
+        
+        # Try to get DHCP config from database if not provided in request or if it's empty
+        # Check if dhcp_config is empty or missing mode
+        dhcp_config_empty = False
+        if not dhcp_config:
+            dhcp_config_empty = True
+        elif isinstance(dhcp_config, dict):
+            if len(dhcp_config) == 0 or not dhcp_config.get("mode"):
+                dhcp_config_empty = True
+        
+        logging.info(f"[DHCP APPLY] Initial check for device {device_id}: dhcp_config={dhcp_config}, empty={dhcp_config_empty}")
+        
+        if dhcp_config_empty:
+            try:
+                existing_device = device_db.get_device(device_id) if device_id else None
+                if existing_device:
+                    existing_dhcp_config = existing_device.get("dhcp_config", {})
+                    existing_dhcp_mode = existing_device.get("dhcp_mode", "")
+                    
+                    # Check if it's a string that needs parsing
+                    if isinstance(existing_dhcp_config, str):
+                        try:
+                            existing_dhcp_config = json.loads(existing_dhcp_config) if existing_dhcp_config else {}
+                        except Exception as parse_exc:
+                            logging.debug(f"[DHCP APPLY] Failed to parse DHCP config string for device {device_id}: {parse_exc}")
+                            existing_dhcp_config = {}
+                    
+                    # If we have a mode in the database but not in config, use it
+                    if existing_dhcp_mode and not existing_dhcp_config.get("mode"):
+                        if not isinstance(existing_dhcp_config, dict):
+                            existing_dhcp_config = {}
+                        existing_dhcp_config["mode"] = existing_dhcp_mode
+                    
+                    if existing_dhcp_config and existing_dhcp_config.get("mode"):
+                        logging.info(f"[DHCP APPLY] Using DHCP config from database for device {device_id}: mode={existing_dhcp_config.get('mode')}, config={existing_dhcp_config}")
+                        dhcp_config = existing_dhcp_config
+                    else:
+                        logging.debug(f"[DHCP APPLY] Device {device_id} has no valid DHCP config in database: dhcp_config={existing_dhcp_config}, dhcp_mode={existing_dhcp_mode}")
+            except Exception as db_exc:
+                logging.warning(f"[DHCP APPLY] Could not retrieve DHCP config from database for device {device_id}: {db_exc}", exc_info=True)
+        
         dhcp_apply_mode = (dhcp_config.get("mode") or "").lower() if isinstance(dhcp_config, dict) else ""
+        logging.info(f"[DHCP APPLY] Checking DHCP config for device {device_id}: dhcp_config={dhcp_config}, mode={dhcp_apply_mode}, device_id={device_id}")
         if device_id and dhcp_apply_mode in ("client", "server"):
             try:
-                logging.info(f"[DHCP] Ensuring DHCP {dhcp_apply_mode} services for device {device_id} during apply on {iface_name}")
+                logging.info(f"[DHCP APPLY] Ensuring DHCP {dhcp_apply_mode} services for device {device_id} during apply on {iface_name}")
                 container_for_dhcp = None
+                # Try to get FRR container (for client mode, it will be used; for server mode, ensure_dhcp_services will ignore it)
                 try:
                     from utils.frr_docker import FRRDockerManager
                     _frr_manager = FRRDockerManager()
                     _container_name = _frr_manager._get_container_name(device_id, device_name)
                     container_for_dhcp = _frr_manager.client.containers.get(_container_name)
+                    logging.info(f"[DHCP APPLY] Retrieved FRR container {_container_name} for device {device_id}")
                 except Exception as container_exc:
-                    logging.debug(f"[DHCP] Unable to retrieve FRR container during apply for {device_id}: {container_exc}")
+                    logging.debug(f"[DHCP APPLY] Unable to retrieve FRR container during apply for {device_id}: {container_exc}")
                     container_for_dhcp = None
 
+                logging.info(f"[DHCP APPLY] Calling ensure_dhcp_services for device {device_id} with mode={dhcp_apply_mode}, container={'present' if container_for_dhcp else 'None'}")
                 dhcp_apply_result = ensure_dhcp_services(
                     device_db,
                     device_id,
@@ -2597,10 +2667,13 @@ def apply_device():
                     container=container_for_dhcp,
                     force_client_restart=(dhcp_apply_mode == "client"),
                 )
+                logging.info(f"[DHCP APPLY] ensure_dhcp_services result for device {device_id}: {dhcp_apply_result}")
                 result["dhcp"] = dhcp_apply_result
             except Exception as dhcp_error:
-                logging.warning(f"[DHCP] Failed to start DHCP during apply for device {device_id}: {dhcp_error}")
+                logging.error(f"[DHCP APPLY] Failed to start DHCP during apply for device {device_id}: {dhcp_error}", exc_info=True)
                 result["dhcp"] = {"success": False, "error": str(dhcp_error)}
+        else:
+            logging.info(f"[DHCP APPLY] Skipping DHCP services for device {device_id}: device_id={device_id}, mode={dhcp_apply_mode}")
         
         return jsonify({
             "status": "applied",
@@ -3150,7 +3223,7 @@ def stop_device():
         try:
             if not frr_manager:
                 frr_manager = FRRDockerManager()
-                container_name = frr_manager._get_container_name(device_id, device_name)
+            container_name = frr_manager._get_container_name(device_id, device_name)
             
             logging.info(f"[DEVICE STOP] Stopping FRR container {container_name} for device {device_name}")
             
@@ -3397,8 +3470,86 @@ def get_dhcp_status():
             dhcp_mode = (device.get("dhcp_mode") or "").lower()
             if not dhcp_mode:
                 continue
+            device_id = device.get("device_id")
+
+            pool_names = {"primary": None, "additional": []}
+            if device_id:
+                try:
+                    db_pools = device_db.get_device_dhcp_pools(device_id) or {}
+                except Exception:
+                    db_pools = {}
+                if isinstance(db_pools, dict):
+                    if db_pools.get("primary"):
+                        pool_names["primary"] = db_pools.get("primary")
+                    additional_from_db = db_pools.get("additional") or []
+                    if isinstance(additional_from_db, (list, tuple, set)):
+                        pool_names["additional"] = [
+                            str(name)
+                            for name in additional_from_db
+                            if name and str(name) not in pool_names["additional"]
+                        ]
+
+            dhcp_cfg = device.get("dhcp_config") or {}
+            if isinstance(dhcp_cfg, str):
+                try:
+                    dhcp_cfg = json.loads(dhcp_cfg) if dhcp_cfg else {}
+                except Exception:
+                    dhcp_cfg = {}
+            if not isinstance(dhcp_cfg, dict):
+                dhcp_cfg = {}
+
+            config_pool_names = dhcp_cfg.get("pool_names")
+            if isinstance(config_pool_names, dict):
+                primary_candidate = config_pool_names.get("primary")
+                if primary_candidate and not pool_names["primary"]:
+                    pool_names["primary"] = primary_candidate
+                additional_candidates = config_pool_names.get("additional") or []
+                if isinstance(additional_candidates, (list, tuple, set)):
+                    for name in additional_candidates:
+                        if not name:
+                            continue
+                        name_str = str(name)
+                        if (
+                            name_str
+                            and name_str != pool_names["primary"]
+                            and name_str not in pool_names["additional"]
+                        ):
+                            pool_names["additional"].append(name_str)
+            else:
+                legacy_primary = dhcp_cfg.get("pool_name")
+                if legacy_primary and not pool_names["primary"]:
+                    pool_names["primary"] = legacy_primary
+                additional_entries = dhcp_cfg.get("additional_pools") or []
+                if isinstance(additional_entries, list):
+                    for entry in additional_entries:
+                        if not isinstance(entry, dict):
+                            continue
+                        pool_name = entry.get("pool_name")
+                        if (
+                            pool_name
+                            and pool_name != pool_names["primary"]
+                            and pool_name not in pool_names["additional"]
+                        ):
+                            pool_names["additional"].append(pool_name)
+
+            # Ensure additional pools list is sorted for stable display
+            if pool_names["additional"]:
+                pool_names["additional"] = sorted(pool_names["additional"])
+
+            # Include default pool information (from Add Device dialog) if no named pools are attached
+            default_pool = None
+            if dhcp_mode == "server" and not pool_names["primary"] and not pool_names["additional"]:
+                pool_start = dhcp_cfg.get("pool_start")
+                pool_end = dhcp_cfg.get("pool_end")
+                if pool_start and pool_end:
+                    default_pool = {
+                        "pool_start": pool_start,
+                        "pool_end": pool_end,
+                        "pool_range": f"{pool_start}-{pool_end}",
+                    }
+
             rows.append({
-                "device_id": device.get("device_id"),
+                "device_id": device_id,
                 "device_name": device.get("device_name"),
                 "interface": device.get("interface"),
                 "server_interface": device.get("server_interface"),
@@ -3412,11 +3563,437 @@ def get_dhcp_status():
                 "lease_server": device.get("dhcp_lease_server"),
                 "lease_expires": device.get("dhcp_lease_expires"),
                 "last_check": device.get("last_dhcp_check"),
+                "pool_names": pool_names,
+                "default_pool": default_pool,
             })
         return jsonify({"devices": rows}), 200
     except Exception as e:
         logging.error(f"[DHCP STATUS] Failed to gather DHCP status: {e}")
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/device/dhcp/server/pool", methods=["POST"])
+def update_dhcp_server_pool():
+    """Attach or replace a DHCP pool for an existing DHCP server device."""
+    try:
+        payload = request.get_json(silent=True) or {}
+    except Exception:
+        payload = {}
+
+    device_id = (payload.get("device_id") or "").strip()
+    pool_start = (payload.get("pool_start") or "").strip()
+    pool_end = (payload.get("pool_end") or "").strip()
+    replace_existing = bool(payload.get("replace_existing"))
+    gateway_override = (payload.get("gateway") or "").strip()
+    gateway_route_input = payload.get("gateway_route")
+
+    gateway_routes_to_add: list = []
+    if isinstance(gateway_route_input, (list, tuple, set)):
+        for item in gateway_route_input:
+            if not item:
+                continue
+            value = str(item).strip()
+            if value:
+                gateway_routes_to_add.append(value)
+    elif isinstance(gateway_route_input, str):
+        value = gateway_route_input.strip()
+        if value:
+            gateway_routes_to_add.append(value)
+    elif gateway_route_input:
+        value = str(gateway_route_input).strip()
+        if value:
+            gateway_routes_to_add.append(value)
+
+    if not device_id or not pool_start or not pool_end:
+        return jsonify({"error": "device_id, pool_start, and pool_end are required"}), 400
+
+    try:
+        device = device_db.get_device(device_id)
+    except Exception as exc:
+        logging.error(f"[DHCP API] Failed to load device {device_id}: {exc}")
+        return jsonify({"error": str(exc)}), 500
+
+    if not device:
+        return jsonify({"error": "Device not found"}), 404
+
+    dhcp_cfg = device.get("dhcp_config") or {}
+    if isinstance(dhcp_cfg, str):
+        try:
+            dhcp_cfg = json.loads(dhcp_cfg) if dhcp_cfg else {}
+        except Exception:
+            dhcp_cfg = {}
+
+    current_mode = (device.get("dhcp_mode") or dhcp_cfg.get("mode") or "").lower()
+    if current_mode != "server":
+        return jsonify({"error": "Selected device is not configured as a DHCP server"}), 400
+
+    interface = (
+        dhcp_cfg.get("interface")
+        or device.get("server_interface")
+        or device.get("interface")
+    )
+    if not interface:
+        return jsonify({"error": "Unable to determine interface for DHCP server"}), 400
+
+    # Manual override detaches existing named pool associations
+    try:
+        device_db.remove_device_dhcp_pools(device_id)
+    except Exception as exc:
+        logging.debug(f"[DHCP API] Failed to clear DHCP pool attachments for {device_id}: {exc}")
+
+    additional_pools = dhcp_cfg.get("additional_pools") or []
+    if isinstance(additional_pools, str):
+        try:
+            additional_pools = json.loads(additional_pools) if additional_pools else []
+        except Exception:
+            additional_pools = []
+    elif not isinstance(additional_pools, list):
+        additional_pools = list(additional_pools) if additional_pools else []
+    additional_pools = [pool for pool in additional_pools if isinstance(pool, dict)]
+
+    new_pool_entry = {
+        "pool_start": pool_start,
+        "pool_end": pool_end,
+    }
+    if gateway_routes_to_add:
+        new_pool_entry["gateway_route"] = gateway_routes_to_add
+
+    if replace_existing or not (dhcp_cfg.get("pool_start") and dhcp_cfg.get("pool_end")):
+        logging.info(
+            "[DHCP API] Replacing base pool for device %s with %s-%s",
+            device_id,
+            pool_start,
+            pool_end,
+        )
+        dhcp_cfg["pool_start"] = pool_start
+        dhcp_cfg["pool_end"] = pool_end
+        if replace_existing:
+            # Keep existing additional pools but ensure no duplicate of new range
+            additional_pools = [
+                pool
+                for pool in additional_pools
+                if pool.get("pool_start") != pool_start or pool.get("pool_end") != pool_end
+            ]
+    else:
+        logging.info(
+            "[DHCP API] Appending additional pool %s-%s to device %s",
+            pool_start,
+            pool_end,
+            device_id,
+        )
+        duplicate = False
+        for pool in additional_pools:
+            if pool.get("pool_start") == pool_start and pool.get("pool_end") == pool_end:
+                duplicate = True
+                break
+        if not duplicate:
+            additional_pools.append(new_pool_entry)
+
+    dhcp_cfg["additional_pools"] = additional_pools
+    dhcp_cfg["mode"] = "server"
+    dhcp_cfg["interface"] = interface
+
+    if gateway_override:
+        dhcp_cfg["gateway"] = gateway_override
+    elif not dhcp_cfg.get("gateway"):
+        dhcp_cfg["gateway"] = (
+            device.get("dhcp_lease_gateway")
+            or device.get("ipv4_gateway")
+            or ""
+        )
+
+    if gateway_routes_to_add:
+        existing_routes = dhcp_cfg.get("gateway_route")
+        route_list = []
+        if isinstance(existing_routes, str):
+            route_list = [existing_routes] if existing_routes else []
+        elif isinstance(existing_routes, list):
+            route_list = list(existing_routes)
+        elif existing_routes:
+            route_list = [str(existing_routes)]
+        for route in gateway_routes_to_add:
+            if route not in route_list:
+                route_list.append(route)
+        dhcp_cfg["gateway_route"] = route_list
+
+    try:
+        result = ensure_dhcp_services(
+            device_db,
+            device_id,
+            interface,
+            dhcp_cfg,
+        )
+    except Exception as exc:
+        logging.error(f"[DHCP API] Failed to ensure DHCP server for {device_id}: {exc}")
+        return jsonify({"error": str(exc)}), 500
+
+    if not result.get("success"):
+        return jsonify({"error": result.get("error", "Failed to update DHCP server")}), 500
+
+    try:
+        updated_device = device_db.get_device(device_id) or {}
+    except Exception as exc:
+        logging.error(f"[DHCP API] Failed to refresh device {device_id}: {exc}")
+        updated_device = {}
+
+    return jsonify({"status": "success", "device": updated_device}), 200
+
+
+@app.route("/api/device/dhcp/server/attach_pools", methods=["POST"])
+def attach_dhcp_pools_to_server():
+    """Attach named DHCP pools from the database to a DHCP server device."""
+    try:
+        data = request.get_json(silent=True) or {}
+    except Exception:
+        data = {}
+
+    device_id = (data.get("device_id") or "").strip()
+    detach_all = bool(data.get("detach_all", False))
+    primary_pool_name = (data.get("primary_pool") or "").strip()
+    additional_pool_names = data.get("additional_pools") or []
+    replace_existing = bool(data.get("replace_existing", True))
+    gateway_override = (data.get("gateway") or "").strip()
+
+    if isinstance(additional_pool_names, str):
+        additional_pool_names = [additional_pool_names]
+    additional_pool_names = [
+        str(name).strip()
+        for name in additional_pool_names
+        if str(name).strip()
+    ]
+
+    if not device_id:
+        return jsonify({"error": "device_id is required"}), 400
+
+    # Handle detach all pools case
+    if detach_all:
+        try:
+            device = device_db.get_device(device_id)
+        except Exception as exc:
+            logging.error(f"[DHCP API] Failed to load device {device_id}: {exc}")
+            return jsonify({"error": str(exc)}), 500
+
+        if not device:
+            return jsonify({"error": "Device not found"}), 404
+
+        # Detach all pools from device
+        try:
+            device_db.remove_device_dhcp_pools(device_id)
+        except Exception as exc:
+            logging.error(f"[DHCP API] Failed to detach DHCP pools for {device_id}: {exc}")
+            return jsonify({"error": str(exc)}), 500
+
+        # Clear pool configuration from dhcp_config
+        dhcp_cfg = device.get("dhcp_config") or {}
+        if isinstance(dhcp_cfg, str):
+            try:
+                dhcp_cfg = json.loads(dhcp_cfg) if dhcp_cfg else {}
+            except Exception:
+                dhcp_cfg = {}
+        if not isinstance(dhcp_cfg, dict):
+            dhcp_cfg = {}
+
+        # Save route metadata before clearing pool fields (needed for route cleanup)
+        saved_pool_networks = dhcp_cfg.get("pool_networks")
+        saved_gateway_routes = dhcp_cfg.get("gateway_route_normalized")
+        saved_interface = dhcp_cfg.get("interface") or device.get("server_interface") or device.get("interface")
+        saved_gateway = dhcp_cfg.get("gateway", "")
+
+        # Stop DHCP server if no pools remain (before clearing config)
+        try:
+            interface = saved_interface
+            if interface:
+                from utils.dhcp import stop_dhcp_server, _get_dhcp_container
+                container = _get_dhcp_container(device_id, mode="server")
+                # Temporarily restore route metadata for cleanup
+                if saved_pool_networks:
+                    dhcp_cfg["pool_networks"] = saved_pool_networks
+                if saved_gateway_routes:
+                    dhcp_cfg["gateway_route_normalized"] = saved_gateway_routes
+                stop_dhcp_server(device_db, device_id, interface, container=container)
+        except Exception as exc:
+            logging.warning(f"[DHCP API] Failed to stop DHCP server after detach: {exc}")
+
+        # Clear pool-related fields but keep other DHCP config (after stopping server)
+        dhcp_cfg.pop("pool_name", None)
+        dhcp_cfg.pop("pool_names", None)
+        dhcp_cfg.pop("pool_start", None)
+        dhcp_cfg.pop("pool_end", None)
+        dhcp_cfg.pop("additional_pools", None)
+        dhcp_cfg.pop("pool_range", None)
+        dhcp_cfg.pop("pool_networks", None)
+        dhcp_cfg.pop("gateway_route_normalized", None)
+
+        # Update device in database
+        try:
+            device_db.update_device(device_id, {"dhcp_config": dhcp_cfg})
+        except Exception as exc:
+            logging.error(f"[DHCP API] Failed to update device {device_id}: {exc}")
+            return jsonify({"error": str(exc)}), 500
+
+        try:
+            updated_device = device_db.get_device(device_id)
+        except Exception:
+            updated_device = device
+
+        return jsonify({"status": "success", "message": "All DHCP pools detached", "device": updated_device}), 200
+
+    if not primary_pool_name:
+        return jsonify({"error": "primary_pool is required (or set detach_all=true)"}), 400
+
+    try:
+        device = device_db.get_device(device_id)
+    except Exception as exc:
+        logging.error(f"[DHCP API] Failed to load device {device_id}: {exc}")
+        return jsonify({"error": str(exc)}), 500
+
+    if not device:
+        return jsonify({"error": "Device not found"}), 404
+
+    primary_pool = device_db.get_dhcp_pool(primary_pool_name)
+    if not primary_pool:
+        return jsonify({"error": f"Primary DHCP pool '{primary_pool_name}' not found"}), 404
+
+    additional_defs = []
+    missing_pools = []
+    for pool_name in additional_pool_names:
+        pool_def = device_db.get_dhcp_pool(pool_name)
+        if not pool_def:
+            missing_pools.append(pool_name)
+        else:
+            additional_defs.append(pool_def)
+    if missing_pools:
+        return jsonify({"error": f"Unknown DHCP pools: {', '.join(sorted(missing_pools))}"}), 404
+
+    dhcp_cfg = {}
+    existing_config = device.get("dhcp_config") or {}
+    if isinstance(existing_config, str):
+        try:
+            existing_config = json.loads(existing_config)
+        except Exception:
+            existing_config = {}
+    if not isinstance(existing_config, dict):
+        existing_config = {}
+
+    if not replace_existing and existing_config:
+        dhcp_cfg = dict(existing_config)
+    else:
+        dhcp_cfg = {}
+
+    # Establish interface
+    interface = (
+        dhcp_cfg.get("interface")
+        or existing_config.get("interface")
+        or device.get("server_interface")
+        or device.get("interface")
+    )
+    if not interface:
+        return jsonify({"error": "Unable to determine interface for DHCP server"}), 400
+    dhcp_cfg["interface"] = interface
+
+    # Apply primary pool settings
+    dhcp_cfg["mode"] = "server"
+    dhcp_cfg["pool_start"] = primary_pool.get("pool_start")
+    dhcp_cfg["pool_end"] = primary_pool.get("pool_end")
+    dhcp_cfg["pool_name"] = primary_pool_name
+    dhcp_cfg.pop("pool_range", None)
+    dhcp_cfg.pop("pool_networks", None)
+    dhcp_cfg.pop("gateway_route_normalized", None)
+
+    if primary_pool.get("lease_time") is not None:
+        dhcp_cfg["lease_time"] = primary_pool.get("lease_time")
+    elif "lease_time" in dhcp_cfg and replace_existing:
+        dhcp_cfg.pop("lease_time", None)
+
+    primary_routes = primary_pool.get("gateway_routes") or []
+    if primary_routes:
+        dhcp_cfg["gateway_route"] = primary_routes
+    else:
+        dhcp_cfg.pop("gateway_route", None)
+
+    if gateway_override:
+        dhcp_cfg["gateway"] = gateway_override
+    elif primary_pool.get("gateway"):
+        dhcp_cfg["gateway"] = primary_pool.get("gateway")
+    elif replace_existing and "gateway" in dhcp_cfg:
+        dhcp_cfg.pop("gateway", None)
+
+    # Merge existing additional pools if requested
+    additional_pools_payload = []
+    existing_additional_names = set()
+    if not replace_existing:
+        existing_additional = dhcp_cfg.get("additional_pools") or existing_config.get("additional_pools") or []
+        if isinstance(existing_additional, str):
+            try:
+                existing_additional = json.loads(existing_additional)
+            except Exception:
+                existing_additional = []
+        if isinstance(existing_additional, list):
+            for pool_entry in existing_additional:
+                if isinstance(pool_entry, dict):
+                    additional_pools_payload.append(pool_entry)
+                    pool_entry_name = pool_entry.get("pool_name")
+                    if pool_entry_name:
+                        existing_additional_names.add(pool_entry_name)
+
+    # Add requested additional pools
+    for pool in additional_defs:
+        pool_entry = {
+            "pool_start": pool.get("pool_start"),
+            "pool_end": pool.get("pool_end"),
+            "pool_name": pool.get("pool_name"),
+        }
+        if pool.get("gateway"):
+            pool_entry["gateway"] = pool.get("gateway")
+        if pool.get("lease_time") is not None:
+            pool_entry["lease_time"] = pool.get("lease_time")
+        if pool.get("gateway_routes"):
+            pool_entry["gateway_route"] = pool.get("gateway_routes")
+        if pool_entry.get("pool_name") not in existing_additional_names:
+            additional_pools_payload.append(pool_entry)
+            if pool_entry.get("pool_name"):
+                existing_additional_names.add(pool_entry["pool_name"])
+
+    dhcp_cfg["additional_pools"] = additional_pools_payload
+    dhcp_cfg["pool_names"] = {
+        "primary": primary_pool_name,
+        "additional": [
+            entry.get("pool_name")
+            for entry in additional_pools_payload
+            if entry.get("pool_name") and entry.get("pool_name") != primary_pool_name
+        ],
+    }
+
+    try:
+        result = ensure_dhcp_services(
+            device_db,
+            device_id,
+            interface,
+            dhcp_cfg,
+        )
+    except Exception as exc:
+        logging.error(f"[DHCP API] Failed to attach DHCP pools for {device_id}: {exc}")
+        return jsonify({"error": str(exc)}), 500
+
+    if not result.get("success"):
+        return jsonify({"error": result.get("error", "Failed to update DHCP server")}), 500
+
+    # Record attachments
+    named_additional = [
+        name for name in dhcp_cfg["pool_names"]["additional"] if name and name != primary_pool_name
+    ]
+    try:
+        device_db.attach_dhcp_pools_to_device(device_id, primary_pool_name, named_additional)
+    except Exception as exc:
+        logging.debug(f"[DHCP API] Failed to persist DHCP pool attachments for {device_id}: {exc}")
+
+    try:
+        updated_device = device_db.get_device(device_id) or {}
+    except Exception as exc:
+        logging.error(f"[DHCP API] Failed to refresh device {device_id}: {exc}")
+        updated_device = {}
+
+    return jsonify({"status": "success", "device": updated_device}), 200
 
 
 def add_static_route_background(device_id, device_name, gateway, container_name_prefix="ostg-frr"):
@@ -5624,7 +6201,7 @@ def configure_bgp():
                     bgp_config_to_save = bgp_config.copy()
                     bgp_config_to_save.pop("_apply_address_families", None)
                     update_data["bgp_config"] = bgp_config_to_save
-                    logging.info(f"[BGP CONFIGURE] Updating BGP configuration for device {device_name}")
+                logging.info(f"[BGP CONFIGURE] Updating BGP configuration for device {device_name}")
                 
                 if update_data:
                     device_db.update_device(device_id, update_data)
@@ -5652,18 +6229,16 @@ def configure_bgp():
         # configure_bgp_for_device handles the primary neighbors, but we may need to add additional ones
         success = True
         
-        # Configure additional IPv4 BGP neighbors if there are multiple neighbors (comma-separated)
+        # Configure IPv4 BGP neighbors (handle single or multiple neighbors uniformly)
         if ipv4_enabled and bgp_config.get("bgp_neighbor_ipv4"):
             ipv4_neighbors_str = bgp_config.get("bgp_neighbor_ipv4", "")
             ipv4_neighbors_list = [n.strip() for n in ipv4_neighbors_str.split(",") if n.strip()] if ipv4_neighbors_str else []
             
-            # If there are multiple neighbors, configure additional ones beyond the first
-            # configure_bgp_for_device already configured the first neighbor, so we only need to add extras
-            if len(ipv4_neighbors_list) > 1:
-                logging.info(f"[BGP CONFIGURE] Configuring additional {len(ipv4_neighbors_list) - 1} IPv4 BGP neighbors")
+            if ipv4_neighbors_list:
+                logging.info(f"[BGP CONFIGURE] Ensuring {len(ipv4_neighbors_list)} IPv4 BGP neighbor(s) are configured")
                 from utils.frr_docker import configure_bgp_neighbor
                 
-                for neighbor_ip in ipv4_neighbors_list[1:]:  # Skip first, already configured
+                for neighbor_ip in ipv4_neighbors_list:
                     neighbor_config_ipv4 = {
                         "neighbor_ip": neighbor_ip,
                         "neighbor_as": bgp_config.get("bgp_neighbor_asn") or bgp_config.get("bgp_remote_asn", ""),
@@ -5676,19 +6251,18 @@ def configure_bgp():
                     neighbor_success = configure_bgp_neighbor(device_id, neighbor_config_ipv4, device_name)
                     if not neighbor_success:
                         success = False
-                        logging.error(f"[BGP CONFIGURE] Failed to configure additional IPv4 BGP neighbor {neighbor_ip}")
+                        logging.error(f"[BGP CONFIGURE] Failed to configure IPv4 BGP neighbor {neighbor_ip}")
         
-        # Configure additional IPv6 BGP neighbors if there are multiple neighbors (comma-separated)
+        # Configure IPv6 BGP neighbors (handle single or multiple neighbors uniformly)
         if ipv6_enabled and bgp_config.get("bgp_neighbor_ipv6"):
             ipv6_neighbors_str = bgp_config.get("bgp_neighbor_ipv6", "")
             ipv6_neighbors_list = [n.strip() for n in ipv6_neighbors_str.split(",") if n.strip()] if ipv6_neighbors_str else []
             
-            # If there are multiple neighbors, configure additional ones beyond the first
-            if len(ipv6_neighbors_list) > 1:
-                logging.info(f"[BGP CONFIGURE] Configuring additional {len(ipv6_neighbors_list) - 1} IPv6 BGP neighbors")
+            if ipv6_neighbors_list:
+                logging.info(f"[BGP CONFIGURE] Ensuring {len(ipv6_neighbors_list)} IPv6 BGP neighbor(s) are configured")
                 from utils.frr_docker import configure_bgp_neighbor
                 
-                for neighbor_ip in ipv6_neighbors_list[1:]:  # Skip first, already configured
+                for neighbor_ip in ipv6_neighbors_list:
                     neighbor_config_ipv6 = {
                         "neighbor_ip": neighbor_ip,
                         "neighbor_as": bgp_config.get("bgp_neighbor_asn") or bgp_config.get("bgp_remote_asn", ""),
@@ -5701,7 +6275,7 @@ def configure_bgp():
                     neighbor_success = configure_bgp_neighbor(device_id, neighbor_config_ipv6, device_name)
                     if not neighbor_success:
                         success = False
-                        logging.error(f"[BGP CONFIGURE] Failed to configure additional IPv6 BGP neighbor {neighbor_ip}")
+                        logging.error(f"[BGP CONFIGURE] Failed to configure IPv6 BGP neighbor {neighbor_ip}")
         
         if not success:
             logging.warning(f"[BGP CONFIGURE] Some additional BGP neighbors failed to configure, but primary configuration succeeded")
@@ -8834,6 +9408,125 @@ def save_bgp_route_pools_batch():
         return jsonify({"error": str(e)}), 500
 
 
+# ============================================================================
+# DHCP Pool Management API Endpoints
+# ============================================================================
+
+
+def _dhcp_pool_to_api(pool: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert database DHCP pool record to API representation."""
+    return {
+        "name": pool.get("pool_name"),
+        "pool_start": pool.get("pool_start"),
+        "pool_end": pool.get("pool_end"),
+        "gateway": pool.get("gateway"),
+        "lease_time": pool.get("lease_time"),
+        "gateway_routes": pool.get("gateway_routes") or [],
+        "description": pool.get("description"),
+        "created_at": pool.get("created_at"),
+        "updated_at": pool.get("updated_at"),
+    }
+
+
+@app.route("/api/dhcp/pools", methods=["GET"])
+def get_dhcp_pools():
+    """Return all DHCP pool definitions."""
+    try:
+        pools = device_db.get_all_dhcp_pools()
+        api_pools = [_dhcp_pool_to_api(pool) for pool in pools]
+        return jsonify({"pools": api_pools, "count": len(api_pools)}), 200
+    except Exception as e:
+        logging.error(f"[DHCP POOLS API] Failed to fetch DHCP pools: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/dhcp/pools", methods=["POST"])
+def create_dhcp_pool():
+    """Create a new DHCP pool definition."""
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "Invalid JSON payload"}), 400
+
+        required_fields = ["name", "pool_start", "pool_end"]
+        for field in required_fields:
+            if not data.get(field):
+                return jsonify({"error": f"Missing required field: {field}"}), 400
+
+        pool_data = {
+            "name": data.get("name"),
+            "pool_start": data.get("pool_start"),
+            "pool_end": data.get("pool_end"),
+            "gateway": data.get("gateway"),
+            "lease_time": data.get("lease_time"),
+            "gateway_routes": data.get("gateway_routes") or data.get("gateway_route"),
+            "description": data.get("description"),
+        }
+
+        success = device_db.add_dhcp_pool(pool_data)
+        if success:
+            pool = device_db.get_dhcp_pool(pool_data["name"])
+            return jsonify({"message": "DHCP pool created", "pool": _dhcp_pool_to_api(pool)}), 201
+        return jsonify({"error": "Failed to create DHCP pool"}), 500
+    except Exception as e:
+        logging.error(f"[DHCP POOLS API] Failed to create DHCP pool: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/dhcp/pools/<pool_name>", methods=["GET"])
+def get_dhcp_pool(pool_name):
+    """Get a DHCP pool definition by name."""
+    try:
+        pool = device_db.get_dhcp_pool(pool_name)
+        if not pool:
+            return jsonify({"error": f"DHCP pool '{pool_name}' not found"}), 404
+        return jsonify({"pool": _dhcp_pool_to_api(pool)}), 200
+    except Exception as e:
+        logging.error(f"[DHCP POOLS API] Failed to fetch DHCP pool '{pool_name}': {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/dhcp/pools/<pool_name>", methods=["PUT"])
+def update_dhcp_pool_endpoint(pool_name):
+    """Update an existing DHCP pool definition."""
+    try:
+        data = request.get_json()
+        if not data:
+            return jsonify({"error": "Invalid JSON payload"}), 400
+
+        pool_data = {}
+        for key in ["pool_start", "pool_end", "gateway", "lease_time", "description"]:
+            if key in data:
+                pool_data[key] = data[key]
+        if "gateway_routes" in data or "gateway_route" in data:
+            pool_data["gateway_routes"] = data.get("gateway_routes") or data.get("gateway_route")
+
+        if not pool_data:
+            return jsonify({"error": "No fields to update"}), 400
+
+        success = device_db.update_dhcp_pool(pool_name, pool_data)
+        if success:
+            pool = device_db.get_dhcp_pool(pool_name)
+            return jsonify({"message": "DHCP pool updated", "pool": _dhcp_pool_to_api(pool)}), 200
+        return jsonify({"error": "Failed to update DHCP pool"}), 500
+    except Exception as e:
+        logging.error(f"[DHCP POOLS API] Failed to update DHCP pool '{pool_name}': {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/dhcp/pools/<pool_name>", methods=["DELETE"])
+def delete_dhcp_pool(pool_name):
+    """Delete a DHCP pool definition."""
+    try:
+        success = device_db.remove_dhcp_pool(pool_name)
+        if success:
+            return jsonify({"message": f"DHCP pool '{pool_name}' deleted"}), 200
+        return jsonify({"error": f"DHCP pool '{pool_name}' not found or could not be deleted"}), 404
+    except Exception as e:
+        logging.error(f"[DHCP POOLS API] Failed to delete DHCP pool '{pool_name}': {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 # Device-Pool Relationship Management API Endpoints
 
 @app.route("/api/device/<device_id>/route-pools", methods=["GET"])
@@ -8984,6 +9677,13 @@ def main(argv=None):
         logging.info("[ARP MONITOR] ARP status monitoring started")
     except Exception as e:
         logging.error(f"[ARP MONITOR] Failed to start ARP monitoring: {e}")
+
+    # Start DHCP client monitoring
+    try:
+        dhcp_client_monitor.start()
+        logging.info("[DHCP MONITOR] DHCP client monitoring started")
+    except Exception as e:
+        logging.error(f"[DHCP MONITOR] Failed to start DHCP monitoring: {e}")
     
     app.run(host=args.host, port=args.port)
 

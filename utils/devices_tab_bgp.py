@@ -53,11 +53,12 @@ class BGPHandler:
         # BGP Controls
         bgp_controls = QHBoxLayout()
         
-        # Add BGP button
+        # Helper function to load icons
         def load_icon(filename: str) -> QIcon:
             from utils.qicon_loader import qicon
             return qicon("resources", f"icons/{filename}")
         
+        # Add BGP button
         self.parent.add_bgp_button = QPushButton()
         self.parent.add_bgp_button.setIcon(load_icon("add.png"))
         self.parent.add_bgp_button.setIconSize(QSize(16, 16))
@@ -588,14 +589,35 @@ class BGPHandler:
             if not bgp_config:
                 return True  # No BGP config to apply
             
+            # Get IPv4/IPv6 from device_info, with fallback to database if not available
+            # This is important for DHCP server devices where IPv4 might not be in device_info
+            ipv4 = device_info.get("IPv4", "")
+            ipv6 = device_info.get("IPv6", "")
+            
+            # If IPv4/IPv6 not in device_info, try to get from database
+            if not ipv4 or not ipv6:
+                try:
+                    import requests
+                    device_response = requests.get(f"{server_url}/api/device/{device_id}", timeout=10)
+                    if device_response.status_code == 200:
+                        device_data = device_response.json()
+                        if not ipv4:
+                            ipv4 = device_data.get("ipv4_address", "")
+                        if not ipv6:
+                            ipv6 = device_data.get("ipv6_address", "")
+                except Exception as e:
+                    logging.warning(f"[BGP APPLY] Could not retrieve device data from server: {e}")
+            
             # Prepare BGP payload using the configure endpoint (same as the original)
             bgp_payload = {
                 "device_id": device_id,
                 "device_name": device_name,
                 "interface": device_info.get("Interface", ""),
                 "vlan": device_info.get("VLAN", "0"),
-                "ipv4": device_info.get("IPv4", ""),
-                "ipv6": device_info.get("IPv6", ""),
+                "ipv4": ipv4,
+                "ipv6": ipv6,
+                "ipv4_mask": device_info.get("ipv4_mask", "24"),
+                "ipv6_mask": device_info.get("ipv6_mask", "64"),
                 "gateway": device_info.get("Gateway", ""),  # Keep for backward compatibility
                 "ipv4_gateway": device_info.get("IPv4 Gateway", ""),  # Include IPv4 gateway for static route
                 "ipv6_gateway": device_info.get("IPv6 Gateway", ""),  # Include IPv6 gateway for static route
@@ -1664,7 +1686,7 @@ class BGPHandler:
                         # Call BGP cleanup endpoint to remove BGP configuration
                         response = requests.post(
                             f"{self.server_url}/api/bgp/cleanup",
-                            json={"device_id": device_id},
+                            json={"device_id": device_id}, 
                             timeout=30,
                         )
                         
@@ -1694,8 +1716,6 @@ class BGPHandler:
                     except Exception as e:
                         results["removal_failed_devices"].append(f"{device_name}: {str(e)}")
                         print(f"❌ Error removing BGP for {device_name}: {str(e)}")
-                
-                self.finished.emit(results)
                 
                 # Emit results when done
                 self.finished.emit(results)

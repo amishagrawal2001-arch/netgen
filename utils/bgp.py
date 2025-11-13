@@ -1040,8 +1040,10 @@ def configure_bgp_for_device(device_id: str, bgp_config: Dict, ipv4: str = None,
         container = frr_manager.client.containers.get(container_name)
         
         # Get router-id (must be loopback IPv4)
-        # First, try to get loopback IPv4 from database
+        # First, try to get loopback IPv4 and interface IPv4 from database
         loopback_ipv4 = None
+        device_ipv4 = None
+        device_ipv6 = None
         try:
             from utils.device_database import DeviceDatabase
             device_db = DeviceDatabase()
@@ -1050,8 +1052,19 @@ def configure_bgp_for_device(device_id: str, bgp_config: Dict, ipv4: str = None,
                 loopback_ipv4 = device_data.get('loopback_ipv4')
                 if loopback_ipv4 and loopback_ipv4.strip():
                     loopback_ipv4 = loopback_ipv4.strip().split('/')[0]
+                # Also get interface IPv4/IPv6 from database if not provided
+                if not ipv4:
+                    device_ipv4 = device_data.get('ipv4_address', '')
+                    if device_ipv4:
+                        device_ipv4_mask = device_data.get('ipv4_mask', '24')
+                        ipv4 = f"{device_ipv4}/{device_ipv4_mask}" if device_ipv4_mask else device_ipv4
+                if not ipv6:
+                    device_ipv6 = device_data.get('ipv6_address', '')
+                    if device_ipv6:
+                        device_ipv6_mask = device_data.get('ipv6_mask', '64')
+                        ipv6 = f"{device_ipv6}/{device_ipv6_mask}" if device_ipv6_mask else device_ipv6
         except Exception as e:
-            logging.warning(f"[BGP] Could not retrieve loopback IPv4 from database: {e}")
+            logging.warning(f"[BGP] Could not retrieve device data from database: {e}")
         
         # Router ID must be loopback IPv4
         if loopback_ipv4:
@@ -1085,7 +1098,16 @@ def configure_bgp_for_device(device_id: str, bgp_config: Dict, ipv4: str = None,
         
         # Configure IPv4 BGP if enabled
         neighbor_ipv4 = bgp_config.get('bgp_neighbor_ipv4')
-        update_source_ipv4 = bgp_config.get('bgp_update_source_ipv4', ipv4.split('/')[0] if ipv4 else None)
+        # Get update_source_ipv4 from config, or derive from ipv4 parameter (which may have been retrieved from database)
+        update_source_ipv4 = bgp_config.get('bgp_update_source_ipv4')
+        if not update_source_ipv4 and ipv4:
+            update_source_ipv4 = ipv4.split('/')[0]
+        
+        # Log IPv4 BGP configuration attempt
+        if neighbor_ipv4:
+            logging.info(f"[BGP] IPv4 BGP neighbor: {neighbor_ipv4}, update_source_ipv4: {update_source_ipv4}, ipv4 parameter: {ipv4}")
+            if not update_source_ipv4:
+                logging.warning(f"[BGP] Cannot configure IPv4 BGP for {device_id}: update_source_ipv4 is None (neighbor={neighbor_ipv4}, ipv4={ipv4})")
         
         if neighbor_ipv4 and update_source_ipv4:
             logging.info(f"[BGP] Configuring IPv4 BGP neighbor {neighbor_ipv4} with update-source {update_source_ipv4}")
@@ -1097,7 +1119,16 @@ def configure_bgp_for_device(device_id: str, bgp_config: Dict, ipv4: str = None,
         
         # Configure IPv6 BGP if enabled
         neighbor_ipv6 = bgp_config.get('bgp_neighbor_ipv6')
-        update_source_ipv6 = bgp_config.get('bgp_update_source_ipv6', ipv6.split('/')[0] if ipv6 else None)
+        # Get update_source_ipv6 from config, or derive from ipv6 parameter (which may have been retrieved from database)
+        update_source_ipv6 = bgp_config.get('bgp_update_source_ipv6')
+        if not update_source_ipv6 and ipv6:
+            update_source_ipv6 = ipv6.split('/')[0]
+        
+        # Log IPv6 BGP configuration attempt
+        if neighbor_ipv6:
+            logging.info(f"[BGP] IPv6 BGP neighbor: {neighbor_ipv6}, update_source_ipv6: {update_source_ipv6}, ipv6 parameter: {ipv6}")
+            if not update_source_ipv6:
+                logging.warning(f"[BGP] Cannot configure IPv6 BGP for {device_id}: update_source_ipv6 is None (neighbor={neighbor_ipv6}, ipv6={ipv6})")
         
         if neighbor_ipv6 and update_source_ipv6:
             logging.info(f"[BGP] Configuring IPv6 BGP neighbor {neighbor_ipv6} with update-source {update_source_ipv6}")

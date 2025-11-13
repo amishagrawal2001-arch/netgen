@@ -136,7 +136,7 @@ class OSPFStatusMonitor:
                         logger.info(f"[OSPF MONITOR] Got OSPF status for device {device.get('device_id', 'unknown')}: {ospf_status is not None}")
                         
                         if ospf_status:
-                            logger.info(f"[OSPF MONITOR] OSPF status data: {ospf_status}")
+                            logger.debug(f"[OSPF MONITOR] OSPF status data: {ospf_status}")
                             logger.info(f"[OSPF MONITOR] Calling _update_device_ospf_status for device {device.get('device_id', 'unknown')}")
                             self._update_device_ospf_status(device["device_id"], ospf_status)
                             logger.info(f"[OSPF MONITOR] Completed _update_device_ospf_status for device {device.get('device_id', 'unknown')}")
@@ -212,7 +212,7 @@ class OSPFStatusMonitor:
                         logger.warning(f"[OSPF MONITOR] Error parsing manual override time: {e}")
             
             logger.info(f"[OSPF MONITOR] Updating OSPF status for device {device_id}")
-            logger.info(f"[OSPF MONITOR] OSPF status data: {ospf_status}")
+            logger.debug(f"[OSPF MONITOR] OSPF status data: {ospf_status}")
             
             # Prepare OSPF status data
             ospf_established = ospf_status.get('ospf_established', False)

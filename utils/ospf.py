@@ -224,6 +224,9 @@ def configure_ospf_neighbor(
         from utils.device_database import DeviceDatabase
         device_db = DeviceDatabase()
         device_data = device_db.get_device(device_id)
+        dhcp_mode = ""
+        if device_data:
+            dhcp_mode = (device_data.get("dhcp_mode") or "").lower()
         
         # Default to True for ipv4_enabled if IPv4 address exists, otherwise use config value
         ipv4_enabled = ospf_config.get("ipv4_enabled")
@@ -235,6 +238,8 @@ def configure_ospf_neighbor(
                 ipv4_enabled = True
             else:
                 ipv4_enabled = False
+        if dhcp_mode == "client":
+            ipv4_enabled = True
         # Default to False for ipv6_enabled if IPv6 address exists, otherwise use config value
         ipv6_enabled = ospf_config.get("ipv6_enabled")
         if ipv6_enabled is None:
@@ -281,7 +286,10 @@ def configure_ospf_neighbor(
             logging.info(f"[OSPF CONFIGURE] Using router-id from config: {router_id}")
         else:
             # Fallback to interface IPv4 if loopback not available
-            if device_data and device_data.get("ipv4_address"):
+            if dhcp_mode == "client":
+                router_id = ""
+                logging.info(f"[OSPF CONFIGURE] DHCP client device {device_id}: skipping router-id configuration")
+            elif device_data and device_data.get("ipv4_address"):
                 router_id = device_data["ipv4_address"].split('/')[0]
                 logging.warning(f"[OSPF CONFIGURE] Loopback IPv4 not found, using interface IPv4 {router_id} as router-id (fallback)")
             elif ipv4_payload_addr:
@@ -313,8 +321,12 @@ def configure_ospf_neighbor(
                 logging.warning(f"[OSPF CONFIGURE] Failed to calculate IPv4 network from payload: {e}")
                 ipv4_network = "192.168.0.0/24"
         else:
-            logging.warning(f"[OSPF CONFIGURE] No device data or IPv4 address found, using fallback network")
-            ipv4_network = "192.168.0.0/24"  # Fallback to default
+            if dhcp_mode == "client":
+                logging.info(f"[OSPF CONFIGURE] DHCP client device {device_id}: deferring IPv4 network statement until lease is acquired")
+                ipv4_network = ""
+            else:
+                logging.warning(f"[OSPF CONFIGURE] No device data or IPv4 address found, using fallback network")
+                ipv4_network = "192.168.0.0/24"  # Fallback to default
         
         # Build OSPF configuration commands
         vtysh_commands = ["configure terminal"]
@@ -428,7 +440,10 @@ def configure_ospf_neighbor(
             ])
             
             # Set router ID (must be loopback IPv4)
-            vtysh_commands.append(f" ospf router-id {router_id}")
+            if router_id:
+                vtysh_commands.append(f" ospf router-id {router_id}")
+            else:
+                vtysh_commands.append(" no ospf router-id")
             
             # Configure graceful restart for IPv4 if enabled
             if graceful_restart_ipv4:
@@ -441,11 +456,7 @@ def configure_ospf_neighbor(
                     "exit"
                 ])
             else:
-                # Fallback if network calculation failed
-                vtysh_commands.extend([
-                    f" network 192.168.0.0/24 area {area_id_ipv4}",
-                    "exit"
-                ])
+                vtysh_commands.append(" exit")
             
             # Configure interface OSPF settings
             # Note: Interface IP addresses (IPv4/IPv6) are configured via frr.conf.template
@@ -486,7 +497,10 @@ def configure_ospf_neighbor(
             ])
             
             # Set router ID (must be loopback IPv4)
-            vtysh_commands.append(f" ospf6 router-id {router_id}")
+            if router_id:
+                vtysh_commands.append(f" ospf6 router-id {router_id}")
+            else:
+                vtysh_commands.append(" no ospf6 router-id")
             
             # Configure graceful restart for IPv6 if enabled
             if graceful_restart_ipv6:
@@ -1098,7 +1112,7 @@ def get_ospf_status(device_id: str) -> Optional[Dict[str, Any]]:
         # Get OSPF summary for IPv6
         result_ipv6_summary = container.exec_run("vtysh -c 'show ipv6 ospf6'")
         ospf_ipv6_summary = result_ipv6_summary.output.decode() if result_ipv6_summary.exit_code == 0 else ""
-        logging.info(f"[OSPF STATUS] IPv6 summary exit_code: {result_ipv6_summary.exit_code}, output length: {len(ospf_ipv6_summary)}")
+        logging.debug(f"[OSPF STATUS] IPv6 summary exit_code: {result_ipv6_summary.exit_code}, output length: {len(ospf_ipv6_summary)}")
         
         # Extract uptime information
         ospf_ipv4_uptime = None
@@ -1110,17 +1124,23 @@ def get_ospf_status(device_id: str) -> Optional[Dict[str, Any]]:
             ipv6_uptime_match = re.search(r'Running\s+(\d+:\d+:\d+)', ospf_ipv6_summary)
             if ipv6_uptime_match:
                 ospf_ipv6_uptime = ipv6_uptime_match.group(1)
-                logging.info(f"[OSPF STATUS] IPv6 OSPF uptime: {ospf_ipv6_uptime}")
+                logging.debug(f"[OSPF STATUS] IPv6 OSPF uptime: {ospf_ipv6_uptime}")
         
         # Extract IPv4 OSPF uptime from /proc filesystem
         try:
             # Try to find ospfd process by scanning /proc directories
             result_proc = container.exec_run("ls /proc")
-            logging.info(f"[OSPF STATUS] Proc ls exit_code: {result_proc.exit_code}")
-            logging.info(f"[OSPF STATUS] Proc ls output: {result_proc.output.decode()}")
+            proc_exit_code = result_proc.exit_code
+            proc_output = result_proc.output.decode()
+            logging.debug(f"[OSPF STATUS] Proc ls exit_code: {proc_exit_code}")
+            if proc_output:
+                logging.debug(
+                    "[OSPF STATUS] Proc ls output (truncated): %s",
+                    proc_output[:256] + ("..." if len(proc_output) > 256 else ""),
+                )
             
-            if result_proc.exit_code == 0:
-                proc_dirs = result_proc.output.decode().strip().split('\n')
+            if proc_exit_code == 0:
+                proc_dirs = proc_output.strip().split('\n')
                 ospfd_pid = None
                 
                 # Look for numeric directories (PIDs) and check their cmdline
@@ -1132,7 +1152,7 @@ def get_ospf_status(device_id: str) -> Optional[Dict[str, Any]]:
                                 cmdline = result_cmdline.output.decode().strip()
                                 if 'ospfd' in cmdline:
                                     ospfd_pid = proc_dir
-                                    logging.info(f"[OSPF STATUS] Found ospfd PID: {ospfd_pid}")
+                                    logging.debug(f"[OSPF STATUS] Found ospfd PID: {ospfd_pid}")
                                     break
                         except:
                             continue

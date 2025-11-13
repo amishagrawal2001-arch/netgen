@@ -9,6 +9,14 @@ echo "Starting FRR for device: ${DEVICE_NAME:-unknown}"
 if [ -f "/etc/frr/frr.conf.template" ]; then
     echo "Generating FRR configuration..."
     
+    # Normalize DHCP mode hint
+    DHCP_MODE_NORMALIZED=$(echo "${DHCP_MODE:-}" | tr '[:upper:]' '[:lower:]')
+    if [ "${DHCP_MODE_NORMALIZED}" = "client" ]; then
+        IS_DHCP_CLIENT=1
+    else
+        IS_DHCP_CLIENT=0
+    fi
+    
     # Replace template variables
     # Handle IPv6 address line conditionally
     if [ -n "${IPV6_ADDRESS}" ] && [ -n "${IPV6_MASK}" ]; then
@@ -18,17 +26,69 @@ if [ -f "/etc/frr/frr.conf.template" ]; then
     fi
     
     # Handle loopback IPs conditionally
-    LOOPBACK_IPV4="${LOOPBACK_IPV4:-${ROUTER_ID:-192.168.0.2}}"
-    if [ -n "${LOOPBACK_IPV6}" ]; then
-        LOOPBACK_IPV6_LINE="${LOOPBACK_IPV6}/128"
+    if [ "${IS_DHCP_CLIENT}" -eq 1 ]; then
+        LOOPBACK_IPV4_LINE=""
     else
-        LOOPBACK_IPV6_LINE="::1/128"
+        LOOPBACK_IPV4_VALUE="${LOOPBACK_IPV4:-${ROUTER_ID:-1.1.1.1}}"
+        LOOPBACK_IPV4_LINE=" ip address ${LOOPBACK_IPV4_VALUE}/32"
+    fi
+    if [ -n "${LOOPBACK_IPV6}" ] && [ "${IS_DHCP_CLIENT}" -ne 1 ]; then
+        LOOPBACK_IPV6_LINE=" ipv6 address ${LOOPBACK_IPV6}/128"
+    else
+        LOOPBACK_IPV6_LINE=""
+    fi
+    
+    # Interface IPv4 configuration (optional)
+    if [ -n "${IP_ADDRESS}" ] && [ -n "${IP_MASK}" ]; then
+        INTERFACE_IPV4_LINE=" ip address ${IP_ADDRESS}/${IP_MASK}"
+    else
+        INTERFACE_IPV4_LINE=""
+    fi
+    
+    # BGP / OSPF network statements (optional)
+    if [ -n "${NETWORK}" ] && [ -n "${NETMASK}" ]; then
+        BGP_NETWORK_LINE=" network ${NETWORK}/${NETMASK}"
+        OSPF_NETWORK_LINE=" network ${NETWORK}/${NETMASK} area 0.0.0.0"
+    else
+        BGP_NETWORK_LINE=""
+        OSPF_NETWORK_LINE=""
+    fi
+    if [ "${IS_DHCP_CLIENT}" -ne 1 ]; then
+        if [ -n "${LOOPBACK_IPV4_VALUE:-}" ]; then
+            BGP_LOOPBACK_NETWORK_LINE=" network ${LOOPBACK_IPV4_VALUE}/32"
+        elif [ -n "${LOOPBACK_IPV4:-}" ]; then
+            BGP_LOOPBACK_NETWORK_LINE=" network ${LOOPBACK_IPV4}/32"
+        else
+            BGP_LOOPBACK_NETWORK_LINE=""
+        fi
+    else
+        BGP_LOOPBACK_NETWORK_LINE=""
+    fi
+    
+    if [ "${IS_DHCP_CLIENT}" -ne 1 ]; then
+        ROUTER_ID_VALUE="${ROUTER_ID:-1.1.1.1}"
+        GLOBAL_ROUTER_ID_LINE="ip router-id ${ROUTER_ID_VALUE}"
+        BGP_ROUTER_ID_LINE=" bgp router-id ${ROUTER_ID_VALUE}"
+        OSPF_ROUTER_ID_LINE=" ospf router-id ${ROUTER_ID_VALUE}"
+        OSPF6_ROUTER_ID_LINE=" ospf6 router-id ${ROUTER_ID_VALUE}"
+        MPLS_ROUTER_ID_LINE=" router-id ${ROUTER_ID_VALUE}"
+        MPLS_TRANSPORT_LINE=" discovery transport-address ${ROUTER_ID_VALUE}"
+    else
+        ROUTER_ID_VALUE="${ROUTER_ID:-}"
+        GLOBAL_ROUTER_ID_LINE=""
+        BGP_ROUTER_ID_LINE=""
+        OSPF_ROUTER_ID_LINE=""
+        OSPF6_ROUTER_ID_LINE=""
+        MPLS_ROUTER_ID_LINE=""
+        MPLS_TRANSPORT_LINE=""
     fi
     
     # Convert router ID to dotted format for IS-IS NET (e.g., 192.168.0.2 -> 192.168.000.002)
-    ROUTER_ID_DOTTED="${ROUTER_ID:-192.168.0.2}"
-    # Replace dots with padded octets
-    ROUTER_ID_DOTTED=$(echo "${ROUTER_ID_DOTTED}" | awk -F. '{printf "%04d.%04d.%04d.%04d", $1, $2, $3, $4}')
+    if [ -n "${ROUTER_ID_VALUE}" ]; then
+        ROUTER_ID_DOTTED=$(echo "${ROUTER_ID_VALUE}" | awk -F. '{printf "%04d.%04d.%04d.%04d", $1, $2, $3, $4}')
+    else
+        ROUTER_ID_DOTTED="0000.0000.0000.0001"
+    fi
     
     # Handle BGP neighbor config lines (empty by default, will be added dynamically via vtysh)
     BGP_NEIGHBOR_LINES="${BGP_NEIGHBOR_CONFIG_LINES:-}"
@@ -38,17 +98,23 @@ if [ -f "/etc/frr/frr.conf.template" ]; then
     
     sed -e "s/{{DEVICE_NAME}}/${DEVICE_NAME:-frr-device}/g" \
         -e "s/{{LOCAL_ASN}}/${LOCAL_ASN:-65001}/g" \
-        -e "s/{{ROUTER_ID}}/${ROUTER_ID:-192.168.0.2}/g" \
+        -e "s/{{ROUTER_ID}}/${ROUTER_ID_VALUE:-}/g" \
         -e "s/{{ROUTER_ID_REPLACED_WITH_DOTTED_FORMAT}}/${ROUTER_ID_DOTTED}/g" \
-        -e "s/{{NETWORK}}/${NETWORK:-192.168.0.0}/g" \
-        -e "s/{{NETMASK}}/${NETMASK:-24}/g" \
         -e "s/{{INTERFACE}}/${INTERFACE:-eth0}/g" \
-        -e "s/{{IP_ADDRESS}}/${IP_ADDRESS:-192.168.0.2}/g" \
-        -e "s/{{IP_MASK}}/${IP_MASK:-24}/g" \
-        -e "s/{{LOOPBACK_IPV4}}/${LOOPBACK_IPV4}/g" \
-        -e "s/{{LOOPBACK_IPV6}}/${LOOPBACK_IPV6_LINE}/g" \
+        -e "s|{{GLOBAL_ROUTER_ID_LINE}}|${GLOBAL_ROUTER_ID_LINE}|g" \
+        -e "s|{{LOOPBACK_IPV4_LINE}}|${LOOPBACK_IPV4_LINE}|g" \
+        -e "s|{{LOOPBACK_IPV6_LINE}}|${LOOPBACK_IPV6_LINE}|g" \
+        -e "s|{{INTERFACE_IPV4_LINE}}|${INTERFACE_IPV4_LINE}|g" \
         -e "s|{{IPV6_ADDRESS_LINE}}|${IPV6_LINE}|g" \
         -e "s|{{BGP_NEIGHBOR_CONFIG_LINES}}|${BGP_NEIGHBOR_LINES}|g" \
+        -e "s|{{BGP_NETWORK_LINE}}|${BGP_NETWORK_LINE}|g" \
+        -e "s|{{BGP_LOOPBACK_NETWORK_LINE}}|${BGP_LOOPBACK_NETWORK_LINE}|g" \
+        -e "s|{{OSPF_NETWORK_LINE}}|${OSPF_NETWORK_LINE}|g" \
+        -e "s|{{BGP_ROUTER_ID_LINE}}|${BGP_ROUTER_ID_LINE}|g" \
+        -e "s|{{OSPF_ROUTER_ID_LINE}}|${OSPF_ROUTER_ID_LINE}|g" \
+        -e "s|{{OSPF6_ROUTER_ID_LINE}}|${OSPF6_ROUTER_ID_LINE}|g" \
+        -e "s|{{MPLS_ROUTER_ID_LINE}}|${MPLS_ROUTER_ID_LINE}|g" \
+        -e "s|{{MPLS_TRANSPORT_LINE}}|${MPLS_TRANSPORT_LINE}|g" \
         -e "s|{{VXLAN_CONFIG_LINE}}|${VXLAN_LINES}|g" \
         /etc/frr/frr.conf.template > /etc/frr/frr.conf
     

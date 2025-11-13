@@ -405,6 +405,7 @@ class AddDeviceDialog(QDialog):
         self.scroll_layout.addWidget(ip_group)
         self.scroll_layout.addWidget(protocol_group)
         self.scroll_layout.addWidget(increment_group)
+        
 
     def _create_protocol_config_widgets(self):
         """Create protocol-specific configuration widgets."""
@@ -694,7 +695,7 @@ class AddDeviceDialog(QDialog):
             return
         self._suppress_protocol_change = True
         try:
-        # Hide all protocol config widgets and disable all fields
+            # Hide all protocol config widgets and disable all fields
             self.bgp_config_widget.setVisible(False)
             self.ospf_config_widget.setVisible(False)
             self.isis_config_widget.setVisible(False)
@@ -947,7 +948,7 @@ class AddDeviceDialog(QDialog):
             if hasattr(self, "dhcp_mode_combo"):
                 dhcp_mode_text = self.dhcp_mode_combo.currentText().strip().lower()
             dhcp_mode_text = dhcp_mode_text or "client"
-
+        
         # Create config for each enabled protocol (can have both BGP, OSPF, and ISIS)
         if self.isis_enable_checkbox.isChecked():
             # Construct VLAN interface name for ISIS configuration (similar to OSPF)
@@ -1097,6 +1098,8 @@ class AddDeviceDialog(QDialog):
             self.ipv6_hextet_combo.currentIndex(),   # 0=8th, 1=7th, ..., 7=1st
             self.mac_byte_combo.currentIndex(),      # 0=6th, 1=5th, ..., 5=1st
             self.gateway_octet_combo.currentIndex(),  # 0=4th, 1=3rd, 2=2nd, 3=1st
+            False,  # incr_dhcp_pool - no longer supported
+            2,  # dhcp_pool_octet_index - default to 2nd octet (not used when incr_dhcp_pool is False)
             self.increment_checkbox_loopback.isChecked(),  # Loopback increment checkbox
             self.loopback_ipv4_octet_combo.currentIndex(),  # 0=4th, 1=3rd, 2=2nd, 3=1st
             self.loopback_ipv6_hextet_combo.currentIndex(),  # 0=8th, 1=7th, ..., 7=1st

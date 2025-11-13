@@ -1,0 +1,8 @@
+[
+  {
+    "directory": "/root/SURAJ/tx_worker/build",
+    "command": "cc -Itx_worker.p -I. -I.. -I/usr/include/dpdk -I/usr/include/libnl3 -I/usr/include/dpdk/../x86_64-linux-gnu/dpdk -fdiagnostics-color=always -D_FILE_OFFSET_BITS=64 -Wall -Winvalid-pch -std=c11 -g -include rte_config.h -march=corei7 -MD -MQ tx_worker.p/tx_worker.c.o -MF tx_worker.p/tx_worker.c.o.d -o tx_worker.p/tx_worker.c.o -c ../tx_worker.c",
+    "file": "../tx_worker.c",
+    "output": "tx_worker.p/tx_worker.c.o"
+  }
+]

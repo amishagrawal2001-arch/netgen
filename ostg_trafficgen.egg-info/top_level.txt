@@ -1,3 +1,4 @@
+build_env
 build_image
 capture_client
 config
