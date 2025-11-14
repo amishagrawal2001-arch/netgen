@@ -5,6 +5,7 @@ DHCP client/server lifecycle helpers for OSTG devices.
 import json
 import logging
 import os
+import shlex
 import subprocess
 import time
 from datetime import datetime, timezone
@@ -53,6 +54,23 @@ def _ensure_paths(container=None) -> None:
                 os.makedirs(path, exist_ok=True)
             except Exception as exc:
                 logger.warning("[DHCP] Failed to ensure path %s: %s", path, exc)
+
+
+def _command_exists(command: str, container=None) -> bool:
+    """Return True if the given command exists (optionally inside container)."""
+    if not command:
+        return False
+    try:
+        quoted = shlex.quote(command)
+        result = _run_command(
+            ["/bin/sh", "-c", f"command -v {quoted} >/dev/null 2>&1"],
+            timeout=5,
+            container=container,
+        )
+        return result.returncode == 0
+    except Exception as exc:
+        logger.debug("[DHCP] Command check failed for %s: %s", command, exc)
+        return False
 
 
 def _derive_networks_from_pool(pool_start: str, pool_end: str) -> Optional[list]:
@@ -116,6 +134,17 @@ def _normalize_gateway_tokens(route_values) -> Optional[list]:
         tokens.append(str(route_values).strip())
     normalized = [token for token in tokens if token]
     return normalized or None
+
+
+def _truthy(value) -> bool:
+    """Return True if value represents an affirmative boolean."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on", "enabled"}
+    return False
 
 
 def _normalize_additional_pools(raw_pools) -> list:
@@ -258,6 +287,36 @@ def _parse_ipv4(interface: str, container=None) -> Optional[Dict[str, str]]:
     return None
 
 
+def _parse_ipv6(interface: str, container=None) -> Optional[list]:
+    """Return list of IPv6 address dictionaries present on the interface."""
+    try:
+        result = _run_command(
+            ["ip", "-o", "-6", "addr", "show", "dev", interface],
+            timeout=5,
+            container=container,
+        )
+        output = result.stdout.strip()
+        if not output:
+            return None
+        entries = []
+        for line in output.splitlines():
+            parts = line.split()
+            if "inet6" not in parts:
+                continue
+            idx = parts.index("inet6")
+            if idx + 1 >= len(parts):
+                continue
+            cidr = parts[idx + 1]
+            if "/" not in cidr:
+                continue
+            ip, prefix = cidr.split("/", 1)
+            entries.append({"ip": ip, "prefix": prefix})
+        return entries or None
+    except Exception as exc:
+        logger.debug("[DHCP] Failed to parse IPv6 for %s: %s", interface, exc)
+    return None
+
+
 def _parse_gateway(interface: str, container=None) -> Optional[str]:
     """Return default gateway for interface if present."""
     try:
@@ -271,6 +330,62 @@ def _parse_gateway(interface: str, container=None) -> Optional[str]:
     except Exception as exc:
         logger.debug("[DHCP] Failed to parse gateway for %s: %s", interface, exc)
     return None
+
+
+def _ensure_ipv6_address(interface: str, address: str, prefix: str, container=None) -> bool:
+    """Ensure the interface has the specified IPv6 address configured."""
+    if not interface or not address or prefix is None:
+        return False
+    existing = _parse_ipv6(interface, container=container) or []
+    for entry in existing:
+        if entry.get("ip") == address and str(entry.get("prefix")) == str(prefix):
+            return True
+    try:
+        result = _run_command(
+            ["ip", "-6", "addr", "add", f"{address}/{prefix}", "dev", interface],
+            timeout=5,
+            container=container,
+        )
+        if result.returncode == 0:
+            logger.info("[DHCP] Added IPv6 address %s/%s to %s", address, prefix, interface)
+            return True
+        logger.warning(
+            "[DHCP] Failed to add IPv6 address %s/%s to %s: %s",
+            address,
+            prefix,
+            interface,
+            result.stderr,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[DHCP] Exception while adding IPv6 address %s/%s to %s: %s",
+            address,
+            prefix,
+            interface,
+            exc,
+        )
+    return False
+
+
+def _remove_ipv6_address(interface: str, address: str, prefix: str, container=None) -> None:
+    """Remove an IPv6 address from an interface."""
+    if not interface or not address or prefix is None:
+        return
+    try:
+        _run_command(
+            ["ip", "-6", "addr", "del", f"{address}/{prefix}", "dev", interface],
+            timeout=5,
+            container=container,
+        )
+        logger.info("[DHCP] Removed IPv6 address %s/%s from %s", address, prefix, interface)
+    except Exception as exc:
+        logger.debug(
+            "[DHCP] Failed to remove IPv6 address %s/%s from %s: %s",
+            address,
+            prefix,
+            interface,
+            exc,
+        )
 
 
 def _verify_interface_exists(interface: str, container=None) -> bool:
@@ -383,6 +498,46 @@ def _flush_ipv4(interface: str, container=None) -> None:
         logger.debug("[DHCP] Flushed IPv4 addresses on %s", interface)
     except Exception as exc:
         logger.debug("[DHCP] Failed to flush IPv4 addresses on %s: %s", interface, exc)
+
+
+def _flush_ipv6(interface: str, container=None) -> None:
+    """Remove all non-link-local IPv6 addresses from an interface."""
+    try:
+        # Get all IPv6 addresses on the interface
+        result = _run_command(
+            ["ip", "-o", "-6", "addr", "show", "dev", interface],
+            timeout=5,
+            container=container,
+        )
+        output = result.stdout.strip()
+        if output:
+            for line in output.splitlines():
+                parts = line.split()
+                if "inet6" not in parts:
+                    continue
+                idx = parts.index("inet6")
+                if idx + 1 >= len(parts):
+                    continue
+                cidr = parts[idx + 1]
+                if "/" not in cidr:
+                    continue
+                ip, prefix = cidr.split("/", 1)
+                # Skip link-local addresses (fe80::/10)
+                if ip.startswith("fe80:"):
+                    continue
+                # Remove the address
+                try:
+                    _run_command(
+                        ["ip", "-6", "addr", "del", f"{ip}/{prefix}", "dev", interface],
+                        timeout=5,
+                        container=container,
+                    )
+                    logger.debug("[DHCP] Removed IPv6 address %s/%s from %s", ip, prefix, interface)
+                except Exception as del_exc:
+                    logger.debug("[DHCP] Failed to remove IPv6 address %s/%s: %s", ip, prefix, del_exc)
+        logger.debug("[DHCP] Flushed non-link-local IPv6 addresses on %s", interface)
+    except Exception as exc:
+        logger.debug("[DHCP] Failed to flush IPv6 addresses on %s: %s", interface, exc)
 
 
 def _update_device_db(device_db, device_id: str, payload: Dict):
@@ -554,102 +709,168 @@ def start_dhcp_client(
         return {"success": False, "error": error_msg}
     
     _ensure_paths(container=container)
-    pidfile = os.path.join(DHCLIENT_PID_DIR, f"dhclient-{interface}.pid")
-    leasefile = os.path.join(DHCLIENT_LEASE_DIR, f"dhclient-{interface}.leases")
+    pidfile_v4 = os.path.join(DHCLIENT_PID_DIR, f"dhclient-{interface}-ipv4.pid")
+    leasefile_v4 = os.path.join(DHCLIENT_LEASE_DIR, f"dhclient-{interface}-ipv4.leases")
+    pidfile_v6 = os.path.join(DHCLIENT_PID_DIR, f"dhclient-{interface}-ipv6.pid")
+    leasefile_v6 = os.path.join(DHCLIENT_LEASE_DIR, f"dhcp6c-{interface}.leases")
 
-    # Release any existing lease first
-    try:
-        _run_command(
-            ["dhclient", "-4", "-r", "-pf", pidfile, interface],
-            timeout=5,
-            container=container,
-        )
-    except Exception as exc:
-        logger.debug("[DHCP] dhclient release error (safe to ignore): %s", exc)
+    ipv4_enabled = _truthy(dhcp_config.get("ipv4_enabled", True)) if dhcp_config else True
+    ipv6_enabled = _truthy(dhcp_config.get("ipv6_enabled", True)) if dhcp_config else True
 
-    cmd = ["dhclient", "-4", "-nw", "-pf", pidfile, "-lf", leasefile]
-    # Optional timeout via configuration
+    ipv4_result = {"success": False, "error": "IPv4 skipped"}
+    ipv6_result = {"success": False, "error": "IPv6 skipped"}
+
     lease_timeout = int(dhcp_config.get("timeout", timeout)) if dhcp_config else timeout
-    # dhclient uses seconds when passed via -timeout but only newer versions support it.
-    if dhcp_config and "timeout" in dhcp_config:
-        cmd.extend(["-timeout", str(lease_timeout)])
-    cmd.append(interface)
 
-    result = _run_command(cmd, timeout=10, container=container)
-    if result.returncode != 0:
-        logger.error("[DHCP] dhclient failed: %s", result.stderr)
-        _update_device_db(
-            device_db,
-            device_id,
-            {
-                "dhcp_mode": "client",
-                "dhcp_state": "Failed",
-                "dhcp_running": False,
-                "last_dhcp_check": datetime.now(timezone.utc).isoformat(),
-            },
-        )
-        return {"success": False, "error": result.stderr.strip()}
-
-    # Poll for IPv4 assignment
-    ip_info = None
-    poll_seconds = lease_timeout if lease_timeout else timeout
-    deadline = time.time() + poll_seconds
-    while time.time() < deadline:
-        ip_info = _parse_ipv4(interface, container=container)
-        if ip_info:
-            break
-        time.sleep(1)
-
-    if not ip_info:
-        logger.error("[DHCP] Timed out waiting for lease on %s", interface)
-        # Attempt to release client
+    if ipv4_enabled:
         try:
             _run_command(
-                ["dhclient", "-4", "-r", "-pf", pidfile, interface],
+                ["dhclient", "-4", "-r", "-pf", pidfile_v4, interface],
                 timeout=5,
+                container=container,
             )
-        except Exception:
-            pass
-        _update_device_db(
-            device_db,
-            device_id,
-            {
-                "dhcp_mode": "client",
-                "dhcp_state": "Timeout",
-                "dhcp_running": False,
-                "dhcp_lease_subnet": "",
-                "last_dhcp_check": datetime.now(timezone.utc).isoformat(),
-            },
-        )
-        return {"success": False, "error": "Lease timeout"}
+        except Exception as exc:
+            logger.debug("[DHCP] dhclient release error (safe to ignore): %s", exc)
 
-    gateway = _parse_gateway(interface, container=container) or ""
-    lease_subnet = ""
-    try:
-        ip_val = ip_info.get("ip")
-        mask_val = ip_info.get("mask")
-        if ip_val and mask_val:
-            lease_subnet = str(ipaddress.IPv4Interface(f"{ip_val}/{mask_val}").network)
-    except Exception as exc:
-        logger.debug("[DHCP] Failed to derive lease subnet for %s: %s", interface, exc)
-    lease_info = {
-        "dhcp_mode": "client",
-        "dhcp_state": "Leased",
-        "dhcp_running": True,
-        "dhcp_lease_ip": ip_info.get("ip", ""),
-        "dhcp_lease_mask": ip_info.get("mask", ""),
-        "dhcp_lease_gateway": gateway,
-        "dhcp_lease_server": "",
-        "dhcp_lease_expires": None,
-        "dhcp_lease_subnet": lease_subnet,
-        "last_dhcp_check": datetime.now(timezone.utc).isoformat(),
-        # Update primary addressing fields so UI sees live address
-        "ipv4_address": f"{ip_info.get('ip')}/{ip_info.get('mask')}",
-        "ipv4_mask": ip_info.get("mask"),
-        "ipv4_gateway": gateway,
-    }
-    _update_device_db(device_db, device_id, lease_info)
-    return {"success": True, "ip": ip_info.get("ip"), "mask": ip_info.get("mask"), "gateway": gateway}
+        cmd_v4 = ["dhclient", "-4", "-nw", "-pf", pidfile_v4, "-lf", leasefile_v4]
+        if dhcp_config and "timeout" in dhcp_config:
+            cmd_v4.extend(["-timeout", str(lease_timeout)])
+        cmd_v4.append(interface)
+
+        ipv4_exec = _run_command(cmd_v4, timeout=10, container=container)
+        if ipv4_exec.returncode != 0:
+            ipv4_result = {"success": False, "error": ipv4_exec.stderr.strip()}
+        else:
+            ip_info = None
+            deadline = time.time() + lease_timeout
+            while time.time() < deadline:
+                ip_info = _parse_ipv4(interface, container=container)
+                if ip_info:
+                    break
+                time.sleep(1)
+            if not ip_info:
+                ipv4_result = {"success": False, "error": "Lease timeout"}
+            else:
+                gateway = _parse_gateway(interface, container=container) or ""
+                lease_subnet = ""
+                try:
+                    ip_val = ip_info.get("ip")
+                    mask_val = ip_info.get("mask")
+                    if ip_val and mask_val:
+                        lease_subnet = str(ipaddress.IPv4Interface(f"{ip_val}/{mask_val}").network)
+                except Exception as exc:
+                    logger.debug("[DHCP] Failed to derive lease subnet for %s: %s", interface, exc)
+                lease_info = {
+                    "dhcp_mode": "client",
+                    "dhcp_state": "Leased",
+                    "dhcp_running": True,
+                    "dhcp_lease_ip": ip_info.get("ip", ""),
+                    "dhcp_lease_mask": ip_info.get("mask", ""),
+                    "dhcp_lease_gateway": gateway,
+                    "dhcp_lease_server": "",
+                    "dhcp_lease_expires": None,
+                    "dhcp_lease_subnet": lease_subnet,
+                    "last_dhcp_check": datetime.now(timezone.utc).isoformat(),
+                    "ipv4_address": f"{ip_info.get('ip')}/{ip_info.get('mask')}",
+                    "ipv4_mask": ip_info.get("mask"),
+                    "ipv4_gateway": gateway,
+                }
+                _update_device_db(device_db, device_id, lease_info)
+                ipv4_result = {"success": True, "ip": ip_info.get("ip"), "mask": ip_info.get("mask"), "gateway": gateway}
+
+    if ipv6_enabled:
+        # Flush existing IPv6 addresses (except link-local) to ensure DHCP client actively requests a lease
+        _flush_ipv6(interface, container=container)
+
+        lease_deadline = time.time() + lease_timeout
+        addr6 = None
+
+        if _command_exists("dhcp6c", container=container):
+            # Use wide-DHCPv6 client (dhcp6c) for SLAAC/DHCPv6 PD support
+            dhcp6_conf = f"/etc/dhcp/dhcp6c-{interface}.conf"
+            dhcp6_cmd = ["dhcp6c", "-c", dhcp6_conf, "-p", pidfile_v6, interface]
+            # Write dhcp6c config file
+            try:
+                dhcp6_conf_content = (
+                    'interface {iface} {\n'
+                    '    send rapid-commit;\n'
+                    '    request domain-name-servers;\n'
+                    '    script "/etc/dhcp/dhcp6c-script";\n'
+                    '};\n'
+                    '\n'
+                    'id-assoc pd 0 {\n'
+                    '    prefix-interface {iface} {\n'
+                    '        sla-id 0;\n'
+                    '        sla-len 0;\n'
+                    '    };\n'
+                    '};\n'
+                ).format(iface=interface)
+                if container:
+                    _run_command(
+                        ["/bin/sh", "-c", f"cat <<'EOF' > {dhcp6_conf}\n{dhcp6_conf_content.strip()}\nEOF"],
+                        container=container,
+                        timeout=5,
+                    )
+                else:
+                    with open(dhcp6_conf, "w") as fh:
+                        fh.write(dhcp6_conf_content.strip() + "\n")
+            except Exception as exc:
+                logger.warning("[DHCP] Failed to write dhcp6c config for %s: %s", interface, exc)
+
+            try:
+                _run_command(["pkill", "-f", f"dhcp6c.*{interface}"], timeout=5, container=container)
+            except Exception:
+                pass
+
+            dhcp6_exec = _run_command(dhcp6_cmd, timeout=10, container=container)
+            if dhcp6_exec.returncode != 0:
+                ipv6_result = {"success": False, "error": dhcp6_exec.stderr.strip()}
+            else:
+                addr6 = _parse_ipv6(interface, container=container)
+        else:
+            logger.info("[DHCP] dhcp6c not found; falling back to dhclient -6 for %s", interface)
+            try:
+                _run_command(
+                    ["dhclient", "-6", "-r", "-pf", pidfile_v6, interface],
+                    timeout=5,
+                    container=container,
+                )
+            except Exception as exc:
+                logger.debug("[DHCP] dhclient -6 release error (safe to ignore): %s", exc)
+
+            cmd_v6 = ["dhclient", "-6", "-nw", "-pf", pidfile_v6, "-lf", leasefile_v6]
+            if dhcp_config and "timeout" in dhcp_config:
+                cmd_v6.extend(["-timeout", str(lease_timeout)])
+            cmd_v6.append(interface)
+
+            dhcp6_exec = _run_command(cmd_v6, timeout=10, container=container)
+            if dhcp6_exec.returncode != 0:
+                ipv6_result = {"success": False, "error": dhcp6_exec.stderr.strip()}
+            else:
+                while time.time() < lease_deadline:
+                    parsed = _parse_ipv6(interface, container=container)
+                    if parsed:
+                        addr6 = parsed
+                        break
+                    time.sleep(1)
+
+        if not addr6:
+            ipv6_result = {"success": False, "error": "IPv6 lease not observed"}
+        else:
+            ipv6_result = {"success": True, "addresses": addr6}
+
+    success = ipv4_result.get("success") or ipv6_result.get("success")
+    _update_device_db(
+        device_db,
+        device_id,
+        {
+            "dhcp_mode": "client",
+            "dhcp_state": "Leased" if success else "Failed",
+            "dhcp_running": success,
+            "last_dhcp_check": datetime.now(timezone.utc).isoformat(),
+        },
+    )
+    return {"success": success, "ipv4": ipv4_result, "ipv6": ipv6_result}
 
 
 def stop_dhcp_client(device_db, device_id: str, interface: str, container=None) -> Dict:
@@ -689,31 +910,87 @@ def start_dhcp_server(
     container=None,
 ) -> Dict:
     """Start a dnsmasq DHCP server bound to interface."""
-    # Verify interface exists before proceeding
     if not _verify_interface_exists(interface, container=container):
         error_msg = f"Interface {interface} not found in container/host. Cannot start DHCP server."
         logger.error(f"[DHCP] {error_msg}")
         return {"success": False, "error": error_msg}
-    
+
     _ensure_paths(container=container)
-    pool_start = dhcp_config.get("pool_start")
-    pool_end = dhcp_config.get("pool_end")
-    gateway = dhcp_config.get("gateway", "")
-    lease_hours = int(dhcp_config.get("lease_time", dhcp_config.get("lease_hours", 24)))
+
+    ipv4_enabled = _truthy(dhcp_config.get("ipv4_enabled", True))
+    ipv6_enabled = _truthy(dhcp_config.get("ipv6_enabled", False))
+
+    pool_start = dhcp_config.get("pool_start") if ipv4_enabled else None
+    pool_end = dhcp_config.get("pool_end") if ipv4_enabled else None
+    gateway = dhcp_config.get("gateway", "") if ipv4_enabled else ""
+
+    lease_hours_raw = dhcp_config.get("lease_time", dhcp_config.get("lease_hours", 24))
+    try:
+        lease_hours = int(lease_hours_raw)
+    except (TypeError, ValueError):
+        lease_hours = 24
     lease_seconds = max(60, lease_hours * 3600)
-    additional_pools = _normalize_additional_pools(dhcp_config.get("additional_pools"))
+
+    additional_pools = _normalize_additional_pools(
+        dhcp_config.get("additional_pools") if ipv4_enabled else []
+    )
     dhcp_config["additional_pools"] = additional_pools
 
-    if not pool_start or not pool_end:
-        if not additional_pools:
-            return {"success": False, "error": "Pool start/end required for DHCP server"}
+    ipv6_pool_start = str(
+        dhcp_config.get("ipv6_pool_start")
+        or dhcp_config.get("pool_start_v6")
+        or ""
+    ).strip()
+    ipv6_pool_end = str(
+        dhcp_config.get("ipv6_pool_end")
+        or dhcp_config.get("pool_end_v6")
+        or ""
+    ).strip()
+    ipv6_prefix = str(
+        dhcp_config.get("ipv6_prefix")
+        or dhcp_config.get("ipv6_prefix_length")
+        or dhcp_config.get("ipv6_prefix_len")
+        or ""
+    ).strip()
+    ipv6_server_ip = str(
+        dhcp_config.get("ipv6_server_ip")
+        or dhcp_config.get("ipv6_server")
+        or ""
+    ).strip()
+    ipv6_gateway = str(dhcp_config.get("ipv6_gateway") or "").strip()
+    ipv6_routes_raw = dhcp_config.get("ipv6_gateway_route") or dhcp_config.get("ipv6_gateway_routes")
+    ipv6_lease_raw = dhcp_config.get("ipv6_lease_time") or dhcp_config.get("lease_time_v6")
+    try:
+        ipv6_lease_seconds = int(ipv6_lease_raw) if ipv6_lease_raw is not None else lease_seconds
+    except (TypeError, ValueError):
+        ipv6_lease_seconds = lease_seconds
+    ipv6_lease_seconds = max(60, ipv6_lease_seconds)
+
+    if ipv4_enabled and not (pool_start and pool_end) and not additional_pools:
+        ipv4_enabled = False
+        logger.info("[DHCP] Disabling IPv4 DHCP for %s due to missing pool range", device_id)
+
+    if ipv6_enabled and (not ipv6_pool_start or not ipv6_pool_end or not ipv6_prefix):
+        logger.warning(
+            "[DHCP] IPv6 DHCP requested for %s but pool_start/pool_end/prefix missing; disabling IPv6",
+            device_id,
+        )
+        ipv6_enabled = False
+
+    if not ipv4_enabled and not ipv6_enabled:
+        return {
+            "success": False,
+            "error": "DHCP server requires at least one of IPv4 or IPv6 pool to be configured",
+        }
+
+    if ipv6_enabled and ipv6_server_ip and ipv6_prefix:
+        _ensure_ipv6_address(interface, ipv6_server_ip, ipv6_prefix, container=container)
 
     pidfile = os.path.join(DNSMASQ_PID_DIR, f"dnsmasq-{interface}.pid")
     leasefile = os.path.join(DNSMASQ_LEASE_DIR, f"dnsmasq-{interface}.leases")
     conffile = os.path.join(DNSMASQ_CONF_DIR, f"ostg-{interface}.conf")
     logfile = os.path.join(DNSMASQ_LOG_DIR, f"dnsmasq-{interface}.log")
 
-    # Write config file
     config_lines = [
         f"interface={interface}",
         "bind-interfaces",
@@ -722,15 +999,39 @@ def start_dhcp_server(
         f"pid-file={pidfile}",
         f"log-facility={logfile}",
     ]
-    if pool_start and pool_end:
-        config_lines.append(f"dhcp-range={pool_start},{pool_end},{lease_seconds}s")
-    for pool in additional_pools:
-        extra_start = pool.get("pool_start")
-        extra_end = pool.get("pool_end")
-        if extra_start and extra_end:
-            config_lines.append(f"dhcp-range={extra_start},{extra_end},{lease_seconds}s")
-    if gateway:
-        config_lines.append(f"dhcp-option=3,{gateway}")  # option 3 = router
+    if ipv4_enabled:
+        if pool_start and pool_end:
+            config_lines.append(f"dhcp-range={pool_start},{pool_end},{lease_seconds}s")
+        for pool in additional_pools:
+            extra_start = pool.get("pool_start")
+            extra_end = pool.get("pool_end")
+            if extra_start and extra_end:
+                config_lines.append(f"dhcp-range={extra_start},{extra_end},{lease_seconds}s")
+        if gateway:
+            config_lines.append("dhcp-option=3," + gateway)
+
+    ipv6_gateway_routes = []
+    if ipv6_enabled:
+        if "enable-ra" not in config_lines:
+            config_lines.append("enable-ra")
+        config_lines.append(
+            f"dhcp-range={ipv6_pool_start},{ipv6_pool_end},{ipv6_prefix},{ipv6_lease_seconds}s"
+        )
+        config_lines.append(f"ra-param={interface},0,0")
+        if ipv6_routes_raw:
+            if isinstance(ipv6_routes_raw, str):
+                ipv6_gateway_routes = [
+                    token.strip()
+                    for token in ipv6_routes_raw.replace(";", ",").split(",")
+                    if token and token.strip()
+                ]
+            elif isinstance(ipv6_routes_raw, (list, tuple, set)):
+                ipv6_gateway_routes = [str(token).strip() for token in ipv6_routes_raw if str(token).strip()]
+            else:
+                route_token = str(ipv6_routes_raw).strip()
+                if route_token:
+                    ipv6_gateway_routes = [route_token]
+
     try:
         if container:
             config_payload = "\n".join(config_lines) + "\n"
@@ -746,7 +1047,6 @@ def start_dhcp_server(
         logger.error("[DHCP] Failed to write dnsmasq config %s: %s", conffile, exc)
         return {"success": False, "error": str(exc)}
 
-    # Stop existing dnsmasq if running
     try:
         if container:
             pid_read = _run_command(
@@ -765,10 +1065,7 @@ def start_dhcp_server(
     except Exception as exc:
         logger.debug("[DHCP] Failed to stop existing dnsmasq: %s", exc)
 
-    cmd = [
-        "dnsmasq",
-        f"--conf-file={conffile}",
-    ]
+    cmd = ["dnsmasq", f"--conf-file={conffile}"]
     try:
         result = _run_command(cmd, timeout=10, container=container)
         if result.returncode != 0:
@@ -778,78 +1075,127 @@ def start_dhcp_server(
         logger.error("[DHCP] dnsmasq launch error: %s", exc)
         return {"success": False, "error": str(exc)}
 
-    pool_networks = _collect_pool_networks(pool_start, pool_end, additional_pools)
     pool_networks_unique = []
-    pool_seen = set()
-    for net in pool_networks or []:
-        if not net:
-            continue
-        key = str(net)
-        if key in pool_seen:
-            continue
-        pool_seen.add(key)
-        pool_networks_unique.append(net)
-
-    gateway_routes = _collect_gateway_routes(dhcp_config, additional_pools)
     route_networks = []
-    route_seen = set()
-    for net in (pool_networks_unique + gateway_routes):
-        if not net:
-            continue
-        key = str(net)
-        if key in route_seen:
-            continue
-        route_seen.add(key)
-        route_networks.append(net)
+    gateway_routes = []
 
-    # Add static routes for gateway_routes (always create these, even without gateway)
-    if gateway_routes:
-        # First, ensure gateway is reachable on the interface (prevents Linux from adding it to loopback)
-        if gateway and interface:
-            try:
-                # Add host route to gateway on the interface to make it directly reachable
-                gateway_host_route = ["ip", "route", "replace", f"{gateway}/32", "dev", interface]
-                _run_command(gateway_host_route, timeout=5, container=container)
-                logger.debug("[DHCP] Added host route to gateway %s on %s", gateway, interface)
-            except Exception as gateway_route_exc:
-                logger.debug("[DHCP] Could not add host route to gateway (may already exist): %s", gateway_route_exc)
-        
-        for net in gateway_routes:
-            try:
-                if gateway:
+    if ipv4_enabled:
+        pool_networks = _collect_pool_networks(pool_start, pool_end, additional_pools)
+        pool_seen = set()
+        for net in pool_networks or []:
+            if not net:
+                continue
+            key = str(net)
+            if key in pool_seen:
+                continue
+            pool_seen.add(key)
+            pool_networks_unique.append(net)
+
+        gateway_routes = _collect_gateway_routes(dhcp_config, additional_pools)
+        route_seen = set()
+        for net in (pool_networks_unique + gateway_routes):
+            if not net:
+                continue
+            key = str(net)
+            if key in route_seen:
+                continue
+            route_seen.add(key)
+            route_networks.append(net)
+
+        if gateway_routes:
+            if gateway and interface:
+                try:
+                    host_route_cmd = ["ip", "route", "replace", f"{gateway}/32", "dev", interface]
+                    _run_command(host_route_cmd, timeout=5, container=container)
+                    logger.debug("[DHCP] Added host route to gateway %s on %s", gateway, interface)
+                except Exception as gateway_route_exc:
+                    logger.debug(
+                        "[DHCP] Could not add host route to gateway (may already exist): %s",
+                        gateway_route_exc,
+                    )
+
+            for net in gateway_routes:
+                try:
+                    if gateway:
+                        route_cmd = ["ip", "route", "replace", str(net), "via", gateway]
+                    else:
+                        route_cmd = ["ip", "route", "replace", str(net)]
+                    if interface:
+                        route_cmd.extend(["dev", interface])
+                    _run_command(route_cmd, timeout=5, container=container)
+                    logger.info(
+                        "[DHCP] Added gateway route %s%s%s",
+                        str(net),
+                        f" via {gateway}" if gateway else "",
+                        f" dev {interface}" if interface else "",
+                    )
+                except Exception as route_exc:
+                    logger.warning("[DHCP] Failed to add gateway route %s: %s", net, route_exc)
+
+        if gateway and pool_networks_unique:
+            for net in pool_networks_unique:
+                try:
                     route_cmd = ["ip", "route", "replace", str(net), "via", gateway]
-                else:
-                    route_cmd = ["ip", "route", "replace", str(net)]
-                if interface:
-                    route_cmd.extend(["dev", interface])
-                _run_command(route_cmd, timeout=5, container=container)
-                logger.info(
-                    "[DHCP] Added gateway route %s%s%s",
-                    str(net),
-                    f" via {gateway}" if gateway else "",
-                    f" dev {interface}" if interface else "",
-                )
-            except Exception as route_exc:
-                logger.warning("[DHCP] Failed to add gateway route %s: %s", net, route_exc)
+                    if interface:
+                        route_cmd.extend(["dev", interface])
+                    _run_command(route_cmd, timeout=5, container=container)
+                    logger.info(
+                        "[DHCP] Added static route %s via %s%s",
+                        net,
+                        gateway,
+                        f" dev {interface}" if interface else "",
+                    )
+                except Exception as route_exc:
+                    logger.warning("[DHCP] Failed to add static route %s via %s: %s", net, gateway, route_exc)
 
-    # Add static routes toward client pool networks if gateway is specified
-    if gateway and pool_networks_unique:
-        for net in pool_networks_unique:
+    ipv6_subnets = []
+    if ipv6_enabled:
+        if ipv6_pool_start and ipv6_prefix:
             try:
-                route_cmd = ["ip", "route", "replace", str(net), "via", gateway]
-                if interface:
-                    route_cmd.extend(["dev", interface])
-                _run_command(route_cmd, timeout=5, container=container)
-                logger.info(
-                    "[DHCP] Added static route %s via %s%s",
-                    net,
-                    gateway,
-                    f" dev {interface}" if interface else "",
+                ipv6_network = str(ipaddress.IPv6Interface(f"{ipv6_pool_start}/{ipv6_prefix}").network)
+                ipv6_subnets.append(ipv6_network)
+            except Exception as exc:
+                logger.debug(
+                    "[DHCP] Failed to derive IPv6 subnet for %s/%s: %s",
+                    ipv6_pool_start,
+                    ipv6_prefix,
+                    exc,
                 )
-            except Exception as route_exc:
-                logger.warning("[DHCP] Failed to add static route %s via %s: %s", net, gateway, route_exc)
 
-    # Persist normalized pool information in the database for visibility
+        if ipv6_gateway_routes:
+            for route in ipv6_gateway_routes:
+                try:
+                    route_cmd = ["ip", "-6", "route", "replace", route]
+                    if ipv6_gateway:
+                        route_cmd.extend(["via", ipv6_gateway])
+                    if interface:
+                        route_cmd.extend(["dev", interface])
+                    _run_command(route_cmd, timeout=5, container=container)
+                    logger.info(
+                        "[DHCP] Added IPv6 gateway route %s%s%s",
+                        route,
+                        f" via {ipv6_gateway}" if ipv6_gateway else "",
+                        f" dev {interface}" if interface else "",
+                    )
+                except Exception as route_exc:
+                    logger.warning("[DHCP] Failed to add IPv6 gateway route %s: %s", route, route_exc)
+
+        if ipv6_gateway and ipv6_subnets:
+            for subnet in ipv6_subnets:
+                try:
+                    route_cmd = ["ip", "-6", "route", "replace", subnet, "via", ipv6_gateway]
+                    if interface:
+                        route_cmd.extend(["dev", interface])
+                    _run_command(route_cmd, timeout=5, container=container)
+                    logger.info(
+                        "[DHCP] Added IPv6 static route %s via %s%s",
+                        subnet,
+                        ipv6_gateway,
+                        f" dev {interface}" if interface else "",
+                    )
+                except Exception as route_exc:
+                    logger.warning("[DHCP] Failed to add IPv6 static route %s via %s: %s", subnet, ipv6_gateway, route_exc)
+
     try:
         config_for_db = dict(dhcp_config)
         if pool_start and pool_end:
@@ -862,6 +1208,22 @@ def start_dhcp_server(
             config_for_db["pool_name"] = dhcp_config.get("pool_name")
         if dhcp_config.get("pool_names"):
             config_for_db["pool_names"] = dhcp_config.get("pool_names")
+        config_for_db["ipv4_enabled"] = ipv4_enabled
+        config_for_db["ipv6_enabled"] = ipv6_enabled
+        if ipv6_enabled:
+            if ipv6_pool_start and ipv6_pool_end:
+                config_for_db["ipv6_pool_start"] = ipv6_pool_start
+                config_for_db["ipv6_pool_end"] = ipv6_pool_end
+                config_for_db["ipv6_pool_range"] = f"{ipv6_pool_start}-{ipv6_pool_end}"
+            if ipv6_prefix:
+                config_for_db["ipv6_prefix"] = ipv6_prefix
+            if ipv6_server_ip:
+                config_for_db["ipv6_server_ip"] = ipv6_server_ip
+            if ipv6_gateway:
+                config_for_db["ipv6_gateway"] = ipv6_gateway
+            if ipv6_gateway_routes:
+                config_for_db["ipv6_gateway_route_normalized"] = ipv6_gateway_routes
+            config_for_db["ipv6_lease_time"] = ipv6_lease_seconds
         _update_device_db(
             device_db,
             device_id,
@@ -873,7 +1235,13 @@ def start_dhcp_server(
         logger.debug("[DHCP] Unable to persist DHCP pool metadata for %s: %s", device_id, exc)
 
     lease_subnet = ""
-    lease_sources = [str(net) for net in route_networks] or config_for_db.get("pool_networks", [])
+    lease_sources = [str(net) for net in route_networks] or []
+    if config_for_db.get("pool_networks"):
+        lease_sources.extend(config_for_db.get("pool_networks", []))
+    if ipv6_subnets:
+        lease_sources.extend(ipv6_subnets)
+    elif ipv6_enabled and config_for_db.get("ipv6_pool_range"):
+        lease_sources.append(config_for_db["ipv6_pool_range"])
     if lease_sources:
         seen_subnets = []
         seen_keys = set()
@@ -883,6 +1251,7 @@ def start_dhcp_server(
             seen_keys.add(subnet)
             seen_subnets.append(subnet)
         lease_subnet = ", ".join(seen_subnets)
+
     _update_device_db(
         device_db,
         device_id,
@@ -892,7 +1261,7 @@ def start_dhcp_server(
             "dhcp_running": True,
             "dhcp_lease_ip": "",
             "dhcp_lease_mask": "",
-            "dhcp_lease_gateway": gateway,
+            "dhcp_lease_gateway": gateway if ipv4_enabled else ipv6_gateway,
             "dhcp_lease_server": "",
             "dhcp_lease_expires": None,
             "dhcp_lease_subnet": lease_subnet,
@@ -909,6 +1278,11 @@ def stop_dhcp_server(device_db, device_id: str, interface: str, container=None) 
     gateway = ""
     networks = None
     extra_routes = None
+    ipv6_gateway = ""
+    ipv6_gateway_routes = []
+    ipv6_server_ip = ""
+    ipv6_prefix = ""
+    ipv6_subnets = []
     try:
         device = device_db.get_device(device_id) if device_db else None
         if device:
@@ -941,7 +1315,16 @@ def stop_dhcp_server(device_db, device_id: str, interface: str, container=None) 
                             networks.append(net)
                     except Exception:
                         pass
-            else:
+            ipv6_gateway = str(dhcp_cfg.get("ipv6_gateway") or "")
+            ipv6_server_ip = str(dhcp_cfg.get("ipv6_server_ip") or dhcp_cfg.get("ipv6_server") or "")
+            ipv6_prefix = str(
+                dhcp_cfg.get("ipv6_prefix")
+                or dhcp_cfg.get("ipv6_prefix_length")
+                or dhcp_cfg.get("ipv6_prefix_len")
+                or ""
+            )
+
+            if not (stored_pool_networks or stored_gateway_routes):
                 # Fallback to deriving from current config
                 additional_pools = _normalize_additional_pools(dhcp_cfg.get("additional_pools"))
                 networks = _collect_pool_networks(
@@ -953,6 +1336,42 @@ def stop_dhcp_server(device_db, device_id: str, interface: str, container=None) 
                     for extra in extra_routes:
                         if str(extra) not in existing:
                             networks.append(extra)
+
+            if _truthy(dhcp_cfg.get("ipv6_enabled")):
+                start_v6 = str(
+                    dhcp_cfg.get("ipv6_pool_start")
+                    or dhcp_cfg.get("pool_start_v6")
+                    or ""
+                ).strip()
+                if start_v6 and ipv6_prefix:
+                    try:
+                        ipv6_network = str(ipaddress.IPv6Interface(f"{start_v6}/{ipv6_prefix}").network)
+                        ipv6_subnets.append(ipv6_network)
+                    except Exception as exc:
+                        logger.debug(
+                            "[DHCP] Failed to derive IPv6 subnet for cleanup %s/%s: %s",
+                            start_v6,
+                            ipv6_prefix,
+                            exc,
+                        )
+                routes_v6 = (
+                    dhcp_cfg.get("ipv6_gateway_route_normalized")
+                    or dhcp_cfg.get("ipv6_gateway_route")
+                    or dhcp_cfg.get("ipv6_gateway_routes")
+                    or []
+                )
+                if isinstance(routes_v6, str):
+                    ipv6_gateway_routes = [
+                        token.strip()
+                        for token in routes_v6.replace(";", ",").split(",")
+                        if token and token.strip()
+                    ]
+                elif isinstance(routes_v6, (list, tuple, set)):
+                    ipv6_gateway_routes = [str(token).strip() for token in routes_v6 if str(token).strip()]
+                elif routes_v6:
+                    route_token = str(routes_v6).strip()
+                    if route_token:
+                        ipv6_gateway_routes = [route_token]
     except Exception as exc:
         logger.debug("[DHCP] Failed to derive routes for cleanup: %s", exc)
     try:
@@ -1032,6 +1451,39 @@ def stop_dhcp_server(device_db, device_id: str, interface: str, container=None) 
                         logger.info("[DHCP] Removed static route %s (with dev) from DHCP container", net)
                 except Exception:
                     logger.debug("[DHCP] Failed to remove static route %s: %s", net, route_exc)
+
+    if container and ipv6_gateway_routes:
+        for route in ipv6_gateway_routes:
+            try:
+                if ipv6_gateway:
+                    _run_command(
+                        ["ip", "-6", "route", "del", route, "via", ipv6_gateway],
+                        timeout=5,
+                        container=container,
+                    )
+                _run_command(
+                    ["ip", "-6", "route", "del", route],
+                    timeout=5,
+                    container=container,
+                )
+                logger.info("[DHCP] Removed IPv6 gateway route %s from DHCP container", route)
+            except Exception as route_exc:
+                logger.debug("[DHCP] Failed to remove IPv6 gateway route %s: %s", route, route_exc)
+
+    if container and ipv6_gateway and ipv6_subnets:
+        for subnet in ipv6_subnets:
+            try:
+                _run_command(
+                    ["ip", "-6", "route", "del", subnet, "via", ipv6_gateway],
+                    timeout=5,
+                    container=container,
+                )
+                logger.info("[DHCP] Removed IPv6 static route %s via %s from DHCP container", subnet, ipv6_gateway)
+            except Exception as route_exc:
+                logger.debug("[DHCP] Failed to remove IPv6 static route %s: %s", subnet, route_exc)
+
+    if ipv6_server_ip and ipv6_prefix:
+        _remove_ipv6_address(interface, ipv6_server_ip, ipv6_prefix, container=container)
 
     _update_device_db(
         device_db,
