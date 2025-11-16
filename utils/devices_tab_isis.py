@@ -729,8 +729,10 @@ class ISISHandler:
                                 device_interface = iface
                         # Debug logs disabled
                         
-                        # Neighbor Type (for first row - no neighbor, show N/A)
-                        self.parent.isis_table.setItem(row, 2, QTableWidgetItem("N/A"))
+                        # Neighbor Type for first row is already set above based on enabled AFs
+                        # If neither IPv4 nor IPv6 is enabled, show N/A
+                        if not (ipv4_enabled or ipv6_enabled):
+                            self.parent.isis_table.setItem(row, 2, QTableWidgetItem("No Neighbors"))
                         
                         # Neighbor Hostname (for first row - no neighbor, show N/A)
                         self.parent.isis_table.setItem(row, 3, QTableWidgetItem("N/A"))
