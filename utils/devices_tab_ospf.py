@@ -311,8 +311,18 @@ class OSPFHandler:
                         area_id = ospf_config.get("area_id", "0.0.0.0") if ospf_config else "0.0.0.0"
                         
                         # Get OSPF configuration flags
-                        ipv4_enabled = ospf_config.get("ipv4_enabled", False) if ospf_config else False
-                        ipv6_enabled = ospf_config.get("ipv6_enabled", False) if ospf_config else False
+                        # Default heuristics: if not explicitly set, infer from presence of device IPs
+                        device_ipv4 = (device.get("IPv4", "") or "").strip()
+                        device_ipv6 = (device.get("IPv6", "") or "").strip()
+                        # If not explicitly set in config, infer from presence of device IPs
+                        if ospf_config and "ipv4_enabled" in ospf_config:
+                            ipv4_enabled = bool(ospf_config.get("ipv4_enabled"))
+                        else:
+                            ipv4_enabled = bool(device_ipv4)
+                        if ospf_config and "ipv6_enabled" in ospf_config:
+                            ipv6_enabled = bool(ospf_config.get("ipv6_enabled"))
+                        else:
+                            ipv6_enabled = bool(device_ipv6)
                         
                         # Try to get actual OSPF status from database via server
                         ospf_status_data = {}
