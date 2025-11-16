@@ -1,33 +1,39 @@
 # Comprehensive FRR Docker Image for OSTG with Full Features
-FROM alpine:3.18
+FROM debian:bookworm-slim
 
-# Install FRR with full features and required packages
-RUN apk add --no-cache \
-    frr \
-    frr-doc \
-    iproute2 \
-    iptables \
-    net-tools \
-    bash \
-    curl \
-    tini \
-    iputils \
-    tcpdump \
-    netcat-openbsd \
-    bind-tools \
-    openssh-client \
-    vim \
-    nano \
-    less \
-    procps \
-    htop \
-    dhclient \
-    dnsmasq
+ARG FRR_VERSION=10.0
+ARG FRR_TAG=frr-10.0
+ENV DEBIAN_FRONTEND=noninteractive
 
-# Create directories and set permissions
-RUN mkdir -p /var/run/frr /etc/frr /var/log/frr \
-    /var/lib/dhcp /var/lib/misc /etc/dnsmasq.d /var/log/dnsmasq && \
-    chown -R frr:frr /var/run/frr /etc/frr /var/log/frr
+# Base runtime and build dependencies
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        curl gnupg ca-certificates git build-essential autoconf automake libtool pkg-config \
+        libreadline-dev libjson-c-dev bison flex libpam0g-dev python3 python3-pip python3-dev python3.11-dev \
+        libcap-dev libelf-dev libsnmp-dev perl libsystemd-dev libyang2-dev libzmq3-dev \
+        libpcre2-dev libssh-dev libssl-dev cmake libc-ares-dev \
+        protobuf-c-compiler protobuf-compiler libprotobuf-c-dev \
+        iproute2 iptables net-tools \
+        bash tini iputils-ping \
+        tcpdump netcat-traditional \
+        dnsutils openssh-client \
+        vim nano less procps htop \
+        isc-dhcp-client dnsmasq && \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
+
+# Install FRR 10.x from official FRRouting APT repository (includes required libyang2)
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends curl gnupg ca-certificates; \
+    mkdir -p /usr/share/keyrings; \
+    curl -fsSL http://deb.frrouting.org/frr/keys.asc | gpg --dearmor > /usr/share/keyrings/frrouting-archive.gpg; \
+    echo "deb [signed-by=/usr/share/keyrings/frrouting-archive.gpg] http://deb.frrouting.org/frr bookworm frr-${FRR_VERSION}" > /etc/apt/sources.list.d/frr.list; \
+    apt-get update; \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+      frr=${FRR_VERSION}* \
+      frr-pythontools=${FRR_VERSION}* \
+      frr-doc=${FRR_VERSION}*; \
+    apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Copy FRR configuration template
 COPY frr.conf.template /etc/frr/frr.conf.template
@@ -39,8 +45,12 @@ RUN echo "service integrated-vtysh-config" > /etc/frr/vtysh.conf
 COPY start-frr.sh /usr/local/bin/start-frr.sh
 RUN chmod +x /usr/local/bin/start-frr.sh
 
-# Keep root user for FRR daemons (they need elevated privileges)
-# USER frr
+# Create directories and set permissions
+RUN mkdir -p /var/run/frr /etc/frr /var/log/frr \
+    /var/lib/dhcp /var/lib/misc /etc/dnsmasq.d /var/log/dnsmasq && \
+    groupadd -r frrvty && groupadd -r frr && useradd -r -g frr frr || true && \
+    usermod -a -G frrvty frr || true && \
+    chown -R frr:frr /var/run/frr /etc/frr /var/log/frr
 
 # Expose BGP port
 EXPOSE 179
@@ -50,5 +60,5 @@ HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
     CMD vtysh -c "show version" || exit 1
 
 # Use tini as init system and start FRR
-ENTRYPOINT ["/sbin/tini", "--"]
+ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["/usr/local/bin/start-frr.sh"]
