@@ -298,6 +298,7 @@ class FRRDockerManager:
                 'NETWORK': network if dhcp_mode != "client" else '',
                 'NETMASK': (ipv4_mask or '') if dhcp_mode != "client" else '',
                 'INTERFACE': iface_name,  # Use determined interface name (vlan20, etc.)
+                'VLAN': str(vlan or ''),
                 'IP_ADDRESS': (ipv4_addr or '') if dhcp_mode != "client" else '',
                 'IP_MASK': (ipv4_mask or '') if dhcp_mode != "client" else '',
                 'LOOPBACK_IPV4': loopback_ipv4,

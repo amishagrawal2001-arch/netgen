@@ -18,6 +18,14 @@ if [ -f "/etc/frr/frr.conf.template" ]; then
     fi
     
     # Replace template variables
+    # Derive effective interface name: INTERFACE > vlan${VLAN} > eth0
+    if [ -n "${INTERFACE:-}" ]; then
+        INTERFACE_EFFECTIVE="${INTERFACE}"
+    elif [ -n "${VLAN:-}" ]; then
+        INTERFACE_EFFECTIVE="vlan${VLAN}"
+    else
+        INTERFACE_EFFECTIVE="eth0"
+    fi
     # Handle IPv6 address line conditionally
     if [ -n "${IPV6_ADDRESS}" ] && [ -n "${IPV6_MASK}" ]; then
         IPV6_LINE=" ipv6 address ${IPV6_ADDRESS}/${IPV6_MASK}"
@@ -100,7 +108,7 @@ if [ -f "/etc/frr/frr.conf.template" ]; then
         -e "s/{{LOCAL_ASN}}/${LOCAL_ASN:-65001}/g" \
         -e "s/{{ROUTER_ID}}/${ROUTER_ID_VALUE:-}/g" \
         -e "s/{{ROUTER_ID_REPLACED_WITH_DOTTED_FORMAT}}/${ROUTER_ID_DOTTED}/g" \
-        -e "s/{{INTERFACE}}/${INTERFACE:-eth0}/g" \
+        -e "s/{{INTERFACE}}/${INTERFACE_EFFECTIVE}/g" \
         -e "s|{{GLOBAL_ROUTER_ID_LINE}}|${GLOBAL_ROUTER_ID_LINE}|g" \
         -e "s|{{LOOPBACK_IPV4_LINE}}|${LOOPBACK_IPV4_LINE}|g" \
         -e "s|{{LOOPBACK_IPV6_LINE}}|${LOOPBACK_IPV6_LINE}|g" \
@@ -130,6 +138,12 @@ echo "Starting FRR daemons..."
 mkdir -p /var/run/frr
 chown frr:frr /var/run/frr 2>/dev/null || true
 
+# Ensure frr user is member of frrvty group at runtime
+if ! id -nG frr 2>/dev/null | grep -q "\\bfrrvty\\b"; then
+    groupadd -f frrvty 2>/dev/null || true
+    usermod -a -G frrvty frr 2>/dev/null || true
+fi
+
 # Function to start daemon safely with error checking
 start_daemon() {
     local daemon=$1
@@ -142,7 +156,13 @@ start_daemon() {
     
     echo "Starting $daemon..."
     # Start daemon and capture output
-    if $daemon_path -d -A 127.0.0.1 -f /etc/frr/frr.conf 2>&1; then
+    # staticd does not accept -f; start it without a config file argument
+    if [ "$daemon" = "staticd" ]; then
+        cmd="$daemon_path -d -A 127.0.0.1"
+    else
+        cmd="$daemon_path -d -A 127.0.0.1 -f /etc/frr/frr.conf"
+    fi
+    if $cmd 2>&1; then
         sleep 1
         # Verify it's actually running
         if pgrep -f "$daemon" > /dev/null; then
