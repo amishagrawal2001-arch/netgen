@@ -133,6 +133,7 @@ run_cmd() {
     local title="$1"
     local cmd="$2"
     echo -e "${YELLOW}--- $title ---${NC}"
+    echo -e "${BLUE}Command: $cmd${NC}"
     docker_exec "$cmd" || echo "Command failed or returned no output"
     echo ""
 }
@@ -147,15 +148,18 @@ run_cmd "Bridge Status" "ip addr show $BRIDGE_NAME"
 run_cmd "ARP Entries (Bridge)" "ip neigh show dev $BRIDGE_NAME"
 
 # 4. ARP Entries on Underlay
-UNDERLAY=$(docker_exec "ip route show default" 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}' | head -n 1)
+cmd="ip route show default"
+UNDERLAY=$(docker_exec "$cmd" 2>/dev/null | awk '/dev/ {for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}' | head -n 1)
 # Alternative: try to find underlay from routes to common VTEP IPs
 if [ -z "$UNDERLAY" ]; then
-    UNDERLAY=$(docker_exec "ip route show 192.168.0.1 2>/dev/null || ip route show 192.255.0.1 2>/dev/null || ip route show 192.168.250.1 2>/dev/null" | awk '/dev/ {for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}' | head -n 1)
+    cmd="ip route show 192.168.0.1 2>/dev/null || ip route show 192.255.0.1 2>/dev/null || ip route show 192.168.250.1 2>/dev/null"
+    UNDERLAY=$(docker_exec "$cmd" | awk '/dev/ {for(i=1;i<=NF;i++) if($i=="dev") {print $(i+1); exit}}' | head -n 1)
 fi
 # Try common interface names
 if [ -z "$UNDERLAY" ]; then
     for iface in ens4np0 vlan20 ens5np0; do
-        if docker_exec "ip link show $iface" 2>/dev/null | grep -q "state UP"; then
+        cmd="ip link show $iface"
+        if docker_exec "$cmd" 2>/dev/null | grep -q "state UP"; then
             UNDERLAY="$iface"
             break
         fi
@@ -170,13 +174,17 @@ else
 fi
 
 # 5. FDB Entries
-VXLAN_IFACE=$(docker_exec "ip link show type vxlan" 2>/dev/null | awk '/^[0-9]+:/ {print $2}' | sed 's/:$//' | head -n 1)
+cmd="ip link show type vxlan"
+VXLAN_IFACE=$(docker_exec "$cmd" 2>/dev/null | awk '/^[0-9]+:/ {print $2}' | sed 's/:$//' | head -n 1)
 # Alternative: try to find VXLAN interface by VNI pattern
 if [ -z "$VXLAN_IFACE" ]; then
-    VXLAN_IFACE=$(docker_exec "ip link show type vxlan" 2>/dev/null | grep -E "vx${VNI}-" | awk '{print $2}' | sed 's/:$//' | head -n 1)
+    cmd="ip link show type vxlan"
+    VXLAN_IFACE=$(docker_exec "$cmd" 2>/dev/null | grep -E "vx${VNI}-" | awk '{print $2}' | sed 's/:$//' | head -n 1)
 fi
 if [ -n "$VXLAN_IFACE" ]; then
     run_cmd "FDB Entries (VXLAN Interface: $VXLAN_IFACE)" "bridge fdb show dev $VXLAN_IFACE"
+    # 5a. Detailed VXLAN Interface Information (after we know the interface name)
+    run_cmd "Detailed VXLAN Interface Info" "ip -d link show $VXLAN_IFACE"
 else
     echo -e "${YELLOW}--- FDB Entries ---${NC}"
     echo "Could not determine VXLAN interface name"
@@ -201,15 +209,17 @@ run_cmd "All Routes" "ip route show"
 # 11. Routes to common VTEP IPs
 echo -e "${YELLOW}--- Routes to Remote VTEPs ---${NC}"
 for vtep in "192.255.0.1" "192.168.250.1" "192.168.0.1"; do
-    result=$(docker_exec "ip route show $vtep" 2>&1)
+    cmd="ip route show $vtep"
+    echo -e "${BLUE}Command: $cmd${NC}"
+    result=$(docker_exec "$cmd" 2>&1)
     if [ -n "$result" ]; then
         echo "Route to $vtep:"
         echo "$result"
     else
         echo "No route to $vtep"
     fi
+    echo ""
 done
-echo ""
 
 # 12. Bridge Link Info
 run_cmd "Bridge Link Info" "bridge link show $BRIDGE_NAME"
@@ -223,18 +233,24 @@ run_cmd "ARP Ignore Setting" "sysctl net.ipv4.conf.$BRIDGE_NAME.arp_ignore 2>/de
 
 # 15. Connectivity Test
 echo -e "${YELLOW}--- Connectivity Tests ---${NC}"
-BRIDGE_IP=$(docker_exec "ip addr show $BRIDGE_NAME" | awk '/inet / {print $2}' | sed 's/\/.*//' | head -n 1)
+cmd="ip addr show $BRIDGE_NAME"
+echo -e "${BLUE}Command: $cmd${NC}"
+BRIDGE_IP=$(docker_exec "$cmd" | awk '/inet / {print $2}' | sed 's/\/.*//' | head -n 1)
 if [ -n "$BRIDGE_IP" ]; then
     echo "Bridge IP: $BRIDGE_IP"
     echo ""
     
     # Get remote SVI IPs from ARP table
-    REMOTE_IPS=$(docker_exec "ip neigh show dev $BRIDGE_NAME" | grep -v "$BRIDGE_IP" | awk '{print $1}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true)
+    cmd="ip neigh show dev $BRIDGE_NAME"
+    echo -e "${BLUE}Command: $cmd${NC}"
+    REMOTE_IPS=$(docker_exec "$cmd" | grep -v "$BRIDGE_IP" | awk '{print $1}' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' || true)
+    echo ""
     
     if [ -n "$REMOTE_IPS" ]; then
         for remote_ip in $REMOTE_IPS; do
-            echo -e "${BLUE}Pinging $remote_ip from $BRIDGE_NAME...${NC}"
-            docker_exec "ping -I $BRIDGE_NAME -c 2 -W 1 $remote_ip" 2>&1 | head -n 5 || echo "Ping failed"
+            cmd="ping -I $BRIDGE_NAME -c 2 -W 1 $remote_ip"
+            echo -e "${BLUE}Command: $cmd${NC}"
+            docker_exec "$cmd" 2>&1 | head -n 5 || echo "Ping failed"
             echo ""
         done
     else
@@ -258,7 +274,8 @@ echo ""
 echo -e "${YELLOW}=== Common Issues Check ===${NC}"
 
 # Check ARP entries with NOARP flag
-NOARP_COUNT=$(docker_exec "ip neigh show dev $BRIDGE_NAME" 2>/dev/null | grep -c "NOARP" 2>/dev/null || echo "0")
+cmd="ip neigh show dev $BRIDGE_NAME"
+NOARP_COUNT=$(docker_exec "$cmd" 2>/dev/null | grep -c "NOARP" 2>/dev/null || echo "0")
 NOARP_COUNT=${NOARP_COUNT//[^0-9]/}  # Remove non-numeric characters
 NOARP_COUNT=${NOARP_COUNT:-0}  # Default to 0 if empty
 if [ "$NOARP_COUNT" -gt 0 ] 2>/dev/null; then
@@ -269,7 +286,8 @@ fi
 # Check FDB entries - BGP next-hop IS the VTEP IP now, so this is correct
 # Just verify FDB entries exist
 if [ -n "$VXLAN_IFACE" ]; then
-    FDB_COUNT=$(docker_exec "bridge fdb show dev $VXLAN_IFACE" 2>/dev/null | grep -c "dst" 2>/dev/null || echo "0")
+    cmd="bridge fdb show dev $VXLAN_IFACE"
+    FDB_COUNT=$(docker_exec "$cmd" 2>/dev/null | grep -c "dst" 2>/dev/null || echo "0")
     FDB_COUNT=${FDB_COUNT//[^0-9]/}  # Remove non-numeric characters
     FDB_COUNT=${FDB_COUNT:-0}  # Default to 0 if empty
     if [ "$FDB_COUNT" -eq 0 ] 2>/dev/null; then
@@ -281,7 +299,8 @@ if [ -n "$VXLAN_IFACE" ]; then
 fi
 
 # Check for FAILED ARP entries
-FAILED_ARP=$(docker_exec "ip neigh show" 2>/dev/null | grep -c "FAILED" 2>/dev/null || echo "0")
+cmd="ip neigh show"
+FAILED_ARP=$(docker_exec "$cmd" 2>/dev/null | grep -c "FAILED" 2>/dev/null || echo "0")
 FAILED_ARP=${FAILED_ARP//[^0-9]/}  # Remove non-numeric characters
 FAILED_ARP=${FAILED_ARP:-0}  # Default to 0 if empty
 if [ "$FAILED_ARP" -gt 0 ] 2>/dev/null; then
@@ -292,19 +311,23 @@ fi
 # Check if route exists to remote VTEP (check both kernel and FRR routing tables)
 # Get remote VTEP IP from EVPN routes (BGP next-hop)
 REMOTE_VTEP_IP=""
-REMOTE_VTEP_IP=$(docker_exec "vtysh -c 'show bgp l2vpn evpn route type macip'" 2>/dev/null | grep -E "^\s+\*>" | head -n 1 | awk '{for(i=1;i<=NF;i++) if($i=="from") print $(i+1)}' || echo "")
+cmd="vtysh -c 'show bgp l2vpn evpn route type macip'"
+REMOTE_VTEP_IP=$(docker_exec "$cmd" 2>/dev/null | grep -E "^\s+\*>" | head -n 1 | awk '{for(i=1;i<=NF;i++) if($i=="from") print $(i+1)}' || echo "")
 
 # If we can't get from EVPN, try to get from EVPN VNI details
 if [ -z "$REMOTE_VTEP_IP" ]; then
-    REMOTE_VTEP_IP=$(docker_exec "vtysh -c 'show evpn vni $VNI detail'" 2>/dev/null | grep -A 5 "Remote VTEPs" | grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' | head -n 1 || echo "")
+    cmd="vtysh -c 'show evpn vni $VNI detail'"
+    REMOTE_VTEP_IP=$(docker_exec "$cmd" 2>/dev/null | grep -A 5 "Remote VTEPs" | grep -oE '\b([0-9]{1,3}\.){3}[0-9]{1,3}\b' | head -n 1 || echo "")
 fi
 
 # Check route in both kernel and FRR routing tables
 if [ -n "$REMOTE_VTEP_IP" ]; then
     # Check kernel route
-    KERNEL_ROUTE=$(docker_exec "ip route show $REMOTE_VTEP_IP" 2>&1 | grep -c "$REMOTE_VTEP_IP" 2>/dev/null || echo "0")
+    cmd="ip route show $REMOTE_VTEP_IP"
+    KERNEL_ROUTE=$(docker_exec "$cmd" 2>&1 | grep -c "$REMOTE_VTEP_IP" 2>/dev/null || echo "0")
     # Check FRR route
-    FRR_ROUTE=$(docker_exec "vtysh -c 'show ip route $REMOTE_VTEP_IP'" 2>&1 | grep -c "$REMOTE_VTEP_IP" 2>/dev/null || echo "0")
+    cmd="vtysh -c 'show ip route $REMOTE_VTEP_IP'"
+    FRR_ROUTE=$(docker_exec "$cmd" 2>&1 | grep -c "$REMOTE_VTEP_IP" 2>/dev/null || echo "0")
     
     if [ "$KERNEL_ROUTE" -eq 0 ] && [ "$FRR_ROUTE" -eq 0 ]; then
         echo -e "${YELLOW}⚠ No route found to remote VTEP $REMOTE_VTEP_IP (checked both kernel and FRR tables)${NC}"
@@ -320,8 +343,18 @@ if [ -n "$REMOTE_VTEP_IP" ]; then
 else
     # Fallback: check for common VTEP IPs
     for vtep_ip in "192.255.0.1" "192.168.0.1"; do
-        KERNEL_ROUTE=$(docker_exec "ip route show $vtep_ip" 2>&1 | grep -c "$vtep_ip" 2>/dev/null || echo "0")
-        FRR_ROUTE=$(docker_exec "vtysh -c 'show ip route $vtep_ip'" 2>&1 | grep -c "$vtep_ip" 2>/dev/null || echo "0")
+        cmd="ip route show $vtep_ip"
+        KERNEL_ROUTE=$(docker_exec "$cmd" 2>&1 | grep -c "$vtep_ip" 2>/dev/null || echo "0")
+        cmd="vtysh -c 'show ip route $vtep_ip'"
+        FRR_ROUTE=$(docker_exec "$cmd" 2>&1 | grep -c "$vtep_ip" 2>/dev/null || echo "0")
+        
+        # Sanitize to ensure integer values (remove newlines and non-numeric characters)
+        KERNEL_ROUTE=$(echo "$KERNEL_ROUTE" | tr -d '\n\r' | sed 's/[^0-9]//g')
+        FRR_ROUTE=$(echo "$FRR_ROUTE" | tr -d '\n\r' | sed 's/[^0-9]//g')
+        
+        # Default to 0 if empty
+        KERNEL_ROUTE=${KERNEL_ROUTE:-0}
+        FRR_ROUTE=${FRR_ROUTE:-0}
         
         if [ "$KERNEL_ROUTE" -eq 0 ] && [ "$FRR_ROUTE" -eq 0 ]; then
             echo -e "${YELLOW}⚠ No route found to VTEP $vtep_ip (checked both kernel and FRR tables)${NC}"

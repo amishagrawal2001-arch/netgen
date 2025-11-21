@@ -470,7 +470,40 @@ def tear_down_vxlan_interface(
                     logger.warning("[VXLAN CLEANUP] ❌ Exception while removing bridge %s: %s", bridge_name, bridge_exc)
             
             # Step 5: Remove bridge SVI configuration from FRR (if it exists)
+            # Also remove VLAN subinterface SVI if it exists (for VLAN-aware bridges)
             if bridge_name:
+                # Remove VLAN subinterface SVI if VLAN-aware mode was used
+                if vlan_id and vlan_id > 0:
+                    vlan_svi_name = f"vlan{vlan_id}"
+                    # Remove VLAN subinterface SVI configuration from FRR if it exists
+                    try:
+                        _run_vtysh(frr_manager, container_name, [
+                            "configure terminal",
+                            f"interface {vlan_svi_name}",
+                            "shutdown",
+                            "no ip address",
+                            "exit",
+                            "end"
+                        ])
+                        logger.info("[VXLAN CLEANUP] Removed VLAN subinterface %s SVI configuration from FRR", vlan_svi_name)
+                    except Exception as vlan_svi_remove_exc:
+                        # VLAN subinterface SVI might not exist in FRR
+                        error_msg = str(vlan_svi_remove_exc).lower()
+                        if "not found" in error_msg or "does not exist" in error_msg or "no such" in error_msg:
+                            logger.debug("[VXLAN CLEANUP] VLAN subinterface %s SVI configuration does not exist in FRR", vlan_svi_name)
+                        else:
+                            logger.debug("[VXLAN CLEANUP] Failed to remove VLAN subinterface %s SVI from FRR (non-critical): %s", vlan_svi_name, vlan_svi_remove_exc)
+                    
+                    # Remove VLAN subinterface at kernel level
+                    try:
+                        _container_ip(frr_manager, container_name, ["ip", "link", "del", vlan_svi_name])
+                        logger.info("[VXLAN CLEANUP] Removed VLAN subinterface %s", vlan_svi_name)
+                    except Exception as vlan_svi_del_exc:
+                        # VLAN subinterface might not exist
+                        if "Cannot find device" not in str(vlan_svi_del_exc) and "does not exist" not in str(vlan_svi_del_exc):
+                            logger.debug("[VXLAN CLEANUP] Failed to remove VLAN subinterface %s (non-critical): %s", vlan_svi_name, vlan_svi_del_exc)
+                
+                # Remove bridge SVI configuration from FRR (if it exists)
                 try:
                     _run_vtysh(frr_manager, container_name, [
                         "configure terminal",
@@ -1036,29 +1069,68 @@ def _ensure_vxlan_in_container_iproute(
                     svi_ip_str = f"10.0.{vni // 256}.{100 + (vni % 256)}/24"
                     logger.info("[VXLAN] Using fallback bridge SVI IP: %s", svi_ip_str)
             
-            # Flush any existing addresses on bridge before adding SVI IP (ensures clean state)
+            # For VLAN-aware bridges, create a VLAN subinterface as the SVI (per FRR EVPN documentation)
+            # For plain bridges, use the bridge itself as the SVI
+            svi_interface = bridge_name  # Default: use bridge as SVI
+            if vlan_id and vlan_id > 0:
+                # VLAN-aware mode: Create VLAN subinterface as SVI (per FRR EVPN best practices)
+                # According to FRR docs: "In Linux an SVI can either be a traditional bridge or a VLAN subinterface of a VLAN-aware bridge"
+                vlan_svi_name = f"vlan{vlan_id}"
+                try:
+                    # Check if VLAN subinterface already exists
+                    try:
+                        _container_ip(frr_manager, container_name, ["ip", "link", "show", vlan_svi_name])
+                        logger.debug("[VXLAN] VLAN subinterface %s already exists", vlan_svi_name)
+                    except Exception:
+                        # Create VLAN subinterface linked to bridge
+                        _container_ip(frr_manager, container_name, ["ip", "link", "add", vlan_svi_name, "link", bridge_name, "type", "vlan", "id", str(vlan_id)])
+                        logger.info("[VXLAN] Created VLAN subinterface %s (VLAN %s) as SVI for bridge %s", vlan_svi_name, vlan_id, bridge_name)
+                    
+                    # Set unique MAC address for VLAN subinterface (per FRR docs recommendation)
+                    try:
+                        # Use bridge MAC with VLAN ID in last octet for uniqueness
+                        vlan_svi_mac = f"aa:bb:cc:00:{(vni >> 8) & 0xff:02x}:{(vni & 0xff) + (vlan_id & 0xff):02x}"
+                        _container_ip(frr_manager, container_name, ["ip", "link", "set", vlan_svi_name, "addr", vlan_svi_mac])
+                        logger.debug("[VXLAN] Set VLAN subinterface MAC address %s", vlan_svi_mac)
+                    except Exception as mac_exc:
+                        logger.debug("[VXLAN] Could not set VLAN subinterface MAC (non-critical): %s", mac_exc)
+                    
+                    # Bring up VLAN subinterface
+                    try:
+                        _container_ip(frr_manager, container_name, ["ip", "link", "set", vlan_svi_name, "up"])
+                        logger.debug("[VXLAN] Brought up VLAN subinterface %s", vlan_svi_name)
+                    except Exception as up_exc:
+                        logger.debug("[VXLAN] VLAN subinterface %s may already be up: %s", vlan_svi_name, up_exc)
+                    
+                    svi_interface = vlan_svi_name
+                    logger.info("[VXLAN] Using VLAN subinterface %s as SVI (VLAN-aware bridge mode)", vlan_svi_name)
+                except Exception as vlan_svi_exc:
+                    logger.warning("[VXLAN] Failed to create VLAN subinterface for SVI, falling back to bridge: %s", vlan_svi_exc)
+                    svi_interface = bridge_name
+            
+            # Flush any existing addresses on SVI interface before adding SVI IP (ensures clean state)
             try:
-                _container_ip(frr_manager, container_name, ["ip", "addr", "flush", "dev", bridge_name])
-                logger.debug("[VXLAN] Flushed existing addresses on bridge %s", bridge_name)
+                _container_ip(frr_manager, container_name, ["ip", "addr", "flush", "dev", svi_interface])
+                logger.debug("[VXLAN] Flushed existing addresses on SVI interface %s", svi_interface)
             except Exception as flush_exc:
-                logger.debug("[VXLAN] Could not flush addresses on bridge (non-critical): %s", flush_exc)
+                logger.debug("[VXLAN] Could not flush addresses on SVI interface (non-critical): %s", flush_exc)
             
             # Add IP address at kernel level first (required for FRR to recognize it)
             try:
-                _container_ip(frr_manager, container_name, ["ip", "addr", "add", svi_ip_str, "dev", bridge_name])
-                logger.debug("[VXLAN] Added IP address %s to bridge %s at kernel level", svi_ip_str, bridge_name)
+                _container_ip(frr_manager, container_name, ["ip", "addr", "add", svi_ip_str, "dev", svi_interface])
+                logger.debug("[VXLAN] Added IP address %s to SVI interface %s at kernel level", svi_ip_str, svi_interface)
             except Exception as ip_add_exc:
                 if "File exists" not in str(ip_add_exc):
-                    logger.warning("[VXLAN] Failed to add IP address to bridge %s at kernel level: %s", bridge_name, ip_add_exc)
+                    logger.warning("[VXLAN] Failed to add IP address to SVI interface %s at kernel level: %s", svi_interface, ip_add_exc)
             
             # Also configure in FRR so zebra knows about it
             _run_vtysh(frr_manager, container_name, [
-                f"interface {bridge_name}",
+                f"interface {svi_interface}",
                 "no shutdown",
                 f"ip address {svi_ip_str}",
                 "exit",
                 "end",
-                "write"  # CRITICAL: Save configuration so bridge SVI persists
+                "write"  # CRITICAL: Save configuration so SVI persists
             ])
             
             # Force EVPN daemon to re-evaluate SVI association by toggling advertise-all-vni
@@ -1088,8 +1160,10 @@ def _ensure_vxlan_in_container_iproute(
             except Exception as toggle_exc:
                 logger.debug("[VXLAN] Failed to toggle advertise-all-vni (non-critical): %s", toggle_exc)
             
-            logger.info("[VXLAN] Configured bridge %s as SVI with IP %s for L2 VNI recognition", bridge_name, svi_ip_str)
+            logger.info("[VXLAN] Configured %s as SVI with IP %s for L2 VNI recognition", svi_interface, svi_ip_str)
             logger.info("[VXLAN] VNI %s should now be recognized as L2 by FRR for EVPN route generation", vni)
+            if vlan_id and vlan_id > 0:
+                logger.info("[VXLAN] Using VLAN subinterface %s as SVI (VLAN-aware bridge mode, per FRR EVPN best practices)", svi_interface)
         except Exception as bridge_config_exc:
             logger.warning("[VXLAN] Failed to configure bridge %s SVI in FRR (non-critical): %s", bridge_name, bridge_config_exc)
         
@@ -1399,7 +1473,7 @@ def _ensure_vxlan_in_container_iproute(
                                             else:
                                                 next_hop_ip = str(next_hop_entry) if isinstance(next_hop_entry, str) else None
                                             
-                                            if next_hop_ip and next_hop_ip != local_ip:
+                                            if next_hop_ip and next_hop_ip != local_ip and next_hop_ip != '0.0.0.0':
                                                 bgp_next_hop = next_hop_ip
                                                 actual_vtep_ip = bgp_next_hop
                                                 logger.info("[VXLAN] Using BGP next-hop %s as remote VTEP IP from Type-2 route JSON", actual_vtep_ip)
@@ -1411,7 +1485,7 @@ def _ensure_vxlan_in_container_iproute(
                                                 path_entry = path_info[0]
                                                 if isinstance(path_entry, dict):
                                                     next_hop_ip = path_entry.get("nexthop") or path_entry.get("ip")
-                                                    if next_hop_ip and next_hop_ip != local_ip:
+                                                    if next_hop_ip and next_hop_ip != local_ip and next_hop_ip != '0.0.0.0':
                                                         bgp_next_hop = next_hop_ip
                                                         actual_vtep_ip = bgp_next_hop
                                                         logger.info("[VXLAN] Using BGP next-hop %s as remote VTEP IP from Type-2 route JSON path_info", actual_vtep_ip)
@@ -1440,7 +1514,7 @@ def _ensure_vxlan_in_container_iproute(
                             from_match = re.search(r'from\s+(\d+\.\d+\.\d+\.\d+)', line, re.IGNORECASE)
                             if from_match:
                                 candidate_next_hop = from_match.group(1)
-                                if candidate_next_hop != local_ip and candidate_next_hop.startswith(('192.', '10.', '172.')):
+                                if candidate_next_hop != local_ip and candidate_next_hop != '0.0.0.0' and candidate_next_hop.startswith(('192.', '10.', '172.')):
                                     bgp_next_hop = candidate_next_hop
                                     actual_vtep_ip = bgp_next_hop
                                     logger.info("[VXLAN] Using BGP next-hop %s as remote VTEP IP from Type-2 route", actual_vtep_ip)
@@ -1457,10 +1531,11 @@ def _ensure_vxlan_in_container_iproute(
                                     if (candidate_next_hop != local_ip and 
                                         candidate_next_hop != remote_ip and
                                         candidate_next_hop.startswith(('192.', '10.', '172.'))):
-                                        bgp_next_hop = candidate_next_hop
-                                        actual_vtep_ip = bgp_next_hop
-                                        logger.info("[VXLAN] Using BGP next-hop %s as remote VTEP IP from Type-2 route (column)", actual_vtep_ip)
-                                        break
+                                        if candidate_next_hop != '0.0.0.0':
+                                            bgp_next_hop = candidate_next_hop
+                                            actual_vtep_ip = bgp_next_hop
+                                            logger.info("[VXLAN] Using BGP next-hop %s as remote VTEP IP from Type-2 route (column)", actual_vtep_ip)
+                                            break
                             if actual_vtep_ip != remote_ip and actual_vtep_ip != local_ip:
                                 break
             
@@ -1480,10 +1555,11 @@ def _ensure_vxlan_in_container_iproute(
                                 if (candidate_next_hop != local_ip and 
                                     candidate_next_hop != remote_ip and
                                     candidate_next_hop.startswith(('192.', '10.', '172.'))):
-                                    bgp_next_hop = candidate_next_hop
-                                    actual_vtep_ip = bgp_next_hop
-                                    logger.info("[VXLAN] Using BGP next-hop %s as remote VTEP IP from Type-2 routes (all routes)", actual_vtep_ip)
-                                    break
+                                    if candidate_next_hop != '0.0.0.0':
+                                        bgp_next_hop = candidate_next_hop
+                                        actual_vtep_ip = bgp_next_hop
+                                        logger.info("[VXLAN] Using BGP next-hop %s as remote VTEP IP from Type-2 routes (all routes)", actual_vtep_ip)
+                                        break
                         if actual_vtep_ip != remote_ip and actual_vtep_ip != local_ip:
                             break
                 except Exception:
@@ -1514,10 +1590,11 @@ def _ensure_vxlan_in_container_iproute(
                                 try:
                                     # IP length should be 32 for IPv4
                                     if route_parts[2] == '32':
-                                        # IPv4 address (OrigIP) follows at positions 3-6
-                                        orig_ip = '.'.join(route_parts[3:7])
+                                        # IPv4 address (OrigIP) is at position 3, may have trailing ']'
+                                        orig_ip = route_parts[3].rstrip(']')
                                         # OrigIP is the actual VTEP IP
                                         if (orig_ip != local_ip and 
+                                            orig_ip != '0.0.0.0' and
                                             orig_ip.startswith(('192.', '10.', '172.'))):
                                             actual_vtep_ip = orig_ip
                                             logger.info("[VXLAN] Found actual VTEP IP %s from Type-3 route OrigIP", actual_vtep_ip)
@@ -1537,6 +1614,7 @@ def _ensure_vxlan_in_container_iproute(
                                     if j+2 < len(parts) and parts[j] == 'from':
                                         candidate_next_hop = parts[j+1]
                                         if (candidate_next_hop != local_ip and 
+                                            candidate_next_hop != '0.0.0.0' and
                                             candidate_next_hop.startswith(('192.', '10.', '172.'))):
                                             bgp_next_hop = candidate_next_hop
                                             # Only use BGP next-hop as fallback if OrigIP not found
@@ -1720,6 +1798,23 @@ def _ensure_vxlan_in_container_iproute(
         # Note: actual_vtep_ip and bgp_next_hop are already extracted above from Type-3 routes
         
         if remote_mac and remote_svi_ip:
+            # Determine SVI interface for ARP entries (VLAN subinterface if VLAN-aware, bridge otherwise)
+            # This should match the SVI interface used above
+            svi_interface_for_arp = bridge_name  # Default: use bridge
+            if vlan_id and vlan_id > 0:
+                # For VLAN-aware bridges, use VLAN subinterface for ARP entries (consistent with SVI)
+                svi_interface_for_arp = f"vlan{vlan_id}"
+                # Check if VLAN subinterface exists (it should if SVI was configured above)
+                try:
+                    container = frr_manager.client.containers.get(container_name)
+                    check_result = container.exec_run(["ip", "link", "show", svi_interface_for_arp])
+                    if check_result.returncode != 0:
+                        # VLAN subinterface doesn't exist, fall back to bridge
+                        svi_interface_for_arp = bridge_name
+                        logger.debug("[VXLAN] VLAN subinterface %s not found, using bridge %s for ARP", f"vlan{vlan_id}", bridge_name)
+                except Exception:
+                    svi_interface_for_arp = bridge_name
+            
             # Configure permanent ARP entry
             # CRITICAL: Delete any existing zebra-managed ARP entry first to remove NOARP flag
             try:
@@ -1727,13 +1822,13 @@ def _ensure_vxlan_in_container_iproute(
                 container = frr_manager.client.containers.get(container_name)
                 
                 # Check if ARP entry exists with NOARP flag (zebra-managed)
-                neigh_result = container.exec_run(["ip", "neigh", "show", "dev", bridge_name, remote_svi_ip_clean])
+                neigh_result = container.exec_run(["ip", "neigh", "show", "dev", svi_interface_for_arp, remote_svi_ip_clean])
                 neigh_output = neigh_result.output.decode("utf-8", errors="ignore") if isinstance(neigh_result.output, bytes) else str(neigh_result.output)
                 
                 # Delete existing entry if it has NOARP or proto zebra
                 if remote_svi_ip_clean in neigh_output and ('NOARP' in neigh_output or 'proto zebra' in neigh_output):
                     try:
-                        _container_ip(frr_manager, container_name, ["ip", "neigh", "del", remote_svi_ip_clean, "dev", bridge_name])
+                        _container_ip(frr_manager, container_name, ["ip", "neigh", "del", remote_svi_ip_clean, "dev", svi_interface_for_arp])
                         logger.info("[VXLAN] Deleted existing zebra-managed ARP entry for %s", remote_svi_ip_clean)
                     except Exception:
                         pass  # Entry might not exist, continue
@@ -1742,10 +1837,10 @@ def _ensure_vxlan_in_container_iproute(
                 _container_ip(frr_manager, container_name, [
                     "ip", "neigh", "replace", remote_svi_ip_clean,
                     "lladdr", remote_mac,
-                    "dev", bridge_name,
+                    "dev", svi_interface_for_arp,
                     "nud", "permanent"
                 ])
-                logger.info("[VXLAN] Configured permanent ARP entry: %s -> %s on %s (kernel-managed)", remote_svi_ip_clean, remote_mac, bridge_name)
+                logger.info("[VXLAN] Configured permanent ARP entry: %s -> %s on %s (kernel-managed)", remote_svi_ip_clean, remote_mac, svi_interface_for_arp)
             except Exception as arp_exc:
                 logger.warning("[VXLAN] Failed to configure ARP entry for %s: %s", remote_svi_ip, arp_exc)
             
@@ -1778,11 +1873,35 @@ def _ensure_vxlan_in_container_iproute(
                 
                 # Get actual VTEP IP for FDB entry
                 # Use the actual VTEP IP we extracted earlier, or try to extract it now
-                if 'actual_vtep_ip' in locals() and actual_vtep_ip and actual_vtep_ip != remote_ip and actual_vtep_ip != local_ip:
+                if 'actual_vtep_ip' in locals() and actual_vtep_ip and actual_vtep_ip != remote_ip and actual_vtep_ip != local_ip and actual_vtep_ip != '0.0.0.0':
                     fdb_dst_ip = actual_vtep_ip
                     logger.debug("[VXLAN] Using extracted actual VTEP IP %s for FDB entry", fdb_dst_ip)
                 else:
-                    fdb_dst_ip = remote_ip
+                    # If actual_vtep_ip is 0.0.0.0 or invalid, try to get from Type-3 route OrigIP
+                    if 'actual_vtep_ip' in locals() and actual_vtep_ip == '0.0.0.0':
+                        logger.warning("[VXLAN] actual_vtep_ip is 0.0.0.0, trying to extract from Type-3 route OrigIP")
+                        try:
+                            container = frr_manager.client.containers.get(container_name)
+                            type3_result = container.exec_run(["vtysh", "-c", "show bgp l2vpn evpn route type multicast"])
+                            type3_output = type3_result.output.decode("utf-8", errors="ignore") if isinstance(type3_result.output, bytes) else str(type3_result.output)
+                            import re
+                            # Look for OrigIP in Type-3 route: [3]:[5000]:[32]:[192.168.250.1]
+                            for line in type3_output.split('\n'):
+                                if '[3]:' in line and f'[{vni}]' in line:
+                                    # Extract OrigIP from route prefix
+                                    origip_match = re.search(r'\[3\]:\[(\d+)\]:\[32\]:\[(\d+\.\d+\.\d+\.\d+)\]', line)
+                                    if origip_match:
+                                        orig_ip = origip_match.group(2)
+                                        if orig_ip != local_ip and orig_ip != '0.0.0.0' and orig_ip.startswith(('192.', '10.', '172.')):
+                                            fdb_dst_ip = orig_ip
+                                            actual_vtep_ip = orig_ip
+                                            logger.info("[VXLAN] Extracted actual VTEP IP %s from Type-3 route OrigIP for FDB", fdb_dst_ip)
+                                            break
+                        except Exception:
+                            pass
+                    if not fdb_dst_ip or fdb_dst_ip == '0.0.0.0':
+                        fdb_dst_ip = remote_ip
+                        logger.warning("[VXLAN] Using remote_ip %s as FDB destination (actual VTEP IP not found)", fdb_dst_ip)
                 
                 # If we still don't have the correct VTEP IP, try to get it from Type-2 route details
                 if fdb_dst_ip == remote_ip or fdb_dst_ip == bgp_next_hop or fdb_dst_ip == local_ip:
@@ -1843,15 +1962,15 @@ def _ensure_vxlan_in_container_iproute(
                                     current_dst = parts[i+1]
                                     break
                             
-                            # If destination is wrong (BGP next-hop instead of actual VTEP), delete it
-                            if current_dst and current_dst != fdb_dst_ip and (current_dst == bgp_next_hop or current_dst == '192.168.0.1'):
+                            # If destination is wrong (BGP next-hop instead of actual VTEP, or 0.0.0.0), delete it
+                            if current_dst and current_dst != fdb_dst_ip and (current_dst == bgp_next_hop or current_dst == '192.168.0.1' or current_dst == '0.0.0.0'):
                                 try:
                                     # Delete existing FDB entry
                                     del_cmd = ["bridge", "fdb", "del", remote_mac, "dev", vxlan_iface]
                                     if 'dst' in line:
                                         del_cmd.extend(["dst", current_dst])
                                     _container_ip(frr_manager, container_name, del_cmd)
-                                    logger.info("[VXLAN] Deleted existing FDB entry with wrong VTEP %s", current_dst)
+                                    logger.info("[VXLAN] Deleted existing FDB entry with wrong/invalid VTEP %s", current_dst)
                                 except Exception:
                                     pass  # Continue even if delete fails
                 except Exception:
