@@ -148,23 +148,91 @@ class TrafficGeneratorClient(
         """Handle application close event - cleanup threads and resources."""
         if self._is_closing:
             # Already in the process of closing, ignore
+            event.accept()
             return
             
         self._is_closing = True
+        
+        # CRITICAL: Clean up save worker before closing
+        if hasattr(self, '_save_worker') and self._save_worker is not None:
+            try:
+                save_worker = self._save_worker
+                self._save_worker = None  # Clear reference first
+                
+                if save_worker.isRunning():
+                    print("[CLEANUP] Waiting for save worker to finish...")
+                    save_worker.quit()  # Request thread to stop
+                    if not save_worker.wait(3000):
+                        print("[CLEANUP] Force terminating save worker...")
+                        save_worker.terminate()
+                        save_worker.wait(1000)
+                
+                # Only deleteLater after thread has definitely stopped
+                if not save_worker.isRunning():
+                    save_worker.deleteLater()
+                else:
+                    print("[CLEANUP] WARNING: Save worker still running after cleanup attempt")
+            except RuntimeError:
+                # Object already deleted, ignore
+                pass
+            except Exception as exc:
+                print(f"[CLEANUP] Error cleaning up save worker: {exc}")
         print("[CLEANUP] Application closing, cleaning up threads...")
+        save_worker_status = 'N/A'
+        try:
+            save_worker = getattr(self, '_save_worker', None)
+            if save_worker is not None:
+                save_worker_status = save_worker.isRunning()
+        except (RuntimeError, AttributeError):
+            save_worker_status = 'deleted'
+        
+        retry_worker_status = 'N/A'
+        try:
+            if self.server_retry_worker:
+                retry_worker_status = self.server_retry_worker.isRunning()
+        except (RuntimeError, AttributeError):
+            retry_worker_status = 'deleted'
+        
+        health_worker_status = 'N/A'
+        try:
+            if self.health_check_worker:
+                health_worker_status = self.health_check_worker.isRunning()
+        except (RuntimeError, AttributeError):
+            health_worker_status = 'deleted'
+        
         print(f"[CLEANUP] Active thread summary -> "
               f"operation_worker={getattr(self.devices_tab, 'operation_worker', None)}, "
               f"arp_worker={getattr(self.devices_tab, 'arp_check_worker', None)}, "
               f"bulk_arp_worker={getattr(self.devices_tab, 'bulk_arp_worker', None)}, "
-              f"retry_worker_running={self.server_retry_worker.isRunning() if self.server_retry_worker else 'N/A'}, "
-              f"health_worker_running={self.health_check_worker.isRunning() if self.health_check_worker else 'N/A'}, "
-              f"save_worker_running={getattr(self, '_save_worker', None).isRunning() if getattr(self, '_save_worker', None) else 'N/A'}")
+              f"retry_worker_running={retry_worker_status}, "
+              f"health_worker_running={health_worker_status}, "
+              f"save_worker_running={save_worker_status}")
         
         # Stop all timers first
         if hasattr(self, 'devices_tab') and self.devices_tab:
             if hasattr(self.devices_tab, 'status_timer') and self.devices_tab.status_timer:
                 print("[CLEANUP] Stopping status timer...")
                 self.devices_tab.status_timer.stop()
+        # Stop main window timers
+        if hasattr(self, 'timer') and self.timer:
+            try:
+                print("[CLEANUP] Stopping main statistics timer...")
+                self.timer.stop()
+            except Exception:
+                pass
+        if hasattr(self, 'stream_stats_timer') and self.stream_stats_timer:
+            try:
+                print("[CLEANUP] Stopping stream statistics timer...")
+                self.stream_stats_timer.stop()
+            except Exception:
+                pass
+        # Stop server section debounce timer if present
+        if hasattr(self, '_stream_table_update_timer') and getattr(self, '_stream_table_update_timer', None):
+            try:
+                print("[CLEANUP] Stopping stream table update timer...")
+                self._stream_table_update_timer.stop()
+            except Exception:
+                pass
         
         # Clean up devices tab threads
         if hasattr(self, 'devices_tab') and self.devices_tab:
@@ -187,6 +255,27 @@ class TrafficGeneratorClient(
         if self.health_check_worker:
             self.health_check_worker.stop()
             self.health_check_worker.wait(3000)  # Wait up to 3 seconds
+        # Ensure any lingering save worker is stopped (belt and suspenders)
+        save_worker = getattr(self, "_save_worker", None)
+        if save_worker:
+            try:
+                self._save_worker = None  # Clear reference first
+                if save_worker.isRunning():
+                    print("[CLEANUP] Waiting for save worker to finish...")
+                    save_worker.quit()  # Request thread to stop
+                    if not save_worker.wait(3000):
+                        print("[CLEANUP] Force terminating save worker...")
+                        save_worker.terminate()
+                        save_worker.wait(500)
+                
+                # Only deleteLater after thread has definitely stopped
+                if not save_worker.isRunning():
+                    save_worker.deleteLater()
+            except RuntimeError:
+                # Object already deleted, ignore
+                pass
+            except Exception as exc:
+                print(f"[CLEANUP] Error in final save worker cleanup: {exc}")
         
         # Close connection manager
         if self.connection_manager:

@@ -191,57 +191,72 @@ class TrafficGenClientMenuAction():
         # Prevent new async saves while shutting down; blocking saves still allowed
         if getattr(self, "_is_closing", False) and not blocking:
             return
-        if not blocking:
-            # Check if this is a duplicate save call within a short time window
-            if hasattr(self, '_last_save_time') and (current_time - self._last_save_time) < 1.0:
-                # Skipping duplicate save call
-                return
-            self._last_save_time = current_time
-        # Check if another save is already in progress
-        in_progress = getattr(self, '_save_in_progress', False)
-        worker_exists = hasattr(self, '_save_worker') and self._save_worker is not None
-        worker_running = False
-        if worker_exists:
-            try:
-                worker_running = self._save_worker.isRunning()
-            except RuntimeError:
-                worker_running = False
-                self._save_worker = None
-                worker_exists = False
         
-        if in_progress:
+        # Check if another save is already in progress
+        # Use a lock to prevent race conditions
+        if not hasattr(self, '_save_lock'):
+            from threading import Lock
+            self._save_lock = Lock()
+        
+        with self._save_lock:
+            in_progress = getattr(self, '_save_in_progress', False)
+            worker_exists = hasattr(self, '_save_worker') and self._save_worker is not None
+            worker_running = False
+            if worker_exists:
+                try:
+                    # Double-check worker is still valid (might have been deleted)
+                    if self._save_worker is not None:
+                        worker_running = self._save_worker.isRunning()
+                except RuntimeError:
+                    # Worker was deleted, treat as not running
+                    worker_running = False
+                    self._save_worker = None
+                    worker_exists = False
+        
+        if in_progress or worker_running:
             if blocking:
                 # Wait for the existing background worker to finish before proceeding
-                if worker_exists and worker_running:
+                if worker_exists and worker_running and self._save_worker is not None:
                     print("[SAVE SESSION] Waiting for existing background save to finish (blocking request)...")
+                    self._save_worker.quit()  # Request thread to stop
                     if not self._save_worker.wait(5000):
                         print("[SAVE SESSION WARNING] Background save did not finish within timeout; forcing termination.")
                         self._save_worker.terminate()
                         self._save_worker.wait(1000)
                 if worker_exists and self._save_worker is not None:
                     try:
-                        self._save_worker.deleteLater()
+                        if not self._save_worker.isRunning():
+                            self._save_worker.deleteLater()
                     except RuntimeError:
                         pass
                     self._save_worker = None
                 self._save_in_progress = False
             else:
                 # Non-blocking call while a save is already in progress – skip
+                print("[SAVE SESSION] Save already in progress, skipping duplicate save request")
                 return
         
-        # For blocking saves we still update the timestamp so throttling remains accurate
+        # Throttle rapid save calls (only for non-blocking saves)
+        if not blocking:
+            # Check if this is a duplicate save call within a short time window
+            if hasattr(self, '_last_save_time') and (current_time - self._last_save_time) < 0.5:
+                print("[SAVE SESSION] Skipping duplicate save call (throttled)")
+                return
+        # Update timestamp for throttling (both blocking and non-blocking)
         self._last_save_time = current_time
         
         # Re-evaluate worker flags after potential cleanup above
-        worker_exists = hasattr(self, '_save_worker') and self._save_worker is not None
-        worker_running = False
-        if worker_exists:
-            try:
-                worker_running = self._save_worker.isRunning()
-            except RuntimeError:
-                worker_running = False
-                self._save_worker = None
-                worker_exists = False
+        with self._save_lock:
+            worker_exists = hasattr(self, '_save_worker') and self._save_worker is not None
+            worker_running = False
+            if worker_exists:
+                try:
+                    if self._save_worker is not None:
+                        worker_running = self._save_worker.isRunning()
+                except RuntimeError:
+                    worker_running = False
+                    self._save_worker = None
+                    worker_exists = False
         
         # CRITICAL: Extract PyQt widget data in main thread before starting worker
         # PyQt widgets cannot be accessed from worker threads
@@ -259,15 +274,17 @@ class TrafficGenClientMenuAction():
         # If we're running a blocking save during shutdown, wait for any existing worker
         if blocking:
             try:
-                if worker_exists and worker_running:
+                if worker_exists and worker_running and self._save_worker is not None:
                     print("[SAVE SESSION] Waiting for existing background save to finish...")
+                    self._save_worker.quit()  # Request thread to stop
                     if not self._save_worker.wait(5000):
                         print("[SAVE SESSION WARNING] Background save did not finish within timeout; forcing termination.")
                         self._save_worker.terminate()
                         self._save_worker.wait(1000)
                 if worker_exists and self._save_worker is not None:
                     try:
-                        self._save_worker.deleteLater()
+                        if not self._save_worker.isRunning():
+                            self._save_worker.deleteLater()
                     except RuntimeError:
                         pass
                     self._save_worker = None
@@ -309,29 +326,41 @@ class TrafficGenClientMenuAction():
         # CRITICAL: Check if worker exists and is valid before checking isRunning()
         # The worker might have been deleted via deleteLater() but not yet cleaned up
         # Clean up previous worker if it exists and is finished
-        if worker_exists and not worker_running:
-            try:
-                # Previous worker finished, clean it up
-                self._save_worker.deleteLater()
-            except RuntimeError:
-                # Object already deleted, ignore
+        with self._save_lock:
+            if worker_exists and not worker_running:
+                try:
+                    # Previous worker finished, ensure it's fully stopped before cleanup
+                    worker = self._save_worker
+                    self._save_worker = None  # Clear reference first
+                    if worker.isRunning():
+                        worker.quit()
+                        worker.wait(100)
+                    if not worker.isRunning():
+                        worker.deleteLater()
+                except RuntimeError:
+                    # Object already deleted, ignore
+                    pass
+                except Exception as exc:
+                    print(f"[SAVE SESSION] Error cleaning up previous worker: {exc}")
+            
+            # CRITICAL: Don't create a new worker if one is already running
+            # This prevents multiple workers from being created during rapid save calls
+            if worker_exists and worker_running:
+                # Worker already running, skip creating a new one
+                print("[SAVE SESSION] Save worker already running, skipping duplicate save request")
+                return True, "Save already in progress"
+            
+            # Create new worker if needed
+            if not worker_exists or self._save_worker is None:
+                self._save_worker = SaveSessionWorker(self, protocol_data)
+                # CRITICAL: Set parent to ensure proper cleanup
+                self._save_worker.setParent(self)
+                # CRITICAL: Connect finished signal to our handler (NOT deleteLater - handle cleanup manually)
+                self._save_worker.finished.connect(self._on_save_finished)
+                self._save_worker.start()
+            else:
+                # Worker already running, just mark as in progress
                 pass
-            self._save_worker = None
-        
-        # Create new worker if needed
-        if not worker_exists or self._save_worker is None:
-            self._save_worker = SaveSessionWorker(self, protocol_data)
-            # CRITICAL: Set parent to ensure proper cleanup
-            self._save_worker.setParent(self)
-            # Reset finish connection tracking for this worker
-            # CRITICAL: Connect finished signal to deleteLater for automatic cleanup
-            self._save_worker.finished.connect(self._save_worker.deleteLater)
-            # Connect finished signal to our handler
-            self._save_worker.finished.connect(self._on_save_finished)
-            self._save_worker.start()
-        else:
-            # Worker already running, just mark as in progress
-            pass
     
     def _on_save_finished(self, success, message):
         """Handle save completion (called from worker thread via signal)."""
@@ -341,12 +370,30 @@ class TrafficGenClientMenuAction():
         else:
             print(f"[SAVE SESSION ERROR] {message}")
         
-        # CRITICAL: Don't call deleteLater() here - it's already connected to finished signal
-        # Just clear the reference after a short delay to allow deleteLater() to process
+        # CRITICAL: Properly clean up the worker thread
+        # Wait for thread to finish, then schedule deletion
         if hasattr(self, '_save_worker') and self._save_worker is not None:
+            worker = self._save_worker
+            self._save_worker = None  # Clear reference immediately to prevent reuse
+            
+            # Ensure thread has finished before scheduling deletion
+            if worker.isRunning():
+                # Thread should have finished by now, but wait just in case
+                worker.wait(100)  # Short wait to ensure thread is done
+            
+            # Schedule deletion in main thread
             from PyQt5.QtCore import QTimer
-            # Clear reference after a short delay to allow deleteLater() to process
-            QTimer.singleShot(100, lambda: setattr(self, '_save_worker', None))
+            def cleanup_worker():
+                try:
+                    if worker.isRunning():
+                        worker.quit()
+                        worker.wait(100)
+                    worker.deleteLater()
+                except RuntimeError:
+                    # Worker already deleted, ignore
+                    pass
+            
+            QTimer.singleShot(50, cleanup_worker)
     
     def _save_session_impl(self, protocol_data=None):
         """Internal implementation of save_session (runs in worker thread).
@@ -455,6 +502,9 @@ class TrafficGenClientMenuAction():
             
             import requests
             
+            # Track devices that were successfully cleaned up or don't exist anymore
+            devices_to_remove_from_session = []
+            
             for device_id in removed_device_ids:
                 try:
                     # Find device info for this ID
@@ -466,8 +516,11 @@ class TrafficGenClientMenuAction():
                             device_name = name
                             break
                     
+                    # If device info not found, it means the device was already removed from session
+                    # or doesn't exist. We should remove it from removed_devices list.
                     if not device_info:
-                        print(f"[DEBUG CLEANUP] Device info not found for ID: {device_id}")
+                        print(f"[DEBUG CLEANUP] Device info not found for ID: {device_id} - already removed or doesn't exist")
+                        devices_to_remove_from_session.append(device_id)
                         continue
                     
                     print(f"[DEBUG CLEANUP] Cleaning up removed device: {device_name} (ID: {device_id})")
@@ -487,10 +540,16 @@ class TrafficGenClientMenuAction():
                     }
                     
                     cleanup_resp = requests.post(f"{server_url}/api/device/cleanup", json=cleanup_payload, timeout=10)
-                    if cleanup_resp.status_code == 200:
+                    cleanup_success = cleanup_resp.status_code == 200
+                    if cleanup_success:
                         print(f"[DEBUG CLEANUP] Successfully cleaned up IPs for device: {device_name}")
                     else:
-                        print(f"[DEBUG CLEANUP] Cleanup failed for {device_name}: {cleanup_resp.status_code}")
+                        # If device doesn't exist (404), it's already cleaned up
+                        if cleanup_resp.status_code == 404:
+                            print(f"[DEBUG CLEANUP] Device {device_name} doesn't exist on server (already removed)")
+                            cleanup_success = True  # Treat as success since device is already gone
+                        else:
+                            print(f"[DEBUG CLEANUP] Cleanup failed for {device_name}: {cleanup_resp.status_code}")
                     
                     # Also call the device remove API for protocol cleanup
                     remove_payload = {
@@ -504,13 +563,47 @@ class TrafficGenClientMenuAction():
                     }
                     
                     remove_resp = requests.post(f"{server_url}/api/device/remove", json=remove_payload, timeout=10)
-                    if remove_resp.status_code == 200:
+                    remove_success = remove_resp.status_code == 200
+                    if remove_success:
                         print(f"[DEBUG CLEANUP] Successfully removed device protocols: {device_name}")
                     else:
-                        print(f"[DEBUG CLEANUP] Remove API failed for {device_name}: {remove_resp.status_code}")
+                        # If device doesn't exist (404), it's already removed
+                        if remove_resp.status_code == 404:
+                            print(f"[DEBUG CLEANUP] Device {device_name} doesn't exist on server (already removed)")
+                            remove_success = True  # Treat as success since device is already gone
+                        else:
+                            print(f"[DEBUG CLEANUP] Remove API failed for {device_name}: {remove_resp.status_code}")
+                    
+                    # If cleanup was successful (or device doesn't exist), remove from session
+                    if cleanup_success or remove_success:
+                        devices_to_remove_from_session.append(device_id)
                         
                 except Exception as e:
                     print(f"[ERROR] Failed to cleanup device {device_id}: {e}")
+            
+            # Remove successfully cleaned devices from session.json
+            if devices_to_remove_from_session:
+                try:
+                    from utils.path_utils import get_session_file_path
+                    session_file = get_session_file_path()
+                    with open(session_file, "r") as f:
+                        session_data = json.load(f)
+                    
+                    removed_devices = session_data.get("removed_devices", [])
+                    # Remove devices that were successfully cleaned up
+                    original_count = len(removed_devices)
+                    session_data["removed_devices"] = [
+                        dev_id for dev_id in removed_devices 
+                        if dev_id not in devices_to_remove_from_session
+                    ]
+                    removed_count = original_count - len(session_data["removed_devices"])
+                    
+                    if removed_count > 0:
+                        with open(session_file, "w") as f:
+                            json.dump(session_data, f, indent=2)
+                        print(f"[DEBUG CLEANUP] Removed {removed_count} device(s) from session.json removed_devices list")
+                except Exception as e:
+                    print(f"[ERROR] Failed to update session.json: {e}")
             
             print(f"[DEBUG CLEANUP] Completed server cleanup for removed devices")
             

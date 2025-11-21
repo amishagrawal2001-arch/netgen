@@ -21,6 +21,7 @@ from utils.devices_tab_bgp import BGPHandler
 from utils.devices_tab_ospf import OSPFHandler
 from utils.devices_tab_isis import ISISHandler
 from utils.devices_tab_dhcp import DHCPHandler
+from utils.devices_tab_vxlan import VXLANHandler
 from .add_device_dialog import AddDeviceDialog
 from .add_bgp_dialog import AddBgpDialog
 from .add_ospf_dialog import AddOspfDialog
@@ -1488,6 +1489,7 @@ class DevicesTab(QWidget):
         self.ospf_handler = OSPFHandler(self)
         self.isis_handler = ISISHandler(self)
         self.dhcp_handler = DHCPHandler(self)
+        self.vxlan_handler = VXLANHandler(self)
 
         # Create Devices sub-tab
         self.devices_subtab = QWidget()
@@ -1509,12 +1511,17 @@ class DevicesTab(QWidget):
         self.dhcp_subtab = QWidget()
         self.dhcp_handler.setup_dhcp_subtab()
 
+        # Create VXLAN sub-tab
+        self.vxlan_subtab = QWidget()
+        self.vxlan_handler.setup_vxlan_subtab()
+
         # Add tabs to tab widget
         self.tab_widget.addTab(self.devices_subtab, "Devices")
         self.tab_widget.addTab(self.bgp_subtab, "BGP")
         self.tab_widget.addTab(self.ospf_subtab, "OSPF")
         self.tab_widget.addTab(self.isis_subtab, "ISIS")
         self.tab_widget.addTab(self.dhcp_subtab, "DHCP")
+        self.tab_widget.addTab(self.vxlan_subtab, "VXLAN")
 
 
     def setup_devices_subtab(self):
@@ -1524,7 +1531,19 @@ class DevicesTab(QWidget):
         # columns
         # Simplified device table - only essential device info
         self.device_headers = [
-            "Device Name", "Status", "IPv4", "IPv6", "VLAN", "IPv4 Gateway", "IPv6 Gateway", "IPv4 Mask", "IPv6 Mask", "MAC Address", "Loopback IPv4", "Loopback IPv6"
+            "Device Name",
+            "Status",
+            "IPv4",
+            "IPv6",
+            "VLAN",
+            "IPv4 Gateway",
+            "IPv6 Gateway",
+            "IPv4 Mask",
+            "IPv6 Mask",
+            "MAC Address",
+            "Loopback IPv4",
+            "Loopback IPv6",
+            "VXLAN",
         ]
         # Add Device List label
         layout.addWidget(QLabel("Device List"))
@@ -1559,10 +1578,12 @@ class DevicesTab(QWidget):
         self.devices_table.setColumnWidth(self.COL["MAC Address"], 150)
         self.devices_table.setColumnWidth(self.COL["Loopback IPv4"], 130)
         self.devices_table.setColumnWidth(self.COL["Loopback IPv6"], 150)
+        self.devices_table.setColumnWidth(self.COL["VXLAN"], 200)
 
         # optionally hide internal-ish fields (starting from column 12, after Loopback IPv4 and IPv6 at columns 10-11)
         for col in range(12, 16):
-            self.devices_table.setColumnHidden(col, True)
+            if col >= len(self.device_headers):
+                self.devices_table.setColumnHidden(col, True)
 
         # ---- icons via shared loader ----
         def load_icon(filename: str) -> QIcon:
@@ -2506,8 +2527,19 @@ class DevicesTab(QWidget):
                             # Update overall status icon based on device status first, then ARP status
                             if device_status == "Running":
                                 # Device is running - check ARP status
-                                # Show green dot only when both IPv4 and IPv6 ARP are resolved
-                                overall_resolved = arp_results["ipv4_resolved"] and arp_results["ipv6_resolved"]
+                                # Only require ARP resolution for configured addresses (same logic as _check_individual_arp_resolution)
+                                ipv6_value = (device_data.get("ipv6_address") or device_data.get("IPv6") or "").strip()
+                                ipv6_configured = bool(ipv6_value)
+                                gateway_value = (device_data.get("ipv4_gateway") or device_data.get("IPv4 Gateway") or "").strip()
+                                gateway_configured = bool(gateway_value)
+                                
+                                # Determine overall ARP status - require only the components that exist
+                                overall_resolved = arp_results["ipv4_resolved"]
+                                if ipv6_configured:
+                                    overall_resolved = overall_resolved and arp_results["ipv6_resolved"]
+                                if gateway_configured:
+                                    overall_resolved = overall_resolved and arp_results["gateway_resolved"]
+                                
                                 self.set_status_icon(row, resolved=overall_resolved, status_text=arp_results["overall_status"], device_status=device_status)
                             else:
                                 # Device is stopped or unknown status - pass device status to set_status_icon
@@ -2626,16 +2658,16 @@ class DevicesTab(QWidget):
             protocols_to_refresh = self._collect_protocols_for_rows(selected_rows)
             if not protocols_to_refresh:
                 return
-
+                
             if "BGP" in protocols_to_refresh:
                 self._safe_update_bgp_table()
             if "OSPF" in protocols_to_refresh:
                 self._safe_update_ospf_table()
             if "IS-IS" in protocols_to_refresh:
                 self._safe_update_isis_table()
-
+            
             print(f"[PROTOCOL REFRESH] Refreshed protocols: {', '.join(protocols_to_refresh)}")
-
+        
         except Exception as e:
             logging.error(f"[PROTOCOL REFRESH ERROR] {e}")
     
@@ -3039,9 +3071,13 @@ class DevicesTab(QWidget):
         
         # Save session after device application to persist status changes
         if successful_count > 0 and hasattr(self.main_window, "save_session"):
-            print(f"[DEBUG APPLY] Saving session after successful device application")
-            self.main_window.save_session()
-
+            print(f"[DEBUG APPLY] Saving session after successful device application ({successful_count} device(s) applied)")
+            try:
+                self.main_window.save_session()
+                print(f"[DEBUG APPLY] ✅ Session saved successfully after applying {successful_count} device(s)")
+            except Exception as save_exc:
+                print(f"[DEBUG APPLY] ⚠️ Failed to save session: {save_exc}")
+    
     def ping_selected_device(self):
         """Ping the selected device(s) after ensuring ARP has been resolved."""
         selected_items = self.devices_table.selectedItems()
@@ -3195,9 +3231,14 @@ class DevicesTab(QWidget):
                 print("[MULTI DEVICE APPLY] Apply operation already running, skipping new request")
                 return
             else:
-                # Clean up finished worker
-                self.multi_device_apply_worker.deleteLater()
+                # Clean up finished worker - ensure thread is stopped first
+                worker = self.multi_device_apply_worker
                 delattr(self, 'multi_device_apply_worker')
+                if worker.isRunning():
+                    worker.quit()
+                    worker.wait(100)
+                if not worker.isRunning():
+                    worker.deleteLater()
 
         # Collect devices to apply
         devices_to_apply = []
@@ -3274,9 +3315,14 @@ class DevicesTab(QWidget):
                 print("[ARP OPERATION] ARP operation already running, skipping new request")
                 return
             else:
-                # Clean up finished worker
-                self.arp_operation_worker.deleteLater()
+                # Clean up finished worker - ensure thread is stopped first
+                worker = self.arp_operation_worker
                 delattr(self, 'arp_operation_worker')
+                if worker.isRunning():
+                    worker.quit()
+                    worker.wait(100)
+                if not worker.isRunning():
+                    worker.deleteLater()
         
         # First run the apply operation silently (without showing dialog)
         self.apply_selected_device_silent()
@@ -3327,7 +3373,7 @@ class DevicesTab(QWidget):
             
             # Don't clear pending ARP rows here - they will be cleared when ARP operation finishes
             # delattr(self, '_pending_arp_rows')
-
+    
     def validate_cell_value(self, header_name, value, row=None, column=None):
         """Validate edited table cell values."""
         try:
@@ -3709,6 +3755,7 @@ class DevicesTab(QWidget):
                     "isis_config": device_info.get("isis_config", {}) or device_info.get("is_is_config", {}),
                     "dhcp_config": device_info.get("dhcp_config", {}),
                     "dhcp_mode": device_info.get("dhcp_mode", ""),
+                    "vxlan_config": device_info.get("vxlan_config", {}),
                 }
                 
                 resp = requests.post(f"{server_url}/api/device/apply", json=payload, timeout=30)
@@ -3771,6 +3818,8 @@ class DevicesTab(QWidget):
                             device_info["ospf_config"] = db_device_data.get("ospf_config", {})
                         if not device_info.get("isis_config"):
                             device_info["isis_config"] = db_device_data.get("isis_config", {}) or db_device_data.get("is_is_config", {})
+                        if not device_info.get("vxlan_config"):
+                            device_info["vxlan_config"] = db_device_data.get("vxlan_config", {})
 
                         existing_dhcp_config = self._normalize_dhcp_config(device_info.get("dhcp_config"))
                         db_dhcp_config = self._normalize_dhcp_config(db_device_data.get("dhcp_config"))
@@ -3782,6 +3831,8 @@ class DevicesTab(QWidget):
 
                         if device_info.get("dhcp_config") and "DHCP" not in protocols_list:
                             protocols_list.append("DHCP")
+                        if device_info.get("vxlan_config") and "VXLAN" not in protocols_list:
+                            protocols_list.append("VXLAN")
                         device_info["protocols"] = protocols_list
                         
                         print(f"[DEBUG APPLY DEVICE] Updated device info - Protocols: {device_info.get('protocols', [])}")
@@ -3814,6 +3865,18 @@ class DevicesTab(QWidget):
                 device_info["dhcp_mode"] = dhcp_config.get("mode", "")
             else:
                 device_info["dhcp_config"] = {}
+
+            vxlan_config = self._with_vxlan_interfaces(
+                device_info.get("vxlan_config"),
+                iface_label,
+                device_info.get("VLAN", "0"),
+            )
+            if vxlan_config:
+                device_info["vxlan_config"] = vxlan_config
+                if "VXLAN" not in protocols_list:
+                    protocols_list.append("VXLAN")
+            else:
+                device_info["vxlan_config"] = {}
             
             payload = {
                 "device_id": device_id,
@@ -3826,6 +3889,8 @@ class DevicesTab(QWidget):
                 "ipv6_mask": device_info.get("ipv6_mask", "64"),
                 "ipv4_gateway": device_info.get("IPv4 Gateway", ""),
                 "ipv6_gateway": device_info.get("IPv6 Gateway", ""),
+                "loopback_ipv4": device_info.get("Loopback IPv4", ""),
+                "loopback_ipv6": device_info.get("Loopback IPv6", ""),
                 "protocols": self._convert_protocols_to_array(protocols_list),
                 "bgp_config": device_info.get("bgp_config", {}),
                 "ospf_config": device_info.get("ospf_config", {}),
@@ -3833,6 +3898,7 @@ class DevicesTab(QWidget):
                 "dhcp_config": device_info.get("dhcp_config", {}),
                 "dhcp_mode": device_info.get("dhcp_mode", ""),
                 "protocol_data": device_info.get("protocol_data", {}),
+                "vxlan_config": device_info.get("vxlan_config", {}),
             }
             
             print(f"[DEBUG APPLY DEVICE] Payload protocols: {payload['protocols']}")
@@ -3898,6 +3964,18 @@ class DevicesTab(QWidget):
                 device_info["dhcp_mode"] = dhcp_config.get("mode", "")
             else:
                 device_info["dhcp_config"] = {}
+
+            vxlan_config = self._with_vxlan_interfaces(
+                device_info.get("vxlan_config"),
+                iface_label,
+                device_info.get("VLAN", "0"),
+            )
+            if vxlan_config:
+                device_info["vxlan_config"] = vxlan_config
+                if "VXLAN" not in protocols_list:
+                    protocols_list.append("VXLAN")
+            else:
+                device_info["vxlan_config"] = {}
             
             basic_payload = {
                 "device_id": device_id,
@@ -3919,6 +3997,7 @@ class DevicesTab(QWidget):
                 "dhcp_config": device_info.get("dhcp_config", {}),
                 "dhcp_mode": device_info.get("dhcp_mode", ""),
                 "protocol_data": device_info.get("protocol_data", {}),
+                "vxlan_config": device_info.get("vxlan_config", {}),
             }
             
             # Apply basic device configuration
@@ -4096,13 +4175,18 @@ class DevicesTab(QWidget):
 
         (
             device_name, iface_name, mac, ipv4, ipv6, ipv4_mask, ipv6_mask,
-            vlan, ipv4_gateway, ipv6_gateway, incr_mac, incr_ipv4, incr_ipv6, incr_gateway, incr_vlan, incr_count, ospf_config, bgp_config, 
+            vlan, ipv4_gateway, ipv6_gateway, incr_mac, incr_ipv4, incr_ipv6, incr_gateway, incr_vlan, incr_vxlan, incr_count, ospf_config, bgp_config, 
             dhcp_config, ipv4_octet_index, ipv6_hextet_index, mac_byte_index, gateway_octet_index, incr_dhcp_pool, dhcp_pool_octet_index,
-            incr_loopback, loopback_ipv4_octet_index, loopback_ipv6_hextet_index, loopback_ipv4, loopback_ipv6, isis_config
+            incr_loopback, loopback_ipv4_octet_index, loopback_ipv6_hextet_index, loopback_ipv4, loopback_ipv6, isis_config,
+            vxlan_vni_increment_index, vxlan_local_octet_index, vxlan_remote_octet_index, vxlan_udp_increment_index
         ) = dialog.get_values()
+        vxlan_config = dialog.get_vxlan_config()
+        print(f"[DEBUG ADD DEVICE] VXLAN config from dialog: {vxlan_config}")
 
         ipv4_mask = ipv4_mask or "24"
         ipv6_mask = ipv6_mask or "64"
+        normalized_vxlan_config = self._normalize_vxlan_config(vxlan_config)
+        print(f"[DEBUG ADD DEVICE] Normalized VXLAN config: {normalized_vxlan_config}")
 
         # Get base name for incrementing - use "device" as default instead of "Device"
         base_name = (device_name or "").strip() or "device"
@@ -4117,7 +4201,7 @@ class DevicesTab(QWidget):
         # Create multiple devices if increment is enabled
         devices_to_create = []
         
-        if incr_count > 1 and (incr_mac or incr_ipv4 or incr_ipv6 or incr_gateway or incr_vlan or incr_loopback):
+        if incr_count > 1 and (incr_mac or incr_ipv4 or incr_ipv6 or incr_gateway or incr_vlan or incr_loopback or incr_vxlan):
             # Create multiple devices with incremented values
             for i in range(incr_count):
                 current_mac = mac
@@ -4196,6 +4280,61 @@ class DevicesTab(QWidget):
                     "Status": "Stopped",
                     "protocols": [],
                 }
+
+                # Always include VXLAN config if it exists (even if incomplete)
+                # This ensures VXLAN config is preserved when user enables VXLAN in UI
+                if normalized_vxlan_config:
+                    # Increment VXLAN fields if enabled
+                    per_device_vxlan = normalized_vxlan_config.copy()
+                    print(f"[DEBUG ADD DEVICE] Processing VXLAN config for device {i+1}/{incr_count}: {per_device_vxlan}")
+                    
+                    # Increment VNI if enabled
+                    if incr_vxlan and i > 0 and per_device_vxlan.get("vni"):
+                        vni_increment_steps = [1, 10, 100, 1000]  # Maps to +1, +10, +100, +1000
+                        increment_step = vni_increment_steps[vxlan_vni_increment_index] if (0 <= vxlan_vni_increment_index < len(vni_increment_steps)) else 1
+                        per_device_vxlan["vni"] = per_device_vxlan["vni"] + (i * increment_step)
+                    
+                    # Increment Local Endpoint if enabled
+                    if incr_vxlan and i > 0 and per_device_vxlan.get("local_ip"):
+                        try:
+                            local_ip = per_device_vxlan["local_ip"]
+                            incremented_local = self._increment_ipv4(local_ip, i, vxlan_local_octet_index)
+                            per_device_vxlan["local_ip"] = incremented_local
+                        except (ValueError, AttributeError):
+                            pass  # Keep as-is if invalid
+                    
+                    # Increment Remote Endpoints if enabled
+                    if incr_vxlan and i > 0 and per_device_vxlan.get("remote_peers"):
+                        incremented_remote_peers = []
+                        for remote_ip in per_device_vxlan["remote_peers"]:
+                            try:
+                                incremented_remote = self._increment_ipv4(remote_ip, i, vxlan_remote_octet_index)
+                                incremented_remote_peers.append(incremented_remote)
+                            except (ValueError, AttributeError):
+                                # If not a valid IP or can't parse, keep as-is
+                                incremented_remote_peers.append(remote_ip)
+                        per_device_vxlan["remote_peers"] = incremented_remote_peers
+                    
+                    # Increment UDP Port if enabled
+                    if incr_vxlan and i > 0 and per_device_vxlan.get("udp_port"):
+                        udp_increment_steps = [1, 10, 100]  # Maps to +1, +10, +100
+                        increment_step = udp_increment_steps[vxlan_udp_increment_index] if (0 <= vxlan_udp_increment_index < len(udp_increment_steps)) else 1
+                        per_device_vxlan["udp_port"] = per_device_vxlan["udp_port"] + (i * increment_step)
+                    
+                    per_device_vxlan = self._with_vxlan_interfaces(
+                        per_device_vxlan,
+                        iface,
+                        current_vlan,
+                    )
+                    device_data["vxlan_config"] = per_device_vxlan
+                    device_data["VXLAN"] = self._format_vxlan_summary(per_device_vxlan)
+                    if "VXLAN" not in device_data["protocols"]:
+                        device_data["protocols"].append("VXLAN")
+                    print(f"[DEBUG ADD DEVICE] Added VXLAN config to device {current_name}: {per_device_vxlan}")
+                else:
+                    # Ensure vxlan_config is always present (even if empty) for consistency
+                    device_data["vxlan_config"] = {}
+                    print(f"[DEBUG ADD DEVICE] No VXLAN config for device {current_name} - normalized_vxlan_config: {normalized_vxlan_config}")
                 
                 # Add OSPF protocol if enabled
                 print(f"[DEBUG ADD DEVICE] OSPF config for device {i+1}: {ospf_config}")
@@ -4242,31 +4381,66 @@ class DevicesTab(QWidget):
                     bgp_protocol_config = {
                         "bgp_asn": bgp_config.get("bgp_asn") or bgp_config.get("local_as", "65000"),
                         "bgp_remote_asn": bgp_config.get("bgp_remote_asn") or bgp_config.get("remote_as", "65001"),
-                        "mode": bgp_config.get("bgp_mode", "eBGP"),
+                        "mode": bgp_config.get("mode") or bgp_config.get("bgp_mode", "eBGP"),
                         "bgp_keepalive": bgp_config.get("bgp_keepalive", "30"),
                         "bgp_hold_time": bgp_config.get("bgp_hold_time", "90"),
                         "ipv4_enabled": bgp_config.get("ipv4_enabled", bgp_config.get("enabled", False)),
                         "ipv6_enabled": bgp_config.get("ipv6_enabled", False)
                     }
                     
+                    # Preserve use_loopback_ip and bgp_remote_loopback_ip from dialog config
+                    use_loopback_ip = bgp_config.get("use_loopback_ip", False)
+                    bgp_remote_loopback_ip = bgp_config.get("bgp_remote_loopback_ip", "")
+                    bgp_remote_loopback_ipv6 = bgp_config.get("bgp_remote_loopback_ipv6", "")
+                    if use_loopback_ip:
+                        bgp_protocol_config["use_loopback_ip"] = True
+                        bgp_protocol_config["bgp_remote_loopback_ip"] = bgp_remote_loopback_ip
+                        bgp_protocol_config["bgp_remote_loopback_ipv6"] = bgp_remote_loopback_ipv6
+                    
                     # Add IPv4 BGP configuration if enabled (support both old and new formats)
                     ipv4_enabled = bgp_config.get("ipv4_enabled", bgp_config.get("enabled", False))
                     if ipv4_enabled:
-                        # Always use the current incremented gateway and device IP for BGP configuration
-                        # This ensures that when multiple devices are created with increment,
-                        # each device gets the correct gateway and device IP for its BGP configuration
-                        neighbor_ipv4 = current_ipv4_gateway  # Use incremented gateway
-                        update_source_ipv4 = current_ipv4     # Use incremented device IP
+                        # Determine neighbor IP and update-source based on use_loopback_ip
+                        if use_loopback_ip and bgp_remote_loopback_ip:
+                            # Use remote loopback IP as neighbor when use_loopback_ip is checked
+                            neighbor_ipv4 = bgp_remote_loopback_ip
+                        else:
+                            # Default: use incremented gateway
+                            neighbor_ipv4 = current_ipv4_gateway
+                        
+                        # Determine update-source based on use_loopback_ip
+                        if use_loopback_ip and current_loopback_ipv4:
+                            # Use loopback IP as update-source when use_loopback_ip is checked
+                            update_source_ipv4 = current_loopback_ipv4
+                        else:
+                            # Default: use incremented device IP
+                            update_source_ipv4 = current_ipv4
+                        
                         bgp_protocol_config["bgp_neighbor_ipv4"] = neighbor_ipv4
                         bgp_protocol_config["bgp_update_source_ipv4"] = update_source_ipv4
                         bgp_protocol_config["protocol"] = "ipv4"
-                        print(f"[DEBUG ADD DEVICE] IPv4 BGP configured for device {current_name}: neighbor={neighbor_ipv4}, source={update_source_ipv4}")
+                        print(f"[DEBUG ADD DEVICE] IPv4 BGP configured for device {current_name}: neighbor={neighbor_ipv4}, source={update_source_ipv4}, use_loopback_ip={use_loopback_ip}")
                     
                     # Add IPv6 BGP configuration if enabled
                     if bgp_config.get("ipv6_enabled", False):
-                        # Use the already calculated IPv6 gateway and device IP for IPv6 BGP
-                        bgp_protocol_config["bgp_neighbor_ipv6"] = current_ipv6_gateway
-                        bgp_protocol_config["bgp_update_source_ipv6"] = current_ipv6
+                        # Determine neighbor IP and update-source based on use_loopback_ip
+                        if use_loopback_ip and bgp_remote_loopback_ipv6:
+                            # Use remote loopback IPv6 as neighbor when use_loopback_ip is checked
+                            neighbor_ipv6 = bgp_remote_loopback_ipv6
+                        else:
+                            # Default: use incremented gateway
+                            neighbor_ipv6 = current_ipv6_gateway
+                        
+                        # Determine update-source based on use_loopback_ip
+                        if use_loopback_ip and current_loopback_ipv6:
+                            # Use loopback IPv6 as update-source when use_loopback_ip is checked
+                            update_source_ipv6 = current_loopback_ipv6
+                        else:
+                            # Default: use incremented device IPv6
+                            update_source_ipv6 = current_ipv6
+                        
+                        bgp_protocol_config["bgp_neighbor_ipv6"] = neighbor_ipv6
+                        bgp_protocol_config["bgp_update_source_ipv6"] = update_source_ipv6
                         # If both IPv4 and IPv6 are enabled, use "dual-stack", otherwise use the specific protocol
                         if ipv4_enabled:
                             bgp_protocol_config["protocol"] = "dual-stack"
@@ -4342,7 +4516,7 @@ class DevicesTab(QWidget):
                     device_data["Protocols"] = ", ".join(unique_protocols)
                 else:
                     device_data["Protocols"] = ""
-
+                
                 devices_to_create.append(device_data)
         else:
             # Create single device - ensure unique name
@@ -4377,6 +4551,24 @@ class DevicesTab(QWidget):
                 "Status": "Stopped",
                 "protocols": [],
             }
+
+            # Always include VXLAN config if it exists (even if incomplete)
+            # This ensures VXLAN config is preserved when user enables VXLAN in UI
+            if normalized_vxlan_config:
+                per_device_vxlan = self._with_vxlan_interfaces(
+                    normalized_vxlan_config,
+                    iface,
+                    vlan,
+                )
+                device_data["vxlan_config"] = per_device_vxlan
+                device_data["VXLAN"] = self._format_vxlan_summary(per_device_vxlan)
+                if "VXLAN" not in device_data["protocols"]:
+                    device_data["protocols"].append("VXLAN")
+                print(f"[DEBUG ADD DEVICE] Added VXLAN config to single device {unique_name}: {per_device_vxlan}")
+            else:
+                # Ensure vxlan_config is always present (even if empty) for consistency
+                device_data["vxlan_config"] = {}
+                print(f"[DEBUG ADD DEVICE] No VXLAN config for single device {unique_name} - normalized_vxlan_config: {normalized_vxlan_config}")
             
             # Add OSPF protocol if enabled
             print(f"[DEBUG ADD DEVICE] Single device OSPF config: {ospf_config}")
@@ -4418,29 +4610,68 @@ class DevicesTab(QWidget):
                 bgp_protocol_config = {
                     "bgp_asn": bgp_config.get("bgp_asn") or bgp_config.get("local_as", "65000"),
                     "bgp_remote_asn": bgp_config.get("bgp_remote_asn") or bgp_config.get("remote_as", "65001"),
-                    "mode": bgp_config.get("bgp_mode", "eBGP"),
+                    "mode": bgp_config.get("mode") or bgp_config.get("bgp_mode", "eBGP"),
                     "bgp_keepalive": bgp_config.get("bgp_keepalive", "30"),
                     "bgp_hold_time": bgp_config.get("bgp_hold_time", "90"),
                     "ipv4_enabled": bgp_config.get("ipv4_enabled", bgp_config.get("enabled", False)),
                     "ipv6_enabled": bgp_config.get("ipv6_enabled", False)
                 }
                 
+                # Preserve use_loopback_ip and bgp_remote_loopback_ip from dialog config
+                use_loopback_ip = bgp_config.get("use_loopback_ip", False)
+                bgp_remote_loopback_ip = bgp_config.get("bgp_remote_loopback_ip", "")
+                bgp_remote_loopback_ipv6 = bgp_config.get("bgp_remote_loopback_ipv6", "")
+                if use_loopback_ip:
+                    bgp_protocol_config["use_loopback_ip"] = True
+                    bgp_protocol_config["bgp_remote_loopback_ip"] = bgp_remote_loopback_ip
+                    bgp_protocol_config["bgp_remote_loopback_ipv6"] = bgp_remote_loopback_ipv6
+                
                 # Add IPv4 BGP configuration if enabled (support both old and new formats)
                 ipv4_enabled = bgp_config.get("ipv4_enabled", bgp_config.get("enabled", False))
                 if ipv4_enabled:
-                    # Always use the current gateway and device IP for BGP configuration
-                    # This ensures consistency with the increment logic
-                    neighbor_ipv4 = ipv4_gateway  # Use current gateway
-                    update_source_ipv4 = ipv4     # Use current device IP
+                    # Determine neighbor IP and update-source based on use_loopback_ip
+                    if use_loopback_ip and bgp_remote_loopback_ip:
+                        # Use remote loopback IP as neighbor when use_loopback_ip is checked
+                        neighbor_ipv4 = bgp_remote_loopback_ip
+                    else:
+                        # Default: use current gateway
+                        neighbor_ipv4 = ipv4_gateway
+                    
+                    # Determine update-source based on use_loopback_ip
+                    loopback_ipv4 = device_data.get("Loopback IPv4", "")
+                    if use_loopback_ip and loopback_ipv4:
+                        # Use loopback IP as update-source when use_loopback_ip is checked
+                        update_source_ipv4 = loopback_ipv4
+                    else:
+                        # Default: use current device IP
+                        update_source_ipv4 = ipv4
+                    
                     bgp_protocol_config["bgp_neighbor_ipv4"] = neighbor_ipv4
                     bgp_protocol_config["bgp_update_source_ipv4"] = update_source_ipv4
                     bgp_protocol_config["protocol"] = "ipv4"
-                    print(f"[DEBUG ADD DEVICE] IPv4 BGP configured for single device {unique_name}: neighbor={neighbor_ipv4}, source={update_source_ipv4}")
+                    print(f"[DEBUG ADD DEVICE] IPv4 BGP configured for single device {unique_name}: neighbor={neighbor_ipv4}, source={update_source_ipv4}, use_loopback_ip={use_loopback_ip}")
                 
                 # Add IPv6 BGP configuration if enabled
                 if bgp_config.get("ipv6_enabled", False):
-                    bgp_protocol_config["bgp_neighbor_ipv6"] = ipv6_gateway
-                    bgp_protocol_config["bgp_update_source_ipv6"] = ipv6
+                    # Determine neighbor IP and update-source based on use_loopback_ip
+                    if use_loopback_ip and bgp_remote_loopback_ipv6:
+                        # Use remote loopback IPv6 as neighbor when use_loopback_ip is checked
+                        neighbor_ipv6 = bgp_remote_loopback_ipv6
+                    else:
+                        # Default: use current gateway
+                        neighbor_ipv6 = ipv6_gateway
+                    
+                    # Determine update-source based on use_loopback_ip
+                    loopback_ipv6 = device_data.get("Loopback IPv6", "")
+                    if use_loopback_ip and loopback_ipv6:
+                        # Use loopback IPv6 as update-source when use_loopback_ip is checked
+                        update_source_ipv6 = loopback_ipv6
+                    else:
+                        # Default: use current device IPv6
+                        update_source_ipv6 = ipv6
+                    
+                    bgp_protocol_config["bgp_neighbor_ipv6"] = neighbor_ipv6
+                    bgp_protocol_config["bgp_update_source_ipv6"] = update_source_ipv6
                     # If both IPv4 and IPv6 are enabled, use "dual-stack", otherwise use the specific protocol
                     if ipv4_enabled:
                         bgp_protocol_config["protocol"] = "dual-stack"
@@ -4490,7 +4721,7 @@ class DevicesTab(QWidget):
                 device_data["Protocols"] = ", ".join(unique_protocols)
             else:
                 device_data["Protocols"] = ""
-
+            
             devices_to_create.append(device_data)
 
         # persist in model
@@ -4511,6 +4742,11 @@ class DevicesTab(QWidget):
 
         # Refresh the table to show new devices
         self.populate_device_table()
+        
+        # Save session immediately after adding device(s) so they persist even if client is closed before apply
+        if hasattr(self.main_window, "save_session"):
+            print(f"[DEBUG ADD] Saving session after adding {len(devices_to_create)} device(s)")
+            self.main_window.save_session()
 
         # keep the interface selected
         tree = self.main_window.server_tree
@@ -4600,6 +4836,13 @@ class DevicesTab(QWidget):
                 "protocols": [],
             }
 
+            vxlan_copy = self._normalize_vxlan_config(copied_device.get("vxlan_config"))
+            if vxlan_copy:
+                vxlan_copy["underlay_interface"] = self._normalize_iface_label(target_interface)
+                new_device["vxlan_config"] = vxlan_copy
+                new_device["VXLAN"] = self._format_vxlan_summary(vxlan_copy)
+                new_device["protocols"].append("VXLAN")
+
             # Add to all_devices data structure
             if target_interface not in self.main_window.all_devices:
                 self.main_window.all_devices[target_interface] = []
@@ -4621,6 +4864,11 @@ class DevicesTab(QWidget):
         
         # Update OSPF table if any devices have OSPF configured
         self.update_ospf_table()
+        
+        # Save session immediately after pasting device(s) so they persist even if client is closed before apply
+        if hasattr(self.main_window, "save_session"):
+            print(f"[DEBUG PASTE] Saving session after pasting {len(pasted_devices)} device(s)")
+            self.main_window.save_session()
 
         if len(pasted_devices) == 1:
             QMessageBox.information(self, "Device Pasted", 
@@ -4671,7 +4919,7 @@ class DevicesTab(QWidget):
         loopback_ipv6 = device_info.get("Loopback IPv6", "")
 
         dialog = AddDeviceDialog(self, default_iface=iface)
-        
+
         # Pre-fill basics
         dialog.device_name_input.setText(device_name)
         dialog.iface_input.setText(iface)
@@ -4685,14 +4933,15 @@ class DevicesTab(QWidget):
         dialog.ipv6_gateway_input.setText(ipv6_gateway)
         dialog.loopback_ipv4_input.setText(loopback_ipv4)
         dialog.loopback_ipv6_input.setText(loopback_ipv6)
-        
+        dialog.set_vxlan_values(device_info.get("vxlan_config"))
+
         # Set checkboxes based on whether fields have values
         dialog.ipv4_checkbox.setChecked(bool(ipv4.strip()))
         dialog.ipv6_checkbox.setChecked(bool(ipv6.strip()))
 
         if dialog.exec_() != dialog.Accepted:
             return
-
+        
         # Get updated values from dialog
         (
             new_name, iface, mac, ipv4, ipv6, ipv4_mask, ipv6_mask,
@@ -4701,6 +4950,7 @@ class DevicesTab(QWidget):
             gateway_octet_index, incr_dhcp_pool, dhcp_pool_octet_index, incr_loopback, loopback_ipv4_octet_index, 
             loopback_ipv6_hextet_index, loopback_ipv4, loopback_ipv6, isis_config
         ) = dialog.get_values()
+        new_vxlan_config = dialog.get_vxlan_config()
 
         ipv4_mask = ipv4_mask or "24"
         ipv6_mask = ipv6_mask or "64"
@@ -4743,7 +4993,7 @@ class DevicesTab(QWidget):
             "Loopback IPv6": loopback_ipv6 if loopback_ipv6 else "",
             "_needs_apply": True  # Mark for server update
         })
-
+        
         # Update protocol configs if provided (but don't overwrite existing if not provided)
         if ospf_config:
             device_info["ospf_config"] = ospf_config
@@ -4766,6 +5016,23 @@ class DevicesTab(QWidget):
             device_info["is_is_config"] = isis_config
             if "IS-IS" not in device_info.get("protocols", []):
                 device_info.setdefault("protocols", []).append("IS-IS")
+
+        normalized_edit_vxlan = self._with_vxlan_interfaces(
+            new_vxlan_config,
+            iface,
+            vlan,
+        )
+        existing_protocols = self._convert_protocols_to_array(device_info.get("protocols", []))
+        device_info["protocols"] = existing_protocols
+        if normalized_edit_vxlan:
+            device_info["vxlan_config"] = normalized_edit_vxlan
+            device_info["VXLAN"] = self._format_vxlan_summary(normalized_edit_vxlan)
+            if "VXLAN" not in existing_protocols:
+                existing_protocols.append("VXLAN")
+        else:
+            device_info.pop("vxlan_config", None)
+            device_info["VXLAN"] = ""
+            device_info["protocols"] = [p for p in existing_protocols if p != "VXLAN"]
 
         # Update table display
         self.devices_table.item(row, self.COL["Device Name"]).setText(new_name or device_name)
@@ -4812,6 +5079,10 @@ class DevicesTab(QWidget):
         if loopback_item:
             loopback_item.setText(loopback_ipv6 if loopback_ipv6 else "")
 
+        vxlan_item = self.devices_table.item(row, self.COL.get("VXLAN"))
+        if vxlan_item:
+            vxlan_item.setText(device_info.get("VXLAN", ""))
+        
         # Refresh protocol tables if needed
         if hasattr(self, 'bgp_handler') and self.bgp_handler:
             self.bgp_handler.refresh_bgp_table()
@@ -4835,10 +5106,10 @@ class DevicesTab(QWidget):
         if not selected_rows:
             QMessageBox.warning(self, "No Selection", "Please select a device to copy.")
             return
-
+        
         copied_devices = []
         device_names = []
-
+        
         for row in selected_rows:
             name_item = self.devices_table.item(row, self.COL.get("Device Name"))
             if not name_item:
@@ -4859,12 +5130,13 @@ class DevicesTab(QWidget):
                     "ipv6_mask": device_info.get("ipv6_mask", "64"),
                     "VLAN": device_info.get("VLAN", "0"),
                     "Interface": device_info.get("Interface", ""),
+                    "vxlan_config": device_info.get("vxlan_config", {}),
                 }
             )
             device_names.append(device_name)
-
+        
         self.main_window.copied_device = copied_devices
-
+        
         if len(device_names) == 1:
             QMessageBox.information(
                 self,
@@ -4907,6 +5179,15 @@ class DevicesTab(QWidget):
                     normalized["lease_time"] = normalized.get(numeric_key)
                 break
 
+        def _coerce_bool(value):
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)):
+                return value != 0
+            if isinstance(value, str):
+                return value.strip().lower() in {"1", "true", "yes", "on", "enabled"}
+            return bool(value)
+
         mode = normalized.get("mode")
         if mode:
             normalized["mode"] = str(mode).lower()
@@ -4915,7 +5196,113 @@ class DevicesTab(QWidget):
         if route_key in normalized and isinstance(normalized[route_key], str):
             normalized[route_key] = [r.strip() for r in normalized[route_key].split(",") if r.strip()]
 
+        for bool_key in ("ipv4_enabled", "ipv6_enabled"):
+            if bool_key in normalized:
+                normalized[bool_key] = _coerce_bool(normalized[bool_key])
+
+        if "ipv6_lease_time" in normalized:
+            try:
+                normalized["ipv6_lease_time"] = int(normalized["ipv6_lease_time"])
+            except Exception:
+                pass
+
         return normalized
+
+    def _normalize_vxlan_config(self, vxlan_config):
+        """Normalize VXLAN configuration payloads."""
+        if not vxlan_config:
+            return {}
+        try:
+            config = copy.deepcopy(vxlan_config)
+        except Exception:
+            config = dict(vxlan_config)
+
+        # Preserve enabled flag if present
+        if "enabled" in config:
+            config["enabled"] = bool(config["enabled"])
+
+        vni = config.get("vni") or config.get("VNI")
+        try:
+            config["vni"] = int(vni) if vni is not None else None
+        except (TypeError, ValueError):
+            config["vni"] = None
+
+        remote = config.get("remote_peers") or config.get("remote_endpoints") or []
+        if isinstance(remote, str):
+            remote_peers = [
+                token.strip()
+                for token in remote.replace(";", ",").split(",")
+                if token.strip()
+            ]
+        else:
+            remote_peers = [
+                str(token).strip()
+                for token in (remote or [])
+                if str(token).strip()
+            ]
+        if remote_peers:
+            config["remote_peers"] = remote_peers
+        else:
+            config.pop("remote_peers", None)
+
+        udp_port = config.get("udp_port")
+        if udp_port is not None:
+            try:
+                config["udp_port"] = int(udp_port)
+            except (TypeError, ValueError):
+                config.pop("udp_port", None)
+
+        # Preserve local_ip if present
+        local_ip = config.get("local_ip")
+        if local_ip:
+            config["local_ip"] = str(local_ip).strip()
+
+        # Preserve vlan_id if present
+        vlan_id = config.get("vlan_id") or config.get("vxlan_vlan_id")
+        if vlan_id is not None:
+            try:
+                config["vlan_id"] = int(vlan_id)
+            except (TypeError, ValueError):
+                pass  # Keep as-is if invalid
+
+        underlay_iface = config.get("underlay_interface") or config.get("interface")
+        if underlay_iface:
+            config["underlay_interface"] = underlay_iface
+        
+        # If config has enabled=True or any meaningful content, return it
+        # This ensures VXLAN config is preserved even if incomplete
+        # CRITICAL: If enabled=True, always preserve the config (user explicitly enabled VXLAN)
+        if config.get("enabled") is True:
+            return config
+        # Otherwise, only return if there's meaningful content
+        if config.get("vni") or config.get("local_ip") or config.get("remote_peers") or config.get("vlan_id"):
+            return config
+        return {}
+
+    def _format_vxlan_summary(self, vxlan_config):
+        config = self._normalize_vxlan_config(vxlan_config)
+        if not config or not config.get("vni"):
+            return ""
+        remote_peers = config.get("remote_peers", [])
+        if not remote_peers:
+            return f"VNI {config['vni']}"
+        preview = ", ".join(remote_peers[:2])
+        if len(remote_peers) > 2:
+            preview = f"{preview}, +{len(remote_peers) - 2}"
+        return f"VNI {config['vni']} -> {preview}"
+
+    def _with_vxlan_interfaces(self, vxlan_config, iface_label, vlan_value):
+        config = self._normalize_vxlan_config(vxlan_config)
+        if not config:
+            return {}
+        iface_norm = self._normalize_iface_label(iface_label)
+        vlan_str = str(vlan_value or "0")
+        overlay_iface = iface_norm
+        if vlan_str and vlan_str != "0":
+            overlay_iface = f"vlan{vlan_str}"
+        config["underlay_interface"] = iface_norm
+        config["overlay_interface"] = overlay_iface
+        return config
 
     def _merge_gateway_routes(self, base_routes, override_routes):
         """Merge gateway_route values preserving uniqueness."""
@@ -5089,6 +5476,10 @@ class DevicesTab(QWidget):
                             value = device.get("Loopback IPv4", "")
                         elif header == "Loopback IPv6":
                             value = device.get("Loopback IPv6", "")
+                        elif header == "VXLAN":
+                            value = self._format_vxlan_summary(
+                                device.get("vxlan_config") or device.get("VXLAN")
+                            )
                         else:
                             value = device.get(header, "")
 
@@ -5097,6 +5488,8 @@ class DevicesTab(QWidget):
                             item.setFlags(Qt.ItemIsEnabled)
                         else:
                             item = QTableWidgetItem(str(value))
+                            if header == "VXLAN":
+                                item.setFlags(Qt.ItemIsSelectable | Qt.ItemIsEnabled)
 
                         if header == "IPv4":
                             item.setData(Qt.UserRole + 1, device.get("ipv4_mask", "24"))
@@ -5183,10 +5576,18 @@ class DevicesTab(QWidget):
         """Cleanup after individual ARP worker completes."""
         if hasattr(self, "individual_arp_worker"):
             try:
-                self.individual_arp_worker.deleteLater()
+                worker = self.individual_arp_worker
+                delattr(self, "individual_arp_worker")
+                if worker.isRunning():
+                    worker.quit()
+                    worker.wait(100)
+                if not worker.isRunning():
+                    worker.deleteLater()
+            except RuntimeError:
+                # Worker already deleted, ignore
+                pass
             except Exception:
                 pass
-            delattr(self, "individual_arp_worker")
         self._arp_check_in_progress = False
         print("[ARP INDIVIDUAL] Individual ARP checks completed")
 
@@ -5440,12 +5841,22 @@ class DevicesTab(QWidget):
                 ipv6_resolved = bool(arp_ipv6_resolved)
                 gateway_resolved = bool(arp_gateway_resolved)
                 
-                # Determine overall status - success if BOTH IPv4 and IPv6 resolve
-                overall_resolved = ipv4_resolved and ipv6_resolved
-                
-                # Debug info available if needed
-                
-                return overall_resolved, arp_status
+                # Determine whether IPv6/Gateway were actually configured
+                ipv6_value = (device_data.get("ipv6_address") or device_data.get("IPv6") or "").strip()
+                ipv6_configured = bool(ipv6_value)
+                gateway_value = (device_data.get("ipv4_gateway") or device_data.get("IPv4 Gateway") or "").strip()
+                gateway_configured = bool(gateway_value)
+
+                # Determine overall status - require only the components that exist
+                overall_resolved = ipv4_resolved
+                if ipv6_configured:
+                    overall_resolved = overall_resolved and ipv6_resolved
+                if gateway_configured:
+                    overall_resolved = overall_resolved and gateway_resolved
+
+                if overall_resolved:
+                    return True, "ARP resolved"
+                return False, arp_status or "ARP pending"
             else:
                 print(f"[DEBUG ARP SYNC DATABASE] Failed to get device data: {response.status_code}")
                 return False, "Database error"
@@ -5496,21 +5907,31 @@ class DevicesTab(QWidget):
                 ipv6_resolved = bool(arp_ipv6_resolved)
                 gateway_resolved = bool(arp_gateway_resolved)
                 
-                # Determine overall status - success if BOTH IPv4 and IPv6 resolve
-                overall_resolved = ipv4_resolved and ipv6_resolved
-                
+                # Determine whether IPv6/Gateway were actually configured
+                ipv6_value = (device_data.get("ipv6_address") or device_data.get("IPv6") or "").strip()
+                ipv6_configured = bool(ipv6_value)
+                gateway_value = (device_data.get("ipv4_gateway") or device_data.get("IPv4 Gateway") or "").strip()
+                gateway_configured = bool(gateway_value)
+
+                # Determine overall status - require only the components that exist
+                overall_resolved = ipv4_resolved
+                if ipv6_configured:
+                    overall_resolved = overall_resolved and ipv6_resolved
+                if gateway_configured:
+                    overall_resolved = overall_resolved and gateway_resolved
+
                 # Provide more descriptive status message when unresolved
                 if overall_resolved:
-                    status_message = arp_status or "ARP resolved"
+                    status_message = "ARP resolved"
                 else:
                     failed_parts = []
                     if not ipv4_resolved:
                         failed_parts.append("IPv4")
-                    if not ipv6_resolved:
+                    if ipv6_configured and not ipv6_resolved:
                         failed_parts.append("IPv6")
-                    if not gateway_resolved:
+                    if gateway_configured and not gateway_resolved:
                         failed_parts.append("Gateway")
-                    status_message = f"ARP pending: {', '.join(failed_parts)}"
+                    status_message = f"ARP pending: {', '.join(failed_parts) if failed_parts else 'Unknown'}"
                 
                 return {
                     "overall_resolved": overall_resolved,
@@ -5582,6 +6003,27 @@ class DevicesTab(QWidget):
             print("[ARP BULK] Skipping ARP check - application is closing")
             return
         
+        # Check if there's already a bulk ARP worker running
+        if hasattr(self, 'bulk_arp_worker') and self.bulk_arp_worker:
+            if self.bulk_arp_worker.isRunning():
+                print("[ARP BULK] ARP check already running, skipping new request")
+                return
+            else:
+                # Clean up finished worker - ensure thread is stopped first
+                try:
+                    worker = self.bulk_arp_worker
+                    delattr(self, 'bulk_arp_worker')
+                    if worker.isRunning():
+                        worker.quit()
+                        worker.wait(100)
+                    if not worker.isRunning():
+                        worker.deleteLater()
+                except RuntimeError:
+                    # Worker already deleted, ignore
+                    pass
+                except Exception:
+                    pass
+        
         # Create and start worker
         self.bulk_arp_worker = ArpCheckWorker(devices_data, self)
         self.bulk_arp_worker.arp_result.connect(self._on_bulk_arp_result)
@@ -5619,10 +6061,21 @@ class DevicesTab(QWidget):
     
     def _on_arp_check_finished(self):
         """Handle ARP check completion."""
-        # Clean up worker reference
+        # Clean up worker reference - ensure thread is stopped first
         if hasattr(self, 'arp_check_worker'):
-            self.arp_check_worker.deleteLater()
-            delattr(self, 'arp_check_worker')
+            try:
+                worker = self.arp_check_worker
+                delattr(self, 'arp_check_worker')
+                if worker.isRunning():
+                    worker.quit()
+                    worker.wait(100)
+                if not worker.isRunning():
+                    worker.deleteLater()
+            except RuntimeError:
+                # Worker already deleted, ignore
+                pass
+            except Exception:
+                pass
 
     def _set_device_status_starting(self, row: int, device_info: dict = None, status_text: str = "Starting device..."):
         """Update the status column to show an in-progress state while apply is running."""
@@ -5651,6 +6104,10 @@ class DevicesTab(QWidget):
 
     def _schedule_arp_retry(self, rows, delay=2000):
         """Schedule a retry of ARP checks for the specified table rows."""
+        # Check if application is closing
+        if hasattr(self.main_window, '_is_closing') and self.main_window._is_closing:
+            return
+        
         if not rows:
             return
 
@@ -5673,6 +6130,9 @@ class DevicesTab(QWidget):
         self._pending_arp_rows.update(new_rows)
 
         def retry():
+            # Check again if application is closing before retrying
+            if hasattr(self.main_window, '_is_closing') and self.main_window._is_closing:
+                return
             try:
                 devices_to_process = []
                 for row in list(new_rows):
@@ -5745,10 +6205,21 @@ class DevicesTab(QWidget):
     def _on_device_apply_finished(self, operation_type):
         """Handle device apply completion from background worker."""
         try:
-            # Clean up worker reference
+            # Clean up worker reference - ensure thread is stopped first
             if hasattr(self, 'db_worker'):
-                self.db_worker.deleteLater()
-                delattr(self, 'db_worker')
+                try:
+                    worker = self.db_worker
+                    delattr(self, 'db_worker')
+                    if worker.isRunning():
+                        worker.quit()
+                        worker.wait(100)
+                    if not worker.isRunning():
+                        worker.deleteLater()
+                except RuntimeError:
+                    # Worker already deleted, ignore
+                    pass
+                except Exception:
+                    pass
         except Exception as e:
             print(f"[DEVICE APPLY FINISHED] Error cleaning up: {e}")
     def _on_multi_device_applied(self, device_name, success, message):
@@ -5779,7 +6250,7 @@ class DevicesTab(QWidget):
                         server_url = self.get_server_url(silent=True)
                         if server_url:
                             import requests
-                            response = requests.post(f"{server_url}/api/device/arp/force-check", timeout=5)
+                            response = requests.post(f"{server_url}/api/arp/monitor/force-check", timeout=5)
                             if response.status_code == 200:
                                 print(f"[MULTI DEVICE APPLY] Triggered ARP force check on server")
                             else:
@@ -5820,13 +6291,28 @@ class DevicesTab(QWidget):
             
             # Save session after device application to persist status changes
             if successful_count > 0 and hasattr(self.main_window, "save_session"):
-                print(f"[MULTI DEVICE APPLY] Saving session after successful device application")
-                self.main_window.save_session()
+                print(f"[MULTI DEVICE APPLY] Saving session after successful device application ({successful_count} device(s) applied)")
+                try:
+                    self.main_window.save_session()
+                    print(f"[MULTI DEVICE APPLY] ✅ Session saved successfully after applying {successful_count} device(s)")
+                except Exception as save_exc:
+                    print(f"[MULTI DEVICE APPLY] ⚠️ Failed to save session: {save_exc}")
             
-            # Clean up worker reference
+            # Clean up worker reference - ensure thread is stopped first
             if hasattr(self, 'multi_device_apply_worker'):
-                self.multi_device_apply_worker.deleteLater()
-                delattr(self, 'multi_device_apply_worker')
+                try:
+                    worker = self.multi_device_apply_worker
+                    delattr(self, 'multi_device_apply_worker')
+                    if worker.isRunning():
+                        worker.quit()
+                        worker.wait(100)
+                    if not worker.isRunning():
+                        worker.deleteLater()
+                except RuntimeError:
+                    # Worker already deleted, ignore
+                    pass
+                except Exception:
+                    pass
             
             # Clear the operation type flag
             if hasattr(self, '_current_operation_type'):
@@ -5840,15 +6326,26 @@ class DevicesTab(QWidget):
         print("[ARP BULK] Completed async ARP checks for all devices")
         # Reset the flag to allow new ARP checks
         self._arp_check_in_progress = False
-        # Clean up worker reference
+        # Clean up worker reference - ensure thread is stopped first
         if hasattr(self, 'bulk_arp_worker'):
-            self.bulk_arp_worker.deleteLater()
-            delattr(self, 'bulk_arp_worker')
+            try:
+                worker = self.bulk_arp_worker
+                delattr(self, 'bulk_arp_worker')
+                if worker.isRunning():
+                    worker.quit()
+                    worker.wait(100)
+                if not worker.isRunning():
+                    worker.deleteLater()
+            except RuntimeError:
+                # Worker already deleted, ignore
+                pass
+            except Exception:
+                pass
 
     def cleanup_threads(self):
         """Clean up timers and worker threads before application exit."""
         print("[CLEANUP] Cleaning up all worker threads...")
-
+        
         timer_attrs = [
             "status_timer",
             "bgp_monitoring_timer",
@@ -5873,18 +6370,24 @@ class DevicesTab(QWidget):
             try:
                 if hasattr(worker, "stop"):
                     worker.stop()
-                worker.quit()
-                if not worker.wait(1000):
-                    print(f"[CLEANUP] Force terminating {attr_name}...")
-                    worker.terminate()
-                    worker.wait(500)
+                if worker.isRunning():
+                    worker.quit()
+                    if not worker.wait(1000):
+                        print(f"[CLEANUP] Force terminating {attr_name}...")
+                        worker.terminate()
+                        worker.wait(500)
+                
+                # Only deleteLater if thread is definitely stopped
+                if not worker.isRunning():
+                    worker.deleteLater()
+                else:
+                    print(f"[CLEANUP] WARNING: {attr_name} still running after cleanup attempt")
+            except RuntimeError:
+                # Worker already deleted, ignore
+                pass
             except Exception as exc:
                 print(f"[CLEANUP] Error stopping {attr_name}: {exc}")
             finally:
-                try:
-                    worker.deleteLater()
-                except Exception:
-                    pass
                 try:
                     delattr(self, attr_name)
                 except Exception:
@@ -5901,6 +6404,70 @@ class DevicesTab(QWidget):
         ]
         for attr in worker_attrs:
             _stop_worker(attr)
+
+        # Also wait for protocol apply workers managed in handler lists
+        def _drain_worker_list(list_attr_name):
+            workers = getattr(self, list_attr_name, None)
+            if not workers:
+                return
+            try:
+                for w in list(workers):
+                    try:
+                        if hasattr(w, "isRunning") and w.isRunning():
+                            print(f"[CLEANUP] Waiting for {list_attr_name} worker to finish...")
+                            w.quit()  # Request thread to stop
+                            if not w.wait(3000):
+                                print(f"[CLEANUP] Force terminating {list_attr_name} worker...")
+                                w.terminate()
+                                w.wait(500)
+                        
+                        # Only deleteLater if thread is definitely stopped
+                        if not w.isRunning():
+                            w.deleteLater()
+                    except RuntimeError:
+                        # Worker might already be deleted, ignore
+                        continue
+                    except Exception as exc:
+                        print(f"[CLEANUP] Error draining {list_attr_name} worker: {exc}")
+                # Clear the list
+                setattr(self, list_attr_name, [])
+            except Exception:
+                pass
+
+        _drain_worker_list("_bgp_apply_workers")
+        _drain_worker_list("_ospf_apply_workers")
+        
+        # Also check OSPF handler for workers
+        if hasattr(self, "ospf_handler") and hasattr(self.ospf_handler, "_ospf_apply_workers"):
+            try:
+                ospf_workers = getattr(self.ospf_handler, "_ospf_apply_workers", [])
+                for w in list(ospf_workers):
+                    try:
+                        if hasattr(w, "isRunning") and w.isRunning():
+                            print("[CLEANUP] Waiting for OSPF handler worker to finish...")
+                            w.quit()  # Request thread to stop
+                            if not w.wait(3000):
+                                print("[CLEANUP] Force terminating OSPF handler worker...")
+                                w.terminate()
+                                w.wait(500)
+                        
+                        # Only deleteLater if thread is definitely stopped
+                        if not w.isRunning():
+                            w.deleteLater()
+                    except RuntimeError:
+                        # Worker already deleted, ignore
+                        pass
+                    except Exception as exc:
+                        print(f"[CLEANUP] Error cleaning up OSPF handler worker: {exc}")
+                self.ospf_handler._ospf_apply_workers = []
+            except Exception as exc:
+                print(f"[CLEANUP] Error cleaning up OSPF handler workers: {exc}")
+        
+        if hasattr(self, "vxlan_handler"):
+            try:
+                self.vxlan_handler.stop_monitoring()
+            except Exception as exc:
+                print(f"[CLEANUP] Failed to stop VXLAN monitoring: {exc}")
 
     def _update_device_protocol(self, row_or_device_name, protocol, config):
         """Update device with protocol configuration.
@@ -6039,6 +6606,30 @@ class DevicesTab(QWidget):
             s = s.rsplit(":", 1)[-1].strip()
         parts = s.split()
         return parts[-1] if parts else ""
+
+    def _increment_mac(self, mac, step, byte_index=0):
+        """Increment MAC address by step in the specified byte.
+        
+        Args:
+            mac: MAC address string (e.g., "00:11:22:33:44:55")
+            step: Number to increment by
+            byte_index: Which byte to increment (0=6th/last, 1=5th, ..., 5=1st)
+        """
+        try:
+            mac_parts = mac.split(":")
+            bytes_list = [int(b, 16) for b in mac_parts]
+            incremented = bytes_list[:]
+            target_byte = 5 - byte_index  # 0 -> last byte, 5 -> first byte
+            incremented[target_byte] += step
+            # Handle overflow from right to left
+            for j in range(5, -1, -1):
+                if incremented[j] > 255:
+                    incremented[j] -= 256
+                    if j > 0:
+                        incremented[j - 1] += 1
+            return ":".join(f"{b:02x}" for b in incremented)
+        except Exception:
+            return mac
     def _convert_protocols_to_array(self, protocols):
         """Convert protocols string to array format for database storage."""
         if not protocols:
@@ -6373,6 +6964,7 @@ class DevicesTab(QWidget):
                 "MAC Address": "Editable: MAC address (XX:XX:XX:XX:XX:XX)",
                 "Loopback IPv4": "Editable: IPv4 loopback address",
                 "Loopback IPv6": "Editable: IPv6 loopback address",
+                "VXLAN": "Read-only: VXLAN summary (VNI and remote peers)",
             }
 
             for header, tooltip in tooltips.items():
@@ -6434,17 +7026,20 @@ class DevicesTab(QWidget):
                 status_item = QTableWidgetItem()
                 self.devices_table.setItem(row, self.COL["Status"], status_item)
             
-            # Set icon based on ARP resolution
+            # Set icon and text based on ARP resolution
             if arp_resolved:
                 status_item.setIcon(self.green_dot)
-                status_item.setToolTip(f"ARP resolved: {arp_status}")
+                status_item.setText("Running")
+                status_item.setToolTip(f"Device running - ARP resolved: {arp_status}")
             else:
                 status_item.setIcon(self.orange_dot)
+                # Keep current text (might be "Starting..." or "Running")
+                # Only update tooltip
                 status_item.setToolTip(f"ARP failed: {arp_status}")
                 
         except Exception as e:
             print(f"[DEVICE STATUS ICON] Error updating status icon for row {row}: {e}")
-
+    
     def update_device_data_in_memory(self, device_id, header_name, new_value):
         """Update device data in the all_devices structure."""
         try:
@@ -6458,7 +7053,7 @@ class DevicesTab(QWidget):
                 "IPv6 Mask": "ipv6_mask",
                 "MAC Address": "MAC Address",
             }
-
+            
             key = key_mapping.get(header_name)
             if not key:
                 return
@@ -6470,7 +7065,7 @@ class DevicesTab(QWidget):
                         return
         except Exception as exc:
             logging.error(f"[update_device_data_in_memory] Error: {exc}")
-
+    
     def mark_device_for_apply(self, device_id):
         """Mark a device as needing to be applied to the server."""
         try:
@@ -6483,7 +7078,7 @@ class DevicesTab(QWidget):
                         return
         except Exception as exc:
             logging.error(f"[mark_device_for_apply] Error: {exc}")
-
+    
     def update_device_name_indicator(self, device_id, device_name):
         """Update the device name in the table to show it needs to be applied."""
         try:
@@ -6496,7 +7091,7 @@ class DevicesTab(QWidget):
                     return
         except Exception as exc:
             logging.error(f"[update_device_name_indicator] Error: {exc}")
-
+    
     def poll_device_status(self):
         """Periodic status poll invoked by status_timer."""
         try:
