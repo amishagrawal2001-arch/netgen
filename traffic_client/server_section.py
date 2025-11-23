@@ -21,18 +21,24 @@ class TrafficGenClientServerSection():
 
         # Server Tree
         self.server_tree = QTreeWidget()
-        self.server_tree.setColumnCount(4)
-        self.server_tree.setHeaderLabels(["TG ID", "Server Address / Interfaces", "Selected", "Status"])
+        self.server_tree.setColumnCount(3)
+        self.server_tree.setHeaderLabels(["TG ID", "Server Address / Interfaces", "Selected"])
+
+        # Set header resize modes
+        header = self.server_tree.header()
+        header.setSectionResizeMode(0, QHeaderView.Fixed)  # TG ID - fixed width
+        header.setSectionResizeMode(1, QHeaderView.Stretch)  # Server Address - stretch to fill
+        header.setSectionResizeMode(2, QHeaderView.Fixed)  # Selected - fixed width
+        header.setMinimumSectionSize(10)  # Allow columns to be as small as 10px
 
         # Enable extended selection for multiple ports using Ctrl/Command
         self.server_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
         layout.addWidget(self.server_tree)
 
         # Adjust column widths
-        self.server_tree.setColumnWidth(0, 150)
-        self.server_tree.setColumnWidth(1, 200)
-        self.server_tree.setColumnWidth(2, 50)
-        self.server_tree.setColumnWidth(3, 80)
+        self.server_tree.setColumnWidth(0, 180)  # Increased to accommodate status icon
+        self.server_tree.setColumnWidth(1, 200)  # Initial width, will stretch
+        self.server_tree.setColumnWidth(2, 10)  # Reduced width for Selected column (checkbox only)
 
         # Connect to unified update for stream + device tables
         self.server_tree.itemSelectionChanged.connect(self._on_server_selection_changed_combined)
@@ -83,6 +89,11 @@ class TrafficGenClientServerSection():
 
         # Populate server tree with current servers and ports
         self.update_server_tree()
+        
+        # Set column widths after tree is populated (ensures they're applied)
+        self.server_tree.setColumnWidth(0, 180)
+        self.server_tree.setColumnWidth(1, 200)
+        self.server_tree.setColumnWidth(2, 10)
 
     def _on_server_selection_changed_combined(self):
         """Update both stream and device tables on server tree selection change."""
@@ -418,12 +429,40 @@ class TrafficGenClientServerSection():
             tg_id = f"TG {server['tg_id']}"
             server_address = server["address"]
 
-            server_item = QTreeWidgetItem([tg_id, server_address, "", ""])
+            # Create TG ID with status icon on the left using a widget
+            is_online = server.get("online", True)
+            
+            # Create a widget for TG ID column with status icon
+            tg_id_widget = QWidget()
+            tg_id_layout = QHBoxLayout(tg_id_widget)
+            tg_id_layout.setContentsMargins(2, 0, 2, 0)
+            tg_id_layout.setSpacing(4)
+            
+            # Status icon label (colored dot)
+            status_label = QLabel("●")  # Bullet character (larger than middle dot)
+            status_label.setStyleSheet(f"color: {'#00b400' if is_online else '#c80000'}; font-size: 14px;")
+            status_label.setFixedWidth(12)
+            tg_id_layout.addWidget(status_label)
+            
+            # TG ID text label
+            tg_id_text_label = QLabel(tg_id)
+            tg_id_layout.addWidget(tg_id_text_label)
+            tg_id_layout.addStretch()
+            
+            server_item = QTreeWidgetItem(["", server_address, ""])
             self.server_tree.addTopLevelItem(server_item)
+            # Set the widget for TG ID column (column 0)
+            self.server_tree.setItemWidget(server_item, 0, tg_id_widget)
+            
+            # Store status label and item for later updates
+            server["status_label_widget"] = status_label
+            server["status_item"] = server_item
 
             # Checkbox to select server
             checkbox = QCheckBox()
             checkbox.setChecked(server in self.selected_servers)
+            checkbox.setFixedWidth(20)  # Set fixed width for checkbox
+            checkbox.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
             """checkbox.stateChanged.connect(
                 lambda state, idx=i: self.on_server_checkbox_state_changed(idx, state)
@@ -435,15 +474,9 @@ class TrafficGenClientServerSection():
             )
             self.server_tree.setItemWidget(server_item, 2, checkbox)
 
-            # Label with icon to show server status (Online/Offline)
-            status_label = QLabel()
-            status_label.setAlignment(Qt.AlignCenter)
-            server["status_label_widget"] = status_label  # Store for later update
-            self.server_tree.setItemWidget(server_item, 3, status_label)
-
-            # Reflect current status visually
-            is_online = server.get("online", True)
-            self.update_server_status_icon(server, is_online)
+            # Store status info for later updates
+            server["status_item"] = server_item  # Store reference for status updates
+            server["is_online"] = is_online
 
             if not is_online:
                 continue
@@ -498,6 +531,11 @@ class TrafficGenClientServerSection():
             server["online"] = True
             self.update_server_status_icon(server, True)
         
+        # Ensure column widths are maintained after update
+        self.server_tree.setColumnWidth(0, 180)
+        self.server_tree.setColumnWidth(1, 200)
+        self.server_tree.setColumnWidth(2, 10)
+        
         print(f"[DEBUG] Tree widget updated with {len(self.server_interfaces)} servers")
     '''def update_server_status_icon(self, server, is_online):
         """Helper to update status icon based on online state."""
@@ -509,45 +547,14 @@ class TrafficGenClientServerSection():
             status_label.repaint()  # ✅ Force visual refresh'''
 
     def update_server_status_icon(self, server, is_online):
-        """Update the little dot on the server row (green=online, red=offline) safely."""
+        """Update the status icon on the left of TG ID (green=online, red=offline) safely."""
         status_label = server.get("status_label_widget")
         if not status_label:
             return
 
-        icon_name = "green_dot.png" if is_online else "red_dot.png"
-
-        # 1) Try packaged icon (QIcon)
-        try:
-            ico = qicon("resources", f"icons/{icon_name}")
-        except Exception:
-            ico = QIcon()
-
-        # 2) Fallback to absolute path via r_icon() → wrap it into QIcon
-        if ico.isNull():
-            try:
-                path = r_icon(f"icons/{icon_name}")
-            except Exception:
-                path = ""
-            if path:
-                ico = QIcon(path)
-
-        # 3) Last resort: paint a colored dot
-        if ico.isNull():
-            pm = QPixmap(16, 16)
-            pm.fill(Qt.transparent)
-            from PyQt5.QtGui import QPainter, QColor, QBrush
-            painter = QPainter(pm)
-            painter.setRenderHint(QPainter.Antialiasing, True)
-            painter.setBrush(QBrush(QColor(0, 180, 0) if is_online else QColor(200, 0, 0)))
-            painter.setPen(Qt.NoPen)
-            painter.drawEllipse(0, 0, 16, 16)
-            painter.end()
-            status_label.setPixmap(pm)
-            status_label.repaint()
-            return
-
-        status_label.setPixmap(ico.pixmap(QSize(16, 16)))
-        status_label.repaint()
+        # Update status icon color
+        status_label.setStyleSheet(f"color: {'#00b400' if is_online else '#c80000'}; font-size: 14px;")
+        server["is_online"] = is_online
 
     def retry_server_connection(self, server):
         """Retry connecting to the specified server and update its status icon."""
@@ -579,9 +586,7 @@ class TrafficGenClientServerSection():
                                 item.addChild(port_item)
 
                         # ✅ Force UI refresh of the status label
-                        status_label = server.get("status_label_widget")
-                        if status_label:
-                            status_label.repaint()  # This ensures visual update
+        # Status is now in TG ID column, no need to repaint separate label
                         break
             else:
                 raise Exception(f"Non-200 status: {response.status_code}")
