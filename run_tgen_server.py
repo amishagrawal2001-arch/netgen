@@ -25,6 +25,7 @@ from utils.device_database import DeviceDatabase
 from utils.bgp_monitor import BGPStatusManager
 from utils.arp_monitor import ARPStatusMonitor
 from utils.dhcp import ensure_dhcp_services, stop_dhcp_services
+from utils import vxlan as vxlan_utils
 
 
 # Initialize Flask app and CORS
@@ -450,6 +451,88 @@ def stop_traffic():
 
 
 
+def _configure_routing_protocols(device_id, device_name, bgp_config=None, ospf_config=None, isis_config=None, 
+                                   ipv4=None, ipv6=None, ipv4_mask=None, ipv6_mask=None, dhcp_mode=None):
+    """
+    Unified helper function to configure all routing protocols.
+    This is the SINGLE SOURCE OF TRUTH for protocol configuration.
+    
+    Args:
+        device_id: Device identifier
+        device_name: Device name
+        bgp_config: BGP configuration dict (optional)
+        ospf_config: OSPF configuration dict (optional)
+        isis_config: ISIS configuration dict (optional)
+        ipv4: IPv4 address (optional)
+        ipv6: IPv6 address (optional)
+        ipv4_mask: IPv4 mask (optional)
+        ipv6_mask: IPv6 mask (optional)
+        dhcp_mode: DHCP mode (optional, "client" will skip BGP)
+    
+    Returns:
+        dict with success status for each protocol
+    """
+    results = {
+        "bgp": {"success": False, "error": None},
+        "ospf": {"success": False, "error": None},
+        "isis": {"success": False, "error": None}
+    }
+    
+    # Normalize IP addresses (strip CIDR notation if present)
+    ipv4_for_config = ipv4.split("/")[0] if ipv4 and "/" in ipv4 else ipv4
+    ipv6_for_config = ipv6.split("/")[0] if ipv6 and "/" in ipv6 else ipv6
+    
+    # Configure BGP if enabled
+    if bgp_config and isinstance(bgp_config, dict) and len(bgp_config) > 0:
+        if dhcp_mode == "client":
+            logging.info(f"[PROTOCOL CONFIG] Skipping BGP configuration because device is in DHCP client mode")
+            results["bgp"]["success"] = False
+            results["bgp"]["error"] = "Skipped (DHCP client mode)"
+        else:
+            try:
+                logging.info(f"[PROTOCOL CONFIG] Configuring BGP for device {device_name}")
+                from utils.bgp import configure_bgp_for_device
+                ipv4_full = f"{ipv4}/{ipv4_mask}" if ipv4 and ipv4_mask else ipv4
+                ipv6_full = f"{ipv6}/{ipv6_mask}" if ipv6 and ipv6_mask else ipv6
+                configure_bgp_for_device(device_id, bgp_config, ipv4_full, ipv6_full, device_name)
+                results["bgp"]["success"] = True
+                logging.info(f"[PROTOCOL CONFIG] ✅ BGP configured successfully for device {device_name}")
+            except Exception as bgp_exc:
+                results["bgp"]["error"] = str(bgp_exc)
+                logging.error(f"[PROTOCOL CONFIG] Failed to configure BGP for device {device_name}: {bgp_exc}", exc_info=True)
+    else:
+        logging.debug(f"[PROTOCOL CONFIG] BGP config is empty or invalid, skipping BGP configuration")
+    
+    # Configure OSPF if enabled
+    if ospf_config and isinstance(ospf_config, dict) and len(ospf_config) > 0:
+        try:
+            logging.info(f"[PROTOCOL CONFIG] Configuring OSPF for device {device_name}")
+            from utils.ospf import configure_ospf_neighbor
+            configure_ospf_neighbor(device_id, ospf_config, device_name, ipv4=ipv4_for_config, ipv6=ipv6_for_config)
+            results["ospf"]["success"] = True
+            logging.info(f"[PROTOCOL CONFIG] ✅ OSPF configured successfully for device {device_name}")
+        except Exception as ospf_exc:
+            results["ospf"]["error"] = str(ospf_exc)
+            logging.error(f"[PROTOCOL CONFIG] Failed to configure OSPF for device {device_name}: {ospf_exc}", exc_info=True)
+    else:
+        logging.debug(f"[PROTOCOL CONFIG] OSPF config is empty or invalid, skipping OSPF configuration")
+    
+    # Configure ISIS if enabled
+    if isis_config and isinstance(isis_config, dict) and len(isis_config) > 0:
+        try:
+            logging.info(f"[PROTOCOL CONFIG] Configuring ISIS for device {device_name}")
+            from utils.isis import configure_isis_neighbor
+            configure_isis_neighbor(device_id, isis_config, device_name, ipv4=ipv4_for_config, ipv6=ipv6_for_config)
+            results["isis"]["success"] = True
+            logging.info(f"[PROTOCOL CONFIG] ✅ ISIS configured successfully for device {device_name}")
+        except Exception as isis_exc:
+            results["isis"]["error"] = str(isis_exc)
+            logging.error(f"[PROTOCOL CONFIG] Failed to configure ISIS for device {device_name}: {isis_exc}", exc_info=True)
+    else:
+        logging.debug(f"[PROTOCOL CONFIG] ISIS config is empty or invalid, skipping ISIS configuration")
+    
+    return results
+
 @app.route("/api/device/start", methods=["POST"])
 def start_device():
     data = request.get_json()
@@ -542,6 +625,19 @@ def start_device():
             if isinstance(existing_dhcp_config, dict):
                 dhcp_config = existing_dhcp_config.copy()
         
+        vxlan_config_raw = data.get("vxlan_config", {})
+        if isinstance(vxlan_config_raw, str):
+            try:
+                vxlan_config = json.loads(vxlan_config_raw) if vxlan_config_raw else {}
+            except json.JSONDecodeError:
+                logging.warning(f"[DEVICE APPLY] Invalid VXLAN config JSON: {vxlan_config_raw}")
+                vxlan_config = {}
+        else:
+            vxlan_config = vxlan_config_raw or {}
+        vxlan_config = vxlan_utils.normalize_config(vxlan_config)
+        if vxlan_config and "VXLAN" not in protocols:
+            protocols.append("VXLAN")
+
         dhcp_mode = (dhcp_config.get("mode") or "").lower() if isinstance(dhcp_config, dict) else ""
         if dhcp_config and "DHCP" not in protocols:
             protocols.append("DHCP")
@@ -861,42 +957,20 @@ def start_device():
                             except Exception as e:
                                 logging.debug(f"[DEVICE START] Could not retrieve device_name from database: {e}")
                             
-                            # Configure BGP if enabled
-                            logging.info(f"[DEVICE START] Checking BGP config (existing container): bgp_config={bgp_config}, has content: {bool(bgp_config)}")
-                            if dhcp_mode == "client":
-                                logging.info("[DEVICE START] Skipping BGP configuration because device is in DHCP client mode")
-                            elif bgp_config and isinstance(bgp_config, dict) and len(bgp_config) > 0:
-                                logging.info(f"[DEVICE START] Configuring BGP in existing container")
-                                from utils.bgp import configure_bgp_for_device
-                                configure_bgp_for_device(device_id, bgp_config, ipv4_full, ipv6_full, device_name_from_container)
-                            else:
-                                logging.warning(f"[DEVICE START] BGP config is empty or invalid, skipping BGP configuration")
-                            
-                            # Configure OSPF if enabled
-                            logging.info(f"[DEVICE START] Checking OSPF config (existing container): ospf_config={ospf_config}, has content: {bool(ospf_config)}")
-                            if ospf_config and isinstance(ospf_config, dict) and len(ospf_config) > 0:
-                                logging.info(f"[DEVICE START] Configuring OSPF in existing container")
-                                from utils.ospf import configure_ospf_neighbor
-                                configure_ospf_neighbor(
-                                    device_id,
-                                    ospf_config,
-                                    device_name_from_container,
-                                    ipv4=ipv4_for_config,
-                                    ipv6=ipv6_for_config,
-                                    ipv4_mask=ipv4_mask_for_config,
-                                    ipv6_mask=ipv6_mask_for_config,
-                                )
-                            else:
-                                logging.warning(f"[DEVICE START] OSPF config is empty or invalid, skipping OSPF configuration")
-                            
-                            # Configure ISIS if enabled
-                            logging.info(f"[DEVICE START] Checking ISIS config (existing container): isis_config={isis_config}, has content: {bool(isis_config)}")
-                            if isis_config and isinstance(isis_config, dict) and len(isis_config) > 0:
-                                logging.info(f"[DEVICE START] Configuring ISIS in existing container")
-                                from utils.isis import configure_isis_neighbor
-                                configure_isis_neighbor(device_id, isis_config, device_name_from_container, ipv4_for_config, ipv6_for_config)
-                            else:
-                                logging.warning(f"[DEVICE START] ISIS config is empty or invalid, skipping ISIS configuration")
+                            # Configure all routing protocols using unified helper
+                            protocol_results = _configure_routing_protocols(
+                                device_id=device_id,
+                                device_name=device_name_from_container,
+                                bgp_config=bgp_config,
+                                ospf_config=ospf_config,
+                                isis_config=isis_config,
+                                ipv4=ipv4_for_config,
+                                ipv6=ipv6_for_config,
+                                ipv4_mask=ipv4_mask_for_config,
+                                ipv6_mask=ipv6_mask_for_config,
+                                dhcp_mode=dhcp_mode
+                            )
+                            logging.info(f"[DEVICE START] Protocol configuration results: {protocol_results}")
                         except Exception:
                             logging.info(f"[DEVICE START] Container {container_name} does not exist, creating it...")
                             # Create container with device configuration
@@ -1027,42 +1101,20 @@ def start_device():
                                 ipv6_mask_for_config = ipv6_mask if ipv6_mask else device_data.get('ipv6_mask', '64')
                                 ipv6_full = f"{ipv6_for_config}/{ipv6_mask_for_config}" if ipv6_for_config else ""
                                 
-                                # Configure BGP if enabled
-                                logging.info(f"[DEVICE START] Checking BGP config: bgp_config={bgp_config}, has content: {bool(bgp_config)}")
-                                if dhcp_mode == "client":
-                                    logging.info("[DEVICE START] Skipping BGP configuration because device is in DHCP client mode")
-                                elif bgp_config and isinstance(bgp_config, dict) and len(bgp_config) > 0:
-                                    logging.info(f"[DEVICE START] Configuring BGP in newly created container")
-                                    from utils.bgp import configure_bgp_for_device
-                                    configure_bgp_for_device(device_id, bgp_config, ipv4_full, ipv6_full, device_name)
-                                else:
-                                    logging.warning(f"[DEVICE START] BGP config is empty or invalid, skipping BGP configuration")
-                                
-                                # Configure OSPF if enabled
-                                logging.info(f"[DEVICE START] Checking OSPF config: ospf_config={ospf_config}, has content: {bool(ospf_config)}")
-                                if ospf_config and isinstance(ospf_config, dict) and len(ospf_config) > 0:
-                                    logging.info(f"[DEVICE START] Configuring OSPF in newly created container")
-                                    from utils.ospf import configure_ospf_neighbor
-                                    configure_ospf_neighbor(
-                                        device_id,
-                                        ospf_config,
-                                        device_name,
-                                        ipv4=ipv4_for_config,
-                                        ipv6=ipv6_for_config,
-                                        ipv4_mask=ipv4_mask_for_config,
-                                        ipv6_mask=ipv6_mask_for_config,
-                                    )
-                                else:
-                                    logging.warning(f"[DEVICE START] OSPF config is empty or invalid, skipping OSPF configuration")
-                                
-                                # Configure ISIS if enabled
-                                logging.info(f"[DEVICE START] Checking ISIS config: isis_config={isis_config}, has content: {bool(isis_config)}")
-                                if isis_config and isinstance(isis_config, dict) and len(isis_config) > 0:
-                                    logging.info(f"[DEVICE START] Configuring ISIS in newly created container")
-                                    from utils.isis import configure_isis_neighbor
-                                    configure_isis_neighbor(device_id, isis_config, device_name, ipv4_for_config, ipv6_for_config)
-                                else:
-                                    logging.warning(f"[DEVICE START] ISIS config is empty or invalid, skipping ISIS configuration")
+                                # Configure all routing protocols using unified helper
+                                protocol_results = _configure_routing_protocols(
+                                    device_id=device_id,
+                                    device_name=device_name,
+                                    bgp_config=bgp_config,
+                                    ospf_config=ospf_config,
+                                    isis_config=isis_config,
+                                    ipv4=ipv4_for_config,
+                                    ipv6=ipv6_for_config,
+                                    ipv4_mask=ipv4_mask_for_config,
+                                    ipv6_mask=ipv6_mask_for_config,
+                                    dhcp_mode=dhcp_mode
+                                )
+                                logging.info(f"[DEVICE START] Protocol configuration results: {protocol_results}")
                             else:
                                 logging.warning(f"[DEVICE START] Failed to create FRR container for device {device_name}")
         except Exception as e:
@@ -2119,6 +2171,7 @@ def apply_device():
         ipv6_gateway = data.get("ipv6_gateway", "")
         loopback_ipv4 = data.get("loopback_ipv4", "")
         loopback_ipv6 = data.get("loopback_ipv6", "")
+        logging.info(f"[DEVICE APPLY] Received loopback_ipv4={loopback_ipv4}, loopback_ipv6={loopback_ipv6} from client")
         protocols = data.get("protocols", [])
         dhcp_config_raw = data.get("dhcp_config", {})
         if isinstance(protocols, str):
@@ -2133,6 +2186,41 @@ def apply_device():
             dhcp_config = dhcp_config_raw or {}
         if dhcp_config and "DHCP" not in protocols:
             protocols.append("DHCP")
+        vxlan_config_raw = data.get("vxlan_config", {})
+        if isinstance(vxlan_config_raw, str):
+            try:
+                vxlan_config = json.loads(vxlan_config_raw) if vxlan_config_raw else {}
+            except json.JSONDecodeError:
+                logging.warning(f"[DEVICE APPLY] Invalid VXLAN config JSON: {vxlan_config_raw}")
+                vxlan_config = {}
+        else:
+            vxlan_config = vxlan_config_raw or {}
+        
+        # Handle multiple tunnels format: {"tunnels": [tunnel1, tunnel2, ...]}
+        # IMPORTANT: Check for tunnels format BEFORE calling normalize_config
+        # because normalize_config expects a single tunnel config, not the tunnels wrapper
+        if isinstance(vxlan_config, dict) and "tunnels" in vxlan_config:
+            # Multiple tunnels format - normalize each tunnel
+            tunnels = vxlan_config.get("tunnels", [])
+            normalized_tunnels = []
+            for tunnel in tunnels:
+                if isinstance(tunnel, dict):
+                    normalized_tunnel = vxlan_utils.normalize_config(tunnel)
+                    if normalized_tunnel:
+                        normalized_tunnels.append(normalized_tunnel)
+            if normalized_tunnels:
+                vxlan_config = {"tunnels": normalized_tunnels}
+                if "VXLAN" not in protocols:
+                    protocols.append("VXLAN")
+                logging.info(f"[DEVICE APPLY] Processing {len(normalized_tunnels)} VXLAN tunnel(s)")
+            else:
+                vxlan_config = {}
+        else:
+            # Single tunnel format (backward compatibility)
+            vxlan_config = vxlan_utils.normalize_config(vxlan_config)
+            if vxlan_config and "VXLAN" not in protocols:
+                protocols.append("VXLAN")
+
         bgp_config = data.get("bgp_config", {})
         dhcp_mode = (dhcp_config.get("mode") or "").lower() if isinstance(dhcp_config, dict) else ""
         if dhcp_mode == "client":
@@ -2156,6 +2244,8 @@ def apply_device():
         logging.info(f"[DEVICE APPLY] OSPF Config: {ospf_config}")
         logging.info(f"[DEVICE APPLY] ISIS Config: {isis_config}")
         logging.info(f"[DEVICE APPLY] DHCP Config: {dhcp_config}")
+        logging.info(f"[DEVICE APPLY] VXLAN Config (raw): {vxlan_config_raw}")
+        logging.info(f"[DEVICE APPLY] VXLAN Config (normalized): {vxlan_config}")
         
         # Normalize interface name (extract base interface from labels like "TG 0 - Port: ens4np0")
         def normalize_iface(iface_str):
@@ -2179,9 +2269,71 @@ def apply_device():
             "interface": interface_normalized,
             "vlan": vlan
         }
+        vxlan_state = "Disabled"
+        vxlan_interface = ""
+        vxlan_error = ""
+        # Consider VXLAN enabled if config provided (with actual content) or protocol explicitly selected
+        # Check if vxlan_config has actual content (not just empty dict)
+        # Note: bool({}) is False, so empty dict won't enable VXLAN
+        # Check for multiple tunnels format or single tunnel format
+        vxlan_config_has_content = False
+        if isinstance(vxlan_config, dict):
+            if "tunnels" in vxlan_config:
+                # Multiple tunnels format
+                tunnels = vxlan_config.get("tunnels", [])
+                vxlan_config_has_content = len(tunnels) > 0
+            else:
+                # Single tunnel format
+                vxlan_config_has_content = (
+                    vxlan_config.get("vni") or 
+                    vxlan_config.get("remote_peers") or 
+                    vxlan_config.get("enabled") is True
+                )
+        vxlan_enabled = vxlan_config_has_content or ("VXLAN" in protocols)
+        if vxlan_enabled:
+            logging.info(f"[DEVICE APPLY] VXLAN enabled: config_has_content={vxlan_config_has_content}, in_protocols={'VXLAN' in protocols}, vxlan_config={vxlan_config}")
+        else:
+            logging.warning(f"[DEVICE APPLY] VXLAN NOT enabled: config_has_content={vxlan_config_has_content}, in_protocols={'VXLAN' in protocols}, vxlan_config={vxlan_config}")
         
         # Determine interface name
         iface_name = f"vlan{vlan}" if (vlan and vlan != "0") else interface_normalized
+
+        if vxlan_enabled:
+            # Handle multiple tunnels format
+            if isinstance(vxlan_config, dict) and "tunnels" in vxlan_config:
+                tunnels = vxlan_config.get("tunnels", [])
+                for tunnel in tunnels:
+                    if isinstance(tunnel, dict):
+                        if not tunnel.get("underlay_interface"):
+                            tunnel["underlay_interface"] = interface_normalized
+                        if not tunnel.get("overlay_interface"):
+                            tunnel["overlay_interface"] = iface_name
+                        tunnel.setdefault("underlay_route_interface", iface_name)
+                        if ipv4_gateway:
+                            tunnel.setdefault("underlay_gateway", ipv4_gateway)
+                        if ipv4_mask:
+                            tunnel.setdefault("local_prefix_len", ipv4_mask)
+                        validation_errors = vxlan_utils.validate_config(tunnel)
+                        if validation_errors:
+                            error_msg = f"Invalid VXLAN tunnel configuration: {validation_errors[0]}"
+                            logging.error(f"[DEVICE APPLY] {error_msg}")
+                            return jsonify({"error": error_msg}), 400
+            else:
+                # Single tunnel format (backward compatibility)
+                if not vxlan_config.get("underlay_interface"):
+                    vxlan_config["underlay_interface"] = interface_normalized
+                if not vxlan_config.get("overlay_interface"):
+                    vxlan_config["overlay_interface"] = iface_name
+                vxlan_config.setdefault("underlay_route_interface", iface_name)
+                if ipv4_gateway:
+                    vxlan_config.setdefault("underlay_gateway", ipv4_gateway)
+                if ipv4_mask:
+                    vxlan_config.setdefault("local_prefix_len", ipv4_mask)
+                validation_errors = vxlan_utils.validate_config(vxlan_config)
+                if validation_errors:
+                    error_msg = f"Invalid VXLAN configuration: {validation_errors[0]}"
+                    logging.error(f"[DEVICE APPLY] {error_msg}")
+                    return jsonify({"error": error_msg}), 400
         
         # CRITICAL: Validate interface name when VLAN is not used
         if not iface_name:
@@ -2234,7 +2386,7 @@ def apply_device():
         except Exception as e:
             logging.warning(f"[DEVICE APPLY] Error bringing up interface {iface_name}: {e}")
             result["interface_up"] = False
-        
+
         # Step 3: Configure IPv4 address
         if ipv4 and ipv4_mask:
             try:
@@ -2279,133 +2431,207 @@ def apply_device():
                 logging.warning(f"[DEVICE APPLY] Error configuring IPv6 address: {e}")
                 result["ipv6_configured"] = False
         
-        # Step 5: Add default routes if gateways are provided
+        # Step 5: Add host routes to gateways (for reachability) but NEVER add default routes on host
+        # Default routes should only be added inside FRR containers, not on the host system
+        # Adding default routes on the host would overwrite the management default route and break connectivity
         if ipv4_gateway:
             try:
-                # First, ensure gateway is reachable on the interface (prevents Linux from adding it to loopback)
                 # Add host route to gateway on the interface to make it directly reachable
+                # This allows the device to reach its gateway without affecting the system default route
                 gateway_host_route = subprocess.run([
                     "ip", "route", "replace", f"{ipv4_gateway}/32", "dev", iface_name
                 ], capture_output=True, text=True, timeout=5)
                 if gateway_host_route.returncode == 0:
-                    logging.debug(f"[DEVICE APPLY] Added host route to gateway {ipv4_gateway}/32 on {iface_name}")
-                
-                # Remove existing default route if any
-                subprocess.run(["ip", "route", "del", "default", "via", ipv4_gateway], 
-                             capture_output=True, text=True, timeout=5)
-                
-                # Add new default route
-                route_result = subprocess.run([
-                    "ip", "route", "add", "default", "via", ipv4_gateway, "dev", iface_name
-                ], capture_output=True, text=True, timeout=5)
-                
-                if route_result.returncode == 0:
-                    logging.info(f"[DEVICE APPLY] Added IPv4 default route via {ipv4_gateway}")
-                    result["ipv4_route_added"] = True
+                    logging.debug(f"[DEVICE APPLY] Added host route to IPv4 gateway {ipv4_gateway}/32 on {iface_name}")
+                    result["ipv4_gateway_route_added"] = True
                 else:
-                    logging.warning(f"[DEVICE APPLY] Failed to add IPv4 default route: {route_result.stderr}")
-                    result["ipv4_route_added"] = False
+                    logging.warning(f"[DEVICE APPLY] Failed to add host route to IPv4 gateway: {gateway_host_route.stderr}")
+                    result["ipv4_gateway_route_added"] = False
             except Exception as e:
-                logging.warning(f"[DEVICE APPLY] Error adding IPv4 default route: {e}")
-                result["ipv4_route_added"] = False
+                logging.warning(f"[DEVICE APPLY] Error adding host route to IPv4 gateway: {e}")
+                result["ipv4_gateway_route_added"] = False
         
         if ipv6_gateway:
             try:
-                # First, ensure IPv6 gateway is reachable on the interface (prevents Linux from adding it to loopback)
                 # Add host route to IPv6 gateway on the interface to make it directly reachable
+                # This allows the device to reach its gateway without affecting the system default route
                 gateway6_host_route = subprocess.run([
                     "ip", "-6", "route", "replace", f"{ipv6_gateway}/128", "dev", iface_name
                 ], capture_output=True, text=True, timeout=5)
                 if gateway6_host_route.returncode == 0:
                     logging.debug(f"[DEVICE APPLY] Added host route to IPv6 gateway {ipv6_gateway}/128 on {iface_name}")
-                
-                # Remove existing specific route to gateway if any
-                subprocess.run(["ip", "-6", "route", "del", f"{ipv6_gateway}/128", "via", ipv6_gateway], 
-                             capture_output=True, text=True, timeout=5)
-                
-                # Add specific route to IPv6 gateway
-                route6_result = subprocess.run([
-                    "ip", "-6", "route", "add", f"{ipv6_gateway}/128", "via", ipv6_gateway, "dev", iface_name
-                ], capture_output=True, text=True, timeout=5)
-                
-                if route6_result.returncode == 0:
-                    logging.info(f"[DEVICE APPLY] Added IPv6 gateway route {ipv6_gateway}/128 via {ipv6_gateway} dev {iface_name}")
-                    result["ipv6_route_added"] = True
+                    result["ipv6_gateway_route_added"] = True
                 else:
-                    logging.warning(f"[DEVICE APPLY] Failed to add IPv6 gateway route: {route6_result.stderr}")
-                    result["ipv6_route_added"] = False
+                    logging.warning(f"[DEVICE APPLY] Failed to add host route to IPv6 gateway: {gateway6_host_route.stderr}")
+                    result["ipv6_gateway_route_added"] = False
             except Exception as e:
-                logging.warning(f"[DEVICE APPLY] Error adding IPv6 gateway route: {e}")
-                result["ipv6_route_added"] = False
+                logging.warning(f"[DEVICE APPLY] Error adding host route to IPv6 gateway: {e}")
+                result["ipv6_gateway_route_added"] = False
         
-        # Step 6: Configure loopback IP addresses on lo interface
-        # Check if FRR container exists - if so, configure loopback inside container
+        # Step 6: Ensure FRR container exists (even for VXLAN-only devices) and configure loopback IPs
+        needs_frr_container = bool(protocols) or bool(dhcp_mode) or vxlan_enabled
         container_exists = False
         container = None
-        try:
-            from utils.frr_docker import FRRDockerManager
-            frr_manager = FRRDockerManager()
-            container_name = frr_manager._get_container_name(device_id, device_name)
+        container_name = ""
+        frr_manager = None
+        if needs_frr_container:
             try:
-                container = frr_manager.client.containers.get(container_name)
-                if container.status == "running":
-                    container_exists = True
-                    logging.info(f"[DEVICE APPLY] FRR container {container_name} exists and is running, will configure loopback inside container")
+                from utils.frr_docker import FRRDockerManager
+                frr_manager = FRRDockerManager()
+                container_name = frr_manager._get_container_name(device_id, device_name)
+                try:
+                    container = frr_manager.client.containers.get(container_name)
+                    if container.status == "running":
+                        container_exists = True
+                        logging.info(f"[DEVICE APPLY] FRR container {container_name} exists and is running, will configure loopback inside container")
+                    else:
+                        logging.info(f"[DEVICE APPLY] FRR container {container_name} exists but is not running, recreating")
+                        try:
+                            container.remove(force=True)
+                        except Exception as remove_exc:
+                            logging.debug(f"[DEVICE APPLY] Failed to remove stale container {container_name}: {remove_exc}")
+                        container = None
+                except Exception:
+                    logging.info(f"[DEVICE APPLY] FRR container {container_name} does not exist, creating it")
+                    container = None
+
+                if not container_exists:
+                    container_device_config = {
+                        "device_name": device_name or f"device_{device_id}",
+                        "interface": interface_normalized,
+                        "vlan": vlan,
+                        "ipv4": f"{ipv4}/{ipv4_mask}" if ipv4 and ipv4_mask else ipv4,
+                        "ipv6": f"{ipv6}/{ipv6_mask}" if ipv6 and ipv6_mask else ipv6,
+                        "loopback_ipv4": loopback_ipv4,
+                        "loopback_ipv6": loopback_ipv6,
+                        "dhcp_mode": dhcp_mode,
+                        "bgp_asn": (bgp_config.get("bgp_asn") if isinstance(bgp_config, dict) and bgp_config.get("bgp_asn") else 65000),
+                        "vxlan_config": vxlan_config if vxlan_enabled else {},
+                    }
+                    created_container_name = frr_manager.start_frr_container(device_id, container_device_config)
+                    if created_container_name:
+                        try:
+                            container = frr_manager.client.containers.get(created_container_name)
+                            container_name = created_container_name
+                            container_exists = True
+                            logging.info(f"[DEVICE APPLY] Created FRR container {created_container_name} for device {device_name}")
+                        except Exception as retrieve_exc:
+                            logging.warning(f"[DEVICE APPLY] FRR container {created_container_name} started but could not be inspected: {retrieve_exc}")
+                    else:
+                        logging.warning(f"[DEVICE APPLY] Failed to start FRR container for device {device_name}")
+            except Exception as e:
+                logging.warning(f"[DEVICE APPLY] Could not ensure FRR container: {e}, will configure loopback on host")
+                container_exists = False
+                container = None
+        else:
+            logging.info(f"[DEVICE APPLY] Skipping FRR container provisioning (protocol-less host configuration)")
+        
+        # CRITICAL: If client didn't send loopback but IPv4 is available, fallback to IPv4 for loopback
+        # This ensures loopback is always set (for FRR router-id and loopback interface)
+        original_loopback_ipv4 = loopback_ipv4  # Track if it was originally provided
+        if (not loopback_ipv4) and ipv4:
+            try:
+                loopback_ipv4 = ipv4.split("/")[0] if "/" in ipv4 else ipv4
+                logging.info(f"[DEVICE APPLY] Loopback IPv4 not provided; using interface IPv4 as fallback: {loopback_ipv4}/32")
             except Exception:
-                logging.info(f"[DEVICE APPLY] FRR container {container_name} does not exist, will configure loopback on host")
-        except Exception as e:
-            logging.warning(f"[DEVICE APPLY] Could not check for FRR container: {e}, will configure loopback on host")
+                pass
         
         # Configure loopback IPs using FRR vtysh commands (if container exists)
-        if loopback_ipv4 or loopback_ipv6:
+        logging.info(f"[DEVICE APPLY] Checking loopback configuration: loopback_ipv4={loopback_ipv4}, loopback_ipv6={loopback_ipv6}, container_exists={container_exists}, container={container}")
+        # CRITICAL: Always configure loopback if container exists, even if loopback IPs are not explicitly provided
+        # The _configure_interfaces method will use fallback logic (interface IP, router_id, or default)
+        if container_exists and container:
+            logging.info(f"[DEVICE APPLY] Container exists, will configure loopback (with fallback if needed)")
+        elif loopback_ipv4 or loopback_ipv6:
+            logging.info(f"[DEVICE APPLY] Loopback IPs provided but container doesn't exist yet")
+        
+        if (container_exists and container) or (loopback_ipv4 or loopback_ipv6):
             try:
                 if container_exists and container:
-                    # Configure loopback inside FRR container using vtysh commands
-                    logging.info(f"[DEVICE APPLY] Configuring loopback IPs via vtysh in container {container_name}")
+                    # Reconfigure interfaces (including loopback) inside FRR container
+                    logging.info(f"[DEVICE APPLY] Reconfiguring interfaces (including loopback) via vtysh in container {container_name}")
                     
-                    # Build vtysh commands for loopback configuration
-                    vtysh_commands = [
-                        "configure terminal",
-                        "interface lo",
-                    ]
+                    # Build device config for interface configuration
+                    interface_config = {
+                        "device_name": device_name or f"device_{device_id}",
+                        "interface": interface_normalized,
+                        "vlan": vlan,
+                        "ipv4": f"{ipv4}/{ipv4_mask}" if ipv4 and ipv4_mask else ipv4,
+                        "ipv6": f"{ipv6}/{ipv6_mask}" if ipv6 and ipv6_mask else ipv6,
+                        "loopback_ipv4": loopback_ipv4,
+                        "loopback_ipv6": loopback_ipv6,
+                        "dhcp_mode": dhcp_mode,
+                    }
                     
-                    # Configure IPv4 loopback if provided
-                    if loopback_ipv4:
-                        vtysh_commands.append(f" ip address {loopback_ipv4}/32")
-                        logging.info(f"[DEVICE APPLY] Adding loopback IPv4 {loopback_ipv4}/32 via vtysh")
-                    
-                    # Configure IPv6 loopback if provided
-                    if loopback_ipv6:
-                        vtysh_commands.append(f" ipv6 address {loopback_ipv6}/128")
-                        logging.info(f"[DEVICE APPLY] Adding loopback IPv6 {loopback_ipv6}/128 via vtysh")
-                    
-                    vtysh_commands.extend([
-                        "exit",
-                        "exit",
-                        "write memory"
-                    ])
-                    
-                    # Execute commands using here-doc to maintain context
-                    config_commands = "\n".join(vtysh_commands)
-                    exec_cmd = f"vtysh << 'EOF'\n{config_commands}\nEOF"
-                    
-                    logging.info(f"[DEVICE APPLY] Executing loopback configuration via vtysh")
-                    loopback_result = container.exec_run(["bash", "-c", exec_cmd])
-                    
-                    if loopback_result.exit_code == 0:
+                    # Use _configure_interfaces to ensure loopback is properly configured
+                    logging.info(f"[DEVICE APPLY] Calling _configure_interfaces with loopback_ipv4={loopback_ipv4}, loopback_ipv6={loopback_ipv6}")
+                    if frr_manager._configure_interfaces(container_name, device_id, interface_config):
+                        logging.info(f"[DEVICE APPLY] ✅ Successfully configured loopback {loopback_ipv4}/32 in container {container_name}")
                         if loopback_ipv4:
-                            logging.info(f"[DEVICE APPLY] ✅ Configured loopback IPv4 address {loopback_ipv4}/32 via vtysh in container {container_name}")
                             result["loopback_ipv4_configured"] = True
                         if loopback_ipv6:
-                            logging.info(f"[DEVICE APPLY] ✅ Configured loopback IPv6 address {loopback_ipv6}/128 via vtysh in container {container_name}")
                             result["loopback_ipv6_configured"] = True
+                        
+                        # Verify loopback is in running config
+                        verify_cmd = f"vtysh -c 'show running-config' | grep -A 3 'interface lo'"
+                        verify_result = container.exec_run(["bash", "-c", verify_cmd])
+                        verify_output = verify_result.output.decode('utf-8') if isinstance(verify_result.output, bytes) else str(verify_result.output)
+                        logging.info(f"[DEVICE APPLY] Loopback verification in running config: {verify_output}")
                     else:
-                        output_str = loopback_result.output.decode('utf-8') if isinstance(loopback_result.output, bytes) else str(loopback_result.output)
-                        logging.warning(f"[DEVICE APPLY] Failed to configure loopback IPs via vtysh in container: {output_str}")
+                        logging.warning(f"[DEVICE APPLY] Failed to configure loopback in container {container_name}, trying direct vtysh")
+                        
+                        # Fallback: Configure loopback directly via vtysh
+                        vtysh_commands = [
+                            "configure terminal",
+                            "interface lo",
+                        ]
+                        
+                        # Configure IPv4 loopback if provided
                         if loopback_ipv4:
-                            result["loopback_ipv4_configured"] = False
+                            vtysh_commands.append(f" ip address {loopback_ipv4}/32")
+                            logging.info(f"[DEVICE APPLY] Adding loopback IPv4 {loopback_ipv4}/32 via vtysh")
+                        
+                        # Configure IPv6 loopback if provided
                         if loopback_ipv6:
-                            result["loopback_ipv6_configured"] = False
+                            vtysh_commands.append(f" ipv6 address {loopback_ipv6}/128")
+                            logging.info(f"[DEVICE APPLY] Adding loopback IPv6 {loopback_ipv6}/128 via vtysh")
+                        
+                        vtysh_commands.extend([
+                            "exit",
+                            "exit",
+                            "write memory"
+                        ])
+                        
+                        # CRITICAL: Ensure mgmtd is running before attempting vtysh commands
+                        # FRR 10.0 with integrated-vtysh-config requires mgmtd to be running
+                        mgmtd_check = container.exec_run(["bash", "-c", "pgrep -f mgmtd > /dev/null && echo 'running' || echo 'not_running'"])
+                        mgmtd_output = mgmtd_check.output.decode('utf-8') if isinstance(mgmtd_check.output, bytes) else str(mgmtd_check.output)
+                        if 'running' not in mgmtd_output.strip():
+                            logging.warning(f"[DEVICE APPLY] mgmtd is not running, attempting to start it manually")
+                            container.exec_run(["bash", "-c", "/usr/lib/frr/mgmtd -d -A 127.0.0.1 2>&1 || true"])
+                            time.sleep(2)  # Give mgmtd time to start
+                        
+                        # Execute commands using here-doc to maintain context
+                        config_commands = "\n".join(vtysh_commands)
+                        exec_cmd = f"vtysh << 'EOF'\n{config_commands}\nEOF"
+                        
+                        logging.info(f"[DEVICE APPLY] Executing loopback configuration via vtysh")
+                        loopback_result = container.exec_run(["bash", "-c", exec_cmd])
+                        
+                        if loopback_result.exit_code == 0:
+                            if loopback_ipv4:
+                                logging.info(f"[DEVICE APPLY] ✅ Configured loopback IPv4 address {loopback_ipv4}/32 via vtysh in container {container_name}")
+                                result["loopback_ipv4_configured"] = True
+                            if loopback_ipv6:
+                                logging.info(f"[DEVICE APPLY] ✅ Configured loopback IPv6 address {loopback_ipv6}/128 via vtysh in container {container_name}")
+                                result["loopback_ipv6_configured"] = True
+                        else:
+                            output_str = loopback_result.output.decode('utf-8') if isinstance(loopback_result.output, bytes) else str(loopback_result.output)
+                            logging.warning(f"[DEVICE APPLY] Failed to configure loopback IPs via vtysh in container: {output_str}")
+                            if loopback_ipv4:
+                                result["loopback_ipv4_configured"] = False
+                            if loopback_ipv6:
+                                result["loopback_ipv6_configured"] = False
                 else:
                     # Container doesn't exist yet - loopback will be configured later during protocol setup
                     logging.info(f"[DEVICE APPLY] FRR container not available yet, loopback IPs will be configured during protocol setup")
@@ -2421,6 +2647,172 @@ def apply_device():
                     result["loopback_ipv4_configured"] = False
                 if loopback_ipv6:
                     result["loopback_ipv6_configured"] = False
+        
+        # Configure VXLAN BEFORE routing protocols to ensure zebra knows about the interface
+        # This is critical for BGP EVPN to work correctly with advertise-all-vni
+        if vxlan_enabled:
+            logging.info(f"[DEVICE APPLY] VXLAN enabled, calling ensure_vxlan_interface for device {device_id}")
+            logging.info(f"[DEVICE APPLY] VXLAN config passed to ensure_vxlan_interface: {vxlan_config}")
+            logging.info(f"[DEVICE APPLY] Container exists: {container_exists}, container_name: {container_name}")
+            try:
+                # Handle multiple tunnels format
+                if isinstance(vxlan_config, dict) and "tunnels" in vxlan_config:
+                    tunnels = vxlan_config.get("tunnels", [])
+                    vxlan_interfaces = []
+                    vxlan_errors = []
+                    updated_tunnels = []
+                    for tunnel in tunnels:
+                        if isinstance(tunnel, dict):
+                            tunnel_result = vxlan_utils.ensure_vxlan_interface(
+                                device_id,
+                                device_name or device_id,
+                                tunnel,
+                                container_name=container_name if container_exists else None,
+                                frr_manager=frr_manager,
+                            )
+                            if tunnel_result.get("success"):
+                                # Update tunnel config with the interface name and any other returned config
+                                updated_tunnel = tunnel_result.get("config", tunnel)
+                                updated_tunnel["vxlan_interface"] = tunnel_result.get("interface", "")
+                                updated_tunnels.append(updated_tunnel)
+                                vxlan_interfaces.append(tunnel_result.get("interface", ""))
+                            else:
+                                # Keep original tunnel config even if it failed
+                                updated_tunnels.append(tunnel)
+                                vxlan_errors.append(tunnel_result.get("error", "Unknown VXLAN error"))
+                    # Update vxlan_config with the updated tunnels (including interface names)
+                    vxlan_config["tunnels"] = updated_tunnels
+                    if vxlan_interfaces:
+                        vxlan_interface = ", ".join(vxlan_interfaces)
+                        vxlan_state = "Configured" if not vxlan_errors else "Partial"
+                        vxlan_error = "; ".join(vxlan_errors) if vxlan_errors else ""
+                        result["vxlan_interface"] = vxlan_interface
+                    else:
+                        vxlan_state = "Error"
+                        vxlan_error = "; ".join(vxlan_errors) if vxlan_errors else "All tunnels failed"
+                        result["vxlan_error"] = vxlan_error
+                else:
+                    # Single tunnel format (backward compatibility)
+                    vxlan_result = vxlan_utils.ensure_vxlan_interface(
+                        device_id,
+                        device_name or device_id,
+                        vxlan_config,
+                        container_name=container_name if container_exists else None,
+                        frr_manager=frr_manager,
+                    )
+                    logging.info(f"[DEVICE APPLY] ensure_vxlan_interface returned: {vxlan_result}")
+                    if vxlan_result.get("success"):
+                        vxlan_config = vxlan_result.get("config", vxlan_config) or vxlan_config
+                        vxlan_interface = vxlan_result.get("interface", "")
+                        vxlan_state = "Configured"
+                        vxlan_error = ""
+                        result["vxlan_interface"] = vxlan_interface
+                    else:
+                        vxlan_state = "Error"
+                        vxlan_error = vxlan_result.get("error", "Unknown VXLAN error")
+                        result["vxlan_error"] = vxlan_error
+            except Exception as vxlan_exc:
+                vxlan_state = "Error"
+                vxlan_error = str(vxlan_exc)
+                logging.error(f"[DEVICE APPLY] VXLAN setup failed for {device_id}: {vxlan_exc}", exc_info=True)
+                result["vxlan_error"] = vxlan_error
+        
+        # CRITICAL: Save/update device in database BEFORE starting protocol config thread
+        # so that BGP EVPN can read VXLAN config from the database
+        try:
+            if device_id:
+                existing_device = device_db.get_device(device_id)
+                device_data = {
+                    "device_id": device_id,
+                    "device_name": device_name,
+                    "interface": interface,
+                    "vlan": vlan,
+                    "ipv4_address": ipv4,
+                    "ipv6_address": ipv6,
+                    "ipv4_mask": ipv4_mask,
+                    "ipv6_mask": ipv6_mask,
+                    "ipv4_gateway": ipv4_gateway,
+                    "ipv6_gateway": ipv6_gateway,
+                    "loopback_ipv4": loopback_ipv4,
+                    "loopback_ipv6": loopback_ipv6,
+                    "status": "Running",
+                    "protocols": protocols,
+                    "bgp_config": bgp_config,
+                    "ospf_config": ospf_config,
+                    "isis_config": isis_config,
+                    "dhcp_config": dhcp_config,
+                    "dhcp_mode": dhcp_config.get("mode") if isinstance(dhcp_config, dict) else "",
+                    "vxlan_config": vxlan_config,
+                    "vxlan_state": vxlan_state,
+                    "vxlan_interface": vxlan_interface,
+                    "vxlan_enabled": vxlan_enabled,
+                    "vxlan_last_error": vxlan_error,
+                    "vxlan_updated_at": datetime.now(timezone.utc).isoformat(),
+                }
+                if not existing_device:
+                    logging.info(f"[DEVICE APPLY] Device {device_id} not found in database, adding it")
+                    device_db.add_device(device_data)
+                else:
+                    logging.info(f"[DEVICE APPLY] Updating device {device_id} in database with VXLAN config")
+                    device_db.update_device(device_id, device_data)
+        except Exception as db_exc:
+            logging.warning(f"[DEVICE DB] Failed to save device {device_id} to database before protocol config: {db_exc}")
+        
+        # Configure routing protocols if container exists and configs are provided
+        # Use unified helper function to ensure consistency across all code paths
+        # Run in background thread to avoid HTTP timeout (protocol config can take 30+ seconds)
+        # NOTE: VXLAN must be configured BEFORE this point so zebra knows about the interface
+        # Database is now updated above, so BGP EVPN can read VXLAN config
+        if container_exists and container:
+            import threading
+            def _configure_protocols_background():
+                try:
+                    # Small delay to ensure database is updated with VXLAN config
+                    import time
+                    # CRITICAL: Wait longer if VXLAN is enabled to ensure bridge SVI is fully configured
+                    # and recognized by FRR's EVPN daemon before BGP EVPN enables advertise-all-vni
+                    if vxlan_enabled:
+                        time.sleep(10)  # Give FRR more time to recognize the bridge SVI (increased from 5 to 10 seconds)
+                        # Additional verification: Check if bridge SVI is recognized by querying EVPN VNI
+                        # This helps ensure the EVPN daemon has processed the bridge SVI configuration
+                        try:
+                            from utils.frr_docker import FRRDockerManager
+                            frr_mgr = FRRDockerManager()
+                            container_name = frr_mgr._get_container_name(device_id, device_name)
+                            import docker
+                            container = frr_mgr.client.containers.get(container_name)
+                            # Query EVPN VNI to see if SVI is recognized (non-blocking check)
+                            evpn_check = container.exec_run(["vtysh", "-c", "show evpn vni detail"], timeout=5)
+                            evpn_output = evpn_check.output.decode("utf-8", errors="ignore") if isinstance(evpn_check.output, bytes) else str(evpn_check.output)
+                            if "SVI interface:" in evpn_output:
+                                logging.info(f"[DEVICE APPLY] Bridge SVI appears to be recognized by EVPN daemon")
+                            else:
+                                logging.warning(f"[DEVICE APPLY] Bridge SVI may not be recognized yet - EVPN daemon may need more time")
+                        except Exception as evpn_check_exc:
+                            logging.debug(f"[DEVICE APPLY] Could not verify EVPN SVI recognition: {evpn_check_exc}")
+                        logging.info(f"[DEVICE APPLY] Waited 10 seconds for VXLAN bridge SVI to be recognized before configuring BGP EVPN")
+                    else:
+                        time.sleep(1)
+                    protocol_results = _configure_routing_protocols(
+                        device_id=device_id,
+                        device_name=device_name,
+                        bgp_config=bgp_config,
+                        ospf_config=ospf_config,
+                        isis_config=isis_config,
+                        ipv4=ipv4,
+                        ipv6=ipv6,
+                        ipv4_mask=ipv4_mask,
+                        ipv6_mask=ipv6_mask,
+                        dhcp_mode=dhcp_mode
+                    )
+                    logging.info(f"[DEVICE APPLY] Protocol configuration results: {protocol_results}")
+                except Exception as protocol_exc:
+                    logging.error(f"[DEVICE APPLY] Error in background protocol configuration: {protocol_exc}", exc_info=True)
+            
+            # Start protocol configuration in background thread
+            protocol_thread = threading.Thread(target=_configure_protocols_background, daemon=True)
+            protocol_thread.start()
+            logging.info(f"[DEVICE APPLY] Started protocol configuration in background thread for device {device_name}")
         
         # Update device status in database
         try:
@@ -2455,7 +2847,13 @@ def apply_device():
                         "ospf_config": ospf_config,
                         "isis_config": isis_config,
                         "dhcp_config": dhcp_config,
-                        "dhcp_mode": dhcp_config.get("mode") if isinstance(dhcp_config, dict) else ""
+                        "dhcp_mode": dhcp_config.get("mode") if isinstance(dhcp_config, dict) else "",
+                        "vxlan_config": vxlan_config,
+                        "vxlan_state": vxlan_state,
+                        "vxlan_interface": vxlan_interface,
+                        "vxlan_enabled": vxlan_enabled,
+                        "vxlan_last_error": vxlan_error,
+                        "vxlan_updated_at": datetime.now(timezone.utc).isoformat(),
                     }
                     
                     if device_db.add_device(device_data):
@@ -2507,14 +2905,17 @@ def apply_device():
                                 "ipv6_gateway": None
                             })
                     
-                    # Update loopback IP addresses if provided
+                    # CRITICAL: Always update loopback IP addresses if they have values
+                    # This includes fallback values set from interface IP (see fallback logic above)
+                    # The fallback logic ensures loopback_ipv4 is always set if IPv4 is available
                     if loopback_ipv4:
                         existing_loopback_ipv4 = existing_device.get("loopback_ipv4", "")
                         if existing_loopback_ipv4 != loopback_ipv4:
                             logging.info(f"[DEVICE APPLY] Loopback IPv4 address changed from '{existing_loopback_ipv4}' to '{loopback_ipv4}' for device {device_name}")
                         update_data["loopback_ipv4"] = loopback_ipv4
+                        logging.info(f"[DEVICE APPLY] Saving loopback_ipv4={loopback_ipv4} to database for device {device_name}")
                     else:
-                        # If loopback IPv4 is empty, clear it from database
+                        # If loopback IPv4 is empty (and no fallback was possible), clear it from database
                         if existing_device.get("loopback_ipv4"):
                             logging.info(f"[DEVICE APPLY] Clearing loopback IPv4 address for device {device_name}")
                             update_data["loopback_ipv4"] = None
@@ -2524,6 +2925,7 @@ def apply_device():
                         if existing_loopback_ipv6 != loopback_ipv6:
                             logging.info(f"[DEVICE APPLY] Loopback IPv6 address changed from '{existing_loopback_ipv6}' to '{loopback_ipv6}' for device {device_name}")
                         update_data["loopback_ipv6"] = loopback_ipv6
+                        logging.info(f"[DEVICE APPLY] Saving loopback_ipv6={loopback_ipv6} to database for device {device_name}")
                     else:
                         # If loopback IPv6 is empty, clear it from database
                         if existing_device.get("loopback_ipv6"):
@@ -2577,6 +2979,19 @@ def apply_device():
                         update_data["dhcp_mode"] = ""
                         update_data["dhcp_state"] = "Disabled"
                         update_data["dhcp_running"] = False
+                    
+                    # Always update VXLAN fields if VXLAN protocol is present or config provided
+                    if ("VXLAN" in protocols) or vxlan_config or existing_device.get("vxlan_config"):
+                        update_data.update(
+                            {
+                                "vxlan_config": vxlan_config or existing_device.get("vxlan_config", {}),
+                                "vxlan_state": vxlan_state,
+                                "vxlan_interface": vxlan_interface,
+                                "vxlan_enabled": vxlan_enabled,
+                                "vxlan_last_error": vxlan_error,
+                                "vxlan_updated_at": datetime.now(timezone.utc).isoformat(),
+                            }
+                        )
                     
                     # Update protocols list if provided
                     if protocols:
@@ -2674,6 +3089,13 @@ def apply_device():
                 result["dhcp"] = {"success": False, "error": str(dhcp_error)}
         else:
             logging.info(f"[DHCP APPLY] Skipping DHCP services for device {device_id}: device_id={device_id}, mode={dhcp_apply_mode}")
+        
+        if vxlan_enabled:
+            result["vxlan"] = {
+                "state": vxlan_state,
+                "interface": vxlan_interface,
+                "error": vxlan_error,
+            }
         
         return jsonify({
             "status": "applied",
@@ -3350,6 +3772,7 @@ def remove_device():
         device_info = None
         container_name = None
         frr_manager = None
+        dhcp_mode_remove = ""
         try:
             device_info = device_db.get_device(device_id)
             if device_info and not device_name:
@@ -3357,11 +3780,32 @@ def remove_device():
             if device_info:
                 base_iface = device_info.get("interface", "")
                 vlan = str(device_info.get("vlan", "0"))
+
                 iface_normalized = base_iface
-                if base_iface and " - " in base_iface:
-                    parts = base_iface.split(" - ", 1)
-                    iface_normalized = parts[-1].strip()
+                if base_iface:
+                    s = base_iface.strip().strip('"').rstrip(",")
+                    if " - " in s:
+                        s = s.split(" - ", 1)[-1].strip()
+                    if ":" in s:
+                        s = s.rsplit(":", 1)[-1].strip()
+                    parts = s.split()
+                    iface_normalized = parts[-1] if parts else s
+
                 iface_name = f"vlan{vlan}" if vlan and vlan != "0" else iface_normalized
+
+                dhcp_cfg = device_info.get("dhcp_config") or {}
+                if isinstance(dhcp_cfg, str):
+                    try:
+                        dhcp_cfg = json.loads(dhcp_cfg) if dhcp_cfg else {}
+                    except Exception:
+                        dhcp_cfg = {}
+                if isinstance(dhcp_cfg, dict):
+                    iface_override = dhcp_cfg.get("interface")
+                    if iface_override:
+                        iface_name = iface_override
+                    dhcp_mode_remove = (dhcp_cfg.get("mode") or device_info.get("dhcp_mode") or "").lower()
+                else:
+                    dhcp_mode_remove = (device_info.get("dhcp_mode") or "").lower()
                 try:
                     if not frr_manager:
                         from utils.frr_docker import FRRDockerManager
@@ -3369,6 +3813,37 @@ def remove_device():
                     container_name = frr_manager._get_container_name(device_id, device_name)
                 except Exception as container_error:
                     logging.debug(f"[DEVICE REMOVE] Failed to resolve container name: {container_error}")
+                vxlan_cfg = device_info.get("vxlan_config")
+                if vxlan_cfg:
+                    try:
+                        # Handle both old format (single tunnel dict) and new format (tunnels list)
+                        if isinstance(vxlan_cfg, dict) and "tunnels" in vxlan_cfg:
+                            # New format: multiple tunnels
+                            tunnels = vxlan_cfg.get("tunnels", [])
+                            logging.info(f"[DEVICE REMOVE] Cleaning up {len(tunnels)} VXLAN tunnel(s) for device {device_id}")
+                            for tunnel in tunnels:
+                                if isinstance(tunnel, dict):
+                                    try:
+                                        vxlan_utils.tear_down_vxlan_interface(
+                                            device_id,
+                                            tunnel,
+                                            container_name=container_name,
+                                            frr_manager=frr_manager,
+                                        )
+                                        logging.info(f"[DEVICE REMOVE] Successfully cleaned up VXLAN tunnel VNI {tunnel.get('vni')} for device {device_id}")
+                                    except Exception as tunnel_exc:
+                                        logging.warning(f"[DEVICE REMOVE] Failed to tear down VXLAN tunnel VNI {tunnel.get('vni')} for {device_id}: {tunnel_exc}")
+                        else:
+                            # Old format: single tunnel dict
+                            vxlan_utils.tear_down_vxlan_interface(
+                                device_id,
+                                vxlan_cfg,
+                                container_name=container_name,
+                                frr_manager=frr_manager,
+                            )
+                            logging.info(f"[DEVICE REMOVE] Successfully cleaned up VXLAN for device {device_id}")
+                    except Exception as vxlan_exc:
+                        logging.warning(f"[DEVICE REMOVE] Failed to tear down VXLAN for {device_id}: {vxlan_exc}")
                 dhcp_mode_remove = (device_info.get("dhcp_mode") or "").lower()
                 if dhcp_mode_remove in ("client", "server") and iface_name:
                     try:
@@ -3385,7 +3860,53 @@ def remove_device():
         except Exception as e:
             logging.warning(f"[DEVICE REMOVE] Failed to get device info from database: {e}")
         
+        # CRITICAL: VXLAN cleanup (bridge removal) must happen BEFORE container removal
+        # The container removal happens below, but we ensure VXLAN cleanup completed first
+        # If VXLAN cleanup failed above, try one more time before container removal
+        if device_info:
+            vxlan_cfg = device_info.get("vxlan_config")
+            if vxlan_cfg and container_name and frr_manager:
+                try:
+                    # Handle both old format (single tunnel dict) and new format (tunnels list)
+                    tunnels_to_verify = []
+                    if isinstance(vxlan_cfg, dict) and "tunnels" in vxlan_cfg:
+                        # New format: multiple tunnels
+                        tunnels_to_verify = vxlan_cfg.get("tunnels", [])
+                    else:
+                        # Old format: single tunnel dict
+                        tunnels_to_verify = [vxlan_cfg] if vxlan_cfg else []
+                    
+                    # Verify VXLAN cleanup completed - check if bridges still exist
+                    for tunnel in tunnels_to_verify:
+                        if isinstance(tunnel, dict):
+                            try:
+                                from utils.vxlan import normalize_config as vxlan_normalize
+                                config = vxlan_normalize(tunnel)
+                                vni = config.get("vni")
+                                bridge_name = f"br{vni}" if vni else None
+                                if bridge_name:
+                                    try:
+                                        container = frr_manager.client.containers.get(container_name)
+                                        check_result = container.exec_run(["ip", "link", "show", bridge_name])
+                                        if check_result.exit_code == 0:
+                                            logging.warning(f"[DEVICE REMOVE] Bridge {bridge_name} still exists, attempting cleanup again before container removal")
+                                            vxlan_utils.tear_down_vxlan_interface(
+                                                device_id,
+                                                tunnel,
+                                                container_name=container_name,
+                                                frr_manager=frr_manager,
+                                            )
+                                    except Exception:
+                                        # Container might not exist or bridge already removed - that's fine
+                                        pass
+                            except Exception as tunnel_verify_exc:
+                                logging.debug(f"[DEVICE REMOVE] VXLAN tunnel verification failed: {tunnel_verify_exc}")
+                except Exception as vxlan_verify_exc:
+                    logging.debug(f"[DEVICE REMOVE] VXLAN cleanup verification failed: {vxlan_verify_exc}")
+        
         # Stop and remove FRR Docker container for this device
+        # NOTE: This will automatically remove all interfaces inside the container, including bridges
+        # But we clean them up explicitly above to ensure proper cleanup order
         container_removed = False
         try:
             from utils.frr_docker import stop_frr_container
@@ -4014,6 +4535,20 @@ def add_static_route_background(device_id, device_name, gateway, container_name_
             try:
                 container_name = frr_manager._get_container_name(device_id, device_name)
                 container = frr_manager.client.containers.get(container_name)
+                
+                # Skip adding default route if VXLAN is enabled for this device
+                # Check both database and protocols list to be safe
+                try:
+                    from utils.device_database import DeviceDatabase
+                    device_db = DeviceDatabase()
+                    device_record = device_db.get_device(device_id) if device_id else None
+                    vxlan_enabled_in_db = device_record and (device_record.get("vxlan_enabled") is True)
+                    vxlan_in_protocols = "VXLAN" in (device_record.get("protocols", []) if device_record else [])
+                    if vxlan_enabled_in_db or vxlan_in_protocols:
+                        logging.info(f"[ROUTE BG] Skipping default route for {device_name} because VXLAN is enabled (DB: {vxlan_enabled_in_db}, Protocols: {vxlan_in_protocols})")
+                        return
+                except Exception as _vx_exc:
+                    logging.debug(f"[ROUTE BG] Could not determine VXLAN status from DB: {_vx_exc}")
                 
                 # Determine if gateway is IPv4 or IPv6
                 try:
@@ -6238,12 +6773,36 @@ def configure_bgp():
                 logging.info(f"[BGP CONFIGURE] Ensuring {len(ipv4_neighbors_list)} IPv4 BGP neighbor(s) are configured")
                 from utils.frr_docker import configure_bgp_neighbor
                 
+                # Get loopback IPv4 from database for use_loopback_ip check
+                loopback_ipv4 = None
+                try:
+                    from utils.device_database import DeviceDatabase
+                    device_db = DeviceDatabase()
+                    device_data = device_db.get_device(device_id) if device_id else None
+                    if device_data:
+                        loopback_ipv4_raw = device_data.get('loopback_ipv4', '')
+                        if loopback_ipv4_raw:
+                            loopback_ipv4 = loopback_ipv4_raw.strip().split('/')[0]
+                except Exception as e:
+                    logging.warning(f"[BGP CONFIGURE] Could not retrieve loopback IPv4 from database: {e}")
+                
+                # Determine update_source_ipv4 based on use_loopback_ip flag (same logic as configure_bgp_for_device)
+                use_loopback_ip = bgp_config.get('use_loopback_ip', False)
+                if use_loopback_ip and loopback_ipv4:
+                    update_source_ipv4 = loopback_ipv4
+                    logging.info(f"[BGP CONFIGURE] Using loopback IPv4 {update_source_ipv4} as update-source (use_loopback_ip=True)")
+                else:
+                    update_source_ipv4 = bgp_config.get("bgp_update_source_ipv4")
+                    if not update_source_ipv4:
+                        update_source_ipv4 = ipv4.split('/')[0] if ipv4 else None
+                        logging.info(f"[BGP CONFIGURE] Using interface IPv4 {update_source_ipv4} as update-source (default)")
+                
                 for neighbor_ip in ipv4_neighbors_list:
                     neighbor_config_ipv4 = {
                         "neighbor_ip": neighbor_ip,
                         "neighbor_as": bgp_config.get("bgp_neighbor_asn") or bgp_config.get("bgp_remote_asn", ""),
                         "local_as": bgp_config.get("bgp_asn", 65001),
-                        "update_source": bgp_config.get("bgp_update_source_ipv4", ipv4),
+                        "update_source": update_source_ipv4,
                         "keepalive": bgp_config.get("bgp_keepalive", "30"),
                         "hold_time": bgp_config.get("bgp_hold_time", "90"),
                         "protocol": "ipv4"
@@ -6262,12 +6821,36 @@ def configure_bgp():
                 logging.info(f"[BGP CONFIGURE] Ensuring {len(ipv6_neighbors_list)} IPv6 BGP neighbor(s) are configured")
                 from utils.frr_docker import configure_bgp_neighbor
                 
+                # Get loopback IPv6 from database for use_loopback_ip check
+                loopback_ipv6 = None
+                try:
+                    from utils.device_database import DeviceDatabase
+                    device_db = DeviceDatabase()
+                    device_data = device_db.get_device(device_id) if device_id else None
+                    if device_data:
+                        loopback_ipv6_raw = device_data.get('loopback_ipv6', '')
+                        if loopback_ipv6_raw:
+                            loopback_ipv6 = loopback_ipv6_raw.strip().split('/')[0]
+                except Exception as e:
+                    logging.warning(f"[BGP CONFIGURE] Could not retrieve loopback IPv6 from database: {e}")
+                
+                # Determine update_source_ipv6 based on use_loopback_ip flag (same logic as configure_bgp_for_device)
+                use_loopback_ip = bgp_config.get('use_loopback_ip', False)
+                if use_loopback_ip and loopback_ipv6:
+                    update_source_ipv6 = loopback_ipv6
+                    logging.info(f"[BGP CONFIGURE] Using loopback IPv6 {update_source_ipv6} as update-source (use_loopback_ip=True)")
+                else:
+                    update_source_ipv6 = bgp_config.get("bgp_update_source_ipv6")
+                    if not update_source_ipv6:
+                        update_source_ipv6 = ipv6.split('/')[0] if ipv6 else None
+                        logging.info(f"[BGP CONFIGURE] Using interface IPv6 {update_source_ipv6} as update-source (default)")
+                
                 for neighbor_ip in ipv6_neighbors_list:
                     neighbor_config_ipv6 = {
                         "neighbor_ip": neighbor_ip,
                         "neighbor_as": bgp_config.get("bgp_neighbor_asn") or bgp_config.get("bgp_remote_asn", ""),
                         "local_as": bgp_config.get("bgp_asn", 65001),
-                        "update_source": bgp_config.get("bgp_update_source_ipv6", ipv6),
+                        "update_source": update_source_ipv6,
                         "keepalive": bgp_config.get("bgp_keepalive", "30"),
                         "hold_time": bgp_config.get("bgp_hold_time", "90"),
                         "protocol": "ipv6"
@@ -6287,6 +6870,18 @@ def configure_bgp():
         gateway = data.get("gateway", "").strip()
         logging.info(f"[BGP ROUTE DEBUG] Gateway value: '{gateway}'")
         route_added = False
+        if gateway and device_id:
+            # Skip adding default route in BGP if VXLAN is enabled
+            try:
+                from utils.device_database import DeviceDatabase
+                _db = DeviceDatabase()
+                _rec = _db.get_device(device_id) if device_id else None
+                if _rec and (_rec.get("vxlan_enabled") is True):
+                    logging.info(f"[BGP ROUTE] Skipping default route for {device_name} because VXLAN is enabled")
+                    gateway = ""
+            except Exception as _vx_exc:
+                logging.debug(f"[BGP ROUTE] Could not determine VXLAN status from DB: {_vx_exc}")
+        
         if gateway and device_id:
             # Add route in background thread (returns immediately)
             # Use shorter wait for BGP case since container already exists

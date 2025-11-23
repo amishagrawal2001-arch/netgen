@@ -578,29 +578,75 @@ class AddDeviceDialog(QDialog):
 
     def _create_protocol_config_widgets(self):
         """Create protocol-specific configuration widgets."""
-        # BGP Configuration Widget with multi-column layout
+        # BGP Configuration Widget with 2-column layout
         self.bgp_config_widget = QWidget()
         bgp_main_layout = QVBoxLayout(self.bgp_config_widget)
         bgp_main_layout.setSpacing(10)
         bgp_main_layout.setContentsMargins(0, 0, 0, 0)
 
-        # Single column layout (removed right column since IPv4/IPv6 toggles moved to Select Protocol section)
-        bgp_layout = QFormLayout()
-        bgp_layout.setSpacing(8)
+        # Create three-column layout for first row (Use Loopback, Local AS, Remote AS)
+        bgp_row1_layout = QHBoxLayout()
+        bgp_row1_layout.setSpacing(20)
         
+        # Left: Use Loopback checkbox
+        bgp_loopback_layout = QFormLayout()
+        bgp_loopback_layout.setSpacing(8)
+        self.bgp_use_loopback_checkbox = QCheckBox()
+        self.bgp_use_loopback_checkbox.setToolTip("Use loopback IP address instead of interface IP for BGP neighbor establishment (update-source)")
+        self.bgp_use_loopback_checkbox.setEnabled(False)
+        self.bgp_use_loopback_checkbox.toggled.connect(self._on_bgp_use_loopback_toggled)
+        bgp_loopback_layout.addRow("Use Loopback:", self.bgp_use_loopback_checkbox)
+        
+        # Middle: Local AS
+        bgp_local_layout = QFormLayout()
+        bgp_local_layout.setSpacing(8)
         self.bgp_local_as_input = QLineEdit("65000")
         self.bgp_local_as_input.setPlaceholderText("Local AS Number")
         self.bgp_local_as_input.setValidator(QIntValidator(1, 2147483647, self))
         self.bgp_local_as_input.setEnabled(False)
-        bgp_layout.addRow("Local AS:", self.bgp_local_as_input)
-
+        # Connect Local AS changes to sync Remote AS when VXLAN is enabled
+        self.bgp_local_as_input.textChanged.connect(self._on_bgp_local_as_changed)
+        bgp_local_layout.addRow("Local AS:", self.bgp_local_as_input)
+        
+        # Right: Remote AS
+        bgp_remote_as_layout = QFormLayout()
+        bgp_remote_as_layout.setSpacing(8)
         self.bgp_remote_as_input = QLineEdit("65001")
         self.bgp_remote_as_input.setPlaceholderText("Remote AS Number")
         self.bgp_remote_as_input.setValidator(QIntValidator(1, 2147483647, self))
         self.bgp_remote_as_input.setEnabled(False)
-        bgp_layout.addRow("Remote AS:", self.bgp_remote_as_input)
+        bgp_remote_as_layout.addRow("Remote AS:", self.bgp_remote_as_input)
         
-        bgp_main_layout.addLayout(bgp_layout)
+        # Add to first row
+        bgp_row1_layout.addLayout(bgp_loopback_layout, 1)
+        bgp_row1_layout.addLayout(bgp_local_layout, 1)
+        bgp_row1_layout.addLayout(bgp_remote_as_layout, 1)
+        bgp_main_layout.addLayout(bgp_row1_layout)
+        
+        # Create two-column layout for second row (IPv4 and IPv6 Remote Loopback IPs)
+        bgp_row2_layout = QHBoxLayout()
+        bgp_row2_layout.setSpacing(20)
+        
+        # Left: IPv4 Remote Loopback IP
+        bgp_ipv4_loopback_layout = QFormLayout()
+        bgp_ipv4_loopback_layout.setSpacing(8)
+        self.bgp_remote_loopback_ip_input = QLineEdit("192.168.250.1")
+        self.bgp_remote_loopback_ip_input.setPlaceholderText("Remote Loopback IP (e.g., 192.168.250.1)")
+        self.bgp_remote_loopback_ip_input.setEnabled(False)
+        bgp_ipv4_loopback_layout.addRow("IPv4 Remote Loopback:", self.bgp_remote_loopback_ip_input)
+        
+        # Right: IPv6 Remote Loopback IP
+        bgp_ipv6_loopback_layout = QFormLayout()
+        bgp_ipv6_loopback_layout.setSpacing(8)
+        self.bgp_remote_loopback_ipv6_input = QLineEdit("2001:ff00:250::1")
+        self.bgp_remote_loopback_ipv6_input.setPlaceholderText("Remote Loopback IPv6 (e.g., 2001:ff00:250::1)")
+        self.bgp_remote_loopback_ipv6_input.setEnabled(False)
+        bgp_ipv6_loopback_layout.addRow("IPv6 Remote Loopback:", self.bgp_remote_loopback_ipv6_input)
+        
+        # Add to second row
+        bgp_row2_layout.addLayout(bgp_ipv4_loopback_layout, 1)
+        bgp_row2_layout.addLayout(bgp_ipv6_loopback_layout, 1)
+        bgp_main_layout.addLayout(bgp_row2_layout)
 
         # OSPF Configuration Widget with multi-column layout
         self.ospf_config_widget = QWidget()
@@ -926,8 +972,10 @@ class AddDeviceDialog(QDialog):
         # Update dropdown with only enabled protocols
         enabled_protocols = []
         
+        # Add iBGP and eBGP as separate protocol options when BGP is enabled
         if self.bgp_enable_checkbox.isChecked():
-            enabled_protocols.append("BGP")
+            enabled_protocols.append("iBGP")
+            enabled_protocols.append("eBGP")
         if self.ospf_enable_checkbox.isChecked():
             enabled_protocols.append("OSPF")
         if self.isis_enable_checkbox.isChecked():
@@ -975,9 +1023,10 @@ class AddDeviceDialog(QDialog):
             self._disable_all_protocol_fields()
             
             # Show the selected protocol config widget and enable its fields
-            if protocol == "BGP" and self.bgp_enable_checkbox.isChecked():
-                self.bgp_config_widget.setVisible(True)
-                self._enable_bgp_fields()
+            if protocol in ["iBGP", "eBGP"]:
+                if self.bgp_enable_checkbox.isChecked():
+                    self.bgp_config_widget.setVisible(True)
+                    self._enable_bgp_fields(protocol)
             elif protocol == "OSPF" and self.ospf_enable_checkbox.isChecked():
                 self.ospf_config_widget.setVisible(True)
                 self._enable_ospf_fields()
@@ -1017,6 +1066,12 @@ class AddDeviceDialog(QDialog):
         # BGP fields
         self.bgp_local_as_input.setEnabled(False)
         self.bgp_remote_as_input.setEnabled(False)
+        if hasattr(self, "bgp_use_loopback_checkbox"):
+            self.bgp_use_loopback_checkbox.setEnabled(False)
+        if hasattr(self, "bgp_remote_loopback_ip_input"):
+            self.bgp_remote_loopback_ip_input.setEnabled(False)
+        if hasattr(self, "bgp_remote_loopback_ipv6_input"):
+            self.bgp_remote_loopback_ipv6_input.setEnabled(False)
         # BGP IPv4/IPv6 toggles are now in Select Protocol section
         
         # OSPF fields
@@ -1060,10 +1115,48 @@ class AddDeviceDialog(QDialog):
         if hasattr(self, "vxlan_vlan_id_input"):
             self.vxlan_vlan_id_input.setEnabled(False)
 
-    def _enable_bgp_fields(self):
-        """Enable BGP configuration fields."""
+    def _on_bgp_local_as_changed(self):
+        """Handle Local AS changes - sync Remote AS when iBGP is selected."""
+        # Get current protocol selection
+        current_protocol = self.protocol_dropdown.currentText() if hasattr(self, "protocol_dropdown") else ""
+        if current_protocol == "iBGP" and self.bgp_enable_checkbox.isChecked():
+            local_as = self.bgp_local_as_input.text().strip()
+            if local_as:
+                self.bgp_remote_as_input.setText(local_as)
+    
+    def _on_bgp_use_loopback_toggled(self, checked):
+        """Enable/disable Remote Loopback IP inputs based on 'Use Loopback IP' checkbox."""
+        if hasattr(self, "bgp_remote_loopback_ip_input"):
+            self.bgp_remote_loopback_ip_input.setEnabled(checked)
+        if hasattr(self, "bgp_remote_loopback_ipv6_input"):
+            self.bgp_remote_loopback_ipv6_input.setEnabled(checked)
+    
+    def _enable_bgp_fields(self, protocol="eBGP"):
+        """Enable BGP configuration fields.
+        
+        Args:
+            protocol: "iBGP" or "eBGP" - determines if Remote AS should be synced
+        """
         self.bgp_local_as_input.setEnabled(True)
-        self.bgp_remote_as_input.setEnabled(True)
+        # If iBGP is selected, Remote AS should be disabled and auto-synced to Local AS
+        if protocol == "iBGP":
+            # Sync Remote AS to Local AS for iBGP
+            local_as = self.bgp_local_as_input.text().strip()
+            if local_as:
+                self.bgp_remote_as_input.setText(local_as)
+            self.bgp_remote_as_input.setEnabled(False)
+            self.bgp_remote_as_input.setToolTip("iBGP requires same ASN - Remote AS automatically matches Local AS")
+        else:
+            # For eBGP, Remote AS is independent
+            self.bgp_remote_as_input.setEnabled(True)
+            self.bgp_remote_as_input.setToolTip("")
+        # Enable "Use Loopback IP" checkbox and Remote Loopback IP field
+        if hasattr(self, "bgp_use_loopback_checkbox"):
+            self.bgp_use_loopback_checkbox.setEnabled(True)
+        if hasattr(self, "bgp_remote_loopback_ip_input"):
+            self.bgp_remote_loopback_ip_input.setEnabled(self.bgp_use_loopback_checkbox.isChecked())
+        if hasattr(self, "bgp_remote_loopback_ipv6_input"):
+            self.bgp_remote_loopback_ipv6_input.setEnabled(self.bgp_use_loopback_checkbox.isChecked())
         # BGP IPv4/IPv6 toggles are now in Select Protocol section, no need to sync
         self._on_bgp_toggle_changed()
 
@@ -1116,7 +1209,7 @@ class AddDeviceDialog(QDialog):
 
         if hasattr(self, "bgp_toggle_container"):
             self.bgp_toggle_container.setVisible(
-                protocol == "BGP" and self.bgp_enable_checkbox.isChecked()
+                protocol in ["iBGP", "eBGP"] and self.bgp_enable_checkbox.isChecked()
             )
         if hasattr(self, "ospf_toggle_container"):
             self.ospf_toggle_container.setVisible(
@@ -1435,16 +1528,47 @@ class AddDeviceDialog(QDialog):
             }
         
         if self.bgp_enable_checkbox.isChecked():
+            # Determine BGP mode from protocol dropdown
+            bgp_mode = "eBGP"  # Default
+            if selected_protocol == "iBGP":
+                bgp_mode = "iBGP"
+            elif selected_protocol == "eBGP":
+                bgp_mode = "eBGP"
+            
+            # Determine neighbor IP based on "Use Loopback IP" checkbox
+            use_loopback_ip = self.bgp_use_loopback_checkbox.isChecked() if hasattr(self, "bgp_use_loopback_checkbox") else False
+            
+            # Determine IPv4 neighbor IP
+            if use_loopback_ip and hasattr(self, "bgp_remote_loopback_ip_input"):
+                # Use remote loopback IP when "Use Loopback IP" is checked
+                neighbor_ipv4 = self.bgp_remote_loopback_ip_input.text().strip() or "192.168.250.1"
+            else:
+                # Default: use IPv4 gateway as neighbor IP
+                neighbor_ipv4 = ipv4_gateway
+            
+            # Determine IPv6 neighbor IP
+            if use_loopback_ip and hasattr(self, "bgp_remote_loopback_ipv6_input"):
+                # Use remote loopback IPv6 when "Use Loopback IP" is checked
+                neighbor_ipv6 = self.bgp_remote_loopback_ipv6_input.text().strip() or "2001:ff00:250::1"
+            else:
+                # Default: use IPv6 gateway as neighbor IP
+                neighbor_ipv6 = ipv6_gateway
+            
             bgp_config = {
                 "bgp_asn": self.bgp_local_as_input.text().strip(),
                 "bgp_remote_asn": self.bgp_remote_as_input.text().strip(),
-                "mode": "eBGP",
+                "mode": bgp_mode,
                 "bgp_keepalive": "30",
                 "bgp_hold_time": "90",
                 "ipv4_enabled": self.bgp_toggle_ipv4.isChecked() if hasattr(self, "bgp_toggle_ipv4") else True,
                 "ipv6_enabled": self.bgp_toggle_ipv6.isChecked() if hasattr(self, "bgp_toggle_ipv6") else True,
                 "local_ip": ipv4,  # Use device IP as local IP
-                "peer_ip": ipv4_gateway  # Use IPv4 gateway as peer IP
+                "peer_ip": neighbor_ipv4,  # Use remote loopback IP or gateway IP based on checkbox
+                "bgp_neighbor_ipv4": neighbor_ipv4,  # Set neighbor IP for BGP configuration
+                "bgp_neighbor_ipv6": neighbor_ipv6,  # Set IPv6 neighbor IP for BGP configuration
+                "use_loopback_ip": use_loopback_ip,
+                "bgp_remote_loopback_ip": self.bgp_remote_loopback_ip_input.text().strip() if hasattr(self, "bgp_remote_loopback_ip_input") else "192.168.250.1",
+                "bgp_remote_loopback_ipv6": self.bgp_remote_loopback_ipv6_input.text().strip() if hasattr(self, "bgp_remote_loopback_ipv6_input") else "2001:ff00:250::1"
             }
         
         if self.ospf_enable_checkbox.isChecked():

@@ -6,6 +6,7 @@ from typing import Dict, Any, List, Tuple
 from ipaddress import ip_interface, ip_network, ip_address
 
 from utils import ospf, bgp
+from utils import vxlan as vxlan_utils
 
 # --------------------------------------------------------------------
 # Globals / state
@@ -185,6 +186,31 @@ class DeviceManager:
             "protocols_started": [],
         }
 
+        vxlan_config = vxlan_utils.normalize_config(device_data.get("vxlan_config"))
+        frr_manager = None
+        container_name = None
+        if device_id:
+            try:
+                from utils.frr_docker import FRRDockerManager
+                frr_manager = FRRDockerManager()
+                container_name = frr_manager._get_container_name(device_id, device_name or "")
+            except Exception:
+                frr_manager = None
+                container_name = None
+        if "VXLAN" in protocols and vxlan_config:
+            try:
+                vxlan_utils.ensure_vxlan_interface(
+                    device_id,
+                    device_name or device_id,
+                    vxlan_config,
+                    container_name=container_name,
+                    frr_manager=frr_manager,
+                )
+                result.setdefault("vxlan", {})["state"] = "Configured"
+            except Exception as exc:
+                logging.warning(f"[VXLAN START] Failed to ensure VXLAN for {device_id}: {exc}")
+                result.setdefault("vxlan", {})["error"] = str(exc)
+
         # OSPF
         if "OSPF" in protocols:
             ospf_cfg = device_data.get("ospf", {}) or {}
@@ -321,6 +347,28 @@ class DeviceManager:
         with _ACTIVE_LOCK:
             ACTIVE_DEVICES.pop(device_id, None)
 
+        vxlan_config = vxlan_utils.normalize_config(device_data.get("vxlan_config"))
+        if "VXLAN" in protocols and vxlan_config:
+            frr_manager = None
+            container_name = None
+            if device_id:
+                try:
+                    from utils.frr_docker import FRRDockerManager
+                    frr_manager = FRRDockerManager()
+                    container_name = frr_manager._get_container_name(device_id, device_name or "")
+                except Exception:
+                    frr_manager = None
+                    container_name = None
+            try:
+                vxlan_utils.tear_down_vxlan_interface(
+                    device_id,
+                    vxlan_config,
+                    container_name=container_name,
+                    frr_manager=frr_manager,
+                )
+            except Exception as exc:
+                logging.debug(f"[VXLAN STOP] Failed to tear down VXLAN for {device_id}: {exc}")
+
         # Ensure result only contains JSON-serializable data
         # Check if result is a dictionary before calling .get()
         if isinstance(result, dict):
@@ -422,5 +470,27 @@ class DeviceManager:
 
         with _ACTIVE_LOCK:
             ACTIVE_DEVICES.pop(device_id, None)
+
+        vxlan_config = vxlan_utils.normalize_config(device_data.get("vxlan_config"))
+        if "VXLAN" in protocols and vxlan_config:
+            frr_manager = None
+            container_name = None
+            if device_id:
+                try:
+                    from utils.frr_docker import FRRDockerManager
+                    frr_manager = FRRDockerManager()
+                    container_name = frr_manager._get_container_name(device_id, device_name or "")
+                except Exception:
+                    frr_manager = None
+                    container_name = None
+            try:
+                vxlan_utils.tear_down_vxlan_interface(
+                    device_id,
+                    vxlan_config,
+                    container_name=container_name,
+                    frr_manager=frr_manager,
+                )
+            except Exception as exc:
+                logging.debug(f"[VXLAN REMOVE] Failed to tear down VXLAN for {device_id}: {exc}")
 
         return result

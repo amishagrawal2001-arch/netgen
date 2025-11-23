@@ -693,7 +693,8 @@ class ISISHandler:
                                 else:
                                     isis_status = "Down"
                             else:
-                                isis_status = "Unknown"
+                                # No DB status yet (device not applied) → show Down (red)
+                                isis_status = "Down"
                             self.parent.set_isis_status_icon(row, isis_status, f"ISIS {isis_status}")
                         
                         # Neighbor Type
@@ -783,7 +784,8 @@ class ISISHandler:
                                 else:
                                     isis_status = "Down"
                             else:
-                                isis_status = "Unknown"
+                                # No DB status yet (device not applied) → show Down (red)
+                                isis_status = "Down"
                             self.parent.set_isis_status_icon(row, isis_status, f"ISIS {isis_status}")
                             
                             # Neighbor Type - IPv6

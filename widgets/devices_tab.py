@@ -26,6 +26,7 @@ from .add_device_dialog import AddDeviceDialog
 from .add_bgp_dialog import AddBgpDialog
 from .add_ospf_dialog import AddOspfDialog
 from .add_isis_dialog import AddIsisDialog
+from .add_vxlan_dialog import AddVxlanDialog
 from .add_bgp_route_dialog import ManageRoutePoolsDialog, AttachRoutePoolsDialog
 
 
@@ -341,6 +342,37 @@ class DatabaseQueryWorker(QThread):
             self.query_error.emit(self.operation_type, f"Operation failed: {str(e)}")
         finally:
             self.finished.emit(self.operation_type)
+    
+    def _handle_device_apply(self):
+        """Handle device apply operation in background."""
+        import requests
+        
+        server_url = self.query_data.get("server_url")
+        payload = self.query_data.get("payload")
+        device_name = self.query_data.get("device_name", "Unknown")
+        
+        if self._should_stop:
+            return
+            
+        try:
+            # Reduced timeout for faster failure detection
+            response = requests.post(f"{server_url}/api/device/apply", json=payload, timeout=15)
+            
+            if response.status_code == 200:
+                result_data = {
+                    "success": True,
+                    "device_name": device_name,
+                    "response": response.json()
+                }
+                self.query_result.emit(self.operation_type, result_data)
+            else:
+                error_msg = f"HTTP {response.status_code}: {response.text[:200]}"
+                self.query_error.emit(self.operation_type, f"Device apply failed for {device_name}: {error_msg}")
+                
+        except requests.exceptions.Timeout:
+            self.query_error.emit(self.operation_type, f"Device apply timeout for {device_name}")
+        except Exception as e:
+            self.query_error.emit(self.operation_type, f"Device apply error for {device_name}: {str(e)}")
 
 
 class MultiDeviceApplyWorker(QThread):
@@ -2084,6 +2116,265 @@ class DevicesTab(QWidget):
         bgp_config = dialog.get_values()
         self._update_device_protocol(row, "BGP", bgp_config)
 
+    def prompt_add_vxlan(self):
+        """Add VXLAN configuration to the currently selected device."""
+        selected_items = self.devices_table.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "No Selection", "Please select a device to add VXLAN tunnel.")
+            return
+
+        row = selected_items[0].row()
+        device_name = self.devices_table.item(row, self.COL["Device Name"]).text()
+
+        device_ipv4 = self.devices_table.item(row, self.COL["IPv4"]).text() if self.devices_table.item(row, self.COL["IPv4"]) else ""
+        loopback_ipv4 = self.devices_table.item(row, self.COL["Loopback IPv4"]).text() if self.devices_table.item(row, self.COL["Loopback IPv4"]) else ""
+
+        dialog = AddVxlanDialog(
+            self,
+            device_name,
+            edit_mode=False,
+            device_ipv4=device_ipv4,
+            loopback_ipv4=loopback_ipv4,
+        )
+        if dialog.exec_() != dialog.Accepted:
+            return
+
+        vxlan_config = dialog.get_values()
+        print(f"[VXLAN ADD] Got VXLAN config: {list(vxlan_config.keys())}")
+        print(f"[VXLAN ADD] VXLAN config values: vni={vxlan_config.get('vni')}, local_ip={vxlan_config.get('local_ip')}, remote_peers={vxlan_config.get('remote_peers')}")
+        logging.debug(f"[VXLAN ADD] Got VXLAN config: {list(vxlan_config.keys())}")
+        
+        # Handle increment if enabled (create multiple tunnels)
+        if vxlan_config.get("increment", {}).get("enabled", False):
+            increment_config = vxlan_config["increment"]
+            count = increment_config["count"]
+            vni_increment = increment_config["vni_increment"]
+            vlan_id_increment = increment_config.get("vlan_id_increment", 1)
+            svi_ip_octet = increment_config.get("svi_ip_octet", "3rd")
+            
+            # Get base values
+            base_vni = vxlan_config["vni"]
+            base_vlan_id = vxlan_config.get("vlan_id")
+            base_svi_ip = vxlan_config.get("bridge_svi_ip", "10.0.0.100/24")
+            
+            # Create multiple VXLAN configurations
+            for i in range(count):
+                tunnel_config = vxlan_config.copy()
+                tunnel_config.pop("increment", None)  # Remove increment config
+                
+                # Increment VNI
+                tunnel_config["vni"] = base_vni + (i * vni_increment)
+                
+                # Increment VLAN ID if provided
+                if base_vlan_id:
+                    tunnel_config["vlan_id"] = base_vlan_id + (i * vlan_id_increment)
+                
+                # Increment Bridge SVI IP if provided
+                if base_svi_ip:
+                    try:
+                        # Parse CIDR notation
+                        if "/" in base_svi_ip:
+                            ip_interface = ipaddress.IPv4Interface(base_svi_ip)
+                            ip_address = ip_interface.ip
+                            prefix = ip_interface.network.prefixlen
+                        else:
+                            ip_address = ipaddress.IPv4Address(base_svi_ip)
+                            prefix = 24  # Default prefix
+                        
+                        # Determine octet index
+                        octet_map = {"1st": 0, "2nd": 1, "3rd": 2, "4th": 3}
+                        octet_index = octet_map.get(svi_ip_octet, 2)
+                        
+                        # Increment the specified octet
+                        ip_parts = str(ip_address).split(".")
+                        ip_parts[octet_index] = str(int(ip_parts[octet_index]) + i)
+                        new_ip = ".".join(ip_parts)
+                        
+                        tunnel_config["bridge_svi_ip"] = f"{new_ip}/{prefix}"
+                    except Exception as e:
+                        print(f"[VXLAN] Error incrementing Bridge SVI IP: {e}")
+                        tunnel_config["bridge_svi_ip"] = base_svi_ip
+                
+                # Update device with this tunnel configuration
+                # For multiple tunnels, we need to merge or create separate entries
+                # For now, we'll update the device with the last tunnel config
+                # TODO: Consider creating separate device entries for each tunnel
+                print(f"[VXLAN ADD] Updating device with tunnel {i+1}/{count}, VNI: {tunnel_config.get('vni')}")
+                logging.debug(f"[VXLAN ADD] Updating device with tunnel {i+1}/{count}, VNI: {tunnel_config.get('vni')}")
+                self._update_device_protocol(row, "VXLAN", tunnel_config)
+        else:
+            # Single tunnel - add to device's tunnel list (support multiple tunnels per device)
+            print(f"[VXLAN ADD] Adding single tunnel to device, VNI: {vxlan_config.get('vni')}")
+            logging.debug(f"[VXLAN ADD] Adding single tunnel to device, VNI: {vxlan_config.get('vni')}")
+            
+            # Get the device
+            device_name = self.devices_table.item(row, self.COL["Device Name"]).text()
+            device = None
+            for iface, devices in self.main_window.all_devices.items():
+                for d in devices:
+                    if d.get("Device Name") == device_name:
+                        device = d
+                        break
+                if device:
+                    break
+            
+            if device:
+                # Get existing vxlan_config
+                existing_vxlan = device.get("vxlan_config", {})
+                
+                # If existing config is a dict (single tunnel), convert to list
+                if isinstance(existing_vxlan, dict) and existing_vxlan:
+                    # Check if it's already a list format or single tunnel
+                    if "tunnels" in existing_vxlan:
+                        tunnels = existing_vxlan.get("tunnels", [])
+                    else:
+                        # Convert single tunnel dict to list format
+                        tunnels = [existing_vxlan]
+                        existing_vxlan = {"tunnels": tunnels}
+                    
+                    # Check if this VNI already exists
+                    new_vni = vxlan_config.get("vni")
+                    tunnel_exists = any(t.get("vni") == new_vni for t in tunnels)
+                    
+                    if tunnel_exists:
+                        # Update existing tunnel
+                        for i, tunnel in enumerate(tunnels):
+                            if tunnel.get("vni") == new_vni:
+                                tunnels[i] = vxlan_config
+                                print(f"[VXLAN ADD] Updated existing tunnel with VNI {new_vni}")
+                                break
+                    else:
+                        # Add new tunnel
+                        tunnels.append(vxlan_config)
+                        print(f"[VXLAN ADD] Added new tunnel with VNI {new_vni} (total tunnels: {len(tunnels)})")
+                    
+                    existing_vxlan["tunnels"] = tunnels
+                    device["vxlan_config"] = existing_vxlan
+                else:
+                    # No existing config, create new list
+                    device["vxlan_config"] = {"tunnels": [vxlan_config]}
+                    print(f"[VXLAN ADD] Created new tunnel list with VNI {vxlan_config.get('vni')}")
+                
+                # Ensure VXLAN is in protocols
+                if "protocols" not in device:
+                    device["protocols"] = []
+                if "VXLAN" not in device["protocols"]:
+                    device["protocols"].append("VXLAN")
+        
+        # Refresh device table first to ensure device data is updated
+        self.update_device_table(self.main_window.all_devices)
+        
+        # Refresh VXLAN table to show the new tunnel (with a small delay to ensure data is ready)
+        if hasattr(self, "vxlan_handler") and self.vxlan_handler:
+            # Use QTimer to refresh after a short delay to ensure device data is updated
+            from PyQt5.QtCore import QTimer
+            QTimer.singleShot(100, self.vxlan_handler.refresh_vxlan_table)
+
+    def apply_vxlan_configurations(self):
+        """Apply VXLAN configurations to the server for selected devices."""
+        server_url = self.get_server_url()
+        if not server_url:
+            QMessageBox.critical(self, "No Server", "No server selected.")
+            return
+
+        # Get selected devices from the devices table
+        selected_items = self.devices_table.selectedItems()
+        devices_to_apply = []
+        
+        if selected_items:
+            # Get unique device names from selected rows
+            selected_device_names = set()
+            for item in selected_items:
+                row = item.row()
+                device_name_item = self.devices_table.item(row, self.COL["Device Name"])
+                if device_name_item:
+                    device_name = device_name_item.text()
+                    selected_device_names.add(device_name)
+            
+            # Find the devices in all_devices that have VXLAN config
+            for device_name in selected_device_names:
+                for iface, devices in self.main_window.all_devices.items():
+                    for device in devices:
+                        if device.get("Device Name") == device_name:
+                            vxlan_config = device.get("vxlan_config", {})
+                            if vxlan_config:
+                                devices_to_apply.append(device)
+                            break
+        else:
+            # If no devices selected, find all devices with VXLAN config
+            for iface, devices in self.main_window.all_devices.items():
+                for device in devices:
+                    vxlan_config = device.get("vxlan_config", {})
+                    if vxlan_config:
+                        devices_to_apply.append(device)
+        
+        if not devices_to_apply:
+            QMessageBox.information(self, "No VXLAN Configuration", 
+                                  "No devices with VXLAN configuration found to apply.\n\n"
+                                  "Please add VXLAN tunnels first using the 'Add' button.")
+            return
+        
+        # Confirm with user
+        device_names = [d.get("Device Name", "Unknown") for d in devices_to_apply]
+        reply = QMessageBox.question(
+            self,
+            "Apply VXLAN Configuration",
+            f"Apply VXLAN configuration to {len(devices_to_apply)} device(s)?\n\n"
+            f"Devices: {', '.join(device_names)}",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes
+        )
+        
+        if reply != QMessageBox.Yes:
+            return
+        
+        # Apply VXLAN configuration for each device
+        success_count = 0
+        failed_count = 0
+        failed_devices = []
+        
+        for device in devices_to_apply:
+            device_name = device.get("Device Name", "Unknown")
+            try:
+                # Ensure VXLAN is in protocols list
+                protocols = self._convert_protocols_to_array(device.get("protocols", []))
+                if "VXLAN" not in protocols:
+                    protocols.append("VXLAN")
+                
+                # Apply device configuration to server
+                result = self._apply_device_to_server(server_url, device)
+                if result:
+                    success_count += 1
+                    logging.info(f"[VXLAN APPLY] Successfully applied VXLAN configuration for {device_name}")
+                else:
+                    failed_count += 1
+                    failed_devices.append(device_name)
+                    logging.error(f"[VXLAN APPLY] Failed to apply VXLAN configuration for {device_name}")
+            except Exception as e:
+                failed_count += 1
+                failed_devices.append(device_name)
+                logging.error(f"[VXLAN APPLY] Exception applying VXLAN configuration for {device_name}: {e}")
+        
+        # Show results
+        if failed_count == 0:
+            QMessageBox.information(
+                self,
+                "VXLAN Configuration Applied",
+                f"Successfully applied VXLAN configuration to {success_count} device(s)."
+            )
+        else:
+            QMessageBox.warning(
+                self,
+                "VXLAN Configuration Partially Applied",
+                f"Applied to {success_count} device(s).\n"
+                f"Failed for {failed_count} device(s):\n{', '.join(failed_devices)}"
+            )
+        
+        # Refresh VXLAN table and device table
+        if hasattr(self, "vxlan_handler") and self.vxlan_handler:
+            self.vxlan_handler.refresh_vxlan_table()
+        self.update_device_table(self.main_window.all_devices)
+
     def prompt_edit_bgp(self):
         """Edit BGP configuration for the selected neighbor entry."""
         selected_items = self.bgp_table.selectedItems()
@@ -3818,8 +4109,21 @@ class DevicesTab(QWidget):
                             device_info["ospf_config"] = db_device_data.get("ospf_config", {})
                         if not device_info.get("isis_config"):
                             device_info["isis_config"] = db_device_data.get("isis_config", {}) or db_device_data.get("is_is_config", {})
-                        if not device_info.get("vxlan_config"):
+                        # Preserve local vxlan_config if it exists (especially for multiple tunnels)
+                        # Only use DB config if local doesn't have any
+                        local_vxlan = device_info.get("vxlan_config", {})
+                        print(f"[DEBUG APPLY DEVICE] Local vxlan_config type: {type(local_vxlan)}, content: {local_vxlan}")
+                        if isinstance(local_vxlan, dict) and "tunnels" in local_vxlan:
+                            tunnel_count = len(local_vxlan.get("tunnels", []))
+                            print(f"[DEBUG APPLY DEVICE] Local vxlan_config has {tunnel_count} tunnel(s) in tunnels list")
+                        if not local_vxlan or (isinstance(local_vxlan, dict) and len(local_vxlan) == 0):
                             device_info["vxlan_config"] = db_device_data.get("vxlan_config", {})
+                            print(f"[DEBUG APPLY DEVICE] Using DB vxlan_config (local was empty)")
+                        else:
+                            # Local config exists - preserve it (it has the multiple tunnels format)
+                            tunnel_count = len(local_vxlan.get('tunnels', [])) if isinstance(local_vxlan, dict) and 'tunnels' in local_vxlan else 1
+                            print(f"[DEBUG APPLY DEVICE] Preserving local vxlan_config with {tunnel_count} tunnel(s)")
+                            print(f"[DEBUG APPLY DEVICE] Local vxlan_config keys: {list(local_vxlan.keys()) if isinstance(local_vxlan, dict) else 'N/A'}")
 
                         existing_dhcp_config = self._normalize_dhcp_config(device_info.get("dhcp_config"))
                         db_dhcp_config = self._normalize_dhcp_config(db_device_data.get("dhcp_config"))
@@ -3866,17 +4170,68 @@ class DevicesTab(QWidget):
             else:
                 device_info["dhcp_config"] = {}
 
-            vxlan_config = self._with_vxlan_interfaces(
-                device_info.get("vxlan_config"),
-                iface_label,
-                device_info.get("VLAN", "0"),
-            )
-            if vxlan_config:
-                device_info["vxlan_config"] = vxlan_config
-                if "VXLAN" not in protocols_list:
-                    protocols_list.append("VXLAN")
+            # Handle multiple tunnels format: {"tunnels": [tunnel1, tunnel2, ...]}
+            vxlan_config = device_info.get("vxlan_config", {})
+            print(f"[DEBUG APPLY DEVICE] Before processing, vxlan_config type: {type(vxlan_config)}, keys: {list(vxlan_config.keys()) if isinstance(vxlan_config, dict) else 'N/A'}")
+            if isinstance(vxlan_config, dict) and "tunnels" in vxlan_config:
+                # Multiple tunnels format - process each tunnel
+                tunnels = vxlan_config.get("tunnels", [])
+                print(f"[DEBUG APPLY DEVICE] Found {len(tunnels)} tunnel(s) in vxlan_config")
+                processed_tunnels = []
+                for idx, tunnel in enumerate(tunnels):
+                    print(f"[DEBUG APPLY DEVICE] Processing tunnel {idx+1}/{len(tunnels)}: VNI={tunnel.get('vni') if isinstance(tunnel, dict) else 'N/A'}, keys={list(tunnel.keys()) if isinstance(tunnel, dict) else 'N/A'}")
+                    if isinstance(tunnel, dict):
+                        # Ensure required fields are present before processing
+                        if not tunnel.get("vni") and not tunnel.get("VNI"):
+                            print(f"[DEBUG APPLY DEVICE] Tunnel {idx+1} missing VNI, skipping")
+                            continue
+                        processed_tunnel = self._with_vxlan_interfaces(
+                            tunnel,
+                            iface_label,
+                            device_info.get("VLAN", "0"),
+                        )
+                        if processed_tunnel:
+                            processed_tunnels.append(processed_tunnel)
+                            print(f"[DEBUG APPLY DEVICE] Tunnel {idx+1} processed successfully, VNI={processed_tunnel.get('vni')}")
+                        else:
+                            # If processing failed but tunnel has VNI, preserve it anyway
+                            if tunnel.get("vni") or tunnel.get("VNI"):
+                                print(f"[DEBUG APPLY DEVICE] Tunnel {idx+1} processing returned empty but has VNI, preserving original")
+                                # Add interface info manually
+                                tunnel_copy = dict(tunnel)
+                                iface_norm = self._normalize_iface_label(iface_label)
+                                vlan_str = str(device_info.get("VLAN", "0") or "0")
+                                overlay_iface = iface_norm
+                                if vlan_str and vlan_str != "0":
+                                    overlay_iface = f"vlan{vlan_str}"
+                                tunnel_copy["underlay_interface"] = iface_norm
+                                tunnel_copy["overlay_interface"] = overlay_iface
+                                processed_tunnels.append(tunnel_copy)
+                            else:
+                                print(f"[DEBUG APPLY DEVICE] Tunnel {idx+1} processing returned empty and no VNI, skipping")
+                    else:
+                        print(f"[DEBUG APPLY DEVICE] Tunnel {idx+1} is not a dict, skipping")
+                if processed_tunnels:
+                    device_info["vxlan_config"] = {"tunnels": processed_tunnels}
+                    if "VXLAN" not in protocols_list:
+                        protocols_list.append("VXLAN")
+                    print(f"[DEBUG APPLY DEVICE] Processing {len(processed_tunnels)} VXLAN tunnel(s)")
+                else:
+                    print(f"[DEBUG APPLY DEVICE] No tunnels processed successfully, clearing vxlan_config")
+                    device_info["vxlan_config"] = {}
             else:
-                device_info["vxlan_config"] = {}
+                # Single tunnel format (backward compatibility)
+                vxlan_config = self._with_vxlan_interfaces(
+                    vxlan_config,
+                    iface_label,
+                    device_info.get("VLAN", "0"),
+                )
+                if vxlan_config:
+                    device_info["vxlan_config"] = vxlan_config
+                    if "VXLAN" not in protocols_list:
+                        protocols_list.append("VXLAN")
+                else:
+                    device_info["vxlan_config"] = {}
             
             payload = {
                 "device_id": device_id,
@@ -4326,11 +4681,12 @@ class DevicesTab(QWidget):
                         iface,
                         current_vlan,
                     )
-                    device_data["vxlan_config"] = per_device_vxlan
+                    # Convert single tunnel config to tunnels format for consistency
+                    device_data["vxlan_config"] = {"tunnels": [per_device_vxlan]}
                     device_data["VXLAN"] = self._format_vxlan_summary(per_device_vxlan)
                     if "VXLAN" not in device_data["protocols"]:
                         device_data["protocols"].append("VXLAN")
-                    print(f"[DEBUG ADD DEVICE] Added VXLAN config to device {current_name}: {per_device_vxlan}")
+                    print(f"[DEBUG ADD DEVICE] Added VXLAN config to device {current_name} in tunnels format: {device_data['vxlan_config']}")
                 else:
                     # Ensure vxlan_config is always present (even if empty) for consistency
                     device_data["vxlan_config"] = {}
@@ -4839,7 +5195,14 @@ class DevicesTab(QWidget):
             vxlan_copy = self._normalize_vxlan_config(copied_device.get("vxlan_config"))
             if vxlan_copy:
                 vxlan_copy["underlay_interface"] = self._normalize_iface_label(target_interface)
-                new_device["vxlan_config"] = vxlan_copy
+                # Convert single tunnel config to tunnels format for consistency
+                # Handle both old format (single dict) and new format (tunnels list)
+                if isinstance(vxlan_copy, dict) and "tunnels" in vxlan_copy:
+                    # Already in tunnels format, use as-is
+                    new_device["vxlan_config"] = vxlan_copy
+                else:
+                    # Single tunnel format, convert to tunnels format
+                    new_device["vxlan_config"] = {"tunnels": [vxlan_copy]}
                 new_device["VXLAN"] = self._format_vxlan_summary(vxlan_copy)
                 new_device["protocols"].append("VXLAN")
 
@@ -5722,6 +6085,11 @@ class DevicesTab(QWidget):
                     self.isis_handler._cleanup_isis_table_for_device(device_id, device_name)
                 except Exception as exc:
                     logging.debug(f"[REMOVE] ISIS cleanup failed for {device_name}: {exc}")
+            if hasattr(self, "vxlan_handler") and self.vxlan_handler:
+                try:
+                    self.vxlan_handler._cleanup_vxlan_table_for_device(device_id, device_name)
+                except Exception as exc:
+                    logging.debug(f"[REMOVE] VXLAN cleanup failed for {device_name}: {exc}")
 
             self.devices_table.removeRow(row)
             self._remove_device_from_data_structure(device_info)
@@ -6492,9 +6860,11 @@ class DevicesTab(QWidget):
             device_name = device_name_item.text()
         
         # Find the device in all_devices and update its protocol configuration
+        device_found = False
         for iface, devices in self.main_window.all_devices.items():
             for device in devices:
                 if device.get("Device Name") == device_name:
+                    device_found = True
                     # Store protocol configuration in device data
                     # Handle both list and dict formats for protocols
                     if "protocols" not in device:
@@ -6506,6 +6876,8 @@ class DevicesTab(QWidget):
                             device["protocols"].append(protocol)
                         # Merge with existing config to preserve fields not in the update
                         config_key = f"{protocol.lower().replace('-', '_')}_config"
+                        print(f"[UPDATE PROTOCOL] Updating {device_name} with {protocol} config, key: {config_key}")
+                        logging.debug(f"[UPDATE PROTOCOL] Updating {device_name} with {protocol} config, key: {config_key}")
                         # For ISIS, check both is_is_config and isis_config for backward compatibility
                         if protocol in ["IS-IS", "ISIS"]:
                             existing_config = device.get(config_key, {}) or device.get("isis_config", {})
@@ -6558,6 +6930,9 @@ class DevicesTab(QWidget):
                         else:
                             # No existing config, use new config as-is
                             device[config_key] = config
+                            print(f"[UPDATE PROTOCOL] Stored new {protocol} config for {device_name}: {list(config.keys())}")
+                            print(f"[UPDATE PROTOCOL] Config content: {config}")
+                            logging.debug(f"[UPDATE PROTOCOL] Stored new {protocol} config for {device_name}: {list(config.keys())}")
                             # For ISIS, also update isis_config for backward compatibility
                             if protocol in ["IS-IS", "ISIS"]:
                                 device["isis_config"] = config
@@ -6565,8 +6940,17 @@ class DevicesTab(QWidget):
                         # If protocols is a dict (old format), store config there
                         device["protocols"][protocol] = config
                     
-                    # Debug logs disabled
+                    print(f"[UPDATE PROTOCOL] Device {device_name} now has vxlan_config: {bool(device.get('vxlan_config'))}")
+                    if device.get('vxlan_config'):
+                        print(f"[UPDATE PROTOCOL] vxlan_config content: {device.get('vxlan_config')}")
+                    print(f"[UPDATE PROTOCOL] Device protocols: {device.get('protocols')}")
+                    logging.debug(f"[UPDATE PROTOCOL] Device {device_name} now has vxlan_config: {bool(device.get('vxlan_config'))}")
                     break
+        
+        if not device_found:
+            print(f"[UPDATE PROTOCOL] WARNING: Device '{device_name}' not found in all_devices")
+            print(f"[UPDATE PROTOCOL] Available devices: {[d.get('Device Name') for iface, devices in self.main_window.all_devices.items() for d in devices]}")
+            logging.warning(f"[UPDATE PROTOCOL] Device '{device_name}' not found in all_devices")
         
         # Update the protocol-specific tables based on the protocol
         # Temporarily disconnect cellChanged signals to prevent infinite loops

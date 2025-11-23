@@ -833,6 +833,14 @@ class TrafficGenClientMenuAction():
                         removed_count += 1
                         continue
                     
+                    # Convert old single-tunnel VXLAN config to tunnels format for consistency
+                    vxlan_config = device_info.get("vxlan_config", {})
+                    if vxlan_config and isinstance(vxlan_config, dict):
+                        if "tunnels" not in vxlan_config:
+                            # Old format: single tunnel dict, convert to tunnels format
+                            print(f"[DEBUG LOAD] Converting old VXLAN config format to tunnels format for {device_name}")
+                            device_info["vxlan_config"] = {"tunnels": [vxlan_config]}
+                    
                     iface = device_info.get("Interface", "")
                     if iface:
                         if iface not in self.all_devices:

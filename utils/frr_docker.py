@@ -423,6 +423,8 @@ class FRRDockerManager:
             loopback_ipv4 = device_config.get('loopback_ipv4', '') if device_config else ''
             loopback_ipv6 = device_config.get('loopback_ipv6', '') if device_config else ''
             
+            logger.info(f"[FRR] _configure_interfaces called with loopback_ipv4={loopback_ipv4}, loopback_ipv6={loopback_ipv6} from device_config")
+            
             # If not in device_config, try to get from database
             if not loopback_ipv4 or not loopback_ipv6:
                 try:
@@ -432,10 +434,12 @@ class FRRDockerManager:
                     if device_data:
                         if not loopback_ipv4:
                             loopback_ipv4 = device_data.get('loopback_ipv4', '')
+                            logger.info(f"[FRR] Retrieved loopback_ipv4={loopback_ipv4} from database")
                         if not loopback_ipv6:
                             loopback_ipv6 = device_data.get('loopback_ipv6', '')
+                            logger.info(f"[FRR] Retrieved loopback_ipv6={loopback_ipv6} from database")
                 except Exception as e:
-                    logger.debug(f"[FRR] Could not retrieve loopback IPs from database: {e}")
+                    logger.warning(f"[FRR] Could not retrieve loopback IPs from database: {e}")
             
             # Clean loopback IPs
             router_id = ''
@@ -446,13 +450,18 @@ class FRRDockerManager:
                 loopback_ipv4 = loopback_ipv4.split('/')[0]
             elif ipv4_addr:
                 loopback_ipv4 = ipv4_addr
+                logger.info(f"[FRR] Using interface IPv4 {ipv4_addr} as loopback fallback")
             elif router_id:
                 loopback_ipv4 = router_id
+                logger.info(f"[FRR] Using router_id {router_id} as loopback fallback")
             else:
                 loopback_ipv4 = '1.1.1.1'
+                logger.info(f"[FRR] Using default loopback 1.1.1.1")
             
             if loopback_ipv6:
                 loopback_ipv6 = loopback_ipv6.split('/')[0]
+            
+            logger.info(f"[FRR] Final loopback values: loopback_ipv4={loopback_ipv4}, loopback_ipv6={loopback_ipv6}")
             
             # Build vtysh commands for interface configuration
             vtysh_commands = ["configure terminal", f"interface {iface_name}"]
@@ -468,28 +477,213 @@ class FRRDockerManager:
             vtysh_commands.extend([
                 " no shutdown",
                 "exit",
-                "interface lo",
-                f" ip address {loopback_ipv4}/32",
             ])
             
-            if loopback_ipv6:
-                vtysh_commands.append(f" ipv6 address {loopback_ipv6}/128")
-            
+            # Note: Loopback IPs are now configured by OSPF/ISIS protocol configuration, not here
+            # This ensures loopback IPs are only configured when OSPF/ISIS are enabled
+            # Loopback interface will be configured by the protocol-specific functions
             vtysh_commands.extend([
-                "exit",
                 "end"
             ])
+            
+            # CRITICAL: Wait for mgmtd to be running before attempting vtysh commands
+            # FRR 10.0 with integrated-vtysh-config requires mgmtd to be running
+            max_wait = 10  # Wait up to 10 seconds
+            wait_interval = 1  # Check every second
+            mgmtd_running = False
+            for i in range(max_wait):
+                check_result = container.exec_run(["bash", "-c", "pgrep -f mgmtd > /dev/null && echo 'running' || echo 'not_running'"])
+                check_output = check_result.output.decode('utf-8') if isinstance(check_result.output, bytes) else str(check_result.output)
+                if 'running' in check_output.strip():
+                    mgmtd_running = True
+                    logger.info(f"[FRR] mgmtd is running (waited {i} seconds)")
+                    break
+                else:
+                    logger.debug(f"[FRR] Waiting for mgmtd to start... ({i+1}/{max_wait})")
+                    time.sleep(wait_interval)
+            
+            if not mgmtd_running:
+                logger.warning(f"[FRR] mgmtd is not running after {max_wait} seconds, attempting to start it manually")
+                # Try to start mgmtd manually
+                start_mgmtd_result = container.exec_run(["bash", "-c", "/usr/lib/frr/mgmtd -d -A 127.0.0.1 2>&1 || true"])
+                time.sleep(2)  # Give mgmtd time to start
+                # Check again
+                check_result = container.exec_run(["bash", "-c", "pgrep -f mgmtd > /dev/null && echo 'running' || echo 'not_running'"])
+                check_output = check_result.output.decode('utf-8') if isinstance(check_result.output, bytes) else str(check_result.output)
+                if 'running' in check_output.strip():
+                    mgmtd_running = True
+                    logger.info(f"[FRR] Successfully started mgmtd manually")
+                else:
+                    logger.warning(f"[FRR] mgmtd still not running, loopback configuration may fail")
             
             # Execute commands
             config_commands = "\n".join(vtysh_commands)
             exec_cmd = f"vtysh << 'EOF'\n{config_commands}\nEOF"
             
+            logger.info(f"[FRR] Executing loopback configuration commands in container {container_name} (mgmtd_running={mgmtd_running})")
+            logger.debug(f"[FRR] Full command sequence:\n{config_commands}")
             result = container.exec_run(["bash", "-c", exec_cmd])
+            output_str = result.output.decode('utf-8') if isinstance(result.output, bytes) else str(result.output)
             if result.exit_code != 0:
-                logger.error(f"[FRR] Failed to configure interfaces in container {container_name}: {result.output.decode()}")
+                logger.error(f"[FRR] Failed to configure interfaces in container {container_name}: exit_code={result.exit_code}, output={output_str}")
                 return False
+            else:
+                logger.info(f"[FRR] Loopback configuration command executed successfully (exit_code=0)")
+                if output_str:
+                    logger.info(f"[FRR] vtysh command output: {output_str}")
+                
+                # CRITICAL: Manually update FRR config file to include loopback IPs
+                # FRR 10.0 with integrated-vtysh-config doesn't always persist interface IPs
+                # We need to manually edit /etc/frr/frr.conf to ensure loopback IPs are saved
+                try:
+                    config_file = "/etc/frr/frr.conf"
+                    read_result = container.exec_run(["bash", "-c", f"cat {config_file}"])
+                    config_content = read_result.output.decode('utf-8') if isinstance(read_result.output, bytes) else str(read_result.output)
+                    
+                    # Check if loopback interface section exists
+                    lines = config_content.split('\n')
+                    new_lines = []
+                    in_loopback_section = False
+                    loopback_has_ipv4 = False
+                    loopback_has_ipv6 = False
+                    loopback_section_found = False
+                    loopback_section_index = -1
+                    
+                    # First pass: find if loopback section exists and check for IPs
+                    for i, line in enumerate(lines):
+                        if line.strip() == "interface lo":
+                            loopback_section_found = True
+                            loopback_section_index = i
+                            in_loopback_section = True
+                            # Check if IPs are already in the next few lines
+                            for j in range(i+1, min(i+20, len(lines))):
+                                if lines[j].strip().startswith("interface ") and "lo" not in lines[j]:
+                                    break
+                                if lines[j].strip() == "!" or lines[j].strip() == "exit":
+                                    if j > i + 1:  # Only break if we've seen at least one line after interface lo
+                                        break
+                                if loopback_ipv4 and f"ip address {loopback_ipv4}/32" in lines[j]:
+                                    loopback_has_ipv4 = True
+                                if loopback_ipv6 and f"ipv6 address {loopback_ipv6}/128" in lines[j]:
+                                    loopback_has_ipv6 = True
+                            break
+                    
+                    # Second pass: build new config
+                    in_loopback_section = False
+                    for i, line in enumerate(lines):
+                        if line.strip() == "interface lo":
+                            in_loopback_section = True
+                            new_lines.append(line)
+                            # Add IPs if not present
+                            if loopback_ipv4 and not loopback_has_ipv4:
+                                new_lines.append(f" ip address {loopback_ipv4}/32")
+                                logger.info(f"[FRR] Manually adding loopback IPv4 {loopback_ipv4}/32 to config file")
+                            if loopback_ipv6 and not loopback_has_ipv6:
+                                new_lines.append(f" ipv6 address {loopback_ipv6}/128")
+                                logger.info(f"[FRR] Manually adding loopback IPv6 {loopback_ipv6}/128 to config file")
+                        elif in_loopback_section and (line.strip().startswith("interface ") or (line.strip() == "!" and i > loopback_section_index + 1)):
+                            in_loopback_section = False
+                            new_lines.append(line)
+                        else:
+                            new_lines.append(line)
+                    
+                    # If loopback section doesn't exist, add it before the first router section
+                    if not loopback_section_found and (loopback_ipv4 or loopback_ipv6):
+                        logger.info(f"[FRR] Loopback interface section not found, creating it")
+                        # Find where to insert (before first router section or at end of interfaces)
+                        insert_index = -1
+                        for i, line in enumerate(new_lines):
+                            if line.strip().startswith("router "):
+                                insert_index = i
+                                break
+                        
+                        if insert_index > 0:
+                            # Insert before router section
+                            loopback_section = ["!"]
+                            if loopback_ipv4:
+                                loopback_section.append("interface lo")
+                                loopback_section.append(f" ip address {loopback_ipv4}/32")
+                            if loopback_ipv6:
+                                if not loopback_ipv4:
+                                    loopback_section.append("interface lo")
+                                loopback_section.append(f" ipv6 address {loopback_ipv6}/128")
+                            loopback_section.append("exit")
+                            loopback_section.append("!")
+                            new_lines = new_lines[:insert_index] + loopback_section + new_lines[insert_index:]
+                            logger.info(f"[FRR] Created new loopback interface section in config file")
+                        else:
+                            # Append at end
+                            new_lines.append("!")
+                            if loopback_ipv4:
+                                new_lines.append("interface lo")
+                                new_lines.append(f" ip address {loopback_ipv4}/32")
+                            if loopback_ipv6:
+                                if not loopback_ipv4:
+                                    new_lines.append("interface lo")
+                                new_lines.append(f" ipv6 address {loopback_ipv6}/128")
+                            new_lines.append("exit")
+                            logger.info(f"[FRR] Appended loopback interface section to config file")
+                    
+                    # Write updated config back
+                    updated_config = '\n'.join(new_lines)
+                    write_result = container.exec_run(["bash", "-c", f"cat > {config_file} << 'CONFIGEOF'\n{updated_config}\nCONFIGEOF"])
+                    if write_result.exit_code == 0:
+                        logger.info(f"[FRR] Successfully updated FRR config file with loopback IPs")
+                        # Reload FRR configuration
+                        reload_result = container.exec_run(["bash", "-c", "vtysh -c 'configure terminal' -c 'end' -c 'reload' 2>&1 || true"])
+                        logger.debug(f"[FRR] FRR reload result: {reload_result.output.decode('utf-8') if isinstance(reload_result.output, bytes) else str(reload_result.output)}")
+                    else:
+                        logger.warning(f"[FRR] Failed to write updated config file: {write_result.output.decode('utf-8') if isinstance(write_result.output, bytes) else str(write_result.output)}")
+                except Exception as e:
+                    logger.warning(f"[FRR] Failed to manually update FRR config file: {e}")
+                
+                # CRITICAL: Also configure loopback IP directly using ip command as a fallback
+                # Sometimes FRR's vtysh doesn't immediately apply the IP to the kernel
+                # This ensures the IP is actually configured on the interface
+                if loopback_ipv4:
+                    ip_cmd = f"ip addr add {loopback_ipv4}/32 dev lo 2>&1 || ip addr replace {loopback_ipv4}/32 dev lo 2>&1"
+                    ip_result = container.exec_run(["bash", "-c", ip_cmd])
+                    ip_output = ip_result.output.decode('utf-8') if isinstance(ip_result.output, bytes) else str(ip_result.output)
+                    if ip_result.exit_code == 0:
+                        logger.info(f"[FRR] Successfully configured loopback IPv4 {loopback_ipv4}/32 directly via ip command")
+                    else:
+                        logger.warning(f"[FRR] Failed to configure loopback IPv4 via ip command (may already exist): {ip_output}")
+                
+                if loopback_ipv6:
+                    ip6_cmd = f"ip -6 addr add {loopback_ipv6}/128 dev lo 2>&1 || ip -6 addr replace {loopback_ipv6}/128 dev lo 2>&1"
+                    ip6_result = container.exec_run(["bash", "-c", ip6_cmd])
+                    ip6_output = ip6_result.output.decode('utf-8') if isinstance(ip6_result.output, bytes) else str(ip6_result.output)
+                    if ip6_result.exit_code == 0:
+                        logger.info(f"[FRR] Successfully configured loopback IPv6 {loopback_ipv6}/128 directly via ip command")
+                    else:
+                        logger.warning(f"[FRR] Failed to configure loopback IPv6 via ip command (may already exist): {ip6_output}")
             
-            logger.info(f"[FRR] ✅ Successfully configured interfaces in container {container_name}")
+            # Verify loopback was configured by checking both running config and saved config
+            verify_cmd = "echo '=== Running Config ===' && vtysh -c 'show running-config' | grep -A 5 'interface lo' || echo 'Loopback not found in running config'; echo '=== Saved Config ===' && cat /etc/frr/frr.conf | grep -A 5 'interface lo' || echo 'Loopback not found in saved config'"
+            verify_result = container.exec_run(["bash", "-c", verify_cmd])
+            verify_output = verify_result.output.decode('utf-8') if isinstance(verify_result.output, bytes) else str(verify_result.output)
+            logger.info(f"[FRR] Loopback verification output:\n{verify_output}")
+            
+            # Also check if loopback IP is actually configured on the interface
+            ip_check_cmd = f"ip addr show lo | grep -E '(inet|inet6)' || echo 'No IPs found on lo'; echo '=== Expected IPv4: {loopback_ipv4}/32 ==='; echo '=== Expected IPv6: {loopback_ipv6}/128 ==='"
+            ip_check_result = container.exec_run(["bash", "-c", ip_check_cmd])
+            ip_check_output = ip_check_result.output.decode('utf-8') if isinstance(ip_check_result.output, bytes) else str(ip_check_result.output)
+            logger.info(f"[FRR] Loopback IP check output:\n{ip_check_output}")
+            
+            # CRITICAL: Check if the loopback IP is actually present
+            if loopback_ipv4:
+                check_ipv4_cmd = f"ip addr show lo | grep -q '{loopback_ipv4}/32' && echo 'Loopback IPv4 {loopback_ipv4}/32 is configured' || echo 'Loopback IPv4 {loopback_ipv4}/32 is NOT configured'"
+                check_ipv4_result = container.exec_run(["bash", "-c", check_ipv4_cmd])
+                check_ipv4_output = check_ipv4_result.output.decode('utf-8') if isinstance(check_ipv4_result.output, bytes) else str(check_ipv4_result.output)
+                logger.info(f"[FRR] Loopback IPv4 verification: {check_ipv4_output}")
+            
+            if loopback_ipv6:
+                check_ipv6_cmd = f"ip addr show lo | grep -q '{loopback_ipv6}/128' && echo 'Loopback IPv6 {loopback_ipv6}/128 is configured' || echo 'Loopback IPv6 {loopback_ipv6}/128 is NOT configured'"
+                check_ipv6_result = container.exec_run(["bash", "-c", check_ipv6_cmd])
+                check_ipv6_output = check_ipv6_result.output.decode('utf-8') if isinstance(check_ipv6_result.output, bytes) else str(check_ipv6_result.output)
+                logger.info(f"[FRR] Loopback IPv6 verification: {check_ipv6_output}")
+            
+            logger.info(f"[FRR] ✅ Successfully configured interfaces (including loopback {loopback_ipv4}/32) in container {container_name}")
             return True
             
         except Exception as e:

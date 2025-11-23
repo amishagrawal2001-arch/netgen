@@ -314,6 +314,41 @@ def configure_isis_neighbor(device_id: str, isis_config: Dict[str, Any], device_
         vtysh_commands.extend([
             f"isis network point-to-point",
             "exit",
+        ])
+        
+        # Add loopback interface to ISIS if loopback IPs are configured
+        loopback_ipv4 = None
+        loopback_ipv6 = None
+        if device_data:
+            loopback_ipv4 = device_data.get('loopback_ipv4')
+            if loopback_ipv4 and loopback_ipv4.strip():
+                loopback_ipv4 = loopback_ipv4.strip().split('/')[0]
+            loopback_ipv6 = device_data.get('loopback_ipv6')
+            if loopback_ipv6 and loopback_ipv6.strip():
+                loopback_ipv6 = loopback_ipv6.strip().split('/')[0]
+            logging.info(f"[ISIS CONFIGURE] Retrieved loopback IPs from database - IPv4: {loopback_ipv4}, IPv6: {loopback_ipv6}")
+        else:
+            logging.warning(f"[ISIS CONFIGURE] device_data is None, cannot retrieve loopback IPs")
+        
+        # Configure loopback interface for ISIS if loopback IPs exist
+        # Note: Loopback should be configured for ISIS based on loopback IPs, not main interface IPs
+        # Configure loopback IPs and ISIS together
+        if loopback_ipv4 or loopback_ipv6:
+            logging.info(f"[ISIS CONFIGURE] Configuring loopback interface for ISIS - IPv4: {loopback_ipv4}, IPv6: {loopback_ipv6}")
+            vtysh_commands.append("interface lo")
+            if loopback_ipv4:
+                vtysh_commands.append(f" ip address {loopback_ipv4}/32")
+                vtysh_commands.append(" ip router isis CORE")
+                logging.info(f"[ISIS CONFIGURE] Adding loopback interface with IPv4 {loopback_ipv4}/32 to ISIS")
+            if loopback_ipv6:
+                vtysh_commands.append(f" ipv6 address {loopback_ipv6}/128")
+                vtysh_commands.append(" ipv6 router isis CORE")
+                logging.info(f"[ISIS CONFIGURE] Adding loopback interface with IPv6 {loopback_ipv6}/128 to ISIS")
+            vtysh_commands.append("exit")
+        else:
+            logging.info(f"[ISIS CONFIGURE] No loopback IPs configured, skipping loopback interface configuration for ISIS")
+        
+        vtysh_commands.extend([
             "end",
             "write"
         ])

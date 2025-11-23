@@ -1040,8 +1040,9 @@ def configure_bgp_for_device(device_id: str, bgp_config: Dict, ipv4: str = None,
         container = frr_manager.client.containers.get(container_name)
         
         # Get router-id (must be loopback IPv4)
-        # First, try to get loopback IPv4 and interface IPv4 from database
+        # First, try to get loopback IPv4/IPv6 and interface IPv4/IPv6 from database
         loopback_ipv4 = None
+        loopback_ipv6 = None
         device_ipv4 = None
         device_ipv6 = None
         try:
@@ -1052,6 +1053,9 @@ def configure_bgp_for_device(device_id: str, bgp_config: Dict, ipv4: str = None,
                 loopback_ipv4 = device_data.get('loopback_ipv4')
                 if loopback_ipv4 and loopback_ipv4.strip():
                     loopback_ipv4 = loopback_ipv4.strip().split('/')[0]
+                loopback_ipv6 = device_data.get('loopback_ipv6')
+                if loopback_ipv6 and loopback_ipv6.strip():
+                    loopback_ipv6 = loopback_ipv6.strip().split('/')[0]
                 # Also get interface IPv4/IPv6 from database if not provided
                 if not ipv4:
                     device_ipv4 = device_data.get('ipv4_address', '')
@@ -1085,6 +1089,38 @@ def configure_bgp_for_device(device_id: str, bgp_config: Dict, ipv4: str = None,
         keepalive = bgp_config.get('bgp_keepalive', 30)
         hold_time = bgp_config.get('bgp_hold_time', 90)
         
+        # Detect iBGP vs eBGP from BGP config mode
+        # Check if mode is explicitly set to iBGP, or if local_as == neighbor_as
+        bgp_mode = bgp_config.get('mode', 'eBGP')
+        is_ibgp = (bgp_mode.upper() == 'IBGP' or str(local_as) == str(neighbor_as))
+        vxlan_config = None
+        
+        if is_ibgp:
+            # For iBGP, ensure neighbor_as matches local_as
+            neighbor_as = local_as
+            logging.info(f"[BGP] Configuring iBGP session (ASN={local_as})")
+        else:
+            logging.info(f"[BGP] Configuring eBGP session (local_as={local_as}, neighbor_as={neighbor_as})")
+        
+        # Get VXLAN config for EVPN configuration (if needed)
+        try:
+            from utils.device_database import DeviceDatabase
+            device_db = DeviceDatabase()
+            device_data = device_db.get_device(device_id) if device_id else None
+            if device_data:
+                vxlan_config_raw = device_data.get('vxlan_config')
+                if vxlan_config_raw:
+                    import json
+                    if isinstance(vxlan_config_raw, str):
+                        try:
+                            vxlan_config = json.loads(vxlan_config_raw) if vxlan_config_raw else {}
+                        except:
+                            vxlan_config = {}
+                    else:
+                        vxlan_config = vxlan_config_raw or {}
+        except Exception as e:
+            logging.debug(f"[BGP] Could not check VXLAN config: {e}")
+        
         vtysh_commands = [
             "configure terminal",
             f"router bgp {local_as}",
@@ -1098,10 +1134,24 @@ def configure_bgp_for_device(device_id: str, bgp_config: Dict, ipv4: str = None,
         
         # Configure IPv4 BGP if enabled
         neighbor_ipv4 = bgp_config.get('bgp_neighbor_ipv4')
-        # Get update_source_ipv4 from config, or derive from ipv4 parameter (which may have been retrieved from database)
-        update_source_ipv4 = bgp_config.get('bgp_update_source_ipv4')
-        if not update_source_ipv4 and ipv4:
-            update_source_ipv4 = ipv4.split('/')[0]
+        # Check use_loopback_ip flag FIRST - if True, ignore bgp_update_source_ipv4 from config
+        use_loopback_ip = bgp_config.get('use_loopback_ip', False)
+        logging.info(f"[BGP] use_loopback_ip={use_loopback_ip}, loopback_ipv4={loopback_ipv4}, bgp_update_source_ipv4={bgp_config.get('bgp_update_source_ipv4')}")
+        
+        if use_loopback_ip and loopback_ipv4:
+            # Use loopback IP if flag is set and loopback is available (ignore bgp_update_source_ipv4 from config)
+            update_source_ipv4 = loopback_ipv4
+            logging.info(f"[BGP] Using loopback IPv4 {update_source_ipv4} as update-source (use_loopback_ip=True)")
+        else:
+            # Get update_source_ipv4 from config, or derive from interface IP
+            update_source_ipv4 = bgp_config.get('bgp_update_source_ipv4')
+            if not update_source_ipv4:
+                if ipv4:
+                    # Default: use interface IP
+                    update_source_ipv4 = ipv4.split('/')[0]
+                    logging.info(f"[BGP] Using interface IPv4 {update_source_ipv4} as update-source (default)")
+                else:
+                    logging.warning(f"[BGP] No update-source IPv4 available (use_loopback_ip=False, no bgp_update_source_ipv4, no ipv4)")
         
         # Log IPv4 BGP configuration attempt
         if neighbor_ipv4:
@@ -1119,10 +1169,23 @@ def configure_bgp_for_device(device_id: str, bgp_config: Dict, ipv4: str = None,
         
         # Configure IPv6 BGP if enabled
         neighbor_ipv6 = bgp_config.get('bgp_neighbor_ipv6')
-        # Get update_source_ipv6 from config, or derive from ipv6 parameter (which may have been retrieved from database)
-        update_source_ipv6 = bgp_config.get('bgp_update_source_ipv6')
-        if not update_source_ipv6 and ipv6:
-            update_source_ipv6 = ipv6.split('/')[0]
+        # Check use_loopback_ip flag FIRST - if True, ignore bgp_update_source_ipv6 from config
+        # (use_loopback_ip already retrieved above)
+        
+        if use_loopback_ip and loopback_ipv6:
+            # Use loopback IP if flag is set and loopback is available (ignore bgp_update_source_ipv6 from config)
+            update_source_ipv6 = loopback_ipv6
+            logging.info(f"[BGP] Using loopback IPv6 {update_source_ipv6} as update-source (use_loopback_ip=True)")
+        else:
+            # Get update_source_ipv6 from config, or derive from interface IP
+            update_source_ipv6 = bgp_config.get('bgp_update_source_ipv6')
+            if not update_source_ipv6:
+                if ipv6:
+                    # Default: use interface IP
+                    update_source_ipv6 = ipv6.split('/')[0]
+                    logging.info(f"[BGP] Using interface IPv6 {update_source_ipv6} as update-source (default)")
+                else:
+                    logging.warning(f"[BGP] No update-source IPv6 available (use_loopback_ip=False, no bgp_update_source_ipv6, no ipv6)")
         
         # Log IPv6 BGP configuration attempt
         if neighbor_ipv6:
@@ -1151,6 +1214,11 @@ def configure_bgp_for_device(device_id: str, bgp_config: Dict, ipv4: str = None,
                 f"neighbor {neighbor_ipv4} activate",
             ])
             
+            # For iBGP, add next-hop-self to ensure routes are advertised with local router-id as next-hop
+            if is_ibgp:
+                vtysh_commands.append(f"neighbor {neighbor_ipv4} next-hop-self")
+                logging.info(f"[BGP iBGP] Added next-hop-self for IPv4 neighbor {neighbor_ipv4}")
+            
             # Add network advertisement if IPv4 network is available
             if ipv4:
                 # Extract network from IP/mask (e.g., 192.168.0.2/24 -> 192.168.0.0/24)
@@ -1173,107 +1241,95 @@ def configure_bgp_for_device(device_id: str, bgp_config: Dict, ipv4: str = None,
             vtysh_commands.extend([
                 "address-family ipv6 unicast",
                 f"neighbor {neighbor_ipv6} activate",
-                "exit-address-family"
             ])
+            
+            # For iBGP, add next-hop-self to ensure routes are advertised with local router-id as next-hop
+            if is_ibgp:
+                vtysh_commands.append(f"neighbor {neighbor_ipv6} next-hop-self")
+                logging.info(f"[BGP iBGP] Added next-hop-self for IPv6 neighbor {neighbor_ipv6}")
+            
+            vtysh_commands.append("exit-address-family")
         
         # Configure BGP EVPN if VXLAN is enabled
-        try:
-            from utils.device_database import DeviceDatabase
-            device_db = DeviceDatabase()
-            device_data = device_db.get_device(device_id) if device_id else None
-            if device_data:
-                vxlan_config_raw = device_data.get('vxlan_config')
-                if vxlan_config_raw:
-                    import json
-                    if isinstance(vxlan_config_raw, str):
-                        try:
-                            vxlan_config = json.loads(vxlan_config_raw) if vxlan_config_raw else {}
-                        except:
-                            vxlan_config = {}
-                    else:
-                        vxlan_config = vxlan_config_raw or {}
-                    
-                    # Check if VXLAN is enabled and has required config
-                    vxlan_enabled = vxlan_config.get('enabled', False) or bool(vxlan_config.get('vni'))
-                    vni = vxlan_config.get('vni')
-                    vxlan_local_ip = vxlan_config.get('local_ip') or loopback_ipv4
-                    
-                    if vxlan_enabled and vni and vxlan_local_ip:
-                        logging.info(f"[BGP EVPN] Configuring BGP EVPN for VXLAN (VNI={vni}, VTEP={vxlan_local_ip})")
-                        
-                        # Create a route-map to permit all EVPN routes (required for route advertisement)
-                        # FRR has a default export policy that blocks routes unless explicitly permitted
-                        # Route-map is created in global config mode (before router bgp)
-                        # Find where "router bgp" is in the command list and insert route-map before it
-                        router_bgp_index = -1
-                        for i, cmd in enumerate(vtysh_commands):
-                            if cmd.strip().startswith("router bgp"):
-                                router_bgp_index = i
-                                break
-                        
-                        if router_bgp_index >= 0:
-                            # Insert route-map commands before "router bgp"
-                            vtysh_commands.insert(router_bgp_index, "route-map PERMIT_ALL_EVPN permit 10")
-                            vtysh_commands.insert(router_bgp_index + 1, "exit")
-                        else:
-                            # Fallback: add at the beginning (after configure terminal)
-                            vtysh_commands.insert(1, "route-map PERMIT_ALL_EVPN permit 10")
-                            vtysh_commands.insert(2, "exit")
-                        logging.info(f"[BGP EVPN] Created PERMIT_ALL_EVPN route-map for EVPN route advertisement")
-                        
-                        # Configure EVPN address-family - SINGLE block with all neighbors and VNI
-                        # CRITICAL: All EVPN configuration must be in ONE address-family block
-                        evpn_commands = [
-                            "address-family l2vpn evpn",
-                            "enable-resolve-overlay-index",  # Enable overlay index resolution for Type-3 routes
-                            "advertise-all-vni",  # Advertise all VNIs
-                            "advertise-svi-ip",  # Advertise SVI IPs
-                        ]
-                        
-                        # Add route-target import/export for the VNI (required for Type-3 route generation)
-                        # Format: route-target import/export ASN:VNI
-                        try:
-                            local_as_int = int(local_as) if local_as else 65000
-                            rt_value = f"{local_as_int}:{vni}"
-                            evpn_commands.extend([
-                                f"route-target import {rt_value}",
-                                f"route-target export {rt_value}",
-                            ])
-                            logging.info(f"[BGP EVPN] Added route-target import/export {rt_value} for VNI {vni}")
-                        except (ValueError, TypeError) as rt_exc:
-                            logging.warning(f"[BGP EVPN] Could not add route-target for VNI {vni}: {rt_exc}")
-                        
-                        # Activate EVPN on IPv4 neighbor (if exists)
-                        if neighbor_ipv4:
-                            evpn_commands.extend([
-                                f"neighbor {neighbor_ipv4} activate",
-                                f"neighbor {neighbor_ipv4} route-map PERMIT_ALL_EVPN out",  # Permit all EVPN routes (outgoing)
-                                f"neighbor {neighbor_ipv4} route-map PERMIT_ALL_EVPN in",  # Permit all EVPN routes (incoming)
-                                # Note: By default, FRR uses router-id (VTEP IP) as next-hop for EVPN routes, which is CORRECT
-                                # If you want to propagate next-hop unchanged, uncomment the line below:
-                                # f"neighbor {neighbor_ipv4} next-hop-unchanged",
-                            ])
-                            logging.info(f"[BGP EVPN] Will activate EVPN on IPv4 neighbor {neighbor_ipv4} with route-map (in/out)")
-                        
-                        # Activate EVPN on IPv6 neighbor (if exists)
-                        if neighbor_ipv6:
-                            evpn_commands.extend([
-                                f"neighbor {neighbor_ipv6} activate",
-                                f"neighbor {neighbor_ipv6} route-map PERMIT_ALL_EVPN out",  # Permit all EVPN routes (outgoing)
-                                f"neighbor {neighbor_ipv6} route-map PERMIT_ALL_EVPN in",  # Permit all EVPN routes (incoming)
-                                # Note: By default, FRR uses router-id (VTEP IP) as next-hop for EVPN routes, which is CORRECT
-                                # If you want to propagate next-hop unchanged, uncomment the line below:
-                                # f"neighbor {neighbor_ipv6} next-hop-unchanged",
-                            ])
-                            logging.info(f"[BGP EVPN] Will activate EVPN on IPv6 neighbor {neighbor_ipv6} with route-map (in/out)")
-                        
-                        evpn_commands.append("exit-address-family")
-                        
-                        # Add EVPN commands to the main command list (after IPv4/IPv6 address families)
-                        vtysh_commands.extend(evpn_commands)
-                        logging.info(f"[BGP EVPN] Configured EVPN address-family with VNI {vni} for advertisement (Type-2 and Type-3 routes)")
-        except Exception as e:
-            logging.warning(f"[BGP EVPN] Failed to check VXLAN config for EVPN: {e}")
+        # Reuse vxlan_config from earlier iBGP detection if available
+        if vxlan_config:
+            # Check if VXLAN is enabled and has required config
+            vxlan_enabled = vxlan_config.get('enabled', False) or bool(vxlan_config.get('vni'))
+            vni = vxlan_config.get('vni')
+            vxlan_local_ip = vxlan_config.get('local_ip') or loopback_ipv4
+            
+            if vxlan_enabled and vni and vxlan_local_ip:
+                logging.info(f"[BGP EVPN] Configuring BGP EVPN for VXLAN (VNI={vni}, VTEP={vxlan_local_ip})")
+                
+                # Create a route-map to permit all EVPN routes (required for route advertisement)
+                # FRR has a default export policy that blocks routes unless explicitly permitted
+                # Route-map is created in global config mode (before router bgp)
+                # Find where "router bgp" is in the command list and insert route-map before it
+                router_bgp_index = -1
+                for i, cmd in enumerate(vtysh_commands):
+                    if cmd.strip().startswith("router bgp"):
+                        router_bgp_index = i
+                        break
+                
+                if router_bgp_index >= 0:
+                    # Insert route-map commands before "router bgp"
+                    vtysh_commands.insert(router_bgp_index, "route-map PERMIT_ALL_EVPN permit 10")
+                    vtysh_commands.insert(router_bgp_index + 1, "exit")
+                else:
+                    # Fallback: add at the beginning (after configure terminal)
+                    vtysh_commands.insert(1, "route-map PERMIT_ALL_EVPN permit 10")
+                    vtysh_commands.insert(2, "exit")
+                logging.info(f"[BGP EVPN] Created PERMIT_ALL_EVPN route-map for EVPN route advertisement")
+                
+                # Configure EVPN address-family - SINGLE block with all neighbors and VNI
+                # CRITICAL: All EVPN configuration must be in ONE address-family block
+                evpn_commands = [
+                    "address-family l2vpn evpn",
+                    "enable-resolve-overlay-index",  # Enable overlay index resolution for Type-3 routes
+                    "advertise-all-vni",  # Advertise all VNIs
+                    "advertise-svi-ip",  # Advertise SVI IPs
+                ]
+                
+                # Add route-target import/export for the VNI (required for Type-3 route generation)
+                # Format: route-target import/export ASN:VNI
+                try:
+                    local_as_int = int(local_as) if local_as else 65000
+                    rt_value = f"{local_as_int}:{vni}"
+                    evpn_commands.extend([
+                        f"route-target import {rt_value}",
+                        f"route-target export {rt_value}",
+                    ])
+                    logging.info(f"[BGP EVPN] Added route-target import/export {rt_value} for VNI {vni}")
+                except (ValueError, TypeError) as rt_exc:
+                    logging.warning(f"[BGP EVPN] Could not add route-target for VNI {vni}: {rt_exc}")
+                
+                # Activate EVPN on IPv4 neighbor (if exists)
+                if neighbor_ipv4:
+                    evpn_commands.extend([
+                        f"neighbor {neighbor_ipv4} activate",
+                        f"neighbor {neighbor_ipv4} route-map PERMIT_ALL_EVPN out",  # Permit all EVPN routes (outgoing)
+                        f"neighbor {neighbor_ipv4} route-map PERMIT_ALL_EVPN in",  # Permit all EVPN routes (incoming)
+                        # Note: By default, FRR uses router-id (VTEP IP) as next-hop for EVPN routes, which is CORRECT
+                        # For iBGP, this is especially important as it ensures the VTEP IP is used as next-hop
+                    ])
+                    logging.info(f"[BGP EVPN] Will activate EVPN on IPv4 neighbor {neighbor_ipv4} with route-map (in/out)")
+                
+                # Activate EVPN on IPv6 neighbor (if exists)
+                if neighbor_ipv6:
+                    evpn_commands.extend([
+                        f"neighbor {neighbor_ipv6} activate",
+                        f"neighbor {neighbor_ipv6} route-map PERMIT_ALL_EVPN out",  # Permit all EVPN routes (outgoing)
+                        f"neighbor {neighbor_ipv6} route-map PERMIT_ALL_EVPN in",  # Permit all EVPN routes (incoming)
+                        # Note: By default, FRR uses router-id (VTEP IP) as next-hop for EVPN routes, which is CORRECT
+                        # For iBGP, this is especially important as it ensures the VTEP IP is used as next-hop
+                    ])
+                    logging.info(f"[BGP EVPN] Will activate EVPN on IPv6 neighbor {neighbor_ipv6} with route-map (in/out)")
+                
+                evpn_commands.append("exit-address-family")
+                
+                # Add EVPN commands to the main command list (after IPv4/IPv6 address families)
+                vtysh_commands.extend(evpn_commands)
+                logging.info(f"[BGP EVPN] Configured EVPN address-family with VNI {vni} for iBGP advertisement (Type-2 and Type-3 routes)")
         
         vtysh_commands.extend([
             "exit",

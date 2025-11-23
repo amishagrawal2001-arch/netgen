@@ -67,6 +67,78 @@ class DeviceDatabase:
         return config
     
     @staticmethod
+    def _prepare_vxlan_config(raw_config: Any) -> Dict[str, Any]:
+        """Normalize VXLAN configuration payloads for storage."""
+        if not raw_config:
+            return {}
+        config: Dict[str, Any] = {}
+        try:
+            if isinstance(raw_config, str):
+                config = json.loads(raw_config) if raw_config else {}
+                if isinstance(config, str):
+                    config = json.loads(config)
+            elif isinstance(raw_config, dict):
+                config = dict(raw_config)
+            else:
+                config = {}
+        except (json.JSONDecodeError, TypeError):
+            config = {}
+        
+        if not isinstance(config, dict):
+            return {}
+        
+        def _clean_str(value: Any) -> str:
+            return str(value).strip() if value is not None else ""
+        
+        vni = config.get("vni") or config.get("vxlan_id")
+        try:
+            config["vni"] = int(vni) if vni is not None else None
+        except (TypeError, ValueError):
+            config["vni"] = None
+        
+        udp_port = config.get("udp_port") or config.get("vxlan_udp_port")
+        try:
+            config["udp_port"] = int(udp_port) if udp_port is not None else 4789
+        except (TypeError, ValueError):
+            config["udp_port"] = 4789
+        
+        remote_values = (
+            config.get("remote_peers")
+            or config.get("remote_endpoints")
+            or config.get("vxlan_remote_ip")
+            or config.get("remote")
+            or []
+        )
+        remote_peers: List[str] = []
+        if isinstance(remote_values, str):
+            tokens = [token.strip() for token in remote_values.replace(";", ",").split(",")]
+            remote_peers = [token for token in tokens if token]
+        elif isinstance(remote_values, (list, tuple, set)):
+            remote_peers = [
+                _clean_str(token)
+                for token in remote_values
+                if _clean_str(token)
+            ]
+        elif remote_values:
+            candidate = _clean_str(remote_values)
+            if candidate:
+                remote_peers = [candidate]
+        config["remote_peers"] = remote_peers
+        
+        config["local_ip"] = _clean_str(
+            config.get("local_ip") or config.get("vxlan_local_ip") or config.get("source_ip")
+        )
+        config["underlay_interface"] = _clean_str(
+            config.get("underlay_interface") or config.get("interface") or config.get("vxlan_underlay")
+        )
+        config["overlay_interface"] = _clean_str(
+            config.get("overlay_interface") or config.get("vxlan_overlay")
+        )
+        config["vxlan_interface"] = _clean_str(config.get("vxlan_interface"))
+        config["enabled"] = bool(config.get("enabled", True) and (config.get("vni") and remote_peers))
+        return config
+    
+    @staticmethod
     def _normalize_gateway_routes_input(routes: Any) -> List[str]:
         """Normalize user-provided gateway routes into a list of CIDR strings."""
         if not routes:
@@ -195,6 +267,13 @@ class DeviceDatabase:
                     ospf_state TEXT DEFAULT 'Unknown',
                     ospf_neighbors TEXT,
                     last_ospf_check TIMESTAMP
+                    ,
+                    vxlan_config TEXT,
+                    vxlan_state TEXT DEFAULT 'Disabled',
+                    vxlan_interface TEXT,
+                    vxlan_enabled BOOLEAN DEFAULT FALSE,
+                    vxlan_last_error TEXT,
+                    vxlan_updated_at TIMESTAMP
                 )
             """)
             
@@ -359,6 +438,21 @@ class DeviceDatabase:
                 logger.info("[DEVICE DB] Successfully added OSPF status columns to devices table")
             else:
                 logger.info("[DEVICE DB] OSPF status columns already exist in devices table")
+            
+            vxlan_columns = {
+                "vxlan_config": "TEXT",
+                "vxlan_state": "TEXT DEFAULT 'Disabled'",
+                "vxlan_interface": "TEXT",
+                "vxlan_enabled": "BOOLEAN DEFAULT FALSE",
+                "vxlan_last_error": "TEXT",
+                "vxlan_updated_at": "TIMESTAMP",
+            }
+            for column_name, definition in vxlan_columns.items():
+                if column_name not in columns:
+                    logger.info(f"[DEVICE DB] Adding {column_name} column to devices table")
+                    conn.execute(f"ALTER TABLE devices ADD COLUMN {column_name} {definition}")
+                    conn.commit()
+                    logger.info(f"[DEVICE DB] Successfully added {column_name} column")
             
             # Check if BGP IPv4/IPv6 columns exist in device_stats table
             cursor = conn.execute("PRAGMA table_info(device_stats)")
@@ -598,6 +692,9 @@ class DeviceDatabase:
                 last_dhcp_check = device_data.get("last_dhcp_check")
                 dhcp_lease_subnet = device_data.get("dhcp_lease_subnet", "")
 
+                vxlan_config_prepared = self._prepare_vxlan_config(device_data.get("vxlan_config"))
+                vxlan_enabled = bool(vxlan_config_prepared)
+
                 device_info = {
                     'device_id': device_id,
                     'device_name': device_data.get("device_name", f"device_{device_id}"),
@@ -629,6 +726,17 @@ class DeviceDatabase:
                     'dhcp_lease_subnet': dhcp_lease_subnet,
                     'last_dhcp_check': last_dhcp_check,
                     'status': device_data.get("status", "Stopped"),
+                    'vxlan_config': json.dumps(vxlan_config_prepared),
+                    'vxlan_state': device_data.get(
+                        "vxlan_state",
+                        "Configured" if vxlan_enabled else "Disabled",
+                    ),
+                    'vxlan_interface': device_data.get("vxlan_interface", ""),
+                    'vxlan_enabled': int(
+                        bool(device_data.get("vxlan_enabled", vxlan_enabled))
+                    ),
+                    'vxlan_last_error': device_data.get("vxlan_last_error", ""),
+                    'vxlan_updated_at': device_data.get("vxlan_updated_at") or datetime.now(timezone.utc).isoformat(),
                     'created_at': datetime.now(timezone.utc).isoformat(),
                     'updated_at': datetime.now(timezone.utc).isoformat()
                 }
@@ -738,7 +846,13 @@ class DeviceDatabase:
                     'isis_uptime': 'isis_uptime',
                     'last_isis_check': 'last_isis_check',
                     'isis_manual_override': 'isis_manual_override',
-                    'isis_manual_override_time': 'isis_manual_override_time'
+                    'isis_manual_override_time': 'isis_manual_override_time',
+                    'vxlan_config': 'vxlan_config',
+                    'vxlan_state': 'vxlan_state',
+                    'vxlan_interface': 'vxlan_interface',
+                    'vxlan_enabled': 'vxlan_enabled',
+                    'vxlan_last_error': 'vxlan_last_error',
+                    'vxlan_updated_at': 'vxlan_updated_at',
                 }
                 
                 for key, db_field in field_mapping.items():
@@ -750,7 +864,19 @@ class DeviceDatabase:
                         elif key in ['protocols', 'bgp_config', 'ospf_config', 'isis_config']:
                             update_fields.append(f"{db_field} = ?")
                             update_values.append(json.dumps(device_data[key]))
+                        elif key == 'vxlan_config':
+                            prepared_vxlan = self._prepare_vxlan_config(device_data[key])
+                            update_fields.append(f"{db_field} = ?")
+                            update_values.append(json.dumps(prepared_vxlan))
+                            if 'vxlan_enabled' not in device_data:
+                                update_fields.append("vxlan_enabled = ?")
+                                update_values.append(int(bool(prepared_vxlan)))
+                            update_fields.append("vxlan_updated_at = ?")
+                            update_values.append(datetime.now(timezone.utc).isoformat())
                         elif key == 'dhcp_running':
+                            update_fields.append(f"{db_field} = ?")
+                            update_values.append(int(bool(device_data[key])))
+                        elif key == 'vxlan_enabled':
                             update_fields.append(f"{db_field} = ?")
                             update_values.append(int(bool(device_data[key])))
                         else:
@@ -816,6 +942,8 @@ class DeviceDatabase:
                         device['isis_config'] = {}
                     device['dhcp_config'] = self._prepare_dhcp_config(device.get('dhcp_config'))
                     device['dhcp_running'] = bool(device.get('dhcp_running'))
+                    device['vxlan_config'] = self._prepare_vxlan_config(device.get('vxlan_config'))
+                    device['vxlan_enabled'] = bool(device.get('vxlan_enabled'))
                     return device
                 else:
                     return None
@@ -862,6 +990,8 @@ class DeviceDatabase:
                         device['isis_config'] = {}
                     device['dhcp_config'] = self._prepare_dhcp_config(device.get('dhcp_config'))
                     device['dhcp_running'] = bool(device.get('dhcp_running'))
+                    device['vxlan_config'] = self._prepare_vxlan_config(device.get('vxlan_config'))
+                    device['vxlan_enabled'] = bool(device.get('vxlan_enabled'))
                     devices.append(device)
                 
                 return devices
@@ -920,6 +1050,8 @@ class DeviceDatabase:
                         device['isis_config'] = {}
                     device['dhcp_config'] = self._prepare_dhcp_config(device.get('dhcp_config'))
                     device['dhcp_running'] = bool(device.get('dhcp_running'))
+                    device['vxlan_config'] = self._prepare_vxlan_config(device.get('vxlan_config'))
+                    device['vxlan_enabled'] = bool(device.get('vxlan_enabled'))
                     devices.append(device)
                 
                 return devices

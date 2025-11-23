@@ -453,9 +453,14 @@ def configure_ospf_neighbor(
             if ipv4_network:
                 vtysh_commands.extend([
                     f" network {ipv4_network} area {area_id_ipv4}",
-                    "exit"
                 ])
-            else:
+            
+            # Add loopback network to OSPF if loopback IPv4 is configured
+            if loopback_ipv4:
+                loopback_network = f"{loopback_ipv4}/32"
+                vtysh_commands.append(f" network {loopback_network} area {area_id_ipv4}")
+                logging.info(f"[OSPF CONFIGURE] Adding loopback network {loopback_network} to OSPF area {area_id_ipv4}")
+            
                 vtysh_commands.append(" exit")
             
             # Configure interface OSPF settings
@@ -489,6 +494,16 @@ def configure_ospf_neighbor(
                         logging.debug(f"[OSPF CONFIGURE] Could not check for existing point-to-point config: {e}")
             
             vtysh_commands.append("exit")
+            
+            # Configure loopback interface with IP and OSPF if loopback IPv4 is configured
+            if loopback_ipv4:
+                vtysh_commands.extend([
+                    "interface lo",
+                    f" ip address {loopback_ipv4}/32",
+                    " ip ospf passive",
+                    "exit"
+                ])
+                logging.info(f"[OSPF CONFIGURE] Adding loopback interface with IPv4 {loopback_ipv4}/32 to OSPF")
         
         # Configure IPv6 OSPF if enabled
         if ipv6_enabled:
@@ -553,6 +568,23 @@ def configure_ospf_neighbor(
                         logging.debug(f"[OSPF CONFIGURE] Could not check for existing point-to-point config: {e}")
             
             vtysh_commands.append("exit")
+            
+            # Add loopback interface to OSPF6 if loopback IPv6 is configured
+            # Configure loopback IP and OSPF6 area together
+            loopback_ipv6 = None
+            if device_data:
+                loopback_ipv6 = device_data.get('loopback_ipv6')
+                if loopback_ipv6 and loopback_ipv6.strip():
+                    loopback_ipv6 = loopback_ipv6.strip().split('/')[0]
+            
+            if loopback_ipv6:
+                vtysh_commands.extend([
+                    "interface lo",
+                    f" ipv6 address {loopback_ipv6}/128",
+                    f" ipv6 ospf6 area {area_id_ipv6}",
+                    "exit"
+                ])
+                logging.info(f"[OSPF CONFIGURE] Adding loopback interface with IPv6 {loopback_ipv6}/128 to OSPF6 area {area_id_ipv6}")
         
         # Check if we actually have any OSPF commands to execute (beyond "configure terminal")
         if len(vtysh_commands) <= 1:
@@ -657,6 +689,17 @@ def start_ospf_neighbor(device_id: str, ospf_config: Dict[str, Any], device_name
         # Normalize AF input
         af_norm = (af or "").strip().lower() if isinstance(af, str) else None
         
+        # Get loopback IPs from database
+        loopback_ipv4 = None
+        loopback_ipv6 = None
+        if device_data:
+            loopback_ipv4 = device_data.get('loopback_ipv4')
+            if loopback_ipv4 and loopback_ipv4.strip():
+                loopback_ipv4 = loopback_ipv4.strip().split('/')[0]
+            loopback_ipv6 = device_data.get('loopback_ipv6')
+            if loopback_ipv6 and loopback_ipv6.strip():
+                loopback_ipv6 = loopback_ipv6.strip().split('/')[0]
+        
         # IPv4-only start: add network statement, no shutdown
         if af_norm in ("ipv4",):
             vtysh_commands.append("router ospf")
@@ -664,7 +707,22 @@ def start_ospf_neighbor(device_id: str, ospf_config: Dict[str, Any], device_name
         if ipv4_enabled and ipv4_network:
             vtysh_commands.append(f" network {ipv4_network} area {area_id}")
             logging.info(f"[OSPF START] (IPv4) Adding network: {ipv4_network} area {area_id}")
+            # Add loopback network if configured
+            if loopback_ipv4:
+                loopback_network = f"{loopback_ipv4}/32"
+                vtysh_commands.append(f" network {loopback_network} area {area_id}")
+                logging.info(f"[OSPF START] (IPv4) Adding loopback network {loopback_network} to area {area_id}")
             vtysh_commands.append("exit")
+            
+            # Configure loopback interface with IP and OSPF if loopback IPv4 is configured
+            if loopback_ipv4:
+                vtysh_commands.extend([
+                    "interface lo",
+                    f" ip address {loopback_ipv4}/32",
+                    " ip ospf passive",
+                    "exit"
+                ])
+                logging.info(f"[OSPF START] (IPv4) Adding loopback interface with IPv4 {loopback_ipv4}/32 to OSPF")
         
         # IPv6-only start: add interface area binding
         elif af_norm in ("ipv6",):
@@ -674,6 +732,15 @@ def start_ospf_neighbor(device_id: str, ospf_config: Dict[str, Any], device_name
                 "exit",
             ])
             logging.info(f"[OSPF START] (IPv6) Adding interface {interface} area {area_id} binding")
+            # Add loopback interface with IP and OSPF6 if configured
+            if loopback_ipv6:
+                vtysh_commands.extend([
+                    "interface lo",
+                    f" ipv6 address {loopback_ipv6}/128",
+                    f" ipv6 ospf6 area {area_id}",
+                    "exit",
+                ])
+                logging.info(f"[OSPF START] (IPv6) Adding loopback interface with IPv6 {loopback_ipv6}/128 to area {area_id}")
         
         # Start both (legacy behavior)
         else:
@@ -683,7 +750,22 @@ def start_ospf_neighbor(device_id: str, ospf_config: Dict[str, Any], device_name
             if ipv4_enabled and ipv4_network:
                 vtysh_commands.append(f" network {ipv4_network} area {area_id}")
                 logging.info(f"[OSPF START] Adding network: {ipv4_network} area {area_id}")
+                # Add loopback network if configured
+                if loopback_ipv4:
+                    loopback_network = f"{loopback_ipv4}/32"
+                    vtysh_commands.append(f" network {loopback_network} area {area_id}")
+                    logging.info(f"[OSPF START] Adding loopback network {loopback_network} to area {area_id}")
             vtysh_commands.append("exit")
+            
+            # Configure loopback interface with IP and OSPF if loopback IPv4 is configured
+            if loopback_ipv4:
+                vtysh_commands.extend([
+                    "interface lo",
+                    f" ip address {loopback_ipv4}/32",
+                    " ip ospf passive",
+                    "exit"
+                ])
+                logging.info(f"[OSPF START] Adding loopback interface with IPv4 {loopback_ipv4}/32 to OSPF")
             
             # IPv6
             if ipv6_enabled:
@@ -692,6 +774,15 @@ def start_ospf_neighbor(device_id: str, ospf_config: Dict[str, Any], device_name
                     f" ipv6 ospf6 area {area_id}",
                     "exit",
                 ])
+                # Add loopback interface with IP and OSPF6 if configured
+                if loopback_ipv6:
+                    vtysh_commands.extend([
+                        "interface lo",
+                        f" ipv6 address {loopback_ipv6}/128",
+                        f" ipv6 ospf6 area {area_id}",
+                        "exit",
+                    ])
+                    logging.info(f"[OSPF START] Adding loopback interface with IPv6 {loopback_ipv6}/128 to OSPF6 area {area_id}")
         
         # Execute commands
         config_commands = "\n".join(vtysh_commands)
