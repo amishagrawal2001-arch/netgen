@@ -21,7 +21,7 @@ class TrafficGenClientServerSection():
         
         # Set consistent spacing and margins for better visual hierarchy
         layout.setSpacing(10)  # Space between elements
-        layout.setContentsMargins(8, 8, 8, 8)  # Padding around the entire section
+        layout.setContentsMargins(4, 4, 4, 4)  # Balanced padding to match right side sections
 
         # Server Tree Section
         self.server_tree = QTreeWidget()
@@ -105,47 +105,58 @@ class TrafficGenClientServerSection():
         # Connect to unified update for stream + device tables
         self.server_tree.itemSelectionChanged.connect(self._on_server_selection_changed_combined)
 
-        # Action Buttons Section (grouped visually)
-        button_layout = QHBoxLayout()
-        button_layout.setAlignment(Qt.AlignLeft)
-        button_layout.setSpacing(5)  # Spacing between buttons
-        button_layout.setContentsMargins(0, 5, 0, 0)  # Top margin to separate from tree
+        # --- Action Buttons Section (grouped separately, aligned with Streams pattern) ---
+        action_button_layout = QHBoxLayout()
+        action_button_layout.setAlignment(Qt.AlignLeft)
+        action_button_layout.setSpacing(5)  # Spacing between buttons
+        action_button_layout.setContentsMargins(0, 5, 0, 0)  # Top margin to separate from tree
 
-        # Delete Port button
-        remove_interface_button = QPushButton()
-        remove_interface_button.setIcon(QIcon(r_icon("icons/Trash.png")))
-        remove_interface_button.setIconSize(QSize(16, 16))
-        remove_interface_button.setFixedSize(32, 28)
-        remove_interface_button.setToolTip("Delete Port")
-        remove_interface_button.clicked.connect(self.remove_selected_interface)
-        button_layout.addWidget(remove_interface_button)
-
-        # Add Ports button
+        # Add Ports button (action button)
         readd_port_button = QPushButton()
         readd_port_button.setIcon(QIcon(r_icon("icons/readd.png")))
         readd_port_button.setIconSize(QSize(16, 16))
         readd_port_button.setFixedSize(32, 28)
         readd_port_button.setToolTip("Add Ports")
         readd_port_button.clicked.connect(self.readd_ports_dialog)
-        button_layout.addWidget(readd_port_button)
+        action_button_layout.addWidget(readd_port_button)
 
-        # Reset Interface button
+        # Delete Port button (action button)
+        remove_interface_button = QPushButton()
+        remove_interface_button.setIcon(QIcon(r_icon("icons/Trash.png")))
+        remove_interface_button.setIconSize(QSize(16, 16))
+        remove_interface_button.setFixedSize(32, 28)
+        remove_interface_button.setToolTip("Delete Port")
+        remove_interface_button.clicked.connect(self.remove_selected_interface)
+        action_button_layout.addWidget(remove_interface_button)
+
+        # Reset Interface button (action button)
         reset_interface_button = QPushButton()
-        reset_icon_path = r_icon("icons/reset.png")
+        reset_icon_path = r_icon("icons/reset_btn.png")
         if reset_icon_path:
             reset_interface_button.setIcon(QIcon(reset_icon_path))
         else:
-            # Fallback icon if reset.png doesn't exist
-            reset_interface_button.setIcon(QIcon(r_icon("icons/refresh.png")))
+            # Fallback icon if reset_btn.png doesn't exist
+            reset_interface_button.setIcon(QIcon(r_icon("icons/reset.png")))
         reset_interface_button.setIconSize(QSize(16, 16))
         reset_interface_button.setFixedSize(32, 28)
         reset_interface_button.setToolTip("Reset Interface")
         reset_interface_button.clicked.connect(self.reset_selected_interface)
-        button_layout.addWidget(reset_interface_button)
+        action_button_layout.addWidget(reset_interface_button)
+
+        # Refresh Interface List button (action button)
+        refresh_interface_button = QPushButton()
+        refresh_icon_path = r_icon("icons/refresh.png")
+        if refresh_icon_path:
+            refresh_interface_button.setIcon(QIcon(refresh_icon_path))
+        refresh_interface_button.setIconSize(QSize(16, 16))
+        refresh_interface_button.setFixedSize(32, 28)
+        refresh_interface_button.setToolTip("Refresh Interface List")
+        refresh_interface_button.clicked.connect(self.refresh_selected_server_interfaces)
+        action_button_layout.addWidget(refresh_interface_button)
 
         # Stretch to align left (buttons stay on left, space on right)
-        button_layout.addStretch(1)
-        layout.addLayout(button_layout)
+        action_button_layout.addStretch(1)
+        layout.addLayout(action_button_layout)
 
         # Finalize section
         self.server_group.setLayout(layout)
@@ -175,6 +186,9 @@ class TrafficGenClientServerSection():
                 self.devices_tab.update_ospf_table()
             if hasattr(self.devices_tab, "update_isis_table"):
                 self.devices_tab.update_isis_table()
+            # Update VXLAN table to show only devices from selected TGen ports
+            if hasattr(self.devices_tab, "vxlan_handler") and hasattr(self.devices_tab.vxlan_handler, "refresh_vxlan_table"):
+                self.devices_tab.vxlan_handler.refresh_vxlan_table()
 
         # Update stream table (this method exists in this mixin)
         if hasattr(self, "update_stream_table"):
@@ -309,10 +323,25 @@ class TrafficGenClientServerSection():
                 for item in selected_items:
                     parent = item.parent()
                     if parent:
-                        tg_id = parent.text(0)
-                        port_name = item.text(0).strip()  # Remove radio button prefix if present
-                        if port_name.startswith("• ") or port_name.startswith("● "):
-                            port_name = port_name[2:]  # Remove bullet prefix
+                        # Extract TG ID from the custom widget in column 0
+                        tg_id_widget = self.server_tree.itemWidget(parent, 0)
+                        tg_id = None
+                        if tg_id_widget:
+                            tg_id_label = tg_id_widget.findChild(QLabel)
+                            if tg_id_label:
+                                tg_id = tg_id_label.text()
+                        
+                        # Fallback: get from server_interfaces based on parent item index
+                        if not tg_id:
+                            parent_index = self.server_tree.indexOfTopLevelItem(parent)
+                            if parent_index >= 0 and parent_index < len(self.server_interfaces):
+                                server = self.server_interfaces[parent_index]
+                                tg_id = f"TG {server.get('tg_id', '0')}"
+                        
+                        if not tg_id:
+                            continue  # Skip if we can't determine TG ID
+                        
+                        port_name = item.text(0).strip()  # Interface name (no bullet prefix since we use icons)
                         full_port_name = f"{tg_id} - {port_name}"
                         selected_ports.append(full_port_name)
 
@@ -574,6 +603,9 @@ class TrafficGenClientServerSection():
                     continue
             
             if interfaces:
+                    # Track added interface names to prevent duplicates
+                    added_interfaces = set()
+                    
                     for interface in interfaces:
                         port_name = interface['name']
                         interface_status = interface.get('status', 'up')
@@ -581,6 +613,12 @@ class TrafficGenClientServerSection():
 
                         if full_interface_name in self.removed_interfaces:
                             continue  # ✅ Skip previously removed interfaces
+                        
+                        # Skip if we've already added this interface name (deduplication)
+                        if port_name in added_interfaces:
+                            continue
+                        
+                        added_interfaces.add(port_name)
 
                         # Create interface name with icon-based status indicator
                         port_item = QTreeWidgetItem([port_name, ""])  # Remove bullet prefix, use icon instead
@@ -691,10 +729,27 @@ class TrafficGenClientServerSection():
         for item in selected_items:
             parent_item = item.parent()
             if parent_item:  # Only process child items (ports)
-                tg_id = parent_item.text(0)  # TG ID (e.g., "TG 0")
-                port_name_with_bullet = item.text(0)  # Interface name with bullet (e.g., "• eth0")
-                # Remove the bullet prefix to get the actual port name
-                port_name = port_name_with_bullet.replace("• ", "", 1)  # Remove bullet prefix
+                # Extract TG ID from the custom widget in column 0
+                tg_id_widget = self.server_tree.itemWidget(parent_item, 0)
+                tg_id = None
+                if tg_id_widget:
+                    # Find the QLabel containing the TG ID text
+                    tg_id_label = tg_id_widget.findChild(QLabel)
+                    if tg_id_label:
+                        tg_id = tg_id_label.text()  # TG ID (e.g., "TG 0")
+                
+                # Fallback: get from server_interfaces based on parent item index
+                if not tg_id:
+                    parent_index = self.server_tree.indexOfTopLevelItem(parent_item)
+                    if parent_index >= 0 and parent_index < len(self.server_interfaces):
+                        server = self.server_interfaces[parent_index]
+                        tg_id = f"TG {server.get('tg_id', '0')}"
+                
+                if not tg_id:
+                    continue  # Skip if we can't determine TG ID
+                
+                # Get port name (no bullet prefix since we use icons now)
+                port_name = item.text(0)  # Interface name (e.g., "ens14f1")
                 full_port_name = f"{tg_id} - {port_name}"
 
                 # Add the full port name to removed interfaces
@@ -717,6 +772,74 @@ class TrafficGenClientServerSection():
         else:
             QMessageBox.warning(self, "No Ports Removed", "No valid ports were selected for removal.")
     
+    def refresh_selected_server_interfaces(self):
+        """Refresh the interface list for the selected server."""
+        selected_items = self.server_tree.selectedItems()
+        if not selected_items:
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.information(
+                self,
+                "No Selection",
+                "Please select a server (TG ID) to refresh its interface list."
+            )
+            return
+        
+        # Get the selected server (parent item if a port is selected, or the item itself if server is selected)
+        selected_item = selected_items[0]
+        server_item = selected_item.parent() if selected_item.parent() else selected_item
+        
+        # Get server address from the selected server
+        server_address = server_item.text(1)
+        if not server_address:
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self,
+                "Invalid Selection",
+                "Could not determine server address from selection."
+            )
+            return
+        
+        # Normalize server address (ensure it has http:// prefix)
+        if not server_address.startswith(("http://", "https://")):
+            server_address = f"http://{server_address}"
+        
+        # Find the server in server_interfaces list and clear its cached interfaces
+        server_found = False
+        for server in self.server_interfaces:
+            if server["address"] == server_address or server["address"] == server_address.replace("http://", "").replace("https://", ""):
+                # Clear cached interfaces to force fresh fetch
+                if "interfaces" in server:
+                    del server["interfaces"]
+                server_found = True
+                print(f"[REFRESH INTERFACES] Cleared cached interfaces for server: {server_address}")
+                break
+        
+        if not server_found:
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self,
+                "Server Not Found",
+                f"Could not find server {server_address} in the server list."
+            )
+            return
+        
+        # Refresh the entire server tree (this will fetch fresh interfaces from all servers)
+        print(f"[REFRESH INTERFACES] Refreshing interface list for server: {server_address}")
+        self.update_server_tree()
+        
+        # Restore selection to the same server after refresh
+        # Find the server item by address and select it
+        for i in range(self.server_tree.topLevelItemCount()):
+            top_item = self.server_tree.topLevelItem(i)
+            item_address = top_item.text(1)
+            if item_address == server_address or item_address == server_address.replace("http://", "").replace("https://", ""):
+                top_item.setSelected(True)
+                self.server_tree.setCurrentItem(top_item)
+                # Expand the server item to show interfaces
+                top_item.setExpanded(True)
+                print(f"[REFRESH INTERFACES] Restored selection to server: {item_address}")
+                break
+
     def reset_selected_interface(self):
         """Reset the selected interface on the server - removes all IPs, VLANs, and devices."""
         selected_items = self.server_tree.selectedItems()
@@ -769,10 +892,26 @@ class TrafficGenClientServerSection():
                 if not parent_item:
                     continue
                 
-                tg_id = parent_item.text(0)  # TG ID (e.g., "TG 0")
-                port_name_with_bullet = item.text(0)  # Interface name with bullet (e.g., "• eth0")
-                # Remove the bullet prefix to get the actual port name
-                port_name = port_name_with_bullet.replace("• ", "", 1).replace("● ", "", 1)
+                # Extract TG ID from the custom widget in column 0
+                tg_id_widget = self.server_tree.itemWidget(parent_item, 0)
+                tg_id = None
+                if tg_id_widget:
+                    tg_id_label = tg_id_widget.findChild(QLabel)
+                    if tg_id_label:
+                        tg_id = tg_id_label.text()
+                
+                # Fallback: get from server_interfaces based on parent item index
+                if not tg_id:
+                    parent_index = self.server_tree.indexOfTopLevelItem(parent_item)
+                    if parent_index >= 0 and parent_index < len(self.server_interfaces):
+                        server = self.server_interfaces[parent_index]
+                        tg_id = f"TG {server.get('tg_id', '0')}"
+                
+                if not tg_id:
+                    continue  # Skip if we can't determine TG ID
+                
+                # Get port name (no bullet prefix since we use icons now)
+                port_name = item.text(0)  # Interface name (e.g., "ens14f1")
                 
                 # Normalize interface name - extract base interface
                 base_interface = port_name

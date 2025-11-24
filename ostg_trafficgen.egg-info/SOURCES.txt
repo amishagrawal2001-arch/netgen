@@ -77,6 +77,7 @@ resources/icons/readd.png
 resources/icons/red_dot.png
 resources/icons/refresh.png
 resources/icons/remove.png
+resources/icons/reset_btn.png
 resources/icons/save.png
 resources/icons/start.png
 resources/icons/startallstream.png
@@ -108,6 +109,7 @@ utils/devices_tab_bgp.py
 utils/devices_tab_dhcp.py
 utils/devices_tab_isis.py
 utils/devices_tab_ospf.py
+utils/devices_tab_vxlan.py
 utils/dhcp.py
 utils/dhcp_monitor.py
 utils/dpdk_tx_worker.py
@@ -129,6 +131,7 @@ utils/rdma_perf.py
 utils/rocev2.py
 utils/udp.py
 utils/uec.py
+utils/vxlan.py
 widgets/__init__.py
 widgets/add_bgp_dialog.py
 widgets/add_bgp_route_dialog.py
@@ -136,6 +139,7 @@ widgets/add_device_dialog.py
 widgets/add_isis_dialog.py
 widgets/add_ospf_dialog.py
 widgets/add_ospf_route_dialog.py
+widgets/add_vxlan_dialog.py
 widgets/devices_tab.py
 widgets/devices_tab_backup.py
 widgets/stream_dialog.py

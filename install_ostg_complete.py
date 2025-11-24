@@ -436,17 +436,18 @@ class OSTGInstaller:
         # Install wheel
         self.run_command(f"pip3 install {remote_wheel_path}")
         
-        # Copy additional files
+        # Copy additional files from ostg_docker directory
         files_to_copy = [
-            ("Dockerfile.frr", f"{INSTALL_DIR}/Dockerfile.frr"),
-            ("frr.conf.template", f"{INSTALL_DIR}/frr.conf.template"),
-            ("start-frr.sh", f"{INSTALL_DIR}/start-frr.sh")
+            ("ostg_docker/Dockerfile.frr", f"{INSTALL_DIR}/Dockerfile.frr"),
+            ("ostg_docker/frr.conf.template", f"{INSTALL_DIR}/frr.conf.template"),
+            ("ostg_docker/start-frr.sh", f"{INSTALL_DIR}/start-frr.sh")
         ]
         
         for local_file, remote_file in files_to_copy:
             if os.path.exists(local_file):
                 self.copy_file(local_file, remote_file)
-                self.run_command(f"chmod +x {remote_file}")
+                if remote_file.endswith(".sh"):
+                    self.run_command(f"chmod +x {remote_file}")
                 
         self.log("✓ OSTG installed successfully")
         
@@ -454,9 +455,20 @@ class OSTGInstaller:
         """Setup Docker FRR image"""
         self.log("Setting up Docker FRR image...")
         
-        # Build FRR Docker image
+        # Build FRR Docker image with platform specification for compatibility
         dockerfile_path = f"{INSTALL_DIR}/Dockerfile.frr"
-        self.run_command(f"docker build -t {DOCKER_IMAGE} -f {dockerfile_path} {INSTALL_DIR}")
+        build_context = INSTALL_DIR
+        
+        # Try to use buildx for multi-platform support if available
+        buildx_check = self.run_command("docker buildx version", check=False, capture_output=True)
+        if buildx_check.returncode == 0:
+            # Use buildx with linux/amd64 platform
+            self.log("Using docker buildx for platform-specific build...")
+            self.run_command(f"docker buildx build --platform linux/amd64 -t {DOCKER_IMAGE} -f {dockerfile_path} --load {build_context}")
+        else:
+            # Fallback to regular docker build
+            self.log("Using standard docker build...")
+            self.run_command(f"docker build -t {DOCKER_IMAGE} -f {dockerfile_path} {build_context}")
         
         # Create Docker network
         result = self.run_command(f"docker network create {DOCKER_NETWORK}", check=False)
@@ -619,10 +631,36 @@ WantedBy=timers.target
             else:
                 self.log("FRR daemons may not be running properly", "WARNING")
                 
-            # Check BGP and Zebra daemons
-            result = self.run_command(f"docker exec {test_container_name} ps aux | grep -E '(zebra|bgpd)' | wc -l", capture_output=True)
-            daemons_running = int(result.stdout.strip())
-            self.log(f"✓ {daemons_running} FRR daemons running (BGP and Zebra only)")
+            # Check all FRR daemons (mgmtd, zebra, bgpd, ospfd, isisd)
+            # Use pgrep inside the container to avoid pipe quoting issues
+            mgmtd_check = self.run_command(f"docker exec {test_container_name} pgrep -c mgmtd", check=False, capture_output=True)
+            zebra_check = self.run_command(f"docker exec {test_container_name} pgrep -c zebra", check=False, capture_output=True)
+            bgpd_check = self.run_command(f"docker exec {test_container_name} pgrep -c bgpd", check=False, capture_output=True)
+            ospfd_check = self.run_command(f"docker exec {test_container_name} pgrep -c ospfd", check=False, capture_output=True)
+            isisd_check = self.run_command(f"docker exec {test_container_name} pgrep -c isisd", check=False, capture_output=True)
+            
+            mgmtd_count = int(mgmtd_check.stdout.strip()) if mgmtd_check.returncode == 0 else 0
+            zebra_count = int(zebra_check.stdout.strip()) if zebra_check.returncode == 0 else 0
+            bgpd_count = int(bgpd_check.stdout.strip()) if bgpd_check.returncode == 0 else 0
+            ospfd_count = int(ospfd_check.stdout.strip()) if ospfd_check.returncode == 0 else 0
+            isisd_count = int(isisd_check.stdout.strip()) if isisd_check.returncode == 0 else 0
+            daemons_running = mgmtd_count + zebra_count + bgpd_count + ospfd_count + isisd_count
+            
+            if daemons_running > 0:
+                daemon_status = []
+                if mgmtd_count > 0:
+                    daemon_status.append(f"mgmtd: {mgmtd_count}")
+                if zebra_count > 0:
+                    daemon_status.append(f"zebra: {zebra_count}")
+                if bgpd_count > 0:
+                    daemon_status.append(f"bgpd: {bgpd_count}")
+                if ospfd_count > 0:
+                    daemon_status.append(f"ospfd: {ospfd_count}")
+                if isisd_count > 0:
+                    daemon_status.append(f"isisd: {isisd_count}")
+                self.log(f"✓ {daemons_running} FRR daemons running ({', '.join(daemon_status)})")
+            else:
+                self.log("Could not verify FRR daemons are running", "WARNING")
             
             # Test host networking connectivity
             result = self.run_command(f"docker exec {test_container_name} ping -c 1 8.8.8.8", check=False, capture_output=True)

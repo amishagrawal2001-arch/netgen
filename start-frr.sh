@@ -32,6 +32,12 @@ echo "Starting FRR daemons..."
 mkdir -p /var/run/frr
 chown frr:frr /var/run/frr 2>/dev/null || true
 
+# Ensure frr user is member of frrvty group at runtime
+if ! id -nG frr 2>/dev/null | grep -q "\\bfrrvty\\b"; then
+    groupadd -f frrvty 2>/dev/null || true
+    usermod -a -G frrvty frr 2>/dev/null || true
+fi
+
 # Function to start daemon safely with error checking
 start_daemon() {
     local daemon=$1
@@ -44,7 +50,14 @@ start_daemon() {
     
     echo "Starting $daemon..."
     # Start daemon and capture output
-    if $daemon_path -d -A 127.0.0.1 -f /etc/frr/frr.conf 2>&1; then
+    # staticd does not accept -f; start it without a config file argument
+    # mgmtd also doesn't use -f flag
+    if [ "$daemon" = "staticd" ] || [ "$daemon" = "mgmtd" ]; then
+        cmd="$daemon_path -d -A 127.0.0.1"
+    else
+        cmd="$daemon_path -d -A 127.0.0.1 -f /etc/frr/frr.conf"
+    fi
+    if $cmd 2>&1; then
         sleep 1
         # Verify it's actually running
         if pgrep -f "$daemon" > /dev/null; then
@@ -60,7 +73,13 @@ start_daemon() {
     fi
 }
 
-# Start zebra first (required for all other daemons)
+# Start mgmtd first (required for integrated-vtysh-config in FRR 10.0)
+if [ -f "/usr/lib/frr/mgmtd" ]; then
+    start_daemon "mgmtd" || echo "WARNING: mgmtd failed to start (integrated-vtysh-config may not work)"
+    sleep 2
+fi
+
+# Start zebra (required for all other daemons)
 start_daemon "zebra" || echo "CRITICAL: zebra failed to start!"
 
 # Wait for zebra to be ready
@@ -86,7 +105,10 @@ sleep 2
 # Verify critical daemons are running
 echo ""
 echo "=== FRR Daemon Status ==="
-for daemon in zebra staticd bgpd ospfd ospf6d isisd; do
+for daemon in mgmtd zebra staticd bgpd ospfd ospf6d isisd; do
+    if [ "$daemon" = "mgmtd" ] && [ ! -f "/usr/lib/frr/mgmtd" ]; then
+        continue  # Skip mgmtd if it doesn't exist
+    fi
     if pgrep -f "$daemon" > /dev/null; then
         echo "✅ $daemon is running (PID: $(pgrep -f "$daemon" | head -1))"
     else
@@ -98,6 +120,9 @@ echo ""
 
 # List of daemons to monitor (only critical ones)
 DAEMONS=("zebra" "staticd" "bgpd" "ospfd" "ospf6d" "isisd")
+if [ -f "/usr/lib/frr/mgmtd" ]; then
+    DAEMONS=("mgmtd" "${DAEMONS[@]}")
+fi
 
 # Keep container running and monitor daemons
 echo "Monitoring FRR daemons..."
