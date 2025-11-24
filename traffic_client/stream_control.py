@@ -20,66 +20,8 @@ class TrafficGenClientStreamControl:
 
     def setup_stream_section(self, parent_widget):
         layout = QVBoxLayout(parent_widget)
-
-        # --- Stream Control + Search Bar Layout ---
-        control_layout = QHBoxLayout()
-
-        self.start_stream_button = QPushButton()
-        self.start_stream_button.setIcon(QIcon(r_icon("icons/start.png")))
-        self.start_stream_button.setIconSize(QSize(16, 16))
-        self.start_stream_button.setToolTip("Start Selected streams")
-        self.start_stream_button.clicked.connect(self.start_stream)
-        control_layout.addWidget(self.start_stream_button)
-
-        self.stop_stream_button = QPushButton()
-        self.stop_stream_button.setIcon(QIcon(r_icon("icons/stop.png")))
-        self.stop_stream_button.setIconSize(QSize(16, 16))
-        self.stop_stream_button.setToolTip("Stop Selected streams")
-        self.stop_stream_button.clicked.connect(self.stop_stream)
-        control_layout.addWidget(self.stop_stream_button)
-
-        # Single Start/Stop ALL toggle
-        self.all_streams_toggle_btn = QPushButton()
-        self.all_streams_toggle_btn.setIconSize(QSize(16, 16))
-        self.all_streams_toggle_btn.setToolTip("Start ALL enabled streams")
-        self.all_streams_toggle_btn.clicked.connect(self._toggle_all_streams)
-
-        # 👇 set a default icon right away (so it’s visible at first paint)
-        _default_icon = QIcon(r_icon("icons/startallstream.png"))
-        if _default_icon.isNull():
-            # fallback to text if the file isn't found (helps during dev)
-            self.all_streams_toggle_btn.setText("Start All")
-        else:
-            self.all_streams_toggle_btn.setIcon(_default_icon)
-
-        control_layout.addWidget(self.all_streams_toggle_btn)
-
-        # Let the UI settle, then compute the real state (running/not running)
-        QTimer.singleShot(0, self.update_all_streams_toggle_ui)
-
-        self.apply_stream_button = QPushButton()
-        self.apply_stream_button.setIcon(QIcon(r_icon("icons/apply.png")))
-        self.apply_stream_button.setIconSize(QSize(16, 16))
-        self.apply_stream_button.setToolTip("Apply stream changes and restart traffic")
-        self.apply_stream_button.clicked.connect(self.apply_stream)
-        control_layout.addWidget(self.apply_stream_button)
-
-        control_layout.addStretch(1)
-
-        self.search_box = QLineEdit()
-        self.search_box.setPlaceholderText("Search...")
-        self.search_box.setFixedWidth(200)
-        self.search_box.returnPressed.connect(self.update_stream_table)
-        self.search_box.textChanged.connect(self.update_stream_table)
-        control_layout.addWidget(self.search_box)
-
-        clear_search_btn = QPushButton("❌")
-        clear_search_btn.setFixedWidth(30)
-        clear_search_btn.setToolTip("Clear search")
-        clear_search_btn.clicked.connect(lambda: self.search_box.setText(""))
-        control_layout.addWidget(clear_search_btn)
-
-        layout.addLayout(control_layout)
+        layout.setContentsMargins(4, 4, 4, 4)  # Balanced padding to match left side (TGEN)
+        layout.setSpacing(10)  # Consistent spacing between elements
 
         # --- Stream Table ---
         self.stream_table = QTableWidget()
@@ -96,32 +38,152 @@ class TrafficGenClientStreamControl:
         self.stream_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.stream_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
 
+        # Table styling for professional appearance (muted color scheme)
+        self.stream_table.setAlternatingRowColors(True)  # Alternating row colors for better readability
+        header = self.stream_table.horizontalHeader()
+        header.setDefaultSectionSize(25)  # Header height
+        header.setHighlightSections(False)  # Don't highlight header sections on click
+
+        # Professional styling with muted color scheme
+        self.stream_table.setStyleSheet("""
+            QTableWidget {
+                background-color: #ffffff;
+                alternate-background-color: #f7f8fa;
+                border: 1px solid #d1d5db;
+                border-radius: 4px;
+                font-size: 11px;
+                outline: none;
+                color: #374151;
+                gridline-color: #e5e7eb;
+            }
+            QTableWidget::item {
+                padding: 3px;
+                border: none;
+            }
+            QTableWidget::item:selected {
+                background-color: #5b7fa8;
+                color: #ffffff;
+            }
+            QTableWidget::item:hover:!selected {
+                background-color: #f0f2f5;
+            }
+            QTableWidget::item:selected:hover {
+                background-color: #4a6b8a;
+            }
+            QHeaderView::section {
+                background-color: #f3f4f6;
+                padding: 6px 6px;
+                border: 1px solid #d1d5db;
+                border-left: none;
+                border-top: none;
+                font-weight: 600;
+                font-size: 11px;
+                color: #4b5563;
+            }
+            QHeaderView::section:first {
+                border-left: 1px solid #d1d5db;
+            }
+        """)
+
         self.stream_table.itemChanged.connect(self.handle_inline_edit)
         layout.addWidget(self.stream_table)
 
-        # --- Stream Action Buttons ---
+        # --- All Buttons in Same Row (Action buttons on left, Control buttons centered) ---
         button_layout = QHBoxLayout()
+        button_layout.setAlignment(Qt.AlignLeft)
+        button_layout.setSpacing(5)  # Spacing between buttons
+        button_layout.setContentsMargins(0, 5, 0, 0)  # Top margin to separate from table
 
-        add_stream_button = QPushButton(" Add")
+        # Action buttons (left side)
+        add_stream_button = QPushButton()
         add_stream_button.setIcon(QIcon(r_icon("icons/add.png")))
         add_stream_button.setIconSize(QSize(16, 16))
+        add_stream_button.setFixedSize(32, 28)
+        add_stream_button.setToolTip("Add Stream")
         add_stream_button.clicked.connect(self.open_add_stream_dialog)
         button_layout.addWidget(add_stream_button)
 
-        edit_stream_button = QPushButton(" Edit")
+        edit_stream_button = QPushButton()
         edit_stream_button.setIcon(QIcon(r_icon("icons/edit.png")))
         edit_stream_button.setIconSize(QSize(16, 16))
+        edit_stream_button.setFixedSize(32, 28)
+        edit_stream_button.setToolTip("Edit Stream")
         edit_stream_button.clicked.connect(self.edit_selected_stream)
         button_layout.addWidget(edit_stream_button)
 
-        remove_stream_button = QPushButton(" Delete")
+        remove_stream_button = QPushButton()
         remove_stream_button.setIcon(QIcon(r_icon("icons/Trash.png")))
         remove_stream_button.setIconSize(QSize(16, 16))
+        remove_stream_button.setFixedSize(32, 28)
+        remove_stream_button.setToolTip("Delete Stream")
         remove_stream_button.clicked.connect(self.remove_selected_stream)
         button_layout.addWidget(remove_stream_button)
 
-
+        # Add stretch to push control buttons to center
         button_layout.addStretch(1)
+
+        # Control buttons (centered)
+        self.start_stream_button = QPushButton()
+        self.start_stream_button.setIcon(QIcon(r_icon("icons/start.png")))
+        self.start_stream_button.setIconSize(QSize(16, 16))
+        self.start_stream_button.setFixedSize(32, 28)
+        self.start_stream_button.setToolTip("Start Selected streams")
+        self.start_stream_button.clicked.connect(self.start_stream)
+        button_layout.addWidget(self.start_stream_button)
+
+        self.stop_stream_button = QPushButton()
+        self.stop_stream_button.setIcon(QIcon(r_icon("icons/stop.png")))
+        self.stop_stream_button.setIconSize(QSize(16, 16))
+        self.stop_stream_button.setFixedSize(32, 28)
+        self.stop_stream_button.setToolTip("Stop Selected streams")
+        self.stop_stream_button.clicked.connect(self.stop_stream)
+        button_layout.addWidget(self.stop_stream_button)
+
+        # Single Start/Stop ALL toggle
+        self.all_streams_toggle_btn = QPushButton()
+        self.all_streams_toggle_btn.setIconSize(QSize(16, 16))
+        self.all_streams_toggle_btn.setFixedSize(32, 28)
+        self.all_streams_toggle_btn.setToolTip("Start ALL enabled streams")
+        self.all_streams_toggle_btn.clicked.connect(self._toggle_all_streams)
+
+        # 👇 set a default icon right away (so it's visible at first paint)
+        _default_icon = QIcon(r_icon("icons/startallstream.png"))
+        if _default_icon.isNull():
+            # fallback to text if the file isn't found (helps during dev)
+            self.all_streams_toggle_btn.setText("Start All")
+        else:
+            self.all_streams_toggle_btn.setIcon(_default_icon)
+
+        button_layout.addWidget(self.all_streams_toggle_btn)
+
+        # Let the UI settle, then compute the real state (running/not running)
+        QTimer.singleShot(0, self.update_all_streams_toggle_ui)
+
+        self.apply_stream_button = QPushButton()
+        self.apply_stream_button.setIcon(QIcon(r_icon("icons/apply.png")))
+        self.apply_stream_button.setIconSize(QSize(16, 16))
+        self.apply_stream_button.setFixedSize(32, 28)
+        self.apply_stream_button.setToolTip("Apply stream changes and restart traffic")
+        self.apply_stream_button.clicked.connect(self.apply_stream)
+        button_layout.addWidget(self.apply_stream_button)
+
+        # Add stretch before search box
+        button_layout.addStretch(1)
+
+        # Search box (right side)
+        self.search_box = QLineEdit()
+        self.search_box.setPlaceholderText("Search...")
+        self.search_box.setFixedWidth(200)
+        self.search_box.returnPressed.connect(self.update_stream_table)
+        self.search_box.textChanged.connect(self.update_stream_table)
+        button_layout.addWidget(self.search_box)
+
+        clear_search_btn = QPushButton("❌")
+        clear_search_btn.setFixedWidth(30)
+        clear_search_btn.setToolTip("Clear search")
+        clear_search_btn.clicked.connect(lambda: self.search_box.setText(""))
+        button_layout.addWidget(clear_search_btn)
+
         layout.addLayout(button_layout)
 
     def setup_stream_start_stop_buttons(self):

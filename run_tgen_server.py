@@ -7007,6 +7007,167 @@ def configure_bgp():
         logging.error(f"[BGP CONFIGURE ERROR] {e}")
         return jsonify({"error": str(e)}), 500
 
+@app.route("/api/device/vxlan/remove", methods=["POST"])
+def remove_vxlan_tunnel():
+    """Remove a single VXLAN tunnel from a device."""
+    data = request.get_json()
+    if not data:
+        return jsonify({"error": "Missing VXLAN tunnel removal data"}), 400
+    
+    try:
+        device_id = data.get("device_id")
+        device_name = data.get("device_name", "")
+        vni = data.get("vni")
+        vxlan_config = data.get("vxlan_config", {})
+        
+        if not device_id:
+            return jsonify({"error": "Missing device_id"}), 400
+        
+        if not vni:
+            return jsonify({"error": "Missing VNI"}), 400
+        
+        logging.info(f"[VXLAN REMOVE] Removing tunnel VNI {vni} for device {device_name} (ID: {device_id})")
+        
+        # Get device from database
+        device_info = device_db.get_device(device_id)
+        if not device_info:
+            return jsonify({"error": f"Device {device_name} not found in database"}), 404
+        
+        # Get FRR container info
+        from utils.frr_docker import FRRDockerManager
+        frr_manager = FRRDockerManager()
+        container_name = frr_manager._get_container_name(device_id, device_name)
+        
+        try:
+            container = frr_manager.client.containers.get(container_name)
+        except Exception:
+            container = None
+            logging.warning(f"[VXLAN REMOVE] Container {container_name} not found, will only remove from database")
+        
+        # Tear down the VXLAN tunnel
+        try:
+            import utils.vxlan as vxlan_utils
+            vxlan_utils.tear_down_vxlan_interface(
+                device_id,
+                vxlan_config,
+                container_name=container_name if container else None,
+                frr_manager=frr_manager if container else None,
+            )
+            logging.info(f"[VXLAN REMOVE] Successfully tore down VXLAN tunnel VNI {vni} for device {device_name}")
+        except Exception as vxlan_exc:
+            logging.warning(f"[VXLAN REMOVE] Failed to tear down VXLAN tunnel VNI {vni}: {vxlan_exc}")
+            # Continue to remove from database even if tear down failed
+        
+        # Remove tunnel from device's vxlan_config in database
+        try:
+            current_vxlan_config = device_info.get("vxlan_config", {})
+            
+            # Parse if string
+            if isinstance(current_vxlan_config, str):
+                try:
+                    current_vxlan_config = json.loads(current_vxlan_config) if current_vxlan_config else {}
+                except Exception:
+                    current_vxlan_config = {}
+            
+            # Handle multiple tunnels format
+            if isinstance(current_vxlan_config, dict) and "tunnels" in current_vxlan_config:
+                tunnels = current_vxlan_config.get("tunnels", [])
+                # Remove tunnel with matching VNI
+                updated_tunnels = [t for t in tunnels if isinstance(t, dict) and t.get("vni") != vni]
+                
+                if len(updated_tunnels) < len(tunnels):
+                    # Tunnel was removed
+                    if updated_tunnels:
+                        # Update with remaining tunnels
+                        current_vxlan_config["tunnels"] = updated_tunnels
+                        
+                        # Update vxlan_interface to reflect only remaining tunnels
+                        remaining_interfaces = []
+                        for tunnel in updated_tunnels:
+                            tunnel_iface = tunnel.get("vxlan_interface")
+                            if tunnel_iface:
+                                remaining_interfaces.append(tunnel_iface)
+                        
+                        update_data = {"vxlan_config": json.dumps(current_vxlan_config)}
+                        if remaining_interfaces:
+                            update_data["vxlan_interface"] = ", ".join(remaining_interfaces)
+                        else:
+                            update_data["vxlan_interface"] = None
+                        
+                        device_db.update_device(device_id, update_data)
+                        logging.info(f"[VXLAN REMOVE] Removed tunnel VNI {vni} from device {device_name}, {len(updated_tunnels)} tunnel(s) remaining")
+                    else:
+                        # No tunnels left, remove VXLAN config entirely
+                        # Also remove VXLAN from protocols list
+                        protocols = device_info.get("protocols", [])
+                        if isinstance(protocols, str):
+                            protocols = [p.strip() for p in protocols.split(",") if p.strip()]
+                        elif not isinstance(protocols, list):
+                            protocols = []
+                        
+                        if "VXLAN" in protocols:
+                            protocols.remove("VXLAN")
+                        
+                        # Convert back to string if it was originally a string
+                        if isinstance(device_info.get("protocols"), str):
+                            protocols_str = ",".join(protocols) if protocols else ""
+                        else:
+                            protocols_str = protocols
+                        
+                        device_db.update_device(device_id, {
+                            "vxlan_config": None,
+                            "vxlan_interface": None,
+                            "vxlan_state": "Disabled",
+                            "protocols": protocols_str
+                        })
+                        logging.info(f"[VXLAN REMOVE] Removed last tunnel VNI {vni} from device {device_name}, VXLAN config cleared and removed from protocols")
+                else:
+                    logging.warning(f"[VXLAN REMOVE] Tunnel VNI {vni} not found in device {device_name} config")
+            elif isinstance(current_vxlan_config, dict) and current_vxlan_config.get("vni") == vni:
+                # Old single tunnel format - remove entire config
+                # Also remove VXLAN from protocols list
+                protocols = device_info.get("protocols", [])
+                if isinstance(protocols, str):
+                    protocols = [p.strip() for p in protocols.split(",") if p.strip()]
+                elif not isinstance(protocols, list):
+                    protocols = []
+                
+                if "VXLAN" in protocols:
+                    protocols.remove("VXLAN")
+                
+                # Convert back to string if it was originally a string
+                if isinstance(device_info.get("protocols"), str):
+                    protocols_str = ",".join(protocols) if protocols else ""
+                else:
+                    protocols_str = protocols
+                
+                device_db.update_device(device_id, {
+                    "vxlan_config": None,
+                    "vxlan_interface": None,
+                    "vxlan_state": "Disabled",
+                    "protocols": protocols_str
+                })
+                logging.info(f"[VXLAN REMOVE] Removed single tunnel VNI {vni} from device {device_name}, VXLAN config cleared and removed from protocols")
+            else:
+                logging.warning(f"[VXLAN REMOVE] Tunnel VNI {vni} not found in device {device_name} config")
+        except Exception as db_exc:
+            logging.error(f"[VXLAN REMOVE] Failed to update database: {db_exc}")
+            return jsonify({"error": f"Failed to update database: {str(db_exc)}"}), 500
+        
+        return jsonify({
+            "success": True,
+            "message": f"Successfully removed VXLAN tunnel VNI {vni} for device {device_name}",
+            "device_id": device_id,
+            "device_name": device_name,
+            "vni": vni
+        }), 200
+        
+    except Exception as e:
+        logging.error(f"[VXLAN REMOVE ERROR] {e}")
+        import traceback
+        logging.error(f"[VXLAN REMOVE ERROR] Traceback: {traceback.format_exc()}")
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/api/device/bgp/stop", methods=["POST"])
 def stop_bgp():
     """Stop BGP protocol for a specific device by shutting down BGP neighbors."""
@@ -9013,16 +9174,23 @@ def get_interfaces():
     """
     API endpoint to fetch dynamic network interfaces with traffic statistics.
     Excludes VLAN interfaces to prevent them from appearing as separate ports.
+    Also includes VXLAN bridges and interfaces from FRR containers.
     """
     interfaces = []
     try:
-        # Use psutil to fetch network interface details
+        # Use psutil to fetch network interface details from host
+        import re
         for name, stats in psutil.net_if_stats().items():
             # Skip VLAN interfaces (vlan*), loopback (lo*), and other virtual interfaces
+            # Skip VXLAN-style bridges (br followed by numbers) on host - these come from containers
+            # Skip VXLAN interfaces (vx* followed by numbers and dashes) on host - these come from containers
+            is_vxlan_bridge = re.match(r'^br\d+$', name)  # Matches br5000, br5001, etc.
+            is_vxlan_interface = re.match(r'^vx\d+-\w+$', name)  # Matches vx5000-9d751a, vx5001-abc123, etc.
+            
             if (name.startswith('vlan') or 
                 name.startswith('lo') or 
                 name.startswith('docker') or 
-                name.startswith('br-') or 
+                name.startswith('br-') or  # Docker bridges
                 name.startswith('bridge') or
                 name.startswith('virbr') or
                 name.startswith('veth') or
@@ -9031,7 +9199,9 @@ def get_interfaces():
                 name.startswith('utun') or
                 name.startswith('awdl') or
                 name.startswith('llw') or
-                name.startswith('anpi')):
+                name.startswith('anpi') or
+                is_vxlan_bridge or  # Skip VXLAN bridges on host (they come from containers)
+                is_vxlan_interface):  # Skip VXLAN interfaces on host (they come from containers)
                 continue
                 
             is_up = stats.isup
@@ -9054,6 +9224,119 @@ def get_interfaces():
                 "received_bytes": received_bytes,
                 "errors": errors,
             })
+        
+        # Also fetch interfaces from FRR containers (VXLAN bridges and VXLAN interfaces)
+        try:
+            import docker
+            docker_client = docker.from_env()
+            
+            # Get all running FRR containers (both ostg-frr-* and dhcp-frr-*)
+            all_containers = docker_client.containers.list(filters={"status": "running"})
+            frr_containers = [
+                c for c in all_containers 
+                if c.name.startswith("ostg-frr-") or c.name.startswith("dhcp-frr-")
+            ]
+            
+            for container in frr_containers:
+                try:
+                    # Get interfaces from container using ip link show
+                    result = container.exec_run(["ip", "link", "show"], user="root")
+                    if result.exit_code == 0:
+                        output = result.output.decode('utf-8')
+                        # Parse interface names from output
+                        import re
+                        # Match interface names (e.g., "123: br5000: <BROADCAST,MULTICAST,UP>")
+                        interface_pattern = r'^\d+:\s+([^:]+):\s+<([^>]+)>'
+                        vxlan_interfaces_found = []
+                        for line in output.split('\n'):
+                            match = re.match(interface_pattern, line.strip())
+                            if match:
+                                iface_name = match.group(1)
+                                iface_flags = match.group(2)
+                                
+                                # Only include VXLAN bridges (br*) and VXLAN interfaces (vx*)
+                                if iface_name.startswith('br') and not iface_name.startswith('br-'):
+                                    vxlan_interfaces_found.append(iface_name)
+                                    # VXLAN bridge
+                                    is_up = 'UP' in iface_flags or 'LOWER_UP' in iface_flags
+                                    
+                                    # Get IP address from container
+                                    ip_result = container.exec_run(
+                                        ["ip", "-4", "addr", "show", iface_name],
+                                        user="root"
+                                    )
+                                    ip_addresses = []
+                                    if ip_result.exit_code == 0:
+                                        ip_output = ip_result.output.decode('utf-8')
+                                        # Extract IP address
+                                        ip_match = re.search(r'inet\s+([^\s]+)', ip_output)
+                                        if ip_match:
+                                            ip_addresses.append(ip_match.group(1))
+                                    
+                                    # Get MTU
+                                    mtu_result = container.exec_run(
+                                        ["ip", "link", "show", iface_name],
+                                        user="root"
+                                    )
+                                    mtu = 1500  # Default
+                                    if mtu_result.exit_code == 0:
+                                        mtu_output = mtu_result.output.decode('utf-8')
+                                        mtu_match = re.search(r'mtu\s+(\d+)', mtu_output)
+                                        if mtu_match:
+                                            mtu = int(mtu_match.group(1))
+                                    
+                                    interfaces.append({
+                                        "name": iface_name,
+                                        "status": "up" if is_up else "down",
+                                        "mtu": mtu,
+                                        "speed": "Unknown",
+                                        "ip_addresses": ip_addresses,
+                                        "tx": 0,
+                                        "rx": 0,
+                                        "sent_bytes": 0,
+                                        "received_bytes": 0,
+                                        "errors": 0,
+                                        "container": container.name,  # Mark as container interface
+                                    })
+                                elif iface_name.startswith('vx'):
+                                    # VXLAN interface
+                                    vxlan_interfaces_found.append(iface_name)
+                                    is_up = 'UP' in iface_flags or 'LOWER_UP' in iface_flags
+                                    
+                                    # Get MTU
+                                    mtu_result = container.exec_run(
+                                        ["ip", "link", "show", iface_name],
+                                        user="root"
+                                    )
+                                    mtu = 1450  # Default for VXLAN
+                                    if mtu_result.exit_code == 0:
+                                        mtu_output = mtu_result.output.decode('utf-8')
+                                        mtu_match = re.search(r'mtu\s+(\d+)', mtu_output)
+                                        if mtu_match:
+                                            mtu = int(mtu_match.group(1))
+                                    
+                                    interfaces.append({
+                                        "name": iface_name,
+                                        "status": "up" if is_up else "down",
+                                        "mtu": mtu,
+                                        "speed": "Unknown",
+                                        "ip_addresses": [],
+                                        "tx": 0,
+                                        "rx": 0,
+                                        "sent_bytes": 0,
+                                        "received_bytes": 0,
+                                        "errors": 0,
+                                        "container": container.name,  # Mark as container interface
+                                    })
+                        
+                        if vxlan_interfaces_found:
+                            logging.debug(f"[INTERFACES] Found {len(vxlan_interfaces_found)} VXLAN interface(s) in container {container.name}: {', '.join(vxlan_interfaces_found)}")
+                except Exception as e:
+                    logging.warning(f"Error fetching interfaces from container {container.name}: {e}")
+                    continue
+        except Exception as e:
+            logging.warning(f"Error fetching interfaces from FRR containers: {e}")
+        
         return jsonify(interfaces)
     except Exception as e:
         logging.error(f"Error fetching interfaces: {e}")

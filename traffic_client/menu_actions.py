@@ -743,7 +743,17 @@ class TrafficGenClientMenuAction():
 
             # Load removed servers and removed interfaces
             self.removed_servers = set(session_data.get("removed_servers", []))
-            self.removed_interfaces = set(session_data.get("removed_interfaces", []))
+            removed_interfaces_raw = session_data.get("removed_interfaces", [])
+            
+            # Clean up old format entries (e.g., " - ens14f1" without TG ID)
+            # These are invalid and should be removed
+            self.removed_interfaces = set()
+            for iface in removed_interfaces_raw:
+                # Only keep entries that have the correct format "TG X - portname"
+                if iface and "TG " in iface and " - " in iface and not iface.startswith(" - "):
+                    self.removed_interfaces.add(iface)
+                else:
+                    print(f"[DEBUG LOAD] Skipping invalid removed interface format: {iface}")
             
             # Always preserve original servers from session.json (for saving later in CLI mode)
             session_servers = session_data.get("servers", [])

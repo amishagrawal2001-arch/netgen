@@ -1559,6 +1559,8 @@ class DevicesTab(QWidget):
     def setup_devices_subtab(self):
         """Setup the Devices sub-tab with device table and controls."""
         layout = QVBoxLayout(self.devices_subtab)
+        layout.setContentsMargins(4, 4, 4, 4)  # Balanced padding to match left side (TGEN)
+        layout.setSpacing(10)  # Consistent spacing between elements
 
         # columns
         # Simplified device table - only essential device info
@@ -1588,6 +1590,53 @@ class DevicesTab(QWidget):
         # Enable inline editing
         self.devices_table.setEditTriggers(QTableWidget.DoubleClicked | QTableWidget.EditKeyPressed)
         self.devices_table.setSelectionBehavior(QTableWidget.SelectItems)
+        
+        # Table styling for professional appearance (muted color scheme)
+        self.devices_table.setAlternatingRowColors(True)  # Alternating row colors for better readability
+        header = self.devices_table.horizontalHeader()
+        header.setDefaultSectionSize(25)  # Header height
+        header.setHighlightSections(False)  # Don't highlight header sections on click
+
+        # Professional styling with muted color scheme
+        self.devices_table.setStyleSheet("""
+            QTableWidget {
+                background-color: #ffffff;
+                alternate-background-color: #f7f8fa;
+                border: 1px solid #d1d5db;
+                border-radius: 4px;
+                font-size: 11px;
+                outline: none;
+                color: #374151;
+                gridline-color: #e5e7eb;
+            }
+            QTableWidget::item {
+                padding: 3px;
+                border: none;
+            }
+            QTableWidget::item:selected {
+                background-color: #5b7fa8;
+                color: #ffffff;
+            }
+            QTableWidget::item:hover:!selected {
+                background-color: #f0f2f5;
+            }
+            QTableWidget::item:selected:hover {
+                background-color: #4a6b8a;
+            }
+            QHeaderView::section {
+                background-color: #f3f4f6;
+                padding: 6px 6px;
+                border: 1px solid #d1d5db;
+                border-left: none;
+                border-top: none;
+                font-weight: 600;
+                font-size: 11px;
+                color: #4b5563;
+            }
+            QHeaderView::section:first {
+                border-left: 1px solid #d1d5db;
+            }
+        """)
         
         # Connect cell change event for validation and updates
         self.devices_table.cellChanged.connect(self.on_cell_changed)
@@ -2374,6 +2423,35 @@ class DevicesTab(QWidget):
         if hasattr(self, "vxlan_handler") and self.vxlan_handler:
             self.vxlan_handler.refresh_vxlan_table()
         self.update_device_table(self.main_window.all_devices)
+        
+        # Refresh interface list from server to show newly created VXLAN/bridge interfaces
+        # Add a small delay to ensure VXLAN interfaces are fully created in containers
+        if success_count > 0 and hasattr(self.main_window, "update_server_tree"):
+            print(f"[VXLAN APPLY] Scheduling interface list refresh from server after VXLAN tunnel creation (delay: 500ms)")
+            from PyQt5.QtCore import QTimer
+            # Define a callback function to ensure it's called correctly
+            def refresh_interfaces():
+                print(f"[VXLAN APPLY] Executing interface list refresh callback")
+                try:
+                    if hasattr(self.main_window, "update_server_tree"):
+                        # Clear cached interfaces for all servers to force fresh fetch
+                        # This ensures newly created VXLAN/bridge interfaces are added to the tree
+                        if hasattr(self.main_window, "server_interfaces"):
+                            for server in self.main_window.server_interfaces:
+                                if "interfaces" in server:
+                                    del server["interfaces"]
+                                    print(f"[VXLAN APPLY] Cleared cached interfaces for server: {server.get('address', 'unknown')}")
+                        
+                        # Now refresh the server tree with fresh data
+                        self.main_window.update_server_tree()
+                        print(f"[VXLAN APPLY] Interface list refresh completed")
+                    else:
+                        print(f"[VXLAN APPLY] WARNING: update_server_tree not available in callback")
+                except Exception as e:
+                    print(f"[VXLAN APPLY] ERROR during interface refresh: {e}")
+                    import logging
+                    logging.error(f"[VXLAN APPLY] ERROR during interface refresh: {e}", exc_info=True)
+            QTimer.singleShot(500, refresh_interfaces)
 
     def prompt_edit_bgp(self):
         """Edit BGP configuration for the selected neighbor entry."""
@@ -3360,6 +3438,40 @@ class DevicesTab(QWidget):
         dialog = MultiDeviceResultsDialog(title, summary, results, self)
         dialog.exec_()
         
+        # Check if any applied devices had VXLAN configuration
+        vxlan_applied = False
+        if successful_count > 0:
+            for row in selected_rows:
+                device_name = self.devices_table.item(row, self.COL["Device Name"]).text()
+                # Find device in all_devices data structure
+                device_info = None
+                for iface, devices in self.main_window.all_devices.items():
+                    for device in devices:
+                        if device.get("Device Name") == device_name:
+                            device_info = device
+                            break
+                    if device_info:
+                        break
+                if device_info:
+                    protocols = device_info.get("protocols", [])
+                    vxlan_config = device_info.get("vxlan_config", {})
+                    # Check for VXLAN in multiple formats
+                    has_vxlan = False
+                    if "VXLAN" in protocols:
+                        has_vxlan = True
+                    elif isinstance(vxlan_config, dict):
+                        # Check for new format: {"tunnels": [...]}
+                        if "tunnels" in vxlan_config and len(vxlan_config.get("tunnels", [])) > 0:
+                            has_vxlan = True
+                        # Check for old format: single dict with vni key
+                        elif vxlan_config.get("vni") or len(vxlan_config) > 0:
+                            has_vxlan = True
+                    
+                    if has_vxlan:
+                        print(f"[DEBUG APPLY] Detected VXLAN in device {device_name}")
+                        vxlan_applied = True
+                        break
+        
         # Save session after device application to persist status changes
         if successful_count > 0 and hasattr(self.main_window, "save_session"):
             print(f"[DEBUG APPLY] Saving session after successful device application ({successful_count} device(s) applied)")
@@ -3368,6 +3480,11 @@ class DevicesTab(QWidget):
                 print(f"[DEBUG APPLY] ✅ Session saved successfully after applying {successful_count} device(s)")
             except Exception as save_exc:
                 print(f"[DEBUG APPLY] ⚠️ Failed to save session: {save_exc}")
+        
+        # Refresh interface list from server if VXLAN was applied
+        if vxlan_applied and hasattr(self.main_window, "update_server_tree"):
+            print(f"[DEBUG APPLY] Refreshing interface list from server after VXLAN tunnel creation")
+            self.main_window.update_server_tree()
     
     def ping_selected_device(self):
         """Ping the selected device(s) after ensuring ARP has been resolved."""
@@ -5827,6 +5944,11 @@ class DevicesTab(QWidget):
                     continue
 
                 for device in devices:
+                    # Skip if device is not a dictionary (safety check)
+                    if not isinstance(device, dict):
+                        logging.warning(f"[DEVICE TABLE] Skipping non-dict device entry: {type(device)}")
+                        continue
+                    
                     row = self.devices_table.rowCount()
                     self.devices_table.insertRow(row)
 
@@ -6106,6 +6228,11 @@ class DevicesTab(QWidget):
         if removed_devices:
             if hasattr(self, "dhcp_handler") and self.dhcp_handler:
                 QTimer.singleShot(200, self.dhcp_handler.refresh_dhcp_status)
+
+            # Refresh interface list from server to remove deleted VXLAN/bridge interfaces
+            if hasattr(self.main_window, "update_server_tree"):
+                print(f"[REMOVE DEVICE] Refreshing interface list from server after device removal")
+                self.main_window.update_server_tree()
 
             if hasattr(self.main_window, "save_session"):
                 self.main_window.save_session()
@@ -6657,6 +6784,32 @@ class DevicesTab(QWidget):
                     print(f"  {result}")
                 print(f"{'='*60}\n")
             
+            # Check if any applied devices had VXLAN configuration (before worker is deleted)
+            vxlan_applied = False
+            if successful_count > 0 and hasattr(self, 'multi_device_apply_worker'):
+                try:
+                    for row, device_info in self.multi_device_apply_worker.devices_to_apply:
+                        protocols = device_info.get("protocols", [])
+                        vxlan_config = device_info.get("vxlan_config", {})
+                        # Check for VXLAN in multiple formats
+                        has_vxlan = False
+                        if "VXLAN" in protocols:
+                            has_vxlan = True
+                        elif isinstance(vxlan_config, dict):
+                            # Check for new format: {"tunnels": [...]}
+                            if "tunnels" in vxlan_config and len(vxlan_config.get("tunnels", [])) > 0:
+                                has_vxlan = True
+                            # Check for old format: single dict with vni key
+                            elif vxlan_config.get("vni") or len(vxlan_config) > 0:
+                                has_vxlan = True
+                        
+                        if has_vxlan:
+                            print(f"[MULTI DEVICE APPLY] Detected VXLAN in device {device_info.get('Device Name', 'Unknown')}")
+                            vxlan_applied = True
+                            break
+                except Exception as e:
+                    print(f"[MULTI DEVICE APPLY] Error checking for VXLAN: {e}")
+            
             # Save session after device application to persist status changes
             if successful_count > 0 and hasattr(self.main_window, "save_session"):
                 print(f"[MULTI DEVICE APPLY] Saving session after successful device application ({successful_count} device(s) applied)")
@@ -6665,6 +6818,11 @@ class DevicesTab(QWidget):
                     print(f"[MULTI DEVICE APPLY] ✅ Session saved successfully after applying {successful_count} device(s)")
                 except Exception as save_exc:
                     print(f"[MULTI DEVICE APPLY] ⚠️ Failed to save session: {save_exc}")
+            
+            # Refresh interface list from server if VXLAN was applied
+            if vxlan_applied and hasattr(self.main_window, "update_server_tree"):
+                print(f"[MULTI DEVICE APPLY] Refreshing interface list from server after VXLAN tunnel creation")
+                self.main_window.update_server_tree()
             
             # Clean up worker reference - ensure thread is stopped first
             if hasattr(self, 'multi_device_apply_worker'):

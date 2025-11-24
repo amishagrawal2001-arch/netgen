@@ -1,8 +1,8 @@
 # Comprehensive FRR Docker Image for OSTG with Full Features
 FROM debian:bookworm-slim
 
-ARG FRR_VERSION=10.0
-ARG FRR_TAG=frr-10.0
+ARG FRR_VERSION=10.5
+ARG FRR_TAG=frr-10.5
 ENV DEBIAN_FRONTEND=noninteractive
 
 # Base runtime and build dependencies
@@ -21,18 +21,18 @@ RUN apt-get update && \
         isc-dhcp-client dnsmasq && \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
-# Install FRR 10.x from official FRRouting APT repository (includes required libyang2)
+# Install FRR 10.5.0 from official FRRouting APT repository (includes required libyang2)
 RUN set -eux; \
     apt-get update; \
     apt-get install -y --no-install-recommends curl gnupg ca-certificates; \
     mkdir -p /usr/share/keyrings; \
     curl -fsSL http://deb.frrouting.org/frr/keys.asc | gpg --dearmor > /usr/share/keyrings/frrouting-archive.gpg; \
-    echo "deb [signed-by=/usr/share/keyrings/frrouting-archive.gpg] http://deb.frrouting.org/frr bookworm frr-${FRR_VERSION}" > /etc/apt/sources.list.d/frr.list; \
+    echo "deb [signed-by=/usr/share/keyrings/frrouting-archive.gpg] http://deb.frrouting.org/frr bookworm frr-stable" > /etc/apt/sources.list.d/frr.list; \
     apt-get update; \
     DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
-      frr=${FRR_VERSION}* \
-      frr-pythontools=${FRR_VERSION}* \
-      frr-doc=${FRR_VERSION}*; \
+      frr \
+      frr-pythontools \
+      frr-doc; \
     apt-get clean && rm -rf /var/lib/apt/lists/*
 
 # Copy FRR configuration template

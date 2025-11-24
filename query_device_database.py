@@ -130,6 +130,37 @@ def print_device_info(device: Dict, detailed: bool = False):
         print(f"   ISIS Neighbors: {device.get('isis_neighbors', 'N/A')}")
         print(f"   ISIS Areas: {device.get('isis_areas', 'N/A')}")
         print(f"   Last ISIS Check: {device.get('last_isis_check', 'N/A')}")
+        # VXLAN details (print if any VXLAN signal exists, even if config is empty)
+        vxlan_config = device.get("vxlan_config")
+        vxlan_state = device.get("vxlan_state")
+        vxlan_iface = device.get("vxlan_interface")
+        vxlan_enabled_flag = device.get("vxlan_enabled")
+        protocols_list = device.get("protocols") or []
+        has_vxlan_protocol = False
+        try:
+            if isinstance(protocols_list, str):
+                # Could be JSON string or comma-separated
+                try:
+                    protocols_list = json.loads(protocols_list)
+                except Exception:
+                    protocols_list = [p.strip() for p in protocols_list.split(",") if p.strip()]
+            has_vxlan_protocol = "VXLAN" in protocols_list
+        except Exception:
+            has_vxlan_protocol = False
+        if vxlan_config is not None or vxlan_state or vxlan_iface or vxlan_enabled_flag or has_vxlan_protocol:
+            try:
+                if isinstance(vxlan_config, str):
+                    vxlan_config = json.loads(vxlan_config) if vxlan_config else {}
+            except Exception as vxlan_exc:
+                # Keep raw for display if parsing fails
+                pass
+            print(f"   VXLAN Enabled: {bool(vxlan_enabled_flag)}")
+            print(f"   VXLAN State: {vxlan_state or 'Unknown'}")
+            print(f"   VXLAN Interface: {vxlan_iface or 'N/A'}")
+            if vxlan_config:
+                print(f"   VXLAN Config: {json.dumps(vxlan_config, indent=6)}")
+            if device.get("vxlan_last_error"):
+                print(f"   VXLAN Last Error: {device.get('vxlan_last_error')}")
 
 def print_protocol_summary(devices: List[Dict]):
     """Print a consolidated summary of all BGP, OSPF, and ISIS neighbor IP addresses"""

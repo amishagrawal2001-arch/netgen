@@ -292,7 +292,10 @@ def tear_down_vxlan_interface(
     vlan_id = config.get("vlan_id")
     
     if not iface and vni:
-        iface = f"vxlan{vni}-{device_id[:8]}" if vni else None
+        # Interface name format: vx{vni}-{device_id_prefix}
+        # e.g., vx5000-35f9e0 (where 35f9e0 is first 6 chars of device_id without dashes)
+        ifname_seed = device_id.replace("-", "")[:6]
+        iface = f"vx{vni}-{ifname_seed}" if vni else None
     
     # Bridge name format: br{vni} (e.g., br5000)
     bridge_name = f"br{vni}" if vni else None
@@ -527,30 +530,67 @@ def tear_down_vxlan_interface(
             logger.warning("[VXLAN CLEANUP] Failed to tear down VXLAN in container %s: %s", container_name, exc)
             return False
 
-    # Host-level cleanup (fallback)
-    if not _interface_exists(iface):
-        return False
-    try:
-        _run(["ip", "link", "set", iface, "down"])
-        _run(["ip", "link", "del", iface])
-        logger.info("[VXLAN CLEANUP] Removed interface %s", iface)
-        
-        # Also try to remove bridge if it exists
-        if bridge_name and _interface_exists(bridge_name):
-            try:
+    # Host-level cleanup (fallback when container doesn't exist or container deletion failed)
+    # Try to delete from host even if container deletion was attempted
+    host_cleanup_success = False
+    
+    # First, try with the provided interface name
+    if iface:
+        try:
+            if _interface_exists(iface):
+                _run(["ip", "link", "set", iface, "down"])
+                _run(["ip", "link", "del", iface])
+                logger.info("[VXLAN CLEANUP] Removed host VXLAN interface %s", iface)
+                host_cleanup_success = True
+            else:
+                logger.debug("[VXLAN CLEANUP] Interface %s does not exist on host", iface)
+        except subprocess.CalledProcessError as exc:
+            logger.debug("[VXLAN CLEANUP] Failed to remove host interface %s: %s", iface, exc.stderr if exc.stderr else exc)
+        except Exception as exc:
+            logger.debug("[VXLAN CLEANUP] Error removing host interface %s: %s", iface, exc)
+    
+    # Also try to find and delete interfaces by VNI pattern (in case interface name doesn't match)
+    if vni:
+        try:
+            # Try to find VXLAN interfaces matching the pattern vx{vni}-*
+            import subprocess
+            result = subprocess.run(
+                ["ip", "link", "show", "type", "vxlan"],
+                capture_output=True,
+                text=True,
+                check=False
+            )
+            if result.returncode == 0:
+                import re
+                # Look for interfaces matching vx{vni}- pattern
+                pattern = rf"vx{vni}-[a-f0-9]{{6}}"
+                for line in result.stdout.split('\n'):
+                    match = re.search(rf":\s+({pattern}):", line)
+                    if match:
+                        found_iface = match.group(1)
+                        if found_iface != iface:  # Don't try to delete the same interface twice
+                            try:
+                                subprocess.run(["ip", "link", "set", found_iface, "down"], capture_output=True, check=False)
+                                subprocess.run(["ip", "link", "del", found_iface], capture_output=True, check=False)
+                                logger.info("[VXLAN CLEANUP] Removed host VXLAN interface %s (found by VNI pattern)", found_iface)
+                                host_cleanup_success = True
+                            except Exception as pattern_exc:
+                                logger.debug("[VXLAN CLEANUP] Failed to remove interface %s found by pattern: %s", found_iface, pattern_exc)
+        except Exception as pattern_search_exc:
+            logger.debug("[VXLAN CLEANUP] Failed to search for VXLAN interfaces by pattern: %s", pattern_search_exc)
+    
+    # Also try to remove bridge if it exists
+    if bridge_name:
+        try:
+            if _interface_exists(bridge_name):
                 _run(["ip", "link", "set", bridge_name, "down"])
                 _run(["ip", "link", "del", bridge_name])
-                logger.info("[VXLAN CLEANUP] Removed bridge %s", bridge_name)
-            except Exception as bridge_exc:
-                logger.debug("[VXLAN CLEANUP] Failed to remove bridge %s: %s", bridge_name, bridge_exc)
-        
-        return True
-    except subprocess.CalledProcessError as exc:
-        logger.warning("[VXLAN CLEANUP] Failed to remove interface %s: %s", iface, exc)
-        return False
-    except Exception as exc:
-        logger.warning("[VXLAN CLEANUP] Unexpected error removing %s: %s", iface, exc)
-        return False
+                logger.info("[VXLAN CLEANUP] Removed host bridge %s", bridge_name)
+                host_cleanup_success = True
+        except Exception as bridge_exc:
+            logger.debug("[VXLAN CLEANUP] Failed to remove host bridge %s: %s", bridge_name, bridge_exc)
+    
+    return host_cleanup_success
 
 
 def _ensure_vxlan_in_container_iproute(
