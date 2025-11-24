@@ -16,70 +16,82 @@ from utils.qicon_loader import qicon, r_icon
 class TrafficGenClientServerSection():
     def setup_server_section(self):
         """Set up the server management section."""
-        self.server_group = QGroupBox()
+        self.server_group = QGroupBox("TGEN")
         layout = QVBoxLayout()
+        
+        # Set consistent spacing and margins for better visual hierarchy
+        layout.setSpacing(10)  # Space between elements
+        layout.setContentsMargins(8, 8, 8, 8)  # Padding around the entire section
 
-        # Server Tree
+        # Server Tree Section
         self.server_tree = QTreeWidget()
         self.server_tree.setColumnCount(3)
-        self.server_tree.setHeaderLabels(["TG ID", "Server Address / Interfaces", "Selected"])
+        self.server_tree.setHeaderLabels(["TG ID", "Server Address / Interfaces", "Select"])
 
         # Set header resize modes
         header = self.server_tree.header()
         header.setSectionResizeMode(0, QHeaderView.Fixed)  # TG ID - fixed width
         header.setSectionResizeMode(1, QHeaderView.Stretch)  # Server Address - stretch to fill
         header.setSectionResizeMode(2, QHeaderView.Fixed)  # Selected - fixed width
-        header.setMinimumSectionSize(10)  # Allow columns to be as small as 10px
+        header.setMinimumSectionSize(30)  # Allow columns to be as small as 30px (for checkbox visibility)
+        
+        # Improve header styling for better visual hierarchy
+        header.setDefaultSectionSize(25)  # Header height
+        header.setStretchLastSection(False)
 
         # Enable extended selection for multiple ports using Ctrl/Command
         self.server_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        layout.addWidget(self.server_tree)
+        
+        # Add tree with spacing
+        layout.addWidget(self.server_tree, 1)  # Stretch factor for tree to take available space
 
         # Adjust column widths
         self.server_tree.setColumnWidth(0, 180)  # Increased to accommodate status icon
         self.server_tree.setColumnWidth(1, 200)  # Initial width, will stretch
-        self.server_tree.setColumnWidth(2, 10)  # Reduced width for Selected column (checkbox only)
+        self.server_tree.setColumnWidth(2, 75)  # Width for Selected column (header text "Selected" needs ~70-75px to be fully visible)
 
         # Connect to unified update for stream + device tables
         self.server_tree.itemSelectionChanged.connect(self._on_server_selection_changed_combined)
 
-        # Buttons for Server Management
+        # Action Buttons Section (grouped visually)
         button_layout = QHBoxLayout()
+        button_layout.setAlignment(Qt.AlignLeft)
+        button_layout.setSpacing(5)  # Spacing between buttons
+        button_layout.setContentsMargins(0, 5, 0, 0)  # Top margin to separate from tree
 
         # Delete Port button
-        remove_interface_button = QPushButton(" Delete Port")
-        #remove_interface_button.setIcon(QIcon("resources/icons/Trash.png"))
+        remove_interface_button = QPushButton()
         remove_interface_button.setIcon(QIcon(r_icon("icons/Trash.png")))
-
         remove_interface_button.setIconSize(QSize(16, 16))
-        remove_interface_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        remove_interface_button.setFixedSize(32, 28)
+        remove_interface_button.setToolTip("Delete Port")
         remove_interface_button.clicked.connect(self.remove_selected_interface)
         button_layout.addWidget(remove_interface_button)
 
-        # Spacer
-        spacer = QSpacerItem(1, 0, QSizePolicy.Minimum, QSizePolicy.Minimum)
-        button_layout.addItem(spacer)
-
         # Add Ports button
-        readd_port_button = QPushButton(" Add Ports")
-        #readd_port_button.setIcon(QIcon("resources/icons/readd.png"))
+        readd_port_button = QPushButton()
         readd_port_button.setIcon(QIcon(r_icon("icons/readd.png")))
         readd_port_button.setIconSize(QSize(16, 16))
-        readd_port_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        readd_port_button.setFixedSize(32, 28)
+        readd_port_button.setToolTip("Add Ports")
         readd_port_button.clicked.connect(self.readd_ports_dialog)
         button_layout.addWidget(readd_port_button)
 
         # Reset Interface button
-        reset_interface_button = QPushButton(" Reset Interface")
+        reset_interface_button = QPushButton()
         reset_icon_path = r_icon("icons/reset.png")
         if reset_icon_path:
             reset_interface_button.setIcon(QIcon(reset_icon_path))
+        else:
+            # Fallback icon if reset.png doesn't exist
+            reset_interface_button.setIcon(QIcon(r_icon("icons/refresh.png")))
         reset_interface_button.setIconSize(QSize(16, 16))
-        reset_interface_button.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+        reset_interface_button.setFixedSize(32, 28)
+        reset_interface_button.setToolTip("Reset Interface")
         reset_interface_button.clicked.connect(self.reset_selected_interface)
         button_layout.addWidget(reset_interface_button)
 
-        # Stretch to align left
+        # Stretch to align left (buttons stay on left, space on right)
         button_layout.addStretch(1)
         layout.addLayout(button_layout)
 
@@ -93,7 +105,7 @@ class TrafficGenClientServerSection():
         # Set column widths after tree is populated (ensures they're applied)
         self.server_tree.setColumnWidth(0, 180)
         self.server_tree.setColumnWidth(1, 200)
-        self.server_tree.setColumnWidth(2, 10)
+        self.server_tree.setColumnWidth(2, 75)
 
     def _on_server_selection_changed_combined(self):
         """Update both stream and device tables on server tree selection change."""
@@ -461,7 +473,7 @@ class TrafficGenClientServerSection():
             # Checkbox to select server
             checkbox = QCheckBox()
             checkbox.setChecked(server in self.selected_servers)
-            checkbox.setFixedWidth(20)  # Set fixed width for checkbox
+            checkbox.setFixedSize(24, 24)  # Set fixed size for checkbox (24x24 is standard checkbox size)
             checkbox.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
 
             """checkbox.stateChanged.connect(
@@ -534,7 +546,7 @@ class TrafficGenClientServerSection():
         # Ensure column widths are maintained after update
         self.server_tree.setColumnWidth(0, 180)
         self.server_tree.setColumnWidth(1, 200)
-        self.server_tree.setColumnWidth(2, 10)
+        self.server_tree.setColumnWidth(2, 75)
         
         print(f"[DEBUG] Tree widget updated with {len(self.server_interfaces)} servers")
     '''def update_server_status_icon(self, server, is_online):
