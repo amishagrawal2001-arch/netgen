@@ -52,43 +52,45 @@ class TrafficGenClientServerSection():
         # Improved selection behavior
         self.server_tree.setSelectionBehavior(QAbstractItemView.SelectRows)  # Select entire rows
         
-        # Better visual styling with stylesheet for professional appearance
+        # Better visual styling with stylesheet for professional appearance (muted color scheme)
         self.server_tree.setStyleSheet("""
             QTreeWidget {
                 background-color: #ffffff;
-                alternate-background-color: #f8f9fa;
-                border: 1px solid #dee2e6;
+                alternate-background-color: #f7f8fa;
+                border: 1px solid #d1d5db;
                 border-radius: 4px;
                 font-size: 11px;
                 outline: none;
+                color: #374151;
             }
             QTreeWidget::item {
                 padding: 2px 4px;
                 border: none;
                 min-height: 20px;
+                color: #374151;
             }
             QTreeWidget::item:selected {
-                background-color: #3b82f6;
+                background-color: #5b7fa8;
                 color: #ffffff;
             }
             QTreeWidget::item:hover:!selected {
-                background-color: #e9ecef;
+                background-color: #f0f2f5;
             }
             QTreeWidget::item:selected:hover {
-                background-color: #2563eb;
+                background-color: #4a6b8a;
             }
             QHeaderView::section {
-                background-color: #f8f9fa;
+                background-color: #f3f4f6;
                 padding: 6px 6px;
-                border: 1px solid #dee2e6;
+                border: 1px solid #d1d5db;
                 border-left: none;
                 border-top: none;
                 font-weight: 600;
                 font-size: 11px;
-                color: #495057;
+                color: #4b5563;
             }
             QHeaderView::section:first {
-                border-left: 1px solid #dee2e6;
+                border-left: 1px solid #d1d5db;
             }
         """)
         
