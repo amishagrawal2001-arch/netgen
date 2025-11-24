@@ -7,7 +7,7 @@ from PyQt5.QtWidgets import (
     QInputDialog, QSplitter, QAction, QMenu, QAbstractItemView, QSizePolicy, QTreeWidget,
     QTreeWidgetItem, QTextEdit, QSpacerItem, QFileDialog, QMessageBox
 )
-from PyQt5.QtGui import QIcon, QPixmap, QColor
+from PyQt5.QtGui import QIcon, QPixmap, QColor, QFont
 from PyQt5.QtCore import Qt, QSize
 
 
@@ -36,11 +36,61 @@ class TrafficGenClientServerSection():
         header.setMinimumSectionSize(30)  # Allow columns to be as small as 30px (for checkbox visibility)
         
         # Improve header styling for better visual hierarchy
-        header.setDefaultSectionSize(25)  # Header height
+        header.setDefaultSectionSize(28)  # Header height (slightly increased for better visibility)
         header.setStretchLastSection(False)
+        header.setHighlightSections(False)  # Don't highlight header sections on click
 
         # Enable extended selection for multiple ports using Ctrl/Command
         self.server_tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        
+        # Table/Tree improvements for professional appearance
+        self.server_tree.setAlternatingRowColors(True)  # Alternating row colors for better readability
+        self.server_tree.setRootIsDecorated(True)  # Show expand/collapse indicators
+        self.server_tree.setIndentation(15)  # Indentation for child items
+        self.server_tree.setAnimated(True)  # Animate expand/collapse
+        
+        # Improved selection behavior
+        self.server_tree.setSelectionBehavior(QAbstractItemView.SelectRows)  # Select entire rows
+        
+        # Better visual styling with stylesheet for professional appearance
+        self.server_tree.setStyleSheet("""
+            QTreeWidget {
+                background-color: #ffffff;
+                alternate-background-color: #f8f9fa;
+                border: 1px solid #dee2e6;
+                border-radius: 4px;
+                font-size: 11px;
+                outline: none;
+            }
+            QTreeWidget::item {
+                padding: 2px 4px;
+                border: none;
+                min-height: 20px;
+            }
+            QTreeWidget::item:selected {
+                background-color: #3b82f6;
+                color: #ffffff;
+            }
+            QTreeWidget::item:hover:!selected {
+                background-color: #e9ecef;
+            }
+            QTreeWidget::item:selected:hover {
+                background-color: #2563eb;
+            }
+            QHeaderView::section {
+                background-color: #f8f9fa;
+                padding: 6px 6px;
+                border: 1px solid #dee2e6;
+                border-left: none;
+                border-top: none;
+                font-weight: 600;
+                font-size: 11px;
+                color: #495057;
+            }
+            QHeaderView::section:first {
+                border-left: 1px solid #dee2e6;
+            }
+        """)
         
         # Add tree with spacing
         layout.addWidget(self.server_tree, 1)  # Stretch factor for tree to take available space
@@ -535,6 +585,12 @@ class TrafficGenClientServerSection():
                             interface_display = f"• {port_name}"  # Green bullet for up
                             port_item = QTreeWidgetItem([interface_display, ""])
                             port_item.setForeground(0, QColor(0, 100, 0))  # Darker green for better readability
+                        
+                        # Increase font size for interface names (child items)
+                        font = port_item.font(0)
+                        font.setPointSize(12)
+                        font.setWeight(QFont.Medium)
+                        port_item.setFont(0, font)
                         
                         # Interface display updated
                         
