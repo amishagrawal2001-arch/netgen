@@ -498,12 +498,16 @@ class TrafficGenClientServerSection():
             tg_id_widget = QWidget()
             tg_id_layout = QHBoxLayout(tg_id_widget)
             tg_id_layout.setContentsMargins(2, 0, 2, 0)
-            tg_id_layout.setSpacing(4)
+            tg_id_layout.setSpacing(6)
             
-            # Status icon label (colored dot)
-            status_label = QLabel("●")  # Bullet character (larger than middle dot)
-            status_label.setStyleSheet(f"color: {'#00b400' if is_online else '#c80000'}; font-size: 14px;")
-            status_label.setFixedWidth(12)
+            # Status icon label (icon-based, consistent with Streams table)
+            status_label = QLabel()
+            status_icon = QIcon(r_icon("icons/green_dot.png" if is_online else "icons/red_dot.png"))
+            status_pixmap = status_icon.pixmap(12, 12)  # Reduced icon size for better fit
+            status_label.setPixmap(status_pixmap)
+            status_label.setFixedSize(14, 14)  # Slightly larger to accommodate icon with padding
+            status_label.setAlignment(Qt.AlignCenter)
+            status_label.setToolTip("Online" if is_online else "Offline")
             tg_id_layout.addWidget(status_label)
             
             # TG ID text label
@@ -576,15 +580,22 @@ class TrafficGenClientServerSection():
                         if full_interface_name in self.removed_interfaces:
                             continue  # ✅ Skip previously removed interfaces
 
-                        # Create interface name with status indicator prefix
+                        # Create interface name with icon-based status indicator
+                        port_item = QTreeWidgetItem([port_name, ""])  # Remove bullet prefix, use icon instead
+                        
+                        # Set status icon (icon-based, consistent with Streams table)
                         if interface_status == 'down':
-                            interface_display = f"• {port_name}"  # Red bullet for down
-                            port_item = QTreeWidgetItem([interface_display, ""])
-                            port_item.setForeground(0, QColor(200, 0, 0))  # Darker red for better readability
+                            status_icon = QIcon(r_icon("icons/red_dot.png"))
+                            tooltip = f"{port_name} - Down"
                         else:
-                            interface_display = f"• {port_name}"  # Green bullet for up
-                            port_item = QTreeWidgetItem([interface_display, ""])
-                            port_item.setForeground(0, QColor(0, 100, 0))  # Darker green for better readability
+                            status_icon = QIcon(r_icon("icons/green_dot.png"))
+                            tooltip = f"{port_name} - Up"
+                        
+                        # Scale icon to smaller size (12x12)
+                        icon_pixmap = status_icon.pixmap(12, 12)
+                        scaled_icon = QIcon(icon_pixmap)
+                        port_item.setIcon(0, scaled_icon)
+                        port_item.setToolTip(0, tooltip)
                         
                         # Increase font size for interface names (child items)
                         font = port_item.font(0)
@@ -620,8 +631,11 @@ class TrafficGenClientServerSection():
         if not status_label:
             return
 
-        # Update status icon color
-        status_label.setStyleSheet(f"color: {'#00b400' if is_online else '#c80000'}; font-size: 14px;")
+        # Update status icon (icon-based, consistent with Streams table)
+        status_icon = QIcon(r_icon("icons/green_dot.png" if is_online else "icons/red_dot.png"))
+        status_pixmap = status_icon.pixmap(12, 12)  # Reduced icon size for better fit
+        status_label.setPixmap(status_pixmap)
+        status_label.setToolTip("Online" if is_online else "Offline")
         server["is_online"] = is_online
 
     def retry_server_connection(self, server):
@@ -933,11 +947,16 @@ class TrafficGenClientServerSection():
                     if tg_item:
                         # Avoid duplicates within the TG
                         existing_ports = [tg_item.child(k).text(0) for k in range(tg_item.childCount())]
-                        # Check if port_name with bullet prefix exists
-                        port_name_with_bullet = f"• {port_name}"
-                        if port_name_with_bullet not in existing_ports:
-                            port_item = QTreeWidgetItem([port_name_with_bullet, ""])
-                            port_item.setForeground(0, QColor(0, 100, 0))  # Green color for up status
+                        # Check if port_name exists (no bullet prefix needed with icons)
+                        if port_name not in existing_ports:
+                            port_item = QTreeWidgetItem([port_name, ""])
+                            # Set status icon (icon-based, consistent with Streams table)
+                            status_icon = QIcon(r_icon("icons/green_dot.png"))
+                            # Scale icon to smaller size (12x12)
+                            icon_pixmap = status_icon.pixmap(12, 12)
+                            scaled_icon = QIcon(icon_pixmap)
+                            port_item.setIcon(0, scaled_icon)
+                            port_item.setToolTip(0, f"{port_name} - Up")
                             tg_item.addChild(port_item)
                             readded_ports.append(port)
                             # Remove from removed_interfaces
