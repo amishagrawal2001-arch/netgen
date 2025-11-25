@@ -2529,7 +2529,8 @@ def configure_vxlan_arp_fdb_from_evpn(device_id: str, vxlan_config: Dict[str, An
                 # CRITICAL: Configure ARP entry for remote VTEP on underlay interface
                 # This is required for VXLAN encapsulation to work
                 # The remote VTEP IP needs to be reachable on the underlay
-                if actual_vtep_ip != remote_ip and actual_vtep_ip != '0.0.0.0':
+                # Always configure underlay ARP if we have a valid VTEP IP (even if it matches remote_ip)
+                if actual_vtep_ip and actual_vtep_ip != '0.0.0.0' and actual_vtep_ip != '::':
                     try:
                         # Get underlay interface from config
                         underlay_interface = config.get("underlay_interface")
@@ -2540,16 +2541,33 @@ def configure_vxlan_arp_fdb_from_evpn(device_id: str, vxlan_config: Dict[str, An
                                 # Get BGP neighbor IP from config or try to derive it
                                 bgp_neighbor_ip = config.get("bgp_neighbor_ip") or remote_ip
                                 
-                                # Find interface that has route to BGP neighbor or remote VTEP
-                                route_result = container.exec_run(["ip", "route", "get", bgp_neighbor_ip])
-                                route_output = route_result.output.decode("utf-8", errors="ignore") if isinstance(route_result.output, bytes) else str(route_result.output)
+                                # First, try to find interface from route to BGP neighbor (more reliable)
+                                try:
+                                    route_result = container.exec_run(["ip", "route", "get", bgp_neighbor_ip])
+                                    route_output = route_result.output.decode("utf-8", errors="ignore") if isinstance(route_result.output, bytes) else str(route_result.output)
+                                    
+                                    # Extract interface from route output (e.g., "192.168.0.1 via 192.168.0.2 dev vlan20")
+                                    import re
+                                    route_match = re.search(r'dev\s+(\S+)', route_output)
+                                    if route_match:
+                                        underlay_interface = route_match.group(1)
+                                        logger.debug("[VXLAN ARP/FDB] Found underlay interface %s from route to BGP neighbor %s", underlay_interface, bgp_neighbor_ip)
+                                except Exception:
+                                    pass
                                 
-                                # Extract interface from route output (e.g., "192.168.0.1 via 192.168.0.2 dev vlan20")
-                                import re
-                                route_match = re.search(r'dev\s+(\S+)', route_output)
-                                if route_match:
-                                    underlay_interface = route_match.group(1)
-                                    logger.debug("[VXLAN ARP/FDB] Found underlay interface %s from route to %s", underlay_interface, bgp_neighbor_ip)
+                                # If still not found, try route to actual VTEP IP
+                                if not underlay_interface:
+                                    try:
+                                        route_result = container.exec_run(["ip", "route", "get", actual_vtep_ip])
+                                        route_output = route_result.output.decode("utf-8", errors="ignore") if isinstance(route_result.output, bytes) else str(route_result.output)
+                                        
+                                        import re
+                                        route_match = re.search(r'dev\s+(\S+)', route_output)
+                                        if route_match:
+                                            underlay_interface = route_match.group(1)
+                                            logger.debug("[VXLAN ARP/FDB] Found underlay interface %s from route to remote VTEP %s", underlay_interface, actual_vtep_ip)
+                                    except Exception:
+                                        pass
                             except Exception:
                                 pass
                         
