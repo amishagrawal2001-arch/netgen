@@ -520,14 +520,14 @@
     }
   ],
   "removed_interfaces": [
-    "TG 0 - ens14f1",
     "TG 0 - ens14f2",
+    "TG 0 - ens14f1",
     "TG 0 - ens14f3"
   ],
   "removed_servers": [
     "http://svl-hp-ai-srv02:5051",
-    "http://127.0.0.1:5050",
     "http://127.0.0.1:5051",
+    "http://127.0.0.1:5050",
     "http://svl-hp-ai-srv01:5050"
   ],
   "selected_servers": [
@@ -537,7 +537,7 @@
   "devices": {
     "device1": {
       "Device Name": "device1",
-      "device_id": "35f9e04a-bea6-41d9-8556-21b2306a43cf",
+      "device_id": "a0e7a140-3c93-425f-b553-cb21dfb9b544",
       "Interface": " - ens4np0",
       "MAC Address": "00:11:22:33:44:55",
       "IPv4": "192.168.0.2",
@@ -552,11 +552,25 @@
       "Loopback IPv6": "2001:ff00::1",
       "Status": "Running",
       "protocols": [
+        "VXLAN",
         "OSPF",
         "IS-IS",
-        "BGP",
-        "VXLAN"
+        "BGP"
       ],
+      "vxlan_config": {
+        "enabled": true,
+        "vni": 5000,
+        "remote_peers": [
+          "192.168.250.1"
+        ],
+        "local_ip": "192.255.0.1",
+        "vlan_id": 100,
+        "bridge_svi_ip": "10.0.0.100",
+        "bridge_svi_subnet": "24",
+        "underlay_interface": "ens4np0",
+        "overlay_interface": "vlan20",
+        "udp_port": 4789
+      },
       "VXLAN": "VNI 5000 -> 192.168.250.1",
       "ospf_config": {
         "area_id": "0.0.0.0",
@@ -600,48 +614,32 @@
         "bgp_hold_time": "90",
         "ipv4_enabled": true,
         "ipv6_enabled": true,
-        "use_loopback_ip": true,
-        "bgp_remote_loopback_ip": "192.168.250.1",
-        "bgp_remote_loopback_ipv6": "2001:ff00:250::1",
-        "bgp_neighbor_ipv4": "192.168.250.1",
-        "bgp_update_source_ipv4": "192.255.0.1",
+        "bgp_neighbor_ipv4": "192.168.0.1",
+        "bgp_update_source_ipv4": "192.168.0.2",
         "protocol": "dual-stack",
-        "bgp_neighbor_ipv6": "2001:ff00:250::1",
-        "bgp_update_source_ipv6": "2001:ff00::1"
+        "bgp_neighbor_ipv6": "2001:db8::1",
+        "bgp_update_source_ipv6": "2001:db8::2"
       },
       "Protocols": "VXLAN, OSPF, IS-IS, BGP",
       "_is_new": false,
       "_needs_apply": false,
       "_ospf_just_edited": true,
       "dhcp_mode": "",
-      "dhcp_config": {},
-      "vxlan_config": {
-        "tunnels": [
-          {
-            "vni": 5001,
-            "udp_port": 4789,
-            "local_ip": "192.255.0.1",
-            "remote_peers": [
-              "192.168.250.1"
-            ],
-            "bridge_svi_ip": "20.0.0.100/24",
-            "vlan_id": 200,
-            "underlay_interface": "ens4np0",
-            "overlay_interface": "vlan20"
-          }
-        ]
-      }
+      "dhcp_config": {}
     }
   },
-  "removed_devices": [],
+  "removed_devices": [
+    "35f9e04a-bea6-41d9-8556-21b2306a43cf",
+    "5a4a7704-ff28-4471-827d-afa826afb1fa"
+  ],
   "protocols": {
     "bgp": [
       {
         "Device": "device1",
         "BGP Status": "",
         "Neighbor Type": "IPv4",
-        "Neighbor IP": "192.168.250.1",
-        "Source IP": "192.255.0.1",
+        "Neighbor IP": "192.168.0.1",
+        "Source IP": "192.168.0.2",
         "BGP Local AS": "65000",
         "BGP Remote AS": "65000",
         "State": "Established",
@@ -654,8 +652,8 @@
         "Device": "device1",
         "BGP Status": "",
         "Neighbor Type": "IPv6",
-        "Neighbor IP": "2001:ff00:250::1",
-        "Source IP": "2001:ff00::1",
+        "Neighbor IP": "2001:db8::1",
+        "Source IP": "2001:db8::2",
         "BGP Local AS": "65000",
         "BGP Remote AS": "65000",
         "State": "Established",
@@ -675,8 +673,8 @@
         "Neighbor ID": "192.168.250.1",
         "State": "Full/DR",
         "Priority": "128",
-        "Dead Timer": "39.263s",
-        "Uptime": "14m17s",
+        "Dead Timer": "36.048s",
+        "Uptime": "4m29s",
         "Graceful Restart": "",
         "P2P": "",
         "Route Pools": ""
@@ -690,8 +688,8 @@
         "Neighbor ID": "192.168.250.1",
         "State": "Full/DR",
         "Priority": "128",
-        "Dead Timer": "00:00:33",
-        "Uptime": "00:14:00",
+        "Dead Timer": "00:00:31",
+        "Uptime": "00:04:17",
         "Graceful Restart": "",
         "P2P": "",
         "Route Pools": ""
