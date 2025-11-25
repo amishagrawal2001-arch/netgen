@@ -890,11 +890,21 @@ def _ensure_vxlan_in_container_iproute(
             # "File exists" errors are expected and can be ignored
             try:
                 _container_ip(frr_manager, container_name, ["ip", "link", "add", "name", bridge_name, "type", "bridge"])
-                logger.debug("[VXLAN] Created new plain bridge %s (no VLAN filtering)", bridge_name)
+                logger.info("[VXLAN] ✅ Created new plain bridge %s (no VLAN filtering)", bridge_name)
             except Exception as create_exc:
-                if "File exists" not in str(create_exc):
+                create_exc_str = str(create_exc)
+                if "File exists" not in create_exc_str and "already exists" not in create_exc_str.lower():
+                    logger.error("[VXLAN] ❌ Failed to create bridge %s: %s", bridge_name, create_exc_str)
                     raise
                 logger.debug("[VXLAN] Bridge %s already exists", bridge_name)
+            
+            # CRITICAL: Bring up the bridge immediately after creation
+            # This ensures the bridge is in a usable state
+            try:
+                _container_ip(frr_manager, container_name, ["ip", "link", "set", bridge_name, "up"])
+                logger.debug("[VXLAN] Brought up bridge %s", bridge_name)
+            except Exception as up_exc:
+                logger.warning("[VXLAN] Failed to bring up bridge %s (may already be up): %s", bridge_name, str(up_exc))
             
             # Configure VLAN-aware mode ONLY if VLAN ID is explicitly specified and > 0
             # Default: Plain bridge without VLAN filtering (better for simple VXLAN setups)
@@ -1164,14 +1174,19 @@ def _ensure_vxlan_in_container_iproute(
                     logger.warning("[VXLAN] Failed to add IP address to SVI interface %s at kernel level: %s", svi_interface, ip_add_exc)
             
             # Also configure in FRR so zebra knows about it
-            _run_vtysh(frr_manager, container_name, [
-                f"interface {svi_interface}",
-                "no shutdown",
-                f"ip address {svi_ip_str}",
-                "exit",
-                "end",
-                "write"  # CRITICAL: Save configuration so SVI persists
-            ])
+            # CRITICAL: Configure the bridge interface in FRR so EVPN can recognize it
+            try:
+                _run_vtysh(frr_manager, container_name, [
+                    f"interface {svi_interface}",
+                    "no shutdown",
+                    f"ip address {svi_ip_str}",
+                    "exit",
+                    "end"
+                ])
+                logger.info("[VXLAN] ✅ Configured interface %s in FRR with IP %s", svi_interface, svi_ip_str)
+            except Exception as frr_iface_exc:
+                logger.error("[VXLAN] ❌ Failed to configure interface %s in FRR: %s", svi_interface, str(frr_iface_exc))
+                # Don't raise - kernel-level IP is already set, FRR might pick it up automatically
             
             # Force EVPN daemon to re-evaluate SVI association by toggling advertise-all-vni
             # This is a workaround for FRR issue where EVPN daemon doesn't immediately recognize SVI
