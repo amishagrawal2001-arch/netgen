@@ -2530,46 +2530,64 @@ def configure_vxlan_arp_fdb_from_evpn(device_id: str, vxlan_config: Dict[str, An
                 # This is required for VXLAN encapsulation to work
                 # The remote VTEP IP needs to be reachable on the underlay
                 # Always configure underlay ARP if we have a valid VTEP IP (even if it matches remote_ip)
+                # BUT: Skip if the VTEP IP is a loopback IP (127.x.x.x or same as BGP neighbor loopback)
+                # to avoid interfering with BGP sessions
                 if actual_vtep_ip and actual_vtep_ip != '0.0.0.0' and actual_vtep_ip != '::':
+                    # Check if this is a loopback IP that might interfere with BGP
+                    is_loopback = False
                     try:
-                        # Get underlay interface from config
-                        underlay_interface = config.get("underlay_interface")
-                        if not underlay_interface:
-                            # Try to find the interface that has the BGP neighbor IP
-                            # This is typically the interface used for BGP peering
-                            try:
-                                # Get BGP neighbor IP from config or try to derive it
-                                bgp_neighbor_ip = config.get("bgp_neighbor_ip") or remote_ip
-                                
-                                # First, try to find interface from route to BGP neighbor (more reliable)
+                        # Check if it's a loopback range (127.x.x.x)
+                        if actual_vtep_ip.startswith('127.'):
+                            is_loopback = True
+                        # Check if it matches BGP neighbor loopback IP (could interfere with BGP)
+                        bgp_remote_loopback = config.get("bgp_remote_loopback_ip") or config.get("bgp_neighbor_ip")
+                        if bgp_remote_loopback and actual_vtep_ip == bgp_remote_loopback:
+                            logger.debug("[VXLAN ARP/FDB] Skipping underlay ARP for VTEP IP %s (matches BGP neighbor loopback, may interfere with BGP)", actual_vtep_ip)
+                            is_loopback = True
+                    except Exception:
+                        pass
+                    
+                    if not is_loopback:
+                        try:
+                            # Get underlay interface from config
+                            underlay_interface = config.get("underlay_interface")
+                            if not underlay_interface:
+                                # Try to find the interface that has the BGP neighbor IP
+                                # This is typically the interface used for BGP peering
                                 try:
-                                    route_result = container.exec_run(["ip", "route", "get", bgp_neighbor_ip])
-                                    route_output = route_result.output.decode("utf-8", errors="ignore") if isinstance(route_result.output, bytes) else str(route_result.output)
+                                    # Get BGP neighbor IP from config or try to derive it
+                                    # Use the actual BGP neighbor IP on the underlay, not the loopback
+                                    bgp_neighbor_ip = config.get("bgp_neighbor_ip") or remote_ip
                                     
-                                    # Extract interface from route output (e.g., "192.168.0.1 via 192.168.0.2 dev vlan20")
-                                    import re
-                                    route_match = re.search(r'dev\s+(\S+)', route_output)
-                                    if route_match:
-                                        underlay_interface = route_match.group(1)
-                                        logger.debug("[VXLAN ARP/FDB] Found underlay interface %s from route to BGP neighbor %s", underlay_interface, bgp_neighbor_ip)
-                                except Exception:
-                                    pass
-                                
-                                # If still not found, try route to actual VTEP IP
-                                if not underlay_interface:
+                                    # First, try to find interface from route to BGP neighbor (more reliable)
                                     try:
-                                        route_result = container.exec_run(["ip", "route", "get", actual_vtep_ip])
+                                        route_result = container.exec_run(["ip", "route", "get", bgp_neighbor_ip])
                                         route_output = route_result.output.decode("utf-8", errors="ignore") if isinstance(route_result.output, bytes) else str(route_result.output)
                                         
+                                        # Extract interface from route output (e.g., "192.168.0.1 via 192.168.0.2 dev vlan20")
                                         import re
                                         route_match = re.search(r'dev\s+(\S+)', route_output)
                                         if route_match:
                                             underlay_interface = route_match.group(1)
-                                            logger.debug("[VXLAN ARP/FDB] Found underlay interface %s from route to remote VTEP %s", underlay_interface, actual_vtep_ip)
+                                            logger.debug("[VXLAN ARP/FDB] Found underlay interface %s from route to BGP neighbor %s", underlay_interface, bgp_neighbor_ip)
                                     except Exception:
                                         pass
-                            except Exception:
-                                pass
+                                    
+                                    # If still not found, try route to actual VTEP IP
+                                    if not underlay_interface:
+                                        try:
+                                            route_result = container.exec_run(["ip", "route", "get", actual_vtep_ip])
+                                            route_output = route_result.output.decode("utf-8", errors="ignore") if isinstance(route_result.output, bytes) else str(route_result.output)
+                                            
+                                            import re
+                                            route_match = re.search(r'dev\s+(\S+)', route_output)
+                                            if route_match:
+                                                underlay_interface = route_match.group(1)
+                                                logger.debug("[VXLAN ARP/FDB] Found underlay interface %s from route to remote VTEP %s", underlay_interface, actual_vtep_ip)
+                                        except Exception:
+                                            pass
+                                except Exception:
+                                    pass
                         
                         if underlay_interface:
                             # Get MAC address for remote VTEP from BGP neighbor ARP entry
