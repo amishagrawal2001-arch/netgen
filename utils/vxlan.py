@@ -2588,8 +2588,8 @@ def configure_vxlan_arp_fdb_from_evpn(device_id: str, vxlan_config: Dict[str, An
                                             pass
                                 except Exception:
                                     pass
-                        
-                        if underlay_interface:
+                            
+                            if underlay_interface:
                             # Get MAC address for remote VTEP from BGP neighbor ARP entry
                             # The remote VTEP MAC is typically the same as the BGP neighbor MAC
                             vtep_mac = None
