@@ -2238,21 +2238,42 @@ def configure_vxlan_arp_fdb_from_evpn(device_id: str, vxlan_config: Dict[str, An
             vxlan_iface = vxlan_iface[:15]
         
         # Get local SVI IP to derive remote SVI IP
+        # In VLAN-aware mode, SVI IP is on VLAN subinterface, not bridge
         container = frr_manager.client.containers.get(container_name)
-        ip_result = container.exec_run(["ip", "addr", "show", bridge_name])
+        vlan_id = config.get("vlan_id")
+        svi_interface = bridge_name  # Default: bridge
+        if vlan_id and vlan_id > 0:
+            svi_interface = f"vlan{vlan_id}"
+            logger.debug("[VXLAN ARP/FDB] VLAN-aware mode: checking SVI IP on %s", svi_interface)
+        
+        ip_result = container.exec_run(["ip", "addr", "show", svi_interface])
         ip_output = ip_result.output.decode("utf-8", errors="ignore") if isinstance(ip_result.output, bytes) else str(ip_result.output)
         
         local_svi_ip_str = None
         for line in ip_output.split('\n'):
-            if 'inet ' in line and bridge_name in line:
+            if 'inet ' in line and svi_interface in line:
                 parts = line.strip().split()
                 if len(parts) >= 2:
                     local_svi_ip_str = parts[1].split('/')[0]
+                    logger.debug("[VXLAN ARP/FDB] Found local SVI IP %s on %s", local_svi_ip_str, svi_interface)
                     break
         
         if not local_svi_ip_str:
-            logger.debug("[VXLAN ARP/FDB] Local SVI IP not found on bridge %s", bridge_name)
-            return False
+            logger.debug("[VXLAN ARP/FDB] Local SVI IP not found on %s, trying bridge %s", svi_interface, bridge_name)
+            # Fallback: try bridge if VLAN subinterface didn't have IP
+            if svi_interface != bridge_name:
+                ip_result = container.exec_run(["ip", "addr", "show", bridge_name])
+                ip_output = ip_result.output.decode("utf-8", errors="ignore") if isinstance(ip_result.output, bytes) else str(ip_result.output)
+                for line in ip_output.split('\n'):
+                    if 'inet ' in line and bridge_name in line:
+                        parts = line.strip().split()
+                        if len(parts) >= 2:
+                            local_svi_ip_str = parts[1].split('/')[0]
+                            logger.debug("[VXLAN ARP/FDB] Found local SVI IP %s on bridge %s", local_svi_ip_str, bridge_name)
+                            break
+            if not local_svi_ip_str:
+                logger.warning("[VXLAN ARP/FDB] Local SVI IP not found on %s or bridge %s", svi_interface, bridge_name)
+                return False
         
         # Derive remote SVI IP
         import ipaddress
@@ -2287,21 +2308,131 @@ def configure_vxlan_arp_fdb_from_evpn(device_id: str, vxlan_config: Dict[str, An
                     break
         
         if remote_mac and remote_svi_ip:
+            # Determine SVI interface for ARP entries (VLAN subinterface if VLAN-aware, bridge otherwise)
+            svi_interface_for_arp = bridge_name  # Default: bridge
+            if vlan_id and vlan_id > 0:
+                svi_interface_for_arp = f"vlan{vlan_id}"
+                # Verify VLAN subinterface exists
+                try:
+                    check_result = container.exec_run(["ip", "link", "show", svi_interface_for_arp])
+                    if check_result.returncode != 0:
+                        svi_interface_for_arp = bridge_name
+                        logger.debug("[VXLAN ARP/FDB] VLAN subinterface %s not found, using bridge", f"vlan{vlan_id}")
+                except Exception:
+                    svi_interface_for_arp = bridge_name
+            
             # Configure permanent ARP entry
+            # CRITICAL: Delete any existing zebra-managed ARP entry first
+            try:
+                neigh_result = container.exec_run(["ip", "neigh", "show", "dev", svi_interface_for_arp])
+                neigh_output = neigh_result.output.decode("utf-8", errors="ignore") if isinstance(neigh_result.output, bytes) else str(neigh_result.output)
+                
+                # Check if ARP entry exists with NOARP flag or proto zebra (zebra-managed)
+                if remote_svi_ip in neigh_output:
+                    for line in neigh_output.split('\n'):
+                        if remote_svi_ip in line and ('NOARP' in line or 'proto zebra' in line or 'extern_learn' in line):
+                            try:
+                                _container_ip(frr_manager, container_name, ["ip", "neigh", "del", remote_svi_ip, "dev", svi_interface_for_arp])
+                                logger.info("[VXLAN ARP/FDB] ✅ Deleted existing zebra-managed ARP entry for %s", remote_svi_ip)
+                                import time
+                                time.sleep(0.1)
+                            except Exception:
+                                pass
+                            break
+            except Exception:
+                pass
+            
             try:
                 _container_ip(frr_manager, container_name, [
                     "ip", "neigh", "replace", remote_svi_ip,
                     "lladdr", remote_mac,
-                    "dev", bridge_name,
+                    "dev", svi_interface_for_arp,
                     "nud", "permanent"
                 ])
-                logger.info("[VXLAN ARP/FDB] Configured permanent ARP entry: %s -> %s on %s", remote_svi_ip, remote_mac, bridge_name)
+                logger.info("[VXLAN ARP/FDB] ✅ Configured permanent ARP entry: %s -> %s on %s (kernel-managed)", remote_svi_ip, remote_mac, svi_interface_for_arp)
             except Exception as arp_exc:
                 logger.warning("[VXLAN ARP/FDB] Failed to configure ARP entry: %s", arp_exc)
                 return False
             
             # Configure FDB entry
+            # Extract actual VTEP IP from EVPN Type-3 routes (OrigIP)
             try:
+                # Get actual VTEP IP from Type-3 routes
+                actual_vtep_ip = remote_ip  # Default to remote_ip from config
+                try:
+                    type3_result = container.exec_run(["vtysh", "-c", "show bgp l2vpn evpn route type multicast"])
+                    type3_output = type3_result.output.decode("utf-8", errors="ignore") if isinstance(type3_result.output, bytes) else str(type3_result.output)
+                    import re
+                    # Look for OrigIP in Type-3 route: [3]:[5000]:[32]:[192.168.250.1]
+                    for line in type3_output.split('\n'):
+                        if '[3]:' in line and f'[{vni}]' in line:
+                            origip_match = re.search(r'\[3\]:\[(\d+)\]:\[32\]:\[(\d+\.\d+\.\d+\.\d+)\]', line)
+                            if origip_match:
+                                orig_ip = origip_match.group(2)
+                                # Get local IP to compare
+                                local_ip = config.get("local_ip", "")
+                                if orig_ip != local_ip and orig_ip != '0.0.0.0' and orig_ip.startswith(('192.', '10.', '172.')):
+                                    actual_vtep_ip = orig_ip
+                                    logger.info("[VXLAN ARP/FDB] Using actual VTEP IP %s from Type-3 route OrigIP for FDB", actual_vtep_ip)
+                                    break
+                except Exception:
+                    logger.debug("[VXLAN ARP/FDB] Could not extract VTEP IP from Type-3 routes, using remote_ip %s", remote_ip)
+                
+                # Also check EVPN VNI details for remote VTEPs
+                if actual_vtep_ip == remote_ip:
+                    try:
+                        evpn_vni_result = container.exec_run(["vtysh", "-c", f"show evpn vni {vni} detail"])
+                        evpn_vni_output = evpn_vni_result.output.decode("utf-8", errors="ignore") if isinstance(evpn_vni_result.output, bytes) else str(evpn_vni_output)
+                        import re
+                        in_remote_vteps = False
+                        for line in evpn_vni_output.split('\n'):
+                            if 'Remote VTEPs' in line:
+                                in_remote_vteps = True
+                                continue
+                            if in_remote_vteps:
+                                ip_pattern = r'\b(?:\d{1,3}\.){3}\d{1,3}\b'
+                                ips = re.findall(ip_pattern, line)
+                                for ip in ips:
+                                    local_ip = config.get("local_ip", "")
+                                    if ip != local_ip and ip != remote_ip and ip != '0.0.0.0':
+                                        actual_vtep_ip = ip
+                                        logger.info("[VXLAN ARP/FDB] Using remote VTEP IP %s from EVPN VNI details for FDB", actual_vtep_ip)
+                                        break
+                                if actual_vtep_ip != remote_ip:
+                                    break
+                    except Exception:
+                        pass
+                
+                # CRITICAL: Reject 0.0.0.0 as FDB destination
+                if actual_vtep_ip == '0.0.0.0' or actual_vtep_ip == '::':
+                    logger.error("[VXLAN ARP/FDB] ❌ Cannot create FDB entry with invalid VTEP IP: %s", actual_vtep_ip)
+                    actual_vtep_ip = remote_ip  # Fallback to remote_ip
+                    if actual_vtep_ip == '0.0.0.0':
+                        logger.error("[VXLAN ARP/FDB] ❌ remote_ip is also 0.0.0.0, skipping FDB entry")
+                        return False
+                
+                # Check if FDB entry exists with wrong VTEP IP and delete it
+                try:
+                    fdb_result = container.exec_run(["bridge", "fdb", "show", "dev", vxlan_iface])
+                    fdb_output = fdb_result.output.decode("utf-8", errors="ignore") if isinstance(fdb_result.output, bytes) else str(fdb_result.output)
+                    for line in fdb_output.split('\n'):
+                        if remote_mac.lower() in line.lower() and 'dst' in line:
+                            parts = line.split()
+                            current_dst = None
+                            for i, part in enumerate(parts):
+                                if part == 'dst' and i+1 < len(parts):
+                                    current_dst = parts[i+1]
+                                    break
+                            if current_dst and current_dst != actual_vtep_ip and (current_dst == '0.0.0.0' or current_dst == remote_ip):
+                                try:
+                                    del_cmd = ["bridge", "fdb", "del", remote_mac, "dev", vxlan_iface, "dst", current_dst]
+                                    _container_ip(frr_manager, container_name, del_cmd)
+                                    logger.info("[VXLAN ARP/FDB] Deleted existing FDB entry with wrong VTEP %s", current_dst)
+                                except Exception:
+                                    pass
+                except Exception:
+                    pass
+                
                 fdb_cmd = [
                     "bridge",
                     "fdb",
@@ -2310,7 +2441,7 @@ def configure_vxlan_arp_fdb_from_evpn(device_id: str, vxlan_config: Dict[str, An
                     "dev",
                     vxlan_iface,
                     "dst",
-                    remote_ip,
+                    actual_vtep_ip,
                 ]
                 vlan_id = config.get("vlan_id")
                 if vlan_id:
