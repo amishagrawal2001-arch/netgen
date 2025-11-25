@@ -115,9 +115,6 @@ if [ -z "$VNI" ] || [ "$VNI" == "$BRIDGE_NAME" ]; then
     VNI="5000"
 fi
 
-echo -e "${BLUE}=== VXLAN Troubleshooting for Bridge: $BRIDGE_NAME (VNI: $VNI) ===${NC}"
-echo ""
-
 # Function to check if container exists
 check_container_exists() {
     if [ -n "$SERVER" ]; then
@@ -136,6 +133,44 @@ docker_exec() {
         docker exec "$CONTAINER" bash -c "$cmd" 2>&1
     fi
 }
+
+# Verify container exists before proceeding
+if ! check_container_exists >/dev/null 2>&1; then
+    echo -e "${RED}Error: Container '$CONTAINER' does not exist${NC}"
+    echo "Please check the container ID or let the script auto-detect it"
+    exit 1
+fi
+
+echo -e "${BLUE}=== VXLAN Troubleshooting for Bridge: $BRIDGE_NAME (VNI: $VNI) ===${NC}"
+echo ""
+
+# Auto-detect actual bridge name from VNI if bridge doesn't exist
+# First, try to find VXLAN interface for this VNI
+cmd="ip link show type vxlan"
+VXLAN_IFACE_TEMP=$(docker_exec "$cmd" 2>/dev/null | grep -E "vx${VNI}-" | awk '{print $2}' | sed 's/:$//' | head -n 1)
+
+# If VXLAN interface found, get the bridge it's attached to
+ACTUAL_BRIDGE=""
+if [ -n "$VXLAN_IFACE_TEMP" ]; then
+    cmd="ip link show $VXLAN_IFACE_TEMP"
+    ACTUAL_BRIDGE=$(docker_exec "$cmd" 2>/dev/null | grep -oE "master br[0-9]+" | awk '{print $2}' | head -n 1)
+    if [ -n "$ACTUAL_BRIDGE" ] && [ "$ACTUAL_BRIDGE" != "$BRIDGE_NAME" ]; then
+        echo -e "${YELLOW}Note: Bridge '$BRIDGE_NAME' not found. Using detected bridge '$ACTUAL_BRIDGE' for VNI $VNI${NC}"
+        BRIDGE_NAME="$ACTUAL_BRIDGE"
+    fi
+fi
+
+# If still no bridge found, try to find from EVPN VNI details
+if [ -z "$ACTUAL_BRIDGE" ]; then
+    cmd="vtysh -c 'show evpn vni detail' 2>/dev/null | grep -A 10 'VNI: $VNI' | grep 'Bridge:' | awk '{print \$2}'"
+    ACTUAL_BRIDGE=$(docker_exec "$cmd" 2>/dev/null | grep -v "^$" | grep -v "^-$" | head -n 1)
+    if [ -n "$ACTUAL_BRIDGE" ] && [ "$ACTUAL_BRIDGE" != "-" ] && [ "$ACTUAL_BRIDGE" != "$BRIDGE_NAME" ]; then
+        echo -e "${YELLOW}Note: Bridge '$BRIDGE_NAME' not found. Using detected bridge '$ACTUAL_BRIDGE' from EVPN for VNI $VNI${NC}"
+        BRIDGE_NAME="$ACTUAL_BRIDGE"
+    fi
+fi
+
+echo ""
 
 # Function to run command and show output
 run_cmd() {
@@ -185,12 +220,17 @@ fi
 # 5. FDB Entries
 # Use VXLAN_IFACE if already detected, otherwise try to find it
 if [ -z "$VXLAN_IFACE" ]; then
-    cmd="ip link show type vxlan"
-    VXLAN_IFACE=$(docker_exec "$cmd" 2>/dev/null | awk '/^[0-9]+:/ {print $2}' | sed 's/:$//' | head -n 1)
-    # Alternative: try to find VXLAN interface by VNI pattern
-    if [ -z "$VXLAN_IFACE" ]; then
+    # Use the VXLAN interface we found earlier if available
+    if [ -n "$VXLAN_IFACE_TEMP" ]; then
+        VXLAN_IFACE="$VXLAN_IFACE_TEMP"
+    else
         cmd="ip link show type vxlan"
-        VXLAN_IFACE=$(docker_exec "$cmd" 2>/dev/null | grep -E "vx${VNI}-" | awk '{print $2}' | sed 's/:$//' | head -n 1)
+        VXLAN_IFACE=$(docker_exec "$cmd" 2>/dev/null | awk '/^[0-9]+:/ {print $2}' | sed 's/:$//' | head -n 1)
+        # Alternative: try to find VXLAN interface by VNI pattern
+        if [ -z "$VXLAN_IFACE" ]; then
+            cmd="ip link show type vxlan"
+            VXLAN_IFACE=$(docker_exec "$cmd" 2>/dev/null | grep -E "vx${VNI}-" | awk '{print $2}' | sed 's/:$//' | head -n 1)
+        fi
     fi
 fi
 if [ -n "$VXLAN_IFACE" ]; then
