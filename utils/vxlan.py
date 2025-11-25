@@ -1872,30 +1872,50 @@ def _ensure_vxlan_in_container_iproute(
             
             # Configure permanent ARP entry
             # CRITICAL: Delete any existing zebra-managed ARP entry first to remove NOARP flag
+            # Zebra-managed ARP entries (proto zebra) prevent kernel forwarding
             try:
                 remote_svi_ip_clean = remote_svi_ip.split('/')[0]
                 container = frr_manager.client.containers.get(container_name)
                 
-                # Check if ARP entry exists with NOARP flag (zebra-managed)
-                neigh_result = container.exec_run(["ip", "neigh", "show", "dev", svi_interface_for_arp, remote_svi_ip_clean])
+                # Check if ARP entry exists with NOARP flag or proto zebra (zebra-managed)
+                neigh_result = container.exec_run(["ip", "neigh", "show", "dev", svi_interface_for_arp])
                 neigh_output = neigh_result.output.decode("utf-8", errors="ignore") if isinstance(neigh_result.output, bytes) else str(neigh_result.output)
                 
-                # Delete existing entry if it has NOARP or proto zebra
-                if remote_svi_ip_clean in neigh_output and ('NOARP' in neigh_output or 'proto zebra' in neigh_output):
-                    try:
-                        _container_ip(frr_manager, container_name, ["ip", "neigh", "del", remote_svi_ip_clean, "dev", svi_interface_for_arp])
-                        logger.info("[VXLAN] Deleted existing zebra-managed ARP entry for %s", remote_svi_ip_clean)
-                    except Exception:
-                        pass  # Entry might not exist, continue
+                # Check each line for the specific IP and zebra management
+                if remote_svi_ip_clean in neigh_output:
+                    for line in neigh_output.split('\n'):
+                        if remote_svi_ip_clean in line and ('NOARP' in line or 'proto zebra' in line or 'extern_learn' in line):
+                            try:
+                                # Delete existing zebra-managed entry
+                                _container_ip(frr_manager, container_name, ["ip", "neigh", "del", remote_svi_ip_clean, "dev", svi_interface_for_arp])
+                                logger.info("[VXLAN] ✅ Deleted existing zebra-managed ARP entry for %s (NOARP/proto zebra)", remote_svi_ip_clean)
+                                # Wait a moment for deletion to complete
+                                import time
+                                time.sleep(0.1)
+                            except Exception as del_exc:
+                                logger.debug("[VXLAN] Could not delete zebra-managed ARP entry (may not exist): %s", del_exc)
+                            break  # Only delete once
                 
-                # Create new ARP entry without proto zebra (kernel-managed)
-                _container_ip(frr_manager, container_name, [
-                    "ip", "neigh", "replace", remote_svi_ip_clean,
-                    "lladdr", remote_mac,
-                    "dev", svi_interface_for_arp,
-                    "nud", "permanent"
-                ])
-                logger.info("[VXLAN] Configured permanent ARP entry: %s -> %s on %s (kernel-managed)", remote_svi_ip_clean, remote_mac, svi_interface_for_arp)
+                # Create new ARP entry as kernel-managed (permanent, no proto zebra)
+                # Use 'replace' to overwrite any existing entry (including zebra-managed ones)
+                try:
+                    _container_ip(frr_manager, container_name, [
+                        "ip", "neigh", "replace", remote_svi_ip_clean,
+                        "lladdr", remote_mac,
+                        "dev", svi_interface_for_arp,
+                        "nud", "permanent"
+                    ])
+                    logger.info("[VXLAN] ✅ Created/replaced kernel-managed ARP entry for %s -> %s on %s (permanent, no proto zebra)", remote_svi_ip_clean, remote_mac, svi_interface_for_arp)
+                    
+                    # Verify the entry was created correctly (not zebra-managed)
+                    verify_result = container.exec_run(["ip", "neigh", "show", remote_svi_ip_clean, "dev", svi_interface_for_arp])
+                    verify_output = verify_result.output.decode("utf-8", errors="ignore") if isinstance(verify_result.output, bytes) else str(verify_result.output)
+                    if 'proto zebra' in verify_output or 'NOARP' in verify_output:
+                        logger.warning("[VXLAN] ⚠️ ARP entry still zebra-managed after creation, zebra may be recreating it")
+                    else:
+                        logger.debug("[VXLAN] Verified ARP entry is kernel-managed (not proto zebra)")
+                except Exception as arp_create_exc:
+                    logger.warning("[VXLAN] Failed to create ARP entry for %s: %s", remote_svi_ip_clean, arp_create_exc)
             except Exception as arp_exc:
                 logger.warning("[VXLAN] Failed to configure ARP entry for %s: %s", remote_svi_ip, arp_exc)
             
