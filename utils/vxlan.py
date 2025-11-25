@@ -2490,10 +2490,11 @@ def configure_vxlan_arp_fdb_from_evpn(device_id: str, vxlan_config: Dict[str, An
                 except Exception as fdb_check_exc:
                     logger.warning("[VXLAN ARP/FDB] Error checking FDB entries: %s", fdb_check_exc)
                 
+                # Use 'replace' instead of 'add' to update existing entry if it exists
                 fdb_cmd = [
                     "bridge",
                     "fdb",
-                    "add",
+                    "replace",
                     remote_mac,
                     "dev",
                     vxlan_iface,
