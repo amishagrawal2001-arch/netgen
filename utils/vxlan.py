@@ -2342,32 +2342,43 @@ def configure_vxlan_arp_fdb_from_evpn(device_id: str, vxlan_config: Dict[str, An
                 try:
                     check_result = container.exec_run(["ip", "link", "show", svi_interface_for_arp])
                     if check_result.returncode != 0:
+                        logger.warning("[VXLAN ARP/FDB] VLAN subinterface %s not found, will try to create ARP on bridge %s", f"vlan{vlan_id}", bridge_name)
                         svi_interface_for_arp = bridge_name
-                        logger.debug("[VXLAN ARP/FDB] VLAN subinterface %s not found, using bridge", f"vlan{vlan_id}")
-                except Exception:
+                    else:
+                        logger.debug("[VXLAN ARP/FDB] Using VLAN subinterface %s for ARP entries", svi_interface_for_arp)
+                except Exception as check_exc:
+                    logger.warning("[VXLAN ARP/FDB] Error checking VLAN subinterface %s: %s, using bridge", f"vlan{vlan_id}", check_exc)
                     svi_interface_for_arp = bridge_name
             
             # Configure permanent ARP entry
-            # CRITICAL: Delete any existing zebra-managed ARP entry first
-            try:
-                neigh_result = container.exec_run(["ip", "neigh", "show", "dev", svi_interface_for_arp])
-                neigh_output = neigh_result.output.decode("utf-8", errors="ignore") if isinstance(neigh_result.output, bytes) else str(neigh_result.output)
-                
-                # Check if ARP entry exists with NOARP flag or proto zebra (zebra-managed)
-                if remote_svi_ip in neigh_output:
-                    for line in neigh_output.split('\n'):
-                        if remote_svi_ip in line and ('NOARP' in line or 'proto zebra' in line or 'extern_learn' in line):
-                            try:
-                                _container_ip(frr_manager, container_name, ["ip", "neigh", "del", remote_svi_ip, "dev", svi_interface_for_arp])
-                                logger.info("[VXLAN ARP/FDB] ✅ Deleted existing zebra-managed ARP entry for %s", remote_svi_ip)
-                                import time
-                                time.sleep(0.1)
-                            except Exception:
-                                pass
-                            break
-            except Exception:
-                pass
+            # CRITICAL: Delete any existing zebra-managed ARP entry first on BOTH vlan100 AND br5000
+            # Zebra might have created it on either interface
+            interfaces_to_check = [svi_interface_for_arp]
+            if vlan_id and vlan_id > 0 and svi_interface_for_arp == f"vlan{vlan_id}":
+                # Also check bridge in case zebra created entry there
+                interfaces_to_check.append(bridge_name)
             
+            for iface in interfaces_to_check:
+                try:
+                    neigh_result = container.exec_run(["ip", "neigh", "show", "dev", iface])
+                    neigh_output = neigh_result.output.decode("utf-8", errors="ignore") if isinstance(neigh_result.output, bytes) else str(neigh_result.output)
+                    
+                    # Check if ARP entry exists with NOARP flag or proto zebra (zebra-managed)
+                    if remote_svi_ip in neigh_output:
+                        for line in neigh_output.split('\n'):
+                            if remote_svi_ip in line and ('NOARP' in line or 'proto zebra' in line or 'extern_learn' in line):
+                                try:
+                                    _container_ip(frr_manager, container_name, ["ip", "neigh", "del", remote_svi_ip, "dev", iface])
+                                    logger.info("[VXLAN ARP/FDB] ✅ Deleted existing zebra-managed ARP entry for %s on %s", remote_svi_ip, iface)
+                                    import time
+                                    time.sleep(0.2)  # Give time for deletion to complete
+                                except Exception as del_exc:
+                                    logger.warning("[VXLAN ARP/FDB] Failed to delete zebra ARP entry on %s: %s", iface, del_exc)
+                                break
+                except Exception as check_exc:
+                    logger.debug("[VXLAN ARP/FDB] Error checking ARP on %s: %s", iface, check_exc)
+            
+            # Now create kernel-managed ARP entry on the correct interface
             try:
                 _container_ip(frr_manager, container_name, [
                     "ip", "neigh", "replace", remote_svi_ip,
@@ -2437,27 +2448,47 @@ def configure_vxlan_arp_fdb_from_evpn(device_id: str, vxlan_config: Dict[str, An
                         logger.error("[VXLAN ARP/FDB] ❌ remote_ip is also 0.0.0.0, skipping FDB entry")
                         return False
                 
-                # Check if FDB entry exists with wrong VTEP IP and delete it
+                # Check if FDB entry exists with wrong VTEP IP and delete ALL of them
+                # Need to delete entries with dst 0.0.0.0 or wrong VTEP IP
                 try:
                     fdb_result = container.exec_run(["bridge", "fdb", "show", "dev", vxlan_iface])
                     fdb_output = fdb_result.output.decode("utf-8", errors="ignore") if isinstance(fdb_result.output, bytes) else str(fdb_result.output)
+                    deleted_entries = []
                     for line in fdb_output.split('\n'):
                         if remote_mac.lower() in line.lower() and 'dst' in line:
                             parts = line.split()
                             current_dst = None
+                            vlan_tag = None
+                            # Extract destination IP
                             for i, part in enumerate(parts):
                                 if part == 'dst' and i+1 < len(parts):
                                     current_dst = parts[i+1]
                                     break
-                            if current_dst and current_dst != actual_vtep_ip and (current_dst == '0.0.0.0' or current_dst == remote_ip):
+                                if part == 'vlan' and i+1 < len(parts):
+                                    try:
+                                        vlan_tag = int(parts[i+1])
+                                    except (ValueError, IndexError):
+                                        pass
+                            
+                            # Delete if destination is wrong (0.0.0.0, wrong VTEP, or old remote_ip)
+                            if current_dst and current_dst != actual_vtep_ip and (current_dst == '0.0.0.0' or current_dst == '::' or current_dst == remote_ip):
                                 try:
                                     del_cmd = ["bridge", "fdb", "del", remote_mac, "dev", vxlan_iface, "dst", current_dst]
+                                    if vlan_tag:
+                                        del_cmd.extend(["vlan", str(vlan_tag)])
+                                    del_cmd.extend(["self"])
                                     _container_ip(frr_manager, container_name, del_cmd)
-                                    logger.info("[VXLAN ARP/FDB] Deleted existing FDB entry with wrong VTEP %s", current_dst)
-                                except Exception:
-                                    pass
-                except Exception:
-                    pass
+                                    deleted_entries.append(f"{current_dst} (vlan {vlan_tag})" if vlan_tag else current_dst)
+                                    logger.info("[VXLAN ARP/FDB] Deleted existing FDB entry with wrong VTEP %s", deleted_entries[-1])
+                                    import time
+                                    time.sleep(0.1)  # Give time for deletion to complete
+                                except Exception as del_exc:
+                                    logger.warning("[VXLAN ARP/FDB] Failed to delete FDB entry with dst %s: %s", current_dst, del_exc)
+                    
+                    if deleted_entries:
+                        logger.info("[VXLAN ARP/FDB] Deleted %d FDB entry/entries with wrong VTEP: %s", len(deleted_entries), ", ".join(deleted_entries))
+                except Exception as fdb_check_exc:
+                    logger.warning("[VXLAN ARP/FDB] Error checking FDB entries: %s", fdb_check_exc)
                 
                 fdb_cmd = [
                     "bridge",
