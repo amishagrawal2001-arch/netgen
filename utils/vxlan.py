@@ -1223,7 +1223,15 @@ def _ensure_vxlan_in_container_iproute(
             logger.warning("[VXLAN] Failed to configure bridge %s SVI in FRR (non-critical): %s", bridge_name, bridge_config_exc)
         
         # Configure VLAN-to-VNI mapping in FRR if VLAN-aware mode
+        # NOTE: FRR 10.5.0 auto-detects VLAN-to-VNI mapping from bridge VLAN configuration
+        # The explicit `vxlan vlan` command may not be available in all FRR versions
+        # FRR detects the mapping when:
+        # 1. Bridge has VLAN filtering enabled
+        # 2. VXLAN interface is a member of the bridge with VLAN as PVID
+        # 3. VLAN subinterface exists on the bridge
         if vlan_id and vlan_id > 0:
+            # Try explicit configuration (may not be available in FRR 10.5.0)
+            mapping_configured = False
             try:
                 _run_vtysh(frr_manager, container_name, [
                     "configure terminal",
@@ -1231,9 +1239,27 @@ def _ensure_vxlan_in_container_iproute(
                     "exit",
                     "write"
                 ])
-                logger.info("[VXLAN] Configured VLAN-aware mapping: VLAN %s → VNI %s in FRR", vlan_id, vni)
+                logger.info("[VXLAN] Configured VLAN-aware mapping: VLAN %s → VNI %s in FRR (explicit)", vlan_id, vni)
+                mapping_configured = True
             except Exception as vlan_vni_exc:
-                logger.warning("[VXLAN] Failed to configure VLAN-to-VNI mapping in FRR: %s", vlan_vni_exc)
+                # Command may not be available in FRR 10.5.0 - FRR auto-detects from bridge config
+                logger.debug("[VXLAN] Explicit VLAN-to-VNI mapping command not available (FRR will auto-detect): %s", vlan_vni_exc)
+            
+            # Verify the mapping is detected by FRR (auto-detection)
+            try:
+                import time
+                time.sleep(1)  # Give FRR time to detect the mapping
+                container = frr_manager.client.containers.get(container_name)
+                evpn_vni_result = container.exec_run(["vtysh", "-c", f"show evpn vni {vni} detail"])
+                evpn_vni_output = evpn_vni_result.output.decode("utf-8", errors="ignore") if isinstance(evpn_vni_result.output, bytes) else str(evpn_vni_result.output)
+                
+                # Check if VLAN is detected in EVPN VNI output
+                if f"Vlan: {vlan_id}" in evpn_vni_output or f"Vlan: {vlan_id}" in evpn_vni_output:
+                    logger.info("[VXLAN] ✅ Verified VLAN-to-VNI mapping: VLAN %s → VNI %s (auto-detected by FRR)", vlan_id, vni)
+                else:
+                    logger.warning("[VXLAN] ⚠️ VLAN-to-VNI mapping may not be detected. Expected Vlan: %s in EVPN VNI %s", vlan_id, vni)
+            except Exception as verify_exc:
+                logger.debug("[VXLAN] Could not verify VLAN-to-VNI mapping (non-critical): %s", verify_exc)
     except Exception as exc:
         logger.warning("[VXLAN] Failed to configure VXLAN interface in FRR (non-critical): %s", exc)
     
@@ -1948,6 +1974,7 @@ def _ensure_vxlan_in_container_iproute(
                 
                 # Get actual VTEP IP for FDB entry
                 # Use the actual VTEP IP we extracted earlier, or try to extract it now
+                fdb_dst_ip = None  # Initialize to None to ensure it's set
                 if 'actual_vtep_ip' in locals() and actual_vtep_ip and actual_vtep_ip != remote_ip and actual_vtep_ip != local_ip and actual_vtep_ip != '0.0.0.0':
                     fdb_dst_ip = actual_vtep_ip
                     logger.debug("[VXLAN] Using extracted actual VTEP IP %s for FDB entry", fdb_dst_ip)
@@ -2065,26 +2092,26 @@ def _ensure_vxlan_in_container_iproute(
                 if skip_fdb or fdb_dst_ip == '0.0.0.0' or fdb_dst_ip == '::' or not fdb_dst_ip:
                     logger.error("[VXLAN] ❌ Cannot create FDB entry with invalid destination IP: %s", fdb_dst_ip)
                     # Skip FDB entry creation - already logged above
-                
-                # Build FDB command - include VLAN tag if VLAN-aware mode is enabled
-                fdb_cmd = [
-                    "bridge",
-                    "fdb",
-                    "add",
-                    remote_mac,
-                    "dev",
-                    vxlan_iface,
-                    "dst",
-                    fdb_dst_ip,
-                ]
-                if vlan_id and vlan_id > 0:
-                    fdb_cmd.extend(["vlan", str(vlan_id)])
-                    logger.debug("[VXLAN] Adding FDB entry with VLAN %s for VLAN-aware VXLAN", vlan_id)
-                fdb_cmd.extend(["self", "permanent"])
-                _container_ip(frr_manager, container_name, fdb_cmd)
-                logger.info("[VXLAN] Configured FDB entry: %s -> %s via %s (permanent, VTEP: %s%s)", 
-                           remote_mac, fdb_dst_ip, vxlan_iface, fdb_dst_ip, 
-                           f", VLAN: {vlan_id}" if vlan_id and vlan_id > 0 else "")
+                else:
+                    # Build FDB command - include VLAN tag if VLAN-aware mode is enabled
+                    fdb_cmd = [
+                        "bridge",
+                        "fdb",
+                        "add",
+                        remote_mac,
+                        "dev",
+                        vxlan_iface,
+                        "dst",
+                        fdb_dst_ip,
+                    ]
+                    if vlan_id and vlan_id > 0:
+                        fdb_cmd.extend(["vlan", str(vlan_id)])
+                        logger.debug("[VXLAN] Adding FDB entry with VLAN %s for VLAN-aware VXLAN", vlan_id)
+                    fdb_cmd.extend(["self", "permanent"])
+                    _container_ip(frr_manager, container_name, fdb_cmd)
+                    logger.info("[VXLAN] Configured FDB entry: %s -> %s via %s (permanent, VTEP: %s%s)", 
+                               remote_mac, fdb_dst_ip, vxlan_iface, fdb_dst_ip, 
+                               f", VLAN: {vlan_id}" if vlan_id and vlan_id > 0 else "")
                 
                 # Ensure kernel route exists to actual VTEP IP (for FDB destination)
                 # This is CRITICAL for VXLAN encapsulation to work
