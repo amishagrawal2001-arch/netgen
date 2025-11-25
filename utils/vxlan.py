@@ -2287,25 +2287,51 @@ def configure_vxlan_arp_fdb_from_evpn(device_id: str, vxlan_config: Dict[str, An
         
         remote_mac = None
         # Parse EVPN output to find MAC for remote SVI IP
+        # Format: [2]:[EthTag]:[48]:[MAC]:[32]:[IP]
+        # Example: [2]:[5000]:[48]:[24:5d:92:a7:65:06]:[32]:[10.0.0.101]
+        import re
         for line in evpn_output.split('\n'):
-            if remote_svi_ip in line and 'MAC/IP' in line:
-                # Try to extract MAC address from the route
-                # Format example: "2:0:0:48:24:5d:92:a7:65:06:128:192.255.0.101"
-                parts = line.split()
-                for part in parts:
-                    if ':' in part and len(part.split(':')) >= 6:
-                        route_parts = part.split(':')
-                        if len(route_parts) >= 10:
-                            try:
-                                mac_octets = route_parts[4:10]
-                                if len(mac_octets) == 6:
-                                    remote_mac = ':'.join(f"{int(octet, 16):02x}" for octet in mac_octets)
-                                    logger.info("[VXLAN ARP/FDB] Found MAC %s for remote SVI IP %s from EVPN routes", remote_mac, remote_svi_ip)
-                                    break
-                            except (ValueError, IndexError):
-                                continue
-                if remote_mac:
-                    break
+            if remote_svi_ip in line and '[2]:' in line:
+                # Match Type-2 route with IP: [2]:[EthTag]:[48]:[MAC]:[32]:[IP]
+                # Extract MAC and IP from route string
+                match = re.search(r'\[2\]:\[(\d+)\]:\[48\]:\[([0-9a-fA-F:]+)\]:\[32\]:\[([0-9.]+)\]', line)
+                if match:
+                    eth_tag = match.group(1)
+                    mac_str = match.group(2)
+                    ip_str = match.group(3)
+                    if ip_str == remote_svi_ip:
+                        # Convert MAC from hex format (24:5d:92:a7:65:06) to standard format
+                        try:
+                            mac_parts = mac_str.split(':')
+                            if len(mac_parts) == 6:
+                                remote_mac = ':'.join(f"{int(part, 16):02x}" for part in mac_parts)
+                                logger.info("[VXLAN ARP/FDB] Found MAC %s for remote SVI IP %s from EVPN Type-2 route (EthTag=%s)", remote_mac, remote_svi_ip, eth_tag)
+                                break
+                        except (ValueError, IndexError) as e:
+                            logger.debug("[VXLAN ARP/FDB] Failed to parse MAC from route: %s", e)
+                            continue
+                else:
+                    # Fallback: try to extract MAC from route parts manually
+                    # Format: [2]:[5000]:[48]:[24:5d:92:a7:65:06]:[32]:[10.0.0.101]
+                    parts = line.split()
+                    for part in parts:
+                        if '[2]:' in part and remote_svi_ip in part:
+                            # Extract MAC from route string
+                            route_match = re.search(r'\[48\]:\[([0-9a-fA-F:]+)\]:\[32\]:\[([0-9.]+)\]', part)
+                            if route_match:
+                                mac_str = route_match.group(1)
+                                ip_str = route_match.group(2)
+                                if ip_str == remote_svi_ip:
+                                    try:
+                                        mac_parts = mac_str.split(':')
+                                        if len(mac_parts) == 6:
+                                            remote_mac = ':'.join(f"{int(p, 16):02x}" for p in mac_parts)
+                                            logger.info("[VXLAN ARP/FDB] Found MAC %s for remote SVI IP %s from EVPN route (fallback)", remote_mac, remote_svi_ip)
+                                            break
+                                    except (ValueError, IndexError):
+                                        continue
+                    if remote_mac:
+                        break
         
         if remote_mac and remote_svi_ip:
             # Determine SVI interface for ARP entries (VLAN subinterface if VLAN-aware, bridge otherwise)
