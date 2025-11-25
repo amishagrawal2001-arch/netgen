@@ -1954,9 +1954,18 @@ def _ensure_vxlan_in_container_iproute(
                                             break
                         except Exception:
                             pass
-                    if not fdb_dst_ip or fdb_dst_ip == '0.0.0.0':
+                    # CRITICAL: Explicitly reject 0.0.0.0 as it's invalid for FDB entries
+                    if not fdb_dst_ip or fdb_dst_ip == '0.0.0.0' or fdb_dst_ip == '::':
                         fdb_dst_ip = remote_ip
-                        logger.warning("[VXLAN] Using remote_ip %s as FDB destination (actual VTEP IP not found)", fdb_dst_ip)
+                        logger.warning("[VXLAN] Using remote_ip %s as FDB destination (actual VTEP IP not found, rejected 0.0.0.0)", fdb_dst_ip)
+                    
+                    # Final validation: ensure fdb_dst_ip is not 0.0.0.0 before using it
+                    if fdb_dst_ip == '0.0.0.0' or fdb_dst_ip == '::':
+                        logger.error("[VXLAN] ❌ Invalid FDB destination IP %s, cannot create FDB entry", fdb_dst_ip)
+                        fdb_dst_ip = remote_ip  # Use remote_ip as last resort
+                        if fdb_dst_ip == '0.0.0.0':
+                            logger.error("[VXLAN] ❌ remote_ip is also 0.0.0.0, skipping FDB entry creation")
+                            continue  # Skip this MAC if we can't determine valid VTEP IP
                 
                 # If we still don't have the correct VTEP IP, try to get it from Type-2 route details
                 if fdb_dst_ip == remote_ip or fdb_dst_ip == bgp_next_hop or fdb_dst_ip == local_ip:
@@ -2031,6 +2040,11 @@ def _ensure_vxlan_in_container_iproute(
                 except Exception:
                     pass  # Continue even if FDB check fails
                 
+                # CRITICAL: Final validation before creating FDB entry - reject 0.0.0.0
+                if fdb_dst_ip == '0.0.0.0' or fdb_dst_ip == '::' or not fdb_dst_ip:
+                    logger.error("[VXLAN] ❌ Cannot create FDB entry with invalid destination IP: %s", fdb_dst_ip)
+                    continue  # Skip this MAC
+                
                 # Build FDB command - include VLAN tag if VLAN-aware mode is enabled
                 fdb_cmd = [
                     "bridge",
@@ -2051,19 +2065,55 @@ def _ensure_vxlan_in_container_iproute(
                            remote_mac, fdb_dst_ip, vxlan_iface, fdb_dst_ip, 
                            f", VLAN: {vlan_id}" if vlan_id and vlan_id > 0 else "")
                 
-                # Ensure route exists to actual VTEP IP (for FDB destination) if different from remote_ip
-                if fdb_dst_ip and fdb_dst_ip != remote_ip:
+                # Ensure kernel route exists to actual VTEP IP (for FDB destination)
+                # This is CRITICAL for VXLAN encapsulation to work
+                # Check both fdb_dst_ip and remote_ip to ensure routes exist
+                vtep_ips_to_check = []
+                if fdb_dst_ip and fdb_dst_ip != '0.0.0.0' and fdb_dst_ip != '::':
+                    vtep_ips_to_check.append(fdb_dst_ip)
+                if remote_ip and remote_ip not in vtep_ips_to_check and remote_ip != '0.0.0.0' and remote_ip != '::':
+                    vtep_ips_to_check.append(remote_ip)
+                
+                for vtep_ip in vtep_ips_to_check:
                     try:
                         container = frr_manager.client.containers.get(container_name)
-                        route_check = container.exec_run(["ip", "route", "show", fdb_dst_ip])
+                        # First check FRR routing table (preferred - uses routing protocols)
+                        frr_route_result = container.exec_run(["vtysh", "-c", f"show ip route {vtep_ip}"])
+                        frr_route_output = frr_route_result.output.decode("utf-8", errors="ignore") if isinstance(frr_route_result.output, bytes) else str(frr_route_result.output)
+                        
+                        # Check if route exists in kernel table
+                        route_check = container.exec_run(["ip", "route", "show", vtep_ip])
                         route_check_output = route_check.output.decode("utf-8", errors="ignore") if isinstance(route_check.output, bytes) else str(route_check.output)
                         
-                        if not route_check_output.strip() or fdb_dst_ip not in route_check_output:
-                            # No route exists, try to add one via underlay
+                        # If route exists in FRR but not in kernel, or no route at all, add kernel route
+                        has_frr_route = vtep_ip in frr_route_output and ('ospf' in frr_route_output.lower() or 'bgp' in frr_route_output.lower() or 'isis' in frr_route_output.lower())
+                        has_kernel_route = vtep_ip in route_check_output and route_check_output.strip()
+                        
+                        if not has_kernel_route:
+                            # Try to extract next-hop from FRR route if available
+                            next_hop = None
+                            if has_frr_route:
+                                # Parse FRR route output to get next-hop
+                                for line in frr_route_output.split('\n'):
+                                    if 'via' in line and 'dev' in line:
+                                        parts = line.split()
+                                        via_idx = parts.index('via') if 'via' in parts else -1
+                                        dev_idx = parts.index('dev') if 'dev' in parts else -1
+                                        if via_idx >= 0 and via_idx + 1 < len(parts):
+                                            next_hop = parts[via_idx + 1]
+                                            if dev_idx >= 0 and dev_idx + 1 < len(parts):
+                                                dev = parts[dev_idx + 1]
+                                                try:
+                                                    _container_ip(frr_manager, container_name, ["ip", "route", "replace", f"{vtep_ip}/32", "via", next_hop, "dev", dev])
+                                                    logger.info("[VXLAN] ✅ Added kernel route to VTEP IP %s via %s dev %s (from FRR route)", vtep_ip, next_hop, dev)
+                                                    continue
+                                                except Exception:
+                                                    pass
+                            
+                            # Fallback: try direct route via underlay interface
                             try:
-                                # Try direct route via underlay interface
-                                _container_ip(frr_manager, container_name, ["ip", "route", "replace", f"{fdb_dst_ip}/32", "dev", underlay])
-                                logger.info("[VXLAN] Added route to actual VTEP IP %s via %s", fdb_dst_ip, underlay)
+                                _container_ip(frr_manager, container_name, ["ip", "route", "replace", f"{vtep_ip}/32", "dev", underlay])
+                                logger.info("[VXLAN] ✅ Added kernel route to VTEP IP %s via %s (direct)", vtep_ip, underlay)
                             except Exception as route_vtep_exc:
                                 # If direct route fails, try via gateway
                                 try:
@@ -2079,10 +2129,10 @@ def _ensure_vxlan_in_container_iproute(
                                                     gateway = parts[idx + 1]
                                                     break
                                     if gateway:
-                                        _container_ip(frr_manager, container_name, ["ip", "route", "replace", f"{fdb_dst_ip}/32", "via", gateway, "dev", underlay])
-                                        logger.info("[VXLAN] Added route to actual VTEP IP %s via gateway %s", fdb_dst_ip, gateway)
+                                        _container_ip(frr_manager, container_name, ["ip", "route", "replace", f"{vtep_ip}/32", "via", gateway, "dev", underlay])
+                                        logger.info("[VXLAN] ✅ Added kernel route to VTEP IP %s via gateway %s dev %s", vtep_ip, gateway, underlay)
                                 except Exception:
-                                    logger.debug("[VXLAN] Could not add route to actual VTEP IP %s (non-critical)", fdb_dst_ip)
+                                    logger.debug("[VXLAN] Could not add kernel route to VTEP IP %s (non-critical)", vtep_ip)
                     except Exception:
                         pass  # Non-critical
             except Exception as fdb_exc:
