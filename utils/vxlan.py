@@ -2632,8 +2632,8 @@ def configure_vxlan_arp_fdb_from_evpn(device_id: str, vxlan_config: Dict[str, An
                                     logger.debug("[VXLAN ARP/FDB] Could not find MAC for remote VTEP %s on underlay interface %s", actual_vtep_ip, underlay_interface)
                             else:
                                 logger.debug("[VXLAN ARP/FDB] Underlay interface not found, skipping remote VTEP ARP configuration")
-                    except Exception as vtep_arp_exc:
-                        logger.debug("[VXLAN ARP/FDB] Error configuring remote VTEP ARP: %s", vtep_arp_exc)
+                        except Exception as vtep_arp_exc:
+                            logger.debug("[VXLAN ARP/FDB] Error configuring remote VTEP ARP: %s", vtep_arp_exc)
                 
                 return True
             except Exception as fdb_exc:
