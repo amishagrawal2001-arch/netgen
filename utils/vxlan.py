@@ -1980,12 +1980,13 @@ def _ensure_vxlan_in_container_iproute(
                         logger.warning("[VXLAN] Using remote_ip %s as FDB destination (actual VTEP IP not found, rejected 0.0.0.0)", fdb_dst_ip)
                     
                     # Final validation: ensure fdb_dst_ip is not 0.0.0.0 before using it
+                    skip_fdb = False
                     if fdb_dst_ip == '0.0.0.0' or fdb_dst_ip == '::':
                         logger.error("[VXLAN] ❌ Invalid FDB destination IP %s, cannot create FDB entry", fdb_dst_ip)
                         fdb_dst_ip = remote_ip  # Use remote_ip as last resort
                         if fdb_dst_ip == '0.0.0.0':
                             logger.error("[VXLAN] ❌ remote_ip is also 0.0.0.0, skipping FDB entry creation")
-                            continue  # Skip this MAC if we can't determine valid VTEP IP
+                            skip_fdb = True  # Skip FDB entry creation if we can't determine valid VTEP IP
                 
                 # If we still don't have the correct VTEP IP, try to get it from Type-2 route details
                 if fdb_dst_ip == remote_ip or fdb_dst_ip == bgp_next_hop or fdb_dst_ip == local_ip:
@@ -2061,9 +2062,9 @@ def _ensure_vxlan_in_container_iproute(
                     pass  # Continue even if FDB check fails
                 
                 # CRITICAL: Final validation before creating FDB entry - reject 0.0.0.0
-                if fdb_dst_ip == '0.0.0.0' or fdb_dst_ip == '::' or not fdb_dst_ip:
+                if skip_fdb or fdb_dst_ip == '0.0.0.0' or fdb_dst_ip == '::' or not fdb_dst_ip:
                     logger.error("[VXLAN] ❌ Cannot create FDB entry with invalid destination IP: %s", fdb_dst_ip)
-                    continue  # Skip this MAC
+                    # Skip FDB entry creation - already logged above
                 
                 # Build FDB command - include VLAN tag if VLAN-aware mode is enabled
                 fdb_cmd = [
