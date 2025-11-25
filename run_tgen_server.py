@@ -2716,6 +2716,46 @@ def apply_device():
                 vxlan_error = str(vxlan_exc)
                 logging.error(f"[DEVICE APPLY] VXLAN setup failed for {device_id}: {vxlan_exc}", exc_info=True)
                 result["vxlan_error"] = vxlan_error
+            
+            # CRITICAL: Configure ARP/FDB entries from EVPN routes after VXLAN is set up
+            # This needs to be done after EVPN routes are received (BGP EVPN is configured)
+            # Use a background thread with delay to allow EVPN routes to be received
+            if vxlan_enabled and vxlan_state in ["Configured", "Partial"]:
+                import threading
+                def configure_arp_fdb_delayed():
+                    """Configure ARP/FDB entries from EVPN routes after a delay."""
+                    import time
+                    # Wait for BGP EVPN to establish and routes to be received
+                    time.sleep(10)  # Give BGP EVPN time to establish and exchange routes
+                    try:
+                        logging.info(f"[DEVICE APPLY] Configuring ARP/FDB entries from EVPN routes for device {device_id}")
+                        # Handle multiple tunnels format
+                        if isinstance(vxlan_config, dict) and "tunnels" in vxlan_config:
+                            tunnels = vxlan_config.get("tunnels", [])
+                            for tunnel in tunnels:
+                                if isinstance(tunnel, dict):
+                                    vxlan_utils.configure_vxlan_arp_fdb_from_evpn(
+                                        device_id,
+                                        tunnel,
+                                        container_name=container_name if container_exists else None,
+                                        frr_manager=frr_manager,
+                                    )
+                        else:
+                            # Single tunnel format
+                            vxlan_utils.configure_vxlan_arp_fdb_from_evpn(
+                                device_id,
+                                vxlan_config,
+                                container_name=container_name if container_exists else None,
+                                frr_manager=frr_manager,
+                            )
+                        logging.info(f"[DEVICE APPLY] ✅ ARP/FDB configuration from EVPN routes completed for device {device_id}")
+                    except Exception as arp_fdb_exc:
+                        logging.warning(f"[DEVICE APPLY] Failed to configure ARP/FDB from EVPN routes for {device_id}: {arp_fdb_exc}")
+                
+                # Start background thread to configure ARP/FDB after delay
+                arp_fdb_thread = threading.Thread(target=configure_arp_fdb_delayed, daemon=True)
+                arp_fdb_thread.start()
+                logging.info(f"[DEVICE APPLY] Started background thread to configure ARP/FDB from EVPN routes for device {device_id} (will run after 10s delay)")
         
         # CRITICAL: Save/update device in database BEFORE starting protocol config thread
         # so that BGP EVPN can read VXLAN config from the database
