@@ -2590,48 +2590,48 @@ def configure_vxlan_arp_fdb_from_evpn(device_id: str, vxlan_config: Dict[str, An
                                     pass
                             
                             if underlay_interface:
-                            # Get MAC address for remote VTEP from BGP neighbor ARP entry
-                            # The remote VTEP MAC is typically the same as the BGP neighbor MAC
-                            vtep_mac = None
-                            try:
-                                neigh_result = container.exec_run(["ip", "neigh", "show", "dev", underlay_interface])
-                                neigh_output = neigh_result.output.decode("utf-8", errors="ignore") if isinstance(neigh_result.output, bytes) else str(neigh_result.output)
-                                
-                                # Look for BGP neighbor IP or remote VTEP IP in ARP table
-                                for line in neigh_output.split('\n'):
-                                    if bgp_neighbor_ip in line or actual_vtep_ip in line:
-                                        # Extract MAC address (format: "IP lladdr MAC ...")
-                                        mac_match = re.search(r'lladdr\s+([0-9a-fA-F:]{17})', line)
-                                        if mac_match:
-                                            vtep_mac = mac_match.group(1)
-                                            logger.debug("[VXLAN ARP/FDB] Found VTEP MAC %s from ARP table on %s", vtep_mac, underlay_interface)
-                                            break
-                            except Exception:
-                                pass
-                            
-                            # If we found the MAC, configure ARP entry for remote VTEP
-                            if vtep_mac:
+                                # Get MAC address for remote VTEP from BGP neighbor ARP entry
+                                # The remote VTEP MAC is typically the same as the BGP neighbor MAC
+                                vtep_mac = None
                                 try:
-                                    # Delete any existing ARP entry for remote VTEP
-                                    try:
-                                        _container_ip(frr_manager, container_name, ["ip", "neigh", "del", actual_vtep_ip, "dev", underlay_interface])
-                                    except Exception:
-                                        pass
+                                    neigh_result = container.exec_run(["ip", "neigh", "show", "dev", underlay_interface])
+                                    neigh_output = neigh_result.output.decode("utf-8", errors="ignore") if isinstance(neigh_result.output, bytes) else str(neigh_result.output)
                                     
-                                    # Create permanent ARP entry for remote VTEP
-                                    _container_ip(frr_manager, container_name, [
-                                        "ip", "neigh", "replace", actual_vtep_ip,
-                                        "lladdr", vtep_mac,
-                                        "dev", underlay_interface,
-                                        "nud", "permanent"
-                                    ])
-                                    logger.info("[VXLAN ARP/FDB] ✅ Configured permanent ARP entry for remote VTEP %s -> %s on underlay interface %s", actual_vtep_ip, vtep_mac, underlay_interface)
-                                except Exception as vtep_arp_exc:
-                                    logger.warning("[VXLAN ARP/FDB] Failed to configure ARP for remote VTEP %s: %s", actual_vtep_ip, vtep_arp_exc)
+                                    # Look for BGP neighbor IP or remote VTEP IP in ARP table
+                                    for line in neigh_output.split('\n'):
+                                        if bgp_neighbor_ip in line or actual_vtep_ip in line:
+                                            # Extract MAC address (format: "IP lladdr MAC ...")
+                                            mac_match = re.search(r'lladdr\s+([0-9a-fA-F:]{17})', line)
+                                            if mac_match:
+                                                vtep_mac = mac_match.group(1)
+                                                logger.debug("[VXLAN ARP/FDB] Found VTEP MAC %s from ARP table on %s", vtep_mac, underlay_interface)
+                                                break
+                                except Exception:
+                                    pass
+                                
+                                # If we found the MAC, configure ARP entry for remote VTEP
+                                if vtep_mac:
+                                    try:
+                                        # Delete any existing ARP entry for remote VTEP
+                                        try:
+                                            _container_ip(frr_manager, container_name, ["ip", "neigh", "del", actual_vtep_ip, "dev", underlay_interface])
+                                        except Exception:
+                                            pass
+                                        
+                                        # Create permanent ARP entry for remote VTEP
+                                        _container_ip(frr_manager, container_name, [
+                                            "ip", "neigh", "replace", actual_vtep_ip,
+                                            "lladdr", vtep_mac,
+                                            "dev", underlay_interface,
+                                            "nud", "permanent"
+                                        ])
+                                        logger.info("[VXLAN ARP/FDB] ✅ Configured permanent ARP entry for remote VTEP %s -> %s on underlay interface %s", actual_vtep_ip, vtep_mac, underlay_interface)
+                                    except Exception as vtep_arp_exc:
+                                        logger.warning("[VXLAN ARP/FDB] Failed to configure ARP for remote VTEP %s: %s", actual_vtep_ip, vtep_arp_exc)
+                                else:
+                                    logger.debug("[VXLAN ARP/FDB] Could not find MAC for remote VTEP %s on underlay interface %s", actual_vtep_ip, underlay_interface)
                             else:
-                                logger.debug("[VXLAN ARP/FDB] Could not find MAC for remote VTEP %s on underlay interface %s", actual_vtep_ip, underlay_interface)
-                        else:
-                            logger.debug("[VXLAN ARP/FDB] Underlay interface not found, skipping remote VTEP ARP configuration")
+                                logger.debug("[VXLAN ARP/FDB] Underlay interface not found, skipping remote VTEP ARP configuration")
                     except Exception as vtep_arp_exc:
                         logger.debug("[VXLAN ARP/FDB] Error configuring remote VTEP ARP: %s", vtep_arp_exc)
                 
