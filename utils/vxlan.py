@@ -2341,7 +2341,9 @@ def configure_vxlan_arp_fdb_from_evpn(device_id: str, vxlan_config: Dict[str, An
                 # Verify VLAN subinterface exists
                 try:
                     check_result = container.exec_run(["ip", "link", "show", svi_interface_for_arp])
-                    if check_result.returncode != 0:
+                    # Docker SDK uses exit_code, not returncode
+                    exit_code = check_result.exit_code if hasattr(check_result, 'exit_code') else (check_result.returncode if hasattr(check_result, 'returncode') else 0)
+                    if exit_code != 0:
                         logger.warning("[VXLAN ARP/FDB] VLAN subinterface %s not found, will try to create ARP on bridge %s", f"vlan{vlan_id}", bridge_name)
                         svi_interface_for_arp = bridge_name
                     else:
@@ -2368,10 +2370,20 @@ def configure_vxlan_arp_fdb_from_evpn(device_id: str, vxlan_config: Dict[str, An
                         for line in neigh_output.split('\n'):
                             if remote_svi_ip in line and ('NOARP' in line or 'proto zebra' in line or 'extern_learn' in line):
                                 try:
+                                    # Delete zebra-managed entry
                                     _container_ip(frr_manager, container_name, ["ip", "neigh", "del", remote_svi_ip, "dev", iface])
                                     logger.info("[VXLAN ARP/FDB] ✅ Deleted existing zebra-managed ARP entry for %s on %s", remote_svi_ip, iface)
                                     import time
-                                    time.sleep(0.2)  # Give time for deletion to complete
+                                    time.sleep(0.3)  # Give time for deletion to complete
+                                    
+                                    # CRITICAL: Also disable zebra from managing this ARP entry
+                                    # Set sysctl to prevent zebra from learning/managing ARP on this interface
+                                    try:
+                                        _container_ip(frr_manager, container_name, ["sysctl", "-w", f"net.ipv4.conf.{iface}.arp_ignore=1"])
+                                        _container_ip(frr_manager, container_name, ["sysctl", "-w", f"net.ipv4.conf.{iface}.arp_announce=2"])
+                                        logger.debug("[VXLAN ARP/FDB] Disabled zebra ARP management on %s", iface)
+                                    except Exception:
+                                        pass  # sysctl might fail, but continue anyway
                                 except Exception as del_exc:
                                     logger.warning("[VXLAN ARP/FDB] Failed to delete zebra ARP entry on %s: %s", iface, del_exc)
                                 break
