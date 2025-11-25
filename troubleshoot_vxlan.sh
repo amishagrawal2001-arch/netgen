@@ -118,6 +118,15 @@ fi
 echo -e "${BLUE}=== VXLAN Troubleshooting for Bridge: $BRIDGE_NAME (VNI: $VNI) ===${NC}"
 echo ""
 
+# Function to check if container exists
+check_container_exists() {
+    if [ -n "$SERVER" ]; then
+        ssh -o StrictHostKeyChecking=no "$SERVER" "docker ps -a --format '{{.ID}}' | grep -q '^$CONTAINER$' || docker ps -a --format '{{.Names}}' | grep -q '^$CONTAINER$'"
+    else
+        docker ps -a --format '{{.ID}}' | grep -q "^$CONTAINER$" || docker ps -a --format '{{.Names}}' | grep -q "^$CONTAINER$"
+    fi
+}
+
 # Function to run docker exec command locally or via SSH
 docker_exec() {
     local cmd="$1"
@@ -174,12 +183,15 @@ else
 fi
 
 # 5. FDB Entries
-cmd="ip link show type vxlan"
-VXLAN_IFACE=$(docker_exec "$cmd" 2>/dev/null | awk '/^[0-9]+:/ {print $2}' | sed 's/:$//' | head -n 1)
-# Alternative: try to find VXLAN interface by VNI pattern
+# Use VXLAN_IFACE if already detected, otherwise try to find it
 if [ -z "$VXLAN_IFACE" ]; then
     cmd="ip link show type vxlan"
-    VXLAN_IFACE=$(docker_exec "$cmd" 2>/dev/null | grep -E "vx${VNI}-" | awk '{print $2}' | sed 's/:$//' | head -n 1)
+    VXLAN_IFACE=$(docker_exec "$cmd" 2>/dev/null | awk '/^[0-9]+:/ {print $2}' | sed 's/:$//' | head -n 1)
+    # Alternative: try to find VXLAN interface by VNI pattern
+    if [ -z "$VXLAN_IFACE" ]; then
+        cmd="ip link show type vxlan"
+        VXLAN_IFACE=$(docker_exec "$cmd" 2>/dev/null | grep -E "vx${VNI}-" | awk '{print $2}' | sed 's/:$//' | head -n 1)
+    fi
 fi
 if [ -n "$VXLAN_IFACE" ]; then
     run_cmd "FDB Entries (VXLAN Interface: $VXLAN_IFACE)" "bridge fdb show dev $VXLAN_IFACE"
