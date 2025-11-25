@@ -2521,10 +2521,84 @@ def configure_vxlan_arp_fdb_from_evpn(device_id: str, vxlan_config: Dict[str, An
                 logger.info(
                     "[VXLAN ARP/FDB] Configured FDB entry: %s -> %s via %s%s",
                     remote_mac,
-                    remote_ip,
+                    actual_vtep_ip,
                     vxlan_iface,
                     f" (VLAN {vlan_id})" if vlan_id else "",
                 )
+                
+                # CRITICAL: Configure ARP entry for remote VTEP on underlay interface
+                # This is required for VXLAN encapsulation to work
+                # The remote VTEP IP needs to be reachable on the underlay
+                if actual_vtep_ip != remote_ip and actual_vtep_ip != '0.0.0.0':
+                    try:
+                        # Get underlay interface from config
+                        underlay_interface = config.get("underlay_interface")
+                        if not underlay_interface:
+                            # Try to find the interface that has the BGP neighbor IP
+                            # This is typically the interface used for BGP peering
+                            try:
+                                # Get BGP neighbor IP from config or try to derive it
+                                bgp_neighbor_ip = config.get("bgp_neighbor_ip") or remote_ip
+                                
+                                # Find interface that has route to BGP neighbor or remote VTEP
+                                route_result = container.exec_run(["ip", "route", "get", bgp_neighbor_ip])
+                                route_output = route_result.output.decode("utf-8", errors="ignore") if isinstance(route_result.output, bytes) else str(route_result.output)
+                                
+                                # Extract interface from route output (e.g., "192.168.0.1 via 192.168.0.2 dev vlan20")
+                                import re
+                                route_match = re.search(r'dev\s+(\S+)', route_output)
+                                if route_match:
+                                    underlay_interface = route_match.group(1)
+                                    logger.debug("[VXLAN ARP/FDB] Found underlay interface %s from route to %s", underlay_interface, bgp_neighbor_ip)
+                            except Exception:
+                                pass
+                        
+                        if underlay_interface:
+                            # Get MAC address for remote VTEP from BGP neighbor ARP entry
+                            # The remote VTEP MAC is typically the same as the BGP neighbor MAC
+                            vtep_mac = None
+                            try:
+                                neigh_result = container.exec_run(["ip", "neigh", "show", "dev", underlay_interface])
+                                neigh_output = neigh_result.output.decode("utf-8", errors="ignore") if isinstance(neigh_result.output, bytes) else str(neigh_result.output)
+                                
+                                # Look for BGP neighbor IP or remote VTEP IP in ARP table
+                                for line in neigh_output.split('\n'):
+                                    if bgp_neighbor_ip in line or actual_vtep_ip in line:
+                                        # Extract MAC address (format: "IP lladdr MAC ...")
+                                        mac_match = re.search(r'lladdr\s+([0-9a-fA-F:]{17})', line)
+                                        if mac_match:
+                                            vtep_mac = mac_match.group(1)
+                                            logger.debug("[VXLAN ARP/FDB] Found VTEP MAC %s from ARP table on %s", vtep_mac, underlay_interface)
+                                            break
+                            except Exception:
+                                pass
+                            
+                            # If we found the MAC, configure ARP entry for remote VTEP
+                            if vtep_mac:
+                                try:
+                                    # Delete any existing ARP entry for remote VTEP
+                                    try:
+                                        _container_ip(frr_manager, container_name, ["ip", "neigh", "del", actual_vtep_ip, "dev", underlay_interface])
+                                    except Exception:
+                                        pass
+                                    
+                                    # Create permanent ARP entry for remote VTEP
+                                    _container_ip(frr_manager, container_name, [
+                                        "ip", "neigh", "replace", actual_vtep_ip,
+                                        "lladdr", vtep_mac,
+                                        "dev", underlay_interface,
+                                        "nud", "permanent"
+                                    ])
+                                    logger.info("[VXLAN ARP/FDB] ✅ Configured permanent ARP entry for remote VTEP %s -> %s on underlay interface %s", actual_vtep_ip, vtep_mac, underlay_interface)
+                                except Exception as vtep_arp_exc:
+                                    logger.warning("[VXLAN ARP/FDB] Failed to configure ARP for remote VTEP %s: %s", actual_vtep_ip, vtep_arp_exc)
+                            else:
+                                logger.debug("[VXLAN ARP/FDB] Could not find MAC for remote VTEP %s on underlay interface %s", actual_vtep_ip, underlay_interface)
+                        else:
+                            logger.debug("[VXLAN ARP/FDB] Underlay interface not found, skipping remote VTEP ARP configuration")
+                    except Exception as vtep_arp_exc:
+                        logger.debug("[VXLAN ARP/FDB] Error configuring remote VTEP ARP: %s", vtep_arp_exc)
+                
                 return True
             except Exception as fdb_exc:
                 logger.warning("[VXLAN ARP/FDB] Failed to configure FDB entry: %s", fdb_exc)
