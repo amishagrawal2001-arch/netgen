@@ -1270,8 +1270,18 @@ TAR_NAME="$(basename "$OUTDIR").tar.gz"
 tar -czf "$TAR_NAME" -C "$(dirname "$OUTDIR")" "$(basename "$OUTDIR")"
 
 log_info "Done."
-log_info "Output directory: $OUTDIR"
-log_info "Tarball: $TAR_NAME"
+# Get absolute path of output directory
+OUTDIR_ABS=$(cd "$OUTDIR" 2>/dev/null && pwd || echo "$OUTDIR")
+TAR_ABS=$(cd "$(dirname "$TAR_NAME")" 2>/dev/null && echo "$(pwd)/$(basename "$TAR_NAME")" || echo "$TAR_NAME")
+log_info "Output directory: $OUTDIR_ABS"
+log_info "Tarball: $TAR_ABS"
+echo ""
+echo "=================================================="
+echo "Logs collected successfully!"
+echo "=================================================="
+echo "Output directory: $OUTDIR_ABS"
+echo "Tarball: $TAR_ABS"
+echo "=================================================="
 
 # Exit with non-zero code if critical issues found
 if [ "$ANALYSIS_EXIT_CODE" -gt 0 ]; then
