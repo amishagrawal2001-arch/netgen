@@ -2302,10 +2302,20 @@ class DevicesTab(QWidget):
                     device["protocols"] = []
                 if "VXLAN" not in device["protocols"]:
                     device["protocols"].append("VXLAN")
+                
+                # Update device table to reflect changes immediately
+                self.update_device_table(self.main_window.all_devices)
+                
+                # Refresh VXLAN table to show the new tunnels
+                if hasattr(self, "vxlan_handler") and self.vxlan_handler:
+                    from PyQt5.QtCore import QTimer
+                    QTimer.singleShot(100, self.vxlan_handler.refresh_vxlan_table)
             else:
-                # Device not found, create new tunnels structure
-                print(f"[VXLAN ADD] Device {device_name} not found, creating new tunnels structure")
-                logging.warning(f"[VXLAN ADD] Device {device_name} not found in all_devices")
+                # Device not found - this shouldn't happen, but handle gracefully
+                print(f"[VXLAN ADD] ERROR: Device {device_name} not found in all_devices")
+                logging.error(f"[VXLAN ADD] Device {device_name} not found in all_devices - cannot add tunnels")
+                QMessageBox.warning(self, "Device Not Found", f"Could not find device '{device_name}' to add VXLAN tunnels. Please ensure the device exists in the devices table.")
+                return  # Exit early if device not found
         else:
             # Single tunnel - add to device's tunnel list (support multiple tunnels per device)
             print(f"[VXLAN ADD] Adding single tunnel to device, VNI: {vxlan_config.get('vni')}")
