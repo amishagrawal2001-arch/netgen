@@ -819,9 +819,6 @@ GPU_OUT="$GPU_DIR/gpu_info.txt"
         echo ""
         echo "Note: After installing NVIDIA drivers, nvidia-smi will be available"
         echo "      and the script will collect additional GPU diagnostics."
-        echo ""
-        # Also print to stderr so it's visible in console output
-        echo "⚠️  WARNING: nvidia-smi not found. See installation instructions above." >&2
     fi
     echo ""
     
