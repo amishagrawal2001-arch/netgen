@@ -2438,6 +2438,30 @@ class DevicesTab(QWidget):
                     for device in devices:
                         if device.get("Device Name") == device_name:
                             vxlan_config = device.get("vxlan_config", {})
+                            # If local config is empty, try to load from database
+                            if not vxlan_config or (isinstance(vxlan_config, dict) and len(vxlan_config) == 0):
+                                device_id = device.get("device_id")
+                                if device_id:
+                                    try:
+                                        import requests
+                                        server_url = self.get_server_url()
+                                        if server_url:
+                                            response = requests.get(f"{server_url}/api/device/database/devices/{device_id}", timeout=5)
+                                            if response.status_code == 200:
+                                                db_device_data = response.json()
+                                                db_vxlan = db_device_data.get("vxlan_config", {})
+                                                if isinstance(db_vxlan, str):
+                                                    import json
+                                                    try:
+                                                        db_vxlan = json.loads(db_vxlan)
+                                                    except:
+                                                        db_vxlan = {}
+                                                if db_vxlan and (isinstance(db_vxlan, dict) and len(db_vxlan) > 0):
+                                                    device["vxlan_config"] = db_vxlan
+                                                    vxlan_config = db_vxlan
+                                                    print(f"[VXLAN APPLY] Loaded VXLAN config from database for {device_name}")
+                                    except Exception as db_load_exc:
+                                        print(f"[VXLAN APPLY] Failed to load VXLAN config from database: {db_load_exc}")
                             if vxlan_config:
                                 devices_to_apply.append(device)
                             break
@@ -2446,6 +2470,30 @@ class DevicesTab(QWidget):
             for iface, devices in self.main_window.all_devices.items():
                 for device in devices:
                     vxlan_config = device.get("vxlan_config", {})
+                    # If local config is empty, try to load from database
+                    if not vxlan_config or (isinstance(vxlan_config, dict) and len(vxlan_config) == 0):
+                        device_id = device.get("device_id")
+                        if device_id:
+                            try:
+                                import requests
+                                server_url = self.get_server_url()
+                                if server_url:
+                                    response = requests.get(f"{server_url}/api/device/database/devices/{device_id}", timeout=5)
+                                    if response.status_code == 200:
+                                        db_device_data = response.json()
+                                        db_vxlan = db_device_data.get("vxlan_config", {})
+                                        if isinstance(db_vxlan, str):
+                                            import json
+                                            try:
+                                                db_vxlan = json.loads(db_vxlan)
+                                            except:
+                                                db_vxlan = {}
+                                        if db_vxlan and (isinstance(db_vxlan, dict) and len(db_vxlan) > 0):
+                                            device["vxlan_config"] = db_vxlan
+                                            vxlan_config = db_vxlan
+                                            print(f"[VXLAN APPLY] Loaded VXLAN config from database for {device.get('Device Name')}")
+                            except Exception as db_load_exc:
+                                print(f"[VXLAN APPLY] Failed to load VXLAN config from database: {db_load_exc}")
                     if vxlan_config:
                         devices_to_apply.append(device)
         
