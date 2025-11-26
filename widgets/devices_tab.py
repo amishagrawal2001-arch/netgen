@@ -2206,7 +2206,8 @@ class DevicesTab(QWidget):
             base_vlan_id = vxlan_config.get("vlan_id")
             base_svi_ip = vxlan_config.get("bridge_svi_ip", "10.0.0.100/24")
             
-            # Create multiple VXLAN configurations
+            # Generate all tunnel configurations first
+            generated_tunnels = []
             for i in range(count):
                 tunnel_config = vxlan_config.copy()
                 tunnel_config.pop("increment", None)  # Remove increment config
@@ -2244,13 +2245,67 @@ class DevicesTab(QWidget):
                         print(f"[VXLAN] Error incrementing Bridge SVI IP: {e}")
                         tunnel_config["bridge_svi_ip"] = base_svi_ip
                 
-                # Update device with this tunnel configuration
-                # For multiple tunnels, we need to merge or create separate entries
-                # For now, we'll update the device with the last tunnel config
-                # TODO: Consider creating separate device entries for each tunnel
-                print(f"[VXLAN ADD] Updating device with tunnel {i+1}/{count}, VNI: {tunnel_config.get('vni')}")
-                logging.debug(f"[VXLAN ADD] Updating device with tunnel {i+1}/{count}, VNI: {tunnel_config.get('vni')}")
-                self._update_device_protocol(row, "VXLAN", tunnel_config)
+                generated_tunnels.append(tunnel_config)
+                print(f"[VXLAN ADD] Generated tunnel {i+1}/{count}, VNI: {tunnel_config.get('vni')}")
+                logging.debug(f"[VXLAN ADD] Generated tunnel {i+1}/{count}, VNI: {tunnel_config.get('vni')}")
+            
+            # Now merge all generated tunnels with existing tunnels
+            device_name = self.devices_table.item(row, self.COL["Device Name"]).text()
+            device = None
+            for iface, devices in self.main_window.all_devices.items():
+                for d in devices:
+                    if d.get("Device Name") == device_name:
+                        device = d
+                        break
+                if device:
+                    break
+            
+            if device:
+                # Get existing vxlan_config
+                existing_vxlan = device.get("vxlan_config", {})
+                
+                # If existing config is a dict, extract tunnels
+                if isinstance(existing_vxlan, dict) and existing_vxlan:
+                    if "tunnels" in existing_vxlan:
+                        existing_tunnels = existing_vxlan.get("tunnels", [])
+                    else:
+                        # Convert single tunnel dict to list format
+                        existing_tunnels = [existing_vxlan]
+                else:
+                    existing_tunnels = []
+                
+                # Merge generated tunnels with existing ones
+                # Check for duplicate VNIs and update existing or add new
+                for new_tunnel in generated_tunnels:
+                    new_vni = new_tunnel.get("vni")
+                    tunnel_exists = False
+                    for i, existing_tunnel in enumerate(existing_tunnels):
+                        if isinstance(existing_tunnel, dict) and existing_tunnel.get("vni") == new_vni:
+                            # Update existing tunnel with same VNI
+                            existing_tunnels[i] = new_tunnel
+                            tunnel_exists = True
+                            print(f"[VXLAN ADD] Updated existing tunnel with VNI {new_vni}")
+                            break
+                    
+                    if not tunnel_exists:
+                        # Add new tunnel
+                        existing_tunnels.append(new_tunnel)
+                        print(f"[VXLAN ADD] Added new tunnel with VNI {new_vni}")
+                
+                # Update device with merged tunnels
+                device["vxlan_config"] = {"tunnels": existing_tunnels}
+                print(f"[VXLAN ADD] Updated device with {len(existing_tunnels)} total tunnel(s) (generated {len(generated_tunnels)} new)")
+                logging.info(f"[VXLAN ADD] Updated device with {len(existing_tunnels)} total tunnel(s)")
+                
+                # Ensure VXLAN is in protocols
+                if "protocols" not in device:
+                    device["protocols"] = []
+                if "VXLAN" not in device["protocols"]:
+                    device["protocols"].append("VXLAN")
+            else:
+                # Device not found, create new tunnels structure
+                print(f"[VXLAN ADD] Device {device_name} not found, creating new tunnels structure")
+                logging.warning(f"[VXLAN ADD] Device {device_name} not found in all_devices")
         else:
             # Single tunnel - add to device's tunnel list (support multiple tunnels per device)
             print(f"[VXLAN ADD] Adding single tunnel to device, VNI: {vxlan_config.get('vni')}")
