@@ -1328,15 +1328,16 @@ def configure_bgp_for_device(device_id: str, bgp_config: Dict, ipv4: str = None,
                             ])
                             logging.info(f"[BGP EVPN] Added route-target import/export {rt_value} for VNI {tunnel_vni}")
                             
-                            # Configure per-VNI advertise-gw-macip and advertise-svi-macip
+                            # Configure per-VNI advertise-default-gw and advertise-svi-ip
                             # These must be configured under each VNI within the EVPN address-family
+                            # Note: FRR syntax is "advertise-default-gw" (not "advertise-gw-macip")
                             evpn_commands.extend([
                                 f"vni {tunnel_vni}",
-                                "advertise-gw-macip",  # Advertise gateway MAC/IP routes
-                                "advertise-svi-macip",  # Advertise SVI MAC/IP routes
+                                "advertise-default-gw",  # Advertise default gateway MAC/IP routes
+                                "advertise-svi-ip",  # Advertise SVI MAC/IP routes
                                 "exit-vni",  # Exit VNI configuration
                             ])
-                            logging.info(f"[BGP EVPN] Enabled advertise-gw-macip and advertise-svi-macip for VNI {tunnel_vni}")
+                            logging.info(f"[BGP EVPN] Enabled advertise-default-gw and advertise-svi-ip for VNI {tunnel_vni}")
                     except (ValueError, TypeError) as rt_exc:
                         logging.warning(f"[BGP EVPN] Could not add route-targets: {rt_exc}")
                     
