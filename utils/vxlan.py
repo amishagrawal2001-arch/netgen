@@ -2804,9 +2804,69 @@ def configure_vxlan_arp_fdb_from_evpn(device_id: str, vxlan_config: Dict[str, An
                 except Exception as fdb_cleanup_exc:
                     logger.debug("[VXLAN ARP/FDB] Error cleaning up FDB entries: %s", fdb_cleanup_exc)
             
-            # If we found a fallback MAC and valid VTEP IP, configure FDB entry
+            # If we found a fallback MAC and valid VTEP IP, configure both ARP and FDB entries
             if fallback_remote_mac and actual_vtep_ip and actual_vtep_ip != '0.0.0.0' and actual_vtep_ip != '::':
                 try:
+                    # Configure ARP entry using fallback MAC
+                    svi_interface_for_arp = bridge_name  # Default: bridge
+                    if vlan_id and vlan_id > 0:
+                        svi_interface_for_arp = f"vlan{vlan_id}"
+                        # Verify VLAN subinterface exists
+                        try:
+                            check_result = container.exec_run(["ip", "link", "show", svi_interface_for_arp])
+                            exit_code = check_result.exit_code if hasattr(check_result, 'exit_code') else (check_result.returncode if hasattr(check_result, 'returncode') else 0)
+                            if exit_code != 0:
+                                logger.warning("[VXLAN ARP/FDB] VLAN subinterface %s not found, will try to create ARP on bridge %s", f"vlan{vlan_id}", bridge_name)
+                                svi_interface_for_arp = bridge_name
+                        except Exception as check_exc:
+                            logger.warning("[VXLAN ARP/FDB] Error checking VLAN subinterface %s: %s, using bridge", f"vlan{vlan_id}", check_exc)
+                            svi_interface_for_arp = bridge_name
+                    
+                    # Delete any existing zebra-managed ARP entry first
+                    interfaces_to_check = [svi_interface_for_arp]
+                    if vlan_id and vlan_id > 0 and svi_interface_for_arp == f"vlan{vlan_id}":
+                        interfaces_to_check.append(bridge_name)
+                    
+                    for iface in interfaces_to_check:
+                        try:
+                            neigh_result = container.exec_run(["ip", "neigh", "show", "dev", iface])
+                            neigh_output = neigh_result.output.decode("utf-8", errors="ignore") if isinstance(neigh_result.output, bytes) else str(neigh_result.output)
+                            
+                            if remote_svi_ip in neigh_output:
+                                for line in neigh_output.split('\n'):
+                                    if remote_svi_ip in line and ('NOARP' in line or 'proto zebra' in line or 'extern_learn' in line or 'FAILED' in line):
+                                        try:
+                                            _container_ip(frr_manager, container_name, ["ip", "neigh", "del", remote_svi_ip, "dev", iface])
+                                            logger.info("[VXLAN ARP/FDB] ✅ Deleted existing zebra-managed/failed ARP entry for %s on %s", remote_svi_ip, iface)
+                                            import time
+                                            time.sleep(0.3)
+                                            
+                                            # Disable zebra ARP management
+                                            try:
+                                                _container_ip(frr_manager, container_name, ["sysctl", "-w", f"net.ipv4.conf.{iface}.arp_ignore=1"])
+                                                _container_ip(frr_manager, container_name, ["sysctl", "-w", f"net.ipv4.conf.{iface}.arp_announce=2"])
+                                                logger.debug("[VXLAN ARP/FDB] Disabled zebra ARP management on %s", iface)
+                                            except Exception:
+                                                pass
+                                        except Exception as del_exc:
+                                            logger.warning("[VXLAN ARP/FDB] Failed to delete ARP entry on %s: %s", iface, del_exc)
+                                        break
+                        except Exception as check_exc:
+                            logger.debug("[VXLAN ARP/FDB] Error checking ARP on %s: %s", iface, check_exc)
+                    
+                    # Create kernel-managed ARP entry using fallback MAC
+                    try:
+                        _container_ip(frr_manager, container_name, [
+                            "ip", "neigh", "replace", remote_svi_ip,
+                            "lladdr", fallback_remote_mac,
+                            "dev", svi_interface_for_arp,
+                            "nud", "permanent"
+                        ])
+                        logger.info("[VXLAN ARP/FDB] ✅ Configured permanent ARP entry using fallback MAC: %s -> %s on %s (kernel-managed)", remote_svi_ip, fallback_remote_mac, svi_interface_for_arp)
+                    except Exception as arp_exc:
+                        logger.warning("[VXLAN ARP/FDB] Failed to configure ARP entry with fallback MAC: %s", arp_exc)
+                    
+                    # Configure FDB entry using fallback MAC
                     fdb_cmd = [
                         "bridge",
                         "fdb",
