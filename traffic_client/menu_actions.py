@@ -750,20 +750,8 @@ class TrafficGenClientMenuAction():
             self.removed_interfaces = set()
             for iface in removed_interfaces_raw:
                 # Only keep entries that have the correct format "TG X - portname"
-                # Must verify: "TG " appears BEFORE " - " in the string
                 if iface and "TG " in iface and " - " in iface and not iface.startswith(" - "):
-                    # Verify that "TG " appears before " - " (correct order)
-                    tg_pos = iface.find("TG ")
-                    dash_pos = iface.find(" - ")
-                    if tg_pos != -1 and dash_pos != -1 and tg_pos < dash_pos:
-                        # Additional check: verify it matches pattern "TG \d+ - .*"
-                        import re
-                        if re.match(r'^TG\s+\d+\s+-\s+.+', iface):
-                            self.removed_interfaces.add(iface)
-                        else:
-                            print(f"[DEBUG LOAD] Skipping invalid removed interface format (pattern mismatch): {iface}")
-                    else:
-                        print(f"[DEBUG LOAD] Skipping invalid removed interface format (wrong order): {iface}")
+                    self.removed_interfaces.add(iface)
                 else:
                     print(f"[DEBUG LOAD] Skipping invalid removed interface format: {iface}")
             
