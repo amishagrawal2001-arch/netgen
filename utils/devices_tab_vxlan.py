@@ -158,8 +158,8 @@ class VXLANHandler:
             devices_from_local = []
             if hasattr(self.parent, "main_window") and hasattr(self.parent.main_window, "all_devices"):
                 print(f"[VXLAN TAB] Checking local devices, total interfaces: {len(self.parent.main_window.all_devices)}")
-                for iface, device_list in self.parent.main_window.all_devices.items():
-                    print(f"[VXLAN TAB] Checking interface: {iface}, devices: {len(device_list)}")
+                for iface_key, device_list in self.parent.main_window.all_devices.items():
+                    print(f"[VXLAN TAB] Checking interface: {iface_key}, devices: {len(device_list)}")
                     for device in device_list:
                         device_name = device.get("Device Name", "Unknown")
                         print(f"[VXLAN TAB] Checking device: {device_name}")
@@ -182,17 +182,19 @@ class VXLANHandler:
                         print(f"[VXLAN TAB] Device {device_name}: vxlan_cfg={bool(vxlan_cfg)}, type={type(vxlan_cfg)}, len={len(vxlan_cfg) if isinstance(vxlan_cfg, dict) else 'N/A'}, has_vxlan_protocol={has_vxlan_protocol}")
                         if (vxlan_cfg and isinstance(vxlan_cfg, dict) and len(vxlan_cfg) > 0) or has_vxlan_protocol:
                             # Create a device dict compatible with database format
+                            # CRITICAL: Store the interface_key from all_devices so we can properly match it later
                             local_device = {
                                 "device_id": device.get("device_id", ""),
                                 "device_name": device.get("Device Name", ""),
                                 "interface": device.get("Interface", ""),
+                                "interface_key": iface_key,  # Store the actual key from all_devices
                                 "vlan": device.get("VLAN", "0"),
                                 "vxlan_config": vxlan_cfg if vxlan_cfg else {},
                                 "vxlan_state": "Pending",  # Mark as pending until applied
                             }
                             devices_from_local.append(local_device)
-                            print(f"[VXLAN TAB] Found local device with VXLAN: {local_device.get('device_name')}, config keys: {list(vxlan_cfg.keys()) if vxlan_cfg else 'none'}")
-                            logging.debug(f"[VXLAN TAB] Found local device with VXLAN: {local_device.get('device_name')}, config keys: {list(vxlan_cfg.keys()) if vxlan_cfg else 'none'}")
+                            print(f"[VXLAN TAB] Found local device with VXLAN: {local_device.get('device_name')}, interface_key: {iface_key}, config keys: {list(vxlan_cfg.keys()) if vxlan_cfg else 'none'}")
+                            logging.debug(f"[VXLAN TAB] Found local device with VXLAN: {local_device.get('device_name')}, interface_key: {iface_key}, config keys: {list(vxlan_cfg.keys()) if vxlan_cfg else 'none'}")
 
             # Merge devices: prefer database entries (they have device_id), but include local-only entries
             device_map = {}
@@ -269,23 +271,30 @@ class VXLANHandler:
             for device in devices_from_local:
                 # Filter by interface if interfaces are selected
                 if interfaces_to_show:
-                    device_interface = device.get("Interface", "")
-                    # Match format: "TG X - interface_name"
-                    device_interface_key = None
-                    if device_interface:
+                    # Use the stored interface_key from all_devices (most reliable)
+                    device_interface_key = device.get("interface_key")
+                    
+                    # Fallback: try to match using Interface field if interface_key not available
+                    if not device_interface_key:
+                        device_interface = device.get("Interface", "")
                         # Try to find matching interface in all_devices
-                        if hasattr(self.parent, "main_window") and hasattr(self.parent.main_window, "all_devices"):
+                        if device_interface and hasattr(self.parent, "main_window") and hasattr(self.parent.main_window, "all_devices"):
+                            # Extract port name from Interface field (e.g., "ens4np0" from " - ens4np0")
+                            port_name = device_interface.strip().lstrip(" - ").strip()
                             for iface_key in self.parent.main_window.all_devices.keys():
-                                if device_interface in iface_key or iface_key.endswith(f" - {device_interface}"):
+                                if iface_key.endswith(f" - {port_name}") or iface_key == port_name:
                                     device_interface_key = iface_key
                                     break
                     
-                    # If we couldn't match, try direct match
+                    # If we still couldn't match, try direct match
                     if not device_interface_key:
-                        device_interface_key = device_interface
+                        device_interface_key = device.get("Interface", "").strip().lstrip(" - ").strip()
                     
                     if device_interface_key not in interfaces_to_show:
+                        print(f"[VXLAN TAB] Skipping local device {device.get('device_name')} - interface_key '{device_interface_key}' not in selected interfaces {interfaces_to_show}")
                         continue  # Skip devices not from selected interfaces
+                    else:
+                        print(f"[VXLAN TAB] Including local device {device.get('device_name')} - interface_key '{device_interface_key}' matches selected interfaces")
                 
                 device_id = device.get("device_id")
                 device_name = device.get("device_name")
