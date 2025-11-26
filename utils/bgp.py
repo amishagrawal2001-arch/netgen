@@ -1287,12 +1287,15 @@ def configure_bgp_for_device(device_id: str, bgp_config: Dict, ipv4: str = None,
                     
                     if router_bgp_index >= 0:
                         # Insert route-map commands before "router bgp"
-                        vtysh_commands.insert(router_bgp_index, "route-map PERMIT_ALL_EVPN permit 10")
-                        vtysh_commands.insert(router_bgp_index + 1, "exit")
+                        # CRITICAL: Use slice assignment to insert both commands at once
+                        # This avoids index shifting issues from sequential insert() calls
+                        # Insert in reverse order: exit first, then route-map, so final order is: route-map, exit, router bgp
+                        route_map_block = ["route-map PERMIT_ALL_EVPN permit 10", "exit"]
+                        vtysh_commands[router_bgp_index:router_bgp_index] = route_map_block
                     else:
                         # Fallback: add at the beginning (after configure terminal)
-                        vtysh_commands.insert(1, "route-map PERMIT_ALL_EVPN permit 10")
-                        vtysh_commands.insert(2, "exit")
+                        route_map_block = ["route-map PERMIT_ALL_EVPN permit 10", "exit"]
+                        vtysh_commands[1:1] = route_map_block
                     logging.info(f"[BGP EVPN] Created PERMIT_ALL_EVPN route-map for EVPN route advertisement")
                     
                     # Configure EVPN address-family - SINGLE block with all neighbors and VNIs
