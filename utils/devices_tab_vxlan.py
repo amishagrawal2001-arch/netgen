@@ -49,6 +49,8 @@ class VXLANHandler:
             "Underlay Interface",
             "Overlay Interface",
             "VNI",
+            "VLAN ID",
+            "VLAN Interface IP",
             "Local Endpoint",
             "Remote Endpoint(s)",
             "UDP Port",
@@ -668,6 +670,33 @@ class VXLANHandler:
         _set("Underlay Interface", vxlan_cfg.get("underlay_interface") if isinstance(vxlan_cfg, dict) else "" or device.get("interface", ""))
         _set("Overlay Interface", vxlan_cfg.get("overlay_interface") if isinstance(vxlan_cfg, dict) else "" or f"vlan{device.get('vlan', '0')}")
         _set("VNI", str(vxlan_cfg.get("vni") or "") if isinstance(vxlan_cfg, dict) else "")
+        
+        # VLAN ID - from tunnel config
+        vlan_id = vxlan_cfg.get("vlan_id") if isinstance(vxlan_cfg, dict) else None
+        if vlan_id is None:
+            # Fallback to device VLAN if tunnel doesn't have vlan_id
+            vlan_id = device.get("vlan", "0")
+        _set("VLAN ID", str(vlan_id) if vlan_id else "")
+        
+        # VLAN Interface IP (Bridge SVI IP) - from tunnel config
+        bridge_svi_ip = vxlan_cfg.get("bridge_svi_ip") if isinstance(vxlan_cfg, dict) else None
+        if bridge_svi_ip:
+            # If it already contains prefix (e.g., "20.0.0.100/24"), use as-is
+            # Otherwise, check if bridge_svi_subnet is available
+            if '/' not in str(bridge_svi_ip):
+                bridge_svi_subnet = vxlan_cfg.get("bridge_svi_subnet") if isinstance(vxlan_cfg, dict) else None
+                if bridge_svi_subnet:
+                    # Extract prefix from subnet if it's in CIDR format
+                    if '/' in str(bridge_svi_subnet):
+                        prefix = str(bridge_svi_subnet).split('/')[-1]
+                        bridge_svi_ip = f"{bridge_svi_ip}/{prefix}"
+                    else:
+                        bridge_svi_ip = f"{bridge_svi_ip}/{bridge_svi_subnet}"
+                else:
+                    # Default to /24 if no subnet specified
+                    bridge_svi_ip = f"{bridge_svi_ip}/24"
+        _set("VLAN Interface IP", bridge_svi_ip if bridge_svi_ip else "")
+        
         _set("Local Endpoint", vxlan_cfg.get("local_ip") if isinstance(vxlan_cfg, dict) else "" or device.get("ipv4_address", ""))
         remote_peers = vxlan_cfg.get("remote_peers", []) if isinstance(vxlan_cfg, dict) else []
         _set("Remote Endpoint(s)", ", ".join(remote_peers) if remote_peers else "")
