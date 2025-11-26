@@ -1071,8 +1071,12 @@ def _ensure_vxlan_in_container_iproute(
             
             if bridge_svi_ip:
                 # Use explicitly configured bridge SVI IP
-                # If subnet is provided, use it; otherwise derive from IP or use /24
-                if bridge_svi_subnet:
+                # Check if IP already contains prefix (e.g., "20.0.0.100/24")
+                if '/' in str(bridge_svi_ip):
+                    # IP already has prefix, use it as-is
+                    svi_ip_str = str(bridge_svi_ip)
+                    logger.info("[VXLAN] Using explicitly configured bridge SVI IP (with prefix): %s", svi_ip_str)
+                elif bridge_svi_subnet:
                     # Validate subnet format (e.g., "24" or "192.168.100.0/24")
                     try:
                         if '/' in bridge_svi_subnet:
@@ -1082,10 +1086,11 @@ def _ensure_vxlan_in_container_iproute(
                             svi_ip_str = f"{bridge_svi_ip}/{bridge_svi_subnet}"
                     except Exception:
                         svi_ip_str = f"{bridge_svi_ip}/24"
+                    logger.info("[VXLAN] Using explicitly configured bridge SVI IP: %s", svi_ip_str)
                 else:
                     # Use /24 as default if subnet not specified
                     svi_ip_str = f"{bridge_svi_ip}/24"
-                logger.info("[VXLAN] Using explicitly configured bridge SVI IP: %s", svi_ip_str)
+                    logger.info("[VXLAN] Using explicitly configured bridge SVI IP: %s", svi_ip_str)
             elif bridge_svi_subnet:
                 # Only subnet provided, derive IP from subnet
                 try:
