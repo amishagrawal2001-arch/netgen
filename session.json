@@ -537,8 +537,8 @@
   "devices": {
     "device1": {
       "Device Name": "device1",
-      "device_id": "dd130073-3d08-49e8-b017-f920624b76ea",
-      "Interface": " - ens4np0",
+      "device_id": "69218253-5a6e-40a6-9b81-a806865ac0b8",
+      "Interface": " - ens5np0",
       "MAC Address": "00:11:22:33:44:55",
       "IPv4": "192.168.0.2",
       "IPv6": "2001:db8::2",
@@ -552,69 +552,27 @@
       "Loopback IPv6": "2001:ff00::1",
       "Status": "Running",
       "protocols": [
-        "VXLAN",
         "OSPF",
-        "BGP"
+        "IS-IS",
+        "BGP",
+        "VXLAN"
       ],
       "vxlan_config": {
         "tunnels": [
           {
-            "bridge_svi_ip": "10.0.0.100",
-            "bridge_svi_subnet": "24",
-            "enabled": true,
-            "local_ip": "192.255.0.1",
-            "local_prefix_len": "24",
-            "overlay_interface": "vlan20",
-            "remote_peers": [
-              "192.168.250.1"
-            ],
-            "udp_port": 4789,
-            "underlay_gateway": "192.168.0.1",
-            "underlay_interface": "ens4np0",
-            "underlay_route_interface": "vlan20",
-            "vlan_id": 100,
             "vni": 5000,
-            "vxlan_interface": "vx5000-dd1300"
-          },
-          {
-            "bridge_svi_ip": "20.0.0.100/24",
-            "bridge_svi_subnet": "",
-            "enabled": true,
+            "udp_port": 4789,
             "local_ip": "192.255.0.1",
-            "local_prefix_len": "24",
-            "overlay_interface": "vlan20",
             "remote_peers": [
               "192.168.250.1"
             ],
-            "udp_port": 4789,
-            "underlay_gateway": "192.168.0.1",
-            "underlay_interface": "ens4np0",
-            "underlay_route_interface": "vlan20",
-            "vlan_id": 200,
-            "vni": 5001,
-            "vxlan_interface": "vx5001-dd1300"
-          },
-          {
-            "bridge_svi_ip": "21.0.0.100/24",
-            "bridge_svi_subnet": "",
-            "enabled": true,
-            "local_ip": "192.255.0.1",
-            "local_prefix_len": "24",
-            "overlay_interface": "vlan20",
-            "remote_peers": [
-              "192.168.250.1"
-            ],
-            "udp_port": 4789,
-            "underlay_gateway": "192.168.0.1",
-            "underlay_interface": "ens4np0",
-            "underlay_route_interface": "vlan20",
-            "vlan_id": 201,
-            "vni": 5002,
-            "vxlan_interface": "vx5002-dd1300"
+            "bridge_svi_ip": "10.0.0.100/24",
+            "vlan_id": 100,
+            "underlay_interface": "ens5np0",
+            "overlay_interface": "vlan20"
           }
         ]
       },
-      "VXLAN": "VNI 5000 -> 192.168.250.1",
       "ospf_config": {
         "area_id": "0.0.0.0",
         "area_id_ipv4": "0.0.0.0",
@@ -627,10 +585,32 @@
         "ipv4_enabled": true,
         "ipv6_enabled": true
       },
+      "is_is_config": {
+        "area_id": "49.0001.0000.0000.0001.00",
+        "system_id": "0000.0000.0001",
+        "level": "Level-2",
+        "hello_interval": "10",
+        "hello_multiplier": "3",
+        "metric": "10",
+        "interface": "vlan20",
+        "ipv4_enabled": true,
+        "ipv6_enabled": true
+      },
+      "isis_config": {
+        "area_id": "49.0001.0000.0000.0001.00",
+        "system_id": "0000.0000.0001",
+        "level": "Level-2",
+        "hello_interval": "10",
+        "hello_multiplier": "3",
+        "metric": "10",
+        "interface": "vlan20",
+        "ipv4_enabled": true,
+        "ipv6_enabled": true
+      },
       "bgp_config": {
         "bgp_asn": "65000",
         "bgp_remote_asn": "65000",
-        "mode": "eBGP",
+        "mode": "iBGP",
         "bgp_keepalive": "30",
         "bgp_hold_time": "90",
         "ipv4_enabled": true,
@@ -644,16 +624,19 @@
         "bgp_neighbor_ipv6": "2001:ff00:250::1",
         "bgp_update_source_ipv6": "2001:ff00::1"
       },
-      "Protocols": "VXLAN, OSPF, BGP",
+      "Protocols": "OSPF, IS-IS, BGP",
       "_is_new": false,
       "_needs_apply": false,
       "_ospf_just_edited": true,
       "dhcp_mode": "",
-      "dhcp_config": {},
-      "isis_config": {}
+      "dhcp_config": {}
     }
   },
-  "removed_devices": [],
+  "removed_devices": [
+    "dd130073-3d08-49e8-b017-f920624b76ea",
+    "a47b1144-7b01-4182-b644-3a1505f78f4c",
+    "4b4cc1ce-1a9e-43ff-95fc-ae4606493804"
+  ],
   "protocols": {
     "bgp": [
       {
@@ -681,8 +664,8 @@
         "Neighbor ID": "192.168.250.1",
         "State": "Full/DR",
         "Priority": "128",
-        "Dead Timer": "33.638s",
-        "Uptime": "1m29s",
+        "Dead Timer": "30.596s",
+        "Uptime": "3m23s",
         "Graceful Restart": "",
         "P2P": "",
         "Route Pools": ""
@@ -696,14 +679,41 @@
         "Neighbor ID": "192.168.250.1",
         "State": "Full/DR",
         "Priority": "128",
-        "Dead Timer": "00:00:38",
-        "Uptime": "00:01:20",
+        "Dead Timer": "00:00:35",
+        "Uptime": "00:03:11",
         "Graceful Restart": "",
         "P2P": "",
         "Route Pools": ""
       }
     ],
-    "isis": [],
+    "isis": [
+      {
+        "Device": "device1",
+        "ISIS Status": "",
+        "Neighbor Type": "IPv4",
+        "Neighbor Hostname": "san-q5130e-04",
+        "Interface": "vlan20",
+        "ISIS Area": "CORE",
+        "Level": "Level-2",
+        "ISIS Net": "47.0005.80ff.f800.0000.0108.0001",
+        "System ID": "0000.0000.0001",
+        "Hello Interval": "10",
+        "Multiplier": "3"
+      },
+      {
+        "Device": "device1",
+        "ISIS Status": "",
+        "Neighbor Type": "IPv6",
+        "Neighbor Hostname": "san-q5130e-04",
+        "Interface": "vlan20",
+        "ISIS Area": "CORE",
+        "Level": "Level-2",
+        "ISIS Net": "47.0005.80ff.f800.0000.0108.0001",
+        "System ID": "0000.0000.0001",
+        "Hello Interval": "10",
+        "Multiplier": "3"
+      }
+    ],
     "dhcp": []
   },
   "bgp_route_pools": [
