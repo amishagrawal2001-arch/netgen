@@ -1,0 +1,4 @@
+
+# Large Docker image files
+build_image/*.tar
+*.tar
