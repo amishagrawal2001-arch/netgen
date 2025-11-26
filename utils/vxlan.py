@@ -2413,17 +2413,26 @@ def configure_vxlan_arp_fdb_from_evpn(device_id: str, vxlan_config: Dict[str, An
                     type3_output = type3_result.output.decode("utf-8", errors="ignore") if isinstance(type3_result.output, bytes) else str(type3_result.output)
                     import re
                     # Look for OrigIP in Type-3 route: [3]:[5000]:[32]:[192.168.250.1]
+                    # The route format can be: *>i [3]:[5000]:[32]:[192.168.250.1]
                     for line in type3_output.split('\n'):
-                        if '[3]:' in line and f'[{vni}]' in line:
+                        if '[3]:' in line:
+                            # Try multiple regex patterns to extract OrigIP
+                            # Pattern 1: [3]:[5000]:[32]:[192.168.250.1]
                             origip_match = re.search(r'\[3\]:\[(\d+)\]:\[32\]:\[(\d+\.\d+\.\d+\.\d+)\]', line)
+                            if not origip_match:
+                                # Pattern 2: [3]:[5000]:[32]:[192.168.250.1] (with optional trailing characters)
+                                origip_match = re.search(r'\[3\]:\[(\d+)\]:\[32\]:\[([0-9.]+)\]', line)
                             if origip_match:
+                                route_vni = origip_match.group(1)
                                 orig_ip = origip_match.group(2)
-                                # Get local IP to compare
-                                local_ip = config.get("local_ip", "")
-                                if orig_ip != local_ip and orig_ip != '0.0.0.0' and orig_ip.startswith(('192.', '10.', '172.')):
-                                    actual_vtep_ip = orig_ip
-                                    logger.info("[VXLAN ARP/FDB] Using actual VTEP IP %s from Type-3 route OrigIP for FDB", actual_vtep_ip)
-                                    break
+                                # Check if this route matches our VNI
+                                if str(vni) == route_vni:
+                                    # Get local IP to compare
+                                    local_ip = config.get("local_ip", "")
+                                    if orig_ip != local_ip and orig_ip != '0.0.0.0' and orig_ip.startswith(('192.', '10.', '172.')):
+                                        actual_vtep_ip = orig_ip
+                                        logger.info("[VXLAN ARP/FDB] Using actual VTEP IP %s from Type-3 route OrigIP for FDB (VNI %s)", actual_vtep_ip, route_vni)
+                                        break
                 except Exception:
                     logger.debug("[VXLAN ARP/FDB] Could not extract VTEP IP from Type-3 routes, using remote_ip %s", remote_ip)
                 
