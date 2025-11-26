@@ -25,12 +25,96 @@ Options:
   -t HOURS      Journalctl time window (default: 4).
   -o DIR        Output directory (default: /tmp/bf3_diag_<timestamp>).
   -h            Show this help.
+  --nvidia-install-help  Show nvidia-smi installation instructions.
 
 If interfaces or PCI slots are not given, the script will try to auto-detect
 Mellanox/NVIDIA devices.
 
 Note: For enhanced GPU diagnostics, nvidia-smi should be installed. If not found,
       the script will display installation instructions during execution.
+      Use --nvidia-install-help to see installation instructions now.
+EOF
+}
+
+show_nvidia_install_help() {
+    cat <<EOF
+================================================================================
+nvidia-smi Installation Instructions
+================================================================================
+
+For enhanced GPU diagnostics, nvidia-smi should be installed. Below are
+OS-specific installation instructions:
+
+EOF
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        if [ "$ID" = "ubuntu" ] || [ "$ID" = "debian" ]; then
+            cat <<EOF
+For Ubuntu/Debian:
+  1. Install from Ubuntu/Debian repository:
+     sudo apt update
+     sudo apt install -y nvidia-driver-<version>
+     # Replace <version> with available version (e.g., 535, 550, 570)
+     # Check available versions: apt search nvidia-driver
+
+  2. Or install from NVIDIA repository:
+     wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb
+     sudo dpkg -i cuda-keyring_1.1-1_all.deb
+     sudo apt update
+     sudo apt install -y cuda-drivers
+
+  3. After installation, reboot the system:
+     sudo reboot
+
+  4. Verify installation:
+     nvidia-smi
+
+EOF
+        elif [ "$ID" = "rhel" ] || [ "$ID" = "centos" ] || [ "$ID" = "rocky" ] || [ "$ID" = "almalinux" ]; then
+            cat <<EOF
+For RHEL/CentOS/Rocky/AlmaLinux:
+  1. Install from EPEL repository:
+     sudo dnf install -y epel-release
+     sudo dnf install -y nvidia-driver
+
+  2. Or install from NVIDIA repository:
+     sudo dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo
+     sudo dnf install -y cuda-drivers
+
+  3. After installation, reboot the system:
+     sudo reboot
+
+  4. Verify installation:
+     nvidia-smi
+
+EOF
+        else
+            cat <<EOF
+For other Linux distributions:
+  Visit: https://www.nvidia.com/Download/index.aspx
+  Download and install the appropriate NVIDIA driver for your system.
+  After installation, reboot and verify with: nvidia-smi
+
+EOF
+        fi
+    else
+        cat <<EOF
+For your Linux distribution:
+  Visit: https://www.nvidia.com/Download/index.aspx
+  Download and install the appropriate NVIDIA driver for your system.
+  After installation, reboot and verify with: nvidia-smi
+
+EOF
+    fi
+    cat <<EOF
+Note: After installing NVIDIA drivers, nvidia-smi will be available
+      and the script will collect additional GPU diagnostics including:
+      - GPU utilization and memory usage
+      - GPU temperature and power consumption
+      - NVLink status and capabilities
+      - Detailed PCIe link information
+
+================================================================================
 EOF
 }
 
@@ -40,6 +124,12 @@ PCI_SLOTS=""
 BF_IP=""
 JOURNAL_HOURS=4
 OUTDIR=""
+
+# Check for --nvidia-install-help before getopts (since it starts with --)
+if [ "$1" = "--nvidia-install-help" ]; then
+    show_nvidia_install_help
+    exit 0
+fi
 
 while getopts "i:s:b:t:o:h" opt; do
     case "$opt" in
