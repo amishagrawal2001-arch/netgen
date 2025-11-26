@@ -2492,7 +2492,19 @@ def configure_vxlan_arp_fdb_from_evpn(device_id: str, vxlan_config: Dict[str, An
                                         pass
                             
                             # Delete if destination is wrong (0.0.0.0, wrong VTEP, or old remote_ip)
-                            if current_dst and current_dst != actual_vtep_ip and (current_dst == '0.0.0.0' or current_dst == '::' or current_dst == remote_ip):
+                            # CRITICAL: Always delete entries with dst 0.0.0.0 or ::, regardless of actual_vtep_ip
+                            should_delete = False
+                            if current_dst:
+                                if current_dst == '0.0.0.0' or current_dst == '::':
+                                    should_delete = True
+                                    logger.info("[VXLAN ARP/FDB] Found FDB entry with invalid dst %s, will delete", current_dst)
+                                elif current_dst != actual_vtep_ip and (current_dst == remote_ip or current_dst != actual_vtep_ip):
+                                    # Only delete if we have a valid actual_vtep_ip and it's different
+                                    if actual_vtep_ip and actual_vtep_ip != '0.0.0.0' and actual_vtep_ip != remote_ip:
+                                        should_delete = True
+                                        logger.info("[VXLAN ARP/FDB] Found FDB entry with wrong dst %s (expected %s), will delete", current_dst, actual_vtep_ip)
+                            
+                            if should_delete:
                                 try:
                                     del_cmd = ["bridge", "fdb", "del", remote_mac, "dev", vxlan_iface, "dst", current_dst]
                                     if vlan_tag:
@@ -2500,9 +2512,9 @@ def configure_vxlan_arp_fdb_from_evpn(device_id: str, vxlan_config: Dict[str, An
                                     del_cmd.extend(["self"])
                                     _container_ip(frr_manager, container_name, del_cmd)
                                     deleted_entries.append(f"{current_dst} (vlan {vlan_tag})" if vlan_tag else current_dst)
-                                    logger.info("[VXLAN ARP/FDB] Deleted existing FDB entry with wrong VTEP %s", deleted_entries[-1])
+                                    logger.info("[VXLAN ARP/FDB] ✅ Deleted existing FDB entry with wrong VTEP %s", deleted_entries[-1])
                                     import time
-                                    time.sleep(0.1)  # Give time for deletion to complete
+                                    time.sleep(0.2)  # Give time for deletion to complete
                                 except Exception as del_exc:
                                     logger.warning("[VXLAN ARP/FDB] Failed to delete FDB entry with dst %s: %s", current_dst, del_exc)
                     
