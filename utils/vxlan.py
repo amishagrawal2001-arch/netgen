@@ -1670,30 +1670,59 @@ def _ensure_vxlan_in_container_iproute(
                     for i, part in enumerate(parts):
                         if '[3]:' in part:
                             # Extract OrigIP from the route prefix: [3]:[5000]:[32]:[192.168.250.1]
-                            route_str = part.strip('[]')
-                            route_parts = route_str.split(':')
-                            if len(route_parts) >= 4 and route_parts[0] == '3':
+                            # The format has brackets around each component, so we need to parse carefully
+                            import re
+                            # Use regex to extract OrigIP: [3]:[EthTag]:[32]:[OrigIP]
+                            # Pattern: [3]:[number]:[32]:[IP]
+                            type3_match = re.search(r'\[3\]:\[(\d+)\]:\[32\]:\[(\d+\.\d+\.\d+\.\d+)\]', part)
+                            if type3_match:
                                 try:
-                                    # IP length should be 32 for IPv4
-                                    if route_parts[2] == '32':
-                                        # IPv4 address (OrigIP) is at position 3, may have trailing ']'
-                                        orig_ip = route_parts[3].rstrip(']')
-                                        # OrigIP is the actual VTEP IP
-                                        if (orig_ip != local_ip and 
-                                            orig_ip != '0.0.0.0' and
-                                            orig_ip.startswith(('192.', '10.', '172.'))):
-                                            actual_vtep_ip = orig_ip
-                                            logger.info("[VXLAN] Found actual VTEP IP %s from Type-3 route OrigIP", actual_vtep_ip)
-                                            
-                                            # Also extract BGP next-hop for reference
-                                            for j in range(i, min(i+15, len(parts))):
-                                                if j+2 < len(parts) and parts[j] == 'from':
-                                                    bgp_next_hop = parts[j+1]
-                                                    logger.info("[VXLAN] BGP next-hop is %s (not used as VTEP IP)", bgp_next_hop)
-                                                    break
-                                            break
-                                except (ValueError, IndexError):
+                                    eth_tag = type3_match.group(1)
+                                    orig_ip = type3_match.group(2)
+                                    # Verify this route is for the correct VNI (if VNI is in the line)
+                                    # OrigIP is the actual VTEP IP
+                                    if (orig_ip != local_ip and 
+                                        orig_ip != '0.0.0.0' and
+                                        orig_ip.startswith(('192.', '10.', '172.'))):
+                                        actual_vtep_ip = orig_ip
+                                        logger.info("[VXLAN] Found actual VTEP IP %s from Type-3 route OrigIP (EthTag=%s)", actual_vtep_ip, eth_tag)
+                                        
+                                        # Also extract BGP next-hop for reference
+                                        for j in range(i, min(i+15, len(parts))):
+                                            if j+2 < len(parts) and parts[j] == 'from':
+                                                bgp_next_hop = parts[j+1]
+                                                logger.info("[VXLAN] BGP next-hop is %s (not used as VTEP IP)", bgp_next_hop)
+                                                break
+                                        break
+                                except (ValueError, IndexError, AttributeError):
                                     continue
+                            # Fallback: try old parsing method if regex fails
+                            else:
+                                # Remove all brackets and split by colon
+                                route_str = part.replace('[', '').replace(']', '')
+                                route_parts = route_str.split(':')
+                                if len(route_parts) >= 4 and route_parts[0] == '3':
+                                    try:
+                                        # IP length should be 32 for IPv4
+                                        if route_parts[2] == '32':
+                                            # IPv4 address (OrigIP) is at position 3
+                                            orig_ip = route_parts[3]
+                                            # OrigIP is the actual VTEP IP
+                                            if (orig_ip != local_ip and 
+                                                orig_ip != '0.0.0.0' and
+                                                orig_ip.startswith(('192.', '10.', '172.'))):
+                                                actual_vtep_ip = orig_ip
+                                                logger.info("[VXLAN] Found actual VTEP IP %s from Type-3 route OrigIP (fallback parsing)", actual_vtep_ip)
+                                                
+                                                # Also extract BGP next-hop for reference
+                                                for j in range(i, min(i+15, len(parts))):
+                                                    if j+2 < len(parts) and parts[j] == 'from':
+                                                        bgp_next_hop = parts[j+1]
+                                                        logger.info("[VXLAN] BGP next-hop is %s (not used as VTEP IP)", bgp_next_hop)
+                                                        break
+                                                break
+                                    except (ValueError, IndexError):
+                                        continue
                             # Fallback: try to get BGP next-hop if OrigIP extraction failed
                             if actual_vtep_ip == remote_ip or actual_vtep_ip is None:
                                 for j in range(i, min(i+15, len(parts))):
