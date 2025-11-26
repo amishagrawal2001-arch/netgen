@@ -820,28 +820,26 @@ GPU_OUT="$GPU_DIR/gpu_info.txt"
         echo "Note: After installing NVIDIA drivers, nvidia-smi will be available"
         echo "      and the script will collect additional GPU diagnostics."
         # Also print to stderr so it's visible in console output
-        {
-            echo ""
-            echo "⚠️  WARNING: nvidia-smi not found. Installation instructions:" >&2
-            echo "⚠️  WARNING: nvidia-smi is not installed. GPU diagnostics will be limited." >&2
-            echo "" >&2
-            echo "To install nvidia-smi and NVIDIA drivers:" >&2
-            if [ -f /etc/os-release ]; then
-                . /etc/os-release
-                if [ "$ID" = "ubuntu" ] || [ "$ID" = "debian" ]; then
-                    echo "  For Ubuntu/Debian: sudo apt install -y nvidia-driver-<version>" >&2
-                    echo "  Or from NVIDIA repo: See gpu/gpu_info.txt for full instructions" >&2
-                elif [ "$ID" = "rhel" ] || [ "$ID" = "centos" ] || [ "$ID" = "rocky" ] || [ "$ID" = "almalinux" ]; then
-                    echo "  For RHEL/CentOS: sudo dnf install -y nvidia-driver" >&2
-                    echo "  Or from NVIDIA repo: See gpu/gpu_info.txt for full instructions" >&2
-                else
-                    echo "  Visit: https://www.nvidia.com/Download/index.aspx" >&2
-                fi
+        echo "" >&2
+        echo "⚠️  WARNING: nvidia-smi not found. Installation instructions:" >&2
+        echo "⚠️  WARNING: nvidia-smi is not installed. GPU diagnostics will be limited." >&2
+        echo "" >&2
+        echo "To install nvidia-smi and NVIDIA drivers:" >&2
+        if [ -f /etc/os-release ]; then
+            . /etc/os-release
+            if [ "$ID" = "ubuntu" ] || [ "$ID" = "debian" ]; then
+                echo "  For Ubuntu/Debian: sudo apt install -y nvidia-driver-<version>" >&2
+                echo "  Or from NVIDIA repo: See gpu/gpu_info.txt for full instructions" >&2
+            elif [ "$ID" = "rhel" ] || [ "$ID" = "centos" ] || [ "$ID" = "rocky" ] || [ "$ID" = "almalinux" ]; then
+                echo "  For RHEL/CentOS: sudo dnf install -y nvidia-driver" >&2
+                echo "  Or from NVIDIA repo: See gpu/gpu_info.txt for full instructions" >&2
             else
                 echo "  Visit: https://www.nvidia.com/Download/index.aspx" >&2
             fi
-            echo "" >&2
-        } 2>&1
+        else
+            echo "  Visit: https://www.nvidia.com/Download/index.aspx" >&2
+        fi
+        echo "" >&2
     fi
     echo ""
     
