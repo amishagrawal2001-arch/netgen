@@ -2806,6 +2806,44 @@ def apply_device():
                         dhcp_mode=dhcp_mode
                     )
                     logging.info(f"[DEVICE APPLY] Protocol configuration results: {protocol_results}")
+                    
+                    # Configure ARP and FDB entries from EVPN routes after BGP EVPN is configured
+                    # This is critical for VXLAN connectivity - wait for EVPN routes to propagate
+                    if vxlan_enabled and vxlan_config and bgp_config:
+                        try:
+                            import time
+                            logging.info(f"[DEVICE APPLY] Waiting 10 seconds for EVPN routes to propagate before configuring ARP/FDB")
+                            time.sleep(10)  # Wait for EVPN routes to be exchanged
+                            
+                            # Call configure_vxlan_arp_fdb_from_evpn for each tunnel
+                            if isinstance(vxlan_config, dict) and "tunnels" in vxlan_config:
+                                tunnels = vxlan_config.get("tunnels", [])
+                                for tunnel in tunnels:
+                                    if isinstance(tunnel, dict):
+                                        try:
+                                            vxlan_utils.configure_vxlan_arp_fdb_from_evpn(
+                                                device_id=device_id,
+                                                vxlan_config=tunnel,
+                                                container_name=container_name if container_exists else None,
+                                                frr_manager=frr_manager,
+                                            )
+                                            logging.info(f"[DEVICE APPLY] Configured ARP/FDB from EVPN for tunnel VNI {tunnel.get('vni')}")
+                                        except Exception as arp_fdb_exc:
+                                            logging.warning(f"[DEVICE APPLY] Failed to configure ARP/FDB from EVPN for tunnel VNI {tunnel.get('vni')}: {arp_fdb_exc}")
+                            else:
+                                # Single tunnel format (old format)
+                                try:
+                                    vxlan_utils.configure_vxlan_arp_fdb_from_evpn(
+                                        device_id=device_id,
+                                        vxlan_config=vxlan_config,
+                                        container_name=container_name if container_exists else None,
+                                        frr_manager=frr_manager,
+                                    )
+                                    logging.info(f"[DEVICE APPLY] Configured ARP/FDB from EVPN for VXLAN tunnel")
+                                except Exception as arp_fdb_exc:
+                                    logging.warning(f"[DEVICE APPLY] Failed to configure ARP/FDB from EVPN: {arp_fdb_exc}")
+                        except Exception as evpn_arp_fdb_exc:
+                            logging.warning(f"[DEVICE APPLY] Error configuring ARP/FDB from EVPN routes: {evpn_arp_fdb_exc}")
                 except Exception as protocol_exc:
                     logging.error(f"[DEVICE APPLY] Error in background protocol configuration: {protocol_exc}", exc_info=True)
             
