@@ -2704,7 +2704,136 @@ def configure_vxlan_arp_fdb_from_evpn(device_id: str, vxlan_config: Dict[str, An
                 logger.warning("[VXLAN ARP/FDB] Failed to configure FDB entry: %s", fdb_exc)
                 return False
         else:
-            logger.debug("[VXLAN ARP/FDB] Could not find MAC address for remote SVI IP %s in EVPN routes", remote_svi_ip)
+            # Remote MAC not found for remote SVI IP, but we should still:
+            # 1. Extract VTEP IP from Type-3 routes
+            # 2. Try to find any remote MAC in the VNI from EVPN MAC table
+            # 3. Delete incorrect FDB entries with dst 0.0.0.0
+            logger.debug("[VXLAN ARP/FDB] Could not find MAC address for remote SVI IP %s in EVPN routes, trying alternative methods", remote_svi_ip)
+            
+            # Extract VTEP IP from Type-3 routes
+            actual_vtep_ip = remote_ip  # Default to remote_ip from config
+            try:
+                type3_result = container.exec_run(["vtysh", "-c", "show bgp l2vpn evpn route type multicast"])
+                type3_output = type3_result.output.decode("utf-8", errors="ignore") if isinstance(type3_result.output, bytes) else str(type3_result.output)
+                import re
+                for line in type3_output.split('\n'):
+                    if '[3]:' in line:
+                        origip_match = re.search(r'\[3\]:\[(\d+)\]:\[32\]:\[(\d+\.\d+\.\d+\.\d+)\]', line)
+                        if origip_match:
+                            eth_tag = origip_match.group(1)
+                            orig_ip = origip_match.group(2)
+                            # CRITICAL: Verify this route is for the correct VNI
+                            if str(eth_tag) != str(vni):
+                                continue
+                            local_ip = config.get("local_ip", "")
+                            if orig_ip != local_ip and orig_ip != '0.0.0.0' and orig_ip.startswith(('192.', '10.', '172.')):
+                                actual_vtep_ip = orig_ip
+                                logger.info("[VXLAN ARP/FDB] Extracted VTEP IP %s from Type-3 route OrigIP (VNI=%s)", actual_vtep_ip, vni)
+                                break
+            except Exception:
+                logger.debug("[VXLAN ARP/FDB] Could not extract VTEP IP from Type-3 routes")
+            
+            # Try to find any remote MAC in the VNI from EVPN MAC table
+            fallback_remote_mac = None
+            try:
+                evpn_mac_result = container.exec_run(["vtysh", "-c", f"show evpn mac vni {vni}"])
+                evpn_mac_output = evpn_mac_result.output.decode("utf-8", errors="ignore") if isinstance(evpn_mac_result.output, bytes) else str(evpn_mac_result.output)
+                
+                # Parse MAC table to find any remote MAC
+                # Format: MAC               Type   Flags Intf/Remote ES/VTEP            VLAN  Seq #'s
+                #         24:5d:92:a7:65:06 remote      192.168.0.1                          0/0
+                for line in evpn_mac_output.split('\n'):
+                    if 'remote' in line.lower():
+                        parts = line.split()
+                        if len(parts) >= 1:
+                            mac_candidate = parts[0].strip()
+                            # Validate MAC format (xx:xx:xx:xx:xx:xx)
+                            if len(mac_candidate.split(':')) == 6:
+                                fallback_remote_mac = mac_candidate
+                                logger.info("[VXLAN ARP/FDB] Found fallback remote MAC %s from EVPN MAC table for VNI %s", fallback_remote_mac, vni)
+                                break
+            except Exception as evpn_mac_exc:
+                logger.debug("[VXLAN ARP/FDB] Could not query EVPN MAC table for fallback MAC: %s", evpn_mac_exc)
+            
+            # Delete incorrect FDB entries with dst 0.0.0.0, even if we don't have a MAC yet
+            if actual_vtep_ip and actual_vtep_ip != '0.0.0.0' and actual_vtep_ip != remote_ip:
+                try:
+                    fdb_result = container.exec_run(["bridge", "fdb", "show", "dev", vxlan_iface])
+                    fdb_output = fdb_result.output.decode("utf-8", errors="ignore") if isinstance(fdb_result.output, bytes) else str(fdb_result.output)
+                    
+                    deleted_count = 0
+                    for line in fdb_output.split('\n'):
+                        if 'dst' in line and ('0.0.0.0' in line or '::' in line):
+                            # Extract MAC and VLAN from the line
+                            parts = line.split()
+                            mac_in_line = None
+                            vlan_tag = None
+                            current_dst = None
+                            
+                            for i, part in enumerate(parts):
+                                if part == 'dst' and i+1 < len(parts):
+                                    current_dst = parts[i+1]
+                                if part == 'vlan' and i+1 < len(parts):
+                                    try:
+                                        vlan_tag = int(parts[i+1])
+                                    except (ValueError, IndexError):
+                                        pass
+                            
+                            # MAC is typically the first field
+                            if len(parts) > 0:
+                                mac_candidate = parts[0]
+                                if len(mac_candidate.split(':')) == 6:
+                                    mac_in_line = mac_candidate
+                            
+                            # Delete entry with dst 0.0.0.0
+                            if mac_in_line and current_dst and (current_dst == '0.0.0.0' or current_dst == '::'):
+                                try:
+                                    del_cmd = ["bridge", "fdb", "del", mac_in_line, "dev", vxlan_iface, "dst", current_dst]
+                                    if vlan_tag:
+                                        del_cmd.extend(["vlan", str(vlan_tag)])
+                                    del_cmd.extend(["self"])
+                                    _container_ip(frr_manager, container_name, del_cmd)
+                                    deleted_count += 1
+                                    import time
+                                    time.sleep(0.2)
+                                except Exception:
+                                    pass
+                    
+                    if deleted_count > 0:
+                        logger.info("[VXLAN ARP/FDB] Deleted %d FDB entry/entries with invalid dst 0.0.0.0 for VNI %s", deleted_count, vni)
+                except Exception as fdb_cleanup_exc:
+                    logger.debug("[VXLAN ARP/FDB] Error cleaning up FDB entries: %s", fdb_cleanup_exc)
+            
+            # If we found a fallback MAC and valid VTEP IP, configure FDB entry
+            if fallback_remote_mac and actual_vtep_ip and actual_vtep_ip != '0.0.0.0' and actual_vtep_ip != '::':
+                try:
+                    fdb_cmd = [
+                        "bridge",
+                        "fdb",
+                        "replace",
+                        fallback_remote_mac,
+                        "dev",
+                        vxlan_iface,
+                        "dst",
+                        actual_vtep_ip,
+                    ]
+                    if vlan_id:
+                        fdb_cmd.extend(["vlan", str(vlan_id)])
+                    fdb_cmd.extend(["self", "permanent"])
+                    _container_ip(frr_manager, container_name, fdb_cmd)
+                    logger.info(
+                        "[VXLAN ARP/FDB] Configured FDB entry using fallback MAC %s -> %s via %s%s (remote SVI IP %s MAC not found)",
+                        fallback_remote_mac,
+                        actual_vtep_ip,
+                        vxlan_iface,
+                        f" (VLAN {vlan_id})" if vlan_id else "",
+                        remote_svi_ip
+                    )
+                    return True
+                except Exception as fdb_fallback_exc:
+                    logger.warning("[VXLAN ARP/FDB] Failed to configure FDB entry with fallback MAC: %s", fdb_fallback_exc)
+            
+            logger.warning("[VXLAN ARP/FDB] Could not configure FDB entry: remote MAC not found for SVI IP %s, and no fallback MAC available", remote_svi_ip)
             return False
             
     except Exception as exc:
