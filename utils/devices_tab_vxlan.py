@@ -272,29 +272,38 @@ class VXLANHandler:
                 # Filter by interface if interfaces are selected
                 if interfaces_to_show:
                     # Use the stored interface_key from all_devices (most reliable)
-                    device_interface_key = device.get("interface_key")
+                    device_interface_key = device.get("interface_key", "")
                     
-                    # Fallback: try to match using Interface field if interface_key not available
-                    if not device_interface_key:
+                    # Normalize interface key matching: extract port name and match against selected interfaces
+                    # The interface_key might be " - ens4np0" but selected interface is "TG 0 - ens4np0"
+                    port_name = None
+                    if device_interface_key:
+                        # Extract port name from interface_key (e.g., "ens4np0" from " - ens4np0" or "TG 0 - ens4np0")
+                        if " - " in device_interface_key:
+                            port_name = device_interface_key.split(" - ")[-1].strip()
+                        else:
+                            port_name = device_interface_key.strip().lstrip(" - ").strip()
+                    
+                    # Fallback: try to extract from Interface field if port_name not available
+                    if not port_name:
                         device_interface = device.get("Interface", "")
-                        # Try to find matching interface in all_devices
-                        if device_interface and hasattr(self.parent, "main_window") and hasattr(self.parent.main_window, "all_devices"):
-                            # Extract port name from Interface field (e.g., "ens4np0" from " - ens4np0")
+                        if device_interface:
                             port_name = device_interface.strip().lstrip(" - ").strip()
-                            for iface_key in self.parent.main_window.all_devices.keys():
-                                if iface_key.endswith(f" - {port_name}") or iface_key == port_name:
-                                    device_interface_key = iface_key
-                                    break
                     
-                    # If we still couldn't match, try direct match
-                    if not device_interface_key:
-                        device_interface_key = device.get("Interface", "").strip().lstrip(" - ").strip()
+                    # Check if any selected interface matches this port name
+                    matches_selected = False
+                    if port_name:
+                        for selected_iface in interfaces_to_show:
+                            # Extract port name from selected interface (e.g., "ens4np0" from "TG 0 - ens4np0")
+                            selected_port = selected_iface.split(" - ")[-1].strip() if " - " in selected_iface else selected_iface.strip()
+                            if port_name == selected_port or selected_iface.endswith(f" - {port_name}"):
+                                matches_selected = True
+                                print(f"[VXLAN TAB] Including local device {device.get('device_name')} - port '{port_name}' matches selected interface '{selected_iface}'")
+                                break
                     
-                    if device_interface_key not in interfaces_to_show:
-                        print(f"[VXLAN TAB] Skipping local device {device.get('device_name')} - interface_key '{device_interface_key}' not in selected interfaces {interfaces_to_show}")
+                    if not matches_selected:
+                        print(f"[VXLAN TAB] Skipping local device {device.get('device_name')} - port '{port_name}' (from interface_key '{device_interface_key}') not in selected interfaces {interfaces_to_show}")
                         continue  # Skip devices not from selected interfaces
-                    else:
-                        print(f"[VXLAN TAB] Including local device {device.get('device_name')} - interface_key '{device_interface_key}' matches selected interfaces")
                 
                 device_id = device.get("device_id")
                 device_name = device.get("device_name")
