@@ -357,6 +357,8 @@ for iface in $IFACE_LIST; do
     run_cmd "$IF_OUT" ethtool "$iface" | grep -E "Supported|Advertised|Link|Speed|Duplex"
     
     # PCIe link status for the interface
+    # Initialize PCI_SLOT to empty string to avoid unbound variable error with set -u
+    PCI_SLOT=""
     if [ -e "/sys/class/net/$iface/device" ]; then
         PCI_SLOT=$(readlink -f "/sys/class/net/$iface/device" | grep -oP 'pci[^/]+' | sed 's/pci//' | tr '/' ':')
         if [ -n "$PCI_SLOT" ]; then
@@ -1009,10 +1011,10 @@ analyze_critical_issues() {
     # Check for transmission/reception errors
     if [ -d "$OUTDIR/interfaces" ]; then
         echo "=== TRANSMISSION/RECEPTION ERRORS ==="
+        errors_found=false
         for iface_file in "$OUTDIR/interfaces"/*/*.txt; do
             if [ -f "$iface_file" ]; then
                 iface_name=$(basename "$(dirname "$iface_file")")
-                errors_found=false
                 
                 # Check for various error types
                 while IFS= read -r error_line; do
