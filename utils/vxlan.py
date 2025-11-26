@@ -1679,13 +1679,17 @@ def _ensure_vxlan_in_container_iproute(
                                 try:
                                     eth_tag = type3_match.group(1)
                                     orig_ip = type3_match.group(2)
-                                    # Verify this route is for the correct VNI (if VNI is in the line)
+                                    # CRITICAL: Verify this route is for the correct VNI
+                                    # eth_tag is the VNI in the Type-3 route
+                                    if str(eth_tag) != str(vni):
+                                        logger.debug("[VXLAN] Type-3 route EthTag %s doesn't match VNI %s, skipping", eth_tag, vni)
+                                        continue
                                     # OrigIP is the actual VTEP IP
                                     if (orig_ip != local_ip and 
                                         orig_ip != '0.0.0.0' and
                                         orig_ip.startswith(('192.', '10.', '172.'))):
                                         actual_vtep_ip = orig_ip
-                                        logger.info("[VXLAN] Found actual VTEP IP %s from Type-3 route OrigIP (EthTag=%s)", actual_vtep_ip, eth_tag)
+                                        logger.info("[VXLAN] Found actual VTEP IP %s from Type-3 route OrigIP (VNI=%s, EthTag=%s)", actual_vtep_ip, vni, eth_tag)
                                         
                                         # Also extract BGP next-hop for reference
                                         for j in range(i, min(i+15, len(parts))):
@@ -2027,11 +2031,16 @@ def _ensure_vxlan_in_container_iproute(
                                     # Extract OrigIP from route prefix
                                     origip_match = re.search(r'\[3\]:\[(\d+)\]:\[32\]:\[(\d+\.\d+\.\d+\.\d+)\]', line)
                                     if origip_match:
+                                        eth_tag = origip_match.group(1)
                                         orig_ip = origip_match.group(2)
+                                        # CRITICAL: Verify this route is for the correct VNI
+                                        if str(eth_tag) != str(vni):
+                                            logger.debug("[VXLAN] Type-3 route EthTag %s doesn't match VNI %s, skipping", eth_tag, vni)
+                                            continue
                                         if orig_ip != local_ip and orig_ip != '0.0.0.0' and orig_ip.startswith(('192.', '10.', '172.')):
                                             fdb_dst_ip = orig_ip
                                             actual_vtep_ip = orig_ip
-                                            logger.info("[VXLAN] Extracted actual VTEP IP %s from Type-3 route OrigIP for FDB", fdb_dst_ip)
+                                            logger.info("[VXLAN] Extracted actual VTEP IP %s from Type-3 route OrigIP for FDB (VNI=%s)", fdb_dst_ip, vni)
                                             break
                         except Exception:
                             pass
