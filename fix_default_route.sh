@@ -50,3 +50,4 @@ echo "Current default route:"
 ip route | grep '^default' || echo "No default route"
 
 
+
