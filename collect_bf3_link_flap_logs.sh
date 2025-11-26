@@ -23,11 +23,14 @@ Options:
   -s "SLOTS"    Space-separated list of PCI slots (e.g. "0000:8a:00.0").
   -b IP         BlueField/DPU management IP (optional, for remote logs).
   -t HOURS      Journalctl time window (default: 4).
-  -o DIR        Output directory (default: ./bf3_diag_<timestamp>).
+  -o DIR        Output directory (default: /tmp/bf3_diag_<timestamp>).
   -h            Show this help.
 
 If interfaces or PCI slots are not given, the script will try to auto-detect
 Mellanox/NVIDIA devices.
+
+Note: For enhanced GPU diagnostics, nvidia-smi should be installed. If not found,
+      the script will display installation instructions during execution.
 EOF
 }
 
