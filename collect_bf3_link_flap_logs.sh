@@ -52,7 +52,8 @@ done
 
 TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
 if [ -z "$OUTDIR" ]; then
-    OUTDIR="./bf3_diag_${TIMESTAMP}"
+    # Default to /tmp to ensure output is in a predictable location
+    OUTDIR="/tmp/bf3_diag_${TIMESTAMP}"
 fi
 
 mkdir -p "$OUTDIR"/{system,logs,pci,nvidia,dpu,gpu,interfaces}
