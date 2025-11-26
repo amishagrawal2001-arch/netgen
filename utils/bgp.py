@@ -1309,6 +1309,7 @@ def configure_bgp_for_device(device_id: str, bgp_config: Dict, ipv4: str = None,
                     
                     # Add route-target import/export for all VNIs (required for Type-3 route generation)
                     # Format: route-target import/export ASN:VNI
+                    # Also configure per-VNI advertise-gw-macip and advertise-svi-macip
                     try:
                         local_as_int = int(local_as) if local_as else 65000
                         # Collect unique VNIs from all tunnels
@@ -1318,7 +1319,7 @@ def configure_bgp_for_device(device_id: str, bgp_config: Dict, ipv4: str = None,
                             if tunnel_vni:
                                 unique_vnis.add(tunnel_vni)
                         
-                        # Add route-targets for each unique VNI
+                        # Add route-targets and per-VNI advertise settings for each unique VNI
                         for tunnel_vni in unique_vnis:
                             rt_value = f"{local_as_int}:{tunnel_vni}"
                             evpn_commands.extend([
@@ -1326,6 +1327,16 @@ def configure_bgp_for_device(device_id: str, bgp_config: Dict, ipv4: str = None,
                                 f"route-target export {rt_value}",
                             ])
                             logging.info(f"[BGP EVPN] Added route-target import/export {rt_value} for VNI {tunnel_vni}")
+                            
+                            # Configure per-VNI advertise-gw-macip and advertise-svi-macip
+                            # These must be configured under each VNI within the EVPN address-family
+                            evpn_commands.extend([
+                                f"vni {tunnel_vni}",
+                                "advertise-gw-macip",  # Advertise gateway MAC/IP routes
+                                "advertise-svi-macip",  # Advertise SVI MAC/IP routes
+                                "exit-vni",  # Exit VNI configuration
+                            ])
+                            logging.info(f"[BGP EVPN] Enabled advertise-gw-macip and advertise-svi-macip for VNI {tunnel_vni}")
                     except (ValueError, TypeError) as rt_exc:
                         logging.warning(f"[BGP EVPN] Could not add route-targets: {rt_exc}")
                     
