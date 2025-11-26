@@ -771,6 +771,48 @@ GPU_OUT="$GPU_DIR/gpu_info.txt"
         nvidia-smi pmon -c 1 2>&1 || echo "nvidia-smi pmon failed"
     else
         echo "nvidia-smi not available"
+        echo ""
+        echo "⚠️  WARNING: nvidia-smi is not installed. GPU diagnostics will be limited."
+        echo ""
+        echo "To install nvidia-smi and NVIDIA drivers, use one of the following:"
+        echo ""
+        # Detect OS and provide appropriate installation instructions
+        if [ -f /etc/os-release ]; then
+            . /etc/os-release
+            if [ "$ID" = "ubuntu" ] || [ "$ID" = "debian" ]; then
+                echo "For Ubuntu/Debian:"
+                echo "  sudo apt update"
+                echo "  sudo apt install -y nvidia-driver-<version>"
+                echo "  # Or install from NVIDIA repository:"
+                echo "  # wget https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2204/x86_64/cuda-keyring_1.1-1_all.deb"
+                echo "  # sudo dpkg -i cuda-keyring_1.1-1_all.deb"
+                echo "  # sudo apt update"
+                echo "  # sudo apt install -y cuda-drivers"
+                echo ""
+                echo "  # After installation, reboot the system:"
+                echo "  # sudo reboot"
+            elif [ "$ID" = "rhel" ] || [ "$ID" = "centos" ] || [ "$ID" = "rocky" ] || [ "$ID" = "almalinux" ]; then
+                echo "For RHEL/CentOS/Rocky/AlmaLinux:"
+                echo "  sudo dnf install -y epel-release"
+                echo "  sudo dnf install -y nvidia-driver"
+                echo "  # Or install from NVIDIA repository:"
+                echo "  # sudo dnf config-manager --add-repo https://developer.download.nvidia.com/compute/cuda/repos/rhel8/x86_64/cuda-rhel8.repo"
+                echo "  # sudo dnf install -y cuda-drivers"
+                echo ""
+                echo "  # After installation, reboot the system:"
+                echo "  # sudo reboot"
+            else
+                echo "For other Linux distributions:"
+                echo "  Visit: https://www.nvidia.com/Download/index.aspx"
+                echo "  Download and install the appropriate NVIDIA driver for your system"
+            fi
+        else
+            echo "  Visit: https://www.nvidia.com/Download/index.aspx"
+            echo "  Download and install the appropriate NVIDIA driver for your system"
+        fi
+        echo ""
+        echo "Note: After installing NVIDIA drivers, nvidia-smi will be available"
+        echo "      and the script will collect additional GPU diagnostics."
     fi
     echo ""
     
@@ -854,6 +896,10 @@ GPU_OUT="$GPU_DIR/gpu_info.txt"
             fi
         else
             echo "$tool: Not available"
+            if [ "$tool" = "nvidia-smi" ]; then
+                echo "  ⚠️  Install nvidia-smi for enhanced GPU diagnostics"
+                echo "  See installation instructions above in this file"
+            fi
         fi
         echo ""
     done
