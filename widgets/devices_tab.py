@@ -2212,6 +2212,12 @@ class DevicesTab(QWidget):
                 tunnel_config = vxlan_config.copy()
                 tunnel_config.pop("increment", None)  # Remove increment config
                 
+                # CRITICAL: Remove interface-related fields from new tunnels
+                # These should only be set when the tunnel is actually applied to the server
+                tunnel_config.pop("vxlan_interface", None)
+                tunnel_config.pop("overlay_interface", None)
+                tunnel_config.pop("underlay_interface", None)
+                
                 # Increment VNI
                 tunnel_config["vni"] = base_vni + (i * vni_increment)
                 
@@ -2282,15 +2288,36 @@ class DevicesTab(QWidget):
                     for i, existing_tunnel in enumerate(existing_tunnels):
                         if isinstance(existing_tunnel, dict) and existing_tunnel.get("vni") == new_vni:
                             # Update existing tunnel with same VNI
-                            existing_tunnels[i] = new_tunnel
+                            # Preserve interface-related fields from existing tunnel if they exist
+                            # (these are set when tunnel is applied to server)
+                            preserved_interface = existing_tunnel.get("vxlan_interface")
+                            preserved_overlay = existing_tunnel.get("overlay_interface")
+                            preserved_underlay = existing_tunnel.get("underlay_interface")
+                            
+                            # Update with new config
+                            existing_tunnels[i] = new_tunnel.copy()
+                            
+                            # Restore interface fields if they existed (tunnel was already applied)
+                            if preserved_interface:
+                                existing_tunnels[i]["vxlan_interface"] = preserved_interface
+                            if preserved_overlay:
+                                existing_tunnels[i]["overlay_interface"] = preserved_overlay
+                            if preserved_underlay:
+                                existing_tunnels[i]["underlay_interface"] = preserved_underlay
+                            
                             tunnel_exists = True
                             print(f"[VXLAN ADD] Updated existing tunnel with VNI {new_vni}")
                             break
                     
                     if not tunnel_exists:
-                        # Add new tunnel
-                        existing_tunnels.append(new_tunnel)
-                        print(f"[VXLAN ADD] Added new tunnel with VNI {new_vni}")
+                        # Add new tunnel (no interface name - will be set when applied)
+                        # Ensure no interface fields are present
+                        new_tunnel_clean = new_tunnel.copy()
+                        new_tunnel_clean.pop("vxlan_interface", None)
+                        new_tunnel_clean.pop("overlay_interface", None)
+                        new_tunnel_clean.pop("underlay_interface", None)
+                        existing_tunnels.append(new_tunnel_clean)
+                        print(f"[VXLAN ADD] Added new tunnel with VNI {new_vni} (no interface - will be set when applied)")
                 
                 # Update device with merged tunnels
                 device["vxlan_config"] = {"tunnels": existing_tunnels}
