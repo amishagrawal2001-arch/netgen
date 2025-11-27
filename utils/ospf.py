@@ -257,16 +257,77 @@ def configure_ospf_neighbor(
         interface = ospf_config.get("interface", "")
         if not interface and device_data:
             interface = device_data.get("interface", "")
+        
+        # CRITICAL: Normalize interface name - remove leading " - " or "- " prefix if present
+        # Also handle "TG X - interface" format for untagged interfaces
+        # This handles cases where interface is stored as "- ens4np0" or "TG 0 - ens4np0" instead of "ens4np0"
+        if interface:
+            interface = interface.strip()
+            if interface.startswith("- "):
+                interface = interface[2:].strip()
+            elif interface.startswith(" - "):
+                interface = interface[3:].strip()
+            # Handle "TG X - interface" format (e.g., "TG 0 - ens4np0" -> "ens4np0")
+            elif "TG" in interface and " - " in interface:
+                # Extract just the interface name after " - "
+                parts = interface.split(" - ", 1)
+                if len(parts) == 2:
+                    interface = parts[1].strip()
+                # Fallback: if split didn't work, try extracting last word
+                elif "TG" in interface:
+                    parts = interface.split()
+                    if len(parts) >= 3 and parts[0] == "TG":
+                        interface = parts[-1]
+        
         vlan = device_data.get("vlan", "0") if device_data else "0"
+        
+        # CRITICAL: Check if a unique-named VLAN interface was created (e.g., vlan20-ens4np0)
+        # This happens when the same VLAN ID is used on different physical interfaces
+        actual_vlan_interface = None
+        if device_data:
+            actual_vlan_interface = device_data.get("actual_vlan_interface", "")
+            if actual_vlan_interface and actual_vlan_interface.strip():
+                actual_vlan_interface = actual_vlan_interface.strip()
+                logging.info(f"[OSPF CONFIGURE] Found actual VLAN interface name '{actual_vlan_interface}' in database, will use it instead of 'vlan{vlan}'")
         
         # CRITICAL: Validate interface name when VLAN is not used
         # Do not fall back to 'eth0' as it's the container's internal interface, not the host interface
+        # NOTE: For VLAN interfaces, use the actual interface name if available (e.g., vlan20-ens4np0),
+        # otherwise use just vlan{vlan} - Linux and FRR can reference VLAN interfaces
+        # by their base name (vlan21) even though ip link show displays them as vlan21@ens5np0
         if vlan and vlan != "0":
-            interface = f"vlan{vlan}"
+            # Use actual interface name if unique-named interface was created, otherwise use vlan{vlan}
+            if actual_vlan_interface:
+                interface = actual_vlan_interface
+            else:
+                interface = f"vlan{vlan}"
         elif not interface:
-            # Interface is required - log error and use empty string (will cause configuration to fail gracefully)
-            logging.error(f"[OSPF CONFIGURE] Interface name is required when VLAN is not specified for device {device_id}")
-            interface = ""  # Will cause vtysh commands to fail, but better than silently using wrong interface
+            # CRITICAL: If interface is empty and VLAN is 0, try to use interface from database
+            if vlan == "0" and device_data:
+                interface_from_db = device_data.get("interface", "")
+                if interface_from_db:
+                    interface_from_db = interface_from_db.strip()
+                    if interface_from_db.startswith("- "):
+                        interface_from_db = interface_from_db[2:].strip()
+                    elif interface_from_db.startswith(" - "):
+                        interface_from_db = interface_from_db[3:].strip()
+                    # Handle "TG X - interface" format (e.g., "TG 0 - ens4np0" -> "ens4np0")
+                    elif "TG" in interface_from_db and " - " in interface_from_db:
+                        parts = interface_from_db.split(" - ", 1)
+                        if len(parts) == 2:
+                            interface_from_db = parts[1].strip()
+                        elif "TG" in interface_from_db:
+                            parts = interface_from_db.split()
+                            if len(parts) >= 3 and parts[0] == "TG":
+                                interface_from_db = parts[-1]
+                    if interface_from_db:
+                        interface = interface_from_db
+                        logging.info(f"[OSPF CONFIGURE] Using normalized interface '{interface}' from database for non-VLAN device")
+            
+            if not interface:
+                # Interface is required - log error and use empty string (will cause configuration to fail gracefully)
+                logging.error(f"[OSPF CONFIGURE] Interface name is required when VLAN is not specified for device {device_id}")
+                interface = ""  # Will cause vtysh commands to fail, but better than silently using wrong interface
         
         # Get router-id (must be loopback IPv4)
         # First, try to get loopback IPv4 from database
@@ -449,25 +510,44 @@ def configure_ospf_neighbor(
             if graceful_restart_ipv4:
                 vtysh_commands.append(" graceful-restart")
             
-            # Configure network using actual device network
-            if ipv4_network:
-                vtysh_commands.extend([
-                    f" network {ipv4_network} area {area_id_ipv4}",
-                ])
+            # CRITICAL: FRR doesn't allow both 'network' statements and 'ip ospf area' on interfaces
+            # We use interface-level 'ip ospf area' (modern method) instead of 'network' statements
+            # So we do NOT add network statements here - they will be removed if they exist
             
-            # Add loopback network to OSPF if loopback IPv4 is configured
-            if loopback_ipv4:
-                loopback_network = f"{loopback_ipv4}/32"
-                vtysh_commands.append(f" network {loopback_network} area {area_id_ipv4}")
-                logging.info(f"[OSPF CONFIGURE] Adding loopback network {loopback_network} to OSPF area {area_id_ipv4}")
+            # Remove any existing network statements for this interface's network
+            # This ensures we're using only interface-level area configuration
+            if current_config and ipv4_network:
+                try:
+                    import re
+                    # Find all network statements in router ospf section
+                    router_ospf_pattern = r'router\s+ospf.*?(?=router\s+ospf6|router\s+isis|router\s+bgp|!\s*$)'
+                    router_ospf_match = re.search(router_ospf_pattern, current_config, re.DOTALL | re.IGNORECASE)
+                    if router_ospf_match:
+                        router_ospf_section = router_ospf_match.group(0)
+                        # Find network statements that match our interface network
+                        network_pattern = rf'network\s+{re.escape(ipv4_network)}\s+area\s+\S+'
+                        if re.search(network_pattern, router_ospf_section, re.IGNORECASE):
+                            logging.info(f"[OSPF CONFIGURE] Removing network statement for {ipv4_network} (using interface-level area instead)")
+                            vtysh_commands.extend([
+                                "router ospf",
+                                f" no network {ipv4_network} area {area_id_ipv4}",
+                                "exit"
+                            ])
+                except Exception as e:
+                    logging.debug(f"[OSPF CONFIGURE] Could not check/remove network statements: {e}")
             
-                vtysh_commands.append(" exit")
+            vtysh_commands.append("exit")
             
-            # Configure interface OSPF settings
+            # Configure interface OSPF settings using interface-level area configuration
+            # CRITICAL: Merge IPv4 and IPv6 OSPF interface configurations into a single interface block
             # Note: Interface IP addresses (IPv4/IPv6) are configured via frr.conf.template
             # when the container is created, not via vtysh commands here
             vtysh_commands.extend([
                 f"interface {interface}",
+            ])
+            
+            # Add IPv4 OSPF configuration
+            vtysh_commands.extend([
                 f" ip ospf hello-interval {hello_interval}",
                 f" ip ospf dead-interval {dead_interval}",
                 f" ip ospf area {area_id_ipv4}",
@@ -496,14 +576,36 @@ def configure_ospf_neighbor(
             vtysh_commands.append("exit")
             
             # Configure loopback interface with IP and OSPF if loopback IPv4 is configured
+            # Loopback uses interface-level area configuration, not network statements
             if loopback_ipv4:
+                loopback_network = f"{loopback_ipv4}/32"
+                # Remove any existing loopback network statement
+                if current_config:
+                    try:
+                        import re
+                        router_ospf_pattern = r'router\s+ospf.*?(?=router\s+ospf6|router\s+isis|router\s+bgp|!\s*$)'
+                        router_ospf_match = re.search(router_ospf_pattern, current_config, re.DOTALL | re.IGNORECASE)
+                        if router_ospf_match:
+                            router_ospf_section = router_ospf_match.group(0)
+                            loopback_network_pattern = rf'network\s+{re.escape(loopback_network)}\s+area\s+\S+'
+                            if re.search(loopback_network_pattern, router_ospf_section, re.IGNORECASE):
+                                logging.info(f"[OSPF CONFIGURE] Removing loopback network statement for {loopback_network} (using interface-level area instead)")
+                                vtysh_commands.extend([
+                                    "router ospf",
+                                    f" no network {loopback_network} area {area_id_ipv4}",
+                                    "exit"
+                                ])
+                    except Exception as e:
+                        logging.debug(f"[OSPF CONFIGURE] Could not check/remove loopback network statement: {e}")
+                
                 vtysh_commands.extend([
                     "interface lo",
                     f" ip address {loopback_ipv4}/32",
+                    f" ip ospf area {area_id_ipv4}",
                     " ip ospf passive",
                     "exit"
                 ])
-                logging.info(f"[OSPF CONFIGURE] Adding loopback interface with IPv4 {loopback_ipv4}/32 to OSPF")
+                logging.info(f"[OSPF CONFIGURE] Adding loopback interface with IPv4 {loopback_ipv4}/32 to OSPF area {area_id_ipv4} (interface-level)")
         
         # Configure IPv6 OSPF if enabled
         if ipv6_enabled:
@@ -538,14 +640,15 @@ def configure_ospf_neighbor(
             # The area range is optional and only needed for route summarization
             vtysh_commands.append("exit")
             
-            # Configure interface OSPF6 settings
-            # Note: Interface IP addresses (IPv4/IPv6) are configured via frr.conf.template
-            # when the container is created, not via vtysh commands here
+            # CRITICAL: Add IPv6 OSPF configuration to the interface
+            # If IPv4 was also configured, we need to re-enter the interface block
+            # Otherwise, create a new interface block
             vtysh_commands.extend([
                 f"interface {interface}",
                 f" ipv6 ospf6 hello-interval {hello_interval}",
                 f" ipv6 ospf6 dead-interval {dead_interval}",
                 f" ipv6 ospf6 area {area_id_ipv6}",
+                " no ipv6 ospf6 passive",  # Ensure interface is not passive (like IPv4)
             ])
             
             # Configure point-to-point network type for IPv6 if enabled
@@ -920,8 +1023,17 @@ def stop_ospf_neighbor(device_id: str, device_name: str = None, af: str = None) 
         ipv6_enabled = ospf_config.get("ipv6_enabled", False)
         # CRITICAL: Validate interface name - do not fall back to 'eth0'
         interface = ospf_config.get("interface") or (device_data.get("interface") if device_data else "")
+        
+        # CRITICAL: Normalize interface name - remove leading " - " or "- " prefix if present
+        if interface:
+            interface = interface.strip()
+            if interface.startswith("- "):
+                interface = interface[2:].strip()
+            elif interface.startswith(" - "):
+                interface = interface[3:].strip()
+        
         if not interface:
-            logging.error(f"[OSPF START] Interface name is required for device {device_id}")
+            logging.error(f"[OSPF STOP] Interface name is required for device {device_id}")
             interface = ""  # Will cause vtysh commands to fail, but better than silently using wrong interface
         
         logging.info(f"[OSPF STOP] Config: af={af}, area_id={area_id}, interface={interface}, ipv4_enabled={ipv4_enabled}, ipv6_enabled={ipv6_enabled}")

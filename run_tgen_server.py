@@ -581,7 +581,11 @@ def start_device():
 
         # Light start: enable interface and configure IP addresses if provided
         result = {"device_id": device_id, "device": device_name, "interface": iface_normalized}
-        iface_name = f"vlan{vlan}" if (vlan and vlan != "0") else iface_normalized
+        # CRITICAL: For VLAN interfaces, use format vlan{vlan}@{interface} to avoid conflicts
+        if vlan and vlan != "0":
+            iface_name = f"vlan{vlan}@{iface_normalized}"
+        else:
+            iface_name = iface_normalized
         
         # CRITICAL: Validate interface name when VLAN is not used
         if not iface_name:
@@ -1400,7 +1404,15 @@ def device_isis_start():
             if vlan and str(vlan).isdigit():
                 isis_config["interface"] = f"vlan{vlan}"
             elif isinstance(data.get("interface"), str) and data.get("interface").startswith("vlan"):
-                isis_config["interface"] = data.get("interface")
+                # CRITICAL: Normalize interface name before storing (remove "- " or " - " prefixes)
+                interface_raw = data.get("interface")
+                if interface_raw:
+                    interface_raw = interface_raw.strip()
+                    if interface_raw.startswith("- "):
+                        interface_raw = interface_raw[2:].strip()
+                    elif interface_raw.startswith(" - "):
+                        interface_raw = interface_raw[3:].strip()
+                isis_config["interface"] = interface_raw if interface_raw else ""
 
         # If NET (area_id) or system_id missing, try to hydrate from DB-stored config
         try:
@@ -1832,6 +1844,46 @@ def configure_isis():
         if not device_id or not isis_config:
             return jsonify({"error": "Missing device_id or ISIS configuration"}), 400
 
+        # CRITICAL: Normalize interface name from UI label format
+        def normalize_iface(iface_str):
+            """Normalize interface name from UI label format."""
+            if not iface_str:
+                return ""
+            s = iface_str.strip().strip('"').rstrip(",")
+            if " - " in s:
+                s = s.split(" - ", 1)[-1].strip()
+            if ":" in s:
+                s = s.rsplit(":", 1)[-1].strip()
+            parts = s.split()
+            return parts[-1] if parts else ""
+        
+        interface_normalized = normalize_iface(interface) if interface else ""
+        
+        # CRITICAL: Normalize interface name in isis_config if present
+        # For untagged interfaces (VLAN 0), interface should be just the interface name (e.g., "ens4np0")
+        # For tagged interfaces, interface should be the VLAN interface name (e.g., "vlan20")
+        if isis_config.get("interface"):
+            isis_config_interface = isis_config.get("interface", "")
+            if isis_config_interface:
+                isis_config_interface_normalized = normalize_iface(isis_config_interface)
+                # If VLAN is 0 and interface still has "TG" prefix, extract just the interface name
+                vlan = data.get("vlan", "0")
+                if vlan == "0" or vlan == 0:
+                    # For untagged interfaces, ensure it's just the interface name
+                    if "TG" in isis_config_interface_normalized or " - " in isis_config_interface_normalized:
+                        # Extract just the interface name after " - "
+                        if " - " in isis_config_interface_normalized:
+                            isis_config_interface_normalized = isis_config_interface_normalized.split(" - ", 1)[-1].strip()
+                        elif "TG" in isis_config_interface_normalized:
+                            # Handle "TG 0 - ens4np0" format
+                            parts = isis_config_interface_normalized.split()
+                            if len(parts) >= 3 and parts[0] == "TG":
+                                isis_config_interface_normalized = parts[-1]
+                isis_config["interface"] = isis_config_interface_normalized
+                logging.info(f"[ISIS CONFIGURE] Normalized interface from '{isis_config_interface}' to '{isis_config_interface_normalized}'")
+            else:
+                isis_config["interface"] = ""
+
         # Import ISIS utilities
         from utils.isis import configure_isis_neighbor
         
@@ -1867,7 +1919,7 @@ def configure_isis():
                 "device_name": device_name,
                 "ipv4": ipv4,
                 "ipv6": ipv6,
-                "interface": data.get("interface", "ens4np0"),
+                "interface": interface_normalized or "ens4np0",  # CRITICAL: Use normalized interface name
                 "vlan": data.get("vlan", "0"),
                 "dhcp_mode": dhcp_mode,
             }
@@ -2042,7 +2094,30 @@ def configure_isis():
                     if "level" in isis_config:
                         merged_isis_config["level"] = isis_config["level"]
                     if "interface" in isis_config:
-                        merged_isis_config["interface"] = isis_config["interface"]
+                        # CRITICAL: Normalize interface field in IS-IS config before saving to database
+                        # For untagged interfaces (VLAN 0), interface should be just the interface name (e.g., "ens4np0")
+                        # For tagged interfaces, interface should be the VLAN interface name (e.g., "vlan20")
+                        isis_interface = isis_config["interface"]
+                        if isis_interface:
+                            # Normalize interface name - remove "TG X - " prefix if present
+                            isis_interface_normalized = normalize_iface(isis_interface)
+                            # If VLAN is 0 and interface still has "TG" prefix, extract just the interface name
+                            vlan = data.get("vlan", existing_device.get("vlan", "0") if existing_device else "0")
+                            if vlan == "0" or vlan == 0:
+                                # For untagged interfaces, ensure it's just the interface name
+                                if "TG" in isis_interface_normalized or " - " in isis_interface_normalized:
+                                    # Extract just the interface name after " - "
+                                    if " - " in isis_interface_normalized:
+                                        isis_interface_normalized = isis_interface_normalized.split(" - ", 1)[-1].strip()
+                                    elif "TG" in isis_interface_normalized:
+                                        # Handle "TG 0 - ens4np0" format
+                                        parts = isis_interface_normalized.split()
+                                        if len(parts) >= 3 and parts[0] == "TG":
+                                            isis_interface_normalized = parts[-1]
+                            merged_isis_config["interface"] = isis_interface_normalized
+                            logging.info(f"[ISIS CONFIGURE] Normalized interface from '{isis_interface}' to '{isis_interface_normalized}' before saving to database")
+                        else:
+                            merged_isis_config["interface"] = isis_interface
                     if "metric" in isis_config:
                         merged_isis_config["metric"] = isis_config["metric"]
                     
@@ -2296,8 +2371,21 @@ def apply_device():
             logging.warning(f"[DEVICE APPLY] VXLAN NOT enabled: config_has_content={vxlan_config_has_content}, in_protocols={'VXLAN' in protocols}, vxlan_config={vxlan_config}")
         
         # Determine interface name
-        iface_name = f"vlan{vlan}" if (vlan and vlan != "0") else interface_normalized
-
+        # CRITICAL: For VLAN interfaces, we need to handle the naming carefully:
+        # - Linux shows VLAN interfaces as vlan{vlan}@{parent} in ip link show
+        # - But when creating with ip link add, we use just vlan{vlan} as the name
+        # - We use vlan{vlan}@{interface} format for our internal tracking to avoid conflicts
+        # - But for actual Linux commands, we use just vlan{vlan} (Linux will show it with @parent)
+        if vlan and vlan != "0":
+            vlan_name_only = f"vlan{vlan}"
+            # CRITICAL: Initialize iface_name_for_commands to vlan_name_only
+            # It will be updated later if we create a unique-named VLAN interface (e.g., vlan20-ens4np0)
+            iface_name_for_commands = vlan_name_only  # Use this for ip link commands
+            iface_name = f"vlan{vlan}@{interface_normalized}"  # Use this for tracking/logging
+        else:
+            iface_name = interface_normalized
+            iface_name_for_commands = interface_normalized
+        
         if vxlan_enabled:
             # Handle multiple tunnels format
             if isinstance(vxlan_config, dict) and "tunnels" in vxlan_config:
@@ -2350,32 +2438,95 @@ def apply_device():
                     logging.error(f"[DEVICE APPLY] {error_msg}")
                     return jsonify({"error": error_msg}), 400
                 
-                # Check if VLAN interface exists
-                check_result = subprocess.run(["ip", "link", "show", iface_name], 
+                # Check if VLAN interface exists with the correct parent interface
+                # Linux shows VLAN interfaces as vlan{vlan}@{parent}, but we check using just vlan{vlan}
+                # Also check if a standalone vlan{vlan} exists and verify its parent
+                vlan_name_only = f"vlan{vlan}"
+                check_result = subprocess.run(["ip", "link", "show", vlan_name_only], 
                                             capture_output=True, text=True, timeout=5)
+                
                 if check_result.returncode != 0:
-                    # Create VLAN interface using normalized interface name
+                    # VLAN interface doesn't exist - create new one
+                    # CRITICAL: Use vlan{vlan} as the name, Linux will show it as vlan{vlan}@{parent}
+                    # The @ format is only for our internal tracking, not for ip link add
                     vlan_result = subprocess.run([
-                        "ip", "link", "add", "link", interface_normalized, "name", iface_name, 
+                        "ip", "link", "add", "link", interface_normalized, "name", vlan_name_only, 
                         "type", "vlan", "id", vlan
                     ], capture_output=True, text=True, timeout=5)
                     
                     if vlan_result.returncode == 0:
-                        logging.info(f"[DEVICE APPLY] Created VLAN interface {iface_name}")
+                        # CRITICAL: Use just the interface name (without @parent) for commands
+                        # Linux shows it as vlan{vlan}@{parent} in ip link show, but commands use just the name
+                        iface_name_for_commands = vlan_name_only
+                        logging.info(f"[DEVICE APPLY] Created VLAN interface {vlan_name_only} (linked to {interface_normalized})")
                         result["vlan_created"] = True
                     else:
                         logging.warning(f"[DEVICE APPLY] Failed to create VLAN interface {iface_name}: {vlan_result.stderr}")
                         result["vlan_created"] = False
                 else:
-                    logging.info(f"[DEVICE APPLY] VLAN interface {iface_name} already exists")
-                    result["vlan_created"] = True
+                    # VLAN interface already exists - verify it's linked to correct parent
+                    link_output = check_result.stdout
+                    if f"@{interface_normalized}" in link_output or f"link/{interface_normalized}" in link_output:
+                        # CRITICAL: Use just the interface name (without @parent) for commands
+                        # Linux shows it as vlan{vlan}@{parent} in ip link show, but commands use just the name
+                        iface_name_for_commands = vlan_name_only
+                        logging.info(f"[DEVICE APPLY] VLAN interface {vlan_name_only} already exists and linked to {interface_normalized}")
+                        result["vlan_created"] = True
+                    else:
+                        # VLAN interface exists but linked to different parent
+                        # Try to create a new VLAN interface with a unique name that includes the parent interface
+                        # This allows the same VLAN ID to be used on multiple interfaces
+                        vlan_name_with_parent = f"vlan{vlan}-{interface_normalized}"
+                        # Linux interface name limit is 15 characters (IFNAMSIZ)
+                        if len(vlan_name_with_parent) > 15:
+                            # Truncate parent interface name if needed
+                            max_vlan_len = len(f"vlan{vlan}-")
+                            max_parent_len = 15 - max_vlan_len
+                            if max_parent_len > 0:
+                                truncated_parent = interface_normalized[:max_parent_len]
+                                vlan_name_with_parent = f"vlan{vlan}-{truncated_parent}"
+                            else:
+                                # Fallback to simple name (will fail if already exists)
+                                vlan_name_with_parent = vlan_name_only
+                        
+                        logging.info(f"[DEVICE APPLY] VLAN {vlan_name_only} exists on different interface, creating {vlan_name_with_parent} on {interface_normalized}")
+                        vlan_result = subprocess.run([
+                            "ip", "link", "add", "link", interface_normalized, "name", vlan_name_with_parent, 
+                            "type", "vlan", "id", vlan
+                        ], capture_output=True, text=True, timeout=5)
+                        
+                        if vlan_result.returncode == 0:
+                            # CRITICAL: Use just the interface name (without @parent) for commands
+                            # Linux shows it as vlan_name@{parent} in ip link show, but commands use just the name
+                            iface_name_for_commands = vlan_name_with_parent
+                            logging.info(f"[DEVICE APPLY] Created VLAN interface {vlan_name_with_parent} (VLAN ID {vlan} on {interface_normalized})")
+                            result["vlan_created"] = True
+                            # Store the actual interface name for use in OSPF/ISIS configuration
+                            result["actual_vlan_interface"] = vlan_name_with_parent
+                        else:
+                            # If unique name creation failed, try the simple name (might work if previous interface was removed)
+                            logging.warning(f"[DEVICE APPLY] Failed to create VLAN interface {vlan_name_with_parent}, trying simple name {vlan_name_only}")
+                            vlan_result2 = subprocess.run([
+                                "ip", "link", "add", "link", interface_normalized, "name", vlan_name_only, 
+                                "type", "vlan", "id", vlan
+                            ], capture_output=True, text=True, timeout=5)
+                            
+                            if vlan_result2.returncode == 0:
+                                # CRITICAL: Use just the interface name (without @parent) for commands
+                                iface_name_for_commands = vlan_name_only
+                                logging.info(f"[DEVICE APPLY] Created VLAN interface {vlan_name_only} using simple name (linked to {interface_normalized})")
+                                result["vlan_created"] = True
+                            else:
+                                error_msg = f"VLAN interface {vlan_name_only} exists but is linked to a different parent interface. Failed to create alternative interface name. Error: {vlan_result.stderr}. Try removing the existing VLAN interface first or use a different VLAN ID."
+                                logging.error(f"[DEVICE APPLY] {error_msg}")
+                                return jsonify({"error": error_msg}), 400
             except Exception as e:
                 logging.warning(f"[DEVICE APPLY] Error creating VLAN interface {iface_name}: {e}")
                 result["vlan_created"] = False
         
         # Step 2: Bring up interface
         try:
-            bringup_result = subprocess.run(["ip", "link", "set", iface_name, "up"], 
+            bringup_result = subprocess.run(["ip", "link", "set", iface_name_for_commands, "up"], 
                                           capture_output=True, text=True, timeout=5)
             if bringup_result.returncode == 0:
                 logging.info(f"[DEVICE APPLY] Interface {iface_name} brought up")
@@ -2391,19 +2542,19 @@ def apply_device():
         if ipv4 and ipv4_mask:
             try:
                 # Remove existing IPv4 address if any
-                subprocess.run(["ip", "addr", "del", f"{ipv4}/{ipv4_mask}", "dev", iface_name], 
+                subprocess.run(["ip", "addr", "del", f"{ipv4}/{ipv4_mask}", "dev", iface_name_for_commands], 
                              capture_output=True, text=True, timeout=5)
                 
                 # Add new IPv4 address
                 ipv4_result = subprocess.run([
-                    "ip", "addr", "add", f"{ipv4}/{ipv4_mask}", "dev", iface_name
+                    "ip", "addr", "add", f"{ipv4}/{ipv4_mask}", "dev", iface_name_for_commands
                 ], capture_output=True, text=True, timeout=5)
                 
                 if ipv4_result.returncode == 0:
-                    logging.info(f"[DEVICE APPLY] Configured IPv4 address {ipv4}/{ipv4_mask} on {iface_name}")
+                    logging.info(f"[DEVICE APPLY] Configured IPv4 address {ipv4}/{ipv4_mask} on {iface_name_for_commands} (interface: {iface_name})")
                     result["ipv4_configured"] = True
                 else:
-                    logging.warning(f"[DEVICE APPLY] Failed to configure IPv4 address {ipv4}/{ipv4_mask}: {ipv4_result.stderr}")
+                    logging.warning(f"[DEVICE APPLY] Failed to configure IPv4 address {ipv4}/{ipv4_mask} on {iface_name_for_commands}: {ipv4_result.stderr}")
                     result["ipv4_configured"] = False
             except Exception as e:
                 logging.warning(f"[DEVICE APPLY] Error configuring IPv4 address: {e}")
@@ -2413,19 +2564,19 @@ def apply_device():
         if ipv6 and ipv6_mask:
             try:
                 # Remove existing IPv6 address if any
-                subprocess.run(["ip", "addr", "del", f"{ipv6}/{ipv6_mask}", "dev", iface_name], 
+                subprocess.run(["ip", "addr", "del", f"{ipv6}/{ipv6_mask}", "dev", iface_name_for_commands], 
                              capture_output=True, text=True, timeout=5)
                 
                 # Add new IPv6 address
                 ipv6_result = subprocess.run([
-                    "ip", "addr", "add", f"{ipv6}/{ipv6_mask}", "dev", iface_name
+                    "ip", "addr", "add", f"{ipv6}/{ipv6_mask}", "dev", iface_name_for_commands
                 ], capture_output=True, text=True, timeout=5)
                 
                 if ipv6_result.returncode == 0:
-                    logging.info(f"[DEVICE APPLY] Configured IPv6 address {ipv6}/{ipv6_mask} on {iface_name}")
+                    logging.info(f"[DEVICE APPLY] Configured IPv6 address {ipv6}/{ipv6_mask} on {iface_name_for_commands} (interface: {iface_name})")
                     result["ipv6_configured"] = True
                 else:
-                    logging.warning(f"[DEVICE APPLY] Failed to configure IPv6 address {ipv6}/{ipv6_mask}: {ipv6_result.stderr}")
+                    logging.warning(f"[DEVICE APPLY] Failed to configure IPv6 address {ipv6}/{ipv6_mask} on {iface_name_for_commands}: {ipv6_result.stderr}")
                     result["ipv6_configured"] = False
             except Exception as e:
                 logging.warning(f"[DEVICE APPLY] Error configuring IPv6 address: {e}")
@@ -2438,12 +2589,64 @@ def apply_device():
             try:
                 # Add host route to gateway on the interface to make it directly reachable
                 # This allows the device to reach its gateway without affecting the system default route
+                # CRITICAL: Specify source IP to ensure correct source address selection when multiple IPs exist on interface
                 gateway_host_route = subprocess.run([
-                    "ip", "route", "replace", f"{ipv4_gateway}/32", "dev", iface_name
+                    "ip", "route", "replace", f"{ipv4_gateway}/32", "dev", iface_name_for_commands, "src", ipv4
                 ], capture_output=True, text=True, timeout=5)
                 if gateway_host_route.returncode == 0:
                     logging.debug(f"[DEVICE APPLY] Added host route to IPv4 gateway {ipv4_gateway}/32 on {iface_name}")
                     result["ipv4_gateway_route_added"] = True
+                    
+                    # CRITICAL: Ensure gateway ARP entry is kernel-managed, not zebra-managed
+                    # Zebra-managed ARP entries can cause ping failures
+                    try:
+                        # Check if ARP entry exists and is zebra-managed
+                        neigh_check = subprocess.run(
+                            ["ip", "neigh", "show", ipv4_gateway, "dev", iface_name_for_commands],
+                            capture_output=True, text=True, timeout=5
+                        )
+                        if neigh_check.returncode == 0 and neigh_check.stdout:
+                            neigh_output = neigh_check.stdout.strip()
+                            # Check if it's zebra-managed or FAILED
+                            if "proto zebra" in neigh_output or "FAILED" in neigh_output or "NOARP" in neigh_output:
+                                # Delete the zebra-managed/failed ARP entry
+                                subprocess.run(
+                                    ["ip", "neigh", "del", ipv4_gateway, "dev", iface_name_for_commands],
+                                    capture_output=True, text=True, timeout=5
+                                )
+                                logging.info(f"[DEVICE APPLY] Deleted zebra-managed/failed ARP entry for gateway {ipv4_gateway}")
+                                import time
+                                time.sleep(0.2)  # Brief delay after deletion
+                        
+                        # Try to resolve gateway MAC address via ARP
+                        arp_resolve = subprocess.run(
+                            ["ping", "-c", "1", "-W", "1", ipv4_gateway],
+                            capture_output=True, text=True, timeout=3
+                        )
+                        
+                        # Check ARP table again to get the MAC address
+                        neigh_check2 = subprocess.run(
+                            ["ip", "neigh", "show", ipv4_gateway, "dev", iface_name_for_commands],
+                            capture_output=True, text=True, timeout=5
+                        )
+                        if neigh_check2.returncode == 0 and neigh_check2.stdout:
+                            # Extract MAC address from ARP entry
+                            import re
+                            mac_match = re.search(r'lladdr\s+([0-9a-fA-F:]{17})', neigh_check2.stdout)
+                            if mac_match:
+                                gateway_mac = mac_match.group(1)
+                                # Create permanent kernel-managed ARP entry
+                                subprocess.run([
+                                    "ip", "neigh", "replace", ipv4_gateway,
+                                    "lladdr", gateway_mac,
+                                    "dev", iface_name_for_commands,
+                                    "nud", "permanent"
+                                ], capture_output=True, text=True, timeout=5)
+                                logging.info(f"[DEVICE APPLY] ✅ Configured permanent kernel-managed ARP entry for gateway {ipv4_gateway} -> {gateway_mac}")
+                            else:
+                                logging.warning(f"[DEVICE APPLY] Could not extract MAC address from ARP entry for gateway {ipv4_gateway}")
+                    except Exception as arp_exc:
+                        logging.warning(f"[DEVICE APPLY] Error configuring gateway ARP entry: {arp_exc}")
                 else:
                     logging.warning(f"[DEVICE APPLY] Failed to add host route to IPv4 gateway: {gateway_host_route.stderr}")
                     result["ipv4_gateway_route_added"] = False
@@ -2455,12 +2658,63 @@ def apply_device():
             try:
                 # Add host route to IPv6 gateway on the interface to make it directly reachable
                 # This allows the device to reach its gateway without affecting the system default route
+                # CRITICAL: Specify source IP to ensure correct source address selection when multiple IPs exist on interface
                 gateway6_host_route = subprocess.run([
-                    "ip", "-6", "route", "replace", f"{ipv6_gateway}/128", "dev", iface_name
+                    "ip", "-6", "route", "replace", f"{ipv6_gateway}/128", "dev", iface_name_for_commands, "src", ipv6
                 ], capture_output=True, text=True, timeout=5)
                 if gateway6_host_route.returncode == 0:
                     logging.debug(f"[DEVICE APPLY] Added host route to IPv6 gateway {ipv6_gateway}/128 on {iface_name}")
                     result["ipv6_gateway_route_added"] = True
+                    
+                    # CRITICAL: Ensure IPv6 gateway neighbor entry is kernel-managed, not zebra-managed
+                    try:
+                        # Check if neighbor entry exists and is zebra-managed
+                        neigh_check = subprocess.run(
+                            ["ip", "-6", "neigh", "show", ipv6_gateway, "dev", iface_name_for_commands],
+                            capture_output=True, text=True, timeout=5
+                        )
+                        if neigh_check.returncode == 0 and neigh_check.stdout:
+                            neigh_output = neigh_check.stdout.strip()
+                            # Check if it's zebra-managed or FAILED
+                            if "proto zebra" in neigh_output or "FAILED" in neigh_output:
+                                # Delete the zebra-managed/failed neighbor entry
+                                subprocess.run(
+                                    ["ip", "-6", "neigh", "del", ipv6_gateway, "dev", iface_name_for_commands],
+                                    capture_output=True, text=True, timeout=5
+                                )
+                                logging.info(f"[DEVICE APPLY] Deleted zebra-managed/failed IPv6 neighbor entry for gateway {ipv6_gateway}")
+                                import time
+                                time.sleep(0.2)  # Brief delay after deletion
+                        
+                        # Try to resolve IPv6 gateway MAC address via neighbor discovery
+                        nd_resolve = subprocess.run(
+                            ["ping6", "-c", "1", "-W", "1", ipv6_gateway],
+                            capture_output=True, text=True, timeout=3
+                        )
+                        
+                        # Check neighbor table again to get the MAC address
+                        neigh_check2 = subprocess.run(
+                            ["ip", "-6", "neigh", "show", ipv6_gateway, "dev", iface_name_for_commands],
+                            capture_output=True, text=True, timeout=5
+                        )
+                        if neigh_check2.returncode == 0 and neigh_check2.stdout:
+                            # Extract MAC address from neighbor entry
+                            import re
+                            mac_match = re.search(r'lladdr\s+([0-9a-fA-F:]{17})', neigh_check2.stdout)
+                            if mac_match:
+                                gateway_mac = mac_match.group(1)
+                                # Create permanent kernel-managed neighbor entry
+                                subprocess.run([
+                                    "ip", "-6", "neigh", "replace", ipv6_gateway,
+                                    "lladdr", gateway_mac,
+                                    "dev", iface_name_for_commands,
+                                    "nud", "permanent"
+                                ], capture_output=True, text=True, timeout=5)
+                                logging.info(f"[DEVICE APPLY] ✅ Configured permanent kernel-managed IPv6 neighbor entry for gateway {ipv6_gateway} -> {gateway_mac}")
+                            else:
+                                logging.warning(f"[DEVICE APPLY] Could not extract MAC address from IPv6 neighbor entry for gateway {ipv6_gateway}")
+                    except Exception as arp_exc:
+                        logging.warning(f"[DEVICE APPLY] Error configuring IPv6 gateway neighbor entry: {arp_exc}")
                 else:
                     logging.warning(f"[DEVICE APPLY] Failed to add host route to IPv6 gateway: {gateway6_host_route.stderr}")
                     result["ipv6_gateway_route_added"] = False
@@ -2725,7 +2979,7 @@ def apply_device():
                 device_data = {
                     "device_id": device_id,
                     "device_name": device_name,
-                    "interface": interface,
+                    "interface": interface_normalized,  # CRITICAL: Use normalized interface name
                     "vlan": vlan,
                     "ipv4_address": ipv4,
                     "ipv6_address": ipv6,
@@ -2748,6 +3002,8 @@ def apply_device():
                     "vxlan_enabled": vxlan_enabled,
                     "vxlan_last_error": vxlan_error,
                     "vxlan_updated_at": datetime.now(timezone.utc).isoformat(),
+                    # CRITICAL: Store actual VLAN interface name if unique-named interface was created
+                    "actual_vlan_interface": result.get("actual_vlan_interface", ""),
                 }
                 if not existing_device:
                     logging.info(f"[DEVICE APPLY] Device {device_id} not found in database, adding it")
@@ -2869,7 +3125,7 @@ def apply_device():
                     device_data = {
                         "device_id": device_id,
                         "device_name": device_name,
-                        "interface": interface,
+                        "interface": interface_normalized,  # CRITICAL: Use normalized interface name
                         "vlan": vlan,
                         "ipv4_address": ipv4,
                         "ipv6_address": ipv6,
@@ -2971,10 +3227,18 @@ def apply_device():
                             update_data["loopback_ipv6"] = None
                     
                     # Also update interface and VLAN if they changed
-                    if interface and interface != existing_device.get("interface", ""):
-                        update_data["interface"] = interface
+                    # CRITICAL: Use normalized interface name for database storage
+                    if interface_normalized and interface_normalized != existing_device.get("interface", ""):
+                        update_data["interface"] = interface_normalized
                     if vlan and vlan != existing_device.get("vlan", "0"):
                         update_data["vlan"] = vlan
+                    
+                    # CRITICAL: Store the actual VLAN interface name if a unique-named interface was created
+                    # This is needed for OSPF/ISIS configuration when vlan20-ens4np0 is created instead of vlan20
+                    if result.get("actual_vlan_interface"):
+                        actual_vlan_iface = result["actual_vlan_interface"]
+                        update_data["actual_vlan_interface"] = actual_vlan_iface
+                        logging.info(f"[DEVICE APPLY] Storing actual VLAN interface name '{actual_vlan_iface}' in database for OSPF/ISIS configuration")
                     
                     # Update protocol configs if provided
                     if bgp_config:
@@ -3190,6 +3454,19 @@ def configure_ospf():
         
         logging.info(f"IPv4 OSPF enabled: {ipv4_enabled}, IPv6 OSPF enabled: {ipv6_enabled}")
         
+        # Normalize interface name (extract base interface from labels like "TG 0 - Port: ens4np0")
+        def normalize_iface(iface_str):
+            """Normalize interface name from UI label format."""
+            if not iface_str:
+                return ""
+            s = iface_str.strip().strip('"').rstrip(",")
+            if " - " in s:
+                s = s.split(" - ", 1)[-1].strip()
+            if ":" in s:
+                s = s.rsplit(":", 1)[-1].strip()
+            parts = s.split()
+            return parts[-1] if parts else ""
+        
         # Ensure FRR container exists before configuring OSPF
         from utils.frr_docker import FRRDockerManager
         frr_manager = FRRDockerManager()
@@ -3208,18 +3485,6 @@ def configure_ospf():
         
         if container is None:
             # Create device config for container creation
-            # Normalize interface name (extract base interface from labels like "TG 0 - Port: ens4np0")
-            def normalize_iface(iface_str):
-                """Normalize interface name from UI label format."""
-                if not iface_str:
-                    return ""
-                s = iface_str.strip().strip('"').rstrip(",")
-                if " - " in s:
-                    s = s.split(" - ", 1)[-1].strip()
-                if ":" in s:
-                    s = s.rsplit(":", 1)[-1].strip()
-                parts = s.split()
-                return parts[-1] if parts else ""
             
             # Get interface from data, then normalize it
             interface_raw = data.get("interface", "ens4np0")
@@ -3400,6 +3665,30 @@ def configure_ospf():
                 
                 # DEBUG: Log what we're saving to database
                 logging.info(f"[OSPF CONFIGURE] Saving to database for {device_name}: area_id_ipv4={merged_ospf_config.get('area_id_ipv4')}, area_id_ipv6={merged_ospf_config.get('area_id_ipv6')}, area_id={merged_ospf_config.get('area_id')}")
+                
+                # CRITICAL: Normalize interface field in OSPF config before saving to database
+                # For untagged interfaces (VLAN 0), interface should be just the interface name (e.g., "ens4np0")
+                # For tagged interfaces, interface should be the VLAN interface name (e.g., "vlan20")
+                if "interface" in merged_ospf_config:
+                    ospf_interface = merged_ospf_config["interface"]
+                    if ospf_interface:
+                        # Normalize interface name - remove "TG X - " prefix if present
+                        ospf_interface_normalized = normalize_iface(ospf_interface)
+                        # If VLAN is 0 and interface still has "TG" prefix, extract just the interface name
+                        vlan = data.get("vlan", existing_device.get("vlan", "0") if existing_device else "0")
+                        if vlan == "0" or vlan == 0:
+                            # For untagged interfaces, ensure it's just the interface name
+                            if "TG" in ospf_interface_normalized or " - " in ospf_interface_normalized:
+                                # Extract just the interface name after " - "
+                                if " - " in ospf_interface_normalized:
+                                    ospf_interface_normalized = ospf_interface_normalized.split(" - ", 1)[-1].strip()
+                                elif "TG" in ospf_interface_normalized:
+                                    # Handle "TG 0 - ens4np0" format
+                                    parts = ospf_interface_normalized.split()
+                                    if len(parts) >= 3 and parts[0] == "TG":
+                                        ospf_interface_normalized = parts[-1]
+                        merged_ospf_config["interface"] = ospf_interface_normalized
+                        logging.info(f"[OSPF CONFIGURE] Normalized interface from '{ospf_interface}' to '{ospf_interface_normalized}' before saving to database")
                 
                 # If this is a partial apply, restore the preserved enabled flags for unselected address families
                 if is_partial_apply:
@@ -3626,7 +3915,11 @@ def stop_device():
             return parts[-1] if parts else ""
         
         iface_normalized = normalize_iface(interface)
-        iface_name = f"vlan{vlan}" if (vlan and vlan != "0") else iface_normalized
+        # CRITICAL: For VLAN interfaces, use format vlan{vlan}@{interface} to avoid conflicts
+        if vlan and vlan != "0":
+            iface_name = f"vlan{vlan}@{iface_normalized}"
+        else:
+            iface_name = iface_normalized
         
         from utils.frr_docker import FRRDockerManager
         frr_manager = None
@@ -3829,7 +4122,11 @@ def remove_device():
                     parts = s.split()
                     iface_normalized = parts[-1] if parts else s
 
-                iface_name = f"vlan{vlan}" if vlan and vlan != "0" else iface_normalized
+                # CRITICAL: For VLAN interfaces, use format vlan{vlan}@{interface} to avoid conflicts
+                if vlan and vlan != "0":
+                    iface_name = f"vlan{vlan}@{iface_normalized}"
+                else:
+                    iface_name = iface_normalized
 
                 dhcp_cfg = device_info.get("dhcp_config") or {}
                 if isinstance(dhcp_cfg, str):
@@ -8349,7 +8646,7 @@ def reset_interface_with_vlans():
         reset_results["devices_removed"] = removed_devices
         reset_results["device_removal_errors"] = device_removal_errors
         
-        # Step 2: Clean up physical interface IPs (if requested)
+        # Step 2: Clean up physical interface IPs and reset MTU (if requested)
         if cleanup_physical:
             try:
                 physical_result = subprocess.run(["ip", "addr", "show", base_interface],
@@ -8372,11 +8669,39 @@ def reset_interface_with_vlans():
                             if remove_result.returncode == 0:
                                 removed_physical_ips.append(ip_part)
                     
+                    # Reset MTU to default (1500) - this helps avoid MTU mismatch issues
+                    # Get current MTU first to check if reset is needed
+                    link_result = subprocess.run(["ip", "link", "show", base_interface],
+                                               capture_output=True, text=True, timeout=5)
+                    current_mtu = None
+                    mtu_reset = False
+                    if link_result.returncode == 0:
+                        # Extract MTU from output (e.g., "mtu 9216" or "mtu 1500")
+                        import re
+                        mtu_match = re.search(r'mtu\s+(\d+)', link_result.stdout)
+                        if mtu_match:
+                            current_mtu = int(mtu_match.group(1))
+                            # Only reset if MTU is not the default (1500)
+                            if current_mtu != 1500:
+                                mtu_reset_cmd = ["ip", "link", "set", base_interface, "mtu", "1500"]
+                                mtu_result = subprocess.run(mtu_reset_cmd, capture_output=True, text=True, timeout=5)
+                                if mtu_result.returncode == 0:
+                                    mtu_reset = True
+                                    logging.info(f"[INTERFACE RESET] Reset MTU from {current_mtu} to 1500 on {base_interface}")
+                                else:
+                                    logging.warning(f"[INTERFACE RESET] Failed to reset MTU on {base_interface}: {mtu_result.stderr}")
+                            else:
+                                logging.debug(f"[INTERFACE RESET] MTU already at default (1500) on {base_interface}, no reset needed")
+                    
                     reset_results["physical_cleanup"] = {
                         "success": True,
-                        "removed_ips": removed_physical_ips
+                        "removed_ips": removed_physical_ips,
+                        "mtu_reset": mtu_reset,
+                        "previous_mtu": current_mtu if current_mtu and current_mtu != 1500 else None
                     }
                     logging.info(f"[INTERFACE RESET] Cleaned up {len(removed_physical_ips)} IPs from physical interface {base_interface}")
+                    if mtu_reset:
+                        logging.info(f"[INTERFACE RESET] Reset MTU to 1500 on {base_interface} (was {current_mtu})")
                 else:
                     logging.warning(f"[INTERFACE RESET] Physical interface {base_interface} not found or error: {physical_result.stderr}")
                     
@@ -8392,6 +8717,12 @@ def reset_interface_with_vlans():
         
         if device_removal_errors:
             message_parts.append(f"{len(device_removal_errors)} device removal error(s)")
+        
+        # Add MTU reset information if MTU was reset
+        if cleanup_physical and reset_results.get("physical_cleanup", {}).get("mtu_reset"):
+            previous_mtu = reset_results["physical_cleanup"].get("previous_mtu")
+            if previous_mtu:
+                message_parts.append(f"MTU reset from {previous_mtu} to 1500")
         
         return jsonify({
             "success": True,
@@ -9226,7 +9557,7 @@ def get_interfaces():
             is_vxlan_interface = re.match(r'^vx\d+-\w+$', name)  # Matches vx5000-9d751a, vx5001-abc123, etc.
             
             if (name.startswith('vlan') or 
-                name.startswith('lo') or 
+                (name.startswith('lo') and name != 'lo') or  # Skip lo* except 'lo' itself
                 name.startswith('docker') or 
                 name.startswith('br-') or  # Docker bridges
                 name.startswith('bridge') or
