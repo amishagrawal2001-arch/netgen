@@ -233,14 +233,14 @@ class TrafficGenClientMenuAction():
                 self._save_in_progress = False
             else:
                 # Non-blocking call while a save is already in progress – skip
-                print("[SAVE SESSION] Save already in progress, skipping duplicate save request")
+                # print("[SAVE SESSION] Save already in progress, skipping duplicate save request")
                 return
         
         # Throttle rapid save calls (only for non-blocking saves)
         if not blocking:
             # Check if this is a duplicate save call within a short time window
             if hasattr(self, '_last_save_time') and (current_time - self._last_save_time) < 0.5:
-                print("[SAVE SESSION] Skipping duplicate save call (throttled)")
+                # print("[SAVE SESSION] Skipping duplicate save call (throttled)")
                 return
         # Update timestamp for throttling (both blocking and non-blocking)
         self._last_save_time = current_time

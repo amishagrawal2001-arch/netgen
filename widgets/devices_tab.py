@@ -424,7 +424,9 @@ class MultiDeviceApplyWorker(QThread):
                     self.device_applied.emit(device_name, True, message)
                     return (message, True)
                 else:
-                    message = f"❌ {device_name}: Failed to apply to server"
+                    # Get error message from device_info if available
+                    error_msg = device_info.get("_apply_error", "Unknown error")
+                    message = f"❌ {device_name}: Failed to apply to server - {error_msg}"
                     self.device_applied.emit(device_name, False, message)
                     return (message, False)
                     
@@ -1516,6 +1518,9 @@ class DevicesTab(QWidget):
         """)
         layout.addWidget(self.tab_widget)
 
+        # Migrate existing interface keys to include TG ID prefix (if needed)
+        self._migrate_interface_keys()
+        
         # Initialize protocol handlers
         self.bgp_handler = BGPHandler(self)
         self.ospf_handler = OSPFHandler(self)
@@ -2418,21 +2423,53 @@ class DevicesTab(QWidget):
             QMessageBox.critical(self, "No Server", "No server selected.")
             return
 
-        # Get selected devices from the devices table
-        selected_items = self.devices_table.selectedItems()
         devices_to_apply = []
+        selected_device_names = set()
         
-        if selected_items:
-            # Get unique device names from selected rows
-            selected_device_names = set()
-            for item in selected_items:
-                row = item.row()
-                device_name_item = self.devices_table.item(row, self.COL["Device Name"])
-                if device_name_item:
-                    device_name = device_name_item.text()
-                    selected_device_names.add(device_name)
-            
-            # Find the devices in all_devices that have VXLAN config
+        # PRIORITY 1: Check if rows are selected in the VXLAN table
+        if hasattr(self, "vxlan_table") and self.vxlan_table:
+            selected_vxlan_items = self.vxlan_table.selectedItems()
+            if selected_vxlan_items:
+                # Get unique device names from selected VXLAN table rows
+                device_col_idx = self.VXLAN_COL.get("Device", 0)
+                unique_rows = set()
+                
+                for item in selected_vxlan_items:
+                    row = item.row()
+                    if row in unique_rows:
+                        continue
+                    unique_rows.add(row)
+                    
+                    # Get device name from the Device column
+                    device_item = self.vxlan_table.item(row, device_col_idx)
+                    if device_item:
+                        device_name = device_item.text().strip()
+                        # Remove "(Tunnel X/Y)" suffix if present (e.g., "device1 (Tunnel 1/3)" -> "device1")
+                        if " (Tunnel " in device_name:
+                            device_name = device_name.split(" (Tunnel ")[0].strip()
+                        if device_name:
+                            selected_device_names.add(device_name)
+                            print(f"[VXLAN APPLY] Selected device from VXLAN table: {device_name}")
+                
+                if selected_device_names:
+                    print(f"[VXLAN APPLY] Found {len(selected_device_names)} device(s) selected in VXLAN table: {selected_device_names}")
+        
+        # PRIORITY 2: If no VXLAN table selection, check devices table selection
+        if not selected_device_names:
+            selected_items = self.devices_table.selectedItems()
+            if selected_items:
+                # Get unique device names from selected rows
+                for item in selected_items:
+                    row = item.row()
+                    device_name_item = self.devices_table.item(row, self.COL["Device Name"])
+                    if device_name_item:
+                        device_name = device_name_item.text()
+                        selected_device_names.add(device_name)
+                        print(f"[VXLAN APPLY] Selected device from devices table: {device_name}")
+        
+        # Find the devices in all_devices that have VXLAN config
+        if selected_device_names:
+            # Apply only to selected devices
             for device_name in selected_device_names:
                 for iface, devices in self.main_window.all_devices.items():
                     for device in devices:
@@ -2466,36 +2503,16 @@ class DevicesTab(QWidget):
                                 devices_to_apply.append(device)
                             break
         else:
-            # If no devices selected, find all devices with VXLAN config
-            for iface, devices in self.main_window.all_devices.items():
-                for device in devices:
-                    vxlan_config = device.get("vxlan_config", {})
-                    # If local config is empty, try to load from database
-                    if not vxlan_config or (isinstance(vxlan_config, dict) and len(vxlan_config) == 0):
-                        device_id = device.get("device_id")
-                        if device_id:
-                            try:
-                                import requests
-                                server_url = self.get_server_url()
-                                if server_url:
-                                    response = requests.get(f"{server_url}/api/device/database/devices/{device_id}", timeout=5)
-                                    if response.status_code == 200:
-                                        db_device_data = response.json()
-                                        db_vxlan = db_device_data.get("vxlan_config", {})
-                                        if isinstance(db_vxlan, str):
-                                            import json
-                                            try:
-                                                db_vxlan = json.loads(db_vxlan)
-                                            except:
-                                                db_vxlan = {}
-                                        if db_vxlan and (isinstance(db_vxlan, dict) and len(db_vxlan) > 0):
-                                            device["vxlan_config"] = db_vxlan
-                                            vxlan_config = db_vxlan
-                                            print(f"[VXLAN APPLY] Loaded VXLAN config from database for {device.get('Device Name')}")
-                            except Exception as db_load_exc:
-                                print(f"[VXLAN APPLY] Failed to load VXLAN config from database: {db_load_exc}")
-                    if vxlan_config:
-                        devices_to_apply.append(device)
+            # If no devices selected in either table, show message asking to select
+            QMessageBox.information(
+                self,
+                "No Selection",
+                "Please select one or more devices in the VXLAN table or Devices table before applying VXLAN configuration.\n\n"
+                "To apply:\n"
+                "1. Select row(s) in the VXLAN Tunnel Status table, OR\n"
+                "2. Select row(s) in the Devices table"
+            )
+            return
         
         if not devices_to_apply:
             QMessageBox.information(self, "No VXLAN Configuration", 
@@ -2564,34 +2581,34 @@ class DevicesTab(QWidget):
             self.vxlan_handler.refresh_vxlan_table()
         self.update_device_table(self.main_window.all_devices)
         
-        # Refresh interface list from server to show newly created VXLAN/bridge interfaces
-        # Add a small delay to ensure VXLAN interfaces are fully created in containers
-        if success_count > 0 and hasattr(self.main_window, "update_server_tree"):
-            print(f"[VXLAN APPLY] Scheduling interface list refresh from server after VXLAN tunnel creation (delay: 500ms)")
-            from PyQt5.QtCore import QTimer
-            # Define a callback function to ensure it's called correctly
-            def refresh_interfaces():
-                print(f"[VXLAN APPLY] Executing interface list refresh callback")
-                try:
-                    if hasattr(self.main_window, "update_server_tree"):
-                        # Clear cached interfaces for all servers to force fresh fetch
-                        # This ensures newly created VXLAN/bridge interfaces are added to the tree
-                        if hasattr(self.main_window, "server_interfaces"):
-                            for server in self.main_window.server_interfaces:
-                                if "interfaces" in server:
-                                    del server["interfaces"]
-                                    print(f"[VXLAN APPLY] Cleared cached interfaces for server: {server.get('address', 'unknown')}")
-                        
-                        # Now refresh the server tree with fresh data
-                        self.main_window.update_server_tree()
-                        print(f"[VXLAN APPLY] Interface list refresh completed")
-                    else:
-                        print(f"[VXLAN APPLY] WARNING: update_server_tree not available in callback")
-                except Exception as e:
-                    print(f"[VXLAN APPLY] ERROR during interface refresh: {e}")
-                    import logging
-                    logging.error(f"[VXLAN APPLY] ERROR during interface refresh: {e}", exc_info=True)
-            QTimer.singleShot(500, refresh_interfaces)
+        # Interface list refresh is now manual only - user can click "Refresh Interface List" button if needed
+        # Removed automatic refresh to prevent unnecessary UI updates
+        # if success_count > 0 and hasattr(self.main_window, "update_server_tree"):
+        #     print(f"[VXLAN APPLY] Scheduling interface list refresh from server after VXLAN tunnel creation (delay: 500ms)")
+        #     from PyQt5.QtCore import QTimer
+        #     # Define a callback function to ensure it's called correctly
+        #     def refresh_interfaces():
+        #         print(f"[VXLAN APPLY] Executing interface list refresh callback")
+        #         try:
+        #             if hasattr(self.main_window, "update_server_tree"):
+        #                 # Clear cached interfaces for all servers to force fresh fetch
+        #                 # This ensures newly created VXLAN/bridge interfaces are added to the tree
+        #                 if hasattr(self.main_window, "server_interfaces"):
+        #                     for server in self.main_window.server_interfaces:
+        #                         if "interfaces" in server:
+        #                             del server["interfaces"]
+        #                             print(f"[VXLAN APPLY] Cleared cached interfaces for server: {server.get('address', 'unknown')}")
+        #                 
+        #                 # Now refresh the server tree with fresh data
+        #                 self.main_window.update_server_tree()
+        #                 print(f"[VXLAN APPLY] Interface list refresh completed")
+        #             else:
+        #                 print(f"[VXLAN APPLY] WARNING: update_server_tree not available in callback")
+        #         except Exception as e:
+        #             print(f"[VXLAN APPLY] ERROR during interface refresh: {e}")
+        #             import logging
+        #             logging.error(f"[VXLAN APPLY] ERROR during interface refresh: {e}", exc_info=True)
+        #     QTimer.singleShot(500, refresh_interfaces)
 
     def prompt_edit_bgp(self):
         """Edit BGP configuration for the selected neighbor entry."""
@@ -3334,7 +3351,13 @@ class DevicesTab(QWidget):
             return self.get_server_url(silent=True)
 
         if "TG" in iface_label:
-            tg_part = iface_label.split("-")[0].strip()
+            # CRITICAL: Split on " - " (space-dash-space) to handle interface names with dashes
+            # This ensures we correctly extract "TG 0" from "TG 0 - ens4np0" even if interface name has dashes
+            if " - " in iface_label:
+                tg_part = iface_label.split(" - ", 1)[0].strip()
+            else:
+                # Fallback: if no " - " found, try splitting on first dash
+                tg_part = iface_label.split("-", 1)[0].strip()
             parts = tg_part.split()
             tg_id = parts[-1] if parts else None
 
@@ -3355,6 +3378,109 @@ class DevicesTab(QWidget):
             return self.main_window.server_interfaces[0].get("address")
 
         return self.get_server_url(silent=True)
+
+    def _migrate_interface_keys(self):
+        """
+        Migrate existing interface keys in all_devices to include TG ID prefix.
+        This fixes devices that were created before the TG ID prefix fix was applied.
+        """
+        if not hasattr(self.main_window, "all_devices") or not self.main_window.all_devices:
+            return
+        
+        if not hasattr(self.main_window, "server_interfaces") or not self.main_window.server_interfaces:
+            return
+        
+        # Build a map of port names to TG IDs from server_interfaces
+        port_to_tg = {}
+        if hasattr(self.main_window, "server_tree") and self.main_window.server_tree:
+            from PyQt5.QtWidgets import QLabel
+            tree = self.main_window.server_tree
+            for i in range(tree.topLevelItemCount()):
+                server_item = tree.topLevelItem(i)
+                if not server_item:
+                    continue
+                
+                # Extract TG ID from custom widget
+                tg_id_widget = tree.itemWidget(server_item, 0)
+                tg_id = None
+                if tg_id_widget:
+                    for child in tg_id_widget.findChildren(QLabel):
+                        text = child.text()
+                        if text.startswith("TG "):
+                            tg_id = text.strip()
+                            break
+                
+                # Fallback to server_interfaces
+                if not tg_id and i < len(self.main_window.server_interfaces):
+                    server = self.main_window.server_interfaces[i]
+                    tg_id = f"TG {server.get('tg_id', '0')}"
+                
+                if tg_id:
+                    # Get all child interfaces for this server
+                    for j in range(server_item.childCount()):
+                        port_item = server_item.child(j)
+                        if port_item:
+                            port_name = port_item.text(0).replace("• ", "").strip()
+                            if port_name:
+                                port_to_tg[port_name] = tg_id
+        
+        migrated_count = 0
+        new_all_devices = {}
+        
+        for old_key, devices in self.main_window.all_devices.items():
+            if not isinstance(devices, list):
+                new_all_devices[old_key] = devices
+                continue
+            
+            # Check if key already has TG ID prefix
+            if old_key.startswith("TG ") and " - " in old_key:
+                # Already migrated, keep as is
+                new_all_devices[old_key] = devices
+                continue
+            
+            # Extract port name from old key (e.g., "ens4np0" from " - ens4np0")
+            port_name = old_key.strip().lstrip(" - ").strip()
+            if not port_name:
+                # Invalid key, keep as is
+                new_all_devices[old_key] = devices
+                continue
+            
+            # Try to find TG ID from port_to_tg map
+            tg_id = port_to_tg.get(port_name)
+            
+            # Fallback: try to find TG ID from device's Interface field
+            if not tg_id:
+                for device in devices:
+                    device_interface = device.get("Interface", "")
+                    if device_interface:
+                        # Check if Interface field contains TG ID (e.g., "TG 0 - ens4np0")
+                        if "TG " in device_interface and " - " in device_interface:
+                            tg_part = device_interface.split(" - ", 1)[0].strip()
+                            if tg_part.startswith("TG "):
+                                tg_id = tg_part
+                                break
+            
+            # Fallback: use first server's TG ID
+            if not tg_id and self.main_window.server_interfaces:
+                first_server = self.main_window.server_interfaces[0]
+                tg_id = f"TG {first_server.get('tg_id', '0')}"
+            
+            # If we found a TG ID, create new key with prefix
+            if tg_id:
+                new_key = f"{tg_id} - {port_name}"
+                new_all_devices[new_key] = devices
+                # Update interface_key in each device
+                for device in devices:
+                    device["interface_key"] = new_key
+                migrated_count += len(devices)
+                print(f"[MIGRATION] Migrated {len(devices)} device(s) from '{old_key}' to '{new_key}'")
+            else:
+                # Could not determine TG ID, keep old key
+                new_all_devices[old_key] = devices
+        
+        if migrated_count > 0:
+            self.main_window.all_devices = new_all_devices
+            print(f"[MIGRATION] Migrated {migrated_count} device(s) to use TG ID prefix in interface keys")
 
     # ---------- Row creation ----------
 
@@ -3621,10 +3747,11 @@ class DevicesTab(QWidget):
             except Exception as save_exc:
                 print(f"[DEBUG APPLY] ⚠️ Failed to save session: {save_exc}")
         
-        # Refresh interface list from server if VXLAN was applied
-        if vxlan_applied and hasattr(self.main_window, "update_server_tree"):
-            print(f"[DEBUG APPLY] Refreshing interface list from server after VXLAN tunnel creation")
-            self.main_window.update_server_tree()
+        # Interface list refresh is now manual only - user can click "Refresh Interface List" button if needed
+        # Removed automatic refresh to prevent unnecessary UI updates
+        # if vxlan_applied and hasattr(self.main_window, "update_server_tree"):
+        #     print(f"[DEBUG APPLY] Refreshing interface list from server after VXLAN tunnel creation")
+        #     self.main_window.update_server_tree()
     
     def ping_selected_device(self):
         """Ping the selected device(s) after ensuring ARP has been resolved."""
@@ -4446,6 +4573,7 @@ class DevicesTab(QWidget):
                             tunnel,
                             iface_label,
                             device_info.get("VLAN", "0"),
+                            device_id=device_info.get("device_id"),
                         )
                         if processed_tunnel:
                             processed_tunnels.append(processed_tunnel)
@@ -4482,6 +4610,7 @@ class DevicesTab(QWidget):
                     vxlan_config,
                     iface_label,
                     device_info.get("VLAN", "0"),
+                    device_id=device_info.get("device_id"),
                 )
                 if vxlan_config:
                     device_info["vxlan_config"] = vxlan_config
@@ -4581,6 +4710,7 @@ class DevicesTab(QWidget):
                 device_info.get("vxlan_config"),
                 iface_label,
                 device_info.get("VLAN", "0"),
+                device_id=device_info.get("device_id"),
             )
             if vxlan_config:
                 device_info["vxlan_config"] = vxlan_config
@@ -4616,8 +4746,19 @@ class DevicesTab(QWidget):
             print(f"[DEBUG DEVICE APPLY] Calling /api/device/apply with payload: {basic_payload}")
             response = requests.post(f"{server_url}/api/device/apply", json=basic_payload, timeout=30)
             if response.status_code != 200:
-                print(f"[ERROR] Failed to apply basic device configuration: {response.status_code}")
-                print(f"[ERROR] Response: {response.text}")
+                error_msg = f"HTTP {response.status_code}"
+                try:
+                    error_data = response.json()
+                    if isinstance(error_data, dict) and "error" in error_data:
+                        error_msg = error_data["error"]
+                    elif isinstance(error_data, str):
+                        error_msg = error_data
+                except:
+                    error_msg = response.text[:200] if response.text else error_msg
+                print(f"[ERROR] Failed to apply basic device configuration: {error_msg}")
+                print(f"[ERROR] Response status: {response.status_code}, body: {response.text[:500]}")
+                # Store error message for display to user
+                device_info["_apply_error"] = error_msg
                 return False
             
             print(f"[SUCCESS] Basic device configuration applied for {device_name}")
@@ -4777,7 +4918,32 @@ class DevicesTab(QWidget):
                                 "Please select a port under a server.")
             return
 
-        tg_id = selected_items[0].parent().text(0).strip()
+        # CRITICAL: Extract TG ID from custom widget in column 0 (same logic as VXLAN handler)
+        parent_item = selected_items[0].parent()
+        tg_id_widget = self.main_window.server_tree.itemWidget(parent_item, 0)
+        tg_id = None
+        if tg_id_widget:
+            # Find the QLabel containing the TG ID text
+            from PyQt5.QtWidgets import QLabel
+            for child in tg_id_widget.findChildren(QLabel):
+                text = child.text()
+                if text.startswith("TG "):
+                    tg_id = text.strip()
+                    break
+        
+        # Fallback: extract from server_interfaces using parent index
+        if not tg_id:
+            parent_index = self.main_window.server_tree.indexOfTopLevelItem(parent_item)
+            if parent_index >= 0 and hasattr(self.main_window, "server_interfaces"):
+                if parent_index < len(self.main_window.server_interfaces):
+                    server = self.main_window.server_interfaces[parent_index]
+                    tg_id = f"TG {server.get('tg_id', '0')}"
+        
+        if not tg_id:
+            QMessageBox.warning(self, "Invalid Selection",
+                                "Could not determine TG ID from selected interface.")
+            return
+        
         port_name = selected_items[0].text(0).replace("• ", "").strip()  # Remove bullet prefix
         iface = f"{tg_id} - {port_name}"  # Match server tree format
 
@@ -4937,6 +5103,7 @@ class DevicesTab(QWidget):
                         per_device_vxlan,
                         iface,
                         current_vlan,
+                        device_id=device_data.get("device_id"),
                     )
                     # Convert single tunnel config to tunnels format for consistency
                     device_data["vxlan_config"] = {"tunnels": [per_device_vxlan]}
@@ -5172,6 +5339,7 @@ class DevicesTab(QWidget):
                     normalized_vxlan_config,
                     iface,
                     vlan,
+                    device_id=device_data.get("device_id"),
                 )
                 device_data["vxlan_config"] = per_device_vxlan
                 device_data["VXLAN"] = self._format_vxlan_summary(per_device_vxlan)
@@ -5338,11 +5506,18 @@ class DevicesTab(QWidget):
             devices_to_create.append(device_data)
 
         # persist in model
-        if iface not in self.main_window.all_devices or not isinstance(self.main_window.all_devices[iface], list):
-            self.main_window.all_devices[iface] = []
+        # CRITICAL: Use the original 'iface' variable (with TG ID) as the key in all_devices,
+        # not 'iface_name' which might be normalized without TG ID
+        # This ensures interface selection from server_tree correctly matches devices
+        interface_key = iface  # Use the full "TG X - portname" format
+        
+        if interface_key not in self.main_window.all_devices or not isinstance(self.main_window.all_devices[interface_key], list):
+            self.main_window.all_devices[interface_key] = []
         
         for device_data in devices_to_create:
-            self.main_window.all_devices[iface].append(device_data)
+            # Store the interface_key in device_data for proper matching during filtering
+            device_data["interface_key"] = interface_key
+            self.main_window.all_devices[interface_key].append(device_data)
             
             # Add to device name mapping for easy lookup
             self.interface_to_device_map[device_data["Device Name"]] = device_data
@@ -5353,15 +5528,12 @@ class DevicesTab(QWidget):
             
             print(f"[DEBUG ADD] Added device '{device_data['Device Name']}' locally (pending apply)")
 
-        # Refresh the table to show new devices
-        self.populate_device_table()
-        
         # Save session immediately after adding device(s) so they persist even if client is closed before apply
         if hasattr(self.main_window, "save_session"):
             print(f"[DEBUG ADD] Saving session after adding {len(devices_to_create)} device(s)")
             self.main_window.save_session()
 
-        # keep the interface selected
+        # Keep the interface selected to ensure devices are visible
         tree = self.main_window.server_tree
         for i in range(tree.topLevelItemCount()):
             tg_item = tree.topLevelItem(i)
@@ -5372,6 +5544,7 @@ class DevicesTab(QWidget):
                     port_item.setSelected(True)
                     break
 
+        # Refresh the table to show new devices - use update_device_table which handles filtering correctly
         self.update_device_table(self.main_window.all_devices)
         
         # Update BGP table if any devices have BGP configured
@@ -5641,6 +5814,7 @@ class DevicesTab(QWidget):
             new_vxlan_config,
             iface,
             vlan,
+            device_id=device_info.get("device_id"),
         )
         existing_protocols = self._convert_protocols_to_array(device_info.get("protocols", []))
         device_info["protocols"] = existing_protocols
@@ -5911,7 +6085,19 @@ class DevicesTab(QWidget):
             preview = f"{preview}, +{len(remote_peers) - 2}"
         return f"VNI {config['vni']} -> {preview}"
 
-    def _with_vxlan_interfaces(self, vxlan_config, iface_label, vlan_value):
+    def _with_vxlan_interfaces(self, vxlan_config, iface_label, vlan_value, device_id=None):
+        """
+        Add interface-related fields to VXLAN configuration.
+        
+        Args:
+            vxlan_config: VXLAN configuration dict
+            iface_label: Interface label (e.g., "TG 0 - ens4np0")
+            vlan_value: VLAN ID (e.g., "20" or "0")
+            device_id: Optional device ID for generating vxlan_interface name
+        
+        Returns:
+            Updated VXLAN configuration with interface fields
+        """
         config = self._normalize_vxlan_config(vxlan_config)
         if not config:
             return {}
@@ -5922,6 +6108,18 @@ class DevicesTab(QWidget):
             overlay_iface = f"vlan{vlan_str}"
         config["underlay_interface"] = iface_norm
         config["overlay_interface"] = overlay_iface
+        
+        # Generate vxlan_interface name if device_id and vni are available
+        # This matches the logic in utils/vxlan.py ensure_vxlan_interface()
+        vni = config.get("vni")
+        if device_id and vni:
+            ifname_seed = device_id.replace("-", "")
+            vxlan_iface = config.get("vxlan_interface") or f"vx{vni}-{ifname_seed[:6]}"
+            # Linux interface name limit is 15 characters (IFNAMSIZ)
+            if len(vxlan_iface) > 15:
+                vxlan_iface = vxlan_iface[:15]
+            config["vxlan_interface"] = vxlan_iface
+        
         return config
 
     def _merge_gateway_routes(self, base_routes, override_routes):
@@ -6070,9 +6268,33 @@ class DevicesTab(QWidget):
                 for item in tree.selectedItems():
                     parent = item.parent()
                     if parent:
-                        tg_id = parent.text(0).strip()
+                        # Extract TG ID from custom widget (QWidget with QLabel)
+                        tg_id = None
+                        tg_id_widget = tree.itemWidget(parent, 0)
+                        if tg_id_widget:
+                            tg_id_label = tg_id_widget.findChild(QLabel)
+                            if tg_id_label:
+                                tg_id = tg_id_label.text().strip()
+                        
+                        # Fallback: extract from server_interfaces using parent index
+                        if not tg_id:
+                            parent_index = tree.indexOfTopLevelItem(parent)
+                            if parent_index >= 0 and hasattr(self.main_window, "server_interfaces"):
+                                if parent_index < len(self.main_window.server_interfaces):
+                                    server = self.main_window.server_interfaces[parent_index]
+                                    tg_id = f"TG {server.get('tg_id', '0')}"
+                        
+                        # If still no TG ID, try text(0) as last resort
+                        if not tg_id:
+                            tg_id = parent.text(0).strip()
+                        
                         port_name = item.text(0).replace("• ", "").strip()
-                        selected_interfaces.add(f"{tg_id} - {port_name}")
+                        if tg_id and port_name:
+                            interface_key = f"{tg_id} - {port_name}"
+                            selected_interfaces.add(interface_key)
+                            logging.debug(f"[DEVICE TABLE] Selected interface: '{interface_key}'")
+            
+            logging.debug(f"[DEVICE TABLE] Selected interfaces: {selected_interfaces}, All device keys: {list(all_devices.keys())}")
 
             interfaces_to_show = selected_interfaces or list(all_devices.keys())
             for iface in interfaces_to_show:
@@ -6319,8 +6541,27 @@ class DevicesTab(QWidget):
         if confirm != QMessageBox.Yes:
             return
 
-        removed_devices = []
+        # Check if any device has VXLAN before removal (to determine if interface refresh is needed)
+        # Do this before removing rows from the table, as row indices become invalid after removal
+        needs_interface_refresh = False
         for row in unique_rows:
+            name_item = self.devices_table.item(row, self.COL.get("Device Name"))
+            if not name_item:
+                continue
+            device_name = name_item.text()
+            device_info = self.get_device_info_by_name(device_name)
+            if device_info:
+                vxlan_config = device_info.get("vxlan_config", {})
+                vxlan_interface = device_info.get("vxlan_interface", "")
+                # Check if device had VXLAN configuration or interface
+                if (vxlan_config and isinstance(vxlan_config, dict) and 
+                    (vxlan_config.get("tunnels") or vxlan_config.get("vni") or vxlan_interface)):
+                    needs_interface_refresh = True
+                    break
+
+        removed_devices = []
+        # Process rows in reverse order to avoid index shifting issues when removing
+        for row in sorted(unique_rows, reverse=True):
             name_item = self.devices_table.item(row, self.COL.get("Device Name"))
             if not name_item:
                 continue
@@ -6369,10 +6610,8 @@ class DevicesTab(QWidget):
             if hasattr(self, "dhcp_handler") and self.dhcp_handler:
                 QTimer.singleShot(200, self.dhcp_handler.refresh_dhcp_status)
 
-            # Refresh interface list from server to remove deleted VXLAN/bridge interfaces
-            if hasattr(self.main_window, "update_server_tree"):
-                print(f"[REMOVE DEVICE] Refreshing interface list from server after device removal")
-                self.main_window.update_server_tree()
+            # Interface list refresh is now manual only - user can click "Refresh Interface List" button if needed
+            # Removed automatic refresh to prevent unnecessary UI updates
 
             if hasattr(self.main_window, "save_session"):
                 self.main_window.save_session()
@@ -6959,10 +7198,11 @@ class DevicesTab(QWidget):
                 except Exception as save_exc:
                     print(f"[MULTI DEVICE APPLY] ⚠️ Failed to save session: {save_exc}")
             
-            # Refresh interface list from server if VXLAN was applied
-            if vxlan_applied and hasattr(self.main_window, "update_server_tree"):
-                print(f"[MULTI DEVICE APPLY] Refreshing interface list from server after VXLAN tunnel creation")
-                self.main_window.update_server_tree()
+            # Interface list refresh is now manual only - user can click "Refresh Interface List" button if needed
+            # Removed automatic refresh to prevent unnecessary UI updates
+            # if vxlan_applied and hasattr(self.main_window, "update_server_tree"):
+            #     print(f"[MULTI DEVICE APPLY] Refreshing interface list from server after VXLAN tunnel creation")
+            #     self.main_window.update_server_tree()
             
             # Clean up worker reference - ensure thread is stopped first
             if hasattr(self, 'multi_device_apply_worker'):
@@ -7174,7 +7414,7 @@ class DevicesTab(QWidget):
                             device["protocols"].append(protocol)
                         # Merge with existing config to preserve fields not in the update
                         config_key = f"{protocol.lower().replace('-', '_')}_config"
-                        print(f"[UPDATE PROTOCOL] Updating {device_name} with {protocol} config, key: {config_key}")
+                        # print(f"[UPDATE PROTOCOL] Updating {device_name} with {protocol} config, key: {config_key}")
                         logging.debug(f"[UPDATE PROTOCOL] Updating {device_name} with {protocol} config, key: {config_key}")
                         # For ISIS, check both is_is_config and isis_config for backward compatibility
                         if protocol in ["IS-IS", "ISIS"]:
@@ -7228,8 +7468,8 @@ class DevicesTab(QWidget):
                         else:
                             # No existing config, use new config as-is
                             device[config_key] = config
-                            print(f"[UPDATE PROTOCOL] Stored new {protocol} config for {device_name}: {list(config.keys())}")
-                            print(f"[UPDATE PROTOCOL] Config content: {config}")
+                            # print(f"[UPDATE PROTOCOL] Stored new {protocol} config for {device_name}: {list(config.keys())}")
+                            # print(f"[UPDATE PROTOCOL] Config content: {config}")
                             logging.debug(f"[UPDATE PROTOCOL] Stored new {protocol} config for {device_name}: {list(config.keys())}")
                             # For ISIS, also update isis_config for backward compatibility
                             if protocol in ["IS-IS", "ISIS"]:
@@ -7238,16 +7478,16 @@ class DevicesTab(QWidget):
                         # If protocols is a dict (old format), store config there
                         device["protocols"][protocol] = config
                     
-                    print(f"[UPDATE PROTOCOL] Device {device_name} now has vxlan_config: {bool(device.get('vxlan_config'))}")
-                    if device.get('vxlan_config'):
-                        print(f"[UPDATE PROTOCOL] vxlan_config content: {device.get('vxlan_config')}")
-                    print(f"[UPDATE PROTOCOL] Device protocols: {device.get('protocols')}")
+                    # print(f"[UPDATE PROTOCOL] Device {device_name} now has vxlan_config: {bool(device.get('vxlan_config'))}")
+                    # if device.get('vxlan_config'):
+                    #     print(f"[UPDATE PROTOCOL] vxlan_config content: {device.get('vxlan_config')}")
+                    # print(f"[UPDATE PROTOCOL] Device protocols: {device.get('protocols')}")
                     logging.debug(f"[UPDATE PROTOCOL] Device {device_name} now has vxlan_config: {bool(device.get('vxlan_config'))}")
                     break
         
         if not device_found:
-            print(f"[UPDATE PROTOCOL] WARNING: Device '{device_name}' not found in all_devices")
-            print(f"[UPDATE PROTOCOL] Available devices: {[d.get('Device Name') for iface, devices in self.main_window.all_devices.items() for d in devices]}")
+            # print(f"[UPDATE PROTOCOL] WARNING: Device '{device_name}' not found in all_devices")
+            # print(f"[UPDATE PROTOCOL] Available devices: {[d.get('Device Name') for iface, devices in self.main_window.all_devices.items() for d in devices]}")
             logging.warning(f"[UPDATE PROTOCOL] Device '{device_name}' not found in all_devices")
         
         # Update the protocol-specific tables based on the protocol

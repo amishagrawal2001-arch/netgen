@@ -6,11 +6,9 @@ import json
 import logging
 import requests
 
-# Configure logging to show DEBUG messages in console
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
-)
+# Logging is configured in traffic_client/main.py
+# Just ensure urllib3 doesn't spam DEBUG messages
+logging.getLogger('urllib3').setLevel(logging.WARNING)
 
 from PyQt5.QtCore import Qt, QSize, QTimer
 from PyQt5.QtWidgets import (
@@ -123,7 +121,7 @@ class VXLANHandler:
     def refresh_vxlan_table(self):
         """Refresh the VXLAN status table from database and local memory."""
         try:
-            print("[VXLAN TAB] Starting refresh_vxlan_table")
+            # print("[VXLAN TAB] Starting refresh_vxlan_table")
             logging.debug("[VXLAN TAB] Starting refresh_vxlan_table")
             server_url = self.parent.get_server_url(silent=True)
             
@@ -159,12 +157,12 @@ class VXLANHandler:
             # Also check local device data (for unapplied configurations)
             devices_from_local = []
             if hasattr(self.parent, "main_window") and hasattr(self.parent.main_window, "all_devices"):
-                print(f"[VXLAN TAB] Checking local devices, total interfaces: {len(self.parent.main_window.all_devices)}")
+                # print(f"[VXLAN TAB] Checking local devices, total interfaces: {len(self.parent.main_window.all_devices)}")
                 for iface_key, device_list in self.parent.main_window.all_devices.items():
-                    print(f"[VXLAN TAB] Checking interface: {iface_key}, devices: {len(device_list)}")
+                    # print(f"[VXLAN TAB] Checking interface: {iface_key}, devices: {len(device_list)}")
                     for device in device_list:
                         device_name = device.get("Device Name", "Unknown")
-                        print(f"[VXLAN TAB] Checking device: {device_name}")
+                        # print(f"[VXLAN TAB] Checking device: {device_name}")
                         # Check for VXLAN config - it's stored as "vxlan_config" key
                         vxlan_cfg = device.get("vxlan_config", {})
                         # Handle case where vxlan_cfg might be a string (from database)
@@ -181,7 +179,7 @@ class VXLANHandler:
                         has_vxlan_protocol = "VXLAN" in protocols
                         
                         # Show device if it has VXLAN config (non-empty dict) or VXLAN in protocols
-                        print(f"[VXLAN TAB] Device {device_name}: vxlan_cfg={bool(vxlan_cfg)}, type={type(vxlan_cfg)}, len={len(vxlan_cfg) if isinstance(vxlan_cfg, dict) else 'N/A'}, has_vxlan_protocol={has_vxlan_protocol}")
+                        # print(f"[VXLAN TAB] Device {device_name}: vxlan_cfg={bool(vxlan_cfg)}, type={type(vxlan_cfg)}, len={len(vxlan_cfg) if isinstance(vxlan_cfg, dict) else 'N/A'}, has_vxlan_protocol={has_vxlan_protocol}")
                         if (vxlan_cfg and isinstance(vxlan_cfg, dict) and len(vxlan_cfg) > 0) or has_vxlan_protocol:
                             # Create a device dict compatible with database format
                             # CRITICAL: Store the interface_key from all_devices so we can properly match it later
@@ -215,16 +213,13 @@ class VXLANHandler:
                     parent = item.parent()
                     if parent:
                         # This is a child item (interface) - extract TG ID and port name
-                        # Extract TG ID from the custom widget in column 0 of parent
-                        tg_id_widget = tree.itemWidget(parent, 0)
+                        # Extract TG ID from custom widget (QWidget with QLabel)
                         tg_id = None
+                        tg_id_widget = tree.itemWidget(parent, 0)
                         if tg_id_widget:
-                            # Find the QLabel containing the TG ID text
-                            for child in tg_id_widget.findChildren(QLabel):
-                                text = child.text()
-                                if text.startswith("TG "):
-                                    tg_id = text.strip()
-                                    break
+                            tg_id_label = tg_id_widget.findChild(QLabel)
+                            if tg_id_label:
+                                tg_id = tg_id_label.text().strip()
                         
                         # Fallback: extract from server_interfaces using parent index
                         if not tg_id:
@@ -234,21 +229,22 @@ class VXLANHandler:
                                     server = self.parent.main_window.server_interfaces[parent_index]
                                     tg_id = f"TG {server.get('tg_id', '0')}"
                         
+                        # If still no TG ID, try text(0) as last resort
+                        if not tg_id:
+                            tg_id = parent.text(0).strip()
+                        
                         port_name = item.text(0).replace("• ", "").strip()  # Remove bullet prefix if present
                         if tg_id and port_name:
                             selected_interfaces.add(f"{tg_id} - {port_name}")  # Match server tree format
                     else:
                         # This is a parent item (TG) - show all interfaces for this TG
-                        # Extract TG ID from the custom widget in column 0
-                        tg_id_widget = tree.itemWidget(item, 0)
+                        # Extract TG ID from custom widget (QWidget with QLabel)
                         tg_id = None
+                        tg_id_widget = tree.itemWidget(item, 0)
                         if tg_id_widget:
-                            # Find the QLabel containing the TG ID text
-                            for child in tg_id_widget.findChildren(QLabel):
-                                text = child.text()
-                                if text.startswith("TG "):
-                                    tg_id = text.strip()
-                                    break
+                            tg_id_label = tg_id_widget.findChild(QLabel)
+                            if tg_id_label:
+                                tg_id = tg_id_label.text().strip()
                         
                         # Fallback: extract from server_interfaces using item index
                         if not tg_id:
@@ -257,6 +253,10 @@ class VXLANHandler:
                                 if item_index < len(self.parent.main_window.server_interfaces):
                                     server = self.parent.main_window.server_interfaces[item_index]
                                     tg_id = f"TG {server.get('tg_id', '0')}"
+                        
+                        # If still no TG ID, try text(0) as last resort
+                        if not tg_id:
+                            tg_id = item.text(0).strip()
                         
                         # If TG is selected, add all interfaces for this TG
                         if tg_id and hasattr(self.parent.main_window, "all_devices"):
@@ -391,7 +391,7 @@ class VXLANHandler:
                         db_device["vxlan_config"] = {}
 
             devices = list(device_map.values())
-            print(f"[VXLAN TAB] Total devices after merge: {len(devices)} (DB: {len(devices_from_db)}, Local: {len(devices_from_local)})")
+            # print(f"[VXLAN TAB] Total devices after merge: {len(devices)} (DB: {len(devices_from_db)}, Local: {len(devices_from_local)})")
             logging.debug(f"[VXLAN TAB] Total devices after merge: {len(devices)} (DB: {len(devices_from_db)}, Local: {len(devices_from_local)})")
 
             # Filter devices by selected interfaces (same logic as other tables)
@@ -450,7 +450,7 @@ class VXLANHandler:
                 # No interfaces selected, show all devices (same as other tables)
                 filtered_devices = devices
             
-            print(f"[VXLAN TAB] Filtered devices: {len(filtered_devices)} (selected interfaces: {len(interfaces_to_show) if interfaces_to_show else 'all'})")
+            # print(f"[VXLAN TAB] Filtered devices: {len(filtered_devices)} (selected interfaces: {len(interfaces_to_show) if interfaces_to_show else 'all'})")
 
             rows = []
             for device in filtered_devices:
@@ -481,9 +481,10 @@ class VXLANHandler:
                         
                         if has_vni or has_local_ip or has_remote_peers or has_bridge_svi_ip:
                             tunnels = [vxlan_cfg]
-                            print(f"[VXLAN TAB] Device {device.get('device_name')}: Found 1 tunnel in old format (single dict)")
+                            # print(f"[VXLAN TAB] Device {device.get('device_name')}: Found 1 tunnel in old format (single dict)")
                         else:
-                            print(f"[VXLAN TAB] Device {device.get('device_name')}: Skipping empty VXLAN config (has keys but no values)")
+                            # print(f"[VXLAN TAB] Device {device.get('device_name')}: Skipping empty VXLAN config (has keys but no values)")
+                            pass
                 
                 # If no tunnels found, check if we should still show this device
                 if not tunnels:
@@ -494,7 +495,7 @@ class VXLANHandler:
                     # Skip devices where VXLAN was completely removed/disabled
                     # If state is "Disabled", it means VXLAN was removed - don't show in table
                     if vxlan_state == "Disabled":
-                        print(f"[VXLAN TAB] Skipping device {device.get('device_name')} - VXLAN disabled/removed (state: {vxlan_state})")
+                        # print(f"[VXLAN TAB] Skipping device {device.get('device_name')} - VXLAN disabled/removed (state: {vxlan_state})")
                         continue
                     
                     # If no tunnels, no enabled flag, and no interface, skip
@@ -519,7 +520,7 @@ class VXLANHandler:
                         rows.append((tunnel_device, tunnel_cfg))
                         print(f"[VXLAN TAB] Added tunnel {tunnel_idx+1}/{len(tunnels)} for device {device.get('device_name')}, VNI: {tunnel_cfg.get('vni')} (total rows: {len(rows)})")
 
-            print(f"[VXLAN TAB] Populating table with {len(rows)} rows")
+            # print(f"[VXLAN TAB] Populating table with {len(rows)} rows")
             logging.debug(f"[VXLAN TAB] Populating table with {len(rows)} rows")
             
             # Clear table

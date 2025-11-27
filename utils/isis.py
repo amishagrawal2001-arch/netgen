@@ -238,7 +238,7 @@ def configure_isis_neighbor(device_id: str, isis_config: Dict[str, Any], device_
         hello_interval = isis_config.get("hello_interval") or "10"
         hello_multiplier = isis_config.get("hello_multiplier") or "3"
         metric = isis_config.get("metric") or "10"
-        interface = isis_config.get("interface") or "vlan20"
+        interface = isis_config.get("interface") or ""
         
         # Convert level to FRR format
         level_map = {
@@ -257,9 +257,30 @@ def configure_isis_neighbor(device_id: str, isis_config: Dict[str, Any], device_
         if not interface and device_data:
             interface_from_db = device_data.get("interface", "")
             vlan = device_data.get("vlan", "0")
+            
+            # CRITICAL: Normalize interface name - remove leading " - " or "- " prefix if present
+            # This handles cases where interface is stored as "- ens4np0" instead of "ens4np0"
+            if interface_from_db:
+                interface_from_db = interface_from_db.strip()
+                if interface_from_db.startswith("- "):
+                    interface_from_db = interface_from_db[2:].strip()
+                elif interface_from_db.startswith(" - "):
+                    interface_from_db = interface_from_db[3:].strip()
+            # CRITICAL: Check if a unique-named VLAN interface was created (e.g., vlan20-ens4np0)
+            actual_vlan_interface = device_data.get("actual_vlan_interface", "")
+            if actual_vlan_interface and actual_vlan_interface.strip():
+                actual_vlan_interface = actual_vlan_interface.strip()
+                logging.info(f"[ISIS CONFIGURE] Found actual VLAN interface name '{actual_vlan_interface}' in database, will use it instead of 'vlan{vlan}'")
             # CRITICAL: Validate interface name when VLAN is not used
+            # NOTE: For VLAN interfaces, use the actual interface name if available (e.g., vlan20-ens4np0),
+            # otherwise use just vlan{vlan} - Linux and FRR can reference VLAN interfaces
+            # by their base name (vlan21) even though ip link show displays them as vlan21@ens5np0
             if vlan and vlan != "0":
-                interface = f"vlan{vlan}"
+                # Use actual interface name if unique-named interface was created, otherwise use vlan{vlan}
+                if actual_vlan_interface:
+                    interface = actual_vlan_interface
+                else:
+                    interface = f"vlan{vlan}"
             elif interface_from_db:
                 interface = interface_from_db
             else:
@@ -267,10 +288,46 @@ def configure_isis_neighbor(device_id: str, isis_config: Dict[str, Any], device_
                 logging.error(f"[ISIS CONFIGURE] Interface name is required when VLAN is not specified for device {device_id}")
                 interface = ""  # Will cause vtysh commands to fail, but better than silently using wrong interface
         else:
+            # CRITICAL: Normalize interface name if it was set from config
+            if interface:
+                interface = interface.strip()
+                if interface.startswith("- "):
+                    interface = interface[2:].strip()
+                elif interface.startswith(" - "):
+                    interface = interface[3:].strip()
+            
             vlan = device_data.get("vlan", "0") if device_data else "0"
+            
+            # CRITICAL: If interface is still invalid (e.g., "- ens4np0" or empty) and VLAN is 0,
+            # use the interface from database
+            if (not interface or interface.startswith("-")) and vlan == "0" and device_data:
+                interface_from_db = device_data.get("interface", "")
+                if interface_from_db:
+                    interface_from_db = interface_from_db.strip()
+                    if interface_from_db.startswith("- "):
+                        interface_from_db = interface_from_db[2:].strip()
+                    elif interface_from_db.startswith(" - "):
+                        interface_from_db = interface_from_db[3:].strip()
+                    if interface_from_db:
+                        interface = interface_from_db
+                        logging.info(f"[ISIS CONFIGURE] Using normalized interface '{interface}' from database for non-VLAN device")
+            # CRITICAL: Check if a unique-named VLAN interface was created (e.g., vlan20-ens4np0)
+            actual_vlan_interface = None
+            if device_data:
+                actual_vlan_interface = device_data.get("actual_vlan_interface", "")
+                if actual_vlan_interface and actual_vlan_interface.strip():
+                    actual_vlan_interface = actual_vlan_interface.strip()
+                    logging.info(f"[ISIS CONFIGURE] Found actual VLAN interface name '{actual_vlan_interface}' in database, will use it instead of 'vlan{vlan}'")
             # CRITICAL: Validate interface name when VLAN is not used
+            # NOTE: For VLAN interfaces, use the actual interface name if available (e.g., vlan20-ens4np0),
+            # otherwise use just vlan{vlan} - Linux and FRR can reference VLAN interfaces
+            # by their base name (vlan21) even though ip link show displays them as vlan21@ens5np0
             if vlan and vlan != "0":
-                interface = f"vlan{vlan}"
+                # Use actual interface name if unique-named interface was created, otherwise use vlan{vlan}
+                if actual_vlan_interface:
+                    interface = actual_vlan_interface
+                else:
+                    interface = f"vlan{vlan}"
             elif interface:
                 # interface already set from config
                 pass
