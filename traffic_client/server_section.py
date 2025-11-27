@@ -8,7 +8,7 @@ from PyQt5.QtWidgets import (
     QTreeWidgetItem, QTextEdit, QSpacerItem, QFileDialog, QMessageBox
 )
 from PyQt5.QtGui import QIcon, QPixmap, QColor, QFont
-from PyQt5.QtCore import Qt, QSize
+from PyQt5.QtCore import Qt, QSize, QTimer
 
 
 from utils.qicon_loader import qicon, r_icon
@@ -103,7 +103,11 @@ class TrafficGenClientServerSection():
         self.server_tree.setColumnWidth(2, 75)  # Width for Selected column (header text "Selected" needs ~70-75px to be fully visible)
 
         # Connect to unified update for stream + device tables
-        self.server_tree.itemSelectionChanged.connect(self._on_server_selection_changed_combined)
+        # Use debounced handler to prevent rapid-fire updates on interface clicks
+        self._selection_update_timer = QTimer()
+        self._selection_update_timer.setSingleShot(True)
+        self._selection_update_timer.timeout.connect(self._on_server_selection_changed_combined)
+        self.server_tree.itemSelectionChanged.connect(self._debounced_selection_changed)
 
         # --- Action Buttons Section (grouped separately, aligned with Streams pattern) ---
         action_button_layout = QHBoxLayout()
@@ -170,6 +174,13 @@ class TrafficGenClientServerSection():
         self.server_tree.setColumnWidth(1, 200)
         self.server_tree.setColumnWidth(2, 75)
 
+    def _debounced_selection_changed(self):
+        """Debounced wrapper for selection change handler to prevent rapid-fire updates."""
+        # Cancel any pending update and schedule a new one after a short delay
+        # This prevents multiple updates from queuing up when user clicks rapidly
+        self._selection_update_timer.stop()
+        self._selection_update_timer.start(150)  # 150ms delay - smooth enough for user, prevents excessive updates
+    
     def _on_server_selection_changed_combined(self):
         """Update both stream and device tables on server tree selection change."""
         # Update main window server URL based on selection
@@ -513,9 +524,21 @@ class TrafficGenClientServerSection():
 
     def update_server_tree(self):
         """Update the server tree with servers and their ports."""
+        # Prevent recursive refreshes - if we're already updating, skip
+        if hasattr(self, "_updating_server_tree") and self._updating_server_tree:
+            return
+        self._updating_server_tree = True
+        
+        # Block signals during tree update to prevent cascading selection change events
+        # This is safer than disconnect/connect and automatically restores signals
+        self.server_tree.blockSignals(True)
+        
         self.server_tree.clear()  # Clear the tree before updating
 
         if not self.server_interfaces:
+            # Clear the update flag and restore signals before returning
+            self._updating_server_tree = False
+            self.server_tree.blockSignals(False)
             return  # Do not add dummy placeholders
 
         for i, server in enumerate(self.server_interfaces):
@@ -644,16 +667,21 @@ class TrafficGenClientServerSection():
                         port_item.setFont(0, font)
                         
                         # Interface display updated
-                        
                         server_item.addChild(port_item)
 
             server["online"] = True
             self.update_server_status_icon(server, True)
         
+        # Restore signals after tree is rebuilt
+        self.server_tree.blockSignals(False)
+        
         # Ensure column widths are maintained after update
         self.server_tree.setColumnWidth(0, 180)
         self.server_tree.setColumnWidth(1, 200)
         self.server_tree.setColumnWidth(2, 75)
+        
+        # Clear the update flag
+        self._updating_server_tree = False
         
         print(f"[DEBUG] Tree widget updated with {len(self.server_interfaces)} servers")
     '''def update_server_status_icon(self, server, is_online):

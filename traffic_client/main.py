@@ -1,4 +1,15 @@
 # traffic_client/main.py
+import logging
+
+# Configure logging early - set to INFO to reduce verbosity
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+# Disable DEBUG messages from urllib3 and other verbose libraries
+logging.getLogger('urllib3').setLevel(logging.WARNING)
+logging.getLogger('requests').setLevel(logging.WARNING)
+
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QTabWidget, QSplitter,
     QMenu, QAction, QApplication
@@ -344,15 +355,15 @@ class TrafficGeneratorClient(
     def _initialize_retry_workers(self):
         """Initialize the retry and health check workers."""
         try:
-            print("[RETRY WORKERS] Initializing enhanced server retry system...")
-            print(f"[RETRY WORKERS] Server interfaces count: {len(self.server_interfaces)}")
+            # print("[RETRY WORKERS] Initializing enhanced server retry system...")
+            # print(f"[RETRY WORKERS] Server interfaces count: {len(self.server_interfaces)}")
             
             # Initialize health check worker (disabled temporarily to prevent freezing)
             # self.health_check_worker = HealthCheckWorker(self.server_interfaces)
             # self.health_check_worker.health_status_updated.connect(self._on_server_health_updated)
             # self.health_check_worker.server_interfaces_updated.connect(self._on_server_interfaces_updated)
             # self.health_check_worker.start()
-            print("[RETRY WORKERS] Health check worker disabled temporarily")
+            # print("[RETRY WORKERS] Health check worker disabled temporarily")
             
             # Initialize retry worker (disabled temporarily to prevent freezing)
             # self.server_retry_worker = ServerRetryWorker([])
@@ -360,9 +371,10 @@ class TrafficGeneratorClient(
             # self.server_retry_worker.server_still_failed.connect(self._on_server_still_failed)
             # self.server_retry_worker.retry_progress.connect(self._on_retry_progress)
             # self.server_retry_worker.start()
-            print("[RETRY WORKERS] Server retry worker disabled temporarily")
+            # print("[RETRY WORKERS] Server retry worker disabled temporarily")
             
-            print("[RETRY WORKERS] Enhanced retry system initialized successfully")
+            # print("[RETRY WORKERS] Enhanced retry system initialized successfully")
+            pass  # All retry workers are disabled, nothing to initialize
         except Exception as e:
             print(f"[RETRY WORKERS ERROR] Failed to initialize retry workers: {e}")
             import traceback
@@ -371,16 +383,17 @@ class TrafficGeneratorClient(
     def _check_initial_server_status(self):
         """Check initial server status and enable menu if servers are offline."""
         try:
-            print("[INITIAL STATUS CHECK] Checking initial server status...")
+            # print("[INITIAL STATUS CHECK] Checking initial server status...")
             offline_servers = [s for s in self.server_interfaces if s.get("online") is False]
-            print(f"[INITIAL STATUS CHECK] Found {len(offline_servers)} offline servers")
+            # print(f"[INITIAL STATUS CHECK] Found {len(offline_servers)} offline servers")
             
             if offline_servers:
-                print("[INITIAL STATUS CHECK] Enabling 'Make Server Online' menu")
+                # print("[INITIAL STATUS CHECK] Enabling 'Make Server Online' menu")
                 if hasattr(self, 'make_server_online_action'):
                     self.make_server_online_action.setEnabled(True)
             else:
-                print("[INITIAL STATUS CHECK] All servers online, menu remains disabled")
+                # print("[INITIAL STATUS CHECK] All servers online, menu remains disabled")
+                pass
         except Exception as e:
             print(f"[INITIAL STATUS CHECK ERROR] Error checking initial status: {e}")
 

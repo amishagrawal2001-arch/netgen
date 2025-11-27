@@ -212,9 +212,29 @@ class OSPFHandler:
                 for item in tree.selectedItems():
                     parent = item.parent()
                     if parent:
-                        tg_id = parent.text(0).strip()
+                        # Extract TG ID from custom widget (QWidget with QLabel)
+                        tg_id = None
+                        tg_id_widget = tree.itemWidget(parent, 0)
+                        if tg_id_widget:
+                            tg_id_label = tg_id_widget.findChild(QLabel)
+                            if tg_id_label:
+                                tg_id = tg_id_label.text().strip()
+                        
+                        # Fallback: extract from server_interfaces using parent index
+                        if not tg_id:
+                            parent_index = tree.indexOfTopLevelItem(parent)
+                            if parent_index >= 0 and hasattr(self.parent.main_window, "server_interfaces"):
+                                if parent_index < len(self.parent.main_window.server_interfaces):
+                                    server = self.parent.main_window.server_interfaces[parent_index]
+                                    tg_id = f"TG {server.get('tg_id', '0')}"
+                        
+                        # If still no TG ID, try text(0) as last resort
+                        if not tg_id:
+                            tg_id = parent.text(0).strip()
+                        
                         port_name = item.text(0).replace("• ", "").strip()  # Remove bullet prefix
-                        selected_interfaces.add(f"{tg_id} - {port_name}")  # Match server tree format
+                        if tg_id and port_name:
+                            selected_interfaces.add(f"{tg_id} - {port_name}")  # Match server tree format
             
             self.parent.ospf_table.setRowCount(0)
             
