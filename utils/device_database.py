@@ -815,7 +815,8 @@ class DeviceDatabase:
                     'dhcp_lease_subnet': 'dhcp_lease_subnet',
                     'last_dhcp_check': 'last_dhcp_check',
                     'status': 'status',
-                    'bgp_established': 'bgp_established',
+                    # Note: 'bgp_established' column doesn't exist in database, only bgp_ipv4_established and bgp_ipv6_established
+                    # 'bgp_established': 'bgp_established',  # Removed - column doesn't exist
                     'bgp_ipv4_established': 'bgp_ipv4_established',
                     'bgp_ipv6_established': 'bgp_ipv6_established',
                     'bgp_ipv4_state': 'bgp_ipv4_state',
@@ -877,6 +878,14 @@ class DeviceDatabase:
                             update_fields.append(f"{db_field} = ?")
                             update_values.append(int(bool(device_data[key])))
                         elif key == 'vxlan_enabled':
+                            update_fields.append(f"{db_field} = ?")
+                            update_values.append(int(bool(device_data[key])))
+                        elif key in ['bgp_established', 'bgp_ipv4_established', 'bgp_ipv6_established', 
+                                     'ospf_established', 'ospf_ipv4_established', 'ospf_ipv6_established',
+                                     'ospf_ipv4_running', 'ospf_ipv6_running',
+                                     'isis_running', 'isis_established',
+                                     'arp_ipv4_resolved', 'arp_ipv6_resolved', 'arp_gateway_resolved']:
+                            # Convert boolean fields to integers for SQLite
                             update_fields.append(f"{db_field} = ?")
                             update_values.append(int(bool(device_data[key])))
                         else:
