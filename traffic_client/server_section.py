@@ -176,32 +176,45 @@ class TrafficGenClientServerSection():
 
     def _debounced_selection_changed(self):
         """Debounced wrapper for selection change handler to prevent rapid-fire updates."""
-        # Cancel any pending update and schedule a new one after a short delay
-        # This prevents multiple updates from queuing up when user clicks rapidly
+        # OPTIMIZATION: Use 0ms delay for instant feedback - QTimer.singleShot(0) defers to next event loop cycle
+        # This allows the UI to respond immediately while still preventing excessive updates during rapid clicks
         self._selection_update_timer.stop()
-        self._selection_update_timer.start(150)  # 150ms delay - smooth enough for user, prevents excessive updates
+        self._selection_update_timer.start(0)  # 0ms = next event loop cycle - instant but non-blocking
     
     def _on_server_selection_changed_combined(self):
         """Update both stream and device tables on server tree selection change."""
         # Update main window server URL based on selection
         self._update_main_window_server_url()
         
-        # Update device table
+        # OPTIMIZATION: Update device table immediately for instant feedback
         if hasattr(self, "devices_tab") and hasattr(self, "all_devices"):
             self.devices_tab.update_device_table(self.all_devices)
             
-            # Update protocol tables to show only devices from selected TGen ports
-            if hasattr(self.devices_tab, "update_bgp_table"):
-                self.devices_tab.update_bgp_table()
-            if hasattr(self.devices_tab, "update_ospf_table"):
-                self.devices_tab.update_ospf_table()
-            if hasattr(self.devices_tab, "update_isis_table"):
-                self.devices_tab.update_isis_table()
-            # Update VXLAN table to show only devices from selected TGen ports
-            if hasattr(self.devices_tab, "vxlan_handler") and hasattr(self.devices_tab.vxlan_handler, "refresh_vxlan_table"):
-                self.devices_tab.vxlan_handler.refresh_vxlan_table()
-
-        # Update stream table (this method exists in this mixin)
+            # OPTIMIZATION: Defer protocol table updates to run after device table is displayed
+            # This makes the device table appear instantly while protocol tables update in background
+            QTimer.singleShot(0, lambda: self._update_protocol_tables())
+        
+        # OPTIMIZATION: Defer stream table update to avoid blocking
+        QTimer.singleShot(0, lambda: self._update_stream_table_if_exists())
+    
+    def _update_protocol_tables(self):
+        """Update protocol tables in background after device table is shown."""
+        if not hasattr(self, "devices_tab"):
+            return
+        
+        # Update protocol tables to show only devices from selected TGen ports
+        if hasattr(self.devices_tab, "update_bgp_table"):
+            self.devices_tab.update_bgp_table()
+        if hasattr(self.devices_tab, "update_ospf_table"):
+            self.devices_tab.update_ospf_table()
+        if hasattr(self.devices_tab, "update_isis_table"):
+            self.devices_tab.update_isis_table()
+        # Update VXLAN table to show only devices from selected TGen ports
+        if hasattr(self.devices_tab, "vxlan_handler") and hasattr(self.devices_tab.vxlan_handler, "refresh_vxlan_table"):
+            self.devices_tab.vxlan_handler.refresh_vxlan_table()
+    
+    def _update_stream_table_if_exists(self):
+        """Update stream table if the method exists."""
         if hasattr(self, "update_stream_table"):
             self.update_stream_table()
 
@@ -529,6 +542,24 @@ class TrafficGenClientServerSection():
             return
         self._updating_server_tree = True
         
+        # OPTIMIZATION: Remember current selection before clearing tree to restore it after update
+        # This prevents selection from jumping to TG when user had selected an interface
+        current_selection = []
+        # Only preserve selection if explicitly requested (via _preserve_selection flag)
+        should_preserve = hasattr(self, "_preserve_selection") and self._preserve_selection
+        if should_preserve:
+            for item in self.server_tree.selectedItems():
+                parent = item.parent()
+                if parent:
+                    # Interface (port) selected
+                    server_address = parent.text(1)
+                    interface_name = item.text(0).strip()
+                    current_selection.append(("interface", server_address, interface_name))
+                else:
+                    # TG (server) selected
+                    server_address = item.text(1)
+                    current_selection.append(("server", server_address, None))
+        
         # Block signals during tree update to prevent cascading selection change events
         # This is safer than disconnect/connect and automatically restores signals
         self.server_tree.blockSignals(True)
@@ -672,7 +703,50 @@ class TrafficGenClientServerSection():
             server["online"] = True
             self.update_server_status_icon(server, True)
         
-        # Restore signals after tree is rebuilt
+        # OPTIMIZATION: Restore previous selection if it was preserved
+        if current_selection and should_preserve:
+            try:
+                for selection_type, sel_server_address, interface_name in current_selection:
+                    # Normalize addresses for comparison
+                    normalized_sel_address = sel_server_address
+                    if not normalized_sel_address.startswith(("http://", "https://")):
+                        normalized_sel_address = f"http://{normalized_sel_address}"
+                    
+                    # Find the server item by address
+                    for i in range(self.server_tree.topLevelItemCount()):
+                        top_item = self.server_tree.topLevelItem(i)
+                        item_address = top_item.text(1)
+                        normalized_item_address = item_address
+                        if not normalized_item_address.startswith(("http://", "https://")):
+                            normalized_item_address = f"http://{normalized_item_address}"
+                        
+                        if normalized_item_address == normalized_sel_address or normalized_item_address == normalized_sel_address.replace("http://", "").replace("https://", ""):
+                            # Expand the server item to show interfaces
+                            top_item.setExpanded(True)
+                            
+                            if selection_type == "interface" and interface_name:
+                                # Restore interface selection - find the specific interface
+                                for j in range(top_item.childCount()):
+                                    child_item = top_item.child(j)
+                                    child_text = child_item.text(0).strip()
+                                    # Remove any icon/prefix from comparison
+                                    if child_text == interface_name or child_text.endswith(interface_name):
+                                        child_item.setSelected(True)
+                                        self.server_tree.setCurrentItem(child_item)
+                                        break
+                                else:
+                                    # Interface not found, fall back to server selection
+                                    top_item.setSelected(True)
+                                    self.server_tree.setCurrentItem(top_item)
+                            else:
+                                # Restore server (TG) selection
+                                top_item.setSelected(True)
+                                self.server_tree.setCurrentItem(top_item)
+                            break
+            except Exception as e:
+                print(f"[SERVER TREE] Error restoring selection: {e}")
+        
+        # Restore signals after tree is rebuilt and selection is restored
         self.server_tree.blockSignals(False)
         
         # Ensure column widths are maintained after update
@@ -682,6 +756,10 @@ class TrafficGenClientServerSection():
         
         # Clear the update flag
         self._updating_server_tree = False
+        
+        # Clear preserve_selection flag if it was set
+        if hasattr(self, "_preserve_selection"):
+            self._preserve_selection = False
         
         print(f"[DEBUG] Tree widget updated with {len(self.server_interfaces)} servers")
     '''def update_server_status_icon(self, server, is_online):
@@ -812,6 +890,20 @@ class TrafficGenClientServerSection():
             )
             return
         
+        # OPTIMIZATION: Remember what was originally selected (TG or interface) to restore exact selection
+        original_selection = []
+        for item in selected_items:
+            parent = item.parent()
+            if parent:
+                # Interface (port) selected - remember both TG and interface name
+                server_address = parent.text(1)
+                interface_name = item.text(0).strip()
+                original_selection.append(("interface", server_address, interface_name))
+            else:
+                # TG (server) selected
+                server_address = item.text(1)
+                original_selection.append(("server", server_address, None))
+        
         # Get the selected server (parent item if a port is selected, or the item itself if server is selected)
         selected_item = selected_items[0]
         server_item = selected_item.parent() if selected_item.parent() else selected_item
@@ -853,20 +945,58 @@ class TrafficGenClientServerSection():
         
         # Refresh the entire server tree (this will fetch fresh interfaces from all servers)
         print(f"[REFRESH INTERFACES] Refreshing interface list for server: {server_address}")
+        
+        # OPTIMIZATION: Tell update_server_tree to preserve selection (it will handle restoration)
+        self._preserve_selection = True
         self.update_server_tree()
         
-        # Restore selection to the same server after refresh
-        # Find the server item by address and select it
-        for i in range(self.server_tree.topLevelItemCount()):
-            top_item = self.server_tree.topLevelItem(i)
-            item_address = top_item.text(1)
-            if item_address == server_address or item_address == server_address.replace("http://", "").replace("https://", ""):
-                top_item.setSelected(True)
-                self.server_tree.setCurrentItem(top_item)
-                # Expand the server item to show interfaces
-                top_item.setExpanded(True)
-                print(f"[REFRESH INTERFACES] Restored selection to server: {item_address}")
-                break
+        # OPTIMIZATION: Restore exact original selection (TG or interface) instead of always selecting TG
+        # Block signals during selection restoration to prevent triggering selection change handlers
+        self.server_tree.blockSignals(True)
+        try:
+            for selection_type, sel_server_address, interface_name in original_selection:
+                # Normalize addresses for comparison
+                normalized_sel_address = sel_server_address
+                if not normalized_sel_address.startswith(("http://", "https://")):
+                    normalized_sel_address = f"http://{normalized_sel_address}"
+                
+                # Find the server item by address
+                for i in range(self.server_tree.topLevelItemCount()):
+                    top_item = self.server_tree.topLevelItem(i)
+                    item_address = top_item.text(1)
+                    normalized_item_address = item_address
+                    if not normalized_item_address.startswith(("http://", "https://")):
+                        normalized_item_address = f"http://{normalized_item_address}"
+                    
+                    if normalized_item_address == normalized_sel_address or normalized_item_address == normalized_sel_address.replace("http://", "").replace("https://", ""):
+                        # Expand the server item to show interfaces
+                        top_item.setExpanded(True)
+                        
+                        if selection_type == "interface" and interface_name:
+                            # Restore interface selection - find the specific interface
+                            for j in range(top_item.childCount()):
+                                child_item = top_item.child(j)
+                                child_text = child_item.text(0).strip()
+                                # Remove any icon/prefix from comparison
+                                if child_text == interface_name or child_text.endswith(interface_name):
+                                    child_item.setSelected(True)
+                                    self.server_tree.setCurrentItem(child_item)
+                                    print(f"[REFRESH INTERFACES] Restored selection to interface: {interface_name} on {item_address}")
+                                    break
+                            else:
+                                # Interface not found, fall back to server selection
+                                top_item.setSelected(True)
+                                self.server_tree.setCurrentItem(top_item)
+                                print(f"[REFRESH INTERFACES] Interface {interface_name} not found, restored selection to server: {item_address}")
+                        else:
+                            # Restore server (TG) selection
+                            top_item.setSelected(True)
+                            self.server_tree.setCurrentItem(top_item)
+                            print(f"[REFRESH INTERFACES] Restored selection to server: {item_address}")
+                        break
+        finally:
+            # Always restore signals after selection restoration
+            self.server_tree.blockSignals(False)
 
     def reset_selected_interface(self):
         """Reset the selected interface on the server - removes all IPs, VLANs, and devices."""

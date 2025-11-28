@@ -157,44 +157,39 @@ class VXLANHandler:
             # Also check local device data (for unapplied configurations)
             devices_from_local = []
             if hasattr(self.parent, "main_window") and hasattr(self.parent.main_window, "all_devices"):
-                # print(f"[VXLAN TAB] Checking local devices, total interfaces: {len(self.parent.main_window.all_devices)}")
                 for iface_key, device_list in self.parent.main_window.all_devices.items():
-                    # print(f"[VXLAN TAB] Checking interface: {iface_key}, devices: {len(device_list)}")
-                    for device in device_list:
-                        device_name = device.get("Device Name", "Unknown")
-                        # print(f"[VXLAN TAB] Checking device: {device_name}")
-                        # Check for VXLAN config - it's stored as "vxlan_config" key
-                        vxlan_cfg = device.get("vxlan_config", {})
-                        # Handle case where vxlan_cfg might be a string (from database)
-                        if isinstance(vxlan_cfg, str):
-                            try:
-                                vxlan_cfg = json.loads(vxlan_cfg) if vxlan_cfg else {}
-                            except Exception:
-                                vxlan_cfg = {}
-                        
-                        # Also check if VXLAN is in protocols list
-                        protocols = device.get("protocols", [])
-                        if isinstance(protocols, str):
-                            protocols = [p.strip() for p in protocols.split(",") if p.strip()]
-                        has_vxlan_protocol = "VXLAN" in protocols
-                        
-                        # Show device if it has VXLAN config (non-empty dict) or VXLAN in protocols
-                        # print(f"[VXLAN TAB] Device {device_name}: vxlan_cfg={bool(vxlan_cfg)}, type={type(vxlan_cfg)}, len={len(vxlan_cfg) if isinstance(vxlan_cfg, dict) else 'N/A'}, has_vxlan_protocol={has_vxlan_protocol}")
-                        if (vxlan_cfg and isinstance(vxlan_cfg, dict) and len(vxlan_cfg) > 0) or has_vxlan_protocol:
-                            # Create a device dict compatible with database format
-                            # CRITICAL: Store the interface_key from all_devices so we can properly match it later
-                            local_device = {
-                                "device_id": device.get("device_id", ""),
-                                "device_name": device.get("Device Name", ""),
-                                "interface": device.get("Interface", ""),
-                                "interface_key": iface_key,  # Store the actual key from all_devices
-                                "vlan": device.get("VLAN", "0"),
-                                "vxlan_config": vxlan_cfg if vxlan_cfg else {},
-                                "vxlan_state": "Pending",  # Mark as pending until applied
-                            }
-                            devices_from_local.append(local_device)
-                            print(f"[VXLAN TAB] Found local device with VXLAN: {local_device.get('device_name')}, interface_key: {iface_key}, config keys: {list(vxlan_cfg.keys()) if vxlan_cfg else 'none'}")
-                            logging.debug(f"[VXLAN TAB] Found local device with VXLAN: {local_device.get('device_name')}, interface_key: {iface_key}, config keys: {list(vxlan_cfg.keys()) if vxlan_cfg else 'none'}")
+                            for device in device_list:
+                                device_name = device.get("Device Name", "Unknown")
+                                # Check for VXLAN config - it's stored as "vxlan_config" key
+                                vxlan_cfg = device.get("vxlan_config", {})
+                                # Handle case where vxlan_cfg might be a string (from database)
+                                if isinstance(vxlan_cfg, str):
+                                    try:
+                                        vxlan_cfg = json.loads(vxlan_cfg) if vxlan_cfg else {}
+                                    except Exception:
+                                        vxlan_cfg = {}
+                                
+                                # Also check if VXLAN is in protocols list
+                                protocols = device.get("protocols", [])
+                                if isinstance(protocols, str):
+                                    protocols = [p.strip() for p in protocols.split(",") if p.strip()]
+                                has_vxlan_protocol = "VXLAN" in protocols
+                                
+                                # Show device if it has VXLAN config (non-empty dict) or VXLAN in protocols
+                                if (vxlan_cfg and isinstance(vxlan_cfg, dict) and len(vxlan_cfg) > 0) or has_vxlan_protocol:
+                                    # Create a device dict compatible with database format
+                                    # CRITICAL: Store the interface_key from all_devices so we can properly match it later
+                                    local_device = {
+                                        "device_id": device.get("device_id", ""),
+                                        "device_name": device.get("Device Name", ""),
+                                        "interface": device.get("Interface", ""),
+                                        "interface_key": iface_key,  # Store the actual key from all_devices
+                                        "vlan": device.get("VLAN", "0"),
+                                        "vxlan_config": vxlan_cfg if vxlan_cfg else {},
+                                        "vxlan_state": "Pending",  # Mark as pending until applied
+                                    }
+                                    devices_from_local.append(local_device)
+                                    logging.debug(f"[VXLAN TAB] Found local device with VXLAN: {local_device.get('device_name')}, interface_key: {iface_key}, config keys: {list(vxlan_cfg.keys()) if vxlan_cfg else 'none'}")
 
             # Merge devices: prefer database entries (they have device_id), but include local-only entries
             device_map = {}
@@ -403,8 +398,8 @@ class VXLANHandler:
                 selected_device_ids = set()
                 selected_device_names = set()
                 if hasattr(self.parent, "main_window") and hasattr(self.parent.main_window, "all_devices"):
-                    print(f"[VXLAN TAB] Selected interfaces: {interfaces_to_show}")
-                    print(f"[VXLAN TAB] Available interface keys in all_devices: {list(self.parent.main_window.all_devices.keys())}")
+                    logging.debug(f"[VXLAN TAB] Selected interfaces: {interfaces_to_show}")
+                    logging.debug(f"[VXLAN TAB] Available interface keys in all_devices: {list(self.parent.main_window.all_devices.keys())}")
                     
                     for iface in interfaces_to_show:
                         # Try exact match first
@@ -419,21 +414,21 @@ class VXLANHandler:
                             for key in self.parent.main_window.all_devices.keys():
                                 if key.endswith(f" - {port_name}") or key == port_name or key.endswith(port_name):
                                     iface_devices = self.parent.main_window.all_devices.get(key, [])
-                                    print(f"[VXLAN TAB] Found matching interface key '{key}' for selected interface '{iface}'")
+                                    logging.debug(f"[VXLAN TAB] Found matching interface key '{key}' for selected interface '{iface}'")
                                     break
                         
-                        print(f"[VXLAN TAB] Interface '{iface}' has {len(iface_devices)} device(s)")
+                        logging.debug(f"[VXLAN TAB] Interface '{iface}' has {len(iface_devices)} device(s)")
                         for iface_device in iface_devices:
                             device_id = iface_device.get("device_id")
                             device_name = iface_device.get("Device Name") or iface_device.get("device_name")
                             if device_id:
                                 selected_device_ids.add(device_id)
-                                print(f"[VXLAN TAB] Added device_id to filter: {device_id}")
+                                logging.debug(f"[VXLAN TAB] Added device_id to filter: {device_id}")
                             if device_name:
                                 selected_device_names.add(device_name)
-                                print(f"[VXLAN TAB] Added device_name to filter: {device_name}")
+                                logging.debug(f"[VXLAN TAB] Added device_name to filter: {device_name}")
                     
-                    print(f"[VXLAN TAB] Filtering {len(devices)} merged devices using {len(selected_device_ids)} device_id(s) and {len(selected_device_names)} device_name(s)")
+                    logging.debug(f"[VXLAN TAB] Filtering {len(devices)} merged devices using {len(selected_device_ids)} device_id(s) and {len(selected_device_names)} device_name(s)")
                     
                     # Filter merged devices to only include those from selected interfaces
                     for device in devices:
@@ -443,9 +438,9 @@ class VXLANHandler:
                         match_by_name = dev_name and dev_name in selected_device_names
                         if match_by_id or match_by_name:
                             filtered_devices.append(device)
-                            print(f"[VXLAN TAB] Matched device: {dev_name} (id={dev_id}, match_by_id={match_by_id}, match_by_name={match_by_name})")
+                            logging.debug(f"[VXLAN TAB] Matched device: {dev_name} (id={dev_id}, match_by_id={match_by_id}, match_by_name={match_by_name})")
                         else:
-                            print(f"[VXLAN TAB] Skipped device: {dev_name} (id={dev_id}) - not in selected interfaces")
+                            logging.debug(f"[VXLAN TAB] Skipped device: {dev_name} (id={dev_id}) - not in selected interfaces")
             else:
                 # No interfaces selected, show all devices (same as other tables)
                 filtered_devices = devices
@@ -457,7 +452,10 @@ class VXLANHandler:
                 if not isinstance(device, dict):
                     logging.debug("[VXLAN TAB] Skipping non-dict device entry: %s", device)
                     continue
+                
+                device_name = device.get('device_name') or device.get('Device Name', 'Unknown')
                 vxlan_cfg = device.get("vxlan_config")
+                
                 try:
                     if isinstance(vxlan_cfg, str):
                         vxlan_cfg = json.loads(vxlan_cfg) if vxlan_cfg else {}
@@ -470,7 +468,7 @@ class VXLANHandler:
                     if "tunnels" in vxlan_cfg and isinstance(vxlan_cfg["tunnels"], list):
                         # New format: list of tunnels
                         tunnels = vxlan_cfg["tunnels"]
-                        print(f"[VXLAN TAB] Device {device.get('device_name')}: Found {len(tunnels)} tunnel(s) in list format")
+                        logging.debug(f"[VXLAN TAB] Device {device_name}: Found {len(tunnels)} tunnel(s) in list format")
                     elif vxlan_cfg and len(vxlan_cfg) > 0:
                         # Old format: single tunnel dict (backward compatibility)
                         # Check if it has actual VXLAN settings with non-empty values (not just empty keys)
@@ -481,10 +479,7 @@ class VXLANHandler:
                         
                         if has_vni or has_local_ip or has_remote_peers or has_bridge_svi_ip:
                             tunnels = [vxlan_cfg]
-                            # print(f"[VXLAN TAB] Device {device.get('device_name')}: Found 1 tunnel in old format (single dict)")
-                        else:
-                            # print(f"[VXLAN TAB] Device {device.get('device_name')}: Skipping empty VXLAN config (has keys but no values)")
-                            pass
+                            logging.debug(f"[VXLAN TAB] Device {device_name}: Found 1 tunnel in old format (single dict)")
                 
                 # If no tunnels found, check if we should still show this device
                 if not tunnels:
@@ -495,13 +490,19 @@ class VXLANHandler:
                     # Skip devices where VXLAN was completely removed/disabled
                     # If state is "Disabled", it means VXLAN was removed - don't show in table
                     if vxlan_state == "Disabled":
-                        # print(f"[VXLAN TAB] Skipping device {device.get('device_name')} - VXLAN disabled/removed (state: {vxlan_state})")
+                        logging.debug(f"[VXLAN TAB] Skipping device {device_name} - VXLAN disabled/removed (state: {vxlan_state})")
                         continue
                     
-                    # If no tunnels, no enabled flag, and no interface, skip
+                    # If no tunnels, no enabled flag, and no interface, skip silently (normal case - device doesn't have VXLAN)
                     if not cfg_enabled and not has_interface:
-                        print(f"[VXLAN TAB] Skipping device {device.get('device_name')} - no VXLAN tunnels/config/status")
+                        logging.debug(f"[VXLAN TAB] Skipping device {device_name} - no VXLAN configuration")
                         continue
+                    
+                    # If we reach here, device has VXLAN enabled but no tunnel config yet
+                    # Create a placeholder row to show the device is configured for VXLAN
+                    logging.debug(f"[VXLAN TAB] Device {device_name}: Creating placeholder row (VXLAN enabled but no tunnel config)")
+                    rows.append((device, {}))
+                    continue
                 
                 # Create one row per tunnel
                 for tunnel_idx, tunnel_cfg in enumerate(tunnels):
@@ -518,23 +519,20 @@ class VXLANHandler:
                         tunnel_device["_tunnel_index"] = tunnel_idx
                         tunnel_device["_tunnel_count"] = len(tunnels)
                         rows.append((tunnel_device, tunnel_cfg))
-                        print(f"[VXLAN TAB] Added tunnel {tunnel_idx+1}/{len(tunnels)} for device {device.get('device_name')}, VNI: {tunnel_cfg.get('vni')} (total rows: {len(rows)})")
+                        logging.debug(f"[VXLAN TAB] Added tunnel {tunnel_idx+1}/{len(tunnels)} for device {device.get('device_name')}, VNI: {tunnel_cfg.get('vni')} (total rows: {len(rows)})")
 
             # print(f"[VXLAN TAB] Populating table with {len(rows)} rows")
             logging.debug(f"[VXLAN TAB] Populating table with {len(rows)} rows")
             
             # Clear table
             current_row_count = self.parent.vxlan_table.rowCount()
-            print(f"[VXLAN TAB] Clearing table (current rows: {current_row_count})")
+            logging.debug(f"[VXLAN TAB] Clearing table (current rows: {current_row_count})")
             self.parent.vxlan_table.setRowCount(0)
             
             # Add rows
             for idx, (device, vxlan_cfg) in enumerate(rows):
-                print(f"[VXLAN TAB] Adding row {idx+1}/{len(rows)} for device: {device.get('device_name')}, VNI: {vxlan_cfg.get('vni') if isinstance(vxlan_cfg, dict) else 'N/A'}")
+                logging.debug(f"[VXLAN TAB] Adding row {idx+1}/{len(rows)} for device: {device.get('device_name')}, VNI: {vxlan_cfg.get('vni') if isinstance(vxlan_cfg, dict) else 'N/A'}")
                 self._append_row(device, vxlan_cfg)
-                # Verify row was added
-                actual_rows = self.parent.vxlan_table.rowCount()
-                print(f"[VXLAN TAB] After adding row {idx+1}, table has {actual_rows} rows")
 
             # Force table update/refresh
             self.parent.vxlan_table.viewport().update()
@@ -557,18 +555,11 @@ class VXLANHandler:
                 self.start_monitoring()
             
             final_row_count = self.parent.vxlan_table.rowCount()
-            print(f"[VXLAN TAB] Refresh complete, table now has {final_row_count} rows")
-            print(f"[VXLAN TAB] Table visible: {self.parent.vxlan_table.isVisible()}, enabled: {self.parent.vxlan_table.isEnabled()}")
-            if final_row_count > 0:
-                # Check first row has data
-                device_col = self.parent.VXLAN_COL.get("Device")
-                status_col = self.parent.VXLAN_COL.get("Status")
-                if device_col is not None and status_col is not None:
-                    first_row_device = self.parent.vxlan_table.item(0, device_col)
-                    first_row_status = self.parent.vxlan_table.item(0, status_col)
-                    print(f"[VXLAN TAB] First row device item: {first_row_device.text() if first_row_device else 'None'}")
-                    print(f"[VXLAN TAB] First row status item: {first_row_status is not None}")
             logging.debug(f"[VXLAN TAB] Refresh complete, table now has {final_row_count} rows")
+            if final_row_count == 0:
+                # Only log when table is empty if there were filtered devices (might indicate an issue)
+                if filtered_devices:
+                    logging.debug(f"[VXLAN TAB] No VXLAN tunnels found for {len(filtered_devices)} device(s) - this is normal if VXLAN is not configured")
         except Exception as e:
             print(f"[VXLAN TAB] ERROR during refresh: {e}")
             logging.error(f"[VXLAN TAB] ERROR during refresh: {e}", exc_info=True)

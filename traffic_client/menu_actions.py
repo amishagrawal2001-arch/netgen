@@ -9,15 +9,43 @@ from PyQt5.QtCore import Qt
 
 def sanitize_for_json(obj):
     """Recursively convert non-serializable objects to JSON-safe formats."""
+    # Check for PyQt objects first (they can't be serialized)
+    if hasattr(obj, '__class__'):
+        obj_type = str(type(obj))
+        if 'PyQt5' in obj_type or 'QWidget' in obj_type or 'QTreeWidgetItem' in obj_type or 'QLabel' in obj_type:
+            # Skip PyQt objects - return a placeholder
+            return f"<PyQt-object: {type(obj).__name__}>"
+    
     if isinstance(obj, dict):
-        return {k: sanitize_for_json(v) for k, v in obj.items()}
+        # Filter out PyQt objects from dictionaries
+        result = {}
+        for k, v in obj.items():
+            if hasattr(v, '__class__'):
+                v_type = str(type(v))
+                if 'PyQt5' in v_type or 'QWidget' in v_type or 'QTreeWidgetItem' in v_type:
+                    continue  # Skip PyQt objects
+            result[k] = sanitize_for_json(v)
+        return result
     elif isinstance(obj, list):
-        return [sanitize_for_json(v) for v in obj]
+        # Filter out PyQt objects from lists
+        result = []
+        for v in obj:
+            if hasattr(v, '__class__'):
+                v_type = str(type(v))
+                if 'PyQt5' in v_type or 'QWidget' in v_type or 'QTreeWidgetItem' in v_type:
+                    continue  # Skip PyQt objects
+            result.append(sanitize_for_json(v))
+        return result
     elif isinstance(obj, (str, int, float, bool)) or obj is None:
         return obj
-    elif hasattr(obj, "text") and callable(obj.text):
-        # Handles QLabel, QLineEdit, etc.
-        return obj.text()
+    elif hasattr(obj, "text") and callable(getattr(obj, "text", None)):
+        # Handles QLabel, QLineEdit, etc. - but check if it's PyQt first
+        try:
+            # Try calling text() without arguments
+            return obj.text()
+        except TypeError:
+            # If it requires arguments (like QTreeWidgetItem.text(column)), skip it
+            return f"<non-serializable: {type(obj).__name__}>"
     elif hasattr(obj, "__str__"):
         return str(obj)
     else:
@@ -41,7 +69,26 @@ class TrafficGenClientMenuAction():
 
         if full_url not in [server["address"] for server in self.server_interfaces]:
             tg_id = len(self.server_interfaces)  # Assign the next TG ID
-            self.server_interfaces.append({"tg_id": tg_id, "address": full_url})
+            server_entry = {"tg_id": tg_id, "address": full_url, "online": True}
+            self.server_interfaces.append(server_entry)
+            
+            # Remove from removed_servers if it was previously removed
+            if full_url in self.removed_servers:
+                self.removed_servers.discard(full_url)
+                print(f"[ADD SERVER] Removed {full_url} from removed_servers (server was re-added)")
+            
+            # Update ServerManager if available
+            if hasattr(self, "server_manager"):
+                from utils.server_manager import ServerManager
+                server_id = ServerManager._extract_server_id_from_url(full_url)
+                self.server_manager.register_server(
+                    server_id=server_id,
+                    address=full_url,
+                    tg_id=tg_id,
+                    online=True
+                )
+                print(f"[ADD SERVER] Registered server {server_id} in ServerManager")
+            
             self.update_server_tree()
             self.save_server_interfaces()
         else:
@@ -62,6 +109,13 @@ class TrafficGenClientMenuAction():
                 self.removed_servers.add(server_address)
 
                 # Remove the server and its ports from the server interfaces
+                # Update ServerManager if available
+                if hasattr(self, "server_manager"):
+                    from utils.server_manager import ServerManager
+                    server_id = ServerManager._extract_server_id_from_url(server_address)
+                    self.server_manager.unregister_server(server_id)
+                    print(f"[REMOVE SERVER] Unregistered server {server_id} from ServerManager")
+                
                 self.server_interfaces = [
                     server for server in self.server_interfaces if server["address"] != server_address
                 ]
@@ -137,7 +191,21 @@ class TrafficGenClientMenuAction():
                 
                 # Add back to server_interfaces with a new TG ID
                 tg_id = len(self.server_interfaces)  # Assign the next available TG ID
-                self.server_interfaces.append({"tg_id": tg_id, "address": server_address})
+                server_entry = {"tg_id": tg_id, "address": server_address, "online": True}
+                self.server_interfaces.append(server_entry)
+                
+                # Update ServerManager if available
+                if hasattr(self, "server_manager"):
+                    from utils.server_manager import ServerManager
+                    server_id = ServerManager._extract_server_id_from_url(server_address)
+                    self.server_manager.register_server(
+                        server_id=server_id,
+                        address=server_address,
+                        tg_id=tg_id,
+                        online=True
+                    )
+                    print(f"[READD SERVER] Registered server {server_id} in ServerManager")
+                
                 readded_servers.append(server_address)
 
         if readded_servers:
@@ -447,22 +515,68 @@ class TrafficGenClientMenuAction():
         bgp_route_pools = getattr(self, 'bgp_route_pools', [])
         
         # Determine which servers to save:
-        # - If server was provided via CLI, preserve original servers from session.json
-        # - Otherwise, save current server_interfaces
+        # - If server was provided via CLI, check if servers were modified
+        # - If servers were added/removed via UI, save current server_interfaces
+        # - Otherwise, preserve original servers from session.json (CLI mode)
+        # - Ensure ServerManager is in sync before saving
+        if hasattr(self, "server_manager") and self.server_interfaces:
+            # Sync ServerManager with current server_interfaces
+            # Reinitialize to ensure consistency (clear_existing=True to prevent duplicates)
+            self.server_manager.initialize_from_server_interfaces(self.server_interfaces, clear_existing=True)
+            print(f"[SAVE SESSION] Synced ServerManager with {len(self.server_interfaces)} server(s)")
+        
+        # Check if we should preserve original servers (CLI mode without modifications)
+        preserve_original = False
         if getattr(self, 'server_url_from_cli', False) and hasattr(self, 'original_session_servers'):
-            # CLI mode: preserve original servers from session.json
+            # In CLI mode, only preserve original if server count hasn't changed
+            # This allows saving when user adds/removes servers via UI
+            original_count = len(self.original_session_servers)
+            current_count = len(self.server_interfaces)
+            if original_count == current_count:
+                # Count matches, check if addresses are the same
+                original_addresses = {s.get("address") for s in self.original_session_servers}
+                current_addresses = {s.get("address") for s in self.server_interfaces}
+                if original_addresses == current_addresses:
+                    preserve_original = True
+        
+        if preserve_original:
+            # CLI mode: preserve original servers from session.json (no changes made)
             servers_to_save = self.original_session_servers
-            print(f"[SAVE SESSION] Preserving {len(servers_to_save)} original server(s) from session.json (CLI mode)")
+            print(f"[SAVE SESSION] Preserving {len(servers_to_save)} original server(s) from session.json (CLI mode, no changes)")
         else:
-            # Normal mode: save current servers
-            servers_to_save = self.server_interfaces
-            print(f"[SAVE SESSION] Saving {len(servers_to_save)} current server(s)")
+            # Normal mode or CLI mode with modifications: save current servers
+            # Clean server_interfaces to remove PyQt widget objects before saving
+            servers_to_save = []
+            for server in self.server_interfaces:
+                # Create a clean copy without PyQt objects
+                clean_server = {
+                    "tg_id": server.get("tg_id", 0),
+                    "address": server.get("address", ""),
+                    "online": server.get("online", True),
+                    "interfaces": server.get("interfaces", [])
+                }
+                # Only include interfaces if it's a list/dict (not a PyQt object)
+                if isinstance(clean_server["interfaces"], (list, dict)):
+                    servers_to_save.append(clean_server)
+                else:
+                    clean_server["interfaces"] = []
+                    servers_to_save.append(clean_server)
+            
+            if getattr(self, 'server_url_from_cli', False):
+                print(f"[SAVE SESSION] Saving {len(servers_to_save)} current server(s) (CLI mode, servers modified)")
+            else:
+                print(f"[SAVE SESSION] Saving {len(servers_to_save)} current server(s)")
+        
+        # Clean up removed_servers - remove any servers that are currently in server_interfaces
+        # This ensures that if a server was previously removed but then re-added, it won't be in removed_servers
+        current_server_addresses = {s.get("address") for s in servers_to_save}
+        cleaned_removed_servers = {addr for addr in self.removed_servers if addr not in current_server_addresses}
         
         # Assemble session data
         session_data = {
             "servers": sanitize_for_json(servers_to_save),
             "removed_interfaces": list(self.removed_interfaces),
-            "removed_servers": list(self.removed_servers),  # Save removed servers
+            "removed_servers": list(cleaned_removed_servers),  # Save cleaned removed servers
             "selected_servers": [s["address"] for s in getattr(self, "selected_servers", [])],
             "streams": updated_streams,
             "devices": sanitize_for_json(device_rows),
@@ -771,6 +885,19 @@ class TrafficGenClientMenuAction():
                     if server_address not in existing_server_urls and server_address not in self.removed_servers:
                         self.server_interfaces.append(server)
                         print(f"[DEBUG LOAD] Added server {server_address} from session")
+                        
+                        # Update ServerManager if available (will be initialized later, but this ensures consistency)
+                        if hasattr(self, "server_manager"):
+                            from utils.server_manager import ServerManager
+                            server_id = ServerManager._extract_server_id_from_url(server_address)
+                            tg_id = server.get("tg_id", 0)
+                            self.server_manager.register_server(
+                                server_id=server_id,
+                                address=server_address,
+                                tg_id=tg_id,
+                                online=server.get("online", True),
+                                interfaces=server.get("interfaces", [])
+                            )
                     elif server_address in self.removed_servers:
                         print(f"[DEBUG LOAD] Skipped removed server {server_address}")
             else:

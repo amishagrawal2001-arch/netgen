@@ -138,10 +138,10 @@ class BGPHandler:
             if not server_url:
                 return
             
-            # Just refresh the table from device configurations (doesn't replace data)
-            # This will call _get_bgp_neighbor_state for each row to get fresh status from database
-            self.parent.update_bgp_table()
-            print("[BGP REFRESH] BGP status refreshed from database")
+            # OPTIMIZATION: Defer table update to next event loop iteration to avoid blocking UI on click
+            from PyQt5.QtCore import QTimer
+            QTimer.singleShot(0, lambda: self.parent.update_bgp_table())
+            print("[BGP REFRESH] BGP status refresh scheduled (non-blocking)")
         except Exception as e:
             print(f"Error refreshing BGP status: {e}")
 
@@ -270,11 +270,20 @@ class BGPHandler:
         
         if neighbors is not None:
             # Update from server data - one row per neighbor
-            self.parent.bgp_table.setRowCount(0)
+            # OPTIMIZATION: Use setRowCount with final count instead of clear+insertRow for better performance
+            neighbor_count = len(neighbors)
+            current_rows = self.parent.bgp_table.rowCount()
             
-            for neighbor in neighbors:
-                row = self.parent.bgp_table.rowCount()
-                self.parent.bgp_table.insertRow(row)
+            # Only resize if needed to avoid unnecessary UI updates
+            if neighbor_count != current_rows:
+                self.parent.bgp_table.setRowCount(neighbor_count)
+            
+            # Disable sorting temporarily for faster updates
+            was_sorting_enabled = self.parent.bgp_table.isSortingEnabled()
+            if was_sorting_enabled:
+                self.parent.bgp_table.setSortingEnabled(False)
+            
+            for row, neighbor in enumerate(neighbors):
                 
                 # Debug: Check if neighbor is a dict or list
                 if not isinstance(neighbor, dict):
@@ -332,16 +341,23 @@ class BGPHandler:
                 self.parent.bgp_table.setItem(row, 8, QTableWidgetItem(str(neighbor.get("routes", 0))))
                 
                 # Route Pools (column 9) - Try to find device and get route pools
+                # OPTIMIZATION: Cache device lookup to avoid repeated nested loops
                 route_pools_str = ""
-                for iface, devices in self.parent.main_window.all_devices.items():
-                    for dev in devices:
-                        if dev.get("Device Name") == device_name:
-                            bgp_cfg = dev.get("bgp_config", {})
-                            route_pools = bgp_cfg.get("route_pools", {}).get(neighbor_ip, [])
-                            route_pools_str = ", ".join(route_pools) if route_pools else ""
-                            break
-                    if route_pools_str:
-                        break
+                if not hasattr(self, '_device_cache'):
+                    self._device_cache = {}
+                if device_name not in self._device_cache:
+                    # Build cache on first access
+                    for iface, devices in self.parent.main_window.all_devices.items():
+                        for dev in devices:
+                            dev_name = dev.get("Device Name")
+                            if dev_name:
+                                self._device_cache[dev_name] = dev
+                
+                dev = self._device_cache.get(device_name)
+                if dev:
+                    bgp_cfg = dev.get("bgp_config", {})
+                    route_pools = bgp_cfg.get("route_pools", {}).get(neighbor_ip, [])
+                    route_pools_str = ", ".join(route_pools) if route_pools else ""
                 pool_item = QTableWidgetItem(route_pools_str)
                 pool_item.setToolTip(f"Attached route pools: {route_pools_str if route_pools_str else 'None'}")
                 self.parent.bgp_table.setItem(row, 9, pool_item)
@@ -357,6 +373,10 @@ class BGPHandler:
                 hold_time_item = QTableWidgetItem(str(hold_time))
                 hold_time_item.setToolTip("BGP Hold-time timer in seconds (default: 90)")
                 self.parent.bgp_table.setItem(row, 11, hold_time_item)
+            
+            # Re-enable sorting if it was enabled
+            if was_sorting_enabled:
+                self.parent.bgp_table.setSortingEnabled(True)
         else:
             # Update from device configurations - one row per neighbor IP
             try:
