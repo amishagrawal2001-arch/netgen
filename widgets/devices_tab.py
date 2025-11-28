@@ -3322,7 +3322,15 @@ class DevicesTab(QWidget):
                     ipv6_gateway_item.setToolTip("IPv6 Gateway address")
                 print(f"[ARP COLOR DEBUG] IPv6 Gateway set to DEFAULT")
 
-    def get_server_url(self, silent=False):
+    def get_server_url(self, silent=False, device_info=None):
+        """Get server URL with support for explicit device server association."""
+        # Priority 1: From device_info (explicit server association)
+        if device_info and hasattr(self.main_window, "server_manager"):
+            server_url = self.main_window.server_manager.get_server_url(device_info=device_info)
+            if server_url:
+                return server_url
+        
+        # Priority 2: From main_window.server_url
         if hasattr(self.main_window, "server_url") and self.main_window.server_url:
             # print(f"[DEBUG SERVER] Using main_window.server_url: {self.main_window.server_url}")
             return self.main_window.server_url
@@ -3345,8 +3353,15 @@ class DevicesTab(QWidget):
                                  "Please select a server before starting/stopping devices.")
         return None
 
-    def _get_server_url_from_interface(self, iface_label):
-        """Derive the server URL from an interface label (e.g., 'TG 0 - Port: • ens4np0')."""
+    def _get_server_url_from_interface(self, iface_label, device_info=None):
+        """Derive the server URL from an interface label or device_info (e.g., 'TG 0 - Port: • ens4np0')."""
+        # Priority 1: Use explicit server info from device_info if available
+        if device_info and hasattr(self.main_window, "server_manager"):
+            server_url = self.main_window.server_manager.get_server_url(device_info=device_info)
+            if server_url:
+                return server_url
+        
+        # Priority 2: Parse from interface label (backward compatibility)
         if not iface_label:
             return self.get_server_url(silent=True)
 
@@ -3613,11 +3628,6 @@ class DevicesTab(QWidget):
             QMessageBox.warning(self, "No Selection", "Please select one or more devices to apply.")
             return
 
-        # Get server URL
-        server_url = self.get_server_url()
-        if not server_url:
-            return
-
         # Process each selected device
         results = []
         successful_count = 0
@@ -3638,6 +3648,13 @@ class DevicesTab(QWidget):
             
             if not device_info:
                 results.append(f"❌ {device_name}: Device not found in data structure")
+                failed_count += 1
+                continue
+
+            # Get server URL from device_info (using ServerManager if available)
+            server_url = self.get_server_url(device_info=device_info)
+            if not server_url:
+                results.append(f"❌ {device_name}: No server URL found for device")
                 failed_count += 1
                 continue
 
@@ -3815,7 +3832,7 @@ class DevicesTab(QWidget):
                 failed_count += 1
                 continue
 
-            server_url = self._get_server_url_from_interface(device_info.get("Interface", ""))
+            server_url = self._get_server_url_from_interface(device_info.get("Interface", ""), device_info=device_info)
             if not server_url:
                 results.append(f"❌ {device_name}: No server URL found for interface")
                 failed_count += 1
@@ -5058,6 +5075,18 @@ class DevicesTab(QWidget):
                     "Status": "Stopped",
                     "protocols": [],
                 }
+                
+                # Add server information if ServerManager is available
+                if hasattr(self.main_window, "server_manager"):
+                    from utils.device_server_migration import DeviceServerMigration
+                    # Extract TG ID from interface
+                    tg_id = DeviceServerMigration.extract_tg_id_from_interface(iface)
+                    if tg_id is not None:
+                        server_url = self.main_window.server_manager.get_server_url(tg_id=tg_id)
+                        if server_url:
+                            device_data["server_url"] = server_url
+                            device_data["tg_id"] = tg_id
+                            device_data["server_id"] = DeviceServerMigration.extract_server_id_from_url(server_url)
 
                 # Always include VXLAN config if it exists (even if incomplete)
                 # This ensures VXLAN config is preserved when user enables VXLAN in UI
@@ -5331,6 +5360,18 @@ class DevicesTab(QWidget):
                 "Status": "Stopped",
                 "protocols": [],
             }
+            
+            # Add server information if ServerManager is available
+            if hasattr(self.main_window, "server_manager"):
+                from utils.device_server_migration import DeviceServerMigration
+                # Extract TG ID from interface
+                tg_id = DeviceServerMigration.extract_tg_id_from_interface(iface)
+                if tg_id is not None:
+                    server_url = self.main_window.server_manager.get_server_url(tg_id=tg_id)
+                    if server_url:
+                        device_data["server_url"] = server_url
+                        device_data["tg_id"] = tg_id
+                        device_data["server_id"] = DeviceServerMigration.extract_server_id_from_url(server_url)
 
             # Always include VXLAN config if it exists (even if incomplete)
             # This ensures VXLAN config is preserved when user enables VXLAN in UI
@@ -5513,6 +5554,18 @@ class DevicesTab(QWidget):
         
         if interface_key not in self.main_window.all_devices or not isinstance(self.main_window.all_devices[interface_key], list):
             self.main_window.all_devices[interface_key] = []
+        
+        # Add server information to all devices if ServerManager is available
+        if hasattr(self.main_window, "server_manager"):
+            from utils.device_server_migration import DeviceServerMigration
+            tg_id = DeviceServerMigration.extract_tg_id_from_interface(iface)
+            if tg_id is not None:
+                server_url = self.main_window.server_manager.get_server_url(tg_id=tg_id)
+                if server_url:
+                    for device_data in devices_to_create:
+                        device_data["server_url"] = server_url
+                        device_data["tg_id"] = tg_id
+                        device_data["server_id"] = DeviceServerMigration.extract_server_id_from_url(server_url)
         
         for device_data in devices_to_create:
             # Store the interface_key in device_data for proper matching during filtering
@@ -6259,34 +6312,42 @@ class DevicesTab(QWidget):
         if all_devices is None:
             all_devices = getattr(self.main_window, "all_devices", {})
 
-        self.devices_table.setRowCount(0)
-
+        # OPTIMIZATION: Calculate row count first, then set once instead of clear+insertRow
         try:
             selected_interfaces = set()
             tree = getattr(self.main_window, "server_tree", None)
             if tree:
+                # OPTIMIZATION: Cache TG ID extraction to avoid repeated lookups
+                tg_id_cache = {}
+                
                 for item in tree.selectedItems():
                     parent = item.parent()
                     if parent:
-                        # Extract TG ID from custom widget (QWidget with QLabel)
-                        tg_id = None
-                        tg_id_widget = tree.itemWidget(parent, 0)
-                        if tg_id_widget:
-                            tg_id_label = tg_id_widget.findChild(QLabel)
-                            if tg_id_label:
-                                tg_id = tg_id_label.text().strip()
-                        
-                        # Fallback: extract from server_interfaces using parent index
-                        if not tg_id:
-                            parent_index = tree.indexOfTopLevelItem(parent)
+                        # OPTIMIZATION: Use cached TG ID if available, otherwise extract once
+                        parent_index = tree.indexOfTopLevelItem(parent)
+                        if parent_index not in tg_id_cache:
+                            tg_id = None
+                            # Try fastest method first: server_interfaces lookup
                             if parent_index >= 0 and hasattr(self.main_window, "server_interfaces"):
                                 if parent_index < len(self.main_window.server_interfaces):
                                     server = self.main_window.server_interfaces[parent_index]
                                     tg_id = f"TG {server.get('tg_id', '0')}"
-                        
-                        # If still no TG ID, try text(0) as last resort
-                        if not tg_id:
-                            tg_id = parent.text(0).strip()
+                            
+                            # Fallback: Extract from custom widget (slower)
+                            if not tg_id:
+                                tg_id_widget = tree.itemWidget(parent, 0)
+                                if tg_id_widget:
+                                    tg_id_label = tg_id_widget.findChild(QLabel)
+                                    if tg_id_label:
+                                        tg_id = tg_id_label.text().strip()
+                            
+                            # Last resort: text(0)
+                            if not tg_id:
+                                tg_id = parent.text(0).strip()
+                            
+                            tg_id_cache[parent_index] = tg_id
+                        else:
+                            tg_id = tg_id_cache[parent_index]
                         
                         port_name = item.text(0).replace("• ", "").strip()
                         if tg_id and port_name:
@@ -6297,6 +6358,10 @@ class DevicesTab(QWidget):
             logging.debug(f"[DEVICE TABLE] Selected interfaces: {selected_interfaces}, All device keys: {list(all_devices.keys())}")
 
             interfaces_to_show = selected_interfaces or list(all_devices.keys())
+            
+            # OPTIMIZATION: Count total rows first, then set once
+            total_rows = 0
+            devices_to_add = []
             for iface in interfaces_to_show:
                 devices = all_devices.get(iface)
                 if not devices:
@@ -6304,16 +6369,26 @@ class DevicesTab(QWidget):
                     devices = all_devices.get(legacy_iface, [])
                 if not isinstance(devices, list):
                     continue
-
+                
                 for device in devices:
-                    # Skip if device is not a dictionary (safety check)
-                    if not isinstance(device, dict):
-                        logging.warning(f"[DEVICE TABLE] Skipping non-dict device entry: {type(device)}")
-                        continue
-                    
-                    row = self.devices_table.rowCount()
-                    self.devices_table.insertRow(row)
-
+                    if isinstance(device, dict):
+                        devices_to_add.append((iface, device))
+                        total_rows += 1
+            
+            # Set row count once instead of multiple insertRow calls
+            self.devices_table.setRowCount(total_rows)
+            
+            # OPTIMIZATION: Disable sorting temporarily for faster updates
+            was_sorting_enabled = self.devices_table.isSortingEnabled()
+            if was_sorting_enabled:
+                self.devices_table.setSortingEnabled(False)
+            
+            # OPTIMIZATION: Block table updates during bulk population for better performance
+            self.devices_table.setUpdatesEnabled(False)
+            
+            try:
+                # Now populate rows
+                for row, (iface, device) in enumerate(devices_to_add):
                     for header in self.device_headers:
                         if header == "IPv4 Mask":
                             value = device.get("ipv4_mask", "24")
@@ -6349,15 +6424,27 @@ class DevicesTab(QWidget):
                         item.setData(Qt.UserRole + 2, str(value))
                         self.devices_table.setItem(row, self.COL[header], item)
 
+                    # OPTIMIZATION: Set status icon immediately - icons are lightweight and won't block
                     status_value = device.get("Status", "Stopped")
                     resolved = status_value == "Running"
                     tooltip = "Device Running" if resolved else "Device Stopped"
                     self.set_status_icon(row, resolved=resolved, status_text=tooltip, device_status=status_value)
+                
+                # Re-enable sorting if it was enabled
+                if was_sorting_enabled:
+                    self.devices_table.setSortingEnabled(True)
+            finally:
+                # Re-enable table updates after bulk population
+                self.devices_table.setUpdatesEnabled(True)
+                # Force a single repaint after all updates
+                self.devices_table.viewport().update()
 
         except Exception as exc:
             logging.error(f"[DEVICE TABLE] Failed to rebuild table: {exc}")
 
-        self._initialize_arp_status_from_database()
+        # OPTIMIZATION: Defer ARP initialization to avoid blocking UI on click
+        from PyQt5.QtCore import QTimer
+        QTimer.singleShot(0, self._initialize_arp_status_from_database)
 
     def _initialize_arp_status_from_database(self):
         """Initialize ARP status icons using database values for running devices."""

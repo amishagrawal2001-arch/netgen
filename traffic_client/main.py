@@ -30,6 +30,8 @@ from traffic_client.statistics_section import TrafficGenClientStatisticsSection
 from traffic_client.stream_logic import TrafficGenClientStreamLogic
 from traffic_client.stream_control import TrafficGenClientStreamControl
 from traffic_client.server_retry_workers import ServerRetryWorker, HealthCheckWorker, ConnectionManager
+from utils.server_manager import ServerManager
+from utils.device_server_migration import DeviceServerMigration
 
 
 class TrafficGeneratorClient(
@@ -75,6 +77,9 @@ class TrafficGeneratorClient(
         self.server_retry_worker = None
         self.health_check_worker = None
         self.retry_timer = None
+        
+        # Initialize ServerManager for multi-server support
+        self.server_manager = ServerManager()
 
         # Root layout
         self.central_widget = QWidget()
@@ -145,6 +150,18 @@ class TrafficGeneratorClient(
                 print(f"✅ Automatically added server: {self.server_url} (TG {tg_id})")
             else:
                 print(f"⚠️ Server {self.server_url} was previously removed, not adding automatically")
+        
+        # Initialize ServerManager from server_interfaces
+        if self.server_interfaces:
+            self.server_manager.initialize_from_server_interfaces(self.server_interfaces)
+            print(f"✅ ServerManager initialized with {len(self.server_manager.servers)} server(s)")
+        
+        # Migrate devices to server-aware structure
+        if self.all_devices:
+            DeviceServerMigration.migrate_all_devices(self.all_devices, self.server_manager)
+            # Also update devices_tab if it exists
+            if hasattr(self, 'devices_tab') and self.devices_tab:
+                self.devices_tab.all_devices = self.all_devices.copy()
         
         # Update server tree after servers are populated (especially important for CLI-provided server)
         if hasattr(self, 'update_server_tree'):
