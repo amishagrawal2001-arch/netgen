@@ -1248,6 +1248,20 @@ def configure_bgp_for_device(device_id: str, bgp_config: Dict, ipv4: str = None,
                 vtysh_commands.append(f"neighbor {neighbor_ipv6} next-hop-self")
                 logging.info(f"[BGP iBGP] Added next-hop-self for IPv6 neighbor {neighbor_ipv6}")
             
+            # Add network advertisement if IPv6 network is available
+            if ipv6:
+                # Extract network from IP/mask (e.g., 2001:db8::2/64 -> 2001:db8::/64)
+                ip_addr = ipv6.split('/')[0]
+                mask = ipv6.split('/')[1] if '/' in ipv6 else '64'
+                # Convert to network address
+                import ipaddress
+                try:
+                    network = ipaddress.IPv6Network(f"{ip_addr}/{mask}", strict=False)
+                    vtysh_commands.append(f"network {network}")
+                    logging.info(f"[BGP] Advertising IPv6 network {network}")
+                except Exception as e:
+                    logging.warning(f"[BGP] Failed to calculate IPv6 network for {ipv6}: {e}")
+            
             vtysh_commands.append("exit-address-family")
         
         # Configure BGP EVPN if VXLAN is enabled

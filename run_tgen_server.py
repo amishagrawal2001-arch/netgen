@@ -2553,6 +2553,57 @@ def apply_device():
                 if ipv4_result.returncode == 0:
                     logging.info(f"[DEVICE APPLY] Configured IPv4 address {ipv4}/{ipv4_mask} on {iface_name_for_commands} (interface: {iface_name})")
                     result["ipv4_configured"] = True
+                    
+                    # CRITICAL: Clean up duplicate IPv4 subnet routes on interfaces that are DOWN/LOWERLAYERDOWN
+                    # This prevents routing issues when multiple interfaces have the same subnet but one is down
+                    try:
+                        import ipaddress
+                        ipv4_network = ipaddress.IPv4Network(f"{ipv4}/{ipv4_mask}", strict=False)
+                        subnet = str(ipv4_network)
+                        
+                        # Get all IPv4 routes for this subnet
+                        route_check = subprocess.run(
+                            ["ip", "route", "show", subnet],
+                            capture_output=True, text=True, timeout=5
+                        )
+                        
+                        if route_check.returncode == 0:
+                            for route_line in route_check.stdout.split('\n'):
+                                route_line = route_line.strip()
+                                if not route_line or subnet not in route_line:
+                                    continue
+                                
+                                # Parse route line: "192.168.0.0/24 dev vlan20 proto kernel metric 256 linkdown"
+                                if f"dev {iface_name_for_commands}" in route_line:
+                                    continue  # Skip our own interface
+                                
+                                # Extract interface name from route
+                                import re
+                                dev_match = re.search(r'dev\s+(\S+)', route_line)
+                                if dev_match:
+                                    other_iface = dev_match.group(1)
+                                    
+                                    # Check if this interface is DOWN or LOWERLAYERDOWN
+                                    link_check = subprocess.run(
+                                        ["ip", "link", "show", other_iface],
+                                        capture_output=True, text=True, timeout=5
+                                    )
+                                    
+                                    if link_check.returncode == 0:
+                                        link_output = link_check.stdout.lower()
+                                        # Check for down states
+                                        if "state down" in link_output or "lowerlayerdown" in link_output or "linkdown" in route_line:
+                                            # Remove the duplicate route on the down interface
+                                            route_del = subprocess.run(
+                                                ["ip", "route", "del", subnet, "dev", other_iface],
+                                                capture_output=True, text=True, timeout=5
+                                            )
+                                            if route_del.returncode == 0:
+                                                logging.info(f"[DEVICE APPLY] ✅ Removed duplicate IPv4 subnet route {subnet} from down interface {other_iface}")
+                                            else:
+                                                logging.debug(f"[DEVICE APPLY] Could not remove duplicate route from {other_iface}: {route_del.stderr}")
+                    except Exception as cleanup_exc:
+                        logging.warning(f"[DEVICE APPLY] Error cleaning up duplicate IPv4 routes: {cleanup_exc}")
                 else:
                     logging.warning(f"[DEVICE APPLY] Failed to configure IPv4 address {ipv4}/{ipv4_mask} on {iface_name_for_commands}: {ipv4_result.stderr}")
                     result["ipv4_configured"] = False
@@ -2575,6 +2626,57 @@ def apply_device():
                 if ipv6_result.returncode == 0:
                     logging.info(f"[DEVICE APPLY] Configured IPv6 address {ipv6}/{ipv6_mask} on {iface_name_for_commands} (interface: {iface_name})")
                     result["ipv6_configured"] = True
+                    
+                    # CRITICAL: Clean up duplicate IPv6 subnet routes on interfaces that are DOWN/LOWERLAYERDOWN
+                    # This prevents routing issues when multiple interfaces have the same subnet but one is down
+                    try:
+                        import ipaddress
+                        ipv6_network = ipaddress.IPv6Network(f"{ipv6}/{ipv6_mask}", strict=False)
+                        subnet = str(ipv6_network)
+                        
+                        # Get all IPv6 routes for this subnet
+                        route_check = subprocess.run(
+                            ["ip", "-6", "route", "show", subnet],
+                            capture_output=True, text=True, timeout=5
+                        )
+                        
+                        if route_check.returncode == 0:
+                            for route_line in route_check.stdout.split('\n'):
+                                route_line = route_line.strip()
+                                if not route_line or subnet not in route_line:
+                                    continue
+                                
+                                # Parse route line: "2001:db8::/64 dev vlan20 proto kernel metric 256 linkdown pref medium"
+                                if f"dev {iface_name_for_commands}" in route_line:
+                                    continue  # Skip our own interface
+                                
+                                # Extract interface name from route
+                                import re
+                                dev_match = re.search(r'dev\s+(\S+)', route_line)
+                                if dev_match:
+                                    other_iface = dev_match.group(1)
+                                    
+                                    # Check if this interface is DOWN or LOWERLAYERDOWN
+                                    link_check = subprocess.run(
+                                        ["ip", "link", "show", other_iface],
+                                        capture_output=True, text=True, timeout=5
+                                    )
+                                    
+                                    if link_check.returncode == 0:
+                                        link_output = link_check.stdout.lower()
+                                        # Check for down states
+                                        if "state down" in link_output or "lowerlayerdown" in link_output or "linkdown" in route_line:
+                                            # Remove the duplicate route on the down interface
+                                            route_del = subprocess.run(
+                                                ["ip", "-6", "route", "del", subnet, "dev", other_iface],
+                                                capture_output=True, text=True, timeout=5
+                                            )
+                                            if route_del.returncode == 0:
+                                                logging.info(f"[DEVICE APPLY] ✅ Removed duplicate IPv6 subnet route {subnet} from down interface {other_iface}")
+                                            else:
+                                                logging.debug(f"[DEVICE APPLY] Could not remove duplicate route from {other_iface}: {route_del.stderr}")
+                    except Exception as cleanup_exc:
+                        logging.warning(f"[DEVICE APPLY] Error cleaning up duplicate IPv6 routes: {cleanup_exc}")
                 else:
                     logging.warning(f"[DEVICE APPLY] Failed to configure IPv6 address {ipv6}/{ipv6_mask} on {iface_name_for_commands}: {ipv6_result.stderr}")
                     result["ipv6_configured"] = False
@@ -8654,20 +8756,46 @@ def reset_interface_with_vlans():
                 
                 removed_physical_ips = []
                 if physical_result.returncode == 0:
+                    # Parse all IP addresses first for reporting
                     for phys_line in physical_result.stdout.split('\n'):
                         phys_line = phys_line.strip()
                         if phys_line.startswith('inet ') and not phys_line.startswith('inet 127.'):
                             ip_part = phys_line.split()[1]
-                            remove_cmd = ["ip", "addr", "del", ip_part, "dev", base_interface]
-                            remove_result = subprocess.run(remove_cmd, capture_output=True, text=True, timeout=5)
-                            if remove_result.returncode == 0:
-                                removed_physical_ips.append(ip_part)
-                        elif phys_line.startswith('inet6 ') and not phys_line.startswith('inet6 fe80:'):
+                            removed_physical_ips.append(ip_part)
+                        elif phys_line.startswith('inet6 '):
+                            # Include ALL IPv6 addresses, including link-local (fe80::)
                             ip_part = phys_line.split()[1]
-                            remove_cmd = ["ip", "addr", "del", ip_part, "dev", base_interface]
-                            remove_result = subprocess.run(remove_cmd, capture_output=True, text=True, timeout=5)
-                            if remove_result.returncode == 0:
-                                removed_physical_ips.append(ip_part)
+                            removed_physical_ips.append(ip_part)
+                    
+                    # Flush all IPv4 addresses (except loopback) - more efficient than individual deletion
+                    flush_ipv4_result = subprocess.run(["ip", "addr", "flush", "dev", base_interface, "scope", "global"],
+                                                     capture_output=True, text=True, timeout=5)
+                    if flush_ipv4_result.returncode == 0:
+                        logging.info(f"[INTERFACE RESET] Flushed all IPv4 addresses from {base_interface}")
+                    else:
+                        # Fallback: remove IPv4 addresses individually
+                        logging.warning(f"[INTERFACE RESET] IPv4 flush failed, trying individual removal: {flush_ipv4_result.stderr}")
+                        for ip_part in removed_physical_ips[:]:  # Iterate over copy
+                            if ':' not in ip_part:  # IPv4 address
+                                remove_cmd = ["ip", "addr", "del", ip_part, "dev", base_interface]
+                                remove_result = subprocess.run(remove_cmd, capture_output=True, text=True, timeout=5)
+                                if remove_result.returncode != 0:
+                                    logging.warning(f"[INTERFACE RESET] Failed to remove IPv4 {ip_part}: {remove_result.stderr}")
+                    
+                    # Flush all IPv6 addresses (including link-local) - this removes ALL IPv6 addresses
+                    flush_ipv6_result = subprocess.run(["ip", "-6", "addr", "flush", "dev", base_interface],
+                                                     capture_output=True, text=True, timeout=5)
+                    if flush_ipv6_result.returncode == 0:
+                        logging.info(f"[INTERFACE RESET] Flushed all IPv6 addresses (including link-local) from {base_interface}")
+                    else:
+                        # Fallback: remove IPv6 addresses individually
+                        logging.warning(f"[INTERFACE RESET] IPv6 flush failed, trying individual removal: {flush_ipv6_result.stderr}")
+                        for ip_part in removed_physical_ips[:]:  # Iterate over copy
+                            if ':' in ip_part:  # IPv6 address
+                                remove_cmd = ["ip", "-6", "addr", "del", ip_part, "dev", base_interface]
+                                remove_result = subprocess.run(remove_cmd, capture_output=True, text=True, timeout=5)
+                                if remove_result.returncode != 0:
+                                    logging.warning(f"[INTERFACE RESET] Failed to remove IPv6 {ip_part}: {remove_result.stderr}")
                     
                     # Reset MTU to default (1500) - this helps avoid MTU mismatch issues
                     # Get current MTU first to check if reset is needed
@@ -9047,17 +9175,36 @@ def get_device_bgp_status(device_id):
                     neighbor_as = parts[2]
                     
                     # Find the state - it's usually after the uptime (8th field) and before the description
+                    # Format: Neighbor V AS MsgRcvd MsgSent TblVer InQ OutQ Up/Down State/PfxRcd PfxSnt Desc
+                    # Example: 192.168.0.1 4 65000 23 31 4 0 0 00:05:55 0 2 N/A
+                    # parts[8] = uptime (00:05:55)
+                    # parts[9] = State/PfxRcd (0 = prefix count when Established, or state name when not Established)
                     uptime = parts[8] if len(parts) > 8 else "00:00:00"
                     
-                    # Look for state in the remaining parts - usually contains parentheses
+                    # Look for state in the remaining parts - usually contains parentheses or state name
                     state = "Unknown"
-                    for i in range(8, len(parts)):
-                        if '(' in parts[i] and ')' in parts[i]:
-                            state = parts[i]
-                            break
-                        elif parts[i] in ['Established', 'Active', 'Idle', 'Connect', 'OpenSent', 'OpenConfirm']:
-                            state = parts[i]
-                            break
+                    # First check parts[9] - it could be a state name (Idle, Active, etc.) or a number (prefix count when Established)
+                    if len(parts) > 9:
+                        # Check if parts[9] is a number (prefix count) - if so, state is Established
+                        try:
+                            prefix_count = int(parts[9])
+                            # If it's a number and we have a valid uptime, the state is Established
+                            if uptime != "00:00:00" and ":" in uptime:
+                                state = "Established"
+                                logging.debug(f"[BGP STATUS] Detected Established state for {neighbor_ip} (prefix count: {prefix_count}, uptime: {uptime})")
+                        except ValueError:
+                            # parts[9] is not a number, so it's likely a state name
+                            state = parts[9]
+                    
+                    # If state is still "Unknown", check remaining parts for state indicators
+                    if state == "Unknown":
+                        for i in range(9, len(parts)):
+                            if '(' in parts[i] and ')' in parts[i]:
+                                state = parts[i]
+                                break
+                            elif parts[i] in ['Established', 'Active', 'Idle', 'Connect', 'OpenSent', 'OpenConfirm', 'OpenWait']:
+                                state = parts[i]
+                                break
                     
                     # Special handling for (Policy) state - this indicates BGP is established
                     if state == "(Policy)":
@@ -9065,9 +9212,9 @@ def get_device_bgp_status(device_id):
                         logging.info(f"[BGP STATUS] Mapped (Policy) to Established for {neighbor_ip}")
                     
                     # If state is still "Unknown" and we have uptime, check if session is actually established
-                    # by looking at the uptime - if it's not "00:00:00", the session is likely established
-                    if state == "Unknown" and uptime != "00:00:00" and ":" in uptime:
-                        # If we have a valid uptime (not 00:00:00), the BGP session is likely Established
+                    # by looking at the uptime - if it's not "00:00:00" or "never", the session is likely established
+                    if state == "Unknown" and uptime != "00:00:00" and uptime != "never" and ":" in uptime:
+                        # If we have a valid uptime (not 00:00:00 or never), the BGP session is likely Established
                         # even if the summary shows "N/A" for state
                         state = "Established"
                         logging.info(f"[BGP STATUS FIX] Setting state to Established for {neighbor_ip} based on uptime {uptime}")

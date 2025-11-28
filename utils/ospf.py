@@ -623,6 +623,13 @@ def configure_ospf_neighbor(
             if graceful_restart_ipv6:
                 vtysh_commands.append(" graceful-restart")
             
+            # CRITICAL: Add interface to router ospf6 explicitly
+            # This ensures the interface is properly associated with OSPFv6
+            # Note: Interface-level "ipv6 ospf6 area" is also needed, but router-level
+            # interface statement helps ensure proper initialization
+            vtysh_commands.append(f" interface {interface} area {area_id_ipv6}")
+            logging.info(f"[OSPF CONFIGURE] Adding interface {interface} to router ospf6 area {area_id_ipv6}")
+            
             # Calculate IPv6 network from device IP if available
             ipv6_network = None
             if device_data and device_data.get("ipv6_address"):

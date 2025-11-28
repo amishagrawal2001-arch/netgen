@@ -126,9 +126,14 @@ class BGPStatusMonitor:
                     try:
                         bgp_status = future.result()
                         if bgp_status:
+                            logger.info(f"[BGP MONITOR] Got BGP status for device {device['device_id']}: established={bgp_status.get('bgp_established')}, ipv4={bgp_status.get('bgp_ipv4_established')}, ipv6={bgp_status.get('bgp_ipv6_established')}")
                             self._update_device_bgp_status(device['device_id'], bgp_status)
+                        else:
+                            logger.warning(f"[BGP MONITOR] No BGP status returned for device {device['device_id']}")
                     except Exception as e:
                         logger.error(f"[BGP MONITOR] Error checking BGP status for device {device['device_id']}: {e}")
+                        import traceback
+                        logger.error(f"[BGP MONITOR] Traceback: {traceback.format_exc()}")
                         
         except Exception as e:
             logger.error(f"[BGP MONITOR] Error in batch BGP status check: {e}")
@@ -255,13 +260,15 @@ class BGPStatusMonitor:
             })
             
             # Update main devices table with BGP status
+            # Note: 'bgp_established' and 'last_bgp_check' columns don't exist in devices table
+            # Only bgp_ipv4_established, bgp_ipv6_established, bgp_ipv4_state, bgp_ipv6_state exist
             update_data = {
-                'bgp_established': bgp_status['bgp_established'],
+                # 'bgp_established': bgp_status['bgp_established'],  # Removed - column doesn't exist in devices table
                 'bgp_ipv4_established': bgp_status['bgp_ipv4_established'],
                 'bgp_ipv6_established': bgp_status['bgp_ipv6_established'],
                 'bgp_ipv4_state': bgp_status['bgp_ipv4_state'],
                 'bgp_ipv6_state': bgp_status['bgp_ipv6_state'],
-                'last_bgp_check': bgp_status['last_check']
+                # 'last_bgp_check': bgp_status['last_check']  # Removed - column doesn't exist in devices table (only in device_stats)
             }
             
             # Clear manual override flag when monitor takes over
@@ -283,7 +290,7 @@ class BGPStatusMonitor:
                 'neighbors': bgp_status['bgp_neighbors']
             })
             
-            logger.debug(f"[BGP MONITOR] Updated BGP status for device {device_id}: {bgp_status['bgp_established']}")
+            logger.info(f"[BGP MONITOR] ✅ Updated BGP status for device {device_id}: established={bgp_status['bgp_established']}, ipv4={bgp_status['bgp_ipv4_established']}, ipv6={bgp_status['bgp_ipv6_established']}, ipv4_state={bgp_status['bgp_ipv4_state']}, ipv6_state={bgp_status['bgp_ipv6_state']}")
             
         except Exception as e:
             logger.error(f"[BGP MONITOR] Error updating BGP status for device {device_id}: {e}")
