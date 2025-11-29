@@ -126,7 +126,7 @@ class VXLANHandler:
             server_url = self.parent.get_server_url(silent=True)
             
             if not server_url:
-                print("[VXLAN TAB] No server URL available, using local data only")
+                # print("[VXLAN TAB] No server URL available, using local data only")
                 logging.warning("[VXLAN TAB] No server URL available for refresh")
             
             # Collect devices from both database and local memory
@@ -140,19 +140,20 @@ class VXLANHandler:
                             devices_from_db = payload.get("devices", [])
                         elif isinstance(payload, list):
                             devices_from_db = payload
-                        print(f"[VXLAN TAB] Fetched {len(devices_from_db)} devices from database")
+                        # print(f"[VXLAN TAB] Fetched {len(devices_from_db)} devices from database")
                         logging.debug(f"[VXLAN TAB] Fetched {len(devices_from_db)} devices from database")
                     else:
-                        print(f"[VXLAN TAB] Failed to fetch from database: HTTP {response.status_code}")
+                        # print(f"[VXLAN TAB] Failed to fetch from database: HTTP {response.status_code}")
                         logging.warning(f"[VXLAN TAB] Failed to fetch from database: HTTP {response.status_code}")
                 except requests.exceptions.RequestException as exc:
-                    print(f"[VXLAN TAB] Network error fetching VXLAN data from database: {exc}")
+                    # print(f"[VXLAN TAB] Network error fetching VXLAN data from database: {exc}")
                     logging.warning(f"[VXLAN TAB] Network error fetching VXLAN data from database: {exc}")
                 except Exception as exc:
-                    print(f"[VXLAN TAB] Error fetching VXLAN data from database: {exc}")
+                    # print(f"[VXLAN TAB] Error fetching VXLAN data from database: {exc}")
                     logging.warning(f"[VXLAN TAB] Error fetching VXLAN data from database: {exc}")
             else:
-                print("[VXLAN TAB] No server URL, skipping database fetch")
+                # print("[VXLAN TAB] No server URL, skipping database fetch")
+                pass
 
             # Also check local device data (for unapplied configurations)
             devices_from_local = []
@@ -295,11 +296,11 @@ class VXLANHandler:
                             selected_port = selected_iface.split(" - ")[-1].strip() if " - " in selected_iface else selected_iface.strip()
                             if port_name == selected_port or selected_iface.endswith(f" - {port_name}"):
                                 matches_selected = True
-                                print(f"[VXLAN TAB] Including local device {device.get('device_name')} - port '{port_name}' matches selected interface '{selected_iface}'")
+                                # print(f"[VXLAN TAB] Including local device {device.get('device_name')} - port '{port_name}' matches selected interface '{selected_iface}'")
                                 break
                     
                     if not matches_selected:
-                        print(f"[VXLAN TAB] Skipping local device {device.get('device_name')} - port '{port_name}' (from interface_key '{device_interface_key}') not in selected interfaces {interfaces_to_show}")
+                        # print(f"[VXLAN TAB] Skipping local device {device.get('device_name')} - port '{port_name}' (from interface_key '{device_interface_key}') not in selected interfaces {interfaces_to_show}")
                         continue  # Skip devices not from selected interfaces
                 
                 device_id = device.get("device_id")
@@ -307,7 +308,7 @@ class VXLANHandler:
                 key = device_id or device_name
                 if key and key not in device_map:
                     device_map[key] = device
-                    print(f"[VXLAN TAB] Added local-only device to map: {device_name}")
+                    # print(f"[VXLAN TAB] Added local-only device to map: {device_name}")
                 elif key in device_map:
                     # Device exists in both DB and local - DB is source of truth for applied tunnels
                     # Only merge if local has new tunnels not yet in DB
@@ -351,7 +352,8 @@ class VXLANHandler:
                             if vni and (isinstance(vni, str) and vni.strip()) or (not isinstance(vni, str) and vni):
                                 valid_db_tunnels.append(db_tunnel)
                             else:
-                                print(f"[VXLAN TAB] Filtering out empty DB tunnel (no VNI) for {device_name}")
+                                # print(f"[VXLAN TAB] Filtering out empty DB tunnel (no VNI) for {device_name}")
+                                pass
                     db_tunnels = valid_db_tunnels
                     
                     # For devices in DB, use DB tunnels as source of truth
@@ -369,20 +371,20 @@ class VXLANHandler:
                             if local_vni and local_vni not in db_vnis:
                                 # This is a new tunnel not yet in DB - add it
                                 merged_tunnels.append(local_tunnel)
-                                print(f"[VXLAN TAB] Adding new local tunnel VNI {local_vni} not yet in DB")
+                                # print(f"[VXLAN TAB] Adding new local tunnel VNI {local_vni} not yet in DB")
                     
                     if merged_tunnels:
-                        print(f"[VXLAN TAB] Merging: Using {len(db_tunnels)} DB tunnel(s) + {len([t for t in local_tunnels if isinstance(t, dict) and t.get('vni') not in db_vnis])} new local tunnel(s) = {len(merged_tunnels)} total for {device_name}")
+                        # print(f"[VXLAN TAB] Merging: Using {len(db_tunnels)} DB tunnel(s) + {len([t for t in local_tunnels if isinstance(t, dict) and t.get('vni') not in db_vnis])} new local tunnel(s) = {len(merged_tunnels)} total for {device_name}")
                         db_device["vxlan_config"] = {"tunnels": merged_tunnels}
                         if not db_device.get("vxlan_state") or db_device.get("vxlan_state") == "Disabled":
                             db_device["vxlan_state"] = "Pending"
                     elif db_tunnels:
                         # Only DB tunnels (no new local tunnels)
-                        print(f"[VXLAN TAB] Merging: Using {len(db_tunnels)} DB tunnel(s) for {device_name} (no new local tunnels)")
+                        # print(f"[VXLAN TAB] Merging: Using {len(db_tunnels)} DB tunnel(s) for {device_name} (no new local tunnels)")
                         db_device["vxlan_config"] = {"tunnels": db_tunnels}
                     else:
                         # No tunnels in DB and no new local tunnels - clear config
-                        print(f"[VXLAN TAB] Merging: No tunnels in DB or local for {device_name}, clearing config")
+                        # print(f"[VXLAN TAB] Merging: No tunnels in DB or local for {device_name}, clearing config")
                         db_device["vxlan_config"] = {}
 
             devices = list(device_map.values())
@@ -510,7 +512,7 @@ class VXLANHandler:
                         # Skip tunnels with empty VNI or no actual configuration
                         vni = tunnel_cfg.get('vni')
                         if not vni or (isinstance(vni, str) and not vni.strip()) or (vni is None):
-                            print(f"[VXLAN TAB] Skipping tunnel {tunnel_idx+1}/{len(tunnels)} for device {device.get('device_name')} - empty VNI")
+                            # print(f"[VXLAN TAB] Skipping tunnel {tunnel_idx+1}/{len(tunnels)} for device {device.get('device_name')} - empty VNI")
                             continue
                         
                         # Create a device copy for this tunnel (so each tunnel gets its own row)
@@ -573,7 +575,7 @@ class VXLANHandler:
 
     def _append_row(self, device, vxlan_cfg):
         row = self.parent.vxlan_table.rowCount()
-        print(f"[VXLAN TAB] _append_row: Inserting row {row} for device {device.get('device_name') or device.get('Device Name')}")
+        # print(f"[VXLAN TAB] _append_row: Inserting row {row} for device {device.get('device_name') or device.get('Device Name')}")
         self.parent.vxlan_table.insertRow(row)
 
         device_name = device.get("device_name") or device.get("Device Name") or "Unknown"
@@ -584,7 +586,7 @@ class VXLANHandler:
             display_name = f"{device_name} (Tunnel {tunnel_index + 1}/{tunnel_count})"
         else:
             display_name = device_name
-        print(f"[VXLAN TAB] _append_row: Setting device name '{display_name}' at row {row}, col {self.parent.VXLAN_COL['Device']}")
+        # print(f"[VXLAN TAB] _append_row: Setting device name '{display_name}' at row {row}, col {self.parent.VXLAN_COL['Device']}")
         device_item = QTableWidgetItem(display_name)
         self.parent.vxlan_table.setItem(row, self.parent.VXLAN_COL["Device"], device_item)
 
@@ -592,7 +594,7 @@ class VXLANHandler:
         state = (device.get("vxlan_state") or "Pending").strip()
         last_error = device.get("vxlan_last_error", "")
         
-        print(f"[VXLAN TAB] _append_row: Setting status for row {row}, state='{state}'")
+        # print(f"[VXLAN TAB] _append_row: Setting status for row {row}, state='{state}'")
 
         status_text = ""
         if state.lower() in {"configured", "up", "running"}:
@@ -616,32 +618,34 @@ class VXLANHandler:
         
         status_col_idx = self.parent.VXLAN_COL.get("Status")
         if status_col_idx is None:
-            print(f"[VXLAN TAB] _append_row: WARNING - Status column not found!")
+            # print(f"[VXLAN TAB] _append_row: WARNING - Status column not found!")
+            pass
         else:
             # Validate column index is within bounds
             max_col = self.parent.vxlan_table.columnCount()
             if status_col_idx < 0 or status_col_idx >= max_col:
-                print(f"[VXLAN TAB] _append_row: WARNING - Status column index {status_col_idx} is out of bounds (max: {max_col-1})")
+                # print(f"[VXLAN TAB] _append_row: WARNING - Status column index {status_col_idx} is out of bounds (max: {max_col-1})")
+                pass
             else:
-                print(f"[VXLAN TAB] _append_row: Setting status '{status_text}' at row {row}, col {status_col_idx}")
+                # print(f"[VXLAN TAB] _append_row: Setting status '{status_text}' at row {row}, col {status_col_idx}")
                 self.parent.vxlan_table.setItem(row, status_col_idx, status_item)
 
         def _set(col, value):
             col_idx = self.parent.VXLAN_COL.get(col)
             if col_idx is None:
-                print(f"[VXLAN TAB] _append_row: WARNING - Column '{col}' not found in VXLAN_COL")
+                # print(f"[VXLAN TAB] _append_row: WARNING - Column '{col}' not found in VXLAN_COL")
                 return
             # Validate column index is within bounds
             max_col = self.parent.vxlan_table.columnCount()
             if col_idx < 0 or col_idx >= max_col:
-                print(f"[VXLAN TAB] _append_row: WARNING - Column index {col_idx} for '{col}' is out of bounds (max: {max_col-1})")
+                # print(f"[VXLAN TAB] _append_row: WARNING - Column index {col_idx} for '{col}' is out of bounds (max: {max_col-1})")
                 return
             item = QTableWidgetItem(str(value) if value else "")
             item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             self.parent.vxlan_table.setItem(row, col_idx, item)
-            print(f"[VXLAN TAB] _append_row: Set {col}='{value}' at row {row}, col {col_idx}")
+            # print(f"[VXLAN TAB] _append_row: Set {col}='{value}' at row {row}, col {col_idx}")
 
-        print(f"[VXLAN TAB] _append_row: vxlan_cfg type: {type(vxlan_cfg)}, keys: {list(vxlan_cfg.keys()) if isinstance(vxlan_cfg, dict) else 'N/A'}")
+        # print(f"[VXLAN TAB] _append_row: vxlan_cfg type: {type(vxlan_cfg)}, keys: {list(vxlan_cfg.keys()) if isinstance(vxlan_cfg, dict) else 'N/A'}")
         # Prioritize tunnel-specific interface name over device-level (which is comma-separated for multiple tunnels)
         tunnel_interface = vxlan_cfg.get("vxlan_interface") if isinstance(vxlan_cfg, dict) else None
         if tunnel_interface:
@@ -712,7 +716,7 @@ class VXLANHandler:
             if item:
                 item.setData(Qt.UserRole, metadata)
         
-        print(f"[VXLAN TAB] _append_row: Completed row {row}, table now has {self.parent.vxlan_table.rowCount()} rows")
+        # print(f"[VXLAN TAB] _append_row: Completed row {row}, table now has {self.parent.vxlan_table.rowCount()} rows")
 
     def _cleanup_vxlan_table_for_device(self, device_id, device_name):
         """Clean up VXLAN table entries for a removed device."""

@@ -35,10 +35,21 @@ class AddStreamDialog(QDialog):
         self.server_interfaces = server_interfaces or []
 
         self.setWindowTitle("Add/Edit Traffic Stream")
-        self.setGeometry(200, 200, 1400, 700)
+        self.setGeometry(200, 200, 1000, 700)
+        self.setMinimumSize(900, 500)  # Reduced minimum width
+        self.setMaximumSize(1200, 750)  # Reduced maximum width
+        # Set smaller base font size
+        font = self.font()
+        font.setPointSize(10)  # Reduced from default 13
+        self.setFont(font)
+        
+        # Apply professional styling
+        self._apply_professional_styling()
 
         # Tabs
         self.tabs = QTabWidget()
+        # Enable scroll buttons for main tabs if they overflow
+        self.tabs.setUsesScrollButtons(True)
 
         # Protocol Selection Tab
         self.protocol_tab = QWidget()
@@ -82,15 +93,30 @@ class AddStreamDialog(QDialog):
         self.scroll_area = QScrollArea()
         self.scroll_area.setWidgetResizable(True)
         self.scroll_area.setWidget(self.tabs)
+        self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
 
         # Main Layout
         self.main_layout = QVBoxLayout()
         self.main_layout.addWidget(self.scroll_area)
 
-        # Buttons
+        # Buttons with professional styling
         self.buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         self.buttons.accepted.connect(self.accept)
         self.buttons.rejected.connect(self.reject)
+        
+        # Style the buttons - more compact
+        ok_button = self.buttons.button(QDialogButtonBox.Ok)
+        cancel_button = self.buttons.button(QDialogButtonBox.Cancel)
+        if ok_button:
+            ok_button.setText("Save")
+            ok_button.setMinimumWidth(80)
+            ok_button.setMinimumHeight(26)
+        if cancel_button:
+            cancel_button.setText("Cancel")
+            cancel_button.setMinimumWidth(80)
+            cancel_button.setMinimumHeight(26)
+        
         self.main_layout.addWidget(self.buttons)
         self.setLayout(self.main_layout)
 
@@ -103,6 +129,258 @@ class AddStreamDialog(QDialog):
 
         # Dynamic updates for Packet View
         self.connect_protocol_data_to_packet_view()
+
+    def _apply_professional_styling(self):
+        """Apply professional styling to the dialog."""
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #ffffff;
+                font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
+                font-size: 10px;
+            }
+            
+            QTabWidget::pane {
+                border: 1px solid #d1d5db;
+                border-radius: 6px;
+                background-color: #ffffff;
+                top: -1px;
+            }
+            
+            QTabBar::tab {
+                background-color: #f3f4f6;
+                color: #4b5563;
+                border: 1px solid #d1d5db;
+                border-bottom: none;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+                padding: 4px 8px;
+                margin-right: 1px;
+                font-weight: 500;
+                font-size: 9px;
+                min-width: 60px;
+                max-width: 80px;
+            }
+            
+            QTabWidget::pane {
+                border: 1px solid #d1d5db;
+                border-radius: 4px;
+                background-color: #ffffff;
+                top: -1px;
+            }
+            
+            QTabBar::tab:selected {
+                background-color: #ffffff;
+                color: #1f2937;
+                border-bottom: 2px solid #3b82f6;
+                font-weight: 600;
+            }
+            
+            QTabBar::tab:hover:!selected {
+                background-color: #e5e7eb;
+                color: #374151;
+            }
+            
+            QGroupBox {
+                font-weight: 600;
+                font-size: 11px;
+                color: #1f2937;
+                border: 2px solid #e5e7eb;
+                border-radius: 6px;
+                margin-top: 8px;
+                padding-top: 10px;
+                padding-bottom: 8px;
+                background-color: #f9fafb;
+            }
+            
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                left: 12px;
+                padding: 0 8px;
+                background-color: #ffffff;
+                color: #1f2937;
+            }
+            
+            QFormLayout {
+                spacing: 12px;
+            }
+            
+            QFormLayout QLabel {
+                color: #374151;
+                font-weight: 500;
+                font-size: 10px;
+                min-width: 120px;
+            }
+            
+            QLineEdit, QComboBox, QSpinBox, QTextEdit {
+                border: 1px solid #d1d5db;
+                border-radius: 4px;
+                padding: 4px 8px;
+                background-color: #ffffff;
+                color: #1f2937;
+                font-size: 10px;
+                min-height: 18px;
+            }
+            
+            QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QTextEdit:focus {
+                border: 2px solid #3b82f6;
+                background-color: #f0f9ff;
+            }
+            
+            QLineEdit:hover, QComboBox:hover, QSpinBox:hover {
+                border: 1px solid #9ca3af;
+            }
+            
+            QComboBox::drop-down {
+                border: none;
+                width: 30px;
+            }
+            
+            QComboBox::down-arrow {
+                image: none;
+                border-left: 4px solid transparent;
+                border-right: 4px solid transparent;
+                border-top: 6px solid #6b7280;
+                width: 0;
+                height: 0;
+            }
+            
+            QComboBox QAbstractItemView {
+                border: 1px solid #d1d5db;
+                border-radius: 6px;
+                background-color: #ffffff;
+                selection-background-color: #dbeafe;
+                selection-color: #1e40af;
+                padding: 4px;
+            }
+            
+            QPushButton {
+                background-color: #3b82f6;
+                color: #ffffff;
+                border: none;
+                border-radius: 4px;
+                padding: 6px 16px;
+                font-weight: 600;
+                font-size: 10px;
+                min-height: 28px;
+            }
+            
+            QPushButton:hover {
+                background-color: #2563eb;
+            }
+            
+            QPushButton:pressed {
+                background-color: #1d4ed8;
+            }
+            
+            QPushButton:disabled {
+                background-color: #9ca3af;
+                color: #d1d5db;
+            }
+            
+            QDialogButtonBox QPushButton[text="Cancel"] {
+                background-color: #ffffff;
+                color: #374151;
+                border: 1px solid #d1d5db;
+            }
+            
+            QDialogButtonBox QPushButton[text="Cancel"]:hover {
+                background-color: #f9fafb;
+                border-color: #9ca3af;
+            }
+            
+            QDialogButtonBox QPushButton[text="Save"] {
+                background-color: #3b82f6;
+                color: #ffffff;
+            }
+            
+            QDialogButtonBox QPushButton[text="Save"]:hover {
+                background-color: #2563eb;
+            }
+            
+            QCheckBox, QRadioButton {
+                color: #374151;
+                font-weight: 500;
+                font-size: 10px;
+                spacing: 6px;
+            }
+            
+            QCheckBox::indicator, QRadioButton::indicator {
+                width: 14px;
+                height: 14px;
+                border: 2px solid #d1d5db;
+                border-radius: 3px;
+                background-color: #ffffff;
+            }
+            
+            QCheckBox::indicator:checked, QRadioButton::indicator:checked {
+                background-color: #3b82f6;
+                border-color: #3b82f6;
+            }
+            
+            QCheckBox::indicator:checked {
+                background-color: #3b82f6;
+                border-color: #3b82f6;
+            }
+            
+            QCheckBox::indicator:hover, QRadioButton::indicator:hover {
+                border-color: #3b82f6;
+            }
+            
+            QScrollArea {
+                border: none;
+                background-color: #ffffff;
+            }
+            
+            QScrollBar:vertical {
+                border: none;
+                background-color: #f3f4f6;
+                width: 12px;
+                border-radius: 6px;
+            }
+            
+            QScrollBar::handle:vertical {
+                background-color: #d1d5db;
+                border-radius: 6px;
+                min-height: 30px;
+            }
+            
+            QScrollBar::handle:vertical:hover {
+                background-color: #9ca3af;
+            }
+            
+            QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {
+                height: 0px;
+            }
+            
+            QTableWidget {
+                border: 1px solid #e5e7eb;
+                border-radius: 6px;
+                background-color: #ffffff;
+                gridline-color: #f3f4f6;
+            }
+            
+            QTableWidget::item {
+                padding: 4px;
+                border: none;
+                font-size: 10px;
+            }
+            
+            QTableWidget::item:selected {
+                background-color: #dbeafe;
+                color: #1e40af;
+            }
+            
+            QHeaderView::section {
+                background-color: #f9fafb;
+                color: #374151;
+                padding: 6px;
+                border: none;
+                border-bottom: 2px solid #e5e7eb;
+                font-weight: 600;
+                font-size: 10px;
+            }
+        """)
 
     # ----------------------------- Tabs & Sections -----------------------------
 
@@ -117,9 +395,11 @@ class AddStreamDialog(QDialog):
         stream_data['dpdk_enable'] (bool). Default is Scapy/kernel path.
         """
         layout = QVBoxLayout()
+        layout.setSpacing(20)
+        layout.setContentsMargins(20, 20, 20, 20)
 
         # Header
-        header = QLabel("<b>Runtime Engine</b>")
+        header = QLabel("<h3 style='color: #1f2937; margin-bottom: 8px;'>Runtime Engine</h3>")
         header.setTextFormat(Qt.RichText)
         layout.addWidget(header)
 
@@ -139,7 +419,7 @@ class AddStreamDialog(QDialog):
             "When enabled, this stream will be transmitted by the DPDK worker.\n"
             "Otherwise the Scapy/kernel path is used."
         )
-        hint.setStyleSheet("color: gray;")
+        hint.setStyleSheet("color: #6b7280; font-size: 12px; padding-top: 8px;")
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
@@ -210,10 +490,14 @@ class AddStreamDialog(QDialog):
     def setup_stream_control_tab(self):
         """Sets up the Stream Control Tab with rate control and duration settings."""
         control_layout = QVBoxLayout()
+        control_layout.setSpacing(20)
+        control_layout.setContentsMargins(20, 20, 20, 20)
 
         # --- Rate Control ---
         rate_group = QGroupBox("Rate Control")
         rate_layout = QFormLayout()
+        rate_layout.setSpacing(12)
+        rate_layout.setContentsMargins(16, 20, 16, 16)
 
         self.rate_type_dropdown = QComboBox()
         self.rate_type_dropdown.addItems([
@@ -263,6 +547,8 @@ class AddStreamDialog(QDialog):
         # --- Duration Control ---
         duration_group = QGroupBox("Duration Control")
         duration_layout = QFormLayout()
+        duration_layout.setSpacing(12)
+        duration_layout.setContentsMargins(16, 20, 16, 16)
 
         self.duration_mode_dropdown = QComboBox()
         self.duration_mode_dropdown.addItems(["Continuous", "Seconds"])
@@ -289,27 +575,30 @@ class AddStreamDialog(QDialog):
         QTimer.singleShot(0, _apply_duration_ui_state)
 
     def setup_protocol_selection_tab(self):
-        self.protocol_tab_layout.setSpacing(5)
-        self.protocol_tab_layout.setContentsMargins(10, 5, 10, 5)
+        self.protocol_tab_layout.setContentsMargins(6, 10, 10, 10)  # Reduced left margin to move content left
+        self.protocol_tab_layout.setSpacing(6)  # Reduced spacing between sections
 
-        # Basics
+        # Basics - Improved layout with better organization
         basics_group = QGroupBox("Basics")
         basics_layout = QGridLayout()
-        basics_layout.setContentsMargins(10, 5, 10, 5)
-        basics_layout.setHorizontalSpacing(15)
-        basics_layout.setVerticalSpacing(8)
+        basics_layout.setContentsMargins(10, 8, 10, 8)  # Reduced margins
+        basics_layout.setHorizontalSpacing(8)  # Reduced horizontal spacing
+        basics_layout.setVerticalSpacing(6)  # Reduced vertical spacing
+        basics_layout.setColumnStretch(1, 1)
+        basics_layout.setColumnStretch(3, 1)
+        basics_layout.setColumnStretch(5, 1)
 
         self.stream_name = QLineEdit()
-        self.stream_name.setMinimumWidth(120)
+        self.stream_name.setMinimumWidth(200)
         self.enabled_checkbox = QCheckBox("Enabled")
         self.details_field = QLineEdit()
-        self.details_field.setMinimumWidth(180)
+        self.details_field.setMinimumWidth(200)
 
         self.rx_port_dropdown = QComboBox()
-        self.rx_port_dropdown.setMinimumWidth(180)
+        self.rx_port_dropdown.setMinimumWidth(200)
         self.rx_port_dropdown.addItem("Same as TX Port")
 
-        self.flow_tracking_checkbox = QCheckBox("Enable")
+        self.flow_tracking_checkbox = QCheckBox("Enable Flow Tracking")
         self.flow_tracking_checkbox.setChecked(False)
 
         if hasattr(self, "dpdk_enable_checkbox"):
@@ -318,133 +607,150 @@ class AddStreamDialog(QDialog):
                      str(stream_data.get("engine", "")).lower() == "dpdk")
             )
 
+        # Row 0: Name and Enabled
         basics_layout.addWidget(QLabel("Name:"), 0, 0, alignment=Qt.AlignRight | Qt.AlignVCenter)
         basics_layout.addWidget(self.stream_name, 0, 1)
         basics_layout.addWidget(QLabel("Enabled:"), 0, 2, alignment=Qt.AlignRight | Qt.AlignVCenter)
         basics_layout.addWidget(self.enabled_checkbox, 0, 3)
-        basics_layout.addWidget(QLabel("Details:"), 0, 4, alignment=Qt.AlignRight | Qt.AlignVCenter)
-        basics_layout.addWidget(self.details_field, 0, 5)
-        basics_layout.addWidget(QLabel("RX Port:"), 0, 6, alignment=Qt.AlignRight | Qt.AlignVCenter)
-        basics_layout.addWidget(self.rx_port_dropdown, 0, 7)
-        basics_layout.addWidget(QLabel("Flow Tracking:"), 0, 8)
-        basics_layout.addWidget(self.flow_tracking_checkbox, 0, 9)
+        
+        # Row 1: Details and RX Port
+        basics_layout.addWidget(QLabel("Details:"), 1, 0, alignment=Qt.AlignRight | Qt.AlignVCenter)
+        basics_layout.addWidget(self.details_field, 1, 1)
+        basics_layout.addWidget(QLabel("RX Port:"), 1, 2, alignment=Qt.AlignRight | Qt.AlignVCenter)
+        basics_layout.addWidget(self.rx_port_dropdown, 1, 3)
+        
+        # Row 2: Flow Tracking
+        basics_layout.addWidget(QLabel("Flow Tracking:"), 2, 0, alignment=Qt.AlignRight | Qt.AlignVCenter)
+        basics_layout.addWidget(self.flow_tracking_checkbox, 2, 1)
 
         basics_group.setLayout(basics_layout)
         self.protocol_tab_layout.addWidget(basics_group)
 
-        # Frame Length
+        # Frame Length - Improved layout with reduced spacing
         frame_length_group = QGroupBox("Frame Length (including FCS)")
         frame_length_layout = QGridLayout()
-        frame_length_layout.setContentsMargins(5, 5, 5, 5)
-        frame_length_layout.setSpacing(2)
+        frame_length_layout.setContentsMargins(0, 8, 10, 8)  # No left margin to indent content fully to the left
+        frame_length_layout.setSpacing(6)  # Reduced spacing
+        frame_length_layout.setHorizontalSpacing(0)  # No horizontal spacing between columns
+        # Don't stretch label columns (0, 2) - keep them compact
+        frame_length_layout.setColumnStretch(0, 0)  # Label column - no stretch
+        frame_length_layout.setColumnStretch(1, 1)  # Input column - stretch
+        frame_length_layout.setColumnStretch(2, 0)  # Label column - no stretch
+        frame_length_layout.setColumnStretch(3, 1)  # Input column - stretch
+        # Remove minimum width - let labels size naturally to their content
 
         self.frame_type = QComboBox()
         self.frame_type.addItems(["Fixed", "Random", "IMIX"])
+        self.frame_type.setMinimumWidth(120)
+        self.frame_type.setMaximumWidth(200)
         self.frame_min = QLineEdit("64")
+        self.frame_min.setMinimumWidth(80)
+        self.frame_min.setMaximumWidth(120)
         self.frame_max = QLineEdit("1518")
+        self.frame_max.setMinimumWidth(80)
+        self.frame_max.setMaximumWidth(120)
         self.frame_size = QLineEdit("64")
+        self.frame_size.setMinimumWidth(80)
+        self.frame_size.setMaximumWidth(120)
         self.frame_min.setValidator(QIntValidator(64, 1518))
         self.frame_max.setValidator(QIntValidator(64, 1518))
         self.frame_size.setValidator(QIntValidator(64, 1518))
 
-        frame_length_layout.addWidget(QLabel("Frame Type:"), 0, 0)
+        # Create labels with minimal spacing
+        frame_type_label = QLabel("Frame Type:")
+        frame_type_label.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Preferred)
+        frame_length_layout.addWidget(frame_type_label, 0, 0, alignment=Qt.AlignRight | Qt.AlignVCenter)
         frame_length_layout.addWidget(self.frame_type, 0, 1)
-        frame_length_layout.addWidget(QLabel("Min:"), 1, 0)
+        
+        fixed_size_label = QLabel("Fixed Size:")
+        fixed_size_label.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Preferred)
+        frame_length_layout.addWidget(fixed_size_label, 0, 2, alignment=Qt.AlignRight | Qt.AlignVCenter)
+        frame_length_layout.addWidget(self.frame_size, 0, 3)
+        
+        min_label = QLabel("Min:")
+        min_label.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Preferred)
+        frame_length_layout.addWidget(min_label, 1, 0, alignment=Qt.AlignRight | Qt.AlignVCenter)
         frame_length_layout.addWidget(self.frame_min, 1, 1)
-        frame_length_layout.addWidget(QLabel("Max:"), 1, 2)
+        
+        max_label = QLabel("Max:")
+        max_label.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Preferred)
+        frame_length_layout.addWidget(max_label, 1, 2, alignment=Qt.AlignRight | Qt.AlignVCenter)
         frame_length_layout.addWidget(self.frame_max, 1, 3)
-        frame_length_layout.addWidget(QLabel("Fixed Size:"), 2, 0)
-        frame_length_layout.addWidget(self.frame_size, 2, 1)
+        
         frame_length_group.setLayout(frame_length_layout)
-        frame_length_group.setMaximumHeight(110)
+        # Remove any extra margins from the group box
+        frame_length_group.setContentsMargins(0, 0, 0, 0)
         self.protocol_tab_layout.addWidget(frame_length_group)
 
-        # Simple Sections
-        simple_group = QGroupBox("Simple")
-        simple_layout = QGridLayout()
-        simple_layout.setContentsMargins(5, 5, 5, 5)
-        simple_layout.setSpacing(5)
+        # Protocol Stack Sections - Improved layout with better spacing and alignment
+        protocol_stack_group = QGroupBox("Protocol Stack")
+        protocol_stack_layout = QGridLayout()
+        protocol_stack_layout.setContentsMargins(12, 10, 12, 10)  # Reduced vertical margins
+        protocol_stack_layout.setSpacing(6)  # Reduced spacing
+        protocol_stack_layout.setHorizontalSpacing(8)  # Reduced horizontal spacing
+        protocol_stack_layout.setVerticalSpacing(6)  # Reduced vertical spacing
+        # Make columns equal width
+        for col in range(5):
+            protocol_stack_layout.setColumnStretch(col, 1)
+
+        # Helper function to create consistent group boxes
+        def create_protocol_group(title, options, checked_index=0):
+            group = QGroupBox(title)
+            layout = QVBoxLayout()
+            layout.setContentsMargins(8, 8, 8, 8)  # Reduced margins
+            layout.setSpacing(3)  # Reduced spacing
+            radio_buttons = []
+            for i, option in enumerate(options):
+                rb = QRadioButton(option)
+                rb.setStyleSheet("font-size: 10px; padding: 1px;")  # Reduced padding
+                if i == checked_index:
+                    rb.setChecked(True)
+                layout.addWidget(rb)
+                radio_buttons.append(rb)
+            group.setLayout(layout)
+            group.setMinimumWidth(120)
+            group.setMaximumWidth(180)
+            return group, radio_buttons
 
         # L1
-        l1_group = QGroupBox("L1")
-        l1_layout = QVBoxLayout()
-        self.l1_none = QRadioButton("None")
-        self.l1_mac = QRadioButton("MAC")
-        self.l1_raw = QRadioButton("RAW")
-        self.l1_none.setChecked(True)
-        for w in (self.l1_none, self.l1_mac, self.l1_raw):
-            l1_layout.addWidget(w)
-        l1_group.setLayout(l1_layout)
-        simple_layout.addWidget(l1_group, 0, 0)
+        l1_group, l1_buttons = create_protocol_group("L1", ["None", "MAC", "RAW"])
+        self.l1_none, self.l1_mac, self.l1_raw = l1_buttons
+        protocol_stack_layout.addWidget(l1_group, 0, 0)
 
         # VLAN
-        vlan_group = QGroupBox("VLAN")
-        vlan_layout = QVBoxLayout()
-        self.vlan_untagged = QRadioButton("Untagged")
-        self.vlan_tagged = QRadioButton("Tagged")
-        self.vlan_stacked = QRadioButton("Stacked")
-        self.vlan_untagged.setChecked(True)
-        for w in (self.vlan_untagged, self.vlan_tagged, self.vlan_stacked):
-            vlan_layout.addWidget(w)
-        vlan_group.setLayout(vlan_layout)
-        simple_layout.addWidget(vlan_group, 0, 1)
+        vlan_group, vlan_buttons = create_protocol_group("VLAN", ["Untagged", "Tagged", "Stacked"])
+        self.vlan_untagged, self.vlan_tagged, self.vlan_stacked = vlan_buttons
+        protocol_stack_layout.addWidget(vlan_group, 0, 1)
 
         # L2
-        l2_group = QGroupBox("L2")
-        l2_layout = QVBoxLayout()
-        self.l2_none = QRadioButton("None")
-        self.l2_ethernet = QRadioButton("Ethernet II")
-        self.l2_mpls = QRadioButton("MPLS")
-        self.l2_none.setChecked(True)
-        for w in (self.l2_none, self.l2_ethernet, self.l2_mpls):
-            l2_layout.addWidget(w)
-        l2_group.setLayout(l2_layout)
-        simple_layout.addWidget(l2_group, 0, 2)
+        l2_group, l2_buttons = create_protocol_group("L2", ["None", "Ethernet II", "MPLS"])
+        self.l2_none, self.l2_ethernet, self.l2_mpls = l2_buttons
+        protocol_stack_layout.addWidget(l2_group, 0, 2)
 
-        # L3
-        l3_group = QGroupBox("L3")
-        l3_layout = QVBoxLayout()
-        self.l3_none = QRadioButton("None")
-        self.l3_arp = QRadioButton("ARP")
-        self.l3_ipv4 = QRadioButton("IPv4")
-        self.l3_ipv6 = QRadioButton("IPv6")
-        self.l3_none.setChecked(True)
-        for w in (self.l3_none, self.l3_arp, self.l3_ipv4, self.l3_ipv6):
-            l3_layout.addWidget(w)
-        l3_group.setLayout(l3_layout)
-        simple_layout.addWidget(l3_group, 1, 0)
-
-        # L4
-        l4_group = QGroupBox("L4")
-        l4_layout = QVBoxLayout()
-        self.l4_none = QRadioButton("None")
-        self.l4_icmp = QRadioButton("ICMP")
-        self.l4_igmp = QRadioButton("IGMP")
-        self.l4_tcp = QRadioButton("TCP")
-        self.l4_udp = QRadioButton("UDP")
-        self.l4_rocev2 = QRadioButton("RoCEv2")
-        self.l4_uec = QRadioButton("UEC")
-        self.l4_none.setChecked(True)
-        for w in (self.l4_none, self.l4_icmp, self.l4_igmp, self.l4_tcp, self.l4_udp, self.l4_rocev2, self.l4_uec):
-            l4_layout.addWidget(w)
-        l4_group.setLayout(l4_layout)
-        simple_layout.addWidget(l4_group, 1, 1)
+        # L4 (first instance - top row)
+        l4_group_1, l4_buttons_1 = create_protocol_group("L4", ["None", "ICMP", "IGMP", "TCP", "UDP"])
+        self.l4_none_1, self.l4_icmp, self.l4_igmp, self.l4_tcp, self.l4_udp = l4_buttons_1
+        protocol_stack_layout.addWidget(l4_group_1, 0, 3)
 
         # Payload
-        payload_group = QGroupBox("Payload")
-        payload_layout = QVBoxLayout()
-        self.payload_none = QRadioButton("None")
-        self.payload_pattern = QRadioButton("Pattern")
-        self.payload_hex = QRadioButton("Hex Dump")
-        self.payload_none.setChecked(True)
-        for w in (self.payload_none, self.payload_pattern, self.payload_hex):
-            payload_layout.addWidget(w)
-        payload_group.setLayout(payload_layout)
-        simple_layout.addWidget(payload_group, 1, 2)
+        payload_group, payload_buttons = create_protocol_group("Payload", ["None", "Pattern", "Random", "From File"])
+        self.payload_none, self.payload_pattern, self.payload_random, self.payload_from_file = payload_buttons
+        self.payload_hex = self.payload_from_file  # Map From File to hex for compatibility
+        protocol_stack_layout.addWidget(payload_group, 0, 4)
 
-        simple_group.setLayout(simple_layout)
-        self.protocol_tab_layout.addWidget(simple_group)
-        self.protocol_tab_layout.addStretch(1)
+        # L3 (second row)
+        l3_group, l3_buttons = create_protocol_group("L3", ["None", "ARP", "IPv4", "IPv6"])
+        self.l3_none, self.l3_arp, self.l3_ipv4, self.l3_ipv6 = l3_buttons
+        protocol_stack_layout.addWidget(l3_group, 1, 0)
+
+        # L4 (second instance - second row)
+        l4_group_2, l4_buttons_2 = create_protocol_group("L4", ["None", "RoCEv2", "UEC"])
+        self.l4_none_2, self.l4_rocev2, self.l4_uec = l4_buttons_2
+        protocol_stack_layout.addWidget(l4_group_2, 1, 1)
+
+        protocol_stack_group.setLayout(protocol_stack_layout)
+        self.protocol_tab_layout.addWidget(protocol_stack_group)
+        # Don't add stretch to prevent content from being cut off
 
         # VLAN Toggle section
         for rb in [self.vlan_untagged, self.vlan_tagged, self.vlan_stacked]:
@@ -452,30 +758,155 @@ class AddStreamDialog(QDialog):
 
         QTimer.singleShot(0, self.refresh_vlan_section)  # initial sync
 
-
         # L3 Toggle section
         for rb in [self.l3_none, self.l3_arp, self.l3_ipv4, self.l3_ipv6]:
             rb.toggled.connect(self.refresh_l3_sections)
         QTimer.singleShot(0, self.refresh_l3_sections)
 
-
-        # L4 toggle section
-        for rb in (self.l4_none, self.l4_icmp, self.l4_igmp, self.l4_tcp, self.l4_udp, self.l4_rocev2, self.l4_uec):
+        # L4 toggle section - connect both L4 groups
+        # Create a unified l4_none reference for backward compatibility
+        self.l4_none = self.l4_none_1  # Use first L4 None as primary
+        for rb in (self.l4_none_1, self.l4_icmp, self.l4_igmp, self.l4_tcp, self.l4_udp):
+            rb.toggled.connect(self.refresh_l4_sections)
+        for rb in (self.l4_none_2, self.l4_rocev2, self.l4_uec):
             rb.toggled.connect(self.refresh_l4_sections)
         QTimer.singleShot(0, self.refresh_l4_sections)
 
+    def _create_scrollable_tab(self, section_group, tab_name):
+        """Helper method to create a scrollable tab with a section group."""
+        # Create scroll area
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QScrollArea.NoFrame)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        
+        # Create content widget - remove width constraints to fill available space
+        content_widget = QWidget()
+        content_layout = QVBoxLayout()
+        content_layout.setContentsMargins(10, 10, 10, 10)
+        content_layout.setSpacing(8)
+        
+        # Set size policy for the group box to expand and fill available width
+        section_group.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        
+        # Add the section group
+        content_layout.addWidget(section_group)
+        content_layout.addStretch()
+        
+        content_widget.setLayout(content_layout)
+        scroll_area.setWidget(content_widget)
+        
+        return scroll_area
+    
     def setup_protocol_data_tab(self):
+        self.protocol_data_layout.setSpacing(8)
+        self.protocol_data_layout.setContentsMargins(10, 10, 10, 10)
+        
+        # Create a tab widget for sub-tabs under Protocol Data
+        self.protocol_data_tabs = QTabWidget()
+        self.protocol_data_tabs.setTabPosition(QTabWidget.North)
+        # Enable scrolling for tabs when they overflow
+        self.protocol_data_tabs.setUsesScrollButtons(True)
+        # Set tab bar to wrap or use elide mode
+        tab_bar = self.protocol_data_tabs.tabBar()
+        tab_bar.setElideMode(Qt.ElideRight)  # Elide text if too long
+        tab_bar.setExpanding(False)  # Don't expand tabs to fill space
+        
+        # Create individual scrollable tabs for each section
+        # MAC Tab
         self.add_mac_section()
+        mac_scroll = self._create_scrollable_tab(self.mac_group, "MAC")
+        self.protocol_data_tabs.addTab(mac_scroll, "MAC")
+        
+        # ARP Tab
         self.add_arp_section()
+        arp_scroll = self._create_scrollable_tab(self.arp_group, "ARP")
+        self.protocol_data_tabs.addTab(arp_scroll, "ARP")
+        
+        # VLAN Tab
         self.add_vlan_section()
+        vlan_scroll = self._create_scrollable_tab(self.vlan_group, "VLAN")
+        self.protocol_data_tabs.addTab(vlan_scroll, "VLAN")
+        
+        # IPv4 Tab
         self.add_ipv4_section()
+        ipv4_scroll = self._create_scrollable_tab(self.ipv4_group, "IPv4")
+        self.protocol_data_tabs.addTab(ipv4_scroll, "IPv4")
+        
+        # IPv6 Tab
         self.add_ipv6_section()
+        ipv6_scroll = self._create_scrollable_tab(self.ipv6_group, "IPv6")
+        self.protocol_data_tabs.addTab(ipv6_scroll, "IPv6")
+        
+        # TCP Tab
         self.add_tcp_section()
+        tcp_scroll = self._create_scrollable_tab(self.tcp_group, "TCP")
+        self.protocol_data_tabs.addTab(tcp_scroll, "TCP")
+        
+        # UDP Tab
         self.add_udp_section()
+        udp_scroll = self._create_scrollable_tab(self.udp_group, "UDP")
+        self.protocol_data_tabs.addTab(udp_scroll, "UDP")
+        
+        # MPLS Tab
         self.add_mpls_section()
+        mpls_scroll = self._create_scrollable_tab(self.mpls_group, "MPLS")
+        self.protocol_data_tabs.addTab(mpls_scroll, "MPLS")
+        
+        # Payload Tab
         self.add_payload_data_section()
+        payload_scroll = self._create_scrollable_tab(self.payload_group, "Payload")
+        self.protocol_data_tabs.addTab(payload_scroll, "Payload")
+        
+        # RoCEv2 Tab
         self.add_rocev2_section()
+        rocev2_scroll = self._create_scrollable_tab(self.rocev2_group, "RoCEv2")
+        self.protocol_data_tabs.addTab(rocev2_scroll, "RoCEv2")
+        
+        # UEC Tab
         self.add_uec_section()
+        uec_scroll = self._create_scrollable_tab(self.uec_group, "UEC")
+        self.protocol_data_tabs.addTab(uec_scroll, "UEC")
+        
+        # Apply compact styling to protocol data tabs to prevent overflow
+        self.protocol_data_tabs.setStyleSheet("""
+            QTabWidget::pane {
+                border: 1px solid #d1d5db;
+                border-radius: 4px;
+                background-color: #ffffff;
+            }
+            QTabBar::tab {
+                background-color: #f3f4f6;
+                color: #4b5563;
+                border: 1px solid #d1d5db;
+                border-bottom: none;
+                border-top-left-radius: 3px;
+                border-top-right-radius: 3px;
+                padding: 3px 6px;
+                margin-right: 1px;
+                font-weight: 500;
+                font-size: 9px;
+                min-width: 45px;
+                max-width: 65px;
+            }
+            QTabBar::tab:selected {
+                background-color: #ffffff;
+                color: #1f2937;
+                border-bottom: 2px solid #3b82f6;
+                font-weight: 600;
+            }
+            QTabBar::tab:hover:!selected {
+                background-color: #e5e7eb;
+                color: #374151;
+            }
+            QTabBar::scroller {
+                width: 20px;
+            }
+        """)
+        
+        # Add the tab widget to the main protocol data layout
+        self.protocol_data_layout.addWidget(self.protocol_data_tabs)
 
     # ----------------------------- RX ports -----------------------------
 
@@ -526,36 +957,60 @@ class AddStreamDialog(QDialog):
     def add_mac_section(self):
         mac_group = QGroupBox("MAC (Media Access Protocol)")
         mac_layout = QGridLayout()
+        mac_layout.setSpacing(8)
+        # Make columns expand to fill available space
+        mac_layout.setColumnStretch(0, 0)  # Label column - fixed
+        mac_layout.setColumnStretch(1, 0)  # Mode dropdown - fixed
+        mac_layout.setColumnStretch(2, 2)  # Address field - expand more
+        mac_layout.setColumnStretch(3, 0)  # Count label - fixed
+        mac_layout.setColumnStretch(4, 0)  # Count field - fixed
+        mac_layout.setColumnStretch(5, 0)  # Step label - fixed
+        mac_layout.setColumnStretch(6, 0)  # Step field - fixed
+        mac_layout.setColumnMinimumWidth(2, 140)  # Minimum width for address field
 
-        # Destination
-        mac_layout.addWidget(QLabel("Destination"), 0, 0)
+        # Destination - reorganize to fit better
+        mac_layout.addWidget(QLabel("Destination:"), 0, 0)
         self.mac_destination_mode = QComboBox()
         self.mac_destination_mode.addItems(["Fixed", "Increment", "Decrement"])
+        self.mac_destination_mode.setMinimumWidth(90)
+        self.mac_destination_mode.setMaximumWidth(120)
         self.mac_destination_address = QLineEdit("00:00:00:00:00:00")
+        self.mac_destination_address.setMinimumWidth(140)
         self.mac_destination_count = QLineEdit("16")
+        self.mac_destination_count.setMinimumWidth(50)
+        self.mac_destination_count.setMaximumWidth(80)
         self.mac_destination_step = QLineEdit("1")
+        self.mac_destination_step.setMinimumWidth(50)
+        self.mac_destination_step.setMaximumWidth(80)
         mac_layout.addWidget(self.mac_destination_mode, 0, 1)
         mac_layout.addWidget(self.mac_destination_address, 0, 2)
-        mac_layout.addWidget(QLabel("Count"), 0, 3)
+        mac_layout.addWidget(QLabel("Count:"), 0, 3)
         mac_layout.addWidget(self.mac_destination_count, 0, 4)
-        mac_layout.addWidget(QLabel("Step"), 0, 5)
+        mac_layout.addWidget(QLabel("Step:"), 0, 5)
         mac_layout.addWidget(self.mac_destination_step, 0, 6)
         self.mac_destination_mode.currentTextChanged.connect(
             lambda mode: self.toggle_mac_fields(mode, self.mac_destination_count, self.mac_destination_step)
         )
 
-        # Source
-        mac_layout.addWidget(QLabel("Source"), 1, 0)
+        # Source - reorganize to fit better
+        mac_layout.addWidget(QLabel("Source:"), 1, 0)
         self.mac_source_mode = QComboBox()
         self.mac_source_mode.addItems(["Fixed", "Increment", "Decrement", "Resolve"])
+        self.mac_source_mode.setMinimumWidth(90)
+        self.mac_source_mode.setMaximumWidth(120)
         self.mac_source_address = QLineEdit("00:00:00:00:00:00")
+        self.mac_source_address.setMinimumWidth(140)
         self.mac_source_count = QLineEdit("16")
+        self.mac_source_count.setMinimumWidth(50)
+        self.mac_source_count.setMaximumWidth(80)
         self.mac_source_step = QLineEdit("1")
+        self.mac_source_step.setMinimumWidth(50)
+        self.mac_source_step.setMaximumWidth(80)
         mac_layout.addWidget(self.mac_source_mode, 1, 1)
         mac_layout.addWidget(self.mac_source_address, 1, 2)
-        mac_layout.addWidget(QLabel("Count"), 1, 3)
+        mac_layout.addWidget(QLabel("Count:"), 1, 3)
         mac_layout.addWidget(self.mac_source_count, 1, 4)
-        mac_layout.addWidget(QLabel("Step"), 1, 5)
+        mac_layout.addWidget(QLabel("Step:"), 1, 5)
         mac_layout.addWidget(self.mac_source_step, 1, 6)
         self.mac_source_mode.currentTextChanged.connect(
             lambda mode: self.toggle_mac_fields(mode, self.mac_source_count, self.mac_source_step)
@@ -569,41 +1024,58 @@ class AddStreamDialog(QDialog):
         mac_layout.addWidget(mac_info_label, 2, 0, 1, 7)
 
         mac_group.setLayout(mac_layout)
-        self.protocol_data_layout.addWidget(mac_group)
+        # Store reference for grid layout organization
+        self.mac_group = mac_group
 
     def add_arp_section(self):
         """Add ARP (L2.5) configuration group."""
         self.arp_group = QGroupBox("ARP")
         arp_layout = QGridLayout()
+        arp_layout.setSpacing(8)
+        # Make columns expand to fill available space
+        arp_layout.setColumnStretch(0, 0)  # Label column - fixed
+        arp_layout.setColumnStretch(1, 2)  # MAC/IP fields - expand more
+        arp_layout.setColumnStretch(2, 0)  # Label column - fixed
+        arp_layout.setColumnStretch(3, 2)  # IP fields - expand more
+        arp_layout.setColumnMinimumWidth(1, 140)
+        arp_layout.setColumnMinimumWidth(3, 110)
 
         # Operation: Request/Reply
         arp_layout.addWidget(QLabel("Operation:"), 0, 0)
         self.arp_operation = QComboBox()
         self.arp_operation.addItems(["Request", "Reply"])
+        self.arp_operation.setMinimumWidth(100)
+        self.arp_operation.setMaximumWidth(120)
         arp_layout.addWidget(self.arp_operation, 0, 1)
 
         # Sender MAC / IP
         arp_layout.addWidget(QLabel("Sender MAC:"), 1, 0)
         self.arp_sender_mac = QLineEdit("00:11:22:33:44:55")
+        self.arp_sender_mac.setMinimumWidth(140)
         arp_layout.addWidget(self.arp_sender_mac, 1, 1)
 
         arp_layout.addWidget(QLabel("Sender IP (IPv4):"), 1, 2)
         self.arp_sender_ip = QLineEdit("0.0.0.0")
+        self.arp_sender_ip.setMinimumWidth(110)
+        self.arp_sender_ip.setMaximumWidth(180)
         arp_layout.addWidget(self.arp_sender_ip, 1, 3)
 
         # Target MAC / IP
         arp_layout.addWidget(QLabel("Target MAC:"), 2, 0)
         self.arp_target_mac = QLineEdit("ff:ff:ff:ff:ff:ff")
+        self.arp_target_mac.setMinimumWidth(140)
         arp_layout.addWidget(self.arp_target_mac, 2, 1)
 
         arp_layout.addWidget(QLabel("Target IP (IPv4):"), 2, 2)
         self.arp_target_ip = QLineEdit("0.0.0.0")
+        self.arp_target_ip.setMinimumWidth(110)
+        self.arp_target_ip.setMaximumWidth(180)
         arp_layout.addWidget(self.arp_target_ip, 2, 3)
 
         # (Optional) Add validators for MAC/IPv4 here
 
         self.arp_group.setLayout(arp_layout)
-        self.protocol_data_layout.addWidget(self.arp_group)
+        # Widget will be added to grid layout in setup_protocol_data_tab
 
         # Initial enabled state
         try:
@@ -613,8 +1085,14 @@ class AddStreamDialog(QDialog):
     def add_mpls_section(self):
         mpls_group = QGroupBox("MPLS")
         mpls_layout = QGridLayout()
-        mpls_layout.setContentsMargins(5, 5, 5, 5)
-        mpls_layout.setSpacing(5)
+        mpls_layout.setContentsMargins(12, 12, 12, 12)
+        mpls_layout.setSpacing(8)
+        # Make columns expand to fill available space
+        for col in range(6):
+            if col % 2 == 0:  # Label columns
+                mpls_layout.setColumnStretch(col, 0)
+            else:  # Input columns
+                mpls_layout.setColumnStretch(col, 1)
 
         self.mpls_label_field = QLineEdit("16")
         self.mpls_label_field.setValidator(QIntValidator(0, 1_048_575))
@@ -629,29 +1107,47 @@ class AddStreamDialog(QDialog):
         mpls_layout.addWidget(self.mpls_ttl_field, 0, 3)
         mpls_layout.addWidget(QLabel("Experimental:"), 0, 4)
         mpls_layout.addWidget(self.mpls_experimental_field, 0, 5)
+        
+        # Add minimum size constraints to MPLS fields (no max to allow expansion)
+        self.mpls_label_field.setMinimumWidth(60)
+        self.mpls_ttl_field.setMinimumWidth(60)
+        self.mpls_experimental_field.setMinimumWidth(60)
 
         mpls_group.setLayout(mpls_layout)
         mpls_group.setMaximumHeight(70)
-        self.protocol_data_layout.addWidget(mpls_group)
+        self.mpls_group = mpls_group
 
     def add_vlan_section(self):
         """Adds the VLAN section to the Protocol Data tab and wires enable/disable."""
         self.vlan_group = QGroupBox("VLAN")
         vlan_layout = QGridLayout()
+        vlan_layout.setSpacing(8)
+        # Make columns expand to fill available space
+        for col in range(8):
+            if col % 2 == 0:  # Label columns
+                vlan_layout.setColumnStretch(col, 0)
+            else:  # Input columns
+                vlan_layout.setColumnStretch(col, 1)
+        vlan_layout.setColumnMinimumWidth(1, 60)
+        vlan_layout.setColumnMinimumWidth(3, 60)
+        vlan_layout.setColumnMinimumWidth(5, 60)
 
         # VLAN ID, Priority, CFI/DEI, and Override TPID in the same row
-        vlan_layout.addWidget(QLabel("VLAN ID"), 0, 0)
+        vlan_layout.addWidget(QLabel("VLAN ID:"), 0, 0)
         self.vlan_id_field = QLineEdit("10")
+        self.vlan_id_field.setMinimumWidth(60)
         vlan_layout.addWidget(self.vlan_id_field, 0, 1)
 
-        vlan_layout.addWidget(QLabel("Priority"), 0, 2)
+        vlan_layout.addWidget(QLabel("Priority:"), 0, 2)
         self.priority_field = QComboBox()
         self.priority_field.addItems([str(i) for i in range(8)])
+        self.priority_field.setMinimumWidth(60)
         vlan_layout.addWidget(self.priority_field, 0, 3)
 
-        vlan_layout.addWidget(QLabel("CFI/DEI"), 0, 4)
+        vlan_layout.addWidget(QLabel("CFI/DEI:"), 0, 4)
         self.cfi_dei_field = QComboBox()
         self.cfi_dei_field.addItems(["0", "1"])
+        self.cfi_dei_field.setMinimumWidth(60)
         vlan_layout.addWidget(self.cfi_dei_field, 0, 5)
 
         self.override_tpid_checkbox = QCheckBox("Override TPID")
@@ -659,6 +1155,7 @@ class AddStreamDialog(QDialog):
 
         self.tpid_field = QLineEdit("81 00")
         self.tpid_field.setDisabled(True)
+        self.tpid_field.setMinimumWidth(60)
         vlan_layout.addWidget(self.tpid_field, 0, 7)
 
         # Connect checkbox to enable/disable TPID field
@@ -689,7 +1186,7 @@ class AddStreamDialog(QDialog):
         )
 
         self.vlan_group.setLayout(vlan_layout)
-        self.protocol_data_layout.addWidget(self.vlan_group)
+        # Widget will be added to grid layout in setup_protocol_data_tab
 
         # Initial enabled state (enabled only if Tagged or Stacked)
         try:
@@ -711,24 +1208,34 @@ class AddStreamDialog(QDialog):
         """Adds the IPv4 section to the Protocol Data tab."""
         self.ipv4_group = QGroupBox("Internet Protocol ver 4")
         ipv4_layout = QGridLayout()
+        ipv4_layout.setSpacing(8)
+        ipv4_layout.setColumnStretch(1, 1)  # Allow IP field to expand
+        ipv4_layout.setColumnMinimumWidth(1, 110)  # Minimum width for IP field
 
         # Source IP
-        ipv4_layout.addWidget(QLabel("Source IP"), 0, 0)
+        ipv4_layout.addWidget(QLabel("Source IP:"), 0, 0)
         self.source_field = QLineEdit("0.0.0.0")
+        self.source_field.setMinimumWidth(110)
         ipv4_layout.addWidget(self.source_field, 0, 1)
 
         self.source_mode_dropdown = QComboBox()
         self.source_mode_dropdown.addItems(["Fixed", "Increment"])
+        self.source_mode_dropdown.setMinimumWidth(90)
+        self.source_mode_dropdown.setMaximumWidth(110)
         ipv4_layout.addWidget(self.source_mode_dropdown, 0, 2)
 
         self.source_increment_step = QLineEdit("1")
         self.source_increment_step.setValidator(QIntValidator(1, 255))
-        ipv4_layout.addWidget(QLabel("Step"), 0, 3)
+        self.source_increment_step.setMinimumWidth(50)
+        self.source_increment_step.setMaximumWidth(70)
+        ipv4_layout.addWidget(QLabel("Step:"), 0, 3)
         ipv4_layout.addWidget(self.source_increment_step, 0, 4)
 
         self.source_increment_count = QLineEdit("1")
         self.source_increment_count.setValidator(QIntValidator(1, 255))
-        ipv4_layout.addWidget(QLabel("Count"), 0, 5)
+        self.source_increment_count.setMinimumWidth(50)
+        self.source_increment_count.setMaximumWidth(70)
+        ipv4_layout.addWidget(QLabel("Count:"), 0, 5)
         ipv4_layout.addWidget(self.source_increment_count, 0, 6)
 
         self.source_mode_dropdown.currentIndexChanged.connect(
@@ -739,22 +1246,29 @@ class AddStreamDialog(QDialog):
         )
 
         # Destination IP
-        ipv4_layout.addWidget(QLabel("Destination IP"), 1, 0)
+        ipv4_layout.addWidget(QLabel("Destination IP:"), 1, 0)
         self.destination_field = QLineEdit("0.0.0.0")
+        self.destination_field.setMinimumWidth(110)
         ipv4_layout.addWidget(self.destination_field, 1, 1)
 
         self.destination_mode_dropdown = QComboBox()
         self.destination_mode_dropdown.addItems(["Fixed", "Increment"])
+        self.destination_mode_dropdown.setMinimumWidth(90)
+        self.destination_mode_dropdown.setMaximumWidth(110)
         ipv4_layout.addWidget(self.destination_mode_dropdown, 1, 2)
 
         self.destination_increment_step = QLineEdit("1")
         self.destination_increment_step.setValidator(QIntValidator(1, 255))
-        ipv4_layout.addWidget(QLabel("Step"), 1, 3)
+        self.destination_increment_step.setMinimumWidth(50)
+        self.destination_increment_step.setMaximumWidth(70)
+        ipv4_layout.addWidget(QLabel("Step:"), 1, 3)
         ipv4_layout.addWidget(self.destination_increment_step, 1, 4)
 
         self.destination_increment_count = QLineEdit("1")
         self.destination_increment_count.setValidator(QIntValidator(1, 255))
-        ipv4_layout.addWidget(QLabel("Count"), 1, 5)
+        self.destination_increment_count.setMinimumWidth(50)
+        self.destination_increment_count.setMaximumWidth(70)
+        ipv4_layout.addWidget(QLabel("Count:"), 1, 5)
         ipv4_layout.addWidget(self.destination_increment_count, 1, 6)
 
         self.destination_mode_dropdown.currentIndexChanged.connect(
@@ -853,7 +1367,7 @@ class AddStreamDialog(QDialog):
 
         # Assemble group
         self.ipv4_group.setLayout(ipv4_layout)
-        self.protocol_data_layout.addWidget(self.ipv4_group)
+        # Widget will be added to grid layout in setup_protocol_data_tab
 
         # Initial enable/disable of increment fields (Fixed by default)
         self.source_increment_step.setEnabled(False)
@@ -942,7 +1456,7 @@ class AddStreamDialog(QDialog):
 
         # Assemble group
         self.ipv6_group.setLayout(ipv6_layout)
-        self.protocol_data_layout.addWidget(self.ipv6_group)
+        # Widget will be added to grid layout in setup_protocol_data_tab
 
         # Initial enabled state of the whole IPv6 group per L3 radios
         try:
@@ -1077,7 +1591,7 @@ class AddStreamDialog(QDialog):
             self.tcp_group.setEnabled(self.l4_tcp.isChecked())
         except AttributeError:
             self.tcp_group.setEnabled(False)
-        self.protocol_data_layout.addWidget(self.tcp_group)
+        # Widget will be added to grid layout in setup_protocol_data_tab
 
     def add_udp_section(self):
         self.udp_group = QGroupBox("User Datagram Protocol (stateless)")
@@ -1443,7 +1957,7 @@ class AddStreamDialog(QDialog):
         self.uec_enable_rocev2_checkbox.toggled.connect(self.refresh_l4_sections)
 
         self.uec_group.setLayout(uec_layout)
-        self.protocol_data_layout.addWidget(self.uec_group)
+        # Widget will be added to grid layout in setup_protocol_data_tab
 
         try:
             self.uec_group.setEnabled(self.l4_uec.isChecked())
@@ -1457,14 +1971,18 @@ class AddStreamDialog(QDialog):
         payload_layout.addWidget(QLabel("Data:"))
         payload_layout.addWidget(self.payload_data_field)
         payload_group.setLayout(payload_layout)
-        self.protocol_data_layout.addWidget(payload_group)
+        self.payload_group = payload_group
 
     # ----------------------------- PCAP Tab -----------------------------
 
     def setup_pcap_tab(self):
         outer_layout = QVBoxLayout()
+        outer_layout.setSpacing(20)
+        outer_layout.setContentsMargins(20, 20, 20, 20)
         pcap_group = QGroupBox("PCAP Replay Settings")
         pcap_form_layout = QFormLayout()
+        pcap_form_layout.setSpacing(12)
+        pcap_form_layout.setContentsMargins(16, 20, 16, 16)
 
         self.enable_pcap_checkbox = QCheckBox("Enable PCAP Replay")
         self.enable_pcap_checkbox.stateChanged.connect(self.toggle_pcap_controls)
@@ -1526,6 +2044,8 @@ class AddStreamDialog(QDialog):
     # ----------------------------- Packet View -----------------------------
 
     def setup_packet_view_tab(self):
+        self.packet_view_layout.setSpacing(20)
+        self.packet_view_layout.setContentsMargins(20, 20, 20, 20)
         self.packet_tree = QTreeWidget()
         self.packet_tree.setHeaderLabels(["Protocol Layer", "Configuration Details"])
         self.packet_view_layout.addWidget(self.packet_tree)
@@ -1553,8 +2073,8 @@ class AddStreamDialog(QDialog):
             self.vlan_untagged, self.vlan_tagged, self.vlan_stacked,
             self.l2_none, self.l2_ethernet, self.l2_mpls,
             self.l3_none, self.l3_arp, self.l3_ipv4, self.l3_ipv6,
-            self.l4_none, self.l4_icmp, self.l4_igmp, self.l4_tcp, self.l4_udp, self.l4_rocev2, self.l4_uec,
-            self.payload_none, self.payload_pattern, self.payload_hex,
+            self.l4_none_1, self.l4_none_2, self.l4_icmp, self.l4_igmp, self.l4_tcp, self.l4_udp, self.l4_rocev2, self.l4_uec,
+            self.payload_none, self.payload_pattern, self.payload_from_file,
         ]:
             try:
                 w.toggled.connect(lambda *_: self._refresh_packet_view_if_visible())
@@ -1623,7 +2143,9 @@ class AddStreamDialog(QDialog):
         self.l3_ipv6.setChecked(l3 == "IPv6")
 
         l4 = stream_data.get("L4", "None")
-        self.l4_none.setChecked(l4 == "None")
+        # Update both L4 groups
+        self.l4_none_1.setChecked(l4 == "None")
+        self.l4_none_2.setChecked(l4 == "None")
         self.l4_icmp.setChecked(l4 == "ICMP")
         self.l4_igmp.setChecked(l4 == "IGMP")
         self.l4_tcp.setChecked(l4 == "TCP")
@@ -1796,7 +2318,9 @@ class AddStreamDialog(QDialog):
         payload_value = stream_data.get("Payload", "None")
         self.payload_none.setChecked(payload_value == "None")
         self.payload_pattern.setChecked(payload_value == "Pattern")
-        self.payload_hex.setChecked(payload_value == "Hex Dump")
+        # Map "Hex Dump" to "From File" for backward compatibility
+        self.payload_from_file.setChecked(payload_value == "Hex Dump" or payload_value == "From File")
+        self.payload_random.setChecked(payload_value == "Random")
 
         # IPv4 detailed
         ipv4_data = stream_data.get("protocol_data", {}).get("ipv4", {})
@@ -1900,6 +2424,7 @@ class AddStreamDialog(QDialog):
         return "None"
 
     def _selected_l4(self):
+        # Check both L4 groups
         if self.l4_tcp.isChecked():    return "TCP"
         if self.l4_udp.isChecked():    return "UDP"
         if self.l4_rocev2.isChecked(): return "RoCEv2"
@@ -1910,7 +2435,8 @@ class AddStreamDialog(QDialog):
 
     def _selected_payload(self):
         if self.payload_pattern.isChecked(): return "Pattern"
-        if self.payload_hex.isChecked():     return "Hex Dump"
+        if self.payload_from_file.isChecked(): return "From File"  # Map to "Hex Dump" for backward compatibility if needed
+        if self.payload_random.isChecked(): return "Random"
         return "None"
 
     def _collect_vlan_pd(self):
@@ -2097,11 +2623,20 @@ class AddStreamDialog(QDialog):
         VLAN_sel = chosen([("Untagged", "vlan_untagged"), ("Tagged", "vlan_tagged"), ("Stacked", "vlan_stacked")])
         L2 = chosen([("None", "l2_none"), ("Ethernet II", "l2_ethernet"), ("MPLS", "l2_mpls")])
         L3 = chosen([("None", "l3_none"), ("ARP", "l3_arp"), ("IPv4", "l3_ipv4"), ("IPv6", "l3_ipv6")])
-        L4 = chosen([
-            ("None", "l4_none"), ("ICMP", "l4_icmp"), ("IGMP", "l4_igmp"),
-            ("TCP", "l4_tcp"), ("UDP", "l4_udp"), ("RoCEv2", "l4_rocev2"), ("UEC", "l4_uec")
-        ])
-        Payload = chosen([("None", "payload_none"), ("Pattern", "payload_pattern"), ("Hex Dump", "payload_hex")])
+        # Check both L4 groups
+        L4 = None
+        for name, attr in [("ICMP", "l4_icmp"), ("IGMP", "l4_igmp"), ("TCP", "l4_tcp"), ("UDP", "l4_udp")]:
+            if getattr(self, attr).isChecked():
+                L4 = name
+                break
+        if not L4:
+            for name, attr in [("RoCEv2", "l4_rocev2"), ("UEC", "l4_uec")]:
+                if getattr(self, attr).isChecked():
+                    L4 = name
+                    break
+        if not L4:
+            L4 = "None"
+        Payload = chosen([("None", "payload_none"), ("Pattern", "payload_pattern"), ("From File", "payload_from_file"), ("Random", "payload_random")])
 
         # ---------- PCAP ----------
         pcap_stream = {

@@ -167,10 +167,72 @@ class TrafficGeneratorClient(
         if hasattr(self, 'update_server_tree'):
             self.update_server_tree()
             print(f"✅ Server tree updated on startup with {len(self.server_interfaces)} server(s)")
+            
+            # If servers are selected by default, ensure stream table is populated
+            # Use QTimer to ensure this happens after the tree is fully built
+            if hasattr(self, 'selected_servers') and self.selected_servers:
+                QTimer.singleShot(100, lambda: self._update_tables_after_startup())
+            elif hasattr(self, 'server_tree'):
+                # Even if no servers are selected, check if a TG is selected in the tree
+                selected_items = self.server_tree.selectedItems()
+                if selected_items:
+                    QTimer.singleShot(100, lambda: self._update_tables_after_startup())
         
         # Initialize retry workers after session is loaded and servers are populated
         self._initialize_retry_workers()
         self._check_initial_server_status()
+        
+        # Start timers for polling stats (optimized interval)
+        print(f"[TIMER INIT] Starting timers...")
+        self.timer = QTimer()
+        # Timer wrapper for fetch_and_update_statistics
+        def fetch_with_debug():
+            # print(f"[TIMER FIRED] fetch_and_update_statistics() called at {__import__('time').time()}")
+            try:
+                self.fetch_and_update_statistics()
+            except Exception as e:
+                print(f"[TIMER ERROR] Exception in fetch_and_update_statistics: {e}")
+                import traceback
+                traceback.print_exc()
+        self.timer.timeout.connect(fetch_with_debug)
+        self.timer.start(2000)  # every 2s to auto-update traffic statistics from database
+        # print(f"[TIMER INIT] Traffic statistics timer started (active: {self.timer.isActive()}, interval: {self.timer.interval()}ms)")
+
+        self.stream_stats_timer = QTimer()
+        # print(f"[TIMER INIT] Checking for poll_stream_stats method...")
+        # Verify the method exists before connecting
+        if hasattr(self, 'poll_stream_stats'):
+            # print(f"[TIMER INIT] poll_stream_stats method found, connecting timer...")
+            # Timer wrapper for poll_stream_stats
+            def poll_with_debug():
+                # print(f"[TIMER FIRED] poll_stream_stats() called")
+                try:
+                    self.poll_stream_stats()
+                except Exception as e:
+                    print(f"[TIMER ERROR] Exception in poll_stream_stats: {e}")
+                    import traceback
+                    traceback.print_exc()
+            
+            self.stream_stats_timer.timeout.connect(poll_with_debug)
+            self.stream_stats_timer.setSingleShot(False)  # Make it repeating
+            self.stream_stats_timer.start(2000)  # every 2s to auto-update stream statistics from database
+            # print(f"[TIMER] Stream stats timer started (interval: 2000ms, active: {self.stream_stats_timer.isActive()}, singleShot: {self.stream_stats_timer.isSingleShot()})")
+        else:
+            print(f"[TIMER ERROR] poll_stream_stats method not found! Available methods: {[m for m in dir(self) if 'poll' in m.lower() or 'stream' in m.lower()]}")
+    
+    def _update_tables_after_startup(self):
+        """Update device and stream tables after startup when servers are selected."""
+        # Update device table if devices exist
+        if hasattr(self, "devices_tab") and hasattr(self, "all_devices"):
+            self.devices_tab.update_device_table(self.all_devices)
+        
+        # Update stream table to show streams for selected servers
+        if hasattr(self, "update_stream_table"):
+            self.update_stream_table()
+        
+        # Update statistics
+        if hasattr(self, "fetch_and_update_statistics"):
+            self.fetch_and_update_statistics()
 
     def closeEvent(self, event):
         """Handle application close event - cleanup threads and resources."""
@@ -196,13 +258,14 @@ class TrafficGeneratorClient(
                         save_worker.wait(1000)
                 
                 # Only deleteLater after thread has definitely stopped
-                if not save_worker.isRunning():
-                    save_worker.deleteLater()
-                else:
-                    print("[CLEANUP] WARNING: Save worker still running after cleanup attempt")
-            except RuntimeError:
-                # Object already deleted, ignore
-                pass
+                try:
+                    if not save_worker.isRunning():
+                        save_worker.deleteLater()
+                    else:
+                        print("[CLEANUP] WARNING: Save worker still running after cleanup attempt")
+                except RuntimeError:
+                    # Object already deleted, ignore
+                    pass
             except Exception as exc:
                 print(f"[CLEANUP] Error cleaning up save worker: {exc}")
         print("[CLEANUP] Application closing, cleaning up threads...")
@@ -301,7 +364,7 @@ class TrafficGeneratorClient(
                     save_worker.deleteLater()
             except RuntimeError:
                 # Object already deleted, ignore
-                pass
+                    pass
             except Exception as exc:
                 print(f"[CLEANUP] Error in final save worker cleanup: {exc}")
         
@@ -346,28 +409,6 @@ class TrafficGeneratorClient(
         self._force_quit_called = True
         print("[CLEANUP] Force quitting application...")
         QApplication.quit()
-        
-        # Update server tree to show server and its interfaces
-        if self.server_interfaces:
-            self.update_server_tree()
-        
-        # Populate device table after session is loaded
-        if hasattr(self, 'devices_tab') and self.devices_tab:
-            self.devices_tab.populate_device_table()
-            print("✅ Server tree updated on startup")
-        
-        # Manual discovery will be triggered by user clicking Start button
-
-        # Start timers for polling stats (optimized interval)
-        self.timer = QTimer()
-        self.timer.timeout.connect(self.fetch_and_update_statistics)
-        self.timer.start(10000)  # every 10s to reduce UI load
-
-        self.stream_stats_timer = QTimer()
-        self.stream_stats_timer.timeout.connect(self.poll_stream_stats)
-        self.stream_stats_timer.start(5000)  # every 5s to reduce UI load
-        
-        # Retry workers are now initialized after session loading
 
     def _initialize_retry_workers(self):
         """Initialize the retry and health check workers."""

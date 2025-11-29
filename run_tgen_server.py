@@ -22,6 +22,7 @@ from multithreaded_traffic_gen import generate_packets, on_stream_stopped, strea
 from utils.device_manager import DeviceManager
 from utils.helpers import increment_ip, increment_ipv6, increment_mac, is_interface_up
 from utils.device_database import DeviceDatabase
+from utils.stream_database import StreamDatabase
 from utils.bgp_monitor import BGPStatusManager
 from utils.arp_monitor import ARPStatusMonitor
 from utils.dhcp import ensure_dhcp_services, stop_dhcp_services
@@ -56,6 +57,9 @@ CORS(app)
 
 # Initialize device database
 device_db = DeviceDatabase()
+
+# Initialize stream database
+stream_db = StreamDatabase()
 
 # IPv6 validation functions
 def validate_ipv6_subnet(subnet_str):
@@ -226,9 +230,45 @@ def load_session():
 
 @app.route("/api/streams/stats", methods=["GET"])
 def stream_stats():
-    stats = stream_tracker.get_stream_stats()
-    logging.info(f"[STATS] {stats}")
-    return jsonify({"active_streams": stats}), 200
+    """Get stream statistics from database (preferred) or stream_tracker (fallback)."""
+    try:
+        # Get from database
+        tg_id = request.args.get("tg_id", type=int)
+        status = request.args.get("status", "Running")
+        
+        # If status is "all", don't filter by status
+        status_filter = None if status and status.lower() == "all" else status
+        streams = stream_db.get_all_streams(status=status_filter, tg_id=tg_id)
+        
+        # Convert to format expected by client
+        active_streams = []
+        for stream in streams:
+            active_streams.append({
+                "stream_id": stream.get("stream_id"),
+                "interface": stream.get("interface"),
+                "stream_name": stream.get("stream_name"),
+                "rx_interface": stream.get("rx_interface"),
+                "tx_count": stream.get("tx_count", 0),
+                "rx_count": stream.get("rx_count", 0),
+                "tx_rate": stream.get("tx_rate", 0.0),
+                "rx_rate": stream.get("rx_rate", 0.0),
+                "flow_tracking_enabled": bool(stream.get("flow_tracking_enabled", False)),
+                "status": stream.get("status", "Unknown"),
+                "tg_id": stream.get("tg_id"),
+                "started_at": stream.get("started_at"),
+                "updated_at": stream.get("updated_at"),
+                # Add internal fields for debugging
+                "last_tx_count": stream.get("last_tx_count"),
+                "last_rx_count": stream.get("last_rx_count"),
+                "last_update": stream.get("last_update")
+            })
+        
+        return jsonify({"active_streams": active_streams}), 200
+    except Exception as e:
+        logging.error(f"[STATS] Error getting stream statistics: {e}")
+        # Fallback to stream_tracker
+        stats = stream_tracker.get_stream_stats()
+        return jsonify({"active_streams": stats}), 200
 
 
 ## check and updated if needed. #
@@ -291,6 +331,12 @@ def restart_stream():
         if existing:
             logging.info(f"Stopping stream {stream_id} on {interface}")
             existing["stop_event"].set()
+            
+            # Wait a brief moment for RX sniffer cleanup if flow tracking was enabled
+            if existing.get("flow_tracking_enabled") and existing.get("rx_interface") != interface:
+                import time
+                time.sleep(0.5)  # Brief delay to allow sniffer cleanup thread to unregister
+            
             stream_tracker.remove_stream_by_id(interface, stream_id)
         else:
             logging.warning(f"Stream {stream_id} not found on {interface}")
@@ -313,29 +359,33 @@ def launch_single_stream(stream_data, interface):
     stream_id = stream_data.setdefault("stream_id", str(uuid.uuid4()))
     stop_event = Event()
 
+    # Normalize rx_port - handle "Same as TX Port" and various formats
     rx_port = stream_data.get("rx_port") or interface
-    rx_interface = str(rx_port).split("Port:")[-1].strip()
+    if isinstance(rx_port, str):
+        # Handle "Same as TX Port" - use TX interface
+        if "Same as TX Port" in rx_port or rx_port.strip() == "Same as TX Port":
+            rx_interface = interface
+        else:
+            # Extract interface name from various formats: "TG X - Port: interface", "Port: interface", "interface"
+            rx_interface = str(rx_port).split("Port:")[-1].strip()
+            if not rx_interface or rx_interface == rx_port:
+                # If no "Port:" found, use the whole string as interface name
+                rx_interface = str(rx_port).strip()
+    else:
+        rx_interface = interface
+    
     stream_data["rx_interface"] = rx_interface
 
     flow_tracking = stream_data.get("flow_tracking_enabled", False)
     rx_thread = None
 
+    # Don't start RX sniffer here - it will be started in generate_packets() with proper selector
+    # This prevents duplicate sniffers and ensures proper packet matching
     if flow_tracking and rx_interface != interface:
-        if is_interface_up(rx_interface):
-            logging.info(f"🟢 RX sniffer launched on '{rx_interface}' for stream '{stream_name}'")
-            """match_criteria = {
-                "mac_src": stream_data.get("mac_source_address"),
-                "ip_src": stream_data.get("ipv4_source"),
-                "ipv6_src": stream_data.get("ipv6_source"),
-                "stream_signature": f"[{stream_name}]"
-            }"""
-            #rx_thread = start_rx_counter(rx_interface, stream_name, stop_event, match_criteria)
-            rx_thread = start_rx_counter(rx_interface, stream_name, stream_id, stream_tracker, stop_event)
-
-        else:
-            logging.warning(f"⚠️ RX interface '{rx_interface}' is DOWN, skipping RX sniffer.")
-    else:
-        logging.info(f"🔇 RX sniffer skipped (FlowTracking={flow_tracking}, RX='{rx_interface}')")
+        if not is_interface_up(rx_interface):
+            logging.warning(f"⚠️ RX interface '{rx_interface}' is DOWN, flow tracking may not work.")
+    elif flow_tracking:
+        logging.info(f"🔇 Flow tracking disabled: RX interface equals TX ('{rx_interface}')")
 
     stream_tracker.add_stream({
         "interface": interface,
@@ -386,15 +436,29 @@ def start_traffic():
             stream_id = stream_data.setdefault("stream_id", str(uuid.uuid4()))
             flow_tracking = stream_data.setdefault("flow_tracking_enabled", False)
 
-            if not stream_data.get("enabled", False):
+            # Check enabled flag - it might be at top level or in protocol_selection
+            enabled = stream_data.get("enabled", False) or stream_data.get("protocol_selection", {}).get("enabled", False)
+            if not enabled:
                 logging.info(f"⏩ Skipping disabled stream '{stream_name}' on interface '{interface_name}'")
                 continue
 
             stream_data["interface"] = interface_name
             stream_data["stream_name"] = stream_name
 
+            # Normalize rx_port - handle "Same as TX Port" and various formats
             rx_port = stream_data.get("rx_port") or interface_name
-            stream_data["rx_interface"] = str(rx_port).split("Port:")[-1].strip()
+            if isinstance(rx_port, str):
+                # Handle "Same as TX Port" - use TX interface
+                if "Same as TX Port" in rx_port or rx_port.strip() == "Same as TX Port":
+                    rx_interface = interface_name
+                else:
+                    # Extract interface name from various formats
+                    rx_interface = str(rx_port).split("Port:")[-1].strip()
+                    if not rx_interface or rx_interface == rx_port:
+                        rx_interface = str(rx_port).strip()
+            else:
+                rx_interface = interface_name
+            stream_data["rx_interface"] = rx_interface
 
             # Prevent duplicates
             existing = stream_tracker.find_stream_by_id(interface_name, stream_id)
@@ -404,6 +468,42 @@ def start_traffic():
 
             try:
                 result = launch_single_stream(stream_data, interface_name)
+                
+                # Register stream in database only if launch was successful
+                if result and result.get("status") == "started" and not result.get("error"):
+                    # Extract TG ID from interface_label (format: "TG X - Port: interface" or "TG X - interface")
+                    tg_id = None
+                    try:
+                        if "TG" in interface_label:
+                            tg_part = interface_label.split("TG")[1].split(" - ")[0].strip()
+                            tg_id = int(tg_part) if tg_part.isdigit() else None
+                    except Exception:
+                        pass
+                    
+                    # Get server URL from request
+                    server_url = request.url_root.rstrip('/')
+                    if not server_url:
+                        server_url = request.host_url.rstrip('/')
+                    
+                    # Get RX interface from stream_data
+                    rx_interface = stream_data.get("rx_interface") or interface_name
+                    
+                    try:
+                        stream_db.register_stream(
+                            stream_id=stream_id,
+                            stream_name=stream_name,
+                            interface=interface_name,
+                            rx_interface=rx_interface,
+                            server_url=server_url,
+                            tg_id=tg_id,
+                            flow_tracking_enabled=flow_tracking,
+                            stream_config=stream_data
+                        )
+                        logging.info(f"✅ Registered stream '{stream_name}' (ID: {stream_id}) in database")
+                    except Exception as db_error:
+                        logging.error(f"❌ Failed to register stream '{stream_name}' in database: {db_error}")
+                        # Continue even if database registration fails - stream is still running
+                
                 started_streams.append(result)
                 logging.info(f"🚀 Launched stream '{stream_name}' on {interface_name} (ID: {stream_id})")
             except Exception as e:
@@ -434,16 +534,39 @@ def stop_traffic():
             logging.warning(f"⚠️ Invalid stop entry: {entry}")
             continue
 
-        logging.info(f"🛑 Attempting to stop stream ID: {stream_id} on interface: {interface}")
-        #stream = stream_tracker.get_stream_by_id(interface, stream_id)
-        stream = stream_tracker.find_stream_by_id(interface, stream_id)
+        # Normalize interface name (remove "Port: " prefix and "TG X - " prefix if present)
+        def normalize_iface(iface_str):
+            """Normalize interface name from UI label format."""
+            if not iface_str:
+                return ""
+            s = iface_str.strip().strip('"').rstrip(",")
+            if " - " in s:
+                s = s.split(" - ", 1)[-1].strip()
+            if ":" in s:
+                s = s.rsplit(":", 1)[-1].strip()
+            if "Port:" in s:
+                s = s.replace("Port:", "").strip()
+            parts = s.split()
+            return parts[-1] if parts else ""
+        
+        interface_normalized = normalize_iface(interface)
+        
+        logging.info(f"🛑 Attempting to stop stream ID: {stream_id} on interface: {interface} (normalized: {interface_normalized})")
+        #stream = stream_tracker.get_stream_by_id(interface_normalized, stream_id)
+        stream = stream_tracker.find_stream_by_id(interface_normalized, stream_id)
 
         if stream:
             stream["stop_event"].set()
-            stream_tracker.remove_stream_by_id(interface, stream_id)
+            stream_tracker.remove_stream_by_id(interface_normalized, stream_id)
+            # Mark stream as stopped in database
+            try:
+                stream_db.stop_stream(stream_id)
+                logging.info(f"✅ Updated stream {stream_id} status to Stopped in database")
+            except Exception as db_error:
+                logging.warning(f"⚠️ Failed to update stream {stream_id} status in database: {db_error}")
             logging.info(f"✅ Stop event set for stream ID: {stream_id}")
-            logging.info(f"🛑 Stream stopped: {stream_id} on {interface} (Reason: manual)")
-            stopped.append({"interface": interface, "stream_id": stream_id})
+            logging.info(f"🛑 Stream stopped: {stream_id} on {interface_normalized} (Reason: manual)")
+            stopped.append({"interface": interface_normalized, "stream_id": stream_id})
         else:
             logging.warning(f"❌ Stream ID '{stream_id}' not found on interface '{interface}'")
 
@@ -11078,6 +11201,67 @@ def main(argv=None):
         logging.info("[DHCP MONITOR] DHCP client monitoring started")
     except Exception as e:
         logging.error(f"[DHCP MONITOR] Failed to start DHCP monitoring: {e}")
+    
+    # Start stream statistics polling thread
+    def _poll_stream_statistics():
+        """Background thread that polls stream_tracker and updates database every 2 seconds."""
+        import time
+        while True:
+            try:
+                time.sleep(2)  # Poll every 2 seconds
+                
+                # Get active streams from stream_tracker
+                active_streams = stream_tracker.get_stream_stats()
+                
+                # Update database with current TX/RX counts and rates
+                for stream in active_streams:
+                    stream_id = stream.get("stream_id")
+                    if not stream_id:
+                        continue
+                    
+                    tx_count = stream.get("tx_count", 0)
+                    rx_count = stream.get("rx_count", 0)
+                    
+                    # Update counts - rates will be calculated by database based on time delta
+                    try:
+                        stream_db.update_stream_statistics(
+                            stream_id=stream_id,
+                            tx_count=tx_count,
+                            rx_count=rx_count,
+                            tx_rate=None,  # Let database calculate rate based on time delta
+                            rx_rate=None
+                        )
+                    except Exception as db_error:
+                        logging.debug(f"[STREAM POLL] Failed to update stream {stream_id}: {db_error}")
+                
+                # Check for streams in database that are no longer in stream_tracker
+                # and mark them as "Stopped"
+                try:
+                    db_streams = stream_db.get_all_streams(status="Running")
+                    db_stream_ids = {s.get("stream_id") for s in db_streams if s.get("stream_id")}
+                    tracker_stream_ids = {s.get("stream_id") for s in active_streams if s.get("stream_id")}
+                    
+                    stopped_stream_ids = db_stream_ids - tracker_stream_ids
+                    for stream_id in stopped_stream_ids:
+                        try:
+                            stream_db.stop_stream(stream_id)
+                            logging.info(f"[STREAM POLL] Marked stream {stream_id} as Stopped (not in tracker)")
+                        except Exception as stop_error:
+                            logging.debug(f"[STREAM POLL] Failed to stop stream {stream_id}: {stop_error}")
+                except Exception as check_error:
+                    logging.debug(f"[STREAM POLL] Error checking stopped streams: {check_error}")
+                    
+            except Exception as e:
+                logging.error(f"[STREAM POLL] Error in stream statistics polling: {e}")
+                time.sleep(2)  # Wait before retrying
+    
+    # Start the polling thread
+    try:
+        poll_thread = threading.Thread(target=_poll_stream_statistics, daemon=True)
+        poll_thread.start()
+        logging.info("[STREAM POLL] Stream statistics polling thread started")
+    except Exception as e:
+        logging.error(f"[STREAM POLL] Failed to start stream statistics polling: {e}")
     
     app.run(host=args.host, port=args.port)
 

@@ -796,8 +796,38 @@ class TrafficGenClientMenuAction():
           - Ensure unique stream_id (create if missing; repair if dup)
         """
         # 1) Filter ports to only valid_ports (if we were able to discover any)
+        # Handle both formats: "TG 0 - ens5np0" and "TG 0 - Port: ens5np0"
         if valid_ports:
-            self.streams = {p: lst for p, lst in self.streams.items() if p in valid_ports}
+            # Create normalized set that includes both formats
+            normalized_valid_ports = set(valid_ports)
+            for p in valid_ports:
+                if " - " in p:
+                    parts = p.split(" - ", 1)
+                    if len(parts) == 2:
+                        # Add format with "Port:" prefix
+                        normalized_valid_ports.add(f"{parts[0]} - Port: {parts[1]}")
+                        # Add format without "Port:" prefix (if it has "Port:")
+                        if parts[1].startswith("Port: "):
+                            normalized_valid_ports.add(f"{parts[0]} - {parts[1].replace('Port: ', '')}")
+            
+            # Filter streams, matching against normalized port names
+            filtered_streams = {}
+            for port_key, stream_list in self.streams.items():
+                # Check if port_key matches any normalized valid port
+                if port_key in normalized_valid_ports:
+                    filtered_streams[port_key] = stream_list
+                else:
+                    # Try to normalize port_key and match
+                    if " - " in port_key:
+                        parts = port_key.split(" - ", 1)
+                        if len(parts) == 2:
+                            # Create normalized versions
+                            key_with_port = f"{parts[0]} - Port: {parts[1].replace('Port: ', '')}"
+                            key_without_port = f"{parts[0]} - {parts[1].replace('Port: ', '')}"
+                            if key_with_port in normalized_valid_ports or key_without_port in normalized_valid_ports:
+                                filtered_streams[port_key] = stream_list
+            
+            self.streams = filtered_streams
 
         # 2) Normalize structure + IDs
         seen_ids = set()
@@ -924,9 +954,12 @@ class TrafficGenClientMenuAction():
                     interfaces = r.json()
                     server["online"] = True
                     for iface in interfaces:
-                        port_name = f"{tg_id} - {iface['name']}"
-                        if port_name not in self.removed_interfaces:
-                            valid_ports.add(port_name)
+                        # Create port names in both formats to match saved stream keys
+                        port_name_simple = f"{tg_id} - {iface['name']}"
+                        port_name_with_port = f"{tg_id} - Port: {iface['name']}"
+                        if port_name_simple not in self.removed_interfaces and port_name_with_port not in self.removed_interfaces:
+                            valid_ports.add(port_name_simple)
+                            valid_ports.add(port_name_with_port)  # Also add format with "Port:" to match saved streams
                 except Exception as e:
                     print(f"⚠️ Error fetching interfaces from {address}: {e}")
                     server["online"] = False
@@ -1019,8 +1052,13 @@ class TrafficGenClientMenuAction():
             # Session save removed - only save on explicit user action (Save Session menu or Apply button)
             # Note: Repairs are done in memory only, user can save manually if needed
 
-            print(
-                f"✅ Session loaded: {sum(len(v) for v in self.streams.values())} streams across {len(self.streams)} ports.")
+            stream_count = sum(len(v) for v in self.streams.values())
+            port_count = len(self.streams)
+            print(f"✅ Session loaded: {stream_count} streams across {port_count} ports.")
+            if stream_count > 0:
+                print(f"[DEBUG LOAD] Stream port keys: {list(self.streams.keys())}")
+            if valid_ports:
+                print(f"[DEBUG LOAD] Valid ports discovered: {sorted(valid_ports)}")
 
         except FileNotFoundError:
             print("No session file found. Starting fresh.")
