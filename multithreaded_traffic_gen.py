@@ -1196,20 +1196,48 @@ def generate_packets(stream_data, interface, stop_event):
             logging.debug(f"[PCAP interleave] skipped: {e}")
 
         try:
+            # Safe list access with modulo - ensure lists are non-empty
+            vlan_ids = pkt_cfg.get("vlan_ids", [1])
+            mac_src_list = pkt_cfg.get("mac_src_list", ["00:00:00:00:00:02"])
+            mac_dst_list = pkt_cfg.get("mac_dst_list", ["00:00:00:00:00:01"])
+            ipv4_src_list = pkt_cfg.get("ipv4_src_list", ["10.0.0.1"])
+            ipv4_dst_list = pkt_cfg.get("ipv4_dst_list", ["10.0.0.2"])
+            ipv6_src_list = pkt_cfg.get("ipv6_src_list", ["2001:db8::1"])
+            ipv6_dst_list = pkt_cfg.get("ipv6_dst_list", ["2001:db8::2"])
+            tcp_sport_list = pkt_cfg.get("tcp_sport_list", [12345])
+            tcp_dport_list = pkt_cfg.get("tcp_dport_list", [80])
+            tcp_seq_list = pkt_cfg.get("tcp_seq_list", [0])
+            udp_sport_list = pkt_cfg.get("udp_sport_list", [1234])
+            udp_dport_list = pkt_cfg.get("udp_dport_list", [80])
+            
+            # Ensure all lists are non-empty
+            if not vlan_ids: vlan_ids = [1]
+            if not mac_src_list: mac_src_list = ["00:00:00:00:00:02"]
+            if not mac_dst_list: mac_dst_list = ["00:00:00:00:00:01"]
+            if not ipv4_src_list: ipv4_src_list = ["10.0.0.1"]
+            if not ipv4_dst_list: ipv4_dst_list = ["10.0.0.2"]
+            if not ipv6_src_list: ipv6_src_list = ["2001:db8::1"]
+            if not ipv6_dst_list: ipv6_dst_list = ["2001:db8::2"]
+            if not tcp_sport_list: tcp_sport_list = [12345]
+            if not tcp_dport_list: tcp_dport_list = [80]
+            if not tcp_seq_list: tcp_seq_list = [0]
+            if not udp_sport_list: udp_sport_list = [1234]
+            if not udp_dport_list: udp_dport_list = [80]
+            
             pkt = build_generic_packet(
                 stream_data, pkt_cfg,
-                vlan_id=pkt_cfg["vlan_ids"][index % len(pkt_cfg["vlan_ids"])],
-                src_mac=pkt_cfg["mac_src_list"][index % len(pkt_cfg["mac_src_list"])],
-                dst_mac=pkt_cfg["mac_dst_list"][index % len(pkt_cfg["mac_dst_list"])],
-                src_ip=pkt_cfg["ipv4_src_list"][index % len(pkt_cfg["ipv4_src_list"])],
-                dst_ip=pkt_cfg["ipv4_dst_list"][index % len(pkt_cfg["ipv4_dst_list"])],
-                src_ipv6=pkt_cfg["ipv6_src_list"][index % len(pkt_cfg["ipv6_src_list"])],
-                dst_ipv6=pkt_cfg["ipv6_dst_list"][index % len(pkt_cfg["ipv6_dst_list"])],
-                tcp_sport=pkt_cfg["tcp_sport_list"][index % len(pkt_cfg["tcp_sport_list"])],
-                tcp_dport=pkt_cfg["tcp_dport_list"][index % len(pkt_cfg["tcp_dport_list"])],
-                tcp_seq=pkt_cfg["tcp_seq_list"][index % len(pkt_cfg["tcp_seq_list"])],
-                udp_sport=pkt_cfg["udp_sport_list"][index % len(pkt_cfg["udp_sport_list"])],
-                udp_dport=pkt_cfg["udp_dport_list"][index % len(pkt_cfg["udp_dport_list"])]
+                vlan_id=vlan_ids[index % len(vlan_ids)],
+                src_mac=mac_src_list[index % len(mac_src_list)],
+                dst_mac=mac_dst_list[index % len(mac_dst_list)],
+                src_ip=ipv4_src_list[index % len(ipv4_src_list)],
+                dst_ip=ipv4_dst_list[index % len(ipv4_dst_list)],
+                src_ipv6=ipv6_src_list[index % len(ipv6_src_list)],
+                dst_ipv6=ipv6_dst_list[index % len(ipv6_dst_list)],
+                tcp_sport=tcp_sport_list[index % len(tcp_sport_list)],
+                tcp_dport=tcp_dport_list[index % len(tcp_dport_list)],
+                tcp_seq=tcp_seq_list[index % len(tcp_seq_list)],
+                udp_sport=udp_sport_list[index % len(udp_sport_list)],
+                udp_dport=udp_dport_list[index % len(udp_dport_list)]
             )
         except Exception as e:
             logging.error(f"[Generic] build_generic_packet() error: {e}")

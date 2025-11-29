@@ -177,6 +177,14 @@ def get_stream_stats(status: Optional[str] = "Running", tg_id: Optional[int] = N
             return None
         data = response.json()
         return data.get("active_streams", [])
+    except requests.exceptions.ConnectionError as e:
+        print(f"❌ Cannot connect to server: {e}")
+        print("   Server appears to be down or unreachable.")
+        return None
+    except requests.exceptions.Timeout as e:
+        print(f"❌ Server request timed out: {e}")
+        print("   Server may be overloaded or unresponsive.")
+        return None
     except Exception as e:
         print(f"❌ Error fetching stream stats: {e}")
         return None
@@ -192,6 +200,7 @@ def show_stream_stats(status: Optional[str] = "Running", tg_id: Optional[int] = 
     
     streams = get_stream_stats(status, tg_id)
     if streams is None:
+        print("❌ Unable to fetch stream statistics. Server may be down or unreachable.")
         return
     
     if not streams:
@@ -878,12 +887,21 @@ def main():
     
     # Check server connectivity
     try:
-        response = requests.get(f"{SERVER_URL}/api/device/database/info", timeout=5)
+        response = requests.get(f"{SERVER_URL}/api/ping", timeout=5)
         if response.status_code != 200:
             print(f"❌ Server not responding: HTTP {response.status_code}")
+            print("   Server appears to be down or not operational.")
             sys.exit(1)
-    except Exception as e:
+    except requests.exceptions.ConnectionError as e:
         print(f"❌ Cannot connect to server: {e}")
+        print("   Server appears to be down or unreachable.")
+        sys.exit(1)
+    except requests.exceptions.Timeout as e:
+        print(f"❌ Server request timed out: {e}")
+        print("   Server may be overloaded or unresponsive.")
+        sys.exit(1)
+    except Exception as e:
+        print(f"❌ Error connecting to server: {e}")
         sys.exit(1)
     
     print("✅ Connected to server successfully")
