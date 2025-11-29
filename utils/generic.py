@@ -80,9 +80,10 @@ def build_generic_packet(stream_data, pkt_cfg, vlan_id,
     l3 = protocol_selection.get("L3", "IPv4")
     l4 = protocol_selection.get("L4", "UDP")
 
-    # Base Ether
-    pkt = Ether(src=src_mac or pkt_cfg["mac_src_list"][0],
-                dst=dst_mac or pkt_cfg["mac_dst_list"][0])
+    # Base Ether - ensure lists are non-empty
+    mac_src = src_mac or (pkt_cfg["mac_src_list"][0] if pkt_cfg.get("mac_src_list") and len(pkt_cfg["mac_src_list"]) > 0 else "00:00:00:00:00:02")
+    mac_dst = dst_mac or (pkt_cfg["mac_dst_list"][0] if pkt_cfg.get("mac_dst_list") and len(pkt_cfg["mac_dst_list"]) > 0 else "00:00:00:00:00:01")
+    pkt = Ether(src=mac_src, dst=mac_dst)
 
     # --- VLAN (802.1Q) with PCP/DEI and optional TPID override ---
     try:
@@ -141,9 +142,11 @@ def build_generic_packet(stream_data, pkt_cfg, vlan_id,
         if ipv4.get("ipv4_df"): flags |= 0x2
         if ipv4.get("ipv4_mf"): flags |= 0x1
 
+        ipv4_src = src_ip or (pkt_cfg["ipv4_src_list"][0] if pkt_cfg.get("ipv4_src_list") and len(pkt_cfg["ipv4_src_list"]) > 0 else "10.0.0.1")
+        ipv4_dst = dst_ip or (pkt_cfg["ipv4_dst_list"][0] if pkt_cfg.get("ipv4_dst_list") and len(pkt_cfg["ipv4_dst_list"]) > 0 else "10.0.0.2")
         pkt /= IP(
-            src=src_ip or pkt_cfg["ipv4_src_list"][0],
-            dst=dst_ip or pkt_cfg["ipv4_dst_list"][0],
+            src=ipv4_src,
+            dst=ipv4_dst,
             ttl=int(ipv4.get("ipv4_ttl", 64)),
             tos=tos,
             id=int(ipv4.get("ipv4_identification", 0)),
@@ -153,9 +156,13 @@ def build_generic_packet(stream_data, pkt_cfg, vlan_id,
 
     elif l3 == "IPv6":
         ipv6 = protocol_data.get("ipv6", {}) or {}
+        ipv6_src_list = pkt_cfg.get("ipv6_src_list", ["2001:db8::1"])
+        ipv6_dst_list = pkt_cfg.get("ipv6_dst_list", ["2001:db8::2"])
+        ipv6_src = src_ipv6 or (ipv6_src_list[0] if ipv6_src_list and len(ipv6_src_list) > 0 else "2001:db8::1")
+        ipv6_dst = dst_ipv6 or (ipv6_dst_list[0] if ipv6_dst_list and len(ipv6_dst_list) > 0 else "2001:db8::2")
         pkt /= IPv6(
-            src=src_ipv6 or pkt_cfg.get("ipv6_src_list", ["2001:db8::1"])[0],
-            dst=dst_ipv6 or pkt_cfg.get("ipv6_dst_list", ["2001:db8::2"])[0],
+            src=ipv6_src,
+            dst=ipv6_dst,
             hlim=int(ipv6.get("ipv6_hop_limit", 64)),
             tc=int(ipv6.get("ipv6_traffic_class", 0)),
             fl=int(ipv6.get("ipv6_flow_label", 0)),
@@ -247,66 +254,115 @@ def get_packet_config(stream_data):
     vlan_increment = bool(vlan.get("vlan_increment", False))
     vlan_ids = [vlan_id + i * vlan_step for i in range(vlan_count)] if vlan_increment else [vlan_id]
 
-    # MACs
-    mac_src_list = [mac.get("mac_source_address")]
-    if mac.get("mac_source_mode") == "Increment":
-        step = int(mac.get("mac_source_step", 1)); count = int(mac.get("mac_source_count", 1))
-        mac_src_list = [increment_mac(mac_src_list[0], step * i) for i in range(count)]
+    # MACs - with defaults and validation
+    mac_src_default = mac.get("mac_source_address") or "00:00:00:00:00:02"
+    mac_src_list = [mac_src_default]
+    mac_src_mode = mac.get("mac_source_mode", "Fixed")
+    if mac_src_mode in ("Increment", "Decrement") and mac_src_default:
+        step = int(mac.get("mac_source_step", 1))
+        count = int(mac.get("mac_source_count", 1))
+        # For Decrement mode, use negative step
+        if mac_src_mode == "Decrement":
+            step = -step
+        if count > 0:
+            mac_src_list = [increment_mac(mac_src_default, step * i) for i in range(count)]
+        else:
+            mac_src_list = [mac_src_default]
 
-    mac_dst_list = [mac.get("mac_destination_address")]
-    if mac.get("mac_destination_mode") == "Increment":
-        step = int(mac.get("mac_destination_step", 1)); count = int(mac.get("mac_destination_count", 1))
-        mac_dst_list = [increment_mac(mac_dst_list[0], step * i) for i in range(count)]
+    mac_dst_default = mac.get("mac_destination_address") or "00:00:00:00:00:01"
+    mac_dst_list = [mac_dst_default]
+    mac_dst_mode = mac.get("mac_destination_mode", "Fixed")
+    if mac_dst_mode in ("Increment", "Decrement") and mac_dst_default:
+        step = int(mac.get("mac_destination_step", 1))
+        count = int(mac.get("mac_destination_count", 1))
+        # For Decrement mode, use negative step
+        if mac_dst_mode == "Decrement":
+            step = -step
+        if count > 0:
+            mac_dst_list = [increment_mac(mac_dst_default, step * i) for i in range(count)]
+        else:
+            mac_dst_list = [mac_dst_default]
 
-    # IPv4
-    ipv4_src_list = [ipv4.get("ipv4_source")]
-    if ipv4.get("ipv4_source_mode") == "Increment":
+    # IPv4 - with defaults and validation
+    ipv4_src_default = ipv4.get("ipv4_source") or "10.0.0.1"
+    ipv4_src_list = [ipv4_src_default]
+    if ipv4.get("ipv4_source_mode") == "Increment" and ipv4_src_default:
         step = int(ipv4.get("ipv4_source_increment_step", 1)); count = int(ipv4.get("ipv4_source_increment_count", 1))
-        ipv4_src_list = [increment_ip(ipv4_src_list[0], step * i) for i in range(count)]
+        if count > 0:
+            ipv4_src_list = [increment_ip(ipv4_src_default, step * i) for i in range(count)]
+        else:
+            ipv4_src_list = [ipv4_src_default]
 
-    ipv4_dst_list = [ipv4.get("ipv4_destination")]
-    if ipv4.get("ipv4_destination_mode") == "Increment":
+    ipv4_dst_default = ipv4.get("ipv4_destination") or "10.0.0.2"
+    ipv4_dst_list = [ipv4_dst_default]
+    if ipv4.get("ipv4_destination_mode") == "Increment" and ipv4_dst_default:
         step = int(ipv4.get("ipv4_destination_increment_step", 1)); count = int(ipv4.get("ipv4_destination_increment_count", 1))
-        ipv4_dst_list = [increment_ip(ipv4_dst_list[0], step * i) for i in range(count)]
+        if count > 0:
+            ipv4_dst_list = [increment_ip(ipv4_dst_default, step * i) for i in range(count)]
+        else:
+            ipv4_dst_list = [ipv4_dst_default]
 
-    # IPv6
-    ipv6_src_list = [ipv6.get("ipv6_source")]
-    if ipv6.get("ipv6_source_mode") == "Increment":
+    # IPv6 - with defaults and validation
+    ipv6_src_default = ipv6.get("ipv6_source") or "2001:db8::1"
+    ipv6_src_list = [ipv6_src_default]
+    if ipv6.get("ipv6_source_mode") == "Increment" and ipv6_src_default:
         step = int(ipv6.get("ipv6_source_increment_step", 1)); count = int(ipv6.get("ipv6_source_increment_count", 1))
-        ipv6_src_list = [increment_ipv6(ipv6_src_list[0], step * i) for i in range(count)]
+        if count > 0:
+            ipv6_src_list = [increment_ipv6(ipv6_src_default, step * i) for i in range(count)]
+        else:
+            ipv6_src_list = [ipv6_src_default]
 
-    ipv6_dst_list = [ipv6.get("ipv6_destination")]
-    if ipv6.get("ipv6_destination_mode") == "Increment":
+    ipv6_dst_default = ipv6.get("ipv6_destination") or "2001:db8::2"
+    ipv6_dst_list = [ipv6_dst_default]
+    if ipv6.get("ipv6_destination_mode") == "Increment" and ipv6_dst_default:
         step = int(ipv6.get("ipv6_destination_increment_step", 1)); count = int(ipv6.get("ipv6_destination_increment_count", 1))
-        ipv6_dst_list = [increment_ipv6(ipv6_dst_list[0], step * i) for i in range(count)]
+        if count > 0:
+            ipv6_dst_list = [increment_ipv6(ipv6_dst_default, step * i) for i in range(count)]
+        else:
+            ipv6_dst_list = [ipv6_dst_default]
 
-    # TCP ports
+    # TCP ports - ensure non-empty lists
     tcp_sport_list = [int(tcp.get("tcp_source_port", 12345))]
     if tcp.get("tcp_increment_source_port"):
         start = int(tcp.get("tcp_source_port", 12345)); step = int(tcp.get("tcp_source_port_step", 1)); count = int(tcp.get("tcp_source_port_count", 1))
-        tcp_sport_list = [start + step * i for i in range(count)]
+        if count > 0:
+            tcp_sport_list = [start + step * i for i in range(count)]
+        else:
+            tcp_sport_list = [start]
 
     tcp_dport_list = [int(tcp.get("tcp_destination_port", 80))]
     if tcp.get("tcp_increment_destination_port"):
         start = int(tcp.get("tcp_destination_port", 80)); step = int(tcp.get("tcp_destination_port_step", 1)); count = int(tcp.get("tcp_destination_port_count", 1))
-        tcp_dport_list = [start + step * i for i in range(count)]
+        if count > 0:
+            tcp_dport_list = [start + step * i for i in range(count)]
+        else:
+            tcp_dport_list = [start]
 
-    # TCP sequence
+    # TCP sequence - ensure non-empty lists
     tcp_seq_list = [int(tcp.get("tcp_sequence_number", 0))]
     if tcp.get("tcp_sequence_count"):
         start = int(tcp.get("tcp_sequence_number", 0)); step = int(tcp.get("tcp_sequence_step", 1)); count = int(tcp.get("tcp_sequence_count", 1))
-        tcp_seq_list = [start + step * i for i in range(count)]
+        if count > 0:
+            tcp_seq_list = [start + step * i for i in range(count)]
+        else:
+            tcp_seq_list = [start]
 
-    # UDP ports
+    # UDP ports - ensure non-empty lists
     udp_sport_list = [int(udp.get("udp_source_port", 1234))]
     if udp.get("udp_increment_source_port"):
         start = int(udp.get("udp_source_port", 1234)); step = int(udp.get("udp_source_port_step", 1)); count = int(udp.get("udp_source_port_count", 1))
-        udp_sport_list = [start + step * i for i in range(count)]
+        if count > 0:
+            udp_sport_list = [start + step * i for i in range(count)]
+        else:
+            udp_sport_list = [start]
 
     udp_dport_list = [int(udp.get("udp_destination_port", 80))]
     if udp.get("udp_increment_destination_port"):
         start = int(udp.get("udp_destination_port", 80)); step = int(udp.get("udp_destination_port_step", 1)); count = int(udp.get("udp_destination_port_count", 1))
-        udp_dport_list = [start + step * i for i in range(count)]
+        if count > 0:
+            udp_dport_list = [start + step * i for i in range(count)]
+        else:
+            udp_dport_list = [start]
 
     return {
         "vlan_ids": vlan_ids,
