@@ -3,7 +3,7 @@ import os
 import uuid
 import requests
 from PyQt5.QtWidgets import QMessageBox
-from PyQt5.QtCore import QTimer,QSize
+from PyQt5.QtCore import QTimer, QSize, Qt
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import QTableWidgetItem
@@ -210,15 +210,23 @@ class TrafficGenClientStreamLogic:
     def start_stream(self):
         """Start the selected streams (incl. PCAP), normalize rate/duration, update UI, and schedule auto-stop.
            Also updates the single Start/Stop-ALL toggle if anything starts."""
-        # 1) gather selection
+        # 1) gather selection - support both row and cell selection
         try:
-            selected_rows = self.stream_table.selectionModel().selectedRows()
+            selection_model = self.stream_table.selectionModel()
+            # Get selected rows (works with both SelectRows and SelectItems)
+            selected_rows = selection_model.selectedRows()
+            # If no rows selected, try getting rows from selected cells
+            if not selected_rows:
+                selected_rows = selection_model.selectedIndexes()
         except Exception:
             selected_rows = []
 
         if not selected_rows:
             QMessageBox.warning(self, "No Selection", "Please select one or more streams to start.")
             return
+        
+        # Extract unique row indices from selection
+        selected_row_indices = sorted(set(idx.row() for idx in selected_rows))
 
         if not getattr(self, "server_interfaces", []):
             QMessageBox.warning(self, "No Server Selected", "Please select a TG chassis from the server list.")
@@ -231,26 +239,60 @@ class TrafficGenClientStreamLogic:
         sid_to_port = {}  # { stream_id: port_label }
 
         # 2) collect and prepare payloads
-        for row in selected_rows:
-            row_idx = row.row()
+        for row_idx in selected_row_indices:
             port_item = self.stream_table.item(row_idx, 1)
             name_item = self.stream_table.item(row_idx, 2)
             if not port_item or not name_item:
                 continue
 
-            port = port_item.text().strip()  # e.g. "TG 0 - eth1"
+            port_text = port_item.text().strip()  # May be "ens5np0" or "Port: ens5np0"
             stream_name = name_item.text().strip()
 
+            # Normalize port_text (remove "Port: " prefix if present)
+            normalized_port_text = port_text
+            if ":" in normalized_port_text:
+                normalized_port_text = normalized_port_text.rsplit(":", 1)[-1].strip()
+            if "Port:" in normalized_port_text:
+                normalized_port_text = normalized_port_text.replace("Port:", "").strip()
+
+            # Find the matching port key in self.streams (e.g., "TG 0 - Port: ens5np0")
+            port_key = None
+            for key in self.streams.keys():
+                # Extract interface name from key
+                key_interface = key.split(" - ")[-1].replace("Port: ", "").strip()
+                if key_interface == normalized_port_text:
+                    port_key = key
+                    break
+            
+            if not port_key:
+                print(f"[ERROR] No matching port key found for interface '{normalized_port_text}' (original: '{port_text}'). Available keys: {list(self.streams.keys())}")
+                continue
+
             matched_stream = next(
-                (s for s in self.streams.get(port, [])
+                (s for s in self.streams.get(port_key, [])
                  if s.get("name") == stream_name or s.get("protocol_selection", {}).get("name") == stream_name),
                 None
             )
             if not matched_stream:
+                print(f"[ERROR] Stream '{stream_name}' not found in port '{port_key}'")
                 continue
 
-            if not matched_stream.get("enabled", False):
-                disabled_streams.append((port, stream_name))
+            # Check enabled flag - sync from table combo box first, then check both locations
+            # Get enabled state from table combo box (column 3)
+            enabled_combo = self.stream_table.cellWidget(row_idx, 3)
+            if enabled_combo:
+                is_enabled_ui = enabled_combo.currentText().strip().lower() in ("yes", "true", "1")
+                # Sync UI state to stream object
+                matched_stream["enabled"] = is_enabled_ui
+                if "protocol_selection" in matched_stream:
+                    matched_stream["protocol_selection"]["enabled"] = is_enabled_ui
+                enabled = is_enabled_ui
+            else:
+                # Fallback: check both locations in stream object
+                enabled = matched_stream.get("enabled", False) or matched_stream.get("protocol_selection", {}).get("enabled", False)
+            
+            if not enabled:
+                disabled_streams.append((port_key, stream_name))
                 continue
 
             # ensure id/interface
@@ -258,33 +300,42 @@ class TrafficGenClientStreamLogic:
                 matched_stream["stream_id"] = str(uuid.uuid4())
             stream_id = matched_stream["stream_id"]
 
+            # Normalize interface name from port_key (e.g., "TG 0 - Port: ens5np0" -> "ens5np0")
             try:
-                normalized_interface = port.split(" - ")[1].strip()
+                if " - " in port_key:
+                    normalized_interface = port_key.split(" - ", 1)[-1].strip()
+                    # Remove "Port:" prefix if present
+                    if ":" in normalized_interface:
+                        normalized_interface = normalized_interface.rsplit(":", 1)[-1].strip()
+                    if normalized_interface.startswith("Port:"):
+                        normalized_interface = normalized_interface.replace("Port:", "").strip()
+                else:
+                    normalized_interface = port_key
             except Exception:
-                normalized_interface = port  # fallback
+                normalized_interface = port_text  # fallback to table text
             matched_stream["interface"] = normalized_interface
-            matched_stream["port"] = port  # keep full label
+            matched_stream["port"] = port_key  # keep full label
 
             # sync master list entry
-            for s in self.streams.get(port, []):
+            for s in self.streams.get(port_key, []):
                 if s.get("name") == matched_stream.get("name"):
                     s["interface"] = normalized_interface
                     s["stream_id"] = stream_id
 
             # find server for this TG
             try:
-                tx_tg_id = port.split(" - ")[0].strip().replace("TG ", "")
+                tx_tg_id = port_key.split(" - ")[0].strip().replace("TG ", "")
             except Exception:
                 tx_tg_id = ""
             tx_server = next((s for s in self.server_interfaces if str(s.get("tg_id")) == tx_tg_id), None)
             if not tx_server:
-                print(f"[ERROR] No TX server found for TG {tx_tg_id}")
+                print(f"[ERROR] No TX server found for TG {tx_tg_id} from port_key '{port_key}'")
                 continue
 
             server_url = tx_server["address"]
             stream_by_id[stream_id] = matched_stream
             row_by_id[stream_id] = row_idx
-            sid_to_port[stream_id] = port
+            sid_to_port[stream_id] = port_key
 
             # PCAP upload (if enabled)
             pcap_cfg = matched_stream.get("pcap_stream", {})
@@ -319,7 +370,7 @@ class TrafficGenClientStreamLogic:
             except Exception as _e:
                 print(f"[DURATION] Could not normalize duration for '{stream_name}': {_e}")
 
-            server_payload_map.setdefault(server_url, {}).setdefault(port, []).append((matched_stream, row_idx))
+            server_payload_map.setdefault(server_url, {}).setdefault(port_key, []).append((matched_stream, row_idx))
 
         # 3) notify about skipped disabled streams
         if disabled_streams:
@@ -404,7 +455,12 @@ class TrafficGenClientStreamLogic:
 
     def stop_stream(self):
         """Stop only the selected streams. Do NOT toggle 'enabled'."""
-        selected = self.stream_table.selectionModel().selectedRows()
+        # Support both row and cell selection
+        selection_model = self.stream_table.selectionModel()
+        selected = selection_model.selectedRows()
+        if not selected:
+            # Fallback: get rows from selected cells
+            selected = selection_model.selectedIndexes()
         if not selected:
             QMessageBox.warning(self, "No Selection", "Please select a stream to stop.")
             return
@@ -415,30 +471,65 @@ class TrafficGenClientStreamLogic:
 
         for idx in selected:
             row = idx.row()
-            port = (self.stream_table.item(row, 1) or QTableWidgetItem("")).text().strip()
+            port_text = (self.stream_table.item(row, 1) or QTableWidgetItem("")).text().strip()
             name = (self.stream_table.item(row, 2) or QTableWidgetItem("")).text().strip()
-            if not port or not name:
+            if not port_text or not name:
                 continue
-            selected_triplets.append((port, name, row))
+            selected_triplets.append((port_text, name, row))
 
-            tg_id = port.split(" - ")[0].replace("TG", "").strip()
-            interface = port.split(" - ")[1].strip()
-            server = next((s for s in self.server_interfaces if str(s.get("tg_id")) == tg_id), None)
-            if not server:
+            # Normalize port_text (remove "Port: " prefix if present)
+            normalized_port_text = port_text
+            if ":" in normalized_port_text:
+                normalized_port_text = normalized_port_text.rsplit(":", 1)[-1].strip()
+            if "Port:" in normalized_port_text:
+                normalized_port_text = normalized_port_text.replace("Port:", "").strip()
+
+            # Find the matching port key in self.streams (e.g., "TG 0 - Port: ens5np0")
+            port_key = None
+            for key in self.streams.keys():
+                # Extract interface name from key
+                key_interface = key.split(" - ")[-1].replace("Port: ", "").strip()
+                if key_interface == normalized_port_text:
+                    port_key = key
+                    break
+            
+            if not port_key:
+                print(f"[STOP ERROR] No matching port key found for interface '{normalized_port_text}' (original: '{port_text}'). Available keys: {list(self.streams.keys())}")
                 continue
 
-            # find the stream by name (supports protocol_selection.name)
+            # Find the stream by name (supports protocol_selection.name)
             matched = next(
-                (s for s in self.streams.get(port, [])
+                (s for s in self.streams.get(port_key, [])
                  if s.get("name") == name or s.get("protocol_selection", {}).get("name") == name),
                 None
             )
             if not matched:
+                print(f"[STOP ERROR] Stream '{name}' not found in port '{port_key}'")
                 continue
+
+            # Extract TG ID from port key (e.g., "TG 0 - Port: ens5np0" -> "0")
+            try:
+                tg_id = port_key.split(" - ")[0].replace("TG", "").strip()
+            except (IndexError, AttributeError):
+                # Fallback: try to get from stream object
+                tg_id = matched.get("tg_id", "")
+                if not tg_id:
+                    print(f"[STOP ERROR] Could not extract TG ID from port key '{port_key}' or stream object")
+                    continue
+            
+            server = next((s for s in self.server_interfaces if str(s.get("tg_id")) == tg_id), None)
+            if not server:
+                print(f"[STOP ERROR] No server found for TG ID '{tg_id}'")
+                continue
+
+            # Get interface name from stream object or normalize port_text
+            interface = matched.get("interface", normalized_port_text)
+            if not interface:
+                interface = normalized_port_text
 
             sid = matched.get("stream_id")
             if not sid:
-                # nothing running on backend to stop
+                print(f"[STOP WARN] Stream '{name}' has no stream_id, skipping")
                 continue
 
             stop_requests.setdefault(server["address"], []).append({
@@ -458,10 +549,27 @@ class TrafficGenClientStreamLogic:
                 print(f"[STOP ERROR] {server_url}: {e}")
 
         # Update ONLY status locally; DO NOT alter 'enabled'
-        for port, name, _ in selected_triplets:
-            for s in self.streams.get(port, []):
-                if s.get("name") == name or s.get("protocol_selection", {}).get("name") == name:
-                    s["status"] = "stopped"
+        # Need to find port_key for each selected stream to update status
+        for port_text, name, _ in selected_triplets:
+            # Normalize port_text to find port_key
+            normalized_port_text = port_text
+            if ":" in normalized_port_text:
+                normalized_port_text = normalized_port_text.rsplit(":", 1)[-1].strip()
+            if "Port:" in normalized_port_text:
+                normalized_port_text = normalized_port_text.replace("Port:", "").strip()
+            
+            # Find matching port_key
+            port_key = None
+            for key in self.streams.keys():
+                key_interface = key.split(" - ")[-1].replace("Port: ", "").strip()
+                if key_interface == normalized_port_text:
+                    port_key = key
+                    break
+            
+            if port_key:
+                for s in self.streams.get(port_key, []):
+                    if s.get("name") == name or s.get("protocol_selection", {}).get("name") == name:
+                        s["status"] = "stopped"
 
         self.update_stream_table()
         self.update_all_streams_toggle_ui()
@@ -903,28 +1011,98 @@ class TrafficGenClientStreamLogic:
             if not port_item or not name_item:
                 continue
 
-            port = port_item.text().strip()
+            port_text = port_item.text().strip()  # May be "ens5np0" or "Port: ens5np0"
             stream_name = name_item.text().strip()
-            if port not in self.streams:
+            
+            # Normalize port_text (remove "Port: " prefix if present)
+            normalized_port_text = port_text
+            if ":" in normalized_port_text:
+                normalized_port_text = normalized_port_text.rsplit(":", 1)[-1].strip()
+            if "Port:" in normalized_port_text:
+                normalized_port_text = normalized_port_text.replace("Port:", "").strip()
+            
+            # Find the matching port key in self.streams (e.g., "TG 0 - Port: ens5np0")
+            port_key = None
+            for key in self.streams.keys():
+                # Extract interface name from key
+                key_interface = key.split(" - ")[-1].replace("Port: ", "").strip()
+                if key_interface == normalized_port_text:
+                    port_key = key
+                    break
+            
+            if not port_key or port_key not in self.streams:
                 continue
 
-            for s in self.streams[port]:
-                ps = s.setdefault("protocol_selection", {})
-                if ps.get("name") == stream_name or s.get("name") == stream_name:
-                    # Enabled combo (column 3)
-                    enabled_widget = self.stream_table.cellWidget(row, 3)
-                    if enabled_widget:
-                        is_enabled = enabled_widget.currentText().strip().lower() in ("yes", "true", "1")
-                        ps["enabled"] = is_enabled
-                        s["enabled"] = is_enabled
+            # Find stream - prefer stream_id from table item UserRole, then fallback to name matching
+            matched_stream = None
+            name_item = self.stream_table.item(row, 2)
+            stream_id_from_table = None
+            if name_item:
+                stream_id_from_table = name_item.data(Qt.UserRole)
+            
+            if stream_id_from_table:
+                # Match by stream_id (most reliable)
+                for s in self.streams[port_key]:
+                    if s.get("stream_id") == stream_id_from_table:
+                        matched_stream = s
+                        break
+            
+            # Fallback: match by name if stream_id not available
+            if not matched_stream:
+                for s in self.streams[port_key]:
+                    ps = s.setdefault("protocol_selection", {})
+                    stream_name_in_obj = ps.get("name") or s.get("name", "")
+                    if stream_name_in_obj == stream_name:
+                        matched_stream = s
+                        break
+            
+            # Last resort: use row index (assumes table order matches stream list order)
+            if not matched_stream and row < len(self.streams[port_key]):
+                matched_stream = self.streams[port_key][row]
+                print(f"[INLINE EDIT] Using row index fallback to find stream at row {row}")
+            
+            if matched_stream:
+                ps = matched_stream.setdefault("protocol_selection", {})
+                
+                # Stream name (column 2) - editable text field (name_item already retrieved above)
+                if name_item:
+                    new_name = name_item.text().strip()
+                    original_name = ps.get("name") or matched_stream.get("name", "")
+                    if new_name and new_name != original_name:
+                        ps["name"] = new_name
+                        matched_stream["name"] = new_name
+                        print(f"[INLINE EDIT] Updated stream name: '{original_name}' -> '{new_name}'")
+                
+                # Enabled combo (column 3)
+                enabled_widget = self.stream_table.cellWidget(row, 3)
+                if enabled_widget:
+                    is_enabled = enabled_widget.currentText().strip().lower() in ("yes", "true", "1")
+                    ps["enabled"] = is_enabled
+                    matched_stream["enabled"] = is_enabled
 
-                    # Flow tracking combo (column 15)
-                    flow_widget = self.stream_table.cellWidget(row, 15)
-                    if flow_widget:
-                        flow_enabled = flow_widget.currentText().strip().lower() in ("yes", "true", "1")
-                        ps["flow_tracking_enabled"] = flow_enabled
-                        s["flow_tracking_enabled"] = flow_enabled
-                    break
+                # Frame size (column 8) - editable text field
+                frame_size_item = self.stream_table.item(row, 8)
+                if frame_size_item:
+                    new_frame_size = frame_size_item.text().strip()
+                    if new_frame_size:
+                        try:
+                            # Validate it's a number
+                            frame_size_int = int(new_frame_size)
+                            if 64 <= frame_size_int <= 9216:  # Valid Ethernet frame size range
+                                ps["frame_size"] = new_frame_size
+                                matched_stream["frame_size"] = new_frame_size
+                                print(f"[INLINE EDIT] Updated frame_size: {new_frame_size}")
+                        except ValueError:
+                            print(f"[INLINE EDIT] Invalid frame_size value: {new_frame_size}")
+
+                # Flow tracking combo (column 15)
+                flow_widget = self.stream_table.cellWidget(row, 15)
+                if flow_widget:
+                    flow_enabled = flow_widget.currentText().strip().lower() in ("yes", "true", "1")
+                    ps["flow_tracking_enabled"] = flow_enabled
+                    matched_stream["flow_tracking_enabled"] = flow_enabled
+            else:
+                print(f"[INLINE EDIT] Could not find stream '{stream_name}' in port '{port_key}' to sync inline edits")
 
         # 🚀 Apply only running + enabled streams per online server
         for server in getattr(self, "server_interfaces", []):

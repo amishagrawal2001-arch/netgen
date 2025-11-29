@@ -174,6 +174,20 @@ class StreamTracker:
 
     def remove_stream_by_id(self, interface, stream_id):
         with self.lock:
+            # Find the stream to get rx_interface for sniffer unregistration
+            stream_to_remove = None
+            for s in self.active_streams:
+                if s["interface"] == interface and s["stream_id"] == stream_id:
+                    stream_to_remove = s
+                    break
+            
+            # Unregister sniffer if flow tracking was enabled
+            if stream_to_remove and stream_to_remove.get("flow_tracking_enabled"):
+                rx_interface = stream_to_remove.get("rx_interface")
+                if rx_interface:
+                    self._sniffers.discard((rx_interface, stream_id))
+            
+            # Remove from active_streams
             self.active_streams = [
                 s for s in self.active_streams
                 if not (s["interface"] == interface and s["stream_id"] == stream_id)
@@ -257,63 +271,86 @@ def _build_bpf(selector):
     if not selector:
         return None
 
-    # Inner expression first (no 'vlan' yet)
-    terms = []
+    # Build separate IPv4 and IPv6 expressions (they can't both be true)
+    ip4_expr = None
+    ip6_expr = None
 
     # L3 (IPv4)
     ip4_src = selector.get("src_ip")
     ip4_dst = selector.get("dst_ip")
     if ip4_src and ip4_dst:
-        terms.append(f"(host {ip4_src} or host {ip4_dst})")
+        ip4_expr = f"(host {ip4_src} or host {ip4_dst})"
     elif ip4_src:
-        terms.append(f"host {ip4_src}")
+        ip4_expr = f"host {ip4_src}"
     elif ip4_dst:
-        terms.append(f"host {ip4_dst}")
+        ip4_expr = f"host {ip4_dst}"
 
     # L3 (IPv6)
     ip6_src = selector.get("src_ip6")
     ip6_dst = selector.get("dst_ip6")
-    ip6_term = None
     if ip6_src and ip6_dst:
-        ip6_term = f"(host {ip6_src} or host {ip6_dst})"
+        ip6_expr = f"(host {ip6_src} or host {ip6_dst})"
     elif ip6_src:
-        ip6_term = f"host {ip6_src}"
+        ip6_expr = f"host {ip6_src}"
     elif ip6_dst:
-        ip6_term = f"host {ip6_dst}"
-    if ip6_term:
-        # Explicitly tag as ip6 to avoid ambiguity
-        terms.append(f"(ip6 and {ip6_term})")
+        ip6_expr = f"host {ip6_dst}"
+
+    # Combine IPv4 and IPv6 with OR (packet can be either IPv4 OR IPv6, not both)
+    l3_terms = []
+    if ip4_expr:
+        l3_terms.append(ip4_expr)
+    if ip6_expr:
+        l3_terms.append(f"(ip6 and {ip6_expr})")
+    
+    l3_expr = None
+    if len(l3_terms) == 2:
+        l3_expr = f"({l3_terms[0]} or {l3_terms[1]})"
+    elif len(l3_terms) == 1:
+        l3_expr = l3_terms[0]
 
     # L4
     l4 = (selector.get("l4") or "").lower()
     sport = selector.get("sport")
     dport = selector.get("dport")
 
+    l4_expr = None
     if l4 == "icmp":
-        terms.append("icmp or icmp6")
+        l4_expr = "icmp or icmp6"
     elif l4 == "udp":
         if sport and dport:
-            terms.append(f"udp and ((src port {sport} and dst port {dport}) or (src port {dport} and dst port {sport}))")
+            l4_expr = f"udp and ((src port {sport} and dst port {dport}) or (src port {dport} and dst port {sport}))"
         elif sport:
-            terms.append(f"udp and (src port {sport} or dst port {sport})")
+            l4_expr = f"udp and (src port {sport} or dst port {sport})"
         elif dport:
-            terms.append(f"udp and (src port {dport} or dst port {dport})")
+            l4_expr = f"udp and (src port {dport} or dst port {dport})"
         else:
-            terms.append("udp")
+            l4_expr = "udp"
     elif l4 == "tcp":
         if sport and dport:
-            terms.append(f"tcp and ((src port {sport} and dst port {dport}) or (src port {dport} and dst port {sport}))")
+            l4_expr = f"tcp and ((src port {sport} and dst port {dport}) or (src port {dport} and dst port {sport}))"
         elif sport:
-            terms.append(f"tcp and (src port {sport} or dst port {sport})")
+            l4_expr = f"tcp and (src port {sport} or dst port {sport})"
         elif dport:
-            terms.append(f"tcp and (src port {dport} or dst port {dport})")
+            l4_expr = f"tcp and (src port {dport} or dst port {dport})"
         else:
-            terms.append("tcp")
+            l4_expr = "tcp"
 
-    inner = " and ".join(terms).strip()
-
-    # Nothing to filter on? fall back so lfilter() can do the work.
-    if not inner:
+    # Combine L3 and L4
+    # Need to properly parenthesize L4 if it contains 'or' to avoid operator precedence issues
+    inner_parts = []
+    if l3_expr:
+        inner_parts.append(f"({l3_expr})")
+    if l4_expr:
+        # Wrap L4 in parentheses if it contains 'or' to ensure proper precedence
+        if " or " in l4_expr:
+            inner_parts.append(f"({l4_expr})")
+        else:
+            inner_parts.append(l4_expr)
+    
+    if inner_parts:
+        inner = " and ".join(inner_parts)
+    else:
+        # Nothing to filter on? fall back so lfilter() can do the work.
         inner = "arp or udp or tcp or icmp or icmp6"
 
     # If VLAN is configured, widen to match both tagged and stripped paths.
@@ -832,8 +869,20 @@ def generate_packets(stream_data, interface, stop_event):
     flow_tracking_enabled = bool(stream_data.get("flow_tracking_enabled", False))
     max_packets = int(stream_data.get("max_packets", 0))  # 0 => unlimited
 
+    # Normalize rx_port - handle "Same as TX Port" and various formats
     rx_port = stream_data.get("rx_port") or interface
-    rx_interface = str(rx_port).split("Port:")[-1].strip()
+    if isinstance(rx_port, str):
+        # Handle "Same as TX Port" - use TX interface
+        if "Same as TX Port" in rx_port or rx_port.strip() == "Same as TX Port":
+            rx_interface = interface
+        else:
+            # Extract interface name from various formats: "TG X - Port: interface", "Port: interface", "interface"
+            rx_interface = str(rx_port).split("Port:")[-1].strip()
+            if not rx_interface or rx_interface == rx_port:
+                # If no "Port:" found, use the whole string as interface name
+                rx_interface = str(rx_port).strip()
+    else:
+        rx_interface = interface
     stream_data["rx_interface"] = rx_interface
 
     protocol_selection = stream_data.get("protocol_selection", {}) or {}
@@ -841,18 +890,24 @@ def generate_packets(stream_data, interface, stop_event):
     l4_sel = (stream_data.get("L4") or protocol_selection.get("L4") or "").strip()
 
     # ---- register stream row (before sniffer) ----
+    # NOTE: Stream is already registered in stream_tracker by launch_single_stream()
+    # This is just to ensure it exists if called directly (defensive programming)
     rx_thread = None
-    stream_tracker.add_stream({
-        "stream_id": stream_id,
-        "interface": interface,
-        "stream_name": stream_name,
-        "stop_event": stop_event,
-        "rx_thread": rx_thread,
-        "rx_interface": rx_interface,
-        "flow_tracking_enabled": flow_tracking_enabled
-    })
+    # Only add if not already present (avoid duplicate registration)
+    existing = stream_tracker.find_stream_by_id(interface, stream_id)
+    if not existing:
+        stream_tracker.add_stream({
+            "stream_id": stream_id,
+            "interface": interface,
+            "stream_name": stream_name,
+            "stop_event": stop_event,
+            "rx_thread": rx_thread,
+            "rx_interface": rx_interface,
+            "flow_tracking_enabled": flow_tracking_enabled
+        })
 
     # ---- RX sniffer (if enabled) ----
+    # This is the ONLY place where RX sniffer should be started (with proper selector)
     if flow_tracking_enabled:
         if rx_interface == interface:
             logging.warning(f"[RX] RX interface equals TX ('{interface}'); disabling flow tracking")
@@ -875,6 +930,18 @@ def generate_packets(stream_data, interface, stop_event):
                 rx_interface, stream_name, stream_id, stream_tracker, stop_event,
                 selector=rx_selector
             )
+            
+            # Update the stream_tracker entry with the rx_thread (for both existing and newly added streams)
+            if rx_thread:
+                if existing:
+                    existing["rx_thread"] = rx_thread
+                else:
+                    # Find the stream we just added and update it
+                    stream_entry = stream_tracker.find_stream_by_id(interface, stream_id)
+                    if stream_entry:
+                        stream_entry["rx_thread"] = rx_thread
+        else:
+            logging.warning(f"[RX] RX interface '{rx_interface}' is DOWN, skipping RX sniffer")
 
 
     # ---- DPDK/tx_worker branch (if requested) ----

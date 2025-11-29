@@ -196,6 +196,10 @@ class TrafficGenClientServerSection():
         
         # OPTIMIZATION: Defer stream table update to avoid blocking
         QTimer.singleShot(0, lambda: self._update_stream_table_if_exists())
+        
+        # Update statistics when selection changes (to show stats for selected TG)
+        if hasattr(self, "fetch_and_update_statistics"):
+            QTimer.singleShot(50, lambda: self.fetch_and_update_statistics())
     
     def _update_protocol_tables(self):
         """Update protocol tables in background after device table is shown."""
@@ -242,25 +246,69 @@ class TrafficGenClientServerSection():
 
 
     def handle_enabled_combo_change(self, value, row):
+        """Handle change in Enabled combo box with safety checks to prevent segfaults."""
+        # Safety checks: validate row and table state
+        if not hasattr(self, "stream_table") or not self.stream_table:
+            return
+        if row < 0 or row >= self.stream_table.rowCount():
+            return
+        
+        # Don't block during table population - allow user changes
+        # The other safety checks (row bounds, streams existence) are sufficient
+        
+        # Safety check: ensure self.streams exists
+        if not hasattr(self, "streams") or not self.streams:
+            return
+        
         port_item = self.stream_table.item(row, 1)
         name_item = self.stream_table.item(row, 2)
         if not port_item or not name_item:
-            print(f"[WARN] Missing port or stream name at row {row}")
             return
 
-        port = port_item.text()
-        name = name_item.text()
+        port_text = port_item.text().strip()
+        name = name_item.text().strip()
+        if not name:  # Empty name is invalid
+            return
+        
         new_flag = value == "Yes"
 
+        # Normalize port_text (remove "Port: " prefix if present)
+        normalized_port_text = port_text
+        if ":" in normalized_port_text:
+            normalized_port_text = normalized_port_text.rsplit(":", 1)[-1].strip()
+        if "Port:" in normalized_port_text:
+            normalized_port_text = normalized_port_text.replace("Port:", "").strip()
+
+        # Find the matching port key in self.streams (e.g., "TG 0 - Port: ens5np0")
+        port_key = None
+        try:
+            for key in self.streams.keys():
+                # Extract interface name from key
+                key_interface = key.split(" - ")[-1].replace("Port: ", "").strip()
+                if key_interface == normalized_port_text:
+                    port_key = key
+                    break
+        except (AttributeError, RuntimeError) as e:
+            # streams dict might be modified during iteration
+            return
+
+        if not port_key:
+            return
+
         # Update matching stream in self.streams
-        for stream in self.streams.get(port, []):
-            stream_name = stream.get("name") or stream.get("protocol_selection", {}).get("name")
-            if stream_name == name:
-                stream["enabled"] = new_flag
-                if "protocol_selection" in stream:
-                    stream["protocol_selection"]["enabled"] = new_flag
-                print(f"[DEBUG] Enabled flag updated for stream '{name}' on {port} → {value}")
-                return
+        try:
+            for stream in self.streams.get(port_key, []):
+                if not isinstance(stream, dict):
+                    continue
+                stream_name = stream.get("name") or stream.get("protocol_selection", {}).get("name")
+                if stream_name == name:
+                    stream["enabled"] = new_flag
+                    if "protocol_selection" in stream:
+                        stream["protocol_selection"]["enabled"] = new_flag
+                    return
+        except (AttributeError, RuntimeError, KeyError) as e:
+            # streams dict might be modified during iteration or key might be deleted
+            return
 
     def sync_ui_to_stream_model(self):
         """Force sync of stream table UI values (ComboBoxes) back into self.streams model."""
@@ -270,13 +318,38 @@ class TrafficGenClientServerSection():
             if not port_item or not name_item:
                 continue
 
-            port = port_item.text()
-            name = name_item.text()
-            stream_list = self.streams.get(port, [])
+            port_text = port_item.text().strip()
+            name = name_item.text().strip()
+            
+            # Normalize port_text to find the correct port key in self.streams
+            normalized_port_text = port_text
+            if ":" in normalized_port_text:
+                normalized_port_text = normalized_port_text.rsplit(":", 1)[-1].strip()
+            if "Port:" in normalized_port_text:
+                normalized_port_text = normalized_port_text.replace("Port:", "").strip()
+            
+            # Find the matching port key in self.streams (e.g., "TG 0 - Port: ens5np0")
+            port_key = None
+            try:
+                for key in self.streams.keys():
+                    key_interface = key.split(" - ")[-1].replace("Port: ", "").strip()
+                    if key_interface == normalized_port_text:
+                        port_key = key
+                        break
+            except (AttributeError, RuntimeError):
+                continue
+            
+            if not port_key:
+                continue
+            
+            stream_list = self.streams.get(port_key, [])
 
             for stream in stream_list:
+                if not isinstance(stream, dict):
+                    continue
                 ps = stream.setdefault("protocol_selection", {})
-                if ps.get("name") == name:
+                stream_name = ps.get("name") or stream.get("name", "")
+                if stream_name == name:
                     # Enabled ComboBox
                     enabled_widget = self.stream_table.cellWidget(row, 3)
                     if enabled_widget:
@@ -290,6 +363,7 @@ class TrafficGenClientServerSection():
                         is_flow = flow_widget.currentText().lower() == "yes"
                         ps["flow_tracking_enabled"] = is_flow
                         stream["flow_tracking_enabled"] = is_flow
+                    break  # Found the stream, no need to continue
 
 
 
@@ -318,15 +392,80 @@ class TrafficGenClientServerSection():
         from PyQt5.QtCore import QSignalBlocker
         from functools import partial
         import time
+        
+        # Import here to avoid repeated imports in lambda/partial calls
+        # (already imported above, but keeping for clarity)
 
         # Guard against re-entrancy while we repopulate
         if not hasattr(self, "_populating_table"):
             self._populating_table = False
         if self._populating_table:
+            # print(f"[STREAM TABLE] Skipping update - already populating (flag is True)")
             return  # Already updating, skip this call
+        
+        # Skip refresh if user is currently interacting with the table (has focus, has selection, or is editing)
+        # This prevents selection from being cleared and cell editing from being interrupted
+        has_selection = False
+        if hasattr(self.stream_table, 'selectionModel') and self.stream_table.selectionModel():
+            has_selection = len(self.stream_table.selectionModel().selectedRows()) > 0
+        
+        # Check if a cell is currently being edited
+        # Check table state - EditingState means a cell editor is open
+        is_editing = False
+        try:
+            is_editing = self.stream_table.state() == QAbstractItemView.EditingState
+        except:
+            pass
+        
+        # Check if any combo box dropdown is open (columns 3 and 15)
+        combo_dropdown_open = False
+        try:
+            for row in range(self.stream_table.rowCount()):
+                # Check Enabled combo (column 3)
+                enabled_combo = self.stream_table.cellWidget(row, 3)
+                if enabled_combo and isinstance(enabled_combo, QComboBox):
+                    if enabled_combo.view().isVisible():
+                        combo_dropdown_open = True
+                        break
+                # Check Flow Tracking combo (column 15)
+                flow_combo = self.stream_table.cellWidget(row, 15)
+                if flow_combo and isinstance(flow_combo, QComboBox):
+                    if flow_combo.view().isVisible():
+                        combo_dropdown_open = True
+                        break
+        except (AttributeError, RuntimeError, TypeError):
+            # If we can't check, assume no dropdown is open
+            pass
+        
+        if self.stream_table.hasFocus() or has_selection or is_editing or combo_dropdown_open:
+            # Delay refresh to allow user interaction to complete
+            # Use longer delay if combo dropdown is open (user needs time to select)
+            delay_ms = 1000 if combo_dropdown_open else 500
+            if not hasattr(self, "_pending_stream_refresh"):
+                self._pending_stream_refresh = False
+            if not self._pending_stream_refresh:
+                self._pending_stream_refresh = True
+                QTimer.singleShot(delay_ms, lambda: self._do_update_stream_table())
+                return
+        
+        # print(f"[STREAM TABLE] Starting _do_update_stream_table() - _populating_table was False")
         self._populating_table = True
+        self._pending_stream_refresh = False  # Clear pending flag
+        # Block signals temporarily to prevent itemChanged from firing during population
+        # This prevents handle_inline_edit from being called during table refresh
         self.stream_table.blockSignals(True)
         self._last_stream_table_update = time.time()
+        # print(f"[STREAM TABLE] Set _populating_table to True, starting table update...")
+
+        # Save current selection before clearing table
+        selected_stream_ids = set()
+        selected_rows = self.stream_table.selectionModel().selectedRows() if hasattr(self.stream_table, 'selectionModel') else []
+        for index in selected_rows:
+            name_item = self.stream_table.item(index.row(), 2)  # Name column has stream_id in UserRole
+            if name_item:
+                stream_id = name_item.data(Qt.UserRole)
+                if stream_id:
+                    selected_stream_ids.add(stream_id)
 
         try:
             self.stream_table.setRowCount(0)
@@ -376,9 +515,9 @@ class TrafficGenClientServerSection():
                 print("No online servers available. Skipping stream table update.")
                 return
             
-            print(f"[DEBUG STREAM TABLE] Selected ports: {selected_ports}")
-            print(f"[DEBUG STREAM TABLE] Online TG IDs: {online_tg_ids}")
-            print(f"[DEBUG STREAM TABLE] Available streams: {list(getattr(self, 'streams', {}).keys())}")
+            # print(f"[DEBUG STREAM TABLE] Selected ports: {selected_ports}")
+            # print(f"[DEBUG STREAM TABLE] Online TG IDs: {online_tg_ids}")
+            # print(f"[DEBUG STREAM TABLE] Available streams: {list(getattr(self, 'streams', {}).keys())}")
 
             row_count = 0
 
@@ -392,9 +531,20 @@ class TrafficGenClientServerSection():
                 port_matches = False
                 if selected_ports:
                     for selected_port in selected_ports:
-                        # Convert formats to match
-                        port_normalized = port.replace("Port: ", "")
-                        selected_port_normalized = selected_port.replace("Port: ", "")
+                        # Normalize both formats for comparison
+                        # Stream key format: "TG 0 - Port: ens5np0" or "TG 0 - ens5np0"
+                        # Selected port format: "TG 0 - ens5np0" or "TG 0 - Port: ens5np0"
+                        port_normalized = port.replace("Port: ", "").strip()
+                        selected_port_normalized = selected_port.replace("Port: ", "").strip()
+                        # Also try matching just the port name part
+                        port_parts = port_normalized.split(" - ")
+                        selected_parts = selected_port_normalized.split(" - ")
+                        if len(port_parts) >= 2 and len(selected_parts) >= 2:
+                            # Compare TG ID and port name separately
+                            if port_parts[0].strip() == selected_parts[0].strip() and port_parts[-1].strip() == selected_parts[-1].strip():
+                                port_matches = True
+                                break
+                        # Fallback: exact match after normalization
                         if port_normalized == selected_port_normalized:
                             port_matches = True
                             break
@@ -428,8 +578,13 @@ class TrafficGenClientServerSection():
                     self.stream_table.setItem(row_count, 0, status_item)
 
                     # (1) Interface (read-only) - extract just the interface name
-                    # Extract interface name from port (e.g., "TG 0 - eno8303" -> "eno8303")
+                    # Extract interface name from port (e.g., "TG 0 - Port: ens5np0" -> "ens5np0")
                     interface_name = port.split(" - ")[-1] if " - " in port else port
+                    # Remove "Port: " prefix if present
+                    if ":" in interface_name:
+                        interface_name = interface_name.rsplit(":", 1)[-1].strip()
+                    if "Port:" in interface_name:
+                        interface_name = interface_name.replace("Port:", "").strip()
                     iface_item = QTableWidgetItem(interface_name)
                     iface_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
                     self.stream_table.setItem(row_count, 1, iface_item)
@@ -453,9 +608,14 @@ class TrafficGenClientServerSection():
                     enabled_raw = stream.get("enabled")
                     if enabled_raw is None:
                         enabled_raw = ps.get("enabled", False)
+                    # Block signals while setting initial value to prevent handler from firing during refresh
+                    enabled_combo.blockSignals(True)
                     enabled_combo.setCurrentText("Yes" if bool(enabled_raw) else "No")
+                    enabled_combo.blockSignals(False)
+                    # Use functools.partial to avoid lambda closure issues with row number
+                    # This prevents segfaults when table refreshes while combo box signal fires
                     enabled_combo.currentTextChanged.connect(
-                        lambda value, row=row_count: self.handle_enabled_combo_change(value, row)
+                        partial(self.handle_enabled_combo_change, row=row_count)
                     )
                     enabled_combo.setEnabled(status != "rx_tracking")
                     self.stream_table.setCellWidget(row_count, 3, enabled_combo)
@@ -465,6 +625,8 @@ class TrafficGenClientServerSection():
                         "details", "frame_type", "frame_min", "frame_max", "frame_size",
                         "L1", "VLAN", "L2", "L3", "L4"
                     ]
+                    protocol_data = stream.get("protocol_data", {}) or {}
+                    
                     for offset, key in enumerate(column_keys):
                         value = ps.get(key, "")
                         col_index = 4 + offset
@@ -475,6 +637,42 @@ class TrafficGenClientServerSection():
                                 value = "64"
                                 ps["frame_size"] = value
                                 stream["frame_size"] = value
+                        
+                        # For VLAN column: show actual VLAN ID if Tagged
+                        elif key == "VLAN":
+                            if value == "Tagged":
+                                vlan_data = protocol_data.get("vlan", {}) or {}
+                                vlan_id = vlan_data.get("vlan_id", "")
+                                if vlan_id:
+                                    value = str(vlan_id)
+                                else:
+                                    value = "Tagged"  # Fallback if vlan_id not found
+                            # Keep "Untagged" or "Stacked" as-is
+                        
+                        # For L3 column: show actual IPv4 address if IPv4 is selected
+                        elif key == "L3":
+                            if value == "IPv4":
+                                ipv4_data = protocol_data.get("ipv4", {}) or {}
+                                src_ip = ipv4_data.get("ipv4_source", "")
+                                dst_ip = ipv4_data.get("ipv4_destination", "")
+                                if src_ip and dst_ip:
+                                    value = f"{src_ip} → {dst_ip}"
+                                elif src_ip:
+                                    value = src_ip
+                                elif dst_ip:
+                                    value = dst_ip
+                                # If no IPs found, keep "IPv4" as-is
+                            elif value == "IPv6":
+                                ipv6_data = protocol_data.get("ipv6", {}) or {}
+                                src_ip6 = ipv6_data.get("ipv6_source", "")
+                                dst_ip6 = ipv6_data.get("ipv6_destination", "")
+                                if src_ip6 and dst_ip6:
+                                    value = f"{src_ip6} → {dst_ip6}"
+                                elif src_ip6:
+                                    value = src_ip6
+                                elif dst_ip6:
+                                    value = dst_ip6
+                                # If no IPs found, keep "IPv6" as-is
 
                         item = QTableWidgetItem(str(value))
 
@@ -496,9 +694,14 @@ class TrafficGenClientServerSection():
                     # (15) Flow Tracking via combo (unified source)
                     flow_combo = QComboBox()
                     flow_combo.addItems(["Yes", "No"])
-                    flow_flag = stream.get("flow_tracking_enabled",
-                                           ps.get("flow_tracking_enabled", False))
+                    # Read flow_tracking_enabled from model (check both locations)
+                    flow_flag = stream.get("flow_tracking_enabled")
+                    if flow_flag is None:
+                        flow_flag = ps.get("flow_tracking_enabled", False)
+                    # Block signals while setting initial value to prevent handler from firing during refresh
+                    flow_combo.blockSignals(True)
                     flow_combo.setCurrentText("Yes" if flow_flag else "No")
+                    flow_combo.blockSignals(False)
                     # Use partial to bind stable row/port
                     flow_combo.currentTextChanged.connect(
                         partial(self.handle_flow_tracking_change, row=row_count, port=port)
@@ -508,21 +711,35 @@ class TrafficGenClientServerSection():
                     row_count += 1
 
             if row_count > 0:
-                print(f"Stream table updated with {row_count} rows and 16 columns.")
+                # print(f"Stream table updated with {row_count} rows and 16 columns.")
+                
+                # Restore selection after repopulating
+                if selected_stream_ids:
+                    selection_model = self.stream_table.selectionModel()
+                    if selection_model:
+                        from PyQt5.QtCore import QItemSelectionModel
+                        for row in range(self.stream_table.rowCount()):
+                            name_item = self.stream_table.item(row, 2)
+                            if name_item:
+                                stream_id = name_item.data(Qt.UserRole)
+                                if stream_id and stream_id in selected_stream_ids:
+                                    index = self.stream_table.model().index(row, 0)
+                                    selection_model.select(index, QItemSelectionModel.Select | QItemSelectionModel.Rows)
             else:
                 print("No valid streams to display for selected ports.")
 
             # Resize-after-fill
             self.stream_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
 
-            # Optional: sync any other UI with model
-            if hasattr(self, "sync_ui_to_stream_model"):
-                self.sync_ui_to_stream_model()
+            # Don't sync UI to model during refresh - handlers already update the model
+            # sync_ui_to_stream_model() can overwrite user changes if called during refresh
+            # It's only needed when explicitly syncing, not during automatic refreshes
 
         finally:
             # Re-enable signals and clear the population guard
             self.stream_table.blockSignals(False)
             self._populating_table = False
+            # print(f"[STREAM TABLE] Completed _do_update_stream_table() - set _populating_table to False")
 
     def on_server_tree_selection_changed(self):
         if not hasattr(self, "main_window"):
@@ -753,6 +970,21 @@ class TrafficGenClientServerSection():
         self.server_tree.setColumnWidth(0, 180)
         self.server_tree.setColumnWidth(1, 200)
         self.server_tree.setColumnWidth(2, 75)
+        
+        # If servers are selected (checkboxes checked), select the first TG in the tree
+        # This ensures the stream table is populated on startup
+        if hasattr(self, "selected_servers") and self.selected_servers:
+            # Select the first selected server's TG item in the tree
+            first_selected = self.selected_servers[0]
+            selected_address = first_selected.get("address")
+            for i in range(self.server_tree.topLevelItemCount()):
+                item = self.server_tree.topLevelItem(i)
+                if item.text(1) == selected_address:
+                    # Select this TG item to trigger selection change handler
+                    self.server_tree.setCurrentItem(item)
+                    # Trigger selection change handler manually to update tables
+                    QTimer.singleShot(50, lambda: self._on_server_selection_changed_combined())
+                    break
         
         # Clear the update flag
         self._updating_server_tree = False

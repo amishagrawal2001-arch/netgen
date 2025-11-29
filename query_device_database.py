@@ -162,6 +162,111 @@ def print_device_info(device: Dict, detailed: bool = False):
             if device.get("vxlan_last_error"):
                 print(f"   VXLAN Last Error: {device.get('vxlan_last_error')}")
 
+def get_stream_stats(status: Optional[str] = "Running", tg_id: Optional[int] = None):
+    """Fetch stream statistics from the server database"""
+    try:
+        params = {}
+        if status:
+            params["status"] = status
+        if tg_id is not None:
+            params["tg_id"] = tg_id
+        
+        response = requests.get(f"{SERVER_URL}/api/streams/stats", params=params or None, timeout=10)
+        if response.status_code != 200:
+            print(f"❌ Failed to fetch stream stats: HTTP {response.status_code}")
+            return None
+        data = response.json()
+        return data.get("active_streams", [])
+    except Exception as e:
+        print(f"❌ Error fetching stream stats: {e}")
+        return None
+
+def show_stream_stats(status: Optional[str] = "Running", tg_id: Optional[int] = None, detailed: bool = False):
+    """Display stream statistics queried from the database"""
+    header = "Stream Statistics"
+    if status:
+        header += f" (Status: {status})"
+    if tg_id is not None:
+        header += f" | TG {tg_id}"
+    print_header(header)
+    
+    streams = get_stream_stats(status, tg_id)
+    if streams is None:
+        return
+    
+    if not streams:
+        print("📭 No streams found for the given filter")
+        return
+    
+    print(f"📊 Found {len(streams)} stream(s)")
+    
+    for idx, stream in enumerate(streams, 1):
+        name = stream.get("stream_name") or stream.get("name") or "Unnamed"
+        stream_id = stream.get("stream_id", "N/A")
+        interface = stream.get("interface", "N/A")
+        rx_interface = stream.get("rx_interface", "N/A")
+        status_str = stream.get("status", "Unknown")
+        tx_count = stream.get("tx_count", 0)
+        rx_count = stream.get("rx_count", 0)
+        tx_rate = stream.get("tx_rate", 0.0)
+        rx_rate = stream.get("rx_rate", 0.0)
+        flow_tracking = stream.get("flow_tracking_enabled", False)
+        started_at = stream.get("started_at", "N/A")
+        updated_at = stream.get("updated_at", "N/A")
+        tg_id_display = stream.get("tg_id", "N/A")
+        
+        print(f"\n▶️  Stream {idx}: {name}")
+        print(f"   ID: {stream_id}")
+        print(f"   TG ID: {tg_id_display}")
+        print(f"   Interface: {interface}")
+        print(f"   RX Interface: {rx_interface}")
+        print(f"   Status: {status_str}")
+        print(f"   Flow Tracking: {'Enabled' if flow_tracking else 'Disabled'}")
+        print(f"   TX Count: {tx_count}")
+        print(f"   RX Count: {rx_count}")
+        print(f"   TX Rate: {tx_rate:.2f} pps")
+        print(f"   RX Rate: {rx_rate:.2f} pps")
+        
+        # Show internal fields for debugging rate calculation
+        last_tx_count = stream.get("last_tx_count")
+        last_rx_count = stream.get("last_rx_count")
+        last_update = stream.get("last_update")
+        
+        if last_tx_count is not None or last_rx_count is not None or last_update:
+            print(f"   ── Debug Info (for rate calculation) ──")
+            if last_tx_count is not None:
+                print(f"   Last TX Count: {last_tx_count}")
+            if last_rx_count is not None:
+                print(f"   Last RX Count: {last_rx_count}")
+            if last_update:
+                print(f"   Last Update: {last_update}")
+            
+            # Calculate expected rates if we have the data
+            if last_update and updated_at and last_update != "N/A" and updated_at != "N/A":
+                try:
+                    from datetime import datetime
+                    last_update_dt = datetime.fromisoformat(last_update.replace('Z', '+00:00'))
+                    updated_at_dt = datetime.fromisoformat(updated_at.replace('Z', '+00:00'))
+                    time_diff = (updated_at_dt - last_update_dt).total_seconds()
+                    
+                    if time_diff > 0:
+                        if last_tx_count is not None and tx_count != last_tx_count:
+                            expected_tx_rate = (tx_count - last_tx_count) / time_diff
+                            print(f"   Expected TX Rate: {expected_tx_rate:.2f} pps (calc: ({tx_count} - {last_tx_count}) / {time_diff:.2f}s)")
+                        if last_rx_count is not None and rx_count != last_rx_count:
+                            expected_rx_rate = (rx_count - last_rx_count) / time_diff
+                            print(f"   Expected RX Rate: {expected_rx_rate:.2f} pps (calc: ({rx_count} - {last_rx_count}) / {time_diff:.2f}s)")
+                        print(f"   Time Diff: {time_diff:.2f} seconds")
+                except Exception as e:
+                    print(f"   Error calculating expected rates: {e}")
+        
+        print(f"   Started At: {started_at}")
+        print(f"   Last Updated: {updated_at}")
+        
+        if detailed:
+            # Print raw JSON for debugging/inspection
+            print(f"   Raw Stream Data: {json.dumps(stream, indent=6)}")
+
 def print_protocol_summary(devices: List[Dict]):
     """Print a consolidated summary of all BGP, OSPF, and ISIS neighbor IP addresses"""
     print(f"\n{'='*80}")
@@ -759,6 +864,11 @@ def main():
     parser.add_argument("--device-pools", type=str, help="Show route pools attached to specific device")
     parser.add_argument("--search-pools", type=str, help="Search route pools by name or subnet")
     
+    # Stream statistics arguments
+    parser.add_argument("--streams", action="store_true", help="Show stream statistics from database")
+    parser.add_argument("--stream-status", type=str, default="Running", help="Filter stream stats by status (default: Running)")
+    parser.add_argument("--stream-tg", type=int, help="Filter stream stats by TG ID")
+    
     args = parser.parse_args()
     
     # Update server URL if provided
@@ -796,6 +906,8 @@ def main():
         search_route_pools(args.search_pools, args.detailed)
     elif args.pools:
         list_route_pools(args.detailed)
+    elif args.streams:
+        show_stream_stats(status=args.stream_status, tg_id=args.stream_tg, detailed=args.detailed)
     elif args.device:
         show_device(args.device, args.events, args.stats)
     elif args.search:
