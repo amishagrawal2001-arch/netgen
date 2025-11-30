@@ -326,11 +326,22 @@ def restart_stream():
             logging.warning(f"Missing stream_id for stream '{stream_name}'. Skipping.")
             continue
 
-        # 🛑 Stop previous stream
+        # 🛑 Stop previous stream(s)
+        # First try by stream_id (most reliable)
         existing = stream_tracker.find_stream_by_id(interface, stream_id)
         if existing:
-            logging.info(f"Stopping stream {stream_id} on {interface}")
+            logging.info(f"Stopping stream {stream_id} on {interface} (found by stream_id)")
             existing["stop_event"].set()
+            
+            # Wait for the thread to actually finish (with timeout)
+            future = existing.get("future")
+            if future:
+                logging.info(f"⏳ Waiting for thread to finish for stream {stream_id}...")
+                try:
+                    future.result(timeout=5.0)
+                    logging.info(f"✅ Thread completed for stream {stream_id}")
+                except Exception as e:
+                    logging.warning(f"⚠️ Thread for stream {stream_id} did not complete within timeout: {e}")
             
             # Wait a brief moment for RX sniffer cleanup if flow tracking was enabled
             if existing.get("flow_tracking_enabled") and existing.get("rx_interface") != interface:
@@ -339,7 +350,38 @@ def restart_stream():
             
             stream_tracker.remove_stream_by_id(interface, stream_id)
         else:
-            logging.warning(f"Stream {stream_id} not found on {interface}")
+            # Fallback: try to find by name (in case stream_id changed or doesn't match)
+            logging.warning(f"Stream {stream_id} not found on {interface}, trying to find by name '{stream_name}'")
+            streams_by_name = stream_tracker.find_streams_by_name(interface, stream_name)
+            if streams_by_name:
+                logging.info(f"Found {len(streams_by_name)} stream(s) with name '{stream_name}' on {interface}, stopping all")
+                for s in streams_by_name:
+                    actual_stream_id = s.get("stream_id")
+                    logging.info(f"Stopping stream {actual_stream_id} (name: '{stream_name}') on {interface}")
+                    s["stop_event"].set()
+                    
+                    # Wait for the thread to actually finish (with timeout)
+                    future = s.get("future")
+                    if future:
+                        try:
+                            future.result(timeout=5.0)
+                            logging.info(f"✅ Thread completed for stream {actual_stream_id}")
+                        except Exception as e:
+                            logging.warning(f"⚠️ Thread for stream {actual_stream_id} did not complete within timeout: {e}")
+                    
+                    # Wait for RX sniffer cleanup if needed
+                    if s.get("flow_tracking_enabled") and s.get("rx_interface") != interface:
+                        import time
+                        time.sleep(0.5)
+                    
+                    # Remove each stream
+                    stream_tracker.remove_stream_by_id(interface, actual_stream_id)
+                
+                # Wait a bit longer to ensure threads have stopped
+                import time
+                time.sleep(0.5)
+            else:
+                logging.warning(f"No stream found with stream_id {stream_id} or name '{stream_name}' on {interface}")
 
         # 🚀 Restart using updated data
         stream_data["stream_id"] = stream_id  # Reuse existing ID
@@ -387,6 +429,9 @@ def launch_single_stream(stream_data, interface):
     elif flow_tracking:
         logging.info(f"🔇 Flow tracking disabled: RX interface equals TX ('{rx_interface}')")
 
+    # Submit the stream generation task and track the Future
+    future = executor.submit(generate_packets, stream_data, interface, stop_event)
+    
     stream_tracker.add_stream({
         "interface": interface,
         "stream_name": stream_name,
@@ -394,11 +439,11 @@ def launch_single_stream(stream_data, interface):
         "stop_event": stop_event,
         "rx_thread": rx_thread,
         "rx_interface": rx_interface,
-        "flow_tracking_enabled": flow_tracking
+        "flow_tracking_enabled": flow_tracking,
+        "future": future  # Track the Future so we can wait for thread completion
     })
 
     try:
-        executor.submit(generate_packets, stream_data, interface, stop_event)
         logging.info(f"🚀 Launched stream '{stream_name}' on interface '{interface}'")
         return {
             "interface": interface,
@@ -429,7 +474,22 @@ def start_traffic():
     started_streams = []
 
     for interface_label, stream_list in streams.items():
-        interface_name = interface_label.split(":")[-1].strip()
+        # Normalize interface name to match stop endpoint normalization
+        def normalize_iface(iface_str):
+            """Normalize interface name from UI label format."""
+            if not iface_str:
+                return ""
+            s = iface_str.strip().strip('"').rstrip(",")
+            if " - " in s:
+                s = s.split(" - ", 1)[-1].strip()
+            if ":" in s:
+                s = s.rsplit(":", 1)[-1].strip()
+            if "Port:" in s:
+                s = s.replace("Port:", "").strip()
+            parts = s.split()
+            return parts[-1] if parts else ""
+        
+        interface_name = normalize_iface(interface_label)
 
         for stream_data in stream_list:
             stream_name = stream_data.get("name", "Unnamed Stream")
@@ -460,11 +520,43 @@ def start_traffic():
                 rx_interface = interface_name
             stream_data["rx_interface"] = rx_interface
 
-            # Prevent duplicates
+            # Prevent duplicates - check by stream_id first
             existing = stream_tracker.find_stream_by_id(interface_name, stream_id)
             if existing:
                 logging.warning(f"⚠️ Stream '{stream_name}' already running on {interface_name} with ID {stream_id}")
                 continue
+            
+            # CRITICAL: Check for existing streams with same name (different stream_id)
+            # This handles the case where stream was edited/restarted and stream_id changed
+            # but old stream with same name is still running
+            existing_by_name = stream_tracker.find_streams_by_name(interface_name, stream_name)
+            if existing_by_name:
+                logging.warning(f"⚠️ Found {len(existing_by_name)} existing stream(s) with name '{stream_name}' on {interface_name}, stopping them first")
+                for existing_stream in existing_by_name:
+                    existing_stream_id = existing_stream.get("stream_id")
+                    logging.info(f"Stopping existing stream {existing_stream_id} (name: '{stream_name}') before starting new one")
+                    existing_stream["stop_event"].set()
+                    
+                    # Wait for the thread to actually finish (with timeout)
+                    future = existing_stream.get("future")
+                    if future:
+                        logging.info(f"⏳ Waiting for thread to finish for stream {existing_stream_id}...")
+                        try:
+                            future.result(timeout=5.0)
+                            logging.info(f"✅ Thread completed for stream {existing_stream_id}")
+                        except Exception as e:
+                            logging.warning(f"⚠️ Thread for stream {existing_stream_id} did not complete within timeout: {e}")
+                    
+                    # Wait for RX sniffer cleanup if flow tracking was enabled
+                    if existing_stream.get("flow_tracking_enabled") and existing_stream.get("rx_interface") != interface_name:
+                        import time
+                        time.sleep(0.5)
+                    
+                    stream_tracker.remove_stream_by_id(interface_name, existing_stream_id)
+                
+                # Wait a bit to ensure threads have stopped before starting new stream
+                import time
+                time.sleep(0.5)
 
             try:
                 result = launch_single_stream(stream_data, interface_name)
@@ -552,11 +644,30 @@ def stop_traffic():
         interface_normalized = normalize_iface(interface)
         
         logging.info(f"🛑 Attempting to stop stream ID: {stream_id} on interface: {interface} (normalized: {interface_normalized})")
-        #stream = stream_tracker.get_stream_by_id(interface_normalized, stream_id)
+        
+        # Debug: Log all active streams for this interface
+        all_active = stream_tracker.get_stream_stats()
+        matching_interface_streams = [s for s in all_active if s.get("interface") == interface_normalized]
+        logging.info(f"🔍 DEBUG: Found {len(matching_interface_streams)} active stream(s) on interface '{interface_normalized}': {[{'id': s.get('stream_id'), 'name': s.get('stream_name')} for s in matching_interface_streams]}")
+        
         stream = stream_tracker.find_stream_by_id(interface_normalized, stream_id)
 
         if stream:
+            logging.info(f"✅ Found stream by stream_id: {stream_id}")
             stream["stop_event"].set()
+            
+            # Wait for the thread to actually finish (with timeout)
+            future = stream.get("future")
+            if future:
+                logging.info(f"⏳ Waiting for thread to finish for stream {stream_id}...")
+                try:
+                    # Wait up to 5 seconds for thread to complete
+                    future.result(timeout=5.0)
+                    logging.info(f"✅ Thread completed for stream {stream_id}")
+                except Exception as e:
+                    # Thread might still be running, but we'll proceed
+                    logging.warning(f"⚠️ Thread for stream {stream_id} did not complete within timeout: {e}")
+            
             stream_tracker.remove_stream_by_id(interface_normalized, stream_id)
             # Mark stream as stopped in database
             try:
@@ -568,7 +679,80 @@ def stop_traffic():
             logging.info(f"🛑 Stream stopped: {stream_id} on {interface_normalized} (Reason: manual)")
             stopped.append({"interface": interface_normalized, "stream_id": stream_id})
         else:
-            logging.warning(f"❌ Stream ID '{stream_id}' not found on interface '{interface}'")
+            # Fallback: try to find by name if we have stream_name in the request
+            stream_name = entry.get("stream_name")
+            if stream_name:
+                logging.warning(f"❌ Stream ID '{stream_id}' not found, trying to find by name '{stream_name}' on interface '{interface_normalized}'")
+                streams_by_name = stream_tracker.find_streams_by_name(interface_normalized, stream_name)
+                if streams_by_name:
+                    logging.info(f"Found {len(streams_by_name)} stream(s) with name '{stream_name}', stopping all")
+                    for s in streams_by_name:
+                        actual_stream_id = s.get("stream_id")
+                        logging.info(f"Stopping stream {actual_stream_id} (name: '{stream_name}') on {interface_normalized}")
+                        s["stop_event"].set()
+                        
+                        # Wait for the thread to actually finish (with timeout)
+                        future = s.get("future")
+                        if future:
+                            try:
+                                future.result(timeout=5.0)
+                                logging.info(f"✅ Thread completed for stream {actual_stream_id}")
+                            except Exception as e:
+                                logging.warning(f"⚠️ Thread for stream {actual_stream_id} did not complete within timeout: {e}")
+                        
+                        # Wait for RX sniffer cleanup if needed
+                        if s.get("flow_tracking_enabled") and s.get("rx_interface") != interface_normalized:
+                            import time
+                            time.sleep(0.5)
+                        
+                        stream_tracker.remove_stream_by_id(interface_normalized, actual_stream_id)
+                        
+                        # Mark as stopped in database
+                        try:
+                            stream_db.stop_stream(actual_stream_id)
+                        except Exception as db_error:
+                            logging.warning(f"⚠️ Failed to update stream {actual_stream_id} status in database: {db_error}")
+                        
+                        stopped.append({"interface": interface_normalized, "stream_id": actual_stream_id})
+                    
+                    # Wait a bit to ensure threads have stopped
+                    import time
+                    time.sleep(0.5)
+                else:
+                    # Last resort: try to find ANY stream on this interface (in case name doesn't match either)
+                    logging.warning(f"❌ Stream ID '{stream_id}' and name '{stream_name}' not found. Checking all streams on interface '{interface_normalized}'")
+                    if matching_interface_streams:
+                        logging.warning(f"⚠️ Found {len(matching_interface_streams)} other stream(s) on this interface. Stopping all to prevent orphaned streams.")
+                        for s in matching_interface_streams:
+                            actual_stream_id = s.get("stream_id")
+                            actual_name = s.get("stream_name")
+                            logging.info(f"Stopping orphaned stream {actual_stream_id} (name: '{actual_name}') on {interface_normalized}")
+                            # Find the stream object to set stop_event
+                            stream_obj = stream_tracker.find_stream_by_id(interface_normalized, actual_stream_id)
+                            if stream_obj:
+                                stream_obj["stop_event"].set()
+                                
+                                # Wait for the thread to actually finish (with timeout)
+                                future = stream_obj.get("future")
+                                if future:
+                                    try:
+                                        future.result(timeout=5.0)
+                                        logging.info(f"✅ Thread completed for orphaned stream {actual_stream_id}")
+                                    except Exception as e:
+                                        logging.warning(f"⚠️ Thread for orphaned stream {actual_stream_id} did not complete within timeout: {e}")
+                                
+                                stream_tracker.remove_stream_by_id(interface_normalized, actual_stream_id)
+                                try:
+                                    stream_db.stop_stream(actual_stream_id)
+                                except Exception:
+                                    pass
+                                stopped.append({"interface": interface_normalized, "stream_id": actual_stream_id})
+                        import time
+                        time.sleep(0.5)
+                    else:
+                        logging.warning(f"❌ Stream ID '{stream_id}' and name '{stream_name}' not found on interface '{interface_normalized}'")
+            else:
+                logging.warning(f"❌ Stream ID '{stream_id}' not found on interface '{interface_normalized}' and no stream_name provided for fallback")
 
     return jsonify({"stopped": stopped}), 200
 

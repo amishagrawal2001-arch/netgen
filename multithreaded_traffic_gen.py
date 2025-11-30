@@ -109,6 +109,7 @@ class StreamTracker:
                 "rx_thread": stream.get("rx_thread"),
                 "rx_interface": stream.get("rx_interface"),
                 "flow_tracking_enabled": stream.get("flow_tracking_enabled", False),
+                "future": stream.get("future"),  # Track Future object to wait for thread completion
                 "tx_count": 0,
                 "rx_count": 0
             })
@@ -171,6 +172,15 @@ class StreamTracker:
                 if s["interface"] == interface and s["stream_id"] == stream_id:
                     return s
         return None
+
+    def find_streams_by_name(self, interface, stream_name):
+        """Find all streams with matching name on the given interface."""
+        with self.lock:
+            matches = []
+            for s in self.active_streams:
+                if s["interface"] == interface and s["stream_name"] == stream_name:
+                    matches.append(s)
+            return matches
 
     def remove_stream_by_id(self, interface, stream_id):
         with self.lock:
