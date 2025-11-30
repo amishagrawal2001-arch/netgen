@@ -347,45 +347,48 @@ deploy_on_server() {
             PYTHON_LIB_PATH="$SERVER_PATH"
         fi
         
-        # Extract and copy files from wheel to ensure we have the latest versions
-        log "Extracting files from wheel..."
+        # Extract ALL files from wheel to ensure complete deployment
+        # rebuild_quick.sh builds the complete package, deploy.sh deploys everything
+        log "Extracting all files from wheel package to $SERVER_PATH..."
         cd $SERVER_PATH
-        python3 -m zipfile -e ostg_trafficgen-0.1.52-py3-none-any.whl /tmp/wheel_extract 2>/dev/null || unzip -q ostg_trafficgen-0.1.52-py3-none-any.whl -d /tmp/wheel_extract 2>/dev/null || true
         
-        # Copy run_tgen_server.py
-        if [[ -f "/tmp/wheel_extract/run_tgen_server.py" ]]; then
-            cp /tmp/wheel_extract/run_tgen_server.py $SERVER_PATH/run_tgen_server.py
-            info "Copied run_tgen_server.py from wheel"
-        elif [[ -f "\$PYTHON_LIB_PATH/run_tgen_server.py" ]]; then
-            cp \$PYTHON_LIB_PATH/run_tgen_server.py $SERVER_PATH/run_tgen_server.py
-            info "Copied run_tgen_server.py from site-packages"
+        # Extract wheel to temporary directory
+        EXTRACT_DIR="/tmp/wheel_extract_ostg"
+        rm -rf \$EXTRACT_DIR 2>/dev/null || true
+        mkdir -p \$EXTRACT_DIR
+        
+        # Extract wheel (wheel is a zip file)
+        if python3 -m zipfile -e ostg_trafficgen-0.1.52-py3-none-any.whl \$EXTRACT_DIR 2>/dev/null || \
+           unzip -q ostg_trafficgen-0.1.52-py3-none-any.whl -d \$EXTRACT_DIR 2>/dev/null; then
+            
+            # Copy ALL files from wheel to $SERVER_PATH, excluding metadata
+            # The wheel contains everything built by rebuild_quick.sh
+            if [[ -d "\$EXTRACT_DIR" ]]; then
+                # Copy all files and directories, excluding dist-info metadata
+                find \$EXTRACT_DIR -mindepth 1 -maxdepth 1 ! -name "*.dist-info" ! -name "*.egg-info" | while read -r item; do
+                    item_name="\$(basename "\$item")"
+                    # Skip metadata directories
+                    if [[ "\$item_name" != *"dist-info"* ]] && [[ "\$item_name" != *"egg-info"* ]]; then
+                        if [[ -d "\$item" ]]; then
+                            # Copy directory recursively
+                            cp -r "\$item" "$SERVER_PATH/"
+                            info "Copied directory \$item_name from wheel"
+                        elif [[ -f "\$item" ]]; then
+                            # Copy file
+                            cp "\$item" "$SERVER_PATH/"
+                            info "Copied file \$item_name from wheel"
+                        fi
+                    fi
+                done
+                
+                info "Successfully extracted and deployed all files from wheel package"
+            fi
         else
-            warn "run_tgen_server.py not found in wheel"
+            warn "Failed to extract wheel file, files may be incomplete"
         fi
         
-        # Copy utils directory files (ensure latest version)
-        if [[ -d "/tmp/wheel_extract/utils" ]]; then
-            mkdir -p $SERVER_PATH/utils
-            cp -r /tmp/wheel_extract/utils/* $SERVER_PATH/utils/
-            info "Copied utils directory from wheel"
-        elif [[ -d "\$PYTHON_LIB_PATH/utils" ]]; then
-            mkdir -p $SERVER_PATH/utils
-            cp -r \$PYTHON_LIB_PATH/utils/* $SERVER_PATH/utils/
-            info "Copied utils directory from site-packages"
-        fi
-        
-        # Copy widgets directory files (ensure latest version for server-side functions)
-        if [[ -d "/tmp/wheel_extract/widgets" ]]; then
-            mkdir -p $SERVER_PATH/widgets
-            cp -r /tmp/wheel_extract/widgets/* $SERVER_PATH/widgets/
-            info "Copied widgets directory from wheel"
-        elif [[ -d "\$PYTHON_LIB_PATH/widgets" ]]; then
-            mkdir -p $SERVER_PATH/widgets
-            cp -r \$PYTHON_LIB_PATH/widgets/* $SERVER_PATH/widgets/
-            info "Copied widgets directory from site-packages"
-        fi
-        
-        rm -rf /tmp/wheel_extract 2>/dev/null || true
+        # Clean up extraction directory
+        rm -rf \$EXTRACT_DIR 2>/dev/null || true
         
         # Update systemd service file to use /opt/OSTG and set PYTHONPATH
         log "Updating systemd service file..."
