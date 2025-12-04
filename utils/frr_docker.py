@@ -463,6 +463,9 @@ class FRRDockerManager:
             
             logger.info(f"[FRR] Final loopback values: loopback_ipv4={loopback_ipv4}, loopback_ipv6={loopback_ipv6}")
             
+            # Get MTU from device_config
+            mtu = device_config.get('mtu', '1500') if device_config else '1500'
+            
             # Build vtysh commands for interface configuration
             vtysh_commands = ["configure terminal", f"interface {iface_name}"]
 
@@ -473,6 +476,10 @@ class FRRDockerManager:
             
             if ipv6_addr:
                 vtysh_commands.append(f" ipv6 address {ipv6_addr}/{ipv6_mask}")
+            
+            # Set MTU if provided
+            if mtu and mtu.isdigit():
+                vtysh_commands.append(f" ip mtu {mtu}")
             
             vtysh_commands.extend([
                 " no shutdown",

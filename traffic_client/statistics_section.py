@@ -221,7 +221,11 @@ class TrafficGenClientStatisticsSection():
             server_address = server["address"]
 
             try:
-                response = requests.get(f"{server_address}/api/streams/stats", timeout=2)
+                # Use connection_manager if available for better timeout handling
+                if hasattr(self, 'connection_manager') and self.connection_manager:
+                    response = self.connection_manager.get(f"{server_address}/api/streams/stats", timeout=1)
+                else:
+                    response = requests.get(f"{server_address}/api/streams/stats", timeout=1)
                 if response.status_code == 200:
                     stream_stats = response.json().get("active_streams", [])
                     print(f"[DEBUG STREAM STATS] Got {len(stream_stats)} stream(s) from {server_address}")
@@ -237,6 +241,7 @@ class TrafficGenClientStatisticsSection():
                         stream["_tg_id"] = tg_id
                     all_stream_stats.extend(stream_stats)
                     
+                    # Process stream statistics for merged_statistics
                     for stream in stream_stats:
                         tx_port = stream.get("interface")
                         rx_port_raw = stream.get("rx_interface") or stream.get("rx_port")
@@ -258,24 +263,38 @@ class TrafficGenClientStatisticsSection():
                             stream_entry["stream_id"] = stream_id
                             stream_entry["flow_tracking_enabled"] = flow_tracking
 
+                            # Get frame_size from stream stats if available, otherwise default to 64
+                            frame_size = stream.get("frame_size", 64)
+                            try:
+                                frame_size = int(frame_size)
+                            except (ValueError, TypeError):
+                                frame_size = 64
+                            
                             merged_statistics[tx_iface]["tx"] += tx
-                            merged_statistics[tx_iface]["sent_bytes"] += tx * 64
+                            merged_statistics[tx_iface]["sent_bytes"] += tx * frame_size
                             merged_statistics[tx_iface]["send_fps"] += tx // 10
-                            merged_statistics[tx_iface]["send_bps"] += tx * 64 * 8
+                            merged_statistics[tx_iface]["send_bps"] += tx * frame_size * 8
                             
                             # For flow tracking, RX count should be aggregated in TX interface column for loss calculation
                             if flow_tracking:
                                 merged_statistics[tx_iface]["rx"] += rx
-                                merged_statistics[tx_iface]["received_bytes"] += rx * 64
+                                merged_statistics[tx_iface]["received_bytes"] += rx * frame_size
                                 merged_statistics[tx_iface]["receive_fps"] += rx // 10
-                                merged_statistics[tx_iface]["receive_bps"] += rx * 64 * 8
+                                merged_statistics[tx_iface]["receive_bps"] += rx * frame_size * 8
 
                         # RX aggregation (for display on RX interface column, but loss is calculated on TX interface)
                         if rx_iface and rx_iface in merged_statistics:
+                            # Get frame_size from stream stats if available, otherwise default to 64
+                            frame_size = stream.get("frame_size", 64)
+                            try:
+                                frame_size = int(frame_size)
+                            except (ValueError, TypeError):
+                                frame_size = 64
+                            
                             merged_statistics[rx_iface]["rx"] += rx
-                            merged_statistics[rx_iface]["received_bytes"] += rx * 64
+                            merged_statistics[rx_iface]["received_bytes"] += rx * frame_size
                             merged_statistics[rx_iface]["receive_fps"] += rx // 10
-                            merged_statistics[rx_iface]["receive_bps"] += rx * 64 * 8
+                            merged_statistics[rx_iface]["receive_bps"] += rx * frame_size * 8
 
                             stream_entry = merged_statistics[rx_iface]["streams"].setdefault(stream_name, {})
                             stream_entry["rx_count"] = rx
@@ -452,7 +471,11 @@ class TrafficGenClientStatisticsSection():
 
             url = f"{server['address']}/api/streams/stats"
             try:
-                response = requests.get(url, timeout=3)
+                # Use shorter timeout and connection_manager if available
+                if hasattr(self, 'connection_manager') and self.connection_manager:
+                    response = self.connection_manager.get(url, timeout=1)
+                else:
+                    response = requests.get(url, timeout=1)
                 if response.status_code == 200:
                     data = response.json()
                     stream_stats = data.get("active_streams", [])
@@ -471,8 +494,15 @@ class TrafficGenClientStatisticsSection():
                         QTimer.singleShot(0, lambda: self.update_stream_table())
                 else:
                     raise Exception(f"HTTP {response.status_code}")
+            except requests.exceptions.Timeout:
+                # Timeout - don't block, just skip this server
+                print(f"[POLL STREAM STATS] Timeout fetching stats from {url} (non-blocking)")
+            except requests.exceptions.ConnectionError:
+                # Connection error - don't block, just skip this server
+                print(f"[POLL STREAM STATS] Connection error fetching stats from {url} (non-blocking)")
             except Exception as e:
-                print(f"❌ Failed to fetch /api/streams/stats from {url}: {e}")
+                # Any other error - don't block, just log
+                print(f"[POLL STREAM STATS] Failed to fetch /api/streams/stats from {url}: {e} (non-blocking)")
                 #self.mark_server_offline(server, "poll_stream_stats failure")
         
         # Update stream statistics table with all collected streams (always call to clear if empty)
@@ -522,29 +552,72 @@ class TrafficGenClientStatisticsSection():
 
             matched_streams = self.streams.get(matched_iface, [])
 
+            # Get stream_id from table item (more reliable than matching by name)
+            stream_id_from_table = stream_name_item.data(Qt.UserRole) if stream_name_item else None
+            
             for stream in matched_streams:
-                if stream.get("name") == stream_name:
-                    stream_id = stream.get("stream_id")
-                    old_status = stream.get("status", "stopped")
-                    
-                    if stream_id and stream_id in stat_map:
-                        new_status = "running"
-                        stat_entry = stat_map[stream_id]
-                        # Update stream object with latest statistics
-                        stream["status"] = new_status
-                        stream["tx_count"] = stat_entry.get("tx_count", 0)
-                        stream["rx_count"] = stat_entry.get("rx_count", 0)
-                        stream["tx_rate"] = stat_entry.get("tx_rate", 0.0)
-                        stream["rx_rate"] = stat_entry.get("rx_rate", 0.0)
-                        self.update_stream_status(row, "green")
-                    else:
-                        new_status = "stopped"
-                        stream["status"] = new_status
-                        self.update_stream_status(row, "red")
-                    
-                    if old_status != new_status:
-                        status_changed = True
-                    break
+                # Match by stream_id first (most reliable), then fall back to name
+                stream_id = stream.get("stream_id")
+                stream_name_match = stream.get("name") == stream_name or stream.get("protocol_selection", {}).get("name") == stream_name
+                
+                # Only update if stream_id matches OR (if no stream_id in table, match by name)
+                if stream_id_from_table:
+                    # If table has stream_id, use it for matching (most reliable)
+                    if stream_id != stream_id_from_table:
+                        continue
+                elif not stream_name_match:
+                    # If no stream_id in table, match by name (fallback)
+                    continue
+                
+                old_status = stream.get("status", "stopped")
+                
+                # Get status from server response (this is the source of truth)
+                server_status = None
+                if stream_id and stream_id in stat_map:
+                    stat_entry = stat_map[stream_id]
+                    server_status = stat_entry.get("status", "Unknown").lower()
+                    # Update stream object with latest statistics
+                    stream["tx_count"] = stat_entry.get("tx_count", 0)
+                    stream["rx_count"] = stat_entry.get("rx_count", 0)
+                    stream["tx_rate"] = stat_entry.get("tx_rate", 0.0)
+                    stream["rx_rate"] = stat_entry.get("rx_rate", 0.0)
+                elif stream_id_from_table and stream_id_from_table in stat_map:
+                    # If stream_id from table matches, use that
+                    stat_entry = stat_map[stream_id_from_table]
+                    server_status = stat_entry.get("status", "Unknown").lower()
+                    stream["tx_count"] = stat_entry.get("tx_count", 0)
+                    stream["rx_count"] = stat_entry.get("rx_count", 0)
+                    stream["tx_rate"] = stat_entry.get("tx_rate", 0.0)
+                    stream["rx_rate"] = stat_entry.get("rx_rate", 0.0)
+                
+                # Determine status based on server's status field (not just presence in stat_map)
+                if server_status == "running":
+                    new_status = "running"
+                    stream["status"] = new_status
+                    self.update_stream_status(row, "green")
+                elif server_status == "stopped":
+                    new_status = "stopped"
+                    stream["status"] = new_status
+                    # Zero out rates for stopped streams
+                    stream["tx_rate"] = 0.0
+                    stream["rx_rate"] = 0.0
+                    self.update_stream_status(row, "red")
+                elif (stream_id and stream_id in stat_map) or (stream_id_from_table and stream_id_from_table in stat_map):
+                    # Fallback: if status not provided but stream is in stats, assume running
+                    new_status = "running"
+                    stream["status"] = new_status
+                    self.update_stream_status(row, "green")
+                else:
+                    # Stream not in stats at all - definitely stopped
+                    new_status = "stopped"
+                    stream["status"] = new_status
+                    stream["tx_rate"] = 0.0
+                    stream["rx_rate"] = 0.0
+                    self.update_stream_status(row, "red")
+                
+                if old_status != new_status:
+                    status_changed = True
+                break  # Only update the first matching stream
         
         # If status changed, refresh the entire stream table to show updated information
         if status_changed and hasattr(self, "update_stream_table"):
@@ -679,18 +752,22 @@ class TrafficGenClientStatisticsSection():
 
     def update_stream_statistics_table(self, stream_stats_list):
         """Update the stream statistics table with detailed per-stream information."""
-        if not hasattr(self, "stream_statistics_table"):
-            print(f"[DEBUG STREAM STATS] stream_statistics_table not found")
+        if not hasattr(self, "stream_statistics_table") or self.stream_statistics_table is None:
+            print(f"[DEBUG STREAM STATS] stream_statistics_table not found or not initialized")
             return
         
         # Set column count first (9 columns: Stream Name, Interface, TX Count, RX Count, TX Rate, RX Rate, Loss %, Status, Flow Tracking)
-        self.stream_statistics_table.setColumnCount(9)
-        self.stream_statistics_table.setHorizontalHeaderLabels([
-            "Stream Name", "Interface", "TX Count", "RX Count", "TX Rate", "RX Rate", 
-            "Loss %", "Status", "Flow Tracking"
-        ])
-        
-        self.stream_statistics_table.setRowCount(0)
+        try:
+            self.stream_statistics_table.setColumnCount(9)
+            self.stream_statistics_table.setHorizontalHeaderLabels([
+                "Stream Name", "Interface", "TX Count", "RX Count", "TX Rate", "RX Rate", 
+                "Loss %", "Status", "Flow Tracking"
+            ])
+            
+            self.stream_statistics_table.setRowCount(0)
+        except Exception as e:
+            print(f"[DEBUG STREAM STATS] Error initializing stream_statistics_table: {e}")
+            return
         
         if not stream_stats_list:
             print(f"[DEBUG STREAM STATS] stream_stats_list is empty")

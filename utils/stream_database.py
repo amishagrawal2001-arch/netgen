@@ -127,23 +127,57 @@ class StreamDatabase:
                 exists = cursor.fetchone()
                 
                 if exists:
-                    # Update existing stream (preserve last_update for rate calculation)
-                    conn.execute("""
-                        UPDATE streams SET
-                            stream_name = ?,
-                            interface = ?,
-                            rx_interface = ?,
-                            server_url = ?,
-                            tg_id = ?,
-                            flow_tracking_enabled = ?,
-                            status = ?,
-                            updated_at = ?,
-                            stream_config = ?
-                        WHERE stream_id = ?
-                    """, (
-                        stream_name, interface, rx_interface, server_url, tg_id,
-                        int(flow_tracking_enabled), 'Running', now, config_json, stream_id
-                    ))
+                    # Check if stream was previously stopped - if so, reset last_update
+                    cursor_status = conn.execute(
+                        "SELECT status FROM streams WHERE stream_id = ?",
+                        (stream_id,)
+                    )
+                    status_row = cursor_status.fetchone()
+                    was_stopped = status_row and status_row[0] == 'Stopped'
+                    
+                    # Update existing stream
+                    # If stream was stopped, reset last_update to current time for accurate rate calculation
+                    if was_stopped:
+                        conn.execute("""
+                            UPDATE streams SET
+                                stream_name = ?,
+                                interface = ?,
+                                rx_interface = ?,
+                                server_url = ?,
+                                tg_id = ?,
+                                flow_tracking_enabled = ?,
+                                status = ?,
+                                started_at = ?,
+                                updated_at = ?,
+                                last_update = ?,
+                                last_tx_count = 0,
+                                last_rx_count = 0,
+                                tx_count = 0,
+                                rx_count = 0,
+                                stream_config = ?
+                            WHERE stream_id = ?
+                        """, (
+                            stream_name, interface, rx_interface, server_url, tg_id,
+                            int(flow_tracking_enabled), 'Running', now, now, now, config_json, stream_id
+                        ))
+                    else:
+                        # Stream is continuing - preserve last_update for rate calculation
+                        conn.execute("""
+                            UPDATE streams SET
+                                stream_name = ?,
+                                interface = ?,
+                                rx_interface = ?,
+                                server_url = ?,
+                                tg_id = ?,
+                                flow_tracking_enabled = ?,
+                                status = ?,
+                                updated_at = ?,
+                                stream_config = ?
+                            WHERE stream_id = ?
+                        """, (
+                            stream_name, interface, rx_interface, server_url, tg_id,
+                            int(flow_tracking_enabled), 'Running', now, config_json, stream_id
+                        ))
                 else:
                     # Insert new stream with initial last_update
                     conn.execute("""
@@ -462,4 +496,54 @@ class StreamDatabase:
         except Exception as e:
             logger.error(f"[STREAM DB] Failed to cleanup old statistics: {e}")
             return 0
+    
+    def cleanup_old_stopped_streams(self, hours: int = 24) -> int:
+        """
+        Clean up old stopped streams from the database.
+        
+        Args:
+            hours: Number of hours to keep stopped streams (default: 24 hours = 1 day)
+            
+        Returns:
+            Number of streams deleted
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                # Delete stopped streams that haven't been updated in the specified time
+                cursor = conn.execute("""
+                    DELETE FROM streams
+                    WHERE status = 'Stopped'
+                    AND (stopped_at IS NOT NULL AND stopped_at < datetime('now', '-' || ? || ' hours'))
+                    OR (stopped_at IS NULL AND updated_at < datetime('now', '-' || ? || ' hours'))
+                """, (hours, hours))
+                deleted = cursor.rowcount
+                conn.commit()
+                if deleted > 0:
+                    logger.info(f"[STREAM DB] Cleaned up {deleted} old stopped stream(s) (older than {hours} hours)")
+                return deleted
+        except Exception as e:
+            logger.error(f"[STREAM DB] Failed to cleanup old stopped streams: {e}")
+            return 0
+    
+    def delete_stream(self, stream_id: str) -> bool:
+        """
+        Delete a stream from the database.
+        
+        Args:
+            stream_id: Stream identifier
+            
+        Returns:
+            True if successful, False otherwise
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.execute("DELETE FROM streams WHERE stream_id = ?", (stream_id,))
+                deleted = cursor.rowcount
+                conn.commit()
+                if deleted > 0:
+                    logger.info(f"[STREAM DB] Deleted stream {stream_id}")
+                return deleted > 0
+        except Exception as e:
+            logger.error(f"[STREAM DB] Failed to delete stream {stream_id}: {e}")
+            return False
 

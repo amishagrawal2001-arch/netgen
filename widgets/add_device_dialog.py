@@ -82,7 +82,7 @@ class AddDeviceDialog(QDialog):
         self.device_name_input.setPlaceholderText("Optional - leave empty for device1, device2, etc.")
         interface_layout.addRow("Device Name:", self.device_name_input)
 
-        # Interface, VLAN-ID, and MAC Address in one row
+        # Interface, VLAN-ID, MAC Address, and MTU in one row
         interface_vlan_mac_layout = QHBoxLayout()
         
         # Interface field
@@ -104,6 +104,14 @@ class AddDeviceDialog(QDialog):
         self.mac_input.setValidator(QRegExpValidator(mac_re, self))
         self.mac_input.setMinimumWidth(150)
         
+        # MTU field
+        self.mtu_input = QLineEdit("1500")
+        self.mtu_input.setPlaceholderText("MTU")
+        self.mtu_input.setValidator(QIntValidator(68, 9216, self))
+        self.mtu_input.setMinimumWidth(60)
+        self.mtu_input.setMaximumWidth(80)
+        self.mtu_input.setToolTip("Interface MTU (68-9216 bytes). Default: 1500")
+        
         # Add fields to horizontal layout
         interface_vlan_mac_layout.addWidget(QLabel("Interface:"))
         interface_vlan_mac_layout.addWidget(self.iface_input)
@@ -111,6 +119,8 @@ class AddDeviceDialog(QDialog):
         interface_vlan_mac_layout.addWidget(self.vlan_input)
         interface_vlan_mac_layout.addWidget(QLabel("MAC Address:"))
         interface_vlan_mac_layout.addWidget(self.mac_input)
+        interface_vlan_mac_layout.addWidget(QLabel("MTU:"))
+        interface_vlan_mac_layout.addWidget(self.mtu_input)
         interface_vlan_mac_layout.addStretch()
         
         interface_layout.addRow("", interface_vlan_mac_layout)
@@ -1693,6 +1703,7 @@ class AddDeviceDialog(QDialog):
             ipv4_mask,
             ipv6_mask,
             self.vlan_input.text().strip(),
+            self.mtu_input.text().strip() or "1500",  # MTU field, default to 1500
             ipv4_gateway,
             ipv6_gateway,
             self.increment_checkbox_mac.isChecked(),

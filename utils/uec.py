@@ -3,7 +3,7 @@
 from utils.rocev2 import build_rocev2_payload  # ✅ Required import
 from scapy.all import Ether, Dot1Q, IP, IPv6, UDP, Raw
 
-def generate_uec_rocev2_packet(src_mac, dst_mac, qp, pasid, stream_data):
+def generate_uec_rocev2_packet(src_mac, dst_mac, qp, pasid, stream_data, src_ip=None, dst_ip=None, src_ipv6=None, dst_ipv6=None):
     protocol_sel  = stream_data.get("protocol_selection", {}) or {}
     protocol_data = stream_data.get("protocol_data", {}) or {}
     mac_cfg       = protocol_data.get("mac", {}) or {}
@@ -44,10 +44,20 @@ def generate_uec_rocev2_packet(src_mac, dst_mac, qp, pasid, stream_data):
 
     # Optional RoCEv2 “embedding” inside payload (your earlier behavior)
     if uec.get("enable_rocev2", False):
-        opcode     = roce_cfg.get("rocev2_opcode", "SendOnly")
-        solicited  = bool(roce_cfg.get("rocev2_solicited_event", False))
-        mig_req    = bool(roce_cfg.get("rocev2_migration_req", False))
-        rocev2_blob = build_rocev2_payload(opcode, qp, solicited, mig_req)
+        # Create a modified stream_data with QP value for RoCEv2 BTH
+        # The build_rocev2_payload function expects stream_data and reads QP from it
+        rocev2_stream_data = stream_data.copy()
+        # Ensure protocol_data.rocev2 exists and has the QP value
+        if "protocol_data" not in rocev2_stream_data:
+            rocev2_stream_data["protocol_data"] = {}
+        if "rocev2" not in rocev2_stream_data["protocol_data"]:
+            rocev2_stream_data["protocol_data"]["rocev2"] = {}
+        # Set the destination QP for RoCEv2 BTH (use UEC's QP value)
+        rocev2_stream_data["protocol_data"]["rocev2"]["rocev2_destination_qp"] = qp
+        # Preserve other RoCEv2 settings from roce_cfg
+        rocev2_stream_data["protocol_data"]["rocev2"].update(roce_cfg)
+        # Build RoCEv2 payload (BTH header)
+        rocev2_blob = build_rocev2_payload(rocev2_stream_data)
         base_payload += b"\n" + rocev2_blob
 
     # Build L2
@@ -60,19 +70,22 @@ def generate_uec_rocev2_packet(src_mac, dst_mac, qp, pasid, stream_data):
         pkt = Ether(src=src_mac, dst=dst_mac)
 
     # L3/L4 (choose IPv4 or IPv6 properly)
+    # Use incremented IP addresses if provided, otherwise fall back to config
     if l3_protocol == "IPv6":
-        ip_src = ipv6_cfg.get("ipv6_source", "2001:db8::1")
-        ip_dst = ipv6_cfg.get("ipv6_destination", "2001:db8::2")
+        ip_src = src_ipv6 or ipv6_cfg.get("ipv6_source", "2001:db8::1")
+        ip_dst = dst_ipv6 or ipv6_cfg.get("ipv6_destination", "2001:db8::2")
         tc     = int(ipv6_cfg.get("ipv6_traffic_class", 0)) & 0xFC  # clear ECN bits
         tc    |= (ecn & 0x3)
+        # Use UEC flow_label if specified, otherwise use IPv6 flow_label
+        flow_label = int(uec.get("flow_label", ipv6_cfg.get("ipv6_flow_label", 0)))
         pkt  /= IPv6(src=ip_src, dst=ip_dst,
                      hlim=int(ipv6_cfg.get("ipv6_hop_limit", 64)),
                      tc=tc,
-                     fl=int(ipv6_cfg.get("ipv6_flow_label", 0)))
+                     fl=flow_label)
         pkt  /= UDP(sport=12345, dport=4791)
     else:
-        ip_src = ipv4_cfg.get("ipv4_source", "10.0.0.1")
-        ip_dst = ipv4_cfg.get("ipv4_destination", "11.0.0.2")
+        ip_src = src_ip or ipv4_cfg.get("ipv4_source", "10.0.0.1")
+        ip_dst = dst_ip or ipv4_cfg.get("ipv4_destination", "11.0.0.2")
         # Set DSCP=0 for now; put ECN in lowest 2 bits
         tos = (0 << 2) | (ecn & 0x3)
         pkt /= IP(src=ip_src, dst=ip_dst,

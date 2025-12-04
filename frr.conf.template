@@ -65,11 +65,11 @@ router rip
  no auto-summary
 
 # IS-IS Configuration
-router isis
+router isis CORE
  net 49.0001.{{ROUTER_ID}}.00
  is-type level-1-2
  interface {{INTERFACE}}
-  ip router isis
+  ip router isis CORE
 
 # PIM Configuration
 ip pim rp 224.0.0.0/4
