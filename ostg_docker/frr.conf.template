@@ -62,8 +62,8 @@ interface {{INTERFACE}}
  ipv6 ospf6 priority 1
  ipv6 ospf6 area 0.0.0.0
 !
- ip router isis FRR-CORE
- ipv6 router isis FRR-CORE
+ ip router isis CORE
+ ipv6 router isis CORE
  ip pim
  ipv6 pim6
 !
@@ -77,7 +77,7 @@ interface lo
 {{LOOPBACK_IPV6_LINE}}
  ip ospf passive
  ipv6 ospf6 passive
- ip router isis FRR-CORE
+ ip router isis CORE
 exit
 
 #----------------------------------------------
@@ -124,7 +124,7 @@ exit
 #----------------------------------------------
 # IS-IS Configuration
 #----------------------------------------------
-router isis FRR-CORE
+router isis CORE
  net 49.0001.{{ROUTER_ID_REPLACED_WITH_DOTTED_FORMAT}}.00
  is-type level-1-2
  metric-style wide
