@@ -1114,7 +1114,7 @@ def configure_bgp_for_device(device_id: str, bgp_config: Dict, ipv4: str = None,
                     if isinstance(vxlan_config_raw, str):
                         try:
                             vxlan_config = json.loads(vxlan_config_raw) if vxlan_config_raw else {}
-                        except:
+                        except Exception:
                             vxlan_config = {}
                     else:
                         vxlan_config = vxlan_config_raw or {}

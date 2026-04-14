@@ -4,9 +4,12 @@ OSTG Path Utilities
 Handles file paths for both development and packaged macOS applications.
 """
 
+import logging
 import os
 import sys
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 
 def get_ostg_data_directory():
@@ -150,30 +153,30 @@ def get_app_info():
 # Test function to verify path utilities
 def test_path_utilities():
     """Test function to verify path utilities work correctly."""
-    print("🔍 OSTG Path Utilities Test")
-    print("=" * 50)
+    logger.info("OSTG Path Utilities Test")
+    logger.info("=" * 50)
     
     info = get_app_info()
     
-    print(f"Platform: {info['platform']}")
-    print(f"Packaged App: {info['is_packaged']}")
-    print(f"Data Directory: {info['data_directory']}")
-    print(f"Session File: {info['session_file']}")
-    print(f"Logs Directory: {info['logs_directory']}")
+    logger.info(f"Platform: {info['platform']}")
+    logger.info(f"Packaged App: {info['is_packaged']}")
+    logger.info(f"Data Directory: {info['data_directory']}")
+    logger.info(f"Session File: {info['session_file']}")
+    logger.info(f"Logs Directory: {info['logs_directory']}")
     
     # Test directory creation
     data_dir = get_ostg_data_directory()
     session_file = get_session_file_path()
     logs_dir = get_logs_directory()
     
-    print(f"\n✅ Data directory exists: {os.path.exists(data_dir)}")
-    print(f"✅ Logs directory exists: {os.path.exists(logs_dir)}")
-    print(f"✅ Can write to data directory: {os.access(data_dir, os.W_OK)}")
+    logger.info(f"Data directory exists: {os.path.exists(data_dir)}")
+    logger.info(f"Logs directory exists: {os.path.exists(logs_dir)}")
+    logger.info(f"Can write to data directory: {os.access(data_dir, os.W_OK)}")
     
     # Test session file path
-    print(f"\n📄 Session file path: {session_file}")
-    print(f"✅ Session file directory exists: {os.path.exists(os.path.dirname(session_file))}")
-    print(f"✅ Can write to session directory: {os.access(os.path.dirname(session_file), os.W_OK)}")
+    logger.info(f"Session file path: {session_file}")
+    logger.info(f"Session file directory exists: {os.path.exists(os.path.dirname(session_file))}")
+    logger.info(f"Can write to session directory: {os.access(os.path.dirname(session_file), os.W_OK)}")
 
 
 if __name__ == "__main__":

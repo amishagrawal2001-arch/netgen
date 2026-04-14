@@ -1,9 +1,13 @@
-from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QFormLayout, QHBoxLayout, 
-                             QLineEdit, QComboBox, QGroupBox, QDialogButtonBox, 
+import ipaddress
+import logging
+
+from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QFormLayout, QHBoxLayout,
+                             QLineEdit, QComboBox, QGroupBox, QDialogButtonBox,
                              QWidget, QMessageBox, QCheckBox, QPushButton, QSpinBox, QLabel)
 from PyQt5.QtGui import QIntValidator
 from PyQt5.QtCore import Qt
-import ipaddress
+
+logger = logging.getLogger(__name__)
 
 
 class AddBgpDialog(QDialog):
@@ -336,7 +340,7 @@ class AddBgpDialog(QDialog):
         try:
             ipaddress.IPv4Address(base_ip)
         except ipaddress.AddressValueError:
-            print(f"Warning: Invalid base IPv4 address '{base_ip}', using default '192.168.0.2'")
+            logger.warning(f"Invalid base IPv4 address '{base_ip}', using default '192.168.0.2'")
             base_ip = "192.168.0.2"
         
         count = self.ipv4_increment_count.value()
@@ -371,12 +375,12 @@ class AddBgpDialog(QDialog):
                     ipaddress.IPv4Address(new_ip)
                     neighbors.append(new_ip)
                 except ipaddress.AddressValueError:
-                    print(f"Warning: Generated invalid IPv4 address '{new_ip}', skipping")
+                    logger.warning(f"Generated invalid IPv4 address '{new_ip}', skipping")
                     continue
             
             return neighbors
         except (ValueError, IndexError, KeyError) as e:
-            print(f"Error generating IPv4 neighbors: {e}")
+            logger.error(f"Error generating IPv4 neighbors: {e}")
             return [base_ip]
 
     def _generate_ipv6_neighbors(self):
@@ -389,7 +393,7 @@ class AddBgpDialog(QDialog):
         try:
             ipaddress.IPv6Address(base_ip)
         except ipaddress.AddressValueError:
-            print(f"Warning: Invalid base IPv6 address '{base_ip}', using default '2001:db8::2'")
+            logger.warning(f"Invalid base IPv6 address '{base_ip}', using default '2001:db8::2'")
             base_ip = "2001:db8::2"
         
         count = self.ipv6_increment_count.value()
@@ -433,5 +437,5 @@ class AddBgpDialog(QDialog):
             
             return neighbors
         except (ValueError, IndexError, KeyError) as e:
-            print(f"Error generating IPv6 neighbors: {e}")
+            logger.error(f"Error generating IPv6 neighbors: {e}")
             return [base_ip]

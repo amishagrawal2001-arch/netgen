@@ -928,7 +928,7 @@ def stop_ospf_neighbor(device_id: str, device_name: str = None, af: str = None) 
                         current_neighbors = json.loads(current_neighbors_json)
                     else:
                         current_neighbors = current_neighbors_json
-                except:
+                except Exception:
                     current_neighbors = []
             
             if af_norm == "ipv4":
@@ -1154,7 +1154,7 @@ def get_ospf_status(device_id: str) -> Optional[Dict[str, Any]]:
                                     ospfd_pid = proc_dir
                                     logging.debug(f"[OSPF STATUS] Found ospfd PID: {ospfd_pid}")
                                     break
-                        except:
+                        except Exception:
                             continue
                 
                 if ospfd_pid:

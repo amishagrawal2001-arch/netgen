@@ -26,6 +26,12 @@ classifiers = [
 ]
 dynamic = ["dependencies"]
 
+[project.urls]
+Homepage = "https://github.com/surajsharma/ostg-trafficgen"
+Repository = "https://github.com/surajsharma/ostg-trafficgen"
+Issues = "https://github.com/surajsharma/ostg-trafficgen/issues"
+Documentation = "https://github.com/surajsharma/ostg-trafficgen#readme"
+
 [tool.setuptools.dynamic]
 dependencies = { file = ["requirements.txt"] }
 
@@ -43,3 +49,17 @@ py-modules = ["multithreaded_traffic_gen", "run_tgen_client", "run_tgen_server",
 "resources.icons" = ["**/*"]
 "resources.dpdk" = ["**/*"]
 "ostg_docker" = ["**/*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v --tb=short"
+
+[tool.coverage.run]
+source = ["utils", "traffic_client", "ostg"]
+omit = ["venv/*", "build_env/*", "tests/*"]
+
+[tool.coverage.report]
+show_missing = true
+skip_empty = true

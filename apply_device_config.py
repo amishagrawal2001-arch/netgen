@@ -69,7 +69,7 @@ def apply_device_config(server_url, device_name):
             if isinstance(bgp_config, str):
                 try:
                     bgp_config = json.loads(bgp_config)
-                except:
+                except Exception:
                     bgp_config = {}
             print(f"   BGP Config Details:")
             print(f"      ASN: {bgp_config.get('bgp_asn', 'N/A')}")
@@ -85,7 +85,7 @@ def apply_device_config(server_url, device_name):
             if isinstance(ospf_config, str):
                 try:
                     ospf_config = json.loads(ospf_config)
-                except:
+                except Exception:
                     ospf_config = {}
             print(f"   OSPF Config Details:")
             print(f"      Area ID: {ospf_config.get('area_id', 'N/A')}")
@@ -99,7 +99,7 @@ def apply_device_config(server_url, device_name):
             if isinstance(isis_config, str):
                 try:
                     isis_config = json.loads(isis_config)
-                except:
+                except Exception:
                     isis_config = {}
             print(f"   ISIS Config Details:")
             print(f"      Area ID: {isis_config.get('area_id', 'N/A')}")
@@ -120,21 +120,21 @@ def apply_device_config(server_url, device_name):
         if isinstance(bgp_config, str) and bgp_config:
             try:
                 bgp_config = json.loads(bgp_config)
-            except:
+            except Exception:
                 bgp_config = {}
         
         ospf_config = device_info.get('ospf_config', {})
         if isinstance(ospf_config, str) and ospf_config:
             try:
                 ospf_config = json.loads(ospf_config)
-            except:
+            except Exception:
                 ospf_config = {}
         
         isis_config = device_info.get('isis_config', {}) or device_info.get('is_is_config', {})
         if isinstance(isis_config, str) and isis_config:
             try:
                 isis_config = json.loads(isis_config)
-            except:
+            except Exception:
                 isis_config = {}
         
         # Build apply payload

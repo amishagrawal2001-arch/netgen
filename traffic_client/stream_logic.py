@@ -1,7 +1,10 @@
 # stream_logic.py
+import logging
 import os
 import uuid
 import requests
+
+logger = logging.getLogger(__name__)
 from PyQt5.QtWidgets import QMessageBox
 from PyQt5.QtCore import QTimer, QSize, Qt
 from PyQt5.QtWidgets import QApplication
@@ -36,7 +39,9 @@ class TrafficGenClientStreamLogic:
             return {"mode": "line"}
 
         if rt.startswith("Packets Per Second"):
-            pps = int(str(_get("stream_pps_rate", "1000")) or "1000")
+            pps_raw = _get("stream_pps_rate", "1000")
+            pps = int(str(pps_raw) or "1000")
+            logger.debug(f"[RATE DEBUG] PPS mode - stream.get('stream_pps_rate')={stream.get('stream_pps_rate')}, ps.get('stream_pps_rate')={ps.get('stream_pps_rate')}, resolved={pps}")
             return {"mode": "pps", "pps": max(1, pps)}
 
         if rt.startswith("Bit Rate"):
@@ -109,7 +114,7 @@ class TrafficGenClientStreamLogic:
             resp = requests.post(f"{server_url}/api/traffic/stop", json=payload, timeout=6)
             ok = resp.ok
         except Exception as e:
-            print(f"[AUTO-STOP ❌] {server_url} stream_id={stream_id}: {e}")
+            logger.error(f"[AUTO-STOP] {server_url} stream_id={stream_id}: {e}")
             ok = False
 
         # update status in memory
@@ -123,7 +128,7 @@ class TrafficGenClientStreamLogic:
         if row_idx is not None:
             self.update_stream_status(row_idx, "red")
         self.update_stream_table()
-        print(f"[AUTO-STOP {'✅' if ok else '⚠️'}] stream_id={stream_id} on {server_url}")
+        logger.info(f"[AUTO-STOP {'OK' if ok else 'WARN'}] stream_id={stream_id} on {server_url}")
 
     def _schedule_stream_auto_stop(self, server_url, port_label, stream_obj, row_idx):
         """
@@ -168,7 +173,7 @@ class TrafficGenClientStreamLogic:
         )
         timer.start(seconds * 1000)
         self._stop_timers[sid] = timer
-        print(f"[AUTO-STOP ⏱️] Scheduled in {seconds}s for stream_id={sid}")
+        logger.info(f"[AUTO-STOP] Scheduled in {seconds}s for stream_id={sid}")
 
     def _selected_stream_rows(self):
         """
@@ -265,7 +270,7 @@ class TrafficGenClientStreamLogic:
                     break
             
             if not port_key:
-                print(f"[ERROR] No matching port key found for interface '{normalized_port_text}' (original: '{port_text}'). Available keys: {list(self.streams.keys())}")
+                logger.error(f"No matching port key found for interface '{normalized_port_text}' (original: '{port_text}'). Available keys: {list(self.streams.keys())}")
                 continue
 
             matched_stream = next(
@@ -274,7 +279,7 @@ class TrafficGenClientStreamLogic:
                 None
             )
             if not matched_stream:
-                print(f"[ERROR] Stream '{stream_name}' not found in port '{port_key}'")
+                logger.error(f"Stream '{stream_name}' not found in port '{port_key}'")
                 continue
 
             # Check enabled flag - sync from table combo box first, then check both locations
@@ -329,7 +334,7 @@ class TrafficGenClientStreamLogic:
                 tx_tg_id = ""
             tx_server = next((s for s in self.server_interfaces if str(s.get("tg_id")) == tx_tg_id), None)
             if not tx_server:
-                print(f"[ERROR] No TX server found for TG {tx_tg_id} from port_key '{port_key}'")
+                logger.error(f"No TX server found for TG {tx_tg_id} from port_key '{port_key}'")
                 continue
 
             server_url = tx_server["address"]
@@ -359,7 +364,7 @@ class TrafficGenClientStreamLogic:
             try:
                 matched_stream["tx_rate"] = self._prepare_tx_rate(matched_stream)
             except Exception as _e:
-                print(f"[RATE] Could not normalize rate for '{stream_name}': {_e}")
+                logger.warning(f"[RATE] Could not normalize rate for '{stream_name}': {_e}")
 
             try:
                 d = self._prepare_duration(matched_stream)
@@ -368,7 +373,7 @@ class TrafficGenClientStreamLogic:
                 matched_stream["duration_seconds"] = d.get("seconds")
                 matched_stream["continuous"] = d.get("continuous")
             except Exception as _e:
-                print(f"[DURATION] Could not normalize duration for '{stream_name}': {_e}")
+                logger.warning(f"[DURATION] Could not normalize duration for '{stream_name}': {_e}")
 
             server_payload_map.setdefault(server_url, {}).setdefault(port_key, []).append((matched_stream, row_idx))
 
@@ -383,9 +388,13 @@ class TrafficGenClientStreamLogic:
         for server_url, per_port in server_payload_map.items():
             try:
                 payload = {"streams": {p: [s for (s, _) in items] for p, items in per_port.items()}}
+                # Debug: Log what streams are being sent
+                for port_label, stream_list in payload.get("streams", {}).items():
+                    stream_names = [s.get("name") or s.get("protocol_selection", {}).get("name", "Unknown") for s in stream_list]
+                    logger.debug(f"[START] Sending {len(stream_list)} stream(s) for port '{port_label}': {stream_names}")
                 resp = requests.post(f"{server_url}/api/traffic/start", json=payload, timeout=10)
                 if not resp.ok:
-                    print(f"[HTTP ❌] Failed to start on {server_url}: {resp.status_code} {resp.text[:200]}")
+                    logger.error(f"[HTTP] Failed to start on {server_url}: {resp.status_code} {resp.text[:200]}")
                     for items in per_port.values():
                         for _, r in items:
                             self.update_stream_status(r, "red")
@@ -441,7 +450,7 @@ class TrafficGenClientStreamLogic:
                             any_started = True
 
             except Exception as e:
-                print(f"[ERROR] Could not reach {server_url}: {e}")
+                logger.error(f"Could not reach {server_url}: {e}")
                 for items in per_port.values():
                     for _, r in items:
                         self.update_stream_status(r, "red")
@@ -467,15 +476,22 @@ class TrafficGenClientStreamLogic:
 
         # Build requests per server
         stop_requests = {}  # server_url -> [{"interface": "...", "stream_id": "..."}]
-        selected_triplets = []  # (port, name, row_idx)
+        selected_triplets = []  # (port, name, row_idx, stream_id)
 
         for idx in selected:
             row = idx.row()
             port_text = (self.stream_table.item(row, 1) or QTableWidgetItem("")).text().strip()
-            name = (self.stream_table.item(row, 2) or QTableWidgetItem("")).text().strip()
-            if not port_text or not name:
+            name_item = self.stream_table.item(row, 2)
+            if not port_text or not name_item:
                 continue
-            selected_triplets.append((port_text, name, row))
+            
+            name = name_item.text().strip()
+            if not name:
+                continue
+            
+            # Get stream_id from table item UserRole (most reliable)
+            stream_id_from_table = name_item.data(Qt.UserRole)
+            selected_triplets.append((port_text, name, row, stream_id_from_table))
 
             # Normalize port_text (remove "Port: " prefix if present)
             normalized_port_text = port_text
@@ -494,17 +510,28 @@ class TrafficGenClientStreamLogic:
                     break
             
             if not port_key:
-                print(f"[STOP ERROR] No matching port key found for interface '{normalized_port_text}' (original: '{port_text}'). Available keys: {list(self.streams.keys())}")
+                logger.error(f"[STOP] No matching port key found for interface '{normalized_port_text}' (original: '{port_text}'). Available keys: {list(self.streams.keys())}")
                 continue
 
-            # Find the stream by name (supports protocol_selection.name)
-            matched = next(
-                (s for s in self.streams.get(port_key, [])
-                 if s.get("name") == name or s.get("protocol_selection", {}).get("name") == name),
-                None
-            )
+            # Find the stream - prefer stream_id from table, then fallback to name matching
+            matched = None
+            if stream_id_from_table:
+                # Match by stream_id (most reliable, especially after apply)
+                for s in self.streams.get(port_key, []):
+                    if s.get("stream_id") == stream_id_from_table:
+                        matched = s
+                        break
+            
+            # Fallback: match by name if stream_id not available or not found
             if not matched:
-                print(f"[STOP ERROR] Stream '{name}' not found in port '{port_key}'")
+                matched = next(
+                    (s for s in self.streams.get(port_key, [])
+                     if s.get("name") == name or s.get("protocol_selection", {}).get("name") == name),
+                    None
+                )
+            
+            if not matched:
+                logger.error(f"[STOP] Stream '{name}' (stream_id: {stream_id_from_table}) not found in port '{port_key}'")
                 continue
 
             # Extract TG ID from port key (e.g., "TG 0 - Port: ens5np0" -> "0")
@@ -514,27 +541,46 @@ class TrafficGenClientStreamLogic:
                 # Fallback: try to get from stream object
                 tg_id = matched.get("tg_id", "")
                 if not tg_id:
-                    print(f"[STOP ERROR] Could not extract TG ID from port key '{port_key}' or stream object")
+                    logger.error(f"[STOP] Could not extract TG ID from port key '{port_key}' or stream object")
                     continue
             
             server = next((s for s in self.server_interfaces if str(s.get("tg_id")) == tg_id), None)
             if not server:
-                print(f"[STOP ERROR] No server found for TG ID '{tg_id}'")
+                logger.error(f"[STOP] No server found for TG ID '{tg_id}'")
                 continue
 
             # Get interface name from stream object or normalize port_text
+            # Normalize interface name to match server expectations (same as server's normalize_iface)
             interface = matched.get("interface", normalized_port_text)
             if not interface:
                 interface = normalized_port_text
+            
+            # Normalize interface name to match server's normalize_iface function
+            # Remove "TG X - " prefix, "Port: " prefix, and extract just the interface name
+            if interface:
+                interface_normalized = interface.strip().strip('"').rstrip(",")
+                if " - " in interface_normalized:
+                    interface_normalized = interface_normalized.split(" - ", 1)[-1].strip()
+                if ":" in interface_normalized:
+                    interface_normalized = interface_normalized.rsplit(":", 1)[-1].strip()
+                if "Port:" in interface_normalized:
+                    interface_normalized = interface_normalized.replace("Port:", "").strip()
+                parts = interface_normalized.split()
+                interface = parts[-1] if parts else interface_normalized
 
+            # Use stream_id from matched stream (should match stream_id_from_table if available)
             sid = matched.get("stream_id")
             if not sid:
-                print(f"[STOP WARN] Stream '{name}' has no stream_id, skipping")
+                logger.warning(f"[STOP] Stream '{name}' has no stream_id, skipping")
                 continue
+
+            # Include stream name for fallback matching if stream_id doesn't match
+            stream_name_for_stop = matched.get("name") or matched.get("protocol_selection", {}).get("name") or name
 
             stop_requests.setdefault(server["address"], []).append({
                 "interface": interface,
-                "stream_id": sid
+                "stream_id": sid,
+                "stream_name": stream_name_for_stop  # Include name for fallback matching
             })
 
         # Send stop requests
@@ -542,15 +588,15 @@ class TrafficGenClientStreamLogic:
             try:
                 r = requests.post(f"{server_url}/api/traffic/stop", json={"streams": items}, timeout=6)
                 if r.ok:
-                    print(f"[STOP ✅] Stopped {len(items)} stream(s) on {server_url}")
+                    logger.info(f"[STOP] Stopped {len(items)} stream(s) on {server_url}")
                 else:
-                    print(f"[STOP ❌] {server_url}: {r.status_code} {r.text}")
+                    logger.error(f"[STOP] {server_url}: {r.status_code} {r.text}")
             except Exception as e:
-                print(f"[STOP ERROR] {server_url}: {e}")
+                logger.error(f"[STOP] {server_url}: {e}")
 
         # Update ONLY status locally; DO NOT alter 'enabled'
         # Need to find port_key for each selected stream to update status
-        for port_text, name, _ in selected_triplets:
+        for port_text, name, _, stream_id_from_table in selected_triplets:
             # Normalize port_text to find port_key
             normalized_port_text = port_text
             if ":" in normalized_port_text:
@@ -567,9 +613,21 @@ class TrafficGenClientStreamLogic:
                     break
             
             if port_key:
-                for s in self.streams.get(port_key, []):
-                    if s.get("name") == name or s.get("protocol_selection", {}).get("name") == name:
-                        s["status"] = "stopped"
+                # Prefer matching by stream_id, then fallback to name
+                updated = False
+                if stream_id_from_table:
+                    for s in self.streams.get(port_key, []):
+                        if s.get("stream_id") == stream_id_from_table:
+                            s["status"] = "stopped"
+                            updated = True
+                            break
+                
+                # Fallback to name matching if stream_id didn't match
+                if not updated:
+                    for s in self.streams.get(port_key, []):
+                        if s.get("name") == name or s.get("protocol_selection", {}).get("name") == name:
+                            s["status"] = "stopped"
+                            break
 
         self.update_stream_table()
         self.update_all_streams_toggle_ui()
@@ -667,7 +725,7 @@ class TrafficGenClientStreamLogic:
                     if port_lbl and name_lbl:
                         row_index_map[(port_lbl, name_lbl)] = r
             except Exception as _e:
-                print(f"[STOP-ALL] Could not prebuild row map: {_e}")
+                logger.warning(f"[STOP-ALL] Could not prebuild row map: {_e}")
 
             stop_requests = {}
             total_running = 0
@@ -711,7 +769,7 @@ class TrafficGenClientStreamLogic:
                         "streams": [{"interface": it["interface"], "stream_id": it["stream_id"]} for it in items]}
                     resp = requests.post(f"{server_url}/api/traffic/stop", json=payload, timeout=10)
                     if resp.ok:
-                        print(f"[STOP-ALL ✅] Stopped {len(items)} stream(s) on {server_url}")
+                        logger.info(f"[STOP-ALL] Stopped {len(items)} stream(s) on {server_url}")
                         for it in items:
                             port_lbl = it["port_label"]
                             sid = it["stream_id"]
@@ -727,11 +785,11 @@ class TrafficGenClientStreamLogic:
                                 try:
                                     self.update_stream_status(row_idx, "red")
                                 except Exception as _e:
-                                    print(f"[STOP-ALL] Row icon update failed: {port_lbl}, {s_name}: {_e}")
+                                    logger.warning(f"[STOP-ALL] Row icon update failed: {port_lbl}, {s_name}: {_e}")
                     else:
-                        print(f"[STOP-ALL ❌] Server {server_url} failed: {resp.status_code} {resp.text[:200]}")
+                        logger.error(f"[STOP-ALL] Server {server_url} failed: {resp.status_code} {resp.text[:200]}")
                 except Exception as e:
-                    print(f"[STOP-ALL ERROR] Could not reach {server_url}: {e}")
+                    logger.error(f"[STOP-ALL] Could not reach {server_url}: {e}")
 
             # Session save removed - only save on explicit user action (Save Session menu or Apply button)
 
@@ -776,7 +834,7 @@ class TrafficGenClientStreamLogic:
             else:
                 btn.setText("")
         except Exception as e:
-            print(f"[UI] update_all_streams_toggle_ui failed: {e}")
+            logger.error(f"[UI] update_all_streams_toggle_ui failed: {e}")
 
     def on_all_streams_toggle_clicked(self):
         """Click handler: stop all if any are running, else start all."""
@@ -816,6 +874,13 @@ class TrafficGenClientStreamLogic:
             if not getattr(self, "streams", {}):
                 QMessageBox.information(self, "No Streams", "There are no streams to start.")
                 return
+            
+            # Ensure stream_table exists and is initialized
+            # Note: This check should not prevent normal operation - stream_table should always exist
+            # If it doesn't, something is wrong with initialization, but we'll try to continue
+            if not hasattr(self, "stream_table") or self.stream_table is None:
+                logger.warning("[START-ALL] Stream table not initialized, falling back to stream keys")
+                # Don't return early - continue with fallback logic below
 
             # Build set of valid, currently-visible port labels from the table
             valid_ports = set()
@@ -824,8 +889,9 @@ class TrafficGenClientStreamLogic:
                     itm = self.stream_table.item(r, 1)
                     if itm:
                         valid_ports.add(itm.text().strip())
-            except Exception:
+            except Exception as e:
                 # If table not ready, fall back to all keys
+                logger.error(f"[START-ALL] Error reading stream table: {e}, falling back to stream keys")
                 valid_ports = set(self.streams.keys())
 
             server_payload_map = {}  # { server_url: { port_label: [(stream_obj, row_idx), ...] } }
@@ -876,11 +942,11 @@ class TrafficGenClientStreamLogic:
                     if pcap_cfg.get("pcap_enabled", False):
                         local_pcap = pcap_cfg.get("pcap_file_path")
                         if not local_pcap or not os.path.isfile(local_pcap):
-                            print(f"[PCAP ❌] Missing file for '{name}' on {port_label}")
+                            logger.error(f"[PCAP] Missing file for '{name}' on {port_label}")
                             continue
                         server_pcap = self.upload_pcap_to_server(local_pcap, server_url)
                         if not server_pcap:
-                            print(f"[PCAP ❌] Upload failed for '{name}' on {port_label}")
+                            logger.error(f"[PCAP] Upload failed for '{name}' on {port_label}")
                             continue
                         pcap_cfg["pcap_file_path"] = server_pcap
                         s["pcap_stream"] = pcap_cfg
@@ -896,7 +962,7 @@ class TrafficGenClientStreamLogic:
                             s["duration_seconds"] = d.get("seconds")
                             s["continuous"] = d.get("continuous")
                     except Exception as _e:
-                        print(f"[RATE] Could not normalize rate/duration for '{name}': {_e}")
+                        logger.warning(f"[RATE] Could not normalize rate/duration for '{name}': {_e}")
 
                     # Row index (if helper exists)
                     row_idx = self._find_table_row(port_label, name) if hasattr(self, "_find_table_row") else None
@@ -904,6 +970,17 @@ class TrafficGenClientStreamLogic:
                     if row_idx is not None:
                         row_by_id[s["stream_id"]] = row_idx
                     sid_to_port[s["stream_id"]] = port_label
+
+                    # Debug: Log MAC increment options being sent
+                    protocol_data = s.get("protocol_data", {})
+                    mac_data = protocol_data.get("mac", {})
+                    if mac_data:
+                        mac_src_mode = mac_data.get("mac_source_mode", "Fixed")
+                        mac_dst_mode = mac_data.get("mac_destination_mode", "Fixed")
+                        if mac_src_mode in ("Increment", "Decrement") or mac_dst_mode in ("Increment", "Decrement"):
+                            logger.debug(f"[MAC] Stream '{name}' MAC increment options:")
+                            logger.debug(f"  Source: mode={mac_src_mode}, step={mac_data.get('mac_source_step')}, count={mac_data.get('mac_source_count')}, addr={mac_data.get('mac_source_address')}")
+                            logger.debug(f"  Dest: mode={mac_dst_mode}, step={mac_data.get('mac_destination_step')}, count={mac_data.get('mac_destination_count')}, addr={mac_data.get('mac_destination_address')}")
 
                     server_payload_map.setdefault(server_url, {}).setdefault(port_label, []).append((s, row_idx))
 
@@ -918,7 +995,7 @@ class TrafficGenClientStreamLogic:
 
             # (Optional) Log stale/unknown ports — don't show a modal dialog
             if unknown_ports:
-                print(f"[INFO] Skipped stale/unknown ports (not in current UI): {sorted(unknown_ports)}")
+                logger.info(f"Skipped stale/unknown ports (not in current UI): {sorted(unknown_ports)}")
 
             # --- Send to servers & update UI ---
             for server_url, per_port in server_payload_map.items():
@@ -926,7 +1003,7 @@ class TrafficGenClientStreamLogic:
                     payload = {"streams": {p: [s for (s, _) in items] for p, items in per_port.items()}}
                     resp = requests.post(f"{server_url}/api/traffic/start", json=payload, timeout=10)
                     if not resp.ok:
-                        print(f"[HTTP ❌] Failed to start on {server_url}: {resp.status_code} {resp.text[:200]}")
+                        logger.error(f"[HTTP] Failed to start on {server_url}: {resp.status_code} {resp.text[:200]}")
                         for items in per_port.values():
                             for _, r in items:
                                 if r is not None:
@@ -983,7 +1060,7 @@ class TrafficGenClientStreamLogic:
                                 )
 
                 except Exception as e:
-                    print(f"[ERROR] Could not reach {server_url}: {e}")
+                    logger.error(f"Could not reach {server_url}: {e}")
                     for items in per_port.values():
                         for _, r in items:
                             if r is not None:
@@ -1035,7 +1112,7 @@ class TrafficGenClientStreamLogic:
 
             # Find stream - prefer stream_id from table item UserRole, then fallback to name matching
             matched_stream = None
-            name_item = self.stream_table.item(row, 2)
+            # name_item already retrieved above at line 1041, reuse it
             stream_id_from_table = None
             if name_item:
                 stream_id_from_table = name_item.data(Qt.UserRole)
@@ -1059,10 +1136,21 @@ class TrafficGenClientStreamLogic:
             # Last resort: use row index (assumes table order matches stream list order)
             if not matched_stream and row < len(self.streams[port_key]):
                 matched_stream = self.streams[port_key][row]
-                print(f"[INLINE EDIT] Using row index fallback to find stream at row {row}")
+                logger.debug(f"[INLINE EDIT] Using row index fallback to find stream at row {row}")
             
             if matched_stream:
                 ps = matched_stream.setdefault("protocol_selection", {})
+                
+                # CRITICAL: Preserve stream_id from table UserRole if available (most reliable source)
+                # This ensures the stream_id matches what's in the table after edit
+                if stream_id_from_table:
+                    matched_stream["stream_id"] = stream_id_from_table
+                    logger.debug(f"[INLINE EDIT] Preserved stream_id from table: {stream_id_from_table}")
+                elif not matched_stream.get("stream_id"):
+                    # If no stream_id in table and stream doesn't have one, generate it
+                    import uuid
+                    matched_stream["stream_id"] = str(uuid.uuid4())
+                    logger.debug(f"[INLINE EDIT] Generated new stream_id: {matched_stream['stream_id']}")
                 
                 # Stream name (column 2) - editable text field (name_item already retrieved above)
                 if name_item:
@@ -1071,7 +1159,7 @@ class TrafficGenClientStreamLogic:
                     if new_name and new_name != original_name:
                         ps["name"] = new_name
                         matched_stream["name"] = new_name
-                        print(f"[INLINE EDIT] Updated stream name: '{original_name}' -> '{new_name}'")
+                        logger.debug(f"[INLINE EDIT] Updated stream name: '{original_name}' -> '{new_name}'")
                 
                 # Enabled combo (column 3)
                 enabled_widget = self.stream_table.cellWidget(row, 3)
@@ -1086,14 +1174,25 @@ class TrafficGenClientStreamLogic:
                     new_frame_size = frame_size_item.text().strip()
                     if new_frame_size:
                         try:
-                            # Validate it's a number
+                            # Validate it's a number in valid range
                             frame_size_int = int(new_frame_size)
                             if 64 <= frame_size_int <= 9216:  # Valid Ethernet frame size range
-                                ps["frame_size"] = new_frame_size
-                                matched_stream["frame_size"] = new_frame_size
-                                print(f"[INLINE EDIT] Updated frame_size: {new_frame_size}")
+                                # Normalize to string and update both protocol_selection and top-level for consistency
+                                frame_size_str = str(frame_size_int)
+                                ps["frame_size"] = frame_size_str
+                                matched_stream["frame_size"] = frame_size_str
+                                matched_stream.setdefault("protocol_selection", {})["frame_size"] = frame_size_str
+                                logger.debug(f"[INLINE EDIT] Updated frame_size: {frame_size_str}")
+                            else:
+                                # Invalid range - revert to previous value
+                                prev_frame_size = int(ps.get("frame_size") or matched_stream.get("frame_size") or 64)
+                                frame_size_item.setText(str(prev_frame_size))
+                                logger.warning(f"[INLINE EDIT] Invalid frame_size range: {new_frame_size}, reverted to {prev_frame_size}")
                         except ValueError:
-                            print(f"[INLINE EDIT] Invalid frame_size value: {new_frame_size}")
+                            # Invalid format - revert to previous value
+                            prev_frame_size = int(ps.get("frame_size") or matched_stream.get("frame_size") or 64)
+                            frame_size_item.setText(str(prev_frame_size))
+                            logger.warning(f"[INLINE EDIT] Invalid frame_size format: {new_frame_size}, reverted to {prev_frame_size}")
 
                 # Flow tracking combo (column 15)
                 flow_widget = self.stream_table.cellWidget(row, 15)
@@ -1102,9 +1201,11 @@ class TrafficGenClientStreamLogic:
                     ps["flow_tracking_enabled"] = flow_enabled
                     matched_stream["flow_tracking_enabled"] = flow_enabled
             else:
-                print(f"[INLINE EDIT] Could not find stream '{stream_name}' in port '{port_key}' to sync inline edits")
+                logger.warning(f"[INLINE EDIT] Could not find stream '{stream_name}' in port '{port_key}' to sync inline edits")
 
-        # 🚀 Apply only running + enabled streams per online server
+        # 🚀 Apply changes to ALL streams (not just running ones)
+        # For running streams: restart them on the server
+        # For stopped streams: just update the config locally (will be used when started)
         for server in getattr(self, "server_interfaces", []):
             if not server.get("online"):
                 continue
@@ -1116,70 +1217,150 @@ class TrafficGenClientStreamLogic:
                 if not str(port_label).startswith(f"TG {tg_id}"):
                     continue
 
-                running = []
+                # Separate running and stopped streams
+                running_streams = []
+                stopped_streams = []
+                
                 for s in stream_list:
                     ps = s.setdefault("protocol_selection", {})
-                    if s.get("status") == "running" and s.get("enabled", ps.get("enabled", False)):
-                        # Ensure consistency
+                    
+                    # Ensure stream_id exists for all streams (but don't overwrite existing ones)
+                    # This is a safety check - stream_id should already be set from sync above
+                    if not s.get("stream_id"):
+                        import uuid
+                        s["stream_id"] = str(uuid.uuid4())
+                        logger.debug(f"[APPLY] Generated stream_id for stream without one: {s['stream_id']}")
+                    
+                    # Ensure consistency for all streams
+                    ft = ps.get("flow_tracking_enabled", s.get("flow_tracking_enabled", False))
+                    ps["flow_tracking_enabled"] = ft
+                    s["flow_tracking_enabled"] = ft
+                    
+                    # ✅ Normalize TX rate for all streams (if helper exists)
+                    try:
+                        s["tx_rate"] = self._prepare_tx_rate(s)
+                        if isinstance(s["tx_rate"], dict):
+                            rt = s["tx_rate"]
+                            for k in ("type", "pps", "bitrate_mbps", "load_pct", "line_rate"):
+                                if k in rt:
+                                    s[f"rate_{k}"] = rt[k]
+                    except Exception as e:
+                        logger.warning(f"[RATE] Could not normalize rate for '{ps.get('name', s.get('name', ''))}': {e}")
+
+                    # ✅ Normalize Duration for all streams (if helper exists)
+                    try:
+                        s["tx_duration"] = self._prepare_duration(s)
+                        if isinstance(s["tx_duration"], dict):
+                            d = s["tx_duration"]
+                            s["duration_mode"] = d.get("mode")
+                            s["duration_seconds"] = d.get("seconds")
+                            s["continuous"] = d.get("continuous")
+                    except Exception as e:
+                        logger.warning(f"[DURATION] Could not normalize duration for '{ps.get('name', s.get('name', ''))}': {e}")
+
+                    # Categorize streams
+                    # Check both status and current enabled state (not just status)
+                    # A stream might have status="running" but be disabled after edit
+                    is_currently_enabled = s.get("enabled", ps.get("enabled", False))
+                    is_running = s.get("status") == "running"
+                    
+                    if is_running and is_currently_enabled:
+                        # Stream is running AND enabled - restart it with new config
+                        # Ensure enabled flag is consistent
                         ps["enabled"] = True
                         s["enabled"] = True
-                        ft = ps.get("flow_tracking_enabled", s.get("flow_tracking_enabled", False))
-                        ps["flow_tracking_enabled"] = ft
-                        s["flow_tracking_enabled"] = ft
-
-                        # Ensure stream_id exists
-                        if not s.get("stream_id"):
-                            s["stream_id"] = str(uuid.uuid4())
-
-                        # ✅ Normalize TX rate (if helper exists)
-                        try:
-                            s["tx_rate"] = self._prepare_tx_rate(s)
-                            # (Optional) flatten a few convenience keys if your server expects them
-                            if isinstance(s["tx_rate"], dict):
-                                rt = s["tx_rate"]
-                                for k in ("type", "pps", "bitrate_mbps", "load_pct", "line_rate"):
-                                    if k in rt:
-                                        s[f"rate_{k}"] = rt[k]
-                        except Exception as e:
-                            print(f"[RATE] Could not normalize rate for '{ps.get('name', s.get('name', ''))}': {e}")
-
-                        # ✅ Normalize Duration (if helper exists)
-                        try:
-                            s["tx_duration"] = self._prepare_duration(s)
-                            if isinstance(s["tx_duration"], dict):
-                                d = s["tx_duration"]
-                                s["duration_mode"] = d.get("mode")
-                                s["duration_seconds"] = d.get("seconds")
-                                s["continuous"] = d.get("continuous")
-                        except Exception as e:
-                            print(
-                                f"[DURATION] Could not normalize duration for '{ps.get('name', s.get('name', ''))}': {e}")
-
-                        running.append(s)
-
-                if not running:
-                    continue
-
-                # POST restart to this server / port
-                try:
-                    resp = requests.post(
-                        f"{server_addr}/api/traffic/restart",
-                        json={"port": port_label, "streams": running},
-                        timeout=8
-                    )
-                    if resp.status_code == 200:
-                        print(f"✅ Applied updates and restarted {len(running)} stream(s) on {port_label}")
-                        # Mark as running+enabled in memory
-                        for s in running:
-                            s["status"] = "running"
-                            s["enabled"] = True
-                            s.setdefault("protocol_selection", {})["enabled"] = True
+                        running_streams.append(s)
+                    elif is_running and not is_currently_enabled:
+                        # Stream is running but was disabled - stop it instead of restarting
+                        # Mark as stopped and flag it for stopping on server
+                        s["status"] = "stopped"
+                        s["_was_running"] = True  # Flag to indicate it needs to be stopped on server
+                        ps["enabled"] = False
+                        s["enabled"] = False
+                        stopped_streams.append(s)
+                        logger.info(f"[APPLY] Stream '{ps.get('name', s.get('name', ''))}' was running but is now disabled - will be stopped")
                     else:
-                        print(f"❌ Failed to apply on {port_label}: {resp.status_code} - {resp.text[:200]}")
-                except Exception as e:
-                    print(f"⚠️ Error applying stream to {port_label} via {server_addr}: {e}")
+                        # For stopped streams, preserve their enabled state from the model
+                        stopped_streams.append(s)
 
-        # 🔁 Refresh GUI
+                # Stop streams that were running but are now disabled
+                streams_to_stop = [s for s in stopped_streams if s.get("status") == "stopped" and s.get("_was_running", False)]
+                if streams_to_stop:
+                    try:
+                        # Extract interface name from port_label more robustly
+                        interface_name = port_label
+                        if " - " in port_label:
+                            interface_name = port_label.split(" - ")[-1]
+                        if "Port:" in interface_name:
+                            interface_name = interface_name.replace("Port:", "").strip()
+                        interface_name = interface_name.strip()
+                        
+                        stop_payload = {
+                            "streams": [
+                                {
+                                    "interface": interface_name,
+                                    "stream_id": s.get("stream_id")
+                                }
+                                for s in streams_to_stop if s.get("stream_id")
+                            ]
+                        }
+                        resp = requests.post(
+                            f"{server_addr}/api/traffic/stop",
+                            json=stop_payload,
+                            timeout=8
+                        )
+                        if resp.status_code == 200:
+                            logger.info(f"Stopped {len(streams_to_stop)} stream(s) that were disabled on {port_label}")
+                        else:
+                            logger.error(f"Failed to stop disabled streams on {port_label}: {resp.status_code} - {resp.text[:200]}")
+                    except Exception as e:
+                        logger.error(f"Error stopping disabled streams on {port_label} via {server_addr}: {e}")
+                    # Remove the temporary flag
+                    for s in streams_to_stop:
+                        s.pop("_was_running", None)
+                
+                # Restart running streams on the server
+                if running_streams:
+                    try:
+                        # Extract interface name from port_label for consistency
+                        interface_name = port_label
+                        if " - " in port_label:
+                            interface_name = port_label.split(" - ")[-1]
+                        if "Port:" in interface_name:
+                            interface_name = interface_name.replace("Port:", "").strip()
+                        interface_name = interface_name.strip()
+                        
+                        # Ensure interface field is set in all streams before sending
+                        for s in running_streams:
+                            if not s.get("interface"):
+                                s["interface"] = interface_name
+                        
+                        resp = requests.post(
+                            f"{server_addr}/api/traffic/restart",
+                            json={"port": port_label, "streams": running_streams},
+                            timeout=8
+                        )
+                        if resp.status_code == 200:
+                            logger.info(f"Applied updates and restarted {len(running_streams)} running stream(s) on {port_label}")
+                            # Mark as running+enabled in memory and ensure interface is set
+                            for s in running_streams:
+                                s["status"] = "running"
+                                s["enabled"] = True
+                                s.setdefault("protocol_selection", {})["enabled"] = True
+                                # Ensure interface field is preserved
+                                if not s.get("interface"):
+                                    s["interface"] = interface_name
+                        else:
+                            logger.error(f"Failed to apply running streams on {port_label}: {resp.status_code} - {resp.text[:200]}")
+                    except Exception as e:
+                        logger.error(f"Error applying running streams to {port_label} via {server_addr}: {e}")
+                
+                # For stopped streams, changes are already applied to self.streams above
+                # They will be used when the stream is started later
+                if stopped_streams:
+                    logger.info(f"Applied changes to {len(stopped_streams)} stopped stream(s) on {port_label} (will take effect when started)")
+
+        # 🔁 Refresh GUI - this will show all streams with their updated configurations
         self.update_stream_table()
 
     def send_inline_update_to_server(self, port, stream):
@@ -1188,7 +1369,7 @@ class TrafficGenClientStreamLogic:
             tg_id = port.split(" - ")[0]  # "TG 0"
             matching_servers = [s for s in self.server_interfaces if f"TG {s['tg_id']}" == tg_id]
             if not matching_servers:
-                print(f"⚠️ No matching server found for {tg_id}")
+                logger.warning(f"No matching server found for {tg_id}")
                 return
 
             server = matching_servers[0]
@@ -1197,16 +1378,16 @@ class TrafficGenClientStreamLogic:
             response = requests.post(url, json=payload, timeout=5)
 
             if response.status_code == 200:
-                print(f"✅ Stream update sent to {url}")
+                logger.info(f"Stream update sent to {url}")
             else:
-                print(f"❌ Failed to update stream. Status: {response.status_code}, Response: {response.text[:200]}")
+                logger.error(f"Failed to update stream. Status: {response.status_code}, Response: {response.text[:200]}")
         except Exception as e:
-            print(f"❌ Error sending stream update to server: {e}")
+            logger.error(f"Error sending stream update to server: {e}")
 
     def upload_pcap_to_server(self, local_path, server_url):
         """Upload a PCAP file to the server and return the server-side path or None."""
         if not os.path.isfile(local_path):
-            print(f"[❌] PCAP file not found: {local_path}")
+            logger.error(f"PCAP file not found: {local_path}")
             return None
 
         filename = os.path.basename(local_path)
@@ -1220,8 +1401,8 @@ class TrafficGenClientStreamLogic:
                 data = response.json()
                 return data.get("filepath")
             else:
-                print(f"[UPLOAD ❌] Failed to upload PCAP: {response.status_code} {response.text[:200]}")
+                logger.error(f"[UPLOAD] Failed to upload PCAP: {response.status_code} {response.text[:200]}")
                 return None
         except Exception as e:
-            print(f"[UPLOAD ❌] Exception uploading PCAP: {e}")
+            logger.error(f"[UPLOAD] Exception uploading PCAP: {e}")
             return None

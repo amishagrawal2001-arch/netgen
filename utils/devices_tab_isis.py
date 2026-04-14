@@ -13,6 +13,8 @@ from PyQt5.QtGui import QIcon
 import requests
 import logging
 
+logger = logging.getLogger(__name__)
+
 
 class ISISHandler:
     """Handler class for ISIS-related functionality in DevicesTab."""
@@ -237,16 +239,16 @@ class ISISHandler:
                                                timeout=10)
                         
                         if response.status_code == 200:
-                            print(f"✅ ISIS configuration removed from server for {device_name}")
+                            logger.info(f"ISIS configuration removed from server for {device_name}")
                         else:
                             error_msg = response.json().get("error", "Unknown error")
-                            print(f"⚠️ Server ISIS cleanup failed for {device_name}: {error_msg}")
+                            logger.error(f"Server ISIS cleanup failed for {device_name}: {error_msg}")
                             # Continue with client-side cleanup even if server fails
                     except requests.exceptions.RequestException as e:
-                        print(f"⚠️ Network error removing ISIS from server for {device_name}: {str(e)}")
+                        logger.warning(f"Network error removing ISIS from server for {device_name}: {str(e)}")
                         # Continue with client-side cleanup even if server fails
                 else:
-                    print("⚠️ No server URL available, removing ISIS configuration locally only")
+                    logger.warning("No server URL available, removing ISIS configuration locally only")
             
             # Mark ISIS for removal instead of immediately deleting it
             # This allows the user to apply the changes to the server later
@@ -373,14 +375,14 @@ class ISISHandler:
                 
                 # Ensure per-device server URL exists
                 if not per_device_server_url:
-                    print(f"[ISIS POST] No server URL resolved for device '{device_name}'. Skipping.")
+                    logger.info(f"[ISIS POST] No server URL resolved for device '{device_name}'. Skipping.")
                     continue
 
                 post_url = f"{per_device_server_url}/api/device/isis/configure"
                 # Client-side debug of outgoing request
                 try:
-                    print(f"[ISIS POST] URL: {post_url}")
-                    print(f"[ISIS POST] Payload: {isis_data}")
+                    logger.info(f"[ISIS POST] URL: {post_url}")
+                    logger.info(f"[ISIS POST] Payload: {isis_data}")
                 except Exception:
                     pass
 
@@ -388,23 +390,23 @@ class ISISHandler:
                 try:
                     response = requests.post(post_url, json=isis_data, timeout=30)
                 except Exception as e:
-                    print(f"[ISIS POST] Exception posting to {post_url}: {e}")
+                    logger.error(f"[ISIS POST] Exception posting to {post_url}: {e}")
                     continue
                 
                 if response.status_code == 200:
-                    print(f"✅ ISIS configuration applied to server for {device_name}")
+                    logger.info(f"ISIS configuration applied to server for {device_name}")
                 else:
                     try:
                         error_msg = response.json().get("error", response.text)
                     except Exception:
                         error_msg = response.text
-                    print(f"❌ Failed to apply ISIS configuration for {device_name} (status {response.status_code}): {error_msg}")
+                    logger.error(f"Failed to apply ISIS configuration for {device_name} (status {response.status_code}): {error_msg}")
             
             # Refresh ISIS table after applying configurations
             self.update_isis_table()
             
         except requests.exceptions.RequestException as e:
-            print(f"❌ Network error applying ISIS configurations: {str(e)}")
+            logger.error(f"Network error applying ISIS configurations: {str(e)}")
             QMessageBox.critical(self.parent, "Network Error", f"Failed to apply ISIS configurations: {str(e)}")
 
 
@@ -436,30 +438,30 @@ class ISISHandler:
                                                timeout=10)
                         
                         if response.status_code == 200:
-                            print(f"✅ ISIS configuration removed from server for {device_name}")
+                            logger.info(f"ISIS configuration removed from server for {device_name}")
                             server_removal_success = True
                         else:
                             error_msg = response.json().get("error", "Unknown error")
-                            print(f"⚠️ Server ISIS removal failed for {device_name}: {error_msg}")
+                            logger.error(f"Server ISIS removal failed for {device_name}: {error_msg}")
                             # Continue with local removal even if server fails
                     except requests.exceptions.RequestException as e:
-                        print(f"⚠️ Network error removing ISIS from server for {device_name}: {str(e)}")
+                        logger.warning(f"Network error removing ISIS from server for {device_name}: {str(e)}")
                         # Continue with local removal even if server fails
                 else:
-                    print(f"⚠️ No server URL available, removing ISIS configuration locally only for {device_name}")
+                    logger.warning(f"No server URL available, removing ISIS configuration locally only for {device_name}")
                 
                 # Always remove ISIS configuration from device data (local removal)
                 # This ensures the configuration is removed regardless of server status
                 if isinstance(device.get("protocols"), dict):
                     device["protocols"].pop("IS-IS", None)
-                    print(f"✅ ISIS configuration removed locally for {device_name} (dict format)")
+                    logger.info(f"ISIS configuration removed locally for {device_name} (dict format)")
                 else:
                     device.pop("is_is_config", None)
                     # Remove IS-IS from protocols list
                     protocols = device.get("protocols", [])
                     if isinstance(protocols, list) and "IS-IS" in protocols:
                         protocols.remove("IS-IS")
-                        print(f"✅ ISIS configuration removed locally for {device_name} (list format)")
+                        logger.info(f"ISIS configuration removed locally for {device_name} (list format)")
             
             # Refresh ISIS table after removing configurations
             self.update_isis_table()
@@ -469,19 +471,19 @@ class ISISHandler:
                 self.parent.main_window.save_session()
             
         except Exception as e:
-            print(f"❌ Error removing ISIS configurations: {str(e)}")
+            logger.error(f"Error removing ISIS configurations: {str(e)}")
             QMessageBox.critical(self.parent, "Error", f"Failed to remove ISIS configurations: {str(e)}")
 
 
     def refresh_isis_status(self):
         """Refresh ISIS neighbor status from server."""
         try:
-            print("[ISIS REFRESH] Refreshing ISIS status from database...")
+            logger.info("[ISIS REFRESH] Refreshing ISIS status from database...")
             # Update the ISIS table which fetches status from database
             self.update_isis_table()
-            print("[ISIS REFRESH] ISIS status refreshed successfully")
+            logger.info("[ISIS REFRESH] ISIS status refreshed successfully")
         except Exception as e:
-            print(f"[ISIS REFRESH ERROR] Error refreshing ISIS status: {e}")
+            logger.error(f"[ISIS REFRESH ERROR] Error refreshing ISIS status: {e}")
 
 
     def update_isis_table(self):
@@ -844,7 +846,7 @@ class ISISHandler:
                             self.parent.isis_table.setItem(row, 10, multiplier_item)
                     
         except Exception as e:
-            print(f"Error updating ISIS table: {e}")
+            logger.error(f"Error updating ISIS table: {e}")
 
 
     def set_isis_status_icon(self, row, status, tooltip):
@@ -880,7 +882,7 @@ class ISISHandler:
             self.parent.isis_table.setItem(row, 1, item)
             
         except Exception as e:
-            print(f"Error setting ISIS status icon: {e}")
+            logger.error(f"Error setting ISIS status icon: {e}")
             # Fallback to text
             self.parent.isis_table.setItem(row, 1, QTableWidgetItem(status))
 
@@ -930,7 +932,7 @@ class ISISHandler:
                                 }
                                 isis_status["neighbors"].append(neighbor_info)
                     except Exception as e:
-                        print(f"Error parsing ISIS neighbors: {e}")
+                        logger.error(f"Error parsing ISIS neighbors: {e}")
                 
                 return isis_status
             else:
@@ -946,7 +948,7 @@ class ISISHandler:
     def _safe_update_isis_table(self):
         """Safely update ISIS table (for parallel execution)."""
         try:
-            print("[PROTOCOL REFRESH] Refreshing ISIS table...")
+            logger.info("[PROTOCOL REFRESH] Refreshing ISIS table...")
             self.update_isis_table()
         except Exception as e:
             logging.error(f"[ISIS REFRESH ERROR] {e}")
@@ -989,7 +991,7 @@ class ISISHandler:
             return response.status_code == 200
                 
         except Exception as e:
-            print(f"[ERROR] Exception in sync ISIS apply for '{device_name}': {e}")
+            logger.error(f"Exception in sync ISIS apply for '{device_name}': {e}")
             return False
     
     
@@ -1481,7 +1483,7 @@ class ISISHandler:
     def _cleanup_isis_table_for_device(self, device_id, device_name):
         """Clean up ISIS table entries for a removed device."""
         try:
-            print(f"[DEBUG ISIS CLEANUP] Cleaning up ISIS entries for device '{device_name}' (ID: {device_id})")
+            logger.debug(f"[DEBUG ISIS CLEANUP] Cleaning up ISIS entries for device '{device_name}' (ID: {device_id})")
             
             # Remove ISIS table rows that match this device
             rows_to_remove = []
@@ -1490,12 +1492,12 @@ class ISISHandler:
                 device_item = self.parent.isis_table.item(row, 0)  # Assuming first column is device name
                 if device_item and device_item.text() == device_name:
                     rows_to_remove.append(row)
-                    print(f"[DEBUG ISIS CLEANUP] Found ISIS row {row} for device '{device_name}'")
+                    logger.debug(f"[DEBUG ISIS CLEANUP] Found ISIS row {row} for device '{device_name}'")
             
             # Remove rows in reverse order to maintain indices
             for row in sorted(rows_to_remove, reverse=True):
                 self.parent.isis_table.removeRow(row)
-                print(f"[DEBUG ISIS CLEANUP] Removed ISIS table row {row}")
+                logger.debug(f"[DEBUG ISIS CLEANUP] Removed ISIS table row {row}")
             
             # Also clean up ISIS protocol data from device protocols
             # Remove ISIS protocol from the device in all_devices
@@ -1508,42 +1510,42 @@ class ISISHandler:
                             if isinstance(device["protocols"], list):
                                 if "IS-IS" in device["protocols"]:
                                     device["protocols"].remove("IS-IS")
-                                    print(f"[DEBUG ISIS CLEANUP] Removed IS-IS protocol from device '{device_name}'")
+                                    logger.debug(f"[DEBUG ISIS CLEANUP] Removed IS-IS protocol from device '{device_name}'")
                                 elif "ISIS" in device["protocols"]:
                                     device["protocols"].remove("ISIS")
-                                    print(f"[DEBUG ISIS CLEANUP] Removed ISIS protocol from device '{device_name}'")
+                                    logger.debug(f"[DEBUG ISIS CLEANUP] Removed ISIS protocol from device '{device_name}'")
                                 
                                 # If no protocols left, remove the protocols key entirely
                                 if not device["protocols"]:
                                     del device["protocols"]
-                                    print(f"[DEBUG ISIS CLEANUP] Removed empty protocols from device '{device_name}'")
+                                    logger.debug(f"[DEBUG ISIS CLEANUP] Removed empty protocols from device '{device_name}'")
                             elif isinstance(device["protocols"], dict):
                                 # Handle old format for backward compatibility
                                 if "IS-IS" in device["protocols"]:
                                     del device["protocols"]["IS-IS"]
-                                    print(f"[DEBUG ISIS CLEANUP] Removed IS-IS protocol from device '{device_name}' (old format)")
+                                    logger.debug(f"[DEBUG ISIS CLEANUP] Removed IS-IS protocol from device '{device_name}' (old format)")
                                 elif "ISIS" in device["protocols"]:
                                     del device["protocols"]["ISIS"]
-                                    print(f"[DEBUG ISIS CLEANUP] Removed ISIS protocol from device '{device_name}' (old format)")
+                                    logger.debug(f"[DEBUG ISIS CLEANUP] Removed ISIS protocol from device '{device_name}' (old format)")
                                 
                                 # If no protocols left, remove the protocols key entirely
                                 if not device["protocols"]:
                                     del device["protocols"]
-                                    print(f"[DEBUG ISIS CLEANUP] Removed empty protocols from device '{device_name}'")
+                                    logger.debug(f"[DEBUG ISIS CLEANUP] Removed empty protocols from device '{device_name}'")
                         
                         # Also remove isis_config and is_is_config if they exist
                         if "isis_config" in device:
                             del device["isis_config"]
-                            print(f"[DEBUG ISIS CLEANUP] Removed isis_config from device '{device_name}'")
+                            logger.debug(f"[DEBUG ISIS CLEANUP] Removed isis_config from device '{device_name}'")
                         if "is_is_config" in device:
                             del device["is_is_config"]
-                            print(f"[DEBUG ISIS CLEANUP] Removed is_is_config from device '{device_name}'")
+                            logger.debug(f"[DEBUG ISIS CLEANUP] Removed is_is_config from device '{device_name}'")
                         break
             
-            print(f"[DEBUG ISIS CLEANUP] Removed {len(rows_to_remove)} ISIS entries for device '{device_name}'")
+            logger.debug(f"[DEBUG ISIS CLEANUP] Removed {len(rows_to_remove)} ISIS entries for device '{device_name}'")
             
         except Exception as e:
-            print(f"[ERROR] Failed to cleanup ISIS entries for device '{device_name}': {e}")
+            logger.error(f"Failed to cleanup ISIS entries for device '{device_name}': {e}")
 
     # ---------- Table refresh ----------
 
@@ -1563,9 +1565,9 @@ class ISISHandler:
         if not self.parent.isis_monitoring_active:
             self.parent.isis_monitoring_active = True
             self.parent.isis_monitoring_timer.start(20000)  # Check every 20 seconds to match OSPF
-            print("[ISIS MONITORING] Started periodic ISIS status monitoring")
+            logger.info("[ISIS MONITORING] Started periodic ISIS status monitoring")
         else:
-            print("[ISIS MONITORING] Already active")
+            logger.info("[ISIS MONITORING] Already active")
     
 
     def stop_isis_monitoring(self):
@@ -1573,9 +1575,9 @@ class ISISHandler:
         if self.parent.isis_monitoring_active:
             self.parent.isis_monitoring_active = False
             self.parent.isis_monitoring_timer.stop()
-            print("[ISIS MONITORING] Stopped periodic ISIS status monitoring")
+            logger.info("[ISIS MONITORING] Stopped periodic ISIS status monitoring")
         else:
-            print("[ISIS MONITORING] Already stopped")
+            logger.info("[ISIS MONITORING] Already stopped")
     
 
     def periodic_isis_status_check(self):
@@ -1589,12 +1591,12 @@ class ISISHandler:
                         isis_devices.append(device)
             
             if isis_devices:
-                print(f"[ISIS MONITORING] Periodic ISIS status check for {len(isis_devices)} devices")
+                logger.info(f"[ISIS MONITORING] Periodic ISIS status check for {len(isis_devices)} devices")
                 # Use QTimer.singleShot to defer table update and avoid blocking UI thread
                 # This ensures the periodic check doesn't block the UI during table updates
                 from PyQt5.QtCore import QTimer
                 QTimer.singleShot(0, self.update_isis_table)  # Defer to next event loop iteration
             
         except Exception as e:
-            print(f"[ISIS MONITORING ERROR] Error in periodic ISIS status check: {e}")
+            logger.error(f"[ISIS MONITORING ERROR] Error in periodic ISIS status check: {e}")
     

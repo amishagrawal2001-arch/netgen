@@ -14,6 +14,8 @@ from PyQt5.QtGui import QIcon
 import requests
 import logging
 
+logger = logging.getLogger(__name__)
+
 
 class OSPFHandler:
     """Handler class for OSPF-related functionality in DevicesTab."""
@@ -135,11 +137,11 @@ class OSPFHandler:
     def refresh_ospf_status(self):
         """Refresh/Update OSPF table display (read-only, does NOT apply to server)."""
         try:
-            print("[OSPF REFRESH] Refreshing OSPF table display from database...")
+            logger.info("[OSPF REFRESH] Refreshing OSPF table display from database...")
             # Temporarily disconnect cellChanged signal to prevent issues during refresh
             try:
                 self.parent.ospf_table.cellChanged.disconnect()
-            except:
+            except Exception:
                 pass  # Signal might not be connected
             
             # Update the OSPF table which fetches status from database
@@ -153,18 +155,18 @@ class OSPFHandler:
             # Reconnect cellChanged signal
             try:
                 self.parent.ospf_table.cellChanged.connect(self.on_ospf_table_cell_changed)
-            except:
+            except Exception:
                 pass  # Signal might already be connected
             
-            print(f"[OSPF REFRESH] OSPF table refreshed successfully (no server changes) - {self.parent.ospf_table.rowCount()} rows displayed")
+            logger.info(f"[OSPF REFRESH] OSPF table refreshed successfully (no server changes) - {self.parent.ospf_table.rowCount()} rows displayed")
         except Exception as e:
-            print(f"[OSPF REFRESH ERROR] Error refreshing OSPF table: {e}")
+            logger.error(f"[OSPF REFRESH ERROR] Error refreshing OSPF table: {e}")
             import traceback
             traceback.print_exc()
             # Try to reconnect signal even on error
             try:
                 self.parent.ospf_table.cellChanged.connect(self.on_ospf_table_cell_changed)
-            except:
+            except Exception:
                 pass
     
     def update_ospf_table(self):
@@ -179,7 +181,7 @@ class OSPFHandler:
                         try:
                             import json
                             device_protocols = json.loads(device_protocols)
-                        except:
+                        except Exception:
                             device_protocols = []
                     
                     if "OSPF" in device_protocols:
@@ -189,7 +191,7 @@ class OSPFHandler:
                     break
             
             if has_ospf_devices:
-                print("[OSPF AUTO-START] Auto-starting OSPF monitoring for existing OSPF devices")
+                logger.info("[OSPF AUTO-START] Auto-starting OSPF monitoring for existing OSPF devices")
                 self.start_ospf_monitoring()
             
             # Auto-start ISIS monitoring if ISIS devices exist
@@ -199,7 +201,7 @@ class OSPFHandler:
                 for device in devices
             )
             if isis_devices_exist:
-                print("[ISIS AUTO-START] Auto-starting ISIS monitoring for existing ISIS devices")
+                logger.info("[ISIS AUTO-START] Auto-starting ISIS monitoring for existing ISIS devices")
                 # Note: This would need to be handled by ISIS handler
                 if hasattr(self.parent, 'start_isis_monitoring'):
                     self.parent.start_isis_monitoring()
@@ -274,7 +276,7 @@ class OSPFHandler:
                             try:
                                 import json
                                 ospf_config = json.loads(ospf_config)
-                            except:
+                            except Exception:
                                 ospf_config = {}
                         
                         # CRITICAL: Skip database reload in update_ospf_table to prevent UI hangs
@@ -299,7 +301,7 @@ class OSPFHandler:
                         #                     try:
                         #                         import json
                         #                         db_ospf_config = json.loads(db_ospf_config)
-                        #                     except:
+                        #                     except Exception:
                         #                         db_ospf_config = {}
                         #                 
                         #                 # Use database config if it exists and is valid
@@ -521,12 +523,12 @@ class OSPFHandler:
                             pool_item.setToolTip(f"Attached route pools for {protocol_type}: {route_pools_str if route_pools_str else 'None'}")
                             self.parent.ospf_table.setItem(row, 12, pool_item)  # Route Pools
         except Exception as e:
-            print(f"Error updating OSPF table: {e}")
+            logger.error(f"Error updating OSPF table: {e}")
     
     def _safe_update_ospf_table(self):
         """Safely update OSPF table (for parallel execution)."""
         try:
-            print("[PROTOCOL REFRESH] Refreshing OSPF table...")
+            logger.info("[PROTOCOL REFRESH] Refreshing OSPF table...")
             self.update_ospf_table()
         except Exception as e:
             logging.error(f"[OSPF REFRESH ERROR] {e}")
@@ -606,7 +608,7 @@ class OSPFHandler:
             return response.status_code == 200
                 
         except Exception as e:
-            print(f"[ERROR] Exception in sync OSPF apply for '{device_name}': {e}")
+            logger.error(f"Exception in sync OSPF apply for '{device_name}': {e}")
             return False
     
     def prompt_add_ospf(self):
@@ -807,7 +809,7 @@ class OSPFHandler:
             # Temporarily disconnect cellChanged signal to prevent issues during refresh
             try:
                 self.parent.ospf_table.cellChanged.disconnect()
-            except:
+            except Exception:
                 pass  # Signal might not be connected
             
             self.update_ospf_table()
@@ -819,10 +821,10 @@ class OSPFHandler:
             # Reconnect cellChanged signal
             try:
                 self.parent.ospf_table.cellChanged.connect(self.on_ospf_table_cell_changed)
-            except:
+            except Exception:
                 pass  # Signal might already be connected
             
-            print(f"[OSPF EDIT] OSPF configuration updated in table for {device_name} ({protocol_type}) - click 'Apply OSPF' to save and apply to server")
+            logger.info(f"[OSPF EDIT] OSPF configuration updated in table for {device_name} ({protocol_type}) - click 'Apply OSPF' to save and apply to server")
             QMessageBox.information(self.parent, "OSPF Configuration Updated", 
                                   f"OSPF configuration updated for {device_name} ({protocol_type}).\n\n"
                                   f"The changes are shown in the table.\n\n"
@@ -878,16 +880,16 @@ class OSPFHandler:
                                                timeout=10)
                         
                         if response.status_code == 200:
-                            print(f"✅ OSPF configuration removed from server for {device_name}")
+                            logger.info(f"OSPF configuration removed from server for {device_name}")
                         else:
                             error_msg = response.json().get("error", "Unknown error")
-                            print(f"⚠️ Server OSPF cleanup failed for {device_name}: {error_msg}")
+                            logger.error(f"Server OSPF cleanup failed for {device_name}: {error_msg}")
                             # Continue with client-side cleanup even if server fails
                     except requests.exceptions.RequestException as e:
-                        print(f"⚠️ Network error removing OSPF from server for {device_name}: {str(e)}")
+                        logger.warning(f"Network error removing OSPF from server for {device_name}: {str(e)}")
                         # Continue with client-side cleanup even if server fails
                 else:
-                    print("⚠️ No server URL available, removing OSPF configuration locally only")
+                    logger.warning("No server URL available, removing OSPF configuration locally only")
             
             # Mark OSPF for removal instead of immediately deleting it
             # This allows the user to apply the changes to the server later
@@ -935,7 +937,7 @@ class OSPFHandler:
                     break
             
             if not device_info:
-                print(f"[OSPF P2P] Device {device_name} not found")
+                logger.info(f"[OSPF P2P] Device {device_name} not found")
                 return
             
             # Get current OSPF config
@@ -963,11 +965,11 @@ class OSPFHandler:
             # Mark as just edited to prevent database reload from overwriting
             device_info["_ospf_just_edited"] = True
             
-            print(f"[OSPF P2P] Updated P2P setting for {device_name} ({protocol_type}): {p2p_enabled}")
-            print(f"[OSPF EDIT] OSPF configuration updated in table for {device_name} ({protocol_type}) - click 'Apply OSPF' to save and apply to server")
+            logger.info(f"[OSPF P2P] Updated P2P setting for {device_name} ({protocol_type}): {p2p_enabled}")
+            logger.info(f"[OSPF EDIT] OSPF configuration updated in table for {device_name} ({protocol_type}) - click 'Apply OSPF' to save and apply to server")
             
         except Exception as e:
-            print(f"[OSPF P2P] Error handling P2P checkbox change: {e}")
+            logger.info(f"[OSPF P2P] Error handling P2P checkbox change: {e}")
     
     def on_graceful_restart_checkbox_changed(self, checkbox, state):
         """Handle Graceful Restart checkbox state change."""
@@ -987,7 +989,7 @@ class OSPFHandler:
                     break
             
             if not device_info:
-                print(f"[OSPF GR] Device {device_name} not found")
+                logger.info(f"[OSPF GR] Device {device_name} not found")
                 return
             
             # Get current OSPF config
@@ -1015,11 +1017,11 @@ class OSPFHandler:
             # Mark as just edited to prevent database reload from overwriting
             device_info["_ospf_just_edited"] = True
             
-            print(f"[OSPF GR] Updated graceful restart setting for {device_name} ({protocol_type}): {graceful_restart_enabled}")
-            print(f"[OSPF EDIT] OSPF configuration updated in table for {device_name} ({protocol_type}) - click 'Apply OSPF' to save and apply to server")
+            logger.info(f"[OSPF GR] Updated graceful restart setting for {device_name} ({protocol_type}): {graceful_restart_enabled}")
+            logger.info(f"[OSPF EDIT] OSPF configuration updated in table for {device_name} ({protocol_type}) - click 'Apply OSPF' to save and apply to server")
             
         except Exception as e:
-            print(f"[OSPF GR] Error handling graceful restart checkbox change: {e}")
+            logger.info(f"[OSPF GR] Error handling graceful restart checkbox change: {e}")
     
     def on_ospf_table_cell_changed(self, row, column):
         """Handle cell changes in OSPF table - handles inline editing of Area ID."""
@@ -1240,7 +1242,7 @@ class OSPFHandler:
                     if hasattr(self.parent.main_window, "save_session"):
                         self.parent.main_window.save_session()
                 except Exception as e:
-                    print(f"[OSPF EDIT ERROR] Error in deferred update: {e}")
+                    logger.error(f"[OSPF EDIT ERROR] Error in deferred update: {e}")
             
             # Defer to next event loop iteration to prevent UI blocking
             QTimer.singleShot(0, deferred_update)
@@ -1254,7 +1256,7 @@ class OSPFHandler:
             total_rows = self.parent.ospf_table.rowCount()
             if total_rows > 0:
                 self.parent.ospf_table.selectAll()
-                print(f"[OSPF TABLE] All {total_rows} rows selected")
+                logger.info(f"[OSPF TABLE] All {total_rows} rows selected")
                 return
             else:
                 QMessageBox.warning(self.parent, "No OSPF Devices", "No OSPF devices are configured. Please add OSPF configuration first.")
@@ -1297,25 +1299,25 @@ class OSPFHandler:
             device_info = self.parent._find_device_by_name(device_name)
             
             if not device_info:
-                print(f"[OSPF ROUTE POOLS] Warning: Could not find device '{device_name}'")
+                logger.warning(f"[OSPF ROUTE POOLS] Warning: Could not find device '{device_name}'")
                 continue
             
             # Ensure device_info is a dictionary - handle list case
             if not isinstance(device_info, dict):
-                print(f"[OSPF ROUTE POOLS] Warning: device_info is not a dict for '{device_name}', it's {type(device_info)}")
+                logger.warning(f"[OSPF ROUTE POOLS] Warning: device_info is not a dict for '{device_name}', it's {type(device_info)}")
                 # Try to extract dict from list if it's a list
                 if isinstance(device_info, list) and len(device_info) > 0:
-                    print(f"[OSPF ROUTE POOLS] Attempting to extract dict from list...")
+                    logger.info(f"[OSPF ROUTE POOLS] Attempting to extract dict from list...")
                     device_info = device_info[0] if isinstance(device_info[0], dict) else None
                     if device_info is None:
-                        print(f"[OSPF ROUTE POOLS] Could not extract dict from list for '{device_name}'")
+                        logger.info(f"[OSPF ROUTE POOLS] Could not extract dict from list for '{device_name}'")
                         continue
                 else:
                     continue
             
             # Final check - ensure device_info is now a dict
             if not isinstance(device_info, dict):
-                print(f"[OSPF ROUTE POOLS] Final check failed: device_info is still not a dict for '{device_name}'")
+                logger.error(f"[OSPF ROUTE POOLS] Final check failed: device_info is still not a dict for '{device_name}'")
                 continue
             
             # Get OSPF config for this device
@@ -1325,17 +1327,17 @@ class OSPFHandler:
                 try:
                     import json
                     protocols = json.loads(protocols)
-                except:
+                except Exception:
                     protocols = []
             
             if not isinstance(protocols, list) or "OSPF" not in protocols:
-                print(f"[OSPF ROUTE POOLS] Warning: Device '{device_name}' does not have OSPF configured")
+                logger.warning(f"[OSPF ROUTE POOLS] Warning: Device '{device_name}' does not have OSPF configured")
                 continue
             
             # Get the actual OSPF configuration
             ospf_config = device_info.get("ospf_config", {})
             if not ospf_config:
-                print(f"[OSPF ROUTE POOLS] Warning: Device '{device_name}' does not have OSPF configuration")
+                logger.warning(f"[OSPF ROUTE POOLS] Warning: Device '{device_name}' does not have OSPF configuration")
                 continue
             
             selected_devices.append({
@@ -1420,7 +1422,7 @@ class OSPFHandler:
                         total_routes += pool["count"]
                         break
             
-            print(f"[OSPF ROUTE POOLS] Attached {len(selected_pools)} pool(s) ({total_routes} routes) to OSPF device '{device_name}'")
+            logger.info(f"[OSPF ROUTE POOLS] Attached {len(selected_pools)} pool(s) ({total_routes} routes) to OSPF device '{device_name}'")
             QMessageBox.information(self.parent, "Route Pools Attached", 
                                   f"Attached {len(selected_pools)} route pool(s) to OSPF device.\n\n"
                                   f"Device: {device_name}\n"
@@ -1564,7 +1566,7 @@ class OSPFHandler:
                         count_part = parts[1].split(" routes")[0]
                         try:
                             total_routes += int(count_part)
-                        except:
+                        except Exception:
                             pass
                 
                 if selected_count == 0:
@@ -1649,7 +1651,7 @@ class OSPFHandler:
                 
                 removed_text = "\n".join(removed_parts) if removed_parts else "No configurations"
                 
-                print(f"[OSPF ROUTE POOLS] Removed all pools from {removed_count} OSPF configuration(s): {removed_text}")
+                logger.info(f"[OSPF ROUTE POOLS] Removed all pools from {removed_count} OSPF configuration(s): {removed_text}")
                 QMessageBox.information(self.parent, "Route Pools Removed", 
                                       f"Successfully removed all route pools from {removed_count} OSPF configuration(s):\n\n"
                                       f"{removed_text}\n\n"
@@ -1694,7 +1696,7 @@ class OSPFHandler:
                 # No pools matching this address family - skip this configuration
                 # This can happen if user selected only IPv4 pools but we have an IPv6 config selected
                 # or vice versa - this is expected behavior
-                print(f"[OSPF ROUTE POOLS] Skipping {device_name} ({address_family}) - no pools selected for this address family")
+                logger.info(f"[OSPF ROUTE POOLS] Skipping {device_name} ({address_family}) - no pools selected for this address family")
                 continue
             
             # Initialize route_pools as dict if needed
@@ -1754,7 +1756,7 @@ class OSPFHandler:
         
         summary_text = "\n".join(summary_parts)
         
-        print(f"[OSPF ROUTE POOLS] Attached pools to {total_devices} OSPF device(s): {summary_text}")
+        logger.info(f"[OSPF ROUTE POOLS] Attached pools to {total_devices} OSPF device(s): {summary_text}")
         QMessageBox.information(self.parent, "Route Pools Attached", 
                               f"Successfully attached route pools to {total_devices} OSPF configuration(s):\n\n"
                               f"{summary_text}\n\n"
@@ -1770,7 +1772,7 @@ class OSPFHandler:
             total_rows = self.parent.ospf_table.rowCount()
             if total_rows > 0:
                 self.parent.ospf_table.selectAll()
-                print(f"[OSPF TABLE] All {total_rows} rows selected")
+                logger.info(f"[OSPF TABLE] All {total_rows} rows selected")
                 return
             else:
                 QMessageBox.warning(self.parent, "No OSPF Devices", "No OSPF devices are configured.")
@@ -1801,25 +1803,25 @@ class OSPFHandler:
             device_info = self.parent._find_device_by_name(device_name)
             
             if not device_info:
-                print(f"[OSPF ROUTE POOLS] Warning: Could not find device '{device_name}'")
+                logger.warning(f"[OSPF ROUTE POOLS] Warning: Could not find device '{device_name}'")
                 continue
             
             # Ensure device_info is a dictionary - handle list case
             if not isinstance(device_info, dict):
-                print(f"[OSPF ROUTE POOLS] Warning: device_info is not a dict for '{device_name}', it's {type(device_info)}")
+                logger.warning(f"[OSPF ROUTE POOLS] Warning: device_info is not a dict for '{device_name}', it's {type(device_info)}")
                 # Try to extract dict from list if it's a list
                 if isinstance(device_info, list) and len(device_info) > 0:
-                    print(f"[OSPF ROUTE POOLS] Attempting to extract dict from list...")
+                    logger.info(f"[OSPF ROUTE POOLS] Attempting to extract dict from list...")
                     device_info = device_info[0] if isinstance(device_info[0], dict) else None
                     if device_info is None:
-                        print(f"[OSPF ROUTE POOLS] Could not extract dict from list for '{device_name}'")
+                        logger.info(f"[OSPF ROUTE POOLS] Could not extract dict from list for '{device_name}'")
                         continue
                 else:
                     continue
             
             # Final check - ensure device_info is now a dict
             if not isinstance(device_info, dict):
-                print(f"[OSPF ROUTE POOLS] Final check failed: device_info is still not a dict for '{device_name}'")
+                logger.error(f"[OSPF ROUTE POOLS] Final check failed: device_info is still not a dict for '{device_name}'")
                 continue
             
             # Get OSPF config for this device
@@ -1829,17 +1831,17 @@ class OSPFHandler:
                 try:
                     import json
                     protocols = json.loads(protocols)
-                except:
+                except Exception:
                     protocols = []
             
             if not isinstance(protocols, list) or "OSPF" not in protocols:
-                print(f"[OSPF ROUTE POOLS] Warning: Device '{device_name}' does not have OSPF configured")
+                logger.warning(f"[OSPF ROUTE POOLS] Warning: Device '{device_name}' does not have OSPF configured")
                 continue
             
             # Get the actual OSPF configuration
             ospf_config = device_info.get("ospf_config", {})
             if not ospf_config:
-                print(f"[OSPF ROUTE POOLS] Warning: Device '{device_name}' does not have OSPF configuration")
+                logger.warning(f"[OSPF ROUTE POOLS] Warning: Device '{device_name}' does not have OSPF configuration")
                 continue
             
             # Check if this address family has any route pools attached
@@ -1935,7 +1937,7 @@ class OSPFHandler:
                 else:
                     ipv6_count += 1
                 
-                print(f"[OSPF ROUTE POOLS] Detached {pools_count} pool(s) from {device_name} ({address_family})")
+                logger.info(f"[OSPF ROUTE POOLS] Detached {pools_count} pool(s) from {device_name} ({address_family})")
             
             # Mark device as needing apply
             device_data["device_info"]["_needs_apply"] = True
@@ -1955,7 +1957,7 @@ class OSPFHandler:
         
         summary_text = "\n".join(summary_parts) if summary_parts else "No configurations"
         
-        print(f"[OSPF ROUTE POOLS] Detached route pools from {total_detached} OSPF configuration(s): {summary_text}")
+        logger.info(f"[OSPF ROUTE POOLS] Detached route pools from {total_detached} OSPF configuration(s): {summary_text}")
         QMessageBox.information(self.parent, "Route Pools Detached", 
                               f"Successfully detached route pools from {total_detached} OSPF configuration(s):\n\n"
                               f"{summary_text}\n\n"
@@ -2142,10 +2144,10 @@ class OSPFHandler:
                                         ospf_config["ipv4_enabled"] = db_ospf_config["ipv4_enabled"]
                                     if "ipv6_enabled" in db_ospf_config:
                                         ospf_config["ipv6_enabled"] = db_ospf_config["ipv6_enabled"]
-                                    print(f"[OSPF APPLY DEBUG] Loaded enabled flags from database: ipv4_enabled={ospf_config.get('ipv4_enabled')}, ipv6_enabled={ospf_config.get('ipv6_enabled')}")
+                                    logger.debug(f"[OSPF APPLY DEBUG] Loaded enabled flags from database: ipv4_enabled={ospf_config.get('ipv4_enabled')}, ipv6_enabled={ospf_config.get('ipv6_enabled')}")
                         except Exception as e:
                             # If database load fails, continue with in-memory config
-                            print(f"[OSPF APPLY DEBUG] Could not load OSPF config from database: {e}")
+                            logger.debug(f"[OSPF APPLY DEBUG] Could not load OSPF config from database: {e}")
                         
                         # CRITICAL: Filter ospf_config to only include fields relevant to selected address families
                         # This prevents sending area_id_ipv4 when only IPv6 is selected, and vice versa
@@ -2203,7 +2205,7 @@ class OSPFHandler:
                             pass
                         
                         # DEBUG: Log what we're sending to verify area IDs are included
-                        print(f"[OSPF APPLY DEBUG] Sending ospf_config for {device_name}: area_id_ipv4={ospf_config.get('area_id_ipv4')}, area_id_ipv6={ospf_config.get('area_id_ipv6')}, area_id={ospf_config.get('area_id')}, selected_afs={selected_address_families}")
+                        logger.debug(f"[OSPF APPLY DEBUG] Sending ospf_config for {device_name}: area_id_ipv4={ospf_config.get('area_id_ipv4')}, area_id_ipv6={ospf_config.get('area_id_ipv6')}, area_id={ospf_config.get('area_id')}, selected_afs={selected_address_families}")
                         
                         # Get route pools from ospf_config - support both old list and new dict format
                         route_pools_data = ospf_config.get("route_pools", {})
@@ -2237,18 +2239,18 @@ class OSPFHandler:
                         
                         if response.status_code == 200:
                             results["success_count"] += 1
-                            print(f"✅ OSPF configuration applied for {device_name}")
+                            logger.info(f"OSPF configuration applied for {device_name}")
                         else:
                             error_msg = response.json().get("error", "Unknown error")
                             results["failed_devices"].append(f"{device_name}: {error_msg}")
-                            print(f"❌ Failed to apply OSPF for {device_name}: {error_msg}")
+                            logger.error(f"Failed to apply OSPF for {device_name}: {error_msg}")
                             
                     except requests.exceptions.RequestException as e:
                         results["failed_devices"].append(f"{device_name}: Network error - {str(e)}")
-                        print(f"❌ Network error applying OSPF for {device_name}: {str(e)}")
+                        logger.error(f"Network error applying OSPF for {device_name}: {str(e)}")
                     except Exception as e:
                         results["failed_devices"].append(f"{device_name}: {str(e)}")
-                        print(f"❌ Error applying OSPF for {device_name}: {str(e)}")
+                        logger.error(f"Error applying OSPF for {device_name}: {str(e)}")
                 
                 # Handle OSPF removal
                 for device_info in self.devices_to_remove_ospf:
@@ -2267,7 +2269,7 @@ class OSPFHandler:
                         
                         if response.status_code == 200:
                             results["removal_success_count"] += 1
-                            print(f"✅ OSPF configuration removed for {device_name}")
+                            logger.info(f"OSPF configuration removed for {device_name}")
                             
                             # Remove OSPF configuration from client data after successful server removal
                             if "protocols" in device_info:
@@ -2283,14 +2285,14 @@ class OSPFHandler:
                         else:
                             error_msg = response.json().get("error", "Unknown error")
                             results["removal_failed_devices"].append(f"{device_name}: {error_msg}")
-                            print(f"❌ Failed to remove OSPF for {device_name}: {error_msg}")
+                            logger.error(f"Failed to remove OSPF for {device_name}: {error_msg}")
                             
                     except requests.exceptions.RequestException as e:
                         results["removal_failed_devices"].append(f"{device_name}: Network error - {str(e)}")
-                        print(f"❌ Network error removing OSPF for {device_name}: {str(e)}")
+                        logger.error(f"Network error removing OSPF for {device_name}: {str(e)}")
                     except Exception as e:
                         results["removal_failed_devices"].append(f"{device_name}: {str(e)}")
-                        print(f"❌ Error removing OSPF for {device_name}: {str(e)}")
+                        logger.error(f"Error removing OSPF for {device_name}: {str(e)}")
                 
                 # Emit results when done
                 self.finished.emit(results)
@@ -2454,10 +2456,10 @@ class OSPFHandler:
                                             import json
                                             try:
                                                 db_ospf_config = json.loads(db_ospf_config)
-                                            except:
+                                            except Exception:
                                                 db_ospf_config = {}
                                         device_name = device_info.get("Device Name", "")
-                                        print(f"[OSPF APPLY DEBUG] Reloaded from database for {device_name}: area_id_ipv4={db_ospf_config.get('area_id_ipv4')}, area_id_ipv6={db_ospf_config.get('area_id_ipv6')}, area_id={db_ospf_config.get('area_id')}")
+                                        logger.debug(f"[OSPF APPLY DEBUG] Reloaded from database for {device_name}: area_id_ipv4={db_ospf_config.get('area_id_ipv4')}, area_id_ipv6={db_ospf_config.get('area_id_ipv6')}, area_id={db_ospf_config.get('area_id')}")
                                         
                                         # Update the device in all_devices with latest data from database
                                         for iface, devices in self.parent.main_window.all_devices.items():
@@ -2470,9 +2472,9 @@ class OSPFHandler:
                                             if device.get("Device Name") == device_name:
                                                 break
                                 except requests.exceptions.RequestException as e:
-                                    print(f"[OSPF APPLY] Warning: Could not reload device data for {device_id} from API: {e}")
+                                    logger.warning(f"[OSPF APPLY] Warning: Could not reload device data for {device_id} from API: {e}")
                     except Exception as e:
-                        print(f"[OSPF APPLY] Warning: Could not reload device data from database: {e}")
+                        logger.warning(f"[OSPF APPLY] Warning: Could not reload device data from database: {e}")
                 
                 # Clear the _ospf_just_edited flag for all devices after apply
                 # This allows the table to reload from database on next refresh
@@ -2492,7 +2494,7 @@ class OSPFHandler:
                                 # Mark device as just applied to prevent immediate reload
                                 device["_ospf_just_applied"] = True
                                 device["_ospf_apply_time"] = current_time
-                                print(f"[OSPF APPLY DEBUG] Cleared _ospf_just_edited and _needs_apply flags for {device_name}, set _ospf_just_applied=True")
+                                logger.debug(f"[OSPF APPLY DEBUG] Cleared _ospf_just_edited and _needs_apply flags for {device_name}, set _ospf_just_applied=True")
                                 break
                         # Check if we found the device
                         for device in devices:
@@ -2505,13 +2507,13 @@ class OSPFHandler:
                 # Temporarily disconnect cellChanged signal to prevent issues during refresh
                 try:
                     self.parent.ospf_table.cellChanged.disconnect()
-                except:
+                except Exception:
                     pass  # Signal might not be connected
                 
                 # Defer table update to prevent UI blocking
                 QTimer.singleShot(0, self.update_ospf_table)
             except Exception as e:
-                print(f"[OSPF APPLY ERROR] Error in deferred reload and update: {e}")
+                logger.error(f"[OSPF APPLY ERROR] Error in deferred reload and update: {e}")
         
         # Defer to next event loop iteration to prevent UI blocking
         QTimer.singleShot(0, deferred_reload_and_update)
@@ -2529,18 +2531,18 @@ class OSPFHandler:
         if not self.parent.ospf_monitoring_active:
             self.parent.ospf_monitoring_active = True
             self.parent.ospf_monitoring_timer.start(20000)  # Check every 20 seconds to reduce UI load
-            print("[OSPF MONITORING] Started periodic OSPF status monitoring")
+            logger.info("[OSPF MONITORING] Started periodic OSPF status monitoring")
         else:
-            print("[OSPF MONITORING] Already active")
+            logger.info("[OSPF MONITORING] Already active")
     
     def stop_ospf_monitoring(self):
         """Stop periodic OSPF status monitoring."""
         if self.parent.ospf_monitoring_active:
             self.parent.ospf_monitoring_active = False
             self.parent.ospf_monitoring_timer.stop()
-            print("[OSPF MONITORING] Stopped periodic OSPF status monitoring")
+            logger.info("[OSPF MONITORING] Stopped periodic OSPF status monitoring")
         else:
-            print("[OSPF MONITORING] Already stopped")
+            logger.info("[OSPF MONITORING] Already stopped")
     
     def periodic_ospf_status_check(self):
         """Periodic OSPF status check for all devices with OSPF configured."""
@@ -2556,7 +2558,7 @@ class OSPFHandler:
                     try:
                         import json
                         device_protocols = json.loads(device_protocols)
-                    except:
+                    except Exception:
                         device_protocols = []
                 
                 if "OSPF" in device_protocols:
@@ -2564,7 +2566,7 @@ class OSPFHandler:
         
         # If no devices have OSPF configured, stop monitoring
         if not devices_with_ospf:
-            print("[OSPF MONITORING] No devices with OSPF configured - stopping monitoring")
+            logger.info("[OSPF MONITORING] No devices with OSPF configured - stopping monitoring")
             self.stop_ospf_monitoring()
             return
             
@@ -2594,12 +2596,12 @@ class OSPFHandler:
         # This ensures the periodic check doesn't block the UI during table updates
         from PyQt5.QtCore import QTimer
         QTimer.singleShot(0, self.update_ospf_table)  # Defer to next event loop iteration
-        print(f"[OSPF MONITORING] Periodic OSPF status check completed for {len(devices_with_ospf)} devices")
+        logger.info(f"[OSPF MONITORING] Periodic OSPF status check completed for {len(devices_with_ospf)} devices")
     
     def _cleanup_ospf_table_for_device(self, device_id, device_name):
         """Clean up OSPF table entries for a removed device."""
         try:
-            print(f"[DEBUG OSPF CLEANUP] Cleaning up OSPF entries for device '{device_name}' (ID: {device_id})")
+            logger.debug(f"[DEBUG OSPF CLEANUP] Cleaning up OSPF entries for device '{device_name}' (ID: {device_id})")
             
             # Remove OSPF table rows that match this device
             rows_to_remove = []
@@ -2608,12 +2610,12 @@ class OSPFHandler:
                 device_item = self.parent.ospf_table.item(row, 0)  # Assuming first column is device name
                 if device_item and device_item.text() == device_name:
                     rows_to_remove.append(row)
-                    print(f"[DEBUG OSPF CLEANUP] Found OSPF row {row} for device '{device_name}'")
+                    logger.debug(f"[DEBUG OSPF CLEANUP] Found OSPF row {row} for device '{device_name}'")
             
             # Remove rows in reverse order to maintain indices
             for row in sorted(rows_to_remove, reverse=True):
                 self.parent.ospf_table.removeRow(row)
-                print(f"[DEBUG OSPF CLEANUP] Removed OSPF table row {row}")
+                logger.debug(f"[DEBUG OSPF CLEANUP] Removed OSPF table row {row}")
             
             # Also clean up OSPF protocol data from device protocols
             # Remove OSPF protocol from the device in all_devices
@@ -2625,30 +2627,30 @@ class OSPFHandler:
                         if "protocols" in device:
                             if isinstance(device["protocols"], list) and "OSPF" in device["protocols"]:
                                 device["protocols"].remove("OSPF")
-                                print(f"[DEBUG OSPF CLEANUP] Removed OSPF protocol from device '{device_name}'")
+                                logger.debug(f"[DEBUG OSPF CLEANUP] Removed OSPF protocol from device '{device_name}'")
                                 
                                 # If no protocols left, remove the protocols key entirely
                                 if not device["protocols"]:
                                     del device["protocols"]
-                                    print(f"[DEBUG OSPF CLEANUP] Removed empty protocols from device '{device_name}'")
+                                    logger.debug(f"[DEBUG OSPF CLEANUP] Removed empty protocols from device '{device_name}'")
                             elif isinstance(device["protocols"], dict) and "OSPF" in device["protocols"]:
                                 # Handle old format for backward compatibility
                                 del device["protocols"]["OSPF"]
-                                print(f"[DEBUG OSPF CLEANUP] Removed OSPF protocol from device '{device_name}' (old format)")
+                                logger.debug(f"[DEBUG OSPF CLEANUP] Removed OSPF protocol from device '{device_name}' (old format)")
                                 
                                 # If no protocols left, remove the protocols key entirely
                                 if not device["protocols"]:
                                     del device["protocols"]
-                                    print(f"[DEBUG OSPF CLEANUP] Removed empty protocols from device '{device_name}'")
+                                    logger.debug(f"[DEBUG OSPF CLEANUP] Removed empty protocols from device '{device_name}'")
                         
                         # Also remove ospf_config if it exists
                         if "ospf_config" in device:
                             del device["ospf_config"]
-                            print(f"[DEBUG OSPF CLEANUP] Removed ospf_config from device '{device_name}'")
+                            logger.debug(f"[DEBUG OSPF CLEANUP] Removed ospf_config from device '{device_name}'")
                         break
             
-            print(f"[DEBUG OSPF CLEANUP] Removed {len(rows_to_remove)} OSPF entries for device '{device_name}'")
+            logger.debug(f"[DEBUG OSPF CLEANUP] Removed {len(rows_to_remove)} OSPF entries for device '{device_name}'")
             
         except Exception as e:
-            print(f"[ERROR] Failed to cleanup OSPF entries for device '{device_name}': {e}")
+            logger.error(f"Failed to cleanup OSPF entries for device '{device_name}': {e}")
 

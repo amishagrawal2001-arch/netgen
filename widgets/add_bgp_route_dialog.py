@@ -1,12 +1,16 @@
+import ipaddress
+import json
+import logging
+import requests
+
 from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QFormLayout, QHBoxLayout,
                              QLineEdit, QSpinBox, QGroupBox, QPushButton,
                              QDialogButtonBox, QTableWidget, QTableWidgetItem,
                              QMessageBox, QHeaderView, QLabel, QCheckBox, QListWidget,
                              QListWidgetItem, QProgressDialog)
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
-import ipaddress
-import requests
-import json
+
+logger = logging.getLogger(__name__)
 
 
 class DatabaseSaveWorker(QThread):
@@ -28,7 +32,7 @@ class DatabaseSaveWorker(QThread):
             saved_count = 0
             errors = []
             
-            print(f"[BGP ROUTE POOLS] Starting to save {total_pools} pools to {self.server_url}")
+            logger.info(f"Starting to save {total_pools} pools to {self.server_url}")
             
             # Fetch current database pools to check for existing names
             try:
@@ -37,17 +41,17 @@ class DatabaseSaveWorker(QThread):
                     data = response.json()
                     existing_pools_data = data.get('pools', [])
                     existing_pool_names = [p.get('name', '') for p in existing_pools_data]
-                    print(f"[BGP ROUTE POOLS] Found {len(existing_pool_names)} existing pools in database: {existing_pool_names}")
+                    logger.info(f"Found {len(existing_pool_names)} existing pools in database: {existing_pool_names}")
                 else:
-                    print(f"[BGP ROUTE POOLS] Failed to fetch existing pools: HTTP {response.status_code}")
+                    logger.error(f"Failed to fetch existing pools: HTTP {response.status_code}")
                     existing_pool_names = []
             except Exception as e:
-                print(f"[BGP ROUTE POOLS] Error fetching existing pools: {e}")
+                logger.error(f"Error fetching existing pools: {e}")
                 existing_pool_names = []
             
             for i, pool in enumerate(self.pools_to_save):
                 try:
-                    print(f"[BGP ROUTE POOLS] Processing pool: {pool}")
+                    logger.debug(f"Processing pool: {pool}")
                     
                     if pool['name'] in existing_pool_names:
                         # Update existing pool
@@ -59,7 +63,7 @@ class DatabaseSaveWorker(QThread):
                             "last_host": pool['last_host'],
                             "increment_type": pool.get('increment_type', 'host')
                         }
-                        print(f"[BGP ROUTE POOLS] Updating pool via PUT {url} with payload: {payload}")
+                        logger.debug(f"Updating pool via PUT {url} with payload: {payload}")
                         response = requests.put(url, json=payload, timeout=10)
                     else:
                         # Create new pool
@@ -72,16 +76,16 @@ class DatabaseSaveWorker(QThread):
                             "last_host": pool['last_host'],
                             "increment_type": pool.get('increment_type', 'host')
                         }
-                        print(f"[BGP ROUTE POOLS] Creating pool via POST {url} with payload: {payload}")
+                        logger.debug(f"Creating pool via POST {url} with payload: {payload}")
                         response = requests.post(url, json=payload, timeout=10)
                     
                     if response.status_code in [200, 201]:
                         saved_count += 1
-                        print(f"[BGP ROUTE POOLS] Successfully saved pool '{pool['name']}'")
+                        logger.info(f"Successfully saved pool '{pool['name']}'")
                     else:
                         error_msg = f"HTTP {response.status_code}: {response.text}"
                         errors.append(f"Failed to save pool '{pool['name']}': {error_msg}")
-                        print(f"[BGP ROUTE POOLS] Failed to save pool '{pool['name']}': {error_msg}")
+                        logger.error(f"Failed to save pool '{pool['name']}': {error_msg}")
                     
                     # Update progress
                     progress = int((i + 1) / total_pools * 100)
@@ -278,7 +282,7 @@ class ManageRoutePoolsDialog(QDialog):
             # Parse the subnet
             try:
                 network = ipaddress.IPv4Network(subnet, strict=False)
-            except:
+            except Exception:
                 network = ipaddress.IPv6Network(subnet, strict=False)
             
             # Check if increment controls are enabled
@@ -420,7 +424,7 @@ class ManageRoutePoolsDialog(QDialog):
             # Try parsing as IPv4 or IPv6 network
             try:
                 network = ipaddress.IPv4Network(subnet, strict=False)
-            except:
+            except Exception:
                 network = ipaddress.IPv6Network(subnet, strict=False)
             
             # Check if increment controls are enabled
@@ -536,12 +540,12 @@ class ManageRoutePoolsDialog(QDialog):
                 try:
                     response = requests.delete(f"{self.server_url}/api/bgp/pools/{pool_name}", timeout=10)
                     if response.status_code == 200:
-                        print(f"[BGP ROUTE POOLS] Successfully deleted pool '{pool_name}' from database")
+                        logger.info(f"Successfully deleted pool '{pool_name}' from database")
                         QMessageBox.information(self, "Pool Deleted", f"Route pool '{pool_name}' has been deleted from the database.")
-                        
+
                         # Remove from local table and list
                         del self.route_pools[row]
-                        print(f"[BGP ROUTE POOLS] Removed pool '{pool_name}' from local table")
+                        logger.debug(f"Removed pool '{pool_name}' from local table")
                         self.pools_table.removeRow(row)
                         
                         # Rebuild pools list from table (in case row indices changed)
@@ -563,13 +567,13 @@ class ManageRoutePoolsDialog(QDialog):
                             })
                         
                     else:
-                        print(f"[BGP ROUTE POOLS] Failed to delete pool '{pool_name}' from database: HTTP {response.status_code}")
+                        logger.error(f"Failed to delete pool '{pool_name}' from database: HTTP {response.status_code}")
                         QMessageBox.warning(self, "Delete Failed", 
                                           f"Failed to delete pool '{pool_name}' from database.\n\n"
                                           f"Error: {response.text}")
                         return  # Don't remove from local table if database delete failed
                 except Exception as e:
-                    print(f"[BGP ROUTE POOLS] Error deleting pool '{pool_name}' from database: {e}")
+                    logger.error(f"Error deleting pool '{pool_name}' from database: {e}")
                     QMessageBox.warning(self, "Delete Error", 
                                       f"Error deleting pool '{pool_name}' from database.\n\n"
                                       f"Error: {str(e)}")
@@ -612,7 +616,7 @@ class ManageRoutePoolsDialog(QDialog):
                     # Delete from database
                     response = requests.delete(f"{self.server_url}/api/bgp/pools/{pool_name}", timeout=10)
                     if response.status_code == 200:
-                        print(f"[BGP ROUTE POOLS] Successfully deleted pool '{pool_name}' from database")
+                        logger.info(f"Successfully deleted pool '{pool_name}' from database")
                         deleted_count += 1
                         
                         # Remove from local table and list
@@ -621,11 +625,11 @@ class ManageRoutePoolsDialog(QDialog):
                         self.pools_table.removeRow(row)
                         
                     else:
-                        print(f"[BGP ROUTE POOLS] Failed to delete pool '{pool_name}' from database: HTTP {response.status_code}")
+                        logger.error(f"Failed to delete pool '{pool_name}' from database: HTTP {response.status_code}")
                         failed_deletions.append(f"{pool_name}: HTTP {response.status_code}")
                         
                 except Exception as e:
-                    print(f"[BGP ROUTE POOLS] Error deleting pool '{pool_name}' from database: {e}")
+                    logger.error(f"Error deleting pool '{pool_name}' from database: {e}")
                     failed_deletions.append(f"{pool_name}: {str(e)}")
             
             # Rebuild pools list from table
@@ -690,11 +694,11 @@ class ManageRoutePoolsDialog(QDialog):
                         'last_host': pool.get('last_host', '')
                     })
                 
-                print(f"[BGP ROUTE POOLS] Loaded {len(self.route_pools)} pools from database")
+                logger.info(f"Loaded {len(self.route_pools)} pools from database")
             else:
-                print(f"[BGP ROUTE POOLS] Failed to load pools from database: HTTP {response.status_code}")
+                logger.error(f"Failed to load pools from database: HTTP {response.status_code}")
         except Exception as e:
-            print(f"[BGP ROUTE POOLS] Error loading pools from database: {e}")
+            logger.error(f"Error loading pools from database: {e}")
             # Continue with empty pools list
     
     def save_both_local_and_database(self):

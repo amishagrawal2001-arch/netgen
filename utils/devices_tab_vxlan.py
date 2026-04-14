@@ -6,6 +6,8 @@ import json
 import logging
 import requests
 
+logger = logging.getLogger(__name__)
+
 # Logging is configured in traffic_client/main.py
 # Just ensure urllib3 doesn't spam DEBUG messages
 logging.getLogger('urllib3').setLevel(logging.WARNING)
@@ -563,7 +565,7 @@ class VXLANHandler:
                 if filtered_devices:
                     logging.debug(f"[VXLAN TAB] No VXLAN tunnels found for {len(filtered_devices)} device(s) - this is normal if VXLAN is not configured")
         except Exception as e:
-            print(f"[VXLAN TAB] ERROR during refresh: {e}")
+            logger.info(f"[VXLAN TAB] ERROR during refresh: {e}")
             logging.error(f"[VXLAN TAB] ERROR during refresh: {e}", exc_info=True)
             # Show error to user
             from PyQt5.QtWidgets import QMessageBox
@@ -721,7 +723,7 @@ class VXLANHandler:
     def _cleanup_vxlan_table_for_device(self, device_id, device_name):
         """Clean up VXLAN table entries for a removed device."""
         try:
-            print(f"[DEBUG VXLAN CLEANUP] Cleaning up VXLAN entries for device '{device_name}' (ID: {device_id})")
+            logger.debug(f"[DEBUG VXLAN CLEANUP] Cleaning up VXLAN entries for device '{device_name}' (ID: {device_id})")
             
             # Remove VXLAN table rows that match this device
             rows_to_remove = []
@@ -736,18 +738,18 @@ class VXLANHandler:
                 device_item = self.parent.vxlan_table.item(row, device_col_idx)
                 if device_item and device_item.text() == device_name:
                     rows_to_remove.append(row)
-                    print(f"[DEBUG VXLAN CLEANUP] Found VXLAN row {row} for device '{device_name}'")
+                    logger.debug(f"[DEBUG VXLAN CLEANUP] Found VXLAN row {row} for device '{device_name}'")
             
             # Remove rows in reverse order to maintain indices
             for row in sorted(rows_to_remove, reverse=True):
                 self.parent.vxlan_table.removeRow(row)
-                print(f"[DEBUG VXLAN CLEANUP] Removed VXLAN table row {row}")
+                logger.debug(f"[DEBUG VXLAN CLEANUP] Removed VXLAN table row {row}")
             
-            print(f"[DEBUG VXLAN CLEANUP] Successfully cleaned up {len(rows_to_remove)} VXLAN table row(s) for device '{device_name}'")
+            logger.debug(f"[DEBUG VXLAN CLEANUP] Successfully cleaned up {len(rows_to_remove)} VXLAN table row(s) for device '{device_name}'")
             
         except Exception as exc:
             logging.warning(f"[VXLAN CLEANUP] Failed to clean up VXLAN table for {device_name}: {exc}")
-            print(f"[DEBUG VXLAN CLEANUP] Error cleaning up VXLAN table: {exc}")
+            logger.debug(f"[DEBUG VXLAN CLEANUP] Error cleaning up VXLAN table: {exc}")
     
     def delete_selected_vxlan_tunnels(self):
         """Delete selected VXLAN tunnel(s) from both client and server."""
@@ -827,7 +829,7 @@ class VXLANHandler:
                 vni = tunnel_info["vni"]
                 vxlan_cfg = tunnel_info["vxlan_cfg"]
                 
-                print(f"[VXLAN DELETE] Deleting tunnel: device={device_name}, VNI={vni}")
+                logger.info(f"[VXLAN DELETE] Deleting tunnel: device={device_name}, VNI={vni}")
                 
                 # Call server API to remove the tunnel
                 response = requests.post(
@@ -844,7 +846,7 @@ class VXLANHandler:
                 if response.status_code == 200:
                     result = response.json()
                     if result.get("success"):
-                        print(f"[VXLAN DELETE] Successfully deleted tunnel VNI {vni} for device {device_name}")
+                        logger.info(f"[VXLAN DELETE] Successfully deleted tunnel VNI {vni} for device {device_name}")
                         deleted_count += 1
                         
                         # Remove tunnel from local device data
@@ -854,11 +856,11 @@ class VXLANHandler:
                         rows_to_remove.append(tunnel_info["row"])
                     else:
                         error_msg = result.get("error", "Unknown error")
-                        print(f"[VXLAN DELETE] Failed to delete tunnel VNI {vni}: {error_msg}")
+                        logger.error(f"[VXLAN DELETE] Failed to delete tunnel VNI {vni}: {error_msg}")
                         failed_count += 1
                 else:
                     error_msg = response.text or f"HTTP {response.status_code}"
-                    print(f"[VXLAN DELETE] Server error deleting tunnel VNI {vni}: {error_msg}")
+                    logger.info(f"[VXLAN DELETE] Server error deleting tunnel VNI {vni}: {error_msg}")
                     failed_count += 1
                     
             except Exception as e:
@@ -884,10 +886,10 @@ class VXLANHandler:
             # Refresh interface list from server to remove deleted VXLAN/bridge interfaces
             # Add a small delay to ensure VXLAN interfaces are fully removed from containers
             if hasattr(self.parent, "main_window") and hasattr(self.parent.main_window, "update_server_tree"):
-                print(f"[VXLAN DELETE] Scheduling interface list refresh from server after VXLAN tunnel deletion (delay: 500ms)")
+                logger.info(f"[VXLAN DELETE] Scheduling interface list refresh from server after VXLAN tunnel deletion (delay: 500ms)")
                 # Define a callback function to ensure it's called correctly
                 def refresh_interfaces():
-                    print(f"[VXLAN DELETE] Executing interface list refresh callback")
+                    logger.info(f"[VXLAN DELETE] Executing interface list refresh callback")
                     try:
                         if hasattr(self.parent, "main_window") and hasattr(self.parent.main_window, "update_server_tree"):
                             # Clear cached interfaces for all servers to force fresh fetch
@@ -896,19 +898,19 @@ class VXLANHandler:
                                 for server in self.parent.main_window.server_interfaces:
                                     if "interfaces" in server:
                                         del server["interfaces"]
-                                        print(f"[VXLAN DELETE] Cleared cached interfaces for server: {server.get('address', 'unknown')}")
+                                        logger.info(f"[VXLAN DELETE] Cleared cached interfaces for server: {server.get('address', 'unknown')}")
                             
                             # Now refresh the server tree with fresh data
                             self.parent.main_window.update_server_tree()
-                            print(f"[VXLAN DELETE] Interface list refresh completed")
+                            logger.info(f"[VXLAN DELETE] Interface list refresh completed")
                         else:
-                            print(f"[VXLAN DELETE] WARNING: main_window or update_server_tree not available in callback")
+                            logger.warning(f"[VXLAN DELETE] WARNING: main_window or update_server_tree not available in callback")
                     except Exception as e:
-                        print(f"[VXLAN DELETE] ERROR during interface refresh: {e}")
+                        logger.info(f"[VXLAN DELETE] ERROR during interface refresh: {e}")
                         logging.error(f"[VXLAN DELETE] ERROR during interface refresh: {e}", exc_info=True)
                 QTimer.singleShot(500, refresh_interfaces)
             else:
-                print(f"[VXLAN DELETE] WARNING: Cannot refresh interface list - main_window or update_server_tree not available")
+                logger.warning(f"[VXLAN DELETE] WARNING: Cannot refresh interface list - main_window or update_server_tree not available")
     
     def _remove_tunnel_from_local_device(self, device_id, device_name, vni):
         """Remove a tunnel from local device data."""
@@ -964,7 +966,7 @@ class VXLANHandler:
                                     protocols.remove("VXLAN")
                                 device["protocols"] = ",".join(protocols)
                         
-                        print(f"[VXLAN DELETE] Removed tunnel VNI {vni} from local device {device_name}")
+                        logger.info(f"[VXLAN DELETE] Removed tunnel VNI {vni} from local device {device_name}")
                         return
         except Exception as e:
             logging.error(f"[VXLAN DELETE] Error removing tunnel from local device: {e}")

@@ -1,5 +1,8 @@
 #server_section.py#
+import logging
 import requests
+
+logger = logging.getLogger(__name__)
 from PyQt5.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTableWidget, QStackedWidget, QSpinBox,
     QTableWidgetItem, QDialog, QFormLayout, QLineEdit, QComboBox, QDialogButtonBox, QWidget,
@@ -363,6 +366,21 @@ class TrafficGenClientServerSection():
                         is_flow = flow_widget.currentText().lower() == "yes"
                         ps["flow_tracking_enabled"] = is_flow
                         stream["flow_tracking_enabled"] = is_flow
+                    
+                    # Frame Size (column 8) - sync from table to model
+                    frame_size_item = self.stream_table.item(row, 8)
+                    if frame_size_item:
+                        frame_size_text = frame_size_item.text().strip()
+                        if frame_size_text:
+                            try:
+                                frame_size_int = int(frame_size_text)
+                                if 64 <= frame_size_int <= 9216:
+                                    frame_size_str = str(frame_size_int)
+                                    ps["frame_size"] = frame_size_str
+                                    stream["frame_size"] = frame_size_str
+                            except (ValueError, TypeError):
+                                pass  # Skip invalid values
+                    
                     break  # Found the stream, no need to continue
 
 
@@ -414,7 +432,7 @@ class TrafficGenClientServerSection():
         is_editing = False
         try:
             is_editing = self.stream_table.state() == QAbstractItemView.EditingState
-        except:
+        except Exception:
             pass
         
         # Check if any combo box dropdown is open (columns 3 and 15)
@@ -512,7 +530,7 @@ class TrafficGenClientServerSection():
             online_tg_ids = {f"TG {server['tg_id']}" for server in getattr(self, "server_interfaces", [])
                              if server.get("online", True)}
             if not online_tg_ids:
-                print("No online servers available. Skipping stream table update.")
+                logger.info("No online servers available. Skipping stream table update.")
                 return
             
             # print(f"[DEBUG STREAM TABLE] Selected ports: {selected_ports}")
@@ -528,8 +546,10 @@ class TrafficGenClientServerSection():
                     continue
 
                 # Check if this port matches any selected port (handle both formats)
-                port_matches = False
+                # If no ports are selected, show all streams from online servers
+                port_matches = True  # Default: show all if nothing selected
                 if selected_ports:
+                    port_matches = False  # Only filter if ports are selected
                     for selected_port in selected_ports:
                         # Normalize both formats for comparison
                         # Stream key format: "TG 0 - Port: ens5np0" or "TG 0 - ens5np0"
@@ -628,15 +648,84 @@ class TrafficGenClientServerSection():
                     protocol_data = stream.get("protocol_data", {}) or {}
                     
                     for offset, key in enumerate(column_keys):
-                        value = ps.get(key, "")
+                        # Read from protocol_selection first, fallback to top-level stream
+                        value = ps.get(key) or stream.get(key, "")
                         col_index = 4 + offset
 
                         # Normalize frame_size in the model if invalid
                         if key == "frame_size":
-                            if value is None or not str(value).isdigit():
-                                value = "64"
-                                ps["frame_size"] = value
-                                stream["frame_size"] = value
+                            # Validate frame_size: must be a number between 64 and 9216
+                            try:
+                                frame_size_int = int(str(value)) if value else 0
+                                if frame_size_int < 64 or frame_size_int > 9216:
+                                    value = "64"  # Invalid range, use default
+                                else:
+                                    value = str(frame_size_int)  # Normalize to string
+                            except (ValueError, TypeError):
+                                value = "64"  # Invalid value, use default
+                            ps["frame_size"] = value
+                            stream["frame_size"] = value
+                        
+                        # Normalize frame_type, frame_min, frame_max if missing
+                        elif key == "frame_type":
+                            if not value:
+                                value = "Fixed"
+                                ps["frame_type"] = value
+                                stream["frame_type"] = value
+                        elif key == "frame_min":
+                            # Validate frame_min: must be a number between 64 and 9216, and <= frame_max
+                            try:
+                                frame_min_int = int(str(value)) if value else 0
+                                frame_max_val = int(ps.get("frame_max") or stream.get("frame_max") or 1518)
+                                
+                                if frame_min_int < 64 or frame_min_int > 9216:
+                                    value = "64"  # Invalid range, use default
+                                elif frame_min_int > frame_max_val:
+                                    # frame_min must be <= frame_max, adjust to frame_max if needed
+                                    value = str(min(frame_max_val, 9216))  # Ensure at most 9216
+                                else:
+                                    value = str(frame_min_int)  # Normalize to string
+                            except (ValueError, TypeError):
+                                value = "64"  # Invalid value, use default
+                            ps["frame_min"] = value
+                            stream["frame_min"] = value
+                        elif key == "frame_max":
+                            # Validate frame_max: must be a number between 64 and 9216, and >= frame_min
+                            try:
+                                frame_max_int = int(str(value)) if value else 0
+                                frame_min_val = int(ps.get("frame_min") or stream.get("frame_min") or 64)
+                                
+                                if frame_max_int < 64 or frame_max_int > 9216:
+                                    value = "1518"  # Invalid range, use default
+                                elif frame_max_int < frame_min_val:
+                                    # frame_max must be >= frame_min, adjust to frame_min if needed
+                                    value = str(max(frame_min_val, 64))  # Ensure at least 64
+                                else:
+                                    value = str(frame_max_int)  # Normalize to string
+                            except (ValueError, TypeError):
+                                value = "1518"  # Invalid value, use default
+                            ps["frame_max"] = value
+                            stream["frame_max"] = value
+                            
+                            # Re-validate frame_min after frame_max is set to ensure consistency
+                            # This handles the case where frame_min was set before frame_max
+                            frame_min_current = ps.get("frame_min") or stream.get("frame_min")
+                            if frame_min_current:
+                                try:
+                                    frame_min_int = int(str(frame_min_current))
+                                    frame_max_int = int(str(value))
+                                    if frame_min_int > frame_max_int:
+                                        # Adjust frame_min to be <= frame_max
+                                        adjusted_frame_min = str(min(frame_max_int, 9216))
+                                        ps["frame_min"] = adjusted_frame_min
+                                        stream["frame_min"] = adjusted_frame_min
+                                        # Update the table item if we're still in the same row
+                                        frame_min_col = 4 + column_keys.index("frame_min")
+                                        frame_min_item = self.stream_table.item(row_count, frame_min_col)
+                                        if frame_min_item:
+                                            frame_min_item.setText(adjusted_frame_min)
+                                except (ValueError, TypeError):
+                                    pass  # Skip if validation fails
                         
                         # For VLAN column: show actual VLAN ID if Tagged
                         elif key == "VLAN":
@@ -726,7 +815,7 @@ class TrafficGenClientServerSection():
                                     index = self.stream_table.model().index(row, 0)
                                     selection_model.select(index, QItemSelectionModel.Select | QItemSelectionModel.Rows)
             else:
-                print("No valid streams to display for selected ports.")
+                logger.debug("No valid streams to display for selected ports.")
 
             # Resize-after-fill
             self.stream_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
@@ -852,26 +941,42 @@ class TrafficGenClientServerSection():
             # Use stored interfaces if available, otherwise fetch them
             interfaces = server.get("interfaces")
             if interfaces is None:
-                try:
-                    # Use shorter timeout to prevent hanging when server is offline
-                    if hasattr(self, 'connection_manager') and self.connection_manager:
-                        response = self.connection_manager.get(f"{server_address}/api/interfaces", timeout=2)
-                    else:
-                        response = requests.get(f"{server_address}/api/interfaces", timeout=2)
-                    if response.status_code == 200:
-                        interfaces = response.json()
-                        server["interfaces"] = interfaces  # Store for future use
-                        print(f"[SERVER TREE] Fetched {len(interfaces)} interfaces from {server_address}")
-                    else:
-                        print(f"[SERVER TREE] Server {server_address} returned status code: {response.status_code}")
-                        server["online"] = False
-                        self.update_server_status_icon(server, False)
-                        continue
-                except Exception as e:
-                    print(f"[SERVER TREE] Error fetching interfaces from {server_address}: {e}")
+                # Defer interface fetching to avoid blocking UI during startup
+                # Use cached interfaces if available, otherwise mark as pending
+                if server.get("interfaces"):
+                    interfaces = server["interfaces"]
+                    logger.debug(f"[SERVER TREE] Using cached interfaces for {server_address}")
+                else:
+                    # Mark as pending and fetch asynchronously
                     server["online"] = False
                     self.update_server_status_icon(server, False)
-                    continue
+                    # Schedule async fetch (non-blocking) - use global QTimer import
+                    def fetch_interfaces_async():
+                        try:
+                            # Use shorter timeout to prevent hanging when server is offline
+                            if hasattr(self, 'connection_manager') and self.connection_manager:
+                                response = self.connection_manager.get(f"{server_address}/api/interfaces", timeout=2)
+                            else:
+                                response = requests.get(f"{server_address}/api/interfaces", timeout=2)
+                            if response.status_code == 200:
+                                interfaces = response.json()
+                                server["interfaces"] = interfaces  # Store for future use
+                                server["online"] = True
+                                self.update_server_status_icon(server, True)
+                                # Refresh tree to show interfaces
+                                if hasattr(self, 'update_server_tree'):
+                                    QTimer.singleShot(0, self.update_server_tree)
+                                logger.info(f"[SERVER TREE] Fetched {len(interfaces)} interfaces from {server_address} (async)")
+                            else:
+                                logger.warning(f"[SERVER TREE] Server {server_address} returned status code: {response.status_code}")
+                                server["online"] = False
+                                self.update_server_status_icon(server, False)
+                        except Exception as e:
+                            logger.error(f"[SERVER TREE] Error fetching interfaces from {server_address} (async): {e}")
+                            server["online"] = False
+                            self.update_server_status_icon(server, False)
+                    QTimer.singleShot(50, fetch_interfaces_async)
+                    continue  # Skip this server for now, will be updated asynchronously
             
             if interfaces:
                     # Track added interface names to prevent duplicates
@@ -961,7 +1066,7 @@ class TrafficGenClientServerSection():
                                 self.server_tree.setCurrentItem(top_item)
                             break
             except Exception as e:
-                print(f"[SERVER TREE] Error restoring selection: {e}")
+                logger.error(f"[SERVER TREE] Error restoring selection: {e}")
         
         # Restore signals after tree is rebuilt and selection is restored
         self.server_tree.blockSignals(False)
@@ -983,7 +1088,10 @@ class TrafficGenClientServerSection():
                     # Select this TG item to trigger selection change handler
                     self.server_tree.setCurrentItem(item)
                     # Trigger selection change handler manually to update tables
-                    QTimer.singleShot(50, lambda: self._on_server_selection_changed_combined())
+                    # QTimer is imported at module level, use it directly
+                    def trigger_selection_change():
+                        self._on_server_selection_changed_combined()
+                    QTimer.singleShot(50, trigger_selection_change)
                     break
         
         # Clear the update flag
@@ -993,7 +1101,7 @@ class TrafficGenClientServerSection():
         if hasattr(self, "_preserve_selection"):
             self._preserve_selection = False
         
-        print(f"[DEBUG] Tree widget updated with {len(self.server_interfaces)} servers")
+        logger.debug(f"Tree widget updated with {len(self.server_interfaces)} servers")
     '''def update_server_status_icon(self, server, is_online):
         """Helper to update status icon based on online state."""
         status_label = server.get("status_label_widget")
@@ -1019,7 +1127,7 @@ class TrafficGenClientServerSection():
     def retry_server_connection(self, server):
         """Retry connecting to the specified server and update its status icon."""
         server_address = server["address"]
-        print(f"Manually retrying connection to {server_address}...")
+        logger.info(f"Manually retrying connection to {server_address}...")
         try:
             if hasattr(self, 'connection_manager') and self.connection_manager:
                 response = self.connection_manager.get(f"{server_address}/api/interfaces", timeout=2)
@@ -1027,7 +1135,7 @@ class TrafficGenClientServerSection():
                 response = requests.get(f"{server_address}/api/interfaces", timeout=2)
             if response.status_code == 200:
                 server["online"] = True
-                print(f"✅ Server {server_address} is now online.")
+                logger.info(f"Server {server_address} is now online.")
 
                 # Update the status icon
                 self.update_server_status_icon(server, True)
@@ -1051,7 +1159,7 @@ class TrafficGenClientServerSection():
             else:
                 raise Exception(f"Non-200 status: {response.status_code}")
         except Exception as e:
-            print(f"❌ Still failed to connect to {server_address}: {e}")
+            logger.error(f"Still failed to connect to {server_address}: {e}")
             server["online"] = False
             self.update_server_status_icon(server, False)
 
@@ -1100,7 +1208,7 @@ class TrafficGenClientServerSection():
                     parent_item.takeChild(index)
 
         if removed_ports:
-            print(f"Removed ports: {', '.join(removed_ports)}")
+            logger.info(f"Removed ports: {', '.join(removed_ports)}")
             # Session save removed - only save on explicit user action (Save Session menu or Apply button)
             """QMessageBox.information(
                 self,
@@ -1163,7 +1271,7 @@ class TrafficGenClientServerSection():
                 if "interfaces" in server:
                     del server["interfaces"]
                 server_found = True
-                print(f"[REFRESH INTERFACES] Cleared cached interfaces for server: {server_address}")
+                logger.debug(f"[REFRESH INTERFACES] Cleared cached interfaces for server: {server_address}")
                 break
         
         if not server_found:
@@ -1176,7 +1284,7 @@ class TrafficGenClientServerSection():
             return
         
         # Refresh the entire server tree (this will fetch fresh interfaces from all servers)
-        print(f"[REFRESH INTERFACES] Refreshing interface list for server: {server_address}")
+        logger.info(f"[REFRESH INTERFACES] Refreshing interface list for server: {server_address}")
         
         # OPTIMIZATION: Tell update_server_tree to preserve selection (it will handle restoration)
         self._preserve_selection = True
@@ -1213,18 +1321,18 @@ class TrafficGenClientServerSection():
                                 if child_text == interface_name or child_text.endswith(interface_name):
                                     child_item.setSelected(True)
                                     self.server_tree.setCurrentItem(child_item)
-                                    print(f"[REFRESH INTERFACES] Restored selection to interface: {interface_name} on {item_address}")
+                                    logger.debug(f"[REFRESH INTERFACES] Restored selection to interface: {interface_name} on {item_address}")
                                     break
                             else:
                                 # Interface not found, fall back to server selection
                                 top_item.setSelected(True)
                                 self.server_tree.setCurrentItem(top_item)
-                                print(f"[REFRESH INTERFACES] Interface {interface_name} not found, restored selection to server: {item_address}")
+                                logger.debug(f"[REFRESH INTERFACES] Interface {interface_name} not found, restored selection to server: {item_address}")
                         else:
                             # Restore server (TG) selection
                             top_item.setSelected(True)
                             self.server_tree.setCurrentItem(top_item)
-                            print(f"[REFRESH INTERFACES] Restored selection to server: {item_address}")
+                            logger.debug(f"[REFRESH INTERFACES] Restored selection to server: {item_address}")
                         break
         finally:
             # Always restore signals after selection restoration
@@ -1308,7 +1416,7 @@ class TrafficGenClientServerSection():
                 if ":" in base_interface:
                     base_interface = base_interface.rsplit(":", 1)[-1].strip()
                 
-                print(f"[INTERFACE RESET] Resetting interface '{base_interface}' (from port '{port_name}')")
+                logger.info(f"[INTERFACE RESET] Resetting interface '{base_interface}' (from port '{port_name}')")
                 
                 # Call the reset API
                 reset_payload = {
@@ -1323,20 +1431,20 @@ class TrafficGenClientServerSection():
                     result_data = response.json()
                     if result_data.get("success"):
                         reset_results.append(f"{base_interface}: {result_data.get('message', 'Reset successful')}")
-                        print(f"✅ Interface '{base_interface}' reset successfully")
+                        logger.info(f"Interface '{base_interface}' reset successfully")
                     else:
                         error_msg = result_data.get("message", "Unknown error")
                         errors.append(f"{base_interface}: {error_msg}")
-                        print(f"⚠️ Interface '{base_interface}' reset failed: {error_msg}")
+                        logger.warning(f"Interface '{base_interface}' reset failed: {error_msg}")
                 else:
                     error_msg = f"HTTP {response.status_code}: {response.text}"
                     errors.append(f"{base_interface}: {error_msg}")
-                    print(f"❌ Interface '{base_interface}' reset failed: {error_msg}")
-                    
+                    logger.error(f"Interface '{base_interface}' reset failed: {error_msg}")
+
             except Exception as e:
                 error_msg = f"Error: {str(e)}"
                 errors.append(f"{port_name if 'port_name' in locals() else 'Unknown'}: {error_msg}")
-                print(f"❌ Exception resetting interface: {e}")
+                logger.error(f"Exception resetting interface: {e}")
         
         # Show results
         if reset_results:
@@ -1494,7 +1602,7 @@ class TrafficGenClientServerSection():
                             self.removed_interfaces.discard(port)
 
         if readded_ports:
-            print(f"Re-added ports: {readded_ports}")
+            logger.info(f"Re-added ports: {readded_ports}")
             # Session save removed - only save on explicit user action (Save Session menu or Apply button)
             #QMessageBox.information(self, "Ports Re-added", f"Re-added ports: {', '.join(readded_ports)}")
         else:
@@ -1508,11 +1616,11 @@ class TrafficGenClientServerSection():
             if server not in self.selected_servers:
                 self.selected_servers.append(server)
                 self.server_url = server["address"]  # ✅ Set it here!
-                print(f"Server selected: {server['address']}")
+                logger.info(f"Server selected: {server['address']}")
         else:
             if server in self.selected_servers:
                 self.selected_servers.remove(server)
-                print(f"Server deselected: {server['address']}")
+                logger.info(f"Server deselected: {server['address']}")
                 if self.selected_servers:
                     self.server_url = self.selected_servers[0]["address"]
                 else:
@@ -1526,7 +1634,7 @@ class TrafficGenClientServerSection():
     def mark_server_offline(self, server, reason="unknown"):
         """Mark a server as offline and update UI/status tracking."""
         server["online"] = False
-        print(f"❌ {reason} for {server['address']}")
+        logger.error(f"{reason} for {server['address']}")
         self.update_server_status_icon(server, False)
         if server not in self.failed_servers:
             self.failed_servers.append(server)

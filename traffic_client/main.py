@@ -10,6 +10,8 @@ logging.basicConfig(
 logging.getLogger('urllib3').setLevel(logging.WARNING)
 logging.getLogger('requests').setLevel(logging.WARNING)
 
+logger = logging.getLogger(__name__)
+
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QTabWidget, QSplitter,
     QMenu, QAction, QApplication
@@ -29,6 +31,7 @@ from traffic_client.server_section import TrafficGenClientServerSection
 from traffic_client.statistics_section import TrafficGenClientStatisticsSection
 from traffic_client.stream_logic import TrafficGenClientStreamLogic
 from traffic_client.stream_control import TrafficGenClientStreamControl
+from traffic_client.dpdk_menu_actions import TrafficGenClientDPDKMenuActions
 from traffic_client.server_retry_workers import ServerRetryWorker, HealthCheckWorker, ConnectionManager
 from utils.server_manager import ServerManager
 from utils.device_server_migration import DeviceServerMigration
@@ -42,7 +45,10 @@ class TrafficGeneratorClient(
     TrafficGenClientStatisticsSection,
     TrafficGenClientStreamLogic,
     TrafficGenClientStreamControl,
+    TrafficGenClientDPDKMenuActions,
 ):
+    # AI menu actions will be added via mixin
+    pass
     def __init__(self, server_url=None, server_explicitly_provided=False):
         super().__init__()
         self.setWindowTitle("Traffic Generator Client")
@@ -87,6 +93,17 @@ class TrafficGeneratorClient(
         self.main_layout = QVBoxLayout(self.central_widget)
 
         self.setup_menu_bar()
+        
+        # Setup AI menu (if available)
+        try:
+            from traffic_client.ai_menu_actions import TrafficGenClientAIMenuActions
+            # Add AI menu actions as mixin
+            TrafficGenClientAIMenuActions.setup_ai_menu(self)
+            # Store reference for access
+            self.ai_menu_actions = TrafficGenClientAIMenuActions
+        except ImportError as e:
+            logging.warning(f"AI features not available: {e}")
+            pass  # AI features not available
 
         # Split layout: top section (server + tabs) and bottom (statistics)
         self.splitter = QSplitter(Qt.Vertical)
@@ -122,8 +139,8 @@ class TrafficGeneratorClient(
             # Create server entry with initial online status (will be updated when tree fetches interfaces)
             server_entry = {"tg_id": tg_id, "address": self.server_url, "online": True}
             self.server_interfaces.append(server_entry)
-            print(f"✅ Using server from command line: {self.server_url} (TG {tg_id})")
-            print(f"ℹ️  Skipped loading servers from session.json (only connecting to {self.server_url})")
+            logger.info(f"Using server from command line: {self.server_url} (TG {tg_id})")
+            logger.info(f"Skipped loading servers from session.json (only connecting to {self.server_url})")
         
         # Load devices from session.json on startup (after all UI components are set up)
         # If server was provided via CLI, skip loading servers from session.json
@@ -133,11 +150,11 @@ class TrafficGeneratorClient(
         # Log summary of loaded servers
         if not self.server_url_from_cli:
             if self.server_interfaces:
-                print(f"✅ Loaded {len(self.server_interfaces)} TG(s) from session.json:")
+                logger.info(f"Loaded {len(self.server_interfaces)} TG(s) from session.json:")
                 for server in self.server_interfaces:
-                    print(f"   - TG {server.get('tg_id', '?')}: {server.get('address', 'N/A')}")
+                    logger.info(f"   - TG {server.get('tg_id', '?')}: {server.get('address', 'N/A')}")
             else:
-                print(f"ℹ️  No TGs found in session.json or all were previously removed")
+                logger.info(f"No TGs found in session.json or all were previously removed")
         
         # If server URL was set via environment variable or default (but not CLI), add it now
         if not self.server_url_from_cli and self.server_url and self.server_url not in [server["address"] for server in self.server_interfaces]:
@@ -147,14 +164,14 @@ class TrafficGeneratorClient(
                 tg_id = len(self.server_interfaces)  # Assign the next TG ID
                 server_entry = {"tg_id": tg_id, "address": self.server_url, "online": True}
                 self.server_interfaces.append(server_entry)
-                print(f"✅ Automatically added server: {self.server_url} (TG {tg_id})")
+                logger.info(f"Automatically added server: {self.server_url} (TG {tg_id})")
             else:
-                print(f"⚠️ Server {self.server_url} was previously removed, not adding automatically")
+                logger.warning(f"Server {self.server_url} was previously removed, not adding automatically")
         
         # Initialize ServerManager from server_interfaces
         if self.server_interfaces:
             self.server_manager.initialize_from_server_interfaces(self.server_interfaces)
-            print(f"✅ ServerManager initialized with {len(self.server_manager.servers)} server(s)")
+            logger.info(f"ServerManager initialized with {len(self.server_manager.servers)} server(s)")
         
         # Migrate devices to server-aware structure
         if self.all_devices:
@@ -166,7 +183,7 @@ class TrafficGeneratorClient(
         # Update server tree after servers are populated (especially important for CLI-provided server)
         if hasattr(self, 'update_server_tree'):
             self.update_server_tree()
-            print(f"✅ Server tree updated on startup with {len(self.server_interfaces)} server(s)")
+            logger.info(f"Server tree updated on startup with {len(self.server_interfaces)} server(s)")
             
             # If servers are selected by default, ensure stream table is populated
             # Use QTimer to ensure this happens after the tree is fully built
@@ -183,15 +200,14 @@ class TrafficGeneratorClient(
         self._check_initial_server_status()
         
         # Start timers for polling stats (optimized interval)
-        print(f"[TIMER INIT] Starting timers...")
+        logger.info("[TIMER INIT] Starting timers...")
         self.timer = QTimer()
         # Timer wrapper for fetch_and_update_statistics
         def fetch_with_debug():
-            # print(f"[TIMER FIRED] fetch_and_update_statistics() called at {__import__('time').time()}")
             try:
                 self.fetch_and_update_statistics()
             except Exception as e:
-                print(f"[TIMER ERROR] Exception in fetch_and_update_statistics: {e}")
+                logger.error(f"[TIMER ERROR] Exception in fetch_and_update_statistics: {e}")
                 import traceback
                 traceback.print_exc()
         self.timer.timeout.connect(fetch_with_debug)
@@ -205,11 +221,10 @@ class TrafficGeneratorClient(
             # print(f"[TIMER INIT] poll_stream_stats method found, connecting timer...")
             # Timer wrapper for poll_stream_stats
             def poll_with_debug():
-                # print(f"[TIMER FIRED] poll_stream_stats() called")
                 try:
                     self.poll_stream_stats()
                 except Exception as e:
-                    print(f"[TIMER ERROR] Exception in poll_stream_stats: {e}")
+                    logger.error(f"[TIMER ERROR] Exception in poll_stream_stats: {e}")
                     import traceback
                     traceback.print_exc()
             
@@ -218,7 +233,7 @@ class TrafficGeneratorClient(
             self.stream_stats_timer.start(2000)  # every 2s to auto-update stream statistics from database
             # print(f"[TIMER] Stream stats timer started (interval: 2000ms, active: {self.stream_stats_timer.isActive()}, singleShot: {self.stream_stats_timer.isSingleShot()})")
         else:
-            print(f"[TIMER ERROR] poll_stream_stats method not found! Available methods: {[m for m in dir(self) if 'poll' in m.lower() or 'stream' in m.lower()]}")
+            logger.error(f"[TIMER ERROR] poll_stream_stats method not found! Available methods: {[m for m in dir(self) if 'poll' in m.lower() or 'stream' in m.lower()]}")
     
     def _update_tables_after_startup(self):
         """Update device and stream tables after startup when servers are selected."""
@@ -230,9 +245,10 @@ class TrafficGeneratorClient(
         if hasattr(self, "update_stream_table"):
             self.update_stream_table()
         
-        # Update statistics
+        # Update statistics (deferred to avoid blocking startup)
+        # Use QTimer to defer statistics fetching after UI is fully rendered
         if hasattr(self, "fetch_and_update_statistics"):
-            self.fetch_and_update_statistics()
+            QTimer.singleShot(500, lambda: self.fetch_and_update_statistics())
 
     def closeEvent(self, event):
         """Handle application close event - cleanup threads and resources."""
@@ -250,10 +266,10 @@ class TrafficGeneratorClient(
                 self._save_worker = None  # Clear reference first
                 
                 if save_worker.isRunning():
-                    print("[CLEANUP] Waiting for save worker to finish...")
+                    logger.info("[CLEANUP] Waiting for save worker to finish...")
                     save_worker.quit()  # Request thread to stop
                     if not save_worker.wait(3000):
-                        print("[CLEANUP] Force terminating save worker...")
+                        logger.warning("[CLEANUP] Force terminating save worker...")
                         save_worker.terminate()
                         save_worker.wait(1000)
                 
@@ -262,13 +278,13 @@ class TrafficGeneratorClient(
                     if not save_worker.isRunning():
                         save_worker.deleteLater()
                     else:
-                        print("[CLEANUP] WARNING: Save worker still running after cleanup attempt")
+                        logger.warning("[CLEANUP] Save worker still running after cleanup attempt")
                 except RuntimeError:
                     # Object already deleted, ignore
                     pass
             except Exception as exc:
-                print(f"[CLEANUP] Error cleaning up save worker: {exc}")
-        print("[CLEANUP] Application closing, cleaning up threads...")
+                logger.error(f"[CLEANUP] Error cleaning up save worker: {exc}")
+        logger.info("[CLEANUP] Application closing, cleaning up threads...")
         save_worker_status = 'N/A'
         try:
             save_worker = getattr(self, '_save_worker', None)
@@ -291,7 +307,7 @@ class TrafficGeneratorClient(
         except (RuntimeError, AttributeError):
             health_worker_status = 'deleted'
         
-        print(f"[CLEANUP] Active thread summary -> "
+        logger.info(f"[CLEANUP] Active thread summary -> "
               f"operation_worker={getattr(self.devices_tab, 'operation_worker', None)}, "
               f"arp_worker={getattr(self.devices_tab, 'arp_check_worker', None)}, "
               f"bulk_arp_worker={getattr(self.devices_tab, 'bulk_arp_worker', None)}, "
@@ -302,34 +318,34 @@ class TrafficGeneratorClient(
         # Stop all timers first
         if hasattr(self, 'devices_tab') and self.devices_tab:
             if hasattr(self.devices_tab, 'status_timer') and self.devices_tab.status_timer:
-                print("[CLEANUP] Stopping status timer...")
+                logger.info("[CLEANUP] Stopping status timer...")
                 self.devices_tab.status_timer.stop()
         # Stop main window timers
         if hasattr(self, 'timer') and self.timer:
             try:
-                print("[CLEANUP] Stopping main statistics timer...")
+                logger.info("[CLEANUP] Stopping main statistics timer...")
                 self.timer.stop()
             except Exception:
                 pass
         if hasattr(self, 'stream_stats_timer') and self.stream_stats_timer:
             try:
-                print("[CLEANUP] Stopping stream statistics timer...")
+                logger.info("[CLEANUP] Stopping stream statistics timer...")
                 self.stream_stats_timer.stop()
             except Exception:
                 pass
         # Stop server section debounce timer if present
         if hasattr(self, '_stream_table_update_timer') and getattr(self, '_stream_table_update_timer', None):
             try:
-                print("[CLEANUP] Stopping stream table update timer...")
+                logger.info("[CLEANUP] Stopping stream table update timer...")
                 self._stream_table_update_timer.stop()
             except Exception:
                 pass
         
         # Clean up devices tab threads
         if hasattr(self, 'devices_tab') and self.devices_tab:
-            print("[CLEANUP] Invoking devices_tab.cleanup_threads()...")
+            logger.info("[CLEANUP] Invoking devices_tab.cleanup_threads()...")
             self.devices_tab.cleanup_threads()
-            print("[CLEANUP] Completed devices_tab.cleanup_threads()")
+            logger.info("[CLEANUP] Completed devices_tab.cleanup_threads()")
         
         # Clean up any stream timers
         if hasattr(self, '_stop_timers'):
@@ -339,7 +355,7 @@ class TrafficGeneratorClient(
             self._stop_timers.clear()
         
         # Clean up retry workers
-        print("[CLEANUP] Stopping retry workers...")
+        logger.info("[CLEANUP] Stopping retry workers...")
         if self.server_retry_worker:
             self.server_retry_worker.stop()
             self.server_retry_worker.wait(3000)  # Wait up to 3 seconds
@@ -352,10 +368,10 @@ class TrafficGeneratorClient(
             try:
                 self._save_worker = None  # Clear reference first
                 if save_worker.isRunning():
-                    print("[CLEANUP] Waiting for save worker to finish...")
+                    logger.info("[CLEANUP] Waiting for save worker to finish...")
                     save_worker.quit()  # Request thread to stop
                     if not save_worker.wait(3000):
-                        print("[CLEANUP] Force terminating save worker...")
+                        logger.warning("[CLEANUP] Force terminating save worker...")
                         save_worker.terminate()
                         save_worker.wait(500)
                 
@@ -366,14 +382,14 @@ class TrafficGeneratorClient(
                 # Object already deleted, ignore
                     pass
             except Exception as exc:
-                print(f"[CLEANUP] Error in final save worker cleanup: {exc}")
+                logger.error(f"[CLEANUP] Error in final save worker cleanup: {exc}")
         
         # Close connection manager
         if self.connection_manager:
             self.connection_manager.close()
         
-        print("[CLEANUP] Retry workers stopped")
-        print(f"[CLEANUP] Post-stop thread status -> "
+        logger.info("[CLEANUP] Retry workers stopped")
+        logger.info(f"[CLEANUP] Post-stop thread status -> "
               f"retry_worker_running={self.server_retry_worker.isRunning() if self.server_retry_worker else 'N/A'}, "
               f"health_worker_running={self.health_check_worker.isRunning() if self.health_check_worker else 'N/A'}")
         
@@ -383,12 +399,12 @@ class TrafficGeneratorClient(
             if isinstance(result, tuple):
                 success, message = result
                 if not success:
-                    print(f"[CLEANUP] Session save reported error during shutdown: {message}")
+                    logger.error(f"[CLEANUP] Session save reported error during shutdown: {message}")
         except Exception as e:
-            print(f"[CLEANUP] Failed to save session: {e}")
+            logger.error(f"[CLEANUP] Failed to save session: {e}")
         finally:
             save_worker = getattr(self, "_save_worker", None)
-            print(f"[CLEANUP] Save worker cleanup state -> exists={bool(save_worker)}, "
+            logger.info(f"[CLEANUP] Save worker cleanup state -> exists={bool(save_worker)}, "
                   f"isRunning={save_worker.isRunning() if save_worker else 'N/A'}")
         
         # Force quit the application after a short delay to allow cleanup
@@ -399,7 +415,7 @@ class TrafficGeneratorClient(
         """Schedule force quit after optional delay, avoiding duplicate scheduling."""
         if self._force_quit_called:
             return
-        print("[CLEANUP] Cleanup completed, forcing application exit...")
+        logger.info("[CLEANUP] Cleanup completed, forcing application exit...")
         QTimer.singleShot(delay, self.force_quit)
     
     def force_quit(self):
@@ -407,7 +423,7 @@ class TrafficGeneratorClient(
         if self._force_quit_called:
             return
         self._force_quit_called = True
-        print("[CLEANUP] Force quitting application...")
+        logger.info("[CLEANUP] Force quitting application...")
         QApplication.quit()
 
     def _initialize_retry_workers(self):
@@ -434,9 +450,9 @@ class TrafficGeneratorClient(
             # print("[RETRY WORKERS] Enhanced retry system initialized successfully")
             pass  # All retry workers are disabled, nothing to initialize
         except Exception as e:
-            print(f"[RETRY WORKERS ERROR] Failed to initialize retry workers: {e}")
+            logger.error(f"[RETRY WORKERS ERROR] Failed to initialize retry workers: {e}")
             import traceback
-            print(f"[RETRY WORKERS ERROR] Traceback: {traceback.format_exc()}")
+            logger.error(f"[RETRY WORKERS ERROR] Traceback: {traceback.format_exc()}")
 
     def _check_initial_server_status(self):
         """Check initial server status and enable menu if servers are offline."""
@@ -453,12 +469,12 @@ class TrafficGeneratorClient(
                 # print("[INITIAL STATUS CHECK] All servers online, menu remains disabled")
                 pass
         except Exception as e:
-            print(f"[INITIAL STATUS CHECK ERROR] Error checking initial status: {e}")
+            logger.error(f"[INITIAL STATUS CHECK ERROR] Error checking initial status: {e}")
 
     def _on_server_health_updated(self, server, is_online):
         """Handle server health status updates."""
         server_address = server.get("address")
-        print(f"[HEALTH UPDATE] Server {server_address}: {'online' if is_online else 'offline'}")
+        logger.info(f"[HEALTH UPDATE] Server {server_address}: {'online' if is_online else 'offline'}")
         
         # Update server status icon
         if hasattr(self, 'update_server_status_icon'):
@@ -467,7 +483,7 @@ class TrafficGeneratorClient(
         # If server came back online, remove from failed list
         if is_online and server in self.failed_servers:
             self.failed_servers.remove(server)
-            print(f"[HEALTH UPDATE] Removed {server_address} from failed servers list")
+            logger.info(f"[HEALTH UPDATE] Removed {server_address} from failed servers list")
             
             # Update "Make Server Online" menu state
             if not self.failed_servers and hasattr(self, 'make_server_online_action'):
@@ -476,7 +492,7 @@ class TrafficGeneratorClient(
         # If server went offline, add to failed list
         elif not is_online and server not in self.failed_servers:
             self.failed_servers.append(server)
-            print(f"[HEALTH UPDATE] Added {server_address} to failed servers list")
+            logger.warning(f"[HEALTH UPDATE] Added {server_address} to failed servers list")
             
             # Add to retry worker
             if self.server_retry_worker:
@@ -489,12 +505,12 @@ class TrafficGeneratorClient(
     def _on_server_interfaces_updated(self, server, interfaces):
         """Handle server interfaces updates."""
         server["interfaces"] = interfaces
-        print(f"[INTERFACES UPDATE] Updated interfaces for {server.get('address')}: {len(interfaces)} interfaces")
+        logger.info(f"[INTERFACES UPDATE] Updated interfaces for {server.get('address')}: {len(interfaces)} interfaces")
 
     def _on_server_reconnected(self, server):
         """Handle successful server reconnection."""
         server_address = server.get("address")
-        print(f"[RETRY SUCCESS] ✅ Server {server_address} reconnected successfully!")
+        logger.info(f"[RETRY SUCCESS] Server {server_address} reconnected successfully!")
         
         # Update server status icon
         if hasattr(self, 'update_server_status_icon'):
@@ -515,11 +531,11 @@ class TrafficGeneratorClient(
     def _on_server_still_failed(self, server, error_message):
         """Handle server still failing after retries."""
         server_address = server.get("address")
-        print(f"[RETRY FAILED] ❌ Server {server_address} still failed: {error_message}")
+        logger.error(f"[RETRY FAILED] Server {server_address} still failed: {error_message}")
 
     def _on_retry_progress(self, server_address, status_message):
         """Handle retry progress updates."""
-        print(f"[RETRY PROGRESS] {server_address}: {status_message}")
+        logger.info(f"[RETRY PROGRESS] {server_address}: {status_message}")
 
     def check_all_device_arp_status(self):
         """Check ARP status for all devices and update UI accordingly."""
@@ -563,7 +579,7 @@ class TrafficGeneratorClient(
                         self.devices_tab.arp_button.setToolTip("Send ARP")
                             
         except Exception as e:
-            print(f"[ARP Status Check] Error: {e}")
+            logger.error(f"[ARP Status Check] Error: {e}")
 
     def setup_menu_bar(self):
         """Set up the menu bar for server and stream management."""
@@ -589,6 +605,16 @@ class TrafficGeneratorClient(
         self.make_server_online_action.setEnabled(False)
         self.make_server_online_action.triggered.connect(self.make_failed_servers_online)
         file_menu.addAction(self.make_server_online_action)
+
+        file_menu.addSeparator()
+
+        restart_tgen_action = QAction("Restart TGEN", self)
+        restart_tgen_action.triggered.connect(self.restart_server)
+        file_menu.addAction(restart_tgen_action)
+        
+        reboot_server_action = QAction("Reboot Physical Server", self)
+        reboot_server_action.triggered.connect(self.reboot_server)
+        file_menu.addAction(reboot_server_action)
 
         # Capture menu
         capture_menu = QMenu("Capture", self)
@@ -626,6 +652,42 @@ class TrafficGeneratorClient(
         paste_device_action = QAction("Paste Device", self)
         paste_device_action.triggered.connect(self.paste_device_to_interface)
         edit_menu.addAction(paste_device_action)
+
+        # DPDK menu
+        dpdk_menu = QMenu("DPDK", self)
+        menu_bar.addMenu(dpdk_menu)
+
+        dpdk_status_action = QAction("Status", self)
+        dpdk_status_action.triggered.connect(self.show_dpdk_status)
+        dpdk_menu.addAction(dpdk_status_action)
+
+        dpdk_bind_action = QAction("Bind Interface", self)
+        dpdk_bind_action.triggered.connect(self.bind_interface_to_dpdk)
+        dpdk_menu.addAction(dpdk_bind_action)
+
+        dpdk_unbind_action = QAction("Unbind Interface", self)
+        dpdk_unbind_action.triggered.connect(self.unbind_interface_from_dpdk)
+        dpdk_menu.addAction(dpdk_unbind_action)
+
+        dpdk_menu.addSeparator()
+
+        dpdk_verify_action = QAction("Verify Installation", self)
+        dpdk_verify_action.triggered.connect(self.verify_dpdk)
+        dpdk_menu.addAction(dpdk_verify_action)
+
+        dpdk_hugepages_action = QAction("Configure Hugepages", self)
+        dpdk_hugepages_action.triggered.connect(self.configure_hugepages)
+        dpdk_menu.addAction(dpdk_hugepages_action)
+
+        dpdk_menu.addSeparator()
+
+        dpdk_iommu_action = QAction("Configure IOMMU", self)
+        dpdk_iommu_action.triggered.connect(self.configure_iommu)
+        
+        dpdk_load_modules_action = QAction("Load VFIO Modules", self)
+        dpdk_menu.addAction(dpdk_load_modules_action)
+        dpdk_load_modules_action.triggered.connect(self.load_vfio_modules)
+        dpdk_menu.addAction(dpdk_iommu_action)
 
     def copy_selected_device(self):
         """Copy the selected device - delegate to devices tab."""
