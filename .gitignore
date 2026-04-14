@@ -1,4 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+dist/
+build/
+*.whl
 
-# Large Docker image files
+# Virtual environments
+venv/
+env/
+.venv/
+ostg_client_env/
+build_env/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.project
+.settings/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Environment & secrets
+.env
+.env.*
+*.env
+.ostg_ai_server_settings.env
+
+# Docker images
 build_image/*.tar
 *.tar
+
+# Logs
+*.log
+
+# Coverage & testing
+.coverage
+htmlcov/
+.pytest_cache/
+.tox/
+
+# Build artifacts
+*.spec
+build_image/dist_macos/
+
+# Backup files
+*.bak
+*_backup.py
+*_old.py
+
+# Session state
+session.json

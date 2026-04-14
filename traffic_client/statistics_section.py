@@ -2,8 +2,78 @@
 
 from PyQt5.QtWidgets import QTableWidget, QTableWidgetItem, QVBoxLayout, QHBoxLayout, QPushButton, QGroupBox, QLabel, QTabWidget, QWidget
 from PyQt5.QtGui import QColor, QFont
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
 import requests
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class StatisticsFetchWorker(QThread):
+    """Background worker for fetching statistics to prevent UI blocking."""
+    
+    # Signals
+    interfaces_fetched = pyqtSignal(dict, dict)  # (server, interfaces_data)
+    stream_stats_fetched = pyqtSignal(dict, list)  # (server, stream_stats)
+    fetch_error = pyqtSignal(dict, str)  # (server, error_message)
+    finished = pyqtSignal()  # Signal when all fetches complete
+    
+    def __init__(self, servers, fetch_type="both", connection_manager=None, parent=None):
+        super().__init__(parent)
+        self.servers = servers  # List of server dicts
+        self.fetch_type = fetch_type  # "interfaces", "streams", or "both"
+        self.connection_manager = connection_manager
+        self._should_stop = False
+    
+    def stop(self):
+        """Request the worker to stop gracefully."""
+        self._should_stop = True
+    
+    def run(self):
+        """Fetch statistics from all servers in background thread."""
+        for server in self.servers:
+            if self._should_stop:
+                break
+            
+            if not server.get("online", True):
+                continue
+            
+            server_address = server.get("address")
+            
+            # Fetch interfaces if needed
+            if self.fetch_type in ("interfaces", "both"):
+                try:
+                    if self.connection_manager:
+                        response = self.connection_manager.get(f"{server_address}/api/interfaces", timeout=2)
+                    else:
+                        response = requests.get(f"{server_address}/api/interfaces", timeout=2)
+                    
+                    if response.status_code == 200:
+                        interfaces = response.json()
+                        self.interfaces_fetched.emit(server, {"interfaces": interfaces, "status_code": 200})
+                    else:
+                        self.fetch_error.emit(server, f"HTTP {response.status_code}")
+                except Exception as e:
+                    self.fetch_error.emit(server, str(e))
+            
+            # Fetch stream stats if needed
+            if self.fetch_type in ("streams", "both"):
+                try:
+                    if self.connection_manager:
+                        response = self.connection_manager.get(f"{server_address}/api/streams/stats", timeout=1)
+                    else:
+                        response = requests.get(f"{server_address}/api/streams/stats", timeout=1)
+                    
+                    if response.status_code == 200:
+                        stream_stats = response.json().get("active_streams", [])
+                        self.stream_stats_fetched.emit(server, stream_stats)
+                    else:
+                        self.fetch_error.emit(server, f"HTTP {response.status_code}")
+                except Exception as e:
+                    self.fetch_error.emit(server, str(e))
+        
+        self.finished.emit()
+
 
 class TrafficGenClientStatisticsSection():
     def setup_traffic_statistics_section(self):
@@ -151,161 +221,183 @@ class TrafficGenClientStatisticsSection():
 
         self.statistics_group.setLayout(layout)
         self.splitter.addWidget(self.statistics_group)
+        
+        # Initialize worker for background statistics fetching
+        self._stats_worker = None
+        self._poll_worker = None
+        self._pending_stats_data = {}  # Store data from worker before processing
+        self._pending_stream_stats = []  # Store stream stats from worker
+        self._pending_poll_stream_stats = []  # Store poll stream stats from worker
+    
     def fetch_and_update_statistics(self):
         """Fetch traffic statistics from all servers and display for selected ones."""
-        # print(f"[FETCH STATS] Called at {__import__('time').time()}")
         if not self.server_interfaces:
-            print("No servers available. Clearing traffic statistics.")
+            logger.info("No servers available. Clearing traffic statistics.")
             self.clear_statistics_table()
             return
-
+        
+        # If worker is already running, skip this call to prevent overlapping
+        if self._stats_worker and self._stats_worker.isRunning():
+            return
+        
+        # Start background worker to fetch data
+        online_servers = [s for s in self.server_interfaces if s.get("online", True)]
+        if not online_servers:
+            return
+        
+        self._stats_worker = StatisticsFetchWorker(
+            online_servers, 
+            fetch_type="both",
+            connection_manager=getattr(self, 'connection_manager', None)
+        )
+        self._stats_worker.interfaces_fetched.connect(self._on_interfaces_fetched)
+        self._stats_worker.stream_stats_fetched.connect(self._on_stream_stats_fetched)
+        self._stats_worker.fetch_error.connect(self._on_fetch_error)
+        self._stats_worker.finished.connect(self._on_stats_fetch_finished)
+        
+        # Reset pending data
+        self._pending_stats_data = {}
+        self._pending_stream_stats = []
+        
+        self._stats_worker.start()
+    
+    def _on_interfaces_fetched(self, server, data):
+        """Handle interfaces data fetched from background worker."""
+        interfaces = data.get("interfaces", [])
+        tg_id = server.get("tg_id")
+        server_address = server.get("address")
+        
+        server["online"] = True
+        if server in self.failed_servers:
+            self.failed_servers.remove(server)
+        self.update_server_status_icon(server, True)
+        
+        # Store interfaces data for processing (use server address as key since dicts are unhashable)
+        if server_address not in self._pending_stats_data:
+            self._pending_stats_data[server_address] = {"server": server, "interfaces": [], "streams": []}
+        self._pending_stats_data[server_address]["interfaces"] = interfaces
+    
+    def _on_stream_stats_fetched(self, server, stream_stats):
+        """Handle stream stats fetched from background worker."""
+        tg_id = server.get("tg_id")
+        server_address = server.get("address")
+        
+        # Add TG ID to each stream
+        for stream in stream_stats:
+            stream["_tg_id"] = tg_id
+        
+        # Store stream stats for processing (use server address as key since dicts are unhashable)
+        if server_address not in self._pending_stats_data:
+            self._pending_stats_data[server_address] = {"server": server, "interfaces": [], "streams": []}
+        self._pending_stats_data[server_address]["streams"] = stream_stats
+        self._pending_stream_stats.extend(stream_stats)
+    
+    def _on_fetch_error(self, server, error_message):
+        """Handle fetch error from background worker."""
+        server_address = server.get("address")
+        logger.error(f"Stats fetch failed for {server_address}: {error_message}")
+        server["online"] = False
+        self.update_server_status_icon(server, False)
+        if server not in self.failed_servers:
+            self.failed_servers.append(server)
+    
+    def _on_stats_fetch_finished(self):
+        """Process all fetched data and update UI when worker finishes."""
         merged_statistics = {}
+        all_stream_stats = []
 
-        # Step 1: Initialize interface stats
-        for server in self.server_interfaces:
-            if not server.get("online", True):
-                continue
+        # Step 1: Process interfaces data from worker
+        for server_address, data in self._pending_stats_data.items():
+            server = data.get("server")
+            tg_id = server.get("tg_id") if server else None
+            interfaces = data.get("interfaces", [])
+            
+            for interface in interfaces:
+                iface_name = f"TG {tg_id} - {interface['name']}"
+                if iface_name in self.removed_interfaces:
+                    continue
 
-            tg_id = server.get("tg_id")
-            server_address = server.get("address")
+                merged_statistics[iface_name] = {
+                    "status": interface.get("status", "N/A"),
+                    "tx": 0,
+                    "rx": 0,
+                    "sent_bytes": 0,
+                    "received_bytes": 0,
+                    "send_fps": 0,
+                    "receive_fps": 0,
+                    "send_bps": 0,
+                    "receive_bps": 0,
+                    "errors": interface.get("errors", 0),
+                    "streams": {}
+                }
+        
+        # Step 2: Process stream stats from worker
+        for server_address, data in self._pending_stats_data.items():
+            server = data.get("server")
+            tg_id = server.get("tg_id") if server else None
+            stream_stats = data.get("streams", [])
+            
+            logger.debug(f"[DEBUG STREAM STATS] Got {len(stream_stats)} stream(s) from {server_address}")
+            # Update stream objects with latest statistics
+            self.update_per_stream_statistics(stream_stats)
+            all_stream_stats.extend(stream_stats)
+            
+            # Process stream statistics for merged_statistics
+            for stream in stream_stats:
+                tx_port = stream.get("interface")
+                rx_port_raw = stream.get("rx_interface") or stream.get("rx_port")
+                stream_name = stream.get("stream_name", "Unnamed")
+                tx = stream.get("tx_count", 0)
+                rx = stream.get("rx_count", 0)
+                stream_id = stream.get("stream_id")
+                flow_tracking = stream.get("flow_tracking_enabled", False)
 
-            try:
-                # Use connection manager for better connection handling
-                if hasattr(self, 'connection_manager') and self.connection_manager:
-                    response = self.connection_manager.get(f"{server_address}/api/interfaces", timeout=2)
-                else:
-                    response = requests.get(f"{server_address}/api/interfaces", timeout=2)
-                if response.status_code == 200:
-                    interfaces = response.json()
-                    server["online"] = True
-                    if server in self.failed_servers:
-                        self.failed_servers.remove(server)
-                    self.update_server_status_icon(server, True)
+                tx_iface = f"TG {tg_id} - {tx_port}"
+                rx_port_clean = rx_port_raw.split(":")[-1].strip() if rx_port_raw else None
+                rx_iface = f"TG {tg_id} - {rx_port_clean}" if rx_port_clean else None
 
-                    for interface in interfaces:
-                        iface_name = f"TG {tg_id} - {interface['name']}"
-                        if iface_name in self.removed_interfaces:
-                            continue
+                # TX aggregation
+                if tx_iface in merged_statistics:
+                    stream_entry = merged_statistics[tx_iface]["streams"].setdefault(stream_name, {})
+                    stream_entry["tx_count"] = tx
+                    stream_entry["rx_count"] = rx if flow_tracking else None
+                    stream_entry["stream_id"] = stream_id
+                    stream_entry["flow_tracking_enabled"] = flow_tracking
 
-                        merged_statistics[iface_name] = {
-                            "status": interface.get("status", "N/A"),
-                            "tx": 0,
-                            "rx": 0,
-                            "sent_bytes": 0,
-                            "received_bytes": 0,
-                            "send_fps": 0,
-                            "receive_fps": 0,
-                            "send_bps": 0,
-                            "receive_bps": 0,
-                            "errors": interface.get("errors", 0),
-                            "streams": {}
-                        }
-                else:
-                    raise Exception(f"HTTP {response.status_code}")
-            except Exception as e:
-                print(f"Interface stats fetch failed for {server_address}: {e}")
-                server["online"] = False
-                self.update_server_status_icon(server, False)
-                if server not in self.failed_servers:
-                    self.failed_servers.append(server)
-                    print(f"[SERVER OFFLINE] Added {server_address} to failed_servers list")
-                    print(f"[SERVER OFFLINE] failed_servers count: {len(self.failed_servers)}")
-
-        # Step 2: Process stream stats
-        all_stream_stats = []  # Collect streams from all servers
-        for server in self.server_interfaces:
-            if not server.get("online", True):
-                continue
-
-            tg_id = server.get("tg_id")
-            server_address = server["address"]
-
-            try:
-                # Use connection_manager if available for better timeout handling
-                if hasattr(self, 'connection_manager') and self.connection_manager:
-                    response = self.connection_manager.get(f"{server_address}/api/streams/stats", timeout=1)
-                else:
-                    response = requests.get(f"{server_address}/api/streams/stats", timeout=1)
-                if response.status_code == 200:
-                    stream_stats = response.json().get("active_streams", [])
-                    print(f"[DEBUG STREAM STATS] Got {len(stream_stats)} stream(s) from {server_address}")
-                    # Debug: log rate values from server
-                    for s in stream_stats:
-                        if s.get("tx_rate") or s.get("rx_rate"):
-                            print(f"[DEBUG STREAM STATS] Stream '{s.get('stream_name')}': tx_rate={s.get('tx_rate')}, rx_rate={s.get('rx_rate')}")
-                    # Update stream objects with latest statistics (similar to poll_stream_stats)
-                    self.update_per_stream_statistics(stream_stats)
-                    # Collect streams for stream statistics table (will update after loop)
-                    # Add TG ID to each stream for proper display
-                    for stream in stream_stats:
-                        stream["_tg_id"] = tg_id
-                    all_stream_stats.extend(stream_stats)
+                    frame_size = stream.get("frame_size", 64)
+                    try:
+                        frame_size = int(frame_size)
+                    except (ValueError, TypeError):
+                        frame_size = 64
                     
-                    # Process stream statistics for merged_statistics
-                    for stream in stream_stats:
-                        tx_port = stream.get("interface")
-                        rx_port_raw = stream.get("rx_interface") or stream.get("rx_port")
-                        stream_name = stream.get("stream_name", "Unnamed")
-                        tx = stream.get("tx_count", 0)
-                        rx = stream.get("rx_count", 0)
-                        stream_id = stream.get("stream_id")
-                        flow_tracking = stream.get("flow_tracking_enabled", False)
+                    merged_statistics[tx_iface]["tx"] += tx
+                    merged_statistics[tx_iface]["sent_bytes"] += tx * frame_size
+                    merged_statistics[tx_iface]["send_fps"] += tx // 10
+                    merged_statistics[tx_iface]["send_bps"] += tx * frame_size * 8
+                    
+                    if flow_tracking:
+                        merged_statistics[tx_iface]["rx"] += rx
+                        merged_statistics[tx_iface]["received_bytes"] += rx * frame_size
+                        merged_statistics[tx_iface]["receive_fps"] += rx // 10
+                        merged_statistics[tx_iface]["receive_bps"] += rx * frame_size * 8
 
-                        tx_iface = f"TG {tg_id} - {tx_port}"
-                        rx_port_clean = rx_port_raw.split(":")[-1].strip() if rx_port_raw else None
-                        rx_iface = f"TG {tg_id} - {rx_port_clean}" if rx_port_clean else None
+                # RX aggregation
+                if rx_iface and rx_iface in merged_statistics:
+                    frame_size = stream.get("frame_size", 64)
+                    try:
+                        frame_size = int(frame_size)
+                    except (ValueError, TypeError):
+                        frame_size = 64
+                    
+                    merged_statistics[rx_iface]["rx"] += rx
+                    merged_statistics[rx_iface]["received_bytes"] += rx * frame_size
+                    merged_statistics[rx_iface]["receive_fps"] += rx // 10
+                    merged_statistics[rx_iface]["receive_bps"] += rx * frame_size * 8
 
-                        # TX aggregation
-                        if tx_iface in merged_statistics:
-                            stream_entry = merged_statistics[tx_iface]["streams"].setdefault(stream_name, {})
-                            stream_entry["tx_count"] = tx
-                            stream_entry["rx_count"] = rx if flow_tracking else None  # Store RX count in TX interface's stream entry for loss calculation
-                            stream_entry["stream_id"] = stream_id
-                            stream_entry["flow_tracking_enabled"] = flow_tracking
-
-                            # Get frame_size from stream stats if available, otherwise default to 64
-                            frame_size = stream.get("frame_size", 64)
-                            try:
-                                frame_size = int(frame_size)
-                            except (ValueError, TypeError):
-                                frame_size = 64
-                            
-                            merged_statistics[tx_iface]["tx"] += tx
-                            merged_statistics[tx_iface]["sent_bytes"] += tx * frame_size
-                            merged_statistics[tx_iface]["send_fps"] += tx // 10
-                            merged_statistics[tx_iface]["send_bps"] += tx * frame_size * 8
-                            
-                            # For flow tracking, RX count should be aggregated in TX interface column for loss calculation
-                            if flow_tracking:
-                                merged_statistics[tx_iface]["rx"] += rx
-                                merged_statistics[tx_iface]["received_bytes"] += rx * frame_size
-                                merged_statistics[tx_iface]["receive_fps"] += rx // 10
-                                merged_statistics[tx_iface]["receive_bps"] += rx * frame_size * 8
-
-                        # RX aggregation (for display on RX interface column, but loss is calculated on TX interface)
-                        if rx_iface and rx_iface in merged_statistics:
-                            # Get frame_size from stream stats if available, otherwise default to 64
-                            frame_size = stream.get("frame_size", 64)
-                            try:
-                                frame_size = int(frame_size)
-                            except (ValueError, TypeError):
-                                frame_size = 64
-                            
-                            merged_statistics[rx_iface]["rx"] += rx
-                            merged_statistics[rx_iface]["received_bytes"] += rx * frame_size
-                            merged_statistics[rx_iface]["receive_fps"] += rx // 10
-                            merged_statistics[rx_iface]["receive_bps"] += rx * frame_size * 8
-
-                            stream_entry = merged_statistics[rx_iface]["streams"].setdefault(stream_name, {})
-                            stream_entry["rx_count"] = rx
-                            stream_entry["stream_id"] = stream_id
-                            stream_entry["flow_tracking_enabled"] = flow_tracking
-            except Exception as e:
-                print(f"Stream stats fetch failed for {server_address}: {e}")
-                server["online"] = False
-                self.update_server_status_icon(server, False)
-                if server not in self.failed_servers:
-                    self.failed_servers.append(server)
+                    stream_entry = merged_statistics[rx_iface]["streams"].setdefault(stream_name, {})
+                    stream_entry["rx_count"] = rx
+                    stream_entry["stream_id"] = stream_id
+                    stream_entry["flow_tracking_enabled"] = flow_tracking
 
         # Step 3: Filter by selected TGs (from checkboxes) AND currently selected TG in tree
         selected_tg_ids = {f"TG {s['tg_id']}" for s in self.selected_servers}
@@ -381,7 +473,7 @@ class TrafficGenClientStatisticsSection():
             self.clear_statistics_table()
         
         # Always update stream statistics table with all collected streams (even if empty, to clear table)
-        print(f"[DEBUG STREAM STATS] Calling update_stream_statistics_table with {len(all_stream_stats)} stream(s)")
+        logger.debug(f"[DEBUG STREAM STATS] Calling update_stream_statistics_table with {len(all_stream_stats)} stream(s)")
         self.update_stream_statistics_table(all_stream_stats)
         
         # Also refresh stream table to show updated statistics
@@ -405,7 +497,7 @@ class TrafficGenClientStatisticsSection():
                     self._do_update_stream_table()
                     # print(f"[STATS] _do_update_stream_table() completed")
             except Exception as e:
-                print(f"[STATS ERROR] Failed to update stream table: {e}")
+                logger.error(f"[STATS ERROR] Failed to update stream table: {e}")
                 import traceback
                 traceback.print_exc()
         elif hasattr(self, "update_stream_table"):
@@ -425,10 +517,13 @@ class TrafficGenClientStatisticsSection():
         elif hasattr(self, 'make_server_online_action'):
             # print(f"[MENU DEBUG] All servers online, disabling 'Make Server Online' menu")
             self.make_server_online_action.setEnabled(False)
+    
     def poll_stream_stats(self):
-        # print(f"[POLL STREAM STATS] Called at {__import__('time').time()}")
+        # If worker is already running, skip this call to prevent overlapping
+        if self._poll_worker and self._poll_worker.isRunning():
+            return
+        
         # Always poll from all online servers to get latest statistics
-        # Selection only affects what's displayed, not what's polled
         servers_to_poll = []
         if hasattr(self, "server_interfaces"):
             servers_to_poll = [s for s in self.server_interfaces if s.get("online", True)]
@@ -444,70 +539,53 @@ class TrafficGenClientStatisticsSection():
             selected_items = self.server_tree.selectedItems()
             if selected_items:
                 selected_item = selected_items[0]
-                # If a port is selected, get the parent (TG server)
                 server_item = selected_item.parent() if selected_item.parent() else selected_item
                 server_address = server_item.text(1)
                 if server_address:
-                    # Find the server in server_interfaces
                     for server in self.server_interfaces:
                         if server.get("address") == server_address and server not in servers_to_poll:
                             servers_to_poll.append(server)
                             break
         
-        # print(f"[POLL STREAM STATS] Polling {len(servers_to_poll)} server(s) from {len(self.server_interfaces) if hasattr(self, 'server_interfaces') else 0} total servers")
-        
-        # If no servers to poll, still refresh stream table if it exists
         if not servers_to_poll:
-            # print(f"[POLL STREAM STATS] No servers to poll, refreshing stream table anyway")
             if hasattr(self, "update_stream_table"):
                 from PyQt5.QtCore import QTimer
                 QTimer.singleShot(0, lambda: self.update_stream_table())
             return
         
-        all_stream_stats = []  # Collect streams from all servers
-        for server in servers_to_poll:
-            if not server.get("online", True):
-                continue
-
-            url = f"{server['address']}/api/streams/stats"
-            try:
-                # Use shorter timeout and connection_manager if available
-                if hasattr(self, 'connection_manager') and self.connection_manager:
-                    response = self.connection_manager.get(url, timeout=1)
-                else:
-                    response = requests.get(url, timeout=1)
-                if response.status_code == 200:
-                    data = response.json()
-                    stream_stats = data.get("active_streams", [])
-                    # print(f"[POLL STREAM STATS] Got {len(stream_stats)} stream(s) from {server['address']}")
-                    # Update per-stream statistics (status icons, etc.)
-                    self.update_per_stream_statistics(stream_stats)
-                    # Collect streams for stream statistics table (will update after loop)
-                    tg_id = server.get("tg_id")
-                    for stream in stream_stats:
-                        stream["_tg_id"] = tg_id
-                    all_stream_stats.extend(stream_stats)
-                    # Always refresh stream table after getting new stats
-                    if hasattr(self, "update_stream_table"):
-                        from PyQt5.QtCore import QTimer
-                        # print(f"[POLL STREAM STATS] Refreshing stream table...")
-                        QTimer.singleShot(0, lambda: self.update_stream_table())
-                else:
-                    raise Exception(f"HTTP {response.status_code}")
-            except requests.exceptions.Timeout:
-                # Timeout - don't block, just skip this server
-                print(f"[POLL STREAM STATS] Timeout fetching stats from {url} (non-blocking)")
-            except requests.exceptions.ConnectionError:
-                # Connection error - don't block, just skip this server
-                print(f"[POLL STREAM STATS] Connection error fetching stats from {url} (non-blocking)")
-            except Exception as e:
-                # Any other error - don't block, just log
-                print(f"[POLL STREAM STATS] Failed to fetch /api/streams/stats from {url}: {e} (non-blocking)")
-                #self.mark_server_offline(server, "poll_stream_stats failure")
+        # Start background worker to fetch stream stats
+        self._poll_worker = StatisticsFetchWorker(
+            servers_to_poll,
+            fetch_type="streams",
+            connection_manager=getattr(self, 'connection_manager', None)
+        )
+        self._poll_worker.stream_stats_fetched.connect(self._on_poll_stream_stats_fetched)
+        self._poll_worker.fetch_error.connect(self._on_poll_fetch_error)
+        self._poll_worker.finished.connect(self._on_poll_finished)
         
-        # Update stream statistics table with all collected streams (always call to clear if empty)
-        print(f"[DEBUG STREAM STATS POLL] Calling update_stream_statistics_table with {len(all_stream_stats)} stream(s)")
-        self.update_stream_statistics_table(all_stream_stats)
+        # Reset pending data
+        self._pending_poll_stream_stats = []
+        
+        self._poll_worker.start()
+    
+    def _on_poll_stream_stats_fetched(self, server, stream_stats):
+        """Handle stream stats fetched from poll worker."""
+        tg_id = server.get("tg_id")
+        for stream in stream_stats:
+            stream["_tg_id"] = tg_id
+        self._pending_poll_stream_stats.extend(stream_stats)
+        self.update_per_stream_statistics(stream_stats)
+    
+    def _on_poll_fetch_error(self, server, error_message):
+        """Handle poll fetch error."""
+        # Just log, don't mark server offline for poll errors
+        pass
+    
+    def _on_poll_finished(self):
+        """Process polled stream stats and update UI when worker finishes."""
+        # Update stream statistics table
+        logger.debug(f"[DEBUG STREAM STATS POLL] Calling update_stream_statistics_table with {len(self._pending_poll_stream_stats)} stream(s)")
+        self.update_stream_statistics_table(self._pending_poll_stream_stats)
     def update_per_stream_statistics(self, stream_stats):
         # print(f"[DEBUG] update_per_stream_statistics() called with {len(stream_stats)} entries")
 
@@ -547,7 +625,7 @@ class TrafficGenClientStatisticsSection():
                         break
 
             if not matched_iface:
-                print(f"[UPDATE STATS] No match found for interface '{interface}' in streams (available keys: {list(self.streams.keys())[:3]}...)")
+                logger.info(f"[UPDATE STATS] No match found for interface '{interface}' in streams (available keys: {list(self.streams.keys())[:3]}...)")
                 continue
 
             matched_streams = self.streams.get(matched_iface, [])
@@ -753,7 +831,7 @@ class TrafficGenClientStatisticsSection():
     def update_stream_statistics_table(self, stream_stats_list):
         """Update the stream statistics table with detailed per-stream information."""
         if not hasattr(self, "stream_statistics_table") or self.stream_statistics_table is None:
-            print(f"[DEBUG STREAM STATS] stream_statistics_table not found or not initialized")
+            logger.debug(f"[DEBUG STREAM STATS] stream_statistics_table not found or not initialized")
             return
         
         # Set column count first (9 columns: Stream Name, Interface, TX Count, RX Count, TX Rate, RX Rate, Loss %, Status, Flow Tracking)
@@ -766,14 +844,14 @@ class TrafficGenClientStatisticsSection():
             
             self.stream_statistics_table.setRowCount(0)
         except Exception as e:
-            print(f"[DEBUG STREAM STATS] Error initializing stream_statistics_table: {e}")
+            logger.debug(f"[DEBUG STREAM STATS] Error initializing stream_statistics_table: {e}")
             return
         
         if not stream_stats_list:
-            print(f"[DEBUG STREAM STATS] stream_stats_list is empty")
+            logger.debug(f"[DEBUG STREAM STATS] stream_stats_list is empty")
             return
         
-        print(f"[DEBUG STREAM STATS] Updating table with {len(stream_stats_list)} stream(s)")
+        logger.debug(f"[DEBUG STREAM STATS] Updating table with {len(stream_stats_list)} stream(s)")
         
         def format_number(num):
             """Format number with commas for readability."""
@@ -798,7 +876,7 @@ class TrafficGenClientStatisticsSection():
                 else:
                     return f"{rate_val:.2f} pps"
             except (ValueError, TypeError) as e:
-                print(f"[DEBUG STREAM STATS] Error formatting rate {rate_val}: {e}")
+                logger.debug(f"[DEBUG STREAM STATS] Error formatting rate {rate_val}: {e}")
                 return "0.00 pps"
         
         # Process all streams from all servers
@@ -818,11 +896,11 @@ class TrafficGenClientStatisticsSection():
             
             # Debug: log rates for troubleshooting
             if tx_rate and tx_rate > 0:
-                print(f"[DEBUG STREAM STATS] Stream '{stream_name}': tx_rate={tx_rate} pps")
+                logger.debug(f"[DEBUG STREAM STATS] Stream '{stream_name}': tx_rate={tx_rate} pps")
             if rx_rate and rx_rate > 0:
-                print(f"[DEBUG STREAM STATS] Stream '{stream_name}': rx_rate={rx_rate} pps")
+                logger.debug(f"[DEBUG STREAM STATS] Stream '{stream_name}': rx_rate={rx_rate} pps")
             if tx_rate == 0.0 and rx_rate == 0.0:
-                print(f"[DEBUG STREAM STATS] Stream '{stream_name}': Both rates are 0.0 (tx_count={tx_count}, rx_count={rx_count})")
+                logger.debug(f"[DEBUG STREAM STATS] Stream '{stream_name}': Both rates are 0.0 (tx_count={tx_count}, rx_count={rx_count})")
             flow_tracking = stream.get("flow_tracking_enabled", False)
             status = stream.get("status", "Unknown")
             stream_id = stream.get("stream_id", "")
@@ -948,7 +1026,7 @@ class TrafficGenClientStatisticsSection():
         self.stream_statistics_table.resizeColumnsToContents()
 
     def clear_cached_statistics(self):
-        print("[INFO] Manually clearing cached traffic statistics.")
+        logger.info("[INFO] Manually clearing cached traffic statistics.")
         if hasattr(self, '_last_statistics'):
             del self._last_statistics
         if hasattr(self, '_last_stream_stats'):

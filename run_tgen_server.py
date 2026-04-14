@@ -6,6 +6,8 @@ from concurrent.futures import ThreadPoolExecutor
 from threading import Event, Lock
 import threading
 import logging
+
+logger = logging.getLogger(__name__)
 import psutil
 import time
 import os
@@ -237,26 +239,123 @@ def stream_stats():
         status = request.args.get("status", "Running")
         
         # If status is "all", don't filter by status
+        # Default to "Running" but also include recently stopped streams (within last 5 minutes)
+        # This ensures streams are visible immediately after server restart
         status_filter = None if status and status.lower() == "all" else status
         streams = stream_db.get_all_streams(status=status_filter, tg_id=tg_id)
+        
+        # If filtering by "Running" and no streams found, also check for recently stopped streams
+        # This helps show streams that were stopped due to server restart
+        if status_filter == "Running" and not streams:
+            import time
+            from datetime import datetime, timezone
+            recent_streams = stream_db.get_all_streams(status="Stopped", tg_id=tg_id)
+            # Filter to streams stopped within last 5 minutes (likely due to restart)
+            current_time = time.time()
+            recent_streams = []
+            for s in stream_db.get_all_streams(status="Stopped", tg_id=tg_id):
+                updated_at = s.get("updated_at")
+                if updated_at:
+                    try:
+                        # Convert ISO timestamp string to Unix timestamp
+                        if isinstance(updated_at, str):
+                            # Parse ISO format timestamp
+                            dt = datetime.fromisoformat(updated_at.replace('Z', '+00:00'))
+                            updated_timestamp = dt.timestamp()
+                        elif isinstance(updated_at, (int, float)):
+                            # Already a Unix timestamp
+                            updated_timestamp = float(updated_at)
+                        else:
+                            continue
+                        
+                        # Check if within last 5 minutes
+                        if (current_time - updated_timestamp) < 300:
+                            recent_streams.append(s)
+                    except (ValueError, TypeError, AttributeError) as e:
+                        logging.debug(f"[STATS] Error parsing updated_at for stream {s.get('stream_id')}: {e}")
+                        continue
+            if recent_streams:
+                logging.info(f"[STATS] No running streams found, but found {len(recent_streams)} recently stopped stream(s) (likely from server restart)")
+                # Return recently stopped streams with status="Stopped" so client can display them
+                streams = recent_streams
+        
+        # Get actually running streams from stream_tracker to verify database status
+        try:
+            active_tracker_streams = stream_tracker.get_stream_stats()
+            # Create a set of (interface, stream_id) tuples for quick lookup
+            tracker_stream_keys = set()
+            for ts in active_tracker_streams:
+                iface = ts.get("interface")
+                sid = ts.get("stream_id")
+                if iface and sid:
+                    tracker_stream_keys.add((iface, sid))
+        except Exception as e:
+            logging.debug(f"[STATS] Error getting stream_tracker stats: {e}")
+            tracker_stream_keys = set()
         
         # Convert to format expected by client
         active_streams = []
         for stream in streams:
+            # Extract frame_size from stream_data if available
+            stream_data = stream.get("stream_data", {}) or {}
+            protocol_selection = stream_data.get("protocol_selection", {}) or {}
+            frame_size = (protocol_selection.get("frame_size") or 
+                         stream_data.get("frame_size") or 
+                         stream.get("frame_size") or 
+                         64)
+            try:
+                frame_size = int(frame_size)
+            except (ValueError, TypeError):
+                frame_size = 64
+            
+            # Verify stream is actually running in stream_tracker
+            stream_id = stream.get("stream_id")
+            interface = stream.get("interface")
+            db_status = stream.get("status", "Unknown")
+            
+            # Check if stream is actually running in stream_tracker
+            is_actually_running = False
+            if interface and stream_id:
+                is_actually_running = (interface, stream_id) in tracker_stream_keys
+            
+            # If database says "Running" but stream_tracker doesn't have it, mark as "Stopped"
+            if db_status == "Running" and not is_actually_running:
+                logging.warning(f"[STATS] Stream '{stream.get('stream_name')}' (id={stream_id}) on {interface} marked as 'Running' in database but not in stream_tracker - correcting to 'Stopped'")
+                actual_status = "Stopped"
+                # Also zero out rates since stream is not actually running
+                tx_rate = 0.0
+                rx_rate = 0.0
+            elif db_status == "Running" and is_actually_running:
+                # Stream is actually running - use database rates (they're updated by background thread)
+                actual_status = "Running"
+                tx_rate = stream.get("tx_rate", 0.0)
+                rx_rate = stream.get("rx_rate", 0.0)
+            else:
+                # Stream is already marked as "Stopped" in database, or status is unknown
+                actual_status = db_status
+                # Zero out rates for stopped streams (they shouldn't have active rates)
+                if actual_status == "Stopped":
+                    tx_rate = 0.0
+                    rx_rate = 0.0
+                else:
+                    tx_rate = stream.get("tx_rate", 0.0)
+                    rx_rate = stream.get("rx_rate", 0.0)
+            
             active_streams.append({
-                "stream_id": stream.get("stream_id"),
-                "interface": stream.get("interface"),
+                "stream_id": stream_id,
+                "interface": interface,
                 "stream_name": stream.get("stream_name"),
                 "rx_interface": stream.get("rx_interface"),
                 "tx_count": stream.get("tx_count", 0),
                 "rx_count": stream.get("rx_count", 0),
-                "tx_rate": stream.get("tx_rate", 0.0),
-                "rx_rate": stream.get("rx_rate", 0.0),
+                "tx_rate": tx_rate,
+                "rx_rate": rx_rate,
                 "flow_tracking_enabled": bool(stream.get("flow_tracking_enabled", False)),
-                "status": stream.get("status", "Unknown"),
+                "status": actual_status,  # Use verified status
                 "tg_id": stream.get("tg_id"),
                 "started_at": stream.get("started_at"),
                 "updated_at": stream.get("updated_at"),
+                "frame_size": frame_size,  # Add frame_size for accurate byte calculations
                 # Add internal fields for debugging
                 "last_tx_count": stream.get("last_tx_count"),
                 "last_rx_count": stream.get("last_rx_count"),
@@ -432,6 +531,16 @@ def launch_single_stream(stream_data, interface):
     # Submit the stream generation task and track the Future
     future = executor.submit(generate_packets, stream_data, interface, stop_event)
     
+    # Extract frame_size from stream_data for tracking
+    protocol_selection = stream_data.get("protocol_selection", {}) or {}
+    frame_size = (protocol_selection.get("frame_size") or 
+                 stream_data.get("frame_size") or 
+                 64)
+    try:
+        frame_size = int(frame_size)
+    except (ValueError, TypeError):
+        frame_size = 64
+    
     stream_tracker.add_stream({
         "interface": interface,
         "stream_name": stream_name,
@@ -440,7 +549,8 @@ def launch_single_stream(stream_data, interface):
         "rx_thread": rx_thread,
         "rx_interface": rx_interface,
         "flow_tracking_enabled": flow_tracking,
-        "future": future  # Track the Future so we can wait for thread completion
+        "future": future,  # Track the Future so we can wait for thread completion
+        "frame_size": frame_size  # Store frame_size for statistics
     })
 
     try:
@@ -470,6 +580,11 @@ def start_traffic():
     streams = data.get("streams", {})
     if not streams:
         return jsonify({"error": "No streams provided"}), 400
+
+    # Debug: Log what streams were received
+    for interface_label, stream_list in streams.items():
+        stream_names = [s.get("name") or s.get("protocol_selection", {}).get("name", "Unknown") for s in stream_list]
+        logging.info(f"[DEBUG START] Received {len(stream_list)} stream(s) for interface '{interface_label}': {stream_names}")
 
     started_streams = []
 
@@ -1079,7 +1194,7 @@ def start_device():
                         import json
                         try:
                             protocols = json.loads(protocols) if protocols else []
-                        except:
+                        except Exception:
                             protocols = []
                     
                     dhcp_config = dhcp_config if dhcp_config else (device_data.get("dhcp_config", {}) if device_data else {})
@@ -1174,7 +1289,7 @@ def start_device():
                                 if isinstance(bgp_config_raw, str) and bgp_config_raw:
                                     try:
                                         bgp_config = json.loads(bgp_config_raw)
-                                    except:
+                                    except Exception:
                                         bgp_config = {}
                                 else:
                                     bgp_config = bgp_config_raw if bgp_config_raw else {}
@@ -1191,7 +1306,7 @@ def start_device():
                                 if isinstance(ospf_config_raw, str) and ospf_config_raw:
                                     try:
                                         ospf_config = json.loads(ospf_config_raw)
-                                    except:
+                                    except Exception:
                                         ospf_config = {}
                                 else:
                                     ospf_config = ospf_config_raw if ospf_config_raw else {}
@@ -1208,7 +1323,7 @@ def start_device():
                                 if isinstance(isis_config_raw, str) and isis_config_raw:
                                     try:
                                         isis_config = json.loads(isis_config_raw)
-                                    except:
+                                    except Exception:
                                         isis_config = {}
                                 else:
                                     isis_config = isis_config_raw if isis_config_raw else {}
@@ -1305,7 +1420,7 @@ def start_device():
                                 if isinstance(bgp_config_raw, str) and bgp_config_raw:
                                     try:
                                         bgp_config = json.loads(bgp_config_raw)
-                                    except:
+                                    except Exception:
                                         bgp_config = {}
                                 else:
                                     bgp_config = bgp_config_raw if bgp_config_raw else {}
@@ -1320,7 +1435,7 @@ def start_device():
                                 if isinstance(ospf_config_raw, str) and ospf_config_raw:
                                     try:
                                         ospf_config = json.loads(ospf_config_raw)
-                                    except:
+                                    except Exception:
                                         ospf_config = {}
                                 else:
                                     ospf_config = ospf_config_raw if ospf_config_raw else {}
@@ -1333,7 +1448,7 @@ def start_device():
                                 if isinstance(isis_config_raw, str) and isis_config_raw:
                                     try:
                                         isis_config = json.loads(isis_config_raw)
-                                    except:
+                                    except Exception:
                                         isis_config = {}
                                 else:
                                     isis_config = isis_config_raw if isis_config_raw else {}
@@ -1653,7 +1768,7 @@ def get_device_ospf_status_from_database(device_id):
             try:
                 import json
                 neighbors = json.loads(ospf_neighbors_str)
-            except:
+            except Exception:
                 neighbors = []
         
         ospf_status['neighbors'] = neighbors
@@ -2379,7 +2494,7 @@ def configure_isis():
                         try:
                             import json
                             existing_isis_config = json.loads(existing_isis_config)
-                        except:
+                        except Exception:
                             existing_isis_config = {}
                     elif not isinstance(existing_isis_config, dict):
                         existing_isis_config = {}
@@ -2432,7 +2547,7 @@ def configure_isis():
                     if isinstance(existing_protocols, str):
                         try:
                             existing_protocols = json.loads(existing_protocols)
-                        except:
+                        except Exception:
                             existing_protocols = []
                     if not isinstance(existing_protocols, list):
                         existing_protocols = []
@@ -2545,6 +2660,7 @@ def apply_device():
         device_name = data.get("device_name", "")
         interface = data.get("interface", "")
         vlan = data.get("vlan", "0")
+        mtu = data.get("mtu", "1500")  # MTU field, default to 1500
         ipv4 = data.get("ipv4", "")
         ipv6 = data.get("ipv6", "")
         ipv4_mask = data.get("ipv4_mask", "24")
@@ -2831,7 +2947,28 @@ def apply_device():
                 logging.warning(f"[DEVICE APPLY] Error creating VLAN interface {iface_name}: {e}")
                 result["vlan_created"] = False
         
-        # Step 2: Bring up interface
+        # Step 2: Configure MTU (if provided)
+        mtu = data.get("mtu", "1500")
+        if mtu:
+            try:
+                mtu_value = str(mtu).strip()
+                if mtu_value and mtu_value.isdigit():
+                    mtu_result = subprocess.run(["ip", "link", "set", iface_name_for_commands, "mtu", mtu_value], 
+                                              capture_output=True, text=True, timeout=5)
+                    if mtu_result.returncode == 0:
+                        logging.info(f"[DEVICE APPLY] Set MTU to {mtu_value} on {iface_name_for_commands}")
+                        result["mtu_configured"] = True
+                    else:
+                        logging.warning(f"[DEVICE APPLY] Failed to set MTU on {iface_name_for_commands}: {mtu_result.stderr}")
+                        result["mtu_configured"] = False
+                else:
+                    logging.warning(f"[DEVICE APPLY] Invalid MTU value: {mtu_value}")
+                    result["mtu_configured"] = False
+            except Exception as e:
+                logging.warning(f"[DEVICE APPLY] Error setting MTU on {iface_name_for_commands}: {e}")
+                result["mtu_configured"] = False
+
+        # Step 3: Bring up interface
         try:
             bringup_result = subprocess.run(["ip", "link", "set", iface_name_for_commands, "up"], 
                                           capture_output=True, text=True, timeout=5)
@@ -2845,7 +2982,7 @@ def apply_device():
             logging.warning(f"[DEVICE APPLY] Error bringing up interface {iface_name}: {e}")
             result["interface_up"] = False
 
-        # Step 3: Configure IPv4 address
+        # Step 4: Configure IPv4 address
         if ipv4 and ipv4_mask:
             try:
                 # Remove existing IPv4 address if any
@@ -3163,6 +3300,7 @@ def apply_device():
                         "device_name": device_name or f"device_{device_id}",
                         "interface": interface_normalized,
                         "vlan": vlan,
+                        "mtu": mtu,  # Include MTU in container config
                         "ipv4": f"{ipv4}/{ipv4_mask}" if ipv4 and ipv4_mask else ipv4,
                         "ipv6": f"{ipv6}/{ipv6_mask}" if ipv6 and ipv6_mask else ipv6,
                         "loopback_ipv4": loopback_ipv4,
@@ -3219,6 +3357,7 @@ def apply_device():
                         "device_name": device_name or f"device_{device_id}",
                         "interface": interface_normalized,
                         "vlan": vlan,
+                        "mtu": mtu,  # Include MTU in interface config
                         "ipv4": f"{ipv4}/{ipv4_mask}" if ipv4 and ipv4_mask else ipv4,
                         "ipv6": f"{ipv6}/{ipv6_mask}" if ipv6 and ipv6_mask else ipv6,
                         "loopback_ipv4": loopback_ipv4,
@@ -3661,7 +3800,7 @@ def apply_device():
                             import json
                             try:
                                 existing_ospf_config = json.loads(existing_ospf_config)
-                            except:
+                            except Exception:
                                 existing_ospf_config = {}
                         
                         merged_ospf_config = existing_ospf_config.copy() if existing_ospf_config else {}
@@ -3970,7 +4109,7 @@ def configure_ospf():
                     import json
                     try:
                         existing_ospf_config = json.loads(existing_ospf_config)
-                    except:
+                    except Exception:
                         existing_ospf_config = {}
                 
                 # Only check for removal if this is NOT a partial apply (all address families are being updated)
@@ -4667,7 +4806,7 @@ def remove_device():
             logging.error(f"[DEVICE REMOVE] Traceback: {traceback.format_exc()}")
 
         # Clean up device-to-IP mapping for this device
-        print(f"[REMOVE] Cleaning up device-to-IP mapping for device '{device_name}' (ID: {device_id})")
+        logger.info(f"[REMOVE] Cleaning up device-to-IP mapping for device '{device_name}' (ID: {device_id})")
         keys_to_remove = []
         for key, mapped_device_id in DEVICE_IP_MAPPING.items():
             if mapped_device_id == device_id:
@@ -4675,9 +4814,9 @@ def remove_device():
         
         for key in keys_to_remove:
             del DEVICE_IP_MAPPING[key]
-            print(f"[REMOVE] Removed IP mapping: {key}")
+            logger.info(f"[REMOVE] Removed IP mapping: {key}")
         
-        print(f"[REMOVE] Cleaned up {len(keys_to_remove)} IP mappings for device {device_id}")
+        logger.info(f"[REMOVE] Cleaned up {len(keys_to_remove)} IP mappings for device {device_id}")
         
         # Call the device manager to handle protocol cleanup
         from utils.device_manager import DeviceManager
@@ -6135,7 +6274,7 @@ def configure_bgp_route_advertisement(device_id, device_name, bgp_asn, neighbor_
                         ipv6_pools_check.append(pool)
                     else:
                         ipv4_pools_check.append(pool)
-                except:
+                except Exception:
                     # Default to IPv4 if parsing fails
                     ipv4_pools_check.append(pool)
         
@@ -6154,7 +6293,7 @@ def configure_bgp_route_advertisement(device_id, device_name, bgp_asn, neighbor_
                         import json
                         try:
                             bgp_config_from_db = json.loads(bgp_config_from_db)
-                        except:
+                        except Exception:
                             bgp_config_from_db = {}
                     device_ipv6 = bgp_config_from_db.get("bgp_update_source_ipv6", "").strip()
         
@@ -6245,7 +6384,7 @@ def configure_bgp_route_advertisement(device_id, device_name, bgp_asn, neighbor_
                         ipv6_pools.append(pool)
                     else:
                         ipv4_pools.append(pool)
-                except:
+                except Exception:
                     # Default to IPv4 if parsing fails
                     ipv4_pools.append(pool)
         
@@ -6606,7 +6745,7 @@ def cleanup_bgp_route_advertisement(device_id, device_name, bgp_asn, neighbor_ip
                 neighbor_network = ipaddress.ip_network(f"{neighbor_ip}/32" if ":" not in neighbor_ip else f"{neighbor_ip}/128", strict=False)
                 af_type = "IPv6" if neighbor_network.version == 6 else "IPv4"
                 logging.info(f"[BGP ROUTE CLEANUP] Inferred AF={af_type} from neighbor IP {neighbor_ip}")
-            except:
+            except Exception:
                 af_type = "IPv4"  # Default
                 logging.warning(f"[BGP ROUTE CLEANUP] Could not infer AF from neighbor IP {neighbor_ip}, defaulting to IPv4")
         
@@ -7010,7 +7149,7 @@ def configure_bgp():
                 import json
                 try:
                     existing_bgp_config = json.loads(existing_bgp_config)
-                except:
+                except Exception:
                     existing_bgp_config = {}
             
             # Adjust enabled flags based on selected families
@@ -7131,7 +7270,7 @@ def configure_bgp():
                     import json
                     try:
                         existing_bgp_config = json.loads(existing_bgp_config)
-                    except:
+                    except Exception:
                         existing_bgp_config = {}
                 
                 # Check if IPv4 was previously enabled but now disabled - need to remove IPv4 neighbors
@@ -8980,7 +9119,7 @@ def reset_interface_with_vlans():
                     import json
                     try:
                         protocols = json.loads(protocols)
-                    except:
+                    except Exception:
                         protocols = []
                 
                 # Cleanup OSPF if configured
@@ -9012,7 +9151,7 @@ def reset_interface_with_vlans():
                             import json
                             try:
                                 isis_config = json.loads(isis_config)
-                            except:
+                            except Exception:
                                 isis_config = {}
                         stop_isis_neighbor(device_id, device_name, isis_config=isis_config)
                         logging.info(f"[INTERFACE RESET] Cleaned up ISIS for device {device_name}")
@@ -9958,7 +10097,7 @@ def register_streams():
     data = request.json
     port = data.get("port")
     streams = data.get("streams", [])
-    print(f"*************** {streams}")
+    logger.debug(f"*************** {streams}")
     if not port or not isinstance(streams, list):
         return jsonify({"error": "Invalid registration data"}), 400
 
@@ -11334,6 +11473,1218 @@ def get_pool_usage(pool_name):
         return jsonify({"error": str(e)}), 500
 
 
+# ============================================================================
+# DPDK API Endpoints
+# ============================================================================
+
+@app.route("/api/dpdk/status", methods=["GET"])
+def dpdk_status():
+    """Get DPDK installation and interface status."""
+    try:
+        import os
+        import subprocess
+        
+        # Check if DPDK is installed
+        dpdk_installed = False
+        tx_worker_exists = False
+        hugepages_configured = False
+        hugepages_available = 0
+        hugepage_size = "N/A"
+        iommu_enabled = False
+        iommu_details = ""
+        vfio_pci_loaded = False
+        vfio_loaded = False
+        
+        # Check for DPDK libraries
+        try:
+            result = subprocess.run(
+                ["pkg-config", "--exists", "libdpdk"],
+                capture_output=True,
+                timeout=5
+            )
+            dpdk_installed = result.returncode == 0
+        except Exception:
+            pass
+        
+        # Check for tx_worker binary
+        tx_worker_paths = [
+            "/opt/OSTG/resources/dpdk/tx_worker/build/tx_worker",
+            "/usr/local/bin/tx_worker",
+            "./resources/dpdk/tx_worker/build/tx_worker"
+        ]
+        for path in tx_worker_paths:
+            if os.path.exists(path):
+                tx_worker_exists = True
+                break
+        
+        # Check hugepages
+        try:
+            with open("/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages", "r") as f:
+                hugepages_available = int(f.read().strip())
+            hugepages_configured = hugepages_available > 0
+            hugepage_size = "2MB"
+        except Exception:
+            pass
+        
+        # Check IOMMU status
+        try:
+            with open("/proc/cmdline", "r") as f:
+                cmdline = f.read()
+            
+            # Check for Intel IOMMU
+            if "intel_iommu=on" in cmdline:
+                iommu_enabled = True
+                iommu_details = "Intel IOMMU enabled"
+                if "iommu=pt" in cmdline:
+                    iommu_details += " (passthrough mode)"
+            # Check for AMD IOMMU
+            elif "amd_iommu=on" in cmdline:
+                iommu_enabled = True
+                iommu_details = "AMD IOMMU enabled"
+                if "iommu=pt" in cmdline:
+                    iommu_details += " (passthrough mode)"
+            else:
+                iommu_details = "IOMMU not enabled in kernel (required for vfio-pci)"
+        except Exception as e:
+            iommu_details = f"Could not check IOMMU: {e}"
+        
+        # Check if vfio-pci module is loaded or builtin
+        try:
+            # First check if modules are builtin (always available)
+            vfio_builtin = False
+            vfio_pci_builtin = False
+            try:
+                result = subprocess.run(
+                    ["modinfo", "vfio"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if result.returncode == 0 and "(builtin)" in result.stdout:
+                    vfio_builtin = True
+                    vfio_loaded = True
+            except Exception:
+                pass
+            
+            try:
+                result = subprocess.run(
+                    ["modinfo", "vfio-pci"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if result.returncode == 0 and "(builtin)" in result.stdout:
+                    vfio_pci_builtin = True
+                    vfio_pci_loaded = True
+            except Exception:
+                pass
+            
+            # If not builtin, check lsmod for loadable modules
+            if not vfio_pci_builtin or not vfio_loaded:
+                result = subprocess.run(
+                    ["lsmod"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if result.returncode == 0:
+                    output = result.stdout.lower()
+                    # lsmod output format: "vfio_pci               45056  0"
+                    # Check for vfio_pci module (with underscore, as it appears in lsmod)
+                    import re
+                    if not vfio_pci_loaded:
+                        vfio_pci_loaded = bool(re.search(r'^vfio_pci\s', output, re.MULTILINE))
+                    # Check for vfio module (base module) - must be a separate line starting with "vfio"
+                    if not vfio_loaded:
+                        vfio_loaded = bool(re.search(r'^vfio\s', output, re.MULTILINE))
+        except Exception as e:
+            logging.warning(f"[DPDK STATUS] Error checking VFIO modules: {e}")
+            pass
+        
+        # Get interface status using dpdk-devbind.py if available
+        interfaces = []
+        dpdk_bind_script = "/opt/OSTG/resources/dpdk/dpdk_bind.sh"
+        if os.path.exists(dpdk_bind_script):
+            try:
+                result = subprocess.run(
+                    ["sudo", dpdk_bind_script, "status"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                if result.returncode == 0:
+                    # Parse output (simplified - would need proper parsing)
+                    interfaces = _parse_dpdk_devbind_status(result.stdout)
+            except Exception as e:
+                logging.debug(f"[DPDK STATUS] Failed to get interface status: {e}")
+        
+        return jsonify({
+            "dpdk_installed": dpdk_installed,
+            "tx_worker_exists": tx_worker_exists,
+            "hugepages_configured": hugepages_configured,
+            "hugepages_available": hugepages_available,
+            "hugepage_size": hugepage_size,
+            "iommu_enabled": iommu_enabled,
+            "iommu_details": iommu_details,
+            "vfio_pci_loaded": vfio_pci_loaded,
+            "vfio_loaded": vfio_loaded,
+            "interfaces": interfaces
+        }), 200
+        
+    except Exception as e:
+        logging.error(f"[DPDK STATUS] Error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/dpdk/interfaces", methods=["GET"])
+def dpdk_interfaces():
+    """Get available interfaces for DPDK operations."""
+    try:
+        import subprocess
+        import os
+        import glob
+        
+        interfaces = []
+        
+        # Method 1: Try dpdk-devbind.py directly (most reliable)
+        dpdk_devbind = None
+        for path in [
+            "/opt/OSTG/resources/dpdk/dpdk/usertools/dpdk-devbind.py",
+            "/usr/local/share/dpdk/usertools/dpdk-devbind.py",
+            "/usr/share/dpdk/usertools/dpdk-devbind.py",
+            "/root/SURAJ/dpdk/usertools/dpdk-devbind.py"
+        ]:
+            if os.path.exists(path):
+                dpdk_devbind = path
+                break
+        
+        if dpdk_devbind:
+            try:
+                result = subprocess.run(
+                    ["sudo", "python3", dpdk_devbind, "--status"],
+                    capture_output=True,
+                    text=True,
+                    timeout=10
+                )
+                if result.returncode == 0:
+                    interfaces = _parse_dpdk_devbind_status(result.stdout)
+                    if interfaces:
+                        logging.info(f"[DPDK INTERFACES] Found {len(interfaces)} interfaces via dpdk-devbind.py")
+            except Exception as e:
+                logging.debug(f"[DPDK INTERFACES] dpdk-devbind.py failed: {e}")
+        
+        # Method 2: Try dpdk_bind.sh status
+        if not interfaces:
+            dpdk_bind_script = "/opt/OSTG/resources/dpdk/dpdk_bind.sh"
+            if os.path.exists(dpdk_bind_script):
+                try:
+                    result = subprocess.run(
+                        ["sudo", dpdk_bind_script, "status"],
+                        capture_output=True,
+                        text=True,
+                        timeout=10
+                    )
+                    if result.returncode == 0:
+                        interfaces = _parse_dpdk_devbind_status(result.stdout)
+                        if interfaces:
+                            logging.info(f"[DPDK INTERFACES] Found {len(interfaces)} interfaces via dpdk_bind.sh")
+                except Exception as e:
+                    logging.debug(f"[DPDK INTERFACES] dpdk_bind.sh failed: {e}")
+        
+        # Method 3: Use /sys filesystem to get interface details
+        if not interfaces:
+            interfaces = _get_interfaces_from_sys()
+            if interfaces:
+                logging.info(f"[DPDK INTERFACES] Found {len(interfaces)} interfaces via /sys filesystem")
+        
+        # Method 4: Fallback to ip link (minimal info)
+        if not interfaces:
+            try:
+                result = subprocess.run(
+                    ["ip", "link", "show"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if result.returncode == 0:
+                    interfaces = _parse_ip_link_output(result.stdout)
+                    # Enhance with PCI info from /sys
+                    for iface in interfaces:
+                        pci = _get_pci_from_interface(iface["name"])
+                        if pci:
+                            iface["pci"] = pci
+                            iface["driver"] = _get_driver_from_pci(pci) or "unknown"
+                            iface["vendor"] = _get_vendor_from_pci(pci) or "unknown"
+            except Exception as e:
+                logging.debug(f"[DPDK INTERFACES] Failed to get system interfaces: {e}")
+        
+        return jsonify({"interfaces": interfaces}), 200
+        
+    except Exception as e:
+        logging.error(f"[DPDK INTERFACES] Error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/dpdk/bind", methods=["POST"])
+def dpdk_bind():
+    """Bind an interface to DPDK."""
+    try:
+        import subprocess
+        import os
+        
+        data = request.get_json() or {}
+        interface = data.get("interface")
+        pci = data.get("pci")
+        force = data.get("force", False)
+        
+        if not interface and not pci:
+            return jsonify({"error": "interface or pci required"}), 400
+        
+        # Validate PCI format if provided (should be like 0000:XX:XX.X)
+        if pci and (pci == "N/A" or ":" not in pci):
+            pci = None  # Ignore invalid PCI
+        
+        # If PCI is invalid, try to get it from interface name
+        if not pci and interface:
+            pci = _get_pci_from_interface(interface)
+        
+        dpdk_bind_script = "/opt/OSTG/resources/dpdk/dpdk_bind.sh"
+        if not os.path.exists(dpdk_bind_script):
+            return jsonify({"error": "dpdk_bind.sh not found"}), 404
+        
+        # Build command - dpdk_bind.sh expects PCI as positional argument
+        # If we have interface name but no PCI, convert interface to PCI
+        if not pci and interface:
+            pci = _get_pci_from_interface(interface)
+        
+        if not pci or ":" not in pci:
+            return jsonify({"error": f"Could not determine PCI address for interface {interface}"}), 400
+        
+        # dpdk_bind.sh expects: bind <PCI> [--force]
+        cmd = ["sudo", dpdk_bind_script, "bind", pci]
+        if force:
+            cmd.append("--force")
+        
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=30
+        )
+        
+        if result.returncode == 0:
+            return jsonify({
+                "success": True,
+                "message": f"Interface {'bound' if result.returncode == 0 else 'binding attempted'}",
+                "output": result.stdout
+            }), 200
+        else:
+            return jsonify({
+                "success": False,
+                "message": result.stderr or "Binding failed",
+                "output": result.stdout
+            }), 500
+        
+    except Exception as e:
+        logging.error(f"[DPDK BIND] Error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/dpdk/unbind", methods=["POST"])
+def dpdk_unbind():
+    """Unbind an interface from DPDK."""
+    try:
+        import subprocess
+        import os
+        
+        data = request.get_json() or {}
+        interface = data.get("interface")
+        pci = data.get("pci")
+        kernel_driver = data.get("kernel_driver", "")
+        
+        # Validate PCI format if provided
+        if pci and (pci == "N/A" or ":" not in pci):
+            pci = None
+        
+        # If we have interface name but no PCI, convert interface to PCI
+        if not pci and interface:
+            pci = _get_pci_from_interface(interface)
+        
+        if not pci or ":" not in pci:
+            return jsonify({"error": f"Could not determine PCI address for interface {interface}"}), 400
+        
+        dpdk_bind_script = "/opt/OSTG/resources/dpdk/dpdk_bind.sh"
+        if not os.path.exists(dpdk_bind_script):
+            return jsonify({"error": "dpdk_bind.sh not found"}), 404
+        
+        # dpdk_bind.sh expects: unbind <PCI> [--kernel-driver <driver>]
+        cmd = ["sudo", dpdk_bind_script, "unbind", pci]
+        if kernel_driver:
+            cmd.extend(["--kernel-driver", kernel_driver])
+        
+        # Increased timeout to accommodate retry logic and interface detection (up to 60 seconds)
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=60
+        )
+        
+        # Check if script output indicates success (even if exit code is non-zero)
+        # The script may return success even if binding to kernel driver fails,
+        # as long as the device is unbound from DPDK (which is the main goal)
+        output_lower = (result.stdout or "").lower()
+        success_indicators = [
+            "unbind operation successful",
+            "device not bound to dpdk",
+            "device remains unbound",
+            "main goal achieved",
+            "✓"
+        ]
+        is_success = result.returncode == 0 or any(indicator in output_lower for indicator in success_indicators)
+        
+        if is_success:
+            return jsonify({
+                "success": True,
+                "message": "Interface unbound from DPDK successfully",
+                "output": result.stdout
+            }), 200
+        else:
+            return jsonify({
+                "success": False,
+                "message": result.stderr or "Unbinding failed",
+                "output": result.stdout
+            }), 500
+        
+    except Exception as e:
+        logging.error(f"[DPDK UNBIND] Error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/dpdk/verify", methods=["GET"])
+def dpdk_verify():
+    """Verify DPDK installation."""
+    try:
+        import os
+        import subprocess
+        
+        messages = []
+        dpdk_libraries = False
+        tx_worker_binary = False
+        hugepages = False
+        kernel_modules = False
+        
+        # Check DPDK libraries
+        try:
+            result = subprocess.run(
+                ["pkg-config", "--exists", "libdpdk"],
+                capture_output=True,
+                timeout=5
+            )
+            dpdk_libraries = result.returncode == 0
+            if dpdk_libraries:
+                version_result = subprocess.run(
+                    ["pkg-config", "--modversion", "libdpdk"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if version_result.returncode == 0:
+                    messages.append(f"DPDK version: {version_result.stdout.strip()}")
+            else:
+                messages.append("DPDK libraries not found")
+        except Exception as e:
+            messages.append(f"Error checking DPDK libraries: {e}")
+        
+        # Check tx_worker binary
+        tx_worker_paths = [
+            "/opt/OSTG/resources/dpdk/tx_worker/build/tx_worker",
+            "/usr/local/bin/tx_worker",
+            "./resources/dpdk/tx_worker/build/tx_worker"
+        ]
+        for path in tx_worker_paths:
+            if os.path.exists(path):
+                tx_worker_binary = True
+                messages.append(f"tx_worker found: {path}")
+                break
+        if not tx_worker_binary:
+            messages.append("tx_worker binary not found")
+        
+        # Check hugepages
+        try:
+            with open("/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages", "r") as f:
+                nr_hugepages = int(f.read().strip())
+            if nr_hugepages > 0:
+                hugepages = True
+                messages.append(f"Hugepages configured: {nr_hugepages} x 2MB")
+            else:
+                messages.append("Hugepages not configured")
+        except Exception as e:
+            messages.append(f"Error checking hugepages: {e}")
+        
+        # Check kernel modules (including builtin modules)
+        try:
+            # Check loaded modules first
+            result = subprocess.run(
+                ["lsmod"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            modules_loaded = False
+            if result.returncode == 0:
+                output = result.stdout.lower()
+                if "vfio" in output or "uio" in output:
+                    modules_loaded = True
+            
+            # Check for builtin modules using modinfo
+            builtin_modules = []
+            for module in ["vfio-pci", "vfio", "vfio_iommu_type1", "uio_pci_generic"]:
+                try:
+                    modinfo_result = subprocess.run(
+                        ["modinfo", module],
+                        capture_output=True,
+                        text=True,
+                        timeout=3
+                    )
+                    if modinfo_result.returncode == 0:
+                        if "(builtin)" in modinfo_result.stdout or "filename:" not in modinfo_result.stdout:
+                            builtin_modules.append(module)
+                except Exception:
+                    pass
+            
+            if modules_loaded or builtin_modules:
+                kernel_modules = True
+                if builtin_modules:
+                    messages.append(f"DPDK kernel modules: {', '.join(builtin_modules)} (builtin)")
+                if modules_loaded:
+                    loaded_list = []
+                    if "vfio" in result.stdout.lower():
+                        loaded_list.append("vfio")
+                    if "uio" in result.stdout.lower():
+                        loaded_list.append("uio")
+                    if loaded_list:
+                        messages.append(f"DPDK kernel modules loaded: {', '.join(loaded_list)}")
+            else:
+                messages.append("DPDK kernel modules not loaded (vfio-pci, vfio, uio_pci_generic)")
+        except Exception as e:
+            messages.append(f"Error checking kernel modules: {e}")
+        
+        return jsonify({
+            "dpdk_libraries": dpdk_libraries,
+            "tx_worker_binary": tx_worker_binary,
+            "hugepages": hugepages,
+            "kernel_modules": kernel_modules,
+            "messages": messages
+        }), 200
+        
+    except Exception as e:
+        logging.error(f"[DPDK VERIFY] Error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/dpdk/hugepages", methods=["POST"])
+def dpdk_hugepages():
+    """Configure hugepages."""
+    try:
+        import subprocess
+        
+        data = request.get_json() or {}
+        num_pages = data.get("num_pages")
+        page_size = data.get("page_size", "2MB")
+        
+        if not num_pages:
+            return jsonify({"error": "num_pages required"}), 400
+        
+        # Configure hugepages
+        if page_size == "2MB":
+            hugepage_file = "/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages"
+        else:
+            return jsonify({"error": f"Unsupported page size: {page_size}"}), 400
+        
+        try:
+            with open(hugepage_file, "w") as f:
+                f.write(str(num_pages))
+            
+            # Mount hugepages if not already mounted
+            mount_point = "/mnt/huge"
+            result = subprocess.run(
+                ["mountpoint", "-q", mount_point],
+                capture_output=True
+            )
+            if result.returncode != 0:
+                subprocess.run(
+                    ["mkdir", "-p", mount_point],
+                    check=True
+                )
+                subprocess.run(
+                    ["mount", "-t", "hugetlbfs", "nodev", mount_point],
+                    check=True
+                )
+            
+            return jsonify({
+                "success": True,
+                "message": f"Configured {num_pages} x {page_size} hugepages"
+            }), 200
+        except Exception as e:
+            return jsonify({
+                "success": False,
+                "message": f"Failed to configure hugepages: {str(e)}"
+            }), 500
+        
+    except Exception as e:
+        logging.error(f"[DPDK HUGEPAGES] Error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+def _parse_dpdk_devbind_status(output):
+    """Parse dpdk-devbind.py --status output."""
+    interfaces = []
+    lines = output.split('\n')
+    current_section = None
+    
+    for line in lines:
+        line = line.strip()
+        if not line or line.startswith('='):
+            continue
+        
+        # Detect section type
+        if 'Network devices using DPDK-compatible driver' in line:
+            current_section = 'network_dpdk'
+            continue
+        elif 'Network devices using kernel driver' in line:
+            current_section = 'network_kernel'
+            continue
+        elif 'Other Network devices' in line:
+            current_section = 'network_other'
+            continue
+        elif 'Network devices' in line:
+            # Generic "Network devices" - default to kernel
+            current_section = 'network_kernel'
+            continue
+        
+        # Parse all network device sections
+        if current_section in ['network_kernel', 'network_other', 'network_dpdk']:
+            # Parse line like: "0000:8a:00.0 'Device 1760' numa_node=1 if=ens5np0 drv=bnxt_en unused=vfio-pci,uio_pci_generic"
+            # Or: "0000:c9:00.0 'Device 1760' numa_node=1 unused=bnxt_en,vfio-pci" (no interface, bound to vfio-pci)
+            parts = line.split()
+            if len(parts) >= 3:
+                # First part should be PCI address (format: 0000:XX:XX.X)
+                pci = parts[0]
+                if not pci or ':' not in pci:
+                    continue
+                
+                iface = None
+                driver = None
+                vendor = "unknown"
+                unused_drivers = []
+                
+                for part in parts:
+                    if part.startswith('if='):
+                        iface = part.split('=')[1]
+                    elif part.startswith('drv='):
+                        driver = part.split('=')[1]
+                    elif part.startswith('vendor='):
+                        vendor = part.split('=')[1]
+                    elif part.startswith('unused='):
+                        unused_drivers = part.split('=')[1].split(',')
+                
+                # Get vendor from lspci if available
+                vendor = _get_vendor_from_pci(pci) or vendor
+                
+                # Get driver from /sys if not found in output (most reliable)
+                sys_driver = _get_driver_from_pci(pci)
+                if sys_driver:
+                    driver = sys_driver
+                elif not driver or driver == "unknown":
+                    # Check if device is in DPDK-compatible driver section
+                    if current_section == 'network_dpdk':
+                        # Device is bound to DPDK driver, check /sys
+                        if sys_driver:
+                            driver = sys_driver
+                        else:
+                            driver = "vfio-pci"  # Default assumption for DPDK section
+                    # Check if device is bound to vfio-pci (in "Other Network devices" section)
+                    elif current_section == 'network_other' and 'vfio-pci' not in unused_drivers:
+                        # Check /sys to see if actually bound to vfio-pci
+                        if sys_driver == "vfio-pci":
+                            driver = "vfio-pci"
+                        else:
+                            driver = "unknown"
+                    else:
+                        driver = "unknown"
+                
+                # Determine status: bound to DPDK driver, kernel driver, or unbound
+                is_bound_to_dpdk = driver in ["vfio-pci", "uio_pci_generic"]
+                is_bound_to_kernel = driver and driver != "unknown" and not is_bound_to_dpdk
+                is_unbound = not driver or driver == "unknown" or driver == ""
+                
+                # Extract kernel driver from unused_drivers for unbound devices
+                kernel_driver = None
+                # For unbound devices (not bound to DPDK), extract kernel driver from unused list
+                if is_unbound and unused_drivers:
+                    # For unbound devices, find the kernel driver (not a DPDK driver)
+                    dpdk_drivers = ["vfio-pci", "uio_pci_generic", "igb_uio"]
+                    for unused_drv in unused_drivers:
+                        if unused_drv not in dpdk_drivers:
+                            kernel_driver = unused_drv
+                            break
+                elif is_bound_to_kernel:
+                    # For kernel-bound devices, the driver itself is the kernel driver
+                    kernel_driver = driver
+                
+                # Include interface even if no interface name (for DPDK-bound devices)
+                # Use PCI address as display name if no interface name
+                display_name = iface if iface else f"{pci} (no interface)"
+                
+                # Determine status string
+                if is_bound_to_dpdk:
+                    status_str = "dpdk-bound"
+                elif is_bound_to_kernel:
+                    status_str = "kernel-bound"
+                else:
+                    status_str = "unbound"
+                
+                interfaces.append({
+                    "name": display_name,
+                    "pci": pci,
+                    "driver": driver or "unknown",
+                    "vendor": vendor or "unknown",
+                    "status": status_str,
+                    "kernel_driver": kernel_driver or "",
+                    "has_interface": iface is not None  # Track if interface name exists
+                })
+    
+    return interfaces
+
+
+def _parse_ip_link_output(output):
+    """Parse ip link show output to get basic interface info."""
+    interfaces = []
+    lines = output.split('\n')
+    
+    for line in lines:
+        line = line.strip()
+        if ':' in line and not line.startswith(' '):
+            # Extract interface name
+            parts = line.split(':')
+            if len(parts) >= 2:
+                iface_name = parts[1].strip().split()[0]
+                # Skip loopback and virtual interfaces
+                if iface_name.startswith('lo') or iface_name.startswith('docker') or iface_name.startswith('veth'):
+                    continue
+                interfaces.append({
+                    "name": iface_name,
+                    "pci": "N/A",
+                    "driver": "unknown",
+                    "vendor": "unknown",
+                    "status": "unknown",
+                    "kernel_driver": ""
+                })
+    
+    return interfaces
+
+
+def _get_interfaces_from_sys():
+    """Get interface information from /sys filesystem."""
+    import os
+    import glob
+    
+    interfaces = []
+    
+    # Find all network interfaces in /sys/class/net
+    net_dir = "/sys/class/net"
+    if not os.path.exists(net_dir):
+        return interfaces
+    
+    for iface_name in os.listdir(net_dir):
+        # Skip loopback and virtual interfaces
+        if iface_name.startswith('lo') or iface_name.startswith('docker') or iface_name.startswith('veth'):
+            continue
+        
+        # Get PCI address from /sys/class/net/<iface>/device
+        device_link = os.path.join(net_dir, iface_name, "device")
+        if os.path.exists(device_link):
+            pci = os.path.basename(os.readlink(device_link))
+            
+            # Get driver
+            driver = _get_driver_from_pci(pci)
+            
+            # Get vendor
+            vendor = _get_vendor_from_pci(pci)
+            
+            # Determine status
+            status = "bound" if driver in ["vfio-pci", "uio_pci_generic"] else "unbound"
+            
+            interfaces.append({
+                "name": iface_name,
+                "pci": pci,
+                "driver": driver or "unknown",
+                "vendor": vendor or "unknown",
+                "status": status,
+                "kernel_driver": driver if driver not in ["vfio-pci", "uio_pci_generic"] else ""
+            })
+    
+    return interfaces
+
+
+def _get_pci_from_interface(iface_name):
+    """Get PCI address from interface name using /sys."""
+    import os
+    
+    device_link = f"/sys/class/net/{iface_name}/device"
+    if os.path.exists(device_link):
+        return os.path.basename(os.readlink(device_link))
+    return None
+
+
+def _get_driver_from_pci(pci):
+    """Get driver name from PCI address."""
+    import os
+    
+    driver_link = f"/sys/bus/pci/devices/{pci}/driver"
+    if os.path.exists(driver_link):
+        return os.path.basename(os.readlink(driver_link))
+    return None
+
+
+def _get_vendor_from_pci(pci):
+    """Get vendor name from PCI address using lspci."""
+    import subprocess
+    
+    try:
+        result = subprocess.run(
+            ["lspci", "-n", "-s", pci],
+            capture_output=True,
+            text=True,
+            timeout=5
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            parts = result.stdout.strip().split()
+            if len(parts) >= 3:
+                vendor_id = parts[2].split(':')[0]
+                vendor_map = {
+                    "15b3": "NVIDIA/Mellanox",
+                    "14e4": "Broadcom",
+                    "8086": "Intel",
+                    "1022": "AMD",
+                    "1023": "AMD",
+                    "1002": "AMD"
+                }
+                return vendor_map.get(vendor_id, f"Unknown ({vendor_id})")
+    except Exception:
+        pass
+    
+    return None
+
+
+@app.route("/api/dpdk/cpu-vendor", methods=["GET"])
+def dpdk_cpu_vendor():
+    """Detect CPU vendor (Intel or AMD) for IOMMU configuration."""
+    try:
+        import subprocess
+        
+        vendor = "intel"  # default
+        
+        # Check /proc/cpuinfo for vendor
+        try:
+            with open("/proc/cpuinfo", "r") as f:
+                cpuinfo = f.read()
+                if "AuthenticAMD" in cpuinfo or "amd" in cpuinfo.lower():
+                    vendor = "amd"
+                elif "GenuineIntel" in cpuinfo or "intel" in cpuinfo.lower():
+                    vendor = "intel"
+        except Exception:
+            pass
+        
+        # Also check lscpu output
+        try:
+            result = subprocess.run(
+                ["lscpu"],
+                capture_output=True,
+                text=True,
+                timeout=5
+            )
+            if result.returncode == 0:
+                output = result.stdout.lower()
+                if "amd" in output or "authenticamd" in output:
+                    vendor = "amd"
+                elif "intel" in output or "genuineintel" in output:
+                    vendor = "intel"
+        except Exception:
+            pass
+        
+        return jsonify({
+            "vendor": vendor,
+            "iommu_param": "amd_iommu=on" if vendor == "amd" else "intel_iommu=on"
+        }), 200
+        
+    except Exception as e:
+        logging.error(f"[DPDK CPU VENDOR] Error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/dpdk/load_modules", methods=["POST"])
+def dpdk_load_modules():
+    """Load VFIO kernel modules (vfio-pci and vfio)."""
+    logging.info("[DPDK LOAD MODULES] API endpoint called")
+    try:
+        import subprocess
+        import os
+        
+        modules_to_load = ["vfio", "vfio-pci"]
+        loaded_modules = []
+        failed_modules = []
+        
+        # Check if running as root
+        is_root = os.geteuid() == 0
+        logging.info(f"[DPDK LOAD MODULES] Running as root: {is_root}, UID: {os.geteuid()}")
+        
+        # Check if modprobe exists - try common paths
+        modprobe_path = None
+        for path in ["/sbin/modprobe", "/usr/sbin/modprobe", "/bin/modprobe", "modprobe"]:
+            if path == "modprobe":
+                # Try to find modprobe in PATH
+                try:
+                    result = subprocess.run(["which", "modprobe"], capture_output=True, text=True, timeout=2)
+                    if result.returncode == 0:
+                        modprobe_path = result.stdout.strip()
+                        break
+                except Exception:
+                    pass
+            elif os.path.exists(path):
+                modprobe_path = path
+                break
+        
+        if not modprobe_path:
+            return jsonify({
+                "success": False,
+                "message": "modprobe command not found. Cannot load kernel modules.",
+                "loaded": [],
+                "failed": [{"module": m, "error": "modprobe not found"} for m in modules_to_load]
+            }), 500
+        
+        logging.info(f"[DPDK LOAD MODULES] Using modprobe at: {modprobe_path}")
+        
+        for module in modules_to_load:
+            try:
+                # First check if module is builtin (always available, can't be loaded)
+                try:
+                    modinfo_result = subprocess.run(
+                        ["modinfo", module],
+                        capture_output=True,
+                        text=True,
+                        timeout=5
+                    )
+                    if modinfo_result.returncode == 0 and "(builtin)" in modinfo_result.stdout:
+                        loaded_modules.append(module)
+                        logging.info(f"[DPDK LOAD MODULES] {module} is builtin (always available)")
+                        continue
+                except Exception as e:
+                    logging.debug(f"[DPDK LOAD MODULES] modinfo check for {module} failed: {e}")
+                
+                # Check if module is already loaded (lsmod shows vfio_pci, not vfio-pci)
+                result = subprocess.run(
+                    ["lsmod"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if result.returncode == 0:
+                    import re
+                    module_pattern = module.replace("-", "_")
+                    if re.search(rf'^{module_pattern}\s', result.stdout, re.MULTILINE | re.IGNORECASE):
+                        loaded_modules.append(module)
+                        logging.info(f"[DPDK LOAD MODULES] {module} is already loaded")
+                        continue
+                
+                # Load the module - try modprobe directly first (service runs as root)
+                result = None
+                error_msg = None
+                
+                # Try modprobe directly first (since service runs as root)
+                try:
+                    logging.info(f"[DPDK LOAD MODULES] Attempting to load {module} using {modprobe_path}")
+                    result = subprocess.run(
+                        [modprobe_path, module],
+                        capture_output=True,
+                        text=True,
+                        timeout=10
+                    )
+                    logging.info(f"[DPDK LOAD MODULES] modprobe {module} returned: exit_code={result.returncode}, stdout='{result.stdout}', stderr='{result.stderr}'")
+                    
+                    if result.returncode == 0:
+                        # Verify it's actually loaded
+                        verify_result = subprocess.run(
+                            ["lsmod"],
+                            capture_output=True,
+                            text=True,
+                            timeout=5
+                        )
+                        if verify_result.returncode == 0:
+                            module_pattern = module.replace("-", "_")
+                            if module_pattern in verify_result.stdout.lower():
+                                loaded_modules.append(module)
+                                logging.info(f"[DPDK LOAD MODULES] Successfully loaded and verified {module}")
+                            else:
+                                # Module command succeeded but not in lsmod - might be a dependency issue
+                                error_msg = f"modprobe succeeded but module {module} not found in lsmod. Check dependencies: {result.stderr or result.stdout}"
+                                logging.warning(f"[DPDK LOAD MODULES] {error_msg}")
+                                failed_modules.append({
+                                    "module": module,
+                                    "error": error_msg
+                                })
+                        else:
+                            error_msg = f"Failed to verify module load: lsmod failed"
+                            logging.error(f"[DPDK LOAD MODULES] {error_msg}")
+                            failed_modules.append({
+                                "module": module,
+                                "error": error_msg
+                            })
+                    else:
+                        error_msg = result.stderr.strip() or result.stdout.strip() or "Unknown error"
+                        logging.error(f"[DPDK LOAD MODULES] modprobe {module} failed (exit code {result.returncode}): stderr='{result.stderr}', stdout='{result.stdout}'")
+                        failed_modules.append({
+                            "module": module,
+                            "error": error_msg
+                        })
+                except FileNotFoundError:
+                    error_msg = "modprobe command not found"
+                    logging.error(f"[DPDK LOAD MODULES] {error_msg}")
+                except subprocess.TimeoutExpired:
+                    error_msg = "modprobe command timed out"
+                    logging.error(f"[DPDK LOAD MODULES] {error_msg}")
+                except Exception as e:
+                    error_msg = f"modprobe failed: {str(e)}"
+                    logging.error(f"[DPDK LOAD MODULES] {error_msg}")
+                
+                # If direct modprobe failed and not root, try with sudo as fallback
+                if error_msg and module not in loaded_modules and not is_root:
+                    try:
+                        logging.info(f"[DPDK LOAD MODULES] Trying sudo modprobe {module} as fallback")
+                        result = subprocess.run(
+                            ["sudo", modprobe_path, module],
+                            capture_output=True,
+                            text=True,
+                            timeout=10
+                        )
+                        if result.returncode == 0:
+                            loaded_modules.append(module)
+                            logging.info(f"[DPDK LOAD MODULES] Successfully loaded {module} with sudo")
+                            continue
+                        else:
+                            error_msg = result.stderr.strip() or result.stdout.strip() or error_msg or "Unknown error"
+                            logging.warning(f"[DPDK LOAD MODULES] sudo modprobe {module} also failed: {error_msg}")
+                    except Exception as e:
+                        error_msg = f"Both modprobe and sudo modprobe failed: {str(e)}"
+                        logging.error(f"[DPDK LOAD MODULES] {error_msg}")
+                
+                # If we get here, loading failed
+                failed_modules.append({
+                    "module": module,
+                    "error": error_msg or "Unknown error - check server logs"
+                })
+            except subprocess.TimeoutExpired:
+                failed_modules.append({
+                    "module": module,
+                    "error": "Command timed out"
+                })
+            except Exception as e:
+                failed_modules.append({
+                    "module": module,
+                    "error": str(e)
+                })
+        
+        if failed_modules:
+            # Provide detailed error information
+            error_details = []
+            for fm in failed_modules:
+                error_details.append(f"{fm['module']}: {fm['error']}")
+            
+            error_message = f"Failed to load modules: {', '.join(error_details)}"
+            error_message += "\n\nPossible causes:"
+            error_message += "\n1. Systemd service has ProtectKernelModules=true (check systemd service file)"
+            error_message += "\n2. Service doesn't have sudo permissions"
+            error_message += "\n3. Modules not available in kernel (check: lsmod | grep vfio)"
+            error_message += "\n4. IOMMU not enabled (required for vfio-pci)"
+            error_message += "\n\nTry manually: sudo modprobe vfio && sudo modprobe vfio-pci"
+            
+            logging.error(f"[DPDK LOAD MODULES] {error_message}")
+            return jsonify({
+                "success": False,
+                "message": error_message,
+                "loaded": loaded_modules,
+                "failed": failed_modules
+            }), 500
+        
+        return jsonify({
+            "success": True,
+            "message": f"Successfully loaded modules: {', '.join(loaded_modules)}",
+            "loaded": loaded_modules
+        }), 200
+        
+    except Exception as e:
+        logging.error(f"[DPDK LOAD MODULES ERROR] {e}")
+        return jsonify({
+            "success": False,
+            "message": f"Failed to load modules: {str(e)}"
+        }), 500
+
+@app.route("/api/dpdk/iommu", methods=["POST"])
+def dpdk_configure_iommu():
+    """Configure IOMMU in GRUB and optionally reboot."""
+    try:
+        import subprocess
+        import os
+        import re
+        
+        data = request.get_json() or {}
+        enable = data.get("enable", True)
+        cpu_vendor = data.get("cpu_vendor", "intel").lower()
+        reboot = data.get("reboot", False)
+        
+        grub_file = "/etc/default/grub"
+        
+        # Check if GRUB file exists
+        if not os.path.exists(grub_file):
+            return jsonify({
+                "success": False,
+                "message": f"GRUB configuration file not found: {grub_file}"
+            }), 404
+        
+        # Read current GRUB configuration
+        try:
+            with open(grub_file, "r") as f:
+                grub_content = f.read()
+        except Exception as e:
+            return jsonify({
+                "success": False,
+                "message": f"Failed to read GRUB file: {str(e)}"
+            }), 500
+        
+        # Determine IOMMU parameters based on CPU vendor
+        if cpu_vendor == "amd":
+            iommu_param = "amd_iommu=on"
+        else:
+            iommu_param = "intel_iommu=on"
+        
+        iommu_params = f"{iommu_param} iommu=pt"
+        
+        # Find GRUB_CMDLINE_LINUX line
+        lines = grub_content.split('\n')
+        cmdline_line_index = None
+        for i, line in enumerate(lines):
+            if line.startswith("GRUB_CMDLINE_LINUX="):
+                cmdline_line_index = i
+                break
+        
+        if cmdline_line_index is None:
+            return jsonify({
+                "success": False,
+                "message": "GRUB_CMDLINE_LINUX not found in GRUB configuration"
+            }), 400
+        
+        # Parse current cmdline
+        cmdline_line = lines[cmdline_line_index]
+        # Extract content between quotes
+        match = re.search(r'GRUB_CMDLINE_LINUX="(.*)"', cmdline_line)
+        if match:
+            current_cmdline = match.group(1)
+        else:
+            # Try without quotes
+            match = re.search(r'GRUB_CMDLINE_LINUX=(.*)', cmdline_line)
+            if match:
+                current_cmdline = match.group(1).strip('"\'')
+            else:
+                current_cmdline = ""
+        
+        # Modify cmdline
+        if enable:
+            # Add IOMMU parameters if not present
+            if iommu_param not in current_cmdline:
+                if current_cmdline:
+                    new_cmdline = f"{current_cmdline} {iommu_params}"
+                else:
+                    new_cmdline = iommu_params
+            else:
+                # Already enabled, just ensure iommu=pt is there
+                if "iommu=pt" not in current_cmdline:
+                    new_cmdline = current_cmdline.replace(iommu_param, iommu_params)
+                else:
+                    new_cmdline = current_cmdline  # Already configured
+        else:
+            # Remove IOMMU parameters
+            new_cmdline = current_cmdline
+            # Remove both intel_iommu=on and amd_iommu=on
+            new_cmdline = re.sub(r'\b(intel_iommu|amd_iommu)=on\b', '', new_cmdline)
+            new_cmdline = re.sub(r'\biommu=pt\b', '', new_cmdline)
+            new_cmdline = re.sub(r'\s+', ' ', new_cmdline).strip()
+        
+        # Update the line
+        lines[cmdline_line_index] = f'GRUB_CMDLINE_LINUX="{new_cmdline}"'
+        
+        # Write back to file
+        try:
+            # Create backup
+            backup_file = f"{grub_file}.backup.{int(time.time())}"
+            subprocess.run(["cp", grub_file, backup_file], check=True)
+            
+            # Write new content
+            with open(grub_file, "w") as f:
+                f.write('\n'.join(lines))
+            
+            # Update GRUB
+            result = subprocess.run(
+                ["update-grub"],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            
+            if result.returncode != 0:
+                # Restore backup on failure
+                subprocess.run(["cp", backup_file, grub_file], check=True)
+                return jsonify({
+                    "success": False,
+                    "message": f"Failed to update GRUB: {result.stderr}"
+                }), 500
+            
+            # Reboot if requested
+            if reboot and enable:
+                # Schedule reboot in 10 seconds
+                subprocess.Popen(["sh", "-c", "sleep 10 && reboot"], 
+                              stdout=subprocess.DEVNULL, 
+                              stderr=subprocess.DEVNULL)
+                return jsonify({
+                    "success": True,
+                    "message": f"IOMMU configured successfully. Server will reboot in 10 seconds.",
+                    "backup_file": backup_file
+                }), 200
+            else:
+                return jsonify({
+                    "success": True,
+                    "message": f"IOMMU configuration updated. Reboot required to apply changes.",
+                    "backup_file": backup_file
+                }), 200
+                
+        except Exception as e:
+            # Try to restore backup
+            try:
+                if 'backup_file' in locals():
+                    subprocess.run(["cp", backup_file, grub_file], check=True)
+            except Exception:
+                pass
+            
+            return jsonify({
+                "success": False,
+                "message": f"Failed to write GRUB configuration: {str(e)}"
+            }), 500
+        
+    except Exception as e:
+        logging.error(f"[DPDK IOMMU CONFIG] Error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
 # ---- Explicit entry point used by 'ostg-server' ----
 def main(argv=None):
     import argparse, os
@@ -11350,6 +12701,33 @@ def main(argv=None):
     parser.add_argument("--host", default=os.environ.get("HOST", "0.0.0.0"))
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "5051")))
     args = parser.parse_args(argv)
+    
+    # Cleanup stale streams on startup (after reboot, no streams are actually running)
+    try:
+        running_streams = stream_db.get_all_streams(status="Running")
+        if running_streams:
+            logging.info(f"[STARTUP CLEANUP] Found {len(running_streams)} stream(s) marked as 'Running' in database - marking as 'Stopped' (server was rebooted)")
+            for stream in running_streams:
+                stream_id = stream.get("stream_id")
+                if stream_id:
+                    try:
+                        stream_db.stop_stream(stream_id)
+                        logging.info(f"[STARTUP CLEANUP] Marked stream {stream_id} ({stream.get('stream_name', 'Unknown')}) as Stopped")
+                    except Exception as e:
+                        logging.warning(f"[STARTUP CLEANUP] Failed to mark stream {stream_id} as Stopped: {e}")
+            logging.info(f"[STARTUP CLEANUP] Cleanup completed - all stale streams marked as Stopped")
+        else:
+            logging.info("[STARTUP CLEANUP] No stale streams found in database")
+        
+        # Also clean up old stopped streams on startup (older than 24 hours)
+        try:
+            deleted = stream_db.cleanup_old_stopped_streams(hours=24)
+            if deleted > 0:
+                logging.info(f"[STARTUP CLEANUP] Cleaned up {deleted} old stopped stream(s) from database")
+        except Exception as cleanup_error:
+            logging.warning(f"[STARTUP CLEANUP] Failed to cleanup old stopped streams: {cleanup_error}")
+    except Exception as e:
+        logging.error(f"[STARTUP CLEANUP] Error cleaning up stale streams: {e}")
     
     # Start BGP monitoring
     try:
@@ -11432,6 +12810,20 @@ def main(argv=None):
                             logging.info(f"[STREAM POLL] Marked stream {stream_id} as Stopped (not in tracker)")
                         except Exception as stop_error:
                             logging.debug(f"[STREAM POLL] Failed to stop stream {stream_id}: {stop_error}")
+                    
+                    # Periodically clean up old stopped streams (every 10 polling cycles = ~20 seconds)
+                    # This prevents database from accumulating too many old streams
+                    if not hasattr(_poll_stream_statistics, "_cleanup_counter"):
+                        _poll_stream_statistics._cleanup_counter = 0
+                    _poll_stream_statistics._cleanup_counter += 1
+                    if _poll_stream_statistics._cleanup_counter >= 10:  # Every ~20 seconds
+                        _poll_stream_statistics._cleanup_counter = 0
+                        try:
+                            deleted = stream_db.cleanup_old_stopped_streams(hours=24)  # Keep stopped streams for 24 hours
+                            if deleted > 0:
+                                logging.info(f"[STREAM POLL] Cleaned up {deleted} old stopped stream(s)")
+                        except Exception as cleanup_error:
+                            logging.debug(f"[STREAM POLL] Error cleaning up old streams: {cleanup_error}")
                 except Exception as check_error:
                     logging.debug(f"[STREAM POLL] Error checking stopped streams: {check_error}")
                     
@@ -11446,6 +12838,3215 @@ def main(argv=None):
         logging.info("[STREAM POLL] Stream statistics polling thread started")
     except Exception as e:
         logging.error(f"[STREAM POLL] Failed to start stream statistics polling: {e}")
+    
+    # Global AI settings storage (can be set via API from client)
+    # Load from persisted file if it exists
+    ai_settings = {
+        "openai_api_key": os.environ.get("OPENAI_API_KEY"),
+        "openai_api_base": os.environ.get("OPENAI_API_BASE")
+    }
+    
+    # Try to load persisted settings from file
+    settings_file = "/opt/OSTG/.ostg_ai_server_settings.env"
+    if os.path.exists(settings_file):
+        try:
+            with open(settings_file, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#'):
+                        continue
+                    if line.startswith('export OPENAI_API_KEY='):
+                        # Extract value between single quotes, handling escaped quotes
+                        # Format: export OPENAI_API_KEY='value'
+                        match = re.match(r"export OPENAI_API_KEY='(.+)'$", line)
+                        if match:
+                            value = match.group(1).replace("'\"'\"'", "'")  # Unescape quotes
+                            ai_settings["openai_api_key"] = value
+                            os.environ["OPENAI_API_KEY"] = value
+                    elif line.startswith('export OPENAI_API_BASE='):
+                        match = re.match(r"export OPENAI_API_BASE='(.+)'$", line)
+                        if match:
+                            value = match.group(1).replace("'\"'\"'", "'")  # Unescape quotes
+                            ai_settings["openai_api_base"] = value
+                            os.environ["OPENAI_API_BASE"] = value
+            if ai_settings.get("openai_api_key") or ai_settings.get("openai_api_base"):
+                logging.info("[AI SETTINGS] Loaded persisted settings from file")
+        except Exception as e:
+            logging.warning(f"[AI SETTINGS] Could not load persisted settings: {e}")
+    
+    def get_ai_api_key():
+        """Get OpenAI API key from settings or environment, reload from file if needed"""
+        key = ai_settings.get("openai_api_key") or os.environ.get("OPENAI_API_KEY")
+        
+        # If not found, try reloading from file
+        if not key:
+            settings_file = "/opt/OSTG/.ostg_ai_server_settings.env"
+            if os.path.exists(settings_file):
+                try:
+                    with open(settings_file, 'r') as f:
+                        for line in f:
+                            line = line.strip()
+                            if line.startswith('export OPENAI_API_KEY='):
+                                match = re.match(r"export OPENAI_API_KEY='(.+)'$", line)
+                                if match:
+                                    key = match.group(1).replace("'\"'\"'", "'")
+                                    ai_settings["openai_api_key"] = key
+                                    os.environ["OPENAI_API_KEY"] = key
+                                    logging.info("[AI SETTINGS] Reloaded API key from file")
+                                    break
+                except Exception as e:
+                    logging.warning(f"[AI SETTINGS] Could not reload API key from file: {e}")
+        
+        # Debug logging (warn only once per process to avoid log spam)
+        if key:
+            logging.debug(f"[AI SETTINGS] API key found: length={len(key)}, source={'ai_settings' if ai_settings.get('openai_api_key') else 'environment'}")
+        else:
+            if not getattr(get_ai_api_key, '_warned', False):
+                logging.warning("[AI SETTINGS] API key not found. Cloud AI features will be disabled. Set OPENAI_API_KEY or configure via client Settings. Local Ollama can still be used.")
+                get_ai_api_key._warned = True
+        
+        return key
+    
+    def get_ai_api_base():
+        """Get OpenAI API base URL from settings or environment, reload from file if needed"""
+        base = ai_settings.get("openai_api_base") or os.environ.get("OPENAI_API_BASE")
+        
+        # If not found, try reloading from file
+        if not base:
+            settings_file = "/opt/OSTG/.ostg_ai_server_settings.env"
+            if os.path.exists(settings_file):
+                try:
+                    with open(settings_file, 'r') as f:
+                        for line in f:
+                            line = line.strip()
+                            if line.startswith('export OPENAI_API_BASE='):
+                                match = re.match(r"export OPENAI_API_BASE='(.+)'$", line)
+                                if match:
+                                    base = match.group(1).replace("'\"'\"'", "'")
+                                    ai_settings["openai_api_base"] = base
+                                    os.environ["OPENAI_API_BASE"] = base
+                                    logging.info("[AI SETTINGS] Reloaded API base from file")
+                                    break
+                except Exception as e:
+                    logging.warning(f"[AI SETTINGS] Could not reload API base from file: {e}")
+        
+        return base
+    
+    # AI Settings API Endpoints
+    @app.route("/api/ai/settings", methods=["GET"])
+    def get_ai_settings():
+        """Get current AI settings (without exposing sensitive keys)"""
+        try:
+            return jsonify({
+                "use_ai_api": bool(get_ai_api_key()),
+                "has_api_key": bool(get_ai_api_key()),
+                "has_api_base": bool(get_ai_api_base()),
+                "api_base": get_ai_api_base() if get_ai_api_base() else None
+            }), 200
+        except Exception as e:
+            logging.error(f"[AI SETTINGS] Failed to get settings: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/settings", methods=["POST"])
+    def set_ai_settings():
+        """Set AI settings from client and persist to file"""
+        try:
+            data = request.get_json()
+            
+            # Update settings
+            if "openai_api_key" in data:
+                ai_settings["openai_api_key"] = data.get("openai_api_key", "").strip()
+                if ai_settings["openai_api_key"]:
+                    # Also set environment variable for modules that check it directly
+                    os.environ["OPENAI_API_KEY"] = ai_settings["openai_api_key"]
+                    logging.info("[AI SETTINGS] API key updated from client")
+                else:
+                    # Clear from environment if empty
+                    if "OPENAI_API_KEY" in os.environ:
+                        del os.environ["OPENAI_API_KEY"]
+                    logging.info("[AI SETTINGS] API key cleared")
+            
+            if "openai_api_base" in data:
+                ai_settings["openai_api_base"] = data.get("openai_api_base", "").strip()
+                if ai_settings["openai_api_base"]:
+                    # Also set environment variable for modules that check it directly
+                    os.environ["OPENAI_API_BASE"] = ai_settings["openai_api_base"]
+                    logging.info(f"[AI SETTINGS] API base URL updated: {ai_settings['openai_api_base']}")
+                else:
+                    # Clear from environment if empty
+                    if "OPENAI_API_BASE" in os.environ:
+                        del os.environ["OPENAI_API_BASE"]
+                    logging.info("[AI SETTINGS] API base URL cleared")
+            
+            # Persist settings to file for server restarts
+            try:
+                # Ensure directory exists
+                settings_dir = "/opt/OSTG"
+                if not os.path.exists(settings_dir):
+                    os.makedirs(settings_dir, mode=0o755)
+                
+                # Save to .env file (can be sourced)
+                settings_file = "/opt/OSTG/.ostg_ai_server_settings.env"
+                with open(settings_file, 'w') as f:
+                    if ai_settings.get("openai_api_key"):
+                        # Escape single quotes in the value
+                        api_key_escaped = ai_settings['openai_api_key'].replace("'", "'\"'\"'")
+                        f.write(f"export OPENAI_API_KEY='{api_key_escaped}'\n")
+                    if ai_settings.get("openai_api_base"):
+                        api_base_escaped = ai_settings['openai_api_base'].replace("'", "'\"'\"'")
+                        f.write(f"export OPENAI_API_BASE='{api_base_escaped}'\n")
+                
+                # Make file readable only by owner
+                os.chmod(settings_file, 0o600)
+                
+                # Also create a shell script that can be sourced
+                script_file = "/opt/OSTG/source_ai_settings.sh"
+                with open(script_file, 'w') as f:
+                    f.write("#!/bin/bash\n")
+                    f.write("# OSTG AI Settings - Source this file to export AI environment variables\n")
+                    f.write(f"# Generated automatically by OSTG server\n\n")
+                    if ai_settings.get("openai_api_key"):
+                        api_key_escaped = ai_settings['openai_api_key'].replace("'", "'\"'\"'")
+                        f.write(f"export OPENAI_API_KEY='{api_key_escaped}'\n")
+                    if ai_settings.get("openai_api_base"):
+                        api_base_escaped = ai_settings['openai_api_base'].replace("'", "'\"'\"'")
+                        f.write(f"export OPENAI_API_BASE='{api_base_escaped}'\n")
+                
+                os.chmod(script_file, 0o755)
+                
+                logging.info(f"[AI SETTINGS] Settings persisted to {settings_file} and {script_file}")
+                logging.info("[AI SETTINGS] To use these settings, run: source /opt/OSTG/.ostg_ai_server_settings.env")
+            except Exception as e:
+                logging.warning(f"[AI SETTINGS] Could not persist settings to file: {e}")
+            
+            return jsonify({
+                "status": "success",
+                "message": "AI settings updated successfully and persisted to server",
+                "has_api_key": bool(ai_settings.get("openai_api_key")),
+                "has_api_base": bool(ai_settings.get("openai_api_base"))
+            }), 200
+        except Exception as e:
+            logging.error(f"[AI SETTINGS] Failed to set settings: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    # Initialize AI Troubleshooting (lazy import to avoid errors if not installed)
+    try:
+        from utils.ai import NetworkTroubleshooter, ConfigKnowledgeBase
+        ai_kb = ConfigKnowledgeBase(db_path="/opt/OSTG/ai_knowledge_base.db")
+        ai_troubleshooter = NetworkTroubleshooter(
+            knowledge_base=ai_kb,
+            use_ai_api=bool(get_ai_api_key()),
+            api_key=get_ai_api_key()
+        )
+        logging.info("[AI] Network troubleshooting AI initialized")
+    except ImportError:
+        logging.warning("[AI] AI modules not available. Install with: pip install scikit-learn pandas numpy")
+        ai_troubleshooter = None
+        ai_kb = None
+    except Exception as e:
+        logging.warning(f"[AI] Failed to initialize AI troubleshooting: {e}")
+        ai_troubleshooter = None
+        ai_kb = None
+    
+    # AI Troubleshooting API Endpoints
+    @app.route("/api/ai/troubleshoot", methods=["POST"])
+    def ai_troubleshoot():
+        """AI-powered network troubleshooting"""
+        if not ai_troubleshooter:
+            return jsonify({"error": "AI troubleshooting not available. Install dependencies: pip install scikit-learn pandas numpy"}), 503
+        
+        try:
+            data = request.get_json()
+            device_id = data.get("device_id")
+            symptoms = data.get("symptoms", {})
+            current_config = data.get("current_config")
+            
+            if not device_id:
+                return jsonify({"error": "device_id is required"}), 400
+            
+            diagnosis = ai_troubleshooter.diagnose(device_id, symptoms, current_config)
+            return jsonify(diagnosis), 200
+        except Exception as e:
+            logging.error(f"[AI TROUBLESHOOT] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/add-config", methods=["POST"])
+    def ai_add_config():
+        """Add device configuration to AI knowledge base"""
+        if not ai_kb:
+            return jsonify({"error": "AI knowledge base not available"}), 503
+        
+        try:
+            data = request.get_json()
+            device_id = data.get("device_id")
+            device_name = data.get("device_name", device_id)
+            config_text = data.get("config_text")
+            vendor = data.get("vendor")
+            
+            if not device_id or not config_text:
+                return jsonify({"error": "device_id and config_text are required"}), 400
+            
+            ai_kb.add_config(device_id, device_name, config_text, vendor)
+            return jsonify({"status": "success", "message": f"Configuration added for device {device_id}"}), 200
+        except Exception as e:
+            logging.error(f"[AI ADD CONFIG] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/train-case", methods=["POST"])
+    def ai_train_case():
+        """Train AI from a resolved troubleshooting case"""
+        if not ai_troubleshooter:
+            return jsonify({"error": "AI troubleshooting not available"}), 503
+        
+        try:
+            data = request.get_json()
+            device_id = data.get("device_id")
+            symptoms = data.get("symptoms", {})
+            solution = data.get("solution")
+            
+            if not device_id or not solution:
+                return jsonify({"error": "device_id and solution are required"}), 400
+            
+            ai_troubleshooter.train_from_resolved_case(device_id, symptoms, solution)
+            return jsonify({"status": "success", "message": "Case trained successfully"}), 200
+        except Exception as e:
+            logging.error(f"[AI TRAIN] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/import-ostg-configs", methods=["POST"])
+    def ai_import_ostg_configs():
+        """Import all device configurations from OSTG database"""
+        if not ai_kb:
+            return jsonify({"error": "AI knowledge base not available"}), 503
+        
+        try:
+            from utils.ai import import_device_configs_from_ostg
+            import_device_configs_from_ostg(knowledge_base=ai_kb)
+            return jsonify({"status": "success", "message": "Imported all OSTG device configurations"}), 200
+        except Exception as e:
+            logging.error(f"[AI IMPORT] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/suggest-config-fix", methods=["POST"])
+    def ai_suggest_config_fix():
+        """Suggest configuration fixes for an issue"""
+        if not ai_troubleshooter:
+            return jsonify({"error": "AI troubleshooting not available"}), 503
+        
+        try:
+            data = request.get_json()
+            device_id = data.get("device_id")
+            issue = data.get("issue")
+            current_config = data.get("current_config")
+            
+            if not device_id or not issue:
+                return jsonify({"error": "device_id and issue are required"}), 400
+            
+            # Get config from knowledge base if not provided
+            if not current_config:
+                current_config = ai_kb.get_device_config(device_id) if ai_kb else None
+            
+            if not current_config:
+                return jsonify({"error": "Device configuration not found"}), 404
+            
+            suggestions = ai_troubleshooter.suggest_config_fix(device_id, issue, current_config)
+            return jsonify(suggestions), 200
+        except Exception as e:
+            logging.error(f"[AI CONFIG FIX] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    # External Device Management API Endpoints
+    @app.route("/api/device/add-external", methods=["POST"])
+    def add_external_device():
+        """Add external network device"""
+        try:
+            from utils.device_database import DeviceDatabase
+            from utils.external_device_manager import ExternalDeviceManager
+            
+            data = request.get_json()
+            if not data:
+                return jsonify({"error": "Invalid JSON payload"}), 400
+            
+            device_db = DeviceDatabase()
+            ext_manager = ExternalDeviceManager()
+            
+            # Generate device ID if not provided
+            device_id = data.get("device_id") or str(uuid.uuid4())
+            device_name = data.get("device_name")
+            device_type = data.get("device_type", "other")
+            connection_method = data.get("connection_method", "ssh")
+            connection_host = data.get("connection_host")
+            connection_port = data.get("connection_port", 22)
+            connection_username = data.get("connection_username")
+            connection_info = data.get("connection_info", {})
+            
+            if not device_name or not connection_host:
+                return jsonify({"error": "device_name and connection_host are required"}), 400
+            
+            # Build device data
+            device_data = {
+                "device_id": device_id,
+                "device_name": device_name,
+                "device_type": device_type,  # juniper, cisco, etc. (not frr_container)
+                "interface": data.get("interface", ""),  # Optional for external devices
+                "connection_method": connection_method,
+                "connection_host": connection_host,
+                "connection_port": connection_port,
+                "connection_username": connection_username,
+                "connection_info": json.dumps(connection_info) if isinstance(connection_info, dict) else connection_info,
+                "ipv4_address": data.get("ipv4_address"),
+                "ipv6_address": data.get("ipv6_address"),
+                "status": "Stopped"
+            }
+            
+            # Add to database
+            success = device_db.add_device(device_data)
+            if not success:
+                return jsonify({"error": "Failed to add device to database"}), 500
+            
+            # Register with external device manager
+            ext_manager.add_device(device_id, device_type, connection_info)
+            
+            # Add to AI knowledge base if config available
+            if ai_kb and connection_info:
+                try:
+                    # Try to get device config
+                    config_result = ext_manager.get_configuration(device_id)
+                    if config_result:
+                        ai_kb.add_config(device_id, device_name, config_result, vendor=device_type)
+                except Exception as e:
+                    logging.warning(f"Failed to add external device config to knowledge base: {e}")
+            
+            return jsonify({
+                "status": "success",
+                "device_id": device_id,
+                "message": f"External device {device_name} added successfully"
+            }), 200
+        
+        except Exception as e:
+            logging.error(f"[ADD EXTERNAL DEVICE] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/device/external/status/<device_id>", methods=["GET"])
+    def get_external_device_status(device_id):
+        """Get status of external device"""
+        try:
+            from utils.external_device_manager import ExternalDeviceManager
+            
+            ext_manager = ExternalDeviceManager()
+            status = ext_manager.get_device_status(device_id)
+            
+            return jsonify({
+                "status": "success",
+                "device_id": device_id,
+                "device_status": status
+            }), 200
+        except Exception as e:
+            logging.error(f"[EXTERNAL DEVICE STATUS] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/device/external/execute", methods=["POST"])
+    def execute_external_device_command():
+        """Execute command on external device"""
+        try:
+            from utils.external_device_manager import ExternalDeviceManager
+            
+            data = request.get_json()
+            device_id = data.get("device_id")
+            command = data.get("command")
+            connection_method = data.get("connection_method")
+            
+            if not device_id or not command:
+                return jsonify({"error": "device_id and command are required"}), 400
+            
+            ext_manager = ExternalDeviceManager()
+            result = ext_manager.execute_command(device_id, command, connection_method)
+            
+            return jsonify({
+                "status": "success",
+                "device_id": device_id,
+                "result": result
+            }), 200
+        except Exception as e:
+            logging.error(f"[EXTERNAL DEVICE EXECUTE] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/device/external/config/<device_id>", methods=["GET"])
+    def get_external_device_config(device_id):
+        """Get configuration from external device"""
+        try:
+            from utils.external_device_manager import ExternalDeviceManager
+            
+            ext_manager = ExternalDeviceManager()
+            config = ext_manager.get_configuration(device_id)
+            
+            return jsonify({
+                "status": "success",
+                "device_id": device_id,
+                "config": config
+            }), 200
+        except Exception as e:
+            logging.error(f"[EXTERNAL DEVICE CONFIG] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    # AI Device Discovery
+    @app.route("/api/ai/device/discover", methods=["POST"])
+    def ai_discover_devices():
+        """AI-powered device discovery on network"""
+        try:
+            data = request.get_json()
+            subnet = data.get("subnet", "192.168.1.0/24")
+            
+            # Simple network scan (can be enhanced with nmap, etc.)
+            import subprocess
+            import ipaddress
+            
+            discovered_devices = []
+            
+            # Parse subnet
+            try:
+                network = ipaddress.ip_network(subnet, strict=False)
+                # Limit to /24 for safety
+                if network.prefixlen < 24:
+                    return jsonify({
+                        "error": "Subnet too large. Please use /24 or smaller."
+                    }), 400
+                
+                # Scan first 10 hosts (for demo - use nmap for production)
+                hosts = list(network.hosts())[:10]
+                
+                for host in hosts:
+                    # Ping test
+                    result = subprocess.run(
+                        ["ping", "-c", "1", "-W", "1", str(host)],
+                        capture_output=True,
+                        timeout=2
+                    )
+                    
+                    if result.returncode == 0:
+                        # Device is reachable
+                        device_info = {
+                            "ip": str(host),
+                            "reachable": True,
+                            "vendor": "Unknown",
+                            "type": "Unknown",
+                            "suggested_method": "ssh"
+                        }
+                        
+                        # Try to detect device type (simplified)
+                        # In production, use nmap, SNMP, banner grabbing, etc.
+                        try:
+                            # Check SSH port
+                            ssh_result = subprocess.run(
+                                ["nc", "-z", "-w", "1", str(host), "22"],
+                                capture_output=True,
+                                timeout=2
+                            )
+                            if ssh_result.returncode == 0:
+                                device_info["suggested_method"] = "ssh"
+                                device_info["ports"] = ["22"]
+                        except Exception:
+                            pass
+                        
+                        discovered_devices.append(device_info)
+                
+                return jsonify({
+                    "status": "success",
+                    "subnet": subnet,
+                    "devices": discovered_devices,
+                    "count": len(discovered_devices)
+                }), 200
+            
+            except ValueError:
+                return jsonify({"error": "Invalid subnet format"}), 400
+        
+        except Exception as e:
+            logging.error(f"[AI DEVICE DISCOVERY] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    # Initialize Test Framework
+    try:
+        from utils.ai import NetworkTestFramework, TestReportStorage, UserTestCaseManager
+        test_framework = NetworkTestFramework(
+            knowledge_base=ai_kb,
+            use_ai_api=bool(get_ai_api_key()),
+            api_key=get_ai_api_key()
+        )
+        test_report_storage = TestReportStorage()
+        test_case_manager = UserTestCaseManager()
+        
+        # Load user-defined test cases
+        user_test_cases = test_case_manager.get_all_test_cases()
+        for tc in user_test_cases:
+            test_framework.add_test_case(tc)
+        
+        logging.info(f"[AI TEST] Test framework initialized with {len(user_test_cases)} user-defined test cases")
+    except ImportError:
+        logging.warning("[AI TEST] Test framework not available")
+        test_framework = None
+        test_report_storage = None
+        test_case_manager = None
+    except Exception as e:
+        logging.warning(f"[AI TEST] Failed to initialize test framework: {e}")
+        test_framework = None
+        test_report_storage = None
+        test_case_manager = None
+    
+    # Test Framework API Endpoints
+    @app.route("/api/ai/test/suggest", methods=["POST"])
+    def ai_suggest_tests():
+        """Suggest test cases for a device"""
+        if not test_framework:
+            return jsonify({"error": "Test framework not available"}), 503
+        
+        try:
+            data = request.get_json()
+            device_id = data.get("device_id")
+            use_ai = data.get("use_ai", True)
+            
+            if not device_id:
+                return jsonify({"error": "device_id is required"}), 400
+            
+            suggestions = test_framework.suggest_test_cases(device_id, use_ai=use_ai)
+            
+            return jsonify({
+                "suggestions": [{
+                    "test_id": tc.test_id,
+                    "name": tc.name,
+                    "description": tc.description,
+                    "category": tc.category,
+                    "severity": tc.severity
+                } for tc in suggestions]
+            }), 200
+        except Exception as e:
+            logging.error(f"[AI TEST SUGGEST] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/test/run", methods=["POST"])
+    def ai_run_tests():
+        """Run a test suite"""
+        if not test_framework:
+            return jsonify({"error": "Test framework not available"}), 503
+        
+        try:
+            data = request.get_json()
+            device_id = data.get("device_id")
+            device_name = data.get("device_name", "")
+            test_ids = data.get("test_ids", [])
+            suite_name = data.get("suite_name", "Test Suite")
+            
+            if not device_id or not test_ids:
+                return jsonify({"error": "device_id and test_ids are required"}), 400
+            
+            report = test_framework.run_test_suite(test_ids, device_id, device_name, suite_name)
+            
+            # Save report
+            if test_report_storage:
+                test_report_storage.save_report(report)
+            
+            # Convert report to dict for JSON response
+            from dataclasses import asdict
+            report_dict = asdict(report)
+            
+            return jsonify(report_dict), 200
+        except Exception as e:
+            logging.error(f"[AI TEST RUN] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/test/report/<report_id>", methods=["GET"])
+    def ai_get_report(report_id):
+        """Get test report by ID"""
+        if not test_report_storage:
+            return jsonify({"error": "Test report storage not available"}), 503
+        
+        try:
+            format_type = request.args.get("format", "json")
+            report = test_report_storage.get_report(report_id)
+            
+            if not report:
+                return jsonify({"error": "Report not found"}), 404
+            
+            if format_type == "html":
+                report_obj = test_framework._generate_html_report(report) if test_framework else None
+                if report_obj:
+                    return report_obj, 200, {"Content-Type": "text/html"}
+            
+            return jsonify(report), 200
+        except Exception as e:
+            logging.error(f"[AI TEST REPORT] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/test/reports/<device_id>", methods=["GET"])
+    def ai_get_device_reports(device_id):
+        """Get test reports for a device"""
+        if not test_report_storage:
+            return jsonify({"error": "Test report storage not available"}), 503
+        
+        try:
+            limit = int(request.args.get("limit", 10))
+            reports = test_report_storage.get_reports_for_device(device_id, limit)
+            return jsonify({"reports": reports}), 200
+        except Exception as e:
+            logging.error(f"[AI TEST REPORTS] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/test/case/create", methods=["POST"])
+    def ai_create_test_case():
+        """Create a user-defined test case"""
+        if not test_case_manager:
+            return jsonify({"error": "Test case manager not available"}), 503
+        
+        try:
+            data = request.get_json()
+            from utils.ai import TestCase
+            
+            test_case = TestCase(
+                test_id=data.get("test_id"),
+                name=data.get("name"),
+                description=data.get("description", ""),
+                category=data.get("category", "custom"),
+                test_function=data.get("test_function"),
+                parameters=data.get("parameters", {}),
+                expected_result=data.get("expected_result"),
+                severity=data.get("severity", "medium"),
+                vendor_specific=data.get("vendor_specific"),
+                prerequisites=data.get("prerequisites", [])
+            )
+            
+            if test_case_manager.create_test_case(test_case):
+                # Add to framework
+                if test_framework:
+                    test_framework.add_test_case(test_case)
+                
+                return jsonify({"status": "success", "test_id": test_case.test_id}), 200
+            else:
+                return jsonify({"error": "Failed to create test case"}), 500
+        except Exception as e:
+            logging.error(f"[AI TEST CASE CREATE] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/test/case/list", methods=["GET"])
+    def ai_list_test_cases():
+        """List all test cases (built-in and user-defined)"""
+        if not test_framework:
+            return jsonify({"error": "Test framework not available"}), 503
+        
+        try:
+            test_cases = []
+            for test_id, test_case in test_framework.test_cases.items():
+                test_cases.append({
+                    "test_id": test_case.test_id,
+                    "name": test_case.name,
+                    "description": test_case.description,
+                    "category": test_case.category,
+                    "severity": test_case.severity,
+                    "vendor_specific": test_case.vendor_specific
+                })
+            
+            return jsonify({"test_cases": test_cases}), 200
+        except Exception as e:
+            logging.error(f"[AI TEST CASE LIST] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/test/case/<test_id>", methods=["GET", "PUT", "DELETE"])
+    def ai_manage_test_case(test_id):
+        """Get, update, or delete a test case"""
+        if not test_case_manager:
+            return jsonify({"error": "Test case manager not available"}), 503
+        
+        try:
+            if request.method == "GET":
+                test_case = test_case_manager.get_test_case(test_id)
+                if not test_case:
+                    return jsonify({"error": "Test case not found"}), 404
+                
+                from dataclasses import asdict
+                return jsonify(asdict(test_case)), 200
+            
+            elif request.method == "PUT":
+                data = request.get_json()
+                from utils.ai import TestCase
+                
+                test_case = TestCase(
+                    test_id=test_id,
+                    name=data.get("name"),
+                    description=data.get("description", ""),
+                    category=data.get("category", "custom"),
+                    test_function=data.get("test_function"),
+                    parameters=data.get("parameters", {}),
+                    expected_result=data.get("expected_result"),
+                    severity=data.get("severity", "medium"),
+                    vendor_specific=data.get("vendor_specific"),
+                    prerequisites=data.get("prerequisites", [])
+                )
+                
+                if test_case_manager.update_test_case(test_id, test_case):
+                    if test_framework:
+                        test_framework.add_test_case(test_case)
+                    return jsonify({"status": "success"}), 200
+                else:
+                    return jsonify({"error": "Failed to update test case"}), 500
+            
+            elif request.method == "DELETE":
+                if test_case_manager.delete_test_case(test_id):
+                    return jsonify({"status": "success"}), 200
+                else:
+                    return jsonify({"error": "Failed to delete test case"}), 500
+        
+        except Exception as e:
+            logging.error(f"[AI TEST CASE MANAGE] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    # Initialize Pytest Generator and Runner
+    try:
+        from utils.ai import PytestGenerator, PytestRunner, CodeGenerator
+        pytest_generator = PytestGenerator(
+            use_ai_api=bool(get_ai_api_key()),
+            api_key=get_ai_api_key()
+        )
+        pytest_runner = PytestRunner()
+        code_generator = CodeGenerator(
+            use_ai_api=bool(get_ai_api_key()),
+            api_key=get_ai_api_key()
+        )
+        logging.info("[AI PYTEST] Pytest generator and runner initialized")
+    except ImportError:
+        logging.warning("[AI PYTEST] Pytest modules not available")
+        pytest_generator = None
+        pytest_runner = None
+        code_generator = None
+    except Exception as e:
+        logging.warning(f"[AI PYTEST] Failed to initialize pytest modules: {e}")
+        pytest_generator = None
+        pytest_runner = None
+        code_generator = None
+    
+    # Pytest and Code Generation API Endpoints
+    @app.route("/api/ai/pytest/generate", methods=["POST"])
+    def ai_generate_pytest():
+        """Generate pytest script"""
+        if not pytest_generator:
+            return jsonify({"error": "Pytest generator not available"}), 503
+        
+        try:
+            data = request.get_json()
+            test_requirements = data.get("test_requirements", {})
+            device_config = data.get("device_config")
+            save_file = data.get("save_file", False)
+            file_path = data.get("file_path")
+            
+            script = pytest_generator.generate_pytest_script(test_requirements, device_config)
+            
+            # Save if requested
+            if save_file:
+                if not file_path:
+                    file_path = f"/opt/OSTG/pytest_scripts/test_{int(time.time())}.py"
+                pytest_generator.save_pytest_script(script, file_path)
+            
+            return jsonify({
+                "script": script,
+                "file_path": file_path if save_file else None
+            }), 200
+        except Exception as e:
+            logging.error(f"[AI PYTEST GENERATE] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/pytest/run", methods=["POST"])
+    def ai_run_pytest():
+        """Run pytest script"""
+        if not pytest_runner:
+            return jsonify({"error": "Pytest runner not available"}), 503
+        
+        try:
+            data = request.get_json()
+            script_content = data.get("script_content")
+            script_name = data.get("script_name")
+            script_path = data.get("script_path")
+            additional_args = data.get("additional_args", [])
+            
+            if script_path:
+                # Run from file
+                result = pytest_runner.run_pytest_file(script_path, additional_args)
+            elif script_content:
+                # Run from content
+                result = pytest_runner.run_pytest_script(script_content, script_name, additional_args)
+            else:
+                return jsonify({"error": "script_content or script_path is required"}), 400
+            
+            return jsonify(result), 200
+        except Exception as e:
+            logging.error(f"[AI PYTEST RUN] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/pytest/scripts", methods=["GET"])
+    def ai_list_pytest_scripts():
+        """List pytest scripts"""
+        if not pytest_runner:
+            return jsonify({"error": "Pytest runner not available"}), 503
+        
+        try:
+            scripts = pytest_runner.list_scripts()
+            return jsonify({"scripts": scripts}), 200
+        except Exception as e:
+            logging.error(f"[AI PYTEST LIST] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/pytest/script/<script_name>", methods=["GET", "DELETE"])
+    def ai_manage_pytest_script(script_name):
+        """Get or delete pytest script"""
+        if not pytest_runner:
+            return jsonify({"error": "Pytest runner not available"}), 503
+        
+        try:
+            if request.method == "GET":
+                content = pytest_runner.get_script_content(script_name)
+                if content is None:
+                    return jsonify({"error": "Script not found"}), 404
+                return jsonify({"script": content, "name": script_name}), 200
+            
+            elif request.method == "DELETE":
+                if pytest_runner.delete_script(script_name):
+                    return jsonify({"status": "success"}), 200
+                else:
+                    return jsonify({"error": "Script not found"}), 404
+        except Exception as e:
+            logging.error(f"[AI PYTEST MANAGE] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    # Code Generation API Endpoints (Cursor.ai-like)
+    @app.route("/api/ai/code/generate", methods=["POST"])
+    def ai_generate_code():
+        """Generate code from prompt using LLM"""
+        try:
+            from utils.ai.local_ai_engine import LocalAIEngine
+            from utils.ai.advanced_code_generator import AdvancedCodeGenerator
+            import os
+            
+            data = request.get_json()
+            prompt = data.get("prompt")
+            language = data.get("language", "python")
+            code_type = data.get("code_type", "").lower()  # Function, Class, Script, Configuration, Template
+            context = data.get("context")
+            requirements = data.get("requirements")
+            
+            if not prompt:
+                return jsonify({"error": "prompt is required"}), 400
+            
+            # Use AdvancedCodeGenerator with LLM support (better timeout handling)
+            advanced_generator = AdvancedCodeGenerator(
+                use_ai_api=bool(os.environ.get("OPENAI_API_KEY")),
+                api_key=os.environ.get("OPENAI_API_KEY"),
+                use_local_llm=True
+            )
+            
+            # Build enhanced prompt for code generation with code_type guidance
+            code_type_instructions = {
+                "function": "Generate a standalone function (not a class method). Include function definition with parameters, docstring, and return statement.",
+                "class": "Generate a complete class with __init__ method, class methods, and proper structure. Include docstrings and type hints where appropriate.",
+                "script": "Generate an executable script with if __name__ == '__main__' block. Include command-line argument handling if needed.",
+                "configuration": "Generate configuration code (e.g., YAML/JSON structure, config parser, settings management).",
+                "template": "Generate a template or boilerplate code structure that can be customized."
+            }
+            
+            enhanced_prompt = f"Generate {language} code: {prompt}"
+            
+            # Add code type specific instructions
+            if code_type and code_type in code_type_instructions:
+                enhanced_prompt += f"\n\nCode Structure: {code_type_instructions[code_type]}"
+                logging.info(f"[AI CODE GENERATE] Using code_type: {code_type}")
+            
+            if context:
+                enhanced_prompt += f"\n\nContext: {json.dumps(context, indent=2)}"
+            if requirements:
+                enhanced_prompt += f"\n\nRequirements:\n" + "\n".join(f"- {r}" for r in requirements)
+            enhanced_prompt += "\n\nMake it complete, production-ready with proper imports, error handling, and documentation."
+            
+            # Try LLM first using LocalAIEngine (has better timeout handling)
+            try:
+                engine = LocalAIEngine(model_dir="/opt/OSTG/ai_models")
+                llm_response = engine._try_llm_response(enhanced_prompt, context)
+                if llm_response and len(llm_response.strip()) > 50 and "TODO: Implement" not in llm_response:
+                    logging.info(f"[AI CODE GENERATE] LLM generated code: {len(llm_response)} chars (type: {code_type})")
+                    return jsonify({"code": llm_response}), 200
+            except Exception as e:
+                logging.debug(f"[AI CODE GENERATE] LLM failed, using generator: {e}")
+            
+            # Fallback to AdvancedCodeGenerator (also tries LLM internally)
+            # Pass code_type as part of context if available
+            enhanced_context = context or {}
+            if code_type:
+                enhanced_context["code_type"] = code_type
+            code = advanced_generator.generate_code(language, prompt, enhanced_context, requirements)
+            
+            # If still template, try one more time with LocalAIEngine chat
+            if code and ("TODO: Implement" in code or len(code.strip()) < 100):
+                try:
+                    engine = LocalAIEngine(model_dir="/opt/OSTG/ai_models")
+                    chat_prompt = f"Generate {language} code for: {prompt}"
+                    if code_type and code_type in code_type_instructions:
+                        chat_prompt += f"\n\n{code_type_instructions[code_type]}"
+                    chat_response = engine.chat(chat_prompt, enhanced_context)
+                    if chat_response and len(chat_response.strip()) > 50 and "TODO: Implement" not in chat_response:
+                        logging.info(f"[AI CODE GENERATE] Chat generated code: {len(chat_response)} chars (type: {code_type})")
+                        return jsonify({"code": chat_response}), 200
+                except Exception as e:
+                    logging.debug(f"[AI CODE GENERATE] Chat fallback failed: {e}")
+            
+            return jsonify({"code": code}), 200
+        except Exception as e:
+            logging.error(f"[AI CODE GENERATE] Error: {e}", exc_info=True)
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/code/refactor", methods=["POST"])
+    def ai_refactor_code():
+        """Refactor code"""
+        if not code_generator:
+            return jsonify({"error": "Code generator not available"}), 503
+        
+        try:
+            data = request.get_json()
+            code = data.get("code")
+            refactoring_request = data.get("refactoring_request", "Improve code quality")
+            
+            if not code:
+                return jsonify({"error": "code is required"}), 400
+            
+            refactored = code_generator.refactor_code(code, refactoring_request)
+            return jsonify({"code": refactored}), 200
+        except Exception as e:
+            logging.error(f"[AI CODE REFACTOR] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/code/fix", methods=["POST"])
+    def ai_fix_code():
+        """Fix code errors"""
+        if not code_generator:
+            return jsonify({"error": "Code generator not available"}), 503
+        
+        try:
+            data = request.get_json()
+            code = data.get("code")
+            error_message = data.get("error_message")
+            
+            if not code:
+                return jsonify({"error": "code is required"}), 400
+            
+            fixed = code_generator.fix_code(code, error_message)
+            return jsonify({"code": fixed}), 200
+        except Exception as e:
+            logging.error(f"[AI CODE FIX] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/code/explain", methods=["POST"])
+    def ai_explain_code():
+        """Explain code"""
+        if not code_generator:
+            return jsonify({"error": "Code generator not available"}), 503
+        
+        try:
+            data = request.get_json()
+            code = data.get("code")
+            
+            if not code:
+                return jsonify({"error": "code is required"}), 400
+            
+            explanation = code_generator.explain_code(code)
+            return jsonify({"explanation": explanation}), 200
+        except Exception as e:
+            logging.error(f"[AI CODE EXPLAIN] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/code/optimize", methods=["POST"])
+    def ai_optimize_code():
+        """Optimize code"""
+        if not code_generator:
+            return jsonify({"error": "Code generator not available"}), 503
+        
+        try:
+            data = request.get_json()
+            code = data.get("code")
+            
+            if not code:
+                return jsonify({"error": "code is required"}), 400
+            
+            optimized = code_generator.optimize_code(code)
+            return jsonify({"code": optimized}), 200
+        except Exception as e:
+            logging.error(f"[AI CODE OPTIMIZE] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/code/test", methods=["POST"])
+    def ai_generate_test():
+        """Generate test script for code"""
+        if not code_generator:
+            return jsonify({"error": "Code generator not available"}), 503
+        
+        try:
+            data = request.get_json()
+            code = data.get("code")
+            test_type = data.get("test_type", "pytest")
+            
+            if not code:
+                return jsonify({"error": "code is required"}), 400
+            
+            test_script = code_generator.generate_test_script(code, test_type)
+            return jsonify({"test_script": test_script}), 200
+        except Exception as e:
+            logging.error(f"[AI CODE TEST] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/code/documentation", methods=["POST"])
+    def ai_code_documentation():
+        """Generate documentation for code"""
+        if not code_generator:
+            return jsonify({"error": "Code generator not available"}), 503
+        
+        try:
+            data = request.get_json()
+            code = data.get("code")
+            doc_format = data.get("format", "markdown")
+            
+            if not code:
+                return jsonify({"error": "code is required"}), 400
+            
+            documentation = code_generator.generate_documentation(code, doc_format)
+            return jsonify({"documentation": documentation}), 200
+        except Exception as e:
+            logging.error(f"[AI CODE DOC] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    # Advanced Code Generator Endpoints
+    @app.route("/api/ai/code/generate-advanced", methods=["POST"])
+    def ai_generate_advanced_code():
+        """Generate code in multiple languages with advanced features"""
+        try:
+            from utils.ai.advanced_code_generator import AdvancedCodeGenerator
+            import os
+            
+            advanced_generator = AdvancedCodeGenerator(
+                use_ai_api=bool(os.environ.get("OPENAI_API_KEY")),
+                api_key=os.environ.get("OPENAI_API_KEY"),
+                use_local_llm=True
+            )
+            
+            data = request.get_json()
+            language = data.get("language", "python")
+            prompt = data.get("prompt")
+            context = data.get("context")
+            requirements = data.get("requirements")
+            
+            if not prompt:
+                return jsonify({"error": "prompt is required"}), 400
+            
+            code = advanced_generator.generate_code(language, prompt, context, requirements)
+            return jsonify({"code": code, "language": language}), 200
+        except Exception as e:
+            logging.error(f"[AI ADVANCED CODE] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/code/generate-network-script", methods=["POST"])
+    def ai_generate_network_script():
+        """Generate network automation script"""
+        try:
+            from utils.ai.advanced_code_generator import AdvancedCodeGenerator
+            import os
+            
+            advanced_generator = AdvancedCodeGenerator(
+                use_ai_api=bool(os.environ.get("OPENAI_API_KEY")),
+                api_key=os.environ.get("OPENAI_API_KEY"),
+                use_local_llm=True
+            )
+            
+            data = request.get_json()
+            requirements = data.get("requirements", {})
+            
+            if not requirements.get("description"):
+                return jsonify({"error": "requirements.description is required"}), 400
+            
+            script = advanced_generator.generate_network_script(requirements)
+            return jsonify({"script": script, "library": requirements.get("library", "netmiko")}), 200
+        except Exception as e:
+            logging.error(f"[AI NETWORK SCRIPT] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/code/generate-config", methods=["POST"])
+    def ai_generate_config():
+        """Generate device configuration template"""
+        try:
+            from utils.ai.advanced_code_generator import AdvancedCodeGenerator
+            import os
+            
+            advanced_generator = AdvancedCodeGenerator(
+                use_ai_api=bool(os.environ.get("OPENAI_API_KEY")),
+                api_key=os.environ.get("OPENAI_API_KEY"),
+                use_local_llm=True
+            )
+            
+            data = request.get_json()
+            vendor = data.get("vendor", "juniper")
+            requirements = data.get("requirements", {})
+            
+            if vendor not in ["juniper", "cisco", "arista", "nokia"]:
+                return jsonify({"error": f"Unsupported vendor: {vendor}"}), 400
+            
+            config = advanced_generator.generate_config_template(vendor, requirements)
+            return jsonify({"config": config, "vendor": vendor}), 200
+        except Exception as e:
+            logging.error(f"[AI CONFIG GENERATE] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    # Code Analyzer Endpoints
+    @app.route("/api/ai/code/analyze", methods=["POST"])
+    def ai_analyze_code():
+        """Analyze code quality and security"""
+        try:
+            from utils.ai.code_analyzer import CodeAnalyzer
+            import os
+            
+            analyzer = CodeAnalyzer(
+                use_ai_api=bool(os.environ.get("OPENAI_API_KEY")),
+                api_key=os.environ.get("OPENAI_API_KEY")
+            )
+            
+            data = request.get_json()
+            code = data.get("code")
+            language = data.get("language", "python")
+            
+            if not code:
+                return jsonify({"error": "code is required"}), 400
+            
+            analysis = analyzer.analyze(code, language)
+            return jsonify(analysis), 200
+        except Exception as e:
+            logging.error(f"[AI CODE ANALYZE] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/code/security-scan", methods=["POST"])
+    def ai_security_scan():
+        """Scan code for security vulnerabilities"""
+        try:
+            from utils.ai.code_analyzer import CodeAnalyzer
+            import os
+            
+            analyzer = CodeAnalyzer(
+                use_ai_api=bool(os.environ.get("OPENAI_API_KEY")),
+                api_key=os.environ.get("OPENAI_API_KEY")
+            )
+            
+            data = request.get_json()
+            code = data.get("code")
+            language = data.get("language", "python")
+            
+            if not code:
+                return jsonify({"error": "code is required"}), 400
+            
+            vulnerabilities = analyzer.detect_vulnerabilities(code, language)
+            return jsonify({"vulnerabilities": vulnerabilities}), 200
+        except Exception as e:
+            logging.error(f"[AI SECURITY SCAN] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/code/optimize-suggestions", methods=["POST"])
+    def ai_optimize_suggestions():
+        """Get performance optimization suggestions"""
+        try:
+            from utils.ai.code_analyzer import CodeAnalyzer
+            import os
+            
+            analyzer = CodeAnalyzer(
+                use_ai_api=bool(os.environ.get("OPENAI_API_KEY")),
+                api_key=os.environ.get("OPENAI_API_KEY")
+            )
+            
+            data = request.get_json()
+            code = data.get("code")
+            language = data.get("language", "python")
+            
+            if not code:
+                return jsonify({"error": "code is required"}), 400
+            
+            suggestions = analyzer.suggest_optimizations(code, language)
+            return jsonify({"suggestions": suggestions}), 200
+        except Exception as e:
+            logging.error(f"[AI OPTIMIZE SUGGESTIONS] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    # Unified Troubleshooter Endpoints
+    @app.route("/api/ai/troubleshoot/unified", methods=["POST"])
+    def ai_troubleshoot_unified():
+        """Unified troubleshooting for all domains"""
+        try:
+            from utils.ai.unified_troubleshooter import UnifiedTroubleshooter
+            import os
+            
+            troubleshooter = UnifiedTroubleshooter(
+                use_ai_api=bool(os.environ.get("OPENAI_API_KEY")),
+                api_key=os.environ.get("OPENAI_API_KEY")
+            )
+            
+            data = request.get_json()
+            domain = data.get("domain", "network")
+            issue = data.get("issue", {})
+            
+            if domain not in ["network", "code", "system", "integration"]:
+                return jsonify({"error": f"Unsupported domain: {domain}"}), 400
+            
+            diagnosis = troubleshooter.troubleshoot(domain, issue)
+            return jsonify(diagnosis), 200
+        except Exception as e:
+            logging.error(f"[AI TROUBLESHOOT UNIFIED] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/troubleshoot/code", methods=["POST"])
+    def ai_troubleshoot_code():
+        """Troubleshoot code issues"""
+        try:
+            from utils.ai.unified_troubleshooter import UnifiedTroubleshooter
+            import os
+            
+            troubleshooter = UnifiedTroubleshooter(
+                use_ai_api=bool(os.environ.get("OPENAI_API_KEY")),
+                api_key=os.environ.get("OPENAI_API_KEY")
+            )
+            
+            data = request.get_json()
+            issue = data.get("issue", {})
+            
+            diagnosis = troubleshooter.troubleshoot("code", issue)
+            return jsonify(diagnosis), 200
+        except Exception as e:
+            logging.error(f"[AI TROUBLESHOOT CODE] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/troubleshoot/system", methods=["POST"])
+    def ai_troubleshoot_system():
+        """Troubleshoot system issues"""
+        try:
+            from utils.ai.unified_troubleshooter import UnifiedTroubleshooter
+            import os
+            
+            troubleshooter = UnifiedTroubleshooter(
+                use_ai_api=bool(os.environ.get("OPENAI_API_KEY")),
+                api_key=os.environ.get("OPENAI_API_KEY")
+            )
+            
+            data = request.get_json()
+            issue = data.get("issue", {})
+            
+            diagnosis = troubleshooter.troubleshoot("system", issue)
+            return jsonify(diagnosis), 200
+        except Exception as e:
+            logging.error(f"[AI TROUBLESHOOT SYSTEM] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/troubleshoot/integration", methods=["POST"])
+    def ai_troubleshoot_integration():
+        """Troubleshoot integration issues"""
+        try:
+            from utils.ai.unified_troubleshooter import UnifiedTroubleshooter
+            import os
+            
+            troubleshooter = UnifiedTroubleshooter(
+                use_ai_api=bool(os.environ.get("OPENAI_API_KEY")),
+                api_key=os.environ.get("OPENAI_API_KEY")
+            )
+            
+            data = request.get_json()
+            issue = data.get("issue", {})
+            
+            diagnosis = troubleshooter.troubleshoot("integration", issue)
+            return jsonify(diagnosis), 200
+        except Exception as e:
+            logging.error(f"[AI TROUBLESHOOT INTEGRATION] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    def ai_generate_documentation():
+        """Generate documentation for code"""
+        if not code_generator:
+            return jsonify({"error": "Code generator not available"}), 503
+        
+        try:
+            data = request.get_json()
+            code = data.get("code")
+            doc_format = data.get("format", "markdown")
+            
+            if not code:
+                return jsonify({"error": "code is required"}), 400
+            
+            documentation = code_generator.generate_documentation(code, doc_format)
+            return jsonify({"documentation": documentation}), 200
+        except Exception as e:
+            logging.error(f"[AI CODE DOC] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    # Comprehensive Test Framework Endpoints
+    @app.route("/api/ai/test/generate-unit", methods=["POST"])
+    def ai_generate_unit_tests():
+        """Generate unit tests from code"""
+        try:
+            from utils.ai.comprehensive_test_framework import ComprehensiveTestFramework
+            import os
+            
+            framework = ComprehensiveTestFramework(
+                use_ai_api=bool(os.environ.get("OPENAI_API_KEY")),
+                api_key=os.environ.get("OPENAI_API_KEY")
+            )
+            
+            data = request.get_json()
+            code = data.get("code")
+            test_framework = data.get("framework", "pytest")
+            
+            if not code:
+                return jsonify({"error": "code is required"}), 400
+            
+            tests = framework.generate_unit_tests(code, test_framework)
+            return jsonify({"tests": tests, "count": len(tests)}), 200
+        except Exception as e:
+            logging.error(f"[AI UNIT TESTS] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/test/generate-integration", methods=["POST"])
+    def ai_generate_integration_tests():
+        """Generate integration tests"""
+        try:
+            from utils.ai.comprehensive_test_framework import ComprehensiveTestFramework
+            import os
+            
+            framework = ComprehensiveTestFramework(
+                use_ai_api=bool(os.environ.get("OPENAI_API_KEY")),
+                api_key=os.environ.get("OPENAI_API_KEY")
+            )
+            
+            data = request.get_json()
+            components = data.get("components", [])
+            
+            if not components:
+                return jsonify({"error": "components is required"}), 400
+            
+            tests = framework.generate_integration_tests(components)
+            return jsonify({"tests": tests, "count": len(tests)}), 200
+        except Exception as e:
+            logging.error(f"[AI INTEGRATION TESTS] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/test/generate-suite", methods=["POST"])
+    def ai_generate_test_suite():
+        """Generate complete test suite"""
+        try:
+            from utils.ai.comprehensive_test_framework import ComprehensiveTestFramework
+            import os
+            
+            framework = ComprehensiveTestFramework(
+                use_ai_api=bool(os.environ.get("OPENAI_API_KEY")),
+                api_key=os.environ.get("OPENAI_API_KEY")
+            )
+            
+            data = request.get_json()
+            code = data.get("code")
+            test_type = data.get("test_type", "unit")
+            options = data.get("options", {})
+            
+            if not code and test_type == "unit":
+                return jsonify({"error": "code is required for unit tests"}), 400
+            
+            suite = framework.generate_test_suite(code, test_type, options)
+            return jsonify({"suite": suite, "type": test_type}), 200
+        except Exception as e:
+            logging.error(f"[AI TEST SUITE] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/test/coverage", methods=["POST"])
+    def ai_analyze_test_coverage():
+        """Analyze test coverage"""
+        try:
+            from utils.ai.comprehensive_test_framework import ComprehensiveTestFramework
+            import os
+            
+            framework = ComprehensiveTestFramework(
+                use_ai_api=bool(os.environ.get("OPENAI_API_KEY")),
+                api_key=os.environ.get("OPENAI_API_KEY")
+            )
+            
+            data = request.get_json()
+            code = data.get("code")
+            tests = data.get("tests", [])
+            
+            if not code:
+                return jsonify({"error": "code is required"}), 400
+            
+            coverage = framework.analyze_test_coverage(code, tests)
+            return jsonify(coverage), 200
+        except Exception as e:
+            logging.error(f"[AI TEST COVERAGE] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    # Intelligent Device Manager Endpoints
+    @app.route("/api/ai/device/provision", methods=["POST"])
+    def ai_provision_device():
+        """Automated device provisioning"""
+        try:
+            from utils.ai.intelligent_device_manager import IntelligentDeviceManager
+            import os
+            
+            manager = IntelligentDeviceManager(
+                use_ai_api=bool(os.environ.get("OPENAI_API_KEY")),
+                api_key=os.environ.get("OPENAI_API_KEY")
+            )
+            
+            data = request.get_json()
+            device_spec = data.get("device_spec", {})
+            
+            if not device_spec:
+                return jsonify({"error": "device_spec is required"}), 400
+            
+            result = manager.provision_device(device_spec)
+            return jsonify(result), 200
+        except Exception as e:
+            logging.error(f"[AI DEVICE PROVISION] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/device/manage-config", methods=["POST"])
+    def ai_manage_device_config():
+        """Intelligent configuration management"""
+        try:
+            from utils.ai.intelligent_device_manager import IntelligentDeviceManager
+            import os
+            
+            manager = IntelligentDeviceManager(
+                use_ai_api=bool(os.environ.get("OPENAI_API_KEY")),
+                api_key=os.environ.get("OPENAI_API_KEY")
+            )
+            
+            data = request.get_json()
+            device_id = data.get("device_id")
+            config_changes = data.get("config_changes", {})
+            
+            if not device_id:
+                return jsonify({"error": "device_id is required"}), 400
+            
+            result = manager.manage_configuration(device_id, config_changes)
+            return jsonify(result), 200
+        except Exception as e:
+            logging.error(f"[AI DEVICE CONFIG] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/device/health/<device_id>", methods=["GET"])
+    def ai_device_health(device_id):
+        """Get device health status"""
+        try:
+            from utils.ai.intelligent_device_manager import IntelligentDeviceManager
+            import os
+            
+            manager = IntelligentDeviceManager(
+                use_ai_api=bool(os.environ.get("OPENAI_API_KEY")),
+                api_key=os.environ.get("OPENAI_API_KEY")
+            )
+            
+            health = manager.monitor_health(device_id)
+            return jsonify(health), 200
+        except Exception as e:
+            logging.error(f"[AI DEVICE HEALTH] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/device/auto-remediate", methods=["POST"])
+    def ai_auto_remediate_device():
+        """Automated issue remediation"""
+        try:
+            from utils.ai.intelligent_device_manager import IntelligentDeviceManager
+            import os
+            
+            manager = IntelligentDeviceManager(
+                use_ai_api=bool(os.environ.get("OPENAI_API_KEY")),
+                api_key=os.environ.get("OPENAI_API_KEY")
+            )
+            
+            data = request.get_json()
+            device_id = data.get("device_id")
+            issue = data.get("issue", {})
+            
+            if not device_id:
+                return jsonify({"error": "device_id is required"}), 400
+            
+            result = manager.auto_remediate(device_id, issue)
+            return jsonify(result), 200
+        except Exception as e:
+            logging.error(f"[AI AUTO REMEDIATE] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    # Proactive AI Assistant Endpoints
+    @app.route("/api/ai/assistant/suggest", methods=["POST"])
+    def ai_assistant_suggest():
+        """Get proactive suggestions"""
+        try:
+            from utils.ai.proactive_assistant import ProactiveAIAssistant
+            import os
+            
+            assistant = ProactiveAIAssistant(
+                use_ai_api=bool(os.environ.get("OPENAI_API_KEY")),
+                api_key=os.environ.get("OPENAI_API_KEY")
+            )
+            
+            data = request.get_json()
+            context = data.get("context", {})
+            
+            suggestions = assistant.suggest_actions(context)
+            return jsonify({"suggestions": suggestions}), 200
+        except Exception as e:
+            logging.error(f"[AI ASSISTANT SUGGEST] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/assistant/learn", methods=["POST"])
+    def ai_assistant_learn():
+        """Learn from user actions"""
+        try:
+            from utils.ai.proactive_assistant import ProactiveAIAssistant
+            import os
+            
+            assistant = ProactiveAIAssistant(
+                use_ai_api=bool(os.environ.get("OPENAI_API_KEY")),
+                api_key=os.environ.get("OPENAI_API_KEY")
+            )
+            
+            data = request.get_json()
+            user_id = data.get("user_id", "default")
+            actions = data.get("actions", [])
+            
+            assistant.learn_preferences(user_id, actions)
+            return jsonify({"status": "success"}), 200
+        except Exception as e:
+            logging.error(f"[AI ASSISTANT LEARN] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/assistant/personalize/<user_id>", methods=["GET"])
+    def ai_assistant_personalize(user_id):
+        """Get personalized experience settings"""
+        try:
+            from utils.ai.proactive_assistant import ProactiveAIAssistant
+            import os
+            
+            assistant = ProactiveAIAssistant(
+                use_ai_api=bool(os.environ.get("OPENAI_API_KEY")),
+                api_key=os.environ.get("OPENAI_API_KEY")
+            )
+            
+            personalization = assistant.personalize_experience(user_id)
+            return jsonify(personalization), 200
+        except Exception as e:
+            logging.error(f"[AI ASSISTANT PERSONALIZE] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/assistant/contextual-help", methods=["POST"])
+    def ai_assistant_contextual_help():
+        """Get contextual help"""
+        try:
+            from utils.ai.proactive_assistant import ProactiveAIAssistant
+            import os
+            
+            assistant = ProactiveAIAssistant(
+                use_ai_api=bool(os.environ.get("OPENAI_API_KEY")),
+                api_key=os.environ.get("OPENAI_API_KEY")
+            )
+            
+            data = request.get_json()
+            context = data.get("context", {})
+            
+            help_info = assistant.get_contextual_help(context)
+            return jsonify(help_info), 200
+        except Exception as e:
+            logging.error(f"[AI ASSISTANT HELP] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    # Network Analytics Endpoints
+    # AI Chat Endpoint
+    
+    def fix_formatting_with_llm(text, llm_client=None):
+        """
+        Use local LLM to fix formatting issues in AI responses.
+        This is a two-pass approach: first generate content, then fix formatting.
+        
+        Args:
+            text: Text that needs formatting fixes
+            llm_client: Optional LocalLLMClient instance. If None, will create one.
+            
+        Returns:
+            Text with improved formatting
+        """
+        if not text or not isinstance(text, str) or len(text.strip()) < 20:
+            return text
+        
+        try:
+            # Only use LLM formatting if client is provided (to avoid extra overhead)
+            if llm_client is None:
+                return text  # Skip LLM formatting if no client provided
+            
+            formatting_prompt = f"""Fix the markdown formatting in the following text. 
+Ensure proper markdown syntax:
+- Convert ** Text**: patterns to ### Text (headings)
+- Convert ** Text** patterns at start of lines to ## Text (headings)
+- Convert single-word ** Logging** or ** Logging to ### Logging (headings)
+- Use ## for main headings, ### for subheadings
+- Use **bold** only for emphasis, not headings
+- Fix concatenated title words: "SummaryTo" -> "Summary\\n\\nTo"
+- Fix list formatting: ensure proper spacing after dashes/bullets
+- Remove excessive separators (----, ====)
+- Fix numbered list formatting (1.**Text** -> 1. **Text**)
+- Remove trailing ** markers
+- Fix patterns like "Text:**" -> "Text:"
+- Ensure proper spacing in contractions (We'll not We' ll)
+- Add proper line breaks after title words (Summary, Plan, Guide, etc.)
+
+Here's the text to fix:
+
+{text}
+
+Return only the corrected text, without any explanation."""
+            
+            formatted_text = llm_client.generate(formatting_prompt, system_prompt="You are a markdown formatting expert. Fix formatting issues while preserving all content and meaning.")
+            
+            if formatted_text and len(formatted_text.strip()) > len(text) * 0.5:  # Ensure we got a reasonable response
+                logging.debug(f"[AI CHAT] LLM-based formatting fix applied: {len(text)} -> {len(formatted_text)} chars")
+                return formatted_text
+            else:
+                logging.debug("[AI CHAT] LLM formatting fix returned insufficient result, using original")
+                return text
+        except Exception as e:
+            logging.warning(f"[AI CHAT] LLM-based formatting fix failed: {e}, using original text")
+            return text
+    
+    def normalize_ai_response(text):
+        """
+        Normalize AI response text to fix concatenated words and spacing issues.
+        This fixes common issues where LLMs generate text without proper spacing.
+        
+        Args:
+            text: Raw AI response text
+            
+        Returns:
+            Normalized text with proper spacing
+        """
+        if not text or not isinstance(text, str):
+            return text
+        
+        import re
+        import json
+        import time
+        
+        # #region agent log
+        try:
+            with open('/Users/surajsharma/OSTG/.cursor/debug.log', 'a') as f:
+                log_entry = {
+                    "id": f"log_{int(time.time() * 1000)}_normalize_before",
+                    "timestamp": int(time.time() * 1000),
+                    "location": "run_tgen_server.py:normalize_ai_response",
+                    "message": "Before normalization",
+                    "data": {
+                        "text_length": len(text),
+                        "text_preview": text[:100] if len(text) > 100 else text,
+                        "has_concatenated": bool(re.search(r'([a-z])([A-Z])', text) or re.search(r'(\w+\')([a-z]{2,})', text))
+                    },
+                    "sessionId": "debug-session",
+                    "runId": "run1",
+                    "hypothesisId": "A"
+                }
+                f.write(json.dumps(log_entry) + "\n")
+        except Exception:
+            pass
+        # #endregion
+        
+        # Comprehensive fix for concatenated words - based on actual observed issues
+        common_fixes = [
+            # Common two-word combinations observed in responses
+            (r'\b(something)(specific)\b', r'\1 \2'),
+            (r'\b(you)(\'d)(like)\b', r'\1\2 \3'),
+            (r'\b(with)(related)\b', r'\1 \2'),
+            (r'\b(like)(humans)\b', r'\1 \2'),
+            (r'\b(but)(I)(\'m)\b', r'\1 \2\3'),
+            (r'\b(with)(any)\b', r'\1 \2'),
+            (r'\b(there)(\'s)(any)(thing)\b', r'\1\2 \3\4'),
+            (r'\b(feel)(free)\b', r'\1 \2'),
+            (r'\b(help)(you)\b', r'\1 \2'),
+            (r'\b(help)(with)\b', r'\1 \2'),
+            (r'\b(assist)(with)\b', r'\1 \2'),
+            (r'\b(here)(to)\b', r'\1 \2'),
+            (r'\b(or)(emotions)\b', r'\1 \2'),
+            (r'\b(a)(specific)\b', r'\1 \2'),
+            (r'\b(can)(I)\b', r'\1 \2'),
+            (r'\b(do)(you)\b', r'\1 \2'),
+            (r'\b(are)(you)\b', r'\1 \2'),
+            (r'\b(is)(there)\b', r'\1 \2'),
+            (r'\b(what)(can)\b', r'\1 \2'),
+            (r'\b(how)(can)\b', r'\1 \2'),
+            (r'\b(would)(you)\b', r'\1 \2'),
+            (r'\b(could)(you)\b', r'\1 \2'),
+            (r'\b(should)(you)\b', r'\1 \2'),
+            (r'\b(will)(you)\b', r'\1 \2'),
+            (r'\b(looking)(for)\b', r'\1 \2'),
+            (r'\b(need)(help)\b', r'\1 \2'),
+            (r'\b(need)(assistance)\b', r'\1 \2'),
+            (r'\b(need)(to)\b', r'\1 \2'),
+            (r'\b(want)(to)\b', r'\1 \2'),
+            (r'\b(try)(to)\b', r'\1 \2'),
+            (r'\b(going)(to)\b', r'\1 \2'),
+            (r'\b(able)(to)\b', r'\1 \2'),
+            (r'\b(ready)(to)\b', r'\1 \2'),
+            (r'\b(happy)(to)\b', r'\1 \2'),
+            (r'\b(glad)(to)\b', r'\1 \2'),
+            (r'\b(sure)(to)\b', r'\1 \2'),
+            (r'\b(sure)(I)\b', r'\1 \2'),
+            # Fix contractions followed by words (but preserve valid contractions like 'll, 're, 've, 'd, 'm, 's, 't, n't)
+            # Only fix if the apostrophe is NOT followed by a valid contraction suffix
+            (r'(\w+\')(?!ll|re|ve|d|m|s|t|n\'t\b)([a-z]{2,})', r'\1 \2'),  # "there'sanything" -> "there's anything" but "We'll" stays "We'll"
+        ]
+        
+        normalized = text
+        for pattern, replacement in common_fixes:
+            normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
+        
+        # Fix lowercase-to-uppercase transitions (word boundaries)
+        # But avoid breaking contractions and code blocks
+        # Skip if inside code blocks (between ``` markers)
+        code_block_pattern = r'```.*?```'
+        code_blocks = re.finditer(code_block_pattern, normalized, flags=re.DOTALL)
+        non_code_parts = []
+        last_end = 0
+        for match in code_blocks:
+            # Process text before code block
+            before_code = normalized[last_end:match.start()]
+            before_code = re.sub(r'([a-z])([A-Z])', r'\1 \2', before_code)
+            non_code_parts.append(before_code)
+            # Keep code block as-is
+            non_code_parts.append(match.group(0))
+            last_end = match.end()
+        # Process remaining text after last code block
+        after_code = normalized[last_end:]
+        after_code = re.sub(r'([a-z])([A-Z])', r'\1 \2', after_code)
+        non_code_parts.append(after_code)
+        normalized = ''.join(non_code_parts)
+        
+        # Fix any spacing issues around apostrophes in contractions that might have been broken
+        # Restore common contractions that might have been incorrectly split
+        contraction_fixes = [
+            (r"(\w+)\s+'\s*(ll|re|ve|d|m|s|t)\b", r"\1'\2"),  # "We ' ll" -> "We'll"
+            (r"(\w+)\s+n\s+'\s+t\b", r"\1n't"),  # "do n ' t" -> "don't"
+            (r"(\w+)\s+'\s+(ll|re|ve|d|m|s|t)\b", r"\1'\2"),  # "there ' s" -> "there's" (but only if valid contraction)
+        ]
+        for pattern, replacement in contraction_fixes:
+            normalized = re.sub(pattern, replacement, normalized, flags=re.IGNORECASE)
+        
+        # Clean up markdown formatting issues
+        # Fix spacing around markdown syntax (but preserve code blocks)
+        code_block_pattern = r'```.*?```'
+        
+        # Fix spacing around bold markers
+        code_blocks = list(re.finditer(code_block_pattern, normalized, flags=re.DOTALL))
+        if code_blocks:
+            parts = []
+            last_end = 0
+            for match in code_blocks:
+                # Process text before code block
+                before_code = normalized[last_end:match.start()]
+                before_code = re.sub(r'\s+(\*\*)', r'\1', before_code)  # Remove space before **
+                before_code = re.sub(r'(\*\*)\s+', r'\1', before_code)  # Remove space after **
+                parts.append(before_code)
+                # Keep code block as-is
+                parts.append(match.group(0))
+                last_end = match.end()
+            # Process remaining text after last code block
+            after_code = normalized[last_end:]
+            after_code = re.sub(r'\s+(\*\*)', r'\1', after_code)  # Remove space before **
+            after_code = re.sub(r'(\*\*)\s+', r'\1', after_code)  # Remove space after **
+            parts.append(after_code)
+            normalized = ''.join(parts)
+        else:
+            # No code blocks, process entire text
+            normalized = re.sub(r'\s+(\*\*)', r'\1', normalized)
+            normalized = re.sub(r'(\*\*)\s+', r'\1', normalized)
+        
+        # Fix double spaces (but preserve code blocks)
+        code_blocks = list(re.finditer(code_block_pattern, normalized, flags=re.DOTALL))
+        if code_blocks:
+            parts = []
+            last_end = 0
+            for match in code_blocks:
+                before_code = normalized[last_end:match.start()]
+                before_code = re.sub(r' {2,}', ' ', before_code)  # Collapse multiple spaces
+                parts.append(before_code)
+                parts.append(match.group(0))
+                last_end = match.end()
+            after_code = normalized[last_end:]
+            after_code = re.sub(r' {2,}', ' ', after_code)
+            parts.append(after_code)
+            normalized = ''.join(parts)
+        else:
+            normalized = re.sub(r' {2,}', ' ', normalized)
+        
+        # Fix markdown formatting issues
+        # Fix triple asterisks (***) to double (**) - but preserve code blocks
+        code_blocks = list(re.finditer(code_block_pattern, normalized, flags=re.DOTALL))
+        if code_blocks:
+            parts = []
+            last_end = 0
+            for match in code_blocks:
+                before_code = normalized[last_end:match.start()]
+                # Fix triple asterisks to double (but not if it's part of a valid pattern)
+                before_code = re.sub(r'\*\*\*([^*]+?)\*\*\*', r'**\1**', before_code)  # ***text*** -> **text**
+                before_code = re.sub(r'\*\*\*([^*\n]+)', r'**\1**', before_code)  # ***text -> **text**
+                parts.append(before_code)
+                parts.append(match.group(0))
+                last_end = match.end()
+            after_code = normalized[last_end:]
+            after_code = re.sub(r'\*\*\*([^*]+?)\*\*\*', r'**\1**', after_code)
+            after_code = re.sub(r'\*\*\*([^*\n]+)', r'**\1**', after_code)
+            parts.append(after_code)
+            normalized = ''.join(parts)
+        else:
+            normalized = re.sub(r'\*\*\*([^*]+?)\*\*\*', r'**\1**', normalized)
+            normalized = re.sub(r'\*\*\*([^*\n]+)', r'**\1**', normalized)
+        
+        # Remove excessive separator lines (more than 3 dashes/equals in a row)
+        # But preserve code blocks
+        code_blocks = list(re.finditer(code_block_pattern, normalized, flags=re.DOTALL))
+        if code_blocks:
+            parts = []
+            last_end = 0
+            for match in code_blocks:
+                before_code = normalized[last_end:match.start()]
+                # Remove lines with only dashes/equals (more than 3)
+                before_code = re.sub(r'^[-=]{4,}$', '', before_code, flags=re.MULTILINE)
+                # Remove separator lines that appear at the start of a section (standalone)
+                before_code = re.sub(r'^[-=]{4,}\s*\n', '', before_code, flags=re.MULTILINE)
+                parts.append(before_code)
+                parts.append(match.group(0))
+                last_end = match.end()
+            after_code = normalized[last_end:]
+            after_code = re.sub(r'^[-=]{4,}$', '', after_code, flags=re.MULTILINE)
+            after_code = re.sub(r'^[-=]{4,}\s*\n', '', after_code, flags=re.MULTILINE)
+            parts.append(after_code)
+            normalized = ''.join(parts)
+        else:
+            normalized = re.sub(r'^[-=]{4,}$', '', normalized, flags=re.MULTILINE)
+            normalized = re.sub(r'^[-=]{4,}\s*\n', '', normalized, flags=re.MULTILINE)
+        
+        # Fix mixed markdown heading formats
+        # Fix patterns like "**Title**================### Subtitle" to proper markdown
+        code_blocks = list(re.finditer(code_block_pattern, normalized, flags=re.DOTALL))
+        if code_blocks:
+            parts = []
+            last_end = 0
+            for match in code_blocks:
+                before_code = normalized[last_end:match.start()]
+                # Fix "**Title**================### Subtitle" -> "## Title\n### Subtitle"
+                before_code = re.sub(r'\*\*([^*]+?)\*\*\s*={3,}\s*###\s*([^\n]+)', r'## \1\n### \2', before_code)
+                # Fix "**Title**================" -> "## Title"
+                before_code = re.sub(r'\*\*([^*]+?)\*\*\s*={3,}', r'## \1', before_code)
+                # Fix "**Title**--------------------" -> "## Title"
+                before_code = re.sub(r'\*\*([^*]+?)\*\*\s*-{3,}', r'## \1', before_code)
+                # Fix "**Title**------------------------" on same line -> "## Title"
+                before_code = re.sub(r'\*\*([^*]+?)\*\*[-=]{4,}', r'## \1', before_code)
+                # Fix separator lines that appear on the line immediately after a heading
+                before_code = re.sub(r'(^##\s+[^\n]+)\n[-=]{4,}\n', r'\1\n', before_code, flags=re.MULTILINE)
+                before_code = re.sub(r'(^###\s+[^\n]+)\n[-=]{4,}\n', r'\1\n', before_code, flags=re.MULTILINE)
+                before_code = re.sub(r'(^\*\*[^*]+\*\*)\n[-=]{4,}\n', r'\1\n', before_code, flags=re.MULTILINE)
+                # Fix text followed by separators on the same line
+                # Pattern 1: Plain text headings (starts with capital letter, looks like a title)
+                before_code = re.sub(r'^([A-Z][A-Za-z0-9\s]{2,50}?)\s*[-=]{4,}\s*\n', r'## \1\n', before_code, flags=re.MULTILINE)
+                # Pattern 2: "** Text**----------------" patterns (with space after **) -> "## Text"
+                before_code = re.sub(r'\*\*\s+([^*]+?)\s*\*\*[-=]{4,}', r'## \1', before_code)
+                before_code = re.sub(r'\*\*\s+([^*]+?)\s*\*\*\s*\n[-=]{4,}\s*\n', r'## \1\n', before_code, flags=re.MULTILINE)
+                # Fix "** Text**" at start of line (likely a heading) -> "## Text"
+                before_code = re.sub(r'^\*\*\s+([^*]+?)\s*\*\*\s*$', r'## \1', before_code, flags=re.MULTILINE)
+                # Fix bold text immediately followed by ###: "**Text###" -> "### Text" and separate the ### part
+                before_code = re.sub(r'\*\*([^*]+?)\*\*\s*###\s*([^\n]+)', r'### \1\n### \2', before_code, flags=re.MULTILINE)
+                # Fix numbered items with bold followed by ###: "1.**Text###" -> "1. ### Text"
+                before_code = re.sub(r'^(\d+\.)\s*\*\*([^*]+?)\*\*\s*###\s*([^\n]+)', r'\1 ### \2\n### \3', before_code, flags=re.MULTILINE)
+                # Fix numbered items with bold: "1.**Text" -> "1. ### Text"
+                before_code = re.sub(r'^(\d+\.)\s*\*\*([^*\n]+?)(?:\*\*|$)', r'\1 ### \2', before_code, flags=re.MULTILINE)
+                # Fix numbered items with text directly attached: "1.Text" -> "1. Text"
+                before_code = re.sub(r'^(\d+\.)([A-Za-z])', r'\1 \2', before_code, flags=re.MULTILINE)
+                # Fix numbered items with trailing dash: "1. Text-" -> "1. Text"
+                before_code = re.sub(r'^(\d+\.\s+[^\n]+?)-$', r'\1', before_code, flags=re.MULTILINE)
+                # Fix numbered items with bold and trailing dash: "1. **Text**-" or "1. ** Text**-" -> "1. Text"
+                before_code = re.sub(r'^(\d+\.)\s*\*\*\s*([^*\n]+?)\s*\*\*-$', r'\1 \2', before_code, flags=re.MULTILINE)
+                # Fix numbered items with bold (no trailing dash): "1. **Text**" or "1. ** Text**" -> "1. Text"
+                before_code = re.sub(r'^(\d+\.)\s*\*\*\s*([^*\n]+?)\s*\*\*\s*$', r'\1 \2', before_code, flags=re.MULTILINE)
+                # Fix "** Test Description:" or "** Verify..." patterns (likely subheadings) -> "### ..."
+                # Match bold text that starts with common action words or descriptive words
+                before_code = re.sub(r'\*\*\s+(Verify|Test|Check|Validate|Confirm|Ensure|Setup|Configure|Execute|Run|Create|Add|Remove|Delete|Update|Modify|Description|Steps|Requirements)\s*:?\s*([^*\n]*?)(?:\s*\*\*|$)', r'### \1\2', before_code, flags=re.IGNORECASE | re.MULTILINE)
+                # Fix "** Verify/Test/Check..." patterns without space after ** (likely subheadings) -> "### ..."
+                before_code = re.sub(r'\*\*([A-Z][a-z]+)\s+(Verify|Test|Check|Validate|Confirm|Ensure|Setup|Configure|Execute|Run|Create|Add|Remove|Delete|Update|Modify)\s+([^*\n]+?)(?:\s*\*\*|$)', r'### \1 \2 \3', before_code, flags=re.IGNORECASE | re.MULTILINE)
+                # Fix remaining "** Text" patterns at start of line -> "### Text"
+                before_code = re.sub(r'^\*\*\s*([A-Z][^*\n]{3,}?)(?:\s*\*\*|$)', r'### \1', before_code, flags=re.MULTILINE)
+                # Fix patterns like "** Text**:" -> "### Text"
+                # This handles cases where bold text ends with colon and should be a heading
+                before_code = re.sub(r'\*\*\s+([A-Z][^*\n]{2,}?)\s*\*\*:', r'### \1', before_code)
+                # Fix single-word headings like "** Logging" -> "### Logging"
+                before_code = re.sub(r'\*\*\s+([A-Z][a-z]+)\s*$', r'### \1', before_code, flags=re.MULTILINE)
+                # Fix patterns like "SummaryTo" -> "Summary\n\nTo" (common title words followed by capitalized word)
+                # Fix both at start of line and in middle of text
+                title_words = r'(Summary|Plan|Guide|Overview|Introduction|Conclusion|Example|Note|Warning|Error)'
+                before_code = re.sub(rf'^({title_words})([A-Z][a-z]+)', r'\1\n\n\2', before_code, flags=re.MULTILINE)
+                # Also fix when title word appears in middle: "Device Log SummaryTo" -> "Device Log Summary\n\nTo"
+                before_code = re.sub(rf'({title_words})([A-Z][a-z]+)', r'\1\n\n\2', before_code)
+                # Fix patterns like "System Logs**" -> "### System Logs" (text followed by ** at end)
+                before_code = re.sub(r'([A-Z][a-zA-Z\s]+)\*\*$', r'### \1', before_code, flags=re.MULTILINE)
+                # Fix patterns like "** Identify Root Cause**" -> "### Identify Root Cause" (looks like heading: multiple words or action words)
+                # Only match if it's 2+ words or starts with action words to avoid breaking valid bold text
+                action_words = r'(Identify|Implement|Monitor|Verify|Test|Check|Validate|Confirm|Ensure|Setup|Configure|Execute|Run|Create|Add|Remove|Delete|Update|Modify)'
+                before_code = re.sub(rf'\*\*\s+({action_words}\s+[^*]+?|\w+\s+\w+[^*]*?)\s*\*\*', r'### \1', before_code, flags=re.IGNORECASE)
+                # Fix concatenated words like "flappingBGP" -> "flapping BGP" (lowercase followed by uppercase)
+                before_code = re.sub(r'([a-z])([A-Z][a-z]+)', r'\1 \2', before_code)
+                # Fix patterns like "Text:**" -> "Text:"
+                before_code = re.sub(r'([A-Za-z0-9]):\*\*', r'\1:', before_code)
+                # Fix patterns where text is followed by newline(s) and colon: "Error Messages\n\n:" -> "**Error Messages:**"
+                before_code = re.sub(r'([A-Z][a-zA-Z\s]+)\n+\s*:\s*', r'**\1**: ', before_code)
+                # Fix patterns where bold text is followed by newline(s) and colon: "** Warning\n\n:" -> "**Warning:**"
+                before_code = re.sub(r'\*\*\s+([^*\n]+?)\s*\*\*\n+\s*:\s*', r'**\1**: ', before_code)
+                # Clean up extra whitespace around colons after bold
+                before_code = re.sub(r'\*\*([^*]+?)\*\*\s+:\s+', r'**\1**: ', before_code)
+                # Fix patterns like "Text*:" -> "**Text**:"
+                before_code = re.sub(r'([A-Z][a-zA-Z\s]+)\*:', r'**\1**:', before_code)
+                # Fix patterns like "*Text**:" -> "**Text**:"
+                before_code = re.sub(r'\*([^*\n]+?)\*\*:', r'**\1**:', before_code)
+                # Fix numbered items with ### immediately after: "2. ### Text" -> "2. Text"
+                before_code = re.sub(r'^(\d+\.)\s*###\s+', r'\1 ', before_code, flags=re.MULTILINE)
+                # Fix patterns like "** Text**:" -> "### Text"
+                # This handles cases where bold text ends with colon and should be a heading
+                before_code = re.sub(r'\*\*\s+([A-Z][^*\n]{2,}?)\s*\*\*:', r'### \1', before_code)
+                # Fix trailing ** at end of lines (stray bold markers)
+                before_code = re.sub(r'([^\*])\*\*\s*$', r'\1', before_code, flags=re.MULTILINE)
+                # Fix "+Result:" patterns -> "**Result:**"
+                before_code = re.sub(r'\+Result:\s*', r'**Result:** ', before_code, flags=re.IGNORECASE)
+                # Fix leading asterisks that should be bullet points: "* text" -> "- text"
+                before_code = re.sub(r'^\*\s+([^\*])', r'- \1', before_code, flags=re.MULTILINE)
+                parts.append(before_code)
+                parts.append(match.group(0))
+                last_end = match.end()
+            after_code = normalized[last_end:]
+            after_code = re.sub(r'\*\*([^*]+?)\*\*\s*={3,}\s*###\s*([^\n]+)', r'## \1\n### \2', after_code)
+            after_code = re.sub(r'\*\*([^*]+?)\*\*\s*={3,}', r'## \1', after_code)
+            after_code = re.sub(r'\*\*([^*]+?)\*\*\s*-{3,}', r'## \1', after_code)
+            parts.append(after_code)
+            normalized = ''.join(parts)
+        else:
+            normalized = re.sub(r'\*\*([^*]+?)\*\*\s*={3,}\s*###\s*([^\n]+)', r'## \1\n### \2', normalized)
+            normalized = re.sub(r'\*\*([^*]+?)\*\*\s*={3,}', r'## \1', normalized)
+            normalized = re.sub(r'\*\*([^*]+?)\*\*\s*-{3,}', r'## \1', normalized)
+            # Fix "**Title**------------------------" on same line -> "## Title"
+            normalized = re.sub(r'\*\*([^*]+?)\*\*[-=]{4,}', r'## \1', normalized)
+            # Fix separator lines that appear on the line immediately after a heading
+            normalized = re.sub(r'(^##\s+[^\n]+)\n[-=]{4,}\n', r'\1\n', normalized, flags=re.MULTILINE)
+            normalized = re.sub(r'(^###\s+[^\n]+)\n[-=]{4,}\n', r'\1\n', normalized, flags=re.MULTILINE)
+            normalized = re.sub(r'(^\*\*[^*]+\*\*)\n[-=]{4,}\n', r'\1\n', normalized, flags=re.MULTILINE)
+            # Fix text followed by separators on the same line
+            # Pattern 1: Plain text headings (starts with capital letter, looks like a title)
+            normalized = re.sub(r'^([A-Z][A-Za-z0-9\s]{2,50}?)\s*[-=]{4,}\s*\n', r'## \1\n', normalized, flags=re.MULTILINE)
+            # Pattern 2: "** Text**----------------" patterns (with space after **) -> "## Text"
+            normalized = re.sub(r'\*\*\s+([^*]+?)\s*\*\*[-=]{4,}', r'## \1', normalized)
+            normalized = re.sub(r'\*\*\s+([^*]+?)\s*\*\*\s*\n[-=]{4,}\s*\n', r'## \1\n', normalized, flags=re.MULTILINE)
+            # Fix "** Text**" at start of line (likely a heading) -> "## Text"
+            normalized = re.sub(r'^\*\*\s+([^*]+?)\s*\*\*\s*$', r'## \1', normalized, flags=re.MULTILINE)
+            # Fix bold text immediately followed by ###: "**Text###" -> "### Text" and separate the ### part
+            normalized = re.sub(r'\*\*([^*]+?)\*\*\s*###\s*([^\n]+)', r'### \1\n### \2', normalized, flags=re.MULTILINE)
+            # Fix numbered items with bold followed by ###: "1.**Text###" -> "1. ### Text"
+            normalized = re.sub(r'^(\d+\.)\s*\*\*([^*]+?)\*\*\s*###\s*([^\n]+)', r'\1 ### \2\n### \3', normalized, flags=re.MULTILINE)
+            # Fix numbered items with bold: "1.**Text" -> "1. ### Text"
+            normalized = re.sub(r'^(\d+\.)\s*\*\*([^*\n]+?)(?:\*\*|$)', r'\1 ### \2', normalized, flags=re.MULTILINE)
+            # Fix numbered items with text directly attached: "1.Text" -> "1. Text"
+            normalized = re.sub(r'^(\d+\.)([A-Za-z])', r'\1 \2', normalized, flags=re.MULTILINE)
+            # Fix numbered items with trailing dash: "1. Text-" -> "1. Text"
+            normalized = re.sub(r'^(\d+\.\s+[^\n]+?)-$', r'\1', normalized, flags=re.MULTILINE)
+            # Fix numbered items with bold and trailing dash: "1. **Text**-" or "1. ** Text**-" -> "1. Text"
+            normalized = re.sub(r'^(\d+\.)\s*\*\*\s*([^*\n]+?)\s*\*\*-$', r'\1 \2', normalized, flags=re.MULTILINE)
+            # Fix numbered items with bold (no trailing dash): "1. **Text**" or "1. ** Text**" -> "1. Text"
+            normalized = re.sub(r'^(\d+\.)\s*\*\*\s*([^*\n]+?)\s*\*\*\s*$', r'\1 \2', normalized, flags=re.MULTILINE)
+            # Fix "** Test Description:" or "** Verify..." patterns (likely subheadings) -> "### ..."
+            # Match bold text that starts with common action words or descriptive words
+            normalized = re.sub(r'\*\*\s+(Verify|Test|Check|Validate|Confirm|Ensure|Setup|Configure|Execute|Run|Create|Add|Remove|Delete|Update|Modify|Description|Steps|Requirements)\s*:?\s*([^*\n]*?)(?:\s*\*\*|$)', r'### \1\2', normalized, flags=re.IGNORECASE | re.MULTILINE)
+            # Fix "** Verify/Test/Check..." patterns without space after ** (likely subheadings) -> "### ..."
+            normalized = re.sub(r'\*\*([A-Z][a-z]+)\s+(Verify|Test|Check|Validate|Confirm|Ensure|Setup|Configure|Execute|Run|Create|Add|Remove|Delete|Update|Modify)\s+([^*\n]+?)(?:\s*\*\*|$)', r'### \1 \2 \3', normalized, flags=re.IGNORECASE | re.MULTILINE)
+            # Fix remaining "** Text" patterns at start of line -> "### Text"
+            normalized = re.sub(r'^\*\*\s*([A-Z][^*\n]{3,}?)(?:\s*\*\*|$)', r'### \1', normalized, flags=re.MULTILINE)
+            # Fix patterns like "** Text**:" -> "### Text"
+            # This handles cases where bold text ends with colon and should be a heading
+            normalized = re.sub(r'\*\*\s+([A-Z][^*\n]{2,}?)\s*\*\*:', r'### \1', normalized)
+            # Fix single-word headings like "** Logging" -> "### Logging"
+            normalized = re.sub(r'\*\*\s+([A-Z][a-z]+)\s*$', r'### \1', normalized, flags=re.MULTILINE)
+            # Fix patterns like "SummaryTo" -> "Summary\n\nTo" (common title words followed by capitalized word)
+            # Fix both at start of line and in middle of text
+            title_words = r'(Summary|Plan|Guide|Overview|Introduction|Conclusion|Example|Note|Warning|Error)'
+            normalized = re.sub(rf'^({title_words})([A-Z][a-z]+)', r'\1\n\n\2', normalized, flags=re.MULTILINE)
+            # Also fix when title word appears in middle: "Device Log SummaryTo" -> "Device Log Summary\n\nTo"
+            normalized = re.sub(rf'({title_words})([A-Z][a-z]+)', r'\1\n\n\2', normalized)
+            # Fix patterns like "System Logs**" -> "### System Logs" (text followed by ** at end)
+            normalized = re.sub(r'([A-Z][a-zA-Z\s]+)\*\*$', r'### \1', normalized, flags=re.MULTILINE)
+            # Fix patterns like "** Identify Root Cause**" -> "### Identify Root Cause" (looks like heading: multiple words or action words)
+            # Only match if it's 2+ words or starts with action words to avoid breaking valid bold text
+            action_words = r'(Identify|Implement|Monitor|Verify|Test|Check|Validate|Confirm|Ensure|Setup|Configure|Execute|Run|Create|Add|Remove|Delete|Update|Modify)'
+            normalized = re.sub(rf'\*\*\s+({action_words}\s+[^*]+?|\w+\s+\w+[^*]*?)\s*\*\*', r'### \1', normalized, flags=re.IGNORECASE)
+            # Fix concatenated words like "flappingBGP" -> "flapping BGP" (lowercase followed by uppercase)
+            normalized = re.sub(r'([a-z])([A-Z][a-z]+)', r'\1 \2', normalized)
+            # Fix patterns like "Text:**" -> "Text:"
+            normalized = re.sub(r'([A-Za-z0-9]):\*\*', r'\1:', normalized)
+            # Fix patterns where text is followed by newline(s) and colon: "Error Messages\n\n:" -> "**Error Messages:**"
+            normalized = re.sub(r'([A-Z][a-zA-Z\s]+)\n+\s*:\s*', r'**\1**: ', normalized)
+            # Fix patterns where bold text is followed by newline(s) and colon: "** Warning\n\n:" -> "**Warning:**"
+            normalized = re.sub(r'\*\*\s+([^*\n]+?)\s*\*\*\n+\s*:\s*', r'**\1**: ', normalized)
+            # Clean up extra whitespace around colons after bold
+            normalized = re.sub(r'\*\*([^*]+?)\*\*\s+:\s+', r'**\1**: ', normalized)
+            # Fix patterns like "Text*:" -> "**Text**:"
+            normalized = re.sub(r'([A-Z][a-zA-Z\s]+)\*:', r'**\1**:', normalized)
+            # Fix patterns like "*Text**:" -> "**Text**:"
+            normalized = re.sub(r'\*([^*\n]+?)\*\*:', r'**\1**:', normalized)
+            # Fix numbered items with ### immediately after: "2. ### Text" -> "2. Text"
+            normalized = re.sub(r'^(\d+\.)\s*###\s+', r'\1 ', normalized, flags=re.MULTILINE)
+            # Fix trailing ** at end of lines (stray bold markers)
+            normalized = re.sub(r'([^\*])\*\*\s*$', r'\1', normalized, flags=re.MULTILINE)
+            # Fix "+Result:" patterns -> "**Result:**"
+            normalized = re.sub(r'\+Result:\s*', r'**Result:** ', normalized, flags=re.IGNORECASE)
+            # Fix leading asterisks that should be bullet points: "* text" -> "- text"
+            normalized = re.sub(r'^\*\s+([^\*])', r'- \1', normalized, flags=re.MULTILINE)
+        
+        # Fix list formatting issues
+        # Fix dashes/bullets without space (e.g., "-Step" -> "- Step", "*Item" -> "* Item")
+        code_blocks = list(re.finditer(code_block_pattern, normalized, flags=re.DOTALL))
+        if code_blocks:
+            parts = []
+            last_end = 0
+            for match in code_blocks:
+                before_code = normalized[last_end:match.start()]
+                # Fix dash/bullet without space before text (but not if it's part of a separator line)
+                # Match any non-whitespace character except dash and asterisk (use \S with negative lookahead)
+                before_code = re.sub(r'^([-*])(?![-\*])(\S)', r'\1 \2', before_code, flags=re.MULTILINE)
+                parts.append(before_code)
+                parts.append(match.group(0))
+                last_end = match.end()
+            after_code = normalized[last_end:]
+            after_code = re.sub(r'^([-*])(?![-\*])(\S)', r'\1 \2', after_code, flags=re.MULTILINE)
+            parts.append(after_code)
+            normalized = ''.join(parts)
+        else:
+            normalized = re.sub(r'^([-*])([A-Za-z])', r'\1 \2', normalized, flags=re.MULTILINE)
+        
+        # Fix numbered list formatting (e.g., "1.**Text**" -> "1. **Text**")
+        code_blocks = list(re.finditer(code_block_pattern, normalized, flags=re.DOTALL))
+        if code_blocks:
+            parts = []
+            last_end = 0
+            for match in code_blocks:
+                before_code = normalized[last_end:match.start()]
+                # Fix numbered lists without space before bold (e.g., "1.**Text**" -> "1. **Text**")
+                before_code = re.sub(r'(\d+)\.\*\*([^*]+?)\*\*', r'\1. **\2**', before_code)
+                parts.append(before_code)
+                parts.append(match.group(0))
+                last_end = match.end()
+            after_code = normalized[last_end:]
+            after_code = re.sub(r'(\d+)\.\*\*([^*]+?)\*\*', r'\1. **\2**', after_code)
+            parts.append(after_code)
+            normalized = ''.join(parts)
+        else:
+            normalized = re.sub(r'(\d+)\.\*\*([^*]+?)\*\*', r'\1. **\2**', normalized)
+        
+        # Clean up excessive blank lines (more than 2 consecutive newlines)
+        normalized = re.sub(r'\n{3,}', '\n\n', normalized)
+        
+        # #region agent log
+        try:
+            with open('/Users/surajsharma/OSTG/.cursor/debug.log', 'a') as f:
+                log_entry = {
+                    "id": f"log_{int(time.time() * 1000)}_normalize_after",
+                    "timestamp": int(time.time() * 1000),
+                    "location": "run_tgen_server.py:normalize_ai_response",
+                    "message": "After normalization",
+                    "data": {
+                        "text_length": len(normalized),
+                        "text_preview": normalized[:100] if len(normalized) > 100 else normalized,
+                        "was_changed": text != normalized,
+                        "has_concatenated": bool(re.search(r'([a-z])([A-Z])', normalized) or re.search(r'(\w+\')([a-z]{2,})', normalized))
+                    },
+                    "sessionId": "debug-session",
+                    "runId": "run1",
+                    "hypothesisId": "A"
+                }
+                f.write(json.dumps(log_entry) + "\n")
+        except Exception:
+            pass
+        # #endregion
+        
+        return normalized
+    
+    @app.route("/api/ai/chat", methods=["POST"])
+    def ai_chat():
+        """Handle AI chat messages using LLM (Ollama or Cloud API)"""
+        try:
+            import os
+            import json
+            
+            data = request.get_json()
+            message = data.get("message", "")
+            context = data.get("context", {})
+            ai_mode_preference = data.get("ai_mode_preference", "hybrid")  # Get preference from client
+            normalize_response = data.get("normalize_response", True)  # Default to True for backward compatibility
+            
+            if not message:
+                return jsonify({"error": "Message is required"}), 400
+            
+            # Determine mode preferences
+            use_cloud_only = (ai_mode_preference == "cloud")
+            use_local_only = (ai_mode_preference == "local")
+            
+            if use_cloud_only:
+                logging.info("[AI CHAT] Cloud Only mode enabled - will not fall back to local LLM")
+            elif use_local_only:
+                logging.info("[AI CHAT] Local Only mode enabled - will not use cloud API")
+            
+            # Try cloud API first (OpenAI/Groq) if available AND not in Local Only mode
+            api_key = get_ai_api_key()
+            api_base = get_ai_api_base()
+            
+            logging.info(f"[AI CHAT] Checking API availability - has_key: {bool(api_key)}, has_base: {bool(api_base)}, base: {api_base}, mode: {ai_mode_preference}")
+            
+            if api_key and not use_local_only:
+                try:
+                    import openai
+                    # Use OpenAI-compatible API (OpenAI, Groq, etc.)
+                    client = openai.OpenAI(
+                        api_key=api_key,
+                        base_url=api_base if api_base else None,
+                        timeout=30.0
+                    )
+                    
+                    # Determine which model to use
+                    models_to_try = ["gpt-4"]  # Default for OpenAI
+                    if api_base and "groq" in api_base.lower():
+                        # Try Groq models - try faster ones first
+                        models_to_try = [
+                            "llama-3.1-8b-instant",      # Fastest, most available
+                            "llama-3.1-70b-versatile",   # More capable
+                            "mixtral-8x7b-32768"         # Alternative
+                        ]
+                    
+                    # Enhanced system prompt with detailed formatting rules
+                    system_prompt = """You are NetGenAI, a networking-focused assistant.
+- Always interpret terms like interface, link, flap, BGP, OSPF, VLAN, MTU in the context of computer networking.
+- Provide concise, structured answers (bullets/steps) for network ops: troubleshooting, test plans, configs, and automation.
+
+CRITICAL MARKDOWN FORMATTING RULES:
+1. Headings: Use ## for main headings, ### for subheadings. NEVER use **bold** for headings.
+   Example: ## Test Plan\\n### Test Cases (NOT **Test Plan**)
+
+2. Bold text: Use **bold** only for emphasis within sentences, NOT for headings.
+   Correct: This is **important**. Wrong: ** Configure logging**: (use ### Configure logging)
+
+3. Lists: Proper spacing after dashes: - Item (NOT -Item)
+
+4. Numbered lists: Space between number and content: 1. Step (NOT 1.Step or 1.**Step**)
+
+5. Code blocks: Use ```language tags
+
+6. NO separators: Never use ---- or ====
+
+7. Contractions: No spaces before apostrophes: We'll (NOT We' ll)
+
+8. Remove trailing ** markers
+
+If off-topic, ask for clarification."""
+                    
+                    # Try models in order until one works
+                    last_error = None
+                    for model in models_to_try:
+                        try:
+                            logging.info(f"[AI CHAT] Attempting cloud API call with model: {model}, base_url: {api_base}")
+                            
+                            # Check if client wants streaming (via query parameter or header)
+                            stream_requested = request.args.get('stream', 'false').lower() == 'true'
+                            
+                            if stream_requested:
+                                # Streaming response
+                                from flask import Response, stream_with_context
+                                import json as json_module
+                                
+                                def generate_stream():
+                                    full_response = ""
+                                    for chunk in client.chat.completions.create(
+                                        model=model,
+                                        messages=[
+                                            {"role": "system", "content": system_prompt},
+                                            {"role": "user", "content": message}
+                                        ],
+                                        temperature=0.7,
+                                        max_tokens=2000,
+                                        stream=True
+                                    ):
+                                        if chunk.choices[0].delta.content:
+                                            content = chunk.choices[0].delta.content
+                                            full_response += content
+                                            try:
+                                                logging.info(f"[AI CHAT][RAW_STREAM_CHUNK] {json_module.dumps(chunk.model_dump())}")
+                                            except Exception:
+                                                logging.info(f"[AI CHAT][RAW_STREAM_CHUNK] {chunk}")
+                                            # Send chunk to client
+                                            yield f"data: {json_module.dumps({'chunk': content, 'model': model, 'source': 'cloud_api'})}\n\n"
+                                    
+                                    # Normalize full response to fix concatenated words (if enabled)
+                                    if normalize_response:
+                                        full_response = normalize_ai_response(full_response)
+                                    
+                                    # Send final message with full response
+                                    yield f"data: {json_module.dumps({'done': True, 'response': full_response, 'model': model, 'source': 'cloud_api'})}\n\n"
+                                
+                                return Response(
+                                    stream_with_context(generate_stream()),
+                                    mimetype='text/event-stream',
+                                    headers={
+                                        'Cache-Control': 'no-cache',
+                                        'X-Accel-Buffering': 'no'
+                                    }
+                                )
+                            else:
+                                # Non-streaming response (original behavior)
+                                response = client.chat.completions.create(
+                                    model=model,
+                                    messages=[
+                                        {"role": "system", "content": system_prompt},
+                                        {"role": "user", "content": message}
+                                    ],
+                                    temperature=0.7,
+                                    max_tokens=2000
+                                )
+                                
+                                try:
+                                    logging.info(f"[AI CHAT][RAW_RESPONSE] {response.model_dump_json()}")
+                                except Exception:
+                                    logging.info(f"[AI CHAT][RAW_RESPONSE] {response}")
+                                
+                                ai_response = response.choices[0].message.content
+                                # Normalize response to fix concatenated words (if enabled)
+                                if normalize_response:
+                                    ai_response = normalize_ai_response(ai_response)
+                                logging.info(f"[AI CHAT] Cloud API response generated successfully (model: {model})")
+                                return jsonify({
+                                    "response": ai_response,
+                                    "model": model,
+                                    "source": "cloud_api"
+                                }), 200
+                        except Exception as model_error:
+                            last_error = model_error
+                            error_msg_str = str(model_error)
+                            # Check for common API URL errors and log helpful message
+                            if "404" in error_msg_str or "unknown_url" in error_msg_str or "not found" in error_msg_str.lower():
+                                if "groq" in api_base.lower() and "/v2" in api_base:
+                                    logging.error(f"[AI CHAT] Invalid Groq API URL detected: {api_base}. Groq uses /openai/v1, not /openai/v2.")
+                                    logging.error(f"[AI CHAT] Please update your API Base URL in AI Settings to: https://api.groq.com/openai/v1")
+                                else:
+                                    logging.warning(f"[AI CHAT] Model {model} failed with 404/URL error: {error_msg_str[:200]}")
+                            else:
+                                logging.warning(f"[AI CHAT] Model {model} failed: {error_msg_str[:200]}, trying next...")
+                            continue
+                    
+                    # If all models failed, handle gracefully instead of raising
+                    # This allows fallback to local LLM in hybrid mode
+                    if last_error:
+                        error_msg_str = str(last_error)
+                        # Check if it's a URL/404 error
+                        if "404" in error_msg_str or "unknown_url" in error_msg_str:
+                            logging.error(f"[AI CHAT] All cloud API models failed with URL/404 error. Falling back to local LLM in hybrid mode.")
+                            if "groq" in api_base.lower() and "/v2" in api_base:
+                                logging.error(f"[AI CHAT] For Groq, the correct URL is: https://api.groq.com/openai/v1 (not /v2)")
+                            # Don't raise - let it fall through to local LLM in hybrid mode
+                        else:
+                            # For other errors, log and continue to fallback
+                            logging.error(f"[AI CHAT] All cloud API models failed: {error_msg_str[:200]}. Falling back to local LLM in hybrid mode.")
+                    else:
+                        logging.error("[AI CHAT] All cloud API models failed with unknown error. Falling back to local LLM in hybrid mode.")
+                    
+                    # Don't raise exception - let it fall through to local LLM fallback
+                except Exception as e:
+                    error_msg = str(e)
+                    logging.error(f"[AI CHAT] Cloud API failed with error: {error_msg}")
+                    logging.error(f"[AI CHAT] Exception type: {type(e).__name__}")
+                    import traceback
+                    logging.error(f"[AI CHAT] Traceback: {traceback.format_exc()}")
+                    
+                    # Check for URL/404 errors and provide helpful message
+                    if "404" in error_msg or "unknown_url" in error_msg or "not found" in error_msg.lower():
+                        if "groq" in api_base.lower() and "/v2" in api_base:
+                            logging.error(f"[AI CHAT] ERROR: Invalid Groq API URL: {api_base}. Groq uses /openai/v1, not /openai/v2.")
+                            logging.error(f"[AI CHAT] Please update your API Base URL in AI Settings to: https://api.groq.com/openai/v1")
+                    
+                    # Don't raise - let it fall through to local LLM in hybrid mode
+                    
+                    # If Cloud Only mode, return error instead of falling back to local LLM
+                    if use_cloud_only:
+                        # Provide more helpful error message
+                        error_summary = "Cloud API failed"
+                        if "401" in error_msg or "authentication" in error_msg.lower() or "invalid api key" in error_msg.lower():
+                            error_summary = "Invalid API key or authentication failed"
+                        elif "connection" in error_msg.lower() or "timeout" in error_msg.lower():
+                            error_summary = "Connection to cloud API failed - check network"
+                        elif "rate limit" in error_msg.lower() or "429" in error_msg:
+                            error_summary = "API rate limit exceeded - please try again later"
+                        elif "model" in error_msg.lower() or "not found" in error_msg.lower():
+                            error_summary = "Model not available - check model name"
+                        
+                        return jsonify({
+                            "error": "Cloud API failed and Cloud Only mode is enabled",
+                            "response": f"{error_summary}. Please check:\n\n1. API key is correct\n2. API base URL is correct (for Groq: https://api.groq.com/openai/v1)\n3. Network connectivity\n4. API service status\n\nError details: {error_msg[:200]}",
+                            "model": "error",
+                            "source": "cloud_api_error"
+                        }), 500
+                    
+                    # Fall through to local LLM only if not in Cloud Only mode
+            
+            # Try local LLM (Ollama) if:
+            # 1. Local Only mode is enabled, OR
+            # 2. Cloud API failed/not available AND Cloud Only mode is not enabled
+            if use_local_only or (not use_cloud_only):
+                try:
+                    from utils.ai.local_ai_engine import LocalLLMClient
+                    
+                    # Load settings from file if available
+                    settings_file = os.path.expanduser("~/.ostg_ai_settings.json")
+                    ollama_url = "http://localhost:11434"
+                    ollama_model = None
+                    
+                    if os.path.exists(settings_file):
+                        try:
+                            with open(settings_file, 'r') as f:
+                                settings = json.load(f)
+                                ollama_url = settings.get("ollama_url", ollama_url)
+                                ollama_model = settings.get("ollama_model")
+                        except Exception:
+                            pass
+                    
+                    llm_client = LocalLLMClient(
+                        llm_type="ollama",
+                        base_url=ollama_url,
+                        model=ollama_model
+                    )
+                    
+                    # Enhanced system prompt with detailed formatting rules for local LLM
+                    system_prompt = """You are NetGenAI, a networking-focused assistant.
+- Always interpret terms like interface, link, flap, BGP, OSPF, VLAN, MTU in the context of computer networking.
+- Provide concise, structured answers (bullets/steps) for network ops: troubleshooting, test plans, configs, and automation.
+
+CRITICAL MARKDOWN FORMATTING RULES:
+1. Headings: Use ## for main headings, ### for subheadings. NEVER use **bold** for headings.
+   Example: ## Test Plan\\n### Test Cases (NOT **Test Plan**)
+
+2. Bold text: Use **bold** only for emphasis within sentences, NOT for headings.
+   Correct: This is **important**. Wrong: ** Configure logging**: (use ### Configure logging)
+
+3. Lists: Proper spacing after dashes: - Item (NOT -Item)
+
+4. Numbered lists: Space between number and content: 1. Step (NOT 1.Step or 1.**Step**)
+
+5. Code blocks: Use ```language tags
+
+6. NO separators: Never use ---- or ====
+
+7. Contractions: No spaces before apostrophes: We'll (NOT We' ll)
+
+8. Remove trailing ** markers
+
+If off-topic, ask for clarification."""
+                    
+                    ai_response = llm_client.generate(message, system_prompt=system_prompt)
+                    
+                    if ai_response and len(ai_response.strip()) > 10:
+                        # Optionally use LLM to fix formatting (two-pass approach)
+                        # Check if LLM-based formatting is enabled via environment variable or settings
+                        use_llm_formatting = os.environ.get("USE_LLM_FORMATTING", "false").lower() == "true"
+                        
+                        if use_llm_formatting:
+                            logging.debug("[AI CHAT] Using LLM-based formatting fix (two-pass)")
+                            ai_response = fix_formatting_with_llm(ai_response, llm_client)
+                        
+                        # Apply regex-based normalization if enabled (faster and catches edge cases)
+                        if normalize_response:
+                            ai_response = normalize_ai_response(ai_response)
+                        logging.info(f"[AI CHAT] Local LLM response generated (model: {llm_client.model})")
+                        return jsonify({
+                            "response": ai_response,
+                            "model": llm_client.model,
+                            "source": "local_llm"
+                        }), 200
+                except Exception as e:
+                    logging.warning(f"[AI CHAT] Local LLM failed: {e}")
+            
+            # Fallback to rule-based if LLM not available
+            from utils.ai.local_ai_engine import LocalAIEngine
+            engine = LocalAIEngine(model_dir="/opt/OSTG/ai_models")
+            response = engine.chat(message, context)
+            
+            # Normalize response to fix concatenated words if enabled (though rule-based should already be fine)
+            if normalize_response:
+                response = normalize_ai_response(response)
+            
+            return jsonify({
+                "response": response,
+                "model": "rule-based",
+                "source": "fallback"
+            }), 200
+            
+        except Exception as e:
+            logging.error(f"[AI CHAT] Error: {e}")
+            import traceback
+            logging.error(traceback.format_exc())
+            return jsonify({
+                "error": str(e),
+                "response": "I apologize, but I encountered an error. Please try again."
+            }), 500
+    
+    @app.route("/api/ai/analytics/performance", methods=["POST"])
+    def ai_analytics_performance():
+        """Analyze network performance"""
+        try:
+            from utils.ai.network_analytics import NetworkAnalytics
+            import os
+            from datetime import datetime, timedelta
+            
+            analytics = NetworkAnalytics(
+                use_ai_api=bool(os.environ.get("OPENAI_API_KEY")),
+                api_key=os.environ.get("OPENAI_API_KEY")
+            )
+            
+            data = request.get_json()
+            start_time_str = data.get("start_time")
+            end_time_str = data.get("end_time")
+            device_id = data.get("device_id")
+            
+            # Parse time range
+            if start_time_str and end_time_str:
+                start_time = datetime.fromisoformat(start_time_str.replace('Z', '+00:00'))
+                end_time = datetime.fromisoformat(end_time_str.replace('Z', '+00:00'))
+            else:
+                # Default to last 24 hours
+                end_time = datetime.now(timezone.utc)
+                start_time = end_time - timedelta(hours=24)
+            
+            analysis = analytics.analyze_performance((start_time, end_time), device_id)
+            return jsonify(analysis), 200
+        except Exception as e:
+            logging.error(f"[AI ANALYTICS PERFORMANCE] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/analytics/traffic", methods=["POST"])
+    def ai_analytics_traffic():
+        """Analyze network traffic"""
+        try:
+            from utils.ai.network_analytics import NetworkAnalytics
+            import os
+            
+            analytics = NetworkAnalytics(
+                use_ai_api=bool(os.environ.get("OPENAI_API_KEY")),
+                api_key=os.environ.get("OPENAI_API_KEY")
+            )
+            
+            data = request.get_json()
+            filters = data.get("filters", {})
+            
+            analysis = analytics.analyze_traffic(filters)
+            return jsonify(analysis), 200
+        except Exception as e:
+            logging.error(f"[AI ANALYTICS TRAFFIC] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/analytics/protocol/<protocol>", methods=["GET"])
+    def ai_analytics_protocol(protocol):
+        """Analyze protocol performance"""
+        try:
+            from utils.ai.network_analytics import NetworkAnalytics
+            import os
+            from datetime import datetime, timedelta
+            
+            analytics = NetworkAnalytics(
+                use_ai_api=bool(os.environ.get("OPENAI_API_KEY")),
+                api_key=os.environ.get("OPENAI_API_KEY")
+            )
+            
+            # Get time range from query params
+            hours = request.args.get("hours", 24, type=int)
+            end_time = datetime.now(timezone.utc)
+            start_time = end_time - timedelta(hours=hours)
+            
+            analysis = analytics.analyze_protocols(protocol, (start_time, end_time))
+            return jsonify(analysis), 200
+        except Exception as e:
+            logging.error(f"[AI ANALYTICS PROTOCOL] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/analytics/insights", methods=["POST"])
+    def ai_analytics_insights():
+        """Generate insights from analytics data"""
+        try:
+            from utils.ai.network_analytics import NetworkAnalytics
+            import os
+            
+            analytics = NetworkAnalytics(
+                use_ai_api=bool(os.environ.get("OPENAI_API_KEY")),
+                api_key=os.environ.get("OPENAI_API_KEY")
+            )
+            
+            data = request.get_json()
+            analysis_data = data.get("data", {})
+            
+            insights = analytics.generate_insights(analysis_data)
+            return jsonify({"insights": insights}), 200
+        except Exception as e:
+            logging.error(f"[AI ANALYTICS INSIGHTS] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    # Test Plan Generator Endpoints
+    @app.route("/api/ai/test/plan/generate", methods=["POST"])
+    def ai_generate_test_plan():
+        """Generate comprehensive test plan from functional specification"""
+        try:
+            from utils.ai.test_plan_generator import TestPlanGenerator
+            import os
+            
+            data = request.get_json()
+            functional_spec = data.get("functional_spec", {})
+            ai_mode_preference = data.get("ai_mode_preference", "hybrid")
+            
+            if not functional_spec:
+                return jsonify({"error": "functional_spec is required"}), 400
+            
+            # Determine AI mode based on preference
+            api_key = get_ai_api_key()
+            api_base = get_ai_api_base()
+            use_cloud_only = (ai_mode_preference == "cloud")
+            use_local_only = (ai_mode_preference == "local")
+            
+            # Log API key status for debugging
+            api_key_present = bool(api_key)
+            api_key_length = len(api_key) if api_key else 0
+            api_key_preview = f"{api_key[:10]}..." if api_key and len(api_key) > 10 else "(empty)"
+            logging.info(f"[AI TEST PLAN] API Key Status: present={api_key_present}, length={api_key_length}, preview={api_key_preview}")
+            logging.info(f"[AI TEST PLAN] API Base: {api_base or '(default - OpenAI)'}")
+            logging.info(f"[AI TEST PLAN] AI Mode Preference: {ai_mode_preference}, cloud_only={use_cloud_only}, local_only={use_local_only}")
+            
+            # Configure generator based on AI mode preference
+            use_ai_api = bool(api_key) and not use_local_only
+            use_local_llm = not use_cloud_only  # Use local LLM unless cloud-only is requested
+            
+            # Note: Standard Mode can work with templates even without LLM
+            # Only Agent Mode requires LLM, so we allow cloud-only mode to proceed
+            # even without API key - it will fall back to templates
+            # The generator will handle the fallback gracefully
+            
+            generator = TestPlanGenerator(
+                use_ai_api=use_ai_api,
+                api_key=api_key if use_ai_api else None,
+                api_base=api_base if use_ai_api else None,
+                use_local_llm=use_local_llm
+            )
+            
+            # Log warning if cloud-only mode but no API key (will use templates)
+            if use_cloud_only and not api_key:
+                logging.warning(f"[AI TEST PLAN] Cloud-only mode requested but no API key found. Will fall back to template generation.")
+                logging.warning(f"[AI TEST PLAN] To use cloud API, ensure API key is set via /api/ai/settings endpoint or OPENAI_API_KEY environment variable.")
+            
+            logging.info(f"[AI TEST PLAN] Mode preference: {ai_mode_preference}, use_ai_api: {use_ai_api}, use_local_llm: {use_local_llm}, api_key_present: {bool(api_key)}")
+            
+            test_plan = generator.generate_test_plan(functional_spec)
+            # Ensure test_plan is a dict and wrap in response format
+            if isinstance(test_plan, dict):
+                return jsonify({"test_plan": test_plan}), 200
+            elif isinstance(test_plan, str):
+                # If it's a string (error message), return as error
+                return jsonify({"error": test_plan, "test_plan": {}}), 200
+            else:
+                return jsonify({"test_plan": test_plan if test_plan else {}}), 200
+        except Exception as e:
+            logging.error(f"[AI TEST PLAN] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/test/plan/generate-unit", methods=["POST"])
+    def ai_generate_unit_tests_from_spec():
+        """Generate unit tests from functional specification"""
+        try:
+            from utils.ai.test_plan_generator import TestPlanGenerator
+            import os
+            
+            generator = TestPlanGenerator(
+                use_ai_api=bool(os.environ.get("OPENAI_API_KEY")),
+                api_key=os.environ.get("OPENAI_API_KEY"),
+                use_local_llm=True
+            )
+            
+            data = request.get_json()
+            functional_spec = data.get("functional_spec", {})
+            test_framework = data.get("framework", "pytest")
+            
+            if not functional_spec:
+                return jsonify({"error": "functional_spec is required"}), 400
+            
+            unit_tests = generator.generate_unit_tests_from_spec(functional_spec, test_framework)
+            return jsonify({"unit_tests": unit_tests, "count": len(unit_tests)}), 200
+        except Exception as e:
+            logging.error(f"[AI UNIT TESTS FROM SPEC] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/test/plan/generate-document", methods=["POST"])
+    def ai_generate_test_plan_document():
+        """Generate detailed test plan document (markdown)"""
+        try:
+            from utils.ai.test_plan_generator import TestPlanGenerator
+            import os
+            
+            generator = TestPlanGenerator(
+                use_ai_api=bool(os.environ.get("OPENAI_API_KEY")),
+                api_key=os.environ.get("OPENAI_API_KEY"),
+                use_local_llm=True
+            )
+            
+            data = request.get_json()
+            functional_spec = data.get("functional_spec", {})
+            
+            if not functional_spec:
+                return jsonify({"error": "functional_spec is required"}), 400
+            
+            document = generator.generate_detailed_test_plan_document(functional_spec)
+            return jsonify({"document": document, "format": "markdown"}), 200
+        except Exception as e:
+            logging.error(f"[AI TEST PLAN DOC] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/test/plan/generate-pytest", methods=["POST"])
+    def ai_generate_pytest_from_test_plan():
+        """Generate pytest script from test plan"""
+        try:
+            from utils.ai.test_plan_generator import TestPlanGenerator
+            import os
+            
+            generator = TestPlanGenerator(
+                use_ai_api=bool(os.environ.get("OPENAI_API_KEY")),
+                api_key=os.environ.get("OPENAI_API_KEY"),
+                use_local_llm=True
+            )
+            
+            data = request.get_json()
+            test_plan = data.get("test_plan")
+            output_format = data.get("output_format", "file")
+            
+            if not test_plan:
+                return jsonify({"error": "test_plan is required"}), 400
+            
+            pytest_script = generator.generate_pytest_script_from_test_plan(test_plan, output_format)
+            return jsonify({"pytest_script": pytest_script, "format": "python"}), 200
+        except Exception as e:
+            logging.error(f"[AI PYTEST FROM PLAN] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/test/plan/generate-pytest-from-spec", methods=["POST"])
+    def ai_generate_pytest_from_spec():
+        """Generate executable pytest script directly from functional specification"""
+        try:
+            from utils.ai.test_plan_generator import TestPlanGenerator
+            import os
+            
+            generator = TestPlanGenerator(
+                use_ai_api=bool(os.environ.get("OPENAI_API_KEY")),
+                api_key=os.environ.get("OPENAI_API_KEY"),
+                use_local_llm=True
+            )
+            
+            data = request.get_json()
+            functional_spec = data.get("functional_spec", {})
+            test_framework = data.get("framework", "pytest")
+            
+            if not functional_spec:
+                return jsonify({"error": "functional_spec is required"}), 400
+            
+            pytest_script = generator.generate_executable_pytest_from_spec(functional_spec, test_framework)
+            return jsonify({
+                "pytest_script": pytest_script,
+                "format": "python",
+                "framework": test_framework
+            }), 200
+        except Exception as e:
+            logging.error(f"[AI PYTEST FROM SPEC] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/test/plan/agent", methods=["POST"])
+    def ai_test_plan_agent():
+        """AI Agent endpoint for autonomous test plan generation"""
+        try:
+            from utils.ai.test_plan_agent import TestPlanAgent, TestPlanAgentToolRegistry
+            import os
+            
+            data = request.get_json()
+            user_request = data.get("message", "")
+            context = data.get("context", {})
+            ai_mode_preference = data.get("ai_mode_preference", "hybrid")
+            user_selected_model = data.get("agent_model", "").strip()  # User-selected model from UI
+            
+            if not user_request:
+                return jsonify({"error": "message is required"}), 400
+            
+            # Get API configuration first
+            api_key = get_ai_api_key()
+            api_base = get_ai_api_base()
+            
+            # Initialize tool registry with API configuration
+            # We'll set the model later after determining it
+            tool_registry = TestPlanAgentToolRegistry(
+                api_key=api_key,
+                api_base=api_base
+            )
+            
+            # Setup LLM client (similar to chat endpoint)
+            use_cloud_only = (ai_mode_preference == "cloud")
+            use_local_only = (ai_mode_preference == "local")
+            
+            llm_client = None
+            agent_model = None  # Store model name separately
+            
+            # Check if cloud-only mode is enabled but API key is missing
+            if use_cloud_only and not api_key:
+                return jsonify({
+                    "error": "Cloud-only mode is enabled but no API key is configured.",
+                    "hint": "Please configure OPENAI_API_KEY environment variable or set API key in server settings. Agent mode requires cloud API with function calling support."
+                }), 503
+            
+            # Try cloud API first if available and not in Local Only mode
+            if api_key and not use_local_only:
+                try:
+                    import openai
+                    llm_client = openai.OpenAI(
+                        api_key=api_key,
+                        base_url=api_base if api_base else None,
+                        timeout=60.0
+                    )
+                    
+                    # Priority: 1) User-selected from UI, 2) Settings file, 3) Defaults
+                    if user_selected_model:
+                        agent_model = user_selected_model
+                        logging.info(f"[TEST PLAN AGENT] Using UI-selected model: {agent_model}")
+                    else:
+                        # Try to get from settings file
+                        try:
+                            settings_file = os.path.expanduser("~/.ostg_ai_settings.json")
+                            if os.path.exists(settings_file):
+                                with open(settings_file, 'r') as f:
+                                    client_settings = json.load(f)
+                                    settings_model = client_settings.get("cloud_model", "").strip()
+                                    if settings_model:
+                                        agent_model = settings_model
+                                        logging.info(f"[TEST PLAN AGENT] Using settings model: {agent_model}")
+                        except Exception as e:
+                            logging.debug(f"[TEST PLAN AGENT] Could not read user model preference: {e}")
+                    
+                    # Fallback to defaults if no model selected
+                    if not agent_model:
+                        if api_base and "groq" in api_base.lower():
+                            # Groq models - default to faster model for agent
+                            agent_model = "llama-3.1-8b-instant"
+                        else:
+                            # OpenAI - use GPT-4 for better function calling
+                            agent_model = "gpt-4"
+                        logging.info(f"[TEST PLAN AGENT] Using default model: {agent_model}")
+                    
+                    logging.info(f"[TEST PLAN AGENT] Using cloud model: {agent_model} at {api_base or 'OpenAI'}")
+                    
+                    # Update tool registry with the selected model
+                    tool_registry.model = agent_model
+                    
+                except Exception as e:
+                    logging.warning(f"[TEST PLAN AGENT] Cloud API initialization failed: {e}")
+                    llm_client = None
+                    # If cloud-only mode, provide specific error
+                    if use_cloud_only:
+                        return jsonify({
+                            "error": f"Cloud API initialization failed: {str(e)}",
+                            "hint": "Please check your API key and base URL configuration. Agent mode requires a working cloud API with function calling support."
+                        }), 503
+            
+            # Fallback to local LLM if cloud not available or in Local Only mode
+            if not llm_client and not use_cloud_only:
+                try:
+                    from utils.ai.local_ai_engine import LocalLLMClient
+                    import json
+                    
+                    settings_file = os.path.expanduser("~/.ostg_ai_settings.json")
+                    user_model = None
+                    user_url = os.environ.get("OLLAMA_URL", "http://localhost:11434")
+                    
+                    if os.path.exists(settings_file):
+                        try:
+                            with open(settings_file, 'r') as f:
+                                settings = json.load(f)
+                                user_model = settings.get("ollama_model")
+                                user_url = settings.get("ollama_url", user_url)
+                        except Exception:
+                            pass
+                    
+                    local_llm = LocalLLMClient(
+                        llm_type=os.environ.get("LOCAL_LLM_TYPE", "ollama"),
+                        base_url=user_url,
+                        model=user_model
+                    )
+                    
+                    # Create a wrapper to make local LLM compatible with OpenAI client interface
+                    # Note: Local LLM may not support function calling, so we'll need a fallback
+                    # For now, we'll try to use it if available
+                    class LocalLLMWrapper:
+                        def __init__(self, local_llm):
+                            self.local_llm = local_llm
+                            self.model = local_llm.model
+                        
+                        class ChatCompletion:
+                            def create(self, **kwargs):
+                                # For local LLM without function calling, we need different handling
+                                # This is a simplified wrapper - may need enhancement
+                                raise NotImplementedError("Local LLM function calling not fully supported yet")
+                    
+                    # For now, prefer cloud API for agent (function calling)
+                    if not llm_client:
+                        logging.warning("[TEST PLAN AGENT] Local LLM function calling not fully supported, preferring cloud API")
+                except Exception as e:
+                    logging.warning(f"[TEST PLAN AGENT] Local LLM not available: {e}")
+            
+            if not llm_client:
+                # Provide specific error message based on mode
+                if use_cloud_only:
+                    error_msg = "Cloud-only mode is enabled but cloud API is not available."
+                    hint_msg = (
+                        "Please check:\n"
+                        "1. OPENAI_API_KEY environment variable is set\n"
+                        "2. API key is valid and has credits\n"
+                        "3. OPENAI_API_BASE is correct (if using Groq/Together AI)\n"
+                        "4. Network connectivity to API endpoint\n\n"
+                        "Alternatively, disable Agent Mode or change AI mode preference to 'hybrid' or 'local'."
+                    )
+                else:
+                    error_msg = "No LLM client available. Please configure OpenAI API key or ensure Ollama is running."
+                    hint_msg = "Agent mode requires LLM with function calling support (OpenAI GPT-4 or compatible)"
+                
+                return jsonify({
+                    "error": error_msg,
+                    "hint": hint_msg
+                }), 503
+            
+            # Initialize agent with model name
+            agent = TestPlanAgent(tool_registry, llm_client, model=agent_model)
+            
+            # Execute agent request
+            result = agent.execute(user_request, context)
+            
+            return jsonify({
+                "response": result.get("response", ""),
+                "test_plan": result.get("test_plan"),
+                "steps": result.get("steps", []),
+                "iterations": result.get("iterations", 0),
+                "state": result.get("state", "error")
+            }), 200
+        
+        except Exception as e:
+            logging.error(f"[TEST PLAN AGENT] Error: {str(e)}", exc_info=True)
+            return jsonify({"error": str(e)}), 500
+    
+    # Pytest Device Execution Endpoints
+    @app.route("/api/ai/pytest/execute-devices", methods=["POST"])
+    def ai_execute_pytest_for_devices():
+        """Execute pytest script against external devices"""
+        try:
+            from utils.ai.pytest_device_runner import PytestDeviceRunner
+            
+            runner = PytestDeviceRunner()
+            
+            data = request.get_json()
+            pytest_script = data.get("pytest_script")
+            device_ids = data.get("device_ids", [])
+            test_config = data.get("test_config", {})
+            
+            if not pytest_script:
+                return jsonify({"error": "pytest_script is required"}), 400
+            
+            if not device_ids:
+                return jsonify({"error": "device_ids is required"}), 400
+            
+            results = runner.execute_pytest_for_devices(pytest_script, device_ids, test_config)
+            return jsonify(results), 200
+        except Exception as e:
+            logging.error(f"[AI PYTEST DEVICES] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/pytest/execute-device-type", methods=["POST"])
+    def ai_execute_pytest_for_device_type():
+        """Execute pytest script for all devices of a specific type"""
+        try:
+            from utils.ai.pytest_device_runner import PytestDeviceRunner
+            
+            runner = PytestDeviceRunner()
+            
+            data = request.get_json()
+            pytest_script = data.get("pytest_script")
+            device_type = data.get("device_type")
+            test_config = data.get("test_config", {})
+            
+            if not pytest_script:
+                return jsonify({"error": "pytest_script is required"}), 400
+            
+            if not device_type:
+                return jsonify({"error": "device_type is required"}), 400
+            
+            if device_type not in ["juniper", "cisco", "arista", "nokia"]:
+                return jsonify({"error": f"Unsupported device type: {device_type}"}), 400
+            
+            results = runner.execute_pytest_for_device_type(pytest_script, device_type, test_config)
+            return jsonify(results), 200
+        except Exception as e:
+            logging.error(f"[AI PYTEST DEVICE TYPE] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/pytest/generate-device-specific", methods=["POST"])
+    def ai_generate_device_specific_pytest():
+        """Generate vendor-specific pytest script"""
+        try:
+            from utils.ai.pytest_device_runner import PytestDeviceRunner
+            
+            runner = PytestDeviceRunner()
+            
+            data = request.get_json()
+            base_pytest_script = data.get("pytest_script")
+            device_type = data.get("device_type")
+            
+            if not base_pytest_script:
+                return jsonify({"error": "pytest_script is required"}), 400
+            
+            if not device_type:
+                return jsonify({"error": "device_type is required"}), 400
+            
+            enhanced_script = runner.generate_device_specific_pytest(base_pytest_script, device_type)
+            return jsonify({
+                "pytest_script": enhanced_script,
+                "device_type": device_type
+            }), 200
+        except Exception as e:
+            logging.error(f"[AI PYTEST DEVICE SPECIFIC] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    # AI Model Management Endpoints
+    @app.route("/api/ai/model/backup", methods=["POST"])
+    def ai_model_backup():
+        """Backup current AI model"""
+        try:
+            from pathlib import Path
+            import shutil
+            from datetime import datetime
+            
+            MODEL_DIR = Path("/opt/OSTG/ai_models")
+            BACKUP_DIR = MODEL_DIR / "backups"
+            CURRENT_MODEL = MODEL_DIR / "troubleshooting_classifier.pkl"
+            
+            if not CURRENT_MODEL.exists():
+                return jsonify({"error": "No current model to backup"}), 404
+            
+            # Load metadata to get current version
+            metadata_file = MODEL_DIR / "metadata.json"
+            current_version = "1.0"
+            if metadata_file.exists():
+                with open(metadata_file, 'r') as f:
+                    metadata = json.load(f)
+                    current_version = metadata.get("troubleshooting_classifier", {}).get("current_version", "1.0")
+            
+            # Create backup
+            BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            backup_file = BACKUP_DIR / f"troubleshooting_classifier_v{current_version}_{timestamp}.pkl"
+            shutil.copy2(CURRENT_MODEL, backup_file)
+            
+            return jsonify({
+                "status": "success",
+                "backup_file": str(backup_file),
+                "message": "Model backed up successfully"
+            }), 200
+        except Exception as e:
+            logging.error(f"[AI MODEL BACKUP] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/model/train", methods=["POST"])
+    def ai_model_train():
+        """Train new AI model version"""
+        try:
+            from utils.ai.local_ai_engine import LocalAIEngine
+            import sqlite3
+            from pathlib import Path
+            import shutil
+            
+            data = request.get_json()
+            version = data.get("version", "2.0")
+            
+            # Get training data
+            kb_path = "/opt/OSTG/ai_knowledge_base.db"
+            if not Path(kb_path).exists():
+                return jsonify({"error": "Knowledge base not found"}), 404
+            
+            conn = sqlite3.connect(kb_path)
+            cursor = conn.cursor()
+            
+            try:
+                cursor.execute("""
+                    SELECT symptoms, root_cause, solution
+                    FROM troubleshooting_cases
+                    WHERE resolved = 1
+                    ORDER BY resolved_at DESC
+                """)
+            except sqlite3.OperationalError:
+                conn.close()
+                return jsonify({"error": "troubleshooting_cases table not found"}), 404
+            
+            training_data = []
+            for row in cursor.fetchall():
+                try:
+                    symptoms = json.loads(row[0]) if row[0] else {}
+                    training_data.append({
+                        "symptoms": symptoms,
+                        "root_cause": row[1] or "Unknown",
+                        "solution": row[2] or ""
+                    })
+                except Exception:
+                    continue
+            
+            conn.close()
+            
+            if len(training_data) < 10:
+                return jsonify({
+                    "error": f"Not enough training data: {len(training_data)} cases (need 10+)"
+                }), 400
+            
+            # Train model
+            local_ai = LocalAIEngine()
+            model = local_ai._train_troubleshooting_model(training_data)
+            
+            if not model:
+                return jsonify({"error": "Training failed"}), 500
+            
+            # Save with version
+            MODEL_DIR = Path("/opt/OSTG/ai_models")
+            MODEL_DIR.mkdir(parents=True, exist_ok=True)
+            versioned_file = MODEL_DIR / f"troubleshooting_classifier_v{version}.pkl"
+            CURRENT_MODEL = MODEL_DIR / "troubleshooting_classifier.pkl"
+            shutil.copy2(CURRENT_MODEL, versioned_file)
+            
+            # Update metadata
+            metadata_file = MODEL_DIR / "metadata.json"
+            if metadata_file.exists():
+                with open(metadata_file, 'r') as f:
+                    metadata = json.load(f)
+            else:
+                metadata = {"troubleshooting_classifier": {"current_version": "1.0", "versions": {}}}
+            
+            if "troubleshooting_classifier" not in metadata:
+                metadata["troubleshooting_classifier"] = {"current_version": "1.0", "versions": {}}
+            
+            from datetime import datetime
+            metadata["troubleshooting_classifier"]["versions"][version] = {
+                "created_at": datetime.now().isoformat(),
+                "training_cases": len(training_data),
+                "file": str(versioned_file.name)
+            }
+            
+            with open(metadata_file, 'w') as f:
+                json.dump(metadata, f, indent=2)
+            
+            return jsonify({
+                "status": "success",
+                "version": version,
+                "training_cases": len(training_data),
+                "message": "Model trained successfully"
+            }), 200
+        except Exception as e:
+            logging.error(f"[AI MODEL TRAIN] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/model/activate", methods=["POST"])
+    def ai_model_activate():
+        """Activate a model version"""
+        try:
+            from pathlib import Path
+            import shutil
+            
+            data = request.get_json()
+            version = data.get("version")
+            
+            if not version:
+                return jsonify({"error": "version required"}), 400
+            
+            MODEL_DIR = Path("/opt/OSTG/ai_models")
+            versioned_file = MODEL_DIR / f"troubleshooting_classifier_v{version}.pkl"
+            CURRENT_MODEL = MODEL_DIR / "troubleshooting_classifier.pkl"
+            
+            if not versioned_file.exists():
+                return jsonify({"error": f"Model version {version} not found"}), 404
+            
+            # Backup current model
+            if CURRENT_MODEL.exists():
+                BACKUP_DIR = MODEL_DIR / "backups"
+                BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+                from datetime import datetime
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                backup_file = BACKUP_DIR / f"troubleshooting_classifier_backup_{timestamp}.pkl"
+                shutil.copy2(CURRENT_MODEL, backup_file)
+            
+            # Activate new version
+            MODEL_DIR.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(versioned_file, CURRENT_MODEL)
+            
+            # Update metadata
+            metadata_file = MODEL_DIR / "metadata.json"
+            if metadata_file.exists():
+                with open(metadata_file, 'r') as f:
+                    metadata = json.load(f)
+            else:
+                metadata = {"troubleshooting_classifier": {"current_version": version, "versions": {}}}
+            
+            if "troubleshooting_classifier" not in metadata:
+                metadata["troubleshooting_classifier"] = {"current_version": version, "versions": {}}
+            
+            metadata["troubleshooting_classifier"]["current_version"] = version
+            
+            with open(metadata_file, 'w') as f:
+                json.dump(metadata, f, indent=2)
+            
+            return jsonify({
+                "status": "success",
+                "version": version,
+                "message": "Model activated successfully"
+            }), 200
+        except Exception as e:
+            logging.error(f"[AI MODEL ACTIVATE] Error: {e}")
+            return jsonify({"error": str(e)}), 500
+    
+    @app.route("/api/ai/model/rollback", methods=["POST"])
+    def ai_model_rollback():
+        """Rollback to a previous model version"""
+        # Same as activate
+        return ai_model_activate()
+    
+    @app.route("/api/ai/model/versions", methods=["GET"])
+    def ai_model_versions():
+        """List all model versions"""
+        try:
+            from pathlib import Path
+            
+            MODEL_DIR = Path("/opt/OSTG/ai_models")
+            metadata_file = MODEL_DIR / "metadata.json"
+            
+            if metadata_file.exists():
+                with open(metadata_file, 'r') as f:
+                    metadata = json.load(f)
+                return jsonify(metadata), 200
+            else:
+                return jsonify({
+                    "troubleshooting_classifier": {
+                        "current_version": "1.0",
+                        "versions": {}
+                    }
+                }), 200
+        except Exception as e:
+            logging.error(f"[AI MODEL VERSIONS] Error: {e}")
+            return jsonify({"error": str(e)}), 500
     
     app.run(host=args.host, port=args.port)
 

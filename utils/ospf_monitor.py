@@ -102,7 +102,7 @@ class OSPFStatusMonitor:
                 if isinstance(protocols, str):
                     try:
                         protocols = json.loads(protocols)
-                    except:
+                    except Exception:
                         protocols = []
                 
                 if "OSPF" in protocols:

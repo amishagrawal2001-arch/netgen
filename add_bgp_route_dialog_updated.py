@@ -235,7 +235,7 @@ class ManageRoutePoolsDialog(QDialog):
             # Parse the subnet
             try:
                 network = ipaddress.IPv4Network(subnet, strict=False)
-            except:
+            except Exception:
                 network = ipaddress.IPv6Network(subnet, strict=False)
             
             # Check if subnet has enough addresses
@@ -346,7 +346,7 @@ class ManageRoutePoolsDialog(QDialog):
             # Try parsing as IPv4 or IPv6 network
             try:
                 network = ipaddress.IPv4Network(subnet, strict=False)
-            except:
+            except Exception:
                 network = ipaddress.IPv6Network(subnet, strict=False)
             
             # Check if subnet has enough addresses for the requested count

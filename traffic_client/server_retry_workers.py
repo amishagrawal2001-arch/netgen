@@ -1,5 +1,8 @@
 # server_retry_workers.py
+import logging
 import requests
+
+logger = logging.getLogger(__name__)
 import time
 import threading
 from PyQt5.QtCore import QThread, pyqtSignal, QTimer
@@ -46,7 +49,7 @@ class ServerRetryWorker(QThread):
         if server not in self.failed_servers:
             self.failed_servers.append(server)
             self._retry_counts[server_address] = 0
-            print(f"[RETRY WORKER] Added {server_address} to retry list")
+            logger.info(f"[RETRY WORKER] Added {server_address} to retry list")
     
     def remove_failed_server(self, server: Dict):
         """Remove a server from the retry list."""
@@ -54,7 +57,7 @@ class ServerRetryWorker(QThread):
         if server in self.failed_servers:
             self.failed_servers.remove(server)
             self._retry_counts.pop(server_address, None)
-            print(f"[RETRY WORKER] Removed {server_address} from retry list")
+            logger.info(f"[RETRY WORKER] Removed {server_address} from retry list")
     
     def _calculate_delay(self, retry_count: int) -> float:
         """Calculate exponential backoff delay."""
@@ -71,7 +74,7 @@ class ServerRetryWorker(QThread):
             response = self.session.get(f"{server_address}/api/ping", timeout=3)
             return response.status_code == 200
         except Exception as e:
-            print(f"[RETRY WORKER] Connection test failed for {server_address}: {e}")
+            logger.warning(f"[RETRY WORKER] Connection test failed for {server_address}: {e}")
             return False
     
     def _fetch_server_interfaces(self, server: Dict) -> Optional[List]:
@@ -82,15 +85,15 @@ class ServerRetryWorker(QThread):
             if response.status_code == 200:
                 return response.json()
             else:
-                print(f"[RETRY WORKER] Server {server_address} returned status {response.status_code}")
+                logger.warning(f"[RETRY WORKER] Server {server_address} returned status {response.status_code}")
                 return None
         except Exception as e:
-            print(f"[RETRY WORKER] Failed to fetch interfaces from {server_address}: {e}")
+            logger.error(f"[RETRY WORKER] Failed to fetch interfaces from {server_address}: {e}")
             return None
     
     def run(self):
         """Main retry loop with exponential backoff."""
-        print(f"[RETRY WORKER] Started with {len(self.failed_servers)} failed servers")
+        logger.info(f"[RETRY WORKER] Started with {len(self.failed_servers)} failed servers")
         
         while not self._should_stop and self.failed_servers:
             servers_to_retry = self.failed_servers.copy()
@@ -104,7 +107,7 @@ class ServerRetryWorker(QThread):
                 
                 # Skip if max retries reached
                 if retry_count >= self._max_retries:
-                    print(f"[RETRY WORKER] Max retries reached for {server_address}, removing from retry list")
+                    logger.warning(f"[RETRY WORKER] Max retries reached for {server_address}, removing from retry list")
                     self.remove_failed_server(server)
                     self.server_still_failed.emit(server, f"Max retries ({self._max_retries}) reached")
                     continue
@@ -114,12 +117,12 @@ class ServerRetryWorker(QThread):
                 
                 # Test connection
                 if self._test_server_connection(server):
-                    print(f"[RETRY WORKER] ✅ Server {server_address} is reachable, testing full connection...")
+                    logger.info(f"[RETRY WORKER] Server {server_address} is reachable, testing full connection...")
                     
                     # Try to fetch interfaces
                     interfaces = self._fetch_server_interfaces(server)
                     if interfaces is not None:
-                        print(f"[RETRY WORKER] ✅ Server {server_address} fully recovered!")
+                        logger.info(f"[RETRY WORKER] Server {server_address} fully recovered!")
                         
                         # Update server status
                         server["online"] = True
@@ -134,7 +137,7 @@ class ServerRetryWorker(QThread):
                 
                 # Connection failed, increment retry count
                 self._retry_counts[server_address] = retry_count + 1
-                print(f"[RETRY WORKER] ❌ Server {server_address} still failed (attempt {retry_count + 1})")
+                logger.warning(f"[RETRY WORKER] Server {server_address} still failed (attempt {retry_count + 1})")
             
             # Calculate delay for next retry cycle
             if not self._should_stop and self.failed_servers:
@@ -142,7 +145,7 @@ class ServerRetryWorker(QThread):
                 min_retry_count = min(self._retry_counts.values()) if self._retry_counts else 0
                 delay = self._calculate_delay(min_retry_count)
                 
-                print(f"[RETRY WORKER] Waiting {delay:.1f}s before next retry cycle...")
+                logger.info(f"[RETRY WORKER] Waiting {delay:.1f}s before next retry cycle...")
                 
                 # Sleep in small increments to allow for early termination
                 sleep_increment = 0.5
@@ -151,7 +154,7 @@ class ServerRetryWorker(QThread):
                     time.sleep(sleep_increment)
                     total_sleep_time += sleep_increment
         
-        print(f"[RETRY WORKER] Stopped. Remaining failed servers: {len(self.failed_servers)}")
+        logger.info(f"[RETRY WORKER] Stopped. Remaining failed servers: {len(self.failed_servers)}")
 
 
 class HealthCheckWorker(QThread):
@@ -208,7 +211,7 @@ class HealthCheckWorker(QThread):
     
     def run(self):
         """Main health check loop."""
-        print(f"[HEALTH CHECK] Started monitoring {len(self.servers)} servers")
+        logger.info(f"[HEALTH CHECK] Started monitoring {len(self.servers)} servers")
         
         while not self._should_stop:
             if not self.servers:
@@ -230,12 +233,12 @@ class HealthCheckWorker(QThread):
                     server["online"] = is_online
                     if is_online:
                         server["interfaces"] = interfaces or []
-                    print(f"[HEALTH CHECK] Server {server_address} status changed: {current_status} -> {is_online}")
+                    logger.info(f"[HEALTH CHECK] Server {server_address} status changed: {current_status} -> {is_online}")
                     
                     # Emit status update signal
                     self.health_status_updated.emit(server, is_online)
                 else:
-                    print(f"[HEALTH CHECK] Server {server_address} status unchanged: {is_online}")
+                    logger.debug(f"[HEALTH CHECK] Server {server_address} status unchanged: {is_online}")
                 
                 # Emit interfaces update if server is online
                 if is_online and interfaces:
@@ -245,7 +248,7 @@ class HealthCheckWorker(QThread):
             if not self._should_stop:
                 time.sleep(10)  # Health check every 10 seconds to reduce load
         
-        print("[HEALTH CHECK] Stopped")
+        logger.info("[HEALTH CHECK] Stopped")
 
 
 class ConnectionManager:
@@ -272,7 +275,7 @@ class ConnectionManager:
         self.session.mount("http://", adapter)
         self.session.mount("https://", adapter)
         
-        print("[CONNECTION MANAGER] Initialized with connection pooling")
+        logger.info("[CONNECTION MANAGER] Initialized with connection pooling")
     
     def get(self, url: str, timeout: int = 5, **kwargs) -> requests.Response:
         """Make a GET request with connection pooling."""
@@ -285,4 +288,4 @@ class ConnectionManager:
     def close(self):
         """Close the session and all connections."""
         self.session.close()
-        print("[CONNECTION MANAGER] Closed all connections")
+        logger.info("[CONNECTION MANAGER] Closed all connections")

@@ -1,10 +1,14 @@
 #menu_actions.py#
 import json, os, requests
-from PyQt5.QtWidgets import QMessageBox, QInputDialog, QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QListWidget, QListWidgetItem, QAbstractItemView
+import subprocess
+from urllib.parse import urlparse
+from PyQt5.QtWidgets import QMessageBox, QInputDialog, QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QListWidget, QListWidgetItem, QAbstractItemView, QLabel
 from PyQt5.QtWidgets import QTableWidgetItem
 import uuid
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QTimer
+import logging
 
+logger = logging.getLogger(__name__)
 
 
 def sanitize_for_json(obj):
@@ -75,7 +79,7 @@ class TrafficGenClientMenuAction():
             # Remove from removed_servers if it was previously removed
             if full_url in self.removed_servers:
                 self.removed_servers.discard(full_url)
-                print(f"[ADD SERVER] Removed {full_url} from removed_servers (server was re-added)")
+                logger.info(f"[ADD SERVER] Removed {full_url} from removed_servers (server was re-added)")
             
             # Update ServerManager if available
             if hasattr(self, "server_manager"):
@@ -87,7 +91,7 @@ class TrafficGenClientMenuAction():
                     tg_id=tg_id,
                     online=True
                 )
-                print(f"[ADD SERVER] Registered server {server_id} in ServerManager")
+                logger.info(f"[ADD SERVER] Registered server {server_id} in ServerManager")
             
             self.update_server_tree()
             self.save_server_interfaces()
@@ -114,7 +118,7 @@ class TrafficGenClientMenuAction():
                     from utils.server_manager import ServerManager
                     server_id = ServerManager._extract_server_id_from_url(server_address)
                     self.server_manager.unregister_server(server_id)
-                    print(f"[REMOVE SERVER] Unregistered server {server_id} from ServerManager")
+                    logger.info(f"[REMOVE SERVER] Unregistered server {server_id} from ServerManager")
                 
                 self.server_interfaces = [
                     server for server in self.server_interfaces if server["address"] != server_address
@@ -134,7 +138,7 @@ class TrafficGenClientMenuAction():
                 index = self.server_tree.indexOfTopLevelItem(item)
                 self.server_tree.takeTopLevelItem(index)
 
-                print(f"Removed server: {server_address} and all associated ports.")
+                logger.info(f"Removed server: {server_address} and all associated ports.")
 
         # Session save removed - only save on explicit user action (Save Session menu or Apply button)
         self.save_server_interfaces()
@@ -204,12 +208,12 @@ class TrafficGenClientMenuAction():
                         tg_id=tg_id,
                         online=True
                     )
-                    print(f"[READD SERVER] Registered server {server_id} in ServerManager")
+                    logger.info(f"[READD SERVER] Registered server {server_id} in ServerManager")
                 
                 readded_servers.append(server_address)
 
         if readded_servers:
-            print(f"Re-added servers: {readded_servers}")
+            logger.info(f"Re-added servers: {readded_servers}")
             # Session save removed - only save on explicit user action (Save Session menu or Apply button)
             self.update_server_tree()  # Update the server tree
             QMessageBox.information(self, "Servers Re-added", f"Re-added servers: {', '.join(readded_servers)}")
@@ -227,9 +231,9 @@ class TrafficGenClientMenuAction():
             with open(server_file, "r") as f:
                 servers = [line.strip() for line in f.readlines()]
             self.server_interfaces = [{"tg_id": i, "address": server} for i, server in enumerate(servers)]
-            print(f"Loaded servers: {self.server_interfaces}")
+            logger.info(f"Loaded servers: {self.server_interfaces}")
         except FileNotFoundError:
-            print("server_interfaces.txt not found. Starting with an empty server list.")
+            logger.info("server_interfaces.txt not found. Starting with an empty server list.")
             self.server_interfaces = []
     def save_server_interfaces(self):
         """Save the server interfaces to a file."""
@@ -241,7 +245,7 @@ class TrafficGenClientMenuAction():
             with open(server_file, "w") as f:
                 for server in self.server_interfaces:
                     f.write(f"{server['address']}\n")
-            print("Server interfaces saved successfully.")
+            logger.info("Server interfaces saved successfully.")
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Could not save server interfaces: {e}")
     def save_session(self, blocking: bool = False):
@@ -285,10 +289,10 @@ class TrafficGenClientMenuAction():
             if blocking:
                 # Wait for the existing background worker to finish before proceeding
                 if worker_exists and worker_running and self._save_worker is not None:
-                    print("[SAVE SESSION] Waiting for existing background save to finish (blocking request)...")
+                    logger.info("[SAVE SESSION] Waiting for existing background save to finish (blocking request)...")
                     self._save_worker.quit()  # Request thread to stop
                     if not self._save_worker.wait(5000):
-                        print("[SAVE SESSION WARNING] Background save did not finish within timeout; forcing termination.")
+                        logger.warning("[SAVE SESSION WARNING] Background save did not finish within timeout; forcing termination.")
                         self._save_worker.terminate()
                         self._save_worker.wait(1000)
                 if worker_exists and self._save_worker is not None:
@@ -343,10 +347,10 @@ class TrafficGenClientMenuAction():
         if blocking:
             try:
                 if worker_exists and worker_running and self._save_worker is not None:
-                    print("[SAVE SESSION] Waiting for existing background save to finish...")
+                    logger.info("[SAVE SESSION] Waiting for existing background save to finish...")
                     self._save_worker.quit()  # Request thread to stop
                     if not self._save_worker.wait(5000):
-                        print("[SAVE SESSION WARNING] Background save did not finish within timeout; forcing termination.")
+                        logger.warning("[SAVE SESSION WARNING] Background save did not finish within timeout; forcing termination.")
                         self._save_worker.terminate()
                         self._save_worker.wait(1000)
                 if worker_exists and self._save_worker is not None:
@@ -364,9 +368,9 @@ class TrafficGenClientMenuAction():
             finally:
                 self._save_in_progress = False
             if success:
-                print(f"[SAVE SESSION] {message}")
+                logger.info(f"[SAVE SESSION] {message}")
             else:
-                print(f"[SAVE SESSION ERROR] {message}")
+                logger.error(f"[SAVE SESSION ERROR] {message}")
             return success, message
         
         self._save_in_progress = True
@@ -409,13 +413,13 @@ class TrafficGenClientMenuAction():
                     # Object already deleted, ignore
                     pass
                 except Exception as exc:
-                    print(f"[SAVE SESSION] Error cleaning up previous worker: {exc}")
+                    logger.info(f"[SAVE SESSION] Error cleaning up previous worker: {exc}")
             
             # CRITICAL: Don't create a new worker if one is already running
             # This prevents multiple workers from being created during rapid save calls
             if worker_exists and worker_running:
                 # Worker already running, skip creating a new one
-                print("[SAVE SESSION] Save worker already running, skipping duplicate save request")
+                logger.info("[SAVE SESSION] Save worker already running, skipping duplicate save request")
                 return True, "Save already in progress"
             
             # Create new worker if needed
@@ -434,9 +438,9 @@ class TrafficGenClientMenuAction():
         """Handle save completion (called from worker thread via signal)."""
         self._save_in_progress = False
         if success:
-            print(f"[SAVE SESSION] {message}")
+            logger.info(f"[SAVE SESSION] {message}")
         else:
-            print(f"[SAVE SESSION ERROR] {message}")
+            logger.error(f"[SAVE SESSION ERROR] {message}")
         
         # CRITICAL: Properly clean up the worker thread
         # Wait for thread to finish, then schedule deletion
@@ -523,7 +527,7 @@ class TrafficGenClientMenuAction():
             # Sync ServerManager with current server_interfaces
             # Reinitialize to ensure consistency (clear_existing=True to prevent duplicates)
             self.server_manager.initialize_from_server_interfaces(self.server_interfaces, clear_existing=True)
-            print(f"[SAVE SESSION] Synced ServerManager with {len(self.server_interfaces)} server(s)")
+            logger.info(f"[SAVE SESSION] Synced ServerManager with {len(self.server_interfaces)} server(s)")
         
         # Check if we should preserve original servers (CLI mode without modifications)
         preserve_original = False
@@ -542,7 +546,7 @@ class TrafficGenClientMenuAction():
         if preserve_original:
             # CLI mode: preserve original servers from session.json (no changes made)
             servers_to_save = self.original_session_servers
-            print(f"[SAVE SESSION] Preserving {len(servers_to_save)} original server(s) from session.json (CLI mode, no changes)")
+            logger.info(f"[SAVE SESSION] Preserving {len(servers_to_save)} original server(s) from session.json (CLI mode, no changes)")
         else:
             # Normal mode or CLI mode with modifications: save current servers
             # Clean server_interfaces to remove PyQt widget objects before saving
@@ -563,9 +567,9 @@ class TrafficGenClientMenuAction():
                     servers_to_save.append(clean_server)
             
             if getattr(self, 'server_url_from_cli', False):
-                print(f"[SAVE SESSION] Saving {len(servers_to_save)} current server(s) (CLI mode, servers modified)")
+                logger.info(f"[SAVE SESSION] Saving {len(servers_to_save)} current server(s) (CLI mode, servers modified)")
             else:
-                print(f"[SAVE SESSION] Saving {len(servers_to_save)} current server(s)")
+                logger.info(f"[SAVE SESSION] Saving {len(servers_to_save)} current server(s)")
         
         # Clean up removed_servers - remove any servers that are currently in server_interfaces
         # This ensures that if a server was previously removed but then re-added, it won't be in removed_servers
@@ -602,16 +606,16 @@ class TrafficGenClientMenuAction():
     def _cleanup_removed_devices_from_server(self, removed_device_ids, all_loaded_devices):
         """Clean up removed devices from server during session loading."""
         try:
-            print(f"[DEBUG CLEANUP] Starting server cleanup for {len(removed_device_ids)} removed devices")
+            logger.debug(f"[DEBUG CLEANUP] Starting server cleanup for {len(removed_device_ids)} removed devices")
             
             # Get server URL
             if not hasattr(self, "devices_tab") or not self.devices_tab:
-                print(f"[DEBUG CLEANUP] No devices_tab available")
+                logger.debug(f"[DEBUG CLEANUP] No devices_tab available")
                 return
             
             server_url = self.devices_tab.get_server_url(silent=True)
             if not server_url:
-                print(f"[DEBUG CLEANUP] No server URL available")
+                logger.debug(f"[DEBUG CLEANUP] No server URL available")
                 return
             
             import requests
@@ -633,11 +637,11 @@ class TrafficGenClientMenuAction():
                     # If device info not found, it means the device was already removed from session
                     # or doesn't exist. We should remove it from removed_devices list.
                     if not device_info:
-                        print(f"[DEBUG CLEANUP] Device info not found for ID: {device_id} - already removed or doesn't exist")
+                        logger.debug(f"[DEBUG CLEANUP] Device info not found for ID: {device_id} - already removed or doesn't exist")
                         devices_to_remove_from_session.append(device_id)
                         continue
                     
-                    print(f"[DEBUG CLEANUP] Cleaning up removed device: {device_name} (ID: {device_id})")
+                    logger.debug(f"[DEBUG CLEANUP] Cleaning up removed device: {device_name} (ID: {device_id})")
                     
                     # Clean up device-specific IPs from server
                     iface_label = device_info.get("Interface", "")
@@ -656,14 +660,14 @@ class TrafficGenClientMenuAction():
                     cleanup_resp = requests.post(f"{server_url}/api/device/cleanup", json=cleanup_payload, timeout=10)
                     cleanup_success = cleanup_resp.status_code == 200
                     if cleanup_success:
-                        print(f"[DEBUG CLEANUP] Successfully cleaned up IPs for device: {device_name}")
+                        logger.debug(f"[DEBUG CLEANUP] Successfully cleaned up IPs for device: {device_name}")
                     else:
                         # If device doesn't exist (404), it's already cleaned up
                         if cleanup_resp.status_code == 404:
-                            print(f"[DEBUG CLEANUP] Device {device_name} doesn't exist on server (already removed)")
+                            logger.debug(f"[DEBUG CLEANUP] Device {device_name} doesn't exist on server (already removed)")
                             cleanup_success = True  # Treat as success since device is already gone
                         else:
-                            print(f"[DEBUG CLEANUP] Cleanup failed for {device_name}: {cleanup_resp.status_code}")
+                            logger.error(f"[DEBUG CLEANUP] Cleanup failed for {device_name}: {cleanup_resp.status_code}")
                     
                     # Also call the device remove API for protocol cleanup
                     remove_payload = {
@@ -679,21 +683,21 @@ class TrafficGenClientMenuAction():
                     remove_resp = requests.post(f"{server_url}/api/device/remove", json=remove_payload, timeout=10)
                     remove_success = remove_resp.status_code == 200
                     if remove_success:
-                        print(f"[DEBUG CLEANUP] Successfully removed device protocols: {device_name}")
+                        logger.debug(f"[DEBUG CLEANUP] Successfully removed device protocols: {device_name}")
                     else:
                         # If device doesn't exist (404), it's already removed
                         if remove_resp.status_code == 404:
-                            print(f"[DEBUG CLEANUP] Device {device_name} doesn't exist on server (already removed)")
+                            logger.debug(f"[DEBUG CLEANUP] Device {device_name} doesn't exist on server (already removed)")
                             remove_success = True  # Treat as success since device is already gone
                         else:
-                            print(f"[DEBUG CLEANUP] Remove API failed for {device_name}: {remove_resp.status_code}")
+                            logger.error(f"[DEBUG CLEANUP] Remove API failed for {device_name}: {remove_resp.status_code}")
                     
                     # If cleanup was successful (or device doesn't exist), remove from session
                     if cleanup_success or remove_success:
                         devices_to_remove_from_session.append(device_id)
                         
                 except Exception as e:
-                    print(f"[ERROR] Failed to cleanup device {device_id}: {e}")
+                    logger.error(f"Failed to cleanup device {device_id}: {e}")
             
             # Remove successfully cleaned devices from session.json
             if devices_to_remove_from_session:
@@ -715,14 +719,14 @@ class TrafficGenClientMenuAction():
                     if removed_count > 0:
                         with open(session_file, "w") as f:
                             json.dump(session_data, f, indent=2)
-                        print(f"[DEBUG CLEANUP] Removed {removed_count} device(s) from session.json removed_devices list")
+                        logger.debug(f"[DEBUG CLEANUP] Removed {removed_count} device(s) from session.json removed_devices list")
                 except Exception as e:
-                    print(f"[ERROR] Failed to update session.json: {e}")
+                    logger.error(f"Failed to update session.json: {e}")
             
-            print(f"[DEBUG CLEANUP] Completed server cleanup for removed devices")
+            logger.debug(f"[DEBUG CLEANUP] Completed server cleanup for removed devices")
             
         except Exception as e:
-            print(f"[ERROR] Failed to cleanup removed devices from server: {e}")
+            logger.error(f"Failed to cleanup removed devices from server: {e}")
 
     def _extract_table_data(self, table):
         """Extract data from a QTableWidget and return as list of dictionaries."""
@@ -836,7 +840,7 @@ class TrafficGenClientMenuAction():
         for port, lst in list(self.streams.items()):
             if not isinstance(lst, list):
                 # Corrupt shape; drop it to be safe
-                print(f"[WARN] Streams for '{port}' not a list; dropping.")
+                logger.warning(f"[WARN] Streams for '{port}' not a list; dropping.")
                 del self.streams[port]
                 continue
 
@@ -869,8 +873,43 @@ class TrafficGenClientMenuAction():
                 seen_ids.add(sid)
 
         if repaired:
-            print(f"[STREAM-ID] Repaired/created {repaired} stream_id(s) during load.")
+            logger.info(f"[STREAM-ID] Repaired/created {repaired} stream_id(s) during load.")
 
+    def _fetch_interfaces_async(self, address, server):
+        """Fetch interfaces from server asynchronously (non-blocking)."""
+        try:
+            # Use shorter timeout to prevent hanging
+            if hasattr(self, 'connection_manager') and self.connection_manager:
+                response = self.connection_manager.get(f"{address}/api/interfaces", timeout=2)
+            else:
+                import requests
+                response = requests.get(f"{address}/api/interfaces", timeout=2)
+            
+            if response.status_code == 200:
+                interfaces = response.json()
+                server["interfaces"] = interfaces
+                server["online"] = True
+                # Update server tree if it exists
+                if hasattr(self, 'update_server_tree'):
+                    from PyQt5.QtCore import QTimer
+                    QTimer.singleShot(0, self.update_server_tree)
+                logger.info(f"Fetched {len(interfaces)} interfaces from {address} (async)")
+            else:
+                server["online"] = False
+                if hasattr(self, 'failed_servers'):
+                    if server not in self.failed_servers:
+                        self.failed_servers.append(server)
+        except Exception as e:
+            logger.warning(f"Error fetching interfaces from {address} (async): {e}")
+            server["online"] = False
+            if hasattr(self, 'failed_servers'):
+                if server not in self.failed_servers:
+                    self.failed_servers.append(server)
+            # Update server tree to show offline status
+            if hasattr(self, 'update_server_tree'):
+                from PyQt5.QtCore import QTimer
+                QTimer.singleShot(0, self.update_server_tree)
+    
     def load_session(self, skip_servers=False):
         """Load the session from a JSON file.
         
@@ -883,7 +922,7 @@ class TrafficGenClientMenuAction():
             with open(session_file, "r") as f:
                 session_data = json.load(f)
             
-            print(f"[DEBUG SESSION] Loaded session.json with {len(session_data.get('devices', {}))} devices")
+            logger.debug(f"[DEBUG SESSION] Loaded session.json with {len(session_data.get('devices', {}))} devices")
 
             # Load removed servers and removed interfaces
             self.removed_servers = set(session_data.get("removed_servers", []))
@@ -897,7 +936,7 @@ class TrafficGenClientMenuAction():
                 if iface and "TG " in iface and " - " in iface and not iface.startswith(" - "):
                     self.removed_interfaces.add(iface)
                 else:
-                    print(f"[DEBUG LOAD] Skipping invalid removed interface format: {iface}")
+                    logger.debug(f"[DEBUG LOAD] Skipping invalid removed interface format: {iface}")
             
             # Always preserve original servers from session.json (for saving later in CLI mode)
             session_servers = session_data.get("servers", [])
@@ -914,7 +953,7 @@ class TrafficGenClientMenuAction():
                     server_address = server["address"]
                     if server_address not in existing_server_urls and server_address not in self.removed_servers:
                         self.server_interfaces.append(server)
-                        print(f"[DEBUG LOAD] Added server {server_address} from session")
+                        logger.debug(f"[DEBUG LOAD] Added server {server_address} from session")
                         
                         # Update ServerManager if available (will be initialized later, but this ensures consistency)
                         if hasattr(self, "server_manager"):
@@ -929,46 +968,53 @@ class TrafficGenClientMenuAction():
                                 interfaces=server.get("interfaces", [])
                             )
                     elif server_address in self.removed_servers:
-                        print(f"[DEBUG LOAD] Skipped removed server {server_address}")
+                        logger.debug(f"[DEBUG LOAD] Skipped removed server {server_address}")
             else:
-                print(f"[DEBUG LOAD] Skipped loading servers from session.json (server provided via CLI)")
-                print(f"[DEBUG LOAD] Preserved {len(self.original_session_servers)} original server(s) from session.json for future saves")
+                logger.debug(f"[DEBUG LOAD] Skipped loading servers from session.json (server provided via CLI)")
+                logger.debug(f"[DEBUG LOAD] Preserved {len(self.original_session_servers)} original server(s) from session.json for future saves")
             
             self.streams = {}
             self.failed_servers = []
             self.all_devices = {}  # Initialize all_devices
 
-            # Discover valid interfaces from online servers
+            # Discover valid interfaces from online servers (deferred to avoid blocking startup)
+            # Use cached interfaces from session.json if available, otherwise fetch asynchronously
             valid_ports = set()
             for server in self.server_interfaces:
                 tg_id = f"TG {server.get('tg_id', '0')}"
                 address = server.get("address")
-                if not self.is_reachable(address):
-                    print(f"❌ Server unreachable: {address}")
-                    server["online"] = False
-                    self.failed_servers.append(server)
-                    continue
-                try:
-                    r = requests.get(f"{address}/api/interfaces", timeout=5)
-                    r.raise_for_status()
-                    interfaces = r.json()
+                
+                # First, try to use cached interfaces from session.json (fast, no network call)
+                cached_interfaces = server.get("interfaces", [])
+                if cached_interfaces:
+                    # Use cached interfaces immediately (non-blocking)
                     server["online"] = True
-                    for iface in interfaces:
-                        # Create port names in both formats to match saved stream keys
-                        port_name_simple = f"{tg_id} - {iface['name']}"
-                        port_name_with_port = f"{tg_id} - Port: {iface['name']}"
-                        if port_name_simple not in self.removed_interfaces and port_name_with_port not in self.removed_interfaces:
-                            valid_ports.add(port_name_simple)
-                            valid_ports.add(port_name_with_port)  # Also add format with "Port:" to match saved streams
-                except Exception as e:
-                    print(f"⚠️ Error fetching interfaces from {address}: {e}")
+                    for iface in cached_interfaces:
+                        iface_name = iface if isinstance(iface, str) else iface.get('name', '')
+                        if iface_name:
+                            port_name_simple = f"{tg_id} - {iface_name}"
+                            port_name_with_port = f"{tg_id} - Port: {iface_name}"
+                            if port_name_simple not in self.removed_interfaces and port_name_with_port not in self.removed_interfaces:
+                                valid_ports.add(port_name_simple)
+                                valid_ports.add(port_name_with_port)
+                    # Schedule async refresh of interfaces (non-blocking)
+                    from PyQt5.QtCore import QTimer
+                    def refresh_interfaces():
+                        self._fetch_interfaces_async(address, server)
+                    QTimer.singleShot(100, refresh_interfaces)
+                else:
+                    # No cached interfaces - mark as offline for now, will be fetched asynchronously
                     server["online"] = False
-                    self.failed_servers.append(server)
+                    # Schedule async fetch (non-blocking)
+                    from PyQt5.QtCore import QTimer
+                    def fetch_interfaces():
+                        self._fetch_interfaces_async(address, server)
+                    QTimer.singleShot(100, fetch_interfaces)
 
             # Load streams (raw)
             loaded_streams = session_data.get("streams", {})
             if not isinstance(loaded_streams, dict):
-                print("⚠️ Session 'streams' malformed; starting with empty.")
+                logger.warning("Session 'streams' malformed; starting with empty.")
                 loaded_streams = {}
 
             self.streams = loaded_streams
@@ -982,7 +1028,7 @@ class TrafficGenClientMenuAction():
 
             # Load BGP route pools from session
             self.bgp_route_pools = session_data.get("bgp_route_pools", [])
-            print(f"[DEBUG LOAD] Loaded {len(self.bgp_route_pools)} BGP route pool(s)")
+            logger.debug(f"[DEBUG LOAD] Loaded {len(self.bgp_route_pools)} BGP route pool(s)")
             
             # Load devices from session
             loaded_devices = session_data.get("devices", {})
@@ -999,7 +1045,7 @@ class TrafficGenClientMenuAction():
                     
                     # Skip devices that were marked as removed
                     if device_id in removed_devices:
-                        print(f"[DEBUG LOAD] Skipping removed device: {device_name} (ID: {device_id})")
+                        logger.debug(f"[DEBUG LOAD] Skipping removed device: {device_name} (ID: {device_id})")
                         removed_count += 1
                         continue
                     
@@ -1008,7 +1054,7 @@ class TrafficGenClientMenuAction():
                     if vxlan_config and isinstance(vxlan_config, dict):
                         if "tunnels" not in vxlan_config:
                             # Old format: single tunnel dict, convert to tunnels format
-                            print(f"[DEBUG LOAD] Converting old VXLAN config format to tunnels format for {device_name}")
+                            logger.debug(f"[DEBUG LOAD] Converting old VXLAN config format to tunnels format for {device_name}")
                             device_info["vxlan_config"] = {"tunnels": [vxlan_config]}
                     
                     iface = device_info.get("Interface", "")
@@ -1020,13 +1066,13 @@ class TrafficGenClientMenuAction():
                 
                 # Clean up removed devices from server if any were found
                 if removed_devices and hasattr(self, "devices_tab") and self.devices_tab:
-                    print(f"[DEBUG LOAD] Found {len(removed_devices)} removed devices in session - cleaning up from server")
+                    logger.debug(f"[DEBUG LOAD] Found {len(removed_devices)} removed devices in session - cleaning up from server")
                     self._cleanup_removed_devices_from_server(removed_devices, loaded_devices)
                 
                 # Load BGP protocols from session
                 session_bgp_protocols = session_data.get("protocols", {}).get("bgp", [])
                 if session_bgp_protocols:
-                    print(f"[DEBUG LOAD] Found {len(session_bgp_protocols)} BGP protocols in session")
+                    logger.debug(f"[DEBUG LOAD] Found {len(session_bgp_protocols)} BGP protocols in session")
                 
                 # Update devices tab with loaded devices
                 if hasattr(self, "devices_tab") and self.devices_tab:
@@ -1034,9 +1080,9 @@ class TrafficGenClientMenuAction():
                     self.devices_tab.update_device_table(self.all_devices)
                     # Update BGP table with loaded BGP configurations
                     self.devices_tab.update_bgp_table()
-                    print(f"[DEBUG LOAD] Loaded {loaded_count} devices from session, skipped {removed_count} removed devices")
+                    logger.debug(f"[DEBUG LOAD] Loaded {loaded_count} devices from session, skipped {removed_count} removed devices")
             else:
-                print("[DEBUG LOAD] No valid devices found in session")
+                logger.debug("[DEBUG LOAD] No valid devices found in session")
                 self.all_devices = {}
 
             # Restore selected servers
@@ -1054,18 +1100,109 @@ class TrafficGenClientMenuAction():
 
             stream_count = sum(len(v) for v in self.streams.values())
             port_count = len(self.streams)
-            print(f"✅ Session loaded: {stream_count} streams across {port_count} ports.")
+            logger.info(f"Session loaded: {stream_count} streams across {port_count} ports.")
             if stream_count > 0:
-                print(f"[DEBUG LOAD] Stream port keys: {list(self.streams.keys())}")
+                logger.debug(f"[DEBUG LOAD] Stream port keys: {list(self.streams.keys())}")
             if valid_ports:
-                print(f"[DEBUG LOAD] Valid ports discovered: {sorted(valid_ports)}")
-
+                logger.debug(f"[DEBUG LOAD] Valid ports discovered: {sorted(valid_ports)}")
+            
+            # Auto-start enabled streams that were previously running (after server restart or client restart)
+            # Wait a moment for servers to be ready, then start enabled streams
+            if stream_count > 0 and hasattr(self, "start_all_streams"):
+                from PyQt5.QtCore import QTimer
+                # Count enabled streams that should be auto-started
+                enabled_streams_count = 0
+                for port_label, stream_list in self.streams.items():
+                    for stream in stream_list:
+                        # Check if stream is enabled (either explicitly or was running)
+                        is_enabled = stream.get("enabled", False)
+                        if not is_enabled:
+                            # Check protocol_selection
+                            ps = stream.get("protocol_selection", {})
+                            is_enabled = ps.get("enabled", False)
+                        # Also check if stream was running (status="running")
+                        was_running = stream.get("status", "").lower() == "running"
+                        if is_enabled or was_running:
+                            enabled_streams_count += 1
+                
+                if enabled_streams_count > 0:
+                    logger.info(f"[AUTO-START] Found {enabled_streams_count} enabled/running stream(s) to auto-start")
+                    # Delay auto-start to ensure servers and UI are ready (wait 3 seconds)
+                    # This gives time for:
+                    # - Server connections to be established
+                    # - Stream table to be populated
+                    # - Statistics polling to initialize
+                    QTimer.singleShot(3000, lambda: self._auto_start_streams_from_session())
+                else:
+                    logger.info(f"[AUTO-START] No enabled streams found to auto-start")
+        
         except FileNotFoundError:
-            print("No session file found. Starting fresh.")
+            logger.info("No session file found. Starting fresh.")
             self._initialize_empty_session()
+    
+    def _auto_start_streams_from_session(self):
+        """Auto-start enabled streams that were loaded from session.json."""
+        # Safety checks: ensure UI is fully initialized before attempting auto-start
+        if not hasattr(self, "start_all_streams"):
+            logger.info("[AUTO-START] start_all_streams method not available")
+            return
+        
+        # Ensure stream_table exists and is initialized
+        if not hasattr(self, "stream_table") or self.stream_table is None:
+            logger.info("[AUTO-START] Stream table not initialized yet, skipping auto-start")
+            return
+        
+        # Check if any servers are online
+        online_servers = [s for s in getattr(self, "server_interfaces", []) if s.get("online", False)]
+        if not online_servers:
+            logger.info("[AUTO-START] No online servers available, skipping auto-start")
+            return
+        
+        # Check if there are any enabled streams to start
+        enabled_count = 0
+        streams_to_start = []
+        for port_label, stream_list in getattr(self, "streams", {}).items():
+            for stream in stream_list:
+                # Check if stream is enabled
+                is_enabled = stream.get("enabled", False)
+                if not is_enabled:
+                    ps = stream.get("protocol_selection", {})
+                    is_enabled = ps.get("enabled", False)
+                # Also check if stream was running (status="running")
+                was_running = stream.get("status", "").lower() == "running"
+                if is_enabled or was_running:
+                    enabled_count += 1
+                    streams_to_start.append((port_label, stream))
+        
+        if enabled_count > 0:
+            logger.info(f"[AUTO-START] Found {enabled_count} enabled stream(s) to auto-start")
+            # Use QTimer to defer execution to next event loop cycle to ensure UI is ready
+            from PyQt5.QtCore import QTimer
+            try:
+                # Defer to next event loop cycle to ensure UI is fully ready
+                QTimer.singleShot(100, lambda: self._do_auto_start_streams(streams_to_start))
+            except Exception as e:
+                logger.info(f"[AUTO-START] ❌ Error scheduling auto-start: {e}")
+                import traceback
+                traceback.print_exc()
+        else:
+            logger.info(f"[AUTO-START] No enabled streams to auto-start")
+    
+    def _do_auto_start_streams(self, streams_to_start):
+        """Actually perform the auto-start of streams."""
+        try:
+            # Double-check UI is ready
+            if not hasattr(self, "stream_table") or self.stream_table is None:
+                logger.info("[AUTO-START] Stream table still not ready, aborting auto-start")
+                return
+            
+            logger.info(f"[AUTO-START] Auto-starting {len(streams_to_start)} enabled stream(s) from session.json...")
+            self.start_all_streams()
+            logger.info(f"[AUTO-START] ✅ Auto-start completed")
         except Exception as e:
-            print(f"❌ Failed to load session: {e}")
-            self._initialize_empty_session()
+            logger.info(f"[AUTO-START] ❌ Error during auto-start: {e}")
+            import traceback
+            traceback.print_exc()
     def reset_session(self):
         """Reset the session data to default."""
         self.server_interfaces = []
@@ -1121,8 +1258,8 @@ class TrafficGenClientMenuAction():
         # Get selected servers from checkboxes
         selected_servers = getattr(self, "selected_servers", [])
         selected_tg_ids = self.get_selected_tg_ids()
-        print(f"[MAKE SERVER ONLINE] Selected TG IDs: {selected_tg_ids}")
-        print(f"[MAKE SERVER ONLINE] Selected servers count: {len(selected_servers)}")
+        logger.info(f"[MAKE SERVER ONLINE] Selected TG IDs: {selected_tg_ids}")
+        logger.info(f"[MAKE SERVER ONLINE] Selected servers count: {len(selected_servers)}")
         
         if not selected_servers:
             QMessageBox.information(self, "No Servers Selected", "Please select servers using the checkboxes to retry connections.")
@@ -1138,14 +1275,14 @@ class TrafficGenClientMenuAction():
             QMessageBox.information(self, "No Selected Servers Failed", "None of the selected servers are currently offline.")
             return
         
-        print(f"🛠️ Attempting reconnection to {len(selected_failed_servers)} selected failed server(s): " +
+        logger.info(f"Attempting reconnection to {len(selected_failed_servers)} selected failed server(s): " +
               ", ".join([s.get('address', 'Unknown') for s in selected_failed_servers]))
         
         any_reconnected = False
 
         for server in selected_failed_servers[:]:  # Iterate over a copy since we may modify it
             address = server.get("address")
-            print(f"🔄 Trying to bring selected server {address} online...")
+            logger.info(f"Trying to bring selected server {address} online...")
 
             try:
                 # Use connection manager if available
@@ -1157,7 +1294,7 @@ class TrafficGenClientMenuAction():
                 if response.status_code == 200:
                     server["online"] = True
                     self.update_server_status_icon(server, True)
-                    print(f"✅ Selected server {address} is now online.")
+                    logger.info(f"Selected server {address} is now online.")
                     any_reconnected = True
                     self.failed_servers.remove(server)  # ✅ Remove from failed list
                     
@@ -1165,9 +1302,9 @@ class TrafficGenClientMenuAction():
                     if hasattr(self, 'server_retry_worker') and self.server_retry_worker:
                         self.server_retry_worker.remove_failed_server(server)
                 else:
-                    print(f"❌ Selected server {address} still unreachable (status {response.status_code})")
+                    logger.error(f"Selected server {address} still unreachable (status {response.status_code})")
             except requests.RequestException as e:
-                print(f"❌ Still failed to connect to selected server {address}: {e}")
+                logger.error(f"Still failed to connect to selected server {address}: {e}")
 
         if any_reconnected:
             QMessageBox.information(self, "Servers Updated", "Some servers are now back online.")
@@ -1188,7 +1325,7 @@ class TrafficGenClientMenuAction():
 
     def _initialize_empty_session(self):
         """Initialize an empty session with default values."""
-        print("Initializing an empty session.")
+        logger.info("Initializing an empty session.")
         # Don't overwrite server_interfaces if servers were added via command line
         if not self.server_interfaces:
             self.server_interfaces = []
@@ -1199,11 +1336,11 @@ class TrafficGenClientMenuAction():
 
         # Check if servers are reachable and update their status
         if self.server_interfaces:
-            print(f"Checking {len(self.server_interfaces)} server(s) for connectivity...")
+            logger.info(f"Checking {len(self.server_interfaces)} server(s) for connectivity...")
             for server in self.server_interfaces:
                 address = server.get("address")
                 if self.is_reachable(address):
-                    print(f"✅ Server {address} is reachable")
+                    logger.info(f"Server {address} is reachable")
                     server["online"] = True
                     try:
                         # Use shorter timeout to prevent hanging during initialization
@@ -1211,12 +1348,12 @@ class TrafficGenClientMenuAction():
                         r.raise_for_status()
                         interfaces = r.json()
                         server["interfaces"] = interfaces  # Store interfaces for update_server_tree
-                        print(f"✅ Fetched {len(interfaces)} interfaces from {address}")
+                        logger.info(f"Fetched {len(interfaces)} interfaces from {address}")
                     except Exception as e:
-                        print(f"❌ Error fetching interfaces from {address}: {e}")
+                        logger.error(f"Error fetching interfaces from {address}: {e}")
                         server["online"] = False
                 else:
-                    print(f"❌ Server {address} is unreachable")
+                    logger.error(f"Server {address} is unreachable")
                     server["online"] = False
 
         # Update UI components to reflect the reset state
@@ -1224,7 +1361,7 @@ class TrafficGenClientMenuAction():
             self.update_server_tree()
         if hasattr(self, "update_stream_table"):
             self.update_stream_table()
-        print("Empty session initialized.")
+        logger.info("Empty session initialized.")
     def is_reachable(self, server_url, timeout=2):
         """Check if a traffic generator server is reachable."""
         try:
@@ -1232,3 +1369,348 @@ class TrafficGenClientMenuAction():
             return response.status_code == 200
         except Exception:
             return False
+    def restart_server(self):
+        """Restart TGEN service on selected server(s) via SSH/systemctl."""
+        if not hasattr(self, "server_interfaces") or not self.server_interfaces:
+            QMessageBox.warning(self, "No Servers", "No servers are configured.")
+            return
+
+        # Get selected servers from tree or use all servers
+        selected_items = self.server_tree.selectedItems() if hasattr(self, "server_tree") else []
+        
+        servers_to_restart = []
+        
+        if selected_items:
+            # Get servers from selected items
+            for item in selected_items:
+                parent = item.parent()
+                if parent:
+                    # This is an interface item, get the server from parent
+                    parent_index = self.server_tree.indexOfTopLevelItem(parent)
+                    if parent_index >= 0 and parent_index < len(self.server_interfaces):
+                        server = self.server_interfaces[parent_index]
+                        if server not in servers_to_restart:
+                            servers_to_restart.append(server)
+                else:
+                    # This is a server item
+                    server_index = self.server_tree.indexOfTopLevelItem(item)
+                    if server_index >= 0 and server_index < len(self.server_interfaces):
+                        server = self.server_interfaces[server_index]
+                        if server not in servers_to_restart:
+                            servers_to_restart.append(server)
+        
+        # If no servers selected, show dialog to select servers
+        if not servers_to_restart:
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Restart TGEN Service")
+            dialog.setGeometry(300, 300, 500, 400)
+            
+            layout = QVBoxLayout(dialog)
+            
+            label = QLabel("Select server(s) to restart TGEN service:")
+            layout.addWidget(label)
+            
+            list_widget = QListWidget()
+            list_widget.setSelectionMode(QAbstractItemView.MultiSelection)
+            layout.addWidget(list_widget)
+            
+            # Populate with all servers
+            for server in self.server_interfaces:
+                address = server.get("address", "Unknown")
+                tg_id = server.get("tg_id", "?")
+                online_status = "Online" if server.get("online", False) else "Offline"
+                item_text = f"TG {tg_id}: {address} ({online_status})"
+                item = QListWidgetItem(item_text)
+                item.setData(Qt.UserRole, server)
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setCheckState(Qt.Unchecked)
+                list_widget.addItem(item)
+            
+            button_layout = QHBoxLayout()
+            restart_button = QPushButton("Restart Selected")
+            restart_button.clicked.connect(lambda: self._restart_selected_servers(list_widget, dialog))
+            cancel_button = QPushButton("Cancel")
+            cancel_button.clicked.connect(dialog.reject)
+            button_layout.addWidget(restart_button)
+            button_layout.addWidget(cancel_button)
+            layout.addLayout(button_layout)
+            
+            dialog.exec()
+            return
+        
+        # Restart selected servers
+        self._restart_servers_list(servers_to_restart)
+
+    def _restart_selected_servers(self, list_widget, dialog):
+        """Restart servers selected in the dialog."""
+        servers_to_restart = []
+        for i in range(list_widget.count()):
+            item = list_widget.item(i)
+            if item.checkState() == Qt.Checked:
+                server = item.data(Qt.UserRole)
+                if server:
+                    servers_to_restart.append(server)
+        
+        dialog.accept()
+        
+        if not servers_to_restart:
+            QMessageBox.information(self, "No Selection", "Please select at least one server to restart.")
+            return
+        
+        self._restart_servers_list(servers_to_restart)
+
+    def _restart_servers_list(self, servers):
+        """Restart a list of servers via SSH/systemctl."""
+        if not servers:
+            return
+        
+        # Confirm restart
+        server_names = [f"TG {s.get('tg_id', '?')}: {s.get('address', 'Unknown')}" for s in servers]
+        reply = QMessageBox.question(
+            self,
+            "Confirm TGEN Restart",
+            f"Are you sure you want to restart the TGEN service on the following server(s)?\n\n" + "\n".join(server_names) + "\n\nThis will:\n• Restart the ostg-server service\n• Stop all running streams\n• Service will be back online in a few seconds",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        
+        if reply != QMessageBox.Yes:
+            return
+        
+        # Restart each server
+        results = []
+        for server in servers:
+            address = server.get("address", "")
+            tg_id = server.get("tg_id", "?")
+            
+            # Extract hostname from URL (e.g., "http://svl-hp-ai-srv04:5051" -> "svl-hp-ai-srv04")
+            try:
+                parsed = urlparse(address)
+                hostname = parsed.hostname
+                if not hostname:
+                    # Fallback: try to extract from address string
+                    if "://" in address:
+                        hostname = address.split("://")[1].split(":")[0]
+                    else:
+                        hostname = address.split(":")[0]
+            except Exception as e:
+                QMessageBox.warning(self, "Invalid Server Address", f"Could not parse server address '{address}': {e}")
+                continue
+            
+            if not hostname:
+                QMessageBox.warning(self, "Invalid Server Address", f"Could not extract hostname from '{address}'")
+                continue
+            
+            # Restart via SSH
+            try:
+                # Use systemctl to restart the service
+                cmd = ["ssh", f"root@{hostname}", "systemctl", "restart", "ostg-server"]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+                
+                if result.returncode == 0:
+                    results.append(f"✅ TG {tg_id} ({hostname}): Restarted successfully")
+                    logger.info(f"[RESTART SERVER] Successfully restarted server TG {tg_id} on {hostname}")
+                else:
+                    error_msg = result.stderr.strip() or result.stdout.strip() or "Unknown error"
+                    results.append(f"❌ TG {tg_id} ({hostname}): Failed - {error_msg}")
+                    logger.error(f"[RESTART SERVER] Failed to restart server TG {tg_id} on {hostname}: {error_msg}")
+            except subprocess.TimeoutExpired:
+                results.append(f"⏱️ TG {tg_id} ({hostname}): Timeout (server may be restarting)")
+                logger.info(f"[RESTART SERVER] Timeout restarting server TG {tg_id} on {hostname}")
+            except FileNotFoundError:
+                results.append(f"❌ TG {tg_id} ({hostname}): SSH not found (install OpenSSH client)")
+                logger.info(f"[RESTART SERVER] SSH command not found - OpenSSH client may not be installed")
+            except Exception as e:
+                results.append(f"❌ TG {tg_id} ({hostname}): Error - {str(e)}")
+                logger.info(f"[RESTART SERVER] Error restarting server TG {tg_id} on {hostname}: {e}")
+        
+        # Show results
+        result_text = "\n".join(results)
+        QMessageBox.information(
+            self,
+            "TGEN Restart Results",
+            f"TGEN service restart results:\n\n{result_text}\n\nNote: Services may take a few seconds to come back online."
+        )
+        
+        # Refresh server status after a delay
+        if hasattr(self, "update_server_tree"):
+            QTimer.singleShot(3000, self.update_server_tree)
+    
+    def reboot_server(self):
+        """Reboot selected server(s) via SSH/reboot command."""
+        if not hasattr(self, "server_interfaces") or not self.server_interfaces:
+            QMessageBox.warning(self, "No Servers", "No servers are configured.")
+            return
+        
+        # Get selected servers from tree or use all servers
+        selected_items = self.server_tree.selectedItems() if hasattr(self, "server_tree") else []
+        
+        servers_to_reboot = []
+        
+        if selected_items:
+            # Get servers from selected items
+            for item in selected_items:
+                parent = item.parent()
+                if parent:
+                    # This is an interface item, get the server from parent
+                    parent_index = self.server_tree.indexOfTopLevelItem(parent)
+                    if parent_index >= 0 and parent_index < len(self.server_interfaces):
+                        server = self.server_interfaces[parent_index]
+                        if server not in servers_to_reboot:
+                            servers_to_reboot.append(server)
+                else:
+                    # This is a server item
+                    server_index = self.server_tree.indexOfTopLevelItem(item)
+                    if server_index >= 0 and server_index < len(self.server_interfaces):
+                        server = self.server_interfaces[server_index]
+                        if server not in servers_to_reboot:
+                            servers_to_reboot.append(server)
+        
+        # If no servers selected, show dialog to select servers
+        if not servers_to_reboot:
+            dialog = QDialog(self)
+            dialog.setWindowTitle("Reboot Physical Server")
+            dialog.setGeometry(300, 300, 500, 400)
+            
+            layout = QVBoxLayout(dialog)
+            
+            label = QLabel("Select physical server(s) to reboot:")
+            layout.addWidget(label)
+            
+            list_widget = QListWidget()
+            list_widget.setSelectionMode(QAbstractItemView.MultiSelection)
+            layout.addWidget(list_widget)
+            
+            # Populate with all servers
+            for server in self.server_interfaces:
+                address = server.get("address", "Unknown")
+                tg_id = server.get("tg_id", "?")
+                online_status = "Online" if server.get("online", False) else "Offline"
+                item_text = f"TG {tg_id}: {address} ({online_status})"
+                item = QListWidgetItem(item_text)
+                item.setData(Qt.UserRole, server)
+                item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+                item.setCheckState(Qt.Unchecked)
+                list_widget.addItem(item)
+            
+            button_layout = QHBoxLayout()
+            reboot_button = QPushButton("Reboot")
+            reboot_button.clicked.connect(lambda: self._reboot_selected_servers(list_widget, dialog))
+            cancel_button = QPushButton("Cancel")
+            cancel_button.clicked.connect(dialog.reject)
+            button_layout.addWidget(reboot_button)
+            button_layout.addWidget(cancel_button)
+            layout.addLayout(button_layout)
+            
+            dialog.exec()
+            return
+        
+        # Reboot selected servers
+        self._reboot_servers_list(servers_to_reboot)
+    
+    def _reboot_selected_servers(self, list_widget, dialog):
+        """Reboot servers selected in the dialog."""
+        servers_to_reboot = []
+        for i in range(list_widget.count()):
+            item = list_widget.item(i)
+            if item.checkState() == Qt.Checked:
+                server = item.data(Qt.UserRole)
+                if server:
+                    servers_to_reboot.append(server)
+        
+        dialog.accept()
+        
+        if not servers_to_reboot:
+            QMessageBox.information(self, "No Selection", "Please select at least one server to reboot.")
+            return
+        
+        self._reboot_servers_list(servers_to_reboot)
+    
+    def _reboot_servers_list(self, servers):
+        """Reboot a list of servers via SSH/reboot command."""
+        if not servers:
+            return
+        
+        # Confirm reboot with strong warning
+        server_names = [f"TG {s.get('tg_id', '?')}: {s.get('address', 'Unknown')}" for s in servers]
+        reply = QMessageBox.warning(
+            self,
+            "Confirm Physical Server Reboot",
+            f"⚠️ WARNING: This will REBOOT the entire physical server(s)!\n\n"
+            f"Are you sure you want to reboot the following physical server(s)?\n\n" + 
+            "\n".join(server_names) + 
+            "\n\nThis will:\n"
+            "• Stop all running streams\n"
+            "• Disconnect all network connections\n"
+            "• Require several minutes (3-5 minutes) for the server to come back online\n"
+            "• Reset all hardware and firmware\n\n"
+            "This is typically needed to fix hardware/firmware issues (e.g., Broadcom NIC firmware).",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No
+        )
+        
+        if reply != QMessageBox.Yes:
+            return
+        
+        # Reboot each server
+        results = []
+        for server in servers:
+            address = server.get("address", "")
+            tg_id = server.get("tg_id", "?")
+            
+            # Extract hostname from URL
+            try:
+                parsed = urlparse(address)
+                hostname = parsed.hostname
+                if not hostname:
+                    if "://" in address:
+                        hostname = address.split("://")[1].split(":")[0]
+                    else:
+                        hostname = address.split(":")[0]
+            except Exception as e:
+                QMessageBox.warning(self, "Invalid Server Address", f"Could not parse server address '{address}': {e}")
+                continue
+            
+            if not hostname:
+                QMessageBox.warning(self, "Invalid Server Address", f"Could not extract hostname from '{address}'")
+                continue
+            
+            # Reboot via SSH
+            try:
+                # Use reboot command (with nohup to ensure it completes even if SSH disconnects)
+                cmd = ["ssh", f"root@{hostname}", "reboot"]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                
+                # Note: reboot command may disconnect SSH immediately, so we check if command was accepted
+                # Exit code 255 usually means SSH disconnected (which is expected during reboot)
+                if result.returncode == 0 or result.returncode == 255:
+                    results.append(f"✅ TG {tg_id} ({hostname}): Reboot initiated successfully")
+                    logger.info(f"[REBOOT SERVER] Successfully initiated reboot for server TG {tg_id} on {hostname}")
+                else:
+                    error_msg = result.stderr.strip() or result.stdout.strip() or "Unknown error"
+                    results.append(f"❌ TG {tg_id} ({hostname}): Failed - {error_msg}")
+                    logger.error(f"[REBOOT SERVER] Failed to reboot server TG {tg_id} on {hostname}: {error_msg}")
+            except subprocess.TimeoutExpired:
+                # Timeout is actually expected - SSH disconnects when server reboots
+                results.append(f"✅ TG {tg_id} ({hostname}): Reboot initiated (SSH disconnected - expected)")
+                logger.info(f"[REBOOT SERVER] Reboot initiated for server TG {tg_id} on {hostname} (SSH timeout expected)")
+            except FileNotFoundError:
+                results.append(f"❌ TG {tg_id} ({hostname}): SSH not found (install OpenSSH client)")
+                logger.info(f"[REBOOT SERVER] SSH command not found - OpenSSH client may not be installed")
+            except Exception as e:
+                results.append(f"❌ TG {tg_id} ({hostname}): Error - {str(e)}")
+                logger.info(f"[REBOOT SERVER] Error rebooting server TG {tg_id} on {hostname}: {e}")
+        
+        # Show results
+        result_text = "\n".join(results)
+        QMessageBox.information(
+            self,
+            "Physical Server Reboot Results",
+            result_text + "\n\n⚠️ IMPORTANT:\n"
+            "• Physical servers are now rebooting\n"
+            "• This will take 3-5 minutes\n"
+            "• All network connections will be lost\n"
+            "• Wait 3-5 minutes before checking server status\n"
+            "• After reboot, hardware/firmware issues should be resolved\n"
+            "• Interfaces should appear in 'ip link show' after reboot"
+        )

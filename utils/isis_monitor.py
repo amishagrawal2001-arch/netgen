@@ -85,7 +85,7 @@ class ISISMonitor:
                         import json
                         try:
                             protocols = json.loads(protocols)
-                        except:
+                        except Exception:
                             protocols = []
                     
                     has_isis_protocol = isinstance(protocols, list) and any(
@@ -104,7 +104,7 @@ class ISISMonitor:
                             # If it's a non-empty dict, mark as having config
                             if isis_config and isinstance(isis_config, dict):
                                 has_isis_config = True
-                        except:
+                        except Exception:
                             # If parsing fails but there's a value, still mark as having config
                             if isis_config:
                                 has_isis_config = True
@@ -326,7 +326,7 @@ class ISISMonitor:
                 if isinstance(protocols, str):
                     try:
                         protocols = json.loads(protocols)
-                    except:
+                    except Exception:
                         protocols = []
                 
                 has_isis_protocol = isinstance(protocols, list) and any(
@@ -342,7 +342,7 @@ class ISISMonitor:
                             isis_config = json.loads(isis_config)
                         if isis_config and isinstance(isis_config, dict):
                             has_isis_config = True
-                    except:
+                    except Exception:
                         if isis_config:
                             has_isis_config = True
                 
@@ -437,7 +437,7 @@ class ISISMonitor:
                         if isinstance(protocols, str):
                             try:
                                 protocols = json.loads(protocols)
-                            except:
+                            except Exception:
                                 protocols = []
                         
                         has_isis_protocol = isinstance(protocols, list) and any(
@@ -452,7 +452,7 @@ class ISISMonitor:
                                     isis_config = json.loads(isis_config)
                                 if isis_config and isinstance(isis_config, dict):
                                     has_isis_config = True
-                            except:
+                            except Exception:
                                 if isis_config:
                                     has_isis_config = True
                         

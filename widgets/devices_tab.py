@@ -23,11 +23,14 @@ from utils.devices_tab_isis import ISISHandler
 from utils.devices_tab_dhcp import DHCPHandler
 from utils.devices_tab_vxlan import VXLANHandler
 from .add_device_dialog import AddDeviceDialog
+from .unified_add_device_dialog import UnifiedAddDeviceDialog
 from .add_bgp_dialog import AddBgpDialog
 from .add_ospf_dialog import AddOspfDialog
 from .add_isis_dialog import AddIsisDialog
 from .add_vxlan_dialog import AddVxlanDialog
 from .add_bgp_route_dialog import ManageRoutePoolsDialog, AttachRoutePoolsDialog
+
+logger = logging.getLogger(__name__)
 
 
 class DeviceOperationWorker(QThread):
@@ -433,7 +436,7 @@ class MultiDeviceApplyWorker(QThread):
             except Exception as e:
                 message = f"❌ {device_name}: Error - {str(e)}"
                 self.device_applied.emit(device_name, False, message)
-                print(f"[MULTI DEVICE APPLY ERROR] {device_name}: {e}")
+                logger.error(f"{device_name}: {e}")
                 return (message, False)
         
         # Process devices in parallel using ThreadPoolExecutor
@@ -467,7 +470,7 @@ class MultiDeviceApplyWorker(QThread):
                     results.append(message)
                     failed_count += 1
                     self.device_applied.emit(device_name, False, message)
-                    print(f"[MULTI DEVICE APPLY ERROR] {device_name}: {e}")
+                    logger.error(f"{device_name}: {e}")
         
         # Emit final results
         self.finished.emit(results, successful_count, failed_count)
@@ -545,7 +548,7 @@ class MultiDeviceApplyWorker(QThread):
         # Check if application is closing (if we have access to main_window)
         if hasattr(self, 'parent_tab') and hasattr(self.parent_tab, 'main_window'):
             if hasattr(self.parent_tab.main_window, '_is_closing') and self.parent_tab.main_window._is_closing:
-                print("[SESSION LOAD] Skipping server online check - application is closing")
+                logger.info("Skipping server online check - application is closing")
                 return
             
         results = []
@@ -556,12 +559,12 @@ class MultiDeviceApplyWorker(QThread):
             # Check again if application is closing
             if hasattr(self, 'parent_tab') and hasattr(self.parent_tab, 'main_window'):
                 if hasattr(self.parent_tab.main_window, '_is_closing') and self.parent_tab.main_window._is_closing:
-                    print("[SESSION LOAD] Stopping server checks - application is closing")
+                    logger.info("Stopping server checks - application is closing")
                     break
                 
             try:
                 address = server.get("address")
-                print(f"[SESSION LOAD] Checking server online status: {address}")
+                logger.info(f"Checking server online status: {address}")
                 # Reduced timeout for server checks
                 response = requests.get(f"{address}/api/interfaces", timeout=3)
                 
@@ -569,18 +572,18 @@ class MultiDeviceApplyWorker(QThread):
                     server["online"] = True
                     server["interfaces"] = response.json()
                     results.append({"server": server, "success": True})
-                    print(f"[SESSION LOAD] ✅ Server {address} is online")
+                    logger.info(f"✅ Server {address} is online")
                 else:
                     server["online"] = False
                     error_msg = f"HTTP {response.status_code}"
                     results.append({"server": server, "success": False, "error": error_msg})
-                    print(f"[SESSION LOAD] ❌ Server {address} check failed: {error_msg}")
+                    logger.error(f"❌ Server {address} check failed: {error_msg}")
                     
             except Exception as e:
                 server["online"] = False
                 error_msg = str(e)
                 results.append({"server": server, "success": False, "error": error_msg})
-                print(f"[SESSION LOAD] ❌ Server {address} check error: {error_msg}")
+                logger.error(f"❌ Server {address} check error: {error_msg}")
         
         result_data = {
             "success": True,
@@ -1770,12 +1773,41 @@ class DevicesTab(QWidget):
         self.manage_route_pools_button.setToolTip("Manage BGP Route Pools")
 
 
+        # NetGenAI button
+        try:
+            from traffic_client.ai_menu_actions import TrafficGenClientAIMenuActions
+            self.ai_assistant_button = QPushButton("🤖 AI")
+            self.ai_assistant_button.setToolTip("Open NetGenAI for selected device")
+            self.ai_assistant_button.setFixedSize(60, 28)
+            self.ai_assistant_button.setStyleSheet("""
+                QPushButton {
+                    background-color: #2196F3;
+                    color: white;
+                    font-weight: bold;
+                    border-radius: 3px;
+                }
+                QPushButton:hover {
+                    background-color: #1976D2;
+                }
+            """)
+            self.ai_assistant_button.clicked.connect(
+                lambda: self.open_ai_assistant_for_selected()
+            )
+        except ImportError:
+            self.ai_assistant_button = None
+        
         # Only add device management buttons to Devices tab
-        for b in (self.add_button, self.edit_button, self.remove_button, 
-                  self.start_device_button, self.stop_device_button,
-                  self.apply_button, self.ping_button, self.arp_button, 
-                  self.copy_button, self.paste_button, 
-                  self.manage_route_pools_button):
+        button_list = [self.add_button, self.edit_button, self.remove_button, 
+                      self.start_device_button, self.stop_device_button,
+                      self.apply_button, self.ping_button, self.arp_button, 
+                      self.copy_button, self.paste_button, 
+                      self.manage_route_pools_button]
+        
+        # Add AI button if available
+        if hasattr(self, 'ai_assistant_button') and self.ai_assistant_button:
+            button_list.append(self.ai_assistant_button)
+        
+        for b in button_list:
             btns.addWidget(b)
 
         layout.addLayout(btns)
@@ -2194,8 +2226,8 @@ class DevicesTab(QWidget):
             return
 
         vxlan_config = dialog.get_values()
-        print(f"[VXLAN ADD] Got VXLAN config: {list(vxlan_config.keys())}")
-        print(f"[VXLAN ADD] VXLAN config values: vni={vxlan_config.get('vni')}, local_ip={vxlan_config.get('local_ip')}, remote_peers={vxlan_config.get('remote_peers')}")
+        logger.info(f"Got VXLAN config: {list(vxlan_config.keys())}")
+        logger.info(f"VXLAN config values: vni={vxlan_config.get('vni')}, local_ip={vxlan_config.get('local_ip')}, remote_peers={vxlan_config.get('remote_peers')}")
         logging.debug(f"[VXLAN ADD] Got VXLAN config: {list(vxlan_config.keys())}")
         
         # Handle increment if enabled (create multiple tunnels)
@@ -2253,11 +2285,11 @@ class DevicesTab(QWidget):
                         
                         tunnel_config["bridge_svi_ip"] = f"{new_ip}/{prefix}"
                     except Exception as e:
-                        print(f"[VXLAN] Error incrementing Bridge SVI IP: {e}")
+                        logger.error(f"Error incrementing Bridge SVI IP: {e}")
                         tunnel_config["bridge_svi_ip"] = base_svi_ip
                 
                 generated_tunnels.append(tunnel_config)
-                print(f"[VXLAN ADD] Generated tunnel {i+1}/{count}, VNI: {tunnel_config.get('vni')}")
+                logger.info(f"Generated tunnel {i+1}/{count}, VNI: {tunnel_config.get('vni')}")
                 logging.debug(f"[VXLAN ADD] Generated tunnel {i+1}/{count}, VNI: {tunnel_config.get('vni')}")
             
             # Now merge all generated tunnels with existing tunnels
@@ -2311,7 +2343,7 @@ class DevicesTab(QWidget):
                                 existing_tunnels[i]["underlay_interface"] = preserved_underlay
                             
                             tunnel_exists = True
-                            print(f"[VXLAN ADD] Updated existing tunnel with VNI {new_vni}")
+                            logger.info(f"Updated existing tunnel with VNI {new_vni}")
                             break
                     
                     if not tunnel_exists:
@@ -2322,11 +2354,11 @@ class DevicesTab(QWidget):
                         new_tunnel_clean.pop("overlay_interface", None)
                         new_tunnel_clean.pop("underlay_interface", None)
                         existing_tunnels.append(new_tunnel_clean)
-                        print(f"[VXLAN ADD] Added new tunnel with VNI {new_vni} (no interface - will be set when applied)")
+                        logger.info(f"Added new tunnel with VNI {new_vni} (no interface - will be set when applied)")
                 
                 # Update device with merged tunnels
                 device["vxlan_config"] = {"tunnels": existing_tunnels}
-                print(f"[VXLAN ADD] Updated device with {len(existing_tunnels)} total tunnel(s) (generated {len(generated_tunnels)} new)")
+                logger.info(f"Updated device with {len(existing_tunnels)} total tunnel(s) (generated {len(generated_tunnels)} new)")
                 logging.info(f"[VXLAN ADD] Updated device with {len(existing_tunnels)} total tunnel(s)")
                 
                 # Ensure VXLAN is in protocols
@@ -2344,13 +2376,13 @@ class DevicesTab(QWidget):
                     QTimer.singleShot(100, self.vxlan_handler.refresh_vxlan_table)
             else:
                 # Device not found - this shouldn't happen, but handle gracefully
-                print(f"[VXLAN ADD] ERROR: Device {device_name} not found in all_devices")
+                logger.error(f"ERROR: Device {device_name} not found in all_devices")
                 logging.error(f"[VXLAN ADD] Device {device_name} not found in all_devices - cannot add tunnels")
                 QMessageBox.warning(self, "Device Not Found", f"Could not find device '{device_name}' to add VXLAN tunnels. Please ensure the device exists in the devices table.")
                 return  # Exit early if device not found
         else:
             # Single tunnel - add to device's tunnel list (support multiple tunnels per device)
-            print(f"[VXLAN ADD] Adding single tunnel to device, VNI: {vxlan_config.get('vni')}")
+            logger.info(f"Adding single tunnel to device, VNI: {vxlan_config.get('vni')}")
             logging.debug(f"[VXLAN ADD] Adding single tunnel to device, VNI: {vxlan_config.get('vni')}")
             
             # Get the device
@@ -2387,19 +2419,19 @@ class DevicesTab(QWidget):
                         for i, tunnel in enumerate(tunnels):
                             if tunnel.get("vni") == new_vni:
                                 tunnels[i] = vxlan_config
-                                print(f"[VXLAN ADD] Updated existing tunnel with VNI {new_vni}")
+                                logger.info(f"Updated existing tunnel with VNI {new_vni}")
                                 break
                     else:
                         # Add new tunnel
                         tunnels.append(vxlan_config)
-                        print(f"[VXLAN ADD] Added new tunnel with VNI {new_vni} (total tunnels: {len(tunnels)})")
+                        logger.info(f"Added new tunnel with VNI {new_vni} (total tunnels: {len(tunnels)})")
                     
                     existing_vxlan["tunnels"] = tunnels
                     device["vxlan_config"] = existing_vxlan
                 else:
                     # No existing config, create new list
                     device["vxlan_config"] = {"tunnels": [vxlan_config]}
-                    print(f"[VXLAN ADD] Created new tunnel list with VNI {vxlan_config.get('vni')}")
+                    logger.info(f"Created new tunnel list with VNI {vxlan_config.get('vni')}")
                 
                 # Ensure VXLAN is in protocols
                 if "protocols" not in device:
@@ -2449,10 +2481,10 @@ class DevicesTab(QWidget):
                             device_name = device_name.split(" (Tunnel ")[0].strip()
                         if device_name:
                             selected_device_names.add(device_name)
-                            print(f"[VXLAN APPLY] Selected device from VXLAN table: {device_name}")
+                            logger.info(f"Selected device from VXLAN table: {device_name}")
                 
                 if selected_device_names:
-                    print(f"[VXLAN APPLY] Found {len(selected_device_names)} device(s) selected in VXLAN table: {selected_device_names}")
+                    logger.info(f"Found {len(selected_device_names)} device(s) selected in VXLAN table: {selected_device_names}")
         
         # PRIORITY 2: If no VXLAN table selection, check devices table selection
         if not selected_device_names:
@@ -2465,7 +2497,7 @@ class DevicesTab(QWidget):
                     if device_name_item:
                         device_name = device_name_item.text()
                         selected_device_names.add(device_name)
-                        print(f"[VXLAN APPLY] Selected device from devices table: {device_name}")
+                        logger.info(f"Selected device from devices table: {device_name}")
         
         # Find the devices in all_devices that have VXLAN config
         if selected_device_names:
@@ -2491,14 +2523,14 @@ class DevicesTab(QWidget):
                                                     import json
                                                     try:
                                                         db_vxlan = json.loads(db_vxlan)
-                                                    except:
+                                                    except Exception:
                                                         db_vxlan = {}
                                                 if db_vxlan and (isinstance(db_vxlan, dict) and len(db_vxlan) > 0):
                                                     device["vxlan_config"] = db_vxlan
                                                     vxlan_config = db_vxlan
-                                                    print(f"[VXLAN APPLY] Loaded VXLAN config from database for {device_name}")
+                                                    logger.info(f"Loaded VXLAN config from database for {device_name}")
                                     except Exception as db_load_exc:
-                                        print(f"[VXLAN APPLY] Failed to load VXLAN config from database: {db_load_exc}")
+                                        logger.error(f"Failed to load VXLAN config from database: {db_load_exc}")
                             if vxlan_config:
                                 devices_to_apply.append(device)
                             break
@@ -2737,12 +2769,12 @@ class DevicesTab(QWidget):
                         timeout=10,
                     )
                     if response.status_code == 200:
-                        print(f"✅ BGP configuration removed from server for {device_name}")
+                        logger.info(f"✅ BGP configuration removed from server for {device_name}")
                     else:
                         error_msg = response.json().get("error", "Unknown error")
-                        print(f"⚠️ Server BGP cleanup failed for {device_name}: {error_msg}")
+                        logger.error(f"⚠️ Server BGP cleanup failed for {device_name}: {error_msg}")
                 except requests.exceptions.RequestException as exc:
-                    print(f"⚠️ Network error removing BGP from server for {device_name}: {exc}")
+                    logger.error(f"⚠️ Network error removing BGP from server for {device_name}: {exc}")
 
         device_info["bgp_config"] = {"_marked_for_removal": True}
         self.update_bgp_table()
@@ -2760,7 +2792,7 @@ class DevicesTab(QWidget):
             total_rows = self.bgp_table.rowCount()
             if total_rows > 0:
                 self.bgp_table.selectAll()
-                print(f"[BGP TABLE] All {total_rows} rows selected")
+                logger.info(f"All {total_rows} rows selected")
             else:
                 QMessageBox.warning(self, "No BGP Neighbors", "No BGP neighbors are configured. Please add BGP neighbors first.")
             return
@@ -2894,7 +2926,7 @@ class DevicesTab(QWidget):
                 arp_status = device_data.get('arp_status', 'Unknown')
                 return arp_status == 'Resolved'
             return False
-        except:
+        except Exception:
             return False
 
     def _get_single_bgp_neighbor_state(self, device_id, neighbor_ip, device_info=None):
@@ -2927,7 +2959,7 @@ class DevicesTab(QWidget):
 
     def _on_device_operation_progress(self, device_name, status_message):
         """Handle progress updates from device operation worker."""
-        print(f"[DEVICE OPERATION] {device_name}: {status_message}")
+        logger.info(f"{device_name}: {status_message}")
     
     def _on_device_status_updated(self, row, status, tooltip):
         """Update device status in table from worker thread."""
@@ -2946,12 +2978,12 @@ class DevicesTab(QWidget):
         """Handle completion of device operation worker."""
         # Print results to console
         if results:
-            print(f"\n{'='*60}")
-            print(f"DEVICE OPERATION RESULTS: {successful_count} successful, {failed_count} failed")
-            print(f"{'='*60}")
+            logger.debug(f"\n{'='*60}")
+            logger.info(f"DEVICE OPERATION RESULTS: {successful_count} successful, {failed_count} failed")
+            logger.debug(f"{'='*60}")
             for result in results:
-                print(f"  {result}")
-            print(f"{'='*60}\n")
+                logger.info(f"  {result}")
+            logger.debug(f"{'='*60}\n")
         
         # Refresh protocol tabs if needed (deferred to avoid UI hang)
         if successful_count > 0:
@@ -3030,7 +3062,7 @@ class DevicesTab(QWidget):
                             arp_ipv6_raw = device_data.get('arp_ipv6_resolved', 0)
                             arp_gateway_raw = device_data.get('arp_gateway_resolved', 0)
                             
-                            print(f"[DATABASE DEBUG] {device_name} - Raw ARP values: IPv4={arp_ipv4_raw}, IPv6={arp_ipv6_raw}, Gateway={arp_gateway_raw}")
+                            logger.info(f"{device_name} - Raw ARP values: IPv4={arp_ipv4_raw}, IPv6={arp_ipv6_raw}, Gateway={arp_gateway_raw}")
                             
                             arp_results = {
                                 "ipv4_resolved": bool(arp_ipv4_raw),
@@ -3042,10 +3074,10 @@ class DevicesTab(QWidget):
                                 "overall_status": device_data.get('arp_status', 'Unknown')
                             }
                             
-                            print(f"[DATABASE DEBUG] {device_name} - Processed ARP values: IPv4={arp_results['ipv4_resolved']}, IPv6={arp_results['ipv6_resolved']}, Gateway={arp_results['gateway_resolved']}")
+                            logger.info(f"{device_name} - Processed ARP values: IPv4={arp_results['ipv4_resolved']}, IPv6={arp_results['ipv6_resolved']}, Gateway={arp_results['gateway_resolved']}")
                             
                             # Debug: Print device and ARP status for troubleshooting
-                            print(f"[DEVICE REFRESH] {device_name} Status: {device_status}, ARP: IPv4={arp_results['ipv4_resolved']}, IPv6={arp_results['ipv6_resolved']}, Gateway={arp_results['gateway_resolved']}")
+                            logger.info(f"{device_name} Status: {device_status}, ARP: IPv4={arp_results['ipv4_resolved']}, IPv6={arp_results['ipv6_resolved']}, Gateway={arp_results['gateway_resolved']}")
                             
                             # Update IP colors based on ARP status
                             self.set_status_icon_with_individual_ips(row, arp_results)
@@ -3072,14 +3104,14 @@ class DevicesTab(QWidget):
                                 self.set_status_icon(row, resolved=False, status_text=arp_results["overall_status"], device_status=device_status)
                             
                 except Exception as e:
-                    print(f"[DEVICE REFRESH] Error refreshing row {row}: {e}")
+                    logger.error(f"Error refreshing row {row}: {e}")
                     
         except Exception as e:
-            print(f"[DEVICE REFRESH] Error refreshing device table: {e}")
+            logger.error(f"Error refreshing device table: {e}")
     
     def _on_arp_operation_progress(self, device_name, status_message):
         """Handle progress updates from ARP operation worker."""
-        print(f"[ARP OPERATION] {device_name}: {status_message}")
+        logger.info(f"{device_name}: {status_message}")
     
     def _on_arp_status_updated(self, row, arp_resolved, status):
         """Update device ARP status in table from worker thread."""
@@ -3096,18 +3128,18 @@ class DevicesTab(QWidget):
         """Handle completion of ARP operation worker."""
         # Print results to console
         if results:
-            print(f"\n{'='*60}")
-            print(f"ARP OPERATION RESULTS: {successful_count} successful, {failed_count} failed")
-            print(f"{'='*60}")
+            logger.debug(f"\n{'='*60}")
+            logger.info(f"ARP OPERATION RESULTS: {successful_count} successful, {failed_count} failed")
+            logger.debug(f"{'='*60}")
             for result in results:
-                print(f"  {result}")
-            print(f"{'='*60}\n")
+                logger.info(f"  {result}")
+            logger.debug(f"{'='*60}\n")
         
         # Only restore status icons for devices that were actually processed (have results)
-        print(f"[DEBUG ARP FINISHED] Processing {len(selected_rows)} selected rows: {selected_rows}")
+        logger.debug(f"Processing {len(selected_rows)} selected rows: {selected_rows}")
         for row in selected_rows:
             device_name = self.devices_table.item(row, self.COL["Device Name"]).text()
-            print(f"[DEBUG ARP FINISHED] Processing row {row}, device: {device_name}")
+            logger.debug(f"Processing row {row}, device: {device_name}")
             status_item = self.devices_table.item(row, self.COL["Status"])
             
             if status_item:
@@ -3120,7 +3152,7 @@ class DevicesTab(QWidget):
                 
                 # Only update status if this device was actually processed (has a result)
                 if device_result:
-                    print(f"[DEBUG ARP FINISHED] Updating status for {device_name} - has result: {device_result}")
+                    logger.debug(f"Updating status for {device_name} - has result: {device_result}")
                     # Set status based on result
                     if "✅" in device_result:
                         # ARP successful - green dot
@@ -3133,15 +3165,15 @@ class DevicesTab(QWidget):
                         status_item.setIcon(self.orange_dot)
                         status_item.setToolTip("Device running - ARP issues detected")
                 else:
-                    print(f"[DEBUG ARP FINISHED] Skipping status update for {device_name} - no result found (not processed)")
+                    logger.debug(f"Skipping status update for {device_name} - no result found (not processed)")
         
         # Clear the pending ARP rows now that the operation is finished
         if hasattr(self, '_pending_arp_rows'):
             if hasattr(self, '_arp_retry_rows') and self._arp_retry_rows:
-                print(f"[DEBUG ARP FINISHED] Pending retries for rows {self._arp_retry_rows} - keeping _pending_arp_rows intact")
+                logger.debug(f"Pending retries for rows {self._arp_retry_rows} - keeping _pending_arp_rows intact")
             else:
                 delattr(self, '_pending_arp_rows')
-                print(f"[DEBUG ARP FINISHED] Cleared _pending_arp_rows")
+                logger.debug(f"Cleared _pending_arp_rows")
         
         # ARP results are now shown via color indicators in the UI
         # No popup needed since status is visible through colored dots and text
@@ -3192,7 +3224,7 @@ class DevicesTab(QWidget):
             if "IS-IS" in protocols_to_refresh:
                 self._safe_update_isis_table()
             
-            print(f"[PROTOCOL REFRESH] Refreshed protocols: {', '.join(protocols_to_refresh)}")
+            logger.info(f"Refreshed protocols: {', '.join(protocols_to_refresh)}")
         
         except Exception as e:
             logging.error(f"[PROTOCOL REFRESH ERROR] {e}")
@@ -3309,18 +3341,18 @@ class DevicesTab(QWidget):
             # IPv6 gateway uses ipv6_resolved status (shows orange when IPv6 ARP fails)
             ipv6_resolved = arp_results.get("ipv6_resolved", False)
             gateway_text = ipv6_gateway_item.text().strip()
-            print(f"[ARP COLOR DEBUG] IPv6 Gateway: text='{gateway_text}', ipv6_resolved={ipv6_resolved}")
+            logger.info(f"IPv6 Gateway: text='{gateway_text}', ipv6_resolved={ipv6_resolved}")
             if not ipv6_resolved and gateway_text:
                 ipv6_gateway_item.setForeground(orange_color)
                 ipv6_gateway_item.setToolTip(f"IPv6 ARP failed: {arp_results.get('ipv6_status', 'Unknown')}")
-                print(f"[ARP COLOR DEBUG] IPv6 Gateway set to ORANGE")
+                logger.info(f"IPv6 Gateway set to ORANGE")
             else:
                 ipv6_gateway_item.setForeground(default_color)
                 if ipv6_resolved:
                     ipv6_gateway_item.setToolTip("IPv6 ARP resolved")
                 else:
                     ipv6_gateway_item.setToolTip("IPv6 Gateway address")
-                print(f"[ARP COLOR DEBUG] IPv6 Gateway set to DEFAULT")
+                logger.info(f"IPv6 Gateway set to DEFAULT")
 
     def get_server_url(self, silent=False, device_info=None):
         """Get server URL with support for explicit device server association."""
@@ -3344,10 +3376,10 @@ class DevicesTab(QWidget):
                 server_item = selected_item.parent() if selected_item.parent() else selected_item
                 server_address = server_item.text(1)
                 if server_address.startswith(("http://", "https://")):
-                    print(f"[DEBUG SERVER] Using tree selection server_url: {server_address}")
+                    logger.debug(f"Using tree selection server_url: {server_address}")
                     return server_address
 
-        print(f"[DEBUG SERVER] No server URL found - main_window.server_url: {getattr(self.main_window, 'server_url', None)}")
+        logger.debug(f"No server URL found - main_window.server_url: {getattr(self.main_window, 'server_url', None)}")
         if not silent:
             QMessageBox.critical(self, "No Server Selected",
                                  "Please select a server before starting/stopping devices.")
@@ -3488,14 +3520,14 @@ class DevicesTab(QWidget):
                 for device in devices:
                     device["interface_key"] = new_key
                 migrated_count += len(devices)
-                print(f"[MIGRATION] Migrated {len(devices)} device(s) from '{old_key}' to '{new_key}'")
+                logger.info(f"Migrated {len(devices)} device(s) from '{old_key}' to '{new_key}'")
             else:
                 # Could not determine TG ID, keep old key
                 new_all_devices[old_key] = devices
         
         if migrated_count > 0:
             self.main_window.all_devices = new_all_devices
-            print(f"[MIGRATION] Migrated {migrated_count} device(s) to use TG ID prefix in interface keys")
+            logger.info(f"Migrated {migrated_count} device(s) to use TG ID prefix in interface keys")
 
     # ---------- Row creation ----------
 
@@ -3605,10 +3637,10 @@ class DevicesTab(QWidget):
                         loopback_ipv6=loopback_ipv6
                     )
             
-            print(f"[DEBUG DEVICE TABLE] Populated table with {self.devices_table.rowCount()} devices")
+            logger.debug(f"Populated table with {self.devices_table.rowCount()} devices")
             
         except Exception as e:
-            print(f"[ERROR] Failed to populate device table: {e}")
+            logger.error(f"Failed to populate device table: {e}")
             logging.error(f"Failed to populate device table: {e}")
 
     # ---------- Dialogs / actions ----------
@@ -3660,7 +3692,7 @@ class DevicesTab(QWidget):
 
             # Always check and reconfigure selected devices (regardless of _needs_apply flag)
             # This ensures devices are properly configured after UI restart
-            print(f"[DEBUG APPLY] Checking and reconfiguring device '{device_name}' (selected by user)")
+            logger.debug(f"Checking and reconfiguring device '{device_name}' (selected by user)")
 
             # Update UI to show starting status immediately
             self._set_device_status_starting(row, device_info, status_text="Starting configuration...")
@@ -3669,14 +3701,14 @@ class DevicesTab(QWidget):
                 # Use the appropriate method based on whether device is new or existing
                 if device_info.get("_is_new", False):
                     # New device - use _add_device_to_server which has proper protocol handling
-                    print(f"[DEBUG APPLY] Adding new device '{device_name}' to server")
+                    logger.debug(f"Adding new device '{device_name}' to server")
                     if self._add_device_to_server(server_url, device_info):
                         success = True
                     else:
                         success = False
                 else:
                     # Existing device - use _apply_device_to_server
-                    print(f"[DEBUG APPLY] Applying existing device '{device_name}' to server")
+                    logger.debug(f"Applying existing device '{device_name}' to server")
                     if self._apply_device_to_server(server_url, device_info):
                         success = True
                     else:
@@ -3751,18 +3783,18 @@ class DevicesTab(QWidget):
                             has_vxlan = True
                     
                     if has_vxlan:
-                        print(f"[DEBUG APPLY] Detected VXLAN in device {device_name}")
+                        logger.debug(f"Detected VXLAN in device {device_name}")
                         vxlan_applied = True
                         break
         
         # Save session after device application to persist status changes
         if successful_count > 0 and hasattr(self.main_window, "save_session"):
-            print(f"[DEBUG APPLY] Saving session after successful device application ({successful_count} device(s) applied)")
+            logger.debug(f"Saving session after successful device application ({successful_count} device(s) applied)")
             try:
                 self.main_window.save_session()
-                print(f"[DEBUG APPLY] ✅ Session saved successfully after applying {successful_count} device(s)")
+                logger.debug(f"✅ Session saved successfully after applying {successful_count} device(s)")
             except Exception as save_exc:
-                print(f"[DEBUG APPLY] ⚠️ Failed to save session: {save_exc}")
+                logger.debug(f"⚠️ Failed to save session: {save_exc}")
         
         # Interface list refresh is now manual only - user can click "Refresh Interface List" button if needed
         # Removed automatic refresh to prevent unnecessary UI updates
@@ -3896,7 +3928,7 @@ class DevicesTab(QWidget):
         try:
             self.refresh_arp_selected_device()
         except Exception as exc:
-            print(f"[ARP REFRESH] Error: {exc}")
+            logger.error(f"Error: {exc}")
 
     def apply_selected_device_silent(self):
         """Apply only the selected devices to the server (silent mode - no dialog)."""
@@ -3920,7 +3952,7 @@ class DevicesTab(QWidget):
         # Check if multi-device apply worker is already running
         if hasattr(self, 'multi_device_apply_worker') and self.multi_device_apply_worker:
             if self.multi_device_apply_worker.isRunning() or not self.multi_device_apply_worker.isFinished():
-                print("[MULTI DEVICE APPLY] Apply operation already running, skipping new request")
+                logger.info("Apply operation already running, skipping new request")
                 return
             else:
                 # Clean up finished worker - ensure thread is stopped first
@@ -3950,10 +3982,10 @@ class DevicesTab(QWidget):
             if device_info:
                 self._set_device_status_starting(row, device_info, status_text="Starting configuration...")
                 devices_to_apply.append((row, device_info))
-                print(f"[DEBUG APPLY SILENT] Will apply device '{device_name}' (selected by user)")
+                logger.debug(f"Will apply device '{device_name}' (selected by user)")
 
         if not devices_to_apply:
-            print("[MULTI DEVICE APPLY] No valid devices found to apply")
+            logger.info("No valid devices found to apply")
             return
 
         # Create and start multi-device apply worker
@@ -3967,7 +3999,7 @@ class DevicesTab(QWidget):
         self.multi_device_apply_worker.finished.connect(self._on_multi_device_apply_finished)
         self.multi_device_apply_worker.start()
         
-        print(f"[MULTI DEVICE APPLY] Started applying {len(devices_to_apply)} devices in background")
+        logger.info(f"Started applying {len(devices_to_apply)} devices in background")
     
     def apply_selected_device_with_arp(self):
         """Apply selected devices and automatically trigger ARP operations."""
@@ -3987,14 +4019,14 @@ class DevicesTab(QWidget):
         self._pending_arp_rows = selected_rows
         
         # Set status to "Applying..." for selected devices
-        print(f"[APPLY WITH ARP] Setting status to 'Applying...' for {len(selected_rows)} devices")
+        logger.info(f"Setting status to 'Applying...' for {len(selected_rows)} devices")
         for row in selected_rows:
             try:
                 self._set_device_status_starting(row, device_info=None, status_text="Starting configuration...")
             except Exception as e:
-                print(f"[APPLY WITH ARP] Exception setting status for row {row}: {e}")
+                logger.error(f"Exception setting status for row {row}: {e}")
         
-        print(f"[APPLY WITH ARP] Apply button clicked - will apply {len(selected_rows)} devices and then run ARP operations")
+        logger.info(f"Apply button clicked - will apply {len(selected_rows)} devices and then run ARP operations")
         
         # Use the existing chain method
         self.apply_selected_device_with_arp_chain()
@@ -4004,7 +4036,7 @@ class DevicesTab(QWidget):
         # Check if ARP operation is already running - use more robust check
         if hasattr(self, 'arp_operation_worker') and self.arp_operation_worker:
             if self.arp_operation_worker.isRunning() or not self.arp_operation_worker.isFinished():
-                print("[ARP OPERATION] ARP operation already running, skipping new request")
+                logger.info("ARP operation already running, skipping new request")
                 return
             else:
                 # Clean up finished worker - ensure thread is stopped first
@@ -4021,7 +4053,7 @@ class DevicesTab(QWidget):
         
         # Check if there are pending ARP operations
         if hasattr(self, '_pending_arp_rows') and self._pending_arp_rows:
-            print(f"[ARP OPERATION] Apply completed, now starting ARP operations for {len(self._pending_arp_rows)} devices...")
+            logger.info(f"Apply completed, now starting ARP operations for {len(self._pending_arp_rows)} devices...")
             
             # Collect devices to process for ARP
             devices_to_process = []
@@ -4041,7 +4073,7 @@ class DevicesTab(QWidget):
                 if device_info:
                     devices_to_process.append((row, device_name, device_info))
                 else:
-                    print(f"[ARP OPERATION] Device {device_name} not found in data structure")
+                    logger.info(f"Device {device_name} not found in data structure")
 
             if devices_to_process:
                 # Store the pending ARP rows in a local variable for the lambda
@@ -4059,9 +4091,9 @@ class DevicesTab(QWidget):
                 # Start the worker (non-blocking)
                 self.arp_operation_worker.start()
                 
-                print(f"[ARP OPERATION] Starting ARP requests for {len(devices_to_process)} devices in background...")
+                logger.info(f"Starting ARP requests for {len(devices_to_process)} devices in background...")
             else:
-                print(f"[ARP OPERATION] No valid devices found for ARP operation")
+                logger.info(f"No valid devices found for ARP operation")
             
             # Don't clear pending ARP rows here - they will be cleared when ARP operation finishes
             # delattr(self, '_pending_arp_rows')
@@ -4250,9 +4282,9 @@ class DevicesTab(QWidget):
                 overall_status = arp_results.get("overall_status", "Unknown")
                 device_status = device_info.get("Status", "Unknown")
                 self.set_status_icon(row, resolved=overall_resolved, status_text=overall_status, device_status=device_status)
-                print(f"[ARP REFRESH] {device_name}: {overall_status}")
+                logger.info(f"{device_name}: {overall_status}")
             except Exception as exc:
-                print(f"[ARP REFRESH] Error for {device_name}: {exc}")
+                logger.error(f"Error for {device_name}: {exc}")
 
     def send_immediate_arp_request(self, device_info, server_url):
         """Compatibility shim - ARP operations are handled by the server-side monitor."""
@@ -4264,7 +4296,7 @@ class DevicesTab(QWidget):
 
     def _calculate_changes(self):
         """Calculate changes between current state and last saved session."""
-        print(f"[DEBUG CHANGES] Calculating changes since last session")
+        logger.debug(f"Calculating changes since last session")
         
         changes = {
             'to_add': [],
@@ -4284,8 +4316,8 @@ class DevicesTab(QWidget):
         if hasattr(self.main_window, 'last_saved_devices'):
             last_saved_devices = self.main_window.last_saved_devices
         
-        print(f"[DEBUG CHANGES] Current devices: {len(current_devices)}")
-        print(f"[DEBUG CHANGES] Last saved devices: {len(last_saved_devices)}")
+        logger.debug(f"Current devices: {len(current_devices)}")
+        logger.debug(f"Last saved devices: {len(last_saved_devices)}")
         
         # First, find devices to remove (devices marked for removal)
         devices_to_remove_names = set()
@@ -4293,14 +4325,14 @@ class DevicesTab(QWidget):
             for removal_info in self.main_window.devices_to_remove:
                 changes['to_remove'].append(removal_info['device_info'])
                 devices_to_remove_names.add(removal_info['name'])
-                print(f"[DEBUG CHANGES] Device marked for removal: '{removal_info['name']}'")
+                logger.debug(f"Device marked for removal: '{removal_info['name']}'")
         
         # Find devices to add (new devices that need to be applied to server)
         # Exclude devices that are marked for removal
         for device_name, device_info in current_devices.items():
             if device_name not in devices_to_remove_names and (device_info.get("_is_new", False) or device_info.get("_needs_apply", False)):
                 changes['to_add'].append(device_info)
-                print(f"[DEBUG CHANGES] Device to add: '{device_name}'")
+                logger.debug(f"Device to add: '{device_name}'")
         
         return changes
     def _add_device_to_server(self, server_url, device_info, force_reconfigure=False):
@@ -4311,12 +4343,12 @@ class DevicesTab(QWidget):
             iface_norm = self._normalize_iface_label(iface_label)
             
             if force_reconfigure:
-                print(f"[DEBUG ADD] Force reconfiguring device '{device_name}' to server: {server_url}")
+                logger.debug(f"Force reconfiguring device '{device_name}' to server: {server_url}")
             else:
-                print(f"[DEBUG ADD] Adding device '{device_name}' to server: {server_url}")
+                logger.debug(f"Adding device '{device_name}' to server: {server_url}")
             
             # Check what's currently configured on the server and compare with intended config
-            print(f"[DEBUG ADD] Checking existing configuration on server for '{device_name}'")
+            logger.debug(f"Checking existing configuration on server for '{device_name}'")
             
             # Check if we need to clean up old VLAN configuration (e.g., VLAN changed)
             old_config = device_info.get("_old_config")
@@ -4325,7 +4357,7 @@ class DevicesTab(QWidget):
                 old_interface = old_config.get("interface", "")
                 if old_vlan != "0" and old_interface:
                     old_iface_norm = self._normalize_iface_label(old_interface)
-                    print(f"[DEBUG ADD] VLAN changed from {old_vlan} to {device_info.get('VLAN', '0')} - cleaning up old VLAN interface")
+                    logger.debug(f"VLAN changed from {old_vlan} to {device_info.get('VLAN', '0')} - cleaning up old VLAN interface")
                     
                     # Clean up the old VLAN interface
                     old_cleanup_payload = {
@@ -4337,9 +4369,9 @@ class DevicesTab(QWidget):
                     
                     old_cleanup_resp = requests.post(f"{server_url}/api/device/cleanup", json=old_cleanup_payload, timeout=10)
                     if old_cleanup_resp.status_code == 200:
-                        print(f"[DEBUG ADD] Successfully cleaned up old VLAN interface vlan{old_vlan}@{old_iface_norm}")
+                        logger.debug(f"Successfully cleaned up old VLAN interface vlan{old_vlan}@{old_iface_norm}")
                     else:
-                        print(f"[DEBUG ADD] Failed to clean up old VLAN interface: {old_cleanup_resp.status_code} - {old_cleanup_resp.text}")
+                        logger.debug(f"Failed to clean up old VLAN interface: {old_cleanup_resp.status_code} - {old_cleanup_resp.text}")
             
             # Get intended configuration from device_info
             intended_ipv4 = device_info.get("IPv4", "").strip()
@@ -4354,7 +4386,7 @@ class DevicesTab(QWidget):
             if intended_ipv6:
                 intended_ips.append(f"{intended_ipv6}/{intended_ipv6_mask}")
             
-            print(f"[DEBUG ADD] Intended configuration: {intended_ips}")
+            logger.debug(f"Intended configuration: {intended_ips}")
             
             # Check what's currently configured on the server
             check_payload = {
@@ -4363,22 +4395,22 @@ class DevicesTab(QWidget):
                 "check_only": True  # Just check, don't modify
             }
             
-            print(f"[DEBUG ADD] Sending check request to server: {server_url}")
+            logger.debug(f"Sending check request to server: {server_url}")
             check_resp = requests.post(f"{server_url}/api/device/check", json=check_payload, timeout=10)
             existing_ips = []
             if check_resp.status_code == 200:
                 check_data = check_resp.json()
                 existing_ips = check_data.get("existing_ips", [])
-                print(f"[DEBUG ADD] Found existing IPs on server: {existing_ips}")
+                logger.debug(f"Found existing IPs on server: {existing_ips}")
             else:
-                print(f"[DEBUG ADD] Could not check existing configuration on {server_url}: {check_resp.status_code} - {check_resp.text}")
+                logger.debug(f"Could not check existing configuration on {server_url}: {check_resp.status_code} - {check_resp.text}")
             
             # Compare intended vs existing configuration
             intended_set = set(intended_ips)
             existing_set = set(existing_ips)
             
             if intended_set == existing_set and not force_reconfigure:
-                print(f"[DEBUG ADD] Configuration matches - no changes needed")
+                logger.debug(f"Configuration matches - no changes needed")
                 # Configuration is already correct, just mark as applied
                 device_info["_is_new"] = False
                 device_info["_needs_apply"] = False
@@ -4386,14 +4418,14 @@ class DevicesTab(QWidget):
                 return True
             else:
                 if force_reconfigure:
-                    print(f"[DEBUG ADD] Force reconfiguration requested - reapplying configuration")
+                    logger.debug(f"Force reconfiguration requested - reapplying configuration")
                 else:
-                    print(f"[DEBUG ADD] Configuration differs - need to reapply")
-                print(f"[DEBUG ADD] Missing on server: {intended_set - existing_set}")
-                print(f"[DEBUG ADD] Extra on server: {existing_set - intended_set}")
+                    logger.debug(f"Configuration differs - need to reapply")
+                logger.debug(f"Missing on server: {intended_set - existing_set}")
+                logger.debug(f"Extra on server: {existing_set - intended_set}")
                 
                 # Clean up existing configuration before applying new one
-                print(f"[DEBUG ADD] Cleaning up existing configuration for '{device_name}'")
+                logger.debug(f"Cleaning up existing configuration for '{device_name}'")
                 cleanup_payload = {
                     "interface": iface_norm,
                     "vlan": device_info.get("VLAN", "0"),
@@ -4408,11 +4440,11 @@ class DevicesTab(QWidget):
                     cleanup_data = cleanup_resp.json()
                     removed_ips = cleanup_data.get("removed_ips", [])
                     if removed_ips:
-                        print(f"[DEBUG ADD] Successfully cleaned up existing IPs: {removed_ips}")
+                        logger.debug(f"Successfully cleaned up existing IPs: {removed_ips}")
                     else:
-                        print(f"[DEBUG ADD] Interface was already clean - no IPs to remove")
+                        logger.debug(f"Interface was already clean - no IPs to remove")
                 else:
-                    print(f"[DEBUG ADD] Cleanup failed for '{device_name}': {cleanup_resp.status_code} - {cleanup_resp.text}")
+                    logger.debug(f"Cleanup failed for '{device_name}': {cleanup_resp.status_code} - {cleanup_resp.text}")
                     # Continue anyway - maybe the interface was already clean or doesn't exist yet
                 
                 # Clear any cleanup flags since we've done the cleanup
@@ -4452,7 +4484,7 @@ class DevicesTab(QWidget):
                 
                 resp = requests.post(f"{server_url}/api/device/apply", json=payload, timeout=30)
                 if resp.status_code == 200:
-                    print(f"[DEBUG ADD] Successfully applied new configuration for '{device_name}'")
+                    logger.debug(f"Successfully applied new configuration for '{device_name}'")
                     # Mark as applied
                     device_info["_is_new"] = False
                     device_info["_needs_apply"] = False
@@ -4468,11 +4500,11 @@ class DevicesTab(QWidget):
                     
                     return True
                 else:
-                    print(f"[ERROR] Failed to add '{device_name}': {resp.status_code} - {resp.text}")
+                    logger.error(f"Failed to add '{device_name}': {resp.status_code} - {resp.text}")
                     return False
                 
         except Exception as e:
-            print(f"[ERROR] Exception adding device '{device_name}' to server '{server_url}': {e}")
+            logger.error(f"Exception adding device '{device_name}' to server '{server_url}': {e}")
             return False
     
     def _apply_device_to_server(self, server_url, device_info):
@@ -4483,22 +4515,22 @@ class DevicesTab(QWidget):
             iface_label = device_info.get("Interface", "")
             iface_norm = self._normalize_iface_label(iface_label)
             
-            print(f"[DEBUG APPLY DEVICE] Starting apply for {device_name}")
-            print(f"[DEBUG APPLY DEVICE] Device info keys: {list(device_info.keys())}")
-            print(f"[DEBUG APPLY DEVICE] Protocols: {device_info.get('protocols', [])}")
-            print(f"[DEBUG APPLY DEVICE] BGP config: {device_info.get('bgp_config', {})}")
-            print(f"[DEBUG APPLY DEVICE] OSPF config: {device_info.get('ospf_config', {})}")
-            print(f"[DEBUG APPLY DEVICE] ISIS config: {device_info.get('isis_config', {})} or {device_info.get('is_is_config', {})}")
+            logger.debug(f"Starting apply for {device_name}")
+            logger.debug(f"Device info keys: {list(device_info.keys())}")
+            logger.debug(f"Protocols: {device_info.get('protocols', [])}")
+            logger.debug(f"BGP config: {device_info.get('bgp_config', {})}")
+            logger.debug(f"OSPF config: {device_info.get('ospf_config', {})}")
+            logger.debug(f"ISIS config: {device_info.get('isis_config', {})} or {device_info.get('is_is_config', {})}")
             
             # If device has an ID, fetch complete device data from database
             if device_id:
                 try:
                     import requests
-                    print(f"[DEBUG APPLY DEVICE] Fetching complete device data from database for {device_name}")
+                    logger.debug(f"Fetching complete device data from database for {device_name}")
                     response = requests.get(f"{server_url}/api/device/database/devices/{device_id}", timeout=5)
                     if response.status_code == 200:
                         db_device_data = response.json()
-                        print(f"[DEBUG APPLY DEVICE] Database device data keys: {list(db_device_data.keys())}")
+                        logger.debug(f"Database device data keys: {list(db_device_data.keys())}")
                         
                         db_protocols = self._convert_protocols_to_array(db_device_data.get("protocols", []))
                         existing_protocols = self._convert_protocols_to_array(device_info.get("protocols", []))
@@ -4513,18 +4545,18 @@ class DevicesTab(QWidget):
                         # Preserve local vxlan_config if it exists (especially for multiple tunnels)
                         # Only use DB config if local doesn't have any
                         local_vxlan = device_info.get("vxlan_config", {})
-                        print(f"[DEBUG APPLY DEVICE] Local vxlan_config type: {type(local_vxlan)}, content: {local_vxlan}")
+                        logger.debug(f"Local vxlan_config type: {type(local_vxlan)}, content: {local_vxlan}")
                         if isinstance(local_vxlan, dict) and "tunnels" in local_vxlan:
                             tunnel_count = len(local_vxlan.get("tunnels", []))
-                            print(f"[DEBUG APPLY DEVICE] Local vxlan_config has {tunnel_count} tunnel(s) in tunnels list")
+                            logger.debug(f"Local vxlan_config has {tunnel_count} tunnel(s) in tunnels list")
                         if not local_vxlan or (isinstance(local_vxlan, dict) and len(local_vxlan) == 0):
                             device_info["vxlan_config"] = db_device_data.get("vxlan_config", {})
-                            print(f"[DEBUG APPLY DEVICE] Using DB vxlan_config (local was empty)")
+                            logger.debug(f"Using DB vxlan_config (local was empty)")
                         else:
                             # Local config exists - preserve it (it has the multiple tunnels format)
                             tunnel_count = len(local_vxlan.get('tunnels', [])) if isinstance(local_vxlan, dict) and 'tunnels' in local_vxlan else 1
-                            print(f"[DEBUG APPLY DEVICE] Preserving local vxlan_config with {tunnel_count} tunnel(s)")
-                            print(f"[DEBUG APPLY DEVICE] Local vxlan_config keys: {list(local_vxlan.keys()) if isinstance(local_vxlan, dict) else 'N/A'}")
+                            logger.debug(f"Preserving local vxlan_config with {tunnel_count} tunnel(s)")
+                            logger.debug(f"Local vxlan_config keys: {list(local_vxlan.keys()) if isinstance(local_vxlan, dict) else 'N/A'}")
 
                         existing_dhcp_config = self._normalize_dhcp_config(device_info.get("dhcp_config"))
                         db_dhcp_config = self._normalize_dhcp_config(db_device_data.get("dhcp_config"))
@@ -4540,14 +4572,14 @@ class DevicesTab(QWidget):
                             protocols_list.append("VXLAN")
                         device_info["protocols"] = protocols_list
                         
-                        print(f"[DEBUG APPLY DEVICE] Updated device info - Protocols: {device_info.get('protocols', [])}")
-                        print(f"[DEBUG APPLY DEVICE] Updated device info - BGP config: {device_info.get('bgp_config', {})}")
-                        print(f"[DEBUG APPLY DEVICE] Updated device info - OSPF config: {device_info.get('ospf_config', {})}")
-                        print(f"[DEBUG APPLY DEVICE] Updated device info - ISIS config: {device_info.get('isis_config', {})} or {device_info.get('is_is_config', {})}")
+                        logger.debug(f"Updated device info - Protocols: {device_info.get('protocols', [])}")
+                        logger.debug(f"Updated device info - BGP config: {device_info.get('bgp_config', {})}")
+                        logger.debug(f"Updated device info - OSPF config: {device_info.get('ospf_config', {})}")
+                        logger.debug(f"Updated device info - ISIS config: {device_info.get('isis_config', {})} or {device_info.get('is_is_config', {})}")
                     else:
-                        print(f"[DEBUG APPLY DEVICE] Failed to fetch device data from database: {response.status_code}")
+                        logger.debug(f"Failed to fetch device data from database: {response.status_code}")
                 except Exception as e:
-                    print(f"[DEBUG APPLY DEVICE] Error fetching device data from database: {e}")
+                    logger.debug(f"Error fetching device data from database: {e}")
             
             # Prepare payload for background worker
             # Get ISIS config - handle both isis_config and is_is_config keys
@@ -4573,18 +4605,18 @@ class DevicesTab(QWidget):
 
             # Handle multiple tunnels format: {"tunnels": [tunnel1, tunnel2, ...]}
             vxlan_config = device_info.get("vxlan_config", {})
-            print(f"[DEBUG APPLY DEVICE] Before processing, vxlan_config type: {type(vxlan_config)}, keys: {list(vxlan_config.keys()) if isinstance(vxlan_config, dict) else 'N/A'}")
+            logger.debug(f"Before processing, vxlan_config type: {type(vxlan_config)}, keys: {list(vxlan_config.keys()) if isinstance(vxlan_config, dict) else 'N/A'}")
             if isinstance(vxlan_config, dict) and "tunnels" in vxlan_config:
                 # Multiple tunnels format - process each tunnel
                 tunnels = vxlan_config.get("tunnels", [])
-                print(f"[DEBUG APPLY DEVICE] Found {len(tunnels)} tunnel(s) in vxlan_config")
+                logger.debug(f"Found {len(tunnels)} tunnel(s) in vxlan_config")
                 processed_tunnels = []
                 for idx, tunnel in enumerate(tunnels):
-                    print(f"[DEBUG APPLY DEVICE] Processing tunnel {idx+1}/{len(tunnels)}: VNI={tunnel.get('vni') if isinstance(tunnel, dict) else 'N/A'}, keys={list(tunnel.keys()) if isinstance(tunnel, dict) else 'N/A'}")
+                    logger.debug(f"Processing tunnel {idx+1}/{len(tunnels)}: VNI={tunnel.get('vni') if isinstance(tunnel, dict) else 'N/A'}, keys={list(tunnel.keys()) if isinstance(tunnel, dict) else 'N/A'}")
                     if isinstance(tunnel, dict):
                         # Ensure required fields are present before processing
                         if not tunnel.get("vni") and not tunnel.get("VNI"):
-                            print(f"[DEBUG APPLY DEVICE] Tunnel {idx+1} missing VNI, skipping")
+                            logger.debug(f"Tunnel {idx+1} missing VNI, skipping")
                             continue
                         processed_tunnel = self._with_vxlan_interfaces(
                             tunnel,
@@ -4594,11 +4626,11 @@ class DevicesTab(QWidget):
                         )
                         if processed_tunnel:
                             processed_tunnels.append(processed_tunnel)
-                            print(f"[DEBUG APPLY DEVICE] Tunnel {idx+1} processed successfully, VNI={processed_tunnel.get('vni')}")
+                            logger.debug(f"Tunnel {idx+1} processed successfully, VNI={processed_tunnel.get('vni')}")
                         else:
                             # If processing failed but tunnel has VNI, preserve it anyway
                             if tunnel.get("vni") or tunnel.get("VNI"):
-                                print(f"[DEBUG APPLY DEVICE] Tunnel {idx+1} processing returned empty but has VNI, preserving original")
+                                logger.debug(f"Tunnel {idx+1} processing returned empty but has VNI, preserving original")
                                 # Add interface info manually
                                 tunnel_copy = dict(tunnel)
                                 iface_norm = self._normalize_iface_label(iface_label)
@@ -4610,16 +4642,16 @@ class DevicesTab(QWidget):
                                 tunnel_copy["overlay_interface"] = overlay_iface
                                 processed_tunnels.append(tunnel_copy)
                             else:
-                                print(f"[DEBUG APPLY DEVICE] Tunnel {idx+1} processing returned empty and no VNI, skipping")
+                                logger.debug(f"Tunnel {idx+1} processing returned empty and no VNI, skipping")
                     else:
-                        print(f"[DEBUG APPLY DEVICE] Tunnel {idx+1} is not a dict, skipping")
+                        logger.debug(f"Tunnel {idx+1} is not a dict, skipping")
                 if processed_tunnels:
                     device_info["vxlan_config"] = {"tunnels": processed_tunnels}
                     if "VXLAN" not in protocols_list:
                         protocols_list.append("VXLAN")
-                    print(f"[DEBUG APPLY DEVICE] Processing {len(processed_tunnels)} VXLAN tunnel(s)")
+                    logger.debug(f"Processing {len(processed_tunnels)} VXLAN tunnel(s)")
                 else:
-                    print(f"[DEBUG APPLY DEVICE] No tunnels processed successfully, clearing vxlan_config")
+                    logger.debug(f"No tunnels processed successfully, clearing vxlan_config")
                     device_info["vxlan_config"] = {}
             else:
                 # Single tunnel format (backward compatibility)
@@ -4659,10 +4691,10 @@ class DevicesTab(QWidget):
                 "vxlan_config": device_info.get("vxlan_config", {}),
             }
             
-            print(f"[DEBUG APPLY DEVICE] Payload protocols: {payload['protocols']}")
-            print(f"[DEBUG APPLY DEVICE] Payload BGP config: {payload['bgp_config']}")
-            print(f"[DEBUG APPLY DEVICE] Payload OSPF config: {payload['ospf_config']}")
-            print(f"[DEBUG APPLY DEVICE] Payload ISIS config: {payload['isis_config']}")
+            logger.debug(f"Payload protocols: {payload['protocols']}")
+            logger.debug(f"Payload BGP config: {payload['bgp_config']}")
+            logger.debug(f"Payload OSPF config: {payload['ospf_config']}")
+            logger.debug(f"Payload ISIS config: {payload['isis_config']}")
             
             # Create and start background worker
             query_data = {
@@ -4681,7 +4713,7 @@ class DevicesTab(QWidget):
             return True
                 
         except Exception as e:
-            print(f"[ERROR] Exception starting device apply for '{device_name}': {e}")
+            logger.error(f"Exception starting device apply for '{device_name}': {e}")
             return False
     
     def _apply_device_to_server_sync(self, server_url, device_info):
@@ -4694,12 +4726,12 @@ class DevicesTab(QWidget):
             iface_label = device_info.get("Interface", "")
             iface_norm = self._normalize_iface_label(iface_label)
             
-            print(f"[DEBUG DEVICE APPLY] Starting device apply for {device_name}")
-            print(f"[DEBUG DEVICE APPLY] Device info keys: {list(device_info.keys())}")
-            print(f"[DEBUG DEVICE APPLY] Protocols: {device_info.get('protocols', [])}")
-            print(f"[DEBUG DEVICE APPLY] BGP config: {device_info.get('bgp_config', {})}")
-            print(f"[DEBUG DEVICE APPLY] OSPF config: {device_info.get('ospf_config', {})}")
-            print(f"[DEBUG DEVICE APPLY] ISIS config: {device_info.get('isis_config', {})} or {device_info.get('is_is_config', {})}")
+            logger.debug(f"Starting device apply for {device_name}")
+            logger.debug(f"Device info keys: {list(device_info.keys())}")
+            logger.debug(f"Protocols: {device_info.get('protocols', [])}")
+            logger.debug(f"BGP config: {device_info.get('bgp_config', {})}")
+            logger.debug(f"OSPF config: {device_info.get('ospf_config', {})}")
+            logger.debug(f"ISIS config: {device_info.get('isis_config', {})} or {device_info.get('is_is_config', {})}")
             
             # Step 1: Apply basic device configuration (interface, IP addresses, routes)
             # Get ISIS config - handle both isis_config and is_is_config keys
@@ -4741,6 +4773,7 @@ class DevicesTab(QWidget):
                 "device_name": device_name,
                 "interface": iface_norm,
                 "vlan": device_info.get("VLAN", "0"),
+                "mtu": device_info.get("MTU", "1500"),  # MTU field, default to 1500
                 "ipv4": device_info.get("IPv4", ""),
                 "ipv6": device_info.get("IPv6", ""),
                 "ipv4_mask": device_info.get("ipv4_mask", "24"),
@@ -4760,7 +4793,7 @@ class DevicesTab(QWidget):
             }
             
             # Apply basic device configuration
-            print(f"[DEBUG DEVICE APPLY] Calling /api/device/apply with payload: {basic_payload}")
+            logger.debug(f"Calling /api/device/apply with payload: {basic_payload}")
             response = requests.post(f"{server_url}/api/device/apply", json=basic_payload, timeout=30)
             if response.status_code != 200:
                 error_msg = f"HTTP {response.status_code}"
@@ -4770,64 +4803,64 @@ class DevicesTab(QWidget):
                         error_msg = error_data["error"]
                     elif isinstance(error_data, str):
                         error_msg = error_data
-                except:
+                except Exception:
                     error_msg = response.text[:200] if response.text else error_msg
-                print(f"[ERROR] Failed to apply basic device configuration: {error_msg}")
-                print(f"[ERROR] Response status: {response.status_code}, body: {response.text[:500]}")
+                logger.error(f"Failed to apply basic device configuration: {error_msg}")
+                logger.error(f"Response status: {response.status_code}, body: {response.text[:500]}")
                 # Store error message for display to user
                 device_info["_apply_error"] = error_msg
                 return False
             
-            print(f"[SUCCESS] Basic device configuration applied for {device_name}")
+            logger.info(f"Basic device configuration applied for {device_name}")
             
             # Step 2: Configure BGP if enabled
             protocols = device_info.get("protocols", [])
             bgp_config = device_info.get("bgp_config", {})
             
-            print(f"[DEBUG DEVICE APPLY] Checking BGP - protocols: {protocols}, bgp_config: {bgp_config}")
+            logger.debug(f"Checking BGP - protocols: {protocols}, bgp_config: {bgp_config}")
             if "BGP" in protocols and bgp_config:
-                print(f"[INFO] Configuring BGP for device {device_name}")
+                logger.info(f"Configuring BGP for device {device_name}")
                 bgp_success = self._apply_bgp_to_server_sync(server_url, device_info)
                 if not bgp_success:
-                    print(f"[ERROR] Failed to configure BGP for device {device_name}")
+                    logger.error(f"Failed to configure BGP for device {device_name}")
                     return False
-                print(f"[SUCCESS] BGP configured for device {device_name}")
+                logger.info(f"BGP configured for device {device_name}")
             else:
-                print(f"[DEBUG DEVICE APPLY] BGP not configured - protocols: {protocols}, bgp_config: {bgp_config}")
+                logger.debug(f"BGP not configured - protocols: {protocols}, bgp_config: {bgp_config}")
             
             # Step 3: Configure OSPF if enabled
             ospf_config = device_info.get("ospf_config", {})
             
-            print(f"[DEBUG DEVICE APPLY] Checking OSPF - protocols: {protocols}, ospf_config: {ospf_config}")
+            logger.debug(f"Checking OSPF - protocols: {protocols}, ospf_config: {ospf_config}")
             if "OSPF" in protocols and ospf_config:
-                print(f"[INFO] Configuring OSPF for device {device_name}")
+                logger.info(f"Configuring OSPF for device {device_name}")
                 ospf_success = self._apply_ospf_to_server_sync(server_url, device_info)
                 if not ospf_success:
-                    print(f"[ERROR] Failed to configure OSPF for device {device_name}")
+                    logger.error(f"Failed to configure OSPF for device {device_name}")
                     return False
-                print(f"[SUCCESS] OSPF configured for device {device_name}")
+                logger.info(f"OSPF configured for device {device_name}")
             else:
-                print(f"[DEBUG DEVICE APPLY] OSPF not configured - protocols: {protocols}, ospf_config: {ospf_config}")
+                logger.debug(f"OSPF not configured - protocols: {protocols}, ospf_config: {ospf_config}")
             
             # Step 4: Configure ISIS if enabled
             # Get ISIS config - handle both isis_config and is_is_config keys
             isis_config = device_info.get("isis_config", {}) or device_info.get("is_is_config", {})
             
-            print(f"[DEBUG DEVICE APPLY] Checking ISIS - protocols: {protocols}, isis_config: {isis_config}")
+            logger.debug(f"Checking ISIS - protocols: {protocols}, isis_config: {isis_config}")
             if "IS-IS" in protocols and isis_config:
-                print(f"[INFO] Configuring ISIS for device {device_name}")
+                logger.info(f"Configuring ISIS for device {device_name}")
                 isis_success = self._apply_isis_to_server_sync(server_url, device_info)
                 if not isis_success:
-                    print(f"[ERROR] Failed to configure ISIS for device {device_name}")
+                    logger.error(f"Failed to configure ISIS for device {device_name}")
                     return False
-                print(f"[SUCCESS] ISIS configured for device {device_name}")
+                logger.info(f"ISIS configured for device {device_name}")
             else:
-                print(f"[DEBUG DEVICE APPLY] ISIS not configured - protocols: {protocols}, isis_config: {isis_config}")
+                logger.debug(f"ISIS not configured - protocols: {protocols}, isis_config: {isis_config}")
             
             return True
                 
         except Exception as e:
-            print(f"[ERROR] Exception in sync device apply for '{device_name}': {e}")
+            logger.error(f"Exception in sync device apply for '{device_name}': {e}")
             return False
     
     def _apply_bgp_to_server_sync(self, server_url, device_info):
@@ -4846,7 +4879,7 @@ class DevicesTab(QWidget):
             device_id = device_info.get("device_id", "")
             iface_label = device_info.get("Interface", "")
             
-            print(f"[DEBUG REMOVE] Removing '{device_name}' from data structure")
+            logger.debug(f"Removing '{device_name}' from data structure")
             
             # Remove from all_devices
             if iface_label in self.main_window.all_devices:
@@ -4858,24 +4891,24 @@ class DevicesTab(QWidget):
                 # Remove empty interface
                 if not self.main_window.all_devices[iface_label]:
                     del self.main_window.all_devices[iface_label]
-                    print(f"[DEBUG REMOVE] Removed empty interface '{iface_label}'")
+                    logger.debug(f"Removed empty interface '{iface_label}'")
             
             # Remove from interface_to_device_map
             if device_name in self.interface_to_device_map:
                 del self.interface_to_device_map[device_name]
-                print(f"[DEBUG REMOVE] Removed '{device_name}' from device mapping")
+                logger.debug(f"Removed '{device_name}' from device mapping")
                 
         except Exception as e:
-            print(f"[ERROR] Failed to remove device from data structure: {e}")
+            logger.error(f"Failed to remove device from data structure: {e}")
 
     def _remove_device_from_server(self, device_info, device_id, device_name):
         """Invoke server APIs to clean up a removed device."""
         try:
-            print(f"[DEBUG REMOVE SERVER] Removing device '{device_name}' from server")
+            logger.debug(f"Removing device '{device_name}' from server")
             
             server_url = self.get_server_url(silent=True)
             if not server_url:
-                print("[DEBUG REMOVE SERVER] No server URL available")
+                logger.debug("No server URL available")
                 return
 
             iface_label = device_info.get("Interface", "")
@@ -4892,13 +4925,13 @@ class DevicesTab(QWidget):
                 "device_id": device_id,
                 "device_name": device_name,
             }
-            print(f"[DEBUG REMOVE SERVER] Calling cleanup API with payload: {cleanup_payload}")
+            logger.debug(f"Calling cleanup API with payload: {cleanup_payload}")
             cleanup_resp = requests.post(f"{server_url}/api/device/cleanup", json=cleanup_payload, timeout=10)
             if cleanup_resp.status_code == 200:
                 removed_ips = cleanup_resp.json().get("removed_ips", [])
-                print(f"[DEBUG REMOVE SERVER] Successfully cleaned up IPs: {removed_ips}")
+                logger.debug(f"Successfully cleaned up IPs: {removed_ips}")
             else:
-                print(f"[DEBUG REMOVE SERVER] Cleanup failed: {cleanup_resp.status_code} - {cleanup_resp.text}")
+                logger.debug(f"Cleanup failed: {cleanup_resp.status_code} - {cleanup_resp.text}")
 
             protocols = device_info.get("protocols", [])
             if isinstance(protocols, dict):
@@ -4917,15 +4950,15 @@ class DevicesTab(QWidget):
                 "ipv6": ipv6,
                 "protocols": protocol_list,
             }
-            print(f"[DEBUG REMOVE SERVER] Calling remove API with payload: {remove_payload}")
+            logger.debug(f"Calling remove API with payload: {remove_payload}")
             remove_resp = requests.post(f"{server_url}/api/device/remove", json=remove_payload, timeout=10)
             if remove_resp.status_code == 200:
-                print(f"[DEBUG REMOVE SERVER] Successfully removed device '{device_name}' from server")
+                logger.debug(f"Successfully removed device '{device_name}' from server")
             else:
-                print(f"[DEBUG REMOVE SERVER] Remove API failed: {remove_resp.status_code} - {remove_resp.text}")
+                logger.debug(f"Remove API failed: {remove_resp.status_code} - {remove_resp.text}")
 
         except Exception as exc:
-            print(f"[ERROR] Failed to remove device '{device_name}' from server: {exc}")
+            logger.error(f"Failed to remove device '{device_name}' from server: {exc}")
 
     def prompt_add_device(self):
         """Open AddDeviceDialog, persist to model, refresh table."""
@@ -4970,18 +5003,18 @@ class DevicesTab(QWidget):
 
         (
             device_name, iface_name, mac, ipv4, ipv6, ipv4_mask, ipv6_mask,
-            vlan, ipv4_gateway, ipv6_gateway, incr_mac, incr_ipv4, incr_ipv6, incr_gateway, incr_vlan, incr_vxlan, incr_count, ospf_config, bgp_config, 
+            vlan, mtu, ipv4_gateway, ipv6_gateway, incr_mac, incr_ipv4, incr_ipv6, incr_gateway, incr_vlan, incr_vxlan, incr_count, ospf_config, bgp_config, 
             dhcp_config, ipv4_octet_index, ipv6_hextet_index, mac_byte_index, gateway_octet_index, incr_dhcp_pool, dhcp_pool_octet_index,
             incr_loopback, loopback_ipv4_octet_index, loopback_ipv6_hextet_index, loopback_ipv4, loopback_ipv6, isis_config,
             vxlan_vni_increment_index, vxlan_local_octet_index, vxlan_remote_octet_index, vxlan_udp_increment_index
         ) = dialog.get_values()
         vxlan_config = dialog.get_vxlan_config()
-        print(f"[DEBUG ADD DEVICE] VXLAN config from dialog: {vxlan_config}")
+        logger.debug(f"VXLAN config from dialog: {vxlan_config}")
 
         ipv4_mask = ipv4_mask or "24"
         ipv6_mask = ipv6_mask or "64"
         normalized_vxlan_config = self._normalize_vxlan_config(vxlan_config)
-        print(f"[DEBUG ADD DEVICE] Normalized VXLAN config: {normalized_vxlan_config}")
+        logger.debug(f"Normalized VXLAN config: {normalized_vxlan_config}")
 
         # Get base name for incrementing - use "device" as default instead of "Device"
         base_name = (device_name or "").strip() or "device"
@@ -5067,6 +5100,7 @@ class DevicesTab(QWidget):
                     "ipv4_mask": ipv4_mask,
                     "ipv6_mask": ipv6_mask,
                     "VLAN": current_vlan,
+                    "MTU": mtu or "1500",  # MTU field, default to 1500
                     "Gateway": current_ipv4_gateway,  # Keep for backward compatibility
                     "IPv4 Gateway": current_ipv4_gateway,
                     "IPv6 Gateway": current_ipv6_gateway,
@@ -5093,7 +5127,7 @@ class DevicesTab(QWidget):
                 if normalized_vxlan_config:
                     # Increment VXLAN fields if enabled
                     per_device_vxlan = normalized_vxlan_config.copy()
-                    print(f"[DEBUG ADD DEVICE] Processing VXLAN config for device {i+1}/{incr_count}: {per_device_vxlan}")
+                    logger.debug(f"Processing VXLAN config for device {i+1}/{incr_count}: {per_device_vxlan}")
                     
                     # Increment VNI if enabled
                     if incr_vxlan and i > 0 and per_device_vxlan.get("vni"):
@@ -5139,16 +5173,16 @@ class DevicesTab(QWidget):
                     device_data["VXLAN"] = self._format_vxlan_summary(per_device_vxlan)
                     if "VXLAN" not in device_data["protocols"]:
                         device_data["protocols"].append("VXLAN")
-                    print(f"[DEBUG ADD DEVICE] Added VXLAN config to device {current_name} in tunnels format: {device_data['vxlan_config']}")
+                    logger.debug(f"Added VXLAN config to device {current_name} in tunnels format: {device_data['vxlan_config']}")
                 else:
                     # Ensure vxlan_config is always present (even if empty) for consistency
                     device_data["vxlan_config"] = {}
-                    print(f"[DEBUG ADD DEVICE] No VXLAN config for device {current_name} - normalized_vxlan_config: {normalized_vxlan_config}")
+                    logger.debug(f"No VXLAN config for device {current_name} - normalized_vxlan_config: {normalized_vxlan_config}")
                 
                 # Add OSPF protocol if enabled
-                print(f"[DEBUG ADD DEVICE] OSPF config for device {i+1}: {ospf_config}")
+                logger.debug(f"OSPF config for device {i+1}: {ospf_config}")
                 if ospf_config:
-                    print(f"[DEBUG ADD DEVICE] Adding OSPF to device {current_name}")
+                    logger.debug(f"Adding OSPF to device {current_name}")
                     # Initialize protocols as list and ospf_config as separate field
                     device_data["protocols"] = device_data.get("protocols", [])
                     if "OSPF" not in device_data["protocols"]:
@@ -5172,10 +5206,10 @@ class DevicesTab(QWidget):
                     incremented_ospf_config["ipv6_enabled"] = bool(current_ipv6)
                     
                     device_data["ospf_config"] = incremented_ospf_config
-                    print(f"[DEBUG ADD DEVICE] Incremented OSPF config: {incremented_ospf_config}")
+                    logger.debug(f"Incremented OSPF config: {incremented_ospf_config}")
                 
                 # Add BGP protocol if enabled
-                print(f"[DEBUG ADD DEVICE] BGP config for device {i+1}: {bgp_config}")
+                logger.debug(f"BGP config for device {i+1}: {bgp_config}")
                 # Check if BGP is enabled (support both old and new formats)
                 bgp_enabled = bgp_config and (
                     bgp_config.get("enabled", False) or  # Old format
@@ -5183,7 +5217,7 @@ class DevicesTab(QWidget):
                     bgp_config.get("ipv6_enabled", False)  # New format
                 )
                 if bgp_enabled:
-                    print(f"[DEBUG ADD DEVICE] Adding BGP to device {current_name}")
+                    logger.debug(f"Adding BGP to device {current_name}")
                     
                     # Build BGP configuration based on enabled protocols
                     # Handle both old and new BGP config formats
@@ -5228,7 +5262,7 @@ class DevicesTab(QWidget):
                         bgp_protocol_config["bgp_neighbor_ipv4"] = neighbor_ipv4
                         bgp_protocol_config["bgp_update_source_ipv4"] = update_source_ipv4
                         bgp_protocol_config["protocol"] = "ipv4"
-                        print(f"[DEBUG ADD DEVICE] IPv4 BGP configured for device {current_name}: neighbor={neighbor_ipv4}, source={update_source_ipv4}, use_loopback_ip={use_loopback_ip}")
+                        logger.debug(f"IPv4 BGP configured for device {current_name}: neighbor={neighbor_ipv4}, source={update_source_ipv4}, use_loopback_ip={use_loopback_ip}")
                     
                     # Add IPv6 BGP configuration if enabled
                     if bgp_config.get("ipv6_enabled", False):
@@ -5255,21 +5289,21 @@ class DevicesTab(QWidget):
                             bgp_protocol_config["protocol"] = "dual-stack"
                         else:
                             bgp_protocol_config["protocol"] = "ipv6"
-                        print(f"[DEBUG ADD DEVICE] IPv6 BGP configured for device {current_name}")
+                        logger.debug(f"IPv6 BGP configured for device {current_name}")
                     
                     # Add BGP to protocols list and store config separately
                     device_data["protocols"] = device_data.get("protocols", [])
                     if "BGP" not in device_data["protocols"]:
                         device_data["protocols"].append("BGP")
                     device_data["bgp_config"] = bgp_protocol_config
-                    print(f"[DEBUG ADD DEVICE] BGP added to device {current_name}: {device_data['bgp_config']}")
+                    logger.debug(f"BGP added to device {current_name}: {device_data['bgp_config']}")
                 else:
-                    print(f"[DEBUG ADD DEVICE] BGP NOT enabled for device {current_name} - bgp_config: {bgp_config}")
+                    logger.debug(f"BGP NOT enabled for device {current_name} - bgp_config: {bgp_config}")
                 
                 # Add ISIS protocol if enabled
-                print(f"[DEBUG ADD DEVICE] ISIS config for device {i+1}: {isis_config}")
+                logger.debug(f"ISIS config for device {i+1}: {isis_config}")
                 if isis_config:
-                    print(f"[DEBUG ADD DEVICE] Adding ISIS to device {current_name}")
+                    logger.debug(f"Adding ISIS to device {current_name}")
                     # Create a copy of ISIS config and update it based on incremented values
                     incremented_isis_config = isis_config.copy()
                     
@@ -5288,12 +5322,12 @@ class DevicesTab(QWidget):
                         device_data["protocols"].append("IS-IS")
                     device_data["is_is_config"] = incremented_isis_config  # Use is_is_config for consistency with database
                     device_data["isis_config"] = incremented_isis_config   # Also store as isis_config for compatibility
-                    print(f"[DEBUG ADD DEVICE] Incremented ISIS config: {incremented_isis_config}")
+                    logger.debug(f"Incremented ISIS config: {incremented_isis_config}")
                 else:
-                    print(f"[DEBUG ADD DEVICE] ISIS NOT enabled for device {current_name}")
+                    logger.debug(f"ISIS NOT enabled for device {current_name}")
                 
                 if dhcp_config:
-                    print(f"[DEBUG ADD DEVICE] DHCP config for device {i+1}: {dhcp_config}")
+                    logger.debug(f"DHCP config for device {i+1}: {dhcp_config}")
                     per_device_dhcp = copy.deepcopy(dhcp_config)
                     dhcp_mode_value = (per_device_dhcp.get("mode") or "client").lower()
                     per_device_dhcp["mode"] = dhcp_mode_value
@@ -5386,16 +5420,16 @@ class DevicesTab(QWidget):
                 device_data["VXLAN"] = self._format_vxlan_summary(per_device_vxlan)
                 if "VXLAN" not in device_data["protocols"]:
                     device_data["protocols"].append("VXLAN")
-                print(f"[DEBUG ADD DEVICE] Added VXLAN config to single device {unique_name}: {per_device_vxlan}")
+                logger.debug(f"Added VXLAN config to single device {unique_name}: {per_device_vxlan}")
             else:
                 # Ensure vxlan_config is always present (even if empty) for consistency
                 device_data["vxlan_config"] = {}
-                print(f"[DEBUG ADD DEVICE] No VXLAN config for single device {unique_name} - normalized_vxlan_config: {normalized_vxlan_config}")
+                logger.debug(f"No VXLAN config for single device {unique_name} - normalized_vxlan_config: {normalized_vxlan_config}")
             
             # Add OSPF protocol if enabled
-            print(f"[DEBUG ADD DEVICE] Single device OSPF config: {ospf_config}")
+            logger.debug(f"Single device OSPF config: {ospf_config}")
             if ospf_config:
-                print(f"[DEBUG ADD DEVICE] Adding OSPF to single device {unique_name}")
+                logger.debug(f"Adding OSPF to single device {unique_name}")
                 # Initialize protocols as list and ospf_config as separate field
                 device_data["protocols"] = device_data.get("protocols", [])
                 if "OSPF" not in device_data["protocols"]:
@@ -5403,21 +5437,21 @@ class DevicesTab(QWidget):
                 device_data["ospf_config"] = ospf_config
             
             # Add ISIS protocol if enabled
-            print(f"[DEBUG ADD DEVICE] Single device ISIS config: {isis_config}")
+            logger.debug(f"Single device ISIS config: {isis_config}")
             if isis_config:
-                print(f"[DEBUG ADD DEVICE] Adding ISIS to single device {unique_name}")
+                logger.debug(f"Adding ISIS to single device {unique_name}")
                 # Initialize protocols as list and isis_config as separate field
                 device_data["protocols"] = device_data.get("protocols", [])
                 if "IS-IS" not in device_data["protocols"]:
                     device_data["protocols"].append("IS-IS")
                 device_data["is_is_config"] = isis_config  # Use is_is_config for consistency with database
                 device_data["isis_config"] = isis_config   # Also store as isis_config for compatibility
-                print(f"[DEBUG ADD DEVICE] ISIS added to single device {unique_name}: {device_data['is_is_config']}")
+                logger.debug(f"ISIS added to single device {unique_name}: {device_data['is_is_config']}")
             else:
-                print(f"[DEBUG ADD DEVICE] ISIS NOT enabled for single device")
+                logger.debug(f"ISIS NOT enabled for single device")
             
             # Add BGP protocol if enabled
-            print(f"[DEBUG ADD DEVICE] Single device BGP config: {bgp_config}")
+            logger.debug(f"Single device BGP config: {bgp_config}")
             # Check if BGP is enabled (support both old and new formats)
             bgp_enabled = bgp_config and (
                 bgp_config.get("enabled", False) or  # Old format
@@ -5425,7 +5459,7 @@ class DevicesTab(QWidget):
                 bgp_config.get("ipv6_enabled", False)  # New format
             )
             if bgp_enabled:
-                print(f"[DEBUG ADD DEVICE] Adding BGP to single device {unique_name}")
+                logger.debug(f"Adding BGP to single device {unique_name}")
                 
                 # Build BGP configuration based on enabled protocols
                 # Handle both old and new BGP config formats
@@ -5471,7 +5505,7 @@ class DevicesTab(QWidget):
                     bgp_protocol_config["bgp_neighbor_ipv4"] = neighbor_ipv4
                     bgp_protocol_config["bgp_update_source_ipv4"] = update_source_ipv4
                     bgp_protocol_config["protocol"] = "ipv4"
-                    print(f"[DEBUG ADD DEVICE] IPv4 BGP configured for single device {unique_name}: neighbor={neighbor_ipv4}, source={update_source_ipv4}, use_loopback_ip={use_loopback_ip}")
+                    logger.debug(f"IPv4 BGP configured for single device {unique_name}: neighbor={neighbor_ipv4}, source={update_source_ipv4}, use_loopback_ip={use_loopback_ip}")
                 
                 # Add IPv6 BGP configuration if enabled
                 if bgp_config.get("ipv6_enabled", False):
@@ -5499,19 +5533,19 @@ class DevicesTab(QWidget):
                         bgp_protocol_config["protocol"] = "dual-stack"
                     else:
                         bgp_protocol_config["protocol"] = "ipv6"
-                    print(f"[DEBUG ADD DEVICE] IPv6 BGP configured for single device {unique_name}")
+                    logger.debug(f"IPv6 BGP configured for single device {unique_name}")
                 
                 # Add BGP to protocols list and store config separately
                 device_data["protocols"] = device_data.get("protocols", [])
                 if "BGP" not in device_data["protocols"]:
                     device_data["protocols"].append("BGP")
                 device_data["bgp_config"] = bgp_protocol_config
-                print(f"[DEBUG ADD DEVICE] BGP added to single device {unique_name}: {device_data['bgp_config']}")
+                logger.debug(f"BGP added to single device {unique_name}: {device_data['bgp_config']}")
             else:
-                print(f"[DEBUG ADD DEVICE] BGP NOT enabled for single device - bgp_config: {bgp_config}")
+                logger.debug(f"BGP NOT enabled for single device - bgp_config: {bgp_config}")
             
             if dhcp_config:
-                print(f"[DEBUG ADD DEVICE] DHCP config for single device: {dhcp_config}")
+                logger.debug(f"DHCP config for single device: {dhcp_config}")
                 per_device_dhcp = copy.deepcopy(dhcp_config)
                 dhcp_mode_value = (per_device_dhcp.get("mode") or "client").lower()
                 per_device_dhcp["mode"] = dhcp_mode_value
@@ -5579,11 +5613,11 @@ class DevicesTab(QWidget):
             device_data["_is_new"] = True
             device_data["_needs_apply"] = True
             
-            print(f"[DEBUG ADD] Added device '{device_data['Device Name']}' locally (pending apply)")
+            logger.debug(f"Added device '{device_data['Device Name']}' locally (pending apply)")
 
         # Save session immediately after adding device(s) so they persist even if client is closed before apply
         if hasattr(self.main_window, "save_session"):
-            print(f"[DEBUG ADD] Saving session after adding {len(devices_to_create)} device(s)")
+            logger.debug(f"Saving session after adding {len(devices_to_create)} device(s)")
             self.main_window.save_session()
 
         # Keep the interface selected to ensure devices are visible
@@ -5713,7 +5747,7 @@ class DevicesTab(QWidget):
         
         # Save session immediately after pasting device(s) so they persist even if client is closed before apply
         if hasattr(self.main_window, "save_session"):
-            print(f"[DEBUG PASTE] Saving session after pasting {len(pasted_devices)} device(s)")
+            logger.debug(f"Saving session after pasting {len(pasted_devices)} device(s)")
             self.main_window.save_session()
 
         if len(pasted_devices) == 1:
@@ -5726,6 +5760,54 @@ class DevicesTab(QWidget):
                                    f"{', '.join(pasted_devices)}\n\n"
                                    f"Click 'Apply' to configure on server and save to session.")
 
+    def open_ai_assistant_for_selected(self):
+        """Open NetGenAI for selected device"""
+        try:
+            from widgets.ai_unified_dialog import AIUnifiedDialog
+            from PyQt5.QtWidgets import QMessageBox
+            
+            selected_items = self.devices_table.selectedItems()
+            if not selected_items:
+                QMessageBox.information(
+                    self,
+                    "No Selection",
+                    "Please select a device first."
+                )
+                return
+            
+            # Get device from first selected row
+            row = selected_items[0].row()
+            device_name = self.devices_table.item(row, self.COL["Device Name"]).text()
+            
+            # Find device info
+            device_info = self.get_device_info_by_name(device_name)
+            if not device_info:
+                QMessageBox.warning(
+                    self,
+                    "Device Not Found",
+                    f"Could not find device '{device_name}'."
+                )
+                return
+            
+            # Open AI assistant dialog with device_id (pre-fills fields automatically)
+            device_id = device_info.get("device_id")
+            dialog = AIUnifiedDialog(self.main_window, device_id=device_id)
+            dialog.exec_()
+        except ImportError as e:
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self,
+                "AI Not Available",
+                f"NetGenAI not available.\n{str(e)}"
+            )
+        except Exception as e:
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.critical(
+                self,
+                "Error",
+                f"Failed to open NetGenAI:\n{str(e)}"
+            )
+    
     def get_device_info_by_name(self, device_name):
         """Get device info by name (wrapper around _find_device_by_name)."""
         return self._find_device_by_name(device_name)
@@ -5791,7 +5873,7 @@ class DevicesTab(QWidget):
         # Get updated values from dialog
         (
             new_name, iface, mac, ipv4, ipv6, ipv4_mask, ipv6_mask,
-            vlan, ipv4_gateway, ipv6_gateway, inc_mac, inc_ipv4, inc_ipv6, inc_gateway, inc_vlan, count, 
+            vlan, mtu, ipv4_gateway, ipv6_gateway, inc_mac, inc_ipv4, inc_ipv6, inc_gateway, inc_vlan, count, 
             ospf_config, bgp_config, dhcp_config, ipv4_octet_index, ipv6_hextet_index, mac_byte_index, 
             gateway_octet_index, incr_dhcp_pool, dhcp_pool_octet_index, incr_loopback, loopback_ipv4_octet_index, 
             loopback_ipv6_hextet_index, loopback_ipv4, loopback_ipv6, isis_config
@@ -5830,6 +5912,7 @@ class DevicesTab(QWidget):
             "IPv4": ipv4,
             "IPv6": ipv6,
             "VLAN": vlan,
+            "MTU": mtu or "1500",  # MTU field, default to 1500
             "Gateway": ipv4_gateway,  # Use IPv4 gateway as primary gateway
             "IPv4 Gateway": ipv4_gateway,
             "IPv6 Gateway": ipv6_gateway,
@@ -6489,17 +6572,17 @@ class DevicesTab(QWidget):
         try:
             name_item = self.devices_table.item(row, self.COL.get("Device Name"))
             device_name = name_item.text() if name_item else "Unknown"
-            print(f"[DEBUG ARP RESULT] Processing ARP result for row {row}, device: {device_name}, operation_id: {operation_id}")
+            logger.debug(f"Processing ARP result for row {row}, device: {device_name}, operation_id: {operation_id}")
 
             if hasattr(self, "_pending_arp_rows") and self._pending_arp_rows:
                 if row not in self._pending_arp_rows:
-                    print(f"[DEBUG ARP RESULT] Skipping row {row} ({device_name}) - not pending")
+                    logger.debug(f"Skipping row {row} ({device_name}) - not pending")
                     return
 
             if hasattr(self, "arp_operation_worker") and self.arp_operation_worker:
                 current_id = getattr(self.arp_operation_worker, "operation_id", None)
                 if operation_id and current_id and operation_id != current_id:
-                    print(f"[DEBUG ARP RESULT] Skipping row {row} ({device_name}) - id mismatch {operation_id} != {current_id}")
+                    logger.debug(f"Skipping row {row} ({device_name}) - id mismatch {operation_id} != {current_id}")
                     return
 
             self.set_status_icon_with_individual_ips(row, arp_results)
@@ -6523,7 +6606,7 @@ class DevicesTab(QWidget):
             except Exception:
                 pass
         self._arp_check_in_progress = False
-        print("[ARP INDIVIDUAL] Individual ARP checks completed")
+        logger.info("Individual ARP checks completed")
 
     def start_selected_devices(self):
         """Start selected devices in background using DeviceOperationWorker."""
@@ -6565,7 +6648,7 @@ class DevicesTab(QWidget):
             lambda results, succ, fail: self._on_device_operation_finished(results, succ, fail, selected_rows)
         )
         self.operation_worker.start()
-        print(f"[DEVICE START] Starting {len(devices_to_process)} device(s) in background...")
+        logger.info(f"Starting {len(devices_to_process)} device(s) in background...")
 
     def stop_selected_devices(self):
         """Stop selected devices in background using DeviceOperationWorker."""
@@ -6607,7 +6690,7 @@ class DevicesTab(QWidget):
             lambda results, succ, fail: self._on_device_operation_finished(results, succ, fail, selected_rows)
         )
         self.operation_worker.start()
-        print(f"[DEVICE STOP] Stopping {len(devices_to_process)} device(s) in background...")
+        logger.info(f"Stopping {len(devices_to_process)} device(s) in background...")
 
     def remove_selected_device(self):
         """Remove selected devices from the UI, data structures, and server."""
@@ -6734,7 +6817,7 @@ class DevicesTab(QWidget):
         self.main_window.save_session()
         
         pool_count = len(self.main_window.bgp_route_pools)
-        print(f"[BGP ROUTE POOLS] Saved {pool_count} route pool(s)")
+        logger.info(f"Saved {pool_count} route pool(s)")
         QMessageBox.information(self, "Route Pools Saved", 
                               f"Saved {pool_count} route pool(s).\n\n"
                               f"Use 📍 'Attach Route Pools' to assign pools to devices.")
@@ -6787,7 +6870,10 @@ class DevicesTab(QWidget):
         
         # Get ARP status from database instead of direct server check
         try:
-            response = requests.get(f"{server_url}/api/device/database/devices/{device_id}", timeout=5)
+            # Increased timeout: (connect_timeout, read_timeout) to handle slow database operations
+            # Connect timeout of 3s fails fast if server is unreachable
+            # Read timeout of 15s allows for slow database queries
+            response = requests.get(f"{server_url}/api/device/database/devices/{device_id}", timeout=(3, 15))
             if response.status_code == 200:
                 device_data = response.json()
                 
@@ -6819,17 +6905,23 @@ class DevicesTab(QWidget):
                     return True, "ARP resolved"
                 return False, arp_status or "ARP pending"
             else:
-                print(f"[DEBUG ARP SYNC DATABASE] Failed to get device data: {response.status_code}")
+                logger.debug(f"Failed to get device data: {response.status_code}")
                 return False, "Database error"
+        except requests.exceptions.Timeout as e:
+            logger.debug(f"Timeout getting ARP status from database: {e}")
+            return False, "Server timeout - may be overloaded"
+        except requests.exceptions.ConnectionError as e:
+            logger.debug(f"Connection error getting ARP status: {e}")
+            return False, "Server unreachable"
         except Exception as e:
-            print(f"[DEBUG ARP SYNC DATABASE] Error getting ARP status from database: {e}")
+            logger.debug(f"Error getting ARP status from database: {e}")
             return False, f"Database error: {str(e)}"
 
     def _check_individual_arp_resolution(self, device_info):
         """Check ARP resolution for individual IPs from database instead of direct server check."""
         # Check if application is closing
         if hasattr(self.main_window, '_is_closing') and self.main_window._is_closing:
-            print("[ARP CHECK] Skipping ARP check - application is closing")
+            logger.info("Skipping ARP check - application is closing")
             return {"overall_resolved": False, "overall_status": "Application closing", 
                     "ipv4_resolved": False, "ipv6_resolved": False, "gateway_resolved": False}
         
@@ -6853,7 +6945,10 @@ class DevicesTab(QWidget):
         
         # Get ARP status from database instead of direct server check
         try:
-            response = requests.get(f"{server_url}/api/device/database/devices/{device_id}", timeout=5)
+            # Increased timeout: (connect_timeout, read_timeout) to handle slow database operations
+            # Connect timeout of 3s fails fast if server is unreachable
+            # Read timeout of 15s allows for slow database queries
+            response = requests.get(f"{server_url}/api/device/database/devices/{device_id}", timeout=(3, 15))
             if response.status_code == 200:
                 device_data = response.json()
                 
@@ -6912,7 +7007,7 @@ class DevicesTab(QWidget):
                         "gateway_resolved": False,
                         "needs_retry": True,
                     }
-                print(f"[DEBUG ARP DATABASE] Failed to get device data: {response.status_code}")
+                logger.debug(f"Failed to get device data: {response.status_code}")
                 return {
                     "overall_resolved": False,
                     "overall_status": "Database error",
@@ -6921,8 +7016,28 @@ class DevicesTab(QWidget):
                     "gateway_resolved": False,
                     "needs_retry": False,
                 }
+        except requests.exceptions.Timeout as e:
+            logger.debug(f"Timeout getting ARP status from database: {e}")
+            return {
+                "overall_resolved": False,
+                "overall_status": "Server timeout - may be overloaded",
+                "ipv4_resolved": False,
+                "ipv6_resolved": False,
+                "gateway_resolved": False,
+                "needs_retry": True,  # Retry on timeout
+            }
+        except requests.exceptions.ConnectionError as e:
+            logger.debug(f"Connection error getting ARP status: {e}")
+            return {
+                "overall_resolved": False,
+                "overall_status": "Server unreachable",
+                "ipv4_resolved": False,
+                "ipv6_resolved": False,
+                "gateway_resolved": False,
+                "needs_retry": True,  # Retry on connection error
+            }
         except Exception as e:
-            print(f"[DEBUG ARP DATABASE] Error getting ARP status from database: {e}")
+            logger.debug(f"Error getting ARP status from database: {e}")
             return {
                 "overall_resolved": False,
                 "overall_status": f"Database error: {str(e)}",
@@ -6940,7 +7055,7 @@ class DevicesTab(QWidget):
         
         # Check if application is closing
         if hasattr(self.main_window, '_is_closing') and self.main_window._is_closing:
-            print("[ARP CHECK] Skipping ARP check - application is closing")
+            logger.info("Skipping ARP check - application is closing")
             return False, "Application closing"
         
         # Create a single-item list for the worker
@@ -6961,13 +7076,13 @@ class DevicesTab(QWidget):
         
         # Check if application is closing
         if hasattr(self.main_window, '_is_closing') and self.main_window._is_closing:
-            print("[ARP BULK] Skipping ARP check - application is closing")
+            logger.info("Skipping ARP check - application is closing")
             return
         
         # Check if there's already a bulk ARP worker running
         if hasattr(self, 'bulk_arp_worker') and self.bulk_arp_worker:
             if self.bulk_arp_worker.isRunning():
-                print("[ARP BULK] ARP check already running, skipping new request")
+                logger.info("ARP check already running, skipping new request")
                 return
             else:
                 # Clean up finished worker - ensure thread is stopped first
@@ -6991,7 +7106,7 @@ class DevicesTab(QWidget):
         self.bulk_arp_worker.finished.connect(self._on_bulk_arp_finished)
         self.bulk_arp_worker.start()
         
-        print(f"[ARP BULK] Started async ARP check for {len(devices_data)} devices")
+        logger.info(f"Started async ARP check for {len(devices_data)} devices")
     
     def _on_arp_check_result(self, row, resolved, status):
         """Handle ARP check result from worker thread."""
@@ -7107,7 +7222,7 @@ class DevicesTab(QWidget):
                         devices_to_process.append((row, device_info))
 
                 if devices_to_process:
-                    print(f"[ARP RETRY] Retrying ARP check for {len(devices_to_process)} device(s)")
+                    logger.info(f"Retrying ARP check for {len(devices_to_process)} device(s)")
                     self.check_arp_resolution_bulk_async(devices_to_process)
             finally:
                 if hasattr(self, "_arp_retry_rows"):
@@ -7119,7 +7234,7 @@ class DevicesTab(QWidget):
         """Handle successful device apply result from background worker."""
         try:
             device_name = result_data.get("device_name", "Unknown")
-            print(f"✅ Successfully applied device configuration for '{device_name}'")
+            logger.info(f"✅ Successfully applied device configuration for '{device_name}'")
 
             if hasattr(self, "dhcp_handler") and self.dhcp_handler:
                 QTimer.singleShot(200, self.dhcp_handler.refresh_dhcp_status)
@@ -7146,22 +7261,22 @@ class DevicesTab(QWidget):
                     
                     # Trigger ARP refresh for this specific device
                     self._refresh_device_table_from_database([device_row])
-                    print(f"[DEVICE APPLY] Triggered ARP refresh for {device_name}")
+                    logger.info(f"Triggered ARP refresh for {device_name}")
                 else:
-                    print(f"[DEVICE APPLY] Could not find device row for {device_name}")
+                    logger.info(f"Could not find device row for {device_name}")
                 
             except Exception as e:
-                print(f"[DEVICE APPLY] Failed to refresh ARP for {device_name}: {e}")
+                logger.error(f"Failed to refresh ARP for {device_name}: {e}")
                 
         except Exception as e:
-            print(f"[DEVICE APPLY RESULT] Error handling result: {e}")
+            logger.error(f"Error handling result: {e}")
     
     def _on_device_apply_error(self, operation_type, error_message):
         """Handle device apply error from background worker."""
         try:
-            print(f"❌ Device apply failed: {error_message}")
+            logger.error(f"❌ Device apply failed: {error_message}")
         except Exception as e:
-            print(f"[DEVICE APPLY ERROR] Error handling error: {e}")
+            logger.error(f"Error handling error: {e}")
     
     def _on_device_apply_finished(self, operation_type):
         """Handle device apply completion from background worker."""
@@ -7182,11 +7297,11 @@ class DevicesTab(QWidget):
                 except Exception:
                     pass
         except Exception as e:
-            print(f"[DEVICE APPLY FINISHED] Error cleaning up: {e}")
+            logger.error(f"Error cleaning up: {e}")
     def _on_multi_device_applied(self, device_name, success, message):
         """Handle individual device apply result from multi-device worker."""
         try:
-            print(f"[MULTI DEVICE APPLY] {message}")
+            logger.info(f"{message}")
             
             # If device was successfully applied, trigger ARP status check
             if success:
@@ -7213,42 +7328,42 @@ class DevicesTab(QWidget):
                             import requests
                             response = requests.post(f"{server_url}/api/arp/monitor/force-check", timeout=5)
                             if response.status_code == 200:
-                                print(f"[MULTI DEVICE APPLY] Triggered ARP force check on server")
+                                logger.info(f"Triggered ARP force check on server")
                             else:
-                                print(f"[MULTI DEVICE APPLY] Failed to trigger ARP force check: {response.status_code}")
+                                logger.error(f"Failed to trigger ARP force check: {response.status_code}")
                     except Exception as e:
-                        print(f"[MULTI DEVICE APPLY] Error triggering ARP force check: {e}")
+                        logger.error(f"Error triggering ARP force check: {e}")
                     
                     # Wait a moment for ARP check to complete
                     time.sleep(1)
                     
                     # Trigger ARP refresh for this specific device
                     self._refresh_device_table_from_database([device_row])
-                    print(f"[MULTI DEVICE APPLY] Triggered ARP refresh for {device_name}")
+                    logger.info(f"Triggered ARP refresh for {device_name}")
                 else:
-                    print(f"[MULTI DEVICE APPLY] Could not find device row for {device_name}")
+                    logger.info(f"Could not find device row for {device_name}")
                     
         except Exception as e:
-            print(f"[MULTI DEVICE APPLY] Error handling result: {e}")
+            logger.error(f"Error handling result: {e}")
     
     def _on_multi_device_progress(self, device_name, status_message):
         """Handle progress updates from multi-device worker."""
         try:
-            print(f"[MULTI DEVICE APPLY] {device_name}: {status_message}")
+            logger.info(f"{device_name}: {status_message}")
         except Exception as e:
-            print(f"[MULTI DEVICE APPLY] Error handling progress: {e}")
+            logger.error(f"Error handling progress: {e}")
     
     def _on_multi_device_apply_finished(self, results, successful_count, failed_count):
         """Handle completion of multi-device apply worker."""
         try:
             # Print results to console
             if results:
-                print(f"\n{'='*60}")
-                print(f"MULTI DEVICE APPLY RESULTS: {successful_count} successful, {failed_count} failed")
-                print(f"{'='*60}")
+                logger.debug(f"\n{'='*60}")
+                logger.info(f"MULTI DEVICE APPLY RESULTS: {successful_count} successful, {failed_count} failed")
+                logger.debug(f"{'='*60}")
                 for result in results:
-                    print(f"  {result}")
-                print(f"{'='*60}\n")
+                    logger.info(f"  {result}")
+                logger.debug(f"{'='*60}\n")
             
             # Check if any applied devices had VXLAN configuration (before worker is deleted)
             vxlan_applied = False
@@ -7270,20 +7385,20 @@ class DevicesTab(QWidget):
                                 has_vxlan = True
                         
                         if has_vxlan:
-                            print(f"[MULTI DEVICE APPLY] Detected VXLAN in device {device_info.get('Device Name', 'Unknown')}")
+                            logger.info(f"Detected VXLAN in device {device_info.get('Device Name', 'Unknown')}")
                             vxlan_applied = True
                             break
                 except Exception as e:
-                    print(f"[MULTI DEVICE APPLY] Error checking for VXLAN: {e}")
+                    logger.error(f"Error checking for VXLAN: {e}")
             
             # Save session after device application to persist status changes
             if successful_count > 0 and hasattr(self.main_window, "save_session"):
-                print(f"[MULTI DEVICE APPLY] Saving session after successful device application ({successful_count} device(s) applied)")
+                logger.info(f"Saving session after successful device application ({successful_count} device(s) applied)")
                 try:
                     self.main_window.save_session()
-                    print(f"[MULTI DEVICE APPLY] ✅ Session saved successfully after applying {successful_count} device(s)")
+                    logger.info(f"✅ Session saved successfully after applying {successful_count} device(s)")
                 except Exception as save_exc:
-                    print(f"[MULTI DEVICE APPLY] ⚠️ Failed to save session: {save_exc}")
+                    logger.error(f"⚠️ Failed to save session: {save_exc}")
             
             # Interface list refresh is now manual only - user can click "Refresh Interface List" button if needed
             # Removed automatic refresh to prevent unnecessary UI updates
@@ -7312,11 +7427,11 @@ class DevicesTab(QWidget):
                 delattr(self, '_current_operation_type')
                 
         except Exception as e:
-            print(f"[MULTI DEVICE APPLY FINISHED] Error handling completion: {e}")
+            logger.error(f"Error handling completion: {e}")
     
     def _on_bulk_arp_finished(self):
         """Handle bulk ARP check completion."""
-        print("[ARP BULK] Completed async ARP checks for all devices")
+        logger.info("Completed async ARP checks for all devices")
         # Reset the flag to allow new ARP checks
         self._arp_check_in_progress = False
         # Clean up worker reference - ensure thread is stopped first
@@ -7337,7 +7452,7 @@ class DevicesTab(QWidget):
 
     def cleanup_threads(self):
         """Clean up timers and worker threads before application exit."""
-        print("[CLEANUP] Cleaning up all worker threads...")
+        logger.info("Cleaning up all worker threads...")
         
         timer_attrs = [
             "status_timer",
@@ -7349,24 +7464,24 @@ class DevicesTab(QWidget):
         for attr in timer_attrs:
             timer = getattr(self, attr, None)
             if timer:
-                print(f"[CLEANUP] Stopping {attr}...")
+                logger.info(f"Stopping {attr}...")
                 try:
                     timer.stop()
                 except Exception as exc:
-                    print(f"[CLEANUP] Failed to stop {attr}: {exc}")
+                    logger.error(f"Failed to stop {attr}: {exc}")
 
         def _stop_worker(attr_name):
             worker = getattr(self, attr_name, None)
             if not worker:
                 return
-            print(f"[CLEANUP] Stopping {attr_name}...")
+            logger.info(f"Stopping {attr_name}...")
             try:
                 if hasattr(worker, "stop"):
                     worker.stop()
                 if worker.isRunning():
                     worker.quit()
                     if not worker.wait(1000):
-                        print(f"[CLEANUP] Force terminating {attr_name}...")
+                        logger.info(f"Force terminating {attr_name}...")
                         worker.terminate()
                         worker.wait(500)
                 
@@ -7374,12 +7489,12 @@ class DevicesTab(QWidget):
                 if not worker.isRunning():
                     worker.deleteLater()
                 else:
-                    print(f"[CLEANUP] WARNING: {attr_name} still running after cleanup attempt")
+                    logger.warning(f"WARNING: {attr_name} still running after cleanup attempt")
             except RuntimeError:
                 # Worker already deleted, ignore
                 pass
             except Exception as exc:
-                print(f"[CLEANUP] Error stopping {attr_name}: {exc}")
+                logger.error(f"Error stopping {attr_name}: {exc}")
             finally:
                 try:
                     delattr(self, attr_name)
@@ -7407,10 +7522,10 @@ class DevicesTab(QWidget):
                 for w in list(workers):
                     try:
                         if hasattr(w, "isRunning") and w.isRunning():
-                            print(f"[CLEANUP] Waiting for {list_attr_name} worker to finish...")
+                            logger.info(f"Waiting for {list_attr_name} worker to finish...")
                             w.quit()  # Request thread to stop
                             if not w.wait(3000):
-                                print(f"[CLEANUP] Force terminating {list_attr_name} worker...")
+                                logger.info(f"Force terminating {list_attr_name} worker...")
                                 w.terminate()
                                 w.wait(500)
                         
@@ -7421,7 +7536,7 @@ class DevicesTab(QWidget):
                         # Worker might already be deleted, ignore
                         continue
                     except Exception as exc:
-                        print(f"[CLEANUP] Error draining {list_attr_name} worker: {exc}")
+                        logger.error(f"Error draining {list_attr_name} worker: {exc}")
                 # Clear the list
                 setattr(self, list_attr_name, [])
             except Exception:
@@ -7437,10 +7552,10 @@ class DevicesTab(QWidget):
                 for w in list(ospf_workers):
                     try:
                         if hasattr(w, "isRunning") and w.isRunning():
-                            print("[CLEANUP] Waiting for OSPF handler worker to finish...")
+                            logger.info("Waiting for OSPF handler worker to finish...")
                             w.quit()  # Request thread to stop
                             if not w.wait(3000):
-                                print("[CLEANUP] Force terminating OSPF handler worker...")
+                                logger.info("Force terminating OSPF handler worker...")
                                 w.terminate()
                                 w.wait(500)
                         
@@ -7451,16 +7566,16 @@ class DevicesTab(QWidget):
                         # Worker already deleted, ignore
                         pass
                     except Exception as exc:
-                        print(f"[CLEANUP] Error cleaning up OSPF handler worker: {exc}")
+                        logger.error(f"Error cleaning up OSPF handler worker: {exc}")
                 self.ospf_handler._ospf_apply_workers = []
             except Exception as exc:
-                print(f"[CLEANUP] Error cleaning up OSPF handler workers: {exc}")
+                logger.error(f"Error cleaning up OSPF handler workers: {exc}")
         
         if hasattr(self, "vxlan_handler"):
             try:
                 self.vxlan_handler.stop_monitoring()
             except Exception as exc:
-                print(f"[CLEANUP] Failed to stop VXLAN monitoring: {exc}")
+                logger.error(f"Failed to stop VXLAN monitoring: {exc}")
 
     def _update_device_protocol(self, row_or_device_name, protocol, config):
         """Update device with protocol configuration.
@@ -7781,10 +7896,10 @@ class DevicesTab(QWidget):
                             selected_bgp_neighbors[device_name] = set()
                         selected_bgp_neighbors[device_name].add(neighbor_ip)
                 
-                print(f"[BGP TOGGLE] Selected devices from BGP table: {selected_device_names}")
-                print(f"[BGP TOGGLE] Selected neighbors: {selected_bgp_neighbors}")
-                print(f"[BGP TOGGLE] selected_bgp_neighbors type: {type(selected_bgp_neighbors)}")
-                print(f"[BGP TOGGLE] selected_bgp_neighbors length: {len(selected_bgp_neighbors)}")
+                logger.info(f"Selected devices from BGP table: {selected_device_names}")
+                logger.info(f"Selected neighbors: {selected_bgp_neighbors}")
+                logger.info(f"selected_bgp_neighbors type: {type(selected_bgp_neighbors)}")
+                logger.info(f"selected_bgp_neighbors length: {len(selected_bgp_neighbors)}")
         elif protocol == "OSPF":
             selected_items = self.ospf_table.selectedItems()
             if selected_items:
@@ -7798,7 +7913,7 @@ class DevicesTab(QWidget):
                         if " (Pending Removal)" in device_name:
                             device_name = device_name.replace(" (Pending Removal)", "")
                         selected_device_names.add(device_name)
-                print(f"[OSPF TOGGLE] Selected devices from OSPF table: {selected_device_names}")
+                logger.info(f"Selected devices from OSPF table: {selected_device_names}")
 
         # Find devices that have this protocol configured
         devices_with_protocol = []
@@ -7811,7 +7926,7 @@ class DevicesTab(QWidget):
                     if selected_device_names:
                         if device.get("Device Name") in selected_device_names:
                             devices_with_protocol.append(device)
-                            print(f"[{protocol} TOGGLE] Including selected device: {device.get('Device Name')}")
+                            logger.info(f"[{protocol} TOGGLE] Including selected device: {device.get('Device Name')}")
                     else:
                         # No selection - include all devices with this protocol
                         devices_with_protocol.append(device)
@@ -7855,12 +7970,12 @@ class DevicesTab(QWidget):
                         payload["bgp"] = device_info.get("bgp_config", {})
                     
                     # Add specific neighbor information if rows were selected
-                    print(f"[BGP TOGGLE] Checking device_name '{device_name}' against selected_bgp_neighbors keys: {list(selected_bgp_neighbors.keys())}")
+                    logger.info(f"Checking device_name '{device_name}' against selected_bgp_neighbors keys: {list(selected_bgp_neighbors.keys())}")
                     if device_name in selected_bgp_neighbors:
                         payload["selected_neighbors"] = list(selected_bgp_neighbors[device_name])
-                        print(f"[BGP TOGGLE] Adding selected neighbors for {device_name}: {payload['selected_neighbors']}")
+                        logger.info(f"Adding selected neighbors for {device_name}: {payload['selected_neighbors']}")
                     else:
-                        print(f"[BGP TOGGLE] Device '{device_name}' not found in selected_bgp_neighbors")
+                        logger.info(f"Device '{device_name}' not found in selected_bgp_neighbors")
                 elif protocol == "OSPF" and "protocols" in device_info and "OSPF" in device_info["protocols"]:
                     if isinstance(device_info["protocols"], dict):
                         payload["ospf_config"] = device_info["protocols"]["OSPF"]
@@ -7901,15 +8016,15 @@ class DevicesTab(QWidget):
                 logging.error(f"[{protocol} {action.upper()}] Error: {device_name} - {e}")
 
         # Print results to console instead of popup
-        print(f"\n{'='*60}")
-        print(f"{protocol.upper()} {action.upper()} RESULTS: {success_count}/{len(devices_with_protocol)} successful")
-        print(f"{'='*60}")
+        logger.debug(f"\n{'='*60}")
+        logger.info(f"{protocol.upper()} {action.upper()} RESULTS: {success_count}/{len(devices_with_protocol)} successful")
+        logger.debug(f"{'='*60}")
         if success_count > 0:
-            print(f"  ✅ Successfully {action}ed {protocol} for {success_count} device(s)")
+            logger.info(f"  ✅ Successfully {action}ed {protocol} for {success_count} device(s)")
         if success_count < len(devices_with_protocol):
             failed = len(devices_with_protocol) - success_count
-            print(f"  ❌ Failed to {action} {protocol} for {failed} device(s)")
-        print(f"{'='*60}\n")
+            logger.error(f"  ❌ Failed to {action} {protocol} for {failed} device(s)")
+        logger.debug(f"{'='*60}\n")
         
         # No popup message - status updated silently in table
 
@@ -7919,7 +8034,7 @@ class DevicesTab(QWidget):
             from PyQt5.QtCore import QTimer
             def delayed_refresh():
                 self.update_bgp_table()
-                print(f"[BGP REFRESH] Refreshed BGP table after {action} operation")
+                logger.info(f"Refreshed BGP table after {action} operation")
             QTimer.singleShot(1000, delayed_refresh)  # Wait 1 second for database update
             # Start/stop periodic BGP monitoring only if operations were successful
             if starting and success_count > 0:
@@ -7931,7 +8046,7 @@ class DevicesTab(QWidget):
             from PyQt5.QtCore import QTimer
             def delayed_refresh():
                 self.update_ospf_table()
-                print(f"[OSPF REFRESH] Refreshed OSPF table after {action} operation")
+                logger.info(f"Refreshed OSPF table after {action} operation")
             QTimer.singleShot(1000, delayed_refresh)  # Wait 1 second for database update
             # Start/stop periodic OSPF monitoring only if operations were successful
             if starting and success_count > 0:
@@ -7943,7 +8058,7 @@ class DevicesTab(QWidget):
             from PyQt5.QtCore import QTimer
             def delayed_refresh():
                 self.update_isis_table()
-                print(f"[ISIS REFRESH] Refreshed ISIS table after {action} operation")
+                logger.info(f"Refreshed ISIS table after {action} operation")
             QTimer.singleShot(1000, delayed_refresh)  # Wait 1 second for database update
             # Start/stop periodic ISIS monitoring only if operations were successful
             if starting and success_count > 0:
@@ -8006,18 +8121,18 @@ class DevicesTab(QWidget):
         if not self.device_status_monitoring_active:
             self.device_status_monitoring_active = True
             self.device_status_timer.start(5000)  # Check every 5 seconds
-            print("[DEVICE STATUS MONITORING] Started periodic device status checks")
+            logger.info("Started periodic device status checks")
         else:
-            print("[DEVICE STATUS MONITORING] Already active - not starting again")
+            logger.info("Already active - not starting again")
     
     def stop_device_status_monitoring(self):
         """Stop periodic device status monitoring."""
         if self.device_status_monitoring_active:
             self.device_status_monitoring_active = False
             self.device_status_timer.stop()
-            print("[DEVICE STATUS MONITORING] Stopped periodic device status checks")
+            logger.info("Stopped periodic device status checks")
         else:
-            print("[DEVICE STATUS MONITORING] Already stopped - not stopping again")
+            logger.info("Already stopped - not stopping again")
     
     def periodic_bgp_status_check(self):
         """Periodic BGP status check for all devices with BGP configured."""
@@ -8047,7 +8162,7 @@ class DevicesTab(QWidget):
                 status_item.setToolTip(f"ARP failed: {arp_status}")
                 
         except Exception as e:
-            print(f"[DEVICE STATUS ICON] Error updating status icon for row {row}: {e}")
+            logger.error(f"Error updating status icon for row {row}: {e}")
     
     def update_device_data_in_memory(self, device_id, header_name, new_value):
         """Update device data in the all_devices structure."""

@@ -69,7 +69,7 @@ def print_device_info(device: Dict, detailed: bool = False):
                 if isinstance(bgp_config, str):
                     bgp_config = json.loads(bgp_config)
                 print(f"   BGP Config: {json.dumps(bgp_config, indent=6)}")
-            except:
+            except Exception:
                 print(f"   BGP Config: {bgp_config}")
         
         # Parse and display OSPF config
@@ -79,7 +79,7 @@ def print_device_info(device: Dict, detailed: bool = False):
                 if isinstance(ospf_config, str):
                     ospf_config = json.loads(ospf_config)
                 print(f"   OSPF Config: {json.dumps(ospf_config, indent=6)}")
-            except:
+            except Exception:
                 print(f"   OSPF Config: {ospf_config}")
         
         # Parse and display ISIS config
@@ -95,7 +95,7 @@ def print_device_info(device: Dict, detailed: bool = False):
                     except Exception:
                         pass
                 print(f"   ISIS Config: {json.dumps(isis_config, indent=6)}")
-            except:
+            except Exception:
                 print(f"   ISIS Config: {isis_config}")
         
         print(f"   Created: {device.get('created_at', 'N/A')}")

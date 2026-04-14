@@ -1,7 +1,11 @@
 # stream_control.py
+import logging
+
+logger = logging.getLogger(__name__)
+
 from PyQt5.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QComboBox, QTableWidget,
-    QTableWidgetItem, QAbstractItemView, QHeaderView, QMessageBox, QDialog, QLabel
+    QTableWidgetItem, QAbstractItemView, QHeaderView, QMessageBox, QDialog
 )
 from PyQt5.QtGui import QIcon
 from PyQt5.QtCore import Qt, QSize
@@ -34,8 +38,8 @@ class TrafficGenClientStreamControl:
         self.stream_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.stream_table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.SelectedClicked)
 
-        # Allow individual cell selection instead of entire rows
-        self.stream_table.setSelectionBehavior(QAbstractItemView.SelectItems)
+        # ✅ ensure multi-select starts/stops work even if user clicks cells
+        self.stream_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.stream_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
 
         # Table styling for professional appearance (muted color scheme)
@@ -222,11 +226,6 @@ class TrafficGenClientStreamControl:
 
         row = item.row()
         col = item.column()
-        
-        # Only handle editable text columns: Name (2) and Frame Size (8)
-        # Columns 3 (Enabled) and 15 (Flow Tracking) are combo boxes handled separately
-        if col not in [2, 8]:
-            return
 
         # Retrieve the Name cell (col 2) where we stash stream_id
         name_item = self.stream_table.item(row, 2)
@@ -281,9 +280,14 @@ class TrafficGenClientStreamControl:
                 item.setText(new_name)
 
         elif col == 3:
-            # Enabled is a combo box, not a text item - handled by handle_enabled_combo_change
-            # Skip inline editing for combo boxes
-            return
+            # Enabled (typed Yes/No if not a combo)
+            raw = item.text().strip().lower()
+            val = raw in ("yes", "true", "1", "on", "y")
+            ps["enabled"] = val
+            stream["enabled"] = val
+            # Normalize UI
+            with QSignalBlocker(self.stream_table):
+                item.setText("Yes" if val else "No")
 
         elif col == 8:
             # Fixed Size (must be positive integer)
@@ -306,9 +310,14 @@ class TrafficGenClientStreamControl:
                 item.setText(str(size))
 
         elif col == 15:
-            # Flow Tracking is a combo box, not a text item - handled by handle_flow_tracking_change
-            # Skip inline editing for combo boxes
-            return
+            # Flow Tracking (typed Yes/No if not a combo)
+            raw = item.text().strip().lower()
+            val = raw in ("yes", "true", "1", "on", "y")
+            ps["flow_tracking_enabled"] = val
+            stream["flow_tracking_enabled"] = val
+            # Normalize UI
+            with QSignalBlocker(self, ):
+                item.setText("Yes" if val else "No")
 
         else:
             # Non-editable/unsupported column; ignore
@@ -319,7 +328,7 @@ class TrafficGenClientStreamControl:
             try:
                 self.send_inline_update_to_server(port, stream)
             except Exception as e:
-                print(f"[WARN] send_inline_update_to_server failed: {e}")
+                logger.warning(f"send_inline_update_to_server failed: {e}")
 
         # Session save removed - only save on explicit user action (Save Session menu or Apply button)
 
@@ -331,14 +340,6 @@ class TrafficGenClientStreamControl:
         Keeps model and UI in sync and updates both protocol_selection and top-level keys.
         """
         from PyQt5.QtCore import QSignalBlocker
-
-        # Safety checks: validate row and table state
-        if not hasattr(self, "stream_table") or not self.stream_table:
-            return
-        if row < 0 or row >= self.stream_table.rowCount():
-            return
-        if not hasattr(self, "streams") or not self.streams:
-            return
 
         # Normalize input to boolean
         val = str(value).strip().lower() in ("yes", "true", "1", "on", "y")
@@ -369,57 +370,34 @@ class TrafficGenClientStreamControl:
                 if not port_item:
                     return
                 resolved_port = port_item.text().strip()
-                # Normalize port_text (remove "Port: " prefix if present)
-                normalized_port_text = resolved_port
-                if ":" in normalized_port_text:
-                    normalized_port_text = normalized_port_text.rsplit(":", 1)[-1].strip()
-                if "Port:" in normalized_port_text:
-                    normalized_port_text = normalized_port_text.replace("Port:", "").strip()
-                # Find the matching port key in self.streams (e.g., "TG 0 - Port: ens5np0")
-                port_key = None
-                try:
-                    for key in self.streams.keys():
-                        key_interface = key.split(" - ")[-1].replace("Port: ", "").strip()
-                        if key_interface == normalized_port_text:
-                            port_key = key
-                            break
-                    if port_key:
-                        resolved_port = port_key
-                except (AttributeError, RuntimeError):
-                    pass
             else:
                 resolved_port = port
             current_name = name_item.text().strip()
-            try:
-                for s in self.streams.get(resolved_port, []):
-                    if not isinstance(s, dict):
-                        continue
-                    if s.get("protocol_selection", {}).get("name") == current_name:
-                        stream = s
-                        break
-            except (AttributeError, RuntimeError, KeyError):
-                pass
+            for s in self.streams.get(resolved_port, []):
+                if s.get("protocol_selection", {}).get("name") == current_name:
+                    stream = s
+                    break
             if not stream:
                 return
 
         # Update both protocol_selection and top-level flags
-        # Update the model - this is what persists the change
         ps = stream.setdefault("protocol_selection", {})
         ps["flow_tracking_enabled"] = val
         stream["flow_tracking_enabled"] = val
-        
-        # Don't update the widget - the user just changed it, so it's already correct
-        # Updating the widget here can cause conflicts and make it revert
+
+        # Normalize the combo text without re-triggering
+        combo = self.stream_table.cellWidget(row, 15)
+        if combo is not None:
+            combo.blockSignals(True)
+            combo.setCurrentText("Yes" if val else "No")
+            combo.blockSignals(False)
 
         # Persist / notify if hooks exist
-        # Skip server update during table refresh to prevent crashes
-        if not getattr(self, "_populating_table", False):
-            if hasattr(self, "send_inline_update_to_server") and resolved_port:
-                try:
-                    self.send_inline_update_to_server(resolved_port, stream)
-                except Exception as e:
-                    # Silently ignore server update failures during refresh
-                    pass
+        if hasattr(self, "send_inline_update_to_server") and resolved_port:
+            try:
+                self.send_inline_update_to_server(resolved_port, stream)
+            except Exception as e:
+                logger.warning(f"send_inline_update_to_server failed: {e}")
 
         # Session save removed - only save on explicit user action (Save Session menu or Apply button)
 
@@ -437,14 +415,14 @@ class TrafficGenClientStreamControl:
         for stream in self.streams.get(port, []):
             if stream.get("name") == stream_name or stream.get("protocol_selection", {}).get("name") == stream_name:
                 stream["enabled"] = new_enabled
-                print(f"🔄 Stream '{stream_name}' on {port} enabled set to {new_enabled}")
+                logger.info(f"Stream '{stream_name}' on {port} enabled set to {new_enabled}")
                 self.send_inline_update_to_server(port, stream)
                 break
 
     def update_rx_port(self, port, stream, new_rx):
         """Update rx_port value for the stream."""
         stream["rx_port"] = new_rx.strip()
-        print(f"🔁 Updated rx_port for stream '{stream.get('name')}' on {port} to {new_rx}")
+        logger.info(f"Updated rx_port for stream '{stream.get('name')}' on {port} to {new_rx}")
 
     def update_stream_status(self, row, color):
         """Update the stream status icon for a specific row."""
@@ -533,7 +511,7 @@ class TrafficGenClientStreamControl:
             if hasattr(self, "copied_stream"):
                 delattr(self, "copied_stream")
 
-        print(f"[COPY] Prepared {len(self.copied_streams)} stream(s) for paste.")
+        logger.info(f"[COPY] Prepared {len(self.copied_streams)} stream(s) for paste.")
 
     def paste_stream_to_interface(self):
         # Accept legacy single-copy clipboard if multi-copy is not present
@@ -606,7 +584,7 @@ class TrafficGenClientStreamControl:
 
             self.streams[full_port_name].append(dst)
             pasted_count += 1
-            print(f"[PASTE] '{new_name}' -> {full_port_name}")
+            logger.info(f"[PASTE] '{new_name}' -> {full_port_name}")
 
         # Clean up legacy single-copy to avoid stale state
         if hasattr(self, "copied_stream"):
@@ -658,21 +636,21 @@ class TrafficGenClientStreamControl:
                         repaired += 1
                 seen.add(s.get("stream_id"))
         if repaired:
-            print(f"[STREAM-ID] Repaired {repaired} missing/duplicate stream_id(s).")
+            logger.info(f"[STREAM-ID] Repaired {repaired} missing/duplicate stream_id(s).")
         return repaired
 
     def open_add_stream_dialog(self):
-        print(f"[DEBUG STREAM] Add stream dialog requested")
-        print(f"[DEBUG STREAM] Has server_tree: {hasattr(self, 'server_tree')}")
+        logger.debug(f"Add stream dialog requested")
+        logger.debug(f"Has server_tree: {hasattr(self, 'server_tree')}")
         if hasattr(self, 'server_tree'):
-            print(f"[DEBUG STREAM] server_tree is not None: {self.server_tree is not None}")
+            logger.debug(f"server_tree is not None: {self.server_tree is not None}")
         
         if not hasattr(self, 'server_tree') or self.server_tree is None:
             QMessageBox.warning(self, "Server Tree Error", "Server tree is not available. Please restart the application.")
             return
             
         selected_items = self.server_tree.selectedItems()
-        print(f"[DEBUG STREAM] Selected items count: {len(selected_items)}")
+        logger.debug(f"Selected items count: {len(selected_items)}")
         if not selected_items:
             QMessageBox.warning(self, "No Selection", "Please select a TG port to add a stream.")
             return
@@ -684,79 +662,106 @@ class TrafficGenClientStreamControl:
             QMessageBox.warning(self, "Invalid Selection", "Please select a TG port, not a server.")
             return
 
-        # Extract TG ID from parent item - handle both widget and text formats
-        tg_id = None
+        # Extract TG ID from the custom widget in column 0 (not from item text)
+        tg_id = ""
         tg_id_widget = self.server_tree.itemWidget(parent_item, 0)
         if tg_id_widget:
+            # Find the QLabel containing the TG ID text
+            from PyQt5.QtWidgets import QLabel
             tg_id_label = tg_id_widget.findChild(QLabel)
             if tg_id_label:
                 tg_id_text = tg_id_label.text()
-                # Extract number from "TG 0" format
                 tg_id = tg_id_text.replace("TG ", "").strip()
         
-        # Fallback: extract from parent item text
+        # Fallback: try to get from item text if widget extraction failed
         if not tg_id:
-            parent_text = parent_item.text(0)
-            tg_id = parent_text.replace("TG ", "").strip()
+            tg_id = parent_item.text(0).replace("TG ", "").strip()
         
-        # Final fallback: use index from server_interfaces
+        # If still no TG ID, try to find it from server_interfaces by matching server address
         if not tg_id:
-            parent_index = self.server_tree.indexOfTopLevelItem(parent_item)
-            if parent_index >= 0 and parent_index < len(self.server_interfaces):
-                server = self.server_interfaces[parent_index]
-                tg_id = str(server.get('tg_id', '0'))
+            server_address = parent_item.text(1)  # Server address is in column 1
+            for srv in self.server_interfaces:
+                if srv.get("address") == server_address:
+                    tg_id = str(srv.get("tg_id", "0"))
+                    break
         
-        if not tg_id:
-            QMessageBox.warning(self, "Error", "Could not determine TG ID. Please select a valid port.")
-            return
-        
-        port_name = selected_item.text(0).strip()
-        # Remove "Port: " prefix if present
-        if port_name.startswith("Port: "):
-            port_name = port_name.replace("Port: ", "").strip()
+        port_name = selected_item.text(0).replace("Port: ", "").strip()
         # Remove radio symbol if present
         if port_name.startswith("• ") or port_name.startswith("● "):
             port_name = port_name[2:]  # Remove bullet prefix
-        
         full_port_name = f"TG {tg_id} - Port: {port_name}"
-        print(f"[DEBUG STREAM] TG ID extracted: '{tg_id}'")
-        print(f"[DEBUG STREAM] Selected interface: {port_name}")
-        print(f"[DEBUG STREAM] Full port name: {full_port_name}")
+        logger.debug(f"Selected interface: {port_name}")
+        logger.debug(f"Full port name: {full_port_name}")
 
-        # Collect RX ports from online TGs
+        # Collect RX ports from online TGs (use cached interfaces to avoid blocking)
         server_interfaces = []
         for srv in self.server_interfaces:
             if not srv.get("online", True):
                 continue
             tg = srv.get("tg_id", "0")
-            try:
-                r = requests.get(f"{srv['address']}/api/interfaces", timeout=5)
-                r.raise_for_status()
-                interfaces = r.json()
+            
+            # Use cached interfaces if available (fast, non-blocking)
+            cached_interfaces = srv.get("interfaces", [])
+            if cached_interfaces:
                 ports = []
-                for iface in interfaces:
-                    name = iface["name"]
+                for iface in cached_interfaces:
+                    # Handle both dict and string formats
+                    if isinstance(iface, dict):
+                        name = iface.get("name", "")
+                    else:
+                        name = str(iface)
+                    
                     if name == "lo":
-                        print(f"[DEBUG STREAM] Skipping loopback interface: {name}")
+                        logger.debug(f"Skipping loopback interface: {name}")
                     elif name == port_name:
-                        print(f"[DEBUG STREAM] Skipping selected TX interface: {name} (same as RX)")
+                        logger.debug(f"Skipping selected TX interface: {name} (same as RX)")
                     else:
                         port_entry = f"TG {tg} - Port: {name}"
                         ports.append(port_entry)
-                        print(f"[DEBUG] Adding RX Port: {port_entry}")
-                server_interfaces.append({"tg_id": tg, "ports": ports})
-            except Exception as e:
-                print(f"❌ Failed to fetch RX interfaces from {srv['address']}: {e}")
+                        logger.debug(f"Adding RX Port: {port_entry}")
+                if ports:
+                    server_interfaces.append({"tg_id": tg, "ports": ports})
+            else:
+                # No cached interfaces - try to fetch with short timeout (non-blocking)
+                try:
+                    # Use connection_manager if available for better timeout handling
+                    if hasattr(self, 'connection_manager') and self.connection_manager:
+                        r = self.connection_manager.get(f"{srv['address']}/api/interfaces", timeout=1)
+                    else:
+                        r = requests.get(f"{srv['address']}/api/interfaces", timeout=1)
+                    if r.status_code == 200:
+                        interfaces = r.json()
+                        # Cache interfaces for future use
+                        srv["interfaces"] = interfaces
+                        ports = []
+                        for iface in interfaces:
+                            name = iface.get("name", "") if isinstance(iface, dict) else str(iface)
+                            if name == "lo":
+                                logger.debug(f"Skipping loopback interface: {name}")
+                            elif name == port_name:
+                                logger.debug(f"Skipping selected TX interface: {name} (same as RX)")
+                            else:
+                                port_entry = f"TG {tg} - Port: {name}"
+                                ports.append(port_entry)
+                                logger.debug(f"Adding RX Port: {port_entry}")
+                        if ports:
+                            server_interfaces.append({"tg_id": tg, "ports": ports})
+                except requests.exceptions.Timeout:
+                    logger.warning(f"Timeout fetching RX interfaces from {srv['address']} (using empty list)")
+                except requests.exceptions.ConnectionError:
+                    logger.warning(f"Connection error fetching RX interfaces from {srv['address']} (using empty list)")
+                except Exception as e:
+                    logger.warning(f"Failed to fetch RX interfaces from {srv['address']}: {e} (using empty list)")
 
         new_stream_id = str(uuid.uuid4())
         new_stream_data = {"stream_id": new_stream_id}
-        print(f"[DEBUG STREAM] Creating dialog for port: {full_port_name}")
-        print(f"[DEBUG STREAM] Server interfaces count: {len(server_interfaces)}")
+        logger.debug(f"Creating dialog for port: {full_port_name}")
+        logger.debug(f"Server interfaces count: {len(server_interfaces)}")
         dialog = AddStreamDialog(self, full_port_name, server_interfaces=server_interfaces, stream_data=new_stream_data)
-        print(f"[DEBUG STREAM] Dialog created, about to show...")
+        logger.debug(f"Dialog created, about to show...")
 
         result = dialog.exec()
-        print(f"[DEBUG STREAM] Dialog result: {result} (QDialog.Accepted={QDialog.Accepted})")
+        logger.debug(f"Dialog result: {result} (QDialog.Accepted={QDialog.Accepted})")
         if result == QDialog.Accepted:
             stream_details = dialog.get_stream_details()
             if not stream_details.get("rx_port"):
@@ -784,9 +789,9 @@ class TrafficGenClientStreamControl:
 
             self.streams[full_port_name].append(stream_details)
             self.ensure_unique_stream_ids()
-            print(f"[DEBUG] Stream added for {full_port_name}:", stream_details)
-            print(f"[DEBUG STREAM] Total streams in self.streams: {sum(len(streams) for streams in self.streams.values())}")
-            print(f"[DEBUG STREAM] Streams for this port: {len(self.streams[full_port_name])}")
+            logger.debug(f"Stream added for {full_port_name}: {stream_details}")
+            logger.debug(f"Total streams in self.streams: {sum(len(streams) for streams in self.streams.values())}")
+            logger.debug(f"Streams for this port: {len(self.streams[full_port_name])}")
             self.update_stream_table()
 
     def edit_selected_stream(self):
@@ -805,37 +810,25 @@ class TrafficGenClientStreamControl:
             tx_port_text = interface_item.text().strip()
             stream_name = stream_name_item.text().strip()
             
-            # The table shows just the interface name (e.g., "ens5np0"), but streams dict uses full format "TG X - Port: interface"
-            # We need to find the matching key by checking which stream has this name
+            # Normalize port text (remove "Port: " prefix if present)
+            normalized_port_text = tx_port_text
+            if ":" in normalized_port_text:
+                normalized_port_text = normalized_port_text.rsplit(":", 1)[-1].strip()
+            if "Port:" in normalized_port_text:
+                normalized_port_text = normalized_port_text.replace("Port:", "").strip()
+
+            # Find the matching port key in self.streams (e.g., "TG 0 - Port: ens5np0")
             tx_port = None
-            
-            # First, try to find the stream by name across all ports
-            for port_key, stream_list in self.streams.items():
-                for stream in stream_list:
-                    stream_name_match = stream.get("protocol_selection", {}).get("name") or stream.get("name", "")
-                    if stream_name_match == stream_name:
-                        # Verify the interface matches
-                        port_interface = port_key.split(" - ")[-1].replace("Port: ", "").strip()
-                        if port_interface == tx_port_text or tx_port_text in port_key:
-                            tx_port = port_key
-                            break
-                if tx_port:
+            for key in self.streams.keys():
+                # Extract interface name from key
+                key_interface = key.split(" - ")[-1].replace("Port: ", "").strip()
+                if key_interface == normalized_port_text:
+                    tx_port = key
                     break
             
-            # Fallback: try to match by interface name in port keys
             if not tx_port:
-                for port_key in self.streams.keys():
-                    port_interface = port_key.split(" - ")[-1].replace("Port: ", "").strip()
-                    if port_interface == tx_port_text:
-                        tx_port = port_key
-                        break
-            
-            # Final fallback: exact match
-            if not tx_port and tx_port_text in self.streams:
-                tx_port = tx_port_text
-            
-            if not tx_port or tx_port not in self.streams:
-                raise KeyError(f"TX Port '{tx_port_text}' not found in streams dictionary. Available keys: {list(self.streams.keys())}")
+                available_keys = list(self.streams.keys())
+                raise KeyError(f"TX Port '{tx_port_text}' (normalized: '{normalized_port_text}') not found in streams dictionary. Available keys: {available_keys}")
 
             original = next(
                 (s for s in self.streams[tx_port] if s.get("protocol_selection", {}).get("name") == stream_name),
@@ -868,7 +861,7 @@ class TrafficGenClientStreamControl:
                             rx_ports.append(name)
                     server_interfaces.append({"tg_id": tid, "ports": rx_ports})
                 except Exception as e:
-                    print(f"❌ Failed to fetch RX interfaces from {srv['address']}: {e}")
+                    logger.error(f"Failed to fetch RX interfaces from {srv['address']}: {e}")
 
             dialog = AddStreamDialog(
                 parent=self, interface=tx_port, stream_data=stream_data, server_interfaces=server_interfaces
@@ -914,7 +907,7 @@ class TrafficGenClientStreamControl:
                         break
 
                 self.update_stream_table()
-                print(f"[✅] Stream '{stream_name}' updated successfully.")
+                logger.info(f"Stream '{stream_name}' updated successfully.")
 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to edit the stream: {e}")
@@ -934,38 +927,40 @@ class TrafficGenClientStreamControl:
                     QMessageBox.critical(self, "Error", "Invalid selection. Missing interface or stream name.")
                     continue
 
-                interface = interface_item.text().strip()
+                interface_text = interface_item.text().strip()
                 stream_name = stream_name_item.text().strip()
-                print(f"Removing stream '{stream_name}' from interface '{interface}'")
-
-                # Find the matching port key in self.streams (e.g., "TG 0 - Port: ens5np0")
-                # The table shows just the interface name (e.g., "ens5np0"), but streams dict uses full format
+                
+                # Normalize interface name to match port key format in self.streams
+                # Table shows just "ens5np0", but streams keys are "TG 0 - Port: ens5np0" or "TG 0 - ens5np0"
+                normalized_port_text = interface_text
+                if ":" in normalized_port_text:
+                    normalized_port_text = normalized_port_text.rsplit(":", 1)[-1].strip()
+                if "Port:" in normalized_port_text:
+                    normalized_port_text = normalized_port_text.replace("Port:", "").strip()
+                
+                # Find the matching port key in self.streams
                 port_key = None
                 for key in self.streams.keys():
                     # Extract interface name from key
                     key_interface = key.split(" - ")[-1].replace("Port: ", "").strip()
-                    if key_interface == interface:
+                    if key_interface == normalized_port_text:
                         port_key = key
                         break
                 
-                if not port_key or port_key not in self.streams:
-                    QMessageBox.warning(self, "Error", f"Interface '{interface}' not found. Available keys: {list(self.streams.keys())}")
+                if not port_key:
+                    QMessageBox.warning(self, "Error", f"Interface '{interface_text}' not found in streams. Available: {list(self.streams.keys())[:3]}...")
                     continue
 
-                # Remove the stream from the port key's stream list
-                original_count = len(self.streams[port_key])
+                logger.info(f"Removing stream '{stream_name}' from port '{port_key}'")
+
                 self.streams[port_key] = [
                     s for s in self.streams[port_key]
-                    if (s.get("protocol_selection", {}).get("name") != stream_name and 
-                        s.get("name") != stream_name)
+                    if s.get("protocol_selection", {}).get("name") != stream_name
                 ]
                 
-                # If no streams left for this port, optionally remove the port key
+                # If no streams left for this port, remove the port key
                 if not self.streams[port_key]:
                     del self.streams[port_key]
-                    print(f"Removed port key '{port_key}' as it has no streams")
-                else:
-                    print(f"Removed stream '{stream_name}' from '{port_key}' ({original_count} -> {len(self.streams[port_key])} streams)")
 
             # Session save removed - only save on explicit user action (Save Session menu or Apply button)
             self.update_stream_table()

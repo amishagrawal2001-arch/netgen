@@ -32,7 +32,7 @@ class OSTGDockerInstaller:
                 self.dockerfile_frr = self.project_root / "Dockerfile.frr"
                 self.start_frr_script = self.project_root / "start-frr.sh"
                 self.frr_config_template = self.project_root / "frr.conf.template"
-        except:
+        except Exception:
             # Fallback to project root
             self.docker_script = self.project_root / "install_docker.sh"
             self.dockerfile_frr = self.project_root / "Dockerfile.frr"

@@ -12,6 +12,7 @@ from PyQt5.QtCore import Qt, QSize, QThread, pyqtSignal
 from PyQt5.QtGui import QIcon
 import requests
 import logging
+logger = logging.getLogger(__name__)
 import ipaddress
 
 
@@ -141,9 +142,9 @@ class BGPHandler:
             # OPTIMIZATION: Defer table update to next event loop iteration to avoid blocking UI on click
             from PyQt5.QtCore import QTimer
             QTimer.singleShot(0, lambda: self.parent.update_bgp_table())
-            print("[BGP REFRESH] BGP status refresh scheduled (non-blocking)")
+            logger.info("[BGP REFRESH] BGP status refresh scheduled (non-blocking)")
         except Exception as e:
-            print(f"Error refreshing BGP status: {e}")
+            logger.error(f"Error refreshing BGP status: {e}")
 
 
     def on_bgp_selection_changed(self):
@@ -235,7 +236,7 @@ class BGPHandler:
                 return "Unknown"
                 
         except Exception as e:
-            print(f"[DEBUG] Error getting BGP state for {neighbor_ip}: {e}")
+            logger.debug(f"[DEBUG] Error getting BGP state for {neighbor_ip}: {e}")
             return "Unknown"
 
 
@@ -265,7 +266,7 @@ class BGPHandler:
                     break
             
             if has_bgp_devices:
-                print("[BGP AUTO-START] Auto-starting BGP monitoring for existing BGP devices")
+                logger.info("[BGP AUTO-START] Auto-starting BGP monitoring for existing BGP devices")
                 self.parent.start_bgp_monitoring()
         
         if neighbors is not None:
@@ -287,7 +288,7 @@ class BGPHandler:
                 
                 # Debug: Check if neighbor is a dict or list
                 if not isinstance(neighbor, dict):
-                    print(f"[BGP TABLE DEBUG] Warning: neighbor is not a dict, it's {type(neighbor)}: {neighbor}")
+                    logger.warning(f"[BGP TABLE DEBUG] Warning: neighbor is not a dict, it's {type(neighbor)}: {neighbor}")
                     continue
                 
                 device_name = neighbor.get("device", "Unknown")
@@ -598,13 +599,13 @@ class BGPHandler:
                 
                 # BGP table updated
             except Exception as e:
-                print(f"Error updating BGP table: {e}")
+                logger.error(f"Error updating BGP table: {e}")
     
 
     def _safe_update_bgp_table(self):
         """Safely update BGP table (for parallel execution)."""
         try:
-            print("[PROTOCOL REFRESH] Refreshing BGP table...")
+            logger.info("[PROTOCOL REFRESH] Refreshing BGP table...")
             self.parent.update_bgp_table()
         except Exception as e:
             logging.error(f"[BGP REFRESH ERROR] {e}")
@@ -670,13 +671,13 @@ class BGPHandler:
             return response.status_code == 200
                 
         except Exception as e:
-            print(f"[ERROR] Exception in sync BGP apply for '{device_name}': {e}")
+            logger.error(f"Exception in sync BGP apply for '{device_name}': {e}")
             return False
     
 
     def _set_bgp_interim_stopping_state(self, device_name, selected_neighbors):
         """Set interim 'Stopping' state for selected BGP neighbors."""
-        print(f"[BGP INTERIM] Setting 'Stopping' state for device {device_name}, neighbors: {selected_neighbors}")
+        logger.info(f"[BGP INTERIM] Setting 'Stopping' state for device {device_name}, neighbors: {selected_neighbors}")
         
         # Find rows in BGP table that match the device and selected neighbors
         for row in range(self.parent.bgp_table.rowCount()):
@@ -703,7 +704,7 @@ class BGPHandler:
                         status_item.setFlags(status_item.flags() & ~Qt.ItemIsEditable)
                         self.parent.bgp_table.setItem(row, 1, status_item)
                         
-                        print(f"[BGP INTERIM] Set 'Stopping' state for {table_device_name} -> {table_neighbor_ip}")
+                        logger.info(f"[BGP INTERIM] Set 'Stopping' state for {table_device_name} -> {table_neighbor_ip}")
 
 
     def prompt_attach_route_pools(self):
@@ -715,7 +716,7 @@ class BGPHandler:
             total_rows = self.parent.bgp_table.rowCount()
             if total_rows > 0:
                 self.parent.bgp_table.selectAll()
-                print(f"[BGP TABLE] All {total_rows} rows selected")
+                logger.info(f"[BGP TABLE] All {total_rows} rows selected")
                 return
             else:
                 QMessageBox.warning(self.parent, "No BGP Neighbors", "No BGP neighbors are configured. Please add BGP neighbors first.")
@@ -757,38 +758,38 @@ class BGPHandler:
             device_info = self.parent._find_device_by_name(device_name)
             
             if not device_info:
-                print(f"[BGP ROUTE POOLS] Warning: Could not find device '{device_name}'")
+                logger.warning(f"[BGP ROUTE POOLS] Warning: Could not find device '{device_name}'")
                 continue
             
             # Ensure device_info is a dictionary - handle list case
             if not isinstance(device_info, dict):
-                print(f"[BGP ROUTE POOLS] Warning: device_info is not a dict for '{device_name}', it's {type(device_info)}")
+                logger.warning(f"[BGP ROUTE POOLS] Warning: device_info is not a dict for '{device_name}', it's {type(device_info)}")
                 # Try to extract dict from list if it's a list
                 if isinstance(device_info, list) and len(device_info) > 0:
-                    print(f"[BGP ROUTE POOLS] Attempting to extract dict from list...")
+                    logger.info(f"[BGP ROUTE POOLS] Attempting to extract dict from list...")
                     device_info = device_info[0] if isinstance(device_info[0], dict) else None
                     if device_info is None:
-                        print(f"[BGP ROUTE POOLS] Could not extract dict from list for '{device_name}'")
+                        logger.info(f"[BGP ROUTE POOLS] Could not extract dict from list for '{device_name}'")
                         continue
                 else:
                     continue
             
             # Final check - ensure device_info is now a dict
             if not isinstance(device_info, dict):
-                print(f"[BGP ROUTE POOLS] Final check failed: device_info is still not a dict for '{device_name}'")
+                logger.error(f"[BGP ROUTE POOLS] Final check failed: device_info is still not a dict for '{device_name}'")
                 continue
             
             # Get BGP config for this device
             # Check if BGP is in the protocols list
             protocols = device_info.get("protocols", [])
             if not isinstance(protocols, list) or "BGP" not in protocols:
-                print(f"[BGP ROUTE POOLS] Warning: Device '{device_name}' does not have BGP configured")
+                logger.warning(f"[BGP ROUTE POOLS] Warning: Device '{device_name}' does not have BGP configured")
                 continue
             
             # Get the actual BGP configuration
             bgp_config = device_info.get("bgp_config", {})
             if not bgp_config:
-                print(f"[BGP ROUTE POOLS] Warning: Device '{device_name}' does not have BGP configuration")
+                logger.warning(f"[BGP ROUTE POOLS] Warning: Device '{device_name}' does not have BGP configuration")
                 continue
             
             selected_neighbors.append({
@@ -849,7 +850,7 @@ class BGPHandler:
                         total_routes += pool["count"]
                         break
             
-            print(f"[BGP ROUTE POOLS] Attached {len(selected_pools)} pool(s) ({total_routes} routes) to BGP neighbor {neighbor_ip} on device '{device_name}'")
+            logger.info(f"[BGP ROUTE POOLS] Attached {len(selected_pools)} pool(s) ({total_routes} routes) to BGP neighbor {neighbor_ip} on device '{device_name}'")
             QMessageBox.information(self.parent, "Route Pools Attached", 
                                   f"Attached {len(selected_pools)} route pool(s) to BGP neighbor {neighbor_ip}.\n\n"
                                   f"Device: {device_name}\n"
@@ -963,7 +964,7 @@ class BGPHandler:
         # Refresh BGP table to show updated pool assignments
         self.parent.update_bgp_table()
         
-        print(f"[BGP ROUTE POOLS] Attached {len(selected_pools)} pool(s) to {total_neighbors} BGP neighbor(s)")
+        logger.info(f"[BGP ROUTE POOLS] Attached {len(selected_pools)} pool(s) to {total_neighbors} BGP neighbor(s)")
         QMessageBox.information(self.parent, "Route Pools Attached", 
                               f"Successfully attached {len(selected_pools)} route pool(s) to {total_neighbors} BGP neighbor(s).\n\n"
                               f"Total routes to advertise: {total_routes}\n\n"
@@ -1192,16 +1193,16 @@ class BGPHandler:
                                                timeout=10)
                         
                         if response.status_code == 200:
-                            print(f"✅ BGP configuration removed from server for {device_name}")
+                            logger.info(f"BGP configuration removed from server for {device_name}")
                         else:
                             error_msg = response.json().get("error", "Unknown error")
-                            print(f"⚠️ Server BGP cleanup failed for {device_name}: {error_msg}")
+                            logger.error(f"Server BGP cleanup failed for {device_name}: {error_msg}")
                             # Continue with client-side cleanup even if server fails
                     except requests.exceptions.RequestException as e:
-                        print(f"⚠️ Network error removing BGP from server for {device_name}: {str(e)}")
+                        logger.warning(f"Network error removing BGP from server for {device_name}: {str(e)}")
                         # Continue with client-side cleanup even if server fails
                 else:
-                    print("⚠️ No server URL available, removing BGP configuration locally only")
+                    logger.warning("No server URL available, removing BGP configuration locally only")
             
             # Mark BGP for removal instead of immediately deleting it
             # This allows the user to apply the changes to the server later
@@ -1439,7 +1440,7 @@ class BGPHandler:
     def _cleanup_bgp_table_for_device(self, device_id, device_name):
         """Clean up BGP table entries for a removed device."""
         try:
-            print(f"[DEBUG BGP CLEANUP] Cleaning up BGP entries for device '{device_name}' (ID: {device_id})")
+            logger.debug(f"[DEBUG BGP CLEANUP] Cleaning up BGP entries for device '{device_name}' (ID: {device_id})")
             
             # Remove BGP table rows that match this device
             rows_to_remove = []
@@ -1448,12 +1449,12 @@ class BGPHandler:
                 device_item = self.parent.bgp_table.item(row, 0)  # Assuming first column is device name
                 if device_item and device_item.text() == device_name:
                     rows_to_remove.append(row)
-                    print(f"[DEBUG BGP CLEANUP] Found BGP row {row} for device '{device_name}'")
+                    logger.debug(f"[DEBUG BGP CLEANUP] Found BGP row {row} for device '{device_name}'")
             
             # Remove rows in reverse order to maintain indices
             for row in sorted(rows_to_remove, reverse=True):
                 self.parent.bgp_table.removeRow(row)
-                print(f"[DEBUG BGP CLEANUP] Removed BGP table row {row}")
+                logger.debug(f"[DEBUG BGP CLEANUP] Removed BGP table row {row}")
             
             # Also clean up BGP protocol data from device protocols
             # Remove BGP protocol from the device in all_devices
@@ -1465,32 +1466,32 @@ class BGPHandler:
                         if "protocols" in device:
                             if isinstance(device["protocols"], list) and "BGP" in device["protocols"]:
                                 device["protocols"].remove("BGP")
-                                print(f"[DEBUG BGP CLEANUP] Removed BGP protocol from device '{device_name}'")
+                                logger.debug(f"[DEBUG BGP CLEANUP] Removed BGP protocol from device '{device_name}'")
                                 
                                 # If no protocols left, remove the protocols key entirely
                                 if not device["protocols"]:
                                     del device["protocols"]
-                                    print(f"[DEBUG BGP CLEANUP] Removed empty protocols from device '{device_name}'")
+                                    logger.debug(f"[DEBUG BGP CLEANUP] Removed empty protocols from device '{device_name}'")
                             elif isinstance(device["protocols"], dict) and "BGP" in device["protocols"]:
                                 # Handle old format for backward compatibility
                                 del device["protocols"]["BGP"]
-                                print(f"[DEBUG BGP CLEANUP] Removed BGP protocol from device '{device_name}' (old format)")
+                                logger.debug(f"[DEBUG BGP CLEANUP] Removed BGP protocol from device '{device_name}' (old format)")
                                 
                                 # If no protocols left, remove the protocols key entirely
                                 if not device["protocols"]:
                                     del device["protocols"]
-                                    print(f"[DEBUG BGP CLEANUP] Removed empty protocols from device '{device_name}'")
+                                    logger.debug(f"[DEBUG BGP CLEANUP] Removed empty protocols from device '{device_name}'")
                         
                         # Also remove bgp_config if it exists
                         if "bgp_config" in device:
                             del device["bgp_config"]
-                            print(f"[DEBUG BGP CLEANUP] Removed bgp_config from device '{device_name}'")
+                            logger.debug(f"[DEBUG BGP CLEANUP] Removed bgp_config from device '{device_name}'")
                         break
             
-            print(f"[DEBUG BGP CLEANUP] Removed {len(rows_to_remove)} BGP entries for device '{device_name}'")
+            logger.debug(f"[DEBUG BGP CLEANUP] Removed {len(rows_to_remove)} BGP entries for device '{device_name}'")
             
         except Exception as e:
-            print(f"[ERROR] Failed to cleanup BGP entries for device '{device_name}': {e}")
+            logger.error(f"Failed to cleanup BGP entries for device '{device_name}': {e}")
 
 
     def apply_bgp_configurations(self):
@@ -1669,7 +1670,7 @@ class BGPHandler:
                         
                         if response.status_code == 200:
                             results["success_count"] += 1
-                            print(f"✅ BGP configuration applied for {device_name}")
+                            logger.info(f"BGP configuration applied for {device_name}")
                             
                             # After successful BGP configuration, start the BGP service
                             try:
@@ -1694,24 +1695,24 @@ class BGPHandler:
                                 )
                                 
                                 if start_response.status_code == 200:
-                                    print(f"✅ BGP service started for {device_name}")
+                                    logger.info(f"BGP service started for {device_name}")
                                 else:
-                                    print(f"⚠️ BGP configured but failed to start service for {device_name}")
+                                    logger.error(f"BGP configured but failed to start service for {device_name}")
                                     
                             except Exception as start_error:
-                                print(f"⚠️ BGP configured but failed to start service for {device_name}: {start_error}")
+                                logger.error(f"BGP configured but failed to start service for {device_name}: {start_error}")
                                 
                         else:
                             error_msg = response.json().get("error", "Unknown error")
                             results["failed_devices"].append(f"{device_name}: {error_msg}")
-                            print(f"❌ Failed to apply BGP for {device_name}: {error_msg}")
+                            logger.error(f"Failed to apply BGP for {device_name}: {error_msg}")
                             
                     except requests.exceptions.RequestException as e:
                         results["failed_devices"].append(f"{device_name}: Network error - {str(e)}")
-                        print(f"❌ Network error applying BGP for {device_name}: {str(e)}")
+                        logger.error(f"Network error applying BGP for {device_name}: {str(e)}")
                     except Exception as e:
                         results["failed_devices"].append(f"{device_name}: {str(e)}")
-                        print(f"❌ Error applying BGP for {device_name}: {str(e)}")
+                        logger.error(f"Error applying BGP for {device_name}: {str(e)}")
 
                 # Handle BGP removal
                 for device_info in self.devices_to_remove_bgp:
@@ -1732,7 +1733,7 @@ class BGPHandler:
                         
                         if response.status_code == 200:
                             results["removal_success_count"] += 1
-                            print(f"✅ BGP configuration removed for {device_name}")
+                            logger.info(f"BGP configuration removed for {device_name}")
                             
                             # Remove BGP configuration from client data after successful server removal
                             if "protocols" in device_info:
@@ -1748,14 +1749,14 @@ class BGPHandler:
                         else:
                             error_msg = response.json().get("error", "Unknown error")
                             results["removal_failed_devices"].append(f"{device_name}: {error_msg}")
-                            print(f"❌ Failed to remove BGP for {device_name}: {error_msg}")
+                            logger.error(f"Failed to remove BGP for {device_name}: {error_msg}")
                             
                     except requests.exceptions.RequestException as e:
                         results["removal_failed_devices"].append(f"{device_name}: Network error - {str(e)}")
-                        print(f"❌ Network error removing BGP for {device_name}: {str(e)}")
+                        logger.error(f"Network error removing BGP for {device_name}: {str(e)}")
                     except Exception as e:
                         results["removal_failed_devices"].append(f"{device_name}: {str(e)}")
-                        print(f"❌ Error removing BGP for {device_name}: {str(e)}")
+                        logger.error(f"Error removing BGP for {device_name}: {str(e)}")
                 
                 # Emit results when done
                 self.finished.emit(results)
