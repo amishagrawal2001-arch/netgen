@@ -678,6 +678,14 @@ class TrafficGenClientServerSection():
 
                     # (2) Name (editable) + stash stream_id
                     name_val = ps.get("name", "") or stream.get("name", "") or ""
+                    # Trace: compare against any current text in row 2 to detect
+                    # populate-overwriting-an-edit. (Cheap; INFO-level.)
+                    existing = self.stream_table.item(row_count, 2)
+                    if existing is not None and existing.text().strip() != name_val:
+                        logger.info(
+                            f"[STREAM TABLE] row={row_count} name in cell={existing.text()!r} "
+                            f"!= model={name_val!r} (stream_id={sid!r}) — populate will overwrite"
+                        )
                     name_item = QTableWidgetItem(name_val)
                     name_item.setData(Qt.UserRole, sid)
                     name_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
@@ -840,8 +848,10 @@ class TrafficGenClientServerSection():
                             # (8) Fixed Size — editable when applicable
                             item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
                         elif cell_disabled:
-                            # Greyed-out, non-interactive
-                            item.setFlags(Qt.ItemIsEnabled & ~Qt.ItemIsEditable)
+                            # Greyed-out: enabled (so it renders) but not selectable/editable.
+                            # Don't try to subtract flags via `&  ~Qt.ItemIsEditable` — PyQt5
+                            # rejects the resulting int. Just set the bits we want.
+                            item.setFlags(Qt.ItemIsEnabled)
                             item.setForeground(QColor("#9ca3af"))
                             item.setToolTip(
                                 f"Not applicable when Frame Type is {current_frame_type}"
