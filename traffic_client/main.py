@@ -51,7 +51,7 @@ class TrafficGeneratorClient(
     pass
     def __init__(self, server_url=None, server_explicitly_provided=False):
         super().__init__()
-        self.setWindowTitle("Traffic Generator Client")
+        self.setWindowTitle("Netgen Traffic Generator")
         self.setGeometry(100, 100, 1400, 800)
 
         self.streams = {}

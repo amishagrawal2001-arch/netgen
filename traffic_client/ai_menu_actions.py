@@ -1,6 +1,6 @@
 """
-AI Menu Actions for OSTG Client
-Adds AI features to the menu bar
+AI menu actions for the Netgen client.
+Adds the AI Assistant submenu to the menu bar.
 """
 
 from PyQt5.QtWidgets import QMenu, QAction, QMessageBox

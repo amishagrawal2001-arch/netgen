@@ -50,7 +50,7 @@ def launch(server_url: str, fullscreen: bool, server_explicitly_provided: bool =
         print(tb, file=sys.stderr)
         msg = QMessageBox()
         msg.setIcon(QMessageBox.Critical)
-        msg.setWindowTitle("OSTG Client - Startup Error")
+        msg.setWindowTitle("Netgen Client - Startup Error")
         msg.setText(str(e))
         msg.setDetailedText(tb)
         msg.exec_()
@@ -66,7 +66,7 @@ def main(argv=None):
     
     parser = argparse.ArgumentParser(
         prog="ostg-client",
-        description="OSTG Traffic Generator GUI client"
+        description="Netgen Traffic Generator GUI client"
     )
     parser.add_argument(
         "-s", "--server",
