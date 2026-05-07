@@ -1,6 +1,7 @@
 """
 AI menu actions for the Netgen client.
-Adds the AI Assistant submenu to the menu bar.
+Adds the AI Assistant submenu under the Tools menu (falls back to a top-level
+menu if the Tools menu hasn't been created yet).
 """
 
 from PyQt5.QtWidgets import QMenu, QAction, QMessageBox
@@ -16,10 +17,13 @@ class TrafficGenClientAIMenuActions:
     
     @staticmethod
     def setup_ai_menu(client_window):
-        """Setup AI menu in menu bar"""
-        # Create AI menu
+        """Setup AI Assistant submenu, preferring the Tools menu if present."""
         client_window.ai_menu = QMenu("&AI Assistant", client_window.menuBar())
-        client_window.menuBar().addMenu(client_window.ai_menu)
+        tools_menu = getattr(client_window, "tools_menu", None)
+        if tools_menu is not None:
+            tools_menu.addMenu(client_window.ai_menu)
+        else:
+            client_window.menuBar().addMenu(client_window.ai_menu)
         
         # Troubleshooting
         troubleshoot_action = QAction("&Troubleshooting Assistant", client_window)

@@ -16,6 +16,41 @@ from PyQt5.QtCore import Qt, QSize, QTimer
 
 from utils.qicon_loader import qicon, r_icon
 
+
+def _make_enabled_cell(initial_state: bool):
+    """Build a centred QCheckBox inside a container suitable for a QTableWidget cell.
+
+    Returns (container_widget, checkbox) so callers can wire signals on the checkbox
+    while installing the container via setCellWidget. A bare QCheckBox sits flush-left
+    in a cell, which looks unprofessional; the wrapper centres it instead.
+    """
+    container = QWidget()
+    layout = QHBoxLayout(container)
+    layout.setContentsMargins(0, 0, 0, 0)
+    layout.setAlignment(Qt.AlignCenter)
+    checkbox = QCheckBox()
+    checkbox.blockSignals(True)
+    checkbox.setChecked(bool(initial_state))
+    checkbox.blockSignals(False)
+    layout.addWidget(checkbox)
+    return container, checkbox
+
+
+def _read_enabled_cell(cell_widget) -> bool:
+    """Read the on/off state of an Enabled cell, tolerating both the new
+    QCheckBox-in-container layout and any legacy QComboBox cells."""
+    if cell_widget is None:
+        return False
+    # New layout: QWidget container holding a QCheckBox
+    checkbox = cell_widget.findChild(QCheckBox) if hasattr(cell_widget, "findChild") else None
+    if checkbox is not None:
+        return checkbox.isChecked()
+    # Legacy layout: bare QComboBox with Yes/No
+    if isinstance(cell_widget, QComboBox):
+        return cell_widget.currentText().strip().lower() in ("yes", "true", "1")
+    return False
+
+
 class TrafficGenClientServerSection():
     def setup_server_section(self):
         """Set up the server management section."""
@@ -100,10 +135,12 @@ class TrafficGenClientServerSection():
         # Add tree with spacing
         layout.addWidget(self.server_tree, 1)  # Stretch factor for tree to take available space
 
-        # Adjust column widths
-        self.server_tree.setColumnWidth(0, 180)  # Increased to accommodate status icon
-        self.server_tree.setColumnWidth(1, 200)  # Initial width, will stretch
-        self.server_tree.setColumnWidth(2, 75)  # Width for Selected column (header text "Selected" needs ~70-75px to be fully visible)
+        # Adjust column widths — keep TG ID compact so the address column has room
+        self.server_tree.setColumnWidth(0, 90)   # Icon + short id like "TG 0"
+        self.server_tree.setColumnWidth(1, 260)  # Initial width; column is set to Stretch
+        self.server_tree.setColumnWidth(2, 60)   # "Select" header is short
+        # Address column needs a healthy minimum so the header isn't clipped at narrow splitter widths
+        header.setMinimumSectionSize(60)
 
         # Connect to unified update for stream + device tables
         # Use debounced handler to prevent rapid-fire updates on interface clicks
@@ -173,9 +210,9 @@ class TrafficGenClientServerSection():
         self.update_server_tree()
         
         # Set column widths after tree is populated (ensures they're applied)
-        self.server_tree.setColumnWidth(0, 180)
-        self.server_tree.setColumnWidth(1, 200)
-        self.server_tree.setColumnWidth(2, 75)
+        self.server_tree.setColumnWidth(0, 90)
+        self.server_tree.setColumnWidth(1, 260)
+        self.server_tree.setColumnWidth(2, 60)
 
     def _debounced_selection_changed(self):
         """Debounced wrapper for selection change handler to prevent rapid-fire updates."""
@@ -353,10 +390,10 @@ class TrafficGenClientServerSection():
                 ps = stream.setdefault("protocol_selection", {})
                 stream_name = ps.get("name") or stream.get("name", "")
                 if stream_name == name:
-                    # Enabled ComboBox
+                    # Enabled checkbox (was a Yes/No combo in older revisions)
                     enabled_widget = self.stream_table.cellWidget(row, 3)
-                    if enabled_widget:
-                        is_enabled = enabled_widget.currentText().lower() == "yes"
+                    if enabled_widget is not None:
+                        is_enabled = _read_enabled_cell(enabled_widget)
                         ps["enabled"] = is_enabled
                         stream["enabled"] = is_enabled
 
@@ -439,13 +476,9 @@ class TrafficGenClientServerSection():
         combo_dropdown_open = False
         try:
             for row in range(self.stream_table.rowCount()):
-                # Check Enabled combo (column 3)
-                enabled_combo = self.stream_table.cellWidget(row, 3)
-                if enabled_combo and isinstance(enabled_combo, QComboBox):
-                    if enabled_combo.view().isVisible():
-                        combo_dropdown_open = True
-                        break
-                # Check Flow Tracking combo (column 15)
+                # Enabled column (3) is now a checkbox — nothing to "open", so no check needed.
+                # Flow Tracking (15) is still a combo and can have an open dropdown we must
+                # not refresh through.
                 flow_combo = self.stream_table.cellWidget(row, 15)
                 if flow_combo and isinstance(flow_combo, QComboBox):
                     if flow_combo.view().isVisible():
@@ -571,6 +604,12 @@ class TrafficGenClientServerSection():
                     if not port_matches:
                         continue
 
+                # Track whether this row is the first one we render for this port —
+                # used below to blank the Interface column on continuation rows so a
+                # port with multiple streams reads as one visual group instead of
+                # three identical-looking rows.
+                _port_first_row_rendered = False
+
                 for stream in streams:
                     ps = stream.get("protocol_selection", {})
 
@@ -583,18 +622,27 @@ class TrafficGenClientServerSection():
                         continue
 
                     self.stream_table.insertRow(row_count)
+                    is_port_continuation = _port_first_row_rendered
+                    _port_first_row_rendered = True
 
-                    # (0) Status (read-only)
+                    # (0) Status (read-only) — icon + hover tooltip + accessible label.
+                    # Color alone is insufficient (colourblind users see no signal); the
+                    # tooltip and Qt accessibility name carry the meaning in text too.
                     status = stream.get("status", "stopped")
                     if status == "running":
                         status_icon = QIcon(r_icon("icons/green_dot.png"))
+                        status_label = "Running"
                     elif status == "rx_tracking":
                         status_icon = QIcon(r_icon("icons/blue_dot.png"))
+                        status_label = "Tracking RX"
                     else:
                         status_icon = QIcon(r_icon("icons/red_dot.png"))
+                        status_label = "Stopped"
                     status_item = QTableWidgetItem()
                     status_item.setIcon(status_icon)
                     status_item.setFlags(Qt.ItemIsEnabled)
+                    status_item.setToolTip(status_label)
+                    status_item.setData(Qt.AccessibleTextRole, status_label)
                     self.stream_table.setItem(row_count, 0, status_item)
 
                     # (1) Interface (read-only) - extract just the interface name
@@ -605,7 +653,20 @@ class TrafficGenClientServerSection():
                         interface_name = interface_name.rsplit(":", 1)[-1].strip()
                     if "Port:" in interface_name:
                         interface_name = interface_name.replace("Port:", "").strip()
-                    iface_item = QTableWidgetItem(interface_name)
+                    if is_port_continuation:
+                        # Same port as the row above — show a subtle indent dash and
+                        # park the full port name in the tooltip so it's still
+                        # discoverable on hover.
+                        iface_item = QTableWidgetItem("↳")
+                        iface_item.setForeground(QColor("#9ca3af"))
+                        iface_item.setToolTip(interface_name)
+                    else:
+                        iface_item = QTableWidgetItem(interface_name)
+                        # Visually separate the start of a new port group with a
+                        # slightly heavier font so the row reads as a header.
+                        header_font = iface_item.font()
+                        header_font.setBold(True)
+                        iface_item.setFont(header_font)
                     iface_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
                     self.stream_table.setItem(row_count, 1, iface_item)
 
@@ -622,23 +683,19 @@ class TrafficGenClientServerSection():
                     name_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
                     self.stream_table.setItem(row_count, 2, name_item)
 
-                    # (3) Enabled via combo
-                    enabled_combo = QComboBox()
-                    enabled_combo.addItems(["Yes", "No"])
+                    # (3) Enabled via centred checkbox (lighter than the previous Yes/No combo)
                     enabled_raw = stream.get("enabled")
                     if enabled_raw is None:
                         enabled_raw = ps.get("enabled", False)
-                    # Block signals while setting initial value to prevent handler from firing during refresh
-                    enabled_combo.blockSignals(True)
-                    enabled_combo.setCurrentText("Yes" if bool(enabled_raw) else "No")
-                    enabled_combo.blockSignals(False)
-                    # Use functools.partial to avoid lambda closure issues with row number
-                    # This prevents segfaults when table refreshes while combo box signal fires
-                    enabled_combo.currentTextChanged.connect(
+                    enabled_widget, enabled_checkbox = _make_enabled_cell(bool(enabled_raw))
+                    enabled_checkbox.setEnabled(status != "rx_tracking")
+                    enabled_checkbox.setToolTip("Include this stream when starting traffic")
+                    # Use functools.partial to bind the row at connect time and avoid
+                    # late-binding/segfault issues when the table is rebuilt mid-signal.
+                    enabled_checkbox.stateChanged.connect(
                         partial(self.handle_enabled_combo_change, row=row_count)
                     )
-                    enabled_combo.setEnabled(status != "rx_tracking")
-                    self.stream_table.setCellWidget(row_count, 3, enabled_combo)
+                    self.stream_table.setCellWidget(row_count, 3, enabled_widget)
 
                     # (4–13) Protocol fields
                     column_keys = [
@@ -763,11 +820,32 @@ class TrafficGenClientServerSection():
                                     value = dst_ip6
                                 # If no IPs found, keep "IPv6" as-is
 
+                        # Mask size cells that don't apply to the current Frame Type so the
+                        # table can't show contradictory information (e.g. Min=64 + Max=1518
+                        # alongside Fixed=64 when the frame type is Fixed).
+                        current_frame_type = (
+                            ps.get("frame_type") or stream.get("frame_type") or "Fixed"
+                        )
+                        cell_disabled = False
+                        if current_frame_type == "Fixed" and key in ("frame_min", "frame_max"):
+                            value = "—"
+                            cell_disabled = True
+                        elif current_frame_type in ("Random", "IMIX") and key == "frame_size":
+                            value = "—"
+                            cell_disabled = True
+
                         item = QTableWidgetItem(str(value))
 
-                        if key == "frame_size":
-                            # (8) Fixed Size — editable
+                        if key == "frame_size" and not cell_disabled:
+                            # (8) Fixed Size — editable when applicable
                             item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable)
+                        elif cell_disabled:
+                            # Greyed-out, non-interactive
+                            item.setFlags(Qt.ItemIsEnabled & ~Qt.ItemIsEditable)
+                            item.setForeground(QColor("#9ca3af"))
+                            item.setToolTip(
+                                f"Not applicable when Frame Type is {current_frame_type}"
+                            )
                         else:
                             # Read-only fields
                             item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
@@ -828,6 +906,9 @@ class TrafficGenClientServerSection():
             # Re-enable signals and clear the population guard
             self.stream_table.blockSignals(False)
             self._populating_table = False
+            # Toggle empty-state overlay (lives on the StreamControl mixin)
+            if hasattr(self, "update_stream_empty_state"):
+                self.update_stream_empty_state()
             # print(f"[STREAM TABLE] Completed _do_update_stream_table() - set _populating_table to False")
 
     def on_server_tree_selection_changed(self):
@@ -907,6 +988,9 @@ class TrafficGenClientServerSection():
             tg_id_layout.addStretch()
             
             server_item = QTreeWidgetItem(["", server_address, ""])
+            # Hover tooltip surfaces the full address even when the column is too narrow.
+            online_label = "Online" if is_online else "Offline"
+            server_item.setToolTip(1, f"{server_address}  ({online_label})")
             self.server_tree.addTopLevelItem(server_item)
             # Set the widget for TG ID column (column 0)
             self.server_tree.setItemWidget(server_item, 0, tg_id_widget)

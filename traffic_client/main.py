@@ -19,6 +19,7 @@ from PyQt5.QtWidgets import (
 
 from PyQt5 import QtCore
 from PyQt5.QtCore import QTimer, Qt
+from PyQt5.QtGui import QKeySequence
 
 # Ensure Qt knows about QVector<int> when signals cross threads (older PyQt builds may lack the helper)
 if hasattr(QtCore, "qRegisterMetaType"):
@@ -586,38 +587,80 @@ class TrafficGeneratorClient(
         menu_bar = self.menuBar()
 
         # File menu
-        file_menu = QMenu("File", self)
+        file_menu = QMenu("&File", self)
         menu_bar.addMenu(file_menu)
 
-        add_server_action = QAction("Add Tgen Chassis", self)
+        add_server_action = QAction("Add TGEN Chassis...", self)
+        add_server_action.setShortcut(QKeySequence("Ctrl+N"))
         add_server_action.triggered.connect(self.add_server_interface)
         file_menu.addAction(add_server_action)
 
-        remove_server_action = QAction("Remove Tgen Chassis", self)
+        remove_server_action = QAction("Remove TGEN Chassis", self)
         remove_server_action.triggered.connect(self.remove_selected_server)
         file_menu.addAction(remove_server_action)
 
+        file_menu.addSeparator()
+
         save_session_action = QAction("Save Session", self)
+        save_session_action.setShortcut(QKeySequence.Save)
         save_session_action.triggered.connect(self.save_session)
         file_menu.addAction(save_session_action)
 
+        # Edit menu
+        edit_menu = QMenu("&Edit", self)
+        menu_bar.addMenu(edit_menu)
+
+        copy_stream_action = QAction("Copy Stream", self)
+        copy_stream_action.setShortcut(QKeySequence.Copy)
+        copy_stream_action.triggered.connect(self.copy_selected_stream)
+        edit_menu.addAction(copy_stream_action)
+
+        paste_stream_action = QAction("Paste Stream", self)
+        paste_stream_action.setShortcut(QKeySequence.Paste)
+        paste_stream_action.triggered.connect(self.paste_stream_to_interface)
+        edit_menu.addAction(paste_stream_action)
+
+        edit_menu.addSeparator()
+
+        copy_device_action = QAction("Copy Device", self)
+        copy_device_action.triggered.connect(self.copy_selected_device)
+        edit_menu.addAction(copy_device_action)
+
+        paste_device_action = QAction("Paste Device", self)
+        paste_device_action.triggered.connect(self.paste_device_to_interface)
+        edit_menu.addAction(paste_device_action)
+
+        # Server menu — chassis-level actions (online state, restart, reboot)
+        server_menu = QMenu("&Server", self)
+        menu_bar.addMenu(server_menu)
+
         self.make_server_online_action = QAction("Make Selected Servers Online", self)
         self.make_server_online_action.setEnabled(False)
+        # Tooltip explains why the action is disabled until a failed server is selected
+        self.make_server_online_action.setToolTip(
+            "Select an offline Tgen chassis in the server pane to enable this action."
+        )
         self.make_server_online_action.triggered.connect(self.make_failed_servers_online)
-        file_menu.addAction(self.make_server_online_action)
+        server_menu.addAction(self.make_server_online_action)
 
-        file_menu.addSeparator()
+        server_menu.addSeparator()
 
-        restart_tgen_action = QAction("Restart TGEN", self)
+        restart_tgen_action = QAction("Restart TGEN Service...", self)
         restart_tgen_action.triggered.connect(self.restart_server)
-        file_menu.addAction(restart_tgen_action)
-        
-        reboot_server_action = QAction("Reboot Physical Server", self)
+        server_menu.addAction(restart_tgen_action)
+
+        reboot_server_action = QAction("Reboot Physical Server...", self)
+        reboot_server_action.setToolTip(
+            "Reboots the entire physical chassis. Requires explicit confirmation."
+        )
         reboot_server_action.triggered.connect(self.reboot_server)
-        file_menu.addAction(reboot_server_action)
+        server_menu.addAction(reboot_server_action)
+
+        # Show tooltips for menu items (Qt hides them by default in menus)
+        server_menu.setToolTipsVisible(True)
 
         # Capture menu
-        capture_menu = QMenu("Capture", self)
+        capture_menu = QMenu("&Capture", self)
         menu_bar.addMenu(capture_menu)
 
         self.start_capture_action = QAction("Start Packet Capture", self)
@@ -629,33 +672,15 @@ class TrafficGeneratorClient(
         self.stop_capture_action.setEnabled(False)
         capture_menu.addAction(self.stop_capture_action)
 
-        # Edit menu
-        edit_menu = QMenu("Edit", self)
-        menu_bar.addMenu(edit_menu)
+        # Tools menu — host the DPDK and AI Assistant submenus together
+        tools_menu = QMenu("&Tools", self)
+        menu_bar.addMenu(tools_menu)
+        # Stash on self so the AI mixin (added later in __init__) can attach into Tools
+        self.tools_menu = tools_menu
 
-        copy_stream_action = QAction("Copy Stream", self)
-        copy_stream_action.triggered.connect(self.copy_selected_stream)
-        edit_menu.addAction(copy_stream_action)
-
-        paste_stream_action = QAction("Paste Stream", self)
-        paste_stream_action.triggered.connect(self.paste_stream_to_interface)
-        edit_menu.addAction(paste_stream_action)
-
-        # Add separator for device actions
-        edit_menu.addSeparator()
-
-        # Device copy/paste actions
-        copy_device_action = QAction("Copy Device", self)
-        copy_device_action.triggered.connect(self.copy_selected_device)
-        edit_menu.addAction(copy_device_action)
-
-        paste_device_action = QAction("Paste Device", self)
-        paste_device_action.triggered.connect(self.paste_device_to_interface)
-        edit_menu.addAction(paste_device_action)
-
-        # DPDK menu
+        # DPDK lives as a submenu under Tools
         dpdk_menu = QMenu("DPDK", self)
-        menu_bar.addMenu(dpdk_menu)
+        tools_menu.addMenu(dpdk_menu)
 
         dpdk_status_action = QAction("Status", self)
         dpdk_status_action.triggered.connect(self.show_dpdk_status)
@@ -683,11 +708,11 @@ class TrafficGeneratorClient(
 
         dpdk_iommu_action = QAction("Configure IOMMU", self)
         dpdk_iommu_action.triggered.connect(self.configure_iommu)
-        
-        dpdk_load_modules_action = QAction("Load VFIO Modules", self)
-        dpdk_menu.addAction(dpdk_load_modules_action)
-        dpdk_load_modules_action.triggered.connect(self.load_vfio_modules)
         dpdk_menu.addAction(dpdk_iommu_action)
+
+        dpdk_load_modules_action = QAction("Load VFIO Modules", self)
+        dpdk_load_modules_action.triggered.connect(self.load_vfio_modules)
+        dpdk_menu.addAction(dpdk_load_modules_action)
 
     def copy_selected_device(self):
         """Copy the selected device - delegate to devices tab."""

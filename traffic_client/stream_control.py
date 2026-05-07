@@ -5,7 +5,7 @@ logger = logging.getLogger(__name__)
 
 from PyQt5.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QComboBox, QTableWidget,
-    QTableWidgetItem, QAbstractItemView, QHeaderView, QMessageBox, QDialog
+    QTableWidgetItem, QAbstractItemView, QHeaderView, QMessageBox, QDialog, QLabel
 )
 from PyQt5.QtGui import QIcon
 from PyQt5.QtCore import Qt, QSize
@@ -29,12 +29,18 @@ class TrafficGenClientStreamControl:
 
         # --- Stream Table ---
         self.stream_table = QTableWidget()
-        self.stream_table.setColumnCount(16)
-        self.stream_table.setHorizontalHeaderLabels([
+        stream_column_labels = [
             "Status", "Interface", "Name", "Enabled", "Details", "Frame Type",
             "Min Size", "Max Size", "Fixed Size", "L1", "VLAN", "L2", "L3", "L4", "RX Port",
-            "Flow Tracking"
-        ])
+            "Flow Tracking",
+        ]
+        self.stream_table.setColumnCount(len(stream_column_labels))
+        self.stream_table.setHorizontalHeaderLabels(stream_column_labels)
+        # Hover tooltip on each column header — useful when the column gets narrow.
+        for col, label in enumerate(stream_column_labels):
+            header_item = self.stream_table.horizontalHeaderItem(col)
+            if header_item is not None:
+                header_item.setToolTip(label)
         self.stream_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         self.stream_table.setEditTriggers(QAbstractItemView.DoubleClicked | QAbstractItemView.SelectedClicked)
 
@@ -91,6 +97,21 @@ class TrafficGenClientStreamControl:
 
         self.stream_table.itemChanged.connect(self.handle_inline_edit)
         layout.addWidget(self.stream_table)
+
+        # Empty-state overlay shown when there are no streams to display.
+        # Parented to the table viewport so it floats above the empty grid.
+        self._stream_empty_label = QLabel(
+            "No streams configured.\nSelect a port on the left and click ➕ to add a stream.",
+            self.stream_table.viewport(),
+        )
+        self._stream_empty_label.setAlignment(Qt.AlignCenter)
+        self._stream_empty_label.setStyleSheet(
+            "QLabel { color: #6b7280; font-size: 12px; padding: 24px; "
+            "background-color: transparent; }"
+        )
+        self._stream_empty_label.hide()
+        # Reposition the overlay whenever the viewport resizes
+        self.stream_table.viewport().installEventFilter(self)
 
         # --- All Buttons in Same Row (Action buttons on left, Control buttons centered) ---
         button_layout = QHBoxLayout()
@@ -167,28 +188,111 @@ class TrafficGenClientStreamControl:
         self.apply_stream_button.setIcon(QIcon(r_icon("icons/apply.png")))
         self.apply_stream_button.setIconSize(QSize(16, 16))
         self.apply_stream_button.setFixedSize(32, 28)
-        self.apply_stream_button.setToolTip("Apply stream changes and restart traffic")
+        # Clearer description of what Apply actually does (audit found the previous
+        # tooltip only described one of three branches).
+        self.apply_stream_button.setToolTip(
+            "Sync your edits to the server. Restarts streams that are currently "
+            "running and still enabled; stops streams you've just disabled."
+        )
+        # Track baseline style so the dirty-edit highlight can be reverted cleanly.
+        self._apply_button_default_style = self.apply_stream_button.styleSheet()
         self.apply_stream_button.clicked.connect(self.apply_stream)
         button_layout.addWidget(self.apply_stream_button)
 
         # Add stretch before search box
         button_layout.addStretch(1)
 
-        # Search box (right side)
+        # Search box (right side) — debounced so each keystroke doesn't trigger a
+        # full table rebuild (audit flagged this as a perf wart with 100+ streams).
         self.search_box = QLineEdit()
         self.search_box.setPlaceholderText("Search...")
         self.search_box.setFixedWidth(200)
+        self._search_debounce_timer = QTimer(self)
+        self._search_debounce_timer.setSingleShot(True)
+        self._search_debounce_timer.setInterval(200)
+        self._search_debounce_timer.timeout.connect(self.update_stream_table)
         self.search_box.returnPressed.connect(self.update_stream_table)
-        self.search_box.textChanged.connect(self.update_stream_table)
+        self.search_box.textChanged.connect(lambda _t: self._search_debounce_timer.start())
         button_layout.addWidget(self.search_box)
 
-        clear_search_btn = QPushButton("❌")
+        # Neutral clear button — the previous "❌" emoji rendered bright red and
+        # read as an error/destructive cue rather than a benign clear control.
+        clear_search_btn = QPushButton("✕")
         clear_search_btn.setFixedWidth(30)
         clear_search_btn.setToolTip("Clear search")
+        clear_search_btn.setStyleSheet(
+            "QPushButton { color: #6b7280; font-size: 13px; }"
+            "QPushButton:hover { color: #1f2937; }"
+        )
         clear_search_btn.clicked.connect(lambda: self.search_box.setText(""))
         button_layout.addWidget(clear_search_btn)
 
         layout.addLayout(button_layout)
+
+    def eventFilter(self, watched, event):
+        # Keep the empty-state label centred over the table viewport.
+        # Returning False lets the event continue to its normal handler.
+        if (
+            hasattr(self, "_stream_empty_label")
+            and hasattr(self, "stream_table")
+            and watched is self.stream_table.viewport()
+            and event.type() == event.Resize
+        ):
+            self._stream_empty_label.resize(watched.size())
+        return False
+
+    def update_stream_empty_state(self):
+        """Show or hide the empty-state placeholder based on the table row count."""
+        if not hasattr(self, "_stream_empty_label"):
+            return
+        if self.stream_table.rowCount() == 0:
+            self._stream_empty_label.resize(self.stream_table.viewport().size())
+            self._stream_empty_label.raise_()
+            self._stream_empty_label.show()
+        else:
+            self._stream_empty_label.hide()
+
+    # ---------- dirty-edit tracking (#8) ----------
+
+    def _dirty_streams(self) -> set:
+        """Set of stream_ids with unapplied inline edits (lazy-init for mixin safety)."""
+        if not hasattr(self, "_dirty_stream_ids"):
+            self._dirty_stream_ids = set()
+        return self._dirty_stream_ids
+
+    def mark_stream_dirty(self, stream_id):
+        """Flag a stream as having unapplied edits and refresh the Apply button cue."""
+        if not stream_id:
+            return
+        self._dirty_streams().add(stream_id)
+        self._refresh_apply_button_state()
+
+    def clear_dirty_streams(self):
+        """Called from apply_stream after a successful sync."""
+        self._dirty_streams().clear()
+        self._refresh_apply_button_state()
+
+    def _refresh_apply_button_state(self):
+        """Tint the Apply button when there are unapplied edits."""
+        btn = getattr(self, "apply_stream_button", None)
+        if btn is None:
+            return
+        if self._dirty_streams():
+            btn.setStyleSheet(
+                "QPushButton { background-color: #fef3c7; border: 1px solid #f59e0b; "
+                "border-radius: 4px; }"
+                "QPushButton:hover { background-color: #fde68a; }"
+            )
+            btn.setToolTip(
+                f"You have {len(self._dirty_streams())} unapplied edit(s). "
+                "Click to sync them to the server."
+            )
+        else:
+            btn.setStyleSheet(getattr(self, "_apply_button_default_style", ""))
+            btn.setToolTip(
+                "Sync your edits to the server. Restarts streams that are currently "
+                "running and still enabled; stops streams you've just disabled."
+            )
 
     def setup_stream_start_stop_buttons(self):
         """Set up Start and Stop Stream buttons."""
@@ -330,6 +434,10 @@ class TrafficGenClientStreamControl:
             except Exception as e:
                 logger.warning(f"send_inline_update_to_server failed: {e}")
 
+        # Flag the row as having unapplied edits so the Apply button highlights.
+        if hasattr(self, "mark_stream_dirty"):
+            self.mark_stream_dirty(stream.get("stream_id"))
+
         # Session save removed - only save on explicit user action (Save Session menu or Apply button)
 
 
@@ -402,7 +510,12 @@ class TrafficGenClientStreamControl:
         # Session save removed - only save on explicit user action (Save Session menu or Apply button)
 
     def handle_enabled_combo_change(self, value, row):
-        """Handle change in Enabled combo box and update stream state."""
+        """Handle a state change on the row's Enabled checkbox.
+
+        Despite the legacy method name, the cell widget is now a QCheckBox; `value`
+        is a Qt.CheckState int from QCheckBox.stateChanged. Older Yes/No string values
+        are still tolerated so any straggling combo cells don't crash the handler.
+        """
         interface_item = self.stream_table.item(row, 1)
         name_item = self.stream_table.item(row, 2)
         if not interface_item or not name_item:
@@ -410,13 +523,19 @@ class TrafficGenClientStreamControl:
 
         port = interface_item.text().strip()
         stream_name = name_item.text().strip()
-        new_enabled = value.strip().lower() == "yes"
+
+        if isinstance(value, str):
+            new_enabled = value.strip().lower() in ("yes", "true", "1")
+        else:
+            new_enabled = bool(value)  # Qt.Checked == 2, Qt.PartiallyChecked == 1, Qt.Unchecked == 0
 
         for stream in self.streams.get(port, []):
             if stream.get("name") == stream_name or stream.get("protocol_selection", {}).get("name") == stream_name:
                 stream["enabled"] = new_enabled
                 logger.info(f"Stream '{stream_name}' on {port} enabled set to {new_enabled}")
                 self.send_inline_update_to_server(port, stream)
+                if hasattr(self, "mark_stream_dirty"):
+                    self.mark_stream_dirty(stream.get("stream_id"))
                 break
 
     def update_rx_port(self, port, stream, new_rx):
