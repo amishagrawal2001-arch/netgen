@@ -763,7 +763,21 @@ class TrafficGenClientStatisticsSection():
         self.statistics_table.setColumnCount(len(statistics))
 
         self.statistics_table.setVerticalHeaderLabels(base_rows)
-        self.statistics_table.setHorizontalHeaderLabels(statistics.keys())
+        header_labels = list(statistics.keys())
+        self.statistics_table.setHorizontalHeaderLabels(header_labels)
+
+        # Make sure column headers don't clip at narrow pane widths.
+        # Use a per-column min width derived from the header text, and expose the
+        # full interface name as a hover tooltip on the header.
+        from PyQt5.QtGui import QFontMetrics
+        header_view = self.statistics_table.horizontalHeader()
+        fm = QFontMetrics(header_view.font())
+        for col, label in enumerate(header_labels):
+            header_item = self.statistics_table.horizontalHeaderItem(col)
+            if header_item is not None:
+                header_item.setToolTip(label)
+            min_width = fm.horizontalAdvance(label) + 24  # padding for sort indicator + breathing room
+            self.statistics_table.setColumnWidth(col, max(min_width, 110))
 
         for col, (iface_name, stats) in enumerate(statistics.items()):
             # (0) Status - with color coding
