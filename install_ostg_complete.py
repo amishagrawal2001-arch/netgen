@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-OSTG Complete Installation Script (Python Version)
-Installs OSTG Traffic Generator with all dependencies including Docker and FRR
+Netgen Complete Installation Script (Python Version)
+Installs the Netgen traffic generator with all dependencies including Docker and FRR.
 """
 
 import os
@@ -15,14 +15,32 @@ import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-# Configuration
-OSTG_VERSION = "0.1.52"
+# Product identity
+PRODUCT_NAME = "Netgen"
+NETGEN_VERSION = "0.2.0"
+
+# Wheel artifact still ships under its original distribution name; surface rename
+# leaves the Python package internals untouched.
+WHEEL_DIST = "ostg_trafficgen"
+WHEEL_VERSION = "0.1.52"
+
 PYTHON_VERSION = "3.10"
-VENV_NAME = "ostg_env"
-OSTG_PORT = 5051
-DOCKER_IMAGE = "ostg-frr:latest"
-DOCKER_NETWORK = "ostg-frr-network"
-INSTALL_DIR = "/opt/OSTG"
+VENV_NAME = "netgen_env"
+NETGEN_PORT = 5051
+DOCKER_IMAGE = "netgen-frr:latest"
+DOCKER_NETWORK = "netgen-frr-network"
+INSTALL_DIR = "/opt/netgen"
+
+# Legacy names retained only for clean-up of prior OSTG installs.
+LEGACY_INSTALL_DIR = "/opt/OSTG"
+LEGACY_DOCKER_IMAGE = "ostg-frr:latest"
+LEGACY_DOCKER_NETWORK = "ostg-frr-network"
+LEGACY_SYSTEMD_UNITS = [
+    "ostg-server.service",
+    "ostg-client.service",
+    "ostg-cleanup.service",
+    "ostg-cleanup.timer",
+]
 
 # Color codes for output
 class Colors:
@@ -32,7 +50,7 @@ class Colors:
     BLUE = '\033[0;34m'
     NC = '\033[0m'  # No Color
 
-class OSTGInstaller:
+class NetgenInstaller:
     def __init__(self, remote_host: Optional[str] = None, remote_user: str = "root", remote_pass: Optional[str] = None):
         self.remote_host = remote_host
         self.remote_user = remote_user
@@ -48,7 +66,7 @@ class OSTGInstaller:
             format='%(asctime)s - %(levelname)s - %(message)s',
             handlers=[
                 logging.StreamHandler(),
-                logging.FileHandler('/tmp/ostg_install_temp.log')
+                logging.FileHandler('/tmp/netgen_install_temp.log')
             ]
         )
         self.logger = logging.getLogger(__name__)
@@ -416,14 +434,14 @@ class OSTGInstaller:
         self.log("✓ Docker installed and started successfully")
         
     def install_ostg(self):
-        """Install OSTG Traffic Generator"""
-        self.log("Installing OSTG Traffic Generator...")
-        
+        """Install the Netgen traffic generator wheel and ancillary files."""
+        self.log(f"Installing {PRODUCT_NAME} traffic generator...")
+
         # Create installation directory
         self.run_command(f"mkdir -p {INSTALL_DIR}")
-        
-        # Copy wheel file
-        wheel_file = f"ostg_trafficgen-{OSTG_VERSION}-py3-none-any.whl"
+
+        # Copy wheel file (still distributed under its original name)
+        wheel_file = f"{WHEEL_DIST}-{WHEEL_VERSION}-py3-none-any.whl"
         local_wheel_path = f"dist/{wheel_file}"
         remote_wheel_path = f"{INSTALL_DIR}/{wheel_file}"
         
@@ -449,7 +467,7 @@ class OSTGInstaller:
                 if remote_file.endswith(".sh"):
                     self.run_command(f"chmod +x {remote_file}")
                 
-        self.log("✓ OSTG installed successfully")
+        self.log(f"✓ {PRODUCT_NAME} installed successfully")
         
     def setup_docker_frr(self):
         """Setup Docker FRR image"""
@@ -481,9 +499,9 @@ class OSTGInstaller:
         """Create systemd services"""
         self.log("Creating systemd services...")
         
-        # OSTG Server Service
+        # Netgen Server Service
         server_service = f"""[Unit]
-Description=OSTG Traffic Generator Server
+Description={PRODUCT_NAME} Traffic Generator Server
 After=network.target docker.service
 Requires=docker.service
 
@@ -497,19 +515,19 @@ Restart=always
 RestartSec=10
 StandardOutput=journal
 StandardError=journal
-SyslogIdentifier=ostg-server
+SyslogIdentifier=netgen-server
 
 [Install]
 WantedBy=multi-user.target
 """
-        
-        self.run_command(f"cat > /etc/systemd/system/ostg-server.service << 'EOF'\n{server_service}EOF")
-        
-        # OSTG Client Service
+
+        self.run_command(f"cat > /etc/systemd/system/netgen-server.service << 'EOF'\n{server_service}EOF")
+
+        # Netgen Client Service
         client_service = f"""[Unit]
-Description=OSTG Traffic Generator Client
-After=network.target ostg-server.service
-Requires=ostg-server.service
+Description={PRODUCT_NAME} Traffic Generator Client
+After=network.target netgen-server.service
+Requires=netgen-server.service
 
 [Service]
 Type=simple
@@ -521,12 +539,12 @@ ExecStart=/usr/bin/python3 /usr/local/lib/python3.10/dist-packages/run_tgen_clie
 [Install]
 WantedBy=multi-user.target
 """
-        
-        self.run_command(f"cat > /etc/systemd/system/ostg-client.service << 'EOF'\n{client_service}EOF")
-        
+
+        self.run_command(f"cat > /etc/systemd/system/netgen-client.service << 'EOF'\n{client_service}EOF")
+
         # Cleanup Service
         cleanup_service = f"""[Unit]
-Description=OSTG Cleanup Service
+Description={PRODUCT_NAME} Cleanup Service
 After=network.target
 
 [Service]
@@ -536,13 +554,13 @@ WorkingDirectory={INSTALL_DIR}
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 ExecStart=/usr/bin/python3 -c "from utils.frr_docker import cleanup_all_containers; cleanup_all_containers()"
 """
-        
-        self.run_command(f"cat > /etc/systemd/system/ostg-cleanup.service << 'EOF'\n{cleanup_service}EOF")
-        
+
+        self.run_command(f"cat > /etc/systemd/system/netgen-cleanup.service << 'EOF'\n{cleanup_service}EOF")
+
         # Cleanup Timer
-        cleanup_timer = """[Unit]
-Description=Run OSTG Cleanup Service every 5 minutes
-Requires=ostg-cleanup.service
+        cleanup_timer = f"""[Unit]
+Description=Run {PRODUCT_NAME} Cleanup Service every 5 minutes
+Requires=netgen-cleanup.service
 
 [Timer]
 OnBootSec=5min
@@ -551,39 +569,40 @@ OnUnitActiveSec=5min
 [Install]
 WantedBy=timers.target
 """
-        
-        self.run_command(f"cat > /etc/systemd/system/ostg-cleanup.timer << 'EOF'\n{cleanup_timer}EOF")
-        
+
+        self.run_command(f"cat > /etc/systemd/system/netgen-cleanup.timer << 'EOF'\n{cleanup_timer}EOF")
+
         # Reload systemd and enable services
         self.run_command("systemctl daemon-reload")
-        self.run_command("systemctl enable ostg-server.service")
-        self.run_command("systemctl enable ostg-cleanup.timer")
-        
+        self.run_command("systemctl enable netgen-server.service")
+        self.run_command("systemctl enable netgen-cleanup.timer")
+
         self.log("✓ Systemd services created successfully")
         
     def start_ostg_services(self):
-        """Start OSTG services"""
-        self.log("Starting OSTG services...")
-        
+        """Start Netgen services."""
+        self.log(f"Starting {PRODUCT_NAME} services...")
+
         # Stop any existing processes
         self.run_command("pkill -f run_tgen_server.py", check=False)
-        
-        # Start OSTG server
-        self.run_command("systemctl start ostg-server.service")
-        
+
+        # Start the server
+        self.run_command("systemctl start netgen-server.service")
+
         # Check status
-        result = self.run_command("systemctl is-active ostg-server.service", capture_output=True)
+        result = self.run_command("systemctl is-active netgen-server.service", capture_output=True)
         if result.stdout.strip() == "active":
-            self.log("✓ OSTG server started successfully")
+            self.log(f"✓ {PRODUCT_NAME} server started successfully")
         else:
-            self.log("Failed to start OSTG server", "ERROR")
+            self.log(f"Failed to start {PRODUCT_NAME} server", "ERROR")
             sys.exit(1)
-            
+
     def verify_installation(self):
-        """Verify the installation"""
+        """Verify the installation."""
         self.log("Verifying installation...")
-        
-        # Check OSTG commands
+
+        # Console-script entry points still ship under their original names
+        # because the wheel itself was not renamed (surface rename only).
         commands_to_check = ["ostg-server", "ostg-client", "ostg-docker-install"]
         for cmd in commands_to_check:
             result = self.run_command(f"which {cmd}", check=False, capture_output=True)
@@ -591,23 +610,28 @@ WantedBy=timers.target
                 self.log(f"✓ {cmd} command available")
             else:
                 self.log(f"✗ {cmd} command not found", "WARNING")
-                
+
         # Check Docker image
         result = self.run_command(f"docker images {DOCKER_IMAGE}", check=False, capture_output=True)
         if DOCKER_IMAGE in result.stdout:
             self.log(f"✓ Docker image {DOCKER_IMAGE} available")
         else:
             self.log(f"✗ Docker image {DOCKER_IMAGE} not found", "WARNING")
-            
+
         # Check systemd services
-        services_to_check = ["ostg-server.service", "ostg-client.service", "ostg-cleanup.service", "ostg-cleanup.timer"]
+        services_to_check = [
+            "netgen-server.service",
+            "netgen-client.service",
+            "netgen-cleanup.service",
+            "netgen-cleanup.timer",
+        ]
         for service in services_to_check:
             result = self.run_command(f"systemctl is-enabled {service}", check=False, capture_output=True)
             if result.stdout.strip() == "enabled":
                 self.log(f"✓ {service} enabled")
             else:
                 self.log(f"✗ {service} not enabled", "WARNING")
-                
+
         self.log("✓ Installation verification completed")
         
     def test_frr_functionality(self):
@@ -615,7 +639,7 @@ WantedBy=timers.target
         self.log("Testing FRR functionality...")
         
         # Test Docker container creation
-        test_container_name = "ostg-frr-test-install"
+        test_container_name = "netgen-frr-test-install"
         
         try:
             # Create test container
@@ -675,24 +699,51 @@ WantedBy=timers.target
             self.run_command(f"docker rm {test_container_name}", check=False)
             self.log("✓ Test container cleaned up")
             
+    def cleanup_old_install(self):
+        """Remove artifacts from a prior OSTG install before laying down Netgen."""
+        self.log("Checking for prior OSTG install to clean up...")
+
+        # Stop and disable legacy systemd units (ignore errors — units may not exist)
+        for unit in LEGACY_SYSTEMD_UNITS:
+            self.run_command(f"systemctl stop {unit}", check=False)
+            self.run_command(f"systemctl disable {unit}", check=False)
+            self.run_command(f"rm -f /etc/systemd/system/{unit}", check=False)
+        self.run_command("systemctl daemon-reload", check=False)
+
+        # Kill any straggling server process
+        self.run_command("pkill -f run_tgen_server.py", check=False)
+
+        # Remove legacy install directory
+        self.run_command(f"rm -rf {LEGACY_INSTALL_DIR}", check=False)
+
+        # Remove legacy docker image and network (best-effort)
+        self.run_command(f"docker rmi {LEGACY_DOCKER_IMAGE}", check=False)
+        self.run_command(f"docker network rm {LEGACY_DOCKER_NETWORK}", check=False)
+
+        self.log("✓ Legacy OSTG artifacts cleaned up (if any were present)")
+
     def install_remote(self):
-        """Install OSTG on a remote host"""
-        self.log(f"Installing OSTG on remote host: {self.remote_host}")
-        
+        """Install Netgen on a remote host."""
+        self.log(f"Installing {PRODUCT_NAME} on remote host: {self.remote_host}")
+
         # Check if sshpass is available
         if not shutil.which("sshpass"):
             self.log("sshpass is required for remote installation. Please install it first.", "ERROR")
             sys.exit(1)
-            
-        # Test SSH connection
+
+        # Test SSH connection — surface ssh's actual error if it fails
         result = self.run_command("echo 'SSH connection test'", check=False, capture_output=True)
         if result.returncode != 0:
-            self.log(f"Failed to connect to {self.remote_host}", "ERROR")
+            stderr = (result.stderr or "").strip()
+            self.log(f"Failed to connect to {self.remote_host} (exit {result.returncode})", "ERROR")
+            if stderr:
+                self.log(f"ssh stderr: {stderr}", "ERROR")
             sys.exit(1)
-            
+
         self.log("✓ SSH connection successful")
-        
+
         # Run installation steps
+        self.cleanup_old_install()
         self.install_system_dependencies()
         self.install_python_dependencies()
         self.install_docker()
@@ -702,17 +753,18 @@ WantedBy=timers.target
         self.start_ostg_services()
         self.verify_installation()
         self.test_frr_functionality()
-        
+
     def install_local(self):
-        """Install OSTG locally"""
-        self.log("Installing OSTG locally...")
-        
+        """Install Netgen locally."""
+        self.log(f"Installing {PRODUCT_NAME} locally...")
+
         # Check if running as root
         if os.geteuid() != 0:
             self.log("This script must be run as root for local installation", "ERROR")
             sys.exit(1)
-            
+
         # Run installation steps
+        self.cleanup_old_install()
         self.install_system_dependencies()
         self.install_python_dependencies()
         self.install_docker()
@@ -724,55 +776,56 @@ WantedBy=timers.target
         self.test_frr_functionality()
         
     def run(self):
-        """Main installation function"""
+        """Main installation function."""
+        banner = f"{PRODUCT_NAME} {NETGEN_VERSION} Complete Installation Script (Python Version)"
         self.log("=" * 60)
-        self.log("OSTG Complete Installation Script (Python Version)")
+        self.log(banner)
         self.log("=" * 60)
         self.log(f"System: {self.system_info['os']} {self.system_info['distro']}")
         self.log(f"Package Manager: {self.system_info['package_manager']}")
         self.log(f"Python Command: {self.system_info['python_cmd']}")
-        
+
         if self.remote_install:
             self.install_remote()
         else:
             self.install_local()
-            
+
         self.log("=" * 60)
-        self.log("OSTG Installation Completed Successfully!")
+        self.log(f"{PRODUCT_NAME} installation completed successfully!")
         self.log("=" * 60)
         self.log("")
         self.log("Next steps:")
-        self.log("1. ✓ OSTG server is already running")
+        self.log(f"1. ✓ {PRODUCT_NAME} server is already running")
         self.log("2. ✓ Systemd services are configured")
         self.log("3. ✓ Docker FRR image is ready")
         self.log("4. You can now create devices and configure BGP")
         self.log("")
         self.log("To monitor logs:")
-        self.log("  journalctl -u ostg-server -f")
+        self.log("  journalctl -u netgen-server -f")
         self.log("")
         self.log("To check status:")
-        self.log("  systemctl status ostg-server.service")
+        self.log("  systemctl status netgen-server.service")
         self.log("=" * 60)
 
 
 def main():
-    parser = argparse.ArgumentParser(description="OSTG Complete Installation Script")
+    parser = argparse.ArgumentParser(description=f"{PRODUCT_NAME} Complete Installation Script")
     parser.add_argument("-H", "--host", help="Remote host for installation")
     parser.add_argument("-u", "--user", default="root", help="Remote user (default: root)")
     parser.add_argument("-p", "--password", help="Remote password")
-    
+
     args = parser.parse_args()
-    
+
     if args.host and not args.password:
         print("Error: Password is required for remote installation. Use -p or --password option.")
         sys.exit(1)
-        
-    installer = OSTGInstaller(
+
+    installer = NetgenInstaller(
         remote_host=args.host,
         remote_user=args.user,
-        remote_pass=args.password
+        remote_pass=args.password,
     )
-    
+
     installer.run()
 
 
