@@ -324,6 +324,10 @@ class TrafficGenClientStreamControl:
         """
         # Ignore programmatic changes during table population
         if getattr(self, "_populating_table", False):
+            logger.warning(
+                f"[INLINE EDIT] Dropped edit at row={item.row()} col={item.column()} "
+                f"text={item.text()!r} — table is being populated"
+            )
             return
 
         from PyQt5.QtCore import QSignalBlocker
@@ -334,6 +338,7 @@ class TrafficGenClientStreamControl:
         # Retrieve the Name cell (col 2) where we stash stream_id
         name_item = self.stream_table.item(row, 2)
         if not name_item:
+            logger.warning(f"[INLINE EDIT] No name_item at row={row}, dropping")
             return
 
         stream_id = name_item.data(Qt.UserRole)
@@ -351,17 +356,27 @@ class TrafficGenClientStreamControl:
                 if stream:
                     break
         if not stream:
-            # Fallback: use (port, name)
+            # Fallback: use (port, name) — but the table's port column may show
+            # "↳" for continuation rows (visual grouping), so resolve it through
+            # the canonical port-key normalizer rather than naive equality.
             port_item = self.stream_table.item(row, 1)
             if not port_item:
+                logger.warning(f"[INLINE EDIT] row={row} stream_id={stream_id!r} not found, no port_item either")
                 return
-            port = port_item.text().strip()
+            from traffic_client.stream_logic import find_port_key
+            port_text = port_item.text().strip()
+            port = find_port_key(self.streams, port_text) or port_text
             current_name = name_item.text().strip()
             for s in self.streams.get(port, []):
-                if s.get("protocol_selection", {}).get("name") == current_name:
+                if s.get("protocol_selection", {}).get("name") == current_name or s.get("name") == current_name:
                     stream = s
                     break
             if not stream:
+                logger.warning(
+                    f"[INLINE EDIT] Could not locate stream at row={row} col={col} "
+                    f"stream_id={stream_id!r} port={port_text!r} resolved_port={port!r} "
+                    f"name={current_name!r}. self.streams keys: {list(self.streams.keys())}"
+                )
                 return
 
         ps = stream.setdefault("protocol_selection", {})
@@ -375,13 +390,19 @@ class TrafficGenClientStreamControl:
                 prev = ps.get("name", stream.get("name", ""))
                 with QSignalBlocker(self.stream_table):
                     item.setText(prev)
+                logger.info(f"[INLINE EDIT] Empty name rejected, reverted to {prev!r}")
                 return
+            old_name = stream.get("name") or ps.get("name") or ""
             # Update model first
             ps["name"] = new_name
             stream["name"] = new_name
             # Normalize UI text (no-op for valid name, but keeps things consistent)
             with QSignalBlocker(self.stream_table):
                 item.setText(new_name)
+            logger.info(
+                f"[INLINE EDIT] Renamed stream on {port!r}: {old_name!r} -> {new_name!r} "
+                f"(stream_id={stream.get('stream_id')!r})"
+            )
 
         elif col == 3:
             # Enabled (typed Yes/No if not a combo)
