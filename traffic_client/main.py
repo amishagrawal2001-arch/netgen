@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QTabWidget, QSplitter,
-    QMenu, QAction, QApplication
+    QMenu, QAction, QApplication, QDockWidget
 )
 
 from PyQt5 import QtCore
@@ -106,10 +106,8 @@ class TrafficGeneratorClient(
             logging.warning(f"AI features not available: {e}")
             pass  # AI features not available
 
-        # Split layout: top section (server + tabs) and bottom (statistics)
-        self.splitter = QSplitter(Qt.Vertical)
+        # Top section: server tree (left) + tabs (right). Lives in the central widget.
         self.top_section = QSplitter(Qt.Horizontal)
-        self.splitter.addWidget(self.top_section)
 
         # Server section on the left
         self.setup_server_section()
@@ -122,12 +120,42 @@ class TrafficGeneratorClient(
         self.tab_widget.addTab(self.devices_tab, "Devices")
         self.top_section.addWidget(self.tab_widget)
 
-        # Statistics section at the bottom
-        self.setup_traffic_statistics_section()
-        self.splitter.addWidget(self.statistics_group)
+        self.main_layout.addWidget(self.top_section)
 
-        # Add top + bottom sections to main layout
-        self.main_layout.addWidget(self.splitter)
+        # Statistics section lives in a QDockWidget so the user can drag it out
+        # into a floating window and drag it back to re-dock. Standard Qt dock
+        # title bar has float (✥) and close (×) buttons.
+        self.setup_traffic_statistics_section()
+        self.statistics_dock = QDockWidget("Traffic Statistics", self)
+        self.statistics_dock.setObjectName("trafficStatisticsDock")  # Required for saveState/restoreState
+        self.statistics_dock.setAllowedAreas(Qt.BottomDockWidgetArea | Qt.TopDockWidgetArea)
+        self.statistics_dock.setFeatures(
+            QDockWidget.DockWidgetMovable
+            | QDockWidget.DockWidgetFloatable
+            | QDockWidget.DockWidgetClosable
+        )
+        # The QGroupBox is now the dock's content; its existing title becomes
+        # redundant with the dock's title bar. Strip the QGroupBox title so we
+        # don't show "Traffic Statistics" twice stacked on top of each other.
+        if hasattr(self.statistics_group, "setTitle"):
+            self.statistics_group.setTitle("")
+        self.statistics_dock.setWidget(self.statistics_group)
+        self.addDockWidget(Qt.BottomDockWidgetArea, self.statistics_dock)
+        # Keep `self.splitter` as an alias to top_section for any older code that
+        # referenced the vertical splitter directly (defensive).
+        self.splitter = self.top_section
+
+        # Wire the dock's toggle into View menu so users who close the pane
+        # have a way to bring it back. toggleViewAction() is a checkable
+        # QAction whose state mirrors the dock's visibility automatically.
+        if hasattr(self, "view_menu"):
+            stats_toggle = self.statistics_dock.toggleViewAction()
+            stats_toggle.setText("Traffic Statistics Pane")
+            stats_toggle.setToolTip(
+                "Show or hide the Traffic Statistics dock. Drag its title bar "
+                "to detach into a floating window; drag back to re-dock."
+            )
+            self.view_menu.addAction(stats_toggle)
 
         # Initialize stream section inside the "Streams" tab
         self.setup_stream_section(self.streams_tab)
@@ -671,6 +699,11 @@ class TrafficGeneratorClient(
         self.stop_capture_action.triggered.connect(self.stop_packet_capture)
         self.stop_capture_action.setEnabled(False)
         capture_menu.addAction(self.stop_capture_action)
+
+        # View menu — toggles for detachable/closable panes. Populated later
+        # in __init__ once the dock widgets exist (via _wire_view_menu_dock_toggles).
+        self.view_menu = QMenu("&View", self)
+        menu_bar.addMenu(self.view_menu)
 
         # Tools menu — host the DPDK and AI Assistant submenus together
         tools_menu = QMenu("&Tools", self)
