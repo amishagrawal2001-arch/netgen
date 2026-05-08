@@ -566,15 +566,38 @@ class NetgenInstaller:
         files_to_copy = [
             (dockerfile_src, f"{INSTALL_DIR}/Dockerfile.frr"),
             (os.path.join(script_dir, "ostg_docker", "frr.conf.template"), f"{INSTALL_DIR}/frr.conf.template"),
-            (os.path.join(script_dir, "ostg_docker", "start-frr.sh"), f"{INSTALL_DIR}/start-frr.sh")
+            (os.path.join(script_dir, "ostg_docker", "start-frr.sh"), f"{INSTALL_DIR}/start-frr.sh"),
         ]
-        
+
         for local_file, remote_file in files_to_copy:
             if os.path.exists(local_file):
                 self.copy_file(local_file, remote_file)
                 if remote_file.endswith(".sh"):
                     self.run_command(f"chmod +x {remote_file}")
-                
+
+        # DPDK runtime scripts. The server endpoints (/api/dpdk/{status,bind,unbind,
+        # interfaces}) shell out to dpdk_bind.sh from $INSTALL_DIR/resources/dpdk/;
+        # if the directory is missing they return 404 "dpdk_bind.sh not found".
+        # Ship the whole resources/dpdk/*.sh tree so DPDK actions work out of the box.
+        dpdk_src_dir = os.path.join(script_dir, "resources", "dpdk")
+        dpdk_remote_dir = f"{INSTALL_DIR}/resources/dpdk"
+        if os.path.isdir(dpdk_src_dir):
+            self.run_command(f"mkdir -p {dpdk_remote_dir}")
+            for fname in sorted(os.listdir(dpdk_src_dir)):
+                if not fname.endswith(".sh"):
+                    continue
+                local_sh = os.path.join(dpdk_src_dir, fname)
+                remote_sh = f"{dpdk_remote_dir}/{fname}"
+                self.copy_file(local_sh, remote_sh)
+                self.run_command(f"chmod +x {remote_sh}")
+            self.log(f"✓ DPDK runtime scripts deployed to {dpdk_remote_dir}")
+        else:
+            self.log(
+                f"resources/dpdk/ not found at {dpdk_src_dir}; DPDK bind/unbind "
+                "endpoints will return 404 until you deploy these manually.",
+                "WARNING",
+            )
+
         self.log(f"✓ {PRODUCT_NAME} installed successfully")
         
     def install_ai_dependencies(self):
