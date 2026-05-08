@@ -224,8 +224,11 @@ class TrafficGenClientStatisticsSection():
         layout.addLayout(button_layout)
 
         self.statistics_group.setLayout(layout)
-        self.splitter.addWidget(self.statistics_group)
-        
+        # NOTE: parent layout placement happens in main.py (currently a QDockWidget;
+        # historically was self.splitter.addWidget). Don't attach here — main owns
+        # the layout decision so we can switch container types without touching
+        # this file again.
+
         # Initialize worker for background statistics fetching
         self._stats_worker = None
         self._poll_worker = None
