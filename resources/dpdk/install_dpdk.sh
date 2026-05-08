@@ -398,15 +398,26 @@ step_build_dpdk() {
     # Build DPDK using meson and ninja
     cd "$DPDK_DIR"
     
+    # Drivers we always disable:
+    #   net/mana — Microsoft Azure NIC PMD; requires IBVERBS_PRIVATE_34 symbols
+    #              which Ubuntu 22.04's libibverbs doesn't ship, so the link
+    #              step fails with "undefined reference to ibv_cmd_query_*".
+    #              No real Azure mana NIC = nothing lost by skipping.
+    local meson_disable="net/mana"
+    local meson_opts=("-Dexamples=all" "-Ddisable_drivers=${meson_disable}")
+
     if [[ ! -d "build" ]]; then
-        log_info "Configuring DPDK build..."
-        meson setup build -Dexamples=all || {
+        log_info "Configuring DPDK build (disabling: ${meson_disable})..."
+        meson setup build "${meson_opts[@]}" || {
             log_error "DPDK meson setup failed"
             exit 1
         }
     else
-        log_info "DPDK build directory exists, rebuilding..."
-        meson setup build --reconfigure || {
+        log_info "DPDK build directory exists, wiping and reconfiguring..."
+        # --wipe drops cached config from a previous failed run so the new
+        # disable_drivers flag is actually applied (without --wipe meson
+        # would honour the old options.txt and re-build the same broken set).
+        meson setup build --wipe "${meson_opts[@]}" || {
             log_error "DPDK meson reconfigure failed"
             exit 1
         }
