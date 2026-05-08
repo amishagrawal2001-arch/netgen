@@ -67,3 +67,14 @@ server_interfaces.txt
 
 # Stray files from accidental shell redirects (e.g. `pip install foo>=3.4.0` unquoted)
 =*
+
+# Scratch / one-off scripts (kept on disk for reference; not part of the app)
+example_pytest_conversion.py
+get_orchagent_error.py
+stop_stale_streams.py
+test_plan_smoke.py
+vnc_fix_*.sh
+vnc_improve_*.sh
+
+# Nested git repository — separate decision pending (submodule vs vendor)
+server_nic_linkdown_script/
