@@ -206,6 +206,13 @@ class OSPFHandler:
                 if hasattr(self.parent, 'start_isis_monitoring'):
                     self.parent.start_isis_monitoring()
         
+        # Block cellChanged while we rebuild — without this, every setItem fires
+        # the on_ospf_table_cell_changed handler, which interprets each populate
+        # write as a user edit and triggers save_session(). With the periodic
+        # OSPF monitor on (auto-started for any device with "OSPF" in its
+        # protocols list), this caused save_session to fire every 20s.
+        signals_were_blocked = self.parent.ospf_table.signalsBlocked()
+        self.parent.ospf_table.blockSignals(True)
         try:
             # Get selected interfaces from server_tree (same logic as device table)
             selected_interfaces = set()
@@ -524,7 +531,10 @@ class OSPFHandler:
                             self.parent.ospf_table.setItem(row, 12, pool_item)  # Route Pools
         except Exception as e:
             logger.error(f"Error updating OSPF table: {e}")
-    
+        finally:
+            # Restore previous signal-block state (don't accidentally leave blocked).
+            self.parent.ospf_table.blockSignals(signals_were_blocked)
+
     def _safe_update_ospf_table(self):
         """Safely update OSPF table (for parallel execution)."""
         try:
