@@ -390,6 +390,50 @@ deploy_on_server() {
         # Clean up extraction directory
         rm -rf \$EXTRACT_DIR 2>/dev/null || true
         
+        # Rebuild tx_worker binary if DPDK version mismatch detected
+        log "Checking DPDK tx_worker binary compatibility..."
+        TX_WORKER_BIN="\$SERVER_PATH/resources/dpdk/tx_worker/build/tx_worker"
+        if [[ -f "\$TX_WORKER_BIN" ]]; then
+            # Check what DPDK version is installed
+            INSTALLED_DPDK=\$(PKG_CONFIG_PATH=/usr/local/lib/x86_64-linux-gnu/pkgconfig:/usr/local/lib/pkgconfig pkg-config --modversion libdpdk 2>/dev/null | cut -d. -f1 || echo "")
+            
+            if [[ -n "\$INSTALLED_DPDK" ]]; then
+                # Check if binary can find DPDK libraries (if not found, ldd will show "not found")
+                LDD_OUTPUT=\$(ldd "\$TX_WORKER_BIN" 2>&1)
+                if echo "\$LDD_OUTPUT" | grep -q "librte_ethdev.so.*not found"; then
+                    warn "tx_worker binary cannot find DPDK libraries (version mismatch)"
+                    log "Rebuilding tx_worker binary for DPDK v\$INSTALLED_DPDK..."
+                    cd "\$SERVER_PATH/resources/dpdk/tx_worker"
+                    if PKG_CONFIG_PATH=/usr/local/lib/x86_64-linux-gnu/pkgconfig:/usr/local/lib/pkgconfig meson setup build --wipe >/dev/null 2>&1 && \
+                       PKG_CONFIG_PATH=/usr/local/lib/x86_64-linux-gnu/pkgconfig:/usr/local/lib/pkgconfig ninja -C build >/dev/null 2>&1; then
+                        success "tx_worker binary rebuilt successfully for DPDK v\$INSTALLED_DPDK"
+                    else
+                        warn "Failed to rebuild tx_worker binary. DPDK streams may not work."
+                    fi
+                else
+                    # Check what version the binary is linked against
+                    LINKED_DPDK=\$(echo "\$LDD_OUTPUT" | grep -oP 'librte_ethdev\.so\.\K\d+' | head -1 || echo "")
+                    if [[ -n "\$LINKED_DPDK" ]] && [[ "\$LINKED_DPDK" != "\$INSTALLED_DPDK" ]]; then
+                        warn "DPDK version mismatch: binary linked to v\$LINKED_DPDK, system has v\$INSTALLED_DPDK"
+                        log "Rebuilding tx_worker binary for DPDK v\$INSTALLED_DPDK..."
+                        cd "\$SERVER_PATH/resources/dpdk/tx_worker"
+                        if PKG_CONFIG_PATH=/usr/local/lib/x86_64-linux-gnu/pkgconfig:/usr/local/lib/pkgconfig meson setup build --wipe >/dev/null 2>&1 && \
+                           PKG_CONFIG_PATH=/usr/local/lib/x86_64-linux-gnu/pkgconfig:/usr/local/lib/pkgconfig ninja -C build >/dev/null 2>&1; then
+                            success "tx_worker binary rebuilt successfully for DPDK v\$INSTALLED_DPDK"
+                        else
+                            warn "Failed to rebuild tx_worker binary. DPDK streams may not work."
+                        fi
+                    else
+                        info "tx_worker binary is compatible with installed DPDK version"
+                    fi
+                fi
+            else
+                info "DPDK not found via pkg-config, skipping binary rebuild check"
+            fi
+        else
+            info "tx_worker binary not found, skipping compatibility check"
+        fi
+        
         # Update systemd service file to use /opt/OSTG and set PYTHONPATH
         log "Updating systemd service file..."
         SYSTEMD_SERVICE="/etc/systemd/system/ostg-server.service"

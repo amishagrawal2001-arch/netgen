@@ -1,26 +1,38 @@
 # Comprehensive FRR Docker Image for OSTG with Full Features
 FROM alpine:3.18
 
-# Install FRR with full features and required packages
-RUN apk add --no-cache \
-    frr \
-    frr-doc \
-    iproute2 \
-    iptables \
-    net-tools \
-    bash \
-    curl \
-    tini \
-    iputils \
-    tcpdump \
-    netcat-openbsd \
-    bind-tools \
-    openssh-client \
-    vim \
-    nano \
-    less \
-    procps \
-    htop
+# Allow override when default CDN is unreachable (e.g. "temporary error (try again later)")
+# Example: docker build --build-arg ALPINE_MIRROR=https://ftp.halifax.rwth-aachen.de/alpine -t ostg-frr:latest -f Dockerfile.frr .
+ARG ALPINE_MIRROR=https://dl-cdn.alpinelinux.org/alpine
+ENV ALPINE_MIRROR=${ALPINE_MIRROR}
+
+# Use chosen mirror and install with retries (handles transient CDN failures)
+RUN echo "${ALPINE_MIRROR}/v3.18/main" > /etc/apk/repositories && \
+    echo "${ALPINE_MIRROR}/v3.18/community" >> /etc/apk/repositories && \
+    for i in 1 2 3 4 5; do \
+        apk update && apk add --no-cache \
+            frr \
+            frr-doc \
+            iproute2 \
+            iptables \
+            net-tools \
+            bash \
+            curl \
+            tini \
+            iputils \
+            tcpdump \
+            netcat-openbsd \
+            bind-tools \
+            openssh-client \
+            vim \
+            nano \
+            less \
+            procps \
+            htop && break; \
+        echo "Apk attempt $$i failed, retrying in 15s..."; \
+        sleep 15; \
+    done && \
+    (test -f /usr/bin/vtysh || test -f /usr/sbin/vtysh) || (echo "FRR install failed after retries" && exit 1)
 
 # Create directories and set permissions
 RUN mkdir -p /var/run/frr /etc/frr /var/log/frr && \
