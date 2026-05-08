@@ -1,0 +1,7 @@
+device_name,user,password
+la-q5130-05,netops,Net0psPass!
+la-q5130-06,netops,Net0psPass!
+router-core-01,admin,AdminPass123
+switch-edge-01,operator,Op3rator!
+
+
