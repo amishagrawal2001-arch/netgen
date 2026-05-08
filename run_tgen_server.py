@@ -12838,8 +12838,23 @@ def api_admin_install_dpdk():
         log_fh = open(log_path, "w", buffering=1)  # line-buffered
         env = os.environ.copy()
         env["AUTO_MODE"] = "1"
+        # The netgen-server systemd unit inherits `TERM=unknown` from PAM.
+        # install_dpdk.sh calls `clear` early; under TERM=unknown the curses
+        # library complains `'unknown': I need something more specific.` and
+        # `set -euo pipefail` kills the script silently.
+        # `dumb` doesn't work either (no clear sequence in its terminfo,
+        # `clear` exits rc=1). `xterm` is universally available and `clear`
+        # just emits the standard CSI sequences harmlessly into the log.
+        env["TERM"] = "xterm"
+        # Force non-interactive APT / debconf during package installs.
+        env["DEBIAN_FRONTEND"] = "noninteractive"
+        env["DEBIAN_PRIORITY"] = "critical"
+        # netgen-server.service already runs as root, so `sudo` is redundant.
+        # Worse, the host's sudoers has `use_pty`, which fails when there's
+        # no TTY (we're a daemon) and exits rc=1 with no output captured.
+        # Drop the sudo wrapper and exec bash directly.
         new_proc = subprocess.Popen(
-            ["sudo", "-n", "bash", script, "--auto"],
+            ["bash", script, "--auto"],
             stdout=log_fh, stderr=subprocess.STDOUT,
             env=env, start_new_session=True,
         )
