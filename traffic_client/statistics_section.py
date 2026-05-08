@@ -40,14 +40,18 @@ class StatisticsFetchWorker(QThread):
             
             server_address = server.get("address")
             
-            # Fetch interfaces if needed
+            # Fetch interfaces if needed.
+            # Timeouts bumped from 2s/1s to 4s/3s — at 1s the polling timer was
+            # racing the server while it was busy writing stream stats DB entries
+            # (~1000 pps active streams), causing constant
+            # "Read timed out" retry warnings even on a healthy server.
             if self.fetch_type in ("interfaces", "both"):
                 try:
                     if self.connection_manager:
-                        response = self.connection_manager.get(f"{server_address}/api/interfaces", timeout=2)
+                        response = self.connection_manager.get(f"{server_address}/api/interfaces", timeout=4)
                     else:
-                        response = requests.get(f"{server_address}/api/interfaces", timeout=2)
-                    
+                        response = requests.get(f"{server_address}/api/interfaces", timeout=4)
+
                     if response.status_code == 200:
                         interfaces = response.json()
                         self.interfaces_fetched.emit(server, {"interfaces": interfaces, "status_code": 200})
@@ -55,14 +59,14 @@ class StatisticsFetchWorker(QThread):
                         self.fetch_error.emit(server, f"HTTP {response.status_code}")
                 except Exception as e:
                     self.fetch_error.emit(server, str(e))
-            
+
             # Fetch stream stats if needed
             if self.fetch_type in ("streams", "both"):
                 try:
                     if self.connection_manager:
-                        response = self.connection_manager.get(f"{server_address}/api/streams/stats", timeout=1)
+                        response = self.connection_manager.get(f"{server_address}/api/streams/stats", timeout=3)
                     else:
-                        response = requests.get(f"{server_address}/api/streams/stats", timeout=1)
+                        response = requests.get(f"{server_address}/api/streams/stats", timeout=3)
                     
                     if response.status_code == 200:
                         stream_stats = response.json().get("active_streams", [])
