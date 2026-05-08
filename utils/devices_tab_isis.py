@@ -488,9 +488,14 @@ class ISISHandler:
 
     def update_isis_table(self):
         """Update ISIS table with data from devices and ISIS status from database."""
+        # Block cellChanged while we rebuild — without this, every setItem fires
+        # the on_isis_table_cell_changed handler, which interprets each populate
+        # write as a user edit and triggers save_session(). With the periodic
+        # ISIS monitor on (auto-started for any device with "IS-IS" in its
+        # protocols list), this caused save_session to fire every 20s.
+        signals_were_blocked = self.parent.isis_table.signalsBlocked()
+        self.parent.isis_table.blockSignals(True)
         try:
-            # Debug logs disabled
-            
             # Get selected interfaces from server_tree (same logic as device table)
             selected_interfaces = set()
             tree = self.parent.main_window.server_tree
@@ -847,6 +852,10 @@ class ISISHandler:
                     
         except Exception as e:
             logger.error(f"Error updating ISIS table: {e}")
+        finally:
+            # Restore previous signal-block state so we don't accidentally leave
+            # signals blocked for caller code that depended on them.
+            self.parent.isis_table.blockSignals(signals_were_blocked)
 
 
     def set_isis_status_icon(self, row, status, tooltip):
