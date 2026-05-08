@@ -57,5 +57,13 @@ build_image/dist_macos/
 *_backup.py
 *_old.py
 
-# Session state
+# Session state (per-host variants too)
 session.json
+session_*.json
+server_interfaces.txt
+
+# Worktree / agent scratch space
+.claude/
+
+# Stray files from accidental shell redirects (e.g. `pip install foo>=3.4.0` unquoted)
+=*
