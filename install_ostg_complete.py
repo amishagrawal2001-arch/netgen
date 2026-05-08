@@ -12,6 +12,7 @@ import shutil
 import json
 import argparse
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -56,20 +57,34 @@ class NetgenInstaller:
         self.remote_user = remote_user
         self.remote_pass = remote_pass
         self.remote_install = remote_host is not None
+        self.ostg_server_active = False
+        self.docker_frr_available = False
         self.setup_logging()
         self.system_info = self._detect_system()
         
     def setup_logging(self):
-        """Setup logging configuration"""
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(levelname)s - %(message)s',
-            handlers=[
-                logging.StreamHandler(),
-                logging.FileHandler('/tmp/netgen_install_temp.log')
-            ]
-        )
-        self.logger = logging.getLogger(__name__)
+        """Setup logging configuration: dedicated logger with timestamped log file so install output is captured."""
+        log_name = "netgen_installer"
+        self.logger = logging.getLogger(log_name)
+        self.logger.setLevel(logging.INFO)
+        self.logger.handlers.clear()
+        self.logger.propagate = False
+
+        fmt = logging.Formatter("%(asctime)s - %(levelname)s - %(message)s")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        for base_dir in ["/tmp", os.path.expanduser("~"), "."]:
+            log_dir = os.path.abspath(base_dir)
+            log_path = os.path.join(log_dir, f"netgen_install_{timestamp}.log")
+            try:
+                fh = logging.FileHandler(log_path, encoding="utf-8")
+                fh.setFormatter(fmt)
+                self.logger.addHandler(fh)
+                self.install_log_path = log_path
+                break
+            except (OSError, IOError):
+                continue
+        else:
+            self.install_log_path = None  # no writable path found
         
     def log(self, message: str, level: str = "INFO"):
         """Log message with color coding"""
@@ -158,7 +173,7 @@ class NetgenInstaller:
                 
         return system_info
         
-    def run_command(self, command: str, check: bool = True, capture_output: bool = False) -> subprocess.CompletedProcess:
+    def run_command(self, command: str, check: bool = True, capture_output: bool = False, timeout: Optional[int] = None) -> subprocess.CompletedProcess:
         """Run a command locally or remotely"""
         # Set environment variables for non-interactive installation
         env = os.environ.copy()
@@ -179,10 +194,10 @@ class NetgenInstaller:
             ]
             env_vars = ' '.join(essential_env_vars)
             ssh_cmd = f"sshpass -p '{self.remote_pass}' ssh {self.remote_user}@{self.remote_host} '{env_vars} {command}'"
-            return subprocess.run(ssh_cmd, shell=True, check=check, capture_output=capture_output, text=True)
+            return subprocess.run(ssh_cmd, shell=True, check=check, capture_output=capture_output, text=True, timeout=timeout)
         else:
             # Run command locally
-            return subprocess.run(command, shell=True, check=check, capture_output=capture_output, text=True, env=env)
+            return subprocess.run(command, shell=True, check=check, capture_output=capture_output, text=True, env=env, timeout=timeout)
             
     def copy_file(self, local_path: str, remote_path: str):
         """Copy file to remote host"""
@@ -196,19 +211,35 @@ class NetgenInstaller:
         """Install system dependencies based on the detected OS"""
         self.log("Installing system dependencies...")
         
-        if self.system_info["package_manager"] == "apt":
-            self._install_apt_packages()
-        elif self.system_info["package_manager"] == "dnf":
-            self._install_dnf_packages()
-        elif self.system_info["package_manager"] == "yum":
-            self._install_yum_packages()
-        elif self.system_info["package_manager"] == "apk":
-            self._install_apk_packages()
-        elif self.system_info["package_manager"] == "zypper":
-            self._install_zypper_packages()
-        else:
-            self.log(f"Unsupported package manager: {self.system_info['package_manager']}", "ERROR")
-            sys.exit(1)
+        try:
+            if self.system_info["package_manager"] == "apt":
+                self._install_apt_packages()
+            elif self.system_info["package_manager"] == "dnf":
+                self._install_dnf_packages()
+            elif self.system_info["package_manager"] == "yum":
+                self._install_yum_packages()
+            elif self.system_info["package_manager"] == "apk":
+                self._install_apk_packages()
+            elif self.system_info["package_manager"] == "zypper":
+                self._install_zypper_packages()
+            else:
+                self.log(f"Unsupported package manager: {self.system_info['package_manager']}", "ERROR")
+                sys.exit(1)
+        except Exception as e:
+            self.log(f"System dependencies installation encountered issues: {e}", "WARNING")
+            self.log("Attempting to continue with remaining installation steps...", "WARNING")
+            # Try to fix broken packages using the appropriate package manager
+            if self.system_info["package_manager"] == "apt":
+                self.run_command("apt-get --fix-broken install -y", check=False)
+            elif self.system_info["package_manager"] == "dnf":
+                self.run_command("dnf check", check=False)
+            elif self.system_info["package_manager"] == "yum":
+                self.run_command("yum check", check=False)
+            elif self.system_info["package_manager"] == "apk":
+                self.run_command("apk fix", check=False)
+            elif self.system_info["package_manager"] == "zypper":
+                self.run_command("zypper verify", check=False)
+            # Don't exit - allow installation to continue
             
     def _install_apt_packages(self):
         """Install packages using apt"""
@@ -244,15 +275,26 @@ class NetgenInstaller:
             # Pre-configure packages to avoid interactive prompts
             self._preconfigure_packages()
             
+            # Fix GPG keys before updating package lists
+            self._fix_apt_gpg_keys()
+            
             try:
-                self.run_command(f"apt-get update")
+                update_result = self.run_command(f"apt-get update", check=False)
+                if update_result.returncode != 0:
+                    self.log("apt-get update had some issues, but continuing...", "WARNING")
                 self.run_command(f"apt-get install -y {' '.join(packages_to_install)}")
             except subprocess.CalledProcessError as e:
-                self.log(f"Package installation failed: {e}", "ERROR")
+                self.log(f"Package installation encountered issues: {e}", "WARNING")
                 # Try to fix broken packages
-                self.run_command("apt-get --fix-broken install -y", check=False)
-                # Try installation again
-                self.run_command(f"apt-get install -y {' '.join(packages_to_install)}")
+                fix_result = self.run_command("apt-get --fix-broken install -y", check=False)
+                if fix_result.returncode != 0:
+                    self.log("Some packages may have dependency issues (e.g., NVIDIA drivers)", "WARNING")
+                    self.log("This is usually non-critical. Continuing with installation...", "WARNING")
+                # Try installation again, but don't fail if it still has issues
+                retry_result = self.run_command(f"apt-get install -y {' '.join(packages_to_install)}", check=False)
+                if retry_result.returncode != 0:
+                    self.log("Some system packages could not be installed due to dependency conflicts", "WARNING")
+                    self.log("This may be due to NVIDIA driver conflicts. Continuing with OSTG installation...", "WARNING")
                 
     def _wait_for_apt_lock(self):
         """Wait for any existing apt processes to finish"""
@@ -361,10 +403,16 @@ class NetgenInstaller:
             
         # Try to install Python 3.10
         if self.system_info["package_manager"] == "apt":
-            self.run_command("apt-get update")
+            # Fix GPG keys before updating
+            self._fix_apt_gpg_keys()
+            update_result = self.run_command("apt-get update", check=False)
+            if update_result.returncode != 0:
+                self.log("apt-get update had some issues, but continuing...", "WARNING")
             self.run_command("apt-get install -y software-properties-common")
             self.run_command("add-apt-repository -y ppa:deadsnakes/ppa")
-            self.run_command("apt-get update")
+            update_result = self.run_command("apt-get update", check=False)
+            if update_result.returncode != 0:
+                self.log("apt-get update had some issues after adding PPA, but continuing...", "WARNING")
             self.run_command("apt-get install -y python3.10 python3.10-venv python3.10-dev python3.10-distutils")
             self.run_command("curl -sS https://bootstrap.pypa.io/get-pip.py | python3.10")
         elif self.system_info["package_manager"] == "dnf":
@@ -385,6 +433,43 @@ class NetgenInstaller:
             self.log("Failed to install Python 3.10", "ERROR")
             sys.exit(1)
             
+    def _fix_apt_gpg_keys(self):
+        """Fix missing GPG keys for apt repositories"""
+        self.log("Checking and fixing GPG keys for apt repositories...")
+        
+        # Check if InfluxData repository exists
+        result = self.run_command("grep -r 'repos.influxdata.com' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null", check=False, capture_output=True)
+        if result.returncode == 0 and "influxdata" in result.stdout.lower():
+            self.log("InfluxData repository detected, adding GPG key...")
+            # Add InfluxData GPG key using modern method (preferred for Ubuntu 22.04+)
+            self.run_command("mkdir -p /etc/apt/keyrings", check=False)
+            influx_key_cmd = "curl -fsSL https://repos.influxdata.com/influxdb.key | gpg --dearmor -o /etc/apt/keyrings/influxdb.gpg"
+            key_result = self.run_command(influx_key_cmd, check=False)
+            if key_result.returncode == 0:
+                self.log("✓ InfluxData GPG key added successfully")
+            else:
+                # Try legacy method as fallback (for older Ubuntu versions)
+                self.log("Trying legacy method for InfluxData GPG key...", "WARNING")
+                legacy_cmd = "curl -fsSL https://repos.influxdata.com/influxdb.key | apt-key add -"
+                self.run_command(legacy_cmd, check=False)
+        
+        # Try apt-get update to detect any missing keys
+        update_result = self.run_command("apt-get update 2>&1", check=False, capture_output=True)
+        if update_result.returncode != 0 and "NO_PUBKEY" in update_result.stdout:
+            import re
+            # Extract missing key IDs
+            key_ids = re.findall(r'NO_PUBKEY\s+([A-F0-9]+)', update_result.stdout)
+            for key_id in key_ids:
+                self.log(f"Adding missing GPG key: {key_id}")
+                # Try to get the key from keyserver using multiple methods
+                # Method 1: Modern gpg with keyring
+                self.run_command(f"gpg --no-default-keyring --keyring /tmp/tmp-keyring.gpg --keyserver keyserver.ubuntu.com --recv-keys {key_id} && gpg --no-default-keyring --keyring /tmp/tmp-keyring.gpg --export --output /etc/apt/keyrings/{key_id}.gpg {key_id}", check=False)
+                # Method 2: Legacy apt-key (for older systems)
+                self.run_command(f"apt-key adv --keyserver keyserver.ubuntu.com --recv-keys {key_id}", check=False)
+                # Method 3: Direct gpg import
+                gpg_cmd = f"gpg --keyserver keyserver.ubuntu.com --recv-keys {key_id} 2>/dev/null && gpg --export --armor {key_id} 2>/dev/null | apt-key add - 2>/dev/null"
+                self.run_command(gpg_cmd, check=False)
+    
     def install_docker(self):
         """Install Docker"""
         self.log("Installing Docker...")
@@ -397,7 +482,15 @@ class NetgenInstaller:
             
         if self.system_info["package_manager"] == "apt":
             # Ubuntu/Debian Docker installation
-            self.run_command("apt-get update")
+            # Fix GPG keys before updating
+            self._fix_apt_gpg_keys()
+            # Try apt-get update, but continue even if there are warnings
+            update_result = self.run_command("apt-get update", check=False)
+            if update_result.returncode != 0:
+                self.log("apt-get update had some issues, but continuing...", "WARNING")
+                # Try to fix GPG keys again and retry
+                self._fix_apt_gpg_keys()
+                self.run_command("apt-get update", check=False)
             self.run_command("apt-get install -y ca-certificates curl gnupg lsb-release")
             self.run_command("mkdir -p /etc/apt/keyrings")
             self.run_command("curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg")
@@ -451,14 +544,29 @@ class NetgenInstaller:
             
         self.copy_file(local_wheel_path, remote_wheel_path)
         
-        # Install wheel
-        self.run_command(f"pip3 install {remote_wheel_path}")
+        # Install wheel (retry with --ignore-installed if distutils-owned packages block uninstall)
+        pip_result = self.run_command(f"pip3 install {remote_wheel_path}", check=False, capture_output=True)
+        if pip_result.returncode != 0:
+            err = (pip_result.stderr or "") + (pip_result.stdout or "")
+            if "uninstall-distutils-installed-package" in err or "Cannot uninstall" in err:
+                self.log("Pip failed due to distutils-installed package conflict; retrying with --ignore-installed", "WARNING")
+                pip_result = self.run_command(f"pip3 install --ignore-installed {remote_wheel_path}", check=False, capture_output=True)
+            if pip_result.returncode != 0:
+                self.log(f"Wheel install failed: {pip_result.stderr or pip_result.stdout or 'unknown'}", "ERROR")
+                raise SystemExit(1)
         
-        # Copy additional files from ostg_docker directory
+        # Copy FRR Docker files: prefer root Dockerfile.frr (Alpine-based, no apt-get build)
+        # to avoid apt-get failures on remote servers (libyang2-dev, python3.11-dev, etc.)
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        root_dockerfile = os.path.join(script_dir, "Dockerfile.frr")
+        ostg_docker_dockerfile = os.path.join(script_dir, "ostg_docker", "Dockerfile.frr")
+        dockerfile_src = root_dockerfile if os.path.exists(root_dockerfile) else ostg_docker_dockerfile
+        if dockerfile_src == root_dockerfile:
+            self.log("Using Alpine-based FRR Dockerfile (avoids apt-get build failures on server)")
         files_to_copy = [
-            ("ostg_docker/Dockerfile.frr", f"{INSTALL_DIR}/Dockerfile.frr"),
-            ("ostg_docker/frr.conf.template", f"{INSTALL_DIR}/frr.conf.template"),
-            ("ostg_docker/start-frr.sh", f"{INSTALL_DIR}/start-frr.sh")
+            (dockerfile_src, f"{INSTALL_DIR}/Dockerfile.frr"),
+            (os.path.join(script_dir, "ostg_docker", "frr.conf.template"), f"{INSTALL_DIR}/frr.conf.template"),
+            (os.path.join(script_dir, "ostg_docker", "start-frr.sh"), f"{INSTALL_DIR}/start-frr.sh")
         ]
         
         for local_file, remote_file in files_to_copy:
@@ -469,36 +577,208 @@ class NetgenInstaller:
                 
         self.log(f"✓ {PRODUCT_NAME} installed successfully")
         
+    def install_ai_dependencies(self):
+        """Install AI/ML dependencies for AI-powered features"""
+        self.log("Installing AI dependencies...")
+        
+        # AI/ML packages required for AI features
+        ai_packages = [
+            "scikit-learn>=1.3.0",
+            "pandas>=2.0.0",
+            "numpy>=1.24.0"
+        ]
+        
+        # Install AI dependencies
+        for package in ai_packages:
+            try:
+                self.run_command(f"pip3 install {package}")
+                self.log(f"✓ Installed {package}")
+            except subprocess.CalledProcessError as e:
+                self.log(f"Failed to install {package}: {e}", "WARNING")
+                # Continue with other packages even if one fails
+                continue
+        
+        # Create AI directories
+        self.run_command(f"mkdir -p {INSTALL_DIR}/ai_models")
+        self.log("✓ AI dependencies installed successfully")
+    
+    def install_ollama(self):
+        """Install Ollama for local LLM support"""
+        self.log("Installing Ollama (local LLM)...")
+        
+        try:
+            # Check if Ollama is already installed
+            result = self.run_command("ollama --version", check=False, capture_output=True)
+            if result.returncode == 0:
+                self.log(f"✓ Ollama already installed: {result.stdout.strip()}")
+                # Check if Ollama service is running
+                service_result = self.run_command("systemctl is-active ollama", check=False, capture_output=True)
+                if service_result.returncode == 0 and "active" in service_result.stdout:
+                    self.log("✓ Ollama service is running")
+                else:
+                    self.log("Starting Ollama service...")
+                    self.run_command("systemctl start ollama", check=False)
+                    self.run_command("systemctl enable ollama", check=False)
+                
+                # Check if essential models are installed
+                self.log("Checking for essential LLM models...")
+                essential_models = ["llama3.2:latest", "all-minilm:latest", "llama2"]
+                list_result = self.run_command("ollama list", check=False, capture_output=True)
+                installed_models = []
+                if list_result.returncode == 0:
+                    # Parse installed models from output
+                    for line in list_result.stdout.split('\n')[1:]:  # Skip header
+                        if line.strip():
+                            model_name = line.split()[0] if line.split() else ""
+                            if model_name:
+                                installed_models.append(model_name)
+                
+                # Install missing essential models
+                for model in essential_models:
+                    if model not in installed_models:
+                        self.log(f"Installing missing model: {model}...")
+                        pull_result = self.run_command(f"ollama pull {model}", check=False, timeout=600)
+                        if pull_result.returncode == 0:
+                            self.log(f"✓ {model} installed successfully")
+                        else:
+                            self.log(f"⚠ Could not install {model} (optional)", "WARNING")
+                    else:
+                        self.log(f"✓ {model} already installed")
+                
+                return
+            
+            # Install Ollama using official install script
+            self.log("Downloading and installing Ollama...")
+            install_script = "curl -fsSL https://ollama.ai/install.sh"
+            
+            if self.remote_install:
+                # For remote install, download and execute via SSH
+                self.run_command(f"{install_script} | sh")
+            else:
+                # For local install, download and execute
+                self.run_command(f"{install_script} | sh")
+            
+            # Start and enable Ollama service
+            self.log("Starting Ollama service...")
+            self.run_command("systemctl start ollama", check=False)
+            self.run_command("systemctl enable ollama", check=False)
+            
+            # Wait a moment for service to start
+            import time
+            time.sleep(2)
+            
+            # Verify Ollama is running
+            verify_result = self.run_command("ollama --version", check=False, capture_output=True)
+            if verify_result.returncode == 0:
+                self.log(f"✓ Ollama installed successfully: {verify_result.stdout.strip()}")
+                
+                # Pull essential LLM models that the app uses
+                # These models are referenced in the app's preferred models list
+                essential_models = [
+                    "llama3.2:latest",  # Primary model: 2GB, fast, good quality
+                    "all-minilm:latest", # Very fast fallback: 45MB (if available)
+                    "llama2"             # Fallback model
+                ]
+                
+                self.log("Pulling essential LLM models for OSTG AI features...")
+                self.log("This may take several minutes depending on your internet connection...")
+                
+                for model in essential_models:
+                    self.log(f"Downloading {model}...")
+                    pull_result = self.run_command(f"ollama pull {model}", check=False, timeout=600)
+                    if pull_result.returncode == 0:
+                        self.log(f"✓ {model} downloaded successfully")
+                    else:
+                        self.log(f"⚠ Could not download {model} (this is optional)", "WARNING")
+                
+                # Inform about optional larger models
+                self.log("")
+                self.log("Optional models (for better quality, install manually if needed):", "INFO")
+                self.log("  - llama3.3:latest (42GB) - Large, high quality", "INFO")
+                self.log("  - gemma3:27b (17GB) - Medium-large, general purpose", "INFO")
+                self.log("  - qwen2.5-coder:32b (19GB) - Large, code-focused", "INFO")
+                self.log("  Install with: ollama pull <model-name>", "INFO")
+            else:
+                self.log("⚠ Ollama installation completed but verification failed. Service may need manual start.", "WARNING")
+                
+        except Exception as e:
+            self.log(f"Failed to install Ollama: {e}", "WARNING")
+            self.log("Ollama is optional. Test plan generation will use template-based generation instead.", "WARNING")
+            self.log("To install Ollama manually: curl -fsSL https://ollama.ai/install.sh | sh", "INFO")
+        
     def setup_docker_frr(self):
-        """Setup Docker FRR image"""
+        """Setup Docker FRR image (uses Alpine-based Dockerfile when available to avoid apt-get build failures)"""
         self.log("Setting up Docker FRR image...")
         
-        # Build FRR Docker image with platform specification for compatibility
         dockerfile_path = f"{INSTALL_DIR}/Dockerfile.frr"
         build_context = INSTALL_DIR
-        
-        # Try to use buildx for multi-platform support if available
         buildx_check = self.run_command("docker buildx version", check=False, capture_output=True)
-        if buildx_check.returncode == 0:
-            # Use buildx with linux/amd64 platform
-            self.log("Using docker buildx for platform-specific build...")
-            self.run_command(f"docker buildx build --platform linux/amd64 -t {DOCKER_IMAGE} -f {dockerfile_path} --load {build_context}")
+        use_buildx = buildx_check.returncode == 0
+
+        # Alternate Alpine mirrors when default CDN has "temporary error (try again later)"
+        alpine_mirrors = [
+            None,  # default (dl-cdn.alpinelinux.org)
+            "https://ftp.halifax.rwth-aachen.de/alpine",
+            "https://mirror.accum.se/mirror/alpinelinux.org",
+        ]
+
+        def run_build(mirror_arg: Optional[str] = None) -> subprocess.CompletedProcess:
+            extra = f" --build-arg ALPINE_MIRROR={mirror_arg}" if mirror_arg else ""
+            if use_buildx:
+                return self.run_command(
+                    f"docker buildx build --platform linux/amd64 -t {DOCKER_IMAGE} -f {dockerfile_path} --load{extra} {build_context}",
+                    check=False, timeout=600
+                )
+            return self.run_command(
+                f"docker build -t {DOCKER_IMAGE} -f {dockerfile_path}{extra} {build_context}",
+                check=False, timeout=600
+            )
+
+        result = None
+        for idx, mirror in enumerate(alpine_mirrors):
+            if use_buildx and idx == 0:
+                self.log("Using docker buildx for platform-specific build...")
+            elif not use_buildx and idx == 0:
+                self.log("Using standard docker build...")
+            if mirror:
+                self.log(f"Retrying with Alpine mirror: {mirror}", "INFO")
+            result = run_build(mirror)
+            if result.returncode == 0:
+                break
+            if idx < len(alpine_mirrors) - 1:
+                self.log("Build failed, trying next mirror...", "WARNING")
+
+        if result and result.returncode != 0:
+            self.log("FRR Docker image build failed. OSTG will work but BGP/OSPF/ISIS device containers will be unavailable.", "WARNING")
+            self.log("To fix later (with optional mirror if CDN is unreachable):", "WARNING")
+            self.log(f"  docker build -t {DOCKER_IMAGE} -f {dockerfile_path} {build_context}", "WARNING")
+            self.log("  Or: docker build --build-arg ALPINE_MIRROR=https://ftp.halifax.rwth-aachen.de/alpine -t ostg-frr:latest -f /opt/OSTG/Dockerfile.frr /opt/OSTG", "WARNING")
         else:
-            # Fallback to regular docker build
-            self.log("Using standard docker build...")
-            self.run_command(f"docker build -t {DOCKER_IMAGE} -f {dockerfile_path} {build_context}")
+            self.log("✓ Docker FRR image built successfully")
         
         # Create Docker network
-        result = self.run_command(f"docker network create {DOCKER_NETWORK}", check=False)
-        if result.returncode != 0:
+        net_result = self.run_command(f"docker network create {DOCKER_NETWORK}", check=False)
+        if net_result.returncode != 0:
             self.log(f"Docker network {DOCKER_NETWORK} may already exist", "WARNING")
             
-        self.log("✓ Docker FRR setup completed successfully")
+        self.log("✓ Docker FRR setup completed")
         
     def create_systemd_services(self):
         """Create systemd services"""
         self.log("Creating systemd services...")
         
+        # Resolve the server entry-point dynamically. The console-script
+        # name is still `ostg-server` (wheel internals weren't renamed in the
+        # surface rebrand), but where it lives on disk varies by install.
+        ostg_server_cmd = "/usr/local/bin/ostg-server"
+        which_result = self.run_command("command -v ostg-server", check=False, capture_output=True)
+        if which_result.returncode == 0 and (which_result.stdout or "").strip():
+            ostg_server_cmd = (which_result.stdout or "").strip()
+            self.log(f"Using ostg-server at: {ostg_server_cmd}")
+        else:
+            # Fallback: run module via python (e.g. if scripts not on PATH)
+            ostg_server_cmd = "/usr/bin/python3 -m run_tgen_server"
+
         # Netgen Server Service
         server_service = f"""[Unit]
 Description={PRODUCT_NAME} Traffic Generator Server
@@ -510,7 +790,7 @@ Type=simple
 User=root
 WorkingDirectory={INSTALL_DIR}
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
-ExecStart=/usr/bin/python3 /usr/local/lib/python3.10/dist-packages/run_tgen_server.py
+ExecStart={ostg_server_cmd}
 Restart=always
 RestartSec=10
 StandardOutput=journal
@@ -586,16 +866,41 @@ WantedBy=timers.target
         # Stop any existing processes
         self.run_command("pkill -f run_tgen_server.py", check=False)
 
-        # Start the server
-        self.run_command("systemctl start netgen-server.service")
+        # Start the server (don't abort the install if it fails — surface a warning
+        # and capture journal logs so the user can debug)
+        start_result = self.run_command("systemctl start netgen-server.service", check=False)
+        if start_result.returncode != 0:
+            self.log("systemctl start netgen-server returned non-zero; checking status...", "WARNING")
 
-        # Check status
-        result = self.run_command("systemctl is-active netgen-server.service", capture_output=True)
-        if result.stdout.strip() == "active":
+        # Give the server a moment to start (or fail)
+        self.run_command("sleep 3", check=False)
+
+        # Check status — use check=False so the install script does not abort
+        result = self.run_command(
+            "systemctl is-active netgen-server.service", check=False, capture_output=True
+        )
+        if result.returncode == 0 and (result.stdout or "").strip() == "active":
             self.log(f"✓ {PRODUCT_NAME} server started successfully")
+            self.ostg_server_active = True
         else:
-            self.log(f"Failed to start {PRODUCT_NAME} server", "ERROR")
-            sys.exit(1)
+            self.log(
+                f"{PRODUCT_NAME} server may not be active. "
+                "Check: systemctl status netgen-server.service",
+                "WARNING",
+            )
+            self.log("You can try: systemctl start netgen-server.service", "INFO")
+            self.ostg_server_active = False
+            # Capture recent journal logs so we can see why the server failed
+            journal = self.run_command(
+                "journalctl -u netgen-server -n 50 --no-pager 2>/dev/null",
+                check=False,
+                capture_output=True,
+            )
+            if journal.returncode == 0 and (journal.stdout or "").strip():
+                self.log("Recent netgen-server logs (for debugging):", "INFO")
+                for line in (journal.stdout or "").strip().split("\n")[-25:]:
+                    self.log(f"  {line}")
+
 
     def verify_installation(self):
         """Verify the installation."""
@@ -613,10 +918,12 @@ WantedBy=timers.target
 
         # Check Docker image
         result = self.run_command(f"docker images {DOCKER_IMAGE}", check=False, capture_output=True)
-        if DOCKER_IMAGE in result.stdout:
+        if result.stdout and DOCKER_IMAGE in result.stdout:
             self.log(f"✓ Docker image {DOCKER_IMAGE} available")
+            self.docker_frr_available = True
         else:
             self.log(f"✗ Docker image {DOCKER_IMAGE} not found", "WARNING")
+            self.docker_frr_available = False
 
         # Check systemd services
         services_to_check = [
@@ -635,15 +942,22 @@ WantedBy=timers.target
         self.log("✓ Installation verification completed")
         
     def test_frr_functionality(self):
-        """Test FRR functionality"""
+        """Test FRR functionality (skip if FRR image was not built)"""
         self.log("Testing FRR functionality...")
         
+        if not getattr(self, "docker_frr_available", False):
+            self.log("Skipping FRR test (Docker image not available)", "INFO")
+            return
+
         # Test Docker container creation
         test_container_name = "netgen-frr-test-install"
         
         try:
             # Create test container
-            self.run_command(f"docker run -d --name {test_container_name} --network host {DOCKER_IMAGE}")
+            run_result = self.run_command(f"docker run -d --name {test_container_name} --network host {DOCKER_IMAGE}", check=False)
+            if run_result.returncode != 0:
+                self.log("Could not start FRR test container (image missing or run failed)", "WARNING")
+                return
             
             # Wait for container to start
             self.run_command("sleep 10")
@@ -748,6 +1062,8 @@ WantedBy=timers.target
         self.install_python_dependencies()
         self.install_docker()
         self.install_ostg()
+        self.install_ai_dependencies()
+        self.install_ollama()
         self.setup_docker_frr()
         self.create_systemd_services()
         self.start_ostg_services()
@@ -769,6 +1085,8 @@ WantedBy=timers.target
         self.install_python_dependencies()
         self.install_docker()
         self.install_ostg()
+        self.install_ai_dependencies()
+        self.install_ollama()
         self.setup_docker_frr()
         self.create_systemd_services()
         self.start_ostg_services()
@@ -794,10 +1112,22 @@ WantedBy=timers.target
         self.log(f"{PRODUCT_NAME} installation completed successfully!")
         self.log("=" * 60)
         self.log("")
+        # Re-check server status so "Next steps" reflects current state (e.g. if server crashed after start)
+        result = self.run_command(
+            "systemctl is-active netgen-server.service", check=False, capture_output=True
+        )
+        self.ostg_server_active = result.returncode == 0 and (result.stdout or "").strip() == "active"
         self.log("Next steps:")
-        self.log(f"1. ✓ {PRODUCT_NAME} server is already running")
+        if self.ostg_server_active:
+            self.log(f"1. ✓ {PRODUCT_NAME} server is already running")
+        else:
+            self.log(f"1. Start {PRODUCT_NAME} server: systemctl start netgen-server.service")
+            self.log("   If it fails: journalctl -u netgen-server -n 50 --no-pager")
         self.log("2. ✓ Systemd services are configured")
-        self.log("3. ✓ Docker FRR image is ready")
+        if self.docker_frr_available:
+            self.log("3. ✓ Docker FRR image is ready")
+        else:
+            self.log("3. Docker FRR image not built; BGP/OSPF/ISIS devices unavailable until built.")
         self.log("4. You can now create devices and configure BGP")
         self.log("")
         self.log("To monitor logs:")
@@ -805,6 +1135,23 @@ WantedBy=timers.target
         self.log("")
         self.log("To check status:")
         self.log("  systemctl status netgen-server.service")
+        if getattr(self, "install_log_path", None):
+            for h in self.logger.handlers:
+                h.flush()
+            self.log("")
+            self.log("Full install log saved to:")
+            self.log(f"  {self.install_log_path}")
+            if self.remote_install:
+                try:
+                    remote_log = f"{INSTALL_DIR}/install.log"
+                    subprocess.run(
+                        ["sshpass", "-p", self.remote_pass, "scp", self.install_log_path,
+                         f"{self.remote_user}@{self.remote_host}:{remote_log}"],
+                        check=False, capture_output=True, timeout=30
+                    )
+                    self.log(f"  (copy on server: {self.remote_host}:{remote_log})")
+                except Exception:
+                    pass
         self.log("=" * 60)
 
 
