@@ -576,8 +576,8 @@ class NetgenInstaller:
                     self.run_command(f"chmod +x {remote_file}")
 
         # DPDK runtime scripts. The server endpoints (/api/dpdk/{status,bind,unbind,
-        # interfaces}) shell out to dpdk_bind.sh from $INSTALL_DIR/resources/dpdk/;
-        # if the directory is missing they return 404 "dpdk_bind.sh not found".
+        # interfaces}) shell out to dpdk_bind.sh; if the script directory is
+        # missing they return 404 "dpdk_bind.sh not found".
         # Ship the whole resources/dpdk/*.sh tree so DPDK actions work out of the box.
         dpdk_src_dir = os.path.join(script_dir, "resources", "dpdk")
         dpdk_remote_dir = f"{INSTALL_DIR}/resources/dpdk"
@@ -591,6 +591,23 @@ class NetgenInstaller:
                 self.copy_file(local_sh, remote_sh)
                 self.run_command(f"chmod +x {remote_sh}")
             self.log(f"✓ DPDK runtime scripts deployed to {dpdk_remote_dir}")
+
+            # The wheel-installed run_tgen_server.py hardcodes the legacy path
+            # /opt/OSTG/resources/dpdk/dpdk_bind.sh in its DPDK endpoints. Even
+            # though INSTALL_DIR has been renamed to /opt/netgen, the server
+            # still resolves DPDK scripts via /opt/OSTG/. Until that hardcoded
+            # path is fixed at the source, drop a symlink so both paths point
+            # at the same files.
+            if INSTALL_DIR != LEGACY_INSTALL_DIR:
+                self.run_command(f"mkdir -p {LEGACY_INSTALL_DIR}", check=False)
+                self.run_command(
+                    f"ln -sfn {INSTALL_DIR}/resources {LEGACY_INSTALL_DIR}/resources",
+                    check=False,
+                )
+                self.log(
+                    f"✓ Compatibility symlink {LEGACY_INSTALL_DIR}/resources → "
+                    f"{INSTALL_DIR}/resources (server still uses legacy path)"
+                )
         else:
             self.log(
                 f"resources/dpdk/ not found at {dpdk_src_dir}; DPDK bind/unbind "
