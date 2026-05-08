@@ -680,37 +680,62 @@ class TrafficGeneratorClient(
 
         # DPDK lives as a submenu under Tools
         dpdk_menu = QMenu("DPDK", self)
+        # Show tooltips on hover (Qt menus hide them by default)
+        dpdk_menu.setToolTipsVisible(True)
         tools_menu.addMenu(dpdk_menu)
 
-        dpdk_status_action = QAction("Status", self)
+        dpdk_status_action = QAction("Status...", self)
+        dpdk_status_action.setToolTip(
+            "Show DPDK installation, hugepage, IOMMU, and per-NIC binding status on the selected server."
+        )
         dpdk_status_action.triggered.connect(self.show_dpdk_status)
         dpdk_menu.addAction(dpdk_status_action)
 
-        dpdk_bind_action = QAction("Bind Interface", self)
+        dpdk_bind_action = QAction("Bind Interface...", self)
+        dpdk_bind_action.setToolTip(
+            "Detach a NIC from the kernel driver and bind it to vfio-pci so DPDK can drive it. "
+            "Requires IOMMU enabled."
+        )
         dpdk_bind_action.triggered.connect(self.bind_interface_to_dpdk)
         dpdk_menu.addAction(dpdk_bind_action)
 
-        dpdk_unbind_action = QAction("Unbind Interface", self)
+        dpdk_unbind_action = QAction("Unbind Interface...", self)
+        dpdk_unbind_action.setToolTip(
+            "Release a DPDK-bound NIC back to the kernel network driver."
+        )
         dpdk_unbind_action.triggered.connect(self.unbind_interface_from_dpdk)
         dpdk_menu.addAction(dpdk_unbind_action)
 
         dpdk_menu.addSeparator()
 
         dpdk_verify_action = QAction("Verify Installation", self)
+        dpdk_verify_action.setToolTip(
+            "Check that DPDK binaries, drivers, and tx_worker are present on the server."
+        )
         dpdk_verify_action.triggered.connect(self.verify_dpdk)
         dpdk_menu.addAction(dpdk_verify_action)
 
-        dpdk_hugepages_action = QAction("Configure Hugepages", self)
+        dpdk_hugepages_action = QAction("Configure Hugepages...", self)
+        dpdk_hugepages_action.setToolTip(
+            "Reserve hugepages required by DPDK. System-wide setting that affects "
+            "memory available to other workloads (VMs, containers)."
+        )
         dpdk_hugepages_action.triggered.connect(self.configure_hugepages)
         dpdk_menu.addAction(dpdk_hugepages_action)
 
         dpdk_menu.addSeparator()
 
-        dpdk_iommu_action = QAction("Configure IOMMU", self)
+        dpdk_iommu_action = QAction("Configure IOMMU...", self)
+        dpdk_iommu_action.setToolTip(
+            "Enable IOMMU in the bootloader (intel_iommu=on / amd_iommu=on). Requires a server reboot."
+        )
         dpdk_iommu_action.triggered.connect(self.configure_iommu)
         dpdk_menu.addAction(dpdk_iommu_action)
 
         dpdk_load_modules_action = QAction("Load VFIO Modules", self)
+        dpdk_load_modules_action.setToolTip(
+            "modprobe vfio, vfio-pci, and vfio_iommu_type1 on the selected server."
+        )
         dpdk_load_modules_action.triggered.connect(self.load_vfio_modules)
         dpdk_menu.addAction(dpdk_load_modules_action)
 

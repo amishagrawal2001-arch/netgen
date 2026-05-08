@@ -5,120 +5,213 @@ from requests.exceptions import ConnectionError, Timeout
 from PyQt5.QtWidgets import (
     QMessageBox, QDialog, QVBoxLayout, QHBoxLayout, QPushButton,
     QListWidget, QListWidgetItem, QLabel, QAbstractItemView, QComboBox,
-    QTextEdit, QScrollArea, QCheckBox, QWidget, QApplication
+    QTextEdit, QScrollArea, QCheckBox, QWidget, QApplication, QProgressDialog
 )
-from PyQt5.QtCore import Qt
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont
 
 logger = logging.getLogger(__name__)
 
 
+class _DpdkApiWorker(QThread):
+    """Run a DPDK API request off the GUI thread.
+
+    Long-timeout DPDK operations (bind/unbind up to 60s, verify up to 15s)
+    used to call requests.* directly in the main thread, freezing the UI.
+    This worker emits exactly one `done` signal carrying:
+      data: dict or None — parsed JSON if any, augmented with
+            `_status_code` and `_full_text`. None when the request failed.
+      error: str — empty on success, human-readable error otherwise.
+    """
+
+    done = pyqtSignal(object, str)
+
+    def __init__(self, method: str, url: str, json: dict = None, timeout: float = 15):
+        super().__init__()
+        self.method = method.upper()
+        self.url = url
+        self.json_payload = json
+        self.timeout = timeout
+
+    def run(self):
+        try:
+            if self.method == "GET":
+                resp = requests.get(self.url, timeout=self.timeout)
+            elif self.method == "POST":
+                resp = requests.post(self.url, json=self.json_payload, timeout=self.timeout)
+            else:
+                self.done.emit(None, f"Unsupported HTTP method: {self.method}")
+                return
+            try:
+                data = resp.json()
+                if not isinstance(data, dict):
+                    data = {"_value": data}
+            except Exception:
+                data = {}
+            data["_status_code"] = resp.status_code
+            data["_full_text"] = resp.text or ""
+            self.done.emit(data, "")
+        except Timeout as e:
+            self.done.emit(None, f"Request timed out after {self.timeout}s ({e})")
+        except ConnectionError as e:
+            self.done.emit(None, f"Could not connect to server ({e})")
+        except Exception as e:
+            self.done.emit(None, f"Request failed: {e}")
+
+
 class TrafficGenClientDPDKMenuActions():
     """DPDK menu actions for the traffic generator client."""
+
+    # ---------- async helpers ----------
+
+    def _track_dpdk_worker(self, worker: _DpdkApiWorker):
+        """Hold a strong reference until the thread reports done.
+
+        Without this, Python can garbage-collect the QThread mid-flight and the
+        request never completes. Workers self-clear when their `done` signal fires.
+        """
+        if not hasattr(self, "_dpdk_workers"):
+            self._dpdk_workers = set()
+        self._dpdk_workers.add(worker)
+        worker.done.connect(lambda *_args, w=worker: self._dpdk_workers.discard(w))
+
+    def _make_dpdk_progress(self, title: str, label: str) -> QProgressDialog:
+        """Spinner-style busy dialog (indeterminate range) with a Cancel button."""
+        dlg = QProgressDialog(label, "Cancel", 0, 0, self)
+        dlg.setWindowTitle(title)
+        dlg.setWindowModality(Qt.WindowModal)
+        dlg.setMinimumDuration(200)  # don't flash on fast requests
+        dlg.setValue(0)
+        return dlg
     
     def show_dpdk_status(self):
-        """Show DPDK status for selected server(s)."""
+        """Show DPDK status for selected server(s) — async fetch, dialog opens immediately."""
         selected_servers = self._get_selected_servers()
         if not selected_servers:
             QMessageBox.warning(self, "No Server Selected", "Please select a server from the server tree.")
             return
-        
-        # Use a custom dialog with scrollable text and inline buttons
+
+        # Build the dialog up-front with a "Loading..." placeholder per server.
+        # Each server's status arrives via an async worker that updates its row in place.
+        from datetime import datetime
         dialog = QDialog(self)
         dialog.setWindowTitle("DPDK Status")
         dialog.setGeometry(300, 300, 700, 500)
-        
         layout = QVBoxLayout(dialog)
-        
-        # Parse results and create formatted display with inline buttons
-        status_widgets = []
-        server_status_map = {}
-        
-        for i, server in enumerate(selected_servers):
+
+        # Top: refresh + last-updated label so the user knows whether data is fresh.
+        header_row = QHBoxLayout()
+        last_updated_label = QLabel("Loading...")
+        last_updated_label.setStyleSheet("color: #6b7280; font-size: 10px;")
+        header_row.addWidget(last_updated_label)
+        header_row.addStretch()
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.setMaximumWidth(90)
+        header_row.addWidget(refresh_btn)
+        layout.addLayout(header_row)
+
+        # Per-server containers. Filled in async.
+        server_rows = {}  # address -> dict(label, text_edit, action_container, action_layout)
+        for server in selected_servers:
             address = server.get("address", "")
             tg_id = server.get("tg_id", "?")
-            
-            # Check if server is online before making API call
-            if not server.get("online", True):
-                server_label = QLabel(f"TG {tg_id} ({address}):")
-                server_label.setStyleSheet("font-weight: bold; font-size: 12px; color: red;")
-                layout.addWidget(server_label)
-                text_edit = QTextEdit()
-                text_edit.setReadOnly(True)
-                text_edit.setPlainText(f"Server is offline or unreachable.")
-                text_edit.setFontFamily("Courier")
-                text_edit.setFontPointSize(9)
-                layout.addWidget(text_edit)
-                layout.addWidget(QLabel(""))  # Spacer
-                continue
-            
-            # Get status data for this server (single API call, reduced timeout)
-            status_data = None
-            try:
-                response = requests.get(f"{address}/api/dpdk/status", timeout=3)
-                if response.status_code == 200:
-                    status_data = response.json()
-                    server_status_map[address] = (server, status_data)
-            except requests.exceptions.ConnectionError:
-                status_data = None
-            except requests.exceptions.Timeout:
-                status_data = None
-            except Exception:
-                status_data = None
-            
-            # Create server section
-            server_label = QLabel(f"TG {tg_id} ({address}):")
-            server_label.setStyleSheet("font-weight: bold; font-size: 12px;")
-            layout.addWidget(server_label)
-            
-            # Create scrollable text area for status
+            row_label = QLabel(f"TG {tg_id} ({address}):")
+            row_label.setStyleSheet("font-weight: bold; font-size: 12px;")
+            layout.addWidget(row_label)
+
             text_edit = QTextEdit()
             text_edit.setReadOnly(True)
-            if status_data:
-                status_text = self._format_dpdk_status(status_data)
-                text_edit.setPlainText(status_text)
-            else:
-                text_edit.setPlainText("Failed to get status from server")
             text_edit.setFontFamily("Courier")
             text_edit.setFontPointSize(9)
             text_edit.setMaximumHeight(200)
+            text_edit.setPlainText("Loading...")
             layout.addWidget(text_edit)
-            
-            # Add inline Fix button if IOMMU is not enabled
-            if status_data and not status_data.get('iommu_enabled', False):
+
+            # Container for IOMMU/VFIO action widgets that get added once status arrives.
+            action_container = QWidget()
+            action_layout = QVBoxLayout(action_container)
+            action_layout.setContentsMargins(0, 0, 0, 0)
+            layout.addWidget(action_container)
+
+            layout.addWidget(QLabel(""))  # Spacer between servers
+            server_rows[address] = dict(
+                server=server, label=row_label, text_edit=text_edit,
+                action_container=action_container, action_layout=action_layout,
+            )
+
+        # OK button
+        button_row = QHBoxLayout()
+        ok_button = QPushButton("OK")
+        ok_button.clicked.connect(dialog.accept)
+        button_row.addStretch()
+        button_row.addWidget(ok_button)
+        layout.addLayout(button_row)
+
+        # ----- async fetch wiring -----
+
+        def _clear_action_layout(action_layout):
+            while action_layout.count():
+                item = action_layout.takeAt(0)
+                w = item.widget()
+                if w is not None:
+                    w.setParent(None)
+
+        def _on_status(addr, data, err):
+            row = server_rows.get(addr)
+            if row is None:
+                return
+            text_edit = row["text_edit"]
+            action_layout = row["action_layout"]
+            _clear_action_layout(action_layout)
+
+            if err:
+                text_edit.setPlainText(f"Error: {err}")
+                row["label"].setStyleSheet("font-weight: bold; font-size: 12px; color: red;")
+                return
+            if data is None or data.get("_status_code") != 200:
+                code = data.get("_status_code") if data else "?"
+                text_edit.setPlainText(f"Failed to get status (HTTP {code})")
+                return
+
+            text_edit.setPlainText(self._format_dpdk_status(data))
+
+            # IOMMU fix banner — kick off CPU-vendor lookup async so the
+            # exact GRUB params are accurate (defaults to "intel" until that returns).
+            if not data.get("iommu_enabled", False):
                 warning_layout = QHBoxLayout()
                 warning_label = QLabel("WARNING: IOMMU is not enabled. Enable in GRUB:")
                 warning_label.setStyleSheet("color: red; font-weight: bold;")
                 warning_layout.addWidget(warning_label)
-                
-                # Show IOMMU parameters
-                cpu_vendor = "intel"  # default
-                try:
-                    cpu_response = requests.get(f"{address}/api/dpdk/cpu-vendor", timeout=3)
-                    if cpu_response.status_code == 200:
-                        cpu_data = cpu_response.json()
-                        cpu_vendor = cpu_data.get('vendor', 'intel').lower()
-                except (requests.exceptions.ConnectionError, requests.exceptions.Timeout):
-                    pass
-                except Exception:
-                    pass
-                
-                iommu_params = f"{cpu_vendor}_iommu=on iommu=pt" if cpu_vendor in ["intel", "amd"] else "intel_iommu=on iommu=pt"
-                params_label = QLabel(f"{iommu_params}")
-                font = QFont("Courier")
-                params_label.setFont(font)
+                params_label = QLabel("intel_iommu=on iommu=pt")
+                params_label.setFont(QFont("Courier"))
                 warning_layout.addWidget(params_label)
-                
-                # Fix button inline
                 fix_button = QPushButton("[FIX]")
-                fix_button.setStyleSheet("background-color: #dc2626; color: white; font-weight: bold; padding: 5px 15px;")
-                fix_button.clicked.connect(lambda checked, s=server, d=dialog: self._handle_fix_iommu_from_status(s, d))
+                fix_button.setStyleSheet(
+                    "background-color: #dc2626; color: white; font-weight: bold; padding: 5px 15px;"
+                )
+                server_obj = row["server"]
+                fix_button.clicked.connect(
+                    lambda checked, s=server_obj, d=dialog: self._handle_fix_iommu_from_status(s, d)
+                )
                 warning_layout.addWidget(fix_button)
-                
-                layout.addLayout(warning_layout)
-            
-            # Add Load Modules button if VFIO modules are not loaded
-            if status_data and not status_data.get('vfio_pci_loaded', False):
+                action_layout.addLayout(warning_layout)
+
+                # Async vendor lookup updates the params label when it returns.
+                cpu_worker = _DpdkApiWorker("GET", f"{addr}/api/dpdk/cpu-vendor", timeout=3)
+                self._track_dpdk_worker(cpu_worker)
+
+                def on_cpu(cd, cerr, label=params_label):
+                    if cerr or cd is None or cd.get("_status_code") != 200:
+                        return  # leave default
+                    vendor = (cd.get("vendor") or "intel").lower()
+                    if vendor in ("intel", "amd"):
+                        label.setText(f"{vendor}_iommu=on iommu=pt")
+
+                cpu_worker.done.connect(on_cpu)
+                cpu_worker.start()
+
+            # VFIO modules section
+            if not data.get("vfio_pci_loaded", False):
                 modules_layout = QVBoxLayout()
                 
                 # Warning message with Read More button
@@ -166,21 +259,55 @@ class TrafficGenClientDPDKMenuActions():
                 
                 load_modules_button = QPushButton("[LOAD MODULES]")
                 load_modules_button.setStyleSheet("background-color: #f59e0b; color: white; font-weight: bold; padding: 5px 15px; border-radius: 3px;")
-                load_modules_button.clicked.connect(lambda checked, s=server, d=dialog: self._handle_load_modules_from_status(s, d))
+                server_obj_for_modules = row["server"]
+                load_modules_button.clicked.connect(
+                    lambda checked, s=server_obj_for_modules, d=dialog: self._handle_load_modules_from_status(s, d)
+                )
                 button_layout.addWidget(load_modules_button)
-                
+
                 modules_layout.addLayout(button_layout)
-                layout.addLayout(modules_layout)
-            
-            layout.addWidget(QLabel(""))  # Spacer between servers
-        
-        # OK button at bottom
-        button_layout = QHBoxLayout()
-        ok_button = QPushButton("OK")
-        ok_button.clicked.connect(dialog.accept)
-        button_layout.addWidget(ok_button)
-        layout.addLayout(button_layout)
-        
+                action_layout.addLayout(modules_layout)
+
+        # ----- worker dispatch / refresh wiring -----
+        pending = set()
+
+        def fetch_one(addr):
+            row = server_rows.get(addr)
+            if row is None:
+                return
+            server = row["server"]
+            if not server.get("online", True):
+                row["text_edit"].setPlainText("Server is offline or unreachable.")
+                row["label"].setStyleSheet("font-weight: bold; font-size: 12px; color: red;")
+                return
+            row["text_edit"].setPlainText("Loading...")
+            _clear_action_layout(row["action_layout"])
+            pending.add(addr)
+            worker = _DpdkApiWorker("GET", f"{addr}/api/dpdk/status", timeout=3)
+            self._track_dpdk_worker(worker)
+
+            def cb(data, err, a=addr):
+                _on_status(a, data, err)
+                pending.discard(a)
+                if not pending:
+                    last_updated_label.setText(
+                        f"Last updated at {datetime.now().strftime('%H:%M:%S')}"
+                    )
+
+            worker.done.connect(cb)
+            worker.start()
+
+        def refresh_all():
+            last_updated_label.setText("Refreshing...")
+            for row_addr in list(server_rows.keys()):
+                fetch_one(row_addr)
+
+        refresh_btn.clicked.connect(refresh_all)
+
+        # Kick off the initial fetch for every selected server.
+        for addr in list(server_rows.keys()):
+            fetch_one(addr)
+
         dialog.exec()
     
     def _copy_to_clipboard(self, text):
@@ -441,65 +568,96 @@ class TrafficGenClientDPDKMenuActions():
         return "\n".join(lines)
     
     def bind_interface_to_dpdk(self):
-        """Bind an interface to DPDK."""
+        """Bind an interface to DPDK — pre-checks IOMMU before opening the picker."""
         selected_servers = self._get_selected_servers()
         if not selected_servers:
             QMessageBox.warning(self, "No Server Selected", "Please select a server from the server tree.")
             return
-        
-        # For now, support single server selection
+
         if len(selected_servers) > 1:
             QMessageBox.information(self, "Multiple Servers", "Please select only one server for binding operations.")
             return
-        
+
         server = selected_servers[0]
         address = server.get("address", "")
-        
-        # Check if server is online
+
         if not server.get("online", True):
             QMessageBox.warning(self, "Server Offline", f"Server {address} is offline or unreachable.")
             return
-        
-        # Get available interfaces from server
-        try:
-            response = requests.get(f"{address}/api/dpdk/interfaces", timeout=3)
-            if response.status_code != 200:
-                QMessageBox.warning(self, "Error", f"Failed to get interfaces: HTTP {response.status_code}")
+
+        progress = self._make_dpdk_progress(
+            "Checking DPDK Status", f"Checking IOMMU and interfaces on {address}..."
+        )
+
+        status_worker = _DpdkApiWorker("GET", f"{address}/api/dpdk/status", timeout=3)
+        self._track_dpdk_worker(status_worker)
+
+        def on_status(data, err):
+            if err:
+                progress.close()
+                QMessageBox.critical(self, "Status Check Failed", f"Could not reach {address}:\n\n{err}")
                 return
-            
-            interfaces_data = response.json()
-            all_interfaces = interfaces_data.get('interfaces', [])
-            
-            # Filter to only show interfaces that are NOT bound to DPDK
-            # (kernel-bound interfaces and unbound interfaces can be bound to DPDK)
-            bindable_interfaces = []
-            for iface in all_interfaces:
-                driver = iface.get('driver', '')
-                # Exclude DPDK-bound interfaces (they're already bound)
-                if driver not in ['vfio-pci', 'uio_pci_generic']:
-                    bindable_interfaces.append(iface)
-            
-            if not bindable_interfaces:
-                QMessageBox.information(
-                    self, 
-                    "No Interfaces", 
-                    "No interfaces available for DPDK binding.\n\n"
-                    "All interfaces are already bound to DPDK, or no interfaces are available."
+            status_code = (data or {}).get("_status_code", 0)
+            if status_code != 200 or data is None:
+                progress.close()
+                QMessageBox.warning(self, "Status Check Failed", f"HTTP {status_code} from {address}")
+                return
+
+            # Pre-check #3: refuse to open the bind dialog when IOMMU is disabled.
+            # Binding without IOMMU will only fail downstream and produce a confusing error.
+            if not data.get("iommu_enabled", False):
+                progress.close()
+                msg = QMessageBox(self)
+                msg.setIcon(QMessageBox.Warning)
+                msg.setWindowTitle("IOMMU Not Enabled")
+                msg.setText("DPDK binding requires IOMMU, which is not enabled on this server.")
+                msg.setInformativeText(
+                    "Use Tools → DPDK → Configure IOMMU... to enable it. The server will need a reboot.\n\n"
+                    "After IOMMU is on, retry Bind Interface."
                 )
+                msg.setStandardButtons(QMessageBox.Ok)
+                msg.exec()
                 return
-            
-            # Show interface selection dialog
-            dialog = self._create_interface_selection_dialog(bindable_interfaces, "Bind Interface to DPDK")
-            if dialog.exec() == QDialog.Accepted:
-                selected_interface = dialog.selected_interface
-                if selected_interface:
-                    self._perform_bind(address, selected_interface, force=False)
-        except requests.exceptions.ConnectionError:
-            QMessageBox.critical(self, "Error", f"Server is unreachable: {address}")
-        except requests.exceptions.Timeout:
-            QMessageBox.critical(self, "Error", f"Server request timed out: {address}")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to get interfaces: {str(e)}")
+
+            # IOMMU is on — fetch bindable interfaces (still async).
+            progress.setLabelText(f"Fetching interfaces from {address}...")
+            ifaces_worker = _DpdkApiWorker("GET", f"{address}/api/dpdk/interfaces", timeout=3)
+            self._track_dpdk_worker(ifaces_worker)
+
+            def on_ifaces(idata, ierr):
+                progress.close()
+                if ierr:
+                    QMessageBox.critical(self, "Error", f"Failed to get interfaces: {ierr}")
+                    return
+                istatus = (idata or {}).get("_status_code", 0)
+                if istatus != 200 or idata is None:
+                    QMessageBox.warning(self, "Error", f"Failed to get interfaces: HTTP {istatus}")
+                    return
+                all_interfaces = idata.get("interfaces", [])
+                # Exclude already-bound interfaces; kernel + unbound devices are bindable.
+                bindable = [
+                    iface for iface in all_interfaces
+                    if iface.get("driver", "") not in ("vfio-pci", "uio_pci_generic")
+                ]
+                if not bindable:
+                    QMessageBox.information(
+                        self, "No Interfaces",
+                        "No interfaces available for DPDK binding.\n\n"
+                        "All interfaces are already bound to DPDK, or no interfaces are available.",
+                    )
+                    return
+
+                dialog = self._create_interface_selection_dialog(bindable, "Bind Interface to DPDK")
+                if dialog.exec() == QDialog.Accepted:
+                    selected_interface = dialog.selected_interface
+                    if selected_interface:
+                        self._perform_bind(address, selected_interface, force=False)
+
+            ifaces_worker.done.connect(on_ifaces)
+            ifaces_worker.start()
+
+        status_worker.done.connect(on_status)
+        status_worker.start()
     
     def unbind_interface_from_dpdk(self):
         """Unbind an interface from DPDK or restore unbound interface to kernel driver."""
@@ -573,37 +731,63 @@ class TrafficGenClientDPDKMenuActions():
             QMessageBox.critical(self, "Error", f"Failed to get interfaces: {str(e)}")
     
     def verify_dpdk(self):
-        """Verify DPDK installation on selected server(s)."""
+        """Verify DPDK installation on selected server(s) — async."""
         selected_servers = self._get_selected_servers()
         if not selected_servers:
             QMessageBox.warning(self, "No Server Selected", "Please select a server from the server tree.")
             return
-        
-        results = []
+
+        # Pre-fill results with offline servers; the async workers fill in the rest.
+        results: dict[str, str] = {}
+        pending: set[str] = set()
+
+        progress = self._make_dpdk_progress(
+            "Verifying DPDK", f"Verifying DPDK on {len(selected_servers)} server(s)..."
+        )
+
+        def maybe_finish():
+            if pending:
+                return
+            progress.close()
+            ordered = []
+            for s in selected_servers:
+                key = s.get("address", "")
+                ordered.append(results.get(key, f"TG {s.get('tg_id', '?')} ({key}): no response"))
+            msg = QMessageBox(self)
+            msg.setWindowTitle("DPDK Verification")
+            msg.setText("\n\n".join(ordered))
+            msg.setStandardButtons(QMessageBox.Ok)
+            msg.exec()
+
         for server in selected_servers:
             address = server.get("address", "")
             tg_id = server.get("tg_id", "?")
-            
-            # Check if server is online
+
             if not server.get("online", True):
-                results.append(f"TG {tg_id} ({address}): Server is offline or unreachable")
+                results[address] = f"TG {tg_id} ({address}): Server is offline or unreachable"
                 continue
-            
-            try:
-                response = requests.get(f"{address}/api/dpdk/verify", timeout=15)
-                if response.status_code == 200:
-                    verify_data = response.json()
-                    results.append(f"TG {tg_id} ({address}):\n{self._format_verify_results(verify_data)}")
+
+            pending.add(address)
+            worker = _DpdkApiWorker("GET", f"{address}/api/dpdk/verify", timeout=15)
+            self._track_dpdk_worker(worker)
+
+            def on_done(data, err, addr=address, tg=tg_id):
+                if err:
+                    results[addr] = f"TG {tg} ({addr}): Error — {err}"
+                elif data is None or data.get("_status_code") != 200:
+                    code = data.get("_status_code") if data else "?"
+                    results[addr] = f"TG {tg} ({addr}): Failed to verify (HTTP {code})"
                 else:
-                    results.append(f"TG {tg_id} ({address}): Failed to verify (HTTP {response.status_code})")
-            except Exception as e:
-                results.append(f"TG {tg_id} ({address}): Error - {str(e)}")
-        
-        msg = QMessageBox(self)
-        msg.setWindowTitle("DPDK Verification")
-        msg.setText("\n\n".join(results))
-        msg.setStandardButtons(QMessageBox.Ok)
-        msg.exec()
+                    results[addr] = f"TG {tg} ({addr}):\n{self._format_verify_results(data)}"
+                pending.discard(addr)
+                maybe_finish()
+
+            worker.done.connect(on_done)
+            worker.start()
+
+        # If everything was offline (no workers spawned), finish immediately.
+        if not pending:
+            maybe_finish()
     
     def _format_verify_results(self, verify_data):
         """Format DPDK verification results for display."""
@@ -1197,302 +1381,325 @@ If DPDK still fails:
             QMessageBox.critical(self, "Error", f"Failed to configure IOMMU: {str(e)}")
     
     def _perform_bind(self, server_address, interface, force=False):
-        """Perform bind operation via API."""
-        try:
-            # Only include PCI if it's valid (not "N/A" or empty)
-            pci = interface.get('pci', '')
-            if pci and pci != 'N/A' and ':' in pci:  # Valid PCI format: 0000:XX:XX.X
-                payload = {
-                    "interface": interface.get('name'),
-                    "pci": pci,
-                    "force": force
-                }
-            else:
-                # Use interface name only if PCI is invalid
-                payload = {
-                    "interface": interface.get('name'),
-                    "force": force
-                }
-            
-            response = requests.post(f"{server_address}/api/dpdk/bind", json=payload, timeout=15)
-            
-            # Get full response text first (for debugging and fallback)
-            full_response = response.text
-            logger.info(f"[DPDK BIND] Response status: {response.status_code}")
-            logger.info(f"[DPDK BIND] Response text (first 300 chars): {full_response[:300]}")
-            
-            # Try to parse JSON response regardless of status code
-            try:
-                result = response.json()
-                logger.info(f"[DPDK BIND] Parsed JSON - success: {result.get('success')}, has output: {bool(result.get('output'))}")
-            except Exception as e:
-                # If JSON parsing fails, try to extract info from text
-                result = {}
-                logger.error(f"[DPDK BIND] Failed to parse JSON: {e}")
-            
-            # Check for active routes error in both 200 and 500 responses
-            # BUT ONLY if force=False (if force=True, we've already asked the user)
-            error_msg = result.get('message', '')
-            output = result.get('output', '')
-            
-            # Combine all text sources for checking
-            all_text = f"{error_msg} {output} {full_response}".lower()
-            logger.info(f"[DPDK BIND] force={force}, Checking for 'active routes': {'active routes' in all_text}")
-            
-            # Only show dialog if force=False and we detect active routes
-            if not force and ('active routes' in all_text or 'disrupt network connectivity' in all_text):
-                logger.info(f"[DPDK BIND] ✓ Active routes detected (force=False), showing dialog...")
-                # Offer to retry with force
-                # Make sure dialog is modal and brings window to front
-                msg_box = QMessageBox(self)
-                msg_box.setWindowTitle("Active Routes Detected")
-                msg_box.setText(f"Interface {interface.get('name')} has active routes.")
-                msg_box.setInformativeText("Binding will disrupt network connectivity.\n\nDo you want to force bind anyway?")
-                msg_box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
-                msg_box.setDefaultButton(QMessageBox.No)
-                msg_box.setIcon(QMessageBox.Warning)
-                # Bring window to front
-                msg_box.activateWindow()
-                msg_box.raise_()
-                reply = msg_box.exec()
-                logger.info(f"[DPDK BIND] Dialog result: {reply} (Yes={QMessageBox.Yes}, No={QMessageBox.No})")
-                if reply == QMessageBox.Yes:
-                    logger.info(f"[DPDK BIND] User chose to force bind, retrying with force=True...")
-                    # Retry with force
-                    self._perform_bind(server_address, interface, force=True)
-                else:
-                    logger.info(f"[DPDK BIND] User cancelled force bind")
-                return
-            
-            # Handle success case
-            if response.status_code == 200 and result.get('success'):
-                QMessageBox.information(self, "Success", f"Interface {interface.get('name')} bound to DPDK successfully.")
-            else:
-                # Check if it's a vfio-pci binding failure
-                if 'failed to bind to vfio-pci' in all_text.lower() or 'failed to bind' in all_text.lower():
-                    # Provide helpful troubleshooting information
-                    troubleshooting = (
-                        "\n\nTroubleshooting:\n"
-                        "1. Check if IOMMU is enabled:\n"
-                        "   grep -i iommu /proc/cmdline\n"
-                        "   Should show: intel_iommu=on iommu=pt (Intel) or amd_iommu=on iommu=pt (AMD)\n\n"
-                        "2. If IOMMU is not enabled, add to GRUB and reboot:\n"
-                        "   sudo nano /etc/default/grub\n"
-                        "   Add: GRUB_CMDLINE_LINUX=\"... intel_iommu=on iommu=pt\"\n"
-                        "   sudo update-grub && sudo reboot\n\n"
-                        "3. Check vfio-pci module:\n"
-                        "   lsmod | grep vfio\n"
-                        "   sudo modprobe vfio-pci\n\n"
-                        "4. Verify device is in an IOMMU group:\n"
-                        "   find /sys/kernel/iommu_groups/ -name \"0000:c9:00.0\""
-                    )
-                    QMessageBox.warning(
-                        self, 
-                        "DPDK Binding Failed", 
-                        f"Failed to bind interface {interface.get('name')} to vfio-pci.\n\n"
-                        f"Error: {error_msg}\n\n"
-                        f"Output:\n{output}\n"
-                        f"{troubleshooting}"
-                    )
-                else:
-                    # Show error message for other failures
-                    if output:
-                        QMessageBox.warning(self, "Failed", f"Failed to bind interface: {error_msg}\n\nOutput:\n{output}")
-                    else:
-                        QMessageBox.warning(self, "Error", f"HTTP {response.status_code}: {full_response}")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to bind interface: {str(e)}")
+        """Perform bind operation via API — runs the POST off the GUI thread.
+
+        15s timeouts used to freeze the UI; the work now happens in a worker
+        and the response is dispatched to _handle_bind_result.
+        """
+        # Only include PCI if it's a valid bus address; otherwise let server resolve by interface name.
+        pci = interface.get('pci', '')
+        if pci and pci != 'N/A' and ':' in pci:  # Valid PCI format: 0000:XX:XX.X
+            payload = {"interface": interface.get('name'), "pci": pci, "force": force}
+        else:
+            payload = {"interface": interface.get('name'), "force": force}
+
+        progress = self._make_dpdk_progress(
+            "Binding to DPDK",
+            f"Binding {interface.get('name')} to vfio-pci on {server_address}...",
+        )
+        worker = _DpdkApiWorker(
+            "POST", f"{server_address}/api/dpdk/bind", json=payload, timeout=15
+        )
+        self._track_dpdk_worker(worker)
+
+        def cb(data, err):
+            progress.close()
+            self._handle_bind_result(server_address, interface, force, data, err)
+
+        worker.done.connect(cb)
+        worker.start()
+
+    def _handle_bind_result(self, server_address, interface, force, data, err):
+        """Process the bind API result and surface the appropriate dialog."""
+        if err:
+            QMessageBox.critical(
+                self, "Bind Failed",
+                f"Could not bind {interface.get('name')} on {server_address}:\n\n{err}",
+            )
+            return
+
+        status_code = (data or {}).get("_status_code", 0)
+        full_response = (data or {}).get("_full_text", "")
+        # Strip the helper keys so the rest of the logic sees the raw API payload
+        result = {k: v for k, v in (data or {}).items() if not k.startswith("_")}
+
+        logger.info(f"[DPDK BIND] Response status: {status_code}")
+        logger.info(f"[DPDK BIND] Response text (first 300 chars): {full_response[:300]}")
+        logger.info(
+            f"[DPDK BIND] Parsed JSON - success: {result.get('success')}, has output: {bool(result.get('output'))}"
+        )
+
+        error_msg = result.get('message', '')
+        output = result.get('output', '')
+        all_text = f"{error_msg} {output} {full_response}".lower()
+        logger.info(f"[DPDK BIND] force={force}, 'active routes' detected: {'active routes' in all_text}")
+
+        # Active-routes prompt (only when not already forced)
+        if not force and ('active routes' in all_text or 'disrupt network connectivity' in all_text):
+            msg_box = QMessageBox(self)
+            msg_box.setWindowTitle("Active Routes Detected")
+            msg_box.setText(f"Interface {interface.get('name')} has active routes.")
+            msg_box.setInformativeText(
+                "Binding will disrupt network connectivity.\n\nDo you want to force bind anyway?"
+            )
+            msg_box.setStandardButtons(QMessageBox.Yes | QMessageBox.No)
+            msg_box.setDefaultButton(QMessageBox.No)
+            msg_box.setIcon(QMessageBox.Warning)
+            msg_box.activateWindow()
+            msg_box.raise_()
+            if msg_box.exec() == QMessageBox.Yes:
+                self._perform_bind(server_address, interface, force=True)
+            return
+
+        if status_code == 200 and result.get('success'):
+            QMessageBox.information(
+                self, "Success",
+                f"Interface {interface.get('name')} bound to DPDK successfully.",
+            )
+            return
+
+        # Failure path — provide IOMMU troubleshooting hint when relevant
+        if 'failed to bind to vfio-pci' in all_text or 'failed to bind' in all_text:
+            troubleshooting = (
+                "\n\nTroubleshooting:\n"
+                "1. Check if IOMMU is enabled:\n"
+                "   grep -i iommu /proc/cmdline\n"
+                "   Should show: intel_iommu=on iommu=pt (Intel) or amd_iommu=on iommu=pt (AMD)\n\n"
+                "2. If IOMMU is not enabled, add to GRUB and reboot:\n"
+                "   sudo nano /etc/default/grub\n"
+                "   Add: GRUB_CMDLINE_LINUX=\"... intel_iommu=on iommu=pt\"\n"
+                "   sudo update-grub && sudo reboot\n\n"
+                "3. Check vfio-pci module:\n"
+                "   lsmod | grep vfio\n"
+                "   sudo modprobe vfio-pci\n\n"
+                "4. Verify device is in an IOMMU group:\n"
+                "   find /sys/kernel/iommu_groups/ -name \"0000:c9:00.0\""
+            )
+            QMessageBox.warning(
+                self, "DPDK Binding Failed",
+                f"Failed to bind interface {interface.get('name')} to vfio-pci.\n\n"
+                f"Error: {error_msg}\n\n"
+                f"Output:\n{output}\n"
+                f"{troubleshooting}",
+            )
+        elif output:
+            QMessageBox.warning(
+                self, "Failed", f"Failed to bind interface: {error_msg}\n\nOutput:\n{output}"
+            )
+        else:
+            QMessageBox.warning(self, "Error", f"HTTP {status_code}: {full_response}")
     
     def _perform_unbind(self, server_address, interface):
-        """Perform unbind operation via API (unbind from DPDK or restore unbound device to kernel)."""
-        try:
-            # Extract interface name and PCI - handle devices without interface names
-            interface_name = interface.get('name', '')
-            pci = interface.get('pci', '')
-            driver = interface.get('driver', '')
-            status = interface.get('status', '')
-            kernel_driver = interface.get('kernel_driver', '')
-            
-            # Determine if this is an unbound device being restored
-            is_unbound = status == 'unbound' or (driver in ['unknown', ''] and kernel_driver)
-            is_dpdk_bound = driver in ['vfio-pci', 'uio_pci_generic'] or status == 'dpdk-bound'
-            
-            # If interface name is PCI address format (e.g., "0000:c9:00.0 (no interface)"), extract PCI
-            if '(no interface)' in interface_name:
-                pci = interface_name.split()[0]  # Extract PCI from "0000:c9:00.0 (no interface)"
-                interface_name = None  # No interface name available
-            
-            payload = {
-                "interface": interface_name if interface_name and interface_name != "N/A" else None,
-                "pci": pci if pci and pci != "N/A" else None,
-                "kernel_driver": kernel_driver
-            }
-            
-            # Ensure we have at least PCI address
-            if not payload.get('pci') and not payload.get('interface'):
-                QMessageBox.warning(self, "Error", "Cannot determine PCI address or interface name for unbinding.")
-                return
-            
-            # For unbound devices, ensure kernel_driver is provided
-            if is_unbound and not kernel_driver:
-                QMessageBox.warning(
-                    self, 
-                    "Error", 
-                    f"Cannot restore device {pci}: kernel driver not available.\n\n"
-                    "The device may need to be manually bound to a kernel driver."
-                )
-                return
-            
-            # Increased timeout to accommodate retry logic and interface detection (up to 60 seconds)
-            response = requests.post(f"{server_address}/api/dpdk/unbind", json=payload, timeout=60)
-            
-            if response.status_code == 200:
-                result = response.json()
-                # Check for success - handle both boolean True and string "true"
-                success = result.get('success', False)
-                # Debug logging
-                logger.debug(f"[DPDK UNBIND DEBUG] Response status: {response.status_code}, success: {success}, type: {type(success)}")
-                if success is True or success == True or (isinstance(success, str) and success.lower() == 'true'):
-                    display_name = interface_name if interface_name else pci
-                    output = result.get('output', '')
+        """Perform unbind operation via API — async; the 60s timeout used to freeze the UI."""
+        # Extract interface name and PCI - handle devices without interface names
+        interface_name = interface.get('name', '')
+        pci = interface.get('pci', '')
+        driver = interface.get('driver', '')
+        status = interface.get('status', '')
+        kernel_driver = interface.get('kernel_driver', '')
+
+        # Determine if this is an unbound device being restored
+        is_unbound = status == 'unbound' or (driver in ['unknown', ''] and kernel_driver)
+
+        # If interface name is PCI address format (e.g., "0000:c9:00.0 (no interface)"), extract PCI
+        if '(no interface)' in interface_name:
+            pci = interface_name.split()[0]
+            interface_name = None
+
+        payload = {
+            "interface": interface_name if interface_name and interface_name != "N/A" else None,
+            "pci": pci if pci and pci != "N/A" else None,
+            "kernel_driver": kernel_driver,
+        }
+
+        # Pre-validation (synchronous — surface errors before we kick off the worker)
+        if not payload.get('pci') and not payload.get('interface'):
+            QMessageBox.warning(
+                self, "Error",
+                "Cannot determine PCI address or interface name for unbinding.",
+            )
+            return
+        if is_unbound and not kernel_driver:
+            QMessageBox.warning(
+                self, "Error",
+                f"Cannot restore device {pci}: kernel driver not available.\n\n"
+                "The device may need to be manually bound to a kernel driver.",
+            )
+            return
+
+        progress = self._make_dpdk_progress(
+            "Unbinding from DPDK",
+            f"Releasing {interface_name or pci} on {server_address}...",
+        )
+        worker = _DpdkApiWorker(
+            "POST", f"{server_address}/api/dpdk/unbind", json=payload, timeout=60,
+        )
+        self._track_dpdk_worker(worker)
+
+        def cb(data, err):
+            progress.close()
+            self._handle_unbind_result(
+                interface_name, pci, kernel_driver, is_unbound, data, err
+            )
+
+        worker.done.connect(cb)
+        worker.start()
+
+    def _handle_unbind_result(self, interface_name, pci, kernel_driver, is_unbound, data, err):
+        """Process the unbind API result and surface the appropriate dialog."""
+        if err:
+            QMessageBox.critical(
+                self, "Unbind Failed",
+                f"Could not unbind interface:\n\n{err}",
+            )
+            return
+
+        status_code = (data or {}).get("_status_code", 0)
+        full_text = (data or {}).get("_full_text", "")
+        result = {k: v for k, v in (data or {}).items() if not k.startswith("_")}
+
+        if status_code == 200:
+            success = result.get('success', False)
+            logger.debug(f"[DPDK UNBIND DEBUG] Response status: {status_code}, success: {success}, type: {type(success)}")
+            if success is True or success == True or (isinstance(success, str) and success.lower() == 'true'):
+                display_name = interface_name if interface_name else pci
+                output = result.get('output', '')
                     
-                    # Check if output indicates firmware issue (Broadcom NICs)
-                    has_firmware_issue = 'firmware not responding' in output.lower() or 'firmware issue' in output.lower()
+                # Check if output indicates firmware issue (Broadcom NICs)
+                has_firmware_issue = 'firmware not responding' in output.lower() or 'firmware issue' in output.lower()
+                # Check if script recommends reboot
+                reboot_recommended = 'reboot is required' in output.lower() or \
+                                   'reboot may be required' in output.lower() or \
+                                   'server reboot' in output.lower() or \
+                                   ('firmware not responding' in output.lower() and 'all recovery attempts' in output.lower())
+                
+                if is_unbound:
+                    # Check if output indicates binding to kernel driver actually failed
+                    binding_failed = 'binding to kernel driver failed' in output.lower() or \
+                                    ('bind attempt completed' in output.lower() and 'current driver: unbound' in output.lower()) or \
+                                    ('device remains unbound' in output.lower() and 'main goal achieved' in output.lower())
+                    
+                    if has_firmware_issue or binding_failed:
+                        if reboot_recommended:
+                            # Show critical message with reboot recommendation
+                            QMessageBox.critical(
+                                self, 
+                                "Reboot Required", 
+                                f"Device {display_name} unbound from DPDK successfully.\n\n"
+                                f"⚠️ CRITICAL: Binding to kernel driver '{kernel_driver}' failed due to Broadcom firmware issue.\n\n"
+                                f"All recovery attempts have been exhausted. The firmware is not responding.\n\n"
+                                f"🔄 REBOOT REQUIRED:\n"
+                                f"The server must be rebooted to reset the Broadcom NIC firmware.\n"
+                                f"After reboot, the interface should appear normally in 'ip link show'.\n\n"
+                                f"Current Status:\n"
+                                f"• Device is unbound from DPDK ✓\n"
+                                f"• Device remains unbound (no driver)\n"
+                                f"• Interface will NOT appear in 'ip link show' until reboot\n\n"
+                                f"To reboot the server:\n"
+                                f"ssh root@<server> 'reboot'"
+                            )
+                        else:
+                            QMessageBox.warning(
+                                self, 
+                                "Partially Successful", 
+                                f"Device {display_name} unbound from DPDK successfully.\n\n"
+                                f"⚠️ Warning: Binding to kernel driver '{kernel_driver}' failed.\n\n"
+                                f"The device is no longer bound to DPDK (main goal achieved), but binding to "
+                                f"kernel driver failed due to a Broadcom firmware initialization issue.\n\n"
+                                f"📌 Important:\n"
+                                f"• The device remains unbound (no driver)\n"
+                                f"• Unbound devices do NOT appear in 'ip link show'\n"
+                                f"• The device will still appear in the unbind dialog (this is expected)\n"
+                                f"• You can try restoring it again later\n\n"
+                                f"To fix and make interface visible:\n"
+                                f"1. Reload driver: rmmod {kernel_driver} && modprobe {kernel_driver}\n"
+                                f"2. Then bind: echo {pci} > /sys/bus/pci/drivers/{kernel_driver}/bind\n"
+                                f"3. Reset PCI device (requires server access)\n"
+                                f"4. Reboot if issue persists"
+                            )
+                    else:
+                        QMessageBox.information(
+                            self, 
+                            "Success", 
+                            f"Device {display_name} restored to kernel driver '{kernel_driver}'.\n\n"
+                            f"The interface should now appear in 'ip link show'."
+                        )
+                else:
                     # Check if script recommends reboot
                     reboot_recommended = 'reboot is required' in output.lower() or \
                                        'reboot may be required' in output.lower() or \
                                        'server reboot' in output.lower() or \
                                        ('firmware not responding' in output.lower() and 'all recovery attempts' in output.lower())
+                    # Check if binding to kernel driver actually failed
+                    binding_failed = 'binding to kernel driver failed' in output.lower() or \
+                                    ('bind attempt completed' in output.lower() and 'current driver: unbound' in output.lower()) or \
+                                    ('device remains unbound' in output.lower() and 'main goal achieved' in output.lower())
                     
-                    if is_unbound:
-                        # Check if output indicates binding to kernel driver actually failed
-                        binding_failed = 'binding to kernel driver failed' in output.lower() or \
-                                        ('bind attempt completed' in output.lower() and 'current driver: unbound' in output.lower()) or \
-                                        ('device remains unbound' in output.lower() and 'main goal achieved' in output.lower())
-                        
-                        if has_firmware_issue or binding_failed:
-                            if reboot_recommended:
-                                # Show critical message with reboot recommendation
-                                QMessageBox.critical(
-                                    self, 
-                                    "Reboot Required", 
-                                    f"Device {display_name} unbound from DPDK successfully.\n\n"
-                                    f"⚠️ CRITICAL: Binding to kernel driver '{kernel_driver}' failed due to Broadcom firmware issue.\n\n"
-                                    f"All recovery attempts have been exhausted. The firmware is not responding.\n\n"
-                                    f"🔄 REBOOT REQUIRED:\n"
-                                    f"The server must be rebooted to reset the Broadcom NIC firmware.\n"
-                                    f"After reboot, the interface should appear normally in 'ip link show'.\n\n"
-                                    f"Current Status:\n"
-                                    f"• Device is unbound from DPDK ✓\n"
-                                    f"• Device remains unbound (no driver)\n"
-                                    f"• Interface will NOT appear in 'ip link show' until reboot\n\n"
-                                    f"To reboot the server:\n"
-                                    f"ssh root@<server> 'reboot'"
-                                )
-                            else:
-                                QMessageBox.warning(
-                                    self, 
-                                    "Partially Successful", 
-                                    f"Device {display_name} unbound from DPDK successfully.\n\n"
-                                    f"⚠️ Warning: Binding to kernel driver '{kernel_driver}' failed.\n\n"
-                                    f"The device is no longer bound to DPDK (main goal achieved), but binding to "
-                                    f"kernel driver failed due to a Broadcom firmware initialization issue.\n\n"
-                                    f"📌 Important:\n"
-                                    f"• The device remains unbound (no driver)\n"
-                                    f"• Unbound devices do NOT appear in 'ip link show'\n"
-                                    f"• The device will still appear in the unbind dialog (this is expected)\n"
-                                    f"• You can try restoring it again later\n\n"
-                                    f"To fix and make interface visible:\n"
-                                    f"1. Reload driver: rmmod {kernel_driver} && modprobe {kernel_driver}\n"
-                                    f"2. Then bind: echo {pci} > /sys/bus/pci/drivers/{kernel_driver}/bind\n"
-                                    f"3. Reset PCI device (requires server access)\n"
-                                    f"4. Reboot if issue persists"
-                                )
-                        else:
-                            QMessageBox.information(
+                    if has_firmware_issue or binding_failed:
+                        if reboot_recommended:
+                            # Show critical message with reboot recommendation
+                            QMessageBox.critical(
                                 self, 
-                                "Success", 
-                                f"Device {display_name} restored to kernel driver '{kernel_driver}'.\n\n"
-                                f"The interface should now appear in 'ip link show'."
+                                "Reboot Required", 
+                                f"Interface {display_name} unbound from DPDK successfully.\n\n"
+                                f"⚠️ CRITICAL: Binding to kernel driver '{kernel_driver}' failed due to Broadcom firmware issue.\n\n"
+                                f"All recovery attempts have been exhausted. The firmware is not responding.\n\n"
+                                f"🔄 REBOOT REQUIRED:\n"
+                                f"The server must be rebooted to reset the Broadcom NIC firmware.\n"
+                                f"After reboot, the interface should appear normally in 'ip link show'.\n\n"
+                                f"Current Status:\n"
+                                f"• Device is unbound from DPDK ✓\n"
+                                f"• Device remains unbound (no driver)\n"
+                                f"• Interface will NOT appear in 'ip link show' until reboot\n\n"
+                                f"To reboot the server:\n"
+                                f"ssh root@<server> 'reboot'"
+                            )
+                        else:
+                            QMessageBox.warning(
+                                self, 
+                                "Partially Successful", 
+                                f"Interface {display_name} unbound from DPDK successfully.\n\n"
+                                f"⚠️ Warning: Binding to kernel driver '{kernel_driver}' failed.\n\n"
+                                f"The device is no longer bound to DPDK (main goal achieved), but binding to "
+                                f"kernel driver failed due to a Broadcom firmware initialization issue.\n\n"
+                                f"📌 Important:\n"
+                                f"• The device remains unbound (no driver)\n"
+                                f"• Unbound devices do NOT appear in 'ip link show'\n"
+                                f"• The device will still appear in the unbind dialog (this is expected)\n"
+                                f"• You can try restoring it again later\n\n"
+                                f"To fix and make interface visible:\n"
+                                f"1. Reload driver: rmmod {kernel_driver} && modprobe {kernel_driver}\n"
+                                f"2. Then bind: echo {pci} > /sys/bus/pci/drivers/{kernel_driver}/bind\n"
+                                f"3. Reset PCI device (requires server access)\n"
+                                f"4. Reboot if issue persists"
                             )
                     else:
-                        # Check if script recommends reboot
-                        reboot_recommended = 'reboot is required' in output.lower() or \
-                                           'reboot may be required' in output.lower() or \
-                                           'server reboot' in output.lower() or \
-                                           ('firmware not responding' in output.lower() and 'all recovery attempts' in output.lower())
-                        # Check if binding to kernel driver actually failed
-                        binding_failed = 'binding to kernel driver failed' in output.lower() or \
-                                        ('bind attempt completed' in output.lower() and 'current driver: unbound' in output.lower()) or \
-                                        ('device remains unbound' in output.lower() and 'main goal achieved' in output.lower())
-                        
-                        if has_firmware_issue or binding_failed:
-                            if reboot_recommended:
-                                # Show critical message with reboot recommendation
-                                QMessageBox.critical(
-                                    self, 
-                                    "Reboot Required", 
-                                    f"Interface {display_name} unbound from DPDK successfully.\n\n"
-                                    f"⚠️ CRITICAL: Binding to kernel driver '{kernel_driver}' failed due to Broadcom firmware issue.\n\n"
-                                    f"All recovery attempts have been exhausted. The firmware is not responding.\n\n"
-                                    f"🔄 REBOOT REQUIRED:\n"
-                                    f"The server must be rebooted to reset the Broadcom NIC firmware.\n"
-                                    f"After reboot, the interface should appear normally in 'ip link show'.\n\n"
-                                    f"Current Status:\n"
-                                    f"• Device is unbound from DPDK ✓\n"
-                                    f"• Device remains unbound (no driver)\n"
-                                    f"• Interface will NOT appear in 'ip link show' until reboot\n\n"
-                                    f"To reboot the server:\n"
-                                    f"ssh root@<server> 'reboot'"
-                                )
-                            else:
-                                QMessageBox.warning(
-                                    self, 
-                                    "Partially Successful", 
-                                    f"Interface {display_name} unbound from DPDK successfully.\n\n"
-                                    f"⚠️ Warning: Binding to kernel driver '{kernel_driver}' failed.\n\n"
-                                    f"The device is no longer bound to DPDK (main goal achieved), but binding to "
-                                    f"kernel driver failed due to a Broadcom firmware initialization issue.\n\n"
-                                    f"📌 Important:\n"
-                                    f"• The device remains unbound (no driver)\n"
-                                    f"• Unbound devices do NOT appear in 'ip link show'\n"
-                                    f"• The device will still appear in the unbind dialog (this is expected)\n"
-                                    f"• You can try restoring it again later\n\n"
-                                    f"To fix and make interface visible:\n"
-                                    f"1. Reload driver: rmmod {kernel_driver} && modprobe {kernel_driver}\n"
-                                    f"2. Then bind: echo {pci} > /sys/bus/pci/drivers/{kernel_driver}/bind\n"
-                                    f"3. Reset PCI device (requires server access)\n"
-                                    f"4. Reboot if issue persists"
-                                )
-                        else:
-                            QMessageBox.information(
-                                self, 
-                                "Success", 
-                                f"Interface {display_name} unbound from DPDK successfully.\n\n"
-                                f"The interface should now appear in 'ip link show'."
-                            )
-                    
-                    # Refresh DPDK status after successful unbind
-                    # Also refresh the interface list to update the status
-                    if hasattr(self, 'show_dpdk_status'):
-                        QApplication.processEvents()  # Process any pending events
-                        # Refresh will happen automatically when user checks status again
-                    
-                    # Note: The device may still appear in the unbind dialog if:
-                    # 1. It was successfully unbound from DPDK but binding to kernel driver failed (firmware issue)
-                    # 2. In this case, the device is still unbound and can be restored again
-                    # This is expected behavior - the device is no longer DPDK-bound, which was the main goal
-                else:
-                    error_msg = result.get('message', 'Unknown error')
-                    output = result.get('output', '')
-                    full_msg = f"Failed to {'restore' if is_unbound else 'unbind'} interface: {error_msg}"
-                    if output:
-                        full_msg += f"\n\nOutput:\n{output}"
-                    QMessageBox.warning(self, "Failed", full_msg)
+                        QMessageBox.information(
+                            self, 
+                            "Success", 
+                            f"Interface {display_name} unbound from DPDK successfully.\n\n"
+                            f"The interface should now appear in 'ip link show'."
+                        )
+                
+                # Refresh DPDK status after successful unbind
+                # Also refresh the interface list to update the status
+                if hasattr(self, 'show_dpdk_status'):
+                    QApplication.processEvents()  # Process any pending events
+                    # Refresh will happen automatically when user checks status again
+                
+                # Note: The device may still appear in the unbind dialog if:
+                # 1. It was successfully unbound from DPDK but binding to kernel driver failed (firmware issue)
+                # 2. In this case, the device is still unbound and can be restored again
+                # This is expected behavior - the device is no longer DPDK-bound, which was the main goal
             else:
-                QMessageBox.warning(self, "Error", f"HTTP {response.status_code}: {response.text}")
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to unbind interface: {str(e)}")
+                error_msg = result.get('message', 'Unknown error')
+                output = result.get('output', '')
+                full_msg = f"Failed to {'restore' if is_unbound else 'unbind'} interface: {error_msg}"
+                if output:
+                    full_msg += f"\n\nOutput:\n{output}"
+                QMessageBox.warning(self, "Failed", full_msg)
+        else:
+            QMessageBox.warning(self, "Error", f"HTTP {status_code}: {full_text}")
     
     def _perform_load_modules(self, server_address, refresh_callback=None):
         """Perform VFIO module loading via API."""
