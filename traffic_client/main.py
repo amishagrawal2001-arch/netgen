@@ -157,6 +157,16 @@ class TrafficGeneratorClient(
             )
             self.view_menu.addAction(stats_toggle)
 
+            # Explicit "Re-dock" command. Drag-back-to-edge is the Qt convention
+            # but the target zone is small and unreliable on macOS, so users
+            # frequently get stuck with a floating window they can't put back.
+            redock_stats_action = QAction("Re-dock Traffic Statistics", self)
+            redock_stats_action.setToolTip(
+                "Force the Traffic Statistics window back into the main window."
+            )
+            redock_stats_action.triggered.connect(self._redock_statistics)
+            self.view_menu.addAction(redock_stats_action)
+
         # Initialize stream section inside the "Streams" tab
         self.setup_stream_section(self.streams_tab)
         
@@ -278,6 +288,25 @@ class TrafficGeneratorClient(
         # Use QTimer to defer statistics fetching after UI is fully rendered
         if hasattr(self, "fetch_and_update_statistics"):
             QTimer.singleShot(500, lambda: self.fetch_and_update_statistics())
+
+    def _redock_statistics(self):
+        """Force the Traffic Statistics dock back into the main window.
+
+        QDockWidget supports drag-back-to-redock natively, but the target
+        zone is small and unreliable on macOS. Users get stranded floating
+        windows they can't put back. This action fixes that:
+          - If the dock is closed, show it.
+          - If the dock is floating, re-attach it to the bottom area.
+          - Always re-add via addDockWidget so the placement is explicit.
+        """
+        if not hasattr(self, "statistics_dock"):
+            return
+        # addDockWidget is idempotent and also handles the "currently floating"
+        # case: it pulls the dock back into the main window's bottom area.
+        self.addDockWidget(Qt.BottomDockWidgetArea, self.statistics_dock)
+        self.statistics_dock.setFloating(False)
+        self.statistics_dock.show()
+        self.statistics_dock.raise_()
 
     def closeEvent(self, event):
         """Handle application close event - cleanup threads and resources."""
