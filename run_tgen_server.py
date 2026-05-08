@@ -12685,6 +12685,474 @@ def dpdk_configure_iommu():
         return jsonify({"error": str(e)}), 500
 
 
+# =============================================================================
+# Admin portal (/admin) — single-page web UI for server-side install / config
+# =============================================================================
+# Renders an HTML page that talks to existing /api/dpdk/* endpoints plus a
+# small set of /api/admin/* endpoints below. Designed to be self-contained:
+# inline CSS + vanilla JS, no static assets, no template files. Safe to ship
+# as a single edit to this file (no wheel template-data plumbing needed).
+#
+# Endpoints added:
+#   GET  /admin                       — serves the HTML page
+#   GET  /api/admin/health            — consolidated health JSON
+#   POST /api/admin/install_dpdk      — runs install_dpdk.sh --auto in bg
+#   GET  /api/admin/install_dpdk/log  — tails the install log
+
+_ADMIN_INSTALL_STATE = {
+    "process": None,     # subprocess.Popen of the running install (None when idle)
+    "log_path": None,    # path to the captured install log
+    "started_at": None,  # ISO timestamp
+    "finished_at": None,
+    "return_code": None,
+}
+
+
+@app.route("/api/admin/health", methods=["GET"])
+def api_admin_health():
+    """Consolidated server health for the admin portal."""
+    import socket
+    out = {
+        "hostname": socket.gethostname(),
+        "netgen_server": {"port": int(os.environ.get("PORT", "5050"))},
+        "dpdk": {},
+        "iommu": {},
+        "vfio": {},
+        "hugepages": {},
+        "tx_worker": {"present": False, "path": None},
+        "install_running": False,
+    }
+    # DPDK libs presence
+    try:
+        result = subprocess.run(
+            ["pkg-config", "--modversion", "libdpdk"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode == 0:
+            out["dpdk"] = {"installed": True, "version": (result.stdout or "").strip()}
+        else:
+            out["dpdk"] = {"installed": False, "version": None}
+    except Exception:
+        out["dpdk"] = {"installed": False, "version": None}
+
+    # IOMMU
+    try:
+        with open("/proc/cmdline", "r") as f:
+            cmdline = f.read()
+        out["iommu"] = {
+            "enabled": ("intel_iommu=on" in cmdline) or ("amd_iommu=on" in cmdline),
+            "cmdline_excerpt": cmdline.strip()[:200],
+        }
+    except Exception:
+        out["iommu"] = {"enabled": False, "cmdline_excerpt": ""}
+
+    # VFIO modules — check both `modinfo` for "(builtin)" AND `lsmod` for
+    # loadable modules. Ubuntu kernels often ship vfio_pci as builtin, in
+    # which case it never appears in lsmod but is still always-available.
+    def _module_loaded(name):
+        try:
+            mi = subprocess.run(["modinfo", name], capture_output=True, text=True, timeout=5)
+            if mi.returncode == 0 and "(builtin)" in mi.stdout:
+                return True
+        except Exception:
+            pass
+        try:
+            ls = subprocess.run(["lsmod"], capture_output=True, text=True, timeout=5)
+            if ls.returncode == 0:
+                import re as _re
+                # lsmod uses underscores in names regardless of how they're written
+                # in modinfo (vfio-pci → vfio_pci); normalise for the regex match.
+                normalised = name.replace("-", "_")
+                return bool(_re.search(rf"^{normalised}\s", ls.stdout, _re.MULTILINE))
+        except Exception:
+            pass
+        return False
+
+    out["vfio"] = {
+        "vfio_loaded": _module_loaded("vfio"),
+        "vfio_pci_loaded": _module_loaded("vfio-pci"),
+    }
+
+    # Hugepages
+    try:
+        with open("/proc/meminfo", "r") as f:
+            meminfo = f.read()
+        total = 0
+        free = 0
+        for line in meminfo.splitlines():
+            if line.startswith("HugePages_Total:"):
+                total = int(line.split()[1])
+            elif line.startswith("HugePages_Free:"):
+                free = int(line.split()[1])
+        out["hugepages"] = {"total": total, "free": free}
+    except Exception:
+        out["hugepages"] = {"total": 0, "free": 0}
+
+    # tx_worker binary
+    candidates = [
+        "/opt/netgen/resources/dpdk/tx_worker/build/tx_worker",
+        "/opt/OSTG/resources/dpdk/tx_worker/build/tx_worker",
+    ]
+    for p in candidates:
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            out["tx_worker"] = {"present": True, "path": p}
+            break
+
+    # Install state
+    proc = _ADMIN_INSTALL_STATE.get("process")
+    out["install_running"] = bool(proc and proc.poll() is None)
+    out["install_log_path"] = _ADMIN_INSTALL_STATE.get("log_path")
+
+    return jsonify(out)
+
+
+@app.route("/api/admin/install_dpdk", methods=["POST"])
+def api_admin_install_dpdk():
+    """Kick off install_dpdk.sh --auto in the background.
+
+    Returns immediately with a log path the client can poll.
+    Refuses if an install is already running.
+    """
+    import datetime as _dt
+
+    proc = _ADMIN_INSTALL_STATE.get("process")
+    if proc and proc.poll() is None:
+        return jsonify({
+            "error": "DPDK install is already running",
+            "log_path": _ADMIN_INSTALL_STATE.get("log_path"),
+        }), 409
+
+    # Resolve the script — same path order as the bind endpoints
+    candidates = [
+        "/opt/netgen/resources/dpdk/install_dpdk.sh",
+        "/opt/OSTG/resources/dpdk/install_dpdk.sh",
+    ]
+    script = next((p for p in candidates if os.path.isfile(p)), None)
+    if script is None:
+        return jsonify({"error": "install_dpdk.sh not found in /opt/netgen or /opt/OSTG"}), 404
+
+    timestamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = f"/tmp/netgen_install_dpdk_{timestamp}.log"
+
+    try:
+        log_fh = open(log_path, "w", buffering=1)  # line-buffered
+        env = os.environ.copy()
+        env["AUTO_MODE"] = "1"
+        new_proc = subprocess.Popen(
+            ["sudo", "-n", "bash", script, "--auto"],
+            stdout=log_fh, stderr=subprocess.STDOUT,
+            env=env, start_new_session=True,
+        )
+    except Exception as e:
+        return jsonify({"error": f"Failed to launch install: {e}"}), 500
+
+    _ADMIN_INSTALL_STATE["process"] = new_proc
+    _ADMIN_INSTALL_STATE["log_path"] = log_path
+    _ADMIN_INSTALL_STATE["started_at"] = _dt.datetime.now().isoformat()
+    _ADMIN_INSTALL_STATE["finished_at"] = None
+    _ADMIN_INSTALL_STATE["return_code"] = None
+
+    return jsonify({
+        "started": True,
+        "pid": new_proc.pid,
+        "log_path": log_path,
+        "started_at": _ADMIN_INSTALL_STATE["started_at"],
+    })
+
+
+@app.route("/api/admin/install_dpdk/log", methods=["GET"])
+def api_admin_install_dpdk_log():
+    """Return the tail of the running (or last) install log + status."""
+    log_path = _ADMIN_INSTALL_STATE.get("log_path")
+    if not log_path or not os.path.isfile(log_path):
+        return jsonify({"running": False, "log": "", "log_path": None})
+
+    proc = _ADMIN_INSTALL_STATE.get("process")
+    running = bool(proc and proc.poll() is None)
+    return_code = None
+    if proc is not None and not running:
+        return_code = proc.poll()
+        if _ADMIN_INSTALL_STATE.get("finished_at") is None:
+            import datetime as _dt
+            _ADMIN_INSTALL_STATE["finished_at"] = _dt.datetime.now().isoformat()
+            _ADMIN_INSTALL_STATE["return_code"] = return_code
+
+    # Cap log size in the response so we don't ship megabytes per poll.
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            tail = 64 * 1024  # last 64 KiB
+            f.seek(max(0, size - tail))
+            data = f.read().decode("utf-8", errors="replace")
+        if size > tail:
+            data = "[...log truncated to last 64 KiB...]\n" + data
+    except Exception as e:
+        data = f"[error reading log: {e}]"
+
+    return jsonify({
+        "running": running,
+        "return_code": return_code,
+        "log_path": log_path,
+        "started_at": _ADMIN_INSTALL_STATE.get("started_at"),
+        "finished_at": _ADMIN_INSTALL_STATE.get("finished_at"),
+        "log": data,
+    })
+
+
+_ADMIN_HTML = r"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Netgen Admin</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    :root {
+      --bg: #f3f4f6; --card: #ffffff; --ink: #1f2937; --muted: #6b7280;
+      --ok: #10b981; --warn: #f59e0b; --bad: #ef4444; --accent: #2563eb;
+      --border: #d1d5db;
+    }
+    * { box-sizing: border-box; }
+    body {
+      font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
+      margin: 0; padding: 24px; background: var(--bg); color: var(--ink);
+    }
+    h1 { margin: 0 0 4px; font-size: 22px; }
+    .sub { color: var(--muted); margin-bottom: 24px; font-size: 12px; }
+    .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); }
+    .card {
+      background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+      padding: 16px 18px; box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+    }
+    .card h2 { margin: 0 0 10px; font-size: 15px; font-weight: 600; }
+    .row { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; border-bottom: 1px dashed var(--border); }
+    .row:last-child { border-bottom: 0; }
+    .row .label { color: var(--muted); }
+    .pill { padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+    .pill.ok { background: #d1fae5; color: #065f46; }
+    .pill.bad { background: #fee2e2; color: #991b1b; }
+    .pill.warn { background: #fef3c7; color: #92400e; }
+    .actions { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+    button {
+      background: var(--accent); color: white; border: 0; border-radius: 6px;
+      padding: 8px 14px; font-size: 13px; font-weight: 500; cursor: pointer;
+    }
+    button.secondary { background: #6b7280; }
+    button.danger { background: var(--bad); }
+    button:hover { filter: brightness(0.95); }
+    button:disabled { background: #9ca3af; cursor: not-allowed; }
+    pre.log {
+      background: #111827; color: #e5e7eb; padding: 12px;
+      border-radius: 6px; max-height: 400px; overflow: auto;
+      font: 12px/1.5 ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+      white-space: pre-wrap; word-wrap: break-word;
+    }
+    input[type=number] { padding: 6px 8px; border: 1px solid var(--border); border-radius: 4px; width: 100px; }
+    .install-status { font-size: 12px; color: var(--muted); margin-top: 8px; }
+    .toast {
+      position: fixed; bottom: 24px; right: 24px; background: #1f2937; color: white;
+      padding: 10px 14px; border-radius: 6px; font-size: 12px; opacity: 0;
+      transition: opacity 0.2s; pointer-events: none;
+    }
+    .toast.show { opacity: 1; }
+  </style>
+</head>
+<body>
+  <h1>Netgen Admin</h1>
+  <div class="sub" id="hostname">Loading…</div>
+
+  <div class="grid">
+    <div class="card" id="dpdk-card">
+      <h2>DPDK Runtime</h2>
+      <div class="row"><span class="label">DPDK libraries</span><span class="pill" id="p-dpdk">…</span></div>
+      <div class="row"><span class="label">tx_worker binary</span><span class="pill" id="p-txworker">…</span></div>
+      <div class="row"><span class="label">Hugepages (total / free)</span><span id="p-hugepages">…</span></div>
+      <div class="actions">
+        <button id="btn-install-dpdk">Install DPDK</button>
+        <button class="secondary" id="btn-refresh">Refresh</button>
+      </div>
+      <div class="install-status" id="install-status"></div>
+    </div>
+
+    <div class="card">
+      <h2>Kernel Prereqs</h2>
+      <div class="row"><span class="label">IOMMU</span><span class="pill" id="p-iommu">…</span></div>
+      <div class="row"><span class="label">vfio module</span><span class="pill" id="p-vfio">…</span></div>
+      <div class="row"><span class="label">vfio_pci module</span><span class="pill" id="p-vfiopci">…</span></div>
+      <div class="actions">
+        <button id="btn-load-modules" class="secondary">Load VFIO Modules</button>
+        <button id="btn-config-iommu" class="danger">Configure IOMMU (reboots host)</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <h2>Hugepages</h2>
+      <p style="color: var(--muted); font-size: 12px; margin-top: 0;">
+        Reserve 2 MiB hugepages required by DPDK packet buffers. System-wide setting; affects other workloads on this host.
+      </p>
+      <label>Pages: <input type="number" id="hp-pages" value="1024" min="64" max="65536"></label>
+      <div class="actions">
+        <button id="btn-config-hp">Configure Hugepages</button>
+      </div>
+    </div>
+
+    <div class="card" style="grid-column: 1 / -1;">
+      <h2>Install Log</h2>
+      <pre class="log" id="log">No install in progress.</pre>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+    const pill = (el, ok, okText, badText) => {
+      el.classList.remove('ok', 'bad', 'warn');
+      if (ok === true) { el.classList.add('ok'); el.textContent = okText || '✓'; }
+      else { el.classList.add('bad'); el.textContent = badText || '✗'; }
+    };
+    const toast = (msg) => {
+      const t = $('toast'); t.textContent = msg; t.classList.add('show');
+      clearTimeout(toast._h); toast._h = setTimeout(() => t.classList.remove('show'), 2500);
+    };
+
+    let pollLogTimer = null;
+
+    async function refreshHealth() {
+      try {
+        const r = await fetch('/api/admin/health');
+        const d = await r.json();
+        $('hostname').textContent = `${d.hostname} — port ${d.netgen_server.port}`;
+        pill($('p-dpdk'), !!d.dpdk.installed,
+          d.dpdk.version ? `Installed (v${d.dpdk.version})` : 'Installed',
+          'Not installed');
+        pill($('p-txworker'), d.tx_worker.present, 'Built', 'Not built');
+        $('p-hugepages').textContent = `${d.hugepages.total} / ${d.hugepages.free}`;
+        $('p-hugepages').style.color = (d.hugepages.total === 0) ? 'var(--bad)' : 'var(--ink)';
+        pill($('p-iommu'), !!d.iommu.enabled, 'Enabled', 'Disabled');
+        pill($('p-vfio'), !!d.vfio.vfio_loaded, 'Loaded', 'Not loaded');
+        pill($('p-vfiopci'), !!d.vfio.vfio_pci_loaded, 'Loaded', 'Not loaded');
+
+        if (d.install_running && !pollLogTimer) {
+          $('btn-install-dpdk').disabled = true;
+          $('install-status').textContent = 'Install running…';
+          startLogPoll();
+        } else if (!d.install_running) {
+          $('btn-install-dpdk').disabled = false;
+        }
+      } catch (e) {
+        toast('Health fetch failed: ' + e);
+      }
+    }
+
+    async function pollLogOnce() {
+      try {
+        const r = await fetch('/api/admin/install_dpdk/log');
+        const d = await r.json();
+        const log = $('log');
+        log.textContent = d.log || '(no output yet)';
+        log.scrollTop = log.scrollHeight;
+        if (!d.running) {
+          stopLogPoll();
+          $('btn-install-dpdk').disabled = false;
+          if (d.return_code === 0) {
+            $('install-status').textContent = 'Install completed successfully';
+            toast('DPDK install completed');
+          } else if (d.return_code !== null) {
+            $('install-status').textContent = `Install exited with code ${d.return_code}`;
+            toast('Install failed (rc=' + d.return_code + ')');
+          }
+          refreshHealth();
+        } else {
+          $('install-status').textContent = 'Install running… (started ' + (d.started_at || '?') + ')';
+        }
+      } catch (e) {
+        toast('Log poll failed: ' + e);
+      }
+    }
+    function startLogPoll() {
+      stopLogPoll();
+      pollLogOnce();
+      pollLogTimer = setInterval(pollLogOnce, 2000);
+    }
+    function stopLogPoll() {
+      if (pollLogTimer) { clearInterval(pollLogTimer); pollLogTimer = null; }
+    }
+
+    $('btn-refresh').addEventListener('click', refreshHealth);
+
+    $('btn-install-dpdk').addEventListener('click', async () => {
+      if (!confirm('Run install_dpdk.sh on this server? Takes 10–20 minutes.')) return;
+      $('btn-install-dpdk').disabled = true;
+      $('install-status').textContent = 'Starting…';
+      $('log').textContent = 'Starting install…';
+      try {
+        const r = await fetch('/api/admin/install_dpdk', { method: 'POST' });
+        const d = await r.json();
+        if (!r.ok) {
+          toast('Install failed to start: ' + (d.error || r.status));
+          $('btn-install-dpdk').disabled = false;
+          return;
+        }
+        $('install-status').textContent = `Started (pid ${d.pid}). Log: ${d.log_path}`;
+        startLogPoll();
+      } catch (e) {
+        toast('Request failed: ' + e);
+        $('btn-install-dpdk').disabled = false;
+      }
+    });
+
+    $('btn-load-modules').addEventListener('click', async () => {
+      try {
+        const r = await fetch('/api/dpdk/load_modules', { method: 'POST' });
+        const d = await r.json();
+        toast(d.success ? 'VFIO modules loaded' : ('Failed: ' + (d.message || d.error || 'unknown')));
+        refreshHealth();
+      } catch (e) { toast('Load failed: ' + e); }
+    });
+
+    $('btn-config-iommu').addEventListener('click', async () => {
+      if (!confirm('Configure IOMMU? This edits GRUB and requires a host reboot.\n\nProceed?')) return;
+      try {
+        const r = await fetch('/api/dpdk/iommu', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ enable: true, reboot_after: false }),
+        });
+        const d = await r.json();
+        toast(d.success ? 'IOMMU configured (reboot required)' : ('Failed: ' + (d.message || d.error || 'unknown')));
+      } catch (e) { toast('Request failed: ' + e); }
+    });
+
+    $('btn-config-hp').addEventListener('click', async () => {
+      const n = parseInt($('hp-pages').value, 10);
+      if (!Number.isFinite(n) || n < 64) { toast('Enter a valid number of pages'); return; }
+      try {
+        const r = await fetch('/api/dpdk/hugepages', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ num_pages: n }),
+        });
+        const d = await r.json();
+        toast(d.success ? `Hugepages configured: ${n}` : ('Failed: ' + (d.message || d.error || 'unknown')));
+        refreshHealth();
+      } catch (e) { toast('Request failed: ' + e); }
+    });
+
+    // Initial render + auto-refresh every 30s.
+    refreshHealth();
+    setInterval(refreshHealth, 30000);
+  </script>
+</body>
+</html>
+"""
+
+
+@app.route("/admin", methods=["GET"])
+def admin_portal():
+    """Serve the single-page admin portal."""
+    from flask import Response
+    return Response(_ADMIN_HTML, mimetype="text/html")
+
+
 # ---- Explicit entry point used by 'ostg-server' ----
 def main(argv=None):
     import argparse, os
