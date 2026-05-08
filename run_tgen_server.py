@@ -12964,6 +12964,16 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
     }
     input[type=number] { padding: 6px 8px; border: 1px solid var(--border); border-radius: 4px; width: 100px; }
     .install-status { font-size: 12px; color: var(--muted); margin-top: 8px; }
+    table.iface { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 4px; }
+    table.iface th, table.iface td {
+      text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border);
+      vertical-align: middle;
+    }
+    table.iface th { background: #f9fafb; color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; }
+    table.iface td.mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace; font-size: 11px; }
+    table.iface tr:hover td { background: #f9fafb; }
+    table.iface button { padding: 4px 10px; font-size: 12px; }
+    .iface-empty { padding: 16px; color: var(--muted); text-align: center; font-style: italic; }
     .toast {
       position: fixed; bottom: 24px; right: 24px; background: #1f2937; color: white;
       padding: 10px 14px; border-radius: 6px; font-size: 12px; opacity: 0;
@@ -13009,6 +13019,19 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       <div class="actions">
         <button id="btn-config-hp">Configure Hugepages</button>
       </div>
+    </div>
+
+    <div class="card" style="grid-column: 1 / -1;">
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+        <h2 style="margin: 0;">Network Interfaces</h2>
+        <button class="secondary" id="btn-refresh-ifaces">Refresh</button>
+      </div>
+      <p style="color: var(--muted); font-size: 12px; margin: 4px 0 8px;">
+        Bind a kernel-driven NIC to <code>vfio-pci</code> so DPDK can drive it,
+        or release a DPDK-bound NIC back to its kernel driver. Binding the
+        management NIC will disconnect this server.
+      </p>
+      <div id="iface-table-wrap"><div class="iface-empty">Loading…</div></div>
     </div>
 
     <div class="card" style="grid-column: 1 / -1;">
@@ -13152,8 +13175,166 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       } catch (e) { toast('Request failed: ' + e); }
     });
 
-    // Initial render + auto-refresh every 30s.
+    // ----- Interface table (bind / unbind) -----
+    function ifaceState(iface) {
+      // Returns { label, pillClass, action } where action is 'bind' | 'unbind' | null
+      const driver = (iface.driver || '').toLowerCase();
+      const status = (iface.status || '').toLowerCase();
+      if (driver === 'vfio-pci' || driver === 'uio_pci_generic' || status === 'dpdk-bound') {
+        return { label: 'DPDK (' + driver + ')', pillClass: 'ok', action: 'unbind' };
+      }
+      if (status === 'unbound' || (!driver && iface.kernel_driver)) {
+        return { label: 'Unbound', pillClass: 'warn', action: 'unbind' };
+      }
+      // Kernel-bound (default case)
+      return { label: 'Kernel (' + (driver || 'unknown') + ')', pillClass: 'bad', action: 'bind' };
+    }
+
+    function escapeHtml(s) {
+      return String(s == null ? '' : s)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+    }
+
+    async function refreshInterfaces() {
+      const wrap = $('iface-table-wrap');
+      wrap.innerHTML = '<div class="iface-empty">Loading…</div>';
+      try {
+        const r = await fetch('/api/dpdk/interfaces');
+        if (!r.ok) {
+          wrap.innerHTML = '<div class="iface-empty">Failed to load interfaces (HTTP ' + r.status + ')</div>';
+          return;
+        }
+        const d = await r.json();
+        const list = d.interfaces || [];
+        if (!list.length) {
+          wrap.innerHTML = '<div class="iface-empty">No interfaces reported.</div>';
+          return;
+        }
+        const rows = list.map((i, idx) => {
+          const s = ifaceState(i);
+          const name = i.name && i.name !== 'N/A' ? i.name : '(no interface)';
+          const vendor = i.vendor || i.vendor_name || '—';
+          const pci = i.pci || '—';
+          const kdrv = i.kernel_driver || '—';
+          let actionBtn = '';
+          if (s.action === 'bind') {
+            actionBtn = `<button data-idx="${idx}" data-action="bind">Bind to DPDK</button>`;
+          } else if (s.action === 'unbind') {
+            actionBtn = `<button data-idx="${idx}" data-action="unbind" class="secondary">Unbind</button>`;
+          }
+          return `
+            <tr>
+              <td><b>${escapeHtml(name)}</b></td>
+              <td class="mono">${escapeHtml(pci)}</td>
+              <td>${escapeHtml(vendor)}</td>
+              <td><span class="pill ${s.pillClass}">${escapeHtml(s.label)}</span></td>
+              <td class="mono">${escapeHtml(kdrv)}</td>
+              <td>${actionBtn}</td>
+            </tr>`;
+        }).join('');
+        wrap.innerHTML = `
+          <table class="iface">
+            <thead><tr><th>Interface</th><th>PCI</th><th>Vendor</th><th>State</th><th>Kernel driver</th><th></th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>`;
+        // Stash the list so click handlers can look up by index.
+        wrap._ifaces = list;
+      } catch (e) {
+        wrap.innerHTML = '<div class="iface-empty">Error: ' + escapeHtml(String(e)) + '</div>';
+      }
+    }
+
+    async function bindInterface(iface, force) {
+      const payload = { interface: iface.name, force: !!force };
+      if (iface.pci && iface.pci !== 'N/A' && iface.pci.includes(':')) {
+        payload.pci = iface.pci;
+      }
+      const r = await fetch('/api/dpdk/bind', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify(payload),
+      });
+      const text = await r.text();
+      let data = {};
+      try { data = JSON.parse(text); } catch (_) {}
+      const all = ((data.message || '') + ' ' + (data.output || '') + ' ' + text).toLowerCase();
+
+      // Mirror the desktop client's safety prompt: if the server warns about
+      // active routes (would disrupt connectivity), ask the user before
+      // re-trying with force=true.
+      if (!force && (all.includes('active routes') || all.includes('disrupt network connectivity'))) {
+        const proceed = confirm(
+          `Interface ${iface.name} has active routes. Binding will disrupt network connectivity.\n\n` +
+          `Force bind anyway?`
+        );
+        if (proceed) {
+          return bindInterface(iface, true);
+        }
+        toast('Bind cancelled');
+        return;
+      }
+
+      if (r.ok && data.success) {
+        toast(`Bound ${iface.name} to DPDK`);
+      } else {
+        toast(`Bind failed: ${data.message || data.error || 'HTTP ' + r.status}`);
+      }
+      refreshInterfaces();
+      refreshHealth();
+    }
+
+    async function unbindInterface(iface) {
+      const payload = {
+        interface: iface.name && iface.name !== 'N/A' ? iface.name : null,
+        pci: iface.pci && iface.pci !== 'N/A' ? iface.pci : null,
+        kernel_driver: iface.kernel_driver || '',
+      };
+      try {
+        const r = await fetch('/api/dpdk/unbind', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(payload),
+        });
+        const data = await r.json();
+        if (r.ok && data.success) {
+          toast(`Unbound ${iface.name || iface.pci}`);
+        } else {
+          toast(`Unbind failed: ${data.message || data.error || 'HTTP ' + r.status}`);
+        }
+      } catch (e) {
+        toast('Unbind request failed: ' + e);
+      }
+      refreshInterfaces();
+      refreshHealth();
+    }
+
+    document.addEventListener('click', (ev) => {
+      const btn = ev.target.closest('button[data-action]');
+      if (!btn) return;
+      const wrap = $('iface-table-wrap');
+      const idx = parseInt(btn.dataset.idx, 10);
+      const iface = (wrap._ifaces || [])[idx];
+      if (!iface) return;
+      const action = btn.dataset.action;
+      if (action === 'bind') {
+        if (!confirm(`Bind ${iface.name || iface.pci} to vfio-pci? It will become invisible to the kernel.`)) return;
+        btn.disabled = true;
+        bindInterface(iface, false).finally(() => { btn.disabled = false; });
+      } else if (action === 'unbind') {
+        const target = iface.kernel_driver || '(no kernel driver — device will remain unbound)';
+        if (!confirm(`Unbind ${iface.name || iface.pci} and restore to ${target}?`)) return;
+        btn.disabled = true;
+        unbindInterface(iface).finally(() => { btn.disabled = false; });
+      }
+    });
+
+    $('btn-refresh-ifaces').addEventListener('click', refreshInterfaces);
+
+    // Initial render + auto-refresh every 30s. Interface list refreshes on
+    // demand only (bind/unbind triggers a refresh; otherwise the user can
+    // hit the Refresh button) — avoid hammering the server every 30s for
+    // a list that rarely changes.
     refreshHealth();
+    refreshInterfaces();
     setInterval(refreshHealth, 30000);
   </script>
 </body>
