@@ -9,6 +9,13 @@ logging.basicConfig(
 # Disable DEBUG messages from urllib3 and other verbose libraries
 logging.getLogger('urllib3').setLevel(logging.WARNING)
 logging.getLogger('requests').setLevel(logging.WARNING)
+# urllib3.connectionpool emits a WARNING for every retry attempt
+# ("Retrying (Retry(total=2, ...)) after connection broken by ..."). On a busy
+# server those fire 5-10x/min as requests cross their timeouts before the
+# retry layer recovers them. The retries are working as designed; the warnings
+# are internal chatter. Push to ERROR — final, unrecoverable failures still
+# surface through application code (which logs them at INFO/ERROR itself).
+logging.getLogger('urllib3.connectionpool').setLevel(logging.ERROR)
 
 logger = logging.getLogger(__name__)
 
