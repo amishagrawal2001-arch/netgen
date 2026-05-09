@@ -100,7 +100,14 @@ def run_stream(
     # Pick device & NUMA
     bdf = _iface_to_bdf(interface)
     numa = _bdf_numa_node(bdf) if bdf else 0
-    corelist = dpdk_corelist or str(stream_data.get("dpdk_corelist") or _pick_corelist_on_node(numa))
+
+    # Multi-queue scaling: tx_cores TX queues = tx_cores worker threads.
+    # EAL needs (1 main + tx_cores workers) lcores total.
+    tx_cores = _resolve_tx_cores(stream_data)
+    needed_lcores = 1 + tx_cores
+    corelist = (dpdk_corelist
+                or str(stream_data.get("dpdk_corelist") or "")
+                or _pick_corelist_on_node(numa, count=needed_lcores))
 
     # Resolve tx_worker binary (env → packaged → relative fallbacks)
     bin_path = tx_worker_bin or _resolve_tx_worker_bin()
@@ -188,6 +195,8 @@ def run_stream(
                 cmd += ["--burst", str(b)]
         except Exception:
             pass
+    if tx_cores > 1:
+        cmd += ["--tx-cores", str(tx_cores)]
 
     # Environment (allow caller to inject EAL/PMD paths etc.)
     child_env = os.environ.copy()
@@ -558,11 +567,16 @@ def _bdf_numa_node(bdf: str) -> int:
         pass
     return 0
 
-def _pick_corelist_on_node(numa_node: int) -> str:
+def _pick_corelist_on_node(numa_node: int, count: int = 2) -> str:
     """
-    Quick default: prefer two cores on the requested NUMA node if discoverable.
-    Fallback to '0,2' (common on HT systems).
+    Pick `count` distinct CPUs on the requested NUMA node, comma-joined for EAL -l.
+    Falls back to a sensible default ('0,2,4,6,...' truncated to count) if lscpu fails.
+
+    The first core in the returned list is the EAL main lcore; the remaining
+    (count - 1) become tx_worker worker lcores driving N TX queues.
     """
+    if count < 2:
+        count = 2
     try:
         out = subprocess.check_output(["lscpu", "-e=CPU,NODE"], text=True)
         cores = []
@@ -573,11 +587,15 @@ def _pick_corelist_on_node(numa_node: int) -> str:
             cpu, node = parts
             if str(node) == str(numa_node):
                 cores.append(int(cpu))
+        if len(cores) >= count:
+            return ",".join(str(c) for c in cores[:count])
         if len(cores) >= 2:
-            return f"{cores[0]},{cores[1]}"
+            # not enough on this node — use what we have
+            return ",".join(str(c) for c in cores)
     except Exception:
         pass
-    return "0,2"
+    # Generic even-numbered fallback (avoids HT siblings on most x86 layouts)
+    return ",".join(str(2 * i) for i in range(count))
 
 def _first_from(*pairs, default=None):
     for d, key in pairs:
@@ -648,6 +666,36 @@ def _resolve_l2_l3_l4(stream_data: Dict[str, Any]) -> Dict[str, Any]:
         udp_sport=udp_sport, udp_dport=udp_dport,
         vlan_id=vlan_id, frame_size=frame_size,
     )
+
+def _resolve_tx_cores(stream_data: Dict[str, Any]) -> int:
+    """
+    Number of TX worker threads (= TX queues) inside the tx_worker process.
+
+    Default 1 (single queue, backwards-compatible). Higher values let a single
+    NIC port saturate higher line rates by spreading TX across multiple queues
+    and lcores.
+
+    Reads (in order):
+      stream_data['dpdk_tx_cores']
+      stream_data['protocol_selection']['dpdk_tx_cores']
+      env DPDK_TX_CORES
+    """
+    candidates = []
+    candidates.append(stream_data.get("dpdk_tx_cores"))
+    ps = stream_data.get("protocol_selection", {}) or {}
+    candidates.append(ps.get("dpdk_tx_cores"))
+    candidates.append(os.environ.get("DPDK_TX_CORES"))
+    for v in candidates:
+        if v in (None, ""):
+            continue
+        try:
+            n = int(v)
+            if n >= 1:
+                return min(n, 32)  # MAX_TX_WORKERS in tx_worker.c
+        except Exception:
+            pass
+    return 1
+
 
 def _resolve_target_pps(stream_data: Dict[str, Any]) -> int:
     """
