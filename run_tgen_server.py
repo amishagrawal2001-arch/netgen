@@ -13177,9 +13177,26 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
 
     // ----- Interface table (bind / unbind) -----
     function ifaceState(iface) {
-      // Returns { label, pillClass, action } where action is 'bind' | 'unbind' | null
+      // Returns { label, pillClass, action, hint? } where action is
+      //   'bind'   — show "Bind to DPDK" button
+      //   'unbind' — show "Unbind" button
+      //   null     — no button (e.g. Mellanox, where binding is the wrong move)
       const driver = (iface.driver || '').toLowerCase();
       const status = (iface.status || '').toLowerCase();
+
+      // Mellanox / NVIDIA NICs use the mlx5 PMD, which talks to the NIC
+      // via libibverbs while the kernel driver stays loaded. Binding to
+      // vfio-pci would actually break DPDK. Surface the NIC as ready, no
+      // bind needed.
+      if (driver === 'mlx5_core' || driver === 'mlx4_core') {
+        return {
+          label: 'DPDK-ready (kernel ' + driver + ')',
+          pillClass: 'ok',
+          action: null,
+          hint: 'Mellanox / NVIDIA NIC. mlx5 PMD uses libibverbs over the kernel driver — no bind required.',
+        };
+      }
+
       if (driver === 'vfio-pci' || driver === 'uio_pci_generic' || status === 'dpdk-bound') {
         return { label: 'DPDK (' + driver + ')', pillClass: 'ok', action: 'unbind' };
       }
@@ -13222,6 +13239,8 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
             actionBtn = `<button data-idx="${idx}" data-action="bind">Bind to DPDK</button>`;
           } else if (s.action === 'unbind') {
             actionBtn = `<button data-idx="${idx}" data-action="unbind" class="secondary">Unbind</button>`;
+          } else if (s.hint) {
+            actionBtn = `<span style="color: var(--muted); font-size: 11px;" title="${escapeHtml(s.hint)}">no bind needed</span>`;
           }
           return `
             <tr>
