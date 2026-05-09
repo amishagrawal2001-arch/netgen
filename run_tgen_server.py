@@ -307,7 +307,21 @@ def stream_stats():
                 frame_size = int(frame_size)
             except (ValueError, TypeError):
                 frame_size = 64
-            
+
+            # Extract DPDK engine info so the client can show what's actually
+            # running (single-queue scapy/kernel vs multi-queue tx_worker).
+            dpdk_enable = bool(
+                stream_data.get("dpdk_enable")
+                or protocol_selection.get("dpdk_enable")
+                or str(stream_data.get("engine") or "").strip().lower() == "dpdk"
+            )
+            try:
+                dpdk_tx_cores = int(stream_data.get("dpdk_tx_cores") or 1)
+                if dpdk_tx_cores < 1:
+                    dpdk_tx_cores = 1
+            except (ValueError, TypeError):
+                dpdk_tx_cores = 1
+
             # Verify stream is actually running in stream_tracker
             stream_id = stream.get("stream_id")
             interface = stream.get("interface")
@@ -356,6 +370,9 @@ def stream_stats():
                 "started_at": stream.get("started_at"),
                 "updated_at": stream.get("updated_at"),
                 "frame_size": frame_size,  # Add frame_size for accurate byte calculations
+                # Engine surface (so the client can render a multi-queue badge)
+                "dpdk_enable": dpdk_enable,
+                "dpdk_tx_cores": dpdk_tx_cores,
                 # Add internal fields for debugging
                 "last_tx_count": stream.get("last_tx_count"),
                 "last_rx_count": stream.get("last_rx_count"),
