@@ -124,11 +124,11 @@ static int tx_loop(void *arg){
                 if ((uint32_t)n < payload_len) memset(pl + n, 0, payload_len - (uint32_t)n);
             }
 
-            if (tx_off & DEV_TX_OFFLOAD_IPV4_CKSUM) {
+            if (tx_off & RTE_ETH_TX_OFFLOAD_IPV4_CKSUM) {
                 m->ol_flags |= RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_IP_CKSUM;
                 m->l2_len = l2_len; m->l3_len = l3_len; m->l4_len = l4_len;
             }
-            if ((tx_off & DEV_TX_OFFLOAD_UDP_CKSUM) && !no_udp_csum) {
+            if ((tx_off & RTE_ETH_TX_OFFLOAD_UDP_CKSUM) && !no_udp_csum) {
                 m->ol_flags |= RTE_MBUF_F_TX_UDP_CKSUM;
                 m->l2_len = l2_len; m->l3_len = l3_len; m->l4_len = l4_len;
             }
@@ -249,7 +249,7 @@ int main(int argc, char **argv){
     }
 
     /* Enable HW checksum offloads if present */
-    uint64_t want_tx_off = DEV_TX_OFFLOAD_IPV4_CKSUM | (no_udp_csum ? 0 : DEV_TX_OFFLOAD_UDP_CKSUM);
+    uint64_t want_tx_off = RTE_ETH_TX_OFFLOAD_IPV4_CKSUM | (no_udp_csum ? 0 : RTE_ETH_TX_OFFLOAD_UDP_CKSUM);
     uint64_t tx_off      = dev_info.tx_offload_capa & want_tx_off;
 
     struct rte_eth_conf port_conf;
@@ -323,12 +323,12 @@ int main(int argc, char **argv){
     udp->dgram_len = rte_cpu_to_be_16(l4_len + payload_len);
 
     /* Checksums (template). If HW offload, leave zero and set mbuf flags per packet. */
-    if (tx_off & DEV_TX_OFFLOAD_IPV4_CKSUM) ip->hdr_checksum = 0; else ip->hdr_checksum = csum_ip4(ip);
+    if (tx_off & RTE_ETH_TX_OFFLOAD_IPV4_CKSUM) ip->hdr_checksum = 0; else ip->hdr_checksum = csum_ip4(ip);
     if (no_udp_csum) {
         udp->dgram_cksum = 0;
-        tx_off &= ~DEV_TX_OFFLOAD_UDP_CKSUM;
+        tx_off &= ~RTE_ETH_TX_OFFLOAD_UDP_CKSUM;
     } else {
-        if (tx_off & DEV_TX_OFFLOAD_UDP_CKSUM) udp->dgram_cksum = 0;
+        if (tx_off & RTE_ETH_TX_OFFLOAD_UDP_CKSUM) udp->dgram_cksum = 0;
         else udp->dgram_cksum = csum_udp4(ip, udp);
     }
 
