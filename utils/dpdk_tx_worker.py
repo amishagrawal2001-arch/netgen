@@ -130,8 +130,42 @@ def run_stream(
     file_prefix = _file_prefix(stream_id, interface)
     LOG.debug("[dpdk] using file-prefix: %s", file_prefix)
 
+    # Detect if this is a Broadcom BNXT NIC and apply workarounds for ULP initialization issues
+    is_broadcom = False
+    if bdf:
+        # Check vendor ID to detect Broadcom NICs (vendor ID 14e4)
+        try:
+            vendor_file = f"/sys/bus/pci/devices/{bdf}/vendor"
+            if os.path.exists(vendor_file):
+                with open(vendor_file, "r") as f:
+                    vendor_id = f.read().strip()
+                    if vendor_id == "0x14e4":  # Broadcom
+                        is_broadcom = True
+                        LOG.info("[dpdk] Broadcom BNXT NIC detected (PCI: %s), applying ULP workarounds", bdf)
+                        
+                        # Workaround 1: Try to reset the device before DPDK initialization
+                        # This can help clear any stale state that causes ULP allocation failures
+                        try:
+                            reset_file = f"/sys/bus/pci/devices/{bdf}/reset"
+                            if os.path.exists(reset_file):
+                                LOG.debug("[dpdk] Attempting PCI device reset for Broadcom NIC")
+                                with open(reset_file, "w") as rf:
+                                    rf.write("1")
+                                import time
+                                time.sleep(0.5)  # Brief pause after reset
+                                LOG.debug("[dpdk] PCI device reset completed")
+                        except Exception as e:
+                            LOG.debug("[dpdk] PCI reset not available or failed: %s", e)
+                        
+                        # Workaround 2: Some BNXT PMDs support device parameters via -a option
+                        # Format: -a <BDF>,param1=value1,param2=value2
+                        # However, we'll try without parameters first and let the error handler suggest alternatives
+        except Exception as e:
+            LOG.debug("[dpdk] Vendor detection failed: %s", e)
+    
     # Build command
     cmd = [bin_path, "-l", str(corelist), "-n", mem_channels, "--file-prefix", file_prefix]
+    
     if bdf:
         # On mlx5 you should *not* bind to vfio; passing -a <BDF> with kernel driver is fine.
         cmd += ["-a", bdf]
@@ -160,12 +194,101 @@ def run_stream(
     if env:
         child_env.update(env)
 
-    # Helpful defaults if user didn’t set them
+    # Helpful defaults if user didn't set them
     child_env.setdefault("RTE_DISABLE_MEMPOOL_OPS", "1")   # avoids missing shared objs on some hosts
-    # You may add library path hints here if you ship PMDs:
-    # child_env.setdefault("LD_LIBRARY_PATH", "/usr/local/lib:/usr/lib")
+    
+    # Set LD_LIBRARY_PATH to include DPDK libraries
+    # Try multiple methods to find DPDK library directory
+    current_ld_path = child_env.get("LD_LIBRARY_PATH", "")
+    dpdk_lib_paths = []
+    
+    # Method 1: Use pkg-config to find DPDK library directory
+    try:
+        import subprocess
+        pkg_config_paths = [
+            "/usr/local/lib/x86_64-linux-gnu/pkgconfig",
+            "/usr/local/lib/pkgconfig",
+            "/usr/lib/x86_64-linux-gnu/pkgconfig",
+            "/usr/lib/pkgconfig"
+        ]
+        for pc_path in pkg_config_paths:
+            if os.path.exists(pc_path):
+                env_pc = os.environ.copy()
+                env_pc["PKG_CONFIG_PATH"] = f"{pc_path}:{env_pc.get('PKG_CONFIG_PATH', '')}"
+                result = subprocess.run(
+                    ["pkg-config", "--variable=libdir", "libdpdk"],
+                    env=env_pc,
+                    capture_output=True,
+                    text=True,
+                    timeout=2
+                )
+                if result.returncode == 0:
+                    libdir = result.stdout.strip()
+                    if libdir and os.path.exists(libdir) and libdir not in dpdk_lib_paths:
+                        dpdk_lib_paths.append(libdir)
+                        LOG.debug("[dpdk] Found DPDK libdir via pkg-config: %s", libdir)
+                    break
+    except Exception as e:
+        LOG.debug("[dpdk] pkg-config method failed: %s", e)
+    
+    # Method 2: Check common locations for DPDK libraries
+    common_paths = [
+        "/usr/local/lib/x86_64-linux-gnu",
+        "/usr/local/lib",
+        "/usr/lib/x86_64-linux-gnu",
+        "/usr/lib"
+    ]
+    for lib_path in common_paths:
+        if os.path.exists(lib_path):
+            # Check if this directory contains DPDK libraries
+            try:
+                files = os.listdir(lib_path)
+                if any(f.startswith("librte_") and f.endswith(".so") or ".so." in f for f in files):
+                    if lib_path not in dpdk_lib_paths:
+                        dpdk_lib_paths.append(lib_path)
+                        LOG.debug("[dpdk] Found DPDK libraries in: %s", lib_path)
+            except Exception:
+                pass
+    
+    # Method 3: Use ldconfig to find librte_ethdev.so
+    try:
+        result = subprocess.run(
+            ["ldconfig", "-p"],
+            capture_output=True,
+            text=True,
+            timeout=2
+        )
+        if result.returncode == 0:
+            for line in result.stdout.splitlines():
+                if "librte_ethdev.so" in line:
+                    # Extract path from ldconfig output (format: "librte_ethdev.so.22 (libc6,x86-64) => /path/to/lib.so.22")
+                    parts = line.split("=>")
+                    if len(parts) == 2:
+                        lib_file = parts[1].strip()
+                        lib_dir = os.path.dirname(lib_file)
+                        if lib_dir and os.path.exists(lib_dir) and lib_dir not in dpdk_lib_paths:
+                            dpdk_lib_paths.append(lib_dir)
+                            LOG.debug("[dpdk] Found DPDK library via ldconfig: %s", lib_dir)
+                            break
+    except Exception as e:
+        LOG.debug("[dpdk] ldconfig method failed: %s", e)
+    
+    # Add paths that aren't already in LD_LIBRARY_PATH
+    for lib_path in dpdk_lib_paths:
+        if lib_path not in current_ld_path:
+            if current_ld_path:
+                current_ld_path = f"{lib_path}:{current_ld_path}"
+            else:
+                current_ld_path = lib_path
+    
+    if current_ld_path:
+        child_env["LD_LIBRARY_PATH"] = current_ld_path
+        LOG.info("[dpdk] Setting LD_LIBRARY_PATH=%s", current_ld_path)
+    else:
+        LOG.warning("[dpdk] Could not find DPDK library directory. LD_LIBRARY_PATH not set.")
 
     LOG.info("[dpdk] exec: %s", shlex.join(cmd))
+    LOG.info("[dpdk] LD_LIBRARY_PATH=%s", child_env.get("LD_LIBRARY_PATH", "not set"))
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -176,7 +299,12 @@ def run_stream(
     )
 
     # Parse "STAT ..." lines to sync StreamTracker
+    # Match: "STAT stream=... tx=123 drop=0 ..." or "STAT_FINAL stream=... tx=123 drop=0"
     stat_re = re.compile(r"^STAT(?:_FINAL)?\s+.*?\bstream=(\S+)\s+tx=(\d+)\s+drop=(\d+)")
+    
+    # Track if we've seen any output (to detect immediate failures)
+    seen_output = False
+    error_lines = []
 
     try:
         for line in proc.stdout:  # type: ignore[arg-type]
@@ -185,9 +313,28 @@ def run_stream(
             line = line.rstrip()
             if not line:
                 continue
+            
+            seen_output = True
+            
+            # Log EAL initialization messages at debug level, but capture errors
             if line.startswith("EAL:"):
-                LOG.debug(line)
+                # Check for common EAL errors and log them at warning/error level
+                if "No free" in line and "hugepages" in line:
+                    LOG.error("[dpdk] %s", line)
+                    LOG.error("[dpdk] Hugepages not configured. Configure hugepages using:")
+                    LOG.error("[dpdk]   echo 1024 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages")
+                    LOG.error("[dpdk]   echo 'vm.nr_hugepages=1024' >> /etc/sysctl.conf")
+                elif "No DPDK ports" in line or "No available" in line:
+                    LOG.error("[dpdk] %s", line)
+                    LOG.error("[dpdk] Device not bound to DPDK. Bind the device using:")
+                    LOG.error("[dpdk]   Use 'Bind Interface to DPDK' in the DPDK menu")
+                elif "Error" in line or "error" in line or "failed" in line:
+                    LOG.error("[dpdk] %s", line)
+                else:
+                    LOG.debug("[dpdk] %s", line)
                 continue
+            
+            # Parse STAT lines for statistics
             m = stat_re.search(line)
             if m:
                 tx_abs = int(m.group(2))
@@ -195,14 +342,52 @@ def run_stream(
                 current = _safe_get_tx(tracker, interface, stream_id)
                 delta = max(tx_abs - current, 0)
                 if delta:
-                    for _ in range(delta):
-                        tracker.update_tx_by_id(interface, stream_id)
-                LOG.debug("[dpdk] %s tx=%s (delta=%s)", stream_id, tx_abs, delta)
+                    # Use batch update to reduce lock contention and improve performance
+                    tracker.update_tx_by_id(interface, stream_id, count=delta)
+                LOG.debug("[dpdk] STAT: stream=%s tx_abs=%s current=%s delta=%s", stream_id, tx_abs, current, delta)
+                continue
+            
+            # Log all other lines (errors, warnings, etc.)
+            # Check for common error patterns
+            line_lower = line.lower()
+            if any(keyword in line_lower for keyword in ["error", "failed", "fail", "cannot", "unable", "invalid", "not found", "missing"]):
+                LOG.error("[dpdk] %s", line)
+                error_lines.append(line)
+            elif any(keyword in line_lower for keyword in ["warning", "warn"]):
+                LOG.warning("[dpdk] %s", line)
+            else:
+                # Log other output at info level (might be useful for debugging)
+                LOG.info("[dpdk] %s", line)
 
             if stop_event.is_set():
                 break
+        
+        # Check if process exited immediately without output (likely a failure)
+        if not seen_output:
+            # Wait a moment to see if process exits
+            import time
+            time.sleep(0.5)
+            if proc.poll() is not None:
+                rc = proc.returncode
+                if rc != 0:
+                    LOG.error("[dpdk] tx_worker exited immediately with code %d (no output captured)", rc)
+                    LOG.error("[dpdk] This usually indicates:")
+                    LOG.error("[dpdk]   - Missing libraries (check LD_LIBRARY_PATH)")
+                    LOG.error("[dpdk]   - Permission denied (need root/sudo)")
+                    LOG.error("[dpdk]   - Invalid command arguments")
+                    LOG.error("[dpdk]   - Device not bound to DPDK")
+                    error_lines.append(f"Process exited with code {rc} (no output)")
+                    # Try to read any remaining output
+                    try:
+                        remaining = proc.stdout.read() if proc.stdout else ""
+                        if remaining:
+                            LOG.error("[dpdk] Remaining output: %s", remaining)
+                            error_lines.append(f"Output: {remaining}")
+                    except Exception:
+                        pass
     except Exception as e:  # defensive
         LOG.warning("[dpdk] stdout reader error: %s", e)
+        error_lines.append(f"Error reading output: {e}")
     finally:
         # Try to shutdown cleanly
         if proc.poll() is None:
@@ -219,7 +404,35 @@ def run_stream(
                     pass
 
     rc = proc.returncode if proc.returncode is not None else 0
-    LOG.info("[dpdk] stream '%s' (id=%s) finished, rc=%s", stream_name, stream_id, rc)
+    
+    # Check for BNXT ULP errors - return special code for automatic fallback
+    is_broadcom_ulp_error = False
+    if rc != 0 and error_lines:
+        error_text = "\n".join(error_lines).lower()
+        if "bnxt" in error_text and ("ulp" in error_text or "stats cache" in error_text or "timeout" in error_text or "-110" in error_text or "hwrm" in error_text):
+            is_broadcom_ulp_error = True
+    
+    # Log final status with error details if any
+    if rc != 0:
+        LOG.error("[dpdk] stream '%s' (id=%s) failed with exit code %s", stream_name, stream_id, rc)
+        if error_lines:
+            LOG.error("[dpdk] Error details:")
+            for err_line in error_lines:
+                LOG.error("[dpdk]   %s", err_line)
+            
+            if is_broadcom_ulp_error:
+                LOG.error("[dpdk] ⚠️  BNXT ULP initialization error detected")
+                LOG.error("[dpdk] This is a known issue with some Broadcom NICs (vendor 14e4)")
+                LOG.error("[dpdk] The error 'Failed to allocate stats cache table' indicates a firmware/driver issue.")
+                LOG.error("[dpdk] Automatically falling back to Scapy backend...")
+                LOG.error("[dpdk] Note: To permanently use Scapy, uncheck 'Use DPDK' in the stream configuration")
+    else:
+        LOG.info("[dpdk] stream '%s' (id=%s) finished successfully, rc=%s", stream_name, stream_id, rc)
+    
+    # Return special exit code 100 for Broadcom ULP errors (triggers automatic Scapy fallback)
+    if is_broadcom_ulp_error:
+        return 100
+    
     return rc
 
 
@@ -256,12 +469,23 @@ def _resolve_duration_seconds(stream_data: Dict[str, Any]) -> Optional[int]:
 
 def _resolve_tx_worker_bin() -> str:
     """
-    Search order:
-      1) $TX_WORKER_BIN if file exists
-      2) importlib.resources: resources.dpdk.tx_worker/build/tx_worker (installed package)
-      3) path relative to this file: ../resources/dpdk/tx_worker/build/tx_worker
-      4) CWD fallback: ./resources/dpdk/tx_worker/build/tx_worker
-      5) Legacy local tree: ./tx_worker/build/tx_worker
+    Search order — prefer freshly-rebuilt install-dir binaries over the wheel-
+    shipped one, because the wheel's tx_worker is built against an old DPDK
+    ABI (e.g. so.22) but a fresh `install_dpdk.sh` build links against the
+    currently-installed DPDK (e.g. so.24). Picking the wheel binary on a box
+    where DPDK was rebuilt produces:
+        error while loading shared libraries: librte_ethdev.so.22:
+        cannot open shared object file
+    and exit code 127.
+
+    Order:
+      1) $TX_WORKER_BIN if file exists                             — explicit override
+      2) /opt/netgen/resources/dpdk/tx_worker/build/tx_worker      — current install dir
+      3) /opt/OSTG/resources/dpdk/tx_worker/build/tx_worker        — legacy install dir
+      4) importlib.resources: resources.dpdk.tx_worker (wheel)     — likely stale ABI
+      5) path relative to this file
+      6) CWD fallback
+      7) Legacy local tree (./tx_worker/build/tx_worker)
     """
     # 1) explicit env override
     p = os.environ.get("TX_WORKER_BIN")
@@ -269,7 +493,14 @@ def _resolve_tx_worker_bin() -> str:
         LOG.debug("[dpdk] TX_WORKER_BIN=%s", p)
         return os.path.abspath(p)
 
-    # 2) packaged resource
+    # 2-3) install-dir binaries (rebuilt by install_dpdk.sh against current DPDK)
+    for install_dir in ("/opt/netgen", "/opt/OSTG"):
+        cand = os.path.join(install_dir, "resources", "dpdk", "tx_worker", "build", "tx_worker")
+        if os.path.exists(cand):
+            LOG.debug("[dpdk] using install-dir tx_worker: %s", cand)
+            return os.path.abspath(cand)
+
+    # 4) packaged resource (wheel-shipped — fallback only; ABI may be stale)
     try:
         # Python 3.9+: importlib.resources.files
         try:
@@ -277,6 +508,7 @@ def _resolve_tx_worker_bin() -> str:
             pkg = "resources.dpdk.tx_worker"
             rp = _res_files(pkg) / "build" / "tx_worker"
             if rp and os.path.exists(rp.as_posix()):
+                LOG.debug("[dpdk] falling back to wheel tx_worker: %s (may have stale DPDK ABI)", rp.as_posix())
                 return os.path.abspath(rp.as_posix())
         except Exception:
             # Back-compat: importlib.resources.path
@@ -288,18 +520,18 @@ def _resolve_tx_worker_bin() -> str:
     except Exception as e:
         LOG.debug("[dpdk] importlib.resources lookup failed: %s", e)
 
-    # 3) relative to this file (site-packages layout has ../resources/…)
+    # 5) relative to this file (site-packages layout has ../resources/…)
     here = os.path.dirname(__file__)
     cand = os.path.abspath(os.path.join(here, "..", "resources", "dpdk", "tx_worker", "build", "tx_worker"))
     if os.path.exists(cand):
         return cand
 
-    # 4) cwd fallback
+    # 6) cwd fallback
     cand = os.path.abspath(os.path.join(os.getcwd(), "resources", "dpdk", "tx_worker", "build", "tx_worker"))
     if os.path.exists(cand):
         return cand
 
-    # 5) legacy local tree
+    # 7) legacy local tree
     cand = os.path.abspath(os.path.join(os.getcwd(), "tx_worker", "build", "tx_worker"))
     if os.path.exists(cand):
         return cand
