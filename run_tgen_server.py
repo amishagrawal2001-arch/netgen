@@ -13339,14 +13339,16 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       const wrap = $('iface-table-wrap');
       wrap.innerHTML = '<div class="iface-empty">Loading…</div>';
       try {
-        // Three parallel fetches:
+        // Four parallel fetches:
         //   /api/dpdk/interfaces      — base list
         //   /api/admin/bind_history   — original names for vfio-pci bound rows
         //   /api/admin/interface_ips  — per-iface IP addresses
-        const [r, hr, ipr] = await Promise.all([
+        //   /api/streams/stats        — running streams (for TX queues badge)
+        const [r, hr, ipr, sr] = await Promise.all([
           fetch('/api/dpdk/interfaces'),
           fetch('/api/admin/bind_history'),
           fetch('/api/admin/interface_ips'),
+          fetch('/api/streams/stats?status=Running'),
         ]);
         if (!r.ok) {
           wrap.innerHTML = '<div class="iface-empty">Failed to load interfaces (HTTP ' + r.status + ')</div>';
@@ -13355,6 +13357,27 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
         const d = await r.json();
         const history = hr.ok ? ((await hr.json()).history || {}) : {};
         _ifaceIPs = ipr.ok ? ((await ipr.json()).interfaces || {}) : {};
+        // Build a per-iface summary of running streams: counts and max
+        // dpdk_tx_cores so the table can show e.g. "DPDK ×8 (2 streams)".
+        const streamSummary = {};
+        if (sr.ok) {
+          try {
+            const sd = (await sr.json()).active_streams || [];
+            for (const s of sd) {
+              if (!s || s.status !== 'Running' || !s.interface) continue;
+              const k = s.interface;
+              if (!streamSummary[k]) {
+                streamSummary[k] = { count: 0, dpdk: 0, maxCores: 0 };
+              }
+              streamSummary[k].count += 1;
+              if (s.dpdk_enable) {
+                streamSummary[k].dpdk += 1;
+                const c = parseInt(s.dpdk_tx_cores || 1, 10);
+                if (c > streamSummary[k].maxCores) streamSummary[k].maxCores = c;
+              }
+            }
+          } catch (_) { /* tolerate stats failures */ }
+        }
         const list = d.interfaces || [];
         if (!list.length) {
           wrap.innerHTML = '<div class="iface-empty">No interfaces reported.</div>';
@@ -13402,6 +13425,25 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
             ipCell = `<div class="ip-cell">${lines}<button class="ip-manage" data-iface="${escapeHtml(kernelName)}">Manage</button></div>`;
           }
 
+          // TX queues badge: shows "DPDK ×N" when this interface has at least
+          // one active multi-queue tx_worker stream; "DPDK" for single-queue;
+          // "—" otherwise. Uses the kernel name for lookup (vfio-bound rows
+          // don't have a kernel name, and they don't appear in stream stats
+          // by design — DPDK streams record by iface name they were started
+          // with).
+          let queuesCell = '<span style="color: var(--muted);">—</span>';
+          const summaryName = kernelName || (i.name && i.name !== 'N/A' ? i.name : null);
+          if (summaryName && streamSummary[summaryName]) {
+            const sm = streamSummary[summaryName];
+            if (sm.dpdk > 0) {
+              const label = sm.maxCores > 1 ? `DPDK ×${sm.maxCores}` : 'DPDK';
+              const suffix = sm.count > 1 ? ` <span style="color: var(--muted); font-size: 11px;">(${sm.count} streams)</span>` : '';
+              queuesCell = `<span class="pill" style="background: #dbeafe; color: #1d4ed8; font-weight: 600;">${label}</span>${suffix}`;
+            } else if (sm.count > 0) {
+              queuesCell = `<span style="color: var(--muted); font-size: 11px;">Scapy (${sm.count})</span>`;
+            }
+          }
+
           // `name` is already html-safe (built above; either escapeHtml output
           // or controlled inline markup). Don't double-escape.
           return `
@@ -13412,12 +13454,13 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
               <td><span class="pill ${s.pillClass}">${escapeHtml(s.label)}</span></td>
               <td class="mono">${escapeHtml(kdrv)}</td>
               <td>${ipCell}</td>
+              <td>${queuesCell}</td>
               <td>${actionBtn}</td>
             </tr>`;
         }).join('');
         wrap.innerHTML = `
           <table class="iface">
-            <thead><tr><th>Interface</th><th>PCI</th><th>Vendor</th><th>State</th><th>Kernel driver</th><th>IP addresses</th><th></th></tr></thead>
+            <thead><tr><th>Interface</th><th>PCI</th><th>Vendor</th><th>State</th><th>Kernel driver</th><th>IP addresses</th><th>TX queues</th><th></th></tr></thead>
             <tbody>${rows}</tbody>
           </table>`;
         // Stash the list so click handlers can look up by index.
