@@ -5317,11 +5317,12 @@ class DevicesTab(QWidget):
                     incremented_isis_config["ipv6_enabled"] = bool(current_ipv6)
                     
                     # Initialize protocols as list and isis_config as separate field
+                    # (Canonical key is isis_config; legacy is_is_config no longer
+                    # written — readers fall back to it when reading old data.)
                     device_data["protocols"] = device_data.get("protocols", [])
                     if "IS-IS" not in device_data["protocols"]:
                         device_data["protocols"].append("IS-IS")
-                    device_data["is_is_config"] = incremented_isis_config  # Use is_is_config for consistency with database
-                    device_data["isis_config"] = incremented_isis_config   # Also store as isis_config for compatibility
+                    device_data["isis_config"] = incremented_isis_config
                     logger.debug(f"Incremented ISIS config: {incremented_isis_config}")
                 else:
                     logger.debug(f"ISIS NOT enabled for device {current_name}")
@@ -5444,9 +5445,8 @@ class DevicesTab(QWidget):
                 device_data["protocols"] = device_data.get("protocols", [])
                 if "IS-IS" not in device_data["protocols"]:
                     device_data["protocols"].append("IS-IS")
-                device_data["is_is_config"] = isis_config  # Use is_is_config for consistency with database
-                device_data["isis_config"] = isis_config   # Also store as isis_config for compatibility
-                logger.debug(f"ISIS added to single device {unique_name}: {device_data['is_is_config']}")
+                device_data["isis_config"] = isis_config
+                logger.debug(f"ISIS added to single device {unique_name}: {device_data['isis_config']}")
             else:
                 logger.debug(f"ISIS NOT enabled for single device")
             
@@ -5942,7 +5942,6 @@ class DevicesTab(QWidget):
         
         if isis_config:
             device_info["isis_config"] = isis_config
-            device_info["is_is_config"] = isis_config
             if "IS-IS" not in device_info.get("protocols", []):
                 device_info.setdefault("protocols", []).append("IS-IS")
 

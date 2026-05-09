@@ -187,7 +187,7 @@ class ISISHandler:
         if isinstance(device_info["protocols"], dict):
             device_info["protocols"]["IS-IS"] = new_isis_config
         else:
-            device_info["is_is_config"] = new_isis_config
+            device_info["isis_config"] = new_isis_config
         
         # Update the ISIS table
         self.update_isis_table()
@@ -220,7 +220,7 @@ class ISISHandler:
         
         if device_info and "protocols" in device_info and "IS-IS" in device_info["protocols"]:
             # Check if ISIS is already marked for removal
-            isis_config = device_info.get("is_is_config", {})
+            isis_config = device_info.get("isis_config", {}) or device_info.get("is_is_config", {})
             if isinstance(isis_config, dict) and isis_config.get("_marked_for_removal"):
                 QMessageBox.information(self.parent, "Already Marked for Removal", 
                                       f"ISIS configuration for '{device_name}' is already marked for removal. Click 'Apply ISIS Configuration' to remove it from the server.")
@@ -255,7 +255,7 @@ class ISISHandler:
             if isinstance(device_info["protocols"], dict):
                 device_info["protocols"]["IS-IS"] = {"_marked_for_removal": True}
             else:
-                device_info["is_is_config"] = {"_marked_for_removal": True}
+                device_info["isis_config"] = {"_marked_for_removal": True}
             
             # Update the ISIS table to show the device as marked for removal
             self.update_isis_table()
@@ -314,7 +314,7 @@ class ISISHandler:
                 for iface, devices in self.parent.main_window.all_devices.items():
                     for device in devices:
                         if device.get("Device Name") == device_name:
-                            isis_config = device.get("is_is_config", {})
+                            isis_config = device.get("isis_config", {}) or device.get("is_is_config", {})
                             if isis_config:
                                 if isis_config.get("_marked_for_removal"):
                                     # Device is marked for ISIS removal
@@ -326,7 +326,7 @@ class ISISHandler:
             # If no ISIS table rows are selected, process all devices with ISIS configurations
             for iface, devices in self.parent.main_window.all_devices.items():
                 for device in devices:
-                    isis_config = device.get("is_is_config", {})
+                    isis_config = device.get("isis_config", {}) or device.get("is_is_config", {})
                     if isis_config:
                         if isis_config.get("_marked_for_removal"):
                             devices_to_remove_isis.append(device)
@@ -416,7 +416,7 @@ class ISISHandler:
             for device in devices:
                 device_id = device.get("device_id")
                 device_name = device.get("Device Name", "Unknown")
-                isis_config = device.get("is_is_config", {})
+                isis_config = device.get("isis_config", {}) or device.get("is_is_config", {})
                 
                 if not device_id:
                     continue
