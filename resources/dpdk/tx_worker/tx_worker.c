@@ -239,7 +239,10 @@ int main(int argc, char **argv){
         rte_exit(EXIT_FAILURE, "No DPDK ports.\n");
 
     struct rte_eth_dev_info dev_info;
-    rte_eth_dev_info_get(port_id, &dev_info);
+    int dev_info_rc = rte_eth_dev_info_get(port_id, &dev_info);
+    if (dev_info_rc != 0) {
+        rte_exit(EXIT_FAILURE, "rte_eth_dev_info_get failed: %d\n", dev_info_rc);
+    }
 
     /* Clamp tx_cores to NIC's max TX queues */
     if (tx_cores > dev_info.max_tx_queues){
