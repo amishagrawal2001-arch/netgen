@@ -12,6 +12,7 @@ A comprehensive network traffic generation and device management system with sup
 - [Client-Server Communication](#client-server-communication)
 - [Device Management](#device-management)
 - [Traffic Generation API](#traffic-generation-api)
+- [DPDK Multi-Queue Scaling](#dpdk-multi-queue-scaling)
 - [Protocol Configuration](#protocol-configuration)
 - [Monitoring and Troubleshooting](#monitoring-and-troubleshooting)
 - [Examples](#examples)
@@ -1053,6 +1054,130 @@ curl -X POST http://localhost:5050/api/traffic/stop \
 curl -G http://localhost:5050/api/streams/stats \
   --data-urlencode "interface=enp180s0np0"
 ```
+
+The response includes per-stream `dpdk_enable` (bool) and
+`dpdk_tx_cores` (int) so clients can render the engine and queue count
+inline.
+
+## DPDK Multi-Queue Scaling
+
+For 100G/400G line-rate generation, a single TX queue is the bottleneck.
+The `tx_worker` binary supports **N TX queues driven by N pinned worker
+lcores inside one primary process**, controlled by the per-stream
+`dpdk_tx_cores` field.
+
+### Enable from the desktop client
+
+In the **Add/Edit Stream** dialog, on the **Variable Fields** tab:
+
+- Tick **Use DPDK (tx_worker)**
+- Set **TX Cores (queues)** to 1 / 2 / 4 / 8 / 12 / 16
+- Click **Recommend** to ask the server for a calibrated suggestion
+  based on the interface's link speed, the chosen frame size, and the
+  target rate.
+
+The running stream is visible in the Statistics dock's
+**Stream Statistics** tab — the **Engine** column shows
+`DPDK ×N` while the stream is active.
+
+### Enable from the API
+
+```bash
+curl -X POST http://localhost:5050/api/traffic/start \
+  -H "Content-Type: application/json" \
+  -d '{
+    "streams": {
+      "Port:enp181s0f0np0": [{
+        "name": "BlastUDP",
+        "enabled": true,
+        "frame_size": 1500,
+        "stream_rate_type": "Line Rate",
+        "L4": "UDP",
+        "dpdk_enable": true,
+        "dpdk_tx_cores": 4
+      }]
+    }
+  }'
+```
+
+`dpdk_tx_cores` is also accepted under `protocol_selection` and via the
+`DPDK_TX_CORES` env var on the server (defaults to 1 = backwards
+compatible single-queue path).
+
+### Recommendation endpoint
+
+```bash
+curl -G http://localhost:5050/api/dpdk/recommend \
+  --data-urlencode "iface=enp181s0f0np0" \
+  --data-urlencode "frame_size=1500" \
+  --data-urlencode "pps=0"
+```
+
+Returns:
+
+```json
+{
+  "ok": true,
+  "iface": "enp181s0f0np0",
+  "link_speed_mbps": 400000,
+  "frame_size": 1500,
+  "target_pps": 32894736,
+  "line_rate_pps": 32894736,
+  "estimated_pps_per_core": 4100000,
+  "recommended_tx_cores": 12,
+  "explanation": "Link 400 Gbps; line rate at 1500B = 32,894,736 pps. ..."
+}
+```
+
+### Calibrated numbers (Mellanox CX-7, AMD EPYC, NUMA-pinned cores)
+
+Measured on `enp181s0f0np0` (BDF `0000:b5:00.0`, NUMA 1):
+
+| Cores | 64B Mpps | 64B % of 100G | 1500B Gbps |
+| ----: | -------: | ------------: | ---------: |
+|     1 |     4.54 |            3% |         49 |
+|     2 |     9.14 |            6% | **99.6** *(100G saturated)* |
+|     4 |    18.21 |           12% |        199 |
+|     8 |    35.66 |           24% | **385** *(approaches 400G)* |
+|    12 |    48.12 |           32% |          – |
+|    16 |    58.24 |           39% |          – |
+
+Linear scaling holds to 8 cores; 80–90% efficiency at 12–16. Past 16
+the bottleneck is per-queue PMD throughput and PCIe overhead, not
+software. Per-core ceiling estimates used by the recommender:
+
+- 64B: 4.5 Mpps/core
+- 512B: 4.3 Mpps/core
+- 1500B: 4.1 Mpps/core
+
+### Prerequisites
+
+- DPDK 21.11+ (uses `RTE_LCORE_FOREACH_WORKER`,
+  `RTE_ETH_TX_OFFLOAD_*`)
+- Hugepages allocated on the NIC's NUMA node (1G recommended)
+- For Intel/AMD: `intel_iommu=on iommu=pt` / `amd_iommu=on iommu=pt`
+- Mellanox: kernel `mlx5_core` driver alongside DPDK (no vfio bind
+  needed). Broadcom: vfio-pci bind via the `/admin` portal.
+- EAL `-l` corelist must contain `1 + dpdk_tx_cores` cores; the
+  launcher allocates them from the NIC's NUMA node automatically.
+
+### How it works under the hood
+
+`utils/dpdk_tx_worker.py` resolves `dpdk_tx_cores` from the stream
+JSON, allocates `1 + N` lcores on the NIC's NUMA node via
+`_pick_corelist_on_node(numa, count=1+N)`, and passes
+`--tx-cores N` to the binary.
+
+`tx_worker.c` configures `rte_eth_dev_configure(port, 1, N, ...)`,
+sets up N TX queues, and launches a `tx_loop(struct tx_worker_ctx*)`
+per worker via `rte_eal_remote_launch`. Each worker drains its own
+queue, owns its own `seq` counter, and publishes per-burst
+`volatile sent/dropped` counts that the main thread aggregates
+into `STAT` lines once per second.
+
+The PPS target is split evenly across workers (remainder spread to
+the first few). `pps=0` (line rate) means each worker floods its
+queue uncapped.
 
 ## Protocol Configuration
 
