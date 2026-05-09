@@ -147,7 +147,49 @@ def run_stream_multi_instance(
     # Get device info
     bdf = _iface_to_bdf(interface)
     numa = _bdf_numa_node(bdf) if bdf else 0
-    
+
+    # Single-device guard + delegation:
+    # Multi-instance launches N independent PRIMARY DPDK processes, each
+    # passing `-a <bdf>` for the same NIC. DPDK only allows ONE primary
+    # process to own a given device — secondary processes need
+    # `--proc-type=secondary` and a shared mempool with the primary,
+    # which the tx_worker C source doesn't currently support. Symptom:
+    # instances probe (each with its own --file-prefix) but only the
+    # first can configure TX queues, so tx_count stays at 0 across all.
+    #
+    # On top of that, the multi monitor's tracker.update_tx_by_id() call
+    # at the bottom of monitor_instances() is a `count=0` placeholder
+    # (search this file) — it never aggregates real stats even in the
+    # N=1 case, and it doesn't read tx_worker stdout for STAT lines the
+    # way single-instance dpdk_tx_worker.run_stream() does. Net result:
+    # any path through this function reports tx_count=0 to the database.
+    #
+    # Until the tx_worker is reworked for secondary-process mode AND
+    # the monitor is rebuilt to actually parse STAT output, the right
+    # behaviour for the single-device case is to delegate to the proven
+    # single-instance backend. Multi-port setups (one BDF per port,
+    # caller-orchestrated) remain the path to scale beyond ~5Mpps.
+    if num_instances >= 1 and bdf:
+        if num_instances > 1:
+            LOG.warning(
+                "[DPDK-MULTI] Requested %d instances on single device %s — DPDK "
+                "primary-process model can't share one NIC across N processes. "
+                "Falling back to single-instance backend. For higher rates use "
+                "multiple ports.",
+                num_instances, bdf,
+            )
+        else:
+            LOG.info(
+                "[DPDK-MULTI] N=1 on single device — delegating to single-instance "
+                "backend (multi monitor's stat reporting is a placeholder)."
+            )
+        # Lazy import to avoid a circular dep with single-instance backend.
+        try:
+            from .dpdk_tx_worker import run_stream as _run_single
+        except ImportError:
+            from utils.dpdk_tx_worker import run_stream as _run_single
+        return _run_single(stream_data, interface, stop_event, tracker)
+
     # Resolve binary
     bin_path = tx_worker_bin or _resolve_tx_worker_bin()
     if not bin_path or not os.path.exists(bin_path):
