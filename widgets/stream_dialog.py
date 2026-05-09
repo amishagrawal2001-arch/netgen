@@ -9,7 +9,8 @@ from PyQt5.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QLabel, QPushButton, QTableWidget, QStackedWidget, QSpinBox,
     QTableWidgetItem, QDialog, QFormLayout, QLineEdit, QComboBox, QDialogButtonBox, QWidget, QMessageBox,
     QHeaderView, QRadioButton, QGroupBox, QGridLayout, QTabWidget, QScrollArea, QCheckBox, QInputDialog, QSplitter,
-    QAction, QMenu, QAbstractItemView, QSizePolicy, QTreeWidget, QTreeWidgetItem, QTextEdit, QSpacerItem, QFileDialog
+    QAction, QMenu, QAbstractItemView, QSizePolicy, QTreeWidget, QTreeWidgetItem, QTextEdit, QTextBrowser,
+    QSpacerItem, QFileDialog
 )
 from PyQt5.QtCore import QTimer, Qt, QRegExp, QSize, QItemSelectionModel, QDateTime
 from PyQt5.QtGui import QIntValidator, QBrush, QRegExpValidator, QIcon, QValidator, QPixmap, QColor
@@ -27,6 +28,225 @@ class Unsigned32BitValidator(QValidator):
             return QValidator.Invalid, input, pos
         except ValueError:
             return QValidator.Invalid, input, pos
+
+
+# =============================================================================
+# DPDK Workflow Guide — content + dialog factory
+# =============================================================================
+# Reachable from two places: the "Read More" button on the stream editor's
+# Variable Fields tab, and the Help → "DPDK Workflow Guide" menu in main.py.
+# The HTML below is rendered with QTextBrowser so the calibrated tables, code
+# blocks, and inline styling stay readable. Keep this in sync with the
+# "DPDK Multi-Queue Scaling" README section.
+
+_DPDK_GUIDE_HTML = r"""
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         color: #1f2937; line-height: 1.55; font-size: 12px; }
+  h1 { color: #1e40af; font-size: 20px; margin: 0 0 8px 0; }
+  h2 { color: #374151; font-size: 15px; margin-top: 18px;
+       border-bottom: 1px solid #e5e7eb; padding-bottom: 4px; }
+  h3 { color: #4b5563; font-size: 13px; margin-top: 14px; }
+  p, li { color: #374151; }
+  code { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+         background: #f3f4f6; padding: 1px 5px; border-radius: 3px;
+         font-size: 11px; color: #1e3a8a; }
+  pre { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+        background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 4px;
+        padding: 10px; font-size: 11px; color: #111827; }
+  table { border-collapse: collapse; margin-top: 6px; font-size: 11px; }
+  th, td { border: 1px solid #d1d5db; padding: 5px 9px; text-align: left; }
+  th { background: #f3f4f6; color: #374151; font-weight: 600; }
+  td.num { text-align: right; font-family: ui-monospace, SFMono-Regular, monospace; }
+  .hot { color: #1d4ed8; font-weight: 600; }
+  .muted { color: #6b7280; font-size: 11px; }
+</style>
+
+<h1>DPDK Traffic Blast — Workflow Guide</h1>
+<p class="muted">End-to-end walkthrough for using the multi-queue DPDK <code>tx_worker</code>
+backend to saturate 100G / 400G line rate.</p>
+
+<h2>1. One-time server setup</h2>
+<p>Done once per server — visit <code>http://&lt;server&gt;:5050/admin</code> in a browser:</p>
+<ol>
+  <li><b>DPDK runtime installed</b> — Card "DPDK Runtime". Click <i>Install DPDK</i>
+      if missing; tail the log inline.</li>
+  <li><b>Hugepages allocated</b> — Card "Hugepages". Allocate 4–8 GB on the NIC's
+      NUMA node (1G pages preferred).</li>
+  <li><b>IOMMU enabled</b> — required for <code>vfio-pci</code> binding. The portal
+      detects and offers a one-click GRUB toggle (reboot needed).</li>
+  <li><b>NIC ready:</b>
+    <ul>
+      <li><b>Mellanox (mlx5):</b> no bind needed — DPDK uses <code>mlx5_core</code>
+          alongside the kernel driver.</li>
+      <li><b>Broadcom / Intel / AMD:</b> click <i>Bind to DPDK</i> on the interface row
+          to bind to <code>vfio-pci</code>.</li>
+    </ul>
+  </li>
+</ol>
+
+<h2>2. Per-stream workflow</h2>
+
+<h3>Step 1 — Create the stream</h3>
+<p>Right-click an interface in the server tree → <b>Add Stream</b>.</p>
+
+<h3>Step 2 — Configure protocol fields</h3>
+<ul>
+  <li><b>L2:</b> source / destination MAC (must be valid; the worker doesn't ARP)</li>
+  <li><b>L3:</b> source / destination IPv4</li>
+  <li><b>L4:</b> <span class="hot">UDP</span> — the worker is UDP-only;
+      don't pick TCP/ICMP</li>
+  <li><b>Frame size:</b> 64 (max pps stress) or 1500 (typical line-rate)</li>
+  <li><b>Stream Rate Type:</b> <i>Line Rate</i> for max blast, or <i>PPS</i> for a target rate</li>
+</ul>
+
+<h3>Step 3 — Enable DPDK + pick TX cores</h3>
+<p>On the <b>Variable Fields</b> tab:</p>
+<pre>☑  Use DPDK (tx_worker)
+☐  Force Multi-Instance DPDK         ← leave unchecked for single-NIC blast
+TX Cores (queues): [ 1 ▾ ]   [ Recommend ]</pre>
+
+<p>Click <b>Recommend</b> — it reads the link speed from
+<code>/sys/class/net/&lt;iface&gt;/speed</code>, factors in your frame size + target pps,
+and auto-selects from <code>1 / 2 / 4 / 8 / 12 / 16</code>. The hint label below shows
+the reasoning.</p>
+
+<p>Or set it manually using the calibrated table (Mellanox CX-7, AMD EPYC):</p>
+
+<table>
+  <tr><th>Goal</th><th>Frame</th><th>TX Cores</th></tr>
+  <tr><td>Saturate 100G</td><td>1500B</td><td class="num"><b>2</b></td></tr>
+  <tr><td>Saturate 200G</td><td>1500B</td><td class="num"><b>4</b></td></tr>
+  <tr><td>Saturate ~400G</td><td>1500B</td><td class="num"><b>8</b></td></tr>
+  <tr><td>Max 64B pps on this NIC</td><td>64B</td><td class="num"><b>16</b>
+      <span class="muted">(~58 Mpps, 39% of 100G line rate)</span></td></tr>
+</table>
+
+<h3>Step 4 — Save and start</h3>
+<p>Click <b>Save</b>, then the <b>▶ Start</b> icon on the stream row. The icon
+flashes yellow (pending) → green (running). Your <code>dpdk_tx_cores</code> rides
+through the API to <code>tx_worker --tx-cores N</code>.</p>
+
+<h2>3. Verification — three places to look</h2>
+
+<h3>A. Stream Statistics dock (this client)</h3>
+<p>The bottom <b>Statistics</b> dock → <b>Stream Statistics</b> tab shows an
+<b>Engine</b> column rendering <span class="hot">DPDK ×N</span> (multi-queue),
+<span class="hot">DPDK</span> (single), or <code>Scapy</code> (kernel). Rates
+update live.</p>
+
+<h3>B. /admin Network Interfaces table</h3>
+<p>Browse <code>http://&lt;server&gt;:5050/admin</code> → "Network Interfaces" — a
+<b>TX queues</b> column shows the same badge server-side, useful when triaging
+without the client open.</p>
+
+<h3>C. Server logs</h3>
+<pre>ssh root@&lt;server&gt; 'journalctl -u netgen-server -f' | grep STAT</pre>
+<p>Each <code>STAT</code> line shows aggregated tx / drop counts and
+<code>tx_cores=N</code>:</p>
+<pre>STAT stream=&lt;id&gt; tx=256487808 drop=0 frame=1500
+     pps_target=0 burst=64 tx_cores=8 offload=0x2</pre>
+
+<h2>4. Calibrated performance numbers</h2>
+<p>Mellanox CX-7 (BDF <code>0000:b5:00.0</code>, NUMA 1) on AMD EPYC, NUMA-pinned
+worker cores. Linear scaling holds to 8 cores; 80–90% efficiency at 12–16. Past
+that the bottleneck is per-queue PMD throughput / PCIe overhead, not software.</p>
+
+<table>
+  <tr><th>Cores</th><th>64B Mpps</th><th>64B % of 100G</th><th>1500B Gbps</th></tr>
+  <tr><td class="num">1</td>  <td class="num">4.54</td>  <td class="num">3%</td>   <td class="num">49</td></tr>
+  <tr><td class="num">2</td>  <td class="num">9.14</td>  <td class="num">6%</td>   <td class="num"><b>99.6 (100G)</b></td></tr>
+  <tr><td class="num">4</td>  <td class="num">18.21</td> <td class="num">12%</td>  <td class="num">199</td></tr>
+  <tr><td class="num">8</td>  <td class="num">35.66</td> <td class="num">24%</td>  <td class="num"><b>385 (~400G)</b></td></tr>
+  <tr><td class="num">12</td> <td class="num">48.12</td> <td class="num">32%</td>  <td>—</td></tr>
+  <tr><td class="num">16</td> <td class="num">58.24</td> <td class="num">39%</td>  <td>—</td></tr>
+</table>
+
+<h2>5. When to change <code>tx_cores</code></h2>
+<table>
+  <tr><th>Symptom</th><th>Action</th></tr>
+  <tr><td>Want more pps, CPU available</td><td>Bump up one step (1→2→4→8)</td></tr>
+  <tr><td>Drops &gt; 0 in STAT lines</td><td>Hit NIC HW ceiling — diminishing returns</td></tr>
+  <tr><td>1500B at line rate, target met</td><td>Stay where you are</td></tr>
+  <tr><td>64B small-packet stress</td><td>Use 16 (NIC ceiling)</td></tr>
+  <tr><td>Dual-port wire-rate from one host</td>
+      <td>Run two streams on different ports, each with its own <code>tx_cores</code> budget</td></tr>
+</table>
+
+<h2>6. Troubleshooting</h2>
+<table>
+  <tr><th>Symptom</th><th>Likely cause / fix</th></tr>
+  <tr><td>"Stream starts and stops immediately"</td>
+      <td>Check <code>journalctl -u netgen-server</code> for <code>tx_worker</code>
+          errors. Most common: hugepages not on the NIC's NUMA node, or
+          <code>vfio-pci</code> not bound (Broadcom / Intel).</td></tr>
+  <tr><td><code>tx-cores=N clamped to M</code> warning</td>
+      <td><code>M</code> is <code>min(available_lcores, NIC max_tx_queues)</code>.
+          Usually means another DPDK process owns the cores —
+          <code>pgrep tx_worker</code>.</td></tr>
+  <tr><td>Engine column shows "Scapy" with DPDK checked</td>
+      <td>Stream was created before DPDK options existed.
+          Re-edit, re-tick <i>Use DPDK</i>, save.</td></tr>
+  <tr><td>L4=ICMP doesn't work</td>
+      <td>tx_worker is UDP-only. Switch L4 to UDP.</td></tr>
+  <tr><td>Drops jump 8 → 16 cores</td>
+      <td>NIC PCIe / per-queue PMD ceiling. Drop back to 8 or 12.</td></tr>
+  <tr><td>100G link reports only ~50G</td>
+      <td>Receiving side is the bottleneck (NIC, cables, intermediate switch
+          PFC, or autoneg to 50G/25G). Verify with
+          <code>ethtool &lt;iface&gt; | grep Speed</code> on both ends.</td></tr>
+</table>
+
+<h2>7. API-only workflow (no GUI)</h2>
+<pre>curl -X POST http://&lt;server&gt;:5050/api/traffic/start \
+  -H "Content-Type: application/json" \
+  -d '{
+    "streams": {
+      "Port:enp181s0f0np0": [{
+        "name": "BlastUDP",
+        "enabled": true,
+        "frame_size": 1500,
+        "stream_rate_type": "Line Rate",
+        "L4": "UDP",
+        "mac_source_address": "8c:91:3a:d6:1b:7a",
+        "mac_destination_address": "8c:91:3a:d6:1b:7b",
+        "ipv4_source": "10.0.0.1",
+        "ipv4_destination": "10.0.0.2",
+        "dpdk_enable": true,
+        "dpdk_tx_cores": 4
+      }]
+    }
+  }'</pre>
+
+<p class="muted">Six clicks (or one curl) from a fresh stream to 100G saturated.</p>
+"""
+
+
+def show_dpdk_usage_guide(parent=None):
+    """Open the DPDK Workflow Guide dialog. Used from the stream editor's
+    "Read More" button and from the main window's Help menu."""
+    dialog = QDialog(parent)
+    dialog.setWindowTitle("DPDK Traffic Blast — Workflow Guide")
+    dialog.setGeometry(250, 200, 880, 760)
+    dialog.setMinimumSize(720, 500)
+
+    layout = QVBoxLayout(dialog)
+    layout.setContentsMargins(12, 12, 12, 12)
+
+    browser = QTextBrowser()
+    browser.setOpenExternalLinks(True)
+    browser.setHtml(_DPDK_GUIDE_HTML)
+    layout.addWidget(browser, 1)
+
+    button_row = QHBoxLayout()
+    button_row.addStretch(1)
+    close_btn = QPushButton("Close")
+    close_btn.setDefault(True)
+    close_btn.clicked.connect(dialog.accept)
+    button_row.addWidget(close_btn)
+    layout.addLayout(button_row)
+
+    dialog.exec()
 
 
 class AddStreamDialog(QDialog):
@@ -483,14 +703,9 @@ class AddStreamDialog(QDialog):
         hint.setWordWrap(True)
         layout.addWidget(hint)
         
-        # Read More button
-        read_more_button = QPushButton("Read More: How to Use DPDK for Packet Generation")
-        read_more_button.setStyleSheet("text-align: left; padding: 5px; color: #3b82f6;")
-        read_more_button.clicked.connect(self._show_dpdk_usage_guide)
-        layout.addWidget(read_more_button)
-
-        # Read More button
-        read_more_button = QPushButton("Read More: How to Use DPDK for Packet Generation")
+        # Read More button — opens the DPDK Workflow Guide
+        # (also reachable from main window: Help → DPDK Traffic Blast Workflow)
+        read_more_button = QPushButton("Read More: DPDK Traffic Blast Workflow")
         read_more_button.setStyleSheet("text-align: left; padding: 8px; color: #3b82f6; font-weight: 500;")
         read_more_button.clicked.connect(self._show_dpdk_usage_guide)
         layout.addWidget(read_more_button)
@@ -577,201 +792,8 @@ class AddStreamDialog(QDialog):
         self.dpdk_tx_cores_hint.setText(explanation)
 
     def _show_dpdk_usage_guide(self):
-        """Show comprehensive guide on how to use DPDK for packet generation."""
-        dialog = QDialog(self)
-        dialog.setWindowTitle("How to Use DPDK for Packet Generation")
-        dialog.setGeometry(300, 300, 800, 700)
-        
-        layout = QVBoxLayout(dialog)
-        
-        # Scrollable content
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setMinimumHeight(600)
-        
-        content_widget = QWidget()
-        content_layout = QVBoxLayout(content_widget)
-        
-        # Title
-        title = QLabel("DPDK Packet Generation Guide")
-        title.setStyleSheet("font-size: 18px; font-weight: bold; color: #1e40af; margin-bottom: 15px;")
-        content_layout.addWidget(title)
-        
-        # Overview
-        overview_label = QLabel("Overview")
-        overview_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #374151; margin-top: 10px;")
-        content_layout.addWidget(overview_label)
-        
-        overview_text = QLabel(
-            "DPDK (Data Plane Development Kit) enables high-performance packet generation "
-            "at line rates (100Gbps, 400Gbps). When enabled, packets are generated by the "
-            "DPDK tx_worker application instead of Scapy, providing 10-100x better performance."
-        )
-        overview_text.setWordWrap(True)
-        overview_text.setStyleSheet("font-size: 11px; color: #4b5563; line-height: 1.5; margin-bottom: 15px;")
-        content_layout.addWidget(overview_text)
-        
-        # Prerequisites
-        prereq_label = QLabel("Prerequisites (Complete Before Enabling DPDK)")
-        prereq_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #374151; margin-top: 10px;")
-        content_layout.addWidget(prereq_label)
-        
-        prereq_text = QLabel(
-            "1. DPDK Installation:\n"
-            "   • DPDK libraries installed (verify via DPDK → Verify Installation)\n"
-            "   • tx_worker binary built and available\n\n"
-            "2. Hugepages Configuration:\n"
-            "   • Configure hugepages: DPDK → Configure Hugepages\n"
-            "   • Recommended: 4096 pages (8GB) for 100-400Gbps\n"
-            "   • Verify: DPDK → Verify Installation should show ✓\n\n"
-            "3. VFIO Modules (for Broadcom/Intel/AMD NICs):\n"
-            "   • Load VFIO modules: DPDK → Load VFIO Modules\n"
-            "   • Verify: DPDK → Status should show modules loaded\n\n"
-            "4. IOMMU Enabled (for Broadcom/Intel/AMD NICs):\n"
-            "   • Enable IOMMU: DPDK → Configure IOMMU\n"
-            "   • Requires server reboot\n"
-            "   • Verify: DPDK → Status should show IOMMU enabled\n\n"
-            "5. NIC Binding:\n"
-            "   • Bind interface to DPDK: DPDK → Bind Interface to DPDK\n"
-            "   • Interface will disappear from 'ip link show'\n"
-            "   • This is normal - DPDK now controls the interface"
-        )
-        prereq_text.setWordWrap(True)
-        prereq_text.setStyleSheet("font-size: 11px; color: #4b5563; line-height: 1.5; font-family: 'Courier New', monospace; margin-bottom: 15px;")
-        content_layout.addWidget(prereq_text)
-        
-        # Step-by-step guide
-        steps_label = QLabel("Step-by-Step: Enabling DPDK for a Stream")
-        steps_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #374151; margin-top: 10px;")
-        content_layout.addWidget(steps_label)
-        
-        steps_text = QLabel(
-            "1. Prepare the System:\n"
-            "   • Complete all prerequisites above\n"
-            "   • Verify DPDK Status shows all ✓\n\n"
-            "2. Bind Interface to DPDK:\n"
-            "   • DPDK → Bind Interface to DPDK\n"
-            "   • Select the interface you want to use\n"
-            "   • Interface will be bound to vfio-pci (or mlx5 for NVIDIA)\n\n"
-            "3. Create/Edit Stream:\n"
-            "   • Click 'Add Stream' or 'Edit Stream'\n"
-            "   • Configure your packet (L2, L3, L4, etc.)\n"
-            "   • Set your desired rate (PPS or Line Rate)\n\n"
-            "4. Enable DPDK:\n"
-            "   • Go to 'Variable Fields' tab\n"
-            "   • Check 'Use DPDK (tx_worker)'\n"
-            "   • For 100Gbps+: Optionally check 'Force Multi-Instance DPDK'\n\n"
-            "5. Save and Start:\n"
-            "   • Click 'Save' to save the stream\n"
-            "   • Click 'Start Stream' to begin packet generation\n"
-            "   • DPDK will handle packet transmission at high rates"
-        )
-        steps_text.setWordWrap(True)
-        steps_text.setStyleSheet("font-size: 11px; color: #4b5563; line-height: 1.5; font-family: 'Courier New', monospace; margin-bottom: 15px;")
-        content_layout.addWidget(steps_text)
-        
-        # When to use DPDK
-        when_label = QLabel("When to Use DPDK vs Scapy")
-        when_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #374151; margin-top: 10px;")
-        content_layout.addWidget(when_label)
-        
-        when_text = QLabel(
-            "Use DPDK When:\n"
-            "  ✓ Need high packet rates (> 1M pps)\n"
-            "  ✓ Targeting 100Gbps or 400Gbps line rates\n"
-            "  ✓ Low latency is critical\n"
-            "  ✓ Testing high-speed network equipment\n\n"
-            "Use Scapy When:\n"
-            "  ✓ Low to moderate rates (< 1M pps)\n"
-            "  ✓ Need complex packet manipulation\n"
-            "  ✓ Testing with standard kernel networking\n"
-            "  ✓ DPDK setup is not available"
-        )
-        when_text.setWordWrap(True)
-        when_text.setStyleSheet("font-size: 11px; color: #4b5563; line-height: 1.5; margin-bottom: 15px;")
-        content_layout.addWidget(when_text)
-        
-        # Performance expectations
-        perf_label = QLabel("Performance Expectations")
-        perf_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #374151; margin-top: 10px;")
-        content_layout.addWidget(perf_label)
-        
-        perf_text = QLabel(
-            "Scapy (Kernel Path):\n"
-            "  • Typical: 50K - 500K pps\n"
-            "  • Maximum: ~1M pps\n"
-            "  • Limited by kernel network stack\n\n"
-            "DPDK Single-Instance:\n"
-            "  • Typical: 1M - 10M pps\n"
-            "  • Maximum: ~50M pps\n"
-            "  • Good for 10-100Gbps rates\n\n"
-            "DPDK Multi-Instance (Auto-enabled for 100Gbps+):\n"
-            "  • Typical: 10M - 100M+ pps\n"
-            "  • Can achieve line rate (100Gbps, 400Gbps)\n"
-            "  • Uses multiple CPU cores and instances"
-        )
-        perf_text.setWordWrap(True)
-        perf_text.setStyleSheet("font-size: 11px; color: #4b5563; line-height: 1.5; font-family: 'Courier New', monospace; margin-bottom: 15px;")
-        content_layout.addWidget(perf_text)
-        
-        # NIC-specific notes
-        nic_label = QLabel("NIC-Specific Notes")
-        nic_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #374151; margin-top: 10px;")
-        content_layout.addWidget(nic_label)
-        
-        nic_text = QLabel(
-            "NVIDIA/Mellanox (mlx5):\n"
-            "  • Works with kernel driver (mlx5_core)\n"
-            "  • No VFIO binding required\n"
-            "  • DPDK mlx5 PMD uses kernel driver\n\n"
-            "Broadcom NetXtreme-E:\n"
-            "  • Requires VFIO binding (vfio-pci)\n"
-            "  • Requires IOMMU enabled\n"
-            "  • Interface disappears from 'ip link show'\n\n"
-            "Intel/AMD NICs:\n"
-            "  • Requires VFIO binding (vfio-pci)\n"
-            "  • Requires IOMMU enabled\n"
-            "  • Interface disappears from 'ip link show'"
-        )
-        nic_text.setWordWrap(True)
-        nic_text.setStyleSheet("font-size: 11px; color: #4b5563; line-height: 1.5; font-family: 'Courier New', monospace; margin-bottom: 15px;")
-        content_layout.addWidget(nic_text)
-        
-        # Troubleshooting
-        trouble_label = QLabel("Troubleshooting")
-        trouble_label.setStyleSheet("font-size: 14px; font-weight: bold; color: #374151; margin-top: 10px;")
-        content_layout.addWidget(trouble_label)
-        
-        trouble_text = QLabel(
-            "If DPDK stream fails to start:\n"
-            "  • Check DPDK Status: DPDK → Status\n"
-            "  • Verify hugepages: Should show configured\n"
-            "  • Verify VFIO modules: Should show loaded\n"
-            "  • Verify IOMMU: Should show enabled (for Broadcom/Intel/AMD)\n"
-            "  • Verify interface binding: Should be bound to vfio-pci\n"
-            "  • Check server logs: journalctl -u ostg-server -n 50\n\n"
-            "If performance is low:\n"
-            "  • Enable 'Force Multi-Instance DPDK' for high rates\n"
-            "  • Ensure sufficient CPU cores available\n"
-            "  • Check CPU affinity and NUMA nodes\n"
-            "  • Verify hugepages are sufficient (4096+ pages)"
-        )
-        trouble_text.setWordWrap(True)
-        trouble_text.setStyleSheet("font-size: 11px; color: #4b5563; line-height: 1.5; font-family: 'Courier New', monospace; margin-bottom: 15px;")
-        content_layout.addWidget(trouble_text)
-        
-        content_layout.addStretch()
-        scroll_area.setWidget(content_widget)
-        layout.addWidget(scroll_area)
-        
-        # Close button
-        button_layout = QHBoxLayout()
-        close_button = QPushButton("Close")
-        close_button.clicked.connect(dialog.accept)
-        button_layout.addWidget(close_button)
-        layout.addLayout(button_layout)
-        
-        dialog.exec()
+        """Open the DPDK Workflow Guide. Same dialog used by the Help menu."""
+        show_dpdk_usage_guide(self)
 
     def _apply_rate_type_ui_state(self):
         """Enable only the input relevant to current Rate Type."""
