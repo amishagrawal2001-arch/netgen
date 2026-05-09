@@ -2242,7 +2242,7 @@ def cleanup_isis():
         
         # Stop ISIS on the device
         from utils.isis import stop_isis_neighbor
-        isis_config = device.get("is_is_config", {})
+        isis_config = device.get("isis_config", {}) or device.get("is_is_config", {})
         success = stop_isis_neighbor(device_id, device.get("Device Name", ""), container_id, isis_config)
         
         if success:
@@ -3835,7 +3835,6 @@ def apply_device():
                         logging.info(f"[DEVICE APPLY] Updating OSPF config for device {device_name} (graceful_restart: {merged_ospf_config.get('graceful_restart', False)})")
                     if isis_config:
                         update_data["isis_config"] = isis_config
-                        update_data["is_is_config"] = isis_config  # Also update is_is_config for compatibility
                         logging.info(f"[DEVICE APPLY] Updating ISIS config for device {device_name}")
                     if dhcp_config:
                         update_data["dhcp_config"] = dhcp_config
