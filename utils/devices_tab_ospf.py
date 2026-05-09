@@ -2643,9 +2643,10 @@ class OSPFHandler:
         # This ensures the periodic check doesn't block the UI during table updates
         from PyQt5.QtCore import QTimer
         QTimer.singleShot(0, self.update_ospf_table)  # Defer to next event loop iteration
-        # Routine timer tick — DEBUG-level so it doesn't clutter the user's
-        # log every 20s. Errors / state changes still log at INFO/WARNING.
-        logger.debug(f"[OSPF MONITORING] Periodic OSPF status check completed for {len(devices_with_ospf)} devices")
+        # Heartbeat at INFO — only fires when there are real-config OSPF
+        # devices (gated above) so it confirms monitoring is alive without
+        # being chatty for misconfigured / orphan-config devices.
+        logger.info(f"[OSPF MONITORING] Periodic OSPF status check completed for {len(devices_with_ospf)} devices")
     
     def _cleanup_ospf_table_for_device(self, device_id, device_name):
         """Clean up OSPF table entries for a removed device."""
