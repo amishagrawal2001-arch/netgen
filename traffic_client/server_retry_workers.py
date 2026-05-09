@@ -189,22 +189,29 @@ class HealthCheckWorker(QThread):
         self.servers = servers.copy()
     
     def _check_server_health(self, server: Dict) -> tuple[bool, Optional[List]]:
-        """Check server health and return (is_online, interfaces)."""
+        """Check server health and return (is_online, interfaces).
+
+        Timeouts (2s ping, 3s interfaces) are intentionally generous: the
+        server can take a full second or two to respond to API calls while
+        it's actively writing stream-stats DB entries (~1000 pps active
+        streams). The previous 0.5s timeouts produced false-negatives that
+        marked the chassis red while the (3s-timeout) stats poller kept
+        succeeding, so ports rendered green underneath an offline chassis
+        — visibly inconsistent.
+        """
         server_address = server.get("address")
         try:
-            # Quick ping check first with very short timeout
-            ping_response = self.session.get(f"{server_address}/api/ping", timeout=0.5)
+            ping_response = self.session.get(f"{server_address}/api/ping", timeout=2)
             if ping_response.status_code != 200:
                 return False, None
-            
-            # If ping succeeds, check interfaces with short timeout
-            interfaces_response = self.session.get(f"{server_address}/api/interfaces", timeout=0.5)
+
+            interfaces_response = self.session.get(f"{server_address}/api/interfaces", timeout=3)
             if interfaces_response.status_code == 200:
                 interfaces = interfaces_response.json()
                 return True, interfaces
             else:
                 return True, None  # Server is online but interfaces failed
-                
+
         except Exception:
             # Don't print every health check failure to reduce spam
             return False, None

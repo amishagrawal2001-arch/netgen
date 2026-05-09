@@ -2579,7 +2579,23 @@ class OSPFHandler:
             logger.info("[OSPF MONITORING] No devices with OSPF configured - stopping monitoring")
             self.stop_ospf_monitoring()
             return
-            
+
+        # Skip the periodic check when no server is online — the table refresh
+        # would just paint stale state and the log line ("Periodic OSPF status
+        # check completed") is misleading since it's actually a local model
+        # refresh, not a server query.
+        mw = getattr(self.parent, 'main_window', None)
+        online_servers = [
+            s for s in (getattr(mw, 'server_interfaces', []) or [])
+            if s.get('online')
+        ]
+        if not online_servers:
+            logger.debug(
+                f"[OSPF MONITORING] Skipping check — {len(devices_with_ospf)} OSPF device(s) "
+                "but no servers online"
+            )
+            return
+
         # Update OSPF table which will refresh all OSPF statuses
         # IMPORTANT: Clear _ospf_just_applied flags before periodic check to allow reload
         # This ensures the periodic check can reload from database after apply has completed
