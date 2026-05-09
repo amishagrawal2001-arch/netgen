@@ -12997,6 +12997,44 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
     table.iface tr:hover td { background: #f9fafb; }
     table.iface button { padding: 4px 10px; font-size: 12px; }
     .iface-empty { padding: 16px; color: var(--muted); text-align: center; font-style: italic; }
+    .ip-cell { font-family: ui-monospace, monospace; font-size: 11px; line-height: 1.6; max-width: 240px; }
+    .ip-cell .ip-line { display: block; }
+    .ip-cell button.ip-manage {
+      margin-top: 4px; padding: 2px 8px; font-size: 11px;
+      background: transparent; color: var(--accent); border: 1px solid var(--accent);
+    }
+    .ip-cell button.ip-manage:hover { background: var(--accent); color: white; }
+    .modal-backdrop {
+      position: fixed; inset: 0; background: rgba(0,0,0,0.45); display: none;
+      align-items: center; justify-content: center; z-index: 1000;
+    }
+    .modal-backdrop.show { display: flex; }
+    .modal {
+      background: var(--card); border-radius: 8px; padding: 20px 22px;
+      width: min(560px, 92vw); max-height: 80vh; overflow: auto;
+      box-shadow: 0 8px 24px rgba(0,0,0,0.18);
+    }
+    .modal h3 { margin: 0 0 4px; font-size: 16px; }
+    .modal .iface-sub { color: var(--muted); font-size: 12px; margin-bottom: 14px; }
+    .modal .ip-row {
+      display: flex; align-items: center; gap: 10px;
+      padding: 6px 0; border-bottom: 1px dashed var(--border);
+      font-family: ui-monospace, monospace; font-size: 12px;
+    }
+    .modal .ip-row .fam {
+      display: inline-block; min-width: 36px; padding: 1px 6px;
+      border-radius: 4px; font-size: 10px; font-weight: 600;
+      background: #e5e7eb; color: #374151; text-transform: uppercase;
+    }
+    .modal .ip-row .fam.v6 { background: #ddd6fe; color: #5b21b6; }
+    .modal .ip-row .cidr { flex: 1; }
+    .modal .add-form { display: flex; gap: 8px; margin-top: 14px; align-items: center; flex-wrap: wrap; }
+    .modal .add-form input[type=text] {
+      padding: 6px 10px; border: 1px solid var(--border); border-radius: 4px;
+      font-family: ui-monospace, monospace; font-size: 12px; flex: 1; min-width: 180px;
+    }
+    .modal .modal-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 16px; }
+    .modal .hint { color: var(--muted); font-size: 11px; margin-top: 6px; }
     .toast {
       position: fixed; bottom: 24px; right: 24px; background: #1f2937; color: white;
       padding: 10px 14px; border-radius: 6px; font-size: 12px; opacity: 0;
@@ -13064,6 +13102,25 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
   </div>
 
   <div class="toast" id="toast"></div>
+
+  <!-- IP management modal -->
+  <div class="modal-backdrop" id="ip-modal-backdrop">
+    <div class="modal">
+      <h3>Manage IP addresses</h3>
+      <div class="iface-sub" id="ip-modal-iface">…</div>
+      <div id="ip-modal-list"><div class="iface-empty">Loading…</div></div>
+      <div class="add-form">
+        <input type="text" id="ip-modal-input" placeholder="e.g. 10.0.0.5/24 or 2001:db8::1/64" autocomplete="off">
+        <button id="ip-modal-add">Add</button>
+      </div>
+      <p class="hint">
+        Changes are applied via <code>ip addr add/del</code> and persist only until the next host reboot.
+      </p>
+      <div class="modal-actions">
+        <button class="secondary" id="ip-modal-close">Close</button>
+      </div>
+    </div>
+  </div>
 
   <script>
     const $ = (id) => document.getElementById(id);
@@ -13254,16 +13311,20 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
         .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
     }
 
+    let _ifaceIPs = {};  // {ifname: {ipv4: [...], ipv6: [...]}} cache for the modal
+
     async function refreshInterfaces() {
       const wrap = $('iface-table-wrap');
       wrap.innerHTML = '<div class="iface-empty">Loading…</div>';
       try {
-        // Fetch interfaces and bind-history in parallel; the history lets
-        // us display the original kernel name on rows that have been bound
-        // to vfio-pci (where /api/dpdk/interfaces only knows the PCI).
-        const [r, hr] = await Promise.all([
+        // Three parallel fetches:
+        //   /api/dpdk/interfaces      — base list
+        //   /api/admin/bind_history   — original names for vfio-pci bound rows
+        //   /api/admin/interface_ips  — per-iface IP addresses
+        const [r, hr, ipr] = await Promise.all([
           fetch('/api/dpdk/interfaces'),
           fetch('/api/admin/bind_history'),
+          fetch('/api/admin/interface_ips'),
         ]);
         if (!r.ok) {
           wrap.innerHTML = '<div class="iface-empty">Failed to load interfaces (HTTP ' + r.status + ')</div>';
@@ -13271,6 +13332,7 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
         }
         const d = await r.json();
         const history = hr.ok ? ((await hr.json()).history || {}) : {};
+        _ifaceIPs = ipr.ok ? ((await ipr.json()).interfaces || {}) : {};
         const list = d.interfaces || [];
         if (!list.length) {
           wrap.innerHTML = '<div class="iface-empty">No interfaces reported.</div>';
@@ -13302,6 +13364,19 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
           } else if (s.hint) {
             actionBtn = `<span style="color: var(--muted); font-size: 11px;" title="${escapeHtml(s.hint)}">no bind needed</span>`;
           }
+          // IP cell: show IPv4/IPv6 lines + a Manage button. Only kernel-
+          // visible interfaces have IPs; vfio-pci rows show "—".
+          let ipCell = '<span style="color: var(--muted);">—</span>';
+          const kernelName = i.name && !looksHeadless ? i.name : null;
+          if (kernelName) {
+            const ips = _ifaceIPs[kernelName] || { ipv4: [], ipv6: [] };
+            const all = [...ips.ipv4, ...ips.ipv6];
+            const lines = all.length
+              ? all.map(c => `<span class="ip-line">${escapeHtml(c)}</span>`).join('')
+              : '<span style="color: var(--muted);">none</span>';
+            ipCell = `<div class="ip-cell">${lines}<button class="ip-manage" data-iface="${escapeHtml(kernelName)}">Manage</button></div>`;
+          }
+
           // `name` is already html-safe (built above; either escapeHtml output
           // or controlled inline markup). Don't double-escape.
           return `
@@ -13311,12 +13386,13 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
               <td>${escapeHtml(vendor)}</td>
               <td><span class="pill ${s.pillClass}">${escapeHtml(s.label)}</span></td>
               <td class="mono">${escapeHtml(kdrv)}</td>
+              <td>${ipCell}</td>
               <td>${actionBtn}</td>
             </tr>`;
         }).join('');
         wrap.innerHTML = `
           <table class="iface">
-            <thead><tr><th>Interface</th><th>PCI</th><th>Vendor</th><th>State</th><th>Kernel driver</th><th></th></tr></thead>
+            <thead><tr><th>Interface</th><th>PCI</th><th>Vendor</th><th>State</th><th>Kernel driver</th><th>IP addresses</th><th></th></tr></thead>
             <tbody>${rows}</tbody>
           </table>`;
         // Stash the list so click handlers can look up by index.
@@ -13424,6 +13500,99 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       }
     });
 
+    // ----- IP management modal -----
+    let _modalIface = null;
+
+    function openIpModal(ifname) {
+      _modalIface = ifname;
+      $('ip-modal-iface').textContent = ifname;
+      $('ip-modal-input').value = '';
+      $('ip-modal-backdrop').classList.add('show');
+      renderModalIPs();
+    }
+    function closeIpModal() {
+      $('ip-modal-backdrop').classList.remove('show');
+      _modalIface = null;
+    }
+    async function renderModalIPs() {
+      const list = $('ip-modal-list');
+      list.innerHTML = '<div class="iface-empty">Loading…</div>';
+      try {
+        const r = await fetch('/api/admin/interface_ips');
+        const d = await r.json();
+        const ips = (d.interfaces || {})[_modalIface] || { ipv4: [], ipv6: [] };
+        const rows = [];
+        ips.ipv4.forEach(c => rows.push(`
+          <div class="ip-row">
+            <span class="fam">v4</span>
+            <span class="cidr">${escapeHtml(c)}</span>
+            <button class="danger" data-cidr="${escapeHtml(c)}">Remove</button>
+          </div>`));
+        ips.ipv6.forEach(c => rows.push(`
+          <div class="ip-row">
+            <span class="fam v6">v6</span>
+            <span class="cidr">${escapeHtml(c)}</span>
+            <button class="danger" data-cidr="${escapeHtml(c)}">Remove</button>
+          </div>`));
+        list.innerHTML = rows.length
+          ? rows.join('')
+          : '<div class="iface-empty">No addresses configured.</div>';
+      } catch (e) {
+        list.innerHTML = '<div class="iface-empty">Error: ' + escapeHtml(String(e)) + '</div>';
+      }
+    }
+    async function modifyIp(action, cidr) {
+      const m = String(cidr).match(/^([^/]+)\/(\d+)$/);
+      if (!m) { toast('Invalid format. Use address/prefix, e.g. 10.0.0.5/24'); return; }
+      const address = m[1].trim();
+      const prefix = parseInt(m[2], 10);
+      try {
+        const r = await fetch('/api/admin/interface_ip', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ iface: _modalIface, action, address, prefix_len: prefix }),
+        });
+        const d = await r.json();
+        if (r.ok && d.success) {
+          toast(`${action === 'add' ? 'Added' : 'Removed'} ${cidr} on ${_modalIface}`);
+          renderModalIPs();
+          refreshInterfaces();  // refresh the main table cell too
+        } else {
+          toast(`Failed: ${d.error || 'HTTP ' + r.status}`);
+        }
+      } catch (e) {
+        toast('Request failed: ' + e);
+      }
+    }
+
+    $('ip-modal-close').addEventListener('click', closeIpModal);
+    $('ip-modal-backdrop').addEventListener('click', (ev) => {
+      if (ev.target === $('ip-modal-backdrop')) closeIpModal();
+    });
+    $('ip-modal-add').addEventListener('click', () => {
+      const v = $('ip-modal-input').value.trim();
+      if (!v) { toast('Enter address/prefix'); return; }
+      modifyIp('add', v);
+      $('ip-modal-input').value = '';
+    });
+    $('ip-modal-input').addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter') $('ip-modal-add').click();
+    });
+    $('ip-modal-list').addEventListener('click', (ev) => {
+      const btn = ev.target.closest('button[data-cidr]');
+      if (!btn) return;
+      const cidr = btn.dataset.cidr;
+      if (!confirm(`Remove ${cidr} from ${_modalIface}?`)) return;
+      modifyIp('remove', cidr);
+    });
+
+    // Open modal when user clicks a Manage button in the interface table.
+    document.addEventListener('click', (ev) => {
+      const btn = ev.target.closest('button.ip-manage');
+      if (!btn) return;
+      const ifname = btn.dataset.iface;
+      if (ifname) openIpModal(ifname);
+    });
+
     $('btn-refresh-ifaces').addEventListener('click', refreshInterfaces);
 
     // Initial render + auto-refresh every 30s. Interface list refreshes on
@@ -13437,6 +13606,90 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
 </body>
 </html>
 """
+
+
+@app.route("/api/admin/interface_ips", methods=["GET"])
+def api_admin_interface_ips():
+    """Return IPv4 + IPv6 addresses on every kernel-visible interface."""
+    try:
+        result = subprocess.run(
+            ["ip", "-j", "addr", "show"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return jsonify({"error": (result.stderr or "ip addr failed").strip()}), 500
+        entries = json.loads(result.stdout or "[]")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+    out = {}
+    for entry in entries:
+        name = entry.get("ifname")
+        if not name:
+            continue
+        ipv4, ipv6 = [], []
+        for addr in entry.get("addr_info", []):
+            local = addr.get("local")
+            pl = addr.get("prefixlen")
+            if not local or pl is None:
+                continue
+            cidr = f"{local}/{pl}"
+            family = addr.get("family")
+            if family == "inet":
+                ipv4.append(cidr)
+            elif family == "inet6":
+                # Skip link-local addresses (fe80::/10) — they're auto-assigned
+                # to every iface and just clutter the display. User-configured
+                # link-local addrs aren't a real workflow.
+                if not local.lower().startswith("fe80:"):
+                    ipv6.append(cidr)
+        out[name] = {"ipv4": ipv4, "ipv6": ipv6, "operstate": entry.get("operstate", "UNKNOWN")}
+    return jsonify({"interfaces": out})
+
+
+@app.route("/api/admin/interface_ip", methods=["POST"])
+def api_admin_interface_ip():
+    """Add or remove an IP address on an interface (transient — not persistent)."""
+    data = request.get_json(silent=True) or {}
+    iface = (data.get("iface") or "").strip()
+    action = (data.get("action") or "").strip()
+    address = (data.get("address") or "").strip()
+    prefix_raw = data.get("prefix_len")
+
+    if action not in ("add", "remove"):
+        return jsonify({"error": "action must be 'add' or 'remove'"}), 400
+    if not iface:
+        return jsonify({"error": "iface required"}), 400
+    if not re.match(r"^[A-Za-z0-9._:-]+$", iface):
+        return jsonify({"error": f"invalid iface name: {iface!r}"}), 400
+    if not address:
+        return jsonify({"error": "address required"}), 400
+    try:
+        prefix = int(prefix_raw)
+    except (TypeError, ValueError):
+        return jsonify({"error": "prefix_len must be an integer"}), 400
+    if not (1 <= prefix <= 128):
+        return jsonify({"error": "prefix_len out of range (1..128)"}), 400
+    # `ip` is fine validating address syntax; reject only obvious shell metas
+    # to keep the input space tight even though we never invoke a shell.
+    if any(c in address for c in (";", "&", "|", "`", "$", "(", ")", "<", ">", "\n")):
+        return jsonify({"error": "invalid characters in address"}), 400
+
+    cmd = ["ip", "addr", "add" if action == "add" else "del", f"{address}/{prefix}", "dev", iface]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+    except Exception as e:
+        return jsonify({"error": f"ip command failed: {e}"}), 500
+    if result.returncode != 0:
+        return jsonify({
+            "error": (result.stderr or result.stdout or "ip command exited non-zero").strip(),
+            "cmd": " ".join(cmd),
+            "rc": result.returncode,
+        }), 500
+    return jsonify({
+        "success": True, "iface": iface, "action": action,
+        "address": f"{address}/{prefix}",
+    })
 
 
 @app.route("/api/admin/bind_history", methods=["GET", "POST"])
