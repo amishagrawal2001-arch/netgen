@@ -739,6 +739,28 @@ class TrafficGeneratorClient(
         dpdk_load_modules_action.triggered.connect(self.load_vfio_modules)
         dpdk_menu.addAction(dpdk_load_modules_action)
 
+        # Help menu — guides + about
+        help_menu = QMenu("&Help", self)
+        menu_bar.addMenu(help_menu)
+        help_menu.setToolTipsVisible(True)
+
+        dpdk_guide_action = QAction("DPDK Traffic Blast Workflow...", self)
+        dpdk_guide_action.setToolTip(
+            "Step-by-step guide to using DPDK tx_worker for line-rate traffic generation, "
+            "including TX core sizing, calibrated performance numbers, and troubleshooting."
+        )
+        dpdk_guide_action.triggered.connect(self.show_dpdk_workflow_guide)
+        help_menu.addAction(dpdk_guide_action)
+
+    def show_dpdk_workflow_guide(self):
+        """Open the DPDK Workflow Guide dialog from the Help menu."""
+        try:
+            from widgets.stream_dialog import show_dpdk_usage_guide
+            show_dpdk_usage_guide(self)
+        except Exception as e:
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Help unavailable", f"Could not open guide: {e}")
+
     def copy_selected_device(self):
         """Copy the selected device - delegate to devices tab."""
         self.devices_tab.copy_selected_device()
