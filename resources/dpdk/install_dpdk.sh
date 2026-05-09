@@ -344,7 +344,13 @@ step_install_dependencies() {
     fi
     
     log_info "Installing build dependencies..."
-    local deps_install_cmd="apt-get install -y --option Acquire::http::Timeout=30 --option Acquire::ftp::Timeout=30 build-essential meson ninja-build pkg-config libnuma-dev libelf-dev libpcap-dev"
+    # Base toolchain + DPDK runtime libs needed by every PMD:
+    #   build-essential meson ninja-build pkg-config libnuma-dev libelf-dev libpcap-dev
+    # Mellanox / NVIDIA mlx5 PMD prereqs (libibverbs / libmlx5 / rdma-core):
+    #   harmless on non-Mellanox boxes (just adds ~30 MB of unused libs),
+    #   but skipping them on a Mellanox-equipped box silently disables the
+    #   mlx5 PMD at meson-config time so DPDK can't drive those NICs at all.
+    local deps_install_cmd="apt-get install -y --option Acquire::http::Timeout=30 --option Acquire::ftp::Timeout=30 build-essential meson ninja-build pkg-config libnuma-dev libelf-dev libpcap-dev libibverbs-dev libmlx5-dev rdma-core"
     
     # Try to install dependencies
     if eval "$deps_install_cmd" 2>&1 | tee /tmp/dpdk_deps_install.log; then
