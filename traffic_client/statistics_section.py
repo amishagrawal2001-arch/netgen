@@ -158,9 +158,9 @@ class TrafficGenClientStatisticsSection():
         
         # Stream Statistics Table
         self.stream_statistics_table = QTableWidget()
-        self.stream_statistics_table.setColumnCount(9)  # Set to 9 columns
+        self.stream_statistics_table.setColumnCount(10)
         self.stream_statistics_table.setHorizontalHeaderLabels([
-            "Stream Name", "Interface", "TX Count", "RX Count", "TX Rate", "RX Rate", 
+            "Stream Name", "Interface", "Engine", "TX Count", "RX Count", "TX Rate", "RX Rate",
             "Loss %", "Status", "Flow Tracking"
         ])
         self.stream_statistics_table.setStyleSheet(table_style)
@@ -848,14 +848,14 @@ class TrafficGenClientStatisticsSection():
             logger.debug(f"[DEBUG STREAM STATS] stream_statistics_table not found or not initialized")
             return
         
-        # Set column count first (9 columns: Stream Name, Interface, TX Count, RX Count, TX Rate, RX Rate, Loss %, Status, Flow Tracking)
+        # Set column count first (10 columns; Engine column added between Interface and TX Count)
         try:
-            self.stream_statistics_table.setColumnCount(9)
+            self.stream_statistics_table.setColumnCount(10)
             self.stream_statistics_table.setHorizontalHeaderLabels([
-                "Stream Name", "Interface", "TX Count", "RX Count", "TX Rate", "RX Rate", 
+                "Stream Name", "Interface", "Engine", "TX Count", "RX Count", "TX Rate", "RX Rate",
                 "Loss %", "Status", "Flow Tracking"
             ])
-            
+
             self.stream_statistics_table.setRowCount(0)
         except Exception as e:
             logger.debug(f"[DEBUG STREAM STATS] Error initializing stream_statistics_table: {e}")
@@ -945,6 +945,8 @@ class TrafficGenClientStatisticsSection():
                 "loss_pct": loss_pct,
                 "status": status,
                 "flow_tracking": flow_tracking,
+                "dpdk_enable": bool(stream.get("dpdk_enable", False)),
+                "dpdk_tx_cores": int(stream.get("dpdk_tx_cores") or 1),
                 "stream_id": stream_id
             })
         
@@ -963,12 +965,33 @@ class TrafficGenClientStatisticsSection():
             # Interface
             iface_item = QTableWidgetItem(stream["interface"])
             self.stream_statistics_table.setItem(row, 1, iface_item)
-            
+
+            # Engine — show DPDK queue count if multi-queue, else "Scapy"
+            if stream.get("dpdk_enable"):
+                tx_cores = int(stream.get("dpdk_tx_cores") or 1)
+                if tx_cores > 1:
+                    engine_label = f"DPDK ×{tx_cores}"
+                else:
+                    engine_label = "DPDK"
+                engine_color = QColor("#1d4ed8")  # Blue for DPDK
+            else:
+                engine_label = "Scapy"
+                engine_color = QColor("#6b7280")  # Gray
+            engine_item = QTableWidgetItem(engine_label)
+            engine_item.setTextAlignment(Qt.AlignCenter)
+            engine_item.setForeground(engine_color)
+            engine_item.setFont(QFont("", 10, QFont.Bold))
+            engine_item.setToolTip(
+                f"Engine: {'DPDK tx_worker' if stream.get('dpdk_enable') else 'Scapy/kernel'}"
+                + (f"\nTX queues: {stream.get('dpdk_tx_cores', 1)}" if stream.get("dpdk_enable") else "")
+            )
+            self.stream_statistics_table.setItem(row, 2, engine_item)
+
             # TX Count
             tx_item = QTableWidgetItem(format_number(stream["tx_count"]))
             tx_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            self.stream_statistics_table.setItem(row, 2, tx_item)
-            
+            self.stream_statistics_table.setItem(row, 3, tx_item)
+
             # RX Count
             rx_count = stream["rx_count"]
             if rx_count is None:
@@ -979,8 +1002,8 @@ class TrafficGenClientStatisticsSection():
             rx_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             if stream["flow_tracking"] and isinstance(rx_count, int) and stream["tx_count"] > 0 and rx_count == 0:
                 rx_item.setForeground(QColor("#ef4444"))  # Red for 100% loss
-            self.stream_statistics_table.setItem(row, 3, rx_item)
-            
+            self.stream_statistics_table.setItem(row, 4, rx_item)
+
             # TX Rate
             tx_rate = stream.get("tx_rate")
             if tx_rate is None or tx_rate == 0.0:
@@ -989,8 +1012,8 @@ class TrafficGenClientStatisticsSection():
                 tx_rate_display = format_rate(tx_rate)
             tx_rate_item = QTableWidgetItem(tx_rate_display)
             tx_rate_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            self.stream_statistics_table.setItem(row, 4, tx_rate_item)
-            
+            self.stream_statistics_table.setItem(row, 5, tx_rate_item)
+
             # RX Rate
             rx_rate = stream.get("rx_rate")
             if rx_rate is None or rx_rate == 0.0:
@@ -999,14 +1022,14 @@ class TrafficGenClientStatisticsSection():
                 rx_rate_display = format_rate(rx_rate)
             rx_rate_item = QTableWidgetItem(rx_rate_display)
             rx_rate_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            self.stream_statistics_table.setItem(row, 5, rx_rate_item)
-            
+            self.stream_statistics_table.setItem(row, 6, rx_rate_item)
+
             # Loss %
             loss_pct = stream["loss_pct"]
             loss_item = QTableWidgetItem(f"{loss_pct:.2f}%")
             loss_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             loss_item.setFont(QFont("", 10, QFont.Bold))
-            
+
             # Color code loss percentage
             if loss_pct > 50:
                 loss_item.setForeground(QColor("#ef4444"))  # Red for >50% loss
@@ -1016,9 +1039,9 @@ class TrafficGenClientStatisticsSection():
                 loss_item.setForeground(QColor("#fbbf24"))  # Yellow for >0% loss
             else:
                 loss_item.setForeground(QColor("#10b981"))  # Green for 0% loss
-            
-            self.stream_statistics_table.setItem(row, 6, loss_item)
-            
+
+            self.stream_statistics_table.setItem(row, 7, loss_item)
+
             # Status
             status = stream["status"]
             status_item = QTableWidgetItem(status)
@@ -1029,12 +1052,12 @@ class TrafficGenClientStatisticsSection():
             else:
                 status_item.setForeground(QColor("#ef4444"))  # Red
             status_item.setFont(QFont("", 10, QFont.Bold))
-            self.stream_statistics_table.setItem(row, 7, status_item)
-            
+            self.stream_statistics_table.setItem(row, 8, status_item)
+
             # Flow Tracking
             flow_tracking_item = QTableWidgetItem("Yes" if stream["flow_tracking"] else "No")
             flow_tracking_item.setTextAlignment(Qt.AlignCenter)
-            self.stream_statistics_table.setItem(row, 8, flow_tracking_item)
+            self.stream_statistics_table.setItem(row, 9, flow_tracking_item)
         
         # Resize columns to fit content
         self.stream_statistics_table.resizeColumnsToContents()
@@ -1055,7 +1078,7 @@ class TrafficGenClientStatisticsSection():
         # Also clear stream statistics table
         if hasattr(self, "stream_statistics_table"):
             self.stream_statistics_table.setRowCount(0)
-            self.stream_statistics_table.setColumnCount(9)  # Keep column count at 9
+            self.stream_statistics_table.setColumnCount(10)  # Includes Engine column
         
         #print("Traffic statistics cleared.")
     def enable_make_server_online_menu(self):
