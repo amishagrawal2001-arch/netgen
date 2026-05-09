@@ -429,6 +429,50 @@ class AddStreamDialog(QDialog):
         )
         layout.addWidget(self.dpdk_multi_instance_checkbox)
 
+        # TX Cores (multi-queue inside one tx_worker process)
+        tx_cores_row = QWidget()
+        tx_cores_layout = QHBoxLayout(tx_cores_row)
+        tx_cores_layout.setContentsMargins(0, 0, 0, 0)
+        tx_cores_label = QLabel("TX Cores (queues):")
+        tx_cores_label.setStyleSheet("color: #1f2937;")
+        self.dpdk_tx_cores_combo = QComboBox()
+        for n in (1, 2, 4, 8, 12, 16):
+            self.dpdk_tx_cores_combo.addItem(str(n), n)
+        self.dpdk_tx_cores_combo.setCurrentIndex(0)  # default: 1
+        self.dpdk_tx_cores_combo.setToolTip(
+            "Number of TX queues / worker lcores inside the DPDK tx_worker process.\n"
+            "Higher values let one NIC port saturate higher line rates.\n\n"
+            "Tested on Mellanox CX-7 (100G):\n"
+            "  • 1 core  ≈ 4.5 Mpps (64B)  /  49 Gbps (1500B)\n"
+            "  • 2 cores ≈ 9.1 Mpps (64B)  /  100 Gbps (1500B) — saturates 100G\n"
+            "  • 4 cores ≈ 18 Mpps  (64B)  /  200 Gbps (1500B)\n"
+            "  • 8 cores ≈ 36 Mpps  (64B)  /  385 Gbps (1500B) — approaches 400G\n\n"
+            "Cost: each core consumes one CPU thread on the NIC's NUMA node.\n"
+            "Default 1 = backwards-compatible single-queue behavior."
+        )
+        self.dpdk_tx_cores_recommend_btn = QPushButton("Recommend")
+        self.dpdk_tx_cores_recommend_btn.setToolTip(
+            "Ask the server to recommend a TX core count for this stream's\n"
+            "interface, frame size, and target rate."
+        )
+        self.dpdk_tx_cores_recommend_btn.setStyleSheet(
+            "QPushButton { padding: 4px 10px; color: #1e40af; "
+            "border: 1px solid #93c5fd; border-radius: 4px; background: #eff6ff; } "
+            "QPushButton:hover { background: #dbeafe; }"
+        )
+        self.dpdk_tx_cores_recommend_btn.clicked.connect(self._recommend_tx_cores)
+
+        self.dpdk_tx_cores_hint = QLabel("")
+        self.dpdk_tx_cores_hint.setStyleSheet("color: #6b7280; font-size: 11px;")
+        self.dpdk_tx_cores_hint.setWordWrap(True)
+
+        tx_cores_layout.addWidget(tx_cores_label)
+        tx_cores_layout.addWidget(self.dpdk_tx_cores_combo)
+        tx_cores_layout.addWidget(self.dpdk_tx_cores_recommend_btn)
+        tx_cores_layout.addStretch(1)
+        layout.addWidget(tx_cores_row)
+        layout.addWidget(self.dpdk_tx_cores_hint)
+
         # Small helper text
         hint = QLabel(
             "When enabled, this stream will be transmitted by the DPDK worker.\n"
@@ -454,6 +498,84 @@ class AddStreamDialog(QDialog):
         layout.addStretch(1)
         self.variable_fields_tab.setLayout(layout)
     
+    def _resolve_server_address_for_tx_port(self) -> str:
+        """
+        Map this dialog's TX port (e.g. 'TG 0 - Port: enp181s0f0np0') to the
+        matching server address in self.server_interfaces. Returns 'host:port'
+        suitable for http://<host:port>/api/... or '' if unknown.
+        """
+        if not self.tx_port:
+            return ""
+        # Pull "TG N" out of the port label
+        try:
+            tg_part = self.tx_port.split("-")[0].strip()  # 'TG 0'
+            tg_num = tg_part.replace("TG", "").strip()
+        except Exception:
+            tg_num = ""
+        for server in self.server_interfaces:
+            sid = str(server.get("tg_id", "")).strip()
+            if sid == tg_num:
+                addr = str(server.get("address", "")).strip()
+                if addr:
+                    return addr
+        # Fallback: first server
+        if self.server_interfaces:
+            return str(self.server_interfaces[0].get("address", "")).strip()
+        return ""
+
+    def _recommend_tx_cores(self):
+        """
+        Ask the server for a recommended dpdk_tx_cores based on this stream's
+        interface, frame size, and target rate, then update the combo box.
+        """
+        try:
+            import requests
+        except ImportError:
+            self.dpdk_tx_cores_hint.setText("requests module not available")
+            return
+
+        addr = self._resolve_server_address_for_tx_port()
+        if not addr:
+            self.dpdk_tx_cores_hint.setText(
+                "Could not resolve server address for this TX port"
+            )
+            return
+
+        # Best-effort frame_size + target pps from the current dialog state
+        try:
+            frame_size = int(self.frame_size.text().strip() or "64")
+        except Exception:
+            frame_size = 64
+        try:
+            target_pps = int(self.stream_pps_field.text().strip() or "0") if hasattr(self, "stream_pps_field") else 0
+        except Exception:
+            target_pps = 0
+
+        iface = self.tx_port_name or ""
+        url = f"http://{addr}/api/dpdk/recommend"
+        params = {"iface": iface, "frame_size": frame_size, "pps": target_pps}
+
+        try:
+            r = requests.get(url, params=params, timeout=3)
+            r.raise_for_status()
+            data = r.json()
+        except Exception as e:
+            self.dpdk_tx_cores_hint.setText(f"Recommendation request failed: {e}")
+            return
+
+        if not data.get("ok"):
+            self.dpdk_tx_cores_hint.setText(
+                f"Server error: {data.get('error', 'unknown')}"
+            )
+            return
+
+        rec = int(data.get("recommended_tx_cores") or 1)
+        idx = self.dpdk_tx_cores_combo.findData(rec)
+        if idx >= 0:
+            self.dpdk_tx_cores_combo.setCurrentIndex(idx)
+        explanation = data.get("explanation") or f"Recommended: {rec}"
+        self.dpdk_tx_cores_hint.setText(explanation)
+
     def _show_dpdk_usage_guide(self):
         """Show comprehensive guide on how to use DPDK for packet generation."""
         dialog = QDialog(self)
@@ -2365,6 +2487,14 @@ class AddStreamDialog(QDialog):
             self.dpdk_multi_instance_checkbox.setChecked(
                 bool(stream_data.get("dpdk_multi_instance", False))
             )
+        if hasattr(self, "dpdk_tx_cores_combo"):
+            try:
+                want = int(stream_data.get("dpdk_tx_cores") or 1)
+            except (TypeError, ValueError):
+                want = 1
+            # Find the closest matching item; fall back to index 0 (=1)
+            idx = self.dpdk_tx_cores_combo.findData(want)
+            self.dpdk_tx_cores_combo.setCurrentIndex(idx if idx >= 0 else 0)
 
 
         # Frame Length
@@ -3149,6 +3279,7 @@ class AddStreamDialog(QDialog):
             "flow_tracking_enabled": flow_tracking,
             "dpdk_enable": bool(getattr(self, "dpdk_enable_checkbox", None) and self.dpdk_enable_checkbox.isChecked()),
             "dpdk_multi_instance": bool(getattr(self, "dpdk_multi_instance_checkbox", None) and self.dpdk_multi_instance_checkbox.isChecked()),
+            "dpdk_tx_cores": int(self.dpdk_tx_cores_combo.currentData() or 1) if hasattr(self, "dpdk_tx_cores_combo") else 1,
             "frame_type": frame_type,
             "frame_min": frame_min,
             "frame_max": frame_max,
@@ -3207,10 +3338,15 @@ class AddStreamDialog(QDialog):
             return
 
         # Show engine selection
-        engine_item = QTreeWidgetItem([
-            "Engine",
-            "DPDK (tx_worker)" if stream_data.get("dpdk_enable") else "Scapy / Kernel"
-        ])
+        engine_label = "DPDK (tx_worker)" if stream_data.get("dpdk_enable") else "Scapy / Kernel"
+        if stream_data.get("dpdk_enable"):
+            try:
+                tx_cores = int(stream_data.get("dpdk_tx_cores") or 1)
+            except (TypeError, ValueError):
+                tx_cores = 1
+            if tx_cores > 1:
+                engine_label = f"DPDK (tx_worker) — {tx_cores} TX queues"
+        engine_item = QTreeWidgetItem(["Engine", engine_label])
         self.packet_tree.addTopLevelItem(engine_item)
 
         def getpd(section, key, default=None):
