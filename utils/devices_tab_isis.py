@@ -1591,13 +1591,40 @@ class ISISHandler:
 
     def periodic_isis_status_check(self):
         """Periodic ISIS status check - called by timer."""
+        # Symmetry with OSPF's periodic_ospf_status_check: refuse to run if the
+        # user has stopped monitoring. Without this guard the timer keeps
+        # firing forever once start_isis_monitoring was ever called.
+        if not getattr(self.parent, 'isis_monitoring_active', False):
+            return
         try:
-            # Get all devices with ISIS configured
+            # Get devices that ACTUALLY have ISIS configured — not just devices
+            # whose protocols list mentions "IS-IS". Many devices end up with
+            # "IS-IS" listed in protocols from earlier sessions or templates
+            # but have no isis_config / is_is_config dict, meaning the user
+            # never finished configuring the protocol. Periodic monitoring on
+            # such devices is just noise.
+            def has_real_isis_config(device):
+                if not device.get("protocols") or "IS-IS" not in device.get("protocols", []):
+                    return False
+                cfg = device.get("isis_config") or device.get("is_is_config") or {}
+                if not isinstance(cfg, dict):
+                    return False
+                # area_id is the minimum required ISIS config; if it's missing,
+                # the device hasn't been configured for ISIS in any meaningful way.
+                return bool(cfg.get("area_id"))
+
             isis_devices = []
             for iface, devices in self.parent.main_window.all_devices.items():
                 for device in devices:
-                    if device.get("protocols") and "IS-IS" in device.get("protocols", {}):
+                    if has_real_isis_config(device):
                         isis_devices.append(device)
+
+            if not isis_devices:
+                # Nothing to monitor; auto-stop so the timer doesn't keep firing.
+                logger.info("[ISIS MONITORING] No devices with ISIS configured - stopping monitoring")
+                if hasattr(self, 'stop_isis_monitoring'):
+                    self.stop_isis_monitoring()
+                return
 
             # Skip the table refresh + log when no server is online — the table
             # would just paint stale state and the log line is misleading
@@ -1608,20 +1635,19 @@ class ISISHandler:
                 s for s in (getattr(mw, 'server_interfaces', []) or [])
                 if s.get('online')
             ]
-            if isis_devices and not online_servers:
+            if not online_servers:
                 logger.debug(
                     f"[ISIS MONITORING] Skipping check — {len(isis_devices)} ISIS device(s) "
                     "but no servers online"
                 )
                 return
 
-            if isis_devices:
-                logger.info(f"[ISIS MONITORING] Periodic ISIS status check for {len(isis_devices)} devices")
-                # Use QTimer.singleShot to defer table update and avoid blocking UI thread
-                # This ensures the periodic check doesn't block the UI during table updates
-                from PyQt5.QtCore import QTimer
-                QTimer.singleShot(0, self.update_isis_table)  # Defer to next event loop iteration
-            
+            logger.info(f"[ISIS MONITORING] Periodic ISIS status check for {len(isis_devices)} devices")
+            # Use QTimer.singleShot to defer table update and avoid blocking UI thread
+            # This ensures the periodic check doesn't block the UI during table updates
+            from PyQt5.QtCore import QTimer
+            QTimer.singleShot(0, self.update_isis_table)  # Defer to next event loop iteration
+
         except Exception as e:
             logger.error(f"[ISIS MONITORING ERROR] Error in periodic ISIS status check: {e}")
     
