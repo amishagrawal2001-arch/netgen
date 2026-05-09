@@ -171,38 +171,46 @@ class OSPFHandler:
     
     def update_ospf_table(self):
         """Update OSPF table with data from devices."""
-        # Auto-start OSPF monitoring if we have OSPF devices and monitoring is not active
+        # Auto-start OSPF / ISIS monitoring only when at least one device has
+        # a *real* protocol config — not just the protocol name in its
+        # protocols list. Sessions often have devices with
+        # protocols=["OSPF","IS-IS","BGP"] but empty config dicts; in that
+        # case the user hasn't actually configured the protocol and the
+        # monitor would just produce log noise every 20s.
         if not self.parent.ospf_monitoring_active:
-            has_ospf_devices = False
-            for iface, devices in self.parent.main_window.all_devices.items():
-                for device in devices:
-                    device_protocols = device.get("protocols", [])
-                    if isinstance(device_protocols, str):
-                        try:
-                            import json
-                            device_protocols = json.loads(device_protocols)
-                        except Exception:
-                            device_protocols = []
-                    
-                    if "OSPF" in device_protocols:
-                        has_ospf_devices = True
-                        break
-                if has_ospf_devices:
-                    break
-            
-            if has_ospf_devices:
+            def _has_protocol_config(device, proto, cfg_keys, area_keys):
+                device_protocols = device.get("protocols", [])
+                if isinstance(device_protocols, str):
+                    try:
+                        import json as _json
+                        device_protocols = _json.loads(device_protocols)
+                    except Exception:
+                        device_protocols = []
+                if proto not in (device_protocols or []):
+                    return False
+                # Any of the listed config dicts non-empty + area-style key set
+                for k in cfg_keys:
+                    cfg = device.get(k) or {}
+                    if isinstance(cfg, dict) and any(cfg.get(a) for a in area_keys):
+                        return True
+                return False
+
+            ospf_real = any(
+                _has_protocol_config(d, "OSPF", ["ospf_config"], ["area", "area_id"])
+                for devices in self.parent.main_window.all_devices.values()
+                for d in devices
+            )
+            if ospf_real:
                 logger.info("[OSPF AUTO-START] Auto-starting OSPF monitoring for existing OSPF devices")
                 self.start_ospf_monitoring()
-            
-            # Auto-start ISIS monitoring if ISIS devices exist
-            isis_devices_exist = any(
-                device.get("protocols") and "IS-IS" in device.get("protocols", {})
+
+            isis_real = any(
+                _has_protocol_config(d, "IS-IS", ["isis_config", "is_is_config"], ["area_id"])
                 for devices in self.parent.main_window.all_devices.values()
-                for device in devices
+                for d in devices
             )
-            if isis_devices_exist:
+            if isis_real:
                 logger.info("[ISIS AUTO-START] Auto-starting ISIS monitoring for existing ISIS devices")
-                # Note: This would need to be handled by ISIS handler
                 if hasattr(self.parent, 'start_isis_monitoring'):
                     self.parent.start_isis_monitoring()
         
@@ -2558,22 +2566,35 @@ class OSPFHandler:
         """Periodic OSPF status check for all devices with OSPF configured."""
         if not self.parent.ospf_monitoring_active:
             return
-        
-        # Check if any devices have OSPF configured
+
+        # Count devices that ACTUALLY have OSPF configured — having "OSPF"
+        # in the protocols list isn't enough. Many devices end up with
+        # "OSPF" listed from earlier sessions / templates but no ospf_config
+        # dict, meaning the user never finished setting it up. Periodic
+        # monitoring on such devices is just log noise.
+        def has_real_ospf_config(device):
+            device_protocols = device.get("protocols", [])
+            if isinstance(device_protocols, str):
+                try:
+                    import json as _json
+                    device_protocols = _json.loads(device_protocols)
+                except Exception:
+                    device_protocols = []
+            if "OSPF" not in (device_protocols or []):
+                return False
+            cfg = device.get("ospf_config") or {}
+            if not isinstance(cfg, dict):
+                return False
+            # area is the bare minimum for any OSPF config; without it nothing
+            # has been configured.
+            return bool(cfg.get("area") or cfg.get("area_id"))
+
         devices_with_ospf = []
         for iface, devices in self.parent.main_window.all_devices.items():
             for device in devices:
-                device_protocols = device.get("protocols", [])
-                if isinstance(device_protocols, str):
-                    try:
-                        import json
-                        device_protocols = json.loads(device_protocols)
-                    except Exception:
-                        device_protocols = []
-                
-                if "OSPF" in device_protocols:
+                if has_real_ospf_config(device):
                     devices_with_ospf.append(device)
-        
+
         # If no devices have OSPF configured, stop monitoring
         if not devices_with_ospf:
             logger.info("[OSPF MONITORING] No devices with OSPF configured - stopping monitoring")
