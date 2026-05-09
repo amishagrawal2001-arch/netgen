@@ -12707,6 +12707,29 @@ _ADMIN_INSTALL_STATE = {
     "return_code": None,
 }
 
+# Map PCI address → {name, kernel_driver, bound_at} for interfaces the user
+# has bound to vfio-pci. After binding, the kernel deletes the netdev so
+# /api/dpdk/interfaces returns name="(no interface)" — the user loses sight
+# of what was bound. Recording the original name at bind time lets the
+# portal still show "eno12399np0 (DPDK)" in the table.
+_ADMIN_BIND_HISTORY_PATH = "/tmp/netgen_admin_bind_history.json"
+
+
+def _load_bind_history():
+    try:
+        with open(_ADMIN_BIND_HISTORY_PATH, "r") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_bind_history(history):
+    try:
+        with open(_ADMIN_BIND_HISTORY_PATH, "w") as f:
+            json.dump(history, f, indent=2)
+    except Exception as e:
+        logging.warning(f"[ADMIN BIND HISTORY] save failed: {e}")
+
 
 @app.route("/api/admin/health", methods=["GET"])
 def api_admin_health():
@@ -13235,12 +13258,19 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       const wrap = $('iface-table-wrap');
       wrap.innerHTML = '<div class="iface-empty">Loading…</div>';
       try {
-        const r = await fetch('/api/dpdk/interfaces');
+        // Fetch interfaces and bind-history in parallel; the history lets
+        // us display the original kernel name on rows that have been bound
+        // to vfio-pci (where /api/dpdk/interfaces only knows the PCI).
+        const [r, hr] = await Promise.all([
+          fetch('/api/dpdk/interfaces'),
+          fetch('/api/admin/bind_history'),
+        ]);
         if (!r.ok) {
           wrap.innerHTML = '<div class="iface-empty">Failed to load interfaces (HTTP ' + r.status + ')</div>';
           return;
         }
         const d = await r.json();
+        const history = hr.ok ? ((await hr.json()).history || {}) : {};
         const list = d.interfaces || [];
         if (!list.length) {
           wrap.innerHTML = '<div class="iface-empty">No interfaces reported.</div>';
@@ -13248,10 +13278,22 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
         }
         const rows = list.map((i, idx) => {
           const s = ifaceState(i);
-          const name = i.name && i.name !== 'N/A' ? i.name : '(no interface)';
-          const vendor = i.vendor || i.vendor_name || '—';
           const pci = i.pci || '—';
-          const kdrv = i.kernel_driver || '—';
+          const vendor = i.vendor || i.vendor_name || '—';
+          // If the row has no kernel name (vfio-pci bound), look up bind
+          // history for the original. Show "<original> (DPDK)" when found
+          // so the user can identify which physical port was bound.
+          let name;
+          let kdrv = i.kernel_driver || '—';
+          const looksHeadless = !i.name || i.name === 'N/A' || /\(no interface\)/.test(i.name);
+          if (looksHeadless && history[pci] && history[pci].name) {
+            name = `${history[pci].name} <span style="color: var(--muted); font-weight: normal;">(DPDK)</span>`;
+            if (kdrv === '—' && history[pci].kernel_driver) kdrv = history[pci].kernel_driver;
+          } else if (looksHeadless) {
+            name = '<span style="color: var(--muted);">(no interface)</span>';
+          } else {
+            name = escapeHtml(i.name);
+          }
           let actionBtn = '';
           if (s.action === 'bind') {
             actionBtn = `<button data-idx="${idx}" data-action="bind">Bind to DPDK</button>`;
@@ -13260,9 +13302,11 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
           } else if (s.hint) {
             actionBtn = `<span style="color: var(--muted); font-size: 11px;" title="${escapeHtml(s.hint)}">no bind needed</span>`;
           }
+          // `name` is already html-safe (built above; either escapeHtml output
+          // or controlled inline markup). Don't double-escape.
           return `
             <tr>
-              <td><b>${escapeHtml(name)}</b></td>
+              <td><b>${name}</b></td>
               <td class="mono">${escapeHtml(pci)}</td>
               <td>${escapeHtml(vendor)}</td>
               <td><span class="pill ${s.pillClass}">${escapeHtml(s.label)}</span></td>
@@ -13283,6 +13327,22 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
     }
 
     async function bindInterface(iface, force) {
+      // Record the original kernel name + driver before binding. After the
+      // bind succeeds the kernel netdev disappears and we lose this info,
+      // so capture it now while the iface object still has it.
+      if (!force && iface.pci && iface.pci.includes(':')) {
+        try {
+          await fetch('/api/admin/bind_history', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+              pci: iface.pci,
+              name: iface.name || '',
+              kernel_driver: iface.driver || iface.kernel_driver || '',
+            }),
+          });
+        } catch (_) { /* non-fatal — bind still works without the record */ }
+      }
+
       const payload = { interface: iface.name, force: !!force };
       if (iface.pci && iface.pci !== 'N/A' && iface.pci.includes(':')) {
         payload.pci = iface.pci;
@@ -13377,6 +13437,31 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
 </body>
 </html>
 """
+
+
+@app.route("/api/admin/bind_history", methods=["GET", "POST"])
+def api_admin_bind_history():
+    """Track / fetch original kernel names of vfio-pci bound NICs.
+
+    POST {pci, name, kernel_driver} — record before binding.
+    GET                              — return the full history dict.
+    """
+    history = _load_bind_history()
+    if request.method == "POST":
+        data = request.get_json(silent=True) or {}
+        pci = data.get("pci")
+        if not pci:
+            return jsonify({"error": "pci required"}), 400
+        import datetime as _dt
+        history[pci] = {
+            "name": data.get("name") or "",
+            "kernel_driver": data.get("kernel_driver") or "",
+            "bound_at": _dt.datetime.now().isoformat(),
+        }
+        _save_bind_history(history)
+        return jsonify({"recorded": True, "pci": pci, "history_size": len(history)})
+    # GET
+    return jsonify({"history": history})
 
 
 @app.route("/admin", methods=["GET"])
