@@ -13184,17 +13184,35 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       const driver = (iface.driver || '').toLowerCase();
       const status = (iface.status || '').toLowerCase();
 
-      // Mellanox / NVIDIA NICs use the mlx5 PMD, which talks to the NIC
-      // via libibverbs while the kernel driver stays loaded. Binding to
-      // vfio-pci would actually break DPDK. Surface the NIC as ready, no
-      // bind needed.
-      if (driver === 'mlx5_core' || driver === 'mlx4_core') {
-        return {
-          label: 'DPDK-ready (kernel ' + driver + ')',
-          pillClass: 'ok',
-          action: null,
+      // Drivers that DPDK can use *while* the kernel driver stays loaded.
+      // For these, "Bind to DPDK" would actually break the device — surface
+      // them as DPDK-ready with no action button.
+      //   mlx5_core / mlx4_core — Mellanox / NVIDIA NICs (mlx5 PMD via libibverbs)
+      //   idxd                  — Intel Data Streaming Accelerator (DSA), used
+      //                           by DPDK's dmadev API for fast memcpy. Not a
+      //                           NIC; lives on the on-CPU PCI bus.
+      //   ioatdma               — Older Intel I/OAT DMA, same dmadev story.
+      const KERNEL_DRIVER_OK = {
+        'mlx5_core': {
+          label: 'DPDK-ready (kernel mlx5_core)',
           hint: 'Mellanox / NVIDIA NIC. mlx5 PMD uses libibverbs over the kernel driver — no bind required.',
-        };
+        },
+        'mlx4_core': {
+          label: 'DPDK-ready (kernel mlx4_core)',
+          hint: 'Older Mellanox NIC. mlx4 PMD uses libibverbs over the kernel driver — no bind required.',
+        },
+        'idxd': {
+          label: 'DPDK accelerator (kernel idxd)',
+          hint: 'Intel Data Streaming Accelerator (DSA), not a NIC. Used via DPDK\'s dmadev API while the kernel idxd driver stays loaded. No vfio-pci bind required.',
+        },
+        'ioatdma': {
+          label: 'DPDK accelerator (kernel ioatdma)',
+          hint: 'Intel I/OAT DMA engine. Used via DPDK\'s dmadev API alongside the kernel driver — no bind required.',
+        },
+      };
+      if (KERNEL_DRIVER_OK[driver]) {
+        const k = KERNEL_DRIVER_OK[driver];
+        return { label: k.label, pillClass: 'ok', action: null, hint: k.hint };
       }
 
       if (driver === 'vfio-pci' || driver === 'uio_pci_generic' || status === 'dpdk-bound') {
