@@ -1598,7 +1598,23 @@ class ISISHandler:
                 for device in devices:
                     if device.get("protocols") and "IS-IS" in device.get("protocols", {}):
                         isis_devices.append(device)
-            
+
+            # Skip the table refresh + log when no server is online — the table
+            # would just paint stale state and the log line is misleading
+            # ("Periodic ISIS status check" sounds like we hit the server,
+            # but it's actually a local model refresh).
+            mw = getattr(self.parent, 'main_window', None)
+            online_servers = [
+                s for s in (getattr(mw, 'server_interfaces', []) or [])
+                if s.get('online')
+            ]
+            if isis_devices and not online_servers:
+                logger.debug(
+                    f"[ISIS MONITORING] Skipping check — {len(isis_devices)} ISIS device(s) "
+                    "but no servers online"
+                )
+                return
+
             if isis_devices:
                 logger.info(f"[ISIS MONITORING] Periodic ISIS status check for {len(isis_devices)} devices")
                 # Use QTimer.singleShot to defer table update and avoid blocking UI thread
