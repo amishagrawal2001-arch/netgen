@@ -12997,11 +12997,16 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
     table.iface tr:hover td { background: #f9fafb; }
     table.iface button { padding: 4px 10px; font-size: 12px; }
     .iface-empty { padding: 16px; color: var(--muted); text-align: center; font-style: italic; }
-    .ip-cell { font-family: ui-monospace, monospace; font-size: 11px; line-height: 1.6; max-width: 240px; }
+    .ip-cell { font-family: ui-monospace, monospace; font-size: 11px; line-height: 1.5; max-width: 240px; }
     .ip-cell .ip-line { display: block; }
+    .ip-cell .ip-none {
+      display: block; color: var(--muted); font-style: italic;
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif; font-size: 11px;
+    }
     .ip-cell button.ip-manage {
-      margin-top: 4px; padding: 2px 8px; font-size: 11px;
+      display: inline-block; margin-top: 8px; padding: 2px 10px; font-size: 11px;
       background: transparent; color: var(--accent); border: 1px solid var(--accent);
+      font-family: -apple-system, BlinkMacSystemFont, sans-serif;
     }
     .ip-cell button.ip-manage:hover { background: var(--accent); color: white; }
     .modal-backdrop {
@@ -13371,9 +13376,12 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
           if (kernelName) {
             const ips = _ifaceIPs[kernelName] || { ipv4: [], ipv6: [] };
             const all = [...ips.ipv4, ...ips.ipv6];
+            // Both populated and "no IPs" placeholders are block-level so the
+            // Manage button sits cleanly on its own line below — previously
+            // the placeholder was an inline <span> and ran into the button.
             const lines = all.length
               ? all.map(c => `<span class="ip-line">${escapeHtml(c)}</span>`).join('')
-              : '<span style="color: var(--muted);">none</span>';
+              : '<span class="ip-none">no addresses</span>';
             ipCell = `<div class="ip-cell">${lines}<button class="ip-manage" data-iface="${escapeHtml(kernelName)}">Manage</button></div>`;
           }
 
