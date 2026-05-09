@@ -1642,9 +1642,10 @@ class ISISHandler:
                 )
                 return
 
-            # Routine timer tick — DEBUG-level so it doesn't clutter the user's
-            # log every 20s. Errors / state changes still log at INFO/WARNING.
-            logger.debug(f"[ISIS MONITORING] Periodic ISIS status check for {len(isis_devices)} devices")
+            # Heartbeat at INFO — only fires when there are real-config ISIS
+            # devices (gated above) so it confirms monitoring is alive without
+            # being chatty for misconfigured / orphan-config devices.
+            logger.info(f"[ISIS MONITORING] Periodic ISIS status check for {len(isis_devices)} devices")
             # Use QTimer.singleShot to defer table update and avoid blocking UI thread
             # This ensures the periodic check doesn't block the UI during table updates
             from PyQt5.QtCore import QTimer
