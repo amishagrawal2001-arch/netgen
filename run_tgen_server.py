@@ -13730,6 +13730,114 @@ def admin_portal():
     """Serve the single-page admin portal."""
     from flask import Response
     return Response(_ADMIN_HTML, mimetype="text/html")
+@app.route("/api/dpdk/recommend", methods=["GET"])
+def dpdk_recommend_tx_cores():
+    """
+    Recommend a tx_cores value for the multi-queue tx_worker.
+
+    Inputs (query string):
+      iface       - network interface name (used to read /sys/class/net/<iface>/speed)
+      frame_size  - bytes (default 64)
+      pps         - target packets-per-second (0 or omitted = line rate)
+
+    Output:
+      {
+        "ok": true,
+        "iface": "...",
+        "link_speed_mbps": 100000,
+        "frame_size": 1500,
+        "target_pps": 0,
+        "estimated_pps_per_core": 4540000,
+        "recommended_tx_cores": 2,
+        "explanation": "...human-readable reasoning..."
+      }
+
+    Methodology (calibrated against Mellanox CX-7 measurements on this server):
+      • Per-core ceiling at 64B  ≈ 4.5 Mpps  (CPU-bound for tiny pkts)
+      • Per-core ceiling at 1500B ≈ 4.1 Mpps (mempool/PCIe-bound for big pkts)
+      • Beyond 12 cores efficiency drops ~80%, so we cap at 16 and keep some
+        headroom by recommending the next supported step (1/2/4/8/12/16).
+      • If target_pps is 0 (line rate), we compute target as link_speed/frame.
+    """
+    try:
+        iface = (request.args.get("iface") or "").strip()
+        try:
+            frame_size = int(request.args.get("frame_size") or 64)
+            if frame_size < 60:
+                frame_size = 60
+        except Exception:
+            frame_size = 64
+        try:
+            target_pps = int(request.args.get("pps") or 0)
+        except Exception:
+            target_pps = 0
+
+        link_mbps = 0
+        if iface:
+            try:
+                p = f"/sys/class/net/{iface}/speed"
+                if os.path.exists(p):
+                    v = int(open(p).read().strip())
+                    if v > 0:
+                        link_mbps = v
+            except Exception:
+                link_mbps = 0
+
+        # Line-rate target if user didn't specify pps
+        # L1 bytes per frame = frame_size + 20 (preamble + IFG)
+        line_pps = 0
+        if link_mbps > 0:
+            line_pps = max(1, int((link_mbps * 1_000_000) // ((frame_size + 20) * 8)))
+        if target_pps <= 0:
+            target_pps = line_pps or 100_000_000  # fallback if no link info
+
+        # Per-core ceiling estimate (calibrated, conservative).
+        # Small frames are CPU-bound; large frames are mempool/PCIe-bound and
+        # scale nearly the same per-core because frame builds dominate.
+        if frame_size <= 128:
+            per_core_pps = 4_500_000
+        elif frame_size <= 512:
+            per_core_pps = 4_300_000
+        else:
+            per_core_pps = 4_100_000
+
+        # Need this many cores in theory
+        need = max(1, (target_pps + per_core_pps - 1) // per_core_pps)
+
+        # Round up to a supported step (1, 2, 4, 8, 12, 16)
+        steps = [1, 2, 4, 8, 12, 16]
+        recommended = steps[-1]
+        for s in steps:
+            if s >= need:
+                recommended = s
+                break
+
+        # Format an explanation the UI can show as a tooltip
+        if link_mbps > 0:
+            link_str = f"{link_mbps / 1000:g} Gbps"
+        else:
+            link_str = "unknown"
+        explanation = (
+            f"Link {link_str}; line rate at {frame_size}B = "
+            f"{line_pps:,} pps. Target = {target_pps:,} pps. "
+            f"Per-core ceiling on this NIC ≈ {per_core_pps:,} pps. "
+            f"Need ~{need} core(s) → recommended {recommended}."
+        )
+
+        return jsonify({
+            "ok": True,
+            "iface": iface,
+            "link_speed_mbps": link_mbps,
+            "frame_size": frame_size,
+            "target_pps": target_pps,
+            "line_rate_pps": line_pps,
+            "estimated_pps_per_core": per_core_pps,
+            "recommended_tx_cores": recommended,
+            "explanation": explanation,
+        })
+    except Exception as e:
+        logging.error("[DPDK recommend] %s", e)
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 # ---- Explicit entry point used by 'ostg-server' ----
