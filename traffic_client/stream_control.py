@@ -120,62 +120,121 @@ class TrafficGenClientStreamControl:
         self.stream_table.viewport().installEventFilter(self)
 
         # --- All Buttons in Same Row (Action buttons on left, Control buttons centered) ---
+        # Bumped for visibility: 32x28 → 40x36, icons 16 → 20. Action buttons
+        # get bordered backgrounds so the hit area is unambiguous, and the
+        # Start/Stop/Apply group is color-coded by semantic so users don't
+        # have to read tooltips to know what each button does.
         button_layout = QHBoxLayout()
         button_layout.setAlignment(Qt.AlignLeft)
-        button_layout.setSpacing(5)  # Spacing between buttons
-        button_layout.setContentsMargins(0, 5, 0, 0)  # Top margin to separate from table
+        button_layout.setSpacing(6)
+        button_layout.setContentsMargins(0, 8, 0, 0)
 
-        # Action buttons (left side)
-        add_stream_button = QPushButton()
-        add_stream_button.setIcon(QIcon(r_icon("icons/add.png")))
-        add_stream_button.setIconSize(QSize(16, 16))
-        add_stream_button.setFixedSize(32, 28)
-        add_stream_button.setToolTip("Add Stream")
-        add_stream_button.clicked.connect(self.open_add_stream_dialog)
+        # Shared base style — bordered, padded, hover/pressed states. Each
+        # button overlays this with a semantic color on top.
+        BTN_BASE = (
+            "QPushButton {"
+            "  border: 1px solid #cbd5e1;"
+            "  border-radius: 5px;"
+            "  background-color: #ffffff;"
+            "  padding: 0px;"
+            "}"
+            "QPushButton:hover { background-color: #f1f5f9; border-color: #94a3b8; }"
+            "QPushButton:pressed { background-color: #e2e8f0; }"
+            "QPushButton:disabled { background-color: #f9fafb; border-color: #e5e7eb; }"
+        )
+        # Semantic overlays for the control group
+        BTN_START = (
+            "QPushButton {"
+            "  border: 1px solid #16a34a;"
+            "  border-radius: 5px;"
+            "  background-color: #dcfce7;"
+            "  padding: 0px;"
+            "}"
+            "QPushButton:hover { background-color: #bbf7d0; border-color: #15803d; }"
+            "QPushButton:pressed { background-color: #86efac; }"
+        )
+        BTN_STOP = (
+            "QPushButton {"
+            "  border: 1px solid #dc2626;"
+            "  border-radius: 5px;"
+            "  background-color: #fee2e2;"
+            "  padding: 0px;"
+            "}"
+            "QPushButton:hover { background-color: #fecaca; border-color: #b91c1c; }"
+            "QPushButton:pressed { background-color: #fca5a5; }"
+        )
+        BTN_APPLY = (
+            "QPushButton {"
+            "  border: 1px solid #2563eb;"
+            "  border-radius: 5px;"
+            "  background-color: #dbeafe;"
+            "  padding: 0px;"
+            "}"
+            "QPushButton:hover { background-color: #bfdbfe; border-color: #1d4ed8; }"
+            "QPushButton:pressed { background-color: #93c5fd; }"
+        )
+
+        BTN_W, BTN_H, ICON_PX = 40, 36, 20
+
+        def _action_btn(icon_name, tooltip, slot, style=None):
+            b = QPushButton()
+            b.setIcon(QIcon(r_icon(f"icons/{icon_name}")))
+            b.setIconSize(QSize(ICON_PX, ICON_PX))
+            b.setFixedSize(BTN_W, BTN_H)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setToolTip(tooltip)
+            b.setStyleSheet(style or BTN_BASE)
+            b.clicked.connect(slot)
+            return b
+
+        # Configuration buttons (left): neutral border, gray hover.
+        add_stream_button = _action_btn("add.png", "Add Stream", self.open_add_stream_dialog)
         button_layout.addWidget(add_stream_button)
 
-        edit_stream_button = QPushButton()
-        edit_stream_button.setIcon(QIcon(r_icon("icons/edit.png")))
-        edit_stream_button.setIconSize(QSize(16, 16))
-        edit_stream_button.setFixedSize(32, 28)
-        edit_stream_button.setToolTip("Edit Stream")
-        edit_stream_button.clicked.connect(self.edit_selected_stream)
+        edit_stream_button = _action_btn("edit.png", "Edit Stream", self.edit_selected_stream)
         button_layout.addWidget(edit_stream_button)
 
-        remove_stream_button = QPushButton()
-        remove_stream_button.setIcon(QIcon(r_icon("icons/Trash.png")))
-        remove_stream_button.setIconSize(QSize(16, 16))
-        remove_stream_button.setFixedSize(32, 28)
-        remove_stream_button.setToolTip("Delete Stream")
-        remove_stream_button.clicked.connect(self.remove_selected_stream)
+        remove_stream_button = _action_btn("Trash.png", "Delete Stream", self.remove_selected_stream)
         button_layout.addWidget(remove_stream_button)
 
-        # Add stretch to push control buttons to center
+        # Vertical divider between configuration and runtime control groups
+        # so the user reads "edit then control" rather than one undifferentiated
+        # row of icons.
+        sep = QLabel()
+        sep.setFixedSize(1, BTN_H)
+        sep.setStyleSheet("background-color: #cbd5e1; margin: 0 6px;")
+        button_layout.addSpacing(4)
+        button_layout.addWidget(sep)
+        button_layout.addSpacing(4)
+
+        # Add stretch so control buttons don't crowd the configuration ones.
         button_layout.addStretch(1)
 
-        # Control buttons (centered)
-        self.start_stream_button = QPushButton()
-        self.start_stream_button.setIcon(QIcon(r_icon("icons/start.png")))
-        self.start_stream_button.setIconSize(QSize(16, 16))
-        self.start_stream_button.setFixedSize(32, 28)
-        self.start_stream_button.setToolTip("Start Selected streams")
-        self.start_stream_button.clicked.connect(self.start_stream)
+        # Runtime control buttons (centered): color-coded by semantic.
+        # Start = green, Stop = red, Apply = blue.
+        self.start_stream_button = _action_btn(
+            "start.png", "Start Selected streams", self.start_stream, BTN_START,
+        )
         button_layout.addWidget(self.start_stream_button)
 
-        self.stop_stream_button = QPushButton()
-        self.stop_stream_button.setIcon(QIcon(r_icon("icons/stop.png")))
-        self.stop_stream_button.setIconSize(QSize(16, 16))
-        self.stop_stream_button.setFixedSize(32, 28)
-        self.stop_stream_button.setToolTip("Stop Selected streams")
-        self.stop_stream_button.clicked.connect(self.stop_stream)
+        self.stop_stream_button = _action_btn(
+            "stop.png", "Stop Selected streams", self.stop_stream, BTN_STOP,
+        )
         button_layout.addWidget(self.stop_stream_button)
 
-        # Single Start/Stop ALL toggle
+        # Single Start/Stop ALL toggle — slightly wider since it acts on
+        # everything; uses the same green tint as Start initially, swapped
+        # to red when streams are running (handled by update_all_streams_toggle_ui).
         self.all_streams_toggle_btn = QPushButton()
-        self.all_streams_toggle_btn.setIconSize(QSize(16, 16))
-        self.all_streams_toggle_btn.setFixedSize(32, 28)
+        self.all_streams_toggle_btn.setIconSize(QSize(ICON_PX, ICON_PX))
+        self.all_streams_toggle_btn.setFixedSize(BTN_W + 8, BTN_H)
+        self.all_streams_toggle_btn.setCursor(Qt.PointingHandCursor)
         self.all_streams_toggle_btn.setToolTip("Start ALL enabled streams")
+        self.all_streams_toggle_btn.setStyleSheet(BTN_START)
         self.all_streams_toggle_btn.clicked.connect(self._toggle_all_streams)
+        # Stash the semantic styles so the toggle handler can swap them.
+        self._all_btn_start_style = BTN_START
+        self._all_btn_stop_style = BTN_STOP
 
         # 👇 set a default icon right away (so it's visible at first paint)
         _default_icon = QIcon(r_icon("icons/startallstream.png"))
@@ -190,19 +249,17 @@ class TrafficGenClientStreamControl:
         # Let the UI settle, then compute the real state (running/not running)
         QTimer.singleShot(0, self.update_all_streams_toggle_ui)
 
-        self.apply_stream_button = QPushButton()
-        self.apply_stream_button.setIcon(QIcon(r_icon("icons/apply.png")))
-        self.apply_stream_button.setIconSize(QSize(16, 16))
-        self.apply_stream_button.setFixedSize(32, 28)
-        # Clearer description of what Apply actually does (audit found the previous
-        # tooltip only described one of three branches).
-        self.apply_stream_button.setToolTip(
+        self.apply_stream_button = _action_btn(
+            "apply.png",
+            # Clearer description of what Apply actually does (audit found the
+            # previous tooltip only described one of three branches).
             "Sync your edits to the server. Restarts streams that are currently "
-            "running and still enabled; stops streams you've just disabled."
+            "running and still enabled; stops streams you've just disabled.",
+            self.apply_stream,
+            BTN_APPLY,
         )
         # Track baseline style so the dirty-edit highlight can be reverted cleanly.
         self._apply_button_default_style = self.apply_stream_button.styleSheet()
-        self.apply_stream_button.clicked.connect(self.apply_stream)
         button_layout.addWidget(self.apply_stream_button)
 
         # Add stretch before search box
@@ -284,10 +341,14 @@ class TrafficGenClientStreamControl:
         if btn is None:
             return
         if self._dirty_streams():
+            # Amber tint signals "edits pending" — same border-radius as the
+            # rest of the action bar so the button doesn't visually shift size
+            # when toggling between baseline-blue and dirty-amber.
             btn.setStyleSheet(
                 "QPushButton { background-color: #fef3c7; border: 1px solid #f59e0b; "
-                "border-radius: 4px; }"
-                "QPushButton:hover { background-color: #fde68a; }"
+                "border-radius: 5px; padding: 0px; }"
+                "QPushButton:hover { background-color: #fde68a; border-color: #d97706; }"
+                "QPushButton:pressed { background-color: #fcd34d; }"
             )
             btn.setToolTip(
                 f"You have {len(self._dirty_streams())} unapplied edit(s). "
