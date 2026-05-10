@@ -125,6 +125,22 @@ class Rfc2544Dialog(QDialog):
         self.start_btn.clicked.connect(self._on_start)
         btn_row.addWidget(self.start_btn)
 
+        # Stop button — cooperative cancel of an in-flight RFC 2544
+        # test. Server flips stop_requested=True and halts the active
+        # stream so the runner thread exits within ~0.5s. Disabled
+        # until Start fires.
+        self.stop_btn = QPushButton("Stop Test")
+        self.stop_btn.setEnabled(False)
+        self.stop_btn.setStyleSheet(
+            "QPushButton { border: 1px solid #dc2626; border-radius: 5px; "
+            "padding: 6px 14px; background: #ffffff; color: #dc2626; "
+            "font-weight: 600; }"
+            "QPushButton:hover { background: #fef2f2; }"
+            "QPushButton:disabled { color: #9ca3af; border-color: #cbd5e1; }"
+        )
+        self.stop_btn.clicked.connect(self._on_stop)
+        btn_row.addWidget(self.stop_btn)
+
         self.export_btn = QPushButton("Export CSV")
         self.export_btn.setEnabled(False)
         self.export_btn.clicked.connect(self._on_export_csv)
@@ -194,6 +210,7 @@ class Rfc2544Dialog(QDialog):
             return
 
         self.start_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
         self.export_btn.setEnabled(False)
         self.status_label.setText("Test running…")
         self.status_label.setStyleSheet("color: #1d4ed8; font-weight: 600;")
@@ -247,6 +264,7 @@ class Rfc2544Dialog(QDialog):
                 self._poll_timer.stop()
                 self._poll_timer = None
             self.start_btn.setEnabled(True)
+            self.stop_btn.setEnabled(False)
             err = data.get("error")
             if err:
                 self.status_label.setText(f"Failed: {err}")
@@ -257,6 +275,25 @@ class Rfc2544Dialog(QDialog):
                 )
                 self.status_label.setStyleSheet("color: #15803d; font-weight: 600;")
                 self.export_btn.setEnabled(bool(results))
+
+    def _on_stop(self):
+        """Cooperative cancel — POST /api/rfc2544/stop and let the next
+        poll tick discover that running=False. Disable the button so
+        the user can't double-click while the server is processing."""
+        self.stop_btn.setEnabled(False)
+        self.status_label.setText("Stopping…")
+        self.status_label.setStyleSheet("color: #b91c1c; font-weight: 600;")
+        try:
+            r = requests.post(
+                f"{self.server_url}/api/rfc2544/stop", timeout=5
+            )
+            if not r.ok:
+                logger.warning(f"[RFC 2544] stop returned {r.status_code}: {r.text[:200]}")
+        except Exception as e:
+            logger.warning(f"[RFC 2544] stop request failed: {e}")
+            # Don't re-enable Stop — the user will see status from the
+            # next poll. If the test is genuinely stuck, restarting
+            # the server is the escape hatch.
 
     def _on_export_csv(self):
         path, _ = QFileDialog.getSaveFileName(
