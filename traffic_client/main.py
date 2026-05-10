@@ -59,7 +59,12 @@ class TrafficGeneratorClient(
     pass
     def __init__(self, server_url=None, server_explicitly_provided=False):
         super().__init__()
-        self.setWindowTitle("Netgen Traffic Generator")
+        # Stash the canonical title so the resize-driven dimension
+        # readout (_update_section_size_readout) can rebuild from a
+        # clean base each time instead of appending to an
+        # ever-growing string.
+        self._base_window_title = "Netgen Traffic Generator"
+        self.setWindowTitle(self._base_window_title)
         self.setGeometry(100, 100, 1400, 800)
 
         self.streams = {}
@@ -354,13 +359,17 @@ class TrafficGeneratorClient(
             logger.debug(f"[LAYOUT] resizeDocks failed: {e}")
 
     def _update_section_size_readout(self):
-        """Refresh the status-bar readout with current section dimensions.
+        """Append live section dimensions to the window title bar.
 
-        Format: 'Window 1920×1080 │ Top 1920×540 │ Stats 1920×540'
-        Updated on every showEvent/resizeEvent so the user can see
+        The title becomes:
+            'Netgen Traffic Generator  —  Window 1920×1080 │ Top 1920×540 │ Stats 1920×540'
+
+        Updates on every showEvent/resizeEvent so the user can see
         exactly how the layout splits as the window grows. Helpful
-        when tuning the stats-dock balance ratio or debugging
-        why one half won't shrink past a certain size.
+        when tuning the stats-dock balance ratio or debugging why
+        one half won't shrink past a certain size. Lives in the
+        title bar (the only always-visible OS-supplied chrome) so
+        we don't have to give up any pixels inside the app for it.
         """
         try:
             win_w, win_h = self.width(), self.height()
@@ -378,7 +387,8 @@ class TrafficGeneratorClient(
                 else:
                     parts.append(f"Stats {sg.width()}×{sg.height()}")
 
-            self.statusBar().showMessage("  │  ".join(parts))
+            base = getattr(self, "_base_window_title", "Netgen Traffic Generator")
+            self.setWindowTitle(f"{base}  —  " + "  │  ".join(parts))
         except Exception as e:
             logger.debug(f"[LAYOUT] section-size readout failed: {e}")
 
