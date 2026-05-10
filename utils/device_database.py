@@ -16,17 +16,47 @@ import ipaddress
 # Configure logging
 logger = logging.getLogger(__name__)
 
+def _resolve_db_path():
+    """Pick the SQLite DB path with sensible defaults + legacy fallback.
+
+    Resolution order (first match wins):
+      1. NETGEN_DB_PATH env var (new) — explicit override
+      2. OSTG_DB_PATH env var (legacy) — explicit override
+      3. /opt/netgen/database.db — default for fresh netgen installs
+      4. /opt/OSTG/device_database.db — legacy default; used iff (3) doesn't
+         exist but (4) does, so existing installs don't silently start with
+         an empty DB after the rebrand. New rows go to whichever path is
+         resolved.
+
+    The DeviceDatabase + StreamDatabase share the same file (multiple
+    tables in one sqlite DB). Both classes call this helper so they stay
+    in sync.
+    """
+    import os
+    env_path = os.environ.get("NETGEN_DB_PATH") or os.environ.get("OSTG_DB_PATH")
+    if env_path:
+        return env_path
+    new_default = "/opt/netgen/database.db"
+    legacy_default = "/opt/OSTG/device_database.db"
+    if (not os.path.exists(new_default)) and os.path.exists(legacy_default):
+        return legacy_default
+    return new_default
+
+
 class DeviceDatabase:
     """SQLite-based device database for OSTG"""
-    
-    def __init__(self, db_path: str = "/opt/OSTG/device_database.db"):
+
+    def __init__(self, db_path: Optional[str] = None):
         """
         Initialize device database.
-        
+
         Args:
-            db_path: Path to SQLite database file
+            db_path: Path to SQLite database file. When None (default),
+                     resolved via _resolve_db_path() — env var → new
+                     /opt/netgen/database.db → legacy
+                     /opt/OSTG/device_database.db fallback.
         """
-        self.db_path = db_path
+        self.db_path = db_path or _resolve_db_path()
         self.backup_path = f"{db_path}.backup"
         self.ensure_db_directory()
         self.init_database()
@@ -534,6 +564,19 @@ class DeviceDatabase:
                 conn.execute("ALTER TABLE devices ADD COLUMN isis_config TEXT")
                 conn.commit()
                 logger.info("[DEVICE DB] Successfully added isis_config column to devices table")
+            
+            # Check if device_type column exists (FRR container vs external device)
+            if 'device_type' not in columns:
+                logger.info("[DEVICE DB] Adding device_type and related columns for external device support")
+                conn.execute("ALTER TABLE devices ADD COLUMN device_type TEXT DEFAULT 'frr_container'")
+                conn.execute("ALTER TABLE devices ADD COLUMN container_id TEXT")
+                conn.execute("ALTER TABLE devices ADD COLUMN connection_method TEXT")  # ssh, snmp, rest, netconf
+                conn.execute("ALTER TABLE devices ADD COLUMN connection_host TEXT")  # IP/hostname for external devices
+                conn.execute("ALTER TABLE devices ADD COLUMN connection_port INTEGER")  # Port for connection
+                conn.execute("ALTER TABLE devices ADD COLUMN connection_username TEXT")  # For SSH/REST
+                conn.execute("ALTER TABLE devices ADD COLUMN connection_info TEXT")  # JSON with full connection details
+                conn.commit()
+                logger.info("[DEVICE DB] Successfully added external device support columns")
             
             # Check if ISIS status columns exist in devices table
             if 'isis_running' not in columns:

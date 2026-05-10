@@ -686,24 +686,57 @@ def start_traffic():
                     existing_stream_id = existing_stream.get("stream_id")
                     logging.info(f"Stopping existing stream {existing_stream_id} (name: '{stream_name}') before starting new one")
                     existing_stream["stop_event"].set()
-                    
-                    # Wait for the thread to actually finish (with timeout)
+
+                    # Shorter graceful window than /api/traffic/stop's 2s —
+                    # we have a backstop pkill below, and start-side latency
+                    # matters more than stop-side (the user is waiting for
+                    # the new stream to come up).
                     future = existing_stream.get("future")
                     if future:
                         logging.info(f"⏳ Waiting for thread to finish for stream {existing_stream_id}...")
                         try:
-                            future.result(timeout=5.0)
+                            future.result(timeout=2.0)
                             logging.info(f"✅ Thread completed for stream {existing_stream_id}")
                         except Exception as e:
                             logging.warning(f"⚠️ Thread for stream {existing_stream_id} did not complete within timeout: {e}")
-                    
+
+                    # Defensive backstop — same pattern as /api/traffic/stop.
+                    # The graceful future.result above can time out if the
+                    # launcher's stdout reader is wedged; without this kill,
+                    # the old tx_worker would keep running alongside the
+                    # one we're about to launch, doubling the wire rate
+                    # while the new tracker only sees half. Scoped by the
+                    # *existing* stream_id so concurrent streams aren't
+                    # disturbed.
+                    try:
+                        import subprocess as _sp
+                        pat = f"--stream-id {existing_stream_id}"
+                        check = _sp.run(["pgrep", "-f", "--", pat],
+                                        capture_output=True, text=True, timeout=3)
+                        if check.returncode == 0 and check.stdout.strip():
+                            stale_pids = check.stdout.strip().split()
+                            logging.warning(
+                                f"⚠️ tx_worker(s) still alive for replaced stream "
+                                f"{existing_stream_id} (pids={','.join(stale_pids)}) "
+                                f"— force-killing before launching new instance"
+                            )
+                            _sp.run(["pkill", "-TERM", "-f", "--", pat],
+                                    capture_output=True, timeout=3)
+                            import time as _t
+                            _t.sleep(0.5)
+                            _sp.run(["pkill", "-KILL", "-f", "--", pat],
+                                    capture_output=True, timeout=3)
+                    except Exception as _e:
+                        logging.warning(f"⚠️ Backstop pkill for replaced stream "
+                                        f"{existing_stream_id} failed: {_e}")
+
                     # Wait for RX sniffer cleanup if flow tracking was enabled
                     if existing_stream.get("flow_tracking_enabled") and existing_stream.get("rx_interface") != interface_name:
                         import time
                         time.sleep(0.5)
-                    
+
                     stream_tracker.remove_stream_by_id(interface_name, existing_stream_id)
-                
+
                 # Wait a bit to ensure threads have stopped before starting new stream
                 import time
                 time.sleep(0.5)
@@ -13966,6 +13999,23 @@ def dpdk_recommend_tx_cores():
 
 
 # ---- Explicit entry point used by 'ostg-server' ----
+def _resolve_ai_settings_path():
+    """AI settings env file path with sensible defaults + legacy fallback.
+
+    Same resolution logic as utils.device_database._resolve_db_path:
+    env override -> /opt/netgen default -> /opt/OSTG legacy iff it
+    exists. Keeps existing AI-key files in place after the rebrand.
+    """
+    env_path = os.environ.get("NETGEN_AI_SETTINGS_PATH") or os.environ.get("OSTG_AI_SETTINGS_PATH")
+    if env_path:
+        return env_path
+    new_default = "/opt/netgen/.netgen_ai_server_settings.env"
+    legacy_default = "/opt/OSTG/.ostg_ai_server_settings.env"
+    if (not os.path.exists(new_default)) and os.path.exists(legacy_default):
+        return legacy_default
+    return new_default
+
+
 def main(argv=None):
     import argparse, os
     # Enable DEBUG logging when OSTG_DEBUG=1 is set
@@ -14150,7 +14200,7 @@ def main(argv=None):
     }
     
     # Try to load persisted settings from file
-    settings_file = "/opt/OSTG/.ostg_ai_server_settings.env"
+    settings_file = _resolve_ai_settings_path()
     if os.path.exists(settings_file):
         try:
             with open(settings_file, 'r') as f:
@@ -14183,7 +14233,7 @@ def main(argv=None):
         
         # If not found, try reloading from file
         if not key:
-            settings_file = "/opt/OSTG/.ostg_ai_server_settings.env"
+            settings_file = _resolve_ai_settings_path()
             if os.path.exists(settings_file):
                 try:
                     with open(settings_file, 'r') as f:
@@ -14216,7 +14266,7 @@ def main(argv=None):
         
         # If not found, try reloading from file
         if not base:
-            settings_file = "/opt/OSTG/.ostg_ai_server_settings.env"
+            settings_file = _resolve_ai_settings_path()
             if os.path.exists(settings_file):
                 try:
                     with open(settings_file, 'r') as f:
@@ -14289,7 +14339,7 @@ def main(argv=None):
                     os.makedirs(settings_dir, mode=0o755)
                 
                 # Save to .env file (can be sourced)
-                settings_file = "/opt/OSTG/.ostg_ai_server_settings.env"
+                settings_file = _resolve_ai_settings_path()
                 with open(settings_file, 'w') as f:
                     if ai_settings.get("openai_api_key"):
                         # Escape single quotes in the value
@@ -14318,7 +14368,7 @@ def main(argv=None):
                 os.chmod(script_file, 0o755)
                 
                 logging.info(f"[AI SETTINGS] Settings persisted to {settings_file} and {script_file}")
-                logging.info("[AI SETTINGS] To use these settings, run: source /opt/OSTG/.ostg_ai_server_settings.env")
+                logging.info(f"[AI SETTINGS] To use these settings, run: source {_resolve_ai_settings_path()}")
             except Exception as e:
                 logging.warning(f"[AI SETTINGS] Could not persist settings to file: {e}")
             
