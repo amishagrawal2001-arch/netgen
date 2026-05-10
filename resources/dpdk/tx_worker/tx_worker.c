@@ -40,6 +40,20 @@ struct tx_worker_ctx {
     char     stream_id[64];
     const uint8_t *hdr_template;
     struct rte_mempool *mp;
+    /* Per-flow incrementing fields. count=0 means fixed (default).
+     * Otherwise each TX packet bumps the field by 1, wrapping at
+     * `count` distinct values. Useful for hashing tests where the
+     * NIC / DUT distributes flows by 5-tuple.
+     *
+     *   src_ip_count / dst_ip_count   — wrap N IPv4 addresses
+     *                                   starting at base_src_ip
+     *                                   / base_dst_ip
+     *   src_port_count / dst_port_count — wrap N UDP ports
+     */
+    uint32_t base_src_ip, base_dst_ip;       /* network-byte-order */
+    uint16_t base_src_port, base_dst_port;   /* host order */
+    uint32_t src_ip_count, dst_ip_count;
+    uint32_t src_port_count, dst_port_count;
     /* outputs (read by main, written by worker) */
     volatile uint64_t sent;
     volatile uint64_t dropped;
@@ -115,6 +129,50 @@ static int tx_loop(void *arg){
 
             rte_memcpy(p, c->hdr_template, hdr_len);
 
+            /* Per-flow field incrementing. When src_ip_count/dst_ip_count/
+             * src_port_count/dst_port_count are non-zero, the field wraps
+             * over that many values, giving the DUT distinct 5-tuples to
+             * hash on. Skipped entirely when all four counts are 0.
+             *
+             * Position of each field is relative to the rendered header
+             * template — consts captured outside the per-burst loop. */
+            if (c->src_ip_count > 1 || c->dst_ip_count > 1
+                || c->src_port_count > 1 || c->dst_port_count > 1) {
+                struct rte_ipv4_hdr *ip4 =
+                    (struct rte_ipv4_hdr *)(p + l2_len);
+                struct rte_udp_hdr *udp =
+                    (struct rte_udp_hdr *)(p + l2_len + l3_len);
+
+                if (c->src_ip_count > 1) {
+                    uint32_t step = (uint32_t)(seq % c->src_ip_count);
+                    /* base_src_ip is network-byte-order; bump host-order
+                     * then convert back so wrap math is straight-forward. */
+                    uint32_t base_h = rte_be_to_cpu_32(c->base_src_ip);
+                    ip4->src_addr = rte_cpu_to_be_32(base_h + step);
+                }
+                if (c->dst_ip_count > 1) {
+                    uint32_t step = (uint32_t)(seq % c->dst_ip_count);
+                    uint32_t base_h = rte_be_to_cpu_32(c->base_dst_ip);
+                    ip4->dst_addr = rte_cpu_to_be_32(base_h + step);
+                }
+                if (c->src_port_count > 1) {
+                    uint16_t step = (uint16_t)(seq % c->src_port_count);
+                    udp->src_port = rte_cpu_to_be_16(c->base_src_port + step);
+                }
+                if (c->dst_port_count > 1) {
+                    uint16_t step = (uint16_t)(seq % c->dst_port_count);
+                    udp->dst_port = rte_cpu_to_be_16(c->base_dst_port + step);
+                }
+                /* Recompute IP checksum if HW offload isn't doing it
+                 * (UDP can stay 0 with no_udp_csum or HW UDP_CKSUM offload). */
+                if (!(tx_off & RTE_ETH_TX_OFFLOAD_IPV4_CKSUM)) {
+                    ip4->hdr_checksum = csum_ip4(ip4);
+                }
+                if (!no_udp_csum && !(tx_off & RTE_ETH_TX_OFFLOAD_UDP_CKSUM)) {
+                    udp->dgram_cksum = csum_udp4(ip4, udp);
+                }
+            }
+
             /* payload signature — include queue id so each worker's pkts are unique */
             if (payload_len){
                 uint8_t *pl = p + hdr_len;
@@ -122,6 +180,8 @@ static int tx_loop(void *arg){
                                  c->stream_id, (unsigned)queue_id, seq++);
                 if (n < 0) n = 0;
                 if ((uint32_t)n < payload_len) memset(pl + n, 0, payload_len - (uint32_t)n);
+            } else {
+                seq++;  /* keep flow-incrementing in sync */
             }
 
             if (tx_off & RTE_ETH_TX_OFFLOAD_IPV4_CKSUM) {
@@ -176,6 +236,13 @@ int main(int argc, char **argv){
     uint32_t tx_cores = 1;
     char stream_id[64] = "stream";
 
+    /* Per-flow field randomization. count==0 (default) means "fixed".
+     * count>=2 means cycle through that many distinct values starting
+     * at the base value. Spirent/Ixia call this a "modifier" — required
+     * for hashing/RSS tests where the DUT distributes flows by 5-tuple. */
+    uint32_t src_ip_count = 0, dst_ip_count = 0;
+    uint32_t src_port_count = 0, dst_port_count = 0;
+
     static struct option long_opts[] = {
         {"src-mac",   required_argument, 0, 1},
         {"dst-mac",   required_argument, 0, 2},
@@ -191,6 +258,11 @@ int main(int argc, char **argv){
         {"no-udp-csum", no_argument,     0,12},
         {"burst",     required_argument, 0,13},
         {"tx-cores",  required_argument, 0,14},
+        /* Field randomization */
+        {"src-ip-count",   required_argument, 0, 15},
+        {"dst-ip-count",   required_argument, 0, 16},
+        {"src-port-count", required_argument, 0, 17},
+        {"dst-port-count", required_argument, 0, 18},
         {0,0,0,0}
     };
     int opt, idx;
@@ -213,6 +285,10 @@ int main(int argc, char **argv){
                      if (tx_cores==0) tx_cores=1;
                      if (tx_cores>MAX_TX_WORKERS) tx_cores=MAX_TX_WORKERS;
                      break;
+            case 15: src_ip_count   = (uint32_t)strtoul(optarg, NULL, 10); break;
+            case 16: dst_ip_count   = (uint32_t)strtoul(optarg, NULL, 10); break;
+            case 17: src_port_count = (uint32_t)strtoul(optarg, NULL, 10); break;
+            case 18: dst_port_count = (uint32_t)strtoul(optarg, NULL, 10); break;
             default: usage(argv[0]); return 1;
         }
     }
@@ -357,6 +433,19 @@ int main(int argc, char **argv){
         snprintf(c->stream_id, sizeof(c->stream_id), "%s", stream_id);
         c->hdr_template = hdr_template;
         c->mp = mp;
+        /* Field randomization base values + counts. The base values
+         * come from the same --src-ip / --dst-ip / --src-port / --dst-port
+         * args used to populate hdr_template, so packet 0 of each worker
+         * matches the template; packets 1..count-1 cycle through bumped
+         * values. */
+        c->base_src_ip   = src_ip;       /* already network-byte-order from inet_pton */
+        c->base_dst_ip   = dst_ip;
+        c->base_src_port = src_port;     /* host order */
+        c->base_dst_port = dst_port;
+        c->src_ip_count   = src_ip_count;
+        c->dst_ip_count   = dst_ip_count;
+        c->src_port_count = src_port_count;
+        c->dst_port_count = dst_port_count;
     }
 
     /* Launch workers on worker lcores (skips main lcore) */
