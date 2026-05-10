@@ -101,9 +101,29 @@ def run_stream(
     bdf = _iface_to_bdf(interface)
     numa = _bdf_numa_node(bdf) if bdf else 0
 
+    # Resolve target rate first — needed below to decide whether to
+    # auto-bump tx_cores for Line Rate streams.
+    pps = _resolve_target_pps(stream_data)
+    vlan_id = fields["vlan_id"]
+    frame_size = int(fields["frame_size"] or 64)
+
     # Multi-queue scaling: tx_cores TX queues = tx_cores worker threads.
     # EAL needs (1 main + tx_cores workers) lcores total.
+    explicit_tx_cores = _user_specified_tx_cores(stream_data)
     tx_cores = _resolve_tx_cores(stream_data)
+    if pps == 0 and not explicit_tx_cores:
+        # User picked "Line Rate" without overriding tx_cores. Derive a
+        # value from the interface speed so a single-queue worker doesn't
+        # cap the rate well below the link's actual capacity (e.g. 49 Gbps
+        # on a 400G link). Same calibrated math as /api/dpdk/recommend.
+        auto = _auto_tx_cores_for_line_rate(interface, frame_size)
+        if auto > tx_cores:
+            LOG.info(
+                "[dpdk] Line Rate auto-picked tx_cores=%d for %s (frame=%dB, "
+                "link-derived); set 'TX Cores (queues)' explicitly to override.",
+                auto, interface, frame_size,
+            )
+            tx_cores = auto
     needed_lcores = 1 + tx_cores
     corelist = (dpdk_corelist
                 or str(stream_data.get("dpdk_corelist") or "")
@@ -118,10 +138,6 @@ def run_stream(
         os.chmod(bin_path, 0o755)
     except Exception:
         pass
-
-    pps = _resolve_target_pps(stream_data)
-    vlan_id = fields["vlan_id"]
-    frame_size = int(fields["frame_size"] or 64)
     no_udp_csum = bool(stream_data.get("no_udp_csum", False))
     mem_channels = str(stream_data.get("dpdk_mem_channels") or os.environ.get("DPDK_MEM_CHANNELS") or "4")
 
@@ -716,6 +732,63 @@ def _resolve_l2_l3_l4(stream_data: Dict[str, Any]) -> Dict[str, Any]:
         udp_sport=udp_sport, udp_dport=udp_dport,
         vlan_id=vlan_id, frame_size=frame_size,
     )
+
+def _user_specified_tx_cores(stream_data: Dict[str, Any]) -> bool:
+    """Return True iff the stream JSON has an explicit dpdk_tx_cores
+    setting from the user (anywhere we look). Used to distinguish "user
+    really wants single-queue" from "user didn't touch the field" so we
+    can auto-bump tx_cores for Line Rate streams without overriding an
+    explicit choice."""
+    if not isinstance(stream_data, dict):
+        return False
+    if stream_data.get("dpdk_tx_cores") not in (None, ""):
+        return True
+    ps = stream_data.get("protocol_selection") or {}
+    if isinstance(ps, dict) and ps.get("dpdk_tx_cores") not in (None, ""):
+        return True
+    if os.environ.get("DPDK_TX_CORES"):
+        return True
+    return False
+
+
+def _auto_tx_cores_for_line_rate(interface: str, frame_size: int) -> int:
+    """Pick a tx_cores value sufficient to saturate the interface's link
+    speed at the given frame size. Mirrors /api/dpdk/recommend's math.
+    Returns 1 if the link speed can't be read.
+
+    Per-core ceilings calibrated on Mellanox CX-7 + EPYC:
+      <=128B:  4.5 Mpps/core   (CPU-bound for tiny pkts)
+      <=512B:  4.3 Mpps/core
+      else:    4.1 Mpps/core   (mempool/PCIe-bound for large pkts)
+    Rounds up to a supported step (1, 2, 4, 8, 12, 16; cap at 16)."""
+    try:
+        if not interface:
+            return 1
+        p = f"/sys/class/net/{interface}/speed"
+        if not os.path.exists(p):
+            return 1
+        try:
+            link_mbps = int(open(p).read().strip())
+        except Exception:
+            return 1
+        if link_mbps <= 0:
+            return 1
+        # L1 bytes per frame = frame_size + 20 (preamble + IFG)
+        line_pps = max(1, (link_mbps * 1_000_000) // ((max(60, int(frame_size)) + 20) * 8))
+        if frame_size <= 128:
+            per_core = 4_500_000
+        elif frame_size <= 512:
+            per_core = 4_300_000
+        else:
+            per_core = 4_100_000
+        need = max(1, (line_pps + per_core - 1) // per_core)
+        for s in (1, 2, 4, 8, 12, 16):
+            if s >= need:
+                return s
+        return 16
+    except Exception:
+        return 1
+
 
 def _resolve_tx_cores(stream_data: Dict[str, Any]) -> int:
     """
