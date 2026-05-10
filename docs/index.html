@@ -307,6 +307,130 @@
     header.nav .cta { margin-left: auto; }
     section.block h2 { font-size: 28px; }
     section.cta-bottom h2 { font-size: 28px; }
+    .matrix { font-size: 12px; }
+    .matrix th, .matrix td { padding: 8px 10px; }
+  }
+
+  /* Use cases */
+  .usecases {
+    display: grid; gap: 18px;
+    grid-template-columns: repeat(2, 1fr);
+  }
+  .uc {
+    border-left: 3px solid var(--blue);
+    padding: 4px 0 4px 18px;
+  }
+  .uc h4 {
+    margin: 0 0 6px; font-size: 16px; color: var(--ink);
+  }
+  .uc p {
+    margin: 0; font-size: 14px; color: var(--gray);
+  }
+
+  /* Hardware matrix */
+  .matrix {
+    width: 100%; border-collapse: collapse;
+    font-size: 14px;
+    border: 1px solid var(--line); border-radius: 8px;
+    overflow: hidden;
+  }
+  .matrix th, .matrix td {
+    padding: 11px 14px; text-align: left;
+    border-bottom: 1px solid var(--line);
+  }
+  .matrix th {
+    background: var(--bg-soft);
+    font-weight: 600; font-size: 13px;
+    color: var(--ink-soft); letter-spacing: 0.01em;
+  }
+  .matrix tr:last-child td { border-bottom: none; }
+  .matrix tr:hover td { background: var(--bg-soft); }
+  .pill {
+    display: inline-block;
+    font-size: 11px; font-weight: 600;
+    padding: 3px 9px; border-radius: 4px;
+  }
+  .pill.ok      { background: #dcfce7; color: #15803d; }
+  .pill.partial { background: #fef3c7; color: #b45309; }
+  .pill.todo    { background: #fee2e2; color: #b91c1c; }
+  .pill.note    { background: #e0e7ff; color: #4338ca; }
+
+  /* Compare */
+  .compare {
+    width: 100%; border-collapse: collapse;
+    font-size: 14px;
+    border: 1px solid var(--line); border-radius: 8px;
+    overflow: hidden;
+  }
+  .compare th, .compare td {
+    padding: 11px 14px; text-align: left;
+    border-bottom: 1px solid var(--line);
+  }
+  .compare th {
+    background: var(--ink); color: white;
+    font-weight: 600; font-size: 13px;
+  }
+  .compare th.us { background: var(--blue); }
+  .compare tr:last-child td { border-bottom: none; }
+  .compare td.us { background: var(--blue-soft); font-weight: 600; color: var(--blue-dark); }
+
+  /* FAQ */
+  .faq details {
+    border-bottom: 1px solid var(--line);
+    padding: 16px 0;
+  }
+  .faq details:first-child { border-top: 1px solid var(--line); }
+  .faq summary {
+    cursor: pointer;
+    font-weight: 600; color: var(--ink);
+    font-size: 16px;
+    list-style: none;
+    display: flex; align-items: center; justify-content: space-between;
+  }
+  .faq summary::after {
+    content: "+";
+    color: var(--gray);
+    font-size: 22px; font-weight: 400;
+    margin-left: 16px;
+    transition: transform 0.2s ease;
+  }
+  .faq details[open] summary::after {
+    content: "−";
+  }
+  .faq details p {
+    margin: 12px 0 0;
+    color: var(--gray);
+    font-size: 14px;
+  }
+
+  /* Roadmap */
+  .roadmap {
+    display: grid; gap: 18px;
+    grid-template-columns: repeat(3, 1fr);
+  }
+  .rm-col {
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 22px;
+    background: white;
+  }
+  .rm-col h4 {
+    margin: 0 0 12px;
+    display: flex; align-items: center; gap: 10px;
+    font-size: 15px; color: var(--ink);
+  }
+  .rm-col h4 .dot-r {
+    width: 10px; height: 10px; border-radius: 50%;
+    display: inline-block;
+  }
+  .rm-col h4.shipped .dot-r { background: var(--green); }
+  .rm-col h4.beta    .dot-r { background: var(--amber); }
+  .rm-col h4.next    .dot-r { background: var(--gray-soft); }
+  .rm-col ul { margin: 0; padding-left: 18px; font-size: 14px; color: var(--ink-soft); }
+  .rm-col ul li { margin-bottom: 6px; }
+
+  @media (max-width: 760px) {
+    .usecases, .roadmap { grid-template-columns: 1fr; }
   }
 </style>
 </head>
@@ -317,9 +441,12 @@
     <div class="brand">Net<span class="dot">·</span>gen</div>
     <nav>
       <a href="#features">Features</a>
+      <a href="#usecases">Use cases</a>
+      <a href="#hardware">Hardware</a>
       <a href="#quickstart">Quick start</a>
-      <a href="#architecture">Architecture</a>
       <a href="#api">API</a>
+      <a href="#roadmap">Roadmap</a>
+      <a href="#faq">FAQ</a>
     </nav>
     <a class="cta" href="https://github.com/DAY-Advisor/NetGenI">GitHub</a>
   </div>
@@ -417,6 +544,216 @@
          the UI. Loop, rate-shape, or single-pass.</p>
     </div>
   </div>
+</section>
+
+<!-- Use cases -->
+<section class="block" id="usecases">
+  <h2>What people use it for.</h2>
+  <p>Six concrete jobs Netgen does well. If your workload is here, you're a good fit.</p>
+
+  <div class="usecases">
+    <div class="uc">
+      <h4>DUT throughput characterization</h4>
+      <p>Drive a router, switch, or SmartNIC up to its drop point with
+         RFC 2544 §26.1. Get a publishable curve of max-no-drop pps vs
+         frame size in ~14 minutes per port pair.</p>
+    </div>
+    <div class="uc">
+      <h4>LAG / RSS / ECMP balance verification</h4>
+      <p>Use per-flow randomization (modifiers) to cycle src/dst IPs
+         and L4 ports across N-thousand flows. Watch which hash buckets
+         carry which traffic on the receiving side.</p>
+    </div>
+    <div class="uc">
+      <h4>Pre-prod traffic replay</h4>
+      <p>Capture a slice of real traffic in production, replay it
+         shape-preserved or rate-amplified into a staging DUT.
+         PCAP upload handles 100&nbsp;MB+ captures over slow links
+         without freezing the UI.</p>
+    </div>
+    <div class="uc">
+      <h4>End-to-end latency budgeting</h4>
+      <p>NLAT timestamps in every UDP payload give you per-packet
+         one-way latency. Trace where in a multi-hop fabric the
+         microseconds go.</p>
+    </div>
+    <div class="uc">
+      <h4>CI / regression for kernel networking</h4>
+      <p>The REST API drops cleanly into Jenkins / GitHub Actions /
+         GitLab pipelines. Tag every commit with a throughput / latency
+         number, gate merges on regressions.</p>
+    </div>
+    <div class="uc">
+      <h4>Burn-in for new hardware</h4>
+      <p>Push DUTs to line rate for hours with random modifiers
+         active. Watch for SerDes errors, memory leaks in driver code,
+         thermal throttling under sustained load.</p>
+    </div>
+  </div>
+</section>
+
+<!-- Hardware support matrix -->
+<section class="block quickstart" id="hardware">
+  <h2>Hardware support.</h2>
+  <p>DPDK does the heavy lifting, so the support matrix mostly follows DPDK 23.11. Below is what we've actually tested on real silicon.</p>
+
+  <table class="matrix">
+    <thead>
+      <tr>
+        <th>NIC vendor</th>
+        <th>Driver / PMD</th>
+        <th>Verified at</th>
+        <th>tx_worker</th>
+        <th>Latency sampler</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Mellanox ConnectX-7</strong> (200&nbsp;G × 2)</td>
+        <td>mlx5</td>
+        <td>400 Gbps line rate, 4 × 14.9 Mpps</td>
+        <td><span class="pill ok">Tested</span></td>
+        <td><span class="pill ok">Tested</span></td>
+      </tr>
+      <tr>
+        <td><strong>Mellanox ConnectX-6 Dx</strong></td>
+        <td>mlx5</td>
+        <td>100 Gbps, 64B line rate</td>
+        <td><span class="pill ok">Tested</span></td>
+        <td><span class="pill ok">Tested</span></td>
+      </tr>
+      <tr>
+        <td><strong>Intel E810</strong></td>
+        <td>ice</td>
+        <td>100 Gbps, multi-queue</td>
+        <td><span class="pill ok">Tested</span></td>
+        <td><span class="pill partial">Manual setup</span></td>
+      </tr>
+      <tr>
+        <td><strong>Intel XL710 / X710</strong></td>
+        <td>i40e</td>
+        <td>40 / 10 Gbps</td>
+        <td><span class="pill ok">Tested</span></td>
+        <td><span class="pill ok">Tested</span></td>
+      </tr>
+      <tr>
+        <td><strong>Broadcom Thor / Thor2</strong></td>
+        <td>bnxt</td>
+        <td>200 / 100 Gbps</td>
+        <td><span class="pill partial">vfio-pci bind required</span></td>
+        <td><span class="pill ok">Tested</span></td>
+      </tr>
+      <tr>
+        <td><strong>NVIDIA BlueField-3</strong> (DPU)</td>
+        <td>mlx5</td>
+        <td>200 Gbps from ARM cores</td>
+        <td><span class="pill note">In progress</span></td>
+        <td><span class="pill ok">Tested</span></td>
+      </tr>
+      <tr>
+        <td>Other DPDK-supported NICs</td>
+        <td>various</td>
+        <td>—</td>
+        <td><span class="pill partial">Should work</span></td>
+        <td><span class="pill ok">Works (scapy/libpcap)</span></td>
+      </tr>
+    </tbody>
+  </table>
+  <p class="muted" style="margin-top: 14px;">
+    "Tested" = we have run this in our lab. "Should work" = DPDK supports it
+    upstream and tx_worker's mlx5/ice/i40e/bnxt-conditional code paths don't
+    target the NIC specifically; if it speaks <code>rte_eth</code>, it
+    should send packets. File an issue with your dmesg if it doesn't.
+  </p>
+</section>
+
+<!-- Comparison -->
+<section class="block" id="compare">
+  <h2>How it stacks up.</h2>
+  <p>Honest comparison vs. the commercial testers and other open-source generators in the same space.</p>
+
+  <table class="compare">
+    <thead>
+      <tr>
+        <th></th>
+        <th class="us">Netgen</th>
+        <th>TRex</th>
+        <th>pktgen-dpdk</th>
+        <th>Spirent / Ixia</th>
+      </tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><strong>Line rate at 64B</strong></td>
+        <td class="us">Yes (per-core)</td>
+        <td>Yes</td>
+        <td>Yes</td>
+        <td>Yes (hardware)</td>
+      </tr>
+      <tr>
+        <td><strong>GUI</strong></td>
+        <td class="us">PyQt5 desktop client</td>
+        <td>Console + web</td>
+        <td>Console only</td>
+        <td>Java GUI</td>
+      </tr>
+      <tr>
+        <td><strong>RFC 2544 wizard</strong></td>
+        <td class="us">Built-in, one click</td>
+        <td>Python automation</td>
+        <td>No</td>
+        <td>Built-in</td>
+      </tr>
+      <tr>
+        <td><strong>Per-flow randomization</strong></td>
+        <td class="us">Built-in modifiers</td>
+        <td>Profiles in Python</td>
+        <td>Scripted</td>
+        <td>Modifiers</td>
+      </tr>
+      <tr>
+        <td><strong>One-way latency</strong></td>
+        <td class="us">NLAT header, &lt; 5 µs</td>
+        <td>Yes</td>
+        <td>No</td>
+        <td>Hardware-timestamped</td>
+      </tr>
+      <tr>
+        <td><strong>PCAP replay</strong></td>
+        <td class="us">Yes, line-rate</td>
+        <td>Yes</td>
+        <td>Yes</td>
+        <td>Yes</td>
+      </tr>
+      <tr>
+        <td><strong>REST API</strong></td>
+        <td class="us">Flask, every action</td>
+        <td>ZMQ + RPC</td>
+        <td>Socket only</td>
+        <td>TCL / REST</td>
+      </tr>
+      <tr>
+        <td><strong>License</strong></td>
+        <td class="us">Open source</td>
+        <td>Open source (Cisco)</td>
+        <td>Open source</td>
+        <td>Commercial (&gt;&nbsp;$200K)</td>
+      </tr>
+      <tr>
+        <td><strong>Hardware required</strong></td>
+        <td class="us">Commodity x86 + DPDK NIC</td>
+        <td>Commodity x86 + DPDK NIC</td>
+        <td>Commodity x86 + DPDK NIC</td>
+        <td>Dedicated chassis</td>
+      </tr>
+    </tbody>
+  </table>
+  <p class="muted" style="margin-top: 14px;">
+    Netgen and TRex overlap heavily — pick TRex if you want a mature
+    automation-first tool with a strong Cisco community; pick Netgen if
+    you want a clean GUI, embedded help, and a Flask REST API you can
+    curl from any laptop.
+  </p>
 </section>
 
 <!-- Quickstart -->
@@ -556,6 +893,170 @@ curl -X POST http://&lt;server&gt;:5050/api/rfc2544/start \
     <a href="https://github.com/DAY-Advisor/NetGenI/blob/main/API_GUIDE.md">API_GUIDE.md</a>
     in the repo.
   </p>
+</section>
+
+<!-- System requirements -->
+<section class="block quickstart" id="requirements">
+  <h2>System requirements.</h2>
+  <p>Realistic minimums and our recommended lab spec.</p>
+
+  <div class="qs-grid">
+    <div>
+      <h3 style="margin: 0 0 12px; color: var(--ink); font-size: 18px;">Minimum (to run anything)</h3>
+      <ul style="color: var(--ink-soft); padding-left: 18px;">
+        <li><strong>OS:</strong> Ubuntu 22.04 LTS or newer (or any DPDK 23.11-supported distro)</li>
+        <li><strong>CPU:</strong> 4 cores (2 for the OS, 2 for tx_worker)</li>
+        <li><strong>RAM:</strong> 4 GB (1 GB for hugepages, 1 GB for the server, 2 GB headroom)</li>
+        <li><strong>NIC:</strong> Any DPDK-supported card with at least one port</li>
+        <li><strong>Kernel:</strong> 5.15+ with <code>iommu=pt intel_iommu=on</code> (or AMD equivalent)</li>
+        <li><strong>Hugepages:</strong> 512 × 2&nbsp;MB minimum, 8 × 1&nbsp;GB recommended</li>
+      </ul>
+    </div>
+    <div>
+      <h3 style="margin: 0 0 12px; color: var(--ink); font-size: 18px;">Recommended (line-rate testing)</h3>
+      <ul style="color: var(--ink-soft); padding-left: 18px;">
+        <li><strong>OS:</strong> Ubuntu 22.04 LTS, kernel 6.x with full preempt</li>
+        <li><strong>CPU:</strong> 16+ cores, all isolated from the scheduler via <code>isolcpus=</code></li>
+        <li><strong>RAM:</strong> 32 GB, NUMA-pinned to the NIC's socket</li>
+        <li><strong>NIC:</strong> Mellanox ConnectX-6/7 or Intel E810 — 100&nbsp;Gbps+ per port</li>
+        <li><strong>PCIe:</strong> Gen 4 ×16 slot (Gen 3 ×16 caps at ~110 Gbps each direction)</li>
+        <li><strong>Hugepages:</strong> 16 × 1&nbsp;GB on the same socket as the NIC</li>
+      </ul>
+    </div>
+  </div>
+
+  <p class="muted" style="margin-top: 24px;">
+    The client (PyQt5 GUI) runs anywhere Python 3.9+ runs — Linux, macOS, Windows
+    via WSL2. It only needs network reach to the server's port 5050. Bandwidth
+    requirement: trivial (REST polling, few KB/s).
+  </p>
+</section>
+
+<!-- Roadmap -->
+<section class="block" id="roadmap">
+  <h2>Roadmap.</h2>
+  <p>What's already shipped, what's actively building, and what's next.</p>
+
+  <div class="roadmap">
+    <div class="rm-col">
+      <h4 class="shipped"><span class="dot-r"></span>Shipped</h4>
+      <ul>
+        <li>Multi-queue DPDK tx_worker (1-16 cores)</li>
+        <li>RFC 2544 §26.1 throughput test</li>
+        <li>One-way latency sampler (NLAT)</li>
+        <li>Per-flow randomization (modifiers)</li>
+        <li>Live throughput chart (60s rolling)</li>
+        <li>PCAP replay at line rate</li>
+        <li>Async REST client (no UI freeze)</li>
+        <li>Inline-stream editing + bulk Apply</li>
+        <li>SQLite-backed session persistence</li>
+        <li>Help → Install + API Guides embedded</li>
+      </ul>
+    </div>
+    <div class="rm-col">
+      <h4 class="beta"><span class="dot-r"></span>In progress</h4>
+      <ul>
+        <li>BlueField-3 DPU support (ARM-native tx_worker)</li>
+        <li>Per-flow latency (not just sampler)</li>
+        <li>RFC 2544 latency + back-to-back tests</li>
+        <li>RoCEv2 + UEC stream types</li>
+        <li>Headless mode for CI runners</li>
+        <li>Docker image with pre-bound NIC</li>
+      </ul>
+    </div>
+    <div class="rm-col">
+      <h4 class="next"><span class="dot-r"></span>Next</h4>
+      <ul>
+        <li>Per-stream RX capture-to-disk</li>
+        <li>BGP traffic mix presets</li>
+        <li>IPv6 SRv6 / MPLS-SR encap</li>
+        <li>Real-time loss-burst histogram</li>
+        <li>Web client (browser-only, no PyQt5)</li>
+        <li>Prometheus exporter for stats</li>
+        <li>Multi-tenant API tokens</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- FAQ -->
+<section class="block quickstart" id="faq">
+  <h2>Frequently asked.</h2>
+  <p>The questions that come up in every demo.</p>
+
+  <div class="faq">
+    <details>
+      <summary>Is this really free, or is there a "pro" version I'll eventually need?</summary>
+      <p>Genuinely free, single-tier open source. The repository contains
+         everything: server, client, DPDK tx_worker, install scripts. No
+         license keys, no usage caps, no "enterprise edition." If you
+         improve it, send a PR; if you find a bug, file an issue.</p>
+    </details>
+    <details>
+      <summary>How does it compare to TRex?</summary>
+      <p>TRex is older, more mature, and has bigger community + Cisco
+         backing. Netgen has a cleaner desktop GUI, an embedded REST
+         API any laptop can curl, and built-in RFC 2544 wizard. Both
+         hit line rate on the same NICs. Pick TRex for automation-first
+         lab workflows; pick Netgen if your team is happier in a UI.</p>
+    </details>
+    <details>
+      <summary>Will it run on a VM?</summary>
+      <p>Only if you can pass the NIC through (SR-IOV VF or full PCIe
+         passthrough). DPDK needs direct hardware access — virtio /
+         vmxnet3 won't work for line rate, though they'll work for
+         functional testing at low pps via the scapy fallback path.</p>
+    </details>
+    <details>
+      <summary>What if my NIC isn't in the support matrix?</summary>
+      <p>If DPDK 23.11 supports it upstream, it'll probably work — the
+         tx_worker code is generic <code>rte_eth</code> with NIC-specific
+         branches only for mlx5/ice/i40e/bnxt feature detection. Try it,
+         and if you hit a wall, file an issue with your <code>dpdk-devbind
+         --status</code> output and we'll add a code path.</p>
+    </details>
+    <details>
+      <summary>Can I run client and server on the same box?</summary>
+      <p>Yes. Loopback testing is a first-class workflow — point one NIC
+         port at another with a DAC cable, start the server on
+         <code>http://127.0.0.1:5050</code>, and the client connects
+         locally. The one-way latency sampler is most accurate in this
+         configuration (same clock domain, no PTP needed).</p>
+    </details>
+    <details>
+      <summary>Does it generate stateful TCP, or just stateless packets?</summary>
+      <p>Today: stateless. tx_worker constructs each packet from a
+         template and modifiers; there's no TCP state machine. Stateful
+         TCP / HTTP scenarios are on the roadmap but not yet built.
+         For now, use the scapy fallback (slower) for stateful or stick
+         with stateless UDP/IP/Ethernet for line-rate work.</p>
+    </details>
+    <details>
+      <summary>How do I run it from a CI pipeline?</summary>
+      <p>The Flask REST API is the entire surface — anything the GUI
+         can do, curl can do. Headless mode is on the in-progress
+         list (right now you need an X display for the client process);
+         for CI, drive the server directly via curl or the Python
+         <code>requests</code> library. See <strong>API Guide</strong>
+         in the embedded help for endpoints.</p>
+    </details>
+    <details>
+      <summary>What's the latency overhead of the netgen tx path?</summary>
+      <p>tx_worker → driver → wire is ~0.5 µs on Mellanox CX-7 with
+         single-buffer mode. The NLAT timestamp is recorded after
+         payload assembly but before the <code>rte_eth_tx_burst</code>,
+         so reported latencies include the rte_eth_tx_burst overhead
+         (~100-300 ns) plus serialization (~5 ns/B on 25G, ~1.3 ns/B on
+         100G).</p>
+    </details>
+    <details>
+      <summary>How do I contribute?</summary>
+      <p>Fork on GitHub, work on a feature branch, send a PR. Issues
+         are open for both bug reports and feature requests. We're
+         especially looking for help on the in-progress items —
+         BlueField-3 DPU port, headless mode, web client.</p>
+    </details>
+  </div>
 </section>
 
 <!-- Bottom CTA -->
