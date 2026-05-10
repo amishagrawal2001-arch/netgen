@@ -80,9 +80,28 @@ def build_generic_packet(stream_data, pkt_cfg, vlan_id,
     l3 = protocol_selection.get("L3", "IPv4")
     l4 = protocol_selection.get("L4", "UDP")
 
-    # Base Ether - ensure lists are non-empty
-    mac_src = src_mac or (pkt_cfg["mac_src_list"][0] if pkt_cfg.get("mac_src_list") and len(pkt_cfg["mac_src_list"]) > 0 else "00:00:00:00:00:02")
-    mac_dst = dst_mac or (pkt_cfg["mac_dst_list"][0] if pkt_cfg.get("mac_dst_list") and len(pkt_cfg["mac_dst_list"]) > 0 else "00:00:00:00:00:01")
+    # Base Ether - use provided MAC addresses (from increment lists) or fall back to lists/defaults
+    # IMPORTANT: src_mac and dst_mac parameters take precedence - these are the incremented values
+    if src_mac:
+        mac_src = src_mac
+    elif pkt_cfg.get("mac_src_list") and len(pkt_cfg["mac_src_list"]) > 0:
+        mac_src = pkt_cfg["mac_src_list"][0]
+    else:
+        mac_src = "00:00:00:00:00:02"
+    
+    if dst_mac:
+        mac_dst = dst_mac
+    elif pkt_cfg.get("mac_dst_list") and len(pkt_cfg["mac_dst_list"]) > 0:
+        mac_dst = pkt_cfg["mac_dst_list"][0]
+    else:
+        mac_dst = "00:00:00:00:00:01"
+    
+    # Reduced logging for performance - only log first packet
+    if not hasattr(build_generic_packet, '_log_count'):
+        build_generic_packet._log_count = 0
+        logging.info(f"[MAC] build_generic_packet: using src={mac_src}, dst={mac_dst} (provided src_mac={src_mac}, dst_mac={dst_mac})")
+    build_generic_packet._log_count += 1
+    
     pkt = Ether(src=mac_src, dst=mac_dst)
 
     # --- VLAN (802.1Q) with PCP/DEI and optional TPID override ---
@@ -233,6 +252,102 @@ def build_generic_packet(stream_data, pkt_cfg, vlan_id,
         except Exception as e:
             logging.warning(f"[IPv4] Fragmentation error: {e}")
 
+    # Apply frame size padding based on frame_type
+    pkt = _apply_frame_size(pkt, stream_data)
+    
+    return pkt
+
+
+def _apply_frame_size(pkt, stream_data):
+    """
+    Pad packet to target frame size based on frame_type (Fixed, Random, IMIX).
+    Frame size is measured as total Ethernet frame length (including FCS, but we pad to L2 payload size).
+    """
+    protocol_selection = stream_data.get("protocol_selection", {}) or {}
+    
+    # Get frame type and size parameters - check both protocol_selection and top-level
+    frame_type = (protocol_selection.get("frame_type") or 
+                  stream_data.get("frame_type") or 
+                  "Fixed")
+    
+    # Get frame size parameters - check both locations with error handling
+    try:
+        frame_size = int(protocol_selection.get("frame_size") or 
+                        stream_data.get("frame_size") or 
+                        64)
+        frame_size = max(64, min(frame_size, 9216))  # Validate range
+    except (ValueError, TypeError):
+        frame_size = 64
+    
+    try:
+        frame_min = int(protocol_selection.get("frame_min") or 
+                       stream_data.get("frame_min") or 
+                       64)
+        frame_min = max(64, min(frame_min, 9216))  # Validate range
+    except (ValueError, TypeError):
+        frame_min = 64
+    
+    try:
+        frame_max = int(protocol_selection.get("frame_max") or 
+                       stream_data.get("frame_max") or 
+                       1518)
+        frame_max = max(64, min(frame_max, 9216))  # Validate range
+    except (ValueError, TypeError):
+        frame_max = 1518
+    
+    # Ensure frame_min <= frame_max for Random type
+    if frame_type == "Random" and frame_min > frame_max:
+        logging.warning(f"[FRAME SIZE] frame_min ({frame_min}) > frame_max ({frame_max}), swapping values")
+        frame_min, frame_max = frame_max, frame_min
+    
+    # Calculate target frame size based on frame_type
+    if frame_type == "Fixed":
+        target_size = frame_size
+    elif frame_type == "Random":
+        # Ensure frame_min <= frame_max before random selection
+        if frame_min > frame_max:
+            frame_min, frame_max = frame_max, frame_min
+        target_size = random.randint(frame_min, frame_max)
+    elif frame_type == "IMIX":
+        # Standard IMIX distribution: 58% 64B, 33% 576B, 9% 1518B
+        rand = random.random()
+        if rand < 0.58:
+            target_size = 64
+        elif rand < 0.91:
+            target_size = 576
+        else:
+            target_size = 1518
+    else:
+        # Default to Fixed
+        target_size = frame_size
+    
+    # Ensure target_size is within valid Ethernet range
+    target_size = max(64, min(target_size, 9216))
+    
+    # Get current packet size (Ethernet frame size without FCS)
+    # len(pkt) includes 14 bytes Ethernet header + payload
+    current_size = len(pkt)
+    
+    # Calculate padding needed
+    # Total Ethernet frame = 14 (Ethernet header) + payload + 4 (FCS)
+    # If target_size = 64 bytes total, then: 14 + payload + 4 = 64, so payload = 46
+    # Since len(pkt) = 14 + payload, we need len(pkt) = target_size - 4 (FCS)
+    target_frame_size = target_size - 4  # Subtract FCS (4 bytes)
+    
+    if current_size < target_frame_size:
+        padding_needed = target_frame_size - current_size
+        if padding_needed > 0:
+            # Add padding to the packet
+            if Raw in pkt:
+                # Append to existing Raw payload
+                try:
+                    pkt[Raw].load = bytes(pkt[Raw].load) + b'\x00' * padding_needed
+                except Exception:
+                    pkt = pkt / Raw(load=b'\x00' * padding_needed)
+            else:
+                # Add new Raw layer with padding
+                pkt = pkt / Raw(load=b'\x00' * padding_needed)
+    
     return pkt
 
 
@@ -240,6 +355,9 @@ def build_generic_packet(stream_data, pkt_cfg, vlan_id,
 def get_packet_config(stream_data):
     protocol_data = stream_data.get("protocol_data", {}) or {}
     mac = protocol_data.get("mac", {}) or {}
+    
+    # Debug: Log what MAC data we received
+    logging.info(f"[MAC] Received protocol_data.mac: {mac}")
     vlan = protocol_data.get("vlan", {}) or {}
     ipv4 = protocol_data.get("ipv4", {}) or {}
     ipv6 = protocol_data.get("ipv6", {}) or {}
@@ -258,30 +376,72 @@ def get_packet_config(stream_data):
     mac_src_default = mac.get("mac_source_address") or "00:00:00:00:00:02"
     mac_src_list = [mac_src_default]
     mac_src_mode = mac.get("mac_source_mode", "Fixed")
+    logging.info(f"[MAC] Source MAC mode: {mac_src_mode}, address: {mac_src_default}")
     if mac_src_mode in ("Increment", "Decrement") and mac_src_default:
-        step = int(mac.get("mac_source_step", 1))
-        count = int(mac.get("mac_source_count", 1))
-        # For Decrement mode, use negative step
-        if mac_src_mode == "Decrement":
-            step = -step
-        if count > 0:
-            mac_src_list = [increment_mac(mac_src_default, step * i) for i in range(count)]
-        else:
+        try:
+            step = int(mac.get("mac_source_step", 1))
+            count = int(mac.get("mac_source_count", 1))
+            logging.info(f"[MAC] Source increment: step={step}, count={count} (raw value from stream_data)")
+            # For Decrement mode, use negative step
+            if mac_src_mode == "Decrement":
+                step = -step
+            # If count is 1 or less, generate at least 2 addresses to show increment working
+            # This ensures increment mode actually produces multiple addresses
+            if count <= 1:
+                logging.warning(f"[MAC] Source increment count is {count}, generating 2 addresses to show increment")
+                count = 2
+            else:
+                logging.info(f"[MAC] Source increment: will generate {count} MAC addresses")
+            if count > 0:
+                mac_src_list = [increment_mac(mac_src_default, step * i) for i in range(count)]
+                if len(mac_src_list) <= 20:
+                    logging.info(f"[MAC] Source MAC list generated ({len(mac_src_list)} addresses): {mac_src_list}")
+                else:
+                    logging.info(f"[MAC] Source MAC list generated ({len(mac_src_list)} addresses): {mac_src_list[:10]}... (showing first 10 of {len(mac_src_list)})")
+                    logging.info(f"[MAC] Source MAC list (last 10): ...{mac_src_list[-10:]}")
+            else:
+                mac_src_list = [mac_src_default]
+                logging.warning(f"[MAC] Source increment count is 0, using fixed address")
+        except Exception as e:
+            logging.error(f"[MAC] Error processing source MAC increment: {e}")
             mac_src_list = [mac_src_default]
+    else:
+        logging.info(f"[MAC] Source MAC mode is '{mac_src_mode}', using fixed address: {mac_src_default}")
 
     mac_dst_default = mac.get("mac_destination_address") or "00:00:00:00:00:01"
     mac_dst_list = [mac_dst_default]
     mac_dst_mode = mac.get("mac_destination_mode", "Fixed")
+    logging.info(f"[MAC] Destination MAC mode: {mac_dst_mode}, address: {mac_dst_default}")
     if mac_dst_mode in ("Increment", "Decrement") and mac_dst_default:
-        step = int(mac.get("mac_destination_step", 1))
-        count = int(mac.get("mac_destination_count", 1))
-        # For Decrement mode, use negative step
-        if mac_dst_mode == "Decrement":
-            step = -step
-        if count > 0:
-            mac_dst_list = [increment_mac(mac_dst_default, step * i) for i in range(count)]
-        else:
+        try:
+            step = int(mac.get("mac_destination_step", 1))
+            count = int(mac.get("mac_destination_count", 1))
+            logging.info(f"[MAC] Destination increment: step={step}, count={count} (raw value from stream_data)")
+            # For Decrement mode, use negative step
+            if mac_dst_mode == "Decrement":
+                step = -step
+            # If count is 1 or less, generate at least 2 addresses to show increment working
+            # This ensures increment mode actually produces multiple addresses
+            if count <= 1:
+                logging.warning(f"[MAC] Destination increment count is {count}, generating 2 addresses to show increment")
+                count = 2
+            else:
+                logging.info(f"[MAC] Destination increment: will generate {count} MAC addresses")
+            if count > 0:
+                mac_dst_list = [increment_mac(mac_dst_default, step * i) for i in range(count)]
+                if len(mac_dst_list) <= 20:
+                    logging.info(f"[MAC] Destination MAC list generated ({len(mac_dst_list)} addresses): {mac_dst_list}")
+                else:
+                    logging.info(f"[MAC] Destination MAC list generated ({len(mac_dst_list)} addresses): {mac_dst_list[:10]}... (showing first 10 of {len(mac_dst_list)})")
+                    logging.info(f"[MAC] Destination MAC list (last 10): ...{mac_dst_list[-10:]}")
+            else:
+                mac_dst_list = [mac_dst_default]
+                logging.warning(f"[MAC] Destination increment count is 0, using fixed address")
+        except Exception as e:
+            logging.error(f"[MAC] Error processing destination MAC increment: {e}")
             mac_dst_list = [mac_dst_default]
+    else:
+        logging.info(f"[MAC] Destination MAC mode is '{mac_dst_mode}', using fixed address: {mac_dst_default}")
 
     # IPv4 - with defaults and validation
     ipv4_src_default = ipv4.get("ipv4_source") or "10.0.0.1"
@@ -364,6 +524,82 @@ def get_packet_config(stream_data):
         else:
             udp_dport_list = [start]
 
+    # RoCEv2 GID and QP increments
+    rocev2 = protocol_data.get("rocev2", {}) or {}
+    
+    # Source GID increment
+    gid_src_default = rocev2.get("rocev2_source_gid", "0:0:0:0:0:ffff:192.168.0.2")
+    gid_src_list = [gid_src_default]
+    gid_src_mode = rocev2.get("rocev2_gid_source_mode", "Fixed")
+    if gid_src_mode == "Increment" and gid_src_default:
+        try:
+            step = int(rocev2.get("rocev2_gid_source_step", 1))
+            count = int(rocev2.get("rocev2_gid_source_count", 1))
+            if count <= 1:
+                logging.warning(f"[RoCEv2] Source GID increment count is {count}, generating 2 addresses to show increment")
+                count = 2
+            if count > 0:
+                from utils.helpers import increment_gid
+                gid_src_list = [increment_gid(gid_src_default, step * i) for i in range(count)]
+                logging.info(f"[RoCEv2] Source GID list generated ({len(gid_src_list)} addresses): {gid_src_list[:5] if len(gid_src_list) > 5 else gid_src_list}")
+        except Exception as e:
+            logging.error(f"[RoCEv2] Error processing source GID increment: {e}")
+            gid_src_list = [gid_src_default]
+    
+    # Destination GID increment
+    gid_dst_default = rocev2.get("rocev2_destination_gid", "0:0:0:0:0:ffff:192.168.0.3")
+    gid_dst_list = [gid_dst_default]
+    gid_dst_mode = rocev2.get("rocev2_gid_destination_mode", "Fixed")
+    if gid_dst_mode == "Increment" and gid_dst_default:
+        try:
+            step = int(rocev2.get("rocev2_gid_destination_step", 1))
+            count = int(rocev2.get("rocev2_gid_destination_count", 1))
+            if count <= 1:
+                logging.warning(f"[RoCEv2] Destination GID increment count is {count}, generating 2 addresses to show increment")
+                count = 2
+            if count > 0:
+                from utils.helpers import increment_gid
+                gid_dst_list = [increment_gid(gid_dst_default, step * i) for i in range(count)]
+                logging.info(f"[RoCEv2] Destination GID list generated ({len(gid_dst_list)} addresses): {gid_dst_list[:5] if len(gid_dst_list) > 5 else gid_dst_list}")
+        except Exception as e:
+            logging.error(f"[RoCEv2] Error processing destination GID increment: {e}")
+            gid_dst_list = [gid_dst_default]
+    
+    # QP (Queue Pair) increment - Destination QP is used in BTH
+    qp_dst_default = int(rocev2.get("rocev2_destination_qp", 0))
+    qp_dst_list = [qp_dst_default]
+    if rocev2.get("rocev2_qp_increment", False):
+        try:
+            start = qp_dst_default
+            step = int(rocev2.get("rocev2_qp_increment_step", 1))
+            count = int(rocev2.get("rocev2_qp_count", 1))
+            if count <= 1:
+                logging.warning(f"[RoCEv2] QP increment count is {count}, generating 2 QPs to show increment")
+                count = 2
+            if count > 0:
+                qp_dst_list = [(start + step * i) & 0xFFFFFF for i in range(count)]  # 24-bit QP
+                logging.info(f"[RoCEv2] Destination QP list generated ({len(qp_dst_list)} QPs): {qp_dst_list[:10] if len(qp_dst_list) > 10 else qp_dst_list}")
+        except Exception as e:
+            logging.error(f"[RoCEv2] Error processing QP increment: {e}")
+            qp_dst_list = [qp_dst_default]
+    
+    # Source QP (not used in BTH but available for other purposes)
+    qp_src_default = int(rocev2.get("rocev2_source_qp", 0))
+    qp_src_list = [qp_src_default]
+    # Note: Source QP increment uses same settings as destination QP increment
+    if rocev2.get("rocev2_qp_increment", False):
+        try:
+            start = qp_src_default
+            step = int(rocev2.get("rocev2_qp_increment_step", 1))
+            count = int(rocev2.get("rocev2_qp_count", 1))
+            if count <= 1:
+                count = 2
+            if count > 0:
+                qp_src_list = [(start + step * i) & 0xFFFFFF for i in range(count)]
+        except Exception as e:
+            logging.error(f"[RoCEv2] Error processing source QP increment: {e}")
+            qp_src_list = [qp_src_default]
+
     return {
         "vlan_ids": vlan_ids,
         "mac_src_list": mac_src_list,
@@ -378,4 +614,8 @@ def get_packet_config(stream_data):
         "udp_sport_list": udp_sport_list,
         "udp_dport_list": udp_dport_list,
         "tcp_flag_string": parse_tcp_flags(tcp.get("tcp_flags", "")),
+        "gid_src_list": gid_src_list,
+        "gid_dst_list": gid_dst_list,
+        "qp_src_list": qp_src_list,
+        "qp_dst_list": qp_dst_list,
     }
