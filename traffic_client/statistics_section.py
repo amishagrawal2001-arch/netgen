@@ -134,7 +134,9 @@ class ThroughputChart(QWidget):
                     seen.add(iface)
                     iface_order.append(iface)
 
-        # Determine Y max across all visible series
+        # Determine Y max across all visible series. We want the SUM
+        # across ifaces (when stacked) but here each series is drawn
+        # separately, so y_max is the max single-series value.
         y_max = 0.0
         for ts, vals in self._samples:
             if ts < t_min:
@@ -144,14 +146,31 @@ class ThroughputChart(QWidget):
                     y_max = v
         if y_max <= 0:
             y_max = 1.0  # avoid div-by-zero; chart will be flat
-        # Round y_max up to a "nice" number
-        # Pick a power-of-10 step that divides y_max into 4 ticks
+
+        # Round y_max up to a chart-friendly top with ~5% headroom so
+        # the line doesn't kiss the top edge.
+        #
+        # OLD bug: the loop was `while step * 8 < y_max: step *= 2`
+        # but y_top was `step * 4`. For y_max = 400 Gbps, step = 50,
+        # `step * 8 = 400 < 400` is false → loop exits → y_top = 200.
+        # Result: the line shot off the top of a chart whose Y axis
+        # claimed to top out at 200 Gbps.
+        #
+        # New: pick the smallest "nice" multiple of a power of 10 that
+        # is >= y_max with headroom, from the set {1, 2, 2.5, 5, 10}.
+        # All five divide cleanly into 5 intervals so tick labels
+        # come out as round numbers (0/100/200/300/400/500 for a
+        # 500 Gbps top, etc.).
         import math
-        log = math.log10(max(y_max, 1.0))
-        step = 10 ** math.floor(log) / 2.0
-        while step * 8 < y_max:
-            step *= 2
-        y_top = step * 4
+        target = y_max * 1.05
+        log = math.log10(max(target, 1.0))
+        pow10 = 10 ** math.floor(log)
+        y_top = 10 * pow10  # fallback / decade-overflow
+        for m in (1.0, 2.0, 2.5, 5.0, 10.0):
+            candidate = m * pow10
+            if candidate >= target:
+                y_top = candidate
+                break
 
         # Axes
         axis_pen = QPen(QColor("#cbd5e1"))
@@ -161,13 +180,17 @@ class ThroughputChart(QWidget):
         p.drawLine(plot_x0, plot_y0 + plot_h,
                    plot_x0 + plot_w, plot_y0 + plot_h)  # X axis
 
-        # Y-axis labels (4 ticks)
+        # Y-axis labels — 5 intervals (6 labels including 0). With the
+        # {1, 2, 2.5, 5, 10} × 10^N y_top picker above this gives clean
+        # tick values: top=100→step=20, top=200→step=40, top=250→step=50,
+        # top=500→step=100, top=1000→step=200.
         label_font = QFont(self.font()); label_font.setPointSize(9)
         p.setFont(label_font)
         p.setPen(QColor("#6b7280"))
-        for i in range(5):
-            y_val = y_top * i / 4
-            y_px = plot_y0 + plot_h - int(plot_h * i / 4)
+        N_TICKS = 5
+        for i in range(N_TICKS + 1):
+            y_val = y_top * i / N_TICKS
+            y_px = plot_y0 + plot_h - int(plot_h * i / N_TICKS)
             p.drawText(4, y_px + 4, self._format_bps(y_val))
             # Faint grid line
             grid_pen = QPen(QColor("#f3f4f6"))
