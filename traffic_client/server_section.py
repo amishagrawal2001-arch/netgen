@@ -645,18 +645,23 @@ class TrafficGenClientServerSection():
                     # (0) Status (read-only) — icon + hover tooltip + accessible label.
                     # Color alone is insufficient (colourblind users see no signal); the
                     # tooltip and Qt accessibility name carry the meaning in text too.
+                    #
+                    # The icon is scaled to a 12x12 pixmap to match the server tree's
+                    # status indicator. Without explicit scaling, Qt's default
+                    # iconSize on a QTableWidget can render this as a 22x22+ square
+                    # block on high-DPI Macs, which looks like a square not a dot.
                     status = stream.get("status", "stopped")
                     if status == "running":
-                        status_icon = QIcon(r_icon("icons/green_dot.png"))
+                        raw_icon = QIcon(r_icon("icons/green_dot.png"))
                         status_label = "Running"
                     elif status == "rx_tracking":
-                        status_icon = QIcon(r_icon("icons/blue_dot.png"))
+                        raw_icon = QIcon(r_icon("icons/blue_dot.png"))
                         status_label = "Tracking RX"
                     else:
-                        status_icon = QIcon(r_icon("icons/red_dot.png"))
+                        raw_icon = QIcon(r_icon("icons/red_dot.png"))
                         status_label = "Stopped"
                     status_item = QTableWidgetItem()
-                    status_item.setIcon(status_icon)
+                    status_item.setIcon(QIcon(raw_icon.pixmap(12, 12)))
                     status_item.setFlags(Qt.ItemIsEnabled)
                     status_item.setToolTip(status_label)
                     status_item.setData(Qt.AccessibleTextRole, status_label)
