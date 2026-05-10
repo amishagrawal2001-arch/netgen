@@ -340,6 +340,17 @@ def stream_stats():
             except (ValueError, TypeError):
                 dpdk_tx_cores = 1
 
+            # Whether this stream was launched with --enable-timestamps so
+            # tx_worker embeds the 16-byte NLAT header at the start of each
+            # UDP payload. The client uses this to decide whether to fetch
+            # /api/latency/stats for the stream's interface and to render
+            # the Latency cell as either a real reading or "off".
+            ts_enabled = bool(
+                stream_data.get("enable_timestamps")
+                or stream_data.get("latency_enabled")
+                or protocol_selection.get("enable_timestamps")
+            )
+
             # Verify stream is actually running in stream_tracker
             stream_id = stream.get("stream_id")
             interface = stream.get("interface")
@@ -391,6 +402,8 @@ def stream_stats():
                 # Engine surface (so the client can render a multi-queue badge)
                 "dpdk_enable": dpdk_enable,
                 "dpdk_tx_cores": dpdk_tx_cores,
+                # One-way latency timestamping flag — see ts_enabled above.
+                "enable_timestamps": ts_enabled,
                 # Add internal fields for debugging
                 "last_tx_count": stream.get("last_tx_count"),
                 "last_rx_count": stream.get("last_rx_count"),
@@ -14239,6 +14252,109 @@ def rfc2544_progress():
             "error":        _RFC2544_STATE["error"],
         }
     return jsonify(snap)
+
+
+# =============================================================================
+# One-way latency — server-side LatencySampler manager
+# =============================================================================
+# Streams started with enable_timestamps=true embed an NLAT header at the
+# start of each UDP payload (see utils/latency_sampler.py + tx_worker.c).
+# A LatencySampler instance per interface decodes the RX side; this module
+# manages their lifecycle and exposes results via /api/latency/stats.
+#
+# Sampler is started lazily — the first /api/latency/stats?iface=X for an
+# interface with timestamp-tagged traffic spins one up. Idle samplers stay
+# alive (negligible cost; sniff thread with bpf "udp and dst port 4791").
+
+_LATENCY_SAMPLERS = {}            # {iface_name: LatencySampler}
+_LATENCY_SAMPLERS_LOCK = __import__("threading").Lock()
+
+
+def _get_or_start_latency_sampler(iface, udp_port=4791):
+    """Return a running LatencySampler for the given iface. Starts one if
+    none exists yet. Returns None if scapy/libpcap unavailable."""
+    with _LATENCY_SAMPLERS_LOCK:
+        s = _LATENCY_SAMPLERS.get(iface)
+        if s is not None:
+            return s
+        try:
+            from utils.latency_sampler import LatencySampler
+        except Exception as e:
+            logging.warning(f"[LATENCY] sampler module unavailable: {e}")
+            return None
+        try:
+            s = LatencySampler(iface=iface, udp_port=udp_port,
+                               window_size=10000)
+            s.start()
+            _LATENCY_SAMPLERS[iface] = s
+            logging.info(f"[LATENCY] started sampler on {iface}")
+            return s
+        except Exception as e:
+            logging.warning(f"[LATENCY] failed to start sampler on {iface}: {e}")
+            return None
+
+
+@app.route("/api/latency/stats", methods=["GET"])
+def latency_stats():
+    """Return one-way latency stats for an interface.
+
+    Query params:
+      iface     - network interface name (required)
+      udp_port  - UDP dst port to filter (default 4791)
+
+    Response:
+      {
+        ok: bool, iface, udp_port,
+        samples_seen, samples_decoded, samples_skipped,
+        window_samples, min_us, avg_us, p50_us, p99_us, max_us
+      }
+
+    Starts a LatencySampler the first time a given interface is queried.
+    Idle samplers stay running — sniff threads are cheap.
+    """
+    iface = (request.args.get("iface") or "").strip()
+    if not iface:
+        return jsonify({"ok": False, "error": "iface required"}), 400
+    try:
+        udp_port = int(request.args.get("udp_port") or 4791)
+    except Exception:
+        udp_port = 4791
+
+    s = _get_or_start_latency_sampler(iface, udp_port=udp_port)
+    if s is None:
+        return jsonify({
+            "ok": False,
+            "error": "latency sampler unavailable (scapy/libpcap missing?)",
+            "iface": iface,
+        }), 503
+
+    stats = s.stats()
+    return jsonify({
+        "ok": True,
+        "iface": iface,
+        "udp_port": udp_port,
+        **stats,
+    })
+
+
+@app.route("/api/latency/stop", methods=["POST"])
+def latency_stop():
+    """Stop the latency sampler for an interface (or all if no iface)."""
+    data = request.get_json(silent=True) or {}
+    iface = (data.get("iface") or "").strip()
+    stopped = []
+    with _LATENCY_SAMPLERS_LOCK:
+        if iface:
+            s = _LATENCY_SAMPLERS.pop(iface, None)
+            if s:
+                s.stop()
+                stopped.append(iface)
+        else:
+            for name, s in list(_LATENCY_SAMPLERS.items()):
+                s.stop()
+                stopped.append(name)
+            _LATENCY_SAMPLERS.clear()
+    return jsonify({"ok": True, "stopped": stopped})
 
 
 # ---- Explicit entry point used by 'ostg-server' ----

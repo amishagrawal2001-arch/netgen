@@ -275,9 +275,42 @@ class StatisticsFetchWorker(QThread):
                         response = self.connection_manager.get(f"{server_address}/api/streams/stats", timeout=3)
                     else:
                         response = requests.get(f"{server_address}/api/streams/stats", timeout=3)
-                    
+
                     if response.status_code == 200:
                         stream_stats = response.json().get("active_streams", [])
+                        # Annotate each stream with latency stats from the
+                        # server's per-iface sampler. We do one fetch per
+                        # unique iface in the response (cached locally for
+                        # this tick) so a 16-stream / 1-iface test only
+                        # makes a single extra HTTP call. The endpoint is
+                        # idempotent — it lazily starts the sampler on
+                        # first call, then returns cached rolling stats.
+                        latency_by_iface = {}
+                        unique_ifaces = {
+                            s.get("interface") for s in stream_stats
+                            if s.get("interface")
+                            and (s.get("enable_timestamps") or s.get("latency_enabled"))
+                        }
+                        for iface in unique_ifaces:
+                            if self._should_stop:
+                                break
+                            try:
+                                url = f"{server_address}/api/latency/stats?iface={iface}"
+                                if self.connection_manager:
+                                    lat_resp = self.connection_manager.get(url, timeout=2)
+                                else:
+                                    lat_resp = requests.get(url, timeout=2)
+                                if lat_resp.status_code == 200:
+                                    latency_by_iface[iface] = lat_resp.json()
+                            except Exception:
+                                # Sampler unavailable / endpoint missing on
+                                # an older server — leave the cell as "—"
+                                # rather than failing the whole stats poll.
+                                pass
+                        for s in stream_stats:
+                            iface = s.get("interface")
+                            if iface and iface in latency_by_iface:
+                                s["_latency"] = latency_by_iface[iface]
                         self.stream_stats_fetched.emit(server, stream_stats)
                     else:
                         self.fetch_error.emit(server, f"HTTP {response.status_code}")
@@ -380,11 +413,11 @@ class TrafficGenClientStatisticsSection():
         
         # Stream Statistics Table
         self.stream_statistics_table = QTableWidget()
-        self.stream_statistics_table.setColumnCount(12)
+        self.stream_statistics_table.setColumnCount(13)
         self.stream_statistics_table.setHorizontalHeaderLabels([
             "Stream Name", "Interface", "Engine", "TX Count", "RX Count",
             "TX Rate", "RX Rate", "TX Bit Rate", "RX Bit Rate",
-            "Loss %", "Status", "Flow Tracking",
+            "Latency (μs)", "Loss %", "Status", "Flow Tracking",
         ])
         self.stream_statistics_table.setStyleSheet(table_style)
         self.stream_statistics_table.setAlternatingRowColors(True)
@@ -1200,16 +1233,17 @@ class TrafficGenClientStatisticsSection():
             logger.debug(f"[DEBUG STREAM STATS] stream_statistics_table not found or not initialized")
             return
         
-        # Set column count first (12 columns: Engine between Interface and
+        # Set column count first (13 columns: Engine between Interface and
         # TX Count; TX Bit Rate / RX Bit Rate inserted after the pps Rate
         # columns so the live throughput readout matches the Interface
-        # Statistics tab without flipping tabs).
+        # Statistics tab without flipping tabs; Latency (μs) inserted after
+        # RX Bit Rate, populated from /api/latency/stats per interface).
         try:
-            self.stream_statistics_table.setColumnCount(12)
+            self.stream_statistics_table.setColumnCount(13)
             self.stream_statistics_table.setHorizontalHeaderLabels([
                 "Stream Name", "Interface", "Engine", "TX Count", "RX Count",
                 "TX Rate", "RX Rate", "TX Bit Rate", "RX Bit Rate",
-                "Loss %", "Status", "Flow Tracking",
+                "Latency (μs)", "Loss %", "Status", "Flow Tracking",
             ])
 
             self.stream_statistics_table.setRowCount(0)
@@ -1327,7 +1361,15 @@ class TrafficGenClientStatisticsSection():
                 "flow_tracking": flow_tracking,
                 "dpdk_enable": bool(stream.get("dpdk_enable", False)),
                 "dpdk_tx_cores": int(stream.get("dpdk_tx_cores") or 1),
-                "stream_id": stream_id
+                "stream_id": stream_id,
+                # Latency-related: raw iface (for the per-iface latency
+                # join), the enable_timestamps flag (so the cell can show
+                # "off" when the stream wasn't sent with --enable-timestamps),
+                # and the per-iface latency stats blob the worker stuffed
+                # onto this entry.
+                "_raw_iface": interface,
+                "enable_timestamps": bool(stream.get("enable_timestamps") or stream.get("latency_enabled")),
+                "_latency": stream.get("_latency"),
             })
         
         # Sort by interface, then by stream name
@@ -1446,6 +1488,64 @@ class TrafficGenClientStatisticsSection():
             rx_bps_item.setForeground(QColor("#111827"))
             self.stream_statistics_table.setItem(row, 8, rx_bps_item)
 
+            # Latency (μs) — sourced from /api/latency/stats per-interface,
+            # joined onto the stream by its raw iface name (the polling
+            # worker stuffs `_latency` onto each stream entry before this
+            # function sees it). The number itself is p50 in microseconds;
+            # tooltip carries the full min/avg/p50/p99/max + sample count
+            # so a hover tells the whole story without widening the column.
+            #
+            # Three display states:
+            #   - "—"  : sampler not running for this iface (or no samples
+            #             yet). Muted gray.
+            #   - "X.YY us" : real reading, color-coded by magnitude
+            #             (green <100us, amber <1ms, red ≥1ms).
+            #   - "off" : stream wasn't sent with --enable-timestamps and
+            #             therefore can't have NLAT-tagged frames. Muted.
+            lat = stream.get("_latency") or {}
+            ts_enabled = bool(stream.get("enable_timestamps") or stream.get("latency_enabled"))
+            p50 = lat.get("p50_us")
+            if not ts_enabled and not p50:
+                lat_text = "off"
+                lat_color = QColor("#9ca3af")
+                lat_tip = ("Latency timestamps disabled for this stream.\n"
+                           "Re-create the stream with the 'Enable timestamps' "
+                           "checkbox set to measure one-way latency.")
+            elif p50 is None:
+                lat_text = "—"
+                lat_color = QColor("#9ca3af")
+                lat_tip = ("Sampler not yet returning samples for this "
+                           "interface.\nThe RX-side server starts the "
+                           "sampler on first /api/latency/stats query — "
+                           "wait one polling tick.")
+            else:
+                if p50 < 100:
+                    lat_color = QColor("#10b981")
+                elif p50 < 1000:
+                    lat_color = QColor("#f59e0b")
+                else:
+                    lat_color = QColor("#ef4444")
+                lat_text = f"{p50:.1f}"
+                lat_tip = (
+                    f"One-way latency over last {lat.get('window_samples', 0)} samples:\n"
+                    f"  min  = {lat.get('min_us'):.2f} us\n"
+                    f"  avg  = {lat.get('avg_us'):.2f} us\n"
+                    f"  p50  = {lat.get('p50_us'):.2f} us  (this cell)\n"
+                    f"  p99  = {lat.get('p99_us'):.2f} us\n"
+                    f"  max  = {lat.get('max_us'):.2f} us\n"
+                    f"\n"
+                    f"Total NLAT-decoded frames seen by sampler: "
+                    f"{lat.get('samples_decoded', 0)}\n"
+                    f"Frames skipped (no NLAT magic / too short): "
+                    f"{lat.get('samples_skipped', 0)}"
+                )
+            lat_item = QTableWidgetItem(lat_text)
+            lat_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            lat_item.setFont(QFont("Monaco, Consolas, monospace", 12, QFont.Bold))
+            lat_item.setForeground(lat_color)
+            lat_item.setToolTip(lat_tip)
+            self.stream_statistics_table.setItem(row, 9, lat_item)
+
             # Loss % — only meaningful when flow tracking is on AND the
             # stream is actively running. A non-flow-tracked stream has no
             # way to know rx_count, so reporting "100% loss" on those
@@ -1474,7 +1574,7 @@ class TrafficGenClientStatisticsSection():
             loss_item.setFont(QFont("", 12, QFont.Bold))
             loss_item.setForeground(loss_color)
 
-            self.stream_statistics_table.setItem(row, 9, loss_item)
+            self.stream_statistics_table.setItem(row, 10, loss_item)
 
             # Status
             status = stream["status"]
@@ -1486,12 +1586,12 @@ class TrafficGenClientStatisticsSection():
             else:
                 status_item.setForeground(QColor("#ef4444"))  # Red
             status_item.setFont(QFont("", 12, QFont.Bold))
-            self.stream_statistics_table.setItem(row, 10, status_item)
+            self.stream_statistics_table.setItem(row, 11, status_item)
 
             # Flow Tracking
             flow_tracking_item = QTableWidgetItem("Yes" if stream["flow_tracking"] else "No")
             flow_tracking_item.setTextAlignment(Qt.AlignCenter)
-            self.stream_statistics_table.setItem(row, 11, flow_tracking_item)
+            self.stream_statistics_table.setItem(row, 12, flow_tracking_item)
         
         # Resize columns to fit content
         self.stream_statistics_table.resizeColumnsToContents()
@@ -1597,13 +1697,14 @@ class TrafficGenClientStatisticsSection():
         # ---- Stream Statistics tab ----
         # Column layout: 0 Stream Name, 1 Interface, 2 Engine, 3 TX Count,
         # 4 RX Count, 5 TX Rate, 6 RX Rate, 7 TX Bit Rate, 8 RX Bit Rate,
-        # 9 Loss %, 10 Status, 11 Flow Tracking.
+        # 9 Latency (μs), 10 Loss %, 11 Status, 12 Flow Tracking.
         if hasattr(self, "stream_statistics_table") and self.stream_statistics_table is not None:
             zero_for_col = {
                 3: "0", 4: "0",                          # counts
                 5: "0.00 pps", 6: "0.00 pps",            # rates (pps)
                 7: "0.00 bps", 8: "0.00 bps",            # rates (bps)
-                9: "0.00%",                              # loss
+                9: "—",                                  # latency
+                10: "0.00%",                             # loss
             }
             try:
                 rows = self.stream_statistics_table.rowCount()
@@ -1620,9 +1721,13 @@ class TrafficGenClientStatisticsSection():
                             self.stream_statistics_table.setItem(r, c, item)
                         else:
                             item.setText(placeholder)
-                            # Reset loss% color (was red/yellow/green)
-                            if c == 7:
+                            # Reset loss% color (was red/yellow/green) at
+                            # the new col 10. Latency cell color reset
+                            # happens naturally on the next poll tick.
+                            if c == 10:
                                 item.setForeground(QColor("#10b981"))
+                            elif c == 9:
+                                item.setForeground(QColor("#9ca3af"))
             except Exception as e:
                 logger.debug(f"[CLEAR STATS] stream table reset failed: {e}")
         

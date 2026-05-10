@@ -1519,6 +1519,25 @@ class AddStreamDialog(QDialog):
         layout.addWidget(tx_cores_row)
         layout.addWidget(self.dpdk_tx_cores_hint)
 
+        # One-way latency: embed a CLOCK_MONOTONIC timestamp at the start
+        # of each UDP payload. Server-side LatencySampler decodes the
+        # NLAT magic on the RX side, computes per-packet latency, and
+        # exposes min/avg/p99 via /api/latency/stats. The Stream
+        # Statistics tab renders these as a "Latency (us)" column.
+        self.enable_timestamps_checkbox = QCheckBox(
+            "Enable timestamps (one-way latency)"
+        )
+        self.enable_timestamps_checkbox.setToolTip(
+            "Embeds a 16-byte NLAT timestamp at the start of each UDP\n"
+            "payload. The server's latency sampler decodes it and reports\n"
+            "min / avg / p50 / p99 / max one-way latency in microseconds.\n\n"
+            "Same-host (loopback) gives accurate one-way numbers. Cross-host\n"
+            "requires PTP-synced clocks for absolute accuracy; without that\n"
+            "only relative drift is meaningful.\n\n"
+            "Requires frame size >= 60B (16 bytes for the header + L2/3/4)."
+        )
+        layout.addWidget(self.enable_timestamps_checkbox)
+
         # Small helper text
         hint = QLabel(
             "When enabled, this stream will be transmitted by the DPDK worker.\n"
@@ -3374,6 +3393,12 @@ class AddStreamDialog(QDialog):
             idx = self.dpdk_tx_cores_combo.findData(want)
             self.dpdk_tx_cores_combo.setCurrentIndex(idx if idx >= 0 else 0)
 
+        if hasattr(self, "enable_timestamps_checkbox"):
+            self.enable_timestamps_checkbox.setChecked(
+                bool(stream_data.get("enable_timestamps") or
+                     stream_data.get("latency_enabled") or False)
+            )
+
 
         # Frame Length
         self.frame_type.setCurrentText(stream_data.get("frame_type", "Fixed"))
@@ -4158,6 +4183,7 @@ class AddStreamDialog(QDialog):
             "dpdk_enable": bool(getattr(self, "dpdk_enable_checkbox", None) and self.dpdk_enable_checkbox.isChecked()),
             "dpdk_multi_instance": bool(getattr(self, "dpdk_multi_instance_checkbox", None) and self.dpdk_multi_instance_checkbox.isChecked()),
             "dpdk_tx_cores": int(self.dpdk_tx_cores_combo.currentData() or 1) if hasattr(self, "dpdk_tx_cores_combo") else 1,
+            "enable_timestamps": bool(getattr(self, "enable_timestamps_checkbox", None) and self.enable_timestamps_checkbox.isChecked()),
             "frame_type": frame_type,
             "frame_min": frame_min,
             "frame_max": frame_max,
