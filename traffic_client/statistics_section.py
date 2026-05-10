@@ -812,15 +812,27 @@ class TrafficGenClientStatisticsSection():
                 v = int(stats.get(key, 0) or 0)
             except (ValueError, TypeError):
                 v = 0
-            base = iface_baselines.get(iface_name, {})
+            base = iface_baselines.setdefault(iface_name, {})
             try:
                 bv = int(base.get(key, 0) or 0)
             except (ValueError, TypeError):
                 bv = 0
-            # Clamp at 0 — server can return a smaller cumulative value
-            # if the kernel netdev got reset (interface flap) since the
-            # baseline was captured.
-            return max(0, v - bv)
+            # Counter-reset detection. The current cumulative can drop
+            # below the captured baseline when:
+            #   - the stream is stopped + restarted (tracker tx_count
+            #     starts again from 0, sometimes from a different stream
+            #     id but aggregated under the same iface);
+            #   - the kernel netdev gets reset (interface flap);
+            #   - the server restarts and re-derives counters.
+            # When that happens, just plain "v - bv" stays negative
+            # forever (clamped at 0) until the new cumulative grows
+            # past the old baseline — which can take ages on a fresh
+            # stream. Detect the reset and re-baseline to v so the
+            # display starts counting up from 0 again.
+            if v < bv:
+                base[key] = v
+                return 0
+            return v - bv
 
         for col, (iface_name, stats) in enumerate(statistics.items()):
             # (0) Status - with color coding
@@ -942,7 +954,8 @@ class TrafficGenClientStatisticsSection():
             stream_name = stream.get("stream_name", "Unnamed")
             interface = stream.get("interface", "N/A")
             stream_baselines = getattr(self, "_stream_baselines", {})
-            sb = stream_baselines.get(stream.get("stream_id"), {})
+            sid = stream.get("stream_id")
+            sb = stream_baselines.setdefault(sid, {}) if sid else {}
             try:
                 raw_tx = int(stream.get("tx_count", 0) or 0)
             except (ValueError, TypeError):
@@ -951,10 +964,21 @@ class TrafficGenClientStatisticsSection():
                 raw_rx = int(stream.get("rx_count", 0) or 0)
             except (ValueError, TypeError):
                 raw_rx = 0
-            # Subtract Clear Stats baseline; clamp at 0 in case the underlying
-            # tracker reset (e.g. stream restart) since the baseline was taken.
-            tx_count = max(0, raw_tx - int(sb.get("tx_count", 0) or 0))
-            rx_count = max(0, raw_rx - int(sb.get("rx_count", 0) or 0))
+            # Subtract Clear Stats baseline. If the tracker reset (stream
+            # stop/start, server restart) made the current count drop below
+            # the captured baseline, re-baseline to the new low so the
+            # display starts climbing from 0 again instead of staying
+            # stuck at zero forever.
+            base_tx = int(sb.get("tx_count", 0) or 0)
+            base_rx = int(sb.get("rx_count", 0) or 0)
+            if raw_tx < base_tx:
+                sb["tx_count"] = raw_tx
+                base_tx = raw_tx
+            if raw_rx < base_rx:
+                sb["rx_count"] = raw_rx
+                base_rx = raw_rx
+            tx_count = raw_tx - base_tx
+            rx_count = raw_rx - base_rx
             # Handle tx_rate and rx_rate - they may be None, 0.0, or a float
             tx_rate = stream.get("tx_rate")
             if tx_rate is None:
