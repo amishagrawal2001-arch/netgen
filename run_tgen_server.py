@@ -12911,6 +12911,249 @@ def dpdk_recommend_tx_cores():
         return jsonify({"ok": False, "error": str(e)}), 500
 
 
+# =============================================================================
+# RFC 2544 throughput test runner
+# =============================================================================
+# Standard benchmark from RFC 2544 §26.1: find the max no-drop frame rate
+# for each of the 7 standard frame sizes via binary search. One step:
+#
+#   1. Send `duration` seconds of traffic at `rate` pps
+#   2. Compare RX frame count to TX frame count
+#   3. If loss <= target (default 0%), accept; else halve rate
+#   4. Repeat until rate band is < `resolution_pps`
+#
+# Returns max no-drop pps. Run once per frame size to build the
+# classic RFC 2544 throughput chart (rate vs frame size).
+#
+# Background-thread model: client kicks off, then polls progress. State
+# lives in _RFC2544_STATE; only one test can run at a time per server.
+
+_RFC2544_STATE = {
+    "running": False,
+    "started_at": None,
+    "finished_at": None,
+    "params": None,
+    "progress": [],   # list of {frame_size, max_no_drop_pps, max_no_drop_gbps, attempts}
+    "current_step": None,  # {"frame_size": ..., "trying_pps": ..., "phase": ...}
+    "error": None,
+}
+_RFC2544_LOCK = __import__("threading").Lock()
+
+
+def _rfc2544_run_step(tx_iface, rx_iface, frame_size, link_pps, duration_s,
+                     target_loss_pct, resolution_pps, mac_src, mac_dst,
+                     ip_src, ip_dst, dpdk_enable, dpdk_tx_cores):
+    """Binary-search the max no-drop rate at one frame size.
+
+    Returns (max_no_drop_pps, attempts) where `attempts` is a list of
+    (rate_pps, tx, rx, loss_pct) tuples for diagnostics."""
+    import time as _t
+    import uuid as _uuid
+    import requests as _req
+
+    base_url = "http://127.0.0.1:5050"
+    attempts = []
+    lo_pps = 0
+    hi_pps = max(int(link_pps), 1)
+    last_good = 0
+
+    while hi_pps - lo_pps > resolution_pps:
+        trying_pps = (lo_pps + hi_pps) // 2
+        if trying_pps == 0:
+            trying_pps = max(resolution_pps, 1)
+
+        with _RFC2544_LOCK:
+            _RFC2544_STATE["current_step"] = {
+                "frame_size": frame_size,
+                "trying_pps": trying_pps,
+                "phase": f"testing {trying_pps:,} pps for {duration_s}s",
+            }
+
+        stream_id = str(_uuid.uuid4())
+        stream_data = {
+            "name": f"rfc2544-{frame_size}B",
+            "enabled": True,
+            "stream_id": stream_id,
+            "frame_size": frame_size,
+            "L4": "UDP",
+            "VLAN": "Untagged",
+            "stream_rate_type": "Packets Per Second (PPS)",
+            "stream_pps_rate": trying_pps,
+            "stream_duration_mode": "Seconds",
+            "stream_duration_seconds": duration_s,
+            "flow_tracking_enabled": True,
+            "rx_port": rx_iface or tx_iface,
+            "protocol_data": {
+                "mac":  {"mac_source_address": mac_src,
+                         "mac_destination_address": mac_dst},
+                "ipv4": {"ipv4_source": ip_src, "ipv4_destination": ip_dst},
+                "udp":  {"udp_source_port": "1234", "udp_destination_port": "4791"},
+            },
+        }
+        if dpdk_enable:
+            stream_data["dpdk_enable"] = True
+            stream_data["dpdk_tx_cores"] = int(dpdk_tx_cores or 1)
+
+        # Kick off the stream
+        try:
+            _req.post(f"{base_url}/api/traffic/start",
+                      json={"streams": {f"Port:{tx_iface}": [stream_data]}},
+                      timeout=10)
+        except Exception as e:
+            logging.warning(f"[RFC 2544] start failed: {e}")
+
+        # Wait for duration plus a small settle window
+        _t.sleep(duration_s + 1.5)
+
+        # Stop and read final counters
+        try:
+            _req.post(f"{base_url}/api/traffic/stop",
+                      json={"streams": [{"interface": tx_iface,
+                                          "stream_id": stream_id}]},
+                      timeout=15)
+        except Exception as e:
+            logging.warning(f"[RFC 2544] stop failed: {e}")
+        _t.sleep(0.5)
+
+        # Read tx/rx from the stats endpoint (status filter "all" so we
+        # catch the just-stopped stream)
+        try:
+            r = _req.get(f"{base_url}/api/streams/stats", params={"status": "all"}, timeout=10)
+            streams = r.json().get("active_streams", []) if r.ok else []
+            ours = next((s for s in streams if s.get("stream_id") == stream_id), None)
+            tx = int(ours.get("tx_count") or 0) if ours else 0
+            rx = int(ours.get("rx_count") or 0) if ours else 0
+        except Exception as e:
+            logging.warning(f"[RFC 2544] stats read failed: {e}")
+            tx = rx = 0
+
+        loss_pct = ((tx - rx) / tx * 100.0) if tx > 0 else 100.0
+        attempts.append({"pps": trying_pps, "tx": tx, "rx": rx, "loss_pct": loss_pct})
+
+        if loss_pct <= target_loss_pct:
+            last_good = trying_pps
+            lo_pps = trying_pps
+        else:
+            hi_pps = trying_pps
+
+    return last_good, attempts
+
+
+def _rfc2544_thread(params):
+    """Background thread — runs the test, updates _RFC2544_STATE."""
+    try:
+        frame_sizes = params["frame_sizes"]
+        tx_iface = params["tx_iface"]
+        rx_iface = params.get("rx_iface") or tx_iface
+        duration_s = int(params.get("duration_per_step", 10))
+        target_loss = float(params.get("target_loss_pct", 0.0))
+        resolution_pps = int(params.get("resolution_pps", 100000))
+        link_mbps = int(params.get("link_speed_mbps", 0))
+        if link_mbps <= 0:
+            # Read from sysfs
+            try:
+                link_mbps = int(open(f"/sys/class/net/{tx_iface}/speed").read().strip())
+            except Exception:
+                link_mbps = 100000  # safe default
+
+        for fs in frame_sizes:
+            # Theoretical line-rate pps at this frame size
+            l1_bytes = max(60, int(fs)) + 20  # preamble + IFG
+            line_pps = max(1, (link_mbps * 1_000_000) // (l1_bytes * 8))
+            max_pps, attempts = _rfc2544_run_step(
+                tx_iface=tx_iface, rx_iface=rx_iface,
+                frame_size=fs, link_pps=line_pps,
+                duration_s=duration_s,
+                target_loss_pct=target_loss,
+                resolution_pps=resolution_pps,
+                mac_src=params["mac_src"], mac_dst=params["mac_dst"],
+                ip_src=params["ip_src"], ip_dst=params["ip_dst"],
+                dpdk_enable=bool(params.get("dpdk_enable", True)),
+                dpdk_tx_cores=int(params.get("dpdk_tx_cores", 0) or 0),
+            )
+            gbps = (max_pps * (fs + 20) * 8) / 1e9
+            with _RFC2544_LOCK:
+                _RFC2544_STATE["progress"].append({
+                    "frame_size": fs,
+                    "max_no_drop_pps": max_pps,
+                    "max_no_drop_gbps": round(gbps, 3),
+                    "line_rate_pps": line_pps,
+                    "pct_of_line_rate": round(100.0 * max_pps / line_pps, 1) if line_pps else 0,
+                    "attempts": attempts,
+                })
+    except Exception as e:
+        with _RFC2544_LOCK:
+            _RFC2544_STATE["error"] = str(e)
+        logging.error(f"[RFC 2544] test failed: {e}")
+    finally:
+        import datetime as _dt
+        with _RFC2544_LOCK:
+            _RFC2544_STATE["running"] = False
+            _RFC2544_STATE["finished_at"] = _dt.datetime.now().isoformat()
+            _RFC2544_STATE["current_step"] = None
+
+
+@app.route("/api/rfc2544/start", methods=["POST"])
+def rfc2544_start():
+    """Kick off an RFC 2544 throughput test in the background.
+
+    Body:
+      tx_iface: str (required)
+      rx_iface: str (optional, defaults to tx_iface for loopback)
+      frame_sizes: list[int] (optional, default RFC 2544 set)
+      duration_per_step: int seconds (default 10)
+      target_loss_pct: float (default 0.0 — strict no-loss)
+      resolution_pps: int (default 100_000 — binary-search precision)
+      mac_src/mac_dst, ip_src/ip_dst: str (required)
+      dpdk_enable: bool (default true)
+      dpdk_tx_cores: int (default auto)
+    """
+    import threading
+    with _RFC2544_LOCK:
+        if _RFC2544_STATE["running"]:
+            return jsonify({"ok": False, "error": "RFC 2544 test already running"}), 409
+        data = request.get_json() or {}
+        if not data.get("tx_iface"):
+            return jsonify({"ok": False, "error": "tx_iface required"}), 400
+        if not data.get("mac_src") or not data.get("mac_dst"):
+            return jsonify({"ok": False, "error": "mac_src and mac_dst required"}), 400
+        if not data.get("ip_src") or not data.get("ip_dst"):
+            return jsonify({"ok": False, "error": "ip_src and ip_dst required"}), 400
+        params = dict(data)
+        params.setdefault("frame_sizes", [64, 128, 256, 512, 1024, 1280, 1518])
+        params.setdefault("duration_per_step", 10)
+        params.setdefault("target_loss_pct", 0.0)
+        params.setdefault("resolution_pps", 100_000)
+        params.setdefault("dpdk_enable", True)
+        import datetime as _dt
+        _RFC2544_STATE["running"] = True
+        _RFC2544_STATE["started_at"] = _dt.datetime.now().isoformat()
+        _RFC2544_STATE["finished_at"] = None
+        _RFC2544_STATE["params"] = params
+        _RFC2544_STATE["progress"] = []
+        _RFC2544_STATE["error"] = None
+        _RFC2544_STATE["current_step"] = None
+
+    threading.Thread(target=_rfc2544_thread, args=(params,), daemon=True).start()
+    return jsonify({"ok": True, "started_at": _RFC2544_STATE["started_at"]})
+
+
+@app.route("/api/rfc2544/progress", methods=["GET"])
+def rfc2544_progress():
+    """Poll for RFC 2544 test progress + per-frame-size results."""
+    with _RFC2544_LOCK:
+        snap = {
+            "running":      _RFC2544_STATE["running"],
+            "started_at":   _RFC2544_STATE["started_at"],
+            "finished_at":  _RFC2544_STATE["finished_at"],
+            "params":       _RFC2544_STATE["params"],
+            "progress":     list(_RFC2544_STATE["progress"]),
+            "current_step": _RFC2544_STATE["current_step"],
+            "error":        _RFC2544_STATE["error"],
+        }
+    return jsonify(snap)
+
+
 # ---- Explicit entry point used by 'ostg-server' ----
 def _resolve_ai_settings_path():
     """AI settings env file path with sensible defaults + legacy fallback.

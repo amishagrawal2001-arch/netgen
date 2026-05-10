@@ -740,6 +740,20 @@ class TrafficGeneratorClient(
         dpdk_load_modules_action.triggered.connect(self.load_vfio_modules)
         dpdk_menu.addAction(dpdk_load_modules_action)
 
+        tools_menu.addSeparator()
+
+        # RFC 2544 throughput test — standard frame-size sweep that
+        # binary-searches the max no-drop rate at each of the 7 standard
+        # frame sizes (64/128/256/512/1024/1280/1518 bytes).
+        rfc2544_action = QAction("RFC 2544 Throughput Test...", self)
+        rfc2544_action.setToolTip(
+            "Standard frame-size sweep — finds the max no-drop rate for "
+            "each of the 7 RFC 2544 frame sizes via binary search. "
+            "Requires a TX/RX port pair with loopback or external cabling."
+        )
+        rfc2544_action.triggered.connect(self.show_rfc2544_dialog)
+        tools_menu.addAction(rfc2544_action)
+
         # Help menu — guides + about
         # NOTE: on macOS, a menu literally named "Help" gets absorbed into the
         # OS-managed Help menu (alongside the search box). The action stays
@@ -795,6 +809,27 @@ class TrafficGeneratorClient(
         except Exception as e:
             from PyQt5.QtWidgets import QMessageBox
             QMessageBox.warning(self, "Help unavailable", f"Could not open guide: {e}")
+
+    def show_rfc2544_dialog(self):
+        """Open the RFC 2544 throughput test dialog from Tools menu."""
+        try:
+            from widgets.rfc2544_dialog import Rfc2544Dialog
+            # Pick the first online server's address; bail if none.
+            srv = next((s for s in getattr(self, "server_interfaces", [])
+                        if s.get("online", True)), None)
+            if not srv:
+                from PyQt5.QtWidgets import QMessageBox
+                QMessageBox.warning(
+                    self, "No server online",
+                    "Connect to a TGEN server before running the RFC 2544 test."
+                )
+                return
+            dlg = Rfc2544Dialog(self, server_url=str(srv.get("address") or ""))
+            dlg.exec_()
+        except Exception as e:
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "RFC 2544 unavailable",
+                                f"Could not open dialog: {e}")
 
     def show_install_guide(self):
         """Open the Installation Guide dialog from the Help menu."""
