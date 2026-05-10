@@ -14036,6 +14036,14 @@ _RFC2544_STATE = {
     "progress": [],   # list of {frame_size, max_no_drop_pps, max_no_drop_gbps, attempts}
     "current_step": None,  # {"frame_size": ..., "trying_pps": ..., "phase": ...}
     "error": None,
+    # Cooperative-cancel flag — /api/rfc2544/stop sets it True; the
+    # runner thread polls it between iterations and aborts cleanly.
+    "stop_requested": False,
+    # Stash the in-flight stream_id so /stop can also halt the
+    # current iteration's per-iface traffic instead of waiting the
+    # full duration for it to die naturally.
+    "active_stream_id": None,
+    "active_tx_iface": None,
 }
 _RFC2544_LOCK = __import__("threading").Lock()
 
@@ -14058,6 +14066,14 @@ def _rfc2544_run_step(tx_iface, rx_iface, frame_size, link_pps, duration_s,
     last_good = 0
 
     while hi_pps - lo_pps > resolution_pps:
+        # Cooperative cancel check between iterations — /api/rfc2544/stop
+        # flips this flag; we bail out cleanly without firing another
+        # binary-search step.
+        with _RFC2544_LOCK:
+            if _RFC2544_STATE.get("stop_requested"):
+                logging.info("[RFC 2544] stop_requested honored — aborting search")
+                break
+
         trying_pps = (lo_pps + hi_pps) // 2
         if trying_pps == 0:
             trying_pps = max(resolution_pps, 1)
@@ -14102,8 +14118,24 @@ def _rfc2544_run_step(tx_iface, rx_iface, frame_size, link_pps, duration_s,
         except Exception as e:
             logging.warning(f"[RFC 2544] start failed: {e}")
 
-        # Wait for duration plus a small settle window
-        _t.sleep(duration_s + 1.5)
+        # Stash the active stream so /api/rfc2544/stop can halt it
+        # mid-iteration rather than waiting the full duration_s out.
+        with _RFC2544_LOCK:
+            _RFC2544_STATE["active_stream_id"] = stream_id
+            _RFC2544_STATE["active_tx_iface"] = tx_iface
+
+        # Wait for duration plus a small settle window, but check the
+        # cancel flag in 0.5s slices so a /stop click takes effect
+        # within ~half a second instead of waiting the full
+        # duration_s+1.5s out.
+        slept = 0.0
+        target = duration_s + 1.5
+        while slept < target:
+            _t.sleep(0.5)
+            slept += 0.5
+            with _RFC2544_LOCK:
+                if _RFC2544_STATE.get("stop_requested"):
+                    break
 
         # Stop and read final counters
         try:
@@ -14126,6 +14158,11 @@ def _rfc2544_run_step(tx_iface, rx_iface, frame_size, link_pps, duration_s,
         except Exception as e:
             logging.warning(f"[RFC 2544] stats read failed: {e}")
             tx = rx = 0
+
+        # Clear the active-stream stash — the stream is stopped by now.
+        with _RFC2544_LOCK:
+            _RFC2544_STATE["active_stream_id"] = None
+            _RFC2544_STATE["active_tx_iface"] = None
 
         loss_pct = ((tx - rx) / tx * 100.0) if tx > 0 else 100.0
         attempts.append({"pps": trying_pps, "tx": tx, "rx": rx, "loss_pct": loss_pct})
@@ -14157,6 +14194,11 @@ def _rfc2544_thread(params):
                 link_mbps = 100000  # safe default
 
         for fs in frame_sizes:
+            # Stop between frame sizes if the user clicked Stop.
+            with _RFC2544_LOCK:
+                if _RFC2544_STATE.get("stop_requested"):
+                    logging.info("[RFC 2544] stop_requested honored — skipping remaining frame sizes")
+                    break
             # Theoretical line-rate pps at this frame size
             l1_bytes = max(60, int(fs)) + 20  # preamble + IFG
             line_pps = max(1, (link_mbps * 1_000_000) // (l1_bytes * 8))
@@ -14233,9 +14275,49 @@ def rfc2544_start():
         _RFC2544_STATE["progress"] = []
         _RFC2544_STATE["error"] = None
         _RFC2544_STATE["current_step"] = None
+        # Clear any leftover cancel flag from a previous run so the
+        # new test isn't aborted on its first iteration.
+        _RFC2544_STATE["stop_requested"] = False
+        _RFC2544_STATE["active_stream_id"] = None
+        _RFC2544_STATE["active_tx_iface"] = None
 
     threading.Thread(target=_rfc2544_thread, args=(params,), daemon=True).start()
     return jsonify({"ok": True, "started_at": _RFC2544_STATE["started_at"]})
+
+
+@app.route("/api/rfc2544/stop", methods=["POST"])
+def rfc2544_stop():
+    """Cooperatively cancel a running RFC 2544 test.
+
+    Sets stop_requested=True so the runner thread bails between
+    iterations (within ~0.5s of the next slice check). Also halts the
+    in-flight stream immediately so the user doesn't have to wait the
+    full duration_per_step out for the current iteration to finish.
+
+    Idempotent — calling on an already-stopped test returns ok=True
+    with `was_running=False`.
+    """
+    import requests as _req
+    with _RFC2544_LOCK:
+        was_running = bool(_RFC2544_STATE.get("running"))
+        sid = _RFC2544_STATE.get("active_stream_id")
+        iface = _RFC2544_STATE.get("active_tx_iface")
+        _RFC2544_STATE["stop_requested"] = True
+
+    # Best-effort: halt the current iteration's stream so the runner's
+    # sleep-loop exits to the cancel check and bails immediately
+    # instead of waiting duration_per_step+1.5s to time out.
+    if was_running and sid and iface:
+        try:
+            _req.post(
+                "http://127.0.0.1:5050/api/traffic/stop",
+                json={"streams": [{"interface": iface, "stream_id": sid}]},
+                timeout=5,
+            )
+        except Exception as e:
+            logging.warning(f"[RFC 2544] inline stream-stop on cancel failed: {e}")
+
+    return jsonify({"ok": True, "was_running": was_running})
 
 
 @app.route("/api/rfc2544/progress", methods=["GET"])
