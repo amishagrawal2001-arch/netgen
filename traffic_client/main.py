@@ -128,11 +128,9 @@ class TrafficGeneratorClient(
         # Server section on the left
         self.setup_server_section()
 
-        # Tabs on the right. Card-style tabs — proper tab visual idiom
-        # (raised tab on top of a pane), but flat instead of skeuomorphic.
-        # Active tab: white background, bold blue label, blue top
-        # accent. Inactive: muted gray on light gray. Matches the
-        # stats-dock tab styling for visual consistency across the app.
+        # Tabs on the right. Flat tab style — text-only labels with a
+        # colored underline on the active tab. Reverted to this from
+        # the card-style attempt in e5ba822 per user preference.
         self.tab_widget = QTabWidget()
         self.streams_tab = QWidget()
         self.devices_tab = DevicesTab(self)
@@ -147,26 +145,21 @@ class TrafficGeneratorClient(
                 top: -1px;
             }
             QTabBar::tab {
-                background-color: #eef2f7;
-                color: #4b5563;
-                border: 1px solid #cbd5e1;
-                border-bottom: none;
-                border-top-left-radius: 4px;
-                border-top-right-radius: 4px;
-                padding: 7px 22px;
+                background-color: transparent;
+                color: #6b7280;
+                border: none;
+                padding: 6px 18px;
                 margin-right: 2px;
-                font-weight: 700;
-                font-size: 13px;
-                min-width: 100px;
+                font-weight: 600;
+                font-size: 12px;
             }
             QTabBar::tab:selected {
-                background-color: #ffffff;
                 color: #1d4ed8;
-                border-top: 3px solid #2563eb;
+                border-bottom: 3px solid #2563eb;
+                background-color: transparent;
             }
             QTabBar::tab:hover:!selected {
-                background-color: #dbeafe;
-                color: #1e40af;
+                color: #1f2937;
             }
         """)
         self.top_section.addWidget(self.tab_widget)
