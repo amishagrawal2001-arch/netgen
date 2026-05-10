@@ -167,6 +167,21 @@ class LatencySampler:
         except Exception as e:
             LOG.error("scapy unavailable: %s", e)
             return
+        # Friendly check before scapy blows up with "Interface not found"
+        if not _iface_exists(self.iface):
+            available = _list_local_interfaces()
+            LOG.error(
+                "Interface %r not found on this host (%s).\n"
+                "  Available interfaces here: %s\n"
+                "  The latency sampler must run ON THE HOST that has the\n"
+                "  RX-side NIC. For a netgen server-side test, SSH to the\n"
+                "  server and run there:\n"
+                "      ssh root@<server> 'python3 -m utils.latency_sampler --iface <iface>'\n"
+                "  Use --list-interfaces to see what's reachable from here.",
+                self.iface, _hostname(),
+                ", ".join(available[:10]) if available else "(none)",
+            )
+            return
         bpf = f"udp and dst port {self.udp_port}" if self.udp_port else "udp"
         LOG.info(f"[lat] sniffing {self.iface}  filter='{bpf}'  window={self.stats_obj._latencies.maxlen}")
         # Sniff with stop_filter so we can shut down cleanly.
@@ -177,6 +192,36 @@ class LatencySampler:
             store=False,
             stop_filter=lambda _p: self._stop_event.is_set(),
         )
+
+
+# -------------------------------------------------------------- helpers
+
+
+def _hostname():
+    import socket
+    try:
+        return socket.gethostname()
+    except Exception:
+        return "this host"
+
+
+def _list_local_interfaces():
+    """Return a list of network-interface names on this host. Tries scapy
+    first (cross-platform), falls back to /sys/class/net (Linux only)."""
+    try:
+        from scapy.all import get_if_list
+        return sorted(get_if_list())
+    except Exception:
+        pass
+    try:
+        import os
+        return sorted(os.listdir("/sys/class/net"))
+    except Exception:
+        return []
+
+
+def _iface_exists(name):
+    return name in _list_local_interfaces()
 
 
 # -------------------------------------------------------------------- CLI
@@ -196,17 +241,33 @@ def main(argv=None):
         prog="latency_sampler",
         description="One-way latency RX sampler. Decodes NLAT-tagged UDP "
                     "packets from netgen tx_worker --enable-timestamps "
-                    "streams and reports min/avg/p50/p99/max latency.",
+                    "streams and reports min/avg/p50/p99/max latency.\n\n"
+                    "MUST RUN ON THE HOST that owns the receiving NIC — for "
+                    "a netgen test that's the server, not the client laptop.",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--iface", required=True,
-                        help="Interface to sniff (e.g. enp181s0f1np1)")
+    parser.add_argument("--iface",
+                        help="Interface to sniff (e.g. enp181s0f1np1). "
+                             "Use --list-interfaces to see what's available.")
     parser.add_argument("--udp-port", type=int, default=4791,
                         help="UDP destination port to filter (default: 4791)")
     parser.add_argument("--window", type=int, default=10000,
                         help="Rolling sample window size (default: 10000)")
     parser.add_argument("--interval", type=float, default=1.0,
                         help="Stats print interval, seconds (default: 1.0)")
+    parser.add_argument("--list-interfaces", action="store_true",
+                        help="List network interfaces on this host and exit.")
     args = parser.parse_args(argv)
+
+    if args.list_interfaces:
+        ifaces = _list_local_interfaces()
+        print(f"Interfaces on {_hostname()}:")
+        for n in ifaces:
+            print(f"  {n}")
+        return 0
+
+    if not args.iface:
+        parser.error("--iface is required (or use --list-interfaces)")
 
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(message)s")
