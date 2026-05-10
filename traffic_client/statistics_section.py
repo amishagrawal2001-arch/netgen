@@ -363,6 +363,21 @@ class TrafficGenClientStatisticsSection():
                 rx_port_clean = rx_port_raw.split(":")[-1].strip() if rx_port_raw else None
                 rx_iface = f"TG {tg_id} - {rx_port_clean}" if rx_port_clean else None
 
+                # The server reports per-stream tx_rate / rx_rate already in
+                # frames-per-second (delta-based, computed from successive
+                # tracker reads). Use those for the rate columns; the prior
+                # code used `tx_count // 10` and `tx_count * size * 8` which
+                # are cumulative quantities, not rates — that produced
+                # impossible values like "561 Gbps" on a 400G link.
+                def _f(v, default=0.0):
+                    try:
+                        return float(v) if v is not None else default
+                    except (ValueError, TypeError):
+                        return default
+
+                tx_rate = _f(stream.get("tx_rate"))  # fps
+                rx_rate = _f(stream.get("rx_rate"))  # fps
+
                 # TX aggregation
                 if tx_iface in merged_statistics:
                     stream_entry = merged_statistics[tx_iface]["streams"].setdefault(stream_name, {})
@@ -376,17 +391,19 @@ class TrafficGenClientStatisticsSection():
                         frame_size = int(frame_size)
                     except (ValueError, TypeError):
                         frame_size = 64
-                    
+
                     merged_statistics[tx_iface]["tx"] += tx
                     merged_statistics[tx_iface]["sent_bytes"] += tx * frame_size
-                    merged_statistics[tx_iface]["send_fps"] += tx // 10
-                    merged_statistics[tx_iface]["send_bps"] += tx * frame_size * 8
-                    
+                    # Rates: use server's delta-computed tx_rate (fps) and
+                    # derive bps from it. L2 frame bits = bytes * 8.
+                    merged_statistics[tx_iface]["send_fps"] += tx_rate
+                    merged_statistics[tx_iface]["send_bps"] += tx_rate * frame_size * 8
+
                     if flow_tracking:
                         merged_statistics[tx_iface]["rx"] += rx
                         merged_statistics[tx_iface]["received_bytes"] += rx * frame_size
-                        merged_statistics[tx_iface]["receive_fps"] += rx // 10
-                        merged_statistics[tx_iface]["receive_bps"] += rx * frame_size * 8
+                        merged_statistics[tx_iface]["receive_fps"] += rx_rate
+                        merged_statistics[tx_iface]["receive_bps"] += rx_rate * frame_size * 8
 
                 # RX aggregation
                 if rx_iface and rx_iface in merged_statistics:
@@ -395,11 +412,11 @@ class TrafficGenClientStatisticsSection():
                         frame_size = int(frame_size)
                     except (ValueError, TypeError):
                         frame_size = 64
-                    
+
                     merged_statistics[rx_iface]["rx"] += rx
                     merged_statistics[rx_iface]["received_bytes"] += rx * frame_size
-                    merged_statistics[rx_iface]["receive_fps"] += rx // 10
-                    merged_statistics[rx_iface]["receive_bps"] += rx * frame_size * 8
+                    merged_statistics[rx_iface]["receive_fps"] += rx_rate
+                    merged_statistics[rx_iface]["receive_bps"] += rx_rate * frame_size * 8
 
                     stream_entry = merged_statistics[rx_iface]["streams"].setdefault(stream_name, {})
                     stream_entry["rx_count"] = rx
