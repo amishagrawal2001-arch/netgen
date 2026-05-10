@@ -64,7 +64,7 @@ class TrafficGenClientServerSection():
         # Server Tree Section
         self.server_tree = QTreeWidget()
         self.server_tree.setColumnCount(3)
-        self.server_tree.setHeaderLabels(["TG ID", "Server Address / Interfaces", "Select"])
+        self.server_tree.setHeaderLabels(["TG ID/Interface", "Server Address", "Select"])
 
         # Set header resize modes
         header = self.server_tree.header()
