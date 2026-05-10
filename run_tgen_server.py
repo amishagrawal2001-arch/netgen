@@ -12829,6 +12829,29 @@ def main(argv=None):
     parser.add_argument("--port", type=int, default=int(os.environ.get("PORT", "5051")))
     args = parser.parse_args(argv)
     
+    # Orphan tx_worker sweep on startup. If the previous netgen-server
+    # was SIGKILL'd (or this host rebooted into a fresh process while
+    # tx_worker was still alive), the launcher's atexit/finally block
+    # never ran and tx_worker keeps blasting the wire on its own. Reap
+    # any leftovers before we accept new traffic — otherwise old streams
+    # appear "stopped" in the DB but are still flooding the network.
+    try:
+        import subprocess as _sp
+        r = _sp.run(["pgrep", "-af", "/opt/netgen/resources/dpdk/tx_worker/build/tx_worker"],
+                    capture_output=True, text=True, timeout=5)
+        if r.returncode == 0 and r.stdout.strip():
+            n = len(r.stdout.strip().splitlines())
+            logging.warning(f"[STARTUP CLEANUP] Found {n} orphan tx_worker process(es) from a previous run — terminating")
+            _sp.run(["pkill", "-TERM", "-f", "/opt/netgen/resources/dpdk/tx_worker/build/tx_worker"],
+                    capture_output=True, timeout=5)
+            import time as _t
+            _t.sleep(2.0)
+            _sp.run(["pkill", "-KILL", "-f", "/opt/netgen/resources/dpdk/tx_worker/build/tx_worker"],
+                    capture_output=True, timeout=5)
+            logging.info("[STARTUP CLEANUP] Orphan tx_worker sweep complete")
+    except Exception as e:
+        logging.warning(f"[STARTUP CLEANUP] Orphan tx_worker sweep failed: {e}")
+
     # Cleanup stale streams on startup (after reboot, no streams are actually running)
     try:
         running_streams = stream_db.get_all_streams(status="Running")

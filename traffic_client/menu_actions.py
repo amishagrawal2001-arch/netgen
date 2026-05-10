@@ -1469,7 +1469,7 @@ class TrafficGenClientMenuAction():
         reply = QMessageBox.question(
             self,
             "Confirm TGEN Restart",
-            f"Are you sure you want to restart the TGEN service on the following server(s)?\n\n" + "\n".join(server_names) + "\n\nThis will:\n• Restart the ostg-server service\n• Stop all running streams\n• Service will be back online in a few seconds",
+            f"Are you sure you want to restart the TGEN service on the following server(s)?\n\n" + "\n".join(server_names) + "\n\nThis will:\n• Restart the netgen-server service\n• Stop all running streams\n• Service will be back online in a few seconds",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
         )
@@ -1501,12 +1501,26 @@ class TrafficGenClientMenuAction():
                 QMessageBox.warning(self, "Invalid Server Address", f"Could not extract hostname from '{address}'")
                 continue
             
-            # Restart via SSH
+            # Restart via SSH. Try the canonical netgen-server unit first;
+            # fall back to the legacy ostg-server name for hosts that haven't
+            # been migrated yet (kept for at least one release of overlap).
             try:
-                # Use systemctl to restart the service
-                cmd = ["ssh", f"root@{hostname}", "systemctl", "restart", "ostg-server"]
+                # Server-side: prefer netgen-server, fall back to ostg-server
+                # if that unit isn't installed. Single SSH round-trip.
+                remote = (
+                    "if systemctl list-unit-files netgen-server.service "
+                    "| grep -q netgen-server; then "
+                    "  systemctl restart netgen-server; "
+                    "elif systemctl list-unit-files ostg-server.service "
+                    "| grep -q ostg-server; then "
+                    "  systemctl restart ostg-server; "
+                    "else "
+                    "  echo 'Neither netgen-server nor ostg-server unit found' >&2; exit 1; "
+                    "fi"
+                )
+                cmd = ["ssh", f"root@{hostname}", remote]
                 result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-                
+
                 if result.returncode == 0:
                     results.append(f"✅ TG {tg_id} ({hostname}): Restarted successfully")
                     logger.info(f"[RESTART SERVER] Successfully restarted server TG {tg_id} on {hostname}")
