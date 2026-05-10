@@ -973,6 +973,10 @@ class TrafficGenClientMenuAction():
                 logger.debug(f"[DEBUG LOAD] Skipped loading servers from session.json (server provided via CLI)")
                 logger.debug(f"[DEBUG LOAD] Preserved {len(self.original_session_servers)} original server(s) from session.json for future saves")
             
+            # Cancel pending auto-stop timers BEFORE clearing self.streams
+            # — otherwise they fire later against vanished stream_ids.
+            if hasattr(self, "_cancel_all_auto_stop_timers"):
+                self._cancel_all_auto_stop_timers()
             self.streams = {}
             self.failed_servers = []
             self.all_devices = {}  # Initialize all_devices
@@ -1205,6 +1209,8 @@ class TrafficGenClientMenuAction():
             traceback.print_exc()
     def reset_session(self):
         """Reset the session data to default."""
+        if hasattr(self, "_cancel_all_auto_stop_timers"):
+            self._cancel_all_auto_stop_timers()
         self.server_interfaces = []
         self.streams = {}
         self.removed_interfaces = set()
@@ -1326,6 +1332,8 @@ class TrafficGenClientMenuAction():
     def _initialize_empty_session(self):
         """Initialize an empty session with default values."""
         logger.info("Initializing an empty session.")
+        if hasattr(self, "_cancel_all_auto_stop_timers"):
+            self._cancel_all_auto_stop_timers()
         # Don't overwrite server_interfaces if servers were added via command line
         if not self.server_interfaces:
             self.server_interfaces = []

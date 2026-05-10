@@ -329,7 +329,22 @@ class TrafficGenClientStreamLogic:
         in_flight.add(stream_id)
 
         try:
-            payload = {"streams": [{"interface": interface, "stream_id": stream_id}]}
+            # Look up stream_name for the payload — kept here for
+            # consistency with Stop Selected / Stop All so the server
+            # can fall back on name matching if stream_id misses
+            # (audit LOW #16). Best-effort; missing it isn't fatal.
+            sname = ""
+            for s in self.streams.get(self._find_port_key_for_stream(stream_id) or "", []):
+                if s.get("stream_id") == stream_id:
+                    sname = (s.get("name")
+                             or s.get("protocol_selection", {}).get("name")
+                             or "")
+                    break
+            payload = {"streams": [{
+                "interface": interface,
+                "stream_id": stream_id,
+                "stream_name": sname,
+            }]}
             resp = self._post_traffic_async(server_url, "stop", payload, timeout=15)
             ok = resp.ok
         except Exception as e:
@@ -395,6 +410,33 @@ class TrafficGenClientStreamLogic:
         timer.start(seconds * 1000)
         self._stop_timers[sid] = timer
         logger.info(f"[AUTO-STOP] Scheduled in {seconds}s for stream_id={sid}")
+
+    def _cancel_all_auto_stop_timers(self):
+        """Cancel every pending auto-stop QTimer.
+
+        Called from the session-reload paths (load_session and friends in
+        menu_actions.py) which reset self.streams = {}. Without this, any
+        timer scheduled for a stream that's about to vanish from
+        self.streams keeps firing — _stop_stream_by_id then can't find
+        the port_key, the local update silently no-ops, and the server
+        gets an orphan /stop POST against the OLD server_url+stream_id
+        pair that the user can't correlate to any action they took.
+        Audit LOW #13.
+        """
+        timers = getattr(self, "_stop_timers", None)
+        if not timers:
+            return
+        cancelled = 0
+        for sid, t in list(timers.items()):
+            try:
+                if isinstance(t, QTimer):
+                    t.stop()
+                cancelled += 1
+            except Exception:
+                pass
+        timers.clear()
+        if cancelled:
+            logger.info(f"[AUTO-STOP] Cancelled {cancelled} pending timer(s) on session reload")
 
     def _cancel_auto_stop_timer(self, stream_id):
         """Cancel any pending auto-stop QTimer for this stream_id.
@@ -642,10 +684,37 @@ class TrafficGenClientStreamLogic:
                     err_msg = f"{server_url}: HTTP {resp.status_code} {body}"
                     logger.error(f"[HTTP] Failed to start on {err_msg}")
                     errors_for_user.append(err_msg)
+                    # Audit LOW #14: parse the response body even on
+                    # non-OK and only red-flag streams the server did
+                    # NOT report as started. The server's 4xx/5xx
+                    # response can still carry a partial-success
+                    # `started_streams` list (e.g. one stream out of
+                    # five failed because its iface is down). Marking
+                    # the whole batch red was misleading and made the
+                    # user re-Start the four that were already running.
+                    started_ids_partial = set()
+                    try:
+                        partial = resp.json().get("started_streams", []) or []
+                        started_ids_partial = {
+                            entry.get("stream_id") for entry in partial
+                            if entry.get("stream_id")
+                        }
+                    except Exception:
+                        pass
                     for items in per_port.values():
                         for st, r in items:
-                            self.update_stream_status(r, "red")
                             sid = st.get("stream_id")
+                            if sid in started_ids_partial:
+                                # This one DID start — green it.
+                                if r is not None:
+                                    self.update_stream_status(r, "green")
+                                st["status"] = "running"
+                                st["enabled"] = True
+                                st.setdefault("protocol_selection", {})["enabled"] = True
+                                any_started = True
+                            else:
+                                if r is not None:
+                                    self.update_stream_status(r, "red")
                             if sid:
                                 in_flight.discard(sid)
                     continue
@@ -1026,8 +1095,24 @@ class TrafficGenClientStreamLogic:
 
             for server_url, items in stop_requests.items():
                 try:
+                    # Audit LOW #16: include stream_name for parity with
+                    # Stop Selected. The server's /api/traffic/stop uses
+                    # it as fallback matching when stream_id misses (e.g.
+                    # after a server restart that re-allocated tracker
+                    # IDs). Inconsistent payload shape between Stop
+                    # Selected vs Stop All / auto-stop was a latent
+                    # bomb if the server ever started leaning on the
+                    # field for matching.
                     payload = {
-                        "streams": [{"interface": it["interface"], "stream_id": it["stream_id"]} for it in items]}
+                        "streams": [
+                            {
+                                "interface": it["interface"],
+                                "stream_id": it["stream_id"],
+                                "stream_name": it.get("stream_name", ""),
+                            }
+                            for it in items
+                        ]
+                    }
                     resp = self._post_traffic_async(server_url, "stop", payload, timeout=15)
                     if resp.ok:
                         logger.info(f"[STOP-ALL] Stopped {len(items)} stream(s) on {server_url}")
@@ -1241,16 +1326,25 @@ class TrafficGenClientStreamLogic:
                         row_by_id[s["stream_id"]] = row_idx
                     sid_to_port[s["stream_id"]] = port_label
 
-                    # Debug: Log MAC increment options being sent
-                    protocol_data = s.get("protocol_data", {})
-                    mac_data = protocol_data.get("mac", {})
-                    if mac_data:
-                        mac_src_mode = mac_data.get("mac_source_mode", "Fixed")
-                        mac_dst_mode = mac_data.get("mac_destination_mode", "Fixed")
-                        if mac_src_mode in ("Increment", "Decrement") or mac_dst_mode in ("Increment", "Decrement"):
-                            logger.debug(f"[MAC] Stream '{name}' MAC increment options:")
-                            logger.debug(f"  Source: mode={mac_src_mode}, step={mac_data.get('mac_source_step')}, count={mac_data.get('mac_source_count')}, addr={mac_data.get('mac_source_address')}")
-                            logger.debug(f"  Dest: mode={mac_dst_mode}, step={mac_data.get('mac_destination_step')}, count={mac_data.get('mac_destination_count')}, addr={mac_data.get('mac_destination_address')}")
+                    # Audit LOW #17: collapsed the per-stream MAC dump
+                    # from three logger.debug calls into one. On a 64-
+                    # stream Start All with LOG_LEVEL=DEBUG that was
+                    # 192 lines per click; now it's a single line per
+                    # stream with the full payload. Gated on at least
+                    # one Increment/Decrement mode so Fixed-only setups
+                    # stay completely quiet.
+                    if logger.isEnabledFor(logging.DEBUG):
+                        mac_data = s.get("protocol_data", {}).get("mac", {})
+                        if mac_data:
+                            src_mode = mac_data.get("mac_source_mode", "Fixed")
+                            dst_mode = mac_data.get("mac_destination_mode", "Fixed")
+                            if src_mode in ("Increment", "Decrement") or dst_mode in ("Increment", "Decrement"):
+                                logger.debug(
+                                    f"[MAC] '{name}' src={src_mode}/{mac_data.get('mac_source_address')}"
+                                    f" step={mac_data.get('mac_source_step')} count={mac_data.get('mac_source_count')}"
+                                    f"  dst={dst_mode}/{mac_data.get('mac_destination_address')}"
+                                    f" step={mac_data.get('mac_destination_step')} count={mac_data.get('mac_destination_count')}"
+                                )
 
                     server_payload_map.setdefault(server_url, {}).setdefault(port_label, []).append((s, row_idx))
 
@@ -1618,11 +1712,18 @@ class TrafficGenClientStreamLogic:
                             interface_name = interface_name.replace("Port:", "").strip()
                         interface_name = interface_name.strip()
                         
+                        # Audit LOW #16: include stream_name on the
+                        # wire for consistency with Stop Selected.
                         stop_payload = {
                             "streams": [
                                 {
                                     "interface": interface_name,
-                                    "stream_id": s.get("stream_id")
+                                    "stream_id": s.get("stream_id"),
+                                    "stream_name": (
+                                        s.get("name")
+                                        or s.get("protocol_selection", {}).get("name")
+                                        or ""
+                                    ),
                                 }
                                 for s in streams_to_stop if s.get("stream_id")
                             ]
