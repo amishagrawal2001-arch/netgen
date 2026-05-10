@@ -296,8 +296,26 @@ def stream_stats():
         # Convert to format expected by client
         active_streams = []
         for stream in streams:
-            # Extract frame_size from stream_data if available
-            stream_data = stream.get("stream_data", {}) or {}
+            # Extract frame_size from the persisted stream config. The DB
+            # column is `stream_config` (JSON-decoded to a dict by
+            # stream_database.get_all_streams). Older code in this handler
+            # read `stream_data`, which doesn't exist on the row — so all
+            # field lookups silently failed, frame_size fell through to
+            # the 64-byte default, and the client's bps calc was
+            # frame_size/64 = ~24x too low at 1500B. Accept either key
+            # for forward-compat (in case anything else writes
+            # 'stream_data').
+            stream_data = stream.get("stream_config") or stream.get("stream_data") or {}
+            if isinstance(stream_data, str):
+                # Defensive — get_all_streams should already json.loads,
+                # but tolerate a raw JSON string just in case.
+                try:
+                    import json as _json
+                    stream_data = _json.loads(stream_data)
+                except Exception:
+                    stream_data = {}
+            if not isinstance(stream_data, dict):
+                stream_data = {}
             protocol_selection = stream_data.get("protocol_selection", {}) or {}
             frame_size = (protocol_selection.get("frame_size") or 
                          stream_data.get("frame_size") or 
