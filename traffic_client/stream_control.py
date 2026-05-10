@@ -174,7 +174,11 @@ class TrafficGenClientStreamControl:
             "QPushButton:pressed { background-color: #93c5fd; }"
         )
 
-        BTN_W, BTN_H, ICON_PX = 40, 36, 20
+        # 34x30 with 18px icons — modest bump from the original 32x28/16
+        # that keeps the action bar aligned with the TGEN section's icon row
+        # at the bottom-left. Visibility wins (color-coded borders, hover
+        # states, group divider) come from styling, not size.
+        BTN_W, BTN_H, ICON_PX = 34, 30, 18
 
         def _action_btn(icon_name, tooltip, slot, style=None):
             b = QPushButton()
@@ -227,7 +231,7 @@ class TrafficGenClientStreamControl:
         # to red when streams are running (handled by update_all_streams_toggle_ui).
         self.all_streams_toggle_btn = QPushButton()
         self.all_streams_toggle_btn.setIconSize(QSize(ICON_PX, ICON_PX))
-        self.all_streams_toggle_btn.setFixedSize(BTN_W + 8, BTN_H)
+        self.all_streams_toggle_btn.setFixedSize(BTN_W + 6, BTN_H)
         self.all_streams_toggle_btn.setCursor(Qt.PointingHandCursor)
         self.all_streams_toggle_btn.setToolTip("Start ALL enabled streams")
         self.all_streams_toggle_btn.setStyleSheet(BTN_START)
