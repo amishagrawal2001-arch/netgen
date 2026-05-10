@@ -80,6 +80,31 @@ class _TrafficPostWorker(QThread):
             self.error = e
 
 
+class _HttpGetWorker(QThread):
+    """One-shot QThread mirror of _TrafficPostWorker for GET requests.
+
+    Used by _get_async() to fetch /api/interfaces (and similar) without
+    freezing the UI. The Edit Stream and Add Stream dialogs need a list
+    of available RX ports per server, and the previous code did one
+    sync requests.get(timeout=5) per online TG on the UI thread —
+    opening Edit on a chassis with one offline TG cost a 5s freeze
+    while that GET timed out.
+    """
+
+    def __init__(self, url, timeout, parent=None):
+        super().__init__(parent)
+        self._url = url
+        self._timeout = timeout
+        self.response = None
+        self.error = None
+
+    def run(self):
+        try:
+            self.response = requests.get(self._url, timeout=self._timeout)
+        except Exception as e:
+            self.error = e
+
+
 class TrafficGenClientStreamLogic:
     # ---------- helpers ----------
 
@@ -107,6 +132,35 @@ class TrafficGenClientStreamLogic:
         worker.start()
         loop.exec_()
         worker.wait()  # ensure thread is fully done before reading attrs
+        # Prevent the slow QThread/socket-handle creep flagged in the
+        # audit. After wait() returns the thread is dead, so deleteLater
+        # is safe and lets Qt's parent/child cleanup release the OS
+        # thread + socket handles immediately rather than waiting for
+        # Python GC to collect the local reference.
+        worker.deleteLater()
+        if worker.error is not None:
+            raise worker.error
+        return worker.response
+
+    def _get_async(self, url, timeout=5):
+        """Synchronous-looking wrapper around requests.get that runs the
+        actual HTTP call in a background QThread.
+
+        Used by Edit Stream and Add Stream when they need to fetch the
+        list of available RX ports per server. Same pattern as
+        _post_traffic_async — pumps a local QEventLoop so the UI stays
+        responsive while the GET is in flight, then returns the real
+        requests.Response (or raises on transport error). Critical when
+        a TG is unreachable: previously the sync GET timed out on the
+        UI thread for ~5s, freezing the app before the dialog opened.
+        """
+        loop = QEventLoop()
+        worker = _HttpGetWorker(url, timeout)
+        worker.finished.connect(loop.quit)
+        worker.start()
+        loop.exec_()
+        worker.wait()
+        worker.deleteLater()
         if worker.error is not None:
             raise worker.error
         return worker.response
@@ -206,7 +260,16 @@ class TrafficGenClientStreamLogic:
         return None
 
     def _stop_stream_by_id(self, server_url, interface, stream_id, row_idx=None):
-        """POST a stop for a single stream_id, update UI + local state (do NOT flip 'enabled')."""
+        """POST a stop for a single stream_id, update UI + local state (do NOT flip 'enabled').
+
+        Used by both the duration-expiry auto-stop QTimer and any other
+        single-stream stop callsite. Participates in `_streams_in_flight()`
+        so a user-initiated Stop click that lands while this method is
+        pumping the QEventLoop (via _post_traffic_async) can't fire a
+        second /stop for the same stream — the audit flagged this as a
+        timer-vs-user race that produced "Could not reach" log noise the
+        user couldn't trace.
+        """
 
         # ⏹️ Cancel any pending auto-stop timer for this stream_id
         try:
@@ -217,6 +280,18 @@ class TrafficGenClientStreamLogic:
         except Exception:
             pass
 
+        # Reserve the in-flight slot so a parallel user-click on Stop for
+        # the same stream_id is rejected. start_stream / stop_stream both
+        # check this set before firing.
+        in_flight = self._streams_in_flight()
+        if stream_id in in_flight:
+            logger.info(
+                f"[AUTO-STOP] Skipping {stream_id} on {server_url} — "
+                f"another stop is already in flight"
+            )
+            return
+        in_flight.add(stream_id)
+
         try:
             payload = {"streams": [{"interface": interface, "stream_id": stream_id}]}
             resp = self._post_traffic_async(server_url, "stop", payload, timeout=15)
@@ -224,6 +299,8 @@ class TrafficGenClientStreamLogic:
         except Exception as e:
             logger.error(f"[AUTO-STOP] {server_url} stream_id={stream_id}: {e}")
             ok = False
+        finally:
+            in_flight.discard(stream_id)
 
         # update status in memory
         port_key = self._find_port_key_for_stream(stream_id)
@@ -282,6 +359,30 @@ class TrafficGenClientStreamLogic:
         timer.start(seconds * 1000)
         self._stop_timers[sid] = timer
         logger.info(f"[AUTO-STOP] Scheduled in {seconds}s for stream_id={sid}")
+
+    def _cancel_auto_stop_timer(self, stream_id):
+        """Cancel any pending auto-stop QTimer for this stream_id.
+
+        Called from edit_selected_stream / remove_selected_stream so a
+        timer scheduled when a 10s-duration stream was started doesn't
+        fire after the stream has been edited (potentially a different
+        duration now) or removed (stream_id no longer exists locally).
+        Without this, the timer fires _stop_stream_by_id with a stale
+        stream_id and the server gets an orphan /stop POST that the
+        user can't correlate to any action they took.
+        """
+        if not stream_id:
+            return
+        try:
+            timers = getattr(self, "_stop_timers", None)
+            if not timers:
+                return
+            t = timers.pop(stream_id, None)
+            if t and isinstance(t, QTimer):
+                t.stop()
+                logger.debug(f"[AUTO-STOP] Cancelled pending timer for {stream_id}")
+        except Exception as e:
+            logger.debug(f"[AUTO-STOP] Cancel-timer error for {stream_id}: {e}")
 
     def _selected_stream_rows(self):
         """
@@ -1212,6 +1313,36 @@ class TrafficGenClientStreamLogic:
            Also normalize & send tx_rate and tx_duration for each restarted stream."""
         # Session save removed - only save on explicit user action (Save Session menu or Apply button)
 
+        # Re-entrance guard. apply_stream pumps a local QEventLoop via
+        # _post_traffic_async (sometimes for several seconds when running
+        # streams need restart), and Qt keeps processing button clicks
+        # while the loop pumps. Without this guard, two rapid clicks fire
+        # two parallel /api/traffic/restart POSTs with identical payloads
+        # — the audit flagged this as a real footgun. Also disable the
+        # button + show busy cursor so the user gets visible feedback
+        # that Apply is doing work.
+        if getattr(self, "_apply_in_flight", False):
+            logger.info("[APPLY] Skipping click — apply already in flight")
+            return
+        self._apply_in_flight = True
+        from PyQt5.QtCore import Qt as _Qt
+        from PyQt5.QtGui import QCursor as _QCursor
+        btn = getattr(self, "apply_stream_button", None)
+        if btn is not None:
+            btn.setEnabled(False)
+        QApplication.setOverrideCursor(_QCursor(_Qt.WaitCursor))
+        try:
+            self._apply_stream_body()
+        finally:
+            QApplication.restoreOverrideCursor()
+            if btn is not None:
+                btn.setEnabled(True)
+            self._apply_in_flight = False
+
+    def _apply_stream_body(self):
+        """The actual Apply logic — wrapped by apply_stream() so the
+        re-entrance guard, busy-cursor + button-disabled feedback can
+        share a single try/finally without indenting the whole method."""
         row_count = self.stream_table.rowCount()
 
         # 🔄 Sync inline-edited values from the table into self.streams
