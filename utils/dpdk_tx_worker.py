@@ -197,6 +197,14 @@ def run_stream(
         if n >= 2:
             cmd += [cli_flag, str(n)]
 
+    # One-way latency timestamping. When enabled, tx_worker embeds a
+    # 16-byte NLAT header at the start of each UDP payload — the
+    # latency_sampler.py RX-side tool decodes it and reports min/avg/
+    # p50/p99/max one-way latency. Requires payload_len >= 16, so the
+    # frame must be big enough (60B frame leaves 18B payload — fits).
+    if stream_data.get("enable_timestamps") or stream_data.get("latency_enabled"):
+        cmd += ["--enable-timestamps"]
+
     # Environment (allow caller to inject EAL/PMD paths etc.)
     child_env = os.environ.copy()
     if env:
