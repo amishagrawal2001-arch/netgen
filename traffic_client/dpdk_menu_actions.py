@@ -1737,7 +1737,7 @@ If DPDK still fails:
                     if loaded:
                         msg += f"Successfully loaded: {', '.join(loaded)}\n\n"
                     msg += "Check server logs for more details:\n"
-                    msg += f"  journalctl -u ostg-server -n 50"
+                    msg += f"  journalctl -u netgen-server -n 50"
                     
                     # Use a scrollable dialog for long error messages
                     error_dialog = QDialog(self)
