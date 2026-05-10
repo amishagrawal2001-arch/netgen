@@ -120,17 +120,20 @@ class TrafficGenClientStreamControl:
         self.stream_table.viewport().installEventFilter(self)
 
         # --- All Buttons in Same Row (Action buttons on left, Control buttons centered) ---
-        # Bumped for visibility: 32x28 → 40x36, icons 16 → 20. Action buttons
-        # get bordered backgrounds so the hit area is unambiguous, and the
-        # Start/Stop/Apply group is color-coded by semantic so users don't
-        # have to read tooltips to know what each button does.
+        # Single uniform palette — same border, same hover, same size for all
+        # buttons in both action rows. The icons carry the semantic (▶ start,
+        # ⬛ stop, etc.); colored fills were too noisy and looked unprofessional
+        # next to the muted TGEN row. Only Apply gets a subtle blue accent
+        # because it's the primary "commit" action and benefits from being
+        # visually distinct from configuration and runtime-control buttons.
         button_layout = QHBoxLayout()
         button_layout.setAlignment(Qt.AlignLeft)
         button_layout.setSpacing(6)
         button_layout.setContentsMargins(0, 8, 0, 0)
 
-        # Shared base style — bordered, padded, hover/pressed states. Each
-        # button overlays this with a semantic color on top.
+        # Universal button style — same as the TGEN section's _tgen_btn so
+        # both rows visually match. Neutral white background, thin gray
+        # border, gray hover. No fill colors.
         BTN_BASE = (
             "QPushButton {"
             "  border: 1px solid #cbd5e1;"
@@ -142,42 +145,22 @@ class TrafficGenClientStreamControl:
             "QPushButton:pressed { background-color: #e2e8f0; }"
             "QPushButton:disabled { background-color: #f9fafb; border-color: #e5e7eb; }"
         )
-        # Semantic overlays for the control group
-        BTN_START = (
-            "QPushButton {"
-            "  border: 1px solid #16a34a;"
-            "  border-radius: 5px;"
-            "  background-color: #dcfce7;"
-            "  padding: 0px;"
-            "}"
-            "QPushButton:hover { background-color: #bbf7d0; border-color: #15803d; }"
-            "QPushButton:pressed { background-color: #86efac; }"
-        )
-        BTN_STOP = (
-            "QPushButton {"
-            "  border: 1px solid #dc2626;"
-            "  border-radius: 5px;"
-            "  background-color: #fee2e2;"
-            "  padding: 0px;"
-            "}"
-            "QPushButton:hover { background-color: #fecaca; border-color: #b91c1c; }"
-            "QPushButton:pressed { background-color: #fca5a5; }"
-        )
+
+        # Apply gets a subtle blue accent — same neutral baseline, but the
+        # border is blue and the hover deepens slightly. Reads as "primary"
+        # without shouting like the previous all-blue fill did.
         BTN_APPLY = (
             "QPushButton {"
             "  border: 1px solid #2563eb;"
             "  border-radius: 5px;"
-            "  background-color: #dbeafe;"
+            "  background-color: #ffffff;"
             "  padding: 0px;"
             "}"
-            "QPushButton:hover { background-color: #bfdbfe; border-color: #1d4ed8; }"
-            "QPushButton:pressed { background-color: #93c5fd; }"
+            "QPushButton:hover { background-color: #eff6ff; border-color: #1d4ed8; }"
+            "QPushButton:pressed { background-color: #dbeafe; }"
         )
 
-        # 34x30 with 18px icons — modest bump from the original 32x28/16
-        # that keeps the action bar aligned with the TGEN section's icon row
-        # at the bottom-left. Visibility wins (color-coded borders, hover
-        # states, group divider) come from styling, not size.
+        # 34x30 with 18px icons — aligns with the TGEN section's icon row.
         BTN_W, BTN_H, ICON_PX = 34, 30, 18
 
         def _action_btn(icon_name, tooltip, slot, style=None):
@@ -214,31 +197,32 @@ class TrafficGenClientStreamControl:
         # Add stretch so control buttons don't crowd the configuration ones.
         button_layout.addStretch(1)
 
-        # Runtime control buttons (centered): color-coded by semantic.
-        # Start = green, Stop = red, Apply = blue.
+        # Runtime control buttons (centered) — same neutral baseline as the
+        # configuration trio. Semantic comes from the icons (▶ vs ⬛), not
+        # from button colors.
         self.start_stream_button = _action_btn(
-            "start.png", "Start Selected streams", self.start_stream, BTN_START,
+            "start.png", "Start Selected streams", self.start_stream,
         )
         button_layout.addWidget(self.start_stream_button)
 
         self.stop_stream_button = _action_btn(
-            "stop.png", "Stop Selected streams", self.stop_stream, BTN_STOP,
+            "stop.png", "Stop Selected streams", self.stop_stream,
         )
         button_layout.addWidget(self.stop_stream_button)
 
-        # Single Start/Stop ALL toggle — slightly wider since it acts on
-        # everything; uses the same green tint as Start initially, swapped
-        # to red when streams are running (handled by update_all_streams_toggle_ui).
+        # Start/Stop ALL toggle — same neutral baseline as the rest. The
+        # icon swap (start-all vs stop-all) tells the user what state we're in.
         self.all_streams_toggle_btn = QPushButton()
         self.all_streams_toggle_btn.setIconSize(QSize(ICON_PX, ICON_PX))
         self.all_streams_toggle_btn.setFixedSize(BTN_W + 6, BTN_H)
         self.all_streams_toggle_btn.setCursor(Qt.PointingHandCursor)
         self.all_streams_toggle_btn.setToolTip("Start ALL enabled streams")
-        self.all_streams_toggle_btn.setStyleSheet(BTN_START)
+        self.all_streams_toggle_btn.setStyleSheet(BTN_BASE)
         self.all_streams_toggle_btn.clicked.connect(self._toggle_all_streams)
-        # Stash the semantic styles so the toggle handler can swap them.
-        self._all_btn_start_style = BTN_START
-        self._all_btn_stop_style = BTN_STOP
+        # Both states use the same neutral style — kept as separate names
+        # so update_all_streams_toggle_ui doesn't need to change shape.
+        self._all_btn_start_style = BTN_BASE
+        self._all_btn_stop_style = BTN_BASE
 
         # 👇 set a default icon right away (so it's visible at first paint)
         _default_icon = QIcon(r_icon("icons/startallstream.png"))
@@ -345,14 +329,15 @@ class TrafficGenClientStreamControl:
         if btn is None:
             return
         if self._dirty_streams():
-            # Amber tint signals "edits pending" — same border-radius as the
-            # rest of the action bar so the button doesn't visually shift size
-            # when toggling between baseline-blue and dirty-amber.
+            # "Edits pending" — amber border (matches the minimal-accent
+            # pattern used elsewhere in the action bar) + a faint amber
+            # tint on hover. Border-radius / padding match the baseline so
+            # toggling clean<->dirty doesn't shift the button size.
             btn.setStyleSheet(
-                "QPushButton { background-color: #fef3c7; border: 1px solid #f59e0b; "
+                "QPushButton { background-color: #ffffff; border: 1px solid #d97706; "
                 "border-radius: 5px; padding: 0px; }"
-                "QPushButton:hover { background-color: #fde68a; border-color: #d97706; }"
-                "QPushButton:pressed { background-color: #fcd34d; }"
+                "QPushButton:hover { background-color: #fffbeb; border-color: #b45309; }"
+                "QPushButton:pressed { background-color: #fef3c7; }"
             )
             btn.setToolTip(
                 f"You have {len(self._dirty_streams())} unapplied edit(s). "
