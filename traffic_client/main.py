@@ -817,6 +817,20 @@ class TrafficGeneratorClient(
         menu_bar.addMenu(help_menu)
         help_menu.setToolTipsVisible(True)
 
+        # Install Guide — covers install_ostg_complete.py end-to-end
+        # (single-command provisioning, what gets installed, opt-out flags,
+        # tolerant-of-failure DPDK build, sanity checks).
+        install_guide_action = QAction("Install Guide...", self)
+        install_guide_action.setToolTip(
+            "Single-command server provisioning: what gets installed, "
+            "DPDK runtime build, CLI flags, troubleshooting paths."
+        )
+        install_guide_action.triggered.connect(self.show_install_guide)
+        help_menu.addAction(install_guide_action)
+        self.addAction(install_guide_action)
+
+        help_menu.addSeparator()
+
         dpdk_guide_action = QAction("DPDK Traffic Blast Workflow...", self)
         dpdk_guide_action.setShortcut(QKeySequence("F1"))
         dpdk_guide_action.setToolTip(
@@ -834,6 +848,15 @@ class TrafficGeneratorClient(
         try:
             from widgets.stream_dialog import show_dpdk_usage_guide
             show_dpdk_usage_guide(self)
+        except Exception as e:
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Help unavailable", f"Could not open guide: {e}")
+
+    def show_install_guide(self):
+        """Open the Installation Guide dialog from the Help menu."""
+        try:
+            from widgets.stream_dialog import show_install_guide
+            show_install_guide(self)
         except Exception as e:
             from PyQt5.QtWidgets import QMessageBox
             QMessageBox.warning(self, "Help unavailable", f"Could not open guide: {e}")
