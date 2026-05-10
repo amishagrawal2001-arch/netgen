@@ -199,7 +199,7 @@ def run_stream(
     # 50% of reality. Catch it here before we Popen.
     try:
         _pat = f"--stream-id {stream_id}"
-        _check = subprocess.run(["pgrep", "-f", _pat], capture_output=True, text=True, timeout=3)
+        _check = subprocess.run(["pgrep", "-f", "--", _pat], capture_output=True, text=True, timeout=3)
         if _check.returncode == 0 and _check.stdout.strip():
             _stale_pids = _check.stdout.strip().split()
             LOG.warning(
@@ -207,10 +207,10 @@ def run_stream(
                 "(pids=%s) - terminating before launching new instance",
                 len(_stale_pids), stream_id, ",".join(_stale_pids),
             )
-            subprocess.run(["pkill", "-TERM", "-f", _pat], capture_output=True, timeout=3)
+            subprocess.run(["pkill", "-TERM", "-f", "--", _pat], capture_output=True, timeout=3)
             import time as _t
             _t.sleep(1.0)
-            subprocess.run(["pkill", "-KILL", "-f", _pat], capture_output=True, timeout=3)
+            subprocess.run(["pkill", "-KILL", "-f", "--", _pat], capture_output=True, timeout=3)
     except Exception as _e:
         LOG.debug("[dpdk] pre-launch sweep for %s failed: %s", stream_id, _e)
 
