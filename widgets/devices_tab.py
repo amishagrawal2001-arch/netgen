@@ -5767,7 +5767,39 @@ class DevicesTab(QWidget):
                                f"Added {len(devices_to_create)} device(s) to the UI.\n\n"
                                f"Click 'Apply' to configure on server and save to session.")
     def paste_device_to_interface(self):
-        """Paste the copied device(s) to the selected interface."""
+        """Paste the copied device(s) to the selected interface.
+
+        Audit HIGH #4 — rewrote four bugs that made this functionally
+        a no-op in most setups:
+
+        (a) TG-ID extraction was `parent_item.text(0).strip()`, but
+            TG ID lives in a custom widget on column 0 (text(0) is
+            empty). target_interface became " - ens4np0", didn't
+            match any all_devices key, pasted devices vanished.
+            Now uses the same widget-walking logic as
+            prompt_add_device above.
+
+        (b) Only 9 fields were carried over from the copied device,
+            dropping gateways, MTU, loopbacks, bgp_config,
+            ospf_config, isis_config, dhcp_config, and protocols
+            (only VXLAN survived). Paste now deep-copies the full
+            device dict and patches in the new identity fields,
+            preserving everything the user originally configured.
+
+        (c) The source MAC was copied verbatim. Two devices on the
+            same L2 with the same MAC = guaranteed ARP collision.
+            Now generates a fresh per-paste MAC by incrementing
+            the last byte of the source MAC, falling back to a
+            random locally-administered MAC if the source is
+            missing/invalid.
+
+        (d) copy_selected_device's 9-field shape was the upstream
+            cause of (b) — that's fixed separately above to
+            deep-copy the whole device.
+        """
+        import copy as _copy
+        import random as _random
+
         if not hasattr(self.main_window, 'copied_device') or not self.main_window.copied_device:
             QMessageBox.warning(self, "Nothing to Paste", "No device has been copied. Please copy a device first.")
             return
@@ -5778,81 +5810,154 @@ class DevicesTab(QWidget):
             QMessageBox.warning(self, "No Port Selected", "Please select a port to paste the device(s) to.")
             return
 
-        # Get the target interface
+        # ---- Target interface resolution (audit HIGH #4a) ----
+        # TG ID lives in a custom widget on parent_item column 0;
+        # text(0) is empty. Walk the widget tree for the "TG N" QLabel,
+        # then fall back to server_interfaces by parent index — same
+        # logic prompt_add_device uses (~line 5092).
         parent_item = selected_items[0].parent()
-        tg_id = parent_item.text(0).strip()
-        port_name = selected_items[0].text(0).replace("• ", "").strip()  # Remove bullet prefix
-        target_interface = f"{tg_id} - {port_name}"  # Match server tree format
+        tg_id = None
+        tg_id_widget = self.main_window.server_tree.itemWidget(parent_item, 0)
+        if tg_id_widget:
+            from PyQt5.QtWidgets import QLabel as _QLabel
+            for child in tg_id_widget.findChildren(_QLabel):
+                if child.text().startswith("TG "):
+                    tg_id = child.text().strip()
+                    break
+        if not tg_id:
+            parent_index = self.main_window.server_tree.indexOfTopLevelItem(parent_item)
+            if parent_index >= 0 and hasattr(self.main_window, "server_interfaces"):
+                if parent_index < len(self.main_window.server_interfaces):
+                    server = self.main_window.server_interfaces[parent_index]
+                    tg_id = f"TG {server.get('tg_id', '0')}"
+        if not tg_id:
+            QMessageBox.warning(
+                self, "Invalid Selection",
+                "Could not determine TG ID from selected port. "
+                "Please pick a port under a TG row in the server tree."
+            )
+            return
+
+        port_name = selected_items[0].text(0).replace("• ", "").strip()
+        target_interface = f"{tg_id} - {port_name}"
 
         # Get the copied device data (can be single device or list)
         copied_devices = self.main_window.copied_device
         if not isinstance(copied_devices, list):
-            copied_devices = [copied_devices]  # Convert single device to list for uniform processing
+            copied_devices = [copied_devices]
 
-        # Get all existing device names for unique name generation
+        # Existing names across the whole model for unique-name generation.
         existing_names = [
             d.get("Device Name", "")
             for dev_list in self.main_window.all_devices.values()
             for d in (dev_list if isinstance(dev_list, list) else [])
         ]
-        
+
+        # Existing MACs (audit HIGH #4c) — to guarantee the freshly
+        # incremented MAC doesn't collide with another device on the
+        # target interface.
+        existing_macs = {
+            (d.get("MAC Address") or "").lower()
+            for dev_list in self.main_window.all_devices.values()
+            for d in (dev_list if isinstance(dev_list, list) else [])
+        }
+
+        def _fresh_mac(source_mac):
+            """Produce a fresh MAC for a pasted device.
+
+            Strategy: increment the last byte of source_mac and keep
+            bumping until we land on something not in existing_macs.
+            If source_mac is missing or unparseable, fall back to a
+            random locally-administered unicast MAC (LSB-of-first-byte
+            = 0 unicast, second-LSB = 1 locally administered).
+            """
+            try:
+                if source_mac and source_mac.count(":") == 5:
+                    for step in range(1, 256):
+                        candidate = self._increment_mac(source_mac, step, byte_index=0)
+                        if candidate and candidate.lower() not in existing_macs:
+                            existing_macs.add(candidate.lower())
+                            return candidate
+            except Exception as e:
+                logger.debug(f"[paste] increment fallback: {e}")
+            # Fallback: random LA-unicast MAC
+            first = 0x02 | (_random.randint(0, 255) & 0xFC)
+            rest = [_random.randint(0, 255) for _ in range(5)]
+            candidate = ":".join(f"{b:02x}" for b in [first] + rest)
+            existing_macs.add(candidate)
+            return candidate
+
         pasted_devices = []
-        
-        # Process each copied device
+
         for copied_device in copied_devices:
-            # Generate a unique name for the pasted device
-            base_name = copied_device.get("Device Name", "Device")
+            # Generate a unique name for the pasted device.
+            base_name = (copied_device.get("Device Name") or "Device").rstrip("_Copy").rstrip("_") or "Device"
             new_name = f"{base_name}_Copy"
             counter = 1
             while new_name in existing_names:
                 counter += 1
                 new_name = f"{base_name}_Copy_{counter}"
-            
-            # Add to existing names to prevent duplicates within this batch
             existing_names.append(new_name)
 
-            # Create new device data
-            new_device = {
-                "Device Name": new_name,
-                "device_id": str(uuid.uuid4()),
-                "Interface": target_interface,
-                "MAC Address": copied_device.get("MAC Address", ""),
-                "IPv4": copied_device.get("IPv4", ""),
-                "IPv6": copied_device.get("IPv6", ""),
-                "ipv4_mask": copied_device.get("ipv4_mask", "24"),
-                "ipv6_mask": copied_device.get("ipv6_mask", "64"),
-                "VLAN": copied_device.get("VLAN", "0"),
-                "Status": "Stopped",
-                "_is_new": True,
-                "_needs_apply": True,
-                "protocols": [],
-            }
+            # Full deep-copy of the source device, then patch identity
+            # fields. This preserves gateways, MTU, loopbacks, all
+            # protocol configs (bgp/ospf/isis/dhcp), and the protocols
+            # list — everything the user configured on the source.
+            # Audit HIGH #4b.
+            new_device = _copy.deepcopy(copied_device)
 
-            vxlan_copy = self._normalize_vxlan_config(copied_device.get("vxlan_config"))
-            if vxlan_copy:
-                vxlan_copy["underlay_interface"] = self._normalize_iface_label(target_interface)
-                # Convert single tunnel config to tunnels format for consistency
-                # Handle both old format (single dict) and new format (tunnels list)
-                if isinstance(vxlan_copy, dict) and "tunnels" in vxlan_copy:
-                    # Already in tunnels format, use as-is
-                    new_device["vxlan_config"] = vxlan_copy
-                else:
-                    # Single tunnel format, convert to tunnels format
-                    new_device["vxlan_config"] = {"tunnels": [vxlan_copy]}
-                new_device["VXLAN"] = self._format_vxlan_summary(vxlan_copy)
-                new_device["protocols"].append("VXLAN")
+            # Strip runtime-only / source-specific fields that must
+            # NOT be carried over into the paste:
+            for k in (
+                "device_id", "Status",
+                "_is_new", "_needs_apply", "_needs_cleanup",
+                "_was_running", "_old_config",
+                "arp_resolved", "ping_status",
+                "last_apply_at", "last_status_check",
+            ):
+                new_device.pop(k, None)
 
-            # Add to all_devices data structure
+            # Identity / placement fields.
+            new_device["Device Name"] = new_name
+            new_device["device_id"] = str(uuid.uuid4())
+            new_device["Interface"] = target_interface
+            new_device["Status"] = "Stopped"
+            new_device["_is_new"] = True
+            new_device["_needs_apply"] = True
+
+            # Fresh MAC (audit HIGH #4c).
+            new_device["MAC Address"] = _fresh_mac(copied_device.get("MAC Address", ""))
+
+            # If the source had a VXLAN config, retarget its
+            # underlay_interface to the paste destination so it
+            # binds against the new port (matches the pre-rewrite
+            # behavior; only difference is we no longer rebuild the
+            # config from scratch).
+            vxlan_cfg = new_device.get("vxlan_config")
+            if vxlan_cfg:
+                normalized = self._normalize_vxlan_config(vxlan_cfg)
+                if normalized:
+                    normalized["underlay_interface"] = self._normalize_iface_label(target_interface)
+                    if isinstance(normalized, dict) and "tunnels" in normalized:
+                        new_device["vxlan_config"] = normalized
+                    else:
+                        new_device["vxlan_config"] = {"tunnels": [normalized]}
+                    new_device["VXLAN"] = self._format_vxlan_summary(normalized)
+
+            # Ensure protocols list survives the deep-copy (defensive;
+            # the deep copy should preserve it already).
+            new_device.setdefault("protocols", [])
+
+            # Add to all_devices data structure.
             if target_interface not in self.main_window.all_devices:
                 self.main_window.all_devices[target_interface] = []
-            
             self.main_window.all_devices[target_interface].append(new_device)
-            
-            # Update interface_to_device_map
+
+            # Update interface_to_device_map.
             if not hasattr(self.main_window, 'interface_to_device_map'):
                 self.main_window.interface_to_device_map = {}
             self.main_window.interface_to_device_map[new_name] = new_device
-            
+
             pasted_devices.append(new_name)
 
         # Refresh the device table
@@ -6180,19 +6285,17 @@ class DevicesTab(QWidget):
                 QMessageBox.warning(self, "Device Not Found", f"Could not find device '{device_name}' in data structure.")
                 return
 
-            copied_devices.append(
-                {
-                    "Device Name": device_info.get("Device Name", ""),
-                    "MAC Address": device_info.get("MAC Address", ""),
-                    "IPv4": device_info.get("IPv4", ""),
-                    "IPv6": device_info.get("IPv6", ""),
-                    "ipv4_mask": device_info.get("ipv4_mask", "24"),
-                    "ipv6_mask": device_info.get("ipv6_mask", "64"),
-                    "VLAN": device_info.get("VLAN", "0"),
-                    "Interface": device_info.get("Interface", ""),
-                    "vxlan_config": device_info.get("vxlan_config", {}),
-                }
-            )
+            # Audit HIGH #4(d): the previous shape only copied 9
+            # named fields, dropping gateways, MTU, loopbacks,
+            # bgp/ospf/isis/dhcp configs, protocols list, etc. Paste
+            # then had nothing to carry over even after its other
+            # bugs were fixed. Full deep-copy now; runtime-only
+            # fields (status flags, internal "_..." markers, the
+            # source's device_id) are stripped at paste time, not
+            # here, so a copy still represents the user's full
+            # config intent.
+            import copy as _copy
+            copied_devices.append(_copy.deepcopy(dict(device_info)))
             device_names.append(device_name)
         
         self.main_window.copied_device = copied_devices
