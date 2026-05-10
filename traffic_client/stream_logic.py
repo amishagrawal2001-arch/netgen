@@ -889,7 +889,20 @@ class TrafficGenClientStreamLogic:
             icon = QIcon(r_icon(icon_file))
             btn.setToolTip(tip)
             btn.setIcon(icon)
-            btn.setIconSize(QSize(16, 16))
+            # Match the larger 20px icon size used by the rest of the action bar.
+            btn.setIconSize(QSize(20, 20))
+
+            # Swap the button's semantic color so it's instantly readable as
+            # "click to stop everything" (red) vs "click to start" (green).
+            # The styles are stashed by setup_stream_section above.
+            if running:
+                stop_style = getattr(self, "_all_btn_stop_style", None)
+                if stop_style:
+                    btn.setStyleSheet(stop_style)
+            else:
+                start_style = getattr(self, "_all_btn_start_style", None)
+                if start_style:
+                    btn.setStyleSheet(start_style)
 
             # If the icon can’t be found/loaded, show text so the button isn’t blank
             if icon.isNull():
