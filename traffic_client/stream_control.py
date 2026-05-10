@@ -5,7 +5,8 @@ logger = logging.getLogger(__name__)
 
 from PyQt5.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QPushButton, QLineEdit, QComboBox, QTableWidget,
-    QTableWidgetItem, QAbstractItemView, QHeaderView, QMessageBox, QDialog, QLabel
+    QTableWidgetItem, QAbstractItemView, QHeaderView, QMessageBox, QDialog, QLabel,
+    QFrame
 )
 from PyQt5.QtGui import QIcon
 from PyQt5.QtCore import Qt, QSize
@@ -139,14 +140,23 @@ class TrafficGenClientStreamControl:
         # next to the muted TGEN row. Only Apply gets a subtle blue accent
         # because it's the primary "commit" action and benefits from being
         # visually distinct from configuration and runtime-control buttons.
-        button_layout = QHBoxLayout()
+        # Wrap the action row in a styled QFrame so it has a subtle grey
+        # "footer" background distinguishing it from the table above —
+        # matches the visual feel of the TGEN section. Without the
+        # frame the row sat on the same pure-white background as the
+        # table, with no visual separator.
+        action_bar = QFrame()
+        action_bar.setStyleSheet(
+            "QFrame { background-color: #f3f4f6; "
+            "border-top: 1px solid #e5e7eb; border-radius: 0; }"
+        )
+        button_layout = QHBoxLayout(action_bar)
         button_layout.setAlignment(Qt.AlignLeft)
         button_layout.setSpacing(6)
         # Was (0, 8, 0, 0) — 8px top gap + the parent layout's 10px
         # spacing put the row 18px below the table. Now flush with a
-        # single 2px breather so the row reads as part of the same
-        # panel as the table above it.
-        button_layout.setContentsMargins(0, 2, 0, 2)
+        # single 4px vertical breather inside the bordered footer.
+        button_layout.setContentsMargins(6, 4, 6, 4)
 
         # Universal button style — same as the TGEN section's _tgen_btn so
         # both rows visually match. Neutral white background, thin gray
@@ -298,7 +308,7 @@ class TrafficGenClientStreamControl:
         clear_search_btn.clicked.connect(lambda: self.search_box.setText(""))
         button_layout.addWidget(clear_search_btn)
 
-        layout.addLayout(button_layout)
+        layout.addWidget(action_bar)
 
     def eventFilter(self, watched, event):
         # Keep the empty-state label centred over the table viewport.

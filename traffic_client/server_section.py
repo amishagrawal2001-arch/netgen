@@ -8,7 +8,8 @@ from PyQt5.QtWidgets import (
     QTableWidgetItem, QDialog, QFormLayout, QLineEdit, QComboBox, QDialogButtonBox, QWidget,
     QHeaderView, QRadioButton, QGroupBox, QGridLayout, QTabWidget, QScrollArea, QCheckBox,
     QInputDialog, QSplitter, QAction, QMenu, QAbstractItemView, QSizePolicy, QTreeWidget,
-    QTreeWidgetItem, QTextEdit, QSpacerItem, QFileDialog, QMessageBox
+    QTreeWidgetItem, QTextEdit, QSpacerItem, QFileDialog, QMessageBox,
+    QFrame
 )
 from PyQt5.QtGui import QIcon, QPixmap, QColor, QFont
 from PyQt5.QtCore import Qt, QSize, QTimer
@@ -184,12 +185,21 @@ class TrafficGenClientServerSection():
         self.server_tree.itemSelectionChanged.connect(self._debounced_selection_changed)
 
         # --- Action Buttons Section (grouped separately, aligned with Streams pattern) ---
-        action_button_layout = QHBoxLayout()
+        # Wrap the action row in a styled QFrame so it has a subtle grey
+        # "footer" background distinguishing it from the tree above —
+        # matches the streams section's action bar styling exactly so
+        # both sides of the top split look like siblings.
+        tgen_action_bar = QFrame()
+        tgen_action_bar.setStyleSheet(
+            "QFrame { background-color: #f3f4f6; "
+            "border-top: 1px solid #e5e7eb; border-radius: 0; }"
+        )
+        action_button_layout = QHBoxLayout(tgen_action_bar)
         action_button_layout.setAlignment(Qt.AlignLeft)
-        # Unified with streams action bar: spacing=6, margins=(0,2,0,2)
-        # so the two rows look like siblings rather than cousins.
+        # Unified with streams action bar: spacing=6, margins=(6,4,6,4)
+        # inside the bordered footer.
         action_button_layout.setSpacing(6)
-        action_button_layout.setContentsMargins(0, 2, 0, 2)
+        action_button_layout.setContentsMargins(6, 4, 6, 4)
 
         # TGEN action buttons — identical to BTN_BASE in stream_control.py
         # (including the :disabled rule that was missing before, so a
@@ -250,7 +260,7 @@ class TrafficGenClientServerSection():
 
         # Stretch to align left (buttons stay on left, space on right)
         action_button_layout.addStretch(1)
-        layout.addLayout(action_button_layout)
+        layout.addWidget(tgen_action_bar)
 
         # Finalize section
         self.server_group.setLayout(layout)
