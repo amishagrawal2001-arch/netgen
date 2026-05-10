@@ -13,8 +13,8 @@ logging.getLogger('requests').setLevel(logging.WARNING)
 logger = logging.getLogger(__name__)
 
 from PyQt5.QtWidgets import (
-    QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QSplitter,
-    QMenu, QAction, QApplication, QToolButton
+    QMainWindow, QWidget, QVBoxLayout, QTabWidget, QSplitter,
+    QMenu, QAction, QApplication
 )
 
 from PyQt5 import QtCore
@@ -92,18 +92,10 @@ class TrafficGeneratorClient(
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
         self.main_layout = QVBoxLayout(self.central_widget)
-        self.main_layout.setContentsMargins(0, 0, 0, 0)
-        self.main_layout.setSpacing(0)
 
         self.setup_menu_bar()
 
-        # In-window top strip with the help button right-aligned. This is the
-        # always-visible entry point — on macOS the QMenuBar is moved to the
-        # OS-managed bar at the top of the screen, where setCornerWidget(...)
-        # doesn't render. The strip below sits inside the window itself so
-        # the help button is always reachable regardless of platform.
-        self._setup_top_strip()
-        
+
         # Setup AI menu (if available)
         try:
             from traffic_client.ai_menu_actions import TrafficGenClientAIMenuActions
@@ -749,10 +741,9 @@ class TrafficGeneratorClient(
         dpdk_menu.addAction(dpdk_load_modules_action)
 
         # Help menu — guides + about
-        # NOTE: on macOS, a menu literally named "Help" gets absorbed by the
-        # native Help menu and user-added items can be hard to spot. The
-        # corner-widget button below is the primary, always-visible entry
-        # point. The menu is kept for keyboard navigation and other platforms.
+        # NOTE: on macOS, a menu literally named "Help" gets absorbed into the
+        # OS-managed Help menu (alongside the search box). The action stays
+        # accessible via F1 — see the explicit self.addAction below.
         help_menu = QMenu("&Help", self)
         menu_bar.addMenu(help_menu)
         help_menu.setToolTipsVisible(True)
@@ -768,60 +759,6 @@ class TrafficGeneratorClient(
         # Make F1 accept the shortcut even when the Help menu is hidden
         # (macOS often absorbs the menu, but the action stays connected).
         self.addAction(dpdk_guide_action)
-
-        # Help button lives in the in-window top strip set up by
-        # _setup_top_strip() in __init__. We don't also mount it via
-        # menu_bar.setCornerWidget(...) because when the menubar renders
-        # inside the window (Linux/Windows, or macOS with
-        # setNativeMenuBar(False)) we'd get two stacked '?' buttons.
-
-    def _make_help_button(self):
-        """Build the round '?' help button used in two places (menubar
-        corner + in-window top strip)."""
-        btn = QToolButton(self)
-        btn.setText("?")
-        btn.setToolTip(
-            "DPDK Traffic Blast Workflow — quick guide to enabling DPDK,\n"
-            "picking TX cores, and verifying line-rate scaling.  (F1)"
-        )
-        btn.setCursor(Qt.PointingHandCursor)
-        btn.setAutoRaise(False)
-        btn.setFixedSize(26, 26)
-        btn.setStyleSheet(
-            "QToolButton {"
-            "  border: 1px solid #93c5fd;"
-            "  border-radius: 13px;"
-            "  background: #eff6ff;"
-            "  color: #1d4ed8;"
-            "  font-weight: 700;"
-            "  font-size: 14px;"
-            "  padding: 0px;"
-            "}"
-            "QToolButton:hover { background: #dbeafe; border-color: #3b82f6; }"
-            "QToolButton:pressed { background: #bfdbfe; }"
-        )
-        btn.clicked.connect(self.show_dpdk_workflow_guide)
-        return btn
-
-    def _setup_top_strip(self):
-        """In-window top strip holding the always-visible help button.
-        Sits just under the menubar (or under the title bar on macOS,
-        where the menubar lives in the system bar)."""
-        strip = QWidget(self.central_widget)
-        strip.setObjectName("topStrip")
-        strip.setStyleSheet(
-            "#topStrip {"
-            "  background: #ffffff;"
-            "  border-bottom: 1px solid #e5e7eb;"
-            "}"
-        )
-        row = QHBoxLayout(strip)
-        row.setContentsMargins(8, 4, 10, 4)
-        row.setSpacing(6)
-        row.addStretch(1)
-        row.addWidget(self._make_help_button())
-        strip.setFixedHeight(34)
-        self.main_layout.addWidget(strip)
 
     def show_dpdk_workflow_guide(self):
         """Open the DPDK Workflow Guide dialog from the Help menu."""
