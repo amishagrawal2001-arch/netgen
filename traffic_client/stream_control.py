@@ -54,44 +54,50 @@ class TrafficGenClientStreamControl:
         header.setDefaultSectionSize(25)  # Header height
         header.setHighlightSections(False)  # Don't highlight header sections on click
 
-        # Professional styling with muted color scheme
+        # Stream table styling — bumped for visibility, matches the
+        # palette used in the stats dock and server pane:
+        # - body 11px → 13px, padding 3 → 5/8 (more breathing room)
+        # - selection blue brightened (#5b7fa8 → #2563eb) so the active
+        #   row pops on screenshots / projector demos
+        # - header bg/contrast strengthened
         self.stream_table.setStyleSheet("""
             QTableWidget {
                 background-color: #ffffff;
-                alternate-background-color: #f7f8fa;
-                border: 1px solid #d1d5db;
+                alternate-background-color: #f5f7fa;
+                border: 1px solid #cbd5e1;
                 border-radius: 4px;
-                font-size: 11px;
+                font-size: 13px;
                 outline: none;
-                color: #374151;
+                color: #111827;
                 gridline-color: #e5e7eb;
             }
             QTableWidget::item {
-                padding: 3px;
+                padding: 5px 8px;
                 border: none;
             }
             QTableWidget::item:selected {
-                background-color: #5b7fa8;
+                background-color: #2563eb;
                 color: #ffffff;
             }
             QTableWidget::item:hover:!selected {
-                background-color: #f0f2f5;
+                background-color: #eef2f7;
             }
             QTableWidget::item:selected:hover {
-                background-color: #4a6b8a;
+                background-color: #1d4ed8;
             }
             QHeaderView::section {
-                background-color: #f3f4f6;
-                padding: 6px 6px;
-                border: 1px solid #d1d5db;
+                background-color: #e5e7eb;
+                padding: 8px 10px;
+                border: 1px solid #cbd5e1;
                 border-left: none;
                 border-top: none;
-                font-weight: 600;
-                font-size: 11px;
-                color: #4b5563;
+                font-weight: 700;
+                font-size: 12px;
+                color: #1f2937;
+                letter-spacing: 0.3px;
             }
             QHeaderView::section:first {
-                border-left: 1px solid #d1d5db;
+                border-left: 1px solid #cbd5e1;
             }
         """)
 
@@ -106,8 +112,8 @@ class TrafficGenClientStreamControl:
         )
         self._stream_empty_label.setAlignment(Qt.AlignCenter)
         self._stream_empty_label.setStyleSheet(
-            "QLabel { color: #6b7280; font-size: 12px; padding: 24px; "
-            "background-color: transparent; }"
+            "QLabel { color: #4b5563; font-size: 14px; padding: 32px; "
+            "font-weight: 500; background-color: transparent; }"
         )
         self._stream_empty_label.hide()
         # Reposition the overlay whenever the viewport resizes
