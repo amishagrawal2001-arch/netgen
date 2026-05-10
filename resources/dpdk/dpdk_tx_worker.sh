@@ -88,9 +88,58 @@ err() { echo -e "\033[1;31m[err]\033[0m   $*" >&2; }
 if [[ "$DO_INSTALL_DEPS" == "1" ]]; then
   if command -v apt-get >/dev/null 2>&1; then
     log "Installing build deps (apt)…"
-    sudo apt-get update -y
-    sudo apt-get install -y build-essential meson ninja-build pkg-config \
-                            libnuma-dev libelf-dev libpcap-dev
+    
+    # Retry logic for apt-get update (network issues)
+    MAX_RETRIES=3
+    RETRY_COUNT=0
+    APT_UPDATE_SUCCESS=0
+    
+    while [[ $RETRY_COUNT -lt $MAX_RETRIES ]]; do
+      log "Attempting apt-get update (attempt $((RETRY_COUNT + 1))/$MAX_RETRIES)..."
+      
+      # Try with timeout - Contents file errors are OK (they're optional metadata)
+      UPDATE_OUTPUT=$(sudo apt-get update -y --option Acquire::http::Timeout=30 --option Acquire::ftp::Timeout=30 2>&1)
+      UPDATE_EXIT=$?
+      
+      # Check if update succeeded (even with Contents errors)
+      if echo "$UPDATE_OUTPUT" | grep -q "Reading package lists"; then
+        log "Package lists updated successfully"
+        # Filter out Contents errors from output (they're harmless)
+        echo "$UPDATE_OUTPUT" | grep -v "Contents.*Connection timed out" || true
+        APT_UPDATE_SUCCESS=1
+        break
+      fi
+      
+      # If exit code is 0 but no "Reading package lists", might still be OK
+      if [[ $UPDATE_EXIT -eq 0 ]]; then
+        log "apt-get update completed (some errors may be present, but continuing)"
+        APT_UPDATE_SUCCESS=1
+        break
+      fi
+      
+      RETRY_COUNT=$((RETRY_COUNT + 1))
+      if [[ $RETRY_COUNT -lt $MAX_RETRIES ]]; then
+        warn "Update failed, retrying in 5 seconds..."
+        sleep 5
+      fi
+    done
+    
+    if [[ $APT_UPDATE_SUCCESS -eq 0 ]]; then
+      warn "apt-get update failed after $MAX_RETRIES attempts"
+      warn "Trying to continue anyway (package lists may be stale)..."
+    fi
+    
+    # Install packages (ignore update errors if packages are available)
+    log "Installing build dependencies..."
+    sudo apt-get install -y --option Acquire::http::Timeout=30 --option Acquire::ftp::Timeout=30 \
+                            build-essential meson ninja-build pkg-config \
+                            libnuma-dev libelf-dev libpcap-dev || {
+      err "Package installation failed. You may need to:"
+      err "  1. Check network connectivity"
+      err "  2. Try a different Ubuntu mirror"
+      err "  3. Manually install: build-essential meson ninja-build pkg-config libnuma-dev libelf-dev libpcap-dev"
+      exit 1
+    }
   elif command -v dnf >/dev/null 2>&1; then
     log "Installing build deps (dnf)…"
     sudo dnf install -y @development-tools meson ninja-build pkgconf-pkg-config \
@@ -222,10 +271,22 @@ int main(int argc, char **argv){
         rte_exit(EXIT_FAILURE, "No DPDK ports.\n");
 
     struct rte_eth_dev_info dev_info;
-    rte_eth_dev_info_get(port_id, &dev_info);
+    int dev_info_rc = rte_eth_dev_info_get(port_id, &dev_info);
+    if (dev_info_rc != 0) {
+        rte_exit(EXIT_FAILURE, "rte_eth_dev_info_get failed: %d\n", dev_info_rc);
+    }
 
     // Enable HW checksum offloads if present
-    uint64_t want_tx_off = DEV_TX_OFFLOAD_IPV4_CKSUM | (no_udp_csum ? 0 : DEV_TX_OFFLOAD_UDP_CKSUM);
+    // Use RTE_ETH_TX_OFFLOAD_* for DPDK 21.11+ (backward compatible with older names)
+    #ifdef RTE_ETH_TX_OFFLOAD_IPV4_CKSUM
+        uint64_t want_tx_off = RTE_ETH_TX_OFFLOAD_IPV4_CKSUM | (no_udp_csum ? 0 : RTE_ETH_TX_OFFLOAD_UDP_CKSUM);
+        #define TX_OFFLOAD_IPV4_CKSUM RTE_ETH_TX_OFFLOAD_IPV4_CKSUM
+        #define TX_OFFLOAD_UDP_CKSUM RTE_ETH_TX_OFFLOAD_UDP_CKSUM
+    #else
+        uint64_t want_tx_off = DEV_TX_OFFLOAD_IPV4_CKSUM | (no_udp_csum ? 0 : DEV_TX_OFFLOAD_UDP_CKSUM);
+        #define TX_OFFLOAD_IPV4_CKSUM DEV_TX_OFFLOAD_IPV4_CKSUM
+        #define TX_OFFLOAD_UDP_CKSUM DEV_TX_OFFLOAD_UDP_CKSUM
+    #endif
     uint64_t tx_off      = dev_info.tx_offload_capa & want_tx_off;
 
     struct rte_eth_conf port_conf;
@@ -294,13 +355,13 @@ int main(int argc, char **argv){
     udp->dgram_len = rte_cpu_to_be_16(l4_len + payload_len);
 
     // Checksums (template). If HW offload, leave zero and set mbuf flags per packet.
-    if (tx_off & DEV_TX_OFFLOAD_IPV4_CKSUM) ip->hdr_checksum = 0; else ip->hdr_checksum = csum_ip4(ip);
+    if (tx_off & TX_OFFLOAD_IPV4_CKSUM) ip->hdr_checksum = 0; else ip->hdr_checksum = csum_ip4(ip);
     if (no_udp_csum) {
         udp->dgram_cksum = 0;
         // ensure we DO NOT set UDP_CKSUM offload in mbuf when no_udp_csum=1
-        tx_off &= ~DEV_TX_OFFLOAD_UDP_CKSUM;
+        tx_off &= ~TX_OFFLOAD_UDP_CKSUM;
     } else {
-        if (tx_off & DEV_TX_OFFLOAD_UDP_CKSUM) udp->dgram_cksum = 0;
+        if (tx_off & TX_OFFLOAD_UDP_CKSUM) udp->dgram_cksum = 0;
         else udp->dgram_cksum = csum_udp4(ip, udp);
     }
 
@@ -350,11 +411,11 @@ int main(int argc, char **argv){
                 if ((uint32_t)n < payload_len) memset(pl + n, 0, payload_len - (uint32_t)n);
             }
 
-            if (tx_off & DEV_TX_OFFLOAD_IPV4_CKSUM) {
+            if (tx_off & TX_OFFLOAD_IPV4_CKSUM) {
                 m->ol_flags |= RTE_MBUF_F_TX_IPV4 | RTE_MBUF_F_TX_IP_CKSUM;
                 m->l2_len = l2_len; m->l3_len = l3_len; m->l4_len = l4_len;
             }
-            if ((tx_off & DEV_TX_OFFLOAD_UDP_CKSUM) && !no_udp_csum) {
+            if ((tx_off & TX_OFFLOAD_UDP_CKSUM) && !no_udp_csum) {
                 m->ol_flags |= RTE_MBUF_F_TX_UDP_CKSUM;
                 m->l2_len = l2_len; m->l3_len = l3_len; m->l4_len = l4_len;
             }
@@ -411,16 +472,35 @@ EOF_M
 fi
 
 # ---------- locate libdpdk.pc ----------
+# Prioritize /usr/local installation (newly built DPDK) over system packages
+if [[ -z "${PKG_CONFIG_PATH:-}" ]]; then
+  export PKG_CONFIG_PATH="/usr/local/lib/x86_64-linux-gnu/pkgconfig:/usr/local/lib/pkgconfig"
+else
+  export PKG_CONFIG_PATH="/usr/local/lib/x86_64-linux-gnu/pkgconfig:/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH}"
+fi
+
 FOUND_PC="0"
 if pkg-config --exists libdpdk || pkg-config --exists dpdk; then
   FOUND_PC="1"
+  # Verify we're using the correct DPDK installation
+  DPDK_LIBDIR=$(pkg-config --variable=libdir libdpdk 2>/dev/null || echo "")
+  if [[ "$DPDK_LIBDIR" == "/usr/lib/x86_64-linux-gnu" ]]; then
+    # System DPDK found, but we want /usr/local - try to override
+    if [[ -f "/usr/local/lib/x86_64-linux-gnu/pkgconfig/libdpdk.pc" ]]; then
+      log "Found system DPDK, but prioritizing /usr/local installation"
+      export PKG_CONFIG_PATH="/usr/local/lib/x86_64-linux-gnu/pkgconfig:/usr/local/lib/pkgconfig"
+      if pkg-config --exists libdpdk; then
+        FOUND_PC="1"
+      fi
+    fi
+  fi
 else
   if [[ -n "$DPDK_PC_DIR" ]]; then
-    export PKG_CONFIG_PATH="$DPDK_PC_DIR:$PKG_CONFIG_PATH"
+    export PKG_CONFIG_PATH="$DPDK_PC_DIR:${PKG_CONFIG_PATH}"
   elif [[ -n "$DPDK_TREE" ]]; then
     PC=$(find "$DPDK_TREE"/build -name 'libdpdk.pc' -print -quit || true)
     if [[ -n "$PC" ]]; then
-      export PKG_CONFIG_PATH="$(dirname "$PC"):$PKG_CONFIG_PATH"
+      export PKG_CONFIG_PATH="$(dirname "$PC"):${PKG_CONFIG_PATH}"
     fi
   fi
   if pkg-config --exists libdpdk || pkg-config --exists dpdk; then
@@ -430,12 +510,13 @@ fi
 [[ "$FOUND_PC" == "1" ]] || { err "Could not locate libdpdk via pkg-config. Use --dpdk-tree or --dpdk-pc-dir."; exit 1; }
 
 # ---------- build ----------
+# Always use --wipe for reconfigure to ensure clean state when PKG_CONFIG_PATH changes
 if [[ ! -d build ]]; then
   log "Meson setup (prefix=$PREFIX)…"
   meson setup build --prefix "$PREFIX"
 else
-  log "Meson reconfigure…"
-  meson setup build --prefix "$PREFIX" --reconfigure
+  log "Meson reconfigure (with --wipe to clear cache)…"
+  meson setup build --prefix "$PREFIX" --wipe
 fi
 
 log "Building…"
