@@ -346,7 +346,18 @@ class StatisticsFetchWorker(QThread):
 class TrafficGenClientStatisticsSection():
     def setup_traffic_statistics_section(self):
         self.statistics_group = QGroupBox("Traffic Statistics")
+        # Pull the QGroupBox's internal padding right in. Default Qt
+        # leaves ~16px on each side which is the "gray gap" the user
+        # sees around the Clear Stats button — even with a tight
+        # button_layout, the parent group still pads its contents.
+        # Trim to almost-flush so all spare height inside the dock
+        # goes to the tables, not to chrome.
+        self.statistics_group.setStyleSheet(
+            "QGroupBox { margin: 0; padding: 0 4px 2px 4px; border: none; }"
+        )
         layout = QVBoxLayout()
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(2)
 
         # Create tab widget for statistics
         self.statistics_tab_widget = QTabWidget()
