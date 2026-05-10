@@ -177,8 +177,11 @@ class TrafficGenClientStreamControl:
             "QPushButton:pressed { background-color: #dbeafe; }"
         )
 
-        # 34x30 with 18px icons — aligns with the TGEN section's icon row.
-        BTN_W, BTN_H, ICON_PX = 34, 30, 18
+        # Was 34×30 with 18px icons; pulled down to 28×24 with 14px
+        # icons so the action row's vertical footprint shrinks and the
+        # streams tab feels lighter. Aligns with the TGEN section's
+        # icon row at the matching new size.
+        BTN_W, BTN_H, ICON_PX = 28, 24, 14
 
         def _action_btn(icon_name, tooltip, slot, style=None):
             b = QPushButton()
