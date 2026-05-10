@@ -439,8 +439,8 @@
     <a class="btn btn-primary" href="#quickstart">
       Get started →
     </a>
-    <a class="btn btn-secondary" href="https://github.com/DAY-Advisor/NetGenI">
-      ★ Star on GitHub
+    <a class="btn btn-secondary" href="#api">
+      View the API
     </a>
   </div>
 </section>
@@ -642,7 +642,7 @@
 <!-- Comparison -->
 <section class="block" id="compare">
   <h2>How it stacks up.</h2>
-  <p>Honest comparison vs. the commercial testers and other open-source generators in the same space.</p>
+  <p>Honest comparison vs. the commercial testers and other software generators in the same space.</p>
 
   <table class="compare">
     <thead>
@@ -706,7 +706,7 @@
       </tr>
       <tr>
         <td><strong>License</strong></td>
-        <td class="us">Open source</td>
+        <td class="us">Commercial</td>
         <td>Open source (Cisco)</td>
         <td>Open source</td>
         <td>Commercial (&gt;&nbsp;$200K)</td>
@@ -911,19 +911,22 @@ curl -X POST http://&lt;server&gt;:5050/api/rfc2544/start \
 
   <div class="faq">
     <details>
-      <summary>Is this really free, or is there a "pro" version I'll eventually need?</summary>
-      <p>Genuinely free, single-tier open source. The repository contains
-         everything: server, client, DPDK tx_worker, install scripts. No
-         license keys, no usage caps, no "enterprise edition." If you
-         improve it, send a PR; if you find a bug, file an issue.</p>
+      <summary>How do I get a license or evaluation copy?</summary>
+      <p>Contact us through the GitHub issues page to discuss licensing
+         and evaluation. Netgen is a commercial product; pricing,
+         deployment scope, and support tiers depend on use case
+         (single-lab, multi-site, CI integration). Request a demo and
+         we'll work out what makes sense for your environment.</p>
     </details>
     <details>
       <summary>How does it compare to TRex?</summary>
-      <p>TRex is older, more mature, and has bigger community + Cisco
-         backing. Netgen has a cleaner desktop GUI, an embedded REST
-         API any laptop can curl, and built-in RFC 2544 wizard. Both
-         hit line rate on the same NICs. Pick TRex for automation-first
-         lab workflows; pick Netgen if your team is happier in a UI.</p>
+      <p>TRex is older, more mature, with strong Cisco backing.
+         Netgen has a cleaner desktop GUI, an embedded REST API any
+         laptop can curl, and a built-in RFC 2544 wizard. Both hit
+         line rate on the same NICs. Pick TRex for automation-first
+         workflows on a tight budget; pick Netgen if your team wants
+         a polished UI, embedded documentation, and a supported
+         product with a single vendor of record.</p>
     </details>
     <details>
       <summary>Will it run on a VM?</summary>
@@ -975,11 +978,12 @@ curl -X POST http://&lt;server&gt;:5050/api/rfc2544/start \
          100G).</p>
     </details>
     <details>
-      <summary>How do I contribute?</summary>
-      <p>Fork on GitHub, work on a feature branch, send a PR. Issues
-         are open for both bug reports and feature requests. We're
-         especially looking for help on the in-progress items —
-         BlueField-3 DPU port, headless mode, web client.</p>
+      <summary>Is there a trial or evaluation period?</summary>
+      <p>Yes — reach out via the GitHub issues page and we'll set up an
+         evaluation install with full functionality for a fixed window.
+         Bring your own hardware (any DPDK-supported NIC) and we'll
+         help with the install + first benchmark run. Feedback from
+         evaluation customers feeds the roadmap.</p>
     </details>
   </div>
 </section>
@@ -987,23 +991,24 @@ curl -X POST http://&lt;server&gt;:5050/api/rfc2544/start \
 <!-- Bottom CTA -->
 <section class="cta-bottom">
   <h2>Try it on your hardware.</h2>
-  <p>Open source, single repository, no license keys. Install in five minutes on any Ubuntu box with a DPDK-supported NIC.</p>
+  <p>Request an evaluation install and run it against your DUTs in
+     a single afternoon. Any DPDK-supported NIC, any modern Ubuntu host.</p>
   <div class="ctas">
-    <a class="btn btn-primary" href="https://github.com/DAY-Advisor/NetGenI">
-      View on GitHub →
+    <a class="btn btn-primary" href="https://github.com/DAY-Advisor/NetGenI/issues">
+      Request a demo →
     </a>
-    <a class="btn btn-secondary" href="https://github.com/DAY-Advisor/NetGenI/blob/main/README.md">
-      Read the docs
+    <a class="btn btn-secondary" href="#api">
+      Read the API
     </a>
   </div>
 </section>
 
 <footer>
   <p>
-    Netgen is open-source software. ·
-    <a href="https://github.com/DAY-Advisor/NetGenI">GitHub</a> ·
-    <a href="https://github.com/DAY-Advisor/NetGenI/blob/main/LICENSE">License</a> ·
-    <a href="https://github.com/DAY-Advisor/NetGenI/issues">Report an issue</a>
+    &copy; Netgen. All rights reserved. ·
+    <a href="https://github.com/DAY-Advisor/NetGenI/issues">Contact</a> ·
+    <a href="#faq">FAQ</a> ·
+    <a href="#api">API</a>
   </p>
 </footer>
 
