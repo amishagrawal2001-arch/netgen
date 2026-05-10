@@ -769,11 +769,11 @@ class TrafficGeneratorClient(
         # (macOS often absorbs the menu, but the action stays connected).
         self.addAction(dpdk_guide_action)
 
-        # Also mount on the menubar's top-right corner (rendered on Linux /
-        # Windows where the menubar lives inside the window). On macOS the
-        # OS-managed menubar at the top of the screen ignores this — the
-        # in-window top-strip button below is the visible entry point there.
-        menu_bar.setCornerWidget(self._make_help_button(), Qt.TopRightCorner)
+        # Help button lives in the in-window top strip set up by
+        # _setup_top_strip() in __init__. We don't also mount it via
+        # menu_bar.setCornerWidget(...) because when the menubar renders
+        # inside the window (Linux/Windows, or macOS with
+        # setNativeMenuBar(False)) we'd get two stacked '?' buttons.
 
     def _make_help_button(self):
         """Build the round '?' help button used in two places (menubar
