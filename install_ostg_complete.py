@@ -12,6 +12,7 @@ import shutil
 import json
 import argparse
 import logging
+import shlex
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -52,13 +53,27 @@ class Colors:
     NC = '\033[0m'  # No Color
 
 class NetgenInstaller:
-    def __init__(self, remote_host: Optional[str] = None, remote_user: str = "root", remote_pass: Optional[str] = None):
+    def __init__(
+        self,
+        remote_host: Optional[str] = None,
+        remote_user: str = "root",
+        remote_pass: Optional[str] = None,
+        install_dpdk: bool = True,
+        skip_dpdk_build: bool = False,
+    ):
         self.remote_host = remote_host
         self.remote_user = remote_user
         self.remote_pass = remote_pass
         self.remote_install = remote_host is not None
         self.ostg_server_active = False
         self.docker_frr_available = False
+        # DPDK runtime install (libraries + tx_worker binary). Default ON;
+        # disable with --no-dpdk for hosts that won't generate traffic
+        # (e.g. devbox-only installs). install_dpdk.sh respects SKIP_BUILD=1
+        # to deploy only the apt prereqs without compiling DPDK + tx_worker —
+        # useful when DPDK is already installed system-wide.
+        self.install_dpdk = install_dpdk
+        self.skip_dpdk_build = skip_dpdk_build
         self.setup_logging()
         self.system_info = self._detect_system()
         
@@ -616,7 +631,101 @@ class NetgenInstaller:
             )
 
         self.log(f"✓ {PRODUCT_NAME} installed successfully")
-        
+
+    def install_dpdk_runtime(self):
+        """Install DPDK runtime: apt prereqs + (optionally) build DPDK and tx_worker.
+
+        Runs the same install_dpdk.sh that the /admin portal's "Install DPDK"
+        button kicks off, just from the install path. Skipped entirely when
+        --no-dpdk was passed; build step skipped (apt-only) when
+        --skip-dpdk-build was passed.
+
+        Tolerant of failures — DPDK build can take 15+ min and depends on
+        kernel headers and libibverbs versions. If install_dpdk.sh exits
+        non-zero, we log a clear WARNING and continue. The /admin portal's
+        "Install DPDK" button remains as the operator's manual recourse.
+        """
+        if not self.install_dpdk:
+            self.log("DPDK install skipped (--no-dpdk).")
+            return
+
+        script = f"{INSTALL_DIR}/resources/dpdk/install_dpdk.sh"
+
+        # Verify the script exists on the target — install_ostg() should have
+        # already deployed it, but guard against partial installs.
+        check = self.run_command(
+            f"test -x {shlex.quote(script)} && echo OK || echo MISSING",
+            check=False, capture_output=True,
+        )
+        out = (check.stdout or "") if hasattr(check, "stdout") else ""
+        if "OK" not in out:
+            self.log(
+                f"DPDK install skipped: {script} not deployed. "
+                f"Re-run after fixing install_ostg() or use the /admin portal.",
+                "WARNING",
+            )
+            return
+
+        if self.skip_dpdk_build:
+            self.log("Installing DPDK apt prerequisites only (--skip-dpdk-build)...")
+            env_prefix = "AUTO_MODE=1 SKIP_BUILD=1"
+            phase_label = "DPDK prereqs"
+            timeout_sec = 600  # 10 min for apt
+        else:
+            self.log("Installing DPDK runtime (apt prereqs + DPDK build + tx_worker)...")
+            self.log("This will take 10-20 minutes on a fresh box. Tail progress with:")
+            self.log(f"  ssh root@{self.remote_host or '<host>'} 'tail -f /var/log/netgen-install-dpdk.log'")
+            env_prefix = "AUTO_MODE=1"
+            phase_label = "DPDK runtime"
+            timeout_sec = 1800  # 30 min cap
+
+        # Run the script with stdout+stderr → log file on the target. We use
+        # `script -qc ...` rather than > redirection so install_dpdk.sh's
+        # color/progress output flushes line-by-line into the log even when
+        # not on a TTY. AUTO_MODE=1 makes prompts non-interactive.
+        log_path = "/var/log/netgen-install-dpdk.log"
+        cmd = (
+            f"{env_prefix} bash {shlex.quote(script)} --auto "
+            f"> {shlex.quote(log_path)} 2>&1"
+        )
+        rc = self.run_command(cmd, check=False, timeout=timeout_sec)
+        rc_code = rc.returncode if hasattr(rc, "returncode") else 1
+
+        if rc_code == 0:
+            self.log(f"✓ {phase_label} install completed (log: {log_path})")
+            # Quick sanity check: confirm tx_worker was built (only if we
+            # asked for the build).
+            if not self.skip_dpdk_build:
+                tx_bin = f"{INSTALL_DIR}/resources/dpdk/tx_worker/build/tx_worker"
+                check = self.run_command(
+                    f"test -x {shlex.quote(tx_bin)} && echo OK || echo MISSING",
+                    check=False, capture_output=True,
+                )
+                out = (check.stdout or "") if hasattr(check, "stdout") else ""
+                if "OK" in out:
+                    self.log(f"✓ tx_worker binary present at {tx_bin}")
+                else:
+                    self.log(
+                        f"DPDK install reported success but tx_worker binary "
+                        f"missing at {tx_bin}. Check {log_path} for details.",
+                        "WARNING",
+                    )
+        else:
+            self.log(
+                f"DPDK install exited rc={rc_code}. Continuing with the rest "
+                f"of the install — netgen-server will start fine without DPDK; "
+                f"streams that need it will fall back to the Scapy/kernel path.",
+                "WARNING",
+            )
+            self.log(
+                f"Diagnose with:  ssh root@{self.remote_host or '<host>'} 'tail -200 {log_path}'",
+                "WARNING",
+            )
+            self.log(
+                f"Or retry from the /admin portal once netgen-server is up.",
+                "WARNING",
+            )
+
     def install_ai_dependencies(self):
         """Install AI/ML dependencies for AI-powered features"""
         self.log("Installing AI dependencies...")
@@ -1102,6 +1211,11 @@ WantedBy=timers.target
         self.install_python_dependencies()
         self.install_docker()
         self.install_ostg()
+        # DPDK runtime — apt prereqs + build + tx_worker. After install_ostg
+        # so resources/dpdk/install_dpdk.sh is already deployed. Tolerant of
+        # failures: if DPDK build fails, netgen-server still runs and the
+        # /admin portal exposes a manual retry button.
+        self.install_dpdk_runtime()
         self.install_ai_dependencies()
         self.install_ollama()
         self.setup_docker_frr()
@@ -1125,6 +1239,11 @@ WantedBy=timers.target
         self.install_python_dependencies()
         self.install_docker()
         self.install_ostg()
+        # DPDK runtime — apt prereqs + build + tx_worker. After install_ostg
+        # so resources/dpdk/install_dpdk.sh is already deployed. Tolerant of
+        # failures: if DPDK build fails, netgen-server still runs and the
+        # /admin portal exposes a manual retry button.
+        self.install_dpdk_runtime()
         self.install_ai_dependencies()
         self.install_ollama()
         self.setup_docker_frr()
@@ -1200,6 +1319,25 @@ def main():
     parser.add_argument("-H", "--host", help="Remote host for installation")
     parser.add_argument("-u", "--user", default="root", help="Remote user (default: root)")
     parser.add_argument("-p", "--password", help="Remote password")
+    parser.add_argument(
+        "--no-dpdk",
+        dest="install_dpdk",
+        action="store_false",
+        default=True,
+        help="Skip the DPDK runtime install step entirely. Default is to "
+             "install it. Pass this on hosts that won't generate traffic "
+             "(devbox-only, no DPDK-capable NIC).",
+    )
+    parser.add_argument(
+        "--skip-dpdk-build",
+        action="store_true",
+        default=False,
+        help="Install DPDK apt prerequisites only — don't compile DPDK or "
+             "tx_worker. Useful when DPDK is already installed system-wide "
+             "and you just want netgen-server's apt deps in place. The "
+             "tx_worker binary won't be built; you can build it later from "
+             "the /admin portal.",
+    )
 
     args = parser.parse_args()
 
@@ -1211,6 +1349,8 @@ def main():
         remote_host=args.host,
         remote_user=args.user,
         remote_pass=args.password,
+        install_dpdk=args.install_dpdk,
+        skip_dpdk_build=args.skip_dpdk_build,
     )
 
     installer.run()
