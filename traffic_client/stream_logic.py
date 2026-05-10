@@ -105,6 +105,42 @@ class _HttpGetWorker(QThread):
             self.error = e
 
 
+class _PcapUploadWorker(QThread):
+    """One-shot QThread for streaming PCAP file uploads.
+
+    Same pattern as _TrafficPostWorker / _HttpGetWorker but for
+    multipart file uploads. Opens the file inside run() (i.e. on the
+    worker thread) so the local file handle is closed before we read
+    the response back, and the UI thread never owns the descriptor.
+
+    Previously upload_pcap_to_server did a synchronous
+    requests.post(files=..., timeout=15) on the UI thread, so the app
+    froze for the full upload duration whenever the user started a
+    PCAP-replay stream — which can be tens of seconds for moderately
+    large captures over a slow link, and the 15s socket timeout
+    silently truncated bigger ones.
+    """
+
+    def __init__(self, url, local_path, timeout, parent=None):
+        super().__init__(parent)
+        self._url = url
+        self._local_path = local_path
+        self._timeout = timeout
+        self.response = None
+        self.error = None
+
+    def run(self):
+        try:
+            filename = os.path.basename(self._local_path)
+            with open(self._local_path, "rb") as f:
+                files = {"file": (filename, f)}
+                self.response = requests.post(
+                    self._url, files=files, timeout=self._timeout
+                )
+        except Exception as e:
+            self.error = e
+
+
 class TrafficGenClientStreamLogic:
     # ---------- helpers ----------
 
@@ -1231,6 +1267,24 @@ class TrafficGenClientStreamLogic:
             if unknown_ports:
                 logger.info(f"Skipped stale/unknown ports (not in current UI): {sorted(unknown_ports)}")
 
+            # Reserve in-flight slots for every stream we're about to
+            # start, BEFORE sending. The toggle button's setDisabled
+            # alone isn't enough — a user could click a per-row Start
+            # button while Start All is mid-pump and double-fire on
+            # the same stream. Mirrors what start_stream does at the
+            # equivalent point in its own flow. Audit MED #8.
+            in_flight = self._streams_in_flight()
+            in_flight_added_here = []
+            for per_port in server_payload_map.values():
+                for items in per_port.values():
+                    for st, r in items:
+                        sid = st.get("stream_id")
+                        if sid and sid not in in_flight:
+                            in_flight.add(sid)
+                            in_flight_added_here.append(sid)
+                        if r is not None:
+                            self.update_stream_status(r, "yellow")
+
             # --- Send to servers & update UI ---
             for server_url, per_port in server_payload_map.items():
                 try:
@@ -1306,6 +1360,17 @@ class TrafficGenClientStreamLogic:
                 self.update_all_streams_toggle_ui()
 
         finally:
+            # Release the in-flight reservations made above. Done in
+            # `finally` so we always clear them even on exceptions; the
+            # alternative would leak the lock and prevent any further
+            # Start/Stop on those streams until the next session reload.
+            try:
+                if "in_flight_added_here" in locals():
+                    in_flight_set = self._streams_in_flight()
+                    for sid in in_flight_added_here:
+                        in_flight_set.discard(sid)
+            except Exception:
+                pass
             finish()
 
     def apply_stream(self):
@@ -1464,7 +1529,15 @@ class TrafficGenClientStreamLogic:
             tg_id = server.get("tg_id")
 
             for port_label, stream_list in self.streams.items():
-                if not str(port_label).startswith(f"TG {tg_id}"):
+                # Audit LOW #10: substring-match bug. The previous test
+                # `port_label.startswith(f"TG {tg_id}")` matches the wrong
+                # TG once IDs reach two digits — "TG 1 - …" startswith
+                # "TG 1" is True, but so is "TG 10 - …".startswith("TG 1").
+                # An apply targeting TG 1 would also send restart payloads
+                # to TG 10's port_labels. Use exact-equality on the parsed
+                # TG token instead.
+                tg_part = str(port_label).split(" - ", 1)[0].strip()
+                if tg_part != f"TG {tg_id}":
                     continue
 
                 # Separate running and stopped streams
@@ -1557,7 +1630,12 @@ class TrafficGenClientStreamLogic:
                         resp = self._post_traffic_async(
                             server_addr, "stop", stop_payload, timeout=15
                         )
-                        if resp.status_code == 200:
+                        # Audit MED #9: use resp.ok (200-299) instead of
+                        # `== 200`. A 202 Accepted or 204 No Content from
+                        # the server would otherwise be flagged as a
+                        # spurious failure here while every other call
+                        # site uses .ok.
+                        if resp.ok:
                             logger.info(f"Stopped {len(streams_to_stop)} stream(s) that were disabled on {port_label}")
                         else:
                             logger.error(f"Failed to stop disabled streams on {port_label}: {resp.status_code} - {resp.text[:200]}")
@@ -1588,7 +1666,8 @@ class TrafficGenClientStreamLogic:
                             {"port": port_label, "streams": running_streams},
                             timeout=8
                         )
-                        if resp.status_code == 200:
+                        # Same audit-MED #9 fix as the stop path above.
+                        if resp.ok:
                             logger.info(f"Applied updates and restarted {len(running_streams)} running stream(s) on {port_label}")
                             # Mark as running+enabled in memory and ensure interface is set
                             for s in running_streams:
@@ -1637,25 +1716,41 @@ class TrafficGenClientStreamLogic:
         except Exception as e:
             logger.error(f"Error sending stream update to server: {e}")
 
-    def upload_pcap_to_server(self, local_path, server_url):
-        """Upload a PCAP file to the server and return the server-side path or None."""
+    def upload_pcap_to_server(self, local_path, server_url, timeout=120):
+        """Upload a PCAP file to the server and return the server-side path or None.
+
+        Hits the UI freeze path when called from start_stream /
+        start_all_streams for PCAP-replay streams. Pumps a local Qt
+        event loop while a worker thread does the actual upload, so
+        the user keeps seeing live stats / chart while a 100MB PCAP
+        crawls up a slow link. Bumped the timeout from 15s → 120s by
+        default (large captures legitimately need it; the audit
+        flagged the 15s as way too tight).
+        """
         if not os.path.isfile(local_path):
             logger.error(f"PCAP file not found: {local_path}")
             return None
 
-        filename = os.path.basename(local_path)
         upload_url = f"{server_url}/api/pcap/upload"
+        loop = QEventLoop()
+        worker = _PcapUploadWorker(upload_url, local_path, timeout)
+        worker.finished.connect(loop.quit)
+        worker.start()
+        loop.exec_()
+        worker.wait()
+        worker.deleteLater()
 
+        if worker.error is not None:
+            logger.error(f"[UPLOAD] Exception uploading PCAP: {worker.error}")
+            return None
+        response = worker.response
+        if response is None or not response.ok:
+            sc = getattr(response, "status_code", "?")
+            body = getattr(response, "text", "")[:200] if response else ""
+            logger.error(f"[UPLOAD] Failed to upload PCAP: {sc} {body}")
+            return None
         try:
-            with open(local_path, "rb") as f:
-                files = {"file": (filename, f)}
-                response = requests.post(upload_url, files=files, timeout=15)
-            if response.ok:
-                data = response.json()
-                return data.get("filepath")
-            else:
-                logger.error(f"[UPLOAD] Failed to upload PCAP: {response.status_code} {response.text[:200]}")
-                return None
+            return response.json().get("filepath")
         except Exception as e:
-            logger.error(f"[UPLOAD] Exception uploading PCAP: {e}")
+            logger.error(f"[UPLOAD] Could not parse response JSON: {e}")
             return None

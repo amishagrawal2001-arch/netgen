@@ -598,8 +598,29 @@ class TrafficGenClientStreamControl:
         if not interface_item or not name_item:
             return
 
-        port = interface_item.text().strip()
+        # Resolve the row's port via the canonical normalizer + stream_id
+        # stash. The previous code did `self.streams.get(port, [])` with
+        # the raw cell text — which is the bare iface name like
+        # "ens5np0", never the canonical "TG 0 - Port: ens5np0" key. So
+        # the loop body never matched any stream, the model was never
+        # updated, and the inline-update POST never fired. Audit MED #7.
+        from traffic_client.stream_logic import find_port_key
         stream_name = name_item.text().strip()
+        stream_id = name_item.data(Qt.UserRole)
+        port = None
+        if stream_id:
+            for p, lst in (self.streams or {}).items():
+                if any(s.get("stream_id") == stream_id for s in lst):
+                    port = p
+                    break
+        if not port:
+            port = find_port_key(self.streams, interface_item.text().strip())
+        if not port:
+            logger.warning(
+                f"[ENABLED-TOGGLE] Could not resolve port for row={row} "
+                f"name={stream_name!r}; click ignored"
+            )
+            return
 
         if isinstance(value, str):
             new_enabled = value.strip().lower() in ("yes", "true", "1")
@@ -609,6 +630,11 @@ class TrafficGenClientStreamControl:
         for stream in self.streams.get(port, []):
             if stream.get("name") == stream_name or stream.get("protocol_selection", {}).get("name") == stream_name:
                 stream["enabled"] = new_enabled
+                # Keep protocol_selection.enabled in sync — the server's
+                # /traffic/start reads from there too, and a half-synced
+                # state was the cause of "Apply doesn't pick up the
+                # checkbox change" reports.
+                stream.setdefault("protocol_selection", {})["enabled"] = new_enabled
                 logger.info(f"Stream '{stream_name}' on {port} enabled set to {new_enabled}")
                 self.send_inline_update_to_server(port, stream)
                 if hasattr(self, "mark_stream_dirty"):
