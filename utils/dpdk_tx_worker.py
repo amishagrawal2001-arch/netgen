@@ -312,6 +312,30 @@ def run_stream(
     else:
         LOG.warning("[dpdk] Could not find DPDK library directory. LD_LIBRARY_PATH not set.")
 
+    # Pre-launch orphan sweep. If a previous tx_worker for this same
+    # stream_id is still alive (Start clicked twice without a successful
+    # Stop, server restart between Start and Stop, etc.), it would keep
+    # blasting alongside the new one. The new launcher only tracks its
+    # own Popen - the orphan is invisible. Result: switch sees 2x line
+    # rate, tracker only follows half, the per-stream rate display is
+    # 50% of reality. Catch it here before we Popen.
+    try:
+        _pat = f"--stream-id {stream_id}"
+        _check = subprocess.run(["pgrep", "-f", _pat], capture_output=True, text=True, timeout=3)
+        if _check.returncode == 0 and _check.stdout.strip():
+            _stale_pids = _check.stdout.strip().split()
+            LOG.warning(
+                "[dpdk] pre-launch: %d stale tx_worker(s) for stream_id=%s "
+                "(pids=%s) - terminating before launching new instance",
+                len(_stale_pids), stream_id, ",".join(_stale_pids),
+            )
+            subprocess.run(["pkill", "-TERM", "-f", _pat], capture_output=True, timeout=3)
+            import time as _t
+            _t.sleep(1.0)
+            subprocess.run(["pkill", "-KILL", "-f", _pat], capture_output=True, timeout=3)
+    except Exception as _e:
+        LOG.debug("[dpdk] pre-launch sweep for %s failed: %s", stream_id, _e)
+
     LOG.info("[dpdk] exec: %s", shlex.join(cmd))
     LOG.info("[dpdk] LD_LIBRARY_PATH=%s", child_env.get("LD_LIBRARY_PATH", "not set"))
     # start_new_session=True puts tx_worker in its own session/process group
