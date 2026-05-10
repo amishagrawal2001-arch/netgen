@@ -24,8 +24,14 @@ class TrafficGenClientStreamControl:
 
     def setup_stream_section(self, parent_widget):
         layout = QVBoxLayout(parent_widget)
-        layout.setContentsMargins(4, 4, 4, 4)  # Balanced padding to match left side (TGEN)
-        layout.setSpacing(10)  # Consistent spacing between elements
+        # Tight chrome — the user reported the action-button row felt
+        # like a separate window from the table. Cause was layered
+        # padding (tab pane border + 4px outer margins + 10px spacing
+        # + 8px button-row top margin = ~25px of gap). Pulled all of
+        # that flush so the table and the action row read as one
+        # continuous panel.
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(2)
 
         # --- Stream Table ---
         self.stream_table = QTableWidget()
@@ -72,8 +78,7 @@ class TrafficGenClientStreamControl:
             QTableWidget {
                 background-color: #ffffff;
                 alternate-background-color: #f5f7fa;
-                border: 1px solid #cbd5e1;
-                border-radius: 4px;
+                border: none;
                 font-size: 13px;
                 outline: none;
                 color: #111827;
@@ -137,7 +142,11 @@ class TrafficGenClientStreamControl:
         button_layout = QHBoxLayout()
         button_layout.setAlignment(Qt.AlignLeft)
         button_layout.setSpacing(6)
-        button_layout.setContentsMargins(0, 8, 0, 0)
+        # Was (0, 8, 0, 0) — 8px top gap + the parent layout's 10px
+        # spacing put the row 18px below the table. Now flush with a
+        # single 2px breather so the row reads as part of the same
+        # panel as the table above it.
+        button_layout.setContentsMargins(0, 2, 0, 2)
 
         # Universal button style — same as the TGEN section's _tgen_btn so
         # both rows visually match. Neutral white background, thin gray
