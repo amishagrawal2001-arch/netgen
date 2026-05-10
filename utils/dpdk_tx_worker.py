@@ -298,6 +298,10 @@ def run_stream(
 
     LOG.info("[dpdk] exec: %s", shlex.join(cmd))
     LOG.info("[dpdk] LD_LIBRARY_PATH=%s", child_env.get("LD_LIBRARY_PATH", "not set"))
+    # start_new_session=True puts tx_worker in its own session/process group
+    # so we can killpg() the entire group on shutdown — defensive against
+    # tx_worker spawning helper subprocesses that otherwise survive as
+    # orphans when their parent dies.
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -305,6 +309,7 @@ def run_stream(
         text=True,
         bufsize=1,
         env=child_env,
+        start_new_session=True,
     )
 
     # Parse "STAT ..." lines to sync StreamTracker
@@ -398,19 +403,64 @@ def run_stream(
         LOG.warning("[dpdk] stdout reader error: %s", e)
         error_lines.append(f"Error reading output: {e}")
     finally:
-        # Try to shutdown cleanly
+        # Two-stage shutdown:
+        #   1. SIGINT the known process group (graceful — tx_worker's
+        #      handler sets keep_running=0 and the workers drain).
+        #   2. If it doesn't exit in 3s, escalate to SIGKILL on the group.
+        # Then sweep any orphan tx_worker for the SAME stream_id that
+        # might have survived a previous launcher (e.g. server SIGKILL).
+        # Without the sweep, repeated start/stop cycles would leak
+        # tx_worker processes that keep blasting traffic after we're gone.
         if proc.poll() is None:
             try:
-                proc.send_signal(signal.SIGINT)
+                pgid = os.getpgid(proc.pid)
+            except Exception:
+                pgid = None
+            try:
+                if pgid is not None:
+                    os.killpg(pgid, signal.SIGINT)
+                else:
+                    proc.send_signal(signal.SIGINT)
                 try:
                     proc.wait(timeout=3.0)
                 except subprocess.TimeoutExpired:
-                    proc.kill()
-            except Exception:
+                    LOG.warning("[dpdk] tx_worker pid=%s did not exit on SIGINT, escalating to SIGKILL",
+                                proc.pid)
+                    try:
+                        if pgid is not None:
+                            os.killpg(pgid, signal.SIGKILL)
+                        else:
+                            proc.kill()
+                    except Exception:
+                        proc.kill()
+            except Exception as e:
+                LOG.warning("[dpdk] error during shutdown of pid=%s: %s", proc.pid, e)
                 try:
                     proc.kill()
                 except Exception:
                     pass
+
+        # Orphan reaper: any tx_worker that's still running with our
+        # stream_id is a leftover from a prior launcher we lost track of.
+        # SIGTERM first (lets DPDK release hugepages cleanly), SIGKILL
+        # 1s later as a backstop. Scoped by stream_id so we don't
+        # disturb other concurrent streams.
+        try:
+            sweep_pat = f"--stream-id {stream_id}"
+            r = subprocess.run(
+                ["pkill", "-TERM", "-f", sweep_pat],
+                capture_output=True, timeout=3,
+            )
+            if r.returncode == 0:
+                LOG.warning("[dpdk] reaped orphan tx_worker(s) for stream_id=%s", stream_id)
+                import time as _t
+                _t.sleep(1.0)
+                subprocess.run(
+                    ["pkill", "-KILL", "-f", sweep_pat],
+                    capture_output=True, timeout=3,
+                )
+        except Exception as e:
+            LOG.debug("[dpdk] orphan-reaper for stream_id=%s: %s", stream_id, e)
 
     rc = proc.returncode if proc.returncode is not None else 0
     
