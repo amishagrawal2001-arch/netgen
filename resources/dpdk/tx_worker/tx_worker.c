@@ -9,6 +9,8 @@
 #include <inttypes.h>
 #include <getopt.h>
 #include <arpa/inet.h>
+#include <endian.h>
+#include <time.h>
 
 #include <rte_eal.h>
 #include <rte_ethdev.h>
@@ -22,6 +24,28 @@
 #include <rte_launch.h>
 
 #define MAX_TX_WORKERS 32
+
+/* One-way latency timestamp header.
+ *
+ * Embedded at the START of the UDP payload when --enable-timestamps is
+ * passed and payload_len >= sizeof(struct nlat_hdr). A receiver-side
+ * sniffer (utils/latency_sampler.py) decodes this and computes
+ *   latency_ns = rx_clock_monotonic - tx_ns
+ *
+ * Both ends use CLOCK_MONOTONIC nanoseconds so they trivially agree
+ * on a same-host loopback test. Cross-host requires the two boxes to
+ * be PTP-synced — without that, only RTT (not one-way) is meaningful.
+ *
+ * Wire order: magic+reserved are big-endian; tx_ns is big-endian uint64.
+ */
+#define NLAT_MAGIC 0x4e4c4154u   /* "NLAT" */
+#define NLAT_HDR_LEN 16
+
+static inline uint64_t netgen_now_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
 
 static volatile int keep_running = 1;
 static void handle_sigint(int sig){ (void)sig; keep_running = 0; }
@@ -54,6 +78,9 @@ struct tx_worker_ctx {
     uint16_t base_src_port, base_dst_port;   /* host order */
     uint32_t src_ip_count, dst_ip_count;
     uint32_t src_port_count, dst_port_count;
+    /* One-way latency timestamping. When nonzero, each packet's UDP
+     * payload starts with a 16-byte nlat_hdr (magic + tx_ns). */
+    int enable_timestamps;
     /* outputs (read by main, written by worker) */
     volatile uint64_t sent;
     volatile uint64_t dropped;
@@ -173,13 +200,30 @@ static int tx_loop(void *arg){
                 }
             }
 
+            /* One-way latency timestamp. Written into the FIRST 16 bytes
+             * of UDP payload when enabled. RX-side sniffer decodes via
+             * magic, computes latency = clock_gettime(MONOTONIC) - tx_ns.
+             * Skipped silently if payload doesn't fit (frame too small). */
+            int ts_off = 0;
+            if (c->enable_timestamps && payload_len >= NLAT_HDR_LEN) {
+                uint8_t *pl = p + hdr_len;
+                uint32_t magic = htobe32(NLAT_MAGIC);
+                uint32_t reserved = 0;
+                uint64_t tx_ns = htobe64(netgen_now_ns());
+                memcpy(pl + 0, &magic, 4);
+                memcpy(pl + 4, &reserved, 4);
+                memcpy(pl + 8, &tx_ns, 8);
+                ts_off = NLAT_HDR_LEN;
+            }
+
             /* payload signature — include queue id so each worker's pkts are unique */
             if (payload_len){
-                uint8_t *pl = p + hdr_len;
-                int n = snprintf((char*)pl, payload_len, "[%s/q%u#%" PRIu64 "]",
-                                 c->stream_id, (unsigned)queue_id, seq++);
+                uint8_t *pl = p + hdr_len + ts_off;
+                uint32_t avail = payload_len - (uint32_t)ts_off;
+                int n = (avail > 0) ? snprintf((char*)pl, avail, "[%s/q%u#%" PRIu64 "]",
+                                                c->stream_id, (unsigned)queue_id, seq++) : 0;
                 if (n < 0) n = 0;
-                if ((uint32_t)n < payload_len) memset(pl + n, 0, payload_len - (uint32_t)n);
+                if ((uint32_t)n < avail) memset(pl + n, 0, avail - (uint32_t)n);
             } else {
                 seq++;  /* keep flow-incrementing in sync */
             }
@@ -243,6 +287,9 @@ int main(int argc, char **argv){
     uint32_t src_ip_count = 0, dst_ip_count = 0;
     uint32_t src_port_count = 0, dst_port_count = 0;
 
+    /* One-way latency timestamping. RX side decodes via NLAT magic. */
+    int enable_timestamps = 0;
+
     static struct option long_opts[] = {
         {"src-mac",   required_argument, 0, 1},
         {"dst-mac",   required_argument, 0, 2},
@@ -263,6 +310,8 @@ int main(int argc, char **argv){
         {"dst-ip-count",   required_argument, 0, 16},
         {"src-port-count", required_argument, 0, 17},
         {"dst-port-count", required_argument, 0, 18},
+        /* Latency timestamping */
+        {"enable-timestamps", no_argument,    0, 19},
         {0,0,0,0}
     };
     int opt, idx;
@@ -289,6 +338,7 @@ int main(int argc, char **argv){
             case 16: dst_ip_count   = (uint32_t)strtoul(optarg, NULL, 10); break;
             case 17: src_port_count = (uint32_t)strtoul(optarg, NULL, 10); break;
             case 18: dst_port_count = (uint32_t)strtoul(optarg, NULL, 10); break;
+            case 19: enable_timestamps = 1; break;
             default: usage(argv[0]); return 1;
         }
     }
@@ -446,6 +496,7 @@ int main(int argc, char **argv){
         c->dst_ip_count   = dst_ip_count;
         c->src_port_count = src_port_count;
         c->dst_port_count = dst_port_count;
+        c->enable_timestamps = enable_timestamps;
     }
 
     /* Launch workers on worker lcores (skips main lcore) */
