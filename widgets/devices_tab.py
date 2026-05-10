@@ -1567,8 +1567,10 @@ class DevicesTab(QWidget):
     def setup_devices_subtab(self):
         """Setup the Devices sub-tab with device table and controls."""
         layout = QVBoxLayout(self.devices_subtab)
-        layout.setContentsMargins(4, 4, 4, 4)  # Balanced padding to match left side (TGEN)
-        layout.setSpacing(10)  # Consistent spacing between elements
+        # Tight chrome — table + action row read as one panel.
+        # Matches the streams tab pattern from 9aa54b8.
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(2)
 
         # columns
         # Simplified device table - only essential device info
@@ -1587,9 +1589,9 @@ class DevicesTab(QWidget):
             "Loopback IPv6",
             "VXLAN",
         ]
-        # Add Device List label
-        layout.addWidget(QLabel("Device List"))
-        
+        # "Device List" label removed — the QTabWidget tab labeled
+        # "Devices" already identifies the section; the extra label
+        # was redundant chrome that ate vertical space.
         self.devices_table = QTableWidget(0, len(self.device_headers))
         self.devices_table.setHorizontalHeaderLabels(self.device_headers)
         # map header -> index
@@ -1599,50 +1601,58 @@ class DevicesTab(QWidget):
         self.devices_table.setEditTriggers(QTableWidget.DoubleClicked | QTableWidget.EditKeyPressed)
         self.devices_table.setSelectionBehavior(QTableWidget.SelectItems)
         
-        # Table styling for professional appearance (muted color scheme)
-        self.devices_table.setAlternatingRowColors(True)  # Alternating row colors for better readability
+        # Table styling — matches the streams table after the
+        # bd9e779/9aa54b8/10ec57c styling pass. Border removed (the
+        # tab pane provides the outer border), selection blue
+        # brightened to #2563eb to match the streams selection,
+        # header padding tightened, font reduced 12→11.
+        self.devices_table.setAlternatingRowColors(True)
         header = self.devices_table.horizontalHeader()
-        header.setDefaultSectionSize(25)  # Header height
-        header.setHighlightSections(False)  # Don't highlight header sections on click
+        header.setDefaultSectionSize(25)
+        header.setHighlightSections(False)
+        # Fix the header bar height so font-metric quirks can't push
+        # it taller than the styled padding implies.
+        header.setFixedHeight(22)
+        # Cap icon size for any per-cell icons (status pills etc).
+        self.devices_table.setIconSize(QSize(14, 14))
 
-        # Professional styling with muted color scheme
         self.devices_table.setStyleSheet("""
             QTableWidget {
                 background-color: #ffffff;
-                alternate-background-color: #f7f8fa;
-                border: 1px solid #d1d5db;
-                border-radius: 4px;
-                font-size: 11px;
+                alternate-background-color: #f5f7fa;
+                border: none;
+                font-size: 13px;
                 outline: none;
-                color: #374151;
+                color: #111827;
                 gridline-color: #e5e7eb;
             }
             QTableWidget::item {
-                padding: 3px;
+                padding: 5px 8px;
                 border: none;
             }
             QTableWidget::item:selected {
-                background-color: #5b7fa8;
+                background-color: #2563eb;
                 color: #ffffff;
             }
             QTableWidget::item:hover:!selected {
-                background-color: #f0f2f5;
+                background-color: #eef2f7;
             }
             QTableWidget::item:selected:hover {
-                background-color: #4a6b8a;
+                background-color: #1d4ed8;
             }
             QHeaderView::section {
-                background-color: #f3f4f6;
-                padding: 6px 6px;
-                border: 1px solid #d1d5db;
+                background-color: #e5e7eb;
+                padding: 3px 8px;
+                border: 1px solid #cbd5e1;
                 border-left: none;
                 border-top: none;
-                font-weight: 600;
+                font-weight: 700;
                 font-size: 11px;
-                color: #4b5563;
+                color: #1f2937;
+                letter-spacing: 0.3px;
             }
             QHeaderView::section:first {
-                border-left: 1px solid #d1d5db;
+                border-left: 1px solid #cbd5e1;
             }
         """)
         
@@ -1704,113 +1714,141 @@ class DevicesTab(QWidget):
         # Note: Removed duplicate device_status_timer - using existing status_timer instead
 
         # ---- buttons ----
-        btns = QHBoxLayout()
+        # Wrap the action row in a styled QFrame so it has the same
+        # grey "footer" background as the streams + TGEN action rows
+        # (commits d96c26c / 364c2a6). Unified BTN_BASE styling on
+        # every button — white fill, thin gray border, neutral hover,
+        # so the row reads as one family instead of a mix of stock
+        # QPushButtons and inline-colored ones.
+        from PyQt5.QtWidgets import QFrame
+        action_bar = QFrame()
+        action_bar.setStyleSheet(
+            "QFrame { background-color: #f3f4f6; "
+            "border-top: 1px solid #e5e7eb; border-radius: 0; }"
+        )
+        btns = QHBoxLayout(action_bar)
         btns.setAlignment(Qt.AlignLeft)
+        btns.setSpacing(6)
+        btns.setContentsMargins(6, 4, 6, 4)
 
+        BTN_BASE = (
+            "QPushButton {"
+            "  border: 1px solid #cbd5e1;"
+            "  border-radius: 5px;"
+            "  background-color: #ffffff;"
+            "  padding: 0px;"
+            "}"
+            "QPushButton:hover { background-color: #f1f5f9; border-color: #94a3b8; }"
+            "QPushButton:pressed { background-color: #e2e8f0; }"
+            "QPushButton:disabled { background-color: #f9fafb; border-color: #e5e7eb; }"
+        )
+        BTN_APPLY = (
+            "QPushButton {"
+            "  border: 1px solid #2563eb;"
+            "  border-radius: 5px;"
+            "  background-color: #ffffff;"
+            "  color: #1d4ed8;"
+            "  padding: 0px;"
+            "}"
+            "QPushButton:hover { background-color: #eff6ff; border-color: #1d4ed8; }"
+            "QPushButton:pressed { background-color: #dbeafe; }"
+        )
 
-        self.add_button = QPushButton()
-        self.add_button.setIcon(load_icon("add.png"))
-        self.add_button.setIconSize(QSize(16, 16))
-        self.add_button.setFixedSize(32, 28)
-        self.add_button.setToolTip("Add Device")
+        BTN_W, BTN_H, ICON_PX = 28, 24, 14
 
-        self.edit_button = QPushButton()
-        self.edit_button.setIcon(load_icon("edit.png"))
-        self.edit_button.setIconSize(QSize(16, 16))
-        self.edit_button.setFixedSize(32, 28)
-        self.edit_button.setToolTip("Edit Device")
+        def _btn(icon_name, tooltip, style=BTN_BASE):
+            b = QPushButton()
+            if icon_name:
+                b.setIcon(load_icon(icon_name))
+                b.setIconSize(QSize(ICON_PX, ICON_PX))
+            b.setFixedSize(BTN_W, BTN_H)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setToolTip(tooltip)
+            b.setStyleSheet(style)
+            return b
 
-        self.remove_button = QPushButton()
-        self.remove_button.setIcon(load_icon("remove.png"))
-        self.remove_button.setIconSize(QSize(16, 16))
-        self.remove_button.setFixedSize(32, 28)
-        self.remove_button.setToolTip("Remove Device")
+        self.add_button    = _btn("add.png",     "Add Device")
+        self.edit_button   = _btn("edit.png",    "Edit Device")
+        self.remove_button = _btn("remove.png",  "Remove Device")
 
+        # Apply gets the blue-accented BTN_APPLY style, matching the
+        # streams Apply button.
         self.apply_button = QPushButton("✓")
-        self.apply_button.setFixedSize(32, 28)
+        self.apply_button.setFixedSize(BTN_W, BTN_H)
+        self.apply_button.setCursor(Qt.PointingHandCursor)
         self.apply_button.setToolTip("Check & Reconfigure Selected Devices")
+        self.apply_button.setStyleSheet(BTN_APPLY)
 
-        self.ping_button = QPushButton()
-        self.ping_button.setIcon(load_icon("start.png"))
-        self.ping_button.setIconSize(QSize(16, 16))
-        self.ping_button.setFixedSize(32, 28)
-        self.ping_button.setToolTip("Ping Test")
-        
-        self.arp_button = QPushButton()
-        self.arp_button.setIcon(load_icon("refresh.png"))
-        self.arp_button.setIconSize(QSize(16, 16))
-        self.arp_button.setFixedSize(32, 28)
-        self.arp_button.setToolTip("Refresh ARP Status")
+        self.ping_button   = _btn("start.png",   "Ping Test")
+        self.arp_button    = _btn("refresh.png", "Refresh ARP Status")
+        self.copy_button   = _btn("copy.png",    "Copy Device")
+        self.paste_button  = _btn("paste.png",   "Paste Device")
+        self.start_device_button = _btn("start.png", "Start Selected Devices")
+        self.stop_device_button  = _btn("stop.png",  "Stop Selected Devices")
 
-        self.copy_button = QPushButton()
-        self.copy_button.setIcon(load_icon("copy.png"))
-        self.copy_button.setIconSize(QSize(16, 16))
-        self.copy_button.setFixedSize(32, 28)
-        self.copy_button.setToolTip("Copy Device")
-
-        self.paste_button = QPushButton()
-        self.paste_button.setIcon(load_icon("paste.png"))
-        self.paste_button.setIconSize(QSize(16, 16))
-        self.paste_button.setFixedSize(32, 28)
-        self.paste_button.setToolTip("Paste Device")
-
-        # Add dedicated Start/Stop buttons for devices
-        self.start_device_button = QPushButton()
-        self.start_device_button.setIcon(load_icon("start.png"))
-        self.start_device_button.setIconSize(QSize(16, 16))
-        self.start_device_button.setFixedSize(32, 28)
-        self.start_device_button.setToolTip("Start Selected Devices")
-
-        self.stop_device_button = QPushButton()
-        self.stop_device_button.setIcon(load_icon("stop.png"))
-        self.stop_device_button.setIconSize(QSize(16, 16))
-        self.stop_device_button.setFixedSize(32, 28)
-        self.stop_device_button.setToolTip("Stop Selected Devices")
-
-        # BGP Route Pool Management button (global pools - in Devices tab)
-        self.manage_route_pools_button = QPushButton("🗂️")
-        self.manage_route_pools_button.setFixedSize(32, 28)
+        # BGP Route Pool Management button — emoji label, no icon
+        self.manage_route_pools_button = QPushButton("🗂")
+        self.manage_route_pools_button.setFixedSize(BTN_W, BTN_H)
+        self.manage_route_pools_button.setCursor(Qt.PointingHandCursor)
         self.manage_route_pools_button.setToolTip("Manage BGP Route Pools")
+        self.manage_route_pools_button.setStyleSheet(BTN_BASE)
 
-
-        # NetGenAI button
+        # NetGenAI button — keep the special blue treatment since it
+        # is a marketing/branded entry point, but adopt the same
+        # height (BTN_H) so it aligns with the rest of the row.
         try:
             from traffic_client.ai_menu_actions import TrafficGenClientAIMenuActions
             self.ai_assistant_button = QPushButton("🤖 AI")
             self.ai_assistant_button.setToolTip("Open NetGenAI for selected device")
-            self.ai_assistant_button.setFixedSize(60, 28)
+            self.ai_assistant_button.setFixedSize(54, BTN_H)
+            self.ai_assistant_button.setCursor(Qt.PointingHandCursor)
             self.ai_assistant_button.setStyleSheet("""
                 QPushButton {
-                    background-color: #2196F3;
+                    background-color: #2563eb;
                     color: white;
-                    font-weight: bold;
-                    border-radius: 3px;
+                    font-weight: 600;
+                    font-size: 11px;
+                    border: 1px solid #1d4ed8;
+                    border-radius: 5px;
                 }
-                QPushButton:hover {
-                    background-color: #1976D2;
-                }
+                QPushButton:hover { background-color: #1d4ed8; }
             """)
             self.ai_assistant_button.clicked.connect(
                 lambda: self.open_ai_assistant_for_selected()
             )
         except ImportError:
             self.ai_assistant_button = None
-        
-        # Only add device management buttons to Devices tab
-        button_list = [self.add_button, self.edit_button, self.remove_button, 
-                      self.start_device_button, self.stop_device_button,
-                      self.apply_button, self.ping_button, self.arp_button, 
-                      self.copy_button, self.paste_button, 
-                      self.manage_route_pools_button]
-        
-        # Add AI button if available
-        if hasattr(self, 'ai_assistant_button') and self.ai_assistant_button:
-            button_list.append(self.ai_assistant_button)
-        
-        for b in button_list:
+
+        # Group buttons logically with a separator (config left,
+        # runtime control right), matching the streams action bar.
+        button_list_left = [
+            self.add_button, self.edit_button, self.remove_button,
+            self.copy_button, self.paste_button,
+        ]
+        button_list_right = [
+            self.start_device_button, self.stop_device_button,
+            self.apply_button, self.ping_button, self.arp_button,
+            self.manage_route_pools_button,
+        ]
+        if self.ai_assistant_button:
+            button_list_right.append(self.ai_assistant_button)
+
+        for b in button_list_left:
             btns.addWidget(b)
 
-        layout.addLayout(btns)
+        # Vertical divider, matching the streams action bar's grouping
+        sep = QLabel()
+        sep.setFixedSize(1, BTN_H)
+        sep.setStyleSheet("background-color: #cbd5e1; margin: 0 6px;")
+        btns.addSpacing(4)
+        btns.addWidget(sep)
+        btns.addSpacing(4)
+
+        for b in button_list_right:
+            btns.addWidget(b)
+
+        btns.addStretch(1)
+        layout.addWidget(action_bar)
 
         # wiring
         self.add_button.clicked.connect(self.prompt_add_device)
