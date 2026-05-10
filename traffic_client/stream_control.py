@@ -29,6 +29,10 @@ class TrafficGenClientStreamControl:
 
         # --- Stream Table ---
         self.stream_table = QTableWidget()
+        # Cap icon size so the Status column's dot doesn't render as a
+        # 22+px square block on high-DPI Macs. Matches the 12×12 pixmap
+        # the per-cell setIcon callers explicitly produce.
+        self.stream_table.setIconSize(QSize(14, 14))
         stream_column_labels = [
             "Status", "Interface", "Name", "Enabled", "Details", "Frame Type",
             "Min Size", "Max Size", "Fixed Size", "L1", "VLAN", "L2", "L3", "L4", "RX Port",
@@ -644,10 +648,16 @@ class TrafficGenClientStreamControl:
         logger.info(f"Updated rx_port for stream '{stream.get('name')}' on {port} to {new_rx}")
 
     def update_stream_status(self, row, color):
-        """Update the stream status icon for a specific row."""
-        status_icon = QIcon(r_icon(f"icons/{color}_dot.png"))
+        """Update the stream status icon for a specific row.
+
+        Icon scaled to 12x12 — without explicit pixmap scaling Qt's
+        default QTableWidget iconSize renders the dot as a square
+        block on high-DPI displays. Matches the initial-render path
+        in server_section.py (~line 660).
+        """
+        raw_icon = QIcon(r_icon(f"icons/{color}_dot.png"))
         status_item = QTableWidgetItem()
-        status_item.setIcon(status_icon)
+        status_item.setIcon(QIcon(raw_icon.pixmap(12, 12)))
         status_item.setFlags(Qt.ItemIsEnabled)  # read-only
         self.stream_table.setItem(row, 0, status_item)
 
