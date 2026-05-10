@@ -55,26 +55,27 @@ class TrafficGenClientServerSection():
     def setup_server_section(self):
         """Set up the server management section."""
         self.server_group = QGroupBox("TGEN")
-        # Style the group's title to read as a section heading rather
-        # than the default QGroupBox stock label — small uppercase
-        # letter-spaced text in the same gray family as the inactive
-        # tab labels, so the left and right sides of the top split
-        # feel like the same visual system.
+        # Style the group's title to read as a section heading. Bumped
+        # up from the prior too-timid 11pt gray to 13pt bold dark gray
+        # so it has presence comparable to the Streams/Devices tab
+        # labels on the right side. Bordered group + slightly inset
+        # title floats over the top-left edge.
         self.server_group.setStyleSheet("""
             QGroupBox {
                 border: 1px solid #cbd5e1;
                 border-radius: 4px;
                 margin-top: 14px;
                 font-weight: 700;
-                font-size: 11px;
-                color: #6b7280;
-                letter-spacing: 1px;
+                font-size: 13px;
+                color: #1f2937;
+                letter-spacing: 0.5px;
             }
             QGroupBox::title {
                 subcontrol-origin: margin;
                 subcontrol-position: top left;
-                padding: 0 6px;
+                padding: 0 8px;
                 left: 8px;
+                background-color: #ffffff;
             }
         """)
         layout = QVBoxLayout()
