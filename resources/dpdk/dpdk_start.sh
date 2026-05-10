@@ -125,8 +125,39 @@ route_has_iface() { ip -o route show 2>/dev/null | awk -v d="$1" '$0 ~ (" dev " 
 
 # ---------- Stages ----------
 ensure_deps() {
-  apt-get update -y
-  apt-get install -y build-essential meson ninja-build pkg-config libnuma-dev libelf-dev libpcap-dev
+  # Retry logic for apt-get update (handle network timeouts)
+  MAX_RETRIES=3
+  RETRY_COUNT=0
+  APT_UPDATE_SUCCESS=0
+  
+  while [[ $RETRY_COUNT -lt $MAX_RETRIES ]]; do
+    echo "[deps] Attempting apt-get update (attempt $((RETRY_COUNT + 1))/$MAX_RETRIES)..."
+    
+    # Try with timeout and ignore Contents file errors (they're optional metadata)
+    if apt-get update -y --option Acquire::http::Timeout=30 --option Acquire::ftp::Timeout=30 2>&1 | grep -q "Reading package lists"; then
+      echo "[deps] Package lists updated successfully"
+      APT_UPDATE_SUCCESS=1
+      break
+    fi
+    
+    RETRY_COUNT=$((RETRY_COUNT + 1))
+    if [[ $RETRY_COUNT -lt $MAX_RETRIES ]]; then
+      echo "[deps] Update failed, retrying in 5 seconds..."
+      sleep 5
+    fi
+  done
+  
+  if [[ $APT_UPDATE_SUCCESS -eq 0 ]]; then
+    echo "[deps] WARNING: apt-get update failed after $MAX_RETRIES attempts"
+    echo "[deps] Continuing anyway (using cached package lists)..."
+  fi
+  
+  # Install packages with timeout settings
+  apt-get install -y --option Acquire::http::Timeout=30 --option Acquire::ftp::Timeout=30 \
+                      build-essential meson ninja-build pkg-config libnuma-dev libelf-dev libpcap-dev || {
+    echo "[deps] ERROR: Package installation failed. Try manual installation or check network."
+    exit 1
+  }
   apt-get install -y rdma-core || true
 }
 
