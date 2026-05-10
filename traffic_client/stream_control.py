@@ -350,24 +350,14 @@ class TrafficGenClientStreamControl:
                 "running and still enabled; stops streams you've just disabled."
             )
 
-    def setup_stream_start_stop_buttons(self):
-        """Set up Start and Stop Stream buttons."""
-        button_layout = QHBoxLayout()
-
-        self.start_stream_button = QPushButton("Start Stream")
-        self.start_stream_button.clicked.connect(self.start_stream)
-        button_layout.addWidget(self.start_stream_button)
-
-        self.stop_stream_button = QPushButton("Stop Stream")
-        self.stop_stream_button.clicked.connect(self.stop_stream)
-        button_layout.addWidget(self.stop_stream_button)
-
-        self.apply_stream_button = QPushButton("Apply Stream")
-        self.apply_stream_button.clicked.connect(self.apply_stream)
-        button_layout.addWidget(self.apply_stream_button)
-
-        button_layout.addStretch()
-        return button_layout
+    # NOTE: an old setup_stream_start_stop_buttons() method used to live
+    # here, hand-rolling a Start/Stop/Apply button row. It was orphaned
+    # when setup_stream_section() took over the styled action bar, and
+    # if anyone ever called it again it would silently re-bind
+    # self.start_stream_button / .stop_stream_button / .apply_stream_button
+    # to fresh unstyled QPushButtons, clobbering the action bar's icons
+    # and the Apply button's dirty-state tracking. Removed in audit
+    # cleanup batch (LOW #12).
 
     # ---------- table edit handlers ----------
     def handle_inline_edit(self, item):
@@ -496,8 +486,15 @@ class TrafficGenClientStreamControl:
             val = raw in ("yes", "true", "1", "on", "y")
             ps["flow_tracking_enabled"] = val
             stream["flow_tracking_enabled"] = val
-            # Normalize UI
-            with QSignalBlocker(self, ):
+            # Normalize UI. Audit LOW #15: previous code was
+            # `QSignalBlocker(self, )` — the trailing comma + `self`
+            # blocked signals on the parent widget (probably the
+            # main window) instead of the stream_table, so a Flow
+            # Tracking inline edit could re-trigger the table's
+            # itemChanged handler and recurse. Fixed to match the
+            # other branches of this method (col 2/3/8/15) which
+            # all correctly block self.stream_table.
+            with QSignalBlocker(self.stream_table):
                 item.setText("Yes" if val else "No")
 
         else:
