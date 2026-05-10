@@ -958,11 +958,15 @@ class TrafficGenClientStreamControl:
             else:
                 # No cached interfaces - try to fetch with short timeout (non-blocking)
                 try:
-                    # Use connection_manager if available for better timeout handling
+                    # Use connection_manager if available for better timeout handling.
+                    # Fall back to _get_async (QThread + local event loop)
+                    # rather than bare requests.get so the UI stays
+                    # responsive while we wait — same pattern as
+                    # _post_traffic_async for /api/traffic/{start,stop}.
                     if hasattr(self, 'connection_manager') and self.connection_manager:
                         r = self.connection_manager.get(f"{srv['address']}/api/interfaces", timeout=1)
                     else:
-                        r = requests.get(f"{srv['address']}/api/interfaces", timeout=1)
+                        r = self._get_async(f"{srv['address']}/api/interfaces", timeout=1)
                     if r.status_code == 200:
                         interfaces = r.json()
                         # Cache interfaces for future use
@@ -1096,6 +1100,13 @@ class TrafficGenClientStreamControl:
             if not original:
                 raise KeyError(f"Stream '{stream_name}' not found under '{tx_port}'.")
 
+            # Cancel any pending duration-expiry auto-stop timer for this
+            # stream — its state is about to change (potentially a new
+            # duration), and a stale timer firing later would issue an
+            # orphan /stop for the old config.
+            if hasattr(self, "_cancel_auto_stop_timer"):
+                self._cancel_auto_stop_timer(original.get("stream_id"))
+
             import copy
             stream_data = copy.deepcopy(original)
 
@@ -1112,7 +1123,24 @@ class TrafficGenClientStreamControl:
                     continue
                 tid = srv.get("tg_id", "0")
                 try:
-                    r = requests.get(f"{srv['address']}/api/interfaces", timeout=5)
+                    # Fast path: cached interfaces. Avoids the per-TG GET
+                    # entirely when the server tree has already populated
+                    # them — opens the dialog instantly in the common case.
+                    cached = srv.get("interfaces") or []
+                    if cached:
+                        rx_ports = [
+                            (iface.get("name") if isinstance(iface, dict) else str(iface))
+                            for iface in cached
+                        ]
+                        rx_ports = [n for n in rx_ports if n and n != "lo" and n != tx_port_name]
+                        server_interfaces.append({"tg_id": tid, "ports": rx_ports})
+                        continue
+                    # Cold path: fetch via _get_async (QThread + local
+                    # event loop) so the UI keeps repainting while we
+                    # wait. Previously this was a sync requests.get with
+                    # timeout=5 — the dialog took up to 5s to open
+                    # whenever any TG was unreachable.
+                    r = self._get_async(f"{srv['address']}/api/interfaces", timeout=3)
                     rx_ports = []
                     for iface in r.json():
                         name = iface["name"]
@@ -1153,6 +1181,20 @@ class TrafficGenClientStreamControl:
                         "protocol_data", "rocev2", "uec", "override_settings",
                         "stream_rate_control", "rx_port", "stream_id", "status", "flow_tracking_enabled"
                     }:
+                        updated["protocol_selection"][k] = v
+
+                # Preserve protocol_selection fields from the original
+                # stream that the dialog didn't surface back. Without
+                # this, fields the user inline-edited BEFORE opening
+                # Edit Stream (frame_size most commonly) — but didn't
+                # touch in the dialog — got silently overwritten by
+                # whatever defaults the dialog produced. Audit fix:
+                # only pull from original.protocol_selection for keys
+                # not already set by the edited form, so the dialog's
+                # explicit changes still win.
+                original_ps = original.get("protocol_selection", {}) or {}
+                for k, v in original_ps.items():
+                    if k not in updated["protocol_selection"]:
                         updated["protocol_selection"][k] = v
 
                 if "flow_tracking_enabled" in edited:
@@ -1218,6 +1260,15 @@ class TrafficGenClientStreamControl:
                     continue
 
                 logger.info(f"Removing stream '{stream_name}' from port '{port_key}'")
+
+                # Cancel any pending auto-stop timer for the stream(s)
+                # being removed — without this, the timer fires later
+                # against a stream_id that no longer exists locally and
+                # the server gets an orphan /stop POST.
+                if hasattr(self, "_cancel_auto_stop_timer"):
+                    for s in self.streams.get(port_key, []):
+                        if s.get("protocol_selection", {}).get("name") == stream_name:
+                            self._cancel_auto_stop_timer(s.get("stream_id"))
 
                 self.streams[port_key] = [
                     s for s in self.streams[port_key]
