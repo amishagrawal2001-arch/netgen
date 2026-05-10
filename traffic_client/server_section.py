@@ -181,8 +181,11 @@ class TrafficGenClientServerSection():
         # --- Action Buttons Section (grouped separately, aligned with Streams pattern) ---
         action_button_layout = QHBoxLayout()
         action_button_layout.setAlignment(Qt.AlignLeft)
-        action_button_layout.setSpacing(6)
-        action_button_layout.setContentsMargins(0, 8, 0, 0)
+        action_button_layout.setSpacing(4)
+        # Tight margins — was (0, 8, 0, 0), the 8px top gap made the
+        # row sit too low under the tree and stretched the section
+        # vertically. Flush now, matching the streams action bar.
+        action_button_layout.setContentsMargins(0, 2, 0, 2)
 
         # TGEN action buttons — bordered + hover-state styling so they match
         # the streams action bar at the bottom of the right pane and the
@@ -197,7 +200,11 @@ class TrafficGenClientServerSection():
             "QPushButton:hover { background-color: #f1f5f9; border-color: #94a3b8; }"
             "QPushButton:pressed { background-color: #e2e8f0; }"
         )
-        TGEN_BTN_W, TGEN_BTN_H, TGEN_ICON = 34, 30, 18
+        # Was 34×30 with 18px icons — pulled down to 28×24 with 14px
+        # icons so the row's overall vertical footprint matches the
+        # streams action bar's new compact size and the section feels
+        # less chrome-heavy under the tree.
+        TGEN_BTN_W, TGEN_BTN_H, TGEN_ICON = 28, 24, 14
 
         def _tgen_btn(icon_name, tooltip, slot, fallback_icon=None):
             btn = QPushButton()
