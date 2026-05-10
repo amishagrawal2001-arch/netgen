@@ -97,22 +97,25 @@ class TrafficGenClientStatisticsSection():
             "Receive Bit Rate (bps)", "Errors"
         ])
         
-        # Apply professional styling
+        # Apply professional styling — bumped for readability:
+        # body 11px → 13px, header 11px → 12px, header bg/contrast strengthened
+        # so column titles stand out from cells. Cell padding 4/8 → 6/10 gives
+        # rows more breathing room on a 1080p screen.
         table_style = """
             QTableWidget {
                 background-color: #ffffff;
-                alternate-background-color: #f7f8fa;
-                border: 1px solid #d1d5db;
+                alternate-background-color: #f5f7fa;
+                border: 1px solid #cbd5e1;
                 border-radius: 4px;
-                font-size: 11px;
+                font-size: 13px;
                 outline: none;
-                color: #374151;
+                color: #111827;
                 gridline-color: #e5e7eb;
                 selection-background-color: #dbeafe;
                 selection-color: #1e40af;
             }
             QTableWidget::item {
-                padding: 4px 8px;
+                padding: 6px 10px;
                 border: none;
             }
             QTableWidget::item:selected {
@@ -120,34 +123,41 @@ class TrafficGenClientStatisticsSection():
                 color: #1e40af;
             }
             QTableWidget::item:hover:!selected {
-                background-color: #f0f2f5;
+                background-color: #eef2f7;
             }
             QHeaderView::section {
-                background-color: #f3f4f6;
+                background-color: #e5e7eb;
                 padding: 8px 10px;
-                border: 1px solid #d1d5db;
+                border: 1px solid #cbd5e1;
                 border-left: none;
                 border-top: none;
-                font-weight: 600;
-                font-size: 11px;
-                color: #4b5563;
+                font-weight: 700;
+                font-size: 12px;
+                color: #1f2937;
+                letter-spacing: 0.3px;
             }
             QHeaderView::section:first {
-                border-left: 1px solid #d1d5db;
+                border-left: 1px solid #cbd5e1;
             }
             QTableCornerButton::section {
-                background-color: #f3f4f6;
-                border: 1px solid #d1d5db;
+                background-color: #e5e7eb;
+                border: 1px solid #cbd5e1;
             }
         """
         self.statistics_table.setStyleSheet(table_style)
         self.statistics_table.setAlternatingRowColors(True)
-        
-        # Set font
+
+        # Set font — bumped 10pt → 12pt for live throughput readouts.
+        # The stats dock is where you check whether traffic is hitting
+        # line rate; cell text needs to be readable across the room.
         font = QFont()
         font.setFamily("Monaco, Consolas, 'Courier New', monospace")
-        font.setPointSize(10)
+        font.setPointSize(12)
         self.statistics_table.setFont(font)
+        # Taller rows so 12pt monospace doesn't clip and rows are easier
+        # to track row-by-row when scanning multiple interfaces.
+        self.statistics_table.verticalHeader().setDefaultSectionSize(32)
+        self.statistics_table.verticalHeader().setMinimumSectionSize(28)
         
         interface_stats_layout.addWidget(self.statistics_table)
         interface_stats_layout.setContentsMargins(0, 0, 0, 0)
@@ -167,6 +177,8 @@ class TrafficGenClientStatisticsSection():
         self.stream_statistics_table.setAlternatingRowColors(True)
         self.stream_statistics_table.setFont(font)
         self.stream_statistics_table.setSortingEnabled(True)
+        self.stream_statistics_table.verticalHeader().setDefaultSectionSize(32)
+        self.stream_statistics_table.verticalHeader().setMinimumSectionSize(28)
         
         stream_stats_layout.addWidget(self.stream_statistics_table)
         stream_stats_layout.setContentsMargins(0, 0, 0, 0)
@@ -175,35 +187,39 @@ class TrafficGenClientStatisticsSection():
         self.statistics_tab_widget.addTab(interface_stats_tab, "Interface Statistics")
         self.statistics_tab_widget.addTab(stream_stats_tab, "Stream Statistics")
         
-        # Apply tab styling
+        # Tab styling — bumped for visibility:
+        # - tab font 11px → 13px so labels are easier to read
+        # - active-tab bottom-border 2px → 3px and a brighter blue so the
+        #   selected tab is unmistakable
+        # - inactive-tab text contrast strengthened (#4b5563 → #374151)
         self.statistics_tab_widget.setStyleSheet("""
             QTabWidget::pane {
-                border: 1px solid #d1d5db;
+                border: 1px solid #cbd5e1;
                 border-radius: 4px;
                 background-color: #ffffff;
                 top: -1px;
             }
             QTabBar::tab {
-                background-color: #f3f4f6;
-                color: #4b5563;
-                border: 1px solid #d1d5db;
+                background-color: #eef2f7;
+                color: #374151;
+                border: 1px solid #cbd5e1;
                 border-bottom: none;
                 border-top-left-radius: 4px;
                 border-top-right-radius: 4px;
-                padding: 6px 12px;
+                padding: 8px 18px;
                 margin-right: 2px;
-                font-weight: 500;
-                font-size: 11px;
+                font-weight: 600;
+                font-size: 13px;
             }
             QTabBar::tab:selected {
                 background-color: #ffffff;
-                color: #1f2937;
-                border-bottom: 2px solid #3b82f6;
-                font-weight: 600;
+                color: #1d4ed8;
+                border-bottom: 3px solid #2563eb;
+                font-weight: 700;
             }
             QTabBar::tab:hover:!selected {
-                background-color: #e5e7eb;
-                color: #374151;
+                background-color: #dbeafe;
+                color: #1e40af;
             }
         """)
         
@@ -844,7 +860,7 @@ class TrafficGenClientStatisticsSection():
                 status_item.setForeground(QColor("#ef4444"))  # Red
             else:
                 status_item.setForeground(QColor("#6b7280"))  # Gray
-            status_item.setFont(QFont("", 10, QFont.Bold))
+            status_item.setFont(QFont("", 12, QFont.Bold))
             self.statistics_table.setItem(0, col, status_item)
 
             # (1) Sent Frames (baseline-subtracted)
@@ -867,24 +883,36 @@ class TrafficGenClientStatisticsSection():
             recv_bytes_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             self.statistics_table.setItem(4, col, recv_bytes_item)
             
+            # The four rate rows are the operationally-critical ones —
+            # bold them and tint TX values blue so live throughput jumps
+            # off the page even at a glance from across the room.
+            rate_send_color = QColor("#1d4ed8")  # blue for TX rates
+            rate_recv_color = QColor("#111827")  # darker neutral for RX
+
             # (5) Send Frame Rate
             send_fps_item = QTableWidgetItem(format_rate(stats.get("send_fps", 0), "fps"))
             send_fps_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            send_fps_item.setFont(QFont("Monaco, Consolas, monospace", 12, QFont.Bold))
+            send_fps_item.setForeground(rate_send_color)
             self.statistics_table.setItem(5, col, send_fps_item)
-            
+
             # (6) Receive Frame Rate
             recv_fps_item = QTableWidgetItem(format_rate(stats.get("receive_fps", 0), "fps"))
             recv_fps_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            recv_fps_item.setForeground(rate_recv_color)
             self.statistics_table.setItem(6, col, recv_fps_item)
-            
+
             # (7) Send Bit Rate
             send_bps_item = QTableWidgetItem(format_rate(stats.get("send_bps", 0), "bps"))
             send_bps_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            send_bps_item.setFont(QFont("Monaco, Consolas, monospace", 12, QFont.Bold))
+            send_bps_item.setForeground(rate_send_color)
             self.statistics_table.setItem(7, col, send_bps_item)
-            
+
             # (8) Receive Bit Rate
             recv_bps_item = QTableWidgetItem(format_rate(stats.get("receive_bps", 0), "bps"))
             recv_bps_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            recv_bps_item.setForeground(rate_recv_color)
             self.statistics_table.setItem(8, col, recv_bps_item)
             
             # (9) Errors (baseline-subtracted) - with color coding
@@ -1059,7 +1087,7 @@ class TrafficGenClientStatisticsSection():
             engine_item = QTableWidgetItem(engine_label)
             engine_item.setTextAlignment(Qt.AlignCenter)
             engine_item.setForeground(engine_color)
-            engine_item.setFont(QFont("", 10, QFont.Bold))
+            engine_item.setFont(QFont("", 12, QFont.Bold))
             engine_item.setToolTip(
                 f"Engine: {'DPDK tx_worker' if stream.get('dpdk_enable') else 'Scapy/kernel'}"
                 + (f"\nTX queues: {stream.get('dpdk_tx_cores', 1)}" if stream.get("dpdk_enable") else "")
@@ -1107,7 +1135,7 @@ class TrafficGenClientStatisticsSection():
             loss_pct = stream["loss_pct"]
             loss_item = QTableWidgetItem(f"{loss_pct:.2f}%")
             loss_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            loss_item.setFont(QFont("", 10, QFont.Bold))
+            loss_item.setFont(QFont("", 12, QFont.Bold))
 
             # Color code loss percentage
             if loss_pct > 50:
@@ -1130,7 +1158,7 @@ class TrafficGenClientStatisticsSection():
                 status_item.setForeground(QColor("#6b7280"))  # Gray
             else:
                 status_item.setForeground(QColor("#ef4444"))  # Red
-            status_item.setFont(QFont("", 10, QFont.Bold))
+            status_item.setFont(QFont("", 12, QFont.Bold))
             self.stream_statistics_table.setItem(row, 8, status_item)
 
             # Flow Tracking

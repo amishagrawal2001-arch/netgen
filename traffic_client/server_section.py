@@ -90,45 +90,51 @@ class TrafficGenClientServerSection():
         # Improved selection behavior
         self.server_tree.setSelectionBehavior(QAbstractItemView.SelectRows)  # Select entire rows
         
-        # Better visual styling with stylesheet for professional appearance (muted color scheme)
+        # Visual styling — bumped for visibility:
+        # - tree font 11px → 13px, item min-height 20→24, padding 2/4 → 4/8
+        # - header bg/contrast strengthened to match the stats dock so the
+        #   server pane and stats dock feel like one cohesive UI
+        # - selected-row blue (#5b7fa8) → brighter (#2563eb) to make the
+        #   active port unambiguous when scanning multiple TGs
         self.server_tree.setStyleSheet("""
             QTreeWidget {
                 background-color: #ffffff;
-                alternate-background-color: #f7f8fa;
-                border: 1px solid #d1d5db;
+                alternate-background-color: #f5f7fa;
+                border: 1px solid #cbd5e1;
                 border-radius: 4px;
-                font-size: 11px;
+                font-size: 13px;
                 outline: none;
-                color: #374151;
+                color: #111827;
             }
             QTreeWidget::item {
-                padding: 2px 4px;
+                padding: 4px 8px;
                 border: none;
-                min-height: 20px;
-                color: #374151;
+                min-height: 24px;
+                color: #111827;
             }
             QTreeWidget::item:selected {
-                background-color: #5b7fa8;
+                background-color: #2563eb;
                 color: #ffffff;
             }
             QTreeWidget::item:hover:!selected {
-                background-color: #f0f2f5;
+                background-color: #eef2f7;
             }
             QTreeWidget::item:selected:hover {
-                background-color: #4a6b8a;
+                background-color: #1d4ed8;
             }
             QHeaderView::section {
-                background-color: #f3f4f6;
-                padding: 6px 6px;
-                border: 1px solid #d1d5db;
+                background-color: #e5e7eb;
+                padding: 8px 10px;
+                border: 1px solid #cbd5e1;
                 border-left: none;
                 border-top: none;
-                font-weight: 600;
-                font-size: 11px;
-                color: #4b5563;
+                font-weight: 700;
+                font-size: 12px;
+                color: #1f2937;
+                letter-spacing: 0.3px;
             }
             QHeaderView::section:first {
-                border-left: 1px solid #d1d5db;
+                border-left: 1px solid #cbd5e1;
             }
         """)
         
