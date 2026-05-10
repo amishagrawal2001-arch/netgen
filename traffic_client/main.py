@@ -14,7 +14,7 @@ logger = logging.getLogger(__name__)
 
 from PyQt5.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QTabWidget, QSplitter,
-    QMenu, QAction, QApplication
+    QMenu, QAction, QApplication, QToolButton
 )
 
 from PyQt5 import QtCore
@@ -740,17 +740,53 @@ class TrafficGeneratorClient(
         dpdk_menu.addAction(dpdk_load_modules_action)
 
         # Help menu — guides + about
+        # NOTE: on macOS, a menu literally named "Help" gets absorbed by the
+        # native Help menu and user-added items can be hard to spot. The
+        # corner-widget button below is the primary, always-visible entry
+        # point. The menu is kept for keyboard navigation and other platforms.
         help_menu = QMenu("&Help", self)
         menu_bar.addMenu(help_menu)
         help_menu.setToolTipsVisible(True)
 
         dpdk_guide_action = QAction("DPDK Traffic Blast Workflow...", self)
+        dpdk_guide_action.setShortcut(QKeySequence("F1"))
         dpdk_guide_action.setToolTip(
             "Step-by-step guide to using DPDK tx_worker for line-rate traffic generation, "
             "including TX core sizing, calibrated performance numbers, and troubleshooting."
         )
         dpdk_guide_action.triggered.connect(self.show_dpdk_workflow_guide)
         help_menu.addAction(dpdk_guide_action)
+        # Make F1 accept the shortcut even when the Help menu is hidden
+        # (macOS often absorbs the menu, but the action stays connected).
+        self.addAction(dpdk_guide_action)
+
+        # Top-right corner help button — always visible regardless of how the
+        # OS treats the Help menu. Round, bordered, blue '?'  with a tooltip.
+        help_btn = QToolButton(self)
+        help_btn.setText("?")
+        help_btn.setToolTip(
+            "DPDK Traffic Blast Workflow — quick guide to enabling DPDK,\n"
+            "picking TX cores, and verifying line-rate scaling.  (F1)"
+        )
+        help_btn.setCursor(Qt.PointingHandCursor)
+        help_btn.setAutoRaise(False)
+        help_btn.setFixedSize(26, 26)
+        help_btn.setStyleSheet(
+            "QToolButton {"
+            "  border: 1px solid #93c5fd;"
+            "  border-radius: 13px;"
+            "  background: #eff6ff;"
+            "  color: #1d4ed8;"
+            "  font-weight: 700;"
+            "  font-size: 14px;"
+            "  margin: 2px 8px 2px 2px;"
+            "  padding: 0px;"
+            "}"
+            "QToolButton:hover { background: #dbeafe; border-color: #3b82f6; }"
+            "QToolButton:pressed { background: #bfdbfe; }"
+        )
+        help_btn.clicked.connect(self.show_dpdk_workflow_guide)
+        menu_bar.setCornerWidget(help_btn, Qt.TopRightCorner)
 
     def show_dpdk_workflow_guide(self):
         """Open the DPDK Workflow Guide dialog from the Help menu."""
