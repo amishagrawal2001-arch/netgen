@@ -172,10 +172,11 @@ class TrafficGenClientStatisticsSection():
         
         # Stream Statistics Table
         self.stream_statistics_table = QTableWidget()
-        self.stream_statistics_table.setColumnCount(10)
+        self.stream_statistics_table.setColumnCount(12)
         self.stream_statistics_table.setHorizontalHeaderLabels([
-            "Stream Name", "Interface", "Engine", "TX Count", "RX Count", "TX Rate", "RX Rate",
-            "Loss %", "Status", "Flow Tracking"
+            "Stream Name", "Interface", "Engine", "TX Count", "RX Count",
+            "TX Rate", "RX Rate", "TX Bit Rate", "RX Bit Rate",
+            "Loss %", "Status", "Flow Tracking",
         ])
         self.stream_statistics_table.setStyleSheet(table_style)
         self.stream_statistics_table.setAlternatingRowColors(True)
@@ -956,12 +957,16 @@ class TrafficGenClientStatisticsSection():
             logger.debug(f"[DEBUG STREAM STATS] stream_statistics_table not found or not initialized")
             return
         
-        # Set column count first (10 columns; Engine column added between Interface and TX Count)
+        # Set column count first (12 columns: Engine between Interface and
+        # TX Count; TX Bit Rate / RX Bit Rate inserted after the pps Rate
+        # columns so the live throughput readout matches the Interface
+        # Statistics tab without flipping tabs).
         try:
-            self.stream_statistics_table.setColumnCount(10)
+            self.stream_statistics_table.setColumnCount(12)
             self.stream_statistics_table.setHorizontalHeaderLabels([
-                "Stream Name", "Interface", "Engine", "TX Count", "RX Count", "TX Rate", "RX Rate",
-                "Loss %", "Status", "Flow Tracking"
+                "Stream Name", "Interface", "Engine", "TX Count", "RX Count",
+                "TX Rate", "RX Rate", "TX Bit Rate", "RX Bit Rate",
+                "Loss %", "Status", "Flow Tracking",
             ])
 
             self.stream_statistics_table.setRowCount(0)
@@ -1162,6 +1167,42 @@ class TrafficGenClientStatisticsSection():
             rx_rate_item.setForeground(QColor("#111827"))
             self.stream_statistics_table.setItem(row, 6, rx_rate_item)
 
+            # TX Bit Rate / RX Bit Rate — derived from the per-second rate
+            # and the stream's frame_size (rate × bytes × 8). Bit-rate
+            # auto-formats to Gbps/Mbps/Kbps the same way the Interface
+            # Statistics tab does, so a 100G line-rate stream shows
+            # "~395 Gbps" right alongside its "32.79 Mpps".
+            try:
+                _fs = int(stream.get("frame_size") or 64)
+            except (ValueError, TypeError):
+                _fs = 64
+            tx_bps_val = (tx_rate or 0.0) * _fs * 8
+            rx_bps_val = (rx_rate or 0.0) * _fs * 8
+
+            def _format_bps(v):
+                if not v or v <= 0:
+                    return "0.00 bps"
+                if v >= 1_000_000_000:
+                    return f"{v / 1_000_000_000:.2f} Gbps"
+                if v >= 1_000_000:
+                    return f"{v / 1_000_000:.2f} Mbps"
+                if v >= 1_000:
+                    return f"{v / 1_000:.2f} Kbps"
+                return f"{v:.2f} bps"
+
+            # TX Bit Rate — bold + blue (paired with TX Rate at col 5).
+            tx_bps_item = QTableWidgetItem(_format_bps(tx_bps_val))
+            tx_bps_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            tx_bps_item.setFont(QFont("Monaco, Consolas, monospace", 12, QFont.Bold))
+            tx_bps_item.setForeground(QColor("#1d4ed8"))
+            self.stream_statistics_table.setItem(row, 7, tx_bps_item)
+
+            # RX Bit Rate — neutral, matches RX Rate styling.
+            rx_bps_item = QTableWidgetItem(_format_bps(rx_bps_val))
+            rx_bps_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            rx_bps_item.setForeground(QColor("#111827"))
+            self.stream_statistics_table.setItem(row, 8, rx_bps_item)
+
             # Loss % — only meaningful when flow tracking is on AND the
             # stream is actively running. A non-flow-tracked stream has no
             # way to know rx_count, so reporting "100% loss" on those
@@ -1190,7 +1231,7 @@ class TrafficGenClientStatisticsSection():
             loss_item.setFont(QFont("", 12, QFont.Bold))
             loss_item.setForeground(loss_color)
 
-            self.stream_statistics_table.setItem(row, 7, loss_item)
+            self.stream_statistics_table.setItem(row, 9, loss_item)
 
             # Status
             status = stream["status"]
@@ -1202,12 +1243,12 @@ class TrafficGenClientStatisticsSection():
             else:
                 status_item.setForeground(QColor("#ef4444"))  # Red
             status_item.setFont(QFont("", 12, QFont.Bold))
-            self.stream_statistics_table.setItem(row, 8, status_item)
+            self.stream_statistics_table.setItem(row, 10, status_item)
 
             # Flow Tracking
             flow_tracking_item = QTableWidgetItem("Yes" if stream["flow_tracking"] else "No")
             flow_tracking_item.setTextAlignment(Qt.AlignCenter)
-            self.stream_statistics_table.setItem(row, 9, flow_tracking_item)
+            self.stream_statistics_table.setItem(row, 11, flow_tracking_item)
         
         # Resize columns to fit content
         self.stream_statistics_table.resizeColumnsToContents()
@@ -1312,12 +1353,14 @@ class TrafficGenClientStatisticsSection():
 
         # ---- Stream Statistics tab ----
         # Column layout: 0 Stream Name, 1 Interface, 2 Engine, 3 TX Count,
-        # 4 RX Count, 5 TX Rate, 6 RX Rate, 7 Loss %, 8 Status, 9 Flow Tracking.
+        # 4 RX Count, 5 TX Rate, 6 RX Rate, 7 TX Bit Rate, 8 RX Bit Rate,
+        # 9 Loss %, 10 Status, 11 Flow Tracking.
         if hasattr(self, "stream_statistics_table") and self.stream_statistics_table is not None:
             zero_for_col = {
-                3: "0", 4: "0",            # counts
-                5: "0.00 pps", 6: "0.00 pps",
-                7: "0.00%",                # loss
+                3: "0", 4: "0",                          # counts
+                5: "0.00 pps", 6: "0.00 pps",            # rates (pps)
+                7: "0.00 bps", 8: "0.00 bps",            # rates (bps)
+                9: "0.00%",                              # loss
             }
             try:
                 rows = self.stream_statistics_table.rowCount()
