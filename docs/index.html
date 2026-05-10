@@ -403,34 +403,8 @@
     font-size: 14px;
   }
 
-  /* Roadmap */
-  .roadmap {
-    display: grid; gap: 18px;
-    grid-template-columns: repeat(3, 1fr);
-  }
-  .rm-col {
-    border: 1px solid var(--line);
-    border-radius: 12px;
-    padding: 22px;
-    background: white;
-  }
-  .rm-col h4 {
-    margin: 0 0 12px;
-    display: flex; align-items: center; gap: 10px;
-    font-size: 15px; color: var(--ink);
-  }
-  .rm-col h4 .dot-r {
-    width: 10px; height: 10px; border-radius: 50%;
-    display: inline-block;
-  }
-  .rm-col h4.shipped .dot-r { background: var(--green); }
-  .rm-col h4.beta    .dot-r { background: var(--amber); }
-  .rm-col h4.next    .dot-r { background: var(--gray-soft); }
-  .rm-col ul { margin: 0; padding-left: 18px; font-size: 14px; color: var(--ink-soft); }
-  .rm-col ul li { margin-bottom: 6px; }
-
   @media (max-width: 760px) {
-    .usecases, .roadmap { grid-template-columns: 1fr; }
+    .usecases { grid-template-columns: 1fr; }
   }
 </style>
 </head>
@@ -445,7 +419,6 @@
       <a href="#hardware">Hardware</a>
       <a href="#quickstart">Quick start</a>
       <a href="#api">API</a>
-      <a href="#roadmap">Roadmap</a>
       <a href="#faq">FAQ</a>
     </nav>
     <a class="cta" href="https://github.com/DAY-Advisor/NetGenI">GitHub</a>
@@ -930,53 +903,6 @@ curl -X POST http://&lt;server&gt;:5050/api/rfc2544/start \
     via WSL2. It only needs network reach to the server's port 5050. Bandwidth
     requirement: trivial (REST polling, few KB/s).
   </p>
-</section>
-
-<!-- Roadmap -->
-<section class="block" id="roadmap">
-  <h2>Roadmap.</h2>
-  <p>What's already shipped, what's actively building, and what's next.</p>
-
-  <div class="roadmap">
-    <div class="rm-col">
-      <h4 class="shipped"><span class="dot-r"></span>Shipped</h4>
-      <ul>
-        <li>Multi-queue DPDK tx_worker (1-16 cores)</li>
-        <li>RFC 2544 §26.1 throughput test</li>
-        <li>One-way latency sampler (NLAT)</li>
-        <li>Per-flow randomization (modifiers)</li>
-        <li>Live throughput chart (60s rolling)</li>
-        <li>PCAP replay at line rate</li>
-        <li>Async REST client (no UI freeze)</li>
-        <li>Inline-stream editing + bulk Apply</li>
-        <li>SQLite-backed session persistence</li>
-        <li>Help → Install + API Guides embedded</li>
-      </ul>
-    </div>
-    <div class="rm-col">
-      <h4 class="beta"><span class="dot-r"></span>In progress</h4>
-      <ul>
-        <li>BlueField-3 DPU support (ARM-native tx_worker)</li>
-        <li>Per-flow latency (not just sampler)</li>
-        <li>RFC 2544 latency + back-to-back tests</li>
-        <li>RoCEv2 + UEC stream types</li>
-        <li>Headless mode for CI runners</li>
-        <li>Docker image with pre-bound NIC</li>
-      </ul>
-    </div>
-    <div class="rm-col">
-      <h4 class="next"><span class="dot-r"></span>Next</h4>
-      <ul>
-        <li>Per-stream RX capture-to-disk</li>
-        <li>BGP traffic mix presets</li>
-        <li>IPv6 SRv6 / MPLS-SR encap</li>
-        <li>Real-time loss-burst histogram</li>
-        <li>Web client (browser-only, no PyQt5)</li>
-        <li>Prometheus exporter for stats</li>
-        <li>Multi-tenant API tokens</li>
-      </ul>
-    </div>
-  </div>
 </section>
 
 <!-- FAQ -->
