@@ -729,11 +729,36 @@ class TrafficGenClientStreamControl:
             QMessageBox.warning(self, "Invalid Selection", "Please select a TG port, not a server.")
             return
 
-        # Properly define all names used below
+        # Properly define all names used below.
+        # Server tree port items hold the bare iface name in text(0) (no
+        # "Port:" prefix; see server_section.py update_server_tree). Other
+        # paths in this codebase key self.streams as "TG N - Port: iface"
+        # WITH the prefix (Add Stream, the streams DB schema, etc.). The
+        # old code built `full_port_name = f"{tg_id} - {port_label}"`
+        # which produced "TG 0 - enp13s0f0np0" — a NEW, mismatched key —
+        # so pasted streams ended up orphaned from the per-port group
+        # the Streams table and stats lookups expected. Rebuild the same
+        # canonical "TG N - Port: iface" form Add Stream uses.
         tg_id = parent_item.text(0).strip()  # e.g., "TG 0"
-        port_label = selected_item.text(0).strip()  # e.g., "Port: enp13s0f0np0"
-        tx_port_name = port_label.replace("Port: ", "").strip()
-        full_port_name = f"{tg_id} - {port_label}"  # e.g., "TG 0 - Port: enp13s0f0np0"
+        raw_port_text = selected_item.text(0).strip()
+        # Strip any incidental "Port: " prefix so tx_port_name is just iface
+        tx_port_name = raw_port_text.replace("Port: ", "").strip()
+        # Strip optional bullet prefix that some tree builds add
+        if tx_port_name.startswith("• ") or tx_port_name.startswith("● "):
+            tx_port_name = tx_port_name[2:].strip()
+        # Sanity-guard: reject the streams-table continuation marker. It
+        # should never appear in the server tree, but guarding here means
+        # a regression elsewhere can't silently create a "TG 0 - Port: ↳"
+        # ghost key in self.streams.
+        if not tx_port_name or tx_port_name == "↳":
+            QMessageBox.warning(
+                self, "Invalid Port",
+                f"Could not resolve a port name from the selected tree item "
+                f"(got {raw_port_text!r}). Please pick a port from the server "
+                f"tree, not a stream row.",
+            )
+            return
+        full_port_name = f"{tg_id} - Port: {tx_port_name}"
 
         if full_port_name not in self.streams:
             self.streams[full_port_name] = []
@@ -885,6 +910,19 @@ class TrafficGenClientStreamControl:
         # Remove radio symbol if present
         if port_name.startswith("• ") or port_name.startswith("● "):
             port_name = port_name[2:]  # Remove bullet prefix
+        # Sanity-guard against bogus selections. The server tree never
+        # holds "↳" — that's the streams-table continuation marker — but
+        # reject it explicitly so a regression elsewhere can't silently
+        # create a "TG 0 - Port: ↳" ghost key in self.streams. Same guard
+        # for an empty selection (which would build "TG 0 - Port: ").
+        if not port_name or port_name == "↳":
+            QMessageBox.warning(
+                self, "Invalid Port",
+                f"Could not resolve a port name from the selected tree item "
+                f"(got {selected_item.text(0)!r}). Please pick a port from "
+                f"the server tree on the left.",
+            )
+            return
         full_port_name = f"TG {tg_id} - Port: {port_name}"
         logger.debug(f"Selected interface: {port_name}")
         logger.debug(f"Full port name: {full_port_name}")
