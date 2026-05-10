@@ -149,6 +149,22 @@ class TrafficGeneratorClient(
             self.statistics_group.setTitle("")
         self.statistics_dock.setWidget(self.statistics_group)
         self.addDockWidget(Qt.BottomDockWidgetArea, self.statistics_dock)
+        # Default Qt behaviour gives the central widget all the spare
+        # vertical real estate; the dock collapses to its content's
+        # sizeHint, which in our case is just one stats table row tall.
+        # That's the "Traffic stats section is small" complaint.
+        #
+        # Two-part fix:
+        #  1) Set a generous minimumHeight on the dock content so the
+        #     stats area is at least readable from the start.
+        #  2) Override resizeEvent (below) to call resizeDocks() with
+        #     a 50/50 split so window-stretches grow BOTH halves
+        #     proportionally instead of giving everything to the top.
+        self.statistics_group.setMinimumHeight(380)
+        # Tell Qt to size the dock to roughly half the window height.
+        # Calling here on init (before show) is cheap — actual layout
+        # computation happens in showEvent / resizeEvent below.
+        self._stats_dock_min_height = 380
         # Keep `self.splitter` as an alias to top_section for any older code that
         # referenced the vertical splitter directly (defensive).
         self.splitter = self.top_section
@@ -315,6 +331,56 @@ class TrafficGeneratorClient(
         self.statistics_dock.setFloating(False)
         self.statistics_dock.show()
         self.statistics_dock.raise_()
+
+    def _balance_stats_dock(self):
+        """Give the Traffic Statistics dock ~half the window height.
+
+        Called from showEvent (initial layout) and resizeEvent (when the
+        user stretches the window). Without this, QMainWindow's default
+        layout policy hands all spare vertical space to the central
+        widget — so when the window grows, the top section stretches
+        and the stats dock stays small. resizeDocks() with explicit
+        per-dock sizes overrides that.
+        """
+        if not hasattr(self, "statistics_dock"):
+            return
+        if self.statistics_dock.isFloating() or not self.statistics_dock.isVisible():
+            return
+        try:
+            min_h = getattr(self, "_stats_dock_min_height", 380)
+            target = max(min_h, self.height() // 2)
+            self.resizeDocks([self.statistics_dock], [target], Qt.Vertical)
+        except Exception as e:
+            logger.debug(f"[LAYOUT] resizeDocks failed: {e}")
+
+    def showEvent(self, event):
+        """Re-balance the stats dock once the window is visible.
+
+        Has to happen after Qt has computed the actual window geometry
+        — calling resizeDocks() in __init__ before show() has no
+        effect because the layout system hasn't run yet.
+        """
+        super().showEvent(event)
+        # Defer one event-loop tick so geometry is settled. QTimer.singleShot(0)
+        # runs after the show is complete.
+        QTimer.singleShot(0, self._balance_stats_dock)
+
+    def resizeEvent(self, event):
+        """Keep the stats dock proportional when the user stretches the window.
+
+        Without this, only the central widget grows when the window is
+        resized larger — the dock stays at whatever pixel height it
+        had. This re-balances on every resize so the stats area
+        actually grows along with the window.
+        """
+        super().resizeEvent(event)
+        # Don't fight the user mid-drag of the dock-splitter handle —
+        # only re-balance when the geometry change came from the window
+        # itself. We detect that by checking the dock's drag state via
+        # a flag on the dock title bar, but Qt doesn't expose that
+        # cleanly; instead we just defer the rebalance enough that
+        # rapid drags settle.
+        QTimer.singleShot(0, self._balance_stats_dock)
 
     def closeEvent(self, event):
         """Handle application close event - cleanup threads and resources."""
