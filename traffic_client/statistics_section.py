@@ -359,6 +359,34 @@ class TrafficGenClientStatisticsSection():
         layout.setContentsMargins(2, 2, 2, 2)
         layout.setSpacing(2)
 
+        # Affordance hint — tells the user they can detach the stats
+        # dock into a floating window (a QDockWidget feature that's
+        # technically discoverable via drag-the-titlebar or the
+        # float-button in the title chrome, but most users don't
+        # find it without a nudge). Subtle styling so it doesn't
+        # compete with the actual data tables for attention.
+        self.stats_dock_hint = QLabel(
+            "💡  Double-click the title bar (or drag it) to pop the "
+            "Traffic Statistics out into a separate window."
+        )
+        self.stats_dock_hint.setStyleSheet(
+            "QLabel {"
+            "  color: #6b7280;"
+            "  font-size: 11px;"
+            "  font-style: italic;"
+            "  padding: 4px 10px;"
+            "  background-color: #f9fafb;"
+            "  border-left: 3px solid #93c5fd;"
+            "  border-radius: 2px;"
+            "}"
+        )
+        self.stats_dock_hint.setToolTip(
+            "Click the 'X' icon in the title bar to close the pane.\n"
+            "Bring it back any time via View → Traffic Statistics Pane,\n"
+            "or use 'Re-dock Traffic Statistics' if it gets stranded."
+        )
+        layout.addWidget(self.stats_dock_hint)
+
         # Create tab widget for statistics
         self.statistics_tab_widget = QTabWidget()
         
