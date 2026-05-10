@@ -172,6 +172,14 @@ class TrafficGeneratorClient(
         self.setup_traffic_statistics_section()
         self.statistics_dock = QDockWidget("Traffic Statistics", self)
         self.statistics_dock.setObjectName("trafficStatisticsDock")  # Required for saveState/restoreState
+        # Title-bar tooltip — gives the user a hover affordance for the
+        # detach/close behavior. Pairs with the persistent hint banner
+        # inside the dock content (see statistics_section.py).
+        self.statistics_dock.setToolTip(
+            "Double-click to detach this pane into a floating window.\n"
+            "Drag the title bar to move/dock it elsewhere.\n"
+            "Close with the X — bring it back via View → Traffic Statistics Pane."
+        )
         self.statistics_dock.setAllowedAreas(Qt.BottomDockWidgetArea | Qt.TopDockWidgetArea)
         self.statistics_dock.setFeatures(
             QDockWidget.DockWidgetMovable
