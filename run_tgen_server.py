@@ -812,8 +812,11 @@ def stop_traffic():
             if future:
                 logging.info(f"⏳ Waiting for thread to finish for stream {stream_id}...")
                 try:
-                    # Wait up to 5 seconds for thread to complete
-                    future.result(timeout=5.0)
+                    # Short graceful window — the backstop pkill below
+                    # catches any miss, so 2s is enough for the launcher
+                    # to drain in the common case. Keeps the whole stop
+                    # endpoint inside the client's 15s read timeout.
+                    future.result(timeout=2.0)
                     logging.info(f"✅ Thread completed for stream {stream_id}")
                     future_completed = True
                 except Exception as e:
@@ -837,7 +840,7 @@ def stop_traffic():
                     )
                     _sp.run(["pkill", "-TERM", "-f", "--", pat], capture_output=True, timeout=3)
                     import time as _t
-                    _t.sleep(1.0)
+                    _t.sleep(0.5)
                     _sp.run(["pkill", "-KILL", "-f", "--", pat], capture_output=True, timeout=3)
                     logging.info(f"✅ Force-kill complete for stream {stream_id}")
             except Exception as e:
@@ -866,11 +869,12 @@ def stop_traffic():
                         logging.info(f"Stopping stream {actual_stream_id} (name: '{stream_name}') on {interface_normalized}")
                         s["stop_event"].set()
 
-                        # Wait for the thread to actually finish (with timeout)
+                        # Wait for the thread to actually finish (with timeout).
+                        # Same 2s graceful window as the by-id branch above.
                         future = s.get("future")
                         if future:
                             try:
-                                future.result(timeout=5.0)
+                                future.result(timeout=2.0)
                                 logging.info(f"✅ Thread completed for stream {actual_stream_id}")
                             except Exception as e:
                                 logging.warning(f"⚠️ Thread for stream {actual_stream_id} did not complete within timeout: {e}")
@@ -889,7 +893,7 @@ def stop_traffic():
                                 )
                                 _sp.run(["pkill", "-TERM", "-f", "--", pat], capture_output=True, timeout=3)
                                 import time as _t
-                                _t.sleep(1.0)
+                                _t.sleep(0.5)
                                 _sp.run(["pkill", "-KILL", "-f", "--", pat], capture_output=True, timeout=3)
                         except Exception as _e:
                             logging.warning(f"⚠️ Backstop pkill for stream {actual_stream_id} failed: {_e}")
