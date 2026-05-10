@@ -506,6 +506,548 @@ def show_install_guide(parent=None):
     _open_help_dialog(parent, "Netgen Server — Installation Guide", _INSTALL_GUIDE_HTML)
 
 
+# =============================================================================
+# API Guide — REST cheatsheet for the netgen-server traffic API
+# =============================================================================
+# Reachable from Help → API Guide. Worked examples for every packet type
+# supported by the engine, both Scapy/kernel path and DPDK path, plus the
+# stream-control + stats endpoints. Single source of truth for "how do I
+# script traffic against this thing."
+
+_API_GUIDE_HTML = r"""
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         color: #1f2937; line-height: 1.55; font-size: 12px; }
+  h1 { color: #1e40af; font-size: 20px; margin: 0 0 8px 0; }
+  h2 { color: #374151; font-size: 15px; margin-top: 22px;
+       border-bottom: 1px solid #e5e7eb; padding-bottom: 4px; }
+  h3 { color: #4b5563; font-size: 13px; margin-top: 14px; }
+  h4 { color: #6b7280; font-size: 12px; margin-top: 10px;
+       text-transform: uppercase; letter-spacing: 0.4px; }
+  p, li { color: #374151; }
+  code { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+         background: #f3f4f6; padding: 1px 5px; border-radius: 3px;
+         font-size: 11px; color: #1e3a8a; }
+  pre { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+        background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 4px;
+        padding: 10px; font-size: 11px; color: #111827;
+        white-space: pre; }
+  table { border-collapse: collapse; margin-top: 6px; font-size: 11px; }
+  th, td { border: 1px solid #d1d5db; padding: 5px 9px; text-align: left;
+           vertical-align: top; }
+  th { background: #f3f4f6; color: #374151; font-weight: 600; }
+  td.method { font-family: ui-monospace, monospace; font-weight: 600;
+              color: #1d4ed8; white-space: nowrap; }
+  .dpdk { color: #1d4ed8; font-weight: 600; }
+  .scapy { color: #6b7280; font-weight: 600; }
+  .muted { color: #6b7280; font-size: 11px; }
+  .warn { background: #fef3c7; border-left: 3px solid #d97706;
+          padding: 8px 12px; margin: 10px 0; }
+</style>
+
+<h1>Netgen Server — REST API Guide</h1>
+<p class="muted">The traffic API is a small Flask app on port 5050. No auth
+(internal use). All requests/responses are JSON. Examples below are
+copy-pasteable curl commands you can run from any host that can reach
+<code>http://&lt;server&gt;:5050</code>.</p>
+
+<h2>1. Endpoint summary</h2>
+
+<table>
+  <tr><th>Method</th><th>Endpoint</th><th>Purpose</th></tr>
+  <tr><td class="method">POST</td><td><code>/api/traffic/start</code></td>
+      <td>Launch one or more streams.</td></tr>
+  <tr><td class="method">POST</td><td><code>/api/traffic/stop</code></td>
+      <td>Stop running streams by id.</td></tr>
+  <tr><td class="method">POST</td><td><code>/api/traffic/restart</code></td>
+      <td>Stop + start a stream in one call.</td></tr>
+  <tr><td class="method">GET</td> <td><code>/api/streams/stats</code></td>
+      <td>Live per-stream stats (tx/rx counts, rates, status).</td></tr>
+  <tr><td class="method">GET</td> <td><code>/api/streams/load</code></td>
+      <td>Persisted streams from the SQLite stream database.</td></tr>
+  <tr><td class="method">GET</td> <td><code>/api/streams/save</code></td>
+      <td>Force a sync of the in-memory stream tracker to disk.</td></tr>
+  <tr><td class="method">GET</td> <td><code>/api/interfaces</code></td>
+      <td>Per-interface kernel netdev counters + link state.</td></tr>
+  <tr><td class="method">GET</td> <td><code>/api/dpdk/recommend</code></td>
+      <td>Suggested <code>dpdk_tx_cores</code> for an iface + frame_size + pps target.</td></tr>
+  <tr><td class="method">GET</td> <td><code>/api/dpdk/status</code></td>
+      <td>DPDK runtime status (libs installed, hugepages, IOMMU).</td></tr>
+  <tr><td class="method">POST</td><td><code>/api/dpdk/bind</code> /
+                                       <code>unbind</code></td>
+      <td>Bind/unbind a NIC to <code>vfio-pci</code> (Broadcom/Intel only).</td></tr>
+  <tr><td class="method">GET</td> <td><code>/admin</code></td>
+      <td>Single-page web UI for runtime configuration.</td></tr>
+</table>
+
+<h2>2. Common stream JSON shape</h2>
+
+<p>Every <code>/api/traffic/start</code> body is keyed by interface label,
+with a list of stream objects per interface:</p>
+
+<pre>{
+  "streams": {
+    "Port:&lt;iface&gt;": [
+      { ...stream object 1... },
+      { ...stream object 2... }
+    ]
+  }
+}</pre>
+
+<p>The stream object accepts these top-level fields (all optional except
+where noted; sensible defaults are applied):</p>
+
+<table>
+  <tr><th>Field</th><th>Type</th><th>Notes</th></tr>
+  <tr><td><code>name</code></td><td>string</td>
+      <td>Display name. Defaults to "Unnamed Stream".</td></tr>
+  <tr><td><code>enabled</code></td><td>bool</td>
+      <td>Must be <code>true</code> for the stream to actually start.</td></tr>
+  <tr><td><code>stream_id</code></td><td>string (UUID)</td>
+      <td>Optional. Server generates one if missing. Required for stop.</td></tr>
+  <tr><td><code>L2</code> / <code>L3</code> / <code>L4</code></td>
+      <td>string</td>
+      <td>"Ethernet" / ("IPv4" or "IPv6") / ("UDP" or "TCP" or "ICMP")</td></tr>
+  <tr><td><code>VLAN</code></td><td>string</td>
+      <td>"Untagged" or "Tagged".</td></tr>
+  <tr><td><code>frame_size</code></td><td>int</td>
+      <td>Bytes. Server-side default 64. Used for rate math too.</td></tr>
+  <tr><td><code>flow_tracking_enabled</code></td><td>bool</td>
+      <td>Enable RX sniff for loss-percentage / rx_count tracking.</td></tr>
+  <tr><td><code>rx_port</code></td><td>string</td>
+      <td>"Same as TX Port" or a "TG N - Port: ifaceX" label. Optional.</td></tr>
+  <tr><td><code>protocol_data</code></td><td>nested object</td>
+      <td>Per-layer field bag. See per-protocol sections below.</td></tr>
+  <tr><td><code>stream_rate_type</code></td><td>string</td>
+      <td>"Line Rate" | "Packets Per Second (PPS)" | "Bit Rate (Mbps)" | "Load (%)"</td></tr>
+  <tr><td><code>stream_pps_rate</code></td><td>int</td>
+      <td>When <code>stream_rate_type == "Packets Per Second (PPS)"</code>.</td></tr>
+  <tr><td><code>stream_bit_rate</code></td><td>int</td>
+      <td>Mbps. When rate_type is bit-rate.</td></tr>
+  <tr><td><code>stream_duration_mode</code> /
+          <code>stream_duration_seconds</code></td><td>string / int</td>
+      <td>"Continuous" or "Seconds" + a count. Defaults to continuous.</td></tr>
+  <tr><td class="dpdk"><code>dpdk_enable</code></td><td>bool</td>
+      <td><span class="dpdk">DPDK only.</span> Use <code>tx_worker</code> backend.
+          Requires <code>L4 == "UDP"</code>.</td></tr>
+  <tr><td class="dpdk"><code>dpdk_tx_cores</code></td><td>int</td>
+      <td><span class="dpdk">DPDK only.</span> 1–16. Default 1. With Line Rate
+          + default 1, the launcher auto-bumps based on link speed.</td></tr>
+</table>
+
+<h2>3. Engine: Scapy/kernel vs DPDK</h2>
+
+<table>
+  <tr><th></th>
+      <th><span class="scapy">Scapy / kernel</span></th>
+      <th><span class="dpdk">DPDK / tx_worker</span></th></tr>
+  <tr><td><b>How to opt in</b></td>
+      <td>Default. Don't set <code>dpdk_enable</code>.</td>
+      <td>Set <code>"dpdk_enable": true</code> in the stream JSON.</td></tr>
+  <tr><td><b>L4 supported</b></td>
+      <td>UDP, TCP, ICMP, raw payloads</td>
+      <td><b>UDP only.</b> TCP/ICMP fall back to Scapy with a warning.</td></tr>
+  <tr><td><b>L3</b></td><td>IPv4, IPv6</td><td>IPv4 (IPv6 not yet supported in tx_worker)</td></tr>
+  <tr><td><b>VLAN</b></td><td>✓</td><td>✓ (single tag)</td></tr>
+  <tr><td><b>Typical rate</b></td>
+      <td>~50K – 1M pps</td>
+      <td>Up to ~395 Gbps / 32 Mpps at 1500B (12 cores, line-rate)</td></tr>
+  <tr><td><b>Prereqs</b></td>
+      <td>Just kernel + python-scapy</td>
+      <td>DPDK libs + tx_worker binary + hugepages + (Broadcom/Intel) vfio-pci</td></tr>
+</table>
+
+<div class="warn">
+<b>Heads up:</b> if you set <code>dpdk_enable: true</code> with
+<code>L4: "ICMP"</code> (or any non-UDP), the launcher logs a warning and
+silently uses UDP for the L4 header. The Scapy path honors L4 faithfully.
+For ICMP / TCP, leave DPDK off.
+</div>
+
+<h2>4. Worked examples — packet types</h2>
+
+<h3>4a. Bare Ethernet (no L3)</h3>
+<p>Two MACs flooding raw frames. Useful for L2 forwarding tests.</p>
+<pre>curl -X POST http://&lt;server&gt;:5050/api/traffic/start \
+  -H "Content-Type: application/json" \
+  -d '{
+    "streams": {
+      "Port:enp181s0f0np0": [{
+        "name": "L2-bare",
+        "enabled": true,
+        "frame_size": 64,
+        "L2": "Ethernet",
+        "L3": "None",
+        "L4": "None",
+        "VLAN": "Untagged",
+        "stream_rate_type": "Packets Per Second (PPS)",
+        "stream_pps_rate": 100000,
+        "protocol_data": {
+          "mac": {
+            "mac_source_address": "00:00:00:00:00:01",
+            "mac_destination_address": "00:00:00:00:00:02"
+          }
+        }
+      }]
+    }
+  }'</pre>
+
+<h3>4b. IPv4 + UDP <span class="muted">(works on both engines)</span></h3>
+
+<h4>Scapy / kernel path</h4>
+<pre>curl -X POST http://&lt;server&gt;:5050/api/traffic/start \
+  -H "Content-Type: application/json" \
+  -d '{
+    "streams": {
+      "Port:enp181s0f0np0": [{
+        "name": "ipv4-udp",
+        "enabled": true,
+        "frame_size": 512,
+        "L2": "Ethernet", "L3": "IPv4", "L4": "UDP",
+        "VLAN": "Untagged",
+        "stream_rate_type": "Packets Per Second (PPS)",
+        "stream_pps_rate": 100000,
+        "protocol_data": {
+          "mac":  { "mac_source_address": "aa:bb:cc:dd:ee:01",
+                    "mac_destination_address": "aa:bb:cc:dd:ee:02" },
+          "ipv4": { "ipv4_source": "10.0.0.1",
+                    "ipv4_destination": "10.0.0.2",
+                    "ttl": 64 },
+          "udp":  { "udp_source_port": "12345",
+                    "udp_destination_port": "54321" }
+        }
+      }]
+    }
+  }'</pre>
+
+<h4>DPDK / tx_worker path — line rate</h4>
+<pre>curl -X POST http://&lt;server&gt;:5050/api/traffic/start \
+  -H "Content-Type: application/json" \
+  -d '{
+    "streams": {
+      "Port:enp181s0f0np0": [{
+        "name": "ipv4-udp-blast",
+        "enabled": true,
+        "frame_size": 1500,
+        "L2": "Ethernet", "L3": "IPv4", "L4": "UDP",
+        "VLAN": "Untagged",
+        "stream_rate_type": "Line Rate",
+        "dpdk_enable": true,
+        "protocol_data": {
+          "mac":  { "mac_source_address": "aa:bb:cc:dd:ee:01",
+                    "mac_destination_address": "aa:bb:cc:dd:ee:02" },
+          "ipv4": { "ipv4_source": "10.0.0.1",
+                    "ipv4_destination": "10.0.0.2" },
+          "udp":  { "udp_source_port": "1234",
+                    "udp_destination_port": "4791" }
+        }
+      }]
+    }
+  }'</pre>
+<p class="muted">With Line Rate + no <code>dpdk_tx_cores</code> override, the
+launcher reads <code>/sys/class/net/&lt;iface&gt;/speed</code> and auto-picks
+the right number of TX queues (12 for 400G@1500B). To pin manually, add
+<code>"dpdk_tx_cores": 8</code>.</p>
+
+<h3>4c. IPv4 + TCP <span class="muted">(Scapy only)</span></h3>
+<pre>curl -X POST http://&lt;server&gt;:5050/api/traffic/start \
+  -H "Content-Type: application/json" \
+  -d '{
+    "streams": {
+      "Port:enp181s0f0np0": [{
+        "name": "ipv4-tcp",
+        "enabled": true,
+        "frame_size": 256,
+        "L2": "Ethernet", "L3": "IPv4", "L4": "TCP",
+        "VLAN": "Untagged",
+        "stream_rate_type": "Packets Per Second (PPS)",
+        "stream_pps_rate": 50000,
+        "protocol_data": {
+          "mac":  { "mac_source_address": "aa:bb:cc:dd:ee:01",
+                    "mac_destination_address": "aa:bb:cc:dd:ee:02" },
+          "ipv4": { "ipv4_source": "10.0.0.1",
+                    "ipv4_destination": "10.0.0.2" },
+          "tcp":  { "tcp_source_port": "10000",
+                    "tcp_destination_port": "80",
+                    "tcp_flags": "SYN" }
+        }
+      }]
+    }
+  }'</pre>
+
+<h3>4d. IPv4 + ICMP <span class="muted">(Scapy only)</span></h3>
+<pre>curl -X POST http://&lt;server&gt;:5050/api/traffic/start \
+  -H "Content-Type: application/json" \
+  -d '{
+    "streams": {
+      "Port:enp181s0f0np0": [{
+        "name": "ipv4-icmp",
+        "enabled": true,
+        "frame_size": 64,
+        "L2": "Ethernet", "L3": "IPv4", "L4": "ICMP",
+        "VLAN": "Untagged",
+        "stream_rate_type": "Packets Per Second (PPS)",
+        "stream_pps_rate": 1000,
+        "protocol_data": {
+          "mac":  { "mac_source_address": "aa:bb:cc:dd:ee:01",
+                    "mac_destination_address": "aa:bb:cc:dd:ee:02" },
+          "ipv4": { "ipv4_source": "10.0.0.1",
+                    "ipv4_destination": "10.0.0.2" },
+          "icmp": { "icmp_type": "8", "icmp_code": "0" }
+        }
+      }]
+    }
+  }'</pre>
+
+<h3>4e. IPv6 + UDP <span class="muted">(Scapy only — DPDK doesn't support IPv6 yet)</span></h3>
+<pre>curl -X POST http://&lt;server&gt;:5050/api/traffic/start \
+  -H "Content-Type: application/json" \
+  -d '{
+    "streams": {
+      "Port:enp181s0f0np0": [{
+        "name": "ipv6-udp",
+        "enabled": true,
+        "frame_size": 512,
+        "L2": "Ethernet", "L3": "IPv6", "L4": "UDP",
+        "VLAN": "Untagged",
+        "stream_rate_type": "Packets Per Second (PPS)",
+        "stream_pps_rate": 100000,
+        "protocol_data": {
+          "mac":  { "mac_source_address": "aa:bb:cc:dd:ee:01",
+                    "mac_destination_address": "aa:bb:cc:dd:ee:02" },
+          "ipv6": { "ipv6_source": "2001:db8::1",
+                    "ipv6_destination": "2001:db8::2",
+                    "hop_limit": 64 },
+          "udp":  { "udp_source_port": "12345",
+                    "udp_destination_port": "54321" }
+        }
+      }]
+    }
+  }'</pre>
+
+<h3>4f. VLAN-tagged IPv4 + UDP <span class="muted">(both engines)</span></h3>
+<pre>curl -X POST http://&lt;server&gt;:5050/api/traffic/start \
+  -H "Content-Type: application/json" \
+  -d '{
+    "streams": {
+      "Port:enp181s0f0np0": [{
+        "name": "vlan-udp",
+        "enabled": true,
+        "frame_size": 1500,
+        "L2": "Ethernet", "L3": "IPv4", "L4": "UDP",
+        "VLAN": "Tagged",
+        "stream_rate_type": "Line Rate",
+        "dpdk_enable": true,
+        "protocol_data": {
+          "mac":  { "mac_source_address": "aa:bb:cc:dd:ee:01",
+                    "mac_destination_address": "aa:bb:cc:dd:ee:02" },
+          "vlan": { "vlan_id": "100", "vlan_priority": "0" },
+          "ipv4": { "ipv4_source": "10.0.0.1",
+                    "ipv4_destination": "10.0.0.2" },
+          "udp":  { "udp_source_port": "1234",
+                    "udp_destination_port": "4791" }
+        }
+      }]
+    }
+  }'</pre>
+
+<h3>4g. Multiple streams in one call</h3>
+<pre>curl -X POST http://&lt;server&gt;:5050/api/traffic/start \
+  -H "Content-Type: application/json" \
+  -d '{
+    "streams": {
+      "Port:enp181s0f0np0": [
+        { "name": "udp-1k",  "enabled": true, "frame_size": 1500,
+          "L4": "UDP", "stream_rate_type": "Packets Per Second (PPS)",
+          "stream_pps_rate": 1000, "dpdk_enable": false,
+          "protocol_data": { ...IPv4+UDP... } },
+        { "name": "tcp-syn", "enabled": true, "frame_size": 256,
+          "L4": "TCP", "stream_rate_type": "Packets Per Second (PPS)",
+          "stream_pps_rate": 500,
+          "protocol_data": { ...IPv4+TCP... } }
+      ],
+      "Port:enp181s0f1np1": [
+        { "name": "v6-udp", "enabled": true, "frame_size": 512,
+          "L3": "IPv6", "L4": "UDP",
+          "protocol_data": { ...IPv6+UDP... } }
+      ]
+    }
+  }'</pre>
+<p class="muted">Streams on different interfaces start in parallel. Streams
+on the same interface run concurrently in separate threads.</p>
+
+<h2>5. Rate types</h2>
+
+<table>
+  <tr><th><code>stream_rate_type</code></th><th>Companion field</th><th>Effect</th></tr>
+  <tr><td>"Line Rate"</td><td>—</td>
+      <td>Flood. DPDK auto-picks <code>tx_cores</code> from link speed.
+          Scapy floods at kernel speed (~1M pps cap).</td></tr>
+  <tr><td>"Packets Per Second (PPS)"</td>
+      <td><code>stream_pps_rate</code></td>
+      <td>Pace at the requested PPS. tx_worker uses TSC pacing
+          per-burst; Scapy uses time.sleep().</td></tr>
+  <tr><td>"Bit Rate (Mbps)"</td>
+      <td><code>stream_bit_rate</code></td>
+      <td>Server converts to PPS using <code>bps / ((frame_size + 20) * 8)</code>.</td></tr>
+  <tr><td>"Load (%)"</td>
+      <td><code>stream_load_percentage</code></td>
+      <td>% of link rate. Useful for "fill 50% of the pipe" tests.</td></tr>
+</table>
+
+<h2>6. Stream control</h2>
+
+<h3>Stop by stream id</h3>
+<pre>curl -X POST http://&lt;server&gt;:5050/api/traffic/stop \
+  -H "Content-Type: application/json" \
+  -d '{
+    "streams": [
+      { "interface": "enp181s0f0np0",
+        "stream_id": "&lt;uuid-from-start-response&gt;" }
+    ]
+  }'</pre>
+
+<p>Behavior:</p>
+<ul>
+  <li>Sets the stream's <code>stop_event</code>.</li>
+  <li>Waits up to 2s for the launcher's graceful drain.</li>
+  <li>If still alive, force-kills any tx_worker matching the stream id
+      via <code>pkill -- "--stream-id &lt;sid&gt;"</code> (defense in depth
+      against orphan tx_worker leaks).</li>
+  <li>Marks the stream as Stopped in the SQLite database.</li>
+</ul>
+
+<h3>Live stats</h3>
+<pre>curl -G http://&lt;server&gt;:5050/api/streams/stats \
+  --data-urlencode "status=Running"</pre>
+
+<p>Response:</p>
+<pre>{
+  "active_streams": [{
+    "stream_id":      "&lt;uuid&gt;",
+    "stream_name":    "ipv4-udp-blast",
+    "interface":      "enp181s0f0np0",
+    "tg_id":          0,
+    "status":         "Running",
+    "tx_count":       12345678901,    // cumulative since stream start
+    "rx_count":       0,              // 0 if flow tracking off
+    "tx_rate":        32794646.5,     // pps (delta-based)
+    "rx_rate":        0.0,
+    "frame_size":     1500,
+    "dpdk_enable":    true,
+    "dpdk_tx_cores":  12,
+    "started_at":     "2026-05-10T07:05:10+00:00",
+    "updated_at":     "2026-05-10T07:05:38+00:00"
+  }]
+}</pre>
+
+<p class="muted">Bit rate (bps) isn't returned directly — derive it as
+<code>tx_rate * frame_size * 8</code>. The client does this in the
+Stream Statistics tab's TX Bit Rate column.</p>
+
+<h2>7. DPDK helper endpoints</h2>
+
+<h3>Get tx_cores recommendation</h3>
+<pre>curl -G http://&lt;server&gt;:5050/api/dpdk/recommend \
+  --data-urlencode "iface=enp181s0f0np0" \
+  --data-urlencode "frame_size=1500" \
+  --data-urlencode "pps=0"      # 0 = line rate
+
+# →
+# {
+#   "ok": true,
+#   "iface": "enp181s0f0np0",
+#   "link_speed_mbps": 400000,
+#   "frame_size": 1500,
+#   "target_pps": 32894736,
+#   "line_rate_pps": 32894736,
+#   "estimated_pps_per_core": 4100000,
+#   "recommended_tx_cores": 12,
+#   "explanation": "Link 400 Gbps; line rate at 1500B = 32,894,736 pps. ..."
+# }</pre>
+
+<h3>DPDK runtime status</h3>
+<pre>curl http://&lt;server&gt;:5050/api/dpdk/status
+# returns hugepage state, IOMMU state, kernel-driver presence,
+# bound vfio-pci interfaces, etc.</pre>
+
+<h3>Bind / unbind a NIC <span class="muted">(Broadcom/Intel only — Mellanox doesn't need this)</span></h3>
+<pre>curl -X POST http://&lt;server&gt;:5050/api/dpdk/bind \
+  -H "Content-Type: application/json" \
+  -d '{ "interface": "enp65s0f0np0", "force": false }'
+
+# Unbind:
+curl -X POST http://&lt;server&gt;:5050/api/dpdk/unbind \
+  -H "Content-Type: application/json" \
+  -d '{ "interface": "enp65s0f0np0", "kernel_driver": "bnxt_en" }'</pre>
+
+<h2>8. Polling pattern</h2>
+
+<p>Standard "kick off + poll" pattern in bash:</p>
+<pre>#!/bin/bash
+SERVER=svl-d-ai-srv01:5050
+IFACE=enp181s0f0np0
+SID=$(uuidgen)
+
+# Start
+curl -s -X POST http://$SERVER/api/traffic/start \
+  -H "Content-Type: application/json" \
+  -d "{ \"streams\": { \"Port:$IFACE\": [{
+        \"name\": \"blast\", \"enabled\": true, \"stream_id\": \"$SID\",
+        \"frame_size\": 1500, \"L4\": \"UDP\",
+        \"stream_rate_type\": \"Line Rate\", \"dpdk_enable\": true,
+        \"protocol_data\": { ... } }] } }" &gt; /dev/null
+
+# Poll every 2 seconds
+for i in $(seq 1 30); do
+  curl -s "http://$SERVER/api/streams/stats?status=Running" \
+    | jq -r ".active_streams[] | select(.stream_id == \"$SID\")
+             | \"\\(.tx_rate / 1e6 | floor) Mpps  \\(.tx_count) frames\""
+  sleep 2
+done
+
+# Stop
+curl -s -X POST http://$SERVER/api/traffic/stop \
+  -H "Content-Type: application/json" \
+  -d "{ \"streams\": [{ \"interface\": \"$IFACE\", \"stream_id\": \"$SID\" }] }"</pre>
+
+<h2>9. Common gotchas</h2>
+
+<table>
+  <tr><th>Symptom</th><th>Likely cause</th></tr>
+  <tr><td>Stream "starts" but tx_count stays 0</td>
+      <td>Wheel-shipped stale tx_worker binary, or DPDK not installed.
+          Check <code>/api/dpdk/status</code>.</td></tr>
+  <tr><td>DPDK stream actually sends ICMP/TCP</td>
+      <td>tx_worker is UDP-only. Set L4=UDP or remove dpdk_enable.</td></tr>
+  <tr><td>Line Rate request only hits a fraction of link speed</td>
+      <td>Default <code>dpdk_tx_cores=1</code>. Auto-pick fires only when
+          <code>dpdk_tx_cores</code> is unset; if you sent
+          <code>"dpdk_tx_cores": 1</code>, you get one TX queue. Either
+          omit the field or call /api/dpdk/recommend first.</td></tr>
+  <tr><td>tx_rate / Loss% values look wrong after restart</td>
+      <td>Tracker cumulative counter resets on stream restart. The
+          client's "Clear Stats" applies a baseline tare — do that, then
+          restart the stream.</td></tr>
+  <tr><td>"Read timed out (read timeout=15)" on stop</td>
+      <td>Server's stop endpoint takes &lt;3s normally. A 15s timeout
+          means the launcher hung AND the backstop pkill missed —
+          extremely rare; check journalctl for matching errors.</td></tr>
+</table>
+
+<h2>10. Authentication, CORS, rate limiting</h2>
+
+<p><b>None.</b> The server has no auth layer, no CORS preflight handling,
+no rate limiting. Internal-network use only — never expose port 5050 to
+the public internet.</p>
+"""
+
+
+def show_api_guide(parent=None):
+    """Open the REST API Guide dialog. Reachable from Help → API Guide."""
+    _open_help_dialog(parent, "Netgen Server — REST API Guide", _API_GUIDE_HTML)
+
+
 def _open_help_dialog(parent, title, html):
     """Shared QTextBrowser-in-a-QDialog shell used by all Help entries.
     Keeps the look + close-button behavior consistent."""
