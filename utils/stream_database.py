@@ -16,14 +16,27 @@ logger = logging.getLogger(__name__)
 
 class StreamDatabase:
     """SQLite-based stream database for OSTG"""
-    
-    def __init__(self, db_path: str = "/opt/OSTG/device_database.db"):
+
+    def __init__(self, db_path: Optional[str] = None):
         """
         Initialize stream database (uses same DB file as device database).
-        
+
         Args:
-            db_path: Path to SQLite database file
+            db_path: Path to SQLite database file. When None (default),
+                     resolved via utils.device_database._resolve_db_path()
+                     — env var → /opt/netgen/database.db → legacy
+                     /opt/OSTG/device_database.db fallback. Both
+                     DeviceDatabase and StreamDatabase share the same
+                     file so they must agree on resolution.
         """
+        if db_path is None:
+            try:
+                from utils.device_database import _resolve_db_path
+                db_path = _resolve_db_path()
+            except Exception:
+                # Defensive fallback if the import path differs in some
+                # deployment layouts.
+                db_path = "/opt/netgen/database.db"
         self.db_path = db_path
         self.ensure_db_directory()
         self.init_database()
