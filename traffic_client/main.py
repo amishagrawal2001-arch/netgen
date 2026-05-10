@@ -225,6 +225,16 @@ class TrafficGeneratorClient(
             self.statistics_group.setTitle("")
         self.statistics_dock.setWidget(self.statistics_group)
         self.addDockWidget(Qt.BottomDockWidgetArea, self.statistics_dock)
+        # Keep the affordance hint in sync with float state — when the
+        # dock is detached the user needs the inverse instruction
+        # ("drag back / View → Re-dock to attach"). Connecting here
+        # rather than inside setup_traffic_statistics_section() because
+        # the dock object is owned by main.py.
+        self.statistics_dock.topLevelChanged.connect(
+            self._on_stats_dock_float_changed
+        )
+        # Prime the hint to match the current (docked) state.
+        self._on_stats_dock_float_changed(self.statistics_dock.isFloating())
         # Default Qt behaviour gives the central widget all the spare
         # vertical real estate; the dock collapses to its content's
         # sizeHint, which in our case is just one stats table row tall.
@@ -407,6 +417,61 @@ class TrafficGeneratorClient(
         self.statistics_dock.setFloating(False)
         self.statistics_dock.show()
         self.statistics_dock.raise_()
+
+    def _on_stats_dock_float_changed(self, floating):
+        """Swap the hint banner copy when the user detaches/re-attaches.
+
+        Connected to QDockWidget.topLevelChanged. The banner is owned
+        by statistics_section.py as self.stats_dock_hint; we just
+        rewrite its text + tooltip + accent stripe color so the
+        instruction matches the current state.
+        """
+        hint = getattr(self, "stats_dock_hint", None)
+        if hint is None:
+            return
+        if floating:
+            hint.setText(
+                "↩  Double-click the title bar (or drag it back) to "
+                "re-attach this pane. Or use "
+                "View → Re-dock Traffic Statistics."
+            )
+            # Amber accent stripe so the floating-state hint reads
+            # distinct from the docked-state one at a glance.
+            accent = "#f59e0b"
+            tip = (
+                "The pane is currently floating.\n"
+                "Drag the title bar back to the bottom edge of the\n"
+                "main window to re-dock, or pick\n"
+                "View → Re-dock Traffic Statistics."
+            )
+        else:
+            hint.setText(
+                "💡  Double-click the title bar (or drag it) to pop the "
+                "Traffic Statistics out into a separate window."
+            )
+            accent = "#93c5fd"
+            tip = (
+                "Click the 'X' icon in the title bar to close the pane.\n"
+                "Bring it back any time via View → Traffic Statistics Pane,\n"
+                "or use 'Re-dock Traffic Statistics' if it gets stranded."
+            )
+        hint.setStyleSheet(
+            "QLabel {"
+            "  color: #6b7280;"
+            "  font-size: 11px;"
+            "  font-style: italic;"
+            "  padding: 4px 10px;"
+            "  background-color: #f9fafb;"
+            f"  border-left: 3px solid {accent};"
+            "  border-radius: 2px;"
+            "}"
+        )
+        hint.setToolTip(tip)
+        # Keep the dock's own title-bar tooltip in sync too — same
+        # text as the banner's tooltip so the user gets a consistent
+        # message whether they hover the banner or the title bar.
+        if hasattr(self, "statistics_dock") and self.statistics_dock is not None:
+            self.statistics_dock.setToolTip(tip)
 
     def _balance_stats_dock(self):
         """Size the Traffic Statistics dock to its calibrated default
