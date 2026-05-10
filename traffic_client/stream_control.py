@@ -55,8 +55,12 @@ class TrafficGenClientStreamControl:
         # Table styling for professional appearance (muted color scheme)
         self.stream_table.setAlternatingRowColors(True)  # Alternating row colors for better readability
         header = self.stream_table.horizontalHeader()
-        header.setDefaultSectionSize(25)  # Header height
-        header.setHighlightSections(False)  # Don't highlight header sections on click
+        header.setDefaultSectionSize(25)  # default per-column width hint
+        header.setHighlightSections(False)  # don't highlight header sections on click
+        # Fix the header bar height so font-metric quirks on different
+        # platforms can't push it taller than the styled padding implies.
+        # 22px = 11pt label + 3px top + 3px bottom + 5px line-height room.
+        header.setFixedHeight(22)
 
         # Stream table styling — bumped for visibility, matches the
         # palette used in the stats dock and server pane:
@@ -91,12 +95,12 @@ class TrafficGenClientStreamControl:
             }
             QHeaderView::section {
                 background-color: #e5e7eb;
-                padding: 8px 10px;
+                padding: 3px 8px;
                 border: 1px solid #cbd5e1;
                 border-left: none;
                 border-top: none;
                 font-weight: 700;
-                font-size: 12px;
+                font-size: 11px;
                 color: #1f2937;
                 letter-spacing: 0.3px;
             }

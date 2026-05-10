@@ -406,12 +406,12 @@ class TrafficGenClientStatisticsSection():
             }
             QHeaderView::section {
                 background-color: #e5e7eb;
-                padding: 8px 10px;
+                padding: 3px 8px;
                 border: 1px solid #cbd5e1;
                 border-left: none;
                 border-top: none;
                 font-weight: 700;
-                font-size: 12px;
+                font-size: 11px;
                 color: #1f2937;
                 letter-spacing: 0.3px;
             }
@@ -437,6 +437,9 @@ class TrafficGenClientStatisticsSection():
         # to track row-by-row when scanning multiple interfaces.
         self.statistics_table.verticalHeader().setDefaultSectionSize(32)
         self.statistics_table.verticalHeader().setMinimumSectionSize(28)
+        # Cap horizontal-header height so font-metric quirks can't push
+        # it taller than the styled padding implies.
+        self.statistics_table.horizontalHeader().setFixedHeight(22)
         
         interface_stats_layout.addWidget(self.statistics_table)
         interface_stats_layout.setContentsMargins(0, 0, 0, 0)
@@ -459,7 +462,8 @@ class TrafficGenClientStatisticsSection():
         self.stream_statistics_table.setSortingEnabled(True)
         self.stream_statistics_table.verticalHeader().setDefaultSectionSize(32)
         self.stream_statistics_table.verticalHeader().setMinimumSectionSize(28)
-        
+        self.stream_statistics_table.horizontalHeader().setFixedHeight(22)
+
         stream_stats_layout.addWidget(self.stream_statistics_table)
         stream_stats_layout.setContentsMargins(0, 0, 0, 0)
         
