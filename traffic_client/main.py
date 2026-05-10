@@ -829,6 +829,19 @@ class TrafficGeneratorClient(
         help_menu.addAction(install_guide_action)
         self.addAction(install_guide_action)
 
+        # API Guide — REST cheatsheet for /api/traffic/* endpoints with
+        # worked examples for every packet type (L2-only, IPv4+UDP/TCP/ICMP,
+        # IPv6+UDP, VLAN-tagged), Scapy and DPDK paths side by side.
+        api_guide_action = QAction("API Guide...", self)
+        api_guide_action.setToolTip(
+            "REST API reference with curl examples for every packet type "
+            "(IPv4/IPv6 + UDP/TCP/ICMP, VLAN, line-rate DPDK), stream "
+            "control, and stats polling."
+        )
+        api_guide_action.triggered.connect(self.show_api_guide)
+        help_menu.addAction(api_guide_action)
+        self.addAction(api_guide_action)
+
         help_menu.addSeparator()
 
         dpdk_guide_action = QAction("DPDK Traffic Blast Workflow...", self)
@@ -857,6 +870,15 @@ class TrafficGeneratorClient(
         try:
             from widgets.stream_dialog import show_install_guide
             show_install_guide(self)
+        except Exception as e:
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Help unavailable", f"Could not open guide: {e}")
+
+    def show_api_guide(self):
+        """Open the REST API Guide dialog from the Help menu."""
+        try:
+            from widgets.stream_dialog import show_api_guide
+            show_api_guide(self)
         except Exception as e:
             from PyQt5.QtWidgets import QMessageBox
             QMessageBox.warning(self, "Help unavailable", f"Could not open guide: {e}")
