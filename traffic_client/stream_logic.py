@@ -6,7 +6,7 @@ import requests
 
 logger = logging.getLogger(__name__)
 from PyQt5.QtWidgets import QMessageBox
-from PyQt5.QtCore import QTimer, QSize, Qt
+from PyQt5.QtCore import QTimer, QSize, Qt, QThread, QEventLoop
 from PyQt5.QtWidgets import QApplication
 from PyQt5.QtGui import QIcon
 from PyQt5.QtWidgets import QTableWidgetItem
@@ -47,8 +47,69 @@ def find_port_key(streams: dict, port_text: str):
     return None
 
 
+class _TrafficPostWorker(QThread):
+    """One-shot QThread that runs requests.post off the UI thread.
+
+    Used by TrafficGenClientStreamLogic._post_traffic_async() to wrap the
+    /api/traffic/{start,stop} POST calls. Without this, a slow server
+    (which is normal under load — start/stop touches the database, the
+    DPDK launcher fork, and tx_worker handshake) would block the UI for
+    up to 10–15 seconds while the click handler waits for the response,
+    freezing the entire app including the live stats chart.
+
+    The worker stores the requests.Response (or the exception) on
+    instance attributes; the caller pumps a local QEventLoop until our
+    finished signal fires, then reads the result. Net effect: the call
+    site reads as a blocking POST but the UI keeps repainting.
+    """
+
+    def __init__(self, url, payload, timeout, parent=None):
+        super().__init__(parent)
+        self._url = url
+        self._payload = payload
+        self._timeout = timeout
+        self.response = None
+        self.error = None
+
+    def run(self):
+        try:
+            self.response = requests.post(
+                self._url, json=self._payload, timeout=self._timeout
+            )
+        except Exception as e:
+            self.error = e
+
+
 class TrafficGenClientStreamLogic:
     # ---------- helpers ----------
+
+    def _post_traffic_async(self, server_url, action, payload, timeout=15):
+        """Synchronous-looking wrapper around requests.post that runs the
+        actual HTTP call in a background QThread.
+
+        Behaves identically to ``requests.post(...)`` from the caller's
+        perspective: returns a Response on HTTP completion, raises on
+        transport error. The difference is that while the POST is in
+        flight, this method pumps a local QEventLoop so the UI thread
+        keeps processing paint events, timers, and (importantly) the
+        live throughput chart's polling tick. No more multi-second
+        freezes when the user clicks Start or Stop.
+
+        Re-entrance protection (a user clicking Start/Stop again while
+        we're pumping the loop) is handled by the existing
+        _streams_in_flight() set in start_stream / stop_stream and by
+        button.setDisabled() on the Start/Stop-ALL toggle.
+        """
+        url = f"{server_url}/api/traffic/{action}"
+        loop = QEventLoop()
+        worker = _TrafficPostWorker(url, payload, timeout)
+        worker.finished.connect(loop.quit)
+        worker.start()
+        loop.exec_()
+        worker.wait()  # ensure thread is fully done before reading attrs
+        if worker.error is not None:
+            raise worker.error
+        return worker.response
 
     def _streams_in_flight(self) -> set:
         """Set of stream_ids that currently have a start/stop request outstanding.
@@ -158,7 +219,7 @@ class TrafficGenClientStreamLogic:
 
         try:
             payload = {"streams": [{"interface": interface, "stream_id": stream_id}]}
-            resp = requests.post(f"{server_url}/api/traffic/stop", json=payload, timeout=15)
+            resp = self._post_traffic_async(server_url, "stop", payload, timeout=15)
             ok = resp.ok
         except Exception as e:
             logger.error(f"[AUTO-STOP] {server_url} stream_id={stream_id}: {e}")
@@ -438,7 +499,7 @@ class TrafficGenClientStreamLogic:
                 for port_label, stream_list in payload.get("streams", {}).items():
                     stream_names = [s.get("name") or s.get("protocol_selection", {}).get("name", "Unknown") for s in stream_list]
                     logger.debug(f"[START] Sending {len(stream_list)} stream(s) for port '{port_label}': {stream_names}")
-                resp = requests.post(f"{server_url}/api/traffic/start", json=payload, timeout=10)
+                resp = self._post_traffic_async(server_url, "start", payload, timeout=10)
                 if not resp.ok:
                     body = (resp.text or "").strip()[:300]
                     err_msg = f"{server_url}: HTTP {resp.status_code} {body}"
@@ -645,7 +706,7 @@ class TrafficGenClientStreamLogic:
         in_flight = self._streams_in_flight()
         for server_url, items in stop_requests.items():
             try:
-                r = requests.post(f"{server_url}/api/traffic/stop", json={"streams": items}, timeout=15)
+                r = self._post_traffic_async(server_url, "stop", {"streams": items}, timeout=15)
                 if r.ok:
                     logger.info(f"[STOP] Stopped {len(items)} stream(s) on {server_url}")
                 else:
@@ -830,7 +891,7 @@ class TrafficGenClientStreamLogic:
                 try:
                     payload = {
                         "streams": [{"interface": it["interface"], "stream_id": it["stream_id"]} for it in items]}
-                    resp = requests.post(f"{server_url}/api/traffic/stop", json=payload, timeout=15)
+                    resp = self._post_traffic_async(server_url, "stop", payload, timeout=15)
                     if resp.ok:
                         logger.info(f"[STOP-ALL] Stopped {len(items)} stream(s) on {server_url}")
                         for it in items:
@@ -1073,7 +1134,7 @@ class TrafficGenClientStreamLogic:
             for server_url, per_port in server_payload_map.items():
                 try:
                     payload = {"streams": {p: [s for (s, _) in items] for p, items in per_port.items()}}
-                    resp = requests.post(f"{server_url}/api/traffic/start", json=payload, timeout=10)
+                    resp = self._post_traffic_async(server_url, "start", payload, timeout=10)
                     if not resp.ok:
                         logger.error(f"[HTTP] Failed to start on {server_url}: {resp.status_code} {resp.text[:200]}")
                         for items in per_port.values():
@@ -1362,10 +1423,8 @@ class TrafficGenClientStreamLogic:
                                 for s in streams_to_stop if s.get("stream_id")
                             ]
                         }
-                        resp = requests.post(
-                            f"{server_addr}/api/traffic/stop",
-                            json=stop_payload,
-                            timeout=15
+                        resp = self._post_traffic_async(
+                            server_addr, "stop", stop_payload, timeout=15
                         )
                         if resp.status_code == 200:
                             logger.info(f"Stopped {len(streams_to_stop)} stream(s) that were disabled on {port_label}")
@@ -1393,9 +1452,9 @@ class TrafficGenClientStreamLogic:
                             if not s.get("interface"):
                                 s["interface"] = interface_name
                         
-                        resp = requests.post(
-                            f"{server_addr}/api/traffic/restart",
-                            json={"port": port_label, "streams": running_streams},
+                        resp = self._post_traffic_async(
+                            server_addr, "restart",
+                            {"port": port_label, "streams": running_streams},
                             timeout=8
                         )
                         if resp.status_code == 200:
