@@ -158,7 +158,7 @@ class TrafficGenClientStreamLogic:
 
         try:
             payload = {"streams": [{"interface": interface, "stream_id": stream_id}]}
-            resp = requests.post(f"{server_url}/api/traffic/stop", json=payload, timeout=6)
+            resp = requests.post(f"{server_url}/api/traffic/stop", json=payload, timeout=15)
             ok = resp.ok
         except Exception as e:
             logger.error(f"[AUTO-STOP] {server_url} stream_id={stream_id}: {e}")
@@ -645,7 +645,7 @@ class TrafficGenClientStreamLogic:
         in_flight = self._streams_in_flight()
         for server_url, items in stop_requests.items():
             try:
-                r = requests.post(f"{server_url}/api/traffic/stop", json={"streams": items}, timeout=6)
+                r = requests.post(f"{server_url}/api/traffic/stop", json={"streams": items}, timeout=15)
                 if r.ok:
                     logger.info(f"[STOP] Stopped {len(items)} stream(s) on {server_url}")
                 else:
@@ -830,7 +830,7 @@ class TrafficGenClientStreamLogic:
                 try:
                     payload = {
                         "streams": [{"interface": it["interface"], "stream_id": it["stream_id"]} for it in items]}
-                    resp = requests.post(f"{server_url}/api/traffic/stop", json=payload, timeout=10)
+                    resp = requests.post(f"{server_url}/api/traffic/stop", json=payload, timeout=15)
                     if resp.ok:
                         logger.info(f"[STOP-ALL] Stopped {len(items)} stream(s) on {server_url}")
                         for it in items:
@@ -1352,7 +1352,7 @@ class TrafficGenClientStreamLogic:
                         resp = requests.post(
                             f"{server_addr}/api/traffic/stop",
                             json=stop_payload,
-                            timeout=8
+                            timeout=15
                         )
                         if resp.status_code == 200:
                             logger.info(f"Stopped {len(streams_to_stop)} stream(s) that were disabled on {port_label}")
