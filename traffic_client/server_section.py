@@ -618,12 +618,17 @@ class TrafficGenClientServerSection():
                     if not port_matches:
                         continue
 
-                # Track whether this row is the first one we render for this port —
-                # used below to blank the Interface column on continuation rows so a
-                # port with multiple streams reads as one visual group instead of
-                # three identical-looking rows.
-                _port_first_row_rendered = False
-
+                # Previously: tracked `_port_first_row_rendered` and replaced
+                # the iface text with "↳" on every row after the first to
+                # collapse a port with multiple streams into a visual group.
+                # That decoration was confusing — users read the "↳" as the
+                # actual iface name, and it created a parallel "bogus iface
+                # name" universe that broke Edit, Remove, and the stats poll
+                # in turn (each had to be taught about the marker). The
+                # cumulative cost wasn't worth the small visual gain. Now
+                # every row shows its real iface name; the table just has
+                # the iface repeated when streams share a port. Sort + the
+                # alternating row colors already give enough visual grouping.
                 for stream in streams:
                     ps = stream.get("protocol_selection", {})
 
@@ -636,8 +641,6 @@ class TrafficGenClientServerSection():
                         continue
 
                     self.stream_table.insertRow(row_count)
-                    is_port_continuation = _port_first_row_rendered
-                    _port_first_row_rendered = True
 
                     # (0) Status (read-only) — icon + hover tooltip + accessible label.
                     # Color alone is insufficient (colourblind users see no signal); the
@@ -659,28 +662,16 @@ class TrafficGenClientServerSection():
                     status_item.setData(Qt.AccessibleTextRole, status_label)
                     self.stream_table.setItem(row_count, 0, status_item)
 
-                    # (1) Interface (read-only) - extract just the interface name
-                    # Extract interface name from port (e.g., "TG 0 - Port: ens5np0" -> "ens5np0")
+                    # (1) Interface (read-only) — show the bare iface name on
+                    # every row. The previous "↳" continuation marker for
+                    # second-and-later streams sharing a port has been
+                    # removed (see comment on the for-loop above).
                     interface_name = port.split(" - ")[-1] if " - " in port else port
-                    # Remove "Port: " prefix if present
                     if ":" in interface_name:
                         interface_name = interface_name.rsplit(":", 1)[-1].strip()
                     if "Port:" in interface_name:
                         interface_name = interface_name.replace("Port:", "").strip()
-                    if is_port_continuation:
-                        # Same port as the row above — show a subtle indent dash and
-                        # park the full port name in the tooltip so it's still
-                        # discoverable on hover.
-                        iface_item = QTableWidgetItem("↳")
-                        iface_item.setForeground(QColor("#9ca3af"))
-                        iface_item.setToolTip(interface_name)
-                    else:
-                        iface_item = QTableWidgetItem(interface_name)
-                        # Visually separate the start of a new port group with a
-                        # slightly heavier font so the row reads as a header.
-                        header_font = iface_item.font()
-                        header_font.setBold(True)
-                        iface_item.setFont(header_font)
+                    iface_item = QTableWidgetItem(interface_name)
                     iface_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
                     self.stream_table.setItem(row_count, 1, iface_item)
 
