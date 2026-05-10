@@ -295,8 +295,222 @@ that the bottleneck is per-queue PMD throughput / PCIe overhead, not software.</
 def show_dpdk_usage_guide(parent=None):
     """Open the DPDK Workflow Guide dialog. Used from the stream editor's
     "Read More" button and from the main window's Help menu."""
+    _open_help_dialog(parent, "DPDK Traffic Blast — Workflow Guide", _DPDK_GUIDE_HTML)
+
+
+# =============================================================================
+# Installation Guide — content + dialog factory
+# =============================================================================
+# Reachable from Help → Install Guide. Documents the single-command install
+# flow (install_ostg_complete.py) and what gets put on the target server, so
+# operators don't have to read the install script's source to know what it
+# does. Same QTextBrowser shell as the DPDK guide.
+
+_INSTALL_GUIDE_HTML = r"""
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+         color: #1f2937; line-height: 1.55; font-size: 12px; }
+  h1 { color: #1e40af; font-size: 20px; margin: 0 0 8px 0; }
+  h2 { color: #374151; font-size: 15px; margin-top: 18px;
+       border-bottom: 1px solid #e5e7eb; padding-bottom: 4px; }
+  h3 { color: #4b5563; font-size: 13px; margin-top: 14px; }
+  p, li { color: #374151; }
+  code { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+         background: #f3f4f6; padding: 1px 5px; border-radius: 3px;
+         font-size: 11px; color: #1e3a8a; }
+  pre { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+        background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 4px;
+        padding: 10px; font-size: 11px; color: #111827; }
+  table { border-collapse: collapse; margin-top: 6px; font-size: 11px; }
+  th, td { border: 1px solid #d1d5db; padding: 5px 9px; text-align: left;
+           vertical-align: top; }
+  th { background: #f3f4f6; color: #374151; font-weight: 600; }
+  .ok { color: #15803d; font-weight: 600; }
+  .muted { color: #6b7280; font-size: 11px; }
+</style>
+
+<h1>Netgen Server — Installation Guide</h1>
+<p class="muted">A single <code>install_ostg_complete.py</code> command provisions
+the netgen-server on a fresh Ubuntu 22.04 host, including the full DPDK
+runtime (libraries + tx_worker binary). No follow-up "Install DPDK" step
+required.</p>
+
+<h2>1. Quick start</h2>
+<pre># From a fresh checkout — build the wheel locally (gitignored)
+python3 -m build --wheel
+
+# Install on a target host (root credentials required)
+python3 install_ostg_complete.py -H &lt;host&gt; -p &lt;password&gt;</pre>
+
+<p>That's it. ~15-20 minutes on a fresh box (most of which is the DPDK build).
+At the end you have netgen-server running as a systemd unit, listening on
+port 5050, and a <code>tx_worker</code> binary ready to drive line-rate
+DPDK streams.</p>
+
+<h2>2. What gets installed, in order</h2>
+
+<table>
+  <tr><th>Step</th><th>What it does</th></tr>
+  <tr><td><b>cleanup_old_install</b></td>
+      <td>Wipes legacy <code>/opt/OSTG/</code> artifacts and the old
+          <code>ostg-server.service</code> systemd unit. No-op on a fresh
+          box.</td></tr>
+  <tr><td><b>install_system_dependencies</b></td>
+      <td>apt baseline: <code>python3-pip</code>, build-essential, git,
+          curl, wget, sshpass, etc.</td></tr>
+  <tr><td><b>install_python_dependencies</b></td>
+      <td>Python deps from <code>requirements.txt</code>.</td></tr>
+  <tr><td><b>install_docker</b></td>
+      <td>Docker Engine + buildx (used by the FRR sidecar containers for
+          BGP/OSPF/ISIS device emulation).</td></tr>
+  <tr><td><b>install_ostg</b></td>
+      <td>pip-installs the <code>ostg_trafficgen-X.Y.Z.whl</code> wheel,
+          deploys all <code>resources/dpdk/*.sh</code> helper scripts, and
+          critically — copies <code>resources/dpdk/tx_worker/</code>
+          (<code>tx_worker.c</code> + <code>meson.build</code>) so the
+          DPDK build step has source to compile.</td></tr>
+  <tr><td><b>install_dpdk_runtime</b><br><span class="ok">★ default ON</span></td>
+      <td>Runs <code>install_dpdk.sh --auto</code> on the target. Installs
+          apt prereqs (<code>build-essential meson ninja-build pkg-config
+          libnuma-dev libelf-dev libpcap-dev libibverbs-dev libmlx5-dev
+          rdma-core</code>), clones DPDK source, configures with meson
+          (<code>-Ddisable_drivers=net/mana</code>), builds with ninja,
+          installs to <code>/usr/local/lib/x86_64-linux-gnu</code>,
+          <code>ldconfig</code>, then compiles <code>tx_worker</code>
+          against the freshly-installed DPDK.</td></tr>
+  <tr><td><b>install_ai_dependencies</b></td>
+      <td>Optional ML/AI helpers for the AI Assistant menu.</td></tr>
+  <tr><td><b>install_ollama</b></td>
+      <td>Local LLM runtime for the AI Assistant.</td></tr>
+  <tr><td><b>setup_docker_frr</b></td>
+      <td>Builds the FRR sidecar Docker image used by emulated devices.</td></tr>
+  <tr><td><b>create_systemd_services</b></td>
+      <td>Drops <code>netgen-server.service</code> into
+          <code>/etc/systemd/system/</code> and enables it.</td></tr>
+  <tr><td><b>start_ostg_services</b></td>
+      <td><code>systemctl start netgen-server</code> + waits for the
+          <code>/api/health</code> endpoint to come up.</td></tr>
+  <tr><td><b>verify_installation</b></td>
+      <td>Sanity checks: pip list, systemctl status, /api/health 200.</td></tr>
+  <tr><td><b>test_frr_functionality</b></td>
+      <td>Smoke-test FRR Docker container can spawn (skipped if Docker is
+          missing).</td></tr>
+</table>
+
+<h2>3. CLI flags</h2>
+
+<table>
+  <tr><th>Flag</th><th>Effect</th></tr>
+  <tr><td><code>-H, --host</code></td>
+      <td>Remote host to install on. Omit for local install (must run as
+          root).</td></tr>
+  <tr><td><code>-u, --user</code></td><td>Remote user (default: <code>root</code>).</td></tr>
+  <tr><td><code>-p, --password</code></td><td>Remote password (required when
+          <code>-H</code> is given).</td></tr>
+  <tr><td><code>--no-dpdk</code></td>
+      <td>Skip the DPDK runtime install step entirely. Pass this on hosts
+          that won't generate traffic — devbox-only installs, hosts with no
+          DPDK-capable NIC.</td></tr>
+  <tr><td><code>--skip-dpdk-build</code></td>
+      <td>Install DPDK apt prerequisites only — don't compile DPDK or
+          tx_worker. Useful when DPDK is already installed system-wide and
+          you just want netgen-server's apt deps in place. The tx_worker
+          binary won't be built; you can build it later from the
+          <code>/admin</code> portal.</td></tr>
+</table>
+
+<p class="muted">Defaults preserve "install DPDK" behavior — no flag needed
+for normal use.</p>
+
+<h2>4. Tolerant of failures</h2>
+
+<p>If the DPDK build fails (kernel-header / libibverbs version mismatch,
+flaky apt mirror, NIC vendor lib missing), the rest of the install
+<i>continues</i>. You'll see in the log:</p>
+
+<pre>WARNING: DPDK install exited rc=N. Continuing — netgen-server will
+         start fine without DPDK; streams that need it will fall back
+         to the Scapy/kernel path.
+WARNING: Diagnose with: ssh root@&lt;host&gt; 'tail -200 /var/log/netgen-install-dpdk.log'
+WARNING: Or retry from the /admin portal once netgen-server is up.</pre>
+
+<p>Even worst-case, you get a working netgen-server with two clear DPDK
+recovery paths:</p>
+<ol>
+  <li>Read the log on the target: <code>tail -f /var/log/netgen-install-dpdk.log</code></li>
+  <li>Open <code>http://&lt;server&gt;:5050/admin</code> → Card "DPDK Runtime"
+      → click <b>Install DPDK</b>. Same script, retried interactively.</li>
+</ol>
+
+<h2>5. Sanity-check after install</h2>
+
+<pre>ssh root@&lt;server&gt; 'systemctl is-active netgen-server'      # active
+ssh root@&lt;server&gt; 'curl -s http://localhost:5050/api/health' # 200 OK
+ssh root@&lt;server&gt; 'ls -la /opt/netgen/resources/dpdk/tx_worker/build/tx_worker'
+                                                            # tx_worker binary present
+ssh root@&lt;server&gt; 'pkg-config --modversion libdpdk'         # e.g. 23.11.0</pre>
+
+<p>Then open <code>http://&lt;server&gt;:5050/admin</code> in a browser to
+confirm the runtime cards (DPDK Runtime, Hugepages, Network Interfaces)
+all show green.</p>
+
+<h2>6. What lives where on the target</h2>
+
+<table>
+  <tr><th>Path</th><th>Contents</th></tr>
+  <tr><td><code>/opt/netgen/</code></td>
+      <td>Install root. Contains the wheel, systemd unit, FRR Docker artifacts.</td></tr>
+  <tr><td><code>/opt/netgen/resources/dpdk/</code></td>
+      <td>DPDK helper scripts (<code>dpdk_bind.sh</code>,
+          <code>install_dpdk.sh</code>, etc.) and the <code>tx_worker/</code>
+          source + build directory.</td></tr>
+  <tr><td><code>/opt/netgen/resources/dpdk/tx_worker/build/tx_worker</code></td>
+      <td>The compiled multi-queue tx_worker binary. The runtime path is
+          fixed; the launcher resolves it here first.</td></tr>
+  <tr><td><code>/usr/local/lib/python3.13/dist-packages/run_tgen_server.py</code></td>
+      <td>The Flask server, installed by <code>pip install</code>ing the
+          wheel.</td></tr>
+  <tr><td><code>/usr/local/lib/python3.13/dist-packages/utils/</code></td>
+      <td>Server-side Python modules (DPDK launcher, stream tracker,
+          SQLite database).</td></tr>
+  <tr><td><code>/usr/local/lib/x86_64-linux-gnu/librte_*.so*</code></td>
+      <td>DPDK runtime libraries (installed by <code>install_dpdk.sh</code>
+          via <code>meson install</code>).</td></tr>
+  <tr><td><code>/etc/systemd/system/netgen-server.service</code></td>
+      <td>Systemd unit. Runs <code>ostg-server</code> (entry point from the
+          wheel) on port 5050.</td></tr>
+  <tr><td><code>/var/log/netgen-install-dpdk.log</code></td>
+      <td>Stdout/stderr from <code>install_dpdk.sh</code>. Tail this if the
+          DPDK build acted up.</td></tr>
+</table>
+
+<h2>7. Reinstall / upgrade</h2>
+
+<p>The install script is <b>idempotent</b>: <code>cleanup_old_install</code>
+wipes legacy artifacts on every run, and the wheel install handles upgrades
+via <code>pip install --upgrade</code> internally. Just bump the version in
+<code>pyproject.toml</code>, rebuild the wheel, re-run the install command.</p>
+
+<pre># Bump pyproject.toml version, then:
+python3 -m build --wheel
+python3 install_ostg_complete.py -H &lt;host&gt; -p &lt;password&gt;</pre>
+
+<p class="muted">For a quick redeploy without re-running the entire flow,
+the file-by-file <code>scp</code> + <code>systemctl restart netgen-server</code>
+pattern still works during development.</p>
+"""
+
+
+def show_install_guide(parent=None):
+    """Open the Installation Guide dialog. Reachable from Help → Install Guide."""
+    _open_help_dialog(parent, "Netgen Server — Installation Guide", _INSTALL_GUIDE_HTML)
+
+
+def _open_help_dialog(parent, title, html):
+    """Shared QTextBrowser-in-a-QDialog shell used by all Help entries.
+    Keeps the look + close-button behavior consistent."""
     dialog = QDialog(parent)
-    dialog.setWindowTitle("DPDK Traffic Blast — Workflow Guide")
+    dialog.setWindowTitle(title)
     dialog.setGeometry(250, 200, 880, 760)
     dialog.setMinimumSize(720, 500)
 
@@ -305,7 +519,7 @@ def show_dpdk_usage_guide(parent=None):
 
     browser = QTextBrowser()
     browser.setOpenExternalLinks(True)
-    browser.setHtml(_DPDK_GUIDE_HTML)
+    browser.setHtml(html)
     layout.addWidget(browser, 1)
 
     button_row = QHBoxLayout()
