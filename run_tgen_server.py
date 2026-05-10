@@ -828,17 +828,17 @@ def stop_traffic():
             try:
                 import subprocess as _sp
                 pat = f"--stream-id {stream_id}"
-                check = _sp.run(["pgrep", "-f", pat], capture_output=True, text=True, timeout=3)
+                check = _sp.run(["pgrep", "-f", "--", pat], capture_output=True, text=True, timeout=3)
                 if check.returncode == 0 and check.stdout.strip():
                     pids = check.stdout.strip().split()
                     logging.warning(
                         f"⚠️ tx_worker(s) still alive for stream {stream_id} after stop "
                         f"(pids={','.join(pids)}, future_completed={future_completed}) — force-killing"
                     )
-                    _sp.run(["pkill", "-TERM", "-f", pat], capture_output=True, timeout=3)
+                    _sp.run(["pkill", "-TERM", "-f", "--", pat], capture_output=True, timeout=3)
                     import time as _t
                     _t.sleep(1.0)
-                    _sp.run(["pkill", "-KILL", "-f", pat], capture_output=True, timeout=3)
+                    _sp.run(["pkill", "-KILL", "-f", "--", pat], capture_output=True, timeout=3)
                     logging.info(f"✅ Force-kill complete for stream {stream_id}")
             except Exception as e:
                 logging.warning(f"⚠️ Backstop pkill for stream {stream_id} failed: {e}")
@@ -880,17 +880,17 @@ def stop_traffic():
                         try:
                             import subprocess as _sp
                             pat = f"--stream-id {actual_stream_id}"
-                            check = _sp.run(["pgrep", "-f", pat], capture_output=True, text=True, timeout=3)
+                            check = _sp.run(["pgrep", "-f", "--", pat], capture_output=True, text=True, timeout=3)
                             if check.returncode == 0 and check.stdout.strip():
                                 pids = check.stdout.strip().split()
                                 logging.warning(
                                     f"⚠️ tx_worker(s) still alive for stream {actual_stream_id} after stop "
                                     f"(pids={','.join(pids)}) — force-killing"
                                 )
-                                _sp.run(["pkill", "-TERM", "-f", pat], capture_output=True, timeout=3)
+                                _sp.run(["pkill", "-TERM", "-f", "--", pat], capture_output=True, timeout=3)
                                 import time as _t
                                 _t.sleep(1.0)
-                                _sp.run(["pkill", "-KILL", "-f", pat], capture_output=True, timeout=3)
+                                _sp.run(["pkill", "-KILL", "-f", "--", pat], capture_output=True, timeout=3)
                         except Exception as _e:
                             logging.warning(f"⚠️ Backstop pkill for stream {actual_stream_id} failed: {_e}")
 
@@ -13986,16 +13986,16 @@ def main(argv=None):
     # appear "stopped" in the DB but are still flooding the network.
     try:
         import subprocess as _sp
-        r = _sp.run(["pgrep", "-af", "/opt/netgen/resources/dpdk/tx_worker/build/tx_worker"],
+        r = _sp.run(["pgrep", "-af", "--", "/opt/netgen/resources/dpdk/tx_worker/build/tx_worker"],
                     capture_output=True, text=True, timeout=5)
         if r.returncode == 0 and r.stdout.strip():
             n = len(r.stdout.strip().splitlines())
             logging.warning(f"[STARTUP CLEANUP] Found {n} orphan tx_worker process(es) from a previous run — terminating")
-            _sp.run(["pkill", "-TERM", "-f", "/opt/netgen/resources/dpdk/tx_worker/build/tx_worker"],
+            _sp.run(["pkill", "-TERM", "-f", "--", "/opt/netgen/resources/dpdk/tx_worker/build/tx_worker"],
                     capture_output=True, timeout=5)
             import time as _t
             _t.sleep(2.0)
-            _sp.run(["pkill", "-KILL", "-f", "/opt/netgen/resources/dpdk/tx_worker/build/tx_worker"],
+            _sp.run(["pkill", "-KILL", "-f", "--", "/opt/netgen/resources/dpdk/tx_worker/build/tx_worker"],
                     capture_output=True, timeout=5)
             logging.info("[STARTUP CLEANUP] Orphan tx_worker sweep complete")
     except Exception as e:
