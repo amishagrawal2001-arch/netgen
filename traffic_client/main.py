@@ -168,11 +168,11 @@ class TrafficGeneratorClient(
         #  2) Override resizeEvent (below) to call resizeDocks() with
         #     a 50/50 split so window-stretches grow BOTH halves
         #     proportionally instead of giving everything to the top.
-        self.statistics_group.setMinimumHeight(380)
-        # Tell Qt to size the dock to roughly half the window height.
-        # Calling here on init (before show) is cheap — actual layout
-        # computation happens in showEvent / resizeEvent below.
-        self._stats_dock_min_height = 380
+        # Calibrated to leave the streams table breathing room above.
+        # The dock can grow well past this when the user drags the
+        # splitter; this is just the floor.
+        self.statistics_group.setMinimumHeight(200)
+        self._stats_dock_min_height = 200
         # Keep `self.splitter` as an alias to top_section for any older code that
         # referenced the vertical splitter directly (defensive).
         self.splitter = self.top_section
@@ -341,22 +341,28 @@ class TrafficGeneratorClient(
         self.statistics_dock.raise_()
 
     def _balance_stats_dock(self):
-        """Give the Traffic Statistics dock ~half the window height.
+        """Size the Traffic Statistics dock to its calibrated default
+        height (465px) — only on initial show.
 
-        Called from showEvent (initial layout) and resizeEvent (when the
-        user stretches the window). Without this, QMainWindow's default
-        layout policy hands all spare vertical space to the central
-        widget — so when the window grows, the top section stretches
-        and the stats dock stays small. resizeDocks() with explicit
-        per-dock sizes overrides that.
+        Earlier revisions targeted self.height() // 2 (a 50/50 split)
+        and re-applied on every window resize. That gave the stats
+        dock more room than its content actually needs and ate into
+        the streams table. The fixed 465 is the right default for
+        the live-stats tables; once set, Qt's natural layout takes
+        over (window stretches grow the central widget; the dock
+        stays at whatever the user has set). The user can drag the
+        splitter for a different ratio at any time.
         """
         if not hasattr(self, "statistics_dock"):
             return
         if self.statistics_dock.isFloating() or not self.statistics_dock.isVisible():
             return
         try:
-            min_h = getattr(self, "_stats_dock_min_height", 380)
-            target = max(min_h, self.height() // 2)
+            target = 465  # matches "Traffic stats = 1500×465" target
+            # Don't push the dock taller than 70% of the window — on a
+            # very small screen we'd otherwise leave the streams table
+            # too cramped to be useful.
+            target = min(target, int(self.height() * 0.70))
             self.resizeDocks([self.statistics_dock], [target], Qt.Vertical)
         except Exception as e:
             logger.debug(f"[LAYOUT] resizeDocks failed: {e}")
@@ -447,23 +453,18 @@ class TrafficGeneratorClient(
         QTimer.singleShot(0, self._update_section_size_readout)
 
     def resizeEvent(self, event):
-        """Keep the stats dock proportional when the user stretches the window.
+        """Update the title-bar dimension readout on window resize.
 
-        Without this, only the central widget grows when the window is
-        resized larger — the dock stays at whatever pixel height it
-        had. This re-balances on every resize so the stats area
-        actually grows along with the window.
+        Earlier revisions also called _balance_stats_dock here so
+        window-stretches grew the dock proportionally. We've since
+        switched to a fixed 465 default — Qt's natural layout on
+        window resize is what we want now (extra height goes to the
+        central widget; dock stays at its set size). User can drag
+        the splitter for a different ratio.
         """
         super().resizeEvent(event)
-        # Don't fight the user mid-drag of the dock-splitter handle —
-        # only re-balance when the geometry change came from the window
-        # itself. We detect that by checking the dock's drag state via
-        # a flag on the dock title bar, but Qt doesn't expose that
-        # cleanly; instead we just defer the rebalance enough that
-        # rapid drags settle.
-        QTimer.singleShot(0, self._balance_stats_dock)
-        # Refresh the status-bar dimension readout in the same deferred
-        # tick so the numbers are read AFTER resizeDocks() has settled.
+        # Refresh the title-bar dimension readout deferred so we
+        # read AFTER Qt has applied the new geometry.
         QTimer.singleShot(0, self._update_section_size_readout)
 
     def closeEvent(self, event):
