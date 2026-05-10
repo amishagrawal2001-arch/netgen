@@ -576,6 +576,16 @@ copy-pasteable curl commands you can run from any host that can reach
   <tr><td class="method">POST</td><td><code>/api/dpdk/bind</code> /
                                        <code>unbind</code></td>
       <td>Bind/unbind a NIC to <code>vfio-pci</code> (Broadcom/Intel only).</td></tr>
+  <tr><td class="method">POST</td><td><code>/api/rfc2544/start</code></td>
+      <td>Kick off an RFC 2544 §26.1 throughput test (binary search per frame size).</td></tr>
+  <tr><td class="method">GET</td> <td><code>/api/rfc2544/progress</code></td>
+      <td>Poll for RFC 2544 progress + converged per-frame-size results.</td></tr>
+  <tr><td class="method">POST</td><td><code>/api/rfc2544/stop</code></td>
+      <td>Cooperatively cancel an in-flight RFC 2544 test.</td></tr>
+  <tr><td class="method">GET</td> <td><code>/api/latency/stats</code></td>
+      <td>One-way latency rolling stats (min/avg/p50/p99/max) for an iface.</td></tr>
+  <tr><td class="method">POST</td><td><code>/api/latency/stop</code></td>
+      <td>Stop the latency sampler for an iface (or all if no iface).</td></tr>
   <tr><td class="method">GET</td> <td><code>/admin</code></td>
       <td>Single-page web UI for runtime configuration.</td></tr>
 </table>
@@ -633,6 +643,19 @@ where noted; sensible defaults are applied):</p>
   <tr><td class="dpdk"><code>dpdk_tx_cores</code></td><td>int</td>
       <td><span class="dpdk">DPDK only.</span> 1–16. Default 1. With Line Rate
           + default 1, the launcher auto-bumps based on link speed.</td></tr>
+  <tr><td class="dpdk"><code>enable_timestamps</code></td><td>bool</td>
+      <td><span class="dpdk">DPDK + UDP only.</span> Embeds a 16-byte NLAT
+          header at the start of each UDP payload for one-way latency
+          measurement. Pair with <code>/api/latency/stats</code> on the
+          RX side. See section 10.</td></tr>
+  <tr><td class="dpdk"><code>src_ip_count</code> /
+          <code>dst_ip_count</code> /
+          <code>src_port_count</code> /
+          <code>dst_port_count</code></td><td>int</td>
+      <td><span class="dpdk">DPDK only.</span> Per-packet field
+          randomization. The launcher cycles src/dst IP and L4 port
+          through a range of size N for 5-tuple-hash distribution
+          (Spirent/Ixia "modifiers"). Default 1 (no variation).</td></tr>
 </table>
 
 <h2>3. Engine: Scapy/kernel vs DPDK</h2>
@@ -1011,7 +1034,171 @@ curl -s -X POST http://$SERVER/api/traffic/stop \
   -H "Content-Type: application/json" \
   -d "{ \"streams\": [{ \"interface\": \"$IFACE\", \"stream_id\": \"$SID\" }] }"</pre>
 
-<h2>9. Common gotchas</h2>
+<h2>9. RFC 2544 throughput test (§26.1)</h2>
+
+<p>Binary-search the maximum no-drop rate at each frame size, classic IETF
+throughput methodology. The server runs the search in a background thread;
+the client kicks it off and polls for progress.</p>
+
+<h3>9a. Start a test</h3>
+
+<pre>curl -X POST http://&lt;server&gt;:5050/api/rfc2544/start \
+  -H "Content-Type: application/json" \
+  -d '{
+    "tx_iface": "enp181s0f0np0",
+    "rx_iface": "enp181s0f1np1",
+    "frame_sizes": [64, 128, 256, 512, 1024, 1280, 1518],
+    "duration_per_step": 10,
+    "target_loss_pct": 0.0,
+    "resolution_pps": 100000,
+    "mac_src": "aa:bb:cc:dd:ee:01",
+    "mac_dst": "aa:bb:cc:dd:ee:02",
+    "ip_src":  "10.0.0.1",
+    "ip_dst":  "10.0.0.2",
+    "dpdk_enable": true
+  }'</pre>
+
+<p>Response: <code>{"ok": true, "started_at": "&lt;ISO timestamp&gt;"}</code>.
+Returns 409 if a test is already running.</p>
+
+<table>
+  <tr><th>Field</th><th>Type</th><th>Notes</th></tr>
+  <tr><td><code>tx_iface</code></td><td>string (required)</td>
+      <td>TX interface name.</td></tr>
+  <tr><td><code>rx_iface</code></td><td>string (optional)</td>
+      <td>RX interface name. Defaults to <code>tx_iface</code> for loopback.</td></tr>
+  <tr><td><code>frame_sizes</code></td><td>list[int]</td>
+      <td>Defaults to the IETF set <code>[64,128,256,512,1024,1280,1518]</code>.</td></tr>
+  <tr><td><code>duration_per_step</code></td><td>int (seconds)</td>
+      <td>How long each binary-search iteration sends traffic. Default 10.
+          Bump to 60 for stable lab measurements; drop to 2 for smoke tests.</td></tr>
+  <tr><td><code>target_loss_pct</code></td><td>float</td>
+      <td>Acceptable loss. RFC 2544 §26.1 defines 0%; some labs use 0.001%.</td></tr>
+  <tr><td><code>resolution_pps</code></td><td>int</td>
+      <td>Binary-search precision floor. Default 100000 (100K pps).
+          Smaller = more iterations = longer test.</td></tr>
+  <tr><td><code>mac_src</code> / <code>mac_dst</code></td><td>string (required)</td>
+      <td>Source / destination MAC for the test frames.</td></tr>
+  <tr><td><code>ip_src</code> / <code>ip_dst</code></td><td>string (required)</td>
+      <td>Source / destination IPv4 for the test frames.</td></tr>
+  <tr><td><code>dpdk_enable</code></td><td>bool</td>
+      <td>Default true. Use DPDK tx_worker for accurate line-rate sends.</td></tr>
+  <tr><td><code>dpdk_tx_cores</code></td><td>int</td>
+      <td>Optional. Forwarded as the stream's <code>dpdk_tx_cores</code>.
+          Leave unset to let the server auto-pick per <code>/api/dpdk/recommend</code>.</td></tr>
+</table>
+
+<h3>9b. Poll for progress</h3>
+
+<pre>curl http://&lt;server&gt;:5050/api/rfc2544/progress</pre>
+
+<p>Response shape:</p>
+
+<pre>{
+  "running": true,
+  "started_at": "2026-05-10T13:01:12+00:00",
+  "finished_at": null,
+  "params": { ...the request body... },
+  "current_step": {
+    "frame_size": 64,
+    "trying_pps": 37202380,
+    "phase": "testing 37,202,380 pps for 10s"
+  },
+  "progress": [
+    {
+      "frame_size": 64,
+      "max_no_drop_pps": 35850000,
+      "max_no_drop_gbps": 24.09,
+      "line_rate_pps": 37202380,
+      "pct_of_line_rate": 96.4,
+      "attempts": [
+        {"pps": 18601190, "tx": 186011900, "rx": 186011900, "loss_pct": 0.0},
+        {"pps": 27901785, "tx": 279017850, "rx": 279017850, "loss_pct": 0.0},
+        ...
+      ]
+    }
+  ],
+  "error": null
+}</pre>
+
+<p><code>progress[]</code> grows by one entry per converged frame size. While the
+search for the current frame size is in progress, <code>current_step</code>
+shows what rate it's testing right now.</p>
+
+<p class="muted"><b>Expected timing:</b> each binary-search iteration is
+<code>duration_per_step + 1.5s settle + 0.5s stats read</code>. To converge
+from 0 to 100K-pps resolution typically takes ~10 iterations × 12s =
+<b>~2 minutes per frame size</b>. Full IETF set ≈ 14 minutes.</p>
+
+<h3>9c. Stop a running test</h3>
+
+<pre>curl -X POST http://&lt;server&gt;:5050/api/rfc2544/stop</pre>
+
+<p>Cooperative cancel — flips <code>stop_requested=true</code>, halts the
+in-flight stream, and the runner thread aborts within ~0.5s. Response:
+<code>{"ok": true, "was_running": true}</code>. Idempotent (returns
+<code>was_running: false</code> if no test is active).</p>
+
+<h2>10. One-way latency sampler</h2>
+
+<p>For streams sent with <code>"enable_timestamps": true</code>, tx_worker
+embeds a 16-byte NLAT header at the start of each UDP payload. A
+per-interface RX-side sampler decodes those headers and computes
+min/avg/p50/p99/max latency over a rolling sample window.</p>
+
+<h3>10a. Get latency stats for an interface</h3>
+
+<pre>curl 'http://&lt;server&gt;:5050/api/latency/stats?iface=enp181s0f1np1'</pre>
+
+<p>Response:</p>
+
+<pre>{
+  "ok": true,
+  "iface": "enp181s0f1np1",
+  "udp_port": 4791,
+  "samples_seen": 1502341,
+  "samples_decoded": 1502340,
+  "samples_skipped": 1,
+  "window_samples": 10000,
+  "min_us": 1.18,
+  "avg_us": 2.41,
+  "p50_us": 2.32,
+  "p99_us": 4.18,
+  "max_us": 12.04
+}</pre>
+
+<table>
+  <tr><th>Query param</th><th>Notes</th></tr>
+  <tr><td><code>iface</code></td>
+      <td>Required. The RX-side interface to sniff.</td></tr>
+  <tr><td><code>udp_port</code></td>
+      <td>Optional. UDP destination port to filter. Default 4791.</td></tr>
+</table>
+
+<p>The sampler is started lazily on first query for an iface and stays
+running until <code>/api/latency/stop</code> is called or the server
+restarts. The 10000-sample rolling window slides forward as new
+NLAT-tagged frames arrive.</p>
+
+<div class="warn"><b>Same-host loopback gives accurate one-way numbers.</b>
+Cross-host requires PTP- or NTP-synced clocks for absolute accuracy —
+without that, only relative drift across the window is meaningful.</div>
+
+<h3>10b. Stop a sampler</h3>
+
+<pre># Stop one iface
+curl -X POST http://&lt;server&gt;:5050/api/latency/stop \
+  -H "Content-Type: application/json" \
+  -d '{"iface": "enp181s0f1np1"}'
+
+# Stop all running samplers
+curl -X POST http://&lt;server&gt;:5050/api/latency/stop \
+  -H "Content-Type: application/json" \
+  -d '{}'</pre>
+
+<p>Response: <code>{"ok": true, "stopped": ["enp181s0f1np1"]}</code>.</p>
+
+<h2>11. Common gotchas</h2>
 
 <table>
   <tr><th>Symptom</th><th>Likely cause</th></tr>
@@ -1035,7 +1222,7 @@ curl -s -X POST http://$SERVER/api/traffic/stop \
           extremely rare; check journalctl for matching errors.</td></tr>
 </table>
 
-<h2>10. Authentication, CORS, rate limiting</h2>
+<h2>12. Authentication, CORS, rate limiting</h2>
 
 <p><b>None.</b> The server has no auth layer, no CORS preflight handling,
 no rate limiting. Internal-network use only — never expose port 5050 to
