@@ -1159,7 +1159,10 @@ class TrafficGenClientStatisticsSection():
         logger.info("[INFO] Clearing displayed traffic statistics (taring baselines).")
 
         # Per-interface baselines for cumulative columns (Sent Frames,
-        # Received Frames, Sent Bytes, Received Bytes, Errors).
+        # Received Frames, Sent Bytes, Received Bytes, Errors). Source the
+        # raw cumulative values from _last_statistics — that's what
+        # update_statistics_table sees on the next poll, so subtracting
+        # this snapshot will correctly reset deltas to 0.
         self._iface_baselines = {}
         last = getattr(self, "_last_statistics", None) or {}
         for iface_name, stats in last.items():
@@ -1186,19 +1189,85 @@ class TrafficGenClientStatisticsSection():
                     "rx_count": int(s.get("rx_count", 0) or 0),
                 }
 
-        # Visual immediate reset — empty the cells until the next poll
-        # populates them with the now-tared values.
+        # Visual immediate reset — overwrite each numeric cell with its
+        # zero-display placeholder so the user sees the click took effect
+        # right away, before the next poll repopulates with tared values.
         self.clear_statistics_table()
     def clear_statistics_table(self):
-        """Clear the traffic statistics table."""
-        self.statistics_table.clearContents()
-        self.statistics_table.setColumnCount(0)
-        self.statistics_table.setRowCount(10)  # Reset rows for default structure
-        
-        # Also clear stream statistics table
-        if hasattr(self, "stream_statistics_table"):
-            self.stream_statistics_table.setRowCount(0)
-            self.stream_statistics_table.setColumnCount(10)  # Includes Engine column
+        """Visually zero every numeric cell in both stats tables.
+
+        Previously this called setColumnCount(0) which destroyed the
+        per-interface columns until the next poll rebuilt them — looked
+        like "Clear Stats half-worked, rates still showing." Now we keep
+        structure intact and overwrite each numeric cell with its
+        zero-display string. The next polling tick (~1s later) re-fills
+        with the now-tared values.
+
+        Status cells, interface labels, and stream names are preserved —
+        they're metadata, not stats.
+        """
+        # ---- Interface Statistics tab ----
+        # Row layout: 0 Status (preserve), 1 Sent Frames, 2 Received Frames,
+        # 3 Sent Bytes, 4 Received Bytes, 5 Send Frame Rate, 6 Receive Frame
+        # Rate, 7 Send Bit Rate, 8 Receive Bit Rate, 9 Errors.
+        zero_for_row = {
+            1: "0", 2: "0",            # frame counts
+            3: "0 B", 4: "0 B",        # byte counts
+            5: "0.00 fps", 6: "0.00 fps",
+            7: "0.00 bps", 8: "0.00 bps",
+            9: "0",                    # errors
+        }
+        try:
+            rows = self.statistics_table.rowCount()
+            cols = self.statistics_table.columnCount()
+            for r in range(rows):
+                if r == 0:  # Status row — keep "up"/"down" intact
+                    continue
+                placeholder = zero_for_row.get(r)
+                if placeholder is None:
+                    continue
+                for c in range(cols):
+                    item = self.statistics_table.item(r, c)
+                    if item is None:
+                        item = QTableWidgetItem(placeholder)
+                        item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                        self.statistics_table.setItem(r, c, item)
+                    else:
+                        item.setText(placeholder)
+                        # Drop any prior color (red errors, etc.)
+                        item.setForeground(QColor("#1f2937"))
+        except Exception as e:
+            logger.debug(f"[CLEAR STATS] interface table reset failed: {e}")
+
+        # ---- Stream Statistics tab ----
+        # Column layout: 0 Stream Name, 1 Interface, 2 Engine, 3 TX Count,
+        # 4 RX Count, 5 TX Rate, 6 RX Rate, 7 Loss %, 8 Status, 9 Flow Tracking.
+        if hasattr(self, "stream_statistics_table") and self.stream_statistics_table is not None:
+            zero_for_col = {
+                3: "0", 4: "0",            # counts
+                5: "0.00 pps", 6: "0.00 pps",
+                7: "0.00%",                # loss
+            }
+            try:
+                rows = self.stream_statistics_table.rowCount()
+                cols = self.stream_statistics_table.columnCount()
+                for r in range(rows):
+                    for c in range(cols):
+                        placeholder = zero_for_col.get(c)
+                        if placeholder is None:
+                            continue
+                        item = self.stream_statistics_table.item(r, c)
+                        if item is None:
+                            item = QTableWidgetItem(placeholder)
+                            item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                            self.stream_statistics_table.setItem(r, c, item)
+                        else:
+                            item.setText(placeholder)
+                            # Reset loss% color (was red/yellow/green)
+                            if c == 7:
+                                item.setForeground(QColor("#10b981"))
+            except Exception as e:
+                logger.debug(f"[CLEAR STATS] stream table reset failed: {e}")
         
         #print("Traffic statistics cleared.")
     def enable_make_server_online_menu(self):
