@@ -66,6 +66,9 @@ class TrafficGeneratorClient(
         self._base_window_title = "Netgen Traffic Generator"
         self.setWindowTitle(self._base_window_title)
         self.setGeometry(100, 100, 1400, 800)
+        # Track which widgets we've installed the section-size event
+        # filter on, so we don't double-install if the layout is rebuilt.
+        self._section_size_filter_installed = set()
 
         self.streams = {}
         self._last_statistics = {}
@@ -358,6 +361,41 @@ class TrafficGeneratorClient(
         except Exception as e:
             logger.debug(f"[LAYOUT] resizeDocks failed: {e}")
 
+    def _install_section_size_filter(self):
+        """Wire QEvent.Resize on the inner section widgets to the
+        title-bar dimension readout.
+
+        QMainWindow.resizeEvent only fires for *window* resizes, so the
+        readout was frozen while the user dragged the dock-splitter
+        handle in the middle of the window. Installing an event filter
+        on the inner widgets (top_section, statistics_group, and the
+        dock itself) catches their own resize events too. Idempotent —
+        each widget is filter-tracked in self._section_size_filter_installed
+        so we don't stack filters if the layout is ever rebuilt.
+        """
+        from PyQt5.QtCore import QEvent  # local import — keeps top of file tidy
+        targets = [
+            getattr(self, "top_section", None),
+            getattr(self, "statistics_group", None),
+            getattr(self, "statistics_dock", None),
+        ]
+        for w in targets:
+            if w is None:
+                continue
+            if id(w) in self._section_size_filter_installed:
+                continue
+            w.installEventFilter(self)
+            self._section_size_filter_installed.add(id(w))
+
+    def eventFilter(self, obj, event):
+        from PyQt5.QtCore import QEvent
+        # Refresh the title-bar readout on any inner section's resize.
+        # Deferred via singleShot(0) so we read AFTER Qt has applied the
+        # geometry change, not in the middle of it.
+        if event.type() == QEvent.Resize and id(obj) in self._section_size_filter_installed:
+            QTimer.singleShot(0, self._update_section_size_readout)
+        return super().eventFilter(obj, event)
+
     def _update_section_size_readout(self):
         """Append live section dimensions to the window title bar.
 
@@ -403,6 +441,9 @@ class TrafficGeneratorClient(
         # Defer one event-loop tick so geometry is settled. QTimer.singleShot(0)
         # runs after the show is complete.
         QTimer.singleShot(0, self._balance_stats_dock)
+        # Install the inner-section resize filter once the layout is up
+        # (idempotent), then prime the title-bar readout.
+        QTimer.singleShot(0, self._install_section_size_filter)
         QTimer.singleShot(0, self._update_section_size_readout)
 
     def resizeEvent(self, event):
