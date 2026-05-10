@@ -779,6 +779,25 @@ class TrafficGenClientStatisticsSection():
             min_width = fm.horizontalAdvance(label) + 24  # padding for sort indicator + breathing room
             self.statistics_table.setColumnWidth(col, max(min_width, 110))
 
+        # Per-interface baselines from the most recent Clear Stats click.
+        # Subtract from cumulative columns so they appear to start from 0.
+        iface_baselines = getattr(self, "_iface_baselines", {})
+
+        def adjusted(iface_name, stats, key):
+            try:
+                v = int(stats.get(key, 0) or 0)
+            except (ValueError, TypeError):
+                v = 0
+            base = iface_baselines.get(iface_name, {})
+            try:
+                bv = int(base.get(key, 0) or 0)
+            except (ValueError, TypeError):
+                bv = 0
+            # Clamp at 0 — server can return a smaller cumulative value
+            # if the kernel netdev got reset (interface flap) since the
+            # baseline was captured.
+            return max(0, v - bv)
+
         for col, (iface_name, stats) in enumerate(statistics.items()):
             # (0) Status - with color coding
             status = stats.get("status", "N/A")
@@ -791,24 +810,24 @@ class TrafficGenClientStatisticsSection():
                 status_item.setForeground(QColor("#6b7280"))  # Gray
             status_item.setFont(QFont("", 10, QFont.Bold))
             self.statistics_table.setItem(0, col, status_item)
-            
-            # (1) Sent Frames
-            tx_item = QTableWidgetItem(format_number(stats.get("tx", 0)))
+
+            # (1) Sent Frames (baseline-subtracted)
+            tx_item = QTableWidgetItem(format_number(adjusted(iface_name, stats, "tx")))
             tx_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             self.statistics_table.setItem(1, col, tx_item)
-            
-            # (2) Received Frames
-            rx_item = QTableWidgetItem(format_number(stats.get("rx", 0)))
+
+            # (2) Received Frames (baseline-subtracted)
+            rx_item = QTableWidgetItem(format_number(adjusted(iface_name, stats, "rx")))
             rx_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             self.statistics_table.setItem(2, col, rx_item)
-            
-            # (3) Sent Bytes
-            sent_bytes_item = QTableWidgetItem(format_bytes(stats.get("sent_bytes", 0)))
+
+            # (3) Sent Bytes (baseline-subtracted)
+            sent_bytes_item = QTableWidgetItem(format_bytes(adjusted(iface_name, stats, "sent_bytes")))
             sent_bytes_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             self.statistics_table.setItem(3, col, sent_bytes_item)
-            
-            # (4) Received Bytes
-            recv_bytes_item = QTableWidgetItem(format_bytes(stats.get("received_bytes", 0)))
+
+            # (4) Received Bytes (baseline-subtracted)
+            recv_bytes_item = QTableWidgetItem(format_bytes(adjusted(iface_name, stats, "received_bytes")))
             recv_bytes_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             self.statistics_table.setItem(4, col, recv_bytes_item)
             
@@ -832,8 +851,8 @@ class TrafficGenClientStatisticsSection():
             recv_bps_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             self.statistics_table.setItem(8, col, recv_bps_item)
             
-            # (9) Errors - with color coding
-            errors = stats.get("errors", 0)
+            # (9) Errors (baseline-subtracted) - with color coding
+            errors = adjusted(iface_name, stats, "errors")
             errors_item = QTableWidgetItem(format_number(errors))
             errors_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             if errors > 0:
@@ -898,8 +917,20 @@ class TrafficGenClientStatisticsSection():
         for stream in stream_stats_list:
             stream_name = stream.get("stream_name", "Unnamed")
             interface = stream.get("interface", "N/A")
-            tx_count = stream.get("tx_count", 0)
-            rx_count = stream.get("rx_count", 0)
+            stream_baselines = getattr(self, "_stream_baselines", {})
+            sb = stream_baselines.get(stream.get("stream_id"), {})
+            try:
+                raw_tx = int(stream.get("tx_count", 0) or 0)
+            except (ValueError, TypeError):
+                raw_tx = 0
+            try:
+                raw_rx = int(stream.get("rx_count", 0) or 0)
+            except (ValueError, TypeError):
+                raw_rx = 0
+            # Subtract Clear Stats baseline; clamp at 0 in case the underlying
+            # tracker reset (e.g. stream restart) since the baseline was taken.
+            tx_count = max(0, raw_tx - int(sb.get("tx_count", 0) or 0))
+            rx_count = max(0, raw_rx - int(sb.get("rx_count", 0) or 0))
             # Handle tx_rate and rx_rate - they may be None, 0.0, or a float
             tx_rate = stream.get("tx_rate")
             if tx_rate is None:
@@ -1063,11 +1094,52 @@ class TrafficGenClientStatisticsSection():
         self.stream_statistics_table.resizeColumnsToContents()
 
     def clear_cached_statistics(self):
-        logger.info("[INFO] Manually clearing cached traffic statistics.")
-        if hasattr(self, '_last_statistics'):
-            del self._last_statistics
-        if hasattr(self, '_last_stream_stats'):
-            del self._last_stream_stats
+        """'Clear Stats' implemented as a baseline tare.
+
+        The server reports kernel netdev counters (tx_packets, rx_packets,
+        bytes, errors) which are cumulative since interface up — they can't
+        be reset from userspace without ifconfig down/up. Same goes for
+        tracker-driven stream tx_count / rx_count: the hot path increments
+        them, no API to zero them out.
+
+        Instead, snapshot the current cumulative values and remember them as
+        baselines. update_statistics_table / update_stream_statistics_table
+        subtract these baselines on each refresh so the display *appears* to
+        reset to 0 and counts up from there. Stream/interface rates (fps,
+        bps) are instantaneous, not cumulative — no baseline needed.
+        """
+        logger.info("[INFO] Clearing displayed traffic statistics (taring baselines).")
+
+        # Per-interface baselines for cumulative columns (Sent Frames,
+        # Received Frames, Sent Bytes, Received Bytes, Errors).
+        self._iface_baselines = {}
+        last = getattr(self, "_last_statistics", None) or {}
+        for iface_name, stats in last.items():
+            if not isinstance(stats, dict):
+                continue
+            self._iface_baselines[iface_name] = {
+                "tx": int(stats.get("tx", 0) or 0),
+                "rx": int(stats.get("rx", 0) or 0),
+                "sent_bytes": int(stats.get("sent_bytes", 0) or 0),
+                "received_bytes": int(stats.get("received_bytes", 0) or 0),
+                "errors": int(stats.get("errors", 0) or 0),
+            }
+
+        # Per-stream baselines for the Stream Statistics tab.
+        self._stream_baselines = {}
+        last_stream = getattr(self, "_last_stream_stats", None) or []
+        for s in last_stream:
+            if not isinstance(s, dict):
+                continue
+            sid = s.get("stream_id")
+            if sid:
+                self._stream_baselines[sid] = {
+                    "tx_count": int(s.get("tx_count", 0) or 0),
+                    "rx_count": int(s.get("rx_count", 0) or 0),
+                }
+
+        # Visual immediate reset — empty the cells until the next poll
+        # populates them with the now-tared values.
         self.clear_statistics_table()
     def clear_statistics_table(self):
         """Clear the traffic statistics table."""
