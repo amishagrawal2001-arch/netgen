@@ -472,9 +472,16 @@ class TrafficGenClientStatisticsSection():
             for iface, stats in filtered_statistics.items():
                 prev = self._last_statistics.get(iface, {}) if hasattr(self, "_last_statistics") else {}
 
-                # Preserve previous values if missing
-                for key in ["tx", "rx", "sent_bytes", "received_bytes", "send_fps", "receive_fps", "send_bps",
-                            "receive_bps"]:
+                # Cumulative-counter preservation only. The kernel's tx_packets,
+                # rx_packets, tx_bytes, rx_bytes monotonically grow while the
+                # interface is up — if a single fetch happens to return 0
+                # (server momentarily slow, partial response), reusing the
+                # previous value avoids flicker. We do NOT preserve the four
+                # *_fps / *_bps rate columns: rates are instantaneous, and the
+                # natural value when traffic isn't flowing IS 0. Preserving
+                # them was the bug that left "32 Mfps / 395 Gbps" visible
+                # after the user clicked Stop.
+                for key in ("tx", "rx", "sent_bytes", "received_bytes"):
                     if stats.get(key, 0) == 0 and prev.get(key, 0) > 0:
                         stats[key] = prev[key]
 
