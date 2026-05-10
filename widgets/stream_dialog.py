@@ -727,15 +727,38 @@ class AddStreamDialog(QDialog):
             tg_num = tg_part.replace("TG", "").strip()
         except Exception:
             tg_num = ""
-        for server in self.server_interfaces:
-            sid = str(server.get("tg_id", "")).strip()
-            if sid == tg_num:
+
+        # The dialog is given a locally-built server_interfaces list (just
+        # tg_id + ports) for the RX-port dropdown — it usually has no
+        # 'address' field. The main window's self.server_interfaces is the
+        # authoritative list that does carry the address. Search both, in
+        # priority order: dialog list (if it happens to include addresses),
+        # then the main window's list reached via parent().
+        candidate_lists = []
+        if self.server_interfaces:
+            candidate_lists.append(self.server_interfaces)
+        try:
+            parent = self.parent()
+            parent_servers = getattr(parent, "server_interfaces", None) if parent else None
+            if parent_servers:
+                candidate_lists.append(parent_servers)
+        except Exception:
+            pass
+
+        for servers in candidate_lists:
+            for server in servers:
+                sid = str(server.get("tg_id", "")).strip()
+                if sid == tg_num:
+                    addr = str(server.get("address", "")).strip()
+                    if addr:
+                        return addr
+
+        # Fallback: first server in any list that has an address
+        for servers in candidate_lists:
+            for server in servers:
                 addr = str(server.get("address", "")).strip()
                 if addr:
                     return addr
-        # Fallback: first server
-        if self.server_interfaces:
-            return str(self.server_interfaces[0].get("address", "")).strip()
         return ""
 
     def _recommend_tx_cores(self):
@@ -767,7 +790,14 @@ class AddStreamDialog(QDialog):
             target_pps = 0
 
         iface = self.tx_port_name or ""
-        url = f"http://{addr}/api/dpdk/recommend"
+        # The main window's server entries already include a scheme
+        # (e.g. "http://svl-d-ai-srv01:5050"). Only prepend http:// when
+        # the address comes from somewhere that didn't include one.
+        if addr.startswith("http://") or addr.startswith("https://"):
+            base = addr.rstrip("/")
+        else:
+            base = "http://" + addr.rstrip("/")
+        url = f"{base}/api/dpdk/recommend"
         params = {"iface": iface, "frame_size": frame_size, "pps": target_pps}
 
         try:
