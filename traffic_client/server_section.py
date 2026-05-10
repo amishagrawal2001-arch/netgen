@@ -158,50 +158,58 @@ class TrafficGenClientServerSection():
         # --- Action Buttons Section (grouped separately, aligned with Streams pattern) ---
         action_button_layout = QHBoxLayout()
         action_button_layout.setAlignment(Qt.AlignLeft)
-        action_button_layout.setSpacing(5)  # Spacing between buttons
-        action_button_layout.setContentsMargins(0, 5, 0, 0)  # Top margin to separate from tree
+        action_button_layout.setSpacing(6)
+        action_button_layout.setContentsMargins(0, 8, 0, 0)
 
-        # Add Ports button (action button)
-        readd_port_button = QPushButton()
-        readd_port_button.setIcon(QIcon(r_icon("icons/readd.png")))
-        readd_port_button.setIconSize(QSize(16, 16))
-        readd_port_button.setFixedSize(32, 28)
-        readd_port_button.setToolTip("Add Ports")
-        readd_port_button.clicked.connect(self.readd_ports_dialog)
+        # TGEN action buttons — bordered + hover-state styling so they match
+        # the streams action bar at the bottom of the right pane and the
+        # two rows align at the same height (34x30 / 18px icons).
+        TGEN_BTN_STYLE = (
+            "QPushButton {"
+            "  border: 1px solid #cbd5e1;"
+            "  border-radius: 5px;"
+            "  background-color: #ffffff;"
+            "  padding: 0px;"
+            "}"
+            "QPushButton:hover { background-color: #f1f5f9; border-color: #94a3b8; }"
+            "QPushButton:pressed { background-color: #e2e8f0; }"
+        )
+        TGEN_BTN_W, TGEN_BTN_H, TGEN_ICON = 34, 30, 18
+
+        def _tgen_btn(icon_name, tooltip, slot, fallback_icon=None):
+            btn = QPushButton()
+            ipath = r_icon(f"icons/{icon_name}")
+            if ipath:
+                btn.setIcon(QIcon(ipath))
+            elif fallback_icon:
+                fpath = r_icon(f"icons/{fallback_icon}")
+                if fpath:
+                    btn.setIcon(QIcon(fpath))
+            btn.setIconSize(QSize(TGEN_ICON, TGEN_ICON))
+            btn.setFixedSize(TGEN_BTN_W, TGEN_BTN_H)
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.setToolTip(tooltip)
+            btn.setStyleSheet(TGEN_BTN_STYLE)
+            btn.clicked.connect(slot)
+            return btn
+
+        readd_port_button = _tgen_btn("readd.png", "Add Ports", self.readd_ports_dialog)
         action_button_layout.addWidget(readd_port_button)
 
-        # Delete Port button (action button)
-        remove_interface_button = QPushButton()
-        remove_interface_button.setIcon(QIcon(r_icon("icons/Trash.png")))
-        remove_interface_button.setIconSize(QSize(16, 16))
-        remove_interface_button.setFixedSize(32, 28)
-        remove_interface_button.setToolTip("Delete Port")
-        remove_interface_button.clicked.connect(self.remove_selected_interface)
+        remove_interface_button = _tgen_btn("Trash.png", "Delete Port", self.remove_selected_interface)
         action_button_layout.addWidget(remove_interface_button)
 
-        # Reset Interface button (action button)
-        reset_interface_button = QPushButton()
-        reset_icon_path = r_icon("icons/reset_btn.png")
-        if reset_icon_path:
-            reset_interface_button.setIcon(QIcon(reset_icon_path))
-        else:
-            # Fallback icon if reset_btn.png doesn't exist
-            reset_interface_button.setIcon(QIcon(r_icon("icons/reset.png")))
-        reset_interface_button.setIconSize(QSize(16, 16))
-        reset_interface_button.setFixedSize(32, 28)
-        reset_interface_button.setToolTip("Reset Interface")
-        reset_interface_button.clicked.connect(self.reset_selected_interface)
+        reset_interface_button = _tgen_btn(
+            "reset_btn.png", "Reset Interface",
+            self.reset_selected_interface,
+            fallback_icon="reset.png",
+        )
         action_button_layout.addWidget(reset_interface_button)
 
-        # Refresh Interface List button (action button)
-        refresh_interface_button = QPushButton()
-        refresh_icon_path = r_icon("icons/refresh.png")
-        if refresh_icon_path:
-            refresh_interface_button.setIcon(QIcon(refresh_icon_path))
-        refresh_interface_button.setIconSize(QSize(16, 16))
-        refresh_interface_button.setFixedSize(32, 28)
-        refresh_interface_button.setToolTip("Refresh Interface List")
-        refresh_interface_button.clicked.connect(self.refresh_selected_server_interfaces)
+        refresh_interface_button = _tgen_btn(
+            "refresh.png", "Refresh Interface List",
+            self.refresh_selected_server_interfaces,
+        )
         action_button_layout.addWidget(refresh_interface_button)
 
         # Stretch to align left (buttons stay on left, space on right)
