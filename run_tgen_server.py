@@ -6038,9 +6038,19 @@ def send_arp_request():
     else:
         return jsonify(result), 200  # Still return 200 for unsuccessful but valid responses
 
-@app.route("/api/device/arp/check", methods=["POST"])
+# DUPLICATE ROUTE — DEAD CODE.
+# Audit HIGH #3: this used to be a second `@app.route("/api/device/arp/check",
+# methods=["POST"])` registration. Flask only routes the URL to the FIRST
+# registered handler (check_arp_resolution at line ~5601, which is more
+# thorough — VLAN-aware, IPv6 support, uses the request's interface
+# field). The decorator was removed so the function is no longer
+# registered; the body survives in case anyone wants to mine pieces of
+# it later, but it is no longer reachable as an HTTP endpoint and
+# shouldn't be called as a Python function (it does request.get_json()
+# at module scope, which requires a Flask request context).
 def device_arp():
-    """Check ARP resolution for a device."""
+    """[REMOVED FROM URL MAP] Old ARP check — superseded by
+    check_arp_resolution above. Kept temporarily as dead code."""
     data = request.get_json()
     target_ip = data.get("ip_address") or data.get("target_ip")
     
