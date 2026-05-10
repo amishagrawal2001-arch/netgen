@@ -80,9 +80,15 @@ class TrafficGenClientServerSection():
         """)
         layout = QVBoxLayout()
 
-        # Set consistent spacing and margins for better visual hierarchy
-        layout.setSpacing(10)  # Space between elements
-        layout.setContentsMargins(4, 4, 4, 4)  # Balanced padding to match right side sections
+        # Match the streams_tab layout: tight margins + minimal spacing
+        # so the tree and the action row read as one continuous panel,
+        # not "table on top, buttons in their own little section
+        # below." This was the real visual gap between left and right —
+        # all the button-style unification in the world didn't help
+        # while the parent layout still inserted a 10px gap above the
+        # action row.
+        layout.setSpacing(2)
+        layout.setContentsMargins(2, 2, 2, 2)
 
         # Server Tree Section
         self.server_tree = QTreeWidget()
@@ -123,8 +129,7 @@ class TrafficGenClientServerSection():
             QTreeWidget {
                 background-color: #ffffff;
                 alternate-background-color: #f5f7fa;
-                border: 1px solid #cbd5e1;
-                border-radius: 4px;
+                border: none;
                 font-size: 13px;
                 outline: none;
                 color: #111827;
