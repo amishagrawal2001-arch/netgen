@@ -787,19 +787,44 @@ def stop_traffic():
         if stream:
             logging.info(f"✅ Found stream by stream_id: {stream_id}")
             stream["stop_event"].set()
-            
+
             # Wait for the thread to actually finish (with timeout)
             future = stream.get("future")
+            future_completed = False
             if future:
                 logging.info(f"⏳ Waiting for thread to finish for stream {stream_id}...")
                 try:
                     # Wait up to 5 seconds for thread to complete
                     future.result(timeout=5.0)
                     logging.info(f"✅ Thread completed for stream {stream_id}")
+                    future_completed = True
                 except Exception as e:
                     # Thread might still be running, but we'll proceed
                     logging.warning(f"⚠️ Thread for stream {stream_id} did not complete within timeout: {e}")
-            
+
+            # Defensive backstop: any tx_worker still running for this
+            # stream_id is a process the launcher's finally block didn't
+            # reap (could be a stuck reader, the launcher already exited,
+            # or a previous-server orphan). pkill -TERM by --stream-id
+            # pattern; if anything matched, log + escalate to KILL after 1s.
+            try:
+                import subprocess as _sp
+                pat = f"--stream-id {stream_id}"
+                check = _sp.run(["pgrep", "-f", pat], capture_output=True, text=True, timeout=3)
+                if check.returncode == 0 and check.stdout.strip():
+                    pids = check.stdout.strip().split()
+                    logging.warning(
+                        f"⚠️ tx_worker(s) still alive for stream {stream_id} after stop "
+                        f"(pids={','.join(pids)}, future_completed={future_completed}) — force-killing"
+                    )
+                    _sp.run(["pkill", "-TERM", "-f", pat], capture_output=True, timeout=3)
+                    import time as _t
+                    _t.sleep(1.0)
+                    _sp.run(["pkill", "-KILL", "-f", pat], capture_output=True, timeout=3)
+                    logging.info(f"✅ Force-kill complete for stream {stream_id}")
+            except Exception as e:
+                logging.warning(f"⚠️ Backstop pkill for stream {stream_id} failed: {e}")
+
             stream_tracker.remove_stream_by_id(interface_normalized, stream_id)
             # Mark stream as stopped in database
             try:
@@ -822,7 +847,7 @@ def stop_traffic():
                         actual_stream_id = s.get("stream_id")
                         logging.info(f"Stopping stream {actual_stream_id} (name: '{stream_name}') on {interface_normalized}")
                         s["stop_event"].set()
-                        
+
                         # Wait for the thread to actually finish (with timeout)
                         future = s.get("future")
                         if future:
@@ -831,12 +856,31 @@ def stop_traffic():
                                 logging.info(f"✅ Thread completed for stream {actual_stream_id}")
                             except Exception as e:
                                 logging.warning(f"⚠️ Thread for stream {actual_stream_id} did not complete within timeout: {e}")
-                        
+
+                        # Defensive backstop — same as in the by-id branch above.
+                        # Force-kill any tx_worker still alive for this stream_id.
+                        try:
+                            import subprocess as _sp
+                            pat = f"--stream-id {actual_stream_id}"
+                            check = _sp.run(["pgrep", "-f", pat], capture_output=True, text=True, timeout=3)
+                            if check.returncode == 0 and check.stdout.strip():
+                                pids = check.stdout.strip().split()
+                                logging.warning(
+                                    f"⚠️ tx_worker(s) still alive for stream {actual_stream_id} after stop "
+                                    f"(pids={','.join(pids)}) — force-killing"
+                                )
+                                _sp.run(["pkill", "-TERM", "-f", pat], capture_output=True, timeout=3)
+                                import time as _t
+                                _t.sleep(1.0)
+                                _sp.run(["pkill", "-KILL", "-f", pat], capture_output=True, timeout=3)
+                        except Exception as _e:
+                            logging.warning(f"⚠️ Backstop pkill for stream {actual_stream_id} failed: {_e}")
+
                         # Wait for RX sniffer cleanup if needed
                         if s.get("flow_tracking_enabled") and s.get("rx_interface") != interface_normalized:
                             import time
                             time.sleep(0.5)
-                        
+
                         stream_tracker.remove_stream_by_id(interface_normalized, actual_stream_id)
                         
                         # Mark as stopped in database
