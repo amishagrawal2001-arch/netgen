@@ -128,12 +128,42 @@ class TrafficGeneratorClient(
         # Server section on the left
         self.setup_server_section()
 
-        # Tabs on the right
+        # Tabs on the right. Flat tab style — text-only labels with a
+        # colored underline on the active tab. Previously these read as
+        # filled pill toggles (blue Streams, gray Devices) which is the
+        # iOS segmented-control idiom, not a tab idiom. Matches the
+        # stats-dock tab styling for visual consistency across the app.
         self.tab_widget = QTabWidget()
         self.streams_tab = QWidget()
         self.devices_tab = DevicesTab(self)
         self.tab_widget.addTab(self.streams_tab, "Streams")
         self.tab_widget.addTab(self.devices_tab, "Devices")
+        self.tab_widget.tabBar().setExpanding(False)
+        self.tab_widget.setStyleSheet("""
+            QTabWidget::pane {
+                border: 1px solid #cbd5e1;
+                border-radius: 4px;
+                background-color: #ffffff;
+                top: -1px;
+            }
+            QTabBar::tab {
+                background-color: transparent;
+                color: #6b7280;
+                border: none;
+                padding: 6px 18px;
+                margin-right: 2px;
+                font-weight: 600;
+                font-size: 12px;
+            }
+            QTabBar::tab:selected {
+                color: #1d4ed8;
+                border-bottom: 3px solid #2563eb;
+                background-color: transparent;
+            }
+            QTabBar::tab:hover:!selected {
+                color: #1f2937;
+            }
+        """)
         self.top_section.addWidget(self.tab_widget)
 
         self.main_layout.addWidget(self.top_section)
@@ -150,6 +180,38 @@ class TrafficGeneratorClient(
             | QDockWidget.DockWidgetFloatable
             | QDockWidget.DockWidgetClosable
         )
+        # Slimmer dock title bar — default Qt chrome is ~28px tall and
+        # the float/close buttons read as oversized X/restore icons in
+        # the top-left corner. Tighten the title bar typography +
+        # padding so the chrome consumes less vertical space and reads
+        # as a section heading rather than an OS window. Features
+        # (movable / floatable / closable) are preserved — only the
+        # visuals change.
+        self.statistics_dock.setStyleSheet("""
+            QDockWidget {
+                titlebar-close-icon: url(none);
+                titlebar-normal-icon: url(none);
+                font-weight: 700;
+                font-size: 11px;
+                color: #6b7280;
+            }
+            QDockWidget::title {
+                background: #f3f4f6;
+                padding: 4px 10px;
+                border-bottom: 1px solid #cbd5e1;
+                text-align: left;
+            }
+            QDockWidget::close-button, QDockWidget::float-button {
+                background: transparent;
+                border: none;
+                padding: 0px;
+                icon-size: 12px;
+            }
+            QDockWidget::close-button:hover, QDockWidget::float-button:hover {
+                background: #e5e7eb;
+                border-radius: 3px;
+            }
+        """)
         # The QGroupBox is now the dock's content; its existing title becomes
         # redundant with the dock's title bar. Strip the QGroupBox title so we
         # don't show "Traffic Statistics" twice stacked on top of each other.
