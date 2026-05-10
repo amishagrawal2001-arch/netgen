@@ -353,6 +353,35 @@ class TrafficGeneratorClient(
         except Exception as e:
             logger.debug(f"[LAYOUT] resizeDocks failed: {e}")
 
+    def _update_section_size_readout(self):
+        """Refresh the status-bar readout with current section dimensions.
+
+        Format: 'Window 1920×1080 │ Top 1920×540 │ Stats 1920×540'
+        Updated on every showEvent/resizeEvent so the user can see
+        exactly how the layout splits as the window grows. Helpful
+        when tuning the stats-dock balance ratio or debugging
+        why one half won't shrink past a certain size.
+        """
+        try:
+            win_w, win_h = self.width(), self.height()
+            parts = [f"Window {win_w}×{win_h}"]
+
+            top = getattr(self, "top_section", None)
+            if top is not None and top.isVisible():
+                parts.append(f"Top {top.width()}×{top.height()}")
+
+            sg = getattr(self, "statistics_group", None)
+            dock = getattr(self, "statistics_dock", None)
+            if sg is not None and dock is not None and dock.isVisible():
+                if dock.isFloating():
+                    parts.append(f"Stats(floating) {sg.width()}×{sg.height()}")
+                else:
+                    parts.append(f"Stats {sg.width()}×{sg.height()}")
+
+            self.statusBar().showMessage("  │  ".join(parts))
+        except Exception as e:
+            logger.debug(f"[LAYOUT] section-size readout failed: {e}")
+
     def showEvent(self, event):
         """Re-balance the stats dock once the window is visible.
 
@@ -364,6 +393,7 @@ class TrafficGeneratorClient(
         # Defer one event-loop tick so geometry is settled. QTimer.singleShot(0)
         # runs after the show is complete.
         QTimer.singleShot(0, self._balance_stats_dock)
+        QTimer.singleShot(0, self._update_section_size_readout)
 
     def resizeEvent(self, event):
         """Keep the stats dock proportional when the user stretches the window.
@@ -381,6 +411,9 @@ class TrafficGeneratorClient(
         # cleanly; instead we just defer the rebalance enough that
         # rapid drags settle.
         QTimer.singleShot(0, self._balance_stats_dock)
+        # Refresh the status-bar dimension readout in the same deferred
+        # tick so the numbers are read AFTER resizeDocks() has settled.
+        QTimer.singleShot(0, self._update_section_size_readout)
 
     def closeEvent(self, event):
         """Handle application close event - cleanup threads and resources."""
