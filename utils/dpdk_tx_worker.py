@@ -214,6 +214,23 @@ def run_stream(
     if tx_cores > 1:
         cmd += ["--tx-cores", str(tx_cores)]
 
+    # Per-flow field randomization. Forwards the four "count" knobs so
+    # tx_worker can bump src_ip / dst_ip / src_port / dst_port across N
+    # packets — required for hashing/RSS tests where the DUT distributes
+    # flows by 5-tuple. count=0 or 1 means "fixed" (the default).
+    for cli_flag, json_key in (
+        ("--src-ip-count",   "src_ip_count"),
+        ("--dst-ip-count",   "dst_ip_count"),
+        ("--src-port-count", "src_port_count"),
+        ("--dst-port-count", "dst_port_count"),
+    ):
+        try:
+            n = int(stream_data.get(json_key) or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if n >= 2:
+            cmd += [cli_flag, str(n)]
+
     # Environment (allow caller to inject EAL/PMD paths etc.)
     child_env = os.environ.copy()
     if env:
