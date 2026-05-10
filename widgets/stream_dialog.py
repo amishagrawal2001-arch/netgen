@@ -106,21 +106,91 @@ backend to saturate 100G / 400G line rate.</p>
 ☐  Force Multi-Instance DPDK         ← leave unchecked for single-NIC blast
 TX Cores (queues): [ 1 ▾ ]   [ Recommend ]</pre>
 
-<p>Click <b>Recommend</b> — it reads the link speed from
-<code>/sys/class/net/&lt;iface&gt;/speed</code>, factors in your frame size + target pps,
-and auto-selects from <code>1 / 2 / 4 / 8 / 12 / 16</code>. The hint label below shows
-the reasoning.</p>
+<p>Three ways to land on a good TX-cores value, in increasing user effort:</p>
 
-<p>Or set it manually using the calibrated table (Mellanox CX-7, AMD EPYC):</p>
+<ol>
+  <li><b>Do nothing — Line Rate auto-picks.</b>
+      If your <i>Stream Rate Type</i> is <b>Line Rate</b> and you leave
+      <b>TX Cores</b> at the default <code>1</code>, the launcher derives a
+      sufficient core count from the interface's link speed at start-up. See
+      "Line Rate auto-pick" below.</li>
+  <li><b>Click <code>Recommend</code></b> — sends the iface, frame size, and
+      target pps to <code>GET /api/dpdk/recommend</code> and auto-selects
+      from <code>1 / 2 / 4 / 8 / 12 / 16</code>. The hint label below the
+      combo box shows the server's reasoning. Use this when you want the
+      number visible in the UI before saving.</li>
+  <li><b>Set it manually</b> using the calibrated table (Mellanox CX-7,
+      AMD EPYC):
+    <table>
+      <tr><th>Goal</th><th>Frame</th><th>TX Cores</th></tr>
+      <tr><td>Saturate 100G</td><td>1500B</td><td class="num"><b>2</b></td></tr>
+      <tr><td>Saturate 200G</td><td>1500B</td><td class="num"><b>4</b></td></tr>
+      <tr><td>Saturate ~400G</td><td>1500B</td><td class="num"><b>8</b></td></tr>
+      <tr><td>Max 64B pps on this NIC</td><td>64B</td>
+          <td class="num"><b>16</b>
+          <span class="muted">(~58 Mpps, 39% of 100G line rate)</span></td></tr>
+    </table>
+  </li>
+</ol>
 
+<h3>Line Rate auto-pick — how it works</h3>
+<p><b>Why it exists.</b> "Line Rate" used to mean <code>--pps 0</code> (each
+worker floods uncapped) but the achievable flood is bounded by
+<code>tx_cores</code>. With the default <code>1</code> you only get
+~4 Mpps × frame_size — about <b>49 Gbps on a 400G link with 1500B frames</b>,
+nowhere near line rate. Surprising and wrong.</p>
+
+<p><b>What the launcher does at start-up</b>, only when
+<i>Stream Rate Type</i> is <b>Line Rate</b> AND the user did not explicitly
+set <code>dpdk_tx_cores</code>:</p>
+
+<ol>
+  <li>Read <code>/sys/class/net/&lt;iface&gt;/speed</code>
+      <span class="muted">(skip auto-pick if unreadable; keep tx_cores=1)</span></li>
+  <li>Compute the link's line-rate pps for the chosen frame size
+      <pre>line_pps = link_mbps × 1e6  /  ((frame_size + 20) × 8)</pre>
+      <span class="muted">+20 bytes covers the L1 preamble + IFG.</span></li>
+  <li>Divide by the calibrated per-core ceiling
+      <table>
+        <tr><th>Frame size</th><th>Per-core pps ceiling</th></tr>
+        <tr><td>≤ 128B</td><td class="num">4,500,000</td></tr>
+        <tr><td>≤ 512B</td><td class="num">4,300,000</td></tr>
+        <tr><td>&gt; 512B</td><td class="num">4,100,000</td></tr>
+      </table>
+  </li>
+  <li>Round the result up to the next supported step
+      (<code>1 / 2 / 4 / 8 / 12 / 16</code>; cap at 16).</li>
+  <li>Use the result <i>only if it's higher</i> than what's already configured
+      — auto-pick never decreases your value.</li>
+</ol>
+
+<p><b>Auto-pick by frame size on a 400G link</b>:</p>
 <table>
-  <tr><th>Goal</th><th>Frame</th><th>TX Cores</th></tr>
-  <tr><td>Saturate 100G</td><td>1500B</td><td class="num"><b>2</b></td></tr>
-  <tr><td>Saturate 200G</td><td>1500B</td><td class="num"><b>4</b></td></tr>
-  <tr><td>Saturate ~400G</td><td>1500B</td><td class="num"><b>8</b></td></tr>
-  <tr><td>Max 64B pps on this NIC</td><td>64B</td><td class="num"><b>16</b>
-      <span class="muted">(~58 Mpps, 39% of 100G line rate)</span></td></tr>
+  <tr><th>Frame</th><th>Line-rate pps</th><th>Need</th><th>Auto tx_cores</th></tr>
+  <tr><td>64B</td>   <td class="num">595,238,095</td><td class="num">~133</td><td class="num"><b>16</b></td></tr>
+  <tr><td>128B</td>  <td class="num">337,837,837</td><td class="num">~76</td> <td class="num"><b>16</b></td></tr>
+  <tr><td>256B</td>  <td class="num">181,159,420</td><td class="num">~41</td> <td class="num"><b>16</b></td></tr>
+  <tr><td>512B</td>  <td class="num">93,984,962</td> <td class="num">~22</td> <td class="num"><b>16</b></td></tr>
+  <tr><td>1500B</td> <td class="num">32,894,736</td> <td class="num">~9</td>  <td class="num"><b>12</b></td></tr>
+  <tr><td>9000B</td> <td class="num">5,541,016</td>  <td class="num">~2</td>  <td class="num"><b>2</b></td></tr>
 </table>
+<p class="muted">At ≤ 512B the theoretical "need" is well above the
+per-NIC ceiling, so auto-pick caps at 16. Beyond that point the limit is
+PCIe / per-queue PMD throughput, not core count — see "Calibrated
+performance numbers" below.</p>
+
+<p><b>How to override.</b> Pick any non-default value in the <i>TX Cores</i>
+combo box, set <code>dpdk_tx_cores</code> in the stream JSON, or export
+<code>DPDK_TX_CORES=N</code> on the server. Any of those counts as
+"explicit" and disables auto-pick — the launcher will use exactly your
+value (clamped at the NIC's <code>max_tx_queues</code>).</p>
+
+<p><b>How to confirm it fired.</b> When auto-pick kicks in, the launcher
+logs at INFO:</p>
+<pre>[dpdk] Line Rate auto-picked tx_cores=12 for enp181s0f0np0
+       (frame=1500B, link-derived); set 'TX Cores (queues)'
+       explicitly to override.</pre>
+<pre>ssh root@&lt;server&gt; 'journalctl -u netgen-server -f' | grep auto-picked</pre>
 
 <h3>Step 4 — Save and start</h3>
 <p>Click <b>Save</b>, then the <b>▶ Start</b> icon on the stream row. The icon
