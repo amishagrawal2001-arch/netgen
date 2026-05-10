@@ -449,11 +449,12 @@ class TrafficGenClientStatisticsSection():
         self.statistics_tab_widget.tabBar().setUsesScrollButtons(True)
         self.statistics_tab_widget.tabBar().setElideMode(Qt.ElideNone)
         
-        # Tab styling — bumped for visibility:
-        # - tab font 11px → 13px so labels are easier to read
-        # - active-tab bottom-border 2px → 3px and a brighter blue so the
-        #   selected tab is unmistakable
-        # - inactive-tab text contrast strengthened (#4b5563 → #374151)
+        # Tab styling — compact:
+        # - padding tightened 8/20 → 4/12 so tabs aren't oversized chips
+        # - min-width dropped 170 → 0 (let labels size to content)
+        # - font 13 → 12 (still legible but takes less vertical room)
+        # Active tab keeps its 3px bottom-border + brighter blue so the
+        # selected tab is still unmistakable.
         self.statistics_tab_widget.setStyleSheet("""
             QTabWidget::pane {
                 border: 1px solid #cbd5e1;
@@ -468,11 +469,10 @@ class TrafficGenClientStatisticsSection():
                 border-bottom: none;
                 border-top-left-radius: 4px;
                 border-top-right-radius: 4px;
-                padding: 8px 20px;
+                padding: 4px 12px;
                 margin-right: 2px;
                 font-weight: 600;
-                font-size: 13px;
-                min-width: 170px;
+                font-size: 12px;
             }
             QTabBar::tab:selected {
                 background-color: #ffffff;
