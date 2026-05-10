@@ -24,7 +24,7 @@ NETGEN_VERSION = "0.2.0"
 # Wheel artifact still ships under its original distribution name; surface rename
 # leaves the Python package internals untouched.
 WHEEL_DIST = "ostg_trafficgen"
-WHEEL_VERSION = "0.1.52"
+WHEEL_VERSION = "0.2.0"
 
 PYTHON_VERSION = "3.10"
 VENV_NAME = "netgen_env"
@@ -590,14 +590,20 @@ class NetgenInstaller:
                 if remote_file.endswith(".sh"):
                     self.run_command(f"chmod +x {remote_file}")
 
-        # DPDK runtime scripts. The server endpoints (/api/dpdk/{status,bind,unbind,
-        # interfaces}) shell out to dpdk_bind.sh; if the script directory is
-        # missing they return 404 "dpdk_bind.sh not found".
-        # Ship the whole resources/dpdk/*.sh tree so DPDK actions work out of the box.
+        # DPDK runtime tree. The server endpoints (/api/dpdk/{status,bind,
+        # unbind,interfaces}) shell out to dpdk_bind.sh; if the script
+        # directory is missing they return 404. install_dpdk.sh's step 6
+        # builds tx_worker from resources/dpdk/tx_worker/{tx_worker.c,
+        # meson.build} — those need to be on the target too, otherwise the
+        # build step fails and there's no tx_worker binary for DPDK streams.
+        # Ship the whole resources/dpdk/ tree (scripts + tx_worker source)
+        # excluding build artifacts and Python bytecode.
         dpdk_src_dir = os.path.join(script_dir, "resources", "dpdk")
         dpdk_remote_dir = f"{INSTALL_DIR}/resources/dpdk"
         if os.path.isdir(dpdk_src_dir):
             self.run_command(f"mkdir -p {dpdk_remote_dir}")
+            # Top-level .sh helpers (dpdk_bind.sh, dpdk_start.sh,
+            # dpdk_tx_worker.sh, install_dpdk.sh, verify_dpdk.sh).
             for fname in sorted(os.listdir(dpdk_src_dir)):
                 if not fname.endswith(".sh"):
                     continue
@@ -605,7 +611,34 @@ class NetgenInstaller:
                 remote_sh = f"{dpdk_remote_dir}/{fname}"
                 self.copy_file(local_sh, remote_sh)
                 self.run_command(f"chmod +x {remote_sh}")
-            self.log(f"✓ DPDK runtime scripts deployed to {dpdk_remote_dir}")
+
+            # tx_worker source — required by install_dpdk.sh step 6.
+            # Copy tx_worker.c and meson.build; skip the local build/
+            # output directory (that gets created on the target during
+            # the actual build).
+            tx_worker_src_dir = os.path.join(dpdk_src_dir, "tx_worker")
+            tx_worker_remote_dir = f"{dpdk_remote_dir}/tx_worker"
+            if os.path.isdir(tx_worker_src_dir):
+                self.run_command(f"mkdir -p {tx_worker_remote_dir}")
+                for fname in sorted(os.listdir(tx_worker_src_dir)):
+                    if fname in ("build", "__pycache__"):
+                        continue
+                    if fname.startswith("."):
+                        continue
+                    local_path = os.path.join(tx_worker_src_dir, fname)
+                    if not os.path.isfile(local_path):
+                        continue
+                    remote_path = f"{tx_worker_remote_dir}/{fname}"
+                    self.copy_file(local_path, remote_path)
+                self.log(f"✓ tx_worker source deployed to {tx_worker_remote_dir}")
+            else:
+                self.log(
+                    f"resources/dpdk/tx_worker/ not found at {tx_worker_src_dir}; "
+                    f"install_dpdk.sh step 6 will fail to build tx_worker.",
+                    "WARNING",
+                )
+
+            self.log(f"✓ DPDK runtime tree deployed to {dpdk_remote_dir}")
 
             # The wheel-installed run_tgen_server.py hardcodes the legacy path
             # /opt/OSTG/resources/dpdk/dpdk_bind.sh in its DPDK endpoints. Even
