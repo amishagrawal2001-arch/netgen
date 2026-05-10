@@ -654,14 +654,15 @@ class TrafficGenClientStreamControl:
     def update_stream_status(self, row, color):
         """Update the stream status icon for a specific row.
 
-        Icon scaled to 12x12 — without explicit pixmap scaling Qt's
-        default QTableWidget iconSize renders the dot as a square
-        block on high-DPI displays. Matches the initial-render path
-        in server_section.py (~line 660).
+        Uses status_dot_icon() (inline QPainter circle) so the dot
+        stays crisp/circular at any size — the 256×256 PNG sprite
+        was anti-aliasing badly at 12-14px and rendering as a
+        square block. Matches the initial-render path in
+        server_section.py.
         """
-        raw_icon = QIcon(r_icon(f"icons/{color}_dot.png"))
+        from utils.qicon_loader import status_dot_icon
         status_item = QTableWidgetItem()
-        status_item.setIcon(QIcon(raw_icon.pixmap(12, 12)))
+        status_item.setIcon(status_dot_icon(color, 14))
         status_item.setFlags(Qt.ItemIsEnabled)  # read-only
         self.stream_table.setItem(row, 0, status_item)
 

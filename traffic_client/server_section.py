@@ -55,8 +55,30 @@ class TrafficGenClientServerSection():
     def setup_server_section(self):
         """Set up the server management section."""
         self.server_group = QGroupBox("TGEN")
+        # Style the group's title to read as a section heading rather
+        # than the default QGroupBox stock label — small uppercase
+        # letter-spaced text in the same gray family as the inactive
+        # tab labels, so the left and right sides of the top split
+        # feel like the same visual system.
+        self.server_group.setStyleSheet("""
+            QGroupBox {
+                border: 1px solid #cbd5e1;
+                border-radius: 4px;
+                margin-top: 14px;
+                font-weight: 700;
+                font-size: 11px;
+                color: #6b7280;
+                letter-spacing: 1px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                subcontrol-position: top left;
+                padding: 0 6px;
+                left: 8px;
+            }
+        """)
         layout = QVBoxLayout()
-        
+
         # Set consistent spacing and margins for better visual hierarchy
         layout.setSpacing(10)  # Space between elements
         layout.setContentsMargins(4, 4, 4, 4)  # Balanced padding to match right side sections
@@ -642,26 +664,23 @@ class TrafficGenClientServerSection():
 
                     self.stream_table.insertRow(row_count)
 
-                    # (0) Status (read-only) — icon + hover tooltip + accessible label.
-                    # Color alone is insufficient (colourblind users see no signal); the
-                    # tooltip and Qt accessibility name carry the meaning in text too.
-                    #
-                    # The icon is scaled to a 12x12 pixmap to match the server tree's
-                    # status indicator. Without explicit scaling, Qt's default
-                    # iconSize on a QTableWidget can render this as a 22x22+ square
-                    # block on high-DPI Macs, which looks like a square not a dot.
+                    # (0) Status (read-only) — inline-painted circular dot
+                    # via status_dot_icon() instead of the PNG sprite. The
+                    # 256×256 sprite was rendering with visible aliasing
+                    # at 12-14px and read as a square block on high-DPI
+                    # Macs. Painting via QPainter gives a clean circle at
+                    # every size. Tooltip + accessibility text still
+                    # carry the status for colourblind users.
+                    from utils.qicon_loader import status_dot_icon
                     status = stream.get("status", "stopped")
                     if status == "running":
-                        raw_icon = QIcon(r_icon("icons/green_dot.png"))
-                        status_label = "Running"
+                        dot_color, status_label = "green", "Running"
                     elif status == "rx_tracking":
-                        raw_icon = QIcon(r_icon("icons/blue_dot.png"))
-                        status_label = "Tracking RX"
+                        dot_color, status_label = "blue", "Tracking RX"
                     else:
-                        raw_icon = QIcon(r_icon("icons/red_dot.png"))
-                        status_label = "Stopped"
+                        dot_color, status_label = "red", "Stopped"
                     status_item = QTableWidgetItem()
-                    status_item.setIcon(QIcon(raw_icon.pixmap(12, 12)))
+                    status_item.setIcon(status_dot_icon(dot_color, 14))
                     status_item.setFlags(Qt.ItemIsEnabled)
                     status_item.setToolTip(status_label)
                     status_item.setData(Qt.AccessibleTextRole, status_label)

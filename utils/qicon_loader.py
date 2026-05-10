@@ -78,3 +78,46 @@ def qicon(package: str, relpath: str) -> QIcon:
     """
     p = r_icon(relpath, package)
     return QIcon(p) if p else QIcon()
+
+
+# Inline-painted status dot.
+# The PNG sprite (resources/icons/red_dot.png at 256×256) was being scaled
+# down to 12-14px by Qt and rendering with visible aliasing, so on the
+# stream table's Status column it read as a square block. Painting the
+# circle directly with QPainter sidesteps PNG scaling entirely — the dot
+# is crisp at every size and platform DPI.
+_STATUS_DOT_COLORS = {
+    "red":    "#dc2626",   # stopped
+    "green":  "#10b981",   # running
+    "blue":   "#2563eb",   # tracking RX
+    "yellow": "#f59e0b",   # pending / in-flight
+    "gray":   "#9ca3af",   # disabled
+}
+
+
+@lru_cache(maxsize=64)
+def status_dot_icon(color_name: str, size: int = 14) -> QIcon:
+    """Return a QIcon containing a centered filled circle of the given
+    color name. Renders inline via QPainter so the dot stays circular
+    and antialiased at any size.
+
+    Cached per (color, size) — typical UI uses 2-3 unique combinations
+    per session.
+    """
+    from PyQt5.QtCore import Qt
+    from PyQt5.QtGui import QColor, QPainter, QPixmap
+
+    pm = QPixmap(size, size)
+    pm.fill(Qt.transparent)
+    p = QPainter(pm)
+    try:
+        p.setRenderHint(QPainter.Antialiasing, True)
+        hex_color = _STATUS_DOT_COLORS.get(color_name, "#6b7280")
+        p.setBrush(QColor(hex_color))
+        p.setPen(Qt.NoPen)
+        # Inset by 1px so the circle's anti-aliased edge isn't clipped
+        # by the pixmap boundary on high-DPI displays.
+        p.drawEllipse(1, 1, size - 2, size - 2)
+    finally:
+        p.end()
+    return QIcon(pm)
