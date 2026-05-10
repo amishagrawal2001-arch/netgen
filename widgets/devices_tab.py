@@ -2187,10 +2187,80 @@ class DevicesTab(QWidget):
         return self.bgp_handler.on_bgp_selection_changed()
 
     def on_cell_changed(self, row, col):
-        """Handle changes to device table cells."""
-        # Stub method for device table cell changes
-        # Add validation logic here if needed
-        pass
+        """Handle inline edits to device table cells.
+
+        Audit HIGH #2: this used to be a stub `pass`, so any inline
+        edit to a cell would update the table widget but NEVER touch
+        self.all_devices. The user would Apply and get the pre-edit
+        config pushed to the server, silently losing their edits.
+
+        Wired now to:
+          1. Resolve device_id from the row's Device Name cell UserRole.
+          2. Look up the column's header name.
+          3. Validate the new value via validate_cell_value(); if
+             invalid, revert the cell to the previous text stashed at
+             UserRole+2 and bail.
+          4. Persist via update_device_data_in_memory().
+          5. Mark the device for re-apply via mark_device_for_apply().
+        """
+        # Don't recurse on programmatic table population.
+        if getattr(self, "_populating_devices_table", False):
+            return
+        try:
+            tbl = self.devices_table
+            item = tbl.item(row, col)
+            if item is None:
+                return
+            new_value = (item.text() or "").strip()
+
+            # Header name for this column. COL maps header → index; build
+            # inverse on the fly (small dict, cheap).
+            header_name = None
+            for h, c in self.COL.items():
+                if c == col:
+                    header_name = h
+                    break
+            if not header_name:
+                return
+
+            # device_id lives on the Device Name cell's UserRole.
+            name_col = self.COL.get("Device Name")
+            if name_col is None:
+                return
+            name_item = tbl.item(row, name_col)
+            device_id = name_item.data(Qt.UserRole) if name_item else None
+            if not device_id:
+                # New row mid-population — skip.
+                return
+
+            # Validate. validate_cell_value returns False for invalid
+            # input; on invalid we revert the cell to the previous
+            # value (stashed at UserRole+2 when the table was built).
+            try:
+                ok = self.validate_cell_value(header_name, new_value, row=row, column=col)
+            except Exception as e:
+                logging.warning(f"[on_cell_changed] validation raised: {e}")
+                ok = True  # fail open
+            if not ok:
+                prev = item.data(Qt.UserRole + 2)
+                if prev is not None:
+                    from PyQt5.QtCore import QSignalBlocker
+                    with QSignalBlocker(tbl):
+                        item.setText(str(prev))
+                return
+
+            # Persist + mark dirty.
+            self.update_device_data_in_memory(device_id, header_name, new_value)
+            # Update the UserRole+2 stash so a future revert uses the
+            # new value as the baseline.
+            item.setData(Qt.UserRole + 2, new_value)
+            if hasattr(self, "mark_device_for_apply"):
+                self.mark_device_for_apply(device_id)
+            logging.info(
+                f"[INLINE EDIT] device {device_id} {header_name!r} → {new_value!r}"
+            )
+        except Exception as e:
+            logging.error(f"[on_cell_changed] error: {e}")
 
     def on_bgp_table_cell_changed(self, row, col):
         """Handle changes to BGP table cells."""
@@ -4940,11 +5010,22 @@ class DevicesTab(QWidget):
             logger.error(f"Failed to remove device from data structure: {e}")
 
     def _remove_device_from_server(self, device_info, device_id, device_name):
-        """Invoke server APIs to clean up a removed device."""
+        """Invoke server APIs to clean up a removed device.
+
+        Audit HIGH #5: this used to call `get_server_url(silent=True)`
+        WITHOUT passing `device_info`, so the priority-1
+        ServerManager-by-device lookup was skipped and resolution fell
+        through to "currently selected TG" (main_window.server_url).
+        Deleting a TG-1 device while a TG-0 port happened to be
+        selected sent cleanup + remove POSTs to TG-0 — the actual
+        TG-1 server kept the interface configured but the UI showed
+        the device gone. Forwarding device_info now so the
+        device-to-server affinity is honored.
+        """
         try:
             logger.debug(f"Removing device '{device_name}' from server")
-            
-            server_url = self.get_server_url(silent=True)
+
+            server_url = self.get_server_url(silent=True, device_info=device_info)
             if not server_url:
                 logger.debug("No server URL available")
                 return
@@ -5908,13 +5989,25 @@ class DevicesTab(QWidget):
         if dialog.exec_() != dialog.Accepted:
             return
         
-        # Get updated values from dialog
+        # Get updated values from dialog.
+        # The 5 VXLAN-increment fields (incr_vxlan, vxlan_vni_increment_index,
+        # vxlan_local_octet_index, vxlan_remote_octet_index, vxlan_udp_increment_index)
+        # were added to AddDeviceDialog.get_values() but this Edit-path unpack
+        # was never updated — only the Add-path at line 5042 was. Result: the
+        # 37-tuple unpacked into 32 names threw `ValueError: too many values
+        # to unpack` and the entire Save click silently failed. Matched to
+        # the Add-path tuple now.
         (
             new_name, iface, mac, ipv4, ipv6, ipv4_mask, ipv6_mask,
-            vlan, mtu, ipv4_gateway, ipv6_gateway, inc_mac, inc_ipv4, inc_ipv6, inc_gateway, inc_vlan, count, 
-            ospf_config, bgp_config, dhcp_config, ipv4_octet_index, ipv6_hextet_index, mac_byte_index, 
-            gateway_octet_index, incr_dhcp_pool, dhcp_pool_octet_index, incr_loopback, loopback_ipv4_octet_index, 
-            loopback_ipv6_hextet_index, loopback_ipv4, loopback_ipv6, isis_config
+            vlan, mtu, ipv4_gateway, ipv6_gateway,
+            inc_mac, inc_ipv4, inc_ipv6, inc_gateway, inc_vlan, incr_vxlan, count,
+            ospf_config, bgp_config, dhcp_config,
+            ipv4_octet_index, ipv6_hextet_index, mac_byte_index, gateway_octet_index,
+            incr_dhcp_pool, dhcp_pool_octet_index,
+            incr_loopback, loopback_ipv4_octet_index, loopback_ipv6_hextet_index,
+            loopback_ipv4, loopback_ipv6, isis_config,
+            vxlan_vni_increment_index, vxlan_local_octet_index,
+            vxlan_remote_octet_index, vxlan_udp_increment_index,
         ) = dialog.get_values()
         new_vxlan_config = dialog.get_vxlan_config()
 

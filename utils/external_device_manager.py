@@ -259,9 +259,15 @@ class ExternalDeviceManager:
         if ping_result.returncode != 0:
             return {"status": "down", "reachable": False}
         
-        # Try to get device info
+        # Try to get device info.
+        # Audit HIGH #6: the kwarg used to be `method="ssh"` but
+        # execute_command's signature is `connection_method=...`.
+        # Every external-device status check raised
+        # TypeError: got an unexpected keyword argument 'method' and
+        # propagated up (no try/except wrapping the call). Fixed to
+        # match the actual parameter name.
         if method == "ssh":
-            result = self.execute_command(device_id, "show version", method="ssh")
+            result = self.execute_command(device_id, "show version", connection_method="ssh")
             if result["success"]:
                 return {
                     "status": "up",
