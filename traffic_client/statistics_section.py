@@ -935,26 +935,47 @@ class TrafficGenClientStatisticsSection():
 
             stream_name = stream_name_item.text().strip()
             interface = interface_item.text().strip()
+            # Read the stream_id stash up front — used both for the iface
+            # resolution below and for the per-stream match further down.
+            stream_id_from_table = stream_name_item.data(Qt.UserRole)
 
-            # Normalize interface name for matching
-            # Table shows just "ens5np0", but streams keys are "TG 0 - Port: ens5np0" or "TG 0 - ens5np0"
+            # Resolve the row to a streams[] key. The Streams table collapses
+            # multiple streams sharing one port into a header row + "↳"
+            # continuation rows; the continuation row's text is literally
+            # "↳" with the real iface in the cell tooltip. This poll tick
+            # was spamming "No match found for interface '↳'" every 2s on
+            # any port with >1 stream until we taught it the layout.
+            #
+            # Three-tier resolution, same pattern as Edit/Remove:
+            #   1. stream_id stashed on the name cell → walk self.streams
+            #      to find the owning port.
+            #   2. Continuation row → read iface from tooltip.
+            #   3. Header row → match the visible text.
             matched_iface = None
-            if interface in self.streams:
-                matched_iface = interface
-            else:
-                # Extract just the interface name (remove VLAN suffix if present)
-                base_interface = interface.split('.')[0] if '.' in interface else interface
-                # Try to find matching port key in streams
-                for k in self.streams:
-                    # Normalize port key: "TG 0 - Port: ens5np0" -> "ens5np0", "TG 0 - ens5np0" -> "ens5np0"
-                    port_key_normalized = k.replace("Port: ", "").split(" - ")[-1] if " - " in k else k
-                    if port_key_normalized == base_interface or port_key_normalized == interface:
-                        matched_iface = k
+            if stream_id_from_table:
+                for p, lst in self.streams.items():
+                    if any(s.get("stream_id") == stream_id_from_table for s in lst):
+                        matched_iface = p
                         break
-                    # Also try partial match
-                    if base_interface in port_key_normalized or port_key_normalized in base_interface:
-                        matched_iface = k
-                        break
+
+            if not matched_iface:
+                # Continuation rows hide the iface in the tooltip.
+                resolve_text = interface
+                if resolve_text == "↳":
+                    resolve_text = (interface_item.toolTip() or "").strip()
+
+                if resolve_text in self.streams:
+                    matched_iface = resolve_text
+                else:
+                    base_interface = resolve_text.split('.')[0] if '.' in resolve_text else resolve_text
+                    for k in self.streams:
+                        port_key_normalized = k.replace("Port: ", "").split(" - ")[-1] if " - " in k else k
+                        if port_key_normalized == base_interface or port_key_normalized == resolve_text:
+                            matched_iface = k
+                            break
+                        if base_interface and (base_interface in port_key_normalized or port_key_normalized in base_interface):
+                            matched_iface = k
+                            break
 
             if not matched_iface:
                 logger.info(f"[UPDATE STATS] No match found for interface '{interface}' in streams (available keys: {list(self.streams.keys())[:3]}...)")
@@ -962,9 +983,8 @@ class TrafficGenClientStatisticsSection():
 
             matched_streams = self.streams.get(matched_iface, [])
 
-            # Get stream_id from table item (more reliable than matching by name)
-            stream_id_from_table = stream_name_item.data(Qt.UserRole) if stream_name_item else None
-            
+            # stream_id_from_table was already read above for the iface
+            # resolution; reuse it here for the per-stream match.
             for stream in matched_streams:
                 # Match by stream_id first (most reliable), then fall back to name
                 stream_id = stream.get("stream_id")
