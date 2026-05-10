@@ -1,12 +1,220 @@
 #statistics_section.py#
 
-from PyQt5.QtWidgets import QTableWidget, QTableWidgetItem, QVBoxLayout, QHBoxLayout, QPushButton, QGroupBox, QLabel, QTabWidget, QWidget
-from PyQt5.QtGui import QColor, QFont
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtWidgets import QTableWidget, QTableWidgetItem, QVBoxLayout, QHBoxLayout, QPushButton, QGroupBox, QLabel, QTabWidget, QWidget, QSizePolicy
+from PyQt5.QtGui import QColor, QFont, QPainter, QPen, QBrush, QFontMetrics
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPointF
 import requests
 import logging
+import time as _time
+from collections import deque
 
 logger = logging.getLogger(__name__)
+
+
+class ThroughputChart(QWidget):
+    """Lightweight rolling-line chart for live throughput.
+
+    No matplotlib / pyqtgraph dep — pure QPainter. Holds a rolling
+    deque of (timestamp, dict) samples, draws one line per interface,
+    auto-scales Y, slides a fixed-width time window.
+
+    add_sample(iface_to_value, ts) is called from the existing polling
+    tick; paintEvent renders.
+    """
+
+    # Window of time to show on the X axis (seconds).
+    WINDOW_SEC = 60
+    # Distinct line colors cycled through interfaces (in selection order).
+    PALETTE = [
+        QColor("#2563eb"),  # blue
+        QColor("#16a34a"),  # green
+        QColor("#dc2626"),  # red
+        QColor("#d97706"),  # amber
+        QColor("#7c3aed"),  # purple
+        QColor("#0891b2"),  # cyan
+    ]
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # samples: deque of (timestamp_seconds, {iface_name: bps_value})
+        self._samples = deque(maxlen=300)  # ~5 min at 1 Hz
+        # Title + Y-axis unit derived from current series ("Gbps" / "Mbps" / "fps").
+        self._title = "Aggregate TX Bit Rate (last 60s)"
+        self.setMinimumHeight(180)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        # Fill background through stylesheet so it matches the surrounding tabs.
+        self.setStyleSheet("background: #ffffff;")
+
+    def add_sample(self, iface_to_bps, ts=None):
+        """Add a sample point. iface_to_bps is {iface_name: bps_value}.
+        Multiple interfaces can be tracked simultaneously."""
+        if ts is None:
+            ts = _time.time()
+        self._samples.append((ts, dict(iface_to_bps or {})))
+        self.update()  # schedule paint
+
+    def clear_samples(self):
+        self._samples.clear()
+        self.update()
+
+    def _samples_iface_history(self):
+        """Set of iface names that have appeared in any visible sample.
+
+        Used by the polling code to keep an iface charted (with value 0)
+        even after it stops sending, until it slides out of the window —
+        otherwise the line just disappears mid-chart, which looks like a
+        bug rather than "traffic stopped."
+        """
+        if not self._samples:
+            return set()
+        now = self._samples[-1][0]
+        t_min = now - self.WINDOW_SEC
+        seen = set()
+        for ts, vals in self._samples:
+            if ts < t_min:
+                continue
+            seen.update(vals.keys())
+        return seen
+
+    @staticmethod
+    def _format_bps(v):
+        if v <= 0:
+            return "0"
+        if v >= 1e9:
+            return f"{v / 1e9:.1f} Gbps"
+        if v >= 1e6:
+            return f"{v / 1e6:.1f} Mbps"
+        if v >= 1e3:
+            return f"{v / 1e3:.1f} Kbps"
+        return f"{v:.0f} bps"
+
+    def paintEvent(self, _event):
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        # Background already set via stylesheet but redraw for safety
+        p.fillRect(0, 0, w, h, QColor("#ffffff"))
+
+        # Layout
+        margin_l, margin_r = 70, 16
+        margin_t, margin_b = 26, 28
+        plot_x0 = margin_l
+        plot_y0 = margin_t
+        plot_w = max(1, w - margin_l - margin_r)
+        plot_h = max(1, h - margin_t - margin_b)
+
+        # Title
+        p.setPen(QColor("#1f2937"))
+        title_font = QFont(self.font())
+        title_font.setPointSize(11)
+        title_font.setBold(True)
+        p.setFont(title_font)
+        p.drawText(margin_l, 18, self._title)
+
+        # No data yet
+        if not self._samples:
+            p.setPen(QColor("#9ca3af"))
+            small = QFont(self.font()); small.setPointSize(10)
+            p.setFont(small)
+            p.drawText(plot_x0 + plot_w // 2 - 80, plot_y0 + plot_h // 2,
+                       "Waiting for samples…")
+            return
+
+        # Determine time window
+        now = self._samples[-1][0]
+        t_min = now - self.WINDOW_SEC
+        # Iface ordering = first-seen order across the visible window
+        iface_order = []
+        seen = set()
+        for ts, vals in self._samples:
+            if ts < t_min:
+                continue
+            for iface in vals:
+                if iface not in seen:
+                    seen.add(iface)
+                    iface_order.append(iface)
+
+        # Determine Y max across all visible series
+        y_max = 0.0
+        for ts, vals in self._samples:
+            if ts < t_min:
+                continue
+            for v in vals.values():
+                if v > y_max:
+                    y_max = v
+        if y_max <= 0:
+            y_max = 1.0  # avoid div-by-zero; chart will be flat
+        # Round y_max up to a "nice" number
+        # Pick a power-of-10 step that divides y_max into 4 ticks
+        import math
+        log = math.log10(max(y_max, 1.0))
+        step = 10 ** math.floor(log) / 2.0
+        while step * 8 < y_max:
+            step *= 2
+        y_top = step * 4
+
+        # Axes
+        axis_pen = QPen(QColor("#cbd5e1"))
+        axis_pen.setWidth(1)
+        p.setPen(axis_pen)
+        p.drawLine(plot_x0, plot_y0, plot_x0, plot_y0 + plot_h)  # Y axis
+        p.drawLine(plot_x0, plot_y0 + plot_h,
+                   plot_x0 + plot_w, plot_y0 + plot_h)  # X axis
+
+        # Y-axis labels (4 ticks)
+        label_font = QFont(self.font()); label_font.setPointSize(9)
+        p.setFont(label_font)
+        p.setPen(QColor("#6b7280"))
+        for i in range(5):
+            y_val = y_top * i / 4
+            y_px = plot_y0 + plot_h - int(plot_h * i / 4)
+            p.drawText(4, y_px + 4, self._format_bps(y_val))
+            # Faint grid line
+            grid_pen = QPen(QColor("#f3f4f6"))
+            grid_pen.setWidth(1)
+            p.setPen(grid_pen)
+            if i > 0:
+                p.drawLine(plot_x0 + 1, y_px, plot_x0 + plot_w, y_px)
+            p.setPen(QColor("#6b7280"))
+
+        # X-axis labels (-60s, -45s, -30s, -15s, now)
+        for i, off in enumerate((-60, -45, -30, -15, 0)):
+            x_px = plot_x0 + int(plot_w * (i / 4))
+            label = "now" if off == 0 else f"-{-off}s"
+            p.drawText(x_px - 12, plot_y0 + plot_h + 18, label)
+
+        # Plot series
+        for idx, iface in enumerate(iface_order):
+            color = self.PALETTE[idx % len(self.PALETTE)]
+            line_pen = QPen(color)
+            line_pen.setWidth(2)
+            p.setPen(line_pen)
+            points = []
+            for ts, vals in self._samples:
+                if ts < t_min:
+                    continue
+                v = vals.get(iface, 0.0)
+                x = plot_x0 + int(plot_w * (ts - t_min) / self.WINDOW_SEC)
+                y = plot_y0 + plot_h - int(plot_h * (v / y_top)) if y_top > 0 else plot_y0 + plot_h
+                points.append(QPointF(x, y))
+            if len(points) >= 2:
+                for i in range(len(points) - 1):
+                    p.drawLine(points[i], points[i + 1])
+
+        # Legend (top-right)
+        legend_x = plot_x0 + plot_w - 200
+        legend_y = plot_y0 + 4
+        p.setFont(label_font)
+        for idx, iface in enumerate(iface_order[:5]):  # cap legend at 5
+            color = self.PALETTE[idx % len(self.PALETTE)]
+            p.setPen(QPen(color, 3))
+            p.drawLine(legend_x, legend_y + 6, legend_x + 14, legend_y + 6)
+            p.setPen(QColor("#1f2937"))
+            short = iface.split(" - ")[-1] if " - " in iface else iface
+            p.drawText(legend_x + 18, legend_y + 10, short[:18])
+            legend_y += 16
+
+        p.end()
 
 
 class StatisticsFetchWorker(QThread):
@@ -184,9 +392,18 @@ class TrafficGenClientStatisticsSection():
         stream_stats_layout.addWidget(self.stream_statistics_table)
         stream_stats_layout.setContentsMargins(0, 0, 0, 0)
         
+        # Tab 3: Live throughput chart — rolling 60s line chart of per-iface
+        # TX bit-rate. Lightweight pure-QPainter implementation; no extra deps.
+        live_chart_tab = QWidget()
+        live_chart_layout = QVBoxLayout(live_chart_tab)
+        live_chart_layout.setContentsMargins(4, 4, 4, 4)
+        self.live_throughput_chart = ThroughputChart(live_chart_tab)
+        live_chart_layout.addWidget(self.live_throughput_chart)
+
         # Add tabs to tab widget
         self.statistics_tab_widget.addTab(interface_stats_tab, "Interface Statistics")
         self.statistics_tab_widget.addTab(stream_stats_tab, "Stream Statistics")
+        self.statistics_tab_widget.addTab(live_chart_tab, "Live Chart")
         # Don't auto-expand tabs to fill the bar — Qt's expand mode shrinks
         # text when the bar is narrow, which clipped "Interface Statistics"
         # to "nterface Statisti..." after the 13px font bump. Let each tab
@@ -514,10 +731,13 @@ class TrafficGenClientStatisticsSection():
 
             self.update_statistics_table(filtered_statistics)
             self._last_statistics = filtered_statistics.copy()
+            # Push a sample to the live chart — one bps value per interface.
+            self._push_chart_sample(filtered_statistics)
         elif hasattr(self, "_last_statistics") and self._last_statistics:
             # Only update if we have meaningful statistics to display
             # Skip the "No new statistics" message to reduce console spam
             self.update_statistics_table(self._last_statistics)
+            self._push_chart_sample(self._last_statistics)
         else:
             self.clear_statistics_table()
         
@@ -751,6 +971,29 @@ class TrafficGenClientStatisticsSection():
             # Use QTimer to avoid blocking
             from PyQt5.QtCore import QTimer
             QTimer.singleShot(0, lambda: self.update_stream_table())
+
+    def _push_chart_sample(self, statistics):
+        """Feed the live throughput chart from a merged-statistics dict.
+
+        For each interface, push its current send_bps. The chart widget
+        slides a 60s window and auto-scales Y, so just hand it raw bps.
+        """
+        chart = getattr(self, "live_throughput_chart", None)
+        if chart is None or not isinstance(statistics, dict):
+            return
+        try:
+            iface_to_bps = {}
+            for iface_name, stats in statistics.items():
+                if not isinstance(stats, dict):
+                    continue
+                # Only chart interfaces that actually have traffic flowing.
+                # Avoids cluttering the legend with idle ports.
+                bps = float(stats.get("send_bps") or 0.0)
+                if bps > 0 or iface_name in chart._samples_iface_history():
+                    iface_to_bps[iface_name] = bps
+            chart.add_sample(iface_to_bps)
+        except Exception as e:
+            logger.debug(f"[CHART] sample push failed: {e}")
 
     def update_statistics_table(self, statistics):
         """Update the traffic statistics table with per-interface and per-stream stats."""
