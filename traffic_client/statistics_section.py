@@ -1136,7 +1136,9 @@ class TrafficGenClientStatisticsSection():
                 rx_item.setForeground(QColor("#ef4444"))  # Red for 100% loss
             self.stream_statistics_table.setItem(row, 4, rx_item)
 
-            # TX Rate
+            # TX Rate — bold + blue to match the Interface Statistics tab's
+            # Send Frame Rate row, so the live throughput readout looks the
+            # same regardless of which tab the user happens to be on.
             tx_rate = stream.get("tx_rate")
             if tx_rate is None or tx_rate == 0.0:
                 tx_rate_display = "0.00 pps"
@@ -1144,9 +1146,12 @@ class TrafficGenClientStatisticsSection():
                 tx_rate_display = format_rate(tx_rate)
             tx_rate_item = QTableWidgetItem(tx_rate_display)
             tx_rate_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            tx_rate_item.setFont(QFont("Monaco, Consolas, monospace", 12, QFont.Bold))
+            tx_rate_item.setForeground(QColor("#1d4ed8"))  # Blue for TX
             self.stream_statistics_table.setItem(row, 5, tx_rate_item)
 
-            # RX Rate
+            # RX Rate — same monospace as TX but regular weight + darker
+            # neutral, matching the Receive Frame Rate row in Interface Stats.
             rx_rate = stream.get("rx_rate")
             if rx_rate is None or rx_rate == 0.0:
                 rx_rate_display = "0.00 pps"
@@ -1154,23 +1159,36 @@ class TrafficGenClientStatisticsSection():
                 rx_rate_display = format_rate(rx_rate)
             rx_rate_item = QTableWidgetItem(rx_rate_display)
             rx_rate_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            rx_rate_item.setForeground(QColor("#111827"))
             self.stream_statistics_table.setItem(row, 6, rx_rate_item)
 
-            # Loss %
+            # Loss % — only meaningful when flow tracking is on AND the
+            # stream is actively running. A non-flow-tracked stream has no
+            # way to know rx_count, so reporting "100% loss" on those
+            # (which the previous code did, in red) was misleading. Show
+            # a muted "—" instead.
             loss_pct = stream["loss_pct"]
-            loss_item = QTableWidgetItem(f"{loss_pct:.2f}%")
+            stream_running = str(stream.get("status", "")).lower() == "running"
+            if not stream["flow_tracking"]:
+                loss_text = "—"
+                loss_color = QColor("#9ca3af")  # muted gray
+            elif not stream_running and stream["tx_count"] == 0:
+                loss_text = "—"
+                loss_color = QColor("#9ca3af")
+            else:
+                loss_text = f"{loss_pct:.2f}%"
+                if loss_pct > 50:
+                    loss_color = QColor("#ef4444")  # Red for >50% loss
+                elif loss_pct > 10:
+                    loss_color = QColor("#f59e0b")  # Orange for >10%
+                elif loss_pct > 0:
+                    loss_color = QColor("#fbbf24")  # Yellow for >0%
+                else:
+                    loss_color = QColor("#10b981")  # Green for 0% loss
+            loss_item = QTableWidgetItem(loss_text)
             loss_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             loss_item.setFont(QFont("", 12, QFont.Bold))
-
-            # Color code loss percentage
-            if loss_pct > 50:
-                loss_item.setForeground(QColor("#ef4444"))  # Red for >50% loss
-            elif loss_pct > 10:
-                loss_item.setForeground(QColor("#f59e0b"))  # Orange for >10% loss
-            elif loss_pct > 0:
-                loss_item.setForeground(QColor("#fbbf24"))  # Yellow for >0% loss
-            else:
-                loss_item.setForeground(QColor("#10b981"))  # Green for 0% loss
+            loss_item.setForeground(loss_color)
 
             self.stream_statistics_table.setItem(row, 7, loss_item)
 
