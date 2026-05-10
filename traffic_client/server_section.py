@@ -54,31 +54,48 @@ def _read_enabled_cell(cell_widget) -> bool:
 
 class TrafficGenClientServerSection():
     def setup_server_section(self):
-        """Set up the server management section."""
-        self.server_group = QGroupBox("TGEN")
-        # Style the group's title to read as a section heading. Bumped
-        # up from the prior too-timid 11pt gray to 13pt bold dark gray
-        # so it has presence comparable to the Streams/Devices tab
-        # labels on the right side. Bordered group + slightly inset
-        # title floats over the top-left edge.
-        self.server_group.setStyleSheet("""
-            QGroupBox {
+        """Set up the server management section.
+
+        Wrapped in a QTabWidget with a single "TGEN" tab so the visual
+        treatment exactly matches the Streams/Devices QTabWidget on the
+        right side of the top split — same tab header chrome, same pane
+        border, same flat-tab styling. Without this, the left side
+        used a QGroupBox (title embedded in the border) while the right
+        side used real tabs, and the two sections never quite looked
+        like siblings no matter how much we tweaked the internals.
+        """
+        # The outer container exposed to the rest of the app is now a
+        # QTabWidget, but we keep `self.server_group` pointing to the
+        # inner content widget so existing code that references
+        # `server_group.setLayout(...)` or similar keeps working.
+        self.server_tab_widget = QTabWidget()
+        self.server_tab_widget.tabBar().setExpanding(False)
+        # Same flat-tab stylesheet as the Streams/Devices side
+        # (traffic_client/main.py) — keep the two in sync.
+        self.server_tab_widget.setStyleSheet("""
+            QTabWidget::pane {
                 border: 1px solid #cbd5e1;
                 border-radius: 4px;
-                margin-top: 14px;
-                font-weight: 700;
-                font-size: 13px;
-                color: #1f2937;
-                letter-spacing: 0.5px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                subcontrol-position: top left;
-                padding: 0 8px;
-                left: 8px;
                 background-color: #ffffff;
+                top: -1px;
+            }
+            QTabBar::tab {
+                background-color: transparent;
+                color: #6b7280;
+                border: none;
+                padding: 6px 18px;
+                margin-right: 2px;
+                font-weight: 600;
+                font-size: 12px;
+            }
+            QTabBar::tab:selected {
+                color: #1d4ed8;
+                border-bottom: 3px solid #2563eb;
+                background-color: transparent;
             }
         """)
+        self.server_group = QWidget()  # inner content widget
+        self.server_tab_widget.addTab(self.server_group, "TGEN")
         layout = QVBoxLayout()
 
         # Match the streams_tab layout: tight margins + minimal spacing
@@ -262,9 +279,11 @@ class TrafficGenClientServerSection():
         action_button_layout.addStretch(1)
         layout.addWidget(tgen_action_bar)
 
-        # Finalize section
+        # Finalize section. server_group is now the inner content widget
+        # owned by self.server_tab_widget — set the layout on it and add
+        # the tab widget (not the bare content) to the top splitter.
         self.server_group.setLayout(layout)
-        self.top_section.addWidget(self.server_group)
+        self.top_section.addWidget(self.server_tab_widget)
 
         # Populate server tree with current servers and ports
         self.update_server_tree()
