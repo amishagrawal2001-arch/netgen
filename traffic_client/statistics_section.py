@@ -190,6 +190,13 @@ class TrafficGenClientStatisticsSection():
         # Add tabs to tab widget
         self.statistics_tab_widget.addTab(interface_stats_tab, "Interface Statistics")
         self.statistics_tab_widget.addTab(stream_stats_tab, "Stream Statistics")
+        # Don't auto-expand tabs to fill the bar — Qt's expand mode shrinks
+        # text when the bar is narrow, which clipped "Interface Statistics"
+        # to "nterface Statisti..." after the 13px font bump. Let each tab
+        # size to its label + the min-width set in CSS instead.
+        self.statistics_tab_widget.tabBar().setExpanding(False)
+        self.statistics_tab_widget.tabBar().setUsesScrollButtons(True)
+        self.statistics_tab_widget.tabBar().setElideMode(Qt.ElideNone)
         
         # Tab styling — bumped for visibility:
         # - tab font 11px → 13px so labels are easier to read
@@ -210,10 +217,11 @@ class TrafficGenClientStatisticsSection():
                 border-bottom: none;
                 border-top-left-radius: 4px;
                 border-top-right-radius: 4px;
-                padding: 8px 18px;
+                padding: 8px 20px;
                 margin-right: 2px;
                 font-weight: 600;
                 font-size: 13px;
+                min-width: 170px;
             }
             QTabBar::tab:selected {
                 background-color: #ffffff;
@@ -816,15 +824,25 @@ class TrafficGenClientStatisticsSection():
         # Make sure column headers don't clip at narrow pane widths.
         # Use a per-column min width derived from the header text, and expose the
         # full interface name as a hover tooltip on the header.
+        # NOTE: QFontMetrics off the header widget reports the *widget* font,
+        # which is smaller than the bold 12px CSS-applied font we actually
+        # render. Build a metrics object with the rendered font (12pt bold)
+        # so the calc isn't undersized — that's what was clipping
+        # "enp181s0f0np0" to "p181s0f0np" after the visibility bump.
         from PyQt5.QtGui import QFontMetrics
         header_view = self.statistics_table.horizontalHeader()
-        fm = QFontMetrics(header_view.font())
+        header_font = QFont(header_view.font())
+        header_font.setPointSize(max(header_font.pointSize(), 12))
+        header_font.setBold(True)
+        fm = QFontMetrics(header_font)
         for col, label in enumerate(header_labels):
             header_item = self.statistics_table.horizontalHeaderItem(col)
             if header_item is not None:
                 header_item.setToolTip(label)
-            min_width = fm.horizontalAdvance(label) + 24  # padding for sort indicator + breathing room
-            self.statistics_table.setColumnWidth(col, max(min_width, 110))
+            # +36 for left/right padding + sort indicator + breathing room
+            # (was +24 — too tight for the 13px body / 12px bold header pair).
+            min_width = fm.horizontalAdvance(label) + 36
+            self.statistics_table.setColumnWidth(col, max(min_width, 140))
 
         # Per-interface baselines from the most recent Clear Stats click.
         # Subtract from cumulative columns so they appear to start from 0.
