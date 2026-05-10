@@ -1,0 +1,585 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<meta name="description" content="Netgen — a DPDK-based traffic generator for line-rate testing. Multi-queue tx_worker, RFC 2544 throughput test, one-way latency, live charts." />
+<title>Netgen — DPDK Traffic Generator</title>
+
+<style>
+  :root {
+    --blue:        #2563eb;
+    --blue-dark:   #1d4ed8;
+    --blue-soft:   #eff6ff;
+    --ink:         #0f172a;
+    --ink-soft:    #1f2937;
+    --gray:        #6b7280;
+    --gray-soft:   #9ca3af;
+    --line:        #e5e7eb;
+    --line-strong: #cbd5e1;
+    --bg:          #ffffff;
+    --bg-soft:     #f9fafb;
+    --bg-code:     #0f172a;
+    --code-text:   #e2e8f0;
+    --green:       #10b981;
+    --amber:       #f59e0b;
+    --red:         #dc2626;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto,
+                 "Helvetica Neue", Arial, sans-serif;
+    color: var(--ink-soft);
+    background: var(--bg);
+    line-height: 1.6;
+    -webkit-font-smoothing: antialiased;
+  }
+  a { color: var(--blue); text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  code, pre {
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo,
+                 Consolas, "Liberation Mono", monospace;
+  }
+  code {
+    background: #f3f4f6;
+    color: #1e3a8a;
+    padding: 1px 6px;
+    border-radius: 3px;
+    font-size: 0.9em;
+  }
+  pre {
+    background: var(--bg-code);
+    color: var(--code-text);
+    padding: 16px 18px;
+    border-radius: 8px;
+    overflow-x: auto;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+  pre code { background: transparent; color: inherit; padding: 0; }
+
+  /* Top nav */
+  header.nav {
+    position: sticky; top: 0; z-index: 10;
+    background: rgba(255,255,255,0.85);
+    backdrop-filter: saturate(180%) blur(10px);
+    -webkit-backdrop-filter: saturate(180%) blur(10px);
+    border-bottom: 1px solid var(--line);
+  }
+  header.nav .inner {
+    max-width: 1140px; margin: 0 auto;
+    padding: 14px 24px;
+    display: flex; align-items: center; gap: 24px;
+  }
+  header.nav .brand {
+    font-weight: 800; font-size: 18px; color: var(--ink);
+    letter-spacing: -0.01em;
+  }
+  header.nav .brand .dot { color: var(--blue); }
+  header.nav nav {
+    margin-left: auto;
+    display: flex; gap: 22px;
+    font-size: 14px; font-weight: 500;
+  }
+  header.nav nav a { color: var(--ink-soft); }
+  header.nav nav a:hover { color: var(--blue); text-decoration: none; }
+  header.nav .cta {
+    background: var(--ink); color: white;
+    padding: 6px 14px; border-radius: 6px;
+    font-size: 13px; font-weight: 600;
+  }
+  header.nav .cta:hover { background: var(--blue-dark); text-decoration: none; }
+
+  /* Hero */
+  section.hero {
+    padding: 84px 24px 64px;
+    text-align: center;
+    background:
+      radial-gradient(circle at 20% 0%, var(--blue-soft) 0%, transparent 40%),
+      radial-gradient(circle at 80% 30%, #fef3c7 0%, transparent 35%);
+  }
+  section.hero .tag {
+    display: inline-block;
+    font-size: 12px; font-weight: 700;
+    letter-spacing: 0.12em; text-transform: uppercase;
+    color: var(--blue);
+    background: var(--blue-soft);
+    padding: 6px 14px; border-radius: 999px;
+    margin-bottom: 18px;
+  }
+  section.hero h1 {
+    font-size: 56px; line-height: 1.1; margin: 0 0 18px;
+    color: var(--ink); font-weight: 800; letter-spacing: -0.02em;
+  }
+  section.hero h1 .accent {
+    background: linear-gradient(90deg, var(--blue), #7c3aed);
+    -webkit-background-clip: text; background-clip: text;
+    -webkit-text-fill-color: transparent;
+  }
+  section.hero p.lede {
+    max-width: 720px; margin: 0 auto 30px;
+    font-size: 18px; color: var(--ink-soft);
+  }
+  section.hero .ctas {
+    display: flex; justify-content: center; gap: 12px; flex-wrap: wrap;
+  }
+  .btn {
+    display: inline-flex; align-items: center; gap: 8px;
+    padding: 12px 22px;
+    border-radius: 8px;
+    font-size: 15px; font-weight: 600;
+    border: 1px solid transparent;
+    transition: transform 0.05s ease, box-shadow 0.15s ease;
+    cursor: pointer; user-select: none;
+  }
+  .btn-primary {
+    background: var(--ink); color: white;
+  }
+  .btn-primary:hover {
+    background: var(--blue-dark); text-decoration: none;
+    box-shadow: 0 4px 12px rgba(37,99,235,0.25);
+  }
+  .btn-secondary {
+    background: white; color: var(--ink-soft);
+    border-color: var(--line-strong);
+  }
+  .btn-secondary:hover {
+    border-color: var(--ink-soft); text-decoration: none;
+  }
+
+  /* Stats strip */
+  section.stats {
+    border-top: 1px solid var(--line); border-bottom: 1px solid var(--line);
+    background: var(--bg-soft);
+  }
+  section.stats .inner {
+    max-width: 1140px; margin: 0 auto;
+    padding: 32px 24px;
+    display: grid; grid-template-columns: repeat(4, 1fr);
+    gap: 20px;
+  }
+  section.stats .stat { text-align: center; }
+  section.stats .stat .n {
+    font-size: 32px; font-weight: 800;
+    color: var(--ink); letter-spacing: -0.02em;
+  }
+  section.stats .stat .label {
+    font-size: 12px; font-weight: 600;
+    color: var(--gray); text-transform: uppercase; letter-spacing: 0.08em;
+    margin-top: 4px;
+  }
+
+  /* Generic section */
+  section.block {
+    max-width: 1140px; margin: 0 auto;
+    padding: 72px 24px;
+  }
+  section.block h2 {
+    font-size: 36px; line-height: 1.2; margin: 0 0 12px;
+    color: var(--ink); font-weight: 800; letter-spacing: -0.02em;
+  }
+  section.block h2 + p {
+    font-size: 17px; color: var(--gray);
+    max-width: 720px; margin: 0 0 40px;
+  }
+
+  /* Features grid */
+  .features {
+    display: grid; gap: 22px;
+    grid-template-columns: repeat(3, 1fr);
+  }
+  .feature {
+    border: 1px solid var(--line); border-radius: 12px;
+    padding: 24px; background: white;
+    transition: border-color 0.15s ease, transform 0.15s ease;
+  }
+  .feature:hover {
+    border-color: var(--line-strong);
+    transform: translateY(-2px);
+  }
+  .feature .ico {
+    width: 38px; height: 38px;
+    border-radius: 8px; background: var(--blue-soft);
+    display: inline-flex; align-items: center; justify-content: center;
+    color: var(--blue); font-size: 20px; font-weight: 700;
+    margin-bottom: 14px;
+  }
+  .feature h3 {
+    margin: 0 0 8px; font-size: 17px; color: var(--ink);
+    font-weight: 700;
+  }
+  .feature p {
+    margin: 0; font-size: 14px; color: var(--gray);
+  }
+
+  /* Quickstart */
+  section.quickstart { background: var(--bg-soft); }
+  .qs-grid {
+    display: grid; gap: 28px;
+    grid-template-columns: 1fr 1fr;
+    align-items: start;
+  }
+  .qs-step {
+    display: flex; gap: 14px; margin-bottom: 22px;
+  }
+  .qs-step .num {
+    flex-shrink: 0;
+    width: 28px; height: 28px;
+    border-radius: 50%;
+    background: var(--ink); color: white;
+    display: inline-flex; align-items: center; justify-content: center;
+    font-weight: 700; font-size: 13px;
+  }
+  .qs-step h4 {
+    margin: 3px 0 4px; font-size: 15px; color: var(--ink);
+  }
+  .qs-step p {
+    margin: 0; font-size: 14px; color: var(--gray);
+  }
+
+  /* Architecture */
+  .arch-grid {
+    display: grid; gap: 18px;
+    grid-template-columns: 1fr 1fr;
+  }
+  .arch-card {
+    border: 1px solid var(--line); border-radius: 12px;
+    padding: 26px; background: white;
+  }
+  .arch-card h3 {
+    margin: 0 0 8px; font-size: 18px; color: var(--ink);
+  }
+  .arch-card .tags {
+    display: flex; gap: 6px; flex-wrap: wrap; margin: 8px 0 14px;
+  }
+  .arch-card .tag {
+    font-size: 11px; font-weight: 600;
+    background: var(--blue-soft); color: var(--blue-dark);
+    padding: 3px 9px; border-radius: 4px;
+  }
+  .arch-card ul {
+    margin: 0; padding-left: 18px; font-size: 14px; color: var(--ink-soft);
+  }
+  .arch-card ul li { margin-bottom: 4px; }
+
+  /* CTA bottom */
+  section.cta-bottom {
+    text-align: center;
+    padding: 80px 24px;
+    background: var(--ink);
+    color: white;
+  }
+  section.cta-bottom h2 {
+    color: white; font-size: 36px; margin: 0 0 12px;
+    font-weight: 800;
+  }
+  section.cta-bottom p {
+    color: var(--gray-soft); font-size: 17px;
+    max-width: 600px; margin: 0 auto 28px;
+  }
+  section.cta-bottom .btn-primary { background: var(--blue); }
+  section.cta-bottom .btn-primary:hover { background: var(--blue-dark); }
+  section.cta-bottom .btn-secondary {
+    background: transparent; color: white;
+    border-color: rgba(255,255,255,0.3);
+  }
+  section.cta-bottom .btn-secondary:hover {
+    border-color: white;
+  }
+
+  /* Footer */
+  footer {
+    border-top: 1px solid var(--line);
+    padding: 28px 24px;
+    text-align: center;
+    font-size: 13px; color: var(--gray);
+  }
+  footer a { color: var(--gray); }
+  footer a:hover { color: var(--ink-soft); }
+
+  @media (max-width: 760px) {
+    section.hero h1 { font-size: 38px; }
+    section.hero p.lede { font-size: 16px; }
+    section.stats .inner { grid-template-columns: repeat(2, 1fr); }
+    .features, .qs-grid, .arch-grid { grid-template-columns: 1fr; }
+    header.nav nav { display: none; }
+    header.nav .cta { margin-left: auto; }
+    section.block h2 { font-size: 28px; }
+    section.cta-bottom h2 { font-size: 28px; }
+  }
+</style>
+</head>
+<body>
+
+<header class="nav">
+  <div class="inner">
+    <div class="brand">Net<span class="dot">·</span>gen</div>
+    <nav>
+      <a href="#features">Features</a>
+      <a href="#quickstart">Quick start</a>
+      <a href="#architecture">Architecture</a>
+      <a href="#api">API</a>
+    </nav>
+    <a class="cta" href="https://github.com/DAY-Advisor/NetGenI">GitHub</a>
+  </div>
+</header>
+
+<!-- Hero -->
+<section class="hero">
+  <div class="tag">DPDK · PyQt5 · Flask</div>
+  <h1>Line-rate traffic generation,<br />
+      <span class="accent">without the price tag.</span></h1>
+  <p class="lede">
+    Netgen is a software traffic generator built on DPDK. Saturate
+    400&nbsp;Gbps Mellanox ports from commodity hardware, run RFC 2544
+    throughput tests, measure one-way latency in microseconds — all
+    from a clean PyQt5 GUI or a scriptable REST API.
+  </p>
+  <div class="ctas">
+    <a class="btn btn-primary" href="#quickstart">
+      Get started →
+    </a>
+    <a class="btn btn-secondary" href="https://github.com/DAY-Advisor/NetGenI">
+      ★ Star on GitHub
+    </a>
+  </div>
+</section>
+
+<!-- Stats -->
+<section class="stats">
+  <div class="inner">
+    <div class="stat">
+      <div class="n">400&nbsp;Gbps</div>
+      <div class="label">Line rate</div>
+    </div>
+    <div class="stat">
+      <div class="n">14.9&nbsp;Mpps</div>
+      <div class="label">Per TX core</div>
+    </div>
+    <div class="stat">
+      <div class="n">&lt; 5&nbsp;µs</div>
+      <div class="label">One-way latency</div>
+    </div>
+    <div class="stat">
+      <div class="n">0%</div>
+      <div class="label">Loss at RFC 2544 §26.1</div>
+    </div>
+  </div>
+</section>
+
+<!-- Features -->
+<section class="block" id="features">
+  <h2>Built for the lab.</h2>
+  <p>Everything you need to characterize a network device, all in one open binary.</p>
+
+  <div class="features">
+    <div class="feature">
+      <div class="ico">⚡</div>
+      <h3>DPDK tx_worker</h3>
+      <p>Multi-queue per-stream sender on commodity NICs. Mellanox mlx5,
+         Intel ice / i40e, Broadcom bnxt. Up to 16 TX cores per stream
+         with automatic core picking based on link speed and frame size.</p>
+    </div>
+    <div class="feature">
+      <div class="ico">📊</div>
+      <h3>RFC 2544 throughput</h3>
+      <p>Classic IETF §26.1 binary search per frame size. 64B → 1518B
+         across the standard IETF set. Cooperative stop, live progress
+         polling, CSV export for customer reports.</p>
+    </div>
+    <div class="feature">
+      <div class="ico">⏱️</div>
+      <h3>One-way latency</h3>
+      <p>NLAT header timestamps in each UDP payload. RX-side scapy
+         sampler computes min / avg / p50 / p99 / max over a rolling
+         10K-sample window. Sub-microsecond resolution on loopback.</p>
+    </div>
+    <div class="feature">
+      <div class="ico">📈</div>
+      <h3>Live throughput chart</h3>
+      <p>Rolling 60-second per-interface bit-rate plot, pure-QPainter
+         (no matplotlib). Auto-scales Y from kbps to Gbps. One line per
+         interface, color-coded legend, no extra deps.</p>
+    </div>
+    <div class="feature">
+      <div class="ico">🎯</div>
+      <h3>Per-flow randomization</h3>
+      <p>Spirent/Ixia-style "modifiers" — cycle src/dst IP and L4 ports
+         across configurable ranges for 5-tuple-hash distribution. RSS
+         and LAG balancing testing without a hardware tester.</p>
+    </div>
+    <div class="feature">
+      <div class="ico">📦</div>
+      <h3>PCAP replay</h3>
+      <p>Upload any capture, replay it at line rate or controlled pps.
+         Streaming uploader handles 100+ MB captures without freezing
+         the UI. Loop, rate-shape, or single-pass.</p>
+    </div>
+  </div>
+</section>
+
+<!-- Quickstart -->
+<section class="block quickstart" id="quickstart">
+  <h2>Three commands to first packet.</h2>
+  <p>One installer brings DPDK + Mellanox drivers + tx_worker + server. The client is a single Python module.</p>
+
+  <div class="qs-grid">
+    <div>
+      <div class="qs-step">
+        <div class="num">1</div>
+        <div>
+          <h4>Install on the server</h4>
+          <p>Apt-retry hardened against flaky mirrors; pulls DPDK 23.11, mlx5 PMD, hugepages config, and the netgen Flask server.</p>
+        </div>
+      </div>
+      <div class="qs-step">
+        <div class="num">2</div>
+        <div>
+          <h4>Start the client</h4>
+          <p>PyQt5 GUI connects to the server, discovers interfaces, and renders the streams table with live stats polling.</p>
+        </div>
+      </div>
+      <div class="qs-step">
+        <div class="num">3</div>
+        <div>
+          <h4>Add a stream and hit Start</h4>
+          <p>Right-click an interface, configure the stream, optionally tick "Enable DPDK" and "Enable timestamps" — done.</p>
+        </div>
+      </div>
+    </div>
+
+    <div>
+<pre><code><span style="color:#94a3b8"># On the server (Ubuntu 22.04+)</span>
+sudo python3 install_ostg_complete.py
+
+<span style="color:#94a3b8"># Launch the server</span>
+sudo netgen-server --port 5050
+
+<span style="color:#94a3b8"># On your laptop</span>
+git clone https://github.com/DAY-Advisor/NetGenI.git
+cd NetGenI
+pip install -r requirements.txt
+python3 -m traffic_client \
+    --server http://&lt;your-server&gt;:5050</code></pre>
+    </div>
+  </div>
+</section>
+
+<!-- Architecture -->
+<section class="block" id="architecture">
+  <h2>Two-process, REST-glued.</h2>
+  <p>A Flask server runs on the box that owns the NICs. The PyQt5 client runs anywhere — your laptop, a CI runner, a Docker container.</p>
+
+  <div class="arch-grid">
+    <div class="arch-card">
+      <h3>netgen-server</h3>
+      <div class="tags">
+        <span class="tag">Flask</span>
+        <span class="tag">DPDK 23.11</span>
+        <span class="tag">SQLite</span>
+        <span class="tag">scapy</span>
+      </div>
+      <ul>
+        <li>tx_worker C process per stream (DPDK), multi-queue</li>
+        <li>Scapy fallback for non-UDP (ICMP, TCP, custom)</li>
+        <li>Stream database (SQLite) + tracker thread for per-flow stats</li>
+        <li>Per-iface latency sampler via libpcap</li>
+        <li>RFC 2544 runner thread with cooperative cancel</li>
+        <li>Single-page <code>/admin</code> web UI</li>
+      </ul>
+    </div>
+    <div class="arch-card">
+      <h3>traffic_client (GUI)</h3>
+      <div class="tags">
+        <span class="tag">PyQt5</span>
+        <span class="tag">QThread</span>
+        <span class="tag">QPainter</span>
+      </div>
+      <ul>
+        <li>Stream editor, copy/paste, inline editing</li>
+        <li>Live stats dock with per-interface + per-stream tabs</li>
+        <li>Rolling throughput chart (60s window)</li>
+        <li>RFC 2544 wizard with CSV export</li>
+        <li>Background workers + local event loops keep the UI responsive</li>
+        <li>Help → Install Guide + API Guide embedded</li>
+      </ul>
+    </div>
+  </div>
+</section>
+
+<!-- API -->
+<section class="block quickstart" id="api">
+  <h2>Scriptable from anywhere.</h2>
+  <p>Every action the GUI takes is a REST call. Use the same endpoints from your CI pipeline, your monitoring system, or your shell.</p>
+
+<pre><code><span style="color:#94a3b8"># Start a UDP stream at line rate via DPDK</span>
+curl -X POST http://&lt;server&gt;:5050/api/traffic/start \
+  -H "Content-Type: application/json" \
+  -d '{
+    "streams": {
+      "Port:enp181s0f0np0": [{
+        "name":          "udp-blast",
+        "enabled":       true,
+        "L3":            "IPv4",
+        "L4":            "UDP",
+        "frame_size":    64,
+        "stream_rate_type": "Line Rate",
+        "dpdk_enable":   true,
+        "dpdk_tx_cores": 4,
+        "enable_timestamps": true,
+        "protocol_data": {
+          "mac":  {"mac_source_address": "aa:bb:cc:dd:ee:01",
+                   "mac_destination_address": "aa:bb:cc:dd:ee:02"},
+          "ipv4": {"ipv4_source": "10.0.0.1",
+                   "ipv4_destination": "10.0.0.2"},
+          "udp":  {"udp_source_port": "1234",
+                   "udp_destination_port": "4791"}
+        }
+      }]
+    }
+  }'
+
+<span style="color:#94a3b8"># Poll latency stats on the RX side</span>
+curl 'http://&lt;server&gt;:5050/api/latency/stats?iface=enp181s0f1np1'
+
+<span style="color:#94a3b8"># Kick off an RFC 2544 throughput test</span>
+curl -X POST http://&lt;server&gt;:5050/api/rfc2544/start \
+  -H "Content-Type: application/json" \
+  -d '{"tx_iface":"enp181s0f0np0", "rx_iface":"enp181s0f1np1",
+       "frame_sizes":[64,512,1518], "duration_per_step":10,
+       "mac_src":"aa:bb:cc:dd:ee:01","mac_dst":"aa:bb:cc:dd:ee:02",
+       "ip_src":"10.0.0.1","ip_dst":"10.0.0.2"}'</code></pre>
+
+  <p style="margin-top:18px;">
+    Full reference: <strong>Help → API Guide</strong> in the GUI, or see
+    <a href="https://github.com/DAY-Advisor/NetGenI/blob/main/API_GUIDE.md">API_GUIDE.md</a>
+    in the repo.
+  </p>
+</section>
+
+<!-- Bottom CTA -->
+<section class="cta-bottom">
+  <h2>Try it on your hardware.</h2>
+  <p>Open source, single repository, no license keys. Install in five minutes on any Ubuntu box with a DPDK-supported NIC.</p>
+  <div class="ctas">
+    <a class="btn btn-primary" href="https://github.com/DAY-Advisor/NetGenI">
+      View on GitHub →
+    </a>
+    <a class="btn btn-secondary" href="https://github.com/DAY-Advisor/NetGenI/blob/main/README.md">
+      Read the docs
+    </a>
+  </div>
+</section>
+
+<footer>
+  <p>
+    Netgen is open-source software. ·
+    <a href="https://github.com/DAY-Advisor/NetGenI">GitHub</a> ·
+    <a href="https://github.com/DAY-Advisor/NetGenI/blob/main/LICENSE">License</a> ·
+    <a href="https://github.com/DAY-Advisor/NetGenI/issues">Report an issue</a>
+  </p>
+</footer>
+
+</body>
+</html>

@@ -1,0 +1,8 @@
+# Disable Jekyll processing — we ship a single static index.html that
+# doesn't need any of Jekyll's transformations. Without this, GitHub
+# Pages will strip files starting with `_` and run Markdown through
+# Liquid, which is unnecessary for a single-file landing page.
+plugins: []
+markdown: kramdown
+theme: null
+include: [".nojekyll"]
