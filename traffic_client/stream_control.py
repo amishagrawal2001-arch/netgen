@@ -1005,31 +1005,56 @@ class TrafficGenClientStreamControl:
 
             tx_port_text = interface_item.text().strip()
             stream_name = stream_name_item.text().strip()
-            
-            # Normalize port text (remove "Port: " prefix if present)
-            normalized_port_text = tx_port_text
-            if ":" in normalized_port_text:
-                normalized_port_text = normalized_port_text.rsplit(":", 1)[-1].strip()
-            if "Port:" in normalized_port_text:
-                normalized_port_text = normalized_port_text.replace("Port:", "").strip()
 
-            # Find the matching port key in self.streams (e.g., "TG 0 - Port: ens5np0")
+            # Resolve the row to a port key in self.streams. The Streams table
+            # collapses multiple streams sharing one port into a "header row"
+            # with the iface name + a "↳" continuation row for each
+            # subsequent stream — see server_section.py setItem(row, 1, "↳").
+            # If the user picked a continuation row, interface_item.text() is
+            # literally "↳" which never matches any key. Three-tier resolution:
+            #
+            #   1. Preferred: stream_id stashed on the name cell's UserRole,
+            #      then walk self.streams to find which port owns it.
+            #   2. Fallback A: continuation row → read iface from tooltip
+            #      (server_section sets it to the bare iface name).
+            #   3. Fallback B: header row → use the visible text directly.
+            #
+            # All three feed the canonical find_port_key normalizer instead
+            # of reinventing the per-key matching loop.
+            from traffic_client.stream_logic import find_port_key
             tx_port = None
-            for key in self.streams.keys():
-                # Extract interface name from key
-                key_interface = key.split(" - ")[-1].replace("Port: ", "").strip()
-                if key_interface == normalized_port_text:
-                    tx_port = key
-                    break
-            
+            stream_id = stream_name_item.data(Qt.UserRole)
+            original = None
+            if stream_id:
+                for p, lst in self.streams.items():
+                    for s in lst:
+                        if s.get("stream_id") == stream_id:
+                            tx_port, original = p, s
+                            break
+                    if original:
+                        break
+
+            if not tx_port:
+                resolve_text = tx_port_text
+                if resolve_text == "↳":
+                    # Continuation row: tooltip has the real iface name.
+                    resolve_text = (interface_item.toolTip() or "").strip()
+                tx_port = find_port_key(self.streams, resolve_text)
+
             if not tx_port:
                 available_keys = list(self.streams.keys())
-                raise KeyError(f"TX Port '{tx_port_text}' (normalized: '{normalized_port_text}') not found in streams dictionary. Available keys: {available_keys}")
+                raise KeyError(
+                    f"TX Port '{tx_port_text}' could not be resolved to any "
+                    f"stream port. Available keys: {available_keys}"
+                )
 
-            original = next(
-                (s for s in self.streams[tx_port] if s.get("protocol_selection", {}).get("name") == stream_name),
-                None
-            )
+            if original is None:
+                original = next(
+                    (s for s in self.streams[tx_port]
+                     if s.get("protocol_selection", {}).get("name") == stream_name
+                     or s.get("name") == stream_name),
+                    None
+                )
             if not original:
                 raise KeyError(f"Stream '{stream_name}' not found under '{tx_port}'.")
 
@@ -1125,26 +1150,33 @@ class TrafficGenClientStreamControl:
 
                 interface_text = interface_item.text().strip()
                 stream_name = stream_name_item.text().strip()
-                
-                # Normalize interface name to match port key format in self.streams
-                # Table shows just "ens5np0", but streams keys are "TG 0 - Port: ens5np0" or "TG 0 - ens5np0"
-                normalized_port_text = interface_text
-                if ":" in normalized_port_text:
-                    normalized_port_text = normalized_port_text.rsplit(":", 1)[-1].strip()
-                if "Port:" in normalized_port_text:
-                    normalized_port_text = normalized_port_text.replace("Port:", "").strip()
-                
-                # Find the matching port key in self.streams
+
+                # Resolve the row to a port key. Continuation rows show "↳"
+                # and never match a key directly; prefer the stream_id
+                # stashed on the name cell, then fall back to the tooltip
+                # (which holds the real iface name on continuation rows),
+                # then the visible text. See edit_selected_stream() for the
+                # full rationale — same three-tier resolution.
+                from traffic_client.stream_logic import find_port_key
                 port_key = None
-                for key in self.streams.keys():
-                    # Extract interface name from key
-                    key_interface = key.split(" - ")[-1].replace("Port: ", "").strip()
-                    if key_interface == normalized_port_text:
-                        port_key = key
-                        break
-                
+                stream_id = stream_name_item.data(Qt.UserRole)
+                if stream_id:
+                    for p, lst in self.streams.items():
+                        if any(s.get("stream_id") == stream_id for s in lst):
+                            port_key = p
+                            break
                 if not port_key:
-                    QMessageBox.warning(self, "Error", f"Interface '{interface_text}' not found in streams. Available: {list(self.streams.keys())[:3]}...")
+                    resolve_text = interface_text
+                    if resolve_text == "↳":
+                        resolve_text = (interface_item.toolTip() or "").strip()
+                    port_key = find_port_key(self.streams, resolve_text)
+
+                if not port_key:
+                    QMessageBox.warning(
+                        self, "Error",
+                        f"Interface '{interface_text}' not found in streams. "
+                        f"Available: {list(self.streams.keys())[:3]}..."
+                    )
                     continue
 
                 logger.info(f"Removing stream '{stream_name}' from port '{port_key}'")
