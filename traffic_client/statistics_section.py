@@ -533,9 +533,42 @@ class TrafficGenClientStatisticsSection():
         button_layout.addStretch(1)
 
         self.clear_stats_button_traffic = QPushButton("Clear Stats")
-        self.clear_stats_button_traffic.setFixedSize(110, 22)
+        self.clear_stats_button_traffic.setFixedSize(110, 24)
+        self.clear_stats_button_traffic.setCursor(Qt.PointingHandCursor)
+        self.clear_stats_button_traffic.setToolTip(
+            "Tare counters/byte totals to zero (baseline subtract). "
+            "Per-second rates are instantaneous — no baseline needed."
+        )
+        # Match the action-bar's neutral-white + thin-gray-border style
+        # (BTN_BASE in stream_control.py) so the Clear Stats button reads
+        # as the same family of control. Slightly tinted hover to give a
+        # subtle "destructive" cue without shouting — clearing is
+        # unrecoverable, but it's only a visual reset (the underlying
+        # cumulative counters survive).
         self.clear_stats_button_traffic.setStyleSheet(
-            "QPushButton { padding: 0 6px; font-size: 11px; }"
+            "QPushButton {"
+            "  border: 1px solid #cbd5e1;"
+            "  border-radius: 5px;"
+            "  background-color: #ffffff;"
+            "  color: #374151;"
+            "  font-size: 11px;"
+            "  font-weight: 500;"
+            "  padding: 0 8px;"
+            "}"
+            "QPushButton:hover {"
+            "  background-color: #fef2f2;"   # subtle red tint
+            "  border-color: #f87171;"
+            "  color: #b91c1c;"
+            "}"
+            "QPushButton:pressed {"
+            "  background-color: #fee2e2;"
+            "  border-color: #ef4444;"
+            "}"
+            "QPushButton:disabled {"
+            "  background-color: #f9fafb;"
+            "  border-color: #e5e7eb;"
+            "  color: #9ca3af;"
+            "}"
         )
         self.clear_stats_button_traffic.clicked.connect(self.clear_cached_statistics)
         button_layout.addWidget(self.clear_stats_button_traffic)
