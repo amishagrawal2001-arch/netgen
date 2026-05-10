@@ -509,17 +509,26 @@ class TrafficGenClientStatisticsSection():
             }
         """)
         
-        layout.addWidget(self.statistics_tab_widget)
-        
-        # Clear Stats Button
+        layout.addWidget(self.statistics_tab_widget, 1)  # stretch=1: tabs take all spare vertical room
+
+        # Clear Stats button row — kept compact so it doesn't eat
+        # vertical space inside the dock. Tight contentsMargins, a
+        # fixed-height button, and zero spacing keep this row at
+        # ~26px tall instead of the ~50px default Qt would give a
+        # QHBoxLayout with a button.
         button_layout = QHBoxLayout()
+        button_layout.setContentsMargins(0, 2, 0, 2)
+        button_layout.setSpacing(0)
         button_layout.addStretch(1)
 
         self.clear_stats_button_traffic = QPushButton("Clear Stats")
-        self.clear_stats_button_traffic.setFixedWidth(120)
+        self.clear_stats_button_traffic.setFixedSize(110, 22)
+        self.clear_stats_button_traffic.setStyleSheet(
+            "QPushButton { padding: 0 6px; font-size: 11px; }"
+        )
         self.clear_stats_button_traffic.clicked.connect(self.clear_cached_statistics)
         button_layout.addWidget(self.clear_stats_button_traffic)
-        layout.addLayout(button_layout)
+        layout.addLayout(button_layout, 0)  # stretch=0: never grows
 
         self.statistics_group.setLayout(layout)
         # NOTE: parent layout placement happens in main.py (currently a QDockWidget;
