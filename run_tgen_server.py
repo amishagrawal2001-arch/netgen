@@ -2647,8 +2647,15 @@ def configure_isis():
                         container_name = frr_manager._get_container_name(device_id, device_name)
                         container = frr_manager.client.containers.get(container_name)
                         
-                        # Get interface from config
-                        isis_interface = isis_config.get("interface", existing_device.get("interface", "eth0"))
+                        # Get interface from config. Never fall back to
+                        # "eth0" — in --net=host containers that points
+                        # at the host's loopback alias, not the device's
+                        # iface, so any "no ip router isis CORE" issued
+                        # against it would silently miss the real
+                        # configured interface. If we can't determine
+                        # the iface we'll skip the per-iface cleanup
+                        # below (router-level cleanup is enough).
+                        isis_interface = isis_config.get("interface") or existing_device.get("interface") or ""
                         # If VLAN is configured, use VLAN interface
                         vlan = data.get("vlan", existing_device.get("vlan", "0"))
                         if vlan and vlan != "0":
@@ -2692,8 +2699,15 @@ def configure_isis():
                         container_name = frr_manager._get_container_name(device_id, device_name)
                         container = frr_manager.client.containers.get(container_name)
                         
-                        # Get interface from config
-                        isis_interface = isis_config.get("interface", existing_device.get("interface", "eth0"))
+                        # Get interface from config. Never fall back to
+                        # "eth0" — in --net=host containers that points
+                        # at the host's loopback alias, not the device's
+                        # iface, so any "no ip router isis CORE" issued
+                        # against it would silently miss the real
+                        # configured interface. If we can't determine
+                        # the iface we'll skip the per-iface cleanup
+                        # below (router-level cleanup is enough).
+                        isis_interface = isis_config.get("interface") or existing_device.get("interface") or ""
                         # If VLAN is configured, use VLAN interface
                         vlan = data.get("vlan", existing_device.get("vlan", "0"))
                         if vlan and vlan != "0":
@@ -8779,26 +8793,34 @@ def start_bgp():
                 # Reapply complete BGP configuration using the FRR manager
                 from utils.frr_docker import FRRDockerManager
                 frr_manager = FRRDockerManager()
-                
-                # Get device IPs from the container
-                ipv4_result = container.exec_run(["ip", "addr", "show", "eth0"])
-                ipv6_result = container.exec_run(["ip", "-6", "addr", "show", "eth0"])
-                
+
+                # Get device IPs. Previously this exec'd `ip addr show
+                # eth0` inside the container — but the container runs
+                # `--net=host` so eth0 is the host's loopback alias,
+                # NOT the device's iface. The IPs we want are the
+                # ones already stored in the device DB.
+                #
+                # Also: the old IPv6 regex hardcoded `2001:db8::\d+/\d+`,
+                # which only matched the default doc subnet and missed
+                # anything user-configured (e.g. `2001:db8:1::2/64`).
+                # Reading from the DB sidesteps the regex entirely.
                 ipv4 = ""
                 ipv6 = ""
-                
-                if ipv4_result.exit_code == 0:
-                    ipv4_output = ipv4_result.output.decode('utf-8')
-                    import re
-                    ipv4_match = re.search(r'inet (\d+\.\d+\.\d+\.\d+/\d+)', ipv4_output)
-                    if ipv4_match:
-                        ipv4 = ipv4_match.group(1)
-                
-                if ipv6_result.exit_code == 0:
-                    ipv6_output = ipv6_result.output.decode('utf-8')
-                    ipv6_match = re.search(r'inet6 (2001:db8::\d+/\d+)', ipv6_output)
-                    if ipv6_match:
-                        ipv6 = ipv6_match.group(1)
+                try:
+                    _dev = device_db.get_device(device_id) if device_id else None
+                    if _dev:
+                        _v4 = (_dev.get("ipv4_address") or "").strip()
+                        _v4m = str(_dev.get("ipv4_mask") or "24").strip()
+                        _v6 = (_dev.get("ipv6_address") or "").strip()
+                        _v6m = str(_dev.get("ipv6_mask") or "64").strip()
+                        if _v4:
+                            ipv4 = _v4 if "/" in _v4 else f"{_v4}/{_v4m}"
+                        if _v6:
+                            ipv6 = _v6 if "/" in _v6 else f"{_v6}/{_v6m}"
+                except Exception as _ip_exc:
+                    logging.warning(
+                        f"[BGP START] Could not read device IPs from DB: {_ip_exc}"
+                    )
                 
                 # Reapply BGP configuration
                 from utils.bgp import configure_bgp_for_device
