@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<meta name="description" content="Netgen — a DPDK-based traffic generator for line-rate testing. Multi-queue tx_worker, RFC 2544 throughput test, one-way latency, live charts." />
+<meta name="description" content="Netgen — a DPDK-based traffic generator for line-rate testing, plus a FRR-backed control plane: BGP / OSPF / IS-IS peering from multiple emulated routers on a single NIC. RFC 2544 throughput, one-way latency, live charts." />
 <title>Netgen — DPDK Traffic Generator</title>
 
 <style>
@@ -515,6 +515,24 @@
          Streaming uploader handles 100+ MB captures without freezing
          the UI. Loop, rate-shape, or single-pass.</p>
     </div>
+    <div class="feature">
+      <div class="ico">🕸️</div>
+      <h3>Multi-device emulation</h3>
+      <p>Spin up N independent routers on a single NIC. Each device
+         gets its own VLAN subinterface plus a per-device Linux VRF,
+         so BGP / OSPF / IS-IS sessions don't collide on TCP/179,
+         OSPF raw sockets, or IS-IS PF_PACKET binds. Increment IPs,
+         MACs, VLANs, and loopbacks across the batch in one click.</p>
+    </div>
+    <div class="feature">
+      <div class="ico">🛣️</div>
+      <h3>Control-plane protocols</h3>
+      <p>FRR 8.5 in per-device containers. BGP (IPv4 + IPv6),
+         OSPFv2 / OSPFv3, IS-IS, and DHCPv4 / DHCPv6 — configured
+         from the GUI, driven by the same REST API. Route-pool
+         attachments let you advertise thousands of prefixes per
+         neighbor without touching vtysh.</p>
+    </div>
   </div>
 </section>
 
@@ -560,6 +578,13 @@
       <p>Push DUTs to line rate for hours with random modifiers
          active. Watch for SerDes errors, memory leaks in driver code,
          thermal throttling under sustained load.</p>
+    </div>
+    <div class="uc">
+      <h4>Control-plane scale testing</h4>
+      <p>Emulate dozens of BGP / OSPF / IS-IS peers off a single
+         server NIC — each on its own VLAN, each in its own Linux
+         VRF so route-table state stays isolated per session. Throw
+         them at a route-reflector or a TOR and watch convergence.</p>
     </div>
   </div>
 </section>
@@ -958,6 +983,19 @@ curl -X POST http://&lt;server&gt;:5050/api/rfc2544/start \
          TCP / HTTP scenarios are on the roadmap but not yet built.
          For now, use the scapy fallback (slower) for stateful or stick
          with stateless UDP/IP/Ethernet for line-rate work.</p>
+    </details>
+    <details>
+      <summary>Can I emulate multiple routers on a single NIC?</summary>
+      <p>Yes. Each "device" you add becomes a VLAN subinterface on
+         the chosen NIC, moved into its own Linux VRF
+         (<code>vrf-&lt;short-id&gt;</code>). The FRR container scoped
+         to that VRF runs BGP / OSPF / IS-IS independently — TCP/179,
+         OSPF raw sockets, and IS-IS PF_PACKET binds don't collide
+         across devices, even on the same physical port. The Add
+         Device dialog increments IP / MAC / VLAN / loopback across
+         a batch so adding 8 routers is one click instead of eight.
+         Constraint: each device on the same NIC must use a unique
+         VLAN tag — same iface + same VLAN is rejected with HTTP 409.</p>
     </details>
     <details>
       <summary>How do I run it from a CI pipeline?</summary>
