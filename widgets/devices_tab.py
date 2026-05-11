@@ -6658,13 +6658,33 @@ class DevicesTab(QWidget):
         if vxlan_item:
             vxlan_item.setText(device_info.get("VXLAN", ""))
         
-        # Refresh protocol tables if needed
-        if hasattr(self, 'bgp_handler') and self.bgp_handler:
-            self.bgp_handler.refresh_bgp_table()
-        if hasattr(self, 'ospf_handler') and self.ospf_handler:
-            self.ospf_handler.refresh_ospf_table()
-        if hasattr(self, 'isis_handler') and self.isis_handler:
-            self.isis_handler.refresh_isis_table()
+        # Refresh protocol tables if needed. The handler methods are
+        # named refresh_bgp_status / refresh_ospf_status /
+        # refresh_isis_status — the old refresh_*_table names never
+        # existed and the calls crashed with AttributeError the
+        # moment Edit Device's Save handler reached this block.
+        # Each call is also wrapped in a try/except so a regression
+        # in one handler doesn't tear down the whole save flow.
+        for handler_attr, method_name in (
+            ("bgp_handler",  "refresh_bgp_status"),
+            ("ospf_handler", "refresh_ospf_status"),
+            ("isis_handler", "refresh_isis_status"),
+        ):
+            handler = getattr(self, handler_attr, None)
+            if handler is None:
+                continue
+            fn = getattr(handler, method_name, None)
+            if fn is None:
+                logger.debug(
+                    f"[EDIT] {handler_attr}.{method_name} not present; skipping"
+                )
+                continue
+            try:
+                fn()
+            except Exception as _refresh_exc:
+                logger.warning(
+                    f"[EDIT] {handler_attr}.{method_name} raised: {_refresh_exc}"
+                )
 
         QMessageBox.information(self, "Device Updated", 
                                f"Device '{new_name or device_name}' updated locally.\n\n"
