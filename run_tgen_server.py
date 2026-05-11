@@ -35,6 +35,57 @@ from utils import vxlan as vxlan_utils
 app = Flask(__name__)
 
 
+def _bgp_router_clause(asn, device_id=None):
+    """Return the right `router bgp <asn>` line for vtysh based on
+    whether the device is wired into a per-device Linux VRF.
+
+    With the multi-device wiring (utils/frr_docker._create_vrf) each
+    device's BGP instance lives in its own VRF; the netgen-frr
+    container image also creates a phantom default-VRF `router bgp`
+    with no neighbors. Server endpoints that emit `router bgp <asn>`
+    without a VRF qualifier end up editing the wrong (empty) instance
+    — shutdown/no-shutdown noop and the user thinks the button is
+    broken.
+
+    Returns "router bgp <asn> vrf <vrf-name>" when the device has a
+    live VRF iface on the host, else "router bgp <asn>" (default VRF,
+    matches single-device legacy behaviour).
+    """
+    try:
+        if device_id:
+            from utils.frr_docker import FRRDockerManager
+            vrf_name = FRRDockerManager().vrf_name_for_device(device_id)
+            if vrf_name:
+                check = subprocess.run(
+                    ["ip", "-o", "link", "show", vrf_name],
+                    capture_output=True, text=True, timeout=2,
+                )
+                if check.returncode == 0 and (check.stdout or "").strip():
+                    return f"router bgp {asn} vrf {vrf_name}"
+    except Exception as exc:
+        logging.debug(f"[BGP] router-clause VRF lookup failed for {device_id}: {exc}")
+    return f"router bgp {asn}"
+
+
+def _bgp_clear_prefix(device_id=None):
+    """Return the `clear ip bgp` prefix scoped to the device's VRF when
+    one exists, else the default-VRF form."""
+    try:
+        if device_id:
+            from utils.frr_docker import FRRDockerManager
+            vrf_name = FRRDockerManager().vrf_name_for_device(device_id)
+            if vrf_name:
+                check = subprocess.run(
+                    ["ip", "-o", "link", "show", vrf_name],
+                    capture_output=True, text=True, timeout=2,
+                )
+                if check.returncode == 0 and (check.stdout or "").strip():
+                    return f"clear ip bgp vrf {vrf_name}"
+    except Exception:
+        pass
+    return "clear ip bgp"
+
+
 # =============================================================================
 # Optional bearer-token auth (audit MED #8)
 # =============================================================================
@@ -6692,7 +6743,7 @@ def configure_bgp_route_advertisement(device_id, device_name, bgp_asn, neighbor_
         
         # Apply route-maps to BGP neighbor and add network statements
         bgp_commands = [
-            f"router bgp {bgp_asn}",
+            _bgp_router_clause(bgp_asn, device_id),
         ]
         
         # Separate IPv4 and IPv6 pools
@@ -7128,7 +7179,7 @@ def cleanup_bgp_route_advertisement(device_id, device_name, bgp_asn, neighbor_ip
             cleanup_commands.append("no route-map RM-EXPORT-IPV6 permit 10")
         
         # Remove BGP redistribution and route-map configurations based on AF
-        cleanup_commands.append(f"router bgp {bgp_asn}")
+        cleanup_commands.append(_bgp_router_clause(bgp_asn, device_id))
         
         if not is_ipv6_only:
             cleanup_commands.extend([
@@ -7664,7 +7715,7 @@ def configure_bgp():
                             # Build commands to remove all IPv4 neighbors
                             remove_commands = [
                                 "configure terminal",
-                                f"router bgp {bgp_asn}",
+                                _bgp_router_clause(bgp_asn, device_id),
                                 "address-family ipv4 unicast",
                             ]
                             
@@ -7731,7 +7782,7 @@ def configure_bgp():
                             # Build commands to remove all IPv6 neighbors
                             remove_commands = [
                                 "configure terminal",
-                                f"router bgp {bgp_asn}",
+                                _bgp_router_clause(bgp_asn, device_id),
                                 "address-family ipv6 unicast",
                             ]
                             
@@ -7810,7 +7861,7 @@ def configure_bgp():
                             # Build commands to remove these neighbors
                             remove_commands = [
                                 "configure terminal",
-                                f"router bgp {bgp_asn}",
+                                _bgp_router_clause(bgp_asn, device_id),
                                 "address-family ipv4 unicast",
                             ]
                             
@@ -7873,7 +7924,7 @@ def configure_bgp():
                             # Build commands to remove these neighbors
                             remove_commands = [
                                 "configure terminal",
-                                f"router bgp {bgp_asn}",
+                                _bgp_router_clause(bgp_asn, device_id),
                                 "address-family ipv6 unicast",
                             ]
                             
@@ -8520,13 +8571,17 @@ def stop_bgp():
                 "message": "All BGP neighbors are already stopped"
             }), 200
 
-        # Execute shutdown commands using here document approach (fixed syntax)
+        # Execute shutdown commands using here document approach (fixed syntax).
+        # `router bgp <asn>` is scoped to the device's VRF — see
+        # _bgp_router_clause. Without this, shutdown commands were
+        # applied to the empty default-VRF instance and the actual
+        # session in `router bgp <asn> vrf vrf-<id>` stayed up.
         logging.info(f"[BGP STOP] Executing BGP shutdown commands")
         commands = [
             "configure terminal",
-            f"router bgp {bgp_asn}",
+            _bgp_router_clause(bgp_asn, device_id),
         ]
-        
+
         # Only add shutdown commands for neighbors that need to be stopped
         for neighbor_type, neighbor_ip in neighbors_to_stop:
             commands.append(f"neighbor {neighbor_ip} shutdown")
@@ -8552,13 +8607,13 @@ def stop_bgp():
         stopped_neighbor_ips = [neighbor_ip for _, neighbor_ip in neighbors_to_stop]
         logging.info(f"[BGP STOP] Successfully shut down BGP neighbors {stopped_neighbor_ips} for {device_name}")
         
-        # Clear BGP sessions to ensure shutdown takes effect
+        # Clear BGP sessions to ensure shutdown takes effect. `clear ip
+        # bgp` also needs the VRF qualifier when the session lives in
+        # a per-device VRF — otherwise vtysh clears the wrong instance
+        # and the session sticks until the next 30s keepalive expires.
+        clear_prefix = _bgp_clear_prefix(device_id)
         for neighbor_type, neighbor_ip in neighbors_to_stop:
-            if ":" in neighbor_ip:  # IPv6
-                clear_result = container.exec_run(["vtysh", "-c", f"clear ip bgp {neighbor_ip}"])
-            else:  # IPv4
-                clear_result = container.exec_run(["vtysh", "-c", f"clear ip bgp {neighbor_ip}"])
-                
+            clear_result = container.exec_run(["vtysh", "-c", f"{clear_prefix} {neighbor_ip}"])
             if clear_result.exit_code == 0:
                 logging.info(f"[BGP STOP] Cleared BGP session with {neighbor_type} neighbor {neighbor_ip}")
             else:
@@ -8769,12 +8824,15 @@ def start_bgp():
             else:
                 logging.info(f"[BGP START] BGP configuration is complete, proceeding with standard start")
 
-        # Build vtysh commands to remove shutdown from BGP neighbors that need to be started
+        # Build vtysh commands to remove shutdown from BGP neighbors that need to be started.
+        # Scope the `router bgp` block to the device's VRF so we edit
+        # the instance that's actually peering (the default-VRF block
+        # is a phantom from the image init — see _bgp_router_clause).
         commands = [
             "configure terminal",
-            f"router bgp {bgp_asn}",
+            _bgp_router_clause(bgp_asn, device_id),
         ]
-        
+
         # Only add no shutdown commands for neighbors that need to be started
         for neighbor_type, neighbor_ip in neighbors_to_start:
             commands.append(f"no neighbor {neighbor_ip} shutdown")
