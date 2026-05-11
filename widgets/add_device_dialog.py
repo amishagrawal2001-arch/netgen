@@ -1059,15 +1059,58 @@ class AddDeviceDialog(QDialog):
             self._suppress_protocol_change = False
 
     def _toggle_ip_fields(self):
-        """Enable/disable IP fields based on checkbox state."""
-        self.ipv4_input.setEnabled(self.ipv4_checkbox.isChecked())
-        self.ipv4_mask_input.setEnabled(self.ipv4_checkbox.isChecked())
-        self.ipv4_gateway_input.setEnabled(self.ipv4_checkbox.isChecked())
-        self.ipv6_input.setEnabled(self.ipv6_checkbox.isChecked())
-        self.ipv6_mask_input.setEnabled(self.ipv6_checkbox.isChecked())
-        self.ipv6_gateway_input.setEnabled(self.ipv6_checkbox.isChecked())
-        self.loopback_ipv4_input.setEnabled(self.ipv4_checkbox.isChecked())
-        self.loopback_ipv6_input.setEnabled(self.ipv6_checkbox.isChecked())
+        """Enable/disable IP fields based on checkbox state.
+
+        Also re-populates any cleared field with its canonical default
+        when the user enables the corresponding address family. The
+        DHCP-server-mode path clears IPv4/IPv6 fields explicitly
+        (line ~1322 below); without this restore, toggling back out
+        of DHCP and re-ticking the address-family checkbox left the
+        user staring at empty inputs — they'd have to remember the
+        defaults and re-type them, which was the user-reported gap
+        ("when ipv6 is enabled on device enable preconfigured ipv6
+        address and gateway, similar to ipv4 address").
+        """
+        ipv4_on = self.ipv4_checkbox.isChecked()
+        ipv6_on = self.ipv6_checkbox.isChecked()
+
+        # Enable/disable inputs
+        self.ipv4_input.setEnabled(ipv4_on)
+        self.ipv4_mask_input.setEnabled(ipv4_on)
+        self.ipv4_gateway_input.setEnabled(ipv4_on)
+        self.ipv6_input.setEnabled(ipv6_on)
+        self.ipv6_mask_input.setEnabled(ipv6_on)
+        self.ipv6_gateway_input.setEnabled(ipv6_on)
+        self.loopback_ipv4_input.setEnabled(ipv4_on)
+        self.loopback_ipv6_input.setEnabled(ipv6_on)
+
+        # Re-populate canonical defaults if the user just enabled an
+        # address family with empty fields. The defaults match the
+        # initial QLineEdit constructor values so an unticked-then-
+        # reticked checkbox returns to the same state a fresh dialog
+        # would show.
+        IPV4_DEFAULTS = {
+            self.ipv4_input:         "192.168.0.2",
+            self.ipv4_mask_input:    "24",
+            self.ipv4_gateway_input: "192.168.0.1",
+            self.loopback_ipv4_input: "192.255.0.1",
+        }
+        IPV6_DEFAULTS = {
+            self.ipv6_input:         "2001:db8::2",
+            self.ipv6_mask_input:    "64",
+            self.ipv6_gateway_input: "2001:db8::1",
+            self.loopback_ipv6_input: "2001:ff00::1",
+        }
+
+        def _restore_if_empty(family_on, defaults):
+            if not family_on:
+                return
+            for widget, default_value in defaults.items():
+                if not widget.text().strip():
+                    widget.setText(default_value)
+
+        _restore_if_empty(ipv4_on, IPV4_DEFAULTS)
+        _restore_if_empty(ipv6_on, IPV6_DEFAULTS)
         # OSPF IPv4/IPv6 toggles are now in Select Protocol section, no need to sync here
         # No manual underlay selection; it matches the main interface automatically.
 
