@@ -135,15 +135,37 @@ class OSPFHandler:
         layout.addLayout(ospf_controls)
     
     def refresh_ospf_status(self):
-        """Refresh/Update OSPF table display (read-only, does NOT apply to server)."""
+        """Refresh OSPF neighbor status.
+
+        First kicks a server-side force-check so the DB reflects live
+        ospfd state (Full / 2-Way / ExStart / Down etc.), then re-renders
+        the table. Previously this skipped the probe and just re-read
+        the cache, so the button rarely seemed to do anything between
+        the periodic 30s monitor ticks.
+        """
         try:
+            import requests
             logger.info("[OSPF REFRESH] Refreshing OSPF table display from database...")
+
+            # Step 1 — server-side force-check so the DB picks up live
+            # OSPF neighbor state. Non-fatal on failure.
+            try:
+                server_url = self.parent.get_server_url(silent=True)
+                if server_url:
+                    fc = requests.post(f"{server_url}/api/ospf/monitor/force-check", timeout=15)
+                    if fc.status_code == 200:
+                        logger.info("[OSPF REFRESH] force-check OK")
+                    else:
+                        logger.warning(f"[OSPF REFRESH] force-check returned HTTP {fc.status_code}")
+            except Exception as exc:
+                logger.warning(f"[OSPF REFRESH] force-check failed (will show cached state): {exc}")
+
             # Temporarily disconnect cellChanged signal to prevent issues during refresh
             try:
                 self.parent.ospf_table.cellChanged.disconnect()
             except Exception:
                 pass  # Signal might not be connected
-            
+
             # Update the OSPF table which fetches status from database
             # This is READ-ONLY - it only updates the display, does NOT apply to server
             self.update_ospf_table()

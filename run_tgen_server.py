@@ -5913,25 +5913,48 @@ def check_arp_resolution_batch():
 
 @app.route("/api/device/ping", methods=["POST"])
 def ping_device():
-    """Ping a given IP address (IPv4 or IPv6) from the server."""
+    """Ping a given IP address (IPv4 or IPv6) from the server.
+
+    If `device_id` is supplied AND that device has been provisioned
+    into a per-device Linux VRF (multi-device wiring), the ping runs
+    inside that VRF. The target IP only exists in the VRF's routing
+    table for multi-device deployments, so a default-netns ping would
+    fail with "Network is unreachable" even though the iface is up.
+    """
     data = request.get_json()
     ip_address = data.get("ip_address")
-    
+    device_id = data.get("device_id")  # optional — legacy clients omit it
+
     if not ip_address:
         return jsonify({"error": "IP address is required"}), 400
-    
+
     try:
         # Detect if it's IPv6 (contains colons) or IPv4
         is_ipv6 = ":" in ip_address
-        
-        if is_ipv6:
-            # Use ping6 for IPv6 addresses
-            result = subprocess.run(["ping6", "-c", "3", ip_address], 
-                                  capture_output=True, text=True, timeout=15)
-        else:
-            # Use ping for IPv4 addresses
-            result = subprocess.run(["ping", "-c", "3", ip_address], 
-                                  capture_output=True, text=True, timeout=15)
+
+        # Resolve a VRF prefix if the caller supplied a device_id and
+        # that device has a live VRF iface on the host. Mirrors the
+        # same pattern as get_device_arp_status; falls back to default
+        # netns when no device_id (or no VRF) so single-device legacy
+        # deployments keep working unchanged.
+        ping_prefix: list = []
+        if device_id:
+            try:
+                from utils.frr_docker import FRRDockerManager
+                _vrf_name = FRRDockerManager().vrf_name_for_device(device_id)
+                if _vrf_name:
+                    _check = subprocess.run(
+                        ["ip", "-o", "link", "show", _vrf_name],
+                        capture_output=True, text=True, timeout=2,
+                    )
+                    if _check.returncode == 0 and (_check.stdout or "").strip():
+                        ping_prefix = ["ip", "vrf", "exec", _vrf_name]
+            except Exception as _vrf_exc:
+                logging.debug(f"[PING] VRF lookup failed for {device_id}: {_vrf_exc}")
+
+        ping_cmd = ["ping6" if is_ipv6 else "ping", "-c", "3", ip_address]
+        result = subprocess.run(ping_prefix + ping_cmd,
+                              capture_output=True, text=True, timeout=15)
         
         if result.returncode == 0:
             return jsonify({
@@ -10984,6 +11007,22 @@ def force_ospf_check():
         return jsonify({"status": "success", "message": "OSPF status check initiated"}), 200
     except Exception as e:
         logging.error(f"[OSPF MONITOR] Failed to force OSPF check: {e}")
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/isis/monitor/force-check", methods=["POST"])
+def force_isis_check():
+    """Force an immediate IS-IS status check for all devices.
+
+    Mirror of the BGP/OSPF force-check endpoints. Lets the client's
+    Refresh ISIS button actually probe fresh state instead of just
+    re-reading whatever the periodic monitor last wrote.
+    """
+    try:
+        isis_monitor.force_check()
+        return jsonify({"status": "success", "message": "IS-IS status check initiated"}), 200
+    except Exception as e:
+        logging.error(f"[ISIS MONITOR] Failed to force ISIS check: {e}")
         return jsonify({"error": str(e)}), 500
 
 

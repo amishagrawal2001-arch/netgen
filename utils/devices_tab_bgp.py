@@ -133,13 +133,36 @@ class BGPHandler:
 
 
     def refresh_bgp_status(self):
-        """Refresh BGP neighbor status from database - only update status, don't replace table."""
+        """Refresh BGP neighbor status.
+
+        Kicks a server-side force-check so the DB picks up live BGP
+        state (Established / Active / Idle / pfx-counts) before the
+        UI re-reads. Previously this only re-rendered the table from
+        whatever the periodic 30s BGP monitor last wrote, so clicks
+        usually showed stale data — same UX bug we fixed for ARP.
+        """
         try:
+            import requests
             server_url = self.parent.get_server_url(silent=True)
             if not server_url:
                 return
-            
-            # OPTIMIZATION: Defer table update to next event loop iteration to avoid blocking UI on click
+
+            # Step 1 — fire the server-side force-check. Synchronous
+            # on the server (probes every BGP device in parallel via
+            # docker exec vtysh), normally returns in <1s. Failures
+            # are non-fatal: we still refresh the table from cache.
+            try:
+                fc = requests.post(f"{server_url}/api/bgp/monitor/force-check", timeout=15)
+                if fc.status_code == 200:
+                    logger.info("[BGP REFRESH] force-check OK")
+                else:
+                    logger.warning(f"[BGP REFRESH] force-check returned HTTP {fc.status_code}")
+            except Exception as exc:
+                logger.warning(f"[BGP REFRESH] force-check failed (will show cached state): {exc}")
+
+            # Step 2 — defer the table update so the UI doesn't block
+            # on click. By the time the QTimer fires the force-check
+            # has already updated the DB.
             from PyQt5.QtCore import QTimer
             QTimer.singleShot(0, lambda: self.parent.update_bgp_table())
             logger.info("[BGP REFRESH] BGP status refresh scheduled (non-blocking)")
