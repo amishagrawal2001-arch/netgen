@@ -11442,9 +11442,18 @@ def get_device_arp_status(device_id):
         # the earlier VRF-detection block fail with "cannot access
         # local variable 'subprocess' where it is not associated
         # with a value". Verified the hard way.
+        #
+        # Pinging the device's OWN local IP: do NOT VRF-wrap. With
+        # `ip vrf exec <vrf> ping 192.168.0.2`, the kernel's "local"
+        # route for that address points to global lo (which is in the
+        # default VRF, not vrf-<id>) and the ping loops back across
+        # VRFs and fails with 100% loss — even though the IP is
+        # perfectly configured on vlan10 inside the VRF. Self-pings
+        # are kernel-loopback ops and don't need the VRF context;
+        # we save it for external targets (gateway).
         if ipv4_address:
             try:
-                result = subprocess.run(ping_prefix + ["ping", "-c", "1", "-W", "1", ipv4_address],
+                result = subprocess.run(["ping", "-c", "1", "-W", "1", ipv4_address],
                                       capture_output=True, text=True, timeout=5)
                 arp_results["arp_ipv4_resolved"] = result.returncode == 0
                 arp_results["details"]["ipv4_ping"] = "success" if result.returncode == 0 else "failed"
@@ -11458,11 +11467,15 @@ def get_device_arp_status(device_id):
             except Exception as e:
                 arp_results["details"]["ipv4_ping"] = f"error: {e}"
 
-        # Check IPv6 NDP (subprocess already at module scope — see IPv4 note)
+        # Check IPv6 NDP. Same VRF/self-ping rule as IPv4: probe in
+        # the VRF when targeting the gateway (external), in default
+        # netns when targeting the device's own address.
         if ipv6_address or ipv6_gateway:
             try:
                 ipv6_target = ipv6_gateway or ipv6_address
-                ping6_cmd = ping_prefix + ["ping6", "-c", "1", "-W", "1", ipv6_target]
+                ipv6_targets_self = ipv6_gateway in ("", None) and bool(ipv6_address)
+                _ping6_prefix = [] if ipv6_targets_self else ping_prefix
+                ping6_cmd = _ping6_prefix + ["ping6", "-c", "1", "-W", "1", ipv6_target]
                 result = subprocess.run(ping6_cmd, capture_output=True, text=True, timeout=5)
                 arp_results["arp_ipv6_resolved"] = result.returncode == 0
                 arp_results["details"]["ipv6_ping_target"] = ipv6_target
