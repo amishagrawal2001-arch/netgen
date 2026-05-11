@@ -2954,7 +2954,46 @@ def apply_device():
         
         # Normalize interface name
         interface_normalized = normalize_iface(interface)
-        
+
+        # --- Multi-device-on-same-interface validation gate -------------
+        # Two devices can share a physical NIC only via different VLAN
+        # tags (each ends up on its own vlanN subinterface, which can
+        # then be moved into its own VRF for protocol isolation). Two
+        # devices on the exact same (interface, vlan) tuple would share
+        # the same L2/L3 segment and would collide on TCP/179, OSPF
+        # raw sockets, and ISIS PF_PACKET binds. Reject up-front so
+        # the user gets a clear error instead of a silent BGP-down.
+        try:
+            from utils.device_database import DeviceDatabase
+            _vlan_norm = str(vlan or "0").strip() or "0"
+            _existing = DeviceDatabase().get_devices_by_interface(
+                interface_normalized, include_vlans=True
+            )
+            for _peer in _existing:
+                if _peer.get("device_id") == device_id:
+                    continue  # same device being re-applied — fine
+                _peer_vlan = str(_peer.get("vlan") or "0").strip() or "0"
+                _peer_iface = (_peer.get("interface") or "").strip()
+                # Match if peer is on the same base iface (bare or
+                # vlanN@base format) AND the same VLAN tag.
+                _peer_base = _peer_iface.split("@", 1)[-1] if "@" in _peer_iface else _peer_iface
+                if _peer_base == interface_normalized and _peer_vlan == _vlan_norm:
+                    _msg = (
+                        f"Interface '{interface_normalized}' with VLAN '{_vlan_norm}' "
+                        f"is already in use by device "
+                        f"'{_peer.get('device_name') or _peer.get('device_id')}'. "
+                        f"To run multiple devices on the same physical interface, "
+                        f"give each device a different VLAN tag."
+                    )
+                    logging.warning(f"[DEVICE APPLY] Rejected duplicate (iface, vlan): {_msg}")
+                    return jsonify({"error": _msg}), 409
+        except Exception as _gate_exc:
+            # Fail-open on validator errors — don't block a valid
+            # apply just because the DB lookup hiccuped. The collision
+            # would surface as a BGP-bind error downstream instead.
+            logging.warning(f"[DEVICE APPLY] (iface, vlan) gate skipped: {_gate_exc}")
+        # ----------------------------------------------------------------
+
         result = {
             "device_id": device_id,
             "device": device_name,
