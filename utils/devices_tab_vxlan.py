@@ -66,44 +66,80 @@ class VXLANHandler:
         # Section header removed — tab name + table columns are enough.
         layout.addWidget(self.parent.vxlan_table)
 
-        controls = QHBoxLayout()
-        
-        # Add VXLAN button
-        self.parent.add_vxlan_button = QPushButton()
-        self.parent.add_vxlan_button.setIcon(qicon("resources", "icons/add.png"))
-        self.parent.add_vxlan_button.setIconSize(QSize(16, 16))
-        self.parent.add_vxlan_button.setFixedSize(32, 28)
-        self.parent.add_vxlan_button.setToolTip("Add VXLAN Tunnel")
+        # VXLAN action bar — unified chrome with Devices + BGP + OSPF + ISIS.
+        from PyQt5.QtWidgets import QFrame, QLabel
+        action_bar = QFrame()
+        action_bar.setStyleSheet(
+            "QFrame { background-color: #f3f4f6; "
+            "border-top: 1px solid #e5e7eb; border-radius: 0; }"
+        )
+        controls = QHBoxLayout(action_bar)
+        controls.setAlignment(Qt.AlignLeft)
+        controls.setSpacing(6)
+        controls.setContentsMargins(6, 4, 6, 4)
+
+        BTN_BASE = (
+            "QPushButton {"
+            "  border: 1px solid #cbd5e1;"
+            "  border-radius: 5px;"
+            "  background-color: #ffffff;"
+            "  padding: 0px;"
+            "}"
+            "QPushButton:hover { background-color: #f1f5f9; border-color: #94a3b8; }"
+            "QPushButton:pressed { background-color: #e2e8f0; }"
+            "QPushButton:disabled { background-color: #f9fafb; border-color: #e5e7eb; }"
+        )
+        BTN_APPLY = (
+            "QPushButton {"
+            "  border: 1px solid #2563eb;"
+            "  border-radius: 5px;"
+            "  background-color: #ffffff;"
+            "  color: #1d4ed8;"
+            "  padding: 0px;"
+            "}"
+            "QPushButton:hover { background-color: #eff6ff; border-color: #1d4ed8; }"
+            "QPushButton:pressed { background-color: #dbeafe; }"
+        )
+        BTN_W, BTN_H, ICON_PX = 28, 24, 14
+
+        def _vxlan_btn(icon_path, tooltip, style=BTN_BASE):
+            b = QPushButton()
+            b.setIcon(qicon("resources", icon_path))
+            b.setIconSize(QSize(ICON_PX, ICON_PX))
+            b.setFixedSize(BTN_W, BTN_H)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setToolTip(tooltip)
+            b.setStyleSheet(style)
+            return b
+
+        # Config group (left)
+        self.parent.add_vxlan_button    = _vxlan_btn("icons/add.png",   "Add VXLAN Tunnel")
+        self.parent.delete_vxlan_button = _vxlan_btn("icons/Trash.png", "Delete Selected VXLAN Tunnel(s)")
+
+        # Runtime group (right)
+        self.parent.apply_vxlan_button  = _vxlan_btn("icons/apply.png",   "Apply VXLAN configurations to server", style=BTN_APPLY)
+        refresh_button                  = _vxlan_btn("icons/refresh.png", "Refresh VXLAN status")
+
         self.parent.add_vxlan_button.clicked.connect(self.parent.prompt_add_vxlan)
-        controls.addWidget(self.parent.add_vxlan_button)
-        
-        # Apply VXLAN button
-        self.parent.apply_vxlan_button = QPushButton()
-        self.parent.apply_vxlan_button.setIcon(qicon("resources", "icons/apply.png"))
-        self.parent.apply_vxlan_button.setIconSize(QSize(16, 16))
-        self.parent.apply_vxlan_button.setFixedSize(32, 28)
-        self.parent.apply_vxlan_button.setToolTip("Apply VXLAN configurations to server")
-        self.parent.apply_vxlan_button.clicked.connect(self.parent.apply_vxlan_configurations)
-        controls.addWidget(self.parent.apply_vxlan_button)
-        
-        # Delete VXLAN button
-        self.parent.delete_vxlan_button = QPushButton()
-        self.parent.delete_vxlan_button.setIcon(qicon("resources", "icons/Trash.png"))
-        self.parent.delete_vxlan_button.setIconSize(QSize(16, 16))
-        self.parent.delete_vxlan_button.setFixedSize(32, 28)
-        self.parent.delete_vxlan_button.setToolTip("Delete Selected VXLAN Tunnel(s)")
         self.parent.delete_vxlan_button.clicked.connect(self.delete_selected_vxlan_tunnels)
-        controls.addWidget(self.parent.delete_vxlan_button)
-        
-        refresh_button = QPushButton()
-        refresh_button.setIcon(qicon("resources", "icons/refresh.png"))
-        refresh_button.setIconSize(QSize(16, 16))
-        refresh_button.setFixedSize(32, 28)
-        refresh_button.setToolTip("Refresh VXLAN status")
+        self.parent.apply_vxlan_button.clicked.connect(self.parent.apply_vxlan_configurations)
         refresh_button.clicked.connect(self.refresh_vxlan_table)
-        controls.addWidget(refresh_button)
-        controls.addStretch()
-        layout.addLayout(controls)
+
+        for b in (self.parent.add_vxlan_button, self.parent.delete_vxlan_button):
+            controls.addWidget(b)
+
+        sep = QLabel()
+        sep.setFixedSize(1, BTN_H)
+        sep.setStyleSheet("background-color: #cbd5e1; margin: 0 6px;")
+        controls.addSpacing(4)
+        controls.addWidget(sep)
+        controls.addSpacing(4)
+
+        for b in (self.parent.apply_vxlan_button, refresh_button):
+            controls.addWidget(b)
+
+        controls.addStretch(1)
+        layout.addWidget(action_bar)
 
         # Kick off initial refresh shortly after tab creation
         QTimer.singleShot(200, self.refresh_vxlan_table)

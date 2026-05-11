@@ -697,50 +697,85 @@ class DHCPHandler:
         # Section header removed — tab name + table columns are enough.
         layout.addWidget(self.parent.dhcp_table)
 
-        # Controls
-        controls = QHBoxLayout()
+        # DHCP action bar — unified chrome with Devices + BGP + OSPF
+        # + ISIS + VXLAN.
+        from PyQt5.QtWidgets import QFrame, QLabel
+        action_bar = QFrame()
+        action_bar.setStyleSheet(
+            "QFrame { background-color: #f3f4f6; "
+            "border-top: 1px solid #e5e7eb; border-radius: 0; }"
+        )
+        controls = QHBoxLayout(action_bar)
         controls.setAlignment(Qt.AlignLeft)
+        controls.setSpacing(6)
+        controls.setContentsMargins(6, 4, 6, 4)
+
+        BTN_BASE = (
+            "QPushButton {"
+            "  border: 1px solid #cbd5e1;"
+            "  border-radius: 5px;"
+            "  background-color: #ffffff;"
+            "  padding: 0px;"
+            "}"
+            "QPushButton:hover { background-color: #f1f5f9; border-color: #94a3b8; }"
+            "QPushButton:pressed { background-color: #e2e8f0; }"
+            "QPushButton:disabled { background-color: #f9fafb; border-color: #e5e7eb; }"
+        )
+        BTN_APPLY = (
+            "QPushButton {"
+            "  border: 1px solid #2563eb;"
+            "  border-radius: 5px;"
+            "  background-color: #ffffff;"
+            "  color: #1d4ed8;"
+            "  padding: 0px;"
+            "}"
+            "QPushButton:hover { background-color: #eff6ff; border-color: #1d4ed8; }"
+            "QPushButton:pressed { background-color: #dbeafe; }"
+        )
+        BTN_W, BTN_H, ICON_PX = 28, 24, 14
 
         def load_icon(filename: str):
             from utils.qicon_loader import qicon
-
             return qicon("resources", f"icons/{filename}")
 
-        self.parent.dhcp_refresh_button = QPushButton()
-        self.parent.dhcp_refresh_button.setIcon(load_icon("refresh.png"))
-        self.parent.dhcp_refresh_button.setIconSize(QSize(16, 16))
-        self.parent.dhcp_refresh_button.setFixedSize(32, 28)
-        self.parent.dhcp_refresh_button.setToolTip("Refresh DHCP status")
+        def _dhcp_btn(icon_name, tooltip, style=BTN_BASE):
+            b = QPushButton()
+            b.setIcon(load_icon(icon_name))
+            b.setIconSize(QSize(ICON_PX, ICON_PX))
+            b.setFixedSize(BTN_W, BTN_H)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setToolTip(tooltip)
+            b.setStyleSheet(style)
+            return b
+
+        # Config group (left)
+        self.parent.dhcp_manage_button  = _dhcp_btn("edit.png",  "Manage DHCP Pools")
+        self.parent.dhcp_attach_button  = _dhcp_btn("readd.png", "Attach DHCP pools to the selected server")
+
+        # Runtime group (right)
+        self.parent.dhcp_apply_button   = _dhcp_btn("apply.png",   "Apply attached DHCP pools on the selected server", style=BTN_APPLY)
+        self.parent.dhcp_refresh_button = _dhcp_btn("refresh.png", "Refresh DHCP status")
+
+        self.parent.dhcp_manage_button.clicked.connect(self.manage_dhcp_pools)
+        self.parent.dhcp_attach_button.clicked.connect(self.attach_dhcp_pools)
+        self.parent.dhcp_apply_button.clicked.connect(self.apply_dhcp_pools)
         self.parent.dhcp_refresh_button.clicked.connect(self.refresh_dhcp_status)
 
-        controls.addWidget(self.parent.dhcp_refresh_button)
+        for b in (self.parent.dhcp_manage_button, self.parent.dhcp_attach_button):
+            controls.addWidget(b)
 
-        self.parent.dhcp_manage_button = QPushButton()
-        self.parent.dhcp_manage_button.setIcon(load_icon("edit.png"))
-        self.parent.dhcp_manage_button.setIconSize(QSize(16, 16))
-        self.parent.dhcp_manage_button.setFixedSize(32, 28)
-        self.parent.dhcp_manage_button.setToolTip("Manage DHCP Pools")
-        self.parent.dhcp_manage_button.clicked.connect(self.manage_dhcp_pools)
-        controls.addWidget(self.parent.dhcp_manage_button)
+        sep = QLabel()
+        sep.setFixedSize(1, BTN_H)
+        sep.setStyleSheet("background-color: #cbd5e1; margin: 0 6px;")
+        controls.addSpacing(4)
+        controls.addWidget(sep)
+        controls.addSpacing(4)
 
-        self.parent.dhcp_attach_button = QPushButton()
-        self.parent.dhcp_attach_button.setIcon(load_icon("readd.png"))
-        self.parent.dhcp_attach_button.setIconSize(QSize(16, 16))
-        self.parent.dhcp_attach_button.setFixedSize(32, 28)
-        self.parent.dhcp_attach_button.setToolTip("Attach DHCP pools to the selected server")
-        self.parent.dhcp_attach_button.clicked.connect(self.attach_dhcp_pools)
-        controls.addWidget(self.parent.dhcp_attach_button)
+        for b in (self.parent.dhcp_apply_button, self.parent.dhcp_refresh_button):
+            controls.addWidget(b)
 
-        self.parent.dhcp_apply_button = QPushButton()
-        self.parent.dhcp_apply_button.setIcon(load_icon("apply.png"))
-        self.parent.dhcp_apply_button.setIconSize(QSize(16, 16))
-        self.parent.dhcp_apply_button.setFixedSize(32, 28)
-        self.parent.dhcp_apply_button.setToolTip("Apply attached DHCP pools on the selected server")
-        self.parent.dhcp_apply_button.clicked.connect(self.apply_dhcp_pools)
-        controls.addWidget(self.parent.dhcp_apply_button)
-
-        controls.addStretch()
-        layout.addLayout(controls)
+        controls.addStretch(1)
+        layout.addWidget(action_bar)
 
         # Kick off an initial status refresh once the UI finishes rendering
         QTimer.singleShot(200, self.refresh_dhcp_status)
