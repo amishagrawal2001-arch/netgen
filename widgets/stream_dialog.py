@@ -588,6 +588,39 @@ copy-pasteable curl commands you can run from any host that can reach
       <td>Stop the latency sampler for an iface (or all if no iface).</td></tr>
   <tr><td class="method">GET</td> <td><code>/admin</code></td>
       <td>Single-page web UI for runtime configuration.</td></tr>
+  <tr><th colspan="3" style="background:#eff6ff; color:#1d4ed8;">Device lifecycle &amp; control plane</th></tr>
+  <tr><td class="method">POST</td><td><code>/api/device/apply</code></td>
+      <td>Create or reconfigure a device: VLAN subif, IP, protocols, VRF.</td></tr>
+  <tr><td class="method">POST</td><td><code>/api/device/start</code></td>
+      <td>Resume a stopped device (restarts its FRR container, preserves VRF).</td></tr>
+  <tr><td class="method">POST</td><td><code>/api/device/stop</code></td>
+      <td>Stop a device's FRR container (Exited state — container + VRF preserved).</td></tr>
+  <tr><td class="method">POST</td><td><code>/api/device/remove</code></td>
+      <td>Tear down: container removed, VRF deleted, DB row dropped.</td></tr>
+  <tr><td class="method">GET</td> <td><code>/api/device/arp/&lt;id&gt;</code></td>
+      <td>Live ARP/ND probe (in-VRF) — IPv4 / IPv6 / gateway reachability.</td></tr>
+  <tr><td class="method">POST</td><td><code>/api/arp/monitor/force-check</code></td>
+      <td>Re-probe every running device now and persist to DB.</td></tr>
+  <tr><td class="method">POST</td><td><code>/api/device/bgp/{start,stop,configure}</code></td>
+      <td>Per-device BGP lifecycle (issues VRF-scoped vtysh into the device's FRR container).</td></tr>
+  <tr><td class="method">GET</td> <td><code>/api/bgp/status/&lt;id&gt;</code></td>
+      <td>Established / Active / Idle, per-AF, scoped to the device's VRF.</td></tr>
+  <tr><td class="method">POST</td><td><code>/api/bgp/monitor/force-check</code></td>
+      <td>Re-probe every BGP device now; writes Established state to DB.</td></tr>
+  <tr><td class="method">POST</td><td><code>/api/device/ospf/{start,stop,configure}</code></td>
+      <td>Per-device OSPFv2 + OSPFv3 lifecycle.</td></tr>
+  <tr><td class="method">GET</td> <td><code>/api/ospf/status/&lt;id&gt;</code></td>
+      <td>Adjacency state, neighbor list (VRF-scoped).</td></tr>
+  <tr><td class="method">POST</td><td><code>/api/ospf/monitor/force-check</code></td>
+      <td>Refresh OSPF state for every running device.</td></tr>
+  <tr><td class="method">POST</td><td><code>/api/device/isis/{start,stop,configure}</code></td>
+      <td>Per-device IS-IS lifecycle.</td></tr>
+  <tr><td class="method">GET</td> <td><code>/api/isis/status/&lt;id&gt;</code></td>
+      <td>Adjacency state + system-id / NET (VRF-scoped).</td></tr>
+  <tr><td class="method">POST</td><td><code>/api/isis/monitor/force-check</code></td>
+      <td>Refresh IS-IS state for every running device.</td></tr>
+  <tr><td class="method">POST</td><td><code>/api/device/ping</code></td>
+      <td>Server-side ping (in-VRF if <code>device_id</code> is supplied).</td></tr>
 </table>
 
 <h2>2. Common stream JSON shape</h2>
@@ -1222,7 +1255,144 @@ curl -X POST http://&lt;server&gt;:5050/api/latency/stop \
           extremely rare; check journalctl for matching errors.</td></tr>
 </table>
 
-<h2>12. Authentication, CORS, rate limiting</h2>
+<h2>12. Device lifecycle</h2>
+
+<p>A <b>device</b> is an emulated router: a VLAN subif on a physical NIC,
+its own Linux VRF, plus an FRR container that owns the BGP / OSPF /
+IS-IS state. Each device is identified by a UUID.</p>
+
+<h3>Apply (create or reconfigure)</h3>
+<pre><code>curl -s -X POST http://&lt;server&gt;:5050/api/device/apply \
+  -H 'Content-Type: application/json' -d '{
+    "device_id":   "47dce96a-348a-43ec-9eed-8223c67378b1",
+    "device_name": "device1",
+    "interface":   "enp181s0f0np0",
+    "vlan":        "10",
+    "ipv4":        "192.168.0.2", "ipv4_mask": "24", "ipv4_gateway": "192.168.0.1",
+    "ipv6":        "2001:db8::2", "ipv6_mask": "64", "ipv6_gateway": "2001:db8::1",
+    "protocols":   ["BGP"],
+    "bgp_config":  { "bgp_asn": 65000, "bgp_remote_asn": 65000,
+                     "bgp_neighbor_ipv4": "192.168.0.1",
+                     "bgp_update_source_ipv4": "192.168.0.2",
+                     "ipv4_enabled": true }
+  }'
+</code></pre>
+
+<p><b>What apply does, in order:</b> create the VLAN subif if needed →
+flip <code>net.ipv6.conf.&lt;iface&gt;.disable_ipv6=0</code> →
+add the IPv4 / IPv6 address →
+provision <code>vrf-&lt;short-id&gt;</code> and move the iface into it →
+start the FRR container (<code>ostg-frr-&lt;device-id&gt;</code>, <code>--net=host</code>) →
+push vtysh config scoped to the device's VRF.</p>
+
+<div class="warn"><b>Same iface + same VLAN is rejected with HTTP 409.</b>
+Two devices on the same physical NIC must use different VLAN tags so
+they end up on distinct VLAN subifs and distinct VRFs. Use the increment
+options in the GUI's Add Device dialog to spread VLANs across a batch.</div>
+
+<h3>Stop / Start</h3>
+<p><code>POST /api/device/stop</code> sends SIGTERM to the FRR container —
+container goes <code>Exited</code>, VRF is <b>preserved</b>, DB status
+flips to <code>Stopped</code>. <code>POST /api/device/start</code> on a
+Stopped device runs <code>docker start</code> on the existing container
+(fast, ~2 s); on a never-applied device it falls through to the apply
+path.</p>
+
+<h3>Remove</h3>
+<p><code>POST /api/device/remove</code> tears down everything: container
+removed, VLAN subif optional (kept by default to avoid disturbing the
+parent NIC), VRF deleted, DB row dropped. The periodic cleanup timer
+will only remove containers whose device row is gone from the DB — your
+Stopped devices are safe.</p>
+
+<h2>13. Control-plane protocols (BGP, OSPF, IS-IS)</h2>
+
+<p>The FRR container inside each device runs <b>bgpd, ospfd, ospf6d,
+isisd, zebra</b>. Every protocol instance is scoped to that device's
+VRF — e.g. the config inside the container reads:</p>
+
+<pre><code>router bgp 65000 vrf vrf-47dce96a348
+ bgp router-id 192.168.0.2
+ neighbor 192.168.0.1 remote-as 65000
+ address-family ipv4 unicast
+  neighbor 192.168.0.1 next-hop-self
+ exit-address-family
+exit
+!
+interface vlan10
+ vrf vrf-47dce96a348
+ ip address 192.168.0.2/24
+ ipv6 address 2001:db8::2/64
+exit
+</code></pre>
+
+<p>So multiple devices on the same host don't collide on TCP/179, the
+OSPF raw-89 socket, or per-iface PF_PACKET binds — each lives in its
+own VRF table.</p>
+
+<h3>Configure / Start / Stop per protocol</h3>
+<pre><code># BGP — push config (idempotent; safe to re-call)
+curl -X POST http://&lt;server&gt;:5050/api/device/bgp/configure -d '{...}'
+
+# Start one neighbor only (selective)
+curl -X POST http://&lt;server&gt;:5050/api/device/bgp/start \
+  -d '{"device_id":"...", "bgp_config":{...},
+       "selected_neighbors":["192.168.0.1"]}'
+
+# Stop all neighbors
+curl -X POST http://&lt;server&gt;:5050/api/device/bgp/stop \
+  -d '{"device_id":"...", "bgp_config":{...}}'
+</code></pre>
+
+<p>Same shape for <code>ospf</code> and <code>isis</code> — substitute the
+protocol name in the URL.</p>
+
+<h3>Status (per-device)</h3>
+<pre><code>curl http://&lt;server&gt;:5050/api/bgp/status/&lt;device_id&gt;
+# → { "bgp_established": true, "bgp_ipv4_established": true,
+#     "bgp_ipv6_established": false, "bgp_state": "Established",
+#     "neighbors": [ {"neighbor_ip":"192.168.0.1","state":"Established",...} ] }
+</code></pre>
+
+<p>OSPF: <code>/api/ospf/status/&lt;id&gt;</code> · IS-IS:
+<code>/api/isis/status/&lt;id&gt;</code> — same response shape with
+protocol-specific fields.</p>
+
+<h3>Refresh (force-check)</h3>
+<p>Each protocol has a <code>force-check</code> endpoint that re-probes
+every running device synchronously and writes fresh state to the DB.
+GUI Refresh buttons hit these:</p>
+<pre><code>curl -X POST http://&lt;server&gt;:5050/api/arp/monitor/force-check
+curl -X POST http://&lt;server&gt;:5050/api/bgp/monitor/force-check
+curl -X POST http://&lt;server&gt;:5050/api/ospf/monitor/force-check
+curl -X POST http://&lt;server&gt;:5050/api/isis/monitor/force-check
+</code></pre>
+
+<p>Without a force-check, the periodic monitor refreshes the DB every
+30 s. Reads of <code>/api/device/database/devices/&lt;id&gt;</code>
+return whatever was last written.</p>
+
+<h2>14. ARP / ND status</h2>
+
+<p>Each device exposes a live ARP/ND probe at
+<code>/api/device/arp/&lt;device_id&gt;</code>. The server runs the
+pings inside the device's VRF for external targets (gateway) and in
+the default netns for self-pings (the kernel's "local" route for the
+device's own IP points at global <code>lo</code>, which sits outside
+the VRF).</p>
+
+<pre><code>curl http://&lt;server&gt;:5050/api/device/arp/&lt;device_id&gt;
+# → { "arp_resolved": true, "arp_status": "Resolved",
+#     "arp_ipv4_resolved": true, "arp_ipv6_resolved": true,
+#     "arp_gateway_resolved": true,
+#     "details": { "ipv4_ping":"success", "ipv6_ping":"success",
+#                  "gateway_ping":"success", "vrf":"vrf-47dce96a348" } }
+</code></pre>
+
+<p>The periodic ARP monitor calls this endpoint every 30 s for every
+Running device and persists the result.</p>
+
+<h2>15. Authentication, CORS, rate limiting</h2>
 
 <p><b>None.</b> The server has no auth layer, no CORS preflight handling,
 no rate limiting. Internal-network use only — never expose port 5050 to
