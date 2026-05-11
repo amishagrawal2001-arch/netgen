@@ -3850,7 +3850,13 @@ class DevicesTab(QWidget):
         )
 
     def populate_device_table(self):
-        """Populate the device table from the data structure."""
+        """Populate the device table from the data structure.
+
+        Sets the populate-guard flag so add_device's per-cell setItem
+        writes don't trigger on_cell_changed and falsely mark devices
+        as _needs_apply=True. Same guard as update_device_table.
+        """
+        self._populating_devices_table = True
         try:
             # Clear existing table
             self.devices_table.setRowCount(0)
@@ -3899,10 +3905,14 @@ class DevicesTab(QWidget):
                     )
             
             logger.debug(f"Populated table with {self.devices_table.rowCount()} devices")
-            
+
         except Exception as e:
             logger.error(f"Failed to populate device table: {e}")
             logging.error(f"Failed to populate device table: {e}")
+        finally:
+            # Restore signal flow so genuine user inline-edits are
+            # caught by on_cell_changed (audit HIGH #2 handler).
+            self._populating_devices_table = False
 
     # ---------- Dialogs / actions ----------
     def apply_selected_device(self):
@@ -5150,25 +5160,33 @@ class DevicesTab(QWidget):
                 bgp_success = self._apply_bgp_to_server_sync(server_url, device_info)
                 if not bgp_success:
                     logger.error(f"Failed to configure BGP for device {device_name}")
+                    # Stash a descriptive error if the BGP handler
+                    # didn't already set one. Without this, the worker
+                    # reports a generic "Unknown error" and the user
+                    # has no idea which protocol step failed.
+                    if not device_info.get("_apply_error"):
+                        device_info["_apply_error"] = "BGP configuration failed (check server logs)"
                     return False
                 logger.info(f"BGP configured for device {device_name}")
             else:
                 logger.debug(f"BGP not configured - protocols: {protocols}, bgp_config: {bgp_config}")
-            
+
             # Step 3: Configure OSPF if enabled
             ospf_config = device_info.get("ospf_config", {})
-            
+
             logger.debug(f"Checking OSPF - protocols: {protocols}, ospf_config: {ospf_config}")
             if "OSPF" in protocols and ospf_config:
                 logger.info(f"Configuring OSPF for device {device_name}")
                 ospf_success = self._apply_ospf_to_server_sync(server_url, device_info)
                 if not ospf_success:
                     logger.error(f"Failed to configure OSPF for device {device_name}")
+                    if not device_info.get("_apply_error"):
+                        device_info["_apply_error"] = "OSPF configuration failed (check server logs)"
                     return False
                 logger.info(f"OSPF configured for device {device_name}")
             else:
                 logger.debug(f"OSPF not configured - protocols: {protocols}, ospf_config: {ospf_config}")
-            
+
             # Step 4: Configure ISIS if enabled
             # Get ISIS config - handle both isis_config and is_is_config keys
             isis_config = device_info.get("isis_config", {}) or device_info.get("is_is_config", {})
@@ -5179,15 +5197,20 @@ class DevicesTab(QWidget):
                 isis_success = self._apply_isis_to_server_sync(server_url, device_info)
                 if not isis_success:
                     logger.error(f"Failed to configure ISIS for device {device_name}")
+                    if not device_info.get("_apply_error"):
+                        device_info["_apply_error"] = "ISIS configuration failed (check server logs)"
                     return False
                 logger.info(f"ISIS configured for device {device_name}")
             else:
                 logger.debug(f"ISIS not configured - protocols: {protocols}, isis_config: {isis_config}")
-            
+
             return True
-                
+
         except Exception as e:
             logger.error(f"Exception in sync device apply for '{device_name}': {e}")
+            # Surface the exception text so the worker's "Unknown error"
+            # message becomes something actionable.
+            device_info["_apply_error"] = f"Exception: {e}"
             return False
     
     def _apply_bgp_to_server_sync(self, server_url, device_info):
@@ -6863,10 +6886,21 @@ class DevicesTab(QWidget):
         return merged
 
     def update_device_table(self, all_devices=None):
-        """Rebuild the device table based on selected interfaces."""
+        """Rebuild the device table based on selected interfaces.
+
+        Guarded by self._populating_devices_table so the programmatic
+        cell writes below don't trigger on_cell_changed (the
+        inline-edit handler from audit HIGH #2). Without this flag,
+        every populate emit `[INLINE EDIT]` log lines AND mark the
+        device _needs_apply=True, which could cause apply storms or
+        unintended re-apply on every refresh tick. The flag is
+        cleared in finally so we always restore the signal flow,
+        even on exception.
+        """
         if all_devices is None:
             all_devices = getattr(self.main_window, "all_devices", {})
 
+        self._populating_devices_table = True
         # OPTIMIZATION: Calculate row count first, then set once instead of clear+insertRow
         try:
             selected_interfaces = set()
@@ -6996,6 +7030,11 @@ class DevicesTab(QWidget):
 
         except Exception as exc:
             logging.error(f"[DEVICE TABLE] Failed to rebuild table: {exc}")
+        finally:
+            # Always clear the populate-guard flag so subsequent
+            # genuine user inline-edits are not ignored. See
+            # on_cell_changed (audit HIGH #2) for the consumer.
+            self._populating_devices_table = False
 
         # OPTIMIZATION: Defer ARP initialization to avoid blocking UI on click
         from PyQt5.QtCore import QTimer
