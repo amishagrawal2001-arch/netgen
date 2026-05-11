@@ -668,10 +668,39 @@ class BGPHandler:
             
             # Make synchronous request to the configure endpoint
             response = requests.post(f"{server_url}/api/device/bgp/configure", json=bgp_payload, timeout=30)
-            return response.status_code == 200
-                
+            if response.status_code == 200:
+                return True
+
+            # Surface the actual server error so the caller can show
+            # something more useful than "BGP configuration failed
+            # (check server logs)". Try to extract a structured
+            # `error` field first; fall back to the raw response
+            # body (truncated). Stashed on device_info["_apply_error"]
+            # so devices_tab.py's apply path picks it up.
+            err_msg = f"HTTP {response.status_code}"
+            try:
+                body = response.json()
+                if isinstance(body, dict):
+                    err_msg = body.get("error") or body.get("message") or err_msg
+                    # Some BGP errors carry a `details` field with
+                    # the FRR vtysh stderr — include it for context.
+                    details = body.get("details") or body.get("stderr")
+                    if details:
+                        err_msg = f"{err_msg} — {str(details)[:200]}"
+            except Exception:
+                # Non-JSON or empty body
+                if response.text:
+                    err_msg = f"{err_msg}: {response.text[:200]}"
+            full_err = f"BGP configure: {err_msg}"
+            logger.error(
+                f"[BGP APPLY] {device_name} configure failed → {full_err}"
+            )
+            device_info["_apply_error"] = full_err
+            return False
+
         except Exception as e:
             logger.error(f"Exception in sync BGP apply for '{device_name}': {e}")
+            device_info["_apply_error"] = f"BGP configure exception: {e}"
             return False
     
 

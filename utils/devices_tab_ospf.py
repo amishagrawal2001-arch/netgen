@@ -623,10 +623,32 @@ class OSPFHandler:
             
             # Make synchronous request to the configure endpoint
             response = requests.post(f"{server_url}/api/device/ospf/configure", json=ospf_payload, timeout=30)
-            return response.status_code == 200
-                
+            if response.status_code == 200:
+                return True
+
+            # Surface the actual server error (same pattern as BGP
+            # handler — stash on device_info["_apply_error"] so the
+            # apply path can display something more useful than
+            # "OSPF configuration failed (check server logs)").
+            err_msg = f"HTTP {response.status_code}"
+            try:
+                body = response.json()
+                if isinstance(body, dict):
+                    err_msg = body.get("error") or body.get("message") or err_msg
+                    details = body.get("details") or body.get("stderr")
+                    if details:
+                        err_msg = f"{err_msg} — {str(details)[:200]}"
+            except Exception:
+                if response.text:
+                    err_msg = f"{err_msg}: {response.text[:200]}"
+            full_err = f"OSPF configure: {err_msg}"
+            logger.error(f"[OSPF APPLY] {device_name} configure failed → {full_err}")
+            device_info["_apply_error"] = full_err
+            return False
+
         except Exception as e:
             logger.error(f"Exception in sync OSPF apply for '{device_name}': {e}")
+            device_info["_apply_error"] = f"OSPF configure exception: {e}"
             return False
     
     def prompt_add_ospf(self):
