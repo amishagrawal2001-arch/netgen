@@ -29,7 +29,26 @@ DNSMASQ_LOG_DIR = "/var/log"
 DHCP_CONTAINER_PREFIX = "ostg-dhcp"
 DHCP_CLIENT_PREFIX = "dhcp-client"
 DHCP_SERVER_PREFIX = "dhcp-server"
-DHCP_DOCKER_IMAGE = os.environ.get("OSTG_DHCP_IMAGE", "ostg-frr:latest")
+# Auto-resolve the FRR image used for DHCP containers — netgen-frr if
+# locally available, ostg-frr as legacy fallback. Same logic as the
+# FRRDockerManager so a rebrand-only deployment doesn't break here.
+def _resolve_dhcp_image():
+    explicit = (
+        os.environ.get("NETGEN_DHCP_IMAGE")
+        or os.environ.get("OSTG_DHCP_IMAGE")
+        or os.environ.get("NETGEN_FRR_IMAGE")
+        or os.environ.get("OSTG_FRR_IMAGE")
+        or ""
+    ).strip()
+    if explicit:
+        return explicit
+    try:
+        from utils.frr_docker import _resolve_frr_image
+        return _resolve_frr_image()
+    except Exception:
+        return "ostg-frr:latest"
+
+DHCP_DOCKER_IMAGE = _resolve_dhcp_image()
 
 
 def _ensure_paths(container=None) -> None:

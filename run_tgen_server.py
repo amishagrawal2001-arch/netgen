@@ -155,19 +155,30 @@ def validate_subnet(subnet_str):
     
     return is_valid, result, address_family
 
+# The status monitors call back into THIS server's own REST API for
+# protocol state. The previous hardcoded `localhost:5051` was a stale
+# carryover from an old port assignment — the netgen-server has been
+# on 5050 for a while, so every monitor request looped to a
+# connection refused (visible in the server log as repeated
+# "BGP MONITOR Request error ... [Errno 111] Connection refused").
+# Resolve from NETGEN_SERVER_PORT env var with a 5050 default; the
+# user can override if they actually run on a different port.
+_SELF_PORT = int(os.environ.get("NETGEN_SERVER_PORT") or "5050")
+_SELF_URL = f"http://localhost:{_SELF_PORT}"
+
 # Initialize BGP status monitor
-bgp_monitor = BGPStatusManager(device_db, server_url="http://localhost:5051")
+bgp_monitor = BGPStatusManager(device_db, server_url=_SELF_URL)
 
 # Initialize OSPF status monitor
 from utils.ospf_monitor import OSPFStatusManager
-ospf_monitor = OSPFStatusManager(device_db, server_url="http://localhost:5051")
+ospf_monitor = OSPFStatusManager(device_db, server_url=_SELF_URL)
 
 # Initialize ISIS status monitor
 from utils.isis_monitor import ISISMonitor
 isis_monitor = ISISMonitor(device_db)
 
 # Initialize ARP status monitor
-arp_monitor = ARPStatusMonitor(device_db, server_url="http://localhost:5051")
+arp_monitor = ARPStatusMonitor(device_db, server_url=_SELF_URL)
 
 # Initialize DHCP client monitor
 from utils.dhcp_monitor import DHCPClientMonitor

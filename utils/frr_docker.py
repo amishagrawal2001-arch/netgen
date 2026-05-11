@@ -15,13 +15,57 @@ from typing import Dict, Optional, List
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+def _resolve_frr_image(client=None):
+    """Pick the FRR docker image to use. Priority:
+
+      1. NETGEN_FRR_IMAGE / OSTG_FRR_IMAGE env var (explicit override)
+      2. netgen-frr:latest if it exists locally (new branding)
+      3. ostg-frr:latest (legacy fallback)
+
+    Without this, the hardcoded "ostg-frr:latest" reference caused
+    every FRR start to fail on a server where the image had been
+    rebuilt as "netgen-frr:latest" — docker would try to PULL
+    ostg-frr from Docker Hub, get a 404 (no such public image),
+    and the BGP/OSPF apply would fail with the opaque
+    "Failed to create FRR container" error. User-reported symptom.
+    """
+    import os as _os
+    env = (
+        _os.environ.get("NETGEN_FRR_IMAGE")
+        or _os.environ.get("OSTG_FRR_IMAGE")
+        or ""
+    ).strip()
+    if env:
+        return env
+    if client is None:
+        try:
+            client = docker.from_env()
+        except Exception:
+            return "ostg-frr:latest"
+    for candidate in ("netgen-frr:latest", "ostg-frr:latest"):
+        try:
+            client.images.get(candidate)
+            return candidate
+        except Exception:
+            continue
+    # Neither image exists locally — return the legacy default so the
+    # error message still reads sensibly (and a docker login + tag
+    # of the new image is a one-line fix on the server).
+    return "ostg-frr:latest"
+
+
 class FRRDockerManager:
     """Manages FRR Docker containers using isolated bridge networking"""
-    
+
     def __init__(self):
         self.client = docker.from_env()
+        # Container / network prefix kept at ostg-frr for backwards
+        # compatibility with already-running deployments (renaming
+        # them would orphan in-flight containers); the image name
+        # auto-resolves so the new netgen-frr build works without
+        # config edits.
         self.container_prefix = "ostg-frr"
-        self.image_name = "ostg-frr:latest"
+        self.image_name = _resolve_frr_image(self.client)
         self.network_name = "ostg-frr-network"
     
     def _sanitize_container_name(self, name: str) -> str:

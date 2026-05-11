@@ -24,7 +24,11 @@ class FRRDockerManager:
     def __init__(self):
         self.client = docker.from_env()
         self.container_prefix = "ostg-frr-vrf"
-        self.image_name = "ostg-frr:latest"
+        try:
+            from utils.frr_docker import _resolve_frr_image
+            self.image_name = _resolve_frr_image(self.client)
+        except Exception:
+            self.image_name = "ostg-frr:latest"
         self.vrf_table_base = 1000  # Starting VRF table number
     
     def _sanitize_container_name(self, name: str) -> str:
