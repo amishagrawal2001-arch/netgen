@@ -6372,6 +6372,99 @@ class DevicesTab(QWidget):
         dialog.ipv4_checkbox.setChecked(bool(ipv4.strip()))
         dialog.ipv6_checkbox.setChecked(bool(ipv6.strip()))
 
+        # Pre-fill the PROTOCOL state from the device's stored config.
+        # Without this, opening Edit on a device that has BGP / OSPF /
+        # ISIS / DHCP configured shows all those checkboxes UNCHECKED
+        # — so the user thinks "BGP isn't enabled here" and may also
+        # silently remove the protocol on Save (per the new
+        # _set_protocol logic from commit d4d2708). Reflect what's
+        # actually on the device so the dialog state matches reality.
+        try:
+            protocols = device_info.get("protocols", []) or []
+            if isinstance(protocols, dict):
+                # Legacy dict format → list of keys
+                protocols = list(protocols.keys())
+            protocols_set = {str(p).upper() for p in protocols}
+
+            existing_bgp  = device_info.get("bgp_config")  or {}
+            existing_ospf = device_info.get("ospf_config") or {}
+            existing_isis = (device_info.get("isis_config")
+                             or device_info.get("is_is_config")
+                             or {})
+            existing_dhcp = device_info.get("dhcp_config") or {}
+
+            bgp_on  = ("BGP"  in protocols_set) and bool(existing_bgp)
+            ospf_on = ("OSPF" in protocols_set) and bool(existing_ospf)
+            isis_on = (
+                ("ISIS" in protocols_set or "IS-IS" in protocols_set)
+                and bool(existing_isis)
+            )
+            dhcp_on = ("DHCP" in protocols_set) and bool(existing_dhcp)
+
+            if hasattr(dialog, "bgp_enable_checkbox"):
+                dialog.bgp_enable_checkbox.setChecked(bgp_on)
+            if hasattr(dialog, "ospf_enable_checkbox"):
+                dialog.ospf_enable_checkbox.setChecked(ospf_on)
+            if hasattr(dialog, "isis_enable_checkbox"):
+                dialog.isis_enable_checkbox.setChecked(isis_on)
+            if hasattr(dialog, "dhcp_enable_checkbox"):
+                dialog.dhcp_enable_checkbox.setChecked(dhcp_on)
+
+            # Pre-fill BGP fields from the stored config so the user
+            # sees the actual ASN / neighbor IPs they configured.
+            if bgp_on:
+                if hasattr(dialog, "bgp_local_as_input"):
+                    dialog.bgp_local_as_input.setText(
+                        str(existing_bgp.get("bgp_asn", ""))
+                    )
+                if hasattr(dialog, "bgp_remote_as_input"):
+                    dialog.bgp_remote_as_input.setText(
+                        str(existing_bgp.get("bgp_remote_asn", ""))
+                    )
+                if hasattr(dialog, "bgp_toggle_ipv4"):
+                    dialog.bgp_toggle_ipv4.setChecked(
+                        bool(existing_bgp.get("ipv4_enabled", True))
+                    )
+                if hasattr(dialog, "bgp_toggle_ipv6"):
+                    dialog.bgp_toggle_ipv6.setChecked(
+                        bool(existing_bgp.get("ipv6_enabled", False))
+                    )
+
+            # Pre-fill OSPF fields similarly.
+            if ospf_on:
+                if hasattr(dialog, "ospf_area_id_input"):
+                    dialog.ospf_area_id_input.setText(
+                        str(existing_ospf.get("area_id", ""))
+                    )
+                if hasattr(dialog, "ospf_toggle_ipv4"):
+                    dialog.ospf_toggle_ipv4.setChecked(
+                        bool(existing_ospf.get("ipv4_enabled", True))
+                    )
+                if hasattr(dialog, "ospf_toggle_ipv6"):
+                    dialog.ospf_toggle_ipv6.setChecked(
+                        bool(existing_ospf.get("ipv6_enabled", False))
+                    )
+
+            # Pre-fill ISIS fields similarly.
+            if isis_on:
+                if hasattr(dialog, "isis_system_id_input"):
+                    dialog.isis_system_id_input.setText(
+                        str(existing_isis.get("system_id", ""))
+                    )
+                if hasattr(dialog, "isis_area_id_input"):
+                    # Stored area_id may be the long form
+                    # "49.0001.0000.0000.0001.00"; keep it as-is.
+                    dialog.isis_area_id_input.setText(
+                        str(existing_isis.get("area_id", ""))
+                    )
+
+            # Refresh the dialog's protocol dropdown + visibility now
+            # that the enable-checkboxes reflect actual state.
+            if hasattr(dialog, "_on_protocol_enabled_changed"):
+                dialog._on_protocol_enabled_changed()
+        except Exception as _prefill_exc:
+            logger.warning(f"[EDIT] Protocol pre-fill skipped: {_prefill_exc}")
+
         if dialog.exec_() != dialog.Accepted:
             return
         
