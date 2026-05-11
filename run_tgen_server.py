@@ -1985,7 +1985,6 @@ def get_device_ospf_status_from_database(device_id):
         logging.info(f"[OSPF DATABASE STATUS] Getting OSPF status from database for device {device_id}")
         
         from utils.device_database import DeviceDatabase
-        device_db = DeviceDatabase()
         
         # Get device from database
         device = device_db.get_device(device_id)
@@ -2053,7 +2052,6 @@ def device_isis_start():
         
         # Get device from database
         from utils.device_database import DeviceDatabase
-        device_db = DeviceDatabase()
         device = device_db.get_device(device_id)
         
         if not device:
@@ -2283,7 +2281,6 @@ def stop_isis():
         # Get device from database
         try:
             from utils.device_database import DeviceDatabase
-            device_db = DeviceDatabase()
             logging.info(f"[ISIS STOP] DeviceDatabase initialized")
             device = device_db.get_device(device_id)
             logging.info(f"[ISIS STOP] Got device from database: {device is not None}")
@@ -2347,7 +2344,6 @@ def get_device_isis_status(device_id):
         
         # Get device from database
         from utils.device_database import DeviceDatabase
-        device_db = DeviceDatabase()
         device = device_db.get_device(device_id)
         
         if not device:
@@ -2378,7 +2374,6 @@ def get_device_isis_status_from_database(device_id):
         logging.info(f"[ISIS DATABASE STATUS] Getting ISIS status from database for device {device_id}")
         
         from utils.device_database import DeviceDatabase
-        device_db = DeviceDatabase()
         
         # Get device from database
         device = device_db.get_device(device_id)
@@ -2458,7 +2453,6 @@ def cleanup_isis():
         
         # Get device from database
         from utils.device_database import DeviceDatabase
-        device_db = DeviceDatabase()
         device = device_db.get_device(device_id)
         
         if not device:
@@ -2600,7 +2594,6 @@ def configure_isis():
         # Save ISIS route pool attachments to database (similar to BGP and OSPF)
         try:
             from utils.device_database import DeviceDatabase
-            device_db = DeviceDatabase()
             route_pools_data = isis_config.get("route_pools", [])
             area_id = isis_config.get("area_id", "49.0001.0000.0000.0001.00")
             
@@ -2838,7 +2831,6 @@ def configure_isis():
                 
                 # Get all available route pools
                 from utils.device_database import DeviceDatabase
-                device_db = DeviceDatabase()
                 all_pools_db = device_db.get_all_route_pools()
                 all_pools = []
                 for pool in all_pools_db:
@@ -5780,7 +5772,6 @@ def add_static_route_background(device_id, device_name, gateway, container_name_
                 # Check both database and protocols list to be safe
                 try:
                     from utils.device_database import DeviceDatabase
-                    device_db = DeviceDatabase()
                     device_record = device_db.get_device(device_id) if device_id else None
                     vxlan_enabled_in_db = device_record and (device_record.get("vxlan_enabled") is True)
                     vxlan_in_protocols = "VXLAN" in (device_record.get("protocols", []) if device_record else [])
@@ -6672,7 +6663,6 @@ def configure_bgp_route_advertisement(device_id, device_name, bgp_asn, neighbor_
         device_ipv6 = ""
         if ipv6_pools_check and is_ipv6_neighbor:
             from utils.device_database import DeviceDatabase
-            device_db = DeviceDatabase()
             device_info = device_db.get_device(device_id)
             if device_info:
                 device_ipv6 = device_info.get("ipv6", "").strip()
@@ -7015,7 +7005,6 @@ def cleanup_ospf_route_advertisement(device_id, device_name, area_id, af_type=No
         
         # Get all route pools from database to remove their static routes
         from utils.device_database import DeviceDatabase
-        device_db = DeviceDatabase()
         all_pools_db = device_db.get_all_route_pools()
         
         # Determine if we should filter by address family
@@ -7144,7 +7133,6 @@ def cleanup_bgp_route_advertisement(device_id, device_name, bgp_asn, neighbor_ip
         
         # Get all route pools from database to remove their static routes
         from utils.device_database import DeviceDatabase
-        device_db = DeviceDatabase()
         all_pools_db = device_db.get_all_route_pools()
         
         # Remove static routes for all pools (both IPv4 and IPv6, or filtered by af_type)
@@ -7425,7 +7413,6 @@ def cleanup_isis_route_advertisement(device_id, device_name, area_id, af_type=No
         is_ipv4_only = af_type == "IPv4"
         
         from utils.device_database import DeviceDatabase
-        device_db = DeviceDatabase()
         all_pools_db = device_db.get_all_route_pools()
         
         for pool in all_pools_db:
@@ -8093,8 +8080,11 @@ def configure_bgp():
                 # Get loopback IPv4 from database for use_loopback_ip check
                 loopback_ipv4 = None
                 try:
-                    from utils.device_database import DeviceDatabase
-                    device_db = DeviceDatabase()
+                    # Module-level `device_db` is already in scope —
+                    # rebinding to a local would promote `device_db`
+                    # to function-local for the entire configure_bgp
+                    # body, breaking the many reads above this point.
+                    # See start_bgp scoping note for full background.
                     device_data = device_db.get_device(device_id) if device_id else None
                     if device_data:
                         loopback_ipv4_raw = device_data.get('loopback_ipv4', '')
@@ -8141,8 +8131,8 @@ def configure_bgp():
                 # Get loopback IPv6 from database for use_loopback_ip check
                 loopback_ipv6 = None
                 try:
-                    from utils.device_database import DeviceDatabase
-                    device_db = DeviceDatabase()
+                    # Same scoping rationale as the loopback_ipv4
+                    # block above — don't rebind device_db locally.
                     device_data = device_db.get_device(device_id) if device_id else None
                     if device_data:
                         loopback_ipv6_raw = device_data.get('loopback_ipv6', '')
@@ -9379,7 +9369,6 @@ def reset_interface_with_vlans():
         devices_to_remove = []
         try:
             from utils.device_database import DeviceDatabase
-            device_db = DeviceDatabase()
             
             # Get devices that match the base interface
             base_devices = device_db.get_devices_by_interface(base_interface, include_vlans=True)
@@ -9543,7 +9532,6 @@ def reset_interface_with_vlans():
                 
                 # Call the device remove endpoint logic directly
                 from utils.device_database import DeviceDatabase
-                device_db = DeviceDatabase()
                 
                 # Get device info before removing
                 device_info = device_db.get_device(device_id)
@@ -15386,7 +15374,6 @@ def main(argv=None):
             if not data:
                 return jsonify({"error": "Invalid JSON payload"}), 400
             
-            device_db = DeviceDatabase()
             ext_manager = ExternalDeviceManager()
             
             # Generate device ID if not provided
