@@ -57,17 +57,12 @@ class FRRDockerManager:
         hash_int = int(hash_obj.hexdigest()[:8], 16)
         return self.vrf_table_base + (hash_int % 1000)  # Ensure table number is reasonable
     
-    def setup_network_infrastructure(self):
-        """Set up VRF infrastructure for FRR containers"""
-        try:
-            logger.info("VRF-based networking - no Docker network setup needed")
-            logger.info("Each device will get its own VRF for network isolation")
-            return True
-            
-        except Exception as e:
-            logger.error(f"Failed to setup VRF infrastructure: {e}")
-            return False
-    
+    # setup_network_infrastructure() was a no-op (VRF mode uses host
+    # networking + per-device VRF tables, no docker network/bridge is
+    # ever needed). Removed in lockstep with the same cleanup in
+    # frr_docker.py.
+
+
     def create_vrf_for_device(self, device_id: str, interface: str, ipv4: str = None, ipv6: str = None) -> bool:
         """Create VRF and configure interface for device."""
         try:
@@ -315,9 +310,8 @@ def stop_frr_container(device_id: str) -> bool:
     """Stop FRR container for a device"""
     return frr_manager.stop_frr_container(device_id)
 
-def setup_frr_network() -> bool:
-    """Set up FRR network infrastructure"""
-    return frr_manager.setup_network_infrastructure()
+# setup_frr_network() was removed along with setup_network_infrastructure();
+# VRF mode runs FRR on host networking and needs no docker network setup.
 
 def get_bgp_status(device_id: str) -> Dict:
     """Get BGP status for a device"""

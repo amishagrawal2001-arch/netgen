@@ -135,23 +135,11 @@ class OSTGDockerInstaller:
             print(f"Error building FRR image: {e}")
             return False
     
-    def setup_docker_network(self):
-        """Create the OSTG Docker network"""
-        print("Setting up OSTG Docker network...")
-        try:
-            # Try to create the network (ignore if it already exists)
-            subprocess.run([
-                'docker', 'network', 'create', '--driver', 'bridge', 
-                'ostg-frr-network'
-            ], capture_output=True)
-            
-            print("OSTG Docker network setup complete")
-            return True
-            
-        except subprocess.CalledProcessError as e:
-            print(f"Error setting up Docker network: {e}")
-            return False
-    
+    # setup_docker_network() was removed: FRR containers run on
+    # `--net=host`, so the `ostg-frr-network` bridge was created but
+    # never used. If you find a stale one on a server, drop it with
+    # `docker network rm ostg-frr-network`.
+
     def verify_installation(self):
         """Verify that Docker and FRR setup is working correctly"""
         print("Verifying OSTG Docker + FRR installation...")
@@ -191,11 +179,9 @@ class OSTGDockerInstaller:
         # Build FRR image
         if not self.build_frr_image():
             success = False
-        
-        # Setup Docker network
-        if not self.setup_docker_network():
-            success = False
-        
+
+        # Docker network step removed — FRR runs on host networking.
+
         # Verify installation
         if not self.verify_installation():
             success = False

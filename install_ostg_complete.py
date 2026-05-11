@@ -30,10 +30,13 @@ PYTHON_VERSION = "3.10"
 VENV_NAME = "netgen_env"
 NETGEN_PORT = 5051
 DOCKER_IMAGE = "netgen-frr:latest"
-DOCKER_NETWORK = "netgen-frr-network"
+# DOCKER_NETWORK constant removed: FRR containers run on host networking
+# (`network_mode='host'`), so no docker bridge is created by the runtime.
 INSTALL_DIR = "/opt/netgen"
 
 # Legacy names retained only for clean-up of prior OSTG installs.
+# LEGACY_DOCKER_NETWORK is the bridge older installs created — we still
+# remove it on upgrade so it doesn't linger as a dead interface.
 LEGACY_INSTALL_DIR = "/opt/OSTG"
 LEGACY_DOCKER_IMAGE = "ostg-frr:latest"
 LEGACY_DOCKER_NETWORK = "ostg-frr-network"
@@ -1014,12 +1017,10 @@ class NetgenInstaller:
             self.log("  Or: docker build --build-arg ALPINE_MIRROR=https://ftp.halifax.rwth-aachen.de/alpine -t ostg-frr:latest -f /opt/OSTG/Dockerfile.frr /opt/OSTG", "WARNING")
         else:
             self.log("✓ Docker FRR image built successfully")
-        
-        # Create Docker network
-        net_result = self.run_command(f"docker network create {DOCKER_NETWORK}", check=False)
-        if net_result.returncode != 0:
-            self.log(f"Docker network {DOCKER_NETWORK} may already exist", "WARNING")
-            
+
+        # Docker network creation removed — FRR containers run on
+        # host networking, the bridge was created but never attached.
+
         self.log("✓ Docker FRR setup completed")
         
     def create_systemd_services(self):
