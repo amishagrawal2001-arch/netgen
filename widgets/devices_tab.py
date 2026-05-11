@@ -5167,12 +5167,22 @@ class DevicesTab(QWidget):
                 return False
             
             logger.info(f"Basic device configuration applied for {device_name}")
-            
+
             # Step 2: Configure BGP if enabled
             protocols = device_info.get("protocols", [])
             bgp_config = device_info.get("bgp_config", {})
-            
-            logger.debug(f"Checking BGP - protocols: {protocols}, bgp_config: {bgp_config}")
+
+            # Promoted these from debug → info so the user can see in
+            # the log exactly which protocols the device claims to
+            # have configured. Common gotcha: a device added before
+            # the BGP checkbox was unchecked (or pasted from a
+            # BGP-enabled source) keeps "BGP" in its protocols list,
+            # and apply tries to push a possibly-stale bgp_config
+            # the user thought they'd cleared.
+            logger.info(
+                f"[APPLY DIAG] {device_name} protocols={protocols} "
+                f"bgp_config_keys={list((bgp_config or {}).keys())}"
+            )
             if "BGP" in protocols and bgp_config:
                 logger.info(f"Configuring BGP for device {device_name}")
                 bgp_success = self._apply_bgp_to_server_sync(server_url, device_info)
