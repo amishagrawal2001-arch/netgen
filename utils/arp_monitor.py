@@ -96,28 +96,37 @@ class ARPStatusMonitor:
     def _monitor_loop(self):
         """Main monitoring loop."""
         logger.info("[ARP MONITOR] Monitoring loop started")
-        
+
+        # Startup settle: the Flask server in the same process binds on
+        # port 5050 a moment after the monitor thread is launched. If we
+        # poll immediately we hit `Connection refused` for the first
+        # iteration and log it as ERROR even though it's a transient
+        # race. Wait a short window to give Flask time to come up.
+        if self.stop_event.wait(5):
+            return
+        self._startup_window_until = time.monotonic() + 25  # tolerate refused for 25s more
+
         while not self.stop_event.is_set():
             try:
                 # Get all devices that need ARP monitoring
                 devices = self._get_arp_devices()
-                
+
                 if devices:
                     logger.info(f"[ARP MONITOR] Checking ARP status for {len(devices)} devices")
                     self._check_arp_status_batch(devices)
                 else:
                     logger.debug("[ARP MONITOR] No ARP devices found")
-                
+
                 # Wait for next check interval
                 if self.stop_event.wait(self.check_interval):
                     break
-                    
+
             except Exception as e:
                 logger.error(f"[ARP MONITOR] Error in monitoring loop: {e}")
                 # Continue monitoring even if there's an error
                 if self.stop_event.wait(5):  # Wait 5 seconds before retrying
                     break
-        
+
         logger.info("[ARP MONITOR] Monitoring loop ended")
     
     def _get_arp_devices(self) -> List[Dict[str, Any]]:
@@ -192,7 +201,18 @@ class ARPStatusMonitor:
                 return None
                 
         except requests.exceptions.RequestException as e:
-            logger.error(f"[ARP MONITOR] Network error checking ARP status for device {device_id}: {e}")
+            # During the first few seconds after netgen-server starts,
+            # Flask hasn't bound :5050 yet → ConnectionRefused. Don't
+            # spam the log with ERROR for that — downgrade to debug
+            # while still inside the startup window.
+            is_startup_blip = (
+                isinstance(e, requests.exceptions.ConnectionError)
+                and time.monotonic() < getattr(self, "_startup_window_until", 0)
+            )
+            if is_startup_blip:
+                logger.debug(f"[ARP MONITOR] startup-window connection-refused for {device_id}; ignoring")
+            else:
+                logger.error(f"[ARP MONITOR] Network error checking ARP status for device {device_id}: {e}")
             return None
         except Exception as e:
             logger.error(f"[ARP MONITOR] Error checking ARP status for device {device_id}: {e}")

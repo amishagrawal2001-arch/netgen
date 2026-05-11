@@ -87,21 +87,28 @@ class OSPFStatusMonitor:
     def _monitor_loop(self):
         """Main monitoring loop."""
         logger.info("[OSPF MONITOR] Monitoring loop started")
-        
+
+        # Startup settle — see same pattern in utils/arp_monitor.py.
+        # Avoid spamming ERROR-level "Connection refused" while Flask
+        # is still coming up on :5050 inside the same process.
+        if self.stop_event.wait(5):
+            return
+        self._startup_window_until = time.monotonic() + 25
+
         while self.is_running and not self.stop_event.is_set():
             try:
                 # Get OSPF-enabled devices
                 devices = self._get_ospf_devices()
-                
+
                 if devices:
                     logger.info(f"[OSPF MONITOR] Checking OSPF status for {len(devices)} devices")
                     self._check_ospf_status_batch(devices)
                 else:
                     logger.info("[OSPF MONITOR] No OSPF devices found")
-                
+
                 # Wait for next check interval
                 self.stop_event.wait(self.check_interval)
-                
+
             except Exception as e:
                 logger.error(f"[OSPF MONITOR] Error in monitoring loop: {e}")
                 self.stop_event.wait(5)  # Wait 5 seconds before retrying
@@ -198,7 +205,15 @@ class OSPFStatusMonitor:
                 return None
                 
         except requests.exceptions.RequestException as e:
-            logger.error(f"[OSPF MONITOR] Request error for device {device.get('device_id', 'unknown')}: {e}")
+            is_startup_blip = (
+                isinstance(e, requests.exceptions.ConnectionError)
+                and time.monotonic() < getattr(self, "_startup_window_until", 0)
+            )
+            dev_id = device.get('device_id', 'unknown')
+            if is_startup_blip:
+                logger.debug(f"[OSPF MONITOR] startup-window connection-refused for {dev_id}; ignoring")
+            else:
+                logger.error(f"[OSPF MONITOR] Request error for device {dev_id}: {e}")
             return None
         except Exception as e:
             logger.error(f"[OSPF MONITOR] Error checking OSPF status for device {device.get('device_id', 'unknown')}: {e}")
