@@ -5,6 +5,38 @@ from typing import Dict, Any, Optional
 
 OSPF_INSTANCES = {}
 
+
+def _ospf_vrf_suffix(device_id: Optional[str]) -> str:
+    """Return ' vrf <name>' if this device has been provisioned with a
+    Linux VRF, else ''.
+
+    The VRF is created by FRRDockerManager when the device's container
+    starts (see utils/frr_docker.py:_create_vrf). All `router ospf*`
+    blocks for this device must carry the same VRF keyword, otherwise
+    ospfd's outgoing packets go via the default routing table while
+    the device's interface routes live in the VRF table — neighbors
+    never come up.
+
+    Falls back to no-VRF if the kernel device isn't present (legacy
+    deployments before VRF wiring landed).
+    """
+    if not device_id:
+        return ""
+    try:
+        from utils.frr_docker import FRRDockerManager
+        vrf_name = FRRDockerManager().vrf_name_for_device(device_id)
+        if not vrf_name:
+            return ""
+        check = subprocess.run(
+            ["ip", "-o", "link", "show", vrf_name],
+            capture_output=True, text=True,
+        )
+        if check.returncode == 0 and (check.stdout or "").strip():
+            return f" vrf {vrf_name}"
+    except Exception as exc:
+        logging.debug(f"[OSPF VRF] suffix lookup failed for {device_id}: {exc}")
+    return ""
+
 def normalize_ospf_area_id(area_id: str) -> str:
     """
     Normalize OSPF area ID to dotted decimal format for comparison.
@@ -358,7 +390,7 @@ def configure_ospf_neighbor(
                         if has_graceful_restart and graceful_restart_ipv4_explicitly_set and not graceful_restart_ipv4:
                             logging.info(f"[OSPF CONFIGURE] Removing graceful-restart from router ospf (IPv4 explicitly disabled)")
                             vtysh_commands.extend([
-                                "router ospf",
+                                f"router ospf{_ospf_vrf_suffix(device_id)}",
                                 " no graceful-restart",
                                 "exit"
                             ])
@@ -372,7 +404,7 @@ def configure_ospf_neighbor(
                     if not ospf_area_ids_equal(old_area, area_id_ipv4):
                         logging.info(f"[OSPF CONFIGURE] Removing old network statement: network {old_network} area {old_area} (new area: {area_id_ipv4})")
                         vtysh_commands.extend([
-                            "router ospf",
+                            f"router ospf{_ospf_vrf_suffix(device_id)}",
                             f" no network {old_network} area {old_area}",
                             "exit"
                         ])
@@ -424,7 +456,7 @@ def configure_ospf_neighbor(
                         if has_graceful_restart and graceful_restart_ipv6_explicitly_set and not graceful_restart_ipv6:
                             logging.info(f"[OSPF CONFIGURE] Removing graceful-restart from router ospf6 (IPv6 explicitly disabled)")
                             vtysh_commands.extend([
-                                "router ospf6",
+                                f"router ospf6{_ospf_vrf_suffix(device_id)}",
                                 " no graceful-restart",
                                 "exit"
                             ])
@@ -436,7 +468,7 @@ def configure_ospf_neighbor(
         if ipv4_enabled:
             logging.info(f"[OSPF CONFIGURE] Configuring IPv4 OSPF with area {area_id_ipv4}")
             vtysh_commands.extend([
-                "router ospf",
+                f"router ospf{_ospf_vrf_suffix(device_id)}",
             ])
             
             # Set router ID (must be loopback IPv4)
@@ -493,7 +525,7 @@ def configure_ospf_neighbor(
         # Configure IPv6 OSPF if enabled
         if ipv6_enabled:
             vtysh_commands.extend([
-                "router ospf6",
+                f"router ospf6{_ospf_vrf_suffix(device_id)}",
             ])
             
             # Set router ID (must be loopback IPv4)
@@ -659,7 +691,7 @@ def start_ospf_neighbor(device_id: str, ospf_config: Dict[str, Any], device_name
         
         # IPv4-only start: add network statement, no shutdown
         if af_norm in ("ipv4",):
-            vtysh_commands.append("router ospf")
+            vtysh_commands.append(f"router ospf{_ospf_vrf_suffix(device_id)}")
             vtysh_commands.append(" no shutdown")
         if ipv4_enabled and ipv4_network:
             vtysh_commands.append(f" network {ipv4_network} area {area_id}")
@@ -678,7 +710,7 @@ def start_ospf_neighbor(device_id: str, ospf_config: Dict[str, Any], device_name
         # Start both (legacy behavior)
         else:
             # IPv4
-            vtysh_commands.append("router ospf")
+            vtysh_commands.append(f"router ospf{_ospf_vrf_suffix(device_id)}")
             vtysh_commands.append(" no shutdown")
             if ipv4_enabled and ipv4_network:
                 vtysh_commands.append(f" network {ipv4_network} area {area_id}")
@@ -845,7 +877,7 @@ def stop_ospf_neighbor(device_id: str, device_name: str = None, af: str = None) 
 
         # IPv4-only stop: remove network statements, avoid global shutdown
         if af_norm in ("ipv4",):
-            vtysh_commands.append("router ospf")
+            vtysh_commands.append(f"router ospf{_ospf_vrf_suffix(device_id)}")
             if ipv4_enabled and ipv4_network:
                 vtysh_commands.append(f" no network {ipv4_network} area {area_id}")
                 logging.info(f"[OSPF STOP] (IPv4) Removing network: {ipv4_network} area {area_id}")
@@ -865,7 +897,7 @@ def stop_ospf_neighbor(device_id: str, device_name: str = None, af: str = None) 
         # Stop both (legacy behavior)
         else:
             # IPv4
-            vtysh_commands.append("router ospf")
+            vtysh_commands.append(f"router ospf{_ospf_vrf_suffix(device_id)}")
         if ipv4_enabled and ipv4_network:
             vtysh_commands.append(f" no network {ipv4_network} area {area_id}")
             logging.info(f"[OSPF STOP] Removing network: {ipv4_network} area {area_id}")
@@ -875,7 +907,7 @@ def stop_ospf_neighbor(device_id: str, device_name: str = None, af: str = None) 
             # IPv6
             if ipv6_enabled:
                 vtysh_commands.extend([
-                    "router ospf6",
+                    f"router ospf6{_ospf_vrf_suffix(device_id)}",
                     " shutdown",
                     "exit",
                     f"interface {interface}",
@@ -1257,7 +1289,7 @@ def build_ospf_cmd(device_id, iface, config):
         f"interface {iface}",
         f"  ip ospf area {area_id}",
         f"exit",
-        "router ospf",
+        f"router ospf{_ospf_vrf_suffix(device_id)}",
         f"  network 0.0.0.0/0 area {area_id}"
     ]
 
@@ -1277,7 +1309,7 @@ def build_ospf_stop_cmd(device_id, iface):
         f"interface {iface}",
         f"  no ip ospf area {area_id}",
         "exit",
-        "no router ospf",
+        f"no router ospf{_ospf_vrf_suffix(device_id)}",
         "write"
     ]
     return ['vtysh'] + [f'-c "{line}"' for line in cmds]
