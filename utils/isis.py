@@ -64,13 +64,21 @@ def get_isis_status(device_id: str, device_name: str, container_id: str) -> Dict
     """
     try:
         import subprocess
-        
+
+        # Scope ISIS show commands to the device's VRF so we read
+        # state from the right isisd instance. Same rationale as the
+        # BGP/OSPF status-query fixes — without the `vrf <name>`
+        # qualifier the queries hit the default-VRF instance which
+        # has no IS-IS configured in our per-device-VRF model.
+        _scope = _isis_vrf_suffix(device_id).strip()  # "vrf <name>" or ""
+        _scope_suffix = f" {_scope}" if _scope else ""
+
         # Get ISIS neighbor details
-        neighbor_cmd = f"docker exec {container_id} vtysh -c 'sh isis nei det json'"
+        neighbor_cmd = f"docker exec {container_id} vtysh -c 'sh isis{_scope_suffix} nei det json'"
         neighbor_result = subprocess.run(neighbor_cmd, shell=True, capture_output=True, text=True, timeout=10)
-        
+
         # Get ISIS summary
-        summary_cmd = f"docker exec {container_id} vtysh -c 'sh isis summary json'"
+        summary_cmd = f"docker exec {container_id} vtysh -c 'sh isis{_scope_suffix} summary json'"
         summary_result = subprocess.run(summary_cmd, shell=True, capture_output=True, text=True, timeout=10)
         
         isis_status = {

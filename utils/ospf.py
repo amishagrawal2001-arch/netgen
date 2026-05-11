@@ -37,6 +37,19 @@ def _ospf_vrf_suffix(device_id: Optional[str]) -> str:
         logging.debug(f"[OSPF VRF] suffix lookup failed for {device_id}: {exc}")
     return ""
 
+
+def _ospf_show_scope(device_id: Optional[str]) -> str:
+    """Return the VRF clause to inject into `show ip ospf …` /
+    `show ipv6 ospf6 …` commands so we hit the device's per-device
+    ospfd instance, not the (empty) default-VRF one.
+
+    Same pattern as BGP's _bgp_vtysh_scope: `vrf <name>` when the
+    device's VRF iface exists, else `` (no qualifier — default VRF,
+    preserves single-device legacy behaviour).
+    """
+    suffix = _ospf_vrf_suffix(device_id).strip()  # strip leading space
+    return suffix  # already starts with "vrf <name>" or is ""
+
 def normalize_ospf_area_id(area_id: str) -> str:
     """
     Normalize OSPF area ID to dotted decimal format for comparison.
@@ -1053,11 +1066,16 @@ def get_ospf_status(device_id: str) -> Optional[Dict[str, Any]]:
             logging.warning(f"[OSPF STATUS] Container {container_name} not found for device {device_id}")
             return None
         
-        # Get OSPF neighbor information for both IPv4 and IPv6
+        # Get OSPF neighbor information for both IPv4 and IPv6.
+        # Scope queries to the device's VRF so we read the right
+        # ospfd instance (the default VRF has no OSPF process in our
+        # per-device-VRF deployment model).
         neighbors = []
-        
+        _scope = _ospf_show_scope(device_id)
+        _scope_suffix = f" {_scope}" if _scope else ""
+
         # Get IPv4 OSPF neighbors
-        result_ipv4 = container.exec_run("vtysh -c 'show ip ospf neighbor'")
+        result_ipv4 = container.exec_run(f"vtysh -c 'show ip ospf{_scope_suffix} neighbor'")
         if result_ipv4.exit_code == 0:
             output_ipv4 = result_ipv4.output.decode()
             
@@ -1098,7 +1116,8 @@ def get_ospf_status(device_id: str) -> Optional[Dict[str, Any]]:
                         })
         
         # Get IPv6 OSPF neighbors
-        result_ipv6 = container.exec_run("vtysh -c 'show ipv6 ospf6 neighbor'")
+        # OSPF6 syntax for VRF: `show ipv6 ospf6 vrf <name> neighbor`
+        result_ipv6 = container.exec_run(f"vtysh -c 'show ipv6 ospf6{_scope_suffix} neighbor'")
         if result_ipv6.exit_code == 0:
             output_ipv6 = result_ipv6.output.decode()
             
@@ -1138,11 +1157,11 @@ def get_ospf_status(device_id: str) -> Optional[Dict[str, Any]]:
                         })
         
         # Get OSPF summary for IPv4
-        result_ipv4_summary = container.exec_run("vtysh -c 'show ip ospf'")
+        result_ipv4_summary = container.exec_run(f"vtysh -c 'show ip ospf{_scope_suffix}'")
         ospf_ipv4_summary = result_ipv4_summary.output.decode() if result_ipv4_summary.exit_code == 0 else ""
         
         # Get OSPF summary for IPv6
-        result_ipv6_summary = container.exec_run("vtysh -c 'show ipv6 ospf6'")
+        result_ipv6_summary = container.exec_run(f"vtysh -c 'show ipv6 ospf6{_scope_suffix}'")
         ospf_ipv6_summary = result_ipv6_summary.output.decode() if result_ipv6_summary.exit_code == 0 else ""
         logging.debug(f"[OSPF STATUS] IPv6 summary exit_code: {result_ipv6_summary.exit_code}, output length: {len(ospf_ipv6_summary)}")
         
