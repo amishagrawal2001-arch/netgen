@@ -23,7 +23,12 @@ from utils.devices_tab_isis import ISISHandler
 from utils.devices_tab_dhcp import DHCPHandler
 from utils.devices_tab_vxlan import VXLANHandler
 from .add_device_dialog import AddDeviceDialog
-from .unified_add_device_dialog import UnifiedAddDeviceDialog
+# Audit MED #7: removed `from .unified_add_device_dialog import
+# UnifiedAddDeviceDialog`. The class was imported here but never
+# instantiated anywhere in the codebase, and its form contained
+# placeholder labels like "(Use existing AddDeviceDialog form)" —
+# a partial migration that was never finished. Keeping the file
+# around as orphan code for now; remove later if no one revives it.
 from .add_bgp_dialog import AddBgpDialog
 from .add_ospf_dialog import AddOspfDialog
 from .add_isis_dialog import AddIsisDialog
@@ -415,14 +420,24 @@ class MultiDeviceApplyWorker(QThread):
                 success = self.parent_tab._apply_device_to_server_sync(self.server_url, device_info)
                 
                 if success:
-                    # Mark device as applied
-                    device_info["_is_new"] = False
-                    device_info["_needs_apply"] = False
-                    device_info["Status"] = "Running"
-                    
+                    # Mark device as applied. device_mutate_lock
+                    # serializes this with any concurrent Edit / Remove
+                    # on the same device dict in the main thread —
+                    # audit MED #9.
+                    lock = getattr(self.parent_tab, "device_mutate_lock", None)
+                    if lock is not None:
+                        with lock:
+                            device_info["_is_new"] = False
+                            device_info["_needs_apply"] = False
+                            device_info["Status"] = "Running"
+                    else:
+                        device_info["_is_new"] = False
+                        device_info["_needs_apply"] = False
+                        device_info["Status"] = "Running"
+
                     # Protocol configuration is now handled in _apply_device_to_server_sync
                     # No need for duplicate calls here
-                    
+
                     message = f"✅ {device_name}: Device applied successfully"
                     self.device_applied.emit(device_name, True, message)
                     return (message, True)
@@ -1480,6 +1495,18 @@ class DevicesTab(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
+
+        # Audit MED #9: worker threads (MultiDeviceApplyWorker via a
+        # ThreadPoolExecutor of 5) mutate device_info dicts that the
+        # main thread also reads/writes (Edit dialog Save, Remove,
+        # the on_cell_changed inline-edit handler). Python dict ops
+        # are individually GIL-safe but cross-thread Edit-during-Apply
+        # could clobber each other's writes (last-writer-wins with
+        # surprising ordering). RLock both sides take when mutating
+        # a device_info dict so updates are serialized. The lock
+        # window is microseconds (3 dict assigns); negligible UI
+        # impact while ensuring no torn state.
+        self.device_mutate_lock = __import__("threading").RLock()
 
         # Caching layer for status results (5 second TTL)
         self.arp_cache = StatusCache(ttl_seconds=5)
@@ -3753,7 +3780,27 @@ class DevicesTab(QWidget):
 
     # ---------- Dialogs / actions ----------
     def apply_selected_device(self):
-        """Apply only the selected devices to the server."""
+        """[ORPHAN — DO NOT CALL DIRECTLY] Apply selected devices SYNCHRONOUSLY.
+
+        Audit MED #10: this method runs a fully-synchronous for-loop
+        with requests.post(timeout=30) per device — applying 10 devices
+        freezes the UI for up to 5 minutes. The Apply button is NOT
+        wired here (it goes through apply_selected_device_with_arp →
+        ... → apply_selected_device_silent, which uses the
+        MultiDeviceApplyWorker QThread). This sync method has no
+        in-tree callers and is preserved only as a defensive
+        emergency path if someone reaches it via getattr or a
+        dynamic UI binding.
+
+        For programmatic apply, call apply_selected_device_silent()
+        instead — same logic, runs in a worker thread with parallel
+        per-device execution (ThreadPoolExecutor, max_workers=5).
+        """
+        logger.warning(
+            "[DEPRECATED] apply_selected_device() called directly. "
+            "This blocks the UI thread. Use "
+            "apply_selected_device_silent() (worker-threaded) instead."
+        )
         selected_items = self.devices_table.selectedItems()
         if not selected_items:
             QMessageBox.warning(self, "No Selection", "Please select one or more devices to apply.")
@@ -4268,15 +4315,33 @@ class DevicesTab(QWidget):
                 if row is not None:
                     ipv4_item = self.devices_table.item(row, self.COL.get("IPv4", -1))
                     mask_item = self.devices_table.item(row, self.COL.get("IPv4 Mask", -1))
+                    # Audit MED #12: the previous except branch did
+                    # `return True` on parse failure, silently accepting
+                    # the gateway as valid even if the IPv4 or mask
+                    # cells were malformed. We can't actually verify
+                    # subnet membership if we can't parse the IP or
+                    # mask, so the safe call is to LEAVE the result
+                    # at "valid format" (the gateway itself parsed
+                    # above) and skip the membership check. Same
+                    # net behavior but without claiming "yes valid"
+                    # explicitly — fall through to the final return
+                    # True below.
                     try:
-                        ip_addr = ipaddress.IPv4Address(ipv4_item.text().strip()) if ipv4_item and ipv4_item.text().strip() else None
-                        mask = int(mask_item.text().strip()) if mask_item and mask_item.text().strip() else None
-                        if ip_addr and mask is not None:
-                            network = ipaddress.IPv4Network(f"{ip_addr}/{mask}", strict=False)
+                        ip_text = ipv4_item.text().strip() if ipv4_item else ""
+                        mask_text = mask_item.text().strip() if mask_item else ""
+                        if ip_text and mask_text:
+                            ip_addr = ipaddress.IPv4Address(ip_text)
+                            mask = int(mask_text)
+                            network = ipaddress.IPv4Network(
+                                f"{ip_addr}/{mask}", strict=False
+                            )
                             if gateway_ip not in network:
                                 return False
                     except (ipaddress.AddressValueError, ValueError):
-                        return True
+                        # Can't determine subnet — leave the gateway
+                        # at "format-valid" without asserting
+                        # membership. Fall through.
+                        pass
                 return True
 
             if header_name == "IPv6 Gateway":
@@ -4290,15 +4355,20 @@ class DevicesTab(QWidget):
                 if row is not None:
                     ipv6_item = self.devices_table.item(row, self.COL.get("IPv6", -1))
                     mask_item = self.devices_table.item(row, self.COL.get("IPv6 Mask", -1))
+                    # Same fix as IPv4 Gateway above (audit MED #12).
                     try:
-                        ip_addr = ipaddress.IPv6Address(ipv6_item.text().strip()) if ipv6_item and ipv6_item.text().strip() else None
-                        mask = int(mask_item.text().strip()) if mask_item and mask_item.text().strip() else None
-                        if ip_addr and mask is not None:
-                            network = ipaddress.IPv6Network(f"{ip_addr}/{mask}", strict=False)
+                        ip_text = ipv6_item.text().strip() if ipv6_item else ""
+                        mask_text = mask_item.text().strip() if mask_item else ""
+                        if ip_text and mask_text:
+                            ip_addr = ipaddress.IPv6Address(ip_text)
+                            mask = int(mask_text)
+                            network = ipaddress.IPv6Network(
+                                f"{ip_addr}/{mask}", strict=False
+                            )
                             if gateway_ip not in network:
                                 return False
                     except (ipaddress.AddressValueError, ValueError):
-                        return True
+                        pass
                 return True
 
             if header_name == "MAC Address":
@@ -4308,6 +4378,21 @@ class DevicesTab(QWidget):
                 return bool(re.match(r"^([0-9A-Fa-f]{2}[:-]){5}([0-9A-Fa-f]{2})$", value))
 
             if header_name == "Status":
+                # Audit MED #12: this used to return False
+                # unconditionally — every inline edit to the Status
+                # column would be silently reverted. Status is meant
+                # to be a server-driven display field (Running /
+                # Stopped / Starting), not a user-editable one;
+                # rejecting all edits is technically correct but is
+                # confusing because the cell still LOOKS editable.
+                # Keep returning False (don't accept user edits) but
+                # do it explicitly + with a debug log so future
+                # readers know it's intentional. Long-term fix is
+                # to mark the cell non-editable in update_device_table.
+                logger.debug(
+                    "[validate_cell_value] Rejected user edit to Status "
+                    "column (display-only, server-driven)"
+                )
                 return False
 
             return True
@@ -6140,47 +6225,56 @@ class DevicesTab(QWidget):
                 "ipv6": old_ipv6
             }
 
-        # Update device in data structure
-        device_info.update({
-            "Device Name": new_name or device_name,
-            "Interface": iface,
-            "MAC Address": mac,
-            "IPv4": ipv4,
-            "IPv6": ipv6,
-            "VLAN": vlan,
-            "MTU": mtu or "1500",  # MTU field, default to 1500
-            "Gateway": ipv4_gateway,  # Use IPv4 gateway as primary gateway
-            "IPv4 Gateway": ipv4_gateway,
-            "IPv6 Gateway": ipv6_gateway,
-            "ipv4_mask": ipv4_mask,
-            "ipv6_mask": ipv6_mask,
-            "Loopback IPv4": loopback_ipv4 if loopback_ipv4 else "",
-            "Loopback IPv6": loopback_ipv6 if loopback_ipv6 else "",
-            "_needs_apply": True  # Mark for server update
-        })
-        
-        # Update protocol configs if provided (but don't overwrite existing if not provided)
-        if ospf_config:
-            device_info["ospf_config"] = ospf_config
-            if "OSPF" not in device_info.get("protocols", []):
-                device_info.setdefault("protocols", []).append("OSPF")
-        
-        if bgp_config:
-            device_info["bgp_config"] = bgp_config
-            if "BGP" not in device_info.get("protocols", []):
-                device_info.setdefault("protocols", []).append("BGP")
-        
-        if dhcp_config:
-            device_info["dhcp_config"] = dhcp_config
-            device_info["dhcp_mode"] = (dhcp_config.get("mode") or "client").lower()
-            if "DHCP" not in device_info.get("protocols", []):
-                device_info.setdefault("protocols", []).append("DHCP")
-        
-        if isis_config:
-            device_info["isis_config"] = isis_config
-            if "IS-IS" not in device_info.get("protocols", []):
-                device_info.setdefault("protocols", []).append("IS-IS")
+        # Update device in data structure. Held under device_mutate_lock
+        # so a concurrent MultiDeviceApplyWorker mutation on the same
+        # device doesn't race with our Edit-Save dict updates (audit
+        # MED #9). The lock window covers the bulk update + the
+        # subsequent protocol RMW operations so the device's state
+        # transitions atomically from the worker's POV.
+        with self.device_mutate_lock:
+            device_info.update({
+                "Device Name": new_name or device_name,
+                "Interface": iface,
+                "MAC Address": mac,
+                "IPv4": ipv4,
+                "IPv6": ipv6,
+                "VLAN": vlan,
+                "MTU": mtu or "1500",  # MTU field, default to 1500
+                "Gateway": ipv4_gateway,  # Use IPv4 gateway as primary gateway
+                "IPv4 Gateway": ipv4_gateway,
+                "IPv6 Gateway": ipv6_gateway,
+                "ipv4_mask": ipv4_mask,
+                "ipv6_mask": ipv6_mask,
+                "Loopback IPv4": loopback_ipv4 if loopback_ipv4 else "",
+                "Loopback IPv6": loopback_ipv6 if loopback_ipv6 else "",
+                "_needs_apply": True  # Mark for server update
+            })
 
+            # Update protocol configs if provided (but don't overwrite existing if not provided)
+            if ospf_config:
+                device_info["ospf_config"] = ospf_config
+                if "OSPF" not in device_info.get("protocols", []):
+                    device_info.setdefault("protocols", []).append("OSPF")
+
+            if bgp_config:
+                device_info["bgp_config"] = bgp_config
+                if "BGP" not in device_info.get("protocols", []):
+                    device_info.setdefault("protocols", []).append("BGP")
+
+            if dhcp_config:
+                device_info["dhcp_config"] = dhcp_config
+                device_info["dhcp_mode"] = (dhcp_config.get("mode") or "client").lower()
+                if "DHCP" not in device_info.get("protocols", []):
+                    device_info.setdefault("protocols", []).append("DHCP")
+
+            if isis_config:
+                device_info["isis_config"] = isis_config
+                if "IS-IS" not in device_info.get("protocols", []):
+                    device_info.setdefault("protocols", []).append("IS-IS")
+
+        # Lock released — VXLAN normalization touches helpers that
+        # don't need the lock, and the subsequent assignments are
+        # single-key writes that are individually GIL-safe.
         normalized_edit_vxlan = self._with_vxlan_interfaces(
             new_vxlan_config,
             iface,
@@ -7086,27 +7180,69 @@ class DevicesTab(QWidget):
         """Open dialog to attach route pools to selected BGP neighbors (Step 2: Attach to BGP)."""
         return self.bgp_handler.prompt_attach_route_pools()
     def _check_arp_resolution_sync(self, device_info):
-        """Check if ARP/Neighbor resolution is working for the device's target from database."""
+        """Check if ARP/Neighbor resolution is working for the device's target from database.
+
+        Audit MED #11: this used to call `requests.get(timeout=(3,15))`
+        directly on the UI thread. populate_device_table calls
+        add_device per device, which calls this per device — opening
+        a session with 30 devices froze the UI for up to ~9 minutes
+        worst case while sync HTTP calls drained.
+
+        Now wraps the HTTP call in a one-shot QThread that pumps a
+        local QEventLoop — same pattern as
+        traffic_client.stream_logic._post_traffic_async / _get_async.
+        Call sites read identically (sync-looking, returns
+        (bool, str)) but the UI keeps repainting while the request
+        is in flight.
+        """
         import requests
-        
+        from PyQt5.QtCore import QThread, QEventLoop
+
         device_name = device_info.get("Device Name", "Unknown")
         device_id = device_info.get("device_id", "")
-        
+
         iface_label = device_info.get("Interface", "")
         if not iface_label:
             return False, "No interface configured"
-        
+
         # Get server URL from the interface label
         server_url = self._get_server_url_from_interface(iface_label)
         if not server_url:
             return False, "No server URL found for interface"
-        
-        # Get ARP status from database instead of direct server check
+
+        # Run the HTTP call off the UI thread via QThread + QEventLoop.
+        class _ArpGetWorker(QThread):
+            def __init__(self, url):
+                super().__init__()
+                self._url = url
+                self.response = None
+                self.error = None
+
+            def run(self):
+                try:
+                    self.response = requests.get(self._url, timeout=(3, 15))
+                except Exception as exc:
+                    self.error = exc
+
+        url = f"{server_url}/api/device/database/devices/{device_id}"
+        loop = QEventLoop()
+        worker = _ArpGetWorker(url)
+        worker.finished.connect(loop.quit)
+        worker.start()
+        loop.exec_()
+        worker.wait()
+        # Release the thread resource immediately rather than relying
+        # on Python GC. Matches the _post_traffic_async pattern.
+        worker.deleteLater()
+
+        # Adapt back to a fake-Response-style local: existing code below
+        # uses `response.status_code` and `response.json()`. If the
+        # worker hit a transport error, surface it the same way the
+        # original code's try/except did.
         try:
-            # Increased timeout: (connect_timeout, read_timeout) to handle slow database operations
-            # Connect timeout of 3s fails fast if server is unreachable
-            # Read timeout of 15s allows for slow database queries
-            response = requests.get(f"{server_url}/api/device/database/devices/{device_id}", timeout=(3, 15))
+            if worker.error is not None:
+                raise worker.error
+            response = worker.response
             if response.status_code == 200:
                 device_data = response.json()
                 

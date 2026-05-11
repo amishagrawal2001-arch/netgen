@@ -57,7 +57,13 @@ class DeviceDatabase:
                      /opt/OSTG/device_database.db fallback.
         """
         self.db_path = db_path or _resolve_db_path()
-        self.backup_path = f"{db_path}.backup"
+        # Audit MED #13: previously read `f"{db_path}.backup"` BEFORE
+        # the `or _resolve_db_path()` had resolved a default, so when
+        # the caller passed db_path=None the backup path was literally
+        # the string "None.backup" (a junk relative path in CWD).
+        # Use self.db_path (post-resolution) so the backup lives
+        # next to the actual database file.
+        self.backup_path = f"{self.db_path}.backup"
         self.ensure_db_directory()
         self.init_database()
         logger.info(f"[DEVICE DB] Initialized database at {self.db_path}")

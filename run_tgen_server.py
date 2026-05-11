@@ -34,6 +34,60 @@ from utils import vxlan as vxlan_utils
 # Initialize Flask app and CORS
 app = Flask(__name__)
 
+
+# =============================================================================
+# Optional bearer-token auth (audit MED #8)
+# =============================================================================
+# The traffic + device API endpoints are unauthenticated by default —
+# fine for an internal-lab dev box, but a serious surface when the
+# server reaches anything beyond a trusted segment. This middleware
+# adds OPT-IN bearer-token auth gated on an env var so existing
+# zero-friction setups aren't disrupted.
+#
+#   - Default behavior (NETGEN_AUTH_TOKEN unset):  no auth required,
+#     identical to legacy behavior.
+#   - With NETGEN_AUTH_TOKEN=<secret>:  every request to /api/* must
+#     carry `Authorization: Bearer <secret>` or it gets 401.
+#
+# Paths exempted regardless of token state:
+#   /admin and its subpaths (the single-page web UI handles its
+#       own session in a future revision)
+#   /api/health (so a load balancer probe doesn't need the token)
+#
+# Set the token on the server side via systemd EnvironmentFile or a
+# launch-script export. The client picks it up the same way.
+_AUTH_TOKEN = os.environ.get("NETGEN_AUTH_TOKEN", "").strip()
+_AUTH_EXEMPT_PREFIXES = ("/admin", "/api/health")
+
+
+@app.before_request
+def _require_bearer_token():
+    """Reject API requests missing the bearer token, when one is set.
+
+    No-op when NETGEN_AUTH_TOKEN is unset (default), so this is fully
+    backward-compatible until an operator opts in by setting the env
+    var. CORS preflight (OPTIONS) is always allowed through.
+    """
+    if not _AUTH_TOKEN:
+        return None
+    if request.method == "OPTIONS":
+        return None
+    path = request.path or ""
+    if not path.startswith("/api/"):
+        return None
+    if any(path.startswith(p) for p in _AUTH_EXEMPT_PREFIXES):
+        return None
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return jsonify({"ok": False, "error": "Missing bearer token"}), 401
+    presented = auth[len("Bearer "):].strip()
+    # constant-time compare to avoid leaking length / prefix info
+    import hmac as _hmac
+    if not _hmac.compare_digest(presented, _AUTH_TOKEN):
+        return jsonify({"ok": False, "error": "Invalid bearer token"}), 401
+    return None
+
+
 # Global request/response logging to help trace API calls (including ISIS)
 @app.before_request
 def _log_request_info():
