@@ -31,7 +31,10 @@ class ISISHandler:
     def setup_isis_subtab(self):
         """Setup the ISIS sub-tab with ISIS-specific functionality."""
         layout = QVBoxLayout(self.parent.isis_subtab)
-        
+        # Tight chrome — see BGP subtab for rationale.
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(2)
+
         # ISIS Neighbors Table with requested columns
         isis_headers = ["Device", "ISIS Status", "Neighbor Type", "Neighbor Hostname", "Interface", "ISIS Area", "Level", "ISIS Net", "System ID", "Hello Interval", "Multiplier"]
         self.parent.isis_table = QTableWidget(0, len(isis_headers))

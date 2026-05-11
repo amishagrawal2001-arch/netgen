@@ -675,6 +675,9 @@ class DHCPHandler:
     def setup_dhcp_subtab(self):
         """Initialise the DHCP subtabs with table and controls."""
         layout = QVBoxLayout(self.parent.dhcp_subtab)
+        # Tight chrome — see BGP subtab for rationale.
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(2)
 
         headers = [
             "Device",

@@ -41,6 +41,9 @@ class VXLANHandler:
 
     def setup_vxlan_subtab(self):
         layout = QVBoxLayout(self.parent.vxlan_subtab)
+        # Tight chrome — see BGP subtab for rationale.
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(2)
 
         table_headers = [
             "Device",

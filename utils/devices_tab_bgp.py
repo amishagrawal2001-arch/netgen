@@ -31,7 +31,12 @@ class BGPHandler:
     def setup_bgp_subtab(self):
         """Setup the BGP sub-tab with BGP-specific functionality."""
         layout = QVBoxLayout(self.parent.bgp_subtab)
-        
+        # Tight chrome — matches the Devices tab so the action bar
+        # sits flush against the bottom edge of the panel instead of
+        # floating with default Qt margins (~11px on each side).
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(2)
+
         # BGP Neighbors Table - each neighbor IP gets its own row
         bgp_headers = ["Device", "BGP Status", "Neighbor Type", "Neighbor IP", "Source IP", "BGP Local AS", "BGP Remote AS", "State", "Routes", "Route Pools", "Keepalive", "Hold-time"]
         self.parent.bgp_table = QTableWidget(0, len(bgp_headers))

@@ -31,9 +31,12 @@ class OSPFHandler:
     def setup_ospf_subtab(self):
         """Setup the OSPF sub-tab with OSPF-specific functionality."""
         from utils.qicon_loader import qicon
-        
+
         layout = QVBoxLayout(self.parent.ospf_subtab)
-        
+        # Tight chrome — see BGP subtab for rationale.
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(2)
+
         # OSPF Neighbors Table
         ospf_headers = ["Device", "OSPF Status", "Area ID", "Neighbor Type", "Interface", "Neighbor ID", "State", "Priority", "Dead Timer", "Uptime", "Graceful Restart", "P2P", "Route Pools"]
         self.parent.ospf_table = QTableWidget(0, len(ospf_headers))
