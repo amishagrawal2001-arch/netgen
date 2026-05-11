@@ -3291,10 +3291,35 @@ def apply_device():
         # Step 4: Configure IPv6 address
         if ipv6 and ipv6_mask:
             try:
+                # CRITICAL: Make sure IPv6 is actually enabled on this iface
+                # before we try to add an address. Many hosts ship with
+                # `net.ipv6.conf.default.disable_ipv6 = 1` (Ubuntu's
+                # cloud-init / hardening profiles do this), and every newly-
+                # created VLAN subinterface inherits that default → the
+                # kernel silently refuses `ip -6 addr add` and the user
+                # later sees "ping6 fails, ARP/ND never resolves" with no
+                # obvious cause. We flip it on for our iface only; not
+                # changing the system-wide default keeps the rest of the
+                # host's policy untouched.
+                # keep_addr_on_down=1 makes sure the IPv6 address survives
+                # the brief admin-down that happens when the iface is moved
+                # into the device's VRF master a moment later.
+                try:
+                    subprocess.run([
+                        "sysctl", "-q", "-w",
+                        f"net.ipv6.conf.{iface_name_for_commands}.disable_ipv6=0",
+                        f"net.ipv6.conf.{iface_name_for_commands}.keep_addr_on_down=1",
+                    ], capture_output=True, text=True, timeout=3)
+                except Exception as _sysctl_exc:
+                    logging.debug(
+                        f"[DEVICE APPLY] non-fatal: could not toggle IPv6 sysctls "
+                        f"on {iface_name_for_commands}: {_sysctl_exc}"
+                    )
+
                 # Remove existing IPv6 address if any
-                subprocess.run(["ip", "addr", "del", f"{ipv6}/{ipv6_mask}", "dev", iface_name_for_commands], 
+                subprocess.run(["ip", "addr", "del", f"{ipv6}/{ipv6_mask}", "dev", iface_name_for_commands],
                              capture_output=True, text=True, timeout=5)
-                
+
                 # Add new IPv6 address
                 ipv6_result = subprocess.run([
                     "ip", "addr", "add", f"{ipv6}/{ipv6_mask}", "dev", iface_name_for_commands
