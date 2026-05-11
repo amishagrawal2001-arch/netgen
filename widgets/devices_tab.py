@@ -7996,9 +7996,24 @@ class DevicesTab(QWidget):
             logger.error(f"Error handling result: {e}")
     
     def _on_device_apply_error(self, operation_type, error_message):
-        """Handle device apply error from background worker."""
+        """Handle device apply error from background worker.
+
+        Used by the single-device async path (`_apply_device_to_server`
+        → DatabaseQueryWorker). Until now this was log-only, so the
+        user got no visible signal — including for the server's HTTP
+        409 "(interface, vlan) already in use" gate. Now we also pop
+        a dialog so the message reaches the user.
+        """
         try:
             logger.error(f"❌ Device apply failed: {error_message}")
+            try:
+                # Trim very long messages so the dialog stays readable.
+                body = str(error_message or "").strip()
+                if len(body) > 800:
+                    body = body[:800] + "…"
+                QMessageBox.warning(self, "Device apply failed", body or "Unknown error")
+            except Exception as _dlg_exc:
+                logger.warning(f"Could not show apply-error dialog: {_dlg_exc}")
         except Exception as e:
             logger.error(f"Error handling error: {e}")
     
@@ -8088,6 +8103,32 @@ class DevicesTab(QWidget):
                 for result in results:
                     logger.info(f"  {result}")
                 logger.debug(f"{'='*60}\n")
+
+            # Surface failures to the user. Previously the only signal
+            # an apply had failed was a logger.info() line nobody reads;
+            # specific cases like the server's HTTP 409 "(interface,
+            # vlan) already in use" gate were effectively silent. Show
+            # one aggregated dialog so multi-device batches don't
+            # produce a popup storm.
+            if failed_count > 0 and results:
+                # results entries from MultiDeviceApplyWorker look like:
+                #   "❌ <name>: Failed to apply to server - <server error>"
+                # or "✅ <name>: ..." on success. Filter to the failures.
+                failures = [r for r in results if isinstance(r, str) and r.lstrip().startswith("❌")]
+                if failures:
+                    body_lines = failures[:8]  # cap so the dialog stays readable
+                    overflow = len(failures) - len(body_lines)
+                    body = "\n\n".join(body_lines)
+                    if overflow > 0:
+                        body += f"\n\n…and {overflow} more (see logs)."
+                    title = (
+                        "Device apply failed" if failed_count == 1
+                        else f"{failed_count} devices failed to apply"
+                    )
+                    try:
+                        QMessageBox.warning(self, title, body)
+                    except Exception as _dlg_exc:
+                        logger.warning(f"Could not show apply-failure dialog: {_dlg_exc}")
             
             # Check if any applied devices had VXLAN configuration (before worker is deleted)
             vxlan_applied = False
