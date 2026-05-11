@@ -46,93 +46,105 @@ class OSPFHandler:
         # Connect cell changed signal for inline editing
         self.parent.ospf_table.cellChanged.connect(self.on_ospf_table_cell_changed)
         
-        layout.addWidget(QLabel("OSPF Neighbors"))
+        # Section header removed — tab name + column headers carry it.
         layout.addWidget(self.parent.ospf_table)
         
-        # OSPF Controls
-        ospf_controls = QHBoxLayout()
-        
-        # Add OSPF button
+        # OSPF action bar — unified chrome with the Devices + BGP rows
+        # (grey footer QFrame, BTN_BASE / BTN_APPLY styles, 28×24 px
+        # buttons, vertical divider between config and runtime groups).
+        from PyQt5.QtWidgets import QFrame
+        from PyQt5.QtCore import Qt
+        action_bar = QFrame()
+        action_bar.setStyleSheet(
+            "QFrame { background-color: #f3f4f6; "
+            "border-top: 1px solid #e5e7eb; border-radius: 0; }"
+        )
+        ospf_controls = QHBoxLayout(action_bar)
+        ospf_controls.setAlignment(Qt.AlignLeft)
+        ospf_controls.setSpacing(6)
+        ospf_controls.setContentsMargins(6, 4, 6, 4)
+
+        BTN_BASE = (
+            "QPushButton {"
+            "  border: 1px solid #cbd5e1;"
+            "  border-radius: 5px;"
+            "  background-color: #ffffff;"
+            "  padding: 0px;"
+            "}"
+            "QPushButton:hover { background-color: #f1f5f9; border-color: #94a3b8; }"
+            "QPushButton:pressed { background-color: #e2e8f0; }"
+            "QPushButton:disabled { background-color: #f9fafb; border-color: #e5e7eb; }"
+        )
+        BTN_APPLY = (
+            "QPushButton {"
+            "  border: 1px solid #2563eb;"
+            "  border-radius: 5px;"
+            "  background-color: #ffffff;"
+            "  color: #1d4ed8;"
+            "  padding: 0px;"
+            "}"
+            "QPushButton:hover { background-color: #eff6ff; border-color: #1d4ed8; }"
+            "QPushButton:pressed { background-color: #dbeafe; }"
+        )
+        BTN_W, BTN_H, ICON_PX = 28, 24, 14
+
         def load_icon(filename: str) -> QIcon:
             return qicon("resources", f"icons/{filename}")
-        
-        self.parent.add_ospf_button = QPushButton()
-        self.parent.add_ospf_button.setIcon(load_icon("add.png"))
-        self.parent.add_ospf_button.setIconSize(QSize(16, 16))
-        self.parent.add_ospf_button.setFixedSize(32, 28)
-        self.parent.add_ospf_button.setToolTip("Add OSPF")
+
+        def _ospf_btn(icon_name, tooltip, style=BTN_BASE):
+            b = QPushButton()
+            if icon_name:
+                b.setIcon(load_icon(icon_name))
+                b.setIconSize(QSize(ICON_PX, ICON_PX))
+            b.setFixedSize(BTN_W, BTN_H)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setToolTip(tooltip)
+            b.setStyleSheet(style)
+            return b
+
+        # Config group (left)
+        self.parent.add_ospf_button           = _ospf_btn("add.png",     "Add OSPF")
+        self.parent.edit_ospf_button          = _ospf_btn("edit.png",    "Edit OSPF Configuration")
+        self.parent.delete_ospf_button        = _ospf_btn("remove.png",  "Delete OSPF Configuration")
+        self.parent.attach_route_pools_button = _ospf_btn("readd.png",   "Attach Route Pools to OSPF Device")
+        self.parent.detach_route_pools_button = _ospf_btn("remove.png",  "Detach Route Pools from OSPF Device")
+
+        # Runtime group (right)
+        self.parent.apply_ospf_button   = _ospf_btn("apply.png",   "Apply Selected OSPF Configurations to Server", style=BTN_APPLY)
+        self.parent.ospf_start_button   = _ospf_btn("start.png",   "Start OSPF")
+        self.parent.ospf_stop_button    = _ospf_btn("stop.png",    "Stop OSPF")
+        self.parent.ospf_refresh_button = _ospf_btn("refresh.png", "Refresh OSPF Status")
+
+        # Wire signals
         self.parent.add_ospf_button.clicked.connect(self.prompt_add_ospf)
-        
-        self.parent.edit_ospf_button = QPushButton()
-        self.parent.edit_ospf_button.setIcon(load_icon("edit.png"))
-        self.parent.edit_ospf_button.setIconSize(QSize(16, 16))
-        self.parent.edit_ospf_button.setFixedSize(32, 28)
-        self.parent.edit_ospf_button.setToolTip("Edit OSPF Configuration")
         self.parent.edit_ospf_button.clicked.connect(self.prompt_edit_ospf)
-        
-        self.parent.delete_ospf_button = QPushButton()
-        self.parent.delete_ospf_button.setIcon(load_icon("remove.png"))
-        self.parent.delete_ospf_button.setIconSize(QSize(16, 16))
-        self.parent.delete_ospf_button.setFixedSize(32, 28)
-        self.parent.delete_ospf_button.setToolTip("Delete OSPF Configuration")
         self.parent.delete_ospf_button.clicked.connect(self.prompt_delete_ospf)
-        
-        self.parent.ospf_refresh_button = QPushButton()
-        self.parent.ospf_refresh_button.setIcon(load_icon("refresh.png"))
-        self.parent.ospf_refresh_button.setIconSize(QSize(16, 16))
-        self.parent.ospf_refresh_button.setFixedSize(32, 28)
-        self.parent.ospf_refresh_button.setToolTip("Refresh/Update OSPF Table (Read-only, no server changes)")
-        self.parent.ospf_refresh_button.clicked.connect(self.refresh_ospf_status)
-        
-        # OSPF Start/Stop buttons
-        self.parent.ospf_start_button = QPushButton()
-        self.parent.ospf_start_button.setIcon(load_icon("start.png"))
-        self.parent.ospf_start_button.setIconSize(QSize(16, 16))
-        self.parent.ospf_start_button.setFixedSize(32, 28)
-        self.parent.ospf_start_button.setToolTip("Start OSPF")
-        self.parent.ospf_start_button.clicked.connect(self.start_ospf_protocol)
-        
-        self.parent.ospf_stop_button = QPushButton()
-        self.parent.ospf_stop_button.setIcon(load_icon("stop.png"))
-        self.parent.ospf_stop_button.setIconSize(QSize(16, 16))
-        self.parent.ospf_stop_button.setFixedSize(32, 28)
-        self.parent.ospf_stop_button.setToolTip("Stop OSPF")
-        self.parent.ospf_stop_button.clicked.connect(self.stop_ospf_protocol)
-        
-        self.parent.apply_ospf_button = QPushButton()
-        self.parent.apply_ospf_button.setIcon(load_icon("apply.png"))
-        self.parent.apply_ospf_button.setIconSize(QSize(16, 16))
-        self.parent.apply_ospf_button.setFixedSize(32, 28)
-        self.parent.apply_ospf_button.setToolTip("Apply Selected OSPF Configurations to Server (Multiple selections supported)")
-        self.parent.apply_ospf_button.clicked.connect(self.apply_ospf_configurations)
-        
-        # Attach Route Pools button (in OSPF tab - device-specific)
-        self.parent.attach_route_pools_button = QPushButton()
-        self.parent.attach_route_pools_button.setIcon(load_icon("readd.png"))
-        self.parent.attach_route_pools_button.setIconSize(QSize(16, 16))
-        self.parent.attach_route_pools_button.setFixedSize(32, 28)
-        self.parent.attach_route_pools_button.setToolTip("Attach Route Pools to OSPF Device")
         self.parent.attach_route_pools_button.clicked.connect(self.prompt_attach_route_pools)
-        
-        # Detach Route Pools button (in OSPF tab - device-specific)
-        self.parent.detach_route_pools_button = QPushButton()
-        self.parent.detach_route_pools_button.setIcon(load_icon("remove.png"))
-        self.parent.detach_route_pools_button.setIconSize(QSize(16, 16))
-        self.parent.detach_route_pools_button.setFixedSize(32, 28)
-        self.parent.detach_route_pools_button.setToolTip("Detach Route Pools from OSPF Device")
         self.parent.detach_route_pools_button.clicked.connect(self.prompt_detach_route_pools)
-        
-        ospf_controls.addWidget(self.parent.add_ospf_button)
-        ospf_controls.addWidget(self.parent.edit_ospf_button)
-        ospf_controls.addWidget(self.parent.delete_ospf_button)
-        ospf_controls.addWidget(self.parent.apply_ospf_button)
-        ospf_controls.addWidget(self.parent.ospf_start_button)
-        ospf_controls.addWidget(self.parent.ospf_stop_button)
-        ospf_controls.addWidget(self.parent.ospf_refresh_button)
-        ospf_controls.addWidget(self.parent.attach_route_pools_button)
-        ospf_controls.addWidget(self.parent.detach_route_pools_button)
-        ospf_controls.addStretch()
-        layout.addLayout(ospf_controls)
+        self.parent.apply_ospf_button.clicked.connect(self.apply_ospf_configurations)
+        self.parent.ospf_start_button.clicked.connect(self.start_ospf_protocol)
+        self.parent.ospf_stop_button.clicked.connect(self.stop_ospf_protocol)
+        self.parent.ospf_refresh_button.clicked.connect(self.refresh_ospf_status)
+
+        for b in (self.parent.add_ospf_button, self.parent.edit_ospf_button,
+                  self.parent.delete_ospf_button,
+                  self.parent.attach_route_pools_button,
+                  self.parent.detach_route_pools_button):
+            ospf_controls.addWidget(b)
+
+        sep = QLabel()
+        sep.setFixedSize(1, BTN_H)
+        sep.setStyleSheet("background-color: #cbd5e1; margin: 0 6px;")
+        ospf_controls.addSpacing(4)
+        ospf_controls.addWidget(sep)
+        ospf_controls.addSpacing(4)
+
+        for b in (self.parent.apply_ospf_button, self.parent.ospf_start_button,
+                  self.parent.ospf_stop_button, self.parent.ospf_refresh_button):
+            ospf_controls.addWidget(b)
+
+        ospf_controls.addStretch(1)
+        layout.addWidget(action_bar)
     
     def refresh_ospf_status(self):
         """Refresh OSPF neighbor status.

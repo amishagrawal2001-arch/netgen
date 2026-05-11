@@ -48,88 +48,106 @@ class BGPHandler:
         # Connect cell changed signal for handling checkbox changes
         self.parent.bgp_table.cellChanged.connect(self.on_bgp_table_cell_changed)
         
-        layout.addWidget(QLabel("BGP Neighbors"))
+        # Section header removed — tab name + column headers carry it.
         layout.addWidget(self.parent.bgp_table)
         
-        # BGP Controls
-        bgp_controls = QHBoxLayout()
-        
-        # Helper function to load icons
+        # BGP action bar — same chrome as the Devices action row
+        # (grey footer QFrame, BTN_BASE / BTN_APPLY styles, 28×24 px
+        # buttons, vertical divider between config and runtime
+        # groups). Previously this was a bare QHBoxLayout of stock
+        # QPushButtons at 32×28 with no background, which looked like
+        # a different application from the rest of the tab.
+        from PyQt5.QtWidgets import QFrame
+        from PyQt5.QtCore import Qt
+        action_bar = QFrame()
+        action_bar.setStyleSheet(
+            "QFrame { background-color: #f3f4f6; "
+            "border-top: 1px solid #e5e7eb; border-radius: 0; }"
+        )
+        bgp_controls = QHBoxLayout(action_bar)
+        bgp_controls.setAlignment(Qt.AlignLeft)
+        bgp_controls.setSpacing(6)
+        bgp_controls.setContentsMargins(6, 4, 6, 4)
+
+        BTN_BASE = (
+            "QPushButton {"
+            "  border: 1px solid #cbd5e1;"
+            "  border-radius: 5px;"
+            "  background-color: #ffffff;"
+            "  padding: 0px;"
+            "}"
+            "QPushButton:hover { background-color: #f1f5f9; border-color: #94a3b8; }"
+            "QPushButton:pressed { background-color: #e2e8f0; }"
+            "QPushButton:disabled { background-color: #f9fafb; border-color: #e5e7eb; }"
+        )
+        BTN_APPLY = (
+            "QPushButton {"
+            "  border: 1px solid #2563eb;"
+            "  border-radius: 5px;"
+            "  background-color: #ffffff;"
+            "  color: #1d4ed8;"
+            "  padding: 0px;"
+            "}"
+            "QPushButton:hover { background-color: #eff6ff; border-color: #1d4ed8; }"
+            "QPushButton:pressed { background-color: #dbeafe; }"
+        )
+        BTN_W, BTN_H, ICON_PX = 28, 24, 14
+
         def load_icon(filename: str) -> QIcon:
             from utils.qicon_loader import qicon
             return qicon("resources", f"icons/{filename}")
-        
-        # Add BGP button
-        self.parent.add_bgp_button = QPushButton()
-        self.parent.add_bgp_button.setIcon(load_icon("add.png"))
-        self.parent.add_bgp_button.setIconSize(QSize(16, 16))
-        self.parent.add_bgp_button.setFixedSize(32, 28)
-        self.parent.add_bgp_button.setToolTip("Add BGP")
+
+        def _bgp_btn(icon_name, tooltip, style=BTN_BASE):
+            b = QPushButton()
+            if icon_name:
+                b.setIcon(load_icon(icon_name))
+                b.setIconSize(QSize(ICON_PX, ICON_PX))
+            b.setFixedSize(BTN_W, BTN_H)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setToolTip(tooltip)
+            b.setStyleSheet(style)
+            return b
+
+        # Config group (left)
+        self.parent.add_bgp_button            = _bgp_btn("add.png",     "Add BGP")
+        self.parent.edit_bgp_button           = _bgp_btn("edit.png",    "Edit BGP Configuration")
+        self.parent.delete_bgp_button         = _bgp_btn("remove.png",  "Delete BGP Configuration")
+        self.parent.attach_route_pools_button = _bgp_btn("readd.png",   "Attach Route Pools to BGP Neighbor")
+
+        # Runtime group (right)
+        self.parent.apply_bgp_button   = _bgp_btn("apply.png",   "Apply BGP configurations to server", style=BTN_APPLY)
+        self.parent.bgp_start_button   = _bgp_btn("start.png",   "Start BGP")
+        self.parent.bgp_stop_button    = _bgp_btn("stop.png",    "Stop BGP")
+        self.parent.bgp_refresh_button = _bgp_btn("refresh.png", "Refresh BGP Status")
+
+        # Wire signals
         self.parent.add_bgp_button.clicked.connect(self.parent.prompt_add_bgp)
-        
-        # Edit BGP button
-        self.parent.edit_bgp_button = QPushButton()
-        self.parent.edit_bgp_button.setIcon(load_icon("edit.png"))
-        self.parent.edit_bgp_button.setIconSize(QSize(16, 16))
-        self.parent.edit_bgp_button.setFixedSize(32, 28)
-        self.parent.edit_bgp_button.setToolTip("Edit BGP Configuration")
         self.parent.edit_bgp_button.clicked.connect(self.parent.prompt_edit_bgp)
-        
-        # Delete BGP button
-        self.parent.delete_bgp_button = QPushButton()
-        self.parent.delete_bgp_button.setIcon(load_icon("remove.png"))
-        self.parent.delete_bgp_button.setIconSize(QSize(16, 16))
-        self.parent.delete_bgp_button.setFixedSize(32, 28)
-        self.parent.delete_bgp_button.setToolTip("Delete BGP Configuration")
         self.parent.delete_bgp_button.clicked.connect(self.parent.prompt_delete_bgp)
-        
-        # Refresh BGP Status button
-        self.parent.bgp_refresh_button = QPushButton()
-        self.parent.bgp_refresh_button.setIcon(load_icon("refresh.png"))
-        self.parent.bgp_refresh_button.setFixedSize(32, 28)
-        self.parent.bgp_refresh_button.setToolTip("Refresh BGP Status")
-        self.parent.bgp_refresh_button.clicked.connect(self.parent.refresh_bgp_status)
-        
-        
-        # Apply BGP button
-        self.parent.apply_bgp_button = QPushButton()
-        self.parent.apply_bgp_button.setIcon(load_icon("apply.png"))
-        self.parent.apply_bgp_button.setFixedSize(32, 28)
-        self.parent.apply_bgp_button.setToolTip("Apply BGP configurations to server")
-        self.parent.apply_bgp_button.clicked.connect(self.parent.apply_bgp_configurations)
-        
-        # BGP Start/Stop buttons
-        self.parent.bgp_start_button = QPushButton()
-        self.parent.bgp_start_button.setIcon(load_icon("start.png"))
-        self.parent.bgp_start_button.setIconSize(QSize(16, 16))
-        self.parent.bgp_start_button.setFixedSize(32, 28)
-        self.parent.bgp_start_button.setToolTip("Start BGP")
-        self.parent.bgp_start_button.clicked.connect(self.parent.start_bgp_protocol)
-        
-        self.parent.bgp_stop_button = QPushButton()
-        self.parent.bgp_stop_button.setIcon(load_icon("stop.png"))
-        self.parent.bgp_stop_button.setIconSize(QSize(16, 16))
-        self.parent.bgp_stop_button.setFixedSize(32, 28)
-        self.parent.bgp_stop_button.setToolTip("Stop BGP")
-        self.parent.bgp_stop_button.clicked.connect(self.parent.stop_bgp_protocol)
-        
-        # Attach Route Pools button (in BGP tab - neighbor-specific)
-        self.parent.attach_route_pools_button = QPushButton()
-        self.parent.attach_route_pools_button.setIcon(load_icon("readd.png"))
-        self.parent.attach_route_pools_button.setFixedSize(32, 28)
-        self.parent.attach_route_pools_button.setToolTip("Attach Route Pools to BGP Neighbor")
         self.parent.attach_route_pools_button.clicked.connect(self.parent.prompt_attach_route_pools)
-        
-        bgp_controls.addWidget(self.parent.add_bgp_button)
-        bgp_controls.addWidget(self.parent.edit_bgp_button)
-        bgp_controls.addWidget(self.parent.delete_bgp_button)
-        bgp_controls.addWidget(self.parent.attach_route_pools_button)
-        bgp_controls.addWidget(self.parent.apply_bgp_button)
-        bgp_controls.addWidget(self.parent.bgp_start_button)
-        bgp_controls.addWidget(self.parent.bgp_stop_button)
-        bgp_controls.addWidget(self.parent.bgp_refresh_button)
-        bgp_controls.addStretch()
-        layout.addLayout(bgp_controls)
+        self.parent.apply_bgp_button.clicked.connect(self.parent.apply_bgp_configurations)
+        self.parent.bgp_start_button.clicked.connect(self.parent.start_bgp_protocol)
+        self.parent.bgp_stop_button.clicked.connect(self.parent.stop_bgp_protocol)
+        self.parent.bgp_refresh_button.clicked.connect(self.parent.refresh_bgp_status)
+
+        # Layout: config | sep | runtime  (matches Devices action row)
+        for b in (self.parent.add_bgp_button, self.parent.edit_bgp_button,
+                  self.parent.delete_bgp_button, self.parent.attach_route_pools_button):
+            bgp_controls.addWidget(b)
+
+        sep = QLabel()
+        sep.setFixedSize(1, BTN_H)
+        sep.setStyleSheet("background-color: #cbd5e1; margin: 0 6px;")
+        bgp_controls.addSpacing(4)
+        bgp_controls.addWidget(sep)
+        bgp_controls.addSpacing(4)
+
+        for b in (self.parent.apply_bgp_button, self.parent.bgp_start_button,
+                  self.parent.bgp_stop_button, self.parent.bgp_refresh_button):
+            bgp_controls.addWidget(b)
+
+        bgp_controls.addStretch(1)
+        layout.addWidget(action_bar)
 
 
     def refresh_bgp_status(self):

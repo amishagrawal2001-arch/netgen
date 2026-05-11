@@ -57,80 +57,98 @@ class ISISHandler:
         # Connect cell changed signal for inline editing
         self.parent.isis_table.cellChanged.connect(self.on_isis_table_cell_changed)
         
-        layout.addWidget(QLabel("ISIS Neighbors"))
+        # Section header removed — tab name + column headers carry it.
         layout.addWidget(self.parent.isis_table)
         
-        # ISIS Controls
-        isis_controls = QHBoxLayout()
-        
-        # Helper function to load icons
+        # IS-IS action bar — unified chrome with Devices + BGP + OSPF.
+        from PyQt5.QtWidgets import QFrame
+        from PyQt5.QtCore import Qt
+        action_bar = QFrame()
+        action_bar.setStyleSheet(
+            "QFrame { background-color: #f3f4f6; "
+            "border-top: 1px solid #e5e7eb; border-radius: 0; }"
+        )
+        isis_controls = QHBoxLayout(action_bar)
+        isis_controls.setAlignment(Qt.AlignLeft)
+        isis_controls.setSpacing(6)
+        isis_controls.setContentsMargins(6, 4, 6, 4)
+
+        BTN_BASE = (
+            "QPushButton {"
+            "  border: 1px solid #cbd5e1;"
+            "  border-radius: 5px;"
+            "  background-color: #ffffff;"
+            "  padding: 0px;"
+            "}"
+            "QPushButton:hover { background-color: #f1f5f9; border-color: #94a3b8; }"
+            "QPushButton:pressed { background-color: #e2e8f0; }"
+            "QPushButton:disabled { background-color: #f9fafb; border-color: #e5e7eb; }"
+        )
+        BTN_APPLY = (
+            "QPushButton {"
+            "  border: 1px solid #2563eb;"
+            "  border-radius: 5px;"
+            "  background-color: #ffffff;"
+            "  color: #1d4ed8;"
+            "  padding: 0px;"
+            "}"
+            "QPushButton:hover { background-color: #eff6ff; border-color: #1d4ed8; }"
+            "QPushButton:pressed { background-color: #dbeafe; }"
+        )
+        BTN_W, BTN_H, ICON_PX = 28, 24, 14
+
         def load_icon(filename: str) -> QIcon:
             from utils.qicon_loader import qicon
             return qicon("resources", f"icons/{filename}")
-        
-        # Add ISIS button
-        self.parent.add_isis_button = QPushButton()
-        self.parent.add_isis_button.setIcon(load_icon("add.png"))
-        self.parent.add_isis_button.setIconSize(QSize(16, 16))
-        self.parent.add_isis_button.setFixedSize(32, 28)
-        self.parent.add_isis_button.setToolTip("Add IS-IS")
+
+        def _isis_btn(icon_name, tooltip, style=BTN_BASE):
+            b = QPushButton()
+            if icon_name:
+                b.setIcon(load_icon(icon_name))
+                b.setIconSize(QSize(ICON_PX, ICON_PX))
+            b.setFixedSize(BTN_W, BTN_H)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setToolTip(tooltip)
+            b.setStyleSheet(style)
+            return b
+
+        # Config group (left)
+        self.parent.add_isis_button     = _isis_btn("add.png",    "Add IS-IS")
+        self.parent.edit_isis_button    = _isis_btn("edit.png",   "Edit ISIS Configuration")
+        self.parent.delete_isis_button  = _isis_btn("remove.png", "Delete ISIS Configuration")
+
+        # Runtime group (right)
+        self.parent.apply_isis_button   = _isis_btn("apply.png",   "Apply ISIS configurations to server", style=BTN_APPLY)
+        self.parent.isis_start_button   = _isis_btn("start.png",   "Start IS-IS")
+        self.parent.isis_stop_button    = _isis_btn("stop.png",    "Stop IS-IS")
+        self.parent.isis_refresh_button = _isis_btn("refresh.png", "Refresh ISIS Status")
+
+        # Wire signals
         self.parent.add_isis_button.clicked.connect(self.prompt_add_isis)
-        
-        # Edit ISIS button
-        self.parent.edit_isis_button = QPushButton()
-        self.parent.edit_isis_button.setIcon(load_icon("edit.png"))
-        self.parent.edit_isis_button.setIconSize(QSize(16, 16))
-        self.parent.edit_isis_button.setFixedSize(32, 28)
-        self.parent.edit_isis_button.setToolTip("Edit ISIS Configuration")
         self.parent.edit_isis_button.clicked.connect(self.prompt_edit_isis)
-        
-        # Delete ISIS button
-        self.parent.delete_isis_button = QPushButton()
-        self.parent.delete_isis_button.setIcon(load_icon("remove.png"))
-        self.parent.delete_isis_button.setIconSize(QSize(16, 16))
-        self.parent.delete_isis_button.setFixedSize(32, 28)
-        self.parent.delete_isis_button.setToolTip("Delete ISIS Configuration")
         self.parent.delete_isis_button.clicked.connect(self.prompt_delete_isis)
-        
-        # ISIS refresh button with icon
-        self.parent.isis_refresh_button = QPushButton()
-        self.parent.isis_refresh_button.setIcon(load_icon("refresh.png"))
-        self.parent.isis_refresh_button.setIconSize(QSize(16, 16))
-        self.parent.isis_refresh_button.setFixedSize(32, 28)
-        self.parent.isis_refresh_button.setToolTip("Refresh ISIS Status")
-        self.parent.isis_refresh_button.clicked.connect(self.refresh_isis_status)
-        
-        # Apply ISIS button
-        self.parent.apply_isis_button = QPushButton()
-        self.parent.apply_isis_button.setIcon(load_icon("apply.png"))
-        self.parent.apply_isis_button.setFixedSize(32, 28)
-        self.parent.apply_isis_button.setToolTip("Apply ISIS configurations to server")
         self.parent.apply_isis_button.clicked.connect(self.apply_isis_configurations)
-        
-        # IS-IS Start/Stop buttons
-        self.parent.isis_start_button = QPushButton()
-        self.parent.isis_start_button.setIcon(load_icon("start.png"))
-        self.parent.isis_start_button.setIconSize(QSize(16, 16))
-        self.parent.isis_start_button.setFixedSize(32, 28)
-        self.parent.isis_start_button.setToolTip("Start IS-IS")
         self.parent.isis_start_button.clicked.connect(self.start_isis_protocol)
-        
-        self.parent.isis_stop_button = QPushButton()
-        self.parent.isis_stop_button.setIcon(load_icon("stop.png"))
-        self.parent.isis_stop_button.setIconSize(QSize(16, 16))
-        self.parent.isis_stop_button.setFixedSize(32, 28)
-        self.parent.isis_stop_button.setToolTip("Stop IS-IS")
         self.parent.isis_stop_button.clicked.connect(self.stop_isis_protocol)
-        
-        isis_controls.addWidget(self.parent.add_isis_button)
-        isis_controls.addWidget(self.parent.edit_isis_button)
-        isis_controls.addWidget(self.parent.delete_isis_button)
-        isis_controls.addWidget(self.parent.apply_isis_button)
-        isis_controls.addWidget(self.parent.isis_start_button)
-        isis_controls.addWidget(self.parent.isis_stop_button)
-        isis_controls.addWidget(self.parent.isis_refresh_button)
-        isis_controls.addStretch()
-        layout.addLayout(isis_controls)
+        self.parent.isis_refresh_button.clicked.connect(self.refresh_isis_status)
+
+        for b in (self.parent.add_isis_button, self.parent.edit_isis_button,
+                  self.parent.delete_isis_button):
+            isis_controls.addWidget(b)
+
+        sep = QLabel()
+        sep.setFixedSize(1, BTN_H)
+        sep.setStyleSheet("background-color: #cbd5e1; margin: 0 6px;")
+        isis_controls.addSpacing(4)
+        isis_controls.addWidget(sep)
+        isis_controls.addSpacing(4)
+
+        for b in (self.parent.apply_isis_button, self.parent.isis_start_button,
+                  self.parent.isis_stop_button, self.parent.isis_refresh_button):
+            isis_controls.addWidget(b)
+
+        isis_controls.addStretch(1)
+        layout.addWidget(action_bar)
 
 
     def prompt_edit_isis(self):
