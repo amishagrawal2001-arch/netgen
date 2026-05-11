@@ -1921,8 +1921,9 @@ class DevicesTab(QWidget):
         
         # Connect cell changed signal for handling checkbox changes
         self.bgp_table.cellChanged.connect(self.on_bgp_table_cell_changed)
-        
-        layout.addWidget(QLabel("BGP Neighbors"))
+
+        # Section header removed — the BGP tab itself + table column
+        # names already make it clear what's shown.
         layout.addWidget(self.bgp_table)
         
         # BGP Controls
@@ -2022,8 +2023,8 @@ class DevicesTab(QWidget):
         
         # Connect cell changed signal for inline editing
         self.ospf_table.cellChanged.connect(self.on_ospf_table_cell_changed)
-        
-        layout.addWidget(QLabel("OSPF Neighbors"))
+
+        # Section header removed — see BGP block for rationale.
         layout.addWidget(self.ospf_table)
         
         # OSPF Controls
@@ -2125,8 +2126,8 @@ class DevicesTab(QWidget):
         
         # Connect cell changed signal for inline editing
         self.isis_table.cellChanged.connect(self.on_isis_table_cell_changed)
-        
-        layout.addWidget(QLabel("ISIS Neighbors"))
+
+        # Section header removed — see BGP block for rationale.
         layout.addWidget(self.isis_table)
         
         # ISIS Controls
