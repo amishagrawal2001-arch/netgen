@@ -86,28 +86,35 @@ class BGPStatusMonitor:
     def _monitor_loop(self):
         """Main monitoring loop."""
         logger.info("[BGP MONITOR] Monitoring loop started")
-        
+
+        # Startup settle — see same pattern in utils/arp_monitor.py.
+        # Avoid spamming ERROR-level "Connection refused" while Flask
+        # is still coming up on :5050 inside the same process.
+        if self.stop_event.wait(5):
+            return
+        self._startup_window_until = time.monotonic() + 25
+
         while not self.stop_event.is_set():
             try:
                 # Get all devices with BGP protocol
                 devices = self._get_bgp_devices()
-                
+
                 if devices:
                     logger.info(f"[BGP MONITOR] Checking BGP status for {len(devices)} devices")
                     self._check_bgp_status_batch(devices)
                 else:
                     logger.debug("[BGP MONITOR] No BGP devices found")
-                
+
                 # Wait for next check interval
                 if self.stop_event.wait(self.check_interval):
                     break
-                    
+
             except Exception as e:
                 logger.error(f"[BGP MONITOR] Error in monitoring loop: {e}")
                 # Continue monitoring even if there's an error
                 if self.stop_event.wait(5):  # Wait 5 seconds before retrying
                     break
-        
+
         logger.info("[BGP MONITOR] Monitoring loop ended")
     
     def _get_bgp_devices(self) -> List[Dict[str, Any]]:
@@ -233,7 +240,14 @@ class BGPStatusMonitor:
                 return None
                 
         except requests.exceptions.RequestException as e:
-            logger.error(f"[BGP MONITOR] Request error checking BGP status for device {device_id}: {e}")
+            is_startup_blip = (
+                isinstance(e, requests.exceptions.ConnectionError)
+                and time.monotonic() < getattr(self, "_startup_window_until", 0)
+            )
+            if is_startup_blip:
+                logger.debug(f"[BGP MONITOR] startup-window connection-refused for {device_id}; ignoring")
+            else:
+                logger.error(f"[BGP MONITOR] Request error checking BGP status for device {device_id}: {e}")
             return None
         except Exception as e:
             logger.error(f"[BGP MONITOR] Error checking BGP status for device {device_id}: {e}")
