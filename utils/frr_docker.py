@@ -184,6 +184,102 @@ class FRRDockerManager:
     # were removed; if you ever need an isolated FRR netns again, the
     # right tool is a docker macvlan or a custom netns, not a bridge.
 
+    # ---------------------------------------------------------------
+    # VRF lifecycle — multi-device-on-same-interface isolation
+    # ---------------------------------------------------------------
+    # Each device gets its own Linux VRF. The device's interface
+    # (physical NIC or VLAN subinterface) is moved into the VRF as
+    # kernel master; FRR config then carries a matching `vrf <name>`
+    # keyword on `router bgp`, `router ospf`, etc. Result: bgpd in
+    # container A binds TCP/179 inside vrf-A, container B's bgpd
+    # binds TCP/179 inside vrf-B — no port collision in the host
+    # netns. Same logic gives OSPF and IS-IS independent socket
+    # spaces per device.
+    #
+    # The single-device case is still correct: it just runs in its
+    # own VRF (an extra routing table, no observable change).
+
+    VRF_TABLE_BASE = 1000  # Linux routing table ids start here for our VRFs
+
+    def _vrf_name(self, device_id: str) -> str:
+        """Stable VRF name for a device. Linux iface names cap at 15
+        chars, so we use the first 11 hex chars of the device id."""
+        if not device_id:
+            return "vrf-default"
+        short = str(device_id).replace("-", "")[:11] or "default"
+        return f"vrf-{short}"
+
+    def _vrf_table(self, device_id: str) -> int:
+        """Deterministic per-device routing-table id (1000..1999)."""
+        import hashlib
+        h = hashlib.md5(str(device_id or "").encode()).hexdigest()[:8]
+        return self.VRF_TABLE_BASE + (int(h, 16) % 1000)
+
+    def _create_vrf(self, device_id: str, iface_name: str) -> Optional[str]:
+        """Create the VRF for a device and move the iface into it.
+
+        Returns the VRF name on success, None on failure. Idempotent:
+        re-running on an existing VRF/iface is fine.
+        """
+        vrf_name = self._vrf_name(device_id)
+        vrf_table = self._vrf_table(device_id)
+        try:
+            # 1. Create the VRF interface (idempotent)
+            create = subprocess.run(
+                ["ip", "link", "add", vrf_name, "type", "vrf", "table", str(vrf_table)],
+                capture_output=True, text=True,
+            )
+            if create.returncode != 0 and "File exists" not in create.stderr:
+                logger.error(f"[VRF] create {vrf_name} failed: {create.stderr.strip()}")
+                return None
+            # 2. Bring the VRF up
+            subprocess.run(["ip", "link", "set", vrf_name, "up"],
+                           capture_output=True, text=True)
+            # 3. Move the iface into the VRF (only if not already there)
+            #    `ip link show <iface>` master field tells us current owner.
+            show = subprocess.run(["ip", "-o", "link", "show", iface_name],
+                                  capture_output=True, text=True)
+            already_in_vrf = f"master {vrf_name}" in (show.stdout or "")
+            if not already_in_vrf:
+                attach = subprocess.run(
+                    ["ip", "link", "set", iface_name, "master", vrf_name],
+                    capture_output=True, text=True,
+                )
+                if attach.returncode != 0:
+                    logger.error(
+                        f"[VRF] attach {iface_name} to {vrf_name} failed: {attach.stderr.strip()}"
+                    )
+                    return None
+            logger.info(
+                f"[VRF] device {device_id}: {iface_name} → {vrf_name} (table {vrf_table})"
+            )
+            return vrf_name
+        except Exception as exc:
+            logger.error(f"[VRF] _create_vrf({device_id}, {iface_name}): {exc}")
+            return None
+
+    def _remove_vrf(self, device_id: str, iface_name: Optional[str] = None) -> bool:
+        """Detach iface from VRF (if known) and delete the VRF.
+        Safe to call when nothing exists."""
+        vrf_name = self._vrf_name(device_id)
+        try:
+            if iface_name:
+                subprocess.run(["ip", "link", "set", iface_name, "nomaster"],
+                               capture_output=True, text=True)
+            subprocess.run(["ip", "link", "del", vrf_name],
+                           capture_output=True, text=True)
+            logger.info(f"[VRF] device {device_id}: removed {vrf_name}")
+            return True
+        except Exception as exc:
+            logger.warning(f"[VRF] _remove_vrf({device_id}): {exc}")
+            return False
+
+    def vrf_name_for_device(self, device_id: str) -> str:
+        """Public accessor — let OSPF/ISIS/BGP configurators in sibling
+        modules look up the device's VRF name without re-implementing
+        the naming convention."""
+        return self._vrf_name(device_id)
+
     def start_frr_container(self, device_id: str, device_config: Dict) -> Optional[str]:
         """Start FRR container on host networking"""
         try:
@@ -222,7 +318,29 @@ class FRRDockerManager:
                 # Interface is required - log error and return None
                 logger.error(f"[FRR] Interface name is required when VLAN is not specified for device {device_id}")
                 return None
-            
+
+            # --- Provision the device's VRF before starting FRR ---------
+            # `iface_name` is the host interface FRR will attach to
+            # (vlanN subif if VLAN-tagged, else the bare NIC). Moving
+            # it into a per-device VRF gives this device's bgpd /
+            # ospfd / isisd their own routing-table + socket-bind
+            # space so a second device on a different VLAN of the
+            # same NIC can coexist. We stash vrf_name back into
+            # device_config so the BGP/OSPF/ISIS configurators below
+            # (and the sibling utils/{bgp,ospf,isis}.py modules) can
+            # emit matching `vrf <name>` keywords on their router
+            # blocks. Failure here is non-fatal — single-device
+            # deployments still work without VRF; we just lose
+            # multi-device isolation.
+            vrf_name = self._create_vrf(device_id, iface_name)
+            if vrf_name:
+                device_config['vrf_name'] = vrf_name
+            else:
+                logger.warning(
+                    f"[FRR] device {device_id}: VRF setup failed, falling back to default VRF "
+                    f"(multi-device-on-{iface_name} will collide on protocol ports)"
+                )
+
             dhcp_mode = (device_config.get('dhcp_mode') or '').lower()
 
             # Get IPv4 and IPv6 addresses from device_config
@@ -460,8 +578,15 @@ class FRRDockerManager:
             # Get MTU from device_config
             mtu = device_config.get('mtu', '1500') if device_config else '1500'
             
-            # Build vtysh commands for interface configuration
+            # Build vtysh commands for interface configuration.
+            # If this device was provisioned into a VRF (multi-device
+            # isolation), bind the interface to that VRF inside FRR
+            # too — FRR needs to mirror the kernel-level VRF master so
+            # protocol daemons resolve neighbors via the right table.
+            vrf_name = (device_config or {}).get('vrf_name') if device_config else None
             vtysh_commands = ["configure terminal", f"interface {iface_name}"]
+            if vrf_name:
+                vtysh_commands.append(f" vrf {vrf_name}")
 
             if ipv4_addr:
                 vtysh_commands.append(f" ip address {ipv4_addr}/{ipv4_mask}")
@@ -845,6 +970,28 @@ class FRRDockerManager:
                     logger.info(f"[FRR] Removing container {container_name}")
                     container.remove(force=True)
                     logger.info(f"[FRR] Container {container_name} removed successfully")
+                    # Only tear down the VRF on a full remove — a plain
+                    # stop is treated as a pause and the VRF should
+                    # survive so the device can resume cleanly. We
+                    # don't know the iface here; nomaster is best-effort
+                    # via _remove_vrf which logs and continues.
+                    try:
+                        # Look up the iface from the device record so we
+                        # can detach it before deleting the VRF.
+                        _iface = None
+                        try:
+                            from utils.device_database import DeviceDatabase
+                            _rec = DeviceDatabase().get_device(device_id) if device_id else None
+                            if _rec:
+                                _stored = (_rec.get("interface") or "").strip()
+                                # Stored form may be "vlanN@base" — strip
+                                # the @base for the kernel iface name.
+                                _iface = _stored.split("@", 1)[0] if _stored else None
+                        except Exception:
+                            _iface = None
+                        self._remove_vrf(device_id, _iface)
+                    except Exception as _vrf_exc:
+                        logger.warning(f"[VRF] cleanup on stop failed for {device_id}: {_vrf_exc}")
                 else:
                     logger.info(f"[FRR] Container {container_name} stopped successfully (not removed)")
             except docker.errors.NotFound:
@@ -889,15 +1036,30 @@ def configure_bgp_neighbor(device_id: str, neighbor_config: Dict, device_name: s
         # Determine protocol from neighbor IP or explicit protocol setting
         protocol = neighbor_config.get('protocol', 'ipv4')
         is_ipv6 = ':' in neighbor_ip or protocol == 'ipv6'
-        
+
+        # If this device was provisioned with a VRF, scope the BGP
+        # instance to it. `router bgp <asn> vrf <name>` makes bgpd
+        # bind TCP/179 inside the VRF table, so multiple devices on
+        # the same host won't collide on the listen socket.
+        # Extract device_id from container_name so we can look up its VRF.
+        device_id = container_name.replace(f"{frr_manager.container_prefix}-", "")
+        vrf_name = neighbor_config.get('vrf_name') or frr_manager.vrf_name_for_device(device_id)
+        # Only use the VRF if it actually exists on the host (lets
+        # legacy non-VRF deployments keep working until the device is
+        # re-applied through the new code path).
+        vrf_exists = False
+        try:
+            _check = subprocess.run(["ip", "-o", "link", "show", vrf_name],
+                                    capture_output=True, text=True)
+            vrf_exists = (_check.returncode == 0 and bool((_check.stdout or "").strip()))
+        except Exception:
+            vrf_exists = False
+        router_bgp_cmd = f"router bgp {local_as} vrf {vrf_name}" if vrf_exists else f"router bgp {local_as}"
+
         commands = [
             "configure terminal",
-            f"router bgp {local_as}",
+            router_bgp_cmd,
         ]
-        
-        # Add BGP router-id (must be loopback IPv4)
-        # Extract device_id from container_name
-        device_id = container_name.replace(f"{frr_manager.container_prefix}-", "")
         # Get router-id (must be loopback IPv4)
         loopback_ipv4 = None
         try:

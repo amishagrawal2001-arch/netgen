@@ -12,6 +12,36 @@ import subprocess
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timezone
 
+
+def _isis_vrf_suffix(device_id: Optional[str]) -> str:
+    """Return ' vrf <name>' if this device has been provisioned with a
+    Linux VRF, else ''.
+
+    Used on the top-level `router isis CORE` block so isisd's RIB and
+    neighbor state for this device land in the device's VRF table.
+    The per-interface `ip router isis CORE` references just bind the
+    iface to the named instance and don't carry a VRF keyword.
+
+    Falls back to no-VRF for legacy deployments that pre-date VRF
+    wiring (kernel VRF iface not present).
+    """
+    if not device_id:
+        return ""
+    try:
+        from utils.frr_docker import FRRDockerManager
+        vrf_name = FRRDockerManager().vrf_name_for_device(device_id)
+        if not vrf_name:
+            return ""
+        check = subprocess.run(
+            ["ip", "-o", "link", "show", vrf_name],
+            capture_output=True, text=True,
+        )
+        if check.returncode == 0 and (check.stdout or "").strip():
+            return f" vrf {vrf_name}"
+    except Exception as exc:
+        logging.debug(f"[ISIS VRF] suffix lookup failed for {device_id}: {exc}")
+    return ""
+
 try:
     import docker.errors
 except ImportError:
@@ -353,8 +383,11 @@ def configure_isis_neighbor(device_id: str, isis_config: Dict[str, Any], device_
         logging.info(f"[ISIS CONFIGURE] About to build ISIS commands - enable_ipv4={enable_ipv4}, enable_ipv6={enable_ipv6}, area_id={area_id}, interface={interface}, frr_level={frr_level}")
         vtysh_commands = [
             "configure terminal",
-            # Configure router-level ISIS first
-            f"router isis CORE",
+            # Configure router-level ISIS first. The optional ` vrf <name>`
+            # suffix scopes this isisd instance to the device's Linux
+            # VRF so multi-device-on-same-NIC deployments don't share
+            # an IS-IS RIB.
+            f"router isis CORE{_isis_vrf_suffix(device_id)}",
             f"is-type {frr_level}",
             f"net {area_id}",
             "exit",
@@ -557,9 +590,11 @@ def start_isis_neighbor(device_id: str, device_name: str, container_id: str, isi
 
         # Ensure router process first, then enable interface (some FRR builds require router before interface attach)
         # Note: Global router-id is configured in frr_docker.py when container is created
+        # VRF suffix scopes the IS-IS instance to the device's Linux
+        # VRF when multi-device-on-same-iface is in use.
         vtysh_commands = [
             "configure terminal",
-            "router isis CORE",
+            f"router isis CORE{_isis_vrf_suffix(device_id)}",
             # Best-effort cleanup of common/default NET before setting desired NET
             "no net 49.0001.0000.0000.0001.00",
             f"is-type {frr_level}",
