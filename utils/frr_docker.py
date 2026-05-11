@@ -1054,30 +1054,68 @@ def cleanup_all_containers() -> int:
     Called from the netgen-cleanup systemd unit on shutdown and from
     `utils/bgp.py` on a global reset. Best-effort: per-container errors
     are logged and skipped. Returns the count actually removed.
+
+    IMPORTANT: only ORPHANED containers get removed — i.e. ones whose
+    device_id no longer matches a row in the device DB. A running OR
+    Exited container that still has a DB record is preserved, because:
+
+      * Running: obviously in use.
+      * Exited: the user explicitly Stopped this device; they expect
+        to be able to Start it again later. If we wiped it on the
+        next netgen-cleanup tick (every 5 minutes), the user reports
+        "Stop is deleting the FRR container" — exactly the symptom
+        that prompted this safer behaviour.
+
+    The DB-membership check is best-effort: if the DB is unreachable
+    we err on the side of caution and skip removal entirely rather
+    than risk wiping live containers.
     """
     removed = 0
     try:
+        # Build a set of known device_ids up front so we don't query
+        # the DB per-container. Fail closed: if we can't read the DB,
+        # don't remove anything.
+        known_device_ids = None
+        try:
+            from utils.device_database import DeviceDatabase
+            known_device_ids = {
+                str(d.get("device_id"))
+                for d in (DeviceDatabase().get_all_devices() or [])
+                if d.get("device_id")
+            }
+        except Exception as db_exc:
+            logger.warning(
+                f"[FRR] cleanup_all_containers: skipping (DB unreadable: {db_exc})"
+            )
+            return 0
+
         client = docker.from_env()
         for c in client.containers.list(all=True):
             name = c.name or ""
             if not any(name.startswith(p) for p in _MANAGED_CONTAINER_PREFIXES):
                 continue
-            # Best-effort VRF teardown alongside the container so we
-            # don't leak Linux VRFs across server restarts. Pull
-            # device_id from the container name and let _remove_vrf
-            # noop if no VRF exists.
+            # Recover the device_id from the container name.
             device_id = None
             for pfx in _MANAGED_CONTAINER_PREFIXES:
                 if name.startswith(pfx):
                     device_id = name[len(pfx):]
                     break
+            # Skip containers that still belong to a live device record
+            # — that's the user-visible Stop/Start lifecycle, not an
+            # orphan.
+            if device_id and device_id in known_device_ids:
+                logger.debug(
+                    f"[FRR] cleanup: keeping {name} (device still in DB)"
+                )
+                continue
             try:
                 c.remove(force=True)
                 removed += 1
-                logger.info(f"[FRR] removed container {name}")
+                logger.info(f"[FRR] cleanup: removed orphaned container {name}")
             except Exception as exc:
                 logger.warning(f"[FRR] failed to remove {name}: {exc}")
             if device_id:
+                # VRF only belongs to an orphan now — safe to drop.
                 try:
                     frr_manager._remove_vrf(device_id, None)
                 except Exception:
