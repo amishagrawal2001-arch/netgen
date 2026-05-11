@@ -18,6 +18,42 @@ from PyQt5.QtCore import Qt, QSize, QTimer
 from utils.qicon_loader import qicon, r_icon
 
 
+def _is_internal_iface(name: str) -> bool:
+    """True for kernel-internal interfaces that should never appear in
+    the TG / Interface picker. Mirrors the server-side filter in
+    run_tgen_server.get_interfaces(); kept client-side too so older
+    servers that haven't been upgraded with the filter don't leak
+    these into the UI.
+
+    Currently rejects:
+      * vrf-<id>  — per-device VRF masters from FRRDockerManager._create_vrf
+                    (devices are configured on the parent NIC / VLAN
+                     subif, not the VRF iface itself)
+    The list is intentionally narrow; the server is the source of
+    truth for the broader filter set (vlan*, docker, br-, veth, etc.).
+    """
+    if not name:
+        return False
+    return name.startswith("vrf-")
+
+
+def _filter_internal_ifaces(ifaces):
+    """Drop entries flagged by _is_internal_iface; tolerant of the
+    server returning either a list of dicts or a list of strings."""
+    if not ifaces:
+        return ifaces
+    out = []
+    for ent in ifaces:
+        if isinstance(ent, dict):
+            if _is_internal_iface(ent.get("name", "")):
+                continue
+        elif isinstance(ent, str):
+            if _is_internal_iface(ent):
+                continue
+        out.append(ent)
+    return out
+
+
 def _make_enabled_cell(initial_state: bool):
     """Build a centred QCheckBox inside a container suitable for a QTableWidget cell.
 
@@ -1125,7 +1161,7 @@ class TrafficGenClientServerSection():
                             else:
                                 response = requests.get(f"{server_address}/api/interfaces", timeout=2)
                             if response.status_code == 200:
-                                interfaces = response.json()
+                                interfaces = _filter_internal_ifaces(response.json())
                                 server["interfaces"] = interfaces  # Store for future use
                                 server["online"] = True
                                 self.update_server_status_icon(server, True)
@@ -1311,7 +1347,7 @@ class TrafficGenClientServerSection():
                     item = self.server_tree.topLevelItem(i)
                     if item.text(1) == server_address:
                         item.takeChildren()
-                        interfaces = response.json()
+                        interfaces = _filter_internal_ifaces(response.json())
                         for interface in interfaces:
                             port_name = interface["name"]
                             full_name = f"TG {server['tg_id']} - {port_name}"

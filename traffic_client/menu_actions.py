@@ -886,7 +886,12 @@ class TrafficGenClientMenuAction():
                 response = requests.get(f"{address}/api/interfaces", timeout=2)
             
             if response.status_code == 200:
-                interfaces = response.json()
+                # Filter kernel-internal ifaces (vrf-* etc.) so they
+                # don't leak into the TG/Interface picker on clients
+                # talking to older servers that haven't been updated
+                # with the same filter. Helper lives in server_section.
+                from traffic_client.server_section import _filter_internal_ifaces
+                interfaces = _filter_internal_ifaces(response.json())
                 server["interfaces"] = interfaces
                 server["online"] = True
                 # Update server tree if it exists
