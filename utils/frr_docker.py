@@ -1218,14 +1218,37 @@ def configure_bgp_neighbor(device_id: str, neighbor_config: Dict, device_name: s
         logger.error(f"[FRR] Failed to configure BGP neighbor for device {device_id}: {e}")
         return False
 
+def _bgp_vtysh_scope(device_id: str) -> str:
+    """Return the `vrf <name>` clause to inject into `show bgp` queries
+    so we hit the device's per-device VRF instance (where the
+    Established session actually lives) instead of the empty default
+    VRF. Falls back to `vrf all` so single-device legacy deployments —
+    which use the default VRF — keep working unchanged.
+    """
+    try:
+        vrf_name = frr_manager.vrf_name_for_device(device_id)
+        if vrf_name:
+            return f"vrf {vrf_name}"
+    except Exception:
+        pass
+    return "vrf all"
+
+
 def get_bgp_status(device_id: str, device_name: str = None) -> Dict:
-    """Get BGP status from FRR container."""
+    """Get BGP status from FRR container.
+
+    Scoped to the device's VRF so multi-device deployments report the
+    session that's actually carrying traffic, not the phantom
+    default-VRF bgpd instance the netgen-frr image creates at startup
+    (which has no neighbors and is never Established).
+    """
     try:
         container_name = frr_manager._get_container_name(device_id, device_name)
         container = frr_manager.client.containers.get(container_name)
-        
-        # Get BGP summary
-        result = container.exec_run("vtysh -c 'show bgp summary'")
+
+        # Get BGP summary, scoped to the device's VRF.
+        scope = _bgp_vtysh_scope(device_id)
+        result = container.exec_run(f"vtysh -c 'show bgp {scope} summary'")
         
         if result.exit_code == 0:
             output_str = result.output.decode('utf-8') if isinstance(result.output, bytes) else str(result.output)
@@ -1251,13 +1274,17 @@ def get_bgp_status(device_id: str, device_name: str = None) -> Dict:
         }
 
 def get_bgp_neighbors(device_id: str, device_name: str = None) -> Dict:
-    """Get BGP neighbors from FRR container."""
+    """Get BGP neighbors from FRR container.
+
+    VRF-scoped — see get_bgp_status for the why.
+    """
     try:
         container_name = frr_manager._get_container_name(device_id, device_name)
         container = frr_manager.client.containers.get(container_name)
-        
-        # Get BGP neighbors
-        result = container.exec_run("vtysh -c 'show bgp neighbors'")
+
+        # Get BGP neighbors, scoped to the device's VRF.
+        scope = _bgp_vtysh_scope(device_id)
+        result = container.exec_run(f"vtysh -c 'show bgp {scope} neighbors'")
         
         if result.exit_code == 0:
             output_str = result.output.decode('utf-8') if isinstance(result.output, bytes) else str(result.output)
