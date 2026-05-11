@@ -487,32 +487,38 @@ class AddDeviceDialog(QDialog):
         ipv4_label = QLabel("IPv4:")
         self.ipv4_octet_combo = QComboBox()
         self.ipv4_octet_combo.addItems(["4th", "3rd", "2nd", "1st"])
-        # Default to the 4th (last) octet — matches the typical "increment
-        # the host portion" expectation (192.168.0.2 → 192.168.0.3 → …).
-        # Previous default was the 2nd octet which silently changed
-        # 192.168.0.2 → 192.169.0.2 and looked broken in the UI.
-        self.ipv4_octet_combo.setCurrentIndex(0)
+        # Default to the 3rd octet — walks the /24 network portion so
+        # each multi-device-on-the-same-NIC gets its own subnet
+        # (192.168.0.2 → 192.168.1.2 → 192.168.2.2), which is the
+        # standard pattern when paired with VLAN increment. Host-portion
+        # (4th octet) increment would put every device on the same L3
+        # network, defeating the point.
+        self.ipv4_octet_combo.setCurrentIndex(1)
         self.ipv4_octet_combo.setFixedWidth(70)
-        self.ipv4_octet_combo.setToolTip("Select which octet to increment (e.g., 192.168.0.X)")
+        self.ipv4_octet_combo.setToolTip("Select which octet to increment (e.g., 192.168.X.2)")
         
         # IPv6 Hextet Selection
         ipv6_label = QLabel("IPv6:")
         self.ipv6_hextet_combo = QComboBox()
         self.ipv6_hextet_combo.addItems(["8th", "7th", "6th", "5th", "4th", "3rd", "2nd", "1st"])
-        # Default to the 8th (last) hextet — natural "::X → ::X+1"
-        # increment. Previous default of "2nd hextet" was unintuitive.
-        self.ipv6_hextet_combo.setCurrentIndex(0)
+        # Default to the 3rd hextet — IPv6 equivalent of varying the
+        # subnet portion of a /48 (so each device lands on its own
+        # /64 within a /48): 2001:db8::1 → 2001:db8:1::1 → 2001:db8:2::1.
+        # Matches the IPv4 "3rd octet" default above.
+        self.ipv6_hextet_combo.setCurrentIndex(5)
         self.ipv6_hextet_combo.setFixedWidth(70)
-        self.ipv6_hextet_combo.setToolTip("Select which hextet to increment (e.g., 2001:db8::X)")
+        self.ipv6_hextet_combo.setToolTip("Select which hextet to increment (e.g., 2001:db8:X::1)")
         
         # MAC Byte Selection
         mac_label = QLabel("MAC:")
         self.mac_byte_combo = QComboBox()
         self.mac_byte_combo.addItems(["6th", "5th", "4th", "3rd", "2nd", "1st"])
-        # Default to the 6th (last) byte — keeps the OUI fixed and only
-        # varies the device-unique tail (00:00:00:11:22:33 → :34 → :35).
-        # Previous default was the 2nd byte which would walk into and
-        # past the OUI.
+        # Default to the 6th (last) byte. Unlike IP, where "network
+        # portion" means a different subnet per device, MAC has no
+        # network/host split — the OUI (first 3 bytes) identifies the
+        # vendor and should stay constant; the last 3 bytes are the
+        # device-unique NIC ID. Walking the last byte keeps the OUI
+        # intact and just enumerates devices (00:11:22:33:44:55 → :56 → …).
         self.mac_byte_combo.setCurrentIndex(0)
         self.mac_byte_combo.setFixedWidth(70)
         self.mac_byte_combo.setToolTip("Select which byte to increment (e.g., 00:11:22:33:44:XX)")
@@ -521,35 +527,35 @@ class AddDeviceDialog(QDialog):
         gateway_label = QLabel("Gateway:")
         self.gateway_octet_combo = QComboBox()
         self.gateway_octet_combo.addItems(["4th", "3rd", "2nd", "1st"])
-        # Default to the 4th (last) octet — same rationale as the IPv4
-        # combo above; matches normal "next-hop" enumeration.
-        self.gateway_octet_combo.setCurrentIndex(0)
+        # Default to the 3rd octet — gateway must move with the device's
+        # subnet, so it matches the IPv4 combo's "3rd octet" default
+        # (192.168.0.1 → 192.168.1.1 → 192.168.2.1).
+        self.gateway_octet_combo.setCurrentIndex(1)
         self.gateway_octet_combo.setFixedWidth(70)
-        self.gateway_octet_combo.setToolTip("Select which octet to increment (e.g., 192.168.0.X)")
+        self.gateway_octet_combo.setToolTip("Select which octet to increment (e.g., 192.168.X.1)")
         
         # Loopback IP Octet/Hextet Selection
         loopback_ipv4_label = QLabel("Loopback IPv4:")
         self.loopback_ipv4_octet_combo = QComboBox()
         self.loopback_ipv4_octet_combo.addItems(["4th", "3rd", "2nd", "1st"])
-        # Combo index 0 maps to the 4th (last) octet — see _increment_ipv4:
-        #   target_octet = 3 - octet_index, so index 0 → octets[3].
-        # The old default of `3` actually picked the 1st octet, which
-        # walked 192.255.0.1 → 193.255.0.1 — almost certainly not what
-        # the user expects when they ask for "increment loopback".
-        self.loopback_ipv4_octet_combo.setCurrentIndex(0)
+        # Default to the 3rd octet — keeps loopback assignment aligned
+        # with the device's subnet pattern (192.255.0.1 → 192.255.1.1 →
+        # 192.255.2.1). Old index `3` mapped to the 1st octet and the
+        # comment claiming "4th octet" was simply wrong.
+        self.loopback_ipv4_octet_combo.setCurrentIndex(1)
         self.loopback_ipv4_octet_combo.setFixedWidth(70)
-        self.loopback_ipv4_octet_combo.setToolTip("Select which octet to increment for loopback IPv4 (e.g., 192.255.0.X)")
+        self.loopback_ipv4_octet_combo.setToolTip("Select which octet to increment for loopback IPv4 (e.g., 192.255.X.1)")
 
         loopback_ipv6_label = QLabel("Loopback IPv6:")
         self.loopback_ipv6_hextet_combo = QComboBox()
         self.loopback_ipv6_hextet_combo.addItems(["8th", "7th", "6th", "5th", "4th", "3rd", "2nd", "1st"])
-        # Combo index 0 maps to the 8th (last) hextet — see
-        # _increment_ipv6: target_hextet = 7 - hextet_index. The old
-        # default of `7` picked the 1st hextet (2001 → 2002), opposite
-        # of the intent expressed by the comment.
-        self.loopback_ipv6_hextet_combo.setCurrentIndex(0)
+        # Default to the 3rd hextet — IPv6 counterpart of the loopback
+        # IPv4 "3rd octet" default; varies the network portion so each
+        # device gets a distinct /64 loopback range. Old index `7`
+        # mapped to the 1st hextet, opposite of its comment's intent.
+        self.loopback_ipv6_hextet_combo.setCurrentIndex(5)
         self.loopback_ipv6_hextet_combo.setFixedWidth(70)
-        self.loopback_ipv6_hextet_combo.setToolTip("Select which hextet to increment for loopback IPv6 (e.g., 2001:ff00::X)")
+        self.loopback_ipv6_hextet_combo.setToolTip("Select which hextet to increment for loopback IPv6 (e.g., 2001:ff00:X::1)")
         
         # VXLAN Increment Selection
         vxlan_vni_label = QLabel("VNI:")
@@ -562,19 +568,20 @@ class AddDeviceDialog(QDialog):
         vxlan_local_label = QLabel("VXLAN Local:")
         self.vxlan_local_octet_combo = QComboBox()
         self.vxlan_local_octet_combo.addItems(["4th", "3rd", "2nd", "1st"])
-        # Combo index 0 = the 4th (last) octet. Comment said "4th
-        # octet" but index was 3, which actually picked the 1st octet.
-        self.vxlan_local_octet_combo.setCurrentIndex(0)
+        # Default to the 3rd octet — keeps each VXLAN tunnel's local
+        # endpoint on a distinct underlay subnet, consistent with the
+        # IPv4 and gateway "3rd octet" defaults.
+        self.vxlan_local_octet_combo.setCurrentIndex(1)
         self.vxlan_local_octet_combo.setFixedWidth(70)
-        self.vxlan_local_octet_combo.setToolTip("Select which octet to increment for VXLAN local endpoint (e.g., 192.255.0.X)")
+        self.vxlan_local_octet_combo.setToolTip("Select which octet to increment for VXLAN local endpoint (e.g., 192.255.X.1)")
 
         vxlan_remote_label = QLabel("VXLAN Remote:")
         self.vxlan_remote_octet_combo = QComboBox()
         self.vxlan_remote_octet_combo.addItems(["4th", "3rd", "2nd", "1st"])
-        # Same fix as the local-endpoint combo above.
-        self.vxlan_remote_octet_combo.setCurrentIndex(0)
+        # Default to the 3rd octet — see VXLAN local combo above.
+        self.vxlan_remote_octet_combo.setCurrentIndex(1)
         self.vxlan_remote_octet_combo.setFixedWidth(70)
-        self.vxlan_remote_octet_combo.setToolTip("Select which octet to increment for VXLAN remote endpoint (e.g., 192.168.250.X)")
+        self.vxlan_remote_octet_combo.setToolTip("Select which octet to increment for VXLAN remote endpoint (e.g., 192.168.X.1)")
         
         vxlan_udp_label = QLabel("VXLAN UDP:")
         self.vxlan_udp_increment_combo = QComboBox()
