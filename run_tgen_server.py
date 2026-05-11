@@ -4241,11 +4241,46 @@ def configure_ospf():
             }
             
             logging.info(f"[OSPF CONFIGURE] Creating FRR container for device {device_name}")
-            created_container_name = frr_manager.start_frr_container(device_id, device_config)
+            # Same surface-real-reason pattern as the BGP path —
+            # capture the actual failure so the client sees something
+            # actionable instead of the generic "Failed to create FRR
+            # container" message.
+            ospf_frr_failure_reason = None
+            try:
+                created_container_name = frr_manager.start_frr_container(device_id, device_config)
+            except Exception as _frr_exc:
+                created_container_name = None
+                ospf_frr_failure_reason = str(_frr_exc)
             if not created_container_name:
                 logging.error(f"[OSPF CONFIGURE] Failed to create FRR container for device {device_name}")
-                return jsonify({"error": "Failed to create FRR container"}), 500
-            
+                if not ospf_frr_failure_reason:
+                    try:
+                        import subprocess as _sp
+                        ps = _sp.run(
+                            ["docker", "info"],
+                            capture_output=True, text=True, timeout=5,
+                        )
+                        if ps.returncode != 0:
+                            ospf_frr_failure_reason = (
+                                f"docker info exited {ps.returncode}: "
+                                f"{(ps.stderr or '').strip()[:200]}"
+                            )
+                    except FileNotFoundError:
+                        ospf_frr_failure_reason = "docker binary not in PATH on the server"
+                    except _sp.TimeoutExpired:
+                        ospf_frr_failure_reason = "docker info timed out — daemon hung?"
+                    except Exception as _probe_exc:
+                        ospf_frr_failure_reason = f"probe failed: {_probe_exc}"
+                if not ospf_frr_failure_reason:
+                    ospf_frr_failure_reason = (
+                        "FRR manager returned None — check the server "
+                        "log around [FRR] entries."
+                    )
+                return jsonify({
+                    "error": "Failed to create FRR container",
+                    "details": ospf_frr_failure_reason,
+                }), 500
+
             logging.info(f"[OSPF CONFIGURE] Successfully created FRR container: {created_container_name}")
             # Wait for FRR daemons to be fully initialized before applying configuration
             # This ensures the container is ready to accept configuration commands (like BGP does)
@@ -7417,11 +7452,55 @@ def configure_bgp():
             }
             
             logging.info(f"[BGP CONFIGURE] Creating FRR container for device {device_name}")
-            created_container_name = frr_manager.start_frr_container(device_id, device_config)
+            # Capture the actual failure reason so we can surface it
+            # to the client instead of the generic "Failed to create
+            # FRR container" message. start_frr_container catches
+            # exceptions internally and returns None — pull the
+            # exception out via a tiny wrapper so the client sees
+            # the real cause (docker daemon down, image missing,
+            # interface mismatch, etc.).
+            frr_failure_reason = None
+            try:
+                created_container_name = frr_manager.start_frr_container(device_id, device_config)
+            except Exception as _frr_exc:
+                created_container_name = None
+                frr_failure_reason = str(_frr_exc)
             if not created_container_name:
                 logging.error(f"[BGP CONFIGURE] Failed to create FRR container for device {device_name}")
-                return jsonify({"error": "Failed to create FRR container"}), 500
-            
+                # Best effort: probe docker daemon + image so we have
+                # something concrete in the JSON response even when
+                # the underlying exception was swallowed by the
+                # FRR manager.
+                if not frr_failure_reason:
+                    try:
+                        import subprocess as _sp
+                        ps = _sp.run(
+                            ["docker", "info"],
+                            capture_output=True, text=True, timeout=5,
+                        )
+                        if ps.returncode != 0:
+                            frr_failure_reason = (
+                                f"docker info exited {ps.returncode}: "
+                                f"{(ps.stderr or '').strip()[:200]}"
+                            )
+                    except FileNotFoundError:
+                        frr_failure_reason = "docker binary not in PATH on the server"
+                    except _sp.TimeoutExpired:
+                        frr_failure_reason = "docker info timed out — daemon hung?"
+                    except Exception as _probe_exc:
+                        frr_failure_reason = f"probe failed: {_probe_exc}"
+                if not frr_failure_reason:
+                    frr_failure_reason = (
+                        "FRR manager returned None — check the server "
+                        "log around [FRR] entries for the underlying "
+                        "exception (interface mismatch, bridge setup, "
+                        "permissions, etc.)"
+                    )
+                return jsonify({
+                    "error": "Failed to create FRR container",
+                    "details": frr_failure_reason,
+                }), 500
+
             logging.info(f"[BGP CONFIGURE] Successfully created FRR container: {created_container_name}")
         
         # Save device to database if it doesn't exist
