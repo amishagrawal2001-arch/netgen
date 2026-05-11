@@ -2248,6 +2248,17 @@ class DevicesTab(QWidget):
                 return
             new_value = (item.text() or "").strip()
 
+            # cellChanged fires for ANY data change on the item —
+            # including setForeground (ARP-status color updates) and
+            # setToolTip. Those aren't user edits and shouldn't be
+            # logged as such or trigger _needs_apply. The previous
+            # value is stashed at UserRole+2 every time we persist;
+            # if it matches new_value, the signal came from a style
+            # change and we bail.
+            prev_stash = item.data(Qt.UserRole + 2)
+            if prev_stash is not None and str(prev_stash) == new_value:
+                return
+
             # Header name for this column. COL maps header → index; build
             # inverse on the fly (small dict, cheap).
             header_name = None
@@ -3688,6 +3699,11 @@ class DevicesTab(QWidget):
                 item.setIcon(icon)
             if user_data is not None:
                 item.setData(Qt.UserRole, user_data)
+            # UserRole+2 stashes the canonical "current value" so
+            # on_cell_changed can distinguish real user edits from
+            # spurious cellChanged signals fired by setForeground /
+            # setToolTip (the ARP-status color-coding path).
+            item.setData(Qt.UserRole + 2, str(val))
             self.devices_table.setItem(row, self.COL[header], item)
 
         put("Device Name", name, user_data=device_id)
@@ -3695,10 +3711,12 @@ class DevicesTab(QWidget):
 
         ipv4_item = QTableWidgetItem(str(ipv4))
         ipv4_item.setData(Qt.UserRole + 1, ipv4_mask)
+        ipv4_item.setData(Qt.UserRole + 2, str(ipv4))
         self.devices_table.setItem(row, self.COL["IPv4"], ipv4_item)
 
         ipv6_item = QTableWidgetItem(str(ipv6))
         ipv6_item.setData(Qt.UserRole + 1, ipv6_mask)
+        ipv6_item.setData(Qt.UserRole + 2, str(ipv6))
         self.devices_table.setItem(row, self.COL["IPv6"], ipv6_item)
 
         # VLAN column
