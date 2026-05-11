@@ -1627,62 +1627,17 @@ class DevicesTab(QWidget):
         # Enable inline editing
         self.devices_table.setEditTriggers(QTableWidget.DoubleClicked | QTableWidget.EditKeyPressed)
         self.devices_table.setSelectionBehavior(QTableWidget.SelectItems)
-        
-        # Table styling — matches the streams table after the
-        # bd9e779/9aa54b8/10ec57c styling pass. Border removed (the
-        # tab pane provides the outer border), selection blue
-        # brightened to #2563eb to match the streams selection,
-        # header padding tightened, font reduced 12→11.
-        self.devices_table.setAlternatingRowColors(True)
-        header = self.devices_table.horizontalHeader()
-        header.setDefaultSectionSize(25)
-        header.setHighlightSections(False)
-        # Fix the header bar height so font-metric quirks can't push
-        # it taller than the styled padding implies.
-        header.setFixedHeight(22)
-        # Cap icon size for any per-cell icons (status pills etc).
-        self.devices_table.setIconSize(QSize(14, 14))
 
-        self.devices_table.setStyleSheet("""
-            QTableWidget {
-                background-color: #ffffff;
-                alternate-background-color: #f5f7fa;
-                border: none;
-                font-size: 13px;
-                outline: none;
-                color: #111827;
-                gridline-color: #e5e7eb;
-            }
-            QTableWidget::item {
-                padding: 5px 8px;
-                border: none;
-            }
-            QTableWidget::item:selected {
-                background-color: #2563eb;
-                color: #ffffff;
-            }
-            QTableWidget::item:hover:!selected {
-                background-color: #eef2f7;
-            }
-            QTableWidget::item:selected:hover {
-                background-color: #1d4ed8;
-            }
-            QHeaderView::section {
-                background-color: #e5e7eb;
-                padding: 3px 8px;
-                border: 1px solid #cbd5e1;
-                border-left: none;
-                border-top: none;
-                font-weight: 700;
-                font-size: 11px;
-                color: #1f2937;
-                letter-spacing: 0.3px;
-            }
-            QHeaderView::section:first {
-                border-left: 1px solid #cbd5e1;
-            }
-        """)
-        
+        # Plain default Qt table chrome — matches the BGP / OSPF /
+        # IS-IS / DHCP / VXLAN tables (which never got the custom
+        # alternating-rows + blue-selection stylesheet the Devices
+        # table used to have). The custom styling was the lone
+        # outlier across all six tabs and looked visually
+        # inconsistent. Kept the inline-edit triggers and selection
+        # behaviour above; just dropped the stylesheet and explicit
+        # header sizing.
+
+
         # Connect cell change event for validation and updates
         self.devices_table.cellChanged.connect(self.on_cell_changed)
         
