@@ -11208,29 +11208,52 @@ def get_device_arp_status(device_id):
                 logging.warning(f"[ARP STATUS] Failed to check interface status for {server_interface}: {e}")
                 # Continue with ARP checks even if interface check fails
         
-        # Get device IP addresses
-        ipv4_address = device.get('ipv4_address')
-        ipv6_address = device.get('ipv6_address')
-        ipv4_gateway = device.get('ipv4_gateway')
-        ipv6_gateway = device.get('ipv6_gateway')
-        
-        
+        # Get device IP addresses. Strip any CIDR suffix — older
+        # records sometimes stored "192.168.0.2/24" in the bare
+        # ipv4_address column, and `ping "192.168.0.2/24"` errors
+        # out with "ping: invalid argument" → False, even though
+        # the host can actually reach the IP. Audit fix for the
+        # "ARP fails even though manual ping works" symptom.
+        def _strip_mask(addr):
+            if addr and "/" in addr:
+                return addr.split("/", 1)[0]
+            return addr
+        ipv4_address = _strip_mask(device.get('ipv4_address'))
+        ipv6_address = _strip_mask(device.get('ipv6_address'))
+        ipv4_gateway = _strip_mask(device.get('ipv4_gateway'))
+        ipv6_gateway = _strip_mask(device.get('ipv6_gateway'))
+
+
         # Perform ARP checks
         arp_results = {
             "arp_ipv4_resolved": False,
             "arp_ipv6_resolved": False,
             "arp_gateway_resolved": False,
-            "details": {}
+            "details": {
+                # Stash the IPs we ACTUALLY pinged so the client can
+                # see what the server resolved to, separately from
+                # what's in the device dict.
+                "ipv4_target": ipv4_address or "",
+                "ipv6_target": ipv6_address or ipv6_gateway or "",
+                "gateway_target": ipv4_gateway or "",
+            },
         }
-        
+
         # Check IPv4 ARP
         if ipv4_address:
             try:
                 import subprocess
-                result = subprocess.run(["ping", "-c", "1", "-W", "1", ipv4_address], 
+                result = subprocess.run(["ping", "-c", "1", "-W", "1", ipv4_address],
                                       capture_output=True, text=True, timeout=5)
                 arp_results["arp_ipv4_resolved"] = result.returncode == 0
                 arp_results["details"]["ipv4_ping"] = "success" if result.returncode == 0 else "failed"
+                if result.returncode != 0:
+                    # Surface ping stderr so a failure mode like
+                    # "Network is unreachable" or "Destination Host
+                    # Unreachable" is visible.
+                    err = (result.stderr or result.stdout or "").strip()[:200]
+                    if err:
+                        arp_results["details"]["ipv4_ping_error"] = err
             except Exception as e:
                 arp_results["details"]["ipv4_ping"] = f"error: {e}"
         
@@ -11263,10 +11286,14 @@ def get_device_arp_status(device_id):
         if ipv4_gateway:
             try:
                 import subprocess
-                result = subprocess.run(["ping", "-c", "1", "-W", "1", ipv4_gateway], 
+                result = subprocess.run(["ping", "-c", "1", "-W", "1", ipv4_gateway],
                                       capture_output=True, text=True, timeout=5)
                 arp_results["arp_gateway_resolved"] = result.returncode == 0
                 arp_results["details"]["gateway_ping"] = "success" if result.returncode == 0 else "failed"
+                if result.returncode != 0:
+                    err = (result.stderr or result.stdout or "").strip()[:200]
+                    if err:
+                        arp_results["details"]["gateway_ping_error"] = err
             except Exception as e:
                 arp_results["details"]["gateway_ping"] = f"error: {e}"
         
