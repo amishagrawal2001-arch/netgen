@@ -13,7 +13,8 @@ BGP_ROUTES = {}  # Store advertised routes per device
 try:
     from .frr_docker import (
         start_frr_container, stop_frr_container,
-        configure_bgp_neighbor, get_bgp_status, get_bgp_neighbors
+        configure_bgp_neighbor, get_bgp_status, get_bgp_neighbors,
+        cleanup_all_containers,
     )
     DOCKER_FRR_AVAILABLE = True
 except ImportError as e:
