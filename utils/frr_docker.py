@@ -1009,6 +1009,84 @@ frr_manager = FRRDockerManager()
 # setup_frr_network() was removed along with setup_network_infrastructure();
 # FRR runs on host networking and needs no docker network/bridge setup.
 
+
+# Container-name prefixes we manage. `ostg-frr` is the historical
+# prefix kept for backwards compatibility; `dhcp-frr` is the DHCP-
+# client variant added later (see _get_container_name).
+_MANAGED_CONTAINER_PREFIXES = ("ostg-frr-", "dhcp-frr-")
+
+
+def list_all_containers() -> List[Dict[str, str]]:
+    """Enumerate every FRR container this manager owns.
+
+    Returns a list of `{"name", "device_id", "status", "image"}` dicts.
+    Empty list on docker errors so callers (status endpoints) can keep
+    working when docker is unreachable.
+    """
+    out: List[Dict[str, str]] = []
+    try:
+        client = docker.from_env()
+        for c in client.containers.list(all=True):
+            name = c.name or ""
+            for pfx in _MANAGED_CONTAINER_PREFIXES:
+                if name.startswith(pfx):
+                    device_id = name[len(pfx):]
+                    image_tag = ""
+                    try:
+                        image_tag = (c.image.tags[0] if c.image and c.image.tags else "")
+                    except Exception:
+                        pass
+                    out.append({
+                        "name": name,
+                        "device_id": device_id,
+                        "status": c.status,
+                        "image": image_tag,
+                    })
+                    break
+    except Exception as exc:
+        logger.warning(f"[FRR] list_all_containers failed: {exc}")
+    return out
+
+
+def cleanup_all_containers() -> int:
+    """Force-remove every FRR container this manager owns.
+
+    Called from the netgen-cleanup systemd unit on shutdown and from
+    `utils/bgp.py` on a global reset. Best-effort: per-container errors
+    are logged and skipped. Returns the count actually removed.
+    """
+    removed = 0
+    try:
+        client = docker.from_env()
+        for c in client.containers.list(all=True):
+            name = c.name or ""
+            if not any(name.startswith(p) for p in _MANAGED_CONTAINER_PREFIXES):
+                continue
+            # Best-effort VRF teardown alongside the container so we
+            # don't leak Linux VRFs across server restarts. Pull
+            # device_id from the container name and let _remove_vrf
+            # noop if no VRF exists.
+            device_id = None
+            for pfx in _MANAGED_CONTAINER_PREFIXES:
+                if name.startswith(pfx):
+                    device_id = name[len(pfx):]
+                    break
+            try:
+                c.remove(force=True)
+                removed += 1
+                logger.info(f"[FRR] removed container {name}")
+            except Exception as exc:
+                logger.warning(f"[FRR] failed to remove {name}: {exc}")
+            if device_id:
+                try:
+                    frr_manager._remove_vrf(device_id, None)
+                except Exception:
+                    pass
+    except Exception as exc:
+        logger.warning(f"[FRR] cleanup_all_containers failed: {exc}")
+    return removed
+
+
 def start_frr_container(device_id: str, device_config: Dict) -> Optional[str]:
     """Start FRR container for device."""
     return frr_manager.start_frr_container(device_id, device_config)
