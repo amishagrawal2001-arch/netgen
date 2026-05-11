@@ -4610,7 +4610,21 @@ class DevicesTab(QWidget):
 
     
     def refresh_arp_selected_device(self):
-        """Refresh ARP status from the database for the selected device(s)."""
+        """Refresh ARP status for the selected device(s).
+
+        Two steps:
+
+        1. Ask the server to run a *fresh* ARP/ND probe and persist
+           the results. Without this, _check_individual_arp_resolution
+           below would just re-read whatever the periodic 30s monitor
+           last wrote — clicking the button would silently show stale
+           data, which is exactly the failure mode the user reported.
+        2. Read the (now-fresh) state from the DB and paint the row.
+
+        Step 1 hits the server's force-check endpoint, which uses the
+        VRF-aware probe path (see run_tgen_server.get_device_arp_status)
+        so multi-device deployments resolve correctly.
+        """
         selected_items = self.devices_table.selectedItems()
         if not selected_items:
             QMessageBox.warning(self, "No Selection", "Please select one or more devices to refresh ARP status.")
@@ -4621,6 +4635,40 @@ class DevicesTab(QWidget):
             QMessageBox.warning(self, "No Selection", "Please select one or more devices to refresh ARP status.")
             return
 
+        # Step 1 — kick a server-side force-check so the DB picks up
+        # the live ARP/ND state instead of whatever the periodic
+        # monitor last cached. Best-effort: failures don't block the
+        # subsequent DB read (we'll show whatever's in the DB).
+        try:
+            import requests
+            # Use the first selected device's row to discover the
+            # server URL — all rows are typically on the same server.
+            first_row = next(iter(selected_rows))
+            first_name_item = self.devices_table.item(first_row, self.COL["Device Name"])
+            server_url = None
+            if first_name_item:
+                first_dev = self._find_device_by_name(first_name_item.text())
+                if first_dev:
+                    iface_label = first_dev.get("Interface", "")
+                    if iface_label:
+                        server_url = self._get_server_url_from_interface(iface_label)
+            if not server_url:
+                server_url = self.get_server_url(silent=True)
+            if server_url:
+                # Timeout sized for the worst case: force-check probes
+                # every running device in parallel, each ping has a 1s
+                # timeout, so even 10+ devices should return in <10s.
+                fc = requests.post(f"{server_url}/api/arp/monitor/force-check", timeout=15)
+                if fc.status_code == 200:
+                    logger.info(f"[REFRESH ARP] force-check OK for {len(selected_rows)} selected device(s)")
+                else:
+                    logger.warning(f"[REFRESH ARP] force-check returned HTTP {fc.status_code}")
+            else:
+                logger.warning("[REFRESH ARP] no server URL — falling back to cached DB state only")
+        except Exception as exc:
+            logger.warning(f"[REFRESH ARP] force-check failed (will show cached state): {exc}")
+
+        # Step 2 — read the now-fresh state and paint each row.
         for row in selected_rows:
             try:
                 name_item = self.devices_table.item(row, self.COL["Device Name"])
