@@ -63,7 +63,7 @@ class VXLANHandler:
         self.parent.vxlan_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.parent.vxlan_table.setSelectionBehavior(QTableWidget.SelectRows)
 
-        layout.addWidget(QLabel("VXLAN Tunnel Status"))
+        # Section header removed — tab name + table columns are enough.
         layout.addWidget(self.parent.vxlan_table)
 
         controls = QHBoxLayout()

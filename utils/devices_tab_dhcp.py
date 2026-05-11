@@ -694,7 +694,7 @@ class DHCPHandler:
         self.parent.dhcp_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.parent.dhcp_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.parent.dhcp_table.setSelectionMode(QTableWidget.SingleSelection)
-        layout.addWidget(QLabel("DHCP Status"))
+        # Section header removed — tab name + table columns are enough.
         layout.addWidget(self.parent.dhcp_table)
 
         # Controls
