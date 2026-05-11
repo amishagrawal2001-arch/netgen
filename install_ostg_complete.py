@@ -541,6 +541,79 @@ class NetgenInstaller:
                 
         self.log("✓ Docker installed and started successfully")
         
+    def _build_wheel(self):
+        """Build a fresh wheel from current source.
+
+        Without this step, install_ostg copies whatever .whl is sitting
+        in dist/ — which may be stale (built hours/days ago, missing
+        in-repo fixes). The ARP-fails-but-ping-works mystery in the
+        most recent session traced back exactly to this: a wheel built
+        before the monitor 5051→5050 fix went out, deployed onto a
+        fresh server, and the bug looked like it'd been fixed in
+        source but the binary still had the old behavior. Always
+        rebuild from current source so the deployed artifact and the
+        git tree never drift.
+        """
+        import subprocess as _sp
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        wheel_file = f"{WHEEL_DIST}-{WHEEL_VERSION}-py3-none-any.whl"
+        local_wheel_path = os.path.join(script_dir, "dist", wheel_file)
+
+        self.log(f"Building fresh wheel from source ({wheel_file})...")
+        try:
+            # Wipe any older artifacts in dist/ to avoid pip picking
+            # up a stale one if the new build fails silently.
+            dist_dir = os.path.join(script_dir, "dist")
+            if os.path.isdir(dist_dir):
+                for f in os.listdir(dist_dir):
+                    if f.endswith((".whl", ".tar.gz")):
+                        try:
+                            os.remove(os.path.join(dist_dir, f))
+                        except OSError:
+                            pass
+
+            # `python -m build` requires the `build` package; fall
+            # back to setuptools' bdist_wheel if it's missing.
+            result = _sp.run(
+                [sys.executable, "-m", "build", "--wheel"],
+                cwd=script_dir, capture_output=True, text=True, timeout=300,
+            )
+            if result.returncode != 0:
+                # `build` not installed → use legacy bdist_wheel.
+                self.log("python -m build failed; falling back to setup.py bdist_wheel", "WARNING")
+                result = _sp.run(
+                    [sys.executable, "setup.py", "bdist_wheel"],
+                    cwd=script_dir, capture_output=True, text=True, timeout=300,
+                )
+            if result.returncode != 0:
+                self.log(
+                    "Wheel build failed:\n"
+                    f"  stdout: {(result.stdout or '').strip()[-500:]}\n"
+                    f"  stderr: {(result.stderr or '').strip()[-500:]}",
+                    "ERROR",
+                )
+                sys.exit(1)
+
+            if not os.path.exists(local_wheel_path):
+                self.log(
+                    f"Wheel build reported success but {wheel_file} not in dist/. "
+                    f"Files present: {os.listdir(dist_dir) if os.path.isdir(dist_dir) else 'none'}",
+                    "ERROR",
+                )
+                sys.exit(1)
+
+            self.log(f"✓ Built {wheel_file}")
+        except _sp.TimeoutExpired:
+            self.log("Wheel build timed out after 5 minutes", "ERROR")
+            sys.exit(1)
+        except FileNotFoundError:
+            self.log(
+                "Python not in PATH for wheel build — install the "
+                "`build` package: pip install build",
+                "ERROR",
+            )
+            sys.exit(1)
+
     def install_ostg(self):
         """Install the Netgen traffic generator wheel and ancillary files."""
         self.log(f"Installing {PRODUCT_NAME} traffic generator...")
@@ -548,11 +621,15 @@ class NetgenInstaller:
         # Create installation directory
         self.run_command(f"mkdir -p {INSTALL_DIR}")
 
+        # Rebuild the wheel from current source before deploying so
+        # the deployed artifact can't drift from the git tree.
+        self._build_wheel()
+
         # Copy wheel file (still distributed under its original name)
         wheel_file = f"{WHEEL_DIST}-{WHEEL_VERSION}-py3-none-any.whl"
         local_wheel_path = f"dist/{wheel_file}"
         remote_wheel_path = f"{INSTALL_DIR}/{wheel_file}"
-        
+
         if not os.path.exists(local_wheel_path):
             self.log(f"Wheel file not found: {local_wheel_path}", "ERROR")
             sys.exit(1)
