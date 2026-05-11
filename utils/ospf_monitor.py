@@ -16,11 +16,28 @@ import queue
 # Configure logging
 logger = logging.getLogger(__name__)
 
+def _default_self_url():
+    """Same pattern as utils.arp_monitor / utils.bgp_monitor — keeps
+    the OSPF monitor defaults in sync with the netgen-server port via
+    NETGEN_SERVER_PORT env var (default 5050)."""
+    import os as _os
+    port = (_os.environ.get("NETGEN_SERVER_PORT")
+            or _os.environ.get("OSTG_SERVER_PORT")
+            or "5050")
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        port = 5050
+    return f"http://localhost:{port}"
+
+
 class OSPFStatusMonitor:
     """Multi-threaded OSPF status monitoring system"""
-    
-    def __init__(self, device_db, server_url: str = "http://localhost:5051", 
+
+    def __init__(self, device_db, server_url: str = None,
                  check_interval: int = 30, max_workers: int = 5):
+        if not server_url:
+            server_url = _default_self_url()
         """
         Initialize OSPF status monitor.
         
@@ -308,8 +325,10 @@ class OSPFStatusMonitor:
 
 class OSPFStatusManager:
     """Manager class for OSPF status monitoring"""
-    
-    def __init__(self, device_db, server_url: str = "http://localhost:5051"):
+
+    def __init__(self, device_db, server_url: str = None):
+        if not server_url:
+            server_url = _default_self_url()
         """
         Initialize OSPF status manager.
         

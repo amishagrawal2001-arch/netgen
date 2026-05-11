@@ -15,11 +15,36 @@ import queue
 # Configure logging
 logger = logging.getLogger(__name__)
 
+def _default_self_url():
+    """Default self-loopback URL the monitors call back into.
+
+    Reads NETGEN_SERVER_PORT (or legacy OSTG_SERVER_PORT) env var,
+    falling back to 5050 — the actual port netgen-server binds to.
+    The previous hardcoded `localhost:5051` was a stale carryover from
+    an older port assignment and caused every monitor poll to log
+    "[ARP/BGP/OSPF MONITOR] ... Connection refused" until run_tgen_server
+    was patched to pass an explicit server_url. Belt-and-braces: also
+    fix the default here so a caller that forgets the kwarg still
+    gets the right port.
+    """
+    import os as _os
+    port = (_os.environ.get("NETGEN_SERVER_PORT")
+            or _os.environ.get("OSTG_SERVER_PORT")
+            or "5050")
+    try:
+        port = int(port)
+    except (TypeError, ValueError):
+        port = 5050
+    return f"http://localhost:{port}"
+
+
 class ARPStatusMonitor:
     """Multi-threaded ARP status monitoring system"""
-    
-    def __init__(self, device_db, server_url: str = "http://localhost:5051", 
+
+    def __init__(self, device_db, server_url: str = None,
                  check_interval: int = 30, max_workers: int = 5):
+        if not server_url:
+            server_url = _default_self_url()
         """
         Initialize ARP status monitor.
         
