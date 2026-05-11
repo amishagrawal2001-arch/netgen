@@ -8036,13 +8036,17 @@ class DevicesTab(QWidget):
                             break
                 
                 if device_row is not None:
-                    # Wait a moment for the interface to be configured
-                    import time
-                    time.sleep(3)
-                    
-                    # Trigger ARP refresh for this specific device
-                    self._refresh_device_table_from_database([device_row])
-                    logger.info(f"Triggered ARP refresh for {device_name}")
+                    # Defer the refresh — give the server a moment to
+                    # write the fresh ARP state — using Qt's event
+                    # loop instead of time.sleep(3) so we don't freeze
+                    # the UI thread.
+                    QTimer.singleShot(
+                        3000,
+                        lambda row=device_row, name=device_name: (
+                            self._refresh_device_table_from_database([row]),
+                            logger.info(f"Triggered ARP refresh for {name}"),
+                        ),
+                    )
                 else:
                     logger.info(f"Could not find device row for {device_name}")
                 
@@ -8095,50 +8099,105 @@ class DevicesTab(QWidget):
         except Exception as e:
             logger.error(f"Error cleaning up: {e}")
     def _on_multi_device_applied(self, device_name, success, message):
-        """Handle individual device apply result from multi-device worker."""
+        """Handle individual device apply result from multi-device worker.
+
+        This slot is invoked by Qt on the *UI thread* every time the
+        worker emits a per-device result. The old implementation did:
+
+            time.sleep(2)
+            requests.post(force-check, timeout=5)   # sync HTTP
+            time.sleep(1)
+            self._refresh_device_table_from_database([row])
+
+        all of which run on the UI thread → guaranteed 3-8s freeze
+        per applied device. Rewritten to:
+
+          1. fire the ARP force-check in a one-shot QThread (non-blocking
+             — server work happens in parallel with the UI event loop)
+          2. queue the DB-backed table refresh on QTimer.singleShot
+             so the UI gets a moment to render before the refresh runs
+
+        Net effect: the UI stays responsive while the same chain of
+        side-effects completes in the background.
+        """
         try:
             logger.info(f"{message}")
-            
-            # If device was successfully applied, trigger ARP status check
-            if success:
-                if hasattr(self, "dhcp_handler") and self.dhcp_handler:
-                    QTimer.singleShot(200, self.dhcp_handler.refresh_dhcp_status)
-                # Find the device row to update ARP status
-                device_row = None
-                for row in range(self.devices_table.rowCount()):
-                    if self.devices_table.item(row, self.COL["Device Name"]):
-                        table_device_name = self.devices_table.item(row, self.COL["Device Name"]).text()
-                        if table_device_name == device_name:
-                            device_row = row
-                            break
-                
-                if device_row is not None:
-                    # Wait a moment for the interface to be configured
-                    import time
-                    time.sleep(2)
-                    
-                    # Force ARP check on server to update database with current status
-                    try:
-                        server_url = self.get_server_url(silent=True)
-                        if server_url:
+
+            if not success:
+                return
+
+            if hasattr(self, "dhcp_handler") and self.dhcp_handler:
+                QTimer.singleShot(200, self.dhcp_handler.refresh_dhcp_status)
+
+            # Find the row for this device (cheap — small table)
+            device_row = None
+            for row in range(self.devices_table.rowCount()):
+                name_item = self.devices_table.item(row, self.COL["Device Name"])
+                if name_item and name_item.text() == device_name:
+                    device_row = row
+                    break
+
+            if device_row is None:
+                logger.info(f"Could not find device row for {device_name}")
+                return
+
+            server_url = self.get_server_url(silent=True)
+
+            # Fire-and-forget force-check from a worker thread so the
+            # UI thread isn't blocked on requests.post().
+            if server_url:
+                from PyQt5.QtCore import QThread, pyqtSignal
+
+                class _ForceCheckWorker(QThread):
+                    done = pyqtSignal(bool)
+
+                    def __init__(self, url):
+                        super().__init__()
+                        self._url = url
+
+                    def run(self):
+                        try:
                             import requests
-                            response = requests.post(f"{server_url}/api/arp/monitor/force-check", timeout=5)
-                            if response.status_code == 200:
-                                logger.info(f"Triggered ARP force check on server")
-                            else:
-                                logger.error(f"Failed to trigger ARP force check: {response.status_code}")
-                    except Exception as e:
-                        logger.error(f"Error triggering ARP force check: {e}")
-                    
-                    # Wait a moment for ARP check to complete
-                    time.sleep(1)
-                    
-                    # Trigger ARP refresh for this specific device
-                    self._refresh_device_table_from_database([device_row])
-                    logger.info(f"Triggered ARP refresh for {device_name}")
-                else:
-                    logger.info(f"Could not find device row for {device_name}")
-                    
+                            r = requests.post(
+                                f"{self._url}/api/arp/monitor/force-check",
+                                timeout=5,
+                            )
+                            self.done.emit(r.status_code == 200)
+                        except Exception as exc:
+                            logger.warning(f"[APPLY] ARP force-check failed: {exc}")
+                            self.done.emit(False)
+
+                # Stash on self so Qt doesn't garbage-collect mid-flight.
+                worker = _ForceCheckWorker(server_url)
+                if not hasattr(self, "_apply_force_check_workers"):
+                    self._apply_force_check_workers = []
+                self._apply_force_check_workers.append(worker)
+                worker.done.connect(
+                    lambda ok, w=worker: (
+                        logger.info(f"[APPLY] ARP force-check {'OK' if ok else 'failed'}")
+                        if True else None
+                    )
+                )
+                # Drop the reference when the thread finishes so we
+                # don't accumulate workers forever.
+                worker.finished.connect(
+                    lambda w=worker: self._apply_force_check_workers.remove(w)
+                    if w in self._apply_force_check_workers else None
+                )
+                worker.start()
+
+            # Defer the DB-backed table refresh to give the server a
+            # moment to write the fresh ARP state to its DB. Uses Qt's
+            # event loop instead of time.sleep, so the UI keeps
+            # rendering.
+            QTimer.singleShot(
+                3000,
+                lambda row=device_row, name=device_name: (
+                    self._refresh_device_table_from_database([row]),
+                    logger.info(f"Triggered ARP refresh for {name}"),
+                ),
+            )
+
         except Exception as e:
             logger.error(f"Error handling result: {e}")
     
