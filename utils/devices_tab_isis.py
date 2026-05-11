@@ -476,9 +476,31 @@ class ISISHandler:
 
 
     def refresh_isis_status(self):
-        """Refresh ISIS neighbor status from server."""
+        """Refresh IS-IS neighbor status.
+
+        First kicks a server-side force-check so the DB reflects live
+        isisd state (Up / Init / Down, system-id, hold-time, etc.),
+        then re-renders the table from the (now-fresh) DB. Without the
+        force-check the button only re-displayed whatever the periodic
+        monitor last wrote — same stale-cache UX bug we fixed for ARP.
+        """
         try:
+            import requests
             logger.info("[ISIS REFRESH] Refreshing ISIS status from database...")
+
+            # Step 1 — server-side force-check. Non-fatal on failure;
+            # we still re-render whatever's in the DB.
+            try:
+                server_url = self.parent.get_server_url(silent=True)
+                if server_url:
+                    fc = requests.post(f"{server_url}/api/isis/monitor/force-check", timeout=15)
+                    if fc.status_code == 200:
+                        logger.info("[ISIS REFRESH] force-check OK")
+                    else:
+                        logger.warning(f"[ISIS REFRESH] force-check returned HTTP {fc.status_code}")
+            except Exception as exc:
+                logger.warning(f"[ISIS REFRESH] force-check failed (will show cached state): {exc}")
+
             # Update the ISIS table which fetches status from database
             self.update_isis_table()
             logger.info("[ISIS REFRESH] ISIS status refreshed successfully")

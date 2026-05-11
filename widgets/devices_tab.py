@@ -4180,9 +4180,17 @@ class DevicesTab(QWidget):
                 continue
 
             try:
+                # Send device_id so the server can scope the ping to
+                # the device's VRF (multi-device wiring). Older
+                # servers ignore the extra field and ping from the
+                # default netns, which still works for single-device
+                # deployments.
                 response = requests.post(
                     f"{server_url}/api/device/ping",
-                    json={"ip_address": ping_target},
+                    json={
+                        "ip_address": ping_target,
+                        "device_id": device_info.get("device_id", ""),
+                    },
                     timeout=15,
                 )
 
