@@ -8831,8 +8831,16 @@ def start_bgp():
                 # Try to get device_name from database, fallback to None
                 device_name_from_container = None
                 try:
-                    from utils.device_database import DeviceDatabase
-                    device_db = DeviceDatabase()
+                    # Do NOT do `device_db = DeviceDatabase()` here —
+                    # `device_db` is already the module-level singleton,
+                    # and adding a local rebind makes Python treat
+                    # `device_db` as function-local everywhere in
+                    # start_bgp(). My earlier DB-sourced IP read up in
+                    # this same function would then fail with
+                    # "cannot access local variable 'device_db' where
+                    # it is not associated with a value" because the
+                    # rebind line below sits after the read in source
+                    # order but in a different conditional branch.
                     device_data = device_db.get_device(device_id) if device_id else None
                     if device_data:
                         device_name_from_container = device_data.get('device_name')
