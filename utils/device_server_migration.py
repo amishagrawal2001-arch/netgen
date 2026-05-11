@@ -11,6 +11,14 @@ logger = logging.getLogger(__name__)
 
 class DeviceServerMigration:
     """Utilities for migrating devices to server-aware structure."""
+
+    # Audit LOW #18: migrate_device gets called every time a session
+    # is loaded or a device list is rehydrated. For devices whose
+    # target server is unreachable / not registered, the warnings
+    # at lines ~83 and ~89 fire on every re-migration. Track which
+    # (device_name, reason) tuples we've already warned about so
+    # logs stay quiet on idempotent re-runs.
+    _already_warned: set = set()
     
     @staticmethod
     def extract_tg_id_from_interface(interface_key: str) -> Optional[int]:
@@ -51,6 +59,20 @@ class DeviceServerMigration:
         return url
     
     @classmethod
+    def _warn_once(cls, device_name, reason, message):
+        """Log a migration warning only on the first occurrence per
+        (device_name, reason) tuple. Subsequent identical warnings
+        drop to debug. Keeps the log clean on session re-loads /
+        idempotent re-migrations of the same data.
+        """
+        key = (device_name or "", reason)
+        if key in cls._already_warned:
+            logger.debug(message)
+        else:
+            cls._already_warned.add(key)
+            logger.warning(message)
+
+    @classmethod
     def migrate_device(cls, device: Dict, server_manager: ServerManager) -> Dict:
         """Migrate a device to include server information."""
         if not isinstance(device, dict):
@@ -80,13 +102,21 @@ class DeviceServerMigration:
                     device["tg_id"] = server_manager.servers[server_id].tg_id
                     logger.debug(f"Migrated device {device.get('device_name')} using existing server_url")
                     return device
-            logger.warning(f"Cannot migrate device {device.get('device_name')}: no TG ID or server URL found")
+            cls._warn_once(
+                device.get("device_name"),
+                "no_tg_id_or_url",
+                f"Cannot migrate device {device.get('device_name')}: no TG ID or server URL found",
+            )
             return device  # Cannot migrate without TG ID or server URL
         
         # Find server by TG ID
         server_url = server_manager.get_server_url(tg_id=tg_id)
         if not server_url:
-            logger.warning(f"Cannot migrate device {device.get('device_name')}: server for TG {tg_id} not found")
+            cls._warn_once(
+                device.get("device_name"),
+                f"server_tg_{tg_id}_not_found",
+                f"Cannot migrate device {device.get('device_name')}: server for TG {tg_id} not found",
+            )
             return device  # Server not found
         
         # Extract server_id from URL

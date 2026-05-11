@@ -1878,13 +1878,36 @@ class AddDeviceDialog(QDialog):
         ipv4_mask = self.ipv4_mask_input.text().strip() if self.ipv4_checkbox.isChecked() else ""
         ipv6_mask = self.ipv6_mask_input.text().strip() if self.ipv6_checkbox.isChecked() else ""
         # Gateway values will be extracted separately below
-        
-        # Basic validation - device name is now optional (will use default names)
-        
+
+        # Audit LOW #15: device names flow into shell-like contexts on
+        # the server side (FRR container names, sysctl, ip/route
+        # commands), so accept only an obviously safe subset of
+        # characters. Empty name is fine — the model assigns a
+        # default ("device1", "device2", …); we only need to police
+        # explicit user input.
+        if device_name:
+            if len(device_name) > 64:
+                QMessageBox.warning(
+                    self, "Validation Error",
+                    "Device name must be 64 characters or fewer.",
+                )
+                return
+            import re as _re
+            if not _re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", device_name):
+                QMessageBox.warning(
+                    self, "Validation Error",
+                    "Device name may only contain letters, digits, '.', "
+                    "'-', and '_', and must start with a letter or digit. "
+                    "Spaces, slashes, and shell metacharacters are not "
+                    "allowed (the name is used in shell commands on the "
+                    "server side).",
+                )
+                return
+
         if not iface:
             QMessageBox.warning(self, "Validation Error", "Interface is required.")
             return
-        
+
         if not mac:
             QMessageBox.warning(self, "Validation Error", "MAC address is required.")
             return
