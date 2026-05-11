@@ -6351,7 +6351,10 @@ class DevicesTab(QWidget):
         loopback_ipv4 = device_info.get("Loopback IPv4", "")
         loopback_ipv6 = device_info.get("Loopback IPv6", "")
 
-        dialog = AddDeviceDialog(self, default_iface=iface)
+        # mode="edit" makes the dialog title read "Edit Device" and
+        # the OK button label read "Update Device" instead of the
+        # default "Add Device" — clearer user intent.
+        dialog = AddDeviceDialog(self, default_iface=iface, mode="edit")
 
         # Pre-fill basics
         dialog.device_name_input.setText(device_name)

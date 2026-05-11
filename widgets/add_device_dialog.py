@@ -21,9 +21,22 @@ import ipaddress
 
 
 class AddDeviceDialog(QDialog):
-    def __init__(self, parent=None, default_iface=""):
+    def __init__(self, parent=None, default_iface="", mode="add"):
+        """AddDeviceDialog also serves as the Edit dialog (same form,
+        same fields). `mode` controls user-facing labels:
+
+          mode="add"  → "Add New Device" title, "Add Device" button
+          mode="edit" → "Edit Device" title, "Update Device" button
+
+        Behavior is identical otherwise; the caller is responsible
+        for pre-filling fields when editing.
+        """
         super().__init__(parent)
-        self.setWindowTitle("Add New Device")
+        self.mode = (mode or "add").lower()
+        if self.mode == "edit":
+            self.setWindowTitle("Edit Device")
+        else:
+            self.setWindowTitle("Add New Device")
         self.setMinimumSize(1000, 700)  # Further increased width for better field spacing
         self.resize(1000, 700)  # Set initial size with wider width
 
@@ -57,9 +70,12 @@ class AddDeviceDialog(QDialog):
         self.scroll_area.setWidget(self.scroll_content)
         self.main_layout.addWidget(self.scroll_area)
         
-        # Add button box
+        # Add button box. Button label depends on mode: "Add Device"
+        # for a new device, "Update Device" when editing an existing
+        # one. Cancel is unchanged.
         self.button_box = QDialogButtonBox()
-        self.ok_button = self.button_box.addButton("Add Device", QDialogButtonBox.AcceptRole)
+        ok_label = "Update Device" if self.mode == "edit" else "Add Device"
+        self.ok_button = self.button_box.addButton(ok_label, QDialogButtonBox.AcceptRole)
         self.cancel_button = self.button_box.addButton("Cancel", QDialogButtonBox.RejectRole)
         
         self.ok_button.clicked.connect(self.validate_and_accept)
