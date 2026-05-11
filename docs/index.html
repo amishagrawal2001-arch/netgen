@@ -416,6 +416,7 @@
     <nav>
       <a href="#features">Features</a>
       <a href="#usecases">Use cases</a>
+      <a href="#protocols">Protocols</a>
       <a href="#hardware">Hardware</a>
       <a href="#quickstart">Quick start</a>
       <a href="#api">API</a>
@@ -586,6 +587,100 @@
          VRF so route-table state stays isolated per session. Throw
          them at a route-reflector or a TOR and watch convergence.</p>
     </div>
+  </div>
+</section>
+
+<!-- Protocol emulation deep dive -->
+<section class="block" id="protocols">
+  <h2>Protocol emulation, in detail.</h2>
+  <p>Each emulated device is a real FRR 8.5 process tree (zebra + bgpd
+     + ospfd + ospf6d + isisd) running in its own Docker container,
+     pinned to its own Linux VRF on the host. Configuration drops into
+     the container as live vtysh commands — same syntax FRR users
+     already know.</p>
+
+  <div class="usecases" style="margin-top: 24px;">
+
+    <div class="uc">
+      <h4>BGP (IPv4 + IPv6)</h4>
+      <p>iBGP and eBGP, dual-stack. Configure local-AS, remote-AS,
+         neighbor IP, update-source, keepalive / hold timers. Use
+         loopback-IP as router-id and update-source for resilient
+         peering through ECMP. Per-neighbor selective start / stop
+         (shut just one peer, not the whole instance). Route-pool
+         attachments let you advertise thousands of prefixes per
+         neighbor with one click — increment by host, subnet, or
+         custom step. Graceful restart on by default.</p>
+    </div>
+
+    <div class="uc">
+      <h4>OSPFv2 + OSPFv3</h4>
+      <p>Both AFs as independent instances inside the same device.
+         Configurable area-id (decimal or dotted), point-to-point
+         network type on the interface, graceful restart toggle.
+         Router-id auto-derived from the loopback IPv4 / IPv6. The
+         /api/ospf/status endpoint reports per-neighbor adjacency
+         state (Full / 2-Way / ExStart / Init / Down). Same neighbor
+         table the GUI refresh button shows.</p>
+    </div>
+
+    <div class="uc">
+      <h4>IS-IS (multi-level, multi-AF)</h4>
+      <p>Level-1, Level-1-2, or Level-2-only via the dropdown. NET
+         constructed from a short area-id (e.g. <code>49.0001</code>
+         → <code>49.0001.0000.0000.0001.00</code>) or supplied
+         verbatim. IPv4 + IPv6 on the same iface, point-to-point
+         hello interval configurable. <code>show isis vrf &lt;name&gt;
+         neighbor</code> backs the status pane — adjacencies, hold
+         time, system-id, area mappings.</p>
+    </div>
+
+    <div class="uc">
+      <h4>DHCPv4 / DHCPv6</h4>
+      <p>Client mode runs dhclient inside the device container,
+         binds to its VLAN subif via PF_PACKET so VRF policy doesn't
+         interfere with broadcast DISCOVER. Server mode runs a
+         dnsmasq-based pool with configurable lease times, pool
+         start / end, gateway, gateway-route push, and DHCPv6
+         prefix delegation. Live lease state surfaces in the GUI
+         (lease IP, mask, gateway, expiry).</p>
+    </div>
+
+    <div class="uc">
+      <h4>VXLAN tunnels</h4>
+      <p>Up to N VXLAN tunnels per device. Each tunnel has a
+         configurable VNI, source / destination VTEP, UDP port (default
+         4789), and underlay interface. Multi-tunnel batch increment
+         on VNI, local VTEP, and remote VTEP (configurable steps:
+         +1 / +10 / +100 / +1000 for VNI; per-octet for IPs). Tunnels
+         show up as <code>vx&lt;vni&gt;-&lt;hash&gt;</code> on the
+         host with their FDB entries visible via <code>bridge fdb
+         show</code>.</p>
+    </div>
+
+    <div class="uc">
+      <h4>Per-device isolation</h4>
+      <p>Each device gets <code>vrf-&lt;short-id&gt;</code> with a
+         unique routing table (1000–1999). Its VLAN subif moves into
+         the VRF as kernel master, so bgpd's TCP/179 listener,
+         ospfd's IP-89 raw socket, and isisd's PF_PACKET bind all
+         live in that VRF's namespace. Run 10 BGP sessions on one
+         physical NIC, all to the same peer IP space, with zero
+         protocol-port collisions. Constraint: each device on a
+         shared NIC needs a unique VLAN tag (server returns HTTP
+         409 if you try to overlap).</p>
+    </div>
+
+  </div>
+
+  <div class="warn" style="background: #eff6ff; border-left: 3px solid var(--blue); padding: 14px 18px; margin-top: 28px; border-radius: 0 4px 4px 0;">
+    <p style="margin: 0; font-size: 14px; color: var(--ink-soft);">
+      <strong style="color: var(--ink);">Under the hood:</strong>
+      everything is real FRR — no Python mocks, no protocol stubs.
+      <code>docker exec ostg-frr-&lt;id&gt; vtysh -c 'show running-config'</code>
+      gives you the same output you'd see on a Cumulus or SONiC
+      switch. The state the GUI shows is what FRR actually reports.
+    </p>
   </div>
 </section>
 
