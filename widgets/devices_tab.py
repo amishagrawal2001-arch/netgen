@@ -1884,6 +1884,14 @@ class DevicesTab(QWidget):
         self.start_device_button.clicked.connect(self.start_selected_devices)
         self.stop_device_button.clicked.connect(self.stop_selected_devices)
         self.apply_button.clicked.connect(self.apply_selected_device_with_arp)
+        # Audit LOW #17: F5 reloads the device list from the server
+        # so devices added out-of-band (curl, /admin web UI, CLI)
+        # surface in the GUI. Background polling is disabled for
+        # stability reasons, so this is the explicit refresh path.
+        from PyQt5.QtWidgets import QShortcut as _QShortcut
+        from PyQt5.QtGui import QKeySequence as _QKeySequence
+        _reload_shortcut = _QShortcut(_QKeySequence("F5"), self)
+        _reload_shortcut.activated.connect(self.reload_devices_from_server)
         self.ping_button.clicked.connect(self.ping_selected_device)
         self.arp_button.clicked.connect(self._on_arp_button_clicked)
         self.copy_button.clicked.connect(self.copy_selected_device)
@@ -3723,6 +3731,124 @@ class DevicesTab(QWidget):
         put("Loopback IPv4", loopback_ipv4 if loopback_ipv4 else "")
         put("Loopback IPv6", loopback_ipv6 if loopback_ipv6 else "")
 
+    def reload_devices_from_server(self):
+        """Refresh the device list from the server-side database.
+
+        Audit LOW #17: no code listens for out-of-band device
+        changes — a device added via curl, CLI, or the /admin web
+        UI doesn't appear in the GUI until the user manually
+        triggers something. Background polling is explicitly
+        disabled (the timer at __init__ is set up but never
+        started; comment cites past QThread crashes), so a manual
+        refresh is the safest way to surface those changes.
+
+        Reachable via F5 (see __init__) and any future menu entry.
+        Fetches /api/device/database/devices from every online
+        server in self.server_interfaces and merges the result
+        into self.all_devices, keyed by Interface label. Devices
+        present locally but not on the server are KEPT so an
+        in-progress edit isn't clobbered by a stale fetch.
+        """
+        import requests as _req
+        from PyQt5.QtCore import QThread, QEventLoop
+
+        servers = getattr(self.main_window, "server_interfaces", []) or []
+        if not servers:
+            QMessageBox.information(
+                self, "Reload Devices",
+                "No servers configured — nothing to refresh.",
+            )
+            return
+
+        # Off-thread fetch per server, same pattern as
+        # _check_arp_resolution_sync so the UI keeps repainting.
+        class _DevFetchWorker(QThread):
+            def __init__(self, url):
+                super().__init__()
+                self._url = url
+                self.devices = []
+                self.error = None
+
+            def run(self):
+                try:
+                    r = _req.get(self._url, timeout=(3, 10))
+                    if r.ok:
+                        body = r.json() or {}
+                        # Endpoint returns either a list or a dict
+                        # with a "devices" key — handle both.
+                        if isinstance(body, list):
+                            self.devices = body
+                        elif isinstance(body, dict):
+                            self.devices = body.get("devices") or []
+                except Exception as exc:
+                    self.error = exc
+
+        merged_seen_ids = set()
+        for srv in servers:
+            if not srv.get("online", True):
+                continue
+            addr = srv.get("address")
+            if not addr:
+                continue
+            tg_id = srv.get("tg_id", "0")
+            url = f"{addr}/api/device/database/devices"
+            loop = QEventLoop()
+            worker = _DevFetchWorker(url)
+            worker.finished.connect(loop.quit)
+            worker.start()
+            loop.exec_()
+            worker.wait()
+            worker.deleteLater()
+            if worker.error is not None:
+                logger.warning(f"[RELOAD] {addr} fetch failed: {worker.error}")
+                continue
+
+            for dev in worker.devices:
+                if not isinstance(dev, dict):
+                    continue
+                dev_id = dev.get("device_id") or dev.get("id")
+                if dev_id:
+                    merged_seen_ids.add(dev_id)
+                iface = dev.get("Interface") or dev.get("interface")
+                if not iface:
+                    # Server-side devices may carry a bare iface;
+                    # synthesize the canonical "TG N - <iface>" key.
+                    bare = dev.get("interface_name") or dev.get("port")
+                    if bare:
+                        iface = f"TG {tg_id} - {bare}"
+                if not iface:
+                    continue
+                # Don't clobber an in-progress local edit: if we
+                # already have this device locally with _needs_apply
+                # set, skip it.
+                with self.device_mutate_lock:
+                    bucket = self.main_window.all_devices.setdefault(iface, [])
+                    existing = next(
+                        (d for d in bucket if d.get("device_id") == dev_id),
+                        None,
+                    )
+                    if existing is not None:
+                        if existing.get("_needs_apply") or existing.get("_is_new"):
+                            continue  # Preserve user's pending edit
+                        existing.update({
+                            k: v for k, v in dev.items()
+                            if not k.startswith("_")
+                        })
+                    else:
+                        # Server-side device new to us — add it,
+                        # mark as already applied (no _is_new).
+                        dev.setdefault("device_id", dev_id or str(uuid.uuid4()))
+                        dev["Interface"] = iface
+                        dev.setdefault("Status", dev.get("Status") or "Stopped")
+                        bucket.append(dev)
+
+        # Refresh table after merge.
+        self.update_device_table(self.main_window.all_devices)
+        logger.info(
+            f"[RELOAD] Synced from {len(servers)} server(s); "
+            f"{len(merged_seen_ids)} device id(s) merged"
+        )
+
     def populate_device_table(self):
         """Populate the device table from the data structure."""
         try:
@@ -4257,7 +4383,15 @@ class DevicesTab(QWidget):
         """Validate edited table cell values."""
         try:
             if header_name == "Device Name":
-                return 0 < len(value) <= 50
+                # Audit LOW #15: device name flows into shell-like
+                # contexts on the server (FRR container names, sysctl
+                # commands). Restrict to a safe charset so an inline
+                # edit can't slip in a `;` or space that the
+                # AddDeviceDialog already rejects.
+                if not (0 < len(value) <= 64):
+                    return False
+                import re as _re
+                return bool(_re.match(r"^[A-Za-z0-9][A-Za-z0-9._-]*$", value))
 
             if header_name == "IPv4":
                 if not value:
@@ -5974,9 +6108,20 @@ class DevicesTab(QWidget):
 
         pasted_devices = []
 
+        import re as _re
+
         for copied_device in copied_devices:
-            # Generate a unique name for the pasted device.
-            base_name = (copied_device.get("Device Name") or "Device").rstrip("_Copy").rstrip("_") or "Device"
+            # Generate a unique name for the pasted device. The previous
+            # implementation used .rstrip("_Copy"), but rstrip is
+            # character-based — `"x_Copy_2".rstrip("_Copy")` returns
+            # `"x_Copy_2"` unchanged because "2" isn't in the strip
+            # set. Use a proper suffix regex so we strip an actual
+            # trailing `_Copy` or `_Copy_<N>` token. Result:
+            #   "router"          → "router_Copy"
+            #   "router_Copy"     → "router_Copy_2"   (not "_Copy_Copy")
+            #   "router_Copy_5"   → "router_Copy_6"   (not "_Copy_5_Copy")
+            raw_name = copied_device.get("Device Name") or "Device"
+            base_name = _re.sub(r'_Copy(_\d+)?$', '', raw_name) or "Device"
             new_name = f"{base_name}_Copy"
             counter = 1
             while new_name in existing_names:
