@@ -10495,9 +10495,9 @@ def get_interfaces():
             is_vxlan_bridge = re.match(r'^br\d+$', name)  # Matches br5000, br5001, etc.
             is_vxlan_interface = re.match(r'^vx\d+-\w+$', name)  # Matches vx5000-9d751a, vx5001-abc123, etc.
             
-            if (name.startswith('vlan') or 
+            if (name.startswith('vlan') or
                 (name.startswith('lo') and name != 'lo') or  # Skip lo* except 'lo' itself
-                name.startswith('docker') or 
+                name.startswith('docker') or
                 name.startswith('br-') or  # Docker bridges
                 name.startswith('bridge') or
                 name.startswith('virbr') or
@@ -10508,6 +10508,14 @@ def get_interfaces():
                 name.startswith('awdl') or
                 name.startswith('llw') or
                 name.startswith('anpi') or
+                # Multi-device VRF masters created by FRRDockerManager
+                # (utils/frr_docker._create_vrf). These are internal
+                # routing-table holders; the device is configured on
+                # the parent NIC / VLAN subif, not on the VRF iface
+                # itself, so showing them in the UI's TG/Port picker
+                # would let the user accidentally pick a non-selectable
+                # interface.
+                name.startswith('vrf-') or
                 is_vxlan_bridge or  # Skip VXLAN bridges on host (they come from containers)
                 is_vxlan_interface):  # Skip VXLAN interfaces on host (they come from containers)
                 continue
