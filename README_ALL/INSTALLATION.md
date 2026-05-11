@@ -323,17 +323,12 @@ The installation includes:
 
 ### FRR Docker Image
 
-- **Image**: `ostg-frr:latest`
+- **Image**: `netgen-frr:latest` (legacy: `ostg-frr:latest`)
 - **Base**: Alpine Linux with FRR
 - **Features**: BGP, OSPF, IS-IS support
-- **Network**: Connected to `ostg-frr-network`
-
-### Docker Network
-
-- **Name**: `ostg-frr-network`
-- **Type**: Bridge network
-- **Subnet**: 172.30.0.0/16
-- **Purpose**: Isolated network for FRR containers
+- **Networking**: `--net=host` (container shares the server's network
+  namespace so FRR can bind directly to physical interfaces and VLAN
+  subinterfaces). No docker bridge is used.
 
 ## Configuration
 
@@ -349,8 +344,7 @@ debug = false
 
 [docker]
 enabled = true
-frr_image = ostg-frr:latest
-network_name = ostg-frr-network
+frr_image = netgen-frr:latest
 
 [logging]
 level = INFO

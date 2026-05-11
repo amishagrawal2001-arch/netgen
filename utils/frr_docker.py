@@ -55,18 +55,23 @@ def _resolve_frr_image(client=None):
 
 
 class FRRDockerManager:
-    """Manages FRR Docker containers using isolated bridge networking"""
+    """Manages FRR Docker containers on host networking.
+
+    Earlier designs created an isolated docker bridge (`ostg-frr-network`,
+    172.30.0.0/16) and rigged static host routes to it. The runtime now
+    starts every FRR container with `network_mode='host'` so the container
+    sees real interfaces (and VLAN subinterfaces) directly — the bridge
+    is no longer needed and the setup helpers were removed.
+    """
 
     def __init__(self):
         self.client = docker.from_env()
-        # Container / network prefix kept at ostg-frr for backwards
-        # compatibility with already-running deployments (renaming
-        # them would orphan in-flight containers); the image name
-        # auto-resolves so the new netgen-frr build works without
-        # config edits.
+        # Container prefix kept at ostg-frr for backwards compatibility
+        # with already-running deployments (renaming would orphan
+        # in-flight containers); the image name auto-resolves so the
+        # new netgen-frr build works without config edits.
         self.container_prefix = "ostg-frr"
         self.image_name = _resolve_frr_image(self.client)
-        self.network_name = "ostg-frr-network"
     
     def _sanitize_container_name(self, name: str) -> str:
         """Sanitize device name for use in container naming."""
@@ -170,72 +175,17 @@ class FRRDockerManager:
         octets = [octet or 1 for octet in octets]
         return ".".join(str(octet) for octet in octets)
     
-    def setup_network_infrastructure(self):
-        """Set up Docker network infrastructure for FRR containers."""
-        try:
-            # Create isolated bridge network for FRR containers
-            try:
-                network = self.client.networks.get(self.network_name)
-                logger.info(f"[FRR] Network {self.network_name} already exists")
-            except docker.errors.NotFound:
-                network = self.client.networks.create(
-                    self.network_name,
-                    driver="bridge",
-                    ipam=docker.types.IPAMConfig(
-                        driver="default",
-                        pool_configs=[
-                            docker.types.IPAMPool(
-                                subnet="172.30.0.0/16",
-                                gateway="172.30.0.1"
-                            )
-                        ]
-                    )
-                )
-                logger.info(f"[FRR] Created network {self.network_name}")
-            
-            # Set up host routing to allow containers to reach host networks
-            self._setup_container_routing()
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"[FRR] Failed to set up network infrastructure: {e}")
-            return False
-    
-    def _setup_container_routing(self):
-        """Set up host routing to allow containers to reach host networks."""
-        try:
-            # Add routes on host to allow container network to reach host networks
-            routes_to_add = [
-                ("192.168.0.0/24", "172.30.0.1"),
-                ("192.168.100.0/24", "172.30.0.1"),
-                ("192.168.33.0/24", "172.30.0.1"),
-            ]
-            
-            for network, gateway in routes_to_add:
-                try:
-                    result = subprocess.run([
-                        "ip", "route", "add", network, "via", gateway
-                    ], capture_output=True, text=True)
-                    
-                    if result.returncode == 0:
-                        logger.info(f"[FRR] Added route {network} via {gateway}")
-                    elif "File exists" in result.stderr:
-                        logger.info(f"[FRR] Route {network} via {gateway} already exists")
-                    else:
-                        logger.warning(f"[FRR] Failed to add route {network} via {gateway}: {result.stderr}")
-                        
-                except Exception as e:
-                    logger.warning(f"[FRR] Failed to add route {network} via {gateway}: {e}")
-            
-            return True
-            
-        except Exception as e:
-            logger.error(f"[FRR] Failed to set up container routing: {e}")
-            return False
-    
+    # NOTE: setup_network_infrastructure() and _setup_container_routing()
+    # used to create an isolated docker bridge (`ostg-frr-network`,
+    # 172.30.0.0/16) and install host static routes through it. That code
+    # was dead — every container starts with `network_mode='host'` (see
+    # start_frr_container below), so the bridge was never attached and
+    # the static routes pointed at an unreachable next-hop. Both helpers
+    # were removed; if you ever need an isolated FRR netns again, the
+    # right tool is a docker macvlan or a custom netns, not a bridge.
+
     def start_frr_container(self, device_id: str, device_config: Dict) -> Optional[str]:
-        """Start FRR container with isolated bridge networking"""
+        """Start FRR container on host networking"""
         try:
             device_name = device_config.get('device_name', f'device_{device_id}')
             dhcp_mode = (device_config.get('dhcp_mode') or '').lower()
@@ -909,9 +859,8 @@ class FRRDockerManager:
 # Global instance
 frr_manager = FRRDockerManager()
 
-def setup_frr_network():
-    """Set up FRR network infrastructure."""
-    return frr_manager.setup_network_infrastructure()
+# setup_frr_network() was removed along with setup_network_infrastructure();
+# FRR runs on host networking and needs no docker network/bridge setup.
 
 def start_frr_container(device_id: str, device_config: Dict) -> Optional[str]:
     """Start FRR container for device."""

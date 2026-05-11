@@ -12,7 +12,7 @@ BGP_ROUTES = {}  # Store advertised routes per device
 # Import Docker FRR management
 try:
     from .frr_docker import (
-        start_frr_container, stop_frr_container, setup_frr_network,
+        start_frr_container, stop_frr_container,
         configure_bgp_neighbor, get_bgp_status, get_bgp_neighbors
     )
     DOCKER_FRR_AVAILABLE = True

@@ -167,14 +167,8 @@ build_frr_image() {
 }
 
 # Function to create OSTG Docker network
-setup_ostg_network() {
-    echo "Setting up OSTG Docker network..."
-    
-    # Create the OSTG FRR network
-    docker network create --driver bridge ostg-frr-network 2>/dev/null || echo "Network ostg-frr-network already exists"
-    
-    echo "OSTG Docker network setup complete"
-}
+# setup_ostg_network() removed: FRR containers run with --net=host,
+# so the ostg-frr-network bridge was never used.
 
 # Main installation function
 main() {
@@ -213,10 +207,9 @@ main() {
     
     # Build FRR image
     build_frr_image
-    
-    # Setup network
-    setup_ostg_network
-    
+
+    # Network setup step removed — FRR runs on host networking.
+
     echo ""
     echo "=== OSTG Docker + FRR Installation Complete ==="
     echo ""
@@ -235,7 +228,7 @@ case "${1:-}" in
         echo "Skipping Docker installation..."
         verify_docker
         build_frr_image
-        setup_ostg_network
+        # Network setup step removed — FRR runs on host networking.
         ;;
     --help|-h)
         echo "Usage: $0 [--skip-docker] [--help]"
