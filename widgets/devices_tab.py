@@ -6446,27 +6446,54 @@ class DevicesTab(QWidget):
                 "_needs_apply": True  # Mark for server update
             })
 
-            # Update protocol configs if provided (but don't overwrite existing if not provided)
-            if ospf_config:
-                device_info["ospf_config"] = ospf_config
-                if "OSPF" not in device_info.get("protocols", []):
-                    device_info.setdefault("protocols", []).append("OSPF")
+            # Update protocol configs based on what the dialog returned.
+            # NEW behaviour (was a bug): an unchecked protocol clears
+            # its config + removes it from the device's protocols list.
+            # Previously only ADDs happened — once a protocol was on a
+            # device you couldn't un-set it from the GUI, which is
+            # exactly the trap user hit ("I didn't enable BGP but
+            # apply keeps trying to configure BGP"). The protocol got
+            # added at some earlier point and the Edit dialog had no
+            # way to remove it.
+            #
+            # Each protocol's checkbox state determines whether the
+            # dialog returns a config (truthy) or None. We treat the
+            # ABSENCE of a config as the user explicitly disabling
+            # the protocol and prune both the config dict and the
+            # protocols list entry.
+            protocols_list = device_info.setdefault("protocols", [])
 
-            if bgp_config:
-                device_info["bgp_config"] = bgp_config
-                if "BGP" not in device_info.get("protocols", []):
-                    device_info.setdefault("protocols", []).append("BGP")
+            def _set_protocol(label, config_dict, config_key, extra_cleanup=None):
+                if config_dict:
+                    device_info[config_key] = config_dict
+                    if label not in protocols_list:
+                        protocols_list.append(label)
+                else:
+                    # User unchecked this protocol — clear the stored
+                    # config and drop the label from the protocols
+                    # list. Server will see the device has no BGP
+                    # next apply and won't try to create the FRR
+                    # container for it.
+                    if config_key in device_info:
+                        del device_info[config_key]
+                    if label in protocols_list:
+                        protocols_list.remove(label)
+                    if extra_cleanup:
+                        extra_cleanup()
 
+            _set_protocol("OSPF", ospf_config, "ospf_config")
+            _set_protocol("BGP",  bgp_config,  "bgp_config")
+            _set_protocol("IS-IS", isis_config, "isis_config")
+
+            def _dhcp_extra_cleanup():
+                device_info.pop("dhcp_mode", None)
             if dhcp_config:
                 device_info["dhcp_config"] = dhcp_config
                 device_info["dhcp_mode"] = (dhcp_config.get("mode") or "client").lower()
-                if "DHCP" not in device_info.get("protocols", []):
-                    device_info.setdefault("protocols", []).append("DHCP")
-
-            if isis_config:
-                device_info["isis_config"] = isis_config
-                if "IS-IS" not in device_info.get("protocols", []):
-                    device_info.setdefault("protocols", []).append("IS-IS")
+                if "DHCP" not in protocols_list:
+                    protocols_list.append("DHCP")
+            else:
+                _set_protocol("DHCP", None, "dhcp_config", extra_cleanup=_dhcp_extra_cleanup)
 
         # Lock released — VXLAN normalization touches helpers that
         # don't need the lock, and the subsequent assignments are
