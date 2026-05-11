@@ -11243,9 +11243,9 @@ def get_device_arp_status(device_id):
         server_interface = device.get('server_interface')
         if server_interface:
             try:
-                import subprocess
+                # subprocess imported at module top — don't shadow it here.
                 # Check interface status using ip link show
-                result = subprocess.run(["ip", "link", "show", server_interface], 
+                result = subprocess.run(["ip", "link", "show", server_interface],
                                       capture_output=True, text=True, timeout=5)
                 if result.returncode == 0:
                     # Check if interface is UP
@@ -11287,6 +11287,32 @@ def get_device_arp_status(device_id):
         ipv4_gateway = _strip_mask(device.get('ipv4_gateway'))
         ipv6_gateway = _strip_mask(device.get('ipv6_gateway'))
 
+        # When multi-device-on-same-iface is enabled, each device's
+        # interface lives inside its own Linux VRF (created in
+        # utils/frr_docker._create_vrf). Routes to the device's
+        # subnet only exist in that VRF's routing table — `ping
+        # 192.168.0.2` from the default netns gets "Network is
+        # unreachable" even though the address is perfectly fine
+        # inside the VRF. Detect the VRF (if any) and prefix every
+        # ARP probe with `ip vrf exec <vrf-name>` so probes run in
+        # the right routing context. Falls back to default netns
+        # when no VRF is wired up (single-device legacy path).
+        ping_prefix: list = []
+        try:
+            from utils.frr_docker import FRRDockerManager
+            _vrf_name = FRRDockerManager().vrf_name_for_device(device_id)
+            if _vrf_name:
+                _check = subprocess.run(
+                    ["ip", "-o", "link", "show", _vrf_name],
+                    capture_output=True, text=True, timeout=2,
+                )
+                if _check.returncode == 0 and (_check.stdout or "").strip():
+                    ping_prefix = ["ip", "vrf", "exec", _vrf_name]
+                    logging.debug(
+                        f"[ARP STATUS] device {device_id}: probing inside {_vrf_name}"
+                    )
+        except Exception as _vrf_exc:
+            logging.warning(f"[ARP STATUS] VRF lookup failed for {device_id}: {_vrf_exc}")
 
         # Perform ARP checks
         arp_results = {
@@ -11300,14 +11326,20 @@ def get_device_arp_status(device_id):
                 "ipv4_target": ipv4_address or "",
                 "ipv6_target": ipv6_address or ipv6_gateway or "",
                 "gateway_target": ipv4_gateway or "",
+                "vrf": ping_prefix[3] if ping_prefix else "",
             },
         }
 
         # Check IPv4 ARP
+        # NB: do NOT re-import subprocess inside these try blocks —
+        # subprocess is imported at module top-level, and a local
+        # `import subprocess` would shadow it function-wide, making
+        # the earlier VRF-detection block fail with "cannot access
+        # local variable 'subprocess' where it is not associated
+        # with a value". Verified the hard way.
         if ipv4_address:
             try:
-                import subprocess
-                result = subprocess.run(["ping", "-c", "1", "-W", "1", ipv4_address],
+                result = subprocess.run(ping_prefix + ["ping", "-c", "1", "-W", "1", ipv4_address],
                                       capture_output=True, text=True, timeout=5)
                 arp_results["arp_ipv4_resolved"] = result.returncode == 0
                 arp_results["details"]["ipv4_ping"] = "success" if result.returncode == 0 else "failed"
@@ -11320,24 +11352,25 @@ def get_device_arp_status(device_id):
                         arp_results["details"]["ipv4_ping_error"] = err
             except Exception as e:
                 arp_results["details"]["ipv4_ping"] = f"error: {e}"
-        
-        # Check IPv6 NDP
+
+        # Check IPv6 NDP (subprocess already at module scope — see IPv4 note)
         if ipv6_address or ipv6_gateway:
             try:
-                import subprocess
                 ipv6_target = ipv6_gateway or ipv6_address
-                ping6_cmd = ["ping6", "-c", "1", "-W", "1", ipv6_target]
+                ping6_cmd = ping_prefix + ["ping6", "-c", "1", "-W", "1", ipv6_target]
                 result = subprocess.run(ping6_cmd, capture_output=True, text=True, timeout=5)
                 arp_results["arp_ipv6_resolved"] = result.returncode == 0
                 arp_results["details"]["ipv6_ping_target"] = ipv6_target
                 arp_results["details"]["ipv6_ping"] = "success" if result.returncode == 0 else "failed"
                 if result.returncode != 0:
                     try:
+                        # Look up the neighbor in the correct VRF too.
+                        neigh_cmd = ["ip", "-6", "neigh", "show"]
+                        if ping_prefix:
+                            neigh_cmd += ["vrf", ping_prefix[3]]
+                        neigh_cmd += [ipv6_target]
                         neigh_result = subprocess.run(
-                            ["ip", "-6", "neigh", "show", ipv6_target],
-                            capture_output=True,
-                            text=True,
-                            timeout=5
+                            neigh_cmd, capture_output=True, text=True, timeout=5
                         )
                         arp_results["details"]["ipv6_neigh"] = neigh_result.stdout.strip() or "no entry"
                     except Exception as neigh_exc:
@@ -11345,12 +11378,11 @@ def get_device_arp_status(device_id):
             except Exception as e:
                 arp_results["details"]["ipv6_ping"] = f"error: {e}"
                 arp_results["details"]["ipv6_ping_target"] = ipv6_gateway or ipv6_address
-        
-        # Check gateway connectivity
+
+        # Check gateway connectivity (subprocess already at module scope — see IPv4 note)
         if ipv4_gateway:
             try:
-                import subprocess
-                result = subprocess.run(["ping", "-c", "1", "-W", "1", ipv4_gateway],
+                result = subprocess.run(ping_prefix + ["ping", "-c", "1", "-W", "1", ipv4_gateway],
                                       capture_output=True, text=True, timeout=5)
                 arp_results["arp_gateway_resolved"] = result.returncode == 0
                 arp_results["details"]["gateway_ping"] = "success" if result.returncode == 0 else "failed"
