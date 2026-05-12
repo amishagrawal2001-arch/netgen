@@ -955,6 +955,25 @@ class TrafficGeneratorClient(
         save_session_action.triggered.connect(self.save_session)
         file_menu.addAction(save_session_action)
 
+        file_menu.addSeparator()
+
+        # Topology export / import — round-trip every configured device
+        # as a portable JSON file. Pairs with the
+        # /api/devices/{export,import} endpoints on the server.
+        export_topology_action = QAction("Export Devices…", self)
+        export_topology_action.setStatusTip(
+            "Save every configured device on the selected server to a JSON file"
+        )
+        export_topology_action.triggered.connect(self.export_devices_to_file)
+        file_menu.addAction(export_topology_action)
+
+        import_topology_action = QAction("Import Devices…", self)
+        import_topology_action.setStatusTip(
+            "Recreate devices on the selected server from a previously-exported JSON file"
+        )
+        import_topology_action.triggered.connect(self.import_devices_from_file)
+        file_menu.addAction(import_topology_action)
+
         # Edit menu
         edit_menu = QMenu("&Edit", self)
         menu_bar.addMenu(edit_menu)

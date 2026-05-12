@@ -10899,6 +10899,131 @@ def get_all_devices_from_db():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/devices/export", methods=["GET"])
+def export_devices():
+    """Export all device configurations as a portable JSON document.
+
+    Strips per-instance / runtime fields (status, ARP / BGP / OSPF /
+    ISIS / DHCP-lease state, last_*_check timestamps, container_id)
+    so the document represents *intent* — what you want to recreate
+    on import — rather than current observed state. Pair with
+    /api/devices/import to round-trip a lab topology into a JSON
+    file that fits in version control.
+    """
+    try:
+        devices = device_db.get_all_devices() or []
+        # Fields that describe *runtime state* and shouldn't travel
+        # with an exported topology — they'll be recomputed by the
+        # monitors after import.
+        runtime_fields = {
+            "status", "arp_status", "arp_ipv4_resolved",
+            "arp_ipv6_resolved", "arp_gateway_resolved", "last_arp_check",
+            "bgp_established", "bgp_ipv4_established", "bgp_ipv6_established",
+            "bgp_ipv4_state", "bgp_ipv6_state", "last_bgp_check",
+            "ospf_established", "ospf_state", "ospf_neighbors",
+            "ospf_ipv4_running", "ospf_ipv6_running",
+            "ospf_ipv4_established", "ospf_ipv6_established",
+            "ospf_ipv4_uptime", "ospf_ipv6_uptime", "last_ospf_check",
+            "isis_running", "isis_established", "isis_state",
+            "isis_neighbors", "isis_areas", "isis_uptime",
+            "last_isis_check",
+            "dhcp_state", "dhcp_running", "dhcp_lease_ip",
+            "dhcp_lease_mask", "dhcp_lease_gateway", "dhcp_lease_server",
+            "dhcp_lease_expires", "dhcp_lease_subnet", "last_dhcp_check",
+            "vxlan_state", "vxlan_last_error", "vxlan_updated_at",
+            "container_id", "created_at", "updated_at",
+            "isis_manual_override", "isis_manual_override_time",
+        }
+        exported = []
+        for d in devices:
+            cleaned = {k: v for k, v in d.items() if k not in runtime_fields}
+            exported.append(cleaned)
+        return jsonify({
+            "version": 1,
+            "count": len(exported),
+            "exported_at": datetime.now(timezone.utc).isoformat(),
+            "devices": exported,
+        }), 200
+    except Exception as exc:
+        logging.error(f"[DEVICE EXPORT] {exc}")
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/devices/import", methods=["POST"])
+def import_devices():
+    """Import device configurations from a previously-exported JSON.
+
+    Accepts the same shape /api/devices/export emits: a top-level
+    object with a `devices` array. Each entry is re-applied via the
+    existing /api/device/apply pipeline (one POST per device, in
+    sequence) so all the validation, VLAN provisioning, VRF wiring,
+    FRR-container start, and DHCP lease acquisition happen exactly
+    as they would for a manual add.
+
+    Returns a summary: { imported, failed, total, errors: [...] }.
+    Failures don't abort the rest of the batch — partial imports are
+    common when one device's interface isn't present.
+    """
+    try:
+        payload = request.get_json() or {}
+        devices = payload.get("devices") or []
+        if not isinstance(devices, list):
+            return jsonify({"error": "expected 'devices' array"}), 400
+
+        imported = 0
+        failed = 0
+        errors = []
+
+        # We re-enter apply_device() in-process by POSTing to the
+        # local Flask server — avoids duplicating the apply pipeline
+        # but adds an HTTP hop. For typical batches this is fine.
+        import requests as _requests
+        self_url = f"http://127.0.0.1:{int(os.environ.get('NETGEN_SERVER_PORT', '5050'))}"
+
+        for entry in devices:
+            if not isinstance(entry, dict):
+                failed += 1
+                errors.append("non-dict device entry skipped")
+                continue
+            # Translate exported field names (some use 'ipv4_address',
+            # others 'IPv4') to the /api/device/apply schema. Most
+            # fields already match; we map the few that diverge.
+            apply_payload = dict(entry)
+            apply_payload.setdefault("ipv4", entry.get("ipv4_address", ""))
+            apply_payload.setdefault("ipv6", entry.get("ipv6_address", ""))
+            try:
+                r = _requests.post(
+                    f"{self_url}/api/device/apply",
+                    json=apply_payload,
+                    timeout=60,
+                )
+                if r.status_code == 200:
+                    imported += 1
+                else:
+                    failed += 1
+                    name = entry.get("device_name") or entry.get("device_id") or "?"
+                    msg = ""
+                    try:
+                        msg = (r.json() or {}).get("error") or r.text[:120]
+                    except Exception:
+                        msg = r.text[:120]
+                    errors.append(f"{name}: HTTP {r.status_code} {msg}")
+            except Exception as exc:
+                failed += 1
+                name = entry.get("device_name") or entry.get("device_id") or "?"
+                errors.append(f"{name}: {exc}")
+
+        return jsonify({
+            "imported": imported,
+            "failed": failed,
+            "total": len(devices),
+            "errors": errors[:20],   # cap to keep response readable
+        }), 200
+    except Exception as exc:
+        logging.error(f"[DEVICE IMPORT] {exc}")
+        return jsonify({"error": str(exc)}), 500
+
+
 @app.route("/api/device/database/devices/<device_id>", methods=["GET"])
 def get_device_from_db(device_id):
     """Get a specific device from database."""
