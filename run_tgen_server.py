@@ -11003,6 +11003,123 @@ def stop_bgp_monitoring():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/monitors/health", methods=["GET"])
+def get_monitors_health():
+    """Aggregated health snapshot of every background monitor.
+
+    Returns one entry per protocol monitor:
+      {
+        "ok": <bool>,                    # overall green light
+        "monitors": {
+          "arp":  {"running": bool, "last_check_at": str|None,
+                   "stale_secs": int|None},
+          "bgp":  {...},
+          "ospf": {...},
+          "isis": {...},
+          "dhcp": {"running": bool},     # no DB heartbeat for DHCP
+        },
+        "checked_at": "<iso8601>",
+      }
+
+    A monitor is "stale" when its DB heartbeat (`last_*_check` row on
+    any Running device) is older than 3× its polling interval — a
+    safe threshold that catches a wedged monitor without false-firing
+    on a single missed tick. Backs the client's status-bar widget.
+    """
+    from datetime import datetime, timezone
+
+    def _max_db_age(column: str):
+        """Return seconds since the freshest `column` timestamp across
+        Running devices, or None if no Running device has one yet."""
+        try:
+            devs = device_db.get_all_devices() or []
+        except Exception:
+            return None
+        newest = None
+        now = datetime.now(timezone.utc)
+        for d in devs:
+            if (d.get("status") or "") != "Running":
+                continue
+            ts = d.get(column)
+            if not ts:
+                continue
+            try:
+                ts_dt = datetime.fromisoformat(ts)
+            except Exception:
+                continue
+            age = (now - ts_dt).total_seconds()
+            if newest is None or age < newest:
+                newest = age
+        return newest
+
+    monitors = {}
+    overall_ok = True
+
+    # ARP — 30s default
+    try:
+        arp_running = bool(getattr(arp_monitor, "is_running", False))
+        arp_age = _max_db_age("last_arp_check")
+        arp_stale = arp_running and arp_age is not None and arp_age > 90
+        monitors["arp"] = {"running": arp_running, "stale_secs": arp_age, "stale": arp_stale}
+        if not arp_running or arp_stale:
+            overall_ok = False
+    except Exception as exc:
+        monitors["arp"] = {"running": False, "error": str(exc)}
+        overall_ok = False
+
+    # BGP — 30s default
+    try:
+        bgp_running = bool(getattr(bgp_monitor, "is_running", False))
+        bgp_age = _max_db_age("last_bgp_check")
+        bgp_stale = bgp_running and bgp_age is not None and bgp_age > 90
+        monitors["bgp"] = {"running": bgp_running, "stale_secs": bgp_age, "stale": bgp_stale}
+        if not bgp_running or bgp_stale:
+            overall_ok = False
+    except Exception as exc:
+        monitors["bgp"] = {"running": False, "error": str(exc)}
+        overall_ok = False
+
+    # OSPF — 30s default
+    try:
+        ospf_running = bool(getattr(ospf_monitor, "is_running", False))
+        ospf_age = _max_db_age("last_ospf_check")
+        ospf_stale = ospf_running and ospf_age is not None and ospf_age > 90
+        monitors["ospf"] = {"running": ospf_running, "stale_secs": ospf_age, "stale": ospf_stale}
+        if not ospf_running or ospf_stale:
+            overall_ok = False
+    except Exception as exc:
+        monitors["ospf"] = {"running": False, "error": str(exc)}
+        overall_ok = False
+
+    # ISIS — uses its own polling; no `is_running` attr but the
+    # last_isis_check DB column is updated on every cycle.
+    try:
+        isis_age = _max_db_age("last_isis_check")
+        isis_stale = isis_age is not None and isis_age > 90
+        monitors["isis"] = {"running": True, "stale_secs": isis_age, "stale": isis_stale}
+        if isis_stale:
+            overall_ok = False
+    except Exception as exc:
+        monitors["isis"] = {"running": False, "error": str(exc)}
+        overall_ok = False
+
+    # DHCP — no per-device DB heartbeat; just report running flag.
+    try:
+        dhcp_running = bool(getattr(dhcp_client_monitor, "is_running", False))
+        monitors["dhcp"] = {"running": dhcp_running}
+        if not dhcp_running:
+            overall_ok = False
+    except Exception as exc:
+        monitors["dhcp"] = {"running": False, "error": str(exc)}
+        overall_ok = False
+
+    return jsonify({
+        "ok": overall_ok,
+        "monitors": monitors,
+        "checked_at": datetime.now(timezone.utc).isoformat(),
+    }), 200
+
+
 @app.route("/api/bgp/monitor/status", methods=["GET"])
 def get_bgp_monitor_status():
     """Get BGP monitoring status."""
