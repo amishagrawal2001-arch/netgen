@@ -336,18 +336,50 @@ def _parse_ipv6(interface: str, container=None) -> Optional[list]:
     return None
 
 
-def _parse_gateway(interface: str, container=None) -> Optional[str]:
-    """Return default gateway for interface if present."""
-    try:
-        result = _run_command(["ip", "route", "show", "dev", interface], timeout=5, container=container)
-        for line in result.stdout.splitlines():
-            line = line.strip()
-            if line.startswith("default via"):
-                parts = line.split()
-                if len(parts) >= 3:
-                    return parts[2]
-    except Exception as exc:
-        logger.debug("[DHCP] Failed to parse gateway for %s: %s", interface, exc)
+def _parse_gateway(interface: str, container=None, device_id: Optional[str] = None) -> Optional[str]:
+    """Return default gateway for interface if present.
+
+    Checks the main routing table first, then the device's VRF table
+    (if the device has been provisioned into one). Without the VRF
+    fallback, this would silently return None on any device whose
+    dhclient-installed default route has already been migrated into
+    the per-device VRF table (see _migrate_dhcp_route_to_vrf), even
+    though the gateway is perfectly reachable through the VRF.
+    """
+    def _scan(extra_args):
+        try:
+            result = _run_command(
+                ["ip", "route", "show"] + extra_args + ["dev", interface],
+                timeout=5, container=container,
+            )
+            for line in result.stdout.splitlines():
+                line = line.strip()
+                if line.startswith("default via"):
+                    parts = line.split()
+                    if len(parts) >= 3:
+                        return parts[2]
+        except Exception as exc:
+            logger.debug("[DHCP] route-show failed (%s): %s", " ".join(extra_args) or "main", exc)
+        return None
+
+    gw = _scan([])
+    if gw:
+        return gw
+
+    # Fall back to the device's VRF table when available.
+    if device_id:
+        try:
+            from utils.frr_docker import FRRDockerManager
+            vrf_name = FRRDockerManager().vrf_name_for_device(device_id)
+            if vrf_name:
+                check = subprocess.run(
+                    ["ip", "-o", "link", "show", vrf_name],
+                    capture_output=True, text=True, timeout=2,
+                )
+                if check.returncode == 0 and (check.stdout or "").strip():
+                    return _scan(["vrf", vrf_name])
+        except Exception as exc:
+            logger.debug("[DHCP] VRF gateway lookup failed for %s: %s", device_id, exc)
     return None
 
 
@@ -558,7 +590,7 @@ def get_dhcp_client_snapshot(
         return snapshot
 
     ip_info = _parse_ipv4(interface, container=container)
-    gateway = _parse_gateway(interface, container=container) or ""
+    gateway = _parse_gateway(interface, container=container, device_id=device_id) or ""
     dhclient_running = _is_dhclient_running(interface, container=container)
 
     if ip_info:
@@ -849,7 +881,7 @@ def start_dhcp_client(
             if not ip_info:
                 ipv4_result = {"success": False, "error": "Lease timeout"}
             else:
-                gateway = _parse_gateway(interface, container=container) or ""
+                gateway = _parse_gateway(interface, container=container, device_id=device_id) or ""
                 lease_subnet = ""
                 try:
                     ip_val = ip_info.get("ip")
@@ -1702,7 +1734,7 @@ def ensure_dhcp_services(
             existing_state = (existing_device or {}).get("dhcp_state")
             existing_ip = ((existing_device or {}).get("dhcp_lease_ip") or "").strip()
             if existing_state == "Leased" and existing_ip == ip_info.get("ip"):
-                gateway = _parse_gateway(interface, container=managed_container) or ""
+                gateway = _parse_gateway(interface, container=managed_container, device_id=device_id) or ""
                 lease_subnet = ""
                 try:
                     ip_val = ip_info.get("ip")
