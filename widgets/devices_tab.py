@@ -1644,6 +1644,33 @@ class DevicesTab(QWidget):
         # Set tooltips for editable columns
         self.setup_column_tooltips()
 
+        # Filter bar above the table. Once a deployment grows past ~15
+        # devices, scrolling to find one becomes annoying. The filter
+        # box hides rows whose Device-Name / Interface / IPv4 / IPv6 /
+        # MAC don't contain the (case-insensitive) substring entered.
+        # Empty box → all rows visible (the at-rest state).
+        from PyQt5.QtWidgets import QLineEdit
+        filter_row = QHBoxLayout()
+        filter_row.setContentsMargins(0, 0, 0, 4)
+        filter_row.setSpacing(6)
+        filter_label = QLabel("Filter:")
+        filter_label.setStyleSheet("color: #6b7280; font-size: 11px;")
+        self._device_filter_input = QLineEdit()
+        self._device_filter_input.setPlaceholderText(
+            "Device Name / Interface / IPv4 / IPv6 / MAC …"
+        )
+        self._device_filter_input.setClearButtonEnabled(True)
+        self._device_filter_input.setFixedHeight(22)
+        self._device_filter_input.setStyleSheet(
+            "QLineEdit { border: 1px solid #cbd5e1; border-radius: 4px;"
+            "  padding: 0 6px; font-size: 12px; background: #ffffff; }"
+            "QLineEdit:focus { border-color: #2563eb; }"
+        )
+        self._device_filter_input.textChanged.connect(self._apply_device_filter)
+        filter_row.addWidget(filter_label)
+        filter_row.addWidget(self._device_filter_input, 1)
+        layout.addLayout(filter_row)
+
         layout.addWidget(self.devices_table)
         
         # Configure column widths - make Status column smaller and ensure proper alignment
@@ -1897,6 +1924,27 @@ class DevicesTab(QWidget):
         from PyQt5.QtGui import QKeySequence as _QKeySequence
         _reload_shortcut = _QShortcut(_QKeySequence("F5"), self)
         _reload_shortcut.activated.connect(self.reload_devices_from_server)
+
+        # Additional keyboard shortcuts for the most-used actions.
+        # Mac- and Linux-friendly (uses Cmd on macOS, Ctrl elsewhere
+        # automatically — that's what QKeySequence("Ctrl+…") does).
+        # Each binding is a no-op when no row is selected (the
+        # underlying handlers already guard on that).
+        _apply_shortcut = _QShortcut(_QKeySequence("Ctrl+Return"), self)
+        _apply_shortcut.activated.connect(self.apply_selected_device_with_arp)
+        _start_shortcut = _QShortcut(_QKeySequence("Ctrl+S"), self)
+        _start_shortcut.activated.connect(self.start_selected_devices)
+        _stop_shortcut = _QShortcut(_QKeySequence("Ctrl+X"), self)
+        _stop_shortcut.activated.connect(self.stop_selected_devices)
+        _refresh_shortcut = _QShortcut(_QKeySequence("Ctrl+R"), self)
+        _refresh_shortcut.activated.connect(self._on_arp_button_clicked)
+        # Ctrl+F focuses the filter box.
+        _filter_shortcut = _QShortcut(_QKeySequence("Ctrl+F"), self)
+        _filter_shortcut.activated.connect(
+            lambda: self._device_filter_input.setFocus()
+            if hasattr(self, "_device_filter_input") else None
+        )
+
         self.ping_button.clicked.connect(self.ping_selected_device)
         self.arp_button.clicked.connect(self._on_arp_button_clicked)
         self.copy_button.clicked.connect(self.copy_selected_device)
@@ -4362,6 +4410,42 @@ class DevicesTab(QWidget):
             return
         self._apply_progress_bar.setVisible(False)
         self._apply_progress_label.setVisible(False)
+
+    def _apply_device_filter(self, text: str = "") -> None:
+        """Hide rows whose Name / Interface / IPv4 / IPv6 / MAC don't
+        contain `text` (case-insensitive). Empty text shows all rows.
+
+        Called on every keystroke from the filter QLineEdit. Iterates
+        the visible table only; safe to call frequently.
+        """
+        needle = (text or "").strip().lower()
+        if not hasattr(self, "devices_table"):
+            return
+
+        # Columns to scan. Some installs may not have every column, so
+        # look up indexes via self.COL and skip missing ones.
+        scan_cols = []
+        for col_name in ("Device Name", "Interface", "IPv4", "IPv6", "MAC Address"):
+            idx = self.COL.get(col_name) if hasattr(self, "COL") else None
+            if idx is not None:
+                scan_cols.append(idx)
+
+        if not scan_cols:
+            return
+
+        for row in range(self.devices_table.rowCount()):
+            if not needle:
+                self.devices_table.setRowHidden(row, False)
+                continue
+            match = False
+            for col_idx in scan_cols:
+                item = self.devices_table.item(row, col_idx)
+                if not item:
+                    continue
+                if needle in item.text().lower():
+                    match = True
+                    break
+            self.devices_table.setRowHidden(row, not match)
 
     def _refresh_monitor_health(self):
         """Poll /api/monitors/health in the background and repaint the
@@ -7404,6 +7488,15 @@ class DevicesTab(QWidget):
         # OPTIMIZATION: Defer ARP initialization to avoid blocking UI on click
         from PyQt5.QtCore import QTimer
         QTimer.singleShot(0, self._initialize_arp_status_from_database)
+
+        # Re-apply the filter so newly-rebuilt rows respect whatever
+        # the user has typed. Without this, any periodic table refresh
+        # would silently clear the filter state.
+        try:
+            if hasattr(self, "_device_filter_input"):
+                self._apply_device_filter(self._device_filter_input.text())
+        except Exception as _filter_exc:
+            logger.debug(f"[FILTER] re-apply failed: {_filter_exc}")
 
     def _initialize_arp_status_from_database(self):
         """Initialize ARP status icons using database values for running devices."""

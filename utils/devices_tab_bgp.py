@@ -158,16 +158,67 @@ class BGPHandler:
     def refresh_bgp_status(self):
         """Refresh BGP neighbor status.
 
-        Kicks a server-side force-check so the DB picks up live BGP
-        state (Established / Active / Idle / pfx-counts) before the
-        UI re-reads. Previously this only re-rendered the table from
-        whatever the periodic 30s BGP monitor last wrote, so clicks
-        usually showed stale data — same UX bug we fixed for ARP.
+        Probe scope:
+          * If specific BGP-table rows are selected, hit the
+            per-device /api/bgp/status/<id> for each unique device —
+            cheaper than re-probing the entire fleet, and writes the
+            same fields to the DB on the server side.
+          * If nothing is selected, fall back to the
+            /api/bgp/monitor/force-check fleet-wide probe.
+
+        Either way, kick the probe before re-rendering the table so
+        the UI doesn't just re-display whatever the periodic 30s
+        monitor last wrote.
         """
         try:
             import requests
             server_url = self.parent.get_server_url(silent=True)
             if not server_url:
+                return
+
+            # Collect device_ids from selected BGP rows (column 0 is
+            # the Device-name cell; map name → device_id via the
+            # client-side device store).
+            selected_device_ids = set()
+            try:
+                tbl = self.parent.bgp_table
+                for it in tbl.selectedItems():
+                    row = it.row()
+                    name_item = tbl.item(row, 0)
+                    if not name_item:
+                        continue
+                    name = name_item.text().strip()
+                    for iface, devs in self.parent.main_window.all_devices.items():
+                        for d in devs:
+                            if d.get("Device Name") == name and d.get("device_id"):
+                                selected_device_ids.add(d["device_id"])
+                                break
+            except Exception as sel_exc:
+                logger.debug(f"[BGP REFRESH] selection scan failed: {sel_exc}")
+
+            if selected_device_ids:
+                # Selective per-device path — one GET per unique device.
+                for did in selected_device_ids:
+                    try:
+                        r = requests.get(
+                            f"{server_url}/api/bgp/status/{did}", timeout=10
+                        )
+                        if r.status_code == 200:
+                            logger.info(f"[BGP REFRESH] selective probe OK for {did}")
+                        else:
+                            logger.warning(
+                                f"[BGP REFRESH] selective probe HTTP {r.status_code} for {did}"
+                            )
+                    except Exception as exc:
+                        logger.warning(
+                            f"[BGP REFRESH] selective probe failed for {did}: {exc}"
+                        )
+                from PyQt5.QtCore import QTimer
+                QTimer.singleShot(0, lambda: self.parent.update_bgp_table())
+                logger.info(
+                    f"[BGP REFRESH] BGP status refresh scheduled "
+                    f"(selective, {len(selected_device_ids)} device(s))"
+                )
                 return
 
             # Step 1 — fire the server-side force-check. Synchronous

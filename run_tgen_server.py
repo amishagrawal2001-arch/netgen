@@ -11091,13 +11091,15 @@ def get_monitors_health():
         monitors["ospf"] = {"running": False, "error": str(exc)}
         overall_ok = False
 
-    # ISIS — uses its own polling; no `is_running` attr but the
-    # last_isis_check DB column is updated on every cycle.
+    # ISIS — `is_running` alias was added to ISISMonitor so this
+    # branch now mirrors ARP/BGP/OSPF without the special-case it
+    # used to need.
     try:
+        isis_running = bool(getattr(isis_monitor, "is_running", False))
         isis_age = _max_db_age("last_isis_check")
-        isis_stale = isis_age is not None and isis_age > 90
-        monitors["isis"] = {"running": True, "stale_secs": isis_age, "stale": isis_stale}
-        if isis_stale:
+        isis_stale = isis_running and isis_age is not None and isis_age > 90
+        monitors["isis"] = {"running": isis_running, "stale_secs": isis_age, "stale": isis_stale}
+        if not isis_running or isis_stale:
             overall_ok = False
     except Exception as exc:
         monitors["isis"] = {"running": False, "error": str(exc)}
