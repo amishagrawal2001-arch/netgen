@@ -974,6 +974,13 @@ class TrafficGeneratorClient(
         import_topology_action.triggered.connect(self.import_devices_from_file)
         file_menu.addAction(import_topology_action)
 
+        file_menu.addSeparator()
+
+        settings_action = QAction("Settings…", self)
+        settings_action.setStatusTip("Application preferences (poll intervals, defaults)")
+        settings_action.triggered.connect(self.open_settings_dialog)
+        file_menu.addAction(settings_action)
+
         # Edit menu
         edit_menu = QMenu("&Edit", self)
         menu_bar.addMenu(edit_menu)
