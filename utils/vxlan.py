@@ -593,6 +593,37 @@ def tear_down_vxlan_interface(
     return host_cleanup_success
 
 
+def _device_vrf_args(container_name: str) -> list:
+    """Return ['vrf', '<name>'] if the device behind this container has
+    been provisioned with a Linux VRF, else [].
+
+    Used to scope `ip route show / replace / del` calls inside the FRR
+    container — the container runs --net=host, so these touch the
+    host's routing tables, and host routes for VRF-owned ifaces live
+    in the VRF's table, not main. Without this, the VXLAN underlay
+    route resolution would miss multi-device deployments entirely.
+    """
+    try:
+        from utils.frr_docker import FRRDockerManager
+        mgr = FRRDockerManager()
+        prefix = f"{mgr.container_prefix}-"
+        if not container_name.startswith(prefix):
+            return []
+        device_id = container_name[len(prefix):]
+        vrf_name = mgr.vrf_name_for_device(device_id)
+        if not vrf_name:
+            return []
+        check = subprocess.run(
+            ["ip", "-o", "link", "show", vrf_name],
+            capture_output=True, text=True, timeout=2,
+        )
+        if check.returncode == 0 and (check.stdout or "").strip():
+            return ["vrf", vrf_name]
+    except Exception:
+        pass
+    return []
+
+
 def _ensure_vxlan_in_container_iproute(
     *,
     container_name: str,
@@ -1290,20 +1321,28 @@ def _ensure_vxlan_in_container_iproute(
         except Exception as frr_check_exc:
             logger.debug("[VXLAN] Could not check FRR routing table for %s: %s", remote_ip, frr_check_exc)
         
+        # Scope the kernel-route operations to the device's VRF when
+        # one exists. Without this, `ip route show/replace` runs
+        # against the main routing table, but the VXLAN underlay
+        # iface for a multi-device deployment lives in vrf-<id>, so
+        # the route lookup misses entirely and the underlay never
+        # resolves the remote VTEP.
+        vrf_args = _device_vrf_args(container_name)
+
         # If protocol route exists, remove any kernel route we might have added previously
         if has_protocol_route:
             try:
                 # Try to remove kernel route if it exists
-                _container_ip(frr_manager, container_name, ["ip", "route", "del", f"{remote_ip}/32"])
+                _container_ip(frr_manager, container_name, ["ip", "route", "del", f"{remote_ip}/32"] + vrf_args)
                 logger.debug("[VXLAN] Removed kernel route to %s to allow %s route to be used", remote_ip, "protocol")
             except Exception:
                 pass  # Route might not exist, ignore
         else:
             # No protocol route found, check kernel routing table and add static route if needed
-            # Check if kernel route already exists
-            route_result = container.exec_run(["ip", "route", "show", remote_ip])
+            # Check if kernel route already exists (in the device's VRF if applicable).
+            route_result = container.exec_run(["ip", "route", "show"] + vrf_args + [remote_ip])
             route_output = route_result.output.decode("utf-8", errors="ignore") if isinstance(route_result.output, bytes) else str(route_result.output)
-            
+
             route_output = route_output.strip()
             local_prefix = vxlan_config.get("local_prefix_len") if vxlan_config else None
             underlay_gateway = vxlan_config.get("underlay_gateway") if vxlan_config else None
@@ -1313,7 +1352,7 @@ def _ensure_vxlan_in_container_iproute(
                     needs_route = False
                 elif (not underlay_gateway) and local_prefix and _remote_in_local_subnet(local_ip, remote_ip, local_prefix):
                     needs_route = False
-            
+
             # Only add/replace static route if required
             if needs_route:
                 route_iface = vxlan_config.get("underlay_route_interface") if vxlan_config else None
@@ -1326,13 +1365,16 @@ def _ensure_vxlan_in_container_iproute(
                     route_cmd.extend(["via", underlay_gateway, "dev", route_iface])
                 else:
                     route_cmd.extend(["dev", route_iface])
+                # Drop the route into the device's VRF table when applicable.
+                route_cmd.extend(vrf_args)
                 try:
                     _container_ip(frr_manager, container_name, route_cmd)
                     logger.debug("[VXLAN] Added host route to remote endpoint %s (%s)", remote_ip, " ".join(route_cmd))
                 except Exception as exc:
-                    # If provided gateway failed, fall back to default route lookup
+                    # If provided gateway failed, fall back to default route lookup.
+                    # The default-route lookup also has to be VRF-scoped.
                     try:
-                        route_result = container.exec_run(["ip", "route", "show", "default"])
+                        route_result = container.exec_run(["ip", "route", "show"] + vrf_args + ["default"])
                         route_output = route_result.output.decode("utf-8", errors="ignore") if isinstance(route_result.output, bytes) else str(route_result.output)
                         gateway = None
                         for line in route_output.split('\n'):
@@ -1344,7 +1386,7 @@ def _ensure_vxlan_in_container_iproute(
                                         gateway = parts[idx + 1]
                                         break
                         if gateway:
-                            _container_ip(frr_manager, container_name, ["ip", "route", "replace", f"{remote_ip}/32", "via", gateway, "dev", route_iface])
+                            _container_ip(frr_manager, container_name, ["ip", "route", "replace", f"{remote_ip}/32", "via", gateway, "dev", route_iface] + vrf_args)
                             logger.debug("[VXLAN] Added host route to remote endpoint %s via gateway %s (fallback)", remote_ip, gateway)
                         else:
                             logger.warning("[VXLAN] Could not determine gateway for remote endpoint %s: %s", remote_ip, exc)

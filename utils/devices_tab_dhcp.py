@@ -784,12 +784,31 @@ class DHCPHandler:
         QTimer.singleShot(200, self.refresh_dhcp_status)
 
     def refresh_dhcp_status(self):
-        """Fetch DHCP status from server and update table."""
+        """Fetch DHCP status from server and update table.
+
+        Kicks a server-side force-check first so the DB picks up live
+        DHCP state (lease IP, mode, expiry) before the UI re-reads.
+        Same pattern as the ARP / BGP / OSPF / ISIS refresh buttons.
+        Failure of the force-check is non-fatal — we still render
+        whatever is in the DB.
+        """
         try:
             server_url = self.parent.get_server_url(silent=True)
             if not server_url:
                 logging.debug("[DHCP UI] No server URL configured")
                 return
+
+            # Step 1 — server-side force-check.
+            try:
+                fc = requests.post(f"{server_url}/api/dhcp/monitor/force-check", timeout=15)
+                if fc.status_code == 200:
+                    logging.info("[DHCP UI] force-check OK")
+                else:
+                    logging.warning(f"[DHCP UI] force-check returned HTTP {fc.status_code}")
+            except Exception as fc_exc:
+                logging.warning(f"[DHCP UI] force-check failed (will show cached state): {fc_exc}")
+
+            # Step 2 — read the (now-fresh) status from the server.
             response = requests.get(f"{server_url}/api/device/dhcp/status", timeout=5)
             if response.status_code != 200:
                 logging.warning(f"[DHCP UI] Failed to fetch status: {response.status_code} {response.text}")

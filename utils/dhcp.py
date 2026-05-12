@@ -351,6 +351,85 @@ def _parse_gateway(interface: str, container=None) -> Optional[str]:
     return None
 
 
+def _migrate_dhcp_route_to_vrf(
+    device_id: str,
+    interface: str,
+    gateway: str,
+    family: str = "ipv4",
+    container=None,
+) -> bool:
+    """Move dhclient's default route from main table → the device's VRF.
+
+    Why this exists: dhclient runs in the host netns and doesn't know
+    anything about Linux VRFs. When it gets a lease and installs the
+    default route (`ip route add default via <gw> dev <iface>`), that
+    route lands in the *main* routing table, even when <iface> is the
+    slave of vrf-<device_id>. Sockets that bind to the VRF then look
+    up routes in the VRF's table and find nothing → the device's
+    container can't reach its gateway.
+
+    This helper:
+      1. Resolves the device's VRF name (only if one exists).
+      2. Adds the default route to the VRF's table.
+      3. Removes the duplicate from main.
+
+    Best-effort — failures are logged at debug, not raised; legacy
+    single-device deployments (no VRF) early-return harmlessly.
+    """
+    if not device_id or not interface or not gateway:
+        return False
+    try:
+        from utils.frr_docker import FRRDockerManager
+        vrf_name = FRRDockerManager().vrf_name_for_device(device_id)
+        if not vrf_name:
+            return False
+        check = subprocess.run(
+            ["ip", "-o", "link", "show", vrf_name],
+            capture_output=True, text=True, timeout=2,
+        )
+        if check.returncode != 0 or not (check.stdout or "").strip():
+            return False  # no VRF on this host
+    except Exception as exc:
+        logger.debug("[DHCP VRF] could not look up VRF for %s: %s", device_id, exc)
+        return False
+
+    ip_flag = "-6" if family == "ipv6" else "-4"
+    # Add default to the VRF table (idempotent — `replace` instead of
+    # `add` so a retry after partial success doesn't error).
+    try:
+        add_res = _run_command(
+            ["ip", ip_flag, "route", "replace", "default",
+             "via", gateway, "dev", interface, "vrf", vrf_name],
+            timeout=5, container=container,
+        )
+        if add_res.returncode != 0:
+            logger.warning(
+                "[DHCP VRF] add default %s to vrf %s via %s failed: %s",
+                family, vrf_name, gateway, (add_res.stderr or "").strip(),
+            )
+            return False
+    except Exception as exc:
+        logger.warning("[DHCP VRF] add-to-vrf raised for %s: %s", device_id, exc)
+        return False
+
+    # Remove the duplicate from main. Use the exact same shape so
+    # iproute2 matches it. Best-effort — silent on absent.
+    try:
+        _run_command(
+            ["ip", ip_flag, "route", "del", "default",
+             "via", gateway, "dev", interface],
+            timeout=5, container=container,
+        )
+    except Exception as exc:
+        logger.debug("[DHCP VRF] main-table cleanup raised: %s", exc)
+
+    logger.info(
+        "[DHCP VRF] device %s: migrated default %s route via %s into %s",
+        device_id, family, gateway, vrf_name,
+    )
+    return True
+
+
 def _ensure_ipv6_address(interface: str, address: str, prefix: str, container=None) -> bool:
     """Ensure the interface has the specified IPv6 address configured."""
     if not interface or not address or prefix is None:
@@ -779,6 +858,17 @@ def start_dhcp_client(
                         lease_subnet = str(ipaddress.IPv4Interface(f"{ip_val}/{mask_val}").network)
                 except Exception as exc:
                     logger.debug("[DHCP] Failed to derive lease subnet for %s: %s", interface, exc)
+
+                # If the device has been provisioned into a Linux VRF,
+                # move dhclient's default route out of the main table
+                # into the VRF table — see _migrate_dhcp_route_to_vrf
+                # for the why.
+                if gateway:
+                    _migrate_dhcp_route_to_vrf(
+                        device_id, interface, gateway,
+                        family="ipv4", container=container,
+                    )
+
                 lease_info = {
                     "dhcp_mode": "client",
                     "dhcp_state": "Leased",
