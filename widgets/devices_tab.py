@@ -1830,6 +1830,56 @@ class DevicesTab(QWidget):
             btns.addWidget(b)
 
         btns.addStretch(1)
+
+        # Inline apply-progress widget — shown only while a multi-device
+        # apply / start / stop is in flight, hidden otherwise. Previously
+        # the UI gave only per-row "Applying…" status with no overall
+        # picture; on a batch of 5+ devices this felt unresponsive even
+        # though work was happening. Now the user sees "Applying 3/5"
+        # ticking up in real time.
+        from PyQt5.QtWidgets import QProgressBar
+        self._apply_progress_label = QLabel("")
+        self._apply_progress_label.setStyleSheet("color: #1d4ed8; font-size: 11px;")
+        self._apply_progress_label.setVisible(False)
+        self._apply_progress_bar = QProgressBar()
+        self._apply_progress_bar.setFixedHeight(BTN_H)
+        self._apply_progress_bar.setFixedWidth(140)
+        self._apply_progress_bar.setTextVisible(False)
+        self._apply_progress_bar.setStyleSheet(
+            "QProgressBar { border: 1px solid #cbd5e1; border-radius: 4px;"
+            "  background-color: #ffffff; }"
+            "QProgressBar::chunk { background-color: #2563eb; border-radius: 3px; }"
+        )
+        self._apply_progress_bar.setVisible(False)
+        btns.addWidget(self._apply_progress_label)
+        btns.addWidget(self._apply_progress_bar)
+
+        # Monitor-health indicator — polls /api/monitors/health every
+        # 30s and goes amber when any of ARP / BGP / OSPF / IS-IS /
+        # DHCP monitors is wedged or stale. Click the label to see
+        # which monitors are off. Without this, background poll
+        # failures only surface in the server journal; the user
+        # could be staring at stale dots and not know why.
+        self._monitor_health_label = QLabel("monitors: …")
+        self._monitor_health_label.setStyleSheet(
+            "color: #6b7280; font-size: 11px; padding: 0 6px;"
+        )
+        self._monitor_health_label.setToolTip("Background-monitor health: polling…")
+        self._monitor_health_label.setCursor(Qt.PointingHandCursor)
+        # mousePressEvent — fire a manual refresh on click for impatient users.
+        def _click_health(event, lbl=self._monitor_health_label):
+            self._refresh_monitor_health()
+        self._monitor_health_label.mousePressEvent = _click_health
+        btns.addWidget(self._monitor_health_label)
+
+        self._monitor_health_timer = QTimer(self)
+        self._monitor_health_timer.setInterval(30_000)  # 30 s
+        self._monitor_health_timer.timeout.connect(self._refresh_monitor_health)
+        self._monitor_health_timer.start()
+        # First poll runs as soon as the event loop ticks so the user
+        # sees a real value within ~1 second instead of waiting 30 s.
+        QTimer.singleShot(1500, self._refresh_monitor_health)
+
         layout.addWidget(action_bar)
 
         # wiring
@@ -4263,16 +4313,148 @@ class DevicesTab(QWidget):
 
         # Create and start multi-device apply worker
         self.multi_device_apply_worker = MultiDeviceApplyWorker(devices_to_apply, server_url, self)
-        
+
         # Set operation type flag for this operation
         self._current_operation_type = 'apply'
-        
+
         self.multi_device_apply_worker.device_applied.connect(self._on_multi_device_applied)
         self.multi_device_apply_worker.progress.connect(self._on_multi_device_progress)
         self.multi_device_apply_worker.finished.connect(self._on_multi_device_apply_finished)
+
+        # Show the inline progress widget for the duration of this apply.
+        self._show_apply_progress(len(devices_to_apply))
+
         self.multi_device_apply_worker.start()
-        
+
         logger.info(f"Started applying {len(devices_to_apply)} devices in background")
+
+    def _show_apply_progress(self, total: int) -> None:
+        """Reveal the inline progress widget with `total` devices in flight."""
+        if not hasattr(self, "_apply_progress_bar"):
+            return
+        self._apply_progress_total = max(1, int(total))
+        self._apply_progress_done = 0
+        self._apply_progress_bar.setRange(0, self._apply_progress_total)
+        self._apply_progress_bar.setValue(0)
+        self._apply_progress_label.setText(f"Applying 0/{self._apply_progress_total}")
+        self._apply_progress_label.setVisible(True)
+        self._apply_progress_bar.setVisible(True)
+
+    def _tick_apply_progress(self) -> None:
+        """Bump the progress counter by one — called per per-device result."""
+        if not hasattr(self, "_apply_progress_bar"):
+            return
+        if not self._apply_progress_bar.isVisible():
+            return
+        self._apply_progress_done = min(
+            getattr(self, "_apply_progress_done", 0) + 1,
+            getattr(self, "_apply_progress_total", 1),
+        )
+        self._apply_progress_bar.setValue(self._apply_progress_done)
+        self._apply_progress_label.setText(
+            f"Applying {self._apply_progress_done}/{self._apply_progress_total}"
+        )
+
+    def _hide_apply_progress(self) -> None:
+        """Tear down the inline progress widget — called from the finished
+        handler. Always safe to call (idempotent)."""
+        if not hasattr(self, "_apply_progress_bar"):
+            return
+        self._apply_progress_bar.setVisible(False)
+        self._apply_progress_label.setVisible(False)
+
+    def _refresh_monitor_health(self):
+        """Poll /api/monitors/health in the background and repaint the
+        monitor-health indicator. Off-UI HTTP so we never block on a
+        slow/offline server."""
+        if not hasattr(self, "_monitor_health_label"):
+            return
+        server_url = self.get_server_url(silent=True)
+        if not server_url:
+            self._monitor_health_label.setText("monitors: ?")
+            self._monitor_health_label.setStyleSheet(
+                "color: #9ca3af; font-size: 11px; padding: 0 6px;"
+            )
+            self._monitor_health_label.setToolTip("No server selected")
+            return
+
+        from PyQt5.QtCore import QThread, pyqtSignal
+
+        class _HealthWorker(QThread):
+            done = pyqtSignal(bool, object, str)  # (ok, payload_dict_or_None, err_msg)
+
+            def __init__(self, url):
+                super().__init__()
+                self._url = url
+
+            def run(self):
+                try:
+                    import requests
+                    r = requests.get(f"{self._url}/api/monitors/health", timeout=3)
+                    if r.status_code == 200:
+                        self.done.emit(True, r.json(), "")
+                    else:
+                        self.done.emit(False, None, f"HTTP {r.status_code}")
+                except Exception as exc:
+                    self.done.emit(False, None, str(exc))
+
+        worker = _HealthWorker(server_url)
+        if not hasattr(self, "_monitor_health_workers"):
+            self._monitor_health_workers = []
+        self._monitor_health_workers.append(worker)
+
+        def _apply(ok, payload, err, w=worker):
+            try:
+                if not ok or not payload:
+                    self._monitor_health_label.setText("monitors: ?")
+                    self._monitor_health_label.setStyleSheet(
+                        "color: #9ca3af; font-size: 11px; padding: 0 6px;"
+                    )
+                    self._monitor_health_label.setToolTip(
+                        f"Health endpoint unreachable: {err}" if err else "no data"
+                    )
+                    return
+
+                overall_ok = bool(payload.get("ok"))
+                monitors = payload.get("monitors") or {}
+                # Identify which monitors are off (not running or stale).
+                offenders = []
+                for name, info in monitors.items():
+                    running = info.get("running", False)
+                    stale = info.get("stale", False)
+                    if not running:
+                        offenders.append(f"{name.upper()} down")
+                    elif stale:
+                        secs = info.get("stale_secs")
+                        offenders.append(
+                            f"{name.upper()} stale ({int(secs)}s)" if secs else f"{name.upper()} stale"
+                        )
+
+                if overall_ok and not offenders:
+                    self._monitor_health_label.setText("monitors: OK")
+                    self._monitor_health_label.setStyleSheet(
+                        "color: #16a34a; font-size: 11px; padding: 0 6px;"
+                    )
+                    self._monitor_health_label.setToolTip(
+                        "All background monitors running and reporting on time."
+                    )
+                else:
+                    self._monitor_health_label.setText(f"monitors: ⚠ {len(offenders)}")
+                    self._monitor_health_label.setStyleSheet(
+                        "color: #d97706; font-size: 11px; padding: 0 6px; font-weight: 600;"
+                    )
+                    self._monitor_health_label.setToolTip(
+                        "Click to re-poll. Issues:\n• " + "\n• ".join(offenders)
+                    )
+            except Exception as exc:
+                logger.debug(f"[MONITOR HEALTH] apply failed: {exc}")
+
+        worker.done.connect(_apply)
+        worker.finished.connect(
+            lambda w=worker: self._monitor_health_workers.remove(w)
+            if w in self._monitor_health_workers else None
+        )
+        worker.start()
     
     def apply_selected_device_with_arp(self):
         """Apply selected devices and automatically trigger ARP operations."""
@@ -8078,6 +8260,11 @@ class DevicesTab(QWidget):
         try:
             logger.info(f"{message}")
 
+            # Tick the inline progress widget once per per-device result,
+            # regardless of success/failure — both count as "done with
+            # this device" from the user's perspective.
+            self._tick_apply_progress()
+
             if not success:
                 return
 
@@ -8165,6 +8352,8 @@ class DevicesTab(QWidget):
     
     def _on_multi_device_apply_finished(self, results, successful_count, failed_count):
         """Handle completion of multi-device apply worker."""
+        # Hide the inline progress widget regardless of outcome.
+        self._hide_apply_progress()
         try:
             # Print results to console
             if results:
