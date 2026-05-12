@@ -1152,32 +1152,76 @@ class TrafficGenClientServerSection():
                     # Mark as pending and fetch asynchronously
                     server["online"] = False
                     self.update_server_status_icon(server, False)
-                    # Schedule async fetch (non-blocking) - use global QTimer import
-                    def fetch_interfaces_async():
-                        try:
-                            # Use shorter timeout to prevent hanging when server is offline
-                            if hasattr(self, 'connection_manager') and self.connection_manager:
-                                response = self.connection_manager.get(f"{server_address}/api/interfaces", timeout=2)
-                            else:
-                                response = requests.get(f"{server_address}/api/interfaces", timeout=2)
-                            if response.status_code == 200:
-                                interfaces = _filter_internal_ifaces(response.json())
-                                server["interfaces"] = interfaces  # Store for future use
-                                server["online"] = True
-                                self.update_server_status_icon(server, True)
-                                # Refresh tree to show interfaces
-                                if hasattr(self, 'update_server_tree'):
-                                    QTimer.singleShot(0, self.update_server_tree)
-                                logger.info(f"[SERVER TREE] Fetched {len(interfaces)} interfaces from {server_address} (async)")
-                            else:
-                                logger.warning(f"[SERVER TREE] Server {server_address} returned status code: {response.status_code}")
-                                server["online"] = False
-                                self.update_server_status_icon(server, False)
-                        except Exception as e:
-                            logger.error(f"[SERVER TREE] Error fetching interfaces from {server_address} (async): {e}")
-                            server["online"] = False
-                            self.update_server_status_icon(server, False)
-                    QTimer.singleShot(50, fetch_interfaces_async)
+                    # Schedule the iface fetch on a real worker thread.
+                    # Previously this used QTimer.singleShot(50, ...) for
+                    # a function named *_async, but QTimer fires on the
+                    # Qt event loop = UI thread. The inner requests.get
+                    # is synchronous, so an unreachable server froze the
+                    # UI for the full 2s timeout per server. Move the
+                    # HTTP work to a real QThread; signal back on
+                    # completion so the UI-thread updates (icon + tree
+                    # refresh) still run on the main thread.
+                    from PyQt5.QtCore import QThread, pyqtSignal
+
+                    class _FetchIfacesWorker(QThread):
+                        done = pyqtSignal(bool, list)  # (ok, interfaces)
+
+                        def __init__(self, url, conn_mgr):
+                            super().__init__()
+                            self._url = url
+                            self._conn_mgr = conn_mgr
+
+                        def run(self):
+                            try:
+                                if self._conn_mgr is not None:
+                                    r = self._conn_mgr.get(
+                                        f"{self._url}/api/interfaces", timeout=2
+                                    )
+                                else:
+                                    r = requests.get(
+                                        f"{self._url}/api/interfaces", timeout=2
+                                    )
+                                if r.status_code == 200:
+                                    self.done.emit(True, _filter_internal_ifaces(r.json()) or [])
+                                    return
+                                logger.warning(
+                                    f"[SERVER TREE] Server {self._url} returned status code: {r.status_code}"
+                                )
+                            except Exception as exc:
+                                logger.debug(
+                                    f"[SERVER TREE] Probe failed for {self._url}: {exc}"
+                                )
+                            self.done.emit(False, [])
+
+                    conn_mgr = getattr(self, "connection_manager", None)
+                    worker = _FetchIfacesWorker(server_address, conn_mgr)
+
+                    # Hold a strong reference so Qt doesn't GC the
+                    # thread while it's mid-flight. Drop on finish.
+                    if not hasattr(self, "_server_probe_workers"):
+                        self._server_probe_workers = []
+                    self._server_probe_workers.append(worker)
+
+                    def _on_done(ok, ifaces, srv=server, addr=server_address, w=worker):
+                        if ok:
+                            srv["interfaces"] = ifaces
+                            srv["online"] = True
+                            self.update_server_status_icon(srv, True)
+                            if hasattr(self, "update_server_tree"):
+                                QTimer.singleShot(0, self.update_server_tree)
+                            logger.info(
+                                f"[SERVER TREE] Fetched {len(ifaces)} interfaces from {addr} (async)"
+                            )
+                        else:
+                            srv["online"] = False
+                            self.update_server_status_icon(srv, False)
+
+                    worker.done.connect(_on_done)
+                    worker.finished.connect(
+                        lambda w=worker: self._server_probe_workers.remove(w)
+                        if w in self._server_probe_workers else None
+                    )
+                    worker.start()
                     continue  # Skip this server for now, will be updated asynchronously
             
             if interfaces:
@@ -1345,43 +1389,78 @@ class TrafficGenClientServerSection():
                 logger.debug(f"[SERVER TREE] tooltip refresh failed for {server_address}: {exc}")
 
     def retry_server_connection(self, server):
-        """Retry connecting to the specified server and update its status icon."""
+        """Retry connecting to the specified server in the background.
+
+        Manual-retry path used by the "retry" UI affordance. Previously
+        did `requests.get(timeout=2)` directly on the UI thread, so an
+        offline server (which is exactly when this is invoked) froze
+        the app for 2 s. Now does the probe on a QThread and applies
+        the result via a signal back to the UI thread.
+        """
         server_address = server["address"]
         logger.info(f"Manually retrying connection to {server_address}...")
-        try:
-            if hasattr(self, 'connection_manager') and self.connection_manager:
-                response = self.connection_manager.get(f"{server_address}/api/interfaces", timeout=2)
-            else:
-                response = requests.get(f"{server_address}/api/interfaces", timeout=2)
-            if response.status_code == 200:
-                server["online"] = True
-                logger.info(f"Server {server_address} is now online.")
 
-                # Update the status icon
-                self.update_server_status_icon(server, True)
+        from PyQt5.QtCore import QThread, pyqtSignal
 
+        class _RetryWorker(QThread):
+            done = pyqtSignal(bool, list)  # (ok, interfaces)
+
+            def __init__(self, url, conn_mgr):
+                super().__init__()
+                self._url = url
+                self._conn_mgr = conn_mgr
+
+            def run(self):
+                try:
+                    if self._conn_mgr is not None:
+                        r = self._conn_mgr.get(
+                            f"{self._url}/api/interfaces", timeout=2
+                        )
+                    else:
+                        r = requests.get(
+                            f"{self._url}/api/interfaces", timeout=2
+                        )
+                    if r.status_code == 200:
+                        self.done.emit(True, _filter_internal_ifaces(r.json()) or [])
+                        return
+                except Exception as exc:
+                    logger.debug(f"Retry probe failed for {self._url}: {exc}")
+                self.done.emit(False, [])
+
+        conn_mgr = getattr(self, "connection_manager", None)
+        worker = _RetryWorker(server_address, conn_mgr)
+        if not hasattr(self, "_server_probe_workers"):
+            self._server_probe_workers = []
+        self._server_probe_workers.append(worker)
+
+        def _on_done(ok, ifaces, srv=server, addr=server_address):
+            if ok:
+                srv["online"] = True
+                logger.info(f"Server {addr} is now online.")
+                self.update_server_status_icon(srv, True)
                 # Refresh ports only for this server item
                 for i in range(self.server_tree.topLevelItemCount()):
                     item = self.server_tree.topLevelItem(i)
-                    if item.text(1) == server_address:
+                    if item.text(1) == addr:
                         item.takeChildren()
-                        interfaces = _filter_internal_ifaces(response.json())
-                        for interface in interfaces:
+                        for interface in ifaces:
                             port_name = interface["name"]
-                            full_name = f"TG {server['tg_id']} - {port_name}"
+                            full_name = f"TG {srv['tg_id']} - {port_name}"
                             if full_name not in self.removed_interfaces:
                                 port_item = QTreeWidgetItem([port_name, ""])
                                 item.addChild(port_item)
-
-                        # ✅ Force UI refresh of the status label
-        # Status is now in TG ID column, no need to repaint separate label
                         break
             else:
-                raise Exception(f"Non-200 status: {response.status_code}")
-        except Exception as e:
-            logger.error(f"Still failed to connect to {server_address}: {e}")
-            server["online"] = False
-            self.update_server_status_icon(server, False)
+                logger.error(f"Still failed to connect to {addr}")
+                srv["online"] = False
+                self.update_server_status_icon(srv, False)
+
+        worker.done.connect(_on_done)
+        worker.finished.connect(
+            lambda w=worker: self._server_probe_workers.remove(w)
+            if w in self._server_probe_workers else None
+        )
+        worker.start()
 
     def remove_selected_interface(self):
         """Remove the selected ports (interfaces) from the server tree."""
