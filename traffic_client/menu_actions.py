@@ -248,6 +248,103 @@ class TrafficGenClientMenuAction():
             logger.info("Server interfaces saved successfully.")
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Could not save server interfaces: {e}")
+
+    def export_devices_to_file(self):
+        """File → Export Devices: dump the selected server's device
+        configurations to a user-chosen JSON file. Strips runtime
+        state (ARP / BGP / OSPF status, lease info, container_id) on
+        the server side so the file represents intent."""
+        from PyQt5.QtWidgets import QFileDialog
+        import requests, json as _json
+        server_url = None
+        # Prefer the active server URL; fall back to the first
+        # registered one.
+        if hasattr(self, "server_manager") and self.server_manager:
+            try:
+                server_url = self.server_manager.get_server_url()
+            except Exception:
+                server_url = None
+        if not server_url:
+            QMessageBox.warning(self, "No Server", "Select a server first.")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Devices", "devices.json", "JSON files (*.json)"
+        )
+        if not path:
+            return
+        try:
+            r = requests.get(f"{server_url}/api/devices/export", timeout=15)
+            if r.status_code != 200:
+                QMessageBox.critical(
+                    self, "Export Failed",
+                    f"Server returned HTTP {r.status_code}:\n{r.text[:300]}",
+                )
+                return
+            payload = r.json()
+            with open(path, "w") as f:
+                _json.dump(payload, f, indent=2)
+            QMessageBox.information(
+                self, "Export Complete",
+                f"Exported {payload.get('count', 0)} device(s) to:\n{path}",
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "Export Error", str(exc))
+
+    def import_devices_from_file(self):
+        """File → Import Devices: read a JSON file produced by Export
+        and apply each entry via /api/devices/import on the selected
+        server. Shows a summary of imported/failed."""
+        from PyQt5.QtWidgets import QFileDialog
+        import requests, json as _json
+        server_url = None
+        if hasattr(self, "server_manager") and self.server_manager:
+            try:
+                server_url = self.server_manager.get_server_url()
+            except Exception:
+                server_url = None
+        if not server_url:
+            QMessageBox.warning(self, "No Server", "Select a server first.")
+            return
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import Devices", "", "JSON files (*.json)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r") as f:
+                payload = _json.load(f)
+            if not isinstance(payload, dict) or "devices" not in payload:
+                QMessageBox.critical(
+                    self, "Bad File",
+                    "Expected a JSON object with a 'devices' array — "
+                    "see /api/devices/export for the format.",
+                )
+                return
+            r = requests.post(
+                f"{server_url}/api/devices/import", json=payload,
+                timeout=300,  # batches can take a while
+            )
+            if r.status_code != 200:
+                QMessageBox.critical(
+                    self, "Import Failed",
+                    f"Server returned HTTP {r.status_code}:\n{r.text[:300]}",
+                )
+                return
+            result = r.json()
+            imported = result.get("imported", 0)
+            failed = result.get("failed", 0)
+            errors = result.get("errors", []) or []
+            msg = f"Imported {imported} device(s). Failed: {failed}."
+            if errors:
+                msg += "\n\nFirst errors:\n• " + "\n• ".join(errors[:5])
+            box = QMessageBox.information if failed == 0 else QMessageBox.warning
+            box(self, "Import Complete", msg)
+            # Refresh the device tree so the new rows show up.
+            if hasattr(self, "update_server_tree"):
+                self.update_server_tree()
+        except Exception as exc:
+            QMessageBox.critical(self, "Import Error", str(exc))
+
     def save_session(self, blocking: bool = False):
         """Save the current session to a JSON file.
 
