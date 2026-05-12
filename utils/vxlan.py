@@ -602,14 +602,23 @@ def _device_vrf_args(container_name: str) -> list:
     host's routing tables, and host routes for VRF-owned ifaces live
     in the VRF's table, not main. Without this, the VXLAN underlay
     route resolution would miss multi-device deployments entirely.
+
+    Recognises both managed container prefixes: `ostg-frr-` (the
+    default per-device container) and `dhcp-frr-` (DHCP-client-mode
+    devices, see FRRDockerManager._get_container_name). Without
+    handling the dhcp-frr- prefix, DHCP-client devices with VXLAN
+    silently fell back to the main routing table.
     """
     try:
-        from utils.frr_docker import FRRDockerManager
-        mgr = FRRDockerManager()
-        prefix = f"{mgr.container_prefix}-"
-        if not container_name.startswith(prefix):
+        from utils.frr_docker import _MANAGED_CONTAINER_PREFIXES, FRRDockerManager
+        device_id = None
+        for pfx in _MANAGED_CONTAINER_PREFIXES:
+            if container_name.startswith(pfx):
+                device_id = container_name[len(pfx):]
+                break
+        if not device_id:
             return []
-        device_id = container_name[len(prefix):]
+        mgr = FRRDockerManager()
         vrf_name = mgr.vrf_name_for_device(device_id)
         if not vrf_name:
             return []
