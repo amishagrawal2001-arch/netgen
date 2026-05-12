@@ -309,6 +309,21 @@ class ISISMonitor:
             import traceback
             logger.error(f"[ISIS MONITOR] Traceback: {traceback.format_exc()}")
     
+    # Compatibility with the other monitors (ARP / BGP / OSPF / DHCP)
+    # which expose `is_running`. Lets /api/monitors/health treat all
+    # five uniformly instead of special-casing IS-IS.
+    @property
+    def is_running(self) -> bool:
+        return bool(self.monitoring_active)
+
+    def get_status(self) -> "Dict[str, Any]":
+        """Return a status dict matching the other monitors' shape."""
+        return {
+            "is_running": self.is_running,
+            "monitoring_active": self.monitoring_active,
+            "thread_alive": bool(self.monitor_thread and self.monitor_thread.is_alive()),
+        }
+
     def force_check(self):
         """Force an immediate ISIS status check for all devices with ISIS configured."""
         if not self.monitoring_active:

@@ -179,7 +179,18 @@ def safe_vtysh_command(cmd_list, timeout=10, device_id=None, device_name=None):
         raise RuntimeError("FRR not installed or not in PATH")
 
 def start_bgp(device_id, iface, config, device_name=None):
-    """Start or resume BGP for a device and register it."""
+    """[Legacy system-FRR path — no-op in docker-per-device deployment.]
+
+    This helper predates the docker-FRR architecture; it issues vtysh
+    against the *host's* system FRR. In the current deployment FRR
+    runs inside the device's container instead, started via
+    utils/frr_docker.start_frr_container + configure_bgp_neighbor.
+    Kept for legacy installs without DOCKER_FRR_AVAILABLE; returns
+    immediately when docker FRR is in use.
+    """
+    if DOCKER_FRR_AVAILABLE:
+        logging.debug("[BGP] start_bgp() skipped — docker FRR in use")
+        return None
     neighbor = config.get("neighbor_ip")
     asn = config.get("asn")
     remote_asn = config.get("remote_asn")
@@ -271,7 +282,12 @@ def start_bgp(device_id, iface, config, device_name=None):
 
 
 def start_dual_stack_bgp(device_id, iface, config):
-    """Start or resume dual-stack BGP (both IPv4 and IPv6) for a device."""
+    """[Legacy system-FRR path — no-op in docker-per-device deployment.]
+    See start_bgp() docstring for context.
+    """
+    if DOCKER_FRR_AVAILABLE:
+        logging.debug("[BGP] start_dual_stack_bgp() skipped — docker FRR in use")
+        return None
     neighbor_ipv4 = config.get("neighbor_ipv4")
     neighbor_ipv6 = config.get("neighbor_ipv6")
     asn = config.get("asn")
@@ -459,7 +475,13 @@ def stop_bgp(device_id):
 
 
 def cleanup_device_routes(device_id):
-    """Clean up all routes and route-maps for a device."""
+    """[Legacy system-FRR path — no-op in docker-per-device deployment.]
+    BGP route cleanup in docker mode happens automatically when the
+    container is removed via stop_frr_container(remove=True).
+    """
+    if DOCKER_FRR_AVAILABLE:
+        logging.debug("[BGP] cleanup_device_routes() skipped — docker FRR in use")
+        return
     if device_id not in BGP_ROUTES:
         return
     
@@ -511,7 +533,12 @@ def cleanup_device_routes(device_id):
     del BGP_ROUTES[device_id]
 
 def remove_bgp_config(device_id):
-    """Remove BGP configuration and clean up all associated routes."""
+    """[Legacy system-FRR path — no-op in docker-per-device deployment.]
+    Container teardown removes the entire BGP instance in docker mode.
+    """
+    if DOCKER_FRR_AVAILABLE:
+        logging.debug("[BGP] remove_bgp_config() skipped — docker FRR in use")
+        return
     instance = BGP_INSTANCES.get(device_id)
     if not instance:
         logging.warning(f"[BGP] No instance found for removal: {device_id}")
