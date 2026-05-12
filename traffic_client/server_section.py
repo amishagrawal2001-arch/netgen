@@ -1323,8 +1323,26 @@ class TrafficGenClientServerSection():
         status_icon = QIcon(r_icon("icons/green_dot.png" if is_online else "icons/red_dot.png"))
         status_pixmap = status_icon.pixmap(12, 12)  # Reduced icon size for better fit
         status_label.setPixmap(status_pixmap)
-        status_label.setToolTip("Online" if is_online else "Offline")
+        online_label = "Online" if is_online else "Offline"
+        status_label.setToolTip(online_label)
         server["is_online"] = is_online
+
+        # Also refresh the tree-item's column-1 tooltip. The tooltip
+        # was set once when the tree was built (see update_server_tree
+        # line ~1111: setToolTip(1, f"{addr}  ({online_label})")) and
+        # would otherwise stay frozen on whatever state the server
+        # was in at that moment — so a server that flipped offline
+        # showed a red dot but still "(Online)" in the hover tooltip.
+        server_address = server.get("address", "")
+        if server_address:
+            try:
+                for i in range(self.server_tree.topLevelItemCount()):
+                    item = self.server_tree.topLevelItem(i)
+                    if item.text(1) == server_address:
+                        item.setToolTip(1, f"{server_address}  ({online_label})")
+                        break
+            except Exception as exc:
+                logger.debug(f"[SERVER TREE] tooltip refresh failed for {server_address}: {exc}")
 
     def retry_server_connection(self, server):
         """Retry connecting to the specified server and update its status icon."""
