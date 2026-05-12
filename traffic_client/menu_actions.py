@@ -876,44 +876,84 @@ class TrafficGenClientMenuAction():
             logger.info(f"[STREAM-ID] Repaired/created {repaired} stream_id(s) during load.")
 
     def _fetch_interfaces_async(self, address, server):
-        """Fetch interfaces from server asynchronously (non-blocking)."""
-        try:
-            # Use shorter timeout to prevent hanging
-            if hasattr(self, 'connection_manager') and self.connection_manager:
-                response = self.connection_manager.get(f"{address}/api/interfaces", timeout=2)
-            else:
-                import requests
-                response = requests.get(f"{address}/api/interfaces", timeout=2)
-            
-            if response.status_code == 200:
-                # Filter kernel-internal ifaces (vrf-* etc.) so they
-                # don't leak into the TG/Interface picker on clients
-                # talking to older servers that haven't been updated
-                # with the same filter. Helper lives in server_section.
-                from traffic_client.server_section import _filter_internal_ifaces
-                interfaces = _filter_internal_ifaces(response.json())
-                server["interfaces"] = interfaces
-                server["online"] = True
-                # Update server tree if it exists
-                if hasattr(self, 'update_server_tree'):
-                    from PyQt5.QtCore import QTimer
+        """Fetch interfaces from server in a real background thread.
+
+        Previously this name was misleading — the function was called
+        from QTimer.singleShot which runs on the Qt event loop (the UI
+        thread), and the body did a synchronous requests.get with a
+        2s timeout. Offline / unreachable servers (especially ones
+        that RST the connection mid-handshake — see user-reported
+        "Connection reset by peer") froze the UI for the full timeout.
+
+        Now: real QThread off the UI thread, results delivered via a
+        signal back to the main thread.
+        """
+        from PyQt5.QtCore import QThread, pyqtSignal, QTimer
+
+        class _MenuFetchWorker(QThread):
+            done = pyqtSignal(bool, int, list, str)  # (ok, status, interfaces, err)
+
+            def __init__(self, url, conn_mgr):
+                super().__init__()
+                self._url = url
+                self._conn_mgr = conn_mgr
+
+            def run(self):
+                try:
+                    if self._conn_mgr is not None:
+                        r = self._conn_mgr.get(
+                            f"{self._url}/api/interfaces", timeout=2
+                        )
+                    else:
+                        import requests
+                        r = requests.get(
+                            f"{self._url}/api/interfaces", timeout=2
+                        )
+                    if r.status_code == 200:
+                        try:
+                            from traffic_client.server_section import _filter_internal_ifaces
+                            self.done.emit(True, 200, _filter_internal_ifaces(r.json()) or [], "")
+                            return
+                        except Exception as fexc:
+                            self.done.emit(False, r.status_code, [], f"parse: {fexc}")
+                            return
+                    self.done.emit(False, r.status_code, [], "")
+                except Exception as exc:
+                    self.done.emit(False, 0, [], str(exc))
+
+        conn_mgr = getattr(self, "connection_manager", None)
+        worker = _MenuFetchWorker(address, conn_mgr)
+
+        # Hold a strong ref; Qt will GC the thread otherwise.
+        if not hasattr(self, "_menu_iface_workers"):
+            self._menu_iface_workers = []
+        self._menu_iface_workers.append(worker)
+
+        def _on_done(ok, status, ifaces, err, srv=server, addr=address):
+            if ok:
+                srv["interfaces"] = ifaces
+                srv["online"] = True
+                if hasattr(self, "update_server_tree"):
                     QTimer.singleShot(0, self.update_server_tree)
-                logger.info(f"Fetched {len(interfaces)} interfaces from {address} (async)")
+                logger.info(f"Fetched {len(ifaces)} interfaces from {addr} (async)")
             else:
-                server["online"] = False
-                if hasattr(self, 'failed_servers'):
-                    if server not in self.failed_servers:
-                        self.failed_servers.append(server)
-        except Exception as e:
-            logger.warning(f"Error fetching interfaces from {address} (async): {e}")
-            server["online"] = False
-            if hasattr(self, 'failed_servers'):
-                if server not in self.failed_servers:
-                    self.failed_servers.append(server)
-            # Update server tree to show offline status
-            if hasattr(self, 'update_server_tree'):
-                from PyQt5.QtCore import QTimer
-                QTimer.singleShot(0, self.update_server_tree)
+                srv["online"] = False
+                if hasattr(self, "failed_servers"):
+                    if srv not in self.failed_servers:
+                        self.failed_servers.append(srv)
+                if err:
+                    logger.warning(f"Error fetching interfaces from {addr} (async): {err}")
+                elif status:
+                    logger.warning(f"{addr} returned HTTP {status}")
+                if hasattr(self, "update_server_tree"):
+                    QTimer.singleShot(0, self.update_server_tree)
+
+        worker.done.connect(_on_done)
+        worker.finished.connect(
+            lambda w=worker: self._menu_iface_workers.remove(w)
+            if w in self._menu_iface_workers else None
+        )
+        worker.start()
     
     def load_session(self, skip_servers=False):
         """Load the session from a JSON file.
@@ -1291,38 +1331,78 @@ class TrafficGenClientMenuAction():
         
         any_reconnected = False
 
-        for server in selected_failed_servers[:]:  # Iterate over a copy since we may modify it
+        # Probe every selected failed server in parallel on background
+        # threads — the previous implementation did sync requests.get
+        # with a 2s timeout on the UI thread, so retrying N offline
+        # servers froze the app for N × 2s. Deliver the per-server
+        # results back to the main thread via a signal and tally once
+        # all probes have completed.
+        from PyQt5.QtCore import QThread, pyqtSignal
+
+        class _RetryAllWorker(QThread):
+            done = pyqtSignal(object, bool)  # (server_dict, ok)
+
+            def __init__(self, server, conn_mgr):
+                super().__init__()
+                self._server = server
+                self._conn_mgr = conn_mgr
+
+            def run(self):
+                url = self._server.get("address")
+                try:
+                    if self._conn_mgr is not None:
+                        r = self._conn_mgr.get(
+                            f"{url}/api/interfaces", timeout=2
+                        )
+                    else:
+                        r = requests.get(
+                            f"{url}/api/interfaces", timeout=2
+                        )
+                    self.done.emit(self._server, r.status_code == 200)
+                except Exception as exc:
+                    logger.debug(f"Retry probe failed for {url}: {exc}")
+                    self.done.emit(self._server, False)
+
+        if not hasattr(self, "_menu_retry_workers"):
+            self._menu_retry_workers = []
+        # Track completion + outcome so we can show a single summary
+        # dialog once all probes return.
+        progress = {"done": 0, "total": len(selected_failed_servers), "ok": 0}
+
+        def _on_one_done(server, ok, w=None):
+            progress["done"] += 1
+            address = server.get("address")
+            if ok:
+                server["online"] = True
+                self.update_server_status_icon(server, True)
+                progress["ok"] += 1
+                logger.info(f"Selected server {address} is now online.")
+                if server in self.failed_servers:
+                    self.failed_servers.remove(server)
+                if hasattr(self, "server_retry_worker") and self.server_retry_worker:
+                    self.server_retry_worker.remove_failed_server(server)
+            else:
+                logger.error(f"Still failed to connect to selected server {address}")
+            if progress["done"] == progress["total"]:
+                if progress["ok"]:
+                    QMessageBox.information(self, "Servers Updated", "Some servers are now back online.")
+                    self.update_server_tree()
+                    self.fetch_and_update_statistics()
+                else:
+                    QMessageBox.information(self, "No Servers Recovered", "No offline servers could be brought online.")
+
+        conn_mgr = getattr(self, "connection_manager", None)
+        for server in selected_failed_servers[:]:
             address = server.get("address")
             logger.info(f"Trying to bring selected server {address} online...")
-
-            try:
-                # Use connection manager if available
-                if hasattr(self, 'connection_manager') and self.connection_manager:
-                    response = self.connection_manager.get(f"{address}/api/interfaces", timeout=2)
-                else:
-                    response = requests.get(f"{address}/api/interfaces", timeout=2)
-                
-                if response.status_code == 200:
-                    server["online"] = True
-                    self.update_server_status_icon(server, True)
-                    logger.info(f"Selected server {address} is now online.")
-                    any_reconnected = True
-                    self.failed_servers.remove(server)  # ✅ Remove from failed list
-                    
-                    # Remove from retry worker if it exists
-                    if hasattr(self, 'server_retry_worker') and self.server_retry_worker:
-                        self.server_retry_worker.remove_failed_server(server)
-                else:
-                    logger.error(f"Selected server {address} still unreachable (status {response.status_code})")
-            except requests.RequestException as e:
-                logger.error(f"Still failed to connect to selected server {address}: {e}")
-
-        if any_reconnected:
-            QMessageBox.information(self, "Servers Updated", "Some servers are now back online.")
-            self.update_server_tree()
-            self.fetch_and_update_statistics()
-        else:
-            QMessageBox.information(self, "No Servers Recovered", "No offline servers could be brought online.")
+            worker = _RetryAllWorker(server, conn_mgr)
+            self._menu_retry_workers.append(worker)
+            worker.done.connect(_on_one_done)
+            worker.finished.connect(
+                lambda w=worker: self._menu_retry_workers.remove(w)
+                if w in self._menu_retry_workers else None
+            )
+            worker.start()
     
     def get_selected_tg_ids(self):
         """Get list of TG IDs for currently selected servers."""
