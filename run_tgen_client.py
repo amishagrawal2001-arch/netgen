@@ -24,6 +24,12 @@ def launch(server_url: str, fullscreen: bool, server_explicitly_provided: bool =
 
     app = QApplication(sys.argv)
     app.setAttribute(Qt.AA_DontUseNativeMenuBar)
+    # Identify the app so QSettings has a deterministic on-disk
+    # location across macOS / Linux. Used by the Settings dialog
+    # (File → Settings…) and any other key/value preferences.
+    app.setOrganizationName("Netgen")
+    app.setOrganizationDomain("netgen.local")
+    app.setApplicationName("netgen-client")
 
     try:
         # Preferred: widget takes server_url and explicit flag

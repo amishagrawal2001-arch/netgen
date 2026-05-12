@@ -1900,7 +1900,16 @@ class DevicesTab(QWidget):
         btns.addWidget(self._monitor_health_label)
 
         self._monitor_health_timer = QTimer(self)
-        self._monitor_health_timer.setInterval(30_000)  # 30 s
+        # Read the user-configurable interval from QSettings (set via
+        # File → Settings…). Default 30s; minimum 5s to avoid hammering
+        # the server.
+        try:
+            from PyQt5.QtCore import QSettings
+            _poll_s = int(QSettings().value("monitor_poll_interval", 30, type=int))
+            _poll_s = max(5, min(300, _poll_s))
+        except Exception:
+            _poll_s = 30
+        self._monitor_health_timer.setInterval(_poll_s * 1000)
         self._monitor_health_timer.timeout.connect(self._refresh_monitor_health)
         self._monitor_health_timer.start()
         # First poll runs as soon as the event loop ticks so the user
@@ -4410,6 +4419,50 @@ class DevicesTab(QWidget):
             return
         self._apply_progress_bar.setVisible(False)
         self._apply_progress_label.setVisible(False)
+
+    def _retry_failed_apply(self, failed_devices):
+        """Re-apply just the devices that failed in the previous batch.
+
+        Triggered from the "Retry Failed" button in the apply-failure
+        dialog. Spawns a fresh MultiDeviceApplyWorker with only the
+        failed (row, device_info) tuples — same plumbing as a normal
+        apply, including the inline progress widget and the failure
+        dialog (which becomes recursive: retry again, retry again,
+        etc., until the user clicks OK or all pass).
+        """
+        if not failed_devices:
+            return
+        server_url = self.get_server_url()
+        if not server_url:
+            return
+
+        # If a worker is somehow still around, refuse — same guard
+        # the original apply path uses.
+        if hasattr(self, "multi_device_apply_worker") and self.multi_device_apply_worker:
+            if self.multi_device_apply_worker.isRunning() or not self.multi_device_apply_worker.isFinished():
+                logger.info("[RETRY] apply still running; skipping")
+                return
+
+        logger.info(f"[RETRY] re-applying {len(failed_devices)} failed device(s)")
+
+        # Mark them back to "Starting…" so the row state matches.
+        for row, device_info in failed_devices:
+            try:
+                self._set_device_status_starting(
+                    row, device_info, status_text="Retrying configuration…",
+                )
+            except Exception as _exc:
+                logger.debug(f"[RETRY] status reset failed for row {row}: {_exc}")
+
+        self.multi_device_apply_worker = MultiDeviceApplyWorker(
+            failed_devices, server_url, self,
+        )
+        self._current_operation_type = "apply"
+        self.multi_device_apply_worker.device_applied.connect(self._on_multi_device_applied)
+        self.multi_device_apply_worker.progress.connect(self._on_multi_device_progress)
+        self.multi_device_apply_worker.finished.connect(self._on_multi_device_apply_finished)
+        self._show_apply_progress(len(failed_devices))
+        self.multi_device_apply_worker.start()
 
     def _apply_device_filter(self, text: str = "") -> None:
         """Hide rows whose Name / Interface / IPv4 / IPv6 / MAC don't
@@ -8462,7 +8515,9 @@ class DevicesTab(QWidget):
             # specific cases like the server's HTTP 409 "(interface,
             # vlan) already in use" gate were effectively silent. Show
             # one aggregated dialog so multi-device batches don't
-            # produce a popup storm.
+            # produce a popup storm — and offer a "Retry Failed"
+            # button so the user doesn't have to re-select + re-apply
+            # by hand.
             if failed_count > 0 and results:
                 # results entries from MultiDeviceApplyWorker look like:
                 #   "❌ <name>: Failed to apply to server - <server error>"
@@ -8478,8 +8533,43 @@ class DevicesTab(QWidget):
                         "Device apply failed" if failed_count == 1
                         else f"{failed_count} devices failed to apply"
                     )
+
+                    # Capture the failed device_info entries before the
+                    # worker is cleaned up below — we need them to
+                    # re-spawn the retry worker.
+                    failed_device_infos = []
+                    if hasattr(self, "multi_device_apply_worker"):
+                        try:
+                            # Pull names from the "❌ <name>:" prefix; map
+                            # to the device_info tuples the worker held.
+                            failed_names = set()
+                            for line in failures:
+                                # Strip "❌ " then take up to ":"
+                                stripped = line.lstrip("❌").strip()
+                                if ":" in stripped:
+                                    failed_names.add(stripped.split(":", 1)[0].strip())
+                            for row, device_info in self.multi_device_apply_worker.devices_to_apply:
+                                if device_info.get("Device Name") in failed_names:
+                                    failed_device_infos.append((row, device_info))
+                        except Exception as _exc:
+                            logger.debug(f"[RETRY] could not capture failed devices: {_exc}")
+
                     try:
-                        QMessageBox.warning(self, title, body)
+                        box = QMessageBox(self)
+                        box.setIcon(QMessageBox.Warning)
+                        box.setWindowTitle(title)
+                        box.setText(body)
+                        box.setStandardButtons(QMessageBox.Ok)
+                        # Only show Retry if we have something to retry on.
+                        retry_btn = None
+                        if failed_device_infos:
+                            retry_btn = box.addButton(
+                                f"Retry Failed ({len(failed_device_infos)})",
+                                QMessageBox.ActionRole,
+                            )
+                        box.exec_()
+                        if retry_btn is not None and box.clickedButton() is retry_btn:
+                            self._retry_failed_apply(failed_device_infos)
                     except Exception as _dlg_exc:
                         logger.warning(f"Could not show apply-failure dialog: {_dlg_exc}")
             

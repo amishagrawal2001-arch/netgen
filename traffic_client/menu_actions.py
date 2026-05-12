@@ -249,6 +249,124 @@ class TrafficGenClientMenuAction():
         except Exception as e:
             QMessageBox.warning(self, "Error", f"Could not save server interfaces: {e}")
 
+    # ---------- Settings dialog ----------
+    # Lightweight QSettings-backed preferences. Persists to:
+    #   macOS:  ~/Library/Preferences/com.netgen.netgen-client.plist
+    #   Linux:  ~/.config/netgen/netgen-client.conf
+    # via the (organization, application) tuple set in QApplication
+    # bootstrap. Read with:
+    #   from PyQt5.QtCore import QSettings
+    #   QSettings().value("monitor_poll_interval", 30, type=int)
+    SETTINGS_DEFAULTS = {
+        "monitor_poll_interval": 30,       # seconds; min 5, max 300
+        "default_bgp_asn":       65000,    # initial value for Add Device → BGP
+        "default_ipv4_base":     "192.168.0.2",
+        "default_loopback_ipv4": "192.255.0.1",
+    }
+
+    def open_settings_dialog(self):
+        """File → Settings… — QSettings-backed preferences dialog."""
+        from PyQt5.QtWidgets import (
+            QDialog, QFormLayout, QSpinBox, QLineEdit, QDialogButtonBox,
+            QLabel, QVBoxLayout,
+        )
+        from PyQt5.QtCore import QSettings
+
+        s = QSettings()
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Netgen — Settings")
+        dlg.setMinimumWidth(420)
+
+        layout = QVBoxLayout(dlg)
+        intro = QLabel(
+            "Application preferences. Changes apply on OK; some take effect "
+            "on next refresh."
+        )
+        intro.setWordWrap(True)
+        intro.setStyleSheet("color: #6b7280; font-size: 11px; padding-bottom: 6px;")
+        layout.addWidget(intro)
+
+        form = QFormLayout()
+        form.setSpacing(8)
+
+        # Monitor poll interval
+        poll_input = QSpinBox()
+        poll_input.setRange(5, 300)
+        poll_input.setSuffix(" s")
+        poll_input.setValue(int(s.value(
+            "monitor_poll_interval",
+            self.SETTINGS_DEFAULTS["monitor_poll_interval"],
+            type=int,
+        )))
+        poll_input.setToolTip("How often the Devices tab polls /api/monitors/health")
+        form.addRow("Monitor poll interval:", poll_input)
+
+        # Default BGP ASN
+        asn_input = QSpinBox()
+        asn_input.setRange(1, 4_294_967_295)
+        asn_input.setValue(int(s.value(
+            "default_bgp_asn",
+            self.SETTINGS_DEFAULTS["default_bgp_asn"],
+            type=int,
+        )))
+        asn_input.setToolTip("Pre-filled in the Add Device → BGP form")
+        form.addRow("Default BGP ASN:", asn_input)
+
+        # Default IPv4 base address
+        ipv4_input = QLineEdit(str(s.value(
+            "default_ipv4_base",
+            self.SETTINGS_DEFAULTS["default_ipv4_base"],
+        )))
+        ipv4_input.setPlaceholderText("e.g. 192.168.0.2")
+        form.addRow("Default IPv4 base:", ipv4_input)
+
+        # Default loopback IPv4
+        lo_input = QLineEdit(str(s.value(
+            "default_loopback_ipv4",
+            self.SETTINGS_DEFAULTS["default_loopback_ipv4"],
+        )))
+        lo_input.setPlaceholderText("e.g. 192.255.0.1")
+        form.addRow("Default loopback IPv4:", lo_input)
+
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+            | QDialogButtonBox.RestoreDefaults
+        )
+        layout.addWidget(buttons)
+
+        def _apply():
+            s.setValue("monitor_poll_interval", poll_input.value())
+            s.setValue("default_bgp_asn", asn_input.value())
+            s.setValue("default_ipv4_base", ipv4_input.text().strip() or self.SETTINGS_DEFAULTS["default_ipv4_base"])
+            s.setValue("default_loopback_ipv4", lo_input.text().strip() or self.SETTINGS_DEFAULTS["default_loopback_ipv4"])
+            s.sync()
+            # Push the poll-interval change to the monitor-health timer
+            # if it's wired up on the Devices tab.
+            try:
+                if hasattr(self, "devices_tab") and hasattr(
+                    self.devices_tab, "_monitor_health_timer"
+                ):
+                    self.devices_tab._monitor_health_timer.setInterval(
+                        max(5_000, poll_input.value() * 1000)
+                    )
+            except Exception as exc:
+                logger.debug(f"[SETTINGS] could not retune monitor timer: {exc}")
+            dlg.accept()
+
+        def _restore():
+            poll_input.setValue(self.SETTINGS_DEFAULTS["monitor_poll_interval"])
+            asn_input.setValue(self.SETTINGS_DEFAULTS["default_bgp_asn"])
+            ipv4_input.setText(self.SETTINGS_DEFAULTS["default_ipv4_base"])
+            lo_input.setText(self.SETTINGS_DEFAULTS["default_loopback_ipv4"])
+
+        buttons.accepted.connect(_apply)
+        buttons.rejected.connect(dlg.reject)
+        buttons.button(QDialogButtonBox.RestoreDefaults).clicked.connect(_restore)
+
+        dlg.exec_()
+
     def export_devices_to_file(self):
         """File → Export Devices: dump the selected server's device
         configurations to a user-chosen JSON file. Strips runtime
