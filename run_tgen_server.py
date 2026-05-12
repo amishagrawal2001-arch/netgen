@@ -11325,6 +11325,22 @@ def force_arp_check():
         logging.error(f"[ARP MONITOR] Failed to force check: {e}")
         return jsonify({"error": str(e)}), 500
 
+
+@app.route("/api/dhcp/monitor/force-check", methods=["POST"])
+def force_dhcp_check():
+    """Force an immediate DHCP status refresh for every running device.
+
+    Mirror of the ARP / BGP / OSPF / ISIS force-check endpoints. Backs
+    the Refresh DHCP button so a click probes live state instead of
+    re-rendering whatever the periodic 30s monitor last wrote.
+    """
+    try:
+        dhcp_client_monitor.force_check()
+        return jsonify({"status": "success", "message": "DHCP status check initiated"}), 200
+    except Exception as e:
+        logging.error(f"[DHCP MONITOR] Failed to force check: {e}")
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/api/arp/monitor/config", methods=["POST"])
 def update_arp_monitor_config():
     """Update ARP monitoring configuration."""

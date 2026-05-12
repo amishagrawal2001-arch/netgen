@@ -1,4 +1,5 @@
 #bgp.py#
+import json
 import logging
 import subprocess
 import random
@@ -753,10 +754,83 @@ def generate_random_prefixes(base_prefix: str, count: int, prefix_length: int = 
         return []
 
 
-def advertise_bgp_routes(device_id: str, route_config: Dict[str, Any]) -> Dict[str, Any]:
+def _resolve_bgp_context(device_id: str):
+    """Look up the FRR container + BGP ASN + neighbor + VRF clause for
+    a device. Returns (container, asn, neighbor, router_clause, error)
+    where router_clause is e.g. "router bgp 65000 vrf vrf-47dce96a348"
+    or "router bgp 65000" for legacy non-VRF deployments. `error` is
+    a string when something's missing, else None.
+
+    Used by the three Route-Management dialog helpers below. Previously
+    these helpers issued vtysh against the *host's* system FRR via
+    safe_vtysh_command(), which doesn't exist in our docker-per-device
+    deployment — every call from the GUI silently failed.
     """
-    Advertise BGP routes for a device.
-    
+    try:
+        from utils.device_database import DeviceDatabase
+        device = DeviceDatabase().get_device(device_id) if device_id else None
+        if not device:
+            return None, None, None, None, "Device not found"
+        bgp_cfg = device.get("bgp_config") or {}
+        if isinstance(bgp_cfg, str):
+            try:
+                bgp_cfg = json.loads(bgp_cfg)
+            except Exception:
+                bgp_cfg = {}
+        asn = bgp_cfg.get("bgp_asn") or bgp_cfg.get("local_as") or 65000
+        try:
+            asn = int(asn)
+        except (TypeError, ValueError):
+            asn = 65000
+        neighbor = (
+            bgp_cfg.get("bgp_neighbor_ipv4")
+            or bgp_cfg.get("bgp_neighbor_ipv6")
+            or device.get("ipv4_gateway")
+            or ""
+        )
+        if not DOCKER_FRR_AVAILABLE:
+            return None, asn, neighbor, f"router bgp {asn}", "Docker FRR not available"
+
+        from utils.frr_docker import FRRDockerManager
+        frr_mgr = FRRDockerManager()
+        container_name = frr_mgr._get_container_name(device_id, device.get("device_name"))
+        try:
+            container = frr_mgr.client.containers.get(container_name)
+        except Exception:
+            return None, asn, neighbor, None, f"FRR container {container_name} not running"
+
+        # Build the VRF-aware `router bgp` clause.
+        vrf_name = frr_mgr.vrf_name_for_device(device_id)
+        router_clause = f"router bgp {asn}"
+        if vrf_name:
+            check = subprocess.run(
+                ["ip", "-o", "link", "show", vrf_name],
+                capture_output=True, text=True, timeout=2,
+            )
+            if check.returncode == 0 and (check.stdout or "").strip():
+                router_clause = f"router bgp {asn} vrf {vrf_name}"
+        return container, asn, neighbor, router_clause, None
+    except Exception as exc:
+        return None, None, None, None, f"Context lookup failed: {exc}"
+
+
+def _exec_vtysh_lines(container, lines):
+    """Run a list of vtysh -c commands inside the device's FRR
+    container. Returns (success, output)."""
+    cmd = ["vtysh"]
+    for line in lines:
+        cmd.extend(["-c", line])
+    try:
+        result = container.exec_run(cmd)
+        output = result.output.decode("utf-8", errors="ignore") if isinstance(result.output, bytes) else str(result.output or "")
+        return result.exit_code == 0, output
+    except Exception as exc:
+        return False, str(exc)
+
+
+def advertise_bgp_routes(device_id: str, route_config: Dict[str, Any]) -> Dict[str, Any]:
+    """Advertise BGP routes for a device via its FRR container.
+
     Args:
         device_id: Device identifier
         route_config: Route configuration containing:
@@ -766,201 +840,160 @@ def advertise_bgp_routes(device_id: str, route_config: Dict[str, Any]) -> Dict[s
             - local_pref: Local preference
             - origin: Route origin (IGP, EGP, INCOMPLETE)
             - communities: BGP communities
-    """
-    instance = BGP_INSTANCES.get(device_id)
-    if not instance:
-        logging.error(f"[BGP] No active BGP instance for device {device_id}")
-        return {"error": "No active BGP instance"}
 
-    # Validate route configuration
+    Issues all vtysh commands inside `ostg-frr-<device_id>`, scoped
+    to the device's per-device VRF instance — previously this used
+    `safe_vtysh_command` against host system FRR which doesn't exist
+    in our deployment model.
+    """
+    # Validate route configuration first.
     validation_result = validate_route_config(route_config.copy())
     if not validation_result["valid"]:
         logging.error(f"[BGP] Route validation failed for device {device_id}: {validation_result['errors']}")
         return {"error": f"Route validation failed: {', '.join(validation_result['errors'])}"}
-    
-    # Use validated route configuration
     route_config = validation_result["route_config"]
-    
-    # Log warnings if any
     if validation_result["warnings"]:
         logging.warning(f"[BGP] Route warnings for device {device_id}: {validation_result['warnings']}")
 
-    asn = instance["asn"]
-    neighbor = instance["neighbor"]
-    
-    # Get route configuration
+    # Resolve the FRR container + VRF-scoped router clause.
+    container, asn, neighbor, router_clause, error = _resolve_bgp_context(device_id)
+    if error or not container:
+        logging.error(f"[BGP] {error or 'Container unavailable'} for device {device_id}")
+        return {"error": error or "BGP context unavailable"}
+
     prefixes = route_config.get("prefixes", [])
+    if not prefixes:
+        return {"error": "No valid prefixes provided"}
+
     as_path = route_config.get("as_path", [])
     med = route_config.get("med", 0)
     local_pref = route_config.get("local_pref", 100)
     origin = route_config.get("origin", "IGP")
     communities = route_config.get("communities", [])
-    
-    if not prefixes:
-        logging.warning(f"[BGP] No valid prefixes provided for device {device_id}")
-        return {"error": "No valid prefixes provided"}
 
-    advertised_routes = []
-    
-    try:
-        # Configure route-map for custom attributes
-        route_map_name = f"RM_{device_id}_{int(time.time())}"
-        
-        # Build route-map commands
-        route_map_cmds = [
-            "vtysh",
-            "-c", "configure terminal",
-            "-c", f"route-map {route_map_name} permit 10"
+    # 1) Route-map for custom attributes.
+    route_map_name = f"RM_{device_id[:8]}_{int(time.time())}"
+    route_map_lines = ["configure terminal", f"route-map {route_map_name} permit 10"]
+    if as_path:
+        route_map_lines.append(f" set as-path prepend {' '.join(map(str, as_path))}")
+    if med and med > 0:
+        route_map_lines.append(f" set metric {med}")
+    if local_pref and local_pref != 100:
+        route_map_lines.append(f" set local-preference {local_pref}")
+    if origin and origin.upper() != "IGP":
+        route_map_lines.append(f" set origin {origin.lower()}")
+    if communities:
+        route_map_lines.append(f" set community {' '.join(communities)}")
+    route_map_lines.extend(["exit"])
+
+    ok, output = _exec_vtysh_lines(container, route_map_lines)
+    if not ok:
+        logging.warning(f"[BGP] Route-map setup partial for {device_id}: {output[:300]}")
+
+    # 2) Attach route-map to the neighbor in both AFs (best-effort —
+    #    only the AF the neighbor speaks will actually take it).
+    if neighbor:
+        rm_attach_lines = [
+            "configure terminal",
+            router_clause,
+            " address-family ipv4 unicast",
+            f"  neighbor {neighbor} route-map {route_map_name} out",
+            " exit-address-family",
+            " address-family ipv6 unicast",
+            f"  neighbor {neighbor} route-map {route_map_name} out",
+            " exit-address-family",
+            "exit",
         ]
-        
-        # Add AS path prepend if specified
-        if as_path:
-            as_path_str = " ".join(map(str, as_path))
-            route_map_cmds.extend(["-c", f"  set as-path prepend {as_path_str}"])
-        
-        # Add MED
-        if med > 0:
-            route_map_cmds.extend(["-c", f"  set metric {med}"])
-        
-        # Add local preference
-        if local_pref != 100:
-            route_map_cmds.extend(["-c", f"  set local-preference {local_pref}"])
-        
-        # Add origin
-        if origin.upper() != "IGP":
-            route_map_cmds.extend(["-c", f"  set origin {origin.lower()}"])
-        
-        # Add communities
-        if communities:
-            comm_str = " ".join(communities)
-            route_map_cmds.extend(["-c", f"  set community {comm_str}"])
-        
-        route_map_cmds.extend(["-c", "exit"])
-        
-        # Apply route-map to neighbor (both IPv4 and IPv6)
-        route_map_cmds.extend([
-            "-c", f"router bgp {asn}",
-            "-c", f"  address-family ipv4 unicast",
-            "-c", f"    neighbor {neighbor} route-map {route_map_name} out",
-            "-c", "  exit-address-family",
-            "-c", f"  address-family ipv6 unicast",
-            "-c", f"    neighbor {neighbor} route-map {route_map_name} out",
-            "-c", "  exit-address-family",
-            "-c", "exit"
-        ])
-        
-        # Execute route-map configuration
-        safe_vtysh_command(route_map_cmds)
-        logging.info(f"[BGP] Configured route-map {route_map_name} for device {device_id}")
-        
-        # Advertise each prefix
-        for prefix in prefixes:
-            try:
-                # Determine if it's IPv4 or IPv6
-                from ipaddress import ip_network
-                network = ip_network(prefix, strict=False)
-                address_family = "ipv4 unicast" if network.version == 4 else "ipv6 unicast"
-                
-                # Use network command to advertise the prefix
-                network_cmd = [
-                    "vtysh",
-                    "-c", "configure terminal",
-                    "-c", f"router bgp {asn}",
-                    "-c", f"  address-family {address_family}",
-                    "-c", f"    network {prefix}",
-                    "-c", "  exit-address-family",
-                    "-c", "exit"
-                ]
-                
-                safe_vtysh_command(network_cmd)
+        _exec_vtysh_lines(container, rm_attach_lines)
+
+    # 3) Advertise each prefix in its address family.
+    advertised_routes = []
+    from ipaddress import ip_network
+    for prefix in prefixes:
+        try:
+            network = ip_network(prefix, strict=False)
+            af = "ipv4 unicast" if network.version == 4 else "ipv6 unicast"
+            net_lines = [
+                "configure terminal",
+                router_clause,
+                f" address-family {af}",
+                f"  network {prefix}",
+                " exit-address-family",
+                "exit",
+            ]
+            ok, _ = _exec_vtysh_lines(container, net_lines)
+            if ok:
                 advertised_routes.append(prefix)
-                logging.info(f"[BGP] Advertised {address_family} route {prefix} for device {device_id}")
-                
-            except (subprocess.CalledProcessError, RuntimeError) as e:
-                logging.error(f"[BGP] Failed to advertise route {prefix}: {e}")
-        
-        # Store advertised routes
-        if device_id not in BGP_ROUTES:
-            BGP_ROUTES[device_id] = []
-        
-        BGP_ROUTES[device_id].extend(advertised_routes)
-        
-        return {
-            "device_id": device_id,
-            "advertised_routes": advertised_routes,
-            "route_map": route_map_name,
-            "total_routes": len(advertised_routes)
-        }
-        
-    except (subprocess.CalledProcessError, RuntimeError) as e:
-        logging.error(f"[BGP] Failed to configure BGP routes for {device_id}: {e}")
-        return {"error": f"Failed to configure routes: {e}"}
+                logging.info(f"[BGP] Advertised {af} route {prefix} for device {device_id}")
+            else:
+                logging.error(f"[BGP] Failed to advertise route {prefix} for {device_id}")
+        except Exception as exc:
+            logging.error(f"[BGP] Error advertising {prefix}: {exc}")
+
+    if device_id not in BGP_ROUTES:
+        BGP_ROUTES[device_id] = []
+    BGP_ROUTES[device_id].extend(advertised_routes)
+
+    return {
+        "device_id": device_id,
+        "advertised_routes": advertised_routes,
+        "route_map": route_map_name,
+        "total_routes": len(advertised_routes),
+    }
 
 
 def withdraw_bgp_routes(device_id: str, prefixes: List[str] = None) -> Dict[str, Any]:
-    """
-    Withdraw BGP routes for a device.
-    
+    """Withdraw BGP routes for a device via its FRR container.
+
     Args:
         device_id: Device identifier
-        prefixes: Specific prefixes to withdraw (if None, withdraw all)
-    """
-    instance = BGP_INSTANCES.get(device_id)
-    if not instance:
-        logging.error(f"[BGP] No active BGP instance for device {device_id}")
-        return {"error": "No active BGP instance"}
+        prefixes: Specific prefixes to withdraw (if None, withdraw all
+                  previously advertised via this module's tracker)
 
-    asn = instance["asn"]
-    
-    # Get routes to withdraw
+    Issues `no network <prefix>` inside the device's FRR container
+    under the VRF-scoped `router bgp` block.
+    """
+    container, _asn, _neighbor, router_clause, error = _resolve_bgp_context(device_id)
+    if error or not container:
+        logging.error(f"[BGP] {error or 'Container unavailable'} for device {device_id}")
+        return {"error": error or "BGP context unavailable"}
+
     if prefixes is None:
         prefixes = BGP_ROUTES.get(device_id, [])
-    
     if not prefixes:
-        logging.warning(f"[BGP] No routes to withdraw for device {device_id}")
         return {"message": "No routes to withdraw"}
 
     withdrawn_routes = []
-    
-    try:
-        for prefix in prefixes:
-            try:
-                # Determine if it's IPv4 or IPv6
-                from ipaddress import ip_network
-                network = ip_network(prefix, strict=False)
-                address_family = "ipv4 unicast" if network.version == 4 else "ipv6 unicast"
-                
-                # Remove network command to withdraw the prefix
-                withdraw_cmd = [
-                    "vtysh",
-                    "-c", "configure terminal",
-                    "-c", f"router bgp {asn}",
-                    "-c", f"  address-family {address_family}",
-                    "-c", f"    no network {prefix}",
-                    "-c", "  exit-address-family",
-                    "-c", "exit"
-                ]
-                
-                safe_vtysh_command(withdraw_cmd)
+    from ipaddress import ip_network
+    for prefix in prefixes:
+        try:
+            network = ip_network(prefix, strict=False)
+            af = "ipv4 unicast" if network.version == 4 else "ipv6 unicast"
+            lines = [
+                "configure terminal",
+                router_clause,
+                f" address-family {af}",
+                f"  no network {prefix}",
+                " exit-address-family",
+                "exit",
+            ]
+            ok, _ = _exec_vtysh_lines(container, lines)
+            if ok:
                 withdrawn_routes.append(prefix)
-                logging.info(f"[BGP] Withdrew {address_family} route {prefix} for device {device_id}")
-                
-            except (subprocess.CalledProcessError, RuntimeError) as e:
-                logging.error(f"[BGP] Failed to withdraw route {prefix}: {e}")
-        
-        # Update stored routes
-        if device_id in BGP_ROUTES:
-            BGP_ROUTES[device_id] = [r for r in BGP_ROUTES[device_id] if r not in withdrawn_routes]
-        
-        return {
-            "device_id": device_id,
-            "withdrawn_routes": withdrawn_routes,
-            "total_withdrawn": len(withdrawn_routes)
-        }
-        
-    except (subprocess.CalledProcessError, RuntimeError) as e:
-        logging.error(f"[BGP] Failed to withdraw BGP routes for {device_id}: {e}")
-        return {"error": f"Failed to withdraw routes: {e}"}
+                logging.info(f"[BGP] Withdrew {af} route {prefix} for device {device_id}")
+            else:
+                logging.error(f"[BGP] Failed to withdraw route {prefix} for {device_id}")
+        except Exception as exc:
+            logging.error(f"[BGP] Error withdrawing {prefix}: {exc}")
+
+    if device_id in BGP_ROUTES:
+        BGP_ROUTES[device_id] = [r for r in BGP_ROUTES[device_id] if r not in withdrawn_routes]
+
+    return {
+        "device_id": device_id,
+        "withdrawn_routes": withdrawn_routes,
+        "total_withdrawn": len(withdrawn_routes),
+    }
 
 
 def get_bgp_routes(device_id: str = None) -> Dict[str, Any]:
@@ -1413,43 +1446,59 @@ def configure_bgp_for_device(device_id: str, bgp_config: Dict, ipv4: str = None,
 
 
 def get_bgp_route_statistics() -> Dict[str, Any]:
-    """Get BGP route statistics from FRR."""
+    """Get BGP route statistics across every running device container.
+
+    Previously this queried host system FRR via vtysh — meaningless in
+    our docker-per-device deployment. Now: enumerate every running
+    container that matches our managed prefix, run
+    `show bgp vrf <name> summary` inside it, and aggregate. The
+    advertised_routes field still reflects this module's local tracker.
+    """
+    if not DOCKER_FRR_AVAILABLE:
+        return {"error": "Docker FRR not available"}
     try:
-        # Get BGP summary
-        summary_cmd = ["vtysh", "-c", "show ip bgp summary"]
-        summary_result = safe_vtysh_command(summary_cmd)
-        summary_output = summary_result.stdout
-        
-        # Get BGP routes
-        routes_cmd = ["vtysh", "-c", "show ip bgp"]
-        routes_result = safe_vtysh_command(routes_cmd)
-        routes_output = routes_result.stdout
-        
-        # Parse summary for neighbor statistics
+        from utils.frr_docker import list_all_containers, FRRDockerManager
+        from utils.frr_docker import _bgp_vtysh_scope  # vrf <name> | vrf all
+        frr_mgr = FRRDockerManager()
+
         neighbors = []
-        for line in summary_output.splitlines():
-            if "BGP router identifier" in line:
-                router_id = line.split()[-1]
-            elif "." in line and len(line.split()) >= 10:
+        router_id = "Unknown"
+        for entry in list_all_containers():
+            if entry.get("status") != "running":
+                continue
+            device_id = entry.get("device_id") or ""
+            try:
+                container = frr_mgr.client.containers.get(entry["name"])
+            except Exception:
+                continue
+            scope = _bgp_vtysh_scope(device_id)
+            try:
+                r = container.exec_run(f"vtysh -c 'show bgp {scope} summary'")
+                out = r.output.decode("utf-8", errors="ignore") if isinstance(r.output, bytes) else str(r.output or "")
+            except Exception:
+                continue
+            for line in out.splitlines():
+                if "BGP router identifier" in line and router_id == "Unknown":
+                    parts = line.split()
+                    if parts:
+                        router_id = parts[-1]
+                    continue
                 parts = line.split()
-                if len(parts) >= 10:
+                if len(parts) >= 10 and (parts[0].count(".") == 3 or ":" in parts[0]):
                     neighbors.append({
+                        "device_id": device_id,
                         "neighbor": parts[0],
                         "as": parts[2],
                         "state": parts[9] if len(parts) > 9 else "Unknown",
-                        "prefixes": parts[10] if len(parts) > 10 else "0"
+                        "prefixes": parts[10] if len(parts) > 10 else "0",
                     })
-        
-        # Count total routes
-        route_count = len([line for line in routes_output.splitlines() if line.strip() and not line.startswith("BGP")])
-        
+
         return {
-            "router_id": router_id if 'router_id' in locals() else "Unknown",
+            "router_id": router_id,
             "neighbors": neighbors,
-            "total_routes": route_count,
-            "advertised_routes": BGP_ROUTES
+            "total_routes": sum(len(v) for v in BGP_ROUTES.values()),
+            "advertised_routes": BGP_ROUTES,
         }
-        
-    except (subprocess.CalledProcessError, RuntimeError) as e:
+    except Exception as e:
         logging.error(f"[BGP] Failed to get route statistics: {e}")
         return {"error": f"Failed to get statistics: {e}"}
