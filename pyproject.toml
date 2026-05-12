@@ -39,10 +39,11 @@ dependencies = { file = ["requirements.txt"] }
 ostg-client = "run_tgen_client:main"
 ostg-server = "ostg.server:main"
 ostg-docker-install = "setup_docker:main"
+netgen-cli = "netgen_cli:main"
 
 [tool.setuptools]
 packages.find = { exclude = ["backup*", "*.backup.*", "*.tmp", "*.temp"] }
-py-modules = ["multithreaded_traffic_gen", "run_tgen_client", "run_tgen_server", "capture_client", "setup_docker"]
+py-modules = ["multithreaded_traffic_gen", "run_tgen_client", "run_tgen_server", "capture_client", "setup_docker", "netgen_cli"]
 
 [tool.setuptools.package-data]
 "resources" = ["**/*"]

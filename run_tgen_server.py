@@ -275,6 +275,19 @@ def ping():
     return jsonify({"status": "ok"}), 200
 
 
+@app.route("/api/health", methods=["GET"])
+def api_health():
+    """Lightweight liveness probe — exempt from bearer-token auth even
+    when NETGEN_AUTH_TOKEN is set (see _AUTH_EXEMPT_PREFIXES). Lets
+    load balancers / monitoring poke the process without juggling
+    secrets."""
+    return jsonify({
+        "status": "ok",
+        "auth_required": bool(_AUTH_TOKEN),
+        "version": 1,
+    }), 200
+
+
 def increment_value(base, step, count, is_ip=False):
     """Increment a base value by a step for a specified count."""
     results = []

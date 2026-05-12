@@ -31,6 +31,29 @@ def launch(server_url: str, fullscreen: bool, server_explicitly_provided: bool =
     app.setOrganizationDomain("netgen.local")
     app.setApplicationName("netgen-client")
 
+    # Optional bearer-token auth — mirror of the server-side
+    # NETGEN_AUTH_TOKEN gate in run_tgen_server.py. When set in the
+    # client's environment, every `requests.{get,post,put,…}` call
+    # auto-injects an `Authorization: Bearer <token>` header so the
+    # 100+ HTTP sites scattered through traffic_client / widgets
+    # don't each need bespoke wiring. Override the per-call header
+    # by passing `headers={"Authorization": "Bearer …"}` explicitly.
+    _auth_token = os.environ.get("NETGEN_AUTH_TOKEN", "").strip()
+    if _auth_token:
+        import requests as _rq
+        def _wrap_request_fn(fn):
+            def _patched(url, **kwargs):
+                headers = dict(kwargs.get("headers") or {})
+                headers.setdefault("Authorization", f"Bearer {_auth_token}")
+                kwargs["headers"] = headers
+                return fn(url, **kwargs)
+            return _patched
+        for _m in ("get", "post", "put", "delete", "patch", "head", "options"):
+            try:
+                setattr(_rq, _m, _wrap_request_fn(getattr(_rq, _m)))
+            except Exception:
+                pass
+
     try:
         # Preferred: widget takes server_url and explicit flag
         try:

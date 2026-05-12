@@ -1392,11 +1392,39 @@ the VRF).</p>
 <p>The periodic ARP monitor calls this endpoint every 30 s for every
 Running device and persists the result.</p>
 
-<h2>15. Authentication, CORS, rate limiting</h2>
+<h2>15. Authentication</h2>
 
-<p><b>None.</b> The server has no auth layer, no CORS preflight handling,
-no rate limiting. Internal-network use only — never expose port 5050 to
-the public internet.</p>
+<p>Off by default — fine for the lab. Opt in by setting
+<code>NETGEN_AUTH_TOKEN=&lt;secret&gt;</code> on the server. Once set,
+every <code>/api/*</code> request must carry
+<code>Authorization: Bearer &lt;secret&gt;</code> or it returns
+<code>401</code>.</p>
+
+<h3>Server</h3>
+<pre><code># systemd EnvironmentFile or launch-script export
+NETGEN_AUTH_TOKEN=8c2f4e9a-3d1b-46f7-…</code></pre>
+
+<p>Exempt paths (no token required even when auth is on):</p>
+<ul>
+  <li><code>/admin</code> — the single-page web UI handles its own session</li>
+  <li><code>/api/health</code> — for load-balancer probes</li>
+</ul>
+
+<h3>Client (curl)</h3>
+<pre><code>curl -H "Authorization: Bearer $NETGEN_AUTH_TOKEN" \
+     http://&lt;server&gt;:5050/api/interfaces</code></pre>
+
+<h3>Client (GUI)</h3>
+<p>Set <code>NETGEN_AUTH_TOKEN</code> in the environment before launching
+the client; a bootstrap hook in <code>run_tgen_client.py</code> auto-
+injects the header into every <code>requests.{get,post,put,…}</code>
+call so the existing 100+ HTTP sites Just Work.</p>
+
+<h3>What's still not handled</h3>
+<p>No CORS preflight handling. No rate limiting. No per-user / per-role
+authorization — bearer-token is shared-secret only. Don't expose port
+5050 to the public internet; auth is a guard against accidental
+discovery, not a hardened access-control layer.</p>
 """
 
 
