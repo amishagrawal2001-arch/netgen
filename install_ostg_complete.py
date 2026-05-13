@@ -19,12 +19,43 @@ from typing import Dict, List, Optional, Tuple
 
 # Product identity
 PRODUCT_NAME = "Netgen"
-NETGEN_VERSION = "0.2.0"
 
 # Wheel artifact still ships under its original distribution name; surface rename
 # leaves the Python package internals untouched.
 WHEEL_DIST = "ostg_trafficgen"
-WHEEL_VERSION = "0.2.0"
+
+
+def _parse_pyproject_version() -> str:
+    """Read `version = "..."` from pyproject.toml.
+
+    Hardcoding the version here was the source of every "wheel built
+    as 0.2.4 but installer looks for 0.2.0" bug. Parsing the canonical
+    source removes the need to keep this file in lock-step with
+    pyproject.toml.
+    """
+    import os as _os
+    import re as _re
+    pyproject_path = _os.path.join(
+        _os.path.dirname(_os.path.abspath(__file__)),
+        "pyproject.toml",
+    )
+    try:
+        with open(pyproject_path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                m = _re.match(r'^\s*version\s*=\s*"([^"]+)"', line)
+                if m:
+                    return m.group(1)
+    except Exception:
+        pass
+    # Last-ditch fallback so the installer doesn't crash if
+    # pyproject.toml is missing (shouldn't happen with the repo, but
+    # we can be defensive). Anything that builds the wheel will still
+    # discover the actual version downstream.
+    return "0.0.0"
+
+
+NETGEN_VERSION = _parse_pyproject_version()
+WHEEL_VERSION = NETGEN_VERSION
 
 PYTHON_VERSION = "3.10"
 VENV_NAME = "netgen_env"
@@ -558,11 +589,18 @@ class NetgenInstaller:
         git tree never drift.
         """
         import subprocess as _sp
+        import glob as _glob
         script_dir = os.path.dirname(os.path.abspath(__file__))
+        # Compute the *expected* wheel filename (from pyproject.toml)
+        # but don't hard-rely on it — after building, glob the dist/
+        # directory and grab whatever's there. That way a bump
+        # between this code reading the version and the build
+        # actually finishing (e.g. someone edits pyproject mid-build)
+        # doesn't cause a false-negative "not in dist/" error.
         wheel_file = f"{WHEEL_DIST}-{WHEEL_VERSION}-py3-none-any.whl"
         local_wheel_path = os.path.join(script_dir, "dist", wheel_file)
 
-        self.log(f"Building fresh wheel from source ({wheel_file})...")
+        self.log(f"Building fresh wheel from source (expecting {wheel_file})...")
         try:
             # Wipe any older artifacts in dist/ to avoid pip picking
             # up a stale one if the new build fails silently.
@@ -597,13 +635,34 @@ class NetgenInstaller:
                 )
                 sys.exit(1)
 
+            # If the exact-name file isn't there, fall back to globbing
+            # for any ostg_trafficgen-*.whl in dist/. Whoever ran
+            # `python -m build` is the source of truth for what the
+            # filename should be, not this script's static constants.
             if not os.path.exists(local_wheel_path):
-                self.log(
-                    f"Wheel build reported success but {wheel_file} not in dist/. "
-                    f"Files present: {os.listdir(dist_dir) if os.path.isdir(dist_dir) else 'none'}",
-                    "ERROR",
+                candidates = sorted(
+                    _glob.glob(os.path.join(dist_dir, f"{WHEEL_DIST}-*-py3-none-any.whl")),
+                    key=os.path.getmtime,
+                    reverse=True,
                 )
-                sys.exit(1)
+                if not candidates:
+                    self.log(
+                        f"Wheel build reported success but no "
+                        f"{WHEEL_DIST}-*.whl in dist/. "
+                        f"Files present: {os.listdir(dist_dir) if os.path.isdir(dist_dir) else 'none'}",
+                        "ERROR",
+                    )
+                    sys.exit(1)
+                local_wheel_path = candidates[0]
+                wheel_file = os.path.basename(local_wheel_path)
+                self.log(
+                    f"Build produced {wheel_file} (expected "
+                    f"{WHEEL_DIST}-{WHEEL_VERSION}-py3-none-any.whl). "
+                    f"Using {wheel_file}.",
+                    "WARNING",
+                )
+            self._actual_wheel_path = local_wheel_path
+            self._actual_wheel_file = wheel_file
 
             self.log(f"✓ Built {wheel_file}")
         except _sp.TimeoutExpired:
@@ -628,9 +687,14 @@ class NetgenInstaller:
         # the deployed artifact can't drift from the git tree.
         self._build_wheel()
 
-        # Copy wheel file (still distributed under its original name)
-        wheel_file = f"{WHEEL_DIST}-{WHEEL_VERSION}-py3-none-any.whl"
-        local_wheel_path = f"dist/{wheel_file}"
+        # _build_wheel() stashes the actual built filename so we don't
+        # have to re-glob here. Falls back to the
+        # constant-driven name if for any reason it wasn't set.
+        local_wheel_path = getattr(self, "_actual_wheel_path", None)
+        wheel_file = getattr(self, "_actual_wheel_file", None)
+        if not local_wheel_path or not wheel_file:
+            wheel_file = f"{WHEEL_DIST}-{WHEEL_VERSION}-py3-none-any.whl"
+            local_wheel_path = f"dist/{wheel_file}"
         remote_wheel_path = f"{INSTALL_DIR}/{wheel_file}"
 
         if not os.path.exists(local_wheel_path):
