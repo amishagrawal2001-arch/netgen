@@ -215,12 +215,124 @@ def _wait_for_device(base: str, device_id: str, timeout: int) -> bool:
     return False
 
 
+def cmd_l2(args) -> int:
+    """L2 frame generator subcommands: start-<protocol>, stop, list, stats."""
+    base = args.server
+    action = args.action
+    if action.startswith("start-"):
+        proto = action.removeprefix("start-")
+        body = {"iface": args.iface}
+        # Map argparse attributes back into the REST body verbatim.
+        # Protocol-specific knobs are sparse since most have sensible
+        # defaults baked into utils/l2_protocols.py.
+        for attr in (
+            "system_priority", "system_mac", "key", "port_priority",
+            "port_number", "state", "fast",
+            "chassis_id", "port_id", "system_name", "system_description",
+            "ttl_s", "interval_s", "duration_s", "src_mac",
+            "version", "vrid", "priority", "virtual_ips", "src_ip",
+            "family", "group", "type_code",
+            "hold_time", "dr_priority", "generation_id",
+        ):
+            v = getattr(args, attr, None)
+            if v is not None:
+                body[attr] = v
+        r = _api("POST", base, f"/api/l2/{proto}/start", json=body, timeout=15)
+    elif action == "stop":
+        body = {"session_id": args.session_id} if args.session_id else {}
+        r = _api("POST", base, "/api/l2/stop", json=body, timeout=10)
+    elif action == "list":
+        r = _api("GET", base, "/api/l2/sessions", timeout=10)
+    elif action == "stats":
+        if not args.session_id:
+            _exit_fail("stats requires --session-id")
+        r = _api("GET", base, f"/api/l2/stats/{args.session_id}", timeout=10)
+    else:
+        _exit_fail(f"unknown l2 action: {action}")
+        return 2
+    if r.status_code != 200:
+        _exit_fail(f"HTTP {r.status_code}: {r.text[:200]}", code=3)
+    _print_json(r.json())
+    return 0
+
+
 def cmd_wait(args) -> int:
     """Block until a device's ARP is fully resolved, or timeout."""
     if not args.device_id:
         _exit_fail("wait requires -i/--device-id")
     ok = _wait_for_device(args.server, args.device_id, args.timeout)
     return 0 if ok else 5
+
+
+# --------------------------------------------------------------------- stateful TCP
+#
+# Thin wrapper over /api/stateful_tcp/*. The point is to let an operator
+# kick off a real TCP test without having to hand-build curl commands;
+# the heavy lifting lives in utils/stateful_tcp.py.
+
+
+def cmd_tcp(args) -> int:
+    """Stateful-TCP subcommands: start-client, start-server, stop, list, stats."""
+    base = args.server
+    action = args.action
+    if action == "start-client":
+        body = {
+            "role": "client",
+            "dst_ip": args.dst_ip,
+            "dst_port": args.dst_port,
+            "duration_s": args.duration,
+            "payload_bytes": args.payload_bytes,
+            "concurrency": args.concurrency,
+            "interval_s": args.interval,
+            "expect_echo": not args.no_echo,
+            "protocol": args.protocol,
+            "tls": args.tls,
+            "tls_verify": args.tls_verify,
+        }
+        if args.src_ip:
+            body["src_ip"] = args.src_ip
+        if args.vrf:
+            body["vrf"] = args.vrf
+        if args.tls_server_hostname:
+            body["tls_server_hostname"] = args.tls_server_hostname
+        r = _api("POST", base, "/api/stateful_tcp/start", json=body, timeout=10)
+    elif action == "start-server":
+        body = {
+            "role": "server",
+            "listen_port": args.port,
+            "listen_ip": args.bind,
+            "mode": args.mode,
+            "protocol": args.protocol,
+            "response_bytes": args.response_bytes,
+            "tls": args.tls,
+        }
+        if args.vrf:
+            body["vrf"] = args.vrf
+        if args.tls_cert:
+            body["tls_cert"] = args.tls_cert
+        if args.tls_key:
+            body["tls_key"] = args.tls_key
+        r = _api("POST", base, "/api/stateful_tcp/start", json=body, timeout=10)
+    elif action == "stop":
+        body = {"session_id": args.session_id} if args.session_id else {}
+        r = _api("POST", base, "/api/stateful_tcp/stop", json=body, timeout=10)
+    elif action == "list":
+        r = _api("GET", base, "/api/stateful_tcp/sessions", timeout=10)
+    elif action == "stats":
+        if not args.session_id:
+            _exit_fail("stats requires --session-id")
+        r = _api("GET", base, f"/api/stateful_tcp/stats/{args.session_id}", timeout=10)
+    else:
+        _exit_fail(f"unknown tcp action: {action}")
+        return 2
+
+    if r.status_code != 200:
+        _exit_fail(f"HTTP {r.status_code}: {r.text[:200]}", code=3)
+    try:
+        _print_json(r.json())
+    except Exception:
+        sys.stdout.write(r.text + "\n")
+    return 0
 
 
 # --------------------------------------------------------------------- main
@@ -267,6 +379,153 @@ def main(argv=None) -> int:
     p_wait.add_argument("-i", "--device-id", required=True)
     p_wait.add_argument("--timeout", type=int, default=60)
     p_wait.set_defaults(func=cmd_wait)
+
+    # tcp <action> — stateful TCP foundation. One subparser per action
+    # keeps the args clean instead of a giant flag soup.
+    p_tcp = sub.add_parser(
+        "tcp",
+        help="Stateful TCP traffic — real handshakes via OS sockets",
+    )
+    tcp_sub = p_tcp.add_subparsers(dest="action", required=True)
+
+    p_tcp_sc = tcp_sub.add_parser("start-client", help="Start a stateful-TCP client session")
+    p_tcp_sc.add_argument("--dst-ip", required=True)
+    p_tcp_sc.add_argument("--dst-port", type=int, required=True)
+    p_tcp_sc.add_argument("--src-ip", default=None)
+    p_tcp_sc.add_argument("--vrf", default=None,
+                          help="Linux VRF/iface name (SO_BINDTODEVICE)")
+    p_tcp_sc.add_argument("--duration", type=float, default=30.0, help="Run time in seconds")
+    p_tcp_sc.add_argument("--payload-bytes", type=int, default=1024)
+    p_tcp_sc.add_argument("--concurrency", type=int, default=1)
+    p_tcp_sc.add_argument("--interval", type=float, default=0.0,
+                          help="Sleep between connections per sender (s)")
+    p_tcp_sc.add_argument("--no-echo", action="store_true",
+                          help="Don't expect response — send + close immediately")
+    p_tcp_sc.add_argument("--protocol", choices=("raw", "http"), default="raw",
+                          help="L7 framing on top of TCP")
+    p_tcp_sc.add_argument("--tls", action="store_true", help="Wrap connection in TLS")
+    p_tcp_sc.add_argument("--tls-verify", action="store_true",
+                          help="Enforce cert+hostname verification (default off)")
+    p_tcp_sc.add_argument("--tls-server-hostname", default=None,
+                          help="SNI / hostname check target (defaults to --dst-ip)")
+    p_tcp_sc.set_defaults(func=cmd_tcp)
+
+    p_tcp_ss = tcp_sub.add_parser("start-server", help="Start a stateful-TCP listener")
+    p_tcp_ss.add_argument("--port", type=int, required=True)
+    p_tcp_ss.add_argument("--bind", default="0.0.0.0")
+    p_tcp_ss.add_argument("--vrf", default=None,
+                          help="Linux VRF/iface name (SO_BINDTODEVICE)")
+    p_tcp_ss.add_argument("--mode", choices=("echo", "discard"), default="echo")
+    p_tcp_ss.add_argument("--protocol", choices=("raw", "http"), default="raw",
+                          help="L7 framing on top of TCP")
+    p_tcp_ss.add_argument("--response-bytes", type=int, default=1024,
+                          help="HTTP body size (only when --protocol=http)")
+    p_tcp_ss.add_argument("--tls", action="store_true")
+    p_tcp_ss.add_argument("--tls-cert", default=None, help="Server cert PEM path")
+    p_tcp_ss.add_argument("--tls-key", default=None, help="Server key PEM path")
+    p_tcp_ss.set_defaults(func=cmd_tcp)
+
+    p_tcp_stop = tcp_sub.add_parser("stop", help="Stop a session (or all sessions)")
+    p_tcp_stop.add_argument("--session-id", default=None,
+                            help="Specific session ID (omit to stop all)")
+    p_tcp_stop.set_defaults(func=cmd_tcp)
+
+    p_tcp_list = tcp_sub.add_parser("list", help="List known TCP sessions")
+    p_tcp_list.set_defaults(func=cmd_tcp)
+
+    p_tcp_stats = tcp_sub.add_parser("stats", help="Live counters for one session")
+    p_tcp_stats.add_argument("--session-id", required=True)
+    p_tcp_stats.set_defaults(func=cmd_tcp)
+
+    # L2 frame generators + multicast protocols
+    p_l2 = sub.add_parser(
+        "l2",
+        help="L2 frame generators — LACP / LLDP / VRRP / IGMP / PIM-Hello",
+    )
+    l2_sub = p_l2.add_subparsers(dest="action", required=True)
+
+    # `--iface` is required by every start-*; defining it once on the
+    # parent action would shadow the action-specific args, so we add
+    # it per-action via _add_iface().
+    def _add_iface(p):
+        p.add_argument("--iface", required=True,
+                       help="Network interface to send frames on (eth0, ens1, …)")
+        p.add_argument("--duration-s", dest="duration_s", type=float, default=None,
+                       help="Stop after N seconds (default: run forever)")
+        p.add_argument("--interval-s", dest="interval_s", type=float, default=None)
+        return p
+
+    # LACP
+    p_lacp = _add_iface(l2_sub.add_parser("start-lacp",
+        help="Start an LACP (802.1AX) frame emitter"))
+    p_lacp.add_argument("--system-mac", dest="system_mac", default=None)
+    p_lacp.add_argument("--system-priority", dest="system_priority", type=int, default=None)
+    p_lacp.add_argument("--key", type=int, default=None)
+    p_lacp.add_argument("--port-priority", dest="port_priority", type=int, default=None)
+    p_lacp.add_argument("--port-number", dest="port_number", type=int, default=None)
+    p_lacp.add_argument("--state", type=int, default=None,
+                        help="LACP state bits (0x01=Activity, 0x04=Aggregation, …)")
+    p_lacp.add_argument("--fast", action="store_true",
+                        help="1s cadence (LACP_Short_Timeout) — default is 30s")
+    p_lacp.set_defaults(func=cmd_l2)
+
+    # LLDP
+    p_lldp = _add_iface(l2_sub.add_parser("start-lldp",
+        help="Start an LLDP (802.1AB) advertiser"))
+    p_lldp.add_argument("--chassis-id", dest="chassis_id", default=None)
+    p_lldp.add_argument("--port-id", dest="port_id", default=None)
+    p_lldp.add_argument("--system-name", dest="system_name", default=None)
+    p_lldp.add_argument("--system-description", dest="system_description", default=None)
+    p_lldp.add_argument("--ttl-s", dest="ttl_s", type=int, default=None)
+    p_lldp.add_argument("--src-mac", dest="src_mac", default=None)
+    p_lldp.set_defaults(func=cmd_l2)
+
+    # VRRP
+    p_vrrp = _add_iface(l2_sub.add_parser("start-vrrp",
+        help="Start a VRRP master advertiser (v2 or v3, IPv4 or IPv6)"))
+    p_vrrp.add_argument("--version", type=int, choices=(2, 3), default=None)
+    p_vrrp.add_argument("--vrid", type=int, default=None)
+    p_vrrp.add_argument("--priority", type=int, default=None)
+    p_vrrp.add_argument("--virtual-ips", dest="virtual_ips", nargs="+", default=None,
+                        help="One or more virtual IP addresses")
+    p_vrrp.add_argument("--src-ip", dest="src_ip", default=None)
+    p_vrrp.add_argument("--src-mac", dest="src_mac", default=None)
+    p_vrrp.add_argument("--family", choices=("ipv4", "ipv6"), default=None)
+    p_vrrp.set_defaults(func=cmd_l2)
+
+    # IGMP
+    p_igmp = _add_iface(l2_sub.add_parser("start-igmp",
+        help="Start an IGMP membership-report emitter"))
+    p_igmp.add_argument("--version", type=int, choices=(2, 3), default=None)
+    p_igmp.add_argument("--group", default=None, help="Multicast group address")
+    p_igmp.add_argument("--type-code", dest="type_code", type=lambda x: int(x, 0), default=None,
+                        help="Override IGMP type byte (e.g. 0x17 for v2 Leave)")
+    p_igmp.add_argument("--src-ip", dest="src_ip", default=None)
+    p_igmp.add_argument("--src-mac", dest="src_mac", default=None)
+    p_igmp.set_defaults(func=cmd_l2)
+
+    # PIM Hello
+    p_pim = _add_iface(l2_sub.add_parser("start-pim",
+        help="Start a PIM Hello (RFC 7761) emitter"))
+    p_pim.add_argument("--hold-time", dest="hold_time", type=int, default=None)
+    p_pim.add_argument("--dr-priority", dest="dr_priority", type=int, default=None)
+    p_pim.add_argument("--generation-id", dest="generation_id",
+                       type=lambda x: int(x, 0), default=None)
+    p_pim.add_argument("--src-ip", dest="src_ip", default=None)
+    p_pim.add_argument("--src-mac", dest="src_mac", default=None)
+    p_pim.set_defaults(func=cmd_l2)
+
+    # Generic stop/list/stats
+    p_l2_stop = l2_sub.add_parser("stop", help="Stop an L2 session (all if no ID)")
+    p_l2_stop.add_argument("--session-id", default=None)
+    p_l2_stop.set_defaults(func=cmd_l2)
+
+    p_l2_list = l2_sub.add_parser("list", help="List L2 sessions")
+    p_l2_list.set_defaults(func=cmd_l2)
+
+    p_l2_stats = l2_sub.add_parser("stats", help="Live counters for one L2 session")
+    p_l2_stats.add_argument("--session-id", required=True)
+    p_l2_stats.set_defaults(func=cmd_l2)
 
     args = parser.parse_args(argv)
     args.server = args.server.rstrip("/")

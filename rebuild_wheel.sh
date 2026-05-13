@@ -5,9 +5,13 @@
 
 set -e
 
-# Configuration
+# Configuration — version pulled from pyproject.toml.
 PROJECT_NAME="ostg-trafficgen"
-VERSION="0.1.52"
+VERSION="$(grep -E '^version' pyproject.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
+if [[ -z "$VERSION" ]]; then
+    echo "ERROR: Could not parse version from pyproject.toml" >&2
+    exit 1
+fi
 WHEEL_FILE="${PROJECT_NAME//-/_}-${VERSION}-py3-none-any.whl"
 
 # Colors for output

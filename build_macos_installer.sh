@@ -13,9 +13,15 @@ BLUE='\033[0;34m'
 PURPLE='\033[0;35m'
 NC='\033[0m' # No Color
 
-# Configuration
-OSTG_VERSION="0.1.52"
-INSTALLER_NAME="OSTG-TrafficGenerator-${OSTG_VERSION}"
+# Configuration. Auto-detect version from pyproject.toml so the DMG
+# filename always matches the wheel inside. Hardcoding was the source
+# of "the deploy installed 0.1.52" mysteries.
+OSTG_VERSION="$(grep -E '^version' pyproject.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
+if [[ -z "$OSTG_VERSION" ]]; then
+    echo "ERROR: Could not parse version from pyproject.toml" >&2
+    exit 1
+fi
+INSTALLER_NAME="Netgen-TrafficGenerator-${OSTG_VERSION}"
 DMG_NAME="${INSTALLER_NAME}-macOS.dmg"
 VENV_NAME="ostg_build_env"
 BUILD_DIR="macos_build"

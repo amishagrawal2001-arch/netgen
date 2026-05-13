@@ -301,7 +301,23 @@ class ISISMonitor:
                 'neighbors': neighbors,
                 'areas': areas
             })
-            
+
+            # Per-protocol state-history timeline (de-dup'd against last row).
+            try:
+                self.device_db.add_state_transition(
+                    device_id,
+                    "isis",
+                    isis_state or "Unknown",
+                    detail={
+                        "running": isis_running,
+                        "established": isis_established,
+                        "neighbors": len(neighbors),
+                        "areas": len(areas) if areas else 0,
+                    },
+                )
+            except Exception as _e:
+                logger.debug(f"[ISIS MONITOR] state-history insert skipped: {_e}")
+
             logger.info(f"[ISIS MONITOR] Successfully updated ISIS status for device {device_id}: {isis_state}")
             
         except Exception as e:

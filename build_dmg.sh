@@ -29,9 +29,14 @@ info() {
     echo -e "${BLUE}[$(date +'%Y-%m-%d %H:%M:%S')] INFO: $1${NC}"
 }
 
-# Configuration
-OSTG_VERSION="0.1.52"
-DMG_NAME="OSTG-TrafficGenerator-${OSTG_VERSION}.dmg"
+# Configuration. Version auto-detected from pyproject.toml — was
+# previously hardcoded (0.1.52) which broke after every bump and
+# caused the DMG filename to disagree with the wheel inside it.
+OSTG_VERSION="$(grep -E '^version' pyproject.toml | head -1 | sed -E 's/.*"([^"]+)".*/\1/')"
+if [[ -z "$OSTG_VERSION" ]]; then
+    error "Could not parse version from pyproject.toml"
+fi
+DMG_NAME="Netgen-TrafficGenerator-${OSTG_VERSION}.dmg"
 
 # Check if we're on macOS
 if [[ "$OSTYPE" != "darwin"* ]]; then

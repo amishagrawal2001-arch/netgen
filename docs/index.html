@@ -417,6 +417,7 @@
       <a href="#features">Features</a>
       <a href="#usecases">Use cases</a>
       <a href="#protocols">Protocols</a>
+      <a href="#whats-new">What's new</a>
       <a href="#hardware">Hardware</a>
       <a href="#quickstart">Quick start</a>
       <a href="#api">API</a>
@@ -534,6 +535,88 @@
          attachments let you advertise thousands of prefixes per
          neighbor without touching vtysh.</p>
     </div>
+    <div class="feature">
+      <div class="ico">🗺️</div>
+      <h3>Topology view (IXNetwork-style) <span class="pill ok" style="font-size:10px;margin-left:6px;">NEW</span></h3>
+      <p>A dedicated canvas with port-lane badges at the bottom, device
+         cards stacked above with vertical protocol-stack chips
+         (ETH / IPv4 / IPv6 / BGP / OSPF / ISIS / DHCP), status LEDs
+         driven by per-protocol health, cables to ports, and peer
+         edges between cards. Right-side property panel updates on
+         selection with state-history transitions. Hierarchical or
+         circular layout, cursor-anchored zoom, persistent layout
+         across sessions.</p>
+    </div>
+    <div class="feature">
+      <div class="ico">🔌</div>
+      <h3>Stateful TCP · 4 L7 protocols <span class="pill ok" style="font-size:10px;margin-left:6px;">NEW</span></h3>
+      <p>Real Python sockets — actual 3-way handshakes, graceful close,
+         per-session counters for conns / bytes / handshake-ms / RTT.
+         Linux <code>SO_BINDTODEVICE</code> for per-VRF source pinning,
+         <code>TCP_INFO</code> scraping for kernel-reported retransmits
+         and RTT, opt-in TLS termination on both ends. Four L7
+         protocols out of the box: <strong>raw</strong> byte echo,
+         <strong>HTTP/1.1</strong> for proxy/WAF tests,
+         <strong>DNS-over-TCP</strong> (RFC 7766) with per-RCODE
+         counters, <strong>SIP-over-TCP</strong> (RFC 3261) with
+         REGISTER and per-status-class counters. Drives middleboxes
+         that gate on connection state.</p>
+    </div>
+    <div class="feature">
+      <div class="ico">📡</div>
+      <h3>Live updates (SSE) <span class="pill ok" style="font-size:10px;margin-left:6px;">NEW</span></h3>
+      <p>Server-Sent Events stream pushes every protocol-state
+         transition to subscribed GUIs in real time — no polling. The
+         Topology canvas auto-refreshes LED colours and chip
+         backgrounds within 750 ms of a state change landing. Plain
+         HTTP (<code>curl -N</code> friendly), bearer-token auth
+         applies for free, auto-reconnects on drop. Add a new event
+         type by calling <code>publish()</code> in any producer.</p>
+    </div>
+    <div class="feature">
+      <div class="ico">⚡</div>
+      <h3>One-click templates <span class="pill ok" style="font-size:10px;margin-left:6px;">NEW</span></h3>
+      <p>8 device profiles + 7 traffic profiles ready to drop in.
+         Device side: bare host, iBGP / eBGP peer, OSPFv2 backbone,
+         dual-stack OSPFv2+v3, IS-IS L1-L2, DHCP client, VXLAN VTEP.
+         Traffic side: UDP line-rate 64 B, UDP IMIX, LAG/RSS/ECMP
+         modifier mix, NLAT latency probe, VXLAN encap, ICMP flood,
+         VLAN-tagged UDP. Pick from a dropdown, tweak IPs, apply.</p>
+    </div>
+    <div class="feature">
+      <div class="ico">⏳</div>
+      <h3>State-history timeline <span class="pill ok" style="font-size:10px;margin-left:6px;">NEW</span></h3>
+      <p>Every protocol monitor writes a row each time a session
+         transitions — Established → Active, Full → Init, Resolved →
+         Stale. De-duped against the previous row so steady-state polls
+         don't bloat the DB. <strong>Ctrl+H</strong> in the GUI shows a
+         per-protocol tabbed timeline; <code>/api/device/database/
+         devices/&lt;id&gt;/history</code> exposes it programmatically.</p>
+    </div>
+    <div class="feature">
+      <div class="ico">⌨️</div>
+      <h3>netgen-cli (headless) <span class="pill ok" style="font-size:10px;margin-left:6px;">NEW</span></h3>
+      <p>Companion CLI for everything the GUI does, scriptable from
+         CI / tmux / SSH. <code>health</code>, <code>export</code>,
+         <code>import</code>, <code>apply --wait</code>,
+         <code>status</code>, plus full <code>tcp</code> session control.
+         Auto-injects bearer-token auth when
+         <code>NETGEN_AUTH_TOKEN</code> is set. Drops cleanly into
+         GitHub Actions / Jenkins / GitLab pipelines.</p>
+    </div>
+    <div class="feature">
+      <div class="ico">🔐</div>
+      <h3>Per-role auth <span class="pill ok" style="font-size:10px;margin-left:6px;">NEW</span></h3>
+      <p>Three roles in a hierarchy:
+         <strong>viewer</strong> &lt; <strong>operator</strong> &lt;
+         <strong>admin</strong>. Token-to-role mapping via
+         <code>NETGEN_AUTH_TOKENS_JSON</code> on the server; 40
+         endpoints currently annotated covering traffic, device CRUD,
+         BGP/OSPF/IS-IS lifecycle, stateful-TCP control. Single-token
+         deployments still work as admin —
+         <code>/api/health</code> stays exempt so k8s / HAProxy
+         probes don't need credentials.</p>
+    </div>
   </div>
 </section>
 
@@ -588,6 +671,156 @@
          them at a route-reflector or a TOR and watch convergence.</p>
     </div>
   </div>
+</section>
+
+<!-- What's new -->
+<section class="block quickstart" id="whats-new">
+  <h2>What's new in 0.2.2.</h2>
+  <p>The 0.2.x line lands operator-grade visibility, real-socket stateful
+     traffic with four L7 protocols (raw, HTTP/1.1, DNS-over-TCP, SIP),
+     live event push via Server-Sent Events, per-role auth, and one-click
+     templates for both device profiles and traffic streams.</p>
+
+  <div class="features" style="grid-template-columns: 1fr 1fr;">
+
+    <div class="feature">
+      <div class="ico">📡</div>
+      <h3>Live updates via Server-Sent Events <span class="pill ok" style="font-size:10px;margin-left:6px;">0.2.2</span></h3>
+      <p>The GUI no longer polls. A long-lived HTTP stream pushes every
+         protocol-state transition (BGP up, OSPF Full, ARP resolved, …)
+         as it happens. Topology canvas LEDs and chip colours re-render
+         within 750 ms of the event landing on the wire. Heartbeats
+         every 15 s keep proxies happy on quiet fabrics.
+         <code>curl -N /api/events/stream</code> works for debugging;
+         the Qt client auto-reconnects on drop.</p>
+    </div>
+
+    <div class="feature">
+      <div class="ico">🗺️</div>
+      <h3>Topology tab</h3>
+      <p>IXNetwork-style canvas. Green port-lane badges at the bottom
+         (one per server interface), device cards stacked above with
+         vertical protocol-stack chips (ETH / IPv4 / IPv6 / BGP / OSPF /
+         ISIS / DHCP), status LEDs driven by rolled-up protocol health,
+         cubic-Bezier cables from each card to its port, and
+         protocol-coloured peer edges between cards. Right-side property
+         panel updates on selection. Live SSE-driven auto-refresh on
+         state changes. Hierarchical / circular layout toggle,
+         cursor-anchored zoom, per-mode position persistence.</p>
+    </div>
+
+    <div class="feature">
+      <div class="ico">⚡</div>
+      <h3>One-click templates <span class="pill ok" style="font-size:10px;margin-left:6px;">0.2.1</span></h3>
+      <p>Skip the "click 14 checkboxes" prelude every test setup starts
+         with. Add Device dialog ships with 8 ready-made device profiles
+         (Bare host, iBGP / eBGP peer, OSPFv2 backbone, dual-stack
+         OSPFv2+v3, IS-IS L1-L2, DHCP client, VXLAN VTEP). Add Stream
+         dialog ships with 7 traffic profiles (UDP line-rate 64 B,
+         UDP IMIX, LAG/RSS/ECMP modifier mix, NLAT latency probe, VXLAN
+         encap, ICMP flood, VLAN-tagged UDP). Pick from a dropdown,
+         tweak IPs to match your lab, apply.</p>
+    </div>
+
+    <div class="feature">
+      <div class="ico">🔌</div>
+      <h3>Stateful TCP — four L7 protocols</h3>
+      <p>Real sockets, actual 3-way handshakes, graceful close.
+         Per-session counters for conns attempted / established /
+         failed, bytes tx / rx, handshake-ms, userspace + kernel-
+         reported RTT (<code>TCP_INFO</code>, Linux). Linux
+         <code>SO_BINDTODEVICE</code> for per-VRF source pinning.
+         Four L7 modes: <strong>raw</strong> byte echo,
+         <strong>HTTP/1.1</strong> with Content-Length framing,
+         <strong>DNS-over-TCP</strong> (RFC 7766) with per-RCODE
+         counters, and <strong>SIP-over-TCP</strong> (RFC 3261) with
+         REGISTER messages and per-status-class counters. Opt-in TLS
+         on both ends.</p>
+    </div>
+
+    <div class="feature">
+      <div class="ico">🔐</div>
+      <h3>Per-role auth <span class="pill ok" style="font-size:10px;margin-left:6px;">0.2.1</span></h3>
+      <p>Three roles in a hierarchy: <strong>viewer</strong> (read-
+         only), <strong>operator</strong> (mutating non-destructive),
+         <strong>admin</strong> (everything). 40 endpoints currently
+         annotated — traffic start/stop, device CRUD, BGP/OSPF/IS-IS
+         lifecycle, stateful-TCP control, monitor force-checks.
+         Single-token deployments (0.2.0 default) keep working as
+         admin — multi-token mapping is opt-in via
+         <code>NETGEN_AUTH_TOKENS_JSON</code>.</p>
+    </div>
+
+    <div class="feature">
+      <div class="ico">⏳</div>
+      <h3>State-history timeline</h3>
+      <p>Every protocol monitor writes a row on each observed state
+         change, de-duped against the previous row so steady-state
+         polls don't bloat the DB.
+         <strong>Ctrl+H</strong> in the GUI shows a per-protocol
+         tabbed view;
+         <code>/api/device/database/devices/&lt;id&gt;/history</code>
+         returns the change-only timeline as JSON. State changes are
+         also published to the SSE bus for live consumers.</p>
+    </div>
+
+    <div class="feature">
+      <div class="ico">⌨️</div>
+      <h3>netgen-cli (headless)</h3>
+      <p>Companion CLI for CI / tmux / SSH workflows.
+         <code>health</code>, <code>list</code>, <code>export</code>,
+         <code>import</code>, <code>apply --wait</code>,
+         <code>status</code>, <code>wait</code>, plus full
+         <code>tcp</code> session control with all four L7 protocols.
+         Auto-injects bearer-token auth via
+         <code>NETGEN_AUTH_TOKEN</code>. Drops into Jenkins, GitHub
+         Actions, or GitLab — gate merges on the JSON it prints.</p>
+    </div>
+
+    <div class="feature">
+      <div class="ico">🔍</div>
+      <h3>View Device Config (Ctrl+J)</h3>
+      <p>Read-only viewer for a device's full server-side JSON
+         configuration. Monospace pretty-print, copy-to-clipboard. Same
+         dialog from both the Devices tab (Ctrl+J on the selected row)
+         and the Topology tab (double-click a card).</p>
+    </div>
+
+    <div class="feature">
+      <div class="ico">📤</div>
+      <h3>Device export / import</h3>
+      <p>Round-trip the entire device topology as JSON via
+         <code>GET /api/devices/export</code> and
+         <code>POST /api/devices/import</code>. Pairs with
+         <code>netgen-cli export</code> / <code>import</code> for a
+         "snapshot this lab, restore on another box" workflow.
+         <code>--wait</code> blocks until ARP resolves on each device.</p>
+    </div>
+
+    <div class="feature">
+      <div class="ico">🏗️</div>
+      <h3>Server modularization <span class="pill ok" style="font-size:10px;margin-left:6px;">0.2.1+</span></h3>
+      <p>The 18,500-line <code>run_tgen_server.py</code> monolith is
+         being broken up one Blueprint at a time. Three route groups
+         extracted so far: stateful-TCP, device-DB queries
+         (events/history/statistics), and live events. Each Blueprint
+         takes the role-decorator and DB instance via
+         <code>configure()</code> so auth stays decoupled. Pattern is
+         set; the rest of the migration is incremental.</p>
+    </div>
+
+  </div>
+
+  <p class="muted" style="margin-top: 28px;">
+    70 pytest cases ride along — VRF naming, stateful-TCP loopback
+    echo, TLS handshake (self-signed cert generated on the fly),
+    HTTP/1.1 framing, DNS-over-TCP rcode counters, SIP REGISTER status
+    class binning, SSE event-bus backpressure, per-role auth
+    hierarchy, device + traffic template registry invariants, plus
+    all legacy helpers. See
+    <a href="https://github.com/DAY-Advisor/NetGenI/blob/main/CHANGELOG.md">CHANGELOG.md</a>
+    for the full diff.
+  </p>
 </section>
 
 <!-- Protocol emulation deep dive -->
@@ -904,33 +1137,47 @@ python3 -m traffic_client \
     <div class="arch-card">
       <h3>netgen-server</h3>
       <div class="tags">
-        <span class="tag">Flask</span>
+        <span class="tag">Flask + Blueprints</span>
         <span class="tag">DPDK 23.11</span>
         <span class="tag">SQLite</span>
         <span class="tag">scapy</span>
+        <span class="tag">FRR 8.5</span>
       </div>
       <ul>
         <li>tx_worker C process per stream (DPDK), multi-queue</li>
         <li>Scapy fallback for non-UDP (ICMP, TCP, custom)</li>
+        <li>Real-socket stateful TCP workers (raw, HTTP/1.1, DNS-over-TCP, SIP-over-TCP, TLS, TCP_INFO scraping)</li>
         <li>Stream database (SQLite) + tracker thread for per-flow stats</li>
+        <li>Per-protocol state-history table — every monitor logs transitions</li>
+        <li>In-process event bus + Server-Sent Events stream for live GUI updates</li>
         <li>Per-iface latency sampler via libpcap</li>
         <li>RFC 2544 runner thread with cooperative cancel</li>
+        <li>Per-role bearer-token auth (viewer / operator / admin)</li>
+        <li>Modular Flask Blueprints — stateful-TCP, device-DB queries, events</li>
         <li>Single-page <code>/admin</code> web UI</li>
       </ul>
     </div>
     <div class="arch-card">
-      <h3>traffic_client (GUI)</h3>
+      <h3>traffic_client (GUI) + netgen-cli</h3>
       <div class="tags">
         <span class="tag">PyQt5</span>
         <span class="tag">QThread</span>
+        <span class="tag">QGraphicsScene</span>
         <span class="tag">QPainter</span>
+        <span class="tag">SSE consumer</span>
       </div>
       <ul>
+        <li>Streams, Devices, and <strong>Topology</strong> tabs</li>
+        <li>IXNetwork-style canvas: port lane + device cards + property panel</li>
+        <li>Live state-change updates via Server-Sent Events — no polling</li>
+        <li>One-click device + traffic templates (15 ready-made profiles)</li>
         <li>Stream editor, copy/paste, inline editing</li>
         <li>Live stats dock with per-interface + per-stream tabs</li>
         <li>Rolling throughput chart (60s window)</li>
         <li>RFC 2544 wizard with CSV export</li>
+        <li>State-history dialog (<strong>Ctrl+H</strong>) + view-device-config (<strong>Ctrl+J</strong>)</li>
         <li>Background workers + local event loops keep the UI responsive</li>
+        <li><code>netgen-cli</code> headless companion for CI / scripting</li>
         <li>Help → Install Guide + API Guide embedded</li>
       </ul>
     </div>
@@ -978,7 +1225,45 @@ curl -X POST http://&lt;server&gt;:5050/api/rfc2544/start \
   -d '{"tx_iface":"enp181s0f0np0", "rx_iface":"enp181s0f1np1",
        "frame_sizes":[64,512,1518], "duration_per_step":10,
        "mac_src":"aa:bb:cc:dd:ee:01","mac_dst":"aa:bb:cc:dd:ee:02",
-       "ip_src":"10.0.0.1","ip_dst":"10.0.0.2"}'</code></pre>
+       "ip_src":"10.0.0.1","ip_dst":"10.0.0.2"}'
+
+<span style="color:#94a3b8"># Start a stateful TCP echo server, then fire a client at it</span>
+curl -X POST http://&lt;server&gt;:5050/api/stateful_tcp/start \
+  -H "Content-Type: application/json" \
+  -d '{"role":"server","listen_port":5001,"listen_ip":"0.0.0.0"}'
+
+curl -X POST http://&lt;server&gt;:5050/api/stateful_tcp/start \
+  -H "Content-Type: application/json" \
+  -d '{"role":"client","dst_ip":"127.0.0.1","dst_port":5001,
+       "duration_s":30,"concurrency":4,"payload_bytes":4096,
+       "protocol":"http","tls":false,"vrf":"vrf-abc12345"}'
+
+<span style="color:#94a3b8"># Poll live counters (conns / bytes / kernel RTT / retransmits)</span>
+curl http://&lt;server&gt;:5050/api/stateful_tcp/stats/&lt;session_id&gt;
+
+<span style="color:#94a3b8"># Subscribe to the live event stream (Server-Sent Events).</span>
+<span style="color:#94a3b8"># Every protocol state transition pushes immediately — no polling.</span>
+curl -N -H "Authorization: Bearer $NETGEN_AUTH_TOKEN" \
+     http://&lt;server&gt;:5050/api/events/stream
+<span style="color:#94a3b8"># → event: state_transition</span>
+<span style="color:#94a3b8">#   data: {"event_type":"state_transition","device_id":"...",</span>
+<span style="color:#94a3b8">#          "protocol":"bgp","state":"Established","detail":{...}}</span>
+
+<span style="color:#94a3b8"># SIP-over-TCP registrar simulator + load (4 L7 protocols total)</span>
+curl -X POST http://&lt;server&gt;:5050/api/stateful_tcp/start \
+  -H "Content-Type: application/json" \
+  -d '{"role":"server","listen_port":5060,"protocol":"sip",
+       "sip_response_status":401,"sip_response_reason":"Unauthorized"}'
+
+curl -X POST http://&lt;server&gt;:5050/api/stateful_tcp/start \
+  -H "Content-Type: application/json" \
+  -d '{"role":"client","dst_ip":"127.0.0.1","dst_port":5060,
+       "protocol":"sip","duration_s":30,"concurrency":2,"interval_s":0.01}'
+
+<span style="color:#94a3b8"># Same things from the headless CLI</span>
+netgen-cli tcp start-client --dst-ip 10.0.0.5 --dst-port 5001 \
+    --duration 30 --concurrency 4 --protocol http --vrf vrf-abc12345
+netgen-cli tcp stats --session-id &lt;id&gt;</code></pre>
 
   <p style="margin-top:18px;">
     Full reference: <strong>Help → API Guide</strong> in the GUI, or see
@@ -1073,11 +1358,18 @@ curl -X POST http://&lt;server&gt;:5050/api/rfc2544/start \
     </details>
     <details>
       <summary>Does it generate stateful TCP, or just stateless packets?</summary>
-      <p>Today: stateless. tx_worker constructs each packet from a
-         template and modifiers; there's no TCP state machine. Stateful
-         TCP / HTTP scenarios are on the roadmap but not yet built.
-         For now, use the scapy fallback (slower) for stateful or stick
-         with stateless UDP/IP/Ethernet for line-rate work.</p>
+      <p>Both, in parallel. tx_worker still throws stateless packets at
+         line rate from templates + modifiers. <strong>As of 0.2.0</strong>
+         there's also a real-socket stateful path: actual 3-way handshakes,
+         per-session connection counters, kernel-reported retransmits and
+         RTT via <code>TCP_INFO</code>, optional TLS termination, and an
+         HTTP/1.1 framing mode for testing reverse proxies and WAFs.
+         Linux hosts can pin each client onto a per-device VRF via
+         <code>SO_BINDTODEVICE</code>. Drive it from the REST API
+         (<code>/api/stateful_tcp/*</code>) or the new
+         <code>netgen-cli tcp</code> subcommand. Stateless DPDK for
+         line-rate forwarding tests, stateful sockets for middlebox
+         and proxy validation — pick the right one per workload.</p>
     </details>
     <details>
       <summary>Can I emulate multiple routers on a single NIC?</summary>
@@ -1094,12 +1386,19 @@ curl -X POST http://&lt;server&gt;:5050/api/rfc2544/start \
     </details>
     <details>
       <summary>How do I run it from a CI pipeline?</summary>
-      <p>The Flask REST API is the entire surface — anything the GUI
-         can do, curl can do. Headless mode is on the in-progress
-         list (right now you need an X display for the client process);
-         for CI, drive the server directly via curl or the Python
-         <code>requests</code> library. See <strong>API Guide</strong>
-         in the embedded help for endpoints.</p>
+      <p><strong>As of 0.2.0</strong> there's a headless companion:
+         <code>netgen-cli</code>. Installed alongside the GUI client as a
+         standalone entry point, it wraps every common multi-device
+         workflow — <code>health</code>, <code>list</code>,
+         <code>export</code>, <code>import</code>, <code>apply</code>,
+         <code>status</code>, <code>wait</code> — plus full
+         <code>tcp start-client / start-server / stats / stop</code> for
+         the stateful TCP surface. Auto-injects
+         <code>Authorization: Bearer …</code> when
+         <code>NETGEN_AUTH_TOKEN</code> is set. Drop it into Jenkins /
+         GitHub Actions / GitLab pipelines and gate merges on the JSON
+         it prints. The Flask REST API is still the full surface for
+         anything <code>netgen-cli</code> doesn't wrap yet.</p>
     </details>
     <details>
       <summary>What's the latency overhead of the netgen tx path?</summary>

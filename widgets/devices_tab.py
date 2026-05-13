@@ -1528,6 +1528,14 @@ class DevicesTab(QWidget):
         self.interface_to_device_map = {}
         self.selected_interfaces = set()
         self._arp_check_in_progress = False  # Flag to prevent multiple ARP checks
+
+        # SSE worker — connects on first reload_devices_from_server.
+        # Server-pushed events (state_transition, device_applied,
+        # device_started/stopped/removed, stream_*) trigger a coalesced
+        # full device-table refresh so cells reflect live state without
+        # the old 30s poll loop.
+        self._sse_worker = None
+        self._sse_refresh_pending = False
         self.selected_iface_name = ""
 
         # Create simple tab widget like main window
@@ -1802,6 +1810,18 @@ class DevicesTab(QWidget):
         self.manage_route_pools_button.setToolTip("Manage BGP Route Pools")
         self.manage_route_pools_button.setStyleSheet(BTN_BASE)
 
+        # Bulk-edit button — operates on the multi-row table selection.
+        # Opens a dialog where the operator picks which fields to edit
+        # and a per-field auto-increment step, then mutates every
+        # selected device in one go. Saves the "edit 8 devices in a
+        # row" loop.
+        self.bulk_edit_button = QPushButton("⧉")
+        self.bulk_edit_button.setFixedSize(BTN_W, BTN_H)
+        self.bulk_edit_button.setCursor(Qt.PointingHandCursor)
+        self.bulk_edit_button.setToolTip("Bulk-edit selected devices")
+        self.bulk_edit_button.setStyleSheet(BTN_BASE)
+        self.bulk_edit_button.clicked.connect(self._open_bulk_edit_dialog)
+
         # NetGenAI button — keep the special blue treatment since it
         # is a marketing/branded entry point, but adopt the same
         # height (BTN_H) so it aligns with the rest of the row.
@@ -1832,7 +1852,7 @@ class DevicesTab(QWidget):
         # runtime control right), matching the streams action bar.
         button_list_left = [
             self.add_button, self.edit_button, self.remove_button,
-            self.copy_button, self.paste_button,
+            self.copy_button, self.paste_button, self.bulk_edit_button,
         ]
         button_list_right = [
             self.start_device_button, self.stop_device_button,
@@ -1953,6 +1973,19 @@ class DevicesTab(QWidget):
             lambda: self._device_filter_input.setFocus()
             if hasattr(self, "_device_filter_input") else None
         )
+        # Ctrl+H opens the per-protocol state-history dialog for the
+        # currently-selected device. Backed by /api/device/database/
+        # devices/<id>/history — the monitors write a row each time a
+        # protocol transitions (Established → Active, etc.) so this
+        # surface is the *change-only* timeline, not every poll.
+        _history_shortcut = _QShortcut(_QKeySequence("Ctrl+H"), self)
+        _history_shortcut.activated.connect(self._show_selected_device_history)
+        # Ctrl+J shows the full server-side config JSON for the selected
+        # row. Cheaper-than-export read of one device — handy when
+        # debugging "why doesn't this look like what I typed?" without
+        # having to leave the GUI for `netgen-cli status`.
+        _viewcfg_shortcut = _QShortcut(_QKeySequence("Ctrl+J"), self)
+        _viewcfg_shortcut.activated.connect(self._show_selected_device_config)
 
         self.ping_button.clicked.connect(self.ping_selected_device)
         self.arp_button.clicked.connect(self._on_arp_button_clicked)
@@ -3929,6 +3962,95 @@ class DevicesTab(QWidget):
             f"[RELOAD] Synced from {len(servers)} server(s); "
             f"{len(merged_seen_ids)} device id(s) merged"
         )
+
+        # Now that the server is confirmed reachable, spin up the SSE
+        # consumer for live updates. Reusing the existing worker is
+        # cheap; we don't stack workers on repeated reloads.
+        try:
+            self._ensure_sse_worker()
+        except Exception as _exc:
+            logger.debug(f"[RELOAD] SSE worker init failed: {_exc}")
+
+    # ------------------------------------------------------------------
+    # SSE live-updates
+    # ------------------------------------------------------------------
+    def _ensure_sse_worker(self):
+        """Start the SSE consumer if not already running. Idempotent
+        across multiple reload_devices_from_server() calls — reused so
+        we don't stack workers when the operator clicks F5 repeatedly."""
+        # Guard against a tombstoned QThread wrapper (same pattern the
+        # topology tab uses).
+        try:
+            if self._sse_worker is not None:
+                if self._sse_worker.isRunning():
+                    return
+                self._sse_worker = None
+        except RuntimeError:
+            self._sse_worker = None
+
+        # Pick the first online server as the event source. With
+        # multi-server deployments we'd want one worker per server,
+        # but today the single-server case is the operational norm.
+        servers = getattr(self.main_window, "server_interfaces", []) or []
+        url_base = None
+        for s in servers:
+            if s.get("online", True):
+                url_base = (s.get("address") or "").rstrip("/")
+                if url_base:
+                    break
+        if not url_base:
+            return
+
+        try:
+            from utils.sse_client import SSEWorker
+        except Exception as exc:
+            logger.debug(f"[DEVICES] SSE client unavailable: {exc}")
+            return
+
+        worker = SSEWorker(f"{url_base}/api/events/stream")
+        worker.event.connect(self._on_sse_event)
+        worker.disconnected.connect(self._on_sse_disconnected)
+        worker.finished.connect(worker.deleteLater)
+        self._sse_worker = worker
+        worker.start()
+        logger.debug(f"[DEVICES] SSE worker started → {url_base}")
+
+    def _on_sse_event(self, event_type: str, payload: dict):
+        """Server-pushed event handler. Coalesces multiple events
+        within a 500 ms window into a single reload so a fabric-wide
+        flap doesn't cascade dozens of /devices fetches.
+
+        Events that warrant a refresh:
+          state_transition  — protocol state changed (BGP/OSPF/ARP/…)
+          device_applied    — someone (or us) applied a device
+          device_started    — lifecycle: started
+          device_stopped    — lifecycle: stopped
+          device_removed    — lifecycle: removed
+
+        Other events (stream_*, heartbeat) we ignore here — the
+        Streams tab can hook them itself.
+        """
+        if event_type not in {
+            "state_transition", "device_applied", "device_started",
+            "device_stopped", "device_removed",
+        }:
+            return
+        if self._sse_refresh_pending:
+            return
+        self._sse_refresh_pending = True
+        from PyQt5.QtCore import QTimer
+
+        def _fire():
+            self._sse_refresh_pending = False
+            try:
+                self.reload_devices_from_server()
+            except Exception as exc:
+                logger.debug(f"[DEVICES] SSE-triggered reload failed: {exc}")
+
+        QTimer.singleShot(500, _fire)
+
+    def _on_sse_disconnected(self, reason: str):
+        logger.debug(f"[DEVICES] SSE disconnect: {reason}")
 
     def populate_device_table(self):
         """Populate the device table from the data structure.
@@ -8661,7 +8783,22 @@ class DevicesTab(QWidget):
     def cleanup_threads(self):
         """Clean up timers and worker threads before application exit."""
         logger.info("Cleaning up all worker threads...")
-        
+
+        # SSE worker first — its stop() forcibly closes the in-flight
+        # response, unblocking iter_lines() in milliseconds. Without
+        # this the GUI close could hang up to heartbeat_interval (15s).
+        try:
+            if self._sse_worker is not None:
+                logger.info("Stopping devices-tab SSE worker...")
+                try:
+                    self._sse_worker.stop()
+                    if self._sse_worker.isRunning():
+                        self._sse_worker.wait(1500)
+                except RuntimeError:
+                    pass
+        except Exception as exc:
+            logger.debug(f"SSE worker shutdown failed: {exc}")
+
         timer_attrs = [
             "status_timer",
             "bgp_monitoring_timer",
@@ -9461,3 +9598,624 @@ class DevicesTab(QWidget):
                 self._refresh_device_table_from_database(rows_to_refresh)
         except Exception as exc:
             logging.debug(f"[DEVICE POLL] Error: {exc}")
+
+    # ------------------------------------------------------------------
+    # State-history dialog (Ctrl+H on the Devices tab)
+    #
+    # Reads /api/device/database/devices/<id>/history — the monitors
+    # de-dup against the previous row, so this surface is the *change-
+    # only* timeline (e.g. "BGP: Established → Active at 12:03"). Cheap
+    # enough to fetch once per dialog open; no live polling.
+    # ------------------------------------------------------------------
+    def _show_selected_device_history(self):
+        """Open the per-protocol state-history dialog for the selected
+        row. No-op when no row is selected or the row has no device_id
+        (e.g. a placeholder template row)."""
+        try:
+            tbl = self.devices_table
+            row = tbl.currentRow()
+            if row < 0:
+                return
+            name_col = self.COL.get("Device Name")
+            if name_col is None:
+                return
+            name_item = tbl.item(row, name_col)
+            if name_item is None:
+                return
+            device_id = name_item.data(Qt.UserRole)
+            if not device_id:
+                # Not-yet-applied row — nothing to show.
+                QMessageBox.information(
+                    self, "State history",
+                    "This device hasn't been applied yet — no history to show.",
+                )
+                return
+            device_name = (name_item.text() or device_id)[:40]
+            server_url = self.get_server_url(silent=True)
+            if not server_url:
+                return
+            dlg = _DeviceStateHistoryDialog(
+                self, server_url, device_id, device_name,
+            )
+            dlg.exec_()
+        except Exception as exc:
+            logging.error(f"[STATE HISTORY] open failed: {exc}")
+
+    # ------------------------------------------------------------------
+    # View Device Config (Ctrl+J)
+    #
+    # Read-only pretty-printed JSON of the server's stored row for the
+    # selected device. No new endpoint — just /api/device/database/
+    # devices/<id>. The dialog has a Copy button so users can paste
+    # the config into a bug report.
+    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Bulk-edit (toolbar ⧉ button)
+    # ------------------------------------------------------------------
+    def _open_bulk_edit_dialog(self):
+        """Open the bulk-edit dialog for the current table selection.
+
+        Resolves selected rows → opens dialog → applies the computed
+        per-row plan back into self.main_window.all_devices, repaints,
+        marks each device for re-apply, and triggers one save_session.
+        """
+        try:
+            tbl = self.devices_table
+            sel_model = tbl.selectionModel()
+            if sel_model is None:
+                return
+            # Unique row indexes from the selection (selectItems may
+            # return one QModelIndex per cell, so dedup).
+            rows = sorted({idx.row() for idx in sel_model.selectedIndexes()})
+            if not rows:
+                QMessageBox.information(
+                    self, "Bulk-edit",
+                    "Select one or more device rows first."
+                )
+                return
+
+            dlg = _BulkEditDialog(self, rows)
+            if dlg.exec_() != QDialog.Accepted:
+                return
+
+            plans = dlg.compute_plans()
+            if not plans:
+                return
+
+            self._apply_bulk_plans(plans)
+        except Exception as exc:
+            logging.error(f"[BULK EDIT] open failed: {exc}")
+            QMessageBox.warning(self, "Bulk-edit", f"Failed: {exc}")
+
+    def _apply_bulk_plans(self, plans):
+        """Walk the list of (row_index, plan_dict) tuples and write
+        every field into the all_devices structure. Block table
+        signals during the writes so cellChanged doesn't fire
+        save_session once per cell."""
+        if not plans:
+            return
+        # Build a row → device_id map from the table's UserRole stash.
+        name_col = self.COL.get("Device Name", 0)
+        row_to_did = {}
+        for row_idx, _plan in plans:
+            it = self.devices_table.item(row_idx, name_col)
+            did = it.data(Qt.UserRole) if it else None
+            if did:
+                row_to_did[row_idx] = did
+
+        from PyQt5.QtCore import QSignalBlocker
+        _blocker = QSignalBlocker(self.devices_table)  # noqa: F841
+
+        # Locate each device once and apply all its updates.
+        all_devs = getattr(self.main_window, "all_devices", {}) or {}
+        applied_count = 0
+        for row_idx, plan in plans:
+            did = row_to_did.get(row_idx)
+            if not did:
+                continue
+            for iface, dev_list in all_devs.items():
+                for device in dev_list:
+                    if device.get("device_id") != did:
+                        continue
+                    self._apply_plan_to_device(device, plan)
+                    applied_count += 1
+                    # Mark for re-apply so the next "Apply" button-click
+                    # pushes the new values to the server.
+                    try:
+                        device["_needs_apply"] = True
+                    except Exception:
+                        pass
+
+        # Repaint + persist.
+        try:
+            self.update_device_table(self.main_window.all_devices)
+        except Exception as exc:
+            logging.debug(f"[BULK EDIT] table repaint failed: {exc}")
+        if hasattr(self.main_window, "save_session"):
+            try:
+                self.main_window.save_session()
+            except Exception as exc:
+                logging.debug(f"[BULK EDIT] save_session failed: {exc}")
+
+        QMessageBox.information(
+            self, "Bulk-edit",
+            f"Applied changes to {applied_count} device(s). "
+            f"Click ✓ (Apply) on the toolbar to push to the server."
+        )
+
+    def _apply_plan_to_device(self, device, plan):
+        """Write a single plan dict into one device record. Handles
+        the protocol-toggle special-case (_proto_XXX keys) separately
+        from regular field assignments."""
+        protocol_overrides = {}
+        for k, v in plan.items():
+            if k.startswith("_proto_"):
+                protocol_overrides[k[len("_proto_"):]] = bool(v)
+                continue
+            # Direct column → device-dict key mapping. The all_devices
+            # dict uses the table-column names as keys (verified via
+            # update_device_data_in_memory's mapping).
+            device[k] = v
+
+        if not protocol_overrides:
+            return
+
+        # Protocol-list mutation. The device's "protocols" can be a
+        # list ["BGP", "OSPF"] or older dict shape; handle both.
+        protos = device.get("protocols")
+        if isinstance(protos, dict):
+            # Legacy shape — convert to list while preserving any
+            # config blocks under the protocol-name keys.
+            protos = list(protos.keys())
+        if not isinstance(protos, list):
+            protos = []
+        proto_set = {p.upper() for p in protos if isinstance(p, str)}
+
+        for proto, want in protocol_overrides.items():
+            if want:
+                proto_set.add(proto.upper())
+            else:
+                proto_set.discard(proto.upper())
+        device["protocols"] = sorted(proto_set)
+
+    def _show_selected_device_config(self):
+        try:
+            tbl = self.devices_table
+            row = tbl.currentRow()
+            if row < 0:
+                return
+            name_col = self.COL.get("Device Name")
+            if name_col is None:
+                return
+            name_item = tbl.item(row, name_col)
+            if name_item is None:
+                return
+            device_id = name_item.data(Qt.UserRole)
+            if not device_id:
+                QMessageBox.information(
+                    self, "Device config",
+                    "This device hasn't been applied yet — server has no copy to view.",
+                )
+                return
+            device_name = (name_item.text() or device_id)[:40]
+            server_url = self.get_server_url(silent=True)
+            if not server_url:
+                return
+            try:
+                r = requests.get(
+                    f"{server_url}/api/device/database/devices/{device_id}",
+                    timeout=5,
+                )
+            except Exception as exc:
+                QMessageBox.warning(self, "Device config", f"Request failed: {exc}")
+                return
+            if r.status_code != 200:
+                QMessageBox.warning(
+                    self, "Device config",
+                    f"HTTP {r.status_code}: {r.text[:200]}",
+                )
+                return
+            payload = r.json()
+            dlg = _DeviceConfigViewerDialog(self, device_name, device_id, payload)
+            dlg.exec_()
+        except Exception as exc:
+            logging.error(f"[VIEW CONFIG] open failed: {exc}")
+
+
+# =====================================================================
+# State-history dialog
+# =====================================================================
+
+class _DeviceStateHistoryDialog(QDialog):
+    """Per-protocol state-transition timeline for one device.
+
+    One tab per protocol (BGP / OSPF / ISIS / ARP / DHCP), each with a
+    small table: timestamp, state, detail (JSON, truncated). Empty tabs
+    are still shown so the user can see "this protocol has no recorded
+    transitions yet" — that distinction matters when triaging.
+    """
+
+    PROTOCOLS = ("bgp", "ospf", "isis", "arp", "dhcp")
+
+    def __init__(self, parent, server_url: str, device_id: str, device_name: str):
+        super().__init__(parent)
+        self._server_url = server_url.rstrip("/")
+        self._device_id = device_id
+        self.setWindowTitle(f"State history — {device_name}")
+        self.resize(720, 460)
+
+        layout = QVBoxLayout(self)
+        header = QLabel(f"<b>{device_name}</b> &nbsp;<small>{device_id}</small>")
+        header.setTextFormat(Qt.RichText)
+        layout.addWidget(header)
+
+        self._tabs = QTabWidget(self)
+        layout.addWidget(self._tabs, 1)
+
+        # Build one tab per protocol; populate lazily on first show so a
+        # device with empty history doesn't pay 5 sequential HTTP calls
+        # up front. We just kick the first tab now.
+        self._fetched = set()
+        for proto in self.PROTOCOLS:
+            tab = QWidget()
+            v = QVBoxLayout(tab)
+            v.setContentsMargins(4, 4, 4, 4)
+            tbl = QTableWidget(0, 3, tab)
+            tbl.setHorizontalHeaderLabels(["Timestamp (UTC)", "State", "Detail"])
+            tbl.horizontalHeader().setStretchLastSection(True)
+            tbl.verticalHeader().setVisible(False)
+            tbl.setEditTriggers(QTableWidget.NoEditTriggers)
+            tbl.setSelectionBehavior(QTableWidget.SelectRows)
+            tbl.setColumnWidth(0, 180)
+            tbl.setColumnWidth(1, 120)
+            v.addWidget(tbl)
+            tab._history_table = tbl  # stash for population
+            self._tabs.addTab(tab, proto.upper())
+
+        self._tabs.currentChanged.connect(self._on_tab_changed)
+
+        btn_row = QHBoxLayout()
+        refresh_btn = QPushButton("Refresh")
+        refresh_btn.clicked.connect(self._refresh_current_tab)
+        btn_row.addWidget(refresh_btn)
+        btn_row.addStretch(1)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+        # Prime the first tab.
+        self._on_tab_changed(0)
+
+    # ------------------------------------------------------------------
+    def _on_tab_changed(self, idx: int):
+        if idx < 0 or idx >= len(self.PROTOCOLS):
+            return
+        proto = self.PROTOCOLS[idx]
+        if proto in self._fetched:
+            return
+        self._fetched.add(proto)
+        self._populate_tab(idx, proto)
+
+    def _refresh_current_tab(self):
+        idx = self._tabs.currentIndex()
+        if idx < 0:
+            return
+        proto = self.PROTOCOLS[idx]
+        self._fetched.discard(proto)
+        self._on_tab_changed(idx)
+
+    # ------------------------------------------------------------------
+    def _populate_tab(self, idx: int, proto: str):
+        tab = self._tabs.widget(idx)
+        tbl = getattr(tab, "_history_table", None)
+        if tbl is None:
+            return
+        tbl.setRowCount(0)
+        url = (
+            f"{self._server_url}/api/device/database/devices/"
+            f"{self._device_id}/history/{proto}?limit=50"
+        )
+        # Modal dialog → blocking is acceptable, but the timeout must
+        # be short enough that 5 sequential tab-switches don't lock
+        # the user out for half a minute on a slow server.
+        try:
+            r = requests.get(url, timeout=3)
+            if r.status_code != 200:
+                tbl.setRowCount(1)
+                tbl.setItem(0, 0, QTableWidgetItem(f"HTTP {r.status_code}"))
+                return
+            rows = (r.json() or {}).get("history") or []
+        except Exception as exc:
+            tbl.setRowCount(1)
+            tbl.setItem(0, 0, QTableWidgetItem(f"error: {exc}"))
+            return
+
+        if not rows:
+            tbl.setRowCount(1)
+            item = QTableWidgetItem("(no transitions recorded yet)")
+            item.setForeground(QColor("#888"))
+            tbl.setItem(0, 0, item)
+            tbl.setSpan(0, 0, 1, 3)
+            return
+
+        tbl.setRowCount(len(rows))
+        for i, row in enumerate(rows):
+            ts = str(row.get("timestamp", ""))[:19].replace("T", " ")
+            state = str(row.get("state", ""))
+            detail = row.get("detail")
+            try:
+                detail_str = json.dumps(detail, separators=(",", ":")) if detail else ""
+            except Exception:
+                detail_str = str(detail)
+            if len(detail_str) > 120:
+                detail_str = detail_str[:117] + "..."
+            tbl.setItem(i, 0, QTableWidgetItem(ts))
+            tbl.setItem(i, 1, QTableWidgetItem(state))
+            tbl.setItem(i, 2, QTableWidgetItem(detail_str))
+
+
+# =====================================================================
+# View-Device-Config dialog (Ctrl+J)
+# =====================================================================
+
+class _DeviceConfigViewerDialog(QDialog):
+    """Pretty-printed JSON of one device's server-side config.
+
+    Read-only by design — this is a *viewer*, not an editor. To change
+    a value, use the inline cell edits on the table (the canonical
+    write path that also updates `all_devices` and re-applies).
+    """
+
+    def __init__(self, parent, device_name: str, device_id: str, payload: dict):
+        super().__init__(parent)
+        self.setWindowTitle(f"Device config — {device_name}")
+        self.resize(720, 560)
+        layout = QVBoxLayout(self)
+
+        header = QLabel(
+            f"<b>{device_name}</b> &nbsp;<small>{device_id}</small>"
+        )
+        header.setTextFormat(Qt.RichText)
+        layout.addWidget(header)
+
+        try:
+            text = json.dumps(payload, indent=2, sort_keys=True, default=str)
+        except Exception:
+            text = str(payload)
+
+        self._text = QTextEdit(self)
+        self._text.setPlainText(text)
+        self._text.setReadOnly(True)
+        # Monospace so JSON indentation lines up.
+        font = QFont("Menlo")
+        font.setStyleHint(QFont.Monospace)
+        font.setPointSize(11)
+        self._text.setFont(font)
+        layout.addWidget(self._text, 1)
+
+        btn_row = QHBoxLayout()
+        copy_btn = QPushButton("Copy to clipboard")
+        copy_btn.clicked.connect(self._copy_to_clipboard)
+        btn_row.addWidget(copy_btn)
+        btn_row.addStretch(1)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        btn_row.addWidget(close_btn)
+        layout.addLayout(btn_row)
+
+    def _copy_to_clipboard(self):
+        try:
+            QApplication.clipboard().setText(self._text.toPlainText())
+        except Exception as exc:
+            logging.debug(f"[VIEW CONFIG] clipboard copy failed: {exc}")
+
+
+# =====================================================================
+# Bulk-edit dialog (operates on multi-row selection in Devices tab)
+# =====================================================================
+#
+# Operator pattern this solves: "I added 8 routers in one batch via
+# the Add Device dialog. Now I need to bump each one's VLAN to a
+# unique tag, each one's loopback to a unique address, and toggle BGP
+# on for half of them." Previously that meant editing each row one by
+# one — 8 dialogs, 8 saves. Now: select all 8, click bulk-edit, set
+# VLAN=100 step=1 + Loopback IPv4=192.255.0.1 step=1 → apply.
+
+class _BulkEditDialog(QDialog):
+    """Multi-device bulk-edit + auto-increment.
+
+    For each editable field, the operator picks a starting value and
+    a step. The first selected row gets `start`; the second gets
+    `increment(start, step)`; etc. IP/MAC use the existing increment
+    helpers so wrap-around, byte-position, and validation are
+    consistent with the Add Device dialog's batch mode.
+    """
+
+    def __init__(self, parent_tab, selected_rows):
+        super().__init__(parent_tab)
+        self._parent_tab = parent_tab
+        self._rows = list(selected_rows)
+        self.setWindowTitle(f"Bulk-edit {len(self._rows)} device(s)")
+        self.setMinimumSize(560, 480)
+
+        layout = QVBoxLayout(self)
+        header = QLabel(
+            f"<b>Bulk-edit {len(self._rows)} selected device(s)</b><br/>"
+            f"<span style='color:#6b7280;font-size:11px;'>"
+            f"Enable a field, set start + step. First selected row gets the "
+            f"start value; each subsequent row increments by step.</span>"
+        )
+        header.setTextFormat(Qt.RichText)
+        header.setWordWrap(True)
+        layout.addWidget(header)
+
+        # ── Field grid ────────────────────────────────────────────────
+        form = QFormLayout()
+        form.setLabelAlignment(Qt.AlignRight)
+
+        self._fields = {}  # key → (enable_checkbox, start_lineedit, step_spin)
+
+        def _row(key, label, default_value, default_step, step_min=0, step_max=10000):
+            chk = QCheckBox()
+            start = QLineEdit(default_value)
+            step = QSpinBox()
+            step.setRange(step_min, step_max)
+            step.setValue(default_step)
+            step.setEnabled(False)
+            start.setEnabled(False)
+            chk.toggled.connect(start.setEnabled)
+            chk.toggled.connect(step.setEnabled)
+            inner = QHBoxLayout()
+            inner.setContentsMargins(0, 0, 0, 0)
+            inner.addWidget(chk)
+            inner.addWidget(start, 2)
+            inner.addWidget(QLabel("step"))
+            inner.addWidget(step)
+            holder = QWidget()
+            holder.setLayout(inner)
+            form.addRow(label, holder)
+            self._fields[key] = (chk, start, step)
+
+        _row("vlan",     "VLAN",          "100",          1)
+        _row("ipv4",     "IPv4",          "192.168.0.2",  1)
+        _row("ipv4_gw",  "IPv4 Gateway",  "192.168.0.1",  0)
+        _row("loopback", "Loopback IPv4", "192.255.0.1",  1)
+        _row("mac",      "MAC",           "00:11:22:33:44:55", 1)
+
+        layout.addLayout(form)
+
+        # ── Protocol-toggle override (independent of auto-inc) ────────
+        proto_box = QGroupBox("Protocol toggles (applied to every selected device)")
+        proto_layout = QHBoxLayout(proto_box)
+        self._proto_checks = {}
+        for p in ("BGP", "OSPF", "ISIS", "DHCP", "VXLAN"):
+            cb = QCheckBox(p)
+            cb.setTristate(True)
+            cb.setCheckState(Qt.PartiallyChecked)  # default: leave as-is
+            cb.setToolTip(
+                "Unchecked: disable on every selected device.\n"
+                "Checked: enable on every selected device.\n"
+                "Partial: leave the device's current setting."
+            )
+            proto_layout.addWidget(cb)
+            self._proto_checks[p] = cb
+        layout.addWidget(proto_box)
+
+        # ── Preview (what's about to be written) ──────────────────────
+        self._preview = QTextEdit()
+        self._preview.setReadOnly(True)
+        self._preview.setMaximumHeight(120)
+        self._preview.setStyleSheet(
+            "font-family: monospace; font-size: 11px; background: #f9fafb;"
+        )
+        layout.addWidget(QLabel("Preview:"))
+        layout.addWidget(self._preview)
+
+        for chk, start, step in self._fields.values():
+            chk.toggled.connect(self._refresh_preview)
+            start.textChanged.connect(self._refresh_preview)
+            step.valueChanged.connect(self._refresh_preview)
+        for cb in self._proto_checks.values():
+            cb.stateChanged.connect(self._refresh_preview)
+        self._refresh_preview()
+
+        # ── Buttons ───────────────────────────────────────────────────
+        btn_row = QHBoxLayout()
+        btn_row.addStretch(1)
+        cancel = QPushButton("Cancel")
+        cancel.clicked.connect(self.reject)
+        btn_row.addWidget(cancel)
+        ok = QPushButton(f"Apply to {len(self._rows)} device(s)")
+        ok.clicked.connect(self.accept)
+        ok.setStyleSheet("QPushButton { font-weight: 600; }")
+        btn_row.addWidget(ok)
+        layout.addLayout(btn_row)
+
+    # ------------------------------------------------------------------
+    def _refresh_preview(self):
+        """Render the first 3 + last 1 rows of what'll be applied so
+        the operator can sanity-check the auto-increment before
+        committing. Empty when no field is enabled."""
+        plans = self.compute_plans()
+        if not plans:
+            self._preview.setPlainText("(no fields enabled)")
+            return
+        lines = []
+        n = len(plans)
+        idxs = list(range(min(n, 3)))
+        if n > 4:
+            idxs.append(n - 1)
+        for i in idxs:
+            if i == n - 1 and n > 4 and i > idxs[-2]:
+                lines.append(f"  …")
+            row_idx, plan = plans[i]
+            kv = ", ".join(f"{k}={v}" for k, v in plan.items())
+            lines.append(f"  row {row_idx}: {kv}")
+        self._preview.setPlainText("\n".join(lines))
+
+    # ------------------------------------------------------------------
+    def compute_plans(self):
+        """For each selected row, build the dict of {field: new_value}
+        to apply. Returns list of (row_index, plan_dict) tuples in
+        selection order. Empty list when no fields are enabled."""
+        any_enabled = any(chk.isChecked() for (chk, _, _) in self._fields.values())
+        proto_active = any(
+            cb.checkState() != Qt.PartiallyChecked
+            for cb in self._proto_checks.values()
+        )
+        if not any_enabled and not proto_active:
+            return []
+
+        plans = []
+        for i, row_idx in enumerate(self._rows):
+            plan = {}
+
+            # VLAN — integer increment, clamped to 1..4094
+            chk, start, step = self._fields["vlan"]
+            if chk.isChecked():
+                try:
+                    base = int(start.text().strip() or "0")
+                    plan["VLAN"] = str(max(0, min(4094, base + i * step.value())))
+                except ValueError:
+                    pass
+
+            # IPv4 / IPv4 gateway / Loopback IPv4 — last-octet increment
+            for key, col in (
+                ("ipv4",     "IPv4"),
+                ("ipv4_gw",  "IPv4 Gateway"),
+                ("loopback", "Loopback IPv4"),
+            ):
+                chk, start, step = self._fields[key]
+                if chk.isChecked():
+                    base = start.text().strip()
+                    try:
+                        new_v = self._parent_tab._increment_ipv4(
+                            base, i * step.value(), octet_index=3,
+                        )
+                        plan[col] = new_v
+                    except Exception:
+                        pass
+
+            # MAC — last-byte increment
+            chk, start, step = self._fields["mac"]
+            if chk.isChecked():
+                base = start.text().strip()
+                try:
+                    new_v = self._parent_tab._increment_mac(
+                        base, i * step.value(), byte_index=5,
+                    )
+                    plan["MAC Address"] = new_v
+                except Exception:
+                    pass
+
+            # Protocol toggles — applied uniformly, no per-row variation
+            for p, cb in self._proto_checks.items():
+                state = cb.checkState()
+                if state == Qt.PartiallyChecked:
+                    continue   # leave as-is
+                plan[f"_proto_{p}"] = (state == Qt.Checked)
+
+            if plan:
+                plans.append((row_idx, plan))
+        return plans

@@ -133,6 +133,23 @@ class DHCPClientMonitor:
                         snapshot.get("dhcp_lease_ip"),
                     )
 
+                    # Per-protocol state-history timeline (de-dup'd).
+                    try:
+                        self.device_db.add_state_transition(
+                            device_id,
+                            "dhcp",
+                            snapshot.get("dhcp_state") or "Unknown",
+                            detail={
+                                "lease_ip": snapshot.get("dhcp_lease_ip"),
+                                "running": snapshot.get("dhcp_running"),
+                            },
+                        )
+                    except Exception as _e:
+                        logger.debug(
+                            "[DHCP MONITOR] state-history insert skipped for %s: %s",
+                            device_id, _e,
+                        )
+
                     needs_restart = (
                         snapshot.get("dhcp_state") != "Leased"
                         or not snapshot.get("dhcp_running")

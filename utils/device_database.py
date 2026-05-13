@@ -351,7 +351,29 @@ class DeviceDatabase:
                     FOREIGN KEY (device_id) REFERENCES devices(device_id) ON DELETE CASCADE
                 )
             """)
-            
+
+            # Per-protocol state-change history. One row per *transition*
+            # recorded by the periodic monitor (not on every poll — only
+            # when the observed state differs from the previous row for
+            # that (device_id, protocol) pair). Backs the "was BGP up at
+            # 14:30?" / timeline UI surfaces. Capped retention is the
+            # caller's job; the table itself grows unbounded.
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS device_state_history (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    device_id TEXT NOT NULL,
+                    protocol TEXT NOT NULL,        -- 'bgp' | 'ospf' | 'isis' | 'arp' | 'dhcp'
+                    state    TEXT NOT NULL,        -- e.g. 'Established', 'Down', 'Resolved'
+                    detail   TEXT,                 -- JSON: neighbor counts, AF-specific flags
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    FOREIGN KEY (device_id) REFERENCES devices(device_id) ON DELETE CASCADE
+                )
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_state_history_lookup
+                  ON device_state_history(device_id, protocol, timestamp DESC)
+            """)
+
             # Create route pools table
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS route_pools (
@@ -1487,7 +1509,135 @@ class DeviceDatabase:
         except Exception as e:
             logger.error(f"[DEVICE DB] Failed to get events for device {device_id}: {e}")
             return []
-    
+
+    # ----- per-protocol state history --------------------------------------
+    #
+    # Distinct from `device_events` (free-form ad-hoc log lines) — this is a
+    # narrow protocol-state timeline: rows are only written when a monitor
+    # observes a STATE CHANGE for that (device_id, protocol). Lets the GUI
+    # show "BGP went Established → Active at 12:03" without grovelling
+    # through the full event log.
+
+    def add_state_transition(
+        self,
+        device_id: str,
+        protocol: str,
+        state: str,
+        detail: Optional[Dict[str, Any]] = None,
+    ) -> bool:
+        """Record a (device_id, protocol) state transition.
+
+        De-dup against the most-recent row: if the previous state for this
+        device+protocol pair already equals `state`, this call is a no-op.
+        Monitors can therefore call us every poll without bloating the
+        table.
+
+        Returns True iff a row was inserted.
+        """
+        if not device_id or not protocol or state is None:
+            return False
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cur = conn.execute(
+                    """
+                    SELECT state FROM device_state_history
+                    WHERE device_id = ? AND protocol = ?
+                    ORDER BY id DESC LIMIT 1
+                    """,
+                    (device_id, protocol),
+                )
+                row = cur.fetchone()
+                if row and row[0] == state:
+                    return False  # unchanged — skip
+                conn.execute(
+                    """
+                    INSERT INTO device_state_history
+                        (device_id, protocol, state, detail, timestamp)
+                    VALUES (?, ?, ?, ?, ?)
+                    """,
+                    (
+                        device_id,
+                        protocol,
+                        state,
+                        json.dumps(detail) if detail is not None else None,
+                        datetime.now(timezone.utc).isoformat(),
+                    ),
+                )
+                conn.commit()
+                logger.debug(
+                    f"[DEVICE DB] state {protocol}={state} for {device_id}"
+                )
+            # Publish the transition to any SSE subscribers so the GUI
+            # can live-refresh without polling. Import inside the try
+            # so the DB module stays usable in test environments where
+            # the event_bus module hasn't been imported yet. Best-effort
+            # — a publish failure must not break the canonical INSERT.
+            try:
+                from utils.event_bus import publish as _publish_event
+                _publish_event("state_transition", {
+                    "device_id": device_id,
+                    "protocol": protocol,
+                    "state": state,
+                    "detail": detail,
+                })
+            except Exception:
+                pass
+            return True
+        except Exception as e:
+            logger.error(
+                f"[DEVICE DB] Failed to record state transition "
+                f"{protocol}={state} for {device_id}: {e}"
+            )
+            return False
+
+    def get_state_history(
+        self,
+        device_id: str,
+        protocol: Optional[str] = None,
+        limit: int = 50,
+    ) -> List[Dict[str, Any]]:
+        """Return state-transition rows for a device, newest first.
+
+        If `protocol` is provided, results are filtered to that protocol;
+        otherwise rows for every protocol are interleaved by timestamp.
+        """
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                conn.row_factory = sqlite3.Row
+                if protocol:
+                    cur = conn.execute(
+                        """
+                        SELECT * FROM device_state_history
+                        WHERE device_id = ? AND protocol = ?
+                        ORDER BY id DESC LIMIT ?
+                        """,
+                        (device_id, protocol, int(limit)),
+                    )
+                else:
+                    cur = conn.execute(
+                        """
+                        SELECT * FROM device_state_history
+                        WHERE device_id = ?
+                        ORDER BY id DESC LIMIT ?
+                        """,
+                        (device_id, int(limit)),
+                    )
+                rows = []
+                for r in cur.fetchall():
+                    row = dict(r)
+                    if row.get("detail"):
+                        try:
+                            row["detail"] = json.loads(row["detail"])
+                        except Exception:
+                            pass
+                    rows.append(row)
+                return rows
+        except Exception as e:
+            logger.error(
+                f"[DEVICE DB] Failed to read state history for {device_id}: {e}"
+            )
+            return []
+
     def get_device_statistics(self, device_id: str, hours: int = 24) -> List[Dict[str, Any]]:
         """
         Get device statistics for the last N hours.
