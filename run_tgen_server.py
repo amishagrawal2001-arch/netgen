@@ -110,16 +110,162 @@ def _bgp_clear_prefix(device_id=None):
 _AUTH_TOKEN = os.environ.get("NETGEN_AUTH_TOKEN", "").strip()
 _AUTH_EXEMPT_PREFIXES = ("/admin", "/api/health")
 
+# ───────────────────────────────────────────────────────────────────
+# Per-role auth (opt-in extension of the bearer-token middleware)
+# ───────────────────────────────────────────────────────────────────
+#
+# Two ways to configure auth, both backward-compatible:
+#
+#   1) NETGEN_AUTH_TOKEN=<secret>
+#      Single token. Treated as the "admin" role — full access to
+#      everything. This is the legacy 0.2.0 surface, unchanged.
+#
+#   2) NETGEN_AUTH_TOKENS_JSON='{"abc...":"admin","def...":"operator","ghi...":"viewer"}'
+#      Multi-token map. Each presented token resolves to a role.
+#      Endpoints annotated with @require_role("operator") check the
+#      caller's role and 403 if insufficient.
+#
+# Role hierarchy (each role implicitly includes the lower ones):
+#   admin    > operator > viewer
+#
+# When NEITHER env var is set, auth is fully off (backward-compat
+# default — fine for the lab, not for production).
+#
+# Routes opt in to enforcement by adding @require_role("..."):
+#
+#    @app.route("/api/devices/import", methods=["POST"])
+#    @require_role("operator")
+#    def devices_import(): ...
+#
+# Annotated endpoints are the ONLY ones that get role-checked. Older
+# unannotated routes keep their pre-existing behaviour (token-required
+# when token is set, but no role discrimination). This is a deliberate
+# choice so the migration can be incremental — each PR can role-gate
+# a handful of routes without touching the rest.
+
+_ROLE_RANK = {"viewer": 0, "operator": 1, "admin": 2}
+
+
+def _load_token_map():
+    """Build the {token: role} mapping from env. The single-token case
+    collapses to {token: 'admin'} so legacy and multi-token paths share
+    a single lookup at request time."""
+    multi = os.environ.get("NETGEN_AUTH_TOKENS_JSON", "").strip()
+    if multi:
+        try:
+            parsed = json.loads(multi)
+            # Validate roles + normalise
+            cleaned = {}
+            for tok, role in parsed.items():
+                tok = str(tok).strip()
+                role = str(role).strip().lower()
+                if tok and role in _ROLE_RANK:
+                    cleaned[tok] = role
+                else:
+                    logging.warning(
+                        f"[AUTH] Dropping invalid token mapping (role={role!r} "
+                        f"not in {sorted(_ROLE_RANK)})"
+                    )
+            return cleaned
+        except Exception as exc:
+            logging.warning(f"[AUTH] NETGEN_AUTH_TOKENS_JSON parse failed: {exc}")
+    if _AUTH_TOKEN:
+        return {_AUTH_TOKEN: "admin"}
+    return {}
+
+
+_AUTH_TOKEN_MAP = _load_token_map()
+
+
+# ───────────────────────────────────────────────────────────────────
+# SSE event publication helper
+# ───────────────────────────────────────────────────────────────────
+#
+# Tiny shim around utils.event_bus.publish that fails closed if the
+# bus is unimportable. Producers should always go through this so we
+# can swap publication backends (Kafka, NATS, …) later without a
+# fleet-wide grep. Cheap-when-quiet — the bus itself short-circuits
+# when nobody is subscribed.
+
+def _emit_event(event_type: str, **fields):
+    """Publish an operator-visible event. Best-effort — a producer
+    must not crash because the bus is misconfigured."""
+    try:
+        from utils.event_bus import publish
+        publish(event_type, dict(fields))
+    except Exception as exc:
+        logging.debug(f"[EVENT] publish({event_type}) failed: {exc}")
+
+
+def _role_for_request():
+    """Resolve the caller's role for the current request. Returns:
+       - the role string when a known token is presented
+       - 'admin' as the implicit fallback when no auth is configured
+         at all (legacy zero-friction mode — back-compat with 0.2.0)
+       - None when auth is on but the token is missing/wrong
+    """
+    if not _AUTH_TOKEN_MAP:
+        return "admin"   # auth disabled → everyone is admin
+    auth = request.headers.get("Authorization", "")
+    if not auth.startswith("Bearer "):
+        return None
+    presented = auth[len("Bearer "):].strip()
+    # Constant-time compare against every known token. With <10 tokens
+    # the cost is negligible and avoids dict-lookup timing leaks.
+    import hmac as _hmac
+    for tok, role in _AUTH_TOKEN_MAP.items():
+        if _hmac.compare_digest(presented, tok):
+            return role
+    return None
+
+
+def require_role(required: str):
+    """Decorator: 403 if the caller's role is below the required one.
+
+    Composes with normal Flask route decorators::
+
+        @app.route("/api/devices/import", methods=["POST"])
+        @require_role("operator")
+        def import_devices(): ...
+
+    Implicit fallback to 'admin' when auth is off keeps legacy
+    no-token deployments fully functional.
+    """
+    if required not in _ROLE_RANK:
+        raise ValueError(f"unknown role {required!r}")
+    required_rank = _ROLE_RANK[required]
+
+    def _decorator(fn):
+        from functools import wraps
+
+        @wraps(fn)
+        def _wrapped(*args, **kwargs):
+            role = _role_for_request()
+            if role is None or _ROLE_RANK[role] < required_rank:
+                return jsonify({
+                    "ok": False,
+                    "error": f"insufficient role: this endpoint requires '{required}'",
+                }), 403
+            return fn(*args, **kwargs)
+
+        return _wrapped
+
+    return _decorator
+
 
 @app.before_request
 def _require_bearer_token():
-    """Reject API requests missing the bearer token, when one is set.
+    """Reject API requests with no/wrong bearer token, when auth is on.
 
-    No-op when NETGEN_AUTH_TOKEN is unset (default), so this is fully
-    backward-compatible until an operator opts in by setting the env
-    var. CORS preflight (OPTIONS) is always allowed through.
+    Per-endpoint role enforcement is layered on top via the
+    @require_role decorator — this middleware just gates 'is this
+    token in the known set at all'.
+
+    No-op when both NETGEN_AUTH_TOKEN and NETGEN_AUTH_TOKENS_JSON are
+    unset (default), so this is fully backward-compatible until an
+    operator opts in. CORS preflight (OPTIONS) is always allowed.
     """
-    if not _AUTH_TOKEN:
+    if not _AUTH_TOKEN_MAP:
         return None
     if request.method == "OPTIONS":
         return None
@@ -128,14 +274,9 @@ def _require_bearer_token():
         return None
     if any(path.startswith(p) for p in _AUTH_EXEMPT_PREFIXES):
         return None
-    auth = request.headers.get("Authorization", "")
-    if not auth.startswith("Bearer "):
-        return jsonify({"ok": False, "error": "Missing bearer token"}), 401
-    presented = auth[len("Bearer "):].strip()
-    # constant-time compare to avoid leaking length / prefix info
-    import hmac as _hmac
-    if not _hmac.compare_digest(presented, _AUTH_TOKEN):
-        return jsonify({"ok": False, "error": "Invalid bearer token"}), 401
+    role = _role_for_request()
+    if role is None:
+        return jsonify({"ok": False, "error": "Missing or invalid bearer token"}), 401
     return None
 
 
@@ -581,6 +722,7 @@ def rx_monitor():
 
 
 @app.route("/api/traffic/restart", methods=["POST"])
+@require_role("operator")
 def restart_stream():
     data = request.json
     logging.info(f"[RESTART REQUEST] Payload received: {data}")
@@ -664,6 +806,11 @@ def restart_stream():
         result = launch_single_stream(stream_data, interface)
         restarted_streams.append(result)
 
+    _emit_event(
+        "stream_restarted",
+        interface=interface,
+        count=len(restarted_streams),
+    )
     return jsonify({
         "status": "restarted",
         "interface": interface,
@@ -748,6 +895,7 @@ def launch_single_stream(stream_data, interface):
         }
 
 @app.route("/api/traffic/start", methods=["POST"])
+@require_role("operator")
 def start_traffic():
     data = request.get_json()
     if not data:
@@ -927,12 +1075,18 @@ def start_traffic():
                 logging.error(f"❌ Failed to launch stream '{stream_name}' on {interface_name}: {e}")
 
     logging.info(f"✅ {len(started_streams)} stream(s) started")
+    _emit_event(
+        "stream_started",
+        count=len(started_streams),
+        streams=started_streams,
+    )
     return jsonify({
         "message": "Traffic streams started successfully.",
         "started_streams": started_streams
     }), 200
 
 @app.route("/api/traffic/stop", methods=["POST"])
+@require_role("operator")
 def stop_traffic():
     data = request.get_json()
     if not data or "streams" not in data:
@@ -1127,11 +1281,12 @@ def stop_traffic():
             else:
                 logging.warning(f"❌ Stream ID '{stream_id}' not found on interface '{interface_normalized}' and no stream_name provided for fallback")
 
+    _emit_event("stream_stopped", count=len(stopped), stream_ids=stopped)
     return jsonify({"stopped": stopped}), 200
 
 
 
-def _configure_routing_protocols(device_id, device_name, bgp_config=None, ospf_config=None, isis_config=None, 
+def _configure_routing_protocols(device_id, device_name, bgp_config=None, ospf_config=None, isis_config=None,
                                    ipv4=None, ipv6=None, ipv4_mask=None, ipv6_mask=None, dhcp_mode=None):
     """
     Unified helper function to configure all routing protocols.
@@ -1214,6 +1369,7 @@ def _configure_routing_protocols(device_id, device_name, bgp_config=None, ospf_c
     return results
 
 @app.route("/api/device/start", methods=["POST"])
+@require_role("operator")
 def start_device():
     data = request.get_json()
     logging.info(f"Start Device Data: {data}")
@@ -1820,7 +1976,8 @@ def start_device():
             _trigger_monitor_async("BGP", bgp_monitor.force_check)
             _trigger_monitor_async("OSPF", ospf_monitor.force_check)
             _trigger_monitor_async("ISIS", isis_monitor.force_check)
-        
+
+        _emit_event("device_started", device_id=data.get("device_id"))
         return jsonify({"status": "started", "details": result}), 200
     except Exception as e:
         logging.error(f"[DEVICE ERROR] Failed to start device: {e}")
@@ -1828,6 +1985,7 @@ def start_device():
 
 
 @app.route("/api/device/ospf/start", methods=["POST"])
+@require_role("operator")
 def start_ospf():
     """Start OSPF for a device."""
     data = request.get_json()
@@ -1922,6 +2080,7 @@ def start_ospf():
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/device/ospf/stop", methods=["POST"])
+@require_role("operator")
 def stop_ospf():
     """Stop OSPF for a device."""
     data = request.get_json()
@@ -1969,6 +2128,7 @@ def stop_ospf():
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/ospf/status/<device_id>", methods=["GET"])
+@require_role("viewer")
 def get_device_ospf_status(device_id):
     """Get OSPF status for a device."""
     try:
@@ -2044,6 +2204,7 @@ def get_device_ospf_status_from_database(device_id):
 
 # ISIS API Endpoints
 @app.route("/api/device/isis/start", methods=["POST"], endpoint="device_isis_start")
+@require_role("operator")
 def device_isis_start():
     """Start ISIS on a device."""
     data = request.get_json()
@@ -2275,6 +2436,7 @@ def device_isis_start():
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/device/isis/stop", methods=["POST"])
+@require_role("operator")
 def stop_isis():
     """Stop ISIS on a device."""
     data = request.get_json()
@@ -2350,6 +2512,7 @@ def stop_isis():
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/isis/status/<device_id>", methods=["GET"])
+@require_role("viewer")
 def get_device_isis_status(device_id):
     """Get ISIS status for a device."""
     try:
@@ -2451,6 +2614,7 @@ def get_device_isis_status_from_database(device_id):
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/isis/cleanup", methods=["POST"])
+@require_role("admin")
 def cleanup_isis():
     """Clean up ISIS configuration for a device."""
     data = request.get_json()
@@ -2495,6 +2659,7 @@ def cleanup_isis():
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/device/isis/configure", methods=["POST"])
+@require_role("operator")
 def configure_isis():
     """Configure ISIS for a specific device using FRR."""
     data = request.get_json()
@@ -2913,6 +3078,7 @@ def configure_isis():
         logging.error(f"[ISIS CONFIGURE ERROR] Traceback: {traceback.format_exc()}")
         return jsonify({"error": str(e)}), 500
 @app.route("/api/device/apply", methods=["POST"])
+@require_role("operator")
 def apply_device():
     """Apply device configuration - configure interface with IP addresses and routes"""
     data = request.get_json()
@@ -4274,16 +4440,29 @@ def apply_device():
                 "error": vxlan_error,
             }
         
+        _emit_event(
+            "device_applied",
+            device_id=device_id,
+            device_name=device_name,
+            interface=interface,
+        )
         return jsonify({
             "status": "applied",
             "details": result
         }), 200
-        
+
     except Exception as e:
         logging.error(f"[DEVICE APPLY ERROR] Failed to apply device configuration: {e}")
+        _emit_event(
+            "device_apply_failed",
+            device_id=data.get("device_id"),
+            device_name=data.get("device_name"),
+            error=str(e),
+        )
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/device/ospf/configure", methods=["POST"])
+@require_role("operator")
 def configure_ospf():
     """Configure OSPF for a specific device using FRR."""
     data = request.get_json()
@@ -4797,6 +4976,7 @@ def configure_ospf():
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/device/stop", methods=["POST"])
+@require_role("operator")
 def stop_device():
     data = request.get_json()
     if not data:
@@ -4989,7 +5169,8 @@ def stop_device():
         except Exception as e:
             logging.warning(f"[DEVICE DB] Failed to update device {device_id} status: {e}")
             # Don't fail device stop if database operation fails
-        
+
+        _emit_event("device_stopped", device_id=device_id)
         return jsonify({
             "status": "stopped",
             "details": result
@@ -5000,6 +5181,7 @@ def stop_device():
 
 
 @app.route("/api/device/remove", methods=["POST"])
+@require_role("admin")
 def remove_device():
     data = request.get_json()
     device_id = data.get("device_id")
@@ -5213,6 +5395,12 @@ def remove_device():
             logging.error(f"[DEVICE DB] Traceback: {traceback.format_exc()}")
 
         # Return status with details
+        _emit_event(
+            "device_removed",
+            device_id=device_id,
+            device_name=device_name,
+            db_removed=bool(db_removed),
+        )
         return jsonify({
             "status": "removed" if db_removed else "partial",
             "details": result,
@@ -7499,6 +7687,7 @@ def cleanup_isis_route_advertisement(device_id, device_name, area_id, af_type=No
 
 
 @app.route("/api/device/bgp/configure", methods=["POST"])
+@require_role("operator")
 def configure_bgp():
     """Configure BGP for a specific device using FRR."""
     data = request.get_json()
@@ -8489,6 +8678,7 @@ def remove_vxlan_tunnel():
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/device/bgp/stop", methods=["POST"])
+@require_role("operator")
 def stop_bgp():
     """Stop BGP protocol for a specific device by shutting down BGP neighbors."""
     data = request.get_json()
@@ -8682,6 +8872,7 @@ def stop_bgp():
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/device/bgp/start", methods=["POST"])
+@require_role("operator")
 def start_bgp():
     """Start BGP protocol for a specific device by removing shutdown commands."""
     data = request.get_json()
@@ -9125,6 +9316,7 @@ def populate_mapping():
     }), 200
 
 @app.route("/api/device/cleanup", methods=["POST"])
+@require_role("admin")
 def cleanup_device_interface():
     """Clean up IP addresses from an interface (remove all IPs) or remove entire VLAN interface."""
     data = request.get_json()
@@ -9937,6 +10129,7 @@ def frr_status():
 # ============================================================================
 
 @app.route("/api/bgp/routes/advertise", methods=["POST"])
+@require_role("operator")
 def advertise_bgp_routes():
     """Advertise BGP routes for a device."""
     data = request.get_json()
@@ -9964,6 +10157,7 @@ def advertise_bgp_routes():
 
 
 @app.route("/api/bgp/routes/withdraw", methods=["POST"])
+@require_role("operator")
 def withdraw_bgp_routes():
     """Withdraw BGP routes for a device."""
     data = request.get_json()
@@ -10051,6 +10245,7 @@ def get_bgp_statistics():
 
 
 @app.route("/api/bgp/status/<device_id>", methods=["GET"])
+@require_role("viewer")
 def get_device_bgp_status(device_id):
     """Get BGP status for a specific device"""
     try:
@@ -10247,6 +10442,7 @@ def get_device_bgp_status_batch():
 
 
 @app.route("/api/bgp/cleanup", methods=["POST"])
+@require_role("admin")
 def cleanup_bgp_routes():
     """Clean up BGP routes for a specific device or all devices."""
     data = request.get_json() or {}
@@ -10324,6 +10520,7 @@ def cleanup_bgp_routes():
 
 
 @app.route("/api/ospf/cleanup", methods=["POST"])
+@require_role("admin")
 def cleanup_ospf_routes():
     """Clean up OSPF routes for a specific device or all devices."""
     data = request.get_json() or {}
@@ -10482,6 +10679,7 @@ def get_bgp_neighbors():
         return jsonify({"error": str(e), "neighbors": []}), 500
 
 @app.route("/api/device/frr/start", methods=["POST"])
+@require_role("operator")
 def start_device_frr():
     """Start FRR Docker container for a specific device."""
     data = request.get_json()
@@ -10514,6 +10712,7 @@ def start_device_frr():
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/device/frr/stop", methods=["POST"])
+@require_role("operator")
 def stop_device_frr():
     """Stop FRR Docker container for a specific device."""
     data = request.get_json()
@@ -10913,6 +11112,7 @@ def get_all_devices_from_db():
 
 
 @app.route("/api/devices/export", methods=["GET"])
+@require_role("viewer")
 def export_devices():
     """Export all device configurations as a portable JSON document.
 
@@ -10963,6 +11163,7 @@ def export_devices():
 
 
 @app.route("/api/devices/import", methods=["POST"])
+@require_role("operator")
 def import_devices():
     """Import device configurations from a previously-exported JSON.
 
@@ -11051,28 +11252,47 @@ def get_device_from_db(device_id):
         return jsonify({"error": str(e)}), 500
 
 
-@app.route("/api/device/database/devices/<device_id>/events", methods=["GET"])
-def get_device_events(device_id):
-    """Get device events from database."""
-    try:
-        limit = request.args.get('limit', 100, type=int)
-        events = device_db.get_device_events(device_id, limit)
-        return jsonify({"events": events, "count": len(events)}), 200
-    except Exception as e:
-        logging.error(f"[DEVICE DB] Failed to get events for device {device_id}: {e}")
-        return jsonify({"error": str(e)}), 500
+# Device-DB query endpoints (events / history / statistics) now live
+# in server/device_db_routes.py as a Flask Blueprint — second pattern
+# extraction (issue #9). Auth + DeviceDatabase instance injected via
+# configure() so the Blueprint stays decoupled from this module's globals.
+try:
+    from server.device_db_routes import (
+        device_db_bp,
+        configure as _configure_device_db_bp,
+    )
+    _configure_device_db_bp(device_db=device_db, require_role=require_role)
+    app.register_blueprint(device_db_bp)
+except Exception as _bp_err:
+    logging.error(f"[DEVICE DB] Blueprint registration failed: {_bp_err}")
 
 
-@app.route("/api/device/database/devices/<device_id>/statistics", methods=["GET"])
-def get_device_statistics(device_id):
-    """Get device statistics from database."""
-    try:
-        hours = request.args.get('hours', 24, type=int)
-        stats = device_db.get_device_statistics(device_id, hours)
-        return jsonify({"statistics": stats, "count": len(stats)}), 200
-    except Exception as e:
-        logging.error(f"[DEVICE DB] Failed to get statistics for device {device_id}: {e}")
-        return jsonify({"error": str(e)}), 500
+# Server-Sent Events live feed (Blueprint #3). Producers anywhere in
+# the codebase call `utils.event_bus.publish(...)`; subscribers stream
+# events via GET /api/events/stream. See server/events_routes.py.
+try:
+    from server.events_routes import (
+        events_bp,
+        configure as _configure_events_bp,
+    )
+    _configure_events_bp(require_role=require_role)
+    app.register_blueprint(events_bp)
+except Exception as _bp_err:
+    logging.error(f"[EVENTS] Blueprint registration failed: {_bp_err}")
+
+
+# L2 frame generators + multicast protocols (Blueprint #4). Workers
+# in utils/l2_protocols.py use scapy to send LACP / LLDP / VRRP /
+# IGMP / PIM-Hello on a configurable interval.
+try:
+    from server.l2_routes import (
+        l2_bp,
+        configure as _configure_l2_bp,
+    )
+    _configure_l2_bp(require_role=require_role)
+    app.register_blueprint(l2_bp)
+except Exception as _bp_err:
+    logging.error(f"[L2] Blueprint registration failed: {_bp_err}")
 
 
 @app.route("/api/device/database/backup", methods=["POST"])
@@ -11260,6 +11480,27 @@ def get_monitors_health():
     }), 200
 
 
+# =====================================================================
+# Stateful TCP — real-socket traffic generator surface
+# =====================================================================
+#
+# Extracted to `server/stateful_tcp_routes.py` as a Flask Blueprint —
+# first pattern-setter for the broader run_tgen_server.py modularization
+# (issue #9). The role-enforcement decorator is injected via
+# `configure()` so the Blueprint stays decoupled from this module's
+# auth-state global. Worker module: utils/stateful_tcp.py.
+
+try:
+    from server.stateful_tcp_routes import (
+        stateful_tcp_bp,
+        configure as _configure_stateful_tcp_bp,
+    )
+    _configure_stateful_tcp_bp(require_role=require_role)
+    app.register_blueprint(stateful_tcp_bp)
+except Exception as _bp_err:
+    logging.error(f"[STATEFUL TCP] Blueprint registration failed: {_bp_err}")
+
+
 @app.route("/api/bgp/monitor/status", methods=["GET"])
 def get_bgp_monitor_status():
     """Get BGP monitoring status."""
@@ -11272,6 +11513,7 @@ def get_bgp_monitor_status():
 
 
 @app.route("/api/bgp/monitor/force-check", methods=["POST"])
+@require_role("operator")
 def force_bgp_check():
     """Force an immediate BGP status check for all devices."""
     try:
@@ -11333,6 +11575,7 @@ def get_ospf_monitor_status():
 
 
 @app.route("/api/ospf/monitor/force-check", methods=["POST"])
+@require_role("operator")
 def force_ospf_check():
     """Force an immediate OSPF status check for all devices."""
     try:
@@ -11344,6 +11587,7 @@ def force_ospf_check():
 
 
 @app.route("/api/isis/monitor/force-check", methods=["POST"])
+@require_role("operator")
 def force_isis_check():
     """Force an immediate IS-IS status check for all devices.
 
@@ -11573,6 +11817,7 @@ def get_arp_monitor_status():
         return jsonify({"error": str(e)}), 500
 
 @app.route("/api/arp/monitor/force-check", methods=["POST"])
+@require_role("operator")
 def force_arp_check():
     """Force an immediate ARP status check for all devices."""
     try:
@@ -11584,6 +11829,7 @@ def force_arp_check():
 
 
 @app.route("/api/dhcp/monitor/force-check", methods=["POST"])
+@require_role("operator")
 def force_dhcp_check():
     """Force an immediate DHCP status refresh for every running device.
 

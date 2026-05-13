@@ -86,6 +86,43 @@ class AddDeviceDialog(QDialog):
 
     def setup_basic_device_form(self):
         """Setup a well-organized form for basic device information."""
+        # ── Template picker (one-click preset profiles) ─────────────
+        # Appears at the very top so operators can pick a role
+        # (eBGP peer, OSPFv2 backbone, DHCP client, ...) and have the
+        # form pre-fill in one click. Skip-applicable: any template
+        # field whose widget doesn't exist on this build is silently
+        # ignored, so old templates work after a form rearrangement.
+        try:
+            from utils.device_templates import list_templates
+            self._templates_meta = list_templates()
+        except Exception:
+            self._templates_meta = []
+        if self._templates_meta and self.mode != "edit":
+            template_group = QGroupBox("Quick start from template")
+            template_layout = QHBoxLayout(template_group)
+            template_layout.setContentsMargins(8, 6, 8, 6)
+
+            self.template_combo = QComboBox()
+            self.template_combo.addItem("— Custom (no template) —", "")
+            for t in self._templates_meta:
+                self.template_combo.addItem(t["title"], t["key"])
+            template_layout.addWidget(QLabel("Template:"))
+            template_layout.addWidget(self.template_combo, 1)
+
+            self._template_summary_label = QLabel(
+                "Pick a template to pre-fill the form, then tweak as needed."
+            )
+            self._template_summary_label.setStyleSheet(
+                "color: #6b7280; font-size: 11px;"
+            )
+            self._template_summary_label.setWordWrap(True)
+
+            self.template_combo.currentIndexChanged.connect(
+                self._on_template_changed
+            )
+            self.scroll_layout.addWidget(template_group)
+            self.scroll_layout.addWidget(self._template_summary_label)
+
         # Interface Configuration Group
         interface_group = QGroupBox("Interface Configuration")
         interface_layout = QFormLayout(interface_group)
@@ -1016,6 +1053,32 @@ class AddDeviceDialog(QDialog):
 
         self._update_dhcp_field_states()
         self._update_protocol_toggle_visibility()
+
+    def _on_template_changed(self, idx: int):
+        """Apply the selected template's defaults to the form.
+
+        Updates the summary line and walks the template registry to
+        push each field into the matching widget. The 'Custom' option
+        is a sentinel — it leaves the form alone for from-scratch
+        entry.
+        """
+        key = self.template_combo.itemData(idx)
+        if not key:
+            self._template_summary_label.setText(
+                "Pick a template to pre-fill the form, then tweak as needed."
+            )
+            return
+        # Find the summary text from the metadata cache.
+        meta = next((t for t in self._templates_meta if t["key"] == key), None)
+        if meta:
+            self._template_summary_label.setText(meta["summary"])
+        try:
+            from utils.device_templates import apply_to_dialog
+            apply_to_dialog(self, key)
+        except Exception as exc:
+            self._template_summary_label.setText(
+                f"Template '{key}' failed to apply: {exc}"
+            )
 
     def _on_protocol_enabled_changed(self):
         """Handle protocol enable/disable checkbox changes."""

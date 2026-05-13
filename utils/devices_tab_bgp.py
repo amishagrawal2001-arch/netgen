@@ -365,7 +365,22 @@ class BGPHandler:
             if has_bgp_devices:
                 logger.info("[BGP AUTO-START] Auto-starting BGP monitoring for existing BGP devices")
                 self.parent.start_bgp_monitoring()
-        
+
+        # Block cellChanged signals while we rebuild the table — without
+        # this, every setItem() below fires the on_bgp_table_cell_changed
+        # handler, which interprets each populate write as a user edit
+        # and triggers save_session(). With the periodic BGP monitor
+        # auto-started for any BGP device (it polls every ~20–30s), this
+        # caused save_session() to fire every 23s — the periodic save
+        # noise the user was seeing in the logs. Mirrors the same guard
+        # already applied in update_ospf_table / update_isis_table.
+        #
+        # QSignalBlocker is RAII-style — restores the previous block
+        # state when the variable goes out of scope at function return,
+        # so we don't have to wrap the rest of the method in try/finally.
+        from PyQt5.QtCore import QSignalBlocker
+        _bgp_signal_blocker = QSignalBlocker(self.parent.bgp_table)  # noqa: F841
+
         if neighbors is not None:
             # Update from server data - one row per neighbor
             # OPTIMIZATION: Use setRowCount with final count instead of clear+insertRow for better performance

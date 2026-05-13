@@ -306,7 +306,22 @@ class OSPFStatusMonitor:
                 'total_neighbors': len(neighbors),
                 'neighbors': neighbors
             })
-            
+
+            # Per-protocol state-history timeline (de-dup'd against last row).
+            try:
+                self.device_db.add_state_transition(
+                    device_id,
+                    "ospf",
+                    ospf_state or "Unknown",
+                    detail={
+                        "ipv4_established": ospf_ipv4_established,
+                        "ipv6_established": ospf_ipv6_established,
+                        "neighbors": len(neighbors),
+                    },
+                )
+            except Exception as _e:
+                logger.debug(f"[OSPF MONITOR] state-history insert skipped: {_e}")
+
             logger.info(f"[OSPF MONITOR] Successfully updated OSPF status for device {device_id}: {ospf_state}")
             
         except Exception as e:

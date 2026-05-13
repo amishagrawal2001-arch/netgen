@@ -546,10 +546,15 @@ _API_GUIDE_HTML = r"""
 </style>
 
 <h1>Netgen Server — REST API Guide</h1>
-<p class="muted">The traffic API is a small Flask app on port 5050. No auth
-(internal use). All requests/responses are JSON. Examples below are
-copy-pasteable curl commands you can run from any host that can reach
-<code>http://&lt;server&gt;:5050</code>.</p>
+<p class="muted">The Netgen API is a Flask app on port 5050. Auth is
+opt-in (see §15) — set <code>NETGEN_AUTH_TOKEN</code> server-side and
+every endpoint except <code>/api/health</code> requires
+<code>Authorization: Bearer &lt;token&gt;</code>. All requests/responses
+are JSON. Examples below are copy-pasteable curl commands you can run
+from any host that can reach <code>http://&lt;server&gt;:5050</code>.</p>
+<p class="muted">For CI / scripting without a GUI, every workflow in
+this guide is also available via the <code>netgen-cli</code> headless
+companion — see §20.</p>
 
 <h2>1. Endpoint summary</h2>
 
@@ -621,6 +626,45 @@ copy-pasteable curl commands you can run from any host that can reach
       <td>Refresh IS-IS state for every running device.</td></tr>
   <tr><td class="method">POST</td><td><code>/api/device/ping</code></td>
       <td>Server-side ping (in-VRF if <code>device_id</code> is supplied).</td></tr>
+  <tr><th colspan="3" style="background:#eff6ff; color:#1d4ed8;">Health, monitors &amp; bulk ops (§16–§17)</th></tr>
+  <tr><td class="method">GET</td> <td><code>/api/health</code></td>
+      <td><strong>Auth-exempt.</strong> Structured health probe — for k8s / HAProxy / Consul.</td></tr>
+  <tr><td class="method">GET</td> <td><code>/api/monitors/health</code></td>
+      <td>Aggregated background-monitor status (ARP / BGP / OSPF / ISIS / DHCP) + staleness.</td></tr>
+  <tr><td class="method">POST</td><td><code>/api/dhcp/monitor/force-check</code></td>
+      <td>Force an immediate DHCP poll for every running client device.</td></tr>
+  <tr><td class="method">GET</td> <td><code>/api/devices/export</code></td>
+      <td>Snapshot the entire device topology as JSON.</td></tr>
+  <tr><td class="method">POST</td><td><code>/api/devices/import</code></td>
+      <td>Restore a previously-exported topology (same shape).</td></tr>
+  <tr><th colspan="3" style="background:#eff6ff; color:#1d4ed8;">State history (§18)</th></tr>
+  <tr><td class="method">GET</td> <td><code>/api/device/database/devices/&lt;id&gt;/history</code></td>
+      <td>Interleaved state-transition timeline across all protocols.</td></tr>
+  <tr><td class="method">GET</td> <td><code>/api/device/database/devices/&lt;id&gt;/history/&lt;proto&gt;</code></td>
+      <td>Filter to one of <code>bgp / ospf / isis / arp / dhcp</code>.</td></tr>
+  <tr><th colspan="3" style="background:#eff6ff; color:#1d4ed8;">Stateful TCP (§19)</th></tr>
+  <tr><td class="method">POST</td><td><code>/api/stateful_tcp/start</code></td>
+      <td>Spawn a real-socket client OR server session — raw / HTTP / <strong>DNS</strong> / <strong>SIP</strong>, TLS, VRF.</td></tr>
+  <tr><td class="method">POST</td><td><code>/api/stateful_tcp/stop</code></td>
+      <td>Stop one session by ID, or all if no <code>session_id</code> given.</td></tr>
+  <tr><td class="method">GET</td> <td><code>/api/stateful_tcp/sessions</code></td>
+      <td>List every known session (running + finished).</td></tr>
+  <tr><td class="method">GET</td> <td><code>/api/stateful_tcp/stats/&lt;id&gt;</code></td>
+      <td>Live counters: conns / bytes / handshake-ms / RTT / retransmits / per-protocol bins.</td></tr>
+  <tr><th colspan="3" style="background:#eff6ff; color:#1d4ed8;">Live events &amp; templates (§21–§22)</th></tr>
+  <tr><td class="method">GET</td> <td><code>/api/events/stream</code></td>
+      <td>Server-Sent Events feed — state transitions + device/stream lifecycle pushed live.</td></tr>
+  <tr><td class="method">GET</td> <td><code>/api/events/status</code></td>
+      <td>Current SSE subscriber count.</td></tr>
+  <tr><th colspan="3" style="background:#eff6ff; color:#1d4ed8;">L2 frame generators &amp; multicast (§23)</th></tr>
+  <tr><td class="method">POST</td><td><code>/api/l2/{lacp,lldp,vrrp,igmp,pim}/start</code></td>
+      <td>Spawn a periodic L2 frame emitter (LACP / LLDP / VRRP / IGMP / PIM-Hello).</td></tr>
+  <tr><td class="method">POST</td><td><code>/api/l2/stop</code></td>
+      <td>Stop one L2 session by ID, or all if no ID given.</td></tr>
+  <tr><td class="method">GET</td> <td><code>/api/l2/sessions</code></td>
+      <td>List every L2 session (running + finished).</td></tr>
+  <tr><td class="method">GET</td> <td><code>/api/l2/stats/&lt;id&gt;</code></td>
+      <td>Live counters for one L2 session — frames sent / failed / bytes.</td></tr>
 </table>
 
 <h2>2. Common stream JSON shape</h2>
@@ -1394,20 +1438,53 @@ Running device and persists the result.</p>
 
 <h2>15. Authentication</h2>
 
-<p>Off by default — fine for the lab. Opt in by setting
-<code>NETGEN_AUTH_TOKEN=&lt;secret&gt;</code> on the server. Once set,
-every <code>/api/*</code> request must carry
-<code>Authorization: Bearer &lt;secret&gt;</code> or it returns
-<code>401</code>.</p>
+<p>Off by default — fine for the lab. Two opt-in modes, both via
+env vars on the server:</p>
 
-<h3>Server</h3>
+<h3>Single token (back-compat, 0.2.0)</h3>
 <pre><code># systemd EnvironmentFile or launch-script export
 NETGEN_AUTH_TOKEN=8c2f4e9a-3d1b-46f7-…</code></pre>
 
-<p>Exempt paths (no token required even when auth is on):</p>
+<p>Every <code>/api/*</code> request must carry
+<code>Authorization: Bearer &lt;secret&gt;</code> or it returns
+<code>401</code>. The token resolves to <strong>admin</strong> role —
+full access everywhere.</p>
+
+<h3>Per-role tokens (0.2.1+)</h3>
+<pre><code>NETGEN_AUTH_TOKENS_JSON='{
+  "abc...":"admin",
+  "def...":"operator",
+  "ghi...":"viewer"
+}'</code></pre>
+
+<p>Multiple tokens, each mapped to a role. Three roles in a strict
+hierarchy:</p>
+
+<table>
+  <tr><th>Role</th><th>Can call</th></tr>
+  <tr><td><strong>viewer</strong></td>
+      <td>Read-only — status / history / export endpoints, SSE
+          stream, stateful-TCP stats.</td></tr>
+  <tr><td><strong>operator</strong></td>
+      <td>Everything viewer can, plus mutating ops — device apply /
+          start / stop, traffic start / stop, BGP / OSPF / IS-IS
+          configure, force-checks, stateful-TCP start / stop.</td></tr>
+  <tr><td><strong>admin</strong></td>
+      <td>Everything — including destructive: device remove,
+          fabric-wide cleanup.</td></tr>
+</table>
+
+<p>Insufficient role returns <code>403</code> (vs <code>401</code> for
+"wrong token") so the client can distinguish identity vs permission.</p>
+
+<p>40 endpoints are currently role-annotated; older unannotated
+endpoints still gate on token presence but don't role-check yet
+(incremental migration).</p>
+
+<h3>Exempt paths (no token required)</h3>
 <ul>
-  <li><code>/admin</code> — the single-page web UI handles its own session</li>
-  <li><code>/api/health</code> — for load-balancer probes</li>
+  <li><code>/admin</code> — single-page web UI handles its own session</li>
+  <li><code>/api/health</code> — for k8s / HAProxy / Consul probes</li>
 </ul>
 
 <h3>Client (curl)</h3>
@@ -1421,10 +1498,595 @@ injects the header into every <code>requests.{get,post,put,…}</code>
 call so the existing 100+ HTTP sites Just Work.</p>
 
 <h3>What's still not handled</h3>
-<p>No CORS preflight handling. No rate limiting. No per-user / per-role
-authorization — bearer-token is shared-secret only. Don't expose port
-5050 to the public internet; auth is a guard against accidental
-discovery, not a hardened access-control layer.</p>
+<p>No CORS preflight handling. No rate limiting. Tokens are shared
+secrets — no per-token rotation tooling. Don't expose port 5050
+to the public internet; the auth layer guards against accidental
+discovery, not against a hardened attacker.</p>
+
+<h2>16. Monitor health</h2>
+
+<p>Each protocol monitor (ARP / BGP / OSPF / ISIS / DHCP) runs in its
+own background thread polling the FRR containers and writing state to
+the device DB. <code>/api/monitors/health</code> is the one-shot
+aggregator — useful for "are my monitors still alive?" dashboards and
+the inline badge in the Devices tab.</p>
+
+<pre><code>curl -H "Authorization: Bearer $NETGEN_AUTH_TOKEN" \
+     http://&lt;server&gt;:5050/api/monitors/health
+
+{
+  "ok": true,
+  "monitors": {
+    "arp":  {"running": true, "stale_secs": 12, "stale": false},
+    "bgp":  {"running": true, "stale_secs": 3,  "stale": false},
+    "ospf": {"running": true, "stale_secs": 8,  "stale": false},
+    "isis": {"running": true, "stale_secs": 9,  "stale": false},
+    "dhcp": {"running": true}
+  },
+  "checked_at": "2026-05-11T22:13:04Z"
+}</code></pre>
+
+<p><code>ok=false</code> when any monitor isn't running or its DB
+heartbeat is &gt; 90 seconds stale. Each monitor also exposes a
+<code>force-check</code> endpoint:</p>
+
+<ul>
+  <li><code>/api/arp/monitor/force-check</code></li>
+  <li><code>/api/bgp/monitor/force-check</code></li>
+  <li><code>/api/ospf/monitor/force-check</code></li>
+  <li><code>/api/isis/monitor/force-check</code></li>
+  <li><code>/api/dhcp/monitor/force-check</code></li>
+</ul>
+
+<p>POST with an empty body — they all run synchronously and return a
+fresh status snapshot.</p>
+
+<p><code>/api/health</code> is the bare liveness probe and is
+<strong>auth-exempt by design</strong> so k8s / HAProxy / Consul can
+probe the server without owning the token:</p>
+
+<pre><code>curl http://&lt;server&gt;:5050/api/health
+{"status":"ok","version":"0.2.0","uptime_s":143}</code></pre>
+
+<h2>17. Device export &amp; import</h2>
+
+<p>Round-trip the entire device topology as JSON. Useful for
+"snapshot this lab, restore on another box", topology version-control
+in git, or seeding a fresh server from a known-good config.</p>
+
+<h3>Export</h3>
+<pre><code>curl -H "Authorization: Bearer $NETGEN_AUTH_TOKEN" \
+     http://&lt;server&gt;:5050/api/devices/export &gt; devices.json
+
+{
+  "count": 3,
+  "exported_at": "2026-05-11T22:14:00Z",
+  "devices": [ { "device_id": "...", "device_name": "...", ... }, ... ]
+}</code></pre>
+
+<h3>Import</h3>
+<pre><code>curl -X POST -H "Authorization: Bearer $NETGEN_AUTH_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d @devices.json \
+     http://&lt;server&gt;:5050/api/devices/import
+
+{ "imported": 3, "failed": 0, "total": 3, "errors": [] }</code></pre>
+
+<p>Import is idempotent on <code>device_id</code> — a row that already
+exists is updated in place; new rows are inserted. Runtime state
+(ARP / BGP / OSPF / IS-IS state, last-check timestamps) is never
+exported so you can move topologies between hosts cleanly.</p>
+
+<p>From the CLI: <code>netgen-cli export -o devices.json</code> /
+<code>netgen-cli import -f devices.json --wait</code> — see §20.</p>
+
+<h2>18. State-history timeline</h2>
+
+<p>Every protocol monitor records a row each time it observes a state
+change for one of its devices. Rows are de-duped against the previous
+row, so steady-state polls don't bloat the table while a device sits
+in <code>Established</code>. The table powers the
+<strong>Ctrl+H</strong> dialog in the GUI and the "Recent transitions"
+block on the Topology tab's property panel.</p>
+
+<h3>All protocols, interleaved</h3>
+<pre><code>curl -H "Authorization: Bearer $NETGEN_AUTH_TOKEN" \
+     "http://&lt;server&gt;:5050/api/device/database/devices/&lt;id&gt;/history?limit=20"</code></pre>
+
+<h3>One protocol</h3>
+<pre><code>curl -H "Authorization: Bearer $NETGEN_AUTH_TOKEN" \
+     "http://&lt;server&gt;:5050/api/device/database/devices/&lt;id&gt;/history/bgp?limit=20"
+
+{
+  "device_id": "47dce96a-...",
+  "protocol":  "bgp",
+  "count": 4,
+  "history": [
+    { "id": 412, "timestamp": "2026-05-11T22:13:04Z",
+      "protocol": "bgp", "state": "Established",
+      "detail": { "ipv4": "Established", "ipv6": "Established",
+                  "neighbors": 2 } },
+    { "id": 387, "timestamp": "2026-05-11T22:11:48Z",
+      "protocol": "bgp", "state": "Active",
+      "detail": { "ipv4": "Active", "ipv6": null, "neighbors": 1 } },
+    ...
+  ]
+}</code></pre>
+
+<p>Valid <code>&lt;proto&gt;</code> values: <code>bgp</code>,
+<code>ospf</code>, <code>isis</code>, <code>arp</code>,
+<code>dhcp</code>. Anything else returns HTTP 400 with the valid list
+— silent-empty was a footgun.</p>
+
+<h2>19. Stateful TCP</h2>
+
+<p>Real-socket TCP traffic, parallel to the scapy / DPDK stateless
+streams. Sessions here complete actual 3-way handshakes, so middleboxes,
+NAT, proxies, and load balancers see real connection state. Each
+session is owned by an in-process worker that loops connect → send →
+recv → close for the configured duration; counters update on every
+connection.</p>
+
+<h3>Start a server</h3>
+<pre><code>curl -X POST -H "Authorization: Bearer $NETGEN_AUTH_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{ "role": "server",
+           "listen_ip": "0.0.0.0",
+           "listen_port": 5001,
+           "mode": "echo" }' \
+     http://&lt;server&gt;:5050/api/stateful_tcp/start
+
+{ "session_id": "9286ba6e-...", "role": "server" }</code></pre>
+
+<h3>Start a client</h3>
+<pre><code>curl -X POST -H "Authorization: Bearer $NETGEN_AUTH_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{ "role": "client",
+           "dst_ip": "10.0.0.5",
+           "dst_port": 5001,
+           "src_ip": "10.0.0.10",
+           "vrf": "vrf-abc12345",
+           "duration_s": 30,
+           "payload_bytes": 4096,
+           "concurrency": 4,
+           "protocol": "raw" }' \
+     http://&lt;server&gt;:5050/api/stateful_tcp/start
+
+{ "session_id": "47dce96a-...", "role": "client" }</code></pre>
+
+<p>Valid <code>protocol</code> values: <code>raw</code> (default —
+byte echo), <code>http</code> (HTTP/1.1 framing), <code>dns</code>
+(DNS-over-TCP per RFC 7766), <code>sip</code> (SIP-over-TCP REGISTER
+per RFC 3261). See per-protocol examples below.</p>
+
+<h3>Poll counters</h3>
+<pre><code>curl -H "Authorization: Bearer $NETGEN_AUTH_TOKEN" \
+     http://&lt;server&gt;:5050/api/stateful_tcp/stats/&lt;session_id&gt;
+
+{
+  "session_id": "47dce96a-...",
+  "role": "client",
+  "running": true,
+  "counters": {
+    "uptime_s": 12.3,
+    "conns_attempted": 412, "conns_established": 410, "conns_failed": 2,
+    "bytes_tx": 419840,  "bytes_rx": 419840,
+    "avg_handshake_ms": 0.92,
+    "avg_rtt_ms": 1.43,           "rtt_samples": 410,
+    "avg_kernel_rtt_us": 920.4,   "kernel_rtt_samples": 410,
+    "retransmits_total": 0,
+    "http_status_2xx": 0,         "http_status_other": 0,
+    "dns_noerror": 0, "dns_nxdomain": 0, "dns_servfail": 0, "dns_other": 0,
+    "sip_2xx": 0,  "sip_3xx": 0, "sip_4xx": 0, "sip_5xx": 0, "sip_other": 0,
+    "last_error": null
+  }
+}</code></pre>
+
+<h3>L7 protocols</h3>
+
+<h4>DNS-over-TCP (RFC 7766)</h4>
+<p>Builds a 2-byte length-prefixed DNS query for <code>dns_qname</code>
+(default <code>netgen.test</code>); server answers with the configured
+<code>dns_response_rcode</code> (default 3 = NXDOMAIN). Useful for
+testing DNS proxies, recursive resolvers handling TCP fallback,
+DNS-aware load balancers. Counters bin per RCODE:
+<code>dns_noerror</code> (0), <code>dns_nxdomain</code> (3),
+<code>dns_servfail</code> (2), <code>dns_other</code>.</p>
+
+<pre><code>curl -X POST -H "Authorization: Bearer $NETGEN_AUTH_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"role":"server","listen_port":5353,
+          "protocol":"dns","dns_response_rcode":0}' \
+     http://&lt;server&gt;:5050/api/stateful_tcp/start
+
+curl -X POST -H "Authorization: Bearer $NETGEN_AUTH_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"role":"client","dst_ip":"127.0.0.1","dst_port":5353,
+          "protocol":"dns","duration_s":10,"concurrency":4}' \
+     http://&lt;server&gt;:5050/api/stateful_tcp/start</code></pre>
+
+<h4>SIP-over-TCP (RFC 3261)</h4>
+<p>Sends well-formed SIP REGISTER messages over TCP and bins the
+response by status class. Server-side simulator mirrors Via / From /
+To / Call-ID / CSeq per §8.2.6.2 so real SIP clients accept the
+responses. Useful for testing SBCs, SIP registrars, reverse proxies
+that gate on SIP transactions.</p>
+
+<pre><code># Registrar simulator returning 401 Unauthorized (auth-retry test)
+curl -X POST -H "Authorization: Bearer $NETGEN_AUTH_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"role":"server","listen_port":5060,"protocol":"sip",
+          "sip_response_status":401,"sip_response_reason":"Unauthorized"}' \
+     http://&lt;server&gt;:5050/api/stateful_tcp/start
+
+curl -X POST -H "Authorization: Bearer $NETGEN_AUTH_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"role":"client","dst_ip":"127.0.0.1","dst_port":5060,
+          "protocol":"sip","sip_host":"registrar.example.com",
+          "duration_s":10,"concurrency":2,"interval_s":0.01}' \
+     http://&lt;server&gt;:5050/api/stateful_tcp/start</code></pre>
+
+<h3>Optional flags</h3>
+
+<table>
+  <tr><th>Flag</th><th>Side</th><th>Behavior</th></tr>
+  <tr><td><code>vrf</code></td><td>both</td>
+      <td>Linux interface name for <code>SO_BINDTODEVICE</code>
+          (typically a per-device VRF or master link). No-op +
+          warning on macOS / Windows.</td></tr>
+  <tr><td><code>protocol</code></td><td>both</td>
+      <td><code>raw</code> | <code>http</code> | <code>dns</code> |
+          <code>sip</code>. Per-protocol counters bin responses.</td></tr>
+  <tr><td><code>tls: true</code></td><td>both</td>
+      <td>Wrap each connection in TLS. Server requires
+          <code>tls_cert</code> + <code>tls_key</code> paths; client
+          defaults to <code>tls_verify=false</code> for self-signed
+          test envs (set <code>true</code> to enforce CA + hostname).</td></tr>
+  <tr><td><code>dns_qname</code> / <code>dns_response_rcode</code></td><td>both</td>
+      <td>Client: query name. Server: rcode to return (0=NOERROR,
+          3=NXDOMAIN, 2=SERVFAIL, …).</td></tr>
+  <tr><td><code>sip_host</code> / <code>sip_user</code></td><td>client</td>
+      <td>Registrar host (defaults to <code>dst_ip</code>) and user
+          part of the REGISTER URI.</td></tr>
+  <tr><td><code>sip_response_status</code> / <code>sip_response_reason</code></td><td>server</td>
+      <td>Status code + reason phrase the SIP simulator returns to
+          every REGISTER. Use 401/Unauthorized to drive auth-retry.</td></tr>
+  <tr><td><code>expect_echo: false</code></td><td>client</td>
+      <td>Send + close immediately without waiting for an echo.
+          Reduces handshake-dominated overhead when measuring tx
+          throughput in isolation.</td></tr>
+  <tr><td><code>concurrency: N</code></td><td>client</td>
+      <td>Spawn N parallel sender threads against the same target.</td></tr>
+</table>
+
+<h3>Counters glossary</h3>
+
+<table>
+  <tr><th>Counter</th><th>Source</th></tr>
+  <tr><td><code>avg_handshake_ms</code></td>
+      <td>Userspace timer around <code>connect()</code>.</td></tr>
+  <tr><td><code>avg_rtt_ms</code></td>
+      <td>Userspace timer around the full connect → send → recv → close.</td></tr>
+  <tr><td><code>avg_kernel_rtt_us</code></td>
+      <td><code>TCP_INFO.rtt_us</code> — smoothed RTT from the kernel.
+          Linux only; <code>0</code> elsewhere.</td></tr>
+  <tr><td><code>retransmits_total</code></td>
+      <td><code>TCP_INFO.total_retrans</code>. Linux only.</td></tr>
+  <tr><td><code>http_status_2xx</code> / <code>_other</code></td>
+      <td>Per HTTP/1.1 status when <code>protocol=http</code>.</td></tr>
+  <tr><td><code>dns_noerror / nxdomain / servfail / other</code></td>
+      <td>Per RCODE bin when <code>protocol=dns</code>.</td></tr>
+  <tr><td><code>sip_2xx / 3xx / 4xx / 5xx / other</code></td>
+      <td>Per status-class bin when <code>protocol=sip</code>.</td></tr>
+</table>
+
+<div class="warn">
+  <strong>When to use stateful vs stateless:</strong> for line-rate
+  forwarding tests stick with the scapy/DPDK streams (§4) — they hit
+  400&nbsp;Gbps. The stateful path is for &quot;does my middlebox
+  proxy TCP correctly?&quot;, &quot;does my reverse proxy handle a
+  WAF check?&quot;, &quot;does my load balancer pin a TLS session?&quot;
+  — workloads that require an actual handshake.
+</div>
+
+<h2>20. netgen-cli (headless companion)</h2>
+
+<p>The headless companion to the GUI. Same REST surface, no X display
+required — drops into CI pipelines, tmux panes, SSH sessions. Installs
+as the <code>netgen-cli</code> entry point alongside the GUI client.</p>
+
+<h3>Common workflows</h3>
+<pre><code># Health + monitor status (§16)
+netgen-cli health
+
+# Topology snapshot / restore (§17)
+netgen-cli export -o devices.json
+netgen-cli import -f devices.json --wait
+
+# Apply one device and block until ARP resolves
+netgen-cli apply -f single_device.json --wait
+
+# Per-device + protocol status
+netgen-cli status -i 47dce96a-...
+netgen-cli wait   -i 47dce96a-... --timeout 60
+
+# List all devices
+netgen-cli list</code></pre>
+
+<h3>Stateful TCP (§19)</h3>
+<pre><code>netgen-cli tcp start-server --port 5001 --bind 127.0.0.1
+netgen-cli tcp start-client --dst-ip 127.0.0.1 --dst-port 5001 \
+    --duration 30 --concurrency 4 --payload-bytes 4096 \
+    --protocol http --vrf vrf-abc12345
+netgen-cli tcp list
+netgen-cli tcp stats --session-id &lt;id&gt;
+netgen-cli tcp stop   --session-id &lt;id&gt;     # or `stop` alone to stop all</code></pre>
+
+<h3>Server URL &amp; auth</h3>
+<p>The server URL is read from <code>$NETGEN_SERVER_URL</code>
+(default <code>http://localhost:5050</code>) — override with
+<code>-s URL</code> on any subcommand. If
+<code>$NETGEN_AUTH_TOKEN</code> is set, every request gets
+<code>Authorization: Bearer …</code> automatically, mirroring the GUI's
+behaviour. Exit codes are bash-friendly:
+<code>0</code> success, <code>1</code> bad args, <code>3</code> HTTP
+error, <code>4</code> partial-failure on bulk operations,
+<code>5</code> timeout on <code>--wait</code> — gate merges on those.</p>
+
+<h2>21. Live event stream (Server-Sent Events)</h2>
+
+<p>Long-lived HTTP stream that pushes operator-visible events to
+subscribers in real time — replaces polling for state changes.
+Used internally by the Topology tab and the Devices tab to live-
+refresh on protocol transitions and device-lifecycle changes.
+External consumers can subscribe too.</p>
+
+<h3>Subscribe</h3>
+<pre><code>curl -N -H "Authorization: Bearer $NETGEN_AUTH_TOKEN" \
+     http://&lt;server&gt;:5050/api/events/stream</code></pre>
+
+<p>Wire format (one event per blank-line-terminated block):</p>
+
+<pre><code>event: state_transition
+data: {"event_type":"state_transition","ts":1747044723.4,
+       "device_id":"47dce96a-...","protocol":"bgp",
+       "state":"Established","detail":{...}}
+
+event: heartbeat
+data: {"event_type":"heartbeat","ts":1747044738.4,"subscriber_count":1}</code></pre>
+
+<p>Heartbeats fire every 15 s during idle windows so proxies don't
+time the connection out. Both <code>EventSource</code> in browsers
+and the GUI's <code>utils.sse_client.SSEWorker</code> auto-reconnect
+on drop.</p>
+
+<h3>Event types emitted today</h3>
+
+<table>
+  <tr><th>Type</th><th>Fires after</th><th>Payload keys</th></tr>
+  <tr><td><code>state_transition</code></td>
+      <td>Any protocol monitor sees a state change.</td>
+      <td><code>device_id</code>, <code>protocol</code>
+          (bgp/ospf/isis/arp/dhcp), <code>state</code>,
+          <code>detail</code></td></tr>
+  <tr><td><code>device_applied</code></td>
+      <td><code>POST /api/device/apply</code> success</td>
+      <td><code>device_id</code>, <code>device_name</code>,
+          <code>interface</code></td></tr>
+  <tr><td><code>device_apply_failed</code></td>
+      <td><code>POST /api/device/apply</code> exception</td>
+      <td><code>device_id</code>, <code>device_name</code>,
+          <code>error</code></td></tr>
+  <tr><td><code>device_started</code></td>
+      <td><code>POST /api/device/start</code> success</td>
+      <td><code>device_id</code></td></tr>
+  <tr><td><code>device_stopped</code></td>
+      <td><code>POST /api/device/stop</code> success</td>
+      <td><code>device_id</code></td></tr>
+  <tr><td><code>device_removed</code></td>
+      <td><code>POST /api/device/remove</code> success</td>
+      <td><code>device_id</code>, <code>device_name</code>,
+          <code>db_removed</code></td></tr>
+  <tr><td><code>stream_started</code></td>
+      <td><code>POST /api/traffic/start</code> success</td>
+      <td><code>count</code>, <code>streams</code></td></tr>
+  <tr><td><code>stream_stopped</code></td>
+      <td><code>POST /api/traffic/stop</code> success</td>
+      <td><code>count</code>, <code>stream_ids</code></td></tr>
+  <tr><td><code>stream_restarted</code></td>
+      <td><code>POST /api/traffic/restart</code> success</td>
+      <td><code>interface</code>, <code>count</code></td></tr>
+  <tr><td><code>heartbeat</code></td>
+      <td>Every ~15 s during idle</td>
+      <td><code>subscriber_count</code></td></tr>
+</table>
+
+<p>Every envelope also carries <code>event_type</code> and
+<code>ts</code> (unix-epoch float) — consumers can rely on those
+two keys always being present.</p>
+
+<h3>Subscriber count</h3>
+<pre><code>curl -H "Authorization: Bearer $NETGEN_AUTH_TOKEN" \
+     http://&lt;server&gt;:5050/api/events/status
+# {"subscribers": 2}</code></pre>
+
+<h3>Adding a new event type</h3>
+<p>Producer code anywhere in the server calls
+<code>utils.event_bus.publish(event_type, {…})</code>. The envelope
+gets the canonical <code>event_type</code> + <code>ts</code> keys
+added automatically. Publication is non-blocking and a no-op when
+nobody is subscribed — safe to drop into hot paths.</p>
+
+<h2>22. Templates &amp; bulk-edit (GUI features)</h2>
+
+<p>Two operator-facing workflow shortcuts that don't have dedicated
+REST endpoints — they live in the GUI but warrant mention here so
+operators know they exist.</p>
+
+<h3>One-click device templates</h3>
+<p>The Add Device dialog opens with a <strong>"Quick start from
+template"</strong> dropdown. Eight pre-baked profiles ship today:</p>
+
+<ul>
+  <li>Bare host (L2/L3 only — no routing)</li>
+  <li>iBGP peer (loopback router-id, peer-AS = local-AS)</li>
+  <li>eBGP peer (AS 65000 ↔ AS 65001 defaults)</li>
+  <li>OSPFv2 area-0 backbone router</li>
+  <li>OSPFv2 + OSPFv3 dual-stack</li>
+  <li>IS-IS Level-1-2 router (default NET 49.0001.…)</li>
+  <li>DHCP client</li>
+  <li>VXLAN tunnel endpoint</li>
+</ul>
+
+<p>Picking a template pre-fills the form; operator tweaks IPs / VLAN
+to match their lab and clicks Apply. Skip-applicable: missing
+widgets are silently ignored so templates survive form
+rearrangements.</p>
+
+<h3>One-click traffic templates</h3>
+<p>The Add Stream dialog opens with a similar <strong>Template</strong>
+dropdown. Seven pre-baked traffic profiles:</p>
+
+<ul>
+  <li>UDP line-rate · 64 B (64-byte DPDK blast)</li>
+  <li>UDP IMIX (three-frame mix; tweak frame_size or modifiers for true IMIX)</li>
+  <li>LAG / RSS / ECMP hash test (modifiers cycle src/dst IP + L4 ports)</li>
+  <li>Latency probe (NLAT, 1000 pps small frames)</li>
+  <li>VXLAN-encapsulated UDP (inner Ether+IP+UDP wrapped in UDP/4789)</li>
+  <li>ICMP echo flood (scapy path)</li>
+  <li>VLAN-tagged UDP (802.1Q over IPv4/UDP)</li>
+</ul>
+
+<h3>Multi-device bulk-edit (⧉ toolbar button)</h3>
+<p>Select N rows in the Devices tab → click ⧉ → set start value +
+step for any of VLAN / IPv4 / IPv4 Gateway / Loopback / MAC. First
+row gets <code>start</code>, second gets <code>start + step</code>,
+etc. Protocol checkboxes are tri-state — Checked enables across the
+selection, Unchecked disables, Partial leaves each device's setting
+alone. Live preview shows the first 3 + last computed plan before
+commit. Marks every touched device for re-apply; next ✓ Apply
+pushes the new values to the server.</p>
+
+<h2>23. L2 frame generators &amp; multicast</h2>
+
+<p>Periodic-frame emitters for the protocols every datacenter and
+enterprise lab tests. Built on scapy's existing layer definitions
+so the wire format follows the contrib package's current shape.
+Each session is a session-registered worker thread that <code>sendp</code>'s
+the configured frame on the chosen interface at the protocol's
+standard cadence.</p>
+
+<p><strong>Requires <code>CAP_NET_RAW</code> or root.</strong>
+<code>sendp</code> opens an AF_PACKET socket on Linux; raw sockets
+are root-only on macOS BSD. The worker surfaces
+<code>PermissionError</code> on <code>last_error</code> and stops
+the session — silent-fail isn't useful when the operator's first
+question is &quot;why are no frames hitting the wire?&quot;</p>
+
+<h3>Supported protocols</h3>
+
+<table>
+  <tr><th>Protocol</th><th>Standard</th><th>Default cadence</th></tr>
+  <tr><td><strong>LACP</strong></td>
+      <td>IEEE 802.1AX (Slow Protocols, ethertype 0x8809)</td>
+      <td>30 s (fast=true → 1 s)</td></tr>
+  <tr><td><strong>LLDP</strong></td>
+      <td>IEEE 802.1AB (ethertype 0x88cc)</td>
+      <td>30 s</td></tr>
+  <tr><td><strong>VRRP v2</strong></td>
+      <td>RFC 3768 (IPv4, multicast 224.0.0.18)</td>
+      <td>1 s</td></tr>
+  <tr><td><strong>VRRP v3</strong></td>
+      <td>RFC 5798 (IPv4 + IPv6 via <code>family</code>)</td>
+      <td>1 s (centi-seconds on the wire)</td></tr>
+  <tr><td><strong>IGMP v2</strong></td>
+      <td>RFC 2236 (type 0x16 Report; 0x17 Leave; 0x11 Query)</td>
+      <td>60 s</td></tr>
+  <tr><td><strong>IGMP v3</strong></td>
+      <td>RFC 3376 (type 0x22, sent to 224.0.0.22)</td>
+      <td>60 s</td></tr>
+  <tr><td><strong>PIM Hello</strong></td>
+      <td>RFC 7761 §4.3 (224.0.0.13, IP-proto 103)</td>
+      <td>30 s</td></tr>
+</table>
+
+<h3>Start examples</h3>
+
+<pre><code># LACP fast-cadence LAG partner emulation
+curl -X POST -H "Authorization: Bearer $NETGEN_AUTH_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"iface":"eth0","fast":true,
+          "system_mac":"00:11:22:33:44:01","key":1}' \
+     http://&lt;server&gt;:5050/api/l2/lacp/start
+
+# LLDP advertiser
+curl -X POST -H "Authorization: Bearer $NETGEN_AUTH_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"iface":"eth0","chassis_id":"netgen-host","port_id":"eth0",
+          "ttl_s":120,"system_name":"netgen"}' \
+     http://&lt;server&gt;:5050/api/l2/lldp/start
+
+# VRRP v3 IPv4 master at priority 200
+curl -X POST -H "Authorization: Bearer $NETGEN_AUTH_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"iface":"eth0","version":3,"vrid":42,"priority":200,
+          "virtual_ips":["192.168.1.254"],"src_ip":"10.0.0.1"}' \
+     http://&lt;server&gt;:5050/api/l2/vrrp/start
+
+# IGMP v2 membership report for a group
+curl -X POST -H "Authorization: Bearer $NETGEN_AUTH_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"iface":"eth0","version":2,"group":"239.1.1.1"}' \
+     http://&lt;server&gt;:5050/api/l2/igmp/start
+
+# IGMP v2 Leave (override type byte)
+curl -X POST ... -d '{"iface":"eth0","version":2,
+                      "group":"239.1.1.1","type_code":23}' ...
+
+# PIM Hello — registers us as a neighbour without doing Join/Prune
+curl -X POST -H "Authorization: Bearer $NETGEN_AUTH_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"iface":"eth0","hold_time":105,"dr_priority":1}' \
+     http://&lt;server&gt;:5050/api/l2/pim/start</code></pre>
+
+<h3>Stats snapshot</h3>
+
+<pre><code>curl http://&lt;server&gt;:5050/api/l2/stats/&lt;session_id&gt;
+
+{
+  "session_id": "...",
+  "protocol": "lacp",
+  "iface": "eth0",
+  "running": true,
+  "counters": {
+    "uptime_s": 14.2,
+    "frames_sent": 14, "frames_failed": 0,
+    "bytes_sent": 1736,
+    "last_send_at": 1747044738.4,
+    "last_error": null
+  }
+}</code></pre>
+
+<h3>From the CLI</h3>
+
+<pre><code>netgen-cli l2 start-lacp --iface eth0 --fast
+netgen-cli l2 start-lldp --iface eth0 --chassis-id netgen-host --port-id eth0
+netgen-cli l2 start-vrrp --iface eth0 --vrid 42 --priority 200 \
+                          --virtual-ips 192.168.1.254
+netgen-cli l2 start-igmp --iface eth0 --group 239.1.1.1
+netgen-cli l2 start-pim  --iface eth0
+netgen-cli l2 list
+netgen-cli l2 stats --session-id &lt;id&gt;
+netgen-cli l2 stop   --session-id &lt;id&gt;     # or just `stop` to stop all</code></pre>
+
+<div class="warn">
+  <strong>Full PIM-SM / multicast-routing flows are not (yet) supported</strong> —
+  this surface only emulates the Hello-side of PIM neighbour discovery,
+  not Join/Prune state-machine state. IGMP is membership reports, not
+  full querier behaviour. Enough for switch IGMP-snooping tests and
+  for proving PIM adjacency on a real router; not enough to be a full
+  multicast control plane.
+</div>
 """
 
 
@@ -1532,6 +2194,41 @@ class AddStreamDialog(QDialog):
 
         # Main Layout
         self.main_layout = QVBoxLayout()
+
+        # Template picker — appears above the tabs in "add new stream"
+        # mode (not when editing an existing one) so operators can
+        # pick a role (UDP line rate, LAG hash test, VXLAN encap, ...)
+        # and have all six tabs pre-populate in one click. The picker
+        # uses the same populate_stream_fields() path the edit case
+        # already drives, so anything the dialog can show via Edit
+        # can be a template.
+        try:
+            from utils.traffic_templates import list_templates
+            self._traffic_templates_meta = list_templates()
+        except Exception:
+            self._traffic_templates_meta = []
+        if self._traffic_templates_meta and not self.stream_data:
+            template_bar = QHBoxLayout()
+            template_bar.setContentsMargins(8, 6, 8, 0)
+            template_bar.addWidget(QLabel("Template:"))
+            self.template_combo = QComboBox()
+            self.template_combo.addItem("— Custom (no template) —", "")
+            for t in self._traffic_templates_meta:
+                self.template_combo.addItem(t["title"], t["key"])
+            self.template_combo.currentIndexChanged.connect(
+                self._on_traffic_template_changed
+            )
+            template_bar.addWidget(self.template_combo, 1)
+            self._traffic_template_summary = QLabel(
+                "Pick a template to pre-fill all tabs."
+            )
+            self._traffic_template_summary.setStyleSheet(
+                "color: #6b7280; font-size: 11px;"
+            )
+            self._traffic_template_summary.setWordWrap(True)
+            self.main_layout.addLayout(template_bar)
+            self.main_layout.addWidget(self._traffic_template_summary)
+
         self.main_layout.addWidget(self.scroll_area)
 
         # Buttons with professional styling
@@ -3753,6 +4450,36 @@ class AddStreamDialog(QDialog):
             truthy(stream_data.get("protocol_selection", {}).get("dpdk_enable", False)),
             truthy(stream_data.get("variable_fields", {}).get("dpdk_enable", False)),
         ))
+
+    def _on_traffic_template_changed(self, idx: int):
+        """Apply the selected traffic template to all tabs.
+
+        The template registry returns a `stream_data` dict in the
+        same shape `populate_stream_fields()` already consumes, so we
+        reuse that single canonical path — no per-tab juggling. The
+        'Custom' option leaves all fields alone for from-scratch entry.
+        """
+        key = self.template_combo.itemData(idx)
+        if not key:
+            self._traffic_template_summary.setText(
+                "Pick a template to pre-fill all tabs."
+            )
+            return
+        meta = next(
+            (t for t in self._traffic_templates_meta if t["key"] == key),
+            None,
+        )
+        if meta:
+            self._traffic_template_summary.setText(meta["summary"])
+        try:
+            from utils.traffic_templates import get_stream_data
+            data = get_stream_data(key)
+            if data:
+                self.populate_stream_fields(data)
+        except Exception as exc:
+            self._traffic_template_summary.setText(
+                f"Template '{key}' failed to apply: {exc}"
+            )
 
     def populate_stream_fields(self, stream_data=None):
         stream_data = stream_data or {}

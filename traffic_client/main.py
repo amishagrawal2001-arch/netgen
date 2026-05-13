@@ -32,6 +32,7 @@ from PyQt5.QtGui import QKeySequence
 if hasattr(QtCore, "qRegisterMetaType"):
     QtCore.qRegisterMetaType('QVector<int>')
 from widgets.devices_tab import DevicesTab
+from widgets.topology_tab import TopologyTab
 from capture_client import PacketCaptureClient
 from traffic_client.menu_actions import TrafficGenClientMenuAction
 from traffic_client.packet_capture import TrafficGenClientPacketCapture
@@ -134,8 +135,24 @@ class TrafficGeneratorClient(
         self.tab_widget = QTabWidget()
         self.streams_tab = QWidget()
         self.devices_tab = DevicesTab(self)
+        # Topology tab — read-only fabric view derived from device DB.
+        # Adds a Refresh button; nothing polls in the background.
+        self.topology_tab = TopologyTab(self)
+        # L2 Emulation tab — frame generators for LACP / LLDP / VRRP /
+        # IGMP / PIM. Backed by /api/l2/* and utils/l2_protocols.py.
+        # Import is lazy-guarded so an older server without scapy
+        # contrib still launches a client without crashing.
+        try:
+            from widgets.l2_emulation_tab import L2EmulationTab
+            self.l2_emulation_tab = L2EmulationTab(self)
+        except Exception as _l2_imp_err:
+            logger.warning(f"L2 Emulation tab unavailable: {_l2_imp_err}")
+            self.l2_emulation_tab = None
         self.tab_widget.addTab(self.streams_tab, "Streams")
         self.tab_widget.addTab(self.devices_tab, "Devices")
+        self.tab_widget.addTab(self.topology_tab, "Topology")
+        if self.l2_emulation_tab is not None:
+            self.tab_widget.addTab(self.l2_emulation_tab, "L2 Emulation")
         self.tab_widget.tabBar().setExpanding(False)
         self.tab_widget.setStyleSheet("""
             QTabWidget::pane {
@@ -606,8 +623,24 @@ class TrafficGeneratorClient(
             # Already in the process of closing, ignore
             event.accept()
             return
-            
+
         self._is_closing = True
+
+        # Persist topology canvas layout so the next session opens with
+        # the same node positions. Cheap (QSettings sync) and best-effort.
+        try:
+            if hasattr(self, "topology_tab") and self.topology_tab:
+                self.topology_tab.save_layout()
+        except Exception as _exc:
+            logger.debug(f"[CLEANUP] topology save_layout: {_exc}")
+
+        # L2 emulation tab — stop the poll timer so it doesn't fire
+        # mid-shutdown and queue a fetch against a half-gone server.
+        try:
+            if getattr(self, "l2_emulation_tab", None):
+                self.l2_emulation_tab.cleanup_threads()
+        except Exception as _exc:
+            logger.debug(f"[CLEANUP] l2_emulation_tab cleanup: {_exc}")
         
         # CRITICAL: Clean up save worker before closing
         if hasattr(self, '_save_worker') and self._save_worker is not None:

@@ -519,18 +519,32 @@ class TrafficGenClientMenuAction():
                     self._save_worker = None
                 self._save_in_progress = False
             else:
-                # Non-blocking call while a save is already in progress – skip
-                # print("[SAVE SESSION] Save already in progress, skipping duplicate save request")
+                # Non-blocking call while a save is already in progress.
+                # Don't silently drop — flag the session as dirty so the
+                # current save's finished handler kicks off one more.
+                # This implements the trailing-edge of a "fire once now,
+                # fire once at the end" coalesce: rapid bursts during
+                # auto-start, multi-cell edits, etc. collapse into at
+                # most two writes regardless of how many triggers fire.
+                self._save_pending = True
                 return
-        
-        # Throttle rapid save calls (only for non-blocking saves)
+
+        # Throttle rapid save calls (only for non-blocking saves).
+        # Widened from 500ms to 2s because the previous window let
+        # auto-start's stream-state cascade through two complete saves
+        # ~350ms apart — both expensive (ServerManager rebuild + JSON
+        # write). Throttled calls now arm a single deferred follow-up
+        # via the dirty flag instead of being silently dropped.
+        SAVE_THROTTLE_S = 2.0
         if not blocking:
-            # Check if this is a duplicate save call within a short time window
-            if hasattr(self, '_last_save_time') and (current_time - self._last_save_time) < 0.5:
-                # print("[SAVE SESSION] Skipping duplicate save call (throttled)")
+            if hasattr(self, '_last_save_time') and (current_time - self._last_save_time) < SAVE_THROTTLE_S:
+                self._save_pending = True
+                self._schedule_trailing_save()
                 return
         # Update timestamp for throttling (both blocking and non-blocking)
         self._last_save_time = current_time
+        # Clear pending — we're about to satisfy it.
+        self._save_pending = False
         
         # Re-evaluate worker flags after potential cleanup above
         with self._save_lock:
@@ -583,11 +597,17 @@ class TrafficGenClientMenuAction():
             finally:
                 self._save_in_progress = False
             if success:
-                logger.info(f"[SAVE SESSION] {message}")
+                # Same hash-skip handling as the async path — keep
+                # no-op blocking saves (close-handler tick on an
+                # already-clean session) silent.
+                if message == "no changes — skipped":
+                    logger.debug(f"[SAVE SESSION] {message}")
+                else:
+                    logger.info(f"[SAVE SESSION] {message}")
             else:
                 logger.error(f"[SAVE SESSION ERROR] {message}")
             return success, message
-        
+
         self._save_in_progress = True
         
         # Run save operation in separate thread to avoid blocking UI
@@ -653,7 +673,13 @@ class TrafficGenClientMenuAction():
         """Handle save completion (called from worker thread via signal)."""
         self._save_in_progress = False
         if success:
-            logger.info(f"[SAVE SESSION] {message}")
+            # The "no changes" sentinel comes from the content-hash
+            # short-circuit in _save_session_impl — log it at debug so
+            # the trailing-edge no-ops don't show up in the console.
+            if message == "no changes — skipped":
+                logger.debug(f"[SAVE SESSION] {message}")
+            else:
+                logger.info(f"[SAVE SESSION] {message}")
         else:
             logger.error(f"[SAVE SESSION ERROR] {message}")
         
@@ -681,7 +707,43 @@ class TrafficGenClientMenuAction():
                     pass
             
             QTimer.singleShot(50, cleanup_worker)
-    
+
+        # Trailing-edge of the coalesce: if anyone called save_session()
+        # while this one was in flight (or got throttled), honour that
+        # request now by scheduling exactly one follow-up. The throttle
+        # window in save_session() prevents a tight loop here.
+        if getattr(self, "_save_pending", False):
+            self._save_pending = False
+            self._schedule_trailing_save()
+
+    def _schedule_trailing_save(self, delay_ms: int = 2100):
+        """Arm a single deferred save call, honouring the throttle window.
+
+        Multiple rapid triggers collapse into one timer — if the timer
+        is already armed, this is a no-op. The delay is just over the
+        throttle window so the trailing save isn't itself re-throttled.
+        Used both when save_session() is called while a save is in
+        flight, and when it's called inside the rate-limit window.
+        """
+        if getattr(self, "_is_closing", False):
+            return
+        if getattr(self, "_trailing_save_armed", False):
+            return
+        self._trailing_save_armed = True
+        from PyQt5.QtCore import QTimer
+
+        def _fire():
+            self._trailing_save_armed = False
+            # _is_closing may have flipped while the timer was pending.
+            if getattr(self, "_is_closing", False):
+                return
+            try:
+                self.save_session()
+            except Exception as exc:
+                logger.debug(f"[SAVE SESSION] trailing-save fired with error: {exc}")
+
+        QTimer.singleShot(delay_ms, _fire)
+
     def _save_session_impl(self, protocol_data=None):
         """Internal implementation of save_session (runs in worker thread).
         
@@ -739,10 +801,28 @@ class TrafficGenClientMenuAction():
         # - Otherwise, preserve original servers from session.json (CLI mode)
         # - Ensure ServerManager is in sync before saving
         if hasattr(self, "server_manager") and self.server_interfaces:
-            # Sync ServerManager with current server_interfaces
-            # Reinitialize to ensure consistency (clear_existing=True to prevent duplicates)
-            self.server_manager.initialize_from_server_interfaces(self.server_interfaces, clear_existing=True)
-            logger.info(f"[SAVE SESSION] Synced ServerManager with {len(self.server_interfaces)} server(s)")
+            # Fingerprint the server list so we only rebuild the
+            # ServerManager when something actually changed. Previously
+            # every save re-registered every server from scratch — that
+            # caused noisy "Registered server: ..." log spam on every
+            # auto-save and burned cycles tearing down + rebuilding
+            # state that was already correct.
+            fp = tuple(sorted(
+                (s.get("address", ""), int(s.get("tg_id", 0)), bool(s.get("online", True)))
+                for s in self.server_interfaces
+            ))
+            last_fp = getattr(self, "_last_server_fp", None)
+            if fp != last_fp:
+                self.server_manager.initialize_from_server_interfaces(
+                    self.server_interfaces, clear_existing=True,
+                )
+                self._last_server_fp = fp
+                logger.info(
+                    f"[SAVE SESSION] Synced ServerManager with "
+                    f"{len(self.server_interfaces)} server(s)"
+                )
+            # Else: silently skip — same servers, same TG ids, same
+            # online flags as last save.
         
         # Check if we should preserve original servers (CLI mode without modifications)
         preserve_original = False
@@ -761,7 +841,6 @@ class TrafficGenClientMenuAction():
         if preserve_original:
             # CLI mode: preserve original servers from session.json (no changes made)
             servers_to_save = self.original_session_servers
-            logger.info(f"[SAVE SESSION] Preserving {len(servers_to_save)} original server(s) from session.json (CLI mode, no changes)")
         else:
             # Normal mode or CLI mode with modifications: save current servers
             # Clean server_interfaces to remove PyQt widget objects before saving
@@ -781,39 +860,74 @@ class TrafficGenClientMenuAction():
                     clean_server["interfaces"] = []
                     servers_to_save.append(clean_server)
             
+            # Demoted to debug. The "Saving N current server(s)" line
+            # used to fire on every save — including the trailing-edge
+            # no-op saves that follow real ones — making it look like
+            # the GUI was thrashing. The actual "✅ Session saved"
+            # log below is now the single user-visible signal that a
+            # write occurred.
             if getattr(self, 'server_url_from_cli', False):
-                logger.info(f"[SAVE SESSION] Saving {len(servers_to_save)} current server(s) (CLI mode, servers modified)")
+                logger.debug(f"[SAVE SESSION] Saving {len(servers_to_save)} current server(s) (CLI mode, servers modified)")
             else:
-                logger.info(f"[SAVE SESSION] Saving {len(servers_to_save)} current server(s)")
-        
+                logger.debug(f"[SAVE SESSION] Saving {len(servers_to_save)} current server(s)")
+
         # Clean up removed_servers - remove any servers that are currently in server_interfaces
         # This ensures that if a server was previously removed but then re-added, it won't be in removed_servers
         current_server_addresses = {s.get("address") for s in servers_to_save}
         cleaned_removed_servers = {addr for addr in self.removed_servers if addr not in current_server_addresses}
-        
-        # Assemble session data
+
+        # Assemble session data.
+        #
+        # NB: every container derived from a `set` is sorted before
+        # serialization. Python's `set` iteration order is not stable
+        # across calls (hash randomization, insertion/removal pattern),
+        # so `list(set)` would produce different orderings on otherwise
+        # identical saves — making the content hash differ even though
+        # nothing meaningful changed, which defeated the no-op
+        # short-circuit. Sorting makes the JSON canonical.
         session_data = {
             "servers": sanitize_for_json(servers_to_save),
-            "removed_interfaces": list(self.removed_interfaces),
-            "removed_servers": list(cleaned_removed_servers),  # Save cleaned removed servers
-            "selected_servers": [s["address"] for s in getattr(self, "selected_servers", [])],
+            "removed_interfaces": sorted(self.removed_interfaces),
+            "removed_servers": sorted(cleaned_removed_servers),
+            "selected_servers": sorted(
+                s["address"] for s in getattr(self, "selected_servers", [])
+            ),
             "streams": updated_streams,
             "devices": sanitize_for_json(device_rows),
             "removed_devices": sanitize_for_json(removed_devices),
             "protocols": sanitize_for_json(protocol_data) if protocol_data else {},
-            "bgp_route_pools": sanitize_for_json(bgp_route_pools)  # Save global route pools
+            "bgp_route_pools": sanitize_for_json(bgp_route_pools),  # Save global route pools
         }
-        
+
         # Store current device state for change tracking
         self.last_saved_devices = device_rows.copy()
+
+        # Content-hash short-circuit. The trailing-edge coalesce in
+        # save_session() was firing a follow-up write after every real
+        # save, even when nothing had changed in the 2 s gap. Now we
+        # serialize once, hash it, and only touch the disk when the
+        # hash differs from the last successful write. Identity-saves
+        # are silent: no log, no I/O, no chain re-arm.
+        try:
+            payload = json.dumps(session_data, indent=2, sort_keys=True, default=str)
+        except Exception as exc:
+            return False, f"[❌] Failed to serialize session: {exc}"
+        import hashlib
+        current_hash = hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        if getattr(self, "_last_session_hash", None) == current_hash:
+            # No-op: matches the last successful write byte-for-byte.
+            # Return success so callers don't think the save failed,
+            # but skip the disk I/O and the "✅ Session saved" log so
+            # the user-visible noise floor stays at zero.
+            return True, "no changes — skipped"
 
         # Save to disk using proper path utilities
         try:
             from utils.path_utils import get_session_file_path
             session_file = get_session_file_path()
-            # Writing to session file
             with open(session_file, "w") as f:
-                json.dump(session_data, f, indent=2)
+                f.write(payload)
+            self._last_session_hash = current_hash
             return True, "✅ Session saved successfully"
         except Exception as e:
             return False, f"[❌] Failed to save session: {e}"

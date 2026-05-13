@@ -201,39 +201,58 @@ check_prerequisites() {
         warn "On Ubuntu: sudo apt-get install sshpass"
     fi
     
-    # Check if wheel file exists (for wheel-only and full deployments)
+    # Check if wheel file exists (for wheel-only and full deployments).
+    # We use a `find` glob instead of a hardcoded version because the
+    # repo version has bumped several times since deploy.sh was first
+    # written — hardcoding caught us out when a fresh wheel sat in
+    # dist/ but the script kept looking for an old filename.
     if [[ "$DEPLOY_TYPE" == "wheel-only" || "$DEPLOY_TYPE" == "full" ]]; then
-        WHEEL_FILE="build_image/ostg_trafficgen-0.1.52-py3-none-any.whl"
-        if [[ ! -f "$WHEEL_FILE" ]]; then
-            # Fallback to root directory
-            WHEEL_FILE="ostg_trafficgen-0.1.52-py3-none-any.whl"
-        fi
-        if [[ ! -f "$WHEEL_FILE" ]]; then
+        WHEEL_FILE="$(_find_latest_wheel)"
+        if [[ -z "$WHEEL_FILE" ]]; then
             if [[ "$FORCE_REBUILD" == "true" ]]; then
                 info "Wheel file not found, rebuilding..."
                 ./rebuild_quick.sh
+                WHEEL_FILE="$(_find_latest_wheel)"
             else
                 error "Wheel file not found. Run './rebuild_quick.sh' first or use --force-rebuild"
             fi
         fi
+        info "Using wheel: $WHEEL_FILE"
     fi
-    
+
     success "Prerequisites check completed"
+}
+
+# Locate the freshest ostg_trafficgen wheel in any of the conventional
+# build-output directories. Used everywhere deploy.sh needs to know
+# the wheel filename — replaces 8 hardcoded version refs.
+_find_latest_wheel() {
+    # Prefer dist/ (modern python -m build output), fall back to
+    # build_image/ (legacy), then the repo root.
+    for dir in dist build_image .; do
+        if [[ -d "$dir" ]]; then
+            local newest
+            newest=$(ls -t "$dir"/ostg_trafficgen-*-py3-none-any.whl 2>/dev/null | head -n 1)
+            if [[ -n "$newest" ]]; then
+                echo "$newest"
+                return 0
+            fi
+        fi
+    done
+    return 1
 }
 
 # Rebuild project if needed
 rebuild_if_needed() {
     if [[ "$DEPLOY_TYPE" == "full" ]]; then
-        WHEEL_FILE="build_image/ostg_trafficgen-0.1.52-py3-none-any.whl"
-        if [[ ! -f "$WHEEL_FILE" ]]; then
-            WHEEL_FILE="ostg_trafficgen-0.1.52-py3-none-any.whl"
-        fi
-        if [[ "$FORCE_REBUILD" == "true" || ! -f "$WHEEL_FILE" ]]; then
+        WHEEL_FILE="$(_find_latest_wheel)"
+        if [[ "$FORCE_REBUILD" == "true" || -z "$WHEEL_FILE" ]]; then
             log "Rebuilding project..."
             ./rebuild_quick.sh
+            WHEEL_FILE="$(_find_latest_wheel)"
             success "Project rebuilt successfully"
         else
-            info "Using existing wheel file"
+            info "Using existing wheel: $WHEEL_FILE"
         fi
     fi
 }
@@ -245,11 +264,15 @@ copy_files_to_server() {
     case $DEPLOY_TYPE in
         full|wheel-only|source-only)
             debug "Copying wheel package..."
-            WHEEL_FILE="build_image/ostg_trafficgen-0.1.52-py3-none-any.whl"
-            if [[ ! -f "$WHEEL_FILE" ]]; then
-                WHEEL_FILE="ostg_trafficgen-0.1.52-py3-none-any.whl"
+            WHEEL_FILE="$(_find_latest_wheel)"
+            if [[ -z "$WHEEL_FILE" ]]; then
+                error "No wheel found — run ./rebuild_quick.sh"
             fi
+            debug "Wheel: $WHEEL_FILE"
             $SSHPASS_CMD -p "$SERVER_PASS" scp "$WHEEL_FILE" "$SERVER_USER@$SERVER_HOST:$SERVER_PATH/"
+            # Stash the basename so the pip-install + cleanup blocks
+            # downstream don't need to re-derive it.
+            WHEEL_BASENAME="$(basename "$WHEEL_FILE")"
             ;;
         config-only)
             debug "Copying configuration files only..."
@@ -311,15 +334,15 @@ deploy_on_server() {
                 log "Performing full deployment..."
                 # Install wheel package to /opt/OSTG (dependencies will also be installed there)
                 log "Installing wheel package to $SERVER_PATH..."
-                pip3 install --target $SERVER_PATH --force-reinstall $SERVER_PATH/ostg_trafficgen-0.1.52-py3-none-any.whl
+                pip3 install --target $SERVER_PATH --force-reinstall --no-deps $SERVER_PATH/$WHEEL_BASENAME
                 ;;
             wheel-only)
                 log "Installing wheel package to $SERVER_PATH..."
-                pip3 install --target $SERVER_PATH --force-reinstall $SERVER_PATH/ostg_trafficgen-0.1.52-py3-none-any.whl
+                pip3 install --target $SERVER_PATH --force-reinstall --no-deps $SERVER_PATH/$WHEEL_BASENAME
                 ;;
             source-only)
                 log "Source files are part of the wheel package. Installing to $SERVER_PATH..."
-                pip3 install --target $SERVER_PATH --force-reinstall $SERVER_PATH/ostg_trafficgen-0.1.52-py3-none-any.whl
+                pip3 install --target $SERVER_PATH --force-reinstall --no-deps $SERVER_PATH/$WHEEL_BASENAME
                 ;;
             config-only)
                 log "Updating configuration files only..."
@@ -357,30 +380,40 @@ deploy_on_server() {
         rm -rf \$EXTRACT_DIR 2>/dev/null || true
         mkdir -p \$EXTRACT_DIR
         
-        # Extract wheel (wheel is a zip file)
-        if python3 -m zipfile -e ostg_trafficgen-0.1.52-py3-none-any.whl \$EXTRACT_DIR 2>/dev/null || \
-           unzip -q ostg_trafficgen-0.1.52-py3-none-any.whl -d \$EXTRACT_DIR 2>/dev/null; then
+        # Extract wheel (wheel is a zip file). Path uses the basename
+        # we computed locally + scp'd up so the script keeps working
+        # across version bumps without code edits.
+        if python3 -m zipfile -e $WHEEL_BASENAME \$EXTRACT_DIR 2>/dev/null || \
+           unzip -q $WHEEL_BASENAME -d \$EXTRACT_DIR 2>/dev/null; then
             
-            # Copy ALL files from wheel to $SERVER_PATH, excluding metadata
-            # The wheel contains everything built by rebuild_quick.sh
+            # Copy ALL files from wheel to $SERVER_PATH, excluding metadata.
+            # The wheel contains everything built by rebuild_quick.sh.
+            #
+            # Per-item: nuke whatever's currently at the destination
+            # BEFORE copying. Without this, `cp -r resources/ /opt/OSTG/`
+            # fails when /opt/OSTG/resources exists as a file (or vice
+            # versa) — which is exactly what bit us last deploy:
+            #   cp: cannot overwrite non-directory '/opt/OSTG/resources'
+            #       with directory '/tmp/wheel_extract_ostg/resources'
             if [[ -d "\$EXTRACT_DIR" ]]; then
-                # Copy all files and directories, excluding dist-info metadata
                 find \$EXTRACT_DIR -mindepth 1 -maxdepth 1 ! -name "*.dist-info" ! -name "*.egg-info" | while read -r item; do
                     item_name="\$(basename "\$item")"
-                    # Skip metadata directories
-                    if [[ "\$item_name" != *"dist-info"* ]] && [[ "\$item_name" != *"egg-info"* ]]; then
-                        if [[ -d "\$item" ]]; then
-                            # Copy directory recursively
-                            cp -r "\$item" "$SERVER_PATH/"
-                            info "Copied directory \$item_name from wheel"
-                        elif [[ -f "\$item" ]]; then
-                            # Copy file
-                            cp "\$item" "$SERVER_PATH/"
-                            info "Copied file \$item_name from wheel"
-                        fi
+                    if [[ "\$item_name" == *"dist-info"* ]] || [[ "\$item_name" == *"egg-info"* ]]; then
+                        continue
+                    fi
+                    target="$SERVER_PATH/\$item_name"
+                    # Remove the existing destination (file OR directory)
+                    # so the copy can replace it cleanly.
+                    rm -rf "\$target"
+                    if [[ -d "\$item" ]]; then
+                        cp -r "\$item" "\$target"
+                        info "Copied directory \$item_name from wheel"
+                    elif [[ -f "\$item" ]]; then
+                        cp "\$item" "\$target"
+                        info "Copied file \$item_name from wheel"
                     fi
                 done
-                
+
                 info "Successfully extracted and deployed all files from wheel package"
             fi
         else
@@ -523,7 +556,9 @@ SERVICEEOF
         # Clean up wheel file if enabled
         if [[ "$CLEAN_TEMP" == "true" ]]; then
             log "Cleaning up wheel file..."
-            rm -f $SERVER_PATH/ostg_trafficgen-0.1.52-py3-none-any.whl
+            # Tidy up any wheel artefacts left in /opt/OSTG — we
+            # match the glob so old + new versions both get cleared.
+            rm -f $SERVER_PATH/ostg_trafficgen-*-py3-none-any.whl
         fi
         
         success "Deployment completed successfully!"

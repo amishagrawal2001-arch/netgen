@@ -320,7 +320,23 @@ class BGPStatusMonitor:
                 'total_neighbors': bgp_status['total_neighbors'],
                 'neighbors': bgp_status['bgp_neighbors']
             })
-            
+
+            # Per-protocol state-history timeline (de-dupes against last row,
+            # so steady-state Established polls don't bloat the table).
+            try:
+                self.device_db.add_state_transition(
+                    device_id,
+                    "bgp",
+                    bgp_status.get("bgp_state") or "Unknown",
+                    detail={
+                        "ipv4": bgp_status.get("bgp_ipv4_state"),
+                        "ipv6": bgp_status.get("bgp_ipv6_state"),
+                        "neighbors": bgp_status.get("total_neighbors"),
+                    },
+                )
+            except Exception as _e:
+                logger.debug(f"[BGP MONITOR] state-history insert skipped: {_e}")
+
             logger.info(f"[BGP MONITOR] ✅ Updated BGP status for device {device_id}: established={bgp_status['bgp_established']}, ipv4={bgp_status['bgp_ipv4_established']}, ipv6={bgp_status['bgp_ipv6_established']}, ipv4_state={bgp_status['bgp_ipv4_state']}, ipv6_state={bgp_status['bgp_ipv6_state']}")
             
         except Exception as e:

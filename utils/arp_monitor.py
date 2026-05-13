@@ -248,7 +248,22 @@ class ARPStatusMonitor:
                 'arp_status': arp_status['arp_status'],
                 'details': arp_status['details']
             })
-            
+
+            # Per-protocol state-history timeline (de-dup'd against last row).
+            try:
+                self.device_db.add_state_transition(
+                    device_id,
+                    "arp",
+                    arp_status.get('arp_status') or "Unknown",
+                    detail={
+                        "ipv4": arp_status.get('arp_ipv4_resolved'),
+                        "ipv6": arp_status.get('arp_ipv6_resolved'),
+                        "gateway": arp_status.get('arp_gateway_resolved'),
+                    },
+                )
+            except Exception as _e:
+                logger.debug(f"[ARP MONITOR] state-history insert skipped: {_e}")
+
             logger.debug(f"[ARP MONITOR] Updated ARP status for device {device_id}: {arp_status['arp_status']}")
             
         except Exception as e:

@@ -1,6 +1,20 @@
-# OSTG (Open Source Traffic Generator)
+# OSTG / Netgen (Open Source Traffic Generator)
 
 A comprehensive network traffic generation and device management system with support for various protocols including BGP, OSPF, IS-IS, and advanced traffic patterns.
+
+## What's New in 0.2.0
+
+See [CHANGELOG.md](CHANGELOG.md) for the full diff. Highlights:
+
+- **Per-device VRF isolation** — every managed FRR Docker container now sits in its own Linux VRF (`vrf-<short>`) so 10s of emulated devices on one host don't share a routing table.
+- **Topology tab** — a new IXNetwork-style canvas: port lane at the bottom, device cards with vertical protocol-stack chips (ETH / IPv4 / IPv6 / BGP / OSPF / ISIS / DHCP), status LEDs, cables, and a right-side property panel that updates on selection. See [Topology Tab](#topology-tab).
+- **Stateful TCP** — a real-socket parallel to the scapy stateless generator: actual 3-way handshakes, TLS, HTTP/1.1 framing, Linux VRF binding (`SO_BINDTODEVICE`), and `TCP_INFO` retransmit / RTT scraping. Surface at `/api/stateful_tcp/*` and `netgen-cli tcp`. See [Stateful TCP](#stateful-tcp).
+- **State-history timeline** — every protocol monitor writes a row on each observed state transition. `Ctrl+H` in the GUI shows a per-protocol timeline; `/api/device/database/devices/<id>/history[/<proto>]` exposes it programmatically.
+- **View Device Config** — `Ctrl+J` opens a read-only JSON viewer for the selected device's full server-side config, with copy-to-clipboard.
+- **Bearer-token auth** — opt-in via `NETGEN_AUTH_TOKEN`. `/api/health` stays exempt so k8s/HAProxy probes work without credentials.
+- **`netgen-cli`** — headless companion: `health`, `list`, `export`, `import`, `apply`, `status`, `wait`, plus full `tcp <subcommand>` for stateful sessions.
+- **GUI quality-of-life** — Apply progress bar, monitor-health indicator, filter bar, Retry Failed Apply, Settings dialog, and a complete keyboard-shortcut set (`Ctrl+Return / S / X / R / F / H / J`).
+- **36 pytest cases** covering VRF naming, stateful-TCP loopback echo / TLS / HTTP framing / VRF degrade / TCP_INFO degrade / dead-target, plus all legacy helpers.
 
 ## Table of Contents
 
@@ -11,6 +25,9 @@ A comprehensive network traffic generation and device management system with sup
 - [Architecture](#architecture)
 - [Client-Server Communication](#client-server-communication)
 - [Device Management](#device-management)
+- [Topology Tab](#topology-tab)
+- [Stateful TCP](#stateful-tcp)
+- [netgen-cli (Headless CLI)](#netgen-cli-headless-cli)
 - [Traffic Generation API](#traffic-generation-api)
 - [DPDK Multi-Queue Scaling](#dpdk-multi-queue-scaling)
 - [Protocol Configuration](#protocol-configuration)
@@ -19,42 +36,99 @@ A comprehensive network traffic generation and device management system with sup
 
 ## Installation
 
-### Quick Installation (Recommended)
+Pick the path that matches how you'll use Netgen:
 
-For a complete installation with Docker + FRR support:
+### A. Turnkey lab-in-a-box (server + GUI on one Linux host)
+
+Single command. Installs the wheel, builds the FRR Docker image,
+sets up DPDK + systemd, drops a desktop launcher for the GUI.
 
 ```bash
-# Clone the repository
 git clone <repository-url>
-cd OSTG
+cd netgen
+./rebuild_quick.sh                      # build the wheel (auto-versioned)
+sudo ./install_turnkey.sh               # full install + desktop launcher
+```
 
-# Build the wheel package
+After this:
+- Server runs as `systemctl status netgen-server`.
+- GUI launches from `Applications → Network → Netgen Client` or via
+  `ostg-client -s http://127.0.0.1:5050`.
+
+Flags pass through to the underlying server install:
+```bash
+sudo ./install_turnkey.sh --no-dpdk          # devbox with no DPDK NIC
+sudo ./install_turnkey.sh --skip-dpdk-build  # apt deps only
+```
+
+### B. Typical split (Linux server + operator laptop)
+
+**On the lab server** (one-time setup):
+```bash
+git clone <repository-url>
+cd netgen
+./rebuild_quick.sh
+sudo python3 install_ostg_complete.py
+# Or remote install from your laptop:
+python3 install_ostg_complete.py -H lab-box -u root -p password
+```
+
+**On your laptop** (or any operator machine):
+```bash
+./install_client.sh                                  # uses dist/*.whl
+./install_client.sh -s http://lab-box:5050           # pre-set server URL
+./install_client.sh path/to/ostg_trafficgen-*.whl    # explicit wheel
+./install_client.sh --upgrade                        # force re-install
+```
+
+`install_client.sh` auto-detects macOS / Linux / WSL, builds a per-user
+venv under `~/.netgen-client`, and drops a desktop launcher / .command
+wrapper. No root needed.
+
+### Updating an existing install
+
+```bash
+# Bump pyproject.toml version, then:
 ./rebuild_quick.sh
 
-# Install locally to /opt/OSTG
-sudo python3 install_ostg_complete.py
+# Server side:
+SERVER_HOST=lab-box ./deploy.sh -t wheel-only
 
-# Or install remotely to a server
-python3 install_ostg_complete.py -H server.com -u root -p password
+# Client side:
+./install_client.sh --upgrade
 ```
+
+Both paths auto-detect the wheel version now — no more
+`hardcoded-0.1.52-doesn't-match-actual-build` confusion.
+
+### macOS .dmg distribution (for shipping to customers)
+
+```bash
+./build_dmg.sh                       # Quick DMG (apps only)
+./build_macos_installer.sh           # Full installer (apps + wheel + docs)
+```
+
+Both auto-version from `pyproject.toml`. Output lands in `build_image/`.
 
 ### Development Environment Setup
 
-For development work with the GUI client:
+For local dev work without the install scripts:
 
 ```bash
-# Use the automated installation script
-./install_ostg_client_env.sh
-
-# Or manual setup
-python3 -m venv ostg_client_env
-source ostg_client_env/bin/activate
-pip install --find-links https://download.qt.io/snapshots/ci/pyqt5/5.15/wheels/ PyQt5
-pip install -r requirements.txt
+python3 -m venv venv
+source venv/bin/activate
 pip install -e .
+pip install -r requirements.txt
 ```
 
-**Note**: The GUI client automatically handles Qt platform plugin issues on macOS. If you encounter "Could not find the Qt platform plugin 'cocoa'" errors, ensure PyQt5 is installed from Qt's official wheels (not from source).
+Run `ostg-server` and `ostg-client` from the venv. `pytest -q tests/`
+runs the test suite.
+
+**Note**: PyQt5 on macOS is sensitive — if you hit "Could not find
+the Qt platform plugin 'cocoa'", install from Qt's official wheels:
+```bash
+pip install --find-links https://download.qt.io/snapshots/ci/pyqt5/5.15/wheels/ PyQt5
+```
 
 ## Script Overview
 
@@ -71,7 +145,9 @@ OSTG provides a comprehensive set of scripts for building, deploying, and instal
 - **`deploy_quick.sh`** - Interactive deployment wrapper
 
 ### 🏗️ Installation Scripts
-- **`install_ostg_complete.py`** - Complete system installation with all dependencies
+- **`install_turnkey.sh`** — Single-host install (server + GUI on the same Linux box). Wraps the complete installer + adds a desktop launcher.
+- **`install_client.sh`** — Client-only install (operator laptop, no Docker/DPDK). Detects macOS / Linux / WSL, builds a per-user venv under `~/.netgen-client`.
+- **`install_ostg_complete.py`** — Lab-server install (full Docker + FRR + DPDK + systemd). Local or remote via `-H`.
 
 ### 📊 Script Workflow
 
@@ -934,6 +1010,133 @@ curl -X POST http://localhost:5050/api/device/ping \
     "target": "192.168.1.1"
   }'
 ```
+
+## Topology Tab
+
+A new top-level tab modelled after IXIA IXNetwork's topology editor. It's a read-only fabric visualisation — to create or edit devices, use the Devices tab; the canvas re-renders from the device DB on Refresh.
+
+### Visual elements
+
+| Element | Meaning |
+| --- | --- |
+| **Port badge** (green pill at the bottom of each column) | One per unique server-side interface; labelled with the interface name and bound-device count. |
+| **Device card** (white rectangle with header + chip stack) | One per device. The header has a status LED, the device name, and an optional `[xN]` multiplicity badge. |
+| **Status LED** | Green = all configured protocols up, amber = some up, red = configured but none up, grey = nothing configured. |
+| **Protocol chip** | One per protocol the device has configured — ETH, IPv4, IPv6, BGP, OSPF, ISIS, DHCP. Fill turns green when that protocol is up. |
+| **Cable** (thick green curve) | Card → its port badge. |
+| **Peer edge** (thin line between cards) | BGP (solid grey), OSPF (dashed purple), IS-IS (dashed cyan). Multiple protocols between the same pair stack with a perpendicular offset. |
+
+### Controls
+
+- **Refresh** — pulls `/api/device/database/devices` on a `QThread` worker so the GUI stays responsive on slow servers.
+- **Reset layout** — clears saved positions for the current layout mode and re-runs the algorithm.
+- **Layout combo** — Hierarchical (default; ports at bottom, devices stacked above) or Circular. Position cache is per-mode so toggling doesn't clobber the other layout.
+- **Zoom**: scroll wheel (cursor-anchored), or the toolbar `+` / `−` / `Fit` buttons. Clamped to `[0.2×, 6×]`.
+- **Pan** — drag empty canvas.
+- **Drag a card** — repositions it. The cable and any peer edges re-route in real time.
+- **Click a card** — populates the **right-side property panel** with device metadata, per-protocol detail (peer addresses, AS, lease IP, etc.), and a "Recent transitions" block fetched asynchronously from the state-history endpoint.
+- **Double-click a card** — opens the full server-side JSON config in a read-only viewer with copy-to-clipboard.
+
+## Stateful TCP
+
+A real-socket TCP traffic generator that runs **in parallel** to the scapy-based stateless streams. Sessions here complete actual 3-way handshakes, so middleboxes, NAT, proxies, and load balancers see real connection state.
+
+### When to use which
+
+| Use case | Use… |
+| --- | --- |
+| Line-rate L2/L3 forwarding, latency under load | Scapy/DPDK streams (existing). |
+| "Does my middlebox proxy TCP correctly?" | Stateful TCP. |
+| HTTP-aware tests (WAF, reverse proxy, gateway) | Stateful TCP, `protocol=http`. |
+| TLS handshake testing | Stateful TCP, `tls=true`. |
+| Per-VRF source pinning | Stateful TCP, `vrf=<iface>` (Linux). |
+| Retransmit / kernel-RTT visibility | Stateful TCP, `TCP_INFO` (Linux). |
+
+### Quick example
+
+```bash
+# Echo server (loopback)
+netgen-cli tcp start-server --port 5001 --bind 127.0.0.1
+# → { "session_id": "9286ba6e-..." }
+
+# Fire a client at it for 10s, 4 parallel senders
+netgen-cli tcp start-client \
+  --dst-ip 127.0.0.1 --dst-port 5001 \
+  --duration 10 --concurrency 4 \
+  --payload-bytes 4096
+# → { "session_id": "47dce96a-..." }
+
+# Live stats
+netgen-cli tcp stats --session-id 47dce96a-...
+# → { "counters": { "conns_established": 8120, "bytes_tx": 33259520, ... } }
+
+# Stop everything
+netgen-cli tcp stop
+```
+
+### HTTP / TLS
+
+```bash
+# HTTP 1.1 echo (POST → 200 OK, Content-Length-framed)
+netgen-cli tcp start-server --port 8080 --protocol http --response-bytes 4096
+netgen-cli tcp start-client --dst-ip 127.0.0.1 --dst-port 8080 \
+    --protocol http --duration 10 --concurrency 8
+# stats: http_status_2xx counter increments per round-trip
+
+# TLS — self-signed cert (test environments)
+netgen-cli tcp start-server --port 8443 \
+    --tls --tls-cert cert.pem --tls-key key.pem
+netgen-cli tcp start-client --dst-ip 127.0.0.1 --dst-port 8443 \
+    --tls --duration 10
+# (tls_verify defaults to off — set --tls-verify to enforce CA + hostname)
+```
+
+### VRF binding (Linux)
+
+```bash
+# Pin client source onto a per-device VRF
+netgen-cli tcp start-client \
+    --dst-ip 10.0.0.5 --dst-port 5001 \
+    --vrf vrf-abc12345 --src-ip 10.0.0.10
+```
+
+On macOS / Windows the `--vrf` flag is a no-op and surfaces a warning on `last_error`; traffic still flows via the main routing table.
+
+### What's surfaced in counters
+
+Per session the registry returns:
+- `conns_attempted / conns_established / conns_failed`
+- `bytes_tx / bytes_rx`
+- `avg_handshake_ms` — userspace `connect()` time
+- `avg_rtt_ms` — userspace round-trip including send + recv
+- `avg_kernel_rtt_us`, `kernel_rtt_samples` — from `TCP_INFO.rtt_us` (Linux)
+- `retransmits_total` — from `TCP_INFO.total_retrans` (Linux)
+- `http_status_2xx / http_status_other` — only when `protocol=http`
+- `last_error` — string snapshot of the most recent error (TLS handshake fail, bind error, etc.)
+
+## netgen-cli (Headless CLI)
+
+`netgen-cli` is the headless companion to the GUI — every common multi-device workflow is one command. Useful in CI, tmux panes, and SSH sessions without an X display.
+
+```bash
+netgen-cli health                                      # /api/health + monitor health
+netgen-cli list                                        # device DB rows
+netgen-cli export -o devices.json                      # snapshot topology
+netgen-cli import -f devices.json --wait               # restore + wait for ARP
+netgen-cli apply -f one_device.json --wait             # apply a single device
+netgen-cli status -i 47dce96a-...                      # device + protocol status
+netgen-cli wait -i 47dce96a-... --timeout 60           # block until ARP resolves
+
+netgen-cli tcp start-client --dst-ip ... --dst-port ...
+netgen-cli tcp start-server --port ...
+netgen-cli tcp stop [--session-id ...]
+netgen-cli tcp list
+netgen-cli tcp stats --session-id ...
+```
+
+**Server URL**: defaults to `$NETGEN_SERVER_URL`, else `http://localhost:5050`. Override with `-s URL`.
+
+**Auth**: if `$NETGEN_AUTH_TOKEN` is set, every request gets `Authorization: Bearer …` automatically (matches the GUI's behaviour).
 
 ## Traffic Generation API
 
