@@ -46,9 +46,26 @@ packages.find = { exclude = ["backup*", "*.backup.*", "*.tmp", "*.temp"] }
 py-modules = ["multithreaded_traffic_gen", "run_tgen_client", "run_tgen_server", "capture_client", "setup_docker", "netgen_cli"]
 
 [tool.setuptools.package-data]
-"resources" = ["**/*"]
+# NB: `"resources" = ["**/*"]` would recurse into resources/dpdk/ and
+# resources/icons/, sweeping in everything regardless of what we set
+# on those subpackages. Keep this entry empty/marker-only; the real
+# data lives in the subpackages.
+"resources" = ["__init__.py"]
 "resources.icons" = ["**/*"]
-"resources.dpdk" = ["**/*"]
+# resources.dpdk: enumerate explicit globs rather than "**/*". The
+# tx_worker/build/ subtree is a per-host artifact rebuilt by
+# install_dpdk.sh step 6 against the host's libdpdk; shipping a stale
+# binary from the dev machine wastes wheel space (~300 KB) and tempts
+# anyone debugging to run the wrong tx_worker against the host's DPDK
+# ABI. setuptools' exclude-package-data doesn't reliably override a
+# `**/*` include, so we whitelist instead.
+"resources.dpdk" = [
+    "*.sh",
+    "__init__.py",
+    "tx_worker/*.c",
+    "tx_worker/*.h",
+    "tx_worker/meson.build",
+]
 "ostg_docker" = ["**/*"]
 
 [tool.pytest.ini_options]
