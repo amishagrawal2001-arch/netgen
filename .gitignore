@@ -49,7 +49,12 @@ htmlcov/
 .tox/
 
 # Build artifacts
+# Default-ignore PyInstaller specs except the project's own — those
+# are tracked because they encode the build matrix.
 *.spec
+!ostg_client.spec
+!ostg_server.spec
+!ostg_client_windows.spec
 build_image/dist_macos/
 
 # Backup files

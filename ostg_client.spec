@@ -1,6 +1,32 @@
 # -*- mode: python ; coding: utf-8 -*-
+#
+# PyInstaller spec for the Netgen GUI client — macOS .app bundle.
+#
+# Invoked by build_dmg.sh / build_macos_installer.sh. Version is read
+# from pyproject.toml at build time so the .app's CFBundleVersion
+# matches the wheel exactly — no more hardcoded 0.1.52 surprises.
 
+import os
+import re
+
+
+def _parse_version():
+    """Read `version = "..."` from pyproject.toml in repo root."""
+    pyproject = os.path.join(SPECPATH, "pyproject.toml")
+    try:
+        with open(pyproject, "r", encoding="utf-8") as fh:
+            for line in fh:
+                m = re.match(r'^\s*version\s*=\s*"([^"]+)"', line)
+                if m:
+                    return m.group(1)
+    except Exception:
+        pass
+    return "0.0.0"
+
+
+VERSION = _parse_version()
 block_cipher = None
+
 
 a = Analysis(
     ['run_tgen_client.py'],
@@ -11,25 +37,26 @@ a = Analysis(
         ('widgets', 'widgets'),
         ('traffic_client', 'traffic_client'),
         ('utils', 'utils'),
+        ('server', 'server'),
     ],
     excludes=['backup', 'backup.*', '*.backup.*', '*.tmp', '*.temp'],
     hiddenimports=[
         'PyQt5.QtCore',
-        'PyQt5.QtGui', 
+        'PyQt5.QtGui',
         'PyQt5.QtWidgets',
         'requests',
         'scapy',
+        'scapy.contrib.lacp',
+        'scapy.contrib.lldp',
+        'scapy.contrib.igmp',
+        'scapy.contrib.igmpv3',
+        'scapy.contrib.pim',
+        'scapy.layers.vrrp',
         'docker',
         'flask',
-        'json',
-        'logging',
-        'ipaddress',
-        'uuid',
-        'subprocess',
-        'threading',
-        'time',
-        'os',
-        'sys',
+        'flask_cors',
+        'cryptography',
+        'paramiko',
     ],
     hookspath=[],
     hooksconfig={},
@@ -47,7 +74,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='OSTG Client',
+    name='Netgen Client',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -69,22 +96,22 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='OSTG Client',
+    name='Netgen Client',
 )
 
 app = BUNDLE(
     coll,
-    name='OSTG Client.app',
+    name='Netgen Client.app',
     icon='resources/icons/add.png',
-    bundle_identifier='com.ostg.trafficgen.client',
+    bundle_identifier='com.netgen.trafficgen.client',
     info_plist={
-        'CFBundleName': 'OSTG Client',
-        'CFBundleDisplayName': 'OSTG Traffic Generator Client',
-        'CFBundleIdentifier': 'com.ostg.trafficgen.client',
-        'CFBundleVersion': '0.1.52',
-        'CFBundleShortVersionString': '0.1.52',
+        'CFBundleName': 'Netgen Client',
+        'CFBundleDisplayName': 'Netgen Traffic Generator Client',
+        'CFBundleIdentifier': 'com.netgen.trafficgen.client',
+        'CFBundleVersion': VERSION,
+        'CFBundleShortVersionString': VERSION,
         'CFBundleInfoDictionaryVersion': '6.0',
-        'CFBundleExecutable': 'OSTG Client',
+        'CFBundleExecutable': 'Netgen Client',
         'CFBundlePackageType': 'APPL',
         'CFBundleSignature': '????',
         'NSHighResolutionCapable': True,
@@ -92,9 +119,3 @@ app = BUNDLE(
         'NSRequiresAquaSystemAppearance': False,
     },
 )
-
-# Override dist directory for macOS builds
-import os
-if os.environ.get('MACOS_BUILD'):
-    coll.dist = 'dist_macos'
-    app.dist = 'dist_macos'

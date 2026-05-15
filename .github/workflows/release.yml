@@ -1,0 +1,188 @@
+# Build multi-platform installers and attach to a GitHub release.
+#
+# Triggers:
+#   * Tag push matching v*  →  full release with all 4 artifacts
+#   * Manual workflow_dispatch  →  builds without creating a release
+#
+# Artifacts produced:
+#   * ostg_trafficgen-<v>-py3-none-any.whl                 (universal)
+#   * Netgen-Client-<v>-windows.exe                        (PyInstaller one-file)
+#   * Netgen-TrafficGenerator-<v>.dmg                      (macOS)
+#   * Netgen-Client-<v>-linux-x86_64.AppImage              (Linux universal)
+#
+# Why split across 3 runners: PyInstaller is OS-native and can't
+# cross-build. The wheel itself is universal so we only need to
+# build it once.
+
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+
+  # ───────────────────────────────────────────────────────────────────
+  # 1. Wheel  (universal, runs anywhere — we use Ubuntu for speed)
+  # ───────────────────────────────────────────────────────────────────
+  build-wheel:
+    name: Wheel (universal)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel
+
+      - name: Upload wheel artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: wheel
+          path: dist/*.whl
+
+  # ───────────────────────────────────────────────────────────────────
+  # 2. macOS .dmg
+  # ───────────────────────────────────────────────────────────────────
+  build-macos:
+    name: macOS .dmg
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install build deps
+        run: |
+          python -m pip install --upgrade pip
+          # build_dmg.sh expects ostg_client_env to exist; create one
+          # with the runtime deps so PyInstaller can resolve hidden
+          # imports during its analysis pass.
+          python -m venv ostg_client_env
+          source ostg_client_env/bin/activate
+          pip install --upgrade pip wheel
+          pip install pyinstaller pillow
+          pip install -r requirements.txt
+
+      - name: Build DMG
+        run: |
+          # Tools the script expects on PATH
+          brew install create-dmg || true
+          source ostg_client_env/bin/activate
+          ./build_dmg.sh
+
+      - name: Upload DMG artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-dmg
+          path: build_image/*.dmg
+
+  # ───────────────────────────────────────────────────────────────────
+  # 3. Windows .exe
+  # ───────────────────────────────────────────────────────────────────
+  build-windows:
+    name: Windows .exe
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build Windows .exe
+        shell: pwsh
+        run: |
+          .\build_windows.ps1
+
+      - name: Upload .exe artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-exe
+          path: dist/Netgen-Client-*-windows.exe
+
+  # ───────────────────────────────────────────────────────────────────
+  # 4. Linux .AppImage
+  # ───────────────────────────────────────────────────────────────────
+  build-appimage:
+    name: Linux .AppImage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install Linux build deps
+        run: |
+          sudo apt-get update
+          # Qt5 plugin deps + fuse for AppImage runtime + libGL for PyQt5
+          sudo apt-get install -y \
+              libxcb-icccm4 libxcb-image0 libxcb-keysyms1 libxcb-randr0 \
+              libxcb-render-util0 libxcb-xinerama0 libxcb-xkb1 \
+              libxkbcommon-x11-0 libgl1 libegl1 fuse libfuse2
+
+      - name: Build AppImage
+        run: |
+          chmod +x build_appimage.sh
+          ./build_appimage.sh
+
+      - name: Upload AppImage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-appimage
+          path: dist/Netgen-Client-*-linux-*.AppImage
+
+  # ───────────────────────────────────────────────────────────────────
+  # 5. Publish release (only on tag push)
+  # ───────────────────────────────────────────────────────────────────
+  release:
+    name: Publish GitHub release
+    needs: [build-wheel, build-macos, build-windows, build-appimage]
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write     # required to create/update releases
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+
+      - name: Flatten artifacts directory
+        run: |
+          # Each upload-artifact lands in its own subdir; flatten so
+          # `gh release create *.{whl,dmg,exe,AppImage}` works.
+          mkdir -p release-assets
+          find artifacts/ -type f \
+              \( -name "*.whl" -o -name "*.dmg" \
+                 -o -name "*.exe" -o -name "*.AppImage" \) \
+              -exec cp {} release-assets/ \;
+          ls -la release-assets/
+
+      - name: Generate release notes from CHANGELOG
+        run: |
+          # Pull all 0.2.x sections from CHANGELOG.md as the release body.
+          awk '/^## \[0\.2\./{flag=1} /^## \[0\.1\./{flag=0} flag' CHANGELOG.md > release-notes.md
+          head -3 release-notes.md
+
+      - name: Create / update release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: release-notes.md
+          files: release-assets/*
+          fail_on_unmatched_files: true
+          # Don't clobber a manually-edited release if one exists for this tag.
+          generate_release_notes: false

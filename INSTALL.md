@@ -1,8 +1,49 @@
 # Netgen Install Guide
 
-Six install scenarios across two profiles (turnkey vs split) and three
-operator platforms (Linux / macOS / Windows). Pick the row that matches
-your deployment and follow the linked steps.
+Two install methods, six deployment scenarios.
+
+## Option A — Pre-built installer (fastest)
+
+Download from the latest **[GitHub release](https://github.com/amishagrawal2001-arch/netgen/releases/latest)**.
+Every tagged release ships four artifacts built by CI:
+
+| File | Use for |
+|------|---------|
+| `Netgen-Client-<v>-windows.exe`           | Windows client, no Python install needed |
+| `Netgen-TrafficGenerator-<v>.dmg`         | macOS client, drag-to-Applications |
+| `Netgen-Client-<v>-linux-x86_64.AppImage` | Linux client, single-file, works on any modern distro |
+| `ostg_trafficgen-<v>-py3-none-any.whl`    | Universal wheel — for the server install + scripted client installs |
+
+### Quick install per platform (Option A)
+
+**Windows**:  download the `.exe` → double-click → done. The bundled
+Python + PyQt5 + all deps make it a single-file install.
+
+**macOS**:  download the `.dmg` → mount → drag **Netgen Client.app**
+to `Applications` → launch from Spotlight or Launchpad.
+
+**Linux** (any modern distro):
+```bash
+chmod +x Netgen-Client-*-linux-x86_64.AppImage
+./Netgen-Client-*-linux-x86_64.AppImage -s http://lab-box:5050
+```
+
+**Server** (Linux box that owns the NICs):
+```bash
+# Download the wheel + the repo's install_ostg_complete.py
+wget https://github.com/amishagrawal2001-arch/netgen/releases/latest/download/ostg_trafficgen-VERSION-py3-none-any.whl
+git clone --depth 1 https://github.com/amishagrawal2001-arch/netgen.git netgen-installer
+sudo python3 netgen-installer/install_ostg_complete.py
+```
+
+That's it for Option A. For finer control or to customize before shipping,
+see Option B below.
+
+---
+
+## Option B — Build from source (full control)
+
+Pick the row that matches your deployment and follow the linked steps.
 
 ## Quick chooser
 
@@ -357,3 +398,56 @@ ostg-client -s http://lab-box:5050   # Linux / macOS
 # Or on Windows:
 & "$env:USERPROFILE\.netgen-client\Scripts\ostg-client.exe"
 ```
+
+---
+
+## Building installers from source
+
+If you're cutting a customer-shippable release locally (or want to
+build a variant the GitHub Actions CI doesn't produce), each platform
+has its own build script.
+
+| Platform | Build script | Output |
+|---|---|---|
+| **Windows** (PyInstaller .exe) | `.\build_windows.ps1`               | `dist\Netgen-Client-<v>-windows.exe`               |
+| **macOS** (drag-to-Applications .dmg) | `./build_dmg.sh`            | `build_image/Netgen-TrafficGenerator-<v>.dmg`      |
+| **macOS** (full installer DMG) | `./build_macos_installer.sh`         | `build_image/Netgen-TrafficGenerator-<v>-macOS.dmg` (includes wheel + docs) |
+| **Linux** (universal AppImage) | `./build_appimage.sh`                | `dist/Netgen-Client-<v>-linux-<arch>.AppImage`     |
+
+All build scripts auto-detect the version from `pyproject.toml`. Bump
+the version once and every script re-builds correctly.
+
+Constraints:
+- **PyInstaller is OS-native** — no cross-builds. To produce a
+  Windows .exe you need a Windows build host. Same for macOS → .dmg
+  and Linux → .AppImage. The GitHub Actions workflow handles this by
+  matrix-running across `windows-latest`, `macos-latest`, and
+  `ubuntu-latest`; trigger it with a `git tag v<x.y.z> && git push --tags`.
+- **AppImage requires FUSE on the build host** (`apt install fuse libfuse2`).
+- **Code-signing is not currently wired up** — macOS users will see
+  the "unidentified developer" warning on first launch (right-click →
+  Open). Windows users get a SmartScreen warning. Signing identities
+  can be added later via env-var secrets in the GitHub Actions
+  workflow.
+
+### Continuous-integration release flow
+
+`.github/workflows/release.yml` runs the full build matrix on every
+tag push:
+
+```bash
+# Bump pyproject.toml, then:
+git tag -a v0.2.5 -m "v0.2.5"
+git push target v0.2.5
+```
+
+The workflow:
+1. Builds the universal wheel on Ubuntu
+2. Builds the .dmg on macOS
+3. Builds the .exe on Windows
+4. Builds the .AppImage on Ubuntu
+5. Pulls release notes from `CHANGELOG.md`
+6. Creates the GitHub release with all four artifacts attached
+
+Customers can `wget` the platform installer they want straight from
+the release page.
