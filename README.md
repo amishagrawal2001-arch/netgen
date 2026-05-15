@@ -2,19 +2,48 @@
 
 A comprehensive network traffic generation and device management system with support for various protocols including BGP, OSPF, IS-IS, and advanced traffic patterns.
 
-## What's New in 0.2.0
+## What's New in 0.2.5
 
 See [CHANGELOG.md](CHANGELOG.md) for the full diff. Highlights:
 
-- **Per-device VRF isolation** — every managed FRR Docker container now sits in its own Linux VRF (`vrf-<short>`) so 10s of emulated devices on one host don't share a routing table.
-- **Topology tab** — a new IXNetwork-style canvas: port lane at the bottom, device cards with vertical protocol-stack chips (ETH / IPv4 / IPv6 / BGP / OSPF / ISIS / DHCP), status LEDs, cables, and a right-side property panel that updates on selection. See [Topology Tab](#topology-tab).
-- **Stateful TCP** — a real-socket parallel to the scapy stateless generator: actual 3-way handshakes, TLS, HTTP/1.1 framing, Linux VRF binding (`SO_BINDTODEVICE`), and `TCP_INFO` retransmit / RTT scraping. Surface at `/api/stateful_tcp/*` and `netgen-cli tcp`. See [Stateful TCP](#stateful-tcp).
-- **State-history timeline** — every protocol monitor writes a row on each observed state transition. `Ctrl+H` in the GUI shows a per-protocol timeline; `/api/device/database/devices/<id>/history[/<proto>]` exposes it programmatically.
-- **View Device Config** — `Ctrl+J` opens a read-only JSON viewer for the selected device's full server-side config, with copy-to-clipboard.
-- **Bearer-token auth** — opt-in via `NETGEN_AUTH_TOKEN`. `/api/health` stays exempt so k8s/HAProxy probes work without credentials.
-- **`netgen-cli`** — headless companion: `health`, `list`, `export`, `import`, `apply`, `status`, `wait`, plus full `tcp <subcommand>` for stateful sessions.
-- **GUI quality-of-life** — Apply progress bar, monitor-health indicator, filter bar, Retry Failed Apply, Settings dialog, and a complete keyboard-shortcut set (`Ctrl+Return / S / X / R / F / H / J`).
-- **36 pytest cases** covering VRF naming, stateful-TCP loopback echo / TLS / HTTP framing / VRF degrade / TCP_INFO degrade / dead-target, plus all legacy helpers.
+- **Prebuilt installers** — every tagged release on GitHub now ships
+  four artifacts built by CI: `.exe` (Windows client), `.dmg` (macOS
+  client), `.AppImage` (Linux client), and the universal `.whl`
+  (server + scripted client installs). Operators no longer need a
+  Python toolchain to run the GUI. See [INSTALL.md](INSTALL.md)
+  Option A.
+- **Windows install path** — `install_client.ps1` / `install_client.bat`
+  parallel to `install_client.sh`: per-user venv, Desktop + Start
+  Menu shortcuts, no admin required.
+- **Per-device VRF isolation** — every managed FRR Docker container
+  sits in its own Linux VRF (`vrf-<short>`) so 10s of emulated devices
+  on one host don't share a routing table.
+- **Topology tab** — IXNetwork-style canvas: port lane at the bottom,
+  device cards with vertical protocol-stack chips
+  (ETH / IPv4 / IPv6 / BGP / OSPF / ISIS / DHCP), status LEDs, cables,
+  and a right-side property panel. See [Topology Tab](#topology-tab).
+- **Stateful TCP** — real-socket parallel to the scapy stateless
+  generator: actual 3-way handshakes, TLS, HTTP/1.1 framing, Linux
+  VRF binding (`SO_BINDTODEVICE`), and `TCP_INFO` retransmit / RTT
+  scraping. `/api/stateful_tcp/*` and `netgen-cli tcp`.
+  See [Stateful TCP](#stateful-tcp).
+- **State-history timeline** — every protocol monitor writes a row
+  on each observed state transition. `Ctrl+H` in the GUI shows a
+  per-protocol timeline; `/api/device/database/devices/<id>/history[/<proto>]`
+  exposes it programmatically.
+- **View Device Config** — `Ctrl+J` opens a read-only JSON viewer
+  for the selected device's full server-side config, copy-to-clipboard.
+- **Bearer-token auth** — opt-in via `NETGEN_AUTH_TOKEN`. `/api/health`
+  stays exempt so k8s/HAProxy probes work without credentials.
+- **`netgen-cli`** — headless companion: `health`, `list`, `export`,
+  `import`, `apply`, `status`, `wait`, plus full `tcp <subcommand>`
+  for stateful sessions.
+- **GUI quality-of-life** — Apply progress bar, monitor-health
+  indicator, filter bar, Retry Failed Apply, Settings dialog, and a
+  complete keyboard-shortcut set (`Ctrl+Return / S / X / R / F / H / J`).
+- **36 pytest cases** covering VRF naming, stateful-TCP loopback
+  echo / TLS / HTTP framing / VRF degrade / TCP_INFO degrade /
+  dead-target, plus all legacy helpers.
 
 ## Table of Contents
 
@@ -38,7 +67,22 @@ See [CHANGELOG.md](CHANGELOG.md) for the full diff. Highlights:
 
 For the complete install matrix (all six profiles: turnkey / split ×
 Linux / macOS / Windows) see [INSTALL.md](INSTALL.md). Quick
-chooser below for the two most common paths:
+chooser below for the three most common paths:
+
+### 0. Just the client, no Python toolchain (download prebuilt)
+
+Operators who only need the GUI can grab a prebuilt installer from
+the **[latest GitHub release](https://github.com/amishagrawal2001-arch/netgen/releases/latest)**:
+
+| File | Platform |
+|------|----------|
+| `Netgen-Client-<v>-windows.exe`           | Windows |
+| `Netgen-TrafficGenerator-<v>.dmg`         | macOS — drag-to-Applications |
+| `Netgen-Client-<v>-linux-x86_64.AppImage` | Linux — `chmod +x` then run |
+| `ostg_trafficgen-<v>-py3-none-any.whl`    | Universal — for the server install |
+
+The server still has to run on Linux (see option A or B below); these
+are client-only bundles.
 
 ### A. Turnkey lab-in-a-box (server + GUI on one Linux host)
 
@@ -139,8 +183,10 @@ OSTG provides a comprehensive set of scripts for building, deploying, and instal
 ### 🏗️ Build Scripts
 - **`rebuild_quick.sh`** - Fast wheel package build for development
 - **`rebuild_wheel.sh`** - Comprehensive wheel package build for production
-- **`build_dmg.sh`** - Simple macOS DMG installer (apps only)
-- **`build_macos_installer.sh`** - Complete macOS DMG installer (full package)
+- **`build_dmg.sh`** - macOS DMG installer (client-only; server is Linux-only)
+- **`build_macos_installer.sh`** - macOS DMG installer (alternate full-package flow)
+- **`build_windows.ps1`** - Windows `.exe` builder (PyInstaller one-file)
+- **`build_appimage.sh`** - Linux `.AppImage` builder (single-file portable)
 
 ### 🚀 Deployment Scripts
 - **`deploy.sh`** - Flexible deployment to remote servers
@@ -149,7 +195,11 @@ OSTG provides a comprehensive set of scripts for building, deploying, and instal
 ### 🏗️ Installation Scripts
 - **`install_turnkey.sh`** — Single-host install (server + GUI on the same Linux box). Wraps the complete installer + adds a desktop launcher.
 - **`install_client.sh`** — Client-only install (operator laptop, no Docker/DPDK). Detects macOS / Linux / WSL, builds a per-user venv under `~/.netgen-client`.
+- **`install_client.ps1`** / **`install_client.bat`** — Windows client install (PowerShell + double-click wrapper). Per-user venv at `%USERPROFILE%\.netgen-client`, Desktop + Start Menu shortcuts.
 - **`install_ostg_complete.py`** — Lab-server install (full Docker + FRR + DPDK + systemd). Local or remote via `-H`.
+
+### 🤖 CI / Release
+- **`.github/workflows/release.yml`** — On every `v*` tag, builds the wheel + macOS `.dmg` + Windows `.exe` + Linux `.AppImage` in parallel and attaches them to a GitHub release. Release notes are extracted from `CHANGELOG.md`.
 
 ### 📊 Script Workflow
 
