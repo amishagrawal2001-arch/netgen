@@ -15,3 +15,10 @@ exclude backup/**
 exclude *.backup.*
 exclude *.tmp
 exclude *.temp
+
+# DPDK tx_worker: ship the source (tx_worker.c + meson.build) only.
+# install_dpdk.sh step 6 rebuilds the binary against the host's DPDK,
+# so the build/ tree from any dev machine is stale by definition and
+# would mislead anyone who tries to run it directly.
+recursive-exclude resources/dpdk/tx_worker/build *
+prune resources/dpdk/tx_worker/build

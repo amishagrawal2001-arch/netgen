@@ -350,7 +350,13 @@ step_install_dependencies() {
     #   harmless on non-Mellanox boxes (just adds ~30 MB of unused libs),
     #   but skipping them on a Mellanox-equipped box silently disables the
     #   mlx5 PMD at meson-config time so DPDK can't drive those NICs at all.
-    local deps_install_cmd="apt-get install -y --option Acquire::http::Timeout=30 --option Acquire::ftp::Timeout=30 build-essential meson ninja-build pkg-config libnuma-dev libelf-dev libpcap-dev libibverbs-dev libmlx5-dev rdma-core"
+    # linux-headers-$(uname -r): vfio-pci is in-tree on stock Ubuntu / Debian
+    # kernels, but cloud / minimal images (Azure, GCP, container-optimized)
+    # frequently strip the modules and need the matching headers to either
+    # rebuild vfio-pci or to compile out-of-tree NIC PMD modules at runtime.
+    # Cheap to install (~80 MB) and silent no-op when already present.
+    local kernel_headers="linux-headers-$(uname -r 2>/dev/null || echo generic)"
+    local deps_install_cmd="apt-get install -y --option Acquire::http::Timeout=30 --option Acquire::ftp::Timeout=30 build-essential meson ninja-build pkg-config libnuma-dev libelf-dev libpcap-dev libibverbs-dev libmlx5-dev rdma-core ${kernel_headers}"
     
     # Try to install dependencies
     if eval "$deps_install_cmd" 2>&1 | tee /tmp/dpdk_deps_install.log; then
@@ -651,7 +657,7 @@ step_configure_hugepages() {
     
     log_info "Setting $pages hugepages..."
     echo "$pages" > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
-    
+
     # Verify
     local new_total=$(grep HugePages_Total /proc/meminfo | awk '{print $2}')
     if [[ $new_total -ge $pages ]]; then
@@ -659,6 +665,19 @@ step_configure_hugepages() {
     else
         log_warning "Requested $pages pages but got $new_total (may need more memory)"
     fi
+
+    # Persist across reboots. Writing to /sys is volatile — reboot wipes
+    # hugepages and the next netgen-server start fails to allocate any
+    # mbufs. Drop a sysctl snippet so systemd-sysctl restores the
+    # allocation on boot.
+    local sysctl_conf="/etc/sysctl.d/99-netgen-hugepages.conf"
+    log_info "Persisting hugepages config to $sysctl_conf ..."
+    cat > "$sysctl_conf" <<EOF
+# Written by Netgen install_dpdk.sh — DPDK 2 MB hugepages.
+# Increase / decrease and run \`sysctl --system\` to apply without reboot.
+vm.nr_hugepages = $pages
+EOF
+    log_success "Hugepages persisted: $sysctl_conf"
 }
 
 # Step 8: NIC binding (optional)
