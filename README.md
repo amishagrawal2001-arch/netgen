@@ -36,7 +36,9 @@ See [CHANGELOG.md](CHANGELOG.md) for the full diff. Highlights:
 
 ## Installation
 
-Pick the path that matches how you'll use Netgen:
+For the complete install matrix (all six profiles: turnkey / split ×
+Linux / macOS / Windows) see [INSTALL.md](INSTALL.md). Quick
+chooser below for the two most common paths:
 
 ### A. Turnkey lab-in-a-box (server + GUI on one Linux host)
 
