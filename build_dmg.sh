@@ -62,7 +62,7 @@ fi
 
 # Clean previous builds
 log "Cleaning previous builds..."
-rm -rf build/ dist_macos/ "OSTG Client.app" "OSTG Server.app"
+rm -rf build/ dist_macos/ "Netgen Client.app" "Netgen Server.app"
 rm -rf build_image/dist_macos/
 
 # Exclude backup folder from build
@@ -72,42 +72,32 @@ log "Excluding backup folder from packaging..."
 log "Building macOS applications..."
 
 # Build client app
-log "Building OSTG Client app..."
+log "Building Netgen Client app..."
 MACOS_BUILD=1 pyinstaller -y ostg_client.spec
 
 # Check if apps were built in dist/ and move them to build_image/dist_macos/
-if [[ -d "dist/OSTG Client.app" ]]; then
-    log "Moving OSTG Client.app to build_image/dist_macos/"
+if [[ -d "dist/Netgen Client.app" ]]; then
+    log "Moving Netgen Client.app to build_image/dist_macos/"
     mkdir -p build_image/dist_macos
-    mv "dist/OSTG Client.app" "build_image/dist_macos/"
-    # Remove the empty OSTG Client directory if it exists
-    [[ -d "dist/OSTG Client" ]] && rm -rf "dist/OSTG Client"
+    mv "dist/Netgen Client.app" "build_image/dist_macos/"
+    # Remove the empty Netgen Client directory if it exists
+    [[ -d "dist/Netgen Client" ]] && rm -rf "dist/Netgen Client"
 fi
 
-if [[ ! -d "build_image/dist_macos/OSTG Client.app" ]]; then
-    error "Failed to build OSTG Client app"
+if [[ ! -d "build_image/dist_macos/Netgen Client.app" ]]; then
+    error "Failed to build Netgen Client app"
 fi
 
-# Build server app
-log "Building OSTG Server app..."
-MACOS_BUILD=1 pyinstaller -y ostg_server.spec
+# macOS Server.app is intentionally NOT built. Netgen-server needs
+# Linux kernel features (DPDK, VRFs, iproute2 / systemd) that don't
+# exist on macOS. Shipping a Server.app would mislead customers into
+# thinking they can run a full Netgen server on a Mac. The DMG ships
+# the client only; operators who want a server on a Mac for protocol-
+# correctness testing run `pip install ostg_trafficgen-*.whl` and
+# `ostg-server --no-dpdk` manually — see INSTALL.md scenario #2.
 
-# Check if server app was built in dist/ and move it to dist_macos/
-if [[ -d "dist/OSTG Server.app" ]]; then
-    log "Moving OSTG Server.app to build_image/dist_macos/"
-    mv "dist/OSTG Server.app" "build_image/dist_macos/"
-fi
-
-if [[ ! -d "build_image/dist_macos/OSTG Server.app" ]]; then
-    error "Failed to build OSTG Server app"
-fi
-
-# Get app sizes
-CLIENT_SIZE=$(du -sh "build_image/dist_macos/OSTG Client.app" | cut -f1)
-SERVER_SIZE=$(du -sh "build_image/dist_macos/OSTG Server.app" | cut -f1)
-
-log "✓ OSTG Client.app built ($CLIENT_SIZE)"
-log "✓ OSTG Server.app built ($SERVER_SIZE)"
+CLIENT_SIZE=$(du -sh "build_image/dist_macos/Netgen Client.app" | cut -f1)
+log "✓ Netgen Client.app built ($CLIENT_SIZE)"
 
 # Create quick DMG installer
 log "Creating DMG installer..."
@@ -119,38 +109,37 @@ mkdir "$DMG_DIR"
 
 # Create README for temp directory
 cat > "$DMG_DIR/README.md" << 'EOF'
-# OSTG DMG Temporary Directory
+# Netgen DMG Temporary Directory
 
-This is a temporary directory created during the DMG build process.
+Build-time scratch directory; cleaned up after DMG creation.
 
 ## Contents
-- OSTG Client.app - macOS client application
-- OSTG Server.app - macOS server application
-- README.txt - Installation instructions
-
-## Note
-This directory is automatically cleaned up after DMG creation.
+- Netgen Client.app — macOS GUI client
+- README.txt — install + usage notes
 EOF
 
-# Copy the apps to the DMG directory
-cp -R "build_image/dist_macos/OSTG Client.app" "$DMG_DIR/"
-cp -R "build_image/dist_macos/OSTG Server.app" "$DMG_DIR/"
+# Copy the client app to the DMG directory
+cp -R "build_image/dist_macos/Netgen Client.app" "$DMG_DIR/"
 
-# Create a simple README
+# Create a user-facing README
 cat > "$DMG_DIR/README.txt" << EOF
-OSTG Traffic Generator v${OSTG_VERSION}
+Netgen Traffic Generator — Client v${OSTG_VERSION}
 
 Quick Start:
-1. Drag OSTG Client.app to Applications folder
-2. Drag OSTG Server.app to Applications folder
-3. Launch OSTG Client.app to start the GUI
-4. Launch OSTG Server.app to start the server
+1. Drag "Netgen Client.app" to your Applications folder
+2. Launch from Applications or Spotlight
+3. Point it at your Netgen server URL (lab box, cloud, etc.)
+
+The Netgen *server* is Linux-only — it depends on DPDK kernel modules,
+Linux VRFs, and iproute2 commands that don't exist on macOS. Install
+the server on a Linux host (see install_ostg_complete.py in the repo)
+and point this client at it via the GUI's server-URL field.
 
 Requirements:
 - macOS 10.13 or later
-- Docker Desktop (for FRR containers)
+- A reachable Netgen server (port 5050 by default)
 
-For full installation with dependencies, use the complete installer.
+For full install matrix + source-build paths, see INSTALL.md in the repo.
 EOF
 
 # Create Applications shortcut
@@ -158,7 +147,7 @@ ln -s /Applications "$DMG_DIR/Applications"
 
 # Create the DMG in build_image directory
 mkdir -p build_image
-hdiutil create -volname "OSTG Traffic Generator" \
+hdiutil create -volname "Netgen Traffic Generator" \
                -srcfolder "$DMG_DIR" \
                -ov -format UDZO \
                "build_image/$DMG_NAME"
@@ -178,12 +167,11 @@ log "🎉 DMG build completed!"
 log ""
 log "📦 DMG Installer: build_image/$DMG_NAME"
 log "📱 Applications:"
-log "   - OSTG Client.app ($CLIENT_SIZE)"
-log "   - OSTG Server.app ($SERVER_SIZE)"
+log "   - Netgen Client.app ($CLIENT_SIZE)"
 log ""
 log "🚀 To use:"
 log "   1. open 'build_image/$DMG_NAME'"
-log "   2. Drag apps to Applications folder"
+log "   2. Drag Netgen Client.app to Applications folder"
 log "   3. Launch from Applications"
 log ""
 log "💡 For complete installation with dependencies, use:"

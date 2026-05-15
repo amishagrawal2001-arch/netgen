@@ -157,22 +157,22 @@ build_apps() {
     log "Building macOS applications..."
     
     # Build client app
-    log "Building OSTG Client app..."
+    log "Building Netgen Client app..."
     MACOS_BUILD=1 pyinstaller -y ostg_client.spec
     
-    if [[ ! -d "dist_macos/OSTG Client.app" ]]; then
-        error "Failed to build OSTG Client app"
+    if [[ ! -d "dist_macos/Netgen Client.app" ]]; then
+        error "Failed to build Netgen Client app"
     fi
-    success "OSTG Client app built"
+    success "Netgen Client app built"
     
     # Build server app
-    log "Building OSTG Server app..."
+    log "Building Netgen Server app..."
     MACOS_BUILD=1 pyinstaller -y ostg_server.spec
     
-    if [[ ! -d "dist_macos/OSTG Server.app" ]]; then
-        error "Failed to build OSTG Server app"
+    if [[ ! -d "dist_macos/Netgen Server.app" ]]; then
+        error "Failed to build Netgen Server app"
     fi
-    success "OSTG Server app built"
+    success "Netgen Server app built"
 }
 
 # Create installer package
@@ -185,8 +185,8 @@ create_installer_package() {
     
     # Copy applications
     log "Copying applications..."
-    cp -R "dist_macos/OSTG Client.app" "$INSTALLER_DIR/"
-    cp -R "dist_macos/OSTG Server.app" "$INSTALLER_DIR/"
+    cp -R "dist_macos/Netgen Client.app" "$INSTALLER_DIR/"
+    cp -R "dist_macos/Netgen Server.app" "$INSTALLER_DIR/"
     
     # Copy wheel package
     WHEEL_FILE=$(find dist/ -name "*.whl" | head -1)
@@ -330,8 +330,8 @@ install_ostg() {
     mkdir -p "$INSTALL_DIR"
     
     # Copy applications
-    cp -R "OSTG Client.app" "$INSTALL_DIR/"
-    cp -R "OSTG Server.app" "$INSTALL_DIR/"
+    cp -R "Netgen Client.app" "$INSTALL_DIR/"
+    cp -R "Netgen Server.app" "$INSTALL_DIR/"
     
     # Copy wheel package if present
     WHEEL_FILE=$(find . -name "*.whl" | head -1)
@@ -359,8 +359,8 @@ install_ostg() {
     
     # Create desktop shortcuts (if on desktop)
     if [[ -d "$HOME/Desktop" ]]; then
-        ln -sf "$INSTALL_DIR/OSTG Client.app" "$HOME/Desktop/OSTG Client"
-        ln -sf "$INSTALL_DIR/OSTG Server.app" "$HOME/Desktop/OSTG Server"
+        ln -sf "$INSTALL_DIR/Netgen Client.app" "$HOME/Desktop/Netgen Client"
+        ln -sf "$INSTALL_DIR/Netgen Server.app" "$HOME/Desktop/Netgen Server"
     fi
     
     log "OSTG installed to: $INSTALL_DIR"
@@ -379,16 +379,16 @@ main() {
     log "🎉 Installation completed successfully!"
     log ""
     log "📱 Applications installed:"
-    log "   - OSTG Client.app (GUI client)"
-    log "   - OSTG Server.app (Server application)"
+    log "   - Netgen Client.app (GUI client)"
+    log "   - Netgen Server.app (Server application)"
     log ""
     log "🚀 To start OSTG:"
-    log "   1. Open 'OSTG Client.app' from Applications or Desktop"
-    log "   2. Or run server: open '$HOME/Applications/OSTG/OSTG Server.app'"
+    log "   1. Open 'Netgen Client.app' from Applications or Desktop"
+    log "   2. Or run server: open '$HOME/Applications/OSTG/Netgen Server.app'"
     log ""
     log "📋 Next steps:"
     log "   1. Start Docker Desktop"
-    log "   2. Launch OSTG Client"
+    log "   2. Launch Netgen Client"
     log "   3. Configure your network interfaces"
     log "   4. Set up BGP neighbors"
 }
@@ -440,25 +440,25 @@ main() {
     fi
     
     # Remove desktop shortcuts
-    if [[ -L "$HOME/Desktop/OSTG Client" ]]; then
-        rm "$HOME/Desktop/OSTG Client"
-        log "Removed desktop shortcut: OSTG Client"
+    if [[ -L "$HOME/Desktop/Netgen Client" ]]; then
+        rm "$HOME/Desktop/Netgen Client"
+        log "Removed desktop shortcut: Netgen Client"
     fi
     
-    if [[ -L "$HOME/Desktop/OSTG Server" ]]; then
-        rm "$HOME/Desktop/OSTG Server"
-        log "Removed desktop shortcut: OSTG Server"
+    if [[ -L "$HOME/Desktop/Netgen Server" ]]; then
+        rm "$HOME/Desktop/Netgen Server"
+        log "Removed desktop shortcut: Netgen Server"
     fi
     
     # Remove from Applications folder if present
-    if [[ -d "/Applications/OSTG Client.app" ]]; then
-        rm -rf "/Applications/OSTG Client.app"
-        log "Removed: /Applications/OSTG Client.app"
+    if [[ -d "/Applications/Netgen Client.app" ]]; then
+        rm -rf "/Applications/Netgen Client.app"
+        log "Removed: /Applications/Netgen Client.app"
     fi
     
-    if [[ -d "/Applications/OSTG Server.app" ]]; then
-        rm -rf "/Applications/OSTG Server.app"
-        log "Removed: /Applications/OSTG Server.app"
+    if [[ -d "/Applications/Netgen Server.app" ]]; then
+        rm -rf "/Applications/Netgen Server.app"
+        log "Removed: /Applications/Netgen Server.app"
     fi
     
     log ""
@@ -486,8 +486,8 @@ Advanced Network Traffic Generator with BGP/OSPF Support for macOS
 
 ## 📦 Package Contents
 
-- **OSTG Client.app** - GUI client application
-- **OSTG Server.app** - Server application
+- **Netgen Client.app** - GUI client application
+- **Netgen Server.app** - Server application
 - **install_ostg.sh** - Installation script
 - **uninstall_ostg.sh** - Uninstallation script
 - **ostg_trafficgen-${OSTG_VERSION}-py3-none-any.whl** - Python wheel package
@@ -499,8 +499,8 @@ Advanced Network Traffic Generator with BGP/OSPF Support for macOS
 ## 🚀 Quick Start
 
 ### Option 1: GUI Applications (Recommended)
-1. Double-click **OSTG Client.app** to launch the GUI client
-2. Double-click **OSTG Server.app** to launch the server
+1. Double-click **Netgen Client.app** to launch the GUI client
+2. Double-click **Netgen Server.app** to launch the server
 
 ### Option 2: Full Installation
 1. Run the installation script:
@@ -537,24 +537,24 @@ The installation script will automatically install:
 ## 📖 Usage
 
 ### Starting the Client
-1. Launch **OSTG Client.app**
+1. Launch **Netgen Client.app**
 2. Connect to server (default: http://localhost:5051)
 3. Configure network interfaces
 4. Add BGP neighbors and route pools
 5. Start traffic generation
 
 ### Starting the Server
-1. Launch **OSTG Server.app**
+1. Launch **Netgen Server.app**
 2. Server starts on port 5051 (configurable)
 3. Wait for client connections
 
 ### Command Line Usage
 \`\`\`bash
 # Start server
-open "OSTG Server.app"
+open "Netgen Server.app"
 
 # Start client
-open "OSTG Client.app"
+open "Netgen Client.app"
 \`\`\`
 
 ## 🔧 Configuration
@@ -585,7 +585,7 @@ OSTG uses Docker to run FRR (Free Range Routing) containers:
    - Ensure Docker daemon is running
 
 2. **Port already in use**
-   - Change server port in OSTG Server.app
+   - Change server port in Netgen Server.app
    - Or stop conflicting services
 
 3. **Permission denied**
@@ -593,8 +593,8 @@ OSTG uses Docker to run FRR (Free Range Routing) containers:
    - Check network interface permissions
 
 ### Logs and Debugging
-- **Server logs**: Check OSTG Server.app console
-- **Client logs**: Check OSTG Client.app console
+- **Server logs**: Check Netgen Server.app console
+- **Client logs**: Check Netgen Client.app console
 - **Docker logs**: \`docker logs <container_name>\`
 
 ## 🗑️ Uninstallation
@@ -695,8 +695,8 @@ main() {
     log ""
     log "📦 Installer Package: $DMG_NAME"
     log "📱 Applications Built:"
-    log "   - OSTG Client.app"
-    log "   - OSTG Server.app"
+    log "   - Netgen Client.app"
+    log "   - Netgen Server.app"
     log ""
     log "🚀 Distribution Ready:"
     log "   - Self-contained macOS applications"
@@ -707,7 +707,7 @@ main() {
     log "📋 To test the installer:"
     log "   1. open '$DMG_NAME'"
     log "   2. Run install_ostg.sh"
-    log "   3. Launch OSTG Client.app"
+    log "   3. Launch Netgen Client.app"
     log ""
     
     # Ask if user wants to clean up
