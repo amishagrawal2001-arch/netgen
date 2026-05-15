@@ -2,6 +2,43 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.5] - 2026-05-13
+
+Distribution-only release — adds the multi-platform installer pipeline
+and CI workflow that builds prebuilt artifacts for every platform on
+tag push. No code/feature changes; functionally equivalent to 0.2.4.
+
+### Added — multi-platform installer pipeline
+- `build_windows.ps1` + `ostg_client_windows.spec` — PyInstaller
+  single-file `.exe` for Windows. Includes VS_VERSION_INFO so the
+  Explorer right-click → Properties tab shows the right version, no
+  hidden cmd.exe window behind the GUI, `-Folder` flag for a faster-
+  startup one-folder build.
+- `build_appimage.sh` — Linux universal AppImage. Wraps a PyInstaller
+  one-folder dist in an AppDir + AppRun + .desktop and squashes it
+  with appimagetool. Works on any modern distro — Ubuntu / Debian /
+  RHEL / Rocky / Fedora / Arch / SUSE — without package-manager fuss.
+- `build_dmg.sh` already shipped a `.dmg`; this release fixes its
+  PyInstaller spec to (a) read version from `pyproject.toml`,
+  (b) include the new `server/` package, (c) declare L2-protocol
+  scapy contrib modules as hidden imports.
+- `.github/workflows/release.yml` — CI matrix that runs on every
+  `v*` tag push. Builds wheel (Ubuntu), .dmg (macOS), .exe (Windows),
+  .AppImage (Ubuntu) in parallel; pulls release notes from
+  CHANGELOG.md; creates the GitHub release with all four artifacts
+  attached. Manual `workflow_dispatch` trigger also enabled for
+  testing the matrix without cutting a release.
+
+### Added — install docs
+- `INSTALL.md` restructured: **Option A** (download a pre-built
+  installer from the Releases page) is now the recommended path;
+  **Option B** (build from source) kept for devs and operators who
+  want control.
+
+### Changed
+- `.gitignore` adds an explicit exception for the three project-owned
+  PyInstaller specs so `*.spec` doesn't block them every time.
+
 ## [0.2.4] - 2026-05-12
 
 L2 frame generators + multicast protocols. Five new periodic-emitter
