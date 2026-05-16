@@ -62,6 +62,10 @@ See [CHANGELOG.md](CHANGELOG.md) for the full diff. Highlights:
   - [Installing DPDK on the Linux server](#installing-dpdk-on-the-linux-server)
 - [Protocol Configuration](#protocol-configuration)
 - [Monitoring and Troubleshooting](#monitoring-and-troubleshooting)
+  - [Server Admin Portal (`/admin`)](#server-admin-portal-admin)
+  - [Consolidated health JSON](#consolidated-health-json)
+  - [systemd + journalctl](#systemd--journalctl)
+  - [Health probe + SSE event stream](#health-probe--sse-event-stream)
 - [Examples](#examples)
 
 ## Installation
@@ -1572,6 +1576,113 @@ curl -G http://localhost:5050/api/frr/status
 ```
 
 ## Monitoring and Troubleshooting
+
+Netgen exposes two server-side monitoring surfaces — a built-in web
+admin portal and the systemd/log layer. Both come pre-installed with
+`install_ostg_complete.py` / `install_turnkey.sh`.
+
+### Server Admin Portal (`/admin`)
+
+Single-page UI at `http://<server>:5050/admin`. Auth-exempt (so it
+works before you set `NETGEN_AUTH_TOKEN`). Renders inline — no
+separate template files, no static assets to deploy.
+
+What it shows / lets you do:
+
+| Panel | Shows | Action |
+|---|---|---|
+| Server health | hostname, port, libdpdk version, IOMMU enabled?, vfio module state, hugepages allocated, tx_worker built? | refresh |
+| DPDK install | live tail of `install_dpdk.sh` log | **"Install DPDK"** button → runs `install_dpdk.sh --auto` in the background |
+| Interfaces | All NICs with PCI BDF, kernel driver, NUMA node, IP, bind state. Recovers original name after vfio binding via `/tmp/netgen_admin_bind_history.json` | bind to vfio-pci / rebind to kernel per row |
+| Hugepages | current `nr_hugepages` per NUMA node | reconfigure |
+| IOMMU | reads `/proc/cmdline` for `intel_iommu=on` / `amd_iommu=on` | warns if missing |
+
+All underlying actions are also callable via curl:
+
+```bash
+# Consolidated health (scrape-friendly)
+curl http://lab-box:5050/api/admin/health | jq
+
+# DPDK control
+curl http://lab-box:5050/api/dpdk/status
+curl http://lab-box:5050/api/dpdk/interfaces
+curl -X POST http://lab-box:5050/api/dpdk/bind   -d '{"pci":"0000:01:00.0"}'
+curl -X POST http://lab-box:5050/api/dpdk/unbind -d '{"pci":"0000:01:00.0"}'
+curl http://lab-box:5050/api/dpdk/verify
+curl -X POST http://lab-box:5050/api/dpdk/hugepages   -d '{"pages":1024}'
+curl -X POST http://lab-box:5050/api/dpdk/iommu                  # checks /proc/cmdline
+curl -X POST http://lab-box:5050/api/dpdk/load_modules           # modprobe vfio-pci
+
+# Trigger install + tail log
+curl -X POST http://lab-box:5050/api/admin/install_dpdk
+curl http://lab-box:5050/api/admin/install_dpdk/log
+```
+
+### Consolidated health JSON
+
+`GET /api/admin/health` returns one structured payload covering
+everything the dashboard panels show — designed for scraping into
+Prometheus, Nagios, or a `watch -n 5 curl ...` loop:
+
+```json
+{
+  "hostname": "lab-box",
+  "netgen_server": {"port": 5050},
+  "dpdk":      {"installed": true,  "version": "23.11.0"},
+  "iommu":     {"enabled": true,    "cmdline_excerpt": "...intel_iommu=on iommu=pt..."},
+  "vfio":      {"vfio_pci_loaded": true, "vfio_loaded": true},
+  "hugepages": {"total": 1024, "free": 1024, "size_kb": 2048},
+  "tx_worker": {"present": true, "path": "/opt/OSTG/resources/dpdk/tx_worker/build/tx_worker"},
+  "install_running": false
+}
+```
+
+### systemd + journalctl
+
+The server runs as a systemd unit installed by
+`install_ostg_complete.py`. Use the normal Linux tools:
+
+```bash
+# Service state
+sudo systemctl status netgen-server
+
+# Live log tail
+sudo journalctl -u netgen-server -f
+
+# Last 200 lines
+sudo journalctl -u netgen-server -n 200 --no-pager
+
+# Restart / stop / start
+sudo systemctl restart netgen-server
+```
+
+Log files under `/var/log/`:
+
+| File | Source |
+|---|---|
+| `/var/log/netgen-install-dpdk.log` | DPDK install (written by `install_ostg_complete.py`) |
+| `journalctl -u netgen-server`      | server stdout/stderr |
+
+### Health probe + SSE event stream
+
+For external uptime checks (HAProxy / k8s / Nagios) — auth-exempt,
+tiny payload:
+
+```bash
+curl -fsS http://lab-box:5050/api/health
+# → 200 {"status":"ok",...}  on success, non-2xx on failure
+```
+
+For dashboards / client GUIs that want real-time protocol-state
+transitions:
+
+```bash
+# Server-Sent Events — emits one line per state change, never closes
+curl -N http://lab-box:5050/api/events/stream
+
+# Snapshot of the in-memory ring buffer
+curl    http://lab-box:5050/api/events/status
+```
 
 ### Network Interface Monitoring
 
