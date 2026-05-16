@@ -621,6 +621,35 @@ step_build_tx_worker() {
 #   ldconfig
 EOF
     log_success "Library path configuration documented"
+
+    # Step 6.2: Expose tx_worker at the paths the server's admin probe checks.
+    #
+    # install_dpdk.sh resolves SCRIPT_DIR from $BASH_SOURCE — wherever it was
+    # invoked from. Operators often run it directly from a git checkout
+    # (e.g. /root/netgen/resources/dpdk/install_dpdk.sh), so the binary lands
+    # under /root/netgen/.../tx_worker/build/tx_worker. Meanwhile the
+    # server's /api/admin/health probe (run_tgen_server.py ~L12960) only
+    # checks /opt/netgen/.../, /opt/OSTG/.../, and /usr/local/bin/tx_worker.
+    # Result: admin portal reports "tx_worker binary Not built" even though
+    # the binary exists and works. Bridge the gap by symlinking into the
+    # canonical roots and dropping a copy on PATH.
+    local _txw="$SCRIPT_DIR/tx_worker/build/tx_worker"
+    if [[ -x "$_txw" ]]; then
+        for canon in /opt/netgen/resources/dpdk/tx_worker/build \
+                     /opt/OSTG/resources/dpdk/tx_worker/build; do
+            if [[ -d "$(dirname "$canon")" ]]; then
+                mkdir -p "$canon"
+                ln -sfn "$_txw" "$canon/tx_worker"
+                log_success "Linked tx_worker → $canon/tx_worker"
+            fi
+        done
+        # Stash a copy on PATH so ad-hoc invocations (`tx_worker --help`) work
+        # without LD_LIBRARY_PATH gymnastics — the wrapper in
+        # utils/dpdk_tx_worker.py handles env setup when launched via the API.
+        if install -m755 "$_txw" /usr/local/bin/tx_worker 2>/dev/null; then
+            log_success "Installed tx_worker to /usr/local/bin/tx_worker"
+        fi
+    fi
 }
 
 # Step 7: Configure hugepages
