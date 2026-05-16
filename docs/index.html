@@ -675,13 +675,64 @@
 
 <!-- What's new -->
 <section class="block quickstart" id="whats-new">
-  <h2>What's new in 0.2.2.</h2>
-  <p>The 0.2.x line lands operator-grade visibility, real-socket stateful
-     traffic with four L7 protocols (raw, HTTP/1.1, DNS-over-TCP, SIP),
-     live event push via Server-Sent Events, per-role auth, and one-click
-     templates for both device profiles and traffic streams.</p>
+  <h2>What's new in 0.2.5.</h2>
+  <p>0.2.5 is a packaging release: prebuilt installers for Windows /
+     macOS / Linux drop on every tag via CI, and the Linux DPDK install
+     path picks up <code>linux-headers</code>, persistent hugepages,
+     and a smaller wheel. The 0.2.x line as a whole lands operator-
+     grade visibility, real-socket stateful traffic with four L7
+     protocols, live event push via Server-Sent Events, per-role auth,
+     one-click templates, and a self-contained <code>/admin</code>
+     server console.</p>
 
   <div class="features" style="grid-template-columns: 1fr 1fr;">
+
+    <div class="feature">
+      <div class="ico">📦</div>
+      <h3>Prebuilt installers — Windows / macOS / Linux <span class="pill ok" style="font-size:10px;margin-left:6px;">0.2.5</span></h3>
+      <p>Every tagged release on GitHub now ships four CI-built
+         artifacts: <code>Netgen-Client-&lt;v&gt;-windows.exe</code>,
+         <code>Netgen-TrafficGenerator-&lt;v&gt;.dmg</code>,
+         <code>Netgen-Client-&lt;v&gt;-linux-x86_64.AppImage</code>,
+         and the universal
+         <code>ostg_trafficgen-&lt;v&gt;-py3-none-any.whl</code>.
+         Operators no longer need a Python toolchain — download the
+         right file, double-click, point at the server URL. Matrix
+         build runs on <code>ubuntu-latest</code> /
+         <code>macos-latest</code> / <code>windows-latest</code>;
+         CHANGELOG release notes attach automatically.</p>
+    </div>
+
+    <div class="feature">
+      <div class="ico">🛠️</div>
+      <h3>DPDK install: kernel-headers, persistent hugepages, slimmer wheel <span class="pill ok" style="font-size:10px;margin-left:6px;">0.2.5</span></h3>
+      <p><code>install_dpdk.sh</code>'s apt list now includes
+         <code>linux-headers-$(uname -r)</code> so vfio-pci loads on
+         cloud / minimal kernels that strip the module. Hugepages
+         survive reboots via
+         <code>/etc/sysctl.d/99-netgen-hugepages.conf</code> — no
+         more "EAL: No free hugepages" after the host bounces. The
+         wheel dropped ~190 KB (1.55 MB → 1.36 MB) by excluding the
+         stale prebuilt <code>tx_worker/build/</code> tree —
+         <code>install_dpdk.sh</code> step 6 rebuilds it against the
+         host's libdpdk anyway, so shipping the dev-machine binary
+         was both dead weight and an ABI-mismatch footgun.</p>
+    </div>
+
+    <div class="feature">
+      <div class="ico">🖥️</div>
+      <h3>Server admin portal — <code>/admin</code> <span class="pill ok" style="font-size:10px;margin-left:6px;">0.2.x</span></h3>
+      <p>Single-page web UI baked into the server at
+         <code>http://&lt;host&gt;:5050/admin</code>. Inline HTML/JS —
+         no static assets, no template files. Shows libdpdk version,
+         IOMMU state, vfio module state, hugepages, tx_worker
+         presence; lists NICs with per-row vfio-pci bind / rebind
+         buttons; tails <code>install_dpdk.sh</code> live with an
+         "Install DPDK" trigger button. Auth-exempt so it works
+         before <code>NETGEN_AUTH_TOKEN</code> is set. Consolidated
+         JSON at <code>GET /api/admin/health</code> for Prometheus /
+         Nagios scraping.</p>
+    </div>
 
     <div class="feature">
       <div class="ico">📡</div>
@@ -1084,7 +1135,11 @@
 <!-- Quickstart -->
 <section class="block quickstart" id="quickstart">
   <h2>Three commands to first packet.</h2>
-  <p>One installer brings DPDK + Mellanox drivers + tx_worker + server. The client is a single Python module.</p>
+  <p>One installer brings DPDK + Mellanox drivers + tx_worker + server.
+     The client is a prebuilt
+     <code>.exe</code>&thinsp;/&thinsp;<code>.dmg</code>&thinsp;/&thinsp;<code>.AppImage</code>
+     from the GitHub release, or a single Python module if you'd rather
+     build it yourself.</p>
 
   <div class="qs-grid">
     <div>
@@ -1092,38 +1147,42 @@
         <div class="num">1</div>
         <div>
           <h4>Install on the server</h4>
-          <p>Apt-retry hardened against flaky mirrors; pulls DPDK 23.11, mlx5 PMD, hugepages config, and the netgen Flask server.</p>
+          <p>Apt-retry hardened against flaky mirrors; pulls DPDK 23.11, mlx5 PMD, kernel headers, persistent hugepages, and the netgen Flask server. Run it once.</p>
         </div>
       </div>
       <div class="qs-step">
         <div class="num">2</div>
         <div>
-          <h4>Start the client</h4>
-          <p>PyQt5 GUI connects to the server, discovers interfaces, and renders the streams table with live stats polling.</p>
+          <h4>Grab the client installer</h4>
+          <p>Download the matching artifact from the latest GitHub release — <code>.exe</code> for Windows, <code>.dmg</code> for macOS, <code>.AppImage</code> for Linux. No Python toolchain needed.</p>
         </div>
       </div>
       <div class="qs-step">
         <div class="num">3</div>
         <div>
           <h4>Add a stream and hit Start</h4>
-          <p>Right-click an interface, configure the stream, optionally tick "Enable DPDK" and "Enable timestamps" — done.</p>
+          <p>Point the client at <code>http://&lt;your-server&gt;:5050</code>, right-click an interface, configure the stream, optionally tick "Enable DPDK" and "Enable timestamps" — done.</p>
         </div>
       </div>
     </div>
 
     <div>
 <pre><code><span style="color:#94a3b8"># On the server (Ubuntu 22.04+)</span>
-sudo python3 install_ostg_complete.py
-
-<span style="color:#94a3b8"># Launch the server</span>
-sudo netgen-server --port 5050
-
-<span style="color:#94a3b8"># On your laptop</span>
 git clone https://github.com/DAY-Advisor/NetGenI.git
 cd NetGenI
-pip install -r requirements.txt
-python3 -m traffic_client \
-    --server http://&lt;your-server&gt;:5050</code></pre>
+./rebuild_quick.sh
+sudo python3 install_ostg_complete.py
+
+<span style="color:#94a3b8"># Server runs as a systemd unit</span>
+sudo systemctl status netgen-server
+
+<span style="color:#94a3b8"># Server admin console — open in a browser</span>
+<span style="color:#94a3b8"># http://&lt;your-server&gt;:5050/admin</span>
+
+<span style="color:#94a3b8"># Client: grab the prebuilt installer from GitHub releases</span>
+<span style="color:#94a3b8">#   github.com/.../releases/latest</span>
+<span style="color:#94a3b8"># Or build from source:</span>
+./install_client.sh -s http://&lt;your-server&gt;:5050</code></pre>
     </div>
   </div>
 </section>
