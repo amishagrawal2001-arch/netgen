@@ -182,7 +182,25 @@ class TrafficGenClientMenuAction():
         for item in selected_items:
             if item.parent() is None:  # Ensure it's a top-level item (server)
                 server_address = item.text(1)  # Server address column
-                tg_id = item.text(0)  # TG ID column
+                tg_id_text = item.text(0)  # TG ID column (string, may be "TG 1" or "1")
+
+                # Normalize tg_id to the bare integer the rest of the
+                # codebase uses for cache keys ("TG 1 - eth0").
+                tg_id_numeric = None
+                # Try tree text first
+                try:
+                    tg_id_numeric = int(str(tg_id_text).replace("TG ", "").strip())
+                except (ValueError, TypeError):
+                    pass
+                # Fallback: look up by server_address in server_interfaces
+                if tg_id_numeric is None:
+                    for s in self.server_interfaces:
+                        if s.get("address") == server_address:
+                            try:
+                                tg_id_numeric = int(s.get("tg_id"))
+                            except (ValueError, TypeError):
+                                pass
+                            break
 
                 # Add server to removed_servers set
                 self.removed_servers.add(server_address)
@@ -194,14 +212,14 @@ class TrafficGenClientMenuAction():
                     server_id = ServerManager._extract_server_id_from_url(server_address)
                     self.server_manager.unregister_server(server_id)
                     logger.info(f"[REMOVE SERVER] Unregistered server {server_id} from ServerManager")
-                
+
                 self.server_interfaces = [
                     server for server in self.server_interfaces if server["address"] != server_address
                 ]
 
                 # Remove related entries from removed_interfaces
                 self.removed_interfaces = {
-                    port for port in self.removed_interfaces if not port.startswith(f"{tg_id} - ")
+                    port for port in self.removed_interfaces if not port.startswith(f"{tg_id_text} - ")
                 }
 
                 # Remove the selected server from selected_servers if applicable
@@ -212,6 +230,19 @@ class TrafficGenClientMenuAction():
                 # Remove the server item from the tree
                 index = self.server_tree.indexOfTopLevelItem(item)
                 self.server_tree.takeTopLevelItem(index)
+
+                # Purge associated rows from the Traffic Statistics +
+                # Stream Statistics tables. Without this they linger
+                # until the next refresh tick (or forever in the cached
+                # _last_statistics fallback path), so the operator sees
+                # ghost rows for a chassis they just removed.
+                if hasattr(self, "prune_server_stats"):
+                    try:
+                        self.prune_server_stats(server_address, tg_id_numeric)
+                    except Exception as e:
+                        logger.warning(
+                            f"[REMOVE SERVER] prune_server_stats failed for {server_address}: {e}"
+                        )
 
                 logger.info(f"Removed server: {server_address} and all associated ports.")
 

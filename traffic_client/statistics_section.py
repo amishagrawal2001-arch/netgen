@@ -651,6 +651,83 @@ class TrafficGenClientStatisticsSection():
         
         self._stats_worker.start()
     
+    def prune_server_stats(self, server_address, tg_id):
+        """Drop every cache + table cell belonging to a removed TGen.
+
+        Called from menu_actions.remove_selected_server() so the stats
+        view doesn't keep showing rows for a chassis the operator just
+        removed. Without this, removed-server interfaces linger in the
+        Interface Statistics + Stream Statistics tables for up to one
+        full refresh cycle (and forever in the chart) because:
+
+          1. `_pending_stats_data` is keyed by server_address — gets
+             reset on the *next* fetch, not the current one.
+          2. `_last_statistics` is the fallback cache used when the
+             current poll returns empty for an interface — it would
+             keep re-displaying the removed TG's rows indefinitely.
+          3. `_iface_baselines` / `_stream_baselines` would skew Clear
+             Stats math if the same TG iface name is re-added later
+             on a different chassis.
+
+        Best-effort — silently no-ops on attributes that don't exist
+        on this MainWindow instance (some are lazily initialized).
+        """
+        tg_prefix = f"TG {tg_id} - " if tg_id is not None else None
+
+        # 1. Pending fetch buffers
+        try:
+            self._pending_stats_data.pop(server_address, None)
+        except (AttributeError, TypeError):
+            pass
+        try:
+            self._pending_stream_stats = [
+                s for s in getattr(self, "_pending_stream_stats", [])
+                if str(s.get("_tg_id", "")) != str(tg_id)
+            ]
+        except (AttributeError, TypeError):
+            pass
+        try:
+            self._pending_poll_stream_stats = [
+                s for s in getattr(self, "_pending_poll_stream_stats", [])
+                if str(s.get("_tg_id", "")) != str(tg_id)
+            ]
+        except (AttributeError, TypeError):
+            pass
+
+        # 2. Persistent display caches keyed by "TG <id> - <iface>"
+        if tg_prefix is not None:
+            for cache_attr in ("_last_statistics", "_iface_baselines", "_stream_baselines"):
+                try:
+                    cache = getattr(self, cache_attr, None)
+                    if isinstance(cache, dict):
+                        stale = [k for k in cache if isinstance(k, str) and k.startswith(tg_prefix)]
+                        for k in stale:
+                            cache.pop(k, None)
+                except Exception:
+                    pass
+
+        # 3. Force an immediate redraw with the pruned caches so the
+        #    operator sees the rows disappear instantly (not 2-5 s
+        #    later when the next refresh tick fires).
+        try:
+            if hasattr(self, "_last_statistics") and self._last_statistics:
+                self.update_statistics_table(self._last_statistics)
+            else:
+                self.clear_statistics_table()
+        except Exception:
+            pass
+        try:
+            self.update_stream_statistics_table(
+                getattr(self, "_pending_poll_stream_stats", [])
+                or getattr(self, "_pending_stream_stats", [])
+            )
+        except Exception:
+            pass
+
+        logger.info(
+            f"[STATS PRUNE] Removed TG {tg_id} ({server_address}) from stats caches + tables"
+        )
+
     def _on_interfaces_fetched(self, server, data):
         """Handle interfaces data fetched from background worker."""
         interfaces = data.get("interfaces", [])
