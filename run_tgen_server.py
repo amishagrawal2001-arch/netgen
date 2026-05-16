@@ -13998,6 +13998,194 @@ def api_admin_install_dpdk_log():
     })
 
 
+# =============================================================================
+# Self-upgrade endpoint — operator uploads a wheel, server pip-installs and
+# restarts itself
+# =============================================================================
+# The client GUI's "Install / Upgrade Server" dialog (widgets/install_server_dialog.py)
+# uses these endpoints to roll a new wheel onto a running server without SSH:
+#
+#   POST /api/admin/upgrade_wheel       — multipart upload, kicks pip install
+#   GET  /api/admin/upgrade_wheel/log   — tail the install log + return state
+#
+# Auth: admin role only when NETGEN_AUTH_TOKEN/_JSON is set; auth-exempt
+# otherwise so first-time setup still works. The endpoint pip-installs the
+# uploaded wheel via the server's own Python interpreter (sys.executable),
+# then triggers `systemctl restart netgen-server` so the new process picks up
+# the upgraded code. The current process dies during the restart — the client
+# polls /api/health to detect the new instance.
+
+_ADMIN_UPGRADE_STATE = {
+    "process": None,     # subprocess.Popen of the running pip install
+    "log_path": None,
+    "wheel_path": None,
+    "wheel_name": None,
+    "started_at": None,
+    "finished_at": None,
+    "return_code": None,
+    "restart_scheduled": False,
+}
+
+
+def _allowed_wheel_name(name: str) -> bool:
+    """Defence-in-depth: don't accept anything other than a wheel filename."""
+    import re as _re
+    if not name or "/" in name or ".." in name:
+        return False
+    return bool(_re.match(r"^[A-Za-z0-9._+-]+\.whl$", name))
+
+
+@app.route("/api/admin/upgrade_wheel", methods=["POST"])
+@require_role("admin")
+def api_admin_upgrade_wheel():
+    """Accept a wheel upload, pip-install it, schedule a service restart.
+
+    Multipart form field `wheel` holds the file. We refuse to start a new
+    upgrade if one is already running. The pip install runs in the
+    background; clients poll /api/admin/upgrade_wheel/log for progress.
+    """
+    import datetime as _dt
+    proc = _ADMIN_UPGRADE_STATE.get("process")
+    if proc is not None and proc.poll() is None:
+        return jsonify({
+            "ok": False,
+            "error": "Upgrade already in progress",
+            "started_at": _ADMIN_UPGRADE_STATE.get("started_at"),
+        }), 409
+
+    if "wheel" not in request.files:
+        return jsonify({"ok": False, "error": "Missing 'wheel' file field"}), 400
+    f = request.files["wheel"]
+    if not f or not f.filename:
+        return jsonify({"ok": False, "error": "Empty wheel upload"}), 400
+    if not _allowed_wheel_name(f.filename):
+        return jsonify({
+            "ok": False,
+            "error": f"Refusing upload: {f.filename!r} is not a wheel filename",
+        }), 400
+
+    # Persist the wheel to a stable path before kicking pip — pip needs a
+    # filesystem path, not a Werkzeug file stream.
+    wheel_dir = "/tmp/netgen_upgrade"
+    os.makedirs(wheel_dir, exist_ok=True)
+    wheel_path = os.path.join(wheel_dir, f.filename)
+    f.save(wheel_path)
+
+    log_path = "/var/log/netgen-upgrade.log"
+    try:
+        log_fh = open(log_path, "wb", buffering=0)
+    except PermissionError:
+        # Fallback when /var/log isn't writable (non-root run, container, ...)
+        log_path = os.path.join(wheel_dir, "upgrade.log")
+        log_fh = open(log_path, "wb", buffering=0)
+
+    # Build pip command using the server's own interpreter so the new wheel
+    # lands in the same site-packages — critical when the server runs under
+    # a venv / pipx.
+    py = sys.executable or "python3"
+    cmd = [
+        py, "-m", "pip", "install",
+        "--upgrade", "--force-reinstall", "--no-deps",
+        wheel_path,
+    ]
+    log_fh.write(f"[upgrade] {_dt.datetime.now().isoformat()} cmd: {' '.join(cmd)}\n".encode())
+    log_fh.write(f"[upgrade] wheel: {wheel_path} ({os.path.getsize(wheel_path)} bytes)\n".encode())
+    log_fh.write(f"[upgrade] python: {py}\n".encode())
+    log_fh.flush()
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            close_fds=True,
+        )
+    except Exception as e:
+        log_fh.close()
+        return jsonify({"ok": False, "error": f"Failed to spawn pip: {e}"}), 500
+
+    _ADMIN_UPGRADE_STATE.update({
+        "process": proc,
+        "log_path": log_path,
+        "wheel_path": wheel_path,
+        "wheel_name": f.filename,
+        "started_at": _dt.datetime.now().isoformat(),
+        "finished_at": None,
+        "return_code": None,
+        "restart_scheduled": False,
+    })
+
+    return jsonify({
+        "ok": True,
+        "pid": proc.pid,
+        "log_path": log_path,
+        "wheel_name": f.filename,
+        "started_at": _ADMIN_UPGRADE_STATE["started_at"],
+    })
+
+
+@app.route("/api/admin/upgrade_wheel/log", methods=["GET"])
+def api_admin_upgrade_wheel_log():
+    """Tail the upgrade log + report status. Triggers restart when pip done."""
+    log_path = _ADMIN_UPGRADE_STATE.get("log_path")
+    if not log_path or not os.path.isfile(log_path):
+        return jsonify({"running": False, "log": "", "log_path": None})
+
+    proc = _ADMIN_UPGRADE_STATE.get("process")
+    running = bool(proc and proc.poll() is None)
+    return_code = None
+    if proc is not None and not running:
+        return_code = proc.poll()
+        if _ADMIN_UPGRADE_STATE.get("finished_at") is None:
+            import datetime as _dt
+            _ADMIN_UPGRADE_STATE["finished_at"] = _dt.datetime.now().isoformat()
+            _ADMIN_UPGRADE_STATE["return_code"] = return_code
+
+            # Pip succeeded — schedule a systemd restart. We use `at` /
+            # `nohup` to detach the restart command so the current process
+            # gets a fraction of a second to flush the HTTP response before
+            # systemd kills it. The client then polls /api/health for the
+            # new instance.
+            if return_code == 0 and not _ADMIN_UPGRADE_STATE.get("restart_scheduled"):
+                _ADMIN_UPGRADE_STATE["restart_scheduled"] = True
+                try:
+                    with open(log_path, "ab") as lf:
+                        lf.write(b"[upgrade] pip ok; scheduling systemctl restart in 2s\n")
+                    # Detached shell so the restart survives this process dying
+                    subprocess.Popen(
+                        ["sh", "-c", "sleep 2 && systemctl restart netgen-server"],
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                        start_new_session=True,
+                    )
+                except Exception as e:
+                    with open(log_path, "ab") as lf:
+                        lf.write(f"[upgrade] restart scheduling failed: {e}\n".encode())
+
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(0, 2)
+            size = f.tell()
+            tail = 64 * 1024
+            f.seek(max(0, size - tail))
+            data = f.read().decode("utf-8", errors="replace")
+        if size > tail:
+            data = "[...log truncated to last 64 KiB...]\n" + data
+    except Exception as e:
+        data = f"[error reading log: {e}]"
+
+    return jsonify({
+        "running": running,
+        "return_code": return_code,
+        "log_path": log_path,
+        "wheel_name": _ADMIN_UPGRADE_STATE.get("wheel_name"),
+        "started_at": _ADMIN_UPGRADE_STATE.get("started_at"),
+        "finished_at": _ADMIN_UPGRADE_STATE.get("finished_at"),
+        "restart_scheduled": _ADMIN_UPGRADE_STATE.get("restart_scheduled", False),
+        "log": data,
+    })
+
+
 _ADMIN_HTML = r"""<!DOCTYPE html>
 <html lang="en">
 <head>

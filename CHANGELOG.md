@@ -2,6 +2,67 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.6] - 2026-05-16
+
+Operator-quality-of-life release. Drives server install and upgrade
+from the client GUI, hardens DPDK install-script path handling, and
+documents the `/admin` server console + DPDK install paths in the
+landing page.
+
+### Added — install / upgrade server from the client GUI
+- **`Help → Install / Upgrade Server...`** opens a two-tab dialog:
+  - **Upgrade running server** — pick a `.whl`, click Upload &
+    Upgrade. Client POSTs to `/api/admin/upgrade_wheel`; server
+    pip-installs into its own Python (`sys.executable -m pip install
+    --upgrade --force-reinstall --no-deps <wheel>`) and triggers
+    `systemctl restart netgen-server`. Client polls
+    `/api/admin/upgrade_wheel/log` for live output, then waits for
+    `/api/health` to come back. 30–60 s typical round-trip.
+  - **Fresh install via SSH** — pick host / user / password OR SSH
+    key file / wheel / installer / optional `--no-dpdk` and
+    `--skip-dpdk-build` flags. Client paramiko-connects, sftp-copies
+    `install_ostg_complete.py` + the wheel to `/tmp/netgen_install/`
+    on the target, then streams the installer's output back into the
+    log pane. Heavy path (15–45 min full install).
+- New server endpoints:
+  - `POST /api/admin/upgrade_wheel` (admin role) — multipart wheel
+    upload; rejects non-wheel filenames; refuses overlapping uploads.
+  - `GET /api/admin/upgrade_wheel/log` — tails the upgrade log,
+    schedules the systemd restart automatically when pip exits 0.
+- New file `widgets/install_server_dialog.py` (~480 LOC) — both
+  worker threads (`WheelUploadWorker`, `SshInstallWorker`) plus the
+  tabbed dialog. Background-threaded so the UI stays responsive
+  through a 30-min full install.
+
+### Fixed — `install_dpdk.sh` tx_worker path mismatch
+- When `install_dpdk.sh` is invoked from a git checkout
+  (`/root/netgen/resources/dpdk/install_dpdk.sh`), `SCRIPT_DIR`
+  resolves to that checkout — so `tx_worker` lands at
+  `/root/netgen/.../tx_worker/build/tx_worker`. But the server's
+  `/api/admin/health` probe only checks `/opt/netgen/`, `/opt/OSTG/`,
+  and `/usr/local/bin/tx_worker`, so the admin portal reports
+  "tx_worker binary Not built" even though the binary works fine.
+- `step_build_tx_worker` now drops symlinks into both canonical
+  install roots (when their parents exist) and installs a copy at
+  `/usr/local/bin/tx_worker`. Self-healing across re-runs.
+
+### Documentation
+- `README.md` — new `### Installing DPDK on the Linux server` and
+  `### Server Admin Portal (/admin)` sections; refreshed What's New
+  to 0.2.5.
+- `docs/index.html` (GitHub Pages landing) — bumped to 0.2.5, three
+  new feature cards, top-nav gains Install + Admin links, two new
+  full sections: "Install — three paths, your call." (download
+  prebuilt / turnkey / split) and "Server admin console — `/admin`"
+  with curl examples and `/api/admin/health` JSON shape.
+
+### Notes
+- No new dependencies on the server side. Client-side `paramiko` is
+  already in `requirements.txt`; the new dialog uses it only when
+  the user picks the SSH install tab.
+- Wheel still ships as `ostg_trafficgen-0.2.6-py3-none-any.whl` for
+  pip-install backwards compatibility.
+
 ## [0.2.5] - 2026-05-13
 
 Distribution-only release — adds the multi-platform installer pipeline
