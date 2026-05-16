@@ -59,6 +59,7 @@ See [CHANGELOG.md](CHANGELOG.md) for the full diff. Highlights:
 - [netgen-cli (Headless CLI)](#netgen-cli-headless-cli)
 - [Traffic Generation API](#traffic-generation-api)
 - [DPDK Multi-Queue Scaling](#dpdk-multi-queue-scaling)
+  - [Installing DPDK on the Linux server](#installing-dpdk-on-the-linux-server)
 - [Protocol Configuration](#protocol-configuration)
 - [Monitoring and Troubleshooting](#monitoring-and-troubleshooting)
 - [Examples](#examples)
@@ -1404,6 +1405,113 @@ software. Per-core ceiling estimates used by the recommender:
 - 64B: 4.5 Mpps/core
 - 512B: 4.3 Mpps/core
 - 1500B: 4.1 Mpps/core
+
+### Installing DPDK on the Linux server
+
+Two paths. Pick by whether you're installing the whole Netgen server
+(DPDK is one step of many) or just want DPDK alone.
+
+**Path 1 — full Netgen server install (DPDK included).** This is
+the normal case; runs `install_dpdk.sh` automatically as part of
+the bigger install.
+
+```bash
+git clone https://github.com/amishagrawal2001-arch/netgen.git
+cd netgen
+./rebuild_quick.sh                                    # build the wheel
+sudo python3 install_ostg_complete.py                 # full server: wheel + Docker + FRR + DPDK + systemd
+
+# Remote install from your laptop:
+python3 install_ostg_complete.py -H lab-box -u root -p '<password>'
+
+# Skip DPDK entirely (devbox / no NIC to bind):
+sudo python3 install_ostg_complete.py --no-dpdk
+
+# Apt-deps only, skip the 10–30 min DPDK build (you'll meson it later):
+sudo python3 install_ostg_complete.py --skip-dpdk-build
+```
+
+Watch the DPDK build progress in another terminal:
+```bash
+ssh root@lab-box 'tail -f /var/log/netgen-install-dpdk.log'
+```
+
+**Path 2 — DPDK only (run the installer script directly).** Use
+when Netgen is already installed and you just want to (re)do DPDK:
+
+```bash
+sudo /opt/OSTG/resources/dpdk/install_dpdk.sh
+
+# Non-interactive (defaults: clones DPDK to ~/SURAJ/dpdk, 1024 hugepages):
+sudo AUTO_MODE=1 /opt/OSTG/resources/dpdk/install_dpdk.sh
+
+# Apt-deps + tx_worker only, skip the meson DPDK build:
+sudo SKIP_BUILD=1 /opt/OSTG/resources/dpdk/install_dpdk.sh
+
+# Use an existing DPDK source tree:
+sudo DPDK_DIR=/opt/dpdk /opt/OSTG/resources/dpdk/install_dpdk.sh
+```
+
+**What the installer does, in order**:
+
+1. **Preflight** — must be root, Linux only.
+2. **Detect DPDK source** at `~/SURAJ/dpdk`, `~/dpdk`, `/opt/dpdk`,
+   or `/usr/src/dpdk`. If missing, offers to
+   `git clone https://dpdk.org/git/dpdk` (v23.11) — **needs internet**.
+3. **apt install** — toolchain
+   (`build-essential meson ninja-build pkg-config`), runtime libs
+   (`libnuma-dev libelf-dev libpcap-dev`), Mellanox PMD prereqs
+   (`libibverbs-dev libmlx5-dev rdma-core`), and
+   `linux-headers-$(uname -r)` for vfio-pci on cloud kernels.
+4. **Build DPDK** with
+   `meson setup build -Dexamples=all -Ddisable_drivers=net/mana`
+   then `ninja -C build` then `ninja -C build install` (10–30 min).
+5. **Build tx_worker** (Netgen's DPDK packet-injector) against the
+   just-installed libdpdk.
+6. **Hugepages** — write `vm.nr_hugepages` to
+   `/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages` AND drop
+   `/etc/sysctl.d/99-netgen-hugepages.conf` so it survives reboots.
+7. **NIC binding** — `dpdk-devbind.py --bind=vfio-pci <BDF>` for
+   Intel; for Mellanox / mlx5 it deliberately stays bound to
+   `mlx5_core` (the mlx5 PMD wants the kernel driver loaded).
+8. **ld.so config** — adds `/usr/local/lib/x86_64-linux-gnu` to
+   `/etc/ld.so.conf.d/dpdk.conf` and runs `ldconfig`.
+9. **Verify** — runs a smoke test.
+
+**Manual prerequisite (before running the script).** For Intel NICs
+you also need IOMMU enabled in the bootloader — the script warns
+but won't touch GRUB:
+```bash
+# /etc/default/grub
+GRUB_CMDLINE_LINUX="... intel_iommu=on iommu=pt"
+sudo update-grub && sudo reboot
+```
+
+For Mellanox NICs **don't** rebind to vfio-pci — the script handles
+that automatically; just make sure `mlx5_core` is loaded
+(`lsmod | grep mlx5`).
+
+**Verify after install**:
+```bash
+grep Huge /proc/meminfo                     # hugepages allocated?
+sudo dpdk-devbind.py --status               # DPDK bind state?
+sudo /opt/OSTG/resources/dpdk/verify_dpdk.sh
+sudo systemctl start netgen-server
+sudo systemctl status netgen-server
+```
+
+**Troubleshooting**:
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `meson setup` fails: "couldn't find libibverbs" | Mellanox prereqs missed | `sudo apt install libibverbs-dev libmlx5-dev rdma-core` |
+| `vfio-pci: bind failed` | IOMMU off | Add `intel_iommu=on iommu=pt` to GRUB, reboot |
+| `EAL: No free hugepages reported` | Hugepages didn't persist (pre-fix) | New install drops `99-netgen-hugepages.conf`; re-run install OR `echo 1024 \| sudo tee /proc/sys/vm/nr_hugepages` |
+| `link: undefined reference to ibv_cmd_query_*` (mana driver) | Ubuntu 22.04 libibverbs lacks `IBVERBS_PRIVATE_34` | Already disabled by `-Ddisable_drivers=net/mana` |
+| tx_worker built but won't start | DPDK ABI mismatch | Re-run `sudo /opt/OSTG/resources/dpdk/install_dpdk.sh` to rebuild against current libdpdk |
+
+Full install_dpdk.sh log lands at `/var/log/netgen-install-dpdk.log`
+when run via `install_ostg_complete.py`.
 
 ### Prerequisites
 
