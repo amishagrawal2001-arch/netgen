@@ -75,45 +75,66 @@ class TrafficGenClientMenuAction():
             return self._add_server_interface_legacy()
 
         dlg = AddTGenDialog(self)
-        if not dlg.exec_() or not dlg.chosen_url:
-            return  # user cancelled
-        full_url = dlg.chosen_url
-
-        if full_url in [server["address"] for server in self.server_interfaces]:
-            QMessageBox.warning(self, "Duplicate Server", "This server is already added.")
+        dlg.exec_()
+        # chosen_connections is the multi-target result list. Empty when
+        # the user added entries to history only (clicked "Add to History"
+        # then Close) or cancelled outright.
+        targets = getattr(dlg, "chosen_connections", None) or []
+        if not targets:
             return
 
-        tg_id = len(self.server_interfaces)
-        server_entry = {"tg_id": tg_id, "address": full_url, "online": True}
-        if dlg.chosen_label:
-            server_entry["label"] = dlg.chosen_label
-        self.server_interfaces.append(server_entry)
+        existing = {server["address"] for server in self.server_interfaces}
+        added, skipped = [], []
+        for entry in targets:
+            full_url = entry.get("url")
+            if not full_url:
+                continue
+            if full_url in existing:
+                skipped.append(full_url)
+                continue
 
-        # Stash the auth token (session-only — not persisted to disk) so the
-        # rest of the client can pick it up for /api/* requests.
-        if dlg.chosen_auth:
-            if not hasattr(self, "_server_auth_tokens"):
-                self._server_auth_tokens = {}
-            self._server_auth_tokens[full_url] = dlg.chosen_auth
+            tg_id = len(self.server_interfaces)
+            server_entry = {"tg_id": tg_id, "address": full_url, "online": True}
+            label = entry.get("label", "")
+            if label:
+                server_entry["label"] = label
+            self.server_interfaces.append(server_entry)
+            existing.add(full_url)
+            added.append(full_url)
 
-        # Forgive a prior remove
-        if full_url in self.removed_servers:
-            self.removed_servers.discard(full_url)
-            logger.info(f"[ADD SERVER] Removed {full_url} from removed_servers (re-added)")
+            # Auth token (session-only — not persisted to disk) for /api/*
+            auth = entry.get("auth_token", "")
+            if auth:
+                if not hasattr(self, "_server_auth_tokens"):
+                    self._server_auth_tokens = {}
+                self._server_auth_tokens[full_url] = auth
 
-        if hasattr(self, "server_manager"):
-            from utils.server_manager import ServerManager
-            server_id = ServerManager._extract_server_id_from_url(full_url)
-            self.server_manager.register_server(
-                server_id=server_id,
-                address=full_url,
-                tg_id=tg_id,
-                online=True,
+            # Forgive a prior remove
+            if full_url in self.removed_servers:
+                self.removed_servers.discard(full_url)
+                logger.info(f"[ADD SERVER] Removed {full_url} from removed_servers (re-added)")
+
+            if hasattr(self, "server_manager"):
+                from utils.server_manager import ServerManager
+                server_id = ServerManager._extract_server_id_from_url(full_url)
+                self.server_manager.register_server(
+                    server_id=server_id,
+                    address=full_url,
+                    tg_id=tg_id,
+                    online=True,
+                )
+                logger.info(f"[ADD SERVER] Registered server {server_id} in ServerManager")
+
+        if added:
+            self.update_server_tree()
+            self.save_server_interfaces()
+            logger.info(f"[ADD SERVER] Added {len(added)} chassis: {', '.join(added)}")
+        if skipped:
+            QMessageBox.information(
+                self, "Already connected",
+                "These chassis were already in your active list and were "
+                "skipped:\n\n• " + "\n• ".join(skipped),
             )
-            logger.info(f"[ADD SERVER] Registered server {server_id} in ServerManager")
-
-        self.update_server_tree()
-        self.save_server_interfaces()
 
     def _add_server_interface_legacy(self):
         """Fallback path: bare two-step input dialog.

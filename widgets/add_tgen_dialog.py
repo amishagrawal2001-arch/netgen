@@ -158,16 +158,32 @@ class ReachabilityWorker(QThread):
 
 
 class AddTGenDialog(QDialog):
-    """Spirent-style chassis manager. Returns (full_url, label, auth_token)."""
+    """Spirent-style chassis manager.
+
+    Returns a list of selected connections in `chosen_connections`. The
+    list is empty when the user only edited history without choosing
+    to connect (e.g. clicked Add to History a few times then Close).
+    Each entry: {url, label, auth_token, address, port, scheme}.
+
+    Legacy single-target attributes (`chosen_url`, `chosen_label`,
+    `chosen_auth`) are populated from the first entry of the list so
+    callers from earlier in this branch keep working unchanged.
+    """
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setWindowTitle("Add TGEN Chassis")
-        self.setMinimumSize(720, 560)
+        self.setMinimumSize(760, 600)
 
         self._entries: list = _load_history()
         self._worker: Optional[ReachabilityWorker] = None
-        # Result populated when user clicks Connect (and form validates):
+
+        # Multi-target result list — one entry per chassis the user
+        # wants to connect to. Empty when user closed without
+        # connecting (e.g. just added to history).
+        self.chosen_connections: list = []
+
+        # Back-compat shims — first chosen_connections entry mirrored here
         self.chosen_url: Optional[str] = None
         self.chosen_label: str = ""
         self.chosen_auth: str = ""
@@ -202,7 +218,10 @@ class AddTGenDialog(QDialog):
             "●", "Address", "Port", "Label", "Last connected", "× connects",
         ])
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
+        # ExtendedSelection = Ctrl/Shift-click for multi-select. Lets the
+        # operator pick 3-4 chassis from history and Connect them all in
+        # one shot.
+        self.table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.table.verticalHeader().setVisible(False)
         h = self.table.horizontalHeader()
@@ -218,10 +237,18 @@ class AddTGenDialog(QDialog):
         hb.addWidget(self.table)
 
         hist_btns = QHBoxLayout()
+        self.connect_selected_btn = QPushButton("Connect Selected")
+        self.connect_selected_btn.setToolTip(
+            "Connect to every chassis selected in the table above. "
+            "Ctrl/Shift-click to select multiple rows."
+        )
+        self.connect_selected_btn.clicked.connect(self._connect_selected_from_history)
+        self.connect_selected_btn.setEnabled(False)
         self.remove_btn = QPushButton("Remove from history")
         self.remove_btn.clicked.connect(self._remove_selected_from_history)
         self.test_btn = QPushButton("Test all")
         self.test_btn.clicked.connect(self._start_reachability_probe)
+        hist_btns.addWidget(self.connect_selected_btn)
         hist_btns.addWidget(self.remove_btn)
         hist_btns.addWidget(self.test_btn)
         hist_btns.addStretch(1)
@@ -262,14 +289,39 @@ class AddTGenDialog(QDialog):
 
         root.addWidget(form_box)
 
-        # Bottom buttons
-        btns = QDialogButtonBox(QDialogButtonBox.Cancel)
-        self.connect_btn = QPushButton("Connect")
+        # Bottom buttons. Three actions, plus Close:
+        #
+        #   Add to History  — form contents → history, no connect, stays open
+        #                     (build up a list of chassis without committing)
+        #   Connect & Add   — form contents → history + connect to it, closes
+        #                     (the common single-shot case)
+        #   Close           — exits without connecting; any "Add to History"
+        #                     entries already made are persisted
+        btns = QDialogButtonBox(QDialogButtonBox.Close)
+        self.add_history_btn = QPushButton("Add to History")
+        self.add_history_btn.setToolTip(
+            "Save the chassis above to your history list without "
+            "connecting. Useful for building up a list of known "
+            "chassis before deciding which to connect to."
+        )
+        self.add_history_btn.clicked.connect(self._add_to_history_only)
+        btns.addButton(self.add_history_btn, QDialogButtonBox.ActionRole)
+
+        self.connect_btn = QPushButton("Connect && Add")
         self.connect_btn.setDefault(True)
+        self.connect_btn.setToolTip(
+            "Save to history AND connect to the chassis above. Closes "
+            "the dialog. (For multiple chassis, use 'Connect Selected' "
+            "in the table area above.)"
+        )
         self.connect_btn.clicked.connect(self._do_connect)
         btns.addButton(self.connect_btn, QDialogButtonBox.AcceptRole)
-        btns.rejected.connect(self.reject)
+
+        btns.rejected.connect(self._close_without_connecting)
         root.addWidget(btns)
+
+        # Hook up table selection → enable/disable Connect Selected
+        self.table.itemSelectionChanged.connect(self._update_connect_selected_btn)
 
     # -- History table -------------------------------------------------------
 
@@ -290,6 +342,10 @@ class AddTGenDialog(QDialog):
             self.table.setItem(i, 5, QTableWidgetItem(str(e.get("connect_count", 0))))
 
     def _on_row_selected(self) -> None:
+        # Auto-fill form from the first selected row. With multi-select
+        # this isn't precisely "the" selected row, but it's a useful hint
+        # that lets the operator tweak the form (e.g. change port) before
+        # clicking Add to History.
         rows = self.table.selectionModel().selectedRows()
         if not rows:
             return
@@ -306,8 +362,19 @@ class AddTGenDialog(QDialog):
         self.https_cb.setChecked(e.get("scheme", "http") == "https")
         # Don't restore auth token — never persisted.
 
+    def _update_connect_selected_btn(self) -> None:
+        count = len(self.table.selectionModel().selectedRows())
+        self.connect_selected_btn.setEnabled(count > 0)
+        if count <= 1:
+            self.connect_selected_btn.setText("Connect Selected")
+        else:
+            self.connect_selected_btn.setText(f"Connect {count} Selected")
+
     def _on_row_double_clicked(self, _item) -> None:
-        # Same effect as clicking Connect with the selected row pre-filled
+        # Same effect as clicking Connect with the selected row pre-filled.
+        # Always treats double-click as a single-chassis connect — operator
+        # used the "Connect Selected" button explicitly if they meant the
+        # multi-select case.
         self._on_row_selected()
         self._do_connect()
 
@@ -371,13 +438,14 @@ class AddTGenDialog(QDialog):
         self.test_btn.setEnabled(True)
         self.status_lbl.setText(" ")
 
-    # -- Connect -------------------------------------------------------------
+    # -- Form-side actions ---------------------------------------------------
 
-    def _do_connect(self) -> None:
+    def _parse_form(self) -> Optional[dict]:
+        """Validate + normalize the connection form. Returns a dict or None."""
         address = (self.address_in.text() or "").strip()
         if not address:
             QMessageBox.warning(self, "Missing", "Enter a chassis address.")
-            return
+            return None
         # Strip scheme if user pasted one
         address = re.sub(r"^https?://", "", address, flags=re.I)
         address = address.rstrip("/")
@@ -394,18 +462,98 @@ class AddTGenDialog(QDialog):
         scheme = "https" if self.https_cb.isChecked() else "http"
         label = (self.label_in.text() or "").strip()
         auth = (self.auth_in.text() or "").strip()
+        return {
+            "url": f"{scheme}://{address}:{port}",
+            "address": address,
+            "port": port,
+            "scheme": scheme,
+            "label": label,
+            "auth_token": auth,
+        }
 
-        full_url = f"{scheme}://{address}:{port}"
+    def _add_to_history_only(self) -> None:
+        """Save form contents to history but don't connect. Stays open."""
+        entry = self._parse_form()
+        if entry is None:
+            return
+        record_connection(
+            entry["address"], entry["port"],
+            label=entry["label"], scheme=entry["scheme"],
+        )
+        # Reload from disk so the table reflects the new entry
+        self._entries = _load_history()
+        self._populate_history_table()
+        self.status_lbl.setText(
+            f"Added {entry['address']}:{entry['port']} to history."
+        )
+        # Clear the form so the operator can type another one without
+        # accidentally re-adding the same chassis
+        self.address_in.clear()
+        self.label_in.clear()
+        self.auth_in.clear()
+        self.address_in.setFocus()
+        # Re-probe so the new entry gets a LED
+        self._start_reachability_probe()
 
-        # Record + return — caller does the actual server registration.
-        record_connection(address, port, label=label, scheme=scheme)
-        self.chosen_url = full_url
-        self.chosen_label = label
-        self.chosen_auth = auth
-        self.chosen_address = address
-        self.chosen_port = port
-        self.chosen_scheme = scheme
+    def _do_connect(self) -> None:
+        """Form contents → history + connect to it. Closes the dialog."""
+        entry = self._parse_form()
+        if entry is None:
+            return
+        record_connection(
+            entry["address"], entry["port"],
+            label=entry["label"], scheme=entry["scheme"],
+        )
+        self._set_results([entry])
         self.accept()
+
+    def _connect_selected_from_history(self) -> None:
+        """Connect to every row currently selected in the history table."""
+        rows = sorted(r.row() for r in self.table.selectionModel().selectedRows())
+        if not rows:
+            QMessageBox.warning(
+                self, "No selection",
+                "Select one or more rows in the table first."
+            )
+            return
+        chosen = []
+        for i in rows:
+            if 0 <= i < len(self._entries):
+                e = self._entries[i]
+                chosen.append({
+                    "url": f"{e.get('scheme', 'http')}://{e.get('address')}:{int(e.get('port', 5050))}",
+                    "address": e.get("address", ""),
+                    "port": int(e.get("port", 5050)),
+                    "scheme": e.get("scheme", "http"),
+                    "label": e.get("label", ""),
+                    # Auth tokens aren't persisted — operator either enters
+                    # one in the form (and uses Connect & Add) or leaves
+                    # bulk-connected chassis token-less.
+                    "auth_token": "",
+                })
+                record_connection(
+                    e.get("address", ""), int(e.get("port", 5050)),
+                    label=e.get("label", ""), scheme=e.get("scheme", "http"),
+                )
+        self._set_results(chosen)
+        self.accept()
+
+    def _close_without_connecting(self) -> None:
+        """Cancel / Close button — exit with empty result."""
+        self.chosen_connections = []
+        self.reject()
+
+    def _set_results(self, entries: list) -> None:
+        """Populate result attributes from a list of parsed entries."""
+        self.chosen_connections = list(entries)
+        if entries:
+            first = entries[0]
+            self.chosen_url = first["url"]
+            self.chosen_label = first.get("label", "")
+            self.chosen_auth = first.get("auth_token", "")
+            self.chosen_address = first.get("address", "")
+            self.chosen_port = int(first.get("port", 5050))
+            self.chosen_scheme = first.get("scheme", "http")
 
     # -- Cleanup -------------------------------------------------------------
 
