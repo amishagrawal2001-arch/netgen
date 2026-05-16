@@ -420,6 +420,8 @@
       <a href="#whats-new">What's new</a>
       <a href="#hardware">Hardware</a>
       <a href="#quickstart">Quick start</a>
+      <a href="#install">Install</a>
+      <a href="#admin">Admin</a>
       <a href="#api">API</a>
       <a href="#faq">FAQ</a>
     </nav>
@@ -1187,6 +1189,105 @@ sudo systemctl status netgen-server
   </div>
 </section>
 
+<!-- Install matrix -->
+<section class="block" id="install">
+  <h2>Install — three paths, your call.</h2>
+  <p>The server is a Linux workload (DPDK, kernel VRFs, iproute2,
+     systemd). The client runs anywhere. Pick the row that matches
+     your deployment.</p>
+
+  <div class="features" style="grid-template-columns: 1fr 1fr 1fr;">
+
+    <div class="feature">
+      <div class="ico">📥</div>
+      <h3>Option 1 — Download prebuilt</h3>
+      <p><strong>For operators who just want the GUI.</strong> Every
+         tagged GitHub release ships four CI-built artifacts. Grab
+         the one for your OS, double-click, point at the server URL.
+         No Python toolchain. No git clone.</p>
+<pre><code><span style="color:#94a3b8"># From the release page:</span>
+Netgen-Client-&lt;v&gt;-windows.exe
+Netgen-TrafficGenerator-&lt;v&gt;.dmg
+Netgen-Client-&lt;v&gt;-linux-x86_64.AppImage
+ostg_trafficgen-&lt;v&gt;-py3-none-any.whl
+
+<span style="color:#94a3b8"># Linux:</span>
+chmod +x Netgen-Client-*.AppImage
+./Netgen-Client-*.AppImage -s http://lab-box:5050</code></pre>
+    </div>
+
+    <div class="feature">
+      <div class="ico">🧪</div>
+      <h3>Option 2 — Turnkey lab-in-a-box</h3>
+      <p><strong>Server + GUI on one Linux host.</strong> One
+         command. Installs the wheel, builds the FRR Docker image,
+         sets up DPDK + persistent hugepages + systemd, drops a
+         desktop launcher for the GUI.</p>
+<pre><code>git clone https://github.com/DAY-Advisor/NetGenI.git
+cd NetGenI
+./rebuild_quick.sh
+sudo ./install_turnkey.sh
+
+<span style="color:#94a3b8"># Devbox (no DPDK NIC):</span>
+sudo ./install_turnkey.sh --no-dpdk
+
+<span style="color:#94a3b8"># Apt deps only, skip the 10–30 min build:</span>
+sudo ./install_turnkey.sh --skip-dpdk-build</code></pre>
+    </div>
+
+    <div class="feature">
+      <div class="ico">🔀</div>
+      <h3>Option 3 — Split (lab server + laptop)</h3>
+      <p><strong>Server on the Linux lab box, GUI on your laptop.</strong>
+         Most production setups end up here. Run the full server install
+         on the lab box, then the lightweight client installer on
+         macOS / Linux / Windows.</p>
+<pre><code><span style="color:#94a3b8"># On the lab server (root):</span>
+sudo python3 install_ostg_complete.py
+<span style="color:#94a3b8"># Or remote from your laptop:</span>
+python3 install_ostg_complete.py \
+    -H lab-box -u root -p '&lt;pw&gt;'
+
+<span style="color:#94a3b8"># On the operator laptop:</span>
+./install_client.sh    -s http://lab-box:5050   <span style="color:#94a3b8"># mac/linux/WSL</span>
+.\install_client.ps1   -Server http://lab-box:5050 <span style="color:#94a3b8"># Windows</span></code></pre>
+    </div>
+
+  </div>
+
+  <h3 style="margin-top: 40px; font-size: 20px; color: var(--ink);">
+    Installing DPDK on the Linux server
+  </h3>
+  <p>Bundled inside <code>install_ostg_complete.py</code>; can also be
+     re-run standalone. Handles apt deps
+     (<code>build-essential meson ninja-build pkg-config libnuma-dev
+     libelf-dev libpcap-dev libibverbs-dev libmlx5-dev rdma-core
+     linux-headers-$(uname -r)</code>), clones DPDK 23.11 if not
+     present, builds with meson+ninja, builds <code>tx_worker</code>
+     against the just-installed libdpdk, configures hugepages
+     persistently (<code>/etc/sysctl.d/99-netgen-hugepages.conf</code>),
+     binds NICs (vfio-pci for Intel; mlx5_core stays loaded for
+     Mellanox), and verifies.</p>
+
+<pre><code><span style="color:#94a3b8"># DPDK only (server already installed):</span>
+sudo /opt/OSTG/resources/dpdk/install_dpdk.sh
+
+<span style="color:#94a3b8"># Non-interactive, default 1024 hugepages:</span>
+sudo AUTO_MODE=1 /opt/OSTG/resources/dpdk/install_dpdk.sh
+
+<span style="color:#94a3b8"># Watch the install log live:</span>
+ssh root@lab-box 'tail -f /var/log/netgen-install-dpdk.log'</code></pre>
+
+  <p class="muted" style="margin-top: 20px;">
+    For Intel NICs you also need IOMMU on in the bootloader —
+    add <code>intel_iommu=on iommu=pt</code> to
+    <code>GRUB_CMDLINE_LINUX</code>, run <code>update-grub</code>,
+    reboot. The script warns but won't touch GRUB on its own. For
+    Mellanox NICs there's nothing to do — the mlx5 PMD uses the
+    kernel driver, so don't rebind to vfio-pci.
+  </p>
+</section>
+
 <!-- Architecture -->
 <section class="block" id="architecture">
   <h2>Two-process, REST-glued.</h2>
@@ -1241,6 +1342,83 @@ sudo systemctl status netgen-server
       </ul>
     </div>
   </div>
+</section>
+
+<!-- Server admin portal + monitoring -->
+<section class="block quickstart" id="admin">
+  <h2>Server admin console — <code>/admin</code>.</h2>
+  <p>Operators don't have to live in SSH. Every netgen-server ships
+     with a single-page web admin portal at
+     <code>http://&lt;host&gt;:5050/admin</code> — auth-exempt,
+     no static assets, no template files, no separate process to
+     deploy. Open it, see what's wrong, fix it from the browser.</p>
+
+  <div class="qs-grid">
+    <div>
+      <div class="qs-step">
+        <div class="num">1</div>
+        <div>
+          <h4>Server health at a glance</h4>
+          <p>libdpdk version, IOMMU state from <code>/proc/cmdline</code>, vfio module state (loadable + builtin both recognised), hugepages allocated per NUMA node, <code>tx_worker</code> binary presence.</p>
+        </div>
+      </div>
+      <div class="qs-step">
+        <div class="num">2</div>
+        <div>
+          <h4>NIC bind / unbind without leaving the browser</h4>
+          <p>Per-row "Bind to vfio-pci" / "Rebind to kernel" buttons. After binding the kernel deletes the netdev — Netgen records the original name in <code>/tmp/netgen_admin_bind_history.json</code> so the table still shows <code>eno12399np0 (DPDK)</code> instead of <code>(no interface)</code>.</p>
+        </div>
+      </div>
+      <div class="qs-step">
+        <div class="num">3</div>
+        <div>
+          <h4>Trigger DPDK install + tail the log</h4>
+          <p>Single "Install DPDK" button → runs <code>install_dpdk.sh --auto</code> in the background, streams the log into the page. Same flow as <code>sudo /opt/OSTG/resources/dpdk/install_dpdk.sh</code> from the CLI — just visible.</p>
+        </div>
+      </div>
+    </div>
+
+    <div>
+<pre><code><span style="color:#94a3b8"># Scrape-friendly health JSON for Prometheus / Nagios</span>
+curl http://lab-box:5050/api/admin/health | jq
+
+<span style="color:#94a3b8">{
+  "hostname": "lab-box",
+  "dpdk":      {"installed": true, "version": "23.11.0"},
+  "iommu":     {"enabled": true,
+                "cmdline_excerpt": "...intel_iommu=on..."},
+  "vfio":      {"vfio_pci_loaded": true, "vfio_loaded": true},
+  "hugepages": {"total": 1024, "free": 1024, "size_kb": 2048},
+  "tx_worker": {"present": true,
+                "path": "/opt/OSTG/.../tx_worker"},
+  "install_running": false
+}</span>
+
+<span style="color:#94a3b8"># DPDK control endpoints (also wired to the /admin UI buttons)</span>
+curl http://lab-box:5050/api/dpdk/status
+curl http://lab-box:5050/api/dpdk/interfaces
+curl -X POST http://lab-box:5050/api/dpdk/bind \
+     -d '{"pci":"0000:01:00.0"}'
+
+<span style="color:#94a3b8"># OS-level service monitoring</span>
+sudo systemctl status netgen-server
+sudo journalctl -u netgen-server -f
+
+<span style="color:#94a3b8"># Tiny health probe for HAProxy / k8s / Nagios</span>
+curl -fsS http://lab-box:5050/api/health
+
+<span style="color:#94a3b8"># SSE event stream — protocol-state transitions, never closes</span>
+curl -N http://lab-box:5050/api/events/stream</code></pre>
+    </div>
+  </div>
+
+  <p class="muted" style="margin-top: 24px;">
+    Auth-exempt routes are <code>/admin*</code> and
+    <code>/api/health</code> — so the admin page and the uptime probe
+    keep working even before <code>NETGEN_AUTH_TOKEN</code> is set.
+    Everything else respects the bearer-token + per-role policy
+    (viewer / operator / admin) when auth is enabled.
+  </p>
 </section>
 
 <!-- API -->
