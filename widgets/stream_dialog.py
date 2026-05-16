@@ -380,19 +380,79 @@ from the current client connection and auth token from
 
 <p>Every tagged release on GitHub ships four CI-built artifacts under
 <a href="https://github.com/amishagrawal2001-arch/netgen/releases/latest">releases/latest</a>.
-For server installs use the wheel; the AppImage/DMG/EXE are
-client-only:</p>
+They're not interchangeable — pick by <i>what you're trying to install
+where</i>, not by your laptop's OS:</p>
 
 <table>
-  <tr><th>File</th><th>Use for</th></tr>
-  <tr><td><code>ostg_trafficgen-&lt;v&gt;-py3-none-any.whl</code></td>
-      <td>Server install + scripted client installs (any platform with Python ≥3.9)</td></tr>
-  <tr><td><code>Netgen-Client-&lt;v&gt;-linux-x86_64.AppImage</code></td>
-      <td>Linux client only — single-file, runs on any modern distro</td></tr>
-  <tr><td><code>Netgen-TrafficGenerator-&lt;v&gt;.dmg</code></td>
-      <td>macOS client only — drag-to-Applications</td></tr>
-  <tr><td><code>Netgen-Client-&lt;v&gt;-windows.exe</code></td>
-      <td>Windows client only — double-click installer</td></tr>
+  <tr><th>File</th><th>Contains</th><th>Runs on</th></tr>
+  <tr><td><code>ostg_trafficgen-&lt;v&gt;-py3-none-any.whl</code><br>
+          <span class="muted">~1.4 MB</span></td>
+      <td><b>Both</b> server + client + CLI (Python source). Four entry
+          points: <code>ostg-server</code>, <code>ostg-client</code>,
+          <code>netgen-cli</code>, <code>ostg-docker-install</code>.</td>
+      <td>Any platform with Python ≥3.9. <b>Server only runs on Linux
+          (DPDK, VRFs, systemd are Linux-only).</b></td></tr>
+  <tr><td><code>Netgen-TrafficGenerator-&lt;v&gt;.dmg</code><br>
+          <span class="muted">~59 MB</span></td>
+      <td><b>Client GUI only.</b> Single bundle:
+          <code>Netgen Client.app</code> (PyQt5 + Python frozen).
+          No Server.app on purpose — see below.</td>
+      <td>macOS only</td></tr>
+  <tr><td><code>Netgen-Client-&lt;v&gt;-windows.exe</code><br>
+          <span class="muted">~73 MB</span></td>
+      <td><b>Client GUI only</b> — PyInstaller one-file installer.</td>
+      <td>Windows only</td></tr>
+  <tr><td><code>Netgen-Client-&lt;v&gt;-linux-x86_64.AppImage</code><br>
+          <span class="muted">~92 MB</span></td>
+      <td><b>Client GUI only</b> — single-file portable.</td>
+      <td>Any modern Linux distro</td></tr>
+</table>
+
+<h3>Pick the right one</h3>
+
+<table>
+  <tr><th>If you want to...</th><th>Download</th></tr>
+  <tr><td>GUI on macOS, point at an existing server</td><td>the <b>DMG</b></td></tr>
+  <tr><td>GUI on Windows</td><td>the <b>EXE</b></td></tr>
+  <tr><td>GUI on Linux</td><td>the <b>AppImage</b></td></tr>
+  <tr><td>Install or upgrade the server itself</td>
+      <td>the <b>wheel</b> — use <code>install_ostg_complete.py</code>
+          or the in-GUI <b>Help → Install / Upgrade Server</b> dialog</td></tr>
+  <tr><td>Headless CLI / Docker / CI / scripted client install</td>
+      <td>the <b>wheel</b> — <code>pip install</code> it directly</td></tr>
+</table>
+
+<h3>Why no Server bundle in the DMG / EXE / AppImage?</h3>
+
+<p>The DMG was deliberately stripped of <code>Netgen Server.app</code>
+in 0.2.5 (commit <code>e03bccf</code>). Netgen-server depends on
+Linux-only kernel features that don't exist on macOS or Windows:</p>
+
+<ul>
+  <li>DPDK kernel modules (<code>vfio-pci</code>, <code>uio_pci_generic</code>)</li>
+  <li>Per-device Linux VRFs (<code>ip link add type vrf</code>)</li>
+  <li><code>iproute2</code> for VLAN / VXLAN subinterfaces</li>
+  <li>systemd for service management</li>
+  <li>FRR Docker containers (work on Docker Desktop but cross-platform is slow + restricted)</li>
+</ul>
+
+<p>Shipping a <code>Server.app</code> would mislead operators into
+thinking they could run a full Netgen server on a Mac. The wheel
+<i>does</i> contain the server code, but on macOS / Windows
+<code>ostg-server</code> only works with <code>--no-dpdk</code>
+(Scapy-only fallback) for protocol-correctness testing — no line
+rate, no DPDK acceleration.</p>
+
+<table>
+  <tr><th>Command</th><th>macOS</th><th>Windows</th><th>Linux</th></tr>
+  <tr><td><code>ostg-client</code></td><td>✅</td><td>✅</td><td>✅</td></tr>
+  <tr><td><code>netgen-cli</code></td><td>✅</td><td>✅</td><td>✅</td></tr>
+  <tr><td><code>ostg-server --no-dpdk</code> (Scapy)</td>
+      <td>⚠️ protocol-correctness only</td>
+      <td>⚠️ same caveat</td>
+      <td>✅ full</td></tr>
+  <tr><td><code>ostg-server</code> (DPDK)</td>
+      <td>❌</td><td>❌</td><td>✅</td></tr>
 </table>
 
 <h2>3. CLI install (deep / scripted)</h2>
