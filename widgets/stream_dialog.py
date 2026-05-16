@@ -330,12 +330,72 @@ _INSTALL_GUIDE_HTML = r"""
 </style>
 
 <h1>Netgen Server — Installation Guide</h1>
-<p class="muted">A single <code>install_ostg_complete.py</code> command provisions
-the netgen-server on a fresh Ubuntu 22.04 host, including the full DPDK
-runtime (libraries + tx_worker binary). No follow-up "Install DPDK" step
-required.</p>
+<p class="muted">Three paths: in-GUI installer (no terminal), prebuilt
+release artifacts (download &amp; double-click), or the
+<code>install_ostg_complete.py</code> CLI for scripted provisioning.
+All three land the same wheel + DPDK runtime + systemd unit. Pick
+based on whether you have SSH creds, a working server, or just want
+a click-through experience.</p>
 
-<h2>1. Quick start</h2>
+<h2>1. In-GUI installer (NEW in 0.2.6) <span class="ok">★ recommended</span></h2>
+
+<p>You're in the client right now. Drive both install and upgrade
+without leaving it:</p>
+
+<p><b>Help → Install / Upgrade Server...</b></p>
+
+<table>
+  <tr><th>Tab</th><th>When to use</th><th>What it does</th></tr>
+  <tr><td><b>Upgrade running server</b><br><span class="muted">HTTP, ~30–60 s</span></td>
+      <td>Server is already running an older wheel; you want to roll a
+          new release onto it. No SSH needed.</td>
+      <td>Picks a <code>.whl</code> file → POSTs to
+          <code>/api/admin/upgrade_wheel</code> → server runs
+          <code>pip install --upgrade --force-reinstall --no-deps</code>
+          under its own interpreter → triggers
+          <code>systemctl restart netgen-server</code> → client polls
+          <code>/api/health</code> for the new instance.</td></tr>
+  <tr><td><b>Fresh install via SSH</b><br><span class="muted">paramiko, 15–45 min</span></td>
+      <td>Bare Linux host. No netgen, no Docker, no DPDK yet.</td>
+      <td>Connects (password OR SSH key) → sftp-copies the wheel +
+          <code>install_ostg_complete.py</code> to
+          <code>/tmp/netgen_install/</code> → runs the installer
+          (sudo'd if user ≠ root) → streams every line of output
+          into the dialog's log pane. Optional flags:
+          <code>--no-dpdk</code>, <code>--skip-dpdk-build</code>.</td></tr>
+</table>
+
+<p><b>Safety properties:</b> overlapping uploads return HTTP 409;
+filenames other than <code>*.whl</code> return HTTP 400 (no path
+traversal); SSH password lives only in the dialog field for the
+operation's duration (never written to disk); closing the dialog
+mid-run prompts before tearing down the worker thread.</p>
+
+<p class="muted">The dialog uses HTTP (Tab 1) and paramiko (Tab 2);
+no Python toolchain required on the target. Pre-fills Server URL
+from the current client connection and auth token from
+<code>$NETGEN_AUTH_TOKEN</code>.</p>
+
+<h2>2. Prebuilt release artifacts</h2>
+
+<p>Every tagged release on GitHub ships four CI-built artifacts under
+<a href="https://github.com/amishagrawal2001-arch/netgen/releases/latest">releases/latest</a>.
+For server installs use the wheel; the AppImage/DMG/EXE are
+client-only:</p>
+
+<table>
+  <tr><th>File</th><th>Use for</th></tr>
+  <tr><td><code>ostg_trafficgen-&lt;v&gt;-py3-none-any.whl</code></td>
+      <td>Server install + scripted client installs (any platform with Python ≥3.9)</td></tr>
+  <tr><td><code>Netgen-Client-&lt;v&gt;-linux-x86_64.AppImage</code></td>
+      <td>Linux client only — single-file, runs on any modern distro</td></tr>
+  <tr><td><code>Netgen-TrafficGenerator-&lt;v&gt;.dmg</code></td>
+      <td>macOS client only — drag-to-Applications</td></tr>
+  <tr><td><code>Netgen-Client-&lt;v&gt;-windows.exe</code></td>
+      <td>Windows client only — double-click installer</td></tr>
+</table>
+
+<h2>3. CLI install (deep / scripted)</h2>
 <pre># From a fresh checkout — build the wheel locally (gitignored)
 python3 -m build --wheel
 
@@ -347,7 +407,7 @@ At the end you have netgen-server running as a systemd unit, listening on
 port 5050, and a <code>tx_worker</code> binary ready to drive line-rate
 DPDK streams.</p>
 
-<h2>2. What gets installed, in order</h2>
+<h2>4. What gets installed, in order</h2>
 
 <table>
   <tr><th>Step</th><th>What it does</th></tr>
@@ -397,7 +457,7 @@ DPDK streams.</p>
           missing).</td></tr>
 </table>
 
-<h2>3. CLI flags</h2>
+<h2>5. CLI flags</h2>
 
 <table>
   <tr><th>Flag</th><th>Effect</th></tr>
@@ -422,7 +482,7 @@ DPDK streams.</p>
 <p class="muted">Defaults preserve "install DPDK" behavior — no flag needed
 for normal use.</p>
 
-<h2>4. Tolerant of failures</h2>
+<h2>6. Tolerant of failures</h2>
 
 <p>If the DPDK build fails (kernel-header / libibverbs version mismatch,
 flaky apt mirror, NIC vendor lib missing), the rest of the install
@@ -442,7 +502,7 @@ recovery paths:</p>
       → click <b>Install DPDK</b>. Same script, retried interactively.</li>
 </ol>
 
-<h2>5. Sanity-check after install</h2>
+<h2>7. Sanity-check after install</h2>
 
 <pre>ssh root@&lt;server&gt; 'systemctl is-active netgen-server'      # active
 ssh root@&lt;server&gt; 'curl -s http://localhost:5050/api/health' # 200 OK
@@ -454,7 +514,7 @@ ssh root@&lt;server&gt; 'pkg-config --modversion libdpdk'         # e.g. 23.11.0
 confirm the runtime cards (DPDK Runtime, Hugepages, Network Interfaces)
 all show green.</p>
 
-<h2>6. What lives where on the target</h2>
+<h2>8. What lives where on the target</h2>
 
 <table>
   <tr><th>Path</th><th>Contents</th></tr>
@@ -484,14 +544,32 @@ all show green.</p>
           DPDK build acted up.</td></tr>
 </table>
 
-<h2>7. Reinstall / upgrade</h2>
+<h2>9. Reinstall / upgrade</h2>
 
-<p>The install script is <b>idempotent</b>: <code>cleanup_old_install</code>
-wipes legacy artifacts on every run, and the wheel install handles upgrades
-via <code>pip install --upgrade</code> internally. Just bump the version in
-<code>pyproject.toml</code>, rebuild the wheel, re-run the install command.</p>
+<p>Three options, fastest to heaviest:</p>
 
-<pre># Bump pyproject.toml version, then:
+<table>
+  <tr><th>Method</th><th>Time</th><th>When to use</th></tr>
+  <tr><td><b>Help → Install / Upgrade Server → Tab 1</b><br>
+          <span class="muted">(NEW in 0.2.6)</span></td>
+      <td>30–60 s</td>
+      <td>Just rolling a new wheel onto a running server. No SSH, no
+          re-running the full provisioning flow. See section&nbsp;1
+          above.</td></tr>
+  <tr><td><b><code>pip install --upgrade</code> over SSH</b></td>
+      <td>~10 s</td>
+      <td>Manual / scripted equivalent of Tab 1:
+          <code>scp wheel.whl root@host:/tmp/ &amp;&amp; ssh root@host
+          'pip install --upgrade /tmp/wheel.whl &amp;&amp; systemctl restart
+          netgen-server'</code></td></tr>
+  <tr><td><b><code>install_ostg_complete.py</code> rerun</b></td>
+      <td>5–10 min</td>
+      <td>Full re-provision (idempotent — <code>cleanup_old_install</code>
+          wipes legacy artifacts). Use when you've also changed DPDK
+          config, systemd unit, or the FRR Docker image.</td></tr>
+</table>
+
+<pre># Full re-provision: bump pyproject.toml version, then:
 python3 -m build --wheel
 python3 install_ostg_complete.py -H &lt;host&gt; -p &lt;password&gt;</pre>
 
