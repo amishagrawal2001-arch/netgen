@@ -57,13 +57,77 @@ def sanitize_for_json(obj):
 
 class TrafficGenClientMenuAction():
     def add_server_interface(self):
-        """Add a new server interface."""
+        """Add a TGEN chassis via the Spirent-style dialog.
+
+        Replaces the legacy two-step QInputDialog flow (address, port).
+        The dialog keeps a history of past connections at
+        ~/.netgen/chassis_history.json so operators can pick a chassis
+        with one click instead of re-typing the address. Auto-probes
+        /api/health for each history row on open so the LED column
+        shows live reachability.
+        """
+        try:
+            from widgets.add_tgen_dialog import AddTGenDialog
+        except Exception as e:
+            # Fallback to the legacy prompt if the dialog can't load
+            # (shouldn't happen — module is part of the wheel/AppImage).
+            logger.error(f"AddTGenDialog import failed, falling back: {e}")
+            return self._add_server_interface_legacy()
+
+        dlg = AddTGenDialog(self)
+        if not dlg.exec_() or not dlg.chosen_url:
+            return  # user cancelled
+        full_url = dlg.chosen_url
+
+        if full_url in [server["address"] for server in self.server_interfaces]:
+            QMessageBox.warning(self, "Duplicate Server", "This server is already added.")
+            return
+
+        tg_id = len(self.server_interfaces)
+        server_entry = {"tg_id": tg_id, "address": full_url, "online": True}
+        if dlg.chosen_label:
+            server_entry["label"] = dlg.chosen_label
+        self.server_interfaces.append(server_entry)
+
+        # Stash the auth token (session-only — not persisted to disk) so the
+        # rest of the client can pick it up for /api/* requests.
+        if dlg.chosen_auth:
+            if not hasattr(self, "_server_auth_tokens"):
+                self._server_auth_tokens = {}
+            self._server_auth_tokens[full_url] = dlg.chosen_auth
+
+        # Forgive a prior remove
+        if full_url in self.removed_servers:
+            self.removed_servers.discard(full_url)
+            logger.info(f"[ADD SERVER] Removed {full_url} from removed_servers (re-added)")
+
+        if hasattr(self, "server_manager"):
+            from utils.server_manager import ServerManager
+            server_id = ServerManager._extract_server_id_from_url(full_url)
+            self.server_manager.register_server(
+                server_id=server_id,
+                address=full_url,
+                tg_id=tg_id,
+                online=True,
+            )
+            logger.info(f"[ADD SERVER] Registered server {server_id} in ServerManager")
+
+        self.update_server_tree()
+        self.save_server_interfaces()
+
+    def _add_server_interface_legacy(self):
+        """Fallback path: bare two-step input dialog.
+
+        Kept for environments where widgets/add_tgen_dialog.py fails to
+        import (corrupted install, custom strip-down). Same logic as the
+        pre-0.2.7 implementation.
+        """
         server_url, ok = QInputDialog.getText(self, "Add Server", "Enter Server Address (e.g., 127.0.0.1):")
         if not ok or not server_url.strip():
             return
 
-        port, ok = QInputDialog.getText(self, "Add Port", "Enter Port (default: 80):")
-        port = port.strip() if port else "80"
+        port, ok = QInputDialog.getText(self, "Add Port", "Enter Port (default: 5050):")
+        port = port.strip() if port else "5050"
 
         try:
             full_url = f"http://{server_url.strip()}:{int(port)}"
@@ -72,27 +136,17 @@ class TrafficGenClientMenuAction():
             return
 
         if full_url not in [server["address"] for server in self.server_interfaces]:
-            tg_id = len(self.server_interfaces)  # Assign the next TG ID
+            tg_id = len(self.server_interfaces)
             server_entry = {"tg_id": tg_id, "address": full_url, "online": True}
             self.server_interfaces.append(server_entry)
-            
-            # Remove from removed_servers if it was previously removed
             if full_url in self.removed_servers:
                 self.removed_servers.discard(full_url)
-                logger.info(f"[ADD SERVER] Removed {full_url} from removed_servers (server was re-added)")
-            
-            # Update ServerManager if available
             if hasattr(self, "server_manager"):
                 from utils.server_manager import ServerManager
                 server_id = ServerManager._extract_server_id_from_url(full_url)
                 self.server_manager.register_server(
-                    server_id=server_id,
-                    address=full_url,
-                    tg_id=tg_id,
-                    online=True
+                    server_id=server_id, address=full_url, tg_id=tg_id, online=True,
                 )
-                logger.info(f"[ADD SERVER] Registered server {server_id} in ServerManager")
-            
             self.update_server_tree()
             self.save_server_interfaces()
         else:
