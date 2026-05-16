@@ -1,5 +1,6 @@
 # traffic_client/main.py
 import logging
+import os
 
 # Configure logging early - set to INFO to reduce verbosity
 logging.basicConfig(
@@ -1201,6 +1202,22 @@ class TrafficGeneratorClient(
 
         help_menu.addSeparator()
 
+        # Install / Upgrade Server — drives the server install + upgrade
+        # paths without leaving the GUI. Tab 1: upload a wheel to a running
+        # server (HTTP). Tab 2: SSH into a bare Linux host and run the
+        # full install_ostg_complete.py provisioning flow.
+        install_server_action = QAction("Install / Upgrade Server...", self)
+        install_server_action.setToolTip(
+            "Upload a wheel to upgrade a running netgen-server, OR SSH "
+            "into a fresh Linux host and run install_ostg_complete.py "
+            "(apt + Docker + FRR + DPDK + systemd)."
+        )
+        install_server_action.triggered.connect(self.show_install_server_dialog)
+        help_menu.addAction(install_server_action)
+        self.addAction(install_server_action)
+
+        help_menu.addSeparator()
+
         dpdk_guide_action = QAction("DPDK Traffic Blast Workflow...", self)
         dpdk_guide_action.setShortcut(QKeySequence("F1"))
         dpdk_guide_action.setToolTip(
@@ -1221,6 +1238,48 @@ class TrafficGeneratorClient(
         except Exception as e:
             from PyQt5.QtWidgets import QMessageBox
             QMessageBox.warning(self, "Help unavailable", f"Could not open guide: {e}")
+
+    def show_install_server_dialog(self):
+        """Open the Install / Upgrade Server dialog (Help menu).
+
+        Pre-fills the Server URL field from the currently-connected server
+        and the auth token from NETGEN_AUTH_TOKEN env, so the common
+        'upgrade the server I'm pointed at' case is one click.
+        """
+        try:
+            from widgets.install_server_dialog import InstallServerDialog
+        except Exception as e:
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self, "Install dialog unavailable",
+                f"Could not load install dialog: {e}\n\n"
+                "If you see 'paramiko import failed' the client venv is "
+                "missing paramiko: pip install paramiko"
+            )
+            return
+
+        # Best-effort pre-fill — both fields are optional and the user
+        # can override in the dialog.
+        default_url = ""
+        try:
+            # ServerSection stores the active URL on the main window as
+            # self.server_url or similar — try a couple of attribute names.
+            for attr in ("server_url", "_server_url", "current_server_url"):
+                val = getattr(self, attr, "") or ""
+                if val:
+                    default_url = str(val)
+                    break
+        except Exception:
+            pass
+
+        default_token = os.environ.get("NETGEN_AUTH_TOKEN", "")
+
+        dlg = InstallServerDialog(
+            parent=self,
+            default_server_url=default_url,
+            default_auth_token=default_token,
+        )
+        dlg.exec_()
 
     def show_rfc2544_dialog(self):
         """Open the RFC 2544 throughput test dialog from Tools menu."""

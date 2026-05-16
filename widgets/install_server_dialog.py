@@ -1,0 +1,632 @@
+"""Install / Upgrade Server dialog — drives both paths from the client GUI.
+
+Tab 1 — "Upgrade running server": uploads a wheel to /api/admin/upgrade_wheel
+on a running server. Server pip-installs it and restarts itself via systemd.
+Pure HTTP; no SSH.
+
+Tab 2 — "Fresh install via SSH": SSHes (paramiko) into a bare Linux host,
+sftp-copies install_ostg_complete.py + the wheel, runs the installer as
+root, streams its output back. Covers the green-field provisioning case.
+
+Both tabs use background QThreads so the UI stays responsive while long
+operations (pip install ~30 s, full install_ostg_complete.py ~15-45 min)
+run. Output is appended into a read-only log pane as it arrives.
+"""
+
+from __future__ import annotations
+
+import os
+import time
+from typing import Optional
+
+from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtWidgets import (
+    QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+    QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+    QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QRadioButton,
+    QSpinBox, QTabWidget, QVBoxLayout, QWidget,
+)
+
+
+# ---------------------------------------------------------------------------
+# Background workers
+# ---------------------------------------------------------------------------
+
+
+class WheelUploadWorker(QThread):
+    """POST /api/admin/upgrade_wheel + poll /log until restart completes."""
+
+    log_chunk = pyqtSignal(str)
+    status = pyqtSignal(str)        # human-readable status updates
+    finished_ok = pyqtSignal(bool)  # True = upgrade succeeded + restart OK
+
+    def __init__(self, server_url: str, wheel_path: str, auth_token: str = ""):
+        super().__init__()
+        self.server_url = server_url.rstrip("/")
+        self.wheel_path = wheel_path
+        self.auth_token = (auth_token or "").strip()
+        self._stop = False
+
+    def stop(self) -> None:
+        self._stop = True
+
+    def _headers(self) -> dict:
+        h = {}
+        if self.auth_token:
+            h["Authorization"] = f"Bearer {self.auth_token}"
+        return h
+
+    def run(self) -> None:
+        try:
+            import requests
+        except Exception as e:
+            self.log_chunk.emit(f"[client] requests import failed: {e}\n")
+            self.finished_ok.emit(False)
+            return
+
+        wheel_name = os.path.basename(self.wheel_path)
+        wheel_size = os.path.getsize(self.wheel_path)
+
+        # 1. Upload
+        self.status.emit(f"Uploading {wheel_name} ({wheel_size/1024:.0f} KB)...")
+        self.log_chunk.emit(f"[client] POST {self.server_url}/api/admin/upgrade_wheel\n")
+        try:
+            with open(self.wheel_path, "rb") as fh:
+                r = requests.post(
+                    f"{self.server_url}/api/admin/upgrade_wheel",
+                    headers=self._headers(),
+                    files={"wheel": (wheel_name, fh, "application/octet-stream")},
+                    timeout=120,
+                )
+        except Exception as e:
+            self.log_chunk.emit(f"[client] upload failed: {e}\n")
+            self.finished_ok.emit(False)
+            return
+
+        if r.status_code != 200:
+            self.log_chunk.emit(
+                f"[client] server rejected upload: {r.status_code} {r.text[:400]}\n"
+            )
+            self.finished_ok.emit(False)
+            return
+        body = r.json()
+        self.log_chunk.emit(f"[client] pip pid={body.get('pid')} log={body.get('log_path')}\n")
+
+        # 2. Poll log
+        self.status.emit("pip install running on server...")
+        last_len = 0
+        deadline = time.time() + 600  # 10 min cap for pip alone
+        restart_seen = False
+        while time.time() < deadline and not self._stop:
+            try:
+                lr = requests.get(
+                    f"{self.server_url}/api/admin/upgrade_wheel/log",
+                    headers=self._headers(),
+                    timeout=10,
+                )
+                if lr.status_code != 200:
+                    self.log_chunk.emit(f"[client] log poll: HTTP {lr.status_code}\n")
+                    time.sleep(2)
+                    continue
+                lb = lr.json()
+                log_text = lb.get("log", "") or ""
+                # Emit just the new tail since last poll
+                if len(log_text) > last_len:
+                    new = log_text[last_len:]
+                    self.log_chunk.emit(new)
+                    last_len = len(log_text)
+
+                if not lb.get("running", False):
+                    rc = lb.get("return_code")
+                    if rc == 0:
+                        if lb.get("restart_scheduled") and not restart_seen:
+                            restart_seen = True
+                            self.status.emit("pip ok — server restarting via systemd...")
+                        break
+                    else:
+                        self.log_chunk.emit(
+                            f"[client] pip exited rc={rc}; aborting\n"
+                        )
+                        self.finished_ok.emit(False)
+                        return
+            except Exception as e:
+                # Server probably restarting — log poll will fail mid-restart.
+                # Don't bail; the health probe below will reconfirm.
+                if restart_seen:
+                    break
+                self.log_chunk.emit(f"[client] log poll error: {e} (retrying)\n")
+            time.sleep(2)
+
+        # 3. Wait for /api/health to come back (server reboot)
+        self.status.emit("Waiting for server to come back...")
+        self.log_chunk.emit("[client] polling /api/health for restart...\n")
+        health_deadline = time.time() + 90
+        while time.time() < health_deadline and not self._stop:
+            try:
+                hr = requests.get(f"{self.server_url}/api/health", timeout=4)
+                if hr.status_code == 200:
+                    self.log_chunk.emit("[client] server healthy — upgrade complete\n")
+                    self.status.emit("Upgrade complete — server back online")
+                    self.finished_ok.emit(True)
+                    return
+            except Exception:
+                pass
+            time.sleep(2)
+
+        self.log_chunk.emit("[client] server did not return to health within 90s\n")
+        self.status.emit("Upgrade finished but server is not responding")
+        self.finished_ok.emit(False)
+
+
+class SshInstallWorker(QThread):
+    """SSH into a bare host, copy wheel + installer, run install_ostg_complete.py."""
+
+    log_chunk = pyqtSignal(str)
+    status = pyqtSignal(str)
+    finished_ok = pyqtSignal(bool)
+
+    def __init__(
+        self,
+        host: str,
+        user: str,
+        password: Optional[str],
+        key_path: Optional[str],
+        wheel_path: str,
+        installer_path: str,
+        extra_flags: list,
+    ):
+        super().__init__()
+        self.host = host
+        self.user = user
+        self.password = password
+        self.key_path = key_path
+        self.wheel_path = wheel_path
+        self.installer_path = installer_path
+        self.extra_flags = extra_flags or []
+        self._stop = False
+
+    def stop(self) -> None:
+        self._stop = True
+
+    def run(self) -> None:
+        try:
+            import paramiko
+        except Exception as e:
+            self.log_chunk.emit(
+                f"[client] paramiko import failed: {e}\n"
+                f"[client] install paramiko in the client env: pip install paramiko\n"
+            )
+            self.finished_ok.emit(False)
+            return
+
+        self.status.emit(f"Connecting to {self.user}@{self.host}...")
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+        try:
+            kwargs = {"hostname": self.host, "username": self.user, "timeout": 15}
+            if self.key_path:
+                kwargs["key_filename"] = self.key_path
+                self.log_chunk.emit(f"[client] auth: key {self.key_path}\n")
+            else:
+                kwargs["password"] = self.password
+                self.log_chunk.emit("[client] auth: password\n")
+            client.connect(**kwargs)
+        except Exception as e:
+            self.log_chunk.emit(f"[client] SSH connect failed: {e}\n")
+            self.finished_ok.emit(False)
+            return
+
+        try:
+            sftp = client.open_sftp()
+        except Exception as e:
+            self.log_chunk.emit(f"[client] SFTP open failed: {e}\n")
+            client.close()
+            self.finished_ok.emit(False)
+            return
+
+        # Copy wheel + installer to /tmp/netgen_install/
+        remote_dir = "/tmp/netgen_install"
+        try:
+            try:
+                sftp.mkdir(remote_dir)
+            except IOError:
+                pass  # exists
+            wheel_remote = f"{remote_dir}/{os.path.basename(self.wheel_path)}"
+            installer_remote = f"{remote_dir}/install_ostg_complete.py"
+            self.status.emit(f"Copying wheel to {wheel_remote}...")
+            self.log_chunk.emit(f"[client] sftp put {self.wheel_path} → {wheel_remote}\n")
+            sftp.put(self.wheel_path, wheel_remote)
+            self.log_chunk.emit(f"[client] sftp put {self.installer_path} → {installer_remote}\n")
+            sftp.put(self.installer_path, installer_remote)
+            sftp.chmod(installer_remote, 0o755)
+        except Exception as e:
+            self.log_chunk.emit(f"[client] SFTP upload failed: {e}\n")
+            sftp.close()
+            client.close()
+            self.finished_ok.emit(False)
+            return
+        finally:
+            try:
+                sftp.close()
+            except Exception:
+                pass
+
+        # Run installer
+        cmd_flags = " ".join(self.extra_flags)
+        cmd = (
+            f"cd {remote_dir} && "
+            f"python3 install_ostg_complete.py "
+            f"-w {remote_dir} {cmd_flags}".strip()
+        )
+        if self.user != "root":
+            cmd = f"sudo {cmd}"
+        self.status.emit("Running install_ostg_complete.py on server...")
+        self.log_chunk.emit(f"[client] exec: {cmd}\n")
+
+        try:
+            stdin, stdout, stderr = client.exec_command(cmd, get_pty=True, timeout=None)
+            stdout.channel.set_combine_stderr(True)
+            for line in iter(stdout.readline, ""):
+                if self._stop:
+                    self.log_chunk.emit("[client] cancelled by user\n")
+                    break
+                self.log_chunk.emit(line)
+            rc = stdout.channel.recv_exit_status()
+            self.log_chunk.emit(f"[client] installer exit rc={rc}\n")
+            if rc == 0:
+                self.status.emit("Install complete — server provisioned")
+                self.finished_ok.emit(True)
+            else:
+                self.status.emit(f"Install failed (rc={rc})")
+                self.finished_ok.emit(False)
+        except Exception as e:
+            self.log_chunk.emit(f"[client] exec failed: {e}\n")
+            self.finished_ok.emit(False)
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
+# Dialog
+# ---------------------------------------------------------------------------
+
+
+class InstallServerDialog(QDialog):
+    """Two-tab dialog: upgrade running server (HTTP) | fresh install (SSH)."""
+
+    def __init__(
+        self,
+        parent=None,
+        default_server_url: str = "",
+        default_auth_token: str = "",
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Install / Upgrade Server")
+        self.setMinimumSize(820, 600)
+
+        self._worker: Optional[QThread] = None
+
+        layout = QVBoxLayout(self)
+
+        intro = QLabel(
+            "Roll a new server build to a running netgen-server, or "
+            "provision a fresh Linux host from this client. The server "
+            "always needs Linux (DPDK + systemd + Docker for FRR); the "
+            "AppImage we ship is client-only."
+        )
+        intro.setWordWrap(True)
+        layout.addWidget(intro)
+
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_upgrade_tab(default_server_url, default_auth_token),
+                         "Upgrade running server")
+        self.tabs.addTab(self._build_fresh_install_tab(), "Fresh install via SSH")
+        layout.addWidget(self.tabs, 1)
+
+        # Shared log pane (each tab writes here)
+        log_box = QGroupBox("Log")
+        log_layout = QVBoxLayout(log_box)
+        self.log_view = QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        self.log_view.setMaximumBlockCount(5000)
+        self.log_view.setStyleSheet(
+            "QPlainTextEdit{font-family: ui-monospace, Menlo, Consolas, monospace; font-size:11px;}"
+        )
+        log_layout.addWidget(self.log_view)
+        self.status_lbl = QLabel("Ready.")
+        self.status_lbl.setStyleSheet("color:#475569; font-size:11px;")
+        log_layout.addWidget(self.status_lbl)
+        layout.addWidget(log_box, 1)
+
+        btn_box = QDialogButtonBox(QDialogButtonBox.Close)
+        btn_box.rejected.connect(self.reject)
+        btn_box.accepted.connect(self.accept)
+        layout.addWidget(btn_box)
+
+    # -- Tab 1: HTTP upgrade -------------------------------------------------
+
+    def _build_upgrade_tab(self, default_url: str, default_token: str) -> QWidget:
+        w = QWidget()
+        form = QFormLayout(w)
+
+        self.up_server = QLineEdit(default_url or "http://lab-box:5050")
+        form.addRow("Server URL:", self.up_server)
+
+        self.up_token = QLineEdit(default_token or "")
+        self.up_token.setEchoMode(QLineEdit.Password)
+        self.up_token.setPlaceholderText("(only if NETGEN_AUTH_TOKEN is set on server)")
+        form.addRow("Auth token:", self.up_token)
+
+        wheel_row = QHBoxLayout()
+        self.up_wheel = QLineEdit()
+        self.up_wheel.setPlaceholderText("/path/to/ostg_trafficgen-<v>-py3-none-any.whl")
+        wheel_browse = QPushButton("Browse...")
+        wheel_browse.clicked.connect(lambda: self._browse_wheel(self.up_wheel))
+        wheel_row.addWidget(self.up_wheel, 1)
+        wheel_row.addWidget(wheel_browse)
+        form.addRow("Wheel file:", wheel_row)
+
+        info = QLabel(
+            "Uploads the wheel to /api/admin/upgrade_wheel. Server runs "
+            "<code>pip install --upgrade --force-reinstall --no-deps</code> "
+            "in its own Python, then triggers <code>systemctl restart "
+            "netgen-server</code>. The client waits for /api/health to "
+            "come back. Typical round-trip: 30–60 s."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color:#475569; font-size:11px;")
+        form.addRow(info)
+
+        self.up_btn = QPushButton("Upload && Upgrade")
+        self.up_btn.clicked.connect(self._start_upgrade)
+        form.addRow("", self.up_btn)
+
+        return w
+
+    def _browse_wheel(self, line_edit: QLineEdit) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select wheel file", "", "Python wheels (*.whl);;All files (*)"
+        )
+        if path:
+            line_edit.setText(path)
+
+    def _start_upgrade(self) -> None:
+        if self._worker and self._worker.isRunning():
+            QMessageBox.information(self, "Busy", "An operation is already in progress.")
+            return
+        url = (self.up_server.text() or "").strip()
+        wheel = (self.up_wheel.text() or "").strip()
+        token = (self.up_token.text() or "").strip()
+        if not url:
+            QMessageBox.warning(self, "Missing", "Server URL is required.")
+            return
+        if not wheel or not os.path.isfile(wheel):
+            QMessageBox.warning(self, "Missing", "Pick a valid wheel file.")
+            return
+
+        self.log_view.clear()
+        self._set_status("Starting upgrade...")
+        self.up_btn.setEnabled(False)
+
+        self._worker = WheelUploadWorker(url, wheel, token)
+        self._worker.log_chunk.connect(self._append_log)
+        self._worker.status.connect(self._set_status)
+        self._worker.finished_ok.connect(self._upgrade_finished)
+        self._worker.start()
+
+    def _upgrade_finished(self, ok: bool) -> None:
+        self.up_btn.setEnabled(True)
+        if ok:
+            QMessageBox.information(self, "Upgrade complete",
+                                    "Server has restarted with the new wheel.")
+        else:
+            QMessageBox.warning(self, "Upgrade failed",
+                                "See log for details.")
+
+    # -- Tab 2: SSH fresh install -------------------------------------------
+
+    def _build_fresh_install_tab(self) -> QWidget:
+        w = QWidget()
+        form = QFormLayout(w)
+
+        host_row = QHBoxLayout()
+        self.ssh_host = QLineEdit()
+        self.ssh_host.setPlaceholderText("lab-box.example.com")
+        self.ssh_user = QLineEdit("root")
+        self.ssh_user.setMaximumWidth(140)
+        host_row.addWidget(self.ssh_host, 1)
+        host_row.addWidget(QLabel("user:"))
+        host_row.addWidget(self.ssh_user)
+        form.addRow("Host:", host_row)
+
+        # Auth toggle
+        self.auth_grp = QButtonGroup(self)
+        self.auth_pw_rb = QRadioButton("Password")
+        self.auth_key_rb = QRadioButton("SSH key")
+        self.auth_pw_rb.setChecked(True)
+        self.auth_grp.addButton(self.auth_pw_rb)
+        self.auth_grp.addButton(self.auth_key_rb)
+        auth_row = QHBoxLayout()
+        auth_row.addWidget(self.auth_pw_rb)
+        auth_row.addWidget(self.auth_key_rb)
+        auth_row.addStretch(1)
+        form.addRow("Auth:", auth_row)
+
+        self.ssh_password = QLineEdit()
+        self.ssh_password.setEchoMode(QLineEdit.Password)
+        self.ssh_password.setPlaceholderText("(SSH password — not stored)")
+        form.addRow("Password:", self.ssh_password)
+
+        key_row = QHBoxLayout()
+        self.ssh_key = QLineEdit()
+        self.ssh_key.setPlaceholderText("~/.ssh/id_ed25519")
+        key_browse = QPushButton("Browse...")
+        key_browse.clicked.connect(lambda: self._browse_file(self.ssh_key, "SSH key files (*)"))
+        key_row.addWidget(self.ssh_key, 1)
+        key_row.addWidget(key_browse)
+        form.addRow("Key file:", key_row)
+
+        self.auth_pw_rb.toggled.connect(self._update_auth_visibility)
+        self._update_auth_visibility()
+
+        # Wheel + installer paths
+        wheel_row = QHBoxLayout()
+        self.ssh_wheel = QLineEdit()
+        self.ssh_wheel.setPlaceholderText("/path/to/ostg_trafficgen-<v>-py3-none-any.whl")
+        wb = QPushButton("Browse...")
+        wb.clicked.connect(lambda: self._browse_wheel(self.ssh_wheel))
+        wheel_row.addWidget(self.ssh_wheel, 1)
+        wheel_row.addWidget(wb)
+        form.addRow("Wheel:", wheel_row)
+
+        installer_row = QHBoxLayout()
+        self.ssh_installer = QLineEdit(self._guess_installer_path())
+        self.ssh_installer.setPlaceholderText("/path/to/install_ostg_complete.py")
+        ib = QPushButton("Browse...")
+        ib.clicked.connect(lambda: self._browse_file(self.ssh_installer, "Python (*.py)"))
+        installer_row.addWidget(self.ssh_installer, 1)
+        installer_row.addWidget(ib)
+        form.addRow("Installer:", installer_row)
+
+        # Flags
+        flags_box = QGroupBox("install_ostg_complete.py flags (optional)")
+        flags_layout = QVBoxLayout(flags_box)
+        self.flag_no_dpdk = QCheckBox("--no-dpdk  (skip DPDK install entirely)")
+        self.flag_skip_dpdk_build = QCheckBox(
+            "--skip-dpdk-build  (apt deps only, no 10–30 min meson build)"
+        )
+        flags_layout.addWidget(self.flag_no_dpdk)
+        flags_layout.addWidget(self.flag_skip_dpdk_build)
+        form.addRow(flags_box)
+
+        info = QLabel(
+            "Copies the wheel + install_ostg_complete.py to <code>/tmp/netgen_install/</code> "
+            "on the target host, then runs the installer (sudo'd if user != root). "
+            "Full installs take 15–45 min; output streams here as it runs."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color:#475569; font-size:11px;")
+        form.addRow(info)
+
+        self.ssh_btn = QPushButton("Install")
+        self.ssh_btn.clicked.connect(self._start_ssh_install)
+        form.addRow("", self.ssh_btn)
+
+        return w
+
+    def _update_auth_visibility(self) -> None:
+        use_pw = self.auth_pw_rb.isChecked()
+        self.ssh_password.setEnabled(use_pw)
+        self.ssh_key.setEnabled(not use_pw)
+
+    def _browse_file(self, line_edit: QLineEdit, filt: str) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Select file", "", filt)
+        if path:
+            line_edit.setText(path)
+
+    def _guess_installer_path(self) -> str:
+        """Find install_ostg_complete.py relative to the running client."""
+        here = os.path.dirname(os.path.abspath(__file__))
+        for candidate in (
+            os.path.join(here, "..", "install_ostg_complete.py"),
+            "/opt/netgen/install_ostg_complete.py",
+            "/opt/OSTG/install_ostg_complete.py",
+        ):
+            if os.path.isfile(candidate):
+                return os.path.abspath(candidate)
+        return ""
+
+    def _start_ssh_install(self) -> None:
+        if self._worker and self._worker.isRunning():
+            QMessageBox.information(self, "Busy", "An operation is already in progress.")
+            return
+        host = (self.ssh_host.text() or "").strip()
+        user = (self.ssh_user.text() or "root").strip()
+        wheel = (self.ssh_wheel.text() or "").strip()
+        installer = (self.ssh_installer.text() or "").strip()
+        if not host:
+            QMessageBox.warning(self, "Missing", "Host is required.")
+            return
+        if not wheel or not os.path.isfile(wheel):
+            QMessageBox.warning(self, "Missing", "Pick a valid wheel file.")
+            return
+        if not installer or not os.path.isfile(installer):
+            QMessageBox.warning(self, "Missing",
+                                "Pick install_ostg_complete.py from the repo checkout.")
+            return
+
+        if self.auth_pw_rb.isChecked():
+            password = self.ssh_password.text() or ""
+            key_path = None
+            if not password:
+                QMessageBox.warning(self, "Missing", "Enter the SSH password.")
+                return
+        else:
+            password = None
+            key_path = (self.ssh_key.text() or "").strip()
+            if not key_path or not os.path.isfile(key_path):
+                QMessageBox.warning(self, "Missing", "Pick a valid SSH key file.")
+                return
+
+        flags = []
+        if self.flag_no_dpdk.isChecked():
+            flags.append("--no-dpdk")
+        if self.flag_skip_dpdk_build.isChecked():
+            flags.append("--skip-dpdk-build")
+
+        self.log_view.clear()
+        self._set_status("Connecting...")
+        self.ssh_btn.setEnabled(False)
+
+        self._worker = SshInstallWorker(
+            host=host, user=user, password=password, key_path=key_path,
+            wheel_path=wheel, installer_path=installer, extra_flags=flags,
+        )
+        self._worker.log_chunk.connect(self._append_log)
+        self._worker.status.connect(self._set_status)
+        self._worker.finished_ok.connect(self._ssh_install_finished)
+        self._worker.start()
+
+    def _ssh_install_finished(self, ok: bool) -> None:
+        self.ssh_btn.setEnabled(True)
+        if ok:
+            QMessageBox.information(
+                self, "Install complete",
+                "Server has been provisioned. Point your client at http://<host>:5050."
+            )
+        else:
+            QMessageBox.warning(self, "Install failed", "See log for details.")
+
+    # -- Shared helpers ------------------------------------------------------
+
+    def _append_log(self, text: str) -> None:
+        # Avoid scrollback explosion on huge installs: maxBlockCount cap above.
+        cur = self.log_view.textCursor()
+        cur.movePosition(cur.End)
+        cur.insertText(text if text.endswith("\n") else text)
+        self.log_view.setTextCursor(cur)
+        self.log_view.ensureCursorVisible()
+
+    def _set_status(self, text: str) -> None:
+        self.status_lbl.setText(text)
+
+    def closeEvent(self, e):
+        if self._worker and self._worker.isRunning():
+            ret = QMessageBox.question(
+                self, "Operation in progress",
+                "An install/upgrade is still running. Cancel and close?",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if ret != QMessageBox.Yes:
+                e.ignore()
+                return
+            try:
+                self._worker.stop()
+                self._worker.wait(2000)
+            except Exception:
+                pass
+        super().closeEvent(e)
