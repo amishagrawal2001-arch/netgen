@@ -1272,17 +1272,53 @@ WantedBy=timers.target
         self.log("✓ Systemd services created successfully")
         
     def start_ostg_services(self):
-        """Start Netgen services."""
+        """Start (or restart) Netgen services.
+
+        Critical subtlety: `systemctl start <unit>` is a no-op when the
+        unit is already active — meaning an upgrade install would
+        leave the OLD process running with the OLD code in memory,
+        even though the new wheel was pip-installed to disk. Operators
+        hit this and were confused why `pip3 show ostg-trafficgen`
+        reported the new version but the running server still behaved
+        like the old one.
+
+        Fix: probe is-active first. If already running, do `restart`
+        (forcibly reloads the process); else do `start` (cold start).
+        Both paths log what they did so the operator can see the
+        decision in the install transcript.
+        """
         self.log(f"Starting {PRODUCT_NAME} services...")
 
-        # Stop any existing processes
+        # Stop any straggling non-systemd processes that might be holding
+        # the listen socket. pkill is safe — it only matches the literal
+        # script name, not the systemd-managed entrypoint.
         self.run_command("pkill -f run_tgen_server.py", check=False)
 
-        # Start the server (don't abort the install if it fails — surface a warning
-        # and capture journal logs so the user can debug)
-        start_result = self.run_command("systemctl start netgen-server.service", check=False)
+        # Decide between start (cold) and restart (already-active).
+        # Capture stdout so we can distinguish "active" from
+        # "inactive"/"failed"/"activating" cleanly.
+        pre = self.run_command(
+            "systemctl is-active netgen-server.service",
+            check=False, capture_output=True,
+        )
+        pre_state = (pre.stdout or "").strip() if hasattr(pre, "stdout") else ""
+
+        if pre_state == "active":
+            self.log(
+                "netgen-server already active — restarting so the new wheel "
+                "loads in memory (start would be a no-op on a live unit)"
+            )
+            start_cmd = "systemctl restart netgen-server.service"
+        else:
+            self.log(f"netgen-server is '{pre_state or 'unknown'}' — starting cold")
+            start_cmd = "systemctl start netgen-server.service"
+
+        start_result = self.run_command(start_cmd, check=False)
         if start_result.returncode != 0:
-            self.log("systemctl start netgen-server returned non-zero; checking status...", "WARNING")
+            self.log(
+                f"{start_cmd} returned non-zero; checking status...",
+                "WARNING",
+            )
 
         # Give the server a moment to start (or fail)
         self.run_command("sleep 3", check=False)
