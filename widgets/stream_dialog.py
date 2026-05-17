@@ -355,26 +355,77 @@ without leaving it:</p>
           under its own interpreter → triggers
           <code>systemctl restart netgen-server</code> → client polls
           <code>/api/health</code> for the new instance.</td></tr>
-  <tr><td><b>Fresh install via SSH</b><br><span class="muted">paramiko, 15–45 min</span></td>
+  <tr><td><b>Fresh install via SSH</b><br><span class="muted">paramiko, 15–45 min, <b>detached</b></span></td>
       <td>Bare Linux host. No netgen, no Docker, no DPDK yet.</td>
       <td>Connects (password OR SSH key) → sftp-copies the wheel +
           <code>install_ostg_complete.py</code> to
-          <code>/tmp/netgen_install/</code> → runs the installer
-          (sudo'd if user ≠ root) → streams every line of output
-          into the dialog's log pane. Optional flags:
-          <code>--no-dpdk</code>, <code>--skip-dpdk-build</code>.</td></tr>
+          <code>/tmp/netgen_install/</code> → spawns the installer
+          <i>detached</i> via <code>nohup</code> on the target →
+          polls <code>/var/log/netgen-install.log</code> for live
+          output. Optional flags: <code>--no-dpdk</code>,
+          <code>--skip-dpdk-build</code>.</td></tr>
 </table>
 
-<p><b>Safety properties:</b> overlapping uploads return HTTP 409;
-filenames other than <code>*.whl</code> return HTTP 400 (no path
-traversal); SSH password lives only in the dialog field for the
-operation's duration (never written to disk); closing the dialog
-mid-run prompts before tearing down the worker thread.</p>
+<h3>Detached install — what survives client exit</h3>
+
+<p>The fresh-install path runs the installer under
+<code>nohup</code> on the target, with stdout/stderr redirected to
+a log file. <b>Close the dialog, lose WiFi, crash the client —
+the install keeps running.</b> The state lives in three target-side
+files:</p>
+
+<table>
+  <tr><th>Path</th><th>Purpose</th></tr>
+  <tr><td><code>/var/log/netgen-install.log</code></td>
+      <td>Full installer stdout+stderr. Permanent record; survives
+          reboot. <code>tail -F</code>-able alongside the GUI.</td></tr>
+  <tr><td><code>/var/run/netgen-install.pid</code></td>
+      <td>Wrapper script's PID while the install is alive. Removed
+          when the installer exits.</td></tr>
+  <tr><td><code>/var/run/netgen-install.exit</code></td>
+      <td>Installer's exit code, written by the wrapper when the
+          install finishes (0 = success, non-zero = failure).</td></tr>
+</table>
+
+<p>Re-open the dialog and click Install against the same host:
+the client probes for the pid file, finds the live install, and
+prompts <b>"Resume monitoring its log?"</b> The worker switches
+into resume mode — skips SFTP upload + spawn entirely, jumps
+straight to polling the log from byte 0. One click to reattach
+to an install you walked away from an hour ago.</p>
+
+<p>Closing the dialog mid-install prompts: <i>"The fresh install
+is running detached on the target — closing this dialog will stop
+monitoring the log, but the install itself will continue to
+completion."</i> The upgrade tab (HTTP-based) still uses the old
+"abort-on-close" prompt because there's no way to detach an HTTP
+upload mid-flight.</p>
+
+<p><b>Safety properties:</b></p>
+<ul>
+  <li>Upgrade tab: overlapping wheel uploads return HTTP 409;
+      filenames other than <code>*.whl</code> return HTTP 400
+      (no path traversal); server pip-installs into its own
+      Python via <code>sys.executable -m pip</code>.</li>
+  <li>Fresh-install tab: <code>nohup</code> + redirected stdin
+      so no PTY → no SIGHUP on disconnect; pre-flight pid check
+      refuses to start a second install on the same target while
+      one's already running.</li>
+  <li>SSH password lives only in the dialog field for the
+      operation's duration (never written to disk). SSH keys
+      are read from the chosen file at connection time.</li>
+  <li>Cancelling reads the right copy depending on the tab —
+      detached SSH says "monitoring stops, install continues",
+      foreground HTTP says "abort and may leave server
+      inconsistent".</li>
+</ul>
 
 <p class="muted">The dialog uses HTTP (Tab 1) and paramiko (Tab 2);
 no Python toolchain required on the target. Pre-fills Server URL
 from the current client connection and auth token from
-<code>$NETGEN_AUTH_TOKEN</code>.</p>
+<code>$NETGEN_AUTH_TOKEN</code>. Adaptive log-poll backoff: 1 s
+while output is flowing, 5 s when idle — keeps SSH churn low
+during the 15+ min DPDK build.</p>
 
 <h2>2. Prebuilt release artifacts</h2>
 
