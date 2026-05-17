@@ -603,11 +603,55 @@ class NetgenInstaller:
         `python -m build` would fail with "pyproject.toml not found"
         — exactly the rc=2 the operator just hit.
         """
-        # Honor a pre-built wheel passed via --wheel. Caller is
-        # responsible for the wheel being a valid ostg_trafficgen
-        # artifact; we just confirm it exists and stash the path.
+        # Honor a pre-built wheel passed via --wheel / -w.
+        #
+        # Accept three forms:
+        #   1. /path/to/ostg_trafficgen-0.2.7-py3-none-any.whl   (file)
+        #   2. /path/to/dir/                                      (directory)
+        #   3. /path/to/dir/ostg_trafficgen-*.whl                 (glob)
+        #
+        # The directory form is what early in-GUI install dialogs
+        # (v0.2.6's widgets/install_server_dialog.py) sent — they
+        # passed `-w /tmp/netgen_install`. The v0.2.7 dialog sends
+        # the full file path. Tolerating both means an upgraded
+        # installer rolls onto a target via an older client without
+        # breaking — just glob the dir for *.whl, pick the newest.
         pw = getattr(self, "_prebuilt_wheel", None)
         if pw:
+            import glob as _glob_pw
+            if os.path.isdir(pw):
+                candidates = sorted(
+                    _glob_pw.glob(os.path.join(pw, f"{WHEEL_DIST}-*-py3-none-any.whl")),
+                    key=os.path.getmtime,
+                    reverse=True,
+                )
+                if not candidates:
+                    self.log(
+                        f"--wheel directory {pw} contains no "
+                        f"{WHEEL_DIST}-*-py3-none-any.whl files. "
+                        f"Pass a file path (or sftp the wheel into "
+                        f"the directory first).",
+                        "ERROR",
+                    )
+                    sys.exit(1)
+                pw = candidates[0]
+                self.log(
+                    f"--wheel pointed at a directory; auto-picked "
+                    f"newest match: {pw}"
+                )
+            elif "*" in pw or "?" in pw:
+                candidates = sorted(
+                    _glob_pw.glob(pw),
+                    key=os.path.getmtime,
+                    reverse=True,
+                )
+                if not candidates:
+                    self.log(
+                        f"--wheel glob {pw} matched no files",
+                        "ERROR",
+                    )
+                    sys.exit(1)
+                pw = candidates[0]
             if not os.path.isfile(pw):
                 self.log(
                     f"--wheel path not found: {pw}",
