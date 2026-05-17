@@ -57,6 +57,25 @@ class ThroughputChart(QWidget):
         self._samples.clear()
         self.update()
 
+    def remove_iface_by_prefix(self, prefix):
+        """Drop every iface whose name starts with `prefix` from every
+        historical sample. Used when a TGen chassis is removed so its
+        per-interface lines vanish from the chart immediately instead
+        of taking up to WINDOW_SEC to slide out of the visible window.
+        """
+        if not prefix:
+            return
+        new_samples = deque(maxlen=self._samples.maxlen)
+        for ts, vals in self._samples:
+            if not isinstance(vals, dict):
+                new_samples.append((ts, vals))
+                continue
+            filtered = {k: v for k, v in vals.items()
+                        if not (isinstance(k, str) and k.startswith(prefix))}
+            new_samples.append((ts, filtered))
+        self._samples = new_samples
+        self.update()
+
     def _samples_iface_history(self):
         """Set of iface names that have appeared in any visible sample.
 
@@ -706,7 +725,43 @@ class TrafficGenClientStatisticsSection():
                 except Exception:
                     pass
 
-        # 3. Force an immediate redraw with the pruned caches so the
+        # 3. self.streams is the source-of-truth dict for the Stream
+        #    configuration table on the main page. It's keyed by port
+        #    labels like "TG 1 - eth0" AND "TG 1 - Port: eth0" (two
+        #    historical formats coexist). Without pruning here, removed-
+        #    TG streams keep rendering in the stream table for the rest
+        #    of the session.
+        if tg_prefix is not None:
+            try:
+                streams = getattr(self, "streams", None)
+                if isinstance(streams, dict):
+                    # Match both "TG 1 - " and "TG 1 - Port: " forms
+                    bare_prefix = f"TG {tg_id} - "
+                    port_prefix = f"TG {tg_id} - Port: "
+                    stale_ports = [
+                        k for k in streams
+                        if isinstance(k, str) and (k.startswith(bare_prefix) or k.startswith(port_prefix))
+                    ]
+                    for k in stale_ports:
+                        streams.pop(k, None)
+                    if stale_ports:
+                        logger.info(
+                            f"[STATS PRUNE] Dropped {len(stale_ports)} stream config entries for TG {tg_id}"
+                        )
+            except Exception as e:
+                logger.debug(f"[STATS PRUNE] self.streams cleanup failed: {e}")
+
+        # 4. Live throughput chart — drop iface lines so they vanish
+        #    immediately rather than scrolling out over WINDOW_SEC.
+        if tg_prefix is not None:
+            try:
+                chart = getattr(self, "live_throughput_chart", None)
+                if chart is not None and hasattr(chart, "remove_iface_by_prefix"):
+                    chart.remove_iface_by_prefix(tg_prefix)
+            except Exception as e:
+                logger.debug(f"[STATS PRUNE] chart prune failed: {e}")
+
+        # 5. Force an immediate redraw with the pruned caches so the
         #    operator sees the rows disappear instantly (not 2-5 s
         #    later when the next refresh tick fires).
         try:
@@ -723,6 +778,16 @@ class TrafficGenClientStatisticsSection():
             )
         except Exception:
             pass
+        # Refresh the main Streams config table so removed-TG rows disappear
+        try:
+            if hasattr(self, "_do_update_stream_table"):
+                if hasattr(self, "_populating_table"):
+                    self._populating_table = False
+                self._do_update_stream_table()
+            elif hasattr(self, "update_stream_table"):
+                self.update_stream_table()
+        except Exception as e:
+            logger.debug(f"[STATS PRUNE] stream table refresh failed: {e}")
 
         logger.info(
             f"[STATS PRUNE] Removed TG {tg_id} ({server_address}) from stats caches + tables"
