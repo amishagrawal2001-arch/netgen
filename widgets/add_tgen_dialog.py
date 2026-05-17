@@ -36,8 +36,8 @@ import re
 from datetime import datetime
 from typing import Optional
 
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
-from PyQt5.QtGui import QFont, QColor
+from PyQt5.QtCore import Qt, QThread, QUrl, pyqtSignal
+from PyQt5.QtGui import QColor, QDesktopServices, QFont
 from PyQt5.QtWidgets import (
     QCheckBox, QDialog, QDialogButtonBox, QFormLayout, QGroupBox,
     QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMessageBox,
@@ -244,11 +244,23 @@ class AddTGenDialog(QDialog):
         )
         self.connect_selected_btn.clicked.connect(self._connect_selected_from_history)
         self.connect_selected_btn.setEnabled(False)
+        # Open the server's /admin web console for the highlighted chassis
+        # (or the chassis currently in the connection form). Auth-exempt
+        # endpoint, so it works against any reachable netgen-server
+        # without needing a token. Opens in the user's default browser.
+        self.open_admin_btn = QPushButton("Open Admin Console")
+        self.open_admin_btn.setToolTip(
+            "Open http://<chassis>:<port>/admin in your default browser. "
+            "Uses the highlighted row, or the chassis in the form below "
+            "if no row is selected."
+        )
+        self.open_admin_btn.clicked.connect(self._open_admin_console)
         self.remove_btn = QPushButton("Remove from history")
         self.remove_btn.clicked.connect(self._remove_selected_from_history)
         self.test_btn = QPushButton("Test all")
         self.test_btn.clicked.connect(self._start_reachability_probe)
         hist_btns.addWidget(self.connect_selected_btn)
+        hist_btns.addWidget(self.open_admin_btn)
         hist_btns.addWidget(self.remove_btn)
         hist_btns.addWidget(self.test_btn)
         hist_btns.addStretch(1)
@@ -377,6 +389,72 @@ class AddTGenDialog(QDialog):
         # multi-select case.
         self._on_row_selected()
         self._do_connect()
+
+    def _open_admin_console(self) -> None:
+        """Open the /admin web portal for the highlighted (or form-entered)
+        chassis in the user's default browser.
+
+        Resolution order:
+          1. Exactly one row selected in the table → that row's URL
+          2. More than one row selected → ambiguous; first selected row
+             with a confirm-style status note
+          3. No row selected → form's address + port (after parsing to
+             handle pasted host:port or http://host:port forms)
+
+        /admin is auth-exempt on every netgen-server build so the
+        operator doesn't need to type a token first. If the server is
+        unreachable the browser shows its own connection-failed page —
+        we don't pre-probe to avoid a UI delay on the click.
+        """
+        url = ""
+        rows = self.table.selectionModel().selectedRows() if self.table.selectionModel() else []
+        if len(rows) >= 1:
+            i = rows[0].row()
+            if 0 <= i < len(self._entries):
+                e = self._entries[i]
+                scheme = e.get("scheme", "http")
+                addr = e.get("address", "")
+                port = int(e.get("port", 5050))
+                if addr:
+                    url = f"{scheme}://{addr}:{port}"
+                if len(rows) > 1:
+                    self.status_lbl.setText(
+                        f"Multiple rows selected — opening admin for {addr} only."
+                    )
+        if not url:
+            # Fall back to the form. Don't mutate _do_connect's parsing
+            # path — just do the minimal cleanup needed for a URL.
+            address = (self.address_in.text() or "").strip()
+            address = re.sub(r"^https?://", "", address, flags=re.I).rstrip("/")
+            if ":" in address and not address.endswith("]"):
+                host, _, port_str = address.rpartition(":")
+                try:
+                    port = int(port_str)
+                    address = host
+                except ValueError:
+                    port = int(self.port_in.value())
+            else:
+                port = int(self.port_in.value())
+            if not address:
+                QMessageBox.warning(
+                    self, "No chassis",
+                    "Select a row in the table above, or enter a chassis "
+                    "address in the form below."
+                )
+                return
+            scheme = "https" if self.https_cb.isChecked() else "http"
+            url = f"{scheme}://{address}:{port}"
+
+        admin_url = f"{url}/admin"
+        ok = QDesktopServices.openUrl(QUrl(admin_url))
+        if ok:
+            self.status_lbl.setText(f"Opened {admin_url} in your default browser.")
+        else:
+            QMessageBox.warning(
+                self, "Could not open browser",
+                f"QDesktopServices.openUrl returned false for {admin_url}.\n\n"
+                "Copy the URL manually:"
+            )
 
     def _remove_selected_from_history(self) -> None:
         rows = self.table.selectionModel().selectedRows()
