@@ -94,6 +94,7 @@ class NetgenInstaller:
         remote_pass: Optional[str] = None,
         install_dpdk: bool = True,
         skip_dpdk_build: bool = False,
+        prebuilt_wheel: Optional[str] = None,
     ):
         self.remote_host = remote_host
         self.remote_user = remote_user
@@ -108,6 +109,12 @@ class NetgenInstaller:
         # useful when DPDK is already installed system-wide.
         self.install_dpdk = install_dpdk
         self.skip_dpdk_build = skip_dpdk_build
+        # Pre-built wheel path (--wheel). When set, _build_wheel skips
+        # the `python -m build` step and uses this file. Required for
+        # the in-GUI install dialog flow where there's no source tree
+        # on the target box — only the wheel and the installer script
+        # got sftp'd over.
+        self._prebuilt_wheel = prebuilt_wheel
         self.setup_logging()
         self.system_info = self._detect_system()
         
@@ -587,7 +594,33 @@ class NetgenInstaller:
         source but the binary still had the old behavior. Always
         rebuild from current source so the deployed artifact and the
         git tree never drift.
+
+        Exception: when self._prebuilt_wheel is set (operator passed
+        --wheel <path>, typically from the in-GUI install dialog
+        which sftp-copies a pre-built artifact alongside the
+        installer), use that file as-is and skip the build step.
+        The GUI dialog has no source tree on the target box, so
+        `python -m build` would fail with "pyproject.toml not found"
+        — exactly the rc=2 the operator just hit.
         """
+        # Honor a pre-built wheel passed via --wheel. Caller is
+        # responsible for the wheel being a valid ostg_trafficgen
+        # artifact; we just confirm it exists and stash the path.
+        pw = getattr(self, "_prebuilt_wheel", None)
+        if pw:
+            if not os.path.isfile(pw):
+                self.log(
+                    f"--wheel path not found: {pw}",
+                    "ERROR",
+                )
+                sys.exit(1)
+            self._actual_wheel_path = os.path.abspath(pw)
+            self.log(
+                f"Using pre-built wheel: {self._actual_wheel_path} "
+                f"(skipping `python -m build` — no source tree expected)",
+            )
+            return
+
         import subprocess as _sp
         import glob as _glob
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -1513,6 +1546,16 @@ def main():
              "tx_worker binary won't be built; you can build it later from "
              "the /admin portal.",
     )
+    parser.add_argument(
+        "-w", "--wheel",
+        dest="wheel",
+        default=None,
+        help="Path to a pre-built ostg_trafficgen-*.whl. Skips the "
+             "`python -m build` step entirely. Required when running on "
+             "a host with no source tree (e.g. the client GUI's Fresh "
+             "Install dialog sftp-copies the wheel + this script into "
+             "/tmp/netgen_install/ and has nothing to build from).",
+    )
 
     args = parser.parse_args()
 
@@ -1526,6 +1569,7 @@ def main():
         remote_pass=args.password,
         install_dpdk=args.install_dpdk,
         skip_dpdk_build=args.skip_dpdk_build,
+        prebuilt_wheel=args.wheel,
     )
 
     installer.run()
