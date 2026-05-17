@@ -641,8 +641,19 @@ class TrafficGenClientStatisticsSection():
     def fetch_and_update_statistics(self):
         """Fetch traffic statistics from all servers and display for selected ones."""
         if not self.server_interfaces:
-            logger.info("No servers available. Clearing traffic statistics.")
-            self.clear_statistics_table()
+            logger.info("No servers available. Wiping traffic statistics.")
+            # Hard-reset, not soft clear — there are no servers, so the
+            # column structure ("TG 0 - eth0", ...) should go too.
+            # clear_statistics_table only zeros the cells; it deliberately
+            # preserves columns for the 'Clear Stats' button flow.
+            if hasattr(self, "reset_statistics_table_structure"):
+                self.reset_statistics_table_structure()
+            else:
+                self.clear_statistics_table()
+            # Also drop the persistent fallback cache so a subsequent
+            # add-server doesn't re-display the old columns from
+            # _last_statistics on first paint.
+            self._last_statistics = {}
             return
         
         # If worker is already running, skip this call to prevent overlapping
@@ -670,6 +681,37 @@ class TrafficGenClientStatisticsSection():
         
         self._stats_worker.start()
     
+    def reset_statistics_table_structure(self):
+        """Hard-reset: wipe columns + headers from both stats tables.
+
+        Distinct from clear_statistics_table (soft-clear used by the
+        'Clear Stats' button), which deliberately preserves the
+        per-interface column structure so the user doesn't see the
+        table briefly empty between Clear Stats and the next poll.
+
+        Use this when the columns *should* go away — TGen removed,
+        all servers offline, fresh session start. Without this, the
+        column headers ("TG 0 - ens5np0", ...) keep showing labels
+        for chassis that no longer exist.
+        """
+        try:
+            if hasattr(self, "statistics_table") and self.statistics_table is not None:
+                self.statistics_table.setColumnCount(0)
+                self.statistics_table.setHorizontalHeaderLabels([])
+        except Exception as e:
+            logger.debug(f"[RESET STATS] interface table reset failed: {e}")
+        try:
+            if hasattr(self, "stream_statistics_table") and self.stream_statistics_table is not None:
+                self.stream_statistics_table.setRowCount(0)
+        except Exception as e:
+            logger.debug(f"[RESET STATS] stream table reset failed: {e}")
+        try:
+            chart = getattr(self, "live_throughput_chart", None)
+            if chart is not None and hasattr(chart, "clear_samples"):
+                chart.clear_samples()
+        except Exception as e:
+            logger.debug(f"[RESET STATS] chart clear failed: {e}")
+
     def prune_server_stats(self, server_address, tg_id):
         """Drop every cache + table cell belonging to a removed TGen.
 
@@ -764,11 +806,20 @@ class TrafficGenClientStatisticsSection():
         # 5. Force an immediate redraw with the pruned caches so the
         #    operator sees the rows disappear instantly (not 2-5 s
         #    later when the next refresh tick fires).
+        #
+        # Key subtlety: clear_statistics_table is a SOFT clear (zeros
+        # cells, keeps columns) intended for the 'Clear Stats' button.
+        # When pruning removes the last TG, we want a HARD reset that
+        # actually wipes the column structure too — otherwise the
+        # column headers "TG 0 - ens5np0" etc. linger forever showing
+        # chassis that no longer exist. Use reset_statistics_table_structure
+        # for that path instead.
         try:
-            if hasattr(self, "_last_statistics") and self._last_statistics:
+            remaining_servers = getattr(self, "server_interfaces", None) or []
+            if remaining_servers and hasattr(self, "_last_statistics") and self._last_statistics:
                 self.update_statistics_table(self._last_statistics)
             else:
-                self.clear_statistics_table()
+                self.reset_statistics_table_structure()
         except Exception:
             pass
         try:
@@ -1025,11 +1076,28 @@ class TrafficGenClientStatisticsSection():
             self._push_chart_sample(filtered_statistics)
         elif hasattr(self, "_last_statistics") and self._last_statistics:
             # Only update if we have meaningful statistics to display
-            # Skip the "No new statistics" message to reduce console spam
-            self.update_statistics_table(self._last_statistics)
-            self._push_chart_sample(self._last_statistics)
+            # Skip the "No new statistics" message to reduce console spam.
+            #
+            # Also: if all known TGens have been removed (server_interfaces
+            # empty), don't render the stale _last_statistics — that was
+            # what caused removed-chassis columns to linger forever
+            # ("TG 0 - ens5np0" still visible after the last TG was
+            # removed). Hard-reset the table structure instead.
+            remaining = getattr(self, "server_interfaces", None) or []
+            if not remaining:
+                if hasattr(self, "reset_statistics_table_structure"):
+                    self.reset_statistics_table_structure()
+                else:
+                    self.clear_statistics_table()
+                self._last_statistics = {}
+            else:
+                self.update_statistics_table(self._last_statistics)
+                self._push_chart_sample(self._last_statistics)
         else:
-            self.clear_statistics_table()
+            if hasattr(self, "reset_statistics_table_structure"):
+                self.reset_statistics_table_structure()
+            else:
+                self.clear_statistics_table()
         
         # Always update stream statistics table with all collected streams (even if empty, to clear table)
         logger.debug(f"[DEBUG STREAM STATS] Calling update_stream_statistics_table with {len(all_stream_stats)} stream(s)")
