@@ -659,6 +659,17 @@ class NetgenInstaller:
                 )
                 sys.exit(1)
             self._actual_wheel_path = os.path.abspath(pw)
+            # install_ostg() reads BOTH _actual_wheel_path and
+            # _actual_wheel_file (the bare basename, used for the
+            # remote-side filename). Setting only _actual_wheel_path
+            # made install_ostg fall through to its fallback that
+            # computes `dist/ostg_trafficgen-{WHEEL_VERSION}-...whl`
+            # — and WHEEL_VERSION on the target is 0.0.0 because
+            # there's no pyproject.toml in the script dir. That
+            # produced the misleading "Wheel file not found:
+            # dist/ostg_trafficgen-0.0.0-py3-none-any.whl" error
+            # operators hit when using the --wheel flag.
+            self._actual_wheel_file = os.path.basename(self._actual_wheel_path)
             self.log(
                 f"Using pre-built wheel: {self._actual_wheel_path} "
                 f"(skipping `python -m build` — no source tree expected)",
