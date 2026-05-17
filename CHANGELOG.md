@@ -2,6 +2,107 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.7] - 2026-05-16
+
+Operator-quality-of-life release. Spirent-style chassis manager,
+in-GUI access to the server admin console, real removal cleanup in
+the Traffic Stats pane, and a self-healing `tx_worker` install path.
+
+### Added — Spirent-style Add TGEN Chassis dialog
+- **File → Add TGEN Chassis (Ctrl+N)** now opens a proper chassis
+  manager instead of two bare `QInputDialog.getText` prompts. New
+  `widgets/add_tgen_dialog.py` (~620 LOC):
+  - **Recent connections** table — address, port, label, last-
+    connected timestamp ("3 min ago"), reachability LED (✓/✗/?),
+    connect count. Auto-probes `/api/health` on open via a
+    background `QThread` so LEDs go live without clicking Test all.
+  - **Multi-select connect** — Ctrl/Shift-click rows, "Connect N
+    Selected" button label shows the count, single-shot bulk-adds
+    every selected chassis with one `update_server_tree()` redraw.
+  - **Add to History** — saves the form to
+    `~/.netgen/chassis_history.json` without connecting, clears the
+    form, stays open so the operator can pre-stage several chassis.
+  - **Open Admin Console** — opens `http://<chassis>:<port>/admin`
+    in the default browser via `QDesktopServices.openUrl`. Resolves
+    the URL from the highlighted row, or the connection form if no
+    row is selected. `/admin` is auth-exempt so no token typing
+    required.
+  - **Test all** re-probes reachability on demand.
+  - **Remove from history** (with confirm prompt) drops rows from
+    `chassis_history.json` without touching connected servers.
+- Persistence at `~/.netgen/chassis_history.json` — capped at 50
+  entries, sorted by `last_connected` desc, auth tokens explicitly
+  not persisted (session-only, re-entered each session).
+- `traffic_client/menu_actions.py` `add_server_interface()` rewritten
+  to consume the dialog's `chosen_connections` list — loops adds,
+  skips already-connected URLs with a single tail info dialog, fires
+  exactly one `update_server_tree()` + `save_server_interfaces()`
+  per batch.
+
+### Fixed — Traffic Stats survive a TGen removal
+- Removing a TGen chassis from the server tree now scrubs every
+  cache and table cell tied to that TG, in lockstep:
+  - `_pending_stats_data[server_address]` — current-cycle fetch buf
+  - `_pending_stream_stats` / `_pending_poll_stream_stats` — stream
+    lists filtered by `_tg_id`
+  - `_last_statistics["TG <id> - <iface>"]` — persistent fallback
+    cache (the killer — without this, removed-TG rows would re-paint
+    on the next "empty fetch" tick and never go away)
+  - `_iface_baselines` / `_stream_baselines` — Clear Stats baselines
+    (so a re-added chassis with the same TG id doesn't inherit
+    stale baselines and report negative deltas)
+  - `self.streams` — main Streams configuration table source
+  - `ThroughputChart._samples` — Live Chart history (via new
+    `remove_iface_by_prefix("TG <id> - ")` method)
+- New `StatisticsSection.reset_statistics_table_structure()` does a
+  real hard reset (`setColumnCount(0)` + `setHorizontalHeaderLabels([])`
+  + `setRowCount(0)` on the stream stats table + chart clear).
+  Called when `server_interfaces` becomes empty, distinct from the
+  existing `clear_statistics_table()` which is deliberately a soft
+  clear (zeros cells, keeps columns) for the Clear Stats button flow.
+- Three previously-broken call sites that called the soft clear when
+  they should have hard-reset are now wired to `reset_statistics_table_structure`:
+  `fetch_and_update_statistics()` no-servers branch,
+  `_on_stats_fetch_finished()` empty-stats branch (both inner cases),
+  and the new `prune_server_stats()`.
+
+### Fixed — `install_dpdk.sh` tx_worker path mismatch
+- When operators run `install_dpdk.sh` from a git checkout
+  (`/root/netgen/resources/dpdk/install_dpdk.sh`), `SCRIPT_DIR`
+  resolves to that checkout and `meson build` lands at
+  `/root/netgen/.../tx_worker/build/tx_worker`. But the server's
+  `/api/admin/health` probe only walks `/opt/netgen/`, `/opt/OSTG/`,
+  and `/usr/local/bin/tx_worker` — so the admin portal reports
+  "tx_worker binary Not built" even though the binary works.
+- `step_build_tx_worker` now drops symlinks into both canonical
+  install roots (when their parents exist) and installs a copy at
+  `/usr/local/bin/tx_worker`. Self-healing across re-runs and across
+  the OSTG → netgen rebrand.
+
+### Documentation
+- **Help → Install Guide** rewritten:
+  - New section "1. In-GUI installer (NEW in 0.2.6) ★ recommended"
+    documenting the Help → Install / Upgrade Server dialog from both
+    tabs (Upgrade running server / Fresh install via SSH) with
+    safety properties.
+  - New section "2. Prebuilt release artifacts" with a three-column
+    table (File / Contains / Runs on) that explicitly spells out
+    the wheel ships BOTH server + client + CLI while the
+    .dmg / .exe / .AppImage are client-GUI-only bundles. Includes
+    a "Why no Server bundle?" subsection covering Linux-only
+    dependencies and a platform-vs-command compatibility table.
+  - New section "9. Reinstall / upgrade" rewritten as a method-vs-time
+    table covering the in-GUI Tab 1 (30-60 s), manual pip-install
+    over SSH (~10 s), and full `install_ostg_complete.py` re-run
+    (5-10 min) paths.
+  - Existing sections renumbered 3-8.
+
+### Notes
+- No new dependencies on either side. Client uses `QDesktopServices`
+  + `paramiko` (both already in `requirements.txt`).
+- Wheel still ships as `ostg_trafficgen-0.2.7-py3-none-any.whl` for
+  pip-install backwards compatibility.
+
 ## [0.2.6] - 2026-05-16
 
 Operator-quality-of-life release. Drives server install and upgrade
