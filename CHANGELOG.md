@@ -2,6 +2,90 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.8] - 2026-05-17
+
+Detached install flow + the bug fixes that made it work end-to-end.
+0.2.7's Fresh Install dialog worked in theory but had three gaps
+(install died on client exit, `--wheel` path was misrouted, upgrade
+didn't restart the live server). All three closed; the in-GUI
+dialog now does a full v0.2.5 → v0.2.x in-place upgrade and the
+operator sees the new behavior immediately.
+
+### Added — detached install survives client exit
+- **`SshInstallWorker` rewritten** around `nohup` + log polling
+  instead of PTY-streamed `exec_command`:
+  - Wrapper script writes pid to `/var/run/netgen-install.pid`,
+    runs the installer with output appended to
+    `/var/log/netgen-install.log`, captures rc into
+    `/var/run/netgen-install.exit`, cleans up the pid file.
+  - `nohup sh -c '...' < /dev/null > /dev/null 2>&1 &` — no PTY,
+    no SIGHUP on disconnect. Install survives client crash, WiFi
+    blip, dialog close.
+  - Client polls the log incrementally (`tail -c +<offset+1>`) with
+    adaptive backoff (1 s while output flows, 5 s idle).
+  - Transient SSH errors during the poll loop logged but don't
+    abort (sshd restart during apt installs recovers gracefully).
+- **Resume monitoring** — `AddTGenDialog._probe_existing_install()`
+  runs a 2-3 s blocking SSH probe at click-time. When a live
+  install is found on the target, prompts: *"A previous install
+  is still running on host (pid N). Resume monitoring its log?"*
+  Worker switches to `resume_mode=True`, skips SFTP + spawn, jumps
+  straight to the poll loop.
+- **`closeEvent` differentiates worker types**: detached SSH says
+  *"closing this dialog will stop monitoring the log, but the
+  install itself will continue to completion"*; foreground HTTP
+  upgrade keeps the old *"abort and may leave server inconsistent"*
+  copy (no way to detach a mid-flight HTTP upload).
+
+### Fixed — `--wheel` early-out also sets `_actual_wheel_file`
+- `_build_wheel()`'s early-out for the `--wheel <path>` flag
+  set `self._actual_wheel_path` but missed setting
+  `self._actual_wheel_file`. `install_ostg()` then read both:
+  ```python
+  local_wheel_path = getattr(self, "_actual_wheel_path", None)
+  wheel_file       = getattr(self, "_actual_wheel_file", None)
+  if not local_wheel_path or not wheel_file:
+      # broken fallback
+  ```
+  Missing `wheel_file` triggered the fallback, which computed
+  `dist/ostg_trafficgen-{WHEEL_VERSION}-...whl` — and
+  `WHEEL_VERSION` on the target is `0.0.0` (the no-pyproject.toml
+  parse fallback). Result: misleading
+  `"Wheel file not found: dist/ostg_trafficgen-0.0.0-py3-none-any.whl"`
+  error and rc=1. One-line fix: also set
+  `self._actual_wheel_file = os.path.basename(pw)` in the early-out.
+
+### Fixed — `start_ostg_services` restarts when already active
+- Upgrade installs (pip-installing a new wheel onto a server that
+  was already running) used to leave the *old* code in memory:
+  `systemctl start <unit>` is a no-op on an already-active unit,
+  so the running process was never bounced. Operators saw
+  `pip3 show ostg-trafficgen` report the new version while the
+  live behavior was still the old one.
+- `start_ostg_services()` now probes `systemctl is-active` first.
+  If the unit is active, switches to `systemctl restart` so the
+  process is forcibly bounced with the new code in memory. If
+  inactive/failed/missing, does the original cold `start`. Both
+  paths log the decision so the operator can see in the install
+  transcript whether it was a fresh boot or an upgrade reload.
+
+### Documentation
+- `Help → Install Guide` section 1 (In-GUI installer) extended
+  with a new "Detached install — what survives client exit"
+  subsection: target-state file table (`/var/log/netgen-install.log`,
+  `/var/run/netgen-install.pid`, `/var/run/netgen-install.exit`),
+  the resume-monitoring flow, and the differentiated `closeEvent`
+  copy split per tab. Safety properties rewritten as a bullet
+  list separating HTTP-tab and SSH-tab guarantees.
+
+### Notes
+- No new dependencies on either side.
+- Wheel ships as `ostg_trafficgen-0.2.8-py3-none-any.whl`.
+- Lab box `svl-hp-ai-srv04` validated end-to-end: 0.2.5 → 0.2.7
+  via dialog → exposed the three bugs above → fixed → 0.2.5 →
+  0.2.8 dialog upgrade should now complete cleanly without
+  manual intervention.
+
 ## [0.2.7] - 2026-05-16
 
 Operator-quality-of-life release. Spirent-style chassis manager,
