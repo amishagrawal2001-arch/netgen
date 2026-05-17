@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import os
 import time
+from shlex import quote as _shquote
 from typing import Optional
 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
@@ -174,6 +175,7 @@ class SshInstallWorker(QThread):
         wheel_path: str,
         installer_path: str,
         extra_flags: list,
+        resume_mode: bool = False,
     ):
         super().__init__()
         self.host = host
@@ -183,6 +185,12 @@ class SshInstallWorker(QThread):
         self.wheel_path = wheel_path
         self.installer_path = installer_path
         self.extra_flags = extra_flags or []
+        # When True, skip wheel/installer sftp + nohup spawn — assume an
+        # install is already running on the target and jump straight to
+        # the log-poll loop. Used by the dialog's reattach flow when a
+        # previous SshInstallWorker died (client crash / WiFi blip /
+        # operator closed the window).
+        self.resume_mode = bool(resume_mode)
         self._stop = False
 
     def stop(self) -> None:
@@ -217,81 +225,225 @@ class SshInstallWorker(QThread):
             self.finished_ok.emit(False)
             return
 
-        try:
-            sftp = client.open_sftp()
-        except Exception as e:
-            self.log_chunk.emit(f"[client] SFTP open failed: {e}\n")
-            client.close()
-            self.finished_ok.emit(False)
-            return
-
-        # Copy wheel + installer to /tmp/netgen_install/
         remote_dir = "/tmp/netgen_install"
-        try:
-            try:
-                sftp.mkdir(remote_dir)
-            except IOError:
-                pass  # exists
-            wheel_remote = f"{remote_dir}/{os.path.basename(self.wheel_path)}"
-            installer_remote = f"{remote_dir}/install_ostg_complete.py"
-            self.status.emit(f"Copying wheel to {wheel_remote}...")
-            self.log_chunk.emit(f"[client] sftp put {self.wheel_path} → {wheel_remote}\n")
-            sftp.put(self.wheel_path, wheel_remote)
-            self.log_chunk.emit(f"[client] sftp put {self.installer_path} → {installer_remote}\n")
-            sftp.put(self.installer_path, installer_remote)
-            sftp.chmod(installer_remote, 0o755)
-        except Exception as e:
-            self.log_chunk.emit(f"[client] SFTP upload failed: {e}\n")
-            sftp.close()
-            client.close()
-            self.finished_ok.emit(False)
-            return
-        finally:
-            try:
-                sftp.close()
-            except Exception:
-                pass
+        wheel_remote = f"{remote_dir}/{os.path.basename(self.wheel_path or 'wheel.whl')}"
+        installer_remote = f"{remote_dir}/install_ostg_complete.py"
 
-        # Run installer. Pass --wheel <path> pointing at the wheel we
-        # just sftp-copied — without this, install_ostg_complete.py
-        # tries `python -m build` from /tmp/netgen_install/, which has
-        # no source tree, and exits rc=2. (We used to pass `-w <dir>`,
-        # which the installer rejected as an unrecognized arg — fixed
-        # in 0.2.7 to add the proper --wheel flag.)
+        # Resume-mode skips the entire upload + spawn flow; the install
+        # is already running. We just need to attach to its log file.
+        if self.resume_mode:
+            self.log_chunk.emit(
+                f"[client] resume mode: attaching to /var/log/netgen-install.log "
+                f"on {self.host}\n"
+            )
+            self.status.emit("Resuming monitoring...")
+        else:
+            try:
+                sftp = client.open_sftp()
+            except Exception as e:
+                self.log_chunk.emit(f"[client] SFTP open failed: {e}\n")
+                client.close()
+                self.finished_ok.emit(False)
+                return
+
+            try:
+                try:
+                    sftp.mkdir(remote_dir)
+                except IOError:
+                    pass  # exists
+                self.status.emit(f"Copying wheel to {wheel_remote}...")
+                self.log_chunk.emit(f"[client] sftp put {self.wheel_path} → {wheel_remote}\n")
+                sftp.put(self.wheel_path, wheel_remote)
+                self.log_chunk.emit(f"[client] sftp put {self.installer_path} → {installer_remote}\n")
+                sftp.put(self.installer_path, installer_remote)
+                sftp.chmod(installer_remote, 0o755)
+            except Exception as e:
+                self.log_chunk.emit(f"[client] SFTP upload failed: {e}\n")
+                try:
+                    sftp.close()
+                except Exception:
+                    pass
+                client.close()
+                self.finished_ok.emit(False)
+                return
+            finally:
+                try:
+                    sftp.close()
+                except Exception:
+                    pass
+
+        # Detached-install design: spawn the installer with nohup, redirect
+        # stdout/stderr to a shared log file, exit immediately. The client
+        # then polls the log file (incremental tail by byte offset) and the
+        # process status until the install finishes.
+        #
+        # Why: get_pty=True + line-buffered stdout (what we had before)
+        # streams the install live, but the PTY also means the remote
+        # process gets SIGHUP when the SSH connection drops. Close the
+        # dialog mid-install → install dies → leaves apt half-configured
+        # on a 15-min DPDK build. With nohup + log polling:
+        #   • Install survives client exit / WiFi blip / laptop close.
+        #   • Operator can re-open the dialog later; we detect the live
+        #     install and offer to resume monitoring.
+        #   • The log file is also a permanent record on the target.
+        log_path = "/var/log/netgen-install.log"
+        pid_path = "/var/run/netgen-install.pid"
+        exit_path = "/var/run/netgen-install.exit"
+
+        # In normal mode, refuse to start a new install if one is
+        # already running on the target. In resume mode, this check
+        # is the precondition (the dialog already prompted the user
+        # to attach instead of starting new).
+        if not self.resume_mode:
+            try:
+                stdin0, stdout0, _ = client.exec_command(
+                    f"[ -f {pid_path} ] && kill -0 $(cat {pid_path}) 2>/dev/null && cat {pid_path} || echo NONE",
+                    timeout=10,
+                )
+                existing = (stdout0.read().decode().strip() or "NONE")
+                if existing != "NONE":
+                    self.log_chunk.emit(
+                        f"[client] install already running on {self.host} (pid={existing}). "
+                        f"Close this dialog and re-open it to resume monitoring.\n"
+                    )
+                    self.status.emit(f"Install already in progress on {self.host}")
+                    client.close()
+                    self.finished_ok.emit(False)
+                    return
+            except Exception as e:
+                self.log_chunk.emit(f"[client] pre-flight pid check failed: {e}\n")
+
         cmd_flags = " ".join(self.extra_flags)
-        cmd = (
+        # The installer is sudo'd when not running as root. The whole
+        # invocation runs under a single `sudo sh -c '...'` so sudo
+        # owns the nohup chain and writes the pid/exit files with
+        # root privileges (matching /var/log + /var/run conventions).
+        installer_invocation = (
             f"cd {remote_dir} && "
             f"python3 install_ostg_complete.py "
-            f"--wheel {wheel_remote} {cmd_flags}".strip()
+            f"--wheel {wheel_remote} {cmd_flags}"
+        ).strip()
+        # Wrapper script that:
+        #   1. Truncates the log file
+        #   2. Writes its own pid to pid_path
+        #   3. Runs the installer, captures exit code, writes to exit_path
+        #   4. Cleans up the pid file
+        # Wrapped in `nohup sh -c '...' < /dev/null > /dev/null 2>&1 &`
+        # so it survives the SSH disconnect.
+        wrapper = (
+            f"rm -f {log_path} {exit_path} && "
+            f"echo $$ > {pid_path} && "
+            f"({installer_invocation}) >> {log_path} 2>&1; "
+            f"rc=$?; "
+            f"echo $rc > {exit_path}; "
+            f"rm -f {pid_path}"
+        )
+        spawn_cmd = (
+            f"nohup sh -c {_shquote(wrapper)} < /dev/null > /dev/null 2>&1 & "
+            f"echo $!"
         )
         if self.user != "root":
-            cmd = f"sudo {cmd}"
-        self.status.emit("Running install_ostg_complete.py on server...")
-        self.log_chunk.emit(f"[client] exec: {cmd}\n")
+            spawn_cmd = f"sudo sh -c {_shquote(spawn_cmd)}"
+
+        if not self.resume_mode:
+            self.status.emit("Spawning installer (detached) on server...")
+            self.log_chunk.emit(
+                f"[client] spawn: {installer_invocation}\n"
+                f"[client]   log: {log_path}\n"
+                f"[client]   pid: {pid_path}\n"
+                f"[client]  exit: {exit_path}\n"
+                f"[client] (install runs detached — closing this dialog "
+                f"won't kill it; re-open later to resume monitoring)\n"
+            )
+
+            try:
+                stdin1, stdout1, stderr1 = client.exec_command(spawn_cmd, timeout=15)
+                launcher_rc = stdout1.channel.recv_exit_status()
+                spawn_out = stdout1.read().decode(errors="replace").strip()
+                spawn_err = stderr1.read().decode(errors="replace").strip()
+                if launcher_rc != 0:
+                    self.log_chunk.emit(
+                        f"[client] spawn failed rc={launcher_rc} "
+                        f"stdout={spawn_out!r} stderr={spawn_err!r}\n"
+                    )
+                    self.finished_ok.emit(False)
+                    client.close()
+                    return
+                if spawn_out:
+                    self.log_chunk.emit(f"[client] spawned pid={spawn_out}\n")
+            except Exception as e:
+                self.log_chunk.emit(f"[client] spawn exception: {e}\n")
+                self.finished_ok.emit(False)
+                client.close()
+                return
+
+        # Poll loop: read log incrementally + check process state.
+        self.status.emit("Install running on server — streaming log...")
+        log_offset = 0
+        idle_polls = 0
+        while not self._stop:
+            try:
+                # Read new bytes since last offset. tail -c +N starts at
+                # byte N (1-indexed in tail's syntax, hence +1).
+                tail_cmd = f"tail -c +{log_offset + 1} {log_path} 2>/dev/null"
+                _, tail_stdout, _ = client.exec_command(tail_cmd, timeout=15)
+                new = tail_stdout.read().decode("utf-8", errors="replace")
+                if new:
+                    self.log_chunk.emit(new)
+                    log_offset += len(new.encode("utf-8"))
+                    idle_polls = 0
+                else:
+                    idle_polls += 1
+
+                # Is the installer still alive?
+                exit_check = (
+                    f"if [ -f {exit_path} ]; then "
+                    f"cat {exit_path}; "
+                    f"else echo RUNNING; fi"
+                )
+                _, status_stdout, _ = client.exec_command(exit_check, timeout=10)
+                status_line = status_stdout.read().decode().strip()
+                if status_line and status_line != "RUNNING":
+                    # Final tail pass to capture anything written between
+                    # last poll and process exit
+                    _, tail_stdout, _ = client.exec_command(
+                        f"tail -c +{log_offset + 1} {log_path} 2>/dev/null",
+                        timeout=15,
+                    )
+                    final_tail = tail_stdout.read().decode("utf-8", errors="replace")
+                    if final_tail:
+                        self.log_chunk.emit(final_tail)
+                    try:
+                        rc = int(status_line)
+                    except ValueError:
+                        rc = -1
+                    self.log_chunk.emit(f"[client] installer exit rc={rc}\n")
+                    if rc == 0:
+                        self.status.emit("Install complete — server provisioned")
+                        self.finished_ok.emit(True)
+                    else:
+                        self.status.emit(f"Install failed (rc={rc})")
+                        self.finished_ok.emit(False)
+                    break
+            except Exception as e:
+                # Transient SSH errors are expected on long installs (sshd
+                # restart during apt, network blip). Log but keep polling.
+                self.log_chunk.emit(f"[client] poll error: {e} (retrying)\n")
+            # Adaptive backoff: poll fast (1s) while output is flowing,
+            # slow down to 5s when idle to reduce SSH churn.
+            time.sleep(1 if idle_polls < 3 else 5)
+        else:
+            # User stopped — the install keeps running on the target.
+            # Don't emit finished_ok(False) here; emit a neutral status.
+            self.log_chunk.emit(
+                "[client] monitoring stopped — install continues on target.\n"
+                "[client] re-open this dialog to resume monitoring.\n"
+            )
+            self.status.emit("Monitoring stopped — install still running on target")
 
         try:
-            stdin, stdout, stderr = client.exec_command(cmd, get_pty=True, timeout=None)
-            stdout.channel.set_combine_stderr(True)
-            for line in iter(stdout.readline, ""):
-                if self._stop:
-                    self.log_chunk.emit("[client] cancelled by user\n")
-                    break
-                self.log_chunk.emit(line)
-            rc = stdout.channel.recv_exit_status()
-            self.log_chunk.emit(f"[client] installer exit rc={rc}\n")
-            if rc == 0:
-                self.status.emit("Install complete — server provisioned")
-                self.finished_ok.emit(True)
-            else:
-                self.status.emit(f"Install failed (rc={rc})")
-                self.finished_ok.emit(False)
-        except Exception as e:
-            self.log_chunk.emit(f"[client] exec failed: {e}\n")
-            self.finished_ok.emit(False)
-        finally:
-            try:
-                client.close()
-            except Exception:
+            client.close()
+        except Exception:
                 pass
 
 
@@ -556,13 +708,6 @@ class InstallServerDialog(QDialog):
         if not host:
             QMessageBox.warning(self, "Missing", "Host is required.")
             return
-        if not wheel or not os.path.isfile(wheel):
-            QMessageBox.warning(self, "Missing", "Pick a valid wheel file.")
-            return
-        if not installer or not os.path.isfile(installer):
-            QMessageBox.warning(self, "Missing",
-                                "Pick install_ostg_complete.py from the repo checkout.")
-            return
 
         if self.auth_pw_rb.isChecked():
             password = self.ssh_password.text() or ""
@@ -577,6 +722,37 @@ class InstallServerDialog(QDialog):
                 QMessageBox.warning(self, "Missing", "Pick a valid SSH key file.")
                 return
 
+        # Probe for an existing detached install before bothering with
+        # the wheel/installer validation. If one's running, offer to
+        # reattach to its log — saves the operator from having to
+        # cancel and recover.
+        running_pid = self._probe_existing_install(host, user, password, key_path)
+        resume_mode = False
+        if running_pid:
+            ret = QMessageBox.question(
+                self, "Install already running",
+                f"A previous install is still running on {host} "
+                f"(pid {running_pid}).\n\n"
+                f"Resume monitoring its log? (The install continues "
+                f"either way — picking No just leaves it running in "
+                f"the background.)",
+                QMessageBox.Yes | QMessageBox.No,
+            )
+            if ret != QMessageBox.Yes:
+                return
+            resume_mode = True
+
+        # Wheel + installer paths only need validation when we're
+        # actually going to upload them.
+        if not resume_mode:
+            if not wheel or not os.path.isfile(wheel):
+                QMessageBox.warning(self, "Missing", "Pick a valid wheel file.")
+                return
+            if not installer or not os.path.isfile(installer):
+                QMessageBox.warning(self, "Missing",
+                                    "Pick install_ostg_complete.py from the repo checkout.")
+                return
+
         flags = []
         if self.flag_no_dpdk.isChecked():
             flags.append("--no-dpdk")
@@ -584,17 +760,55 @@ class InstallServerDialog(QDialog):
             flags.append("--skip-dpdk-build")
 
         self.log_view.clear()
-        self._set_status("Connecting...")
+        self._set_status("Resuming monitoring..." if resume_mode else "Connecting...")
         self.ssh_btn.setEnabled(False)
 
         self._worker = SshInstallWorker(
             host=host, user=user, password=password, key_path=key_path,
             wheel_path=wheel, installer_path=installer, extra_flags=flags,
+            resume_mode=resume_mode,
         )
         self._worker.log_chunk.connect(self._append_log)
         self._worker.status.connect(self._set_status)
         self._worker.finished_ok.connect(self._ssh_install_finished)
         self._worker.start()
+
+    def _probe_existing_install(
+        self, host: str, user: str, password: Optional[str], key_path: Optional[str]
+    ) -> Optional[str]:
+        """One-shot SSH probe for /var/run/netgen-install.pid. Returns
+        the pid string when a live install is running on `host`, else
+        None. Blocks the UI for ~2 s — acceptable trade-off for
+        avoiding a wrong-mode worker start.
+        """
+        try:
+            import paramiko
+        except Exception:
+            return None
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        try:
+            kw = {"hostname": host, "username": user, "timeout": 5}
+            if key_path:
+                kw["key_filename"] = key_path
+            else:
+                kw["password"] = password or ""
+            client.connect(**kw)
+            _, stdout, _ = client.exec_command(
+                "[ -f /var/run/netgen-install.pid ] && "
+                "kill -0 $(cat /var/run/netgen-install.pid) 2>/dev/null && "
+                "cat /var/run/netgen-install.pid || echo NONE",
+                timeout=8,
+            )
+            out = (stdout.read().decode().strip() or "NONE")
+            return None if out == "NONE" else out
+        except Exception:
+            return None
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
 
     def _ssh_install_finished(self, ok: bool) -> None:
         self.ssh_btn.setEnabled(True)
@@ -621,9 +835,31 @@ class InstallServerDialog(QDialog):
 
     def closeEvent(self, e):
         if self._worker and self._worker.isRunning():
+            # Differentiate the two worker types:
+            #   • WheelUploadWorker (Tab 1): foreground HTTP request, no
+            #     way to detach. Closing aborts the upload + restart wait.
+            #   • SshInstallWorker (Tab 2): install runs detached via
+            #     nohup on the target. Closing only stops monitoring;
+            #     the install keeps running and can be re-attached by
+            #     reopening this dialog.
+            is_detached_ssh = isinstance(self._worker, SshInstallWorker)
+            if is_detached_ssh:
+                msg = (
+                    "The fresh install is running detached on the target — "
+                    "closing this dialog will stop monitoring the log, but "
+                    "the install itself will continue to completion. "
+                    "Re-open this dialog later to resume monitoring.\n\n"
+                    "Close anyway?"
+                )
+            else:
+                msg = (
+                    "The upgrade is mid-flight (uploading wheel / waiting "
+                    "for systemd restart). Closing now will abort it and "
+                    "may leave the server in an inconsistent state.\n\n"
+                    "Close anyway?"
+                )
             ret = QMessageBox.question(
-                self, "Operation in progress",
-                "An install/upgrade is still running. Cancel and close?",
+                self, "Operation in progress", msg,
                 QMessageBox.Yes | QMessageBox.No,
             )
             if ret != QMessageBox.Yes:
@@ -631,7 +867,9 @@ class InstallServerDialog(QDialog):
                 return
             try:
                 self._worker.stop()
-                self._worker.wait(2000)
+                # Detached SSH installs get longer wait — the poll loop
+                # may be mid-sleep when we ask it to stop.
+                self._worker.wait(6000 if is_detached_ssh else 2000)
             except Exception:
                 pass
         super().closeEvent(e)
