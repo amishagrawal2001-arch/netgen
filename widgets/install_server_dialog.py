@@ -252,12 +252,17 @@ class SshInstallWorker(QThread):
             except Exception:
                 pass
 
-        # Run installer
+        # Run installer. Pass --wheel <path> pointing at the wheel we
+        # just sftp-copied — without this, install_ostg_complete.py
+        # tries `python -m build` from /tmp/netgen_install/, which has
+        # no source tree, and exits rc=2. (We used to pass `-w <dir>`,
+        # which the installer rejected as an unrecognized arg — fixed
+        # in 0.2.7 to add the proper --wheel flag.)
         cmd_flags = " ".join(self.extra_flags)
         cmd = (
             f"cd {remote_dir} && "
             f"python3 install_ostg_complete.py "
-            f"-w {remote_dir} {cmd_flags}".strip()
+            f"--wheel {wheel_remote} {cmd_flags}".strip()
         )
         if self.user != "root":
             cmd = f"sudo {cmd}"
