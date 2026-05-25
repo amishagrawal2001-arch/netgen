@@ -301,35 +301,56 @@ class AddTGenDialog(QDialog):
 
         root.addWidget(form_box)
 
-        # Bottom buttons. Three actions, plus Close:
+        # Bottom buttons. Four actions, plus Close:
         #
-        #   Add to History  — form contents → history, no connect, stays open
-        #                     (build up a list of chassis without committing)
-        #   Connect & Add   — form contents → history + connect to it, closes
-        #                     (the common single-shot case)
-        #   Close           — exits without connecting; any "Add to History"
-        #                     entries already made are persisted
+        #   Add to History       — form → history, no tree, no connect, stays
+        #                          open. For pre-staging chassis you might
+        #                          someday connect to.
+        #
+        #   Add to TGen List     — form → history + main TGen tree on the
+        #                          left, marked offline. No immediate connect
+        #                          attempt — the periodic health worker will
+        #                          flip it online once it can reach the box.
+        #                          Stays open so you can queue several.
+        #
+        #   Connect && Add       — form → history + tree + immediate connect.
+        #                          Closes the dialog. Common single-shot case.
+        #
+        #   Close                — exits with any queued tree-adds applied;
+        #                          Add to History rows already persisted to
+        #                          disk regardless.
         btns = QDialogButtonBox(QDialogButtonBox.Close)
         self.add_history_btn = QPushButton("Add to History")
         self.add_history_btn.setToolTip(
-            "Save the chassis above to your history list without "
-            "connecting. Useful for building up a list of known "
-            "chassis before deciding which to connect to."
+            "Save the chassis above to your history list. No tree entry, "
+            "no connect attempt. Useful for building up a list of known "
+            "chassis before deciding which to add to your workspace."
         )
         self.add_history_btn.clicked.connect(self._add_to_history_only)
         btns.addButton(self.add_history_btn, QDialogButtonBox.ActionRole)
 
+        self.add_tree_btn = QPushButton("Add to TGen List")
+        self.add_tree_btn.setToolTip(
+            "Add the chassis above to your TGen tree (left pane) without "
+            "connecting. The entry appears offline; the periodic health "
+            "worker will flip it online once /api/health responds. "
+            "Stays open so you can queue several before closing."
+        )
+        self.add_tree_btn.clicked.connect(self._add_to_tree_only)
+        btns.addButton(self.add_tree_btn, QDialogButtonBox.ActionRole)
+
         self.connect_btn = QPushButton("Connect && Add")
         self.connect_btn.setDefault(True)
         self.connect_btn.setToolTip(
-            "Save to history AND connect to the chassis above. Closes "
-            "the dialog. (For multiple chassis, use 'Connect Selected' "
-            "in the table area above.)"
+            "Save to history AND add to TGen List AND mark as online so "
+            "the periodic worker probes immediately. Closes the dialog. "
+            "(For multiple chassis, use 'Connect Selected' in the table "
+            "area above, or 'Add to TGen List' repeatedly then Close.)"
         )
         self.connect_btn.clicked.connect(self._do_connect)
         btns.addButton(self.connect_btn, QDialogButtonBox.AcceptRole)
 
-        btns.rejected.connect(self._close_without_connecting)
+        btns.rejected.connect(self._close_with_queued)
         root.addWidget(btns)
 
         # Hook up table selection → enable/disable Connect Selected
@@ -550,7 +571,8 @@ class AddTGenDialog(QDialog):
         }
 
     def _add_to_history_only(self) -> None:
-        """Save form contents to history but don't connect. Stays open."""
+        """Save form contents to history but don't add to tree or connect.
+        Stays open so the operator can queue several."""
         entry = self._parse_form()
         if entry is None:
             return
@@ -564,25 +586,57 @@ class AddTGenDialog(QDialog):
         self.status_lbl.setText(
             f"Added {entry['address']}:{entry['port']} to history."
         )
-        # Clear the form so the operator can type another one without
-        # accidentally re-adding the same chassis
-        self.address_in.clear()
-        self.label_in.clear()
-        self.auth_in.clear()
-        self.address_in.setFocus()
+        self._reset_form_for_next_entry()
         # Re-probe so the new entry gets a LED
         self._start_reachability_probe()
 
-    def _do_connect(self) -> None:
-        """Form contents → history + connect to it. Closes the dialog."""
+    def _add_to_tree_only(self) -> None:
+        """Add to history + queue for the main TGen tree, no connect.
+
+        Unlike _add_to_history_only, this records an entry in
+        self.chosen_connections with connect_now=False — when the dialog
+        closes, the parent's add_server_interface() will add these to
+        the server_interfaces list with online=False. The periodic
+        health worker still probes them; they flip online once
+        /api/health responds. Stays open so several can be queued."""
         entry = self._parse_form()
         if entry is None:
             return
+        entry["connect_now"] = False
         record_connection(
             entry["address"], entry["port"],
             label=entry["label"], scheme=entry["scheme"],
         )
-        self._set_results([entry])
+        # Avoid double-queueing the same URL if the operator clicks twice.
+        if not any(e.get("url") == entry["url"] for e in self.chosen_connections):
+            self.chosen_connections.append(entry)
+        # Refresh history table too — chassis was added via record_connection
+        self._entries = _load_history()
+        self._populate_history_table()
+        n = len(self.chosen_connections)
+        self.status_lbl.setText(
+            f"Queued {entry['address']}:{entry['port']} for TGen list "
+            f"({n} chassis queued — Close to apply)."
+        )
+        self._reset_form_for_next_entry()
+        self._start_reachability_probe()
+
+    def _do_connect(self) -> None:
+        """Form contents → history + tree + immediate connect. Closes."""
+        entry = self._parse_form()
+        if entry is None:
+            return
+        entry["connect_now"] = True
+        record_connection(
+            entry["address"], entry["port"],
+            label=entry["label"], scheme=entry["scheme"],
+        )
+        # Append (not replace) — operator may have already queued
+        # additions via "Add to TGen List" before clicking Connect & Add.
+        # Skip if this URL was already queued.
+        if not any(e.get("url") == entry["url"] for e in self.chosen_connections):
+            self.chosen_connections.append(entry)
+        self._set_results(self.chosen_connections)
         self.accept()
 
     def _connect_selected_from_history(self) -> None:
@@ -594,12 +648,16 @@ class AddTGenDialog(QDialog):
                 "Select one or more rows in the table first."
             )
             return
-        chosen = []
+        chosen = list(self.chosen_connections)  # preserve any already-queued
+        existing_urls = {e.get("url") for e in chosen}
         for i in rows:
             if 0 <= i < len(self._entries):
                 e = self._entries[i]
+                url = f"{e.get('scheme', 'http')}://{e.get('address')}:{int(e.get('port', 5050))}"
+                if url in existing_urls:
+                    continue
                 chosen.append({
-                    "url": f"{e.get('scheme', 'http')}://{e.get('address')}:{int(e.get('port', 5050))}",
+                    "url": url,
                     "address": e.get("address", ""),
                     "port": int(e.get("port", 5050)),
                     "scheme": e.get("scheme", "http"),
@@ -608,7 +666,9 @@ class AddTGenDialog(QDialog):
                     # one in the form (and uses Connect & Add) or leaves
                     # bulk-connected chassis token-less.
                     "auth_token": "",
+                    "connect_now": True,
                 })
+                existing_urls.add(url)
                 record_connection(
                     e.get("address", ""), int(e.get("port", 5050)),
                     label=e.get("label", ""), scheme=e.get("scheme", "http"),
@@ -616,10 +676,31 @@ class AddTGenDialog(QDialog):
         self._set_results(chosen)
         self.accept()
 
-    def _close_without_connecting(self) -> None:
-        """Cancel / Close button — exit with empty result."""
-        self.chosen_connections = []
-        self.reject()
+    def _close_with_queued(self) -> None:
+        """Close button — accepts if anything was queued via Add to TGen
+        List (so the parent applies those tree-adds), else rejects.
+
+        Differentiates the two close paths:
+          • User clicked Add to TGen List N times then Close → accept
+            with chosen_connections holding N connect_now=False entries
+          • User opened the dialog and clicked Close without queueing
+            anything → reject (no-op for the parent)
+        Either way, any Add to History rows are already persisted to
+        chassis_history.json on disk.
+        """
+        if self.chosen_connections:
+            self._set_results(self.chosen_connections)
+            self.accept()
+        else:
+            self.reject()
+
+    def _reset_form_for_next_entry(self) -> None:
+        """Clear the connection form so the operator can type another
+        chassis without accidentally re-submitting the same one."""
+        self.address_in.clear()
+        self.label_in.clear()
+        self.auth_in.clear()
+        self.address_in.setFocus()
 
     def _set_results(self, entries: list) -> None:
         """Populate result attributes from a list of parsed entries."""

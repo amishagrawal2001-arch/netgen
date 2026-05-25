@@ -84,7 +84,7 @@ class TrafficGenClientMenuAction():
             return
 
         existing = {server["address"] for server in self.server_interfaces}
-        added, skipped = [], []
+        added, skipped, added_offline = [], [], []
         for entry in targets:
             full_url = entry.get("url")
             if not full_url:
@@ -93,14 +93,27 @@ class TrafficGenClientMenuAction():
                 skipped.append(full_url)
                 continue
 
+            # connect_now=False entries come from the dialog's "Add to
+            # TGen List" button — operator wants the chassis in the
+            # tree but hasn't asked for a connection attempt yet.
+            # Mark offline so the icon shows red until the periodic
+            # health worker probes /api/health successfully. Anything
+            # without the field (legacy callers, "Connect & Add",
+            # "Connect Selected") defaults to online=True.
+            connect_now = bool(entry.get("connect_now", True))
+            online = connect_now
+
             tg_id = len(self.server_interfaces)
-            server_entry = {"tg_id": tg_id, "address": full_url, "online": True}
+            server_entry = {"tg_id": tg_id, "address": full_url, "online": online}
             label = entry.get("label", "")
             if label:
                 server_entry["label"] = label
             self.server_interfaces.append(server_entry)
             existing.add(full_url)
-            added.append(full_url)
+            if connect_now:
+                added.append(full_url)
+            else:
+                added_offline.append(full_url)
 
             # Auth token (session-only — not persisted to disk) for /api/*
             auth = entry.get("auth_token", "")
@@ -121,14 +134,23 @@ class TrafficGenClientMenuAction():
                     server_id=server_id,
                     address=full_url,
                     tg_id=tg_id,
-                    online=True,
+                    online=online,
                 )
-                logger.info(f"[ADD SERVER] Registered server {server_id} in ServerManager")
+                logger.info(
+                    f"[ADD SERVER] Registered server {server_id} in ServerManager "
+                    f"(online={online})"
+                )
 
-        if added:
+        if added or added_offline:
             self.update_server_tree()
             self.save_server_interfaces()
-            logger.info(f"[ADD SERVER] Added {len(added)} chassis: {', '.join(added)}")
+            if added:
+                logger.info(f"[ADD SERVER] Added {len(added)} chassis (online): {', '.join(added)}")
+            if added_offline:
+                logger.info(
+                    f"[ADD SERVER] Added {len(added_offline)} chassis (offline, no connect): "
+                    f"{', '.join(added_offline)}"
+                )
         if skipped:
             QMessageBox.information(
                 self, "Already connected",
