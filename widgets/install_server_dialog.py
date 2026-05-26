@@ -871,7 +871,20 @@ class InstallServerDialog(QDialog):
         w = QWidget()
         form = QFormLayout(w)
 
-        self.up_server = QLineEdit(default_url or "http://lab-box:5050")
+        # Server URL — editable combobox seeded from ~/.netgen/chassis_history.json
+        # (the same store Add TGEN Chassis uses). Operators who've already
+        # added their lab boxes there can pick from the dropdown instead
+        # of retyping. Typing a new address still works — combobox is
+        # editable. Each item carries the full chassis dict as user
+        # data so we can react to selection with port-aware fill-in.
+        self.up_server = QComboBox()
+        self.up_server.setEditable(True)
+        self.up_server.setInsertPolicy(QComboBox.NoInsert)
+        self.up_server.lineEdit().setPlaceholderText("http://lab-box:5050")
+        self._populate_chassis_dropdown(self.up_server, default_url, full_url=True)
+        self.up_server.currentIndexChanged.connect(
+            lambda i: self._on_chassis_picked(self.up_server, i, full_url=True)
+        )
         form.addRow("Server URL:", self.up_server)
 
         self.up_token = QLineEdit(default_token or "")
@@ -987,6 +1000,89 @@ class InstallServerDialog(QDialog):
         self.up_ssh_password.setEnabled(use_pw)
         self.up_ssh_key.setEnabled(not use_pw)
 
+    def _populate_chassis_dropdown(
+        self, combo: QComboBox, default_text: str, *, full_url: bool
+    ) -> None:
+        """Seed an editable QComboBox with entries from chassis_history.json.
+
+        Used by both the Upgrade tab's Server URL field (full_url=True,
+        items show "http://host:port — label") and the Fresh Install
+        tab's Host field (full_url=False, items show "host — label").
+        Each item carries the full chassis dict as user data so
+        _on_chassis_picked can fill the form fields with port etc.
+
+        Adds a blank "(type a new address, or pick from history below)"
+        sentinel as index 0 so the dropdown opens with the placeholder
+        showing instead of auto-selecting the first chassis. default_text
+        wins over the sentinel when provided (operator already has a
+        connection — pre-fill it).
+        """
+        try:
+            from widgets.add_tgen_dialog import _load_history
+            entries = _load_history()
+        except Exception:
+            entries = []
+
+        # Sentinel — empty text so the placeholder shows through
+        combo.addItem("", None)
+
+        for e in entries:
+            address = e.get("address", "")
+            if not address:
+                continue
+            port = int(e.get("port", 5050))
+            scheme = e.get("scheme", "http")
+            label = e.get("label", "") or ""
+            if full_url:
+                display = f"{scheme}://{address}:{port}"
+            else:
+                display = address
+            if label:
+                display = f"{display}  —  {label}"
+            combo.addItem(display, e)
+
+        if default_text:
+            # Try to match an existing item; if not found, just type it
+            # in (combobox stays editable so this works).
+            idx = combo.findText(default_text)
+            if idx >= 0:
+                combo.setCurrentIndex(idx)
+            else:
+                combo.setEditText(default_text)
+        else:
+            combo.setCurrentIndex(0)
+            combo.setEditText("")  # show placeholder
+
+    def _on_chassis_picked(
+        self, combo: QComboBox, index: int, *, full_url: bool
+    ) -> None:
+        """Handler for chassis-dropdown selection.
+
+        Index 0 is the sentinel — ignore. For real picks, extract the
+        chassis dict via itemData and fill in:
+          • full_url=True  (Upgrade tab): leave the combobox showing
+            the scheme://host:port URL it already has (no extra work
+            — addItem text IS the URL).
+          • full_url=False (Fresh Install tab): strip back to just the
+            hostname (combobox display might include " — label"), and
+            bump the port spinbox to the chassis's stored port.
+        """
+        if index <= 0:
+            return
+        entry = combo.itemData(index)
+        if not isinstance(entry, dict):
+            return
+        address = entry.get("address", "")
+        port = int(entry.get("port", 5050))
+        if full_url:
+            scheme = entry.get("scheme", "http")
+            combo.setEditText(f"{scheme}://{address}:{port}")
+        else:
+            combo.setEditText(address)
+            # Bump the port spinbox if we have one on this tab
+            if hasattr(self, "ssh_port"):
+                self.ssh_port.setValue(port)
+
     def _browse_wheel(self, line_edit: QLineEdit) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self, "Select wheel file", "", "Python wheels (*.whl);;All files (*)"
@@ -998,7 +1094,7 @@ class InstallServerDialog(QDialog):
         if self._worker and self._worker.isRunning():
             QMessageBox.information(self, "Busy", "An operation is already in progress.")
             return
-        url = (self.up_server.text() or "").strip()
+        url = (self.up_server.currentText() or "").strip()
         wheel = (self.up_wheel.text() or "").strip()
         token = (self.up_token.text() or "").strip()
         if not url:
@@ -1146,8 +1242,19 @@ class InstallServerDialog(QDialog):
         form = QFormLayout(w)
 
         host_row = QHBoxLayout()
-        self.ssh_host = QLineEdit()
-        self.ssh_host.setPlaceholderText("lab-box.example.com")
+        # Host — editable combobox seeded from chassis_history.json.
+        # Same story as the Upgrade tab's Server URL field, but here we
+        # pull just the hostname (no scheme, no port — those live in
+        # separate fields on this tab). Picking a row also bumps the
+        # port spinbox to whatever was stored with the chassis entry.
+        self.ssh_host = QComboBox()
+        self.ssh_host.setEditable(True)
+        self.ssh_host.setInsertPolicy(QComboBox.NoInsert)
+        self.ssh_host.lineEdit().setPlaceholderText("lab-box.example.com")
+        self._populate_chassis_dropdown(self.ssh_host, "", full_url=False)
+        self.ssh_host.currentIndexChanged.connect(
+            lambda i: self._on_chassis_picked(self.ssh_host, i, full_url=False)
+        )
         self.ssh_user = QLineEdit("root")
         self.ssh_user.setMaximumWidth(120)
         # SSH port — defaults to 22, but lab boxes behind jump hosts /
@@ -1282,7 +1389,7 @@ class InstallServerDialog(QDialog):
         if self._worker and self._worker.isRunning():
             QMessageBox.information(self, "Busy", "An operation is already in progress.")
             return
-        host = (self.ssh_host.text() or "").strip()
+        host = (self.ssh_host.currentText() or "").strip()
         user = (self.ssh_user.text() or "root").strip()
         wheel = (self.ssh_wheel.text() or "").strip()
         installer = (self.ssh_installer.text() or "").strip()
@@ -1377,7 +1484,7 @@ class InstallServerDialog(QDialog):
             QMessageBox.information(self, "Busy",
                                     "An operation is already in progress.")
             return
-        host = (self.ssh_host.text() or "").strip()
+        host = (self.ssh_host.currentText() or "").strip()
         user = (self.ssh_user.text() or "root").strip()
         if not host:
             QMessageBox.warning(self, "Missing", "Host is required.")
