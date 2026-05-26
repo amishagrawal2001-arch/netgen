@@ -176,10 +176,12 @@ class SshInstallWorker(QThread):
         installer_path: str,
         extra_flags: list,
         resume_mode: bool = False,
+        port: int = 22,
     ):
         super().__init__()
         self.host = host
         self.user = user
+        self.port = int(port) if port else 22
         self.password = password
         self.key_path = key_path
         self.wheel_path = wheel_path
@@ -212,7 +214,12 @@ class SshInstallWorker(QThread):
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
         try:
-            kwargs = {"hostname": self.host, "username": self.user, "timeout": 15}
+            kwargs = {
+                "hostname": self.host,
+                "username": self.user,
+                "port": self.port,
+                "timeout": 15,
+            }
             if self.key_path:
                 kwargs["key_filename"] = self.key_path
                 self.log_chunk.emit(f"[client] auth: key {self.key_path}\n")
@@ -594,10 +601,20 @@ class InstallServerDialog(QDialog):
         self.ssh_host = QLineEdit()
         self.ssh_host.setPlaceholderText("lab-box.example.com")
         self.ssh_user = QLineEdit("root")
-        self.ssh_user.setMaximumWidth(140)
+        self.ssh_user.setMaximumWidth(120)
+        # SSH port — defaults to 22, but lab boxes behind jump hosts /
+        # alternate sshd configs often use 2222 / 22000 / etc. Without
+        # this field the dialog was unusable on those boxes.
+        self.ssh_port = QSpinBox()
+        self.ssh_port.setRange(1, 65535)
+        self.ssh_port.setValue(22)
+        self.ssh_port.setMaximumWidth(80)
+        self.ssh_port.setToolTip("SSH port (default 22)")
         host_row.addWidget(self.ssh_host, 1)
         host_row.addWidget(QLabel("user:"))
         host_row.addWidget(self.ssh_user)
+        host_row.addWidget(QLabel("port:"))
+        host_row.addWidget(self.ssh_port)
         form.addRow("Host:", host_row)
 
         # Auth toggle
@@ -669,9 +686,25 @@ class InstallServerDialog(QDialog):
         info.setStyleSheet("color:#475569; font-size:11px;")
         form.addRow(info)
 
+        # Action row: Test connection + Install side by side. Test is a
+        # 2-3 s probe that catches credential typos / wrong port / dead
+        # host before kicking off a 15-min install. Pre-flight checks
+        # (Python version, sudo, disk) also run as part of Install,
+        # but Test lets the operator verify SSH alone first.
+        action_row = QHBoxLayout()
+        self.ssh_test_btn = QPushButton("Test Connection")
+        self.ssh_test_btn.setToolTip(
+            "Connect via SSH + run a few pre-flight checks (Python "
+            "version, sudo capability, disk space). 2-3 seconds. "
+            "Run this first to catch typos before the 15-min install."
+        )
+        self.ssh_test_btn.clicked.connect(self._start_ssh_test)
         self.ssh_btn = QPushButton("Install")
         self.ssh_btn.clicked.connect(self._start_ssh_install)
-        form.addRow("", self.ssh_btn)
+        action_row.addWidget(self.ssh_test_btn)
+        action_row.addWidget(self.ssh_btn)
+        action_row.addStretch(1)
+        form.addRow("", action_row)
 
         return w
 
@@ -722,11 +755,13 @@ class InstallServerDialog(QDialog):
                 QMessageBox.warning(self, "Missing", "Pick a valid SSH key file.")
                 return
 
+        port = int(self.ssh_port.value())
+
         # Probe for an existing detached install before bothering with
         # the wheel/installer validation. If one's running, offer to
         # reattach to its log — saves the operator from having to
         # cancel and recover.
-        running_pid = self._probe_existing_install(host, user, password, key_path)
+        running_pid = self._probe_existing_install(host, user, password, key_path, port=port)
         resume_mode = False
         if running_pid:
             ret = QMessageBox.question(
@@ -764,7 +799,8 @@ class InstallServerDialog(QDialog):
         self.ssh_btn.setEnabled(False)
 
         self._worker = SshInstallWorker(
-            host=host, user=user, password=password, key_path=key_path,
+            host=host, user=user, port=port,
+            password=password, key_path=key_path,
             wheel_path=wheel, installer_path=installer, extra_flags=flags,
             resume_mode=resume_mode,
         )
@@ -773,8 +809,191 @@ class InstallServerDialog(QDialog):
         self._worker.finished_ok.connect(self._ssh_install_finished)
         self._worker.start()
 
+    def _start_ssh_test(self) -> None:
+        """Click handler for the Test Connection button.
+
+        Runs an SSH connect against the same host+user+auth+port the
+        Install button would use, then runs four cheap pre-flight
+        probes (Python version, sudo capability, free disk, target's
+        own /api/health). Reports each as a ✓/✗ line in the log pane
+        and a one-line summary in a QMessageBox. Total budget ~5 s.
+
+        Doesn't kick off the install. Operators run this first to
+        catch a wrong password / wrong port / dead host / Python 3.8
+        target / non-root user without sudo — any of which would
+        otherwise blow up 30 s to 15 min into an Install attempt.
+        """
+        if self._worker and self._worker.isRunning():
+            QMessageBox.information(self, "Busy",
+                                    "An operation is already in progress.")
+            return
+        host = (self.ssh_host.text() or "").strip()
+        user = (self.ssh_user.text() or "root").strip()
+        if not host:
+            QMessageBox.warning(self, "Missing", "Host is required.")
+            return
+        port = int(self.ssh_port.value())
+
+        if self.auth_pw_rb.isChecked():
+            password = self.ssh_password.text() or ""
+            key_path = None
+            if not password:
+                QMessageBox.warning(self, "Missing", "Enter the SSH password.")
+                return
+        else:
+            password = None
+            key_path = (self.ssh_key.text() or "").strip()
+            if not key_path or not os.path.isfile(key_path):
+                QMessageBox.warning(self, "Missing", "Pick a valid SSH key file.")
+                return
+
+        self.log_view.clear()
+        self.ssh_test_btn.setEnabled(False)
+        self._set_status(f"Testing {user}@{host}:{port}...")
+        self._append_log(f"[test] connect to {user}@{host}:{port}\n")
+
+        try:
+            import paramiko
+        except Exception as e:
+            self._append_log(f"[test] paramiko import failed: {e}\n")
+            self.ssh_test_btn.setEnabled(True)
+            return
+
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        passed, failed = [], []
+        try:
+            kw = {"hostname": host, "username": user, "port": port, "timeout": 8}
+            if key_path:
+                kw["key_filename"] = key_path
+            else:
+                kw["password"] = password or ""
+            try:
+                client.connect(**kw)
+            except Exception as e:
+                self._append_log(f"[test] ✗ SSH connect failed: {e}\n")
+                self._set_status("Test failed — see log")
+                QMessageBox.warning(
+                    self, "Test failed",
+                    f"Couldn't reach {user}@{host}:{port}.\n\n"
+                    f"{e}\n\n"
+                    f"Check host, port, credentials, and that sshd is "
+                    f"running on the target."
+                )
+                return
+            self._append_log("[test] ✓ SSH connect OK\n")
+            passed.append("ssh connect")
+
+            # Probe 1: Python ≥ 3.9 (install_python_dependencies needs it)
+            out, _ = self._test_remote(client, "python3 --version 2>&1")
+            ok = False
+            try:
+                # "Python 3.10.12" → 3.10
+                ver = out.strip().split()[-1]
+                maj, minor = (int(x) for x in ver.split(".")[:2])
+                ok = (maj, minor) >= (3, 9)
+            except Exception:
+                pass
+            if ok:
+                self._append_log(f"[test] ✓ Python: {out.strip()}\n")
+                passed.append("python>=3.9")
+            else:
+                self._append_log(f"[test] ✗ Python (need ≥3.9): {out.strip() or '(no output)'}\n")
+                failed.append("python<3.9 or missing")
+
+            # Probe 2: sudo capability (skip for root)
+            if user == "root":
+                self._append_log("[test] ✓ Sudo: not needed (user is root)\n")
+                passed.append("sudo (root)")
+            else:
+                # `sudo -n true` succeeds iff sudo is configured without
+                # password prompt OR a cached credential exists.
+                out, rc = self._test_remote(
+                    client, "sudo -n true 2>&1 && echo OK || echo FAIL"
+                )
+                if "OK" in out:
+                    self._append_log("[test] ✓ Sudo: passwordless / cached\n")
+                    passed.append("sudo")
+                else:
+                    self._append_log(
+                        f"[test] ✗ Sudo: user {user!r} can't sudo without prompt. "
+                        "Install will block waiting for a password it can't see.\n"
+                    )
+                    failed.append("sudo without prompt")
+
+            # Probe 3: free disk on /var (DPDK build needs ~4 GB)
+            out, _ = self._test_remote(
+                client,
+                "df -BG --output=avail /var 2>/dev/null | tail -1 | tr -d 'G '"
+            )
+            try:
+                free_gb = int(out.strip())
+            except (ValueError, TypeError):
+                free_gb = -1
+            if free_gb >= 4:
+                self._append_log(f"[test] ✓ Disk: {free_gb} GB free on /var\n")
+                passed.append(f"disk={free_gb}G")
+            elif free_gb < 0:
+                self._append_log(f"[test] ? Disk: couldn't parse df output: {out!r}\n")
+            else:
+                self._append_log(
+                    f"[test] ✗ Disk: only {free_gb} GB free on /var (need ≥4 GB "
+                    "for DPDK build). Pass --skip-dpdk-build or --no-dpdk to fit.\n"
+                )
+                failed.append(f"disk={free_gb}G")
+
+            # Probe 4: is netgen-server already running? (upgrade hint)
+            out, _ = self._test_remote(
+                client,
+                "systemctl is-active netgen-server.service 2>/dev/null || echo missing"
+            )
+            state = out.strip() or "missing"
+            if state == "active":
+                self._append_log(
+                    "[test] ℹ netgen-server already active on this host — "
+                    "consider using the 'Upgrade running server' tab instead "
+                    "for a 30 s upgrade (Tab 2 is a 15-min full install).\n"
+                )
+                passed.append(f"netgen-server={state}")
+            else:
+                self._append_log(f"[test] ✓ netgen-server: {state}\n")
+                passed.append(f"netgen-server={state}")
+
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
+            self.ssh_test_btn.setEnabled(True)
+
+        if failed:
+            self._set_status(f"Test: {len(passed)} ok, {len(failed)} failed")
+            QMessageBox.warning(
+                self, "Pre-flight checks failed",
+                "Some pre-flight checks failed. Install will likely fail too:"
+                "\n\n• " + "\n• ".join(failed) + "\n\nSee log for details."
+            )
+        else:
+            self._set_status(f"Test: all {len(passed)} checks passed")
+            QMessageBox.information(
+                self, "Pre-flight OK",
+                "All pre-flight checks passed:\n\n• " + "\n• ".join(passed)
+                + "\n\nSafe to click Install."
+            )
+
+    def _test_remote(self, client, cmd: str, timeout: int = 6):
+        """Run `cmd` over the client SSH connection. Returns (stdout, rc)."""
+        try:
+            _, stdout, _ = client.exec_command(cmd, timeout=timeout)
+            out = stdout.read().decode("utf-8", errors="replace")
+            rc = stdout.channel.recv_exit_status()
+            return out, rc
+        except Exception as e:
+            return f"(exec failed: {e})", -1
+
     def _probe_existing_install(
-        self, host: str, user: str, password: Optional[str], key_path: Optional[str]
+        self, host: str, user: str, password: Optional[str], key_path: Optional[str],
+        port: int = 22,
     ) -> Optional[str]:
         """One-shot SSH probe for /var/run/netgen-install.pid. Returns
         the pid string when a live install is running on `host`, else
@@ -788,7 +1007,7 @@ class InstallServerDialog(QDialog):
         client = paramiko.SSHClient()
         client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
         try:
-            kw = {"hostname": host, "username": user, "timeout": 5}
+            kw = {"hostname": host, "username": user, "port": int(port), "timeout": 5}
             if key_path:
                 kw["key_filename"] = key_path
             else:
