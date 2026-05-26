@@ -357,14 +357,95 @@ without leaving it:</p>
           <code>/api/health</code> for the new instance.</td></tr>
   <tr><td><b>Fresh install via SSH</b><br><span class="muted">paramiko, 15–45 min, <b>detached</b></span></td>
       <td>Bare Linux host. No netgen, no Docker, no DPDK yet.</td>
-      <td>Connects (password OR SSH key) → sftp-copies the wheel +
-          <code>install_ostg_complete.py</code> to
+      <td>Connects (password OR SSH key, configurable port) → sftp-copies
+          the wheel + <code>install_ostg_complete.py</code> to
           <code>/tmp/netgen_install/</code> → spawns the installer
           <i>detached</i> via <code>nohup</code> on the target →
           polls <code>/var/log/netgen-install.log</code> for live
           output. Optional flags: <code>--no-dpdk</code>,
           <code>--skip-dpdk-build</code>.</td></tr>
 </table>
+
+<h3>Test Connection + pre-flight checks (NEW in 0.2.9)</h3>
+
+<p>The Fresh Install tab grew a <b>Test Connection</b> button next
+to <b>Install</b>. Run it first to verify SSH credentials work and
+the target meets the install's prerequisites — saves a 15-min
+install round-trip when the password's wrong or Python is too old.
+2–3 seconds total budget. Four probes after the SSH connect:</p>
+
+<table>
+  <tr><th>Probe</th><th>What it checks</th><th>Why</th></tr>
+  <tr><td><b>Python ≥ 3.9</b></td>
+      <td><code>python3 --version</code> → parses major/minor</td>
+      <td><code>install_python_dependencies</code> needs ≥3.9 for
+          f-strings + type hints in the wheel</td></tr>
+  <tr><td><b>Sudo capability</b></td>
+      <td><code>sudo -n true</code> (skipped when user is root)</td>
+      <td>Non-root installs that hit a password prompt block
+          forever — paramiko has no terminal to type into</td></tr>
+  <tr><td><b>Free disk ≥ 4 GB on /var</b></td>
+      <td><code>df -BG --output=avail /var</code></td>
+      <td>DPDK build + FRR Docker image + apt cache all land under
+          <code>/var</code>; smaller boxes crash mid-meson</td></tr>
+  <tr><td><b>netgen-server already active?</b></td>
+      <td><code>systemctl is-active netgen-server.service</code></td>
+      <td>If yes, hints to switch to the <b>Upgrade running server</b>
+          tab — a 30s round-trip instead of a 15-min full install</td></tr>
+</table>
+
+<p>Results stream into the log pane as <code>[test] ✓ / ✗</code>
+lines. Tail QMessageBox shows either <b>"All checks passed — safe
+to click Install"</b> or <b>"Some checks failed — install will
+likely fail too"</b> with the failing bullet list. The Install
+button still works without first clicking Test, but Test catches
+the obvious bugs in 2 s instead of 30 s into spawn.</p>
+
+<h3>SSH port + host configuration</h3>
+
+<p>The Host row exposes <b>address / user / port</b> — port
+defaults to 22 but lab boxes behind jump hosts or alternate
+sshd configs (2222 / 22000 / etc.) were unreachable before. Both
+the connect step and the pid-probe / pre-flight probes use the
+configured port.</p>
+
+<h3>Error surfacing (NEW in 0.2.9)</h3>
+
+<p>The log pane is now <b>color-coded</b> as output streams in:</p>
+
+<ul>
+  <li><span style="color:#dc2626;">red</span> — <code>[ERROR]</code>,
+      <code>error</code>, <code>exception</code>, <code>failed</code>,
+      <code>fatal</code>, <code>traceback</code>, <code>-E-</code>,
+      <code>✗</code></li>
+  <li><span style="color:#d97706;">amber</span> — <code>[WARNING]</code>,
+      <code>warn</code>, <code>⚠</code></li>
+  <li><span style="color:#15803d;">green</span> — <code>✓</code>,
+      <code>success</code>, <code>OK</code></li>
+  <li>neutral — everything else</li>
+</ul>
+
+<p>Cleanup-style messages from <code>install_ostg_complete.py</code>
+that aren't real errors (<code>Failed to stop ostg-server: Unit
+not loaded</code>, <code>No such image: ostg-frr:latest</code>,
+etc.) get filtered out of the error color so the operator's eye
+isn't drawn to "this is fine" cleanup spam.</p>
+
+<p>On failure, the dialog now pops a <b>QMessageBox.critical</b>
+with the last 6 captured error lines bullet-listed — no more
+scrolling a 1000-line log to find the actual cause. Example:</p>
+
+<pre style="background:#fef2f2; border-left:3px solid #dc2626; padding:8px;">
+Install failed
+
+The fresh install did not complete. Most recent errors from the log:
+
+ • install_ostg_complete.py: error: unrecognized arguments: -w
+ • [ERROR] Wheel file not found: dist/ostg_trafficgen-0.0.0-py3-none-any.whl
+</pre>
+
+<p>Errors are also reset between runs — a failed install doesn't
+leak its captured errors into the next attempt's failure dialog.</p>
 
 <h3>Detached install — what survives client exit</h3>
 
