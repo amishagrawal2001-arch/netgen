@@ -421,11 +421,34 @@ def api_health():
     """Lightweight liveness probe — exempt from bearer-token auth even
     when NETGEN_AUTH_TOKEN is set (see _AUTH_EXEMPT_PREFIXES). Lets
     load balancers / monitoring poke the process without juggling
-    secrets."""
+    secrets.
+
+    Returns:
+        status         — always "ok" when the route fires (the process
+                         is alive enough to handle a request)
+        auth_required  — informational; True when NETGEN_AUTH_TOKEN is
+                         set so /api/health probes survive even with
+                         auth on
+        version        — API contract version; bumped on backwards-
+                         incompatible response-shape changes (still 1)
+        netgen_version — the actual ostg-trafficgen package version on
+                         the server. Added in 0.2.12 so the Add TGEN
+                         Chassis dialog can show the server version in
+                         its history table. Falls back to "unknown" if
+                         pip metadata isn't readable for any reason
+                         (shouldn't happen on a real install).
+    """
+    netgen_version = "unknown"
+    try:
+        from importlib.metadata import version as _pkg_version
+        netgen_version = _pkg_version("ostg-trafficgen")
+    except Exception:
+        pass
     return jsonify({
         "status": "ok",
         "auth_required": bool(_AUTH_TOKEN),
         "version": 1,
+        "netgen_version": netgen_version,
     }), 200
 
 
