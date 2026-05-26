@@ -2,6 +2,87 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.11] - 2026-05-26
+
+**Mandatory upgrade if your server runs any 0.2.6–0.2.10 build.**
+The in-GUI Upgrade tab was bricked by a latent NameError on the
+server side; this release fixes it. Also bundles all install-dialog
+support files so a Fresh Install actually deploys DPDK + FRR.
+
+### Fixed — `/api/admin/upgrade_wheel` NameError
+- Server-side handler (shipped in 0.2.6) used `sys.executable` to
+  invoke pip with the same Python interpreter the server runs
+  under. But `sys` was never imported anywhere in run_tgen_server.py
+  (15k+ LOC, no other reference). Every call to the Upgrade tab
+  returned a bare HTTP 500 with this stack trace:
+
+      File "run_tgen_server.py", line 14085, in api_admin_upgrade_wheel
+          py = sys.executable or "python3"
+      NameError: name 'sys' is not defined
+
+- Bug went unnoticed for four releases because the OTHER
+  install-dialog bugs (apt-wait infinite loop, Python stdout
+  buffering, --wheel path mismatch) blocked operators from
+  actually reaching this code path. With 0.2.10's fixes the dialog
+  finally got far enough to hit it.
+- Fix: `import sys` inline at the call site (commit a882229).
+  Chicken-and-egg: operators on 0.2.6–0.2.10 must do this one
+  upgrade *manually* via SSH (Install Guide section 9a) before
+  the Upgrade tab works. Once on 0.2.11+, subsequent upgrades
+  can use Tab 1 cleanly.
+
+### Added — Fresh Install dialog now ships support files
+- The dialog used to sftp only the wheel + install_ostg_complete.py.
+  The installer then logged warnings + errors trying to read
+  sibling files that weren't on the target:
+  - `WARNING: resources/dpdk/ not found — DPDK bind/unbind endpoints will return 404`
+  - `ERROR: failed to read dockerfile: open Dockerfile.frr: no such file or directory`
+- The install completed (script is tolerant) but the target ended
+  up without DPDK scripts at /opt/netgen/resources/dpdk/ and without
+  a netgen-frr Docker image. Operators had to manually scp the
+  missing files or re-run install_ostg_complete.py from a full
+  source checkout.
+- Fix: SshInstallWorker.run() now also uploads, after the wheel +
+  installer:
+  - `Dockerfile.frr` (FRR Alpine container recipe)
+  - `requirements.txt`
+  - `resources/dpdk/` (full recursive tree — DPDK scripts +
+    tx_worker source)
+  - `ostg_docker/` (full recursive tree — frr.conf.template,
+    start-frr.sh, etc.)
+- New `_sftp_put_tree` helper walks a local directory, recreates
+  the structure on the target, skips __pycache__ + dotfiles,
+  preserves the executable bit on .sh/.py files.
+- Missing local files log a `[warn]` and continue — operator may
+  not need all features on a given install (e.g. client-only
+  setups don't need Dockerfile.frr).
+
+### Documentation
+- Install Guide section 9 (Reinstall / upgrade) expanded from a
+  3-line table into a full walkthrough with five subsections:
+  - **9a. Manual SSH one-liner** ★ — `scp + ssh + pip install + restart`,
+    each flag explained
+  - **9b. Step-by-step on the box** — numbered 1-7 interactive
+    walkthrough with shell snippets and the "skip restart →
+    server runs old code in memory" footgun
+  - **9c. Rollback** — one-liner pattern + "keep last 2-3 wheels"
+    tip for bisecting regressions
+  - **9d. Full re-provision** — install_ostg_complete.py rerun
+  - **9e. When the Upgrade tab is broken** — chicken-and-egg
+    recovery; explicitly calls out the 0.2.6–0.2.10 NameError
+    bug for operators reading the guide on those versions
+
+### Notes
+- No new dependencies on either side.
+- Wheel ships as `ostg_trafficgen-0.2.11-py3-none-any.whl`.
+- Validated end-to-end on svl-hp-ai-srv04: hot-patched the sys
+  import → POST `/api/admin/upgrade_wheel` returned 200 →
+  background pip install completed → GET log poll triggered
+  systemctl restart → fresh PID, /api/health returned 200.
+- svl-hp-ai-srv02 manually upgraded to 0.2.10 via the new
+  section 9a one-liner end-to-end, validating the doc against
+  a real operator workflow.
+
 ## [0.2.10] - 2026-05-26
 
 Install dialog visibility fixes — three bugs that made successful
