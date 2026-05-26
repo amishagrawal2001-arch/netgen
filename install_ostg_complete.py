@@ -850,7 +850,85 @@ class NetgenInstaller:
             if pip_result.returncode != 0:
                 self.log(f"Wheel install failed: {pip_result.stderr or pip_result.stdout or 'unknown'}", "ERROR")
                 raise SystemExit(1)
-        
+
+        # Extract bundled assets from the wheel's site-packages to
+        # /opt/netgen/ — covers the case where the operator's install
+        # source tree (script_dir) is missing the support files
+        # (e.g. dialog flow that only sftp'd wheel + installer; bare
+        # `pip install <wheel>` directly). The wheel ALWAYS contains
+        # these under site-packages/resources/dpdk/ and
+        # site-packages/ostg_docker/, so we can recover from there.
+        # Runs unconditionally — overwriting is safe because the wheel
+        # is the canonical source for these files anyway.
+        self.log(
+            f"Deploying bundled assets from wheel to {INSTALL_DIR}/ "
+            f"(resources/dpdk + ostg_docker + Dockerfile.frr)..."
+        )
+        # Pass the extraction script via Python heredoc so multi-line
+        # control flow works (a single `python -c "..."` can't carry
+        # `if/for` blocks). The script imports the freshly-installed
+        # packages directly, finds their on-disk location via
+        # __file__, and copies the trees to INSTALL_DIR. Works
+        # regardless of where pip decided to install the wheel
+        # (system site-packages, venv, pipx).
+        wheel_extract_cmd = (
+            "python3 - <<'PYEOF'\n"
+            "import os, shutil\n"
+            f"DEST = {INSTALL_DIR!r}\n"
+            "os.makedirs(DEST, exist_ok=True)\n"
+            "\n"
+            "# 1. resources/dpdk — DPDK install scripts + tx_worker source\n"
+            "import resources.dpdk as d\n"
+            "src = os.path.dirname(d.__file__)\n"
+            "dst = os.path.join(DEST, 'resources', 'dpdk')\n"
+            "os.makedirs(os.path.dirname(dst), exist_ok=True)\n"
+            "shutil.rmtree(dst, ignore_errors=True)\n"
+            "shutil.copytree(src, dst)\n"
+            "for f in os.listdir(dst):\n"
+            "    if f.endswith('.sh'):\n"
+            "        os.chmod(os.path.join(dst, f), 0o755)\n"
+            "\n"
+            "# 2. ostg_docker — Dockerfile.frr + start-frr.sh + frr.conf.template\n"
+            "try:\n"
+            "    import ostg_docker as o\n"
+            "    src2 = os.path.dirname(o.__file__)\n"
+            "    dst2 = os.path.join(DEST, 'ostg_docker')\n"
+            "    shutil.rmtree(dst2, ignore_errors=True)\n"
+            "    shutil.copytree(src2, dst2)\n"
+            "    # 3. Convenience: publish key FRR files at the install root\n"
+            "    #    too — setup_docker_frr looks here historically.\n"
+            "    for f in ('Dockerfile.frr', 'start-frr.sh', 'frr.conf.template'):\n"
+            "        s = os.path.join(src2, f)\n"
+            "        if os.path.isfile(s):\n"
+            "            d3 = os.path.join(DEST, f)\n"
+            "            shutil.copy2(s, d3)\n"
+            "            if f.endswith('.sh'):\n"
+            "                os.chmod(d3, 0o755)\n"
+            "except ImportError:\n"
+            "    pass\n"
+            "\n"
+            "print('deployed:', sorted(os.listdir(DEST)))\n"
+            "PYEOF\n"
+        )
+        extract_result = self.run_command(
+            wheel_extract_cmd, check=False, capture_output=True,
+        )
+        if extract_result.returncode == 0:
+            self.log(f"✓ Bundled assets deployed to {INSTALL_DIR}/")
+        else:
+            err = (extract_result.stderr or extract_result.stdout or "unknown").strip()[:400]
+            self.log(
+                f"Wheel asset extraction returned rc={extract_result.returncode}: "
+                f"{err}. Falling back to script_dir copy below.",
+                "WARNING",
+            )
+
+        # Legacy: also copy from script_dir if the files exist there
+        # (gives full-source installs the same behavior). Either path
+        # produces the same end state — the wheel extract above is
+        # authoritative, the script_dir copy is a fallback for very
+        # old install paths.
+        #
         # Copy FRR Docker files: prefer root Dockerfile.frr (Alpine-based, no apt-get build)
         # to avoid apt-get failures on remote servers (libyang2-dev, python3.11-dev, etc.)
         script_dir = os.path.dirname(os.path.abspath(__file__))

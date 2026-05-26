@@ -13790,6 +13790,85 @@ _ADMIN_INSTALL_STATE = {
     "return_code": None,
 }
 
+
+def _ensure_dpdk_tree_deployed():
+    """Make sure /opt/netgen/resources/dpdk/ exists by copying from the
+    wheel's pip-install location if needed.
+
+    Why: the /admin Install DPDK button + the /api/dpdk/* bind/unbind
+    endpoints look for scripts at /opt/netgen/resources/dpdk/. That
+    directory only exists when install_ostg_complete.py deployed it
+    (full install flow) — a bare `pip install <wheel>` or the
+    pre-v0.2.12 dialog flow that only sftp'd wheel+installer leaves
+    it empty, and the admin portal then 404s when the operator clicks
+    Install DPDK.
+
+    The wheel itself ships these files under
+    site-packages/resources/dpdk/. Self-heal by copying from there
+    to /opt/netgen/. Returns the deployed install_dpdk.sh path on
+    success, None on failure (no write perms, missing source, etc.)
+    so the caller can surface a clear error.
+
+    Best-effort: skips silently if /opt/netgen/ isn't writable
+    (caller handles the None return).
+    """
+    import shutil
+
+    # Where does the wheel install resources/dpdk/? Use importlib to
+    # locate it portably — the actual path varies by Python version
+    # and venv/system install style.
+    try:
+        import resources.dpdk as _dpdk_pkg
+        src_dir = os.path.dirname(os.path.abspath(_dpdk_pkg.__file__))
+    except Exception:
+        # Fallback: walk common site-packages locations
+        import sys
+        for sp in sys.path:
+            candidate = os.path.join(sp, "resources", "dpdk")
+            if os.path.isdir(candidate) and os.path.isfile(
+                os.path.join(candidate, "install_dpdk.sh")
+            ):
+                src_dir = candidate
+                break
+        else:
+            logging.warning("[ADMIN DPDK SELFHEAL] resources/dpdk/ not found in any sys.path location")
+            return None
+
+    if not os.path.isfile(os.path.join(src_dir, "install_dpdk.sh")):
+        logging.warning(f"[ADMIN DPDK SELFHEAL] {src_dir}/install_dpdk.sh missing in wheel")
+        return None
+
+    dst_dir = "/opt/netgen/resources/dpdk"
+    try:
+        os.makedirs(dst_dir, exist_ok=True)
+        # Copy each file individually; preserve executable bit on .sh
+        # scripts. Avoid shutil.copytree because dst_dir may already
+        # exist (Python <3.8 copytree errors on existing dest; we
+        # support 3.9+ but defensive coding is cheap).
+        for entry in os.listdir(src_dir):
+            sp = os.path.join(src_dir, entry)
+            dp = os.path.join(dst_dir, entry)
+            if os.path.isdir(sp):
+                # Subdirs (tx_worker/ etc.) — recursive copy
+                if os.path.isdir(dp):
+                    shutil.rmtree(dp)
+                shutil.copytree(sp, dp)
+            elif os.path.isfile(sp):
+                shutil.copy2(sp, dp)
+                if entry.endswith(".sh"):
+                    os.chmod(dp, 0o755)
+        deployed_script = os.path.join(dst_dir, "install_dpdk.sh")
+        if os.path.isfile(deployed_script):
+            logging.info(
+                f"[ADMIN DPDK SELFHEAL] Deployed resources/dpdk/ tree from "
+                f"{src_dir} → {dst_dir}"
+            )
+            return deployed_script
+        return None
+    except (OSError, PermissionError) as e:
+        logging.warning(f"[ADMIN DPDK SELFHEAL] Deploy to {dst_dir} failed: {e}")
+        return None
+
 # Map PCI address → {name, kernel_driver, bound_at} for interfaces the user
 # has bound to vfio-pci. After binding, the kernel deletes the netdev so
 # /api/dpdk/interfaces returns name="(no interface)" — the user loses sight
@@ -13928,14 +14007,31 @@ def api_admin_install_dpdk():
             "log_path": _ADMIN_INSTALL_STATE.get("log_path"),
         }), 409
 
-    # Resolve the script — same path order as the bind endpoints
+    # Resolve the script — same path order as the bind endpoints.
+    # If the canonical locations are empty (server was installed by a
+    # pre-v0.2.12 dialog that didn't sftp the resources/ tree, OR by
+    # a bare `pip install <wheel>` without running install_ostg_complete.py),
+    # self-heal by copying the tree from the wheel's pip-install
+    # location. The wheel itself ships the same files at
+    # site-packages/resources/dpdk/ — we just need to deploy them to
+    # /opt/netgen/ where the bind/install endpoints can find them.
     candidates = [
         "/opt/netgen/resources/dpdk/install_dpdk.sh",
         "/opt/OSTG/resources/dpdk/install_dpdk.sh",
     ]
     script = next((p for p in candidates if os.path.isfile(p)), None)
     if script is None:
-        return jsonify({"error": "install_dpdk.sh not found in /opt/netgen or /opt/OSTG"}), 404
+        script = _ensure_dpdk_tree_deployed()
+        if script is None:
+            return jsonify({
+                "error": (
+                    "install_dpdk.sh not found in /opt/netgen or /opt/OSTG, "
+                    "and self-heal from wheel failed. Check that the "
+                    "ostg-trafficgen wheel is installed (pip3 show "
+                    "ostg-trafficgen) and that the netgen-server user "
+                    "can write to /opt/netgen/."
+                )
+            }), 404
 
     timestamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = f"/tmp/netgen_install_dpdk_{timestamp}.log"
