@@ -738,22 +738,27 @@ all show green.</p>
 
 <h2>9. Reinstall / upgrade</h2>
 
-<p>Three options, fastest to heaviest:</p>
+<p>Four paths, fastest to heaviest:</p>
 
 <table>
   <tr><th>Method</th><th>Time</th><th>When to use</th></tr>
-  <tr><td><b>Help → Install / Upgrade Server → Tab 1</b><br>
+  <tr><td><b>Help → Install / Upgrade Server → Upgrade tab</b><br>
           <span class="muted">(NEW in 0.2.6)</span></td>
       <td>30–60 s</td>
       <td>Just rolling a new wheel onto a running server. No SSH, no
           re-running the full provisioning flow. See section&nbsp;1
           above.</td></tr>
-  <tr><td><b><code>pip install --upgrade</code> over SSH</b></td>
-      <td>~10 s</td>
-      <td>Manual / scripted equivalent of Tab 1:
-          <code>scp wheel.whl root@host:/tmp/ &amp;&amp; ssh root@host
-          'pip install --upgrade /tmp/wheel.whl &amp;&amp; systemctl restart
-          netgen-server'</code></td></tr>
+  <tr><td><b>Manual SSH one-liner</b> ★</td>
+      <td>~30 s</td>
+      <td>The Upgrade tab is broken or unreachable
+          (firewall, proxy, server version with the latent
+          <code>NameError</code> bug); scripted CI/CD pipelines that
+          want explicit control over each step.</td></tr>
+  <tr><td><b>Step-by-step on the box</b></td>
+      <td>~1 min</td>
+      <td>Production lab box where you want to see each step's output
+          before proceeding — confirm version before, verify after,
+          have a clean rollback path ready.</td></tr>
   <tr><td><b><code>install_ostg_complete.py</code> rerun</b></td>
       <td>5–10 min</td>
       <td>Full re-provision (idempotent — <code>cleanup_old_install</code>
@@ -761,13 +766,120 @@ all show green.</p>
           config, systemd unit, or the FRR Docker image.</td></tr>
 </table>
 
-<pre># Full re-provision: bump pyproject.toml version, then:
+<h3>9a. Manual SSH one-liner</h3>
+
+<p>One terminal, two commands:</p>
+
+<pre>scp ~/Downloads/ostg_trafficgen-&lt;v&gt;-py3-none-any.whl root@&lt;host&gt;:/tmp/
+ssh root@&lt;host&gt; 'pip3 install --upgrade --force-reinstall --no-deps \
+  /tmp/ostg_trafficgen-&lt;v&gt;-py3-none-any.whl \
+  &amp;&amp; systemctl restart netgen-server \
+  &amp;&amp; sleep 2 \
+  &amp;&amp; curl -fsS http://127.0.0.1:5050/api/health &amp;&amp; echo'</pre>
+
+<p>What each piece does:</p>
+<ul>
+  <li><code>scp</code> — copies the wheel to <code>/tmp/</code> on the
+      target.</li>
+  <li><code>pip3 install --upgrade --force-reinstall --no-deps</code>
+      — installs the new wheel using the system Python (matches what
+      the server runs under). <code>--no-deps</code> skips
+      re-resolving / re-installing dependencies (faster + safer:
+      your existing deps are already correct).</li>
+  <li><code>systemctl restart netgen-server</code> — bounces the
+      running process so it loads the new code in memory.
+      <b>Critical:</b> without this, pip-installing the new wheel
+      only updates files on disk; the live process keeps running
+      the OLD code until restart.</li>
+  <li><code>curl /api/health</code> — confirms the new instance came
+      back up.</li>
+</ul>
+
+<h3>9b. Step-by-step on the box</h3>
+
+<p>SSH in first, then run each step interactively so you can see
+what's happening:</p>
+
+<pre>ssh root@&lt;host&gt;</pre>
+
+<pre><span style="color:#6b7280;"># 1. Confirm current version</span>
+pip3 show ostg-trafficgen | head -2
+<span style="color:#6b7280"># Name: ostg-trafficgen
+# Version: 0.2.9        ← what's installed now</span>
+
+<span style="color:#6b7280"># 2. Fetch the new wheel from GitHub releases (or scp from laptop)</span>
+wget -O /tmp/ostg_trafficgen-0.2.11-py3-none-any.whl \
+  https://github.com/amishagrawal2001-arch/netgen/releases/download/v0.2.11/ostg_trafficgen-0.2.11-py3-none-any.whl
+
+<span style="color:#6b7280"># 3. Confirm the wheel is valid + peek at its metadata</span>
+ls -la /tmp/ostg_trafficgen-*.whl
+unzip -p /tmp/ostg_trafficgen-*.whl '*/METADATA' | head -10
+
+<span style="color:#6b7280"># 4. Upgrade</span>
+pip3 install --upgrade --force-reinstall --no-deps \
+  /tmp/ostg_trafficgen-0.2.11-py3-none-any.whl
+
+<span style="color:#6b7280"># 5. Verify pip sees the new version</span>
+pip3 show ostg-trafficgen | head -2
+<span style="color:#6b7280"># Version: 0.2.11       ← upgraded ✓</span>
+
+<span style="color:#6b7280"># 6. Restart so the running process loads the new code</span>
+systemctl restart netgen-server
+
+<span style="color:#6b7280"># 7. Confirm the new instance is healthy</span>
+systemctl status netgen-server --no-pager | head -7
+curl -fsS http://127.0.0.1:5050/api/health</pre>
+
+<p>The critical step is <b>#6</b> — <code>pip3 install</code> alone
+leaves the running server unchanged. Skipping the restart was a real
+footgun until 0.2.8 added auto-restart to
+<code>install_ostg_complete.py</code>.</p>
+
+<h3>9c. Rollback</h3>
+
+<p>Wheels stick around forever (in <code>~/Downloads/</code> on your
+laptop and on GitHub Releases). Rollback is always one
+<code>pip install</code> away:</p>
+
+<pre>ssh root@&lt;host&gt; 'pip3 install --upgrade --force-reinstall --no-deps \
+  /tmp/ostg_trafficgen-&lt;previous-version&gt;-py3-none-any.whl \
+  &amp;&amp; systemctl restart netgen-server'</pre>
+
+<p>Tip: keep the last two or three wheels in
+<code>/tmp/</code> on the target box — they're tiny (~1.4 MB each)
+and instant to install when you need to bisect a regression.</p>
+
+<h3>9d. Full re-provision (rare)</h3>
+
+<pre><span style="color:#6b7280"># Bump pyproject.toml version locally, then:</span>
 python3 -m build --wheel
 python3 install_ostg_complete.py -H &lt;host&gt; -p &lt;password&gt;</pre>
 
-<p class="muted">For a quick redeploy without re-running the entire flow,
-the file-by-file <code>scp</code> + <code>systemctl restart netgen-server</code>
-pattern still works during development.</p>
+<p class="muted">For a quick redeploy without re-running the entire
+flow, the file-by-file <code>scp</code> +
+<code>systemctl restart netgen-server</code> pattern still works
+during development.</p>
+
+<h3>9e. When the Upgrade tab is broken</h3>
+
+<p>The Upgrade tab calls <code>/api/admin/upgrade_wheel</code> on the
+server. If that endpoint is broken (e.g. the
+<code>NameError: name 'sys' is not defined</code> bug latent in
+0.2.6 → 0.2.10), the dialog can't fix itself — chicken and egg.
+Recovery paths:</p>
+
+<ul>
+  <li><b>Manual SSH one-liner (9a)</b> — bypasses the broken endpoint
+      entirely; uses pip directly on the target.</li>
+  <li><b>Fresh Install via SSH tab</b> — also bypasses the broken
+      endpoint. Uses <code>install_ostg_complete.py</code> end-to-end
+      via paramiko/sftp. The auto-restart in
+      <code>start_ostg_services</code> (0.2.8+) handles the
+      "running process needs to bounce" step.</li>
+  <li><b>Once on 0.2.11+, the Upgrade tab works again</b> — the
+      <code>sys</code> import is fixed. Subsequent upgrades can use
+      Tab 1 cleanly.</li>
+</ul>
 """
 
 
