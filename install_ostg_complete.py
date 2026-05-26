@@ -353,22 +353,71 @@ class NetgenInstaller:
                     self.log("This may be due to NVIDIA driver conflicts. Continuing with OSTG installation...", "WARNING")
                 
     def _wait_for_apt_lock(self):
-        """Wait for any existing apt processes to finish"""
+        """Wait for any existing apt/dpkg processes to release the lock.
+
+        Uses fuser on the actual lock files instead of pgrep because:
+          • `pgrep -f '(apt|dpkg)'` matched its own `sh -c 'pgrep ...'`
+            wrapper (the cmdline contains the literal characters "apt"
+            and "dpkg"), so the check always returned positive — every
+            call thought an apt process was running and entered the
+            10s sleep loop. Operators saw "Waiting for apt processes
+            to finish... (0s, 10s, 20s, ...)" indefinitely until the
+            5-min timeout, then proceeded — and gave up before that.
+          • `fuser <lockfile>` is what apt itself uses internally; it
+            only returns success if the kernel says some process has
+            the lock file open via an fd. The fuser binary's own
+            cmdline doesn't open the lock file, so no self-match.
+          • Also: this is what /usr/bin/wait-for-apt does on Debian.
+
+        Returns immediately when no lock is held. The 5-min timeout
+        is a safety net for the genuine case (apt-daily.service /
+        unattended-upgrades mid-update). Falls through with a
+        WARNING and proceeds if the timeout fires — pip install
+        wheel doesn't actually need the apt lock.
+        """
         import time
         max_wait = 300  # 5 minutes
         wait_time = 0
-        
+        # The four canonical apt/dpkg lock files. fuser is OK with
+        # paths that don't exist (silently skips them).
+        locks = (
+            "/var/lib/dpkg/lock /var/lib/dpkg/lock-frontend "
+            "/var/lib/apt/lists/lock /var/cache/apt/archives/lock"
+        )
+
         while wait_time < max_wait:
-            result = self.run_command("pgrep -f '(apt|dpkg)'", check=False, capture_output=True)
-            if result.returncode != 0 or not result.stdout.strip():
-                self.log("✓ No conflicting apt processes found")
+            # fuser exits 0 if at least one of the listed files is
+            # held by some process, 1 if none are held. stderr noise
+            # ("Specified filename ... does not exist") suppressed.
+            result = self.run_command(
+                f"fuser {locks} 2>/dev/null",
+                check=False, capture_output=True,
+            )
+            holder_pids = (result.stdout or "").strip()
+            if result.returncode != 0 or not holder_pids:
+                self.log("✓ No apt/dpkg lock held")
                 return
-                
-            self.log(f"Waiting for apt processes to finish... ({wait_time}s)")
+
+            # Identify the holder so operators see what's blocking
+            # — much better diagnostic than "waiting" with no detail.
+            who = self.run_command(
+                f"ps -o pid,etime,cmd -p {holder_pids} --no-headers 2>/dev/null | head -3",
+                check=False, capture_output=True,
+            )
+            who_lines = (who.stdout or "").strip().replace("\n", " | ")
+            self.log(
+                f"Waiting for apt/dpkg lock to release... ({wait_time}s) — "
+                f"holder: {who_lines or holder_pids}"
+            )
             time.sleep(10)
             wait_time += 10
-            
-        self.log("Timeout waiting for apt processes. Proceeding anyway.", "WARNING")
+
+        self.log(
+            "Timeout waiting for apt lock. Proceeding anyway — most "
+            "install steps don't actually need the apt lock; if apt-get "
+            "install fails later, run `apt --fix-broken install` and retry.",
+            "WARNING",
+        )
             
     def _preconfigure_packages(self):
         """Pre-configure packages to avoid interactive prompts"""
