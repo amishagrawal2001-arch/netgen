@@ -361,9 +361,32 @@ class SshInstallWorker(QThread):
         # invocation runs under a single `sudo sh -c '...'` so sudo
         # owns the nohup chain and writes the pid/exit files with
         # root privileges (matching /var/log + /var/run conventions).
+        # python3 -u: force unbuffered stdout/stderr. Critical for the
+        # poll-loop UX:
+        #
+        # install_ostg_complete.py uses print(...) for its [INFO] /
+        # [WARNING] / [ERROR] lines. When stdout is redirected to a
+        # file (which the wrapper does via `>> /var/log/netgen-
+        # install.log 2>&1`), Python detects "not a tty" and switches
+        # from line-buffered to FULL-buffered (typically 4 KB / 8 KB
+        # chunks). Result: print() output doesn't actually reach the
+        # log file until the buffer fills OR Python exits.
+        #
+        # Meanwhile subprocess.run() output bypasses Python's stdout
+        # buffer entirely — it writes directly to the inherited fd.
+        # So `systemctl stop / docker rmi` errors appeared instantly
+        # while [INFO] lines stayed invisible for 5-10 minutes until
+        # the installer exited and flushed.
+        #
+        # Operators saw the dialog log apparently "stuck" at the last
+        # subprocess error line and concluded the install had failed.
+        # In reality it was progressing fine; they just couldn't see it.
+        # `python3 -u` makes stdout unbuffered so each [INFO] print()
+        # lands in /var/log/netgen-install.log immediately, and the
+        # poll loop surfaces it within ~1-5 s.
         installer_invocation = (
             f"cd {remote_dir} && "
-            f"python3 install_ostg_complete.py "
+            f"python3 -u install_ostg_complete.py "
             f"--wheel {wheel_remote} {cmd_flags}"
         ).strip()
         # Wrapper script that:
