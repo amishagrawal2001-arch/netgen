@@ -541,6 +541,27 @@ class InstallServerDialog(QDialog):
         # Shared log pane (each tab writes here)
         log_box = QGroupBox("Log")
         log_layout = QVBoxLayout(log_box)
+
+        # Header row above the log: pop-out button on the right so the
+        # operator can drag a much larger log window around alongside
+        # the install dialog (15-min DPDK builds with ~1000 lines of
+        # output deserve more than the cramped pane at the bottom of
+        # this dialog). The popout shares the same QTextDocument so
+        # appendHtml / appendPlainText calls show in both windows
+        # automatically — no manual mirroring needed.
+        log_header = QHBoxLayout()
+        log_header.addStretch(1)
+        self.popout_btn = QPushButton("Pop out ↗")
+        self.popout_btn.setToolTip(
+            "Open the log in a separate, freely-resizable window. "
+            "The popout shares the same content — anything written "
+            "to the log here appears there too."
+        )
+        self.popout_btn.setMaximumWidth(110)
+        self.popout_btn.clicked.connect(self._toggle_log_popout)
+        log_header.addWidget(self.popout_btn)
+        log_layout.addLayout(log_header)
+
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(5000)
@@ -552,6 +573,9 @@ class InstallServerDialog(QDialog):
         self.status_lbl.setStyleSheet("color:#475569; font-size:11px;")
         log_layout.addWidget(self.status_lbl)
         layout.addWidget(log_box, 1)
+
+        # Holder for the popout window — created lazily on first click.
+        self._log_popout: Optional[QDialog] = None
 
         btn_box = QDialogButtonBox(QDialogButtonBox.Close)
         btn_box.rejected.connect(self.reject)
@@ -1205,6 +1229,107 @@ class InstallServerDialog(QDialog):
     def _set_status(self, text: str) -> None:
         self.status_lbl.setText(text)
 
+    # -- Log popout window ---------------------------------------------------
+
+    def _toggle_log_popout(self) -> None:
+        """Open (or focus, or close) the detached log window.
+
+        Uses QTextDocument sharing — the popout's QPlainTextEdit calls
+        setDocument(self.log_view.document()), so both widgets render
+        the same underlying buffer. Any future appendHtml /
+        appendPlainText / clear() on self.log_view also updates the
+        popout. No mirroring code needed.
+
+        Non-modal so the operator can keep clicking around the main
+        dialog (Install / Test Connection / etc.) while watching the
+        popout grow alongside.
+        """
+        # Already open → bring to front and focus instead of stacking
+        # multiple popouts
+        if self._log_popout is not None:
+            try:
+                if self._log_popout.isVisible():
+                    self._log_popout.raise_()
+                    self._log_popout.activateWindow()
+                    return
+            except RuntimeError:
+                # Underlying Qt object was destroyed somewhere else
+                self._log_popout = None
+
+        popout = QDialog(self)
+        popout.setWindowTitle("Install Log — Netgen Server")
+        popout.setWindowFlags(popout.windowFlags() | Qt.Window)
+        popout.resize(1100, 720)
+
+        v = QVBoxLayout(popout)
+        v.setContentsMargins(8, 8, 8, 8)
+
+        # The actual mirror view — shares the document with the main
+        # log_view, so anything written either side stays in sync.
+        view = QPlainTextEdit(popout)
+        view.setReadOnly(True)
+        view.setDocument(self.log_view.document())
+        view.setStyleSheet(
+            "QPlainTextEdit{font-family: ui-monospace, Menlo, Consolas, "
+            "monospace; font-size:12px; background:#0f172a; color:#e2e8f0;}"
+        )
+        # Cap the popout's history too — without this, setDocument
+        # would inherit the embedded view's maxBlockCount (good) but
+        # explicit set documents the contract.
+        view.setMaximumBlockCount(self.log_view.maximumBlockCount())
+        v.addWidget(view, 1)
+
+        # Footer row: scroll-to-bottom toggle (default ON) + close
+        footer = QHBoxLayout()
+        self._popout_autoscroll = QCheckBox("Auto-scroll to bottom")
+        self._popout_autoscroll.setChecked(True)
+        self._popout_autoscroll.setToolTip(
+            "Untick to freeze the view at the operator's current scroll "
+            "position — useful for reading through a section while the "
+            "install is still appending output."
+        )
+        # Wire scroll-keep behavior: whenever the document changes,
+        # snap to bottom only if autoscroll is on.
+        def _on_doc_changed():
+            if self._popout_autoscroll.isChecked():
+                cur = view.textCursor()
+                cur.movePosition(cur.End)
+                view.setTextCursor(cur)
+                view.ensureCursorVisible()
+        self.log_view.document().contentsChanged.connect(_on_doc_changed)
+        # Initial scroll to bottom on open
+        _on_doc_changed()
+
+        footer.addWidget(self._popout_autoscroll)
+        footer.addStretch(1)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(popout.close)
+        footer.addWidget(close_btn)
+        v.addLayout(footer)
+
+        # When the popout is closed (× button, Esc, our Close button),
+        # reset the holder and the toggle button label
+        def _on_popout_closed(_event):
+            try:
+                self.log_view.document().contentsChanged.disconnect(_on_doc_changed)
+            except (TypeError, RuntimeError):
+                # Already disconnected, or signal was never connected
+                pass
+            self._log_popout = None
+            self.popout_btn.setText("Pop out ↗")
+            self.popout_btn.setToolTip(
+                "Open the log in a separate, freely-resizable window. "
+                "The popout shares the same content — anything written "
+                "to the log here appears there too."
+            )
+            QDialog.closeEvent(popout, _event)
+        popout.closeEvent = _on_popout_closed
+
+        self._log_popout = popout
+        self.popout_btn.setText("Focus popout ↗")
+        self.popout_btn.setToolTip("Bring the detached log window to the front.")
+        popout.show()
+
     def closeEvent(self, e):
         if self._worker and self._worker.isRunning():
             # Differentiate the two worker types:
@@ -1244,4 +1369,14 @@ class InstallServerDialog(QDialog):
                 self._worker.wait(6000 if is_detached_ssh else 2000)
             except Exception:
                 pass
+        # Tear down the popout if it's still open. Without this, the
+        # standalone log window would stick around as a top-level
+        # widget after the parent dialog is gone — confusing and would
+        # crash on the next setDocument call against a dead document.
+        if self._log_popout is not None:
+            try:
+                self._log_popout.close()
+            except (RuntimeError, AttributeError):
+                pass
+            self._log_popout = None
         super().closeEvent(e)
