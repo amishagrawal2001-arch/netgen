@@ -2,6 +2,75 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.9] - 2026-05-17
+
+Operator-workflow improvements across the install dialog + chassis
+manager. No behavioral changes to traffic generation or DPDK —
+this release is entirely about the click-paths around them.
+
+### Added — Install / Upgrade Server dialog
+- **SSH port field** (defaults to 22) — lab boxes behind jump hosts
+  or alternate sshd configs (2222 / 22000 / etc.) were unreachable
+  from the dialog before. Threaded through `SshInstallWorker` and
+  `_probe_existing_install`.
+- **Test Connection button** — runs the SSH connect + four cheap
+  pre-flight probes in 2-3 s:
+  - Python ≥ 3.9 on the target (`install_python_dependencies`
+    needs it)
+  - Sudo capability (`sudo -n true`) for non-root users
+  - Free disk ≥ 4 GB on /var (DPDK build + FRR Docker + apt cache)
+  - Is `netgen-server` already active? If yes, hints to switch to
+    the Upgrade tab (30 s round-trip) instead of a 15-min full
+    install.
+  - Each probe logs ✓/✗ to the log pane; tail QMessageBox shows
+    pass/fail summary. Catches the obvious bugs (wrong password,
+    wrong port, no sudo, Python 3.8) in 2 s instead of 30 s into
+    spawn.
+
+### Added — error surfacing
+- **Log pane is now color-coded** as output streams in:
+  - red `#dc2626` — `[ERROR]`, `error`, `exception`, `failed`,
+    `fatal`, `traceback`, `-E-`, `✗`
+  - amber `#d97706` — `[WARNING]`, `warn`, `⚠`
+  - green `#15803d` — `✓`, `success`, `OK`
+  - neutral — everything else
+  - Explicit bracket tags (`[ERROR]`, `[WARN]`) win over the noise
+    heuristic, so `[ERROR] Wheel file not found: dist/...` stays
+    red even though "not found" matches the noise filter.
+  - ANSI escape sequences (`\x1b[...m`) from `install_dpdk.sh`'s
+    colored stdout get stripped before we re-color via HTML.
+- **Failure dialog now shows the actual error**, not "see log":
+  `QMessageBox.critical` bullets the last 6 captured error lines
+  so operators no longer have to scroll a 1000-line log to find
+  the proximate cause. Used by both upgrade (Tab 1) and SSH
+  install (Tab 2) failure paths.
+- **Cleanup-style noise filtered** — `Failed to stop ostg-server:
+  Unit not loaded`, `No such image: ostg-frr:latest`, and
+  similar legitimate "this is fine" cleanup messages don't get
+  highlighted as errors. Regex tuned against 13 real log lines
+  from operator installs.
+
+### Added — Add TGEN Chassis dialog
+- **"Add to TGen List" button** (new, between Add to History and
+  Connect & Add) — adds the chassis to the main TGen tree on the
+  left without attempting a connection. Marked offline initially;
+  the periodic health worker still probes and flips it online
+  when `/api/health` responds. Stays open so the operator can
+  queue several before clicking Close.
+- Multi-select queueing — the chosen-connections list grows
+  across Add to TGen List clicks; Close applies them all in one
+  `update_server_tree()` redraw.
+- `connect_now: bool` field on chosen-connection entries lets the
+  dialog distinguish "add and connect" from "add only". Default
+  True for backward compat with Connect Selected / Connect & Add.
+
+### Notes
+- No new dependencies on either side.
+- Wheel ships as `ostg_trafficgen-0.2.9-py3-none-any.whl`.
+- Pre-flight probes validated against svl-hp-ai-srv04 — all four
+  return expected results (Python 3.10.12, sudo as root, 1777 GB
+  free, netgen-server already active → Upgrade-tab hint).
+
 ## [0.2.8] - 2026-05-17
 
 Detached install flow + the bug fixes that made it work end-to-end.
