@@ -2,6 +2,114 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.12] - 2026-05-26
+
+The "no more chicken-and-egg" release. v0.2.11 fixed the broken
+upgrade endpoint but left the manual-one-time-upgrade burden on
+operators; v0.2.12 closes the loop by making the *client* able to
+upgrade a still-broken server, and the *server* able to self-heal
+its DPDK install tree from the wheel.
+
+### Added — Upgrade tab now has an SSH fallback
+- When POST `/api/admin/upgrade_wheel` returns HTTP 5xx (the latent
+  v0.2.6–v0.2.10 NameError, or any future server-side bug) OR the
+  HTTP connect itself fails, the dialog can automatically fall
+  back to a paramiko-based pip-install + systemctl restart.
+- New collapsible "SSH fallback" section in the Upgrade tab —
+  default OFF (the first attempt stays pure HTTP, fastest path for
+  healthy servers). Operator fills user / port / password OR SSH
+  key once and forgets it.
+- New `WheelUploadWorker.http_endpoint_broken` signal carries a
+  short reason string for the dialog to surface. 4xx still routes
+  to the existing failure dialog (4xx = bad input, SSH fallback
+  wouldn't help).
+- New `SshUpgradeWorker` class: minimal paramiko-based pip + restart.
+  ~10s round-trip vs 5-45 min for the Fresh Install tab. Uses a PTY
+  (no nohup detach) since the 10-second upgrade doesn't need to
+  survive client disconnects.
+- Dialog log shows the transition explicitly:
+  ```
+  [client] HTTP endpoint failed: server returned HTTP 500 ...
+  [client] Falling back to SSH-based pip install + restart (Install Guide §9a)...
+  [ssh-upgrade] auth: password
+  [ssh-upgrade] sftp put .../ostg_trafficgen-0.2.12-py3-none-any.whl
+  [ssh-upgrade] exec: pip3 install --upgrade ... && systemctl restart ...
+  Successfully installed ostg-trafficgen-0.2.12
+  [ssh-upgrade] exit rc=0
+  ```
+
+### Added — Server self-heal for `/api/admin/install_dpdk`
+- New `_ensure_dpdk_tree_deployed()` helper. When the `/admin`
+  Install DPDK button (or any `/api/dpdk/*` endpoint) needs
+  `install_dpdk.sh` and can't find it at `/opt/netgen/resources/dpdk/`
+  or the legacy `/opt/OSTG/...` path, the server now:
+  1. Imports `resources.dpdk` to locate the wheel's pip-install
+     directory (handles system / venv / pipx layouts via `__file__`).
+  2. `shutil.copytree`'s the tree to `/opt/netgen/resources/dpdk/`.
+  3. Preserves the executable bit on .sh scripts.
+- Net effect: operators who installed via bare `pip install <wheel>`
+  (or the pre-v0.2.12 dialog that didn't sftp the resources tree)
+  can now click Install DPDK in `/admin` and the server fixes its
+  own state before launching the script. No more "install_dpdk.sh
+  not found" 404 with manual `scp resources/dpdk/...` recovery.
+- Validated live on svl-hp-ai-srv04: deliberately renamed
+  `/opt/netgen/resources/dpdk/` to `.bak`, called the endpoint,
+  HTTP 200 returned + tree was recreated from site-packages.
+
+### Added — Installer extracts bundled assets from the wheel
+- `install_ostg_complete.py`'s `install_ostg()` step runs a Python
+  heredoc on the target after `pip install <wheel>` that imports
+  `resources.dpdk` and `ostg_docker` and copies their on-disk
+  locations into `/opt/netgen/`. Also publishes `Dockerfile.frr`,
+  `start-frr.sh`, `frr.conf.template` at the install root.
+- Makes the dialog Fresh Install flow (which sftps only the wheel
+  + installer) functionally identical to a full source-tree
+  install. The `script_dir`-based copy code below is preserved as
+  a fallback for very old install paths but no longer load-bearing.
+
+### Added — Fresh Install dialog sftps support files
+- `SshInstallWorker.run()` now also uploads, after the wheel +
+  installer:
+  - `Dockerfile.frr` (FRR Alpine container recipe)
+  - `requirements.txt`
+  - `resources/dpdk/` (full recursive tree — DPDK scripts +
+    tx_worker source)
+  - `ostg_docker/` (full recursive tree — frr.conf.template,
+    start-frr.sh, etc.)
+- New `_sftp_put_tree` helper: walks a local directory, recreates
+  the structure on the target, skips `__pycache__` + dotfiles,
+  preserves the executable bit on .sh/.py via sftp.chmod(0o755).
+- Missing local files log a `[warn]` and continue — operator may
+  not need all features on a given install (e.g. client-only
+  setups don't need Dockerfile.frr).
+
+### Added — Server version column in Add TGEN Chassis dialog
+- `/api/health` response gains a `netgen_version` field, parsed
+  from pip metadata via `importlib.metadata.version("ostg-trafficgen")`.
+  Falls back to `"unknown"` if metadata isn't readable.
+- History table in Add TGEN Chassis dialog grows a "Version"
+  column (col 4). Populated by the existing ReachabilityWorker —
+  when the probe returns 200, parse `netgen_version` from the JSON
+  and write it into the row.
+- Three colour states for at-a-glance scanning:
+  - **black** — server reachable and exposes version (0.2.12+)
+  - **amber `?`** — server reachable but old (0.2.11 or earlier)
+  - **grey `?`** — server unreachable / probe failed / untested
+- Tooltip on each cell explains the state. Operators get a visual
+  checklist of boxes that still need upgrading.
+
+### Notes
+- **No mandatory upgrade for v0.2.6–v0.2.11 servers.** v0.2.11 was
+  the mandatory one (fixed the upgrade endpoint NameError); v0.2.12
+  is purely additive on the server side. The wheel is backwards-
+  compatible.
+- **The client's Upgrade tab now works against v0.2.6–v0.2.11
+  servers** when SSH fallback is enabled — the broken endpoint
+  triggers the auto-fallback to paramiko-based pip install. This
+  removes the "must do one manual upgrade per box" friction from
+  the v0.2.11 release notes.
+- Wheel ships as `ostg_trafficgen-0.2.12-py3-none-any.whl`.
+
 ## [0.2.11] - 2026-05-26
 
 **Mandatory upgrade if your server runs any 0.2.6–0.2.10 build.**
