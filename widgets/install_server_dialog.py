@@ -984,19 +984,29 @@ class InstallServerDialog(QDialog):
         auth_row.addStretch(1)
         ssh_layout.addRow("Auth:", auth_row)
 
+        # Wrap each auth row's label + field so we can toggle the
+        # whole row's visibility. Without this the inactive row stays
+        # rendered (just disabled) and operators saw the same overlap
+        # in the Upgrade tab's SSH fallback as on the Fresh Install
+        # tab — Password and Key file both visible at once.
         self.up_ssh_password = QLineEdit()
         self.up_ssh_password.setEchoMode(QLineEdit.Password)
         self.up_ssh_password.setPlaceholderText("SSH password (not stored)")
-        ssh_layout.addRow("Password:", self.up_ssh_password)
+        self._up_pw_lbl = QLabel("Password:")
+        ssh_layout.addRow(self._up_pw_lbl, self.up_ssh_password)
 
-        key_row = QHBoxLayout()
         self.up_ssh_key = QLineEdit()
         self.up_ssh_key.setPlaceholderText("~/.ssh/id_ed25519")
         key_browse = QPushButton("Browse...")
         key_browse.clicked.connect(lambda: self._browse_file(self.up_ssh_key, "SSH key files (*)"))
-        key_row.addWidget(self.up_ssh_key, 1)
-        key_row.addWidget(key_browse)
-        ssh_layout.addRow("Key file:", key_row)
+        up_key_wrap = QWidget()
+        up_key_row = QHBoxLayout(up_key_wrap)
+        up_key_row.setContentsMargins(0, 0, 0, 0)
+        up_key_row.addWidget(self.up_ssh_key, 1)
+        up_key_row.addWidget(key_browse)
+        self._up_key_lbl = QLabel("Key file:")
+        self._up_key_wrap = up_key_wrap
+        ssh_layout.addRow(self._up_key_lbl, up_key_wrap)
 
         self.up_ssh_pw_rb.toggled.connect(self._update_up_auth_visibility)
         self._update_up_auth_visibility()
@@ -1021,9 +1031,15 @@ class InstallServerDialog(QDialog):
         return w
 
     def _update_up_auth_visibility(self) -> None:
+        # Hide rather than disable: setEnabled left both rows visible
+        # (just greyed). Toggling visibility of label+field together
+        # makes QFormLayout reclaim the row, matching what
+        # _update_auth_visibility does on the Fresh Install tab.
         use_pw = self.up_ssh_pw_rb.isChecked()
-        self.up_ssh_password.setEnabled(use_pw)
-        self.up_ssh_key.setEnabled(not use_pw)
+        self.up_ssh_password.setVisible(use_pw)
+        self._up_pw_lbl.setVisible(use_pw)
+        self._up_key_wrap.setVisible(not use_pw)
+        self._up_key_lbl.setVisible(not use_pw)
 
     def _populate_chassis_dropdown(
         self, combo: QComboBox, default_text: str, *, full_url: bool
