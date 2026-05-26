@@ -926,13 +926,37 @@ class InstallServerDialog(QDialog):
         # paramiko-based pip-install on HTTP failure. The fallback runs
         # the exact section-9a one-liner: scp wheel + pip install +
         # systemctl restart + health check. ~10s round-trip.
-        ssh_box = QGroupBox(
-            "SSH fallback (used only if the HTTP upgrade fails)"
+        # The SSH-fallback group used to be checkable-but-always-visible.
+        # That made the dialog too tall — the fields rendered (just
+        # greyed out) even when the operator wasn't using them, and
+        # the bottom row clipped the Upload button on smaller screens.
+        # Now the group has a separate checkbox header; the form body
+        # only mounts when checked, so the dialog stays compact in the
+        # "I don't need SSH fallback" common case.
+        ssh_box = QGroupBox()
+        ssh_box.setStyleSheet("QGroupBox{border:1px solid #e2e8f0; border-radius:4px; margin-top:4px; padding-top:6px;}")
+        ssh_outer = QVBoxLayout(ssh_box)
+        ssh_outer.setContentsMargins(8, 4, 8, 4)
+        ssh_outer.setSpacing(4)
+
+        # Header row: checkbox + one-line description. Tightened from
+        # the 3-sentence paragraph that was clipping.
+        self.up_ssh_enable_cb = QCheckBox("Use SSH fallback if HTTP upgrade fails")
+        self.up_ssh_enable_cb.setToolTip(
+            "On HTTP 500 (e.g. v0.2.6-v0.2.10 NameError) or connect "
+            "failure, sftp the wheel + run pip + systemctl restart via "
+            "SSH. Install Guide §9a."
         )
-        ssh_box.setCheckable(True)
-        ssh_box.setChecked(False)
-        ssh_box.setStyleSheet("QGroupBox::title{color:#475569; font-size:11px;}")
-        ssh_layout = QFormLayout(ssh_box)
+        ssh_outer.addWidget(self.up_ssh_enable_cb)
+
+        # Inner form — wrapped in a container widget we can show/hide
+        # cleanly when the checkbox toggles. Hiding the container
+        # reclaims its vertical space; just disabling children would
+        # leave the dialog the same height.
+        ssh_form_wrap = QWidget()
+        ssh_layout = QFormLayout(ssh_form_wrap)
+        ssh_layout.setContentsMargins(0, 4, 0, 0)
+        ssh_layout.setSpacing(4)
 
         ssh_row = QHBoxLayout()
         self.up_ssh_user = QLineEdit("root")
@@ -962,7 +986,7 @@ class InstallServerDialog(QDialog):
 
         self.up_ssh_password = QLineEdit()
         self.up_ssh_password.setEchoMode(QLineEdit.Password)
-        self.up_ssh_password.setPlaceholderText("(only used on HTTP failure)")
+        self.up_ssh_password.setPlaceholderText("SSH password (not stored)")
         ssh_layout.addRow("Password:", self.up_ssh_password)
 
         key_row = QHBoxLayout()
@@ -977,17 +1001,18 @@ class InstallServerDialog(QDialog):
         self.up_ssh_pw_rb.toggled.connect(self._update_up_auth_visibility)
         self._update_up_auth_visibility()
 
-        ssh_info = QLabel(
-            "If the HTTP endpoint returns 500 (latent bug in v0.2.6–v0.2.10 "
-            "servers), the dialog will sftp the wheel and run pip + "
-            "systemctl restart directly. Same as Install Guide section 9a."
-        )
-        ssh_info.setWordWrap(True)
-        ssh_info.setStyleSheet("color:#94a3b8; font-size:10px;")
-        ssh_layout.addRow(ssh_info)
+        ssh_outer.addWidget(ssh_form_wrap)
+        ssh_form_wrap.setVisible(False)  # hidden by default
+
+        # Toggle: showing/hiding the form wrap collapses the group
+        # cleanly. The dialog's overall layout shrinks to match,
+        # eliminating the overlap the operator reported.
+        self.up_ssh_enable_cb.toggled.connect(ssh_form_wrap.setVisible)
 
         form.addRow(ssh_box)
-        self.up_ssh_box = ssh_box  # so the click handler can read .isChecked()
+        # Used downstream to decide whether to actually invoke the SSH
+        # fallback worker on HTTP failure.
+        self.up_ssh_box = self.up_ssh_enable_cb
 
         self.up_btn = QPushButton("Upload && Upgrade")
         self.up_btn.clicked.connect(self._start_upgrade)
