@@ -14082,6 +14082,14 @@ def api_admin_upgrade_wheel():
     # Build pip command using the server's own interpreter so the new wheel
     # lands in the same site-packages — critical when the server runs under
     # a venv / pipx.
+    #
+    # `import sys` is intentionally inline rather than at module level: this
+    # is a 15k+ LOC file with no other `sys` reference, and a NameError
+    # here (lurking since 0.2.6) bricked the entire upgrade flow with a
+    # bare 500. Inline keeps the blast radius to just this handler — and
+    # the import is essentially free (sys is already loaded; just rebinds
+    # the local name).
+    import sys
     py = sys.executable or "python3"
     cmd = [
         py, "-m", "pip", "install",
