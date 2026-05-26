@@ -120,9 +120,15 @@ def record_connection(
 
 
 class ReachabilityWorker(QThread):
-    """Pings /api/health on a list of (row, full_url) tuples concurrently."""
+    """Pings /api/health on a list of (row, full_url) tuples concurrently.
 
-    result = pyqtSignal(int, bool, str)  # (row, ok, detail)
+    Result signal carries (row, ok, detail, netgen_version). The version
+    is parsed from the JSON body when /api/health returns 200; servers
+    on 0.2.11 or older don't return it and we report "?" instead.
+    Unreachable / 4xx / 5xx responses also report version "?".
+    """
+
+    result = pyqtSignal(int, bool, str, str)  # (row, ok, detail, netgen_version)
 
     def __init__(self, targets: list):
         super().__init__()
@@ -137,19 +143,27 @@ class ReachabilityWorker(QThread):
             import requests
         except Exception as e:
             for row, _ in self.targets:
-                self.result.emit(row, False, f"requests missing: {e}")
+                self.result.emit(row, False, f"requests missing: {e}", "?")
             return
         for row, url in self.targets:
             if self._stop:
                 return
-            ok, detail = False, ""
+            ok, detail, ver = False, "", "?"
             try:
                 r = requests.get(f"{url}/api/health", timeout=3)
                 ok = r.status_code == 200
                 detail = f"HTTP {r.status_code}"
+                if ok:
+                    try:
+                        body = r.json()
+                        # netgen_version landed in /api/health in 0.2.12;
+                        # older servers don't include the field → keep "?"
+                        ver = str(body.get("netgen_version", "?") or "?")
+                    except Exception:
+                        pass
             except Exception as e:
                 detail = str(e).split("\n", 1)[0][:80]
-            self.result.emit(row, ok, detail)
+            self.result.emit(row, ok, detail, ver)
 
 
 # ---------------------------------------------------------------------------
@@ -213,9 +227,13 @@ class AddTGenDialog(QDialog):
         # History table
         hist_box = QGroupBox("Recent connections")
         hb = QVBoxLayout(hist_box)
-        self.table = QTableWidget(0, 6)
+        # 7 columns: LED, Address, Port, Label, Version, Last, Count.
+        # Version (col 4) is populated by ReachabilityWorker from
+        # /api/health's netgen_version field (added in 0.2.12; older
+        # servers show "?" because the field isn't in their response).
+        self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels([
-            "●", "Address", "Port", "Label", "Last connected", "× connects",
+            "●", "Address", "Port", "Label", "Version", "Last connected", "× connects",
         ])
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         # ExtendedSelection = Ctrl/Shift-click for multi-select. Lets the
@@ -231,6 +249,7 @@ class AddTGenDialog(QDialog):
         h.setSectionResizeMode(3, QHeaderView.Stretch)
         h.setSectionResizeMode(4, QHeaderView.ResizeToContents)
         h.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(6, QHeaderView.ResizeToContents)
         self.table.setColumnWidth(0, 28)
         self.table.itemSelectionChanged.connect(self._on_row_selected)
         self.table.itemDoubleClicked.connect(self._on_row_double_clicked)
@@ -370,9 +389,16 @@ class AddTGenDialog(QDialog):
             self.table.setItem(i, 1, QTableWidgetItem(e.get("address", "")))
             self.table.setItem(i, 2, QTableWidgetItem(str(e.get("port", 5050))))
             self.table.setItem(i, 3, QTableWidgetItem(e.get("label", "")))
+            # Version column starts as "?" — ReachabilityWorker fills
+            # it in from /api/health's netgen_version field on probe.
+            ver_item = QTableWidgetItem("?")
+            ver_item.setTextAlignment(Qt.AlignCenter)
+            ver_item.setForeground(QColor("#9ca3af"))
+            ver_item.setToolTip("Server version — populated by the reachability probe")
+            self.table.setItem(i, 4, ver_item)
             last = e.get("last_connected", "")
-            self.table.setItem(i, 4, QTableWidgetItem(_pretty_age(last)))
-            self.table.setItem(i, 5, QTableWidgetItem(str(e.get("connect_count", 0))))
+            self.table.setItem(i, 5, QTableWidgetItem(_pretty_age(last)))
+            self.table.setItem(i, 6, QTableWidgetItem(str(e.get("connect_count", 0))))
 
     def _on_row_selected(self) -> None:
         # Auto-fill form from the first selected row. With multi-select
@@ -520,8 +546,9 @@ class AddTGenDialog(QDialog):
         self._worker.finished.connect(self._on_probe_finished)
         self._worker.start()
 
-    def _on_probe_result(self, row: int, ok: bool, detail: str) -> None:
+    def _on_probe_result(self, row: int, ok: bool, detail: str, ver: str = "?") -> None:
         led = self.table.item(row, 0)
+        ver_item = self.table.item(row, 4)
         if not led:
             return
         if ok:
@@ -532,6 +559,26 @@ class AddTGenDialog(QDialog):
             led.setText("✗")
             led.setForeground(QColor("#dc2626"))
             led.setToolTip(f"Unreachable — {detail}")
+        if ver_item is not None:
+            ver_item.setText(ver or "?")
+            # Different shades for known / unknown / unreachable so the
+            # operator can scan the column quickly. Question-mark
+            # response means "server is up but on a version that
+            # doesn't expose netgen_version in /api/health" — older
+            # than 0.2.12.
+            if not ok:
+                ver_item.setForeground(QColor("#9ca3af"))   # grey — no data
+                ver_item.setToolTip("Server unreachable; version unknown")
+            elif ver == "?" or ver == "unknown":
+                ver_item.setForeground(QColor("#d97706"))   # amber — old server
+                ver_item.setToolTip(
+                    "Server reachable but doesn't expose version "
+                    "(running 0.2.11 or older; netgen_version landed "
+                    "in /api/health in 0.2.12)"
+                )
+            else:
+                ver_item.setForeground(QColor("#0f172a"))   # normal text
+                ver_item.setToolTip(f"netgen-server {ver}")
 
     def _on_probe_finished(self) -> None:
         self.test_btn.setEnabled(True)
