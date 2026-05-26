@@ -234,6 +234,43 @@ class SshInstallWorker(QThread):
     def stop(self) -> None:
         self._stop = True
 
+    def _sftp_put_tree(self, sftp, local_dir: str, remote_dir: str) -> None:
+        """Recursively sftp-upload `local_dir` to `remote_dir`.
+
+        Creates remote_dir + every subdirectory. Skips files starting
+        with '.' (no .DS_Store, no .git/) and Python bytecode caches
+        (no __pycache__ / *.pyc). Files are uploaded one at a time —
+        paramiko's sftp.put doesn't have a recursive mode.
+
+        Helper used by the Fresh Install upload pass to ship
+        resources/dpdk/, ostg_docker/, etc. alongside the wheel +
+        install_ostg_complete.py — without these the installer
+        warned-and-skipped DPDK + FRR Docker setup.
+        """
+        try:
+            sftp.mkdir(remote_dir)
+        except IOError:
+            pass  # exists
+        for entry in sorted(os.listdir(local_dir)):
+            if entry.startswith(".") or entry == "__pycache__":
+                continue
+            local_path = os.path.join(local_dir, entry)
+            remote_path = f"{remote_dir}/{entry}"
+            if os.path.isdir(local_path):
+                self._sftp_put_tree(sftp, local_path, remote_path)
+            elif os.path.isfile(local_path):
+                if entry.endswith((".pyc", ".pyo")):
+                    continue
+                sftp.put(local_path, remote_path)
+                # Preserve executable bit on .sh / .py scripts so the
+                # installer can invoke them directly without an
+                # explicit chmod step on each.
+                if entry.endswith((".sh", ".py")):
+                    try:
+                        sftp.chmod(remote_path, 0o755)
+                    except IOError:
+                        pass
+
     def run(self) -> None:
         try:
             import paramiko
@@ -300,6 +337,55 @@ class SshInstallWorker(QThread):
                 self.log_chunk.emit(f"[client] sftp put {self.installer_path} → {installer_remote}\n")
                 sftp.put(self.installer_path, installer_remote)
                 sftp.chmod(installer_remote, 0o755)
+
+                # Upload supporting files that install_ostg_complete.py
+                # expects to find alongside itself. Without these the
+                # installer prints "WARNING: resources/dpdk/ not found"
+                # and "ERROR: Dockerfile.frr: no such file or directory"
+                # — install still succeeds but DPDK + FRR Docker image
+                # never get deployed. Source paths resolved relative to
+                # the installer's parent dir (same shape as the git
+                # checkout layout).
+                src_root = os.path.dirname(os.path.abspath(self.installer_path))
+                # Top-level files: name → optional. Anything missing
+                # logs a [warn] but doesn't abort — operator may not
+                # need all features on a given install.
+                top_files = [
+                    "Dockerfile.frr",
+                    "requirements.txt",
+                ]
+                # Recursive directory uploads: (local_dir, remote_dir)
+                tree_uploads = [
+                    (os.path.join(src_root, "resources", "dpdk"),
+                     f"{remote_dir}/resources/dpdk"),
+                    (os.path.join(src_root, "ostg_docker"),
+                     f"{remote_dir}/ostg_docker"),
+                ]
+
+                for fname in top_files:
+                    local = os.path.join(src_root, fname)
+                    if not os.path.isfile(local):
+                        self.log_chunk.emit(
+                            f"[client] [warn] {fname} not found at {local} "
+                            f"— some install steps will be skipped\n"
+                        )
+                        continue
+                    remote = f"{remote_dir}/{fname}"
+                    self.log_chunk.emit(f"[client] sftp put {local} → {remote}\n")
+                    sftp.put(local, remote)
+
+                for local_dir, rem_dir in tree_uploads:
+                    if not os.path.isdir(local_dir):
+                        self.log_chunk.emit(
+                            f"[client] [warn] {local_dir} not found "
+                            f"— skipping that subtree\n"
+                        )
+                        continue
+                    self.log_chunk.emit(
+                        f"[client] sftp put {local_dir}/ → {rem_dir}/ "
+                        f"(recursive)\n"
+                    )
+                    self._sftp_put_tree(sftp, local_dir, rem_dir)
             except Exception as e:
                 self.log_chunk.emit(f"[client] SFTP upload failed: {e}\n")
                 try:
