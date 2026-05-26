@@ -76,6 +76,11 @@ class WheelUploadWorker(QThread):
     log_chunk = pyqtSignal(str)
     status = pyqtSignal(str)        # human-readable status updates
     finished_ok = pyqtSignal(bool)  # True = upgrade succeeded + restart OK
+    # Distinct signal for "HTTP endpoint is broken or unreachable" so the
+    # dialog can offer the SSH fallback (uses pip directly via paramiko,
+    # bypassing the busted endpoint). Carries a short reason string for
+    # the operator-facing prompt. Emitted IN ADDITION to finished_ok(False).
+    http_endpoint_broken = pyqtSignal(str)
 
     def __init__(self, server_url: str, wheel_path: str, auth_token: str = ""):
         super().__init__()
@@ -117,6 +122,10 @@ class WheelUploadWorker(QThread):
                 )
         except Exception as e:
             self.log_chunk.emit(f"[client] upload failed: {e}\n")
+            # Network-level failure → SSH fallback could still reach the
+            # box if the operator has SSH creds. Emit the broken-endpoint
+            # signal so the dialog knows to offer it.
+            self.http_endpoint_broken.emit(f"network error: {e}")
             self.finished_ok.emit(False)
             return
 
@@ -124,6 +133,16 @@ class WheelUploadWorker(QThread):
             self.log_chunk.emit(
                 f"[client] server rejected upload: {r.status_code} {r.text[:400]}\n"
             )
+            # 5xx = server-side bug (likely the v0.2.6-v0.2.10 NameError);
+            # 4xx = client error (wrong filename, conflict, etc). Only
+            # 5xx is recoverable via SSH fallback — 4xx means the
+            # operator should fix their input instead.
+            if r.status_code >= 500:
+                self.http_endpoint_broken.emit(
+                    f"server returned HTTP {r.status_code} — endpoint may have the "
+                    f"latent v0.2.6-v0.2.10 NameError bug. Falling back to SSH "
+                    f"would bypass it."
+                )
             self.finished_ok.emit(False)
             return
         body = r.json()
@@ -193,6 +212,161 @@ class WheelUploadWorker(QThread):
         self.log_chunk.emit("[client] server did not return to health within 90s\n")
         self.status.emit("Upgrade finished but server is not responding")
         self.finished_ok.emit(False)
+
+
+class SshUpgradeWorker(QThread):
+    """Fallback path for the Upgrade tab when /api/admin/upgrade_wheel is
+    broken (v0.2.6-v0.2.10 servers had a latent NameError there).
+
+    Runs the Install Guide section 9a one-liner via paramiko:
+
+      scp wheel.whl root@host:/tmp/
+      ssh root@host 'pip3 install --upgrade --force-reinstall --no-deps wheel.whl
+        && systemctl restart netgen-server
+        && curl /api/health'
+
+    Distinct from SshInstallWorker (which is for fresh installs and
+    runs the full install_ostg_complete.py end-to-end). This worker
+    just does the bare minimum to upgrade a running server: one
+    sftp put, one pip install, one systemctl restart, one health
+    probe. ~10 s round-trip vs the Fresh Install tab's 5-45 min.
+    """
+
+    log_chunk = pyqtSignal(str)
+    status = pyqtSignal(str)
+    finished_ok = pyqtSignal(bool)
+
+    def __init__(
+        self,
+        host: str,
+        user: str,
+        password: Optional[str],
+        key_path: Optional[str],
+        wheel_path: str,
+        port: int = 22,
+        server_url: str = "",
+    ):
+        super().__init__()
+        # `host` is the SSH target; `server_url` is the http URL the
+        # client uses to probe /api/health post-restart. Usually
+        # derived from host but the operator might be using a
+        # bastion / port-forward, so we accept both.
+        self.host = host
+        self.user = user
+        self.port = int(port) if port else 22
+        self.password = password
+        self.key_path = key_path
+        self.wheel_path = wheel_path
+        self.server_url = (server_url or f"http://{host}:5050").rstrip("/")
+        self._stop = False
+
+    def stop(self) -> None:
+        self._stop = True
+
+    def run(self) -> None:
+        try:
+            import paramiko
+        except Exception as e:
+            self.log_chunk.emit(f"[ssh-upgrade] paramiko import failed: {e}\n")
+            self.finished_ok.emit(False)
+            return
+
+        self.status.emit(f"SSH connect to {self.user}@{self.host}:{self.port}...")
+        client = paramiko.SSHClient()
+        client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+        try:
+            kw = {
+                "hostname": self.host, "username": self.user,
+                "port": self.port, "timeout": 15,
+            }
+            if self.key_path:
+                kw["key_filename"] = self.key_path
+                self.log_chunk.emit(f"[ssh-upgrade] auth: key {self.key_path}\n")
+            else:
+                kw["password"] = self.password or ""
+                self.log_chunk.emit("[ssh-upgrade] auth: password\n")
+            client.connect(**kw)
+        except Exception as e:
+            self.log_chunk.emit(f"[ssh-upgrade] SSH connect failed: {e}\n")
+            self.finished_ok.emit(False)
+            return
+
+        try:
+            try:
+                sftp = client.open_sftp()
+            except Exception as e:
+                self.log_chunk.emit(f"[ssh-upgrade] SFTP open failed: {e}\n")
+                self.finished_ok.emit(False)
+                return
+
+            # Stage the wheel under /tmp (writeable by any user; pip
+            # only needs read access to the file)
+            wheel_name = os.path.basename(self.wheel_path)
+            remote_wheel = f"/tmp/{wheel_name}"
+            try:
+                self.status.emit(f"Copying wheel to {remote_wheel}...")
+                self.log_chunk.emit(
+                    f"[ssh-upgrade] sftp put {self.wheel_path} → {remote_wheel} "
+                    f"({os.path.getsize(self.wheel_path)} bytes)\n"
+                )
+                sftp.put(self.wheel_path, remote_wheel)
+            except Exception as e:
+                self.log_chunk.emit(f"[ssh-upgrade] SFTP put failed: {e}\n")
+                self.finished_ok.emit(False)
+                return
+            finally:
+                try:
+                    sftp.close()
+                except Exception:
+                    pass
+
+            # Build the section-9a one-liner. sudo'd when user != root
+            # so pip can write under the system Python's dist-packages.
+            cmd_payload = (
+                f"pip3 install --upgrade --force-reinstall --no-deps "
+                f"{remote_wheel} && "
+                f"systemctl restart netgen-server && "
+                f"sleep 2 && "
+                f"pip3 show ostg-trafficgen | head -2 && "
+                f"curl -fsS http://127.0.0.1:5050/api/health && echo"
+            )
+            cmd = (
+                f"sudo sh -c {_shquote(cmd_payload)}"
+                if self.user != "root" else cmd_payload
+            )
+
+            self.status.emit("Running pip install + systemctl restart...")
+            self.log_chunk.emit(f"[ssh-upgrade] exec: {cmd_payload}\n")
+
+            try:
+                # PTY OK here — we WANT the install to die if the SSH
+                # disconnects, since the round-trip is ~10s. The
+                # tradeoff that drove SshInstallWorker to nohup
+                # (15+ min installs surviving client exit) doesn't
+                # apply to a 10-second upgrade.
+                _, stdout, _ = client.exec_command(cmd, get_pty=True, timeout=180)
+                stdout.channel.set_combine_stderr(True)
+                for line in iter(stdout.readline, ""):
+                    if self._stop:
+                        self.log_chunk.emit("[ssh-upgrade] cancelled by user\n")
+                        break
+                    self.log_chunk.emit(line)
+                rc = stdout.channel.recv_exit_status()
+                self.log_chunk.emit(f"[ssh-upgrade] exit rc={rc}\n")
+                if rc == 0:
+                    self.status.emit("Upgrade complete — server back online")
+                    self.finished_ok.emit(True)
+                else:
+                    self.status.emit(f"SSH upgrade failed (rc={rc})")
+                    self.finished_ok.emit(False)
+            except Exception as e:
+                self.log_chunk.emit(f"[ssh-upgrade] exec failed: {e}\n")
+                self.finished_ok.emit(False)
+        finally:
+            try:
+                client.close()
+            except Exception:
+                pass
 
 
 class SshInstallWorker(QThread):
@@ -725,11 +899,93 @@ class InstallServerDialog(QDialog):
         info.setStyleSheet("color:#475569; font-size:11px;")
         form.addRow(info)
 
+        # ──────────── SSH fallback (used only if HTTP fails) ────────────
+        #
+        # The /api/admin/upgrade_wheel endpoint had a latent NameError on
+        # v0.2.6–v0.2.10 servers that returned a bare HTTP 500 — the
+        # Upgrade tab couldn't fix the bug because the endpoint that
+        # would do the fixing was the very thing that's broken. Operators
+        # had to do one manual SSH upgrade before subsequent HTTP
+        # upgrades would work.
+        #
+        # This section closes that gap: when the operator fills in SSH
+        # credentials here, the dialog automatically falls back to a
+        # paramiko-based pip-install on HTTP failure. The fallback runs
+        # the exact section-9a one-liner: scp wheel + pip install +
+        # systemctl restart + health check. ~10s round-trip.
+        ssh_box = QGroupBox(
+            "SSH fallback (used only if the HTTP upgrade fails)"
+        )
+        ssh_box.setCheckable(True)
+        ssh_box.setChecked(False)
+        ssh_box.setStyleSheet("QGroupBox::title{color:#475569; font-size:11px;}")
+        ssh_layout = QFormLayout(ssh_box)
+
+        ssh_row = QHBoxLayout()
+        self.up_ssh_user = QLineEdit("root")
+        self.up_ssh_user.setMaximumWidth(120)
+        self.up_ssh_port = QSpinBox()
+        self.up_ssh_port.setRange(1, 65535)
+        self.up_ssh_port.setValue(22)
+        self.up_ssh_port.setMaximumWidth(80)
+        ssh_row.addWidget(QLabel("user:"))
+        ssh_row.addWidget(self.up_ssh_user)
+        ssh_row.addWidget(QLabel("port:"))
+        ssh_row.addWidget(self.up_ssh_port)
+        ssh_row.addStretch(1)
+        ssh_layout.addRow("SSH:", ssh_row)
+
+        self.up_ssh_pw_rb = QRadioButton("Password")
+        self.up_ssh_key_rb = QRadioButton("SSH key")
+        self.up_ssh_pw_rb.setChecked(True)
+        self._up_ssh_auth_grp = QButtonGroup(self)
+        self._up_ssh_auth_grp.addButton(self.up_ssh_pw_rb)
+        self._up_ssh_auth_grp.addButton(self.up_ssh_key_rb)
+        auth_row = QHBoxLayout()
+        auth_row.addWidget(self.up_ssh_pw_rb)
+        auth_row.addWidget(self.up_ssh_key_rb)
+        auth_row.addStretch(1)
+        ssh_layout.addRow("Auth:", auth_row)
+
+        self.up_ssh_password = QLineEdit()
+        self.up_ssh_password.setEchoMode(QLineEdit.Password)
+        self.up_ssh_password.setPlaceholderText("(only used on HTTP failure)")
+        ssh_layout.addRow("Password:", self.up_ssh_password)
+
+        key_row = QHBoxLayout()
+        self.up_ssh_key = QLineEdit()
+        self.up_ssh_key.setPlaceholderText("~/.ssh/id_ed25519")
+        key_browse = QPushButton("Browse...")
+        key_browse.clicked.connect(lambda: self._browse_file(self.up_ssh_key, "SSH key files (*)"))
+        key_row.addWidget(self.up_ssh_key, 1)
+        key_row.addWidget(key_browse)
+        ssh_layout.addRow("Key file:", key_row)
+
+        self.up_ssh_pw_rb.toggled.connect(self._update_up_auth_visibility)
+        self._update_up_auth_visibility()
+
+        ssh_info = QLabel(
+            "If the HTTP endpoint returns 500 (latent bug in v0.2.6–v0.2.10 "
+            "servers), the dialog will sftp the wheel and run pip + "
+            "systemctl restart directly. Same as Install Guide section 9a."
+        )
+        ssh_info.setWordWrap(True)
+        ssh_info.setStyleSheet("color:#94a3b8; font-size:10px;")
+        ssh_layout.addRow(ssh_info)
+
+        form.addRow(ssh_box)
+        self.up_ssh_box = ssh_box  # so the click handler can read .isChecked()
+
         self.up_btn = QPushButton("Upload && Upgrade")
         self.up_btn.clicked.connect(self._start_upgrade)
         form.addRow("", self.up_btn)
 
         return w
+
+    def _update_up_auth_visibility(self) -> None:
+        use_pw = self.up_ssh_pw_rb.isChecked()
+        self.up_ssh_password.setEnabled(use_pw)
+        self.up_ssh_key.setEnabled(not use_pw)
 
     def _browse_wheel(self, line_edit: QLineEdit) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -757,24 +1013,131 @@ class InstallServerDialog(QDialog):
         self._log_carry = ""
         self._set_status("Starting upgrade...")
         self.up_btn.setEnabled(False)
+        # Track whether HTTP failed in a recoverable way (5xx / network),
+        # so finished_ok handler knows whether to trigger SSH fallback
+        # vs just show the error dialog.
+        self._http_broken = False
+        self._http_broken_reason = ""
+        # Stash inputs for the fallback path (creating a new worker
+        # later needs them, can't re-read the QLineEdits from inside a
+        # connected slot reliably if the user is editing them)
+        self._pending_upgrade = {
+            "url": url,
+            "wheel": wheel,
+            "token": token,
+        }
 
         self._worker = WheelUploadWorker(url, wheel, token)
         self._worker.log_chunk.connect(self._append_log)
         self._worker.status.connect(self._set_status)
+        self._worker.http_endpoint_broken.connect(self._on_http_endpoint_broken)
         self._worker.finished_ok.connect(self._upgrade_finished)
         self._worker.start()
 
+    def _on_http_endpoint_broken(self, reason: str) -> None:
+        """WheelUploadWorker says the HTTP endpoint can't be used (5xx
+        or network error). Flag for the finish handler to trigger the
+        SSH fallback (or show a tailored prompt if SSH creds weren't
+        provided)."""
+        self._http_broken = True
+        self._http_broken_reason = reason
+
     def _upgrade_finished(self, ok: bool) -> None:
-        self.up_btn.setEnabled(True)
         if ok:
-            QMessageBox.information(self, "Upgrade complete",
-                                    "Server has restarted with the new wheel.")
+            # Clean success — clear fallback state and report.
+            self._http_broken = False
+            self._http_broken_reason = ""
+            self.up_btn.setEnabled(True)
+            QMessageBox.information(
+                self, "Upgrade complete",
+                "Server has restarted with the new wheel."
+            )
+            return
+
+        # Failure path. Try SSH fallback if:
+        #   (1) the failure was an HTTP-recoverable one (5xx / network), AND
+        #   (2) the operator enabled the SSH fallback group with creds
+        if self._http_broken and getattr(self, "up_ssh_box", None) and self.up_ssh_box.isChecked():
+            self._try_ssh_fallback()
+            return
+
+        # No fallback available — show the captured errors.
+        self.up_btn.setEnabled(True)
+        if self._http_broken:
+            self._show_failure_dialog(
+                "Upgrade failed (HTTP endpoint broken)",
+                f"The HTTP upgrade endpoint failed: {self._http_broken_reason}\n\n"
+                f"Enable 'SSH fallback' in the Upgrade tab and provide "
+                f"SSH credentials — the dialog will then automatically "
+                f"fall back to a paramiko-based pip install (Install "
+                f"Guide §9a) when this happens. Most recent errors:",
+            )
         else:
             self._show_failure_dialog(
                 "Upgrade failed",
                 "The wheel upgrade did not complete. Most recent errors "
                 "from the log:",
             )
+
+    def _try_ssh_fallback(self) -> None:
+        """Kick off SshUpgradeWorker against the server the upgrade tab
+        was targeting. Reuses host from the http URL, creds from the
+        SSH fallback group."""
+        url = self._pending_upgrade.get("url", "")
+        wheel = self._pending_upgrade.get("wheel", "")
+
+        # Parse hostname out of the URL (strip scheme + port)
+        host_from_url = re.sub(r"^https?://", "", url, flags=re.I)
+        host_from_url = host_from_url.split("/")[0]
+        # Drop :port suffix from hostname (paramiko uses port=)
+        if ":" in host_from_url:
+            host_from_url = host_from_url.rsplit(":", 1)[0]
+
+        user = (self.up_ssh_user.text() or "root").strip()
+        port = int(self.up_ssh_port.value())
+        if self.up_ssh_pw_rb.isChecked():
+            password = self.up_ssh_password.text() or ""
+            key_path = None
+            if not password:
+                self.up_btn.setEnabled(True)
+                QMessageBox.warning(
+                    self, "SSH fallback: missing password",
+                    "The HTTP endpoint failed and SSH fallback was "
+                    "enabled, but no password was provided. Either "
+                    "fill in the password / pick a key, or disable "
+                    "the fallback to see the original error."
+                )
+                return
+        else:
+            password = None
+            key_path = (self.up_ssh_key.text() or "").strip()
+            if not key_path or not os.path.isfile(key_path):
+                self.up_btn.setEnabled(True)
+                QMessageBox.warning(
+                    self, "SSH fallback: missing key",
+                    "Pick a valid SSH key file or switch to password auth."
+                )
+                return
+
+        self._append_log(
+            f"\n[client] HTTP endpoint failed: {self._http_broken_reason}\n"
+            f"[client] Falling back to SSH-based pip install + restart "
+            f"(Install Guide §9a)...\n"
+        )
+        self._set_status(f"SSH fallback: connecting to {user}@{host_from_url}:{port}...")
+        # Reset for the new worker
+        self._http_broken = False
+        self._http_broken_reason = ""
+
+        self._worker = SshUpgradeWorker(
+            host=host_from_url, user=user, port=port,
+            password=password, key_path=key_path,
+            wheel_path=wheel, server_url=url,
+        )
+        self._worker.log_chunk.connect(self._append_log)
+        self._worker.status.connect(self._set_status)
+        self._worker.finished_ok.connect(self._upgrade_finished)
+        self._worker.start()
 
     # -- Tab 2: SSH fresh install -------------------------------------------
 
