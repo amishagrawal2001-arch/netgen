@@ -15,10 +15,46 @@ run. Output is appended into a read-only log pane as it arrives.
 
 from __future__ import annotations
 
+import html as _html
 import os
+import re
 import time
+from collections import deque
 from shlex import quote as _shquote
 from typing import Optional
+
+
+# Lines we treat as errors / warnings / successes for log-pane coloring
+# and the "what went wrong" extraction at install end. Matched case-
+# insensitively against each line. Order matters — first match wins.
+_ERROR_RX = re.compile(
+    r"\b(error|exception|failed|fatal|traceback|"
+    r"\[error\]|\[err\]|-E-|✗)\b",
+    re.IGNORECASE,
+)
+_WARN_RX = re.compile(
+    r"\b(warning|warn|\[warn\]|\[warning\]|⚠)\b",
+    re.IGNORECASE,
+)
+_OK_RX = re.compile(r"(✓|\bsuccess(?:fully)?\b|\bOK\b)", re.IGNORECASE)
+# Explicit bracket tags that override the noise heuristic. Some lines
+# from install_ostg_complete.py contain both an "[ERROR]" tag AND a
+# substring like "not found" that NOISE_RX would otherwise filter out
+# (e.g. "[ERROR] Wheel file not found: dist/..."). When operators ship
+# an explicit tag they mean it.
+_EXPLICIT_ERR_RX = re.compile(r"\[(ERROR|ERR|FATAL)\]", re.IGNORECASE)
+_EXPLICIT_WARN_RX = re.compile(r"\[(WARN|WARNING)\]", re.IGNORECASE)
+# Strip ANSI escape sequences (\x1b[...m). install_dpdk.sh and the
+# server's installer emit colored output; we re-color via HTML on the
+# client side, so the raw escapes would otherwise show as visual junk.
+_ANSI_RX = re.compile(r"\x1b\[[0-9;]*m")
+# Lines we DON'T want to flag as errors even though they contain the word.
+# The DPDK install for instance prints "no errors" / "0 errors" lots.
+_NOISE_RX = re.compile(
+    r"\b(no error|0 error|errors=0|error_count=0|may not exist|"
+    r"if any were present|not loaded|no such image|not found)\b",
+    re.IGNORECASE,
+)
 
 from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtWidgets import (
@@ -473,6 +509,17 @@ class InstallServerDialog(QDialog):
         self.setMinimumSize(820, 600)
 
         self._worker: Optional[QThread] = None
+        # Ring buffer of recent ERROR-tagged lines from the log stream.
+        # On install/upgrade failure the dialog peels these out into the
+        # QMessageBox so operators don't have to scroll a 1000-line log
+        # to find what went wrong. Capped to keep memory bounded on
+        # long DPDK builds.
+        self._recent_errors: deque = deque(maxlen=20)
+        # Carry-over for split-mid-line chunks. SSH streams arrive on
+        # arbitrary byte boundaries; we buffer trailing partial lines
+        # so the error-extraction regex doesn't miss them on the next
+        # chunk join.
+        self._log_carry: str = ""
 
         layout = QVBoxLayout(self)
 
@@ -573,6 +620,8 @@ class InstallServerDialog(QDialog):
             return
 
         self.log_view.clear()
+        self._recent_errors.clear()
+        self._log_carry = ""
         self._set_status("Starting upgrade...")
         self.up_btn.setEnabled(False)
 
@@ -588,8 +637,11 @@ class InstallServerDialog(QDialog):
             QMessageBox.information(self, "Upgrade complete",
                                     "Server has restarted with the new wheel.")
         else:
-            QMessageBox.warning(self, "Upgrade failed",
-                                "See log for details.")
+            self._show_failure_dialog(
+                "Upgrade failed",
+                "The wheel upgrade did not complete. Most recent errors "
+                "from the log:",
+            )
 
     # -- Tab 2: SSH fresh install -------------------------------------------
 
@@ -795,6 +847,8 @@ class InstallServerDialog(QDialog):
             flags.append("--skip-dpdk-build")
 
         self.log_view.clear()
+        self._recent_errors.clear()
+        self._log_carry = ""
         self._set_status("Resuming monitoring..." if resume_mode else "Connecting...")
         self.ssh_btn.setEnabled(False)
 
@@ -848,6 +902,8 @@ class InstallServerDialog(QDialog):
                 return
 
         self.log_view.clear()
+        self._recent_errors.clear()
+        self._log_carry = ""
         self.ssh_test_btn.setEnabled(False)
         self._set_status(f"Testing {user}@{host}:{port}...")
         self._append_log(f"[test] connect to {user}@{host}:{port}\n")
@@ -1037,17 +1093,114 @@ class InstallServerDialog(QDialog):
                 "Server has been provisioned. Point your client at http://<host>:5050."
             )
         else:
-            QMessageBox.warning(self, "Install failed", "See log for details.")
+            self._show_failure_dialog(
+                "Install failed",
+                "The fresh install did not complete. Most recent errors "
+                "from the log:",
+            )
+
+    def _show_failure_dialog(self, title: str, lead: str) -> None:
+        """Pop a QMessageBox with the last N captured error lines so the
+        operator sees the actual cause without scrolling the log pane.
+        Falls back to a generic "see log" message if no error lines were
+        captured (rare — usually the worker emits at least one)."""
+        if self._recent_errors:
+            # Show up to the last 6 errors. The streaming order matches
+            # chronological order, so the LAST captured line is usually
+            # the proximate cause.
+            errs = list(self._recent_errors)[-6:]
+            bullet = "\n• " + "\n• ".join(e[:200] for e in errs)
+            QMessageBox.critical(self, title, f"{lead}{bullet}")
+        else:
+            QMessageBox.critical(
+                self, title,
+                f"{lead}\n\n(No specific error lines captured — scroll the "
+                f"log pane for details.)"
+            )
 
     # -- Shared helpers ------------------------------------------------------
 
     def _append_log(self, text: str) -> None:
-        # Avoid scrollback explosion on huge installs: maxBlockCount cap above.
-        cur = self.log_view.textCursor()
-        cur.movePosition(cur.End)
-        cur.insertText(text if text.endswith("\n") else text)
-        self.log_view.setTextCursor(cur)
+        """Append a streamed log chunk to the visible log pane.
+
+        Does three things:
+          1. Splits the chunk on newlines and carries any trailing
+             partial line over for the next call (SSH chunks land on
+             arbitrary byte boundaries).
+          2. Colors each complete line by its category — red for
+             ERROR, amber for WARNING, green for ✓/success, neutral
+             otherwise. Uses appendHtml so a single line can carry
+             color without re-formatting earlier lines.
+          3. Captures error lines into self._recent_errors so the
+             failure QMessageBox can show them without operators
+             having to scroll.
+
+        maxBlockCount cap on the QPlainTextEdit prevents scrollback
+        explosion on multi-thousand-line DPDK builds.
+        """
+        if not text:
+            return
+        # Join leftover partial line from last call
+        text = self._log_carry + text
+        lines = text.split("\n")
+        # Last piece is either "" (chunk ended on \n) or a partial line —
+        # buffer it for next time.
+        self._log_carry = lines.pop() if lines else ""
+
+        for line in lines:
+            self._classify_and_append(line)
+
+        # If carry has grown unreasonably (no newline in a 10 KB blob),
+        # flush it as-is to avoid pathological buffering.
+        if len(self._log_carry) > 10_000:
+            self._classify_and_append(self._log_carry)
+            self._log_carry = ""
+
         self.log_view.ensureCursorVisible()
+
+    def _classify_and_append(self, line: str) -> None:
+        """Append a single complete line with category-based color."""
+        # Classification order:
+        #   1. Explicit bracket tag ([ERROR], [WARN]) — wins over
+        #      anything else. install_ostg_complete.py adds these
+        #      deliberately on lines that matter.
+        #   2. Noise heuristic — strip out cleanup-style "X not found"
+        #      messages that aren't actually errors.
+        #   3. Generic error / warning / success word match.
+        if not line:
+            color = None
+            self.log_view.appendPlainText("")
+            return
+
+        is_explicit_err = bool(_EXPLICIT_ERR_RX.search(line))
+        is_explicit_warn = bool(_EXPLICIT_WARN_RX.search(line))
+        is_noise = (not is_explicit_err) and (not is_explicit_warn) and bool(_NOISE_RX.search(line))
+        is_error = is_explicit_err or ((not is_noise) and bool(_ERROR_RX.search(line)))
+        is_warn  = (not is_error) and (is_explicit_warn or ((not is_noise) and bool(_WARN_RX.search(line))))
+        is_ok    = (not is_error) and (not is_warn) and bool(_OK_RX.search(line))
+
+        if is_error:
+            color = "#dc2626"   # red-600
+            self._recent_errors.append(line.strip())
+        elif is_warn:
+            color = "#d97706"   # amber-600
+        elif is_ok:
+            color = "#15803d"   # green-700
+        else:
+            color = None
+
+        # Strip ANSI escape sequences from the server-side colored
+        # output (install_dpdk.sh uses \033[0;32m style colors); we
+        # color via HTML on our end so the raw escapes just produce
+        # visual junk.
+        line = _ANSI_RX.sub("", line)
+
+        if color:
+            self.log_view.appendHtml(
+                f'<span style="color:{color};">{_html.escape(line) or "&nbsp;"}</span>'
+            )
+        else:
+            self.log_view.appendPlainText(line)
 
     def _set_status(self, text: str) -> None:
         self.status_lbl.setText(text)
