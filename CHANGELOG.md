@@ -2,6 +2,86 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.10] - 2026-05-26
+
+Install dialog visibility fixes — three bugs that made successful
+installs LOOK like failures to the operator. All three reproduced
+live on svl-hp-ai-srv04 during a real v0.2.7 → v0.2.9 upgrade
+attempt; this release fixes them.
+
+### Added — pop-out log window
+- New **"Pop out ↗"** button in the Log group box header of the
+  Install / Upgrade Server dialog. Opens a detached 1100×720
+  QDialog with a much larger log view — both windows share the
+  same QTextDocument via setDocument(), so any appendHtml /
+  appendPlainText / clear() on the embedded view shows in both.
+  Non-modal: the operator keeps interacting with the main dialog
+  (Install / Test Connection / etc.) while watching output stream
+  in the popout alongside.
+- Dark-mode styling (#0f172a background, #e2e8f0 text, 12pt
+  monospace) — easier on the eyes for the 15-min DPDK build than
+  the cramped light-mode pane.
+- Auto-scroll toggle (default ON) — freezeable so the operator
+  can read carefully while the install keeps appending output.
+- Toggle button label flips between "Pop out ↗" / "Focus popout ↗"
+  based on state. Parent dialog closeEvent tears down the popout
+  so no orphan top-level window survives.
+
+### Fixed — infinite apt-wait via self-matching pgrep
+- `_wait_for_apt_lock` ran `pgrep -f '(apt|dpkg)'` via
+  `subprocess.run(..., shell=True)`, which executes as
+  `sh -c "pgrep -f '(apt|dpkg)'"`. The wrapper's own command line
+  contains the literal characters "apt" and "dpkg" — so pgrep -f
+  (which regex-matches the full cmdline of every process) always
+  matched the wrapper itself and returned a hit. The check was
+  effectively `while true: log("waiting...")` until the 5-min
+  timeout fired and proceeded with a WARNING. Operators gave up
+  watching long before that.
+- Fix: switch to `fuser /var/lib/dpkg/lock /var/lib/dpkg/lock-frontend
+  /var/lib/apt/lists/lock /var/cache/apt/archives/lock 2>/dev/null`.
+  fuser only flags a process if the kernel reports it has the lock
+  file open via an fd. The fuser binary itself doesn't open the
+  lock files, so no self-match. This is what apt itself uses
+  internally.
+- Bonus diagnostic: when a real holder IS found, the log now
+  resolves the pid → cmdline via `ps -o pid,etime,cmd -p <pid>`
+  and surfaces "Waiting for apt/dpkg lock to release... (10s) —
+  holder: 2291 3-04:11 /usr/share/unattended-upgrades/..." so
+  operators see WHO is blocking them.
+
+### Fixed — log stream frozen for entire install duration
+- `install_ostg_complete.py` uses `print(...)` for its [INFO] /
+  [WARNING] / [ERROR] lines. When stdout is redirected to a file
+  (the wrapper does this via `>> /var/log/netgen-install.log
+  2>&1`), Python detects "not a tty" and switches print() to
+  FULL buffering — lines accumulate in Python's userspace buffer
+  and don't reach the file until either the buffer fills (4-8 KB)
+  or Python exits.
+- Meanwhile subprocess.run() output bypasses Python's stdout
+  buffer entirely (inherits the parent's fd directly). So
+  systemctl/docker errors appeared instantly, while every [INFO]
+  line stayed invisible until the install finally exited.
+- The dialog's poll loop showed cleanup output ending at
+  "exit status 1" and then APPEARED FROZEN for 5-10 minutes.
+  Operators consistently concluded the install had failed and
+  killed it.
+- Fix: invoke the installer as `python3 -u install_ostg_complete.py`
+  in the dialog's spawn wrapper. `-u` forces unbuffered
+  stdout/stderr — each print() reaches the file fd immediately,
+  the poll loop surfaces it within 1-5 s.
+
+### Notes
+- No new dependencies on either side.
+- Wheel ships as `ostg_trafficgen-0.2.10-py3-none-any.whl`.
+- The detached-install wrapper (`/var/log/netgen-install.log`,
+  `/var/run/netgen-install.pid`, `/var/run/netgen-install.exit`)
+  introduced in 0.2.8 is unchanged. Only the python3 invocation
+  inside it picks up the -u flag.
+- Validated end-to-end: v0.2.7 → v0.2.10 upgrade via the dialog
+  flow on svl-hp-ai-srv04 now streams log lines live (no more
+  "appears stuck" UX) and the apt-wait check passes immediately
+  when no real lock is held.
+
 ## [0.2.9] - 2026-05-17
 
 Operator-workflow improvements across the install dialog + chassis
