@@ -1310,19 +1310,29 @@ class InstallServerDialog(QDialog):
         auth_row.addStretch(1)
         form.addRow("Auth:", auth_row)
 
+        # Password + Key file rows wrapped in container widgets so we
+        # can hide the inactive one entirely (reclaims vertical space).
+        # Previously _update_auth_visibility only setEnabled() which
+        # left both rows visible / greyed — wasted ~30px and added
+        # to the overlap operators reported.
         self.ssh_password = QLineEdit()
         self.ssh_password.setEchoMode(QLineEdit.Password)
-        self.ssh_password.setPlaceholderText("(SSH password — not stored)")
-        form.addRow("Password:", self.ssh_password)
+        self.ssh_password.setPlaceholderText("SSH password (not stored)")
+        self._pw_row_lbl = QLabel("Password:")
+        form.addRow(self._pw_row_lbl, self.ssh_password)
 
-        key_row = QHBoxLayout()
         self.ssh_key = QLineEdit()
         self.ssh_key.setPlaceholderText("~/.ssh/id_ed25519")
         key_browse = QPushButton("Browse...")
         key_browse.clicked.connect(lambda: self._browse_file(self.ssh_key, "SSH key files (*)"))
+        key_row_wrap = QWidget()
+        key_row = QHBoxLayout(key_row_wrap)
+        key_row.setContentsMargins(0, 0, 0, 0)
         key_row.addWidget(self.ssh_key, 1)
         key_row.addWidget(key_browse)
-        form.addRow("Key file:", key_row)
+        self._key_row_lbl = QLabel("Key file:")
+        self._key_row_wrap = key_row_wrap
+        form.addRow(self._key_row_lbl, key_row_wrap)
 
         self.auth_pw_rb.toggled.connect(self._update_auth_visibility)
         self._update_auth_visibility()
@@ -1346,9 +1356,17 @@ class InstallServerDialog(QDialog):
         installer_row.addWidget(ib)
         form.addRow("Installer:", installer_row)
 
-        # Flags
+        # Flags — tightened from the default QGroupBox spacing which
+        # made the two checkboxes consume ~80px and overflow onto the
+        # info paragraph below. Now ~40px total.
         flags_box = QGroupBox("install_ostg_complete.py flags (optional)")
+        flags_box.setStyleSheet(
+            "QGroupBox{margin-top:6px; padding-top:6px;}"
+            "QGroupBox::title{subcontrol-origin:margin; left:8px;}"
+        )
         flags_layout = QVBoxLayout(flags_box)
+        flags_layout.setContentsMargins(8, 4, 8, 4)
+        flags_layout.setSpacing(2)
         self.flag_no_dpdk = QCheckBox("--no-dpdk  (skip DPDK install entirely)")
         self.flag_skip_dpdk_build = QCheckBox(
             "--skip-dpdk-build  (apt deps only, no 10–30 min meson build)"
@@ -1357,10 +1375,11 @@ class InstallServerDialog(QDialog):
         flags_layout.addWidget(self.flag_skip_dpdk_build)
         form.addRow(flags_box)
 
+        # Info — one short line instead of the 3-sentence paragraph
+        # that pushed the action buttons off-screen at the bottom.
         info = QLabel(
-            "Copies the wheel + install_ostg_complete.py to <code>/tmp/netgen_install/</code> "
-            "on the target host, then runs the installer (sudo'd if user != root). "
-            "Full installs take 15–45 min; output streams here as it runs."
+            "Installs to <code>/tmp/netgen_install/</code> then runs the "
+            "installer. Full installs take 15–45 min; log streams below."
         )
         info.setWordWrap(True)
         info.setStyleSheet("color:#475569; font-size:11px;")
@@ -1389,9 +1408,16 @@ class InstallServerDialog(QDialog):
         return w
 
     def _update_auth_visibility(self) -> None:
+        # Hide rather than disable: setEnabled left both rows visible
+        # (just greyed), and on the Fresh Install tab that contributed
+        # to the overlap operators reported. Toggling the wrappers'
+        # visibility makes QFormLayout reclaim the row's vertical
+        # space instead of leaving a greyed-out gap.
         use_pw = self.auth_pw_rb.isChecked()
-        self.ssh_password.setEnabled(use_pw)
-        self.ssh_key.setEnabled(not use_pw)
+        self.ssh_password.setVisible(use_pw)
+        self._pw_row_lbl.setVisible(use_pw)
+        self._key_row_wrap.setVisible(not use_pw)
+        self._key_row_lbl.setVisible(not use_pw)
 
     def _browse_file(self, line_edit: QLineEdit, filt: str) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Select file", "", filt)
