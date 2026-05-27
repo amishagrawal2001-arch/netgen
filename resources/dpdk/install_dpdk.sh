@@ -676,8 +676,39 @@ EOF
                      /opt/OSTG/resources/dpdk/tx_worker/build; do
             if [[ -d "$(dirname "$canon")" ]]; then
                 mkdir -p "$canon"
-                ln -sfn "$_txw" "$canon/tx_worker"
-                log_success "Linked tx_worker → $canon/tx_worker"
+                local _target="$canon/tx_worker"
+                # CRITICAL: skip when source and target are the SAME
+                # file. When /admin's Install DPDK button runs this
+                # script, SCRIPT_DIR=/opt/netgen/resources/dpdk — so
+                # _txw IS already at the canonical path, and
+                # `ln -sfn X X` errors with "are the same file" under
+                # `set -euo pipefail`. The whole install aborts here,
+                # and the operator never gets past Step 6 to Step 7
+                # (Configure Hugepages). That's exactly the failure
+                # mode on svl-hp-ai-srv02: install completed enough
+                # to build tx_worker but never allocated hugepages,
+                # so subsequent DPDK streams started + exited in 1 s.
+                #
+                # Bash's `-ef` tests "same inode + device" — handles
+                # both the direct-same-path case and the
+                # symlink-already-points-here case. Returns false
+                # when target doesn't exist yet (first install on a
+                # fresh box), which is what we want — fall through to
+                # `ln` and create it.
+                if [[ "$_txw" -ef "$_target" ]]; then
+                    log_info "tx_worker already at $_target — no symlink needed"
+                    continue
+                fi
+                # Wrap in || true so any other ln failure (permission
+                # denied on a read-only mount, etc.) doesn't abort the
+                # install at Step 6. Log it and move on; hugepages +
+                # subsequent steps are more important than this
+                # convenience symlink.
+                if ln -sfn "$_txw" "$_target" 2>/dev/null; then
+                    log_success "Linked tx_worker → $_target"
+                else
+                    log_warning "Could not link $_target (skipping — non-fatal)"
+                fi
             fi
         done
         # Stash a copy on PATH so ad-hoc invocations (`tx_worker --help`) work
