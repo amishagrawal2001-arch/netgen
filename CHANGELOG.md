@@ -2,6 +2,67 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.17] - 2026-05-27
+
+Quick fix for the device-apply failure operators hit when "VXLAN"
+ends up in the protocols list without VXLAN-specific config. Plus
+a fix for the prune-old-releases CI job that no-op'd on its first
+run.
+
+### Fixed — device/apply 400's on empty VXLAN config
+- Real trace from svl-hp-ai-srv02:
+  ```
+  POST /api/device/apply  →  device1
+    Protocols: ['OSPF', 'IS-IS', 'BGP', 'VXLAN']
+    VXLAN Config (raw): {}
+  VXLAN enabled: config_has_content=False, in_protocols=True, vxlan_config={}
+  ERROR: Invalid VXLAN configuration: VXLAN VNI is required
+  RESPONSE 400 for POST /api/device/apply
+  ```
+- Old logic flipped VXLAN enabled=True purely because "VXLAN" was in
+  the protocols list. Validation then found no VNI and 400'd the
+  WHOLE device apply — operator lost the OSPF/IS-IS/BGP config they
+  actually wanted because of one orphaned checkbox.
+- New behavior: VXLAN is only "enabled" when the config dict has
+  actual content (VNI / remote_peers / explicit enabled=True). If
+  "VXLAN" is in protocols but config is empty, log a clear warning,
+  drop VXLAN from the active protocols list, and proceed with the
+  rest of the device config. Operator sees in the server log:
+
+      WARNING: 'VXLAN' is in protocols list but vxlan_config has no
+      VNI / remote peers / enabled=True flag — skipping VXLAN
+      configuration. Fix: either remove VXLAN from the device's
+      protocols, OR fill in VXLAN VNI + at least one remote peer in
+      the device's VXLAN section. The rest of the device config
+      (OSPF/IS-IS/BGP/IP) will still apply.
+
+- To force the old strict behavior (intentionally require VXLAN
+  config when VXLAN is in protocols), set
+  `vxlan_config={"enabled": True}` explicitly.
+
+### Fixed — release.yml prune-old-releases no-op'd on first run
+- v0.2.16's prune-old-releases job (introduced in v0.2.15) ran but
+  reported "Found 0 releases. Keeping latest 4. Nothing to prune."
+- Cause: no `actions/checkout` step in the job and no `--repo` flag
+  on the `gh release list` call. Without a checked-out repo, gh has
+  no way to know which repo to query.
+- Fix: pass `--repo ${{ github.repository }}` explicitly to all three
+  `gh` invocations (list, delete, final list). Cheaper than adding
+  `actions/checkout` — the job doesn't read any repo files, just
+  talks to the GitHub API.
+- Confirmed by manually running the equivalent from local: v0.2.5
+  release entry deleted (216 MB freed), v0.2.5 git tag preserved.
+  After this commit, the next tag push will auto-prune everything
+  past KEEP=4 cleanly.
+
+### Notes
+- Server-only fix for VXLAN behavior — client-side dialogs unchanged.
+- Wheel ships as `ostg_trafficgen-0.2.17-py3-none-any.whl`.
+- Operators with broken `device1`-style applies on 0.2.5-0.2.16:
+  upgrade to 0.2.17 and re-Apply, OR (as a one-off workaround on the
+  current server) untick the "VXLAN" protocol checkbox in the Add
+  Device dialog before clicking Apply.
+
 ## [0.2.16] - 2026-05-27
 
 Bug fix for the "DPDK stream starts and stops in 1 second" failure
