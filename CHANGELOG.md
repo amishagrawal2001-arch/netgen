@@ -2,6 +2,51 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.14] - 2026-05-27
+
+Server-side fix for the DPDK install path. v0.2.13 fixed
+`install_dpdk.sh` itself, but operators upgrading via the §9a
+SSH one-liner ended up with a stale copy at `/opt/netgen/` while
+the wheel's copy had the fix — and the `/admin` Install DPDK
+endpoint launched the stale one. Closes that loop.
+
+### Fixed — `/admin Install DPDK` always syncs from wheel
+- `_ensure_dpdk_tree_deployed()` is now called unconditionally
+  before the script-resolution step in `api_admin_install_dpdk`,
+  not just when the script is missing.
+- Why the change: `pip install --upgrade <new.whl> + systemctl
+  restart` (Install Guide §9a one-liner) updates the wheel's
+  `/usr/local/lib/python3.10/dist-packages/resources/dpdk/`
+  copy but doesn't touch `/opt/netgen/resources/dpdk/`. The
+  /admin Install DPDK endpoint runs the `/opt/netgen/` copy.
+  Earlier self-heal only triggered on MISSING — present-but-stale
+  was a no-op.
+- Net effect: clicking Install DPDK now resyncs the resources
+  tree from the freshly-installed wheel, so the latest
+  `install_dpdk.sh` (with any bug fixes) runs every time.
+- Trade-off: operator file edits under `/opt/netgen/resources/dpdk/`
+  are lost on every Install DPDK click. The design contract is
+  "wheel is canonical" — customizations belong in the wheel or
+  via env-var overrides, not local file mods.
+
+### Validated against the real failure
+- svl-hp-ai-srv02 had 0.2.13 wheel installed (with 8c87de6's
+  parent-dir mkdir fix), but `/opt/netgen/resources/dpdk/install_dpdk.sh`
+  was the pre-fix version — grep for "mkdir -p" returned only
+  the unrelated tx_worker line at 641, not the new line ~250
+  block. /admin Install DPDK ran the stale script → identical
+  Step 3 "cd: /root/SURAJ: No such file or directory" failure
+  that 8c87de6 had explicitly fixed in the wheel.
+- After 0.2.14: Install DPDK click → resync from wheel runs
+  first → fresh script with the fix → mkdir -p creates the
+  parent → git clone proceeds.
+
+### Notes
+- No client-side changes — server-only fix.
+- Wheel ships as `ostg_trafficgen-0.2.14-py3-none-any.whl`.
+- After upgrading to 0.2.14, every Install DPDK click is a
+  cheap (~100 KB) idempotent sync. Performance impact: a few ms.
+
 ## [0.2.13] - 2026-05-27
 
 Dialog layout cleanup + fix for `/admin Install DPDK` on brand-new
