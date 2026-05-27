@@ -2,6 +2,55 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.16] - 2026-05-27
+
+Bug fix for the "DPDK stream starts and stops in 1 second" failure
+caught live on svl-hp-ai-srv02.
+
+### Fixed — `install_dpdk.sh` symlink-to-self aborts before hugepages
+Root cause traced through the full install chain:
+
+  1. Operator clicks `/admin Install DPDK` → script invoked from
+     `/opt/netgen/resources/dpdk/install_dpdk.sh`, so SCRIPT_DIR =
+     `/opt/netgen/resources/dpdk`.
+  2. Steps 1-6 complete successfully — tx_worker builds, links
+     against libdpdk 25.11 cleanly.
+  3. Step 6's post-build symlink block (added in v0.2.5's b24ec9a)
+     loops over canonical paths and does
+     `ln -sfn "$_txw" "$canon/tx_worker"`. First iteration:
+     `_txw = $canon/tx_worker` = same physical file.
+  4. `ln` errors with `'X' and 'X' are the same file`.
+  5. `set -euo pipefail` propagates the error.
+  6. Script exits BEFORE Step 7 (Configure Hugepages) runs.
+  7. `HugePages_Total` stays at 0.
+  8. On next DPDK stream start, tx_worker spawns, EAL tries to
+     reserve mbufs from hugetlbfs, finds 0 hugepages, exits in
+     ~1 s. Stream "starts and stops".
+
+Fix: skip the symlink when source and target are the same file
+(detected via bash's `-ef` inode+device test, which also handles
+the "symlink already points here" case). Also wraps the `ln`
+itself in a `log_warning` fallback so OTHER ln failures
+(permission denied on read-only mounts, etc.) don't abort the
+install before the critical Step 7.
+
+Operators with broken installs from 0.2.5-0.2.15 can either:
+
+  - Re-run /admin Install DPDK on a v0.2.16 server (the always-sync
+    from v0.2.14 will deploy the fixed install_dpdk.sh, then re-run
+    the install — this time it gets past Step 6 and reaches Step 7).
+
+  - Manually allocate hugepages once: `sudo sysctl -w vm.nr_hugepages=1024`
+    plus `echo "vm.nr_hugepages = 1024" > /etc/sysctl.d/99-netgen-hugepages.conf`.
+    (Install Guide section 9b style.)
+
+### Notes
+- Server-only fix; no client-side changes.
+- Wheel ships as `ostg_trafficgen-0.2.16-py3-none-any.whl`.
+- This release will be the first to use the `prune-old-releases`
+  job from v0.2.15 — v0.2.5 (oldest milestone) will fall off the
+  Releases page automatically.
+
 ## [0.2.15] - 2026-05-27
 
 Phase-aware progress UI for `/admin Install DPDK`. Operator clicking
