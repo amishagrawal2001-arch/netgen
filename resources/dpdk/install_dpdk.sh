@@ -240,25 +240,62 @@ step_detect_dpdk_source() {
 # Step 3: Clone DPDK if needed
 step_clone_dpdk() {
     log_step "Step 3: Cloning DPDK"
-    
+
     local target_dir=$(dirname "$DPDK_DIR")
     local dpdk_name=$(basename "$DPDK_DIR")
-    
+
     log_info "Cloning DPDK to: $DPDK_DIR"
-    
-    if command -v git >/dev/null 2>&1; then
-        cd "$target_dir"
-        git clone https://dpdk.org/git/dpdk "$dpdk_name" || {
-            log_error "Failed to clone DPDK"
-            exit 1
-        }
-        cd "$dpdk_name"
-        git checkout v23.11 || git checkout main
-        log_success "DPDK cloned successfully"
-    else
+
+    if ! command -v git >/dev/null 2>&1; then
         log_error "git not found. Please install git or provide DPDK source manually"
         exit 1
     fi
+
+    # Make sure the parent dir exists before we cd into it. Default
+    # DPDK_DIR is $HOME/SURAJ/dpdk; on a fresh box with no SURAJ/
+    # directory, the old `cd "$target_dir"` failed with
+    # "No such file or directory" and the install died at Step 3
+    # before git ever ran — operators hit this from the /admin
+    # Install DPDK button on every brand-new box.
+    if [[ ! -d "$target_dir" ]]; then
+        log_info "Parent directory $target_dir doesn't exist — creating it"
+        if ! mkdir -p "$target_dir"; then
+            log_error "Failed to create $target_dir (permission denied?)"
+            exit 1
+        fi
+    fi
+
+    cd "$target_dir" || {
+        log_error "cd $target_dir failed after mkdir — filesystem issue"
+        exit 1
+    }
+
+    # If a partial clone is already there (previous attempt that died
+    # mid-download), git clone refuses with "destination path already
+    # exists and is not an empty directory". Detect + clean.
+    if [[ -d "$dpdk_name" ]]; then
+        if [[ -d "$dpdk_name/.git" ]]; then
+            log_info "$DPDK_DIR already exists as a git repo — reusing"
+            cd "$dpdk_name"
+            git checkout v23.11 2>/dev/null || git checkout main 2>/dev/null || true
+            log_success "DPDK source ready (reused existing clone)"
+            return 0
+        else
+            log_warning "$DPDK_DIR exists but isn't a git repo — removing for fresh clone"
+            rm -rf "$dpdk_name"
+        fi
+    fi
+
+    git clone https://dpdk.org/git/dpdk "$dpdk_name" || {
+        log_error "Failed to clone DPDK from https://dpdk.org/git/dpdk"
+        log_error "If your lab firewalls dpdk.org, pre-stage the source manually:"
+        log_error "  git clone -b v23.11 --depth 1 https://dpdk.org/git/dpdk $DPDK_DIR"
+        log_error "Or set DPDK_DIR=/path/to/existing/dpdk before running this script."
+        exit 1
+    }
+    cd "$dpdk_name"
+    git checkout v23.11 || git checkout main
+    log_success "DPDK cloned successfully"
 }
 
 # Check if DPDK dependencies are installed
