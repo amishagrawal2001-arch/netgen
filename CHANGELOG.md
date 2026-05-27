@@ -2,6 +2,73 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.18] - 2026-05-26
+
+Closes the "wheel-only upgrade leaves FRR broken" gap that 0.2.17
+hit live on svl-hp-ai-srv02: after `pip install --upgrade
+ostg_trafficgen-0.2.17.whl`, the BGP/FRR device-apply path failed
+with the opaque "FRR manager returned None" because (a) no FRR
+Docker image existed on the host and (b) /opt/netgen/Dockerfile.frr
+wasn't on disk either, so the operator had to SSH in and rebuild
+by hand. v0.2.18 makes the server self-sufficient for both halves.
+
+### Fixed — auto-deploy FRR build assets from the wheel at server startup
+- New `_ensure_frr_assets_deployed()` in `run_tgen_server.py`,
+  fired from `main()` alongside the existing tx_worker orphan sweep.
+- Delegates to `utils.frr_docker._deploy_frr_assets_from_wheel`,
+  which imports the freshly-installed `ostg_docker` package, finds
+  its on-disk site-packages location via `__file__`, and copies:
+    * `Dockerfile.frr` → `/opt/netgen/Dockerfile.frr`
+    * `start-frr.sh` → `/opt/netgen/start-frr.sh`
+    * `frr.conf.template` → `/opt/netgen/frr.conf.template`
+    * Full `ostg_docker/` tree → `/opt/netgen/ostg_docker/`
+- Same self-heal pattern as `_ensure_dpdk_tree_deployed`: wheel is
+  the canonical source, /opt/netgen/ gets overwritten on every
+  startup. Operator customisations to those files are lost (matches
+  the existing DPDK contract).
+- Best-effort: logs a warning and continues if /opt/netgen/ isn't
+  writable. Doesn't block server startup.
+
+### Fixed — auto-build netgen-frr:latest when no FRR image exists locally
+- New `_try_build_frr_image(client)` in `utils/frr_docker.py`.
+- Wired into `_resolve_frr_image` between "scan local images" and
+  "fall back to legacy ostg-frr:latest string". If neither
+  `netgen-frr:latest` nor `ostg-frr:latest` is present locally:
+    1. Ensure `/opt/netgen/Dockerfile.frr` is in place (calls the
+       deploy helper above; idempotent with the startup self-heal).
+    2. Run `docker build -t netgen-frr:latest -f Dockerfile.frr .`
+       from `/opt/netgen` via the Docker Python SDK (no shell-out).
+    3. Also tag the result as `ostg-frr:latest` so legacy callers
+       still find an image.
+    4. Return the tag on success, None on failure.
+- Build takes 2–3 minutes on first run (alpine apk install of frr +
+  tooling). Guarded by a module-level `_FRR_BUILD_ATTEMPTED` flag so
+  the multi-minute build only runs once per server process — if it
+  fails the operator sees the original error on the next apply
+  rather than another 3-minute hang.
+- On `BuildError`, the helper streams the last 20 lines of the
+  build log into the server log so the operator can see WHY it
+  failed (apk mirror down, network blip, etc.) without having to
+  SSH in and re-run by hand.
+
+### Why this matters
+- Old §9a wheel-only upgrade: `pip install --upgrade <new.whl> +
+  systemctl restart netgen-server` left /opt/netgen/ frozen at
+  whatever the previous install_ostg_complete.py run produced.
+  FRR Dockerfile + image got stale (or absent) silently.
+- New §9a path: the first time a BGP/OSPF device apply triggers
+  the FRR start path, the resolver finds no image, the build
+  helper deploys the wheel's Dockerfile + builds the image, and
+  the apply proceeds. No operator intervention needed.
+- Trade-off: 2–3 minute first-apply latency on a fresh install.
+  Acceptable — beats the current "fails opaquely until you SSH
+  in" UX.
+
+### Notes
+- Both fixes live entirely in the wheel — no install_ostg_complete.py
+  changes needed. The wheel-only upgrade path now self-heals.
+- Wheel ships as `ostg_trafficgen-0.2.18-py3-none-any.whl`.
+
 ## [0.2.17] - 2026-05-27
 
 Quick fix for the device-apply failure operators hit when "VXLAN"

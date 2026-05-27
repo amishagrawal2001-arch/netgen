@@ -15,19 +15,162 @@ from typing import Dict, Optional, List
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
+_FRR_BUILD_DIR = "/opt/netgen"
+_FRR_BUILD_ATTEMPTED = False  # one-shot per process — don't loop on failures
+
+
+def _deploy_frr_assets_from_wheel(dest_dir=_FRR_BUILD_DIR):
+    """Copy Dockerfile.frr + ostg_docker/ from the wheel-installed
+    location into ``dest_dir`` so `docker build` has something to chew on.
+
+    Why this lives here AND in install_ostg_complete.py: the §9a wheel-only
+    upgrade path (`pip install --upgrade <new.whl> + systemctl restart`)
+    doesn't run install_ostg_complete.py, so /opt/netgen/Dockerfile.frr
+    can stay missing or stale after an upgrade. Same self-heal pattern as
+    `_ensure_dpdk_tree_deployed` in run_tgen_server.py — the wheel is the
+    canonical source.
+
+    Returns True if Dockerfile.frr ends up in place, False otherwise.
+    """
+    import shutil
+    try:
+        import ostg_docker as _od
+    except Exception as e:
+        logger.warning(f"[FRR BUILD] ostg_docker package not importable: {e}")
+        return False
+
+    src_dir = os.path.dirname(os.path.abspath(_od.__file__))
+    dockerfile_src = os.path.join(src_dir, "Dockerfile.frr")
+    if not os.path.isfile(dockerfile_src):
+        logger.warning(f"[FRR BUILD] {dockerfile_src} missing in wheel")
+        return False
+
+    try:
+        os.makedirs(dest_dir, exist_ok=True)
+        # 1. The full ostg_docker/ subtree (start-frr.sh + frr.conf.template
+        #    are referenced by Dockerfile.frr's COPY directives).
+        dst_pkg = os.path.join(dest_dir, "ostg_docker")
+        if os.path.isdir(dst_pkg):
+            shutil.rmtree(dst_pkg)
+        shutil.copytree(src_dir, dst_pkg)
+        for f in os.listdir(dst_pkg):
+            if f.endswith(".sh"):
+                os.chmod(os.path.join(dst_pkg, f), 0o755)
+        # 2. Publish Dockerfile.frr + start-frr.sh + frr.conf.template
+        #    at the install root — that's where `docker build -f
+        #    Dockerfile.frr .` expects them when the build context
+        #    is the install root.
+        for f in ("Dockerfile.frr", "start-frr.sh", "frr.conf.template"):
+            s = os.path.join(src_dir, f)
+            if os.path.isfile(s):
+                d = os.path.join(dest_dir, f)
+                shutil.copy2(s, d)
+                if f.endswith(".sh"):
+                    os.chmod(d, 0o755)
+        logger.info(f"[FRR BUILD] Deployed FRR assets from {src_dir} → {dest_dir}")
+        return os.path.isfile(os.path.join(dest_dir, "Dockerfile.frr"))
+    except (OSError, PermissionError) as e:
+        logger.warning(f"[FRR BUILD] Deploy to {dest_dir} failed: {e}")
+        return False
+
+
+def _try_build_frr_image(client):
+    """Last-ditch self-heal: build netgen-frr:latest from the wheel's
+    bundled Dockerfile.frr when no FRR image is present locally.
+
+    Without this, the very first BGP/OSPF apply on a freshly-installed
+    server fails with "Failed to create FRR container — FRR manager
+    returned None" because docker tries to pull `ostg-frr:latest` from
+    Docker Hub (no such public image exists) and gets a 404. The
+    operator then has to SSH in and `docker build` by hand — a
+    documented step the install dialog used to do, but which the
+    §9a wheel-only upgrade path silently skipped.
+
+    Build can take 2–3 minutes (alpine apk install of frr + tools).
+    Runs at most once per process (``_FRR_BUILD_ATTEMPTED`` guard) —
+    if it fails, subsequent FRR-start calls return the legacy fallback
+    and the operator sees the original error rather than retrying
+    a multi-minute build on every device apply.
+
+    Returns the tag string ("netgen-frr:latest") on success, None on
+    failure.
+    """
+    global _FRR_BUILD_ATTEMPTED
+    if _FRR_BUILD_ATTEMPTED:
+        return None
+    _FRR_BUILD_ATTEMPTED = True
+
+    if not _deploy_frr_assets_from_wheel(_FRR_BUILD_DIR):
+        return None
+
+    dockerfile_path = os.path.join(_FRR_BUILD_DIR, "Dockerfile.frr")
+    if not os.path.isfile(dockerfile_path):
+        logger.warning(f"[FRR BUILD] {dockerfile_path} still missing after deploy")
+        return None
+
+    target_tag = "netgen-frr:latest"
+    logger.info(
+        f"[FRR BUILD] No FRR image found locally — building {target_tag} from "
+        f"{dockerfile_path} (this may take 2–3 minutes on first run)..."
+    )
+    try:
+        # `decode=True` gives a stream of dicts so we can log progress;
+        # `rm=True` cleans up intermediate containers; `forcerm=True`
+        # cleans them up even on failure so a partial build doesn't
+        # leak <none>:<none> layers across retries.
+        image, _logs = client.images.build(
+            path=_FRR_BUILD_DIR,
+            dockerfile="Dockerfile.frr",
+            tag=target_tag,
+            rm=True,
+            forcerm=True,
+            pull=False,
+        )
+        # Tag as ostg-frr:latest too so any legacy caller that hardcodes
+        # the old name still finds an image.
+        try:
+            image.tag("ostg-frr", tag="latest")
+        except Exception as e:
+            logger.debug(f"[FRR BUILD] legacy ostg-frr tag failed: {e}")
+        logger.info(f"[FRR BUILD] Built {target_tag} successfully (id={image.short_id})")
+        return target_tag
+    except docker.errors.BuildError as e:
+        # Stream the last few build log lines so the operator can see
+        # WHY the build failed (apk mirror error, network blip, etc.)
+        # without having to SSH in and re-run by hand.
+        try:
+            tail = []
+            for chunk in e.build_log:
+                line = chunk.get("stream") or chunk.get("error") or ""
+                if line.strip():
+                    tail.append(line.rstrip())
+                if len(tail) > 20:
+                    tail = tail[-20:]
+            logger.error(
+                f"[FRR BUILD] BuildError: {e.msg}\n"
+                f"[FRR BUILD] Last build log lines:\n" + "\n".join(tail)
+            )
+        except Exception:
+            logger.error(f"[FRR BUILD] BuildError (no log details): {e}")
+        return None
+    except Exception as e:
+        logger.error(f"[FRR BUILD] Unexpected error during build: {e}")
+        return None
+
+
 def _resolve_frr_image(client=None):
     """Pick the FRR docker image to use. Priority:
 
       1. NETGEN_FRR_IMAGE / OSTG_FRR_IMAGE env var (explicit override)
       2. netgen-frr:latest if it exists locally (new branding)
-      3. ostg-frr:latest (legacy fallback)
+      3. ostg-frr:latest (legacy fallback) if it exists locally
+      4. Auto-build netgen-frr:latest from the wheel-bundled Dockerfile.frr
+      5. Legacy "ostg-frr:latest" string so the failure message reads sensibly
 
-    Without this, the hardcoded "ostg-frr:latest" reference caused
-    every FRR start to fail on a server where the image had been
-    rebuilt as "netgen-frr:latest" — docker would try to PULL
-    ostg-frr from Docker Hub, get a 404 (no such public image),
-    and the BGP/OSPF apply would fail with the opaque
-    "Failed to create FRR container" error. User-reported symptom.
+    Without #4, the very first BGP/OSPF apply on a freshly-installed
+    server fails with "Failed to create FRR container" because docker
+    tries to pull ostg-frr from Docker Hub, gets a 404, and the BGP
+    apply errors out with the opaque message.
     """
     import os as _os
     env = (
@@ -48,9 +191,13 @@ def _resolve_frr_image(client=None):
             return candidate
         except Exception:
             continue
-    # Neither image exists locally — return the legacy default so the
-    # error message still reads sensibly (and a docker login + tag
-    # of the new image is a one-line fix on the server).
+    # Neither image present locally — try to build from the wheel.
+    built = _try_build_frr_image(client)
+    if built:
+        return built
+    # Build also failed (or already attempted this process). Return the
+    # legacy default so the next start_frr_container call surfaces a
+    # sensible error rather than crashing.
     return "ostg-frr:latest"
 
 

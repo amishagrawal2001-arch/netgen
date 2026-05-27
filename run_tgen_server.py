@@ -13900,6 +13900,36 @@ def _ensure_dpdk_tree_deployed():
         logging.warning(f"[ADMIN DPDK SELFHEAL] Deploy to {dst_dir} failed: {e}")
         return None
 
+
+def _ensure_frr_assets_deployed():
+    """Sync /opt/netgen/Dockerfile.frr + /opt/netgen/ostg_docker/ from the
+    wheel's pip-install location. Same rationale as ``_ensure_dpdk_tree_deployed``:
+    a §9a wheel-only upgrade (pip install --upgrade + systemctl restart)
+    leaves /opt/netgen/'s support files at the OLD version because pip
+    doesn't touch /opt/netgen/. Without this self-heal, the FRR
+    auto-build path in utils/frr_docker.py would build from a stale
+    Dockerfile (or, worse, from no Dockerfile at all on a §9a-only
+    install).
+
+    Delegates to ``utils.frr_docker._deploy_frr_assets_from_wheel`` so
+    the deploy logic lives next to the build helper that consumes it.
+
+    Best-effort: returns True on success, False on failure (no write
+    perms, missing wheel package, etc.). Logged either way.
+    """
+    try:
+        from utils.frr_docker import _deploy_frr_assets_from_wheel
+        ok = _deploy_frr_assets_from_wheel("/opt/netgen")
+        if ok:
+            logging.info("[STARTUP FRR SELFHEAL] FRR assets deployed to /opt/netgen")
+        else:
+            logging.warning("[STARTUP FRR SELFHEAL] FRR asset deploy returned False")
+        return ok
+    except Exception as e:
+        logging.warning(f"[STARTUP FRR SELFHEAL] Skipped: {e}")
+        return False
+
+
 # Map PCI address → {name, kernel_driver, bound_at} for interfaces the user
 # has bound to vfio-pci. After binding, the kernel deletes the netdev so
 # /api/dpdk/interfaces returns name="(no interface)" — the user loses sight
@@ -16167,6 +16197,19 @@ def main(argv=None):
             logging.info("[STARTUP CLEANUP] Orphan tx_worker sweep complete")
     except Exception as e:
         logging.warning(f"[STARTUP CLEANUP] Orphan tx_worker sweep failed: {e}")
+
+    # Self-heal: deploy FRR Dockerfile + ostg_docker/ from the wheel to
+    # /opt/netgen/. Wheel-only upgrades (Install Guide §9a) don't touch
+    # /opt/netgen/, so these files can stay missing or stale. When the
+    # first BGP/OSPF device apply triggers utils.frr_docker._try_build_frr_image
+    # the helper expects to find Dockerfile.frr at /opt/netgen/ — pre-deploying
+    # at startup means the asset deploy is decoupled from the build attempt
+    # (operators can also `docker build` manually from /opt/netgen and get
+    # the current wheel's Dockerfile rather than a months-old one).
+    try:
+        _ensure_frr_assets_deployed()
+    except Exception as e:
+        logging.warning(f"[STARTUP FRR SELFHEAL] Unexpected error: {e}")
 
     # Cleanup stale streams on startup (after reboot, no streams are actually running)
     try:

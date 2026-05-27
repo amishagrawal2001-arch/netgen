@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ostg-trafficgen"
-version = "0.2.17"
+version = "0.2.18"
 description = "OSTG Traffic Generator - Advanced Network Traffic Generation with BGP/OSPF Support"
 readme = "README.md"
 requires-python = ">=3.9"
