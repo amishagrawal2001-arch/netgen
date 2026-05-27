@@ -2,6 +2,69 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.19] - 2026-05-27
+
+Hotfix for v0.2.18 — server went offline post-upgrade on
+svl-hp-ai-srv02. Three stacked bugs:
+
+1. v0.2.18 called `_try_build_frr_image` from `_resolve_frr_image`,
+   which fires at `FRRDockerManager.__init__`. The bgp/ospf/isis
+   monitors all instantiate that manager at server startup. So the
+   2–3 minute docker build blocked `main()` BEFORE `app.run()` —
+   Flask never bound port 5050 and the GUI saw "server offline."
+2. The Dockerfile.frr that ships in the wheel (`ostg_docker/`) was
+   the OLD Debian/apt-get version that fails because it mixes
+   Alpine package names ("nano has no installation candidate") into
+   a Debian RUN. The working Alpine Dockerfile.frr lives at the
+   repo root and was never in the wheel.
+3. The default `docker build` inside the daemon's build sandbox
+   couldn't resolve Alpine CDN DNS on hosts behind corporate DNS
+   (Juniper internal). Build logs: "WARNING: updating and opening
+   https://dl-cdn.alpinelinux.org/alpine/v3.18/main: temporary
+   error (try again later)" — 5 retries, then "FRR install failed
+   after retries." Host `curl` worked fine, just the sandbox didn't.
+
+### Fixed — auto-build no longer blocks server startup
+- `_resolve_frr_image` reverts to pure-lookup. v0.2.18's auto-build
+  call removed from here (and the docstring now flags this as a
+  must-stay-side-effect-free invariant).
+- Auto-build moved into `start_frr_container`: right before
+  `client.containers.run(self.image_name, ...)`, do
+  `self.client.images.get(self.image_name)`; on `ImageNotFound`,
+  call `_try_build_frr_image(self.client)` and update
+  `self.image_name` to the new tag. Server startup never blocks;
+  operators only pay the 2–3 minute wait on the first BGP/OSPF
+  Apply click (where blocking is expected — the GUI shows a spinner).
+
+### Fixed — ship the Alpine Dockerfile.frr in the wheel
+- Overwrote `ostg_docker/Dockerfile.frr` with the working Alpine
+  version (was: 26-line Debian apt-get install of build-essential
+  + ~30 packages, ~10 min build, and broken; now: 30-line Alpine
+  apk add of frr + iproute2 + iptables + tooling, ~30 sec build).
+- Eliminates the dual-Dockerfile state. `install_ostg_complete.py`'s
+  "prefer root, fall back to ostg_docker/" guard still works either
+  way — both copies are now identical.
+
+### Fixed — `--network=host` for the auto-build
+- `_try_build_frr_image` now passes `network_mode="host"` to
+  `client.images.build()`. Equivalent to `docker build --network=host`.
+- Without this, the build container uses docker's default bridge
+  DNS, which on Juniper internal can't reach Alpine CDN even
+  though the host can. Reproduced live on srv02:
+  - Host: `curl https://dl-cdn.alpinelinux.org/...APKINDEX.tar.gz`
+    → HTTP 200 in 0.99s
+  - Build sandbox (default network): same URL → "temporary error
+    (try again later)" 5 times → build fails
+  - Build with `--network=host`: succeeds in ~30 sec
+
+### Notes
+- Manual unblock applied to srv02: stopped service, scp'd Alpine
+  Dockerfile, `docker build --network=host`, restarted. Image is
+  now present locally so the resolver short-circuits and the
+  build path isn't exercised on this box until the operator wipes
+  the image.
+- Wheel ships as `ostg_trafficgen-0.2.19-py3-none-any.whl`.
+
 ## [0.2.18] - 2026-05-26
 
 Closes the "wheel-only upgrade leaves FRR broken" gap that 0.2.17

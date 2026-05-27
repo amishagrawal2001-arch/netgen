@@ -86,11 +86,26 @@ def _try_build_frr_image(client):
     documented step the install dialog used to do, but which the
     §9a wheel-only upgrade path silently skipped.
 
+    ⚠ Call from ``start_frr_container`` only — NEVER from
+    ``_resolve_frr_image`` / ``FRRDockerManager.__init__``. v0.2.18
+    learned this the hard way: monitors (bgp/ospf/isis) instantiate
+    FRRDockerManager at server startup, which called this helper,
+    which blocked Flask from binding port 5050 for 2-3 minutes
+    while the build ran. By the time the operator hit the GUI the
+    server looked offline.
+
     Build can take 2–3 minutes (alpine apk install of frr + tools).
     Runs at most once per process (``_FRR_BUILD_ATTEMPTED`` guard) —
-    if it fails, subsequent FRR-start calls return the legacy fallback
-    and the operator sees the original error rather than retrying
-    a multi-minute build on every device apply.
+    if it fails, subsequent FRR-start calls return None immediately
+    rather than retrying a multi-minute build on every device apply.
+
+    The build runs with ``--network=host`` semantics (network_mode='host')
+    so the apk fetch inside the build container inherits the host's
+    /etc/resolv.conf. Without this, docker's default bridge DNS can
+    fail to resolve Alpine CDN mirrors on hosts behind corporate
+    DNS (e.g. Juniper internal). Confirmed on svl-hp-ai-srv02:
+    APKINDEX fetch failed with "temporary error (try again later)"
+    repeatedly until `--network=host` was added.
 
     Returns the tag string ("netgen-frr:latest") on success, None on
     failure.
@@ -111,13 +126,13 @@ def _try_build_frr_image(client):
     target_tag = "netgen-frr:latest"
     logger.info(
         f"[FRR BUILD] No FRR image found locally — building {target_tag} from "
-        f"{dockerfile_path} (this may take 2–3 minutes on first run)..."
+        f"{dockerfile_path} with --network=host (may take 2–3 minutes)..."
     )
     try:
-        # `decode=True` gives a stream of dicts so we can log progress;
         # `rm=True` cleans up intermediate containers; `forcerm=True`
         # cleans them up even on failure so a partial build doesn't
-        # leak <none>:<none> layers across retries.
+        # leak <none>:<none> layers across retries. `network_mode='host'`
+        # is the SDK equivalent of `docker build --network=host`.
         image, _logs = client.images.build(
             path=_FRR_BUILD_DIR,
             dockerfile="Dockerfile.frr",
@@ -125,6 +140,7 @@ def _try_build_frr_image(client):
             rm=True,
             forcerm=True,
             pull=False,
+            network_mode="host",
         )
         # Tag as ostg-frr:latest too so any legacy caller that hardcodes
         # the old name still finds an image.
@@ -159,18 +175,21 @@ def _try_build_frr_image(client):
 
 
 def _resolve_frr_image(client=None):
-    """Pick the FRR docker image to use. Priority:
+    """Pick the FRR docker image to use. Priority (pure lookup, no
+    side-effects):
 
       1. NETGEN_FRR_IMAGE / OSTG_FRR_IMAGE env var (explicit override)
       2. netgen-frr:latest if it exists locally (new branding)
       3. ostg-frr:latest (legacy fallback) if it exists locally
-      4. Auto-build netgen-frr:latest from the wheel-bundled Dockerfile.frr
-      5. Legacy "ostg-frr:latest" string so the failure message reads sensibly
+      4. Legacy "ostg-frr:latest" string so the failure message reads sensibly
 
-    Without #4, the very first BGP/OSPF apply on a freshly-installed
-    server fails with "Failed to create FRR container" because docker
-    tries to pull ostg-frr from Docker Hub, gets a 404, and the BGP
-    apply errors out with the opaque message.
+    ⚠ This function MUST stay side-effect-free. ``FRRDockerManager.__init__``
+    calls it, and the monitor threads (bgp/ospf/isis) instantiate that
+    manager during server startup. v0.2.18 added an auto-build call here;
+    the build blocked startup for 2-3 minutes and the server looked
+    offline from the GUI. v0.2.19 moved auto-build into
+    ``start_frr_container`` where blocking is expected (operator clicked
+    Apply, they're waiting on something to happen anyway).
     """
     import os as _os
     env = (
@@ -191,13 +210,10 @@ def _resolve_frr_image(client=None):
             return candidate
         except Exception:
             continue
-    # Neither image present locally — try to build from the wheel.
-    built = _try_build_frr_image(client)
-    if built:
-        return built
-    # Build also failed (or already attempted this process). Return the
-    # legacy default so the next start_frr_container call surfaces a
-    # sensible error rather than crashing.
+    # Neither image present locally — return the legacy default. The
+    # actual auto-build runs lazily from start_frr_container() when an
+    # operator first applies a BGP/OSPF device, at which point a 2-3
+    # minute hang is expected by the GUI.
     return "ostg-frr:latest"
 
 
@@ -584,6 +600,38 @@ class FRRDockerManager:
             # Start container with host networking
             device_config['router_id'] = router_id
             device_config['dhcp_mode'] = dhcp_mode
+
+            # Lazy auto-build: if the resolver returned a tag that no
+            # longer exists locally (fresh §9a wheel-only upgrade with
+            # no FRR image on disk), build it now from the wheel's
+            # Dockerfile.frr. v0.2.18 tried to do this from __init__
+            # and blocked server startup for 2-3 minutes; v0.2.19 does
+            # it here where the operator is already waiting on the
+            # Apply click. One-shot: _FRR_BUILD_ATTEMPTED guard inside
+            # _try_build_frr_image means we only try once per process.
+            try:
+                self.client.images.get(self.image_name)
+            except docker.errors.ImageNotFound:
+                logger.info(
+                    f"[FRR] Image {self.image_name} not present locally — "
+                    f"attempting auto-build from wheel-bundled Dockerfile.frr"
+                )
+                built_tag = _try_build_frr_image(self.client)
+                if built_tag:
+                    self.image_name = built_tag
+                else:
+                    logger.error(
+                        f"[FRR] Auto-build failed and no FRR image is available. "
+                        f"Manual fix on the server: "
+                        f"docker build --network=host -t netgen-frr:latest "
+                        f"-f /opt/netgen/Dockerfile.frr /opt/netgen "
+                        f"(see server log for [FRR BUILD] BuildError details)"
+                    )
+                    return None
+            except Exception as e:
+                # Don't block on a docker daemon glitch — let containers.run
+                # raise the canonical error.
+                logger.debug(f"[FRR] images.get check raised non-NotFound: {e}")
 
             container = self.client.containers.run(
                 self.image_name,
