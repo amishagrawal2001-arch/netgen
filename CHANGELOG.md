@@ -2,6 +2,73 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.13] - 2026-05-27
+
+Dialog layout cleanup + fix for `/admin Install DPDK` on brand-new
+boxes. All five commits target real operator pain points hit live
+during the v0.2.12 lab rollout.
+
+### Fixed — `install_dpdk.sh` parent-dir clone failure
+- Real failure on svl-hp-ai-srv02 from the /admin Install DPDK
+  button on a fresh box (no `$HOME/SURAJ/` pre-staged):
+
+      Step 3: Cloning DPDK
+      [INFO] Cloning DPDK to: /root/SURAJ/dpdk
+      install_dpdk.sh: line 250: cd: /root/SURAJ: No such file or directory
+      [install died here — git clone never ran]
+
+- `step_clone_dpdk` did `cd $(dirname $DPDK_DIR)` straight off, with
+  no `mkdir -p`. Worked fine on dev boxes where SURAJ/ already
+  existed from earlier manual setup; failed silently on every new
+  box.
+- Fix: `mkdir -p` the parent before cd, with a clear
+  permission-denied path. Also handles the existing-dir case:
+  reuse the clone if it's already a git repo, rm-rf and re-clone
+  if it's a half-finished previous attempt. Better error message
+  on git clone failure (mentions the pre-stage / DPDK_DIR
+  workarounds for firewalled labs).
+
+### Added — Install/Upgrade dialog: chassis history dropdowns
+- Server URL (Upgrade tab) and Host (Fresh Install tab) fields
+  converted from `QLineEdit` to editable `QComboBox` widgets seeded
+  from `~/.netgen/chassis_history.json` (the same store Add TGEN
+  Chassis uses). Operators who've already added their lab boxes
+  there can pick from the dropdown instead of retyping; typing a
+  new address still works.
+- Upgrade tab items show `http://host:port — label`; Fresh Install
+  tab items show `host — label` and picking one also bumps the
+  port spinbox to whatever was stored.
+- `InsertPolicy.NoInsert` — typed text doesn't auto-add to the
+  dropdown, so operator typing doesn't pollute the history list.
+
+### Fixed — Install/Upgrade dialog: overlapping fields
+- Three rounds of layout cleanup after operator screenshots
+  showed fields rendering on top of each other:
+  - **Upgrade tab SSH fallback**: replaced checkable QGroupBox
+    (only `setEnabled` children when off) with a plain header
+    checkbox controlling a `QWidget` wrapper's visibility. Off
+    state collapses to a single 1-line header instead of the full
+    4-row form. Saves ~140 px vertical when not in use.
+  - **Fresh Install tab auth rows**: Password and Key file rows
+    wrapped in container widgets; `_update_auth_visibility` now
+    hides the inactive row instead of just disabling it. Saves
+    ~30 px.
+  - **Fresh Install tab flags group**: tightened margins (8,4,8,4)
+    and spacing (2); shortened the 3-sentence footer paragraph to
+    1 line. Saves ~70 px total.
+  - **Upgrade tab SSH fallback auth rows**: same hide-don't-disable
+    fix as Fresh Install. Saves ~30 px.
+
+### Notes
+- No server-side schema changes; chassis history reads work
+  against any /api/health endpoint that returns netgen_version
+  (0.2.12+). Older servers still display amber `?` in the Version
+  column.
+- Wheel ships as `ostg_trafficgen-0.2.13-py3-none-any.whl`.
+- Validated `install_dpdk.sh` diagnosis against svl-hp-ai-srv02's
+  `/tmp/netgen_install_dpdk_*.log` — script truncated at exactly
+  the cd line, confirming the failure path before fix.
+
 ## [0.2.12] - 2026-05-26
 
 The "no more chicken-and-egg" release. v0.2.11 fixed the broken
