@@ -14227,35 +14227,91 @@ def api_admin_install_dpdk_log():
     except (TypeError, ValueError):
         offset = 0
 
+    # Cap on bytes returned in any single response. A 20-min ninja
+    # build can produce several MB of log; before this cap, a
+    # `?offset=0` call (fresh install OR page reload mid-install)
+    # would ship the entire multi-MB log + duplicate it in the
+    # 64 KiB back-compat field. With the cap, offset=0 returns the
+    # last 1 MiB and the client advances logOffset to (size - 1MiB)
+    # so subsequent polls are still incremental from there.
+    MAX_TAIL_BYTES = 1 * 1024 * 1024
+    BACKCOMPAT_TAIL_BYTES = 64 * 1024
+
     tail_field = None
+    tail_start = None  # the byte offset where tail_field begins; clients should send this back as next offset
+
+    # Read the full file separately for phase parsing — earlier the
+    # phase parser was fed the 64 KiB back-compat tail, which on a
+    # 20-min ninja build doesn't contain the "Step 5: Building DPDK"
+    # marker (it scrolled out at the top). Result: phase regex found
+    # no match and the progress bar vanished mid-install. Reading
+    # the full file is cheap (typically <10 MB) and runs once per
+    # poll on the server thread.
+    phase_text = ""
     try:
         with open(log_path, "rb") as f:
             f.seek(0, 2)
             size = f.tell()
-            # Always populate `log` (last 64 KiB) for back-compat with
-            # older clients that don't track offset
-            backcompat_tail = 64 * 1024
-            f.seek(max(0, size - backcompat_tail))
+
+            # Back-compat: `log` field is always last 64 KiB.
+            f.seek(max(0, size - BACKCOMPAT_TAIL_BYTES))
             data = f.read().decode("utf-8", errors="replace")
-            if size > backcompat_tail:
+            if size > BACKCOMPAT_TAIL_BYTES:
                 data = "[...log truncated to last 64 KiB...]\n" + data
-            # Incremental tail (only what's new since `offset`)
+
+            # Incremental tail (only what's new since `offset`).
             if offset > 0 or "offset" in request.args:
-                if offset <= size:
-                    f.seek(offset)
-                    tail_field = f.read().decode("utf-8", errors="replace")
+                if offset > size:
+                    # Operator's offset is past EOF (log was reset /
+                    # new install started) — return from start, capped.
+                    tail_start = max(0, size - MAX_TAIL_BYTES)
+                    f.seek(tail_start)
+                    tail_bytes = f.read()
+                    tail_field = tail_bytes.decode("utf-8", errors="replace")
+                    if tail_start > 0:
+                        tail_field = (
+                            "[client offset past log size — log was reset; "
+                            "showing last %d KB]\n" % (MAX_TAIL_BYTES // 1024)
+                        ) + tail_field
                 else:
-                    # Operator's offset is past EOF (log was truncated
-                    # / new install started) — return everything
-                    f.seek(0)
-                    tail_field = f.read().decode("utf-8", errors="replace")
-                    tail_field = (
-                        "[client offset past log size — log was reset; "
-                        "showing from start]\n" + tail_field
-                    )
+                    # Normal incremental path. Cap so a stale client
+                    # asking for offset=0 against a multi-MB log
+                    # doesn't ship the whole thing.
+                    effective_offset = max(offset, size - MAX_TAIL_BYTES) if (size - offset) > MAX_TAIL_BYTES else offset
+                    tail_start = effective_offset
+                    f.seek(effective_offset)
+                    tail_bytes = f.read()
+                    tail_field = tail_bytes.decode("utf-8", errors="replace")
+                    if effective_offset > offset:
+                        tail_field = (
+                            "[%d KB skipped — client offset too far behind; "
+                            "showing last %d KB]\n" % (
+                                (effective_offset - offset) // 1024,
+                                MAX_TAIL_BYTES // 1024,
+                            )
+                        ) + tail_field
+
+            # Full-file read for phase parsing (separate from the
+            # back-compat tail, which is too small to be reliable).
+            # Cap defensively at 10 MiB for pathological log growth.
+            f.seek(max(0, size - 10 * 1024 * 1024))
+            phase_text = f.read().decode("utf-8", errors="replace")
+
+        # Fix race-#3: report log_size based on actual bytes the
+        # client just received, not the pre-read size. The script
+        # may have written more bytes between our seek(0,2) and
+        # the tail read; if we report the smaller `size`, the
+        # client's next offset will under-shoot and re-fetch the
+        # bytes already appended → duplicated lines.
+        if tail_field is not None and tail_start is not None:
+            log_size_reported = tail_start + len(tail_bytes)
+        else:
+            log_size_reported = size
     except Exception as e:
         data = f"[error reading log: {e}]"
         size = 0
+        log_size_reported = 0
+        phase_text = ""
 
     # Compute elapsed time for the operator-facing UI
     import datetime as _dt
@@ -14271,6 +14327,13 @@ def api_admin_install_dpdk_log():
         except Exception:
             pass
 
+    # Fix #4: when the install has finished, don't ship a stale
+    # phase dict from a previous run — the client would render
+    # "Step 10 / 99%" as if mid-install. Just report `phase: null`
+    # so the client hides the progress bar; rc tells the operator
+    # the actual outcome.
+    phase_data = _parse_install_phase(phase_text) if running else None
+
     response = {
         "running": running,
         "return_code": return_code,
@@ -14278,8 +14341,8 @@ def api_admin_install_dpdk_log():
         "started_at": started_at,
         "finished_at": _ADMIN_INSTALL_STATE.get("finished_at"),
         "log": data,
-        "log_size": size,
-        "phase": _parse_install_phase(data),
+        "log_size": log_size_reported,
+        "phase": phase_data,
         "elapsed_sec": elapsed_sec,
     }
     if tail_field is not None:
@@ -14741,9 +14804,20 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
     }
 
     // Track byte offset into the install log so each poll only fetches
-    // new bytes (avoids 300 KB transfers + DOM thrash on 20 min ninja
+    // new bytes (avoids ~300 KB transfers + DOM thrash on 20 min ninja
     // builds). Reset to 0 on every fresh Install DPDK click.
     let logOffset = 0;
+    // In-flight poll guard — prevents two parallel polls from racing
+    // each other and appending out-of-order chunks (Finding #6).
+    let pollInFlight = false;
+    // Cap log.textContent at this many bytes to keep DOM responsive
+    // after 20-min builds with multi-MB output (Finding #7). When the
+    // log grows past this, we keep the most recent half plus an
+    // ellipsis marker — operators scrolling up looking for "what
+    // happened at Step 3" can still read /tmp/netgen_install_dpdk_*.log
+    // directly on the host for the full record.
+    const LOG_DOM_CAP_BYTES = 2 * 1024 * 1024;
+    const LOG_DOM_TRIM_TO   = 1 * 1024 * 1024;
     // Polished `secs → "Xm Ys"` formatter for the elapsed / ETA labels
     const fmtDuration = (secs) => {
       if (secs == null || secs < 0) return '?';
@@ -14763,9 +14837,19 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       $('phase-name').textContent = phase.step_name;
       $('phase-bar').style.width = `${phase.overall_pct}%`;
       $('phase-elapsed').textContent = `${fmtDuration(elapsed_sec)} elapsed`;
-      // ETA from overall_pct + elapsed (linear extrapolation — rough
-      // but matches operator intuition while ninja is the long tail)
-      if (elapsed_sec && phase.overall_pct > 0 && phase.overall_pct < 100) {
+      // ETA from overall_pct + elapsed (linear extrapolation).
+      // Suppress when the extrapolation would produce nonsense
+      // (Finding #5):
+      //   • elapsed < 30s → too noisy, single slow poll skews it
+      //   • overall_pct < 5 → division by tiny number blows up
+      //   • overall_pct >= 100 → nothing meaningful to project
+      // Operators see "~5m remaining" once we have a reasonable
+      // extrapolation base.
+      const haveEnoughData = (
+        elapsed_sec != null && elapsed_sec >= 30 &&
+        phase.overall_pct >= 5 && phase.overall_pct < 100
+      );
+      if (haveEnoughData) {
         const projected_total = Math.round(elapsed_sec * 100 / phase.overall_pct);
         const remaining = Math.max(0, projected_total - elapsed_sec);
         $('phase-eta').textContent = `~${fmtDuration(remaining)} remaining`;
@@ -14783,7 +14867,21 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       }
     }
 
+    // "Near bottom" check — within 20px of scroll bottom counts as
+    // "still following the live tail". Used so auto-scroll respects
+    // an operator who deliberately scrolls up to read earlier output
+    // (Finding #8). Without this, every 2-s poll yanks them back
+    // to the bottom mid-read.
+    function isNearBottom(el) {
+      return (el.scrollHeight - el.clientHeight - el.scrollTop) < 20;
+    }
+
     async function pollLogOnce() {
+      // In-flight guard: skip if a previous poll hasn't returned
+      // (sshd lagging, slow log read on a busy box). Without this,
+      // two parallel polls would race + double-append.
+      if (pollInFlight) return;
+      pollInFlight = true;
       try {
         // ?offset= asks the server to return only the bytes appended
         // since our last poll. Saves us re-fetching the full ~300 KB
@@ -14793,20 +14891,36 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
         const log = $('log');
 
         if (d.tail !== undefined) {
-          // Incremental path — append only what's new
+          // Guard against out-of-order responses or a server log_size
+          // that's somehow behind our local offset — only append
+          // when the server's log_size has actually advanced.
+          const advanced = (d.log_size != null && d.log_size > logOffset) ||
+                           (logOffset === 0);
           if (logOffset === 0) {
             // First poll of this install: replace the "No install in
             // progress." placeholder
             log.textContent = d.tail || '(no output yet)';
-          } else if (d.tail) {
+          } else if (d.tail && advanced) {
             log.textContent += d.tail;
           }
-          logOffset = d.log_size || logOffset;
+          if (advanced && d.log_size != null) {
+            logOffset = d.log_size;
+          }
+          // Cap the in-DOM log size — keep last LOG_DOM_TRIM_TO bytes
+          if (log.textContent.length > LOG_DOM_CAP_BYTES) {
+            const trimmed = log.textContent.slice(-LOG_DOM_TRIM_TO);
+            log.textContent =
+              `[...earlier ${Math.round((log.textContent.length - trimmed.length) / 1024)} KB trimmed; full log on host at ${d.log_path || '/tmp/netgen_install_dpdk_*.log'}...]\n` +
+              trimmed;
+          }
         } else {
           // Fallback if server doesn't support offset (older version)
           log.textContent = d.log || '(no output yet)';
         }
-        if ($('log-autoscroll').checked) {
+        // Auto-scroll only if operator is already at the bottom
+        // (or the checkbox forces it). This way, scrolling up to
+        // read an earlier error doesn't get interrupted by every poll.
+        if ($('log-autoscroll').checked && isNearBottom(log)) {
           log.scrollTop = log.scrollHeight;
         }
 
@@ -14819,13 +14933,20 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
           if (d.return_code === 0) {
             $('install-status').textContent =
               `Install completed successfully (${fmtDuration(d.elapsed_sec)})`;
+            $('phase-wrap').style.display = '';
             $('phase-bar').style.width = '100%';
             $('phase-bar').style.background = 'var(--ok, #15803d)';
+            $('phase-step').textContent = 'Completed';
+            $('phase-name').textContent = '';
+            $('phase-eta').textContent = '';
+            $('phase-substep').textContent = '';
             toast('DPDK install completed');
           } else if (d.return_code !== null) {
             $('install-status').textContent =
               `Install exited with code ${d.return_code} after ${fmtDuration(d.elapsed_sec)}`;
+            $('phase-wrap').style.display = '';
             $('phase-bar').style.background = 'var(--bad, #dc2626)';
+            $('phase-step').textContent = `Failed (rc=${d.return_code})`;
             toast('Install failed (rc=' + d.return_code + ')');
           }
           refreshHealth();
@@ -14834,6 +14955,8 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
         }
       } catch (e) {
         toast('Log poll failed: ' + e);
+      } finally {
+        pollInFlight = false;
       }
     }
     function startLogPoll() {
