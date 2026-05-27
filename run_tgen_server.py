@@ -3279,11 +3279,41 @@ def apply_device():
                     vxlan_config.get("remote_peers") or 
                     vxlan_config.get("enabled") is True
                 )
-        vxlan_enabled = vxlan_config_has_content or ("VXLAN" in protocols)
+        # VXLAN is "enabled" only when the operator has actually
+        # provided some configuration for it — a VNI, at least one
+        # remote peer, or an explicit `enabled: True`. Just having
+        # "VXLAN" in the `protocols` list isn't enough.
+        #
+        # Earlier this was `has_content or ("VXLAN" in protocols)`,
+        # which made device apply fail outright when a template /
+        # operator checkbox left "VXLAN" in the protocols list but
+        # the VXLAN fields were blank. The server validated the
+        # empty config, found no VNI, and 400'd the whole device —
+        # blocking the OSPF/IS-IS/BGP config the operator actually
+        # cared about.
+        #
+        # New behavior: protocols-only "VXLAN" with empty config is
+        # treated as "operator forgot to fill in VXLAN fields" and
+        # SKIPPED with a clear warning. Other protocols still apply.
+        # To force the strict behavior, set vxlan_config={"enabled": True}.
+        vxlan_enabled = vxlan_config_has_content
         if vxlan_enabled:
             logging.info(f"[DEVICE APPLY] VXLAN enabled: config_has_content={vxlan_config_has_content}, in_protocols={'VXLAN' in protocols}, vxlan_config={vxlan_config}")
+        elif "VXLAN" in protocols:
+            logging.warning(
+                f"[DEVICE APPLY] 'VXLAN' is in protocols list but vxlan_config "
+                f"has no VNI / remote peers / enabled=True flag — skipping "
+                f"VXLAN configuration. Fix: either remove VXLAN from the "
+                f"device's protocols, OR fill in VXLAN VNI + at least one "
+                f"remote peer in the device's VXLAN section. The rest of "
+                f"the device config (OSPF/IS-IS/BGP/IP) will still apply."
+            )
+            # Drop VXLAN from the active protocols list so downstream
+            # code (status reporting, FRR config) doesn't try to set
+            # it up either.
+            protocols = [p for p in protocols if p != "VXLAN"]
         else:
-            logging.warning(f"[DEVICE APPLY] VXLAN NOT enabled: config_has_content={vxlan_config_has_content}, in_protocols={'VXLAN' in protocols}, vxlan_config={vxlan_config}")
+            logging.info(f"[DEVICE APPLY] VXLAN NOT enabled: config_has_content={vxlan_config_has_content}, in_protocols={'VXLAN' in protocols}, vxlan_config={vxlan_config}")
         
         # Determine interface name
         # CRITICAL: For VLAN interfaces, we need to handle the naming carefully:
