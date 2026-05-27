@@ -13792,22 +13792,23 @@ _ADMIN_INSTALL_STATE = {
 
 
 def _ensure_dpdk_tree_deployed():
-    """Make sure /opt/netgen/resources/dpdk/ exists by copying from the
-    wheel's pip-install location if needed.
+    """Sync /opt/netgen/resources/dpdk/ from the wheel's pip-install
+    location. Always overwrites — wheel is the canonical source.
 
-    Why: the /admin Install DPDK button + the /api/dpdk/* bind/unbind
-    endpoints look for scripts at /opt/netgen/resources/dpdk/. That
-    directory only exists when install_ostg_complete.py deployed it
-    (full install flow) — a bare `pip install <wheel>` or the
-    pre-v0.2.12 dialog flow that only sftp'd wheel+installer leaves
-    it empty, and the admin portal then 404s when the operator clicks
-    Install DPDK.
+    Why always-sync (and not "only if missing"): the common upgrade
+    path is `pip install --upgrade <new.whl> + systemctl restart`
+    (Install Guide §9a). pip updates the wheel's location in
+    site-packages, but /opt/netgen/resources/dpdk/ stays at the OLD
+    script because pip doesn't touch /opt/netgen/. The /admin Install
+    DPDK button then runs the stale script and hits bugs already
+    fixed in the wheel. svl-hp-ai-srv02 caught this live in 0.2.13.
 
-    The wheel itself ships these files under
-    site-packages/resources/dpdk/. Self-heal by copying from there
-    to /opt/netgen/. Returns the deployed install_dpdk.sh path on
-    success, None on failure (no write perms, missing source, etc.)
-    so the caller can surface a clear error.
+    Trade-off: operator customizations to /opt/netgen/'s files are
+    lost on every /admin Install DPDK click. Acceptable — the design
+    contract is "wheel is canonical" (same as pip → /usr/local/lib).
+
+    Returns the deployed install_dpdk.sh path on success, None on
+    failure (no write perms, missing source, etc.).
 
     Best-effort: skips silently if /opt/netgen/ isn't writable
     (caller handles the None return).
@@ -14007,31 +14008,45 @@ def api_admin_install_dpdk():
             "log_path": _ADMIN_INSTALL_STATE.get("log_path"),
         }), 409
 
-    # Resolve the script — same path order as the bind endpoints.
-    # If the canonical locations are empty (server was installed by a
-    # pre-v0.2.12 dialog that didn't sftp the resources/ tree, OR by
-    # a bare `pip install <wheel>` without running install_ostg_complete.py),
-    # self-heal by copying the tree from the wheel's pip-install
-    # location. The wheel itself ships the same files at
-    # site-packages/resources/dpdk/ — we just need to deploy them to
-    # /opt/netgen/ where the bind/install endpoints can find them.
+    # ALWAYS sync /opt/netgen/resources/dpdk/ from the wheel before
+    # launching the script — the wheel is the canonical source.
+    #
+    # Earlier (0.2.12-0.2.13) we only self-healed when the file was
+    # MISSING. That broke the common upgrade path: operator does
+    # `pip install --upgrade <new.whl> + systemctl restart` (the
+    # Install Guide §9a one-liner). pip updates the wheel's
+    # site-packages location with the new script, but
+    # /opt/netgen/resources/dpdk/install_dpdk.sh stays at the OLD
+    # version because pip doesn't touch /opt/netgen/. The /admin
+    # Install DPDK button then runs the stale script and hits bugs
+    # the wheel already fixed.
+    #
+    # Real failure on svl-hp-ai-srv02 (0.2.13 wheel installed, but
+    # /opt/netgen/'s install_dpdk.sh still the pre-8c87de6 version
+    # → Step 3 cd failure that 8c87de6 explicitly fixed).
+    #
+    # Fix: always-sync. _ensure_dpdk_tree_deployed does an
+    # overwriting file-by-file copy that's cheap (~7 files, ~100 KB)
+    # and idempotent. Operator's customizations to /opt/netgen/
+    # files would be lost, but the design contract is "wheel is
+    # canonical" — same as a pip install does to /usr/local/lib/.
+    deployed = _ensure_dpdk_tree_deployed()
     candidates = [
+        deployed,
         "/opt/netgen/resources/dpdk/install_dpdk.sh",
         "/opt/OSTG/resources/dpdk/install_dpdk.sh",
     ]
-    script = next((p for p in candidates if os.path.isfile(p)), None)
+    script = next((p for p in candidates if p and os.path.isfile(p)), None)
     if script is None:
-        script = _ensure_dpdk_tree_deployed()
-        if script is None:
-            return jsonify({
-                "error": (
-                    "install_dpdk.sh not found in /opt/netgen or /opt/OSTG, "
-                    "and self-heal from wheel failed. Check that the "
-                    "ostg-trafficgen wheel is installed (pip3 show "
-                    "ostg-trafficgen) and that the netgen-server user "
-                    "can write to /opt/netgen/."
-                )
-            }), 404
+        return jsonify({
+            "error": (
+                "install_dpdk.sh not found in /opt/netgen or /opt/OSTG, "
+                "and self-heal from wheel failed. Check that the "
+                "ostg-trafficgen wheel is installed (pip3 show "
+                "ostg-trafficgen) and that the netgen-server user "
+                "can write to /opt/netgen/."
+            )
+        }), 404
 
     timestamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     log_path = f"/tmp/netgen_install_dpdk_{timestamp}.log"
