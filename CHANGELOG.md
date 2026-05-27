@@ -2,6 +2,81 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.15] - 2026-05-27
+
+Phase-aware progress UI for `/admin Install DPDK`. Operator clicking
+Install DPDK now sees an actual progress bar, current step, elapsed
+time, and ETA — instead of staring at a static "log running…"
+message that gave no signal until completion 10-20 min later.
+
+### Added — `/admin Install DPDK` progress UI
+- New phase indicator above the log pane:
+  ```
+  Step 5 of 10: Building DPDK              8m 12s elapsed  ~3m remaining
+  ▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓▓░░░░░░  87%
+  Compiling DPDK: 2863 / 2954 units (97%)
+  ```
+- Server-side phase parser scans the install log for the
+  `Step N: TITLE` markers `install_dpdk.sh` emits and computes
+  overall progress weighted by per-step typical durations
+  (Step 5 ninja build dominates at 900s of the 1064s total).
+  Sub-step interpolation via the `[X/Y] Compiling` ninja lines so
+  the bar fills smoothly during the long step rather than jumping
+  in 10% chunks.
+- Auto-scroll toggle on the log pane (default on). Respects operator
+  scroll position — scrolling up to read an earlier error freezes
+  the view; scrolling back to the bottom resumes following the tail.
+- Completion state: green 100% bar on `rc=0`, red bar with
+  `Failed (rc=N)` label on non-zero exit.
+- Page-load auto-resume: refresh the `/admin` page mid-install and
+  the progress UI picks up where it left off.
+
+### Performance
+- Incremental log fetch via `?offset=N` query param on
+  `/api/admin/install_dpdk/log` — server returns only bytes appended
+  since the client's last offset (capped at 1 MiB per response).
+  Client appends rather than replaces, no more DOM thrash on multi-MB
+  logs. Reduces network transfer per poll from ~300 KB to a few KB
+  during steady-state ninja compilation.
+- DOM cap: client trims log to last 1 MiB once it exceeds 2 MiB,
+  with a header line noting how many KB were trimmed and pointing
+  at the full log file on the host. Browser stays responsive even
+  after multi-hour pathological builds.
+
+### Fixed — 8 bugs caught in pre-tag code review
+- **#1** Phase parser was fed only the 64 KiB back-compat tail; on
+  long ninja builds the `Step 5` marker scrolled out → bar
+  disappeared mid-install. Now reads the full log file (capped
+  10 MiB) for phase extraction.
+- **#2** `?offset=0` shipped the entire multi-MB log uncapped. Now
+  capped at 1 MiB per response with a skip-ahead marker.
+- **#3** `log_size` reported pre-read → client's next offset
+  under-shot → duplicate appends in the log pane. Now computed
+  as `tail_start + len(actual_bytes_read)`.
+- **#4** Stale `phase` from previous install showed "Step 10 / 99%"
+  indefinitely. Now `phase=null` when not running; rc tells the
+  operator the actual outcome.
+- **#5** ETA produced nonsense at early polls and step boundaries
+  (e.g. "~3m20s" at elapsed=2s, pct=1%). Now suppressed until
+  elapsed≥30s AND overall_pct≥5.
+- **#6** Concurrent / out-of-order polls double-appended log
+  content. Added `pollInFlight` guard plus a server-side
+  advancement check (`d.log_size > logOffset`).
+- **#7** `log.textContent` grew unbounded. 2 MiB DOM cap added.
+- **#8** Auto-scroll yanked operator back to bottom mid-read.
+  `isNearBottom(el)` check — only auto-scrolls if within 20 px.
+
+### Notes
+- No client-side install/upgrade dialog changes — this release is
+  entirely about the `/admin` web UI in netgen-server.
+- Wheel ships as `ostg_trafficgen-0.2.15-py3-none-any.whl`.
+- Backward compatible: older clients (or curl scripts) using the
+  `/api/admin/install_dpdk/log` endpoint without `?offset=` still
+  get the 64 KiB `log` field as before.
+- Operators on v0.2.14 servers with in-progress installs: upgrading
+  mid-install is safe — the new server can read the existing log file
+  on disk and resume phase parsing immediately.
+
 ## [0.2.14] - 2026-05-27
 
 Server-side fix for the DPDK install path. v0.2.13 fixed
