@@ -14092,12 +14092,124 @@ def api_admin_install_dpdk():
     })
 
 
+# Phase parsing for the /admin DPDK install progress bar.
+#
+# install_dpdk.sh emits "  Step N: TITLE" lines via its log_step()
+# helper. We extract the latest one to drive the progress UI. For
+# Step 5 (Building DPDK — the long one) we also pick up the most
+# recent `[X/Y] Compiling ...` ninja line so the bar fills in
+# smoothly during the 10-20 min build instead of jumping in 10%
+# chunks per step.
+_STEP_RX = re.compile(r"Step\s+(\d+)(?:\.\d+)?:?\s+([^\n\x1b]+)")
+_NINJA_RX = re.compile(r"\[(\d+)/(\d+)\]")
+
+# Typical wall-clock duration per step in seconds — used as weights
+# when computing the overall progress %. Step 5 dominates. Values
+# come from real installs on lab boxes; if a step takes longer than
+# its weight, the bar appears to slow down inside that step but
+# never goes backwards.
+_STEP_WEIGHTS = {
+    1: 1,        # Preflight checks
+    2: 1,        # DPDK source detection
+    3: 60,       # Clone DPDK (network-bound)
+    4: 60,       # apt install build deps
+    5: 900,      # meson + ninja build DPDK (the long one)
+    6: 30,       # Build tx_worker
+    7: 1,        # Configure hugepages
+    8: 5,        # NIC binding
+    9: 1,        # Configure ld paths
+    10: 5,       # Verify
+}
+_TOTAL_WEIGHT = sum(_STEP_WEIGHTS.values())
+_STEP_TITLES_FALLBACK = {
+    1: "Pre-flight checks",
+    2: "DPDK source detection",
+    3: "Cloning DPDK",
+    4: "Installing build dependencies",
+    5: "Building DPDK",
+    6: "Building tx_worker",
+    7: "Configuring hugepages",
+    8: "NIC binding",
+    9: "Configuring library paths",
+    10: "Verification",
+}
+
+
+def _parse_install_phase(log_text: str):
+    """Extract step + ninja progress + overall % from install_dpdk.sh log."""
+    if not log_text:
+        return None
+    matches = list(_STEP_RX.finditer(log_text))
+    if not matches:
+        return None
+    last = matches[-1]
+    try:
+        current_step = int(last.group(1))
+    except (ValueError, IndexError):
+        return None
+    if not 1 <= current_step <= 10:
+        return None
+    step_name = last.group(2).strip()[:80] or _STEP_TITLES_FALLBACK.get(current_step, "?")
+
+    # Sub-step: ninja's [X/Y] inside Step 5
+    ninja = None
+    if current_step == 5:
+        post = log_text[last.end():]
+        nm = list(_NINJA_RX.finditer(post))
+        if nm:
+            done = int(nm[-1].group(1))
+            total = int(nm[-1].group(2))
+            ninja = {"done": done, "total": total}
+
+    # Overall progress weighted by typical step durations
+    completed_w = sum(_STEP_WEIGHTS.get(i, 0) for i in range(1, current_step))
+    current_w = _STEP_WEIGHTS.get(current_step, 0)
+    if ninja and ninja["total"] > 0:
+        current_w = int(current_w * (ninja["done"] / ninja["total"]))
+    overall_pct = int(100 * (completed_w + current_w) / _TOTAL_WEIGHT)
+    # Never report 100% while still running — final step's tail
+    # (ldconfig + verify) lives outside the weight model
+    overall_pct = min(99, overall_pct) if current_step < 10 else min(99, overall_pct)
+
+    return {
+        "current_step": current_step,
+        "total_steps": 10,
+        "step_name": step_name,
+        "ninja_progress": ninja,
+        "overall_pct": overall_pct,
+    }
+
+
 @app.route("/api/admin/install_dpdk/log", methods=["GET"])
 def api_admin_install_dpdk_log():
-    """Return the tail of the running (or last) install log + status."""
+    """Return install state + log tail. Supports incremental fetch.
+
+    Query params:
+      offset — optional. When set, the response carries only the bytes
+               appended to the log file SINCE that byte position (in
+               the `tail` field). Lets the client append rather than
+               replace the log pane each poll, avoiding DOM thrash
+               on large logs.
+
+    Response fields:
+      running         — bool, install_dpdk.sh still alive?
+      return_code     — int or null, when running=False
+      log_path        — absolute path on the target box
+      started_at      — ISO timestamp
+      finished_at     — ISO timestamp or null
+      log             — last 64 KiB of log (always returned, back-compat
+                        for older clients without offset support)
+      tail            — bytes since `offset` (only when offset given)
+      log_size        — current total size of the log file in bytes
+      phase           — {current_step, total_steps, step_name,
+                         ninja_progress, overall_pct} — parsed from log
+    """
     log_path = _ADMIN_INSTALL_STATE.get("log_path")
     if not log_path or not os.path.isfile(log_path):
-        return jsonify({"running": False, "log": "", "log_path": None})
+        return jsonify({
+            "running": False, "log": "", "log_path": None,
+            "log_size": 0, "phase": None,
+        })
 
     proc = _ADMIN_INSTALL_STATE.get("process")
     running = bool(proc and proc.poll() is None)
@@ -14109,27 +14221,70 @@ def api_admin_install_dpdk_log():
             _ADMIN_INSTALL_STATE["finished_at"] = _dt.datetime.now().isoformat()
             _ADMIN_INSTALL_STATE["return_code"] = return_code
 
-    # Cap log size in the response so we don't ship megabytes per poll.
+    # Incremental fetch: ?offset=N returns just the new bytes.
+    try:
+        offset = max(0, int(request.args.get("offset", 0)))
+    except (TypeError, ValueError):
+        offset = 0
+
+    tail_field = None
     try:
         with open(log_path, "rb") as f:
             f.seek(0, 2)
             size = f.tell()
-            tail = 64 * 1024  # last 64 KiB
-            f.seek(max(0, size - tail))
+            # Always populate `log` (last 64 KiB) for back-compat with
+            # older clients that don't track offset
+            backcompat_tail = 64 * 1024
+            f.seek(max(0, size - backcompat_tail))
             data = f.read().decode("utf-8", errors="replace")
-        if size > tail:
-            data = "[...log truncated to last 64 KiB...]\n" + data
+            if size > backcompat_tail:
+                data = "[...log truncated to last 64 KiB...]\n" + data
+            # Incremental tail (only what's new since `offset`)
+            if offset > 0 or "offset" in request.args:
+                if offset <= size:
+                    f.seek(offset)
+                    tail_field = f.read().decode("utf-8", errors="replace")
+                else:
+                    # Operator's offset is past EOF (log was truncated
+                    # / new install started) — return everything
+                    f.seek(0)
+                    tail_field = f.read().decode("utf-8", errors="replace")
+                    tail_field = (
+                        "[client offset past log size — log was reset; "
+                        "showing from start]\n" + tail_field
+                    )
     except Exception as e:
         data = f"[error reading log: {e}]"
+        size = 0
 
-    return jsonify({
+    # Compute elapsed time for the operator-facing UI
+    import datetime as _dt
+    elapsed_sec = None
+    started_at = _ADMIN_INSTALL_STATE.get("started_at")
+    if started_at:
+        try:
+            t0 = _dt.datetime.fromisoformat(started_at)
+            t1 = _dt.datetime.now() if running else _dt.datetime.fromisoformat(
+                _ADMIN_INSTALL_STATE.get("finished_at") or _dt.datetime.now().isoformat()
+            )
+            elapsed_sec = int((t1 - t0).total_seconds())
+        except Exception:
+            pass
+
+    response = {
         "running": running,
         "return_code": return_code,
         "log_path": log_path,
-        "started_at": _ADMIN_INSTALL_STATE.get("started_at"),
+        "started_at": started_at,
         "finished_at": _ADMIN_INSTALL_STATE.get("finished_at"),
         "log": data,
-    })
+        "log_size": size,
+        "phase": _parse_install_phase(data),
+        "elapsed_sec": elapsed_sec,
+    }
+    if tail_field is not None:
+        response["tail"] = tail_field
+    return jsonify(response)
 
 
 # =============================================================================
@@ -14491,7 +14646,29 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
     </div>
 
     <div class="card" style="grid-column: 1 / -1;">
-      <h2>Install Log</h2>
+      <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+        <h2 style="margin: 0;">Install Log</h2>
+        <label style="font-size: 12px; color: var(--muted); user-select: none;">
+          <input type="checkbox" id="log-autoscroll" checked> Auto-scroll
+        </label>
+      </div>
+      <!-- Phase indicator: hidden until first poll returns a phase -->
+      <div id="phase-wrap" style="display: none; margin-bottom: 8px;">
+        <div style="display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 4px;">
+          <div>
+            <span id="phase-step" style="font-weight: 600; font-size: 13px;">Step ? of 10</span>
+            <span id="phase-name" style="color: var(--muted); margin-left: 6px;">…</span>
+          </div>
+          <div style="font-size: 12px; color: var(--muted);">
+            <span id="phase-elapsed">0s elapsed</span>
+            <span id="phase-eta" style="margin-left: 12px;"></span>
+          </div>
+        </div>
+        <div style="background:#e2e8f0; border-radius:4px; height:8px; overflow:hidden;">
+          <div id="phase-bar" style="background: var(--accent); height:100%; width:0%; transition: width 0.4s ease;"></div>
+        </div>
+        <div id="phase-substep" style="font-size: 11px; color: var(--muted); margin-top: 4px;"></div>
+      </div>
       <pre class="log" id="log">No install in progress.</pre>
     </div>
   </div>
@@ -14547,8 +14724,13 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
         pill($('p-vfiopci'), !!d.vfio.vfio_pci_loaded, 'Loaded', 'Not loaded');
 
         if (d.install_running && !pollLogTimer) {
+          // Auto-resume polling — operator just loaded the page mid-install,
+          // or refreshed it. Reset incremental-fetch state so we get the
+          // full current log on the first poll (one-time ~300 KB hit;
+          // subsequent polls are bytes-since-offset).
+          logOffset = 0;
           $('btn-install-dpdk').disabled = true;
-          $('install-status').textContent = 'Install running…';
+          $('install-status').textContent = 'Install running… (resuming log)';
           startLogPoll();
         } else if (!d.install_running) {
           $('btn-install-dpdk').disabled = false;
@@ -14558,26 +14740,97 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       }
     }
 
+    // Track byte offset into the install log so each poll only fetches
+    // new bytes (avoids 300 KB transfers + DOM thrash on 20 min ninja
+    // builds). Reset to 0 on every fresh Install DPDK click.
+    let logOffset = 0;
+    // Polished `secs → "Xm Ys"` formatter for the elapsed / ETA labels
+    const fmtDuration = (secs) => {
+      if (secs == null || secs < 0) return '?';
+      if (secs < 60) return `${secs}s`;
+      const m = Math.floor(secs / 60);
+      const s = secs % 60;
+      return s > 0 ? `${m}m ${s}s` : `${m}m`;
+    };
+
+    function renderPhase(phase, elapsed_sec) {
+      if (!phase) {
+        $('phase-wrap').style.display = 'none';
+        return;
+      }
+      $('phase-wrap').style.display = '';
+      $('phase-step').textContent = `Step ${phase.current_step} of ${phase.total_steps}`;
+      $('phase-name').textContent = phase.step_name;
+      $('phase-bar').style.width = `${phase.overall_pct}%`;
+      $('phase-elapsed').textContent = `${fmtDuration(elapsed_sec)} elapsed`;
+      // ETA from overall_pct + elapsed (linear extrapolation — rough
+      // but matches operator intuition while ninja is the long tail)
+      if (elapsed_sec && phase.overall_pct > 0 && phase.overall_pct < 100) {
+        const projected_total = Math.round(elapsed_sec * 100 / phase.overall_pct);
+        const remaining = Math.max(0, projected_total - elapsed_sec);
+        $('phase-eta').textContent = `~${fmtDuration(remaining)} remaining`;
+      } else {
+        $('phase-eta').textContent = '';
+      }
+      // Sub-step (ninja) line for the long Step 5
+      if (phase.ninja_progress) {
+        const n = phase.ninja_progress;
+        const pct = Math.round(100 * n.done / Math.max(1, n.total));
+        $('phase-substep').textContent =
+          `Compiling DPDK: ${n.done} / ${n.total} units (${pct}%)`;
+      } else {
+        $('phase-substep').textContent = '';
+      }
+    }
+
     async function pollLogOnce() {
       try {
-        const r = await fetch('/api/admin/install_dpdk/log');
+        // ?offset= asks the server to return only the bytes appended
+        // since our last poll. Saves us re-fetching the full ~300 KB
+        // log every 2 s during a 20-min ninja compile.
+        const r = await fetch(`/api/admin/install_dpdk/log?offset=${logOffset}`);
         const d = await r.json();
         const log = $('log');
-        log.textContent = d.log || '(no output yet)';
-        log.scrollTop = log.scrollHeight;
+
+        if (d.tail !== undefined) {
+          // Incremental path — append only what's new
+          if (logOffset === 0) {
+            // First poll of this install: replace the "No install in
+            // progress." placeholder
+            log.textContent = d.tail || '(no output yet)';
+          } else if (d.tail) {
+            log.textContent += d.tail;
+          }
+          logOffset = d.log_size || logOffset;
+        } else {
+          // Fallback if server doesn't support offset (older version)
+          log.textContent = d.log || '(no output yet)';
+        }
+        if ($('log-autoscroll').checked) {
+          log.scrollTop = log.scrollHeight;
+        }
+
+        // Phase + progress bar
+        renderPhase(d.phase, d.elapsed_sec);
+
         if (!d.running) {
           stopLogPoll();
           $('btn-install-dpdk').disabled = false;
           if (d.return_code === 0) {
-            $('install-status').textContent = 'Install completed successfully';
+            $('install-status').textContent =
+              `Install completed successfully (${fmtDuration(d.elapsed_sec)})`;
+            $('phase-bar').style.width = '100%';
+            $('phase-bar').style.background = 'var(--ok, #15803d)';
             toast('DPDK install completed');
           } else if (d.return_code !== null) {
-            $('install-status').textContent = `Install exited with code ${d.return_code}`;
+            $('install-status').textContent =
+              `Install exited with code ${d.return_code} after ${fmtDuration(d.elapsed_sec)}`;
+            $('phase-bar').style.background = 'var(--bad, #dc2626)';
             toast('Install failed (rc=' + d.return_code + ')');
           }
           refreshHealth();
         } else {
-          $('install-status').textContent = 'Install running… (started ' + (d.started_at || '?') + ')';
+          $('install-status').textContent = `Install running… (started ${d.started_at || '?'})`;
         }
       } catch (e) {
         toast('Log poll failed: ' + e);
@@ -14599,6 +14852,10 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       $('btn-install-dpdk').disabled = true;
       $('install-status').textContent = 'Starting…';
       $('log').textContent = 'Starting install…';
+      // Reset incremental-fetch state + phase UI for the new install
+      logOffset = 0;
+      $('phase-wrap').style.display = 'none';
+      $('phase-bar').style.background = 'var(--accent)';
       try {
         const r = await fetch('/api/admin/install_dpdk', { method: 'POST' });
         const d = await r.json();
