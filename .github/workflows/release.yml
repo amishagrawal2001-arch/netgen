@@ -198,6 +198,13 @@ jobs:
       - name: Keep only the N most recent releases
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # `gh` needs to know which repo to query. Earlier this job
+          # had no checkout step and no --repo flag — `gh release list`
+          # returned 0 entries and the prune ran as a no-op. Pass the
+          # repo explicitly via the github.repository context so the
+          # job works without needing actions/checkout (which would
+          # be 95% wasted work for a job that doesn't read repo files).
+          REPO: ${{ github.repository }}
           # How many releases to retain on the GitHub Releases page.
           # Older ones get their artifacts deleted (saves storage +
           # cleans up the Releases UI) but their git tags STAY — so
@@ -215,7 +222,8 @@ jobs:
           # explicitly if they want it retained without counting
           # against the limit.
           mapfile -t all_tags < <(
-            gh release list --limit 50 --json tagName,createdAt,isDraft \
+            gh release list --repo "$REPO" --limit 50 \
+              --json tagName,createdAt,isDraft \
               --jq 'sort_by(.createdAt) | reverse | .[] | select(.isDraft|not) | .tagName'
           )
 
@@ -234,9 +242,9 @@ jobs:
             # --cleanup-tag=false  → tag stays; only the release entry
             # + uploaded artifacts go. Re-creating the release later
             # is one `gh workflow run release.yml -r <tag>` away.
-            gh release delete "$t" --yes --cleanup-tag=false \
+            gh release delete "$t" --repo "$REPO" --yes --cleanup-tag=false \
               || echo "  (delete failed for $t — continuing)"
           done
 
           echo "Done. Remaining releases:"
-          gh release list --limit 20
+          gh release list --repo "$REPO" --limit 20
