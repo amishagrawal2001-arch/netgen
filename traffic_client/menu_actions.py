@@ -1406,10 +1406,28 @@ class TrafficGenClientMenuAction():
                     QTimer.singleShot(0, self.update_server_tree)
 
         worker.done.connect(_on_done)
-        worker.finished.connect(
-            lambda w=worker: self._menu_iface_workers.remove(w)
-            if w in self._menu_iface_workers else None
-        )
+
+        # Cleanup pattern: wait() + deleteLater() (matches stream_logic.py /
+        # main.py). The previous "just remove from list" handler dropped
+        # the only strong ref while Qt's internal QThread cleanup hadn't
+        # finished joining the OS thread → C++ QThread destructor fired
+        # with the thread still marked running → "QThread: Destroyed
+        # while thread is still running" + SIGABRT. Reproduced on startup
+        # when /api/interfaces returned quickly enough that finished fired
+        # before the main thread had moved on. wait() is instant here
+        # because run() already returned (that's why finished fired);
+        # it just blocks for Qt's internal bookkeeping. deleteLater()
+        # then hands ownership of the deletion back to Qt's event loop.
+        def _cleanup(w=worker):
+            try:
+                w.wait()  # join OS thread cleanly (instant — run() done)
+            except Exception:
+                pass
+            if w in self._menu_iface_workers:
+                self._menu_iface_workers.remove(w)
+            w.deleteLater()
+
+        worker.finished.connect(_cleanup)
         worker.start()
     
     def load_session(self, skip_servers=False):
@@ -1855,10 +1873,20 @@ class TrafficGenClientMenuAction():
             worker = _RetryAllWorker(server, conn_mgr)
             self._menu_retry_workers.append(worker)
             worker.done.connect(_on_one_done)
-            worker.finished.connect(
-                lambda w=worker: self._menu_retry_workers.remove(w)
-                if w in self._menu_retry_workers else None
-            )
+
+            # Same wait()+deleteLater() cleanup as the sibling
+            # _fetch_interfaces_async — see that function's comment for
+            # the QThread-destroyed-while-running SIGABRT details.
+            def _cleanup(w=worker):
+                try:
+                    w.wait()
+                except Exception:
+                    pass
+                if w in self._menu_retry_workers:
+                    self._menu_retry_workers.remove(w)
+                w.deleteLater()
+
+            worker.finished.connect(_cleanup)
             worker.start()
     
     def get_selected_tg_ids(self):

@@ -2,6 +2,47 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.20] - 2026-05-27
+
+Hotfix for a startup-time client crash: `python3 run_tgen_client.py`
+SIGABRT'd shortly after the first `/api/interfaces` fetch with
+
+    Fetched 8 interfaces from http://svl-hp-ai-srv02:5050 (async)
+    QThread: Destroyed while thread is still running
+    zsh: abort      python3 run_tgen_client.py
+
+Reproduced live on macOS connecting to svl-hp-ai-srv02:5050.
+
+### Fixed — QThread cleanup in four async-fetch sites
+- Root cause: the `finished.connect(lambda: list.remove(worker))`
+  pattern dropped the only Python strong ref to the QThread *while*
+  Qt's internal bookkeeping (joining the OS thread, releasing
+  QThreadPrivate state) was still in flight. Python's GC then deleted
+  the C++ QThread object out from under Qt, and Qt's destructor
+  saw the thread still marked running → SIGABRT.
+- Fix: replace the bare remove-from-list lambda with a cleanup
+  closure that does `wait() → list.remove(w) → deleteLater()`. The
+  `wait()` is essentially instant since `finished` only fires after
+  `run()` returns; it just blocks for Qt's internal join.
+  `deleteLater()` then hands ownership of the C++ deletion back
+  to Qt's event loop where it belongs.
+- Same idiom already in use elsewhere in the codebase
+  (`stream_logic.py`, `main.py`); these four sites just predated
+  that convention.
+- Applied to:
+    * `traffic_client/menu_actions.py::_fetch_interfaces_async`
+    * `traffic_client/menu_actions.py::_RetryAllWorker` loop
+    * `traffic_client/server_section.py` async-fetch (line ~1219)
+    * `traffic_client/server_section.py` server-probe (line ~1476)
+- Symptom only surfaces when `/api/interfaces` returns FAST enough
+  that `finished` fires while the UI thread is still mid-startup,
+  which is why this didn't show up in dev until svl-hp-ai-srv02
+  came back online with a warm connection pool.
+
+### Notes
+- Client-only fix — wheel server code unchanged from v0.2.19.
+- Wheel ships as `ostg_trafficgen-0.2.20-py3-none-any.whl`.
+
 ## [0.2.19] - 2026-05-27
 
 Hotfix for v0.2.18 — server went offline post-upgrade on

@@ -1217,10 +1217,28 @@ class TrafficGenClientServerSection():
                             self.update_server_status_icon(srv, False)
 
                     worker.done.connect(_on_done)
-                    worker.finished.connect(
-                        lambda w=worker: self._server_probe_workers.remove(w)
-                        if w in self._server_probe_workers else None
-                    )
+
+                    # Cleanup: wait() + deleteLater() (matches
+                    # stream_logic.py / main.py / menu_actions.py
+                    # _fetch_interfaces_async). The previous
+                    # "just remove from list" handler dropped the
+                    # only strong ref while Qt's internal QThread
+                    # cleanup hadn't finished joining the OS thread,
+                    # triggering "QThread: Destroyed while thread is
+                    # still running" + SIGABRT. Reproduces when
+                    # /api/interfaces returns quickly (cached server,
+                    # warm connection pool) so finished fires before
+                    # the UI thread moves on.
+                    def _cleanup(w=worker):
+                        try:
+                            w.wait()
+                        except Exception:
+                            pass
+                        if w in self._server_probe_workers:
+                            self._server_probe_workers.remove(w)
+                        w.deleteLater()
+
+                    worker.finished.connect(_cleanup)
                     worker.start()
                     continue  # Skip this server for now, will be updated asynchronously
             
@@ -1456,10 +1474,20 @@ class TrafficGenClientServerSection():
                 self.update_server_status_icon(srv, False)
 
         worker.done.connect(_on_done)
-        worker.finished.connect(
-            lambda w=worker: self._server_probe_workers.remove(w)
-            if w in self._server_probe_workers else None
-        )
+
+        # Same wait()+deleteLater() cleanup as the sibling async-fetch
+        # site above. See that block's comment for the SIGABRT
+        # repro details.
+        def _cleanup(w=worker):
+            try:
+                w.wait()
+            except Exception:
+                pass
+            if w in self._server_probe_workers:
+                self._server_probe_workers.remove(w)
+            w.deleteLater()
+
+        worker.finished.connect(_cleanup)
         worker.start()
 
     def remove_selected_interface(self):
