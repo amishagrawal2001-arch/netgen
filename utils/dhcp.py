@@ -744,8 +744,48 @@ def _ensure_dhcp_container(device_id: str, mode: Optional[str] = None):
             client.images.get(DHCP_DOCKER_IMAGE)
             logger.info("[DHCP] Docker image %s found", DHCP_DOCKER_IMAGE)
         except NotFound:
-            logger.error("[DHCP] Docker image %s not found. Please build the image first.", DHCP_DOCKER_IMAGE)
-            return None
+            # Image missing — auto-build it from the wheel's Dockerfile.
+            # The DHCP container reuses the FRR image (_resolve_dhcp_image
+            # → _resolve_frr_image), so building the FRR image covers DHCP
+            # too. Previously this just errored "build the image first",
+            # which broke DHCP-only deployments that never applied a
+            # BGP/OSPF device (the only path that lazily built the image).
+            # _build_frr_image_now tags both netgen-frr:latest AND
+            # ostg-frr:latest, so DHCP_DOCKER_IMAGE resolves afterward for
+            # all non-env-override cases.
+            logger.warning(
+                "[DHCP] Docker image %s not found — auto-building the FRR/DHCP "
+                "image from /opt/netgen/Dockerfile.frr (may take 2-3 minutes)...",
+                DHCP_DOCKER_IMAGE,
+            )
+            built = None
+            try:
+                from utils.frr_docker import _build_frr_image_now
+                built = _build_frr_image_now(client, reason="DHCP container needs the FRR image")
+            except Exception as build_exc:
+                logger.error("[DHCP] Auto-build failed: %s", build_exc, exc_info=True)
+            if not built:
+                logger.error(
+                    "[DHCP] Image %s not found and auto-build failed. Build manually: "
+                    "docker build --network=host -t netgen-frr:latest "
+                    "-f /opt/netgen/Dockerfile.frr /opt/netgen",
+                    DHCP_DOCKER_IMAGE,
+                )
+                return None
+            # Confirm the resolved name is now present (it is for the
+            # netgen-frr / ostg-frr / fallback cases since both tags are
+            # written). For an explicit env-var image that we can't build,
+            # this will still fail — correctly, since we honour the override.
+            try:
+                client.images.get(DHCP_DOCKER_IMAGE)
+                logger.info("[DHCP] Image %s available after auto-build", DHCP_DOCKER_IMAGE)
+            except Exception:
+                logger.error(
+                    "[DHCP] Auto-build produced %s but the configured DHCP image %s "
+                    "is still not resolvable (custom NETGEN_DHCP_IMAGE override?)",
+                    built, DHCP_DOCKER_IMAGE,
+                )
+                return None
         except Exception as img_exc:
             logger.error("[DHCP] Failed to check Docker image %s: %s", DHCP_DOCKER_IMAGE, img_exc, exc_info=True)
             return None

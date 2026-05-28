@@ -2,6 +2,36 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.29] - 2026-05-27
+
+Closes the two minor gaps flagged in the v0.2.28 review.
+
+### DHCP container auto-builds the image when missing
+`_ensure_dhcp_container` previously errored "Docker image not found.
+Please build the image first." if the FRR image was absent. Since the
+DHCP container reuses the FRR image (`_resolve_dhcp_image` →
+`_resolve_frr_image`), a DHCP-only deployment that never applied a
+BGP/OSPF device (the only path that lazily built the image) could
+never start DHCP. Now it calls `_build_frr_image_now()` to build the
+image on demand (tags both `netgen-frr:latest` and `ostg-frr:latest`),
+then retries. An explicit `NETGEN_DHCP_IMAGE` override that can't be
+built still fails cleanly (we honour the override).
+
+### Lazy FRRDockerManager (import no longer needs Docker)
+`utils/frr_docker.py` ended with `frr_manager = FRRDockerManager()`,
+which called `docker.from_env()` at IMPORT time — so merely importing
+the module (directly or transitively) required a running Docker daemon
+and a ~1 s connect. Replaced with a transparent lazy proxy
+(`_LazyFRRManager`) that instantiates the real manager on first
+attribute access. Import is now side-effect-free; all existing
+`frr_manager.X` call sites are unchanged. Confirmed: `import
+utils.frr_docker` and `import utils.dhcp` now succeed with no Docker
+daemon present (previously raised `DockerException` at import).
+
+### Notes
+- Server-side fixes (utils/dhcp.py + utils/frr_docker.py).
+- Wheel ships as `ostg_trafficgen-0.2.29-py3-none-any.whl`.
+
 ## [0.2.28] - 2026-05-27
 
 Closes the gap that made v0.2.27's DHCP fix a no-op on wheel-only

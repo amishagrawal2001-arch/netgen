@@ -1286,8 +1286,34 @@ class FRRDockerManager:
             logger.error(f"[FRR] Failed to stop FRR container for device {device_id}: {e}")
             return False
 
-# Global instance
-frr_manager = FRRDockerManager()
+# Global instance — lazily created.
+#
+# Previously this was `frr_manager = FRRDockerManager()`, which called
+# `docker.from_env()` at IMPORT time. That made `import utils.frr_docker`
+# require a running Docker daemon (and 1+ second connect) just to load the
+# module — it broke headless test/lint environments and added a hard
+# Docker dependency to anything that transitively imports this file.
+# The lazy proxy defers the Docker connection until the first real method
+# call, so import is side-effect-free. All existing `frr_manager.X` call
+# sites work unchanged.
+class _LazyFRRManager:
+    """Transparent proxy that instantiates the real FRRDockerManager on
+    first attribute access and forwards everything to it thereafter."""
+    __slots__ = ()
+    _real = None
+
+    def _get(self):
+        if _LazyFRRManager._real is None:
+            _LazyFRRManager._real = FRRDockerManager()
+        return _LazyFRRManager._real
+
+    def __getattr__(self, name):
+        # __getattr__ only fires for names not found normally, so this
+        # never recurses on _get / class internals.
+        return getattr(self._get(), name)
+
+
+frr_manager = _LazyFRRManager()
 
 # setup_frr_network() was removed along with setup_network_infrastructure();
 # FRR runs on host networking and needs no docker network/bridge setup.
