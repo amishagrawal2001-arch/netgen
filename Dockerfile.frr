@@ -24,6 +24,8 @@ RUN echo "${ALPINE_MIRROR}/v3.18/main" > /etc/apk/repositories && \
             netcat-openbsd \
             bind-tools \
             openssh-client \
+            dhclient \
+            dnsmasq \
             vim \
             nano \
             less \
@@ -32,7 +34,16 @@ RUN echo "${ALPINE_MIRROR}/v3.18/main" > /etc/apk/repositories && \
         echo "Apk attempt $$i failed, retrying in 15s..."; \
         sleep 15; \
     done && \
-    (test -f /usr/bin/vtysh || test -f /usr/sbin/vtysh) || (echo "FRR install failed after retries" && exit 1)
+    (test -f /usr/bin/vtysh || test -f /usr/sbin/vtysh) || (echo "FRR install failed after retries" && exit 1) && \
+    # DHCP tooling is required by the device DHCP feature: utils/dhcp.py
+    # shells out to `dhclient` (client mode) and `dnsmasq` (server mode)
+    # INSIDE this image (the DHCP container reuses the FRR image). The
+    # original Debian-based Dockerfile bundled isc-dhcp-client + dnsmasq;
+    # the v0.2.19 Alpine rewrite dropped them, silently breaking both
+    # DHCP modes (binaries not found). Fail the build loudly if either
+    # is missing rather than ship a DHCP-broken image.
+    (command -v dhclient >/dev/null && command -v dnsmasq >/dev/null) \
+        || (echo "DHCP tooling (dhclient/dnsmasq) missing after install" && exit 1)
 
 # Create directories and set permissions
 RUN mkdir -p /var/run/frr /etc/frr /var/log/frr && \

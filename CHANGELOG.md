@@ -2,6 +2,62 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.27] - 2026-05-27
+
+Restore DHCP. v0.2.19's Alpine Dockerfile.frr rewrite silently
+dropped the DHCP tooling the old Debian image shipped, breaking
+both DHCP client and server modes on every host built since.
+
+### Symptom
+Device DHCP (client or server mode) failed. `utils/dhcp.py` shells
+out to `dhclient` (client) and `dnsmasq` (server) INSIDE the
+container — and the DHCP container reuses the FRR image
+(`_resolve_dhcp_image()` → `_resolve_frr_image()`). The Alpine
+image only had busybox `udhcpc`; `dhclient` and `dnsmasq` were
+absent, so the exec'd commands errored with "not found".
+
+### Cause
+The original Debian `Dockerfile.frr` installed `isc-dhcp-client`
+and `dnsmasq`. The v0.2.19 Alpine rewrite (which fixed the broken
+apt-get build) carried over FRR + networking tools but not the DHCP
+packages. Nothing failed loudly — the gap only surfaced when a DHCP
+device was applied.
+
+### Fix
+`Dockerfile.frr` (and the `ostg_docker/` copy) now install:
+- `dhclient` (Alpine `dhclient-4.4.3` — ISC DHCP client; the code's
+  IPv6 path already falls back to `dhclient -6` when `dhcp6c` is
+  absent, so IPv6 DHCP works too)
+- `dnsmasq` (Alpine `dnsmasq-2.90` — the DHCP server backend)
+
+A build-time assertion now FAILS the image build if either binary
+is missing after install, so this regression can't silently recur.
+
+### Verification
+Rebuilt `netgen-frr:latest` on svl-hp-ai-srv02:
+`dhclient → /usr/sbin/dhclient`, `dnsmasq → /usr/sbin/dnsmasq`,
+`vtysh → /usr/bin/vtysh` (FRR intact). Build rc=0.
+
+### VRF note
+DHCP client is already VRF-aware — `utils/dhcp.py::_migrate_dhcp_route_to_vrf`
+moves dhclient's learned default route into the device VRF (the same
+per-device VRF used by BGP/OSPF/IS-IS). The DHCP exchange itself is
+L2 broadcast on the device interface, so dnsmasq server mode works
+regardless of VRF placement.
+
+### Operational note
+After upgrading, the FRR image must be rebuilt so new DHCP/FRR
+containers pick up the tooling. The server self-heal
+(`_try_build_frr_image`) rebuilds it automatically on the next
+BGP/OSPF apply when no image is present; to force it, remove the
+`netgen-frr:latest` image (or run the §9-documented
+`docker build -t netgen-frr:latest -f /opt/netgen/Dockerfile.frr
+/opt/netgen`). Already rebuilt on svl-hp-ai-srv02.
+
+### Notes
+- Image/server-side fix — client dialogs unchanged.
+- Wheel ships as `ostg_trafficgen-0.2.27-py3-none-any.whl`.
+
 ## [0.2.26] - 2026-05-27
 
 Fix BGP being configured in the WRONG VRF, which left every BGP
