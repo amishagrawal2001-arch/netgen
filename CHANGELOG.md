@@ -2,6 +2,59 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.23] - 2026-05-27
+
+Fix yet another QThread SIGABRT site — the stats polling
+workers in `statistics_section.py`. Same Python-GC race as
+v0.2.21/v0.2.22, different allocation pattern.
+
+The user's log after v0.2.22 still showed:
+
+    Fetched 8 interfaces from http://svl-hp-ai-srv02:5050 (async)
+    [AUTO-START] Found 1 enabled stream(s) to auto-start
+    QThread: Destroyed while thread is still running
+
+The `[AUTO-START]` log fires inside `_auto_start_streams_from_session`
+which then schedules the actual auto-start via
+`QTimer.singleShot(100, ...)` — so `_post_traffic_async` (v0.2.22's
+target) couldn't be the crash. Process of elimination led to the
+stats polling timer (2 sec interval), which fires near-continuously
+during startup as the UI initializes.
+
+### Real culprit
+`fetch_and_update_statistics()` and `poll_stream_stats()` in
+`traffic_client/statistics_section.py` both do:
+
+    self._stats_worker = StatisticsFetchWorker(...)
+    self._stats_worker.finished.connect(self._on_stats_fetch_finished)
+    self._stats_worker.start()
+
+Every 2 sec the timer fires the next cycle. `self._stats_worker =
+StatisticsFetchWorker(...)` drops the Python ref to the PREVIOUS
+worker. There's an `isRunning()` guard above the assignment that
+returns early if the previous worker is still running — but that
+races: `isRunning()` returns false the moment `run()` exits, while
+Qt's internal QThreadPrivate cleanup is still in flight. In that
+window, Python GC of the wrapper destroys the C++ object → SIGABRT.
+
+### Fix
+`self._stats_worker.setParent(self)` immediately after construction
+(both sites). PyQt5 checks for a Qt parent on wrapper destruction
+and skips the delete if one exists. Also added explicit
+`finished.connect(self._stats_worker.deleteLater)` so Qt cleans
+up the C++ side on the event loop after the thread fully exits.
+
+Same fix as v0.2.21/v0.2.22 just on a different allocation
+shape (assigned to `self.X`, replaced on each timer cycle, vs
+local variable that goes out of scope on function return).
+
+### Notes
+- The `[AUTO-START]` log is a red herring — it just happens to fall
+  between two stats-poll cycles. The actual crash is the OLD
+  stats worker getting GC'd when a new one is assigned.
+- Client-only fix — wheel server code unchanged from v0.2.19.
+- Wheel ships as `ostg_trafficgen-0.2.23-py3-none-any.whl`.
+
 ## [0.2.22] - 2026-05-27
 
 Extends v0.2.21's Qt-parent fix to the three SYNC-wait QThread

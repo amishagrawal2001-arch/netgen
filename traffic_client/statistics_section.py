@@ -666,19 +666,33 @@ class TrafficGenClientStatisticsSection():
             return
         
         self._stats_worker = StatisticsFetchWorker(
-            online_servers, 
+            online_servers,
             fetch_type="both",
             connection_manager=getattr(self, 'connection_manager', None)
         )
+        # CRITICAL: Qt-parent ownership. Without this, the next polling
+        # cycle's `self._stats_worker = StatisticsFetchWorker(...)` drops
+        # the only Python ref to the PREVIOUS worker. If that previous
+        # worker's run() just returned but Qt's internal post-run cleanup
+        # is still in flight, Python's GC destroys the C++ QThread and
+        # the destructor sees isRunning() still true → "QThread:
+        # Destroyed while thread is still running" → SIGABRT. The
+        # isRunning() check above guards the common case but races on
+        # the run-just-returned window. setParent moves ownership to Qt
+        # entirely; Python GC of the wrapper is a no-op and Qt's
+        # deleteLater (via finished→_on_stats_fetch_finished) handles
+        # destruction cleanly on the event loop.
+        self._stats_worker.setParent(self)
         self._stats_worker.interfaces_fetched.connect(self._on_interfaces_fetched)
         self._stats_worker.stream_stats_fetched.connect(self._on_stream_stats_fetched)
         self._stats_worker.fetch_error.connect(self._on_fetch_error)
         self._stats_worker.finished.connect(self._on_stats_fetch_finished)
-        
+        self._stats_worker.finished.connect(self._stats_worker.deleteLater)
+
         # Reset pending data
         self._pending_stats_data = {}
         self._pending_stream_stats = []
-        
+
         self._stats_worker.start()
     
     def reset_statistics_table_structure(self):
@@ -1186,13 +1200,18 @@ class TrafficGenClientStatisticsSection():
             fetch_type="streams",
             connection_manager=getattr(self, 'connection_manager', None)
         )
+        # Qt-parent ownership prevents the Python-GC race when the next
+        # poll cycle overwrites self._poll_worker. See _stats_worker
+        # site above for full rationale.
+        self._poll_worker.setParent(self)
         self._poll_worker.stream_stats_fetched.connect(self._on_poll_stream_stats_fetched)
         self._poll_worker.fetch_error.connect(self._on_poll_fetch_error)
         self._poll_worker.finished.connect(self._on_poll_finished)
-        
+        self._poll_worker.finished.connect(self._poll_worker.deleteLater)
+
         # Reset pending data
         self._pending_poll_stream_stats = []
-        
+
         self._poll_worker.start()
     
     def _on_poll_stream_stats_fetched(self, server, stream_stats):
