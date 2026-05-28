@@ -1182,9 +1182,35 @@ def configure_bgp_for_device(device_id: str, bgp_config: Dict, ipv4: str = None,
         except Exception as e:
             logging.debug(f"[BGP] Could not check VXLAN config: {e}")
         
+        # Build the VRF-aware `router bgp` clause. The device's interface
+        # (vlanN / bare NIC) is moved into a per-device VRF by
+        # FRRDockerManager.start_frr_container so multiple devices on the
+        # same NIC don't collide on protocol sockets. ALL of this device's
+        # BGP config (router-id, networks, neighbors, address-families)
+        # MUST live under `router bgp <asn> vrf <name>` — otherwise it
+        # lands in the default VRF, where the device's interface IP isn't
+        # present, so `update-source` can't bind and the session sticks in
+        # Active/Connect forever. (Live bug on svl-hp-ai-srv02 v0.2.19:
+        # the full config went to the default VRF while the interface sat
+        # in vrf-<id>, leaving two half-built BGP instances, neither able
+        # to peer.) Mirror the detection in _bgp_neighbor_context().
+        router_clause = f"router bgp {local_as}"
+        try:
+            vrf_name = frr_manager.vrf_name_for_device(device_id)
+            if vrf_name:
+                _chk = subprocess.run(
+                    ["ip", "-o", "link", "show", vrf_name],
+                    capture_output=True, text=True, timeout=2,
+                )
+                if _chk.returncode == 0 and (_chk.stdout or "").strip():
+                    router_clause = f"router bgp {local_as} vrf {vrf_name}"
+                    logging.info(f"[BGP] Configuring under device VRF: {router_clause}")
+        except Exception as _vrf_exc:
+            logging.warning(f"[BGP] VRF detection failed, using default VRF: {_vrf_exc}")
+
         vtysh_commands = [
             "configure terminal",
-            f"router bgp {local_as}",
+            router_clause,
             f"bgp router-id {router_id}",
             "bgp log-neighbor-changes",
             "bgp graceful-restart",

@@ -2,6 +2,62 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.26] - 2026-05-27
+
+Fix BGP being configured in the WRONG VRF, which left every BGP
+session stuck and never establishing. Found live on svl-hp-ai-srv02
+with a VLAN-100 device (vlan100@ens6f1np1 in vrf-3e811e65c12).
+
+### Symptom
+`show ip bgp summary` showed the neighbor stuck in `Active`/`Connect`,
+`Up/Down: never`. The running-config had TWO half-built BGP
+instances for the same ASN:
+
+    router bgp 65000                      ← default VRF: full config
+      neighbor 10.x.x.1 ...                 (networks, next-hop-self)
+      neighbor 10.x.x.1 update-source 10.x.x.39
+      address-family ipv4 unicast
+        network 10.x.x.0/24
+    router bgp 65000 vrf vrf-3e811e65c12  ← device VRF: stub only
+      neighbor 10.x.x.1 ...                 (no address-family, no nets)
+
+The device's `vlan100` interface (and its IP `10.x.x.39`) lives in
+`vrf-3e811e65c12`, so the default-VRF instance can't bind its
+`update-source` → never connects. The device-VRF instance can reach
+the peer but has no address-family activated → never advertises.
+
+### Cause
+`utils/bgp.py::configure_bgp_for_device` — the function that emits
+the *full* BGP setup (router-id, neighbors, networks, address
+families) — hard-coded `router bgp {asn}` with no VRF clause, so it
+all landed in the default VRF. A separate neighbor-tweak path
+(`_bgp_neighbor_context`) WAS VRF-aware, which is how the stub ended
+up in the device VRF — hence the split.
+
+OSPF and IS-IS were already correct (every `router ospf` /
+`router isis` block goes through `_ospf_vrf_suffix` /
+`_isis_vrf_suffix`). BGP was the lone configurator missing it.
+
+### Fix
+`configure_bgp_for_device` now builds the same VRF-aware
+`router bgp {asn} vrf {vrf_name}` clause (when the device's VRF link
+exists) and emits the entire config under it — matching OSPF/IS-IS
+and `_bgp_neighbor_context`. All router-id / network / neighbor /
+address-family commands inherit the correct VRF.
+
+### Operational note
+After upgrading, **remove and re-add** the affected device (or
+restart its FRR container) so the stale default-VRF `router bgp`
+block from the old code is cleared — a fresh container starts with
+clean config and the new code writes only the device-VRF instance.
+Also verify the BGP peer IP is a real, configured neighbor: a
+session to a management gateway that isn't running BGP will still
+stay down regardless of VRF placement.
+
+### Notes
+- Server-side fix (utils/bgp.py) — client dialogs unchanged.
+- Wheel ships as `ostg_trafficgen-0.2.26-py3-none-any.whl`.
+
 ## [0.2.25] - 2026-05-27
 
 Follow-up to v0.2.24: the keepalive registry's *trim* introduced a
