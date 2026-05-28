@@ -2,6 +2,45 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.31] - 2026-05-28
+
+Fix the gateway/IP ARP-status colors not updating on a passive view
+(e.g. a gateway whose ARP failed stayed in normal font instead of
+turning orange).
+
+### Diagnosis (server was right; client wasn't refreshing)
+Traced end-to-end on svl-hp-ai-srv02: `/api/device/arp/<id>` correctly
+reported `arp_gateway_resolved: false` (VRF-aware ping, 100% loss) and
+the DB stored `0`. The client's coloring logic
+(`set_status_icon_with_individual_ips`) was also correct. The gap: the
+chain that applies it — `status_timer → poll_device_status →
+_refresh_device_table_from_database → set_status_icon_with_individual_ips`
+— never ran, because `status_timer.start()` was commented out
+("DISABLED to prevent QThread crashes"). So colors only updated on a
+manual refresh / right after an operation, never periodically. A
+Running device whose gateway ARP later failed kept stale normal-font
+colors.
+
+### Fix
+- `_refresh_device_table_from_database` is now **async**: the per-device
+  DB fetch runs in a background QThread (`_DeviceStatusFetchWorker`,
+  pinned via the global keepalive), and all widget updates happen on the
+  main thread in the new `_apply_device_status_row` slot. No UI blocking.
+- Re-enabled `status_timer.start(30000)`. The crashes that justified
+  disabling it were the QThread-destruction race fixed in v0.2.24/25
+  (global keepalive), and the poll's HTTP is no longer on the UI thread —
+  so it's safe again. `poll_device_status` self-adjusts the cadence
+  (30 s active / 60 s idle) and only refreshes Running/Starting rows.
+
+### Result
+ARP/gateway cells now refresh on a passive view: a gateway goes orange
+when its ARP fails and back to normal when it resolves — without a
+manual refresh.
+
+### Notes
+- Client-only fix (widgets/devices_tab.py).
+- Wheel ships as `ostg_trafficgen-0.2.31-py3-none-any.whl`.
+
 ## [0.2.30] - 2026-05-27
 
 Audit + fix to ensure a wheel install/upgrade actually activates

@@ -1512,11 +1512,18 @@ class DevicesTab(QWidget):
         self.arp_cache = StatusCache(ttl_seconds=5)
         self.bgp_cache = StatusCache(ttl_seconds=10)
 
-        # polling - DISABLED to prevent QThread crashes
-        # ARP checks will be manual only via refresh button
+        # Periodic device-status / ARP-color poll. This was historically
+        # DISABLED "to prevent QThread crashes" — but those crashes were
+        # the QThread-destruction race fixed in v0.2.24/25 (global
+        # keepalive) and the poll's HTTP is now off-thread + non-blocking
+        # (_refresh_device_table_from_database runs async). Re-enabled so
+        # ARP/gateway cells refresh on a passive view (e.g. a gateway
+        # going orange when its ARP fails, and back when it resolves)
+        # instead of only updating on a manual refresh. poll_device_status
+        # self-adjusts the interval (30s active / 60s idle).
         self.status_timer = QTimer()
         self.status_timer.timeout.connect(self.poll_device_status)
-        # self.status_timer.start(30000)  # DISABLED - no automatic polling
+        self.status_timer.start(30000)  # async + QThread-safe (keepalive)
 
         # Dedicated timer/flag for lightweight periodic status refreshes triggered after ops
         self.device_status_timer = QTimer()
@@ -3270,95 +3277,137 @@ class DevicesTab(QWidget):
             delattr(self, '_current_operation_type')
     
     def _refresh_device_table_from_database(self, selected_rows):
-        """Refresh device table status from database for selected rows."""
+        """Refresh device table status + ARP colors for the given rows.
+
+        ASYNC: the per-device DB fetch (HTTP) runs in a background QThread
+        so the UI never blocks. This is what let us re-enable the periodic
+        status poll (status_timer) — it was disabled to dodge the
+        QThread-destruction crashes now fixed by the global keepalive
+        (utils.qthread_keepalive). Widget updates happen only on the main
+        thread, in _apply_device_status_row, via the worker's signal.
+        """
         try:
             server_url = self.get_server_url(silent=True)
             if not server_url:
                 return
-            
+
+            # Build the (row, device_id) job list on the MAIN thread —
+            # this reads widgets/all_devices, which must not be touched
+            # off-thread. The worker only does HTTP + emits plain data.
+            jobs = []
             for row in selected_rows:
                 try:
-                    device_name = self.devices_table.item(row, self.COL["Device Name"]).text()
-                    
-                    # Find device in all_devices data structure
-                    device_info = None
+                    name_item = self.devices_table.item(row, self.COL["Device Name"])
+                    if not name_item:
+                        continue
+                    device_name = name_item.text()
+                    device_id = None
                     for iface, devices in self.main_window.all_devices.items():
                         for device in devices:
                             if device.get("Device Name") == device_name:
-                                device_info = device
+                                device_id = device.get("device_id")
                                 break
-                        if device_info:
+                        if device_id:
                             break
-                    
-                    if device_info and device_info.get("device_id"):
-                        device_id = device_info.get("device_id")
-                        
-                        # Get device data from database
-                        response = requests.get(f"{server_url}/api/device/database/devices/{device_id}", timeout=3)
-                        if response.status_code == 200:
-                            device_data = response.json()
-                            
-                            # Update device status
-                            device_status = device_data.get('status', 'Unknown')
-                            if device_status != device_info.get("Status", ""):
-                                device_info["Status"] = device_status
-                                # Update status column in table
-                                status_item = self.devices_table.item(row, self.COL["Status"])
-                                if status_item:
-                                    status_item.setText(device_status)
-                            
-                            # Update ARP status and colors
-                            arp_ipv4_raw = device_data.get('arp_ipv4_resolved', 0)
-                            arp_ipv6_raw = device_data.get('arp_ipv6_resolved', 0)
-                            arp_gateway_raw = device_data.get('arp_gateway_resolved', 0)
-                            
-                            logger.info(f"{device_name} - Raw ARP values: IPv4={arp_ipv4_raw}, IPv6={arp_ipv6_raw}, Gateway={arp_gateway_raw}")
-                            
-                            arp_results = {
-                                "ipv4_resolved": bool(arp_ipv4_raw),
-                                "ipv6_resolved": bool(arp_ipv6_raw),
-                                "gateway_resolved": bool(arp_gateway_raw),
-                                "ipv4_status": "Resolved" if arp_ipv4_raw else "Failed",
-                                "ipv6_status": "Resolved" if arp_ipv6_raw else "Failed",
-                                "gateway_status": "Resolved" if arp_gateway_raw else "Failed",
-                                "overall_status": device_data.get('arp_status', 'Unknown')
-                            }
-                            
-                            logger.info(f"{device_name} - Processed ARP values: IPv4={arp_results['ipv4_resolved']}, IPv6={arp_results['ipv6_resolved']}, Gateway={arp_results['gateway_resolved']}")
-                            
-                            # Debug: Print device and ARP status for troubleshooting
-                            logger.info(f"{device_name} Status: {device_status}, ARP: IPv4={arp_results['ipv4_resolved']}, IPv6={arp_results['ipv6_resolved']}, Gateway={arp_results['gateway_resolved']}")
-                            
-                            # Update IP colors based on ARP status
-                            self.set_status_icon_with_individual_ips(row, arp_results)
-                            
-                            # Update overall status icon based on device status first, then ARP status
-                            if device_status == "Running":
-                                # Device is running - check ARP status
-                                # Only require ARP resolution for configured addresses (same logic as _check_individual_arp_resolution)
-                                ipv6_value = (device_data.get("ipv6_address") or device_data.get("IPv6") or "").strip()
-                                ipv6_configured = bool(ipv6_value)
-                                gateway_value = (device_data.get("ipv4_gateway") or device_data.get("IPv4 Gateway") or "").strip()
-                                gateway_configured = bool(gateway_value)
-                                
-                                # Determine overall ARP status - require only the components that exist
-                                overall_resolved = arp_results["ipv4_resolved"]
-                                if ipv6_configured:
-                                    overall_resolved = overall_resolved and arp_results["ipv6_resolved"]
-                                if gateway_configured:
-                                    overall_resolved = overall_resolved and arp_results["gateway_resolved"]
-                                
-                                self.set_status_icon(row, resolved=overall_resolved, status_text=arp_results["overall_status"], device_status=device_status)
-                            else:
-                                # Device is stopped or unknown status - pass device status to set_status_icon
-                                self.set_status_icon(row, resolved=False, status_text=arp_results["overall_status"], device_status=device_status)
-                            
+                    if device_id:
+                        jobs.append((row, device_id))
                 except Exception as e:
-                    logger.error(f"Error refreshing row {row}: {e}")
-                    
+                    logger.debug(f"[DEVICE POLL] job build error row {row}: {e}")
+            if not jobs:
+                return
+
+            from PyQt5.QtCore import QThread, pyqtSignal
+
+            class _DeviceStatusFetchWorker(QThread):
+                # (row, device_data) — emitted per device once fetched.
+                row_data = pyqtSignal(int, dict)
+
+                def __init__(self, url, jobs):
+                    super().__init__()
+                    self._url = url
+                    self._jobs = jobs
+
+                def run(self):
+                    import requests as _rq
+                    for _row, _dev_id in self._jobs:
+                        try:
+                            r = _rq.get(
+                                f"{self._url}/api/device/database/devices/{_dev_id}",
+                                timeout=3,
+                            )
+                            if r.status_code == 200:
+                                self.row_data.emit(_row, r.json() or {})
+                        except Exception:
+                            # Unreachable/slow device — skip; next poll retries.
+                            pass
+
+            worker = _DeviceStatusFetchWorker(server_url, jobs)
+            # Pin a strong ref so the QThread can't be GC'd mid-run
+            # (the global QThread.start hook also covers this, but be
+            # explicit so the Devices tab is safe standalone too).
+            try:
+                from utils.qthread_keepalive import keep
+                keep(worker)
+            except Exception:
+                pass
+            worker.row_data.connect(self._apply_device_status_row)
+            worker.start()
         except Exception as e:
             logger.error(f"Error refreshing device table: {e}")
-    
+
+    def _apply_device_status_row(self, row, device_data):
+        """Main-thread slot: apply status + ARP colors for one device row
+        from freshly-fetched DB data. Mirrors the old synchronous loop
+        body of _refresh_device_table_from_database (now async)."""
+        try:
+            name_item = self.devices_table.item(row, self.COL["Device Name"])
+            device_name = name_item.text() if name_item else f"row{row}"
+
+            # Update device status text
+            device_status = device_data.get('status', 'Unknown')
+            status_item = self.devices_table.item(row, self.COL["Status"])
+            if status_item and status_item.text() != device_status:
+                status_item.setText(device_status)
+            # Keep all_devices in sync so other paths see the fresh status.
+            try:
+                info = self.get_device_info_by_name(device_name)
+                if info is not None:
+                    info["Status"] = device_status
+            except Exception:
+                pass
+
+            # ARP status → individual IP/gateway cell colors
+            arp_ipv4_raw = device_data.get('arp_ipv4_resolved', 0)
+            arp_ipv6_raw = device_data.get('arp_ipv6_resolved', 0)
+            arp_gateway_raw = device_data.get('arp_gateway_resolved', 0)
+            arp_results = {
+                "ipv4_resolved": bool(arp_ipv4_raw),
+                "ipv6_resolved": bool(arp_ipv6_raw),
+                "gateway_resolved": bool(arp_gateway_raw),
+                "ipv4_status": "Resolved" if arp_ipv4_raw else "Failed",
+                "ipv6_status": "Resolved" if arp_ipv6_raw else "Failed",
+                "gateway_status": "Resolved" if arp_gateway_raw else "Failed",
+                "overall_status": device_data.get('arp_status', 'Unknown'),
+            }
+            self.set_status_icon_with_individual_ips(row, arp_results)
+
+            # Overall status icon: require only the configured families.
+            if device_status == "Running":
+                ipv6_configured = bool((device_data.get("ipv6_address") or device_data.get("IPv6") or "").strip())
+                gateway_configured = bool((device_data.get("ipv4_gateway") or device_data.get("IPv4 Gateway") or "").strip())
+                overall_resolved = arp_results["ipv4_resolved"]
+                if ipv6_configured:
+                    overall_resolved = overall_resolved and arp_results["ipv6_resolved"]
+                if gateway_configured:
+                    overall_resolved = overall_resolved and arp_results["gateway_resolved"]
+                self.set_status_icon(row, resolved=overall_resolved,
+                                     status_text=arp_results["overall_status"], device_status=device_status)
+            else:
+                self.set_status_icon(row, resolved=False,
+                                     status_text=arp_results["overall_status"], device_status=device_status)
+        except Exception as e:
+            logger.error(f"[DEVICE POLL] apply row {row} failed: {e}")
+
     def _on_arp_operation_progress(self, device_name, status_message):
         """Handle progress updates from ARP operation worker."""
         logger.info(f"{device_name}: {status_message}")
