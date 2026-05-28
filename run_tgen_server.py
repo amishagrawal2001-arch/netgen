@@ -16211,6 +16211,33 @@ def main(argv=None):
     except Exception as e:
         logging.warning(f"[STARTUP FRR SELFHEAL] Unexpected error: {e}")
 
+    # If a wheel upgrade changed Dockerfile.frr (e.g. v0.2.27 adding
+    # dhclient/dnsmasq for DHCP), the running netgen-frr image is stale —
+    # the lazy auto-build only fires when NO image exists, so a §9a
+    # upgrade would silently keep the old image and the change (DHCP
+    # tooling, etc.) never takes effect. Rebuild it when the bundled
+    # Dockerfile SHA differs from the image's label. CRITICAL: do this in
+    # a daemon thread — the build blocks 2-3 min and must NOT delay Flask
+    # binding its port (the v0.2.18 startup-hang lesson). New FRR/DHCP
+    # containers created after the rebuild completes pick up the change;
+    # already-running containers are unaffected until recreated.
+    try:
+        import threading as _threading
+
+        def _frr_image_refresh():
+            try:
+                from utils.frr_docker import maybe_rebuild_frr_image
+                result = maybe_rebuild_frr_image()
+                logging.info(f"[STARTUP FRR REBUILD] stale-check result: {result}")
+            except Exception as e:
+                logging.warning(f"[STARTUP FRR REBUILD] failed: {e}")
+
+        _threading.Thread(
+            target=_frr_image_refresh, name="frr-image-refresh", daemon=True
+        ).start()
+    except Exception as e:
+        logging.warning(f"[STARTUP FRR REBUILD] could not start refresh thread: {e}")
+
     # Cleanup stale streams on startup (after reboot, no streams are actually running)
     try:
         running_streams = stream_db.get_all_streams(status="Running")

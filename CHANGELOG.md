@@ -2,6 +2,63 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.28] - 2026-05-27
+
+Closes the gap that made v0.2.27's DHCP fix a no-op on wheel-only
+(§9a) upgrades: the FRR image is now rebuilt automatically when the
+bundled `Dockerfile.frr` changes.
+
+### The gap
+The auto-build (`_try_build_frr_image`) only fires when NO FRR image
+exists. A host upgrading from an older wheel already has a
+`netgen-frr:latest`, so a Dockerfile change (e.g. v0.2.27 adding
+`dhclient`/`dnsmasq`) never took effect — DHCP stayed broken until
+the operator manually removed/rebuilt the image. Found during a
+post-release bug/gap review.
+
+### Fix
+- `_build_frr_image_now()` (extracted from `_try_build_frr_image`)
+  now stamps the image with a `netgen.dockerfile_sha` LABEL holding
+  the SHA-256 of the Dockerfile it built from.
+- New `maybe_rebuild_frr_image()` compares the wheel's current
+  Dockerfile SHA against that label and rebuilds when they differ.
+- `run_tgen_server.py` `main()` spawns it in a **daemon thread** at
+  startup (right after the FRR asset self-heal). Non-blocking — the
+  2–3 min build runs in the background while Flask binds its port
+  immediately (the v0.2.18 startup-hang lesson, respected). New
+  FRR/DHCP containers created after the rebuild completes pick up the
+  change; already-running containers keep going until recreated.
+- Behaviour matrix: image missing → left to the lazy first-apply
+  build (no 2-3 min penalty at every startup on FRR-less hosts);
+  image present + SHA matches → no-op; image present + SHA differs →
+  background rebuild.
+
+### Verification
+On svl-hp-ai-srv02: the running image had no label → stale-check
+detected the mismatch → rebuilt with the SHA label → a second check
+reported "current" (no redundant rebuild). DHCP tooling
+(`dhclient`/`dnsmasq`) confirmed present in the rebuilt image. The
+server's image is now labelled, so it won't rebuild again until the
+Dockerfile actually changes.
+
+### Review notes (no code change)
+- BGP VRF fix (v0.2.26) confirmed complete for the live path — the
+  other `router bgp` emitters (`start_bgp`, `build_bgp_cmd`,
+  `cleanup_device_routes`, `remove_bgp_config`, …) all early-return
+  in docker-FRR mode, so none write default-VRF config.
+- DHCP server (dnsmasq) is VRF-compatible: it binds via
+  `interface=<dev>` + `bind-interfaces` (SO_BINDTODEVICE), and the
+  DHCP container is `network_mode=host`, so it sees the VLAN
+  subinterface regardless of VRF membership.
+- Minor known gap (not fixed, documented): a DHCP-only deployment
+  that never built an FRR image will see `_ensure_dhcp_container`
+  error "build the image first" rather than auto-building. Normal
+  installs and the startup rebuild cover the common cases.
+
+### Notes
+- Server-side fix (utils/frr_docker.py + run_tgen_server.py).
+- Wheel ships as `ostg_trafficgen-0.2.28-py3-none-any.whl`.
+
 ## [0.2.27] - 2026-05-27
 
 Restore DHCP. v0.2.19's Alpine Dockerfile.frr rewrite silently

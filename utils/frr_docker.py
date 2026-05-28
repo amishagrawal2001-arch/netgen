@@ -114,7 +114,40 @@ def _try_build_frr_image(client):
     if _FRR_BUILD_ATTEMPTED:
         return None
     _FRR_BUILD_ATTEMPTED = True
+    return _build_frr_image_now(client, reason="no FRR image found locally")
 
+
+# Docker image label that records the SHA-256 of the Dockerfile.frr the
+# image was built from. Lets the startup self-heal detect a wheel upgrade
+# that changed the Dockerfile (e.g. v0.2.27 adding dhclient/dnsmasq) and
+# rebuild the image, instead of silently keeping the stale one.
+_FRR_DOCKERFILE_LABEL = "netgen.dockerfile_sha"
+
+
+def _dockerfile_sha(path):
+    """SHA-256 of a Dockerfile's bytes, or None if unreadable."""
+    import hashlib
+    try:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+    except Exception:
+        return None
+
+
+def _build_frr_image_now(client, reason=""):
+    """Deploy the wheel's FRR assets to /opt/netgen and build
+    netgen-frr:latest (also tagged ostg-frr:latest). Stamps the image
+    with a label recording the Dockerfile's SHA so a later wheel upgrade
+    can detect a changed Dockerfile and rebuild.
+
+    Unguarded — callers decide when to invoke (lazy one-shot via
+    _try_build_frr_image, or startup stale-check via
+    maybe_rebuild_frr_image). Returns the tag on success, None on failure.
+
+    Uses network_mode='host' so apk inside the build container inherits
+    the host's resolver — docker's default bridge DNS can't reach Alpine
+    CDN mirrors on corporate-DNS hosts (confirmed on svl-hp-ai-srv02).
+    """
     if not _deploy_frr_assets_from_wheel(_FRR_BUILD_DIR):
         return None
 
@@ -124,16 +157,17 @@ def _try_build_frr_image(client):
         return None
 
     target_tag = "netgen-frr:latest"
+    sha = _dockerfile_sha(dockerfile_path)
     logger.info(
-        f"[FRR BUILD] No FRR image found locally — building {target_tag} from "
-        f"{dockerfile_path} with --network=host (may take 2–3 minutes)..."
+        f"[FRR BUILD] Building {target_tag} from {dockerfile_path} "
+        f"with --network=host ({reason}; may take 2–3 minutes)..."
     )
     try:
-        # `rm=True` cleans up intermediate containers; `forcerm=True`
-        # cleans them up even on failure so a partial build doesn't
-        # leak <none>:<none> layers across retries. `network_mode='host'`
-        # is the SDK equivalent of `docker build --network=host`.
-        image, _logs = client.images.build(
+        # `rm=True`/`forcerm=True` clean up intermediate containers even on
+        # failure. `network_mode='host'` == `docker build --network=host`.
+        # `labels` stamps the Dockerfile SHA so maybe_rebuild_frr_image()
+        # can tell when a wheel upgrade changed the Dockerfile.
+        build_kwargs = dict(
             path=_FRR_BUILD_DIR,
             dockerfile="Dockerfile.frr",
             tag=target_tag,
@@ -142,8 +176,9 @@ def _try_build_frr_image(client):
             pull=False,
             network_mode="host",
         )
-        # Tag as ostg-frr:latest too so any legacy caller that hardcodes
-        # the old name still finds an image.
+        if sha:
+            build_kwargs["labels"] = {_FRR_DOCKERFILE_LABEL: sha}
+        image, _logs = client.images.build(**build_kwargs)
         try:
             image.tag("ostg-frr", tag="latest")
         except Exception as e:
@@ -151,9 +186,6 @@ def _try_build_frr_image(client):
         logger.info(f"[FRR BUILD] Built {target_tag} successfully (id={image.short_id})")
         return target_tag
     except docker.errors.BuildError as e:
-        # Stream the last few build log lines so the operator can see
-        # WHY the build failed (apk mirror error, network blip, etc.)
-        # without having to SSH in and re-run by hand.
         try:
             tail = []
             for chunk in e.build_log:
@@ -172,6 +204,62 @@ def _try_build_frr_image(client):
     except Exception as e:
         logger.error(f"[FRR BUILD] Unexpected error during build: {e}")
         return None
+
+
+def maybe_rebuild_frr_image(client=None):
+    """Startup self-heal for the 'image exists but is STALE' case.
+
+    The lazy ``_try_build_frr_image`` only builds when NO FRR image
+    exists. A §9a wheel-only upgrade that changes Dockerfile.frr (e.g.
+    v0.2.27 adding dhclient/dnsmasq for DHCP) leaves the OLD image in
+    place, so the change never takes effect. This function compares the
+    wheel's current Dockerfile SHA against the label baked into the
+    running image and rebuilds if they differ.
+
+    MUST be called off the main/Flask thread (it blocks 2–3 min on the
+    build). run_tgen_server spawns it in a daemon thread at startup, so
+    Flask binds its port immediately (the v0.2.18 startup-hang lesson).
+
+    Returns: "rebuilt" | "current" | "missing" | "skipped" | "failed".
+    """
+    if client is None:
+        try:
+            client = docker.from_env()
+        except Exception as e:
+            logger.warning(f"[FRR REBUILD] Docker unavailable: {e}")
+            return "skipped"
+
+    # Make sure the wheel's Dockerfile is on disk before hashing it.
+    _deploy_frr_assets_from_wheel(_FRR_BUILD_DIR)
+    dockerfile_path = os.path.join(_FRR_BUILD_DIR, "Dockerfile.frr")
+    want_sha = _dockerfile_sha(dockerfile_path)
+    if not want_sha:
+        logger.debug("[FRR REBUILD] No Dockerfile to hash; skipping stale-check")
+        return "skipped"
+
+    try:
+        image = client.images.get("netgen-frr:latest")
+    except Exception:
+        # No image at all — leave it to the lazy build on first apply
+        # (don't pay a 2-3 min build at every startup on hosts that
+        # never use FRR/DHCP).
+        logger.debug("[FRR REBUILD] netgen-frr:latest absent; lazy build will handle it")
+        return "missing"
+
+    have_sha = (image.labels or {}).get(_FRR_DOCKERFILE_LABEL)
+    if have_sha == want_sha:
+        logger.debug("[FRR REBUILD] FRR image matches current Dockerfile; no rebuild")
+        return "current"
+
+    logger.info(
+        f"[FRR REBUILD] Dockerfile.frr changed since the running image was built "
+        f"(image label={have_sha or 'none'}, wheel={want_sha[:12]}…) — rebuilding "
+        f"netgen-frr:latest in the background. New FRR/DHCP containers will pick "
+        f"up the change; existing containers keep running until recreated."
+    )
+    # Bypass the lazy one-shot guard — this is the explicit stale-rebuild.
+    tag = _build_frr_image_now(client, reason="Dockerfile.frr changed after wheel upgrade")
+    return "rebuilt" if tag else "failed"
 
 
 def _resolve_frr_image(client=None):
