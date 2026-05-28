@@ -164,15 +164,22 @@ class TrafficGenClientStreamLogic:
         url = f"{server_url}/api/traffic/{action}"
         loop = QEventLoop()
         worker = _TrafficPostWorker(url, payload, timeout)
+        # CRITICAL: setParent(self) transfers C++ ownership to Qt. The
+        # previous pattern (wait() + deleteLater() + return) raced with
+        # Python's GC of the local `worker` reference when the function
+        # returned: PyQt5's wrapper saw no Qt parent → ran the C++
+        # destructor immediately, and the C++ QThread destructor saw
+        # isRunning() still true (Qt's post-run cleanup still in flight)
+        # → "QThread: Destroyed while thread is still running" → SIGABRT.
+        # Reproduced live on Python 3.14 + PyQt5 during stream auto-start.
+        # With a Qt parent, Python GC of the wrapper is a no-op for the
+        # C++ object; deleteLater handles destruction cleanly on the
+        # event loop after wait() returns.
+        worker.setParent(self)
         worker.finished.connect(loop.quit)
         worker.start()
         loop.exec_()
         worker.wait()  # ensure thread is fully done before reading attrs
-        # Prevent the slow QThread/socket-handle creep flagged in the
-        # audit. After wait() returns the thread is dead, so deleteLater
-        # is safe and lets Qt's parent/child cleanup release the OS
-        # thread + socket handles immediately rather than waiting for
-        # Python GC to collect the local reference.
         worker.deleteLater()
         if worker.error is not None:
             raise worker.error
@@ -192,6 +199,11 @@ class TrafficGenClientStreamLogic:
         """
         loop = QEventLoop()
         worker = _HttpGetWorker(url, timeout)
+        # Qt-parent ownership prevents the Python-GC-vs-Qt-destructor
+        # race that triggers "QThread: Destroyed while thread is still
+        # running" SIGABRT. See _post_traffic_async for the full
+        # rationale.
+        worker.setParent(self)
         worker.finished.connect(loop.quit)
         worker.start()
         loop.exec_()
@@ -1835,6 +1847,9 @@ class TrafficGenClientStreamLogic:
         upload_url = f"{server_url}/api/pcap/upload"
         loop = QEventLoop()
         worker = _PcapUploadWorker(upload_url, local_path, timeout)
+        # Qt-parent ownership prevents the Python-GC-vs-Qt-destructor
+        # race — see _post_traffic_async for full rationale.
+        worker.setParent(self)
         worker.finished.connect(loop.quit)
         worker.start()
         loop.exec_()

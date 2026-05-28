@@ -2,6 +2,62 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.22] - 2026-05-27
+
+Extends v0.2.21's Qt-parent fix to the three SYNC-wait QThread
+sites in `stream_logic.py`. Same SIGABRT, different code path:
+
+    Fetched 8 interfaces from http://svl-hp-ai-srv02:5050 (async)
+    [AUTO-START] Found 1 enabled stream(s) to auto-start
+    QThread: Destroyed while thread is still running
+    zsh: abort      python3 run_tgen_client.py
+
+v0.2.21 fixed it for the async-fetch path (interface-fetch worker
+now exits cleanly — note "Fetched 8 interfaces" now prints
+BEFORE "[AUTO-START]"). The crash just moved to the stream
+auto-start path that runs ~100ms later via
+`_do_auto_start_streams` → `start_all_streams` →
+`_post_traffic_async`.
+
+### Why these slipped through v0.2.21
+v0.2.21 only audited the four async-fetch sites that used the
+`finished.connect(cleanup)` pattern. The sync-wait sites in
+`stream_logic.py` look superficially safer because they call
+`worker.wait()` (which IS instant after `run()` returns) and
+THEN `worker.deleteLater()` — but `deleteLater()` only schedules
+destruction on the event loop. The function returns before the
+event loop processes that delete, the local `worker` falls out
+of scope, Python destroys the C++ object, QThread destructor
+sees isRunning() still true (Qt internal cleanup mid-flight),
+SIGABRT. Exact same race as v0.2.21, just on a different
+allocation pattern.
+
+### Fix
+`worker.setParent(self)` added before `worker.start()` in all
+three sites:
+  - `_post_traffic_async` (line ~166) — used by Start/Stop streams
+    AND by stream auto-start on session load
+  - `_get_async` (line ~194) — used by Edit Stream / Add Stream
+    dialogs to fetch RX ports
+  - `_pcap_upload_async` (line ~1837) — used by PCAP-mode streams
+    to upload .pcap to the server before starting
+
+With a Qt parent, the Python wrapper's GC is a no-op for the
+C++ object; `deleteLater()` handles destruction cleanly on the
+event loop after `wait()` returns.
+
+### Notes
+- Comment at line 170 in v0.2.21 explicitly claimed the
+  wait()+deleteLater pattern was safe — "After wait() returns
+  the thread is dead, so deleteLater is safe and lets Qt's
+  parent/child cleanup release the OS thread + socket handles
+  immediately rather than waiting for Python GC to collect the
+  local reference." That assumption holds on PyQt5 + Python
+  ≤3.13; Python 3.14's GC behavior is stricter and exposed the
+  race. Comment now corrected.
+- Client-only fix — wheel server code unchanged from v0.2.19.
+- Wheel ships as `ostg_trafficgen-0.2.22-py3-none-any.whl`.
+
 ## [0.2.21] - 2026-05-27
 
 Real fix for the QThread SIGABRT on client startup — v0.2.20's
