@@ -136,33 +136,51 @@ def install():
 
 
 def _trim():
-    """Drop + deleteLater workers that finished > _TRIM_AGE_S ago."""
+    """Release this registry's strong ref to workers that finished
+    > _TRIM_AGE_S ago.
+
+    IMPORTANT: we deliberately do NOT call ``deleteLater()`` here.
+    deleteLater() destroys the underlying C++ QThread immediately on the
+    next event-loop pass — but a finished worker is very often still
+    referenced elsewhere (e.g. ``self.arp_operation_worker`` on a tab),
+    and force-deleting the C++ object turns every one of those Python
+    references into a dangling wrapper. The next ``.isRunning()`` /
+    ``.isFinished()`` on such a wrapper raises
+    ``RuntimeError: wrapped C/C++ object ... has been deleted``, which —
+    unhandled inside a Qt slot — aborts the process. (Exactly what bit
+    the device-apply path after the keepalive landed.)
+
+    The registry's only job is to hold a strong ref across the
+    post-run() teardown race window. Once a worker has been finished for
+    > _TRIM_AGE_S the race is long over, so we simply stop holding our
+    ref and let ordinary Python refcounting / Qt parent-child cleanup
+    delete the C++ object when the LAST owner releases it — by which
+    point no thread is running and no wrapper is left dangling.
+    """
     now = _time.monotonic()
     survivors = []
     for w in _KEEP:
         try:
             running = w.isRunning()
         except RuntimeError:
-            # C++ side already gone (someone else deleted it) — drop the
-            # dead wrapper from the registry.
+            # C++ side already gone (a legitimate owner deleted it) —
+            # drop our dead wrapper from the registry.
             continue
         except Exception:
-            # Unknown state — keep it to be safe.
             survivors.append(w)
             continue
 
         kept_at = getattr(w, "_kept_at", now)
         if (not running) and (now - kept_at > _TRIM_AGE_S):
-            try:
-                w.deleteLater()
-            except RuntimeError:
-                pass  # already deleted
-        else:
-            survivors.append(w)
+            # Safe to stop tracking — DON'T deleteLater (see docstring).
+            # Dropping our ref lets the object die naturally once every
+            # other owner has also released it.
+            continue
+        survivors.append(w)
 
     dropped = len(_KEEP) - len(survivors)
     if dropped:
-        _logger.debug("[QTHREAD KEEPALIVE] trimmed %d finished worker(s); %d live",
+        _logger.debug("[QTHREAD KEEPALIVE] released %d finished worker(s); %d live",
                       dropped, len(survivors))
     _KEEP[:] = survivors
 

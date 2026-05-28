@@ -2,6 +2,51 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.25] - 2026-05-27
+
+Follow-up to v0.2.24: the keepalive registry's *trim* introduced a
+new crash on device-apply. The startup SIGABRT stayed fixed (client
+ran for minutes), but clicking Apply aborted with:
+
+    RuntimeError: wrapped C/C++ object of type ArpOperationWorker
+    has been deleted
+    (in apply_selected_device_with_arp_chain, on .isRunning())
+
+### Cause
+v0.2.24's `_trim()` called `deleteLater()` on workers finished
+>30 s ago. But a finished worker is often still referenced by a
+tab attribute (e.g. `self.arp_operation_worker`). Force-deleting
+the C++ object left that Python attribute pointing at a dead
+wrapper; the next `.isRunning()` on it raised RuntimeError, which —
+unhandled inside a Qt slot — aborts the process.
+
+### Fix
+1. `utils/qthread_keepalive.py::_trim()` no longer calls
+   `deleteLater()`. It only releases the registry's OWN strong
+   reference once a worker has been finished >30 s. Ordinary Python
+   refcounting / Qt parent-child cleanup then deletes the C++ object
+   when the LAST owner releases it — by which point the thread is
+   long done and no wrapper is left dangling. (The registry's only
+   real job was to bridge the post-run() teardown race window; after
+   that it just gets out of the way.)
+2. `widgets/devices_tab.py::apply_selected_device_with_arp_chain`
+   now tolerates a stale wrapper defensively: the busy-check is
+   wrapped in try/except RuntimeError and treats a deleted worker as
+   "free to proceed". It also no longer `deleteLater()`s the previous
+   worker itself (same teardown-race risk) — it just clears the
+   attribute and lets the registry own teardown.
+
+### Verification
+- Unit test: with `_TRIM_AGE_S=0` and the trim forced to run, an
+  externally-held worker stays a valid C++ object afterwards (would
+  have been deleted under v0.2.24).
+- Headless launch with aggressive trim (`_TRIM_AGE_S=3`,
+  threshold=5) ran 16 s of startup + poll cycles → CLEAN EXIT rc=0.
+
+### Notes
+- Client-only fix — wheel server code unchanged from v0.2.19.
+- Wheel ships as `ostg_trafficgen-0.2.25-py3-none-any.whl`.
+
 ## [0.2.24] - 2026-05-27
 
 DEFINITIVE fix for the client startup SIGABRT (v0.2.20–v0.2.23 all

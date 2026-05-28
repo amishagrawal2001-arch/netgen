@@ -4753,20 +4753,37 @@ class DevicesTab(QWidget):
 
     def apply_selected_device_with_arp_chain(self):
         """Apply selected devices and then run ARP operations if pending."""
-        # Check if ARP operation is already running - use more robust check
-        if hasattr(self, 'arp_operation_worker') and self.arp_operation_worker:
-            if self.arp_operation_worker.isRunning() or not self.arp_operation_worker.isFinished():
+        # Check if ARP operation is already running - use more robust check.
+        # Guard against a deleted C++ wrapper: a previous worker's C++
+        # object may have been released (cleanup path's deleteLater, or
+        # the keepalive registry dropping its ref) while this Python
+        # attribute still points at the dead wrapper. Touching
+        # .isRunning() on it then raises "RuntimeError: wrapped C/C++
+        # object ... has been deleted", which — unhandled in a Qt slot —
+        # aborts the process. Treat a dead/finished worker as "free to
+        # proceed".
+        existing = getattr(self, 'arp_operation_worker', None)
+        if existing is not None:
+            try:
+                _busy = existing.isRunning() or not existing.isFinished()
+            except RuntimeError:
+                # C++ side already gone — stale wrapper, not busy.
+                _busy = False
+            if _busy:
                 logger.info("ARP operation already running, skipping new request")
                 return
-            else:
-                # Clean up finished worker - ensure thread is stopped first
-                worker = self.arp_operation_worker
+            # Finished (or a dead wrapper) — just release our reference.
+            # Deliberately NOT calling deleteLater() here: if the worker
+            # only just finished, its QThread teardown may still be
+            # settling and deleteLater would destroy the C++ object
+            # mid-teardown → "QThread: Destroyed while thread is still
+            # running" SIGABRT. Lifetime is owned by the global keepalive
+            # registry, which deletes safely once the race window has
+            # closed. Clearing the attribute is all we need here.
+            try:
                 delattr(self, 'arp_operation_worker')
-                if worker.isRunning():
-                    worker.quit()
-                    worker.wait(100)
-                if not worker.isRunning():
-                    worker.deleteLater()
+            except Exception:
+                self.arp_operation_worker = None
         
         # First run the apply operation silently (without showing dialog)
         self.apply_selected_device_silent()
