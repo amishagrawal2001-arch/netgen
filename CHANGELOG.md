@@ -2,6 +2,56 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.30] - 2026-05-27
+
+Audit + fix to ensure a wheel install/upgrade actually activates
+every change shipped this release cycle (v0.2.18–v0.2.29).
+
+### Fixed — installer builds the FRR image with --network=host
+`install_ostg_complete.py::setup_docker_frr` ran `docker build` /
+`docker buildx build` WITHOUT `--network=host`. On corporate-DNS
+hosts (Juniper internal / svl-hp-ai-srv02) the Alpine apk fetch in
+the build sandbox can't resolve the CDN even though the host can, so
+a FRESH install's FRR image build failed on every mirror (the
+mirror-retry loop can't fix a DNS-in-sandbox problem). Added
+`--network=host` to both build commands — the same flag proven
+necessary for the server-side auto-build. Even if this build still
+fails, the v0.2.28 server-startup self-heal
+(`maybe_rebuild_frr_image`) rebuilds it correctly on first run.
+
+### Verified — upgrade path activates all changes (no code change)
+Confirmed end-to-end that a wheel upgrade carries and activates
+everything:
+- **Wheel contents**: `ostg_docker/Dockerfile.frr` is the Alpine +
+  `dhclient` + `dnsmasq` version; `utils/{frr_docker,dhcp,bgp,
+  qthread_keepalive}.py`, `run_tgen_server.py`, `run_tgen_client.py`,
+  `ostg_docker/{start-frr.sh,frr.conf.template}` and
+  `resources/dpdk/install_dpdk.sh` are all packaged.
+- **§9a HTTP upgrade** (`/api/admin/upgrade_wheel`) and **SSH
+  fallback** both `pip install --upgrade` then `systemctl restart
+  netgen-server`. On restart:
+    1. `_ensure_frr_assets_deployed()` copies the new Dockerfile.frr
+       + ostg_docker tree from the wheel to /opt/netgen.
+    2. `maybe_rebuild_frr_image()` (daemon thread) sees the Dockerfile
+       SHA changed and rebuilds netgen-frr:latest with the DHCP
+       tooling — non-blocking.
+  So server code (BGP-VRF, DHCP, FRR self-heal) + Dockerfile + image
+  rebuild all land from a plain wheel upgrade.
+- **Client** (wheel / DMG / AppImage / exe): `run_tgen_client.py`
+  installs the QThread keepalive hook at launch; the fix modules are
+  packaged.
+
+### Operator steps after upgrade (unchanged, restated)
+- Re-add each BGP device once to clear the stale default-VRF
+  `router bgp` block written by the pre-v0.2.26 code (a running
+  container is reused, so re-apply alone won't drop it).
+- Re-apply DHCP devices so their container is recreated on the
+  rebuilt image.
+
+### Notes
+- Installer fix (install_ostg_complete.py).
+- Wheel ships as `ostg_trafficgen-0.2.30-py3-none-any.whl`.
+
 ## [0.2.29] - 2026-05-27
 
 Closes the two minor gaps flagged in the v0.2.28 review.

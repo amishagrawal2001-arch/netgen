@@ -1265,13 +1265,25 @@ class NetgenInstaller:
 
         def run_build(mirror_arg: Optional[str] = None) -> subprocess.CompletedProcess:
             extra = f" --build-arg ALPINE_MIRROR={mirror_arg}" if mirror_arg else ""
+            # --network=host is REQUIRED: the Alpine apk fetch inside the
+            # build container must use the host's resolver. On corporate-DNS
+            # hosts (e.g. Juniper internal / svl-hp-ai-srv02) docker's
+            # default bridge DNS can't reach the Alpine CDN even though the
+            # host can, and the build dies with repeated
+            # "temporary error (try again later)" on EVERY mirror — the
+            # mirror-retry loop above can't help because it's a DNS-in-the-
+            # sandbox problem, not a mirror problem. Confirmed live: the
+            # build only succeeds with host networking. (If this build still
+            # fails, the server's startup self-heal — maybe_rebuild_frr_image
+            # — will rebuild the image via the Docker SDK with the same
+            # network_mode=host on first run, so FRR/DHCP still recover.)
             if use_buildx:
                 return self.run_command(
-                    f"docker buildx build --platform linux/amd64 -t {DOCKER_IMAGE} -f {dockerfile_path} --load{extra} {build_context}",
+                    f"docker buildx build --network=host --platform linux/amd64 -t {DOCKER_IMAGE} -f {dockerfile_path} --load{extra} {build_context}",
                     check=False, timeout=600
                 )
             return self.run_command(
-                f"docker build -t {DOCKER_IMAGE} -f {dockerfile_path}{extra} {build_context}",
+                f"docker build --network=host -t {DOCKER_IMAGE} -f {dockerfile_path}{extra} {build_context}",
                 check=False, timeout=600
             )
 
