@@ -1195,17 +1195,10 @@ class TrafficGenClientServerSection():
 
                     conn_mgr = getattr(self, "connection_manager", None)
                     worker = _FetchIfacesWorker(server_address, conn_mgr)
-                    # CRITICAL: Qt-parent ownership prevents the Python-GC
-                    # race that triggers "QThread: Destroyed while thread
-                    # is still running" SIGABRT. See _fetch_interfaces_async
-                    # in menu_actions.py for the full rationale.
-                    worker.setParent(self)
-
-                    # List kept for in-flight tracking; lifetime is owned
-                    # by Qt (setParent above), not the list.
-                    if not hasattr(self, "_server_probe_workers"):
-                        self._server_probe_workers = []
-                    self._server_probe_workers.append(worker)
+                    # Permanent keepalive — see _keepalive_worker in
+                    # menu_actions.py for why setParent/deleteLater don't
+                    # suffice on PyQt5 5.15.11 + Python 3.14.
+                    self._keepalive_worker(worker)
 
                     def _on_done(ok, ifaces, srv=server, addr=server_address, w=worker):
                         if ok:
@@ -1222,13 +1215,6 @@ class TrafficGenClientServerSection():
                             self.update_server_status_icon(srv, False)
 
                     worker.done.connect(_on_done)
-
-                    def _drop_from_list(w=worker):
-                        if w in self._server_probe_workers:
-                            self._server_probe_workers.remove(w)
-
-                    worker.finished.connect(_drop_from_list)
-                    worker.finished.connect(worker.deleteLater)
                     worker.start()
                     continue  # Skip this server for now, will be updated asynchronously
             
@@ -1437,12 +1423,8 @@ class TrafficGenClientServerSection():
 
         conn_mgr = getattr(self, "connection_manager", None)
         worker = _RetryWorker(server_address, conn_mgr)
-        # CRITICAL: Qt-parent ownership — see _fetch_interfaces_async
-        # in menu_actions.py for the full SIGABRT rationale.
-        worker.setParent(self)
-        if not hasattr(self, "_server_probe_workers"):
-            self._server_probe_workers = []
-        self._server_probe_workers.append(worker)
+        # Permanent keepalive — see _keepalive_worker in menu_actions.py.
+        self._keepalive_worker(worker)
 
         def _on_done(ok, ifaces, srv=server, addr=server_address):
             if ok:
@@ -1467,13 +1449,6 @@ class TrafficGenClientServerSection():
                 self.update_server_status_icon(srv, False)
 
         worker.done.connect(_on_done)
-
-        def _drop_from_list(w=worker):
-            if w in self._server_probe_workers:
-                self._server_probe_workers.remove(w)
-
-        worker.finished.connect(_drop_from_list)
-        worker.finished.connect(worker.deleteLater)
         worker.start()
 
     def remove_selected_interface(self):

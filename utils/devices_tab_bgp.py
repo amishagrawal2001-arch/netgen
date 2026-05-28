@@ -1915,7 +1915,10 @@ class BGPHandler:
         # CRITICAL: Set parent to ensure proper cleanup
         worker.setParent(self.parent)
         worker.finished.connect(lambda results: self._on_bgp_apply_finished(results, progress, devices_to_apply_bgp, devices_to_remove_bgp))
-        worker.finished.connect(worker.deleteLater)  # Clean up worker when done
+        # No finished→deleteLater: destroys the C++ QThread mid-teardown
+        # → "QThread: Destroyed while thread is still running" SIGABRT on
+        # PyQt5 5.15.11 + Python 3.14. The _bgp_apply_workers list below
+        # plus the global keepalive registry own the lifetime instead.
         worker.start()
         
         # Store worker reference to prevent garbage collection

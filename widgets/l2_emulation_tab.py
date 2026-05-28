@@ -554,6 +554,16 @@ class L2EmulationTab(QWidget):
             self._fetch_worker = None
 
         worker = _JsonFetchWorker(f"{url}/api/l2/sessions", timeout_s=3.0)
+        # Pin a process-global strong ref so the worker survives the
+        # QThread teardown race (PyQt5 5.15.11 + Python 3.14). See
+        # utils/qthread_keepalive.py. NB: the QThread.start monkeypatch
+        # installed at client launch also does this, but call it
+        # explicitly so the L2 tab is safe even when launched stand-alone.
+        try:
+            from utils.qthread_keepalive import keep
+            keep(worker)
+        except Exception:
+            pass
         worker.finished_ok.connect(self._on_refresh_ok)
         worker.failed.connect(self._on_refresh_failed)
         worker.finished.connect(self._on_worker_finished)
@@ -561,13 +571,16 @@ class L2EmulationTab(QWidget):
         worker.start()
 
     def _on_worker_finished(self):
-        worker = self._fetch_worker
+        # Just clear the guard so the next refresh can spawn. Do NOT call
+        # worker.deleteLater() here — `finished` fires the instant run()
+        # returns, while Qt's internal QThreadPrivate teardown is still
+        # settling. deleteLater() at that point destroys the C++ QThread
+        # mid-teardown → "QThread: Destroyed while thread is still
+        # running" → SIGABRT (confirmed culprit of the client's
+        # startup crash on PyQt5 5.15.11 + Python 3.14). Lifetime is now
+        # owned by the global keepalive registry, which trims workers
+        # only after they've been finished >30s — long past the race.
         self._fetch_worker = None
-        if worker is not None:
-            try:
-                worker.deleteLater()
-            except RuntimeError:
-                pass
 
     def _on_refresh_ok(self, payload, _code: int):
         sessions = (payload or {}).get("sessions") or []

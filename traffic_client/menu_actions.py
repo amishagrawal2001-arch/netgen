@@ -56,6 +56,25 @@ def sanitize_for_json(obj):
         return f"<non-serializable: {type(obj).__name__}>"
 
 class TrafficGenClientMenuAction():
+    def _keepalive_worker(self, worker):
+        """Thin instance-method shim over the process-global QThread
+        keepalive registry (utils.qthread_keepalive.keep).
+
+        Why a global registry rather than a per-window list / setParent:
+        on PyQt5 5.15.11 + Python 3.14, a QThread whose last Python ref
+        drops during the window between run() returning and Qt's internal
+        teardown completing gets its C++ object deleted by PyQt's wrapper
+        destructor while Qt still thinks the thread runs → "QThread:
+        Destroyed while thread is still running" → SIGABRT. setParent()
+        only fixes this when the worker shares the parent's thread
+        affinity — workers spawned from a background threading.Thread
+        (monitor callbacks) can't be parented to the main-thread window,
+        so setParent no-ops there. A process-global strong ref is
+        thread-agnostic and always wins. See utils/qthread_keepalive.py.
+        """
+        from utils.qthread_keepalive import keep
+        keep(worker)
+
     def add_server_interface(self):
         """Add a TGEN chassis via the Spirent-style dialog.
 
@@ -1380,27 +1399,9 @@ class TrafficGenClientMenuAction():
 
         conn_mgr = getattr(self, "connection_manager", None)
         worker = _MenuFetchWorker(address, conn_mgr)
-        # CRITICAL: setParent(self) transfers C++ ownership to Qt.
-        # Without this, PyQt5's wrapper owns the C++ QThread; when the
-        # last Python ref drops, PyQt's __del__ deletes the C++ object —
-        # and if Qt's internal thread-cleanup hasn't fully completed yet,
-        # the QThread destructor fires with the thread still marked
-        # running → "QThread: Destroyed while thread is still running"
-        # → SIGABRT. v0.2.20's wait()+deleteLater() cleanup couldn't fix
-        # this because the local `w` variable in the cleanup closure still
-        # held a Python ref that dropped to 0 when the closure returned.
-        # Setting a QObject parent moves ownership entirely to Qt; Python
-        # GC of the wrapper becomes a no-op, and finished→deleteLater
-        # handles destruction cleanly on the event loop.
-        worker.setParent(self)
-
-        # Keep the list for in-flight tracking (cancel-all paths look
-        # at it). The list ref is no longer load-bearing for lifetime —
-        # Qt's parent ownership is. Workers self-remove from the list
-        # in the finished slot below.
-        if not hasattr(self, "_menu_iface_workers"):
-            self._menu_iface_workers = []
-        self._menu_iface_workers.append(worker)
+        # Permanent keepalive — see _keepalive_worker for why setParent
+        # + deleteLater don't suffice on PyQt5 5.15.11 + Python 3.14.
+        self._keepalive_worker(worker)
 
         def _on_done(ok, status, ifaces, err, srv=server, addr=address):
             if ok:
@@ -1422,18 +1423,6 @@ class TrafficGenClientMenuAction():
                     QTimer.singleShot(0, self.update_server_tree)
 
         worker.done.connect(_on_done)
-
-        # Self-remove from in-flight list when finished. Lifetime is
-        # owned by Qt (via setParent above) — this slot is purely for
-        # list bookkeeping. The deleteLater connection below is what
-        # actually destroys the C++ object, cleanly on the event loop
-        # after the worker thread has fully exited.
-        def _drop_from_list(w=worker):
-            if w in self._menu_iface_workers:
-                self._menu_iface_workers.remove(w)
-
-        worker.finished.connect(_drop_from_list)
-        worker.finished.connect(worker.deleteLater)
         worker.start()
     
     def load_session(self, skip_servers=False):
@@ -1877,20 +1866,9 @@ class TrafficGenClientMenuAction():
             address = server.get("address")
             logger.info(f"Trying to bring selected server {address} online...")
             worker = _RetryAllWorker(server, conn_mgr)
-            # See _fetch_interfaces_async for the full setParent
-            # rationale. Qt-parent ownership prevents the Python-GC
-            # race that triggers "QThread: Destroyed while thread is
-            # still running" SIGABRT.
-            worker.setParent(self)
-            self._menu_retry_workers.append(worker)
+            # Permanent keepalive — see _keepalive_worker docstring.
+            self._keepalive_worker(worker)
             worker.done.connect(_on_one_done)
-
-            def _drop_from_list(w=worker):
-                if w in self._menu_retry_workers:
-                    self._menu_retry_workers.remove(w)
-
-            worker.finished.connect(_drop_from_list)
-            worker.finished.connect(worker.deleteLater)
             worker.start()
     
     def get_selected_tg_ids(self):

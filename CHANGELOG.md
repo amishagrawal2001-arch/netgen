@@ -2,6 +2,66 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.24] - 2026-05-27
+
+DEFINITIVE fix for the client startup SIGABRT (v0.2.20–v0.2.23 all
+chased the wrong worker). This time the crash was **reproduced
+locally headless** (`QT_QPA_PLATFORM=offscreen` against
+svl-hp-ai-srv02) so the fix is verified, not guessed.
+
+### Root cause (finally)
+The fatal call wasn't Python GC of a worker — it was an **explicit
+`worker.deleteLater()` in a `finished` slot**. A Qt message handler
+showed the abort firing from inside the event loop (not Python
+code), i.e. a queued `deleteLater` being processed on a QThread
+whose `run()` had returned but whose internal QThreadPrivate
+teardown was still settling → `isRunning()` still true → Qt aborts.
+
+`widgets/l2_emulation_tab.py::_on_worker_finished` did exactly
+this, and the L2 sessions refresh timer fires it during startup.
+The `[AUTO-START]` / `Fetched 8 interfaces` log lines in every
+crash report were red herrings — they just bracket the L2 timer
+tick.
+
+Crucially, **no Python-side ref-keeping can prevent this** —
+`deleteLater()` destroys the C++ object regardless of how many
+Python references exist. v0.2.21–v0.2.23's setParent / keep-ref
+approaches couldn't have worked against an explicit deleteLater.
+
+### Fix, in two parts
+1. **`utils/qthread_keepalive.py`** (new) — a process-global
+   registry. `install()` monkeypatches `QThread.start` so EVERY
+   worker app-wide auto-pins a strong ref on start (covers the
+   GC-race class of bug for workers we don't individually touch).
+   Trims workers >30 s after they finish, when deletion is provably
+   safe. Installed once at client launch in `run_tgen_client.py`,
+   before the main window (and its startup workers) are built.
+2. **Removed every premature `deleteLater` on a QThread** —
+   `finished.connect(worker.deleteLater)` connections and
+   `worker.deleteLater()` calls inside `finished` slots, across:
+     * `widgets/l2_emulation_tab.py` (the startup culprit)
+     * `widgets/topology_tab.py` (history fetch, device fetch, SSE)
+     * `widgets/devices_tab.py` (SSE worker)
+     * `utils/devices_tab_ospf.py` (OSPF apply worker)
+     * `utils/devices_tab_bgp.py` (BGP apply worker)
+   Lifetime is now owned by the keepalive registry, which only
+   deletes a worker once it's been finished long enough that the
+   teardown race window has closed.
+
+The known-good sync-wait sites (`stream_logic.py`,
+`statistics_section.py`) were also routed through the keepalive
+registry instead of immediate deleteLater.
+
+### Verification
+Headless launch against srv02 ran 18 s through interface fetch,
+stream auto-start, and ~9 stats-poll cycles with devices/topology/L2
+tabs all live: `CLEAN EXIT rc=0`, no abort. The same scenario
+SIGABRT'd reliably before the fix.
+
+### Notes
+- Client-only fix — wheel server code unchanged from v0.2.19.
+- Wheel ships as `ostg_trafficgen-0.2.24-py3-none-any.whl`.
+
 ## [0.2.23] - 2026-05-27
 
 Fix yet another QThread SIGABRT site — the stats polling

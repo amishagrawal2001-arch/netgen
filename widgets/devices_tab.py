@@ -4010,7 +4010,13 @@ class DevicesTab(QWidget):
         worker = SSEWorker(f"{url_base}/api/events/stream")
         worker.event.connect(self._on_sse_event)
         worker.disconnected.connect(self._on_sse_disconnected)
-        worker.finished.connect(worker.deleteLater)
+        # No finished→deleteLater (QThread teardown race → SIGABRT on
+        # PyQt5 5.15.11 + Python 3.14). Global keepalive owns lifetime.
+        try:
+            from utils.qthread_keepalive import keep
+            keep(worker)
+        except Exception:
+            pass
         self._sse_worker = worker
         worker.start()
         logger.debug(f"[DEVICES] SSE worker started → {url_base}")

@@ -682,12 +682,16 @@ class TrafficGenClientStatisticsSection():
         # entirely; Python GC of the wrapper is a no-op and Qt's
         # deleteLater (via finished→_on_stats_fetch_finished) handles
         # destruction cleanly on the event loop.
-        self._stats_worker.setParent(self)
+        # Permanent keepalive — see _keepalive_worker in menu_actions.py.
+        # setParent + deleteLater proved unreliable on PyQt5 5.15.11 +
+        # Python 3.14; a permanent ref (trimmed >30s after finish) is the
+        # only thing that reliably dodges the destructor race.
+        if hasattr(self, "_keepalive_worker"):
+            self._keepalive_worker(self._stats_worker)
         self._stats_worker.interfaces_fetched.connect(self._on_interfaces_fetched)
         self._stats_worker.stream_stats_fetched.connect(self._on_stream_stats_fetched)
         self._stats_worker.fetch_error.connect(self._on_fetch_error)
         self._stats_worker.finished.connect(self._on_stats_fetch_finished)
-        self._stats_worker.finished.connect(self._stats_worker.deleteLater)
 
         # Reset pending data
         self._pending_stats_data = {}
@@ -1200,14 +1204,12 @@ class TrafficGenClientStatisticsSection():
             fetch_type="streams",
             connection_manager=getattr(self, 'connection_manager', None)
         )
-        # Qt-parent ownership prevents the Python-GC race when the next
-        # poll cycle overwrites self._poll_worker. See _stats_worker
-        # site above for full rationale.
-        self._poll_worker.setParent(self)
+        # Permanent keepalive — see _keepalive_worker in menu_actions.py.
+        if hasattr(self, "_keepalive_worker"):
+            self._keepalive_worker(self._poll_worker)
         self._poll_worker.stream_stats_fetched.connect(self._on_poll_stream_stats_fetched)
         self._poll_worker.fetch_error.connect(self._on_poll_fetch_error)
         self._poll_worker.finished.connect(self._on_poll_finished)
-        self._poll_worker.finished.connect(self._poll_worker.deleteLater)
 
         # Reset pending data
         self._pending_poll_stream_stats = []

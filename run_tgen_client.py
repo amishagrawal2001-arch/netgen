@@ -24,6 +24,21 @@ def launch(server_url: str, fullscreen: bool, server_explicitly_provided: bool =
 
     app = QApplication(sys.argv)
     app.setAttribute(Qt.AA_DontUseNativeMenuBar)
+
+    # Install the process-global QThread keepalive BEFORE building the
+    # main window (which spawns interface-fetch / stats-poll workers on
+    # startup). On PyQt5 5.15.11 + Python 3.14 a QThread whose last
+    # Python ref drops during the gap between run() returning and Qt's
+    # internal teardown completing gets its C++ object deleted by PyQt
+    # mid-teardown → "QThread: Destroyed while thread is still running"
+    # → SIGABRT on launch. This hook makes every QThread.start() pin a
+    # strong ref in a global registry (trimmed once workers are provably
+    # done), eliminating the race app-wide. See utils/qthread_keepalive.py.
+    try:
+        from utils.qthread_keepalive import install as _install_qthread_keepalive
+        _install_qthread_keepalive()
+    except Exception as _e:
+        print(f"[WARN] QThread keepalive install failed: {_e}", file=sys.stderr)
     # Identify the app so QSettings has a deterministic on-disk
     # location across macOS / Linux. Used by the Settings dialog
     # (File → Settings…) and any other key/value preferences.

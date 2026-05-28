@@ -741,8 +741,16 @@ class _PropertyPanel(QWidget):
 
         worker.finished_ok.connect(_ok)
         worker.failed.connect(_fail)
-        worker.finished.connect(worker.deleteLater)
-        # Keep a handle on the frame so the GC doesn't reap mid-fetch.
+        # Lifetime owned by the global keepalive registry — do NOT
+        # connect finished→deleteLater (destroys the C++ QThread mid-
+        # teardown → SIGABRT on PyQt5 5.15.11 + Python 3.14). See
+        # utils/qthread_keepalive.py.
+        try:
+            from utils.qthread_keepalive import keep
+            keep(worker)
+        except Exception:
+            pass
+        # Keep a handle on the frame too (harmless belt-and-suspenders).
         section_frame._history_worker = worker
         worker.start()
 
@@ -931,13 +939,11 @@ class TopologyTab(QWidget):
             self._refresh_btn.setEnabled(True)
         except Exception:
             pass
-        worker = self._fetch_worker
+        # Clear the guard only. Do NOT deleteLater() here — see
+        # _on_worker_finished in l2_emulation_tab.py for why (QThread
+        # teardown race → SIGABRT). The global keepalive registry owns
+        # the worker's lifetime and trims it safely >30s after finish.
         self._fetch_worker = None
-        if worker is not None:
-            try:
-                worker.deleteLater()
-            except RuntimeError:
-                pass
 
     def _on_refresh_ok(self, payload, _code: int):
         rows = (payload or {}).get("devices") or []
@@ -982,7 +988,13 @@ class TopologyTab(QWidget):
         worker = SSEWorker(f"{url}/api/events/stream")
         worker.event.connect(self._on_sse_event)
         worker.disconnected.connect(self._on_sse_disconnected)
-        worker.finished.connect(worker.deleteLater)
+        # No finished→deleteLater (QThread teardown race → SIGABRT).
+        # Global keepalive owns lifetime. See utils/qthread_keepalive.py.
+        try:
+            from utils.qthread_keepalive import keep
+            keep(worker)
+        except Exception:
+            pass
         self._sse_worker = worker
         worker.start()
         logger.debug("[TOPOLOGY] SSE worker started")
