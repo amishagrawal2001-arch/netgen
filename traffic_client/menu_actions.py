@@ -1380,8 +1380,24 @@ class TrafficGenClientMenuAction():
 
         conn_mgr = getattr(self, "connection_manager", None)
         worker = _MenuFetchWorker(address, conn_mgr)
+        # CRITICAL: setParent(self) transfers C++ ownership to Qt.
+        # Without this, PyQt5's wrapper owns the C++ QThread; when the
+        # last Python ref drops, PyQt's __del__ deletes the C++ object —
+        # and if Qt's internal thread-cleanup hasn't fully completed yet,
+        # the QThread destructor fires with the thread still marked
+        # running → "QThread: Destroyed while thread is still running"
+        # → SIGABRT. v0.2.20's wait()+deleteLater() cleanup couldn't fix
+        # this because the local `w` variable in the cleanup closure still
+        # held a Python ref that dropped to 0 when the closure returned.
+        # Setting a QObject parent moves ownership entirely to Qt; Python
+        # GC of the wrapper becomes a no-op, and finished→deleteLater
+        # handles destruction cleanly on the event loop.
+        worker.setParent(self)
 
-        # Hold a strong ref; Qt will GC the thread otherwise.
+        # Keep the list for in-flight tracking (cancel-all paths look
+        # at it). The list ref is no longer load-bearing for lifetime —
+        # Qt's parent ownership is. Workers self-remove from the list
+        # in the finished slot below.
         if not hasattr(self, "_menu_iface_workers"):
             self._menu_iface_workers = []
         self._menu_iface_workers.append(worker)
@@ -1407,27 +1423,17 @@ class TrafficGenClientMenuAction():
 
         worker.done.connect(_on_done)
 
-        # Cleanup pattern: wait() + deleteLater() (matches stream_logic.py /
-        # main.py). The previous "just remove from list" handler dropped
-        # the only strong ref while Qt's internal QThread cleanup hadn't
-        # finished joining the OS thread → C++ QThread destructor fired
-        # with the thread still marked running → "QThread: Destroyed
-        # while thread is still running" + SIGABRT. Reproduced on startup
-        # when /api/interfaces returned quickly enough that finished fired
-        # before the main thread had moved on. wait() is instant here
-        # because run() already returned (that's why finished fired);
-        # it just blocks for Qt's internal bookkeeping. deleteLater()
-        # then hands ownership of the deletion back to Qt's event loop.
-        def _cleanup(w=worker):
-            try:
-                w.wait()  # join OS thread cleanly (instant — run() done)
-            except Exception:
-                pass
+        # Self-remove from in-flight list when finished. Lifetime is
+        # owned by Qt (via setParent above) — this slot is purely for
+        # list bookkeeping. The deleteLater connection below is what
+        # actually destroys the C++ object, cleanly on the event loop
+        # after the worker thread has fully exited.
+        def _drop_from_list(w=worker):
             if w in self._menu_iface_workers:
                 self._menu_iface_workers.remove(w)
-            w.deleteLater()
 
-        worker.finished.connect(_cleanup)
+        worker.finished.connect(_drop_from_list)
+        worker.finished.connect(worker.deleteLater)
         worker.start()
     
     def load_session(self, skip_servers=False):
@@ -1871,22 +1877,20 @@ class TrafficGenClientMenuAction():
             address = server.get("address")
             logger.info(f"Trying to bring selected server {address} online...")
             worker = _RetryAllWorker(server, conn_mgr)
+            # See _fetch_interfaces_async for the full setParent
+            # rationale. Qt-parent ownership prevents the Python-GC
+            # race that triggers "QThread: Destroyed while thread is
+            # still running" SIGABRT.
+            worker.setParent(self)
             self._menu_retry_workers.append(worker)
             worker.done.connect(_on_one_done)
 
-            # Same wait()+deleteLater() cleanup as the sibling
-            # _fetch_interfaces_async — see that function's comment for
-            # the QThread-destroyed-while-running SIGABRT details.
-            def _cleanup(w=worker):
-                try:
-                    w.wait()
-                except Exception:
-                    pass
+            def _drop_from_list(w=worker):
                 if w in self._menu_retry_workers:
                     self._menu_retry_workers.remove(w)
-                w.deleteLater()
 
-            worker.finished.connect(_cleanup)
+            worker.finished.connect(_drop_from_list)
+            worker.finished.connect(worker.deleteLater)
             worker.start()
     
     def get_selected_tg_ids(self):

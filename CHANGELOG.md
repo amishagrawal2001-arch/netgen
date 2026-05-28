@@ -2,6 +2,55 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.21] - 2026-05-27
+
+Real fix for the QThread SIGABRT on client startup — v0.2.20's
+wait()+deleteLater() cleanup didn't actually fix it. Reproduced
+again on macOS post-upgrade:
+
+    Fetched 8 interfaces from http://svl-hp-ai-srv02:5050 (async)
+    QThread: Destroyed while thread is still running
+    zsh: abort      python3 run_tgen_client.py
+
+### Why v0.2.20 failed
+The cleanup closure ran `wait() → list.remove(w) → deleteLater()`.
+But `deleteLater()` only *schedules* destruction on the event
+loop — the actual delete happens on a later loop iteration. The
+local `w` variable in the closure went out of scope when the
+closure returned (BEFORE the event loop got to the deleteLater),
+which dropped the last Python ref. PyQt5's wrapper then noticed
+no C++ parent → assumed Python ownership → called the C++
+destructor immediately. The QThread destructor saw isRunning()
+still true (Qt's internal post-`run()` cleanup hadn't completed)
+→ SIGABRT.
+
+### Real fix — Qt-parent ownership
+`worker.setParent(self)` transfers C++ ownership to Qt. PyQt5
+checks for a Qt parent on wrapper destruction and skips the
+delete if one exists. So Python GC of the wrapper becomes a
+no-op for the C++ object — Qt owns it. Then
+`finished.connect(worker.deleteLater)` lets Qt schedule clean
+destruction on the event loop after the thread has fully exited.
+
+Applied to all 4 async-fetch sites that previously had the
+half-fix:
+  * `menu_actions._fetch_interfaces_async`
+  * `menu_actions._RetryAllWorker` loop
+  * `server_section` async-fetch (line ~1196)
+  * `server_section` server-probe (line ~1439)
+
+The list-tracking (`_menu_iface_workers`, `_server_probe_workers`)
+is kept for in-flight bookkeeping but is no longer load-bearing
+for lifetime — Qt's parent ownership is. Workers self-remove
+from the list in a `finished` slot that does only the list
+mutation; deleteLater is a separate connection.
+
+### Notes
+- Same idiom already in use at `menu_actions.SaveSessionWorker`
+  (line 792) — those four sites just predated the convention.
+- Client-only fix — wheel server code unchanged from v0.2.19.
+- Wheel ships as `ostg_trafficgen-0.2.21-py3-none-any.whl`.
+
 ## [0.2.20] - 2026-05-27
 
 Hotfix for a startup-time client crash: `python3 run_tgen_client.py`
