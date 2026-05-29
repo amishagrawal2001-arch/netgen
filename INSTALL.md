@@ -288,6 +288,37 @@ named "Netgen Client". Double-click to launch the GUI.
 
 ## Updating an existing install
 
+### From the GUI (operators) — recommended
+
+**Help → Install / Upgrade Server… → Upgrade running server** tab. Enter
+the server URL + pick the new `.whl`, then click one of:
+
+- **Upload && Upgrade** — HTTP path (`POST /api/admin/upgrade_wheel`); the
+  server pip-installs the wheel and restarts itself. Auto-falls back to
+  SSH if the endpoint is missing (HTTP 404) or erroring, provided you've
+  filled in the SSH credentials.
+- **Upgrade via SSH (manual)** — skips HTTP entirely: sftp the wheel,
+  `pip install --upgrade --force-reinstall --no-deps`, restart the
+  service. Use this for **old servers** that predate the
+  `/api/admin/upgrade_wheel` endpoint (pre-0.2.6), or whenever you prefer
+  the direct path. The restart tries `netgen-server` and falls back to the
+  legacy `ostg-server` unit.
+
+Manual one-liner equivalent (terminal):
+
+```bash
+scp ostg_trafficgen-<ver>-py3-none-any.whl root@<host>:/tmp/
+ssh root@<host> 'pip3 install --upgrade --force-reinstall --no-deps \
+    /tmp/ostg_trafficgen-<ver>-py3-none-any.whl && \
+    (systemctl restart netgen-server || systemctl restart ostg-server)'
+```
+
+On 0.2.28+, the server's startup self-heal redeploys the FRR/DHCP assets
+to `/opt/netgen/` and rebuilds the container image automatically when the
+bundled `Dockerfile.frr` changes — so a wheel-only upgrade is self-sufficient.
+
+### From the repo scripts (developers)
+
 Bump the version in `pyproject.toml`, then on each host:
 
 ```bash

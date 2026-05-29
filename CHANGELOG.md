@@ -2,6 +2,35 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.36] - 2026-05-28
+
+Docs: bring the install/upgrade guidance up to date with the
+v0.2.34/v0.2.35 upgrade improvements.
+
+### In-app guide (Help → Install Guide)
+`_INSTALL_GUIDE_HTML` gains a new **§1a "Two ways to upgrade a running
+server"** that documents:
+- **Upload && Upgrade** (HTTP) vs **Upgrade via SSH (manual)** — when to
+  use each.
+- The HTTP path's **auto-fallback to SSH** on a missing/erroring endpoint
+  (404/5xx), and that the manual button is the direct path for **old
+  servers** without `/api/admin/upgrade_wheel`.
+- The restart trying `netgen-server` then the legacy `ostg-server` unit.
+- The equivalent manual `scp + pip + restart` one-liner, plus a note that
+  0.2.28+ self-heals the FRR/DHCP assets on restart.
+The Upgrade-tab row in §1 was updated to mention both buttons.
+
+### Repo INSTALL.md
+"Updating an existing install" now leads with a **"From the GUI
+(operators)"** subsection (the two buttons + manual one-liner + self-heal
+note), with the existing repo-script flow kept under "From the repo
+scripts (developers)".
+
+### Notes
+- Docs-only (widgets/stream_dialog.py guide HTML, INSTALL.md).
+- Verified: guide HTML parses, new sections present, dialog opens.
+- Wheel ships as `ostg_trafficgen-0.2.36-py3-none-any.whl`.
+
 ## [0.2.35] - 2026-05-28
 
 Add an explicit **"Upgrade via SSH (manual)"** button to the

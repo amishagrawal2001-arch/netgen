@@ -346,14 +346,14 @@ without leaving it:</p>
 
 <table>
   <tr><th>Tab</th><th>When to use</th><th>What it does</th></tr>
-  <tr><td><b>Upgrade running server</b><br><span class="muted">HTTP, ~30–60 s</span></td>
+  <tr><td><b>Upgrade running server</b><br><span class="muted">HTTP or SSH, ~30–60 s</span></td>
       <td>Server is already running an older wheel; you want to roll a
-          new release onto it. No SSH needed.</td>
-      <td>Picks a <code>.whl</code> file → POSTs to
-          <code>/api/admin/upgrade_wheel</code> → server runs
+          new release onto it.</td>
+      <td>The Upgrade tab has <b>two</b> buttons (see §1a below):
+          <b>Upload &amp;&amp; Upgrade</b> (HTTP) and
+          <b>Upgrade via SSH (manual)</b>. Both land the new wheel via
           <code>pip install --upgrade --force-reinstall --no-deps</code>
-          under its own interpreter → triggers
-          <code>systemctl restart netgen-server</code> → client polls
+          then restart the service; the client polls
           <code>/api/health</code> for the new instance.</td></tr>
   <tr><td><b>Fresh install via SSH</b><br><span class="muted">paramiko, 15–45 min, <b>detached</b></span></td>
       <td>Bare Linux host. No netgen, no Docker, no DPDK yet.</td>
@@ -365,6 +365,45 @@ without leaving it:</p>
           output. Optional flags: <code>--no-dpdk</code>,
           <code>--skip-dpdk-build</code>.</td></tr>
 </table>
+
+<h3>1a. Two ways to upgrade a running server</h3>
+
+<p>On the <b>Upgrade running server</b> tab, fill in the server URL +
+wheel (+ optional auth token), then pick a button:</p>
+
+<table>
+  <tr><th>Button</th><th>Path</th><th>Use when</th></tr>
+  <tr><td><b>Upload &amp;&amp; Upgrade</b></td>
+      <td>HTTP <code>POST /api/admin/upgrade_wheel</code> → server
+          pip-installs &amp; restarts itself. <b>No SSH needed.</b></td>
+      <td>Normal case — the server is on 0.2.6+ (has the upgrade
+          endpoint). If the endpoint is missing/erroring and you've
+          filled in the SSH box, it <i>auto-falls back</i> to SSH
+          (see below).</td></tr>
+  <tr><td><b>Upgrade via SSH (manual)</b><br><span class="muted">NEW in 0.2.35</span></td>
+      <td>Skips HTTP entirely: sftp the wheel →
+          <code>pip install --upgrade --force-reinstall --no-deps</code>
+          → restart the service. Uses the SSH credentials on the tab.</td>
+      <td><b>OLD servers</b> that predate the
+          <code>/api/admin/upgrade_wheel</code> endpoint (pre-0.2.6), or
+          whenever you just prefer the direct path. No 404 round-trip.</td></tr>
+</table>
+
+<div class="warn"><b>Old server without the HTTP upgrade endpoint?</b>
+Use <b>Upgrade via SSH (manual)</b>. (As of 0.2.34, <b>Upload &amp;&amp;
+Upgrade</b> also auto-detects the missing endpoint — HTTP 404 — and
+offers the SSH fallback, provided you've entered SSH credentials.) The
+SSH restart tries <code>systemctl restart netgen-server</code> and falls
+back to the legacy <code>ostg-server</code> unit, so it works on both
+new and old installs.</div>
+
+<p class="muted">Equivalent manual one-liner (if you'd rather use a
+terminal): <code>scp ostg_trafficgen-&lt;ver&gt;.whl root@&lt;host&gt;:/tmp/
+&amp;&amp; ssh root@&lt;host&gt; 'pip3 install --upgrade --force-reinstall
+--no-deps /tmp/ostg_trafficgen-&lt;ver&gt;.whl &amp;&amp; (systemctl
+restart netgen-server || systemctl restart ostg-server)'</code>. Once on
+0.2.28+, the server's startup self-heal redeploys the FRR/DHCP assets and
+rebuilds the container image automatically.</p>
 
 <h3>Test Connection + pre-flight checks (NEW in 0.2.9)</h3>
 
