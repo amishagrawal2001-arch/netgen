@@ -573,12 +573,18 @@ class TrafficGenClientServerSection():
             # print(f"[STREAM TABLE] Skipping update - already populating (flag is True)")
             return  # Already updating, skip this call
         
-        # Skip refresh if user is currently interacting with the table (has focus, has selection, or is editing)
-        # This prevents selection from being cleared and cell editing from being interrupted
-        has_selection = False
-        if hasattr(self.stream_table, 'selectionModel') and self.stream_table.selectionModel():
-            has_selection = len(self.stream_table.selectionModel().selectedRows()) > 0
-        
+        # Defer the refresh ONLY for in-progress input a rebuild would
+        # destroy — an open inline editor or an open combo dropdown.
+        #
+        # We deliberately do NOT defer on mere selection or table focus.
+        # Selection is saved + restored across every rebuild (see
+        # selected_stream_ids below), so a refresh can't lose it; and an
+        # explicit user action that changes the model then refreshes —
+        # most importantly Delete (remove_selected_stream) — happens while
+        # the affected row is still selected. Deferring on has_selection
+        # made the deleted row never disappear ("delete not working"), so
+        # selection/focus are intentionally excluded from the guard.
+
         # Check if a cell is currently being edited
         # Check table state - EditingState means a cell editor is open
         is_editing = False
@@ -618,14 +624,13 @@ class TrafficGenClientServerSection():
             # If we can't check, assume no dropdown is open
             pass
         
-        if (self.stream_table.hasFocus() or has_selection or is_editing
-                or editor_open or combo_dropdown_open):
-            # Defer the refresh while the user is interacting (row selected,
-            # inline-editing a cell, or a combo dropdown open). Schedule a
-            # single catch-up retry so the deferred refresh isn't lost, then
-            # ALWAYS skip the rebuild this pass.
+        if is_editing or editor_open or combo_dropdown_open:
+            # Defer the refresh while the user has an inline editor or a
+            # combo dropdown open. Schedule a single catch-up retry so the
+            # deferred refresh isn't lost, then ALWAYS skip the rebuild this
+            # pass.
             #
-            # BUGFIX: the `return` used to be nested under
+            # BUGFIX (edit): the `return` used to be nested under
             # `if not self._pending_stream_refresh`, so only the *first*
             # poll during an edit was deferred. The 2nd+ poll (the stats
             # poller fires every ~2s, an edit takes longer) found the flag

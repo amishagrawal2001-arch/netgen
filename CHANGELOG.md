@@ -2,6 +2,37 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.51] - 2026-05-29
+
+Fix **stream delete not refreshing** — a regression from the 0.2.49/0.2.50
+inline-edit guard.
+
+### The bug (`traffic_client/server_section.py`)
+The interaction guard in `_do_update_stream_table` deferred a refresh
+whenever the table had a **selection** (or focus). But `remove_selected_stream`
+deletes the stream from the model and then calls `update_stream_table()`
+**while the deleted row is still selected** — so the guard deferred the
+rebuild and the row never disappeared, making Delete look broken. The same
+over-broad guard also held up the post-Edit / post-Apply refresh.
+
+### The fix
+Narrowed the guard to defer **only** for in-progress input a rebuild would
+actually destroy: an **open inline editor** (`state()==EditingState` or the
+focused widget being a descendant of the table) or an **open combo
+dropdown**. Selection and focus are no longer part of the condition —
+selection is saved and restored across every rebuild anyway, so a refresh
+can't lose it.
+
+### Verified (headless repros)
+- **Delete**: remove a stream while its row is selected → table refreshes,
+  row count drops, remaining rows intact. (Was: stayed unchanged.)
+- **Inline edit**: editor still survives 4 consecutive stats polls.
+- **Selection**: a selected row stays selected across an automatic refresh.
+- Full suite **103 passed**.
+
+### Notes
+- Client-only. No server or wire-format change.
+
 ## [0.2.50] - 2026-05-29
 
 Harden the Streams inline-edit guard (follow-up to 0.2.49).
