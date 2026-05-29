@@ -421,6 +421,16 @@ def start_vrrp(
 # ====================================================================
 
 
+def _ipv4_mcast_mac(ip: str) -> str:
+    """Map an IPv4 multicast address to its Ethernet multicast MAC.
+
+    RFC 1112 §6.4: 01:00:5e + the low 23 bits of the group address.
+    e.g. 239.1.1.1 → 01:00:5e:01:01:01, and 224.0.0.22 → 01:00:5e:00:00:16.
+    """
+    p = [int(x) for x in ip.split(".")]
+    return f"01:00:5e:{p[1] & 0x7f:02x}:{p[2]:02x}:{p[3]:02x}"
+
+
 def start_igmp(
     iface: str,
     *,
@@ -455,21 +465,21 @@ def start_igmp(
     def _factory():
         from scapy.layers.l2 import Ether
         from scapy.layers.inet import IP
-        # IGMP multicast frame: ether dst maps from the v4 group address,
-        # IP dst = group, TTL must be 1 (per RFC 2236 §3).
-        # Multicast MAC = 01:00:5e + low 23 bits of group.
-        parts = [int(p) for p in group.split(".")]
-        dst_mac = (
-            f"01:00:5e:{parts[1] & 0x7f:02x}:"
-            f"{parts[2]:02x}:{parts[3]:02x}"
-        )
-        ether = Ether(src=src_mac, dst=dst_mac)
+        # IGMP multicast frame: TTL must be 1 (per RFC 2236 §3). The
+        # Ethernet dst MUST track the IP dst (RFC 1112 §6.4 mapping):
+        #   • v2 Membership Report → IP dst = group  → MAC = group's MAC
+        #   • v3 Membership Report → IP dst = 224.0.0.22 → MAC = 01:00:5e:00:00:16
+        # The old code derived the L2 dst from the GROUP for BOTH versions,
+        # so v3 reports went out addressed at L2 to the group's MAC while
+        # their IP said 224.0.0.22 — a mismatched frame that IGMP-snooping
+        # switches process on the wrong multicast MAC (or drop). Bug fix:
+        # match L2 to L3 per version.
         if version == 3:
             from scapy.contrib.igmpv3 import IGMPv3, IGMPv3mr, IGMPv3gr
             t = type_code if type_code is not None else 0x22
             rec = IGMPv3gr(rtype=2, maddr=group)  # MODE_IS_EXCLUDE
             return (
-                ether
+                Ether(src=src_mac, dst=_ipv4_mcast_mac("224.0.0.22"))
                 / IP(src=src_ip, dst="224.0.0.22", ttl=1, options=[])
                 / IGMPv3(type=t)
                 / IGMPv3mr(numgrp=1, records=[rec])
@@ -477,7 +487,7 @@ def start_igmp(
         from scapy.contrib.igmp import IGMP
         t = type_code if type_code is not None else 0x16
         return (
-            ether
+            Ether(src=src_mac, dst=_ipv4_mcast_mac(group))
             / IP(src=src_ip, dst=group, ttl=1)
             / IGMP(type=t, gaddr=group)
         )

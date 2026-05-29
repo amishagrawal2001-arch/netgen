@@ -2,6 +2,41 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.38] - 2026-05-28
+
+Fix an IGMPv3 packet bug in L2 emulation: the report frame had a
+mismatched Ethernet vs IP destination.
+
+### Bug
+`utils/l2_protocols.py::start_igmp` derived the Ethernet destination
+MAC from the **group** address for *both* IGMP versions. But an IGMPv3
+Membership Report's IP destination is **224.0.0.22**, not the group —
+so v3 reports went out addressed at L2 to the group's MAC (e.g.
+`01:00:5e:01:01:01` for 239.1.1.1) while the IP header said 224.0.0.22.
+That L2/L3 mismatch makes IGMP-snooping switches process the report on
+the wrong multicast MAC (or drop it), so v3 membership wasn't being
+learned correctly. (IGMPv2 was fine — there both L2 and L3 target the
+group.)
+
+### Fix
+- Added `_ipv4_mcast_mac()` — the RFC 1112 §6.4 mapping
+  (`01:00:5e` + low 23 bits of the IPv4 group), including the high-bit
+  mask (`239.255.255.250 → 01:00:5e:7f:ff:fa`).
+- IGMPv3 now sets the Ethernet dst to `01:00:5e:00:00:16` (the MAC for
+  224.0.0.22), matching its IP dst. IGMPv2 keeps the group-derived MAC.
+- Both versions now derive the L2 dst through the shared helper so they
+  can't drift apart again.
+
+### Verified
+- MAC-mapping unit check across 224.0.0.22, group, all-routers, and the
+  0x7f-mask edge case.
+- Built a real IGMPv3 frame: `Ether dst = 01:00:5e:00:00:16`,
+  `IP dst = 224.0.0.22`, TTL 1 — L2/L3 now match.
+
+### Notes
+- Server-side fix (utils/l2_protocols.py).
+- Wheel ships as `ostg_trafficgen-0.2.38-py3-none-any.whl`.
+
 ## [0.2.37] - 2026-05-28
 
 Cosmetic fix: the SSH manual-upgrade log no longer prints a scary
