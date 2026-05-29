@@ -2,6 +2,37 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.33] - 2026-05-28
+
+Surface the v0.2.32 service-health verdict in the **Add TGEN Chassis**
+window's "Recent connections" table, so the operator sees a chassis's
+health (not just reachability) right where they pick which TGen to
+connect to.
+
+### Changes
+- `ReachabilityWorker` now also probes `/api/admin/health` (after the
+  `/api/health` reachability check) and carries the `health` verdict +
+  `issues` in its result signal.
+- New **Health** column (col 5) in the table, and the status LED (col 0)
+  is now 3-state:
+    * **✓ green** — reachable + healthy (or a pre-0.2.32 server with no
+      verdict — never false-amber)
+    * **▲ amber** — reachable but degraded; the Health cell shows
+      "Degraded" and the tooltip lists the reasons (e.g. "DPDK installed
+      but no hugepages allocated")
+    * **✗ red** — unreachable; Health shows "Offline"
+    * **—** — reachable but no verdict (server < 0.2.32 or
+      `/api/admin/health` auth-gated)
+- Probe runs on dialog open (auto) and on "Test all", so the table
+  reflects live health each time you open Add TGEN Chassis.
+
+### Notes
+- Client-only (widgets/add_tgen_dialog.py); pairs with the v0.2.32
+  server verdict.
+- Verified headless: 8-column table, all four states render correctly,
+  no false amber against a pre-verdict server.
+- Wheel ships as `ostg_trafficgen-0.2.33-py3-none-any.whl`.
+
 ## [0.2.32] - 2026-05-28
 
 Enhancement: the per-TGen status LED now reflects **service health**,

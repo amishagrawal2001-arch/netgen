@@ -120,15 +120,19 @@ def record_connection(
 
 
 class ReachabilityWorker(QThread):
-    """Pings /api/health on a list of (row, full_url) tuples concurrently.
+    """Probes /api/health (reachability + version) and, when reachable,
+    /api/admin/health (service-health verdict) for a list of
+    (row, full_url) tuples concurrently.
 
-    Result signal carries (row, ok, detail, netgen_version). The version
-    is parsed from the JSON body when /api/health returns 200; servers
-    on 0.2.11 or older don't return it and we report "?" instead.
-    Unreachable / 4xx / 5xx responses also report version "?".
+    Result signal: (row, ok, detail, netgen_version, health, issues).
+      • ok      — /api/health returned 200
+      • version — netgen_version from /api/health (0.2.12+, else "?")
+      • health  — "healthy" | "degraded" | "" (unknown / pre-0.2.32 /
+                  auth-gated admin endpoint)
+      • issues  — "; "-joined human-readable degraded reasons, or ""
     """
 
-    result = pyqtSignal(int, bool, str, str)  # (row, ok, detail, netgen_version)
+    result = pyqtSignal(int, bool, str, str, str, str)  # row, ok, detail, ver, health, issues
 
     def __init__(self, targets: list):
         super().__init__()
@@ -143,12 +147,12 @@ class ReachabilityWorker(QThread):
             import requests
         except Exception as e:
             for row, _ in self.targets:
-                self.result.emit(row, False, f"requests missing: {e}", "?")
+                self.result.emit(row, False, f"requests missing: {e}", "?", "", "")
             return
         for row, url in self.targets:
             if self._stop:
                 return
-            ok, detail, ver = False, "", "?"
+            ok, detail, ver, health, issues = False, "", "?", "", ""
             try:
                 r = requests.get(f"{url}/api/health", timeout=3)
                 ok = r.status_code == 200
@@ -161,9 +165,22 @@ class ReachabilityWorker(QThread):
                         ver = str(body.get("netgen_version", "?") or "?")
                     except Exception:
                         pass
+                    # Service-health verdict (added to /api/admin/health in
+                    # 0.2.32). Best-effort: a pre-0.2.32 server, or one that
+                    # auth-gates /api/admin/*, just leaves health="" → the
+                    # table shows "—" and the LED stays green-on-reachable.
+                    try:
+                        hr = requests.get(f"{url}/api/admin/health", timeout=4)
+                        if hr.status_code == 200:
+                            hb = hr.json()
+                            health = str(hb.get("health", "") or "")
+                            iss = hb.get("issues") or []
+                            issues = "; ".join(iss) if isinstance(iss, list) else str(iss)
+                    except Exception:
+                        pass
             except Exception as e:
                 detail = str(e).split("\n", 1)[0][:80]
-            self.result.emit(row, ok, detail, ver)
+            self.result.emit(row, ok, detail, ver, health, issues)
 
 
 # ---------------------------------------------------------------------------
@@ -227,13 +244,14 @@ class AddTGenDialog(QDialog):
         # History table
         hist_box = QGroupBox("Recent connections")
         hb = QVBoxLayout(hist_box)
-        # 7 columns: LED, Address, Port, Label, Version, Last, Count.
-        # Version (col 4) is populated by ReachabilityWorker from
-        # /api/health's netgen_version field (added in 0.2.12; older
-        # servers show "?" because the field isn't in their response).
-        self.table = QTableWidget(0, 7)
+        # 8 columns: LED, Address, Port, Label, Version, Health, Last, Count.
+        # Version (col 4) is the netgen_version from /api/health (0.2.12+).
+        # Health (col 5) is the service-health verdict from
+        # /api/admin/health (0.2.32+): Healthy / Degraded(+reasons) / —.
+        # Both are populated by ReachabilityWorker on probe.
+        self.table = QTableWidget(0, 8)
         self.table.setHorizontalHeaderLabels([
-            "●", "Address", "Port", "Label", "Version", "Last connected", "× connects",
+            "●", "Address", "Port", "Label", "Version", "Health", "Last connected", "× connects",
         ])
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         # ExtendedSelection = Ctrl/Shift-click for multi-select. Lets the
@@ -248,8 +266,9 @@ class AddTGenDialog(QDialog):
         h.setSectionResizeMode(2, QHeaderView.ResizeToContents)
         h.setSectionResizeMode(3, QHeaderView.Stretch)
         h.setSectionResizeMode(4, QHeaderView.ResizeToContents)
-        h.setSectionResizeMode(5, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(5, QHeaderView.ResizeToContents)   # Health
         h.setSectionResizeMode(6, QHeaderView.ResizeToContents)
+        h.setSectionResizeMode(7, QHeaderView.ResizeToContents)
         self.table.setColumnWidth(0, 28)
         self.table.itemSelectionChanged.connect(self._on_row_selected)
         self.table.itemDoubleClicked.connect(self._on_row_double_clicked)
@@ -396,9 +415,15 @@ class AddTGenDialog(QDialog):
             ver_item.setForeground(QColor("#9ca3af"))
             ver_item.setToolTip("Server version — populated by the reachability probe")
             self.table.setItem(i, 4, ver_item)
+            # Health (col 5) — service-health verdict, filled by the probe.
+            health_item = QTableWidgetItem("—")
+            health_item.setTextAlignment(Qt.AlignCenter)
+            health_item.setForeground(QColor("#9ca3af"))
+            health_item.setToolTip("Service health — populated by the reachability probe")
+            self.table.setItem(i, 5, health_item)
             last = e.get("last_connected", "")
-            self.table.setItem(i, 5, QTableWidgetItem(_pretty_age(last)))
-            self.table.setItem(i, 6, QTableWidgetItem(str(e.get("connect_count", 0))))
+            self.table.setItem(i, 6, QTableWidgetItem(_pretty_age(last)))
+            self.table.setItem(i, 7, QTableWidgetItem(str(e.get("connect_count", 0))))
 
     def _on_row_selected(self) -> None:
         # Auto-fill form from the first selected row. With multi-select
@@ -546,19 +571,53 @@ class AddTGenDialog(QDialog):
         self._worker.finished.connect(self._on_probe_finished)
         self._worker.start()
 
-    def _on_probe_result(self, row: int, ok: bool, detail: str, ver: str = "?") -> None:
+    def _on_probe_result(self, row: int, ok: bool, detail: str, ver: str = "?",
+                         health: str = "", issues: str = "") -> None:
         led = self.table.item(row, 0)
         ver_item = self.table.item(row, 4)
+        health_item = self.table.item(row, 5)
         if not led:
             return
-        if ok:
-            led.setText("✓")
-            led.setForeground(QColor("#15803d"))
-            led.setToolTip(f"Online — {detail}")
-        else:
+        degraded = ok and (health == "degraded")
+        if not ok:
+            # Unreachable → red ✗
             led.setText("✗")
             led.setForeground(QColor("#dc2626"))
             led.setToolTip(f"Unreachable — {detail}")
+        elif degraded:
+            # Reachable but service-degraded → amber ▲
+            led.setText("▲")
+            led.setForeground(QColor("#d97706"))
+            led.setToolTip(f"Degraded — {issues or 'a subsystem is unhealthy'}")
+        else:
+            # Reachable + healthy (or pre-0.2.32 server w/o verdict) → green ✓
+            led.setText("✓")
+            led.setForeground(QColor("#15803d"))
+            led.setToolTip(f"Online — {detail}")
+
+        # Health column (col 5)
+        if health_item is not None:
+            if not ok:
+                health_item.setText("Offline")
+                health_item.setForeground(QColor("#9ca3af"))
+                health_item.setToolTip("Server unreachable")
+            elif degraded:
+                health_item.setText("Degraded")
+                health_item.setForeground(QColor("#d97706"))
+                health_item.setToolTip(issues or "A subsystem is unhealthy")
+            elif health == "healthy":
+                health_item.setText("Healthy")
+                health_item.setForeground(QColor("#15803d"))
+                health_item.setToolTip("All subsystems OK")
+            else:
+                # Reachable but no verdict (server < 0.2.32, or /api/admin
+                # auth-gated) — show a neutral dash, keep the LED green.
+                health_item.setText("—")
+                health_item.setForeground(QColor("#9ca3af"))
+                health_item.setToolTip(
+                    "Service-health verdict unavailable (server older than "
+                    "0.2.32, or /api/admin/health requires auth)"
+                )
         if ver_item is not None:
             ver_item.setText(ver or "?")
             # Different shades for known / unknown / unreachable so the
