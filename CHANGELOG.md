@@ -2,6 +2,35 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.39] - 2026-05-28
+
+Fix: L2 emulation always defaulted its interface to **loopback** — which
+is useless, since LACP/LLDP/VRRP/IGMP/PIM frames must egress a real NIC
+toward the switch.
+
+### Cause
+`L2EmulationTab._guess_default_iface()` returned `ifaces[0]` — the first
+entry of the server's `/api/interfaces` list. That list returns **`lo`
+first** (confirmed on svl-hp-ai-srv02:
+`['lo', 'ens14f0', …, 'ens6f1np1', …]`), so the Start-session dialog
+pre-filled `lo` every time.
+
+### Fix
+- Added `_skip_as_default_iface()` — skips `lo`/`lo0`/`loopback` and
+  obvious virtual/non-egress devices (`vrf-`, `docker`, `br-`, `veth`,
+  `virbr`, `tap`, `tun`).
+- `_guess_default_iface()` now returns the **first real egress NIC** from
+  the first online server's cached list (e.g. `ens14f0` instead of `lo`).
+  Still editable in the dialog; falls back to `eth0` if none cached.
+
+### Verified
+Against srv02's actual interface order, the picker now skips `lo` (and
+docker/vrf/veth/virbr) and selects `ens14f0` — the first physical NIC.
+
+### Notes
+- Client-only (widgets/l2_emulation_tab.py).
+- Wheel ships as `ostg_trafficgen-0.2.39-py3-none-any.whl`.
+
 ## [0.2.38] - 2026-05-28
 
 Fix an IGMPv3 packet bug in L2 emulation: the report frame had a

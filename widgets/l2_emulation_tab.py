@@ -758,21 +758,35 @@ class L2EmulationTab(QWidget):
             f"HTTP {r.status_code}: {err}"
         )
 
+    @staticmethod
+    def _skip_as_default_iface(name: str) -> bool:
+        """True for interfaces that must never be the L2 default.
+
+        L2 emulation frames (LACP/LLDP/VRRP/IGMP/PIM) have to egress a
+        real NIC toward the switch — loopback delivers them nowhere. The
+        server's /api/interfaces list frequently returns 'lo' FIRST, so
+        the old `ifaces[0]` pick defaulted the dialog to loopback. Skip
+        loopback and obvious virtual/non-egress devices.
+        """
+        n = (name or "").strip().lower()
+        if not n:
+            return True
+        if n in ("lo", "lo0", "loopback"):
+            return True
+        return n.startswith(("vrf-", "docker", "br-", "veth", "virbr", "tap", "tun"))
+
     def _guess_default_iface(self) -> str:
-        """Pick a sane default interface for the dialog. Walks the
-        first online server's interface list (if cached), else falls
-        back to eth0."""
+        """Pick a sane default EGRESS interface for the dialog: the first
+        non-loopback, non-virtual interface from the first online server's
+        cached list. Falls back to eth0 if none is cached."""
         try:
             mw = self._parent_window
             servers = getattr(mw, "server_interfaces", []) or []
             for s in servers:
-                ifaces = s.get("interfaces") or []
-                if ifaces:
-                    first = ifaces[0]
-                    if isinstance(first, dict):
-                        return first.get("name") or "eth0"
-                    if isinstance(first, str):
-                        return first
+                for ent in (s.get("interfaces") or []):
+                    name = ent.get("name") if isinstance(ent, dict) else ent
+                    if name and not self._skip_as_default_iface(name):
+                        return name
         except Exception:
             pass
         return "eth0"
