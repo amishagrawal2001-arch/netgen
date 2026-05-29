@@ -520,40 +520,36 @@ class L2EmulationTab(QWidget):
         self._unsupported_reason: str = ""
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(10, 10, 10, 10)
-        outer.setSpacing(8)
+        outer.setContentsMargins(8, 6, 8, 4)
+        outer.setSpacing(5)
 
         # ── Header banner ─────────────────────────────────────────────
-        # Title + one-line purpose on the left, a live status chip on the
-        # right. Gives the tab a clear identity instead of a bare toolbar.
+        # Single compact row: title + inline protocol list on the left, a
+        # live status chip on the right. Kept to one line so the table gets
+        # the vertical space.
         header = QFrame()
         header.setObjectName("l2Header")
         header.setStyleSheet(
             "#l2Header { background: #f8fafc; border: 1px solid #e2e8f0; "
-            "border-radius: 8px; }"
+            "border-radius: 6px; }"
         )
         hl = QHBoxLayout(header)
-        hl.setContentsMargins(14, 10, 14, 10)
+        hl.setContentsMargins(12, 4, 10, 4)
+        hl.setSpacing(8)
 
-        title_box = QVBoxLayout()
-        title_box.setSpacing(1)
-        title = QLabel("L2 / Multicast Emulation")
-        title.setStyleSheet(
-            "font-size: 15px; font-weight: 700; color: #0f172a;"
+        title = QLabel(
+            "<b style='font-size:13px;color:#0f172a;'>L2 / Multicast "
+            "Emulation</b><span style='color:#94a3b8;font-size:11px;'>"
+            "&nbsp;&nbsp;LACP · LLDP · VRRP · IGMP · PIM Hello</span>"
         )
-        subtitle = QLabel(
-            "LACP · LLDP · VRRP · IGMP · PIM Hello frame generators"
-        )
-        subtitle.setStyleSheet("color: #64748b; font-size: 11px;")
-        title_box.addWidget(title)
-        title_box.addWidget(subtitle)
-        hl.addLayout(title_box)
+        title.setTextFormat(Qt.RichText)
+        hl.addWidget(title)
         hl.addStretch(1)
 
         # Live count chip — running / total. Updated each poll.
         self._count_chip = QLabel("—")
         self._count_chip.setAlignment(Qt.AlignCenter)
-        self._count_chip.setMinimumWidth(150)
+        self._count_chip.setMinimumWidth(140)
         self._set_count_chip(0, 0)
         hl.addWidget(self._count_chip)
         outer.addWidget(header)
@@ -566,7 +562,7 @@ class L2EmulationTab(QWidget):
         self._start_btn.setCursor(Qt.PointingHandCursor)
         self._start_btn.setStyleSheet(
             "QPushButton { background-color: #16a34a; color: white; "
-            "font-weight: 600; padding: 6px 16px; border-radius: 4px; } "
+            "font-weight: 600; padding: 4px 16px; border-radius: 4px; } "
             "QPushButton:hover { background-color: #15803d; }"
         )
         self._start_btn.clicked.connect(self._on_start_clicked)
@@ -575,13 +571,13 @@ class L2EmulationTab(QWidget):
         # Neutral / danger buttons share a consistent flat style.
         _neutral_css = (
             "QPushButton { background-color: #ffffff; color: #334155; "
-            "border: 1px solid #cbd5e1; padding: 6px 14px; border-radius: 4px; } "
+            "border: 1px solid #cbd5e1; padding: 4px 14px; border-radius: 4px; } "
             "QPushButton:hover { background-color: #f1f5f9; } "
             "QPushButton:disabled { color: #cbd5e1; border-color: #e2e8f0; }"
         )
         _danger_css = (
             "QPushButton { background-color: #ffffff; color: #b91c1c; "
-            "border: 1px solid #fca5a5; padding: 6px 14px; border-radius: 4px; } "
+            "border: 1px solid #fca5a5; padding: 4px 14px; border-radius: 4px; } "
             "QPushButton:hover { background-color: #fef2f2; }"
         )
 
@@ -626,7 +622,7 @@ class L2EmulationTab(QWidget):
         self._table.setAlternatingRowColors(True)
         self._table.setShowGrid(False)
         self._table.verticalHeader().setVisible(False)
-        self._table.verticalHeader().setDefaultSectionSize(30)
+        self._table.verticalHeader().setDefaultSectionSize(26)
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.horizontalHeader().setHighlightSections(False)
         self._table.setStyleSheet(
@@ -665,15 +661,18 @@ class L2EmulationTab(QWidget):
                 hi.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
         outer.addWidget(self._table, 1)
 
-        # Hint footer
+        # Hint footer — single compact line, full text on hover.
         hint = QLabel(
-            "L2 frame generators need <code>CAP_NET_RAW</code> on Linux or root on macOS. "
-            "If you see <code>PermissionError</code> in Last Error, the worker stopped — "
-            "fix the server-side permissions and retry."
+            "Needs <code>CAP_NET_RAW</code> (Linux) / root (macOS). "
+            "<code>PermissionError</code> in Last Error means the worker stopped."
         )
         hint.setTextFormat(Qt.RichText)
-        hint.setStyleSheet("color: #94a3b8; font-size: 11px;")
-        hint.setWordWrap(True)
+        hint.setStyleSheet("color: #94a3b8; font-size: 10px;")
+        hint.setToolTip(
+            "L2 frame generators need CAP_NET_RAW on Linux or root on macOS. "
+            "If you see PermissionError in Last Error, the worker stopped — "
+            "fix the server-side permissions and retry."
+        )
         outer.addWidget(hint)
 
         # Auto-refresh timer — light, just polls /api/l2/sessions.
@@ -774,8 +773,8 @@ class L2EmulationTab(QWidget):
         )
         self._count_chip.setTextFormat(Qt.RichText)
         self._count_chip.setStyleSheet(
-            f"background: {bg}; color: {fg}; font-size: 12px; "
-            f"padding: 4px 12px; border-radius: 10px;"
+            f"background: {bg}; color: {fg}; font-size: 11px; "
+            f"padding: 2px 10px; border-radius: 9px;"
         )
 
     def _on_refresh_failed(self, msg: str, http_code: int):
@@ -820,8 +819,8 @@ class L2EmulationTab(QWidget):
         self._info_label.setText(reason)
         self._count_chip.setText("unavailable")
         self._count_chip.setStyleSheet(
-            "background: #fef3c7; color: #b45309; font-size: 12px; "
-            "padding: 4px 12px; border-radius: 10px;"
+            "background: #fef3c7; color: #b45309; font-size: 11px; "
+            "padding: 2px 10px; border-radius: 9px;"
         )
         # Tooltip on the button for hover-discovery.
         self._start_btn.setToolTip(reason)

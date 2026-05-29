@@ -2,6 +2,35 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.44] - 2026-05-29
+
+Make the L2 / Multicast Emulation tab **more compact** — the chrome was
+eating vertical space and squeezing the session table.
+
+### What changed (`widgets/l2_emulation_tab.py`)
+- **Header collapsed to a single row**: the title and the protocol list
+  (`LACP · LLDP · …`) now share one line instead of stacking, with the
+  status chip beside them. Tighter banner padding.
+- **Slimmer toolbar buttons** (reduced vertical padding) and a slimmer
+  status chip.
+- **Table row height 30 → 26 px** so more sessions fit on screen.
+- **Footer condensed to one short line**, with the full
+  CAP_NET_RAW/root explanation moved to its tooltip.
+- Reduced outer margins / inter-widget spacing.
+
+### Why
+Follow-up to 0.2.43: on a normal window the header + toolbar + footer
+were taking a disproportionate share of the tab, leaving the table a thin
+strip. This reclaims that space for session rows.
+
+### Verified
+Headless render of empty + populated states; smoke assertions still pass.
+Full suite green (one timing-sensitive stateful-TCP test flaked then
+passed in isolation — unrelated to this client-only change).
+
+### Notes
+- Client-only (`widgets/l2_emulation_tab.py`). No functional change.
+
 ## [0.2.43] - 2026-05-29
 
 Visual redesign of the **L2 / Multicast Emulation** tab for better
