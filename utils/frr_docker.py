@@ -1298,8 +1298,15 @@ class FRRDockerManager:
 # sites work unchanged.
 class _LazyFRRManager:
     """Transparent proxy that instantiates the real FRRDockerManager on
-    first attribute access and forwards everything to it thereafter."""
-    __slots__ = ()
+    first attribute access and forwards everything to it thereafter.
+
+    NB: intentionally NOT using ``__slots__`` — the proxy needs a normal
+    ``__dict__`` so callers (and ``unittest.mock.patch.object``) can SET
+    attributes on it. Attributes set on the proxy live in its __dict__
+    and take precedence; only *unset* attributes fall through to the real
+    manager via ``__getattr__`` (which still defers the Docker connect
+    until the first real method use — preserving import-without-Docker).
+    """
     _real = None
 
     def _get(self):
@@ -1308,8 +1315,9 @@ class _LazyFRRManager:
         return _LazyFRRManager._real
 
     def __getattr__(self, name):
-        # __getattr__ only fires for names not found normally, so this
-        # never recurses on _get / class internals.
+        # __getattr__ only fires for names not found on the instance/class,
+        # so a patched/explicitly-set attribute shadows this and we never
+        # recurse on _get / class internals.
         return getattr(self._get(), name)
 
 

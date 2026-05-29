@@ -2,6 +2,34 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.42] - 2026-05-29
+
+Fix a regression in the lazy `FRRDockerManager` proxy that prevented
+attributes from being **set** on the `frr_manager` singleton.
+
+### What changed
+- **`utils/frr_docker.py`**: removed `__slots__ = ()` from
+  `_LazyFRRManager`. Without a `__dict__`, any attempt to *set* an
+  attribute on the proxy (`frr_manager.foo = ...`) — or to patch one via
+  `unittest.mock.patch.object(frr_manager, ...)` — raised
+  `AttributeError: '_LazyFRRManager' object … has no __dict__ for setting
+  new attributes`. The proxy now has a normal `__dict__`: set/patched
+  attributes live there and shadow `__getattr__`, while *unset* attributes
+  still fall through to the real manager (and still defer the Docker
+  connect until first real use, preserving import-without-Docker).
+
+### Why
+The `__slots__` was added in 0.2.29 as a micro-optimisation but broke
+`patch.object(frr_manager, "vrf_name_for_device", …)` in the VRF-wiring
+tests and would have broken any production code that assigns onto the
+singleton.
+
+### Verified
+Full suite **103 passed** (`tests/test_vrf_wiring.py` 6/6 green again).
+
+### Notes
+- Server-side only (utils/frr_docker.py). No client or wire-format change.
+
 ## [0.2.41] - 2026-05-28
 
 Add **inline 802.1Q (Dot1Q) VLAN tagging** to L2 emulation — Spirent-style
