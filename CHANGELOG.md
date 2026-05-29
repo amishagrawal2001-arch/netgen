@@ -2,6 +2,34 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.48] - 2026-05-29
+
+Finish the cross-tab table-consistency pass: the **L2 Emulation** table
+now shows the row-number gutter like every other data table.
+
+### What changed (`widgets/l2_emulation_tab.py`)
+- Removed `verticalHeader().setVisible(False)`. The L2 table was the lone
+  outlier hiding the row-number gutter; Devices, Streams and all the
+  protocol sub-tables (BGP / OSPF / IS-IS / DHCP / VXLAN) show it. The
+  table now matches them. Rows stay compact (24 px).
+
+### Audit result (no other changes needed)
+- **Config-tab data tables** (Devices, Streams, BGP/OSPF/IS-IS/DHCP/VXLAN,
+  L2) — all now plain default Qt chrome + row-number gutter. Consistent.
+- **Topology tab** — a graphics/diagram view, no table. N/A.
+- **Statistics dock** (Interface + Stream stats) — intentionally left
+  with its monospace 12 px font + taller rows for live-throughput
+  readability (a distinct monitoring surface, per user direction).
+- **Server tree** (left navigator) — a styled `QTreeWidget`, distinct nav
+  element, unchanged.
+
+### Verified
+Headless render confirms the gutter is shown and the table is otherwise
+unchanged. Full suite **103 passed**.
+
+### Notes
+- Client-only. No server or wire-format change.
+
 ## [0.2.47] - 2026-05-29
 
 Make the **Streams table** visually identical to the Devices tab —

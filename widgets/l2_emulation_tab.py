@@ -613,7 +613,10 @@ class L2EmulationTab(QWidget):
         self._table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._table.setSelectionBehavior(QTableWidget.SelectRows)
         self._table.setSelectionMode(QTableWidget.ExtendedSelection)
-        self._table.verticalHeader().setVisible(False)
+        # Show the row-number gutter like every other data table in the
+        # app (Devices / Streams / BGP / OSPF / IS-IS / DHCP / VXLAN) — the
+        # L2 table used to be the lone outlier that hid it. Rows stay
+        # compact (24px).
         self._table.verticalHeader().setDefaultSectionSize(24)
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.horizontalHeader().setHighlightSections(False)
