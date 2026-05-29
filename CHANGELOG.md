@@ -2,6 +2,51 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.43] - 2026-05-29
+
+Visual redesign of the **L2 / Multicast Emulation** tab for better
+readability and a more professional look.
+
+### What changed (`widgets/l2_emulation_tab.py`)
+- **Header banner**: title + one-line protocol summary, with a live
+  status chip on the right (`● N running · M total`) that turns green
+  when something is emitting and amber when the server can't serve
+  `/api/l2/*`.
+- **Restyled toolbar**: primary-green Start, flat neutral
+  Stop-selected / Refresh, outlined-red Stop-all, pointer cursors, and a
+  right-aligned status/notice line (errors now render in amber instead
+  of plain grey).
+- **Richer session table**:
+  - New **VLAN** column (shows the inline 802.1Q tag + PCP, or
+    `untagged`) and a dedicated **Failed** column for `frames_failed`
+    (red when non-zero).
+  - **Status pill** (`● Running` / `● Stopped`) and a per-protocol
+    **colour-coded badge** (LACP/LLDP/VRRP/IGMP/PIM).
+  - Human-readable formatting: thousands-separated frame counts,
+    `KB/MB/GB` byte sizes, and compact `2h 5m 9s` uptime (was raw bytes
+    and `123.4`-second floats).
+  - Session ID is monospaced + truncated with the full UUID on hover;
+    columns reordered glance-first (Status → … → Session ID → Last
+    Error), alternating row colours, styled header, no gridlines.
+- **Config dialog polish**: dialog header + subtitle, common fields
+  grouped under a **Common settings** box (distinct from the
+  protocol-specific section), and a green **Start** button.
+
+### Why
+The old tab was a bare toolbar over a plain table that printed raw byte
+counts and second-floats and didn't surface the VLAN tag or failed-frame
+count at all. This makes session state readable at a glance.
+
+### Verified
+Headless render + assertions on formatting, columns, VLAN display,
+session-id stashing (for Stop-selected), and dialog payload round-trip.
+Full suite **103 passed**.
+
+### Notes
+- Client-only (`widgets/l2_emulation_tab.py`). No server or wire-format
+  change; the data shown all comes from the existing
+  `/api/l2/sessions` snapshot.
+
 ## [0.2.42] - 2026-05-29
 
 Fix a regression in the lazy `FRRDockerManager` proxy that prevented

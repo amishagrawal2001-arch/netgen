@@ -29,13 +29,20 @@ from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
 from PyQt5.QtGui import QColor, QFont
 from PyQt5.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
-    QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton, QSpinBox,
-    QStackedWidget, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
-    QHeaderView, QGroupBox, QDoubleSpinBox,
+    QFrame, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPushButton,
+    QSpinBox, QStackedWidget, QTableWidget, QTableWidgetItem, QVBoxLayout,
+    QWidget, QHeaderView, QGroupBox, QDoubleSpinBox,
 )
 
 
 logger = logging.getLogger(__name__)
+
+
+def _bold_font() -> QFont:
+    """A semibold font for the protocol-badge cell."""
+    f = QFont()
+    f.setBold(True)
+    return f
 
 
 # ---------------------------------------------------------------- fetch worker
@@ -101,13 +108,32 @@ class _L2ConfigDialog(QDialog):
     def __init__(self, parent=None, default_iface: str = ""):
         super().__init__(parent)
         self.setWindowTitle("Start L2 emulation session")
-        self.setMinimumWidth(540)
+        self.setMinimumWidth(560)
         self._payload: Optional[Dict[str, Any]] = None
 
         outer = QVBoxLayout(self)
+        outer.setContentsMargins(14, 12, 14, 12)
+        outer.setSpacing(10)
 
-        # Protocol picker
-        top_form = QFormLayout()
+        # Dialog header — title + one-line purpose.
+        hdr = QLabel("Start L2 / multicast emulation")
+        hdr.setStyleSheet(
+            "font-size: 15px; font-weight: 600; color: #0f172a;"
+        )
+        outer.addWidget(hdr)
+        sub = QLabel(
+            "Pick a protocol and tune its parameters. The frame egresses the "
+            "chosen interface on the server."
+        )
+        sub.setStyleSheet("color: #64748b; font-size: 11px;")
+        sub.setWordWrap(True)
+        outer.addWidget(sub)
+
+        # Common settings (apply to every protocol) live in their own box
+        # so the protocol-specific stack reads as a distinct second section.
+        common_box = QGroupBox("Common settings")
+        top_form = QFormLayout(common_box)
+        top_form.setLabelAlignment(Qt.AlignRight)
         self._proto_combo = QComboBox()
         for key, label in self.PROTOCOLS:
             self._proto_combo.addItem(label, key)
@@ -147,7 +173,7 @@ class _L2ConfigDialog(QDialog):
         self._vlan_pcp_spin.setToolTip("802.1p priority (PCP), 0-7. Only used when VLAN ID > 0.")
         top_form.addRow("VLAN PCP:", self._vlan_pcp_spin)
 
-        outer.addLayout(top_form)
+        outer.addWidget(common_box)
 
         # Per-protocol stack
         self._stack = QStackedWidget()
@@ -160,16 +186,23 @@ class _L2ConfigDialog(QDialog):
 
         # Hint footer
         hint = QLabel(
-            "After clicking Start, watch the session table for the "
-            "'last_error' column — root/CAP_NET_RAW failures surface there."
+            "After clicking Start, watch the session table's <b>Last Error</b> "
+            "column — root / <code>CAP_NET_RAW</code> failures surface there."
         )
+        hint.setTextFormat(Qt.RichText)
         hint.setStyleSheet("color: #6b7280; font-size: 11px;")
         hint.setWordWrap(True)
         outer.addWidget(hint)
 
         # Buttons
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        buttons.button(QDialogButtonBox.Ok).setText("Start")
+        ok_btn = buttons.button(QDialogButtonBox.Ok)
+        ok_btn.setText("Start")
+        ok_btn.setStyleSheet(
+            "QPushButton { background-color: #16a34a; color: white; "
+            "font-weight: 600; padding: 5px 18px; border-radius: 4px; } "
+            "QPushButton:hover { background-color: #15803d; }"
+        )
         buttons.accepted.connect(self._on_accept)
         buttons.rejected.connect(self.reject)
         outer.addWidget(buttons)
@@ -455,10 +488,25 @@ class L2EmulationTab(QWidget):
     """
 
     POLL_INTERVAL_MS = 3000
+    # Column order is glance-first: status & protocol up front, the long
+    # opaque Session ID near the end, Last Error stretches to fill.
     COLUMNS = [
-        "Session ID", "Protocol", "Iface", "Running",
-        "Frames Sent", "Bytes Sent", "Last Error", "Uptime (s)",
+        "Status", "Protocol", "Interface", "VLAN",
+        "Frames TX", "Failed", "Bytes TX", "Uptime",
+        "Session ID", "Last Error",
     ]
+    COL_STATUS, COL_PROTO, COL_IFACE, COL_VLAN = 0, 1, 2, 3
+    COL_FRAMES, COL_FAILED, COL_BYTES, COL_UPTIME = 4, 5, 6, 7
+    COL_SID, COL_ERR = 8, 9
+
+    # Per-protocol accent colour for the badge text.
+    _PROTO_COLORS = {
+        "lacp": "#7c3aed",   # violet
+        "lldp": "#0891b2",   # cyan
+        "vrrp": "#ca8a04",   # amber
+        "igmp": "#2563eb",   # blue
+        "pim":  "#db2777",   # pink
+    }
 
     def __init__(self, parent_window):
         super().__init__(parent_window)
@@ -472,26 +520,80 @@ class L2EmulationTab(QWidget):
         self._unsupported_reason: str = ""
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(8, 8, 8, 8)
-        outer.setSpacing(6)
+        outer.setContentsMargins(10, 10, 10, 10)
+        outer.setSpacing(8)
 
-        # Toolbar
+        # ── Header banner ─────────────────────────────────────────────
+        # Title + one-line purpose on the left, a live status chip on the
+        # right. Gives the tab a clear identity instead of a bare toolbar.
+        header = QFrame()
+        header.setObjectName("l2Header")
+        header.setStyleSheet(
+            "#l2Header { background: #f8fafc; border: 1px solid #e2e8f0; "
+            "border-radius: 8px; }"
+        )
+        hl = QHBoxLayout(header)
+        hl.setContentsMargins(14, 10, 14, 10)
+
+        title_box = QVBoxLayout()
+        title_box.setSpacing(1)
+        title = QLabel("L2 / Multicast Emulation")
+        title.setStyleSheet(
+            "font-size: 15px; font-weight: 700; color: #0f172a;"
+        )
+        subtitle = QLabel(
+            "LACP · LLDP · VRRP · IGMP · PIM Hello frame generators"
+        )
+        subtitle.setStyleSheet("color: #64748b; font-size: 11px;")
+        title_box.addWidget(title)
+        title_box.addWidget(subtitle)
+        hl.addLayout(title_box)
+        hl.addStretch(1)
+
+        # Live count chip — running / total. Updated each poll.
+        self._count_chip = QLabel("—")
+        self._count_chip.setAlignment(Qt.AlignCenter)
+        self._count_chip.setMinimumWidth(150)
+        self._set_count_chip(0, 0)
+        hl.addWidget(self._count_chip)
+        outer.addWidget(header)
+
+        # ── Toolbar ───────────────────────────────────────────────────
         toolbar = QHBoxLayout()
+        toolbar.setSpacing(6)
 
         self._start_btn = QPushButton("Start emulation…")
+        self._start_btn.setCursor(Qt.PointingHandCursor)
         self._start_btn.setStyleSheet(
             "QPushButton { background-color: #16a34a; color: white; "
-            "font-weight: 600; padding: 5px 14px; border-radius: 4px; } "
+            "font-weight: 600; padding: 6px 16px; border-radius: 4px; } "
             "QPushButton:hover { background-color: #15803d; }"
         )
         self._start_btn.clicked.connect(self._on_start_clicked)
         toolbar.addWidget(self._start_btn)
 
+        # Neutral / danger buttons share a consistent flat style.
+        _neutral_css = (
+            "QPushButton { background-color: #ffffff; color: #334155; "
+            "border: 1px solid #cbd5e1; padding: 6px 14px; border-radius: 4px; } "
+            "QPushButton:hover { background-color: #f1f5f9; } "
+            "QPushButton:disabled { color: #cbd5e1; border-color: #e2e8f0; }"
+        )
+        _danger_css = (
+            "QPushButton { background-color: #ffffff; color: #b91c1c; "
+            "border: 1px solid #fca5a5; padding: 6px 14px; border-radius: 4px; } "
+            "QPushButton:hover { background-color: #fef2f2; }"
+        )
+
         self._stop_btn = QPushButton("Stop selected")
+        self._stop_btn.setCursor(Qt.PointingHandCursor)
+        self._stop_btn.setStyleSheet(_neutral_css)
         self._stop_btn.clicked.connect(self._on_stop_selected)
         toolbar.addWidget(self._stop_btn)
 
         self._stop_all_btn = QPushButton("Stop all")
+        self._stop_all_btn.setCursor(Qt.PointingHandCursor)
+        self._stop_all_btn.setStyleSheet(_danger_css)
         self._stop_all_btn.setToolTip(
             "Stop every L2 emulation session on this server."
         )
@@ -499,40 +601,68 @@ class L2EmulationTab(QWidget):
         toolbar.addWidget(self._stop_all_btn)
 
         self._refresh_btn = QPushButton("Refresh")
+        self._refresh_btn.setCursor(Qt.PointingHandCursor)
+        self._refresh_btn.setStyleSheet(_neutral_css)
         self._refresh_btn.clicked.connect(self.refresh)
         toolbar.addWidget(self._refresh_btn)
 
-        self._info_label = QLabel("No sessions loaded.")
-        self._info_label.setStyleSheet("color: #6b7280; font-size: 11px;")
-        toolbar.addWidget(self._info_label)
-
         toolbar.addStretch(1)
 
-        protocols_legend = QLabel(
-            "<span style='font-size:11px;color:#6b7280;'>"
-            "Supports: <b>LACP</b> · <b>LLDP</b> · <b>VRRP</b> · "
-            "<b>IGMP</b> · <b>PIM Hello</b></span>"
-        )
-        protocols_legend.setTextFormat(Qt.RichText)
-        toolbar.addWidget(protocols_legend)
+        # Status / notice line — transient errors and unsupported-server
+        # notices land here (right-aligned so it never shoves the buttons).
+        self._info_label = QLabel("")
+        self._info_label.setStyleSheet("color: #6b7280; font-size: 11px;")
+        self._info_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        toolbar.addWidget(self._info_label, 1)
 
         outer.addLayout(toolbar)
 
-        # Session table
+        # ── Session table ─────────────────────────────────────────────
         self._table = QTableWidget(0, len(self.COLUMNS))
         self._table.setHorizontalHeaderLabels(self.COLUMNS)
         self._table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._table.setSelectionBehavior(QTableWidget.SelectRows)
         self._table.setSelectionMode(QTableWidget.ExtendedSelection)
+        self._table.setAlternatingRowColors(True)
+        self._table.setShowGrid(False)
         self._table.verticalHeader().setVisible(False)
+        self._table.verticalHeader().setDefaultSectionSize(30)
         self._table.horizontalHeader().setStretchLastSection(True)
-        self._table.setColumnWidth(0, 250)
-        self._table.setColumnWidth(1, 70)
-        self._table.setColumnWidth(2, 80)
-        self._table.setColumnWidth(3, 70)
-        self._table.setColumnWidth(4, 100)
-        self._table.setColumnWidth(5, 100)
-        self._table.setColumnWidth(7, 90)
+        self._table.horizontalHeader().setHighlightSections(False)
+        self._table.setStyleSheet(
+            "QTableWidget {"
+            " background: #ffffff;"
+            " alternate-background-color: #f8fafc;"
+            " gridline-color: #e2e8f0;"
+            " selection-background-color: #dbeafe;"
+            " selection-color: #0f172a;"
+            " border: 1px solid #e2e8f0;"
+            " border-radius: 6px;"
+            "}"
+            "QTableWidget::item { padding: 2px 8px; }"
+            "QHeaderView::section {"
+            " background: #f1f5f9; color: #475569;"
+            " padding: 6px 8px; border: none;"
+            " border-bottom: 2px solid #e2e8f0;"
+            " font-weight: 600;"
+            "}"
+        )
+        self._table.setColumnWidth(self.COL_STATUS, 96)
+        self._table.setColumnWidth(self.COL_PROTO, 86)
+        self._table.setColumnWidth(self.COL_IFACE, 110)
+        self._table.setColumnWidth(self.COL_VLAN, 92)
+        self._table.setColumnWidth(self.COL_FRAMES, 108)
+        self._table.setColumnWidth(self.COL_FAILED, 72)
+        self._table.setColumnWidth(self.COL_BYTES, 100)
+        self._table.setColumnWidth(self.COL_UPTIME, 92)
+        self._table.setColumnWidth(self.COL_SID, 132)
+        # Right-align the numeric-column headers so they sit over their
+        # right-aligned values.
+        for col in (self.COL_FRAMES, self.COL_FAILED,
+                    self.COL_BYTES, self.COL_UPTIME):
+            hi = self._table.horizontalHeaderItem(col)
+            if hi is not None:
+                hi.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
         outer.addWidget(self._table, 1)
 
         # Hint footer
@@ -542,7 +672,7 @@ class L2EmulationTab(QWidget):
             "fix the server-side permissions and retry."
         )
         hint.setTextFormat(Qt.RichText)
-        hint.setStyleSheet("color: #6b7280; font-size: 11px;")
+        hint.setStyleSheet("color: #94a3b8; font-size: 11px;")
         hint.setWordWrap(True)
         outer.addWidget(hint)
 
@@ -621,12 +751,32 @@ class L2EmulationTab(QWidget):
         self._sessions_cache = sessions
         self._render_sessions(sessions)
         running = sum(1 for s in sessions if s.get("running"))
-        self._info_label.setText(
-            f"{len(sessions)} session(s) · {running} running"
-        )
+        self._set_count_chip(running, len(sessions))
+        # Clear any stale error/notice now that the server is healthy.
+        self._info_label.setText("")
+        self._info_label.setStyleSheet("color: #6b7280; font-size: 11px;")
         # If a previous 404 had us in degraded mode, restore the full
         # poll cadence and re-enable Start.
         self._exit_unsupported_mode()
+
+    def _set_count_chip(self, running: int, total: int):
+        """Render the header status chip: green when something's running,
+        slate when idle. Reads at a glance — 'N running · M total'."""
+        if running > 0:
+            bg, fg, dot = "#dcfce7", "#166534", "#16a34a"
+        elif total > 0:
+            bg, fg, dot = "#f1f5f9", "#475569", "#94a3b8"
+        else:
+            bg, fg, dot = "#f1f5f9", "#94a3b8", "#cbd5e1"
+        self._count_chip.setText(
+            f"<span style='color:{dot};'>●</span> "
+            f"<b>{running}</b> running · {total} total"
+        )
+        self._count_chip.setTextFormat(Qt.RichText)
+        self._count_chip.setStyleSheet(
+            f"background: {bg}; color: {fg}; font-size: 12px; "
+            f"padding: 4px 12px; border-radius: 10px;"
+        )
 
     def _on_refresh_failed(self, msg: str, http_code: int):
         """Categorise the failure so the operator sees something
@@ -640,6 +790,7 @@ class L2EmulationTab(QWidget):
             )
             return
         if http_code == 401 or http_code == 403:
+            self._info_label.setStyleSheet("color: #b45309; font-size: 11px;")
             self._info_label.setText(
                 f"Auth failed ({http_code}). Set NETGEN_AUTH_TOKEN "
                 "(operator or admin role) and restart the client."
@@ -647,6 +798,7 @@ class L2EmulationTab(QWidget):
             return
         # Plain connect / timeout / DNS errors → show as-is but capped
         # so a multi-KB error blob doesn't wreck the layout.
+        self._info_label.setStyleSheet("color: #b45309; font-size: 11px;")
         self._info_label.setText(f"Fetch failed: {msg[:120]}")
 
     def _enter_unsupported_mode(self, reason: str):
@@ -664,7 +816,13 @@ class L2EmulationTab(QWidget):
             return
         self._unsupported = True
         self._unsupported_reason = reason
+        self._info_label.setStyleSheet("color: #b45309; font-size: 11px;")
         self._info_label.setText(reason)
+        self._count_chip.setText("unavailable")
+        self._count_chip.setStyleSheet(
+            "background: #fef3c7; color: #b45309; font-size: 12px; "
+            "padding: 4px 12px; border-radius: 10px;"
+        )
         # Tooltip on the button for hover-discovery.
         self._start_btn.setToolTip(reason)
         # Slow the timer way down — once a minute is plenty for
@@ -691,30 +849,122 @@ class L2EmulationTab(QWidget):
             pass
 
     # ------------------------------------------------------------------
+    @staticmethod
+    def _fmt_count(n) -> str:
+        """Thousands-separated integer; '0' falls through unchanged."""
+        try:
+            return f"{int(n):,}"
+        except (TypeError, ValueError):
+            return str(n)
+
+    @staticmethod
+    def _fmt_bytes(n) -> str:
+        """Human-readable byte size (B/KB/MB/GB/TB)."""
+        try:
+            b = float(n)
+        except (TypeError, ValueError):
+            return str(n)
+        for unit in ("B", "KB", "MB", "GB"):
+            if b < 1024.0:
+                return f"{int(b)} {unit}" if unit == "B" else f"{b:.1f} {unit}"
+            b /= 1024.0
+        return f"{b:.1f} TB"
+
+    @staticmethod
+    def _fmt_uptime(s) -> str:
+        """Compact h/m/s uptime, e.g. '2h 5m 9s' or '47s'."""
+        try:
+            total = int(float(s))
+        except (TypeError, ValueError):
+            return "—"
+        if total <= 0:
+            return "0s"
+        h, rem = divmod(total, 3600)
+        m, sec = divmod(rem, 60)
+        if h:
+            return f"{h}h {m}m {sec}s"
+        if m:
+            return f"{m}m {sec}s"
+        return f"{sec}s"
+
     def _render_sessions(self, sessions: List[Dict[str, Any]]):
+        mono = QFont("Menlo")
+        mono.setStyleHint(QFont.Monospace)
+        mono.setPointSize(11)
+
         self._table.setRowCount(len(sessions))
         for row, sess in enumerate(sessions):
             counters = sess.get("counters", {}) or {}
-            session_id = sess.get("session_id", "")
+            config = sess.get("config", {}) or {}
+            session_id = str(sess.get("session_id", ""))
+            proto = str(sess.get("protocol", "")).lower()
             running = bool(sess.get("running"))
 
-            def _set(col, text, color: Optional[QColor] = None):
+            def _set(col, text, *, color: Optional[QColor] = None,
+                     align=None, font: Optional[QFont] = None,
+                     tooltip: Optional[str] = None, sid: bool = False):
                 item = QTableWidgetItem(str(text))
                 if color is not None:
                     item.setForeground(color)
+                if align is not None:
+                    item.setTextAlignment(align | Qt.AlignVCenter)
+                if font is not None:
+                    item.setFont(font)
+                if tooltip is not None:
+                    item.setToolTip(tooltip)
+                if sid:
+                    # Stash the full session_id so Stop-selected can
+                    # recover it regardless of the displayed column text.
+                    item.setData(Qt.UserRole, session_id)
                 self._table.setItem(row, col, item)
 
-            _set(0, session_id)
-            _set(1, str(sess.get("protocol", "")).upper())
-            _set(2, sess.get("iface", ""))
-            _set(3, "Running" if running else "Stopped",
-                 QColor("#16a34a") if running else QColor("#94a3b8"))
-            _set(4, counters.get("frames_sent", 0))
-            _set(5, counters.get("bytes_sent", 0))
+            # Status pill — coloured dot + word, the most glanceable cell.
+            _set(self.COL_STATUS,
+                 ("● Running" if running else "● Stopped"),
+                 color=QColor("#16a34a") if running else QColor("#94a3b8"),
+                 align=Qt.AlignCenter, sid=True)
+
+            # Protocol badge — uppercase, per-protocol accent colour.
+            _set(self.COL_PROTO, proto.upper(),
+                 color=QColor(self._PROTO_COLORS.get(proto, "#334155")),
+                 align=Qt.AlignCenter, font=_bold_font())
+
+            _set(self.COL_IFACE, sess.get("iface", ""))
+
+            # VLAN — show tag + PCP, or a subtle 'untagged'.
+            vlan_id = config.get("vlan_id")
+            if vlan_id:
+                pcp = config.get("vlan_pcp") or 0
+                vlan_txt = f"{vlan_id}" + (f" · p{pcp}" if pcp else "")
+                _set(self.COL_VLAN, vlan_txt, align=Qt.AlignCenter,
+                     color=QColor("#0f172a"))
+            else:
+                _set(self.COL_VLAN, "untagged", align=Qt.AlignCenter,
+                     color=QColor("#cbd5e1"))
+
+            _set(self.COL_FRAMES, self._fmt_count(counters.get("frames_sent", 0)),
+                 align=Qt.AlignRight)
+
+            failed = counters.get("frames_failed", 0) or 0
+            _set(self.COL_FAILED, self._fmt_count(failed),
+                 align=Qt.AlignRight,
+                 color=QColor("#dc2626") if failed else QColor("#94a3b8"))
+
+            _set(self.COL_BYTES, self._fmt_bytes(counters.get("bytes_sent", 0)),
+                 align=Qt.AlignRight)
+
+            _set(self.COL_UPTIME, self._fmt_uptime(counters.get("uptime_s", 0)),
+                 align=Qt.AlignRight)
+
+            # Session ID — monospaced, truncated, full value on hover.
+            short_sid = (session_id[:10] + "…") if len(session_id) > 11 else session_id
+            _set(self.COL_SID, short_sid, font=mono,
+                 color=QColor("#64748b"), tooltip=session_id)
+
             err = counters.get("last_error") or ""
-            _set(6, err[:80], QColor("#dc2626") if err else None)
-            uptime = counters.get("uptime_s", 0)
-            _set(7, f"{uptime:.1f}" if uptime else "0.0")
+            _set(self.COL_ERR, err[:120],
+                 color=QColor("#dc2626") if err else None,
+                 tooltip=err or None)
 
     # ------------------------------------------------------------------
     def _on_start_clicked(self):
@@ -839,9 +1089,14 @@ class L2EmulationTab(QWidget):
             return
         sids = []
         for row in rows:
-            it = self._table.item(row, 0)
-            if it and it.text():
-                sids.append(it.text())
+            it = self._table.item(row, self.COL_STATUS)
+            if it is None:
+                continue
+            # Full session_id is stashed in UserRole (the Status cell shows
+            # a pill, not the ID — the ID lives in its own column now).
+            sid = it.data(Qt.UserRole)
+            if sid:
+                sids.append(str(sid))
         for sid in sids:
             try:
                 requests.post(
