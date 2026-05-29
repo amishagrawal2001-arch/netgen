@@ -2,6 +2,39 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.47] - 2026-05-29
+
+Make the **Streams table** visually identical to the Devices tab —
+plain default Qt chrome.
+
+### What changed (`traffic_client/stream_control.py`)
+- Removed the Streams table's custom stylesheet entirely (the slate/
+  coloured `QHeaderView` header, alternating row colours, brightened
+  `#2563eb` blue selection, 13 px body font) plus the explicit header
+  sizing (`setDefaultSectionSize`, `setFixedHeight(22)`). The table now
+  renders with the same plain default Qt chrome as the Devices / BGP /
+  OSPF / IS-IS tables. Only `setHighlightSections(False)` is kept
+  (cosmetic, harmless).
+- Functional behaviour is untouched: inline-edit triggers, row selection
+  / extended multi-select, `ResizeToContents`, status-dot icons, and the
+  per-column header tooltips all stay.
+
+### Why
+After 0.2.46 the Streams table still carried its old
+"bumped-for-visibility" styling, so it looked different from the Devices
+tab. The user asked for them to match; the cleanest way is to drop the
+lone custom stylesheet so every data table in the app is consistent. The
+running/total status chip added in 0.2.46 lives in the action bar (not
+the table) and is unaffected.
+
+### Verified
+Byte-compiled; rendered the real Streams section next to a plain default
+Qt table (Devices-tab equivalent) — header, rows, and selection now
+match. Full suite **103 passed**.
+
+### Notes
+- Client-only. No server or wire-format change.
+
 ## [0.2.46] - 2026-05-29
 
 Bring the L2-emulation-tab polish to the **Streams tab**: a live

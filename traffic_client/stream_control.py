@@ -59,56 +59,15 @@ class TrafficGenClientStreamControl:
         self.stream_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.stream_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
 
-        # Table styling for professional appearance (muted color scheme)
-        self.stream_table.setAlternatingRowColors(True)  # Alternating row colors for better readability
-        header = self.stream_table.horizontalHeader()
-        header.setDefaultSectionSize(25)  # default per-column width hint
-        header.setHighlightSections(False)  # don't highlight header sections on click
-        # Fix the header bar height so font-metric quirks on different
-        # platforms can't push it taller than the styled padding implies.
-        # 22px = 11pt label + 3px top + 3px bottom + 5px line-height room.
-        header.setFixedHeight(22)
-
-        # Stream table styling — bumped for visibility, matches the
-        # palette used in the stats dock and server pane:
-        # - body 11px → 13px, padding 3 → 5/8 (more breathing room)
-        # - selection blue brightened (#5b7fa8 → #2563eb) so the active
-        #   row pops on screenshots / projector demos
-        # - header bg/contrast strengthened
-        self.stream_table.setStyleSheet("""
-            QTableWidget {
-                background-color: #ffffff;
-                alternate-background-color: #f5f7fa;
-                border: none;
-                font-size: 13px;
-                outline: none;
-                color: #111827;
-                gridline-color: #e5e7eb;
-            }
-            QTableWidget::item {
-                padding: 5px 8px;
-                border: none;
-            }
-            QTableWidget::item:selected {
-                background-color: #2563eb;
-                color: #ffffff;
-            }
-            QTableWidget::item:hover:!selected {
-                background-color: #eef2f7;
-            }
-            QTableWidget::item:selected:hover {
-                background-color: #1d4ed8;
-            }
-            QHeaderView::section {
-                background-color: #f1f5f9;
-                padding: 4px 8px;
-                border: none;
-                border-bottom: 2px solid #e2e8f0;
-                font-weight: 600;
-                font-size: 11px;
-                color: #475569;
-            }
-        """)
+        # Plain default Qt table chrome — matches the Devices / BGP /
+        # OSPF / IS-IS tables. The custom stylesheet this used to carry
+        # (coloured/slate header, alternating rows, brightened blue
+        # selection, 13px body) made the Streams table the lone outlier;
+        # dropped so every data table in the app looks identical. Only
+        # don't-highlight-header is kept (cosmetic, harmless). Functional
+        # config (edit triggers, row selection, ResizeToContents, icon
+        # size, per-column header tooltips) is set above/below.
+        self.stream_table.horizontalHeader().setHighlightSections(False)
 
         self.stream_table.itemChanged.connect(self.handle_inline_edit)
         layout.addWidget(self.stream_table)
