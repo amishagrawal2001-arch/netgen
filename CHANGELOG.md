@@ -2,6 +2,32 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.50] - 2026-05-29
+
+Harden the Streams inline-edit guard (follow-up to 0.2.49).
+
+### What changed (`traffic_client/server_section.py`)
+- Added a **focus-descendant** check to `_do_update_stream_table`'s
+  interaction guard: if the app's focused widget is a child of the stream
+  table, an inline cell editor is open, so the periodic refresh is
+  deferred. This is the most reliable "is the user editing" signal.
+- Reproduced headlessly that on PyQt5 5.15.11 + Python 3.14,
+  `state() == EditingState` and `selectedRows()` can **both** report
+  False while an editor is genuinely open — in which case the old guard
+  (which relied only on those) would let a poll rebuild the table and
+  close the editor. The focus-descendant signal catches that case.
+
+### Verified
+Headless reproduction: open an editor on the Name cell, fire 4 simulated
+stats polls — the editor stays open and the row is intact every time;
+the focus-descendant signal reads True throughout. Full suite **103
+passed**.
+
+### Notes
+- Client-only. **The running client must include this fix** — a published
+  wheel / client reinstall is required; updating the server alone does
+  nothing for this (it's a GUI-side guard).
+
 ## [0.2.49] - 2026-05-29
 
 Fix inline editing in the **Streams table** being interrupted by the

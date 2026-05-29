@@ -586,7 +586,22 @@ class TrafficGenClientServerSection():
             is_editing = self.stream_table.state() == QAbstractItemView.EditingState
         except Exception:
             pass
-        
+
+        # Most reliable edit signal: is the app's focused widget a child of
+        # the stream table? An open inline editor (the QLineEdit/QComboBox
+        # Qt spawns over the cell) lives inside the table's viewport, so it
+        # shows up as a descendant. On PyQt5 5.15.11 + Python 3.14 we have
+        # seen state()==EditingState come back False and selectedRows()==0
+        # even while an editor is genuinely open — this catches that case so
+        # a periodic refresh never rebuilds the table out from under an edit.
+        editor_open = False
+        try:
+            from PyQt5.QtWidgets import QApplication
+            fw = QApplication.focusWidget()
+            editor_open = fw is not None and self.stream_table.isAncestorOf(fw)
+        except Exception:
+            pass
+
         # Check if any combo box dropdown is open (columns 3 and 15)
         combo_dropdown_open = False
         try:
@@ -603,7 +618,8 @@ class TrafficGenClientServerSection():
             # If we can't check, assume no dropdown is open
             pass
         
-        if self.stream_table.hasFocus() or has_selection or is_editing or combo_dropdown_open:
+        if (self.stream_table.hasFocus() or has_selection or is_editing
+                or editor_open or combo_dropdown_open):
             # Defer the refresh while the user is interacting (row selected,
             # inline-editing a cell, or a combo dropdown open). Schedule a
             # single catch-up retry so the deferred refresh isn't lost, then
