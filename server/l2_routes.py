@@ -52,22 +52,25 @@ def configure(*, require_role: Optional[Callable] = None) -> None:
 # ──────────────────────────────────────────────────────────────────────
 
 
+# Every factory also accepts vlan_id + vlan_pcp (inline 802.1Q tag);
+# appended to each allow-list so the body fields reach the factory.
+_VLAN_KEYS = ("vlan_id", "vlan_pcp")
 _PROTOCOL_FACTORIES = {
     "lacp": ("start_lacp",      ("system_priority", "system_mac", "key",
                                  "port_priority", "port_number", "state",
-                                 "fast", "duration_s")),
+                                 "fast", "duration_s") + _VLAN_KEYS),
     "lldp": ("start_lldp",      ("chassis_id", "port_id", "system_name",
                                  "system_description", "ttl_s",
-                                 "interval_s", "duration_s", "src_mac")),
+                                 "interval_s", "duration_s", "src_mac") + _VLAN_KEYS),
     "vrrp": ("start_vrrp",      ("version", "vrid", "priority",
                                  "virtual_ips", "interval_s", "duration_s",
-                                 "src_ip", "src_mac", "family")),
+                                 "src_ip", "src_mac", "family") + _VLAN_KEYS),
     "igmp": ("start_igmp",      ("version", "group", "type_code",
                                  "interval_s", "duration_s",
-                                 "src_ip", "src_mac")),
+                                 "src_ip", "src_mac") + _VLAN_KEYS),
     "pim":  ("start_pim_hello", ("hold_time", "dr_priority", "generation_id",
                                  "interval_s", "duration_s",
-                                 "src_ip", "src_mac")),
+                                 "src_ip", "src_mac") + _VLAN_KEYS),
 }
 
 

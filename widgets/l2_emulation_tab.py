@@ -127,6 +127,26 @@ class _L2ConfigDialog(QDialog):
         self._duration_spin.setValue(0.0)   # 0 = forever
         top_form.addRow("Duration:", self._duration_spin)
 
+        # Inline 802.1Q encapsulation (Spirent-style) — applies to ALL
+        # protocols. 0 = untagged. When set, the frame egresses VLAN-tagged
+        # straight off the chosen interface; no pre-created vlanN subif
+        # needed. PCP is the 802.1p priority (0-7).
+        self._vlan_id_spin = QSpinBox()
+        self._vlan_id_spin.setRange(0, 4094)
+        self._vlan_id_spin.setValue(0)
+        self._vlan_id_spin.setSpecialValueText("untagged")
+        self._vlan_id_spin.setToolTip(
+            "802.1Q VLAN ID for the emulated frames. 0 = untagged. Set this "
+            "to send tagged frames without creating a vlanN subinterface."
+        )
+        top_form.addRow("VLAN ID:", self._vlan_id_spin)
+
+        self._vlan_pcp_spin = QSpinBox()
+        self._vlan_pcp_spin.setRange(0, 7)
+        self._vlan_pcp_spin.setValue(0)
+        self._vlan_pcp_spin.setToolTip("802.1p priority (PCP), 0-7. Only used when VLAN ID > 0.")
+        top_form.addRow("VLAN PCP:", self._vlan_pcp_spin)
+
         outer.addLayout(top_form)
 
         # Per-protocol stack
@@ -330,6 +350,12 @@ class _L2ConfigDialog(QDialog):
         duration = self._duration_spin.value()
         if duration > 0:
             body["duration_s"] = duration
+        # Inline 802.1Q tag (applies to every protocol). 0 = untagged →
+        # don't send the field so the server default (untagged) applies.
+        vlan_id = self._vlan_id_spin.value()
+        if vlan_id > 0:
+            body["vlan_id"] = vlan_id
+            body["vlan_pcp"] = self._vlan_pcp_spin.value()
 
         if proto == "lacp":
             body.update({

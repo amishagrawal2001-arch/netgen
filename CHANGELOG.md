@@ -2,6 +2,44 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.41] - 2026-05-28
+
+Add **inline 802.1Q (Dot1Q) VLAN tagging** to L2 emulation — Spirent-style
+encapsulation, so you can send tagged LACP/LLDP/VRRP/IGMP/PIM frames
+without pre-creating a `vlanN` subinterface on the host.
+
+### What changed
+- **`utils/l2_protocols.py`**: new `_l2_hdr(src, dst, ethertype,
+  vlan_id, vlan_pcp)` helper builds the Ethernet header — plain
+  `Ether(type=ethertype)` when untagged, or
+  `Ether(type=0x8100)/Dot1Q(vlan, prio, type=ethertype)` when tagged,
+  preserving the protocol's original ethertype on the tag. All five
+  builders now route their header through it and accept `vlan_id` /
+  `vlan_pcp` (stored in the session config too).
+- **`server/l2_routes.py`**: `vlan_id` + `vlan_pcp` added to every
+  protocol's allow-list so the fields reach the factory.
+- **`widgets/l2_emulation_tab.py`**: the Start-session dialog gains
+  **VLAN ID** (0 = untagged) and **VLAN PCP** (0–7) fields in the common
+  section — they apply to whichever protocol you pick. `vlan_id` is only
+  sent when > 0, so untagged behaviour is unchanged.
+
+### Verified (wire format)
+For LACP/LLDP/IPv4/IPv6 ethertypes: untagged frames carry no Dot1Q;
+tagged frames are exactly **+4 bytes** with outer ethertype `0x8100`,
+correct TCI (e.g. PCP 3 + VID 100 → `0x6064`), the inner ethertype
+preserved, and the upper-protocol payload byte-identical to the untagged
+frame. Dialog emits `vlan_id`/`vlan_pcp` only when VLAN ID > 0.
+
+### Why
+Closes the main usability gap vs Spirent's encapsulation-stack model:
+you tag inline in the dialog instead of having to `ip link add … type
+vlan` a subinterface first.
+
+### Notes
+- Server + client (utils/l2_protocols.py, server/l2_routes.py,
+  widgets/l2_emulation_tab.py).
+- Wheel ships as `ostg_trafficgen-0.2.41-py3-none-any.whl`.
+
 ## [0.2.40] - 2026-05-28
 
 Two more L2-emulation protocol-correctness fixes, plus a full builder

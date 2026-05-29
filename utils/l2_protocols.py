@@ -195,6 +195,30 @@ def _register_and_start(sess: _Session, frame_factory, interval_s, duration_s):
         _SESSIONS[sess.session_id] = sess
 
 
+def _l2_hdr(src: str, dst: str, ethertype: int,
+            vlan_id: Optional[int] = None, vlan_pcp: int = 0):
+    """Build the Ethernet header for an emulated L2 frame, with optional
+    inline 802.1Q tagging.
+
+    * Untagged (vlan_id None/0): ``Ether(src, dst, type=ethertype)``.
+    * Tagged: ``Ether(type=0x8100) / Dot1Q(vlan, prio, type=ethertype)`` —
+      the frame egresses VLAN-tagged straight off the named interface,
+      WITHOUT needing a pre-created ``vlanN`` subinterface (Spirent-style
+      inline encapsulation). The original ethertype is preserved on the
+      Dot1Q so the upper protocol still parses correctly downstream.
+
+    `ethertype` is the protocol's L2 type: 0x8809 (LACP), 0x88cc (LLDP),
+    0x0800 (IPv4-carried: VRRPv2/v3-v4, IGMP, PIM), 0x86dd (IPv6 VRRPv3).
+    """
+    from scapy.layers.l2 import Ether, Dot1Q
+    if vlan_id:
+        return (
+            Ether(src=src, dst=dst)
+            / Dot1Q(vlan=int(vlan_id), prio=int(vlan_pcp) & 0x7, type=ethertype)
+        )
+    return Ether(src=src, dst=dst, type=ethertype)
+
+
 # ====================================================================
 # LACP (802.3ad / 802.1AX)
 # ====================================================================
@@ -215,6 +239,8 @@ def start_lacp(
     port_number: int = 1,
     state: int = 0x05,   # Activity | Aggregation
     fast: bool = False,  # True = 1s interval (PDU_FAST), False = 30s (PDU_SLOW)
+    vlan_id: Optional[int] = None,   # 802.1Q tag; None/0 = untagged
+    vlan_pcp: int = 0,               # 802.1p priority (0-7)
     duration_s: Optional[float] = None,
 ) -> str:
     """Spawn an LACPDU emitter. Returns session_id.
@@ -234,16 +260,16 @@ def start_lacp(
         "port_number": int(port_number),
         "state": int(state),
         "fast": bool(fast),
+        "vlan_id": vlan_id, "vlan_pcp": int(vlan_pcp),
         "duration_s": duration_s,
     }
     sess = _Session(session_id=sid, protocol="lacp", iface=iface, config=config)
 
     def _factory():
-        from scapy.layers.l2 import Ether
         from scapy.contrib.lacp import SlowProtocol, LACP
-        # Slow Protocols dest MAC + ethertype + subtype
+        # Slow Protocols dest MAC + ethertype (0x8809) + subtype
         return (
-            Ether(dst="01:80:c2:00:00:02", src=system_mac, type=0x8809)
+            _l2_hdr(system_mac, "01:80:c2:00:00:02", 0x8809, vlan_id, vlan_pcp)
             / SlowProtocol(subtype=0x01)
             / LACP(
                 version=1,
@@ -282,6 +308,8 @@ def start_lldp(
     interval_s: float = 30.0,
     duration_s: Optional[float] = None,
     src_mac: str = "00:11:22:33:44:02",
+    vlan_id: Optional[int] = None,   # 802.1Q tag; None/0 = untagged
+    vlan_pcp: int = 0,               # 802.1p priority (0-7)
 ) -> str:
     """Spawn an LLDP advertiser. Returns session_id."""
     sid = str(uuid.uuid4())
@@ -293,11 +321,11 @@ def start_lldp(
         "interval_s": float(interval_s),
         "duration_s": duration_s,
         "src_mac": src_mac,
+        "vlan_id": vlan_id, "vlan_pcp": int(vlan_pcp),
     }
     sess = _Session(session_id=sid, protocol="lldp", iface=iface, config=config)
 
     def _factory():
-        from scapy.layers.l2 import Ether
         from scapy.contrib.lldp import (
             LLDPDUChassisID, LLDPDUPortID, LLDPDUTimeToLive,
             LLDPDUSystemName, LLDPDUSystemDescription, LLDPDUEndOfLLDPDU,
@@ -306,7 +334,7 @@ def start_lldp(
         # `LLDPDU(tlvlist=...)` constructor. Order matters: Chassis-ID,
         # Port-ID, TTL must come first per 802.1AB §8.6.
         return (
-            Ether(dst="01:80:c2:00:00:0e", src=src_mac, type=0x88cc)
+            _l2_hdr(src_mac, "01:80:c2:00:00:0e", 0x88cc, vlan_id, vlan_pcp)
             / LLDPDUChassisID(
                 subtype="locally assigned",
                 id=chassis_id.encode("ascii"),
@@ -360,6 +388,8 @@ def start_vrrp(
     src_ip: str = "10.0.0.1",
     src_mac: Optional[str] = None,   # None/"" → derive the VRRP virtual MAC
     family: str = "ipv4",   # "ipv4" or "ipv6" (v3 only)
+    vlan_id: Optional[int] = None,   # 802.1Q tag; None/0 = untagged
+    vlan_pcp: int = 0,               # 802.1p priority (0-7)
 ) -> str:
     """Spawn a VRRP master advertisement emitter. Returns session_id.
 
@@ -384,11 +414,11 @@ def start_vrrp(
         "duration_s": duration_s,
         "src_ip": src_ip, "src_mac": eff_src_mac,
         "family": family.lower(),
+        "vlan_id": vlan_id, "vlan_pcp": int(vlan_pcp),
     }
     sess = _Session(session_id=sid, protocol="vrrp", iface=iface, config=config)
 
     def _factory():
-        from scapy.layers.l2 import Ether
         from scapy.layers.inet import IP
         from scapy.layers.vrrp import VRRP, VRRPv3
         # VRRP destination: 224.0.0.18 (IPv4) or ff02::12 (IPv6).
@@ -400,7 +430,7 @@ def start_vrrp(
             from scapy.layers.inet6 import IPv6
             ip_layer = IPv6(src=src_ip, dst="ff02::12", hlim=255, nh=112)
             return (
-                Ether(src=eff_src_mac, dst="33:33:00:00:00:12")
+                _l2_hdr(eff_src_mac, "33:33:00:00:00:12", 0x86dd, vlan_id, vlan_pcp)
                 / ip_layer
                 / VRRPv3(
                     version=3, vrid=vrid, priority=priority,
@@ -410,7 +440,7 @@ def start_vrrp(
         ip_layer = IP(src=src_ip, dst="224.0.0.18", ttl=255, proto=112)
         if version == 2:
             return (
-                Ether(src=eff_src_mac, dst="01:00:5e:00:00:12")
+                _l2_hdr(eff_src_mac, "01:00:5e:00:00:12", 0x0800, vlan_id, vlan_pcp)
                 / ip_layer
                 / VRRP(
                     version=2, vrid=vrid, priority=priority,
@@ -418,7 +448,7 @@ def start_vrrp(
                 )
             )
         return (
-            Ether(src=eff_src_mac, dst="01:00:5e:00:00:12")
+            _l2_hdr(eff_src_mac, "01:00:5e:00:00:12", 0x0800, vlan_id, vlan_pcp)
             / ip_layer
             / VRRPv3(
                 version=3, vrid=vrid, priority=priority,
@@ -459,6 +489,8 @@ def start_igmp(
     duration_s: Optional[float] = None,
     src_ip: str = "10.0.0.10",
     src_mac: str = "00:11:22:33:44:04",
+    vlan_id: Optional[int] = None,   # 802.1Q tag; None/0 = untagged
+    vlan_pcp: int = 0,               # 802.1p priority (0-7)
 ) -> str:
     """Spawn an IGMP membership-report emitter.
 
@@ -477,11 +509,11 @@ def start_igmp(
         "interval_s": float(interval_s),
         "duration_s": duration_s,
         "src_ip": src_ip, "src_mac": src_mac,
+        "vlan_id": vlan_id, "vlan_pcp": int(vlan_pcp),
     }
     sess = _Session(session_id=sid, protocol="igmp", iface=iface, config=config)
 
     def _factory():
-        from scapy.layers.l2 import Ether
         from scapy.layers.inet import IP
         # IGMP multicast frame: TTL must be 1 (per RFC 2236 §3). The
         # Ethernet dst MUST track the IP dst (RFC 1112 §6.4 mapping):
@@ -497,7 +529,7 @@ def start_igmp(
             t = type_code if type_code is not None else 0x22
             rec = IGMPv3gr(rtype=2, maddr=group)  # MODE_IS_EXCLUDE
             return (
-                Ether(src=src_mac, dst=_ipv4_mcast_mac("224.0.0.22"))
+                _l2_hdr(src_mac, _ipv4_mcast_mac("224.0.0.22"), 0x0800, vlan_id, vlan_pcp)
                 / IP(src=src_ip, dst="224.0.0.22", ttl=1, options=[])
                 / IGMPv3(type=t)
                 / IGMPv3mr(numgrp=1, records=[rec])
@@ -510,7 +542,7 @@ def start_igmp(
         # dst via the same RFC 1112 mapping.
         ip_dst = "224.0.0.2" if t == 0x17 else group
         return (
-            Ether(src=src_mac, dst=_ipv4_mcast_mac(ip_dst))
+            _l2_hdr(src_mac, _ipv4_mcast_mac(ip_dst), 0x0800, vlan_id, vlan_pcp)
             / IP(src=src_ip, dst=ip_dst, ttl=1)
             / IGMP(type=t, gaddr=group)
         )
@@ -542,6 +574,8 @@ def start_pim_hello(
     duration_s: Optional[float] = None,
     src_ip: str = "10.0.0.20",
     src_mac: str = "00:11:22:33:44:05",
+    vlan_id: Optional[int] = None,   # 802.1Q tag; None/0 = untagged
+    vlan_pcp: int = 0,               # 802.1p priority (0-7)
 ) -> str:
     """Spawn a PIM Hello emitter — registers us as a PIM neighbour
     on the segment without actually doing Join/Prune."""
@@ -553,11 +587,11 @@ def start_pim_hello(
         "interval_s": float(interval_s),
         "duration_s": duration_s,
         "src_ip": src_ip, "src_mac": src_mac,
+        "vlan_id": vlan_id, "vlan_pcp": int(vlan_pcp),
     }
     sess = _Session(session_id=sid, protocol="pim", iface=iface, config=config)
 
     def _factory():
-        from scapy.layers.l2 import Ether
         from scapy.layers.inet import IP
         from scapy.contrib.pim import PIMv2Hdr, PIMv2Hello
         from scapy.contrib.pim import PIMv2HelloHoldtime, PIMv2HelloDRPriority
@@ -566,7 +600,7 @@ def start_pim_hello(
         # PIMv2HelloHoldtime.fields_desc etc.
         return (
             # PIM all-routers multicast: 224.0.0.13, MAC 01:00:5e:00:00:0d
-            Ether(src=src_mac, dst="01:00:5e:00:00:0d")
+            _l2_hdr(src_mac, "01:00:5e:00:00:0d", 0x0800, vlan_id, vlan_pcp)
             / IP(src=src_ip, dst="224.0.0.13", ttl=1, proto=103)
             / PIMv2Hdr(type=0)   # 0 = Hello
             / PIMv2Hello(
