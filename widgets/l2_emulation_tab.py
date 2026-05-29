@@ -241,7 +241,15 @@ class _L2ConfigDialog(QDialog):
             "Comma-separated virtual IPs (e.g. 192.168.1.254,192.168.1.253)"
         )
         self._vrrp_src_ip = QLineEdit("10.0.0.1")
-        self._vrrp_src_mac = QLineEdit("00:11:22:33:44:03")
+        self._vrrp_src_mac = QLineEdit("")
+        self._vrrp_src_mac.setPlaceholderText(
+            "auto — VRRP virtual MAC 00:00:5e:00:01:<vrid> (leave blank)"
+        )
+        self._vrrp_src_mac.setToolTip(
+            "Leave blank to source advertisements from the RFC 5798 virtual "
+            "router MAC (00:00:5e:00:01:<vrid> for IPv4, …:02:<vrid> for IPv6) "
+            "— what a real VRRP master uses. Only set this to override."
+        )
         self._vrrp_interval = QDoubleSpinBox()
         self._vrrp_interval.setRange(0.1, 60.0)
         self._vrrp_interval.setValue(1.0)

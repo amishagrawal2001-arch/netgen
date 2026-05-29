@@ -2,6 +2,42 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.40] - 2026-05-28
+
+Two more L2-emulation protocol-correctness fixes, plus a full builder
+sweep.
+
+### VRRP — source from the virtual router MAC
+VRRP advertisements defaulted to an arbitrary source MAC
+(`00:11:22:33:44:03`). A real master sources them FROM the RFC 5798
+virtual router MAC so downstream switches learn it on the master's port.
+`start_vrrp` now derives `00:00:5e:00:01:{vrid}` (IPv4) /
+`00:00:5e:00:02:{vrid}` (IPv6) when `src_mac` is blank, and the dialog's
+Source-MAC field is now blank-by-default with an "auto" placeholder
+(enter a value only to override).
+
+### IGMPv2 — Leave goes to all-routers
+An IGMPv2 Leave (`type_code=0x17`) was sent to the group address; RFC
+2236 §3 requires Leaves go to **224.0.0.2** (all-routers). `start_igmp`
+now routes Leave to 224.0.0.2 (`01:00:5e:00:00:02`) with `gaddr` still
+the group being left; Membership Reports (0x16) and group-specific
+Queries (0x11) continue to target the group.
+
+### Builder sweep — no further issues
+Introspected the installed scapy against every L2 builder: LACP
+(`actor_*` fields), LLDP (Chassis/Port/TTL/SysName/SysDesc TLV order +
+field names), PIM Hello (`holdtime`/`dr_priority`/`generation_id`),
+VRRP/VRRPv3, IGMPv3 — all field names and constants correct. No further
+bugs found.
+
+### Verified
+VRRP virtual-MAC derivation across VRIDs + IPv6 + explicit override;
+IGMP frames for Report/Leave/Query show the correct L2+L3 destinations.
+
+### Notes
+- Server + client (utils/l2_protocols.py, widgets/l2_emulation_tab.py).
+- Wheel ships as `ostg_trafficgen-0.2.40-py3-none-any.whl`.
+
 ## [0.2.39] - 2026-05-28
 
 Fix: L2 emulation always defaulted its interface to **loopback** — which

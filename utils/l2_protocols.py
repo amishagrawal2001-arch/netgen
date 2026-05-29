@@ -336,6 +336,18 @@ def start_lldp(
 # Default cadence is 1 second per spec.
 
 
+def _vrrp_virtual_mac(vrid: int, family: str = "ipv4") -> str:
+    """The VRRP virtual router MAC for a VRID (RFC 5798 §7.3).
+
+    IPv4: 00:00:5e:00:01:{VRID}   IPv6: 00:00:5e:00:02:{VRID}
+    A real VRRP master sources its advertisements FROM this address, so
+    downstream switches learn the virtual MAC on the master's port. The
+    emulator now does the same by default (was an arbitrary src MAC).
+    """
+    block = 0x02 if str(family).lower() == "ipv6" else 0x01
+    return f"00:00:5e:00:{block:02x}:{int(vrid) & 0xff:02x}"
+
+
 def start_vrrp(
     iface: str,
     *,
@@ -346,7 +358,7 @@ def start_vrrp(
     interval_s: float = 1.0,
     duration_s: Optional[float] = None,
     src_ip: str = "10.0.0.1",
-    src_mac: str = "00:11:22:33:44:03",
+    src_mac: Optional[str] = None,   # None/"" → derive the VRRP virtual MAC
     family: str = "ipv4",   # "ipv4" or "ipv6" (v3 only)
 ) -> str:
     """Spawn a VRRP master advertisement emitter. Returns session_id.
@@ -354,9 +366,15 @@ def start_vrrp(
     `version=2` is IPv4-only. `version=3` supports both AFs via
     `family`. `priority=255` means "owner of the virtual IP" (highest
     preemption); 100 is the default for non-owner masters.
+
+    `src_mac` defaults to the RFC 5798 virtual router MAC for the VRID
+    (00:00:5e:00:01:{VRID} for IPv4) — what a real master uses. Pass an
+    explicit MAC only to override that behaviour.
     """
     sid = str(uuid.uuid4())
     virtual_ips = virtual_ips or ["192.168.1.254"]
+    # Default to the virtual router MAC unless the caller forced one.
+    eff_src_mac = (src_mac or "").strip() or _vrrp_virtual_mac(vrid, family)
     config = {
         "version": int(version),
         "vrid": int(vrid),
@@ -364,7 +382,7 @@ def start_vrrp(
         "virtual_ips": list(virtual_ips),
         "interval_s": float(interval_s),
         "duration_s": duration_s,
-        "src_ip": src_ip, "src_mac": src_mac,
+        "src_ip": src_ip, "src_mac": eff_src_mac,
         "family": family.lower(),
     }
     sess = _Session(session_id=sid, protocol="vrrp", iface=iface, config=config)
@@ -382,7 +400,7 @@ def start_vrrp(
             from scapy.layers.inet6 import IPv6
             ip_layer = IPv6(src=src_ip, dst="ff02::12", hlim=255, nh=112)
             return (
-                Ether(src=src_mac, dst="33:33:00:00:00:12")
+                Ether(src=eff_src_mac, dst="33:33:00:00:00:12")
                 / ip_layer
                 / VRRPv3(
                     version=3, vrid=vrid, priority=priority,
@@ -392,7 +410,7 @@ def start_vrrp(
         ip_layer = IP(src=src_ip, dst="224.0.0.18", ttl=255, proto=112)
         if version == 2:
             return (
-                Ether(src=src_mac, dst="01:00:5e:00:00:12")
+                Ether(src=eff_src_mac, dst="01:00:5e:00:00:12")
                 / ip_layer
                 / VRRP(
                     version=2, vrid=vrid, priority=priority,
@@ -400,7 +418,7 @@ def start_vrrp(
                 )
             )
         return (
-            Ether(src=src_mac, dst="01:00:5e:00:00:12")
+            Ether(src=eff_src_mac, dst="01:00:5e:00:00:12")
             / ip_layer
             / VRRPv3(
                 version=3, vrid=vrid, priority=priority,
@@ -486,9 +504,14 @@ def start_igmp(
             )
         from scapy.contrib.igmp import IGMP
         t = type_code if type_code is not None else 0x16
+        # Leave Group (0x17) is sent to ALL-ROUTERS 224.0.0.2 (RFC 2236
+        # §3) — NOT the group. Membership Reports (0x16) and group-specific
+        # Queries (0x11) target the group itself. The L2 dst tracks the L3
+        # dst via the same RFC 1112 mapping.
+        ip_dst = "224.0.0.2" if t == 0x17 else group
         return (
-            Ether(src=src_mac, dst=_ipv4_mcast_mac(group))
-            / IP(src=src_ip, dst=group, ttl=1)
+            Ether(src=src_mac, dst=_ipv4_mcast_mac(ip_dst))
+            / IP(src=src_ip, dst=ip_dst, ttl=1)
             / IGMP(type=t, gaddr=group)
         )
 
