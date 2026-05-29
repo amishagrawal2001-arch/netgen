@@ -2,6 +2,40 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.37] - 2026-05-28
+
+Cosmetic fix: the SSH manual-upgrade log no longer prints a scary
+(but harmless) BrokenPipeError on a fully successful upgrade.
+
+### Symptom
+A successful SSH upgrade (0.2.4 → 0.2.32, service restarted,
+`/api/health` OK, `exit rc=0`) still showed:
+```
+ERROR: Pipe to stdout was broken
+Exception ignored on flushing sys.stdout:
+BrokenPipeError: [Errno 32] Broken pipe
+```
+
+### Cause
+The post-install verification ran `pip3 show ostg-trafficgen | head -2`.
+`head` reads two lines then closes the pipe, so `pip` receives SIGPIPE
+while still writing — pip dutifully prints the broken-pipe error. The
+upgrade itself was unaffected (the Name/Version lines were captured,
+`head` exits 0, the `&&` chain continued, rc=0).
+
+### Fix
+Replaced `| head -2` with `2>/dev/null | grep -E '^(Name|Version):'` in
+the SSH upgrade command (`widgets/install_server_dialog.py`). `grep`
+consumes pip's entire stdout, so pip never gets SIGPIPE — and it still
+shows exactly the Name + Version lines. Verified the `shlex.quote`
+wrapping keeps the embedded single-quotes intact on the non-root
+`sudo sh -c` path. (The server-side HTTP upgrade builds its pip command
+as a subprocess list — no shell pipe — so it never had this issue.)
+
+### Notes
+- Client-only (widgets/install_server_dialog.py); purely log-noise.
+- Wheel ships as `ostg_trafficgen-0.2.37-py3-none-any.whl`.
+
 ## [0.2.36] - 2026-05-28
 
 Docs: bring the install/upgrade guidance up to date with the

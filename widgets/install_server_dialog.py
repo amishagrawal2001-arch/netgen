@@ -347,7 +347,13 @@ class SshUpgradeWorker(QThread):
                 f"(systemctl restart netgen-server 2>/dev/null || "
                 f"systemctl restart ostg-server) && "
                 f"sleep 2 && "
-                f"pip3 show ostg-trafficgen | head -2 && "
+                # grep (not `head -2`): grep consumes pip's whole stdout so
+                # pip never gets SIGPIPE. `head -2` closed the pipe early,
+                # making pip print a harmless-but-alarming
+                # "ERROR: Pipe to stdout was broken / BrokenPipeError" in
+                # the upgrade log even on a fully successful upgrade.
+                f"pip3 show ostg-trafficgen 2>/dev/null | "
+                f"grep -E '^(Name|Version):' && "
                 f"curl -fsS http://127.0.0.1:5050/api/health && echo"
             )
             cmd = (
