@@ -1116,6 +1116,9 @@ class TrafficGenClientServerSection():
             # Store status label and item for later updates
             server["status_label_widget"] = status_label
             server["status_item"] = server_item
+            # Re-apply via the 3-state renderer so a previously-learned
+            # health verdict (green/amber) survives this tree rebuild.
+            self._update_server_led(server)
 
             # Checkbox to select server
             checkbox = QCheckBox()
@@ -1352,35 +1355,119 @@ class TrafficGenClientServerSection():
             status_label.repaint()  # ✅ Force visual refresh'''
 
     def update_server_status_icon(self, server, is_online):
-        """Update the status icon on the left of TG ID (green=online, red=offline) safely."""
+        """Update the TG status icon on reachability change. Delegates to
+        the 3-state renderer so a known health verdict (green vs amber) is
+        preserved when the server is online."""
+        server["is_online"] = is_online
+        server["online"] = is_online
+        self._update_server_led(server)
+
+    def _update_server_led(self, server):
+        """Render the TG status LED with three states:
+          • red    — unreachable (offline)
+          • amber   (yellow_dot) — reachable but DEGRADED (Flask up, a
+            subsystem is unhealthy; tooltip lists the issues)
+          • green  — reachable and healthy
+
+        Reachability (online/offline) is owned by the interface-fetch /
+        retry probes; the health verdict (degraded) is learned by
+        poll_server_health from /api/admin/health. Both feed this single
+        renderer so the LED never disagrees with itself.
+        """
         status_label = server.get("status_label_widget")
         if not status_label:
             return
-
-        # Update status icon (icon-based, consistent with Streams table)
-        status_icon = QIcon(r_icon("icons/green_dot.png" if is_online else "icons/red_dot.png"))
-        status_pixmap = status_icon.pixmap(12, 12)  # Reduced icon size for better fit
-        status_label.setPixmap(status_pixmap)
-        online_label = "Online" if is_online else "Offline"
-        status_label.setToolTip(online_label)
-        server["is_online"] = is_online
-
-        # Also refresh the tree-item's column-1 tooltip. The tooltip
-        # was set once when the tree was built (see update_server_tree
-        # line ~1111: setToolTip(1, f"{addr}  ({online_label})")) and
-        # would otherwise stay frozen on whatever state the server
-        # was in at that moment — so a server that flipped offline
-        # showed a red dot but still "(Online)" in the hover tooltip.
+        online = bool(server.get("online", server.get("is_online", False)))
+        if not online:
+            icon_path, tip = "icons/red_dot.png", "Offline"
+        elif (server.get("health") == "degraded"):
+            issues = server.get("health_issues") or []
+            tip = "Degraded — " + "; ".join(issues) if issues else "Degraded"
+            icon_path = "icons/yellow_dot.png"
+        else:
+            icon_path, tip = "icons/green_dot.png", "Online"
+        try:
+            status_label.setPixmap(QIcon(r_icon(icon_path)).pixmap(12, 12))
+            status_label.setToolTip(tip)
+        except Exception as exc:
+            logger.debug(f"[SERVER TREE] LED update failed: {exc}")
+            return
+        # Keep the tree-item column-1 hover tooltip in sync.
         server_address = server.get("address", "")
         if server_address:
             try:
                 for i in range(self.server_tree.topLevelItemCount()):
                     item = self.server_tree.topLevelItem(i)
                     if item.text(1) == server_address:
-                        item.setToolTip(1, f"{server_address}  ({online_label})")
+                        item.setToolTip(1, f"{server_address}  ({tip})")
                         break
             except Exception as exc:
                 logger.debug(f"[SERVER TREE] tooltip refresh failed for {server_address}: {exc}")
+
+    def poll_server_health(self):
+        """Periodic TGen service-health probe (fired by a timer in main.py).
+
+        For each ONLINE server, fetch /api/admin/health in a background
+        thread and degrade its LED to amber when `degraded` is true (Flask
+        up but a subsystem unhealthy — e.g. DPDK installed with hugepages=0
+        or tx_worker missing). Reachability (green/red) is handled by the
+        interface-fetch probes; this only refines green↔amber for reachable
+        servers, so it never fights the offline detection.
+        """
+        try:
+            servers = [s for s in getattr(self, "server_interfaces", []) if s.get("online")]
+            if not servers:
+                return
+            conn_mgr = getattr(self, "connection_manager", None)
+            from PyQt5.QtCore import QThread, pyqtSignal
+
+            class _ServerHealthWorker(QThread):
+                result = pyqtSignal(object, dict)  # (server_dict, health_json)
+
+                def __init__(self, jobs, cm):
+                    super().__init__()
+                    self._jobs = jobs
+                    self._cm = cm
+
+                def run(self):
+                    import requests as _rq
+                    for srv, url in self._jobs:
+                        try:
+                            if self._cm is not None:
+                                r = self._cm.get(f"{url}/api/admin/health", timeout=4)
+                            else:
+                                r = _rq.get(f"{url}/api/admin/health", timeout=4)
+                            if r.status_code == 200:
+                                self.result.emit(srv, r.json() or {})
+                        except Exception:
+                            # Unreachable mid-poll — leave reachability to
+                            # the interface probe; just skip health this tick.
+                            pass
+
+            jobs = [(s, s.get("address")) for s in servers if s.get("address")]
+            if not jobs:
+                return
+            worker = _ServerHealthWorker(jobs, conn_mgr)
+            try:
+                from utils.qthread_keepalive import keep
+                keep(worker)
+            except Exception:
+                pass
+            worker.result.connect(self._apply_server_health)
+            worker.start()
+        except Exception as exc:
+            logger.debug(f"[SERVER HEALTH] poll error: {exc}")
+
+    def _apply_server_health(self, server, health):
+        """Main-thread slot: store the health verdict + refresh the LED."""
+        try:
+            degraded = bool(health.get("degraded"))
+            server["health"] = "degraded" if degraded else "healthy"
+            server["health_issues"] = health.get("issues") or []
+            server["netgen_version"] = health.get("netgen_version") or server.get("netgen_version")
+            self._update_server_led(server)
+        except Exception as exc:
+            logger.debug(f"[SERVER HEALTH] apply error: {exc}")
 
     def retry_server_connection(self, server):
         """Retry connecting to the specified server in the background.

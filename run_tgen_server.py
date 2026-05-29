@@ -14049,6 +14049,34 @@ def api_admin_health():
     out["install_running"] = bool(proc and proc.poll() is None)
     out["install_log_path"] = _ADMIN_INSTALL_STATE.get("log_path")
 
+    # Overall health verdict for the client's TGen status LED. The client
+    # shows green when reachable+healthy, amber when reachable but
+    # `degraded` is true (Flask is up but a subsystem the operator likely
+    # cares about is wrong), red when unreachable.
+    #
+    # Conservative on purpose — avoid false-positive amber on healthy
+    # kernel/scapy deployments that legitimately have no DPDK. DPDK-related
+    # problems only count when DPDK is actually installed. These exact
+    # signals (hugepages=0, missing tx_worker) are the failure modes behind
+    # the real "stream starts and stops" incident, so surfacing them on the
+    # LED is genuinely useful.
+    issues = []
+    if out["install_running"]:
+        issues.append("install/build in progress")
+    if out["dpdk"].get("installed"):
+        # Only the two high-signal, low-false-positive DPDK failure modes —
+        # both are the actual cause of the real "stream starts and stops"
+        # incident. vfio is deliberately NOT checked here: vfio_pci is
+        # frequently a builtin the module probe can't see, which would
+        # produce spurious amber on a perfectly healthy DPDK host.
+        if int(out["hugepages"].get("total", 0) or 0) == 0:
+            issues.append("DPDK installed but no hugepages allocated")
+        if not out["tx_worker"].get("present"):
+            issues.append("DPDK installed but tx_worker binary missing")
+    out["issues"] = issues
+    out["degraded"] = bool(issues)
+    out["health"] = "degraded" if issues else "healthy"
+
     return jsonify(out)
 
 

@@ -2,6 +2,52 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.32] - 2026-05-28
+
+Enhancement: the per-TGen status LED now reflects **service health**,
+not just reachability. Previously the dot was 2-state — green
+("answers HTTP") / red ("doesn't"). A chassis whose Flask was up but
+whose data plane was broken (the real "stream starts and stops"
+incident: DPDK installed but hugepages=0) still showed green. Now
+there's a third state.
+
+### Server — health verdict on /api/admin/health
+The endpoint now returns `health` ("healthy"|"degraded"), `degraded`
+(bool), and `issues` (list of human-readable strings). Verdict rules
+are deliberately conservative to avoid false-positive amber:
+- `install/build in progress` → degraded (transient/busy)
+- DPDK **installed** AND `hugepages.total == 0` → degraded
+- DPDK **installed** AND `tx_worker` binary missing → degraded
+- Kernel/scapy deployments (no DPDK) and fully-healthy DPDK hosts stay
+  healthy. `vfio` is intentionally NOT a trigger — `vfio_pci` is often
+  a builtin the module probe can't see, which would flag spurious amber.
+
+### Client — 3-state LED
+- New `poll_server_health()` (in `server_section.py`) hits
+  `/api/admin/health` for each ONLINE server every **30 s**, in a
+  background thread (keepalive-tracked, non-blocking). The endpoint is
+  heavier than the reachability probe (it shells out to pkg-config /
+  lsmod / proc), hence the modest cadence.
+- New 3-state renderer `_update_server_led()`:
+    * **red** — unreachable (offline)
+    * **amber** (`yellow_dot.png`) — reachable but `degraded`; the
+      tooltip lists the specific issues (e.g. "Degraded — DPDK installed
+      but no hugepages allocated")
+    * **green** — reachable and healthy
+- Reachability (green↔red) is still owned by the interface-fetch /
+  retry probes; the health poll only refines green↔amber for reachable
+  servers, so the two never disagree. `update_server_status_icon` now
+  delegates to `_update_server_led` so a learned health verdict
+  survives reachability flips and tree rebuilds.
+- Backward compatible: an older server that doesn't return the verdict
+  fields resolves to green (no false amber).
+
+### Notes
+- Server + client change (run_tgen_server.py, server_section.py, main.py).
+- Verified headless against svl-hp-ai-srv02 (no crash; healthy server →
+  green) and unit-tested the verdict matrix.
+- Wheel ships as `ostg_trafficgen-0.2.32-py3-none-any.whl`.
+
 ## [0.2.31] - 2026-05-28
 
 Fix the gateway/IP ARP-status colors not updating on a passive view

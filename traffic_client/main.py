@@ -401,6 +401,24 @@ class TrafficGeneratorClient(
             # print(f"[TIMER] Stream stats timer started (interval: 2000ms, active: {self.stream_stats_timer.isActive()}, singleShot: {self.stream_stats_timer.isSingleShot()})")
         else:
             logger.error(f"[TIMER ERROR] poll_stream_stats method not found! Available methods: {[m for m in dir(self) if 'poll' in m.lower() or 'stream' in m.lower()]}")
+
+        # TGen service-health poll (30s). Refines the per-TG status LED
+        # from a 2-state reachability light (green/red) to 3-state
+        # (green=healthy, amber=reachable-but-degraded, red=offline) by
+        # consulting each online server's /api/admin/health. Heavier than
+        # the reachability probe (the endpoint shells out to pkg-config/
+        # lsmod/proc), so it runs at a modest 30s cadence in a background
+        # thread. Safe re: QThread lifecycle via the global keepalive.
+        self.server_health_timer = QTimer()
+        if hasattr(self, "poll_server_health"):
+            def _poll_server_health_safe():
+                try:
+                    self.poll_server_health()
+                except Exception as e:
+                    logger.error(f"[TIMER ERROR] Exception in poll_server_health: {e}")
+            self.server_health_timer.timeout.connect(_poll_server_health_safe)
+            self.server_health_timer.setSingleShot(False)
+            self.server_health_timer.start(30000)  # every 30s
     
     def _update_tables_after_startup(self):
         """Update device and stream tables after startup when servers are selected."""
