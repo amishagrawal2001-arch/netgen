@@ -520,129 +520,103 @@ class L2EmulationTab(QWidget):
         self._unsupported_reason: str = ""
 
         outer = QVBoxLayout(self)
-        outer.setContentsMargins(8, 6, 8, 4)
-        outer.setSpacing(5)
+        # Tight chrome to match the Devices tab — action bar + table read
+        # as one panel. No big banner: the QTabWidget tab label already
+        # says "L2 Emulation".
+        outer.setContentsMargins(2, 2, 2, 2)
+        outer.setSpacing(0)
 
-        # ── Header banner ─────────────────────────────────────────────
-        # Single compact row: title + inline protocol list on the left, a
-        # live status chip on the right. Kept to one line so the table gets
-        # the vertical space.
-        header = QFrame()
-        header.setObjectName("l2Header")
-        header.setStyleSheet(
-            "#l2Header { background: #f8fafc; border: 1px solid #e2e8f0; "
-            "border-radius: 6px; }"
+        # ── Action bar ────────────────────────────────────────────────
+        # Light-grey strip with the controls, mirroring devices_tab's
+        # action_bar. Sits directly on top of the table (bottom border
+        # only) so the two read as a single panel.
+        action_bar = QFrame()
+        action_bar.setStyleSheet(
+            "QFrame { background-color: #f3f4f6; "
+            "border: 1px solid #e5e7eb; border-bottom: none; }"
         )
-        hl = QHBoxLayout(header)
-        hl.setContentsMargins(12, 4, 10, 4)
-        hl.setSpacing(8)
+        bar = QHBoxLayout(action_bar)
+        bar.setContentsMargins(6, 4, 6, 4)
+        bar.setSpacing(6)
 
-        title = QLabel(
-            "<b style='font-size:13px;color:#0f172a;'>L2 / Multicast "
-            "Emulation</b><span style='color:#94a3b8;font-size:11px;'>"
-            "&nbsp;&nbsp;LACP · LLDP · VRRP · IGMP · PIM Hello</span>"
-        )
-        title.setTextFormat(Qt.RichText)
-        hl.addWidget(title)
-        hl.addStretch(1)
-
-        # Live count chip — running / total. Updated each poll.
-        self._count_chip = QLabel("—")
-        self._count_chip.setAlignment(Qt.AlignCenter)
-        self._count_chip.setMinimumWidth(140)
-        self._set_count_chip(0, 0)
-        hl.addWidget(self._count_chip)
-        outer.addWidget(header)
-
-        # ── Toolbar ───────────────────────────────────────────────────
-        toolbar = QHBoxLayout()
-        toolbar.setSpacing(6)
-
+        _BTN_H = 24
         self._start_btn = QPushButton("Start emulation…")
         self._start_btn.setCursor(Qt.PointingHandCursor)
+        self._start_btn.setFixedHeight(_BTN_H)
         self._start_btn.setStyleSheet(
             "QPushButton { background-color: #16a34a; color: white; "
-            "font-weight: 600; padding: 4px 16px; border-radius: 4px; } "
+            "font-weight: 600; padding: 0 14px; border-radius: 5px; } "
             "QPushButton:hover { background-color: #15803d; }"
         )
         self._start_btn.clicked.connect(self._on_start_clicked)
-        toolbar.addWidget(self._start_btn)
+        bar.addWidget(self._start_btn)
 
         # Neutral / danger buttons share a consistent flat style.
         _neutral_css = (
             "QPushButton { background-color: #ffffff; color: #334155; "
-            "border: 1px solid #cbd5e1; padding: 4px 14px; border-radius: 4px; } "
-            "QPushButton:hover { background-color: #f1f5f9; } "
-            "QPushButton:disabled { color: #cbd5e1; border-color: #e2e8f0; }"
+            "border: 1px solid #cbd5e1; padding: 0 12px; border-radius: 5px; } "
+            "QPushButton:hover { background-color: #f1f5f9; border-color: #94a3b8; } "
+            "QPushButton:disabled { color: #cbd5e1; border-color: #e5e7eb; }"
         )
         _danger_css = (
             "QPushButton { background-color: #ffffff; color: #b91c1c; "
-            "border: 1px solid #fca5a5; padding: 4px 14px; border-radius: 4px; } "
+            "border: 1px solid #fca5a5; padding: 0 12px; border-radius: 5px; } "
             "QPushButton:hover { background-color: #fef2f2; }"
         )
 
         self._stop_btn = QPushButton("Stop selected")
         self._stop_btn.setCursor(Qt.PointingHandCursor)
+        self._stop_btn.setFixedHeight(_BTN_H)
         self._stop_btn.setStyleSheet(_neutral_css)
         self._stop_btn.clicked.connect(self._on_stop_selected)
-        toolbar.addWidget(self._stop_btn)
+        bar.addWidget(self._stop_btn)
 
         self._stop_all_btn = QPushButton("Stop all")
         self._stop_all_btn.setCursor(Qt.PointingHandCursor)
+        self._stop_all_btn.setFixedHeight(_BTN_H)
         self._stop_all_btn.setStyleSheet(_danger_css)
         self._stop_all_btn.setToolTip(
             "Stop every L2 emulation session on this server."
         )
         self._stop_all_btn.clicked.connect(self._on_stop_all)
-        toolbar.addWidget(self._stop_all_btn)
+        bar.addWidget(self._stop_all_btn)
 
         self._refresh_btn = QPushButton("Refresh")
         self._refresh_btn.setCursor(Qt.PointingHandCursor)
+        self._refresh_btn.setFixedHeight(_BTN_H)
         self._refresh_btn.setStyleSheet(_neutral_css)
         self._refresh_btn.clicked.connect(self.refresh)
-        toolbar.addWidget(self._refresh_btn)
-
-        toolbar.addStretch(1)
+        bar.addWidget(self._refresh_btn)
 
         # Status / notice line — transient errors and unsupported-server
-        # notices land here (right-aligned so it never shoves the buttons).
+        # notices land here. Sits between the buttons and the chip.
         self._info_label = QLabel("")
         self._info_label.setStyleSheet("color: #6b7280; font-size: 11px;")
         self._info_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        toolbar.addWidget(self._info_label, 1)
+        bar.addWidget(self._info_label, 1)
 
-        outer.addLayout(toolbar)
+        # Live count chip — running / total. Updated each poll.
+        self._count_chip = QLabel("—")
+        self._count_chip.setAlignment(Qt.AlignCenter)
+        self._set_count_chip(0, 0)
+        bar.addWidget(self._count_chip)
+
+        outer.addWidget(action_bar)
 
         # ── Session table ─────────────────────────────────────────────
+        # Plain default Qt table chrome, matching the Devices / BGP /
+        # OSPF / IS-IS tables. Compact row height; rich cell content
+        # (status pill, protocol badge, formatted counters) is applied
+        # per-item in _render_sessions.
         self._table = QTableWidget(0, len(self.COLUMNS))
         self._table.setHorizontalHeaderLabels(self.COLUMNS)
         self._table.setEditTriggers(QTableWidget.NoEditTriggers)
         self._table.setSelectionBehavior(QTableWidget.SelectRows)
         self._table.setSelectionMode(QTableWidget.ExtendedSelection)
-        self._table.setAlternatingRowColors(True)
-        self._table.setShowGrid(False)
         self._table.verticalHeader().setVisible(False)
-        self._table.verticalHeader().setDefaultSectionSize(26)
+        self._table.verticalHeader().setDefaultSectionSize(24)
         self._table.horizontalHeader().setStretchLastSection(True)
         self._table.horizontalHeader().setHighlightSections(False)
-        self._table.setStyleSheet(
-            "QTableWidget {"
-            " background: #ffffff;"
-            " alternate-background-color: #f8fafc;"
-            " gridline-color: #e2e8f0;"
-            " selection-background-color: #dbeafe;"
-            " selection-color: #0f172a;"
-            " border: 1px solid #e2e8f0;"
-            " border-radius: 6px;"
-            "}"
-            "QTableWidget::item { padding: 2px 8px; }"
-            "QHeaderView::section {"
-            " background: #f1f5f9; color: #475569;"
-            " padding: 6px 8px; border: none;"
-            " border-bottom: 2px solid #e2e8f0;"
-            " font-weight: 600;"
-            "}"
-        )
         self._table.setColumnWidth(self.COL_STATUS, 96)
         self._table.setColumnWidth(self.COL_PROTO, 86)
         self._table.setColumnWidth(self.COL_IFACE, 110)
@@ -659,21 +633,14 @@ class L2EmulationTab(QWidget):
             hi = self._table.horizontalHeaderItem(col)
             if hi is not None:
                 hi.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-        outer.addWidget(self._table, 1)
-
-        # Hint footer — single compact line, full text on hover.
-        hint = QLabel(
-            "Needs <code>CAP_NET_RAW</code> (Linux) / root (macOS). "
-            "<code>PermissionError</code> in Last Error means the worker stopped."
-        )
-        hint.setTextFormat(Qt.RichText)
-        hint.setStyleSheet("color: #94a3b8; font-size: 10px;")
-        hint.setToolTip(
+        # The permission note that used to be a footer row now lives as a
+        # tooltip on the table — keeps the chrome to just the action bar.
+        self._table.setToolTip(
             "L2 frame generators need CAP_NET_RAW on Linux or root on macOS. "
             "If you see PermissionError in Last Error, the worker stopped — "
             "fix the server-side permissions and retry."
         )
-        outer.addWidget(hint)
+        outer.addWidget(self._table, 1)
 
         # Auto-refresh timer — light, just polls /api/l2/sessions.
         self._timer = QTimer()

@@ -2,6 +2,43 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.45] - 2026-05-29
+
+Re-style the L2 / Multicast Emulation tab to match the **Devices tab**
+and reclaim still more vertical space for the session table.
+
+### What changed (`widgets/l2_emulation_tab.py`)
+- **Dropped the header banner** entirely — the top-level tab is already
+  labelled, so the banner was redundant chrome (same reasoning the
+  Devices tab used to drop its "Device List" label).
+- **Controls moved into a Devices-tab-style action bar**: a light-grey
+  `QFrame` strip (`#f3f4f6`, bottom border only) that sits flush on top
+  of the table so the two read as one panel. Buttons are fixed-height
+  (24 px) with the shared neutral/danger styling; the running/total
+  status chip moved to the right end of this bar.
+- **Table now uses plain default Qt chrome** like the Devices / BGP /
+  OSPF / IS-IS tables (removed the custom alternating-rows / no-gridline
+  / rounded-border stylesheet). Row height trimmed to 24 px. The rich
+  cell content — status pill, per-protocol colour badge, VLAN column,
+  human-readable counters — is unchanged (it's applied per-item, not via
+  the table stylesheet).
+- **Removed the footer hint row**; the CAP_NET_RAW / root note is now a
+  tooltip on the table.
+- Outer margins `8/6/8/4 → 2/2/2/2`, spacing `5 → 0`.
+
+### Why
+Follow-up to 0.2.43/0.2.44. The banner + footer + padded toolbar were
+eating a disproportionate share of the tab; folding everything into a
+single action bar (Devices-tab pattern) leaves nearly the whole tab for
+session rows and keeps the look consistent across tabs.
+
+### Verified
+Headless render of empty + populated states; smoke assertions pass; full
+suite **103 passed**.
+
+### Notes
+- Client-only (`widgets/l2_emulation_tab.py`). No functional change.
+
 ## [0.2.44] - 2026-05-29
 
 Make the L2 / Multicast Emulation tab **more compact** — the chrome was
