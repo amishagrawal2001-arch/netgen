@@ -604,16 +604,25 @@ class TrafficGenClientServerSection():
             pass
         
         if self.stream_table.hasFocus() or has_selection or is_editing or combo_dropdown_open:
-            # Delay refresh to allow user interaction to complete
-            # Use longer delay if combo dropdown is open (user needs time to select)
+            # Defer the refresh while the user is interacting (row selected,
+            # inline-editing a cell, or a combo dropdown open). Schedule a
+            # single catch-up retry so the deferred refresh isn't lost, then
+            # ALWAYS skip the rebuild this pass.
+            #
+            # BUGFIX: the `return` used to be nested under
+            # `if not self._pending_stream_refresh`, so only the *first*
+            # poll during an edit was deferred. The 2nd+ poll (the stats
+            # poller fires every ~2s, an edit takes longer) found the flag
+            # already True, fell through, and rebuilt the table mid-edit —
+            # closing the editor. Returning unconditionally keeps the editor
+            # open for the whole edit; the periodic poll refreshes once the
+            # user is done (which clears _pending_stream_refresh below).
             delay_ms = 1000 if combo_dropdown_open else 500
-            if not hasattr(self, "_pending_stream_refresh"):
-                self._pending_stream_refresh = False
-            if not self._pending_stream_refresh:
+            if not getattr(self, "_pending_stream_refresh", False):
                 self._pending_stream_refresh = True
                 QTimer.singleShot(delay_ms, lambda: self._do_update_stream_table())
-                return
-        
+            return
+
         # print(f"[STREAM TABLE] Starting _do_update_stream_table() - _populating_table was False")
         self._populating_table = True
         self._pending_stream_refresh = False  # Clear pending flag

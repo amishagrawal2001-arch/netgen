@@ -2,6 +2,43 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.49] - 2026-05-29
+
+Fix inline editing in the **Streams table** being interrupted by the
+periodic stats refresh.
+
+### The bug (`traffic_client/server_section.py`)
+`_do_update_stream_table` has a guard that should defer a refresh while
+the user is interacting (row selected / inline-editing a cell / combo
+dropdown open). But the `return` that skips the rebuild was **nested
+inside** the `if not self._pending_stream_refresh:` branch:
+
+- 1st poll during an edit → flag is False → schedule a retry, set the
+  flag, `return` (correctly deferred).
+- 2nd+ poll during the *same* edit → flag is now True → the `if not …`
+  block is skipped → control **falls through and rebuilds the table**,
+  closing the open editor.
+
+Because the stats poller fires every ~2 s and an edit takes longer, the
+second poll always interrupted you mid-edit.
+
+### The fix
+The `return` now fires unconditionally whenever you're interacting; only
+the *first* deferred pass schedules the single catch-up retry. The editor
+stays open for the whole edit, and the table refreshes on the next poll
+once you're done (which clears `_pending_stream_refresh`). This covers
+both refresh paths — the debounced `update_stream_table` and the direct
+`_do_update_stream_table()` call from the stats poller.
+
+### Verified
+Control-flow simulation: across 4 consecutive polls during a sustained
+edit, zero rebuilds and exactly one scheduled retry; refresh resumes
+after the edit ends. Full suite **103 passed**.
+
+### Notes
+- Client-only. Pre-existing debounce bug (not introduced by the recent
+  styling work). No server or wire-format change.
+
 ## [0.2.48] - 2026-05-29
 
 Finish the cross-tab table-consistency pass: the **L2 Emulation** table
