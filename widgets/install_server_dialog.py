@@ -133,11 +133,24 @@ class WheelUploadWorker(QThread):
             self.log_chunk.emit(
                 f"[client] server rejected upload: {r.status_code} {r.text[:400]}\n"
             )
-            # 5xx = server-side bug (likely the v0.2.6-v0.2.10 NameError);
-            # 4xx = client error (wrong filename, conflict, etc). Only
-            # 5xx is recoverable via SSH fallback — 4xx means the
-            # operator should fix their input instead.
-            if r.status_code >= 500:
+            # Which HTTP failures are SSH-recoverable?
+            #   • 404 / 501 → the /api/admin/upgrade_wheel endpoint does
+            #     NOT EXIST on this server (it predates the in-GUI upgrade
+            #     feature). This is the classic "old server" case and is
+            #     exactly what the SSH path (pip + systemctl restart) is
+            #     for — so OFFER it.
+            #   • 5xx → endpoint exists but errored (e.g. the latent
+            #     v0.2.6-v0.2.10 NameError); SSH bypasses it.
+            #   • other 4xx (400/409/413…) → genuine client/input error
+            #     (bad filename, conflict, too large); SSH won't help, so
+            #     don't offer it — the operator should fix the input.
+            if r.status_code in (404, 501):
+                self.http_endpoint_broken.emit(
+                    f"server returned HTTP {r.status_code} — this server predates the "
+                    f"in-GUI upgrade endpoint (/api/admin/upgrade_wheel). Falling back "
+                    f"to SSH (pip install + service restart) to upgrade it."
+                )
+            elif r.status_code >= 500:
                 self.http_endpoint_broken.emit(
                     f"server returned HTTP {r.status_code} — endpoint may have the "
                     f"latent v0.2.6-v0.2.10 NameError bug. Falling back to SSH "
@@ -322,10 +335,17 @@ class SshUpgradeWorker(QThread):
 
             # Build the section-9a one-liner. sudo'd when user != root
             # so pip can write under the system Python's dist-packages.
+            # Restart whichever service this host actually runs. New
+            # installs use `netgen-server`; legacy/old servers (the exact
+            # case this SSH path serves — they predate the HTTP upgrade
+            # endpoint) often still run `ostg-server`. Try the new name
+            # first, fall back to the legacy unit so the restart doesn't
+            # fail on an old box.
             cmd_payload = (
                 f"pip3 install --upgrade --force-reinstall --no-deps "
                 f"{remote_wheel} && "
-                f"systemctl restart netgen-server && "
+                f"(systemctl restart netgen-server 2>/dev/null || "
+                f"systemctl restart ostg-server) && "
                 f"sleep 2 && "
                 f"pip3 show ostg-trafficgen | head -2 && "
                 f"curl -fsS http://127.0.0.1:5050/api/health && echo"

@@ -2,6 +2,48 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.34] - 2026-05-28
+
+Fix the in-GUI upgrade so it works against **old servers** that predate
+the `/api/admin/upgrade_wheel` endpoint.
+
+### Problem
+On a server without the HTTP upgrade endpoint, the upload returns
+**HTTP 404**. The dialog's worker only offered the SSH fallback on
+network errors or **5xx**; it lumped 404 in with "client/input errors"
+(400/409/413) and just failed. So the GUI couldn't upgrade exactly the
+servers that most need upgrading.
+
+### Fixes (widgets/install_server_dialog.py)
+1. **404 / 501 → SSH fallback.** These specifically mean "endpoint
+   missing" (server predates the feature), which is the canonical
+   SSH-recoverable case. The dialog now emits `http_endpoint_broken` and
+   offers the SSH upgrade path (sftp wheel → `pip install` →
+   service restart). Genuine 4xx input errors (400/409/413) still don't
+   offer SSH — those need the operator to fix the input.
+2. **Legacy service name.** The SSH upgrade hardcoded
+   `systemctl restart netgen-server`, but old servers often still run
+   the `ostg-server` unit. The restart now does
+   `systemctl restart netgen-server || systemctl restart ostg-server`,
+   so it works on both.
+
+### How to upgrade an old server (no `/api/admin/upgrade_wheel`)
+- **GUI**: Install/Upgrade Server → it now auto-detects the missing
+  endpoint (404) and offers SSH — enter SSH creds and go.
+- **Manual** (equivalent one-liner):
+  ```
+  scp ostg_trafficgen-0.2.34-py3-none-any.whl root@<server>:/tmp/
+  ssh root@<server> 'pip3 install --upgrade --force-reinstall --no-deps \
+      /tmp/ostg_trafficgen-0.2.34-py3-none-any.whl && \
+      (systemctl restart netgen-server || systemctl restart ostg-server)'
+  ```
+  Once on 0.2.34+, the startup self-heal deploys the FRR/DHCP assets and
+  rebuilds the image, and future upgrades can use the HTTP path.
+
+### Notes
+- Client-only (widgets/install_server_dialog.py).
+- Wheel ships as `ostg_trafficgen-0.2.34-py3-none-any.whl`.
+
 ## [0.2.33] - 2026-05-28
 
 Surface the v0.2.32 service-health verdict in the **Add TGEN Chassis**
