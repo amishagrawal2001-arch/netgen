@@ -1044,11 +1044,42 @@ class InstallServerDialog(QDialog):
         # fallback worker on HTTP failure.
         self.up_ssh_box = self.up_ssh_enable_cb
 
+        # Two ways to upgrade, side by side:
+        #   • "Upload && Upgrade" — HTTP path (POST /api/admin/upgrade_wheel),
+        #     auto-falls back to SSH on 404/5xx/network when the SSH box is on.
+        #   • "Upgrade via SSH (manual)" — skips HTTP entirely and goes
+        #     straight to pip-over-SSH. The right choice for OLD servers
+        #     that don't have the HTTP endpoint at all (don't wait for a
+        #     404 round-trip), or when you just prefer the direct path.
+        btn_row = QHBoxLayout()
         self.up_btn = QPushButton("Upload && Upgrade")
+        self.up_btn.setToolTip(
+            "Upgrade via the server's HTTP endpoint (/api/admin/upgrade_wheel). "
+            "Falls back to SSH automatically if that endpoint is missing/erroring "
+            "and the SSH option above is enabled."
+        )
         self.up_btn.clicked.connect(self._start_upgrade)
-        form.addRow("", self.up_btn)
+        self.up_ssh_manual_btn = QPushButton("Upgrade via SSH (manual)")
+        self.up_ssh_manual_btn.setToolTip(
+            "Skip the HTTP endpoint and upgrade directly over SSH: sftp the wheel, "
+            "pip install --upgrade --force-reinstall --no-deps, then restart the "
+            "service. Use this for OLD servers that don't have the "
+            "/api/admin/upgrade_wheel endpoint. Fill in the SSH credentials above."
+        )
+        self.up_ssh_manual_btn.clicked.connect(self._start_ssh_upgrade_manual)
+        btn_row.addWidget(self.up_btn)
+        btn_row.addWidget(self.up_ssh_manual_btn)
+        form.addRow("", self._wrap_row(btn_row))
 
         return w
+
+    @staticmethod
+    def _wrap_row(layout) -> QWidget:
+        """Wrap a QLayout in a QWidget so it can be added via QFormLayout.addRow."""
+        holder = QWidget()
+        holder.setLayout(layout)
+        layout.setContentsMargins(0, 0, 0, 0)
+        return holder
 
     def _update_up_auth_visibility(self) -> None:
         # Hide rather than disable: setEnabled left both rows visible
@@ -1151,6 +1182,43 @@ class InstallServerDialog(QDialog):
         if path:
             line_edit.setText(path)
 
+    def _set_upgrade_busy(self, busy: bool) -> None:
+        """Enable/disable BOTH upgrade buttons together so a run can't be
+        double-started from the other button."""
+        self.up_btn.setEnabled(not busy)
+        if hasattr(self, "up_ssh_manual_btn"):
+            self.up_ssh_manual_btn.setEnabled(not busy)
+
+    def _start_ssh_upgrade_manual(self) -> None:
+        """Direct SSH upgrade — skip the HTTP endpoint entirely.
+
+        For OLD servers that lack /api/admin/upgrade_wheel (no 404
+        round-trip needed), or whenever the operator prefers the direct
+        pip-over-SSH path. Reuses the SSH credentials entered on this tab.
+        """
+        if self._worker and self._worker.isRunning():
+            QMessageBox.information(self, "Busy", "An operation is already in progress.")
+            return
+        url = (self.up_server.currentText() or "").strip()
+        wheel = (self.up_wheel.text() or "").strip()
+        token = (self.up_token.text() or "").strip()
+        if not url:
+            QMessageBox.warning(self, "Missing", "Server URL is required (used to derive the SSH host).")
+            return
+        if not wheel or not os.path.isfile(wheel):
+            QMessageBox.warning(self, "Missing", "Pick a valid wheel file.")
+            return
+
+        self.log_view.clear()
+        self._recent_errors.clear()
+        self._log_carry = ""
+        self._set_status("Starting manual SSH upgrade...")
+        self._set_upgrade_busy(True)
+        self._http_broken = False
+        self._http_broken_reason = ""
+        self._pending_upgrade = {"url": url, "wheel": wheel, "token": token}
+        self._try_ssh_fallback(manual=True)
+
     def _start_upgrade(self) -> None:
         if self._worker and self._worker.isRunning():
             QMessageBox.information(self, "Busy", "An operation is already in progress.")
@@ -1169,7 +1237,7 @@ class InstallServerDialog(QDialog):
         self._recent_errors.clear()
         self._log_carry = ""
         self._set_status("Starting upgrade...")
-        self.up_btn.setEnabled(False)
+        self._set_upgrade_busy(True)
         # Track whether HTTP failed in a recoverable way (5xx / network),
         # so finished_ok handler knows whether to trigger SSH fallback
         # vs just show the error dialog.
@@ -1204,7 +1272,7 @@ class InstallServerDialog(QDialog):
             # Clean success — clear fallback state and report.
             self._http_broken = False
             self._http_broken_reason = ""
-            self.up_btn.setEnabled(True)
+            self._set_upgrade_busy(False)
             QMessageBox.information(
                 self, "Upgrade complete",
                 "Server has restarted with the new wheel."
@@ -1219,7 +1287,7 @@ class InstallServerDialog(QDialog):
             return
 
         # No fallback available — show the captured errors.
-        self.up_btn.setEnabled(True)
+        self._set_upgrade_busy(False)
         if self._http_broken:
             self._show_failure_dialog(
                 "Upgrade failed (HTTP endpoint broken)",
@@ -1236,10 +1304,15 @@ class InstallServerDialog(QDialog):
                 "from the log:",
             )
 
-    def _try_ssh_fallback(self) -> None:
+    def _try_ssh_fallback(self, manual: bool = False) -> None:
         """Kick off SshUpgradeWorker against the server the upgrade tab
         was targeting. Reuses host from the http URL, creds from the
-        SSH fallback group."""
+        SSH fallback group.
+
+        `manual=True` when invoked directly via the "Upgrade via SSH
+        (manual)" button (no preceding HTTP attempt) — only changes the
+        log wording so it doesn't claim "HTTP endpoint failed".
+        """
         url = self._pending_upgrade.get("url", "")
         wheel = self._pending_upgrade.get("wheel", "")
 
@@ -1256,7 +1329,7 @@ class InstallServerDialog(QDialog):
             password = self.up_ssh_password.text() or ""
             key_path = None
             if not password:
-                self.up_btn.setEnabled(True)
+                self._set_upgrade_busy(False)
                 QMessageBox.warning(
                     self, "SSH fallback: missing password",
                     "The HTTP endpoint failed and SSH fallback was "
@@ -1269,18 +1342,25 @@ class InstallServerDialog(QDialog):
             password = None
             key_path = (self.up_ssh_key.text() or "").strip()
             if not key_path or not os.path.isfile(key_path):
-                self.up_btn.setEnabled(True)
+                self._set_upgrade_busy(False)
                 QMessageBox.warning(
                     self, "SSH fallback: missing key",
                     "Pick a valid SSH key file or switch to password auth."
                 )
                 return
 
-        self._append_log(
-            f"\n[client] HTTP endpoint failed: {self._http_broken_reason}\n"
-            f"[client] Falling back to SSH-based pip install + restart "
-            f"(Install Guide §9a)...\n"
-        )
+        if manual:
+            self._append_log(
+                "\n[client] Manual SSH upgrade (skipping the HTTP endpoint)...\n"
+                "[client] sftp wheel → pip install --upgrade --force-reinstall "
+                "--no-deps → restart service (Install Guide §9a)...\n"
+            )
+        else:
+            self._append_log(
+                f"\n[client] HTTP endpoint failed: {self._http_broken_reason}\n"
+                f"[client] Falling back to SSH-based pip install + restart "
+                f"(Install Guide §9a)...\n"
+            )
         self._set_status(f"SSH fallback: connecting to {user}@{host_from_url}:{port}...")
         # Reset for the new worker
         self._http_broken = False

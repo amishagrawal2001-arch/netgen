@@ -2,6 +2,38 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.35] - 2026-05-28
+
+Add an explicit **"Upgrade via SSH (manual)"** button to the
+Install/Upgrade Server dialog's Upgrade tab.
+
+### Why
+Until now the SSH upgrade path was only reachable as an *automatic*
+fallback after the HTTP attempt failed (v0.2.34 made 404 trigger it).
+For an old server you KNOW lacks `/api/admin/upgrade_wheel`, waiting for
+the HTTP round-trip to 404 is pointless — and some operators just prefer
+the direct pip-over-SSH path. There was no way to invoke it directly.
+
+### Change (widgets/install_server_dialog.py)
+- The Upgrade tab now has **two** buttons side by side:
+    * **Upload && Upgrade** — HTTP path (auto-falls back to SSH on
+      404/5xx/network when the SSH option is enabled).
+    * **Upgrade via SSH (manual)** — skips HTTP entirely: sftp the wheel
+      → `pip install --upgrade --force-reinstall --no-deps` → restart
+      the service (`netgen-server` or legacy `ostg-server`). Uses the SSH
+      credentials entered on the tab.
+- New `_start_ssh_upgrade_manual()` validates the wheel + server, then
+  calls the shared SSH worker directly (`_try_ssh_fallback(manual=True)`,
+  which logs "Manual SSH upgrade" rather than "HTTP endpoint failed").
+- Both buttons share a `_set_upgrade_busy()` helper so a run can't be
+  double-started from the other button.
+
+### Notes
+- Client-only (widgets/install_server_dialog.py).
+- Verified headless: dialog builds with both buttons, manual handler
+  wired, busy-state toggles both.
+- Wheel ships as `ostg_trafficgen-0.2.35-py3-none-any.whl`.
+
 ## [0.2.34] - 2026-05-28
 
 Fix the in-GUI upgrade so it works against **old servers** that predate
