@@ -585,26 +585,16 @@ class TrafficGenClientServerSection():
         # made the deleted row never disappear ("delete not working"), so
         # selection/focus are intentionally excluded from the guard.
 
-        # Check if a cell is currently being edited
-        # Check table state - EditingState means a cell editor is open
-        is_editing = False
-        try:
-            is_editing = self.stream_table.state() == QAbstractItemView.EditingState
-        except Exception:
-            pass
-
-        # Most reliable edit signal: is the app's focused widget a child of
-        # the stream table? An open inline editor (the QLineEdit/QComboBox
-        # Qt spawns over the cell) lives inside the table's viewport, so it
-        # shows up as a descendant. On PyQt5 5.15.11 + Python 3.14 we have
-        # seen state()==EditingState come back False and selectedRows()==0
-        # even while an editor is genuinely open — this catches that case so
-        # a periodic refresh never rebuilds the table out from under an edit.
+        # Is an inline cell editor open in the stream table? Shared helper
+        # checks both the view's EditingState and whether a genuine editor
+        # child holds focus (state() alone is unreliable on PyQt5 5.15.11 +
+        # Python 3.14). It deliberately ignores mere table/viewport focus
+        # and selection, so this guard defers ONLY for real in-progress
+        # edits — not for clicking a row (which broke delete in 0.2.50/51).
         editor_open = False
         try:
-            from PyQt5.QtWidgets import QApplication
-            fw = QApplication.focusWidget()
-            editor_open = fw is not None and self.stream_table.isAncestorOf(fw)
+            from utils.qt_table_guard import table_has_open_editor
+            editor_open = table_has_open_editor(self.stream_table)
         except Exception:
             pass
 
@@ -624,7 +614,7 @@ class TrafficGenClientServerSection():
             # If we can't check, assume no dropdown is open
             pass
         
-        if is_editing or editor_open or combo_dropdown_open:
+        if editor_open or combo_dropdown_open:
             # Defer the refresh while the user has an inline editor or a
             # combo dropdown open. Schedule a single catch-up retry so the
             # deferred refresh isn't lost, then ALWAYS skip the rebuild this

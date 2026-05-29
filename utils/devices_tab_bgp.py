@@ -344,6 +344,18 @@ class BGPHandler:
 
     def update_bgp_table(self, neighbors=None):
         """Update the BGP table with neighbor information - one row per neighbor IP."""
+        # Don't rebuild while the user has an inline editor open in this
+        # table — a rebuild (setRowCount + setItem) would discard the edit
+        # and close the editor. Monitoring repaints on its next pass once
+        # the editor closes; explicit refreshes run with no editor open,
+        # so they're unaffected. (Same class of fix as the Streams table.)
+        try:
+            from utils.qt_table_guard import table_has_open_editor
+            if table_has_open_editor(self.parent.bgp_table):
+                return
+        except Exception:
+            pass
+
         # Auto-start BGP monitoring if we have BGP devices and monitoring is not active
         if not self.parent.bgp_monitoring_active:
             has_bgp_devices = False

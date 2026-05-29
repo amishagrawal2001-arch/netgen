@@ -531,6 +531,20 @@ class ISISHandler:
 
     def update_isis_table(self):
         """Update ISIS table with data from devices and ISIS status from database."""
+        # Don't rebuild while the user has an inline editor open in this
+        # table — IS-IS deliberately exposes editable cells (ISIS Net,
+        # System ID, Hello Interval, Multiplier), and a rebuild would
+        # discard an in-progress edit. The periodic ISIS monitor repaints
+        # on its next pass once the editor closes; explicit refreshes run
+        # with no editor open, so they're unaffected. (Same class of fix
+        # as the Streams table.)
+        try:
+            from utils.qt_table_guard import table_has_open_editor
+            if table_has_open_editor(self.parent.isis_table):
+                return
+        except Exception:
+            pass
+
         # Block cellChanged while we rebuild — without this, every setItem fires
         # the on_isis_table_cell_changed handler, which interprets each populate
         # write as a user edit and triggers save_session(). With the periodic

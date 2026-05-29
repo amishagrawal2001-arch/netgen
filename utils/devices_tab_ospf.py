@@ -208,6 +208,18 @@ class OSPFHandler:
     
     def update_ospf_table(self):
         """Update OSPF table with data from devices."""
+        # Don't rebuild while the user has an inline editor open in this
+        # table — a rebuild (setRowCount + setItem) would discard the edit
+        # and close the editor. Monitoring repaints on its next pass once
+        # the editor closes; explicit refreshes run with no editor open,
+        # so they're unaffected. (Same class of fix as the Streams table.)
+        try:
+            from utils.qt_table_guard import table_has_open_editor
+            if table_has_open_editor(self.parent.ospf_table):
+                return
+        except Exception:
+            pass
+
         # Auto-start OSPF / ISIS monitoring only when at least one device has
         # a *real* protocol config — not just the protocol name in its
         # protocols list. Sessions often have devices with

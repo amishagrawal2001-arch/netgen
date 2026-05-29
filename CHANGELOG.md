@@ -2,6 +2,46 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.52] - 2026-05-29
+
+Proactive audit after the stream-delete regression: fix the **same
+edit-vs-refresh bug class** in the BGP / OSPF / IS-IS tables, and correct
+an over-eager defer in the stream guard.
+
+### Audit findings
+- **Devices status table** — safe. Its 30 s poll does surgical in-place
+  updates (Status text + ARP icons), never a full rebuild, so it can't
+  clobber an edit or selection.
+- **BGP / OSPF / IS-IS tables** — **same bug as streams.** All three are
+  intentionally inline-editable (each has a `cellChanged` save handler;
+  IS-IS explicitly makes ISIS Net / System ID / Hello Interval /
+  Multiplier editable) AND are full-rebuilt by their periodic monitoring
+  (`update_*_table`) with no editor guard. So an in-progress inline edit
+  there got discarded when that protocol's monitor ticked.
+
+### What changed
+- **`utils/qt_table_guard.py`** (new): shared `table_has_open_editor(table)`
+  predicate — true only when a real cell editor is open. Checks the view's
+  `EditingState` and whether a genuine editor *child* holds focus, while
+  explicitly **ignoring** focus on the table/viewport and any selection
+  (those were the over-broad signals that broke delete).
+- **`utils/devices_tab_bgp.py` / `devices_tab_ospf.py` / `devices_tab_isis.py`**:
+  `update_*_table` now bails early if an editor is open in that table.
+  Monitoring repaints on its next tick once the editor closes; explicit
+  refreshes (no editor open) are unaffected.
+- **`traffic_client/server_section.py`**: the stream guard now uses the
+  shared helper too. This also fixes a latent over-defer introduced in
+  0.2.50 — merely *focusing/clicking* a stream row (no editor) was pausing
+  the live stats refresh; now only a real open editor defers it.
+
+### Verified (headless)
+Helper: focused-not-editing → False, editing → True, button-focus → False.
+Streams: delete-while-selected refreshes; focused-not-editing refreshes
+(no longer deferred); editing survives 4 polls. Full suite **103 passed**.
+
+### Notes
+- Client-only. No server or wire-format change.
+
 ## [0.2.51] - 2026-05-29
 
 Fix **stream delete not refreshing** — a regression from the 0.2.49/0.2.50
