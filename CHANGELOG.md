@@ -2,6 +2,43 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.46] - 2026-05-29
+
+Bring the L2-emulation-tab polish to the **Streams tab**: a live
+running/total status chip and a cleaner table header.
+
+### What changed
+- **`traffic_client/stream_control.py`**: added a status chip
+  (`● N running · M total`) to the right end of the Streams action bar —
+  same widget/idiom as the L2 emulation tab (green when streams are
+  running, slate when idle). New `_set_stream_count_chip(running, total)`
+  helper. Also **cleaned up the table header**: dropped the heavy
+  `#e5e7eb` fill + 1 px cell borders + letter-spacing for a softer
+  `#f1f5f9` header with a single 2 px bottom rule (matches the L2 tab's
+  header). The bumped-for-visibility body styling (alternating rows,
+  blue selection) is unchanged.
+- **`traffic_client/server_section.py`**: `_do_update_stream_table` now
+  counts running streams while it builds the table and refreshes the
+  chip in its `finally` block (counters initialised before the `try` so
+  an early-exit can't `NameError`). Because start / stop / start-all /
+  stop-all all call `update_stream_table()`, the chip updates on every
+  state transition.
+
+### Why
+The user asked for the Streams tab to pick up the L2 tab's "more
+professional" treatment. The Streams tab already shared the compact
+action-bar + tight-margins pattern (it's where that pattern originated),
+so this adds the missing piece — an at-a-glance running/total indicator —
+and harmonises the header.
+
+### Verified
+Byte-compiled both files; headless chip-logic assertions; rendered the
+real Streams section (stubbed handlers) showing the chip + new header.
+Full suite **103 passed**.
+
+### Notes
+- Client-only. No server or wire-format change.
+
 ## [0.2.45] - 2026-05-29
 
 Re-style the L2 / Multicast Emulation tab to match the **Devices tab**

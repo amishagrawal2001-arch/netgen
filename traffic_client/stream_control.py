@@ -100,18 +100,13 @@ class TrafficGenClientStreamControl:
                 background-color: #1d4ed8;
             }
             QHeaderView::section {
-                background-color: #e5e7eb;
-                padding: 3px 8px;
-                border: 1px solid #cbd5e1;
-                border-left: none;
-                border-top: none;
-                font-weight: 700;
+                background-color: #f1f5f9;
+                padding: 4px 8px;
+                border: none;
+                border-bottom: 2px solid #e2e8f0;
+                font-weight: 600;
                 font-size: 11px;
-                color: #1f2937;
-                letter-spacing: 0.3px;
-            }
-            QHeaderView::section:first {
-                border-left: 1px solid #cbd5e1;
+                color: #475569;
             }
         """)
 
@@ -308,7 +303,39 @@ class TrafficGenClientStreamControl:
         clear_search_btn.clicked.connect(lambda: self.search_box.setText(""))
         button_layout.addWidget(clear_search_btn)
 
+        # Live count chip — running / total streams. Mirrors the L2
+        # emulation tab's status chip; refreshed every time the table is
+        # repopulated (see _do_update_stream_table's finally block).
+        button_layout.addSpacing(8)
+        self._stream_count_chip = QLabel()
+        self._stream_count_chip.setAlignment(Qt.AlignCenter)
+        self._set_stream_count_chip(0, 0)
+        button_layout.addWidget(self._stream_count_chip)
+
         layout.addWidget(action_bar)
+
+    def _set_stream_count_chip(self, running: int, total: int):
+        """Render the action-bar status chip — green when streams are
+        running, slate when idle: '● N running · M total'. Mirrors the
+        L2 emulation tab's chip for cross-tab consistency."""
+        chip = getattr(self, "_stream_count_chip", None)
+        if chip is None:
+            return
+        if running > 0:
+            bg, fg, dot = "#dcfce7", "#166534", "#16a34a"
+        elif total > 0:
+            bg, fg, dot = "#f1f5f9", "#475569", "#94a3b8"
+        else:
+            bg, fg, dot = "#f1f5f9", "#94a3b8", "#cbd5e1"
+        chip.setTextFormat(Qt.RichText)
+        chip.setText(
+            f"<span style='color:{dot};'>●</span> "
+            f"<b>{running}</b> running · {total} total"
+        )
+        chip.setStyleSheet(
+            f"background: {bg}; color: {fg}; font-size: 11px; "
+            f"padding: 2px 10px; border-radius: 9px;"
+        )
 
     def eventFilter(self, watched, event):
         # Keep the empty-state label centred over the table viewport.

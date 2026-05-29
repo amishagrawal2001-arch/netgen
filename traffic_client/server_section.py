@@ -633,6 +633,11 @@ class TrafficGenClientServerSection():
                 if stream_id:
                     selected_stream_ids.add(stream_id)
 
+        # Counters for the action-bar status chip. Initialised before the
+        # try so the finally block can read them even if we bail early.
+        row_count = 0
+        running_count = 0
+
         try:
             self.stream_table.setRowCount(0)
 
@@ -686,6 +691,7 @@ class TrafficGenClientServerSection():
             # print(f"[DEBUG STREAM TABLE] Available streams: {list(getattr(self, 'streams', {}).keys())}")
 
             row_count = 0
+            running_count = 0
 
             # Step 3: Build table from model
             for port, streams in getattr(self, "streams", {}).items():
@@ -753,6 +759,7 @@ class TrafficGenClientServerSection():
                     from utils.qicon_loader import status_dot_icon
                     status = stream.get("status", "stopped")
                     if status == "running":
+                        running_count += 1
                         dot_color, status_label = "green", "Running"
                     elif status == "rx_tracking":
                         dot_color, status_label = "blue", "Tracking RX"
@@ -1027,6 +1034,13 @@ class TrafficGenClientServerSection():
             # Toggle empty-state overlay (lives on the StreamControl mixin)
             if hasattr(self, "update_stream_empty_state"):
                 self.update_stream_empty_state()
+            # Refresh the action-bar status chip (running / total). Lives
+            # on the StreamControl mixin; guard in case of partial init.
+            if hasattr(self, "_set_stream_count_chip"):
+                try:
+                    self._set_stream_count_chip(running_count, row_count)
+                except Exception:
+                    pass
             # print(f"[STREAM TABLE] Completed _do_update_stream_table() - set _populating_table to False")
 
     def on_server_tree_selection_changed(self):
