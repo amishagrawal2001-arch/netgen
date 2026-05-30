@@ -2,6 +2,109 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.91] - 2026-05-30
+
+**Stateful TCP tab — fixup bundle from v0.2.88 code-review + GUI
+smoke.** Six surgical fixes in `widgets/stateful_tcp_tab.py` covering
+two HIGH-severity bugs (one of which blocked all remote-server use
+of server-side TLS), three MED bugs, and one UX bug surfaced by
+running the dialog in the offscreen Qt smoke. Six regression tests
+added to keep them away.
+
+### What changed
+
+#### Finding #1 — Cert/key path validation removed (HIGH)
+- The dialog used to call `os.path.isfile()` on cert/key paths before
+  POSTing to `/api/stateful_tcp/start`. Those paths are read by the
+  netgen-server, not by the GUI host — anyone running the client on
+  a workstation against a remote server had every valid server-side
+  path rejected with a false-positive "file not found" error.
+- Fix: dropped the check entirely. The server is the authoritative
+  validator; its non-200 response surfaces via the existing
+  Start-failed dialog path.
+
+#### Finding #2 — Stale Stop button on running→stopped row (HIGH)
+- `setItem(row, COL_ACTION, QTableWidgetItem(""))` does NOT clear a
+  previously-installed `setCellWidget` Stop button at the same cell
+  — cellWidget always wins over setItem in Qt. A session that
+  flipped running→stopped between polls would keep its now-stale
+  Stop button visible and clickable, POSTing /stop for a dead
+  session_id on click.
+- Fix: `self._table.removeCellWidget(row, self.COL_ACTION)` before
+  the `setItem` call in the stopped branch.
+
+#### Findings #3 + #6 — TLS-group row visibility (MED-HIGH + smoke)
+- `_on_role_changed` was hiding only the inner `QLineEdit`s for the
+  cert/key fields, leaving the wrapping `QWidget`s — which also
+  contained the "Browse…" `QPushButton`s — fully visible. Result:
+  two orphan Browse buttons floated in the client-TLS view with no
+  input next to them, visually suggesting required cert files for
+  client mode.
+- GUI smoke surfaced a sister bug (#6): `QFormLayout.addRow(<string>,
+  field)` builds the label internally with no handle to hide it. In
+  server-TLS view the "SNI hostname:" label stayed visible with no
+  field next to it.
+- Fix: capture the cert/key Browse-wrap `QWidget`s as
+  `_tls_cert_wrap` / `_tls_key_wrap` and toggle their visibility
+  instead of the inner QLineEdits; capture explicit `QLabel`s
+  (`_tls_sni_label`, `_tls_verify_label`) for every previously
+  string-keyed row. `_on_role_changed` now toggles label + field as
+  a pair for every row.
+
+#### Finding #4 — Synchronous stop POSTs blocking GUI (MED)
+- All three stop paths called `requests.post(..., timeout=5)` (or
+  10 for Stop all) on the GUI thread. A slow / hung server froze
+  the UI for up to 5 s per Stop click, or 5 × N for Stop selected.
+- Fix: new `_JsonPostWorker` QThread (sibling of `_JsonFetchWorker`)
+  emits `done(http_code, msg)` for logging. New helper
+  `_spawn_stop_post(body, timeout_s, tag)` fires-and-forgets via the
+  worker; the next refresh poll surfaces the result. All three stop
+  paths now use it. UI never blocks.
+
+#### Finding #5 — Stop selected ignored filter-hidden rows (MED)
+- `selectionModel().selectedIndexes()` returns every selected row
+  regardless of `setRowHidden` state. An operator could select 5
+  rows, type a filter substring that hid 3 of them, click Stop
+  selected, and silently stop sessions they could no longer see.
+- Fix: filter selected rows on `self._table.isRowHidden(row)` before
+  walking them; updated the empty-selection message to say "visible
+  session rows".
+
+### Tests
+- **`tests/test_stateful_tcp_tab.py`** — 6 new regression tests, one
+  per finding, each named `test_v0_2_91_finding_N_…` so the audit
+  trail is preserved in the test report:
+  - `_finding_1_server_tls_does_not_validate_path_on_client_fs` —
+    asserts a non-existent path is accepted into the payload and no
+    "file not found" warning fires.
+  - `_finding_2_stale_stop_button_evicted_on_running_to_stopped` —
+    renders a running session, flips to stopped, asserts
+    `cellWidget(...) is None`.
+  - `_finding_3_browse_buttons_hidden_in_client_tls_mode` —
+    constructs the dialog, checks TLS, asserts no visible Browse
+    button in the TLS group while role=Client.
+  - `_finding_6_sni_label_hidden_in_server_tls_mode` — asserts
+    `_tls_sni_label.isVisible() is False` in server mode (would
+    have caught the smoke-surfaced bug).
+  - `_finding_4_stop_posts_run_off_gui_thread` — monkeypatches
+    `_JsonPostWorker.__init__` to capture every construction and
+    asserts a worker is spawned per Stop click (not a direct
+    `requests.post`).
+  - `_finding_5_stop_selected_skips_filter_hidden_rows` — selects
+    3 rows, hides one via `setRowHidden(True)`, asserts the
+    hidden row's SID is NOT in the captured stop POSTs.
+- Two pre-existing tests updated (`test_tab_per_row_stop_posts_…`,
+  `test_tab_stop_all_posts_empty_body_…`) to collapse the new async
+  hop via a `_patch_async_post_to_sync` helper that monkeypatches
+  `_JsonPostWorker.start` to call `run()` inline. The capture
+  pattern via `mod.requests.post` stays identical.
+- Full suite: **633 tests passing** (was 613 at v0.2.88 head).
+
+### Files changed
+- Edit: `widgets/stateful_tcp_tab.py` (~+86 / -36),
+  `tests/test_stateful_tcp_tab.py` (~+170 / -25).
+
+
 ## [0.2.90] - 2026-05-30
 
 **Help-guide refresh for v0.2.80 → v0.2.89** — third doc-catch-up

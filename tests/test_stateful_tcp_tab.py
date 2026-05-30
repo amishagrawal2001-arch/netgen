@@ -487,11 +487,26 @@ def test_tab_auth_failure_surfaces_in_info_label(make_tab):
 # ──────────────────────────────────────────────── tab: stop paths
 
 
-def test_tab_per_row_stop_posts_correct_session_id(make_tab):
+def _patch_async_post_to_sync(monkeypatch, mod):
+    """v0.2.91: stop paths now spawn a _JsonPostWorker QThread so the
+    GUI doesn't block on slow servers. For unit tests we collapse the
+    async hop by monkeypatching the worker's start() to call run()
+    synchronously — the mocked module-level requests.post still
+    captures the call, just on the test's thread instead of a QThread.
+    Without this, tests asserting on captured calls race against the
+    OS thread scheduler."""
+    monkeypatch.setattr(
+        mod._JsonPostWorker, "start",
+        lambda self: self.run()
+    )
+
+
+def test_tab_per_row_stop_posts_correct_session_id(make_tab, monkeypatch):
     """Closure-in-loop trap: the row's session_id must be captured by
     the lambda, not the loop variable. Two rows → click each Stop
     button → each POST hits the right session_id."""
     tab, mod, _ = make_tab
+    _patch_async_post_to_sync(monkeypatch, mod)
     captured: List[Dict[str, Any]] = []
     mod.requests = MagicMock()
     mod.requests.post = lambda url, json=None, headers=None, timeout=None: (
@@ -516,6 +531,7 @@ def test_tab_per_row_stop_posts_correct_session_id(make_tab):
 
 def test_tab_stop_all_posts_empty_body_after_confirm(make_tab, monkeypatch):
     tab, mod, _ = make_tab
+    _patch_async_post_to_sync(monkeypatch, mod)
     captured: List[Dict[str, Any]] = []
     mod.requests = MagicMock()
     mod.requests.post = lambda url, json=None, headers=None, timeout=None: (
@@ -552,3 +568,181 @@ def test_tab_cleanup_threads_stops_timer(make_tab):
     assert tab._timer.isActive() is True
     tab.cleanup_threads()
     assert tab._timer.isActive() is False
+
+
+# ──────────────────────────────────────────────── v0.2.91 regressions
+#
+# One test per finding from the v0.2.88 code-review + GUI smoke. These
+# guard against the specific bugs coming back — keep them around even
+# if the implementation is later restructured. Each test names the
+# finding number so the audit trail is preserved in the test report.
+
+
+def test_v0_2_91_finding_1_server_tls_does_not_validate_path_on_client_fs(
+    open_dialog, monkeypatch
+):
+    """Finding #1 — the cert/key files are read by the netgen-SERVER,
+    not by the GUI host. Previously the dialog rejected any path that
+    didn't exist on the operator's laptop, breaking every remote-server
+    deployment. The fix dropped the os.path.isfile() check entirely;
+    server-side validation now surfaces via the existing non-200 path."""
+    dlg, _ = open_dialog
+    warnings: List[Any] = []
+    monkeypatch.setattr(
+        QMessageBox, "warning",
+        staticmethod(lambda *a, **k: warnings.append(a))
+    )
+    dlg._role_server.setChecked(True)
+    dlg._tls_check.setChecked(True)
+    # Path that DEFINITELY doesn't exist on the test host.
+    dlg._tls_cert.setText("/nonexistent/server/path/cert.pem")
+    dlg._tls_key.setText("/nonexistent/server/path/key.pem")
+    dlg._on_accept()
+    # Payload should be assembled (no client-side rejection).
+    pl = dlg.accepted_payload()
+    assert pl is not None
+    assert pl["body"]["tls_cert"] == "/nonexistent/server/path/cert.pem"
+    assert pl["body"]["tls_key"] == "/nonexistent/server/path/key.pem"
+    # And no warning about "file not found" should have fired.
+    msgs = " ".join(str(w) for w in warnings)
+    assert "not found" not in msgs.lower(), (
+        f"finding #1 regression — dialog re-introduced client-side "
+        f"path check: {msgs}"
+    )
+
+
+def test_v0_2_91_finding_2_stale_stop_button_evicted_on_running_to_stopped(
+    make_tab
+):
+    """Finding #2 — when a session flips running→stopped between
+    polls, setItem() does NOT clear a previously-installed Stop
+    QPushButton at the same cell. The fix calls removeCellWidget()
+    before setItem(). Regression check: render running → render same
+    row stopped → the cellWidget must be gone."""
+    tab, _, _ = make_tab
+    sess = _running_session(sid="ephemeral")
+    tab._on_refresh_ok({"sessions": [sess]}, 200)
+    assert tab._table.cellWidget(0, tab.COL_ACTION) is not None, (
+        "running row should have a Stop QPushButton"
+    )
+    # Now flip the same row to stopped.
+    sess["running"] = False
+    tab._on_refresh_ok({"sessions": [sess]}, 200)
+    assert tab._table.cellWidget(0, tab.COL_ACTION) is None, (
+        "finding #2 regression — stale Stop button persisted on "
+        "stopped row"
+    )
+
+
+def test_v0_2_91_finding_3_browse_buttons_hidden_in_client_tls_mode(
+    open_dialog
+):
+    """Finding #3 (and smoke-surfaced #6) — the cert/key Browse
+    buttons live inside cert_wrap/key_wrap QWidgets. The old
+    _on_role_changed hid only the inner QLineEdits, leaving Browse
+    buttons floating in client-TLS view. Fix: hide the wraps."""
+    dlg, _ = open_dialog
+    dlg._tls_check.setChecked(True)
+    # Client mode (default) — every server-side TLS row should be hidden.
+    assert dlg._tls_cert_wrap.isVisible() is False
+    assert dlg._tls_key_wrap.isVisible() is False
+    # And concretely the Browse buttons inside the wraps should be
+    # invisible too (Qt propagates parent visibility to children).
+    from PyQt5.QtWidgets import QPushButton
+    visible_browse = [
+        btn.text() for btn in dlg._tls_group.findChildren(QPushButton)
+        if btn.text().lower().startswith("browse") and btn.isVisible()
+    ]
+    assert visible_browse == [], (
+        f"finding #3 regression — Browse button(s) visible in "
+        f"client-TLS mode: {visible_browse}"
+    )
+
+
+def test_v0_2_91_finding_6_sni_label_hidden_in_server_tls_mode(open_dialog):
+    """Smoke-surfaced finding #6 — when QFormLayout.addRow() is called
+    with a string label, Qt builds the QLabel internally; hiding only
+    the field leaves the label dangling. The fix captures the SNI label
+    as an explicit QLabel (and similarly for the empty-label row of the
+    Verify checkbox) so we can hide it alongside the field."""
+    dlg, _ = open_dialog
+    dlg._tls_check.setChecked(True)
+    dlg._role_server.setChecked(True)
+    # In server mode the SNI label + field, and Verify label + checkbox,
+    # must ALL be hidden — not just the input parts.
+    assert dlg._tls_sni.isVisible() is False
+    assert dlg._tls_sni_label.isVisible() is False, (
+        "finding #6 regression — 'SNI hostname:' label dangling in "
+        "server-TLS view"
+    )
+    assert dlg._tls_verify.isVisible() is False
+    assert dlg._tls_verify_label.isVisible() is False
+
+
+def test_v0_2_91_finding_4_stop_posts_run_off_gui_thread(
+    make_tab, monkeypatch
+):
+    """Finding #4 — the three stop paths used to call requests.post()
+    synchronously on the GUI thread (5s × N for Stop selected, 10s for
+    Stop all). Fix: route every stop through _JsonPostWorker, a
+    QThread that emits done(http_code, msg) for logging.
+
+    Regression check: when Stop is clicked, a _JsonPostWorker is
+    constructed and start()-ed, and requests.post is NOT invoked
+    directly on the GUI thread."""
+    tab, mod, _ = make_tab
+    # Track every _JsonPostWorker construction.
+    spawned: List[Dict[str, Any]] = []
+    original_init = mod._JsonPostWorker.__init__
+
+    def _capturing_init(self, url, json_body=None, timeout_s=5.0):
+        spawned.append({"url": url, "json": json_body, "timeout_s": timeout_s})
+        original_init(self, url, json_body=json_body, timeout_s=timeout_s)
+
+    monkeypatch.setattr(mod._JsonPostWorker, "__init__", _capturing_init)
+    # Stop the worker's run() from actually hitting the network in the
+    # test — we only care that a worker was spawned per stop click.
+    monkeypatch.setattr(mod._JsonPostWorker, "start", lambda self: None)
+
+    tab._on_refresh_ok({"sessions": [_running_session(sid="x1")]}, 200)
+    btn = tab._table.cellWidget(0, tab.COL_ACTION)
+    assert btn is not None
+    btn.click()
+    assert len(spawned) == 1
+    assert spawned[0]["url"].endswith("/api/stateful_tcp/stop")
+    assert spawned[0]["json"] == {"session_id": "x1"}
+
+
+def test_v0_2_91_finding_5_stop_selected_skips_filter_hidden_rows(
+    make_tab, monkeypatch
+):
+    """Finding #5 — _on_stop_selected used to walk every selected row,
+    including rows hidden by _apply_session_filter (selection survives
+    filter changes). The fix skips hidden rows so the operator can
+    only stop sessions they can actually see."""
+    tab, mod, _ = make_tab
+    _patch_async_post_to_sync(monkeypatch, mod)
+    captured: List[Dict[str, Any]] = []
+    mod.requests = MagicMock()
+    mod.requests.post = lambda url, json=None, headers=None, timeout=None: (
+        captured.append({"json": json}) or
+        SimpleNamespace(status_code=200, text="", json=lambda: {})
+    )
+    tab._on_refresh_ok({"sessions": [
+        _running_session(sid="visible-1"),
+        _running_session(sid="visible-2"),
+        _running_session(sid="hidden-row"),
+    ]}, 200)
+    # Select all 3 rows...
+    tab._table.selectAll()
+    # ...then hide one via the filter (simulating: operator typed a
+    # substring that doesn't match the third session).
+    tab._table.setRowHidden(2, True)
+    # Stop selected should walk visible rows only.
+    tab._on_stop_selected()
+    sids_stopped = [c["json"]["session_id"] for c in captured]
+    assert "hidden-row" not in sids_stopped, (
+        f"finding #5 regression — Stop selected hit a hidden row: "
+        f"{sids_stopped}"
+    )
+    assert sorted(sids_stopped) == ["visible-1", "visible-2"]

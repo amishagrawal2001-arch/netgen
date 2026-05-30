@@ -122,6 +122,41 @@ class _JsonFetchWorker(QThread):
             self.failed.emit(f"bad JSON: {exc}", r.status_code)
 
 
+# ---------------------------------------------------------------- post worker
+
+
+class _JsonPostWorker(QThread):
+    """Fire-and-forget JSON POST so stop / stop-selected / stop-all
+    don't block the GUI thread on a slow or hung server. Emits
+    `done(http_code, short_msg)` for logging; the next 3 s poll
+    surfaces the actual result in the table.
+
+    Bug surfaced in v0.2.88 code-review finding #4: the original tab
+    called requests.post(timeout=5) synchronously on the GUI thread,
+    freezing the UI for up to 5 s per Stop click (worse for Stop
+    selected on N rows, and 10 s for Stop all)."""
+
+    done = pyqtSignal(int, str)   # http_code (0 on exception), short_msg ("" on success)
+
+    def __init__(self, url: str, json_body: Optional[Dict[str, Any]] = None,
+                 timeout_s: float = 5.0):
+        super().__init__()
+        self._url = url
+        self._json = json_body if json_body is not None else {}
+        self._timeout = timeout_s
+
+    def run(self):
+        token = os.environ.get("NETGEN_AUTH_TOKEN", "").strip()
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        try:
+            r = requests.post(self._url, json=self._json,
+                              headers=headers, timeout=self._timeout)
+        except Exception as exc:
+            self.done.emit(0, f"{type(exc).__name__}: {exc}")
+            return
+        self.done.emit(r.status_code, "" if r.status_code == 200 else f"HTTP {r.status_code}")
+
+
 # ====================================================================
 # Config dialog
 # ====================================================================
@@ -349,15 +384,30 @@ class _StatefulTcpConfigDialog(QDialog):
         form = QFormLayout(box)
         form.setLabelAlignment(Qt.AlignRight)
 
+        # NOTE on visibility: every row hides BOTH its label and its
+        # field-or-wrapper-QWidget together. QFormLayout auto-creates
+        # an internal QLabel when you pass a string as the first arg
+        # to addRow(); we never get a handle to that label, so hiding
+        # only the field leaves the label dangling. Capturing the label
+        # as an explicit QLabel (and the field-or-wrap as a QWidget)
+        # is the only reliable way to hide a row end-to-end across
+        # PyQt5 versions. The cert/key Browse buttons live INSIDE the
+        # cert_wrap/key_wrap QWidgets — hiding the wrap hides the
+        # buttons too (vs hiding just the inner QLineEdit, which left
+        # the Browse buttons floating). Bug surfaced by the v0.2.88
+        # GUI smoke + code-review findings #3 + #6.
+
         # Client-side TLS fields ----
+        self._tls_verify_label = QLabel("")
         self._tls_verify = QCheckBox(
             "Verify cert + hostname (defaults off for self-signed test certs)"
         )
-        form.addRow("", self._tls_verify)
+        form.addRow(self._tls_verify_label, self._tls_verify)
 
+        self._tls_sni_label = QLabel("SNI hostname:")
         self._tls_sni = QLineEdit()
         self._tls_sni.setPlaceholderText("optional — SNI / hostname check (defaults to dst-ip)")
-        form.addRow("SNI hostname:", self._tls_sni)
+        form.addRow(self._tls_sni_label, self._tls_sni)
 
         # Server-side TLS fields ----
         cert_row = QHBoxLayout()
@@ -369,9 +419,9 @@ class _StatefulTcpConfigDialog(QDialog):
         )
         cert_row.addWidget(self._tls_cert, 1)
         cert_row.addWidget(cert_browse)
-        cert_wrap = QWidget(); cert_wrap.setLayout(cert_row)
+        self._tls_cert_wrap = QWidget(); self._tls_cert_wrap.setLayout(cert_row)
         self._tls_cert_label = QLabel("Cert (server):")
-        form.addRow(self._tls_cert_label, cert_wrap)
+        form.addRow(self._tls_cert_label, self._tls_cert_wrap)
 
         key_row = QHBoxLayout()
         self._tls_key = QLineEdit()
@@ -382,9 +432,9 @@ class _StatefulTcpConfigDialog(QDialog):
         )
         key_row.addWidget(self._tls_key, 1)
         key_row.addWidget(key_browse)
-        key_wrap = QWidget(); key_wrap.setLayout(key_row)
+        self._tls_key_wrap = QWidget(); self._tls_key_wrap.setLayout(key_row)
         self._tls_key_label = QLabel("Key (server):")
-        form.addRow(self._tls_key_label, key_wrap)
+        form.addRow(self._tls_key_label, self._tls_key_wrap)
 
         return box
 
@@ -393,12 +443,17 @@ class _StatefulTcpConfigDialog(QDialog):
     def _on_role_changed(self, *_):
         is_client = self._role_client.isChecked()
         self._role_stack.setCurrentIndex(0 if is_client else 1)
-        # Toggle client-only vs server-only TLS rows.
-        self._tls_verify.setVisible(is_client)
-        self._tls_sni.setVisible(is_client)
-        # cert / key only matter for server-side TLS; hide on client.
-        for w in (self._tls_cert, self._tls_cert_label,
-                  self._tls_key, self._tls_key_label):
+        # Toggle client-only TLS rows (label + field together — both
+        # captured in _build_tls_group for this purpose).
+        for w in (self._tls_verify_label, self._tls_verify,
+                  self._tls_sni_label, self._tls_sni):
+            w.setVisible(is_client)
+        # Toggle server-only TLS rows. cert_wrap / key_wrap are the
+        # QWidget containers that hold both the QLineEdit AND the
+        # "Browse…" button — hide the wrap so the Browse buttons hide
+        # with the inputs (bug surfaced in GUI smoke of v0.2.88).
+        for w in (self._tls_cert_label, self._tls_cert_wrap,
+                  self._tls_key_label, self._tls_key_wrap):
             w.setVisible(not is_client)
         # Reset visibility of the loopback warning when switching to
         # server (it only applies to client).
@@ -510,17 +565,15 @@ class _StatefulTcpConfigDialog(QDialog):
                         "path. Use the Browse… buttons to pick them."
                     )
                     return
-                # Cert/key path existence — soft-check so the operator
-                # spots a typo before the API rejects it. The actual load
-                # still happens server-side.
-                for label, path in (("Cert", cert), ("Key", key)):
-                    if not os.path.isfile(path):
-                        _reject(
-                            f"{label} file not found at {path}. The "
-                            "server reads this path directly, so it must "
-                            "be readable from the server's filesystem."
-                        )
-                        return
+                # NOTE: we deliberately do NOT os.path.isfile() the
+                # cert/key paths here — those paths are read by the
+                # netgen-server, not by the GUI host. Anyone running
+                # the client on a workstation against a remote server
+                # would have valid server-side paths rejected with
+                # false-positive "file not found" errors. The server
+                # is the authoritative validator; its response surfaces
+                # in the dialog via the existing non-200 branch below.
+                # (Bug surfaced by v0.2.88 code-review finding #1.)
             body = {
                 "role": "server",
                 "listen_ip": listen_ip,
@@ -1056,6 +1109,13 @@ class StatefulTcpTab(QWidget):
                 )
                 self._table.setCellWidget(row, self.COL_ACTION, btn)
             else:
+                # Explicitly evict any prior-render Stop QPushButton at
+                # this cell — setItem alone does NOT clear a cellWidget,
+                # so a row that flipped running→stopped between polls
+                # would otherwise keep its now-stale Stop button live,
+                # POSTing /stop for a dead SID on click. Bug surfaced
+                # in v0.2.88 code-review finding #2.
+                self._table.removeCellWidget(row, self.COL_ACTION)
                 self._table.setItem(row, self.COL_ACTION, QTableWidgetItem(""))
 
         self._table.setSortingEnabled(was_sorting)
@@ -1084,31 +1144,64 @@ class StatefulTcpTab(QWidget):
 
     # ----- stop paths --------------------------------------------------
 
-    def _stop_session_by_id(self, session_id: str) -> None:
-        if not session_id:
-            return
+    def _spawn_stop_post(self, body: Dict[str, Any], *,
+                         timeout_s: float = 5.0,
+                         tag: str = "stop") -> None:
+        """Async fire-and-forget POST to /api/stateful_tcp/stop. The
+        next refresh poll catches up the table; we only emit `done`
+        for logging. Used by all three stop paths (per-row, selected,
+        all) so the GUI thread never blocks on slow servers — bug
+        surfaced in v0.2.88 code-review finding #4."""
         url = self._get_server_url()
         if not url:
             return
+        worker = _JsonPostWorker(
+            f"{url.rstrip('/')}/api/stateful_tcp/stop",
+            json_body=body, timeout_s=timeout_s,
+        )
         try:
-            requests.post(
-                f"{url.rstrip('/')}/api/stateful_tcp/stop",
-                json={"session_id": session_id},
-                headers=self._auth_headers(), timeout=5,
-            )
-        except Exception as exc:
-            logger.debug(f"[STATEFUL TCP] per-row stop failed for {session_id}: {exc}")
+            from utils.qthread_keepalive import keep
+            keep(worker)
+        except Exception:
+            pass
+        worker.done.connect(
+            (lambda code, msg, _t=tag:
+             self._on_stop_post_done(code, msg, _t))
+        )
+        worker.start()
+
+    def _on_stop_post_done(self, http_code: int, err: str, tag: str) -> None:
+        if err:
+            logger.debug(f"[STATEFUL TCP] {tag} POST failed: {err}")
+        # Schedule a refresh so the row flips from running→stopped
+        # without waiting for the next 3 s poll.
         QTimer.singleShot(150, self.refresh)
+
+    def _stop_session_by_id(self, session_id: str) -> None:
+        if not session_id:
+            return
+        self._spawn_stop_post(
+            {"session_id": session_id},
+            tag=f"per-row stop {session_id[:8]}",
+        )
 
     def _on_stop_selected(self):
         url = self._get_server_url()
         if not url:
             return
-        rows = sorted({i.row() for i in self._table.selectionModel().selectedIndexes()})
+        # Filter out rows hidden by _apply_session_filter — a row
+        # selected before the operator typed into the filter box stays
+        # in selectionModel(), so a naive walk would stop sessions the
+        # operator can no longer see. Bug surfaced in v0.2.88 code-
+        # review finding #5.
+        rows = sorted({
+            i.row() for i in self._table.selectionModel().selectedIndexes()
+            if not self._table.isRowHidden(i.row())
+        })
         if not rows:
             QMessageBox.information(
                 self, "Stop selected",
-                "Select one or more session rows first."
+                "Select one or more visible session rows first."
             )
             return
         sids: List[str] = []
@@ -1119,16 +1212,15 @@ class StatefulTcpTab(QWidget):
             sid = it.data(Qt.UserRole)
             if sid:
                 sids.append(str(sid))
+        # Async fan-out — one worker per SID. The GUI thread doesn't
+        # block on any of them; the next 3 s poll surfaces the
+        # outcome. _spawn_stop_post schedules its own delayed refresh
+        # via _on_stop_post_done.
         for sid in sids:
-            try:
-                requests.post(
-                    f"{url}/api/stateful_tcp/stop",
-                    json={"session_id": sid},
-                    headers=self._auth_headers(), timeout=5,
-                )
-            except Exception as exc:
-                logger.debug(f"[STATEFUL TCP] stop {sid} failed: {exc}")
-        QTimer.singleShot(150, self.refresh)
+            self._spawn_stop_post(
+                {"session_id": sid},
+                tag=f"stop-selected {sid[:8]}",
+            )
 
     def _on_stop_all(self):
         url = self._get_server_url()
@@ -1143,15 +1235,11 @@ class StatefulTcpTab(QWidget):
         )
         if confirm != QMessageBox.Yes:
             return
-        try:
-            requests.post(
-                f"{url}/api/stateful_tcp/stop", json={},
-                headers=self._auth_headers(), timeout=10,
-            )
-        except Exception as exc:
-            QMessageBox.warning(self, "Stop all", f"Request failed: {exc}")
-            return
-        QTimer.singleShot(150, self.refresh)
+        # Empty body → server fans out stop_all_sessions(). 10 s
+        # timeout is generous because the server might have many
+        # handlers to join; the worker carries it without blocking
+        # the GUI.
+        self._spawn_stop_post({}, timeout_s=10.0, tag="stop-all")
 
     # ----- start path --------------------------------------------------
 
