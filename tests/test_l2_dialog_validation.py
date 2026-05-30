@@ -1,0 +1,194 @@
+"""L2 dialog validation tests (v0.2.81).
+
+Pinned behaviour after the L2 emulation audit:
+
+* MAC + IP address fields validate at submit time, not at
+  scapy-frame-building time. Typos surface in the dialog with a
+  clear reason, not as opaque "invalid MAC" in the Last Error column.
+* VRRPv2 + IPv6 virtual IP combo is rejected up-front (backend
+  silently reverted to v3 before).
+* PIM generation_id is bounds-checked against the 32-bit field
+  width (RFC 7761 §4.9.5).
+"""
+
+import pytest
+from PyQt5 import QtWidgets
+from PyQt5.QtWidgets import QWidget
+
+
+# ────────────────────────────────────────── pure validator unit tests
+from widgets.l2_emulation_tab import _validate_mac, _validate_ip
+
+
+@pytest.mark.parametrize("good_mac", [
+    "00:11:22:33:44:55",
+    "ff:ff:ff:ff:ff:ff",
+    "AB:CD:EF:01:02:03",
+    "00:00:5e:00:01:01",   # the VRRP virtual MAC
+])
+def test_validate_mac_accepts_well_formed(good_mac):
+    assert _validate_mac(good_mac) is None
+
+
+@pytest.mark.parametrize("bad_mac", [
+    "",
+    "00:11:22:33:44",          # too short
+    "00:11:22:33:44:55:66",    # too long
+    "00:11:22:33:44:ZZ",       # non-hex
+    "00-11-22-33-44-55",       # dashes
+    "001122334455",            # bare hex
+    "192.168.1.1",             # IP shape
+])
+def test_validate_mac_rejects_bad_input(bad_mac):
+    assert _validate_mac(bad_mac) is not None
+
+
+@pytest.mark.parametrize("good,family", [
+    ("192.168.1.1", "any"),
+    ("10.0.0.1",    "v4"),
+    ("0.0.0.0",     "v4"),
+    ("2001:db8::1", "v6"),
+    ("fe80::1",     "v6"),
+    ("::1",         "any"),
+])
+def test_validate_ip_accepts_well_formed(good, family):
+    assert _validate_ip(good, family=family) is None
+
+
+@pytest.mark.parametrize("bad,family", [
+    ("",              "any"),
+    ("192.168.1.999", "any"),
+    ("not.an.ip",     "any"),
+    ("gggg::1",       "any"),
+    ("2001:db8::1",   "v4"),    # IPv6 in v4-required slot
+    ("192.168.1.1",   "v6"),    # IPv4 in v6-required slot
+])
+def test_validate_ip_rejects_bad_input(bad, family):
+    assert _validate_ip(bad, family=family) is not None
+
+
+# ──────────────────────────────────── dialog-level integration tests
+def _open(qapp, monkeypatch):
+    """Build the L2 config dialog with QMessageBox silenced so we
+    can probe payloads without a modal blocking the test."""
+    captured = []
+    monkeypatch.setattr(
+        QtWidgets.QMessageBox, "warning",
+        staticmethod(lambda *a, **k: captured.append((a, k)) or 0),
+    )
+    monkeypatch.setattr(QtWidgets.QMessageBox, "information",
+                        staticmethod(lambda *a, **k: None))
+    from widgets.l2_emulation_tab import _L2ConfigDialog
+    parent = QWidget()
+    dlg = _L2ConfigDialog(parent, default_iface="ens1f0")
+    return parent, dlg, captured
+
+
+def _select(dlg, proto):
+    combo = dlg._proto_combo
+    for i in range(combo.count()):
+        if combo.itemData(i) == proto:
+            combo.setCurrentIndex(i)
+            return
+    raise AssertionError(f"protocol {proto} missing from combo")
+
+
+def test_lacp_bad_mac_rejected(qapp, monkeypatch):
+    parent, dlg, captured = _open(qapp, monkeypatch)
+    _select(dlg, "lacp")
+    dlg._lacp_system_mac.setText("00:11:22:33:44:ZZ")
+    dlg._on_accept()
+    assert dlg.accepted_payload() is None
+    # First warning message references the System MAC field.
+    assert any("System MAC" in str(args) for args, _ in captured)
+
+
+def test_bfd_bad_dst_ip_rejected(qapp, monkeypatch):
+    parent, dlg, captured = _open(qapp, monkeypatch)
+    _select(dlg, "bfd")
+    dlg._bfd_dst_ip.setText("not-an-ip")
+    dlg._on_accept()
+    assert dlg.accepted_payload() is None
+    assert any("Destination IP" in str(args) for args, _ in captured)
+
+
+def test_pim_bad_src_mac_rejected(qapp, monkeypatch):
+    parent, dlg, captured = _open(qapp, monkeypatch)
+    _select(dlg, "pim")
+    dlg._pim_src_mac.setText("not-a-mac")
+    dlg._on_accept()
+    assert dlg.accepted_payload() is None
+    assert any("Source MAC" in str(args) for args, _ in captured)
+
+
+def test_pim_gen_id_overflow_rejected(qapp, monkeypatch):
+    """v0.2.81 #3: PIM generation_id > 0xFFFFFFFF is rejected
+    explicitly instead of silently truncated by scapy."""
+    parent, dlg, captured = _open(qapp, monkeypatch)
+    _select(dlg, "pim")
+    dlg._pim_generation_id.setText("0x100000000")  # 2^32, one too big
+    dlg._on_accept()
+    assert dlg.accepted_payload() is None
+    assert any("out of range" in str(args) or "32-bit" in str(args)
+               for args, _ in captured)
+
+
+def test_vrrp_v2_with_ipv6_virtual_ip_rejected(qapp, monkeypatch):
+    """v0.2.81 #2: backend used to silently revert to v3 when v2 +
+    IPv6 was submitted. Now rejected at the dialog with a clear
+    message naming the RFCs."""
+    parent, dlg, captured = _open(qapp, monkeypatch)
+    _select(dlg, "vrrp")
+    # Pick v2 + an IPv6 vip
+    for i in range(dlg._vrrp_version.count()):
+        if dlg._vrrp_version.itemData(i) == 2:
+            dlg._vrrp_version.setCurrentIndex(i)
+            break
+    dlg._vrrp_virtual_ips.setText("2001:db8::254")
+    dlg._on_accept()
+    assert dlg.accepted_payload() is None
+    assert any("VRRPv2 is IPv4-only" in str(args) for args, _ in captured)
+
+
+def test_vrrp_v3_with_ipv6_accepted(qapp, monkeypatch):
+    """The legitimate v3 + IPv6 combo MUST still work."""
+    parent, dlg, captured = _open(qapp, monkeypatch)
+    _select(dlg, "vrrp")
+    # v3 is default; just set family + ipv6 ip
+    for i in range(dlg._vrrp_family.count()):
+        if dlg._vrrp_family.itemData(i) == "ipv6":
+            dlg._vrrp_family.setCurrentIndex(i)
+            break
+    dlg._vrrp_virtual_ips.setText("fe80::254")
+    dlg._vrrp_src_ip.setText("fe80::1")
+    dlg._vrrp_src_mac.setText("00:11:22:33:44:01")
+    dlg._on_accept()
+    p = dlg.accepted_payload()
+    assert p is not None
+    assert p["body"]["version"] == 3
+    assert p["body"]["family"] == "ipv6"
+    assert p["body"]["virtual_ips"] == ["fe80::254"]
+
+
+def test_igmp_zero_group_accepted_as_general_query(qapp, monkeypatch):
+    """0.0.0.0 is the RFC-2236 General Query group address — must
+    NOT be rejected by the IPv4-validate check."""
+    parent, dlg, captured = _open(qapp, monkeypatch)
+    _select(dlg, "igmp")
+    dlg._igmp_group.setText("0.0.0.0")
+    dlg._on_accept()
+    p = dlg.accepted_payload()
+    assert p is not None
+    assert p["body"]["group"] == "0.0.0.0"
+
+
+def test_lacp_good_input_round_trips(qapp, monkeypatch):
+    """Sanity: with all good inputs the dialog accepts and the
+    payload carries the MAC verbatim."""
+    parent, dlg, captured = _open(qapp, monkeypatch)
+    _select(dlg, "lacp")
+    dlg._lacp_system_mac.setText("AA:BB:CC:DD:EE:01")
+    dlg._on_accept()
+    p = dlg.accepted_payload()
+    assert p is not None
+    assert p["body"]["system_mac"] == "AA:BB:CC:DD:EE:01"

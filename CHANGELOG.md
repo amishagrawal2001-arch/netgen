@@ -2,6 +2,84 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.81] - 2026-05-30
+
+**L2 emulation audit fixes** — first round from a holistic audit of
+the L2 emulation surface (LACP / LLDP / VRRP / IGMP / PIM / BFD,
+last touched piecemeal from v0.2.38 through v0.2.74). Closes the 5
+highest-impact PAIN items plus a server-doc cleanup. Three BLOCKER
+items (IGMPv1, VRRP auth TLVs, PIM Join/Prune) defer to their own
+focused releases; four POLISH items defer too.
+
+### What changed
+
+#### Validation (lifted out of scapy-deep-error-land)
+- **`widgets/l2_emulation_tab.py`** — two new module-level helpers:
+  - `_validate_mac(value)` — accepts `XX:XX:XX:XX:XX:XX` only;
+    rejects dashes, bare hex, IP shapes, junk.
+  - `_validate_ip(value, family="any"|"v4"|"v6")` — uses Python's
+    `ipaddress` module; honours required family per call site.
+  
+  Wired into `_on_accept` for every protocol's MAC / IP fields
+  (LACP system_mac, LLDP src_mac, VRRP virtual_ips + src_ip +
+  src_mac, IGMP group + src_ip + src_mac, PIM src_ip + src_mac,
+  BFD src_ip + dst_ip + src_mac + dst_mac). Typos now surface as
+  `"Source MAC: '00:11:22:33:44:ZZ' isn't a valid MAC address — …"`
+  in a dialog at submit time, not as opaque "invalid MAC" deep in
+  the sessions table's Last Error column an hour later.
+
+#### VRRP v2 + IPv6 mismatch rejected
+- The backend silently reverted to v3 when an IPv6 virtual_ip was
+  shipped with `version=2` — surprising, since the dialog accepts
+  the combination as valid. Now rejected up-front with a clear
+  message naming the RFCs (3768 vs 5798). The legitimate v3 + IPv6
+  combo continues to work.
+
+#### PIM generation_id bounds-check
+- `0xFFFFFFFF` is the max per RFC 7761 §4.9.5. Values >= 2³² used
+  to silently truncate inside scapy; now rejected at submit time
+  with a message naming the RFC and the field width.
+
+#### Tooltips
+- **IGMP group** field — tooltip explains that `0.0.0.0` is the
+  General Query group address (RFC 2236 §3); otherwise specify the
+  group. The validation block accepts `0.0.0.0` despite the v4
+  family check.
+- **PIM generation_id** field — tooltip explains the 32-bit width
+  and that the value should change every PIM-daemon restart.
+
+#### Server doc cleanup
+- **`server/l2_routes.py`** module docstring — added `bfd` to the
+  supported-protocols list (it landed in v0.2.61 but was never
+  added) and a design note explaining why there's no
+  `/api/l2/<protocol>/stop` (one generic `/api/l2/stop` is by
+  design — kind-agnostic).
+
+### Tests
+- **`tests/test_l2_dialog_validation.py`** — new file, 31 tests:
+  - 11 parametrised MAC/IP validator unit tests (good + bad
+    inputs).
+  - Integration tests for each protocol's bad-input rejection
+    (LACP MAC, BFD dst_ip, PIM src_mac, PIM gen_id overflow,
+    VRRP v2+IPv6, VRRP v3+IPv6 sanity, IGMP `0.0.0.0` accepted).
+
+### Deferred from the audit
+- **IGMPv1 support** (BLOCKER) — needs scapy IGMPv1 wiring; own release.
+- **VRRP auth TLVs** (BLOCKER) — VRRPv2 auth_type/password + VRRPv3
+  auth-extension TLV; own release.
+- **PIM Join/Prune** (BLOCKER, marked roadmap) — full PIM-SM state
+  machine, big lift.
+- **Frame preview** (POLISH) — hex dump + scapy.summary() before
+  Start.
+- **Per-row Stop button** (POLISH) — current Stop-selected /
+  Stop-all UX is functional but takes 2 clicks instead of 1.
+- **Sortable / filterable sessions table** (POLISH).
+- **Last Error column truncation** (POLISH) — 120 → 200 chars or
+  Details popup.
+
+### Test count
+437 → 468 (+31).
+
 ## [0.2.80] - 2026-05-30
 
 **Help-guide self-audit corrections** — a second pass over the

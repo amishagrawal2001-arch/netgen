@@ -1,7 +1,7 @@
 """L2 frame generators + multicast protocols REST surface.
 
 Fourth Blueprint extracted from the monolith (after stateful_tcp,
-device_db, events). Same `configure(require_role=...)` injection
+device_db, events). Same ``configure(require_role=...)`` injection
 pattern so auth state stays decoupled.
 
 Routes:
@@ -10,7 +10,14 @@ Routes:
   GET  /api/l2/sessions              role=viewer
   GET  /api/l2/stats/<session_id>    role=viewer
 
-Supported `<protocol>` values: lacp, lldp, vrrp, igmp, pim
+Design note: per-protocol *start* (one endpoint per protocol kind so
+the body schema can be protocol-specific), but ONE generic *stop*
+that takes a session_id and routes to the right cleaner. There is
+no ``/api/l2/<protocol>/stop`` — the stop endpoint is kind-agnostic
+by design.
+
+Supported ``<protocol>`` values (v0.2.81): ``lacp``, ``lldp``,
+``vrrp``, ``igmp``, ``pim``, ``bfd``.
 """
 
 from __future__ import annotations

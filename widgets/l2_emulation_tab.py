@@ -45,6 +45,54 @@ def _bold_font() -> QFont:
     return f
 
 
+# ──────────────────────────────────────────────── input validators (v0.2.81)
+# Lift the "validate before submitting" guard out of the per-protocol
+# branches in _on_accept so all six protocols get the same checks. Until
+# now, a typo'd MAC ("00:11:22:33:44:ZZ") or junk IP ("192.168.1.999")
+# slipped through to scapy and surfaced as opaque "invalid MAC" errors
+# in the sessions table's Last Error column. These return None if OK
+# or a human-readable reason string the caller wraps in QMessageBox.
+
+import ipaddress as _ipaddress
+import re as _re
+
+_MAC_RE = _re.compile(r"^([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}$")
+
+
+def _validate_mac(value: str) -> Optional[str]:
+    """Return None if ``value`` looks like a 6-byte MAC ``XX:XX:XX:XX:XX:XX``,
+    or a short error string. Accepts uppercase and lowercase hex; rejects
+    dash-separated and bare-hex forms (those are valid syntactically but
+    the rest of the codebase expects colons)."""
+    if not value:
+        return "MAC address is empty"
+    if not _MAC_RE.match(value.strip()):
+        return (f"'{value}' isn't a valid MAC address — use "
+                f"XX:XX:XX:XX:XX:XX (colon-separated hex bytes).")
+    return None
+
+
+def _validate_ip(value: str, *, family: str = "any") -> Optional[str]:
+    """Return None if ``value`` parses as an IP address of the requested
+    family (``"v4"`` / ``"v6"`` / ``"any"``), or a short error string.
+
+    For VRRP virtual_ips we accept v4 only on version=2 and v4-or-v6 on
+    version=3 — the caller picks the family.
+    """
+    if not value:
+        return "IP address is empty"
+    try:
+        addr = _ipaddress.ip_address(value.strip())
+    except (ValueError, TypeError):
+        return (f"'{value}' isn't a valid IP address — must be IPv4 "
+                f"(dotted quad) or IPv6.")
+    if family == "v4" and not isinstance(addr, _ipaddress.IPv4Address):
+        return f"'{value}' is IPv6; IPv4 required here."
+    if family == "v6" and not isinstance(addr, _ipaddress.IPv6Address):
+        return f"'{value}' is IPv4; IPv6 required here."
+    return None
+
+
 # ---------------------------------------------------------------- fetch worker
 
 
@@ -352,6 +400,12 @@ class _L2ConfigDialog(QDialog):
         self._igmp_version.addItem("v2 (RFC 2236)", 2)
         self._igmp_version.addItem("v3 (RFC 3376)", 3)
         self._igmp_group = QLineEdit("239.1.1.1")
+        self._igmp_group.setToolTip(
+            "Multicast group address (IPv4). Use 0.0.0.0 for an IGMPv2 "
+            "General Query (RFC 2236 §3) — all stations report their "
+            "memberships. Otherwise specify the group you're "
+            "joining / leaving / querying."
+        )
         self._igmp_type_code = QLineEdit("")
         self._igmp_type_code.setPlaceholderText(
             "(default: 0x16 Report for v2, 0x22 for v3 — override to 0x17 for Leave, 0x11 for Query)"
@@ -383,6 +437,11 @@ class _L2ConfigDialog(QDialog):
         self._pim_dr_priority.setValue(1)
         self._pim_generation_id = QLineEdit("0xABCDEF01")
         self._pim_generation_id.setPlaceholderText("Hex (0xABCDEF01) or decimal")
+        self._pim_generation_id.setToolTip(
+            "32-bit Generation ID (RFC 7761 §4.9.5): 0x00000000 to "
+            "0xFFFFFFFF. Used by neighbors to detect a router restart "
+            "(value should change every time the PIM daemon comes up)."
+        )
         self._pim_src_ip = QLineEdit("10.0.0.20")
         self._pim_src_mac = QLineEdit("00:11:22:33:44:05")
         self._pim_interval = QDoubleSpinBox()
@@ -557,9 +616,21 @@ class _L2ConfigDialog(QDialog):
             body["outer_vlan_id"] = outer_vlan_id
             body["outer_vlan_pcp"] = self._outer_vlan_pcp_spin.value()
 
+        # v0.2.81: pre-flight MAC / IP validation. Catches typos at
+        # submit time instead of letting scapy fail deep in the
+        # session-launcher and surface as opaque "invalid MAC" /
+        # "invalid IP" in the Last Error column.
+        def _reject(reason: str) -> None:
+            QMessageBox.warning(self, "Invalid input", reason)
+
         if proto == "lacp":
+            mac = self._lacp_system_mac.text().strip()
+            err = _validate_mac(mac)
+            if err:
+                _reject(f"System MAC: {err}")
+                return
             body.update({
-                "system_mac": self._lacp_system_mac.text().strip(),
+                "system_mac": mac,
                 "system_priority": self._lacp_system_priority.value(),
                 "key": self._lacp_key.value(),
                 "port_priority": self._lacp_port_priority.value(),
@@ -568,6 +639,11 @@ class _L2ConfigDialog(QDialog):
                 "fast": self._lacp_fast.isChecked(),
             })
         elif proto == "lldp":
+            src_mac = self._lldp_src_mac.text().strip()
+            err = _validate_mac(src_mac)
+            if err:
+                _reject(f"Source MAC: {err}")
+                return
             body.update({
                 "chassis_id": self._lldp_chassis_id.text().strip(),
                 "port_id": self._lldp_port_id.text().strip(),
@@ -575,7 +651,7 @@ class _L2ConfigDialog(QDialog):
                 "system_description": self._lldp_system_description.text().strip(),
                 "ttl_s": self._lldp_ttl.value(),
                 "interval_s": self._lldp_interval.value(),
-                "src_mac": self._lldp_src_mac.text().strip(),
+                "src_mac": src_mac,
             })
         elif proto == "vrrp":
             vips = [
@@ -588,22 +664,69 @@ class _L2ConfigDialog(QDialog):
                     "At least one virtual IP is required."
                 )
                 return
+            family = self._vrrp_family.currentData()
+            ip_family = "v6" if family == "ipv6" else "v4"
+            # v0.2.81 #2: VRRPv2 is IPv4-only per RFC 3768; the
+            # backend silently reverts to v3 on IPv6 VIPs, which
+            # surprises operators. Reject the mismatch up-front.
+            version = self._vrrp_version.currentData()
+            if version == 2:
+                for vip in vips:
+                    if ":" in vip:  # cheap pre-check; full validate below
+                        _reject(
+                            "VRRPv2 is IPv4-only per RFC 3768. Switch "
+                            "to VRRPv3 (RFC 5798) if you need IPv6 "
+                            "virtual IPs, or use IPv4 addresses."
+                        )
+                        return
+            for vip in vips:
+                err = _validate_ip(vip, family=ip_family)
+                if err:
+                    _reject(f"Virtual IP: {err}")
+                    return
+            src_ip = self._vrrp_src_ip.text().strip()
+            err = _validate_ip(src_ip, family=ip_family)
+            if err:
+                _reject(f"Source IP: {err}")
+                return
+            src_mac = self._vrrp_src_mac.text().strip()
+            err = _validate_mac(src_mac)
+            if err:
+                _reject(f"Source MAC: {err}")
+                return
             body.update({
-                "version": self._vrrp_version.currentData(),
-                "family": self._vrrp_family.currentData(),
+                "version": version,
+                "family": family,
                 "vrid": self._vrrp_vrid.value(),
                 "priority": self._vrrp_priority.value(),
                 "virtual_ips": vips,
-                "src_ip": self._vrrp_src_ip.text().strip(),
-                "src_mac": self._vrrp_src_mac.text().strip(),
+                "src_ip": src_ip,
+                "src_mac": src_mac,
                 "interval_s": self._vrrp_interval.value(),
             })
         elif proto == "igmp":
+            group = self._igmp_group.text().strip()
+            # 0.0.0.0 is valid for IGMPv2 General Query — allow it.
+            if group != "0.0.0.0":
+                err = _validate_ip(group, family="v4")
+                if err:
+                    _reject(f"Group: {err}")
+                    return
+            src_ip = self._igmp_src_ip.text().strip()
+            err = _validate_ip(src_ip, family="v4")
+            if err:
+                _reject(f"Source IP: {err}")
+                return
+            src_mac = self._igmp_src_mac.text().strip()
+            err = _validate_mac(src_mac)
+            if err:
+                _reject(f"Source MAC: {err}")
+                return
             body.update({
                 "version": self._igmp_version.currentData(),
-                "group": self._igmp_group.text().strip(),
-                "src_ip": self._igmp_src_ip.text().strip(),
-                "src_mac": self._igmp_src_mac.text().strip(),
+                "group": group,
+                "src_ip": src_ip,
+                "src_mac": src_mac,
                 "interval_s": self._igmp_interval.value(),
             })
             tc = self._igmp_type_code.text().strip()
@@ -625,12 +748,32 @@ class _L2ConfigDialog(QDialog):
                     f"Generation ID must be hex (0x...) or decimal."
                 )
                 return
+            # v0.2.81 #3: PIM generation_id is a 32-bit field per
+            # RFC 7761 §4.9.5; reject out-of-range values up-front
+            # instead of letting scapy truncate silently.
+            if gen_id < 0 or gen_id > 0xFFFFFFFF:
+                _reject(
+                    f"Generation ID {gen_id:#x} is out of range. RFC "
+                    f"7761 §4.9.5 defines it as a 32-bit field "
+                    f"(0x00000000 to 0xFFFFFFFF)."
+                )
+                return
+            src_ip = self._pim_src_ip.text().strip()
+            err = _validate_ip(src_ip, family="v4")
+            if err:
+                _reject(f"Source IP: {err}")
+                return
+            src_mac = self._pim_src_mac.text().strip()
+            err = _validate_mac(src_mac)
+            if err:
+                _reject(f"Source MAC: {err}")
+                return
             body.update({
                 "hold_time": self._pim_hold_time.value(),
                 "dr_priority": self._pim_dr_priority.value(),
                 "generation_id": gen_id,
-                "src_ip": self._pim_src_ip.text().strip(),
-                "src_mac": self._pim_src_mac.text().strip(),
+                "src_ip": src_ip,
+                "src_mac": src_mac,
                 "interval_s": self._pim_interval.value(),
             })
         elif proto == "bfd":
@@ -659,12 +802,35 @@ class _L2ConfigDialog(QDialog):
             your_disc = _parse_disc(self._bfd_your_disc.text(), "Your Discriminator")
             if your_disc is None:
                 return
+            # v0.2.81: validate the 4 BFD address fields. "any"
+            # family — both v4 and v6 are valid for single-hop BFD;
+            # the BFD code paths support both.
+            src_ip = self._bfd_src_ip.text().strip()
+            err = _validate_ip(src_ip)
+            if err:
+                _reject(f"Source IP: {err}")
+                return
+            dst_ip = self._bfd_dst_ip.text().strip()
+            err = _validate_ip(dst_ip)
+            if err:
+                _reject(f"Destination IP: {err}")
+                return
+            src_mac = self._bfd_src_mac.text().strip()
+            err = _validate_mac(src_mac)
+            if err:
+                _reject(f"Source MAC: {err}")
+                return
+            dst_mac = self._bfd_dst_mac.text().strip()
+            err = _validate_mac(dst_mac)
+            if err:
+                _reject(f"Destination MAC: {err}")
+                return
             body.update({
                 "state":                    self._bfd_state.currentData(),
-                "src_ip":                   self._bfd_src_ip.text().strip(),
-                "dst_ip":                   self._bfd_dst_ip.text().strip(),
-                "src_mac":                  self._bfd_src_mac.text().strip(),
-                "dst_mac":                  self._bfd_dst_mac.text().strip(),
+                "src_ip":                   src_ip,
+                "dst_ip":                   dst_ip,
+                "src_mac":                  src_mac,
+                "dst_mac":                  dst_mac,
                 "my_discriminator":         my_disc,
                 "your_discriminator":       your_disc,
                 "detect_mult":              self._bfd_detect_mult.value(),
