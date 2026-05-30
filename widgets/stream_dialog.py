@@ -1078,14 +1078,28 @@ companion — see §20.</p>
   <tr><td class="method">GET</td> <td><code>/api/events/status</code></td>
       <td>Current SSE subscriber count.</td></tr>
   <tr><th colspan="3" style="background:#eff6ff; color:#1d4ed8;">L2 frame generators &amp; multicast (§23)</th></tr>
-  <tr><td class="method">POST</td><td><code>/api/l2/{lacp,lldp,vrrp,igmp,pim}/start</code></td>
-      <td>Spawn a periodic L2 frame emitter (LACP / LLDP / VRRP / IGMP / PIM-Hello).</td></tr>
+  <tr><td class="method">POST</td><td><code>/api/l2/{lacp,lldp,vrrp,igmp,pim,bfd}/start</code></td>
+      <td>Spawn a periodic L2 frame emitter. <strong>BFD</strong> (RFC 5880) added in 0.2.61; all protocols accept inline 802.1Q + <strong>QinQ</strong> (802.1ad) tags since 0.2.60.</td></tr>
   <tr><td class="method">POST</td><td><code>/api/l2/stop</code></td>
       <td>Stop one L2 session by ID, or all if no ID given.</td></tr>
   <tr><td class="method">GET</td> <td><code>/api/l2/sessions</code></td>
       <td>List every L2 session (running + finished).</td></tr>
   <tr><td class="method">GET</td> <td><code>/api/l2/stats/&lt;id&gt;</code></td>
       <td>Live counters for one L2 session — frames sent / failed / bytes.</td></tr>
+  <tr><th colspan="3" style="background:#eff6ff; color:#1d4ed8;">EVPN bulk inject (§24) — new in 0.2.62 / 0.2.66</th></tr>
+  <tr><td class="method">POST</td><td><code>/api/evpn/type2/inject</code></td>
+      <td>Manufacture N synthetic MAC (+ optional IP) entries on a VXLAN iface so FRR advertises them as Type-2 routes.</td></tr>
+  <tr><td class="method">POST</td><td><code>/api/evpn/type2/clear</code></td>
+      <td>Undo a previous Type-2 inject by <code>inject_id</code>.</td></tr>
+  <tr><td class="method">POST</td><td><code>/api/evpn/type5/inject</code></td>
+      <td>Inject N consecutive IPv4 prefixes as kernel routes; FRR advertises them as Type-5 (IP Prefix) routes.</td></tr>
+  <tr><td class="method">POST</td><td><code>/api/evpn/type5/clear</code></td>
+      <td>Undo a previous Type-5 inject by <code>inject_id</code>.</td></tr>
+  <tr><td class="method">GET</td> <td><code>/api/evpn/type2/list</code></td>
+      <td>Unified snapshot of every active inject on this server (Type-2 + Type-5 with <code>kind</code> field).</td></tr>
+  <tr><th colspan="3" style="background:#eff6ff; color:#1d4ed8;">Preflight (§25) — new in 0.2.68</th></tr>
+  <tr><td class="method">GET</td> <td><code>/api/preflight/check</code></td>
+      <td>Pre-Apply sanity report: BGP/VXLAN/OSPF/ISIS misconfigs + cross-device duplicate IPv4. Counts + per-device grouping.</td></tr>
 </table>
 
 <h2>2. Common stream JSON shape</h2>
@@ -2429,7 +2443,18 @@ question is &quot;why are no frames hitting the wire?&quot;</p>
   <tr><td><strong>PIM Hello</strong></td>
       <td>RFC 7761 §4.3 (224.0.0.13, IP-proto 103)</td>
       <td>30 s</td></tr>
+  <tr><td><strong>BFD</strong> <span class="muted">(0.2.61+)</span></td>
+      <td>RFC 5880 / 5881 (single-hop UDP/3784, IP TTL=255)</td>
+      <td>1 s (sub-second supported via <code>interval_s=0.1</code>)</td></tr>
 </table>
+
+<p><strong>Inline 802.1Q + 802.1ad (QinQ)</strong> <span class="muted">(0.2.41 / 0.2.60+)</span>:
+every protocol accepts <code>vlan_id</code> / <code>vlan_pcp</code> (inner) and
+<code>outer_vlan_id</code> / <code>outer_vlan_pcp</code> (outer S-VLAN). Untagged when
+both are 0; single 802.1Q when only inner is set; 802.1ad QinQ
+(<code>Ether(type=0x88a8) / Dot1Q(outer, type=0x8100) / Dot1Q(inner,
+type=&lt;protocol&gt;)</code>) when both are set. No <code>vlanN</code> subif
+needed.</p>
 
 <h3>Start examples</h3>
 
@@ -2468,7 +2493,23 @@ curl -X POST ... -d '{"iface":"eth0","version":2,
 curl -X POST -H "Authorization: Bearer $NETGEN_AUTH_TOKEN" \
      -H "Content-Type: application/json" \
      -d '{"iface":"eth0","hold_time":105,"dr_priority":1}' \
-     http://&lt;server&gt;:5050/api/l2/pim/start</code></pre>
+     http://&lt;server&gt;:5050/api/l2/pim/start
+
+# BFD single-hop async — keep a peer's session Up by asserting liveness
+curl -X POST -H "Authorization: Bearer $NETGEN_AUTH_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"iface":"eth0","src_ip":"10.0.0.1","dst_ip":"10.0.0.2",
+          "my_discriminator":"0x11111111","state":3,
+          "detect_mult":3,"interval_s":1.0}' \
+     http://&lt;server&gt;:5050/api/l2/bfd/start
+
+# Any protocol + QinQ (S-VLAN 200 outer, C-VLAN 100 inner)
+curl -X POST -H "Authorization: Bearer $NETGEN_AUTH_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"iface":"eth0","chassis_id":"netgen-host","port_id":"eth0",
+          "vlan_id":100,"vlan_pcp":3,
+          "outer_vlan_id":200,"outer_vlan_pcp":5}' \
+     http://&lt;server&gt;:5050/api/l2/lldp/start</code></pre>
 
 <h3>Stats snapshot</h3>
 
@@ -2508,12 +2549,350 @@ netgen-cli l2 stop   --session-id &lt;id&gt;     # or just `stop` to stop all</c
   for proving PIM adjacency on a real router; not enough to be a full
   multicast control plane.
 </div>
+
+<h2>24. EVPN bulk inject (Type-2 / Type-5)</h2>
+
+<p>Scale-test EVPN peers by <strong>manufacturing N synthetic
+entries</strong> in the host kernel; FRR's zebra picks them up and BGP
+advertises them under the existing
+<code>address-family l2vpn evpn</code> (which
+<code>configure_bgp_for_device</code> auto-enables when a device has
+VXLAN config). The injection skips the data-plane learning step that
+real EVPN routers depend on — handy for soak-testing a partner's
+ability to handle 10 000 MAC routes or 100 IP-prefix routes without
+having to plumb that many real flows.</p>
+
+<h3>Type-2 (MAC / MAC+IP)</h3>
+
+<p>Populates the bridge FDB + ip-neigh tables on a VXLAN interface.
+Optional <code>base_ip</code> generates the MAC+IP sub-routes; optional
+<code>remote_vtep_ip</code> attaches the FDB entry to a specific remote
+VTEP (becomes the Type-2 next-hop).</p>
+
+<pre><code># Inject 1000 MAC+IP entries on vxlan100, advertising via VTEP 192.0.2.5
+curl -X POST -H "Authorization: Bearer $NETGEN_AUTH_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"iface":"vxlan100","base_mac":"aa:bb:cc:00:00:01",
+          "base_ip":"10.100.0.1","count":1000,
+          "remote_vtep_ip":"192.0.2.5","l3_iface":"br100"}' \
+     http://&lt;server&gt;:5050/api/evpn/type2/inject
+
+# Response:
+# {"inject_id":"&lt;uuid&gt;","kind":"type2","iface":"vxlan100",
+#  "count":1000,"ok_count":2000,"failed_count":0,
+#  "entries":[{"mac":"aa:bb:cc:00:00:01","ip":"10.100.0.1"},…],
+#  "errors":[]}
+
+# Clean up
+curl -X POST -H "Authorization: Bearer $NETGEN_AUTH_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"inject_id":"&lt;uuid&gt;"}' \
+     http://&lt;server&gt;:5050/api/evpn/type2/clear</code></pre>
+
+<h3>Type-5 (IP Prefix)</h3>
+
+<p>Adds N consecutive IPv4 prefixes as kernel routes (optionally in a
+VRF table). Requires FRR to have
+<code>advertise ipv4 unicast</code> set under the VRF's
+<code>address-family l2vpn evpn</code> so the routes are exported as
+Type-5.</p>
+
+<pre><code># 100 /24s starting at 10.100.0.0/24, in VRF table 1001, via 192.168.1.1
+curl -X POST -H "Authorization: Bearer $NETGEN_AUTH_TOKEN" \
+     -H "Content-Type: application/json" \
+     -d '{"dev":"eth0","base_prefix":"10.100.0.0","prefix_len":24,
+          "count":100,"gateway":"192.168.1.1","vrf_table":1001}' \
+     http://&lt;server&gt;:5050/api/evpn/type5/inject
+
+# Response — same shape as Type-2 but with `prefixes` instead of `entries`
+# Use the returned inject_id with /api/evpn/type5/clear to undo.</code></pre>
+
+<h3>Listing active injections (both kinds)</h3>
+
+<pre><code>curl http://&lt;server&gt;:5050/api/evpn/type2/list \
+     -H "Authorization: Bearer $NETGEN_AUTH_TOKEN"
+
+{
+  "injections": [
+    {"inject_id":"…","kind":"type2","iface":"vxlan100",
+     "l3_iface":"br100","remote_vtep_ip":"192.0.2.5","count":1000},
+    {"inject_id":"…","kind":"type5","iface":"eth0",
+     "count":100}
+  ]
+}</code></pre>
+
+<div class="warn">
+  Each <code>inject_id</code> is tagged with <code>kind</code>; the
+  matching <code>/api/evpn/{kind}/clear</code> endpoint is the right
+  cleaner. Calling the wrong cleaner is rejected with a warning
+  message and the record stays registered (defensive — the wrong
+  cleaner would build wrong kernel commands and leak state).
+</div>
+
+<h2>25. Preflight checks</h2>
+
+<p>Pre-Apply sanity report. Surfaces common bad-config shapes
+(<strong>BGP without remote ASN</strong>,
+<strong>VXLAN missing required fields</strong>,
+<strong>OSPF / IS-IS without area</strong>,
+<strong>cross-device IPv4 collisions</strong>) BEFORE the Apply
+round-trip so the operator sees the issue first. Heads-up surface —
+NOT a gate; Apply still runs regardless.</p>
+
+<pre><code>curl http://&lt;server&gt;:5050/api/preflight/check \
+     -H "Authorization: Bearer $NETGEN_AUTH_TOKEN"
+
+{
+  "summary": {"error":2,"warning":1,"ok":5,"total":8},
+  "findings": [
+    {"level":"error",  "code":"BGP_NO_REMOTE_ASN", "device_name":"R3",
+     "interface":"ens1f0",
+     "message":"BGP is enabled but bgp_remote_asn is empty — no
+                neighbour session will form."},
+    {"level":"error",  "code":"DUPLICATE_IPV4",    "device_name":"R7",
+     "message":"IPv4 10.0.0.5 is also configured on: R8 — this will
+                wedge forwarding and flap ARP."},
+    {"level":"warning","code":"BGP_NO_LOOPBACK",   "device_name":"R3",
+     "message":"BGP is enabled but Loopback IPv4 is empty — the
+                router-id will be derived from a transient interface
+                address."}
+  ],
+  "by_device": { "R3": [...], "R7": [...], "R8": [...] }
+}</code></pre>
+
+<p>Codes today: <code>BGP_NO_REMOTE_ASN</code> /
+<code>BGP_NO_LOOPBACK</code> / <code>VXLAN_MISSING_FIELDS</code> /
+<code>VXLAN_EMPTY</code> / <code>OSPF_NO_AREA</code> /
+<code>ISIS_NO_AREA</code> / <code>DUPLICATE_IPV4</code>. Every check
+is a pure function in <code>utils/preflight.py</code> — adding a new
+one is purely additive.</p>
+
+<h2>26. RFC 2544 latency + HTML report</h2>
+
+<p>The §26.1 throughput test (binary-search max-no-drop rate per RFC
+2544 frame size) gains an opt-in <strong>latency-capture</strong>
+pass (RFC 2544 §26.2) in 0.2.59. Send <code>capture_latency:true</code>
+on <code>/api/rfc2544/start</code> to embed NLAT timestamps in each
+trial; <code>/api/rfc2544/progress</code> then returns
+<code>latency: {min_us, avg_us, p50_us, p95_us, p99_us, max_us}</code>
+per frame-size entry. <strong>p95</strong> was added to the latency
+sampler in 0.2.58 — most SLAs are stated in p95 rather than p50 or
+p99, so it gets its own field. The GUI dialog renders a self-contained
+HTML report (test parameters + per-frame-size table + best-throughput
+summary) that any browser can Print → Save as PDF for a formal
+deliverable.</p>
+
+<h2>27. SR-MPLS label stack on the scapy tx path</h2>
+
+<p>The existing single-label MPLS branch in
+<code>utils/generic.py</code> became a true label <em>stack</em> in
+0.2.64 (RFC 8660). Set <code>protocol_data.mpls.mpls_labels:
+[16000, 16001, 16002]</code> on a stream and frames carry that SID
+list with ethertype <code>0x8847</code>, only the bottom label's
+<code>S</code> bit set, and a uniform Traffic Class + TTL across the
+stack. The Stream Edit dialog has a "Label stack" text field (0.2.65)
+that accepts decimal or hex, comma-separated. The legacy scalar
+<code>mpls_label</code> field still works — pre-0.2.64 streams produce
+bit-identical bytes.</p>
 """
 
 
 def show_api_guide(parent=None):
     """Open the REST API Guide dialog. Reachable from Help → API Guide."""
     _open_help_dialog(parent, "Netgen Server — REST API Guide", _API_GUIDE_HTML)
+
+
+_FEATURE_GUIDE_HTML = r"""
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+         sans-serif; color: #1f2937; line-height: 1.55; font-size: 12px; }
+  h1 { color: #1e40af; font-size: 20px; margin: 0 0 8px 0; }
+  h2 { color: #374151; font-size: 15px; margin-top: 22px;
+       border-bottom: 1px solid #e5e7eb; padding-bottom: 4px; }
+  h3 { color: #4b5563; font-size: 13px; margin-top: 14px; }
+  p, li { color: #374151; }
+  code { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+         background: #f3f4f6; padding: 1px 5px; border-radius: 3px;
+         font-size: 11px; color: #1e3a8a; }
+  .ver { display: inline-block; background: #e0e7ff; color: #3730a3;
+         padding: 1px 8px; border-radius: 10px; font-size: 10px;
+         font-weight: 600; margin-right: 6px; }
+  .new { background: #dcfce7; color: #166534; }
+  .fix { background: #fef3c7; color: #92400e; }
+  .muted { color: #6b7280; font-size: 11px; }
+  ul { margin: 4px 0; padding-left: 22px; }
+  li { margin: 3px 0; }
+  .where { color: #1d4ed8; font-weight: 600; font-size: 11px; }
+  table { border-collapse: collapse; margin-top: 6px; font-size: 11px; }
+  th, td { border: 1px solid #d1d5db; padding: 5px 9px; text-align: left;
+           vertical-align: top; }
+  th { background: #f3f4f6; color: #374151; font-weight: 600; }
+</style>
+
+<h1>Netgen — What's New (Feature Guide)</h1>
+<p class="muted">A tour of the user-visible features added since 0.2.41,
+organised so the menu / tab where you'll find each one is obvious. For
+the REST endpoint signatures see <strong>Help → API Guide</strong>.</p>
+
+<h2>Streams tab</h2>
+
+<h3><span class="ver new">0.2.46</span> Live "running / total" status chip</h3>
+<p>Right end of the Streams action bar shows
+<code>● N running · M total</code> — green when anything's emitting,
+slate when idle. Updates every time the table repopulates, which now
+happens on every start / stop / apply / refresh. <span class="where">Where: Streams tab,
+right of the search box.</span></p>
+
+<h3><span class="ver new">0.2.65</span> SR-MPLS label stack</h3>
+<p>MPLS section in Stream Edit gains a "Label stack" text field —
+comma-separated SIDs (decimal or hex, e.g. <code>16000, 16001, 16002</code>).
+When set, the frame carries a multi-label MPLS stack (ethertype
+<code>0x8847</code>, BOS bit auto-handled). Legacy single-label streams
+still work unchanged. <span class="where">Where: Stream Edit → Protocol Data → MPLS.</span></p>
+
+<h3><span class="ver fix">0.2.57</span> No more 2-second table flicker</h3>
+<p>The Streams table used to fully rebuild every 2 s (driven by the
+stats poll) just to repaint a status icon. Now an in-place updater
+touches only the col-0 Status cell when something actually changed.
+Inline editing is unconditionally safe across polls; selection never
+gets wiped; rows don't flicker. <span class="where">Where: throughout the Streams tab —
+the change is invisible until you notice it stopped happening.</span></p>
+
+<h2>L2 / Multicast Emulation tab</h2>
+
+<h3><span class="ver new">0.2.41 → 0.2.45</span> Spirent-style redesign</h3>
+<p>Compact one-row header, devices-tab-style action bar with primary
+Start / neutral Stop / red Stop-all, plain-default-Qt table matching
+the rest of the app, status pill + protocol badge per row,
+human-readable byte / pps / uptime formatting. <span class="where">Where: L2 Emulation tab.</span></p>
+
+<h3><span class="ver new">0.2.60</span> QinQ (802.1ad) double-tagging</h3>
+<p>Start-session dialog gains <strong>Outer VLAN ID</strong> +
+<strong>Outer VLAN PCP</strong> spinners. Default 0 → single-tagged or
+untagged (unchanged from 0.2.41). When set, the frame egresses with
+TPID <code>0x88a8</code> outer + <code>0x8100</code> inner; the
+sessions table's VLAN column shows <code>&lt;outer&gt; » &lt;inner&gt;</code> with
+the full S-/C-VLAN semantics in the tooltip. No <code>vlanN</code>
+subinterface needed. <span class="where">Where: L2 Emulation → Start → Common settings.</span></p>
+
+<h3><span class="ver new">0.2.61</span> BFD (RFC 5880) emitter</h3>
+<p>Sixth L2 protocol after LACP / LLDP / VRRP / IGMP / PIM. Sends RFC
+5880 control packets at the configured cadence — enough to keep a
+peer's session Up (default State=Up, detect_mult=3, 1 Hz) or
+deliberately tear one down (State=Down). Sub-second cadence supported
+for aggressive BFD. <span class="where">Where: L2 Emulation → Start → protocol = BFD.</span></p>
+
+<h2>Devices tab → VXLAN sub-tab</h2>
+
+<h3><span class="ver new">0.2.62 → 0.2.67</span> EVPN bulk-inject (Type-2 / Type-5)</h3>
+<p>Backend landed first (Type-2 inject in 0.2.62, Type-5 in 0.2.66 —
+both scriptable via curl); the GUI arrived in 0.2.63 (Type-2 form)
+and 0.2.67 (Type-5 form + tab selector + kind-aware Clear). New
+"EVPN Inject" button (right of Apply / Refresh on the VXLAN sub-tab
+action bar) opens a tabbed dialog:</p>
+<ul>
+  <li><strong>Type-2 (MAC / IP)</strong>: pick VXLAN iface, base MAC,
+      optional base IP + remote VTEP + L3 iface, count. Inject N
+      synthetic entries that FRR/BGP advertises as Type-2 routes.</li>
+  <li><strong>Type-5 (IP Prefix)</strong>: pick egress dev, base
+      prefix + length, optional gateway + VRF table, count. Inject N
+      kernel routes that FRR advertises as Type-5 (RFC 7432).</li>
+</ul>
+<p>Active-injections table at the bottom shows every running inject
+on this server (Type-2 blue, Type-5 violet, with iface / count /
+remote VTEP) and a per-row <strong>Clear</strong> button that routes
+to the right cleaner endpoint based on the row's kind.
+<span class="where">Where: Devices → VXLAN sub-tab → EVPN Inject button.</span></p>
+
+<h2>Statistics dock</h2>
+
+<h3><span class="ver new">0.2.58</span> Latency p95 + Export CSV</h3>
+<p>The latency tooltip on the Stream Statistics table now shows the
+<strong>p95 latency</strong> alongside the existing p50 / p99
+(most SLAs are stated in p95). A new <strong>Export CSV</strong>
+button next to "Clear Stats" dumps both stats tables (Interface +
+Stream) to a single CSV with a header block and per-section markers
+— attach to a test report without screenshotting.
+<span class="where">Where: Statistics dock — Stream Statistics tab (tooltip on Latency cell);
+Clear Stats row (Export CSV button).</span></p>
+
+<h2>Tools menu</h2>
+
+<h3><span class="ver new">0.2.59</span> RFC 2544 latency + HTML report</h3>
+<p>The RFC 2544 throughput dialog (Tools → RFC 2544 Throughput Test)
+gains:</p>
+<ul>
+  <li>A <strong>"Capture latency (RFC 2544 §26.2)"</strong> checkbox
+      — embeds NLAT timestamps in each binary-search trial so the
+      results table populates three new columns:
+      <strong>Lat p50 / p95 / p99 (µs)</strong>.</li>
+  <li>An <strong>"Export HTML Report"</strong> button — single
+      self-contained HTML file with test parameters, full results
+      table, and a best-throughput summary. Open in any browser and
+      Print → Save-as-PDF for a formal deliverable.</li>
+</ul>
+<p>Old runs still show "—" in the latency columns; pre-0.2.59 servers
+work too (the client falls back gracefully).
+<span class="where">Where: Tools → RFC 2544 Throughput Test.</span></p>
+
+<h2>Server / API surface</h2>
+
+<h3><span class="ver new">0.2.68</span> Preflight checks endpoint</h3>
+<p>New <code>GET /api/preflight/check</code> returns common bad-config
+findings before Apply: BGP without remote ASN, VXLAN missing required
+fields, OSPF / IS-IS without area, cross-device IPv4 collisions. See
+the API Guide §25 for the exact response shape. The GUI bar that
+surfaces these in the Devices tab is the next slice — for now the
+endpoint is scriptable / curl-able.</p>
+
+<h2>Reliability fixes worth knowing about</h2>
+
+<h3><span class="ver fix">0.2.49 → 0.2.55</span> Streams table interaction fixes</h3>
+<ul>
+  <li>Inline editing no longer interrupted by the 2 s stats refresh.</li>
+  <li>Delete actually removes the row from view (was stuck showing
+      after model removal).</li>
+  <li>Copy + Paste actually find the source stream (the bare-iface vs
+      full-key mismatch is resolved via stream_id lookup).</li>
+  <li><strong>Start All</strong> no longer silently skips every
+      stream — the "stale/unknown ports" filter was comparing
+      bare-iface cell text to full <code>"TG N - Port: iface"</code>
+      keys.</li>
+</ul>
+<p>Each fix has its own regression test pinned in the test suite (now
+at <strong>284+ tests</strong> vs 103 before this push).</p>
+
+<h2>Help &amp; reference</h2>
+<table>
+  <tr><th>Menu entry</th><th>Covers</th></tr>
+  <tr><td>Install Guide</td>
+      <td>End-to-end provisioning (apt + Docker + FRR + DPDK +
+          systemd); the <code>install_ostg_complete.py</code> driver.</td></tr>
+  <tr><td>API Guide</td>
+      <td>Full REST endpoint reference with curl examples for every
+          packet type, plus the new EVPN-inject (§24), Preflight
+          (§25), latency / HTML-report (§26), and SR-MPLS stack
+          (§27) sections.</td></tr>
+  <tr><td>Install / Upgrade Server</td>
+      <td>In-app wheel upgrade for a running server, or SSH-based
+          first-install on a fresh Linux host.</td></tr>
+  <tr><td>DPDK Traffic Blast Workflow</td>
+      <td>Line-rate DPDK tx_worker walkthrough: TX core sizing,
+          calibrated numbers, troubleshooting.</td></tr>
+  <tr><td><strong>What's New (this dialog)</strong></td>
+      <td>You're reading it.</td></tr>
+</table>
+
+<p class="muted">For the version-by-version detail see
+<code>CHANGELOG.md</code> at the repo root.</p>
+"""
+
+
+def show_feature_guide(parent=None):
+    """Open the What's-New / Feature Guide dialog. Reachable from
+    Help → What's New."""
+    _open_help_dialog(parent, "Netgen — What's New (Feature Guide)",
+                      _FEATURE_GUIDE_HTML)
 
 
 def _open_help_dialog(parent, title, html):

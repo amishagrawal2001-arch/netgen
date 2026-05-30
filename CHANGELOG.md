@@ -2,6 +2,78 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.69] - 2026-05-30
+
+**Help menu refresh** — update the existing API Guide with everything
+shipped since 0.2.41, and add a new "What's New" feature guide that
+tells operators where to click for each new GUI surface.
+
+### API Guide (Help → API Guide) — content additions
+- **Endpoint summary table** gains rows for all the new endpoints:
+  - EVPN bulk inject (`/api/evpn/type2/inject` / `clear` /
+    `type5/inject` / `type5/clear` / `type2/list` — unified for both
+    kinds).
+  - Preflight (`/api/preflight/check`).
+  - L2 row updated to advertise `bfd` alongside the existing 5
+    protocols and to call out inline QinQ support.
+- **New §23 callouts**: BFD added to the supported-protocols table
+  with RFC 5880/5881 + TTL=255 single-hop note; QinQ paragraph
+  describes the inner/outer encoding (`0x88a8` / `0x8100`) and the
+  payload-ethertype-on-inner contract. New BFD + QinQ curl examples
+  in the Start-examples block.
+- **New §24 — EVPN bulk inject**: Type-2 + Type-5 with copy-pasteable
+  curl blocks (inject + clear + the unified list endpoint), plus the
+  cross-kind-safety warning about calling the wrong /clear endpoint.
+- **New §25 — Preflight checks**: full response-shape example, the
+  current finding-code list, and the "heads-up surface, not a gate"
+  framing.
+- **New §26 — RFC 2544 latency + HTML report**: `capture_latency`
+  opt-in, the latency dict shape, the p95 addition, and the HTML
+  report's Print → Save-as-PDF deliverable workflow.
+- **New §27 — SR-MPLS label stack**: `mpls_labels` config shape,
+  ethertype `0x8847`, BOS-bit auto-handling, and the legacy single-
+  label back-compat guarantee.
+
+### New: "What's New" feature guide (Help → What's New)
+First feature-guide menu entry. Organised by where the change lives
+(Streams tab / L2 Emulation / VXLAN sub-tab / Stats dock / Tools menu
+/ Server-side / Reliability fixes), with a **"Where:" pointer** at
+the end of each section so the operator knows which tab + button to
+click. Every entry is tagged with the version it shipped in (green
+chip for new features, amber chip for reliability fixes).
+
+Sections covered: Streams chip (0.2.46); SR-MPLS stack field (0.2.65);
+2 s flicker fix (0.2.57); L2 redesign (0.2.41 → 0.2.45); QinQ
+(0.2.60); BFD (0.2.61); EVPN inject GUI (0.2.62 → 0.2.67); latency
+p95 + CSV export (0.2.58); RFC 2544 latency + HTML report (0.2.59);
+Preflight endpoint (0.2.68); Streams-table interaction fixes
+(0.2.49 → 0.2.55).
+
+### What changed
+- **`widgets/stream_dialog.py`** — `_API_GUIDE_HTML` extended with
+  the new rows + 4 new sections (§24–§27); new `_FEATURE_GUIDE_HTML`
+  constant; new `show_feature_guide(parent)` function alongside the
+  existing `show_api_guide` / `show_install_guide` / etc.
+- **`traffic_client/main.py`** — new "What's New..." entry in the
+  Help menu (between API Guide and the separator); new
+  `show_feature_guide` method routes through the dialog opener.
+
+### Verified — 14 new tests, full suite 298 passing
+`tests/test_help_dialogs.py`:
+- Pure-string content pins on the API guide: every new endpoint URL
+  present; L2 row carries BFD; QinQ / `outer_vlan_id` / `0x88a8`
+  mentioned; dedicated `<h2>` sections §24–§27 exist; BFD curl
+  example present.
+- Pure-string content pins on the Feature guide: every expected
+  section heading present; every version chip from 0.2.41 → 0.2.68
+  present; "Where:" pointer convention used at least 6 times;
+  cross-reference to the API Guide present.
+- Qt smoke: opening each guide builds a `QTextBrowser` and populates
+  it from the right constant (verified by intercepting `setHtml`).
+
+### Notes
+- Client-only addition; no server change.
+
 ## [0.2.68] - 2026-05-30
 
 **Preflight checks** — surface common bad-config shapes BEFORE Apply

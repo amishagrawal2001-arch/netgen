@@ -1208,15 +1208,33 @@ class TrafficGeneratorClient(
         # API Guide — REST cheatsheet for /api/traffic/* endpoints with
         # worked examples for every packet type (L2-only, IPv4+UDP/TCP/ICMP,
         # IPv6+UDP, VLAN-tagged), Scapy and DPDK paths side by side.
+        # Updated in 0.2.68 with sections §24 (EVPN bulk inject),
+        # §25 (Preflight), §26 (RFC 2544 latency + HTML report), §27
+        # (SR-MPLS stack), plus BFD + QinQ in §23.
         api_guide_action = QAction("API Guide...", self)
         api_guide_action.setToolTip(
             "REST API reference with curl examples for every packet type "
             "(IPv4/IPv6 + UDP/TCP/ICMP, VLAN, line-rate DPDK), stream "
-            "control, and stats polling."
+            "control, stats polling, EVPN bulk inject, and preflight."
         )
         api_guide_action.triggered.connect(self.show_api_guide)
         help_menu.addAction(api_guide_action)
         self.addAction(api_guide_action)
+
+        # What's New — feature guide describing the GUI changes operators
+        # actually see (status chips, L2/EVPN/SR-MPLS dialogs, RFC 2544
+        # HTML report, latency p95, …). Lives alongside the API Guide so
+        # the operator can switch between "where do I click?" and "what's
+        # the curl?" without leaving the Help menu. Added in 0.2.69.
+        feature_guide_action = QAction("What's New...", self)
+        feature_guide_action.setToolTip(
+            "Tour of the user-visible features added since 0.2.41 — "
+            "Streams chip, L2 tab redesign, QinQ, BFD, EVPN bulk-inject "
+            "GUI, RFC 2544 latency + HTML report, SR-MPLS stack, …"
+        )
+        feature_guide_action.triggered.connect(self.show_feature_guide)
+        help_menu.addAction(feature_guide_action)
+        self.addAction(feature_guide_action)
 
         help_menu.addSeparator()
 
@@ -1334,6 +1352,17 @@ class TrafficGeneratorClient(
         try:
             from widgets.stream_dialog import show_api_guide
             show_api_guide(self)
+        except Exception as e:
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Help unavailable", f"Could not open guide: {e}")
+
+    def show_feature_guide(self):
+        """Open the 'What's New' feature guide from the Help menu.
+        Companion to the API Guide — describes the GUI changes operators
+        actually see, with a where-to-click pointer for each one."""
+        try:
+            from widgets.stream_dialog import show_feature_guide
+            show_feature_guide(self)
         except Exception as e:
             from PyQt5.QtWidgets import QMessageBox
             QMessageBox.warning(self, "Help unavailable", f"Could not open guide: {e}")
