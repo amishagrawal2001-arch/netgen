@@ -2,6 +2,37 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.80] - 2026-05-30
+
+**Help-guide self-audit corrections** — a second pass over the
+What's New guide caught three small drifts that v0.2.79 itself
+introduced or left behind.
+
+### What changed
+- **Stale test count** — guide footer claimed "431 tests" but the
+  actual count after v0.2.79 is 436. Fixed (and there's a pinning
+  test in `tests/test_help_dialogs.py` so the next stale period
+  fails CI loudly).
+- **Help menu order table out of sync with the actual menu** —
+  the v0.2.79 doc update added Supported Features and What's New to
+  the table but left them at the bottom. The real menu (from
+  v0.2.73 onwards) puts them BEFORE the first separator, alongside
+  Install Guide and API Guide. Table reordered to match; separators
+  rendered explicitly so the visual matches the menu structure.
+- **"Added 0.2.72" caption was wrong** — Supported Features content
+  + menu entry both landed in v0.2.73 (v0.2.72 was the prior
+  What's-New refresh that preceded it). Caption corrected to
+  "Added 0.2.73".
+
+### New test
+- **`tests/test_help_dialogs.py::test_feature_guide_help_table_matches_menu_order`**
+  uses string-position checks to pin the table order. If a future
+  edit moves entries around without updating the table, the test
+  fails immediately.
+
+### Test count
+436 → 437 (+1).
+
 ## [0.2.79] - 2026-05-30
 
 **Help guide refresh** — catch What's New + Capabilities guides up

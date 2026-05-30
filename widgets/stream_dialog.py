@@ -3035,9 +3035,12 @@ Export CSV / Export HTML Report.</span></p>
       keys.</li>
 </ul>
 <p>Each fix has its own regression test pinned in the test suite (now
-at <strong>431 tests</strong> vs 103 before this push).</p>
+at <strong>436 tests</strong> vs 103 before this push).</p>
 
 <h2>Help &amp; reference</h2>
+<p class="muted">Listed in the same order they appear in the Help
+menu — first group is reference / "what's this?", second is
+operational, third is the DPDK deep-dive.</p>
 <table>
   <tr><th>Menu entry</th><th>Covers</th></tr>
   <tr><td>Install Guide</td>
@@ -3048,18 +3051,22 @@ at <strong>431 tests</strong> vs 103 before this push).</p>
           packet type, plus the new EVPN-inject (§24), Preflight
           (§25), latency / HTML-report (§26), and SR-MPLS stack
           (§27) sections.</td></tr>
-  <tr><td>Install / Upgrade Server</td>
-      <td>In-app wheel upgrade for a running server, or SSH-based
-          first-install on a fresh Linux host.</td></tr>
-  <tr><td>DPDK Traffic Blast Workflow</td>
-      <td>Line-rate DPDK tx_worker walkthrough: TX core sizing,
-          calibrated numbers, troubleshooting.</td></tr>
   <tr><td><strong>Supported Features</strong></td>
       <td>The full capability matrix — every packet type, protocol,
           emulator, backend the app supports. Answers "can the app
-          do X?" without scanning the codebase. (Added 0.2.72.)</td></tr>
+          do X?" without scanning the codebase. (Added 0.2.73.)</td></tr>
   <tr><td><strong>What's New (this dialog)</strong></td>
       <td>You're reading it.</td></tr>
+  <tr><td colspan="2" style="background:#f9fafb; color:#9ca3af;
+       font-size:10px; text-align:center;">— separator —</td></tr>
+  <tr><td>Install / Upgrade Server</td>
+      <td>In-app wheel upgrade for a running server, or SSH-based
+          first-install on a fresh Linux host.</td></tr>
+  <tr><td colspan="2" style="background:#f9fafb; color:#9ca3af;
+       font-size:10px; text-align:center;">— separator —</td></tr>
+  <tr><td>DPDK Traffic Blast Workflow</td>
+      <td>Line-rate DPDK tx_worker walkthrough: TX core sizing,
+          calibrated numbers, troubleshooting.</td></tr>
 </table>
 
 <p class="muted">For the version-by-version detail see

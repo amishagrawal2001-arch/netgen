@@ -120,6 +120,37 @@ def test_feature_guide_documents_preflight_followups():
     assert "SR-MPLS row badge" in _FEATURE_GUIDE_HTML
 
 
+def test_feature_guide_help_table_matches_menu_order():
+    """The "Help & reference" table at the bottom of the What's New
+    guide should list entries in the same order they appear in the
+    actual Help menu (traffic_client/main.py setup_menu_bar). Out-of-
+    sync ordering misleads operators about where to find things.
+
+    Actual menu order (as of v0.2.80):
+      Install Guide, API Guide, Supported Features, What's New,
+      [separator], Install / Upgrade Server,
+      [separator], DPDK Traffic Blast Workflow.
+    """
+    from widgets.stream_dialog import _FEATURE_GUIDE_HTML
+    # Crude but effective: assert each pair appears in the right
+    # order in the HTML by checking string positions.
+    pos = lambda s: _FEATURE_GUIDE_HTML.find(s)
+    # Anchor at the "Help & reference" header so we're not catching
+    # earlier mentions of the same labels.
+    table_start = _FEATURE_GUIDE_HTML.find("<h2>Help &amp; reference")
+    assert table_start > 0
+    tail = _FEATURE_GUIDE_HTML[table_start:]
+    def order(*labels):
+        positions = [tail.find(lbl) for lbl in labels]
+        assert all(p > 0 for p in positions), \
+            f"missing label in Help table: {labels}"
+        assert positions == sorted(positions), \
+            f"out-of-order Help table entries: {labels}"
+    order("Install Guide", "API Guide", "Supported Features",
+          "What's New", "Install / Upgrade Server",
+          "DPDK Traffic Blast Workflow")
+
+
 def test_feature_guide_documents_preflight_bar():
     """The 0.2.70 preflight bar and 0.2.71 Apply-refresh hook each
     need their own discoverable section — operators who can see the
