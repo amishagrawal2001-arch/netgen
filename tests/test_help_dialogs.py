@@ -90,14 +90,72 @@ def test_feature_guide_references_recent_versions():
     """Each new feature is tagged with the version it shipped in so
     the operator can cross-reference the changelog."""
     from widgets.stream_dialog import _FEATURE_GUIDE_HTML
-    # v0.2.79 catches the doc lag from v0.2.72 onwards — every
-    # release with a user-visible surface gets pinned here so the
-    # next stale period is caught quickly.
+    # v0.2.79 catches the doc lag from v0.2.72 onwards; v0.2.90
+    # extends the pinning through v0.2.89. Every release with a
+    # user-visible surface lives here so the next stale period gets
+    # caught immediately.
     for ver in ("0.2.41", "0.2.45", "0.2.46", "0.2.57", "0.2.58",
                 "0.2.59", "0.2.60", "0.2.61", "0.2.63", "0.2.65",
                 "0.2.66", "0.2.67", "0.2.68", "0.2.70", "0.2.71",
-                "0.2.74", "0.2.75", "0.2.76", "0.2.77", "0.2.78"):
+                "0.2.74", "0.2.75", "0.2.76", "0.2.77", "0.2.78",
+                "0.2.81", "0.2.82", "0.2.83", "0.2.84",
+                "0.2.85", "0.2.86", "0.2.87", "0.2.88", "0.2.89"):
         assert ver in _FEATURE_GUIDE_HTML, f"missing version tag: {ver}"
+
+
+def test_feature_guide_documents_l2_validation_burst():
+    """v0.2.81 → v0.2.83 + v0.2.84 added a series of L2 fixes /
+    features that operators rely on; pin the key strings so a
+    future doc edit doesn't accidentally regress them."""
+    from widgets.stream_dialog import _FEATURE_GUIDE_HTML
+    # The L2 audit hits.
+    assert "IGMPv1" in _FEATURE_GUIDE_HTML
+    assert "VRRPv2 authentication" in _FEATURE_GUIDE_HTML
+    assert "Frame preview" in _FEATURE_GUIDE_HTML
+    # The v0.2.81 audit-driven validators.
+    assert "MAC + IP validators" in _FEATURE_GUIDE_HTML
+
+
+def test_feature_guide_documents_devices_tab_additions():
+    """v0.2.85 → v0.2.89 added the Devices-tab audit fixes; pin
+    the section header + the marquee items."""
+    from widgets.stream_dialog import _FEATURE_GUIDE_HTML
+    assert "Devices tab additions" in _FEATURE_GUIDE_HTML
+    assert "ISIS NET-ID validation" in _FEATURE_GUIDE_HTML
+    assert "OSPF area-id validation" in _FEATURE_GUIDE_HTML
+    assert "Empty-state placeholders" in _FEATURE_GUIDE_HTML
+    assert "Delete-key shortcut" in _FEATURE_GUIDE_HTML
+
+
+def test_feature_guide_documents_stateful_tcp_tab():
+    """v0.2.88 brought the stateful-TCP feature into a first-class
+    GUI tab. Pin the section + a few signature labels."""
+    from widgets.stream_dialog import _FEATURE_GUIDE_HTML
+    assert "Stateful TCP tab" in _FEATURE_GUIDE_HTML
+    assert "client + server" in _FEATURE_GUIDE_HTML
+    assert "TLS both directions" in _FEATURE_GUIDE_HTML
+    assert "EADDRNOTAVAIL" in _FEATURE_GUIDE_HTML
+
+
+def test_capabilities_guide_lists_igmpv1_and_vrrpv2_auth():
+    """§2 L2/Multicast table was updated for v0.2.82 (IGMPv1) and
+    v0.2.83 (VRRPv2 auth TLVs). Pin those references."""
+    from widgets.stream_dialog import _CAPABILITIES_GUIDE_HTML
+    assert "IGMP</strong> v1 + v2 + v3" in _CAPABILITIES_GUIDE_HTML
+    # The auth blurb spans a line break — normalise whitespace
+    # before substring-matching so the HTML's word-wrap doesn't
+    # break the pin.
+    flat = " ".join(_CAPABILITIES_GUIDE_HTML.split())
+    assert "RFC 3768 §5.3.6 authentication" in flat
+
+
+def test_capabilities_guide_has_validators_subsection():
+    """v0.2.90 added a 'Catch-bad-config-early validators' sub-block
+    naming both helpers (utils/isis_net.py + utils/ospf_area.py)."""
+    from widgets.stream_dialog import _CAPABILITIES_GUIDE_HTML
+    assert "Catch-bad-config-early validators" in _CAPABILITIES_GUIDE_HTML
+    assert "validate_isis_net" in _CAPABILITIES_GUIDE_HTML
+    assert "validate_ospf_area_id" in _CAPABILITIES_GUIDE_HTML
 
 
 def test_feature_guide_documents_dpdk_telemetry_surfaces():

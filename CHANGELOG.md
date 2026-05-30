@@ -2,6 +2,88 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.90] - 2026-05-30
+
+**Help-guide refresh for v0.2.80 → v0.2.89** — third doc-catch-up
+in the series (v0.2.72, v0.2.79, now this). What's New had drifted
+9 releases behind the actual code; this release closes the gap and
+extends the pinning tests through v0.2.89 so the next stale period
+fails CI immediately.
+
+### What's New (`_FEATURE_GUIDE_HTML`) additions
+
+#### L2 Emulation section — 4 new entries
+- `0.2.81` Submit-time MAC + IP validators (LACP / LLDP / VRRP /
+  IGMP / PIM / BFD). Bundled: VRRP v2 + IPv6 mismatch rejected
+  up-front; PIM gen_id bounds-checked; IGMP group tooltip.
+- `0.2.82` IGMPv1 (RFC 1112) support — legacy multicast-router
+  tests; type-code default 0x12 (Report), override to 0x11 (Query)
+  → IP dst = 224.0.0.1.
+- `0.2.83` VRRPv2 authentication (RFC 3768 §5.3.6) — Auth type
+  combo + 8-ASCII-byte password, fields disable on v3 with RFC
+  5798 §5.1 tooltip.
+- `0.2.84` Sessions-table polish + Frame preview — Last Error 120
+  → 200 chars, filter QLineEdit, per-row Stop button, Preview
+  modal with scapy summary + tcpdump-style hex.
+
+#### Devices tab additions — NEW top-level section
+- `0.2.85` Right-click menu + Delete-key shortcut.
+- `0.2.85` DHCP apply now refreshes preflight (closes the 5-protocol
+  consistency loop).
+- `0.2.86` ISIS NET-ID validation (RFC 1195 §3.1) — variable-length
+  area IDs, NSEL=00 enforcement, both inline-edit + Add Device
+  dialog.
+- `0.2.87` OSPF area-id validation + normalisation — `1` → `0.0.0.1`,
+  matches what FRR puts on the wire.
+- `0.2.89` Empty-state placeholders on every protocol sub-tab.
+
+#### Stateful TCP tab — NEW top-level section
+- `0.2.88` First-class GUI tab — client + server roles, raw + http
+  protocols, TLS both directions, VRF passthrough, loopback warning,
+  sessions table with per-row Stop, graceful 404 degrade.
+
+#### Reliability fixes
+- `0.2.88` Stateful-TCP suite-flake fix — five tests throttled to
+  `interval_s=0.02` to stop emptying the macOS ephemeral-port pool
+  inside a single test. 20 consecutive full-suite runs green after
+  the fix.
+
+#### Stale test count
+`436 tests` → `622 tests`. (Suite is at 622 as of the v0.2.89 ship;
+v0.2.90 adds 5 more pin tests.)
+
+### Capabilities (`_CAPABILITIES_GUIDE_HTML`) updates
+- §2 L2 / Multicast emulator table — VRRP row notes the 0.2.83 v2
+  auth TLVs (and explains why v3 has no auth fields); IGMP row
+  promoted from "v2 + v3" to "v1 + v2 + v3" with the 0.2.82
+  reference.
+- §7 Preflight "Findings surfaces" — DHCP added to the
+  auto-refresh-after-Apply list (closing the 5-protocol loop).
+  New sub-block "Catch-bad-config-early validators" names both
+  helpers (`utils/isis_net.py`, `utils/ospf_area.py`) and explains
+  the normalisation behaviour.
+- §11 Stateful TCP (capability matrix) — already added in v0.2.88;
+  no change needed.
+
+### Tests
+- **`tests/test_help_dialogs.py`** — 5 new tests + 9 new version
+  pins:
+  - `test_feature_guide_references_recent_versions` extended through
+    `0.2.89`.
+  - `test_feature_guide_documents_l2_validation_burst` pins IGMPv1
+    / VRRPv2 auth / Frame preview / MAC+IP validators strings.
+  - `test_feature_guide_documents_devices_tab_additions` pins the
+    new section + each Devices-tab feature label.
+  - `test_feature_guide_documents_stateful_tcp_tab` pins the
+    Stateful TCP section + signature labels.
+  - `test_capabilities_guide_lists_igmpv1_and_vrrpv2_auth` pins the
+    §2 updates.
+  - `test_capabilities_guide_has_validators_subsection` pins the §7
+    validator sub-block.
+
+### Test count
+622 → 627 (+5).
+
 ## [0.2.89] - 2026-05-30
 
 **Empty-state placeholders on protocol sub-tabs** — closes another

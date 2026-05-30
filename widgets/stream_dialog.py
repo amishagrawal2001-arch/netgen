@@ -3008,6 +3008,132 @@ peer behaviours (echo mode, simulated path-down) can now reach
 them without curl. <span class="where">Where: L2 Emulation →
 Start → protocol = BFD.</span></p>
 
+<h3><span class="ver new">0.2.81</span> Submit-time MAC + IP validators</h3>
+<p>Every MAC / IP field across LACP / LLDP / VRRP / IGMP / PIM /
+BFD now validates at submit time. Typos like
+<code>00:11:22:33:44:ZZ</code> or <code>192.168.1.999</code>
+surface as a dialog warning naming the field, not as opaque
+"invalid MAC" deep in the sessions table's Last Error column an
+hour later. Also: VRRP v2 + IPv6 mismatch rejected up-front (was
+silently reverting to v3); PIM <code>generation_id</code> bounds-
+checked to 32 bits per RFC 7761 §4.9.5; IGMP <code>group</code>
+field tooltip clarifies <code>0.0.0.0</code> is the General Query
+group per RFC 2236 §3.</p>
+
+<h3><span class="ver new">0.2.82</span> IGMPv1 (RFC 1112) support</h3>
+<p>Legacy IGMPv1 query / report generation for testing older
+multicast routers or IGMP-snooping fallback on switches that still
+accept v1. Type code default <code>0x12</code> (Membership Report)
+→ IP dst = group; override to <code>0x11</code> (Query) → IP dst
+= <code>224.0.0.1</code> (ALL-SYSTEMS), L2 dst auto-mapped to
+<code>01:00:5e:00:00:01</code>. <span class="where">Where: L2
+Emulation → Start → protocol = IGMP → Version = v1.</span></p>
+
+<h3><span class="ver new">0.2.83</span> VRRPv2 authentication (RFC 3768 §5.3.6)</h3>
+<p>New <strong>Auth type</strong> combo (0 = None / 1 = Simple Text
+Password / 2 = IPAH) + <strong>Auth data</strong> field (up to 8
+ASCII bytes, packed into auth1 + auth2 NUL-padded). When Version =
+v3 both fields disable with a tooltip citing RFC 5798 §5.1 — auth
+was removed from v3 entirely, so the GUI surfaces that intent
+rather than silently ignoring the fields.</p>
+
+<h3><span class="ver new">0.2.84</span> Sessions-table polish + Frame preview</h3>
+<p>Four POLISH items closed in one bundle:</p>
+<ul>
+  <li><strong>Last Error column</strong> truncation 120 → 200 chars
+      (full text still in tooltip). Scapy tracebacks fit now.</li>
+  <li><strong>Filter QLineEdit</strong> in the action bar — substring
+      match on protocol / iface / session_id, case-insensitive.
+      Sorting deliberately left off (Qt's setSortingEnabled doesn't
+      move cellWidgets so a sort would orphan the per-row Stop
+      buttons).</li>
+  <li><strong>Per-row Stop button</strong> on every running session.
+      One click → POST /api/l2/stop with that session_id, refresh
+      150 ms later.</li>
+  <li><strong>Frame preview</strong> button in the Start dialog —
+      pure <code>build_preview_frame()</code> helper renders the
+      first frame each protocol would emit; modal shows scapy
+      <code>summary()</code> + tcpdump-style hex without sending
+      anything. <span class="where">Where: L2 Emulation → Start →
+      Preview frame…</span></li>
+</ul>
+
+
+<h2>Devices tab additions</h2>
+
+<h3><span class="ver new">0.2.85</span> Right-click menu + Delete-key shortcut</h3>
+<p>Devices table gets a context menu (Apply selected / Copy /
+Paste / Delete — mirrors the toolbar) that selects the row under
+the cursor first. The Delete key is bound to
+<code>remove_selected_device</code> with <code>Qt.WidgetShortcut</code>
+context so it doesn't fire during inline editing.</p>
+
+<h3><span class="ver new">0.2.85</span> DHCP apply now refreshes preflight</h3>
+<p>Every other protocol's apply path kicked the preflight bar;
+DHCP was the lone outlier. <code>DUPLICATE_IPV4</code> finding
+state can flip when a DHCP-assigned address collides with a
+static one, so the bar now repaints. Closes the 5-protocol
+consistency loop opened in v0.2.71.</p>
+
+<h3><span class="ver new">0.2.86</span> ISIS NET-ID validation (RFC 1195 §3.1)</h3>
+<p>New <code>utils/isis_net.py</code> helper accepts variable-length
+area IDs (AFI + Area(1–13) + SysID(6) + NSEL = 8–20 bytes total)
+and enforces NSEL = 00 — the old inline check was hardcoded to one
+specific length and didn't enforce NSEL. Wired into the inline-edit
+path AND the Add Device dialog (with <code>allow_short_area=True</code>
+so the <code>49.0001</code> AFI-only shortcut still pads to a
+full NET).</p>
+
+<h3><span class="ver new">0.2.87</span> OSPF area-id validation + normalisation</h3>
+<p>New <code>utils/ospf_area.py</code> validates both forms (integer
+0–4294967295 OR dotted-decimal A.B.C.D) and <strong>normalises</strong>
+to the dotted form FRR puts on the wire. Operator typing
+<code>1</code> for area 1 now gets <code>0.0.0.1</code> stored,
+matching what <code>show ip ospf</code> reports later — eliminates
+the silent mismatch that used to trigger apply-storms when
+subsequent inline edits saw "1 → 0.0.0.1" as a change.</p>
+
+<h3><span class="ver new">0.2.89</span> Empty-state placeholders on every protocol sub-tab</h3>
+<p>BGP / OSPF / IS-IS / VXLAN / DHCP sub-tabs used to render as
+blank rectangles on a fresh session — operators couldn't tell
+"empty by design" from "broken connection" or "still loading".
+New <code>EmptyStateOverlay</code> widget shows a centred dimmed
+placeholder with a per-protocol "do this to add the first row"
+hint. Hides the instant the first row arrives.</p>
+
+
+<h2>Stateful TCP tab</h2>
+
+<h3><span class="ver new">0.2.88</span> First-class Stateful TCP GUI tab</h3>
+<p>The stateful-TCP feature (previously API/CLI-only) gets a
+dedicated tab next to L2 Emulation, modelled on the L2 tab's
+action-bar / sessions-table / poll-worker shape. Highlights:</p>
+<ul>
+  <li><strong>Roles</strong>: client + server in one dialog,
+      switched via a button group driving a <code>QStackedWidget</code>.</li>
+  <li><strong>Protocols</strong>: <code>raw</code> + <code>http</code>
+      in v1 (<code>dns</code> + <code>sip</code> deferred to v2
+      alongside matching <code>netgen-cli tcp</code> flag adds).</li>
+  <li><strong>TLS both directions</strong>: client gets verify +
+      SNI inputs; server gets cert + key file pickers with file-
+      exists validation.</li>
+  <li><strong>VRF passthrough</strong>: degrades gracefully on
+      macOS / non-root Linux (last_error carries the reason;
+      traffic still flows via the default routing table).</li>
+  <li><strong>Loopback warning</strong>: inline amber callout
+      when <code>dst_ip</code> parses as loopback and the interval
+      is sub-5 ms — guards against the EADDRNOTAVAIL trap the
+      v0.2.88 suite-flake fix addresses.</li>
+  <li><strong>Sessions table</strong>: 10 columns + per-row Stop
+      button + Status-cell tooltip with the full counter dump
+      (per-protocol bins, last_error, retransmits, kernel RTT).</li>
+  <li><strong>Graceful 404 degrade</strong>: same pattern as the
+      L2 tab — slowed poll + amber chip + intercepted Start +
+      auto-recovery when the endpoint returns.</li>
+</ul>
+<p><span class="where">Where: top tab bar → "Stateful TCP" (right
+of L2 Emulation).</span></p>
+
 
 <h2>Tools menu additions</h2>
 
@@ -3034,8 +3160,22 @@ Export CSV / Export HTML Report.</span></p>
       bare-iface cell text to full <code>"TG N - Port: iface"</code>
       keys.</li>
 </ul>
-<p>Each fix has its own regression test pinned in the test suite (now
-at <strong>436 tests</strong> vs 103 before this push).</p>
+
+<h3><span class="ver fix">0.2.88</span> Stateful-TCP suite-flake fix (TIME_WAIT / EADDRNOTAVAIL)</h3>
+<p>Five stateful-TCP / DNS / SIP tests were running their client
+with the default <code>interval_s=0</code>. On loopback a single
+sender thread fires ~5 000 connect()s/sec, each leaving a 30–60 s
+TIME_WAIT; the macOS ephemeral-port pool (~16 k) emptied inside
+the same test → <code>OSError [Errno 49] Can't assign requested
+address</code>. Subsequent tests inherited the dry port pool and
+flaked sporadically — including <code>test_vrf_bind_no_op_on_non_linux</code>,
+which was the long-standing user-visible symptom. Throttle to
+<code>interval_s=0.02</code> (≈50 conns/sec) keeps the assertions
+intact and the port pool healthy. 20 consecutive full-suite runs
+green after the fix.</p>
+
+<p>Each fix has its own regression test pinned in the test suite
+(now at <strong>622 tests</strong> vs 103 before this push).</p>
 
 <h2>Help &amp; reference</h2>
 <p class="muted">Listed in the same order they appear in the Help
@@ -3199,9 +3339,14 @@ hellos on a cadence. All accept inline 802.1Q + 802.1ad tags.</p>
       <td>Chassis ID, port ID, system name + description, TTL.</td></tr>
   <tr><td><strong>VRRP</strong> v2 + v3</td><td>3768 / 5798</td>
       <td>Master advertisements; IPv4 <code>224.0.0.18</code> +
-          IPv6 <code>ff02::12</code>.</td></tr>
-  <tr><td><strong>IGMP</strong> v2 + v3</td><td>2236 / 3376</td>
-      <td>Membership reports + Leave; configurable group address.</td></tr>
+          IPv6 <code>ff02::12</code>. v2 supports the RFC 3768 §5.3.6
+          authentication TLVs (None / Simple Text Password / IPAH)
+          since 0.2.83; v3 deprecated auth per RFC 5798 §5.1 so
+          those fields disable when v3 is picked.</td></tr>
+  <tr><td><strong>IGMP</strong> v1 + v2 + v3</td><td>1112 / 2236 / 3376</td>
+      <td>Membership reports + Leave + General Query.
+          v1 (RFC 1112) added in 0.2.82 for legacy multicast-router
+          tests; v2 default; v3 source-aware (Mode-Is-Exclude).</td></tr>
   <tr><td><strong>PIM Hello</strong></td><td>7761 §4.3</td>
       <td>Neighbour discovery probe for PIM-SM / SSM.</td></tr>
   <tr><td><strong>BFD</strong></td><td>5880 / 5881</td>
@@ -3317,8 +3462,28 @@ or not.
       + <strong>Export CSV / Export JSON</strong> buttons
       (timestamped filenames). (v0.2.74)</li>
   <li><strong>Auto-refresh after Apply</strong> — bar repaints
-      immediately after device / BGP / OSPF / IS-IS / VXLAN apply,
-      not on the 60 s poll. (v0.2.71 + v0.2.74)</li>
+      immediately after device / BGP / OSPF / IS-IS / VXLAN / DHCP
+      apply, not on the 60 s poll. (v0.2.71 + v0.2.74 + v0.2.85;
+      DHCP coverage closed the 5-protocol consistency loop.)</li>
+</ul>
+
+<h3>Catch-bad-config-early validators (v0.2.86 + v0.2.87)</h3>
+<p>Two pure-function helpers stop common BGP/OSPF/IS-IS typos at
+submit time instead of letting FRR reject them five seconds later
+inside the container:</p>
+<ul>
+  <li><code>utils/isis_net.py:validate_isis_net</code> — RFC 1195
+      §3.1: AFI + Area(1–13) + SysID(6) + NSEL=00 = 8–20 bytes
+      total. Accepts variable-length area IDs. Wired into the
+      inline-edit path + the Add Device dialog (the latter with
+      <code>allow_short_area=True</code> so the
+      <code>49.0001</code> shortcut still pads).</li>
+  <li><code>utils/ospf_area.py:validate_ospf_area_id</code> —
+      RFC 2328 §6: 32-bit integer, displayed as IPv4 dotted-
+      decimal. Accepts both forms; <em>normalises</em> integer
+      input to the dotted form FRR puts on the wire so operator-
+      typed "1" becomes "0.0.0.1" stored, matching
+      <code>show ip ospf</code> output.</li>
 </ul>
 
 
