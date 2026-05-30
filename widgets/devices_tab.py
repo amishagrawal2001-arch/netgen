@@ -1631,6 +1631,13 @@ class DevicesTab(QWidget):
                     return None
             self.preflight_bar = PreflightBar(_resolve_url, parent=self.devices_subtab)
             layout.addWidget(self.preflight_bar)
+            # v0.2.78: subscribe to per-device breakdown so the Devices
+            # table can paint a red/amber/green dot in front of each
+            # device name. The bar already polls every 60s; we just
+            # mirror its data into the table.
+            self.preflight_bar.by_device_updated.connect(
+                self._apply_preflight_dots
+            )
         except Exception as _e:
             # Bar is purely advisory — failure to construct must NEVER
             # block the Devices tab from rendering. Logged for triage.
@@ -7621,6 +7628,75 @@ class DevicesTab(QWidget):
 
         return merged
 
+    def _apply_preflight_dots(self, by_device):
+        """Paint a per-device red/amber/green dot in front of each
+        Device Name cell, driven by the preflight bar's by_device
+        breakdown (v0.2.78).
+
+        ``by_device`` shape: ``{device_name: {error: n, warning: n,
+        ok: n, ...}}`` — matches what the /api/preflight/check endpoint
+        returns. Devices missing from the dict get no prefix (they
+        haven't been touched by any preflight check).
+
+        Idempotent: re-applying overwrites the prefix, so this can run
+        every time the bar refreshes without piling up dots.
+        """
+        try:
+            from PyQt5.QtGui import QColor
+            if not isinstance(by_device, dict):
+                return
+            table = getattr(self, "devices_table", None)
+            if table is None:
+                return
+            col = self.COL.get("Device Name", 0)
+            for row in range(table.rowCount()):
+                item = table.item(row, col)
+                if item is None:
+                    continue
+                # The display string may carry a leading dot from the
+                # last apply — strip it so we don't pile up emoji.
+                raw_name = item.text()
+                for prefix in ("●  ", "○  "):
+                    if raw_name.startswith(prefix):
+                        raw_name = raw_name[len(prefix):]
+                        break
+                stats = by_device.get(raw_name)
+                if not stats:
+                    # No findings for this device — strip any stale dot.
+                    item.setText(raw_name)
+                    continue
+                n_err = int(stats.get("error", 0))
+                n_warn = int(stats.get("warning", 0))
+                # Severity wins: error > warning > ok-only > unknown.
+                if n_err > 0:
+                    dot_color = "#b91c1c"  # red
+                    tip = (f"{n_err} preflight error"
+                           f"{'' if n_err == 1 else 's'}"
+                           + (f", {n_warn} warning"
+                              f"{'' if n_warn == 1 else 's'}"
+                              if n_warn else ""))
+                elif n_warn > 0:
+                    dot_color = "#b45309"  # amber
+                    tip = (f"{n_warn} preflight warning"
+                           f"{'' if n_warn == 1 else 's'}")
+                else:
+                    dot_color = "#166534"  # green
+                    tip = "preflight: clean"
+                item.setText(f"●  {raw_name}")
+                item.setForeground(QColor(dot_color))
+                # Keep the existing tooltip if there was one + append
+                # preflight info on a new line so users hovering for
+                # device meta don't lose context.
+                existing_tip = item.toolTip()
+                if existing_tip and "preflight" not in existing_tip.lower():
+                    item.setToolTip(f"{existing_tip}\nPreflight: {tip}")
+                else:
+                    item.setToolTip(f"Preflight: {tip}")
+        except Exception:
+            # Painter is purely advisory — never let a colouring bug
+            # block the table from rendering.
+            pass
+
     def update_device_table(self, all_devices=None):
         """Rebuild the device table based on selected interfaces.
 
@@ -7775,6 +7851,17 @@ class DevicesTab(QWidget):
         # OPTIMIZATION: Defer ARP initialization to avoid blocking UI on click
         from PyQt5.QtCore import QTimer
         QTimer.singleShot(0, self._initialize_arp_status_from_database)
+
+        # v0.2.78: re-apply the preflight per-device dots after a
+        # rebuild (the bar may have been polling all along; we just
+        # blew away the cells it last painted, so re-paint from the
+        # cached state).
+        try:
+            bar = getattr(self, "preflight_bar", None)
+            if bar is not None and hasattr(bar, "current_by_device"):
+                self._apply_preflight_dots(bar.current_by_device())
+        except Exception:
+            pass
 
         # Re-apply the filter so newly-rebuilt rows respect whatever
         # the user has typed. Without this, any periodic table refresh

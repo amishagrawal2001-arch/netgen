@@ -852,6 +852,43 @@ class TrafficGenClientServerSection():
                         value = ps.get(key) or stream.get(key, "")
                         col_index = 4 + offset
 
+                        # v0.2.78: SR-MPLS badge on the Details cell —
+                        # operator can spot MPLS streams in the table
+                        # without opening each editor. mpls_labels
+                        # (list/str) is the SR-MPLS stack;
+                        # mpls_label is the legacy single-label field.
+                        if key == "details":
+                            mpls_labels = (ps.get("mpls_labels")
+                                           or stream.get("mpls_labels"))
+                            n_labels = 0
+                            if isinstance(mpls_labels, str):
+                                n_labels = len([
+                                    s for s in
+                                    mpls_labels.replace(";", ",").split(",")
+                                    if s.strip()
+                                ])
+                            elif isinstance(mpls_labels, (list, tuple)):
+                                # Filter out None / "" / 0 explicitly;
+                                # `str(None).strip()` is "None" (truthy),
+                                # which would over-count a trailing None.
+                                n_labels = len([
+                                    x for x in mpls_labels
+                                    if x not in (None, "", 0, "0")
+                                    and str(x).strip()
+                                ])
+                            badge = ""
+                            if n_labels > 1:
+                                badge = f"  [MPLS ×{n_labels}]"
+                            elif n_labels == 1:
+                                badge = "  [MPLS]"
+                            else:
+                                legacy = (ps.get("mpls_label")
+                                          or stream.get("mpls_label"))
+                                if legacy not in (None, "", 0, "0"):
+                                    badge = "  [MPLS]"
+                            if badge:
+                                value = f"{value or ''}{badge}".strip()
+
                         # Normalize frame_size in the model if invalid
                         if key == "frame_size":
                             # Validate frame_size: must be a number between 64 and 9216

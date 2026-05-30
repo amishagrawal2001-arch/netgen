@@ -309,6 +309,88 @@ def test_protocol_apply_paths_call_kick_refresh(apply_method):
     )
 
 
+# ───────────────────────────────────── by_device signal + cache (v0.2.78)
+def test_apply_summary_emits_by_device_signal(make_bar):
+    """The bar exposes per-device counts via a Qt signal so the
+    Devices table can paint per-row dots without polling."""
+    bar, _ = make_bar()
+    captured = []
+    bar.by_device_updated.connect(lambda d: captured.append(d))
+    payload = _payload(error=2, warning=1, ok=3)
+    payload["by_device"] = {
+        "R1": {"error": 2, "warning": 0, "ok": 1},
+        "R2": {"error": 0, "warning": 1, "ok": 2},
+    }
+    bar._apply_summary(payload)
+    assert captured, "by_device_updated did not fire"
+    assert "R1" in captured[-1] and "R2" in captured[-1]
+    assert captured[-1]["R1"]["error"] == 2
+
+
+def test_current_by_device_returns_last_cached_snapshot(make_bar):
+    """Late subscribers (Devices table rebuild) need to pull state
+    without waiting for the next refresh — the bar caches it."""
+    bar, _ = make_bar()
+    payload = _payload(error=1, ok=5)
+    payload["by_device"] = {"R1": {"error": 1, "ok": 5}}
+    bar._apply_summary(payload)
+    snap = bar.current_by_device()
+    assert snap == {"R1": {"error": 1, "ok": 5}}
+    # Returns a copy — mutating it doesn't poison the cache.
+    snap["R1"]["error"] = 99
+    assert bar.current_by_device()["R1"]["error"] == 1
+
+
+def test_apply_summary_handles_missing_by_device():
+    """Pre-0.2.78 servers don't return by_device — just don't crash
+    and don't emit garbage."""
+    # Skipping make_bar to use raw mod, since the fixture asserts.
+    from PyQt5.QtWidgets import QWidget
+    from widgets import preflight_bar as mod
+    parent = QWidget()
+    bar = mod.PreflightBar(lambda: None, parent=parent, poll_interval_ms=0)
+    received = []
+    bar.by_device_updated.connect(lambda d: received.append(d))
+    bar._apply_summary({"summary": {"error": 0, "warning": 0, "ok": 0,
+                                    "total": 0}, "findings": []})
+    # Missing by_device → empty dict cached, signal still fires.
+    assert received == [{}]
+    bar.stop()
+
+
+# ───────────────────────────────────── pill-click level filter (v0.2.78)
+def test_details_dialog_respects_level_filter():
+    """Pill click opens the modal with only the matching level shown."""
+    from PyQt5.QtWidgets import QWidget
+    from widgets.preflight_bar import PreflightDetailsDialog
+    findings = [
+        {"level": "error", "code": "BGP_NO_REMOTE_ASN", "device_name": "R1"},
+        {"level": "warning", "code": "VXLAN_EMPTY", "device_name": "R2"},
+        {"level": "error", "code": "DUPLICATE_IPV4", "device_name": "R3"},
+    ]
+    parent = QWidget()  # noqa: F841
+    dlg = PreflightDetailsDialog(findings, parent=parent,
+                                 level_filter="error")
+    # Two error rows, not three.
+    assert dlg.table.rowCount() == 2
+    # Title reflects the filter.
+    assert "errors only" in dlg.windowTitle()
+
+
+def test_details_dialog_no_filter_shows_everything():
+    from PyQt5.QtWidgets import QWidget
+    from widgets.preflight_bar import PreflightDetailsDialog
+    findings = [
+        {"level": "error",   "code": "A", "device_name": "R1"},
+        {"level": "warning", "code": "B", "device_name": "R2"},
+    ]
+    parent = QWidget()  # noqa: F841
+    dlg = PreflightDetailsDialog(findings, parent=parent)
+    assert dlg.table.rowCount() == 2
+    # No-filter title omits the "—" suffix.
+    assert dlg.windowTitle() == "Preflight findings"
+
+
 # ─────────────────────────────────────────────── details dialog
 def test_details_dialog_renders_one_row_per_finding(qapp):
     from widgets.preflight_bar import PreflightDetailsDialog

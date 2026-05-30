@@ -156,6 +156,29 @@ class VXLANHandler:
             controls.addWidget(b)
 
         controls.addStretch(1)
+
+        # v0.2.78: EVPN active-injections chip. Polls
+        # /api/evpn/type2/list every 30s and shows N active records
+        # across both kinds. Click opens the EVPN Inject dialog so
+        # operators don't have to hunt for the button.
+        try:
+            from widgets.evpn_active_chip import EvpnActiveChip
+            def _resolve_url():
+                try:
+                    return self.parent.get_server_url(silent=True)
+                except Exception:
+                    return None
+            self.parent.evpn_chip = EvpnActiveChip(
+                _resolve_url, parent=action_bar
+            )
+            self.parent.evpn_chip.clicked.connect(self._open_evpn_inject_dialog)
+            controls.addWidget(self.parent.evpn_chip)
+        except Exception as _e:
+            # Chip is purely advisory — never let it block the action
+            # bar from rendering.
+            import logging as _lg
+            _lg.warning(f"[VXLAN] EVPN active chip unavailable: {_e}")
+
         layout.addWidget(action_bar)
 
         # Kick off initial refresh shortly after tab creation

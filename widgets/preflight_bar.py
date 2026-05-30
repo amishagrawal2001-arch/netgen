@@ -26,7 +26,7 @@ import os
 from typing import Any, Callable, Dict, List, Optional
 
 import requests
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtWidgets import (
     QDialog, QFileDialog, QFrame, QHBoxLayout, QHeaderView, QLabel,
     QMessageBox, QPushButton, QTableWidget, QTableWidgetItem,
@@ -55,6 +55,11 @@ class PreflightBar(QFrame):
         Set to 0 to disable auto-polling (tests + external-driven mode).
     """
 
+    # v0.2.78: emitted on every successful refresh so the Devices
+    # table can mirror per-device dots. Payload is the by_device dict
+    # from the server: {device_name: {error: n, warning: n, ok: n}}.
+    by_device_updated = pyqtSignal(dict)
+
     def __init__(self,
                  server_url_provider: Callable[[], Optional[str]],
                  parent: Optional[QWidget] = None,
@@ -63,6 +68,10 @@ class PreflightBar(QFrame):
         self._get_server_url = server_url_provider
         self._poll_interval_ms = int(poll_interval_ms)
         self._findings: List[Dict[str, Any]] = []
+        # v0.2.78: cache of the most recent by_device snapshot so a
+        # Devices-tab refresh can ask for it (e.g. after a table
+        # rebuild) without waiting for the next signal emit.
+        self._by_device: Dict[str, Dict[str, int]] = {}
         self._build_ui()
         self._timer = QTimer(self)
         self._timer.setInterval(self._poll_interval_ms or 60_000)
@@ -96,6 +105,18 @@ class PreflightBar(QFrame):
         self._ok_pill      = _make_pill("—", _GREEN)
         for pill in (self._error_pill, self._warning_pill, self._ok_pill):
             bar.addWidget(pill)
+        # v0.2.78: pills are clickable shortcuts to a level-filtered
+        # Details dialog. Click red → see only errors; click amber →
+        # only warnings. OK pill is non-interactive (clean findings
+        # have no Details rows to filter).
+        self._error_pill.setCursor(Qt.PointingHandCursor)
+        self._warning_pill.setCursor(Qt.PointingHandCursor)
+        self._error_pill.mousePressEvent = (
+            lambda ev: self._show_details_dialog(level_filter="error")
+        )
+        self._warning_pill.mousePressEvent = (
+            lambda ev: self._show_details_dialog(level_filter="warning")
+        )
 
         bar.addStretch(1)
 
@@ -192,10 +213,35 @@ class PreflightBar(QFrame):
         self._findings = list(findings)
         self.details_btn.setEnabled(bool(findings))
 
-    def _show_details_dialog(self) -> None:
+        # v0.2.78: snapshot by_device + notify subscribers (the Devices
+        # tab uses this to paint per-row dots). The cache lets a late
+        # subscriber pull the current state via current_by_device()
+        # without waiting for the next refresh.
+        by_device = payload.get("by_device") or {}
+        if isinstance(by_device, dict):
+            self._by_device = dict(by_device)
+            try:
+                self.by_device_updated.emit(dict(self._by_device))
+            except Exception:
+                pass
+
+    def _show_details_dialog(self, level_filter: Optional[str] = None) -> None:
         if not self._findings:
             return
-        PreflightDetailsDialog(self._findings, parent=self).exec_()
+        PreflightDetailsDialog(
+            self._findings, parent=self, level_filter=level_filter,
+        ).exec_()
+
+    def current_by_device(self) -> Dict[str, Dict[str, int]]:
+        """Snapshot of the last by_device payload — for late subscribers
+        (e.g. Devices-table rebuild) that need the current state without
+        waiting for the next refresh.
+
+        Returns a DEEP copy so a caller mutating the result (rare but
+        possible during dot painting) can't poison the bar's cache.
+        """
+        import copy
+        return copy.deepcopy(self._by_device)
 
 
 class PreflightDetailsDialog(QDialog):
@@ -204,9 +250,22 @@ class PreflightDetailsDialog(QDialog):
     LEVEL_COLORS = {"error": "#b91c1c", "warning": "#b45309"}
 
     def __init__(self, findings: List[Dict[str, Any]],
-                 parent: Optional[QWidget] = None):
+                 parent: Optional[QWidget] = None,
+                 *, level_filter: Optional[str] = None):
         super().__init__(parent)
-        self.setWindowTitle("Preflight findings")
+        # v0.2.78: optional level filter — populated by pill-click on the
+        # bar. None = show everything; "error"/"warning" = subset only.
+        # Title reflects the filter so the operator knows what they're
+        # looking at.
+        if level_filter:
+            findings = [f for f in findings
+                        if str(f.get("level", "")).strip().lower()
+                        == level_filter.lower()]
+            self.setWindowTitle(
+                f"Preflight findings — {level_filter}s only"
+            )
+        else:
+            self.setWindowTitle("Preflight findings")
         self.setMinimumWidth(720)
         self.resize(820, 460)
 
@@ -214,12 +273,19 @@ class PreflightDetailsDialog(QDialog):
         outer.setContentsMargins(12, 10, 12, 10)
         outer.setSpacing(8)
 
-        hint = QLabel(
+        hint_text = (
             "These are pre-Apply sanity checks — issues that will keep "
             "BGP from forming, EVPN routes from advertising, or "
             "forwarding from working. Apply still runs whether you "
             "address them or not."
         )
+        if level_filter:
+            hint_text = (
+                f"Filtered to {level_filter}s only — close and reopen "
+                f"from the Details… button to see every finding.\n\n"
+                + hint_text
+            )
+        hint = QLabel(hint_text)
         hint.setStyleSheet("color: #475569; font-size: 11px;")
         hint.setWordWrap(True)
         outer.addWidget(hint)

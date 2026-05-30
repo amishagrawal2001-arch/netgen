@@ -2,6 +2,84 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.78] - 2026-05-30
+
+**Preflight closeout** — clears the 4 remaining preflight follow-up
+items from the v0.2.74 audit. Per-device dot in the Devices table,
+clickable filter pills on the bar, EVPN active-count chip on the
+VXLAN sub-tab, SR-MPLS row badge in the stream table.
+
+### Per-device preflight dot in Devices table
+- **`widgets/preflight_bar.py`** — gains a `by_device_updated`
+  pyqtSignal emitted on every successful refresh; new
+  `current_by_device()` returns a deep-copied snapshot for late
+  subscribers (the dialog can mutate it without poisoning the bar's
+  cache).
+- **`widgets/devices_tab.py`** — new `_apply_preflight_dots`
+  paints a red/amber/green dot in front of each Device Name cell
+  driven by the bar's `by_device` payload. Severity wins
+  (error > warning > clean). Re-applied after every table rebuild
+  (pulled from `current_by_device`) so a refresh doesn't blank the
+  dots. Idempotent — repaints strip the previous dot, no emoji
+  pile-up. Tooltip rolls into the existing one.
+
+### Pill-click filter on preflight bar
+- **`widgets/preflight_bar.py`** — error + warning pills now have
+  cursor=Pointing and a mousePressEvent that opens the Details
+  dialog with a `level_filter` argument. OK pill is non-interactive
+  (clean findings have no rows to filter).
+- **`PreflightDetailsDialog`** — new `level_filter` kwarg
+  pre-filters the findings list before population; title reflects
+  the filter ("Preflight findings — errors only") and the hint
+  text adds a "Close and reopen from Details… to see every
+  finding" instruction.
+
+### EVPN active-injections chip on VXLAN sub-tab
+- **`widgets/evpn_active_chip.py`** — new module. `EvpnActiveChip`
+  polls `/api/evpn/type2/list` (which returns both kinds since
+  v0.2.67) every 30 s and shows **⚡ EVPN: N active** in violet
+  (with the count) or **⚡ EVPN: idle** in gray. Click emits a
+  `clicked()` signal so the host opens the EVPN Inject dialog —
+  operators no longer have to open the dialog just to check whether
+  anything's running.
+- **`utils/devices_tab_vxlan.py`** — chip wired into the VXLAN
+  sub-tab action bar (right side after `addStretch`), try/except
+  guarded, hooked to `_open_evpn_inject_dialog`.
+
+### SR-MPLS row badge in stream table
+- **`traffic_client/server_section.py`** — Details cell renderer
+  appends `[MPLS ×N]` (when ≥2 labels), `[MPLS]` (single label or
+  legacy `mpls_label` field), or nothing. None / "" / 0 explicitly
+  filtered out so trailing nulls don't over-count. Operators can
+  scan the table for MPLS streams without opening each editor.
+
+### Tests
+- **`tests/test_preflight_bar.py`** — +5 tests covering the
+  by_device signal, deep-copy snapshot semantics, missing-by_device
+  payload graceful path, and PreflightDetailsDialog level filter
+  (filter applies + windowTitle reflects + no-filter still works).
+- **`tests/test_evpn_active_chip.py`** — new file, 7 tests pinning
+  the chip's idle/active states, count rendering, alt-key fallback
+  (`items` vs `injections`), silent-on-HTTP-failure, silent-on-503,
+  clicked signal emission, no-server graceful path.
+- **`tests/test_sr_mpls_badge.py`** — new file, 9 tests pinning the
+  badge formatter (no MPLS → empty, legacy label → `[MPLS]`,
+  modern stack → `[MPLS ×N]`, trailing-null filtering, modern wins
+  over legacy).
+- **`tests/test_devices_preflight_dot.py`** — new file, 7 tests
+  covering severity-wins classification, idempotent strip + repaint,
+  and the round-trip from `PreflightBar.by_device_updated` to a
+  subscriber callable.
+
+### Both audits now closed
+With v0.2.78, every item from the v0.2.74 GUI audit and the v0.2.75
+DPDK audit is either shipped (v0.2.74→v0.2.78) or explicitly
+deferred (per-core TX stats — requires tx_worker.c change + binary
+rebuild, bundled with future C work).
+
+### Test count
+404 → 431 (+27).
+
 ## [0.2.77] - 2026-05-30
 
 **DPDK closeout** — clears the remaining items from the v0.2.75 DPDK
