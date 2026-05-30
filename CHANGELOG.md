@@ -2,6 +2,38 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.71] - 2026-05-30
+
+**Preflight bar refreshes immediately after Apply** — close the
+60 s feedback gap between committing an edit and seeing whether it
+introduced (or cleared) a finding.
+
+### What changed
+- **`widgets/preflight_bar.py`** — new module-level helper
+  `kick_refresh(host, attr="preflight_bar")` that calls
+  `host.<attr>.refresh()` guarded with hasattr + try/except. Returns
+  True iff the refresh actually fired, so tests can assert the hook
+  ran without watching the network.
+- **`widgets/devices_tab.py`** — `_on_device_apply_finished` (single-
+  device DB apply) and `_on_multi_device_apply_finished` (the main
+  toolbar Apply path via MultiDeviceApplyWorker) both call
+  `kick_refresh(self)` at the end. Fires on success and failure —
+  operators want "all clean" confirmation too, not only new
+  findings.
+- **`tests/test_preflight_bar.py`** — 4 new tests for `kick_refresh`:
+  fires when bar present, no-op when absent, swallows refresh
+  exceptions, honours custom attr name.
+
+### Why a helper instead of inline `self.preflight_bar.refresh()`
+The Devices tab wraps the bar construction in try/except (so a bar
+build failure can't block the tab from rendering), which means every
+caller would have to repeat the hasattr + try/except dance. A
+3-line helper makes the call sites one-liners and gives us a single
+place to unit-test the guards.
+
+### Test count
+311 → 315 (+4).
+
 ## [0.2.70] - 2026-05-30
 
 **Preflight findings bar** — the GUI front end for the preflight

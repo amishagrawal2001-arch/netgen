@@ -8596,6 +8596,14 @@ class DevicesTab(QWidget):
                     pass
                 except Exception:
                     pass
+            # Repaint preflight pills immediately so the operator sees
+            # the impact of their edit instead of waiting up to 60 s
+            # for the auto-poll.
+            try:
+                from widgets.preflight_bar import kick_refresh
+                kick_refresh(self)
+            except Exception:
+                pass
         except Exception as e:
             logger.error(f"Error cleaning up: {e}")
     def _on_multi_device_applied(self, device_name, success, message):
@@ -8850,10 +8858,21 @@ class DevicesTab(QWidget):
             # Clear the operation type flag
             if hasattr(self, '_current_operation_type'):
                 delattr(self, '_current_operation_type')
-                
+
+            # Repaint preflight pills immediately so the operator sees
+            # the impact of their multi-device push instead of waiting
+            # up to 60 s for the auto-poll. Fires regardless of
+            # success/fail counts — operators want to see "all clean"
+            # confirmation too, not just new findings.
+            try:
+                from widgets.preflight_bar import kick_refresh
+                kick_refresh(self)
+            except Exception:
+                pass
+
         except Exception as e:
             logger.error(f"Error handling completion: {e}")
-    
+
     def _on_bulk_arp_finished(self):
         """Handle bulk ARP check completion."""
         logger.info("Completed async ARP checks for all devices")

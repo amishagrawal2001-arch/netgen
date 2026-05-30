@@ -228,6 +228,48 @@ def test_timer_on_when_interval_set(qapp, monkeypatch):
         bar.stop()
 
 
+# ────────────────────────────────────────────── kick_refresh helper
+def test_kick_refresh_calls_bar_when_present():
+    """The Apply success hook should fire the bar's refresh when the
+    bar is wired up on the host object."""
+    from widgets.preflight_bar import kick_refresh
+
+    host = SimpleNamespace(preflight_bar=MagicMock())
+    fired = kick_refresh(host)
+    assert fired is True
+    host.preflight_bar.refresh.assert_called_once_with()
+
+
+def test_kick_refresh_silent_when_no_bar():
+    """No preflight_bar attribute → no-op, no exception (Devices tab
+    construction may have failed without us)."""
+    from widgets.preflight_bar import kick_refresh
+
+    host = SimpleNamespace()
+    assert kick_refresh(host) is False
+
+
+def test_kick_refresh_swallows_refresh_exception():
+    """A refresh that raises must not bubble up to the Apply success
+    handler (which has nothing useful to do with the error)."""
+    from widgets.preflight_bar import kick_refresh
+
+    bar = MagicMock()
+    bar.refresh.side_effect = RuntimeError("boom")
+    host = SimpleNamespace(preflight_bar=bar)
+    assert kick_refresh(host) is False
+
+
+def test_kick_refresh_custom_attr():
+    """The attr name is overridable so future call sites can host the
+    bar under a different name without touching the helper."""
+    from widgets.preflight_bar import kick_refresh
+
+    host = SimpleNamespace(my_bar=MagicMock())
+    assert kick_refresh(host, attr="my_bar") is True
+    host.my_bar.refresh.assert_called_once_with()
+
+
 # ─────────────────────────────────────────────── details dialog
 def test_details_dialog_renders_one_row_per_finding(qapp):
     from widgets.preflight_bar import PreflightDetailsDialog

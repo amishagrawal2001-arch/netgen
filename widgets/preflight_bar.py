@@ -296,3 +296,33 @@ def _set_pill_text(lbl: QLabel, text: str, *,
 def _auth_headers() -> Dict[str, str]:
     tok = os.environ.get("NETGEN_AUTH_TOKEN", "").strip()
     return {"Authorization": f"Bearer {tok}"} if tok else {}
+
+
+def kick_refresh(host: Any, attr: str = "preflight_bar") -> bool:
+    """Trigger an immediate preflight refresh on ``host.<attr>``.
+
+    Defensively no-ops when the bar isn't present (Devices tab failed
+    to wire it up) or when the refresh itself raises (the bar already
+    swallows its own HTTP errors, but belt-and-braces). Returns True
+    iff ``refresh()`` was actually invoked — handy for tests, ignored
+    by callers.
+
+    Used by the Devices tab's Apply success paths to update the bar
+    immediately after a config push instead of waiting up to 60 s for
+    the next auto-poll. Operators care most about the post-Apply
+    moment — "did the change I just made introduce a new finding?" —
+    so the bar repainting on demand there is worth the one line of
+    extra wiring.
+    """
+    bar = getattr(host, attr, None)
+    if bar is None:
+        return False
+    refresh = getattr(bar, "refresh", None)
+    if not callable(refresh):
+        return False
+    try:
+        refresh()
+        return True
+    except Exception as exc:
+        logger.debug(f"[PREFLIGHT BAR] kick_refresh suppressed: {exc}")
+        return False
