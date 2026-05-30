@@ -1670,6 +1670,35 @@ class AddDeviceDialog(QDialog):
             
             # Get area_id - if it's a short format like "49.0001", construct full NET format
             area_id_input = self.isis_area_id_input.text().strip() or "49.0001"
+
+            # v0.2.86: validate before constructing the full NET.
+            # allow_short_area=True because this dialog accepts the
+            # AFI.Area shortcut and pads it; the validator treats
+            # anything 2-14 bytes as valid short form. Bail out of
+            # submit on hard-invalid input (non-hex chars, NSEL!=00,
+            # > 20 bytes…) so the operator sees a clear reason
+            # instead of FRR rejecting it 5 seconds later.
+            try:
+                from utils.isis_net import validate_isis_net
+                _isis_err = validate_isis_net(area_id_input,
+                                              allow_short_area=True)
+                if _isis_err:
+                    from PyQt5.QtWidgets import QMessageBox
+                    QMessageBox.warning(
+                        self, "Invalid ISIS Area ID / NET",
+                        f"'{area_id_input}' is not a valid ISIS Area ID "
+                        f"or NET.\n\n"
+                        f"Accepted: short form 'AFI.Area' (e.g. "
+                        f"'49.0001') which is padded to a full NET, OR "
+                        f"a complete NET like '49.0001.0000.0000.0001.00'.\n\n"
+                        f"Error: {_isis_err}"
+                    )
+                    return None
+            except Exception:
+                # Helper missing or import failed — don't block the
+                # operator. Server-side validation still catches it.
+                pass
+
             # If area_id is short format (e.g., "49.0001"), construct full NET format
             if area_id_input and len(area_id_input.split('.')) <= 2:
                 # Short format like "49.0001" -> "49.0001.0000.0000.0001.00"

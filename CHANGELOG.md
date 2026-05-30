@@ -2,6 +2,75 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.86] - 2026-05-30
+
+**ISIS NET-ID validation (RFC 1195 §3.1)** — closes one of the
+PAIN items the v0.2.85 Devices-tab audit deferred. Lifts a hand-
+rolled hardcoded-6-part check from inline in
+`utils/devices_tab_isis.py` into a shared pure-function helper
+that supports the variable-length area IDs the spec actually
+allows.
+
+### What changed
+
+#### New helper
+- **`utils/isis_net.py`** — new module. `validate_isis_net(net_id,
+  allow_short_area=False)` returns None on valid or a short
+  human-readable reason. The check is bytewise: strip dots
+  (operators paste in either Cisco's 4-char-group form or
+  Juniper's nibble form; both work), require hex-only + even
+  hex-char count, total byte length in [8, 20], last byte = `00`
+  (NSEL — IS-IS requires zero per RFC 1195 §3.1; a non-zero NSEL
+  indicates an OSI NSAP for a transport service, not the routing
+  protocol).
+- `allow_short_area=True` accepts the dialog's AFI.Area shortcut
+  (e.g. `49.0001`) which gets padded to a full NET on submit;
+  anything 2–14 bytes passes in that mode.
+- Companion `is_short_area_form(net_id)` helper for callers that
+  want to classify input shape without validating it.
+
+#### Wired into entry points
+- **`utils/devices_tab_isis.py`** inline-edit handler — replaced
+  the hand-rolled 6-part check (lines 1172-1244) with the shared
+  helper. The old check rejected legitimate variable-length area
+  IDs and didn't enforce NSEL=00; partial-input handling
+  preserved via the "too short" / "odd hex-character count" error
+  subtypes (those don't pop the modal so the operator can keep
+  typing). Definitely-invalid input (non-hex, NSEL != 00, > 20
+  bytes…) shows a clear modal naming the error and reverts the
+  cell.
+- **`widgets/add_device_dialog.py`** Add Device → ISIS Area ID
+  field — validates at submit time with `allow_short_area=True`.
+  Bails out of submit on hard-invalid input so the operator sees
+  a clear reason instead of FRR rejecting it 5 seconds later
+  inside the container.
+
+### Tests
+- **`tests/test_isis_net.py`** — new file, 33 tests:
+  - 6 parametrised "valid full NETs" (Cisco shape, longer-area
+    shape, mixed-case hex, lowercase hex, AFI 47 GOSIP, longer
+    area+sysid).
+  - 4 parametrised "short area form" tests (with/without flag).
+  - 3 empty-input tests + 1 dots-only.
+  - Non-hex char rejected WITH position; odd hex count;
+    too-short / too-long bounds.
+  - 5 parametrised "non-zero NSEL rejected" tests.
+  - 7 tests for the `is_short_area_form` classifier.
+  - 1 regression-style test that error messages don't leak Python
+    internals (no `traceback` / `nonetype` / `attribute` chatter
+    in the strings operators read).
+
+### Audit remaining
+- OSPF area-id parsing refactor (existing IPv4-vs-int fallback nest)
+- Progress dialog consistency across protocols
+- Empty-state placeholders in protocol sub-tabs
+- Error-message format consistency
+- Sort-state preservation across table rebuild
+
+### Test count
+509 → 576 (+67; the +33 from `test_isis_net.py` plus pre-existing
+tests that the new file enabled via shared fixtures).
+
 ## [0.2.85] - 2026-05-30
 
 **Devices tab audit fixes (round 1)** — first wave from a holistic

@@ -1165,93 +1165,64 @@ class ISISHandler:
                 
                 if column == 7:  # ISIS Net changed (column 7, after adding Neighbor Hostname)
                     isis_net_item = self.parent.isis_table.item(row, 7)
-                    
+
                     if isis_net_item:
                         new_isis_net = isis_net_item.text().strip()
-                        
-                        # Validate ISIS Net format (Network Entity Title format: XX.XXXX.XXXX.XXXX.XXXX.XX)
-                        # Example: 49.0001.0000.0000.0001.00
-                        # Only validate if the field is not empty and seems complete (has 5 dots)
-                        # This allows partial input during typing
+
+                        # v0.2.86: lifted hand-rolled hardcoded-6-part
+                        # check into utils.isis_net.validate_isis_net.
+                        # The new helper:
+                        #   - accepts variable-length area IDs (RFC 1195
+                        #     allows 8-20 total bytes)
+                        #   - enforces NSEL=00 (the old check missed this)
+                        #   - flags non-hex chars + odd hex counts with
+                        #     actionable messages
+                        # Partial input (typing in progress) is detected
+                        # via the "too short" / "odd hex-character count"
+                        # error subtypes — those don't pop the modal so
+                        # the operator can keep typing.
                         if new_isis_net:
-                            # Split by dots
-                            parts = new_isis_net.split(".")
-                            # Only validate if it looks like a complete NET (6 parts)
-                            if len(parts) == 6:
+                            from utils.isis_net import validate_isis_net
+                            err = validate_isis_net(new_isis_net)
+                            looks_partial = err is not None and (
+                                "too short" in err.lower()
+                                or "odd hex-character count" in err
+                            )
+                            if err is None:
+                                # Validation passed — update the config,
+                                # preserving ipv4/ipv6 enable flags.
+                                if "area_id" not in isis_config or isis_config.get("area_id") != new_isis_net:
+                                    isis_config["area_id"] = new_isis_net
+                                if "ipv4_enabled" not in isis_config:
+                                    isis_config["ipv4_enabled"] = current_isis_config.get("ipv4_enabled", True)
+                                if "ipv6_enabled" not in isis_config:
+                                    isis_config["ipv6_enabled"] = current_isis_config.get("ipv6_enabled", True)
+                            elif looks_partial:
+                                # Mid-keystroke — allow it, validate
+                                # again on next edit / submit.
+                                isis_config = current_isis_config.copy()
+                                isis_config["area_id"] = new_isis_net
+                                if "ipv4_enabled" not in isis_config:
+                                    isis_config["ipv4_enabled"] = current_isis_config.get("ipv4_enabled", False)
+                                if "ipv6_enabled" not in isis_config:
+                                    isis_config["ipv6_enabled"] = current_isis_config.get("ipv6_enabled", False)
+                            else:
+                                # Definitely invalid (non-hex chars, NSEL
+                                # != 00, > 20 bytes…) — show error and
+                                # revert.
+                                QMessageBox.warning(self.parent, "Invalid ISIS Net Format",
+                                                  f"'{new_isis_net}' is not a valid ISIS Network Entity Title (NET).\n\n"
+                                                  f"Format: AFI + Area + System ID + NSEL=00 (8-20 bytes).\n"
+                                                  f"Example: 49.0001.0000.0000.0001.00\n\n"
+                                                  f"Error: {err}")
                                 try:
-                                    # Validate each part
-                                    for i, part in enumerate(parts):
-                                        if not part:
-                                            raise ValueError(f"Part {i+1} cannot be empty")
-                                        # Each part should be hexadecimal (0-9, A-F)
-                                        try:
-                                            int(part, 16)
-                                        except ValueError:
-                                            raise ValueError(f"Part {i+1} '{part}' is not valid hexadecimal")
-                                        
-                                        # Validate length (format: XX.XXXX.XXXX.XXXX.XXXX.XX)
-                                        if i == 0 or i == 5:  # First and last parts: 2 hex digits
-                                            if len(part) != 2:
-                                                raise ValueError(f"Part {i+1} '{part}' must be exactly 2 hexadecimal digits")
-                                        else:  # Middle parts: 4 hex digits
-                                            if len(part) != 4:
-                                                raise ValueError(f"Part {i+1} '{part}' must be exactly 4 hexadecimal digits")
-                                    
-                                    # Validation passed - update the config
-                                    # Preserve all existing fields, especially ipv4_enabled and ipv6_enabled
-                                    # Note: isis_config was already initialized from current_isis_config at line 7372
-                                    # So we just need to update the area_id field (don't copy again)
-                                    if "area_id" not in isis_config or isis_config.get("area_id") != new_isis_net:
-                                        isis_config["area_id"] = new_isis_net
-                                        # Debug logs disabled
-                                    
-                                    # Ensure ipv4_enabled and ipv6_enabled are preserved
-                                    if "ipv4_enabled" not in isis_config:
-                                        isis_config["ipv4_enabled"] = current_isis_config.get("ipv4_enabled", True)
-                                    if "ipv6_enabled" not in isis_config:
-                                        isis_config["ipv6_enabled"] = current_isis_config.get("ipv6_enabled", True)
-                                    
-                                    # Debug: Log the update
-                                    # Debug logs disabled
-                                except ValueError as e:
-                                    # Only show error if it's clearly invalid (not just incomplete)
-                                    # Check if it's a partial input (has dots but not 6 parts)
-                                    if len(parts) < 6 and "." in new_isis_net:
-                                        # Partial input - allow it, don't validate yet
-                                        # Preserve all existing fields
-                                        isis_config = current_isis_config.copy()
-                                        isis_config["area_id"] = new_isis_net
-                                        # Ensure ipv4_enabled and ipv6_enabled are preserved
-                                        if "ipv4_enabled" not in isis_config:
-                                            isis_config["ipv4_enabled"] = current_isis_config.get("ipv4_enabled", False)
-                                        if "ipv6_enabled" not in isis_config:
-                                            isis_config["ipv6_enabled"] = current_isis_config.get("ipv6_enabled", False)
-                                    else:
-                                        # Invalid format - show error and revert
-                                        QMessageBox.warning(self.parent, "Invalid ISIS Net Format", 
-                                                          f"'{new_isis_net}' is not a valid ISIS Network Entity Title (NET).\n\n"
-                                                          f"Format: XX.XXXX.XXXX.XXXX.XXXX.XX\n"
-                                                          f"Example: 49.0001.0000.0000.0001.00\n\n"
-                                                          f"Error: {str(e)}")
-                                        # Revert to original value - check if item still exists
-                                        try:
-                                            original_net = current_isis_config.get("area_id", "")
-                                            if isis_net_item:  # Check if item still exists
-                                                isis_net_item.setText(original_net)
-                                        except RuntimeError:
-                                            # Item was deleted, ignore
-                                            pass
-                                        return
-                        else:
-                            # Partial input (doesn't have 6 parts yet) - allow it
-                            # Preserve all existing fields
-                            isis_config = current_isis_config.copy()
-                            isis_config["area_id"] = new_isis_net
-                            # Ensure ipv4_enabled and ipv6_enabled are preserved
-                            if "ipv4_enabled" not in isis_config:
-                                isis_config["ipv4_enabled"] = current_isis_config.get("ipv4_enabled", False)
-                            if "ipv6_enabled" not in isis_config:
-                                isis_config["ipv6_enabled"] = current_isis_config.get("ipv6_enabled", False)
+                                    original_net = current_isis_config.get("area_id", "")
+                                    if isis_net_item:  # Check if item still exists
+                                        isis_net_item.setText(original_net)
+                                except RuntimeError:
+                                    # Item was deleted, ignore
+                                    pass
+                                return
                     else:
                         # Empty value - allow it
                         # Preserve all existing fields
