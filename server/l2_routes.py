@@ -52,9 +52,10 @@ def configure(*, require_role: Optional[Callable] = None) -> None:
 # ──────────────────────────────────────────────────────────────────────
 
 
-# Every factory also accepts vlan_id + vlan_pcp (inline 802.1Q tag);
-# appended to each allow-list so the body fields reach the factory.
-_VLAN_KEYS = ("vlan_id", "vlan_pcp")
+# Every factory also accepts vlan_id + vlan_pcp (inline 802.1Q tag) and,
+# as of 0.2.60, outer_vlan_id + outer_vlan_pcp for 802.1ad QinQ (S-VLAN).
+# Appended to each allow-list so the body fields reach the factory.
+_VLAN_KEYS = ("vlan_id", "vlan_pcp", "outer_vlan_id", "outer_vlan_pcp")
 _PROTOCOL_FACTORIES = {
     "lacp": ("start_lacp",      ("system_priority", "system_mac", "key",
                                  "port_priority", "port_number", "state",

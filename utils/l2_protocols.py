@@ -196,21 +196,53 @@ def _register_and_start(sess: _Session, frame_factory, interval_s, duration_s):
 
 
 def _l2_hdr(src: str, dst: str, ethertype: int,
-            vlan_id: Optional[int] = None, vlan_pcp: int = 0):
+            vlan_id: Optional[int] = None, vlan_pcp: int = 0,
+            outer_vlan_id: Optional[int] = None, outer_vlan_pcp: int = 0):
     """Build the Ethernet header for an emulated L2 frame, with optional
-    inline 802.1Q tagging.
+    inline 802.1Q or 802.1ad (QinQ) tagging.
 
-    * Untagged (vlan_id None/0): ``Ether(src, dst, type=ethertype)``.
-    * Tagged: ``Ether(type=0x8100) / Dot1Q(vlan, prio, type=ethertype)`` —
-      the frame egresses VLAN-tagged straight off the named interface,
-      WITHOUT needing a pre-created ``vlanN`` subinterface (Spirent-style
-      inline encapsulation). The original ethertype is preserved on the
-      Dot1Q so the upper protocol still parses correctly downstream.
+    Three encapsulations:
+
+    * **Untagged** (both VLAN ids None/0):
+      ``Ether(src, dst, type=ethertype)``.
+
+    * **Single 802.1Q** (only `vlan_id`):
+      ``Ether(type=0x8100) / Dot1Q(vlan_id, prio, type=ethertype)`` —
+      Spirent-style inline tag; no pre-created ``vlanN`` subif needed.
+
+    * **QinQ / 802.1ad** (both `outer_vlan_id` *and* `vlan_id`):
+      ``Ether(type=0x88a8) / Dot1Q(outer, type=0x8100) / Dot1Q(inner,
+      type=ethertype)``. Outer is the S-VLAN (service provider), inner
+      is the C-VLAN (customer). 0x88a8 on the outer is the IEEE 802.1ad
+      TPID; the inner uses the legacy 0x8100. The protocol's original
+      ethertype rides on the inner Dot1Q so the upper layer parses
+      correctly through the double tag.
 
     `ethertype` is the protocol's L2 type: 0x8809 (LACP), 0x88cc (LLDP),
     0x0800 (IPv4-carried: VRRPv2/v3-v4, IGMP, PIM), 0x86dd (IPv6 VRRPv3).
+
+    An outer tag without an inner tag is invalid 802.1ad — passing
+    `outer_vlan_id` without `vlan_id` raises ``ValueError`` rather than
+    silently emitting a single-tagged frame the operator didn't ask for.
     """
     from scapy.layers.l2 import Ether, Dot1Q
+    if outer_vlan_id and not vlan_id:
+        raise ValueError(
+            "QinQ requires both inner (vlan_id) and outer (outer_vlan_id) "
+            "tags — set vlan_id too, or clear outer_vlan_id for an untagged "
+            "frame."
+        )
+    if outer_vlan_id and vlan_id:
+        # 802.1ad: outer S-Tag (0x88a8) → inner C-Tag (0x8100) → payload.
+        return (
+            Ether(src=src, dst=dst, type=0x88a8)
+            / Dot1Q(vlan=int(outer_vlan_id),
+                    prio=int(outer_vlan_pcp) & 0x7,
+                    type=0x8100)
+            / Dot1Q(vlan=int(vlan_id),
+                    prio=int(vlan_pcp) & 0x7,
+                    type=ethertype)
+        )
     if vlan_id:
         return (
             Ether(src=src, dst=dst)
@@ -239,8 +271,10 @@ def start_lacp(
     port_number: int = 1,
     state: int = 0x05,   # Activity | Aggregation
     fast: bool = False,  # True = 1s interval (PDU_FAST), False = 30s (PDU_SLOW)
-    vlan_id: Optional[int] = None,   # 802.1Q tag; None/0 = untagged
-    vlan_pcp: int = 0,               # 802.1p priority (0-7)
+    vlan_id: Optional[int] = None,   # 802.1Q inner tag; None/0 = untagged
+    vlan_pcp: int = 0,               # 802.1p inner priority (0-7)
+    outer_vlan_id: Optional[int] = None,  # 802.1ad outer (S-VLAN); None/0 = single-tagged
+    outer_vlan_pcp: int = 0,              # outer priority (0-7); QinQ only
     duration_s: Optional[float] = None,
 ) -> str:
     """Spawn an LACPDU emitter. Returns session_id.
@@ -261,6 +295,7 @@ def start_lacp(
         "state": int(state),
         "fast": bool(fast),
         "vlan_id": vlan_id, "vlan_pcp": int(vlan_pcp),
+        "outer_vlan_id": outer_vlan_id, "outer_vlan_pcp": int(outer_vlan_pcp),
         "duration_s": duration_s,
     }
     sess = _Session(session_id=sid, protocol="lacp", iface=iface, config=config)
@@ -269,7 +304,8 @@ def start_lacp(
         from scapy.contrib.lacp import SlowProtocol, LACP
         # Slow Protocols dest MAC + ethertype (0x8809) + subtype
         return (
-            _l2_hdr(system_mac, "01:80:c2:00:00:02", 0x8809, vlan_id, vlan_pcp)
+            _l2_hdr(system_mac, "01:80:c2:00:00:02", 0x8809, vlan_id, vlan_pcp,
+                    outer_vlan_id, outer_vlan_pcp)
             / SlowProtocol(subtype=0x01)
             / LACP(
                 version=1,
@@ -308,8 +344,10 @@ def start_lldp(
     interval_s: float = 30.0,
     duration_s: Optional[float] = None,
     src_mac: str = "00:11:22:33:44:02",
-    vlan_id: Optional[int] = None,   # 802.1Q tag; None/0 = untagged
-    vlan_pcp: int = 0,               # 802.1p priority (0-7)
+    vlan_id: Optional[int] = None,   # 802.1Q inner tag; None/0 = untagged
+    vlan_pcp: int = 0,               # 802.1p inner priority (0-7)
+    outer_vlan_id: Optional[int] = None,  # 802.1ad outer (S-VLAN); None/0 = single-tagged
+    outer_vlan_pcp: int = 0,              # outer priority (0-7); QinQ only
 ) -> str:
     """Spawn an LLDP advertiser. Returns session_id."""
     sid = str(uuid.uuid4())
@@ -322,6 +360,7 @@ def start_lldp(
         "duration_s": duration_s,
         "src_mac": src_mac,
         "vlan_id": vlan_id, "vlan_pcp": int(vlan_pcp),
+        "outer_vlan_id": outer_vlan_id, "outer_vlan_pcp": int(outer_vlan_pcp),
     }
     sess = _Session(session_id=sid, protocol="lldp", iface=iface, config=config)
 
@@ -334,7 +373,8 @@ def start_lldp(
         # `LLDPDU(tlvlist=...)` constructor. Order matters: Chassis-ID,
         # Port-ID, TTL must come first per 802.1AB §8.6.
         return (
-            _l2_hdr(src_mac, "01:80:c2:00:00:0e", 0x88cc, vlan_id, vlan_pcp)
+            _l2_hdr(src_mac, "01:80:c2:00:00:0e", 0x88cc, vlan_id, vlan_pcp,
+                    outer_vlan_id, outer_vlan_pcp)
             / LLDPDUChassisID(
                 subtype="locally assigned",
                 id=chassis_id.encode("ascii"),
@@ -388,8 +428,10 @@ def start_vrrp(
     src_ip: str = "10.0.0.1",
     src_mac: Optional[str] = None,   # None/"" → derive the VRRP virtual MAC
     family: str = "ipv4",   # "ipv4" or "ipv6" (v3 only)
-    vlan_id: Optional[int] = None,   # 802.1Q tag; None/0 = untagged
-    vlan_pcp: int = 0,               # 802.1p priority (0-7)
+    vlan_id: Optional[int] = None,   # 802.1Q inner tag; None/0 = untagged
+    vlan_pcp: int = 0,               # 802.1p inner priority (0-7)
+    outer_vlan_id: Optional[int] = None,  # 802.1ad outer (S-VLAN); None/0 = single-tagged
+    outer_vlan_pcp: int = 0,              # outer priority (0-7); QinQ only
 ) -> str:
     """Spawn a VRRP master advertisement emitter. Returns session_id.
 
@@ -415,6 +457,7 @@ def start_vrrp(
         "src_ip": src_ip, "src_mac": eff_src_mac,
         "family": family.lower(),
         "vlan_id": vlan_id, "vlan_pcp": int(vlan_pcp),
+        "outer_vlan_id": outer_vlan_id, "outer_vlan_pcp": int(outer_vlan_pcp),
     }
     sess = _Session(session_id=sid, protocol="vrrp", iface=iface, config=config)
 
@@ -430,7 +473,8 @@ def start_vrrp(
             from scapy.layers.inet6 import IPv6
             ip_layer = IPv6(src=src_ip, dst="ff02::12", hlim=255, nh=112)
             return (
-                _l2_hdr(eff_src_mac, "33:33:00:00:00:12", 0x86dd, vlan_id, vlan_pcp)
+                _l2_hdr(eff_src_mac, "33:33:00:00:00:12", 0x86dd, vlan_id, vlan_pcp,
+                    outer_vlan_id, outer_vlan_pcp)
                 / ip_layer
                 / VRRPv3(
                     version=3, vrid=vrid, priority=priority,
@@ -440,7 +484,8 @@ def start_vrrp(
         ip_layer = IP(src=src_ip, dst="224.0.0.18", ttl=255, proto=112)
         if version == 2:
             return (
-                _l2_hdr(eff_src_mac, "01:00:5e:00:00:12", 0x0800, vlan_id, vlan_pcp)
+                _l2_hdr(eff_src_mac, "01:00:5e:00:00:12", 0x0800, vlan_id, vlan_pcp,
+                    outer_vlan_id, outer_vlan_pcp)
                 / ip_layer
                 / VRRP(
                     version=2, vrid=vrid, priority=priority,
@@ -448,7 +493,8 @@ def start_vrrp(
                 )
             )
         return (
-            _l2_hdr(eff_src_mac, "01:00:5e:00:00:12", 0x0800, vlan_id, vlan_pcp)
+            _l2_hdr(eff_src_mac, "01:00:5e:00:00:12", 0x0800, vlan_id, vlan_pcp,
+                    outer_vlan_id, outer_vlan_pcp)
             / ip_layer
             / VRRPv3(
                 version=3, vrid=vrid, priority=priority,
@@ -489,8 +535,10 @@ def start_igmp(
     duration_s: Optional[float] = None,
     src_ip: str = "10.0.0.10",
     src_mac: str = "00:11:22:33:44:04",
-    vlan_id: Optional[int] = None,   # 802.1Q tag; None/0 = untagged
-    vlan_pcp: int = 0,               # 802.1p priority (0-7)
+    vlan_id: Optional[int] = None,   # 802.1Q inner tag; None/0 = untagged
+    vlan_pcp: int = 0,               # 802.1p inner priority (0-7)
+    outer_vlan_id: Optional[int] = None,  # 802.1ad outer (S-VLAN); None/0 = single-tagged
+    outer_vlan_pcp: int = 0,              # outer priority (0-7); QinQ only
 ) -> str:
     """Spawn an IGMP membership-report emitter.
 
@@ -510,6 +558,7 @@ def start_igmp(
         "duration_s": duration_s,
         "src_ip": src_ip, "src_mac": src_mac,
         "vlan_id": vlan_id, "vlan_pcp": int(vlan_pcp),
+        "outer_vlan_id": outer_vlan_id, "outer_vlan_pcp": int(outer_vlan_pcp),
     }
     sess = _Session(session_id=sid, protocol="igmp", iface=iface, config=config)
 
@@ -529,7 +578,8 @@ def start_igmp(
             t = type_code if type_code is not None else 0x22
             rec = IGMPv3gr(rtype=2, maddr=group)  # MODE_IS_EXCLUDE
             return (
-                _l2_hdr(src_mac, _ipv4_mcast_mac("224.0.0.22"), 0x0800, vlan_id, vlan_pcp)
+                _l2_hdr(src_mac, _ipv4_mcast_mac("224.0.0.22"), 0x0800, vlan_id, vlan_pcp,
+                    outer_vlan_id, outer_vlan_pcp)
                 / IP(src=src_ip, dst="224.0.0.22", ttl=1, options=[])
                 / IGMPv3(type=t)
                 / IGMPv3mr(numgrp=1, records=[rec])
@@ -542,7 +592,8 @@ def start_igmp(
         # dst via the same RFC 1112 mapping.
         ip_dst = "224.0.0.2" if t == 0x17 else group
         return (
-            _l2_hdr(src_mac, _ipv4_mcast_mac(ip_dst), 0x0800, vlan_id, vlan_pcp)
+            _l2_hdr(src_mac, _ipv4_mcast_mac(ip_dst), 0x0800, vlan_id, vlan_pcp,
+                    outer_vlan_id, outer_vlan_pcp)
             / IP(src=src_ip, dst=ip_dst, ttl=1)
             / IGMP(type=t, gaddr=group)
         )
@@ -574,8 +625,10 @@ def start_pim_hello(
     duration_s: Optional[float] = None,
     src_ip: str = "10.0.0.20",
     src_mac: str = "00:11:22:33:44:05",
-    vlan_id: Optional[int] = None,   # 802.1Q tag; None/0 = untagged
-    vlan_pcp: int = 0,               # 802.1p priority (0-7)
+    vlan_id: Optional[int] = None,   # 802.1Q inner tag; None/0 = untagged
+    vlan_pcp: int = 0,               # 802.1p inner priority (0-7)
+    outer_vlan_id: Optional[int] = None,  # 802.1ad outer (S-VLAN); None/0 = single-tagged
+    outer_vlan_pcp: int = 0,              # outer priority (0-7); QinQ only
 ) -> str:
     """Spawn a PIM Hello emitter — registers us as a PIM neighbour
     on the segment without actually doing Join/Prune."""
@@ -588,6 +641,7 @@ def start_pim_hello(
         "duration_s": duration_s,
         "src_ip": src_ip, "src_mac": src_mac,
         "vlan_id": vlan_id, "vlan_pcp": int(vlan_pcp),
+        "outer_vlan_id": outer_vlan_id, "outer_vlan_pcp": int(outer_vlan_pcp),
     }
     sess = _Session(session_id=sid, protocol="pim", iface=iface, config=config)
 
@@ -600,7 +654,8 @@ def start_pim_hello(
         # PIMv2HelloHoldtime.fields_desc etc.
         return (
             # PIM all-routers multicast: 224.0.0.13, MAC 01:00:5e:00:00:0d
-            _l2_hdr(src_mac, "01:00:5e:00:00:0d", 0x0800, vlan_id, vlan_pcp)
+            _l2_hdr(src_mac, "01:00:5e:00:00:0d", 0x0800, vlan_id, vlan_pcp,
+                    outer_vlan_id, outer_vlan_pcp)
             / IP(src=src_ip, dst="224.0.0.13", ttl=1, proto=103)
             / PIMv2Hdr(type=0)   # 0 = Hello
             / PIMv2Hello(

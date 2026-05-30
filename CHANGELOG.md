@@ -2,6 +2,60 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.60] - 2026-05-29
+
+**Enhancement #4 of 4 (slice 1) — protocol expansion: QinQ (802.1ad)
+double-tag** for the L2 / Multicast Emulation tab.
+
+### Wire format
+`_l2_hdr` gains a second tag pair (`outer_vlan_id` / `outer_vlan_pcp`):
+
+* **Untagged** (no VLAN ids): unchanged — bare `Ether(type=ethertype)`.
+* **Single 802.1Q** (only `vlan_id`): unchanged — `Ether(type=0x8100) /
+  Dot1Q(vlan, type=ethertype)`.
+* **QinQ / 802.1ad** (both `outer_vlan_id` AND `vlan_id`): emits
+  `Ether(type=0x88a8) / Dot1Q(outer, type=0x8100) / Dot1Q(inner,
+  type=ethertype)`. Outer is the S-VLAN (service-provider), inner is the
+  C-VLAN (customer); the protocol's original ethertype rides on the
+  inner Dot1Q so upper layers still parse cleanly through the double
+  tag.
+
+Passing `outer_vlan_id` without `vlan_id` raises `ValueError` rather
+than silently emitting a single-tagged frame.
+
+### What changed
+- **`utils/l2_protocols.py`** — `_l2_hdr` gets the new kwargs; all five
+  factories (LACP, LLDP, VRRP, IGMP, PIM) forward them and stash them
+  in the session's `config` dict.
+- **`server/l2_routes.py`** — `_VLAN_KEYS` includes the two outer fields
+  so the REST allow-list accepts them.
+- **`widgets/l2_emulation_tab.py`** — Common-settings section gains
+  **Outer VLAN ID** + **Outer VLAN PCP** spinners (default 0 = single
+  tag). Dialog refuses outer-without-inner with a clear warning. L2
+  sessions table's VLAN cell renders `"<outer> » <inner>"` for QinQ
+  sessions, with a tooltip naming the S-/C-VLAN semantics; single-tag
+  and untagged renders are unchanged.
+
+### Verified — 13 new tests, full suite 153 passing
+- `tests/test_qinq_l2_hdr.py` (6): outer TPID 0x88a8 + inner 0x8100 +
+  original ethertype on inner; QinQ frame is +4 bytes over single-tag;
+  outer PCP encodes in the TCI (verified by reparsing raw bytes);
+  outer-without-inner raises ValueError; untagged & single-tag paths
+  unchanged by the new kwargs (no regression).
+- `tests/test_l2_emulation_qinq.py` (7): payload round-trips outer
+  fields only when set; outer-without-inner refused by the dialog;
+  sessions-table cell renders `"<outer> » <inner>"` with informative
+  tooltip; single-tag and untagged renders unchanged.
+
+### Notes
+- Backward compatible end-to-end. Old clients ignore the new factory
+  kwargs (they default to None); new clients with outer=0 produce the
+  exact bytes the 0.2.41 single-tag tests pin.
+
+### Next on this enhancement
+0.2.61: BFD emitter (RFC 5880 packet format); EVPN type-2/3/5; SR-MPLS
+/ SRv6 label-stack support.
+
 ## [0.2.59] - 2026-05-29
 
 **Enhancement #3 of 4 (slice 2) — RFC 2544 latency capture + HTML

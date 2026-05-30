@@ -173,6 +173,31 @@ class _L2ConfigDialog(QDialog):
         self._vlan_pcp_spin.setToolTip("802.1p priority (PCP), 0-7. Only used when VLAN ID > 0.")
         top_form.addRow("VLAN PCP:", self._vlan_pcp_spin)
 
+        # 802.1ad / QinQ outer (S-VLAN) tag — 0.2.60. Set > 0 to add a
+        # second outer tag (TPID 0x88a8); the field above becomes the
+        # inner C-VLAN in that case. An outer-without-inner is rejected
+        # at submit time because it isn't valid 802.1ad.
+        self._outer_vlan_id_spin = QSpinBox()
+        self._outer_vlan_id_spin.setRange(0, 4094)
+        self._outer_vlan_id_spin.setValue(0)
+        self._outer_vlan_id_spin.setSpecialValueText("single tag")
+        self._outer_vlan_id_spin.setToolTip(
+            "802.1ad outer (S-VLAN) tag for QinQ double-tagging. 0 = single "
+            "tagged (uses the VLAN ID above only). When set, the inner tag "
+            "is the VLAN ID above and the outer tag is added with TPID "
+            "0x88a8 (IEEE 802.1ad)."
+        )
+        top_form.addRow("Outer VLAN ID:", self._outer_vlan_id_spin)
+
+        self._outer_vlan_pcp_spin = QSpinBox()
+        self._outer_vlan_pcp_spin.setRange(0, 7)
+        self._outer_vlan_pcp_spin.setValue(0)
+        self._outer_vlan_pcp_spin.setToolTip(
+            "802.1p priority on the outer (S-VLAN) tag, 0-7. Only used "
+            "when Outer VLAN ID > 0."
+        )
+        top_form.addRow("Outer VLAN PCP:", self._outer_vlan_pcp_spin)
+
         outer.addWidget(common_box)
 
         # Per-protocol stack
@@ -385,10 +410,25 @@ class _L2ConfigDialog(QDialog):
             body["duration_s"] = duration
         # Inline 802.1Q tag (applies to every protocol). 0 = untagged →
         # don't send the field so the server default (untagged) applies.
+        # When Outer VLAN ID > 0 too, the frame is 802.1ad (QinQ) with
+        # the inner being the field above and the outer being added.
         vlan_id = self._vlan_id_spin.value()
+        outer_vlan_id = self._outer_vlan_id_spin.value()
+        if outer_vlan_id > 0 and vlan_id == 0:
+            QMessageBox.warning(
+                self, "QinQ requires inner tag",
+                "You set an Outer VLAN ID but left VLAN ID at 0. 802.1ad "
+                "QinQ frames must carry both an inner (C-VLAN) and an "
+                "outer (S-VLAN) tag. Set VLAN ID > 0, or clear Outer "
+                "VLAN ID for a single-tagged frame."
+            )
+            return
         if vlan_id > 0:
             body["vlan_id"] = vlan_id
             body["vlan_pcp"] = self._vlan_pcp_spin.value()
+        if outer_vlan_id > 0:
+            body["outer_vlan_id"] = outer_vlan_id
+            body["outer_vlan_pcp"] = self._outer_vlan_pcp_spin.value()
 
         if proto == "lacp":
             body.update({
@@ -900,9 +940,20 @@ class L2EmulationTab(QWidget):
 
             _set(self.COL_IFACE, sess.get("iface", ""))
 
-            # VLAN — show tag + PCP, or a subtle 'untagged'.
+            # VLAN — render as "untagged" / "<id> [· p<pcp>]" (single
+            # tag) / "<outer>·<inner>" (QinQ, 0.2.60). PCP suffix
+            # collapsed in QinQ to keep the cell readable.
             vlan_id = config.get("vlan_id")
-            if vlan_id:
+            outer_id = config.get("outer_vlan_id")
+            if outer_id and vlan_id:
+                vlan_txt = f"{outer_id} » {vlan_id}"
+                tip = (f"802.1ad QinQ: outer S-VLAN {outer_id}"
+                       f" (pcp {config.get('outer_vlan_pcp') or 0})"
+                       f", inner C-VLAN {vlan_id}"
+                       f" (pcp {config.get('vlan_pcp') or 0})")
+                _set(self.COL_VLAN, vlan_txt, align=Qt.AlignCenter,
+                     color=QColor("#0f172a"), tooltip=tip)
+            elif vlan_id:
                 pcp = config.get("vlan_pcp") or 0
                 vlan_txt = f"{vlan_id}" + (f" · p{pcp}" if pcp else "")
                 _set(self.COL_VLAN, vlan_txt, align=Qt.AlignCenter,
