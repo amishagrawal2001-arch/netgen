@@ -2,6 +2,59 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.67] - 2026-05-30
+
+**EVPN Type-5 inject GUI** — completes v0.2.66. The dialog now has a
+tab selector and a Type-5 (IP Prefix) form alongside the existing
+Type-2 (MAC/IP) form; the per-row Clear button is **kind-aware** and
+routes to the matching `/api/evpn/{kind}/clear` endpoint.
+
+### What changed
+- **`widgets/evpn_inject_dialog.py`** — restructured around a
+  `QTabWidget`:
+  - **Tab 1 — "Type-2 (MAC/IP)"**: existing v0.2.63 form unchanged
+    (every attribute name preserved so the v0.2.63 tests still hold —
+    `iface_field`, `base_mac_field`, `count_spin`, …, `inject_btn`).
+  - **Tab 2 — "Type-5 (IP Prefix)"**: new form with `dev_field`,
+    `base_prefix_field`, `prefix_len_spin`, `count_t5_spin`,
+    `gateway_field`, `vrf_table_spin` (special text "main" at 0), and
+    its own `inject_btn_t5`.
+  - Shared `status_label` below the tabs — both Inject buttons write
+    to the same green/amber/red status line; success messages
+    identify the kind so the user can tell which tab fired.
+  - Active-injections table grew a **Kind** column (color-coded:
+    Type-2 blue, Type-5 violet); the per-row Clear button routes to
+    `/api/evpn/type2/clear` or `/api/evpn/type5/clear` based on the
+    row's kind via a new `_row_kinds` cache populated by
+    `_populate_active`.
+  - `_clear_one(inject_id, kind=None)` — when called without `kind`,
+    looks it up in the cache and falls back to `"type2"` so the
+    v0.2.63 test `test_clear_one_posts_inject_id` (which calls with
+    no cache) still hits the Type-2 endpoint.
+
+### Verified — 12 new tests + 14 v0.2.63 tests still passing; full suite 258
+`tests/test_evpn_inject_dialog_type5.py`:
+- Tabs exist with expected labels; both inject buttons present on `self`.
+- Type-5 payload: minimal / with gateway / `vrf_table=0` omitted vs
+  non-zero passed through / missing required → None.
+- `_on_inject_t5` posts to `/api/evpn/type5/inject`; status message
+  mentions "Type-5"; partial failure goes amber.
+- Active table renders a Kind column (Type-2 / Type-5); legacy rows
+  with no `kind` field default to Type-2 (back-compat with pre-0.2.66
+  servers).
+- **Per-row Clear routes correctly**: type-5 row → `/type5/clear`,
+  type-2 row → `/type2/clear` (the critical contract — wrong routing
+  would leak kernel state via the wrong cleaner). Direct
+  `_clear_one(id)` call with no populated cache still defaults to
+  `/type2/clear` (v0.2.63 test contract intact).
+
+### Notes
+- Client-only; no server change. v0.2.66's endpoints power it.
+- The fix in this slice (VRF table id capped to a sane signed-32-bit
+  range, not the unsigned-32-bit kernel max) caught itself in tests —
+  the dialog wouldn't even construct against the larger range because
+  QSpinBox is signed.
+
 ## [0.2.66] - 2026-05-30
 
 **EVPN Type-5 (IP Prefix) bulk injection** — sibling of v0.2.62's
