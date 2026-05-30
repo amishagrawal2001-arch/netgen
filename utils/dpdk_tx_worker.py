@@ -35,6 +35,10 @@ def should_use_dpdk(stream_data: Dict[str, Any]) -> bool:
     Decide whether this stream should be driven by the DPDK backend.
     Convention: engine == 'dpdk' OR any of: dpdk_enable, dpdk, use_dpdk (truthy / 'true'/'1'/etc).
     Supports flags under protocol_selection as well.
+
+    NB: this only checks the *opt-in* flags. For the full decision including
+    whether the stream is *compatible* with the tx_worker, use
+    ``resolve_engine()`` below — that's what the launcher should be calling.
     """
     if not isinstance(stream_data, dict):
         return False
@@ -53,6 +57,103 @@ def should_use_dpdk(stream_data: Dict[str, Any]) -> bool:
         if bool(v):
             return True
     return False
+
+
+def dpdk_compatibility_check(stream_data: Dict[str, Any]) -> Optional[str]:
+    """Return None if the stream can run through the tx_worker C binary,
+    or a short human-readable reason string explaining why it can't.
+
+    The tx_worker today supports:
+      * L3: IPv4 only (no IPv6)
+      * L4: UDP only (no TCP / ICMP / IGMP / …)
+      * Single 802.1Q tag OR untagged (no 802.1ad QinQ)
+      * No MPLS / SR-MPLS label stack (only kernel-emitted MPLS works)
+
+    Anything outside that envelope silently falls back to Scapy inside the
+    launcher — which means the operator sees DPDK enabled in the dialog
+    but the wire-side runs at Scapy speed and they wonder why. We surface
+    the reason here so the start response can hand it back to the GUI.
+
+    Pure function: takes the stream dict as the server stores it, returns
+    None or a string. No I/O.
+    """
+    if not isinstance(stream_data, dict):
+        return None
+    ps = stream_data.get("protocol_selection") or {}
+
+    def _get(key, default=None):
+        v = stream_data.get(key)
+        if v in (None, ""):
+            v = ps.get(key, default)
+        return v
+
+    # ── L4: UDP only ────────────────────────────────────────────────
+    l4 = str(_get("L4") or _get("l4") or "").strip().upper()
+    # Some streams encode the L4 inside protocol_selection['L4'] as
+    # "UDP" / "TCP" / "ICMP" / "Any". "Any" is treated as UDP for
+    # compatibility (the tx_worker default), so it's OK.
+    if l4 and l4 not in ("UDP", "ANY", ""):
+        return f"DPDK tx_worker is UDP-only; this stream uses {l4}"
+
+    # ── L3: IPv4 only ───────────────────────────────────────────────
+    l3 = str(_get("L3") or _get("l3") or "IPv4").strip().upper()
+    if l3 in ("IPV6", "IP6"):
+        return "DPDK tx_worker is IPv4-only; IPv6 streams fall back to Scapy"
+
+    # ── MPLS / SR-MPLS not supported (kernel-side MPLS works, but
+    #    tx_worker can't build MPLS headers itself) ──────────────────
+    mpls_labels = _get("mpls_labels") or stream_data.get("mpls_labels")
+    if mpls_labels:
+        # Accept both "16001,16002" and [16001, 16002]; both are truthy
+        # only when at least one label is set.
+        if isinstance(mpls_labels, str):
+            non_empty = [s for s in mpls_labels.replace(";", ",").split(",")
+                         if s.strip()]
+            if non_empty:
+                return ("DPDK tx_worker doesn't build MPLS headers; "
+                        "SR-MPLS streams fall back to Scapy")
+        elif isinstance(mpls_labels, (list, tuple)) and len(mpls_labels) > 0:
+            return ("DPDK tx_worker doesn't build MPLS headers; "
+                    "SR-MPLS streams fall back to Scapy")
+
+    # Legacy single MPLS label field — same constraint.
+    single_label = _get("mpls_label") or stream_data.get("mpls_label")
+    if single_label not in (None, "", 0, "0"):
+        return ("DPDK tx_worker doesn't build MPLS headers; "
+                "MPLS streams fall back to Scapy")
+
+    # ── QinQ (802.1ad outer tag) not supported ─────────────────────
+    outer_vlan = _get("outer_vlan_id") or stream_data.get("outer_vlan_id")
+    if outer_vlan not in (None, "", 0, "0"):
+        try:
+            if int(outer_vlan) > 0:
+                return ("DPDK tx_worker builds single-VLAN frames only; "
+                        "QinQ (802.1ad) streams fall back to Scapy")
+        except (TypeError, ValueError):
+            pass
+
+    return None
+
+
+def resolve_engine(stream_data: Dict[str, Any]) -> "tuple[str, Optional[str]]":
+    """Synchronous pre-flight engine decision.
+
+    Returns ``(engine, fallback_reason)``:
+      * ``("dpdk", None)``  — user opted in AND the stream is compatible
+      * ``("scapy", None)`` — user didn't opt in (the common case)
+      * ``("scapy", reason)`` — user opted in but the stream is incompatible
+
+    Use this in both the REST start handler (to put the decision into the
+    response) and the worker thread (so they pick the same engine). The
+    ``reason`` is operator-friendly English suitable for the GUI to show
+    in a toast / column tooltip.
+    """
+    if not should_use_dpdk(stream_data):
+        return "scapy", None
+    reason = dpdk_compatibility_check(stream_data)
+    if reason is None:
+        return "dpdk", None
+    return "scapy", reason
 
 
 def run_stream(

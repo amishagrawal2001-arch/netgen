@@ -679,6 +679,20 @@ class TrafficGenClientStreamLogic:
                     self.update_stream_status(r, "yellow")
 
         errors_for_user = []  # collected and shown in a single dialog at the end
+        # v0.2.75: server's start response carries actual_engine + fallback_reason
+        # per stream. Surface them in a single end-of-batch dialog so an operator
+        # who enabled DPDK on (say) a TCP stream sees the "fell back to Scapy"
+        # warning instead of silently running ~10x slower than expected.
+        dpdk_warnings: list = []   # [(stream_name, reason), ...]
+
+        def _collect_dpdk_warnings(started_entries):
+            for e in (started_entries or []):
+                reason = e.get("fallback_reason")
+                if reason:
+                    dpdk_warnings.append(
+                        (e.get("stream_name") or e.get("name") or
+                         e.get("stream_id") or "?", reason)
+                    )
 
         for server_url, per_port in server_payload_map.items():
             try:
@@ -708,6 +722,7 @@ class TrafficGenClientStreamLogic:
                             entry.get("stream_id") for entry in partial
                             if entry.get("stream_id")
                         }
+                        _collect_dpdk_warnings(partial)
                     except Exception:
                         pass
                     for items in per_port.values():
@@ -730,6 +745,7 @@ class TrafficGenClientStreamLogic:
 
                 data = resp.json()
                 started = data.get("started_streams", [])
+                _collect_dpdk_warnings(started)
                 if started:
                     ids_started = set()
                     for entry in started:
@@ -799,6 +815,25 @@ class TrafficGenClientStreamLogic:
                 self,
                 "Failed to Start Streams",
                 "Some streams could not be started:\n\n" + "\n\n".join(errors_for_user),
+            )
+
+        # v0.2.75: DPDK fallback warnings — one dialog per Start batch
+        # naming every stream that asked for DPDK but ran on Scapy. Use
+        # information (not warning) — the streams ARE running, just on
+        # a slower engine than the operator expected.
+        if dpdk_warnings:
+            msg_lines = [f"• {name}: {reason}" for name, reason in dpdk_warnings]
+            logger.info(f"[DPDK] {len(dpdk_warnings)} stream(s) fell back to Scapy")
+            for name, reason in dpdk_warnings:
+                logger.info(f"[DPDK] '{name}' on Scapy: {reason}")
+            QMessageBox.information(
+                self,
+                "DPDK fallback",
+                f"{len(dpdk_warnings)} stream(s) requested DPDK but are "
+                f"running on Scapy:\n\n" + "\n".join(msg_lines) +
+                "\n\nFix the incompatibility (or uncheck Use DPDK) to "
+                "make the warning go away — the streams are sending in "
+                "the meantime.",
             )
 
         # 5) refresh (session save removed - only save on explicit user action)

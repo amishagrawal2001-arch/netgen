@@ -3692,12 +3692,21 @@ class AddStreamDialog(QDialog):
         self.dpdk_enable_checkbox = QCheckBox("Use DPDK (tx_worker)")
         self.dpdk_enable_checkbox.setToolTip(
             "Enable the high-performance DPDK-based tx_worker backend.\n"
-            "Hints:\n"
-            "• mlx5/NVIDIA: runs with the kernel driver (no vfio).\n"
-            "• Broadcom NetXtreme-E / Thor2: binds to vfio-pci.\n"
-            "• For 100Gbps+: Auto-enables multi-instance mode.\n"
-            "• For 400Gbps: Uses 8-16 instances for line rate.\n"
-            "See README for prerequisites."
+            "\n"
+            "Supported by tx_worker (everything else silently falls back\n"
+            "to Scapy — the Start response will flag it):\n"
+            "  • L3: IPv4 only (no IPv6)\n"
+            "  • L4: UDP only (no TCP / ICMP / IGMP)\n"
+            "  • Tags: untagged or single 802.1Q (no 802.1ad / QinQ)\n"
+            "  • No MPLS / SR-MPLS label stack\n"
+            "\n"
+            "NIC hints:\n"
+            "  • mlx5 / NVIDIA: runs with the kernel driver (no vfio).\n"
+            "  • Broadcom NetXtreme-E / Thor2: binds to vfio-pci.\n"
+            "  • 100Gbps+: auto-enables multi-instance mode.\n"
+            "  • 400Gbps: uses 8–16 instances for line rate.\n"
+            "\n"
+            "See Help → DPDK Traffic Blast Workflow for prerequisites."
         )
         layout.addWidget(self.dpdk_enable_checkbox)
         

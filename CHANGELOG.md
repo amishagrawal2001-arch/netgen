@@ -2,6 +2,65 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.75] - 2026-05-30
+
+**DPDK fallback telemetry** — close the silent-fallback gap cluster
+the v0.2.74 audit surfaced. Operators who enabled "Use DPDK" on a
+TCP / IPv6 / MPLS / QinQ stream used to watch it "run" at Scapy
+speed with no clue why; now the start endpoint pre-flights the
+decision and the GUI surfaces the reason in a single end-of-batch
+dialog.
+
+### What changed
+
+#### Backend
+- **`utils/dpdk_tx_worker.py`** — new pure-function helpers:
+  - `dpdk_compatibility_check(stream_data) -> Optional[str]` returns
+    a human-readable reason if the stream can't run on `tx_worker`
+    (TCP / ICMP / IPv6 / MPLS stack / legacy single MPLS label /
+    QinQ outer VLAN); returns `None` if compatible.
+  - `resolve_engine(stream_data) -> (engine, fallback_reason)`
+    wraps `should_use_dpdk` + the compat check into the
+    "(scapy|dpdk), reason" tuple the start endpoint hands back.
+- **`run_tgen_server.py`** — `/api/traffic/start` calls
+  `resolve_engine` per stream and decorates every entry in the
+  `started_streams` response with `actual_engine` and (when
+  fallback happens) `fallback_reason`. Logged server-side too so
+  the journal carries the same trail.
+
+#### Client
+- **`traffic_client/stream_logic.py`** — collects every
+  `fallback_reason` across the Start batch and shows ONE
+  consolidated `QMessageBox.information` at the end naming each
+  affected stream + reason. Logged at INFO.
+- **`widgets/stream_dialog.py`** — DPDK checkbox tooltip rewritten
+  to spell out the supported envelope (IPv4 + UDP + ≤1 VLAN tag +
+  no MPLS) so operators see the constraint at point-of-use, not
+  buried in the workflow guide.
+
+#### Tests
+- **`tests/test_dpdk_engine_resolver.py`** — new file, 26 pure-
+  function tests pinning every compatibility rule + the engine
+  decision matrix (parametrised across all 7 known-incompat
+  combos).
+
+### Limitations
+This release covers **pre-flight** fallback (decisions made before
+the worker thread starts). **Runtime** fallback (tx_worker rc=100
+Broadcom ULP error, NIC link drop mid-stream, OOM) still goes
+through the worker thread's existing logging path and isn't yet
+surfaced to the GUI — that needs an async telemetry channel through
+the stats endpoint, deferred to a focused follow-up.
+
+The other DPDK audit items also deferred:
+* No DPDK-readiness chip in the main window status bar (BLOCKER #3)
+* No NIC-bind safety guards (mgmt interface, active stream detection)
+* No hugepage allocation feedback
+* No per-core TX stats, ABI version indicator, inline Unbind button
+
+### Test count
+338 → 364 (+26).
+
 ## [0.2.74] - 2026-05-30
 
 **Loose-ends bundle from the v0.2.62→v0.2.73 audit.** Triaged 18

@@ -1054,9 +1054,33 @@ def start_traffic():
                 import time
                 time.sleep(0.5)
 
+            # Pre-flight engine resolution. The DPDK fallback decision
+            # used to happen invisibly in the worker thread — operators
+            # enabled DPDK on a TCP / IPv6 / MPLS / QinQ stream, watched
+            # it run at Scapy speed, and had no clue why. Surface the
+            # decision (and reason) here so the start response carries
+            # it back. v0.2.75.
+            actual_engine = "scapy"
+            fallback_reason = None
+            try:
+                from utils.dpdk_tx_worker import resolve_engine
+                actual_engine, fallback_reason = resolve_engine(stream_data)
+                if fallback_reason:
+                    logging.info(f"[DPDK] '{stream_name}' falls back to Scapy: "
+                                 f"{fallback_reason}")
+            except Exception as _e:
+                logging.debug(f"[DPDK] resolve_engine unavailable: {_e}")
+
             try:
                 result = launch_single_stream(stream_data, interface_name)
-                
+                # Annotate the start response with the engine decision so
+                # the GUI can render a "DPDK requested but using Scapy"
+                # toast / column tooltip without polling extra endpoints.
+                if isinstance(result, dict):
+                    result["actual_engine"] = actual_engine
+                    if fallback_reason:
+                        result["fallback_reason"] = fallback_reason
+
                 # Register stream in database only if launch was successful
                 if result and result.get("status") == "started" and not result.get("error"):
                     # Extract TG ID from interface_label (format: "TG X - Port: interface" or "TG X - interface")
