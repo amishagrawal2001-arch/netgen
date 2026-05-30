@@ -435,6 +435,41 @@ class EvpnInjectDialog(QDialog):
             return
         self._populate_active(data.get("injections") or [])
 
+    @staticmethod
+    def _row_tooltip(it: Dict[str, Any], kind: str) -> str:
+        """Build a hover tooltip summarising the inject parameters.
+
+        Operators routinely want to know "what's this inject actually
+        doing?" without clicking around — show kind, count, iface,
+        base MAC/prefix, optional VTEP, all in one multi-line tip.
+        Quiet on missing fields so partially-reported records (older
+        servers, third-party injects) still render."""
+        kind_label = "Type-2 (MAC/IP)" if kind == "type2" else "Type-5 (IP Prefix)"
+        lines = [f"<b>{kind_label}</b>"]
+        if it.get("count") is not None:
+            lines.append(f"Count: {it.get('count')}")
+        if it.get("iface"):
+            lines.append(f"Iface: {it.get('iface')}")
+        if it.get("l3_iface"):
+            lines.append(f"L3 iface: {it.get('l3_iface')}")
+        # Type-2 uses base_mac (+ optional base_ip); Type-5 uses
+        # base_prefix + prefix_len. Show whichever the payload carries.
+        if it.get("base_mac"):
+            lines.append(f"Base MAC: {it.get('base_mac')}")
+        if it.get("base_ip"):
+            lines.append(f"Base IP: {it.get('base_ip')}")
+        if it.get("base_prefix"):
+            plen = it.get("prefix_len")
+            if plen:
+                lines.append(f"Base prefix: {it.get('base_prefix')}/{plen}")
+            else:
+                lines.append(f"Base prefix: {it.get('base_prefix')}")
+        if it.get("remote_vtep_ip"):
+            lines.append(f"Remote VTEP: {it.get('remote_vtep_ip')}")
+        if it.get("vrf_table"):
+            lines.append(f"VRF table: {it.get('vrf_table')}")
+        return "<br>".join(lines)
+
     def _populate_active(self, items: List[Dict[str, Any]]) -> None:
         self._row_kinds.clear()
         self.active_table.setRowCount(len(items))
@@ -442,9 +477,12 @@ class EvpnInjectDialog(QDialog):
             inj_id = str(it.get("inject_id", ""))
             kind = str(it.get("kind") or "type2")
             self._row_kinds[inj_id] = kind
+            tip = self._row_tooltip(it, kind)
 
             self.active_table.setItem(row, self.COL_ID,
                                       QTableWidgetItem(inj_id[:8] + "…"))
+            # ID cell already shows the FULL inject_id on hover (since
+            # v0.2.63), so don't clobber that — leave it.
             self.active_table.item(row, self.COL_ID).setToolTip(inj_id)
 
             # Pretty kind badge — "type-2" / "type-5" with a colour.
@@ -453,16 +491,24 @@ class EvpnInjectDialog(QDialog):
             ki.setTextAlignment(Qt.AlignCenter)
             from PyQt5.QtGui import QColor
             ki.setForeground(QColor(self._KIND_COLORS.get(kind, "#475569")))
+            ki.setToolTip(tip)
             self.active_table.setItem(row, self.COL_KIND, ki)
 
-            self.active_table.setItem(row, self.COL_IFACE,
-                                      QTableWidgetItem(str(it.get("iface", ""))))
-            self.active_table.setItem(row, self.COL_L3,
-                                      QTableWidgetItem(str(it.get("l3_iface") or "—")))
-            self.active_table.setItem(row, self.COL_VTEP,
-                                      QTableWidgetItem(str(it.get("remote_vtep_ip") or "—")))
+            iface_item = QTableWidgetItem(str(it.get("iface", "")))
+            iface_item.setToolTip(tip)
+            self.active_table.setItem(row, self.COL_IFACE, iface_item)
+
+            l3_item = QTableWidgetItem(str(it.get("l3_iface") or "—"))
+            l3_item.setToolTip(tip)
+            self.active_table.setItem(row, self.COL_L3, l3_item)
+
+            vtep_item = QTableWidgetItem(str(it.get("remote_vtep_ip") or "—"))
+            vtep_item.setToolTip(tip)
+            self.active_table.setItem(row, self.COL_VTEP, vtep_item)
+
             ci = QTableWidgetItem(str(it.get("count", 0)))
             ci.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            ci.setToolTip(tip)
             self.active_table.setItem(row, self.COL_COUNT, ci)
 
             # Per-row Clear — explicit default-arg lambda so each button

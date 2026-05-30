@@ -270,6 +270,45 @@ def test_kick_refresh_custom_attr():
     host.my_bar.refresh.assert_called_once_with()
 
 
+# ─────────────────── Protocol-specific apply paths kick refresh (v0.2.74)
+# v0.2.71 wired the device-level Apply path; v0.2.74 closes the loop by
+# wiring the four protocol-specific apply buttons too. Source-level grep
+# is the cheapest reliable check — we don't want to stand up the entire
+# Devices tab to exercise QPushButton clicks.
+@pytest.mark.parametrize("apply_method", [
+    "apply_bgp_configurations",
+    "apply_ospf_configurations",
+    "apply_isis_configurations",
+    "apply_vxlan_configurations",
+])
+def test_protocol_apply_paths_call_kick_refresh(apply_method):
+    """Each protocol-specific apply method in widgets/devices_tab.py
+    must invoke kick_refresh so its finding codes (BGP_NO_REMOTE_ASN,
+    OSPF_NO_AREA, ISIS_NO_AREA, VXLAN_*) repaint immediately instead
+    of waiting up to 60 s for the next auto-poll."""
+    import re
+    from pathlib import Path
+    src = (Path(__file__).resolve().parent.parent
+           / "widgets" / "devices_tab.py").read_text()
+    # Find the relevant method block — match the def, then the body
+    # up to the next `    def ` at the same indent.
+    pat = re.compile(
+        rf"    def {apply_method}\(self\)[^\n]*\n"
+        r"(?P<body>(?:        .*\n|        \n|\n)*?)"
+        r"    def ",
+        re.MULTILINE,
+    )
+    matches = list(pat.finditer(src))
+    assert matches, f"{apply_method} not found in widgets/devices_tab.py"
+    # Take the LAST occurrence (some methods have an earlier delegator
+    # that's superseded by a later override).
+    body = matches[-1].group("body")
+    assert "kick_refresh" in body, (
+        f"{apply_method} success path does not call kick_refresh — "
+        f"the preflight bar will not repaint until the 60 s poll fires"
+    )
+
+
 # ─────────────────────────────────────────────── details dialog
 def test_details_dialog_renders_one_row_per_finding(qapp):
     from widgets.preflight_bar import PreflightDetailsDialog
@@ -293,3 +332,89 @@ def test_details_dialog_renders_one_row_per_finding(qapp):
     from PyQt5.QtGui import QColor
     assert dlg.table.item(0, 0).foreground().color() == QColor("#b91c1c")
     assert dlg.table.item(1, 0).foreground().color() == QColor("#b45309")
+    # Sortable after population — operators routinely group by Device
+    # or Level by clicking the column header. Was off before v0.2.74.
+    assert dlg.table.isSortingEnabled() is True
+
+
+def test_details_dialog_exports_findings_to_csv(qapp, tmp_path, monkeypatch):
+    """The Export CSV button writes the raw findings (not the
+    display-coerced table cells) to disk so operators can paste into
+    tickets / spreadsheets."""
+    from PyQt5 import QtWidgets
+    from widgets.preflight_bar import PreflightDetailsDialog
+    findings = [
+        {"level": "error", "code": "BGP_NO_REMOTE_ASN",
+         "device_name": "R1", "interface": "ens1f0",
+         "message": "no remote ASN"},
+        {"level": "warning", "code": "VXLAN_EMPTY",
+         "device_name": "R2", "interface": None,
+         "message": "vxlan_config present but empty"},
+    ]
+    parent = QWidget()  # noqa: F841
+    dlg = PreflightDetailsDialog(findings, parent=parent)
+
+    out = tmp_path / "out.csv"
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getSaveFileName",
+                        staticmethod(lambda *a, **k: (str(out), "")))
+    dlg._export_csv()
+    assert out.exists()
+    text = out.read_text(encoding="utf-8")
+    # Header row + 2 finding rows.
+    assert text.count("\n") == 3
+    assert "level,code,device_name,interface,message" in text
+    assert "error,BGP_NO_REMOTE_ASN,R1,ens1f0,no remote ASN" in text
+    # Missing interface preserved as empty string in the export — NOT
+    # the em-dash the table cell shows (raw payload, not display data).
+    assert "warning,VXLAN_EMPTY,R2,,vxlan_config present but empty" in text
+
+
+def test_details_dialog_exports_findings_to_json(qapp, tmp_path, monkeypatch):
+    from PyQt5 import QtWidgets
+    from widgets.preflight_bar import PreflightDetailsDialog
+    findings = [
+        {"level": "error", "code": "BGP_NO_REMOTE_ASN",
+         "device_name": "R1", "message": "no remote ASN"},
+    ]
+    parent = QWidget()  # noqa: F841
+    dlg = PreflightDetailsDialog(findings, parent=parent)
+
+    out = tmp_path / "out.json"
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getSaveFileName",
+                        staticmethod(lambda *a, **k: (str(out), "")))
+    dlg._export_json()
+    import json as _json
+    payload = _json.loads(out.read_text(encoding="utf-8"))
+    assert payload == findings
+
+
+def test_details_dialog_export_cancel_does_nothing(qapp, tmp_path, monkeypatch):
+    """Operator cancels the Save dialog → no file is written, no
+    exception bubbles up."""
+    from PyQt5 import QtWidgets
+    from widgets.preflight_bar import PreflightDetailsDialog
+    parent = QWidget()  # noqa: F841
+    dlg = PreflightDetailsDialog([], parent=parent)
+
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getSaveFileName",
+                        staticmethod(lambda *a, **k: ("", "")))
+    dlg._export_csv()
+    dlg._export_json()
+    # No files anywhere under tmp_path.
+    assert list(tmp_path.iterdir()) == []
+
+
+def test_details_dialog_default_filename_is_timestamped(qapp):
+    """The Save dialog should get a default filename with a
+    timestamp so the operator can hit Save without typing — and
+    re-exports don't collide."""
+    from widgets.preflight_bar import PreflightDetailsDialog
+    parent = QWidget()  # noqa: F841
+    dlg = PreflightDetailsDialog([], parent=parent)
+    name = dlg._default_filename("csv")
+    assert name.startswith("preflight_findings_")
+    assert name.endswith(".csv")
+    # YYYY-MM-DD prefix after "preflight_findings_".
+    import re
+    assert re.match(r"preflight_findings_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.csv",
+                    name)

@@ -342,8 +342,15 @@ class Rfc2544Dialog(QDialog):
             # the server is the escape hatch.
 
     def _on_export_csv(self):
+        # Timestamped default filename — operator hits Save without
+        # typing, and re-exports don't silently overwrite the previous
+        # one. Same YYYY-MM-DD_HH-MM-SS convention as the HTML export
+        # below + preflight findings export (v0.2.74).
+        import datetime as _dt
+        default_name = (f"rfc2544_results_"
+                        f"{_dt.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.csv")
         path, _ = QFileDialog.getSaveFileName(
-            self, "Export RFC 2544 Results", "rfc2544_results.csv",
+            self, "Export RFC 2544 Results", default_name,
             "CSV (*.csv)"
         )
         if not path:
@@ -393,9 +400,12 @@ class Rfc2544Dialog(QDialog):
         from PyQt5.QtWidgets import QFileDialog, QMessageBox
         import datetime as _dt
 
+        # YYYY-MM-DD_HH-MM-SS — matches the CSV export above and the
+        # preflight findings export (v0.2.74) so all of netgen's
+        # exports sort naturally next to each other on disk.
         path, _ = QFileDialog.getSaveFileName(
             self, "Export RFC 2544 Report",
-            f"rfc2544_report_{_dt.datetime.now().strftime('%Y%m%d-%H%M%S')}.html",
+            f"rfc2544_report_{_dt.datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}.html",
             "HTML (*.html)"
         )
         if not path:

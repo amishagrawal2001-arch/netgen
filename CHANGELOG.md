@@ -2,6 +2,87 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.74] - 2026-05-30
+
+**Loose-ends bundle from the v0.2.62→v0.2.73 audit.** Triaged 18
+gaps the audit surfaced; this release closes the 3 confirmed bugs +
+3 cheap polish items. The bigger UX changes (per-device preflight
+dot in Devices table, EVPN active-count chip on VXLAN sub-tab,
+pill-click filter, SR-MPLS badge) are deferred to focused
+follow-up releases.
+
+### Bug fixes
+- **Preflight bar now refreshes after BGP / OSPF / IS-IS / VXLAN
+  apply.** v0.2.71 wired `kick_refresh` into the device-level Apply
+  paths but missed the four protocol-specific Apply buttons.
+  Operators tweaking just BGP got the same 60 s wait the v0.2.71
+  hook was supposed to eliminate.
+  Pinned by a parametrised regression test in
+  `tests/test_preflight_bar.py::test_protocol_apply_paths_call_kick_refresh`.
+- **Preflight Details modal is sortable.** `setSortingEnabled` was
+  hard-coded `False`; header clicks did nothing. Now sorted by Level
+  ascending on open (errors on top) and operators can click any
+  header to re-group by Device or Code.
+- **Full BFD RFC 5880 field set exposed in the L2 emulation GUI.**
+  Backend `start_bfd` accepted `diag` (RFC 5880 §4.1 diagnostic
+  code) and `required_min_echo_rx_us` as kwargs since v0.2.61, but
+  the GUI silently defaulted both to 0. Added:
+  - `Diagnostic:` QComboBox with the 9 named RFC 5880 §4.1 codes
+    (defaults to 0 — No Diagnostic).
+  - `Required Min Echo RX:` µs spinner (defaults to 0 — echo
+    function disabled).
+
+### Polish
+- **Export findings (CSV + JSON) on the preflight Details modal.**
+  Two new buttons next to Close. Defaults to a timestamped filename
+  (`preflight_findings_2026-05-30_14-35-22.csv`) so the operator
+  hits Save without typing.
+- **Per-row tooltips on the EVPN active-injections table.** Hover
+  any cell to see Type-2/5 kind, count, iface, base MAC / prefix /
+  VTEP / VRF table at a glance — no need to open Details to know
+  what's running.
+- **Timestamped default filenames for RFC 2544 exports** (CSV was
+  missing one; HTML had one in a different format). Both now use
+  the same `YYYY-MM-DD_HH-MM-SS` convention as the preflight export
+  so they sort naturally next to each other on disk.
+
+### What changed
+- **`widgets/devices_tab.py`** — `apply_bgp_configurations`,
+  `apply_ospf_configurations`, `apply_isis_configurations`,
+  `apply_vxlan_configurations` all call `kick_refresh(self)` after
+  the handler returns.
+- **`widgets/preflight_bar.py`** — `setSortingEnabled(True)` + sort
+  by Level ascending after population; sort indicator visible. New
+  `_export_csv` / `_export_json` / `_default_filename` helpers +
+  Export buttons in the dialog footer. Standard library imports
+  added (`csv`, `datetime`, `json`).
+- **`widgets/l2_emulation_tab.py`** — `_build_bfd_panel` gains
+  `_bfd_diag` (QComboBox of RFC 5880 codes) + `_bfd_echo_rx_us`
+  (µs spinner). `_on_accept` carries both into the body.
+- **`widgets/evpn_inject_dialog.py`** — new `_row_tooltip` static
+  helper builds an HTML tip from the inject record. Applied to
+  every populated cell in each row.
+- **`widgets/rfc2544_dialog.py`** — CSV default filename is now
+  timestamped; HTML reformatted to match.
+- **`tests/test_preflight_bar.py`** — parametrised hook-check
+  across the 4 protocol apply methods (source-grep, no need to
+  stand up the full tab); `setSortingEnabled` pinned in the
+  existing dialog test; 4 new tests for the export buttons.
+- **`tests/test_l2_emulation_bfd.py`** — new file. 4 tests pinning
+  the BFD GUI: diag combo has all 9 codes + defaults to 0, echo-RX
+  spinner present + defaults to 0, both round-trip through
+  `_on_accept` payload.
+- **`tests/test_evpn_inject_dialog.py`** — new
+  `test_active_row_tooltip_summarises_inject_params` covers
+  Type-2 + Type-5 tip content and that every populated cell carries
+  the same tip.
+- **`tests/test_rfc2544_dialog.py`** — new
+  `test_export_default_filenames_are_timestamped` covers both CSV
+  and HTML exports.
+
+### Test count
+324 → 338 (+14).
+
 ## [0.2.73] - 2026-05-30
 
 **Supported Features (Capabilities Guide)** — the comprehensive

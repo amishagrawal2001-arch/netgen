@@ -107,6 +107,42 @@ def test_populate_active_renders_one_row_per_item(open_dialog):
     assert isinstance(dlg.active_table.cellWidget(1, dlg.COL_CLEAR), QPushButton)
 
 
+def test_active_row_tooltip_summarises_inject_params(open_dialog):
+    """Hovering an active-injection row should show kind + count +
+    iface + base MAC / prefix at a glance, so the operator doesn't
+    have to open Details to know what's running. Added in v0.2.74."""
+    dlg, *_ = open_dialog
+    dlg._populate_active([
+        {"inject_id": "abcdefgh-1111", "kind": "type2",
+         "iface": "vxlan100", "l3_iface": "br100",
+         "remote_vtep_ip": "192.0.2.5", "count": 250,
+         "base_mac": "02:00:00:00:00:01", "base_ip": "10.0.0.1"},
+        {"inject_id": "12345678-2222", "kind": "type5",
+         "iface": "vxlan200", "count": 10,
+         "base_prefix": "203.0.113.0", "prefix_len": 24,
+         "vrf_table": 42},
+    ])
+    tip_t2 = dlg.active_table.item(0, dlg.COL_IFACE).toolTip()
+    assert "Type-2" in tip_t2
+    assert "Count: 250" in tip_t2
+    assert "vxlan100" in tip_t2
+    assert "02:00:00:00:00:01" in tip_t2
+    assert "10.0.0.1" in tip_t2
+    assert "192.0.2.5" in tip_t2
+
+    tip_t5 = dlg.active_table.item(1, dlg.COL_IFACE).toolTip()
+    assert "Type-5" in tip_t5
+    assert "Count: 10" in tip_t5
+    assert "203.0.113.0/24" in tip_t5
+    assert "VRF table: 42" in tip_t5
+
+    # The tooltip lands on every populated cell in the row (operator
+    # can hover anywhere), not just one specific column.
+    for col in (dlg.COL_KIND, dlg.COL_IFACE, dlg.COL_L3,
+                dlg.COL_VTEP, dlg.COL_COUNT):
+        assert dlg.active_table.item(0, col).toolTip() == tip_t2
+
+
 def test_clear_button_binds_correct_inject_id(open_dialog, monkeypatch):
     """Closure-capture regression: the Clear lambda must call
     _clear_one with the row's *own* inject_id, not whatever the loop

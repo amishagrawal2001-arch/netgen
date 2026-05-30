@@ -183,6 +183,38 @@ def test_html_report_missing_latency_renders_em_dash():
     assert "<table class='results'>" in html
 
 
+def test_export_default_filenames_are_timestamped(qapp, monkeypatch):
+    """Both CSV and HTML exports should pre-populate the Save dialog
+    with a YYYY-MM-DD_HH-MM-SS filename so re-exports don't silently
+    collide and the operator can hit Save without typing. Pinned in
+    v0.2.74; the CSV path was missing it before."""
+    import re
+    from PyQt5 import QtWidgets
+
+    dlg = Rfc2544Dialog(server_url="http://1.1.1.1")
+
+    seen = {}
+    def _spy(*a, **k):
+        # QFileDialog.getSaveFileName(parent, caption, default_name, filter)
+        # — defensively read by both positional and keyword.
+        if len(a) >= 3:
+            seen["default"] = a[2]
+        # Return ("", "") to cancel and skip the rest of the export.
+        return ("", "")
+    monkeypatch.setattr(QtWidgets.QFileDialog, "getSaveFileName",
+                        staticmethod(_spy))
+
+    dlg._on_export_csv()
+    assert "default" in seen
+    assert re.match(r"rfc2544_results_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.csv",
+                    seen["default"]), f"got: {seen['default']!r}"
+
+    seen.clear()
+    dlg._on_export_html()
+    assert re.match(r"rfc2544_report_\d{4}-\d{2}-\d{2}_\d{2}-\d{2}-\d{2}\.html",
+                    seen["default"]), f"got: {seen['default']!r}"
+
+
 def test_html_report_no_results_shows_message():
     """An empty progress list (test cancelled / hadn't started) renders
     a visible error line instead of a malformed empty table."""

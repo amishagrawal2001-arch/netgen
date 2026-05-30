@@ -18,6 +18,9 @@ a flaky link.
 
 from __future__ import annotations
 
+import csv
+import datetime as _dt
+import json
 import logging
 import os
 from typing import Any, Callable, Dict, List, Optional
@@ -25,8 +28,9 @@ from typing import Any, Callable, Dict, List, Optional
 import requests
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtWidgets import (
-    QDialog, QFrame, QHBoxLayout, QHeaderView, QLabel, QPushButton,
-    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
+    QDialog, QFileDialog, QFrame, QHBoxLayout, QHeaderView, QLabel,
+    QMessageBox, QPushButton, QTableWidget, QTableWidgetItem,
+    QVBoxLayout, QWidget,
 )
 
 
@@ -225,11 +229,16 @@ class PreflightDetailsDialog(QDialog):
             ["Level", "Code", "Device", "Interface", "Message"]
         )
         self.table.verticalHeader().setVisible(False)
+        # Header click sorts the column — operators routinely want to
+        # group by Device (all R1's findings together) or by Level (all
+        # errors first). Sorting MUST be off while we populate or the
+        # rows land in the wrong cells; we re-enable after the loop.
         self.table.setSortingEnabled(False)
         self.table.horizontalHeader().setStretchLastSection(True)
         self.table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeToContents
         )
+        self.table.horizontalHeader().setSortIndicatorShown(True)
         for row, f in enumerate(findings):
             level = str(f.get("level", "")).strip()
             level_item = QTableWidgetItem(level.upper())
@@ -241,15 +250,90 @@ class PreflightDetailsDialog(QDialog):
             self.table.setItem(row, 2, QTableWidgetItem(str(f.get("device_name", ""))))
             self.table.setItem(row, 3, QTableWidgetItem(str(f.get("interface") or "—")))
             self.table.setItem(row, 4, QTableWidgetItem(str(f.get("message", ""))))
+        # All rows populated — safe to turn header-click sorting on now.
+        # Explicitly sort by Level ascending so ERROR < WARNING
+        # alphabetically puts errors on top (operators' first concern);
+        # the implicit Qt default is descending and would land WARNING
+        # before ERROR which is the wrong instinct.
+        self.table.setSortingEnabled(True)
+        self.table.sortByColumn(0, Qt.AscendingOrder)
         outer.addWidget(self.table, 1)
 
+        # Keep a reference to the raw findings list so Export… can
+        # write the original payload, not whatever we coerced into the
+        # table (level case-folded, missing iface rendered as em-dash,
+        # etc.).
+        self._findings: List[Dict[str, Any]] = list(findings)
+
         close_row = QHBoxLayout()
+        export_csv_btn = QPushButton("Export CSV…")
+        export_csv_btn.setToolTip(
+            "Save the visible findings to a CSV file — paste into a "
+            "ticket / spreadsheet without screenshotting."
+        )
+        export_csv_btn.clicked.connect(self._export_csv)
+        close_row.addWidget(export_csv_btn)
+
+        export_json_btn = QPushButton("Export JSON…")
+        export_json_btn.setToolTip(
+            "Save the raw findings list as JSON — for scripts that "
+            "consume the preflight payload programmatically."
+        )
+        export_json_btn.clicked.connect(self._export_json)
+        close_row.addWidget(export_json_btn)
+
         close_row.addStretch(1)
         close_btn = QPushButton("Close")
         close_btn.setDefault(True)
         close_btn.clicked.connect(self.accept)
         close_row.addWidget(close_btn)
         outer.addLayout(close_row)
+
+    # ─────────────────────────────────────────────── export handlers
+    def _default_filename(self, ext: str) -> str:
+        """Timestamped default filename so an operator doesn't have to
+        type one — date sorts naturally and disambiguates re-exports."""
+        stamp = _dt.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+        return f"preflight_findings_{stamp}.{ext}"
+
+    def _export_csv(self) -> None:
+        path, _filter = QFileDialog.getSaveFileName(
+            self, "Export preflight findings (CSV)",
+            self._default_filename("csv"),
+            "CSV files (*.csv);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as fh:
+                w = csv.writer(fh)
+                w.writerow(["level", "code", "device_name",
+                            "interface", "message"])
+                for f in self._findings:
+                    w.writerow([
+                        str(f.get("level", "")),
+                        str(f.get("code", "")),
+                        str(f.get("device_name", "")),
+                        str(f.get("interface") or ""),
+                        str(f.get("message", "")),
+                    ])
+        except Exception as exc:
+            QMessageBox.warning(self, "Export failed", str(exc))
+
+    def _export_json(self) -> None:
+        path, _filter = QFileDialog.getSaveFileName(
+            self, "Export preflight findings (JSON)",
+            self._default_filename("json"),
+            "JSON files (*.json);;All files (*)",
+        )
+        if not path:
+            return
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(self._findings, fh, indent=2, sort_keys=True)
+                fh.write("\n")
+        except Exception as exc:
+            QMessageBox.warning(self, "Export failed", str(exc))
 
 
 # ─────────────────────────────────────────────────────────── helpers

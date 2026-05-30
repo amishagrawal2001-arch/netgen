@@ -2333,7 +2333,16 @@ class DevicesTab(QWidget):
         return self.isis_handler.prompt_delete_isis()
     def apply_isis_configurations(self):
         """Apply ISIS configurations to the server for selected ISIS table rows."""
-        return self.isis_handler.apply_isis_configurations()
+        result = self.isis_handler.apply_isis_configurations()
+        # Refresh preflight pills immediately — IS-IS area edits flip
+        # the ISIS_NO_AREA finding state and operators expect the bar
+        # to track without the 60 s auto-poll wait.
+        try:
+            from widgets.preflight_bar import kick_refresh
+            kick_refresh(self)
+        except Exception:
+            pass
+        return result
     def _apply_isis_to_devices(self, devices, server_url):
         """Apply ISIS configuration to the specified devices."""
         return self.isis_handler._apply_isis_to_devices(devices, server_url)
@@ -2892,7 +2901,15 @@ class DevicesTab(QWidget):
         if hasattr(self, "vxlan_handler") and self.vxlan_handler:
             self.vxlan_handler.refresh_vxlan_table()
         self.update_device_table(self.main_window.all_devices)
-        
+
+        # Refresh preflight pills — VXLAN edits flip VXLAN_EMPTY /
+        # VXLAN_MISSING_FIELDS finding state immediately.
+        try:
+            from widgets.preflight_bar import kick_refresh
+            kick_refresh(self)
+        except Exception:
+            pass
+
         # Interface list refresh is now manual only - user can click "Refresh Interface List" button if needed
         # Removed automatic refresh to prevent unnecessary UI updates
         # if success_count > 0 and hasattr(self.main_window, "update_server_tree"):
@@ -9298,7 +9315,15 @@ class DevicesTab(QWidget):
 
     def apply_bgp_configurations(self):
         """Apply BGP configurations to the server for selected BGP table rows."""
-        return self.bgp_handler.apply_bgp_configurations()
+        result = self.bgp_handler.apply_bgp_configurations()
+        # Refresh preflight pills — BGP edits flip BGP_NO_REMOTE_ASN /
+        # BGP_NO_LOOPBACK finding state immediately.
+        try:
+            from widgets.preflight_bar import kick_refresh
+            kick_refresh(self)
+        except Exception:
+            pass
+        return result
     def start_bgp_protocol(self):
         """Start BGP protocol for selected devices."""
         return self.bgp_handler.start_bgp_protocol()
@@ -9307,7 +9332,15 @@ class DevicesTab(QWidget):
         return self.bgp_handler.stop_bgp_protocol()
     def apply_ospf_configurations(self):
         """Apply OSPF configurations to the server for selected OSPF table rows."""
-        return self.ospf_handler.apply_ospf_configurations()
+        result = self.ospf_handler.apply_ospf_configurations()
+        # Refresh preflight pills — OSPF area edits flip OSPF_NO_AREA
+        # finding state immediately.
+        try:
+            from widgets.preflight_bar import kick_refresh
+            kick_refresh(self)
+        except Exception:
+            pass
+        return result
     def start_ospf_protocol(self):
         """Start OSPF protocol for selected devices."""
         return self.ospf_handler.start_ospf_protocol()

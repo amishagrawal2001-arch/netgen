@@ -454,6 +454,41 @@ class _L2ConfigDialog(QDialog):
         self._bfd_rx_us.setSuffix(" µs")
         self._bfd_rx_us.setToolTip("Required Min RX Interval (µs).")
 
+        # Required Min Echo RX (RFC 5880 §6.8.1) — 0 disables echo
+        # function (the common case). Operators only set this when
+        # exercising the echo-mode path; default 0 keeps the wire
+        # behaviour unchanged.
+        self._bfd_echo_rx_us = QSpinBox()
+        self._bfd_echo_rx_us.setRange(0, 30_000_000)
+        self._bfd_echo_rx_us.setValue(0)
+        self._bfd_echo_rx_us.setSuffix(" µs")
+        self._bfd_echo_rx_us.setToolTip(
+            "Required Min Echo RX Interval (µs). 0 = echo function "
+            "disabled (RFC 5880 §6.8.1)."
+        )
+
+        # Diagnostic code (RFC 5880 §4.1) — the 5-bit field telling
+        # the peer WHY the local session is in its current state. 0
+        # (no diagnostic) is the right default while State = Up.
+        self._bfd_diag = QComboBox()
+        for code, label in (
+            (0,  "0 — No Diagnostic"),
+            (1,  "1 — Control Detection Time Expired"),
+            (2,  "2 — Echo Function Failed"),
+            (3,  "3 — Neighbor Signaled Session Down"),
+            (4,  "4 — Forwarding Plane Reset"),
+            (5,  "5 — Path Down"),
+            (6,  "6 — Concatenated Path Down"),
+            (7,  "7 — Administratively Down"),
+            (8,  "8 — Reverse Concatenated Path Down"),
+        ):
+            self._bfd_diag.addItem(label, code)
+        self._bfd_diag.setToolTip(
+            "Diagnostic code reported to the peer (RFC 5880 §4.1). "
+            "Leave at 0 while State = Up; useful for exercising peer "
+            "behaviour to specific tear-down reasons."
+        )
+
         self._bfd_dst_port = QSpinBox()
         self._bfd_dst_port.setRange(1, 65535)
         self._bfd_dst_port.setValue(3784)
@@ -480,8 +515,10 @@ class _L2ConfigDialog(QDialog):
         f.addRow("My Discriminator:", self._bfd_my_disc)
         f.addRow("Your Discriminator:", self._bfd_your_disc)
         f.addRow("Detect Mult:", self._bfd_detect_mult)
+        f.addRow("Diagnostic:", self._bfd_diag)
         f.addRow("Desired Min TX:", self._bfd_tx_us)
         f.addRow("Required Min RX:", self._bfd_rx_us)
+        f.addRow("Required Min Echo RX:", self._bfd_echo_rx_us)
         f.addRow("Dst UDP port:", self._bfd_dst_port)
         f.addRow("Send interval:", self._bfd_interval)
         return w
@@ -623,18 +660,20 @@ class _L2ConfigDialog(QDialog):
             if your_disc is None:
                 return
             body.update({
-                "state":               self._bfd_state.currentData(),
-                "src_ip":              self._bfd_src_ip.text().strip(),
-                "dst_ip":              self._bfd_dst_ip.text().strip(),
-                "src_mac":             self._bfd_src_mac.text().strip(),
-                "dst_mac":             self._bfd_dst_mac.text().strip(),
-                "my_discriminator":    my_disc,
-                "your_discriminator":  your_disc,
-                "detect_mult":         self._bfd_detect_mult.value(),
-                "desired_min_tx_us":   self._bfd_tx_us.value(),
-                "required_min_rx_us":  self._bfd_rx_us.value(),
-                "dst_udp_port":        self._bfd_dst_port.value(),
-                "interval_s":          self._bfd_interval.value(),
+                "state":                    self._bfd_state.currentData(),
+                "src_ip":                   self._bfd_src_ip.text().strip(),
+                "dst_ip":                   self._bfd_dst_ip.text().strip(),
+                "src_mac":                  self._bfd_src_mac.text().strip(),
+                "dst_mac":                  self._bfd_dst_mac.text().strip(),
+                "my_discriminator":         my_disc,
+                "your_discriminator":       your_disc,
+                "detect_mult":              self._bfd_detect_mult.value(),
+                "diag":                     self._bfd_diag.currentData(),
+                "desired_min_tx_us":        self._bfd_tx_us.value(),
+                "required_min_rx_us":       self._bfd_rx_us.value(),
+                "required_min_echo_rx_us":  self._bfd_echo_rx_us.value(),
+                "dst_udp_port":             self._bfd_dst_port.value(),
+                "interval_s":               self._bfd_interval.value(),
             })
 
         self._payload = {"protocol": proto, "body": body}
