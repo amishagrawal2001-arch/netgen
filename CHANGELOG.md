@@ -2,6 +2,62 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.66] - 2026-05-30
+
+**EVPN Type-5 (IP Prefix) bulk injection** — sibling of v0.2.62's
+Type-2 inject. Synthesise N IPv4 prefixes as kernel routes; FRR
+(`address-family l2vpn evpn` + `advertise ipv4 unicast` under the VRF)
+picks them up and advertises them as EVPN Type-5.
+
+### What changed
+- **`utils/evpn_inject.py`** — extended (not replaced) with:
+  - `generate_prefix_range_v4(base_prefix, prefix_len, count)` — strict
+    alignment validation (refuses misaligned bases up front so the
+    operator sees the typo).
+  - `build_route_inject_commands(prefixes, dev, gateway, vrf_table)`
+    and `build_route_clear_commands(...)` — pure command-list builders.
+    Clear deliberately omits `via` (kernel matches by prefix + table
+    on delete).
+  - `inject_type5(...)` and `clear_type5(...)` — same shape as the
+    Type-2 entry points; injectable `run` for tests.
+  - Registry now tags every record with ``kind`` (``"type2"`` |
+    ``"type5"``). `clear_type2` defensively refuses a type-5 record
+    (and vice versa) and puts it back so the right cleaner can find
+    it — protects against the wrong cleaner building wrong commands
+    and leaking kernel state.
+  - `list_active_injections` returns ``kind`` + protocol-specific
+    summary fields, plus a cross-kind ``iface``/``count`` alias so the
+    v0.2.63 GUI table renders type-5 rows cleanly without changes.
+- **`run_tgen_server.py`** — two new operator-gated endpoints:
+  - ``POST /api/evpn/type5/inject``
+  - ``POST /api/evpn/type5/clear``
+  The existing ``GET /api/evpn/type2/list`` already returns both
+  kinds (it's the unified list).
+
+### Verified — 15 new tests, full suite 246 passing
+`tests/test_evpn_type5_inject.py`:
+- Prefix range arithmetic: /24 across octet boundary; /28 step of 16;
+  zero count → empty; misaligned base raises; out-of-range prefix_len
+  raises (1..32).
+- Command-list builders: minimal `ip route add`; with-gateway-and-VRF
+  flag passthrough; clear omits `via` and keeps `table`; clear omits
+  `dev` when None.
+- `inject_type5`: one command per prefix; gateway/vrf threaded
+  through; partial failure surfaces per-command errors; zero count
+  raises.
+- `clear_type5`: drops record even when kernel "no such route" errors;
+  unknown id returns warning not 500.
+- Cross-kind safety: `list_active_injections` includes both kinds with
+  a stable alias; `clear_type2` refuses a type-5 record (leaves it
+  registered for the right cleaner); `clear_type5` refuses a type-2
+  record symmetrically.
+
+### Notes
+- Server-only addition; the existing Type-2 endpoints + GUI are
+  unchanged (no client release needed yet). The v0.2.63 inject dialog
+  will render type-5 rows in the Active-injections table via the
+  cross-kind alias today — a future slice adds a Type-5 inject form.
+
 ## [0.2.65] - 2026-05-30
 
 **SR-MPLS label-stack GUI field** — completes 0.2.64. The backend

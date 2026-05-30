@@ -202,6 +202,7 @@ def inject_type2(
 
     inject_id = str(uuid.uuid4())
     record = {
+        "kind": "type2",
         "iface": iface,
         "l3_iface": l3_iface,
         "remote_vtep_ip": remote_vtep_ip,
@@ -237,6 +238,17 @@ def clear_type2(
                 "failed_count": 0, "errors": [],
                 "warning": "unknown inject_id (already cleared or "
                            "server restarted)"}
+    # 0.2.66: the registry now mixes kinds (type2 + type5). Defensively
+    # refuse to clear a type-5 record with the type-2 cleaner — would
+    # build the wrong commands and leak the kernel state. Put it back
+    # so /api/evpn/type5/clear can pick it up.
+    if rec.get("kind") not in (None, "type2"):
+        with _INJ_LOCK:
+            _INJECTIONS[inject_id] = rec
+        return {"inject_id": inject_id, "ok_count": 0,
+                "failed_count": 0, "errors": [],
+                "warning": f"inject_id is a {rec['kind']} record — call "
+                           "the matching /api/evpn/{kind}/clear instead"}
     cmds = build_clear_commands(rec["iface"], rec["entries"], rec.get("l3_iface"))
     errors = []
     ok = 0
@@ -258,19 +270,246 @@ def clear_type2(
 
 def list_active_injections() -> List[dict]:
     """Lightweight snapshot of currently-registered injections —
-    powers a future /api/evpn/type2/list route + the GUI table."""
+    powers the /api/evpn/type2/list route + the GUI table.
+
+    Kind-aware as of 0.2.66: each entry carries ``kind`` (``"type2"``
+    or ``"type5"``) plus the protocol-specific summary fields. Old
+    type-2-only callers can keep keying off ``iface`` / ``count``
+    unchanged.
+    """
+    out = []
     with _INJ_LOCK:
-        return [
-            {"inject_id": iid, "iface": rec["iface"],
-             "l3_iface": rec.get("l3_iface"),
-             "remote_vtep_ip": rec.get("remote_vtep_ip"),
-             "count": len(rec["entries"])}
-            for iid, rec in _INJECTIONS.items()
-        ]
+        for iid, rec in _INJECTIONS.items():
+            kind = rec.get("kind", "type2")
+            if kind == "type5":
+                out.append({
+                    "inject_id": iid,
+                    "kind": "type5",
+                    "vrf_table": rec.get("vrf_table"),
+                    "dev": rec.get("dev"),
+                    "gateway": rec.get("gateway"),
+                    "count": len(rec.get("prefixes") or []),
+                    # Cross-kind convenience aliases so a single GUI
+                    # column can render either: iface ≈ dev, l3_iface
+                    # n/a. Keeps the v0.2.63 EVPN dialog table from
+                    # breaking when type-5 rows appear.
+                    "iface": rec.get("dev"),
+                    "l3_iface": None,
+                    "remote_vtep_ip": None,
+                })
+            else:
+                out.append({
+                    "inject_id": iid,
+                    "kind": "type2",
+                    "iface": rec.get("iface"),
+                    "l3_iface": rec.get("l3_iface"),
+                    "remote_vtep_ip": rec.get("remote_vtep_ip"),
+                    "count": len(rec.get("entries") or []),
+                })
+    return out
 
 
 def _reset_registry_for_tests():
     """Clear the in-process registry. Test-only — never call from
-    production code; an explicit clear_type2() is the right path."""
+    production code; an explicit clear_type{2,5}() is the right path."""
     with _INJ_LOCK:
         _INJECTIONS.clear()
+
+
+# ──────────────────────────────────────────────────────── Type-5 (0.2.66)
+# Type-5 = IP Prefix route. A VTEP (or a router with FRR's
+# `address-family l2vpn evpn` + `advertise ipv4 unicast`) advertises a
+# routed prefix into the EVPN address-family — common in EVPN-VXLAN
+# fabrics for inter-VRF routing. The kernel-side injection path is to
+# add the prefix to a VRF's routing table (so FRR/zebra picks it up
+# and BGP advertises). This module just builds + runs the `ip route
+# add/del` commands; the FRR-side `advertise ipv4 unicast` config is
+# assumed to already be in place.
+
+
+def generate_prefix_range_v4(base_prefix: str, prefix_len: int,
+                             count: int) -> List[str]:
+    """Return ``count`` consecutive IPv4 prefixes, each ``/prefix_len``,
+    starting at ``base_prefix`` (e.g. ``"10.100.0.0"``).
+
+    Each successive prefix is one host-block away — i.e. the network
+    address advances by ``2**(32-prefix_len)``. Useful for scaled EVPN
+    Type-5 tests: a hundred ``/24``s starting at ``10.100.0.0`` ->
+    ``10.100.0.0/24``, ``10.100.1.0/24``, …, ``10.100.99.0/24``.
+    """
+    if count <= 0:
+        return []
+    if not 1 <= int(prefix_len) <= 32:
+        raise ValueError(f"prefix_len must be 1..32, got {prefix_len!r}")
+    step = 1 << (32 - int(prefix_len))
+    start = int(ipaddress.IPv4Address(base_prefix))
+    if start % step != 0:
+        raise ValueError(
+            f"base_prefix {base_prefix!r} is not aligned to /{prefix_len} "
+            f"boundary (off by {start % step} addresses)"
+        )
+    return [
+        f"{ipaddress.IPv4Address(start + i * step)}/{prefix_len}"
+        for i in range(count)
+    ]
+
+
+def build_route_inject_commands(
+    prefixes: Sequence[str],
+    dev: str,
+    gateway: Optional[str] = None,
+    vrf_table: Optional[int] = None,
+) -> List[List[str]]:
+    """One ``ip route add`` per prefix.
+
+    * ``gateway`` (when set) becomes ``via <gateway>`` — common when
+      the prefix sits behind a remote next-hop; omit for directly-
+      attached prefixes.
+    * ``vrf_table`` (when set) appends ``table <id>`` — required when
+      the FRR VRF maps to a kernel routing table other than ``main``.
+    """
+    cmds: List[List[str]] = []
+    for pfx in prefixes:
+        argv = ["ip", "route", "add", pfx]
+        if gateway:
+            argv.extend(["via", gateway])
+        argv.extend(["dev", dev])
+        if vrf_table is not None:
+            argv.extend(["table", str(int(vrf_table))])
+        cmds.append(argv)
+    return cmds
+
+
+def build_route_clear_commands(
+    prefixes: Sequence[str],
+    dev: Optional[str] = None,
+    vrf_table: Optional[int] = None,
+) -> List[List[str]]:
+    """One ``ip route del`` per prefix. ``dev`` is optional on delete —
+    the kernel matches by prefix + table; ``via`` is intentionally NOT
+    included (kernel matches without it). ``vrf_table`` (when set)
+    appends ``table <id>`` so the right table's route is removed."""
+    cmds: List[List[str]] = []
+    for pfx in prefixes:
+        argv = ["ip", "route", "del", pfx]
+        if dev:
+            argv.extend(["dev", dev])
+        if vrf_table is not None:
+            argv.extend(["table", str(int(vrf_table))])
+        cmds.append(argv)
+    return cmds
+
+
+def inject_type5(
+    dev: str,
+    base_prefix: str,
+    prefix_len: int,
+    count: int,
+    gateway: Optional[str] = None,
+    vrf_table: Optional[int] = None,
+    run: Callable[[List[str]], subprocess.CompletedProcess] = _default_run,
+) -> dict:
+    """Inject ``count`` consecutive IP prefixes as kernel routes.
+
+    Counterpart of :func:`inject_type2` for EVPN Type-5. Returns the
+    same-shaped result dict (``inject_id``, ``ok_count``, ``failed_count``,
+    ``errors``, plus the generated ``prefixes`` list and the request
+    fields echoed back).
+
+    All validation lives in :func:`generate_prefix_range_v4` —
+    misaligned ``base_prefix`` or out-of-range ``prefix_len`` raise
+    ``ValueError`` (the Flask route returns 400).
+    """
+    if count <= 0:
+        raise ValueError("count must be > 0")
+    prefixes = generate_prefix_range_v4(base_prefix, prefix_len, count)
+    cmds = build_route_inject_commands(prefixes, dev, gateway, vrf_table)
+
+    errors = []
+    ok = 0
+    for argv in cmds:
+        try:
+            res = run(argv)
+            if res.returncode != 0:
+                errors.append({
+                    "cmd": argv,
+                    "returncode": res.returncode,
+                    "stderr": (res.stderr or "")[:500],
+                })
+            else:
+                ok += 1
+        except Exception as exc:
+            errors.append({
+                "cmd": argv,
+                "returncode": -1,
+                "stderr": f"{type(exc).__name__}: {exc}"[:500],
+            })
+
+    inject_id = str(uuid.uuid4())
+    record = {
+        "kind": "type5",
+        "dev": dev,
+        "gateway": gateway,
+        "vrf_table": vrf_table,
+        "prefixes": prefixes,
+    }
+    with _INJ_LOCK:
+        _INJECTIONS[inject_id] = record
+    return {
+        "inject_id": inject_id,
+        "kind": "type5",
+        "dev": dev,
+        "count": count,
+        "ok_count": ok,
+        "failed_count": len(errors),
+        "prefixes": list(prefixes),
+        "errors": errors,
+    }
+
+
+def clear_type5(
+    inject_id: str,
+    run: Callable[[List[str]], subprocess.CompletedProcess] = _default_run,
+) -> dict:
+    """Remove every prefix from a previous :func:`inject_type5` call.
+
+    Same best-effort contract as :func:`clear_type2`: kernel "no such
+    route" errors are surfaced under ``errors`` but the call succeeds
+    and the in-process record is dropped. Refuses to clear a type-2
+    record (puts it back) so the caller can route through the right
+    cleaner."""
+    with _INJ_LOCK:
+        rec = _INJECTIONS.pop(inject_id, None)
+    if rec is None:
+        return {"inject_id": inject_id, "ok_count": 0,
+                "failed_count": 0, "errors": [],
+                "warning": "unknown inject_id (already cleared or "
+                           "server restarted)"}
+    if rec.get("kind") != "type5":
+        with _INJ_LOCK:
+            _INJECTIONS[inject_id] = rec
+        return {"inject_id": inject_id, "ok_count": 0,
+                "failed_count": 0, "errors": [],
+                "warning": f"inject_id is a {rec.get('kind', 'type2')} "
+                           "record — call /api/evpn/type2/clear instead"}
+    cmds = build_route_clear_commands(
+        rec.get("prefixes") or [],
+        dev=rec.get("dev"),
+        vrf_table=rec.get("vrf_table"),
+    )
+    errors = []
+    ok = 0
+    for argv in cmds:
+        try:
+            res = run(argv)
+            if res.returncode != 0:
+                errors.append({"cmd": argv,
+                               "returncode": res.returncode,
+                               "stderr": (res.stderr or "")[:500]})
+            else:
+                ok += 1
+        except Exception as exc:
+            errors.append({"cmd": argv, "returncode": -1,
+                           "stderr": f"{type(exc).__name__}: {exc}"[:500]})
+    return {"inject_id": inject_id, "ok_count": ok,
+            "failed_count": len(errors), "errors": errors}

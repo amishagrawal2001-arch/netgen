@@ -16181,6 +16181,77 @@ def evpn_type2_list():
     return jsonify({"injections": list_active_injections()})
 
 
+# ─────────────────────────────────────────────────────────── Type-5 (0.2.66)
+# Type-5 = IP Prefix route. FRR's `address-family l2vpn evpn` with
+# `advertise ipv4 unicast` (in the VRF's address-family) picks up
+# kernel routes in that VRF's table and advertises them as EVPN
+# Type-5. We inject the prefixes; FRR does the BGP advertisement.
+
+
+@app.route("/api/evpn/type5/inject", methods=["POST"])
+@require_role("operator")
+def evpn_type5_inject():
+    """Inject N consecutive IPv4 prefixes as kernel routes so FRR
+    advertises them as EVPN Type-5.
+
+    JSON body:
+      ``{"dev": "eth0", "base_prefix": "10.100.0.0", "prefix_len": 24,
+         "count": 100, "gateway": "192.168.1.1" (optional),
+         "vrf_table": 1001 (optional — kernel routing-table id for the
+         FRR VRF)}``
+
+    Returns ``inject_id`` (use with /clear) + per-route success counts.
+    """
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+    except Exception as exc:
+        return jsonify({"error": f"bad JSON: {exc}"}), 400
+    dev = (body.get("dev") or "").strip()
+    base_prefix = (body.get("base_prefix") or "").strip()
+    prefix_len = body.get("prefix_len")
+    count = body.get("count", 0)
+    if not dev or not base_prefix or not isinstance(prefix_len, int) \
+            or not isinstance(count, int) or count <= 0:
+        return jsonify({"error": "missing/invalid dev, base_prefix, "
+                                  "prefix_len, or count"}), 400
+    try:
+        from utils.evpn_inject import inject_type5
+        result = inject_type5(
+            dev=dev,
+            base_prefix=base_prefix,
+            prefix_len=prefix_len,
+            count=count,
+            gateway=(body.get("gateway") or None),
+            vrf_table=body.get("vrf_table") if isinstance(
+                body.get("vrf_table"), int) else None,
+        )
+    except ValueError as ve:
+        return jsonify({"error": str(ve)}), 400
+    except Exception as exc:
+        logging.error(f"[EVPN TYPE-5 INJECT] failed: {exc}")
+        return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
+    return jsonify(result)
+
+
+@app.route("/api/evpn/type5/clear", methods=["POST"])
+@require_role("operator")
+def evpn_type5_clear():
+    """Undo a previous /api/evpn/type5/inject by inject_id."""
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+    except Exception as exc:
+        return jsonify({"error": f"bad JSON: {exc}"}), 400
+    inject_id = (body.get("inject_id") or "").strip()
+    if not inject_id:
+        return jsonify({"error": "missing inject_id"}), 400
+    try:
+        from utils.evpn_inject import clear_type5
+        return jsonify(clear_type5(inject_id))
+    except Exception as exc:
+        logging.error(f"[EVPN TYPE-5 CLEAR] failed: {exc}")
+        return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
+
+
 # =============================================================================
 # One-way latency — server-side LatencySampler manager
 # =============================================================================
