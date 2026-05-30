@@ -16253,6 +16253,58 @@ def evpn_type5_clear():
 
 
 # =============================================================================
+# Preflight checks — 0.2.68
+# =============================================================================
+# Pre-Apply sanity report. Reads every device from the device database
+# and runs a set of pure-function checks (see utils/preflight.py). The
+# Apply path STILL runs even if there are findings — this is a heads-
+# up surface, not a gate. The GUI integration (a yellow/red bar at the
+# top of the Devices tab) lands in a follow-up slice; the endpoint
+# here is also scriptable today.
+
+
+@app.route("/api/preflight/check", methods=["GET"])
+@require_role("viewer")
+def preflight_check():
+    """Run every preflight check against every device in the local DB.
+
+    Returns the aggregated report shape `utils.preflight.check_all_devices`
+    produces: a summary count, the flat findings list, and a per-device
+    grouping for the GUI table. Empty deployment → all-zero summary.
+    """
+    try:
+        from utils.preflight import check_all_devices
+    except Exception as exc:
+        return jsonify({"error": f"preflight import failed: {exc}"}), 500
+
+    devices: list = []
+    # Pull devices from the same DB the rest of the server uses. The
+    # codebase has a few code paths for this; try the most common
+    # helpers in order, falling back to an empty list so the endpoint
+    # never 500s just because the device store is empty/uninit.
+    try:
+        from utils.device_database import get_all_devices
+        rows = get_all_devices() or []
+        # get_all_devices may return rows keyed by interface; flatten
+        # into a single list because the check helpers want individual
+        # device dicts.
+        if isinstance(rows, dict):
+            for entries in rows.values():
+                if isinstance(entries, list):
+                    devices.extend(entries)
+        elif isinstance(rows, list):
+            devices.extend(rows)
+    except Exception as exc:
+        logging.debug(f"[PREFLIGHT] could not read device DB: {exc}")
+
+    try:
+        return jsonify(check_all_devices(devices))
+    except Exception as exc:
+        logging.error(f"[PREFLIGHT] check failed: {exc}")
+        return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
+
+
+# =============================================================================
 # One-way latency — server-side LatencySampler manager
 # =============================================================================
 # Streams started with enable_timestamps=true embed an NLAT header at the

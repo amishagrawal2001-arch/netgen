@@ -2,6 +2,59 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.68] - 2026-05-30
+
+**Preflight checks** — surface common bad-config shapes BEFORE Apply
+so the operator doesn't debug failures after the round-trip. Backend
+only this release; GUI integration (a bar at the top of the Devices
+tab) lands in 0.2.69.
+
+### Findings caught today
+The codebase had log lines for several of these (e.g.
+``utils/bgp.py:1473`` logs ``"VXLAN config found but missing required
+fields"``); they're now visible BEFORE the Apply round-trip:
+
+  * ``BGP_NO_REMOTE_ASN`` (error) — BGP protocol enabled but
+    ``bgp_config.bgp_remote_asn`` is empty. No session will form.
+  * ``BGP_NO_LOOPBACK`` (warning) — BGP enabled but Loopback IPv4 is
+    empty. FRR's router-id falls back to a transient interface
+    address; works, but brittle.
+  * ``VXLAN_MISSING_FIELDS`` (error) — vxlan_config tunnel missing
+    one or more of vni / local_ip / remote_ip. FRR EVPN will skip it.
+  * ``VXLAN_EMPTY`` (warning) — vxlan_config present but no usable
+    tunnels.
+  * ``OSPF_NO_AREA`` / ``ISIS_NO_AREA`` (warning) — adjacency won't
+    form. Also catches the IS-IS-monitor-auto-stop case from
+    ``utils/devices_tab_isis.py``'s ``has_real_isis_config``.
+  * ``DUPLICATE_IPV4`` (error) — cross-device check. Same IPv4 on two
+    devices in the deployment wedges forwarding and flaps ARP.
+
+### What changed
+- **`utils/preflight.py`** (new): every check is a pure function
+  taking a device dict (+ all-devices list for cross-device checks)
+  and returning ``List[Finding]``. Findings carry ``level``, ``code``,
+  ``message``, ``device_name``, ``interface`` — stable shape the GUI
+  can render and tests pin. ``check_all_devices(devices)`` aggregates
+  into ``{summary: {error,warning,ok,total}, findings: [...],
+  by_device: {name: [...]}}`` ready for ``jsonify``.
+- **`run_tgen_server.py`**: new ``GET /api/preflight/check``
+  (viewer-gated) — reads the local device DB and returns the
+  aggregated report. Defensive: empty DB → all-zero summary, never
+  500s.
+
+### Verified — 26 new tests, full suite 284 passing
+Per-check coverage (happy / sad / skip-when-protocol-absent) + the
+cross-device case (unique / two-way duplicates / CIDR-stripped
+match / both-empty doesn't collide). Aggregator: groups by device,
+counts levels right, runs cross-device checks, handles empty
+deployment, and the finding shape is pinned for the GUI.
+
+### Notes
+- Operator-friendly: this is a **heads-up surface**, NOT a gate.
+  Apply still runs whether there are findings or not; the GUI just
+  shows them so the operator can choose to address them first.
+- Adding new checks is one-function + one test — purely additive.
+
 ## [0.2.67] - 2026-05-30
 
 **EVPN Type-5 inject GUI** — completes v0.2.66. The dialog now has a
