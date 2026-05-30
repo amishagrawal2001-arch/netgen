@@ -182,6 +182,77 @@ def test_igmp_zero_group_accepted_as_general_query(qapp, monkeypatch):
     assert p["body"]["group"] == "0.0.0.0"
 
 
+def test_vrrp_auth_fields_present_and_enabled_for_v2(qapp, monkeypatch):
+    """v0.2.83: VRRPv2 dialog gains auth_type + auth_data fields,
+    enabled when version=v2."""
+    parent, dlg, captured = _open(qapp, monkeypatch)
+    _select(dlg, "vrrp")
+    # Switch to v2 explicitly.
+    for i in range(dlg._vrrp_version.count()):
+        if dlg._vrrp_version.itemData(i) == 2:
+            dlg._vrrp_version.setCurrentIndex(i)
+            break
+    assert hasattr(dlg, "_vrrp_auth_type")
+    assert hasattr(dlg, "_vrrp_auth_data")
+    assert dlg._vrrp_auth_type.isEnabled()
+    assert dlg._vrrp_auth_data.isEnabled()
+    # All 3 RFC 3768 §5.3.6 codes present.
+    codes = [dlg._vrrp_auth_type.itemData(i)
+             for i in range(dlg._vrrp_auth_type.count())]
+    assert codes == [0, 1, 2]
+
+
+def test_vrrp_auth_fields_disabled_for_v3(qapp, monkeypatch):
+    """RFC 5798 §5.1 removed authentication from VRRPv3 — the dialog
+    fields must disable when v3 is picked, with a tooltip naming
+    the RFC."""
+    parent, dlg, captured = _open(qapp, monkeypatch)
+    _select(dlg, "vrrp")
+    # v3 is the default; explicit pick to be safe.
+    for i in range(dlg._vrrp_version.count()):
+        if dlg._vrrp_version.itemData(i) == 3:
+            dlg._vrrp_version.setCurrentIndex(i)
+            break
+    assert not dlg._vrrp_auth_type.isEnabled()
+    assert not dlg._vrrp_auth_data.isEnabled()
+    tip = dlg._vrrp_auth_type.toolTip()
+    assert "RFC 5798" in tip or "v3" in tip.lower()
+
+
+def test_vrrp_auth_data_truncated_to_8_chars_via_maxlength(qapp, monkeypatch):
+    """The auth_data field is bounded to 8 chars by QLineEdit's
+    maxLength so the operator can't enter more than the RFC allows."""
+    parent, dlg, captured = _open(qapp, monkeypatch)
+    _select(dlg, "vrrp")
+    assert dlg._vrrp_auth_data.maxLength() == 8
+
+
+def test_vrrp_v2_payload_carries_auth_fields(qapp, monkeypatch):
+    """End-to-end through _on_accept: pick v2 + auth_type=1 +
+    auth_data='secret', confirm both keys reach the body."""
+    parent, dlg, captured = _open(qapp, monkeypatch)
+    _select(dlg, "vrrp")
+    for i in range(dlg._vrrp_version.count()):
+        if dlg._vrrp_version.itemData(i) == 2:
+            dlg._vrrp_version.setCurrentIndex(i)
+            break
+    # Set IPv4 vips so v2 doesn't trip the IPv6 guard.
+    dlg._vrrp_virtual_ips.setText("192.168.1.254")
+    dlg._vrrp_src_ip.setText("10.0.0.1")
+    dlg._vrrp_src_mac.setText("00:00:5e:00:01:01")
+    # Pick Simple Text Password.
+    for i in range(dlg._vrrp_auth_type.count()):
+        if dlg._vrrp_auth_type.itemData(i) == 1:
+            dlg._vrrp_auth_type.setCurrentIndex(i)
+            break
+    dlg._vrrp_auth_data.setText("secret")
+    dlg._on_accept()
+    p = dlg.accepted_payload()
+    assert p is not None
+    assert p["body"]["auth_type"] == 1
+    assert p["body"]["auth_data"] == "secret"
+
+
 def test_igmp_version_combo_offers_v1(qapp, monkeypatch):
     """v0.2.82: IGMPv1 (RFC 1112) is now available alongside v2/v3."""
     parent, dlg, captured = _open(qapp, monkeypatch)

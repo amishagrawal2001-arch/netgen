@@ -383,6 +383,54 @@ class _L2ConfigDialog(QDialog):
         self._vrrp_interval.setValue(1.0)
         self._vrrp_interval.setSuffix(" s")
 
+        # v0.2.83: VRRPv2 authentication (RFC 3768 §5.3.6). VRRPv3
+        # (RFC 5798 §5.1) deprecated auth; the fields disable for v3
+        # with a tooltip explaining why.
+        self._vrrp_auth_type = QComboBox()
+        self._vrrp_auth_type.addItem("0 — None (default)", 0)
+        self._vrrp_auth_type.addItem("1 — Simple Text Password", 1)
+        self._vrrp_auth_type.addItem("2 — IP Auth Header (deprecated)", 2)
+        self._vrrp_auth_type.setToolTip(
+            "VRRPv2 authentication type (RFC 3768 §5.3.6).\n"
+            "  • 0: No Authentication — the common case.\n"
+            "  • 1: Simple Text Password — auth_data filled into the\n"
+            "    8-byte auth1/auth2 fields (NUL-padded if shorter).\n"
+            "  • 2: IP Authentication Header — type byte only; the AH\n"
+            "    payload itself is IPsec's responsibility.\n"
+            "\n"
+            "VRRPv3 (RFC 5798 §5.1) removed authentication from the\n"
+            "protocol. When Version = v3 these fields are disabled."
+        )
+        self._vrrp_auth_data = QLineEdit("")
+        self._vrrp_auth_data.setPlaceholderText(
+            "up to 8 ASCII chars; padded with NUL"
+        )
+        self._vrrp_auth_data.setMaxLength(8)
+        self._vrrp_auth_data.setToolTip(
+            "Simple Text Password for VRRPv2 auth_type=1. Truncated to "
+            "8 bytes; right-padded with NUL bytes."
+        )
+
+        # Wire the version combo so v3 disables both auth fields with
+        # a tooltip explaining the RFC 5798 §5.1 deprecation.
+        def _on_version_changed():
+            is_v2 = self._vrrp_version.currentData() == 2
+            self._vrrp_auth_type.setEnabled(is_v2)
+            self._vrrp_auth_data.setEnabled(is_v2)
+            if not is_v2:
+                # Keep the existing tooltip but prepend an explanation
+                # the operator sees on hover.
+                disabled_tip = (
+                    "Disabled because VRRPv3 (RFC 5798 §5.1) removed "
+                    "authentication from the protocol. Switch Version to "
+                    "v2 to use VRRPv2 auth fields."
+                )
+                self._vrrp_auth_type.setToolTip(disabled_tip)
+                self._vrrp_auth_data.setToolTip(disabled_tip)
+        self._vrrp_version.currentIndexChanged.connect(
+            lambda _i: _on_version_changed()
+        )
+
         f.addRow("Version:", self._vrrp_version)
         f.addRow("Family:", self._vrrp_family)
         f.addRow("VRID:", self._vrrp_vrid)
@@ -391,6 +439,10 @@ class _L2ConfigDialog(QDialog):
         f.addRow("Source IP:", self._vrrp_src_ip)
         f.addRow("Source MAC:", self._vrrp_src_mac)
         f.addRow("Advertisement interval:", self._vrrp_interval)
+        f.addRow("Auth type:", self._vrrp_auth_type)
+        f.addRow("Auth data:", self._vrrp_auth_data)
+        # Apply the initial enabled state based on the default version.
+        _on_version_changed()
         return w
 
     def _build_igmp_panel(self) -> QWidget:
@@ -706,6 +758,10 @@ class _L2ConfigDialog(QDialog):
                 "src_ip": src_ip,
                 "src_mac": src_mac,
                 "interval_s": self._vrrp_interval.value(),
+                # v0.2.83: VRRPv2 auth — backend silently ignores when
+                # version=3 so it's safe to always include.
+                "auth_type": self._vrrp_auth_type.currentData(),
+                "auth_data": self._vrrp_auth_data.text(),
             })
         elif proto == "igmp":
             group = self._igmp_group.text().strip()

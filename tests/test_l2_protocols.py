@@ -108,6 +108,68 @@ def test_vrrp_v2_uses_separate_packet_class():
     assert len(bytes(frame)) >= 54
 
 
+def test_vrrpv2_auth_type_simple_packs_password_into_auth1_auth2():
+    """RFC 3768 §5.3.6 auth_type=1 (Simple Text Password): the
+    password's 8 bytes go into the 4-byte auth1 + 4-byte auth2 fields.
+    Test the round-trip of "secret" → 73:65:63:72:65:74:00:00 split
+    across the two fields (NUL-padded to 8 bytes)."""
+    from scapy.layers.l2 import Ether
+    from scapy.layers.inet import IP
+    from scapy.layers.vrrp import VRRP
+    # "secret" + NUL pad = b"secret\x00\x00" = 8 bytes
+    auth1_int = int.from_bytes(b"secr", "big")
+    auth2_int = int.from_bytes(b"et\x00\x00", "big")
+    frame = (
+        Ether(src="00:11:22:33:44:03", dst="01:00:5e:00:00:12")
+        / IP(src="10.0.0.1", dst="224.0.0.18", ttl=255, proto=112)
+        / VRRP(version=2, vrid=1, priority=100,
+               addrlist=["192.168.1.254"], adv=1,
+               authtype=1, auth1=auth1_int, auth2=auth2_int)
+    )
+    parsed = frame[VRRP]
+    assert parsed.authtype == 1
+    # Re-extract password bytes from auth1+auth2.
+    pw_bytes = (parsed.auth1.to_bytes(4, "big")
+                + parsed.auth2.to_bytes(4, "big"))
+    assert pw_bytes == b"secret\x00\x00"
+
+
+def test_vrrpv2_auth_type_none_zeroes_auth_fields():
+    """auth_type=0 (None) is the default and matches the common case
+    — both auth1 and auth2 must be zero on the wire."""
+    from scapy.layers.l2 import Ether
+    from scapy.layers.inet import IP
+    from scapy.layers.vrrp import VRRP
+    frame = (
+        Ether(src="00:11:22:33:44:03", dst="01:00:5e:00:00:12")
+        / IP(src="10.0.0.1", dst="224.0.0.18", ttl=255, proto=112)
+        / VRRP(version=2, vrid=1, priority=100,
+               addrlist=["192.168.1.254"], adv=1,
+               authtype=0, auth1=0, auth2=0)
+    )
+    parsed = frame[VRRP]
+    assert parsed.authtype == 0
+    assert parsed.auth1 == 0 and parsed.auth2 == 0
+
+
+def test_vrrpv2_auth_type_ipah_sets_type_byte_only():
+    """auth_type=2 (IPAH) is RFC-defined but the AH payload is
+    IPsec's responsibility, not VRRP's. We set the type byte and
+    leave the auth fields as the operator's data — no implicit zero."""
+    from scapy.layers.l2 import Ether
+    from scapy.layers.inet import IP
+    from scapy.layers.vrrp import VRRP
+    frame = (
+        Ether(src="00:11:22:33:44:03", dst="01:00:5e:00:00:12")
+        / IP(src="10.0.0.1", dst="224.0.0.18", ttl=255, proto=112)
+        / VRRP(version=2, vrid=1, priority=100,
+               addrlist=["192.168.1.254"], adv=1,
+               authtype=2, auth1=0, auth2=0)
+    )
+    parsed = frame[VRRP]
+    assert parsed.authtype == 2
+
+
 def test_igmpv2_membership_report_target_is_group():
     """RFC 2236 §3: a v2 Membership Report (type 0x16) has its IP dst
     SET TO the group being reported. TTL is 1. Without those, the

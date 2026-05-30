@@ -428,6 +428,8 @@ def start_vrrp(
     src_ip: str = "10.0.0.1",
     src_mac: Optional[str] = None,   # None/"" → derive the VRRP virtual MAC
     family: str = "ipv4",   # "ipv4" or "ipv6" (v3 only)
+    auth_type: int = 0,    # RFC 3768 §5.3.6: 0=None, 1=Simple, 2=IPAH (v2 only)
+    auth_data: str = "",   # up to 8 ASCII bytes for type=1; NUL-padded
     vlan_id: Optional[int] = None,   # 802.1Q inner tag; None/0 = untagged
     vlan_pcp: int = 0,               # 802.1p inner priority (0-7)
     outer_vlan_id: Optional[int] = None,  # 802.1ad outer (S-VLAN); None/0 = single-tagged
@@ -442,11 +444,35 @@ def start_vrrp(
     `src_mac` defaults to the RFC 5798 virtual router MAC for the VRID
     (00:00:5e:00:01:{VRID} for IPv4) — what a real master uses. Pass an
     explicit MAC only to override that behaviour.
+
+    ``auth_type`` / ``auth_data`` apply ONLY to ``version=2`` (RFC 3768
+    §5.3.6). Values:
+
+    * 0 — No Authentication (default; matches the common case).
+    * 1 — Simple Text Password. ``auth_data`` is packed into the 8-byte
+      ``auth1+auth2`` field, NUL-padded if shorter, truncated if longer.
+      Useful for lab tests of switch / peer behaviour when an auth-type
+      or password mismatch should reject the advertisement.
+    * 2 — IP Authentication Header (RFC 2402). Spec-defined but rarely
+      used in practice; we wire the type byte but don't compute the AH
+      payload (operators wanting AH should use IPsec end-to-end).
+
+    For ``version=3`` (RFC 5798 §5.1) authentication has been removed
+    from the protocol; these kwargs are silently ignored.
     """
     sid = str(uuid.uuid4())
     virtual_ips = virtual_ips or ["192.168.1.254"]
     # Default to the virtual router MAC unless the caller forced one.
     eff_src_mac = (src_mac or "").strip() or _vrrp_virtual_mac(vrid, family)
+    # v0.2.83: pack auth_data into the two 4-byte VRRPv2 auth fields.
+    # NUL-pad if shorter than 8 bytes; truncate if longer. Encoded as
+    # network-byte-order 32-bit integers since scapy's auth1/auth2
+    # are IntField (4 bytes each).
+    auth_bytes = (auth_data or "").encode("ascii", errors="replace")[:8]
+    auth_bytes = auth_bytes.ljust(8, b"\x00")
+    auth1_int = int.from_bytes(auth_bytes[:4], "big")
+    auth2_int = int.from_bytes(auth_bytes[4:8], "big")
+
     config = {
         "version": int(version),
         "vrid": int(vrid),
@@ -456,9 +482,19 @@ def start_vrrp(
         "duration_s": duration_s,
         "src_ip": src_ip, "src_mac": eff_src_mac,
         "family": family.lower(),
+        "auth_type": int(auth_type),
+        "auth_data": (auth_data or ""),  # store the operator's input
         "vlan_id": vlan_id, "vlan_pcp": int(vlan_pcp),
         "outer_vlan_id": outer_vlan_id, "outer_vlan_pcp": int(outer_vlan_pcp),
     }
+    # Diagnostic: auth_type set with v3 is operator-confusable. Log so
+    # the trail shows the v3 session ran auth-less by spec, not by bug.
+    if version == 3 and int(auth_type) != 0:
+        logger.debug(
+            "[L2 VRRP] auth_type=%d ignored — VRRPv3 has no authentication "
+            "(RFC 5798 §5.1 deprecated it; use IPsec at the IP layer)",
+            auth_type,
+        )
     sess = _Session(session_id=sid, protocol="vrrp", iface=iface, config=config)
 
     def _factory():
@@ -483,6 +519,11 @@ def start_vrrp(
             )
         ip_layer = IP(src=src_ip, dst="224.0.0.18", ttl=255, proto=112)
         if version == 2:
+            # v0.2.83: RFC 3768 §5.3.6 authentication. auth_type 0 (None)
+            # zeroes auth1+auth2 — what scapy does anyway. auth_type 1
+            # (Simple Text Password) stuffs the 8 packed bytes; type 2
+            # (IPAH) just sets the type byte (the AH payload itself is
+            # IPsec's responsibility, not VRRP's).
             return (
                 _l2_hdr(eff_src_mac, "01:00:5e:00:00:12", 0x0800, vlan_id, vlan_pcp,
                     outer_vlan_id, outer_vlan_pcp)
@@ -490,6 +531,9 @@ def start_vrrp(
                 / VRRP(
                     version=2, vrid=vrid, priority=priority,
                     addrlist=virtual_ips, adv=int(interval_s),
+                    authtype=int(auth_type),
+                    auth1=auth1_int,
+                    auth2=auth2_int,
                 )
             )
         return (

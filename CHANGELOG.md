@@ -2,6 +2,66 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.83] - 2026-05-30
+
+**VRRPv2 authentication (RFC 3768 §5.3.6)** — closes the second of
+three BLOCKER items from the v0.2.81 L2 audit. Operators testing
+peer behaviour around auth-type or password mismatches can now
+generate the frames from the GUI.
+
+### Why not VRRPv3 too?
+The audit asked for "VRRPv3 auth extension TLV (RFC 5798)" but on
+closer reading RFC 5798 §5.1 **removed authentication from the
+protocol entirely** — no auth field exists in v3 at all (the spec
+defers to IPsec at the IP layer). So this release wires v2 auth
+properly and surfaces v3's auth-less design correctly in the GUI
+(fields disabled with a tooltip naming the RFC).
+
+### What changed
+- **`utils/l2_protocols.py`** — `start_vrrp()` gains two kwargs:
+  - `auth_type: int = 0` — 0=None, 1=Simple Text Password, 2=IPAH.
+  - `auth_data: str = ""` — up to 8 ASCII bytes packed into the
+    `auth1` + `auth2` 4-byte fields (NUL-padded if shorter,
+    truncated if longer). Only honoured for version=2; ignored
+    with a debug log when version=3.
+  - When auth_type=2 (IPAH) the type byte is set but the AH
+    payload itself stays the operator's responsibility (IPsec
+    handles AH end-to-end; VRRP just carries the type indication).
+- **`widgets/l2_emulation_tab.py`** — VRRP panel gains:
+  - `Auth type:` QComboBox with the three RFC codes.
+  - `Auth data:` QLineEdit with `setMaxLength(8)` so the operator
+    can't enter more than the RFC allows.
+  - Both fields **disabled** when Version=v3 via a
+    `currentIndexChanged` signal on the version combo, with a
+    tooltip explaining RFC 5798 §5.1's removal of authentication.
+- **`server/l2_routes.py`** — `_PROTOCOL_FACTORIES["vrrp"]`
+  kwarg-allow-list gains `auth_type` + `auth_data`.
+
+### Tests
+- **`tests/test_l2_protocols.py`** — 3 new packet-shape tests:
+  - `test_vrrpv2_auth_type_simple_packs_password_into_auth1_auth2`
+    confirms "secret" round-trips through auth1+auth2 with correct
+    NUL padding.
+  - `test_vrrpv2_auth_type_none_zeroes_auth_fields`.
+  - `test_vrrpv2_auth_type_ipah_sets_type_byte_only`.
+- **`tests/test_l2_dialog_validation.py`** — 4 new dialog tests:
+  - `test_vrrp_auth_fields_present_and_enabled_for_v2` (all 3
+    codes available; enabled for v2).
+  - `test_vrrp_auth_fields_disabled_for_v3` (disabled + tooltip
+    cites RFC 5798).
+  - `test_vrrp_auth_data_truncated_to_8_chars_via_maxlength`.
+  - `test_vrrp_v2_payload_carries_auth_fields` end-to-end through
+    `_on_accept`.
+
+### Remaining from the v0.2.81 audit
+Only **PIM Join/Prune** (BLOCKER, marked roadmap) and the 4 POLISH
+items (frame preview, per-row Stop, sortable sessions, Last Error
+truncation) remain. PIM Join/Prune is the full PIM-SM state machine
+— a bigger lift than a single release.
+
+### Test count
+473 → 480 (+7).
+
 ## [0.2.82] - 2026-05-30
 
 **IGMPv1 (RFC 1112) support** — closes the first of the three

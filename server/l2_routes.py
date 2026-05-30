@@ -72,7 +72,11 @@ _PROTOCOL_FACTORIES = {
                                  "interval_s", "duration_s", "src_mac") + _VLAN_KEYS),
     "vrrp": ("start_vrrp",      ("version", "vrid", "priority",
                                  "virtual_ips", "interval_s", "duration_s",
-                                 "src_ip", "src_mac", "family") + _VLAN_KEYS),
+                                 "src_ip", "src_mac", "family",
+                                 # v0.2.83: VRRPv2 auth (RFC 3768 §5.3.6).
+                                 # Silently ignored when version=3 per
+                                 # RFC 5798 §5.1 (auth removed from v3).
+                                 "auth_type", "auth_data") + _VLAN_KEYS),
     "igmp": ("start_igmp",      ("version", "group", "type_code",
                                  "interval_s", "duration_s",
                                  "src_ip", "src_mac") + _VLAN_KEYS),
