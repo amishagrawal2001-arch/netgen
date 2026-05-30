@@ -2,6 +2,79 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.57] - 2026-05-29
+
+**Enhancement #2 of 4 — Incremental in-place updates for the Streams
+table.** Retires the entire bug class behind the v0.2.51 / .53 / .54 /
+.55 regressions by removing the cause: the periodic full table rebuild.
+
+### Insight
+Every column on the Streams table is *configuration* (Interface, Name,
+Enabled, Frame Type, sizes, L1/L2/L3/L4, VLAN, RX Port, Flow Tracking).
+The ONLY thing that periodically changes from a stats poll is the col-0
+**Status** icon. Yet the every-2 s stats poll was calling
+`_do_update_stream_table()` — a full `setRowCount(0)` + re-`setItem` of
+every cell of every row — purely to repaint that one icon. That
+overkill interacting with selection / inline edits / display-derived
+key lookups is what produced the four regressions.
+
+### What changed
+- **`traffic_client/server_section.py`**: new
+  `_refresh_stream_status_in_place()`. Iterates current rows,
+  identifies each by `stream_id` (stashed at `Qt.UserRole` on the Name
+  cell), and updates ONLY the col-0 Status cell when the underlying
+  status changes. Per-instance `_stream_status_pushed: {sid: color}`
+  cache skips no-op updates. Signals blocked during the update so an
+  itemChanged can't fire spuriously.
+- **`traffic_client/statistics_section.py`**: `fetch_and_update_statistics`
+  now calls `_refresh_stream_status_in_place()` instead of the full
+  `_do_update_stream_table()`. The wall of `_populating_table` flag
+  pokes around it is gone too.
+- Structural changes (add / edit / remove / apply / start / stop)
+  continue to call `_do_update_stream_table` from their own code paths —
+  that's the right time for a full rebuild. The TG-prune path
+  (`statistics_section.py:855`) also still rebuilds (a TG removal IS
+  structural).
+
+### What this kills
+- **No more selection wipe on every poll.**
+- **No more flicker every 2 s.**
+- **The display-derived key reconstruction loop runs only on structural
+  changes**, so the (port-cell-text vs. self.streams key) mismatch
+  *cannot* fire on the periodic path. The four shipped regressions
+  (Delete, Copy, Paste, Start All) would have been impossible.
+- **Inline editing is unconditionally safe** during the periodic refresh
+  because the in-place path touches only col 0 (not editable) and
+  blocks signals.
+
+### Verified
+4 new tests in `tests/test_client_stream_ops.py` (13 tests total in that
+file, 121 in the full suite):
+- `status_in_place_no_rebuild_no_selection_loss` — 5 consecutive
+  in-place refreshes leave row count, selection and the col-1/col-2
+  item Python objects unchanged.
+- `status_in_place_updates_changed_status_and_skips_unchanged` —
+  flipping one stream's status repaints its col-0 cell; the other row's
+  item is the same Python object (no churn); push-cache reflects the
+  change.
+- `status_in_place_does_not_close_open_editor` — editor on the Name cell
+  survives 3 in-place refreshes that change col-0 on the same row.
+- `status_in_place_handles_missing_or_pruned_streams` — row outliving
+  its stream entry doesn't crash; structural rebuild not triggered.
+
+Full suite: **121 passed**.
+
+### Next on the menu
+0.2.58+: stats / latency / reports — p50/p95/p99, RFC 2544 run,
+CSV/JSON export.
+
+### Notes
+- Client-only. No server or wire-format change. The same in-place
+  pattern can later be extended to the BGP/OSPF/IS-IS protocol tables
+  if they grow periodic refreshes that don't actually need a rebuild;
+  for now they remain rebuild-driven because their content (neighbor
+  state) genuinely changes.
+
 ## [0.2.56] - 2026-05-29
 
 **Enhancement #1 of 4 — Client GUI test coverage.** Lock the 4 recent

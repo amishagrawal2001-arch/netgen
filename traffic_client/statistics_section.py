@@ -1121,34 +1121,28 @@ class TrafficGenClientStatisticsSection():
         logger.debug(f"[DEBUG STREAM STATS] Calling update_stream_statistics_table with {len(all_stream_stats)} stream(s)")
         self.update_stream_statistics_table(all_stream_stats)
         
-        # Also refresh stream table to show updated statistics
-        # This ensures the stream table updates periodically along with traffic statistics
-        # Call _do_update_stream_table directly to bypass debouncing for periodic updates
-        if hasattr(self, "_do_update_stream_table"):
-            # Reset the populating flag to ensure updates can happen
-            if hasattr(self, "_populating_table") and self._populating_table:
-                # print(f"[STATS] Stream table was populating, resetting flag")
-                self._populating_table = False
-            # print(f"[STATS] Refreshing stream table from fetch_and_update_statistics() - calling _do_update_stream_table()")
-            # Call directly instead of using timer - the statistics update is already async
-            # This ensures the stream table updates every time statistics are fetched
-            try:
-                # Check if _populating_table is blocking us
-                if hasattr(self, "_populating_table") and self._populating_table:
-                    # print(f"[STATS WARNING] Stream table is already populating, skipping this update")
-                    pass
-                else:
-                    # print(f"[STATS] Calling _do_update_stream_table() now...")
-                    self._do_update_stream_table()
-                    # print(f"[STATS] _do_update_stream_table() completed")
-            except Exception as e:
-                logger.error(f"[STATS ERROR] Failed to update stream table: {e}")
-                import traceback
-                traceback.print_exc()
-        elif hasattr(self, "update_stream_table"):
-            from PyQt5.QtCore import QTimer
-            # print(f"[STATS] Refreshing stream table (fallback) from fetch_and_update_statistics()")
-            QTimer.singleShot(10, lambda: self.update_stream_table())
+        # Periodic refresh of the Streams table's Status column. The
+        # ONLY thing on this table that changes due to a stats poll is
+        # the col-0 Status icon — everything else is configuration.
+        # Previously this called _do_update_stream_table() (full
+        # setRowCount(0) + re-setItem of every cell), which interacted
+        # badly with selection / inline-editing / display-derived key
+        # lookups and produced the regression cascade fixed in
+        # 0.2.51/.53/.54/.55. Now we surgically repaint just the rows
+        # whose status changed, identified by stream_id — no rebuild,
+        # no key reconstruction. Structural changes (add / edit /
+        # remove / apply / start / stop) still call
+        # _do_update_stream_table from their own code paths.
+        try:
+            if hasattr(self, "_refresh_stream_status_in_place"):
+                self._refresh_stream_status_in_place()
+            elif hasattr(self, "update_stream_table"):
+                # Defensive fallback only if the in-place method is
+                # missing for some reason (mixin not loaded).
+                from PyQt5.QtCore import QTimer
+                QTimer.singleShot(10, lambda: self.update_stream_table())
+        except Exception as e:
+            logger.error(f"[STATS ERROR] Failed to refresh stream status: {e}")
 
         offline_servers = [s for s in self.server_interfaces if s.get("online") is False]
         # Reduced debug output to prevent UI spam

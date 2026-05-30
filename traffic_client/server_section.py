@@ -1063,6 +1063,100 @@ class TrafficGenClientServerSection():
                     pass
             # print(f"[STREAM TABLE] Completed _do_update_stream_table() - set _populating_table to False")
 
+    # ──────────────────────────────────────────────────────────────────
+    # Incremental in-place status refresh (0.2.57).
+    #
+    # The stream table's columns are all configuration (Interface, Name,
+    # Enabled, Frame Type, sizes, L1/L2/L3/L4, VLAN, RX Port, Flow
+    # Tracking). The ONLY thing that periodically changes due to a stats
+    # poll is the col-0 Status icon. Yet `_do_update_stream_table` was
+    # called from the every-2s stats poll, doing a full setRowCount(0) +
+    # re-setItem of every cell of every row just to repaint one icon.
+    # That full rebuild — interacting with selection / inline edit /
+    # display-derived key lookups — is what produced the four shipped
+    # regressions (Delete 0.2.51, Copy 0.2.53, Paste 0.2.54,
+    # Start-All 0.2.55).
+    #
+    # This method does the periodic refresh in place: it iterates current
+    # rows, identifies each row by the stream_id stashed at
+    # Qt.UserRole on the Name cell, and updates ONLY the col-0 Status
+    # cell when the underlying status changes. No setRowCount, no
+    # display-derived key reconstruction, no selection wipe, no
+    # interference with open editors. Structural changes
+    # (add/edit/remove/apply/start/stop) still flow through
+    # `_do_update_stream_table`.
+    #
+    # A per-instance `_stream_status_pushed: {stream_id: color}` cache
+    # avoids spurious setItem calls when nothing has changed.
+    # ──────────────────────────────────────────────────────────────────
+    _STATUS_TO_COLOR = {"running": "green", "rx_tracking": "blue"}
+    _COLOR_TO_LABEL = {"green": "Running", "blue": "Tracking RX", "red": "Stopped"}
+
+    def _refresh_stream_status_in_place(self):
+        """Repaint the col-0 Status icon for every row whose stream's
+        status has changed since the last push. No-op for unchanged rows.
+
+        Replaces the full-table rebuild the periodic stats poll used to
+        do. Safe to call while the user is interacting (selecting a row
+        or inline-editing a cell on another column).
+        """
+        table = getattr(self, "stream_table", None)
+        if table is None:
+            return
+
+        pushed = getattr(self, "_stream_status_pushed", None)
+        if pushed is None:
+            pushed = {}
+            self._stream_status_pushed = pushed
+
+        # Index streams by id once (avoid O(R * N_streams) scans).
+        by_sid = {}
+        for stream_list in getattr(self, "streams", {}).values():
+            for s in stream_list:
+                sid = s.get("stream_id")
+                if sid:
+                    by_sid[sid] = s
+
+        # Block itemChanged so any setItem below doesn't fire
+        # handle_inline_edit (col 0 isn't editable; this is belt-and-
+        # suspenders + matches the pattern in _do_update_stream_table).
+        was_blocked = table.signalsBlocked()
+        table.blockSignals(True)
+        try:
+            from utils.qicon_loader import status_dot_icon
+
+            for row in range(table.rowCount()):
+                name_item = table.item(row, 2)
+                if name_item is None:
+                    continue
+                sid = name_item.data(Qt.UserRole)
+                if not sid:
+                    continue
+                stream = by_sid.get(sid)
+                if stream is None:
+                    # Row exists for a stream no longer in self.streams —
+                    # leave it alone; a structural refresh will reconcile.
+                    continue
+                status = stream.get("status", "stopped")
+                color = self._STATUS_TO_COLOR.get(status, "red")
+                if pushed.get(sid) == color:
+                    continue   # nothing to do
+                try:
+                    item = QTableWidgetItem()
+                    item.setIcon(status_dot_icon(color, 14))
+                    item.setFlags(Qt.ItemIsEnabled)
+                    label = self._COLOR_TO_LABEL.get(color, "Stopped")
+                    item.setToolTip(label)
+                    item.setData(Qt.AccessibleTextRole, label)
+                    table.setItem(row, 0, item)
+                    pushed[sid] = color
+                except Exception as e:
+                    logger.warning(
+                        f"[STATUS-IN-PLACE] sid={sid} row={row} failed: {e}"
+                    )
+        finally:
+            table.blockSignals(was_blocked)
+
     def on_server_tree_selection_changed(self):
         if not hasattr(self, "main_window"):
             return

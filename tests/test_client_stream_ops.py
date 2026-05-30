@@ -256,6 +256,99 @@ def test_start_all_valid_ports_uses_stream_id_not_bare_iface(client_stub):
     assert fixed_unknown == []                          # fix outcome
 
 
+# ─────────────────── v0.2.57  Incremental in-place status refresh
+def test_status_in_place_no_rebuild_no_selection_loss(client_stub):
+    """The periodic stats poll's new path must NOT rebuild the table or
+    drop selection — that's the entire reason it exists (replaces the
+    full _do_update_stream_table call that produced the bug cascade)."""
+    s = client_stub(streams=_two_streams_one_port())
+    s._do_update_stream_table()
+    sm = s.stream_table.selectionModel()
+    sm.select(s.stream_table.model().index(1, 0),
+              QItemSelectionModel.Select | QItemSelectionModel.Rows)
+
+    # Cache the row items so we can verify col 1/2 items weren't replaced.
+    name_item_before = s.stream_table.item(1, 2)
+    iface_item_before = s.stream_table.item(1, 1)
+
+    # Fire 5 in-place refreshes — simulates the 2s poll firing repeatedly.
+    for _ in range(5):
+        s._refresh_stream_status_in_place()
+
+    assert s.stream_table.rowCount() == 2, "in-place refresh must not change row count"
+    # Same Python items — proves no setItem ran on non-status cells.
+    assert s.stream_table.item(1, 2) is name_item_before
+    assert s.stream_table.item(1, 1) is iface_item_before
+    # Selection preserved.
+    sel = [i.row() for i in s.stream_table.selectionModel().selectedRows()]
+    assert sel == [1]
+
+
+def test_status_in_place_updates_changed_status_and_skips_unchanged(client_stub):
+    """When a stream's status changes in the model, in-place refresh
+    repaints col 0; unchanged streams are skipped (verified via the
+    pushed-cache)."""
+    s = client_stub(streams=_two_streams_one_port())
+    s._do_update_stream_table()
+    # First call seeds the pushed-cache from current (stopped/red) state.
+    s._refresh_stream_status_in_place()
+    cache_before = dict(getattr(s, "_stream_status_pushed", {}))
+    assert cache_before == {"sid-a": "red", "sid-b": "red"}
+
+    # Flip one stream's status to running; the other stays stopped.
+    s.streams["TG 0 - Port: eno8303"][0]["status"] = "running"
+    item_unchanged = s.stream_table.item(1, 0)   # row 1's col-0 item
+
+    s._refresh_stream_status_in_place()
+
+    # The flipped row (row 0) gets a new col-0 item (we setItem'd a new one).
+    # The unchanged row's col-0 item is the same Python object — proves we
+    # didn't churn it.
+    assert s.stream_table.item(1, 0) is item_unchanged
+    # Cache reflects the new push.
+    assert s._stream_status_pushed == {"sid-a": "green", "sid-b": "red"}
+    # And the flipped row's tooltip is now "Running".
+    assert s.stream_table.item(0, 0).toolTip() == "Running"
+
+
+def test_status_in_place_does_not_close_open_editor(qapp, client_stub):
+    """Critical guarantee: an inline editor on the Name cell must survive
+    the in-place status refresh. The full-rebuild path closed it; the
+    new path must not."""
+    s = client_stub(streams=_two_streams_one_port())
+    s._do_update_stream_table()
+    s.show()
+    qapp.processEvents()
+
+    # Open editor on row 0, Name cell.
+    s.stream_table.editItem(s.stream_table.item(0, 2))
+    qapp.processEvents()
+    assert s.stream_table.state() == QAbstractItemView.EditingState
+
+    # Now flip the same row's status and call in-place — the editor on
+    # col 2 must remain open while col 0 is repainted.
+    s.streams["TG 0 - Port: eno8303"][0]["status"] = "running"
+    for _ in range(3):
+        s._refresh_stream_status_in_place()
+        qapp.processEvents()
+    assert s.stream_table.state() == QAbstractItemView.EditingState
+    # And col 0 actually got the new green icon.
+    assert s.stream_table.item(0, 0).toolTip() == "Running"
+
+
+def test_status_in_place_handles_missing_or_pruned_streams(client_stub):
+    """A row may briefly outlive its stream entry (mid-delete races).
+    The in-place refresh must skip such rows quietly rather than crash."""
+    s = client_stub(streams=_two_streams_one_port())
+    s._do_update_stream_table()
+    # Remove the stream from the model WITHOUT rebuilding the table —
+    # the row's stream_id now refers to nothing.
+    s.streams["TG 0 - Port: eno8303"].pop(0)
+    # Should not raise and should not crash the row.
+    s._refresh_stream_status_in_place()
+    assert s.stream_table.rowCount() == 2  # rebuild not triggered
+
+
 def test_stop_all_row_index_map_keyed_by_stream_id(client_stub):
     """stop_all_streams keys row_index_map by stream_id (v0.2.55), not
     by (bare-iface, name). Mirror that derivation here so the regression
