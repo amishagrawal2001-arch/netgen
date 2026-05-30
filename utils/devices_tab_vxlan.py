@@ -123,10 +123,23 @@ class VXLANHandler:
         self.parent.apply_vxlan_button  = _vxlan_btn("icons/apply.png",   "Apply VXLAN configurations to server", style=BTN_APPLY)
         refresh_button                  = _vxlan_btn("icons/refresh.png", "Refresh VXLAN status")
 
+        # EVPN Type-2 bulk-inject (v0.2.63). Opens a small dialog that
+        # POSTs to /api/evpn/type2/inject + lists active injections. The
+        # icon is the generic "advertise" arrow; tooltip carries the
+        # plain-English explanation since this is a less-common power
+        # user feature.
+        evpn_inject_button = _vxlan_btn(
+            "icons/start.png",
+            "EVPN Type-2 bulk inject — manufacture N synthetic MAC/IP "
+            "entries on a VXLAN iface so FRR/BGP advertises them as "
+            "Type-2 routes. For scale-testing EVPN peers."
+        )
+
         self.parent.add_vxlan_button.clicked.connect(self.parent.prompt_add_vxlan)
         self.parent.delete_vxlan_button.clicked.connect(self.delete_selected_vxlan_tunnels)
         self.parent.apply_vxlan_button.clicked.connect(self.parent.apply_vxlan_configurations)
         refresh_button.clicked.connect(self.refresh_vxlan_table)
+        evpn_inject_button.clicked.connect(self._open_evpn_inject_dialog)
 
         for b in (self.parent.add_vxlan_button, self.parent.delete_vxlan_button):
             controls.addWidget(b)
@@ -138,7 +151,8 @@ class VXLANHandler:
         controls.addWidget(sep)
         controls.addSpacing(4)
 
-        for b in (self.parent.apply_vxlan_button, refresh_button):
+        for b in (self.parent.apply_vxlan_button, refresh_button,
+                  evpn_inject_button):
             controls.addWidget(b)
 
         controls.addStretch(1)
@@ -148,6 +162,59 @@ class VXLANHandler:
         QTimer.singleShot(200, self.refresh_vxlan_table)
         # Ensure periodic monitoring starts even before VXLAN rows exist
         self.start_monitoring()
+
+    def _open_evpn_inject_dialog(self):
+        """Launch the EVPN Type-2 inject dialog (0.2.63).
+
+        Resolves the server URL via the parent Devices tab (same path
+        every other VXLAN action uses), then pre-fills the iface from
+        the currently-selected VXLAN row when there's exactly one
+        selection — operator convenience so they don't retype it.
+        """
+        try:
+            server_url = self.parent.get_server_url(silent=True) \
+                if hasattr(self.parent, "get_server_url") else ""
+        except Exception:
+            server_url = ""
+        if not server_url:
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self.parent, "No server",
+                "No server URL configured. Add/select a TG chassis first."
+            )
+            return
+
+        # Try to pre-fill the iface from the selected VXLAN row. The
+        # VXLAN table's column 0 is the device name, but elsewhere we
+        # render the VXLAN iface name itself in another column — guard
+        # both cases and just leave the field blank if we can't tell.
+        default_iface = ""
+        try:
+            tbl = getattr(self.parent, "vxlan_table", None)
+            if tbl is not None:
+                rows = sorted({i.row() for i in tbl.selectionModel().selectedIndexes()})
+                if len(rows) == 1:
+                    headers = [
+                        tbl.horizontalHeaderItem(c).text()
+                        if tbl.horizontalHeaderItem(c) else ""
+                        for c in range(tbl.columnCount())
+                    ]
+                    # Find the iface column by header text — survives
+                    # column reorderings.
+                    for label in ("VXLAN Interface", "Interface", "iface"):
+                        if label in headers:
+                            col = headers.index(label)
+                            it = tbl.item(rows[0], col)
+                            if it and it.text().strip():
+                                default_iface = it.text().strip()
+                            break
+        except Exception:
+            pass
+
+        from widgets.evpn_inject_dialog import EvpnInjectDialog
+        dlg = EvpnInjectDialog(self.parent, server_url=server_url,
+                               default_iface=default_iface)
+        dlg.exec_()
 
     def start_monitoring(self):
         if not self._monitoring_active:

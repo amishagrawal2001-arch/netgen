@@ -2,6 +2,63 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.63] - 2026-05-30
+
+**Enhancement #4 of 4 (slice 4) — EVPN Type-2 inject GUI.** GUI front
+end for the v0.2.62 endpoints; no more curl required.
+
+### What changed
+- **`widgets/evpn_inject_dialog.py`** (new): the `EvpnInjectDialog` —
+  one inject form (VXLAN iface, base MAC, count, optional base IP /
+  remote VTEP / L3 iface) plus a live "Active injections" table with a
+  per-row "Clear" button and a Refresh. Status line below the Inject
+  button goes green on success, amber on partial failure, red on HTTP
+  errors / connection problems. Dialog refreshes the active list on
+  open and after every inject/clear.
+- **`utils/devices_tab_vxlan.py`**: new **EVPN Inject** button on the
+  Devices → VXLAN sub-tab action bar (right of Apply / Refresh).
+  Opens the dialog with the server URL resolved via the existing
+  `parent.get_server_url()` path and the VXLAN iface pre-filled from
+  the currently-selected VXLAN row (when exactly one is selected).
+
+### Wire format / behaviour
+- Inject button → `POST /api/evpn/type2/inject` with the assembled
+  body; success message echoes the count + ok-command count.
+- Clear button per row → `POST /api/evpn/type2/clear` with that row's
+  `inject_id`; success / partial-failure / error each map to a status
+  colour.
+- Refresh / on-open → `GET /api/evpn/type2/list`; populates the table.
+
+Per-row Clear binds the row's own `inject_id` via an explicit lambda
+default-arg, so the Python closure-capture bug (every button calling
+clear on the LAST row) can't bite — regression-locked by a test that
+clicks all rows and asserts the sequence.
+
+### Verified — 14 new tests, full suite 203 passing
+`tests/test_evpn_inject_dialog.py`:
+- `build_inject_payload`: MAC-only minimal body / all optional fields /
+  missing-required → None.
+- `_populate_active`: every column carries the right value, missing
+  optionals render "—", inject_id truncated with full ID in the
+  tooltip, Clear cellWidget present.
+- Clear closure: clicking each row's button calls `_clear_one` with
+  *its own* `inject_id` (not the last loop value).
+- `_on_inject`: posts the right URL + body; green status on full
+  success; amber on partial failure; red + server error message on
+  400; red + exception text on connection failure.
+- `refresh_active`: populates the table from the server payload;
+  swallows network errors without crashing.
+- `_clear_one`: posts inject_id to /clear; amber on partial failure.
+
+### Notes
+- Client-only addition; no server change since the endpoints landed
+  in 0.2.62. Old clients still scripted-only against the API; new
+  clients can run inject + clear from the GUI.
+
+### Next on this enhancement
+0.2.64 (final slice of #4): SR-MPLS label-stack support in the
+existing tx path — needs DPDK tx_worker C changes.
+
 ## [0.2.62] - 2026-05-30
 
 **Enhancement #4 of 4 (slice 3) — EVPN Type-2 bulk injection.** Scale
