@@ -1772,7 +1772,33 @@ class AddDeviceDialog(QDialog):
             else:
                 ospf_interface = base_interface
             
-            area_id = self.ospf_area_id_input.text().strip() or "0.0.0.0"
+            area_id_raw = self.ospf_area_id_input.text().strip() or "0.0.0.0"
+            # v0.2.87: validate + normalise. Operators routinely type
+            # the plain-integer shortcut ("1" for area 1); normalise
+            # to the dotted-decimal FRR puts on the wire so the
+            # stored config matches what `show ip ospf` later reports.
+            # Bail out of submit on hard-invalid input so the operator
+            # sees a clear reason instead of FRR rejecting it later.
+            try:
+                from utils.ospf_area import validate_ospf_area_id
+                _ok, _norm, _err = validate_ospf_area_id(area_id_raw)
+                if not _ok:
+                    from PyQt5.QtWidgets import QMessageBox
+                    QMessageBox.warning(
+                        self, "Invalid OSPF Area ID",
+                        f"'{area_id_raw}' is not a valid OSPF area "
+                        f"ID.\n\n"
+                        f"Accepted forms:\n"
+                        f"  • Integer 0–4294967295 (e.g. '0', '1')\n"
+                        f"  • Dotted-decimal A.B.C.D (e.g. "
+                        f"'0.0.0.0', '0.0.0.1')\n\n"
+                        f"Error: {_err}"
+                    )
+                    return None
+                area_id = _norm  # canonical dotted-decimal
+            except Exception:
+                # Helper missing — fall back to the raw value.
+                area_id = area_id_raw
             ospf_config = {
                 "area_id": area_id,
                 "area_id_ipv4": area_id,  # Initialize from area_id

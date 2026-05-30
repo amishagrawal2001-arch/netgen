@@ -1156,42 +1156,42 @@ class OSPFHandler:
             
             if column == 2:  # Area ID changed (column 2)
                 area_id_item = self.parent.ospf_table.item(row, 2)
-                
+
                 if area_id_item:
                     new_area_id = area_id_item.text().strip()
-                    
-                    # Validate area ID format (supports both decimal and dotted-decimal)
-                    try:
-                        if new_area_id:
-                            # Try to parse as decimal (0-4294967295)
-                            try:
-                                area_decimal = int(new_area_id)
-                                if area_decimal < 0 or area_decimal > 4294967295:
-                                    raise ValueError("Area ID out of range")
-                            except ValueError:
-                                # Try to parse as dotted-decimal (A.B.C.D)
-                                try:
-                                    parts = new_area_id.split(".")
-                                    if len(parts) != 4:
-                                        raise ValueError("Invalid dotted-decimal format")
-                                    for part in parts:
-                                        if not (0 <= int(part) <= 255):
-                                            raise ValueError("Octet out of range")
-                                except (ValueError, AttributeError):
-                                    raise ValueError("Invalid area ID format")
-                    except ValueError as e:
-                        QMessageBox.warning(self.parent, "Invalid Area ID", 
-                                          f"'{new_area_id}' is not a valid OSPF area ID.\n"
-                                          f"Area ID must be:\n"
-                                          f"- Decimal: 0-4294967295\n"
-                                          f"- Dotted-decimal: A.B.C.D (each octet 0-255)")
-                        # Revert to original value
-                        if is_ipv6:
-                            original_area = ospf_config.get("area_id_ipv6") or ospf_config.get("area_id", "0.0.0.0")
-                        else:
-                            original_area = ospf_config.get("area_id_ipv4") or ospf_config.get("area_id", "0.0.0.0")
-                        area_id_item.setText(original_area)
-                        return
+
+                    # v0.2.87: replaced hand-rolled decimal-or-dotted
+                    # check with utils.ospf_area.validate_ospf_area_id.
+                    # The helper also NORMALISES — operators typing
+                    # "1" get "0.0.0.1" stored, matching what FRR puts
+                    # on the wire so subsequent `show ip ospf` output
+                    # lines up with the saved config.
+                    if new_area_id:
+                        from utils.ospf_area import validate_ospf_area_id
+                        _ok, _norm, _err = validate_ospf_area_id(new_area_id)
+                        if not _ok:
+                            QMessageBox.warning(
+                                self.parent, "Invalid Area ID",
+                                f"'{new_area_id}' is not a valid OSPF "
+                                f"area ID.\n\nAccepted forms:\n"
+                                f"  • Integer 0–4294967295\n"
+                                f"  • Dotted-decimal A.B.C.D (each "
+                                f"octet 0–255)\n\nError: {_err}"
+                            )
+                            # Revert to original value
+                            if is_ipv6:
+                                original_area = ospf_config.get("area_id_ipv6") or ospf_config.get("area_id", "0.0.0.0")
+                            else:
+                                original_area = ospf_config.get("area_id_ipv4") or ospf_config.get("area_id", "0.0.0.0")
+                            area_id_item.setText(original_area)
+                            return
+                        # Normalise: if the operator typed the short
+                        # integer form, swap it for the dotted form in
+                        # the cell so the stored config + the display
+                        # match.
+                        if _norm != new_area_id:
+                            area_id_item.setText(_norm)
+                            new_area_id = _norm
                     
                     # CRITICAL: Skip update if area ID is empty or "0.0.0.0" - don't process empty/invalid values
                     # This prevents overwriting valid config with zeros when user is typing or when table shows default

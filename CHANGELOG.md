@@ -2,6 +2,71 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.87] - 2026-05-30
+
+**OSPF area-id refactor + normalisation (RFC 2328 §6)** — closes
+the second-to-last validation deferral from the v0.2.85 Devices-tab
+audit. Lifts the inline decimal-or-dotted check into a shared
+helper and adds normalisation so the stored config matches what FRR
+puts on the wire.
+
+### What changed
+
+#### New helper
+- **`utils/ospf_area.py`** — new module.
+  `validate_ospf_area_id(value)` returns `(ok, normalised_dotted,
+  error)`. Accepts plain integer form (0–4294967295) or dotted-
+  decimal (each octet 0–255); normalises to dotted-decimal IPv4
+  shape (the form FRR / Quagga / Cisco IOS all put on the wire).
+  Companion `normalise_ospf_area_id(value)` returns just the
+  normalised string for call sites that don't need the error text.
+
+#### Normalisation matters
+The Add Device dialog used to store whatever the operator typed —
+`1` for area 1 stayed as `1`, but FRR's `show ip ospf` later
+reported it as `0.0.0.1`. Subsequent inline-edits saw the mismatch
+as a change and triggered apply storms. Normalising at submit
+time + at inline-edit time keeps the stored config and the live
+output in lockstep.
+
+#### Wired into entry points
+- **`widgets/add_device_dialog.py`** Add Device → OSPF Area ID
+  field (line 1775). Validates at submit; bails on hard-invalid
+  input with a clear modal explaining BOTH accepted forms; stores
+  the dotted-decimal normalised value.
+- **`utils/devices_tab_ospf.py`** inline-edit handler (line 1157).
+  Replaced the hand-rolled try/except nest with the shared
+  validator + normaliser. When the operator types `1`, the cell
+  is updated to `0.0.0.1` in place so the display matches what
+  goes into the config dict.
+
+### Tests
+- **`tests/test_ospf_area.py`** — new file, 37 tests:
+  - 12 parametrised happy-path tests covering integer form (0,
+    1, 100, 256, 65535, 4294967295) and dotted form (0.0.0.0,
+    0.0.0.1, 10.0.0.1, 255.255.255.255).
+  - Whitespace stripping; leading-zero canonicalisation
+    (`001.002.003.004` → `1.2.3.4`).
+  - 6 parametrised `_int_to_dotted` round-trip tests covering
+    every byte-shift boundary.
+  - Rejection tests: empty, negative, > 2³², garbage no-dots,
+    7 parametrised malformed-dotted variants (too few/many
+    parts, octet > 255, negative octet, empty octet, non-numeric
+    octet).
+  - Error-message quality: names which octet is bad, names actual
+    part count, no Python internals in user-facing strings.
+  - Backbone area accepted in both forms + normalised to same
+    canonical value.
+
+### Audit remaining (after v0.2.87)
+- Progress dialog consistency across protocols
+- Empty-state placeholders in protocol sub-tabs
+- Error-message format consistency
+- Sort-state preservation across table rebuild
+
+### Test count
+576 → 613 (+37).
+
 ## [0.2.86] - 2026-05-30
 
 **ISIS NET-ID validation (RFC 1195 §3.1)** — closes one of the
