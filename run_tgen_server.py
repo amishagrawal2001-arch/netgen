@@ -16092,6 +16092,96 @@ def rfc2544_progress():
 
 
 # =============================================================================
+# EVPN Type-2 (MAC/IP) bulk injection — 0.2.62
+# =============================================================================
+# Real EVPN routers learn MACs from the data plane and BGP advertises
+# them as Type-2 routes. For traffic-generator-style scaled testing
+# (emulate one VTEP carrying N endpoints) we instead populate the bridge
+# FDB + ip-neigh tables directly; FRR's zebra learns them and the BGP
+# EVPN address-family (auto-enabled by configure_bgp_for_device when a
+# device has VXLAN config) advertises them as Type-2.
+#
+# All the heavy lifting (MAC/IP range generation, kernel command-list
+# building, subprocess execution, registry of active injections) lives
+# in utils/evpn_inject.py — these routes are thin wrappers, so the
+# logic is fully unit-testable without spinning up Flask.
+
+
+@app.route("/api/evpn/type2/inject", methods=["POST"])
+@require_role("operator")
+def evpn_type2_inject():
+    """Bulk-inject N synthetic MAC (+ optional IP) entries on a VXLAN
+    interface so FRR/zebra advertises them as EVPN Type-2 routes.
+
+    JSON body:
+      ``{"iface": "vxlan100", "base_mac": "aa:bb:cc:00:00:00",
+         "count": 100, "base_ip": "10.100.0.1" (optional),
+         "remote_vtep_ip": "192.0.2.5" (optional),
+         "l3_iface": "br100" (optional)}``
+
+    Returns the per-call ``inject_id`` (use with /clear), plus per-
+    entry success/failure counts.
+    """
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+    except Exception as exc:
+        return jsonify({"error": f"bad JSON: {exc}"}), 400
+    iface = (body.get("iface") or "").strip()
+    base_mac = (body.get("base_mac") or "").strip()
+    count = body.get("count", 0)
+    if not iface or not base_mac or not isinstance(count, int) or count <= 0:
+        return jsonify({"error": "missing/invalid iface, base_mac, or count"}), 400
+    try:
+        from utils.evpn_inject import inject_type2
+        result = inject_type2(
+            iface=iface,
+            base_mac=base_mac,
+            count=count,
+            base_ip=(body.get("base_ip") or None),
+            remote_vtep_ip=(body.get("remote_vtep_ip") or None),
+            l3_iface=(body.get("l3_iface") or None),
+        )
+    except ValueError as ve:
+        return jsonify({"error": str(ve)}), 400
+    except Exception as exc:
+        logging.error(f"[EVPN INJECT] failed: {exc}")
+        return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
+    return jsonify(result)
+
+
+@app.route("/api/evpn/type2/clear", methods=["POST"])
+@require_role("operator")
+def evpn_type2_clear():
+    """Undo a previous /inject by inject_id.
+
+    JSON body: ``{"inject_id": "..."}``.
+    Returns counts; "entry not found" kernel errors are best-effort and
+    surfaced under ``errors`` without failing the call.
+    """
+    try:
+        body = request.get_json(force=True, silent=True) or {}
+    except Exception as exc:
+        return jsonify({"error": f"bad JSON: {exc}"}), 400
+    inject_id = (body.get("inject_id") or "").strip()
+    if not inject_id:
+        return jsonify({"error": "missing inject_id"}), 400
+    try:
+        from utils.evpn_inject import clear_type2
+        return jsonify(clear_type2(inject_id))
+    except Exception as exc:
+        logging.error(f"[EVPN CLEAR] failed: {exc}")
+        return jsonify({"error": f"{type(exc).__name__}: {exc}"}), 500
+
+
+@app.route("/api/evpn/type2/list", methods=["GET"])
+@require_role("viewer")
+def evpn_type2_list():
+    """Snapshot of currently-registered Type-2 injections on this server."""
+    from utils.evpn_inject import list_active_injections
+    return jsonify({"injections": list_active_injections()})
+
+
+# =============================================================================
 # One-way latency — server-side LatencySampler manager
 # =============================================================================
 # Streams started with enable_timestamps=true embed an NLAT header at the

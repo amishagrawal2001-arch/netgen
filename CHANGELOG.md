@@ -2,6 +2,80 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.62] - 2026-05-30
+
+**Enhancement #4 of 4 (slice 3) — EVPN Type-2 bulk injection.** Scale
+test the existing EVPN/VXLAN BGP wiring by manufacturing N synthetic
+MAC (+ optional IP) entries — let one chassis pretend to be a VTEP with
+hundreds or thousands of endpoints.
+
+### Mechanism
+The EVPN address-family was already auto-enabled by
+`configure_bgp_for_device` when a device has VXLAN config (advertises
+all VNIs, sets route-targets, activates EVPN on the IPv4/IPv6
+neighbours). What was missing was a way to *get entries into the MAC
+table*. Real EVPN routers learn them from data-plane forwarding; the
+traffic-generator path is to write them directly into the kernel:
+
+  * ``bridge fdb append <mac> dev <vxlanN> master self static dst <vtep>``
+    populates the VXLAN MAC table.
+  * ``ip neigh add <ip> lladdr <mac> dev <iface> nud noarp`` adds the
+    IP→MAC binding for MAC+IP Type-2 sub-routes.
+
+FRR's zebra picks both up and BGP advertises them as Type-2 routes
+under the existing l2vpn-evpn address-family.
+
+### What changed
+- **`utils/evpn_inject.py`** (new): pure helpers + a high-level entry
+  point.
+  - `mac_to_int` / `int_to_mac` / `generate_mac_range` /
+    `generate_ip_range` — range arithmetic with strict validation.
+  - `build_inject_commands(iface, entries, remote_vtep_ip, l3_iface)` /
+    `build_clear_commands(...)` — pure command-list builders.
+  - `inject_type2(...)` / `clear_type2(...)` — runs commands via an
+    injectable ``run`` callable (subprocess.run by default; tests pass
+    a fake). Registers each batch under a UUID so /clear can find it.
+  - `list_active_injections()` — for the GUI table coming in 0.2.63.
+- **`run_tgen_server.py`**: three new endpoints, all role-gated.
+  - ``POST /api/evpn/type2/inject`` (operator)
+  - ``POST /api/evpn/type2/clear`` (operator)
+  - ``GET  /api/evpn/type2/list`` (viewer)
+  Routes are thin wrappers around `utils.evpn_inject` — all logic +
+  validation lives there.
+
+### Verified — 18 new tests, full suite 189 passing
+`tests/test_evpn_inject.py`:
+- MAC parsing round-trips; rejects 7 different malformed shapes.
+- MAC range crosses byte boundaries (`…00:fe` → `…01:00`).
+- IP range crosses /24 boundaries.
+- Command lists: MAC-only emits only `bridge fdb`; MAC+IP emits both;
+  `remote_vtep_ip` appends `dst <vtep>`; `l3_iface` overrides the
+  neigh interface (SVI vs VXLAN); clear order is neigh-then-FDB.
+- `inject_type2` runs the right number of commands (2N for MAC+IP, N
+  for MAC-only); partial failure surfaces per-command errors without
+  aborting; subprocess exceptions are caught and recorded, not
+  propagated; zero count rejected with ValueError.
+- `clear_type2` drops the in-process record even when kernel commands
+  fail (stale entry is common, must not leak the record); unknown
+  inject_id returns a warning, not a 500.
+- `list_active_injections` reflects inject/clear lifecycle.
+
+### Notes
+- Server-only addition. Inject endpoint is `require_role("operator")`,
+  list is viewer-read. Bridge/`ip` commands run on the host (FRR
+  containers are `--network=host`, established in 0.2.19), so the
+  server process needs CAP_NET_ADMIN — already required by netgen for
+  routing-table edits.
+- GUI dialog (Devices → VXLAN sub-tab → "Bulk Inject Type-2") follows
+  in 0.2.63; today the endpoints are scriptable via curl / ansible /
+  any HTTP client.
+
+### Next on this enhancement
+0.2.63: GUI dialog for EVPN Type-2 inject; live "Active injections"
+table with row-level Clear.
+0.2.64: SR-MPLS label-stack support in the existing tx path (DPDK
+tx_worker C changes).
+
 ## [0.2.61] - 2026-05-30
 
 **Enhancement #4 of 4 (slice 2) — BFD emitter (RFC 5880 / 5881).**
