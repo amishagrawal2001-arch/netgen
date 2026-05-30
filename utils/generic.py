@@ -129,13 +129,23 @@ def build_generic_packet(stream_data, pkt_cfg, vlan_id,
     except Exception as e:
         logging.warning(f"[VLAN] Invalid VLAN ID '{vlan_id}', skipping tag: {e}")
 
-    # --- MPLS (if selected) ---
+    # --- MPLS / SR-MPLS (if selected) ---
+    # 0.2.64 added stack support. Reads `mpls_labels` (a list, RFC 8660
+    # SR-MPLS) when present; falls back to the scalar `mpls_label` for
+    # back-compat with the single-label config that shipped before. The
+    # stacker handles the bottom-of-stack `s` bit automatically.
     if l2 == "MPLS":
+        from utils.mpls import build_mpls_stack, extract_mpls_labels
         mpls = protocol_data.get("mpls", {}) or {}
-        pkt /= MPLS(
-            label=int(mpls.get("mpls_label", 16)),
+        labels = extract_mpls_labels(mpls)
+        if not labels:
+            # Preserve prior behaviour: missing config → single label 16
+            # (a typical reserved-range value used as a placeholder).
+            labels = [int(mpls.get("mpls_label", 16))]
+        pkt /= build_mpls_stack(
+            labels,
+            tc=int(mpls.get("mpls_experimental", 0)),
             ttl=int(mpls.get("mpls_ttl", 64)),
-            cos=int(mpls.get("mpls_experimental", 0)),
         )
 
     # --- L3 ---

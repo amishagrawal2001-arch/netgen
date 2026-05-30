@@ -2,6 +2,66 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.64] - 2026-05-30
+
+**Enhancement #4 of 4 (final slice) — SR-MPLS label-stack support
+(RFC 8660) in the scapy tx path.** The existing single-label MPLS
+branch becomes a true label *stack* that can carry the SID list an SR
+test needs.
+
+### What changed
+- **`utils/mpls.py`** (new): pure-function helper
+  `build_mpls_stack(labels, tc=0, ttl=64)` that returns a chained
+  scapy MPLS layer. Bottom-of-stack `s` bit is set on the last label
+  only (scapy handles this automatically when MPLS layers are stacked
+  via `/`). Validates every input — empty stack, 20-bit label range,
+  3-bit TC, 8-bit TTL — and raises with a useful message rather than
+  silently emitting a malformed frame. Companion
+  `extract_mpls_labels(mpls_config)` reads both the new
+  `mpls_labels: [..]` list AND the legacy scalar `mpls_label`, plus
+  a comma-separated string ("100, 200, 300") for whatever the GUI
+  field eventually looks like.
+- **`utils/generic.py`** — the existing single-label MPLS branch
+  routes through `build_mpls_stack` via `extract_mpls_labels`. Streams
+  with `mpls_labels: [16, 200, 300]` get a proper 3-label stack with
+  ethertype 0x8847; streams that only set the legacy `mpls_label`
+  scalar produce the same bytes as before (back-compat verified).
+
+### Wire format (pinned by 15 new tests)
+- Single label → 4 bytes, S=1, ethertype 0x8847 on the Ether layer.
+- N-label stack → 4N bytes; on-wire order matches the list order
+  (top of stack first); only the bottom (last) label carries S=1.
+- TC + TTL applied uniformly to every label (verified by parsing
+  the raw bytes, not just the scapy object).
+- L3 payload starts at exactly 14 + 4N bytes.
+- 21-bit label, TC > 7, TTL > 255, negative inputs, and empty stack
+  all raise `ValueError` at build time.
+- `extract_mpls_labels` round-trips the new list, the legacy scalar,
+  the comma-separated string, hex labels, falsy / missing config,
+  and an invalid legacy string (returns `[]` rather than raising,
+  so the caller treats it as "no MPLS").
+
+### Verified
+Full suite **218 passed** (15 new tests in `tests/test_mpls_stack.py`).
+
+### Notes
+- Back-compat: pre-0.2.64 streams (with `mpls_label` scalar) produce
+  bit-identical bytes vs prior releases. New streams add
+  `mpls_labels` to their `protocol_data.mpls` dict.
+- The Stream Edit dialog doesn't yet expose `mpls_labels` as a GUI
+  field — set it via the JSON `protocol_data` until that lands. A
+  small text input ("Labels (comma-separated)") fits naturally next
+  to the existing single-label field; that's the next iteration on
+  this enhancement if you want it.
+
+### Enhancement #4 complete
+QinQ (0.2.60), BFD (0.2.61), EVPN Type-2 inject backend (0.2.62) and
+GUI (0.2.63), and now SR-MPLS stacks (0.2.64). The protocol /
+data-plane expansion menu from 0.2.56's plan is fully shipped — 4
+enhancements, 9 releases (0.2.56–0.2.64), test count grew from 103
+to **218** with every recent regression and every new feature
+locked behind a regression test.
+
 ## [0.2.63] - 2026-05-30
 
 **Enhancement #4 of 4 (slice 4) — EVPN Type-2 inject GUI.** GUI front
