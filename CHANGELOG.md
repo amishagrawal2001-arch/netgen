@@ -2,6 +2,69 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.55] - 2026-05-29
+
+Proactive audit after the Copy/Paste bugs. Found **3 more** instances of
+the same "UI cell text used as a model key" anti-pattern that the recent
+bugs all share. Two of these were real user-facing breakage; one was a
+silent visual miss.
+
+### CRITICAL — `start_all_streams` silently skipped every stream
+**`traffic_client/stream_logic.py`**: `valid_ports` was built from the
+stream table's Interface cell (col 1), which holds the BARE iface
+(``"eno8303"``), then compared to ``self.streams`` keys
+(``"TG 0 - Port: eno8303"``). They never matched, so every port went
+into ``unknown_ports`` and Start All did nothing — exactly the
+``Skipped stale/unknown ports (not in current UI):
+['TG 0 - Port: eno8303']`` log line the user saw. Fixed by collecting
+displayed ``stream_id``s from the Name cell's ``Qt.UserRole`` and walking
+``self.streams`` to find which full port keys contain any of them.
+
+### HIGH — packet capture couldn't determine server URL
+**`traffic_client/packet_capture.py`**: ``tg_id = parent_item.text(0)``
+returned ``""`` because the TG node uses an itemWidget (status icon +
+``"TG N"`` QLabel), not text(0). The server-URL lookup
+(``"TG " + tg_id == "TG "``) silently failed and start-capture bailed.
+Fixed with the same 3-tier resolution paste_stream_to_interface uses
+(itemWidget label-with-text → server_interfaces by parent index →
+legacy text(0)).
+
+### MINOR (visual) — stop_all_streams couldn't update row icons
+Same file: ``row_index_map`` was keyed ``(bare-iface, name)`` from cell
+text but looked up with the full port_label, so the per-row red-icon
+update on Stop All silently missed. (The stops themselves landed; only
+the icon flip was lost.) Rekeyed by ``stream_id`` — the natural unique
+id, and one already stashed at ``Qt.UserRole``.
+
+### Other findings (no fix needed)
+- `open_add_stream_dialog`, `server_section.py:1588/1803` use a naive
+  `findChild(QLabel)` that picks the icon label first, but the icon
+  label is pixmap-only (empty text), so the existing
+  `server_interfaces`-index fallback rescues them. Working today,
+  fragile, but not breakage.
+- Devices tab's status poll remains safe — surgical in-place updates,
+  never a key-rebuild.
+
+### Verified (headless repro reproduces the user's log line)
+With ``self.streams`` keyed ``"TG 0 - Port: eno8303"`` and table cells
+showing ``"eno8303"``:
+- buggy ``valid_ports = {'eno8303'}`` → ``'TG 0 - Port: eno8303'``
+  flagged unknown → Start All would skip everything (matches the user's
+  log exactly);
+- fixed ``valid_ports = {'TG 0 - Port: eno8303'}`` → no skip.
+Full suite **103 passed**.
+
+### Theme
+This is the 4th release in a row fixing the same anti-pattern (UI cells
+display human-readable text but the model is keyed by a canonical string
+built elsewhere). The proper structural fix is the
+**incremental-table-update** refactor — rows carry the model id and
+lookups happen by id, not by rebuilding display-derived keys. Still the
+highest-leverage enhancement on the menu.
+
+### Notes
+- Client-only; no server or wire-format change.
+
 ## [0.2.54] - 2026-05-29
 
 Fix stream **Paste** silently dropping streams (the log line gave it

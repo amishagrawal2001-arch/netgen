@@ -1054,15 +1054,20 @@ class TrafficGenClientStreamLogic:
                 QMessageBox.information(self, "Nothing to Stop", "There are no streams loaded.")
                 return
 
-            row_index_map = {}
+            # Key the row map by stream_id (stashed at Qt.UserRole on the
+            # Name cell). The previous (port_lbl, name) key used col 1's BARE
+            # iface ("eno8303"), while the lookup below uses the full port
+            # label ("TG 0 - Port: eno8303") — they never matched, so the
+            # per-row red-icon update on stop was silently skipped. stream_id
+            # is the natural unique key and avoids the mismatch entirely.
+            row_index_map = {}    # stream_id -> row
             try:
                 for r in range(self.stream_table.rowCount()):
-                    port_lbl = (self.stream_table.item(r, 1).text() or "").strip() if self.stream_table.item(r,
-                                                                                                             1) else ""
-                    name_lbl = (self.stream_table.item(r, 2).text() or "").strip() if self.stream_table.item(r,
-                                                                                                             2) else ""
-                    if port_lbl and name_lbl:
-                        row_index_map[(port_lbl, name_lbl)] = r
+                    name_item = self.stream_table.item(r, 2)
+                    if name_item:
+                        sid = name_item.data(Qt.UserRole)
+                        if sid:
+                            row_index_map[sid] = r
             except Exception as _e:
                 logger.warning(f"[STOP-ALL] Could not prebuild row map: {_e}")
 
@@ -1135,12 +1140,12 @@ class TrafficGenClientStreamLogic:
                                     self.streams[port_lbl][i]["status"] = "stopped"
                                     break
 
-                            row_idx = row_index_map.get((port_lbl, s_name))
+                            row_idx = row_index_map.get(sid)
                             if row_idx is not None:
                                 try:
                                     self.update_stream_status(row_idx, "red")
                                 except Exception as _e:
-                                    logger.warning(f"[STOP-ALL] Row icon update failed: {port_lbl}, {s_name}: {_e}")
+                                    logger.warning(f"[STOP-ALL] Row icon update failed: sid={sid} ({port_lbl}, {s_name}): {_e}")
                     else:
                         logger.error(f"[STOP-ALL] Server {server_url} failed: {resp.status_code} {resp.text[:200]}")
                 except Exception as e:
@@ -1250,13 +1255,31 @@ class TrafficGenClientStreamLogic:
                 logger.warning("[START-ALL] Stream table not initialized, falling back to stream keys")
                 # Don't return early - continue with fallback logic below
 
-            # Build set of valid, currently-visible port labels from the table
+            # Build the set of valid, currently-visible port LABELS — i.e.,
+            # the full self.streams keys ("TG 0 - Port: eno8303") whose
+            # streams appear in the table right now.
+            #
+            # BUGFIX: previously this read the Interface cell's text (col 1),
+            # which is the BARE iface ("eno8303"), and compared it to full
+            # keys — they never matched, so every port went into unknown_ports
+            # and Start All silently skipped *every* stream (user-reported,
+            # log: "Skipped stale/unknown ports (not in current UI):
+            # ['TG 0 - Port: eno8303']"). Resolve via the stream_id stashed
+            # at Qt.UserRole on the Name cell — collect displayed stream_ids,
+            # then walk self.streams to find which port_keys hold any of them.
             valid_ports = set()
             try:
+                displayed_sids = set()
                 for r in range(self.stream_table.rowCount()):
-                    itm = self.stream_table.item(r, 1)
-                    if itm:
-                        valid_ports.add(itm.text().strip())
+                    name_item = self.stream_table.item(r, 2)
+                    if name_item:
+                        sid = name_item.data(Qt.UserRole)
+                        if sid:
+                            displayed_sids.add(sid)
+                if displayed_sids:
+                    for port_key, stream_list in self.streams.items():
+                        if any(s.get("stream_id") in displayed_sids for s in stream_list):
+                            valid_ports.add(port_key)
             except Exception as e:
                 # If table not ready, fall back to all keys
                 logger.error(f"[START-ALL] Error reading stream table: {e}, falling back to stream keys")
