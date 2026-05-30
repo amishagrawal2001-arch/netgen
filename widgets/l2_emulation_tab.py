@@ -397,8 +397,10 @@ class _L2ConfigDialog(QDialog):
         w = QGroupBox("IGMP parameters")
         f = QFormLayout(w)
         self._igmp_version = QComboBox()
+        self._igmp_version.addItem("v1 (RFC 1112)", 1)
         self._igmp_version.addItem("v2 (RFC 2236)", 2)
         self._igmp_version.addItem("v3 (RFC 3376)", 3)
+        self._igmp_version.setCurrentIndex(1)  # default v2 (unchanged)
         self._igmp_group = QLineEdit("239.1.1.1")
         self._igmp_group.setToolTip(
             "Multicast group address (IPv4). Use 0.0.0.0 for an IGMPv2 "
@@ -408,7 +410,8 @@ class _L2ConfigDialog(QDialog):
         )
         self._igmp_type_code = QLineEdit("")
         self._igmp_type_code.setPlaceholderText(
-            "(default: 0x16 Report for v2, 0x22 for v3 — override to 0x17 for Leave, 0x11 for Query)"
+            "(default: 0x12 Report for v1, 0x16 for v2, 0x22 for v3 "
+            "— override to 0x17 for Leave or 0x11 for Query)"
         )
         self._igmp_src_ip = QLineEdit("10.0.0.10")
         self._igmp_src_mac = QLineEdit("00:11:22:33:44:04")

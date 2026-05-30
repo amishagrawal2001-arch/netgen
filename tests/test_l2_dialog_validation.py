@@ -182,6 +182,41 @@ def test_igmp_zero_group_accepted_as_general_query(qapp, monkeypatch):
     assert p["body"]["group"] == "0.0.0.0"
 
 
+def test_igmp_version_combo_offers_v1(qapp, monkeypatch):
+    """v0.2.82: IGMPv1 (RFC 1112) is now available alongside v2/v3."""
+    parent, dlg, captured = _open(qapp, monkeypatch)
+    _select(dlg, "igmp")
+    versions = [dlg._igmp_version.itemData(i)
+                for i in range(dlg._igmp_version.count())]
+    assert 1 in versions
+    assert 2 in versions
+    assert 3 in versions
+
+
+def test_igmp_default_version_unchanged_at_v2(qapp, monkeypatch):
+    """v0.2.82: adding v1 to the combo must not change the default
+    (v2 has been the default since the protocol shipped — operators
+    rely on it)."""
+    parent, dlg, captured = _open(qapp, monkeypatch)
+    _select(dlg, "igmp")
+    assert dlg._igmp_version.currentData() == 2
+
+
+def test_igmpv1_dialog_payload_round_trips(qapp, monkeypatch):
+    """v0.2.82: selecting v1 ships version=1 in the body so the
+    server-side factory takes the v1 branch."""
+    parent, dlg, captured = _open(qapp, monkeypatch)
+    _select(dlg, "igmp")
+    for i in range(dlg._igmp_version.count()):
+        if dlg._igmp_version.itemData(i) == 1:
+            dlg._igmp_version.setCurrentIndex(i)
+            break
+    dlg._on_accept()
+    p = dlg.accepted_payload()
+    assert p is not None
+    assert p["body"]["version"] == 1
+
+
 def test_lacp_good_input_round_trips(qapp, monkeypatch):
     """Sanity: with all good inputs the dialog accepts and the
     payload carries the MAC verbatim."""

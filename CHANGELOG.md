@@ -2,6 +2,56 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.82] - 2026-05-30
+
+**IGMPv1 (RFC 1112) support** — closes the first of the three
+BLOCKER items the v0.2.81 L2 audit flagged. Operators testing
+legacy IGMPv1 query/report behaviour (older multicast routers,
+IGMP-snooping fallback on switches that still accept v1) can now
+generate the frames from the GUI without dropping to scapy.
+
+### What changed
+- **`utils/l2_protocols.py`** — `start_igmp()` gains a `version == 1`
+  branch:
+  - Type code default 0x12 (Membership Report) → IP dst = group;
+    matches RFC 1112 §4 "Host-to-Router" report semantics.
+  - Override `type_code=0x11` → IP dst = 224.0.0.1 (ALL-SYSTEMS),
+    L2 dst auto-mapped to 01:00:5e:00:00:01 — that's the General
+    Query a router would emit.
+  - `mrcode` forced to 0 (v1 spec reserves the byte; v2 reuses it
+    as max-resp-time, which v1 readers would misinterpret).
+  - Existing v2 (0x16 Report / 0x17 Leave / 0x11 Query) and v3
+    (0x22 Report) code paths untouched.
+- **`widgets/l2_emulation_tab.py`** — IGMP version combo gains
+  `v1 (RFC 1112)` as the first entry. Default explicitly pinned
+  at v2 (`setCurrentIndex(1)`) so the established default doesn't
+  flip from under operators. Type-code placeholder updated to
+  mention the v1 codes.
+
+### Tests
+- **`tests/test_l2_protocols.py`** — 2 new tests:
+  - `test_igmpv1_membership_report_target_is_group` pins type=0x12,
+    IP dst=group, TTL=1, mrcode=0.
+  - `test_igmpv1_membership_query_target_is_all_systems` pins
+    type=0x11, IP dst=224.0.0.1, L2 dst=01:00:5e:00:00:01.
+- **`tests/test_l2_dialog_validation.py`** — 3 new tests:
+  - `test_igmp_version_combo_offers_v1` confirms 1, 2, 3 all
+    available.
+  - `test_igmp_default_version_unchanged_at_v2` pins the default
+    so operators aren't surprised.
+  - `test_igmpv1_dialog_payload_round_trips` confirms the dialog
+    ships `version=1` in the body.
+
+### Still open from the v0.2.81 audit
+- **VRRP auth TLVs** (BLOCKER) — VRRPv2 auth_type/password +
+  VRRPv3 auth-extension TLV. Next focused release.
+- **PIM Join/Prune** (BLOCKER, roadmap) — full PIM-SM state machine.
+- **POLISH items** — frame preview, per-row Stop button, sortable
+  sessions table, Last Error column truncation.
+
+### Test count
+468 → 473 (+5).
+
 ## [0.2.81] - 2026-05-30
 
 **L2 emulation audit fixes** — first round from a holistic audit of

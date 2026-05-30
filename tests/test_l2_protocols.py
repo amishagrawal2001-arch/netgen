@@ -131,6 +131,53 @@ def test_igmpv2_membership_report_target_is_group():
     assert parsed.gaddr == "239.1.1.1"
 
 
+def test_igmpv1_membership_report_target_is_group():
+    """RFC 1112 §4: a v1 Membership Report (type 0x12) goes to the
+    group address being reported, with TTL=1 and mrcode reserved/zero
+    (the v2 max-resp-time field doesn't exist in v1 — must read 0)."""
+    from scapy.layers.l2 import Ether
+    from scapy.layers.inet import IP
+    from scapy.contrib.igmp import IGMP
+    frame = (
+        Ether(src="00:11:22:33:44:04", dst="01:00:5e:01:01:01")
+        / IP(src="10.0.0.10", dst="239.1.1.1", ttl=1)
+        / IGMP(type=0x12, mrcode=0, gaddr="239.1.1.1")
+    )
+    raw = bytes(frame)
+    # IP dst = 239.1.1.1 (the group) at bytes 30..34
+    assert raw[30:34] == bytes([239, 1, 1, 1])
+    # TTL = 1 at byte 22
+    assert raw[22] == 1
+    # IGMP type 0x12 (v1 Membership Report)
+    parsed = frame[IGMP]
+    assert parsed.type == 0x12
+    assert parsed.mrcode == 0  # v1 reserved-must-be-zero
+    assert parsed.gaddr == "239.1.1.1"
+
+
+def test_igmpv1_membership_query_target_is_all_systems():
+    """RFC 1112 §4: a v1 Membership Query (type 0x11) is sent by
+    routers to 224.0.0.1 (ALL-SYSTEMS multicast), L2-mapped to
+    01:00:5e:00:00:01. The gaddr field is 0.0.0.0 for a General
+    Query (asking everyone to report)."""
+    from scapy.layers.l2 import Ether
+    from scapy.layers.inet import IP
+    from scapy.contrib.igmp import IGMP
+    frame = (
+        Ether(src="00:11:22:33:44:04", dst="01:00:5e:00:00:01")
+        / IP(src="10.0.0.10", dst="224.0.0.1", ttl=1)
+        / IGMP(type=0x11, mrcode=0, gaddr="0.0.0.0")
+    )
+    raw = bytes(frame)
+    # L2 dst = 01:00:5e:00:00:01 (ALL-SYSTEMS MAC) at bytes 0..6
+    assert raw[0:6] == bytes([0x01, 0x00, 0x5e, 0x00, 0x00, 0x01])
+    # IP dst = 224.0.0.1 at bytes 30..34
+    assert raw[30:34] == bytes([224, 0, 0, 1])
+    parsed = frame[IGMP]
+    assert parsed.type == 0x11
+    assert parsed.mrcode == 0
+
+
 def test_igmpv3_membership_report_destination_is_22():
     """IGMPv3 reports (type 0x22) go to 224.0.0.22 regardless of the
     reported group — that's where IGMPv3-capable queriers listen."""

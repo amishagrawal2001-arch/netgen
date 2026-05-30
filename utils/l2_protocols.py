@@ -542,12 +542,15 @@ def start_igmp(
 ) -> str:
     """Spawn an IGMP membership-report emitter.
 
-    `version=2` sends V2 Membership Reports (type 0x16).
-    `version=3` sends V3 Membership Reports (type 0x22) with a
-    single Mode-Is-Exclude record for `group`.
+    ``version=1`` sends V1 Membership Reports (type 0x12) per RFC 1112.
+    ``version=2`` sends V2 Membership Reports (type 0x16) per RFC 2236.
+    ``version=3`` sends V3 Membership Reports (type 0x22) with a
+    single Mode-Is-Exclude record for ``group`` (RFC 3376).
 
-    Override `type_code` to send Leave (0x17 for v2) or Query (0x11)
-    instead — useful for switch IGMP-snooping tests.
+    Override ``type_code`` to send Leave (0x17 for v2) or Query (0x11)
+    instead — useful for switch IGMP-snooping tests. For v1 Queries,
+    set ``type_code=0x11`` AND ``group="0.0.0.0"`` (General Query);
+    the destination is auto-set to ALL-SYSTEMS (224.0.0.1).
     """
     sid = str(uuid.uuid4())
     config = {
@@ -585,6 +588,24 @@ def start_igmp(
                 / IGMPv3mr(numgrp=1, records=[rec])
             )
         from scapy.contrib.igmp import IGMP
+        if version == 1:
+            # IGMPv1 (RFC 1112 §4):
+            #   • Membership Query: type 0x11, dst = 224.0.0.1
+            #     (ALL-SYSTEMS). Sent by routers.
+            #   • Membership Report: type 0x12, dst = group. Sent by
+            #     hosts in response to a Query.
+            # The scapy IGMP layer's mrcode field is RFC-2236 v2
+            # max-resp-time; v1 spec says it's reserved/zero, so we
+            # force mrcode=0 to be RFC-conformant.
+            t = type_code if type_code is not None else 0x12
+            ip_dst = "224.0.0.1" if t == 0x11 else group
+            return (
+                _l2_hdr(src_mac, _ipv4_mcast_mac(ip_dst), 0x0800,
+                        vlan_id, vlan_pcp, outer_vlan_id, outer_vlan_pcp)
+                / IP(src=src_ip, dst=ip_dst, ttl=1)
+                / IGMP(type=t, mrcode=0, gaddr=group)
+            )
+        # v2 (RFC 2236): the established default path.
         t = type_code if type_code is not None else 0x16
         # Leave Group (0x17) is sent to ALL-ROUTERS 224.0.0.2 (RFC 2236
         # §3) — NOT the group. Membership Reports (0x16) and group-specific
