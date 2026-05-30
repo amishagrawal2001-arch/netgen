@@ -2910,20 +2910,57 @@ class DevicesTab(QWidget):
                 failed_devices.append(device_name)
                 logging.error(f"[VXLAN APPLY] Exception applying VXLAN configuration for {device_name}: {e}")
         
-        # Show results
-        if failed_count == 0:
-            QMessageBox.information(
-                self,
-                "VXLAN Configuration Applied",
-                f"Successfully applied VXLAN configuration to {success_count} device(s)."
+        # v0.2.93: use MultiDeviceResultsDialog for per-device results —
+        # matches BGP / OSPF / ISIS apply UX. The previous
+        # QMessageBox.information just gave a count + comma-separated
+        # name list; the dialog shows each device's outcome on its own
+        # colour-coded line, which scales when there are more than a
+        # handful of devices.
+        failed_set = set(failed_devices)
+        results = []
+        for device in devices_to_apply:
+            name = device.get("Device Name", "Unknown")
+            if name in failed_set:
+                results.append(
+                    f"❌ {name}: VXLAN configuration failed "
+                    f"(check server logs)"
+                )
+            else:
+                results.append(
+                    f"✅ {name}: VXLAN configuration applied"
+                )
+
+        try:
+            summary = (
+                f"Applied VXLAN configuration: "
+                f"{success_count} succeeded, {failed_count} failed"
             )
-        else:
-            QMessageBox.warning(
-                self,
-                "VXLAN Configuration Partially Applied",
-                f"Applied to {success_count} device(s).\n"
-                f"Failed for {failed_count} device(s):\n{', '.join(failed_devices)}"
+            title = (
+                "VXLAN Configuration Applied"
+                if failed_count == 0
+                else "VXLAN Configuration Partially Applied"
             )
+            MultiDeviceResultsDialog(title, summary, results, self).exec_()
+        except Exception as dlg_exc:
+            # Dialog failure should never block the apply path; fall
+            # back to the simpler message so the operator still gets
+            # confirmation that work happened.
+            logging.warning(
+                f"[VXLAN APPLY] could not show results dialog: {dlg_exc}"
+            )
+            if failed_count == 0:
+                QMessageBox.information(
+                    self, "VXLAN Configuration Applied",
+                    f"Successfully applied VXLAN configuration to "
+                    f"{success_count} device(s)."
+                )
+            else:
+                QMessageBox.warning(
+                    self, "VXLAN Configuration Partially Applied",
+                    f"Applied to {success_count} device(s).\n"
+                    f"Failed for {failed_count} device(s):\n"
+                    + ", ".join(failed_devices)
+                )
         
         # Refresh VXLAN table and device table
         if hasattr(self, "vxlan_handler") and self.vxlan_handler:

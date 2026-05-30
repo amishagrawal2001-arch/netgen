@@ -2,6 +2,73 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.93] - 2026-05-30
+
+**Apply-result consistency across all 5 protocols** — closes the
+last open Devices-tab audit POLISH item. ISIS apply, ISIS remove,
+and VXLAN apply now show per-device results through the same
+`MultiDeviceResultsDialog` that BGP and OSPF already use. Operators
+get the same colour-coded ✅ / ❌ / ⚠️ / ℹ️ outcomes per device
+regardless of which protocol they applied.
+
+### What changed
+- **`utils/devices_tab_isis.py:_apply_isis_to_devices`** — was
+  silent on success, only popping a `QMessageBox.critical` on
+  network errors. Now collects per-device results, shows the
+  dialog at the end. Records skips with ℹ️ (missing device_id /
+  config / server URL), successes with ✅, HTTP failures with ❌ +
+  the server's error message (capped at 200 chars).
+- **`utils/devices_tab_isis.py:_remove_isis_from_devices`** —
+  same treatment. The dual-path nature (server removal + local
+  removal) surfaces honestly: ✅ for full server+local success,
+  ⚠️ for local-only when server removal failed or was skipped
+  (typical for non-Docker devices or when the FRR container's
+  already down).
+- **`widgets/devices_tab.py:apply_vxlan_configurations`** —
+  replaced the binary `QMessageBox.information` / `.warning`
+  branches (which just listed device names comma-separated) with
+  `MultiDeviceResultsDialog`. Each device gets its own
+  colour-coded line, which scales when the operator selects more
+  than a handful. Dialog-failure fallback retained so the legacy
+  message still fires if the dialog itself can't be constructed.
+
+### Why not the progress dialog too?
+The audit also flagged BGP/OSPF using `QProgressDialog` while
+ISIS/VXLAN/DHCP show nothing during the apply. Closing that gap
+properly means moving the sync apply paths to async worker threads
+(matching the `ApplyBGPWorker` pattern), which risks the same
+QThread SIGABRT problems v0.2.20–v0.2.25 fixed. The
+result-dialog consistency is the higher-value, lower-risk half;
+the progress-dialog half is deferred to a focused follow-up where
+the async-worker scaffolding can be done carefully.
+
+### Tests
+- **`tests/test_apply_result_consistency.py`** — new file, 10 tests:
+  - 4 dialog-level Qt tests: results render as labelled rows,
+    colour-coded by emoji prefix (green / red / orange / blue /
+    purple), summary label rendered, empty results don't crash.
+  - 3 parametrised source-grep guards confirming each apply path
+    (`_apply_isis_to_devices`, `_remove_isis_from_devices`,
+    `apply_vxlan_configurations`) imports
+    `MultiDeviceResultsDialog`.
+  - 2 tests confirming the new per-device-results list shape
+    (`results = []`, ✅/❌ prefixes used).
+  - 1 test confirming the VXLAN fallback-on-dialog-failure path
+    still exists so a future dialog refactor can't silently strip
+    operator feedback.
+
+### Devices audit — fully closed
+With v0.2.93 every PAIN + POLISH item from the v0.2.85 Devices-tab
+audit has been shipped. Only deferred:
+- **Async-worker progress dialogs** for the remaining 3 sync
+  apply paths (see "Why not the progress dialog" above).
+- **Sortable headers** for the OSPF / IS-IS / VXLAN / DHCP tables
+  (feature add, not a bug; the v0.2.92 sort-state helper is
+  ready when they get it).
+
+### Test count
+645 → 655 (+10).
+
 ## [0.2.92] - 2026-05-30
 
 **Sort-state preservation across table rebuilds** — closes another

@@ -377,7 +377,21 @@ class ISISHandler:
 
 
     def _apply_isis_to_devices(self, devices, server_url):
-        """Apply ISIS configuration to the specified devices."""
+        """Apply ISIS configuration to the specified devices.
+
+        v0.2.93: collect per-device results into the same shape BGP
+        and OSPF use, then surface them through MultiDeviceResultsDialog
+        so all 5 protocols' apply-completion UX is consistent. Old
+        behaviour was silent-on-success / QMessageBox.critical on
+        network error only — operators had no confirmation per
+        device.
+        """
+        # Per-device result strings, prefixed with the same emoji the
+        # MultiDeviceResultsDialog colour-codes on (✅ = green, ❌ = red,
+        # ⚠️ = orange, ℹ️ = blue, ⏱️ = purple).
+        results = []
+        success_count = 0
+        failed_count = 0
         try:
             for device in devices:
                 device_id = device.get("device_id")
@@ -392,8 +406,12 @@ class ISISHandler:
                     isis_config = proto.get("ISIS", {}) or proto.get("isis", {})
                 
                 if not device_id or not isis_config:
+                    results.append(
+                        f"ℹ️ {device_name}: skipped (missing "
+                        f"device_id or isis_config)"
+                    )
                     continue
-                
+
                 # Prepare ISIS configuration data using the configure endpoint (similar to OSPF)
                 isis_data = {
                     "device_id": device_id,
@@ -410,6 +428,10 @@ class ISISHandler:
                 # Ensure per-device server URL exists
                 if not per_device_server_url:
                     logger.info(f"[ISIS POST] No server URL resolved for device '{device_name}'. Skipping.")
+                    results.append(
+                        f"ℹ️ {device_name}: skipped (no server URL "
+                        f"resolved from interface)"
+                    )
                     continue
 
                 post_url = f"{per_device_server_url}/api/device/isis/configure"
@@ -425,34 +447,86 @@ class ISISHandler:
                     response = requests.post(post_url, json=isis_data, timeout=30)
                 except Exception as e:
                     logger.error(f"[ISIS POST] Exception posting to {post_url}: {e}")
+                    results.append(
+                        f"❌ {device_name}: network error — {e}"
+                    )
+                    failed_count += 1
                     continue
-                
+
                 if response.status_code == 200:
                     logger.info(f"ISIS configuration applied to server for {device_name}")
+                    results.append(
+                        f"✅ {device_name}: ISIS configuration applied"
+                    )
+                    success_count += 1
                 else:
                     try:
                         error_msg = response.json().get("error", response.text)
                     except Exception:
                         error_msg = response.text
                     logger.error(f"Failed to apply ISIS configuration for {device_name} (status {response.status_code}): {error_msg}")
-            
+                    # Cap error message at 200 chars so the dialog stays
+                    # readable; full text is in the server logs.
+                    short = (error_msg or "")[:200]
+                    results.append(
+                        f"❌ {device_name}: HTTP {response.status_code} — {short}"
+                    )
+                    failed_count += 1
+
             # Refresh ISIS table after applying configurations
             self.update_isis_table()
-            
+
         except requests.exceptions.RequestException as e:
             logger.error(f"Network error applying ISIS configurations: {str(e)}")
-            QMessageBox.critical(self.parent, "Network Error", f"Failed to apply ISIS configurations: {str(e)}")
+            results.append(f"❌ Network error applying ISIS configurations: {e}")
+            failed_count += 1
+
+        # v0.2.93: show MultiDeviceResultsDialog — same UX BGP and OSPF
+        # already use. Only when we actually processed something; an
+        # empty selection should stay silent.
+        if results:
+            try:
+                from widgets.devices_tab import MultiDeviceResultsDialog
+                summary = (
+                    f"Applied ISIS configuration: "
+                    f"{success_count} succeeded, {failed_count} failed"
+                )
+                title = (
+                    "ISIS Configuration Applied"
+                    if failed_count == 0
+                    else "ISIS Configuration Partially Applied"
+                )
+                MultiDeviceResultsDialog(
+                    title, summary, results, self.parent
+                ).exec_()
+            except Exception as dlg_exc:
+                # Dialog failure should never block the apply — log
+                # and fall through.
+                logger.warning(
+                    f"[ISIS APPLY] could not show results dialog: {dlg_exc}"
+                )
 
 
     def _remove_isis_from_devices(self, devices, server_url):
-        """Remove ISIS configuration from the specified devices."""
+        """Remove ISIS configuration from the specified devices.
+
+        v0.2.93: same MultiDeviceResultsDialog treatment as the
+        apply path — per-device results collected and shown at the
+        end so operators see what actually happened.
+        """
+        results = []
+        success_count = 0
+        failed_count = 0
         try:
             for device in devices:
                 device_id = device.get("device_id")
                 device_name = device.get("Device Name", "Unknown")
                 isis_config = device.get("isis_config", {}) or device.get("is_is_config", {})
-                
+
                 if not device_id:
+                    results.append(
+                        f"ℹ️ {device_name}: skipped (no device_id)"
+                    )
                     continue
                 
                 # Try to remove ISIS configuration from server first (for Docker-based devices)
@@ -496,17 +570,57 @@ class ISISHandler:
                     if isinstance(protocols, list) and "IS-IS" in protocols:
                         protocols.remove("IS-IS")
                         logger.info(f"ISIS configuration removed locally for {device_name} (list format)")
-            
+
+                # Record per-device result. Server-side removal +
+                # local removal both happen — call out which path
+                # succeeded for transparency.
+                if server_removal_success:
+                    results.append(
+                        f"✅ {device_name}: ISIS removed (server + local)"
+                    )
+                    success_count += 1
+                else:
+                    # Local removal worked even if server removal
+                    # didn't — typical for non-Docker devices or when
+                    # the FRR container's already down.
+                    results.append(
+                        f"⚠️ {device_name}: ISIS removed locally only "
+                        f"(server removal skipped or failed; check logs)"
+                    )
+                    success_count += 1  # local removal IS a success
+
             # Refresh ISIS table after removing configurations
             self.update_isis_table()
-            
+
             # Save session
             if hasattr(self.parent.main_window, "save_session"):
                 self.parent.main_window.save_session()
-            
+
         except Exception as e:
             logger.error(f"Error removing ISIS configurations: {str(e)}")
-            QMessageBox.critical(self.parent, "Error", f"Failed to remove ISIS configurations: {str(e)}")
+            results.append(f"❌ Error removing ISIS configurations: {e}")
+            failed_count += 1
+
+        # Per-device results dialog (v0.2.93).
+        if results:
+            try:
+                from widgets.devices_tab import MultiDeviceResultsDialog
+                summary = (
+                    f"Removed ISIS configuration: "
+                    f"{success_count} succeeded, {failed_count} failed"
+                )
+                title = (
+                    "ISIS Configuration Removed"
+                    if failed_count == 0
+                    else "ISIS Configuration Removal Partial"
+                )
+                MultiDeviceResultsDialog(
+                    title, summary, results, self.parent
+                ).exec_()
+            except Exception as dlg_exc:
+                logger.warning(
+                    f"[ISIS REMOVE] could not show results dialog: {dlg_exc}"
+                )
 
 
     def refresh_isis_status(self):
