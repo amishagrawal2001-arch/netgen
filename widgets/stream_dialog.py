@@ -3878,14 +3878,36 @@ class AddStreamDialog(QDialog):
         mpls_layout.addWidget(self.mpls_ttl_field, 0, 3)
         mpls_layout.addWidget(QLabel("Experimental:"), 0, 4)
         mpls_layout.addWidget(self.mpls_experimental_field, 0, 5)
-        
+
         # Add minimum size constraints to MPLS fields (no max to allow expansion)
         self.mpls_label_field.setMinimumWidth(60)
         self.mpls_ttl_field.setMinimumWidth(60)
         self.mpls_experimental_field.setMinimumWidth(60)
 
+        # SR-MPLS label-stack field (0.2.65). Comma-separated SIDs build
+        # a multi-label stack with auto bottom-of-stack handling (see
+        # utils/mpls.build_mpls_stack). When set, this OVERRIDES the
+        # single Label field above — extract_mpls_labels in
+        # utils/mpls.py prefers `mpls_labels` over `mpls_label`. TC and
+        # TTL above apply uniformly to every label in the stack.
+        self.mpls_labels_field = QLineEdit("")
+        self.mpls_labels_field.setPlaceholderText(
+            "(optional — comma-separated label stack, e.g. 16000, 16001, 16002)"
+        )
+        self.mpls_labels_field.setToolTip(
+            "SR-MPLS label stack — comma-separated SIDs, top-of-stack "
+            "first. When set, the Label field above is ignored and the "
+            "full stack is emitted with ethertype 0x8847 and the bottom-"
+            "of-stack bit set on the last label. Leave blank for a "
+            "single-label MPLS frame using the Label field above."
+        )
+        self.mpls_labels_field.setMinimumWidth(220)
+        mpls_layout.addWidget(QLabel("Label stack:"), 1, 0)
+        mpls_layout.addWidget(self.mpls_labels_field, 1, 1, 1, 5)
+
         mpls_group.setLayout(mpls_layout)
-        mpls_group.setMaximumHeight(70)
+        # Two-row layout now; the old 70px cap clipped the second row.
+        mpls_group.setMaximumHeight(110)
         self.mpls_group = mpls_group
 
     def add_vlan_section(self):
@@ -5021,6 +5043,14 @@ class AddStreamDialog(QDialog):
         self.mpls_label_field.setText(mpls_data.get("mpls_label", "16"))
         self.mpls_ttl_field.setText(mpls_data.get("mpls_ttl", "64"))
         self.mpls_experimental_field.setText(mpls_data.get("mpls_experimental", "0"))
+        # SR-MPLS label stack (0.2.65). Stored either as a list or a
+        # comma-separated string — normalise back to the dialog's
+        # comma-separated text form so the user sees what they typed.
+        raw_labels = mpls_data.get("mpls_labels", "")
+        if isinstance(raw_labels, list):
+            self.mpls_labels_field.setText(", ".join(str(x) for x in raw_labels))
+        else:
+            self.mpls_labels_field.setText(str(raw_labels or ""))
 
         # TCP
         tcp_data = stream_data.get("protocol_data", {}).get("tcp", {})
@@ -5494,11 +5524,29 @@ class AddStreamDialog(QDialog):
 
         # MPLS
         if hasattr(self, "mpls_label_field"):
-            protocol_data["mpls"] = {
+            mpls_block = {
                 "mpls_label": self.mpls_label_field.text().strip(),
                 "mpls_ttl": self.mpls_ttl_field.text().strip(),
                 "mpls_experimental": self.mpls_experimental_field.text().strip(),
             }
+            # SR-MPLS stack (0.2.65). Persist as a parsed list when the
+            # text parses cleanly — that's the canonical shape the
+            # generic builder + tests expect. Empty/blank → omit, so
+            # legacy single-label streams stay bit-identical.
+            stack_text = self.mpls_labels_field.text().strip() \
+                if hasattr(self, "mpls_labels_field") else ""
+            if stack_text:
+                try:
+                    from utils.mpls import extract_mpls_labels
+                    parsed = extract_mpls_labels({"mpls_labels": stack_text})
+                    if parsed:
+                        mpls_block["mpls_labels"] = parsed
+                except Exception:
+                    # Helper raised on bad input — drop the stack and
+                    # let the user see the validation feedback elsewhere
+                    # (the generic builder will refuse and log).
+                    pass
+            protocol_data["mpls"] = mpls_block
 
         # IPv4
         if hasattr(self, "source_field"):

@@ -2,6 +2,46 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.65] - 2026-05-30
+
+**SR-MPLS label-stack GUI field** — completes 0.2.64. The backend
+understood `mpls_labels`; now the Stream Edit dialog exposes it so
+users don't have to hand-edit JSON.
+
+### What changed
+- **`widgets/stream_dialog.py`** — Stream Edit's MPLS group gains a
+  second row: **Label stack** (comma-separated SIDs, e.g.
+  ``16000, 16001, 16002``). Accepts hex too (``0x10, 0x20``).
+  - Placeholder + tooltip both call out that this is the SR-MPLS
+    stack and that it overrides the single Label field above.
+  - Save path parses the text into a list via the existing
+    ``utils.mpls.extract_mpls_labels`` helper and writes
+    ``mpls_labels: [..]`` to ``protocol_data.mpls``. Blank field
+    → key omitted (pre-0.2.64 streams stay bit-identical).
+  - Load path normalises a stored list back to comma-separated
+    text so the user sees what they originally typed (not a
+    Python list repr).
+  - Garbage input is dropped silently — the legacy single-label
+    field still goes through, so a typo doesn't brick the stream.
+  - MPLS group cap raised 70 → 110 px to fit the second row
+    (previously clipped).
+
+### Verified — 9 new tests, full suite 227 passing
+`tests/test_stream_dialog_mpls.py`:
+- Field exists with helpful placeholder + SR-MPLS tooltip.
+- Save: blank field omits `mpls_labels`; comma-separated text
+  parses into a list; hex labels accepted; garbage input dropped
+  without breaking the rest of the payload.
+- Load: list normalises to comma-separated text; string passes
+  through unchanged; empty stack → empty field.
+- Round-trip: load → save preserves the stack.
+
+(One unrelated flake in the stateful-TCP TLS-handshake test —
+timing-sensitive, passes in isolation; not touched by this change.)
+
+### Notes
+- Client-only. Server side was already done in 0.2.64.
+
 ## [0.2.64] - 2026-05-30
 
 **Enhancement #4 of 4 (final slice) — SR-MPLS label-stack support
