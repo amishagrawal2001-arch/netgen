@@ -670,3 +670,128 @@ def start_pim_hello(
     _register_and_start(sess, _factory, interval_s, duration_s)
     logger.info(f"[L2] PIM Hello started session={sid} iface={iface}")
     return sid
+
+
+# ====================================================================
+# BFD — Bidirectional Forwarding Detection (RFC 5880 / 5881)
+# ====================================================================
+#
+# Single-hop async-mode control packets. UDP/3784 (multi-hop is 4784,
+# echo is 3785). RFC 5881 §5 mandates IP TTL=255 for single-hop so a
+# receiver can verify the packet was originated on the directly
+# connected link.
+#
+# We don't implement the full state machine (no Poll / Final sequence,
+# no peer's discriminator learning, no demand-mode). The emitter sends
+# a fixed-state control packet at the configured interval, which is
+# enough to: (a) keep a peer's session Up by asserting our liveness,
+# or (b) deliberately tear a session down by sending state=Down.
+#
+# scapy doesn't carry a stable BFD layer across versions, so we build
+# the 24-byte control payload via struct.pack — the RFC bit layout is
+# fully pinned by tests/test_bfd_l2.py.
+
+
+def start_bfd(
+    iface: str,
+    *,
+    src_ip: str = "10.0.0.1",
+    dst_ip: str = "10.0.0.2",
+    src_mac: str = "00:11:22:33:44:06",
+    dst_mac: str = "00:11:22:33:44:07",
+    my_discriminator: int = 0x11111111,
+    your_discriminator: int = 0,
+    state: int = 3,                       # 0=AdminDown 1=Down 2=Init 3=Up
+    detect_mult: int = 3,
+    diag: int = 0,
+    desired_min_tx_us: int = 1_000_000,
+    required_min_rx_us: int = 1_000_000,
+    required_min_echo_rx_us: int = 0,
+    dst_udp_port: int = 3784,             # 3784 single-hop / 4784 multi-hop
+    interval_s: float = 1.0,
+    duration_s: Optional[float] = None,
+    vlan_id: Optional[int] = None,
+    vlan_pcp: int = 0,
+    outer_vlan_id: Optional[int] = None,
+    outer_vlan_pcp: int = 0,
+) -> str:
+    """Spawn a BFD control-packet emitter (RFC 5880 async mode).
+
+    Defaults to State=Up, detect_mult=3, 1 Hz, dst_udp_port=3784
+    (single-hop), TTL=255. Override state=1 (Down) to simulate a peer
+    going down; tweak intervals for sub-second BFD (e.g. interval_s=0.1
+    + desired_min_tx_us=100000).
+
+    Returns session_id.
+    """
+    import struct
+    import uuid as _uuid
+
+    sid = str(_uuid.uuid4())
+    config = {
+        "src_ip": src_ip, "dst_ip": dst_ip,
+        "src_mac": src_mac, "dst_mac": dst_mac,
+        "my_discriminator": int(my_discriminator),
+        "your_discriminator": int(your_discriminator),
+        "state": int(state),
+        "detect_mult": int(detect_mult),
+        "diag": int(diag),
+        "desired_min_tx_us": int(desired_min_tx_us),
+        "required_min_rx_us": int(required_min_rx_us),
+        "required_min_echo_rx_us": int(required_min_echo_rx_us),
+        "dst_udp_port": int(dst_udp_port),
+        "interval_s": float(interval_s),
+        "duration_s": duration_s,
+        "vlan_id": vlan_id, "vlan_pcp": int(vlan_pcp),
+        "outer_vlan_id": outer_vlan_id, "outer_vlan_pcp": int(outer_vlan_pcp),
+    }
+    sess = _Session(session_id=sid, protocol="bfd", iface=iface, config=config)
+
+    # Pre-compute the BFD payload once — fixed across the session.
+    # Byte 0: Version (top 3 bits, =3) | Diag (bottom 5 bits).
+    # Byte 1: State (top 2 bits) | Flags (bottom 6 bits — P/F/C/A/D/M).
+    #         No flags by default (no Poll handshake, no auth).
+    # Byte 2: Detect Multiplier.
+    # Byte 3: Length (24 for no-auth).
+    # Then four 32-bit big-endian fields:
+    #   My Discriminator, Your Discriminator,
+    #   Desired Min TX Interval (µs), Required Min RX Interval (µs),
+    #   Required Min Echo RX Interval (µs).
+    ver_diag = (3 << 5) | (int(diag) & 0x1f)
+    state_flags = (int(state) & 0x3) << 6
+    bfd_payload = struct.pack(
+        ">BBBBIIIII",
+        ver_diag,
+        state_flags,
+        int(detect_mult) & 0xff,
+        24,
+        int(my_discriminator) & 0xffffffff,
+        int(your_discriminator) & 0xffffffff,
+        int(desired_min_tx_us) & 0xffffffff,
+        int(required_min_rx_us) & 0xffffffff,
+        int(required_min_echo_rx_us) & 0xffffffff,
+    )
+
+    def _factory():
+        from scapy.layers.inet import IP, UDP
+        from scapy.packet import Raw
+        # RFC 5881 §5: single-hop BFD MUST use TTL=255. The receiver
+        # verifies TTL==255 to confirm the packet originated on the
+        # directly-connected link (no router could have decremented it).
+        # An ephemeral source port keeps the path through any stateful
+        # NAT/conntrack stable for the session lifetime.
+        return (
+            _l2_hdr(src_mac, dst_mac, 0x0800,
+                    vlan_id, vlan_pcp,
+                    outer_vlan_id, outer_vlan_pcp)
+            / IP(src=src_ip, dst=dst_ip, ttl=255)
+            / UDP(sport=49152, dport=int(dst_udp_port))
+            / Raw(load=bfd_payload)
+        )
+
+    _register_and_start(sess, _factory, interval_s, duration_s)
+    logger.info(
+        f"[L2] BFD started session={sid} iface={iface} "
+        f"state={state} my_disc=0x{int(my_discriminator):08x}"
+    )
+    return sid

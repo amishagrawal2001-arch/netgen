@@ -72,6 +72,12 @@ _PROTOCOL_FACTORIES = {
     "pim":  ("start_pim_hello", ("hold_time", "dr_priority", "generation_id",
                                  "interval_s", "duration_s",
                                  "src_ip", "src_mac") + _VLAN_KEYS),
+    "bfd":  ("start_bfd", ("src_ip", "dst_ip", "src_mac", "dst_mac",
+                           "my_discriminator", "your_discriminator",
+                           "state", "detect_mult", "diag",
+                           "desired_min_tx_us", "required_min_rx_us",
+                           "required_min_echo_rx_us", "dst_udp_port",
+                           "interval_s", "duration_s") + _VLAN_KEYS),
 }
 
 

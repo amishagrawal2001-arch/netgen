@@ -2,6 +2,79 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.61] - 2026-05-30
+
+**Enhancement #4 of 4 (slice 2) — BFD emitter (RFC 5880 / 5881).**
+Sixth L2-emulation protocol, joining LACP / LLDP / VRRP / IGMP / PIM
+Hello.
+
+### Wire format
+`utils/l2_protocols.start_bfd` emits an `Ether / IP / UDP / Raw(BFD)`
+frame at the configured cadence. BFD control payload is hand-packed to
+the RFC 5880 §4.1 layout (scapy carries no stable BFD layer across
+versions), 24 bytes, no auth:
+
+  * Byte 0: Version (3) | Diag (5 bits)
+  * Byte 1: State (top 2 bits) | Flags (bottom 6, all 0 — no Poll, no
+    auth, no demand)
+  * Byte 2: Detect Multiplier · Byte 3: Length (24)
+  * Bytes 4-7 / 8-11: My / Your Discriminator (big-endian)
+  * Bytes 12-23: Desired Min TX, Required Min RX, Required Min Echo
+    RX intervals (µs, big-endian)
+
+L3/L4 envelope: source UDP port 49152, dst port **3784** (single-hop;
+override to 4784 multi-hop or 3785 echo), **IP TTL=255** as RFC 5881 §5
+mandates so the receiver can verify the packet originated on the
+directly-connected link. Inline 802.1Q and 802.1ad QinQ tagging
+(0.2.41 / 0.2.60) are supported transparently.
+
+State machine is intentionally not modelled — emitter sends a fixed
+state at a fixed cadence, which is enough to: keep a peer's session Up
+by asserting our liveness, or deliberately tear a session down by
+sending State=Down.
+
+### What changed
+- **`utils/l2_protocols.py`** — new `start_bfd` factory. Defaults to
+  State=Up, detect_mult=3, 1 Hz, dst_udp_port=3784, my_discriminator
+  0x11111111. Pre-computes the 24-byte payload once and reuses it
+  across every frame (no per-tick struct.pack cost).
+- **`server/l2_routes.py`** — added `"bfd"` to `_PROTOCOL_FACTORIES`
+  with the full kwarg allow-list (state, detect_mult, my/your
+  discriminator, all three intervals, dst_udp_port, send interval,
+  duration, + the inherited VLAN keys).
+- **`widgets/l2_emulation_tab.py`** — `"BFD — Bidirectional Forwarding
+  Detection (RFC 5880)"` added to the protocol picker. New BFD
+  parameter panel with: state combo (Up/Down/Init/AdminDown), src/dst
+  IP+MAC, My/Your Discriminator (hex or decimal), detect mult, desired
+  min TX µs, required min RX µs, dst UDP port (3784 default), send
+  interval (sub-second supported). Dispatch in `_on_accept` parses
+  discriminators, rejects zero My Discriminator (RFC 5880 §6.8.1).
+  Emerald protocol-badge colour `#059669` (distinct from running/
+  stopped greens).
+
+### Verified — 18 new tests, full suite 171 passing
+`tests/test_bfd_l2.py`:
+- Factory export + REST allow-list contains `start_bfd` with every
+  expected kwarg.
+- Envelope: dst port 3784 single-hop / 4784 multi-hop / TTL=255.
+- Payload bytes: 24 bytes, version=3, length=24; state encoded in
+  byte-1 top 2 bits for all four states; default flags = 0; diag in
+  byte-0 bottom 5 bits without leaking into version; detect_mult in
+  byte 2; discriminators at offsets 4 / 8 big-endian; intervals at
+  12 / 16 / 20 big-endian µs.
+- 802.1Q single-tag and 802.1ad QinQ wrapping keep the 24-byte payload
+  intact and the outer ethertype correct (0x8100 / 0x88a8).
+- Dialog round-trips state / discriminators / intervals / port;
+  rejects zero discriminator and malformed text.
+
+### Next on this enhancement
+0.2.62: EVPN type-2 (MAC/IP) generator (BGP-side; UPDATE messages
+carrying EVPN NLRI); SR-MPLS label-stack support in the existing tx
+path.
+
+### Notes
+- Server-only addition; the existing factories are unchanged.
+
 ## [0.2.60] - 2026-05-29
 
 **Enhancement #4 of 4 (slice 1) — protocol expansion: QinQ (802.1ad)

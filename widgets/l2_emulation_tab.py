@@ -103,6 +103,7 @@ class _L2ConfigDialog(QDialog):
         ("vrrp", "VRRP — First-hop redundancy"),
         ("igmp", "IGMP — Multicast group reports"),
         ("pim",  "PIM Hello — Multicast adjacency"),
+        ("bfd",  "BFD — Bidirectional Forwarding Detection (RFC 5880)"),
     ]
 
     def __init__(self, parent=None, default_iface: str = ""):
@@ -207,6 +208,7 @@ class _L2ConfigDialog(QDialog):
         self._stack.addWidget(self._build_vrrp_panel())
         self._stack.addWidget(self._build_igmp_panel())
         self._stack.addWidget(self._build_pim_panel())
+        self._stack.addWidget(self._build_bfd_panel())
         outer.addWidget(self._stack, 1)
 
         # Hint footer
@@ -396,6 +398,94 @@ class _L2ConfigDialog(QDialog):
         f.addRow("Interval:", self._pim_interval)
         return w
 
+    def _build_bfd_panel(self) -> QWidget:
+        w = QGroupBox("BFD parameters (RFC 5880 single-hop async)")
+        f = QFormLayout(w)
+
+        # State combo — most useful day-1 control. Up = peer thinks
+        # we're alive (default). Down = simulate us going down. Init/
+        # AdminDown are advanced (manual session bring-up / admin
+        # disable). Numeric values match the RFC: 0/1/2/3.
+        self._bfd_state = QComboBox()
+        self._bfd_state.addItem("Up (3)",         3)
+        self._bfd_state.addItem("Down (1)",       1)
+        self._bfd_state.addItem("Init (2)",       2)
+        self._bfd_state.addItem("AdminDown (0)",  0)
+        self._bfd_state.setToolTip(
+            "BFD session state we declare in each control packet. Up = "
+            "peer sees us as alive; Down = simulate us going down."
+        )
+
+        self._bfd_src_ip = QLineEdit("10.0.0.1")
+        self._bfd_dst_ip = QLineEdit("10.0.0.2")
+        self._bfd_src_mac = QLineEdit("00:11:22:33:44:06")
+        self._bfd_dst_mac = QLineEdit("00:11:22:33:44:07")
+
+        self._bfd_my_disc = QLineEdit("0x11111111")
+        self._bfd_my_disc.setPlaceholderText("Hex (0x…) or decimal — non-zero")
+        self._bfd_my_disc.setToolTip(
+            "My Discriminator — unique session identifier we choose. "
+            "RFC 5880 requires a non-zero value; the peer echoes it back "
+            "as 'Your Discriminator' in its replies."
+        )
+        self._bfd_your_disc = QLineEdit("0x00000000")
+        self._bfd_your_disc.setPlaceholderText("Hex or decimal — 0 if peer unknown")
+        self._bfd_your_disc.setToolTip(
+            "Your Discriminator — the peer's session ID, learned from "
+            "its packets. 0 is correct until we hear from the peer."
+        )
+
+        self._bfd_detect_mult = QSpinBox()
+        self._bfd_detect_mult.setRange(1, 255)
+        self._bfd_detect_mult.setValue(3)
+        self._bfd_detect_mult.setToolTip(
+            "Detection multiplier — peer declares us Down after this "
+            "many missed packets. Industry default is 3."
+        )
+
+        self._bfd_tx_us = QSpinBox()
+        self._bfd_tx_us.setRange(1000, 30_000_000)
+        self._bfd_tx_us.setValue(1_000_000)
+        self._bfd_tx_us.setSuffix(" µs")
+        self._bfd_tx_us.setToolTip("Desired Min TX Interval (µs).")
+        self._bfd_rx_us = QSpinBox()
+        self._bfd_rx_us.setRange(1000, 30_000_000)
+        self._bfd_rx_us.setValue(1_000_000)
+        self._bfd_rx_us.setSuffix(" µs")
+        self._bfd_rx_us.setToolTip("Required Min RX Interval (µs).")
+
+        self._bfd_dst_port = QSpinBox()
+        self._bfd_dst_port.setRange(1, 65535)
+        self._bfd_dst_port.setValue(3784)
+        self._bfd_dst_port.setToolTip(
+            "Destination UDP port. 3784 = single-hop async (default), "
+            "4784 = multi-hop, 3785 = echo."
+        )
+
+        self._bfd_interval = QDoubleSpinBox()
+        self._bfd_interval.setRange(0.05, 60.0)
+        self._bfd_interval.setSingleStep(0.1)
+        self._bfd_interval.setValue(1.0)
+        self._bfd_interval.setSuffix(" s")
+        self._bfd_interval.setToolTip(
+            "Send-cadence in seconds (independent of the µs intervals "
+            "above, which only describe BFD timing intent to the peer)."
+        )
+
+        f.addRow("State:", self._bfd_state)
+        f.addRow("Source IP:", self._bfd_src_ip)
+        f.addRow("Destination IP:", self._bfd_dst_ip)
+        f.addRow("Source MAC:", self._bfd_src_mac)
+        f.addRow("Destination MAC:", self._bfd_dst_mac)
+        f.addRow("My Discriminator:", self._bfd_my_disc)
+        f.addRow("Your Discriminator:", self._bfd_your_disc)
+        f.addRow("Detect Mult:", self._bfd_detect_mult)
+        f.addRow("Desired Min TX:", self._bfd_tx_us)
+        f.addRow("Required Min RX:", self._bfd_rx_us)
+        f.addRow("Dst UDP port:", self._bfd_dst_port)
+        f.addRow("Send interval:", self._bfd_interval)
+        return w
+
     # ------------------------------------------------------------------
     def _on_accept(self):
         proto = self._proto_combo.currentData()
@@ -506,6 +596,46 @@ class _L2ConfigDialog(QDialog):
                 "src_mac": self._pim_src_mac.text().strip(),
                 "interval_s": self._pim_interval.value(),
             })
+        elif proto == "bfd":
+            # Parse discriminator fields the same way generation_id does
+            # — accept hex (0xABCDEF01) or decimal. RFC 5880 requires
+            # My Discriminator to be non-zero; reject "0" up front rather
+            # than letting the factory ship a bogus session id.
+            def _parse_disc(field_text, label):
+                try:
+                    return int(field_text.strip(), 0)
+                except ValueError:
+                    QMessageBox.warning(
+                        self, "Invalid input",
+                        f"{label} must be hex (0x...) or decimal."
+                    )
+                    return None
+            my_disc = _parse_disc(self._bfd_my_disc.text(), "My Discriminator")
+            if my_disc is None:
+                return
+            if my_disc == 0:
+                QMessageBox.warning(
+                    self, "Invalid input",
+                    "My Discriminator must be non-zero (RFC 5880 §6.8.1)."
+                )
+                return
+            your_disc = _parse_disc(self._bfd_your_disc.text(), "Your Discriminator")
+            if your_disc is None:
+                return
+            body.update({
+                "state":               self._bfd_state.currentData(),
+                "src_ip":              self._bfd_src_ip.text().strip(),
+                "dst_ip":              self._bfd_dst_ip.text().strip(),
+                "src_mac":             self._bfd_src_mac.text().strip(),
+                "dst_mac":             self._bfd_dst_mac.text().strip(),
+                "my_discriminator":    my_disc,
+                "your_discriminator":  your_disc,
+                "detect_mult":         self._bfd_detect_mult.value(),
+                "desired_min_tx_us":   self._bfd_tx_us.value(),
+                "required_min_rx_us":  self._bfd_rx_us.value(),
+                "dst_udp_port":        self._bfd_dst_port.value(),
+                "interval_s":          self._bfd_interval.value(),
+            })
 
         self._payload = {"protocol": proto, "body": body}
         self.accept()
@@ -546,6 +676,7 @@ class L2EmulationTab(QWidget):
         "vrrp": "#ca8a04",   # amber
         "igmp": "#2563eb",   # blue
         "pim":  "#db2777",   # pink
+        "bfd":  "#059669",   # emerald — distinct from running/stopped greens
     }
 
     def __init__(self, parent_window):
@@ -1066,7 +1197,7 @@ class L2EmulationTab(QWidget):
     def _skip_as_default_iface(name: str) -> bool:
         """True for interfaces that must never be the L2 default.
 
-        L2 emulation frames (LACP/LLDP/VRRP/IGMP/PIM) have to egress a
+        L2 emulation frames (LACP/LLDP/VRRP/IGMP/PIM/BFD) have to egress a
         real NIC toward the switch — loopback delivers them nowhere. The
         server's /api/interfaces list frequently returns 'lo' FIRST, so
         the old `ifaces[0]` pick defaulted the dialog to loopback. Skip
