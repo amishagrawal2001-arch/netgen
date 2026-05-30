@@ -1,0 +1,554 @@
+"""Stateful TCP tab — dialog + table widget tests.
+
+Headless qapp tests for `widgets/stateful_tcp_tab.py`. The pattern
+mirrors `tests/test_dpdk_readiness_chip.py` and `tests/test_evpn_inject_dialog.py`:
+monkeypatch `requests.get` / `requests.post` at the module the widget
+imports, drive `refresh()` and the dialog's accept path directly,
+assert on the rendered cells and the captured request bodies.
+
+Bypasses the QTimer/QThread machinery — we test the synchronous
+handlers (`_on_refresh_ok`, `_on_refresh_failed`, `_on_accept`,
+`_stop_session_by_id`, etc.) rather than waiting for real polls.
+"""
+
+from types import SimpleNamespace
+from typing import Any, Dict, List
+from unittest.mock import MagicMock
+
+import pytest
+from PyQt5.QtCore import Qt
+from PyQt5.QtWidgets import QDialog, QMessageBox, QWidget
+
+
+# ──────────────────────────────────────────────────────── pure validators
+
+
+def test_validate_ip_accepts_v4_v6_and_bind_any():
+    from widgets.stateful_tcp_tab import _validate_ip
+    assert _validate_ip("10.0.0.5") is None
+    assert _validate_ip("0.0.0.0") is None           # server bind-any
+    assert _validate_ip("127.0.0.1") is None
+    assert _validate_ip("::1") is None
+    assert _validate_ip("2001:db8::1") is None
+
+
+def test_validate_ip_rejects_garbage():
+    from widgets.stateful_tcp_tab import _validate_ip
+    assert _validate_ip("") is not None
+    assert _validate_ip("999.0.0.1") is not None
+    assert _validate_ip("not-an-ip") is not None
+
+
+def test_validate_port_rejects_zero_and_overflow():
+    from widgets.stateful_tcp_tab import _validate_port
+    assert _validate_port(1) is None
+    assert _validate_port(5001) is None
+    assert _validate_port(65535) is None
+    assert _validate_port(0) is not None
+    assert _validate_port(65536) is not None
+
+
+def test_is_loopback_handles_v4_v6_and_garbage():
+    from widgets.stateful_tcp_tab import _is_loopback
+    assert _is_loopback("127.0.0.1") is True
+    assert _is_loopback("127.5.5.5") is True   # entire 127/8
+    assert _is_loopback("::1") is True
+    assert _is_loopback("10.0.0.5") is False
+    assert _is_loopback("") is False           # graceful fallback
+    assert _is_loopback("garbage") is False
+
+
+# ──────────────────────────────────────────────────────── dialog fixtures
+
+
+@pytest.fixture
+def open_dialog(qapp, monkeypatch):
+    """Build a config dialog with the modal QMessageBox calls
+    silenced — pop-ups would otherwise block the headless run.
+
+    The dialog is `show()`-n (against the offscreen Qt platform) so
+    `QWidget.isVisible()` works in the visibility-toggle assertions
+    below. Without show(), every widget reports `isVisible() == False`
+    regardless of `setVisible()` state because no ancestor is mapped."""
+    monkeypatch.setattr(QMessageBox, "warning", staticmethod(lambda *a, **k: None))
+    monkeypatch.setattr(QMessageBox, "information", staticmethod(lambda *a, **k: None))
+    monkeypatch.setattr(QMessageBox, "question",
+                        staticmethod(lambda *a, **k: QMessageBox.Yes))
+    from widgets.stateful_tcp_tab import _StatefulTcpConfigDialog
+    parent = QWidget()
+    parent.show()
+    dlg = _StatefulTcpConfigDialog(parent)
+    dlg.show()
+    yield dlg, parent
+    try:
+        dlg.close()
+        parent.close()
+    except Exception:
+        pass
+
+
+# ─────────────────────────────────────────────── dialog: visibility wiring
+
+
+def test_dialog_default_role_is_client(open_dialog):
+    dlg, _ = open_dialog
+    assert dlg._role_client.isChecked() is True
+    assert dlg._role_server.isChecked() is False
+    # Stack should be on the client panel (index 0).
+    assert dlg._role_stack.currentIndex() == 0
+
+
+def test_dialog_role_toggle_swaps_field_set(open_dialog):
+    """Flipping to Server moves the stack to index 1 and hides the
+    client-only loopback warning region."""
+    dlg, _ = open_dialog
+    dlg._role_server.setChecked(True)
+    assert dlg._role_stack.currentIndex() == 1
+    assert dlg._loopback_warn.isVisible() is False
+    # Flipping back returns to client panel.
+    dlg._role_client.setChecked(True)
+    assert dlg._role_stack.currentIndex() == 0
+
+
+def test_dialog_tls_toggle_shows_tls_group(open_dialog):
+    dlg, _ = open_dialog
+    assert dlg._tls_group.isVisible() is False
+    dlg._tls_check.setChecked(True)
+    assert dlg._tls_group.isVisible() is True
+    dlg._tls_check.setChecked(False)
+    assert dlg._tls_group.isVisible() is False
+
+
+def test_dialog_tls_rows_swap_with_role(open_dialog):
+    """Client-side: verify + SNI visible, cert+key hidden.
+    Server-side: cert+key visible, verify+SNI hidden."""
+    dlg, _ = open_dialog
+    dlg._tls_check.setChecked(True)
+
+    # Client default — verify + SNI shown, cert/key hidden.
+    assert dlg._tls_verify.isVisible() is True
+    assert dlg._tls_sni.isVisible() is True
+    assert dlg._tls_cert.isVisible() is False
+    assert dlg._tls_key.isVisible() is False
+
+    # Flip to server — cert/key shown, verify + SNI hidden.
+    dlg._role_server.setChecked(True)
+    assert dlg._tls_verify.isVisible() is False
+    assert dlg._tls_sni.isVisible() is False
+    assert dlg._tls_cert.isVisible() is True
+    assert dlg._tls_key.isVisible() is True
+
+
+def test_dialog_protocol_change_disables_response_bytes_for_raw(open_dialog):
+    """response_bytes is HTTP-only; greyed (but not hidden) for raw so
+    the operator doesn't think it's a noop knob they forgot to set."""
+    dlg, _ = open_dialog
+    # Protocol combo defaults to raw (index 0).
+    assert dlg._proto_combo.currentData() == "raw"
+    assert dlg._srv_response_bytes.isEnabled() is False
+    # Switch to http → enabled.
+    http_idx = next(i for i in range(dlg._proto_combo.count())
+                    if dlg._proto_combo.itemData(i) == "http")
+    dlg._proto_combo.setCurrentIndex(http_idx)
+    assert dlg._srv_response_bytes.isEnabled() is True
+
+
+def test_dialog_loopback_warning_fires_on_loopback_zero_interval(open_dialog):
+    """The bug we just fixed in pytest needs an inline UX warning here."""
+    dlg, _ = open_dialog
+    # Empty IP → no warning yet.
+    assert dlg._loopback_warn.isVisible() is False
+
+    dlg._cli_dst_ip.setText("127.0.0.1")
+    # interval defaults to 0.0 → loopback + 0 = warn.
+    assert dlg._loopback_warn.isVisible() is True
+    assert "ephemeral" in dlg._loopback_warn.text().lower()
+
+    # Raising interval to >=0.005 clears the warning.
+    dlg._cli_interval.setValue(0.02)
+    assert dlg._loopback_warn.isVisible() is False
+
+
+def test_dialog_loopback_warning_silent_for_non_loopback(open_dialog):
+    dlg, _ = open_dialog
+    dlg._cli_dst_ip.setText("10.0.0.5")
+    dlg._cli_interval.setValue(0.0)
+    assert dlg._loopback_warn.isVisible() is False
+
+
+# ─────────────────────────────────────────────── dialog: payload assembly
+
+
+def test_dialog_client_payload_default_shape(open_dialog):
+    """Filling required fields + accept → payload has client role, the
+    right kwargs, and optional fields omitted when blank."""
+    dlg, _ = open_dialog
+    dlg._cli_dst_ip.setText("10.0.0.5")
+    dlg._cli_dst_port.setValue(5001)
+    dlg._cli_duration.setValue(10.0)
+    dlg._cli_concurrency.setValue(2)
+    dlg._cli_interval.setValue(0.02)
+    dlg._on_accept()
+    pl = dlg.accepted_payload()
+    assert pl is not None
+    assert pl["role"] == "client"
+    body = pl["body"]
+    assert body["role"] == "client"
+    assert body["dst_ip"] == "10.0.0.5"
+    assert body["dst_port"] == 5001
+    assert body["duration_s"] == 10.0
+    assert body["concurrency"] == 2
+    assert body["interval_s"] == 0.02
+    assert body["protocol"] == "raw"
+    assert body["tls"] is False
+    # Optional fields not in body when blank.
+    assert "src_ip" not in body
+    assert "vrf" not in body
+
+
+def test_dialog_client_payload_carries_optional_vrf_and_src_ip(open_dialog):
+    dlg, _ = open_dialog
+    dlg._cli_dst_ip.setText("10.0.0.5")
+    dlg._cli_src_ip.setText("10.0.0.10")
+    dlg._cli_vrf.setText("vrf-blue")
+    dlg._on_accept()
+    body = dlg.accepted_payload()["body"]
+    assert body["src_ip"] == "10.0.0.10"
+    assert body["vrf"] == "vrf-blue"
+
+
+def test_dialog_client_payload_with_tls_carries_verify_and_sni(open_dialog):
+    dlg, _ = open_dialog
+    dlg._cli_dst_ip.setText("10.0.0.5")
+    dlg._tls_check.setChecked(True)
+    dlg._tls_verify.setChecked(True)
+    dlg._tls_sni.setText("server.example.com")
+    dlg._on_accept()
+    body = dlg.accepted_payload()["body"]
+    assert body["tls"] is True
+    assert body["tls_verify"] is True
+    assert body["tls_server_hostname"] == "server.example.com"
+
+
+def test_dialog_server_payload_default_shape(open_dialog):
+    dlg, _ = open_dialog
+    dlg._role_server.setChecked(True)
+    dlg._srv_listen_port.setValue(5001)
+    dlg._on_accept()
+    pl = dlg.accepted_payload()
+    assert pl is not None
+    assert pl["role"] == "server"
+    body = pl["body"]
+    assert body["role"] == "server"
+    assert body["listen_ip"] == "0.0.0.0"
+    assert body["listen_port"] == 5001
+    assert body["mode"] == "echo"
+    assert body["protocol"] == "raw"
+    # response_bytes omitted for raw — it's HTTP-only.
+    assert "response_bytes" not in body
+
+
+def test_dialog_server_http_carries_response_bytes(open_dialog):
+    dlg, _ = open_dialog
+    dlg._role_server.setChecked(True)
+    http_idx = next(i for i in range(dlg._proto_combo.count())
+                    if dlg._proto_combo.itemData(i) == "http")
+    dlg._proto_combo.setCurrentIndex(http_idx)
+    dlg._srv_response_bytes.setValue(2048)
+    dlg._on_accept()
+    body = dlg.accepted_payload()["body"]
+    assert body["protocol"] == "http"
+    assert body["response_bytes"] == 2048
+
+
+def test_dialog_rejects_invalid_dst_ip(open_dialog, monkeypatch):
+    """An invalid IP fires the Invalid-input warning AND leaves
+    payload None so the caller doesn't fire a malformed POST."""
+    dlg, _ = open_dialog
+    warnings: List[Any] = []
+    monkeypatch.setattr(
+        QMessageBox, "warning",
+        staticmethod(lambda *a, **k: warnings.append(a))
+    )
+    dlg._cli_dst_ip.setText("999.999.999.999")
+    dlg._on_accept()
+    assert dlg.accepted_payload() is None
+    assert warnings, "expected a QMessageBox.warning to be raised"
+
+
+def test_dialog_rejects_server_tls_without_cert_and_key(open_dialog, monkeypatch):
+    dlg, _ = open_dialog
+    warnings: List[Any] = []
+    monkeypatch.setattr(
+        QMessageBox, "warning",
+        staticmethod(lambda *a, **k: warnings.append(a))
+    )
+    dlg._role_server.setChecked(True)
+    dlg._tls_check.setChecked(True)
+    # Cert + key both blank → reject.
+    dlg._on_accept()
+    assert dlg.accepted_payload() is None
+    assert warnings
+    msg = " ".join(str(w) for w in warnings[0])
+    assert "cert" in msg.lower() and "key" in msg.lower()
+
+
+# ──────────────────────────────────────────────── tab fixtures
+
+
+@pytest.fixture
+def make_tab(qapp, monkeypatch):
+    """Construct a StatefulTcpTab against a stubbed parent_window and
+    a network module patched to never actually call out. Stop the
+    poll timer immediately so tests drive refresh state by hand."""
+    monkeypatch.setattr(QMessageBox, "warning", staticmethod(lambda *a, **k: None))
+    monkeypatch.setattr(QMessageBox, "information", staticmethod(lambda *a, **k: None))
+    monkeypatch.setattr(QMessageBox, "question",
+                        staticmethod(lambda *a, **k: QMessageBox.Yes))
+
+    from widgets import stateful_tcp_tab as mod
+
+    parent = QWidget()
+    # Match the real main window's `devices_tab.get_server_url(silent=…)`
+    # contract so _get_server_url returns a predictable URL.
+    parent.devices_tab = SimpleNamespace(
+        get_server_url=lambda silent=False: "http://test-server:5050"
+    )
+
+    tab = mod.StatefulTcpTab(parent)
+    # Kill the poll timer + cancel the 300ms first-refresh so no test
+    # accidentally fires a real fetch worker.
+    tab._timer.stop()
+    return tab, mod, parent
+
+
+def _running_session(sid="abc-1", role="client", proto="raw",
+                     **counter_overrides) -> Dict[str, Any]:
+    """Helper to build a session payload the server would return."""
+    counters = {
+        "uptime_s": 12.3,
+        "conns_attempted": 412, "conns_established": 410, "conns_failed": 2,
+        "bytes_tx": 419840, "bytes_rx": 419840,
+        "avg_handshake_ms": 0.92, "avg_rtt_ms": 1.43, "rtt_samples": 410,
+        "avg_kernel_rtt_us": 920.4, "kernel_rtt_samples": 410,
+        "retransmits_total": 0,
+        "http_status_2xx": 0, "http_status_other": 0,
+        "dns_noerror": 0, "dns_nxdomain": 0, "dns_servfail": 0, "dns_other": 0,
+        "sip_2xx": 0, "sip_3xx": 0, "sip_4xx": 0, "sip_5xx": 0, "sip_other": 0,
+        "last_error": None,
+    }
+    counters.update(counter_overrides)
+    config = {
+        "dst_ip": "10.0.0.5", "dst_port": 5001,
+        "listen_ip": "0.0.0.0", "listen_port": 5001,
+        "protocol": proto, "tls": False, "vrf": None,
+    }
+    return {
+        "session_id": sid, "role": role,
+        "protocol": proto, "running": True,
+        "config": config, "counters": counters,
+    }
+
+
+# ──────────────────────────────────────────────── tab: rendering
+
+
+def test_tab_constructs_with_empty_session_table(make_tab):
+    tab, _, _ = make_tab
+    assert tab._table.rowCount() == 0
+    # Count chip starts at zero/zero.
+    assert "0" in tab._count_chip.text()
+
+
+def test_tab_renders_running_client_session(make_tab):
+    tab, _, _ = make_tab
+    tab._on_refresh_ok({"sessions": [_running_session()]}, 200)
+    assert tab._table.rowCount() == 1
+    status_item = tab._table.item(0, tab.COL_STATUS)
+    assert status_item is not None
+    assert "Running" in status_item.text()
+    # Session ID stashed in UserRole on the Status cell — used by
+    # per-row Stop and Stop selected.
+    assert status_item.data(Qt.UserRole) == "abc-1"
+    # Role cell carries the badge text.
+    assert tab._table.item(0, tab.COL_ROLE).text() == "CLIENT"
+    # Target column built from dst_ip:dst_port for clients.
+    assert tab._table.item(0, tab.COL_TARGET).text() == "10.0.0.5:5001"
+    # Conns established → count column.
+    assert "410" in tab._table.item(0, tab.COL_CONNS).text()
+
+
+def test_tab_renders_server_session_target_from_listen(make_tab):
+    tab, _, _ = make_tab
+    tab._on_refresh_ok({
+        "sessions": [_running_session(sid="srv-1", role="server")]
+    }, 200)
+    assert tab._table.item(0, tab.COL_ROLE).text() == "SERVER"
+    # Server target is listen_ip:listen_port, NOT dst_*.
+    assert tab._table.item(0, tab.COL_TARGET).text() == "0.0.0.0:5001"
+
+
+def test_tab_protocol_cell_carries_tls_suffix(make_tab):
+    """Operator wants to see at a glance whether TLS is wrapping the
+    underlying protocol — encoded as 'HTTP+TLS' / 'RAW+TLS' in the
+    badge cell rather than its own column."""
+    tab, _, _ = make_tab
+    sess = _running_session(proto="http")
+    sess["config"]["tls"] = True
+    tab._on_refresh_ok({"sessions": [sess]}, 200)
+    assert tab._table.item(0, tab.COL_PROTO).text() == "HTTP+TLS"
+
+
+def test_tab_status_tooltip_carries_protocol_specific_bins(make_tab):
+    """The 200-char-or-more last_error and per-protocol counter bins
+    live in the Status cell tooltip rather than their own column."""
+    tab, _, _ = make_tab
+    sess = _running_session(proto="http", http_status_2xx=410,
+                            last_error="OSError: [Errno 49] EADDRNOTAVAIL")
+    tab._on_refresh_ok({"sessions": [sess]}, 200)
+    tip = tab._table.item(0, tab.COL_STATUS).toolTip()
+    assert "http: 2xx=410" in tip
+    assert "EADDRNOTAVAIL" in tip
+
+
+def test_tab_status_tooltip_dns_bins(make_tab):
+    tab, _, _ = make_tab
+    sess = _running_session(proto="dns",
+                            dns_noerror=10, dns_nxdomain=400,
+                            dns_servfail=0, dns_other=0)
+    tab._on_refresh_ok({"sessions": [sess]}, 200)
+    tip = tab._table.item(0, tab.COL_STATUS).toolTip()
+    assert "dns: noerror=10" in tip
+    assert "nxdomain=400" in tip
+
+
+def test_tab_status_tooltip_sip_bins(make_tab):
+    tab, _, _ = make_tab
+    sess = _running_session(proto="sip", sip_4xx=42)
+    tab._on_refresh_ok({"sessions": [sess]}, 200)
+    tip = tab._table.item(0, tab.COL_STATUS).toolTip()
+    assert "sip:" in tip and "4xx=42" in tip
+
+
+def test_tab_stopped_session_shows_no_stop_button(make_tab):
+    """Stop button only on running rows — stopped rows get a
+    placeholder QTableWidgetItem so sort/filter see a stable cell."""
+    tab, _, _ = make_tab
+    sess = _running_session()
+    sess["running"] = False
+    tab._on_refresh_ok({"sessions": [sess]}, 200)
+    assert tab._table.cellWidget(0, tab.COL_ACTION) is None
+    assert tab._table.item(0, tab.COL_ACTION) is not None
+
+
+def test_tab_count_chip_reflects_running_total(make_tab):
+    tab, _, _ = make_tab
+    s1 = _running_session(sid="r1")
+    s2 = _running_session(sid="r2"); s2["running"] = False
+    tab._on_refresh_ok({"sessions": [s1, s2]}, 200)
+    txt = tab._count_chip.text()
+    assert "1" in txt and "2" in txt  # 1 running · 2 total
+
+
+# ──────────────────────────────────────────────── tab: failure paths
+
+
+def test_tab_enters_unsupported_mode_on_404(make_tab):
+    tab, _, _ = make_tab
+    tab._on_refresh_failed("HTTP 404", 404)
+    assert tab._unsupported is True
+    assert "/api/stateful_tcp" in tab._unsupported_reason
+    # Timer should be slowed dramatically so we don't hammer a missing
+    # endpoint every 3 seconds.
+    assert tab._timer.interval() >= 60_000
+    # Count chip switches to amber "unavailable" label.
+    assert "unavailable" in tab._count_chip.text().lower()
+
+
+def test_tab_exits_unsupported_mode_when_sessions_returns_again(make_tab):
+    tab, _, _ = make_tab
+    tab._on_refresh_failed("HTTP 404", 404)
+    assert tab._unsupported is True
+    # Now sessions endpoint comes back online.
+    tab._on_refresh_ok({"sessions": []}, 200)
+    assert tab._unsupported is False
+    assert tab._timer.interval() == tab.POLL_INTERVAL_MS
+
+
+def test_tab_auth_failure_surfaces_in_info_label(make_tab):
+    tab, _, _ = make_tab
+    tab._on_refresh_failed("HTTP 401", 401)
+    assert "auth failed" in tab._info_label.text().lower()
+    # NOT entering unsupported mode — different recovery path (set
+    # the token), so the table remains live.
+    assert tab._unsupported is False
+
+
+# ──────────────────────────────────────────────── tab: stop paths
+
+
+def test_tab_per_row_stop_posts_correct_session_id(make_tab):
+    """Closure-in-loop trap: the row's session_id must be captured by
+    the lambda, not the loop variable. Two rows → click each Stop
+    button → each POST hits the right session_id."""
+    tab, mod, _ = make_tab
+    captured: List[Dict[str, Any]] = []
+    mod.requests = MagicMock()
+    mod.requests.post = lambda url, json=None, headers=None, timeout=None: (
+        captured.append({"url": url, "json": json}) or
+        SimpleNamespace(status_code=200, text="", json=lambda: {})
+    )
+    tab._on_refresh_ok({"sessions": [
+        _running_session(sid="alpha"),
+        _running_session(sid="beta"),
+    ]}, 200)
+    btn0 = tab._table.cellWidget(0, tab.COL_ACTION)
+    btn1 = tab._table.cellWidget(1, tab.COL_ACTION)
+    assert btn0 is not None and btn1 is not None
+    btn0.click()
+    btn1.click()
+    sids = [c["json"]["session_id"] for c in captured]
+    assert sids == ["alpha", "beta"]
+    # Every POST went to the stop endpoint.
+    for c in captured:
+        assert c["url"].endswith("/api/stateful_tcp/stop")
+
+
+def test_tab_stop_all_posts_empty_body_after_confirm(make_tab, monkeypatch):
+    tab, mod, _ = make_tab
+    captured: List[Dict[str, Any]] = []
+    mod.requests = MagicMock()
+    mod.requests.post = lambda url, json=None, headers=None, timeout=None: (
+        captured.append({"url": url, "json": json}) or
+        SimpleNamespace(status_code=200, text="", json=lambda: {})
+    )
+    # Q-msgbox confirm already monkeypatched to Yes in the fixture.
+    tab._on_stop_all()
+    assert len(captured) == 1
+    assert captured[0]["url"].endswith("/api/stateful_tcp/stop")
+    assert captured[0]["json"] == {}
+
+
+def test_tab_stop_all_aborts_when_user_says_no(make_tab, monkeypatch):
+    tab, mod, _ = make_tab
+    monkeypatch.setattr(QMessageBox, "question",
+                        staticmethod(lambda *a, **k: QMessageBox.No))
+    captured: List[Any] = []
+    mod.requests = MagicMock()
+    mod.requests.post = lambda *a, **k: (
+        captured.append(a) or
+        SimpleNamespace(status_code=200, text="", json=lambda: {})
+    )
+    tab._on_stop_all()
+    assert captured == []
+
+
+# ──────────────────────────────────────────────── tab: lifecycle
+
+
+def test_tab_cleanup_threads_stops_timer(make_tab):
+    tab, _, _ = make_tab
+    tab._timer.start()
+    assert tab._timer.isActive() is True
+    tab.cleanup_threads()
+    assert tab._timer.isActive() is False

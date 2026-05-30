@@ -3432,6 +3432,292 @@ reboot), NIC bind/unbind to <code>vfio-pci</code> /
 </ul>
 
 
+<h2>11. Stateful TCP (real-socket traffic generator)</h2>
+<p>Parallel to the stateless stream builder (§1): sessions complete
+<strong>real 3-way handshakes</strong>, so middleboxes / NAT / proxies
+/ TLS terminators see actual connection state. Sessions live
+server-side — close the GUI and they keep running until they hit
+their Duration or you stop them.
+<span class="where">Where: Stateful TCP tab.</span></p>
+
+<h3>11a. What's supported in the GUI</h3>
+<table>
+  <tr><th>Knob</th><th>v1</th><th>Notes</th></tr>
+  <tr><td>Role</td><td class="yes">Client + Server</td>
+      <td>Run server on box A, client on box B.</td></tr>
+  <tr><td>Protocol</td><td class="yes">raw + http</td>
+      <td>DNS / SIP available via API today; GUI exposure deferred to v2.</td></tr>
+  <tr><td>TLS</td><td class="yes">Both sides</td>
+      <td>Client: verify + SNI. Server: cert + key file pickers.</td></tr>
+  <tr><td>VRF</td><td class="yes">Linux SO_BINDTODEVICE</td>
+      <td>Graceful no-op on macOS / non-root Linux — falls back to default route.</td></tr>
+  <tr><td>Counters</td><td class="yes">Live, 3 s poll</td>
+      <td>conns_*, bytes_*, RTT (kernel TCP_INFO on Linux), per-protocol status bins.</td></tr>
+</table>
+
+<h3>11b. Scale &amp; limits</h3>
+<p>What the per-session knobs accept, and what the server-side
+process will actually do under load. Numbers below are the
+<em>operative ceilings</em> — beyond them the GUI rejects the value
+or the kernel does.</p>
+<table>
+  <tr><th>Knob</th><th>Range</th><th>Default</th><th>Notes</th></tr>
+  <tr><td>Destination / Listen port</td><td>1 – 65535</td><td>5001</td>
+      <td>Port 0 (OS-allocated) is intentionally rejected — almost
+          always a leftover from a cleared field.</td></tr>
+  <tr><td>Duration</td><td>0.1 s – 86400 s (24 h)</td><td>30 s</td>
+      <td>Server-side worker exits cleanly at the deadline; row stays
+          in the table as <code>● Stopped</code>.</td></tr>
+  <tr><td>Payload bytes (client)</td><td>0 – 1,048,576 (1 MB)</td><td>1024 B</td>
+      <td>Per-connection payload — bytes_tx grows
+          <code>conns × payload</code> for echo / raw.</td></tr>
+  <tr><td>Response bytes (HTTP server)</td><td>0 – 1,048,576 (1 MB)</td><td>1024 B</td>
+      <td>HTTP body size; ignored for <code>protocol=raw</code>
+          (grey in the dialog).</td></tr>
+  <tr><td>Concurrency (client)</td><td>1 – 256 sender threads</td><td>1</td>
+      <td>Each thread runs its own connect→send→recv→close loop;
+          effective rate ≈ <code>concurrency × (1 / max(interval_s,
+          connect_RTT))</code>.</td></tr>
+  <tr><td>Interval per conn</td><td>0 – 60 s</td><td>0 s</td>
+      <td><strong>Set ≥ 0.02 s for loopback</strong> — see §11f. On
+          real RTT-bound targets the round-trip itself paces you.</td></tr>
+  <tr><td>Connect timeout</td><td>0.1 s – 120 s</td><td>5 s</td>
+      <td>Per-attempt; <code>conns_failed++</code> on timeout with
+          <code>last_error</code> set.</td></tr>
+</table>
+
+<h4>Server-side process limits (not exposed in the GUI)</h4>
+<table>
+  <tr><th>Setting</th><th>Value</th><th>Where it matters</th></tr>
+  <tr><td>Listen backlog</td><td>128</td>
+      <td>SYN queue depth. Beyond this, the kernel drops half-open
+          connects until accept() catches up. Override via API
+          (<code>backlog</code> field) for stress tests.</td></tr>
+  <tr><td>Accept timeout</td><td>0.5 s</td>
+      <td>Determines how fast Stop is observed by the server thread
+          — bounded shutdown latency.</td></tr>
+  <tr><td>Per-conn handler timeout</td><td>10 s</td>
+      <td>Each accepted connection has 10 s to complete its
+          read/echo/close cycle before being torn down.</td></tr>
+  <tr><td>HTTP message read cap</td><td>1 MB</td>
+      <td>Single request/response body limit; over-sized payloads
+          truncate at the receiver.</td></tr>
+  <tr><td>DNS / SIP message read cap</td><td>65,535 B</td>
+      <td>Per the wire format (DNS length prefix is 16-bit).</td></tr>
+  <tr><td>Stop join deadlines</td><td>3 s supervisor + 2 s handlers</td>
+      <td>Bounded — a misbehaving peer can't stall a stop
+          indefinitely.</td></tr>
+  <tr><td>Session registry</td><td>In-memory dict, no cap</td>
+      <td>Bounded only by Python memory. Typical operator load: under
+          a dozen simultaneous sessions; the GUI table handles 100+
+          cleanly.</td></tr>
+</table>
+
+<h4>Realistic throughput envelope (observed)</h4>
+<table>
+  <tr><th>Scenario</th><th>Per sender</th><th>Notes</th></tr>
+  <tr><td>Loopback, interval=0</td><td>~5,000 conns/sec</td>
+      <td>Hard ceiling: kernel ephemeral-port pool empties out in
+          seconds → EADDRNOTAVAIL on every subsequent connect.
+          <strong>Don't do this.</strong></td></tr>
+  <tr><td>Loopback, interval=0.02 s</td><td>~50 conns/sec</td>
+      <td>Sane loopback rate — well under the TIME_WAIT recycle
+          window.</td></tr>
+  <tr><td>Cross-host, sub-millisecond RTT</td><td>~1,000 conns/sec</td>
+      <td>Per sender, naturally rate-limited by RTT × handshake.
+          Scale by raising <code>concurrency</code>.</td></tr>
+  <tr><td>Cross-host, 10–50 ms RTT (WAN)</td><td>~20–100 conns/sec</td>
+      <td>RTT dominates. Raise concurrency to fill the pipe.</td></tr>
+  <tr><td>TLS handshakes</td><td>~30–60% of TCP rate</td>
+      <td>RSA / ECDHE handshake adds CPU + RTTs. Server-side cert
+          loaded once per session; client-side ctx built once.</td></tr>
+</table>
+
+<h4>Ephemeral-port ceilings (the EADDRNOTAVAIL math)</h4>
+<table>
+  <tr><th>OS</th><th>Default port range</th><th>Effective ceiling</th></tr>
+  <tr><td>macOS</td><td>49152 – 65535</td><td>~16,000 ports</td></tr>
+  <tr><td>Linux</td><td>32768 – 60999</td><td>~28,000 ports</td></tr>
+</table>
+<p class="muted">Each completed TCP close → TIME_WAIT for 30–60 s.
+Sustained connect rate above
+<code>ports / time_wait_seconds</code> hits the ceiling: <strong>~265
+conns/sec on macOS, ~470 conns/sec on Linux</strong> if every
+connection runs to completion. Real workloads rarely sustain this for
+long; if yours does, raise the ephemeral range
+(<code>sysctl net.inet.ip.portrange.first</code> on macOS,
+<code>net.ipv4.ip_local_port_range</code> on Linux) or use multiple
+source IPs.</p>
+
+
+<h3>11c. Workflow A — "Does my middlebox forward TCP correctly?" (two-machine)</h3>
+<p><strong>On box A (target side):</strong></p>
+<ol>
+  <li><strong>Start session…</strong> → Role: <strong>Server</strong>
+      → Protocol <code>raw</code> → Listen IP <code>0.0.0.0</code>,
+      Port <code>5001</code> → Mode <code>echo</code> → <strong>Start</strong>.</li>
+  <li>Row appears: <code>● Running · SERVER · RAW · 0.0.0.0:5001</code>.
+      Conns stays at 0 until traffic arrives.</li>
+</ol>
+<p><strong>On box B (driver):</strong></p>
+<ol>
+  <li><strong>Start session…</strong> → Role: <strong>Client</strong>
+      → Protocol <code>raw</code> → Destination IP = box A's IP, Port
+      <code>5001</code> → Duration <code>30 s</code> → Concurrency
+      <code>4</code> → Payload <code>1024</code> B → <strong>Start</strong>.</li>
+  <li>Watch the client row: <strong>Conns</strong> climbs,
+      <strong>Bytes TX</strong> ≈ <strong>Bytes RX</strong> (echo),
+      <strong>Avg RTT</strong> settles. Hover the
+      <strong>Status</strong> cell → tooltip dumps
+      <code>conns_attempted</code>, <code>conns_failed</code>,
+      <code>retransmits_total</code> (Linux only), <code>last_error</code>.</li>
+  <li>Server row on box A mirrors: <code>bytes_rx</code> on the server
+      equals <code>bytes_tx</code> on the client.</li>
+</ol>
+<p class="muted">If the middlebox drops or NATs badly:
+<code>conns_failed</code> climbs on the client and <code>last_error</code>
+names the syscall failure (e.g. <code>ConnectionResetError</code>,
+<code>TimeoutError: connect timed out</code>).</p>
+
+<h3>11d. Workflow B — "Does my WAF still terminate TLS?"</h3>
+<p><strong>Target box:</strong> Start session → Server → Protocol
+<code>http</code> → Listen Port <code>8443</code> → check
+<strong>☑ TLS</strong> → Browse… to a cert + key PEM (paths are
+read by the <em>server</em>, not the GUI host) → Response bytes
+<code>4096</code> → Start.</p>
+<p><strong>Driver box:</strong> Start session → Client → Protocol
+<code>http</code> → Destination IP/Port <code>8443</code> → check
+<strong>☑ TLS</strong> → leave <strong>Verify cert + hostname</strong>
+unchecked for self-signed test certs → Duration <code>30 s</code>,
+Concurrency <code>8</code> → Start.</p>
+<p>Status tooltip on the client row tells the story:</p>
+<ul>
+  <li><code>http: 2xx=410 other=0</code> → handshake + HTTP both healthy.</li>
+  <li><code>http: 2xx=0 other=410</code> → connection works, WAF
+      rejects payloads. <code>last_error</code> carries the rejection.</li>
+  <li>No conns at all → TLS handshake failing. Tooltip names the
+      OpenSSL error.</li>
+</ul>
+
+<h3>11e. Workflow C — "Pin client traffic onto a Linux VRF"</h3>
+<p>Start session → Client → fill destination → <strong>VRF:
+<code>vrf-blue</code></strong> → optional Source IP → Start.
+Behavior depends on what the server-side worker can do:</p>
+<table>
+  <tr><th>Server platform</th><th>Result</th><th>last_error</th></tr>
+  <tr><td>Linux as root (or CAP_NET_RAW)</td>
+      <td class="yes">VRF bind applied — packets egress via the VRF</td>
+      <td><code>null</code></td></tr>
+  <tr><td>Linux non-root</td><td class="partial">Falls back to default routing table</td>
+      <td><code>vrf=X requires CAP_NET_RAW / root</code></td></tr>
+  <tr><td>macOS / Windows server</td><td class="partial">Falls back to default routing table</td>
+      <td><code>vrf=X ignored (SO_BINDTODEVICE only on Linux)</code></td></tr>
+</table>
+<p class="muted">The session <strong>never fails outright</strong> on
+VRF bind issues — it always falls back so you can develop on a laptop
+and only see the real VRF effect in the lab.</p>
+
+<h3>11f. Workflow D — Loopback dev smoke (and the EADDRNOTAVAIL trap)</h3>
+<p>Start session → Client → Destination IP <code>127.0.0.1</code>.
+The moment you type the loopback IP, an <strong>amber warning</strong>
+appears under the Interval field:</p>
+<blockquote style="margin:6px 0; padding:6px 10px; background:#fef3c7;
+border:1px solid #fde68a; border-radius:4px; color:#b45309;">
+⚠ Loopback + interval=0 will exhaust the kernel ephemeral-port range
+within seconds (EADDRNOTAVAIL). Set interval to ≥ 0.02 s for loopback
+runs.
+</blockquote>
+<p>Set <strong>Interval per conn: <code>0.02 s</code></strong> →
+warning disappears → Start. If you ignore the warning, the session
+row will land at <code>Conns=0 Conns_failed=5000+</code> and the
+tooltip will read
+<code>last_error: OSError: [Errno 49] Can't assign requested address</code>.</p>
+<p class="muted">This is the same kernel exhaustion that earlier
+caused intermittent failures across the stateful-TCP <em>pytest</em>
+suite — the dialog surface here is the GUI-side guard so operators
+don't have to learn it the hard way.</p>
+
+<h3>11g. Reading the session table</h3>
+<table>
+  <tr><th>Cell</th><th>What it tells you</th></tr>
+  <tr><td><strong>Status pill</strong></td>
+      <td>● Green = running, ● grey = stopped. <em>Hover</em> for the
+          full counter dump: per-protocol bins, kernel RTT samples,
+          retransmits, last_error.</td></tr>
+  <tr><td><strong>Role badge</strong></td>
+      <td>CLIENT (blue) / SERVER (violet) so a mixed table reads fast.</td></tr>
+  <tr><td><strong>Protocol</strong></td>
+      <td><code>RAW</code> / <code>HTTP</code> / <code>HTTP+TLS</code>
+          — TLS gets suffixed onto the protocol so you don't need a
+          separate column.</td></tr>
+  <tr><td><strong>Target</strong></td>
+      <td><code>dst:port</code> for clients; <code>listen_ip:port</code>
+          for servers. Hover → VRF + src_ip (client) or VRF + mode
+          (server).</td></tr>
+  <tr><td><strong>Conns</strong></td>
+      <td><code>conns_established</code> — climbs only on
+          <em>successful</em> 3-way handshakes.</td></tr>
+  <tr><td><strong>Bytes TX / RX</strong></td>
+      <td>Formatted KB / MB; hover for exact byte count. Echo sessions
+          should show TX ≈ RX.</td></tr>
+  <tr><td><strong>Avg RTT</strong></td>
+      <td>Kernel <code>TCP_INFO.rtt_us</code> if available (Linux),
+          else userspace <code>connect()+send+recv</code>.
+          <code>—</code> if no samples yet.</td></tr>
+  <tr><td><strong>Session ID</strong></td>
+      <td>First 10 chars + <code>…</code>; full ID in the tooltip,
+          plugs straight into
+          <code>netgen-cli tcp stats --session-id …</code>.</td></tr>
+</table>
+<p>The <strong>Filter</strong> box (top-right) does case-insensitive
+substring match on role / protocol / target / session-ID — useful
+once you have a dozen sessions running.</p>
+
+<h3>11h. Stop operations</h3>
+<ul>
+  <li><strong>Per-row Stop</strong> — the <code>×</code> button on
+      every running row. Single session, instant; row flips to Stopped
+      150 ms later on the next forced refresh.</li>
+  <li><strong>Stop selected</strong> — multi-select rows (Cmd-click /
+      Shift-click), then the action-bar button. Each gets a separate
+      POST so a slow stop on one doesn't block the others.</li>
+  <li><strong>Stop all</strong> — confirmation modal first ("affects
+      every operator on this server"), then one POST with an empty
+      body that the server fans out to every session.</li>
+  <li><strong>Implicit stop</strong> — when <code>Duration</code>
+      elapses, the worker exits on its own. The row stays in the
+      table as <code>● Stopped</code> so you can still hover the
+      Status cell and read final counters.</li>
+</ul>
+
+<h3>11i. When something looks wrong</h3>
+<ol>
+  <li><strong>Hover the Status cell</strong> — 90% of "why isn't this
+      working?" answers itself in the tooltip. Per-protocol counter
+      bins (<code>http: 2xx=…</code>, <code>dns: nxdomain=…</code>,
+      <code>sip: 4xx=…</code>) and the full <code>last_error</code>
+      live there.</li>
+  <li><strong>Conns vs Conns_failed</strong> — Conns climbing but
+      Bytes at 0 → handshake works but data doesn't (firewall
+      mid-stream, TLS reject mid-handshake). Conns flat and
+      Conns_failed high → target unreachable / refusing.</li>
+  <li><strong>Action bar's right-side info label</strong> turns amber
+      on transient fetch failures. <code>401</code>/<code>403</code> →
+      set <code>NETGEN_AUTH_TOKEN</code> client-side + restart.
+      <code>404</code> → upgrade the netgen-server.</li>
+  <li><strong>Drop to CLI</strong> if you need to script the same
+      run: the Session ID from the tooltip plugs into
+      <code>netgen-cli tcp stats --session-id &lt;id&gt;</code> or
+      the HTTP API directly.</li>
+</ol>
+
+<p class="muted"><strong>Mental model:</strong> the tab is a thin REST
+viewer over <code>/api/stateful_tcp/*</code>. Sessions live on the
+<em>server</em>, not in the client. Closing the GUI doesn't stop your
+sessions; you can re-open on another machine and the same table is
+there.</p>
+
+
 <h2>What this app is not</h2>
 <p class="muted">A short honest list so you don't go hunting:</p>
 <ul>

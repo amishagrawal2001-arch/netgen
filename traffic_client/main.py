@@ -167,11 +167,23 @@ class TrafficGeneratorClient(
         except Exception as _l2_imp_err:
             logger.warning(f"L2 Emulation tab unavailable: {_l2_imp_err}")
             self.l2_emulation_tab = None
+        # Stateful TCP tab — real-socket TCP traffic generator. Same
+        # lazy-guard pattern as L2 so an older server's missing
+        # /api/stateful_tcp/* doesn't prevent the client from starting;
+        # the tab's own refresh path handles 404 → unsupported-mode.
+        try:
+            from widgets.stateful_tcp_tab import StatefulTcpTab
+            self.stateful_tcp_tab = StatefulTcpTab(self)
+        except Exception as _tcp_imp_err:
+            logger.warning(f"Stateful TCP tab unavailable: {_tcp_imp_err}")
+            self.stateful_tcp_tab = None
         self.tab_widget.addTab(self.streams_tab, "Streams")
         self.tab_widget.addTab(self.devices_tab, "Devices")
         self.tab_widget.addTab(self.topology_tab, "Topology")
         if self.l2_emulation_tab is not None:
             self.tab_widget.addTab(self.l2_emulation_tab, "L2 Emulation")
+        if self.stateful_tcp_tab is not None:
+            self.tab_widget.addTab(self.stateful_tcp_tab, "Stateful TCP")
         self.tab_widget.tabBar().setExpanding(False)
         self.tab_widget.setStyleSheet("""
             QTabWidget::pane {
@@ -678,6 +690,14 @@ class TrafficGeneratorClient(
                 self.l2_emulation_tab.cleanup_threads()
         except Exception as _exc:
             logger.debug(f"[CLEANUP] l2_emulation_tab cleanup: {_exc}")
+
+        # Stateful TCP tab — same pattern: drain the 3s poll worker
+        # before the QApplication tears the event loop down.
+        try:
+            if getattr(self, "stateful_tcp_tab", None):
+                self.stateful_tcp_tab.cleanup_threads()
+        except Exception as _exc:
+            logger.debug(f"[CLEANUP] stateful_tcp_tab cleanup: {_exc}")
         
         # CRITICAL: Clean up save worker before closing
         if hasattr(self, '_save_worker') and self._save_worker is not None:

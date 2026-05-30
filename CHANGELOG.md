@@ -2,6 +2,140 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.88] - 2026-05-30
+
+**Stateful-TCP GUI tab + suite-flake fix** — gives the stateful-TCP
+feature (previously API/CLI-only) a first-class tab next to L2
+Emulation, and fixes a kernel-resource flake that intermittently
+killed five tests across the stateful-TCP / DNS / SIP suites on
+macOS.
+
+### What changed
+
+#### Test-suite flake fix — TIME_WAIT / EADDRNOTAVAIL
+- Five tests (`test_echo_round_trip_counts_bytes_both_ways`,
+  `test_http_protocol_status_2xx_counter_moves`,
+  `test_dns_nxdomain_counters_increment`,
+  `test_dns_noerror_when_server_configured`,
+  `test_sip_register_2xx_counters_increment`) were running the
+  stateful-TCP client with the default `interval_s=0`. A single
+  sender thread hammers ~5000 connect()s/sec on loopback; every
+  completed handshake leaves a TIME_WAIT for 30–60 s; the macOS
+  ephemeral-port pool (~16 k ports) empties out inside the same
+  test → `OSError [Errno 49] Can't assign requested address`.
+  Subsequent stateful-TCP tests inherited the dry port pool and
+  flaked sporadically — including `test_vrf_bind_no_op_on_non_linux`,
+  which was the user-visible symptom.
+- **Fix**: added `interval_s=0.02` to all five offending tests
+  (`tests/test_stateful_tcp.py`, `tests/test_dns_over_tcp.py`,
+  `tests/test_sip_over_tcp.py`). Brings each to ~50 conns/sec —
+  well under the TIME_WAIT recycle window — while still exercising
+  the same assertions. Matches the throttle pattern already used by
+  the TLS + VRF tests in the same file.
+- 20 consecutive full-suite runs green after the fix.
+
+#### New Stateful TCP tab (`widgets/stateful_tcp_tab.py`, 1233 lines)
+- Session-based GUI tab modelled on `widgets/l2_emulation_tab.py` —
+  same action-bar / table / poll-worker shape so the two tabs read
+  as siblings.
+- **Roles**: client + server in one dialog, switched via
+  `QButtonGroup` driving a `QStackedWidget`.
+- **Protocols**: `raw` + `http` in v1 (the API-side `dns` / `sip`
+  are deferred to v2 alongside matching `netgen-cli tcp` flag adds).
+- **TLS**: both directions. Client gets `verify` + SNI inputs;
+  server gets cert + key file pickers with file-exists validation.
+- **VRF**: passed through unchanged — the API-side helper degrades
+  gracefully on macOS / non-root Linux (last_error carries the
+  reason, traffic still flows via the default routing table).
+- **Loopback warning** — inline amber callout under the Interval
+  field when `dst_ip` parses as loopback and `interval_s < 0.005`.
+  GUI-side guard against the same EADDRNOTAVAIL trap the test-flake
+  fix above addresses; non-blocking (operator can still hit Start).
+- **Session table** — 10 columns (Status / Role / Protocol+TLS /
+  Target / Conns / Bytes TX / Bytes RX / Avg RTT / Uptime / Session
+  ID) + per-row Stop button. 3 s auto-refresh. Hover the Status cell
+  for the full counter dump (per-protocol bins + last_error +
+  retransmits + kernel RTT) — keeps the column count glanceable
+  while preserving every counter the worker tracks.
+- **Graceful degrade on 404** — same "unsupported mode" pattern as
+  L2 tab: slowed poll, amber chip, intercepted Start, auto-recovery
+  when the endpoint returns.
+
+#### Wired into the main window (`traffic_client/main.py`, +20 lines)
+- Lazy-guarded import (same pattern as `L2EmulationTab`) so an
+  import-time exception doesn't prevent the client from starting.
+- New "Stateful TCP" tab inserted right after "L2 Emulation".
+- `cleanup_threads()` hook in the close path so the 3 s poll worker
+  is drained before the QApplication tears the event loop down.
+
+#### Help → Supported Features dialog — new §11
+- **`widgets/stream_dialog.py`** — appended `<h2>11. Stateful TCP
+  (real-socket traffic generator)</h2>` to `_CAPABILITIES_GUIDE_HTML`
+  with nine subsections:
+  - 11a. What's supported in the GUI (capability matrix)
+  - 11b. Scale & limits (knob ranges, server-side process limits,
+    observed throughput envelope, ephemeral-port ceiling math for
+    macOS + Linux)
+  - 11c–11f. Four end-to-end workflows (middlebox/proxy soak,
+    WAF/TLS termination, VRF pinning, loopback dev smoke incl. the
+    EADDRNOTAVAIL trap).
+  - 11g. Reading the session table.
+  - 11h. Stop operations (per-row / selected / all / implicit).
+  - 11i. When something looks wrong — 4-step diagnostic ladder.
+
+#### API_GUIDE.md / README.md — VRF + loopback caveat documented
+- **`API_GUIDE.md`** §8 — added three new subsections after the
+  stats response: VRF binding semantics (3-row platform matrix:
+  Linux-root / Linux-non-root / macOS-Windows with exact last_error
+  strings), Loopback testing caveat (the EADDRNOTAVAIL trap with
+  both macOS errno 49 and Linux errno 99 spelled out), CLI coverage
+  gap (note that `netgen-cli tcp` exposes `--protocol raw|http`
+  only; DNS / SIP via API directly).
+- **`README.md`** § Stateful TCP — surfaced DNS-over-TCP and
+  SIP-over-TCP rows in the "When to use which" table (flagged
+  `API only`); expanded the VRF paragraph; added a
+  `### Loopback caveat` section with the EADDRNOTAVAIL guidance;
+  refreshed the stale "36 pytest cases" intro line (the suite is
+  larger now). Counter list gained the full `dns_*` + `sip_*` bins.
+
+### Tests
+- **`tests/test_stateful_tcp_tab.py`** — new file, 34 tests:
+  - Pure validators: `_validate_ip`, `_validate_port`,
+    `_is_loopback` (4 tests).
+  - Dialog visibility wiring: default role, role-toggle stack swap,
+    TLS-checkbox group visibility, role+TLS interaction (verify+SNI
+    vs cert+key), protocol-combo greys response_bytes on raw,
+    loopback warning fires on `127.0.0.1` + `interval=0`, silent
+    otherwise (7 tests).
+  - Dialog payload assembly: client default shape, optional
+    `src_ip` + `vrf` carried, TLS-on carries `verify` + SNI, server
+    default shape, server-HTTP carries `response_bytes`, invalid
+    `dst_ip` rejected, server-TLS without cert/key rejected
+    (7 tests).
+  - Tab rendering: empty-table construct, running client/server
+    rendered correctly (target column built from role-specific
+    config), `HTTP+TLS` protocol badge, status tooltip carries
+    HTTP / DNS / SIP protocol bins, stopped session has no Stop
+    button, count chip math (8 tests).
+  - Tab failure paths: 404 enters unsupported mode, recovery on
+    next successful poll, 401/403 surfaces in info label without
+    entering unsupported mode (3 tests).
+  - Tab stop paths: per-row Stop POSTs correct session_id (guards
+    against closure-in-loop trap), Stop-all POSTs empty body after
+    confirm, Stop-all aborts when user picks No (3 tests).
+  - Lifecycle: `cleanup_threads()` stops the poll timer (1 test).
+- Full suite: **613 tests passing**, no flakes across 20+ runs.
+
+### Files changed
+- New: `widgets/stateful_tcp_tab.py` (1233 lines),
+  `tests/test_stateful_tcp_tab.py` (554 lines).
+- Edit: `traffic_client/main.py` (+20), `widgets/stream_dialog.py`
+  (+382, §11 + §11b), `API_GUIDE.md` (+27),
+  `README.md` (+39), `tests/test_stateful_tcp.py` (+6),
+  `tests/test_dns_over_tcp.py` (+2),
+  `tests/test_sip_over_tcp.py` (+1).
+
+
 ## [0.2.87] - 2026-05-30
 
 **OSPF area-id refactor + normalisation (RFC 2328 §6)** — closes
