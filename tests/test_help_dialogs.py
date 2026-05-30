@@ -92,8 +92,24 @@ def test_feature_guide_references_recent_versions():
     from widgets.stream_dialog import _FEATURE_GUIDE_HTML
     for ver in ("0.2.41", "0.2.45", "0.2.46", "0.2.57", "0.2.58",
                 "0.2.59", "0.2.60", "0.2.61", "0.2.63", "0.2.65",
-                "0.2.66", "0.2.67", "0.2.68"):
+                "0.2.66", "0.2.67", "0.2.68", "0.2.70", "0.2.71"):
         assert ver in _FEATURE_GUIDE_HTML, f"missing version tag: {ver}"
+
+
+def test_feature_guide_documents_preflight_bar():
+    """The 0.2.70 preflight bar and 0.2.71 Apply-refresh hook each
+    need their own discoverable section — operators who can see the
+    pills should be able to find the doc for them."""
+    from widgets.stream_dialog import _FEATURE_GUIDE_HTML
+    # Dedicated section header.
+    assert "Preflight bar" in _FEATURE_GUIDE_HTML
+    # Both shipping versions named.
+    assert "0.2.70" in _FEATURE_GUIDE_HTML
+    assert "0.2.71" in _FEATURE_GUIDE_HTML
+    # Key behaviours called out.
+    assert "Details" in _FEATURE_GUIDE_HTML
+    assert "60 s" in _FEATURE_GUIDE_HTML  # auto-poll cadence
+    assert "Apply" in _FEATURE_GUIDE_HTML  # the refresh hook
 
 
 def test_feature_guide_points_to_where_each_feature_lives():

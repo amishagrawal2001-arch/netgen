@@ -2,6 +2,34 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.72] - 2026-05-30
+
+**What's-New guide catches up to the preflight bar** — operator
+opened Help → What's New looking for documentation on the new pills
+in the Devices tab and found nothing. The v0.2.69 guide stopped at
+"the GUI bar is the next slice" and was never updated when v0.2.70 /
+v0.2.71 actually shipped.
+
+### What changed
+- **`widgets/stream_dialog.py`** — new dedicated **"Devices tab →
+  Preflight bar"** section in `_FEATURE_GUIDE_HTML`:
+  - 0.2.70 entry covers the three pills, severity tinting, Details
+    modal, ↻ button, auto-poll cadence, the current check codes,
+    and the heads-up-not-a-gate framing.
+  - 0.2.71 entry covers the immediate-refresh-after-Apply hook.
+  - The existing 0.2.68 endpoint entry reframed as "the JSON
+    backend behind the bar above" instead of "the GUI is the next
+    slice".
+  - Test-count line updated from "284+ tests" (stale since 0.2.65)
+    to "315 tests".
+- **`tests/test_help_dialogs.py`** — `0.2.70` + `0.2.71` added to the
+  version-tag check; new `test_feature_guide_documents_preflight_bar`
+  pins the section header + key behaviours so the next guide edit
+  can't silently regress them.
+
+### Test count
+315 → 316 (+1).
+
 ## [0.2.71] - 2026-05-30
 
 **Preflight bar refreshes immediately after Apply** — close the

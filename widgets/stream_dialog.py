@@ -2835,15 +2835,46 @@ gains:</p>
 work too (the client falls back gracefully).
 <span class="where">Where: Tools → RFC 2544 Throughput Test.</span></p>
 
+<h2>Devices tab → Preflight bar</h2>
+
+<h3><span class="ver new">0.2.70</span> Preflight findings bar</h3>
+<p>A thin colour-coded strip at the top of the Devices sub-tab tells
+you whether your config is going to fly <em>before</em> you click
+Apply. Three pills — <code>● N errors · ● N warnings · ● N OK</code>
+— with the bar background tinted by worst severity (red / amber /
+green / neutral).</p>
+<ul>
+  <li><strong>Details…</strong> button opens a modal table listing
+      every finding: Level / Code / Device / Interface / Message,
+      with the level column colour-coded so the eye picks up errors
+      first.</li>
+  <li><strong>↻</strong> button forces an immediate re-check; the
+      bar also auto-polls every 60 s so unsolicited edits (someone
+      hitting the API directly) still show up.</li>
+  <li>Catches today: BGP without remote ASN / loopback, VXLAN
+      missing VNI / local IP / remote peers, OSPF + IS-IS without
+      area, cross-device IPv4 collisions. (Heads-up surface — Apply
+      still runs whether you address the findings or not.)</li>
+  <li>Defensively quiet: HTTP failures, no-server-selected, malformed
+      JSON all leave the previous pill values intact and log a debug
+      line. No modal pop-ups on flaky links.</li>
+</ul>
+<p><span class="where">Where: Devices tab → top of the sub-tab, above the filter row.</span></p>
+
+<h3><span class="ver new">0.2.71</span> Bar refreshes immediately after Apply</h3>
+<p>When you click Apply (single-device or the multi-device toolbar
+batch), the bar repaints within a second — no waiting up to 60 s for
+the next poll. Fires on both success and failure so you also get the
+"all clean" confirmation, not only new findings.
+<span class="where">Where: Devices tab — invisible until you notice the bar updates the moment your Apply completes.</span></p>
+
 <h2>Server / API surface</h2>
 
 <h3><span class="ver new">0.2.68</span> Preflight checks endpoint</h3>
-<p>New <code>GET /api/preflight/check</code> returns common bad-config
-findings before Apply: BGP without remote ASN, VXLAN missing required
-fields, OSPF / IS-IS without area, cross-device IPv4 collisions. See
-the API Guide §25 for the exact response shape. The GUI bar that
-surfaces these in the Devices tab is the next slice — for now the
-endpoint is scriptable / curl-able.</p>
+<p>The backend behind the bar above — <code>GET /api/preflight/check</code>
+returns the findings as JSON for scripts that want to wire their own
+gates (CI checks, pre-deploy hooks). See the API Guide §25 for the
+exact response shape.</p>
 
 <h2>Reliability fixes worth knowing about</h2>
 
@@ -2860,7 +2891,7 @@ endpoint is scriptable / curl-able.</p>
       keys.</li>
 </ul>
 <p>Each fix has its own regression test pinned in the test suite (now
-at <strong>284+ tests</strong> vs 103 before this push).</p>
+at <strong>315 tests</strong> vs 103 before this push).</p>
 
 <h2>Help &amp; reference</h2>
 <table>
