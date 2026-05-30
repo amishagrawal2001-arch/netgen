@@ -2,6 +2,79 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.85] - 2026-05-30
+
+**Devices tab audit fixes (round 1)** — first wave from a holistic
+audit of the Devices tab + per-protocol helpers (BGP/OSPF/ISIS/VXLAN
+/DHCP). The audit found 17 items; this release closes the 4 most
+impactful + drops 1 audit miss (verified the alleged gap doesn't
+exist). Remaining 12 items are mostly POLISH and validation refactors
+that warrant their own focused passes.
+
+### Bug fixes
+- **Duplicate `apply_bgp_configurations` removed.** widgets/devices_tab.py
+  had TWO defs of `apply_bgp_configurations` + matching start/stop
+  wrappers — Python last-def-wins meant the v0.2.74 versions (with
+  the `kick_refresh` hook) won, but the dead earlier defs (lines
+  3195-3203) were a refactor trap. Same for `start_bgp_protocol` and
+  `stop_bgp_protocol`. Cleaned up; pinned to "exactly one def" by
+  tests.
+- **DHCP apply now kicks the preflight bar.** Every other protocol's
+  apply path calls `kick_refresh` (v0.2.71/74); DHCP was the lone
+  outlier. DUPLICATE_IPV4 finding state can flip when a DHCP-assigned
+  address collides with a static one, so the bar should repaint.
+  Pinned by a parametrised `test_every_apply_path_kicks_preflight`
+  that walks all 5 protocols.
+
+### Affordances
+- **Delete-key shortcut for selected device(s)** — standard
+  table-keyboard expectation; widgets/devices_tab.py was the only
+  big table without it. Scoped to `self.devices_table` with
+  `Qt.WidgetShortcut` context so a Delete key during inline editing
+  doesn't accidentally drop the row.
+- **Right-click context menu on the devices table.** Apply selected
+  / Copy / Paste / Delete — same 4 actions the toolbar exposes.
+  Handler selects the row under the cursor first (so operators
+  don't have to left-then-right-click), and Paste is greyed out
+  when the clipboard is empty.
+
+### Audit miss
+- **VXLAN VNI range validation** was flagged as missing but is
+  actually in place — `QIntValidator(1, 16777215)` on both
+  `widgets/add_vxlan_dialog.py:61` and `widgets/add_device_dialog.py:974`,
+  plus a submit-time int() check. The VXLAN table itself is
+  `NoEditTriggers` so no inline-edit bypass either. Noted in the
+  task description and skipped.
+
+### Deferred from the audit
+- **ISIS NET-ID format validation** — `mm.nnnn…nnnn` regex is
+  fiddly and easy to get wrong; own focused release.
+- **OSPF area-id parsing refactor** — existing IPv4-vs-int fallback
+  nest is messy; surgical refactor needed.
+- **Progress dialog consistency across protocols** — different
+  protocols use different patterns.
+- **Empty-state placeholders** in protocol sub-tabs.
+- **Error-message format consistency** (BGP/OSPF/ISIS/VXLAN each
+  use a different shape).
+- **Sort-state preservation across rebuild.**
+
+### Tests
+- **`tests/test_devices_tab_audit.py`** — new file, 13 tests:
+  - 2 tests pinning the duplicate-def cleanup (apply / start / stop
+    BGP each exactly-once).
+  - 1 test confirming `apply_dhcp_pools` calls `kick_refresh`.
+  - 1 test confirming Delete-key shortcut wiring (correct widget +
+    context + slot).
+  - 4 tests covering the right-click menu (custom policy +
+    handler exists; menu offers Apply/Copy/Paste/Delete; selects
+    row under cursor; Paste disabled without clipboard).
+  - 5 parametrised tests asserting `kick_refresh` lives in EVERY
+    protocol's apply method (BGP/OSPF/ISIS/VXLAN/DHCP). Closes
+    the "did we wire it everywhere?" question once and for all.
+
+### Test count
+496 → 509 (+13).
+
 ## [0.2.84] - 2026-05-30
 
 **L2 emulation POLISH bundle** — closes the 4 remaining POLISH items

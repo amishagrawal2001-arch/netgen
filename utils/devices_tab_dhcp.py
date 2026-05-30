@@ -1260,4 +1260,13 @@ class DHCPHandler:
             "Attached DHCP pools have been applied to the server.",
         )
         self.refresh_dhcp_status()
+        # v0.2.85: kick the preflight bar so it repaints immediately
+        # after a DHCP edit (DUPLICATE_IPV4 finding state can flip
+        # when a DHCP-assigned address collides with a static one).
+        # Every other apply path does this; DHCP was the odd one out.
+        try:
+            from widgets.preflight_bar import kick_refresh
+            kick_refresh(self.parent)
+        except Exception:
+            pass
 

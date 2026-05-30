@@ -2024,6 +2024,27 @@ class DevicesTab(QWidget):
         _viewcfg_shortcut = _QShortcut(_QKeySequence("Ctrl+J"), self)
         _viewcfg_shortcut.activated.connect(self._show_selected_device_config)
 
+        # v0.2.85: Delete key removes the selected device(s) — standard
+        # table-keyboard expectation. Scoped to the devices_table so
+        # an inline-edit's Backspace/Delete on a single character
+        # doesn't accidentally delete the row. The table's
+        # SelectionBehaviour is SelectItems but the remove_selected_*
+        # methods walk the row-set so multi-row delete works too.
+        _del_shortcut = _QShortcut(_QKeySequence(Qt.Key_Delete),
+                                   self.devices_table)
+        _del_shortcut.setContext(Qt.WidgetShortcut)  # not global
+        _del_shortcut.activated.connect(self.remove_selected_device)
+
+        # v0.2.85: right-click context menu on the devices table.
+        # Mirrors the toolbar actions so the operator can apply /
+        # copy / paste / delete without rolling the mouse all the
+        # way up to the action bar. Custom policy (not the Qt
+        # default) so we control the menu items.
+        self.devices_table.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.devices_table.customContextMenuRequested.connect(
+            self._on_devices_table_context_menu
+        )
+
         self.ping_button.clicked.connect(self.ping_selected_device)
         self.arp_button.clicked.connect(self._on_arp_button_clicked)
         self.copy_button.clicked.connect(self.copy_selected_device)
@@ -3192,17 +3213,13 @@ class DevicesTab(QWidget):
                 self.main_window.save_session()
             self.update_bgp_table()
 
-    def apply_bgp_configurations(self):
-        """Apply (or remove) BGP configurations for the selected BGP neighbors."""
-        return self.bgp_handler.apply_bgp_configurations() if hasattr(self.bgp_handler, "apply_bgp_configurations") else None
-
-    def start_bgp_protocol(self):
-        """Start BGP protocol for selected devices."""
-        self._toggle_protocol_action("BGP", starting=True)
-
-    def stop_bgp_protocol(self):
-        """Stop BGP protocol for selected devices."""
-        self._toggle_protocol_action("BGP", starting=False)
+    # v0.2.85: removed three dead wrappers (apply_bgp_configurations,
+    # start_bgp_protocol, stop_bgp_protocol). Each was redefined later
+    # in the class body (the v0.2.74 versions with the kick_refresh
+    # hook + the v0.2.41 _toggle_protocol_action variants), so the
+    # earlier defs here were dead per Python's last-def-wins rule.
+    # Deleting reduces the surface a future refactor can accidentally
+    # call the wrong one.
 
     def refresh_ospf_status(self):
         """Refresh OSPF neighbor status from server."""
@@ -8034,6 +8051,60 @@ class DevicesTab(QWidget):
         )
         self.operation_worker.start()
         logger.info(f"Stopping {len(devices_to_process)} device(s) in background...")
+
+    def _on_devices_table_context_menu(self, pos):
+        """v0.2.85: right-click handler for the devices table — opens
+        a small QMenu next to the cursor with the same actions the
+        toolbar exposes. Selecting the row under the cursor first so
+        operators don't have to left-click then right-click.
+
+        ``pos`` is a QPoint relative to the table viewport.
+        """
+        from PyQt5.QtWidgets import QMenu
+        # If the operator right-clicked on a row that isn't currently
+        # selected, select it first (most other apps do this; without
+        # it, the menu acts on whatever was previously selected and
+        # confuses).
+        idx = self.devices_table.indexAt(pos)
+        if idx.isValid():
+            sel_model = self.devices_table.selectionModel()
+            if not sel_model.isRowSelected(idx.row(), idx.parent()):
+                self.devices_table.selectRow(idx.row())
+
+        menu = QMenu(self.devices_table)
+        # Disable everything when there's no selection — a right-click
+        # on empty space below the rows shouldn't offer broken actions.
+        has_selection = bool(self.devices_table.selectedItems())
+
+        act_apply = menu.addAction("Apply selected")
+        act_apply.setEnabled(has_selection)
+        act_apply.triggered.connect(self.apply_selected_device_with_arp)
+
+        menu.addSeparator()
+
+        act_copy = menu.addAction("Copy")
+        act_copy.setEnabled(has_selection)
+        act_copy.triggered.connect(self.copy_selected_device)
+
+        act_paste = menu.addAction("Paste")
+        # Paste enabled only when there's a clipboard payload — match
+        # the existing paste-button behaviour (the method itself checks
+        # main_window.copied_device(s) and warns if empty).
+        clipboard_has_device = bool(
+            getattr(self.main_window, "copied_device", None)
+            or getattr(self.main_window, "copied_devices", None)
+        )
+        act_paste.setEnabled(clipboard_has_device)
+        act_paste.triggered.connect(self.paste_device_to_interface)
+
+        menu.addSeparator()
+
+        act_delete = menu.addAction("Delete")
+        act_delete.setEnabled(has_selection)
+        act_delete.triggered.connect(self.remove_selected_device)
+
+        # Map the viewport-relative pos to a global screen pos for popup.
+        menu.exec_(self.devices_table.viewport().mapToGlobal(pos))
 
     def remove_selected_device(self):
         """Remove selected devices from the UI, data structures, and server."""
