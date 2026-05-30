@@ -2,6 +2,57 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.56] - 2026-05-29
+
+**Enhancement #1 of 4 — Client GUI test coverage.** Lock the 4 recent
+regression fixes against re-breaking, and lay the foundation for the
+incremental-table-update refactor that comes next.
+
+### What changed
+- **`tests/conftest.py`**: added `qapp` (session-scoped, offscreen
+  QApplication) and `client_stub` (factory that builds a minimal stub
+  of the StreamControl + ServerSection mixins on a QWidget base, with
+  every external handler no-op'd and modal QMessageBox calls silenced).
+  Replaces the ~30-line ad-hoc harness I'd been re-typing into every
+  inline repro.
+- **`tests/test_qt_table_guard.py`** (5 tests): locks
+  `utils.qt_table_guard.table_has_open_editor` returns True ONLY for a
+  real cell editor — never for viewport / table focus or selection
+  (which is the over-broad signal that broke stream delete in 0.2.50/51).
+- **`tests/test_client_stream_ops.py`** (9 tests): one regression test
+  per recent bug, plus a couple of supporting invariants:
+  - Delete refreshes while the row is still selected (v0.2.51).
+  - Selection is preserved across automatic refreshes.
+  - Inline editor survives 4 consecutive stats polls (v0.2.49/52).
+  - Focused-but-not-editing does **not** defer the refresh (v0.2.52).
+  - Copy resolves bare-iface cell text via stream_id (v0.2.53).
+  - Paste lands in the correct full key (no `" - Port: …"` ghost),
+    primary path (v0.2.54).
+  - Paste falls back to `server_interfaces` index when the TG widget
+    has no text label.
+  - Start All's `valid_ports` is built from stream_id, not bare iface —
+    the bug that silently skipped every stream (v0.2.55).
+  - Stop All's row index map is keyed by stream_id, not by
+    (bare-iface, name) (v0.2.55).
+
+### Why this comes first
+The 4 recent bugs slipped through because there were **no client GUI
+tests**. Each repro I built was correct but inline and disposable. Now
+the same shape lives as proper tests — the next refactor (incremental
+updates) can land without re-introducing what we just fixed.
+
+### Verified
+Full suite: **117 passed** (103 existing + 14 new). New tests run in
+~0.25 s, so they stay in the regular suite.
+
+### Next on the menu
+0.2.57+: incremental table updates (retires the bug class) → stats /
+latency / reports → protocol & data-plane expansion.
+
+### Notes
+- Test-only addition; no behavioural change. Client-only; no server or
+  wire-format change.
+
 ## [0.2.55] - 2026-05-29
 
 Proactive audit after the Copy/Paste bugs. Found **3 more** instances of
