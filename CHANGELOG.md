@@ -2,6 +2,44 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.53] - 2026-05-29
+
+Fix **stream Copy** failing with *"Unable to resolve the selected streams
+to copy"*.
+
+### The bug (`traffic_client/stream_control.py`)
+`copy_selected_stream` called `_get_stream_by_port_and_name(port, name)`
+with `port` = the Interface cell's text (just the bare iface, e.g.
+`"ens1f0"`). But `self.streams` is keyed by full port labels like
+`"TG 0 - Port: ens1f0"`, so the helper's naive `self.streams.get(port)`
+returned `[]` for every row → no streams resolved → the warning. Likely
+exposed when the `"↳"` continuation-row marker was removed earlier
+(before, the first row of each port held the full key, masking the bug).
+`remove_selected_stream` already handles this with a 3-tier resolution
+(stream_id → `find_port_key` → name); copy didn't.
+
+### The fix
+- Hardened `_get_stream_by_port_and_name` to fall back to `find_port_key`
+  when the direct dict lookup misses — so it now tolerates either the
+  full key or the bare iface name.
+- Updated `copy_selected_stream` to prefer `stream_id` (stashed on the
+  Name cell at `Qt.UserRole`) first, with the (port, name) helper as
+  fallback — same robust 3-tier resolution `remove_selected_stream` uses.
+  Survives renames and duplicate names across ports.
+
+### Verified (headless repro)
+With `self.streams` keyed `"TG 0 - Port: ens1f0"` and a row showing
+`"ens1f0"`:
+- before fix: naive lookup → `[]` (bug exposed),
+- after fix: helper resolves to the correct stream by id,
+- end-to-end: selecting 2 rows + Copy → `copied_streams` holds both,
+  `stream_id` correctly stripped from each copy.
+Full suite **103 passed**.
+
+### Notes
+- Pre-existing bug (not introduced by the recent styling / guard work),
+  but a real one. Client-only. No server or wire-format change.
+
 ## [0.2.52] - 2026-05-29
 
 Proactive audit after the stream-delete regression: fix the **same

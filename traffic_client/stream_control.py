@@ -677,10 +677,30 @@ class TrafficGenClientStreamControl:
     # ---------- copy/paste & CRUD ----------
 
     def _get_stream_by_port_and_name(self, port: str, stream_name: str):
-        """Return the stream dict under `port` whose protocol_selection.name == stream_name."""
+        """Return the stream dict matching (port, name).
+
+        Tolerates `port` being either the full self.streams key
+        (``"TG 0 - Port: ens1f0"``) OR just the bare iface name
+        (``"ens1f0"``) that the stream table's Interface cell shows. The
+        bare-iface case is the one copy_selected_stream hits, since the
+        '↳' continuation marker was removed and every row now displays the
+        plain iface name. Falls back to find_port_key for normalization —
+        same pattern remove_selected_stream uses.
+        """
+        # Fast path: exact key match.
         for s in self.streams.get(port, []):
             if s.get("protocol_selection", {}).get("name") == stream_name:
                 return s
+        # Fallback: normalize a bare iface to a full self.streams key.
+        try:
+            from traffic_client.stream_logic import find_port_key
+            resolved = find_port_key(self.streams, port)
+            if resolved and resolved != port:
+                for s in self.streams.get(resolved, []):
+                    if s.get("protocol_selection", {}).get("name") == stream_name:
+                        return s
+        except Exception:
+            pass
         return None
 
     def _collect_selected_table_rows(self):
@@ -733,7 +753,25 @@ class TrafficGenClientStreamControl:
                 continue
             port = iface_item.text().strip()
             stream_name = name_item.text().strip()
-            src = self._get_stream_by_port_and_name(port, stream_name)
+
+            # Same 3-tier resolution remove_selected_stream uses:
+            #   1) stream_id from name_item.UserRole — most reliable,
+            #      survives renames and duplicate names across ports.
+            #   2) (port, name) lookup — the helper now normalizes the
+            #      bare iface ("ens1f0") to the full self.streams key
+            #      ("TG 0 - Port: ens1f0") via find_port_key.
+            src = None
+            sid = name_item.data(Qt.UserRole)
+            if sid:
+                for _p, lst in self.streams.items():
+                    for _s in lst:
+                        if _s.get("stream_id") == sid:
+                            src = _s
+                            break
+                    if src:
+                        break
+            if src is None:
+                src = self._get_stream_by_port_and_name(port, stream_name)
             if src:
                 c = copy.deepcopy(src)
                 # ✅ strip any existing ids to avoid accidental reuse
