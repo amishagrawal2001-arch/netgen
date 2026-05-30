@@ -278,6 +278,25 @@ class _L2ConfigDialog(QDialog):
             "font-weight: 600; padding: 5px 18px; border-radius: 4px; } "
             "QPushButton:hover { background-color: #15803d; }"
         )
+        # v0.2.84: Preview frame button — destructive role so Qt
+        # doesn't treat it as Apply/OK. Calls _on_preview which builds
+        # the body the same way _on_accept does (minus the validation
+        # rejects), hands it to utils.l2_protocols.build_preview_frame,
+        # and shows scapy.summary() + hex in a modal.
+        preview_btn = QPushButton("Preview frame…")
+        preview_btn.setStyleSheet(
+            "QPushButton { background-color: #ffffff; color: #334155; "
+            "border: 1px solid #cbd5e1; padding: 5px 14px; "
+            "border-radius: 4px; } "
+            "QPushButton:hover { background-color: #f1f5f9; }"
+        )
+        preview_btn.setToolTip(
+            "Build the first frame this configuration will emit and "
+            "show the scapy summary + hex dump — verify MAC mapping, "
+            "VLAN nesting, etc. before clicking Start."
+        )
+        preview_btn.clicked.connect(self._on_preview)
+        buttons.addButton(preview_btn, QDialogButtonBox.ActionRole)
         buttons.accepted.connect(self._on_accept)
         buttons.rejected.connect(self.reject)
         outer.addWidget(buttons)
@@ -902,7 +921,99 @@ class _L2ConfigDialog(QDialog):
             })
 
         self._payload = {"protocol": proto, "body": body}
-        self.accept()
+        # v0.2.84: when in preview mode, leave the dialog open so the
+        # operator can adjust + re-preview without re-typing everything.
+        # _on_preview flips the flag, calls _on_accept, then reads
+        # self._payload and builds the preview frame.
+        if not getattr(self, "_preview_mode", False):
+            self.accept()
+
+    # ------------------------------------------------------------------
+    def _on_preview(self):
+        """v0.2.84: build the first frame this config would emit and
+        show scapy summary + hex dump in a modal — without sending
+        anything or closing the Start dialog."""
+        self._preview_mode = True
+        self._payload = None
+        try:
+            self._on_accept()  # runs every validation
+        finally:
+            self._preview_mode = False
+        p = self._payload
+        if not p:
+            return  # validation rejected; the warning was shown
+        try:
+            from utils.l2_protocols import build_preview_frame
+            frame = build_preview_frame(p["protocol"], p["body"])
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "Preview failed",
+                f"Couldn't build the preview frame:\n\n{exc}",
+            )
+            return
+        if frame is None:
+            QMessageBox.warning(
+                self, "Preview unavailable",
+                f"Preview isn't wired up for protocol "
+                f"{p['protocol']!r} yet.",
+            )
+            return
+        self._show_preview_modal(p["protocol"], frame)
+
+    def _show_preview_modal(self, protocol, frame):
+        """Render the preview frame's summary + hex dump in a modal.
+        scapy.summary() gives the human-readable layer chain; hex
+        dump on the raw bytes shows the wire-level result. v0.2.84."""
+        try:
+            raw = bytes(frame)
+            summary = frame.summary()
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "Preview failed",
+                f"Couldn't serialise the frame:\n\n{exc}",
+            )
+            return
+        # Format hex dump in "offset  hex  ascii" rows — same shape
+        # tcpdump -X produces, easy on the eye.
+        hex_lines = []
+        for off in range(0, len(raw), 16):
+            chunk = raw[off:off + 16]
+            hex_part = " ".join(f"{b:02x}" for b in chunk).ljust(48)
+            ascii_part = "".join(
+                chr(b) if 0x20 <= b < 0x7f else "." for b in chunk
+            )
+            hex_lines.append(f"{off:04x}  {hex_part}  {ascii_part}")
+        hex_block = "\n".join(hex_lines)
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Preview — {protocol.upper()} frame")
+        dlg.resize(640, 460)
+        outer = QVBoxLayout(dlg)
+        outer.setContentsMargins(12, 10, 12, 10)
+        outer.setSpacing(8)
+        hint = QLabel(
+            f"<b>Summary:</b> {summary}<br>"
+            f"<span style='color:#6b7280;'>Total: {len(raw)} bytes</span>"
+        )
+        hint.setTextFormat(Qt.RichText)
+        hint.setWordWrap(True)
+        outer.addWidget(hint)
+        mono = QFont("Menlo")
+        mono.setStyleHint(QFont.Monospace)
+        mono.setPointSize(11)
+        from PyQt5.QtWidgets import QTextEdit
+        te = QTextEdit()
+        te.setReadOnly(True)
+        te.setFont(mono)
+        te.setPlainText(hex_block)
+        outer.addWidget(te, 1)
+        close_row = QHBoxLayout()
+        close_row.addStretch(1)
+        close_btn = QPushButton("Close")
+        close_btn.setDefault(True)
+        close_btn.clicked.connect(dlg.accept)
+        close_row.addWidget(close_btn)
+        outer.addLayout(close_row)
+        dlg.exec_()
 
     def accepted_payload(self) -> Optional[Dict[str, Any]]:
         return self._payload
@@ -927,11 +1038,11 @@ class L2EmulationTab(QWidget):
     COLUMNS = [
         "Status", "Protocol", "Interface", "VLAN",
         "Frames TX", "Failed", "Bytes TX", "Uptime",
-        "Session ID", "Last Error",
+        "Session ID", "Last Error", "",  # blank header for Stop button col
     ]
     COL_STATUS, COL_PROTO, COL_IFACE, COL_VLAN = 0, 1, 2, 3
     COL_FRAMES, COL_FAILED, COL_BYTES, COL_UPTIME = 4, 5, 6, 7
-    COL_SID, COL_ERR = 8, 9
+    COL_SID, COL_ERR, COL_ACTION = 8, 9, 10
 
     # Per-protocol accent colour for the badge text.
     _PROTO_COLORS = {
@@ -1030,6 +1141,24 @@ class L2EmulationTab(QWidget):
         self._info_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         bar.addWidget(self._info_label, 1)
 
+        # v0.2.84: filter box — substring-match on protocol / iface /
+        # session_id (case-insensitive). Empty filter shows all. Useful
+        # once an operator has more than ~10 sessions running.
+        self._filter_edit = QLineEdit()
+        self._filter_edit.setPlaceholderText("Filter: protocol / iface / sid…")
+        self._filter_edit.setFixedHeight(_BTN_H)
+        self._filter_edit.setFixedWidth(220)
+        self._filter_edit.setStyleSheet(
+            "QLineEdit { border: 1px solid #cbd5e1; border-radius: 4px; "
+            "padding: 2px 6px; }"
+        )
+        self._filter_edit.setToolTip(
+            "Substring filter — matches on protocol (lacp/lldp/vrrp/igmp/"
+            "pim/bfd), interface, or session ID. Case-insensitive."
+        )
+        self._filter_edit.textChanged.connect(self._apply_session_filter)
+        bar.addWidget(self._filter_edit)
+
         # Live count chip — running / total. Updated each poll.
         self._count_chip = QLabel("—")
         self._count_chip.setAlignment(Qt.AlignCenter)
@@ -1064,6 +1193,14 @@ class L2EmulationTab(QWidget):
         self._table.setColumnWidth(self.COL_BYTES, 100)
         self._table.setColumnWidth(self.COL_UPTIME, 92)
         self._table.setColumnWidth(self.COL_SID, 132)
+        # v0.2.84: per-row Stop button column — fixed width, no header
+        # text (the button itself is the affordance).
+        self._table.setColumnWidth(self.COL_ACTION, 60)
+        # v0.2.84: header-click sort considered but skipped — Qt
+        # reorders items on sort but NOT the cellWidget-based per-row
+        # Stop buttons, so a click after sort fires the wrong stream's
+        # Stop. The filter QLineEdit covers the "find a specific
+        # session" case well enough for the ~5-running typical load.
         # Right-align the numeric-column headers so they sit over their
         # right-aligned values.
         for col in (self.COL_FRAMES, self.COL_FAILED,
@@ -1296,6 +1433,12 @@ class L2EmulationTab(QWidget):
         mono.setStyleHint(QFont.Monospace)
         mono.setPointSize(11)
 
+        # v0.2.84: sorting must be OFF during population — Qt sorts
+        # rows as items land and the column data ends up in the wrong
+        # row otherwise. Saved + restored around the loop so the
+        # header-click sort the constructor enabled stays in effect.
+        was_sorting = self._table.isSortingEnabled()
+        self._table.setSortingEnabled(False)
         self._table.setRowCount(len(sessions))
         for row, sess in enumerate(sessions):
             counters = sess.get("counters", {}) or {}
@@ -1377,9 +1520,90 @@ class L2EmulationTab(QWidget):
                  color=QColor("#64748b"), tooltip=session_id)
 
             err = counters.get("last_error") or ""
-            _set(self.COL_ERR, err[:120],
+            # v0.2.84: 120 was too tight for scapy tracebacks (e.g.
+            # "ValueError: invalid literal for int() with base 16: ..."
+            # is 100 chars just for the prefix). 200 keeps the column
+            # wide-but-readable; full text still in the tooltip.
+            _set(self.COL_ERR, err[:200],
                  color=QColor("#dc2626") if err else None,
                  tooltip=err or None)
+
+            # v0.2.84: per-row Stop button on running sessions.
+            # Stopped rows get a placeholder item so the column reads
+            # cleanly. Default-arg lambda captures THIS row's
+            # session_id (classic closure-in-loop trap otherwise).
+            if running:
+                btn = QPushButton("Stop")
+                btn.setCursor(Qt.PointingHandCursor)
+                btn.setStyleSheet(
+                    "QPushButton { background-color: #ffffff; "
+                    "color: #b91c1c; border: 1px solid #fca5a5; "
+                    "padding: 1px 8px; border-radius: 4px; "
+                    "font-size: 10px; } "
+                    "QPushButton:hover { background-color: #fef2f2; }"
+                )
+                btn.clicked.connect(
+                    (lambda _checked=False, _sid=session_id:
+                     self._stop_session_by_id(_sid))
+                )
+                self._table.setCellWidget(row, self.COL_ACTION, btn)
+            else:
+                # No button on stopped rows — but DO place an item so
+                # sorting / filtering see a stable cell.
+                self._table.setItem(row, self.COL_ACTION, QTableWidgetItem(""))
+
+        # v0.2.84: restore sorting (was suspended during population so
+        # Qt didn't move cells around mid-loop and orphan cellWidgets);
+        # re-apply filter so a poll mid-typing doesn't blow it away.
+        self._table.setSortingEnabled(was_sorting)
+        self._apply_session_filter()
+
+    def _apply_session_filter(self, *_args) -> None:
+        """Substring filter on protocol / iface / session_id. Hides
+        non-matching rows; empty filter shows all. Called on every
+        textChanged and re-applied on every render so the filter
+        survives the 3 s poll. v0.2.84."""
+        needle = ""
+        try:
+            needle = self._filter_edit.text().strip().lower()
+        except Exception:
+            return
+        for row in range(self._table.rowCount()):
+            if not needle:
+                self._table.setRowHidden(row, False)
+                continue
+            hay = []
+            for col in (self.COL_PROTO, self.COL_IFACE, self.COL_SID):
+                item = self._table.item(row, col)
+                if item is not None:
+                    hay.append(item.text().lower())
+                    # SID cell carries the FULL session_id in UserRole;
+                    # the display is truncated. Match on the full thing.
+                    ud = item.data(Qt.UserRole)
+                    if isinstance(ud, str):
+                        hay.append(ud.lower())
+            self._table.setRowHidden(row, not any(needle in h for h in hay))
+
+    def _stop_session_by_id(self, session_id: str) -> None:
+        """Stop one specific session — invoked by the per-row Stop
+        button (v0.2.84). Mirrors _on_stop_selected's POST logic but
+        scoped to a single id."""
+        if not session_id:
+            return
+        url = self._get_server_url()
+        if not url:
+            return
+        try:
+            requests.post(
+                f"{url.rstrip('/')}/api/l2/stop",
+                json={"session_id": session_id},
+                headers=self._auth_headers(), timeout=5,
+            )
+        except Exception as exc:
+            logger.debug(f"[L2] per-row stop failed for {session_id}: {exc}")
+        # Refresh immediately so the row flips from running to stopped
+        # without waiting for the next 3 s poll.
+        QTimer.singleShot(150, self.refresh)
 
     # ------------------------------------------------------------------
     def _on_start_clicked(self):

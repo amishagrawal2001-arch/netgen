@@ -2,6 +2,89 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.84] - 2026-05-30
+
+**L2 emulation POLISH bundle** — closes the 4 remaining POLISH items
+from the v0.2.81 L2 audit. The audit is now fully resolved
+(BLOCKERs in v0.2.82 + v0.2.83, PAIN in v0.2.81, POLISH here)
+except the explicitly-deferred PIM Join/Prune state machine.
+
+### What changed
+
+#### Last Error column 120 → 200 chars (audit POLISH #12)
+- `widgets/l2_emulation_tab.py` — `err[:120]` → `err[:200]`. Scapy
+  tracebacks ("ValueError: invalid literal for int() with base 16: …")
+  used to get chopped mid-message; 200 is enough for the common
+  cases without making the column unwieldy. Full text still in
+  the tooltip.
+
+#### Filterable sessions table (audit POLISH #14)
+- New `Filter:` QLineEdit in the action bar — substring-matches on
+  protocol / iface / session_id (case-insensitive). Empty filter
+  shows everything; non-empty hides rows via `setRowHidden`. Survives
+  the 3 s poll because `_apply_session_filter` runs at the end of
+  every `_render_sessions`.
+- **Sorting** considered but **intentionally skipped** — Qt's
+  `setSortingEnabled` reorders items on header click but NOT the
+  cellWidget-based per-row Stop buttons (next item), so a click
+  after sort would fire the wrong session's Stop. Pinned by a
+  `test_sessions_table_sorting_intentionally_off` test so a future
+  refactor that re-enables sort without also fixing the cellWidget
+  association fails CI loudly.
+
+#### Per-row Stop button (audit POLISH #13)
+- New COL_ACTION column with a tiny red `Stop` QPushButton on every
+  running row. Single click → `POST /api/l2/stop` with that
+  session_id, then a 150 ms `singleShot` refresh so the row flips
+  from running → stopped without waiting for the next 3 s poll.
+- Stopped rows get a placeholder QTableWidgetItem (so the column
+  still reads cleanly in a future sort-aware rebuild). Default-arg
+  lambda captures each row's session_id (same closure-in-loop trap
+  the EVPN Inject dialog hit in v0.2.63).
+
+#### Frame preview (audit POLISH #11)
+- `utils/l2_protocols.py` gains `build_preview_frame(protocol, body)`
+  — pure synchronous function that builds the first frame each
+  factory would emit, with no threading and no session registration.
+  Returns a scapy Packet (or None if protocol unrecognised). Mirrors
+  every per-protocol RFC mapping the live factories use:
+  LACP / LLDP TLV stack / VRRPv2 + v3 / IGMPv1+v2+v3 with the right
+  L3 destinations / PIM Hello with options / BFD with the packed
+  24-byte payload.
+- `widgets/l2_emulation_tab.py` Start dialog gains a `Preview
+  frame…` button. Calls `_on_preview` which flips a `_preview_mode`
+  flag, runs `_on_accept` (so the same MAC/IP validators fire),
+  reads the resolved body, hands it to `build_preview_frame`, and
+  shows scapy's `summary()` + tcpdump-style hex dump in a modal —
+  WITHOUT closing the Start dialog.
+
+### Tests
+- **`tests/test_l2_preview_and_polish.py`** — new file, 16 tests:
+  - 6 parametrised `build_preview_frame` smoke tests (one per
+    protocol; each yields a non-empty frame from an empty body).
+  - VRRPv2 simple-password preview round-trips through auth1/2
+    with the right NUL padding (the v0.2.83 wiring works in the
+    preview path too).
+  - IGMPv1 query preview targets 224.0.0.1, not the group (v0.2.82
+    wiring).
+  - QinQ preview produces a frame with outer ethertype 0x88a8.
+  - Sessions table COL_ACTION column exists; filter hides
+    non-matching rows; per-row Stop button on running rows only
+    (stopped row has placeholder item); closure-capture regression
+    (3 rows fire their own session_ids).
+  - Last Error cell capped at 200; tooltip carries the full text.
+
+### v0.2.81 L2 audit — final tally
+- ✅ All 5 PAIN items shipped in v0.2.81.
+- ✅ BLOCKER #1 IGMPv1 shipped in v0.2.82.
+- ✅ BLOCKER #2 VRRPv2 auth shipped in v0.2.83.
+- ⏸️ BLOCKER #3 PIM Join/Prune — explicitly deferred (full PIM-SM
+  state machine, much bigger lift than a single release).
+- ✅ All 4 POLISH items shipped here.
+
+### Test count
+480 → 496 (+16).
+
 ## [0.2.83] - 2026-05-30
 
 **VRRPv2 authentication (RFC 3768 §5.3.6)** — closes the second of

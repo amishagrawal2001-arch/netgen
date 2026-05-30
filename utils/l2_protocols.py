@@ -860,3 +860,240 @@ def start_bfd(
         f"state={state} my_disc=0x{int(my_discriminator):08x}"
     )
     return sid
+
+
+# ====================================================================
+# Frame preview (v0.2.84) — pure synchronous frame-build for the GUI
+# ====================================================================
+#
+# The L2 dialog's "Preview frame" button needs to show the operator
+# what's about to go on the wire WITHOUT spawning a worker thread or
+# touching any state. We re-use the per-protocol factories' building
+# blocks (_l2_hdr + the same scapy layers + the same RFC mappings)
+# but in a pure pass-the-body function. Returns raw bytes ready for
+# scapy.hexdump() / Packet.summary().
+
+def build_preview_frame(protocol: str, body: Dict[str, Any]) -> "Optional[Any]":
+    """Build the first frame the named protocol would emit, given the
+    same body dict the REST endpoint receives. Returns a scapy Packet
+    or None if the protocol is unrecognised. Pure — no threading, no
+    session registration.
+
+    ``protocol`` ∈ {"lacp", "lldp", "vrrp", "igmp", "pim", "bfd"}.
+    The body keys are the same the REST endpoint accepts (validated
+    by ``server/l2_routes.py``'s allow-list); missing keys take the
+    factory defaults. Lifted defaults are deliberately permissive
+    here so the preview works even on a partially-filled dialog.
+    """
+    proto = (protocol or "").lower().strip()
+    b = dict(body or {})
+    vlan_id = b.get("vlan_id") or None
+    vlan_pcp = int(b.get("vlan_pcp") or 0)
+    outer_vlan_id = b.get("outer_vlan_id") or None
+    outer_vlan_pcp = int(b.get("outer_vlan_pcp") or 0)
+
+    if proto == "lacp":
+        system_mac = b.get("system_mac") or "00:11:22:33:44:01"
+        return _l2_hdr(
+            system_mac, "01:80:c2:00:00:02", 0x8809,
+            vlan_id, vlan_pcp, outer_vlan_id, outer_vlan_pcp,
+        ) / _lacpdu(b)
+
+    if proto == "lldp":
+        src_mac = b.get("src_mac") or "00:11:22:33:44:02"
+        return _l2_hdr(
+            src_mac, "01:80:c2:00:00:0e", 0x88cc,
+            vlan_id, vlan_pcp, outer_vlan_id, outer_vlan_pcp,
+        ) / _lldpdu(b)
+
+    if proto == "vrrp":
+        return _vrrp_preview(b, vlan_id, vlan_pcp, outer_vlan_id, outer_vlan_pcp)
+
+    if proto == "igmp":
+        return _igmp_preview(b, vlan_id, vlan_pcp, outer_vlan_id, outer_vlan_pcp)
+
+    if proto == "pim":
+        return _pim_preview(b, vlan_id, vlan_pcp, outer_vlan_id, outer_vlan_pcp)
+
+    if proto == "bfd":
+        return _bfd_preview(b, vlan_id, vlan_pcp, outer_vlan_id, outer_vlan_pcp)
+
+    return None
+
+
+def _lacpdu(b):
+    from scapy.contrib.lacp import LACP, SlowProtocol
+    return SlowProtocol(subtype=0x01) / LACP(
+        actor_system_priority=int(b.get("system_priority") or 32768),
+        actor_system=b.get("system_mac") or "00:11:22:33:44:01",
+        actor_key=int(b.get("key") or 1),
+        actor_port_priority=int(b.get("port_priority") or 32768),
+        actor_port_number=int(b.get("port_number") or 1),
+        actor_state=int(b.get("state") or 0x3d),
+    )
+
+
+def _lldpdu(b):
+    """Match the live LLDP factory's stacking: TLVs chain via `/`
+    (there is no `LLDPDU(tlvlist=...)` constructor in scapy)."""
+    from scapy.contrib.lldp import (
+        LLDPDUChassisID, LLDPDUPortID, LLDPDUTimeToLive,
+        LLDPDUSystemName, LLDPDUSystemDescription, LLDPDUEndOfLLDPDU,
+    )
+    chassis_id = (b.get("chassis_id") or "netgen-host")
+    port_id = (b.get("port_id") or "eth0")
+    system_name = (b.get("system_name") or "netgen")
+    system_description = (b.get("system_description") or "")
+    return (
+        LLDPDUChassisID(subtype="locally assigned",
+                        id=chassis_id.encode("ascii"))
+        / LLDPDUPortID(subtype="locally assigned",
+                       id=port_id.encode("ascii"))
+        / LLDPDUTimeToLive(ttl=int(b.get("ttl_s") or 120))
+        / LLDPDUSystemName(system_name=system_name.encode("ascii"))
+        / LLDPDUSystemDescription(
+            description=system_description.encode("ascii"))
+        / LLDPDUEndOfLLDPDU()
+    )
+
+
+def _vrrp_preview(b, vlan_id, vlan_pcp, outer_vlan_id, outer_vlan_pcp):
+    from scapy.layers.inet import IP
+    from scapy.layers.vrrp import VRRP, VRRPv3
+    version = int(b.get("version") or 3)
+    vrid = int(b.get("vrid") or 1)
+    priority = int(b.get("priority") or 100)
+    family = str(b.get("family") or "ipv4").lower()
+    src_ip = b.get("src_ip") or "10.0.0.1"
+    src_mac = b.get("src_mac") or _vrrp_virtual_mac(vrid, family)
+    virtual_ips = b.get("virtual_ips") or ["192.168.1.254"]
+    interval_s = float(b.get("interval_s") or 1.0)
+    if family == "ipv6" and version == 3:
+        from scapy.layers.inet6 import IPv6
+        return (
+            _l2_hdr(src_mac, "33:33:00:00:00:12", 0x86dd,
+                    vlan_id, vlan_pcp, outer_vlan_id, outer_vlan_pcp)
+            / IPv6(src=src_ip, dst="ff02::12", hlim=255, nh=112)
+            / VRRPv3(version=3, vrid=vrid, priority=priority,
+                     addrlist=virtual_ips, adv=int(interval_s * 100))
+        )
+    ip = IP(src=src_ip, dst="224.0.0.18", ttl=255, proto=112)
+    if version == 2:
+        # Mirror the auth wiring v0.2.83 added.
+        auth_bytes = (b.get("auth_data") or "").encode(
+            "ascii", errors="replace")[:8].ljust(8, b"\x00")
+        return (
+            _l2_hdr(src_mac, "01:00:5e:00:00:12", 0x0800,
+                    vlan_id, vlan_pcp, outer_vlan_id, outer_vlan_pcp)
+            / ip
+            / VRRP(version=2, vrid=vrid, priority=priority,
+                   addrlist=virtual_ips, adv=int(interval_s),
+                   authtype=int(b.get("auth_type") or 0),
+                   auth1=int.from_bytes(auth_bytes[:4], "big"),
+                   auth2=int.from_bytes(auth_bytes[4:8], "big"))
+        )
+    return (
+        _l2_hdr(src_mac, "01:00:5e:00:00:12", 0x0800,
+                vlan_id, vlan_pcp, outer_vlan_id, outer_vlan_pcp)
+        / ip
+        / VRRPv3(version=3, vrid=vrid, priority=priority,
+                 addrlist=virtual_ips, adv=int(interval_s * 100))
+    )
+
+
+def _igmp_preview(b, vlan_id, vlan_pcp, outer_vlan_id, outer_vlan_pcp):
+    from scapy.layers.inet import IP
+    version = int(b.get("version") or 2)
+    group = b.get("group") or "239.1.1.1"
+    src_ip = b.get("src_ip") or "10.0.0.10"
+    src_mac = b.get("src_mac") or "00:11:22:33:44:04"
+    type_code = b.get("type_code")
+    if version == 3:
+        from scapy.contrib.igmpv3 import IGMPv3, IGMPv3mr, IGMPv3gr
+        t = type_code if type_code is not None else 0x22
+        rec = IGMPv3gr(rtype=2, maddr=group)
+        return (
+            _l2_hdr(src_mac, _ipv4_mcast_mac("224.0.0.22"), 0x0800,
+                    vlan_id, vlan_pcp, outer_vlan_id, outer_vlan_pcp)
+            / IP(src=src_ip, dst="224.0.0.22", ttl=1, options=[])
+            / IGMPv3(type=int(t))
+            / IGMPv3mr(numgrp=1, records=[rec])
+        )
+    from scapy.contrib.igmp import IGMP
+    if version == 1:
+        t = type_code if type_code is not None else 0x12
+        ip_dst = "224.0.0.1" if int(t) == 0x11 else group
+        return (
+            _l2_hdr(src_mac, _ipv4_mcast_mac(ip_dst), 0x0800,
+                    vlan_id, vlan_pcp, outer_vlan_id, outer_vlan_pcp)
+            / IP(src=src_ip, dst=ip_dst, ttl=1)
+            / IGMP(type=int(t), mrcode=0, gaddr=group)
+        )
+    t = type_code if type_code is not None else 0x16
+    ip_dst = "224.0.0.2" if int(t) == 0x17 else group
+    return (
+        _l2_hdr(src_mac, _ipv4_mcast_mac(ip_dst), 0x0800,
+                vlan_id, vlan_pcp, outer_vlan_id, outer_vlan_pcp)
+        / IP(src=src_ip, dst=ip_dst, ttl=1)
+        / IGMP(type=int(t), gaddr=group)
+    )
+
+
+def _pim_preview(b, vlan_id, vlan_pcp, outer_vlan_id, outer_vlan_pcp):
+    """Mirror the live PIM factory's PIMv2Hdr + PIMv2Hello option list
+    (scapy class names are PIMv2*, not bare PIM*)."""
+    from scapy.layers.inet import IP
+    from scapy.contrib.pim import (
+        PIMv2Hdr, PIMv2Hello,
+        PIMv2HelloHoldtime, PIMv2HelloDRPriority,
+        PIMv2HelloGenerationID,
+    )
+    src_ip = b.get("src_ip") or "10.0.0.20"
+    src_mac = b.get("src_mac") or "00:11:22:33:44:05"
+    return (
+        _l2_hdr(src_mac, "01:00:5e:00:00:0d", 0x0800,
+                vlan_id, vlan_pcp, outer_vlan_id, outer_vlan_pcp)
+        / IP(src=src_ip, dst="224.0.0.13", ttl=1, proto=103)
+        / PIMv2Hdr(type=0)  # 0 = Hello
+        / PIMv2Hello(option=[
+            PIMv2HelloHoldtime(holdtime=int(b.get("hold_time") or 105)),
+            PIMv2HelloDRPriority(dr_priority=int(b.get("dr_priority") or 1)),
+            PIMv2HelloGenerationID(
+                generation_id=int(b.get("generation_id") or 0xABCDEF01)
+            ),
+        ])
+    )
+
+
+def _bfd_preview(b, vlan_id, vlan_pcp, outer_vlan_id, outer_vlan_pcp):
+    from scapy.layers.inet import IP, UDP
+    from scapy.packet import Raw
+    import struct
+    src_ip = b.get("src_ip") or "10.0.0.1"
+    dst_ip = b.get("dst_ip") or "10.0.0.2"
+    src_mac = b.get("src_mac") or "00:11:22:33:44:06"
+    dst_mac = b.get("dst_mac") or "00:11:22:33:44:07"
+    my_disc = int(b.get("my_discriminator") or 0x11111111)
+    your_disc = int(b.get("your_discriminator") or 0)
+    state = int(b.get("state") or 3)  # Up
+    detect_mult = int(b.get("detect_mult") or 3)
+    diag = int(b.get("diag") or 0)
+    tx_us = int(b.get("desired_min_tx_us") or 1_000_000)
+    rx_us = int(b.get("required_min_rx_us") or 1_000_000)
+    echo_us = int(b.get("required_min_echo_rx_us") or 0)
+    ver_diag = (3 << 5) | (diag & 0x1f)
+    sta_flags = (state & 0x3) << 6
+    payload = struct.pack(
+        "!BBBBII III",
+        ver_diag, sta_flags, detect_mult, 24,
+        my_disc & 0xffffffff, your_disc & 0xffffffff,
+        tx_us & 0xffffffff, rx_us & 0xffffffff,
+        echo_us & 0xffffffff,
+    )
+    return (
+        _l2_hdr(src_mac, dst_mac, 0x0800,
+                vlan_id, vlan_pcp, outer_vlan_id, outer_vlan_pcp)
+        / IP(src=src_ip, dst=dst_ip, ttl=255)
+        / UDP(sport=49152, dport=int(b.get("dst_udp_port") or 3784))
+        / Raw(load=payload)
+    )
