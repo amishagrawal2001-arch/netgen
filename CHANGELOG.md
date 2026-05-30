@@ -2,6 +2,56 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.92] - 2026-05-30
+
+**Sort-state preservation across table rebuilds** — closes another
+Devices-tab audit POLISH item. The BGP-neighbours table and the
+main Devices table both follow the "disable sort → setRowCount →
+repopulate → re-enable sort" pattern, but they were losing the
+operator's chosen sort column + direction every time. Click
+"Sort by State", hit Apply, the rebuild snapped rows back to
+insertion order. Annoying enough that operators didn't bother
+sorting at all.
+
+### What changed
+- **`utils/table_sort_state.py`** — new pure-function helper.
+  `capture_sort_state(table)` snapshots the header's sort indicator
+  (column + Qt.SortOrder); `restore_sort_state(table, state)`
+  re-applies via `sortByColumn()`. Defensive against C++-side
+  teardown (any access failure returns / consumes the `(-1, …)`
+  sentinel and the rebuild keeps going).
+- **`utils/devices_tab_bgp.py`** — BGP-neighbours rebuild captures
+  the sort state before `setSortingEnabled(False)` and restores it
+  after re-enabling.
+- **`widgets/devices_tab.py`** — Devices-table rebuild does the
+  same. Existing `_populating_devices_table` guard untouched.
+
+The other 4 protocol tables (OSPF / IS-IS / VXLAN / DHCP) don't
+have sorting enabled today; this release deliberately does NOT
+turn it on — adding sortable headers is a feature add, not the
+bug fix this release addresses. Same helper would slot in if
+those tables get sortable later.
+
+### Tests
+- **`tests/test_table_sort_state.py`** — new file, 12 tests:
+  - 4 parametrised round-trip tests covering column 0 + column 2
+    in both ascending + descending order.
+  - Capture returns Qt's default (column 0) when no header click
+    has happened; -1 sentinel when the table lacks
+    `horizontalHeader()` (defensive against rebuild-mid-flight).
+  - Restore is a no-op on `None`, on the `(-1, …)` sentinel, and
+    on a dead-C++ table (the "wrapped C/C++ object" failure mode).
+
+### Audit remaining (after v0.2.92)
+- Progress dialog consistency across protocols
+- Error-message format consistency across protocols
+- PIM Join/Prune (BLOCKER, full state-machine; roadmap)
+- tx_worker C-side bundle (3 deferrals; needs binary rebuild)
+
+### Test count
+627 → 645 (+18 — 12 in this file + 6 stateful-TCP-tab tests now
+green after the v0.2.91 fixup bundle).
+
 ## [0.2.91] - 2026-05-30
 
 **Stateful TCP tab — fixup bundle from v0.2.88 code-review + GUI

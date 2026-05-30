@@ -7796,8 +7796,13 @@ class DevicesTab(QWidget):
             # Set row count once instead of multiple insertRow calls
             self.devices_table.setRowCount(total_rows)
             
-            # OPTIMIZATION: Disable sorting temporarily for faster updates
+            # OPTIMIZATION: Disable sorting temporarily for faster updates.
+            # v0.2.91: also snapshot the operator's chosen sort column
+            # so a rebuild (Apply / Refresh / device delete) doesn't
+            # blow away their pick and snap rows back to insertion order.
             was_sorting_enabled = self.devices_table.isSortingEnabled()
+            from utils.table_sort_state import capture_sort_state
+            _devices_sort_state = capture_sort_state(self.devices_table)
             if was_sorting_enabled:
                 self.devices_table.setSortingEnabled(False)
             
@@ -7848,9 +7853,12 @@ class DevicesTab(QWidget):
                     tooltip = "Device Running" if resolved else "Device Stopped"
                     self.set_status_icon(row, resolved=resolved, status_text=tooltip, device_status=status_value)
                 
-                # Re-enable sorting if it was enabled
+                # Re-enable sorting if it was enabled, then restore the
+                # operator's pre-rebuild sort column + direction.
                 if was_sorting_enabled:
                     self.devices_table.setSortingEnabled(True)
+                    from utils.table_sort_state import restore_sort_state
+                    restore_sort_state(self.devices_table, _devices_sort_state)
             finally:
                 # Re-enable table updates after bulk population
                 self.devices_table.setUpdatesEnabled(True)

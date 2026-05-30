@@ -419,8 +419,13 @@ class BGPHandler:
             if neighbor_count != current_rows:
                 self.parent.bgp_table.setRowCount(neighbor_count)
             
-            # Disable sorting temporarily for faster updates
+            # Disable sorting temporarily for faster updates.
+            # v0.2.91: also snapshot the operator's chosen sort column
+            # + direction so the rebuild doesn't blow away their
+            # "Sort by State" / "Sort by Local AS" pick.
             was_sorting_enabled = self.parent.bgp_table.isSortingEnabled()
+            from utils.table_sort_state import capture_sort_state
+            _bgp_sort_state = capture_sort_state(self.parent.bgp_table)
             if was_sorting_enabled:
                 self.parent.bgp_table.setSortingEnabled(False)
             
@@ -515,9 +520,12 @@ class BGPHandler:
                 hold_time_item.setToolTip("BGP Hold-time timer in seconds (default: 90)")
                 self.parent.bgp_table.setItem(row, 11, hold_time_item)
             
-            # Re-enable sorting if it was enabled
+            # Re-enable sorting if it was enabled, then restore the
+            # operator's pre-rebuild sort column + direction.
             if was_sorting_enabled:
                 self.parent.bgp_table.setSortingEnabled(True)
+                from utils.table_sort_state import restore_sort_state
+                restore_sort_state(self.parent.bgp_table, _bgp_sort_state)
         else:
             # Update from device configurations - one row per neighbor IP
             try:
