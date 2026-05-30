@@ -700,6 +700,20 @@ class DHCPHandler:
         # Section header removed — tab name + table columns are enough.
         layout.addWidget(self.parent.dhcp_table)
 
+        # v0.2.88: empty-state placeholder.
+        try:
+            from widgets.empty_state_overlay import EmptyStateOverlay
+            self.parent.dhcp_empty_state = EmptyStateOverlay(
+                self.parent.dhcp_table,
+                "No DHCP servers or clients configured.\n\n"
+                "Configure DHCP on a device via the main Devices "
+                "table (right-click → Edit → enable DHCP). DHCP "
+                "pools attached to running servers will appear "
+                "here once Apply succeeds."
+            )
+        except Exception:
+            pass  # overlay is advisory; never block sub-tab render
+
         # DHCP action bar — unified chrome with Devices + BGP + OSPF
         # + ISIS + VXLAN.
         from PyQt5.QtWidgets import QFrame, QLabel

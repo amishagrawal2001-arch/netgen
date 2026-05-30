@@ -62,7 +62,20 @@ class ISISHandler:
         
         # Section header removed — tab name + column headers carry it.
         layout.addWidget(self.parent.isis_table)
-        
+
+        # v0.2.88: empty-state placeholder.
+        try:
+            from widgets.empty_state_overlay import EmptyStateOverlay
+            self.parent.isis_empty_state = EmptyStateOverlay(
+                self.parent.isis_table,
+                "No IS-IS neighbours configured.\n\n"
+                "Add one with the Add button below, or configure "
+                "IS-IS on a device via the main Devices table "
+                "(right-click → Edit → enable IS-IS)."
+            )
+        except Exception:
+            pass  # overlay is advisory; never block sub-tab render
+
         # IS-IS action bar — unified chrome with Devices + BGP + OSPF.
         from PyQt5.QtWidgets import QFrame
         from PyQt5.QtCore import Qt

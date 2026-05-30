@@ -51,7 +51,20 @@ class OSPFHandler:
         
         # Section header removed — tab name + column headers carry it.
         layout.addWidget(self.parent.ospf_table)
-        
+
+        # v0.2.88: empty-state placeholder.
+        try:
+            from widgets.empty_state_overlay import EmptyStateOverlay
+            self.parent.ospf_empty_state = EmptyStateOverlay(
+                self.parent.ospf_table,
+                "No OSPF neighbours configured.\n\n"
+                "Add one with the Add button below, or configure "
+                "OSPF on a device via the main Devices table "
+                "(right-click → Edit → enable OSPF)."
+            )
+        except Exception:
+            pass  # overlay is advisory; never block sub-tab render
+
         # OSPF action bar — unified chrome with the Devices + BGP rows
         # (grey footer QFrame, BTN_BASE / BTN_APPLY styles, 28×24 px
         # buttons, vertical divider between config and runtime groups).

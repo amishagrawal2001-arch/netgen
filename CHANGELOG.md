@@ -2,6 +2,66 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.89] - 2026-05-30
+
+**Empty-state placeholders on protocol sub-tabs** — closes another
+Devices-tab audit POLISH item. The 5 protocol sub-tabs (BGP / OSPF
+/ IS-IS / VXLAN / DHCP) used to render as blank rectangles when
+nothing was configured yet; operators new to the app couldn't tell
+"empty by design" from "broken connection" or "still loading".
+
+### What changed
+- **`widgets/empty_state_overlay.py`** — new reusable widget.
+  `EmptyStateOverlay(table, message)` overlays a centred dimmed
+  label on the table's viewport when `rowCount() == 0`. Show/hide
+  is driven by the model's `rowsInserted` / `rowsRemoved` /
+  `modelReset` / `layoutChanged` signals so it disappears the
+  instant the first row arrives. Re-centres on viewport resize
+  via an installed event filter. Click-transparent so right-click
+  context menus still reach the table underneath. Defensive
+  against Qt teardown order (signals firing after the QLabel is
+  C++-deleted are no-oped).
+- **`utils/devices_tab_{bgp,ospf,isis,vxlan,dhcp}.py`** — each
+  sub-tab construction wires an overlay with a per-protocol
+  message naming the action that creates the first row (e.g.
+  "Add one with the Add button below, or configure BGP on a device
+  via the main Devices table"). All wrapped in try/except so a
+  construction failure can't block the sub-tab from rendering.
+
+### Tests
+- **`tests/test_empty_state_overlay.py`** — new file, 9 tests:
+  - Overlay visible on empty table at construction (requires
+    `parent.show()` for `isVisible()` to return True under
+    offscreen Qt).
+  - Hidden when rows present at construction (initial `_refresh`
+    runs in the constructor).
+  - Hides on first `insertRow`; reappears on last `removeRow`.
+  - `setRowCount(0)` + explicit `refresh()` re-shows (programmatic
+    setRowCount doesn't always fire the rowsRemoved signal).
+  - `set_message()` swaps label text in place.
+  - `WA_TransparentForMouseEvents` set so clicks pass through to
+    the table.
+  - Reparents to `table.viewport()` (not the table itself) so it
+    sits inside the data area.
+  - Viewport resize re-centres the label via the event filter.
+
+### Defensive teardown
+The first test draft hit a cross-test segfault — model signals
+fired after the QLabel was C++-deleted. Fixed two ways:
+1. The overlay's `_refresh` catches `RuntimeError` from a deleted
+   QLabel and returns silently.
+2. The test fixture uses a `yield`-based teardown that closes +
+   deleteLater()s the parent QWidget so children clean up before
+   the next test's QApplication state.
+
+### Audit remaining (after v0.2.89)
+- Progress dialog consistency across protocols
+- Error-message format consistency across protocols
+- Sort-state preservation across table rebuild
+
+### Test count
+613 → 622 (+9).
+
 ## [0.2.88] - 2026-05-30
 
 **Stateful-TCP GUI tab + suite-flake fix** — gives the stateful-TCP

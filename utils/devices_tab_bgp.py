@@ -55,6 +55,22 @@ class BGPHandler:
         
         # Section header removed — tab name + column headers carry it.
         layout.addWidget(self.parent.bgp_table)
+
+        # v0.2.88: empty-state placeholder. A fresh session with no
+        # BGP configured used to render this table as a blank
+        # rectangle — operators couldn't tell "no BGP yet" from
+        # "broken connection".
+        try:
+            from widgets.empty_state_overlay import EmptyStateOverlay
+            self.parent.bgp_empty_state = EmptyStateOverlay(
+                self.parent.bgp_table,
+                "No BGP neighbours configured.\n\n"
+                "Add one with the Add button below, or configure "
+                "BGP on a device via the main Devices table "
+                "(right-click → Edit → enable BGP)."
+            )
+        except Exception:
+            pass  # overlay is advisory; never block sub-tab render
         
         # BGP action bar — same chrome as the Devices action row
         # (grey footer QFrame, BTN_BASE / BTN_APPLY styles, 28×24 px

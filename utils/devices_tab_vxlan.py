@@ -69,6 +69,21 @@ class VXLANHandler:
         # Section header removed — tab name + table columns are enough.
         layout.addWidget(self.parent.vxlan_table)
 
+        # v0.2.88: empty-state placeholder.
+        try:
+            from widgets.empty_state_overlay import EmptyStateOverlay
+            self.parent.vxlan_empty_state = EmptyStateOverlay(
+                self.parent.vxlan_table,
+                "No VXLAN tunnels configured.\n\n"
+                "Add a tunnel with the Add button below, or "
+                "configure VXLAN on a device via the main Devices "
+                "table (right-click → Edit → enable VXLAN). "
+                "EVPN Type-2 / Type-5 bulk-inject lives on the "
+                "EVPN Inject button (action bar)."
+            )
+        except Exception:
+            pass  # overlay is advisory; never block sub-tab render
+
         # VXLAN action bar — unified chrome with Devices + BGP + OSPF + ISIS.
         from PyQt5.QtWidgets import QFrame, QLabel
         action_bar = QFrame()
