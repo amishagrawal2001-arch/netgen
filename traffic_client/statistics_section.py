@@ -623,6 +623,45 @@ class TrafficGenClientStatisticsSection():
         )
         self.clear_stats_button_traffic.clicked.connect(self.clear_cached_statistics)
         button_layout.addWidget(self.clear_stats_button_traffic)
+
+        # Export CSV — dumps the currently visible stats tables to a
+        # single CSV with one section per table (Interface Statistics,
+        # then Stream Statistics). Useful for attaching a snapshot to a
+        # test report without screenshotting. Sits flush against the
+        # Clear Stats button so the row stays compact.
+        self.export_stats_button = QPushButton("Export CSV")
+        self.export_stats_button.setFixedSize(110, 24)
+        self.export_stats_button.setCursor(Qt.PointingHandCursor)
+        self.export_stats_button.setToolTip(
+            "Save the current Interface + Stream statistics tables to a "
+            "CSV file. Captures whatever is on screen right now — clear "
+            "first if you want a fresh baseline."
+        )
+        # Neutral style — non-destructive. Blue-tinted hover to read as
+        # primary-ish without competing with Apply elsewhere.
+        self.export_stats_button.setStyleSheet(
+            "QPushButton {"
+            "  border: 1px solid #cbd5e1;"
+            "  border-radius: 5px;"
+            "  background-color: #ffffff;"
+            "  color: #374151;"
+            "  font-size: 11px;"
+            "  font-weight: 500;"
+            "  padding: 0 8px;"
+            "}"
+            "QPushButton:hover {"
+            "  background-color: #eff6ff;"
+            "  border-color: #60a5fa;"
+            "  color: #1d4ed8;"
+            "}"
+            "QPushButton:pressed {"
+            "  background-color: #dbeafe;"
+            "  border-color: #2563eb;"
+            "}"
+        )
+        self.export_stats_button.clicked.connect(self.export_statistics_csv)
+        button_layout.addWidget(self.export_stats_button)
+
         layout.addLayout(button_layout, 0)  # stretch=0: never grows
 
         self.statistics_group.setLayout(layout)
@@ -1879,11 +1918,19 @@ class TrafficGenClientStatisticsSection():
                 else:
                     lat_color = QColor("#ef4444")
                 lat_text = f"{p50:.1f}"
+                # p95 was added in 0.2.58 — most SLAs are stated in p95
+                # rather than p50 or p99, so surface it in the tooltip
+                # too. Format defensively in case an old server (no p95
+                # in its snapshot dict) is on the other end.
+                p95 = lat.get("p95_us")
+                p95_line = (f"  p95  = {p95:.2f} us\n"
+                            if isinstance(p95, (int, float)) else "")
                 lat_tip = (
                     f"One-way latency over last {lat.get('window_samples', 0)} samples:\n"
                     f"  min  = {lat.get('min_us'):.2f} us\n"
                     f"  avg  = {lat.get('avg_us'):.2f} us\n"
                     f"  p50  = {lat.get('p50_us'):.2f} us  (this cell)\n"
+                    f"{p95_line}"
                     f"  p99  = {lat.get('p99_us'):.2f} us\n"
                     f"  max  = {lat.get('max_us'):.2f} us\n"
                     f"\n"
@@ -1948,6 +1995,117 @@ class TrafficGenClientStatisticsSection():
         
         # Resize columns to fit content
         self.stream_statistics_table.resizeColumnsToContents()
+
+    def export_statistics_csv(self):
+        """Dump the visible Interface + Stream statistics tables to a
+        CSV file the operator picks via a save dialog.
+
+        Layout: a small header block (timestamp + per-server addresses)
+        followed by two sections, each preceded by a ``# Section: ...``
+        comment row and that table's header row. Empty tables write the
+        header + a ``# (no rows)`` comment instead of being skipped, so
+        the file structure is self-describing even mid-test before any
+        traffic has flowed.
+
+        This captures the snapshot currently on screen — it does NOT
+        re-poll the servers. For a fresh baseline, click Clear Stats
+        first, wait one poll, then export.
+        """
+        from PyQt5.QtWidgets import QFileDialog, QMessageBox
+        import csv
+        import datetime as _dt
+        import os as _os
+
+        default_name = (
+            "netgen-stats-"
+            + _dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+            + ".csv"
+        )
+        default_dir = _os.path.expanduser("~/Downloads")
+        default_path = _os.path.join(default_dir, default_name)
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Export Statistics", default_path, "CSV Files (*.csv)"
+        )
+        if not path:
+            return   # user cancelled
+
+        try:
+            with open(path, "w", newline="", encoding="utf-8") as fh:
+                w = csv.writer(fh)
+                # Header block
+                w.writerow([f"# netgen statistics export"])
+                w.writerow([f"# exported_at: {_dt.datetime.now().isoformat(timespec='seconds')}"])
+                servers = getattr(self, "server_interfaces", []) or []
+                for s in servers:
+                    w.writerow([
+                        f"# server: TG {s.get('tg_id','?')} "
+                        f"{s.get('address','?')} "
+                        f"online={s.get('online', True)}"
+                    ])
+                w.writerow([])
+                # Section 1 — Interface Statistics
+                self._dump_table_to_csv(w, "Interface Statistics",
+                                       getattr(self, "statistics_table", None))
+                w.writerow([])
+                # Section 2 — Stream Statistics
+                self._dump_table_to_csv(w, "Stream Statistics",
+                                       getattr(self, "stream_statistics_table", None))
+        except Exception as exc:
+            QMessageBox.critical(
+                self, "Export Failed",
+                f"Could not write CSV to:\n{path}\n\n{type(exc).__name__}: {exc}"
+            )
+            logger.error(f"[EXPORT] CSV export failed: {exc}")
+            return
+
+        QMessageBox.information(
+            self, "Export Complete", f"Statistics written to:\n{path}"
+        )
+        logger.info(f"[EXPORT] Wrote statistics CSV: {path}")
+
+    @staticmethod
+    def _dump_table_to_csv(writer, section_name, table):
+        """Helper: serialize a QTableWidget to the given csv.writer.
+
+        Writes a section comment, the header row, then each visible (not
+        hidden) row as plain cell text. Cell widgets that aren't items
+        (combos, checkboxes) are read via their `currentText()` or
+        `isChecked()` if available; otherwise the cell renders as empty.
+        """
+        writer.writerow([f"# Section: {section_name}"])
+        if table is None or table.columnCount() == 0:
+            writer.writerow([f"# (table not available)"])
+            return
+        headers = []
+        for c in range(table.columnCount()):
+            hi = table.horizontalHeaderItem(c)
+            headers.append(hi.text() if hi else f"col{c}")
+        writer.writerow(headers)
+        n_rows = table.rowCount()
+        if n_rows == 0:
+            writer.writerow([f"# (no rows)"])
+            return
+        for r in range(n_rows):
+            if table.isRowHidden(r):
+                continue
+            row = []
+            for c in range(table.columnCount()):
+                item = table.item(r, c)
+                if item is not None:
+                    row.append(item.text())
+                    continue
+                # Cell widget fallback — best-effort for combos / checkboxes.
+                w_ = table.cellWidget(r, c)
+                if w_ is None:
+                    row.append("")
+                    continue
+                if hasattr(w_, "currentText"):
+                    row.append(w_.currentText())
+                elif hasattr(w_, "isChecked"):
+                    row.append("yes" if w_.isChecked() else "no")
+                else:
+                    row.append("")
+            writer.writerow(row)
 
     def clear_cached_statistics(self):
         """'Clear Stats' implemented as a baseline tare.

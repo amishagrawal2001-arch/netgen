@@ -2,6 +2,53 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.58] - 2026-05-29
+
+**Enhancement #3 of 4 (slice 1) — stats / latency / reports.** Adds
+**p95** latency to the sampler and an **Export CSV** button on the stats
+dock. The bigger pieces (RFC 2544 binary-search runner, PDF reports)
+follow in 0.2.59.
+
+### What changed
+- **`utils/latency_sampler.py`** — `LatencyStats.snapshot()` now returns
+  `p95_us` alongside the existing `p50_us` and `p99_us`. Most SLAs are
+  stated in p95, and without it operators were eyeballing between p50
+  and p99. Old-server-compatible (the empty-window snapshot also
+  contains the key, set to `None`).
+- **`traffic_client/statistics_section.py`** — Stream-Statistics table's
+  Latency cell tooltip now includes a `p95` line (formatted only when
+  the server actually returned one, so old servers don't render
+  `None us`).
+- **`traffic_client/statistics_section.py`** — new **Export CSV** button
+  next to Clear Stats. Writes both stats tables to one CSV with a header
+  block (timestamp + server addresses) and a `# Section: …` marker per
+  table. Handles cell widgets (combos / checkboxes) via the obvious
+  fallbacks; skips hidden (filtered) rows; writes a self-describing
+  `# (no rows)` / `# (table not available)` marker rather than silently
+  emitting nothing.
+
+### Verified
+11 new tests, full suite **132 passed**:
+- `tests/test_latency_percentiles.py` (4): empty-snapshot key presence;
+  min ≤ p50 ≤ p95 ≤ p99 ≤ max ordering on 1000 uniform samples; single-
+  sample degenerate case; p95 strictly between p50 and p99 on skewed
+  data (proves we didn't alias them).
+- `tests/test_stats_csv_export.py` (7): `_dump_table_to_csv` for the
+  common shapes (header, empty, None, missing item, hidden rows,
+  combo/checkbox cell widgets) + an end-to-end test that mocks
+  `QFileDialog`, runs `export_statistics_csv` against two real
+  `QTableWidget`s on a real mixin, and parses the resulting CSV.
+
+### Next on this enhancement
+0.2.59: RFC 2544 dialog wired up (throughput / latency / loss / FLR with
+binary-search rate convergence); per-frame-size results table; optional
+PDF report.
+
+### Notes
+- Server change is additive (new `p95_us` field in the snapshot);
+  pre-0.2.58 clients ignore it. Client tooltip falls back gracefully
+  against a pre-0.2.58 server.
+
 ## [0.2.57] - 2026-05-29
 
 **Enhancement #2 of 4 — Incremental in-place updates for the Streams

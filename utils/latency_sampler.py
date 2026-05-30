@@ -79,10 +79,14 @@ class LatencyStats:
                 "samples_skipped": self.samples_skipped,
                 "window_samples": 0,
                 "min_us": None, "avg_us": None, "p50_us": None,
-                "p99_us": None, "max_us": None,
+                "p95_us": None, "p99_us": None, "max_us": None,
             }
         # Sort once for percentile reads — at window_size=10K this is cheap.
         sorted_ns = sorted(self._latencies)
+        # Percentile index — nearest-rank method. `min(n-1, ...)` guards
+        # the empty/one-sample edge so we don't IndexError on n==1.
+        def _pct(p: float) -> float:
+            return sorted_ns[min(n - 1, int(n * p))] / 1000.0
         return {
             "samples_seen": self.samples_seen,
             "samples_decoded": self.samples_decoded,
@@ -91,7 +95,10 @@ class LatencyStats:
             "min_us":  sorted_ns[0] / 1000.0,
             "avg_us":  sum(sorted_ns) / n / 1000.0,
             "p50_us":  sorted_ns[n // 2] / 1000.0,
-            "p99_us":  sorted_ns[min(n - 1, int(n * 0.99))] / 1000.0,
+            # p95 added in 0.2.58 — most SLAs are stated in p95, and
+            # without it operators were eyeballing between p50 and p99.
+            "p95_us":  _pct(0.95),
+            "p99_us":  _pct(0.99),
             "max_us":  sorted_ns[-1] / 1000.0,
         }
 
