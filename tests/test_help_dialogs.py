@@ -90,10 +90,34 @@ def test_feature_guide_references_recent_versions():
     """Each new feature is tagged with the version it shipped in so
     the operator can cross-reference the changelog."""
     from widgets.stream_dialog import _FEATURE_GUIDE_HTML
+    # v0.2.79 catches the doc lag from v0.2.72 onwards — every
+    # release with a user-visible surface gets pinned here so the
+    # next stale period is caught quickly.
     for ver in ("0.2.41", "0.2.45", "0.2.46", "0.2.57", "0.2.58",
                 "0.2.59", "0.2.60", "0.2.61", "0.2.63", "0.2.65",
-                "0.2.66", "0.2.67", "0.2.68", "0.2.70", "0.2.71"):
+                "0.2.66", "0.2.67", "0.2.68", "0.2.70", "0.2.71",
+                "0.2.74", "0.2.75", "0.2.76", "0.2.77", "0.2.78"):
         assert ver in _FEATURE_GUIDE_HTML, f"missing version tag: {ver}"
+
+
+def test_feature_guide_documents_dpdk_telemetry_surfaces():
+    """v0.2.79 explicitly pins the DPDK admin & telemetry surfaces
+    so a future guide refresh can't accidentally drop them."""
+    from widgets.stream_dialog import _FEATURE_GUIDE_HTML
+    assert "DPDK telemetry" in _FEATURE_GUIDE_HTML
+    assert "readiness chip" in _FEATURE_GUIDE_HTML
+    assert "Bind anyway" in _FEATURE_GUIDE_HTML
+    assert "Runtime DPDK fallback" in _FEATURE_GUIDE_HTML
+    assert "Hugepage allocation feedback" in _FEATURE_GUIDE_HTML
+
+
+def test_feature_guide_documents_preflight_followups():
+    from widgets.stream_dialog import _FEATURE_GUIDE_HTML
+    # The four v0.2.78 preflight closeouts.
+    assert "Per-device dot" in _FEATURE_GUIDE_HTML
+    assert "Pill-click filter" in _FEATURE_GUIDE_HTML
+    assert "EVPN active-injections chip" in _FEATURE_GUIDE_HTML
+    assert "SR-MPLS row badge" in _FEATURE_GUIDE_HTML
 
 
 def test_feature_guide_documents_preflight_bar():
@@ -216,6 +240,40 @@ def test_capabilities_guide_has_honest_not_supported_list():
     saves support tickets."""
     from widgets.stream_dialog import _CAPABILITIES_GUIDE_HTML
     assert "What this app is not" in _CAPABILITIES_GUIDE_HTML
+
+
+def test_capabilities_guide_covers_preflight_findings_surfaces():
+    """v0.2.79: Preflight section enumerates all the surfaces
+    (pills, per-device dot, pill-click filter, sortable Details,
+    auto-refresh) so operators don't think they're stuck with the
+    aggregate counts."""
+    from widgets.stream_dialog import _CAPABILITIES_GUIDE_HTML
+    assert "Per-device dot" in _CAPABILITIES_GUIDE_HTML
+    assert "filtered Details" in _CAPABILITIES_GUIDE_HTML
+    assert "Sortable Details" in _CAPABILITIES_GUIDE_HTML
+
+
+def test_capabilities_guide_covers_dpdk_fallback_telemetry():
+    """v0.2.79: Backends section calls out both pre-flight and
+    runtime fallback telemetry as a real feature (not just a
+    fallback-happened-silently caveat)."""
+    from widgets.stream_dialog import _CAPABILITIES_GUIDE_HTML
+    assert "DPDK fallback telemetry" in _CAPABILITIES_GUIDE_HTML
+    assert "Pre-flight" in _CAPABILITIES_GUIDE_HTML
+    assert "Runtime" in _CAPABILITIES_GUIDE_HTML
+    assert "runtime_engine" in _CAPABILITIES_GUIDE_HTML
+
+
+def test_capabilities_guide_covers_dpdk_admin_surfaces():
+    """v0.2.79: DPDK admin subsection in §10 enumerates the
+    readiness chip + bind safety + hugepage feedback + inline
+    Unbind + EVPN active chip."""
+    from widgets.stream_dialog import _CAPABILITIES_GUIDE_HTML
+    assert "Readiness chip" in _CAPABILITIES_GUIDE_HTML
+    assert "NIC bind safety" in _CAPABILITIES_GUIDE_HTML
+    assert "Hugepage allocation feedback" in _CAPABILITIES_GUIDE_HTML
+    assert "Inline Unbind" in _CAPABILITIES_GUIDE_HTML
+    assert "Active EVPN injections chip" in _CAPABILITIES_GUIDE_HTML
 
 
 def test_show_capabilities_guide_renders_html_into_textbrowser(qapp, monkeypatch):

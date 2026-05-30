@@ -2,6 +2,68 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.79] - 2026-05-30
+
+**Help guide refresh** — catch What's New + Capabilities guides up
+to the five releases shipped since v0.2.73 (preflight closeout,
+DPDK closeout, loose-ends bundle). Same doc-drift problem v0.2.72
+fixed; this is its sequel.
+
+### What's New (`_FEATURE_GUIDE_HTML`) additions
+Seven new sections covering 18 user-visible surfaces:
+
+- **DPDK telemetry & admin** (new top-level §)
+  - 0.2.75 pre-flight DPDK fallback warnings (Use-DPDK checkbox
+    constraint tooltip + end-of-batch dialog).
+  - 0.2.76 readiness chip in the status bar.
+  - 0.2.76 NIC bind safety guards (mgmt iface / SSH / active stream)
+    with the "Bind anyway" escape hatch.
+  - 0.2.77 runtime DPDK fallback in the Engine column.
+  - 0.2.77 hugepage allocation feedback (requested vs actual).
+  - 0.2.77 inline Unbind button in DPDK Status.
+- **Devices tab → Preflight surfaces** (new top-level §)
+  - 0.2.70 → 0.2.71 preflight bar + Apply hook (was inline before).
+  - 0.2.74 Export CSV/JSON + sortable Details.
+  - 0.2.78 per-device dot + pill-click filter.
+- **VXLAN sub-tab additions** (new top-level §)
+  - 0.2.74 active-injections row tooltips.
+  - 0.2.78 EVPN active-injections chip.
+- **Streams tab additions** (new top-level §)
+  - 0.2.78 SR-MPLS row badge.
+- **L2 Emulation additions** (new top-level §)
+  - 0.2.74 full BFD RFC 5880 field set (diag + echo RX).
+- **Tools menu additions** (new top-level §)
+  - 0.2.74 RFC 2544 timestamped export filenames.
+
+Also: stale `315 tests` → `431 tests` in the reliability-fixes
+footer.
+
+### Capabilities (`_CAPABILITIES_GUIDE_HTML`) updates
+- §7 Preflight: new "Findings surfaces" sub-block enumerating
+  pills, per-device dot, pill-click filter, sortable Details +
+  CSV/JSON export, auto-refresh after Apply.
+- §9 Backends: DPDK caveat row updated to call out the surfaced
+  fallback ("surfaced explicitly since 0.2.75"); new sub-block
+  "DPDK fallback telemetry" covers both pre-flight and runtime
+  channels with the API field names (`actual_engine`,
+  `fallback_reason`, `runtime_engine`, `runtime_fallback_reason`).
+  Per-core TX stats explicitly called out as the one deferred item.
+- §10 Server/API: new "DPDK admin in the main GUI" sub-block
+  enumerating the readiness chip, bind safety, hugepage feedback,
+  inline Unbind, and EVPN active chip.
+
+### Tests
+- **`tests/test_help_dialogs.py`** — 5 new tests:
+  - Version-tag check extended through 0.2.78.
+  - `test_feature_guide_documents_dpdk_telemetry_surfaces`.
+  - `test_feature_guide_documents_preflight_followups`.
+  - `test_capabilities_guide_covers_preflight_findings_surfaces`.
+  - `test_capabilities_guide_covers_dpdk_fallback_telemetry`.
+  - `test_capabilities_guide_covers_dpdk_admin_surfaces`.
+
+### Test count
+431 → 436 (+5).
+
 ## [0.2.78] - 2026-05-30
 
 **Preflight closeout** — clears the 4 remaining preflight follow-up

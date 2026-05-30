@@ -2876,6 +2876,150 @@ returns the findings as JSON for scripts that want to wire their own
 gates (CI checks, pre-deploy hooks). See the API Guide §25 for the
 exact response shape.</p>
 
+
+<h2>DPDK telemetry &amp; admin</h2>
+
+<h3><span class="ver new">0.2.75</span> Pre-flight DPDK fallback warnings</h3>
+<p>Enabling Use-DPDK on a stream that isn't DPDK-compatible (TCP,
+IPv6, MPLS stack, QinQ) used to silently fall back to Scapy. Now the
+start endpoint pre-flights the engine decision and the GUI shows ONE
+end-of-batch dialog naming every affected stream + the reason. The
+Use-DPDK checkbox tooltip also spells out the supported envelope
+(IPv4 + UDP + ≤1 VLAN tag + no MPLS). <span class="where">Where:
+Stream Edit → Variable Fields → Use DPDK tooltip; warning dialog
+fires after Start.</span></p>
+
+<h3><span class="ver new">0.2.76</span> DPDK readiness chip in the main status bar</h3>
+<p>A small colour-coded indicator (right-aligned in the
+QMainWindow status bar) tells you at a glance whether DPDK will
+work on the currently-selected server BEFORE you enable Use-DPDK
+on a stream. Green = ready; amber = degraded (Mellanox / mlx5
+still works); red = unavailable; gray = no server selected.
+Hover for per-subsystem detail (libdpdk, tx_worker, hugepages,
+IOMMU, vfio-pci) and — since 0.2.77 — the libdpdk version + the
+binary's build date so ABI drift after a server upgrade is
+visible at a glance. <span class="where">Where: bottom-right of
+the main window.</span></p>
+
+<h3><span class="ver new">0.2.76</span> NIC bind safety guards</h3>
+<p>Binding the management interface to vfio-pci used to lock
+operators out of the host. Now <code>/api/dpdk/bind</code> refuses
+with HTTP 409 + a specific reason when the candidate NIC carries
+the default route, is the SSH session's interface, or has an
+active traffic stream. The GUI surfaces the reason verbatim with
+a <strong>Bind anyway</strong> destructive-role button for the
+"I really mean it" case (e.g. binding from console with a spare
+NIC for SSH). <span class="where">Where: Tools → DPDK → Bind
+Interface.</span></p>
+
+<h3><span class="ver new">0.2.77</span> Runtime DPDK fallback surfaces in the Engine column</h3>
+<p>When the launcher has to swap engines mid-flight (tx_worker
+exits with the Broadcom ULP rc=100, or an exception during DPDK
+handoff), the Engine column now renders <strong>"Scapy ⚠ (was
+DPDK)"</strong> in amber with the reason in the cell tooltip.
+No more grep-journalctl to figure out why throughput halved.
+<span class="where">Where: Statistics dock → Stream Statistics →
+Engine column.</span></p>
+
+<h3><span class="ver new">0.2.77</span> Hugepage allocation feedback</h3>
+<p>The Configure Hugepages dialog now reports both the requested
+AND the actually-allocated count. When the kernel caps the
+request (memory fragmentation, NUMA imbalance), you see
+<strong>"⚠ Requested 8192, Actually allocated 4096"</strong>
+instead of a misleading "success" toast.
+<span class="where">Where: Tools → DPDK → Configure Hugepages.</span></p>
+
+<h3><span class="ver new">0.2.77</span> Inline Unbind button in DPDK Status</h3>
+<p>Every vfio-pci-bound interface in the DPDK Status dialog gets
+a per-row <strong>Unbind</strong> button. No more trip to the
+separate Tools → Unbind Interface menu action.
+<span class="where">Where: Tools → DPDK → Show Status.</span></p>
+
+
+<h2>Devices tab → Preflight surfaces</h2>
+
+<h3><span class="ver new">0.2.70 → 0.2.71</span> Preflight findings bar + Apply hook</h3>
+<p>The thin colour-coded strip at the top of the Devices sub-tab
+shows three pills (errors / warnings / OK), tints the bar
+background by worst severity, and opens a sortable Details modal
+on click. Polls every 60 s and refreshes immediately after Apply.
+Defensively quiet — HTTP failures hold previous values, never
+modal-alert. <span class="where">Where: Devices tab → top of the
+sub-tab.</span></p>
+
+<h3><span class="ver new">0.2.74</span> Export findings + Details modal sortable</h3>
+<p>Details modal gains <strong>Export CSV</strong> / <strong>Export
+JSON</strong> buttons (timestamped filenames) and header-click
+sorting. Operators paste into tickets without screenshotting.
+<span class="where">Where: Preflight bar → Details…</span></p>
+
+<h3><span class="ver new">0.2.78</span> Per-device dot in Devices table</h3>
+<p>The bar tells you N errors total; the per-device dot tells you
+<em>which</em>. A red/amber/green prefix on each Device Name cell
+driven by the bar's <code>by_device</code> breakdown. Severity
+wins (error > warning > clean); tooltip rolls in alongside any
+existing one. <span class="where">Where: Devices tab → Device
+Name column.</span></p>
+
+<h3><span class="ver new">0.2.78</span> Pill-click filter on preflight bar</h3>
+<p>Click the red errors pill → Details modal opens
+<strong>pre-filtered to errors only</strong>. Same for warnings.
+Saves the "open Details, then mentally filter" step.
+<span class="where">Where: Preflight bar pills.</span></p>
+
+
+<h2>VXLAN sub-tab additions</h2>
+
+<h3><span class="ver new">0.2.74</span> EVPN active-injections row tooltips</h3>
+<p>Hover any cell in the active-injections table to see kind,
+count, iface, base MAC / prefix, remote VTEP, VRF table — no
+need to open the per-row Details to know what's running.
+<span class="where">Where: VXLAN sub-tab → EVPN Inject button →
+Active table.</span></p>
+
+<h3><span class="ver new">0.2.78</span> EVPN active-injections chip</h3>
+<p>A small <strong>⚡ EVPN: N active</strong> chip on the VXLAN
+sub-tab action bar (right side) polls
+<code>/api/evpn/type2/list</code> every 30 s and shows the
+combined Type-2 + Type-5 count. Click opens the EVPN Inject
+dialog directly. Operators stop having to open the dialog just to
+check whether anything's running.
+<span class="where">Where: VXLAN sub-tab action bar.</span></p>
+
+
+<h2>Streams tab additions</h2>
+
+<h3><span class="ver new">0.2.78</span> SR-MPLS row badge</h3>
+<p>Streams with an MPLS label stack are now suffixed with
+<strong>[MPLS ×N]</strong> (or <strong>[MPLS]</strong> for a
+single label / legacy single-label field) in the Details column.
+Scan the table for MPLS streams without opening each editor.
+<span class="where">Where: Streams tab → Details column.</span></p>
+
+
+<h2>L2 Emulation additions</h2>
+
+<h3><span class="ver new">0.2.74</span> Full BFD RFC 5880 field set</h3>
+<p>The BFD panel gains <strong>Diagnostic</strong> (combo of the
+9 RFC 5880 §4.1 codes) and <strong>Required Min Echo RX</strong>
+(µs spinner). The backend accepted both as kwargs since 0.2.61
+but silently defaulted them to 0; operators exercising specific
+peer behaviours (echo mode, simulated path-down) can now reach
+them without curl. <span class="where">Where: L2 Emulation →
+Start → protocol = BFD.</span></p>
+
+
+<h2>Tools menu additions</h2>
+
+<h3><span class="ver new">0.2.74</span> RFC 2544 timestamped export filenames</h3>
+<p>Both the CSV and HTML exports now pre-populate the Save dialog
+with <code>rfc2544_results_YYYY-MM-DD_HH-MM-SS.{csv,html}</code>
+(same convention as the preflight export). Hit Save without
+typing; re-exports never collide.
+<span class="where">Where: Tools → RFC 2544 Throughput Test →
+Export CSV / Export HTML Report.</span></p>
+
+
 <h2>Reliability fixes worth knowing about</h2>
 
 <h3><span class="ver fix">0.2.49 → 0.2.55</span> Streams table interaction fixes</h3>
@@ -2891,7 +3035,7 @@ exact response shape.</p>
       keys.</li>
 </ul>
 <p>Each fix has its own regression test pinned in the test suite (now
-at <strong>315 tests</strong> vs 103 before this push).</p>
+at <strong>431 tests</strong> vs 103 before this push).</p>
 
 <h2>Help &amp; reference</h2>
 <table>
@@ -3153,6 +3297,23 @@ time. v4 client tracks bound lease in the device row.
 or not.
 <span class="where">Where: Devices tab → preflight bar (top of sub-tab) → Details…</span></p>
 
+<h3>Findings surfaces</h3>
+<ul>
+  <li><strong>Aggregate pills</strong> in the bar — errors / warnings
+      / OK counts with severity tint on the bar background.</li>
+  <li><strong>Per-device dot</strong> in front of each Device Name
+      cell (red / amber / green; severity wins). Answers "which
+      device has problems?" without opening Details. (v0.2.78)</li>
+  <li><strong>Click pills → filtered Details modal</strong> — click
+      red opens errors-only, amber opens warnings-only. (v0.2.78)</li>
+  <li><strong>Sortable Details modal</strong> with column-click sort
+      + <strong>Export CSV / Export JSON</strong> buttons
+      (timestamped filenames). (v0.2.74)</li>
+  <li><strong>Auto-refresh after Apply</strong> — bar repaints
+      immediately after device / BGP / OSPF / IS-IS / VXLAN apply,
+      not on the 60 s poll. (v0.2.71 + v0.2.74)</li>
+</ul>
+
 
 <h2>8. Statistics + reporting</h2>
 <ul>
@@ -3181,11 +3342,33 @@ or not.
   <tr><td><strong>DPDK <code>tx_worker</code></strong></td>
       <td>Line-rate UDP (100G / 400G); per-core TX queues; NLAT
           timestamps.</td>
-      <td>UDP only (TCP / ICMP / IPv6 fall back to Scapy). Needs
+      <td>UDP + IPv4 only (TCP / ICMP / IPv6 / MPLS / QinQ fall
+          back to Scapy — <em>surfaced explicitly</em> since 0.2.75
+          as a Start-time warning + Engine column annotation). Needs
           hugepages + IOMMU + NIC bound to <code>vfio-pci</code>
           (Mellanox uses <code>mlx5</code> direct). One-click admin
           UI handles all of this.</td></tr>
 </table>
+
+<h3>DPDK fallback telemetry (v0.2.75 → v0.2.77)</h3>
+<p>Two-layer feedback when DPDK doesn't take:</p>
+<ul>
+  <li><strong>Pre-flight</strong> — Start endpoint pre-checks the
+      stream against the DPDK envelope and decorates its response
+      with <code>actual_engine</code> + <code>fallback_reason</code>.
+      Client shows a consolidated end-of-batch dialog naming every
+      affected stream + reason.</li>
+  <li><strong>Runtime</strong> — when the launcher has to swap
+      engines mid-flight (tx_worker rc=100 Broadcom ULP error,
+      DPDK handoff exception), the swap is recorded on the stream
+      tracker; <code>/api/traffic/stats</code> surfaces
+      <code>runtime_engine</code> + <code>runtime_fallback_reason</code>;
+      the Engine column shows <strong>"Scapy ⚠ (was DPDK)"</strong>
+      in amber with the reason in the cell tooltip.</li>
+</ul>
+<p class="muted">"Per-core TX stats" remains the one explicitly
+deferred audit item — needs a <code>tx_worker.c</code> change to
+emit per-queue STAT lines, bundled with future C-side work.</p>
 
 
 <h2>10. Server / API / operations</h2>
@@ -3217,6 +3400,29 @@ or not.
 runtime install, hugepages allocation, IOMMU toggle (GRUB edit +
 reboot), NIC bind/unbind to <code>vfio-pci</code> /
 <code>mlx5</code>, TX-core recommender, and live tx_worker status.</p>
+
+<h3>DPDK admin in the main GUI (v0.2.76 → v0.2.77)</h3>
+<ul>
+  <li><strong>Readiness chip</strong> — small status-bar indicator
+      (green / amber / red / gray) polling
+      <code>/api/dpdk/status</code> every 30 s; tooltip lists every
+      subsystem + libdpdk version + tx_worker build date.</li>
+  <li><strong>NIC bind safety</strong> — <code>/api/dpdk/bind</code>
+      refuses (HTTP 409) when the candidate iface carries the
+      default route, is the SSH session's iface, or has an active
+      stream. GUI surfaces the reason with a <strong>Bind anyway</strong>
+      escape hatch.</li>
+  <li><strong>Hugepage allocation feedback</strong> — Configure
+      Hugepages dialog reports requested-vs-actually-allocated
+      (catches kernel-capped requests due to memory fragmentation
+      or NUMA imbalance).</li>
+  <li><strong>Inline Unbind</strong> — DPDK Status dialog has a
+      per-row Unbind button next to every vfio-pci-bound interface.</li>
+  <li><strong>Active EVPN injections chip</strong> — VXLAN sub-tab
+      shows <code>⚡ EVPN: N active</code> driven by
+      <code>/api/evpn/type2/list</code> (counts both kinds).
+      Click opens the EVPN Inject dialog.</li>
+</ul>
 
 
 <h2>What this app is not</h2>
