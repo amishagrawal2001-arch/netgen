@@ -48,6 +48,11 @@ def test_echo_round_trip_counts_bytes_both_ways():
             payload_bytes=128,
             concurrency=1,
             expect_echo=True,
+            # Throttle: the default interval_s=0 lets a single loopback
+            # client burn through 5000+ connect()s/sec, each leaving a
+            # TIME_WAIT, exhausting the macOS ephemeral-port range
+            # mid-test (EADDRNOTAVAIL) and poisoning later TCP tests.
+            interval_s=0.02,
         )
         # Let the client run its 1s window then a small grace period.
         time.sleep(1.4)
@@ -130,6 +135,7 @@ def test_http_protocol_status_2xx_counter_moves():
             dst_ip="127.0.0.1", dst_port=port,
             protocol="http", payload_bytes=32,
             duration_s=1.0, concurrency=1,
+            interval_s=0.02,  # throttle vs ephemeral-port exhaustion
         )
         time.sleep(1.5)
         snap = stateful_tcp.get_session(cli_id)

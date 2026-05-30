@@ -41,9 +41,11 @@ See [CHANGELOG.md](CHANGELOG.md) for the full diff. Highlights:
 - **GUI quality-of-life** — Apply progress bar, monitor-health
   indicator, filter bar, Retry Failed Apply, Settings dialog, and a
   complete keyboard-shortcut set (`Ctrl+Return / S / X / R / F / H / J`).
-- **36 pytest cases** covering VRF naming, stateful-TCP loopback
-  echo / TLS / HTTP framing / VRF degrade / TCP_INFO degrade /
-  dead-target, plus all legacy helpers.
+- **480-test pytest suite** — 20 of those cover the stateful-TCP +
+  VRF cluster alone (loopback echo / HTTP framing / TLS handshake /
+  DNS-over-TCP / SIP-over-TCP / VRF degrade-to-no-op / TCP_INFO
+  degrade / dead-target failure path / VRF naming round-trip), the
+  rest cover the GUI, server endpoints, dialogs, and legacy helpers.
 
 ## Table of Contents
 
@@ -1106,6 +1108,8 @@ A real-socket TCP traffic generator that runs **in parallel** to the scapy-based
 | "Does my middlebox proxy TCP correctly?" | Stateful TCP. |
 | HTTP-aware tests (WAF, reverse proxy, gateway) | Stateful TCP, `protocol=http`. |
 | TLS handshake testing | Stateful TCP, `tls=true`. |
+| DNS-over-TCP resolvers / RFC 7766 fallback | Stateful TCP, `protocol=dns` (API only). |
+| SIP registrars / SBCs / REGISTER replay | Stateful TCP, `protocol=sip` (API only). |
 | Per-VRF source pinning | Stateful TCP, `vrf=<iface>` (Linux). |
 | Retransmit / kernel-RTT visibility | Stateful TCP, `TCP_INFO` (Linux). |
 
@@ -1157,7 +1161,30 @@ netgen-cli tcp start-client \
     --vrf vrf-abc12345 --src-ip 10.0.0.10
 ```
 
-On macOS / Windows the `--vrf` flag is a no-op and surfaces a warning on `last_error`; traffic still flows via the main routing table.
+On macOS / Windows the `--vrf` flag is a no-op and surfaces a warning on `last_error`; traffic still flows via the main routing table. On Linux non-root the bind also degrades (last_error: `requires CAP_NET_RAW / root`) but the connection still goes out via the default routing table. See [API_GUIDE §8 → VRF binding semantics](API_GUIDE.md#vrf-binding-semantics-vrf) for the full matrix.
+
+### DNS-over-TCP / SIP-over-TCP
+
+Both protocols are L7 framings on the same worker — they're exposed through the HTTP API (`protocol=dns` or `protocol=sip` in `/api/stateful_tcp/start`) but **not** through the CLI yet. Quickest way:
+
+```bash
+# DNS server answering NOERROR for every query
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"role":"server","listen_port":5353,"protocol":"dns","dns_response_rcode":0}' \
+  http://localhost:5050/api/stateful_tcp/start
+
+# SIP registrar returning 401 Unauthorized (drives auth-retry tests)
+curl -X POST -H "Content-Type: application/json" \
+  -d '{"role":"server","listen_port":5060,"protocol":"sip",
+       "sip_response_status":401,"sip_response_reason":"Unauthorized"}' \
+  http://localhost:5050/api/stateful_tcp/start
+```
+
+Response codes bin into `dns_noerror / dns_nxdomain / dns_servfail / dns_other` and `sip_2xx / sip_3xx / sip_4xx / sip_5xx / sip_other` — see [API_GUIDE §8](API_GUIDE.md#8-stateful-tcp) for full request bodies.
+
+### Loopback caveat — set `interval_s` when `dst_ip=127.0.0.1`
+
+The default `interval_s=0` lets a single sender thread burn ~5000 `connect()`s/sec on loopback. Each handshake leaves a TIME_WAIT for 30-60 s and the kernel ephemeral-port pool empties out inside the same session — every subsequent attempt then fails with `OSError [Errno 49] Can't assign requested address` (macOS) / `[Errno 99]` (Linux). For loopback tests pass `--interval 0.02` (or `interval_s: 0.02` in the JSON body); real cross-host traffic is naturally rate-limited by RTT and rarely needs this.
 
 ### What's surfaced in counters
 
@@ -1169,7 +1196,9 @@ Per session the registry returns:
 - `avg_kernel_rtt_us`, `kernel_rtt_samples` — from `TCP_INFO.rtt_us` (Linux)
 - `retransmits_total` — from `TCP_INFO.total_retrans` (Linux)
 - `http_status_2xx / http_status_other` — only when `protocol=http`
-- `last_error` — string snapshot of the most recent error (TLS handshake fail, bind error, etc.)
+- `dns_noerror / dns_nxdomain / dns_servfail / dns_other` — only when `protocol=dns` (bins per DNS RCODE; `dns_other` carries the raw rcode in `last_error`)
+- `sip_2xx / sip_3xx / sip_4xx / sip_5xx / sip_other` — only when `protocol=sip` (bins per SIP response class; 4xx/5xx also write `sip <status>` to `last_error` so an operator can spot a stuck "every request hit 503" pattern at a glance)
+- `last_error` — string snapshot of the most recent error (TLS handshake fail, bind error, VRF degrade, port-exhaustion EADDRNOTAVAIL, etc.)
 
 ## netgen-cli (Headless CLI)
 

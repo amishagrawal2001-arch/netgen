@@ -38,6 +38,7 @@ def test_sip_register_2xx_counters_increment():
             dst_ip="127.0.0.1", dst_port=port,
             protocol="sip",
             duration_s=0.6, concurrency=1,
+            interval_s=0.02,  # throttle vs ephemeral-port exhaustion
         )
         time.sleep(1.0)
         cc = stateful_tcp.get_session(cli)["counters"]

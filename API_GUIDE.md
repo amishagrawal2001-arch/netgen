@@ -388,6 +388,33 @@ Real-socket TCP traffic generator. Parallel to the scapy-based stateless streams
 
 `avg_kernel_rtt_us` and `retransmits_total` come from `TCP_INFO` (Linux only — both are 0 elsewhere). DNS counters bin per-RCODE for `protocol=dns` sessions: `0=NOERROR`, `3=NXDOMAIN`, `2=SERVFAIL`, everything else lumped as `dns_other` with the raw rcode written to `last_error`. Counters are deltas-since-start.
 
+### VRF binding semantics (`vrf=...`)
+
+`vrf` calls `setsockopt(SOL_SOCKET, SO_BINDTODEVICE, "...")` so connections (and listeners) egress via the named Linux VRF / master interface. Three runtime behaviours; all three are non-fatal — the session is created either way and `last_error` carries the explanation:
+
+| Platform | Result | `last_error` |
+|---|---|---|
+| Linux as root (or `CAP_NET_RAW`) | Bind applied — packets actually leave via `vrf` | `null` |
+| Linux non-root | Bind silently fails; session falls back to default routing table | `vrf=X requires CAP_NET_RAW / root` |
+| macOS / Windows | Skipped at the helper level; default routing table used | `vrf=X ignored (SO_BINDTODEVICE only on Linux)` |
+
+The macOS/Windows fall-through is what makes the test/dev loop usable on a laptop — VRF-pinned configs still spin up sessions, you just don't get true VRF isolation. See `_bind_to_vrf()` in `utils/stateful_tcp.py`.
+
+### Loopback testing caveat (`interval_s` and TIME_WAIT)
+
+When `dst_ip=127.0.0.1`, set `interval_s >= 0.02`. The default `interval_s=0` lets a single sender burn through ~5000 `connect()`s/sec; every completed handshake leaves a TIME_WAIT for 30–60 s on macOS / Linux, and the kernel ephemeral-port pool runs dry inside the same session. Symptom: `conns_established` plateaus at 0, every attempt counts as `conns_failed`, and `last_error` reads:
+
+```
+OSError: [Errno 49] Can't assign requested address      # macOS
+OSError: [Errno 99] Cannot assign requested address     # Linux
+```
+
+Real cross-host traffic isn't usually affected — round-trip alone throttles the issue rate.
+
+### CLI coverage gap
+
+`netgen-cli tcp start-client / start-server` (see [netgen-cli](README.md#netgen-cli-headless-cli)) exposes `--protocol raw|http` only. To drive `dns` or `sip`, POST directly to `/api/stateful_tcp/start` with the JSON bodies above.
+
 ### DNS-over-TCP (RFC 7766)
 
 The `protocol="dns"` mode builds 2-byte-length-prefixed DNS messages — a standard `A` query for `dns_qname` (default `netgen.test`) over TCP. The server answers with the configured `dns_response_rcode` (default 3 = NXDOMAIN). Useful for testing DNS proxies, recursive resolvers handling TCP fallback (queries >512 B), and DNS-aware load balancers.

@@ -38,6 +38,7 @@ def test_dns_nxdomain_counters_increment():
             dst_ip="127.0.0.1", dst_port=port,
             protocol="dns",
             duration_s=0.6, payload_bytes=0, concurrency=1,
+            interval_s=0.02,  # throttle vs ephemeral-port exhaustion
         )
         time.sleep(1.0)
         snap = stateful_tcp.get_session(cli)
@@ -70,6 +71,7 @@ def test_dns_noerror_when_server_configured():
             dst_ip="127.0.0.1", dst_port=port,
             protocol="dns",
             duration_s=0.6, concurrency=1,
+            interval_s=0.02,  # throttle vs ephemeral-port exhaustion
         )
         time.sleep(1.0)
         cc = stateful_tcp.get_session(cli)["counters"]
