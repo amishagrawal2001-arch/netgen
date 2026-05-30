@@ -2,6 +2,90 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.77] - 2026-05-30
+
+**DPDK closeout** — clears the remaining items from the v0.2.75 DPDK
+audit. Runtime fallback now surfaces to the GUI; Line-Rate auto-pick
+is no longer invisible; hugepage allocation reports actual-vs-
+requested; status carries ABI version indicators; bound interfaces
+gain inline Unbind buttons.
+
+### Runtime fallback telemetry (audit BLOCKER #2, deferred from v0.2.75)
+Until now, when the launcher had to swap engines mid-flight
+(tx_worker rc=100 Broadcom ULP error, exception during DPDK
+handoff), the swap was logged server-side and invisible to the
+operator. Now:
+
+- **`multithreaded_traffic_gen.py`** — new
+  `StreamTracker.mark_runtime_engine(iface, sid, runtime_engine=,
+  fallback_reason=)` records the swap on the tracked stream;
+  `get_stream_stats` surfaces `runtime_engine` +
+  `runtime_fallback_reason` (optional fields, omitted when never set
+  so the legacy stats shape stays clean). The Broadcom ULP rc=100
+  path and the catch-all exception-handler both call `mark_*`.
+- **`traffic_client/statistics_section.py`** — Engine column renders
+  **"Scapy ⚠ (was DPDK)"** in amber when the stream got swapped
+  mid-flight; cell tooltip carries the reason verbatim. Operators
+  stop wondering why throughput halved without grep'ing journalctl.
+
+### Line-Rate auto-pick echoed in start response (PAIN #4 + POLISH #10)
+- **`utils/dpdk_tx_worker.py`** — new pure-function
+  `resolve_actual_tx_cores(stream, iface)` returns `(value,
+  was_auto_picked)`. Mirrors the in-worker auto-pick logic so the
+  start endpoint can synchronously include the chosen value.
+- **`run_tgen_server.py`** — `/api/traffic/start` decorates DPDK
+  entries with `actual_tx_cores` + `tx_cores_auto_picked`.
+- **`traffic_client/stream_logic.py`** — logs "Line-Rate auto-picked
+  tx_cores=8 for 'stream-name'" so the operator confirms the engine
+  ran multi-queue (no modal — the bump is desired, not warning-worthy).
+
+### Hugepage allocation feedback (PAIN #6)
+- **`run_tgen_server.py`** — `/api/dpdk/hugepages` re-reads the
+  sysfs file after writing and returns `requested` +
+  `actual_allocated` so the client can spot kernel-capped requests.
+- **`traffic_client/dpdk_menu_actions.py`** — toast now reads
+  **"Allocated 4096 × 2MB on srv01"** or, when partial,
+  **"⚠ Requested 8192, Actually allocated 4096"** with a hint
+  about memory fragmentation. Pre-0.2.77 servers fall back to the
+  legacy "configured successfully: N" message.
+
+### tx_worker / DPDK ABI version (POLISH #11)
+- **`run_tgen_server.py`** — `/api/dpdk/status` includes
+  `dpdk_version` (`pkg-config --modversion libdpdk`) +
+  `tx_worker_built` (binary mtime). Catches the silent-crash class
+  where libdpdk got upgraded but tx_worker wasn't rebuilt.
+- **`widgets/dpdk_readiness_chip.py`** — tooltip rows show
+  `DPDK libraries: ok (v23.11.0)` + `tx_worker binary: ok (built
+  2026-05-15 14:32)`. Operator scans for ABI drift at a glance.
+
+### Inline Unbind button in DPDK Status dialog (POLISH #12)
+- **`traffic_client/dpdk_menu_actions.py`** — the Status dialog now
+  enumerates every vfio-pci-bound interface under a "Bound to DPDK
+  (vfio-pci):" header with a per-row **Unbind** button. No more
+  trip to Tools → Unbind Interface; the action lives where the
+  listing is.
+
+### Deferred (still open)
+- **Per-core TX stats exposure** (POLISH #9) — requires modifying
+  `tx_worker.c` to emit `STAT_Q: stream=<id> queue=N tx=<count>`
+  lines + rebuilding the binary on every deployed server. Pure-
+  Python release scope only; bundled with other tx_worker C changes
+  (MPLS/QinQ support) in a focused follow-up.
+
+### Tests
+- **`tests/test_dpdk_engine_resolver.py`** — +4 tests covering
+  `resolve_actual_tx_cores` (explicit value honoured, non-Line-Rate
+  defaults to 1, missing iface graceful, unknown iface graceful).
+- **`tests/test_dpdk_readiness_chip.py`** — +3 tests covering
+  `dpdk_version` + `tx_worker_built` in the tooltip + the legacy-
+  payload graceful path (no "None" leakage).
+- **`tests/test_dpdk_runtime_fallback.py`** — new file, 5 tests
+  pinning `mark_runtime_engine` semantics + the stats payload
+  shape (fields omitted unless marked, present when marked).
+
+### Test count
+392 → 404 (+12).
+
 ## [0.2.76] - 2026-05-30
 
 **DPDK readiness chip + NIC-bind safety guards.** Closes the last

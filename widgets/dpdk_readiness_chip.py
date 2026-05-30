@@ -155,8 +155,24 @@ def classify_dpdk_status(payload: Dict[str, Any]) -> "tuple[str, str, str]":
     # Detail rows for the tooltip — built incrementally so the order
     # is stable.
     rows = []
-    rows.append(("DPDK libraries", "ok" if libdpdk else "missing"))
-    rows.append(("tx_worker binary", "ok" if tx_worker else "missing"))
+    libdpdk_label = "ok"
+    if libdpdk and payload.get("dpdk_version"):
+        libdpdk_label = f"ok (v{payload['dpdk_version']})"
+    elif not libdpdk:
+        libdpdk_label = "missing"
+    rows.append(("DPDK libraries", libdpdk_label))
+
+    tx_worker_label = "ok"
+    if tx_worker and payload.get("tx_worker_built"):
+        # v0.2.77: include the binary's build date so an operator
+        # who upgraded libdpdk can spot the ABI staleness at a
+        # glance ("tx_worker built 2024-06 against libdpdk 22.11,
+        # now running 23.11" = rebuild required).
+        tx_worker_label = f"ok (built {payload['tx_worker_built']})"
+    elif not tx_worker:
+        tx_worker_label = "missing"
+    rows.append(("tx_worker binary", tx_worker_label))
+
     rows.append((
         "Hugepages",
         f"ok ({payload.get('hugepages_available', 0)} × "

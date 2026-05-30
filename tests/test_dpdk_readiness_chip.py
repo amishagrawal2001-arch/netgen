@@ -113,6 +113,33 @@ def test_classify_hugepage_count_appears_in_tooltip():
     assert "2MB" in tip
 
 
+def test_classify_surfaces_dpdk_version_in_tooltip():
+    """v0.2.77: ABI version surfaced so operators can catch the
+    "rebuild tx_worker after upgrading libdpdk" class of crashes."""
+    p = _ready_payload()
+    p["dpdk_version"] = "23.11.0"
+    _, _, tip = classify_dpdk_status(p)
+    assert "23.11.0" in tip
+
+
+def test_classify_surfaces_tx_worker_build_date_in_tooltip():
+    p = _ready_payload()
+    p["tx_worker_built"] = "2026-05-15 14:32"
+    _, _, tip = classify_dpdk_status(p)
+    assert "2026-05-15" in tip
+
+
+def test_classify_omits_versions_when_payload_lacks_them():
+    """Pre-0.2.77 servers don't return the new fields — tooltip
+    should still render cleanly (no 'None' leakage)."""
+    p = _ready_payload()
+    # Intentionally NOT setting dpdk_version / tx_worker_built.
+    _, _, tip = classify_dpdk_status(p)
+    assert "None" not in tip
+    assert "DPDK libraries: ok" in tip
+    assert "tx_worker binary: ok" in tip
+
+
 # ───────────────────────────────────────────────── chip widget (Qt)
 @pytest.fixture
 def make_chip(qapp, monkeypatch):

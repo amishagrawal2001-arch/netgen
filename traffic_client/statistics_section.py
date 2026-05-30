@@ -1754,6 +1754,12 @@ class TrafficGenClientStatisticsSection():
                 "dpdk_enable": bool(stream.get("dpdk_enable", False)),
                 "dpdk_tx_cores": int(stream.get("dpdk_tx_cores") or 1),
                 "stream_id": stream_id,
+                # v0.2.77: runtime engine + fallback markers from the
+                # stats endpoint. Set ONLY when the launcher had to swap
+                # engines mid-flight (e.g. tx_worker rc=100); absent in
+                # the common case.
+                "runtime_engine": stream.get("runtime_engine"),
+                "runtime_fallback_reason": stream.get("runtime_fallback_reason"),
                 # Latency-related: raw iface (for the per-iface latency
                 # join), the enable_timestamps flag (so the cell can show
                 # "off" when the stream wasn't sent with --enable-timestamps),
@@ -1780,8 +1786,19 @@ class TrafficGenClientStatisticsSection():
             iface_item = QTableWidgetItem(stream["interface"])
             self.stream_statistics_table.setItem(row, 1, iface_item)
 
-            # Engine — show DPDK queue count if multi-queue, else "Scapy"
-            if stream.get("dpdk_enable"):
+            # Engine — show DPDK queue count if multi-queue, else "Scapy".
+            # v0.2.77: when the server marks a RUNTIME fallback (the
+            # launcher had to swap engines mid-flight, e.g. tx_worker
+            # rc=100), render "Scapy ⚠ (was DPDK)" + the reason in the
+            # tooltip so the operator doesn't have to grep journalctl
+            # to find out why throughput is half of what it should be.
+            runtime_engine = stream.get("runtime_engine")
+            fallback_reason = stream.get("runtime_fallback_reason")
+            dpdk_requested = bool(stream.get("dpdk_enable"))
+            if runtime_engine == "scapy" and dpdk_requested:
+                engine_label = "Scapy ⚠ (was DPDK)"
+                engine_color = QColor("#b45309")  # Amber — degraded
+            elif dpdk_requested:
                 tx_cores = int(stream.get("dpdk_tx_cores") or 1)
                 if tx_cores > 1:
                     engine_label = f"DPDK ×{tx_cores}"
@@ -1795,10 +1812,20 @@ class TrafficGenClientStatisticsSection():
             engine_item.setTextAlignment(Qt.AlignCenter)
             engine_item.setForeground(engine_color)
             engine_item.setFont(QFont("", 12, QFont.Bold))
-            engine_item.setToolTip(
-                f"Engine: {'DPDK tx_worker' if stream.get('dpdk_enable') else 'Scapy/kernel'}"
-                + (f"\nTX queues: {stream.get('dpdk_tx_cores', 1)}" if stream.get("dpdk_enable") else "")
-            )
+            if fallback_reason:
+                engine_item.setToolTip(
+                    f"Engine: Scapy (runtime fallback)\n\n"
+                    f"Reason: {fallback_reason}\n\n"
+                    f"Originally requested DPDK; the launcher had to "
+                    f"swap engines mid-flight. The stream is still "
+                    f"sending — just on a slower engine than expected."
+                )
+            else:
+                engine_item.setToolTip(
+                    f"Engine: {'DPDK tx_worker' if dpdk_requested else 'Scapy/kernel'}"
+                    + (f"\nTX queues: {stream.get('dpdk_tx_cores', 1)}"
+                       if dpdk_requested else "")
+                )
             self.stream_statistics_table.setItem(row, 2, engine_item)
 
             # TX Count

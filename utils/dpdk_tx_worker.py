@@ -135,6 +135,39 @@ def dpdk_compatibility_check(stream_data: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+def resolve_actual_tx_cores(stream_data: Dict[str, Any],
+                            interface: str) -> "tuple[int, bool]":
+    """Pure-function pre-flight tx_cores resolver — returns
+    ``(value, was_auto_picked)``.
+
+    Mirrors the logic inside ``run_stream``: take the operator's
+    explicit ``dpdk_tx_cores`` if set; otherwise, when "Line Rate" is
+    requested (pps == 0), derive a value from the link speed so a
+    single-queue worker doesn't bottleneck a 400G NIC.
+
+    Lives next to ``resolve_engine`` so the start endpoint can include
+    the chosen value in its response — operators no longer have to
+    grep journalctl to find out whether their ``TX Cores: 1`` setting
+    was overridden by the auto-pick. v0.2.77.
+    """
+    explicit = _user_specified_tx_cores(stream_data)
+    tx_cores = _resolve_tx_cores(stream_data)
+    pps = _resolve_target_pps(stream_data)
+    if pps == 0 and not explicit and interface:
+        frame_size = 64
+        try:
+            ps = stream_data.get("protocol_selection") or {}
+            fs = (ps.get("frame_size")
+                  or stream_data.get("frame_size") or 64)
+            frame_size = int(fs)
+        except (TypeError, ValueError):
+            frame_size = 64
+        auto = _auto_tx_cores_for_line_rate(interface, frame_size)
+        if auto > tx_cores:
+            return auto, True
+    return tx_cores, False
+
+
 def resolve_engine(stream_data: Dict[str, Any]) -> "tuple[str, Optional[str]]":
     """Synchronous pre-flight engine decision.
 

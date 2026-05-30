@@ -173,3 +173,44 @@ def test_resolve_engine_known_incompat_combos(override, expected_substring):
     assert engine == "scapy"
     assert reason is not None
     assert expected_substring in reason
+
+
+# ─────────────────────────────────────── resolve_actual_tx_cores (v0.2.77)
+from utils.dpdk_tx_worker import resolve_actual_tx_cores
+
+
+def test_actual_tx_cores_returns_user_value_when_explicit():
+    """If the operator set dpdk_tx_cores, honour it — don't auto-pick
+    on top."""
+    cores, auto = resolve_actual_tx_cores(
+        {**_base_stream(), "dpdk_tx_cores": 4},
+        interface="ens1f0",
+    )
+    assert cores == 4
+    assert auto is False
+
+
+def test_actual_tx_cores_returns_default_one_when_not_line_rate():
+    """No explicit value, pps != 0 (specific rate) → keep default 1."""
+    cores, auto = resolve_actual_tx_cores(
+        {**_base_stream(), "tx_rate_pps": 1000},
+        interface="ens1f0",
+    )
+    assert cores == 1
+    assert auto is False
+
+
+def test_actual_tx_cores_handles_missing_interface_gracefully():
+    """No iface name → can't read link speed → fall back to 1, not auto."""
+    cores, auto = resolve_actual_tx_cores(_base_stream(), interface="")
+    assert cores == 1
+    assert auto is False
+
+
+def test_actual_tx_cores_handles_unknown_interface_speed():
+    """Real iface name but no /sys/class/net/.../speed file → 1, not auto."""
+    cores, auto = resolve_actual_tx_cores(
+        _base_stream(), interface="totally_made_up_iface_xyz",
+    )
+    assert cores == 1
+    assert auto is False

@@ -1062,14 +1062,29 @@ def start_traffic():
             # it back. v0.2.75.
             actual_engine = "scapy"
             fallback_reason = None
+            actual_tx_cores: Optional[int] = None
+            tx_cores_auto_picked = False
             try:
-                from utils.dpdk_tx_worker import resolve_engine
+                from utils.dpdk_tx_worker import (
+                    resolve_engine, resolve_actual_tx_cores,
+                )
                 actual_engine, fallback_reason = resolve_engine(stream_data)
                 if fallback_reason:
                     logging.info(f"[DPDK] '{stream_name}' falls back to Scapy: "
                                  f"{fallback_reason}")
+                # Only meaningful when the engine actually IS dpdk —
+                # for Scapy streams tx_cores is irrelevant.
+                if actual_engine == "dpdk":
+                    actual_tx_cores, tx_cores_auto_picked = (
+                        resolve_actual_tx_cores(stream_data, interface_name)
+                    )
+                    if tx_cores_auto_picked:
+                        logging.info(
+                            f"[DPDK] '{stream_name}' Line Rate auto-picked "
+                            f"tx_cores={actual_tx_cores} on {interface_name}"
+                        )
             except Exception as _e:
-                logging.debug(f"[DPDK] resolve_engine unavailable: {_e}")
+                logging.debug(f"[DPDK] pre-flight unavailable: {_e}")
 
             try:
                 result = launch_single_stream(stream_data, interface_name)
@@ -1080,6 +1095,9 @@ def start_traffic():
                     result["actual_engine"] = actual_engine
                     if fallback_reason:
                         result["fallback_reason"] = fallback_reason
+                    if actual_tx_cores is not None:
+                        result["actual_tx_cores"] = actual_tx_cores
+                        result["tx_cores_auto_picked"] = tx_cores_auto_picked
 
                 # Register stream in database only if launch was successful
                 if result and result.get("status") == "started" and not result.get("error"):
@@ -12649,10 +12667,38 @@ def dpdk_status():
             "/usr/local/bin/tx_worker",
             "./resources/dpdk/tx_worker/build/tx_worker"
         ]
+        tx_worker_path_found = None
         for path in tx_worker_paths:
             if os.path.exists(path):
                 tx_worker_exists = True
+                tx_worker_path_found = path
                 break
+
+        # v0.2.77: ABI version indicators. Surface BOTH the libdpdk
+        # version the system has AND the binary's mtime as a proxy
+        # for "when was tx_worker last built against the current
+        # libdpdk?" — catches the silent-crash class where the
+        # operator upgraded libdpdk and didn't rebuild tx_worker.
+        dpdk_version = None
+        tx_worker_built = None
+        try:
+            r = subprocess.run(
+                ["pkg-config", "--modversion", "libdpdk"],
+                capture_output=True, text=True, timeout=5,
+            )
+            if r.returncode == 0:
+                dpdk_version = r.stdout.strip() or None
+        except Exception:
+            pass
+        if tx_worker_path_found:
+            try:
+                import datetime as _dt
+                mtime = os.path.getmtime(tx_worker_path_found)
+                tx_worker_built = (
+                    _dt.datetime.fromtimestamp(mtime).strftime("%Y-%m-%d %H:%M")
+                )
+            except Exception:
+                pass
         
         # Check hugepages
         try:
@@ -12765,7 +12811,10 @@ def dpdk_status():
             "iommu_details": iommu_details,
             "vfio_pci_loaded": vfio_pci_loaded,
             "vfio_loaded": vfio_loaded,
-            "interfaces": interfaces
+            "interfaces": interfaces,
+            # v0.2.77: ABI / build-freshness indicators.
+            "dpdk_version": dpdk_version,
+            "tx_worker_built": tx_worker_built,
         }), 200
         
     except Exception as e:
@@ -13188,7 +13237,7 @@ def dpdk_hugepages():
         try:
             with open(hugepage_file, "w") as f:
                 f.write(str(num_pages))
-            
+
             # Mount hugepages if not already mounted
             mount_point = "/mnt/huge"
             result = subprocess.run(
@@ -13204,10 +13253,25 @@ def dpdk_hugepages():
                     ["mount", "-t", "hugetlbfs", "nodev", mount_point],
                     check=True
                 )
-            
+
+            # v0.2.77: re-read the sysfs file to surface what the
+            # kernel ACTUALLY allocated (may be less than requested
+            # if memory was fragmented / capped). Operator gets
+            # honest feedback in the toast instead of the GUI
+            # claiming success while the count is short.
+            actual_allocated = num_pages
+            try:
+                with open(hugepage_file, "r") as f:
+                    actual_allocated = int(f.read().strip())
+            except Exception:
+                pass
+
             return jsonify({
                 "success": True,
-                "message": f"Configured {num_pages} x {page_size} hugepages"
+                "message": f"Configured {num_pages} x {page_size} hugepages",
+                "requested": int(num_pages),
+                "actual_allocated": int(actual_allocated),
+                "page_size": page_size,
             }), 200
         except Exception as e:
             return jsonify({

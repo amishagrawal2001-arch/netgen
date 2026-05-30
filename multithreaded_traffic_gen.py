@@ -124,6 +124,28 @@ class StreamTracker:
                     s["tx_count"] += count
                     return
 
+    # ----- runtime engine + fallback markers (v0.2.77) -----
+    def mark_runtime_engine(self, interface, stream_id, *,
+                            runtime_engine=None, fallback_reason=None):
+        """Annotate a tracked stream with its actual runtime engine
+        and (when fallback happened) a one-line reason.
+
+        Called from the launcher when the worker had to swap engines
+        mid-flight — e.g. tx_worker exits with rc=100 (Broadcom ULP
+        error) and we fall back to Scapy. The stats endpoint surfaces
+        these so the GUI can show "Scapy (was DPDK)" in the Engine
+        column and the operator stops wondering why throughput is lower.
+        """
+        with self.lock:
+            for s in self.active_streams:
+                if (s.get("interface") == interface
+                        and s.get("stream_id") == stream_id):
+                    if runtime_engine:
+                        s["runtime_engine"] = runtime_engine
+                    if fallback_reason:
+                        s["runtime_fallback_reason"] = fallback_reason
+                    return
+
     # ----- RX: count by stream_id (name only for UI map) -----
     def update_rx(self, rx_interface, stream_name, stream_id):
         with self.lock:
@@ -160,6 +182,14 @@ class StreamTracker:
                     "flow_tracking_enabled": s.get("flow_tracking_enabled", False),
                     "frame_size": s.get("frame_size", 64),  # Include frame_size in stats
                 }
+                # v0.2.77: surface runtime engine + runtime fallback reason
+                # when the launcher had to swap engines mid-flight (e.g.
+                # tx_worker rc=100 → Scapy). Optional; omitted from the
+                # JSON when never set so the legacy shape stays clean.
+                if s.get("runtime_engine"):
+                    item["runtime_engine"] = s["runtime_engine"]
+                if s.get("runtime_fallback_reason"):
+                    item["runtime_fallback_reason"] = s["runtime_fallback_reason"]
                 if s["interface"] in perf_stats:
                     item.update({
                         "ibperf_rate": perf_stats[s["interface"]]["rate"],
@@ -1083,6 +1113,22 @@ def generate_packets(stream_data, interface, stop_event):
                 stream_data["dpdk_enable"] = False
                 stream_data["use_dpdk"] = False
                 stream_data["engine"] = "scapy"
+                # v0.2.77: mark the runtime fallback on the tracker so
+                # the stats endpoint surfaces it back to the GUI. The
+                # operator sees "Scapy (was DPDK: Broadcom ULP init
+                # error)" in the Engine column instead of wondering
+                # why throughput dropped.
+                try:
+                    stream_tracker.mark_runtime_engine(
+                        interface, stream_id,
+                        runtime_engine="scapy",
+                        fallback_reason=(
+                            "tx_worker hit Broadcom ULP initialization "
+                            "error (rc=100); fell back to Scapy at runtime"
+                        ),
+                    )
+                except Exception:
+                    pass
                 # Continue to Scapy path below
             elif rc != 0:
                 logging.error("[DPDK] tx_worker failed for stream '%s' (id=%s) with exit code %d", stream_name, stream_id, rc)
@@ -1102,6 +1148,18 @@ def generate_packets(stream_data, interface, stop_event):
                 logging.debug("[DPDK] backend not available; falling back to Scapy.")
     except Exception as e:
         logging.warning("[DPDK] handoff failed (%s); falling back to Scapy path.", e)
+        # v0.2.77: also mark this catch-all fallback so the stats
+        # endpoint surfaces it. Any exception caught here means the
+        # DPDK launcher tripped before completing handoff — operator
+        # deserves to know without reading server logs.
+        try:
+            stream_tracker.mark_runtime_engine(
+                interface, stream_id,
+                runtime_engine="scapy",
+                fallback_reason=f"DPDK handoff failed at runtime: {e}",
+            )
+        except Exception:
+            pass
 
     # ---- Check if interface is available for Scapy (not bound to DPDK) ----
     # If DPDK handoff didn't happen, we need to ensure the interface is available for Scapy

@@ -684,15 +684,22 @@ class TrafficGenClientStreamLogic:
         # who enabled DPDK on (say) a TCP stream sees the "fell back to Scapy"
         # warning instead of silently running ~10x slower than expected.
         dpdk_warnings: list = []   # [(stream_name, reason), ...]
+        # v0.2.77: same channel also carries Line-Rate auto-pick info — surface
+        # which streams had their TX-cores bumped by the server so the operator
+        # knows the engine actually ran multi-queue.
+        dpdk_autopick_info: list = []  # [(stream_name, cores), ...]
 
         def _collect_dpdk_warnings(started_entries):
             for e in (started_entries or []):
+                name = (e.get("stream_name") or e.get("name") or
+                        e.get("stream_id") or "?")
                 reason = e.get("fallback_reason")
                 if reason:
-                    dpdk_warnings.append(
-                        (e.get("stream_name") or e.get("name") or
-                         e.get("stream_id") or "?", reason)
-                    )
+                    dpdk_warnings.append((name, reason))
+                if e.get("tx_cores_auto_picked"):
+                    cores = e.get("actual_tx_cores")
+                    if cores:
+                        dpdk_autopick_info.append((name, cores))
 
         for server_url, per_port in server_payload_map.items():
             try:
@@ -835,6 +842,18 @@ class TrafficGenClientStreamLogic:
                 "make the warning go away — the streams are sending in "
                 "the meantime.",
             )
+
+        # v0.2.77: Line-Rate auto-pick info — log only (not modal). The
+        # operator typically WANTS the bump and doesn't need to dismiss
+        # a dialog for it; the log line / status bar is enough so they
+        # know the engine ran multi-queue, not single.
+        if dpdk_autopick_info:
+            for name, cores in dpdk_autopick_info:
+                logger.info(
+                    f"[DPDK] Line-Rate auto-picked tx_cores={cores} for "
+                    f"'{name}' (set TX Cores explicitly in the editor "
+                    f"to override)"
+                )
 
         # 5) refresh (session save removed - only save on explicit user action)
         self.update_stream_table()

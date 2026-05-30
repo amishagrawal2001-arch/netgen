@@ -268,6 +268,55 @@ class TrafficGenClientDPDKMenuActions():
                 modules_layout.addLayout(button_layout)
                 action_layout.addLayout(modules_layout)
 
+            # v0.2.77: inline Unbind buttons for every interface bound
+            # to vfio-pci. Operators no longer have to flip to Tools →
+            # Unbind Interface — the action lives next to the listing
+            # that prompted them to think about it.
+            bound_ifaces = []
+            for iface in (data.get("interfaces") or []):
+                drv = str(iface.get("driver") or "").lower()
+                if drv == "vfio-pci":
+                    bound_ifaces.append(iface)
+            if bound_ifaces:
+                server_obj = row["server"]
+                unbind_header = QLabel("Bound to DPDK (vfio-pci):")
+                unbind_header.setStyleSheet(
+                    "color: #475569; font-size: 11px; font-weight: 600; "
+                    "margin-top: 4px;"
+                )
+                action_layout.addWidget(unbind_header)
+                for iface in bound_ifaces:
+                    iface_name = (iface.get("name")
+                                  or iface.get("interface")
+                                  or iface.get("pci")
+                                  or "(unknown)")
+                    iface_row_layout = QHBoxLayout()
+                    iface_lbl = QLabel(
+                        f"  • {iface_name}  "
+                        f"<span style='color:#6b7280;font-size:10px;'>"
+                        f"{iface.get('pci', '')}</span>"
+                    )
+                    iface_lbl.setTextFormat(Qt.RichText)
+                    iface_row_layout.addWidget(iface_lbl)
+                    iface_row_layout.addStretch()
+                    unbind_btn = QPushButton("Unbind")
+                    unbind_btn.setStyleSheet(
+                        "background-color: #ffffff; color: #b91c1c; "
+                        "border: 1px solid #fca5a5; padding: 2px 12px; "
+                        "border-radius: 4px; font-size: 10px;"
+                    )
+                    unbind_btn.setMaximumWidth(90)
+                    # Default-arg lambda captures THIS row's iface dict;
+                    # without it every button would close over the loop
+                    # variable's final value.
+                    unbind_btn.clicked.connect(
+                        lambda _checked=False, _s=server_obj.get("address"),
+                        _i=iface:
+                        self._perform_unbind(_s, _i)
+                    )
+                    iface_row_layout.addWidget(unbind_btn)
+                    action_layout.addLayout(iface_row_layout)
+
         # ----- worker dispatch / refresh wiring -----
         pending = set()
 
@@ -1820,7 +1869,32 @@ If DPDK still fails:
             if response.status_code == 200:
                 result = response.json()
                 if result.get('success'):
-                    QMessageBox.information(self, "Success", f"Hugepages configured successfully: {num_pages} x 2MB pages")
+                    # v0.2.77: show requested vs actually-allocated so
+                    # operators see when the kernel capped it (memory
+                    # fragmentation / NUMA-node imbalance). Falls back
+                    # gracefully on pre-0.2.77 servers that don't return
+                    # the actual_allocated field.
+                    requested = result.get('requested', num_pages)
+                    allocated = result.get('actual_allocated')
+                    page_sz = result.get('page_size', '2MB')
+                    if allocated is None:
+                        # Legacy server — just confirm the request went in.
+                        body = (f"Hugepages configured successfully: "
+                                f"{requested} x {page_sz} pages")
+                    elif allocated == requested:
+                        body = (f"Allocated {allocated} x {page_sz} "
+                                f"hugepages on {server_address}.")
+                    else:
+                        body = (
+                            f"⚠ Partial allocation on {server_address}.\n\n"
+                            f"Requested: {requested} x {page_sz}\n"
+                            f"Actually allocated: {allocated} x {page_sz}\n\n"
+                            f"The kernel couldn't satisfy the full "
+                            f"request — usually means memory is "
+                            f"fragmented or the NUMA node is short. "
+                            f"Reboot may help; or allocate fewer pages."
+                        )
+                    QMessageBox.information(self, "Hugepages", body)
                 else:
                     QMessageBox.warning(self, "Failed", f"Failed to configure hugepages: {result.get('message', 'Unknown error')}")
             else:
