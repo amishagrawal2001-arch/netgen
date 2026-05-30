@@ -2,6 +2,54 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.70] - 2026-05-30
+
+**Preflight findings bar** — the GUI front end for the preflight
+backend that shipped in 0.2.68. A thin colour-coded strip at the top
+of the Devices sub-tab tells operators at a glance whether their
+config is BGP/EVPN-shaped before they hit Apply.
+
+### What it does
+- Self-contained `PreflightBar` widget docks above the Devices filter
+  row. Polls `/api/preflight/check` every 60 s, also exposes a manual
+  `↻` refresh button, and external code (e.g. post-Apply hooks) can
+  call `refresh()` to update on demand.
+- Three pills — `● N errors · ● N warnings · ● N OK` — coloured red /
+  amber / green and muted when the count is zero. Pills get singular
+  / plural right ("1 error", "2 errors") because operators notice
+  when they don't.
+- Bar background tints by worst severity: red on any error, amber on
+  warning, green when clean. Subtle, doesn't drown out the table.
+- **Details…** button opens a modal table (Level / Code / Device /
+  Interface / Message), level cells colour-coded, sortable. Missing
+  interface renders as em-dash so no "None" leaks visually.
+- **Defensively quiet** — HTTP exception, non-200, malformed JSON,
+  empty server URL all leave the previous pill values intact and log
+  a debug line. No modal alerts on a flaky link.
+
+### What changed
+- **`widgets/preflight_bar.py`** — new module. `PreflightBar` (QFrame)
+  + `PreflightDetailsDialog` (QDialog) + pill helpers + colour
+  palette. ~300 LOC.
+- **`widgets/devices_tab.py`** — `setup_devices_subtab` instantiates
+  the bar as the first widget above the filter row, wrapped in
+  try/except so a construction failure can't block the Devices tab
+  rendering.
+- **`tests/test_preflight_bar.py`** — 13 new tests: summary →
+  pill text + bar tint, singular/plural copy, details-button enable
+  state, refresh silent on exception / no-URL / 5xx, refresh
+  populates from 200, timer on/off by interval, dialog row count +
+  per-level colours.
+
+### Reliability note
+The bar resolves the server URL on every refresh via the provider
+callback (`main_window.get_server_url`) rather than caching it at
+construction, so changing the active server in the chassis picker
+just works without a signal hookup.
+
+### Test count
+298 → 311 (+13).
+
 ## [0.2.69] - 2026-05-30
 
 **Help menu refresh** — update the existing API Guide with everything

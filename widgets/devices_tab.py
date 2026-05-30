@@ -1614,6 +1614,29 @@ class DevicesTab(QWidget):
         layout.setContentsMargins(2, 2, 2, 2)
         layout.setSpacing(2)
 
+        # Preflight bar (0.2.70). Self-contained widget — polls
+        # /api/preflight/check on a slow timer and updates colour-coded
+        # pills. Click Details to see every finding in a table modal.
+        # Defensive: never raises on HTTP failure (silent debug log
+        # only), so an unreachable server doesn't pop a modal every
+        # minute. Lives ABOVE the filter row so the operator's eye
+        # catches it before they scroll the table.
+        try:
+            from widgets.preflight_bar import PreflightBar
+            def _resolve_url():
+                try:
+                    return self.get_server_url(silent=True) \
+                        if hasattr(self, "get_server_url") else None
+                except Exception:
+                    return None
+            self.preflight_bar = PreflightBar(_resolve_url, parent=self.devices_subtab)
+            layout.addWidget(self.preflight_bar)
+        except Exception as _e:
+            # Bar is purely advisory — failure to construct must NEVER
+            # block the Devices tab from rendering. Logged for triage.
+            import logging as _lg
+            _lg.warning(f"[DEVICES] preflight bar unavailable: {_e}")
+
         # columns
         # Simplified device table - only essential device info
         self.device_headers = [
