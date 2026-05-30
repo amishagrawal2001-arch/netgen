@@ -1221,6 +1221,22 @@ class TrafficGeneratorClient(
         help_menu.addAction(api_guide_action)
         self.addAction(api_guide_action)
 
+        # Supported Features — the capability matrix. Answers "can
+        # this app do X?" — every packet type, protocol, emulator,
+        # backend. Distinct from What's-New (release notes) and API
+        # Guide (curl reference). Added in 0.2.72.
+        capabilities_action = QAction("Supported Features...", self)
+        capabilities_action.setToolTip(
+            "Comprehensive capability matrix: every packet type "
+            "(L2/L3/L4 + encapsulations), every protocol emulator "
+            "(LACP/LLDP/VRRP/IGMP/PIM/BFD), routing (BGP/EVPN/"
+            "OSPF/IS-IS), VXLAN/EVPN inject, RFC 2544, preflight, "
+            "DPDK vs Scapy backends, auth, install/upgrade."
+        )
+        capabilities_action.triggered.connect(self.show_capabilities_guide)
+        help_menu.addAction(capabilities_action)
+        self.addAction(capabilities_action)
+
         # What's New — feature guide describing the GUI changes operators
         # actually see (status chips, L2/EVPN/SR-MPLS dialogs, RFC 2544
         # HTML report, latency p95, …). Lives alongside the API Guide so
@@ -1363,6 +1379,18 @@ class TrafficGeneratorClient(
         try:
             from widgets.stream_dialog import show_feature_guide
             show_feature_guide(self)
+        except Exception as e:
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Help unavailable", f"Could not open guide: {e}")
+
+    def show_capabilities_guide(self):
+        """Open the Supported Features / Capabilities Guide from the
+        Help menu. The comprehensive capability matrix — every packet
+        type, protocol, emulator, backend the app supports. Distinct
+        from What's-New (release notes) and API Guide (curl reference)."""
+        try:
+            from widgets.stream_dialog import show_capabilities_guide
+            show_capabilities_guide(self)
         except Exception as e:
             from PyQt5.QtWidgets import QMessageBox
             QMessageBox.warning(self, "Help unavailable", f"Could not open guide: {e}")

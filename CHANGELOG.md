@@ -2,6 +2,67 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.73] - 2026-05-30
+
+**Supported Features (Capabilities Guide)** — the comprehensive
+capability matrix as its own Help menu entry. Operator opened
+Help → What's New looking for "everything this app can do" and
+correctly noted the existing dialog is a changelog, not a capability
+reference.
+
+### Three distinct Help surfaces now
+
+| Dialog | Question it answers |
+|---|---|
+| Supported Features (new) | "Can the app do X?" |
+| What's New | "What changed in 0.2.N?" |
+| API Guide | "What's the curl command?" |
+
+### What the new guide covers
+Ten sections, each with the surface (tab / menu / endpoint) where the
+feature lives:
+1. **Stream packet builder** — L2 framing variants (untagged / Dot1Q /
+   QinQ), L3 (IPv4/IPv6), L4 (UDP/TCP/ICMP/IGMP), encapsulations
+   (MPLS / SR-MPLS stack / VXLAN), frame sizing (fixed / random /
+   IMIX), payload modes, NLAT timestamps. Scapy-vs-DPDK matrix per
+   protocol.
+2. **L2 / Multicast emulation** — LACP, LLDP, VRRP, IGMP, PIM, BFD
+   with RFC references.
+3. **Routing / control plane** — BGP, BGP EVPN, OSPF, IS-IS, VRF.
+4. **VXLAN / EVPN** — tunnels, Type-2 + Type-5 bulk inject, kind-
+   tagged active table.
+5. **DHCP** — v4/v6 × server/client matrix.
+6. **Compliance** — RFC 2544 throughput + latency, HTML report.
+7. **Preflight** — every current finding code with severity.
+8. **Statistics + reporting** — counters, percentiles, CSV / HTML
+   export.
+9. **Backends** — Scapy vs DPDK with the UDP-only caveat called out
+   explicitly.
+10. **Server / API / operations** — multi-server, auth roles,
+    install / upgrade paths, DPDK admin portal.
+
+Plus a **"What this app is not"** section so operators don't waste
+time hunting GRE / GTP / SRv6 / RFC 2889 — explicitly listed as
+out-of-scope today.
+
+### What changed
+- **`widgets/stream_dialog.py`** — new `_CAPABILITIES_GUIDE_HTML`
+  constant (~250 lines of structured HTML with tables, where-
+  pointers, RFC numbers, Scapy/DPDK matrix) + `show_capabilities_guide`
+  opener. Existing What's-New Help-table row updated to point at the
+  new entry.
+- **`traffic_client/main.py`** — new "Supported Features..." QAction
+  in the Help menu (placed before "What's New" so the broader
+  capability question comes first); new `show_capabilities_guide`
+  slot method.
+- **`tests/test_help_dialogs.py`** — 8 new tests pinning the section
+  list, packet-layer protocols, L2 emulators, routing protocols,
+  every preflight code, the DPDK UDP-only caveat, the "what we don't
+  support" honesty section, and the Qt smoke-open.
+
+### Test count
+316 → 324 (+8).
+
 ## [0.2.72] - 2026-05-30
 
 **What's-New guide catches up to the preflight bar** — operator

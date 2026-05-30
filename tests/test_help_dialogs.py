@@ -148,6 +148,93 @@ def test_show_api_guide_renders_html_into_textbrowser(qapp, monkeypatch):
     assert "/api/evpn/type2/inject" in captured["html"]
 
 
+# ──────────────────────────────────────── Capabilities guide content
+def test_capabilities_guide_covers_every_major_surface():
+    """The capability matrix should have a section for each major
+    surface so an operator can answer 'can the app do X?' without
+    leaving the dialog."""
+    from widgets.stream_dialog import _CAPABILITIES_GUIDE_HTML
+    for section in (
+        "Stream packet builder",
+        "L2 / Multicast emulation",
+        "Routing / control plane",
+        "VXLAN / EVPN data plane",
+        "DHCP",
+        "Compliance test methodologies",
+        "Preflight checks",
+        "Statistics + reporting",
+        "Backends",
+        "Server / API / operations",
+    ):
+        assert section in _CAPABILITIES_GUIDE_HTML, f"missing: {section}"
+
+
+def test_capabilities_guide_lists_packet_layer_protocols():
+    """L3/L4 + encap should each be named explicitly so the matrix
+    is grep-able by an operator looking for support."""
+    from widgets.stream_dialog import _CAPABILITIES_GUIDE_HTML
+    for proto in ("IPv4", "IPv6", "UDP", "TCP", "ICMP",
+                  "MPLS", "SR-MPLS", "VXLAN",
+                  "802.1Q", "802.1ad", "QinQ", "IMIX", "NLAT"):
+        assert proto in _CAPABILITIES_GUIDE_HTML, f"missing protocol: {proto}"
+
+
+def test_capabilities_guide_lists_every_l2_emulator():
+    from widgets.stream_dialog import _CAPABILITIES_GUIDE_HTML
+    for proto in ("LACP", "LLDP", "VRRP", "IGMP", "PIM", "BFD"):
+        assert proto in _CAPABILITIES_GUIDE_HTML, f"missing emulator: {proto}"
+
+
+def test_capabilities_guide_lists_routing_protocols():
+    from widgets.stream_dialog import _CAPABILITIES_GUIDE_HTML
+    for proto in ("BGP", "EVPN", "OSPF", "IS-IS", "VRF"):
+        assert proto in _CAPABILITIES_GUIDE_HTML, f"missing routing: {proto}"
+
+
+def test_capabilities_guide_lists_every_preflight_code():
+    """If preflight gains a new code we want the capability matrix
+    pinned to it — otherwise the doc silently goes stale."""
+    from widgets.stream_dialog import _CAPABILITIES_GUIDE_HTML
+    for code in ("BGP_NO_REMOTE_ASN", "BGP_NO_LOOPBACK",
+                 "VXLAN_EMPTY", "VXLAN_MISSING_FIELDS",
+                 "OSPF_NO_AREA", "ISIS_NO_AREA",
+                 "DUPLICATE_IPV4"):
+        assert code in _CAPABILITIES_GUIDE_HTML, f"missing code: {code}"
+
+
+def test_capabilities_guide_calls_out_dpdk_limits():
+    """DPDK is UDP-only — be explicit so operators don't waste an
+    afternoon wondering why their TCP stream silently fell back to
+    Scapy."""
+    from widgets.stream_dialog import _CAPABILITIES_GUIDE_HTML
+    assert "DPDK" in _CAPABILITIES_GUIDE_HTML
+    assert "UDP only" in _CAPABILITIES_GUIDE_HTML or "UDP-only" in _CAPABILITIES_GUIDE_HTML
+
+
+def test_capabilities_guide_has_honest_not_supported_list():
+    """A 'what this app is not' section earns operator trust and
+    saves support tickets."""
+    from widgets.stream_dialog import _CAPABILITIES_GUIDE_HTML
+    assert "What this app is not" in _CAPABILITIES_GUIDE_HTML
+
+
+def test_show_capabilities_guide_renders_html_into_textbrowser(qapp, monkeypatch):
+    from PyQt5.QtWidgets import QDialog, QWidget, QTextBrowser
+    monkeypatch.setattr(QDialog, "exec", lambda self: 0)
+
+    captured = {}
+    orig_set_html = QTextBrowser.setHtml
+    def capturing_set_html(self, html):
+        captured["html"] = html
+        return orig_set_html(self, html)
+    monkeypatch.setattr(QTextBrowser, "setHtml", capturing_set_html)
+
+    from widgets.stream_dialog import show_capabilities_guide
+    show_capabilities_guide(QWidget())
+    assert "Supported Features" in captured.get("html", "")
+    assert "Stream packet builder" in captured["html"]
+
+
 def test_show_feature_guide_renders_html_into_textbrowser(qapp, monkeypatch):
     from PyQt5.QtWidgets import QDialog, QWidget, QTextBrowser
     monkeypatch.setattr(QDialog, "exec", lambda self: 0)

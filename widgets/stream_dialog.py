@@ -2910,6 +2910,10 @@ at <strong>315 tests</strong> vs 103 before this push).</p>
   <tr><td>DPDK Traffic Blast Workflow</td>
       <td>Line-rate DPDK tx_worker walkthrough: TX core sizing,
           calibrated numbers, troubleshooting.</td></tr>
+  <tr><td><strong>Supported Features</strong></td>
+      <td>The full capability matrix — every packet type, protocol,
+          emulator, backend the app supports. Answers "can the app
+          do X?" without scanning the codebase. (Added 0.2.72.)</td></tr>
   <tr><td><strong>What's New (this dialog)</strong></td>
       <td>You're reading it.</td></tr>
 </table>
@@ -2924,6 +2928,325 @@ def show_feature_guide(parent=None):
     Help → What's New."""
     _open_help_dialog(parent, "Netgen — What's New (Feature Guide)",
                       _FEATURE_GUIDE_HTML)
+
+
+# ─────────────────────────────────────────── Capabilities (what we support)
+# Distinct from What's-New: this is the comprehensive feature matrix — every
+# packet type, every protocol, every emulator, every backend. Operators
+# answer "can this app do X?" from this dialog; "what changed in 0.2.N?"
+# from What's-New; "what curl command?" from API Guide.
+_CAPABILITIES_GUIDE_HTML = r"""
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI",
+         sans-serif; color: #1f2937; line-height: 1.5; font-size: 12px; }
+  h1 { color: #1e40af; font-size: 20px; margin: 0 0 6px 0; }
+  h2 { color: #374151; font-size: 15px; margin-top: 22px;
+       border-bottom: 1px solid #e5e7eb; padding-bottom: 4px; }
+  h3 { color: #4b5563; font-size: 13px; margin-top: 14px; }
+  p, li { color: #374151; }
+  code { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+         background: #f3f4f6; padding: 1px 5px; border-radius: 3px;
+         font-size: 11px; color: #1e3a8a; }
+  .where { color: #1d4ed8; font-weight: 600; font-size: 11px; }
+  .muted { color: #6b7280; font-size: 11px; }
+  table { border-collapse: collapse; margin-top: 6px; font-size: 11px;
+          width: 100%; }
+  th, td { border: 1px solid #d1d5db; padding: 5px 9px; text-align: left;
+           vertical-align: top; }
+  th { background: #f3f4f6; color: #374151; font-weight: 600; }
+  td.yes  { color: #166534; font-weight: 600; }
+  td.no   { color: #b91c1c; font-weight: 600; }
+  td.partial { color: #b45309; font-weight: 600; }
+  ul { margin: 4px 0; padding-left: 22px; }
+  li { margin: 3px 0; }
+</style>
+
+<h1>Netgen — Supported Features</h1>
+<p class="muted">The complete capability matrix: every packet type the
+generator can emit, every protocol the emulator can speak, every
+backend the wire-side runs on. For version-by-version detail see
+<strong>Help → What's New</strong>; for the curl commands see
+<strong>Help → API Guide</strong>.</p>
+
+
+<h2>1. Stream packet builder (Streams tab)</h2>
+<p>Per-stream packet construction. Each stream emits a single shape;
+combine streams for mixed traffic. Backend defaults to Scapy; opt
+into DPDK <code>tx_worker</code> per-stream for line-rate UDP.</p>
+
+<h3>L2 framing</h3>
+<table>
+  <tr><th>Variant</th><th>How</th><th>Notes</th></tr>
+  <tr><td>Untagged Ethernet II</td><td>Default</td><td>—</td></tr>
+  <tr><td>Single 802.1Q tag</td><td>Set <code>VLAN ID</code> + PCP</td>
+      <td>TPID <code>0x8100</code></td></tr>
+  <tr><td>802.1ad QinQ (S+C)</td><td>Set <strong>Outer</strong> +
+      <strong>Inner</strong> VLAN ID/PCP</td>
+      <td>Outer TPID <code>0x88a8</code> / inner <code>0x8100</code></td></tr>
+</table>
+
+<h3>L3 / L4 protocol stack</h3>
+<table>
+  <tr><th>Layer</th><th>Scapy</th><th>DPDK</th></tr>
+  <tr><td>IPv4 (DSCP/ECN/TTL/flags)</td><td class="yes">✓</td><td class="yes">✓</td></tr>
+  <tr><td>IPv6 (TC, flow label, hop limit)</td><td class="yes">✓</td><td class="no">—</td></tr>
+  <tr><td>UDP</td><td class="yes">✓</td><td class="yes">✓</td></tr>
+  <tr><td>TCP (full flags / seq / ack / window)</td><td class="yes">✓</td><td class="no">—</td></tr>
+  <tr><td>ICMP / ICMPv6 (echo, type/code)</td><td class="yes">✓</td><td class="no">—</td></tr>
+  <tr><td>IGMP v2 / v3 (membership reports)</td><td class="yes">✓</td><td class="no">—</td></tr>
+</table>
+
+<h3>Encapsulations</h3>
+<ul>
+  <li><strong>MPLS (single label)</strong> — TTL / TC controllable.
+      Ethertype <code>0x8847</code>.</li>
+  <li><strong>SR-MPLS label stack</strong> — comma-separated SID list
+      (e.g. <code>16000, 16001, 16002</code>); BOS bit auto-set on
+      the innermost. RFC 8660. Legacy single-label streams keep
+      working unchanged.</li>
+  <li><strong>VXLAN</strong> — inner Ether+IP+UDP wrapped in UDP/4789.
+      Stateless decap on RX too, so a stream sent <em>into</em> a
+      VXLAN tunnel can be counted on the other side.</li>
+</ul>
+
+<h3>Frame sizing</h3>
+<ul>
+  <li><strong>Fixed</strong> — 64–9216 bytes.</li>
+  <li><strong>Random</strong> — uniform random between min / max.</li>
+  <li><strong>IMIX</strong> — RFC 3139 three-frame mix (58.3% × 64 B,
+      33.3% × 594 B, 8.3% × 1518 B).</li>
+</ul>
+
+<h3>Payload modes</h3>
+<ul>
+  <li><strong>None</strong> — bare L4 header only.</li>
+  <li><strong>Pattern</strong> — repeating hex pattern (e.g.
+      <code>DEADBEEF</code>).</li>
+  <li><strong>Random</strong> — random bytes (re-randomised per packet).</li>
+  <li><strong>Custom hex / file</strong> — paste a hex blob or load
+      from disk; sent verbatim.</li>
+</ul>
+
+<h3>Latency timestamping</h3>
+<p><strong>NLAT</strong> — 16-byte header (<code>magic 0x4e4c4154</code>
++ <code>tx_ns</code>) prepended to the UDP payload. Both Scapy and
+DPDK backends embed it; the receiver decodes it for one-way latency
+samples (p50 / p95 / p99 reported in the stats dock + RFC 2544
+results).</p>
+
+
+<h2>2. L2 / Multicast emulation (continuous protocol senders)</h2>
+<p>Distinct from the Streams builder — these are <em>protocol
+emulators</em> that hold a session open and send keepalives /
+hellos on a cadence. All accept inline 802.1Q + 802.1ad tags.</p>
+<table>
+  <tr><th>Protocol</th><th>RFC</th><th>What it does</th></tr>
+  <tr><td><strong>LACP</strong></td><td>802.1AX</td>
+      <td>LACPDU slow-protocol frames; fast (1 s) or long (30 s)
+          timeout; full state-bit control.</td></tr>
+  <tr><td><strong>LLDP</strong></td><td>802.1AB</td>
+      <td>Chassis ID, port ID, system name + description, TTL.</td></tr>
+  <tr><td><strong>VRRP</strong> v2 + v3</td><td>3768 / 5798</td>
+      <td>Master advertisements; IPv4 <code>224.0.0.18</code> +
+          IPv6 <code>ff02::12</code>.</td></tr>
+  <tr><td><strong>IGMP</strong> v2 + v3</td><td>2236 / 3376</td>
+      <td>Membership reports + Leave; configurable group address.</td></tr>
+  <tr><td><strong>PIM Hello</strong></td><td>7761 §4.3</td>
+      <td>Neighbour discovery probe for PIM-SM / SSM.</td></tr>
+  <tr><td><strong>BFD</strong></td><td>5880 / 5881</td>
+      <td>Single-hop UDP/3784 with TTL=255; sub-second cadence
+          supported; State = Up / Down for keepalive vs. tear-down.</td></tr>
+</table>
+<p><span class="where">Where: L2 Emulation tab → Start session.</span></p>
+
+
+<h2>3. Routing / control plane (per-device FRR)</h2>
+<p>Each device runs a per-instance FRR Docker container; protocols
+auto-start when the device is Applied. VRF-isolated per device.</p>
+<table>
+  <tr><th>Protocol</th><th>What you configure</th></tr>
+  <tr><td><strong>BGP</strong> (RFC 4271)</td>
+      <td>Local AS, router-id / loopback, neighbours (IPv4 + IPv6
+          AFs).</td></tr>
+  <tr><td><strong>BGP EVPN</strong> (RFC 7432)</td>
+      <td>Auto-enabled with VXLAN. Type-2 (MAC/IP) and Type-5 (IP
+          Prefix) routes — populate via bulk-inject (see §4).</td></tr>
+  <tr><td><strong>OSPF</strong> (RFC 2328)</td>
+      <td>Area ID, ABR/ASBR roles, loopback router-id.</td></tr>
+  <tr><td><strong>IS-IS</strong> (RFC 1195)</td>
+      <td>Area ID, integrated IPv4 + IPv6, multi-area.</td></tr>
+  <tr><td><strong>VRF</strong></td>
+      <td>Per-device VRF isolation on the host; one FRR instance per
+          VRF per device.</td></tr>
+</table>
+<p><span class="where">Where: Devices tab → Add/Edit device → Protocols selector.</span></p>
+
+
+<h2>4. VXLAN / EVPN data plane</h2>
+<ul>
+  <li><strong>VXLAN tunnels</strong> — VNI, local + remote VTEPs,
+      UDP 4789, optional VLAN mapping.</li>
+  <li><strong>EVPN Type-2 bulk inject</strong> — synthesise N
+      MAC/IP entries on a VXLAN interface; FRR/BGP advertises them
+      as Type-2 routes. Used for scale testing without N real
+      hosts.</li>
+  <li><strong>EVPN Type-5 bulk inject</strong> — synthesise N IP
+      prefixes; advertised as Type-5 (IP Prefix) routes. Optional
+      gateway + VRF table ID.</li>
+  <li><strong>Active-injections table</strong> — every inject on
+      the server, kind-tagged (Type-2 blue / Type-5 violet), per-row
+      Clear button routes to the right cleaner.</li>
+</ul>
+<p><span class="where">Where: Devices tab → VXLAN sub-tab → EVPN Inject button.</span></p>
+
+
+<h2>5. DHCP</h2>
+<table>
+  <tr><th>Variant</th><th>Server</th><th>Client</th></tr>
+  <tr><td>DHCPv4</td><td class="yes">✓ (dnsmasq pool)</td>
+      <td class="yes">✓ (dhclient DISCOVER/REQUEST/RENEW)</td></tr>
+  <tr><td>DHCPv6</td><td class="partial">stateless mode</td>
+      <td class="partial">solicit/advertise</td></tr>
+</table>
+<p>v4 server lets you configure pool start/end, DNS, gateway, lease
+time. v4 client tracks bound lease in the device row.
+<span class="where">Where: Devices tab → DHCP sub-tab.</span></p>
+
+
+<h2>6. Compliance test methodologies</h2>
+<ul>
+  <li><strong>RFC 2544 Throughput</strong> — binary-search to no-loss
+      rate at the 7 standard frame sizes (64, 128, 256, 512, 1024,
+      1280, 1518 B). Configurable loss tolerance, per-step duration,
+      and resolution.</li>
+  <li><strong>RFC 2544 §26.2 Latency</strong> — optional per-step
+      NLAT capture; results table populates p50 / p95 / p99
+      latency columns alongside throughput.</li>
+  <li><strong>HTML test report</strong> — single self-contained HTML
+      with parameters + full results table + best-throughput summary.
+      Open in any browser → Print → Save-as-PDF for a formal
+      deliverable.</li>
+</ul>
+<p><span class="where">Where: Tools menu → RFC 2544 Throughput Test.</span></p>
+
+
+<h2>7. Preflight checks</h2>
+<p>Pre-Apply sanity surface. Current finding codes:</p>
+<table>
+  <tr><th>Code</th><th>Level</th><th>What's wrong</th></tr>
+  <tr><td><code>BGP_NO_REMOTE_ASN</code></td><td>error</td>
+      <td>BGP neighbour configured, no remote AS.</td></tr>
+  <tr><td><code>BGP_NO_LOOPBACK</code></td><td>warning</td>
+      <td>iBGP / EVPN device with no loopback IP.</td></tr>
+  <tr><td><code>VXLAN_EMPTY</code></td><td>warning</td>
+      <td>VXLAN enabled but no tunnels configured.</td></tr>
+  <tr><td><code>VXLAN_MISSING_FIELDS</code></td><td>error</td>
+      <td>VXLAN tunnel missing VNI / local IP / remote peers.</td></tr>
+  <tr><td><code>OSPF_NO_AREA</code></td><td>warning</td>
+      <td>OSPF enabled but no area ID.</td></tr>
+  <tr><td><code>ISIS_NO_AREA</code></td><td>warning</td>
+      <td>IS-IS enabled but no area ID.</td></tr>
+  <tr><td><code>DUPLICATE_IPV4</code></td><td>error</td>
+      <td>Same IPv4 on two devices.</td></tr>
+</table>
+<p>Heads-up surface — Apply still runs whether you address findings
+or not.
+<span class="where">Where: Devices tab → preflight bar (top of sub-tab) → Details…</span></p>
+
+
+<h2>8. Statistics + reporting</h2>
+<ul>
+  <li><strong>Per-interface RX counters</strong> — bytes / packets /
+      drops, in-place repaint (no flicker).</li>
+  <li><strong>Per-stream TX + RX counters</strong> with status badge
+      (running / idle).</li>
+  <li><strong>Latency percentiles</strong> — p50 / p95 / p99 from
+      NLAT decode, in stats tooltip + RFC 2544 results.</li>
+  <li><strong>CSV export</strong> — both stats tables (Interface +
+      Stream) to a single CSV with header block + per-section
+      markers.</li>
+  <li><strong>HTML report</strong> — RFC 2544 results (see §6).</li>
+  <li><strong>Device import / export</strong> — JSON save/load of the
+      full device config set (round-trippable).</li>
+</ul>
+<p><span class="where">Where: Statistics dock + Tools menu (RFC 2544 export).</span></p>
+
+
+<h2>9. Backends</h2>
+<table>
+  <tr><th>Backend</th><th>Covers</th><th>Caveats</th></tr>
+  <tr><td><strong>Scapy</strong> (default)</td>
+      <td>Every L2/L3/L4 combination above; full protocol breadth.</td>
+      <td>CPU-bound; no line-rate guarantee.</td></tr>
+  <tr><td><strong>DPDK <code>tx_worker</code></strong></td>
+      <td>Line-rate UDP (100G / 400G); per-core TX queues; NLAT
+          timestamps.</td>
+      <td>UDP only (TCP / ICMP / IPv6 fall back to Scapy). Needs
+          hugepages + IOMMU + NIC bound to <code>vfio-pci</code>
+          (Mellanox uses <code>mlx5</code> direct). One-click admin
+          UI handles all of this.</td></tr>
+</table>
+
+
+<h2>10. Server / API / operations</h2>
+<h3>REST API</h3>
+<ul>
+  <li><strong>Multi-server (TGen chassis)</strong> — single client
+      manages many servers; topology import/export carries the
+      chassis list.</li>
+  <li><strong>Bearer-token auth (optional)</strong> —
+      <code>NETGEN_AUTH_TOKEN</code> env var; single token = admin.</li>
+  <li><strong>Role-based auth (optional)</strong> —
+      <code>NETGEN_AUTH_TOKENS_JSON</code> mapping; hierarchy
+      <code>admin &gt; operator &gt; viewer</code> with per-endpoint
+      <code>@require_role</code> gates.</li>
+</ul>
+
+<h3>Install / Upgrade</h3>
+<ul>
+  <li><strong>SSH-based install</strong> — fresh Linux host →
+      <code>install_ostg_complete.py</code> (apt + Docker + FRR +
+      DPDK + systemd) driven from the GUI.</li>
+  <li><strong>In-app wheel upgrade</strong> — upload a wheel to a
+      running server, inline log stream, auto-restart. Falls back to
+      SSH-based reinstall on pre-0.2.34 servers.</li>
+</ul>
+
+<h3>DPDK admin portal (browser)</h3>
+<p>Visit <code>http://server:5050/admin</code> for one-click DPDK
+runtime install, hugepages allocation, IOMMU toggle (GRUB edit +
+reboot), NIC bind/unbind to <code>vfio-pci</code> /
+<code>mlx5</code>, TX-core recommender, and live tx_worker status.</p>
+
+
+<h2>What this app is not</h2>
+<p class="muted">A short honest list so you don't go hunting:</p>
+<ul>
+  <li><strong>No GRE / GTP packet builders</strong> — workaround:
+      assemble in custom-hex payload or send via the API with a
+      Scapy expression.</li>
+  <li><strong>No SRv6 / SRH</strong> (SR-MPLS yes, IPv6 SR no).</li>
+  <li><strong>DPDK is UDP-only</strong> — TCP / ICMP / IPv6 fall
+      back to Scapy automatically per-stream.</li>
+  <li><strong>No real-time RFC 2889 / 3918 / 8239 test profiles</strong>
+      yet — currently only RFC 2544 is automated; the others can be
+      composed manually with stream batches.</li>
+</ul>
+
+<p class="muted">For the curl commands behind any of the above see
+<strong>Help → API Guide</strong>. For the version each feature
+shipped in see <code>CHANGELOG.md</code> or <strong>Help → What's
+New</strong>.</p>
+"""
+
+
+def show_capabilities_guide(parent=None):
+    """Open the comprehensive Supported Features / Capabilities
+    Guide dialog. Reachable from Help → Supported Features.
+    Distinct from the What's-New guide — this answers 'can the app
+    do X?', What's-New answers 'what changed in 0.2.N?'."""
+    _open_help_dialog(parent, "Netgen — Supported Features",
+                      _CAPABILITIES_GUIDE_HTML)
 
 
 def _open_help_dialog(parent, title, html):
