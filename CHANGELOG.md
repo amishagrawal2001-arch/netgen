@@ -2,6 +2,49 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.54] - 2026-05-29
+
+Fix stream **Paste** silently dropping streams (the log line gave it
+away: ``[PASTE] 'str1' ->  - Port: eno8303`` — empty TG ID).
+
+### The bug (`traffic_client/stream_control.py`)
+`paste_stream_to_interface` resolved the destination TG with
+``tg_id = parent_item.text(0).strip()``. But the TG node's column 0 is
+no longer plain text — `update_server_tree` builds a custom
+``itemWidget`` (status-icon QLabel + a separate "TG N" QLabel), so
+``text(0)`` is ``""``. That produced ``tg_id = ""`` →
+``full_port_name = " - Port: eno8303"`` → the paste appended into a
+ghost key that the Streams table and the stats lookups never match, so
+the pasted stream looked like it vanished.
+
+### The fix
+Three-tier TG-ID resolution that mirrors what `_do_update_stream_table`
+already does for this same tree:
+1. Iterate ``itemWidget(parent, 0).findChildren(QLabel)`` and pick the
+   first label with **non-empty text** (the icon labels are pixmap-only,
+   so this picks the actual "TG N" text label). Robust against the
+   findChild-returns-icon-first ordering quirk that bites the naive
+   approach.
+2. Fall back to ``server_interfaces[indexOfTopLevelItem(parent)]`` and
+   build ``"TG N"`` from the cached chassis record.
+3. Last-resort fall back to legacy ``parent_item.text(0)``.
+A user-facing warning fires only if all three miss; previously the
+failure was silent.
+
+### Verified (headless, prod-shaped server tree)
+Primary path (icon-pixmap label + TG-text label): paste lands in
+``"TG 0 - Port: eno8303"``, no ghost key, ``rx_port`` correct,
+``str1`` auto-named.
+Fallback path (icon-only widget, no text label): falls through to the
+``server_interfaces`` index and still pastes correctly.
+Full suite **103 passed**.
+
+### Notes
+- Pre-existing bug; this kind of "two pieces of UI built the same key
+  from different inputs" is the same class as the v0.2.53 copy bug, and
+  is what the incremental-table-update enhancement would retire for
+  good. Client-only; no server / wire-format change.
+
 ## [0.2.53] - 2026-05-29
 
 Fix **stream Copy** failing with *"Unable to resolve the selected streams

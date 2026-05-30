@@ -823,7 +823,54 @@ class TrafficGenClientStreamControl:
         # so pasted streams ended up orphaned from the per-port group
         # the Streams table and stats lookups expected. Rebuild the same
         # canonical "TG N - Port: iface" form Add Stream uses.
-        tg_id = parent_item.text(0).strip()  # e.g., "TG 0"
+        #
+        # tg_id resolution: the TG node in the tree no longer puts text
+        # into text(0) — it sets a custom itemWidget(parent, 0) holding a
+        # status icon + a QLabel with the "TG N" text. parent_item.text(0)
+        # therefore returns "", which silently produced full_port_name
+        # " - Port: eno8303" and pasted streams went nowhere. Mirror the
+        # exact widget→label→server_interfaces fallback that
+        # _do_update_stream_table uses.
+        tg_id = ""
+        try:
+            tg_widget = self.server_tree.itemWidget(parent_item, 0)
+            if tg_widget:
+                from PyQt5.QtWidgets import QLabel
+                # The TG node's itemWidget is a pixmap icon QLabel + a
+                # text QLabel side by side. findChild(QLabel) returns the
+                # FIRST one (the icon), whose text() is "" — so iterate
+                # all QLabel children and pick the first with non-empty
+                # text. The icon labels are always text-less in
+                # update_server_tree, so this is robust today and stays
+                # correct if a future tooltip ever lands on the icon.
+                for lbl in tg_widget.findChildren(QLabel):
+                    txt = (lbl.text() or "").strip()
+                    if txt:
+                        tg_id = txt
+                        break
+        except Exception:
+            pass
+        if not tg_id:
+            # Fallback: derive from server_interfaces by parent index.
+            try:
+                idx = self.server_tree.indexOfTopLevelItem(parent_item)
+                if 0 <= idx < len(getattr(self, "server_interfaces", [])):
+                    srv = self.server_interfaces[idx]
+                    tg_id = f"TG {srv.get('tg_id', '0')}"
+            except Exception:
+                pass
+        # Last-resort fallback: legacy text(0) (in case some build still
+        # uses the old plain-text TG node).
+        if not tg_id:
+            tg_id = parent_item.text(0).strip()
+        if not tg_id:
+            QMessageBox.warning(
+                self, "Paste Streams",
+                "Could not determine the TG chassis for the selected port "
+                "(the tree's TG node had no resolvable label or index). "
+                "Re-select the port and try again."
+            )
+            return
         raw_port_text = selected_item.text(0).strip()
         # Strip any incidental "Port: " prefix so tx_port_name is just iface
         tx_port_name = raw_port_text.replace("Port: ", "").strip()
