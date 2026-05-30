@@ -2,6 +2,65 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.59] - 2026-05-29
+
+**Enhancement #3 of 4 (slice 2) — RFC 2544 latency capture + HTML
+report.** Completes the §26.1 throughput test with §26.2 latency and a
+formal printable deliverable.
+
+### What changed
+- **`run_tgen_server.py`** — `_rfc2544_run_step` accepts a
+  `capture_latency` kwarg and, when set, embeds NLAT timestamps in the
+  binary-search stream so the RX-side `LatencySampler` decodes them.
+  `_rfc2544_thread` snapshots the sampler at the end of each frame
+  size's search and stores it under the new `latency` key in the
+  progress entry (min/avg/p50/p95/p99/max µs). Defensive: any
+  snapshot failure leaves `latency=None` and the client renders "—".
+- **`widgets/rfc2544_dialog.py`**:
+  - New **"Capture latency (RFC 2544 §26.2)"** checkbox (default off,
+    so the §26.1 throughput run stays bit-for-bit identical to prior
+    releases for users that don't opt in).
+  - Three new results-table columns: **Lat p50 / p95 / p99 (µs)**.
+    Pre-0.2.59 servers (no `latency` field) render "—" — fully
+    backward-compatible.
+  - CSV export now includes the three latency columns.
+  - New **"Export HTML Report"** button. Generates a self-contained,
+    browser-printable HTML report (test parameters + full results +
+    best-throughput summary). No PDF dep — the browser's
+    Print → Save-as-PDF handles the PDF need. Pure-function
+    `build_rfc2544_html_report(params, rows, server_url)` is exposed
+    at module level so it's testable / scriptable.
+
+### Verified
+8 new tests in `tests/test_rfc2544_dialog.py`, full suite **140 passed**:
+- Dialog construction (8-column results table, capture-latency
+  defaults off, HTML button disabled until completion).
+- Param payload carries `capture_latency`.
+- Progress poll populates the new latency cells when a 0.2.59 server
+  supplies them.
+- Pre-0.2.59 server (no `latency` field) — cells render "—" cleanly,
+  no crash, no `None` text.
+- Mixed-percentile-availability — None percentiles render "—"
+  per-cell (not whole-row).
+- HTML report contains params + data rows + summary footer; is
+  self-contained (no external links/scripts).
+- Missing-latency HTML report renders "—" cells.
+- Empty-results HTML report shows a clear "no results" message
+  instead of a malformed table.
+
+### Notes
+- Server change is fully backward-compatible (additive `latency` field,
+  opt-in via `capture_latency`). Old clients ignore the new field; new
+  clients render "—" against old servers. The throughput numbers are
+  unchanged when capture-latency is off.
+- Pre-0.2.58 servers still won't return `p95_us` even with capture on —
+  the client renders that specific cell as "—" and the rest still
+  populate. Recommended: upgrade both ends.
+
+### Next on the menu
+0.2.60: enhancement #4 — protocol & data-plane expansion (QinQ
+double-tag, BFD, EVPN type-2/3/5, SR-MPLS / SRv6).
+
 ## [0.2.58] - 2026-05-29
 
 **Enhancement #3 of 4 (slice 1) — stats / latency / reports.** Adds

@@ -15780,7 +15780,8 @@ _RFC2544_LOCK = __import__("threading").Lock()
 
 def _rfc2544_run_step(tx_iface, rx_iface, frame_size, link_pps, duration_s,
                      target_loss_pct, resolution_pps, mac_src, mac_dst,
-                     ip_src, ip_dst, dpdk_enable, dpdk_tx_cores):
+                     ip_src, ip_dst, dpdk_enable, dpdk_tx_cores,
+                     capture_latency=False):
     """Binary-search the max no-drop rate at one frame size.
 
     Returns (max_no_drop_pps, attempts) where `attempts` is a list of
@@ -15839,6 +15840,12 @@ def _rfc2544_run_step(tx_iface, rx_iface, frame_size, link_pps, duration_s,
         if dpdk_enable:
             stream_data["dpdk_enable"] = True
             stream_data["dpdk_tx_cores"] = int(dpdk_tx_cores or 1)
+        # When the user asked for latency capture (RFC 2544 §26.2), embed
+        # NLAT timestamps in the payload so the rx-side LatencySampler can
+        # decode them. The sampler itself is auto-started when the thread
+        # snapshots it after the search converges (see _rfc2544_thread).
+        if capture_latency:
+            stream_data["enable_timestamps"] = True
 
         # Kick off the stream
         try:
@@ -15932,6 +15939,7 @@ def _rfc2544_thread(params):
             # Theoretical line-rate pps at this frame size
             l1_bytes = max(60, int(fs)) + 20  # preamble + IFG
             line_pps = max(1, (link_mbps * 1_000_000) // (l1_bytes * 8))
+            capture_latency = bool(params.get("capture_latency", False))
             max_pps, attempts = _rfc2544_run_step(
                 tx_iface=tx_iface, rx_iface=rx_iface,
                 frame_size=fs, link_pps=line_pps,
@@ -15942,8 +15950,24 @@ def _rfc2544_thread(params):
                 ip_src=params["ip_src"], ip_dst=params["ip_dst"],
                 dpdk_enable=bool(params.get("dpdk_enable", True)),
                 dpdk_tx_cores=int(params.get("dpdk_tx_cores", 0) or 0),
+                capture_latency=capture_latency,
             )
             gbps = (max_pps * (fs + 20) * 8) / 1e9
+            # Snapshot one-way latency (RFC 2544 §26.2) at the end of this
+            # frame size's binary search. The trials above ran with
+            # enable_timestamps=True when capture_latency is set, so the
+            # rx-side LatencySampler has been accumulating NLAT-tagged
+            # samples; snapshot returns min/avg/p50/p95/p99/max for the
+            # rolling window. Defensive — any failure leaves latency=None
+            # and the client renders "—" in the latency columns.
+            latency = None
+            if capture_latency:
+                try:
+                    s = _get_or_start_latency_sampler(rx_iface)
+                    if s is not None:
+                        latency = s.snapshot()
+                except Exception as _le:
+                    logging.warning(f"[RFC 2544] latency snapshot for {rx_iface} failed: {_le}")
             with _RFC2544_LOCK:
                 _RFC2544_STATE["progress"].append({
                     "frame_size": fs,
@@ -15952,6 +15976,7 @@ def _rfc2544_thread(params):
                     "line_rate_pps": line_pps,
                     "pct_of_line_rate": round(100.0 * max_pps / line_pps, 1) if line_pps else 0,
                     "attempts": attempts,
+                    "latency": latency,
                 })
     except Exception as e:
         with _RFC2544_LOCK:
