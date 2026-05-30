@@ -1434,6 +1434,32 @@ If DPDK still fails:
         all_text = f"{error_msg} {output} {full_response}".lower()
         logger.info(f"[DPDK BIND] force={force}, 'active routes' detected: {'active routes' in all_text}")
 
+        # v0.2.76: explicit pre-flight refusal from the server. The
+        # /api/dpdk/bind endpoint now returns 409 + code=BIND_UNSAFE
+        # when the candidate iface is the mgmt interface or has an
+        # active stream. Surface the reason verbatim + offer a force
+        # re-post (server's `force` flag bypasses the safety check).
+        if (status_code == 409 and result.get("code") == "BIND_UNSAFE"
+                and not force and result.get("can_force")):
+            msg_box = QMessageBox(self)
+            msg_box.setWindowTitle("Unsafe to Bind")
+            msg_box.setIcon(QMessageBox.Warning)
+            msg_box.setText(f"Refusing to bind '{interface.get('name')}'.")
+            msg_box.setInformativeText(
+                result.get("error", "Pre-flight safety check failed.") +
+                "\n\nBind anyway?"
+            )
+            yes_btn = msg_box.addButton("Bind anyway",
+                                        QMessageBox.DestructiveRole)
+            msg_box.addButton("Cancel", QMessageBox.RejectRole)
+            msg_box.setDefaultButton(msg_box.buttons()[-1])  # Cancel
+            msg_box.activateWindow()
+            msg_box.raise_()
+            msg_box.exec()
+            if msg_box.clickedButton() is yes_btn:
+                self._perform_bind(server_address, interface, force=True)
+            return
+
         # Active-routes prompt (only when not already forced)
         if not force and ('active routes' in all_text or 'disrupt network connectivity' in all_text):
             msg_box = QMessageBox(self)

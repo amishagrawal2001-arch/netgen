@@ -2,6 +2,97 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.76] - 2026-05-30
+
+**DPDK readiness chip + NIC-bind safety guards.** Closes the last
+BLOCKER from the v0.2.75 DPDK audit (#3) and the riskiest PAIN (#5)
+in one focused release.
+
+### What changed
+
+#### DPDK readiness chip (audit BLOCKER #3)
+A small colour-coded indicator now lives in the QMainWindow status
+bar (right-aligned, always visible). Polls `/api/dpdk/status` every
+30 s and shows:
+
+* **green** — DPDK ready (libdpdk + tx_worker + hugepages + IOMMU +
+  vfio-pci all present).
+* **amber** — degraded (libdpdk + tx_worker present, but missing
+  hugepages / IOMMU / vfio). Mellanox / mlx5 NICs still work; others
+  won't. Tooltip explains.
+* **red** — unusable (tx_worker binary or libdpdk missing).
+  Enabling Use-DPDK guarantees a fallback.
+* **gray** — unknown (no server selected or HTTP failure).
+
+Hover the chip to see each subsystem's individual state — answers
+"why amber?" without opening a dialog. Defensively quiet on flaky
+links: holds previous state, logs a debug line, never modal-alerts.
+
+#### NIC-bind safety guards (audit PAIN #5)
+`/api/dpdk/bind` now pre-flights the bind and refuses (HTTP 409)
+when the candidate interface:
+
+* **carries the default route** — binding it would drop kernel
+  networking and lock the operator out of the host;
+* **is the SSH session's interface** — same outcome, different
+  detection path (parses `$SSH_CLIENT`);
+* **has an active traffic stream running on it** — would kill the
+  test mid-flight.
+
+The client surfaces the reason verbatim in a modal with a
+**"Bind anyway"** escape hatch (re-posts with `force=true`) so
+operators who *really* mean it (e.g. binding from console with a
+spare NIC for SSH) aren't blocked. Refusal is logged server-side
+too. Safety check failure itself is non-fatal — `ip route` parse
+errors won't lock anyone out.
+
+### What changed (files)
+- **`widgets/dpdk_readiness_chip.py`** — new module. `classify_dpdk_status`
+  (pure function: payload → state/headline/tooltip) + `DpdkReadinessChip`
+  QLabel widget with 30 s timer + manual `refresh()`. Modeled on
+  `widgets/preflight_bar.py` for visual consistency and the same
+  "defensively quiet on HTTP failure" contract.
+- **`utils/dpdk_bind_safety.py`** — new module. Pure-function
+  `check_bind_safe(iface, default_route_iface, ssh_client_iface,
+  active_stream_ifaces)` returns None or refusal-reason string.
+  Helpers `collect_default_route_iface(run=…)` and
+  `collect_ssh_client_iface(env, run=…)` accept an injectable `run`
+  callable so subprocess calls are mockable in tests.
+- **`traffic_client/main.py`** — `DpdkReadinessChip` instantiated
+  and added to `statusBar().addPermanentWidget(…)` during main
+  window init, wrapped in try/except so a construction failure
+  can't block the window.
+- **`run_tgen_server.py`** — `/api/dpdk/bind` calls `check_bind_safe`
+  with snapshots of default route + SSH session iface +
+  `stream_tracker.get_stream_stats()`. Returns 409 +
+  `{error, code: "BIND_UNSAFE", interface, can_force: true}` when
+  unsafe and `force` flag is not set.
+- **`traffic_client/dpdk_menu_actions.py`** — `_handle_bind_result`
+  short-circuits on 409 + `code=BIND_UNSAFE`: shows the refusal
+  reason in a QMessageBox.Warning with a destructive-role
+  "Bind anyway" button that re-posts with `force=true`.
+
+### Tests
+- **`tests/test_dpdk_readiness_chip.py`** — 14 tests covering all 8
+  classify branches (green/amber/red across 5 subsystem combos +
+  edge cases) plus the Qt smoke tests (initial gray, green-on-ready,
+  red-on-tx-worker-missing, silent-on-HTTP-failure, silent-on-503).
+- **`tests/test_dpdk_bind_safety.py`** — 14 tests covering every
+  refusal combo (mgmt-iface via default-route, mgmt-iface via SSH,
+  active-stream, none, both — and the priority order), whitespace
+  handling, empty-iface no-crash, plus 6 tests for the two
+  collector helpers including subprocess-error suppression.
+
+### Deferred from the DPDK audit
+* PAIN #4 — line-rate auto-pick result invisible (needs the start
+  endpoint to echo back the chosen `tx_cores`)
+* PAIN #6 — hugepage allocation feedback toast
+* Runtime fallback telemetry (BLOCKER #2 deferred from v0.2.75)
+* POLISH #9–#12 — per-core stats, version indicator, inline Unbind
+
+### Test count
+364 → 392 (+28).
+
 ## [0.2.75] - 2026-05-30
 
 **DPDK fallback telemetry** — close the silent-fallback gap cluster

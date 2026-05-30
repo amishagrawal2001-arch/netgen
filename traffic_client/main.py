@@ -112,6 +112,24 @@ class TrafficGeneratorClient(
 
         self.setup_menu_bar()
 
+        # DPDK readiness chip in the status bar (right-aligned). Polls
+        # /api/dpdk/status every 30 s so an operator never has to ask
+        # "is DPDK going to work today?" before enabling Use-DPDK on a
+        # stream. v0.2.76 — addresses BLOCKER #3 from the DPDK audit.
+        # Guarded — a construction failure can't block the main window.
+        try:
+            from widgets.dpdk_readiness_chip import DpdkReadinessChip
+            def _resolve_url():
+                try:
+                    return (self.get_server_url(silent=True)
+                            if hasattr(self, "get_server_url") else None)
+                except Exception:
+                    return None
+            self.dpdk_chip = DpdkReadinessChip(_resolve_url, parent=self)
+            self.statusBar().addPermanentWidget(self.dpdk_chip)
+        except Exception as _e:
+            logging.warning(f"[MAIN] DPDK readiness chip unavailable: {_e}")
+
 
         # Setup AI menu (if available)
         try:

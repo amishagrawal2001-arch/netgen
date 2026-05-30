@@ -12868,22 +12868,68 @@ def dpdk_bind():
     try:
         import subprocess
         import os
-        
+
         data = request.get_json() or {}
         interface = data.get("interface")
         pci = data.get("pci")
         force = data.get("force", False)
-        
+
         if not interface and not pci:
             return jsonify({"error": "interface or pci required"}), 400
-        
+
         # Validate PCI format if provided (should be like 0000:XX:XX.X)
         if pci and (pci == "N/A" or ":" not in pci):
             pci = None  # Ignore invalid PCI
-        
+
         # If PCI is invalid, try to get it from interface name
         if not pci and interface:
             pci = _get_pci_from_interface(interface)
+
+        # v0.2.76: pre-flight safety guard. Binding the management
+        # interface locks the operator out of the host; binding a NIC
+        # with an active stream kills the test mid-flight. Refuse with
+        # 409 unless force=true (the GUI offers a "Bind anyway" button
+        # that re-posts with force=true after the operator acknowledges).
+        if interface and not force:
+            try:
+                from utils.dpdk_bind_safety import (
+                    check_bind_safe,
+                    collect_default_route_iface,
+                    collect_ssh_client_iface,
+                )
+                default_iface = collect_default_route_iface()
+                ssh_iface = collect_ssh_client_iface(
+                    os.environ.get("SSH_CLIENT")
+                )
+                active_ifaces = set()
+                try:
+                    for s in stream_tracker.get_stream_stats() or []:
+                        iface_val = s.get("interface")
+                        if iface_val:
+                            active_ifaces.add(iface_val)
+                except Exception:
+                    pass
+                refusal = check_bind_safe(
+                    interface,
+                    default_route_iface=default_iface,
+                    ssh_client_iface=ssh_iface,
+                    active_stream_ifaces=active_ifaces,
+                )
+                if refusal:
+                    logging.warning(
+                        f"[DPDK BIND] refused bind of '{interface}': {refusal}"
+                    )
+                    return jsonify({
+                        "error": refusal,
+                        "code": "BIND_UNSAFE",
+                        "interface": interface,
+                        "can_force": True,
+                    }), 409
+            except Exception as _e:
+                # Safety check failure is itself non-fatal — log and
+                # proceed (don't lock out a user because we couldn't
+                # parse `ip route`).
+                logging.debug(f"[DPDK BIND] safety check skipped: {_e}")
         
         dpdk_bind_script = "/opt/OSTG/resources/dpdk/dpdk_bind.sh"
         if not os.path.exists(dpdk_bind_script):
