@@ -22,6 +22,17 @@ on:
       - 'v*'
   workflow_dispatch:
 
+# When several version-bump pushes land in quick succession (e.g.
+# v0.2.91 → v0.2.92 → v0.2.93 inside a few minutes during an audit-
+# fix burst), cancel the prior in-flight release run instead of
+# letting all of them race for the same release artifacts. Saves
+# ~50% on burst days. The `cancel-in-progress: true` matters more
+# than the group key — every tag push gets the same `release` group
+# so a newer push pre-empts an older one regardless of tag name.
+concurrency:
+  group: release-${{ github.workflow }}
+  cancel-in-progress: true
+
 jobs:
 
   # ───────────────────────────────────────────────────────────────────
@@ -51,8 +62,17 @@ jobs:
   # ───────────────────────────────────────────────────────────────────
   # 2. macOS .dmg
   # ───────────────────────────────────────────────────────────────────
+  # macOS runners are billed at 10× the per-minute rate of Linux ones
+  # ($0.08/min vs $0.008/min) and account for ~80% of every release's
+  # cost. We gate this job so it only runs on minor / major bumps
+  # (v*.0 tags — v0.3.0, v1.0.0, …) or when an operator explicitly
+  # triggers the workflow via the Actions UI. Patch bumps (v0.2.91,
+  # v0.2.92, …) skip it; the wheel + AppImage + Windows artifacts
+  # still publish without a .dmg attached. To force a .dmg build on
+  # a patch tag, re-run the workflow via workflow_dispatch.
   build-macos:
     name: macOS .dmg
+    if: endsWith(github.ref, '.0') || github.event_name == 'workflow_dispatch'
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v4
@@ -149,7 +169,22 @@ jobs:
   release:
     name: Publish GitHub release
     needs: [build-wheel, build-macos, build-windows, build-appimage]
-    if: startsWith(github.ref, 'refs/tags/v')
+    # By default a SKIPPED `needs:` job propagates to skip the
+    # downstream — but we explicitly want publish to proceed when
+    # macOS is skipped on a patch bump (see build-macos `if:` above).
+    # Conditions:
+    #   - always() + !cancelled() so we don't run on cancelled workflows
+    #   - tag push (existing guard)
+    #   - the three always-on builds must have succeeded
+    #   - macOS may be either 'success' (minor bump / dispatch) or
+    #     'skipped' (patch bump — no .dmg attached, that's fine)
+    if: |
+      always() && !cancelled() &&
+      startsWith(github.ref, 'refs/tags/v') &&
+      needs.build-wheel.result == 'success' &&
+      needs.build-windows.result == 'success' &&
+      needs.build-appimage.result == 'success' &&
+      (needs.build-macos.result == 'success' || needs.build-macos.result == 'skipped')
     runs-on: ubuntu-latest
     permissions:
       contents: write     # required to create/update releases
