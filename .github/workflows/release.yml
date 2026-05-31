@@ -58,6 +58,14 @@ jobs:
         with:
           name: wheel
           path: dist/*.whl
+          # Workflow-run artifacts default to 90 days; we only need
+          # them long enough for the `release` job to download them
+          # in the same workflow run, plus a small buffer for
+          # debugging re-runs. 7 days cuts artifact storage ~92%.
+          # The release-attached copies (uploaded by softprops in
+          # the release job) live independently on the GitHub Release
+          # page and are not subject to this retention.
+          retention-days: 7
 
   # ───────────────────────────────────────────────────────────────────
   # 2. macOS .dmg
@@ -105,6 +113,7 @@ jobs:
         with:
           name: macos-dmg
           path: build_image/*.dmg
+          retention-days: 7
 
   # ───────────────────────────────────────────────────────────────────
   # 3. Windows .exe
@@ -129,6 +138,7 @@ jobs:
         with:
           name: windows-exe
           path: dist/Netgen-Client-*-windows.exe
+          retention-days: 7
 
   # ───────────────────────────────────────────────────────────────────
   # 4. Linux .AppImage
@@ -162,6 +172,7 @@ jobs:
         with:
           name: linux-appimage
           path: dist/Netgen-Client-*-linux-*.AppImage
+          retention-days: 7
 
   # ───────────────────────────────────────────────────────────────────
   # 5. Publish release (only on tag push)
