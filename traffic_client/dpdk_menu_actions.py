@@ -147,6 +147,19 @@ class TrafficGenClientDPDKMenuActions():
         button_row.addWidget(ok_button)
         layout.addLayout(button_row)
 
+        # v0.2.97: Ctrl+Return dismisses the dialog — standard Qt
+        # shortcut every other modal in the app supports. Power
+        # users (read: every time the operator opens this dialog
+        # repeatedly to chase a stuck bind) appreciate it.
+        try:
+            from PyQt5.QtWidgets import QShortcut
+            from PyQt5.QtGui import QKeySequence
+            _ok_sc = QShortcut(QKeySequence(Qt.CTRL + Qt.Key_Return), dialog)
+            _ok_sc.setContext(Qt.WindowShortcut)
+            _ok_sc.activated.connect(dialog.accept)
+        except Exception:
+            pass  # shortcut is convenience; never block dialog open
+
         # ----- async fetch wiring -----
 
         def _clear_action_layout(action_layout):
@@ -306,6 +319,17 @@ class TrafficGenClientDPDKMenuActions():
                         "border-radius: 4px; font-size: 10px;"
                     )
                     unbind_btn.setMaximumWidth(90)
+                    # v0.2.97: explicit warning that this drops any
+                    # DPDK traffic in flight on this interface. The
+                    # confirmation dialog inside _perform_unbind is
+                    # the actual gate; this tooltip surfaces the
+                    # consequence before the operator commits.
+                    unbind_btn.setToolTip(
+                        "Unbind from vfio-pci and restore the "
+                        "kernel network driver.\n\n"
+                        "WARNING: any DPDK traffic currently running "
+                        "on this interface will stop."
+                    )
                     # Default-arg lambda captures THIS row's iface dict;
                     # without it every button would close over the loop
                     # variable's final value.
@@ -613,7 +637,20 @@ class TrafficGenClientDPDKMenuActions():
                 status = iface.get('status', 'N/A')
                 vendor = iface.get('vendor', 'N/A')
                 lines.append(f"  - {iface.get('name', 'N/A')}: PCI={pci}, Driver={driver}, Status={status}, Vendor={vendor}")
-        
+        else:
+            # v0.2.97: when the interfaces list is empty (typically a
+            # dpdk-devbind.py tooling failure or a host with no NICs)
+            # the dialog used to silently render an empty section.
+            # Operators interpreted the blank as "all good" and missed
+            # the underlying issue. Make the absence loud.
+            lines.append("\nInterfaces (0):")
+            lines.append(
+                "  No interfaces detected. This usually means "
+                "`dpdk-devbind.py` is missing on the server or "
+                "returned no devices. Check the server's "
+                "install_dpdk.sh output."
+            )
+
         return "\n".join(lines)
     
     def bind_interface_to_dpdk(self):
@@ -1601,6 +1638,34 @@ If DPDK still fails:
                 "The device may need to be manually bound to a kernel driver.",
             )
             return
+
+        # v0.2.97: confirm before unbinding an ACTIVE vfio-pci binding.
+        # Skip the prompt when we're restoring an already-released
+        # (is_unbound) device — that's a recovery operation and an
+        # extra click adds friction without safety value. Both the
+        # inline Unbind button in the status dialog AND the Tools →
+        # Unbind menu path land here, so this single confirmation
+        # covers both surfaces. Unbinding from vfio-pci RESTORES the
+        # kernel driver (it doesn't drop networking like bind does),
+        # but it WILL kill any DPDK traffic stream currently using
+        # this interface, which is the operator's real concern.
+        if not is_unbound:
+            display_name = interface_name or pci or "this interface"
+            confirm = QMessageBox.question(
+                self,
+                "Confirm DPDK unbind",
+                f"Unbind <b>{display_name}</b> from vfio-pci on "
+                f"<code>{server_address}</code>?\n\n"
+                f"This will:\n"
+                f"  • Stop any DPDK traffic running on this interface\n"
+                f"  • Restore the kernel network driver "
+                f"({kernel_driver or '(auto)'})\n\n"
+                f"Continue?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if confirm != QMessageBox.Yes:
+                return
 
         progress = self._make_dpdk_progress(
             "Unbinding from DPDK",

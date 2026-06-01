@@ -2,6 +2,75 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.97] - 2026-06-01
+
+**DPDK Status dialog — unbind safety + UX polish.** The v0.2.97
+audit found one real safety gap and three smaller UX items on the
+DPDK Status surface. Worth noting up front: the audit's initial
+"unbind = host lockout" framing was overblown — unbinding from
+vfio-pci RESTORES kernel networking; the real risk is killing
+any in-flight DPDK traffic stream that was using the interface.
+Still worth a confirmation prompt.
+
+### What changed
+- **Unbind confirmation gate**
+  (`traffic_client/dpdk_menu_actions.py:_perform_unbind`).
+  Pre-v0.2.97 both the inline Unbind button in the Status dialog
+  AND the Tools → Unbind menu fired straight at the worker —
+  operator could one-click their way into stopping a running
+  DPDK stream. New `QMessageBox.question` gate, scoped to the
+  single entry point so both surfaces are covered. Skipped when
+  `is_unbound` is True (the device is already released and the
+  operation is just a recovery-restore of the kernel driver — no
+  in-flight traffic to disrupt; an extra prompt would be friction).
+- **Inline Unbind button tooltip**
+  (`traffic_client/dpdk_menu_actions.py:show_dpdk_status`). The
+  red-border button now carries an explicit tooltip naming the
+  consequence ("any DPDK traffic currently running on this
+  interface will stop") so the operator sees it before the
+  confirmation dialog even fires.
+- **Empty-interfaces state message**
+  (`traffic_client/dpdk_menu_actions.py:_format_dpdk_status`).
+  When the server returns zero interfaces (typically because
+  `dpdk-devbind.py` is missing or returned nothing) the dialog
+  used to render a silent empty section that operators
+  interpreted as "all good." Now emits a user-facing hint
+  pointing at the tooling-failure hypothesis.
+- **Ctrl+Return shortcut to dismiss** the Status dialog
+  (`traffic_client/dpdk_menu_actions.py:show_dpdk_status`).
+  Matches the rest of the app's modal convention; saves a mouse
+  trip when the operator is in repeat-check mode chasing a stuck
+  bind.
+
+### What didn't change (audit findings verified-shipped)
+The audit cross-checked v0.2.76 / v0.2.77 wiring and confirmed
+none of it has regressed:
+- "Bind anyway" override path (server returns 409 → client offers
+  the explicit override button) — present, line 1486-1509.
+- Hugepage allocation feedback toast — present.
+- Async QThread keepalive pin — present.
+- Periodic refresh + last-refresh-time chip — present.
+- Per-core TX stats plumbing — present on the resolver side; the
+  audit's claim that the Status dialog should display per-queue
+  PPS is the wrong architectural choice (those stats belong in
+  the Stream Stats table, where they already live).
+
+### Tests
+- **`tests/test_dpdk_unbind_safety.py`** — 6 source-grep pins:
+  - `_perform_unbind` carries a `QMessageBox.question` before
+    the worker dispatch.
+  - Confirmation is gated on `if not is_unbound:` so recovery
+    operations skip the prompt.
+  - Confirmation cancellation hits a `return` (worker doesn't
+    fire on No).
+  - Inline Unbind button has a `setToolTip` call.
+  - `_format_dpdk_status` has an `else` branch on the empty-
+    interfaces case with the "No interfaces detected" hint.
+  - `show_dpdk_status` wires a `QShortcut` for `Qt.Key_Return`.
+
+### Test count
+723 → 729 (+6).
+
 ## [0.2.96] - 2026-06-01
 
 **Stream dialog — input safety + UX consistency (5 audit items
