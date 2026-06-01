@@ -2,6 +2,88 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.3.5] - 2026-06-01
+
+**Per-stream latency histograms.** Second real correctness fix
+from the v0.3.4 flow-tracking audit. Pre-v0.3.5 the
+`LatencySampler` accumulated all NLAT-tagged packets into ONE
+histogram per RX interface — two concurrent streams on the same
+iface produced one mixed histogram, and the GUI joined that
+mixed blob onto every stream sharing the iface. Operator saw a
+single set of p50/p95/p99 numbers that wasn't meaningful for
+either stream individually.
+
+### What changed
+- **`utils/latency_sampler.py:_SIG_EXTRACT_RE`** — new module-
+  level regex extracts the stream_id from the
+  `[<stream_id>(/q<queue>)?#<seq>]` signature the v0.3.4
+  matcher already standardised. Tolerates both Scapy and DPDK
+  packet formats.
+- **`utils/latency_sampler.py:LatencySampler`** — gained
+  `_per_stream_stats: Dict[str, LatencyStats]` + a
+  `threading.Lock` protecting dict iteration. `_on_packet`
+  now searches the post-NLAT-header payload for the signature
+  and, when found, also adds the sample to a per-stream
+  histogram. The aggregate `stats_obj` continues to be
+  updated unconditionally, so backward-compatible callers
+  using `.stats()` see the same numbers as pre-v0.3.5.
+- **`utils/latency_sampler.py:stats_by_stream`** — new method
+  returns `{stream_id: snapshot}` for every stream the sampler
+  has decoded signature + NLAT for in the recent window.
+- **`run_tgen_server.py:latency_stats` endpoint** — response
+  body now carries a `streams: {stream_id: {...}}` field
+  alongside the legacy aggregate fields. Older clients ignore
+  it; newer clients prefer per-stream when present.
+- **`traffic_client/statistics_section.py`** — per-stream
+  lookup added to the latency join. For each stream row,
+  prefer `iface_blob["streams"][stream_id]` when the server
+  returned one; fall back to the iface aggregate otherwise.
+  Pre-v0.3.5 GUI behaviour preserved when the server is older
+  (no `streams` field) OR when `flow_tracking=off` (no
+  signature → no per-stream bucket).
+
+### When this kicks in
+The per-stream path requires BOTH:
+- `capture_latency=True` (NLAT header in TX packets)
+- `flow_tracking=True` (signature in TX packets)
+
+This was already a documented prerequisite — pre-v0.3.5 the
+combination just silently produced a per-iface mixed
+histogram. Operators with only one of the flags on see the
+same behaviour as before.
+
+### Tests
+- **`tests/test_latency_per_stream.py`** — 13 pins:
+  - Extractor regex captures stream_id for Scapy (`[sid#seq]`)
+    and DPDK (`[sid/q<n>#seq]`) formats.
+  - Extractor doesn't match unsigned packets (capture_latency-
+    only mode stays clean).
+  - Extractor rejects malformed `/q` segments.
+  - `_on_packet` populates per-stream buckets when signature
+    is present, with correct sample counts.
+  - Aggregate `.stats()` still counts all samples (backward
+    compat).
+  - Unsigned packet lands in aggregate but no per-stream
+    bucket.
+  - Two streams' samples on same sampler end up in two
+    separate buckets — the actual bug fix.
+  - Threaded concurrent-insert stress: 6 workers × 50 samples
+    each + concurrent `stats_by_stream()` reads must not raise.
+  - `.stats()` signature unchanged — pin the legacy dict shape
+    so old GUIs don't break.
+
+### Test count
+789 → 802 (+13).
+
+### Status of the v0.3.4 audit follow-ups
+| Item | v0.3.5 |
+|---|---|
+| Per-stream latency histogram | **✅ shipped** |
+| Loss% null contract on idle streams | deferred |
+| Tuple-match fallback ignores per-stream dport | deferred |
+| Auto-relax 2s timeout masks early drops | deferred |
+| Out-of-order packet detection not surfaced | deferred |
+
 ## [0.3.4] - 2026-06-01
 
 **Flow-tracking: fix silent zero RX count on DPDK streams.**
@@ -221,12 +303,6 @@ so a future session knows they exist.
   but the operator has no indicator the stream was silent at
   first. Fix needs a "first signature-matched packet seen at"
   timestamp surfaced in the stats payload.
-- **Latency histogram is per-interface, not per-stream**
-  (`utils/latency_sampler.py:~106`). Two concurrent streams
-  on the same RX iface have mixed latency samples. The stats
-  endpoint returns one latency blob per interface. Fix needs
-  per-stream histogram + per-stream API response — bigger
-  refactor.
 - **Out-of-order packet detection is computed but never
   surfaced** (`multithreaded_traffic_gen.py:~475`). The
   sniffer can decode sequence numbers but no OOO counter

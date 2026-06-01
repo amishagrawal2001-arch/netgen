@@ -16615,10 +16615,26 @@ def latency_stats():
         }), 503
 
     stats = s.stats()
+    # v0.3.5: add per-stream latency buckets to the response. The
+    # aggregate (top-level fields) stays unchanged for backward
+    # compat — old GUIs continue to display interface-aggregate
+    # latency. New consumers can read `streams[<sid>]` to get the
+    # per-stream snapshot that pre-v0.3.5 was silently mixed into
+    # the aggregate when two streams shared an RX iface.
+    # `stats_by_stream` is best-effort: empty dict when no signature
+    # has been observed yet (capture_latency=on, flow_tracking=off).
+    streams_dict = {}
+    try:
+        streams_dict = s.stats_by_stream() or {}
+    except Exception:
+        # Defensive — never let the new field break the legacy
+        # response shape.
+        streams_dict = {}
     return jsonify({
         "ok": True,
         "iface": iface,
         "udp_port": udp_port,
+        "streams": streams_dict,
         **stats,
     })
 

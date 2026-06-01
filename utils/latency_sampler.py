@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import argparse
 import logging
+import re
 import struct
 import sys
 import threading
@@ -47,7 +48,7 @@ import time
 from collections import deque
 from dataclasses import dataclass, field
 from statistics import median
-from typing import Optional
+from typing import Dict, Optional
 
 LOG = logging.getLogger("latency_sampler")
 
@@ -55,6 +56,19 @@ LOG = logging.getLogger("latency_sampler")
 NLAT_MAGIC = 0x4e4c4154  # "NLAT"
 NLAT_HDR_LEN = 16
 NLAT_STRUCT = ">IIQ"     # magic, reserved, tx_ns
+
+# v0.3.5: per-stream attribution regex. The same signature the v0.3.4
+# RX sniffer matches against (Scapy: `[<sid>#<seq>]`, DPDK:
+# `[<sid>/q<queue>#<seq>]`) carries the stream-id we need to bucket
+# latency samples per stream. Pre-v0.3.5 the sampler accumulated all
+# NLAT-tagged packets into one histogram per-interface — two
+# concurrent streams on the same iface produced one mixed histogram
+# the operator couldn't separate.
+#
+# Capture group: the stream-id token between `[` and (`/q...#` or
+# bare `#`). Non-greedy because stream IDs can contain anything but
+# `[`, `]`, `/`, `#`, and whitespace.
+_SIG_EXTRACT_RE = re.compile(rb"\[([^/\[\]#\s]+)(?:/q\d+)?#")
 
 
 @dataclass
@@ -120,6 +134,15 @@ class LatencySampler:
         self.udp_port = udp_port  # None = all UDP
         self.stats_obj = LatencyStats()
         self.stats_obj._latencies = deque(maxlen=window_size)
+        # v0.3.5: per-stream histograms keyed by extracted stream_id.
+        # Populated lazily in `_on_packet` when the UDP payload past
+        # the NLAT header contains the `[<sid>(/q<queue>)?#<seq>]`
+        # signature. The aggregate `stats_obj` continues to be
+        # updated unconditionally so backward-compatible callers see
+        # the same numbers they did pre-v0.3.5.
+        self._per_stream_stats: Dict[str, LatencyStats] = {}
+        self._per_stream_lock = threading.Lock()
+        self._window_size = window_size
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
 
@@ -137,6 +160,39 @@ class LatencySampler:
 
     def stats(self) -> dict:
         return self.stats_obj.snapshot()
+
+    # v0.3.5: per-stream snapshot. Returns ``{stream_id: snapshot_dict}``
+    # for every stream the sampler has decoded NLAT + signature for in
+    # this iface's recent window. Callers that need the legacy
+    # aggregate keep using ``.stats()``; new callers should prefer
+    # this when the operator has flow_tracking AND capture_latency
+    # both enabled (the only mode where signatures + NLAT headers
+    # co-occur in the same packet).
+    def stats_by_stream(self) -> Dict[str, dict]:
+        # Snapshot the dict keys under the lock so a concurrent
+        # `_on_packet` insertion can't mutate the dict mid-iter.
+        # The individual `LatencyStats.snapshot()` calls are
+        # GIL-safe (sorted() reads the deque atomically per call).
+        with self._per_stream_lock:
+            keys = list(self._per_stream_stats.keys())
+        out: Dict[str, dict] = {}
+        for sid in keys:
+            ls = self._per_stream_stats.get(sid)
+            if ls is not None:
+                out[sid] = ls.snapshot()
+        return out
+
+    def _get_or_create_stream_stats(self, sid: str) -> LatencyStats:
+        """First sample for a given stream_id lazily allocates a
+        per-stream `LatencyStats` with the same window_size as the
+        aggregate."""
+        with self._per_stream_lock:
+            ls = self._per_stream_stats.get(sid)
+            if ls is None:
+                ls = LatencyStats()
+                ls._latencies = deque(maxlen=self._window_size)
+                self._per_stream_stats[sid] = ls
+            return ls
 
     # -------------------------------------------------------------- internals
 
@@ -167,6 +223,28 @@ class LatencySampler:
             self.stats_obj.samples_skipped += 1
             return
         self.stats_obj.add(latency_ns)
+
+        # v0.3.5: attribute the sample to its stream when the signature
+        # is present in the packet body past the NLAT header. Both
+        # features (capture_latency + flow_tracking) are independently
+        # toggled on the stream config; when both are on, the C-side
+        # tx_worker / Scapy TX path emits the signature immediately
+        # after the NLAT_HDR_LEN-byte header. Aggregate accumulation
+        # above stays unchanged — backward compat for callers using
+        # `.stats()` — and per-stream is additive via this dict.
+        # If the signature isn't found (capture_latency=on but
+        # flow_tracking=off), no per-stream bucket is touched and the
+        # `stats_by_stream()` call later returns nothing for this
+        # stream. That's the correct degradation: per-stream latency
+        # requires both flags.
+        m = _SIG_EXTRACT_RE.search(payload, NLAT_HDR_LEN)
+        if m is not None:
+            try:
+                sid = m.group(1).decode("ascii", errors="replace")
+            except Exception:
+                sid = ""
+            if sid:
+                self._get_or_create_stream_stats(sid).add(latency_ns)
 
     def _run(self):
         try:

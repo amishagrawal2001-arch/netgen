@@ -359,7 +359,31 @@ class StatisticsFetchWorker(QThread):
                         for s in stream_stats:
                             iface = s.get("interface")
                             if iface and iface in latency_by_iface:
-                                s["_latency"] = latency_by_iface[iface]
+                                iface_blob = latency_by_iface[iface]
+                                # v0.3.5: prefer the per-stream
+                                # snapshot when the server returns
+                                # one for this stream's ID. Pre-
+                                # v0.3.5 the server only returned an
+                                # iface-aggregate latency dict — two
+                                # streams on the same iface got the
+                                # SAME mixed-samples blob. Falls
+                                # back to the aggregate when:
+                                #   * server is older (no `streams`
+                                #     field in response)
+                                #   * no signature seen for this sid
+                                #     yet (flow_tracking=off or
+                                #     warmup window)
+                                streams_map = (
+                                    iface_blob.get("streams") or {}
+                                ) if isinstance(iface_blob, dict) else {}
+                                sid = (s.get("stream_id")
+                                       or s.get("id") or "")
+                                per_stream = (streams_map.get(sid)
+                                              if sid else None)
+                                if per_stream:
+                                    s["_latency"] = per_stream
+                                else:
+                                    s["_latency"] = iface_blob
                         self.stream_stats_fetched.emit(server, stream_stats)
                     else:
                         self.fetch_error.emit(server, f"HTTP {response.status_code}")
