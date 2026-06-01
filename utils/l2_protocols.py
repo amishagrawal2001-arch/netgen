@@ -126,6 +126,16 @@ def stop_session(session_id: str) -> bool:
         sess.thread.join(timeout=3.0)
     with sess.lock:
         sess.counters.stopped_at = time.time()
+    # v0.3.8: evict the entry from the registry. Pre-v0.3.8 the
+    # session stayed in `_SESSIONS` forever — `list_sessions()`
+    # would keep returning it as `running=False`, and on a long-
+    # running server with many start/stop cycles the dict grew
+    # without bound. The final counters are already returned in
+    # the /api/l2/<proto>/stop response body so the client has its
+    # post-mortem data; keeping the in-memory entry alive added
+    # nothing the operator could use.
+    with _REG_LOCK:
+        _SESSIONS.pop(session_id, None)
     return True
 
 

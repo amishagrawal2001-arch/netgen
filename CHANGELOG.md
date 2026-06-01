@@ -2,6 +2,77 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.3.8] - 2026-06-01
+
+**L2 Emulation audit close.** Two real findings from the L2
+Emulation tab audit shipped; one Tier-1 claim filtered as a
+false positive (with a regression pin guarding the
+verified-correct code from a future "cleanup").
+
+### What changed
+
+- **`_SESSIONS` no longer grows unbounded**
+  (`utils/l2_protocols.py:stop_session`). Pre-v0.3.8 the
+  registry dict only marked entries as stopped — they
+  persisted forever. On a long-running server with many
+  start/stop cycles the dict grew without bound. v0.3.8
+  evicts the entry via `_SESSIONS.pop(session_id, None)`
+  inside the registry lock after the worker thread joins.
+  The final counters are still returned in the
+  `/api/l2/<proto>/stop` response body so the client has its
+  post-mortem data; keeping the in-memory entry alive added
+  nothing the operator could use.
+
+- **L2 session-start no longer freezes the GUI for up to 15 s**
+  (`widgets/l2_emulation_tab.py:_on_start_clicked` + new
+  `_JsonPostWorker` + new `_on_start_failed` dispatcher).
+  Pre-v0.3.8 the start path called `requests.post(timeout=15)`
+  synchronously on the GUI thread — a slow / unreachable
+  server parked the entire client window. v0.3.8 dispatches
+  the POST via a new `_JsonPostWorker` QThread (mirrors the
+  existing `_JsonFetchWorker` shape — `finished_ok` +
+  `failed(msg, http_code)`). The pre-existing branching for
+  200 / 404 / 401-403 / generic now runs from the `failed`
+  signal in `_on_start_failed`. Reuses `utils.qthread_keepalive`
+  to dodge the v0.2.20–v0.2.25 SIGABRT class.
+
+### Filtered as false positive
+- **"BFD `struct.pack` format string typo"** — the audit
+  flagged `"!BBBBII III"` (with a space) as suspicious. Python
+  explicitly ignores whitespace in struct format strings;
+  the packed output is exactly 24 bytes (RFC 5880 §4.1).
+  Verified by computing the pack output. Two regression pins
+  added so a future "let me clean up that space" edit can't
+  silently break the wire format.
+
+### Tests
+- **`tests/test_l2_v0_3_8.py`** — 9 pins:
+  - `_SESSIONS` eviction on stop_session (the memory-leak fix).
+  - Unknown session id stays a no-op + False return.
+  - `stop_all_sessions` drains the registry.
+  - `_JsonPostWorker` class exists + has the right signal
+    shape.
+  - `_on_start_clicked` uses the worker (no inline
+    `requests.post`) + the keepalive pin.
+  - `_on_start_failed` dispatcher method exists.
+  - Dispatcher branches by http_code (404, 401/403,
+    `_enter_unsupported_mode`).
+  - BFD `struct.pack` output is exactly 24 bytes.
+  - Source format-string pin guards against accidental
+    "cleanup".
+
+### Test count
+813 → 822 (+9).
+
+### Status of L2-audit follow-ups
+| Item | v0.3.8 |
+|---|---|
+| `_SESSIONS` memory leak | **✅ shipped** |
+| 15s GUI block on Start | **✅ shipped** |
+| BFD struct.pack "typo" | filtered — false positive (regression pinned) |
+| LACP port priority tooltip | deferred (polish) |
+| Session table default sort | deferred (polish) |
+
 ## [0.3.7] - 2026-06-01
 
 **Three small polish fixes.** Two are deferred items from the

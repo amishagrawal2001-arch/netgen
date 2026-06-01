@@ -132,6 +132,63 @@ class _JsonFetchWorker(QThread):
             self.failed.emit(f"bad JSON: {exc}", r.status_code)
 
 
+class _JsonPostWorker(QThread):
+    """v0.3.8: async /api/l2/<proto>/start so the GUI thread isn't
+    parked for up to 15 s while the server processes the request.
+
+    Pre-v0.3.8 the start path called `requests.post(timeout=15)`
+    synchronously after the dialog accepted — every Start click
+    froze the entire client window for up to the full timeout if
+    the server was slow or unreachable. The audit (TX/RX flow
+    tracking + L2 surface, June 2026) flagged it as a Tier 1 GUI
+    block.
+
+    Emits the same (finished_ok, failed) pair `_JsonFetchWorker`
+    uses so the consumer can branch on http_code (200 success,
+    404 server-too-old, 401/403 auth, anything else generic).
+    The response body is passed through on failure so the dialog
+    can surface the server's actual error message instead of a
+    generic "HTTP 500" — matters for L2 start failures where the
+    server's validator carries the specific reason ("invalid MAC",
+    "VLAN out of range", etc.)."""
+
+    finished_ok = pyqtSignal(object, int)
+    failed = pyqtSignal(str, int)   # body_or_msg, http_code (0 if no response)
+
+    def __init__(self, url: str, json_body=None, timeout_s: float = 15.0):
+        super().__init__()
+        self._url = url
+        self._json = json_body if json_body is not None else {}
+        self._timeout = timeout_s
+
+    def run(self):
+        token = os.environ.get("NETGEN_AUTH_TOKEN", "").strip()
+        headers = {"Authorization": f"Bearer {token}"} if token else {}
+        try:
+            r = requests.post(self._url, json=self._json,
+                              headers=headers, timeout=self._timeout)
+        except Exception as exc:
+            self.failed.emit(f"{type(exc).__name__}: {exc}", 0)
+            return
+        if r.status_code != 200:
+            # Try to pull the server's structured error message;
+            # fall back to a truncated text body so we don't dump
+            # Flask's HTML 404 page in a QMessageBox.
+            err = ""
+            try:
+                err = r.json().get("error") or ""
+            except Exception:
+                pass
+            if not err:
+                err = (r.text or "")[:200]
+            self.failed.emit(err or f"HTTP {r.status_code}", r.status_code)
+            return
+        try:
+            self.finished_ok.emit(r.json() if r.text else {}, r.status_code)
+        except Exception as exc:
+            self.failed.emit(f"bad JSON: {exc}", r.status_code)
+
+
 # ====================================================================
 # Per-protocol config dialog
 # ====================================================================
@@ -1634,51 +1691,65 @@ class L2EmulationTab(QWidget):
         proto = payload["protocol"]
         body = payload["body"]
 
+        # v0.3.8: dispatch the start POST on a worker thread so the
+        # GUI doesn't freeze for up to 15 s while the server processes
+        # the request. Pre-v0.3.8 a slow / unreachable server parked
+        # the entire client window — clicking Start with the
+        # server hung gave you nothing to do except wait or kill
+        # the client. Branching logic for 200 / 404 / 401-403 / other
+        # is preserved, just dispatched off the success/failure
+        # signals instead of run inline.
+        worker = _JsonPostWorker(
+            f"{url}/api/l2/{proto}/start",
+            json_body=body, timeout_s=15.0,
+        )
+        # Reuse the same keepalive pin as the refresh worker so the
+        # GC can't free the QThread mid-run (the v0.2.20-v0.2.25
+        # SIGABRT class).
         try:
-            r = requests.post(
-                f"{url}/api/l2/{proto}/start",
-                json=body, headers=self._auth_headers(), timeout=15,
-            )
-        except Exception as exc:
-            QMessageBox.warning(
-                self, "Start failed", f"Request failed: {exc}"
-            )
-            return
+            from utils.qthread_keepalive import keep
+            keep(worker)
+        except Exception:
+            pass
+        worker.finished_ok.connect(
+            lambda _payload, _code: QTimer.singleShot(150, self.refresh)
+        )
+        worker.failed.connect(
+            lambda msg, code, _proto=proto: self._on_start_failed(msg, code, _proto)
+        )
+        worker.start()
 
-        if r.status_code == 200:
-            QTimer.singleShot(150, self.refresh)
-            return
-
-        # Non-200 — categorise the same way the refresh path does so
-        # the operator doesn't see Flask's default 404 HTML page in a
-        # QMessageBox.
-        if r.status_code == 404:
-            # Server doesn't have /api/l2/* — also flip the tab into
-            # unsupported mode so subsequent clicks are intercepted.
-            msg = (
+    def _on_start_failed(self, msg: str, http_code: int, proto: str) -> None:
+        """v0.3.8: dispatcher for the async start POST's failed
+        signal. Preserves the pre-v0.3.8 branching (404 → server
+        too old, 401/403 → auth, else → generic) but now runs from
+        the worker callback instead of inline so the GUI stayed
+        responsive while the POST was in flight."""
+        if http_code == 404:
+            full = (
                 "The server doesn't expose /api/l2/* — upgrade to "
                 "netgen-server ≥ 0.2.4 to use L2 emulation."
             )
-            self._enter_unsupported_mode(msg)
-            QMessageBox.information(self, "L2 emulation unavailable", msg)
+            self._enter_unsupported_mode(full)
+            QMessageBox.information(self, "L2 emulation unavailable", full)
             return
-        if r.status_code in (401, 403):
+        if http_code in (401, 403):
             QMessageBox.warning(
                 self, "Authentication failed",
-                f"Server returned {r.status_code}. Set "
+                f"Server returned {http_code}. Set "
                 f"NETGEN_AUTH_TOKEN with operator-or-admin role and "
                 f"restart the client."
             )
             return
-        # Try to surface the server's JSON error, else just the code.
-        # Drop the Flask HTML body — never shown to the operator.
-        try:
-            err = r.json().get("error") or r.text[:200]
-        except Exception:
-            err = r.text[:200] if r.text else f"(no body)"
+        if http_code == 0:
+            # Connection-level failure (timeout, ECONNREFUSED, etc.).
+            QMessageBox.warning(
+                self, "Start failed", f"Request failed: {msg}",
+            )
+            return
         QMessageBox.warning(
             self, "Start failed",
-            f"HTTP {r.status_code}: {err}"
+            f"HTTP {http_code}: {msg}",
         )
 
     @staticmethod
