@@ -2,6 +2,41 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.98] - 2026-06-01
+
+**CI: ship macOS .dmg on every release.** The `.0`-only gate
+added in `3190ef9` (Apr 2026) was a cost-control measure while
+the fork was private — macOS runners are 10× the Linux per-minute
+rate, and every patch release was burning ~$1.20 in macOS time
+alone. After the public-flip the original cost argument no longer
+applies: standard-runner compute is free and unlimited on public
+GitHub repos for Linux, Windows, AND macOS. Mac operators
+shouldn't have to wait for the next `.0` minor bump to get the
+latest installer when the build is free.
+
+### What changed
+- **`.github/workflows/release.yml`** — removed the
+  `if: endsWith(github.ref, '.0') || workflow_dispatch` gate on
+  the `build-macos` job. Every tag push now builds + publishes
+  a .dmg alongside the wheel, .exe, and .AppImage.
+- **`.github/workflows/release.yml`** — updated the comment on
+  the `release:` job's `needs.build-macos.result == 'skipped'`
+  allowance to explain that it's now a defensive holdover (in
+  case the gate ever comes back) rather than the expected path.
+
+### Trade-off
+- **Wall-time**: release end-to-end goes from ~3 min to ~5 min
+  (macOS becomes the slowest job in the parallel set, ~10-15 min
+  on a cold runner). Cancellation-on-newer-push concurrency group
+  still in place so a burst of patch tags only races the last one.
+- **Cost**: $0 on the public fork. Would be ~$1.20/release if the
+  fork ever goes private — restoring the gate is a one-line edit.
+
+### Verification
+This release (v0.2.98) is the first patch tag in this stream to
+ship .dmg. If macOS .dmg lands in the Releases page artifacts
+alongside the other 3, the workflow change is verified end-to-end.
+
 ## [0.2.97] - 2026-06-01
 
 **DPDK Status dialog — unbind safety + UX polish.** The v0.2.97
