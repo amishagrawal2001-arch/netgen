@@ -2,6 +2,57 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.3.3] - 2026-06-01
+
+**CI: opt every release job into Node.js 24.** GitHub deprecated
+Node.js 20 on 19 Sep 2025 and started forcing Node.js 24 on
+16 Jun 2026 for JavaScript actions. Every release run since v0.2.94
+has been logging deprecation warnings:
+
+> ⚠ Node.js 20 actions are deprecated. The following actions are
+> running on Node.js 20 and may not work as expected:
+> actions/checkout@v4, actions/setup-python@v5,
+> actions/upload-artifact@v4, actions/download-artifact@v4,
+> softprops/action-gh-release@v2.
+
+### What changed
+- `.github/workflows/release.yml` — added a workflow-level
+  `env: FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"` block. This
+  is the opt-in path GitHub explicitly documents in the
+  deprecation notice. It flips the runtime engine for every
+  JavaScript action in the workflow without needing per-action
+  major-version bumps.
+
+### Why not bump individual action versions?
+The alternative was upgrading each action to a Node-24-compatible
+major (e.g. `actions/checkout@v5`). That introduces API-shape
+risk per action (new defaults, removed options) and would have
+required individually verifying each release-pipeline asset still
+builds correctly. The env-var path is purely a runtime-engine
+selector — it doesn't change any action's API surface, so if it
+breaks anything, the surface area to debug is narrower.
+
+If a specific action turns out to be incompatible with Node 24,
+the fallback is per-action version bump for that single action.
+None of the pinned actions have had reported Node 24
+incompatibilities to date.
+
+### Tests
+None — purely a CI policy change. Verification: the next release
+run won't log the Node 20 deprecation warning, and all 4
+artifacts still publish cleanly.
+
+### What's deferred (from the v0.3.2 audit cycle close)
+- **C-side tx_worker audit** — agent flagged one "BLOCKER"
+  (uninitialised `pkts[]` array) which inspection confirmed as a
+  false positive: when `rte_pktmbuf_alloc_bulk` fails, the
+  loop `continue;`s and skips the free path entirely. The free
+  loop only walks indices written by a successful alloc. No
+  fix shipped.
+- Other deferred items (async progress dialogs, sortable
+  protocol-table headers, last-error column, etc.) unchanged
+  from the v0.3.2 list.
+
 ## [0.3.2] - 2026-06-01
 
 **DPDK closing-pass.** All four items the v0.3.1 audit cycle

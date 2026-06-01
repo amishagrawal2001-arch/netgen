@@ -33,6 +33,24 @@ concurrency:
   group: release-${{ github.workflow }}
   cancel-in-progress: true
 
+# v0.3.3: opt every JavaScript action into Node.js 24 BEFORE the
+# 16 Sep 2026 forced cutover. GitHub deprecated Node 20 on
+# 19 Sep 2025; the per-run warning the workflow has been logging
+# since looks like this (one per action):
+#   ! Node.js 20 actions are deprecated. … Actions will be forced
+#     to run with Node.js 24 by default starting June 16th, 2026.
+# We're past June 16, 2026 (the warning continues until full
+# removal); flipping this env var now eliminates the warning AND
+# de-risks the September forced cutover. Cleaner than chasing per-
+# action major-version bumps (checkout@v4 → v5, setup-python@v5 →
+# v6, etc.) because the version bumps add API-shape risk while
+# this env var is purely a runtime-engine selector. If a specific
+# action breaks under Node 24, restore-via-version-bump is the
+# fallback — but to date none of our pinned actions have had
+# reported incompatibilities.
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
 jobs:
 
   # ───────────────────────────────────────────────────────────────────
