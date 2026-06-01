@@ -891,6 +891,45 @@ class InstallServerDialog(QDialog):
         btn_box.accepted.connect(self.accept)
         layout.addWidget(btn_box)
 
+        # v0.3.7: Ctrl+Return = run the active tab's primary action.
+        # Standard modal shortcut every other dialog in the app
+        # supports (Stream dialog v0.2.96, RFC 2544 v0.3.0, DPDK
+        # Status v0.2.97, Stats dock Pause-toggle, etc.). Without
+        # it operators have to click between fields and the button
+        # every time they tweak the URL or wheel path.
+        try:
+            from PyQt5.QtWidgets import QShortcut
+            from PyQt5.QtGui import QKeySequence
+            _go_sc = QShortcut(QKeySequence(Qt.CTRL + Qt.Key_Return), self)
+            _go_sc.setContext(Qt.WindowShortcut)
+            _go_sc.activated.connect(self._on_ctrl_return)
+        except Exception:
+            pass  # shortcut is convenience; never block dialog open
+
+    # v0.3.7: dispatch helper — the dialog has two tabs with
+    # different primary buttons. Ctrl+Return needs to fire whichever
+    # one is active. If the operator is mid-install (the busy flag
+    # has disabled both buttons), this is a no-op — same behaviour
+    # as clicking the disabled button itself.
+    def _on_ctrl_return(self):
+        try:
+            current = self.tabs.currentIndex()
+        except Exception:
+            return
+        if current == 0:
+            # Upgrade tab — prefer the HTTP path; the SSH manual
+            # path has its own button the operator can still click.
+            btn = getattr(self, "up_btn", None)
+        else:
+            # Fresh-install tab.
+            btn = (getattr(self, "fresh_install_btn", None)
+                   or getattr(self, "install_btn", None))
+        try:
+            if btn is not None and btn.isEnabled():
+                btn.click()
+        except Exception:
+            pass
+
     # -- Tab 1: HTTP upgrade -------------------------------------------------
 
     def _build_upgrade_tab(self, default_url: str, default_token: str) -> QWidget:
@@ -1187,6 +1226,28 @@ class InstallServerDialog(QDialog):
         )
         if path:
             line_edit.setText(path)
+            # v0.3.7: warn (don't block) when the chosen file isn't a
+            # wheel. The file dialog filter is set to *.whl but the
+            # "All files" option is reachable; operators have picked
+            # tarballs / source dirs by accident, then waited 5 minutes
+            # for the upload to finish before pip rejected it
+            # downstream with a less-friendly "not a valid wheel"
+            # error. Surface it now while the path is still on
+            # screen.
+            try:
+                import os as _os
+                if not path.lower().endswith(".whl"):
+                    QMessageBox.warning(
+                        self,
+                        "Not a .whl file",
+                        f"The selected file doesn't have a .whl extension:\n\n"
+                        f"  {_os.path.basename(path)}\n\n"
+                        "pip will reject it during install. Pick the wheel "
+                        "produced by `python -m build --wheel` (or the one "
+                        "attached to a GitHub release)."
+                    )
+            except Exception:
+                pass
 
     def _set_upgrade_busy(self, busy: bool) -> None:
         """Enable/disable BOTH upgrade buttons together so a run can't be

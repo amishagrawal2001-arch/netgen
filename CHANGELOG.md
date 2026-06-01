@@ -2,6 +2,70 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.3.7] - 2026-06-01
+
+**Three small polish fixes.** Two are deferred items from the
+v0.3.4 flow-tracking audit; one is a deferred item from the
+install-dialog audit. All real, all small, all closing audit
+follow-ups so the deferred list shrinks.
+
+### What changed
+- **Loss% null contract on warmup-window streams**
+  (`traffic_client/statistics_section.py:~1857`). Pre-v0.3.7 a
+  newly-started stream with `tx_count == 0` rendered as "0.00%"
+  in **green** — a false-positive "perfect zero loss" reading
+  when actually no packets had been TX'd at all. Compute path
+  now stores `loss_pct = None`; renderer treats None as the
+  muted "—" placeholder (same as the "flow tracking off" case).
+- **`.whl` extension warning on the install dialog's wheel
+  picker** (`widgets/install_server_dialog.py:_browse_wheel`).
+  The "All files" option in the file dialog let operators pick
+  tarballs / arbitrary binaries; they'd wait 5 min for the
+  upload, then pip would reject downstream. New post-pick
+  `QMessageBox.warning` if the path doesn't end in `.whl`
+  (case-insensitive). Warns rather than blocks — the operator
+  may have a legitimate edge case.
+- **Ctrl+Return shortcut on the install/upgrade dialog**
+  (`widgets/install_server_dialog.py:_on_ctrl_return`). Matches
+  the standard pattern from Stream dialog v0.2.96, RFC 2544
+  v0.3.0, DPDK Status v0.2.97. Dispatcher checks
+  `tabs.currentIndex()` and clicks the active tab's primary
+  button (Upgrade tab → `up_btn`; Fresh-install tab →
+  install button). No-ops if the button is disabled (mid-run).
+
+### What didn't change
+- **Test Connection button on the Upgrade tab** — the audit
+  flagged this as a Tier 2 PAIN. Skipped in v0.3.7 because
+  porting the Fresh-Install `_start_ssh_test` machinery
+  (probes, status panel, button-state management) is closer to
+  a 100-line port than a 30-line polish. Stays deferred.
+
+### Tests
+- **`tests/test_v0_3_7_polish.py`** — 7 pins:
+  - Loss%-compute block stores `None` when `tx_count == 0`.
+  - Renderer carries the `elif loss_pct is None: → "—"` branch.
+  - Loss-formula backward compat (`(tx-rx)/tx*100` still
+    present for the positive case).
+  - `_browse_wheel` has the .whl check + QMessageBox warning.
+  - Extension check is case-insensitive (`.lower()` + `endswith`).
+  - Ctrl+Return shortcut wired in `InstallServerDialog.__init__`.
+  - `_on_ctrl_return` dispatcher exists, branches by
+    `currentIndex()`, and respects `isEnabled()`.
+
+### Test count
+806 → 813 (+7).
+
+### Deferred follow-ups status
+| Item | Status |
+|---|---|
+| Loss% null contract on idle streams | **✅ shipped** |
+| Tuple-match fallback dport narrowing | still deferred |
+| Auto-relax 2s timeout drop indicator | still deferred |
+| OOO packet detection surfacing | still deferred |
+| Install: wheel extension check | **✅ shipped** |
+| Install: Ctrl+Return shortcut | **✅ shipped** |
+| Install: Test Connection on Upgrade tab | still deferred |
+
 ## [0.3.6] - 2026-06-01
 
 **Fix: "Read More: DPDK Traffic Blast Workflow" button was
@@ -324,11 +388,6 @@ Items still on the deferred list — not blocking, but documented
 so a future session knows they exist.
 
 ### From the v0.3.4 flow-tracking audit
-- **Loss% returns `0.0` on idle streams** instead of `null` /
-  `n/a` (`run_tgen_server.py` stats endpoint). The GUI handles
-  it correctly (`if tx > 0` guard renders `—`), but API
-  callers see an ambiguous numeric zero. Better contract: omit
-  the field, or return null, when `tx_count == 0`.
 - **RX matching falls back to L2/L3/L4 tuple when signature
   missed** (`multithreaded_traffic_gen.py:_tuple_match`). Two
   streams on the same iface with identical 5-tuple but

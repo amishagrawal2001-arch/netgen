@@ -1853,14 +1853,24 @@ class TrafficGenClientStatisticsSection():
             stream_id = stream.get("stream_id", "")
             tg_id = stream.get("_tg_id")  # Get TG ID from stream (added during collection)
             
-            # Calculate loss percentage
+            # Calculate loss percentage.
+            # v0.3.7: when tx_count == 0 (warmup window or just-started
+            # stream that hasn't TX'd a packet yet) report None instead
+            # of 0.0. Pre-v0.3.7 the 0.0 rendered as "0.00%" in green,
+            # which read as "perfect zero loss" — exactly the opposite
+            # of what's true (no packets sent yet, can't measure).
+            # The renderer at line ~2108 now treats None as the muted
+            # "—" placeholder so the operator sees "not yet measured"
+            # instead of false-positive green.
             if isinstance(tx_count, int) and tx_count > 0:
                 if isinstance(rx_count, int):
-                    loss_pct = ((tx_count - rx_count) / tx_count * 100) if tx_count > 0 else 0.0
+                    loss_pct = ((tx_count - rx_count) / tx_count * 100)
                 else:
-                    loss_pct = 100.0 if flow_tracking else 0.0
+                    loss_pct = 100.0 if flow_tracking else None
             else:
-                loss_pct = 0.0
+                # tx_count is 0 (or non-int) — no basis for a loss
+                # measurement. Surface that honestly as None.
+                loss_pct = None
             
             # Format interface name with TG ID if available
             if tg_id is not None:
@@ -2105,12 +2115,19 @@ class TrafficGenClientStatisticsSection():
             # way to know rx_count, so reporting "100% loss" on those
             # (which the previous code did, in red) was misleading. Show
             # a muted "—" instead.
+            # v0.3.7: also treat loss_pct=None as "not yet measured" so
+            # a running stream in its warmup window (tx_count=0) shows
+            # "—" instead of a false-positive "0.00% green" reading.
             loss_pct = stream["loss_pct"]
             stream_running = str(stream.get("status", "")).lower() == "running"
             if not stream["flow_tracking"]:
                 loss_text = "—"
                 loss_color = QColor("#9ca3af")  # muted gray
             elif not stream_running and stream["tx_count"] == 0:
+                loss_text = "—"
+                loss_color = QColor("#9ca3af")
+            elif loss_pct is None:
+                # v0.3.7: tx_count is 0 (warmup) — no basis to compute.
                 loss_text = "—"
                 loss_color = QColor("#9ca3af")
             else:
