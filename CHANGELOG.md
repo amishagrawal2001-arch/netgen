@@ -2,6 +2,97 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.3.0] - 2026-06-01
+
+**Minor bump to mark the audit cycle close.** v0.2.93 → v0.2.99
+shipped 7 consecutive patches that closed UX/safety audits across
+5 major surfaces (Stateful TCP, Devices tab, Stream dialog, DPDK
+Status, Statistics dock) + reclaimed 1.17 GB of repo bloat + made
+the fork's CI free forever. v0.3.0 closes the cycle with the last
+unaudited customer-facing surface: the **RFC 2544 wizard**, which
+produces the HTML reports customers actually read.
+
+### What changed
+- **Close-while-test-running orphan fix**
+  (`widgets/rfc2544_dialog.py:closeEvent / reject / accept`).
+  Pre-v0.3.0 the dialog had no override on any of the three
+  close paths (X button, Esc, Close button). Hitting any of them
+  while a test was running silently:
+  1. Orphaned the server-side test (it kept running to
+     completion with no client visibility, polluting the line).
+  2. Leaked the QTimer (it kept polling indefinitely until GC).
+  New unified gate: if `_is_test_running()` is True, prompt to
+  cancel; on Yes, fire `/api/rfc2544/stop` AND tear down the
+  poll timer. Single `_stop_test_and_cleanup_timer` helper so
+  the three overrides can't drift.
+- **PASS / FAIL per-frame column in the HTML report**
+  (`widgets/rfc2544_dialog.py:build_rfc2544_html_report`). The
+  results table now leads with a coloured verdict badge: PASS
+  (green) when `max_no_drop_pps > 0` (the RFC 2544 binary search
+  found a passing rate within `target_loss_pct`), FAIL (red)
+  when zero (no rate stayed within the loss target). Plus a
+  summary line — `N/M frame sizes passed (target loss ≤ X%)` —
+  so customers don't have to interpret the loss column to read
+  the verdict.
+- **Live MAC + IPv4 validators**
+  (`widgets/rfc2544_dialog.py:_wire_live_validators`). Reuses
+  the v0.2.96 `utils/stream_input.py` pure-function validators.
+  Red border + tooltip on bad input as the operator types.
+  `_on_start` also re-runs the same checks as a backstop so an
+  operator who ignores the red border still gets blocked before
+  the request hits the server.
+- **Ctrl+Return shortcut to Start Test** on the dialog. Matches
+  the rest of the app's modal convention.
+
+### What didn't change
+- The server-side `_rfc2544_run_step` worker, throughput math
+  (`(fs + 20) * 8 / 1e9` — RFC 2544 Appendix B preamble + IFG),
+  or the binary search itself. The audit cross-checked the math
+  and found it correct.
+- The v0.2.74 timestamped export filename — present, no
+  regression.
+
+### Audit cycle summary (v0.2.93 → v0.3.0)
+| Tag | Surface | Tests |
+|---|---|---|
+| v0.2.93 | Re-shipped after public-flip | — |
+| v0.2.94 | Stateful TCP — 3 PAIN fixes | +5 |
+| v0.2.95 | Devices-tab POLISH (5 sub-tabs + OSPF validators) | +6 |
+| v0.2.96 | Stream dialog input safety + Ctrl+Return | +57 |
+| v0.2.97 | DPDK unbind safety + UX polish | +6 |
+| v0.2.98 | CI: macOS .dmg on every tag (public-fork win) | — |
+| v0.2.99 | Stats dock sort + filter/pause/last-refresh | +9 |
+| **v0.3.0** | **RFC 2544 wizard close-gate + PASS/FAIL + validators** | **+15** |
+
+**Cumulative:** +98 new tests, ~+2400 lines of net change,
+roughly 6-8 audit findings filtered as false positives per
+cycle (always verified against actual code before scoping).
+
+### Tests
+- **`tests/test_rfc2544_v0_3_0.py`** — 15 tests:
+  - 3 parametrised pins for the closeEvent / reject / accept
+    overrides (each must check `_is_test_running` AND call
+    `_stop_test_and_cleanup_timer`).
+  - 1 pin for the cleanup helper itself (stops timer + posts
+    `/api/rfc2544/stop`).
+  - 1 pin for `_is_test_running` using `isActive()`.
+  - 4 pins for live-validator wiring + import + backstop.
+  - 1 pin for Ctrl+Return.
+  - 5 behavioural tests for the HTML builder PASS/FAIL +
+    summary line (mixed pass/fail, all-pass, all-fail, target-
+    loss in summary, empty rows safe).
+
+### Test count
+738 → 753 (+15).
+
+### What's deferred
+- "Resume from saved test config" (`QSettings` persistence) —
+  feature, not regression; not blocking.
+- Result table sortability in the GUI — minor UX, not driving
+  customer pain.
+- Server-side frame_size range validation — not blocking (the
+  defaults clamp correctly); separate scope.
+
 ## [0.2.99] - 2026-06-01
 
 **Statistics dock — sort-state preservation + 3 PAIN polish items.**

@@ -18,12 +18,21 @@ from typing import Optional
 
 import requests
 from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QColor, QFont
+from PyQt5.QtGui import QColor, QFont, QKeySequence
 from PyQt5.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QLineEdit,
     QPushButton, QSpinBox, QDoubleSpinBox, QCheckBox, QTableWidget,
     QTableWidgetItem, QGroupBox, QMessageBox, QFileDialog, QHeaderView,
+    QShortcut,
 )
+
+# v0.3.0: reuse the v0.2.96 Stream-dialog pure-function validators
+# for the MAC + IPv4 fields. Live red-border feedback on textChanged
+# + a backstop check at _on_start time.
+from utils.stream_input import validate_mac, validate_ipv4
+
+_LIVE_OK_QSS  = ""  # Qt default — respects platform theme
+_LIVE_BAD_QSS = "QLineEdit { border: 1px solid #dc2626; background: #fef2f2; }"
 
 logger = logging.getLogger(__name__)
 
@@ -212,6 +221,152 @@ class Rfc2544Dialog(QDialog):
         close_row.addWidget(close_btn)
         root.addLayout(close_row)
 
+        # v0.3.0: live red-border feedback on MAC + IPv4 fields. The
+        # _on_start path already would have failed on garbage input,
+        # but the operator only saw the error AFTER clicking Start +
+        # the server rejected. textChanged wiring catches it as they
+        # type. Same pattern as v0.2.95 OSPF + v0.2.96 Stream-dialog.
+        self._wire_live_validators()
+
+        # v0.3.0: Ctrl+Return = Start Test. Standard modal shortcut
+        # missing from this dialog — operators have been clicking
+        # Start with the mouse on every run. Scoped to WindowShortcut
+        # so it doesn't fire while the dialog isn't active.
+        try:
+            _start_sc = QShortcut(
+                QKeySequence(Qt.CTRL + Qt.Key_Return), self,
+            )
+            _start_sc.setContext(Qt.WindowShortcut)
+            _start_sc.activated.connect(self._on_start_shortcut)
+        except Exception:
+            pass  # shortcut is convenience; never block dialog open
+
+    # ─────────────────────────────────────── v0.3.0 helpers
+    def _wire_live_validators(self):
+        """Wire textChanged on the MAC + IPv4 QLineEdits so the
+        operator sees red-border + tooltip the moment they type
+        garbage. Defensive: each field is independent so a missing
+        widget doesn't break the others."""
+        pairs = [
+            ("mac_src_field",  validate_mac),
+            ("mac_dst_field",  validate_mac),
+            ("ip_src_field",   validate_ipv4),
+            ("ip_dst_field",   validate_ipv4),
+        ]
+        for attr, validator in pairs:
+            line = getattr(self, attr, None)
+            if line is None:
+                continue
+            try:
+                def _on_change(_t="", _l=line, _v=validator):
+                    err = _v(_l.text())
+                    _l.setStyleSheet(_LIVE_BAD_QSS if err else _LIVE_OK_QSS)
+                    _l.setToolTip(err or "")
+                line.textChanged.connect(_on_change)
+                _on_change()
+            except Exception:
+                continue
+
+    def _on_start_shortcut(self):
+        """Ctrl+Return handler. Only fires Start if the button is
+        enabled — pre-test (no running test) AND no validator-red
+        fields. Avoids accidentally re-firing a Start while a test
+        is in flight."""
+        try:
+            if self.start_btn.isEnabled():
+                self._on_start()
+        except Exception:
+            pass
+
+    def _is_test_running(self) -> bool:
+        """True when the poll timer is alive and ticking — proxy for
+        "the server-side RFC 2544 test is in flight." Used by the
+        close-gate path to decide whether to prompt + send /stop."""
+        try:
+            return (self._poll_timer is not None
+                    and self._poll_timer.isActive())
+        except Exception:
+            return False
+
+    def _stop_test_and_cleanup_timer(self):
+        """Tear down everything that needs to die on dialog close:
+          * Send /api/rfc2544/stop so the server-side test doesn't
+            orphan and keep churning packets on the line.
+          * Stop the poll timer so it doesn't keep firing after the
+            dialog widget is destroyed (the GC eventually cleans it
+            up, but the explicit stop avoids leaked polling).
+        Safe to call when no test is running — both ops no-op."""
+        try:
+            if self._poll_timer is not None:
+                self._poll_timer.stop()
+                self._poll_timer = None
+        except Exception:
+            pass
+        if self.server_url:
+            try:
+                requests.post(
+                    f"{self.server_url}/api/rfc2544/stop", timeout=3,
+                )
+            except Exception as exc:
+                logger.debug(f"[RFC 2544] stop on close failed: {exc}")
+
+    def closeEvent(self, event):
+        """v0.3.0: gate window-close (X button + Esc + accept) behind
+        a confirmation when a test is running. Without this the
+        operator could orphan a long benchmark run server-side AND
+        leak the QTimer client-side. Both bad — RFC 2544 tests can
+        run for 7 frame sizes × duration_per_step seconds and the
+        operator usually wants the result they're waiting for."""
+        if self._is_test_running():
+            confirm = QMessageBox.question(
+                self,
+                "Test in progress",
+                "An RFC 2544 test is currently running.\n\n"
+                "Closing this dialog will cancel the test on the "
+                "server (no partial results saved).\n\n"
+                "Continue and cancel the test?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if confirm != QMessageBox.Yes:
+                event.ignore()
+                return
+        self._stop_test_and_cleanup_timer()
+        super().closeEvent(event)
+
+    def reject(self):
+        """Esc key path — route through the same gate as closeEvent
+        so the test-in-progress confirmation fires on Esc too."""
+        if self._is_test_running():
+            confirm = QMessageBox.question(
+                self,
+                "Test in progress",
+                "Cancel the running RFC 2544 test and close?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if confirm != QMessageBox.Yes:
+                return
+        self._stop_test_and_cleanup_timer()
+        super().reject()
+
+    def accept(self):
+        """Close button path — same gate as Esc. Pre-v0.3.0 the
+        Close button connected straight to QDialog.accept and
+        silently orphaned any running test."""
+        if self._is_test_running():
+            confirm = QMessageBox.question(
+                self,
+                "Test in progress",
+                "Cancel the running RFC 2544 test and close?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if confirm != QMessageBox.Yes:
+                return
+        self._stop_test_and_cleanup_timer()
+        super().accept()
+
     # ------------------------------------------------------------- Logic
 
     def _on_start(self):
@@ -219,6 +374,30 @@ class Rfc2544Dialog(QDialog):
             QMessageBox.warning(self, "No server",
                                 "No server URL — can't run the test.")
             return
+
+        # v0.3.0: pre-submit MAC + IPv4 validation. The live red-border
+        # validators already flag bad input as the operator types, but
+        # the operator can still click Start with the warning ignored.
+        # Backstop here so the server never sees garbage.
+        errors = []
+        for label, value, validator in [
+            ("Source MAC",       self.mac_src_field.text(), validate_mac),
+            ("Destination MAC",  self.mac_dst_field.text(), validate_mac),
+            ("Source IPv4",      self.ip_src_field.text(),  validate_ipv4),
+            ("Destination IPv4", self.ip_dst_field.text(),  validate_ipv4),
+        ]:
+            err = validator(value)
+            if err is not None:
+                errors.append(f"  • {label}: {err}")
+        if errors:
+            QMessageBox.warning(
+                self,
+                "Test parameters invalid",
+                "Fix the highlighted (red-border) fields and click "
+                "Start Test again:\n\n" + "\n".join(errors),
+            )
+            return
+
         params = {
             "tx_iface": self.tx_iface_field.text().strip(),
             "rx_iface": self.rx_iface_field.text().strip() or None,
@@ -535,8 +714,17 @@ def build_rfc2544_html_report(params: dict, rows: list,
     if not rows:
         pieces.append("<p style='color:#dc2626;'>(no results — test did not complete)</p>")
     else:
+        # v0.3.0: added PASS / FAIL badge column. The RFC 2544
+        # binary search reports max_no_drop_pps = 0 when no rate
+        # (down to the resolution_pps floor) stayed within
+        # target_loss_pct. Any non-zero pps means the search found
+        # a passing rate — that's our PASS/FAIL semantic, encoded as
+        # a coloured badge so customer reports lead with the verdict
+        # instead of forcing the reader to interpret the loss%
+        # column themselves.
         pieces.append("<table class='results'><thead><tr>"
                       "<th>Frame size (B)</th>"
+                      "<th>Result</th>"
                       "<th>Max no-drop pps</th>"
                       "<th>Throughput (Gbps)</th>"
                       "<th>% of line rate</th>"
@@ -550,9 +738,24 @@ def build_rfc2544_html_report(params: dict, rows: list,
             pct = entry.get("pct_of_line_rate")
             pps = entry.get("max_no_drop_pps") or 0
             gbps = entry.get("max_no_drop_gbps") or 0
+            # v0.3.0 PASS/FAIL — inline-styled span so the report
+            # stays self-contained (no external CSS class needed).
+            if int(pps) > 0:
+                verdict_html = (
+                    "<span style='display:inline-block; padding:2px 10px; "
+                    "border-radius:10px; background:#d1fae5; color:#065f46; "
+                    "font-weight:600; font-size:11px;'>PASS</span>"
+                )
+            else:
+                verdict_html = (
+                    "<span style='display:inline-block; padding:2px 10px; "
+                    "border-radius:10px; background:#fee2e2; color:#991b1b; "
+                    "font-weight:600; font-size:11px;'>FAIL</span>"
+                )
             pieces.append(
                 "<tr>"
                 f"<td>{esc(entry.get('frame_size'))}</td>"
+                f"<td style='text-align:center;'>{verdict_html}</td>"
                 f"<td>{int(pps):,}</td>"
                 f"<td>{gbps:.2f}</td>"
                 f"<td>{esc(pct)}%</td>"
@@ -562,6 +765,18 @@ def build_rfc2544_html_report(params: dict, rows: list,
                 f"<td>{fmt_lat(lat, 'p99_us')}</td>"
                 "</tr>")
         pieces.append("</tbody></table>")
+        # v0.3.0 summary line — count of PASS vs FAIL so the report
+        # leads with the headline figure even before the operator
+        # reads the table.
+        n_pass = sum(1 for e in rows if int(e.get("max_no_drop_pps") or 0) > 0)
+        n_total = len(rows)
+        pieces.append(
+            f"<p style='margin-top:6px; font-size:12px;'>"
+            f"<b>{n_pass}/{n_total}</b> frame size{'s' if n_total != 1 else ''} "
+            f"passed (target loss "
+            f"≤ {esc(params.get('target_loss_pct'))}%)."
+            f"</p>"
+        )
 
     # Footer summary
     if rows:
