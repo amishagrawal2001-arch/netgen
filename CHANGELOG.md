@@ -2,6 +2,78 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.99] - 2026-06-01
+
+**Statistics dock — sort-state preservation + 3 PAIN polish items.**
+The audit found one real correctness gap (sort indicator wiped on
+every 2 s refresh) and three operator-friction items. All four
+shipped together since the wiring lives in the same action-bar /
+update-method region.
+
+### What changed
+- **Sort indicator survives the 2-second refresh**
+  (`traffic_client/statistics_section.py:update_stream_statistics_table`).
+  The stream-statistics table has `setSortingEnabled(True)` at
+  construction (line 509) but the periodic rebuild was clearing it
+  via `setRowCount(0)` + per-row `setItem` — Qt was re-sorting on
+  EVERY setItem call, scrambling the operator's chosen column
+  order. Same `capture_sort_state` / `restore_sort_state` helper
+  the Devices tab adopted in v0.2.92.
+- **Filter box** above the table
+  (`statistics_section.py:setup_traffic_statistics_section`). New
+  `QLineEdit` with `Filter streams…` placeholder. Hides rows whose
+  Stream Name / Interface / Engine cells don't contain the
+  case-insensitive substring. Important for sessions with 50+
+  streams where scrolling-by-sort isn't enough.
+- **Pause-refresh toggle button**
+  (`statistics_section.py`). Checkable button: click → freezes
+  both stats tables (label flips to `Resume`, amber background).
+  The polling timers in main.py keep firing server-side (cheap),
+  but the GUI rebuild is gated on `_refresh_paused` at the top of
+  both `update_statistics_table` and `update_stream_statistics_table`
+  so the snapshot the operator screenshots stays stable.
+- **"Last refresh" chip** in the action bar
+  (`statistics_section.py:_update_last_refresh_chip`). Updated to
+  `Updated HH:MM:SS` at the end of every successful
+  (non-paused) rebuild. Lets the operator distinguish a stuck
+  reading from a slow stream — pre-v0.2.99 there was no way to
+  tell whether a flat-line was fresh or a poll wedge.
+
+### Verified-shipped (not changed; cross-checked by the audit)
+- v0.2.77 engine fallback badge ("Scapy ⚠ (was DPDK)") — present.
+- v0.2.78 SR-MPLS badge — the audit initially flagged it as
+  "missing" but searched the wrong file. It correctly lives in
+  `traffic_client/server_section.py:855` (Server-Section Details
+  cell), not the per-stream stats table. No regression.
+- QThread keepalive pin on `StatisticsFetchWorker` — present.
+- Live-chart `deque(maxlen=300)` bound — present (no memory leak).
+
+### Tests
+- **`tests/test_statistics_dock_polish.py`** — 9 source-grep +
+  pure-function pins:
+  - Sort-state helpers imported.
+  - `update_stream_statistics_table` orders capture → setRowCount(0)
+    → restore correctly.
+  - Both update paths bail when `_refresh_paused`.
+  - Pause-check precedes capture so we don't waste cycles on
+    paused frames.
+  - Action bar carries the three new widgets.
+  - Helper methods defined.
+  - Pause toggle flips between Pause / Resume strings.
+  - Filter walks columns (0, 1, 2) — pinned so a column reorder
+    must update the filter wiring too.
+  - Sort-state helpers round-trip without raising on garbage
+    input.
+
+### Deferred POLISH
+- Tunable refresh interval (currently hardcoded 2000ms in
+  `main.py:411,430`). Would need a Settings dialog surface; the
+  pause toggle covers the screenshot use case which was the main
+  driver. Bigger scope than this release.
+
+### Test count
+729 → 738 (+9).
+
 ## [0.2.98] - 2026-06-01
 
 **CI: ship macOS .dmg on every release.** The `.0`-only gate

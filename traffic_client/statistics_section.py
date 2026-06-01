@@ -1,12 +1,19 @@
 #statistics_section.py#
 
-from PyQt5.QtWidgets import QTableWidget, QTableWidgetItem, QVBoxLayout, QHBoxLayout, QPushButton, QGroupBox, QLabel, QTabWidget, QWidget, QSizePolicy
+from PyQt5.QtWidgets import QTableWidget, QTableWidgetItem, QVBoxLayout, QHBoxLayout, QPushButton, QGroupBox, QLabel, QTabWidget, QWidget, QSizePolicy, QLineEdit
 from PyQt5.QtGui import QColor, QFont, QPainter, QPen, QBrush, QFontMetrics
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QPointF
 import requests
 import logging
 import time as _time
 from collections import deque
+
+# v0.2.99: shared sort-state helper. The stream-stats table has
+# setSortingEnabled(True) but the periodic refresh rebuilds via
+# setRowCount(0) + per-row setItem, which Qt would re-sort on EVERY
+# setItem call (the same scramble v0.2.92 fixed for Devices tables).
+# Capture before the rebuild, restore after.
+from utils.table_sort_state import capture_sort_state, restore_sort_state
 
 logger = logging.getLogger(__name__)
 
@@ -661,6 +668,83 @@ class TrafficGenClientStatisticsSection():
         )
         self.export_stats_button.clicked.connect(self.export_statistics_csv)
         button_layout.addWidget(self.export_stats_button)
+
+        # ── v0.2.99: filter / pause / last-refresh trio ────────────────
+        # These three widgets close the audit gaps the Statistics-dock
+        # 4-tier pass surfaced: many-stream sessions need a substring
+        # filter; operators grabbing screenshots need to pause the 2 s
+        # refresh; the dock previously gave no clue whether a stuck
+        # reading was fresh or stale. All three live on the same row
+        # as Clear Stats / Export CSV so the action bar stays compact.
+
+        # State init — lazy, since this class is used as a mixin and has
+        # no __init__ of its own. Default values match the pre-v0.2.99
+        # behaviour (no filter, refresh active).
+        if not hasattr(self, "_stream_filter_needle"):
+            self._stream_filter_needle = ""
+        if not hasattr(self, "_refresh_paused"):
+            self._refresh_paused = False
+
+        # Filter box — hides rows in the stream-statistics table whose
+        # Stream Name / Interface / Engine cells don't contain the
+        # case-insensitive substring. Empty = show all. Doesn't touch
+        # the Interface Statistics tab (10 rows, no filter needed).
+        self.stream_filter_edit = QLineEdit()
+        self.stream_filter_edit.setPlaceholderText("Filter streams…")
+        self.stream_filter_edit.setFixedHeight(24)
+        self.stream_filter_edit.setFixedWidth(160)
+        self.stream_filter_edit.setToolTip(
+            "Hide rows in the Stream Statistics tab whose name / "
+            "interface / engine don't match. Case-insensitive substring."
+        )
+        self.stream_filter_edit.setStyleSheet(
+            "QLineEdit { border: 1px solid #cbd5e1; border-radius: 4px; "
+            "padding: 2px 6px; font-size: 11px; }"
+        )
+        self.stream_filter_edit.textChanged.connect(
+            self._on_stream_filter_changed
+        )
+        button_layout.addWidget(self.stream_filter_edit)
+
+        # Pause-refresh toggle — flips `self._refresh_paused`. The two
+        # update_* paths check the flag at entry and bail early if
+        # paused. The polling timers in main.py keep firing (cheap)
+        # but the GUI stops updating, which is what the operator
+        # actually wants when grabbing a screenshot.
+        self.pause_refresh_button = QPushButton("Pause")
+        self.pause_refresh_button.setCheckable(True)
+        self.pause_refresh_button.setFixedSize(72, 24)
+        self.pause_refresh_button.setCursor(Qt.PointingHandCursor)
+        self.pause_refresh_button.setToolTip(
+            "Pause / resume the 2-second statistics refresh.\n"
+            "Polling continues server-side; only the GUI freezes.\n"
+            "Useful for screenshotting a stable snapshot."
+        )
+        self.pause_refresh_button.setStyleSheet(
+            "QPushButton { border: 1px solid #cbd5e1; border-radius: 5px; "
+            "background-color: #ffffff; color: #374151; font-size: 11px; "
+            "font-weight: 500; padding: 0 8px; }"
+            "QPushButton:hover { background-color: #f1f5f9; }"
+            "QPushButton:checked { background-color: #fef3c7; "
+            "border-color: #f59e0b; color: #92400e; font-weight: 600; }"
+        )
+        self.pause_refresh_button.toggled.connect(
+            self._on_refresh_pause_toggled
+        )
+        button_layout.addWidget(self.pause_refresh_button)
+
+        # Last-refresh time chip — updated whenever
+        # update_stream_statistics_table finishes a non-paused rebuild.
+        # Format: "Updated HH:MM:SS". Empty until the first refresh.
+        self.last_refresh_label = QLabel("")
+        self.last_refresh_label.setStyleSheet(
+            "QLabel { color: #6b7280; font-size: 10px; padding: 0 6px; }"
+        )
+        self.last_refresh_label.setToolTip(
+            "Time of the most recent successful statistics fetch.\n"
+            "Stale (>5 s) text turns amber to flag a poll wedge."
+        )
+        button_layout.addWidget(self.last_refresh_label)
 
         layout.addLayout(button_layout, 0)  # stretch=0: never grows
 
@@ -1429,6 +1513,11 @@ class TrafficGenClientStatisticsSection():
 
     def update_statistics_table(self, statistics):
         """Update the traffic statistics table with per-interface and per-stream stats."""
+        # v0.2.99: pause-refresh gate. Same flag as the stream-stats
+        # path checks; freezes both tables together so a screenshot
+        # gets a consistent snapshot.
+        if getattr(self, "_refresh_paused", False):
+            return
         self.statistics_table.clearContents()
 
         def format_number(num):
@@ -1624,13 +1713,27 @@ class TrafficGenClientStatisticsSection():
         if not hasattr(self, "stream_statistics_table") or self.stream_statistics_table is None:
             logger.debug(f"[DEBUG STREAM STATS] stream_statistics_table not found or not initialized")
             return
-        
+
+        # v0.2.99: pause-refresh gate. The polling timers in main.py
+        # keep firing (cheap) but we skip the rebuild so the table
+        # contents stay frozen while the operator grabs a screenshot.
+        if getattr(self, "_refresh_paused", False):
+            return
+
         # Set column count first (13 columns: Engine between Interface and
         # TX Count; TX Bit Rate / RX Bit Rate inserted after the pps Rate
         # columns so the live throughput readout matches the Interface
         # Statistics tab without flipping tabs; Latency (μs) inserted after
         # RX Bit Rate, populated from /api/latency/stats per interface).
         try:
+            # v0.2.99: capture sort state + disable sorting BEFORE the
+            # rebuild. setSortingEnabled(True) makes Qt re-sort on every
+            # subsequent setItem call — that scramble is the bug v0.2.92
+            # fixed for the Devices tables; same fix applies here.
+            _sort_state = capture_sort_state(self.stream_statistics_table)
+            _was_sorting = self.stream_statistics_table.isSortingEnabled()
+            self.stream_statistics_table.setSortingEnabled(False)
+
             self.stream_statistics_table.setColumnCount(13)
             self.stream_statistics_table.setHorizontalHeaderLabels([
                 "Stream Name", "Interface", "Engine", "TX Count", "RX Count",
@@ -2019,9 +2122,98 @@ class TrafficGenClientStatisticsSection():
             flow_tracking_item = QTableWidgetItem("Yes" if stream["flow_tracking"] else "No")
             flow_tracking_item.setTextAlignment(Qt.AlignCenter)
             self.stream_statistics_table.setItem(row, 12, flow_tracking_item)
-        
+
         # Resize columns to fit content
         self.stream_statistics_table.resizeColumnsToContents()
+
+        # v0.2.99: restore sort indicator + re-apply filter + update
+        # the last-refresh chip. The capture happened at the top of
+        # this method; restore here so the operator's chosen sort
+        # column persists across the 2 s rebuild.
+        try:
+            self.stream_statistics_table.setSortingEnabled(_was_sorting)
+            restore_sort_state(self.stream_statistics_table, _sort_state)
+        except (NameError, Exception):
+            # _sort_state / _was_sorting weren't set (early-return
+            # path above). Nothing to restore.
+            pass
+        try:
+            self._apply_stream_filter()
+        except Exception:
+            pass
+        try:
+            self._update_last_refresh_chip()
+        except Exception:
+            pass
+
+    # ─────────────────────────────────────── v0.2.99 helpers
+    def _on_stream_filter_changed(self, text):
+        """Cache the needle and re-hide rows. Lower-cased here so the
+        per-row walk in `_apply_stream_filter` doesn't have to do it
+        N times per refresh."""
+        self._stream_filter_needle = (text or "").strip().lower()
+        self._apply_stream_filter()
+
+    def _apply_stream_filter(self):
+        """Walk the stream-statistics table and hide rows that don't
+        contain the cached needle in any of: Stream Name (col 0),
+        Interface (col 1), Engine (col 2). Empty needle = show all."""
+        if not hasattr(self, "stream_statistics_table") \
+                or self.stream_statistics_table is None:
+            return
+        needle = getattr(self, "_stream_filter_needle", "")
+        table = self.stream_statistics_table
+        for row in range(table.rowCount()):
+            if not needle:
+                table.setRowHidden(row, False)
+                continue
+            match = False
+            for col in (0, 1, 2):
+                item = table.item(row, col)
+                if item is not None and needle in item.text().lower():
+                    match = True
+                    break
+            table.setRowHidden(row, not match)
+
+    def _on_refresh_pause_toggled(self, checked):
+        """Pause button flip. The two update_* paths check
+        `self._refresh_paused` at entry and bail early when True.
+        Button label flips so the operator can see at a glance whether
+        the GUI is live or frozen."""
+        self._refresh_paused = bool(checked)
+        try:
+            self.pause_refresh_button.setText("Resume" if checked else "Pause")
+        except Exception:
+            pass
+        # When resuming, force-fire an immediate refresh of the chip so
+        # the operator sees a fresh timestamp instead of the stale one
+        # the dock froze on.
+        if not checked:
+            try:
+                self._update_last_refresh_chip()
+            except Exception:
+                pass
+
+    def _update_last_refresh_chip(self):
+        """Stamp the action-bar chip with the current wall-clock time.
+        Called at the end of every successful (non-paused) rebuild of
+        the stream table — that's the operator's primary "is this
+        fresh?" signal. Format: ``Updated HH:MM:SS``."""
+        if not hasattr(self, "last_refresh_label") \
+                or self.last_refresh_label is None:
+            return
+        now = _time.localtime()
+        ts = f"{now.tm_hour:02d}:{now.tm_min:02d}:{now.tm_sec:02d}"
+        try:
+            self.last_refresh_label.setText(f"Updated {ts}")
+            # Reset to neutral grey (the colour is amber when the chip
+            # has been frozen by the pause toggle for > 5 s; otherwise
+            # plain grey).
+            self.last_refresh_label.setStyleSheet(
+                "QLabel { color: #6b7280; font-size: 10px; padding: 0 6px; }"
+            )
+        except Exception:
+            pass
 
     def export_statistics_csv(self):
         """Dump the visible Interface + Stream statistics tables to a
