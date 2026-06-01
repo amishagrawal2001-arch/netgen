@@ -746,3 +746,182 @@ def test_v0_2_91_finding_5_stop_selected_skips_filter_hidden_rows(
         f"{sids_stopped}"
     )
     assert sorted(sids_stopped) == ["visible-1", "visible-2"]
+
+
+# ──────────────────────────────────────────────── v0.2.94 PAIN-tier
+#
+# Three patterns that landed on every other session-table surface
+# between v0.2.74 and v0.2.93 but were missing from Stateful TCP.
+# Each test pins the v0.2.94 behaviour so a future refactor can't
+# accidentally regress to the pre-v0.2.94 state where:
+#   * the operator's sort column reset every 3 s on auto-refresh,
+#   * the table sat blank/ambiguous when empty,
+#   * Stop-selected fired async without telling the operator which
+#     SIDs succeeded vs failed.
+
+
+def test_v0_2_94_empty_state_overlay_shown_when_no_sessions(make_tab):
+    """v0.2.94 #1 — EmptyStateOverlay placeholder is visible while
+    the table has 0 rows; the parent must show() for QLabel.isVisible
+    to actually return True under offscreen Qt."""
+    tab, _, parent = make_tab
+    parent.show()
+    overlay = getattr(tab, "_empty_overlay", None)
+    assert overlay is not None, "v0.2.94 regression — _empty_overlay missing"
+    # Fresh tab → 0 rows → overlay visible.
+    assert tab._table.rowCount() == 0
+    assert overlay._label.isVisible() is True
+    # Render one session → overlay hides.
+    tab._on_refresh_ok({"sessions": [_running_session()]}, 200)
+    assert tab._table.rowCount() == 1
+    assert overlay._label.isVisible() is False
+    # Sessions drain → overlay returns.
+    tab._on_refresh_ok({"sessions": []}, 200)
+    assert tab._table.rowCount() == 0
+    assert overlay._label.isVisible() is True
+
+
+def test_v0_2_94_empty_state_overlay_message_mentions_start_session(make_tab):
+    """The placeholder should hint at what to do next, not just say
+    'empty'. Pin that it points the operator at the Start button."""
+    tab, _, _ = make_tab
+    overlay = tab._empty_overlay
+    txt = overlay._label.text()
+    assert "Start session" in txt, (
+        f"empty-state hint should mention the Start affordance "
+        f"(got: {txt!r})"
+    )
+
+
+def test_v0_2_94_sort_state_preserved_across_render(make_tab):
+    """v0.2.94 #2 — operator clicks the 'Uptime' column header to sort
+    by longest-running. The next 3 s auto-refresh must NOT reset the
+    sort indicator (pre-v0.2.94 the indicator vanished on every poll
+    because the rebuild cycled setSortingEnabled false→true)."""
+    tab, _, _ = make_tab
+    tab._table.setSortingEnabled(True)
+    # Render once with two sessions so sorting has something to do.
+    tab._on_refresh_ok({"sessions": [
+        _running_session(sid="r1"),
+        _running_session(sid="r2"),
+    ]}, 200)
+    # Operator clicks 'Uptime' header → descending.
+    tab._table.sortByColumn(tab.COL_UPTIME, Qt.DescendingOrder)
+    # Sanity check: indicator landed on the right column + order.
+    header = tab._table.horizontalHeader()
+    assert header.sortIndicatorSection() == tab.COL_UPTIME
+    assert header.sortIndicatorOrder() == Qt.DescendingOrder
+    # Now an auto-refresh fires (same payload — what matters is the
+    # render path runs end-to-end).
+    tab._on_refresh_ok({"sessions": [
+        _running_session(sid="r1"),
+        _running_session(sid="r2"),
+    ]}, 200)
+    # Indicator must still be on the operator's chosen column + order.
+    assert header.sortIndicatorSection() == tab.COL_UPTIME, (
+        "v0.2.94 regression — sort indicator reset on rebuild"
+    )
+    assert header.sortIndicatorOrder() == Qt.DescendingOrder
+
+
+def test_v0_2_94_bulk_stop_shows_multi_device_results_dialog(
+    make_tab, monkeypatch,
+):
+    """v0.2.94 #3 — Stop selected on N rows must surface a per-row
+    MultiDeviceResultsDialog (✅/❌ prefixes) so the operator sees
+    exactly which SIDs succeeded. Pre-v0.2.94 the fan-out was
+    fire-and-forget — operator only learned the outcome via the next
+    3 s poll, which was ambiguous when some failed.
+    """
+    tab, mod, _ = make_tab
+    _patch_async_post_to_sync(monkeypatch, mod)
+    # 2/3 succeed, middle one fails with a non-2xx.
+    responses = iter([
+        SimpleNamespace(status_code=200, text="", json=lambda: {}),
+        SimpleNamespace(status_code=500, text="boom", json=lambda: {}),
+        SimpleNamespace(status_code=200, text="", json=lambda: {}),
+    ])
+    mod.requests = MagicMock()
+    mod.requests.post = (
+        lambda url, json=None, headers=None, timeout=None: next(responses)
+    )
+    # Intercept the dialog so the test can introspect what was passed
+    # without an actual modal popping up.
+    captured: List[Dict[str, Any]] = []
+
+    class _FakeDlg:
+        def __init__(self, title, summary, results, parent):
+            captured.append({
+                "title": title, "summary": summary,
+                "results": list(results), "parent": parent,
+            })
+
+        def exec_(self):
+            return 0  # accepted/rejected doesn't matter for the test
+
+    # Patch the lazy import inside _show_bulk_stop_results.
+    import widgets.devices_tab as devices_tab_mod
+    monkeypatch.setattr(
+        devices_tab_mod, "MultiDeviceResultsDialog", _FakeDlg
+    )
+
+    tab._on_refresh_ok({"sessions": [
+        _running_session(sid="alpha"),
+        _running_session(sid="bravo"),
+        _running_session(sid="charlie"),
+    ]}, 200)
+    tab._table.selectAll()
+    tab._on_stop_selected()
+
+    # All 3 SIDs accounted for, dialog constructed exactly once.
+    assert len(captured) == 1
+    payload = captured[0]
+    assert "Stop selected" in payload["title"]
+    # Summary mentions the 2-of-3 split.
+    assert "2" in payload["summary"] and "3" in payload["summary"]
+    assert "fail" in payload["summary"].lower()
+    # Per-row result lines carry the expected emoji prefixes — pin the
+    # convention so a future refactor can't swap to plain text.
+    joined = " ".join(payload["results"])
+    assert joined.count("✅") == 2
+    assert joined.count("❌") == 1
+    # Each SID surfaces (short form: first 10 chars + ellipsis).
+    for short in ("alpha", "bravo", "charlie"):
+        assert any(short in r for r in payload["results"]), (
+            f"bulk-stop dialog missing row for {short!r}"
+        )
+
+
+def test_v0_2_94_bulk_stop_falls_back_to_messagebox_on_dialog_failure(
+    make_tab, monkeypatch,
+):
+    """Defensive: if MultiDeviceResultsDialog construction raises
+    (import error, Qt teardown, whatever) the operator still gets a
+    QMessageBox digest rather than silent failure. Same belt-and-
+    braces pattern as the v0.2.93 VXLAN apply fallback."""
+    tab, mod, _ = make_tab
+    _patch_async_post_to_sync(monkeypatch, mod)
+    mod.requests = MagicMock()
+    mod.requests.post = lambda *a, **k: SimpleNamespace(
+        status_code=200, text="", json=lambda: {},
+    )
+    # Force the dialog constructor to blow up.
+    import widgets.devices_tab as devices_tab_mod
+
+    def _blowup(*_a, **_k):
+        raise RuntimeError("simulated dialog construction failure")
+
+    monkeypatch.setattr(
+        devices_tab_mod, "MultiDeviceResultsDialog", _blowup
+    )
+    # Intercept QMessageBox.information to confirm the fallback fires.
+    fallback_calls: List[Any] = []
+    monkeypatch.setattr(
+        QMessageBox, "information",
+        staticmethod(lambda *a, **k: fallback_calls.append(a))
+    )
+    tab._on_refresh_ok({"sessions": [_running_session(sid="solo")]}, 200)
+    tab._table.selectAll()
+    tab._on_stop_selected()
+    # The fallback QMessageBox.information should have fired.
+    assert fallback_calls, "v0.2.94 fallback path didn't run"

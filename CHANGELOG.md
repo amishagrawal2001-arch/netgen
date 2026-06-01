@@ -2,6 +2,73 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.94] - 2026-05-31
+
+**Stateful TCP tab — UX-consistency sweep (3 PAIN gaps closed).** The
+Stateful-TCP session table shipped in v0.2.88 (code-review-fixed in
+v0.2.91) and has been stable, but it was the only session-table
+surface in the app missing three patterns every other tab adopted
+between v0.2.74 and v0.2.93. This release lifts those patterns over
+verbatim so operators get the same UX whether they're looking at
+L2 emulation, Devices, or Stateful TCP.
+
+### What changed
+- **Sort indicator survives the 3-second auto-refresh**
+  (`widgets/stateful_tcp_tab.py:_render_sessions`). Click "Uptime"
+  to sort by longest-running session and the indicator now stays
+  put through every poll, instead of resetting to the default and
+  snapping rows back to insertion order. Same `capture_sort_state` /
+  `restore_sort_state` helper that landed on the Devices tab in
+  v0.2.92.
+- **"No sessions" placeholder when the table is empty**
+  (`widgets/stateful_tcp_tab.py:__init__`). A blank table is
+  ambiguous — is it empty? still loading? broken? The new
+  `EmptyStateOverlay` centres a dimmed hint over the viewport
+  pointing the operator at "Start session…" and Help → Capabilities
+  → Stateful TCP. Auto-hides on the first session and reappears
+  when the last drains. Same widget shipped for the Devices
+  sub-tabs in v0.2.89.
+- **Stop-selected shows a per-row results dialog**
+  (`widgets/stateful_tcp_tab.py:_on_stop_selected` + new
+  `_spawn_bulk_stop` / `_show_bulk_stop_results`). Pre-v0.2.94 the
+  fan-out was fire-and-forget — operator only learned which SIDs
+  stopped via the next 3-second poll, and when some failed there
+  was no way to tell which without diffing the count chip. Now the
+  same `MultiDeviceResultsDialog` that ships per-device results for
+  BGP/OSPF/ISIS/VXLAN/DHCP (v0.2.93) collects ✅/❌ per SID and
+  pops at the end of the fan-out. Defensive fallback to
+  `QMessageBox.information` if the dialog can't construct, matching
+  the v0.2.93 VXLAN-apply fallback pattern.
+
+### What didn't change
+- Per-row Stop button: untouched.
+- Stop-all: still a single POST with empty body. No multi-row
+  collection to surface — the server reports back via the next
+  poll just fine.
+
+### Tests
+- **`tests/test_stateful_tcp_tab.py`** — 5 new tests, prefixed
+  `test_v0_2_94_*` so the audit trail is preserved:
+  - Empty-state overlay visibility flips as sessions arrive/drain.
+  - Empty-state hint mentions the Start affordance (pin the
+    operator-guidance copy so future refactors can't strip it).
+  - Sort indicator survives a render cycle (regression for the
+    pre-v0.2.94 reset behaviour).
+  - Bulk-stop shows MultiDeviceResultsDialog with ✅/❌ prefixes,
+    correct success/failure counts, and one row per SID.
+  - Bulk-stop falls back to QMessageBox.information when the
+    dialog constructor raises.
+
+### Stateful TCP audit — PAIN tier closed
+The remaining 6 POLISH items from the audit (right-click context
+menu, Delete-key shortcut, live IP validators, payload preview
+button, export CSV/JSON, optional last-error column) are deferred
+to v0.2.95 / v0.2.96. None are user-visible breakage; daily users
+get the biggest wins from this release.
+
+### Test count
+655 → 660 (+5).
+
 ## [0.2.93] - 2026-05-30
 
 **Apply-result consistency across all 5 protocols** — closes the

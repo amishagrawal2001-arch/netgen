@@ -40,6 +40,18 @@ from PyQt5.QtWidgets import (
     QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
+# v0.2.94: shared UX helpers landed for the Devices tab + L2 emulation
+# tab — wire the same patterns here so Stateful TCP stops being the only
+# session-table surface without them.
+#   * capture_sort_state / restore_sort_state — sort indicator survives
+#     the 3 s auto-refresh rebuild (otherwise the operator's "sort by
+#     uptime" choice resets every poll).
+#   * EmptyStateOverlay — centred "No sessions" placeholder when the
+#     table is empty (otherwise blank table is ambiguous: empty,
+#     loading, or broken?).
+from utils.table_sort_state import capture_sort_state, restore_sort_state
+from widgets.empty_state_overlay import EmptyStateOverlay
+
 
 logger = logging.getLogger(__name__)
 
@@ -768,6 +780,18 @@ class StatefulTcpTab(QWidget):
         )
         outer.addWidget(self._table, 1)
 
+        # ── Empty-state overlay ───────────────────────────────────────
+        # Centred placeholder when the table has 0 rows. The overlay
+        # auto-hides as soon as the first session arrives and reappears
+        # when the last session stops, driven by the table's model
+        # signals. Matches the v0.2.89 pattern on Devices sub-tabs.
+        self._empty_overlay = EmptyStateOverlay(
+            self._table,
+            "No stateful-TCP sessions running.\n\n"
+            "Click ‘Start session…’ to launch a client or server,\n"
+            "or open Help → Capabilities → Stateful TCP for the workflow guide.",
+        )
+
         # ── Poll timer ────────────────────────────────────────────────
         self._timer = QTimer()
         self._timer.setInterval(self.POLL_INTERVAL_MS)
@@ -1010,6 +1034,12 @@ class StatefulTcpTab(QWidget):
         mono.setPointSize(11)
 
         was_sorting = self._table.isSortingEnabled()
+        # v0.2.94: snapshot the operator's chosen sort column + order
+        # so the 3 s auto-refresh rebuild can put rows back in the same
+        # order. Without this, clicking "sort by Uptime" lasts <3 s
+        # before the next poll wipes the indicator. Same pattern the
+        # Devices tab adopted in v0.2.92.
+        sort_state = capture_sort_state(self._table)
         self._table.setSortingEnabled(False)
         self._table.setRowCount(len(sessions))
         for row, sess in enumerate(sessions):
@@ -1119,7 +1149,18 @@ class StatefulTcpTab(QWidget):
                 self._table.setItem(row, self.COL_ACTION, QTableWidgetItem(""))
 
         self._table.setSortingEnabled(was_sorting)
+        # Re-apply the captured sort indicator AFTER the rebuild.
+        # No-op when the operator hasn't sorted yet (column == -1).
+        restore_sort_state(self._table, sort_state)
         self._apply_session_filter()
+        # Explicit overlay refresh — setRowCount fires model signals
+        # the overlay already listens to, but a programmatic call is
+        # cheap and pins the placeholder visibility even if a future
+        # refactor breaks the signal path.
+        try:
+            self._empty_overlay.refresh()
+        except Exception:
+            pass
 
     def _apply_session_filter(self, *_args) -> None:
         needle = ""
@@ -1212,14 +1253,90 @@ class StatefulTcpTab(QWidget):
             sid = it.data(Qt.UserRole)
             if sid:
                 sids.append(str(sid))
-        # Async fan-out — one worker per SID. The GUI thread doesn't
-        # block on any of them; the next 3 s poll surfaces the
-        # outcome. _spawn_stop_post schedules its own delayed refresh
-        # via _on_stop_post_done.
+        if not sids:
+            return
+
+        # v0.2.94: collect per-SID outcomes across the async fan-out
+        # and surface them in MultiDeviceResultsDialog (✅/❌ prefixes)
+        # so the operator sees exactly which sessions stopped instead
+        # of just waiting for the next 3 s poll to (maybe) confirm.
+        # Matches the v0.2.93 per-protocol apply-result consistency.
+        self._spawn_bulk_stop(sids, dialog_title="Stop selected — results")
+
+    def _spawn_bulk_stop(self, sids: List[str], *,
+                         dialog_title: str = "Bulk stop — results") -> None:
+        """Fan out one stop POST per SID, accumulate per-row results,
+        show a MultiDeviceResultsDialog when all complete.
+
+        Single-SID case still uses the dialog — the operator who
+        selected one row asked for explicit confirmation, and an empty
+        per-row dialog is friendlier than a silent fire-and-forget.
+        """
+        url = self._get_server_url()
+        if not url:
+            return
+        expected = len(sids)
+        if expected == 0:
+            return
+        collected: List[str] = []
+        # Short display labels for the dialog rows — full SID is in the
+        # tooltip on each cell of the original table.
+        def _short(sid: str) -> str:
+            return (sid[:10] + "…") if len(sid) > 11 else sid
+
+        def _on_one_done(http_code: int, err: str, sid: str) -> None:
+            label = _short(sid)
+            if err and http_code == 0:
+                collected.append(f"❌ {label}: {err[:120]}")
+            elif http_code and 200 <= http_code < 300:
+                collected.append(f"✅ {label}: stopped (HTTP {http_code})")
+            else:
+                detail = err[:120] if err else "(no body)"
+                collected.append(f"❌ {label}: HTTP {http_code} — {detail}")
+            # Trigger a refresh per-completion — same cadence as
+            # _spawn_stop_post.  Cheap; the timer coalesces.
+            QTimer.singleShot(150, self.refresh)
+            if len(collected) >= expected:
+                self._show_bulk_stop_results(
+                    collected, expected, title=dialog_title,
+                )
+
         for sid in sids:
-            self._spawn_stop_post(
-                {"session_id": sid},
-                tag=f"stop-selected {sid[:8]}",
+            worker = _JsonPostWorker(
+                f"{url.rstrip('/')}/api/stateful_tcp/stop",
+                json_body={"session_id": sid}, timeout_s=5.0,
+            )
+            try:
+                from utils.qthread_keepalive import keep
+                keep(worker)
+            except Exception:
+                pass
+            worker.done.connect(
+                (lambda code, msg, _sid=sid: _on_one_done(code, msg, _sid))
+            )
+            worker.start()
+
+    def _show_bulk_stop_results(self, results: List[str], expected: int,
+                                *, title: str) -> None:
+        ok = sum(1 for r in results if r.startswith("✅"))
+        failed = expected - ok
+        plural = "s" if expected != 1 else ""
+        summary = f"Stopped {ok} of {expected} session{plural}"
+        if failed:
+            summary += f" — {failed} failed"
+        try:
+            from widgets.devices_tab import MultiDeviceResultsDialog
+            dlg = MultiDeviceResultsDialog(title, summary, results, self)
+            dlg.exec_()
+        except Exception as exc:
+            # Defensive fallback — the operator still gets a digest
+            # even if the rich dialog can't construct (matches the
+            # VXLAN apply fallback shipped in v0.2.93).
+            logger.debug(
+                f"[STATEFUL TCP] could not show results dialog: {exc}"
+            )
+            QMessageBox.information(
+                self, title, f"{summary}\n\n" + "\n".join(results)
             )
 
     def _on_stop_all(self):
