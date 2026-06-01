@@ -2,6 +2,68 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## Unreleased — known follow-ups
+
+Findings from audits whose fixes haven't shipped yet. Captured
+here so a future session (or any reader of this file) knows
+they exist + that they were deliberately not fixed in the
+cycle that closed at v0.3.1.
+
+### From the v0.3.1 DPDK server audit
+- **tx_worker stdout deadlock**
+  (`utils/dpdk_tx_worker.py:523`). The `for line in
+  proc.stdout:` loop blocks indefinitely if DPDK EAL hangs
+  during device initialisation — the worker thread can't see
+  the stop_event between lines. Failure mode is "operator
+  restarts the server", not data loss. Fix needs a select-based
+  reader (~80 lines + integration test); deferred because the
+  refactor risks the v0.2.20–v0.2.25 SIGABRT class of QThread
+  bugs if done carelessly.
+
+### From the v0.3.1 DPDK shell-script audit
+- **PCI address format not regex-validated in `dpdk_bind.sh`**
+  (`resources/dpdk/dpdk_bind.sh:158, 429`). Defence-in-depth
+  complement to the v0.3.1 `_is_safe_iface_name` whitelist —
+  same philosophy: don't trust the Flask layer to be the only
+  gate. Expected regex: `^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]$`
+  before any sysfs write that uses `$pci`.
+- **`/tmp/dpdk_deps_install.log` world-readable**
+  (`resources/dpdk/install_dpdk.sh:399`). Low-sensitivity
+  content (apt-get output) but the fix is trivial: `umask 077`
+  before the tee. Worth one-line cleanup whenever the script is
+  next touched.
+- **No validation of `git clone` artifacts before build**
+  (`resources/dpdk/install_dpdk.sh:289, 297`). After
+  `git clone`, the script doesn't verify `meson.build` exists.
+  A corrupted clone surfaces 60 s later as a cryptic meson
+  error. Fail-early check would land the error at the clone
+  step. ~5 lines.
+
+### From earlier audits (still deferred)
+- **Async-worker progress dialogs** for ISIS / VXLAN / DHCP
+  apply paths (BGP + OSPF have them). Skipped per v0.2.93
+  because moving sync applies to async worker threads risks
+  reintroducing the v0.2.20–v0.2.25 QThread SIGABRT class.
+- **Sortable headers** on OSPF / IS-IS / VXLAN / DHCP tables.
+  Feature add, not a bug. v0.2.92 sort-state helper is ready.
+- **Last-error column** on protocol tables. POLISH, deferred
+  v0.2.74; internal `_apply_error` is captured but not surfaced.
+- **Tunable stats-refresh interval** (currently hardcoded 2000ms
+  in `traffic_client/main.py:411,430`). Needs a Settings dialog
+  surface; the v0.2.99 pause toggle covers the screenshot use
+  case which was the main driver.
+- **Node.js 24 CI migration**. Every release run logs Node 20
+  deprecation warnings. GitHub forces Node 24 on 16 Sep 2026.
+  ~5-line edit when convenient.
+- **Stream dialog POLISH**: Preview button, Clone, Reset,
+  stylesheet unification, semantic-hint tooltips. None
+  blocking.
+
+These are *known and accepted* — they're listed here, not
+hidden. Pick any up when there's a driver (bug report, feature
+ask, customer complaint) or when consolidating the audit
+findings warrants a focused PR.
+
 ## [0.3.1] - 2026-06-01
 
 **Server-side DPDK hardening.** The v0.2.76 / v0.2.77 / v0.2.97
