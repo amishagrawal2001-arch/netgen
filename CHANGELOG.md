@@ -2,6 +2,46 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.3.6] - 2026-06-01
+
+**Fix: "Read More: DPDK Traffic Blast Workflow" button was
+invisible.** User screenshot showed a solid blue bar with no
+visible text where the Read-More button should be. Real
+discoverability bug — the link to the DPDK workflow guide was
+effectively hidden in the most-touched dialog in the app.
+
+### Root cause
+`widgets/stream_dialog.py:~4495` set the button's text color to
+`#3b82f6` (blue) but left `background-color` unspecified, so it
+inherited the dialog-wide primary-button background (also a
+blue). Blue text on a blue background = invisible label —
+operator saw just the gradient bar.
+
+### What changed
+- **`widgets/stream_dialog.py`** — explicit `background-color:
+  #ffffff` + text color bumped to `#1d4ed8` (Tailwind blue-700,
+  AA-contrast-safe on white) + thin blue border + `:hover` /
+  `:pressed` states + `setCursor(Qt.PointingHandCursor)`. Matches
+  the "neutral white" button family used elsewhere (Stats dock
+  Clear/Export, DPDK Status Unbind, install-script footer
+  buttons).
+- Added a small open-book emoji prefix to the label so the
+  button reads as documentation-link-shaped at a glance.
+
+### Tests
+- **`tests/test_dpdk_read_more_button_visibility.py`** — 4 pins:
+  - `background-color` explicitly set (the v0.3.6 fix).
+  - Background must be white (#ffffff) — any colour risks the
+    same readability issue.
+  - Text color uses `#1d4ed8` for AA contrast.
+  - `:hover` state present — without it the button doesn't
+    visually respond to mouse-over.
+  - `setCursor(Qt.PointingHandCursor)` present — standard
+    "clickable" affordance the app uses everywhere else.
+
+### Test count
+802 → 806 (+4).
+
 ## [0.3.5] - 2026-06-01
 
 **Per-stream latency histograms.** Second real correctness fix

@@ -4491,8 +4491,36 @@ class AddStreamDialog(QDialog):
         
         # Read More button — opens the DPDK Workflow Guide
         # (also reachable from main window: Help → DPDK Traffic Blast Workflow)
-        read_more_button = QPushButton("Read More: DPDK Traffic Blast Workflow")
-        read_more_button.setStyleSheet("text-align: left; padding: 8px; color: #3b82f6; font-weight: 500;")
+        # v0.3.6: previous stylesheet set `color: #3b82f6` (blue) but
+        # left the background unspecified, so the button inherited the
+        # dialog's primary-button background (also blue, set by the
+        # dialog-wide stylesheet earlier in __init__) → blue text on
+        # blue background = invisible button. Operator saw a solid
+        # blue bar with no readable label. Explicit background + a
+        # contrasting border + cursor + hover state — same shape as
+        # the "neutral white" buttons elsewhere in the app (Stats
+        # dock Clear/Export, DPDK Status Unbind, etc.).
+        read_more_button = QPushButton("📖  Read More: DPDK Traffic Blast Workflow")
+        read_more_button.setCursor(Qt.PointingHandCursor)
+        read_more_button.setStyleSheet(
+            "QPushButton {"
+            "  text-align: left;"
+            "  padding: 6px 12px;"
+            "  color: #1d4ed8;"            # deeper blue for AA contrast on white
+            "  background-color: #ffffff;"
+            "  border: 1px solid #93c5fd;"
+            "  border-radius: 5px;"
+            "  font-weight: 500;"
+            "}"
+            "QPushButton:hover {"
+            "  background-color: #eff6ff;"
+            "  border-color: #2563eb;"
+            "  color: #1e40af;"
+            "}"
+            "QPushButton:pressed {"
+            "  background-color: #dbeafe;"
+            "}"
+        )
         read_more_button.clicked.connect(self._show_dpdk_usage_guide)
         layout.addWidget(read_more_button)
         
