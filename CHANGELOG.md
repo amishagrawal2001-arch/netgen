@@ -2,6 +2,94 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.3.1] - 2026-06-01
+
+**Server-side DPDK hardening.** The v0.2.76 / v0.2.77 / v0.2.97
+work hardened the CLIENT-side DPDK dialog (bind-safety override,
+hugepage feedback, unbind confirmation). The v0.3.1 audit closed
+the complementary SERVER-side gaps that the dialog can't protect
+against.
+
+### What changed
+- **Concurrent bind/unbind serialised**
+  (`run_tgen_server.py:_DPDK_BIND_LOCK`). Two parallel
+  `/api/dpdk/bind` requests targeting the same PCI device used
+  to race `dpdk_bind.sh` — one's unbind step could collide with
+  the other's bind step, leaving sysfs with a NIC bound but the
+  kernel-driver symlink dangling. New module-level `Lock()`
+  wraps the subprocess.run on both `dpdk_bind` and `dpdk_unbind`
+  handlers so the second request blocks until the first
+  completes (or the 30s/60s timeout fires). Low probability in
+  practice but the fix is trivial and the failure mode is
+  painful enough to warrant guarding.
+- **Hugepage subprocess timeouts + rollback**
+  (`run_tgen_server.py:dpdk_hugepages`). Pre-v0.3.1 the
+  `mountpoint` / `mkdir` / `mount` subprocess calls had no
+  timeout — a stuck mount (e.g. an autofs lookup or a network
+  FS in the way) would park the Flask worker thread
+  indefinitely. All three now carry `timeout=10`. AND: if the
+  mount fails after the sysfs allocation succeeded, the handler
+  now rolls back by writing `0` to `nr_hugepages` — pre-v0.3.1
+  the pages stayed reserved-but-unmounted and the operator saw
+  "success" in the response while every subsequent stream-start
+  failed with the cryptic "no free hugepages."
+- **Iface-name input whitelist**
+  (`run_tgen_server.py:_is_safe_iface_name` +
+  `_get_pci_from_interface`). The audit flagged
+  `_get_pci_from_interface` as a path-traversal vector. On
+  inspection the actual disclosure surface was tiny (sysfs
+  kernel-collapses `..` and the function only returns
+  `os.path.basename(os.readlink(...))` — no file contents
+  leak), but rejecting non-conforming names earlier is cheap
+  defence-in-depth and any future call site that uses `iface`
+  in a less-tolerant context (subprocess argv, `os.path.join`)
+  is now pre-protected. Whitelist:
+  `^[A-Za-z0-9][A-Za-z0-9._:-]{0,31}$` (IFNAMSIZ-1 = 32; same
+  characters Linux netdev names actually use, including
+  Solarflare / bonding `:` subifaces).
+
+### Audit findings filtered (not shipped)
+- **"Path-traversal can read /etc/shadow"** — over-claim. Sysfs
+  collapses `..` such that `/sys/class/net/../../etc/shadow/device`
+  resolves to a non-existent path; even if it existed, the
+  function returns only the basename of a readlink target, not
+  file contents. Reclassified from BLOCKER to POLISH input
+  hygiene (still fixed, just not the panic-level fix the audit
+  framed).
+- **"Bind safety not on unbind"** — second time this has been
+  flagged (also in the v0.2.97 audit). Unbind from vfio-pci →
+  kernel driver RESTORES networking; the actual risk is just
+  disrupting in-flight DPDK traffic. The v0.2.97 confirmation
+  dialog covers that on the client side. Server-side `/unbind`
+  intentionally has no safety check so the GUI's "Unbind anyway"
+  recovery path always works.
+- **"tx_worker stdout deadlock"** — real (the `for line in
+  proc.stdout:` loop has no per-line timeout), but the failure
+  mode is "operator restarts the server", not data loss. Fix
+  would require switching from blocking line iteration to a
+  select-based reader — larger refactor, deferred.
+
+### Tests
+- **`tests/test_dpdk_server_hardening.py`** — 9 source-grep +
+  pure-function pins:
+  - `_DPDK_BIND_LOCK` defined as a module-level `Lock()`.
+  - Both `dpdk_bind` and `dpdk_unbind` handlers wrap their
+    subprocess.run in `with _DPDK_BIND_LOCK:` (parametrised).
+  - `_is_safe_iface_name` + `_IFACE_NAME_RE` defined.
+  - `_get_pci_from_interface` calls the whitelist BEFORE
+    constructing the sysfs path.
+  - Whitelist accepts real names (eth0, enp181s0f0np0,
+    bond0.10, em1:0, lo, wlan0, br-1234abcd).
+  - Whitelist rejects path-traversal / shell-meta / oversized
+    / leading-dot+dash names.
+  - Every `subprocess.run` in `dpdk_hugepages` carries
+    `timeout=`.
+  - Rollback path writes `0` to `nr_hugepages` on mount
+    failure.
+
+### Test count
+753 → 762 (+9).
+
 ## [0.3.0] - 2026-06-01
 
 **Minor bump to mark the audit cycle close.** v0.2.93 → v0.2.99

@@ -405,6 +405,37 @@ active_streams_lock = Lock()
 STREAMS = {}
 capture_processes = {}
 
+# v0.3.1: serialise /api/dpdk/bind + /api/dpdk/unbind. Two concurrent
+# bind requests targeting the same PCI device used to race —
+# dpdk_bind.sh would unbind from the old driver while a parallel
+# instance bound to vfio-pci, leaving sysfs in an inconsistent state
+# (NIC bound but the kernel-driver symlink dangling). One global
+# lock is enough here: bind/unbind takes a few seconds, runs rarely,
+# and per-PCI granularity would just hide the symptom of "operator
+# fired two binds on the same device by accident."
+_DPDK_BIND_LOCK = Lock()
+
+
+# v0.3.1: defence-in-depth iface-name input filter. The agent flagged
+# `_get_pci_from_interface` as a path-traversal vector. The actual
+# disclosure surface is tiny (sysfs resolves `..` and returns
+# os.path.basename of a readlink target — no file contents leak), but
+# rejecting non-conforming names earlier means cleaner error paths +
+# kills any future code that uses iface in a less-tolerant context.
+_IFACE_NAME_RE = __import__("re").compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,31}$")
+
+
+def _is_safe_iface_name(name) -> bool:
+    """Whitelist Linux netdev names (plus the colon Solarflare /
+    bonding subifaces use). Rejects empty / non-string, anything
+    over 32 chars (IFNAMSIZ - 1), and anything containing `/`,
+    null bytes, whitespace, or path-traversal sequences."""
+    if not isinstance(name, str):
+        return False
+    if not name or len(name) > 32:
+        return False
+    return bool(_IFACE_NAME_RE.match(name))
+
 # Set up logging
 log_level = os.environ.get('OSTG_LOG_LEVEL', 'INFO').upper()
 logging.basicConfig(level=getattr(logging, log_level, logging.INFO), format='%(asctime)s - %(levelname)s - %(message)s')
@@ -12996,13 +13027,20 @@ def dpdk_bind():
         cmd = ["sudo", dpdk_bind_script, "bind", pci]
         if force:
             cmd.append("--force")
-        
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=30
-        )
+
+        # v0.3.1: serialise bind under the global DPDK lock so two
+        # concurrent /api/dpdk/bind requests on the same PCI don't
+        # race dpdk_bind.sh and leave sysfs in an inconsistent
+        # state. The lock is held across the full subprocess.run
+        # window (the script is the actual side-effect — guarding
+        # only the wrapper would be pointless).
+        with _DPDK_BIND_LOCK:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
         
         if result.returncode == 0:
             return jsonify({
@@ -13053,14 +13091,19 @@ def dpdk_unbind():
         cmd = ["sudo", dpdk_bind_script, "unbind", pci]
         if kernel_driver:
             cmd.extend(["--kernel-driver", kernel_driver])
-        
-        # Increased timeout to accommodate retry logic and interface detection (up to 60 seconds)
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            text=True,
-            timeout=60
-        )
+
+        # v0.3.1: share the bind lock — same race window. A bind
+        # and an unbind hitting the same PCI in parallel would
+        # also leave sysfs inconsistent. Increased timeout retained
+        # (up to 60 s) to accommodate retry logic and interface
+        # detection inside the script.
+        with _DPDK_BIND_LOCK:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                timeout=60
+            )
         
         # Check if script output indicates success (even if exit code is non-zero)
         # The script may return success even if binding to kernel driver fails,
@@ -13238,21 +13281,67 @@ def dpdk_hugepages():
             with open(hugepage_file, "w") as f:
                 f.write(str(num_pages))
 
-            # Mount hugepages if not already mounted
+            # Mount hugepages if not already mounted.
+            # v0.3.1: timeouts on every subprocess so a hung mount
+            # (e.g. autofs / network FS in the way) doesn't park a
+            # Flask worker thread indefinitely. 10 s is generous —
+            # the local hugetlbfs mount completes in milliseconds.
             mount_point = "/mnt/huge"
             result = subprocess.run(
                 ["mountpoint", "-q", mount_point],
-                capture_output=True
+                capture_output=True,
+                timeout=10,
             )
             if result.returncode != 0:
-                subprocess.run(
-                    ["mkdir", "-p", mount_point],
-                    check=True
-                )
-                subprocess.run(
-                    ["mount", "-t", "hugetlbfs", "nodev", mount_point],
-                    check=True
-                )
+                # v0.3.1: rollback the sysfs allocation if the mount
+                # fails. Pre-v0.3.1 the operator saw "success" in
+                # the response while the hugepages stayed reserved
+                # but unmounted — every subsequent stream start
+                # then failed with the cryptic "no free hugepages"
+                # even though `cat nr_hugepages` said N. Zero the
+                # sysfs back to whatever it was before so the next
+                # attempt starts from a clean baseline.
+                _prev_hugepages = 0
+                try:
+                    with open(hugepage_file, "r") as _f:
+                        _prev_hugepages = int(_f.read().strip())
+                except Exception:
+                    pass
+                try:
+                    subprocess.run(
+                        ["mkdir", "-p", mount_point],
+                        check=True, timeout=10,
+                    )
+                    subprocess.run(
+                        ["mount", "-t", "hugetlbfs", "nodev", mount_point],
+                        check=True, timeout=10,
+                    )
+                except (subprocess.TimeoutExpired,
+                        subprocess.CalledProcessError) as mount_exc:
+                    # Roll back the sysfs write. Best-effort: if even
+                    # the rollback fails, log and let the operator
+                    # see the original mount failure (more
+                    # actionable than a doubled-up traceback).
+                    try:
+                        with open(hugepage_file, "w") as _f:
+                            _f.write("0")
+                        logging.warning(
+                            f"[DPDK HUGEPAGES] mount failed ({mount_exc}); "
+                            f"rolled back sysfs from {num_pages} to 0 "
+                            f"(was {_prev_hugepages} before this call)"
+                        )
+                    except Exception as rb_exc:
+                        logging.error(
+                            f"[DPDK HUGEPAGES] mount failed AND rollback "
+                            f"failed: mount={mount_exc} rollback={rb_exc}"
+                        )
+                    return jsonify({
+                        "success": False,
+                        "message": (
+                            f"Failed to mount hugetlbfs at {mount_point}: "
+                            f"{mount_exc}. Sysfs allocation rolled back."
+                        ),
+                    }), 500
 
             # v0.2.77: re-read the sysfs file to surface what the
             # kernel ACTUALLY allocated (may be less than requested
@@ -13476,9 +13565,22 @@ def _get_interfaces_from_sys():
 
 
 def _get_pci_from_interface(iface_name):
-    """Get PCI address from interface name using /sys."""
+    """Get PCI address from interface name using /sys.
+
+    v0.3.1: reject names that don't match the Linux netdev whitelist
+    BEFORE building the sysfs path. Pre-v0.3.1 a request body
+    crafted with ``"interface": "../../foo"`` would resolve to
+    ``/sys/class/net/../../foo/device`` (kernel-normalised to
+    ``/foo/device``) — the function would return None or raise,
+    but the value was still touching the wider filesystem when
+    sysfs alone was intended. The whitelist closes that window
+    + makes the failure mode "explicit refusal" instead of
+    "silently None on weird paths."
+    """
     import os
-    
+
+    if not _is_safe_iface_name(iface_name):
+        return None
     device_link = f"/sys/class/net/{iface_name}/device"
     if os.path.exists(device_link):
         return os.path.basename(os.readlink(device_link))
