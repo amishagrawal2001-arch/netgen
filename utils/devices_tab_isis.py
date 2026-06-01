@@ -76,6 +76,39 @@ class ISISHandler:
         except Exception:
             pass  # overlay is advisory; never block sub-tab render
 
+        # v0.2.95: Delete-key shortcut + right-click context menu.
+        # Same pattern that landed on the BGP / OSPF sub-tabs.
+        try:
+            from PyQt5.QtWidgets import QShortcut, QMenu
+            from PyQt5.QtGui import QKeySequence
+            from PyQt5.QtCore import Qt as _Qt
+            _isis_del = QShortcut(
+                QKeySequence(_Qt.Key_Delete), self.parent.isis_table,
+            )
+            _isis_del.setContext(_Qt.WidgetShortcut)
+            _isis_del.activated.connect(self.prompt_delete_isis)
+
+            self.parent.isis_table.setContextMenuPolicy(_Qt.CustomContextMenu)
+            def _on_isis_ctx(pos):
+                menu = QMenu(self.parent.isis_table)
+                act_refresh = menu.addAction("Refresh IS-IS table")
+                act_apply   = menu.addAction("Apply IS-IS configurations")
+                menu.addSeparator()
+                act_delete  = menu.addAction("Delete selected IS-IS")
+                act = menu.exec_(self.parent.isis_table.viewport().mapToGlobal(pos))
+                if act is act_refresh:
+                    try: self.update_isis_table()
+                    except Exception: pass
+                elif act is act_apply:
+                    try: self.apply_isis_configurations()
+                    except Exception: pass
+                elif act is act_delete:
+                    try: self.prompt_delete_isis()
+                    except Exception: pass
+            self.parent.isis_table.customContextMenuRequested.connect(_on_isis_ctx)
+        except Exception:
+            pass
+
         # IS-IS action bar — unified chrome with Devices + BGP + OSPF.
         from PyQt5.QtWidgets import QFrame
         from PyQt5.QtCore import Qt
@@ -473,7 +506,11 @@ class ISISHandler:
                     )
                     failed_count += 1
 
-            # Refresh ISIS table after applying configurations
+            # Refresh ISIS table after applying configurations.
+            # NB: preflight bar kick_refresh is wired at the outer
+            # wrapper (widgets/devices_tab.py:apply_isis_configurations
+            # → line ~2370). Adding one here too would be redundant —
+            # the wrapper fires after this returns regardless.
             self.update_isis_table()
 
         except requests.exceptions.RequestException as e:

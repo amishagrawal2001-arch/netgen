@@ -2,6 +2,64 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.95] - 2026-06-01
+
+**Devices-tab POLISH sweep — cross-sub-tab keyboard/RMB consistency
++ OSPF dialog live validators.** Three POLISH items deferred from
+v0.2.74 / v0.2.85 closed in one release. No PAIN-tier items shipped —
+the two flagged by the v0.2.94 audit (DHCP MultiDeviceResultsDialog,
+ISIS kick_refresh) were both confirmed as false positives on closer
+inspection (`apply_dhcp_pools` is single-device; the outer
+`apply_isis_configurations` wrapper already calls kick_refresh).
+
+### What changed
+- **Delete-key + right-click context menu on all 5 protocol sub-tabs**
+  (`utils/devices_tab_{bgp,ospf,isis,vxlan,dhcp}.py`). The
+  v0.2.74-era pattern that landed on the main Devices table now
+  fires on BGP, OSPF, IS-IS, VXLAN, and DHCP. Delete-key invokes
+  each protocol's existing delete handler
+  (`prompt_delete_bgp` / `prompt_delete_ospf` / `prompt_delete_isis`
+  / `delete_selected_vxlan_tunnels` / `delete_selected_pool`).
+  Right-click menus offer the per-protocol Refresh + Apply +
+  Delete-selected actions. Shortcut is scoped to the table widget
+  (`Qt.WidgetShortcut`) so an inline-edit Delete on a single char
+  doesn't trigger the row-delete.
+- **OSPF add dialog gains live validators**
+  (`widgets/add_ospf_dialog.py`). Area-ID, Router-ID, and the
+  Hello/Dead intervals now go red as the operator types invalid
+  values instead of waiting for the submit-time QMessageBox. Hello
+  + Dead carry `QIntValidator(1, 65535)`; the cross-field
+  "Dead > Hello" constraint flags both inputs and explains itself
+  in tooltips. Area-ID reuses the v0.2.87 `validate_ospf_area_id`
+  helper so dotted-decimal and 32-bit-int formats both pass.
+
+### Notes on the false positives
+The Devices-tab audit produced two PAIN findings that turned out to
+be already-handled:
+- DHCP "missing MultiDeviceResultsDialog" — `apply_dhcp_pools`
+  operates on a single selected DHCP server row, not a fan-out, so
+  the dialog (designed for N-device per-row results) doesn't
+  apply. `QMessageBox.information` is the correct UX here.
+- ISIS "missing kick_refresh" — the inner `_apply_isis_to_devices`
+  doesn't call kick_refresh, but the outer wrapper
+  `widgets.devices_tab.DevicesTab.apply_isis_configurations` does
+  (line ~2370), so the preflight bar gets kicked regardless. An
+  explanatory comment was added at the apparent gap so the next
+  audit doesn't re-flag the same false signal.
+
+### Tests
+- **`tests/test_devices_tab_audit.py`** — 6 new tests, all pinned
+  with the `v0_2_95` audit-trail prefix in the docstring:
+  - 5 parametrised tests (one per sub-tab) verifying the
+    Delete-key shortcut + CustomContextMenu policy + the delete
+    handler are reachable from the setup body.
+  - 1 test verifying the OSPF dialog defines the three live-
+    validator methods, wires `textChanged` to them, and carries
+    `QIntValidator(1, 65535)` on the two interval fields.
+
+### Test count
+660 → 666 (+6).
+
 ## [0.2.94] - 2026-05-31
 
 **Stateful TCP tab — UX-consistency sweep (3 PAIN gaps closed).** The

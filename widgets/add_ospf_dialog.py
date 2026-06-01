@@ -1,7 +1,15 @@
-from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QFormLayout, QHBoxLayout, 
-                             QLineEdit, QCheckBox, QGroupBox, QDialogButtonBox, 
+from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QFormLayout, QHBoxLayout,
+                             QLineEdit, QCheckBox, QGroupBox, QDialogButtonBox,
                              QWidget, QMessageBox)
+from PyQt5.QtGui import QIntValidator
 import ipaddress
+
+# v0.2.95: live-validation styles. Red border = invalid, normal border
+# = valid / empty. The accept-time validator (in `_validate`) is kept
+# as a backstop so malformed values can't slip through if the operator
+# ignores the visual cue (e.g. via paste).
+_OK_QSS  = ""   # empty stylesheet → Qt default; respects platform theme
+_BAD_QSS = "QLineEdit { border: 1px solid #dc2626; background: #fef2f2; }"
 
 
 class AddOspfDialog(QDialog):
@@ -41,7 +49,14 @@ class AddOspfDialog(QDialog):
 
         # Area ID
         self.area_id_input = QLineEdit("0.0.0.0")
-        self.area_id_input.setPlaceholderText("e.g., 0.0.0.0")
+        self.area_id_input.setPlaceholderText("e.g., 0.0.0.0  or  decimal 0–4294967295")
+        self.area_id_input.setToolTip(
+            "RFC 2328 §6 area identifier — accept either dotted-decimal "
+            "(0.0.0.0) or a 32-bit unsigned integer (0–4294967295). "
+            "Backbone area is 0 / 0.0.0.0."
+        )
+        # v0.2.95: live border colour driven by validate_ospf_area_id.
+        self.area_id_input.textChanged.connect(self._validate_area_id_live)
         layout.addRow("Area ID:", self.area_id_input)
 
         # Graceful Restart
@@ -51,25 +66,101 @@ class AddOspfDialog(QDialog):
         # Additional OSPF options can be added here
         options_group = QGroupBox("Additional Options")
         options_layout = QFormLayout(options_group)
-        
+
         # Router ID (optional)
         self.router_id_input = QLineEdit()
         self.router_id_input.setPlaceholderText("Auto-assigned if empty")
+        self.router_id_input.setToolTip(
+            "Optional IPv4 router-id. Leave blank to let the daemon "
+            "auto-pick from an interface address."
+        )
+        # v0.2.95: live IPv4 validation. Empty stays valid (optional).
+        self.router_id_input.textChanged.connect(self._validate_router_id_live)
         options_layout.addRow("Router ID:", self.router_id_input)
-        
+
         # Hello interval
         self.hello_interval_input = QLineEdit("10")
-        self.hello_interval_input.setPlaceholderText("seconds")
+        self.hello_interval_input.setPlaceholderText("seconds (1–65535)")
+        # v0.2.95: QIntValidator + live border to flag negatives / overflow.
+        self.hello_interval_input.setValidator(QIntValidator(1, 65535, self))
+        self.hello_interval_input.textChanged.connect(self._validate_intervals_live)
         options_layout.addRow("Hello Interval:", self.hello_interval_input)
-        
+
         # Dead interval
         self.dead_interval_input = QLineEdit("40")
-        self.dead_interval_input.setPlaceholderText("seconds")
+        self.dead_interval_input.setPlaceholderText("seconds (1–65535, > hello)")
+        self.dead_interval_input.setValidator(QIntValidator(1, 65535, self))
+        self.dead_interval_input.textChanged.connect(self._validate_intervals_live)
         options_layout.addRow("Dead Interval:", self.dead_interval_input)
-        
+
         layout.addRow(options_group)
-        
+
         self.layout.addWidget(form_widget)
+
+    # ─────────────────────────────────────── v0.2.95 live validators
+    def _validate_area_id_live(self, _text: str = "") -> None:
+        """Red border when the typed Area-ID parses as neither a
+        dotted IPv4 nor an int in [0, 4294967295]. Empty stays
+        neutral — the accept-time backstop fills in the default."""
+        val = self.area_id_input.text().strip()
+        if not val:
+            self.area_id_input.setStyleSheet(_OK_QSS)
+            return
+        try:
+            from utils.ospf_area import validate_ospf_area_id
+            ok, _norm, _err = validate_ospf_area_id(val)
+        except Exception:
+            # Helper missing? Fall back to the raw parse.
+            ok = False
+            try:
+                ipaddress.IPv4Address(val); ok = True
+            except Exception:
+                try:
+                    n = int(val); ok = 0 <= n <= 4294967295
+                except Exception:
+                    pass
+        self.area_id_input.setStyleSheet(_OK_QSS if ok else _BAD_QSS)
+
+    def _validate_router_id_live(self, _text: str = "") -> None:
+        """Router-ID is optional. Red border only when non-empty and
+        not a valid IPv4."""
+        val = self.router_id_input.text().strip()
+        if not val:
+            self.router_id_input.setStyleSheet(_OK_QSS)
+            return
+        try:
+            ipaddress.IPv4Address(val)
+            self.router_id_input.setStyleSheet(_OK_QSS)
+        except Exception:
+            self.router_id_input.setStyleSheet(_BAD_QSS)
+
+    def _validate_intervals_live(self, _text: str = "") -> None:
+        """Both intervals must be positive ints in QIntValidator's
+        accepted range, and dead must be > hello. QIntValidator
+        handles the per-field range; this catches the cross-field
+        constraint."""
+        try:
+            hello = int(self.hello_interval_input.text() or "0")
+            dead  = int(self.dead_interval_input.text() or "0")
+        except ValueError:
+            # In-progress typing — leave the per-field validator do it.
+            return
+        if hello > 0 and dead > 0 and dead <= hello:
+            # Cross-field violation → red both fields so the operator
+            # sees the relationship matters, not just the numbers.
+            self.hello_interval_input.setStyleSheet(_BAD_QSS)
+            self.dead_interval_input.setStyleSheet(_BAD_QSS)
+            tip = (
+                "Dead interval must be greater than Hello interval "
+                "(RFC 2328 §10 recommends Dead = 4×Hello)."
+            )
+            self.hello_interval_input.setToolTip(tip)
+            self.dead_interval_input.setToolTip(tip)
+        else:
+            self.hello_interval_input.setStyleSheet(_OK_QSS)
+            self.dead_interval_input.setStyleSheet(_OK_QSS)
+            self.hello_interval_input.setToolTip("")
+            self.dead_interval_input.setToolTip("")
     
     def _populate_fields(self):
         """Pre-populate form fields with current OSPF configuration."""

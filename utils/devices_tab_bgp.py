@@ -71,6 +71,42 @@ class BGPHandler:
             )
         except Exception:
             pass  # overlay is advisory; never block sub-tab render
+
+        # v0.2.95: Delete-key shortcut + right-click context menu.
+        # Lifts the v0.2.74/v0.2.85 main-Devices-table affordances
+        # over to the BGP sub-tab so the keyboard + mouse-RMB UX is
+        # the same wherever the operator is. Scoped to the table
+        # widget so inline-edit Delete doesn't fire the row-delete.
+        try:
+            from PyQt5.QtWidgets import QShortcut, QMenu
+            from PyQt5.QtGui import QKeySequence
+            from PyQt5.QtCore import Qt as _Qt
+            _bgp_del = QShortcut(
+                QKeySequence(_Qt.Key_Delete), self.parent.bgp_table,
+            )
+            _bgp_del.setContext(_Qt.WidgetShortcut)
+            _bgp_del.activated.connect(self.parent.prompt_delete_bgp)
+
+            self.parent.bgp_table.setContextMenuPolicy(_Qt.CustomContextMenu)
+            def _on_bgp_ctx(pos):
+                menu = QMenu(self.parent.bgp_table)
+                act_refresh = menu.addAction("Refresh BGP status")
+                act_apply   = menu.addAction("Apply BGP configurations")
+                menu.addSeparator()
+                act_delete  = menu.addAction("Delete selected BGP")
+                act = menu.exec_(self.parent.bgp_table.viewport().mapToGlobal(pos))
+                if act is act_refresh:
+                    try: self.parent.refresh_bgp_status()
+                    except Exception: pass
+                elif act is act_apply:
+                    try: self.parent.apply_bgp_configurations()
+                    except Exception: pass
+                elif act is act_delete:
+                    try: self.parent.prompt_delete_bgp()
+                    except Exception: pass
+            self.parent.bgp_table.customContextMenuRequested.connect(_on_bgp_ctx)
+        except Exception:
+            pass  # never block sub-tab render on shortcut/menu wiring
         
         # BGP action bar — same chrome as the Devices action row
         # (grey footer QFrame, BTN_BASE / BTN_APPLY styles, 28×24 px

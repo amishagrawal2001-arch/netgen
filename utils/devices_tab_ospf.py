@@ -65,6 +65,39 @@ class OSPFHandler:
         except Exception:
             pass  # overlay is advisory; never block sub-tab render
 
+        # v0.2.95: Delete-key shortcut + right-click context menu.
+        # Same pattern that landed on the BGP sub-tab in v0.2.95 #1.
+        try:
+            from PyQt5.QtWidgets import QShortcut, QMenu
+            from PyQt5.QtGui import QKeySequence
+            from PyQt5.QtCore import Qt as _Qt
+            _ospf_del = QShortcut(
+                QKeySequence(_Qt.Key_Delete), self.parent.ospf_table,
+            )
+            _ospf_del.setContext(_Qt.WidgetShortcut)
+            _ospf_del.activated.connect(self.prompt_delete_ospf)
+
+            self.parent.ospf_table.setContextMenuPolicy(_Qt.CustomContextMenu)
+            def _on_ospf_ctx(pos):
+                menu = QMenu(self.parent.ospf_table)
+                act_refresh = menu.addAction("Refresh OSPF table")
+                act_apply   = menu.addAction("Apply OSPF configurations")
+                menu.addSeparator()
+                act_delete  = menu.addAction("Delete selected OSPF")
+                act = menu.exec_(self.parent.ospf_table.viewport().mapToGlobal(pos))
+                if act is act_refresh:
+                    try: self.update_ospf_table()
+                    except Exception: pass
+                elif act is act_apply:
+                    try: self.apply_ospf_configurations()
+                    except Exception: pass
+                elif act is act_delete:
+                    try: self.prompt_delete_ospf()
+                    except Exception: pass
+            self.parent.ospf_table.customContextMenuRequested.connect(_on_ospf_ctx)
+        except Exception:
+            pass
+
         # OSPF action bar — unified chrome with the Devices + BGP rows
         # (grey footer QFrame, BTN_BASE / BTN_APPLY styles, 28×24 px
         # buttons, vertical divider between config and runtime groups).

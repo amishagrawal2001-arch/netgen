@@ -714,6 +714,39 @@ class DHCPHandler:
         except Exception:
             pass  # overlay is advisory; never block sub-tab render
 
+        # v0.2.95: Delete-key shortcut + right-click context menu.
+        # Closes the cross-tab keyboard/mouse-RMB consistency sweep.
+        try:
+            from PyQt5.QtWidgets import QShortcut, QMenu
+            from PyQt5.QtGui import QKeySequence
+            from PyQt5.QtCore import Qt as _Qt
+            _dhcp_del = QShortcut(
+                QKeySequence(_Qt.Key_Delete), self.parent.dhcp_table,
+            )
+            _dhcp_del.setContext(_Qt.WidgetShortcut)
+            _dhcp_del.activated.connect(self.delete_selected_pool)
+
+            self.parent.dhcp_table.setContextMenuPolicy(_Qt.CustomContextMenu)
+            def _on_dhcp_ctx(pos):
+                menu = QMenu(self.parent.dhcp_table)
+                act_refresh = menu.addAction("Refresh DHCP status")
+                act_apply   = menu.addAction("Apply DHCP pools")
+                menu.addSeparator()
+                act_delete  = menu.addAction("Delete selected pool")
+                act = menu.exec_(self.parent.dhcp_table.viewport().mapToGlobal(pos))
+                if act is act_refresh:
+                    try: self.refresh_dhcp_status()
+                    except Exception: pass
+                elif act is act_apply:
+                    try: self.apply_dhcp_pools()
+                    except Exception: pass
+                elif act is act_delete:
+                    try: self.delete_selected_pool()
+                    except Exception: pass
+            self.parent.dhcp_table.customContextMenuRequested.connect(_on_dhcp_ctx)
+        except Exception:
+            pass
+
         # DHCP action bar — unified chrome with Devices + BGP + OSPF
         # + ISIS + VXLAN.
         from PyQt5.QtWidgets import QFrame, QLabel

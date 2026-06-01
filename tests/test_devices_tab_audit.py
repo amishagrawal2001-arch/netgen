@@ -161,3 +161,97 @@ def test_every_apply_path_kicks_preflight(apply_method, host_file):
         f"{apply_method} in {host_file} has no kick_refresh call — "
         f"the preflight bar will fall out of sync after this apply."
     )
+
+
+# ──────────────────────────────────────── v0.2.95: cross-sub-tab UX sweep
+#
+# v0.2.74 added Delete-key + right-click context menu to the main
+# Devices table. v0.2.95 lifts the same pattern over to the 5 protocol
+# sub-tabs so the keyboard / mouse-RMB UX is uniform regardless of
+# which table the operator is on. These tests pin that wiring per
+# protocol — a future setup refactor that drops the QShortcut or the
+# setContextMenuPolicy line will fail loudly here.
+@pytest.mark.parametrize("setup_method,host_file,table_attr,delete_handler", [
+    ("setup_bgp_subtab",   "utils/devices_tab_bgp.py",
+     "bgp_table",   "prompt_delete_bgp"),
+    ("setup_ospf_subtab",  "utils/devices_tab_ospf.py",
+     "ospf_table",  "prompt_delete_ospf"),
+    ("setup_isis_subtab",  "utils/devices_tab_isis.py",
+     "isis_table",  "prompt_delete_isis"),
+    ("setup_vxlan_subtab", "utils/devices_tab_vxlan.py",
+     "vxlan_table", "delete_selected_vxlan_tunnels"),
+    ("setup_dhcp_subtab",  "utils/devices_tab_dhcp.py",
+     "dhcp_table",  "delete_selected_pool"),
+])
+def test_v0_2_95_subtab_has_delete_key_and_context_menu(
+    setup_method, host_file, table_attr, delete_handler,
+):
+    """Each sub-tab's setup_*_subtab body must wire:
+      * A QShortcut bound to Qt.Key_Delete on its table widget.
+      * setContextMenuPolicy(Qt.CustomContextMenu) on the same table.
+      * customContextMenuRequested.connect to a handler.
+      * The protocol's delete handler is reachable from both (the
+        shortcut hits it directly, the menu has a 'Delete selected …'
+        entry).
+    Catches accidental regressions of the v0.2.95 cross-tab sweep."""
+    src = (REPO / host_file).read_text()
+    # NB: my context-menu wiring contains a nested `def _on_*_ctx(pos):`
+    # inside a try-block, so the existing "stop at next def" regex
+    # truncates the method body early. Anchor on `\n    def ` (4-space
+    # indent = class-body level) so we capture through to the *next*
+    # method, not the nested helper.
+    m = re.search(
+        rf"def {setup_method}\(self\).*?(?=\n    def |\Z)",
+        src, flags=re.DOTALL,
+    )
+    assert m is not None, f"{setup_method} not found in {host_file}"
+    body = m.group(0)
+    # Delete-key shortcut on this protocol's table.
+    assert "Key_Delete" in body, (
+        f"{setup_method} missing Qt.Key_Delete shortcut on {table_attr} — "
+        f"v0.2.95 cross-tab Delete-key wiring regressed."
+    )
+    assert table_attr in body, (
+        f"{setup_method} references no {table_attr} — refactor moved the "
+        f"table attribute? Update the audit pin."
+    )
+    # Right-click custom menu policy + handler connect.
+    assert "CustomContextMenu" in body, (
+        f"{setup_method} missing setContextMenuPolicy(Qt.CustomContextMenu) "
+        f"on {table_attr} — v0.2.95 right-click wiring regressed."
+    )
+    assert "customContextMenuRequested" in body, (
+        f"{setup_method} missing customContextMenuRequested.connect — "
+        f"context menu won't fire."
+    )
+    # Delete-handler reachable.
+    assert delete_handler in body, (
+        f"{setup_method} doesn't reach {delete_handler} from either the "
+        f"Delete-key shortcut or the context-menu 'Delete selected' entry."
+    )
+
+
+# ──────────────────────────────────────── v0.2.95: OSPF dialog live validators
+def test_v0_2_95_ospf_dialog_has_live_area_id_validator():
+    """The OSPF add dialog's area_id_input QLineEdit must connect a
+    textChanged handler that re-evaluates the input against
+    validate_ospf_area_id (or its inline fallback) and toggles the
+    red-border stylesheet. Deferred from v0.2.74; pinned in v0.2.95."""
+    src = (REPO / "widgets" / "add_ospf_dialog.py").read_text()
+    # The new live-validator method wiring.
+    assert "_validate_area_id_live" in src, (
+        "AddOspfDialog must define _validate_area_id_live for the "
+        "live area-id border feedback (v0.2.95 POLISH closure)."
+    )
+    assert "area_id_input.textChanged.connect" in src, (
+        "area_id_input must connect textChanged to the live validator."
+    )
+    # Router ID + intervals also covered.
+    assert "_validate_router_id_live" in src
+    assert "_validate_intervals_live" in src
+    # QIntValidator pinned on hello + dead intervals.
+    assert src.count("QIntValidator(1, 65535") >= 2, (
+        "Hello + Dead interval QLineEdits must each carry "
+        "QIntValidator(1, 65535) so the live border catches "
+        "out-of-range typing before submit."
+    )

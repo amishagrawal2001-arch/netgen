@@ -84,6 +84,41 @@ class VXLANHandler:
         except Exception:
             pass  # overlay is advisory; never block sub-tab render
 
+        # v0.2.95: Delete-key shortcut + right-click context menu.
+        # Same pattern that landed on BGP / OSPF / IS-IS sub-tabs.
+        # VXLAN's delete handler removes selected tunnel rows; apply
+        # lives on the parent (DevicesTab) so menu reaches into it.
+        try:
+            from PyQt5.QtWidgets import QShortcut, QMenu
+            from PyQt5.QtGui import QKeySequence
+            from PyQt5.QtCore import Qt as _Qt
+            _vxlan_del = QShortcut(
+                QKeySequence(_Qt.Key_Delete), self.parent.vxlan_table,
+            )
+            _vxlan_del.setContext(_Qt.WidgetShortcut)
+            _vxlan_del.activated.connect(self.delete_selected_vxlan_tunnels)
+
+            self.parent.vxlan_table.setContextMenuPolicy(_Qt.CustomContextMenu)
+            def _on_vxlan_ctx(pos):
+                menu = QMenu(self.parent.vxlan_table)
+                act_refresh = menu.addAction("Refresh VXLAN table")
+                act_apply   = menu.addAction("Apply VXLAN configurations")
+                menu.addSeparator()
+                act_delete  = menu.addAction("Delete selected VXLAN tunnel(s)")
+                act = menu.exec_(self.parent.vxlan_table.viewport().mapToGlobal(pos))
+                if act is act_refresh:
+                    try: self.refresh_vxlan_table()
+                    except Exception: pass
+                elif act is act_apply:
+                    try: self.parent.apply_vxlan_configurations()
+                    except Exception: pass
+                elif act is act_delete:
+                    try: self.delete_selected_vxlan_tunnels()
+                    except Exception: pass
+            self.parent.vxlan_table.customContextMenuRequested.connect(_on_vxlan_ctx)
+        except Exception:
+            pass
+
         # VXLAN action bar — unified chrome with Devices + BGP + OSPF + ISIS.
         from PyQt5.QtWidgets import QFrame, QLabel
         action_bar = QFrame()
