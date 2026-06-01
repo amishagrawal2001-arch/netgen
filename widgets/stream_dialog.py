@@ -13,7 +13,21 @@ from PyQt5.QtWidgets import (
     QSpacerItem, QFileDialog
 )
 from PyQt5.QtCore import QTimer, Qt, QRegExp, QSize, QItemSelectionModel, QDateTime
-from PyQt5.QtGui import QIntValidator, QBrush, QRegExpValidator, QIcon, QValidator, QPixmap, QColor
+from PyQt5.QtGui import QIntValidator, QBrush, QRegExpValidator, QIcon, QValidator, QPixmap, QColor, QKeySequence
+from PyQt5.QtWidgets import QShortcut
+
+# v0.2.96: pure-function validators + live red-border stylesheet
+# constants. The dialog wires both live (textChanged → border colour)
+# and at submit-time (accept() override → blocking QMessageBox with
+# the full error list). See utils/stream_input.py for the parsing.
+from utils.stream_input import (
+    validate_mac, is_zero_mac,
+    validate_ipv4, validate_ipv6,
+    validate_frame_sizes, collect_errors,
+)
+
+_LIVE_OK_QSS  = ""  # Qt default — respects platform theme
+_LIVE_BAD_QSS = "QLineEdit { border: 1px solid #dc2626; background: #fef2f2; }"
 
 
 class Unsigned32BitValidator(QValidator):
@@ -4069,6 +4083,24 @@ class AddStreamDialog(QDialog):
         self.main_layout.addWidget(self.buttons)
         self.setLayout(self.main_layout)
 
+        # v0.2.96: Ctrl+Return = Save. Standard Qt dialog shortcut
+        # that was missing — operators expect it from the main window
+        # (Ctrl+S Save Session, Ctrl+Return Apply Stream) and every
+        # other modal in the app.
+        try:
+            _save_sc = QShortcut(
+                QKeySequence(Qt.CTRL + Qt.Key_Return), self,
+            )
+            _save_sc.setContext(Qt.WindowShortcut)
+            _save_sc.activated.connect(self.accept)
+        except Exception:
+            pass  # shortcut is convenience; never block dialog open
+
+        # v0.2.96: live red-border feedback on MAC + IP fields.
+        # Wired AFTER setup_*_section methods have run (everything
+        # in __init__ before this line builds the fields).
+        self._wire_live_validators()
+
         # Populate RX list after protocol tab exists
         self.populate_rx_ports(self.tx_port_name)
 
@@ -6329,6 +6361,139 @@ class AddStreamDialog(QDialog):
             self._traffic_template_summary.setText(
                 f"Template '{key}' failed to apply: {exc}"
             )
+
+    # ─────────────────────────────────────── v0.2.96: input validation
+    def _wire_live_validators(self):
+        """Bind ``textChanged`` on the MAC + IP QLineEdits so the
+        operator sees a red border the moment they type something
+        the server will reject. Pure-function validators live in
+        ``utils/stream_input.py`` so the parsing has its own tests
+        without spinning up Qt.
+
+        Defensive: any missing attribute (e.g. the IPv6 section
+        wasn't built because the protocol-data tab was lazy-loaded
+        on a tab change) is silently skipped — the dialog stays
+        usable; the accept() backstop catches it at submit.
+        """
+        pairs = [
+            ("mac_source_address",       validate_mac),
+            ("mac_destination_address",  validate_mac),
+            ("source_field",             validate_ipv4),  # IPv4 src
+            ("destination_field",        validate_ipv4),  # IPv4 dst
+            ("ipv6_source_field",        validate_ipv6),
+            ("ipv6_destination_field",   validate_ipv6),
+        ]
+        for attr, validator in pairs:
+            line = getattr(self, attr, None)
+            if line is None:
+                continue
+            try:
+                # Closure over validator + line — default-arg trick
+                # to capture per-iteration value instead of last-loop.
+                def _on_change(_text="", _l=line, _v=validator):
+                    err = _v(_l.text())
+                    _l.setStyleSheet(_LIVE_BAD_QSS if err else _LIVE_OK_QSS)
+                    # Tooltip carries the explanatory error so the
+                    # operator can hover to see why it's red.
+                    _l.setToolTip(err or "")
+                line.textChanged.connect(_on_change)
+                # Run once now so a pre-populated edit-mode value
+                # is evaluated immediately instead of waiting for
+                # the operator to touch the field.
+                _on_change()
+            except Exception:
+                # Don't let a single field's wiring break the dialog.
+                continue
+
+    def accept(self):
+        """v0.2.96: gate Save behind a full-form validation pass.
+
+        Pre-v0.2.96 the buttons.accepted signal connected straight
+        to ``QDialog.accept`` — Save would close the dialog with
+        any garbage in any field. The server's /api/stream/add
+        rejected later, but the operator had already lost the modal
+        and could only see the failure as a generic toast.
+
+        Collects every per-field error AND the cross-field frame-
+        size constraint into a single QMessageBox so the operator
+        sees the full picture instead of dismissing one popup at
+        a time. Returns without calling super().accept() so the
+        dialog stays open on failure.
+        """
+        # Per-field MAC + IP validation. Skip absent fields
+        # (lazy-loaded protocol sub-sections, edit mode without
+        # certain protocols selected) — accept() shouldn't reject
+        # a stream because a field it doesn't use is unset.
+        check_pairs = []
+        for label, attr, validator in [
+            ("Source MAC",        "mac_source_address",       validate_mac),
+            ("Destination MAC",   "mac_destination_address",  validate_mac),
+            ("Source IPv4",       "source_field",             validate_ipv4),
+            ("Destination IPv4",  "destination_field",        validate_ipv4),
+            ("Source IPv6",       "ipv6_source_field",        validate_ipv6),
+            ("Destination IPv6",  "ipv6_destination_field",   validate_ipv6),
+        ]:
+            line = getattr(self, attr, None)
+            if line is None:
+                continue
+            # An IPv6 field that's part of the dialog but the
+            # operator hasn't enabled the IPv6 group for: skip the
+            # check rather than force them to fix a field they
+            # won't ship. We use isEnabled() as the proxy because
+            # the dialog disables sections when the protocol combo
+            # excludes them.
+            try:
+                if not line.isEnabled():
+                    continue
+            except Exception:
+                pass
+            check_pairs.append((label, line.text(), validator))
+
+        errors = collect_errors(check_pairs)
+
+        # Cross-field: frame_min ≤ frame_max (only when both fields
+        # exist + their parent random/imix mode is active). Read
+        # the frame_type combo to know which check applies.
+        try:
+            frame_type = "fixed"
+            ft_combo = getattr(self, "frame_type_dropdown", None) \
+                or getattr(self, "frame_type", None)
+            if ft_combo is not None and hasattr(ft_combo, "currentText"):
+                frame_type = (ft_combo.currentText() or "fixed").lower()
+            def _maybe_int(attr):
+                w = getattr(self, attr, None)
+                if w is None:
+                    return None
+                try:
+                    return int(w.text())
+                except (ValueError, TypeError):
+                    return None
+            fs_err = validate_frame_sizes(
+                fixed=_maybe_int("frame_size"),
+                minimum=_maybe_int("frame_min"),
+                maximum=_maybe_int("frame_max"),
+                frame_type=frame_type,
+            )
+            if fs_err is not None:
+                errors.append(("Frame size", fs_err))
+        except Exception:
+            # Frame-section absent in some dialog modes — skip.
+            pass
+
+        if errors:
+            lines = ["The following fields need attention:", ""]
+            for label, err in errors:
+                lines.append(f"  • {label}: {err}")
+            lines.append("")
+            lines.append(
+                "Fix the highlighted (red-border) fields and click "
+                "Save again."
+            )
+            QMessageBox.warning(
+                self, "Stream configuration invalid", "\n".join(lines),
+            )
+            return  # stay open
+        super().accept()
 
     def populate_stream_fields(self, stream_data=None):
         stream_data = stream_data or {}

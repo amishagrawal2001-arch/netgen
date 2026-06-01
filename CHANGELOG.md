@@ -2,6 +2,86 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.2.96] - 2026-06-01
+
+**Stream dialog — input safety + UX consistency (5 audit items
+closed).** The Add-stream / Edit-stream modal is the most-touched
+dialog in the app — every traffic flow starts there. The v0.2.96
+audit found that while every numeric field was guarded by
+`QIntValidator` at type-time, three submit-time gaps let bad data
+through to the server:
+
+- **No custom `accept()` override** — Save fired straight through
+  to `QDialog.accept`, no pre-submit validation pass.
+- **MAC fields were plain QLineEdit** — accepted unicode,
+  garbage, the empty string. Server rejected with a less-friendly
+  error after the dialog was already gone.
+- **IPv4 / IPv6 fields were plain QLineEdit** — same story.
+- **No cross-field check** for the frame-size group: an operator
+  could enter `min=1518, max=64` and the dialog accepted it.
+- **No `Ctrl+Return` shortcut to Save** — every other dialog in
+  the app supports it.
+
+### What changed
+- **New `utils/stream_input.py`** pure-function validators —
+  `validate_mac`, `is_zero_mac`, `validate_ipv4`, `validate_ipv6`,
+  `validate_frame_sizes`, `collect_errors`. Pure-Python so they
+  have their own tests without spinning up Qt. Matches the
+  `utils/isis_net.py` (v0.2.86) and `utils/ospf_area.py` (v0.2.87)
+  shape.
+- **`widgets/stream_dialog.py:_wire_live_validators`** — wires
+  `textChanged` on src/dst MAC + IPv4 + IPv6 fields to apply the
+  v0.2.95 OSPF-dialog red-border stylesheet pattern. Tooltip
+  carries the explanatory error so the operator can hover to see
+  why a field went red. Defensive against missing attributes
+  (lazy-loaded protocol sub-sections won't crash the wiring).
+- **`widgets/stream_dialog.py:accept`** — custom override that
+  walks every required MAC + IP field, applies the cross-field
+  frame-size check, collects every error into a single
+  `QMessageBox.warning` (so the operator sees the full picture
+  instead of dismissing one popup at a time), and returns without
+  closing the dialog on failure. Pre-v0.2.96 the buttons.accepted
+  signal connected straight to `QDialog.accept` so Save closed
+  the modal regardless of field content.
+- **`widgets/stream_dialog.py` Ctrl+Return shortcut** —
+  `QShortcut(Qt.CTRL+Qt.Key_Return)` bound to `accept()` so
+  keyboard-driven operators get the same "Submit" muscle memory
+  the main window already trains.
+
+### What didn't change
+- **All existing `QIntValidator` wiring** (port, MAC count, MPLS
+  label, VLAN, TTL, intervals, etc.) — those already enforce
+  per-field bounds at type-time. The v0.2.96 audit initially
+  flagged "missing live validators on port fields" as PAIN, but
+  inspection confirmed the existing `QIntValidator` already
+  catches out-of-range numerics — false positive.
+- **`populate_rx_ports`** — the audit flagged it as a "GUI thread
+  block" but reading the method confirmed it's an in-memory walk
+  of the already-resolved `server_interfaces` list, no network
+  call. False positive.
+
+### Deferred POLISH
+- "Preview frame" button on the dialog (v0.2.84 L2-emulation
+  pattern, but the Stream dialog's frame builder is more complex
+  — needs its own design pass).
+- "Clone stream" affordance (would need a template-management
+  surface, larger than a polish PR).
+- "Reset to defaults" button (needs to track the factory state
+  per protocol section).
+- Tooltips sweep for DSCP / ECN / MPLS-EXP semantic hints.
+- Stylesheet unification (would touch many files; risk vs. value
+  unclear without a real UI complaint).
+
+### Tests
+- **`tests/test_stream_input.py`** — 57 new pure-function tests
+  covering MAC / IPv4 / IPv6 / frame-size / batch-collect across
+  the obvious garbage inputs (unicode, wrong family, out-of-range,
+  inverted min/max, etc.). The whole file runs in 0.07 s without
+  Qt.
+
+### Test count
+666 → 723 (+57).
+
 ## [0.2.95] - 2026-06-01
 
 **Devices-tab POLISH sweep — cross-sub-tab keyboard/RMB consistency
