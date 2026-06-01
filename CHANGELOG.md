@@ -2,6 +2,84 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.3.4] - 2026-06-01
+
+**Flow-tracking: fix silent zero RX count on DPDK streams.**
+Real correctness bug surfaced by the v0.3.4 flow-tracking audit:
+the RX sniffer's signature matcher was a fixed prefix
+(`f"[{stream_id}#".encode()`) that recognised only the Scapy TX
+packet format and silently ignored the DPDK TX format. Any
+stream with `flow_tracking=True` AND `dpdk_enable=True` showed
+`rx_count=0` / `loss=100%` in the GUI — operator saw "none of
+my DPDK packets got through" when they actually all arrived;
+the sniffer just couldn't recognise them.
+
+### Root cause
+The two TX backends embed different signatures in each packet:
+
+- **Scapy TX** (`multithreaded_traffic_gen.py:_append_sig_with_seq`):
+  `[<stream_id>#<seq>]`
+- **DPDK TX** (`resources/dpdk/tx_worker/tx_worker.c:223`):
+  `[<stream_id>/q<queue_id>#<seq>]`
+
+The DPDK side embeds the per-queue ID for debug visibility. The
+RX sniffer only cares about the `<stream_id>`, but its matcher
+demanded `#` immediately after the stream_id — the optional
+`/q<queue_id>` segment broke it. Bug pre-dates v0.2.94 and
+has been in tree since DPDK TX gained per-queue tagging.
+
+### What changed
+- **`multithreaded_traffic_gen.py:_build_sig_pattern`** — new
+  module-level helper that compiles a bytes regex tolerating
+  the optional `/q\d+` segment:
+  `re.compile(rb"\[" + re.escape(stream_id.encode()) + rb"(?:/q\d+)?#")`
+  Extracted out of the sniffer-thread closure so the pattern
+  has its own tests without spinning up scapy.
+- **`multithreaded_traffic_gen.py:start_rx_counter`** — the
+  closure-local `sig_prefix` byte-string is replaced with a
+  call to `_build_sig_pattern(stream_id)`. The `_sig_present`
+  helper now does `pat.search(raw_bytes)` instead of `in`.
+- `stream_id` is `re.escape`'d so legitimate IDs containing
+  regex meta-characters (dots, parens, plus signs — UUIDs use
+  hyphens; some installs use dot-separators) match as literals
+  instead of being treated as wildcards.
+
+### Tests
+- **`tests/test_flow_tracking_sig.py`** — 18 pins (mostly
+  parametrised):
+  - Returns a compiled bytes regex.
+  - Matches every Scapy-format example (6 cases inc. UUID-
+    style and dot-separator IDs).
+  - Matches every DPDK-format example (7 cases inc. multi-
+    queue 0/1/15/127 and dot-separator IDs).
+  - Does NOT match similar-looking other-stream signatures
+    (prefix-collision, missing `[`, missing `#`).
+  - Does NOT match malformed `/q` segments (no digits,
+    letters, full word).
+  - `re.escape`'s the stream_id (the test for `s.x` not
+    matching `sax`).
+  - Searches within larger payloads (real packets have
+    padding before/after the signature).
+
+### Other flow-tracking audit findings — documented in
+### "Unreleased — known follow-ups" below
+None of the other 5 PAIN findings ship in v0.3.4. Each is real
+but design-level work bigger than a focused patch release:
+- Loss% returns `0.0` on idle streams instead of null (GUI
+  handles correctly with `if tx > 0` guard; API contract
+  ambiguity).
+- RX matching falls back to L2/L3/L4 tuple when signature
+  missed — design tradeoff for missed-signature recovery.
+- Auto-relax 2 s timeout can mask early frame drops.
+- Latency histogram is per-interface, not per-stream
+  (two concurrent streams on same RX iface have mixed
+  samples).
+- Out-of-order packet detection is computed but never
+  surfaced in the GUI.
+
+### Test count
+771 → 789 (+18).
+
 ## [0.3.3] - 2026-06-01
 
 **CI: opt every release job into Node.js 24.** GitHub deprecated
@@ -122,6 +200,38 @@ v0.3.1 DPDK audit cycle.
 
 Items still on the deferred list — not blocking, but documented
 so a future session knows they exist.
+
+### From the v0.3.4 flow-tracking audit
+- **Loss% returns `0.0` on idle streams** instead of `null` /
+  `n/a` (`run_tgen_server.py` stats endpoint). The GUI handles
+  it correctly (`if tx > 0` guard renders `—`), but API
+  callers see an ambiguous numeric zero. Better contract: omit
+  the field, or return null, when `tx_count == 0`.
+- **RX matching falls back to L2/L3/L4 tuple when signature
+  missed** (`multithreaded_traffic_gen.py:_tuple_match`). Two
+  streams on the same iface with identical 5-tuple but
+  different signatures will get mis-attributed if the
+  signature path fails. Design tradeoff for missed-signature
+  recovery — fix would require per-stream dport narrowing in
+  the tuple path too.
+- **Auto-relax 2 s timeout can mask early frame drops**
+  (`multithreaded_traffic_gen.py:~625`). If the RX sniffer
+  doesn't see matching packets in 2 s it relaxes to "any UDP."
+  Frames arriving after relaxation count toward `rx_count`,
+  but the operator has no indicator the stream was silent at
+  first. Fix needs a "first signature-matched packet seen at"
+  timestamp surfaced in the stats payload.
+- **Latency histogram is per-interface, not per-stream**
+  (`utils/latency_sampler.py:~106`). Two concurrent streams
+  on the same RX iface have mixed latency samples. The stats
+  endpoint returns one latency blob per interface. Fix needs
+  per-stream histogram + per-stream API response — bigger
+  refactor.
+- **Out-of-order packet detection is computed but never
+  surfaced** (`multithreaded_traffic_gen.py:~475`). The
+  sniffer can decode sequence numbers but no OOO counter
+  exists in `update_rx()` or the API response. Feature
+  appears half-finished.
 
 ### From earlier audits (still deferred)
 - **Async-worker progress dialogs** for ISIS / VXLAN / DHCP

@@ -11,6 +11,7 @@ Multithreaded traffic generator with optional DPDK/tx_worker backend.
   L2/L3/L4 selector (DPDK path) so rx_count increases for both engines.
 """
 
+import re
 import time
 import logging
 import threading
@@ -244,6 +245,29 @@ stream_tracker = StreamTracker()
 # ---------------------------
 # Signature helpers (unique per packet) — Scapy path only
 # ---------------------------
+def _build_sig_pattern(stream_id: str):
+    """v0.3.4: compile the signature-matching regex for the RX
+    sniffer. Accepts BOTH packet formats produced by the two TX
+    backends:
+      * Scapy TX: ``[<stream_id>#<seq>]``
+      * DPDK TX:  ``[<stream_id>/q<queue_id>#<seq>]``
+    The optional ``/q\\d+`` segment is the only difference; the DPDK
+    C-side worker (``resources/dpdk/tx_worker/tx_worker.c:223``)
+    embeds the per-queue ID for debug visibility, but the RX path
+    only cares about the stream ID. Pre-v0.3.4 the matcher was a
+    fixed prefix that silently dropped DPDK packets — any flow-
+    tracking stream with ``dpdk_enable=True`` showed ``rx_count=0``
+    and reported 100% loss.
+
+    Pure function — extracted from ``start_rx_counter`` so the
+    pattern can have its own tests without spinning up the sniffer.
+    Returns a compiled bytes regex.
+    """
+    return re.compile(
+        rb"\[" + re.escape(stream_id.encode()) + rb"(?:/q\d+)?#"
+    )
+
+
 def _append_sig_with_seq(pkt, stream_id: str, seq: int):
     from scapy.layers.inet import IP, UDP
     from scapy.layers.inet6 import IPv6
@@ -472,7 +496,22 @@ def start_rx_counter(rx_interface, stream_name, stream_id, tracker: StreamTracke
     logging.info(f"[RX] BPF applied on {sniff_iface}: {final_bpf}")
 
     # ---- local state ----
-    sig_prefix = f"[{stream_id}#".encode()
+    # v0.3.4: signature matcher accepts BOTH packet formats produced
+    # by the two TX backends:
+    #   * Scapy TX (multithreaded_traffic_gen.py:~253):
+    #         [<stream_id>#<seq>]
+    #   * DPDK TX (resources/dpdk/tx_worker/tx_worker.c:223):
+    #         [<stream_id>/q<queue_id>#<seq>]
+    # Pre-v0.3.4 the matcher was `f"[{stream_id}#".encode()` — a
+    # fixed prefix that only matched the Scapy format. Any stream
+    # with flow tracking enabled AND dpdk_enable=True silently
+    # showed rx_count=0 / loss=100% because the DPDK packets carried
+    # the queue-id segment between `<stream_id>` and `#`.
+    # Regex below tolerates the optional `/q<digit>+` segment so a
+    # single sniffer matches both backends. stream_id is re.escape'd
+    # because legitimate stream IDs can contain `.` (used as a wildcard
+    # in regex otherwise).
+    sig_pattern = _build_sig_pattern(stream_id)
     try:
         local_mac = (get_if_hwaddr(sniff_iface) or "").lower()
     except Exception:
@@ -489,13 +528,13 @@ def start_rx_counter(rx_interface, stream_name, stream_id, tracker: StreamTracke
     def _sig_present(pkt) -> bool:
         try:
             if Raw in pkt and getattr(pkt[Raw], "load", None) is not None:
-                if sig_prefix in bytes(pkt[Raw].load):
+                if sig_pattern.search(bytes(pkt[Raw].load)):
                     return True
         except Exception:
             pass
         try:
             raw_frame = bytes(getattr(pkt, "original", None) or pkt)
-            return sig_prefix in raw_frame
+            return sig_pattern.search(raw_frame) is not None
         except Exception:
             return False
 
