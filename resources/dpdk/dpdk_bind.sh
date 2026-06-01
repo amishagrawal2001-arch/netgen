@@ -141,22 +141,47 @@ has_active_routes() {
     ip -o route show 2>/dev/null | grep -q " dev $iface " && return 0 || return 1
 }
 
+# v0.3.2: defence-in-depth PCI address validator. The Python layer
+# (run_tgen_server.py) checks for `":" in pci` but nothing more
+# rigorous; this script runs as root via sudo so a malformed PCI
+# string (or one constructed to escape sysfs path resolution) would
+# be free to do real damage. Standard format per the kernel:
+#   <domain:4hex>:<bus:2hex>:<device:2hex>.<function:1hex>
+# Examples that pass:  0000:00:1f.6   0000:c9:00.0   abcd:01:02.7
+# Examples that fail:  garbage   "../etc"   ;rm   :00:00.0   0000:00:00
+validate_pci_address() {
+    local pci="$1"
+    [[ -z "$pci" ]] && return 1
+    # Bash regex — 4 hex : 2 hex : 2 hex . 1 hex, anchored.
+    if [[ "$pci" =~ ^[0-9a-fA-F]{4}:[0-9a-fA-F]{2}:[0-9a-fA-F]{2}\.[0-9a-fA-F]$ ]]; then
+        return 0
+    fi
+    return 1
+}
+
 # Bind NIC to DPDK
 bind_to_dpdk() {
     local pci="$1"
     local force="${2:-0}"
-    
+
     # Handle --force flag if passed as separate argument
     if [[ "$force" == "--force" ]] || [[ "$force" == "1" ]] || [[ "$force" == "true" ]]; then
         force="1"
     else
         force="0"
     fi
-    
+
     check_root
-    
+
     if [[ -z "$pci" ]]; then
         log_error "PCI address required"
+        return 1
+    fi
+
+    # v0.3.2: strict format check BEFORE any sysfs write. The Python
+    # layer doesn't enforce this; we run as root so we must.
+    if ! validate_pci_address "$pci"; then
+        log_error "Invalid PCI address format: '$pci' (expected NNNN:NN:NN.N hex)"
         return 1
     fi
     
@@ -423,11 +448,17 @@ bind_to_dpdk() {
 unbind_from_dpdk() {
     local pci="$1"
     local kernel_driver="${2:-}"
-    
+
     check_root
-    
+
     if [[ -z "$pci" ]]; then
         log_error "PCI address required"
+        return 1
+    fi
+
+    # v0.3.2: same defence-in-depth guard as bind_to_dpdk above.
+    if ! validate_pci_address "$pci"; then
+        log_error "Invalid PCI address format: '$pci' (expected NNNN:NN:NN.N hex)"
         return 1
     fi
     

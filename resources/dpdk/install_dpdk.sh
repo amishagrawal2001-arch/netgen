@@ -295,6 +295,17 @@ step_clone_dpdk() {
     }
     cd "$dpdk_name"
     git checkout v23.11 || git checkout main
+
+    # v0.3.2: fail-early sanity check on the clone. Pre-v0.3.2 a
+    # corrupted clone (no meson.build) only surfaced ~60 s later
+    # during the build step as a cryptic meson error. Confirm the
+    # tree looks like a DPDK source checkout RIGHT NOW so the
+    # operator gets an actionable message at the source step.
+    if [[ ! -f meson.build ]] || [[ ! -d lib ]]; then
+        log_error "DPDK source tree looks incomplete (missing meson.build or lib/)"
+        log_error "The git clone may have been interrupted. Delete $DPDK_DIR and re-run."
+        exit 1
+    fi
     log_success "DPDK cloned successfully"
 }
 
@@ -395,8 +406,14 @@ step_install_dependencies() {
     local kernel_headers="linux-headers-$(uname -r 2>/dev/null || echo generic)"
     local deps_install_cmd="apt-get install -y --option Acquire::http::Timeout=30 --option Acquire::ftp::Timeout=30 build-essential meson ninja-build pkg-config libnuma-dev libelf-dev libpcap-dev libibverbs-dev libmlx5-dev rdma-core ${kernel_headers}"
     
+    # v0.3.2: tighten umask around the temp-log tee so the file is
+    # 0600 (owner-only) instead of the default 0644 (world-readable).
+    # apt-get output isn't high-sensitivity, but there's no reason
+    # to leak package names + error fragments to every user on the
+    # host. The (subshell) keeps the umask change scoped — outer
+    # process umask is untouched after the block exits.
     # Try to install dependencies
-    if eval "$deps_install_cmd" 2>&1 | tee /tmp/dpdk_deps_install.log; then
+    if (umask 077 && eval "$deps_install_cmd" 2>&1 | tee /tmp/dpdk_deps_install.log); then
         log_success "Dependencies installed successfully"
     else
         # Check if it's just unrelated package issues (like NVIDIA drivers)

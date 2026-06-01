@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import re
+import select
 import shlex
 import signal
 import subprocess
@@ -519,61 +520,130 @@ def run_stream(
     seen_output = False
     error_lines = []
 
-    try:
-        for line in proc.stdout:  # type: ignore[arg-type]
-            if line is None:
-                break
-            line = line.rstrip()
-            if not line:
-                continue
-            
-            seen_output = True
-            
-            # Log EAL initialization messages at debug level, but capture errors
-            if line.startswith("EAL:"):
-                # Check for common EAL errors and log them at warning/error level
-                if "No free" in line and "hugepages" in line:
-                    LOG.error("[dpdk] %s", line)
-                    LOG.error("[dpdk] Hugepages not configured. Configure hugepages using:")
-                    LOG.error("[dpdk]   echo 1024 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages")
-                    LOG.error("[dpdk]   echo 'vm.nr_hugepages=1024' >> /etc/sysctl.conf")
-                elif "No DPDK ports" in line or "No available" in line:
-                    LOG.error("[dpdk] %s", line)
-                    LOG.error("[dpdk] Device not bound to DPDK. Bind the device using:")
-                    LOG.error("[dpdk]   Use 'Bind Interface to DPDK' in the DPDK menu")
-                elif "Error" in line or "error" in line or "failed" in line:
-                    LOG.error("[dpdk] %s", line)
-                else:
-                    LOG.debug("[dpdk] %s", line)
-                continue
-            
-            # Parse STAT lines for statistics
-            m = stat_re.search(line)
-            if m:
-                tx_abs = int(m.group(2))
-                # Convert absolute to deltas for StreamTracker
-                current = _safe_get_tx(tracker, interface, stream_id)
-                delta = max(tx_abs - current, 0)
-                if delta:
-                    # Use batch update to reduce lock contention and improve performance
-                    tracker.update_tx_by_id(interface, stream_id, count=delta)
-                LOG.debug("[dpdk] STAT: stream=%s tx_abs=%s current=%s delta=%s", stream_id, tx_abs, current, delta)
-                continue
-            
-            # Log all other lines (errors, warnings, etc.)
-            # Check for common error patterns
-            line_lower = line.lower()
-            if any(keyword in line_lower for keyword in ["error", "failed", "fail", "cannot", "unable", "invalid", "not found", "missing"]):
+    # v0.3.2: stdout reader switched from `for line in proc.stdout:`
+    # (blocking iteration, can park the thread indefinitely if DPDK
+    # EAL hangs on device init) to a select-based poll. The select
+    # call wakes every 500 ms even if no data arrives, giving the
+    # loop a chance to:
+    #   * notice stop_event has been set (operator clicked Stop)
+    #   * notice the child process died (proc.poll() != None) and
+    #     drain any final output before exiting
+    # Pre-v0.3.2 both checks only fired after a line arrived; if EAL
+    # was stuck waiting on a never-coming-up vfio-pci device, the
+    # operator could not stop the stream without restarting the
+    # server. See CHANGELOG for the full audit context.
+    def _process_one_line(raw_line):
+        """Inner dispatch — extracted so both the select-based main
+        loop AND the drain-on-exit path can use the same routing
+        logic for EAL / STAT / generic-error lines."""
+        nonlocal seen_output
+        line = raw_line.rstrip()
+        if not line:
+            return
+        seen_output = True
+        if line.startswith("EAL:"):
+            if "No free" in line and "hugepages" in line:
                 LOG.error("[dpdk] %s", line)
-                error_lines.append(line)
-            elif any(keyword in line_lower for keyword in ["warning", "warn"]):
-                LOG.warning("[dpdk] %s", line)
+                LOG.error("[dpdk] Hugepages not configured. Configure hugepages using:")
+                LOG.error("[dpdk]   echo 1024 > /sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages")
+                LOG.error("[dpdk]   echo 'vm.nr_hugepages=1024' >> /etc/sysctl.conf")
+            elif "No DPDK ports" in line or "No available" in line:
+                LOG.error("[dpdk] %s", line)
+                LOG.error("[dpdk] Device not bound to DPDK. Bind the device using:")
+                LOG.error("[dpdk]   Use 'Bind Interface to DPDK' in the DPDK menu")
+            elif "Error" in line or "error" in line or "failed" in line:
+                LOG.error("[dpdk] %s", line)
             else:
-                # Log other output at info level (might be useful for debugging)
-                LOG.info("[dpdk] %s", line)
+                LOG.debug("[dpdk] %s", line)
+            return
+        m = stat_re.search(line)
+        if m:
+            tx_abs = int(m.group(2))
+            current = _safe_get_tx(tracker, interface, stream_id)
+            delta = max(tx_abs - current, 0)
+            if delta:
+                tracker.update_tx_by_id(interface, stream_id, count=delta)
+            LOG.debug("[dpdk] STAT: stream=%s tx_abs=%s current=%s delta=%s",
+                      stream_id, tx_abs, current, delta)
+            return
+        line_lower = line.lower()
+        if any(k in line_lower for k in (
+            "error", "failed", "fail", "cannot", "unable",
+            "invalid", "not found", "missing",
+        )):
+            LOG.error("[dpdk] %s", line)
+            error_lines.append(line)
+        elif any(k in line_lower for k in ("warning", "warn")):
+            LOG.warning("[dpdk] %s", line)
+        else:
+            LOG.info("[dpdk] %s", line)
 
+    try:
+        # Cache the fd once; proc.stdout's wrapper survives until
+        # `proc` is GC'd at end of scope.
+        stdout_fd = proc.stdout.fileno() if proc.stdout else -1
+        _POLL_TIMEOUT_S = 0.5
+
+        while True:
+            # Stop-event check FIRST so a request that came in while
+            # we were blocked in the previous select returns control
+            # to the caller before we attempt another read.
             if stop_event.is_set():
+                LOG.debug("[dpdk] stop_event set — exiting stdout reader")
                 break
+
+            # Process-died check. If the child exited (clean or
+            # crashed), drain any buffered output then bail. Without
+            # this the loop would spin forever calling select on a
+            # closed pipe.
+            if proc.poll() is not None:
+                try:
+                    remaining = proc.stdout.read() if proc.stdout else ""
+                except Exception:
+                    remaining = ""
+                if remaining:
+                    for line in remaining.splitlines():
+                        _process_one_line(line)
+                break
+
+            if stdout_fd < 0:
+                # No stdout to read — degenerate; just wait for proc
+                # to exit so the poll() check above eventually fires.
+                if stop_event.wait(_POLL_TIMEOUT_S):
+                    break
+                continue
+
+            try:
+                rlist, _, _ = select.select(
+                    [stdout_fd], [], [], _POLL_TIMEOUT_S,
+                )
+            except (OSError, ValueError):
+                # fd closed under us — treat as EOF, let the loop's
+                # next poll() check route us out.
+                continue
+
+            if not rlist:
+                # 500 ms passed with no data — loop back to the
+                # stop_event + poll() checks. This is the whole
+                # point of the v0.3.2 refactor.
+                continue
+
+            # Data available. readline() may still block waiting for
+            # the line terminator, but tx_worker's stdout is
+            # line-buffered (bufsize=1 in subprocess.Popen above) so
+            # each readable event corresponds to a complete line in
+            # the common case. The defensive try/except below catches
+            # the rare partial-line/EOF scenarios.
+            try:
+                line = proc.stdout.readline()
+            except (OSError, ValueError):
+                continue
+            if not line:
+                # EOF — child probably just exited; let the next
+                # poll() check confirm and drain.
+                continue
+
+            _process_one_line(line)
         
         # Check if process exited immediately without output (likely a failure)
         if not seen_output:

@@ -2,42 +2,75 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.3.2] - 2026-06-01
+
+**DPDK closing-pass.** All four items the v0.3.1 audit cycle
+deferred — the tx_worker stdout deadlock + the three shell-script
+PAINs — landed together. The "Unreleased — known follow-ups"
+section that documented these has been trimmed accordingly; only
+the genuinely-still-deferred items remain.
+
+### What changed
+- **tx_worker stdout reader: blocking iteration → select-based
+  poll** (`utils/dpdk_tx_worker.py`). Pre-v0.3.2 the launcher
+  thread read tx_worker output with `for line in proc.stdout:`
+  — a blocking iterator that could park the thread indefinitely
+  if DPDK EAL hung on device initialisation. Operator had to
+  restart the server to recover. New reader runs `select.select(
+  [stdout_fd], [], [], 0.5)` in a `while True:` loop that
+  checks `stop_event.is_set()` AND `proc.poll()` between each
+  500 ms timeout, so an operator-initiated stop OR a clean
+  child exit both wake the loop within half a second.
+  Line-processing logic was extracted into a `_process_one_line`
+  inner closure so the same dispatch handles both the main
+  loop and the drain-on-exit path.
+- **PCI address regex validator in `dpdk_bind.sh`**
+  (`resources/dpdk/dpdk_bind.sh:validate_pci_address`). Both
+  `bind_to_dpdk` and `unbind_from_dpdk` now call it before any
+  sysfs write. Defence-in-depth complement to the v0.3.1
+  `_is_safe_iface_name` whitelist: the Flask layer's PCI check
+  is `":" in pci`, which is too permissive. Regex matches the
+  kernel-standard format `<NNNN>:<NN>:<NN>.<N>` (hex).
+- **`/tmp/dpdk_deps_install.log` written under `umask 077`**
+  (`resources/dpdk/install_dpdk.sh`). Subshell-scoped
+  `(umask 077 && eval … | tee …)` so the temp log ends up 0600
+  instead of the default 0644. Outer process umask is
+  unchanged.
+- **`git clone` artifact validation in `install_dpdk.sh`**
+  (`resources/dpdk/install_dpdk.sh`). After the DPDK clone +
+  checkout, the script now verifies `meson.build` exists and
+  `lib/` is a directory. A corrupted clone used to surface 60 s
+  later as a cryptic meson error; now it fails at the source
+  step with an actionable message ("delete $DPDK_DIR and
+  re-run").
+
+### Why this isn't a feature release
+All four items are correctness + hardening. No new user-visible
+features. v0.3.2 is the natural patch-bump close on the
+v0.3.1 DPDK audit cycle.
+
+### Tests
+- **`tests/test_dpdk_v0_3_2.py`** — 9 pins:
+  - tx_worker imports `select` + uses `select.select(`.
+  - Blocking `for line in proc.stdout:` removed; check both
+    `stop_event.is_set()` AND `proc.poll()` exist in the new
+    reader window.
+  - `dpdk_bind.sh:validate_pci_address` function defined +
+    parametrised test confirms both `bind_to_dpdk` AND
+    `unbind_from_dpdk` call it.
+  - Actual shell-extract test runs the validator against a
+    matrix of good (4) + bad (9) PCI strings.
+  - `install_dpdk.sh` tee runs in `(umask 077 && ...)`
+    subshell.
+  - Post-clone block verifies `meson.build` exists.
+
+### Test count
+762 → 771 (+9).
+
 ## Unreleased — known follow-ups
 
-Findings from audits whose fixes haven't shipped yet. Captured
-here so a future session (or any reader of this file) knows
-they exist + that they were deliberately not fixed in the
-cycle that closed at v0.3.1.
-
-### From the v0.3.1 DPDK server audit
-- **tx_worker stdout deadlock**
-  (`utils/dpdk_tx_worker.py:523`). The `for line in
-  proc.stdout:` loop blocks indefinitely if DPDK EAL hangs
-  during device initialisation — the worker thread can't see
-  the stop_event between lines. Failure mode is "operator
-  restarts the server", not data loss. Fix needs a select-based
-  reader (~80 lines + integration test); deferred because the
-  refactor risks the v0.2.20–v0.2.25 SIGABRT class of QThread
-  bugs if done carelessly.
-
-### From the v0.3.1 DPDK shell-script audit
-- **PCI address format not regex-validated in `dpdk_bind.sh`**
-  (`resources/dpdk/dpdk_bind.sh:158, 429`). Defence-in-depth
-  complement to the v0.3.1 `_is_safe_iface_name` whitelist —
-  same philosophy: don't trust the Flask layer to be the only
-  gate. Expected regex: `^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9a-f]$`
-  before any sysfs write that uses `$pci`.
-- **`/tmp/dpdk_deps_install.log` world-readable**
-  (`resources/dpdk/install_dpdk.sh:399`). Low-sensitivity
-  content (apt-get output) but the fix is trivial: `umask 077`
-  before the tee. Worth one-line cleanup whenever the script is
-  next touched.
-- **No validation of `git clone` artifacts before build**
-  (`resources/dpdk/install_dpdk.sh:289, 297`). After
-  `git clone`, the script doesn't verify `meson.build` exists.
-  A corrupted clone surfaces 60 s later as a cryptic meson
-  error. Fail-early check would land the error at the clone
-  step. ~5 lines.
+Items still on the deferred list — not blocking, but documented
+so a future session knows they exist.
 
 ### From earlier audits (still deferred)
 - **Async-worker progress dialogs** for ISIS / VXLAN / DHCP
