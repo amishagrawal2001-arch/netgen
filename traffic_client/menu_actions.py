@@ -1770,6 +1770,93 @@ class TrafficGenClientMenuAction():
             if str(server.get("tg_id")) == str(tg_id):
                 return [server]
         return []
+    def mark_selected_servers_offline(self):
+        """v0.3.10: inverse of `make_failed_servers_online`. Operator
+        asked for a way to manually mark a server offline — useful
+        for silencing polling/stats on a specific TG without
+        removing it from the chassis list. Sets `server["online"]
+        = False`, adds to `failed_servers`, calls
+        `update_server_status_icon(server, False)` which triggers
+        the v0.3.9 iface-children cascade.
+
+        Not persistent: the next health probe will flip the server
+        back online if it's actually reachable. That's by design —
+        the action is "mark", not "block reconnects". Operators
+        who want a permanently-silent TG can remove it from the
+        chassis list via File → Remove Server.
+        """
+        from PyQt5.QtWidgets import QMessageBox
+        selected_servers = getattr(self, "selected_servers", []) or []
+        if not selected_servers:
+            QMessageBox.information(
+                self, "No Servers Selected",
+                "Tick one or more TG chassis in the server pane, then "
+                "try again.",
+            )
+            return
+        # Filter to currently-online servers — no point marking an
+        # already-offline server.
+        online_selected = [
+            s for s in selected_servers
+            if s.get("online", True) is True
+        ]
+        if not online_selected:
+            QMessageBox.information(
+                self, "No Online Servers Selected",
+                "Every selected TG is already marked offline. Use "
+                "'Make Selected Servers Online' to reconnect.",
+            )
+            return
+        names = ", ".join(s.get("address", "?") for s in online_selected)
+        confirm = QMessageBox.question(
+            self,
+            "Mark TGs offline",
+            f"Mark <b>{len(online_selected)}</b> TG chassis as "
+            f"offline?\n\n  {names}\n\n"
+            "This:\n"
+            "  • Stops the GUI from showing live data for these TGs\n"
+            "  • Greys out their iface child dots (server-offline cascade)\n"
+            "  • Does NOT block automatic reconnect — the next health "
+            "probe will flip them back if they're reachable\n\n"
+            "Continue?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+        if not hasattr(self, "failed_servers") or self.failed_servers is None:
+            self.failed_servers = []
+        for server in online_selected:
+            try:
+                server["online"] = False
+                if hasattr(self, "update_server_status_icon"):
+                    self.update_server_status_icon(server, False)
+                if server not in self.failed_servers:
+                    self.failed_servers.append(server)
+                logger.info(
+                    f"[MANUAL OFFLINE] Marked "
+                    f"{server.get('address', '?')} as offline"
+                )
+            except Exception as exc:
+                logger.warning(
+                    f"[MANUAL OFFLINE] Failed for "
+                    f"{server.get('address', '?')}: {exc}"
+                )
+        # Flip the inverse action's enablement now that at least one
+        # server is in the failed-servers list.
+        try:
+            if hasattr(self, "make_server_online_action"):
+                self.make_server_online_action.setEnabled(True)
+        except Exception:
+            pass
+        # Refresh the server tree so the parent LED + the cascaded
+        # iface children re-render together.
+        try:
+            if hasattr(self, "update_server_tree"):
+                self.update_server_tree()
+        except Exception:
+            pass
+
     def make_failed_servers_online(self):
         """Retry connection to offline servers manually via menu - only for selected servers."""
         if not hasattr(self, "failed_servers") or not self.failed_servers:

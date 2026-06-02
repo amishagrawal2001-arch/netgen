@@ -2,6 +2,70 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.3.10] - 2026-06-02
+
+**Server menu: new "Mark Selected Servers Offline" action.**
+User-requested feature. Pre-v0.3.10 the Server menu had only
+the inverse — "Make Selected Servers Online" — for reconnecting
+TGs the system detected as failed. There was no operator-driven
+way to mark a healthy TG as offline for quick silencing.
+
+### What changed
+- **`traffic_client/main.py`** — new `QAction("Mark Selected
+  Servers Offline")` added to the Server menu next to the
+  existing online-toggle action. Always enabled (handler
+  validates selection).
+- **`traffic_client/menu_actions.py:mark_selected_servers_offline`**
+  — handler:
+  - Validates that at least one server is selected. Surfaces
+    `QMessageBox.information` otherwise.
+  - Filters the selection to currently-online TGs. Surfaces a
+    different info dialog if every selected TG is already
+    offline.
+  - Confirms via `QMessageBox.question` listing the affected
+    addresses + the trade-offs (next health probe will flip
+    them back if reachable; this is "mark", not "block
+    reconnect").
+  - On Yes: for each filtered server, sets `server["online"]
+    = False`, appends to `failed_servers`, calls
+    `update_server_status_icon(server, False)` — which
+    triggers the v0.3.9 iface-children cascade so the iface
+    dots agree with the parent TG state.
+  - Enables `make_server_online_action` so the operator can
+    flip back without restarting.
+  - Refreshes the server tree so the parent LED + cascaded
+    children re-render together.
+
+### Why not persistent?
+The action is "mark", not "block reconnect". The retry worker
+keeps probing — if the TG is actually reachable, the next
+health probe will mark it online again. Operators who want a
+permanently-silent TG can use `File → Remove Server` instead.
+The tooltip + confirmation dialog document this trade-off so
+the behaviour isn't surprising.
+
+### Tests
+- **`tests/test_mark_servers_offline.py`** — 9 pins:
+  - Action wired to the Server menu, label correct, handler
+    connected.
+  - Action enabled by default (no selection subscription).
+  - Handler method defined.
+  - No-selection path → info dialog, no confirm.
+  - All-already-offline path → info dialog (different from
+    no-selection one).
+  - User-declines-confirm → server state unchanged + not added
+    to `failed_servers`.
+  - User-confirms → previously-online servers flip to offline,
+    already-offline ones untouched, `update_server_status_icon`
+    called per marked server with `False`.
+  - User-confirms → `make_server_online_action.setEnabled(True)`
+    so recovery is immediately discoverable.
+  - User-confirms → `update_server_tree()` called once to
+    re-render the parent LED + v0.3.9 cascade together.
+
+### Test count
+827 → 836 (+9).
+
 ## [0.3.9] - 2026-06-01
 
 **Fix: server-tree iface child dots didn't cascade when the

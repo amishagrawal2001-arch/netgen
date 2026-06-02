@@ -1108,6 +1108,33 @@ class TrafficGeneratorClient(
         self.make_server_online_action.triggered.connect(self.make_failed_servers_online)
         server_menu.addAction(self.make_server_online_action)
 
+        # v0.3.10: inverse of "Make Selected Servers Online". Operator
+        # asked for a way to manually mark a server offline — useful
+        # when they want to quickly silence the polling/stats for a
+        # specific TG while keeping others active. Not persistent:
+        # the next health probe will flip it back if it's actually
+        # reachable. Operator can re-mark or simply remove the
+        # chassis if they want it permanently silent.
+        self.mark_server_offline_action = QAction(
+            "Mark Selected Servers Offline", self,
+        )
+        # Always enabled — the handler validates selection + filters to
+        # currently-online TGs, surfacing a clear info dialog if there's
+        # nothing to mark. Tying enablement to "at least one online
+        # server is selected" would need a selection-change subscription
+        # for marginal UX value (operator gets the same outcome either
+        # way: click → "select a TG first" or click → confirm).
+        self.mark_server_offline_action.setEnabled(True)
+        self.mark_server_offline_action.setToolTip(
+            "Mark selected online TGen chassis as offline. Next health "
+            "probe will flip them back if they're actually reachable. "
+            "Use this to quickly silence a TG without removing it."
+        )
+        self.mark_server_offline_action.triggered.connect(
+            self.mark_selected_servers_offline
+        )
+        server_menu.addAction(self.mark_server_offline_action)
+
         server_menu.addSeparator()
 
         restart_tgen_action = QAction("Restart TGEN Service...", self)
