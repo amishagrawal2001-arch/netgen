@@ -1538,6 +1538,14 @@ class TrafficGenClientServerSection():
         retry probes; the health verdict (degraded) is learned by
         poll_server_health from /api/admin/health. Both feed this single
         renderer so the LED never disagrees with itself.
+
+        v0.3.9: when the server transitions to offline, the previously-
+        rendered iface children kept showing their LAST-KNOWN green /
+        red dots from the stale cache — operator saw "TG 1 offline"
+        next to "eno8303 ✓ up" which is nonsense (we can't measure
+        the link state of an iface on a server we can't reach). After
+        the LED update, walk the children and cascade the offline
+        state down so the dots agree with the parent verdict.
         """
         status_label = server.get("status_label_widget")
         if not status_label:
@@ -1568,6 +1576,69 @@ class TrafficGenClientServerSection():
                         break
             except Exception as exc:
                 logger.debug(f"[SERVER TREE] tooltip refresh failed for {server_address}: {exc}")
+        # v0.3.9: cascade offline → child ifaces. On online (green or
+        # amber) we don't touch children — the next /api/interfaces
+        # poll repopulates from authoritative state.
+        if not online:
+            try:
+                self._cascade_offline_to_iface_children(server)
+            except Exception as exc:
+                logger.debug(
+                    f"[SERVER TREE] iface cascade failed for "
+                    f"{server_address}: {exc}"
+                )
+
+    def _cascade_offline_to_iface_children(self, server):
+        """v0.3.9: when a server goes offline, walk the iface child
+        items under its tree node and switch every dot to red with a
+        "server-offline" tooltip. Without this the children kept
+        their last-known up/down state from the stale cache — operator
+        screenshot showed "TG 1 offline" parent with mixed-color
+        children below it, which is nonsense (we can't know any
+        iface's state on a server we can't reach).
+
+        Best-effort: no-op when the tree item isn't attached yet
+        (race during first build) or when the server has no
+        children stored. The next successful /api/interfaces poll
+        rebuilds the children from authoritative state via
+        ``update_server_tree``.
+        """
+        server_item = server.get("status_item")
+        if server_item is None:
+            return
+        try:
+            child_count = server_item.childCount()
+        except Exception:
+            return
+        if child_count <= 0:
+            return
+        # Pre-build the cascade icon once instead of per-child.
+        try:
+            offline_icon = QIcon(
+                QIcon(r_icon("icons/red_dot.png")).pixmap(12, 12)
+            )
+        except Exception:
+            offline_icon = None
+        for i in range(child_count):
+            try:
+                child = server_item.child(i)
+                if child is None:
+                    continue
+                iface_name = child.text(0) or "(unknown iface)"
+                if offline_icon is not None:
+                    child.setIcon(0, offline_icon)
+                # Explain the cascade so the operator doesn't think
+                # the link itself went down — the server connection
+                # did, and the iface state is therefore unknown.
+                child.setToolTip(
+                    0,
+                    f"{iface_name} — server offline; iface state "
+                    f"unknown (last-known status is stale)."
+                )
+            except Exception:
+                # Defensive — a child mutation race is harmless;
+                # next rebuild fixes it.
+                continue
 
     def poll_server_health(self):
         """Periodic TGen service-health probe (fired by a timer in main.py).

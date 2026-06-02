@@ -2,6 +2,68 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.3.9] - 2026-06-01
+
+**Fix: server-tree iface child dots didn't cascade when the
+server went offline.** User-reported via screenshot: the server-
+tree's parent "TG 1" node showed red (offline), but the iface
+children below it (lo, eno8303, eno8403, enp13s0f0np0, etc.)
+kept showing their last-known green / red dots from the stale
+cache. Operator saw "TG 1 offline" next to "lo ✓ up" + a mix
+of greens and reds underneath — nonsense, because we can't
+measure the link state of an iface on a server we can't reach.
+
+### Root cause
+`_update_server_led` only swapped the parent's status icon; the
+iface child items were never touched. They kept whatever dots
+`update_server_tree` painted on them from the LAST successful
+`/api/interfaces` poll, so a server transitioning to offline
+left the children visually stuck on stale state.
+
+### What changed
+- **`traffic_client/server_section.py:_cascade_offline_to_iface_children`**
+  — new helper that walks the iface child items under a
+  server's tree node and:
+  - Swaps each dot to red (best-available representation of
+    "we don't know; treat as unreachable").
+  - Updates the tooltip to "<iface> — server offline; iface
+    state unknown (last-known status is stale)" so the
+    operator understands the cascade is from server
+    unreachability, not a real link-down.
+- **`_update_server_led`** invokes the cascade ONLY when the
+  server transitions to offline. The online (green) and
+  degraded (amber) branches don't touch children — the next
+  successful `/api/interfaces` poll repopulates from
+  authoritative state via `update_server_tree`.
+- Defensive: no-op when the tree item isn't attached yet (race
+  during first build) or when the server has no rendered
+  children. The next rebuild fixes it regardless.
+
+### Why not a separate "unknown" / grey icon?
+There's no `grey_dot.png` asset in `resources/icons/`; adding
+one + plumbing it through would be a larger change. The
+operational meaning of "server offline" is "you can't use
+these interfaces" — same as "the iface is down" from the
+operator's perspective. Tooltip carries the semantic
+distinction for anyone hovering.
+
+### Tests
+- **`tests/test_server_tree_offline_cascade.py`** — 5 pins:
+  - `_cascade_offline_to_iface_children` helper exists.
+  - `_update_server_led` calls the cascade AND gates it on
+    `if not online:` (calling it on the online branch would
+    clobber real iface up/down state with stale red).
+  - Behavioural test (with `qapp` fixture): cascade swaps the
+    icon on each child + sets a tooltip mentioning the iface
+    name AND "server offline" AND "stale"/"unknown".
+  - Cascade is a no-op when the server has no `status_item`
+    (added but never rendered).
+  - Cascade is a no-op when the server has 0 children (iface
+    fetch hasn't completed yet).
+
+### Test count
+822 → 827 (+5).
+
 ## [0.3.8] - 2026-06-01
 
 **L2 Emulation audit close.** Two real findings from the L2
