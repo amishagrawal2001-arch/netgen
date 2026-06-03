@@ -49,6 +49,31 @@ class OSPFHandler:
         # Connect cell changed signal for inline editing
         self.parent.ospf_table.cellChanged.connect(self.on_ospf_table_cell_changed)
         
+        # v0.3.11: filter input ABOVE the table — parity with
+        # Devices / Streams / L2 / Stateful TCP / BGP sub-tab.
+        try:
+            from utils.table_filter_bar import make_table_filter_row
+            _ospf_filter_row, self.parent._ospf_filter_input = (
+                make_table_filter_row(
+                    table=self.parent.ospf_table,
+                    columns=(
+                        "Device", "Area ID", "Neighbor Type",
+                        "Interface", "Neighbor ID", "State",
+                    ),
+                    placeholder=(
+                        "Device / Area / Interface / Neighbor / State …"
+                    ),
+                    tooltip=(
+                        "Substring filter — Device / Area / Interface / "
+                        "Neighbor / State columns. Case-insensitive."
+                    ),
+                )
+            )
+            layout.addLayout(_ospf_filter_row)
+        except Exception as _e:
+            import logging as _lg
+            _lg.warning(f"[OSPF TAB] filter row unavailable: {_e}")
+
         # Section header removed — tab name + column headers carry it.
         layout.addWidget(self.parent.ospf_table)
 
@@ -637,6 +662,12 @@ class OSPFHandler:
         finally:
             # Restore previous signal-block state (don't accidentally leave blocked).
             self.parent.ospf_table.blockSignals(signals_were_blocked)
+            # v0.3.11: reapply substring filter so it survives this rebuild.
+            try:
+                from utils.table_filter_bar import reapply_filter
+                reapply_filter(getattr(self.parent, "_ospf_filter_input", None))
+            except Exception:
+                pass
 
     def _safe_update_ospf_table(self):
         """Safely update OSPF table (for parallel execution)."""

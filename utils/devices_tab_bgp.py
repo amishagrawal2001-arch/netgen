@@ -53,6 +53,33 @@ class BGPHandler:
         # Connect cell changed signal for handling checkbox changes
         self.parent.bgp_table.cellChanged.connect(self.on_bgp_table_cell_changed)
         
+        # v0.3.11: filter input ABOVE the table — parity with
+        # Devices / Streams / L2 Emulation / Stateful TCP tabs. Shared
+        # helper handles the cell-widget fallback + reapply hook.
+        try:
+            from utils.table_filter_bar import make_table_filter_row
+            _bgp_filter_row, self.parent._bgp_filter_input = (
+                make_table_filter_row(
+                    table=self.parent.bgp_table,
+                    columns=(
+                        "Device", "Neighbor Type", "Neighbor IP",
+                        "Source IP", "BGP Local AS", "BGP Remote AS",
+                        "State",
+                    ),
+                    placeholder=(
+                        "Device / Neighbor IP / AS / State …"
+                    ),
+                    tooltip=(
+                        "Substring filter — Device / Neighbor / AS / "
+                        "State columns. Case-insensitive."
+                    ),
+                )
+            )
+            layout.addLayout(_bgp_filter_row)
+        except Exception as _e:
+            import logging as _lg
+            _lg.warning(f"[BGP TAB] filter row unavailable: {_e}")
+
         # Section header removed — tab name + column headers carry it.
         layout.addWidget(self.parent.bgp_table)
 
@@ -782,9 +809,17 @@ class BGPHandler:
                                 self.parent.bgp_table.setItem(row, 11, hold_time_item)
                 
                 # BGP table updated
+                # v0.3.11: reapply any active substring filter so it
+                # survives this rebuild. Without this, the periodic
+                # refresh would un-hide every row mid-typing.
+                try:
+                    from utils.table_filter_bar import reapply_filter
+                    reapply_filter(getattr(self.parent, "_bgp_filter_input", None))
+                except Exception:
+                    pass
             except Exception as e:
                 logger.error(f"Error updating BGP table: {e}")
-    
+
 
     def _safe_update_bgp_table(self):
         """Safely update BGP table (for parallel execution)."""

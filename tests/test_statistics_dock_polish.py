@@ -114,14 +114,25 @@ def test_v0_2_99_interface_update_bails_when_paused(src):
 
 # ─────────────────────────────────── action-bar widgets
 def test_v0_2_99_action_bar_has_filter_pause_chip_widgets(src):
-    """The button_layout must gain three new widgets alongside the
-    existing Clear Stats / Export CSV buttons."""
-    # Filter box
+    """The v0.2.99 trio (filter, pause, last-refresh) all exist.
+
+    v0.3.11 split the trio: the substring filter moved out of the
+    bottom action bar to sit ABOVE the Stream Statistics table (its
+    real target), matching the "filter above table" convention of
+    the Devices / L2 / Stateful TCP / Streams configuration tabs.
+    Pause + last-refresh chip stayed in the bottom action bar — they
+    affect the whole dock, not one table.
+    """
+    # Filter box still exists (placement changed in v0.3.11; existence
+    # of the widget itself is what we care about for state continuity).
     assert "self.stream_filter_edit" in src, (
-        "stream_filter_edit QLineEdit missing from action bar"
+        "stream_filter_edit QLineEdit missing"
     )
-    assert "Filter streams" in src, (
-        "stream_filter_edit placeholder text pinned"
+    # Placeholder text — v0.3.11 reworded ("Filter streams…" was vague,
+    # the new wording names the columns it matches against).
+    assert "Stream Name / Interface / Engine" in src, (
+        "stream_filter_edit placeholder text pinned to the v0.3.11 "
+        "column-naming wording"
     )
     # Pause button
     assert "self.pause_refresh_button" in src

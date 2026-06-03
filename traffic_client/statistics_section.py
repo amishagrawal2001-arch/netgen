@@ -542,6 +542,48 @@ class TrafficGenClientStatisticsSection():
         self.stream_statistics_table.verticalHeader().setMinimumSectionSize(28)
         self.stream_statistics_table.horizontalHeader().setFixedHeight(22)
 
+        # v0.3.11: filter input ABOVE the Stream Statistics table
+        # (matches the Devices / L2 Emulation / Stateful TCP / Streams
+        # configuration-tab convention). Previously this widget sat in
+        # the dock's bottom action bar next to Export CSV, which the
+        # user flagged as inconsistent — and which placed a "filter"
+        # control nowhere near the table it actually filtered. State
+        # lives on `self._stream_filter_needle` (lazy-init below) so
+        # the widget can be torn down + rebuilt without losing the
+        # current filter value across construction orders.
+        if not hasattr(self, "_stream_filter_needle"):
+            self._stream_filter_needle = ""
+        _stream_filter_row = QHBoxLayout()
+        _stream_filter_row.setContentsMargins(0, 0, 0, 2)
+        _stream_filter_row.setSpacing(6)
+        _stream_filter_label = QLabel("Filter:")
+        _stream_filter_label.setStyleSheet(
+            "color: #6b7280; font-size: 11px;"
+        )
+        self.stream_filter_edit = QLineEdit()
+        self.stream_filter_edit.setPlaceholderText(
+            "Stream Name / Interface / Engine …"
+        )
+        self.stream_filter_edit.setClearButtonEnabled(True)
+        self.stream_filter_edit.setFixedHeight(22)
+        self.stream_filter_edit.setMaximumWidth(280)
+        self.stream_filter_edit.setStyleSheet(
+            "QLineEdit { border: 1px solid #cbd5e1; border-radius: 4px;"
+            "  padding: 0 6px; font-size: 12px; background: #ffffff; }"
+            "QLineEdit:focus { border-color: #2563eb; }"
+        )
+        self.stream_filter_edit.setToolTip(
+            "Hide rows in the Stream Statistics table whose name / "
+            "interface / engine don't match. Case-insensitive substring."
+        )
+        self.stream_filter_edit.textChanged.connect(
+            self._on_stream_filter_changed
+        )
+        _stream_filter_row.addWidget(_stream_filter_label)
+        _stream_filter_row.addWidget(self.stream_filter_edit)
+        _stream_filter_row.addStretch(1)
+        stream_stats_layout.addLayout(_stream_filter_row)
+
         stream_stats_layout.addWidget(self.stream_statistics_table)
         stream_stats_layout.setContentsMargins(0, 0, 0, 0)
         
@@ -693,42 +735,18 @@ class TrafficGenClientStatisticsSection():
         self.export_stats_button.clicked.connect(self.export_statistics_csv)
         button_layout.addWidget(self.export_stats_button)
 
-        # ── v0.2.99: filter / pause / last-refresh trio ────────────────
-        # These three widgets close the audit gaps the Statistics-dock
-        # 4-tier pass surfaced: many-stream sessions need a substring
-        # filter; operators grabbing screenshots need to pause the 2 s
-        # refresh; the dock previously gave no clue whether a stuck
-        # reading was fresh or stale. All three live on the same row
-        # as Clear Stats / Export CSV so the action bar stays compact.
-
-        # State init — lazy, since this class is used as a mixin and has
-        # no __init__ of its own. Default values match the pre-v0.2.99
-        # behaviour (no filter, refresh active).
-        if not hasattr(self, "_stream_filter_needle"):
-            self._stream_filter_needle = ""
+        # ── v0.2.99: pause / last-refresh pair ─────────────────────────
+        # Pause toggle + last-refresh chip stay in this bottom action
+        # bar (next to Clear Stats / Export CSV) — they're dock-scoped,
+        # not table-scoped. The v0.2.99 "filter / pause / last-refresh
+        # trio" was split in v0.3.11: the substring filter moved to
+        # sit ABOVE the Stream Statistics table (its real target) so
+        # the dock matches the same "filter above table" convention as
+        # the Devices / L2 / Stateful TCP / Streams configuration tabs.
+        # State init — lazy, since this class is used as a mixin and
+        # has no __init__ of its own.
         if not hasattr(self, "_refresh_paused"):
             self._refresh_paused = False
-
-        # Filter box — hides rows in the stream-statistics table whose
-        # Stream Name / Interface / Engine cells don't contain the
-        # case-insensitive substring. Empty = show all. Doesn't touch
-        # the Interface Statistics tab (10 rows, no filter needed).
-        self.stream_filter_edit = QLineEdit()
-        self.stream_filter_edit.setPlaceholderText("Filter streams…")
-        self.stream_filter_edit.setFixedHeight(24)
-        self.stream_filter_edit.setFixedWidth(160)
-        self.stream_filter_edit.setToolTip(
-            "Hide rows in the Stream Statistics tab whose name / "
-            "interface / engine don't match. Case-insensitive substring."
-        )
-        self.stream_filter_edit.setStyleSheet(
-            "QLineEdit { border: 1px solid #cbd5e1; border-radius: 4px; "
-            "padding: 2px 6px; font-size: 11px; }"
-        )
-        self.stream_filter_edit.textChanged.connect(
-            self._on_stream_filter_changed
-        )
-        button_layout.addWidget(self.stream_filter_edit)
 
         # Pause-refresh toggle — flips `self._refresh_paused`. The two
         # update_* paths check the flag at entry and bail early if

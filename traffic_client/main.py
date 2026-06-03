@@ -65,8 +65,48 @@ class TrafficGeneratorClient(
         # readout (_update_section_size_readout) can rebuild from a
         # clean base each time instead of appending to an
         # ever-growing string.
+        #
+        # v0.3.11: the base title now also reflects the active session
+        # file basename (Save As / Load From can swap it) and a
+        # dirty-marker asterisk when a save is in flight or pending.
+        # _update_window_title() recomputes this and triggers the
+        # size-readout to re-render; we set the path default here so
+        # the title shows the correct file from boot, and the menu
+        # actions / save / load paths call _update_window_title()
+        # whenever the path or dirty state changes.
+        try:
+            from utils.path_utils import get_session_file_path
+            self._current_session_path = get_session_file_path()
+        except Exception:
+            self._current_session_path = None
+        # v0.3.11: auto-save opt-in. Default False so removing a row
+        # while experimenting doesn't silently commit the deletion to
+        # the active session file. QSettings-persisted so the
+        # operator's choice survives a restart. File → Auto-save
+        # Session toggles it. When OFF, only Ctrl+S / Save As writes.
+        try:
+            from PyQt5.QtCore import QSettings
+            self._auto_save_enabled = QSettings().value(
+                "auto_save_enabled", False, type=bool,
+            )
+        except Exception:
+            self._auto_save_enabled = False
+        # v0.3.11: unsaved-edits flag — set True whenever the
+        # auto-save gate suppresses a save_session() call, cleared
+        # on every successful write. closeEvent reads this to decide
+        # whether to prompt "Save before quitting?". Title bar's
+        # asterisk also reads it. NOT persisted — a fresh launch is
+        # always clean.
+        self._has_unsaved_edits = False
         self._base_window_title = "Netgen Traffic Generator"
-        self.setWindowTitle(self._base_window_title)
+        # _update_window_title() bakes the session basename into
+        # _base_window_title; called here so the first paint shows
+        # the right file. Defensive — the helper isn't wired in via
+        # mixin yet if mixin order ever changes, so swallow failures.
+        try:
+            self._update_window_title()
+        except Exception:
+            self.setWindowTitle(self._base_window_title)
         self.setGeometry(100, 100, 1400, 800)
         # Track which widgets we've installed the section-size event
         # filter on, so we don't double-install if the layout is rebuilt.
@@ -126,6 +166,13 @@ class TrafficGeneratorClient(
                 except Exception:
                     return None
             self.dpdk_chip = DpdkReadinessChip(_resolve_url, parent=self)
+            # v0.3.11: click the chip to open Make DPDK Ready. The
+            # chip exposes a `clicked` signal so red/amber operators
+            # can fix the issue without hunting through Tools→DPDK.
+            try:
+                self.dpdk_chip.clicked.connect(self.show_dpdk_make_ready_dialog)
+            except Exception as _e:
+                logging.debug(f"[MAIN] DPDK chip click wiring failed: {_e}")
             self.statusBar().addPermanentWidget(self.dpdk_chip)
         except Exception as _e:
             logging.warning(f"[MAIN] DPDK readiness chip unavailable: {_e}")
@@ -673,6 +720,64 @@ class TrafficGeneratorClient(
             event.accept()
             return
 
+        # v0.3.11: unsaved-edits guard. When auto-save is OFF and the
+        # user has pending edits, prompt before quitting so they
+        # don't silently lose work. Auto-save ON means edits have
+        # already been written, so no prompt is needed. The prompt
+        # offers three outcomes:
+        #
+        #   * Save → blocking save, then close. Failure still allows
+        #     close (with an error message) since refusing to close
+        #     after a save error would trap the operator.
+        #   * Discard → close without saving. Edits are lost; explicit
+        #     user choice.
+        #   * Cancel → ignore the close event; the app keeps running.
+        #
+        # The check uses _is_closing as a once-per-app guard so we
+        # never re-prompt after the user has answered.
+        if (getattr(self, "_has_unsaved_edits", False)
+                and not getattr(self, "_auto_save_enabled", False)):
+            from PyQt5.QtWidgets import QMessageBox
+            import os as _os
+            _path = getattr(self, "_current_session_path", None)
+            _name = _os.path.basename(_path) if _path else "session.json"
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Warning)
+            box.setWindowTitle("Unsaved Edits")
+            box.setText("You have unsaved edits in this session.")
+            box.setInformativeText(
+                f"Auto-save is OFF. Closing now will lose changes "
+                f"that haven't been written to {_name}."
+            )
+            box.setStandardButtons(
+                QMessageBox.Save | QMessageBox.Discard
+                | QMessageBox.Cancel,
+            )
+            box.setDefaultButton(QMessageBox.Save)
+            choice = box.exec_()
+            if choice == QMessageBox.Cancel:
+                # Operator changed their mind — abort the close.
+                event.ignore()
+                return
+            if choice == QMessageBox.Save:
+                try:
+                    success, msg = self.save_session(
+                        blocking=True, manual=True,
+                    )
+                except Exception as exc:
+                    success, msg = False, str(exc)
+                if not success:
+                    # Save failed — let them know but don't trap them
+                    # in the app. They explicitly chose Save and we
+                    # tried; the prompt is one-shot.
+                    QMessageBox.warning(
+                        self, "Save Failed",
+                        f"Failed to save session before closing:\n\n"
+                        f"{msg}\n\nClosing anyway. Edits are lost.",
+                    )
+            # Discard / Save (success or failed) → fall through to
+            # the normal close path.
+
         self._is_closing = True
 
         # Persist topology canvas layout so the next session opens with
@@ -1042,8 +1147,71 @@ class TrafficGeneratorClient(
 
         save_session_action = QAction("Save Session", self)
         save_session_action.setShortcut(QKeySequence.Save)
-        save_session_action.triggered.connect(self.save_session)
+        save_session_action.setStatusTip(
+            "Save the current session to the active file "
+            "(default: session.json in the data dir)"
+        )
+        # v0.3.11: pass manual=True so the auto-save-disabled gate
+        # doesn't suppress an explicit Ctrl+S. Without this kwarg the
+        # menu action would silently no-op whenever auto-save is off.
+        save_session_action.triggered.connect(
+            lambda: self.save_session(manual=True)
+        )
         file_menu.addAction(save_session_action)
+
+        # v0.3.11: Save As / Load From / Recent — operator wants
+        # named snapshots (baseline / stress / evpn / etc) instead of
+        # the single fixed slot. Save As changes the active path so
+        # subsequent Ctrl+S writes to the new file. Load From repoints
+        # at an existing snapshot.
+        save_session_as_action = QAction("Save Session As…", self)
+        save_session_as_action.setShortcut(QKeySequence("Ctrl+Shift+S"))
+        save_session_as_action.setStatusTip(
+            "Save the current session to a chosen file. The chosen "
+            "file becomes the new active session for subsequent saves."
+        )
+        save_session_as_action.triggered.connect(self.save_session_as)
+        file_menu.addAction(save_session_as_action)
+
+        load_session_from_action = QAction("Load Session From…", self)
+        load_session_from_action.setStatusTip(
+            "Open a previously-saved session file. Becomes the new "
+            "active session for subsequent Save operations."
+        )
+        load_session_from_action.triggered.connect(self.load_session_from)
+        file_menu.addAction(load_session_from_action)
+
+        # Recent Sessions — submenu rebuilt after every save/load via
+        # `_rebuild_recent_sessions_menu`. Created here so the menu
+        # entry exists from boot; populated lazily once the recent
+        # list helper has been imported.
+        self.recent_sessions_menu = QMenu("Recent Sessions", self)
+        file_menu.addMenu(self.recent_sessions_menu)
+        try:
+            self._rebuild_recent_sessions_menu()
+        except Exception as _e:
+            import logging as _lg
+            _lg.warning(f"[FILE MENU] recent-sessions build failed: {_e}")
+
+        # v0.3.11: Auto-save Session — checkable. Default OFF
+        # (initialized from QSettings above). When OFF, only Ctrl+S
+        # and Save As… write to disk; edit handlers (BGP / OSPF /
+        # ISIS / DHCP / VXLAN apply, stream remove, inline edits)
+        # become no-ops at the save layer. When ON, the historical
+        # every-edit-writes behaviour returns. Operator's choice
+        # persists across restarts.
+        self.auto_save_action = QAction("Auto-save Session", self)
+        self.auto_save_action.setCheckable(True)
+        self.auto_save_action.setChecked(
+            getattr(self, "_auto_save_enabled", False),
+        )
+        self.auto_save_action.setStatusTip(
+            "When ON, every edit (apply, stream remove, inline edit) "
+            "writes to the active session file. When OFF (default), "
+            "only Ctrl+S and Save As… write — safer when experimenting."
+        )
+        self.auto_save_action.toggled.connect(self.toggle_auto_save_enabled)
+        file_menu.addAction(self.auto_save_action)
 
         file_menu.addSeparator()
 
@@ -1180,6 +1348,50 @@ class TrafficGeneratorClient(
         # Show tooltips on hover (Qt menus hide them by default)
         dpdk_menu.setToolTipsVisible(True)
         tools_menu.addMenu(dpdk_menu)
+
+        # v0.3.11: three one-click DPDK orchestrators at the top of
+        # the menu — pick by user familiarity:
+        #
+        #   * Quick Start Wizard — first-timer / guided. Multi-page
+        #     wizard explaining each step before it runs.
+        #   * Make DPDK Ready — power user / "do the right thing
+        #     and tell me when it's done".
+        #   * Blast a Flow — demo / smoke-test. Make ready + start
+        #     a sample 64 B UDP line-rate flow in one shot.
+        #
+        # All three share the same orchestrator engine
+        # (utils.dpdk_orchestrator) so behaviour is consistent.
+        dpdk_wizard_action = QAction("Quick Start Wizard...", self)
+        dpdk_wizard_action.setToolTip(
+            "First-timer setup. Multi-step wizard walks you through "
+            "DPDK install / IOMMU / VFIO / hugepages / NIC bind with "
+            "explanations and Skip options at each step."
+        )
+        dpdk_wizard_action.triggered.connect(self.show_dpdk_quick_start_wizard)
+        dpdk_menu.addAction(dpdk_wizard_action)
+
+        dpdk_make_ready_action = QAction("Make DPDK Ready...", self)
+        dpdk_make_ready_action.setToolTip(
+            "One-click orchestrator: surveys the server, then runs "
+            "install → IOMMU → VFIO modules → hugepages → bind a NIC "
+            "in sequence. Skips already-completed steps. Pauses on "
+            "reboot (IOMMU). For power users — no narrative; just runs."
+        )
+        dpdk_make_ready_action.triggered.connect(self.show_dpdk_make_ready_dialog)
+        dpdk_menu.addAction(dpdk_make_ready_action)
+
+        dpdk_blast_flow_action = QAction("Blast a Flow...", self)
+        dpdk_blast_flow_action.setToolTip(
+            "Demo / smoke-test. Makes DPDK ready, then starts a "
+            "64-byte UDP flow at line rate on the bound NIC. One "
+            "click from a fresh server to packets flying. The "
+            "flow is ephemeral (server-side only, not in the "
+            "Streams tab); the dialog has a Stop button."
+        )
+        dpdk_blast_flow_action.triggered.connect(self.show_dpdk_blast_flow_dialog)
+        dpdk_menu.addAction(dpdk_blast_flow_action)
+
+        dpdk_menu.addSeparator()
 
         dpdk_status_action = QAction("Status...", self)
         dpdk_status_action.setToolTip(

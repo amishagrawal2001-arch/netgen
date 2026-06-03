@@ -83,7 +83,189 @@ class TrafficGenClientDPDKMenuActions():
         dlg.setMinimumDuration(200)  # don't flash on fast requests
         dlg.setValue(0)
         return dlg
-    
+
+    def show_dpdk_make_ready_dialog(self):
+        """v0.3.11: launch the 'Make DPDK Ready' orchestrator dialog.
+
+        Pulls the current server URL from the selected TG, opens the
+        dialog, and lets it drive the survey → plan → run → bind
+        sequence. Single-server only for v1 — pops a warning if
+        multiple servers are selected so the operator can pick
+        which one to remediate.
+        """
+        servers = self._get_selected_servers()
+        if not servers:
+            QMessageBox.information(
+                self, "Make DPDK Ready",
+                "Select a server (TG) in the server tree first, "
+                "then open the dialog.",
+            )
+            return
+        if len(servers) > 1:
+            # Multi-server orchestration is post-v0.3.11 — for now
+            # nudge the operator to pick one. The dialog runs against
+            # a single server URL at a time.
+            QMessageBox.information(
+                self, "Make DPDK Ready",
+                "Multiple servers selected. Make DPDK Ready operates "
+                "on one server at a time — please select a single "
+                "TG in the server tree and try again.",
+            )
+            return
+        server = servers[0]
+        server_url = server.get("address") if isinstance(server, dict) else server
+        if not server_url:
+            QMessageBox.warning(
+                self, "Make DPDK Ready",
+                "Could not resolve the selected server's URL.",
+            )
+            return
+
+        # Honour an explicit management_iface field if the operator
+        # set one on the server dict; otherwise leave None and let
+        # the bind picker show every NIC.
+        mgmt_iface = None
+        if isinstance(server, dict):
+            mgmt_iface = server.get("management_iface")
+
+        from widgets.dpdk_make_ready_dialog import MakeDpdkReadyDialog
+        dlg = MakeDpdkReadyDialog(
+            server_url, management_iface=mgmt_iface, parent=self,
+        )
+        dlg.exec_()
+
+    def show_dpdk_blast_flow_dialog(self):
+        """v0.3.11 Phase 3: 'Blast a Flow' demo orchestrator.
+
+        Same single-server / NIC-picker plumbing as Make DPDK Ready,
+        plus a sample 1500 B UDP line-rate flow that starts the
+        instant binding succeeds.
+
+        Non-blocking: opens via show() (not exec_()) so the operator
+        can fire MULTIPLE Blast a Flow dialogs in parallel — one per
+        interface — to get truly parallel multi-NIC blasts without
+        leaving the menu. Each dialog manages its own bound iface +
+        sample stream lifecycle independently. We hold a reference
+        in self._blast_dialogs so the dialogs don't get GC'd while
+        Qt still owns their windows; we prune the list on close so
+        long-running sessions don't accumulate stale references.
+        """
+        server, server_url = self._resolve_single_server_for_dpdk(
+            "Blast a Flow",
+        )
+        if not server_url:
+            return
+        mgmt_iface = (
+            server.get("management_iface") if isinstance(server, dict)
+            else None
+        )
+        from widgets.dpdk_blast_flow_dialog import DpdkBlastFlowDialog
+        dlg = DpdkBlastFlowDialog(
+            server_url, management_iface=mgmt_iface, parent=self,
+        )
+        # Per-instance attribute (not class-level) — the list is
+        # created lazily on first call so existing call sites need
+        # no init changes. parent=self keeps Qt-side ownership too,
+        # but the Python reference here is what stops GC.
+        if not hasattr(self, "_blast_dialogs"):
+            self._blast_dialogs = []
+        # Cascade window positions BEFORE appending so the new
+        # dialog offsets from the current sibling count. Default Qt
+        # behaviour stacks every new window at the same screen
+        # position — three parallel Blast Flow dialogs look like
+        # one until the operator drags them apart. Offset by
+        # 36 px (window-title bar + a bit) per existing sibling.
+        _CASCADE_STEP = 36
+        _cascade_index = len(self._blast_dialogs)
+        if _cascade_index > 0:
+            try:
+                _anchor = self.geometry().topLeft()
+                dlg.move(
+                    _anchor.x() + 80 + _CASCADE_STEP * _cascade_index,
+                    _anchor.y() + 80 + _CASCADE_STEP * _cascade_index,
+                )
+            except Exception:
+                pass  # geometry not available pre-show; skip silently
+        # Same-NIC guard: tell the new dialog about siblings'
+        # already-claimed ifaces so it can warn before starting a
+        # second tx_worker on the same NIC. Wired via the dialog's
+        # claimed-iface lookup hook so the dialog stays decoupled
+        # from the host's class shape.
+        dlg.set_sibling_iface_provider(
+            lambda excluding=dlg: {
+                d._active_iface for d in self._blast_dialogs
+                if d is not excluding and getattr(d, "_active_iface", None)
+            }
+        )
+        self._blast_dialogs.append(dlg)
+        # Prune on close so a long session doesn't grow the list
+        # forever. Using a closure that captures the dialog by ref
+        # because finished() doesn't pass the sender to a slot.
+        def _on_blast_closed(_result, _dlg=dlg):
+            try:
+                self._blast_dialogs.remove(_dlg)
+            except ValueError:
+                pass  # already gone — close fired twice
+        dlg.finished.connect(_on_blast_closed)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def show_dpdk_quick_start_wizard(self):
+        """v0.3.11 Phase 4: multi-step QWizard for first-timers.
+
+        Same orchestrator engine as the one-click dialog, but
+        explained step-by-step with Skip / Edit affordances at each
+        page. Recommended for operators new to DPDK setup.
+        """
+        server, server_url = self._resolve_single_server_for_dpdk(
+            "Quick Start Wizard",
+        )
+        if not server_url:
+            return
+        mgmt_iface = (
+            server.get("management_iface") if isinstance(server, dict)
+            else None
+        )
+        from widgets.dpdk_quick_start_wizard import DpdkQuickStartWizard
+        wiz = DpdkQuickStartWizard(
+            server_url, management_iface=mgmt_iface, parent=self,
+        )
+        wiz.exec_()
+
+    def _resolve_single_server_for_dpdk(self, action_name: str):
+        """Common single-server selection helper for the three
+        orchestrator entry points. Returns (server_dict, url) or
+        (None, None) after showing the appropriate dialog.
+        """
+        servers = self._get_selected_servers()
+        if not servers:
+            QMessageBox.information(
+                self, action_name,
+                f"Select a server (TG) in the server tree first, "
+                f"then open {action_name}.",
+            )
+            return None, None
+        if len(servers) > 1:
+            QMessageBox.information(
+                self, action_name,
+                f"Multiple servers selected. {action_name} operates "
+                f"on one server at a time — please select a single "
+                f"TG in the server tree and try again.",
+            )
+            return None, None
+        server = servers[0]
+        server_url = (
+            server.get("address") if isinstance(server, dict) else server
+        )
+        if not server_url:
+            QMessageBox.warning(
+                self, action_name,
+                "Could not resolve the selected server's URL.",
+            )
+            return None, None
+        return server, server_url
+
     def show_dpdk_status(self):
         """Show DPDK status for selected server(s) — async fetch, dialog opens immediately."""
         selected_servers = self._get_selected_servers()

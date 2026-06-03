@@ -697,6 +697,31 @@ class DHCPHandler:
         self.parent.dhcp_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.parent.dhcp_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.parent.dhcp_table.setSelectionMode(QTableWidget.SingleSelection)
+        # v0.3.11: filter input ABOVE the table — parity with the
+        # other sub-tabs.
+        try:
+            from utils.table_filter_bar import make_table_filter_row
+            _dhcp_filter_row, self.parent._dhcp_filter_input = (
+                make_table_filter_row(
+                    table=self.parent.dhcp_table,
+                    columns=(
+                        "Device", "Interface", "VLAN", "Mode",
+                        "Pools", "State", "Lease IP", "Gateway",
+                    ),
+                    placeholder=(
+                        "Device / Interface / Pool / State / IP …"
+                    ),
+                    tooltip=(
+                        "Substring filter — Device / Interface / VLAN / "
+                        "Mode / Pool / State / IP. Case-insensitive."
+                    ),
+                )
+            )
+            layout.addLayout(_dhcp_filter_row)
+        except Exception as _e:
+            import logging as _lg
+            _lg.warning(f"[DHCP TAB] filter row unavailable: {_e}")
+
         # Section header removed — tab name + table columns are enough.
         layout.addWidget(self.parent.dhcp_table)
 
@@ -898,6 +923,13 @@ class DHCPHandler:
                 item = table.item(row, column_index)
                 if item is not None:
                     item.setData(Qt.UserRole, metadata)
+
+        # v0.3.11: reapply substring filter so it survives this rebuild.
+        try:
+            from utils.table_filter_bar import reapply_filter
+            reapply_filter(getattr(self.parent, "_dhcp_filter_input", None))
+        except Exception:
+            pass
 
     def _format_pool_names(self, entry: Dict) -> str:
         """Human readable string for attached pool names or default pool."""

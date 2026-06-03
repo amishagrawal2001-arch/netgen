@@ -34,6 +34,43 @@ class TrafficGenClientStreamControl:
         layout.setContentsMargins(2, 2, 2, 2)
         layout.setSpacing(2)
 
+        # v0.3.11: Filter input ABOVE the table. The Devices, L2
+        # Emulation, and Stateful TCP tabs all surface a filter at the
+        # top of their tables; the Streams tab was the lone outlier
+        # (its `stream_filter_edit` in statistics_section.py belongs to
+        # the Stats dock's secondary streams view, not the main table
+        # here). Substring-match runs against the user-meaningful
+        # configuration columns — see `_apply_stream_table_filter`.
+        filter_row = QHBoxLayout()
+        filter_row.setContentsMargins(0, 0, 0, 0)
+        filter_row.setSpacing(6)
+        filter_label = QLabel("Filter:")
+        filter_label.setStyleSheet("color: #6b7280; font-size: 11px;")
+        self._stream_filter_input = QLineEdit()
+        self._stream_filter_input.setPlaceholderText(
+            "Name / Interface / Frame Type / VLAN / L3 / L4 …"
+        )
+        self._stream_filter_input.setClearButtonEnabled(True)
+        self._stream_filter_input.setFixedHeight(22)
+        self._stream_filter_input.setMaximumWidth(320)
+        self._stream_filter_input.setStyleSheet(
+            "QLineEdit { border: 1px solid #cbd5e1; border-radius: 4px;"
+            "  padding: 0 6px; font-size: 12px; background: #ffffff; }"
+            "QLineEdit:focus { border-color: #2563eb; }"
+        )
+        self._stream_filter_input.setToolTip(
+            "Substring filter — matches on Name / Interface / Frame "
+            "Type / VLAN / L3 / L4 / RX Port / Flow Tracking. "
+            "Case-insensitive. Empty box shows every stream."
+        )
+        self._stream_filter_input.textChanged.connect(
+            self._apply_stream_table_filter
+        )
+        filter_row.addWidget(filter_label)
+        filter_row.addWidget(self._stream_filter_input)
+        filter_row.addStretch(1)
+        layout.addLayout(filter_row)
+
         # --- Stream Table ---
         self.stream_table = QTableWidget()
         # Cap icon size so the Status column's dot doesn't render as a
@@ -234,33 +271,17 @@ class TrafficGenClientStreamControl:
         self._apply_button_default_style = self.apply_stream_button.styleSheet()
         button_layout.addWidget(self.apply_stream_button)
 
-        # Add stretch before search box
+        # Stretch pushes the live-count chip to the right edge of the
+        # action bar.
         button_layout.addStretch(1)
 
-        # Search box (right side) — debounced so each keystroke doesn't trigger a
-        # full table rebuild (audit flagged this as a perf wart with 100+ streams).
-        self.search_box = QLineEdit()
-        self.search_box.setPlaceholderText("Search...")
-        self.search_box.setFixedWidth(200)
-        self._search_debounce_timer = QTimer(self)
-        self._search_debounce_timer.setSingleShot(True)
-        self._search_debounce_timer.setInterval(200)
-        self._search_debounce_timer.timeout.connect(self.update_stream_table)
-        self.search_box.returnPressed.connect(self.update_stream_table)
-        self.search_box.textChanged.connect(lambda _t: self._search_debounce_timer.start())
-        button_layout.addWidget(self.search_box)
-
-        # Neutral clear button — the previous "❌" emoji rendered bright red and
-        # read as an error/destructive cue rather than a benign clear control.
-        clear_search_btn = QPushButton("✕")
-        clear_search_btn.setFixedWidth(30)
-        clear_search_btn.setToolTip("Clear search")
-        clear_search_btn.setStyleSheet(
-            "QPushButton { color: #6b7280; font-size: 13px; }"
-            "QPushButton:hover { color: #1f2937; }"
-        )
-        clear_search_btn.clicked.connect(lambda: self.search_box.setText(""))
-        button_layout.addWidget(clear_search_btn)
+        # v0.3.11: the bottom "Search..." box + ✕ clear button used to
+        # live here. Removed because it filtered the same `stream_table`
+        # as the top-of-tab filter (added in the same release for
+        # parity with the Devices / L2 Emulation / Stateful TCP tabs).
+        # Two filter inputs on one table is the exact inconsistency the
+        # user was reporting. The top filter uses in-place row-hide
+        # which is also cheaper than the old debounced full rebuild.
 
         # Live count chip — running / total streams. Mirrors the L2
         # emulation tab's status chip; refreshed every time the table is
@@ -318,6 +339,73 @@ class TrafficGenClientStreamControl:
             self._stream_empty_label.show()
         else:
             self._stream_empty_label.hide()
+
+    # ---------- v0.3.11: streams-table filter (parity with Devices /
+    # L2 Emulation / Stateful TCP tabs) ----------
+
+    # Stable column-label allowlist for substring-match. Status icons
+    # and numeric-only columns (sizes, L1) are intentionally excluded
+    # so a needle like "1500" doesn't match a row's Max Size column
+    # by accident — operators filter by config fields, not byte counts.
+    _STREAM_FILTER_COLUMNS = (
+        "Interface", "Name", "Frame Type", "VLAN",
+        "L2", "L3", "L4", "RX Port", "Flow Tracking",
+    )
+
+    def _apply_stream_table_filter(self, *_args):
+        """Hide stream-table rows whose allowlisted columns don't
+        contain the current filter substring (case-insensitive).
+        Empty filter → all rows visible.
+
+        Re-invoked from `_do_update_stream_table` after every rebuild
+        so the filter survives the periodic stats-driven refresh.
+        Defensive — table or filter widget may not yet exist during
+        early init / partial mixin construction.
+        """
+        table = getattr(self, "stream_table", None)
+        if table is None:
+            return
+        edit = getattr(self, "_stream_filter_input", None)
+        needle = (edit.text() if edit is not None else "").strip().lower()
+
+        # Resolve allowlisted column names to current indices each
+        # call — column order is stable today, but cheap to recompute
+        # and survives any future reorder without a separate cache
+        # invalidation hook.
+        wanted = set(self._STREAM_FILTER_COLUMNS)
+        cols = []
+        for c in range(table.columnCount()):
+            hi = table.horizontalHeaderItem(c)
+            if hi is not None and hi.text() in wanted:
+                cols.append(c)
+
+        for r in range(table.rowCount()):
+            if not needle:
+                table.setRowHidden(r, False)
+                continue
+            match = False
+            for c in cols:
+                item = table.item(r, c)
+                if item is None:
+                    # Cell may host a widget (e.g. inline combo for
+                    # Enabled / Flow Tracking) — fall back to that
+                    # widget's accessible text if present.
+                    w = table.cellWidget(r, c)
+                    if w is not None:
+                        txt = (
+                            w.currentText().lower()
+                            if hasattr(w, "currentText")
+                            else (w.text().lower()
+                                  if hasattr(w, "text") else "")
+                        )
+                        if txt and needle in txt:
+                            match = True
+                            break
+                    continue
+                if needle in (item.text() or "").lower():
+                    match = True
+                    break
+            table.setRowHidden(r, not match)
 
     # ---------- dirty-edit tracking (#8) ----------
 

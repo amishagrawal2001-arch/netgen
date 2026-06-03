@@ -66,6 +66,34 @@ class VXLANHandler:
         self.parent.vxlan_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.parent.vxlan_table.setSelectionBehavior(QTableWidget.SelectRows)
 
+        # v0.3.11: filter input ABOVE the table — parity with the
+        # other sub-tabs. VXLAN has a wide 13-column table so the
+        # filter is especially valuable here.
+        try:
+            from utils.table_filter_bar import make_table_filter_row
+            _vxlan_filter_row, self.parent._vxlan_filter_input = (
+                make_table_filter_row(
+                    table=self.parent.vxlan_table,
+                    columns=(
+                        "Device", "VXLAN Interface", "Underlay Interface",
+                        "Overlay Interface", "VNI", "VLAN ID",
+                        "VLAN Interface IP", "Local Endpoint",
+                        "Remote Endpoint(s)",
+                    ),
+                    placeholder=(
+                        "Device / Interface / VNI / VLAN / Endpoint …"
+                    ),
+                    tooltip=(
+                        "Substring filter — Device / Interface / VNI / "
+                        "VLAN / Endpoint columns. Case-insensitive."
+                    ),
+                )
+            )
+            layout.addLayout(_vxlan_filter_row)
+        except Exception as _e:
+            import logging as _lg
+            _lg.warning(f"[VXLAN TAB] filter row unavailable: {_e}")
+
         # Section header removed — tab name + table columns are enough.
         layout.addWidget(self.parent.vxlan_table)
 
@@ -753,6 +781,13 @@ class VXLANHandler:
                 "Refresh Failed",
                 f"Failed to refresh VXLAN status table:\n{str(e)}"
             )
+        finally:
+            # v0.3.11: reapply substring filter so it survives this rebuild.
+            try:
+                from utils.table_filter_bar import reapply_filter
+                reapply_filter(getattr(self.parent, "_vxlan_filter_input", None))
+            except Exception:
+                pass
 
     def _append_row(self, device, vxlan_cfg):
         row = self.parent.vxlan_table.rowCount()

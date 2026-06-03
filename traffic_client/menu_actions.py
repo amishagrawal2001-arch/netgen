@@ -448,15 +448,35 @@ class TrafficGenClientMenuAction():
         poll_input.setToolTip("How often the Devices tab polls /api/monitors/health")
         form.addRow("Monitor poll interval:", poll_input)
 
-        # Default BGP ASN
-        asn_input = QSpinBox()
-        asn_input.setRange(1, 4_294_967_295)
-        asn_input.setValue(int(s.value(
+        # Default BGP ASN.
+        # v0.3.11 crash fix: was QSpinBox.setRange(1, 4_294_967_295)
+        # which throws OverflowError on Qt5 (QSpinBox stores int32 —
+        # max 2_147_483_647). Settings dialog wouldn't even open.
+        # Switched to QLineEdit + regex so we can support the full
+        # BGP 4-byte ASN range (1..2^32-1) RFC 6793 allows.
+        from PyQt5.QtCore import QRegExp
+        from PyQt5.QtGui import QRegExpValidator
+        _ASN_MAX = 4_294_967_295   # 2^32 - 1, BGP 4-byte AS upper bound
+        # Read as STRING (not type=int) — QSettings.value(..., type=int)
+        # routes through Qt's signed int32 conversion and silently
+        # truncates values > 2_147_483_647 to -1. Python int() handles
+        # the full range without overflow.
+        _saved_asn = s.value(
             "default_bgp_asn",
-            self.SETTINGS_DEFAULTS["default_bgp_asn"],
-            type=int,
-        )))
-        asn_input.setToolTip("Pre-filled in the Add Device → BGP form")
+            str(self.SETTINGS_DEFAULTS["default_bgp_asn"]),
+        )
+        try:
+            _saved_asn_int = int(_saved_asn)
+        except (TypeError, ValueError):
+            _saved_asn_int = self.SETTINGS_DEFAULTS["default_bgp_asn"]
+        asn_input = QLineEdit(str(_saved_asn_int))
+        # 1–10 digits — keystroke filter; range is enforced in _apply
+        # because regex can't express "<=4294967295" cleanly.
+        asn_input.setValidator(QRegExpValidator(QRegExp(r"\d{1,10}")))
+        asn_input.setToolTip(
+            "Pre-filled in the Add Device → BGP form. "
+            "Accepts 1..4,294,967,295 (BGP 4-byte ASN per RFC 6793)."
+        )
         form.addRow("Default BGP ASN:", asn_input)
 
         # Default IPv4 base address
@@ -485,7 +505,20 @@ class TrafficGenClientMenuAction():
 
         def _apply():
             s.setValue("monitor_poll_interval", poll_input.value())
-            s.setValue("default_bgp_asn", asn_input.value())
+            # Parse + clamp the ASN to the legal 4-byte range. Regex
+            # validator already filtered to digits, but extreme
+            # values (>2^32-1) still possible if operator types 10
+            # nines. Fall back to default on parse failure (which
+            # shouldn't happen given the validator, but be safe).
+            try:
+                _asn_val = int(asn_input.text() or 0)
+            except ValueError:
+                _asn_val = self.SETTINGS_DEFAULTS["default_bgp_asn"]
+            _asn_val = max(1, min(_asn_val, _ASN_MAX))
+            # Store as STRING for the same reason we READ as string:
+            # writing a Python int > 2^31-1 lands as QVariant.Int
+            # which truncates to -1 on the next read.
+            s.setValue("default_bgp_asn", str(_asn_val))
             s.setValue("default_ipv4_base", ipv4_input.text().strip() or self.SETTINGS_DEFAULTS["default_ipv4_base"])
             s.setValue("default_loopback_ipv4", lo_input.text().strip() or self.SETTINGS_DEFAULTS["default_loopback_ipv4"])
             s.sync()
@@ -504,7 +537,7 @@ class TrafficGenClientMenuAction():
 
         def _restore():
             poll_input.setValue(self.SETTINGS_DEFAULTS["monitor_poll_interval"])
-            asn_input.setValue(self.SETTINGS_DEFAULTS["default_bgp_asn"])
+            asn_input.setText(str(self.SETTINGS_DEFAULTS["default_bgp_asn"]))
             ipv4_input.setText(self.SETTINGS_DEFAULTS["default_ipv4_base"])
             lo_input.setText(self.SETTINGS_DEFAULTS["default_loopback_ipv4"])
 
@@ -610,17 +643,54 @@ class TrafficGenClientMenuAction():
         except Exception as exc:
             QMessageBox.critical(self, "Import Error", str(exc))
 
-    def save_session(self, blocking: bool = False):
+    def save_session(self, blocking: bool = False, manual: bool = False):
         """Save the current session to a JSON file.
 
         Args:
             blocking: When True, perform the save synchronously on the caller thread.
                       When False (default), run the save in a background QThread.
+            manual: When True, the call originated from a deliberate user
+                action (Ctrl+S, Save As, Load From… side-effects). Manual
+                saves ALWAYS run, regardless of the auto-save preference.
+                When False (default), this is an auto-save triggered by
+                an edit handler — gated behind `self._auto_save_enabled`
+                so the user can opt out of every-edit-writes-to-disk
+                behaviour without each edit site needing to know.
+
+                Old behaviour: every BGP/OSPF/ISIS/DHCP/VXLAN apply,
+                every stream remove, every inline-edit fired
+                save_session() and the throttled trailing-edge
+                eventually wrote to disk. That meant
+                "I removed a row to experiment" silently committed
+                the deletion to the active session file. v0.3.11
+                makes that opt-in: the operator gates auto-saves via
+                File → Auto-save Session.
         """
         import traceback
         import time
         # Starting save_session()
-        
+
+        # v0.3.11: auto-save opt-in gate. Default False — the operator
+        # explicitly toggles File → Auto-save Session to bring back the
+        # historical edit-triggered-save behaviour. Manual saves
+        # (Ctrl+S, Save As…) bypass the gate. Logged once at DEBUG so
+        # the trailing-save loop doesn't spam the log every 2 s.
+        if not manual and not getattr(self, "_auto_save_enabled", False):
+            # Mark the session dirty so the closeEvent prompt fires
+            # and the title-bar asterisk appears — without this the
+            # operator has no signal that there are pending edits
+            # the gate suppressed. Set BEFORE the early return.
+            self._has_unsaved_edits = True
+            try:
+                self._update_window_title()
+            except Exception:
+                pass
+            logger.debug(
+                "[SAVE SESSION] auto-save disabled; skipping "
+                "edit-triggered save. Use Ctrl+S to save manually."
+            )
+            return
+
         current_time = time.time()
         # Prevent new async saves while shutting down; blocking saves still allowed
         if getattr(self, "_is_closing", False) and not blocking:
@@ -751,12 +821,28 @@ class TrafficGenClientMenuAction():
                     logger.debug(f"[SAVE SESSION] {message}")
                 else:
                     logger.info(f"[SAVE SESSION] {message}")
+                # v0.3.11: blocking-save success also clears the
+                # unsaved-edits marker (mirror of the async
+                # _on_save_finished path) — closeEvent prompt and
+                # title asterisk go away.
+                self._has_unsaved_edits = False
+                try:
+                    self._update_window_title()
+                except Exception:
+                    pass
             else:
                 logger.error(f"[SAVE SESSION ERROR] {message}")
             return success, message
 
         self._save_in_progress = True
-        
+        # v0.3.11: title bar shows the dirty marker (`*`) for the
+        # duration of the in-flight save. _on_save_finished clears it
+        # when the worker reports done.
+        try:
+            self._update_window_title()
+        except Exception:
+            pass
+
         # Run save operation in separate thread to avoid blocking UI
         from PyQt5.QtCore import QThread, pyqtSignal
         
@@ -827,8 +913,26 @@ class TrafficGenClientMenuAction():
                 logger.debug(f"[SAVE SESSION] {message}")
             else:
                 logger.info(f"[SAVE SESSION] {message}")
+                # v0.3.11: post a brief status-bar toast on real saves
+                # only (skip the hash-no-op so the toast doesn't fire
+                # for the trailing-edge tick that wrote nothing). The
+                # summary fields are populated by _save_session_impl
+                # at write time so we don't re-walk the structures.
+                self._post_save_toast()
+            # v0.3.11: a successful write clears the unsaved-edits
+            # marker — closeEvent prompt and title asterisk go away.
+            # The hash-no-op path also counts as "in sync with disk",
+            # so clear in both branches.
+            self._has_unsaved_edits = False
         else:
             logger.error(f"[SAVE SESSION ERROR] {message}")
+        # v0.3.11: dirty marker reflects in-flight/pending saves +
+        # the unsaved-edits flag — refresh here on completion so the
+        # title-bar asterisk re-renders against the new state.
+        try:
+            self._update_window_title()
+        except Exception:
+            pass
         
         # CRITICAL: Properly clean up the worker thread
         # Wait for thread to finish, then schedule deletion
@@ -891,6 +995,302 @@ class TrafficGenClientMenuAction():
 
         QTimer.singleShot(delay_ms, _fire)
 
+    # ─────────────────────────── v0.3.11: Save As / Load From / Recent
+
+    def save_session_as(self):
+        """File menu → Save Session As… — pick a destination, write
+        the session there, and make that path the new active session
+        so subsequent Ctrl+S writes to it too.
+
+        Blocking save so the file is on disk before we update the
+        recent-sessions list and refresh the title — async would leak
+        the trio (active path, file contents, recent list) out of
+        sync if the worker thread finishes after the menu rebuilds.
+        """
+        from PyQt5.QtWidgets import QFileDialog
+        from utils.path_utils import get_session_file_path
+        start_dir = (
+            getattr(self, "_current_session_path", None)
+            or get_session_file_path()
+        )
+        path, _filt = QFileDialog.getSaveFileName(
+            self, "Save Session As",
+            start_dir,
+            "Session JSON (*.json);;All files (*)",
+        )
+        if not path:
+            return  # user cancelled
+        # Ensure .json suffix — Qt's file dialog doesn't enforce it
+        # cross-platform, and a missing suffix breaks the file-picker
+        # filter on the next Load From… (the operator types "stress"
+        # and gets no JSON file in the list).
+        if not path.lower().endswith(".json"):
+            path = path + ".json"
+
+        self._current_session_path = path
+        # Force a fresh write: the content-hash short-circuit in
+        # _save_session_impl would otherwise treat this as a no-op
+        # if the in-memory state matches the previous saved hash
+        # (common when Save As is invoked right after a regular save).
+        self._last_session_hash = None
+        # Blocking save so the chronology is: file written → recent
+        # list updated → title refreshed. async would race. Marked
+        # manual=True so the auto-save-disabled gate doesn't suppress
+        # this — Save As is always a deliberate user action.
+        try:
+            self.save_session(blocking=True, manual=True)
+        except Exception as exc:
+            logger.error(f"[SAVE AS] save failed: {exc}")
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Save Session As",
+                                f"Failed to save session:\n{exc}")
+            return
+
+        # Update recent list + menu + title bar.
+        try:
+            from utils.recent_sessions import add_recent
+            add_recent(path)
+        except Exception as exc:
+            logger.debug(f"[SAVE AS] recent-list update failed: {exc}")
+        try:
+            self._rebuild_recent_sessions_menu()
+        except Exception:
+            pass
+        try:
+            self._update_window_title()
+        except Exception:
+            pass
+
+    def load_session_from(self):
+        """File menu → Load Session From… — pick an existing session
+        file, load it, and make that path the new active session so
+        subsequent Ctrl+S writes back to it.
+
+        The actual reload triggers UI rebuilds via `load_session`'s
+        existing post-load handlers (stream table, devices, server
+        tree, etc.) — we just thread the path through and refresh
+        the title + recent list.
+        """
+        from PyQt5.QtWidgets import QFileDialog, QMessageBox
+        from utils.path_utils import get_session_file_path
+        start_dir = (
+            getattr(self, "_current_session_path", None)
+            or get_session_file_path()
+        )
+        path, _filt = QFileDialog.getOpenFileName(
+            self, "Load Session From",
+            start_dir,
+            "Session JSON (*.json);;All files (*)",
+        )
+        if not path:
+            return  # user cancelled
+
+        try:
+            self.load_session(session_file_path=path)
+        except Exception as exc:
+            logger.error(f"[LOAD FROM] load failed: {exc}")
+            QMessageBox.warning(self, "Load Session From",
+                                f"Failed to load session:\n{exc}")
+            return
+
+        try:
+            from utils.recent_sessions import add_recent
+            add_recent(path)
+        except Exception as exc:
+            logger.debug(f"[LOAD FROM] recent-list update failed: {exc}")
+        try:
+            self._rebuild_recent_sessions_menu()
+        except Exception:
+            pass
+        try:
+            self._update_window_title()
+        except Exception:
+            pass
+
+    def _rebuild_recent_sessions_menu(self):
+        """Repopulate the File → Recent Sessions submenu from the
+        on-disk recent-list. Called after Save As / Load From and at
+        boot. No-op if the menu wasn't constructed (defensive — the
+        menu lives in main.py and is wired in early; mixin order
+        could in theory change).
+        """
+        menu = getattr(self, "recent_sessions_menu", None)
+        if menu is None:
+            return
+        try:
+            from utils.recent_sessions import load_recent
+            paths = load_recent()
+        except Exception:
+            paths = []
+
+        menu.clear()
+        if not paths:
+            from PyQt5.QtWidgets import QAction
+            empty = QAction("(no recent sessions)", self)
+            empty.setEnabled(False)
+            menu.addAction(empty)
+            return
+
+        from PyQt5.QtWidgets import QAction
+        import os
+
+        def _make_loader(p):
+            # Closure captures `p` by value at action-creation time —
+            # without this every menu item would load whichever path
+            # the loop variable happens to hold when it fires.
+            def _load():
+                try:
+                    self.load_session(session_file_path=p)
+                except Exception as exc:
+                    logger.error(f"[RECENT] load {p!r} failed: {exc}")
+                    from PyQt5.QtWidgets import QMessageBox
+                    QMessageBox.warning(
+                        self, "Recent Sessions",
+                        f"Failed to load:\n{p}\n\n{exc}",
+                    )
+                    return
+                try:
+                    from utils.recent_sessions import add_recent
+                    add_recent(p)
+                except Exception:
+                    pass
+                try:
+                    self._rebuild_recent_sessions_menu()
+                except Exception:
+                    pass
+                try:
+                    self._update_window_title()
+                except Exception:
+                    pass
+            return _load
+
+        for p in paths:
+            label = os.path.basename(p)
+            act = QAction(label, self)
+            act.setStatusTip(p)
+            act.setToolTip(p)
+            act.triggered.connect(_make_loader(p))
+            menu.addAction(act)
+        # Clear-list affordance — operators sometimes want to drop a
+        # stale entry without manually editing recent_sessions.json.
+        menu.addSeparator()
+        clear_act = QAction("Clear Recent List", self)
+
+        def _clear():
+            try:
+                from utils.recent_sessions import clear_recent
+                clear_recent()
+            except Exception:
+                pass
+            self._rebuild_recent_sessions_menu()
+        clear_act.triggered.connect(_clear)
+        menu.addAction(clear_act)
+
+    def _update_window_title(self):
+        """Bake the active session file basename + dirty marker into
+        ``self._base_window_title``, then trigger the existing
+        section-size readout to render the full title.
+
+        Title format:
+          ``Netgen Traffic Generator — <basename>[ *]  —  <sizes>``
+
+        The asterisk shows whenever a save is in flight or pending
+        (the trailing-edge of the coalesce). Auto-save makes it brief
+        but it's an accurate signal that in-memory state hasn't been
+        persisted yet.
+        """
+        import os
+        app = "Netgen Traffic Generator"
+        path = getattr(self, "_current_session_path", None)
+        name = os.path.basename(path) if path else ""
+        # v0.3.11: dirty reflects three signals:
+        #   * _save_in_progress / _save_pending — save worker active
+        #     (brief flicker during auto-save tick)
+        #   * _has_unsaved_edits — edit happened but auto-save is OFF
+        #     so the write was suppressed. Stays True until a manual
+        #     Ctrl+S / Save As… clears it.
+        dirty = (getattr(self, "_save_in_progress", False)
+                 or getattr(self, "_save_pending", False)
+                 or getattr(self, "_has_unsaved_edits", False))
+        marker = " *" if dirty else ""
+        if name:
+            self._base_window_title = f"{app} — {name}{marker}"
+        else:
+            self._base_window_title = app
+        # _update_section_size_readout (defined in main.py) appends
+        # dimensions and calls setWindowTitle. Fall back to setting
+        # the base directly if it isn't wired in.
+        readout = getattr(self, "_update_section_size_readout", None)
+        if callable(readout):
+            try:
+                readout()
+                return
+            except Exception:
+                pass
+        try:
+            self.setWindowTitle(self._base_window_title)
+        except Exception:
+            pass
+
+    def toggle_auto_save_enabled(self, checked: bool):
+        """Wire-up handler for the File → Auto-save Session checkable
+        menu action. Flips ``self._auto_save_enabled`` and persists to
+        QSettings so the choice survives a restart.
+
+        Default is OFF (opt-in). When ON, every edit handler that
+        calls ``save_session()`` writes through to the active session
+        file (BGP / OSPF / ISIS / DHCP / VXLAN applies, stream
+        add/remove, inline cell edits). When OFF, only deliberate
+        user actions (Ctrl+S, Save Session As…) write.
+        """
+        self._auto_save_enabled = bool(checked)
+        try:
+            from PyQt5.QtCore import QSettings
+            QSettings().setValue("auto_save_enabled", self._auto_save_enabled)
+        except Exception as exc:
+            logger.debug(f"[SAVE SESSION] QSettings persist failed: {exc}")
+        state = "enabled" if self._auto_save_enabled else "disabled"
+        logger.info(f"[SAVE SESSION] auto-save {state}")
+        # Brief status-bar nudge so the operator sees the toggle
+        # took effect (the menu checkmark is easy to miss).
+        try:
+            sb = self.statusBar() if callable(getattr(self, "statusBar", None)) else None
+            if sb is not None:
+                msg = (
+                    "Auto-save ON — edits will write to the active "
+                    "session file"
+                    if self._auto_save_enabled
+                    else "Auto-save OFF — use Ctrl+S / Save As to save"
+                )
+                sb.showMessage(msg, 3500)
+        except Exception:
+            pass
+
+    def _post_save_toast(self):
+        """Brief status-bar message after a successful save.
+
+        Reads `_last_save_summary` populated by `_save_session_impl`
+        (devices count, streams count, written path). Silent fallback
+        when the status bar isn't available or the summary wasn't
+        populated (legacy code path, partial init).
+        """
+        import os
+        sb = getattr(self, "statusBar", None)
+        bar = sb() if callable(sb) else None
+        if bar is None:
+            return
+        summary = getattr(self, "_last_save_summary", None) or {}
+        path = summary.get("path") or ""
+        name = os.path.basename(path) if path else "session.json"
+        ndev = summary.get("devices", 0)
+        nstr = summary.get("streams", 0)
+        msg = f"Saved {ndev} device{'' if ndev == 1 else 's'}, " \
+              f"{nstr} stream{'' if nstr == 1 else 's'} to {name}"
+        try:
+            bar.showMessage(msg, 4000)  # 4 second timeout
+        except Exception:
+            pass
+
     def _save_session_impl(self, protocol_data=None):
         """Internal implementation of save_session (runs in worker thread).
         
@@ -919,11 +1319,84 @@ class TrafficGenClientMenuAction():
             # Use the all_devices data structure which has the complete device information
             # Get the current state directly from the main_window (same as device removal uses)
             all_devices = getattr(self, "all_devices", {})
+            # v0.3.11 diagnostic: log what the save sees from both
+            # main_window.all_devices and devices_tab.all_devices so
+            # the user-reported "devices in GUI but 0 in saved file"
+            # bug surfaces the discrepancy if those two have drifted.
+            # Cheap to compute, prints once per save, makes the next
+            # bug-report log paste self-explanatory.
+            _mw_count = sum(
+                len(v) if isinstance(v, list) else 0
+                for v in all_devices.values()
+            )
+            _dt_all_devices = getattr(self.devices_tab, "all_devices", {})
+            _dt_count = sum(
+                len(v) if isinstance(v, list) else 0
+                for v in (_dt_all_devices or {}).values()
+            )
+            logger.info(
+                f"[SAVE SESSION] all_devices snapshot: "
+                f"main_window has {_mw_count} device(s) across "
+                f"{len(all_devices)} iface(s); devices_tab has "
+                f"{_dt_count} device(s) across "
+                f"{len(_dt_all_devices or {})} iface(s)"
+            )
+            # If the GUI's devices_tab has devices but main_window
+            # doesn't (the drift case), fall back to devices_tab's
+            # copy so the save captures what the operator actually
+            # sees. Logged so the discrepancy isn't silent.
+            if _mw_count == 0 and _dt_count > 0:
+                logger.warning(
+                    f"[SAVE SESSION] main_window.all_devices is "
+                    f"empty but devices_tab has {_dt_count} "
+                    f"device(s). Using devices_tab.all_devices as "
+                    f"the save source — investigate the drift."
+                )
+                all_devices = _dt_all_devices
+            # v0.3.11: canonicalize the device's Interface field
+            # before persisting. Historically the in-memory key and
+            # the device's own Interface attribute could drift — a
+            # server returning a malformed truthy iface landed both
+            # under the malformed bucket, and naive save persisted
+            # the malformed value. Once that file ever loaded
+            # somewhere without the load-time repair, the device
+            # vanished. Sanitize on the way out so the on-disk
+            # format is always the canonical "TG N - port" form,
+            # regardless of how it got into memory.
+            from utils.iface_naming import (
+                canonical_iface_key, looks_canonical,
+            )
+            # Build a quick iface→tg_id map from server_interfaces so
+            # the sanitizer can repair malformed keys when we can
+            # infer the right TG.
+            _tg_by_address = {}
+            for _s in getattr(self, "server_interfaces", []):
+                _addr = _s.get("address")
+                if _addr:
+                    _tg_by_address[_addr] = _s.get("tg_id", 0)
+
             # Convert from interface-based structure to device name-based structure
             for iface, devices in all_devices.items():
                 for device in devices:
                     device_name = device.get("Device Name", "")
                     if device_name:
+                        # If the bucket key is malformed, try to
+                        # repair it using the device's own tg_id /
+                        # server_url field, else fall back to the
+                        # bucket key as-is (the load-time repair
+                        # will still try to fix it on the next
+                        # round-trip).
+                        if not looks_canonical(iface):
+                            _tg = device.get("tg_id")
+                            if _tg is None:
+                                _srv_url = device.get("server_url")
+                                if _srv_url:
+                                    _tg = _tg_by_address.get(_srv_url)
+                            _canon = canonical_iface_key(iface, tg_id=_tg)
+                            if _canon and looks_canonical(_canon):
+                                device["Interface"] = _canon
+                        else:
+                            device["Interface"] = iface
                         # Use device name as key instead of MAC address
                         device_rows[device_name] = device
             
@@ -1068,13 +1541,33 @@ class TrafficGenClientMenuAction():
             # the user-visible noise floor stays at zero.
             return True, "no changes — skipped"
 
-        # Save to disk using proper path utilities
+        # Save to disk. v0.3.11: write to `_current_session_path` so
+        # Save As / Load From can swap the active file; fall back to
+        # the default ostg data-dir path if the attr was never set
+        # (defensive — pre-mixin code paths or unit-test mocks).
         try:
             from utils.path_utils import get_session_file_path
-            session_file = get_session_file_path()
+            session_file = (
+                getattr(self, "_current_session_path", None)
+                or get_session_file_path()
+            )
+            # If a Save As pointed us at a directory that doesn't
+            # exist yet (e.g. ~/sessions/), create it. Mirrors the
+            # behaviour of the data-dir default which auto-creates.
+            import os
+            os.makedirs(os.path.dirname(session_file) or ".",
+                        exist_ok=True)
             with open(session_file, "w") as f:
                 f.write(payload)
             self._last_session_hash = current_hash
+            # Stash counts so the post-save toast can quote them
+            # without re-walking the structures (the worker thread
+            # already iterated them above).
+            self._last_save_summary = {
+                "path": session_file,
+                "devices": len(device_rows),
+                "streams": sum(len(v) for v in updated_streams.values()),
+            }
             return True, "✅ Session saved successfully"
         except Exception as e:
             return False, f"[❌] Failed to save session: {e}"
@@ -1425,15 +1918,53 @@ class TrafficGenClientMenuAction():
         worker.done.connect(_on_done)
         worker.start()
     
-    def load_session(self, skip_servers=False):
+    def load_session(self, skip_servers=False, session_file_path=None):
         """Load the session from a JSON file.
-        
+
         Args:
-            skip_servers: If True, skip loading servers from session.json (useful when server is provided via CLI)
+            skip_servers: If True, skip loading servers from session.json
+                (useful when server is provided via CLI).
+            session_file_path: Optional path override. When supplied
+                (Load From… picker), the helper also updates
+                ``self._current_session_path`` so subsequent Save
+                operations write to the same file. When None, falls
+                back to ``self._current_session_path`` (Save As may
+                have changed it) and finally to the default data-dir
+                path.
         """
         try:
             from utils.path_utils import get_session_file_path
-            session_file = get_session_file_path()
+            session_file = (
+                session_file_path
+                or getattr(self, "_current_session_path", None)
+                or get_session_file_path()
+            )
+            # If the caller passed an explicit path, point the active
+            # session at it. Save As / Load From rely on this. Also
+            # treat it as a full REPLACE rather than the startup merge
+            # the original implementation was built around — without
+            # this, opening a second snapshot mid-session leaves
+            # ghosts from the previous one (server list keeps the
+            # stale entries because the loader below only appends new
+            # ones; same hazard for the removed_* sets).
+            is_replace_load = bool(session_file_path)
+            if session_file_path:
+                self._current_session_path = session_file_path
+                # Wipe state that the startup merge path would
+                # otherwise leave dangling. Streams + all_devices
+                # already get cleared further down, but the server
+                # list, removed_* sets, and the content-hash
+                # short-circuit need to be reset here so the rest of
+                # the load behaves like a fresh boot against the
+                # chosen file.
+                self.server_interfaces = []
+                self.removed_servers = set()
+                self.removed_interfaces = set()
+                # Clear the save-hash so the next save (which will
+                # write the freshly-loaded state back to the new
+                # active file) doesn't get short-circuited by a
+                # stale hash from the previous session.
+                self._last_session_hash = None
             with open(session_file, "r") as f:
                 session_data = json.load(f)
             
@@ -1559,15 +2090,52 @@ class TrafficGenClientMenuAction():
                 loaded_count = 0
                 removed_count = 0
                 
+                # v0.3.11: build a (port-name → "TG X - port-name") map
+                # from the server list so we can repair malformed device
+                # Interface fields. Old session files (and at least one
+                # bug path the user reported on load) wrote the device's
+                # Interface as just " - ens5np0" instead of the canonical
+                # "TG 0 - ens5np0" — the loader would dutifully bucket
+                # the device under that key, then update_device_table /
+                # update_bgp_table couldn't find it because every other
+                # lookup uses the "TG X - port" form. Result: a device
+                # in `all_devices` but invisible in every tab.
+                #
+                # The repair: walk server_interfaces, expand each
+                # server's interfaces into both the bare and canonical
+                # forms, and remember which TG owns each suffix. On
+                # load, any device whose Interface lacks "TG " gets
+                # rewritten to the canonical form (single suffix
+                # match) or left alone (ambiguous / no match). Logged
+                # so an operator debugging "where did my device go"
+                # sees the rewrite.
+                _suffix_to_canonical = {}
+                for _srv in self.server_interfaces:
+                    _tg = f"TG {_srv.get('tg_id', '0')}"
+                    for _i in _srv.get("interfaces", []) or []:
+                        _name = _i if isinstance(_i, str) else _i.get("name", "")
+                        if not _name:
+                            continue
+                        # Track every shape the suffix might appear in.
+                        for _suffix in (
+                            _name,
+                            f" - {_name}",
+                            f" - Port: {_name}",
+                        ):
+                            _canon = f"{_tg} - {_name}"
+                            _suffix_to_canonical.setdefault(
+                                _suffix, set(),
+                            ).add(_canon)
+
                 for device_name, device_info in loaded_devices.items():
                     device_id = device_info.get("device_id", "")
-                    
+
                     # Skip devices that were marked as removed
                     if device_id in removed_devices:
                         logger.debug(f"[DEBUG LOAD] Skipping removed device: {device_name} (ID: {device_id})")
                         removed_count += 1
                         continue
-                    
+
                     # Convert old single-tunnel VXLAN config to tunnels format for consistency
                     vxlan_config = device_info.get("vxlan_config", {})
                     if vxlan_config and isinstance(vxlan_config, dict):
@@ -1575,8 +2143,74 @@ class TrafficGenClientMenuAction():
                             # Old format: single tunnel dict, convert to tunnels format
                             logger.debug(f"[DEBUG LOAD] Converting old VXLAN config format to tunnels format for {device_name}")
                             device_info["vxlan_config"] = {"tunnels": [vxlan_config]}
-                    
+
                     iface = device_info.get("Interface", "")
+                    # v0.3.11: repair malformed Interface — see the
+                    # `_suffix_to_canonical` comment above. Trigger is
+                    # "looks like an iface but missing a TG prefix"
+                    # (leading " - " or no "TG " at all). Three-tier
+                    # repair, most-specific-first:
+                    #
+                    #   1. Suffix matches a known server-reported
+                    #      interface exactly → use the canonical
+                    #      "TG X - port" form.
+                    #   2. Single-server topology → prepend that
+                    #      server's TG even if the port isn't in its
+                    #      reported interfaces (covers the case where
+                    #      the device's saved port doesn't exist on
+                    #      the current server — operator may have
+                    #      renamed it, or the session was saved
+                    #      against a different host. Device still
+                    #      lands in `all_devices` under a canonical
+                    #      key so it RENDERS instead of vanishing).
+                    #   3. Multi-server + no match → log warning and
+                    #      keep the malformed key. Better visible
+                    #      with stale data than silently dropped.
+                    if iface and "TG " not in iface:
+                        _candidates = _suffix_to_canonical.get(iface)
+                        _new_iface = None
+                        if _candidates and len(_candidates) == 1:
+                            _new_iface = next(iter(_candidates))
+                        elif _candidates:
+                            # Ambiguous — pick the first deterministic
+                            # candidate, but warn so the operator can
+                            # spot it.
+                            _new_iface = sorted(_candidates)[0]
+                            logger.warning(
+                                f"[LOAD SESSION] Interface {iface!r} "
+                                f"ambiguous across servers; defaulting "
+                                f"to {_new_iface!r} (candidates: "
+                                f"{sorted(_candidates)})"
+                            )
+                        elif len(self.server_interfaces) == 1:
+                            # Single-server fallback. Strip any leading
+                            # " - " / "Port: " noise off the saved key
+                            # before composing the canonical name.
+                            _bare = iface
+                            for _prefix in (" - Port: ", " - ", "Port: "):
+                                if _bare.startswith(_prefix):
+                                    _bare = _bare[len(_prefix):]
+                                    break
+                            _tg = f"TG {self.server_interfaces[0].get('tg_id', '0')}"
+                            _new_iface = f"{_tg} - {_bare}"
+                        if _new_iface:
+                            logger.info(
+                                f"[LOAD SESSION] Repaired malformed "
+                                f"Interface for device {device_name!r}: "
+                                f"{iface!r} → {_new_iface!r}"
+                            )
+                            iface = _new_iface
+                            device_info["Interface"] = _new_iface
+                        else:
+                            logger.warning(
+                                f"[LOAD SESSION] Cannot repair "
+                                f"Interface {iface!r} for device "
+                                f"{device_name!r} (multi-server, no "
+                                f"suffix match). Device kept under "
+                                f"original key; will render via "
+                                f"all_devices fallback when no tree "
+                                f"selection is active."
+                            )
                     if iface:
                         if iface not in self.all_devices:
                             self.all_devices[iface] = []
@@ -1597,8 +2231,46 @@ class TrafficGenClientMenuAction():
                 if hasattr(self, "devices_tab") and self.devices_tab:
                     self.devices_tab.all_devices = self.all_devices.copy()
                     self.devices_tab.update_device_table(self.all_devices)
-                    # Update BGP table with loaded BGP configurations
-                    self.devices_tab.update_bgp_table()
+                    # v0.3.11: refresh EVERY protocol sub-tab, not just
+                    # BGP. The pre-v0.3.11 code only called
+                    # `update_bgp_table()`, so a Load From… (or even a
+                    # startup load on a session with OSPF / ISIS /
+                    # DHCP / VXLAN configs) left those tabs stale — the
+                    # operator's saved configs were in memory but not
+                    # rendered until something else triggered a
+                    # rebuild.
+                    #
+                    # BGP / OSPF / ISIS have wrapper methods on
+                    # devices_tab that delegate to the handler. DHCP
+                    # and VXLAN have no such wrappers — the refresh
+                    # method only lives on the handler instance. The
+                    # routing table below covers both shapes so a
+                    # silent no-op (getattr returning None against a
+                    # missing wrapper) can't hide the bug again.
+                    _refreshers = [
+                        # (host_attr, method_name)
+                        ("self",         "update_bgp_table"),
+                        ("self",         "update_ospf_table"),
+                        ("self",         "update_isis_table"),
+                        ("dhcp_handler", "refresh_dhcp_status"),
+                        ("vxlan_handler", "refresh_vxlan_table"),
+                    ]
+                    for _host_attr, _method in _refreshers:
+                        if _host_attr == "self":
+                            _target = self.devices_tab
+                        else:
+                            _target = getattr(self.devices_tab, _host_attr, None)
+                        if _target is None:
+                            continue
+                        _refresh_fn = getattr(_target, _method, None)
+                        if callable(_refresh_fn):
+                            try:
+                                _refresh_fn()
+                            except Exception as _e:
+                                logger.warning(
+                                    f"[LOAD SESSION] {_method} "
+                                    f"raised during refresh: {_e}"
+                                )
                     logger.debug(f"[DEBUG LOAD] Loaded {loaded_count} devices from session, skipped {removed_count} removed devices")
             else:
                 logger.debug("[DEBUG LOAD] No valid devices found in session")

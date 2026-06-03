@@ -73,8 +73,14 @@ class Rfc2544Dialog(QDialog):
         self.rx_iface_field.setPlaceholderText("(defaults to TX iface — loopback)")
         params_layout.addRow("RX interface:", self.rx_iface_field)
 
-        self.mac_src_field = QLineEdit("aa:bb:cc:dd:ee:01")
-        self.mac_dst_field = QLineEdit("aa:bb:cc:dd:ee:02")
+        # v0.3.11: MAC defaults unified with Blast a DPDK Flow dialog
+        # + the Stream templates library (both use 02:00:00:00:00:01/02).
+        # Was aa:bb:cc:dd:ee:0x — operator running RFC 2544 then
+        # comparing captures with Blast a Flow saw different source
+        # MACs and lost confidence in the defaults. All three paths
+        # now produce identical-looking frames so captures align.
+        self.mac_src_field = QLineEdit("02:00:00:00:00:01")
+        self.mac_dst_field = QLineEdit("02:00:00:00:00:02")
         params_layout.addRow("Source MAC:", self.mac_src_field)
         params_layout.addRow("Destination MAC:", self.mac_dst_field)
 
@@ -83,13 +89,23 @@ class Rfc2544Dialog(QDialog):
         params_layout.addRow("Source IPv4:", self.ip_src_field)
         params_layout.addRow("Destination IPv4:", self.ip_dst_field)
 
+        # v0.3.11: default duration 10 → 60 s per RFC 2544 §26.1.
+        # 10 s was labelled "fast sanity check" but operators kept
+        # exporting "RFC 2544 Throughput Test Report" with 10-s
+        # measurements, which auditors then rejected as non-
+        # compliant. 60 s is the RFC's minimum for a certified run;
+        # operator can dial down to 10 s explicitly for a quick
+        # smoke check.
         self.duration_spin = QSpinBox()
         self.duration_spin.setRange(2, 600)
-        self.duration_spin.setValue(10)
+        self.duration_spin.setValue(60)
         self.duration_spin.setSuffix(" s")
         self.duration_spin.setToolTip(
-            "Per-step traffic duration. RFC 2544 recommends 60s for trial "
-            "runs and longer for certification; 10s is a fast sanity check."
+            "Per-step traffic duration. RFC 2544 §26.1 requires 60 s "
+            "for a certified trial run; bump to 300 s+ for full "
+            "certification reports. Drop to 10–20 s for a fast "
+            "sanity check — results below 60 s are NOT RFC 2544 "
+            "compliant and should not be reported as such."
         )
         params_layout.addRow("Duration per step:", self.duration_spin)
 
@@ -99,8 +115,12 @@ class Rfc2544Dialog(QDialog):
         self.loss_spin.setValue(0.0)
         self.loss_spin.setSuffix(" %")
         self.loss_spin.setToolTip(
-            "Acceptable loss percentage for a step to be considered "
-            "'passing'. Default 0.0 (strict, per RFC 2544)."
+            "Maximum acceptable packet-loss percentage for a step to be "
+            "'passing'. Computed as (frames_sent − frames_received) / "
+            "frames_sent × 100. Default 0.0 = strict no-drop per "
+            "RFC 2544 §26.1. Bump to 0.01 / 0.1 / 1.0 for relaxed "
+            "trials where you specifically want to characterise "
+            "above-line-rate behaviour."
         )
         params_layout.addRow("Target loss:", self.loss_spin)
 

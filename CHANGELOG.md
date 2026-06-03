@@ -2,6 +2,197 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.3.11] - 2026-06-03
+
+**Operator-facing "easy DPDK + line rate" release.** Stops 0.3.10's
+"how do I actually configure a line-rate blast?" pattern by adding
+a one-click Blast a Flow dialog AND a 14-template library, then
+polishes the Add Stream dialog end-to-end so editing a stream no
+longer silently loses fields on reopen.
+
+### What changed (by area)
+
+**DPDK — Blast a Flow dialog (new since 0.3.10, hardened this release)**
+- `widgets/dpdk_blast_flow_dialog.py` — `DEFAULT_FRAME_SIZE` 64 → 1500
+  (Ethernet MTU; 100 G needs only 8.2 Mpps at MTU, well inside a
+  single tx_worker core; 64 B caps ~23 Gbps single-core and was
+  unreachable as a default). `DEFAULT_DST_MAC` ff:ff:ff:ff:ff:ff →
+  02:00:00:00:00:02 (broadcast triggered driver-side special handling
+  that capped wire rate). Layout: removed wrong column-stretch causing
+  field overlap; vSpacing 6→10 + setRowMinimumHeight; pinned dialog
+  setMinimumHeight to sizeHint so parent can't squeeze the group.
+- `traffic_client/dpdk_menu_actions.py::show_dpdk_blast_flow_dialog`
+  — `dlg.exec_()` → `dlg.show()` + `self._blast_dialogs.append(dlg)`
+  + `finished.connect(prune_hook)`, enabling **parallel multi-NIC
+  blasts**. Cascade-position each new dialog (`80 + 36 × index`) so
+  they don't stack. Inject `siblings_iface_provider` so the dialog
+  can warn before starting a second tx_worker on an already-claimed
+  NIC (DPDK PMD lock contention / silent throughput halving).
+- Dialog is now `Qt.NonModal` (parent class stays ApplicationModal
+  for short setup flows) — operator can use the main window while
+  traffic blasts.
+
+**Stream templates (Add Stream → Template dropdown)**
+- `utils/traffic_templates.py` — 6 new scaling templates: MAC sweep
+  1024 dst MACs, IPv4 dst /24, IPv4 src 256, IPv6 dst 64, 5-tuple
+  RSS, VLAN ID 4094. Plus `udp_line_rate_1500b` sibling of the
+  existing 64 B template. Default `_DEFAULT_SRC/DST_MAC` unified
+  with Blast a Flow (02:00:00:00:00:01/02 instead of
+  aa:bb:cc:dd:ee:01/02) so packet captures from the two paths
+  line up. Cross-module test pin enforces parity.
+- `widgets/stream_dialog.py::AddStreamDialog.__init__` — Template
+  dropdown was being suppressed for fresh new streams because the
+  launcher passes `{"stream_id": uuid}` (non-empty dict), failing
+  the `not self.stream_data` gate. Replaced with a real
+  edit-existing-stream check based on operator-facing keys.
+- `template_combo` gets `setMaxVisibleItems(30)` +
+  `combobox-popup: 0` stylesheet so all 14 templates render in one
+  popup (macOS native popup ignores maxVisibleItems by default;
+  was clipping the last 5 entries below the fold).
+- `populate_stream_fields` str()-coerces `frame_size` / `mpls_label`
+  / `mpls_ttl` / `mpls_experimental` so templates supplying int
+  values don't crash `QLineEdit.setText`.
+
+**Add Stream dialog — Protocol Selection tab**
+- Removed dead L1 group (None / MAC / RAW — value was written to
+  the stream dict but no packet builder ever read it) and dead
+  Payload Random radio (no encoder path).
+- Second "L4" radio group relabelled **Encap (over UDP)** — was
+  the same label twice in two boxes; ambiguous.
+- Frame size `QIntValidator(64, 9216)` (was 1518) — jumbo frames
+  now enterable. Matches tx_worker + Blast a Flow ceiling.
+- Tab labels stopped eliding ("Protocol Selection" was "rotocol
+  Selectio") via `min-width: 118px` stylesheet + `setExpanding(False)`.
+- Dialog default height tuned to 640 px for the tallest tab
+  (Protocol Data sizeHint=465 + chrome) — was 720 leaving
+  ~130 px dead absorber space.
+
+**Add Stream dialog — Protocol Data tab (round-trip + validation fixes)**
+- `rocev2_use_perf_server` checkbox + Payload `payload_data_field`
+  were COLLECTED but never RESTORED — operator ticked / typed,
+  saved, reopened, got an empty field. Silent loss. Now both
+  round-trip in populate.
+- PCAP fields (`enable_pcap_checkbox`, `pcap_file_path`,
+  `pcap_loop_count`, `pcap_rate_mode`) were COLLECTED but never
+  RESTORED — same silent-loss bug, hit operators editing an
+  existing PCAP-replay stream.
+- Packet View tree's Payload row used wrong key path
+  (`payload_data.data` instead of `payload.payload_data`) — custom
+  payload bytes never appeared in the preview.
+- RoCEv2 GID source/destination mode dropdowns weren't wired to
+  enable their step/count fields; picking "Increment" left the
+  sweep config unreachable.
+- ARP MAC + IP fields now go through `_wire_live_validators` like
+  every other MAC/IP field — was bypass.
+- TCP/UDP "Override Source/Destination Port" checkboxes now clear
+  the field value on uncheck (was serializing stale port despite
+  override=False).
+- MAC src/dst step gain `QIntValidator(1, 16M)` (reject 0/negative).
+- TCP checksum hex-pair regex validator.
+
+**Add Stream dialog — cross-layer save guards**
+- New `accept()` override surfaces a "Save Anyway / Fix First"
+  QMessageBox when:
+  - L2=None + L3=IPv4/IPv6/ARP (no Ethernet header → NIC drops)
+  - Frame Type=Random with Min ≥ Max (uniform stream or crash)
+  - PCAP enabled + protocol stack picks both set (PCAP wins,
+    operator's L3/L4 picks silently ignored)
+- L3 transition (e.g., IPv4 → None) now resets scale-mode
+  dropdowns back to "Fixed" so the next IPv4 enable doesn't show
+  stale "Increment" with empty step/count.
+- Template apply now fires `_refresh_packet_view_if_visible()` so
+  the Packet View tab shows the templated packet immediately
+  instead of stale-until-you-type.
+- VLAN ID field gained `QIntValidator(1, 4094)` + tooltip.
+- L3=ARP now UNCHECKS L4 radios (was only disabling the groupbox,
+  leaving stale L4=UDP serialized in the saved stream).
+
+**Add Stream dialog — compact + professional look**
+- Tighter spacing pass: protocol_tab outer margins, basics row
+  spacing, frame length row spacing, protocol stack vSpacing all
+  reduced. QGroupBox stylesheet padding-top 10 → 4. Dialog rendered
+  height shrunk 11%. `addStretch(1)` at the end of
+  protocol_tab_layout absorbs leftover height into a bottom spacer
+  instead of inflating the groupboxes.
+- Tab styling refresh: thinner padding, selected-tab bold + blue,
+  hover state, force Qt popup so all 6 tabs fit with `min-width:
+  118px` instead of overflowing.
+
+**Settings dialog crash fix**
+- `traffic_client/menu_actions.py::open_settings_dialog` — opening
+  it threw `OverflowError: argument 2 overflowed: value must be in
+  the range -2147483648 to 2147483647` because BGP-ASN field used
+  `QSpinBox.setRange(1, 4294967295)` — Qt5 QSpinBox is int32.
+  Replaced with QLineEdit + QRegExpValidator + string-form storage
+  in QSettings so the full 4-byte ASN range (RFC 6793) round-trips.
+
+**RFC 2544 dialog (cross-dialog consistency + RFC compliance)**
+- MAC defaults unified with Blast a Flow + Stream templates
+  (`02:00:00:00:00:01/02`) — packet captures from all three line-
+  rate test paths now align.
+- Duration default 10 s → 60 s per RFC 2544 §26.1. Was labelled
+  "fast sanity check" but operators kept exporting "RFC 2544
+  Throughput Test Report" with 10-s measurements that auditors
+  rejected. Tooltip now explains when to dial down.
+- Loss-tolerance tooltip clarifies the formula + when to use
+  non-zero tolerance.
+
+**Devices tab polish**
+- Right-click context menu was missing **Edit** — operator had to
+  use the toolbar Edit button or double-click; broke parity with
+  the Streams tab's right-click menu. Added between Apply and
+  Copy.
+- BGP local + remote ASN fields gained `QRegExpValidator(\d{1,10})`
+  + tooltip explaining the 4-byte ASN range. Was apply-time-only
+  range check — operator typed "abc", got a generic warning AFTER
+  clicking Apply.
+
+**API guide (Help → API Guide) updated**
+- Endpoint summary now lists `/api/dpdk/hugepages`,
+  `/api/dpdk/iommu`, `/api/dpdk/load_modules`,
+  `/api/dpdk/interfaces`, `/api/dpdk/verify`,
+  `/api/admin/bind_history`, `/api/admin/install_dpdk`.
+- `/api/dpdk/hugepages` documented with the v0.3.11-corrected
+  schema (`num_pages` / `page_size`, not `count` / `size_kb`).
+- `/api/admin/bind_history` documented with the actual
+  `{"history": {pci_bdf: {name, kernel_driver}}}` shape used by
+  the Blast a Flow + Make DPDK Ready dialogs.
+- `/api/streams/stats` response example extended with
+  `actual_engine`, `fallback_reason`, `per_core_tx_count`,
+  `engine_version` fields.
+- Stop-payload callout: LIST shape `[{interface, stream_id}]`
+  asymmetric with start (DICT keyed by iface) — silent no-op trap
+  if confused.
+
+**In-app help guides (Help → What's New, Help → Capabilities)**
+- "0.3.11 highlights" block added at top of What's New.
+- New "0. Quick-launch workflows" section in Capabilities cross-
+  links Blast a Flow + template library with use-case guidance.
+
+### Test count
+- 1056 tests passing across the broader codebase (1 pre-existing
+  L2-protocols failure unrelated to this release).
+- 49 templates suite tests (was 15; added round-trip pins, RoCEv2,
+  PCAP, packet-view-key, RFC 2544 MAC/duration, Devices Edit menu,
+  BGP ASN validator).
+- 108 DPDK orchestrator tests.
+- 3 Settings dialog tests (new — Settings was never tested before).
+
+### Files changed
+- `widgets/dpdk_blast_flow_dialog.py`
+- `widgets/dpdk_make_ready_dialog.py`
+- `widgets/stream_dialog.py`
+- `widgets/devices_tab.py`
+- `widgets/rfc2544_dialog.py`
+- `utils/traffic_templates.py`
+- `traffic_client/dpdk_menu_actions.py`
+- `traffic_client/menu_actions.py`
+- `tests/test_templates.py`
+- `tests/test_dpdk_orchestrator.py`
+- `tests/test_settings_dialog.py` (new)
+
+---
+
 ## [0.3.10] - 2026-06-02
 
 **Server menu: new "Mark Selected Servers Offline" action.**

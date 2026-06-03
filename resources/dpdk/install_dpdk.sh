@@ -56,6 +56,59 @@ check_root() {
     fi
 }
 
+# v0.3.11: distro support check. The package-install step uses apt
+# exclusively (libdpdk-dev / libibverbs-dev / etc) and a wrong-distro
+# run fails cryptically several steps deep with 'apt-get: command
+# not found'. Detect upfront and either succeed (Ubuntu / Debian)
+# or exit with a clear actionable message (RHEL / CentOS / Fedora /
+# Alpine / Arch). RHEL-family support would need a parallel
+# package-name map; out of scope for now.
+check_supported_distro() {
+    local id="" id_like=""
+    if [[ -r /etc/os-release ]]; then
+        # shellcheck disable=SC1091
+        . /etc/os-release
+        id="${ID:-}"
+        id_like="${ID_LIKE:-}"
+    fi
+    case "$id" in
+        ubuntu|debian)
+            log_info "Detected ${PRETTY_NAME:-$id} — supported."
+            return 0
+            ;;
+        "")
+            log_warning "Could not read /etc/os-release. Proceeding on "
+            log_warning "assumption this is an apt-based distro."
+            return 0
+            ;;
+    esac
+    # Some downstream Debian derivatives set ID_LIKE=debian.
+    case "$id_like" in
+        *debian*|*ubuntu*)
+            log_info "Detected ${PRETTY_NAME:-$id} (Debian-family) — "
+            log_info "proceeding via apt."
+            return 0
+            ;;
+    esac
+    log_error "Unsupported distro: ${PRETTY_NAME:-$id}"
+    log_error ""
+    log_error "install_dpdk.sh currently supports Ubuntu and Debian "
+    log_error "(and derivatives). RHEL / CentOS / Fedora / Alpine / "
+    log_error "Arch use different package names and aren't auto-"
+    log_error "installed yet."
+    log_error ""
+    log_error "Manual install path: install DPDK + dependencies via "
+    log_error "your distro's package manager, then build tx_worker:"
+    log_error "  cd resources/dpdk/tx_worker && meson setup build && "
+    log_error "  ninja -C build"
+    log_error ""
+    log_error "Required packages (RHEL/Fedora equivalents):"
+    log_error "  dpdk-devel  pkgconf-pkg-config  meson  ninja-build"
+    log_error "  numactl-devel  elfutils-libelf-devel  libpcap-devel"
+    log_error "  rdma-core-devel  libmlx5  kernel-devel"
+    exit 1
+}
+
 # Prompt for user input
 prompt_yes_no() {
     local prompt="$1"
@@ -175,7 +228,11 @@ step_preflight() {
     log_step "Step 1: Pre-flight Checks"
     
     check_root
-    
+    # v0.3.11: bail early on non-apt distros with a clear actionable
+    # message instead of failing deep in step 4 with 'apt-get not
+    # found'. RPM-family operators get pointed at the manual path.
+    check_supported_distro
+
     log_info "Checking system requirements..."
     
     # Check disk space (need at least 2GB)

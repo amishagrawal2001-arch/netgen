@@ -1012,10 +1012,30 @@ companion — see §20.</p>
   <tr><td class="method">GET</td> <td><code>/api/dpdk/recommend</code></td>
       <td>Suggested <code>dpdk_tx_cores</code> for an iface + frame_size + pps target.</td></tr>
   <tr><td class="method">GET</td> <td><code>/api/dpdk/status</code></td>
-      <td>DPDK runtime status (libs installed, hugepages, IOMMU).</td></tr>
+      <td>DPDK runtime status (libs installed, hugepages, IOMMU, tx_worker / DPDK ABI version).</td></tr>
+  <tr><td class="method">GET</td> <td><code>/api/dpdk/interfaces</code></td>
+      <td>List of interfaces currently bound to a DPDK driver (<code>vfio-pci</code> or bifurcated).</td></tr>
   <tr><td class="method">POST</td><td><code>/api/dpdk/bind</code> /
                                        <code>unbind</code></td>
       <td>Bind/unbind a NIC to <code>vfio-pci</code> (Broadcom/Intel only).</td></tr>
+  <tr><td class="method">GET</td> <td><code>/api/dpdk/verify</code></td>
+      <td>Confirm a NIC is functionally usable by DPDK (EAL probe).</td></tr>
+  <tr><td class="method">POST</td><td><code>/api/dpdk/hugepages</code></td>
+      <td>Allocate hugepages. Schema:
+          <code>{"num_pages": N, "page_size": "2MB"}</code>. <b>v0.3.11:</b>
+          server accepts <code>"2MB"</code> only; <code>"1GB"</code>
+          requires kernel boot-time reservation.</td></tr>
+  <tr><td class="method">POST</td><td><code>/api/dpdk/iommu</code></td>
+      <td>Enable IOMMU on the host (reboot required to take effect).</td></tr>
+  <tr><td class="method">POST</td><td><code>/api/dpdk/load_modules</code></td>
+      <td>Load <code>vfio</code> + <code>vfio-pci</code> kernel modules.</td></tr>
+  <tr><td class="method">GET</td> <td><code>/api/admin/bind_history</code></td>
+      <td>Map of pci_bdf → original interface name + kernel_driver before
+          vfio-pci binding. Used by the GUI to label vfio-bound NICs by
+          their pre-bind name (e.g. <code>"eth0 (DPDK)"</code>).</td></tr>
+  <tr><td class="method">POST</td><td><code>/api/admin/install_dpdk</code></td>
+      <td>Server-side DPDK + tx_worker install. Async; tail via
+          <code>/api/admin/install_dpdk/log</code>.</td></tr>
   <tr><td class="method">POST</td><td><code>/api/rfc2544/start</code></td>
       <td>Kick off an RFC 2544 §26.1 throughput test (binary search per frame size).</td></tr>
   <tr><td class="method">GET</td> <td><code>/api/rfc2544/progress</code></td>
@@ -1454,7 +1474,26 @@ on the same interface run concurrently in separate threads.</p>
       { "interface": "enp181s0f0np0",
         "stream_id": "&lt;uuid-from-start-response&gt;" }
     ]
-  }'</pre>
+  }'
+
+# Response — verify the stop was honoured:
+# { "ok": true,
+#   "stopped": [
+#     { "interface": "enp181s0f0np0",
+#       "stream_id": "&lt;uuid&gt;",
+#       "status": "Stopped" }
+#   ],
+#   "not_found": [] }</pre>
+
+<div class="warn"><b>Schema note (v0.3.11):</b> <code>streams</code> is
+a <b>LIST</b> of <code>{interface, stream_id}</code> entries —
+asymmetric with <code>/api/traffic/start</code>, which keys streams by
+interface in a DICT. Sending the start-style dict here causes the
+server to iterate keys silently and the request returns
+<code>ok=true</code> with an empty <code>stopped</code> list. Always
+verify the response's <code>stopped</code> array has an entry for each
+requested stream — a no-op stop indicates schema confusion or a
+stale stream_id.</div>
 
 <p>Behavior:</p>
 <ul>
@@ -1483,12 +1522,28 @@ on the same interface run concurrently in separate threads.</p>
     "tx_rate":        32794646.5,     // pps (delta-based)
     "rx_rate":        0.0,
     "frame_size":     1500,
-    "dpdk_enable":    true,
+    "dpdk_enable":    true,            // what the OPERATOR asked for
+    "actual_engine":  "DPDK",          // what's REALLY running — see below
+    "fallback_reason": null,           // populated if engine differs from request
     "dpdk_tx_cores":  12,
+    "per_core_tx_count": [3086419725, 3086419725, 3086419725, 3086419726],
+    "engine_version":  "tx_worker-1.4.2 / DPDK 23.11.1",
     "started_at":     "2026-05-10T07:05:10+00:00",
     "updated_at":     "2026-05-10T07:05:38+00:00"
   }]
 }</pre>
+
+<p class="muted"><b>v0.3.11:</b> <code>actual_engine</code> +
+<code>fallback_reason</code> let the client surface silent engine
+downgrades. Example: operator asked for DPDK on a TCP stream (DPDK
+tx_worker is UDP-only) → server falls back to Scapy and reports
+<code>actual_engine=Scapy, fallback_reason="DPDK supports UDP only,
+got TCP"</code>. The client renders this as an amber chip on the
+stream so the operator notices.</p>
+
+<p class="muted"><code>per_core_tx_count</code> is a per-lcore array
+(one entry per <code>dpdk_tx_cores</code>) for diagnosing imbalanced
+RSS / steering — added in v0.2.77.</p>
 
 <p class="muted">Bit rate (bps) isn't returned directly — derive it as
 <code>tx_rate * frame_size * 8</code>. The client does this in the
@@ -1529,6 +1584,40 @@ Stream Statistics tab's TX Bit Rate column.</p>
 curl -X POST http://&lt;server&gt;:5050/api/dpdk/unbind \
   -H "Content-Type: application/json" \
   -d '{ "interface": "enp65s0f0np0", "kernel_driver": "bnxt_en" }'</pre>
+
+<h3>Allocate hugepages <span class="muted">(v0.3.11 schema fix)</span></h3>
+<pre>curl -X POST http://&lt;server&gt;:5050/api/dpdk/hugepages \
+  -H "Content-Type: application/json" \
+  -d '{ "num_pages": 1024, "page_size": "2MB" }'
+
+# →
+# { "ok": true, "allocated": 1024, "page_size": "2MB",
+#   "total_bytes": 2147483648 }</pre>
+<p class="muted">Schema correction in v0.3.11: keys are
+<code>num_pages</code> (int) and <code>page_size</code> (string
+<code>"2MB"</code> or <code>"1GB"</code>). Earlier clients sent
+<code>count</code>/<code>size_kb</code> which the server silently
+ignored — hugepages never allocated, DPDK init failed downstream.
+Server currently allocates <code>"2MB"</code> only at runtime;
+<code>"1GB"</code> needs a kernel boot-time reservation.</p>
+
+<h3>Bind history <span class="muted">(GUI helper for vfio-bound NICs)</span></h3>
+<pre>curl http://&lt;server&gt;:5050/api/admin/bind_history
+
+# →
+# { "history": {
+#     "0000:b5:00.0": { "name": "enp181s0f0np0",
+#                       "kernel_driver": "mlx5_core" },
+#     "0000:b5:00.1": { "name": "enp181s0f1np1",
+#                       "kernel_driver": "mlx5_core" }
+# }}</pre>
+<p class="muted">When a NIC is bound to <code>vfio-pci</code>, the
+kernel no longer exposes its netdev name — <code>/proc/net/dev</code>
+loses the entry. Without this map, the GUI's NIC picker can't show
+operators a recognisable name for the bound device (only the bare
+pci_bdf). The Blast a Flow + Make DPDK Ready dialogs merge this map
+into the interface list at render time so a bound NIC reads
+"eth0 (DPDK)" instead of "0000:b5:00.0".</p>
 
 <h2>8. Polling pattern</h2>
 
@@ -2748,6 +2837,54 @@ _FEATURE_GUIDE_HTML = r"""
 organised so the menu / tab where you'll find each one is obvious. For
 the REST endpoint signatures see <strong>Help → API Guide</strong>.</p>
 
+<h2><span class="ver new">0.3.11</span> highlights</h2>
+<p>Major operator-facing additions this release:</p>
+<ul>
+  <li><b>Blast a DPDK Flow</b> dialog (DPDK menu → "Blast a Flow") —
+      one-click: bind a NIC → fire a 1500-byte UDP flow at line rate.
+      Sized for ACTUAL wire-speed: 100 G needs only 8.2 Mpps at MTU,
+      well inside a single tx_worker core. Override to 64 B for the
+      max-pps stress test. Now <b>non-modal</b> so the main window
+      stays interactive, with <b>multi-NIC parallel blast</b>
+      support — open one dialog per interface; windows cascade so
+      they don't stack.</li>
+  <li><b>Stream templates library</b> (Add Stream → Template dropdown) —
+      14 ready-made profiles covering line-rate (64 B / 1500 B
+      sibling), IMIX, LAG / RSS / ECMP hash test, latency probe,
+      VXLAN encap, ICMP flood, VLAN-tagged, and 6 new
+      <b>scaling</b> templates (MAC sweep 1024, IPv4 dst /24, IPv4
+      src 256, IPv6 dst 64, 5-tuple RSS, VLAN 4094). All use unified
+      <code>02:xx</code> locally-administered MAC defaults that
+      match the Blast a Flow dialog.</li>
+  <li><b>Add Stream dialog polish</b> — Protocol Selection: dead L1
+      group and Payload Random radio removed; second "L4" group
+      relabelled <i>Encap (over UDP)</i>; jumbo frames (>1518)
+      finally enterable; VLAN ID validator; tab labels stop eliding;
+      compact layout. Protocol Data: RoCEv2 "Use Performance Server"
+      checkbox and Payload data bytes now round-trip correctly
+      (silent loss fixed); RoCEv2 GID mode dropdowns finally enable
+      step/count fields; ARP MAC/IP fields gain live red-border
+      validators; TCP/UDP override-uncheck clears stale value;
+      MPLS template int → str coercion guard. PCAP fields restore
+      on edit-existing-stream (was silent loss). Packet View tree
+      finally shows custom payload bytes (wrong-key-path bug).</li>
+  <li><b>Cross-layer save guards</b> — accept() now warns on:
+      L2=None + L3=IP, Frame Type=Random with Min ≥ Max, PCAP
+      enabled + protocol stack picks both set.</li>
+  <li><b>Settings dialog crash fixed</b> (File → Settings) — opening
+      it used to throw <code>OverflowError</code> on PyQt5 because
+      the BGP-ASN spinbox tried to set a uint32 range. Now a
+      QLineEdit + validator that supports the full 4-byte ASN range.</li>
+  <li><b>API Guide</b> updated with <code>/api/dpdk/hugepages</code>
+      (corrected v0.3.11 schema), <code>/api/admin/bind_history</code>,
+      <code>/api/dpdk/interfaces</code> + <code>verify</code> +
+      <code>iommu</code> + <code>load_modules</code>, plus the
+      <code>actual_engine</code> / <code>fallback_reason</code> /
+      <code>per_core_tx_count</code> fields in stream stats, plus a
+      callout on the asymmetric stop-payload schema (LIST not DICT).
+      <span class="where">Where: Help → API Guide.</span></li>
+</ul>
+
 <h2>Streams tab</h2>
 
 <h3><span class="ver new">0.2.46</span> Live "running / total" status chip</h3>
@@ -3273,6 +3410,28 @@ backend the wire-side runs on. For version-by-version detail see
 <strong>Help → What's New</strong>; for the curl commands see
 <strong>Help → API Guide</strong>.</p>
 
+<h2>0. Quick-launch workflows <span class="ver new">0.3.11</span></h2>
+<p>Two one-click paths added in 0.3.11 — pick the right depth for the
+operator:</p>
+<table>
+  <tr><th>Workflow</th><th>Path</th><th>Use when</th></tr>
+  <tr><td><b>Blast a DPDK Flow</b></td>
+      <td>DPDK menu → "Blast a Flow"</td>
+      <td>Smoke-test a NIC or demo line rate. One click does:
+          bind a NIC → start a 1500 B UDP flow at line rate →
+          show live tx_count / tx_rate. Non-modal so the main
+          window stays usable; open multiple dialogs for
+          parallel multi-NIC blasts.</td></tr>
+  <tr><td><b>Stream templates</b></td>
+      <td>Add Stream → Template dropdown</td>
+      <td>Standardised stream profiles for repeatable benchmarks.
+          14 templates: UDP line rate (64 B / 1500 B), IMIX, LAG /
+          RSS hash, latency probe, VXLAN encap, ICMP flood,
+          VLAN-tagged, plus 6 scaling profiles (MAC sweep 1024,
+          IPv4 dst /24, IPv4 src 256, IPv6 dst 64, 5-tuple RSS,
+          VLAN 4094). All use unified <code>02:xx</code> locally-
+          administered MAC defaults that match Blast a Flow.</td></tr>
+</table>
 
 <h2>1. Stream packet builder (Streams tab)</h2>
 <p>Per-stream packet construction. Each stream emits a single shape;
@@ -3963,9 +4122,19 @@ class AddStreamDialog(QDialog):
         self.server_interfaces = server_interfaces or []
 
         self.setWindowTitle("Add/Edit Traffic Stream")
-        self.setGeometry(200, 200, 1000, 700)
-        self.setMinimumSize(900, 500)  # Reduced minimum width
-        self.setMaximumSize(1200, 750)  # Reduced maximum width
+        # v0.3.11: default height sized for the tallest tab's
+        # content. Measured per-tab sizeHints:
+        #   Protocol Selection 445  Protocol Data 465 (tallest)
+        #   Variable Fields    434  Stream Control 374
+        #   Packet View        232  PCAP Replay    259
+        # 465 content + tab bar (30) + template combo (~50) +
+        # button bar (42) + margins (~30) = ~617 px needed for
+        # the tallest tab to fit without scrolling. 640 default
+        # gives a small buffer above the buttons without the
+        # 130+ px of dead absorber space the old 720 had.
+        self.setGeometry(200, 200, 1000, 640)
+        self.setMinimumSize(900, 500)
+        self.setMaximumSize(1200, 900)
         # Set smaller base font size
         font = self.font()
         font.setPointSize(10)  # Reduced from default 13
@@ -3978,6 +4147,50 @@ class AddStreamDialog(QDialog):
         self.tabs = QTabWidget()
         # Enable scroll buttons for main tabs if they overflow
         self.tabs.setUsesScrollButtons(True)
+        # v0.3.11: enforce a minimum width per tab so the labels
+        # render in full ("Protocol Selection" not "rotocol Selectio").
+        # macOS-styled QTabBar tends to elide long labels first;
+        # styleSheet forces a minimum width that fits the widest
+        # tab text (~140 px is enough for the current titles).
+        # v0.3.11 compact + professional: tabs auto-fit content
+        # width so all 6 fit in the dialog without scroll arrows.
+        # 140 px min-width was too aggressive — total tab bar width
+        # 140 × 6 = 840 px overflowed even at 1000 px dialog width.
+        # 90 px keeps the shorter labels ("PCAP Replay") readable
+        # while letting the longer ones ("Protocol Selection") size
+        # naturally. Tighter padding (2px vertical, 10px horizontal)
+        # for a sleeker look; bold-on-selected + subtle hover
+        # highlight makes the active tab pop without heavy chrome.
+        self.tabs.setStyleSheet("""
+            QTabBar::tab {
+                min-width: 118px;
+                padding: 4px 10px;
+                font-size: 11px;
+                color: #4b5563;
+                background: #f3f4f6;
+                border: 1px solid #d1d5db;
+                border-bottom: none;
+                border-top-left-radius: 4px;
+                border-top-right-radius: 4px;
+                margin-right: 1px;
+            }
+            QTabBar::tab:selected {
+                background: #ffffff;
+                color: #1e40af;
+                font-weight: 600;
+                border-bottom: 1px solid #ffffff;
+            }
+            QTabBar::tab:hover:!selected {
+                background: #e5e7eb;
+                color: #1f2937;
+            }
+        """)
+        # v0.3.11: disable QTabBar's equal-share expansion so each
+        # tab takes its NATURAL content width (Protocol Selection
+        # needs ~120 px, PCAP Replay only ~85 px). With expanding,
+        # Qt averaged all 6 to dialog_width/6 = 113 px which
+        # truncated the longest label.
+        self.tabs.tabBar().setExpanding(False)
 
         # Protocol Selection Tab
         self.protocol_tab = QWidget()
@@ -4039,11 +4252,44 @@ class AddStreamDialog(QDialog):
             self._traffic_templates_meta = list_templates()
         except Exception:
             self._traffic_templates_meta = []
-        if self._traffic_templates_meta and not self.stream_data:
+        # v0.3.11 fix: the original gate was `not self.stream_data`,
+        # but the Add Stream launcher (stream_control.py:956) ALWAYS
+        # pre-seeds stream_data with `{"stream_id": uuid}` for new
+        # streams — so the gate evaluated False and the dropdown was
+        # never built. Symptom: operator clicks Add Stream, sees the
+        # dialog with no Template: row. The intent of the gate is
+        # "skip when EDITING an existing stream" — those carry a
+        # full populated dict (name, frame_size, protocol_data, …).
+        # A fresh-new-stream payload contains only stream_id (and
+        # maybe protocol_selection scaffolding), nothing operator-
+        # facing. Detect that by checking for the operator-facing
+        # keys a real stream always has.
+        _existing_stream_keys = {
+            "name", "frame_size", "protocol_data", "L3", "L4",
+            "stream_rate_type", "dpdk_enable", "enabled",
+        }
+        _is_editing_existing = bool(
+            self.stream_data
+            and (_existing_stream_keys & set(self.stream_data.keys()))
+        )
+        if self._traffic_templates_meta and not _is_editing_existing:
             template_bar = QHBoxLayout()
             template_bar.setContentsMargins(8, 6, 8, 0)
             template_bar.addWidget(QLabel("Template:"))
             self.template_combo = QComboBox()
+            # v0.3.11: show ALL entries without scrolling. Qt's
+            # QComboBox default maxVisibleItems is 10 — with 14
+            # templates + Custom = 15 entries, the last 5 sit below
+            # the fold and operators don't realize the dropdown
+            # scrolls. Force Qt's own popup (combobox-popup: 0
+            # disables the macOS native popup, which IGNORES
+            # maxVisibleItems) and set the limit high enough that
+            # adding a few more templates won't re-introduce the
+            # cutoff.
+            self.template_combo.setStyleSheet(
+                "QComboBox { combobox-popup: 0; }"
+            )
+            self.template_combo.setMaxVisibleItems(30)
             self.template_combo.addItem("— Custom (no template) —", "")
             for t in self._traffic_templates_meta:
                 self.template_combo.addItem(t["title"], t["key"])
@@ -4051,9 +4297,14 @@ class AddStreamDialog(QDialog):
                 self._on_traffic_template_changed
             )
             template_bar.addWidget(self.template_combo, 1)
-            self._traffic_template_summary = QLabel(
-                "Pick a template to pre-fill all tabs."
-            )
+            # v0.3.11 compact: the summary label starts EMPTY (no
+            # default "Pick a template to pre-fill all tabs." row)
+            # — the dropdown's own "— Custom (no template) —"
+            # placeholder already conveys that. When the operator
+            # picks a real template, _on_traffic_template_changed
+            # fills the label with the template's summary, which
+            # expands the row at that point.
+            self._traffic_template_summary = QLabel("")
             self._traffic_template_summary.setStyleSheet(
                 "color: #6b7280; font-size: 11px;"
             )
@@ -4165,11 +4416,11 @@ class AddStreamDialog(QDialog):
                 font-weight: 600;
                 font-size: 11px;
                 color: #1f2937;
-                border: 2px solid #e5e7eb;
-                border-radius: 6px;
-                margin-top: 8px;
-                padding-top: 10px;
-                padding-bottom: 8px;
+                border: 1px solid #e5e7eb;
+                border-radius: 5px;
+                margin-top: 5px;          /* v0.3.11 compact: was 8 */
+                padding-top: 4px;         /* v0.3.11 compact: was 10 */
+                padding-bottom: 2px;      /* v0.3.11 compact: was 8 */
                 background-color: #f9fafb;
             }
             
@@ -4405,7 +4656,33 @@ class AddStreamDialog(QDialog):
             "See Help → DPDK Traffic Blast Workflow for prerequisites."
         )
         layout.addWidget(self.dpdk_enable_checkbox)
-        
+
+        # v0.3.11: pre-validation banner — when the main window's
+        # cached DPDK chip says the server isn't ready, surface
+        # that here so the operator doesn't tick "Use DPDK" only
+        # to watch the stream silently fall back to Scapy. Clickable
+        # link opens the Make DPDK Ready orchestrator. Falls back
+        # to a static note when we can't reach the main window
+        # (e.g. dialog opened from a context that doesn't expose it).
+        self._dpdk_not_ready_banner = QLabel("")
+        self._dpdk_not_ready_banner.setOpenExternalLinks(False)
+        self._dpdk_not_ready_banner.setTextFormat(Qt.RichText)
+        self._dpdk_not_ready_banner.setWordWrap(True)
+        self._dpdk_not_ready_banner.setStyleSheet(
+            "QLabel { background: #fef3c7; border: 1px solid #f59e0b; "
+            "border-radius: 4px; padding: 4px 8px; color: #92400e; "
+            "font-size: 11px; }"
+        )
+        self._dpdk_not_ready_banner.hide()
+        self._dpdk_not_ready_banner.linkActivated.connect(
+            self._on_dpdk_make_ready_link,
+        )
+        layout.addWidget(self._dpdk_not_ready_banner)
+        # Populate the banner based on the host main window's chip
+        # state (cached snapshot — no extra HTTP). Best-effort; if
+        # the main window or chip is missing, banner stays hidden.
+        self._refresh_dpdk_readiness_banner()
+
         # Multi-instance DPDK option (for high rates)
         self.dpdk_multi_instance_checkbox = QCheckBox("Force Multi-Instance DPDK (100Gbps+)")
         self.dpdk_multi_instance_checkbox.setToolTip(
@@ -4639,6 +4916,71 @@ class AddStreamDialog(QDialog):
         """Open the DPDK Workflow Guide. Same dialog used by the Help menu."""
         show_dpdk_usage_guide(self)
 
+    def _refresh_dpdk_readiness_banner(self):
+        """v0.3.11: surface a warning when the server's DPDK isn't
+        ready, so ticking 'Use DPDK' doesn't silently fall back to
+        Scapy at runtime.
+
+        Reads the cached chip state from the main window (no extra
+        HTTP). Banner stays hidden when the chip is green or
+        unavailable. Single-line nudge with a 'Make DPDK Ready'
+        link that opens the orchestrator dialog.
+        """
+        try:
+            mw = self.parent()
+            # Walk up to find the main window — dialog may be
+            # nested inside a tab or other widget.
+            while mw is not None and not hasattr(mw, "dpdk_chip"):
+                mw = mw.parent() if hasattr(mw, "parent") else None
+            chip = getattr(mw, "dpdk_chip", None) if mw else None
+            state = chip.state() if chip and hasattr(chip, "state") else "gray"
+        except Exception:
+            state = "gray"
+
+        if state == "green":
+            self._dpdk_not_ready_banner.hide()
+            return
+        if state == "gray":
+            # No server selected / poll failed — don't shout. The
+            # operator may genuinely not need DPDK on this stream.
+            self._dpdk_not_ready_banner.hide()
+            return
+
+        if state == "amber":
+            msg = (
+                "<b>⚠ DPDK is partially set up</b> on the selected "
+                "server (missing one or more of hugepages / IOMMU / "
+                "vfio-pci). Some NICs (Mellanox mlx5) work anyway, "
+                "but Intel/Broadcom NICs will fall back to Scapy.<br/>"
+                "<a href='make-ready'>Open Make DPDK Ready…</a> to fix."
+            )
+        else:  # red
+            msg = (
+                "<b>⛔ DPDK is not usable</b> on the selected server "
+                "(libdpdk or tx_worker missing). Ticking 'Use DPDK' "
+                "below will silently fall back to Scapy at start "
+                "time.<br/>"
+                "<a href='make-ready'>Open Make DPDK Ready…</a> to fix."
+            )
+        self._dpdk_not_ready_banner.setText(msg)
+        self._dpdk_not_ready_banner.show()
+
+    def _on_dpdk_make_ready_link(self, href: str):
+        """Bridge the banner's 'Make DPDK Ready' link to the
+        orchestrator dialog. Resolves the main window the same way
+        the banner builder does — if anything's missing, silently
+        no-op (the operator can still use Tools→DPDK manually)."""
+        if href != "make-ready":
+            return
+        try:
+            mw = self.parent()
+            while mw is not None and not hasattr(mw, "show_dpdk_make_ready_dialog"):
+                mw = mw.parent() if hasattr(mw, "parent") else None
+            if mw is not None:
+                mw.show_dpdk_make_ready_dialog()
+        except Exception:
+            pass
+
     def _apply_rate_type_ui_state(self):
         """Enable only the input relevant to current Rate Type."""
         if not hasattr(self, "rate_type_dropdown"):
@@ -4719,6 +5061,16 @@ class AddStreamDialog(QDialog):
             "Load (%)",
             "Line Rate"
         ])
+        self.rate_type_dropdown.setToolTip(
+            "How the stream rate is interpreted:\n"
+            " • Packets Per Second (PPS) — explicit packet count "
+            "per second; the Stream PPS Rate field is used.\n"
+            " • Bit Rate — explicit Mbps; the Stream Bit Rate "
+            "(Mbps) field is used. Frame size determines the pps.\n"
+            " • Load (%) — percent of port line rate.\n"
+            " • Line Rate — saturate the link (DPDK only — Scapy "
+            "tops out around 1-2 Mpps regardless of frame size)."
+        )
         rate_layout.addRow("Rate Type:", self.rate_type_dropdown)
 
         self.stream_pps_rate = QLineEdit("1000")
@@ -4788,15 +5140,16 @@ class AddStreamDialog(QDialog):
         QTimer.singleShot(0, _apply_duration_ui_state)
 
     def setup_protocol_selection_tab(self):
-        self.protocol_tab_layout.setContentsMargins(6, 10, 10, 10)  # Reduced left margin to move content left
-        self.protocol_tab_layout.setSpacing(6)  # Reduced spacing between sections
+        # v0.3.11 compact pass: tighten outer + per-section spacing.
+        self.protocol_tab_layout.setContentsMargins(6, 4, 8, 4)
+        self.protocol_tab_layout.setSpacing(3)  # was 6 — section gap
 
         # Basics - Improved layout with better organization
         basics_group = QGroupBox("Basics")
         basics_layout = QGridLayout()
-        basics_layout.setContentsMargins(10, 8, 10, 8)  # Reduced margins
-        basics_layout.setHorizontalSpacing(8)  # Reduced horizontal spacing
-        basics_layout.setVerticalSpacing(6)  # Reduced vertical spacing
+        basics_layout.setContentsMargins(8, 4, 8, 4)  # v0.3.11 compact
+        basics_layout.setHorizontalSpacing(6)
+        basics_layout.setVerticalSpacing(3)  # was 6 — tighter Name/Details/Flow rows
         basics_layout.setColumnStretch(1, 1)
         basics_layout.setColumnStretch(3, 1)
         basics_layout.setColumnStretch(5, 1)
@@ -4839,8 +5192,8 @@ class AddStreamDialog(QDialog):
         # Frame Length - Improved layout with reduced spacing
         frame_length_group = QGroupBox("Frame Length (including FCS)")
         frame_length_layout = QGridLayout()
-        frame_length_layout.setContentsMargins(0, 8, 10, 8)  # No left margin to indent content fully to the left
-        frame_length_layout.setSpacing(6)  # Reduced spacing
+        frame_length_layout.setContentsMargins(0, 2, 8, 2)  # v0.3.11 compact pass 2
+        frame_length_layout.setSpacing(1)  # was 3 — tightest row stack
         frame_length_layout.setHorizontalSpacing(0)  # No horizontal spacing between columns
         # Don't stretch label columns (0, 2) - keep them compact
         frame_length_layout.setColumnStretch(0, 0)  # Label column - no stretch
@@ -4862,9 +5215,14 @@ class AddStreamDialog(QDialog):
         self.frame_size = QLineEdit("64")
         self.frame_size.setMinimumWidth(80)
         self.frame_size.setMaximumWidth(120)
-        self.frame_min.setValidator(QIntValidator(64, 1518))
-        self.frame_max.setValidator(QIntValidator(64, 1518))
-        self.frame_size.setValidator(QIntValidator(64, 1518))
+        # v0.3.11: bumped 1518 → 9216 so operators can enter jumbo
+        # frames. Was a silent blocker — keystrokes >1518 were
+        # rejected by the validator even though tx_worker, the
+        # server, and the Blast a Flow dialog all accept up to
+        # 9216. Same operator, two dialogs, two ceilings → fixed.
+        self.frame_min.setValidator(QIntValidator(64, 9216))
+        self.frame_max.setValidator(QIntValidator(64, 9216))
+        self.frame_size.setValidator(QIntValidator(64, 9216))
 
         # Create labels with minimal spacing
         frame_type_label = QLabel("Frame Type:")
@@ -4920,20 +5278,26 @@ class AddStreamDialog(QDialog):
         # Protocol Stack Sections - Improved layout with better spacing and alignment
         protocol_stack_group = QGroupBox("Protocol Stack")
         protocol_stack_layout = QGridLayout()
-        protocol_stack_layout.setContentsMargins(12, 10, 12, 10)  # Reduced vertical margins
-        protocol_stack_layout.setSpacing(6)  # Reduced spacing
-        protocol_stack_layout.setHorizontalSpacing(8)  # Reduced horizontal spacing
-        protocol_stack_layout.setVerticalSpacing(6)  # Reduced vertical spacing
-        # Make columns equal width
-        for col in range(5):
+        protocol_stack_layout.setContentsMargins(8, 4, 8, 4)  # v0.3.11 compact
+        protocol_stack_layout.setSpacing(4)
+        protocol_stack_layout.setHorizontalSpacing(6)
+        protocol_stack_layout.setVerticalSpacing(4)  # was 6 — tighter top/bottom rows
+        # v0.3.11: column stretch was set up for 5 boxes per row
+        # (back when L1 was a separate group). L1 is gone; top row
+        # now has 4 boxes (VLAN | L2 | L4 | Payload), so use 4
+        # equal-weight columns. The bottom row's 2 boxes (L3 +
+        # Encap) just leave columns 2 and 3 visually empty — that's
+        # fine; aligning the bottom-row boxes to the top-row column
+        # widths keeps the grid visually coherent.
+        for col in range(4):
             protocol_stack_layout.setColumnStretch(col, 1)
 
         # Helper function to create consistent group boxes
         def create_protocol_group(title, options, checked_index=0):
             group = QGroupBox(title)
             layout = QVBoxLayout()
-            layout.setContentsMargins(8, 8, 8, 8)  # Reduced margins
-            layout.setSpacing(3)  # Reduced spacing
+            layout.setContentsMargins(6, 4, 6, 4)  # v0.3.11 compact — was 8/8
+            layout.setSpacing(1)  # was 3 — tighter radio stack
             radio_buttons = []
             for i, option in enumerate(options):
                 rb = QRadioButton(option)
@@ -4947,45 +5311,71 @@ class AddStreamDialog(QDialog):
             group.setMaximumWidth(180)
             return group, radio_buttons
 
-        # L1
-        l1_group, l1_buttons = create_protocol_group("L1", ["None", "MAC", "RAW"])
-        self.l1_none, self.l1_mac, self.l1_raw = l1_buttons
-        protocol_stack_layout.addWidget(l1_group, 0, 0)
+        # v0.3.11 Protocol Stack cleanup:
+        #   • L1 group ("None / MAC / RAW") was dead UI — the value
+        #     was written to the stream dict + shown in the streams
+        #     table but no packet builder ever read it. MAC/RAW are
+        #     also L2 things, not L1. Removed the group entirely.
+        #   • Payload "Random" was a dead radio — no encoder path
+        #     ever produced random payload from it. Removed it from
+        #     the list.
+        #   • L4 group 2 (RoCEv2 / UEC) relabeled "Encap (over UDP)"
+        #     so operators stop seeing two boxes both labeled "L4."
+        # Backward compat: L1 still emitted as "None" in
+        # get_stream_details so saved sessions / templates carrying
+        # an L1 field keep their shape.
 
         # VLAN
         vlan_group, vlan_buttons = create_protocol_group("VLAN", ["Untagged", "Tagged", "Stacked"])
         self.vlan_untagged, self.vlan_tagged, self.vlan_stacked = vlan_buttons
-        protocol_stack_layout.addWidget(vlan_group, 0, 1)
+        protocol_stack_layout.addWidget(vlan_group, 0, 0)
 
         # L2
         l2_group, l2_buttons = create_protocol_group("L2", ["None", "Ethernet II", "MPLS"])
         self.l2_none, self.l2_ethernet, self.l2_mpls = l2_buttons
-        protocol_stack_layout.addWidget(l2_group, 0, 2)
+        protocol_stack_layout.addWidget(l2_group, 0, 1)
 
-        # L4 (first instance - top row)
+        # L4 (transport: TCP / UDP / IP-protocol-style ICMP / IGMP)
         l4_group_1, l4_buttons_1 = create_protocol_group("L4", ["None", "ICMP", "IGMP", "TCP", "UDP"])
         self.l4_none_1, self.l4_icmp, self.l4_igmp, self.l4_tcp, self.l4_udp = l4_buttons_1
-        protocol_stack_layout.addWidget(l4_group_1, 0, 3)
+        protocol_stack_layout.addWidget(l4_group_1, 0, 2)
 
-        # Payload
-        payload_group, payload_buttons = create_protocol_group("Payload", ["None", "Pattern", "Random", "From File"])
-        self.payload_none, self.payload_pattern, self.payload_random, self.payload_from_file = payload_buttons
+        # Payload (Random removed — no encoder ever produced random
+        # bytes from it; kept None / Pattern / From File).
+        payload_group, payload_buttons = create_protocol_group(
+            "Payload", ["None", "Pattern", "From File"]
+        )
+        self.payload_none, self.payload_pattern, self.payload_from_file = payload_buttons
         self.payload_hex = self.payload_from_file  # Map From File to hex for compatibility
-        protocol_stack_layout.addWidget(payload_group, 0, 4)
+        protocol_stack_layout.addWidget(payload_group, 0, 3)
 
         # L3 (second row)
         l3_group, l3_buttons = create_protocol_group("L3", ["None", "ARP", "IPv4", "IPv6"])
         self.l3_none, self.l3_arp, self.l3_ipv4, self.l3_ipv6 = l3_buttons
         protocol_stack_layout.addWidget(l3_group, 1, 0)
 
-        # L4 (second instance - second row)
-        l4_group_2, l4_buttons_2 = create_protocol_group("L4", ["None", "RoCEv2", "UEC"])
+        # Encap (over UDP) — was "L4" group 2, which read confusingly
+        # as a second L4 picker. These options layer ON TOP of UDP
+        # (RoCEv2 is UDP/4791, UEC is UDP/9999). Operator should
+        # pick L4=UDP above THEN tick an encap here.
+        l4_group_2, l4_buttons_2 = create_protocol_group(
+            "Encap (over UDP)", ["None", "RoCEv2", "UEC"],
+        )
         self.l4_none_2, self.l4_rocev2, self.l4_uec = l4_buttons_2
         protocol_stack_layout.addWidget(l4_group_2, 1, 1)
 
         protocol_stack_group.setLayout(protocol_stack_layout)
         self.protocol_tab_layout.addWidget(protocol_stack_group)
-        # Don't add stretch to prevent content from being cut off
+        # v0.3.11 compact: ABSORB extra dialog height into a bottom
+        # spacer instead of letting QVBoxLayout stretch the three
+        # groupboxes (Basics / Frame Length / Protocol Stack) to
+        # fill it. Without this stretch, the Frame Length section
+        # ended up 147 px tall to fit ~60 px of content because
+        # QVBoxLayout splits leftover height across all expanding
+        # widgets. The old comment ("Don't add stretch to prevent
+        # content from being cut off") was wrong — content is in a
+        # scroll area; the stretch absorbs OVERFLOW, doesn't clip.
+        self.protocol_tab_layout.addStretch(1)
 
         # VLAN Toggle section
         for rb in [self.vlan_untagged, self.vlan_tagged, self.vlan_stacked]:
@@ -5216,6 +5606,7 @@ class AddStreamDialog(QDialog):
         self.mac_destination_count.setMinimumWidth(50)
         self.mac_destination_count.setMaximumWidth(80)
         self.mac_destination_step = QLineEdit("1")
+        self.mac_destination_step.setValidator(QIntValidator(1, 16777215))  # v0.3.11: must be >= 1
         self.mac_destination_step.setMinimumWidth(50)
         self.mac_destination_step.setMaximumWidth(80)
         mac_layout.addWidget(self.mac_destination_mode, 0, 1)
@@ -5241,6 +5632,7 @@ class AddStreamDialog(QDialog):
         self.mac_source_count.setMinimumWidth(50)
         self.mac_source_count.setMaximumWidth(80)
         self.mac_source_step = QLineEdit("1")
+        self.mac_source_step.setValidator(QIntValidator(1, 16777215))  # v0.3.11: must be >= 1
         self.mac_source_step.setMinimumWidth(50)
         self.mac_source_step.setMaximumWidth(80)
         mac_layout.addWidget(self.mac_source_mode, 1, 1)
@@ -5395,6 +5787,16 @@ class AddStreamDialog(QDialog):
         vlan_layout.addWidget(QLabel("VLAN ID:"), 0, 0)
         self.vlan_id_field = QLineEdit("10")
         self.vlan_id_field.setMinimumWidth(60)
+        # v0.3.11: pin the 802.1Q VLAN ID range (1..4094). 0 and 4095
+        # are reserved (priority-tagged-only and reserved respectively)
+        # — server-side validation rejects them but the dialog used to
+        # accept any string and lose the edit on reopen. Tooltip
+        # documents the range so the validator's red border has context.
+        self.vlan_id_field.setValidator(QIntValidator(1, 4094))
+        self.vlan_id_field.setToolTip(
+            "802.1Q VLAN ID. Range 1..4094. "
+            "0 and 4095 are reserved per IEEE 802.1Q."
+        )
         vlan_layout.addWidget(self.vlan_id_field, 0, 1)
 
         vlan_layout.addWidget(QLabel("Priority:"), 0, 2)
@@ -5735,6 +6137,22 @@ class AddStreamDialog(QDialog):
         if hasattr(self, "arp_group"):
             self.arp_group.setEnabled(arp_on)
 
+        # v0.3.11: when L3 leaves IPv4/IPv6, snap the scale-mode
+        # dropdowns back to "Fixed". Without this, switching L3
+        # IPv4 → None → IPv4 left the source/destination_mode in
+        # "Increment" (disabled while away) — confusing on re-enable
+        # because the operator saw "Increment" but the step/count
+        # fields were empty / inconsistent with the dropdown state.
+        if not ipv4_on:
+            for _attr in ("source_mode_dropdown", "destination_mode_dropdown"):
+                if hasattr(self, _attr):
+                    getattr(self, _attr).setCurrentIndex(0)  # "Fixed"
+        if not ipv6_on:
+            for _attr in ("ipv6_source_mode_dropdown",
+                          "ipv6_destination_mode_dropdown"):
+                if hasattr(self, _attr):
+                    getattr(self, _attr).setCurrentIndex(0)  # "Fixed"
+
     def update_increment_fields(self, mode, step_field, count_field):
         is_increment = mode == "Increment"
         step_field.setEnabled(is_increment)
@@ -5759,7 +6177,12 @@ class AddStreamDialog(QDialog):
         self.source_port_field.setValidator(QIntValidator(0, 65535))
         self.source_port_field.setDisabled(True)
         tcp_layout.addWidget(self.source_port_field, 0, 1)
-        self.override_source_port_checkbox.toggled.connect(self.source_port_field.setEnabled)
+        # v0.3.11: ALSO clear the value when unchecking so the
+        # stale port doesn't get serialized despite override=False.
+        self.override_source_port_checkbox.toggled.connect(
+            lambda c, f=self.source_port_field:
+                (f.setEnabled(c), c or f.setText("0"))
+        )
 
         self.increment_tcp_source_checkbox = QCheckBox("Increment Source Port")
         tcp_layout.addWidget(self.increment_tcp_source_checkbox, 0, 2)
@@ -5787,7 +6210,10 @@ class AddStreamDialog(QDialog):
         self.destination_port_field.setValidator(QIntValidator(0, 65535))
         self.destination_port_field.setDisabled(True)
         tcp_layout.addWidget(self.destination_port_field, 1, 1)
-        self.override_destination_port_checkbox.toggled.connect(self.destination_port_field.setEnabled)
+        self.override_destination_port_checkbox.toggled.connect(
+            lambda c, f=self.destination_port_field:
+                (f.setEnabled(c), c or f.setText("0"))
+        )
 
         self.increment_tcp_destination_checkbox = QCheckBox("Increment Destination Port")
         tcp_layout.addWidget(self.increment_tcp_destination_checkbox, 1, 2)
@@ -5827,6 +6253,12 @@ class AddStreamDialog(QDialog):
         self.override_checksum_checkbox = QCheckBox("Override Checksum")
         tcp_layout.addWidget(self.override_checksum_checkbox, 2, 6)
         self.tcp_checksum_field = QLineEdit("B3 E7")
+        # v0.3.11: hex pairs ("00 00" through "FF FF"). Allow
+        # optional whitespace between octets so operators can paste
+        # captures verbatim.
+        self.tcp_checksum_field.setValidator(
+            QRegExpValidator(QRegExp(r"[0-9a-fA-F]{2}\s?[0-9a-fA-F]{2}"))
+        )
         self.tcp_checksum_field.setDisabled(True)
         tcp_layout.addWidget(self.tcp_checksum_field, 2, 7)
         self.override_checksum_checkbox.toggled.connect(self.tcp_checksum_field.setEnabled)
@@ -5863,7 +6295,10 @@ class AddStreamDialog(QDialog):
         self.udp_source_port_field.setValidator(QIntValidator(0, 65535))
         self.udp_source_port_field.setDisabled(True)
         layout.addWidget(self.udp_source_port_field, 0, 1)
-        self.override_udp_source_port_checkbox.toggled.connect(self.udp_source_port_field.setEnabled)
+        self.override_udp_source_port_checkbox.toggled.connect(
+            lambda c, f=self.udp_source_port_field:
+                (f.setEnabled(c), c or f.setText("0"))
+        )
 
         self.udp_increment_source_checkbox = QCheckBox("Increment Source Port")
         layout.addWidget(self.udp_increment_source_checkbox, 0, 2)
@@ -5891,7 +6326,10 @@ class AddStreamDialog(QDialog):
         self.udp_destination_port_field.setValidator(QIntValidator(0, 65535))
         self.udp_destination_port_field.setDisabled(True)
         layout.addWidget(self.udp_destination_port_field, 1, 1)
-        self.override_udp_destination_port_checkbox.toggled.connect(self.udp_destination_port_field.setEnabled)
+        self.override_udp_destination_port_checkbox.toggled.connect(
+            lambda c, f=self.udp_destination_port_field:
+                (f.setEnabled(c), c or f.setText("0"))
+        )
 
         self.udp_increment_destination_checkbox = QCheckBox("Increment Destination Port")
         layout.addWidget(self.udp_increment_destination_checkbox, 1, 2)
@@ -6045,10 +6483,25 @@ class AddStreamDialog(QDialog):
         if hasattr(self, "udp_group"):    self.udp_group.setEnabled(udp_on)
         if hasattr(self, "rocev2_group"): self.rocev2_group.setEnabled(roce_on or (uec_on and embed_roce))
         if hasattr(self, "uec_group"):    self.uec_group.setEnabled(uec_on)
-        # If ARP is selected at L3, disable all explicit L4 groups (no TCP/UDP over ARP)
+        # If ARP is selected at L3, disable all explicit L4 groups (no TCP/UDP over ARP).
+        # v0.3.11: also UNCHECK the L4 radios — disabling the groupbox
+        # alone left the radio in its prior state, so an operator who
+        # picked UDP and then switched to ARP saved a stream with
+        # both L3=ARP and L4=UDP. The server has no path for that
+        # combo; the stream silently failed to transmit.
         if hasattr(self, "l3_arp") and self.l3_arp.isChecked():
             if hasattr(self, "tcp_group"):  self.tcp_group.setEnabled(False)
             if hasattr(self, "udp_group"):  self.udp_group.setEnabled(False)
+            # Clear stale L4 selections so the saved stream stays
+            # coherent. l4_none_1 is the primary "None" radio.
+            for _attr in ("l4_tcp", "l4_udp", "l4_icmp", "l4_igmp",
+                          "l4_rocev2", "l4_uec"):
+                if hasattr(self, _attr):
+                    getattr(self, _attr).setChecked(False)
+            if hasattr(self, "l4_none_1"):
+                self.l4_none_1.setChecked(True)
+            if hasattr(self, "l4_none_2"):
+                self.l4_none_2.setChecked(True)
     def add_rocev2_section(self):
         self.rocev2_group = QGroupBox("RoCEv2 (RDMA over Converged Ethernet v2)")
         rocev2_layout = QGridLayout()
@@ -6118,6 +6571,29 @@ class AddStreamDialog(QDialog):
         self.rocev2_gid_destination_count = QLineEdit("1")
         self.rocev2_gid_destination_count.setValidator(Unsigned32BitValidator())
         rocev2_layout.addWidget(self.rocev2_gid_destination_count, 4, 5)
+
+        # v0.3.11: wire the GID source/dest mode dropdowns to
+        # enable/disable their corresponding step+count fields.
+        # Without these connections, picking "Increment" left the
+        # fields disabled (they default to disabled) → operator
+        # couldn't actually configure the sweep. Mirror the IPv4
+        # / IPv6 pattern in `update_increment_fields`.
+        self.rocev2_gid_source_step.setEnabled(False)
+        self.rocev2_gid_source_count.setEnabled(False)
+        self.rocev2_gid_destination_step.setEnabled(False)
+        self.rocev2_gid_destination_count.setEnabled(False)
+        self.rocev2_gid_source_mode.currentTextChanged.connect(
+            lambda mode: self.update_increment_fields(
+                mode, self.rocev2_gid_source_step,
+                self.rocev2_gid_source_count,
+            )
+        )
+        self.rocev2_gid_destination_mode.currentTextChanged.connect(
+            lambda mode: self.update_increment_fields(
+                mode, self.rocev2_gid_destination_step,
+                self.rocev2_gid_destination_count,
+            )
+        )
 
         rocev2_layout.addWidget(QLabel("Opcode:"), 5, 0)
         self.rocev2_opcode = QComboBox()
@@ -6328,7 +6804,7 @@ class AddStreamDialog(QDialog):
             except Exception:
                 pass
         for w in [
-            self.l1_none, self.l1_mac, self.l1_raw,
+            # L1 + payload_random removed in v0.3.11 (dead widgets).
             self.vlan_untagged, self.vlan_tagged, self.vlan_stacked,
             self.l2_none, self.l2_ethernet, self.l2_mpls,
             self.l3_none, self.l3_arp, self.l3_ipv4, self.l3_ipv6,
@@ -6370,9 +6846,11 @@ class AddStreamDialog(QDialog):
         """
         key = self.template_combo.itemData(idx)
         if not key:
-            self._traffic_template_summary.setText(
-                "Pick a template to pre-fill all tabs."
-            )
+            # v0.3.11 compact: clear the summary line instead of
+            # showing the verbose "Pick a template..." hint. The
+            # dropdown's own "— Custom (no template) —" entry
+            # already conveys the action.
+            self._traffic_template_summary.setText("")
             return
         meta = next(
             (t for t in self._traffic_templates_meta if t["key"] == key),
@@ -6385,10 +6863,121 @@ class AddStreamDialog(QDialog):
             data = get_stream_data(key)
             if data:
                 self.populate_stream_fields(data)
+                # v0.3.11: kick the Packet View tab so the operator
+                # sees the freshly-templated packet, not the stale one
+                # from before. populate_stream_fields fires many
+                # textChanged signals that DO call this refresh, but
+                # the radio button / combobox changes from a template
+                # apply DON'T all chain through textChanged — without
+                # this explicit kick, Packet View tab stays stale
+                # until the operator types in any field.
+                if hasattr(self, "_refresh_packet_view_if_visible"):
+                    self._refresh_packet_view_if_visible()
         except Exception as exc:
             self._traffic_template_summary.setText(
                 f"Template '{key}' failed to apply: {exc}"
             )
+
+    # ─────────────────────────────── v0.3.11: pre-save validation
+
+    def accept(self):
+        """Override QDialog.accept to run cross-layer validation
+        before the dialog closes. Catches invalid combos that
+        single-field validators (validators on individual QLineEdits)
+        can't see — like 'L2=None + L3=IPv4' which is fine field-by-
+        field but produces a headerless IP frame the server drops.
+
+        On any validation failure: show a QMessageBox describing
+        the problem AND its fix, then keep the dialog open so the
+        operator can correct it without losing all their other
+        edits. Only call super().accept() when everything's clean.
+
+        Skip-on-edit-existing: if stream_data was passed in
+        (operator is editing a previously-saved stream), validation
+        still runs — better to surface long-standing bugs in
+        existing saved streams than to ship them unchanged.
+        """
+        problems = self._validate_cross_layer()
+        if problems:
+            from PyQt5.QtWidgets import QMessageBox
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Warning)
+            box.setWindowTitle("Stream has invalid combinations")
+            box.setText(
+                "The stream you're saving has fields that don't "
+                "form a transmittable packet:"
+            )
+            box.setInformativeText("\n".join(f"• {p}" for p in problems))
+            box.setStandardButtons(
+                QMessageBox.Cancel | QMessageBox.Save
+            )
+            box.setDefaultButton(QMessageBox.Cancel)
+            box.button(QMessageBox.Save).setText("Save Anyway")
+            box.button(QMessageBox.Cancel).setText("Fix First")
+            choice = box.exec_()
+            if choice != QMessageBox.Save:
+                # Operator chose to fix — keep dialog open. Their
+                # other edits are preserved (this is the whole point
+                # of validating in accept() vs at field-edit time).
+                return
+        super().accept()
+
+    def _validate_cross_layer(self) -> list:
+        """Run every cross-layer / multi-field sanity check.
+        Returns a list of human-readable problem strings (empty
+        if clean). Pure-function-ish — only reads widget state,
+        no side effects, so it's safe to call from a test."""
+        problems = []
+
+        # ─── Frame Type = Random: Min must be < Max ───
+        if hasattr(self, "frame_type") and self.frame_type.currentText() == "Random":
+            try:
+                fmin = int(self.frame_min.text().strip() or "0")
+                fmax = int(self.frame_max.text().strip() or "0")
+                if fmin >= fmax:
+                    problems.append(
+                        f"Frame Type=Random needs Min < Max — got "
+                        f"Min={fmin}, Max={fmax}. Either widen the "
+                        f"range or switch to Frame Type=Fixed."
+                    )
+            except (ValueError, AttributeError):
+                problems.append(
+                    "Frame Type=Random has non-numeric Min/Max — "
+                    "fix the values or switch to Fixed."
+                )
+
+        # ─── L2=None but L3 picks an Ethernet-payload protocol ───
+        l3 = self._selected_l3() if hasattr(self, "_selected_l3") else "None"
+        l2 = self._selected_l2() if hasattr(self, "_selected_l2") else "None"
+        if l2 == "None" and l3 in ("IPv4", "IPv6", "ARP"):
+            problems.append(
+                f"L2=None with L3={l3} produces a frame with no "
+                f"Ethernet header — the NIC will drop it. Set "
+                f"L2=Ethernet II to wrap the {l3} payload."
+            )
+
+        # ─── PCAP enabled + protocol-stack picks both set ───
+        # PCAP replay transmits the file's contents verbatim — the
+        # protocol-stack fields are ignored. Warn before the operator
+        # spends 20 minutes wondering why their custom UDP fields
+        # don't show up in the capture.
+        pcap_on = (
+            hasattr(self, "enable_pcap_checkbox")
+            and self.enable_pcap_checkbox.isChecked()
+        )
+        stack_set = (l3 != "None") or (
+            hasattr(self, "_selected_l4")
+            and self._selected_l4() != "None"
+        )
+        if pcap_on and stack_set:
+            problems.append(
+                "PCAP Replay is enabled AND protocol-stack fields "
+                "(L3/L4) are set. PCAP transmits the file's frames "
+                "verbatim — the L3/L4 picks will be silently ignored. "
+                "Either uncheck PCAP or clear L3/L4 to confirm intent."
+            )
+
+        return problems
 
     # ─────────────────────────────────────── v0.2.96: input validation
     def _wire_live_validators(self):
@@ -6410,6 +6999,14 @@ class AddStreamDialog(QDialog):
             ("destination_field",        validate_ipv4),  # IPv4 dst
             ("ipv6_source_field",        validate_ipv6),
             ("ipv6_destination_field",   validate_ipv6),
+            # v0.3.11: ARP also has MAC + IPv4 fields that were
+            # bypassing live validation. Same red-border feedback
+            # so the operator sees the moment they type "0.0.0.999"
+            # or "GG:..." into an ARP form.
+            ("arp_sender_mac",           validate_mac),
+            ("arp_target_mac",           validate_mac),
+            ("arp_sender_ip",            validate_ipv4),
+            ("arp_target_ip",            validate_ipv4),
         ]
         for attr, validator in pairs:
             line = getattr(self, attr, None)
@@ -6556,15 +7153,19 @@ class AddStreamDialog(QDialog):
 
         # Frame Length
         self.frame_type.setCurrentText(stream_data.get("frame_type", "Fixed"))
-        self.frame_min.setText(stream_data.get("frame_min", "64"))
-        self.frame_max.setText(stream_data.get("frame_max", "1518"))
-        self.frame_size.setText(stream_data.get("frame_size", "64"))
+        # v0.3.11 fix: every traffic template stores frame_size /
+        # frame_min / frame_max as INT (Pythonic), but QLineEdit.setText
+        # requires str — without str() coercion, applying any template
+        # raises TypeError and the dialog never repaints. Round-trip
+        # through str() works for both str and int input.
+        self.frame_min.setText(str(stream_data.get("frame_min", "64")))
+        self.frame_max.setText(str(stream_data.get("frame_max", "1518")))
+        self.frame_size.setText(str(stream_data.get("frame_size", "64")))
 
-        # L1/L2/L3/L4/Payload
-        l1 = stream_data.get("L1", "None")
-        self.l1_none.setChecked(l1 == "None")
-        self.l1_mac.setChecked(l1 == "MAC")
-        self.l1_raw.setChecked(l1 == "RAW")
+        # L2/L3/L4/Payload — L1 group removed in v0.3.11 (was dead UI).
+        # We still ACCEPT a saved L1 field in stream_data so existing
+        # session.json files load without warnings, but there are no
+        # widgets to write the value to anymore.
 
         vlan_sel = stream_data.get("VLAN", "Untagged")
         self.vlan_untagged.setChecked(vlan_sel == "Untagged")
@@ -6639,9 +7240,12 @@ class AddStreamDialog(QDialog):
 
         # MPLS
         mpls_data = stream_data.get("protocol_data", {}).get("mpls", {})
-        self.mpls_label_field.setText(mpls_data.get("mpls_label", "16"))
-        self.mpls_ttl_field.setText(mpls_data.get("mpls_ttl", "64"))
-        self.mpls_experimental_field.setText(mpls_data.get("mpls_experimental", "0"))
+        # v0.3.11: str() coerce so an int from a future template
+        # (e.g., {"mpls_label": 16}) doesn't raise TypeError —
+        # same trap we fixed for frame_size.
+        self.mpls_label_field.setText(str(mpls_data.get("mpls_label", "16")))
+        self.mpls_ttl_field.setText(str(mpls_data.get("mpls_ttl", "64")))
+        self.mpls_experimental_field.setText(str(mpls_data.get("mpls_experimental", "0")))
         # SR-MPLS label stack (0.2.65). Stored either as a list or a
         # comma-separated string — normalise back to the dialog's
         # comma-separated text form so the user sees what they typed.
@@ -6768,7 +7372,15 @@ class AddStreamDialog(QDialog):
         self.payload_pattern.setChecked(payload_value == "Pattern")
         # Map "Hex Dump" to "From File" for backward compatibility
         self.payload_from_file.setChecked(payload_value == "Hex Dump" or payload_value == "From File")
-        self.payload_random.setChecked(payload_value == "Random")
+        # payload_random widget removed in v0.3.11 (dead) — silently
+        # ignore stored "Random" payloads; they fall through to None.
+        # v0.3.11 round-trip: restore payload bytes from the new
+        # protocol_data["payload"] slot that _collect now persists.
+        _payload_pd = stream_data.get("protocol_data", {}).get("payload", {})
+        if hasattr(self, "payload_data_field"):
+            self.payload_data_field.setText(
+                str(_payload_pd.get("payload_data", "0000"))
+            )
 
         # IPv4 detailed
         ipv4_data = stream_data.get("protocol_data", {}).get("ipv4", {})
@@ -6846,13 +7458,47 @@ class AddStreamDialog(QDialog):
         else:
             self.rx_port_dropdown.setCurrentText("Same as TX Port")
 
+        # v0.3.11 round-trip fix: PCAP Replay fields were COLLECTED
+        # by get_stream_details (top-level `pcap_stream` dict + a
+        # duplicate inside protocol_data) but never RESTORED in
+        # populate. Operator edited a stream with PCAP enabled,
+        # reopened it, saw every PCAP field reset — silent loss of
+        # file path / loop count / rate mode. Try the top-level
+        # key first (current shape) then fall back to the
+        # protocol_data nested copy (older saves).
+        pcap_stream = (
+            stream_data.get("pcap_stream")
+            or stream_data.get("protocol_data", {}).get("pcap_stream", {})
+            or {}
+        )
+        if hasattr(self, "enable_pcap_checkbox"):
+            self.enable_pcap_checkbox.setChecked(
+                bool(pcap_stream.get("pcap_enabled", False))
+            )
+        if hasattr(self, "pcap_file_path"):
+            self.pcap_file_path.setText(
+                str(pcap_stream.get("pcap_file_path", ""))
+            )
+        if hasattr(self, "pcap_loop_count"):
+            try:
+                self.pcap_loop_count.setValue(
+                    int(pcap_stream.get("pcap_loop_count", 1))
+                )
+            except (TypeError, ValueError):
+                self.pcap_loop_count.setValue(1)
+        if hasattr(self, "pcap_rate_mode"):
+            self.pcap_rate_mode.setCurrentText(
+                str(pcap_stream.get("pcap_rate_mode", "Original Timing"))
+            )
+
         QTimer.singleShot(0, self.refresh_l4_sections)
 
     # ----------------------------- Build stream dict -----------------------------
 
     def _selected_l1(self):
-        if self.l1_mac.isChecked(): return "MAC"
-        if self.l1_raw.isChecked(): return "RAW"
+        # L1 group removed in v0.3.11 (was dead UI — value was
+        # written but no packet builder ever read it). Hard-coded
+        # to "None" so saved stream shape stays unchanged.
         return "None"
 
     def _selected_vlan(self):
@@ -6884,7 +7530,7 @@ class AddStreamDialog(QDialog):
     def _selected_payload(self):
         if self.payload_pattern.isChecked(): return "Pattern"
         if self.payload_from_file.isChecked(): return "From File"  # Map to "Hex Dump" for backward compatibility if needed
-        if self.payload_random.isChecked(): return "Random"
+        # payload_random removed in v0.3.11 (dead — no encoder path).
         return "None"
 
     def _collect_vlan_pd(self):
@@ -7018,6 +7664,13 @@ class AddStreamDialog(QDialog):
             "rocev2_gid_destination_step": self.rocev2_gid_destination_step.text().strip() or "1",
             "rocev2_gid_destination_count": self.rocev2_gid_destination_count.text().strip() or "1",
             "send_cnp": self.rocev2_send_cnp.isChecked(),
+            # v0.3.11 round-trip fix: this checkbox was BUILT in
+            # setup but never collected — operator ticked it, saved,
+            # reopened, and the box was empty again. Silent loss.
+            "rocev2_use_perf_server": (
+                self.rocev2_use_perf_server.isChecked()
+                if hasattr(self, "rocev2_use_perf_server") else False
+            ),
         }
 
     def _collect_uec_pd(self):
@@ -7067,7 +7720,9 @@ class AddStreamDialog(QDialog):
                     return label
             return pairs[0][0]
 
-        L1 = chosen([("None", "l1_none"), ("MAC", "l1_mac"), ("RAW", "l1_raw")])
+        # v0.3.11: L1 group removed (dead UI). Field stays in
+        # stream_data for back-compat with saved sessions.
+        L1 = "None"
         VLAN_sel = chosen([("Untagged", "vlan_untagged"), ("Tagged", "vlan_tagged"), ("Stacked", "vlan_stacked")])
         L2 = chosen([("None", "l2_none"), ("Ethernet II", "l2_ethernet"), ("MPLS", "l2_mpls")])
         L3 = chosen([("None", "l3_none"), ("ARP", "l3_arp"), ("IPv4", "l3_ipv4"), ("IPv6", "l3_ipv6")])
@@ -7084,7 +7739,10 @@ class AddStreamDialog(QDialog):
                     break
         if not L4:
             L4 = "None"
-        Payload = chosen([("None", "payload_none"), ("Pattern", "payload_pattern"), ("From File", "payload_from_file"), ("Random", "payload_random")])
+        # v0.3.11: payload_random removed (dead widget). Note the
+        # tuple order now matches the radio button order in
+        # setup_protocol_selection_tab (None / Pattern / From File).
+        Payload = chosen([("None", "payload_none"), ("Pattern", "payload_pattern"), ("From File", "payload_from_file")])
 
         # ---------- PCAP ----------
         pcap_stream = {
@@ -7303,6 +7961,17 @@ class AddStreamDialog(QDialog):
                 "rocev2_gid_destination_step": self.rocev2_gid_destination_step.text().strip(),
                 "rocev2_gid_destination_count": self.rocev2_gid_destination_count.text().strip(),
                 "send_cnp": self.rocev2_send_cnp.isChecked() if hasattr(self, "rocev2_send_cnp") else False,
+                # v0.3.11 round-trip fix: checkbox was BUILT in setup
+                # but never collected — operator ticked it, saved,
+                # reopened, and the box was empty again. Silent loss.
+                # NOTE: there's also a _collect_rocev2_pd helper with
+                # this field added but that helper isn't called from
+                # this inline collect path; both are kept in sync as
+                # a defense-in-depth measure.
+                "rocev2_use_perf_server": (
+                    self.rocev2_use_perf_server.isChecked()
+                    if hasattr(self, "rocev2_use_perf_server") else False
+                ),
             }
 
         # UEC
@@ -7323,6 +7992,16 @@ class AddStreamDialog(QDialog):
         # ARP
         if hasattr(self, "arp_group"):
             protocol_data["arp"] = self._collect_arp_pd()
+
+        # Payload — v0.3.11 round-trip fix: the payload data field
+        # (hex bytes for Pattern / From File modes) was built in
+        # setup but never collected. Operator typed a custom
+        # payload, saved, reopened → field reset to default "0000".
+        # Silent loss; now persisted under protocol_data["payload"].
+        if hasattr(self, "payload_data_field"):
+            protocol_data["payload"] = {
+                "payload_data": self.payload_data_field.text().strip() or "0000",
+            }
 
         # override flags
         override_settings = {
@@ -7530,5 +8209,14 @@ class AddStreamDialog(QDialog):
         # Payload
         if Payload != "None":
             p = QTreeWidgetItem(["Payload", Payload])
-            p.addChild(QTreeWidgetItem(["Data", stream_data.get("protocol_data", {}).get("payload_data", {}).get("data", "")]))
+            # v0.3.11 fix: was looking up the wrong key path
+            # (`payload_data.data` — never populated). Actual collect
+            # writes `protocol_data.payload.payload_data`. Without
+            # this fix, custom payload bytes never showed in the
+            # Packet View tree even though they were saved correctly.
+            p.addChild(QTreeWidgetItem([
+                "Data",
+                str(stream_data.get("protocol_data", {})
+                    .get("payload", {}).get("payload_data", ""))
+            ]))
             self.packet_tree.addTopLevelItem(p)

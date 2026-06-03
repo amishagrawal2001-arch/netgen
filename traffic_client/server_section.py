@@ -661,8 +661,14 @@ class TrafficGenClientServerSection():
         try:
             self.stream_table.setRowCount(0)
 
-            search_term = (self.search_box.text().strip().lower()
-                           if hasattr(self, "search_box") and self.search_box else "")
+            # v0.3.11: the per-row `search_box` filter was removed —
+            # the top-of-tab `_stream_filter_input` (parity with
+            # Devices / L2 Emulation / Stateful TCP) now owns
+            # filtering, applied in-place via `setRowHidden` from the
+            # `finally` block below. Keep `search_term` as the empty
+            # string so the row-skip branch downstream is a no-op
+            # without touching its conditional structure.
+            search_term = ""
 
             self.stream_table.setColumnCount(16)
             self.stream_table.setHorizontalHeaderLabels([
@@ -1096,6 +1102,15 @@ class TrafficGenClientServerSection():
             if hasattr(self, "_set_stream_count_chip"):
                 try:
                     self._set_stream_count_chip(running_count, row_count)
+                except Exception:
+                    pass
+            # v0.3.11: reapply the streams-table filter so it survives
+            # this rebuild. Without this, a periodic refresh would
+            # un-hide every row and the operator would see flickering
+            # rows reappear each cycle while typing in the filter box.
+            if hasattr(self, "_apply_stream_table_filter"):
+                try:
+                    self._apply_stream_table_filter()
                 except Exception:
                     pass
             # print(f"[STREAM TABLE] Completed _do_update_stream_table() - set _populating_table to False")

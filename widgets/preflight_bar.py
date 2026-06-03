@@ -91,8 +91,16 @@ class PreflightBar(QFrame):
         self._set_bar_style(border_color="#e2e8f0",
                             background="#f8fafc")
         bar = QHBoxLayout(self)
-        bar.setContentsMargins(8, 4, 8, 4)
+        # v0.3.11: tightened vertical margins (4→2) so the bar consumes
+        # less of the parent tab's vertical real estate. The Devices
+        # tab was reporting only one table row visible because preflight
+        # + filter chrome was eating ~65px combined.
+        bar.setContentsMargins(8, 2, 8, 2)
         bar.setSpacing(8)
+        # Keep a reference so callers can `add_inline_widget()` to fold
+        # tab-scoped chrome (e.g. the Devices filter input) onto this
+        # row instead of stacking another row beneath it.
+        self._bar_layout = bar
 
         title = QLabel("Preflight:")
         title.setStyleSheet("color: #475569; font-size: 11px; "
@@ -242,6 +250,27 @@ class PreflightBar(QFrame):
         """
         import copy
         return copy.deepcopy(self._by_device)
+
+    def add_inline_widget(self, widget: QWidget, *, stretch: int = 0) -> None:
+        """v0.3.11: insert a host-supplied widget into the bar's row,
+        positioned between the pills' trailing stretch and the
+        Details… button.
+
+        Lets the parent tab piggy-back tab-scoped chrome (the Devices
+        tab uses this for its filter input) onto the preflight bar
+        instead of stacking another row beneath it. Saves ~28 px of
+        vertical chrome on the Devices tab — operators were reporting
+        only one device row visible before this change.
+
+        :param widget: any QWidget; reparented to the bar.
+        :param stretch: layout stretch factor — pass 1 to let the
+            widget consume the bar's free horizontal space.
+        """
+        idx = self._bar_layout.indexOf(self.details_btn)
+        if idx < 0:  # defensive — bar wasn't built normally
+            self._bar_layout.addWidget(widget, stretch)
+            return
+        self._bar_layout.insertWidget(idx, widget, stretch)
 
 
 class PreflightDetailsDialog(QDialog):

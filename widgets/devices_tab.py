@@ -1198,11 +1198,31 @@ class BgpRouteManagementDialog(QDialog):
         self.bgp_mode_combo = QComboBox()
         self.bgp_mode_combo.addItems(["eBGP", "iBGP"])
 
+        # v0.3.11: live regex validators on the ASN fields. Previously
+        # plain QLineEdit accepted anything; apply-time check at
+        # devices_tab_bgp.py:1608 rejected with a generic warning
+        # AFTER save attempt. Now: digit-only keystroke filter at
+        # entry time (up to 10 digits — covers the full 4-byte ASN
+        # range 1..2^32-1=4294967295). Apply-time range check
+        # remains as the backstop for the "10 nines" edge case.
+        # Avoids the Settings-dialog OverflowError trap by using
+        # QRegExpValidator (no Qt int32 limit) instead of QIntValidator.
+        from PyQt5.QtCore import QRegExp
+        from PyQt5.QtGui import QRegExpValidator
+        _asn_validator = QRegExpValidator(QRegExp(r"\d{1,10}"))
+        _asn_tooltip = (
+            "BGP AS number. Range 1..4,294,967,295 "
+            "(RFC 6793 4-byte ASN)."
+        )
         self.bgp_asn_input = QLineEdit("65000")
-        
+        self.bgp_asn_input.setValidator(_asn_validator)
+        self.bgp_asn_input.setToolTip(_asn_tooltip)
+
         # IPv4 BGP fields
         self.bgp_neighbor_ipv4_input = QLineEdit("192.168.0.2")
         self.bgp_remote_asn_input = QLineEdit("65001")
+        self.bgp_remote_asn_input.setValidator(_asn_validator)
+        self.bgp_remote_asn_input.setToolTip(_asn_tooltip)
         self.bgp_update_source_ipv4_input = QLineEdit("192.168.0.2")
         
         # IPv6 BGP fields
@@ -1689,32 +1709,53 @@ class DevicesTab(QWidget):
         # Set tooltips for editable columns
         self.setup_column_tooltips()
 
-        # Filter bar above the table. Once a deployment grows past ~15
-        # devices, scrolling to find one becomes annoying. The filter
-        # box hides rows whose Device-Name / Interface / IPv4 / IPv6 /
-        # MAC don't contain the (case-insensitive) substring entered.
-        # Empty box → all rows visible (the at-rest state).
+        # Filter input. Once a deployment grows past ~15 devices,
+        # scrolling to find one becomes annoying. Hides rows whose
+        # Device-Name / Interface / IPv4 / IPv6 / MAC don't contain
+        # the (case-insensitive) substring entered. Empty → all rows
+        # visible (at-rest state).
+        #
+        # v0.3.11: inlined onto the preflight bar's row instead of
+        # taking its own row. Operators were reporting only one device
+        # row visible — the combined preflight + filter chrome was
+        # eating ~65 px of vertical space. Falls back to a standalone
+        # row if the preflight bar failed to construct (defensive —
+        # the filter must work even without preflight).
         from PyQt5.QtWidgets import QLineEdit
-        filter_row = QHBoxLayout()
-        filter_row.setContentsMargins(0, 0, 0, 4)
-        filter_row.setSpacing(6)
-        filter_label = QLabel("Filter:")
-        filter_label.setStyleSheet("color: #6b7280; font-size: 11px;")
         self._device_filter_input = QLineEdit()
         self._device_filter_input.setPlaceholderText(
-            "Device Name / Interface / IPv4 / IPv6 / MAC …"
+            "Filter: Device / Interface / IPv4 / IPv6 / MAC …"
         )
         self._device_filter_input.setClearButtonEnabled(True)
         self._device_filter_input.setFixedHeight(22)
+        self._device_filter_input.setMaximumWidth(320)
         self._device_filter_input.setStyleSheet(
             "QLineEdit { border: 1px solid #cbd5e1; border-radius: 4px;"
             "  padding: 0 6px; font-size: 12px; background: #ffffff; }"
             "QLineEdit:focus { border-color: #2563eb; }"
         )
         self._device_filter_input.textChanged.connect(self._apply_device_filter)
-        filter_row.addWidget(filter_label)
-        filter_row.addWidget(self._device_filter_input, 1)
-        layout.addLayout(filter_row)
+        _inlined = False
+        bar = getattr(self, "preflight_bar", None)
+        if bar is not None and hasattr(bar, "add_inline_widget"):
+            try:
+                bar.add_inline_widget(self._device_filter_input, stretch=0)
+                _inlined = True
+            except Exception as _e:
+                import logging as _lg
+                _lg.warning(
+                    f"[DEVICES] filter inline-attach failed; "
+                    f"falling back to standalone row: {_e}"
+                )
+        if not _inlined:
+            filter_row = QHBoxLayout()
+            filter_row.setContentsMargins(0, 0, 0, 4)
+            filter_row.setSpacing(6)
+            filter_label = QLabel("Filter:")
+            filter_label.setStyleSheet("color: #6b7280; font-size: 11px;")
+            filter_row.addWidget(filter_label)
+            filter_row.addWidget(self._device_filter_input, 1)
+            layout.addLayout(filter_row)
 
         layout.addWidget(self.devices_table)
         
@@ -4074,12 +4115,21 @@ class DevicesTab(QWidget):
                 if dev_id:
                     merged_seen_ids.add(dev_id)
                 iface = dev.get("Interface") or dev.get("interface")
+                # v0.3.11: previously this only synthesized the
+                # canonical form when iface was FALSY. A server
+                # returning a malformed truthy value (" - ens5np0",
+                # "Port: ens5np0", or just "ens5np0") would flow
+                # through verbatim, bucket the device under the
+                # malformed key, and make it invisible to every UI
+                # lookup that uses the "TG N - port" form. The
+                # shared `canonical_iface_key` helper now normalizes
+                # uniformly — both the bare-fallback path and the
+                # malformed-but-truthy case land in the same canonical
+                # bucket.
                 if not iface:
-                    # Server-side devices may carry a bare iface;
-                    # synthesize the canonical "TG N - <iface>" key.
-                    bare = dev.get("interface_name") or dev.get("port")
-                    if bare:
-                        iface = f"TG {tg_id} - {bare}"
+                    iface = dev.get("interface_name") or dev.get("port")
+                from utils.iface_naming import canonical_iface_key
+                iface = canonical_iface_key(iface, tg_id=tg_id)
                 if not iface:
                     continue
                 # Don't clobber an in-progress local edit: if we
@@ -8124,6 +8174,15 @@ class DevicesTab(QWidget):
         act_apply = menu.addAction("Apply selected")
         act_apply.setEnabled(has_selection)
         act_apply.triggered.connect(self.apply_selected_device_with_arp)
+
+        # v0.3.11: Edit was missing from the context menu — operators
+        # had to mouse to the Edit toolbar button or double-click the
+        # row to open the Edit dialog, which broke parity with the
+        # Streams-tab right-click menu (which exposes Edit). Same
+        # handler as the toolbar button (wired at line 2001).
+        act_edit = menu.addAction("Edit")
+        act_edit.setEnabled(has_selection)
+        act_edit.triggered.connect(self.prompt_edit_device)
 
         menu.addSeparator()
 

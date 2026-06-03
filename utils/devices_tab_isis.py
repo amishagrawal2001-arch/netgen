@@ -60,6 +60,33 @@ class ISISHandler:
         # Connect cell changed signal for inline editing
         self.parent.isis_table.cellChanged.connect(self.on_isis_table_cell_changed)
         
+        # v0.3.11: filter input ABOVE the table — parity with the
+        # other sub-tabs. Substring match across Device / Interface /
+        # Area / Level / System ID columns.
+        try:
+            from utils.table_filter_bar import make_table_filter_row
+            _isis_filter_row, self.parent._isis_filter_input = (
+                make_table_filter_row(
+                    table=self.parent.isis_table,
+                    columns=(
+                        "Device", "Neighbor Type", "Neighbor Hostname",
+                        "Interface", "ISIS Area", "Level", "ISIS Net",
+                        "System ID",
+                    ),
+                    placeholder=(
+                        "Device / Interface / Area / Level / NET …"
+                    ),
+                    tooltip=(
+                        "Substring filter — Device / Interface / Area / "
+                        "Level / NET / System ID. Case-insensitive."
+                    ),
+                )
+            )
+            layout.addLayout(_isis_filter_row)
+        except Exception as _e:
+            import logging as _lg
+            _lg.warning(f"[ISIS TAB] filter row unavailable: {_e}")
+
         # Section header removed — tab name + column headers carry it.
         layout.addWidget(self.parent.isis_table)
 
@@ -1077,6 +1104,12 @@ class ISISHandler:
             # Restore previous signal-block state so we don't accidentally leave
             # signals blocked for caller code that depended on them.
             self.parent.isis_table.blockSignals(signals_were_blocked)
+            # v0.3.11: reapply substring filter so it survives this rebuild.
+            try:
+                from utils.table_filter_bar import reapply_filter
+                reapply_filter(getattr(self.parent, "_isis_filter_input", None))
+            except Exception:
+                pass
 
 
     def set_isis_status_icon(self, row, status, tooltip):

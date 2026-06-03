@@ -30,7 +30,7 @@ import os
 from typing import Any, Callable, Dict, Optional
 
 import requests
-from PyQt5.QtCore import Qt, QTimer
+from PyQt5.QtCore import Qt, QTimer, pyqtSignal
 from PyQt5.QtWidgets import QLabel, QWidget
 
 
@@ -40,8 +40,17 @@ DEFAULT_POLL_INTERVAL_MS = 30_000
 
 
 class DpdkReadinessChip(QLabel):
-    """One-glance readiness indicator. Click does nothing today; the
-    label + tooltip carry the whole signal."""
+    """One-glance readiness indicator.
+
+    v0.3.11: clicking the chip emits ``clicked`` so the host (main
+    window) can hook it up to open the Make DPDK Ready orchestrator.
+    Cursor changes to pointing-hand to advertise the affordance —
+    previously the chip looked clickable but did nothing.
+    """
+
+    # Emitted on left-click. Host wires this to the Make DPDK Ready
+    # menu handler so a single chip click opens the fix flow.
+    clicked = pyqtSignal()
 
     # Tri-state colour palettes — match the preflight bar's palette
     # convention so the two widgets feel related.
@@ -62,6 +71,8 @@ class DpdkReadinessChip(QLabel):
         self._last_payload: Dict[str, Any] = {}
         self._state = "gray"
         self.setAlignment(Qt.AlignCenter)
+        # v0.3.11: pointer cursor advertises clickability.
+        self.setCursor(Qt.PointingHandCursor)
         self._paint("gray", "DPDK: —", "No server selected yet.")
 
         self._timer = QTimer(self)
@@ -115,6 +126,15 @@ class DpdkReadinessChip(QLabel):
         state, headline, tip = classify_dpdk_status(payload)
         self._state = state
         self._paint(state, headline, tip)
+
+    def mousePressEvent(self, ev):
+        """v0.3.11: emit clicked on left-click so the host can
+        bridge to Make DPDK Ready. Right-click ignored — reserved
+        for a future context menu (Refresh, Show details, etc).
+        """
+        if ev.button() == Qt.LeftButton:
+            self.clicked.emit()
+        super().mousePressEvent(ev)
 
     def _paint(self, state: str, text: str, tooltip: str) -> None:
         palette = self._STATES.get(state, self._STATES["gray"])
@@ -182,9 +202,28 @@ def classify_dpdk_status(payload: Dict[str, Any]) -> "tuple[str, str, str]":
     rows.append(("IOMMU", iommu_detail))
     rows.append(("vfio-pci", "loaded" if vfio_pci else "not loaded"))
 
+    # v0.3.11 fix #5: surface the bound-NIC count in the tooltip so
+    # operators know their bound NICs aren't lost — they're just
+    # invisible from psutil (and therefore the server tree) once
+    # vfio-pci owns them. The bound list IS available via Tools →
+    # DPDK → Status… and from /api/dpdk/interfaces.
+    interfaces = payload.get("interfaces") or []
+    bound_count = sum(
+        1 for i in interfaces
+        if isinstance(i, dict)
+        and "vfio" in str(i.get("driver", "")).lower()
+    )
+    if bound_count:
+        rows.append((
+            "Bound NICs",
+            f"{bound_count} (not shown in Server tree — Tools→DPDK→Status)",
+        ))
+
     tip = "DPDK readiness:\n" + "\n".join(
         f"  • {k}: {v}" for k, v in rows
     )
+    # v0.3.11 fix #1: advertise the click-to-fix affordance.
+    tip += "\n\nClick this chip to open Make DPDK Ready…"
 
     if not libdpdk or not tx_worker:
         missing = []
