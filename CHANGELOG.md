@@ -2,6 +2,78 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.3.13] - 2026-06-03
+
+**RDMA parser fixes from live-hardware verification.** v0.3.12 shipped
+without lab validation; bringing it up on svl-d-ai-srv01 (6 Mellanox
+HCAs, mlx5 driver, perftest 24.04.0-0.41) surfaced two cosmetic data-
+parsing gaps in `utils/rdma_perf.py`. Functional RDMA worked
+end-to-end (verified 316.48 Gbps loopback on mlx5_5 + clean SIGTERM
+on Stop), but the **RDMA Devices viewer** showed misleading
+`MTU: 0` on every NIC and `perftest installed (?)` instead of a
+real version.
+
+### What changed
+
+**`utils/rdma_perf._parse_active_mtu` — new helper**
+- Mellanox + most modern kernels (5.x+) write
+  `/sys/class/infiniband/<dev>/ports/<n>/active_mtu` as a single
+  IB MTU enum digit (`1` → 256 B … `5` → 4096 B per IBA spec §3.5.3).
+- v0.3.12's regex `\d{3,5}` required ≥3 digits, so single-digit
+  enum values returned 0. Result: every device showed `mtu: 0`.
+- The new helper accepts all three formats:
+  bare enum `"3"`, colon `"3: 1024"`, raw bytes `"1024"`, and the
+  perftest-style `"4096[B]"` suffix. 16 parameterized test cases
+  pin every format observed in the wild.
+- srv01's mlx5_5 port 1 now correctly reports `mtu: 1024`
+  matching perftest's own `Mtu : 1024[B]` banner line.
+
+**`utils/rdma_perf._probe_perftest_version` — multi-stage fallback**
+- v0.3.12 relied on `<tool> --version`, which on srv01's perftest
+  build (24.04.0-0.41, the version shipped by Mellanox MOFED + the
+  newer Ubuntu 24.04 perftest package) returns no useful output.
+- New fallback chain (cheapest probe first):
+  1. `<tool> --version` (older perftest works here)
+  2. `<tool> -V` (some forks)
+  3. `dpkg -s perftest` (Debian/Ubuntu — what works on srv01)
+  4. `rpm -q perftest` (RHEL/Fedora)
+  5. `apk info -v perftest` (Alpine)
+- Returns None only if every probe fails — the GUI then renders
+  just "perftest installed" without a version qualifier rather
+  than 500-ing.
+- 5 new tests: extract-version-from-blob parameterized over real
+  format strings, fall-through-to-dpkg pin, all-probes-fail
+  graceful-None pin.
+
+### Lab verification on svl-d-ai-srv01 (Mellanox, 6 NICs)
+- ✓ `/api/health` reports v0.3.13 after wheel upgrade
+- ✓ `/api/rdma/devices` now shows correct MTU per port
+  (1024 B on the active mlx5_5 port, was 0 in v0.3.12)
+- ✓ `/api/rdma/perftest/installed` now reports
+  `version: "24.04.0-0.41"` via the dpkg fallback (was null in v0.3.12)
+- ✓ Loopback Send BW test on mlx5_5 hit 316.48 Gbps avg
+- ✓ Cross-NIC test mlx5_3↔mlx5_0 failed cleanly with operator-
+  readable "Failed to modify QP to RTR" (subnets unrouted) —
+  proves the failure-surfacing path works as designed
+- ✓ Stop button SIGTERMs the perftest child cleanly (rc=-15
+  captured, pairing record dropped) — regression for the
+  v0.3.12 audit-pass fix
+- ✓ Blast a RDMA Flow dialog populates the device combo with all
+  6 NICs incl. per-port state badges (ACTIVE vs DOWN)
+
+### Tests
+- 16 new parameterized tests for `_parse_active_mtu` covering
+  every sysfs format variant observed.
+- 5 new tests for `_probe_perftest_version` covering blob parsing,
+  dpkg fallback, all-probes-fail graceful return.
+- Suite: 1119 passing (up from 1119 — RDMA suite grew from 49 → 70).
+
+### Files changed
+- `utils/rdma_perf.py` (parser fixes — no API surface change)
+- `tests/test_rdma_perf.py` (21 new test cases)
+
+---
+
 ## [0.3.12] - 2026-06-03
 
 **RDMA traffic generation release.** Adds end-to-end RDMA support via

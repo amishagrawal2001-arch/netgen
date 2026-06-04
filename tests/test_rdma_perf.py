@@ -120,6 +120,102 @@ def test_perftest_installed_all_missing(monkeypatch):
     assert out["version"] is None
 
 
+# ─────────────────────────────────────────── _parse_active_mtu (v0.3.13 fix)
+
+@pytest.mark.parametrize("raw,expected", [
+    # Modern kernel (5.x+) bare IB MTU enum — the format we saw on srv01.
+    # The v0.3.12 \d{3,5} regex returned 0 for these and produced "mtu: 0"
+    # on every Mellanox NIC in the /api/rdma/devices response.
+    ("1",          256),
+    ("2",          512),
+    ("3",          1024),
+    ("4",          2048),
+    ("5",          4096),
+    # Older kernel "enum: bytes" format (still seen on some out-of-tree drivers).
+    ("3: 1024",    1024),
+    ("5: 4096",    4096),
+    ("4: 2048",    2048),
+    # Driver-wrote-bytes-directly variant.
+    ("1024",       1024),
+    ("4096",       4096),
+    # Defensive: perftest-style "[B]" suffix.
+    ("4096[B]",    4096),
+    # Whitespace / newlines (sysfs reads strip but defend anyway).
+    ("  3\n",      1024),
+    # Unparseable / empty.
+    ("",           0),
+    (None,         0),
+    ("foo",        0),
+    # Bare-enum out of range (vendor-specific) — pick from candidates fallback.
+    ("9",          0),
+])
+def test_parse_active_mtu(raw, expected):
+    assert rdma_perf._parse_active_mtu(raw) == expected
+
+
+# ─────────────────────────────────────────── _extract_version_from_blob
+
+@pytest.mark.parametrize("blob,expected", [
+    # Apt/dpkg-style version strings on older perftest builds.
+    ("perftest 6.2-1\n",                "6.2-1"),
+    ("perftest-6.10\n",                 "6.10"),
+    ("Perftest version 6.2.0",          "6.2.0"),
+    # Bare-version forks.
+    ("\n6.10\n",                        "6.10"),
+    ("6.2-1",                           "6.2-1"),
+    # No version present (the case observed on srv01 — perftest --version
+    # output empty / unhelpful, drives the dpkg/rpm fallbacks).
+    ("",                                None),
+    ("usage: ib_send_bw ...",           None),
+])
+def test_extract_version_from_blob(blob, expected):
+    assert rdma_perf._extract_version_from_blob(blob) == expected
+
+
+def test_probe_perftest_version_falls_through_to_dpkg(monkeypatch):
+    """When perftest --version returns nothing useful (observed on srv01's
+    perftest build), the dpkg/rpm/apk fallback chain must kick in. Pin
+    the order so a regression doesn't silently break version display."""
+    tools = {"send_bw": "/usr/bin/ib_send_bw"}
+
+    # All perftest --version / -V calls return empty banner.
+    def fake_run(cmd, **kw):
+        class R:
+            stdout = ""
+            stderr = ""
+            returncode = 0
+        # dpkg -s perftest → simulate a successful Debian lookup.
+        if cmd[:2] == ["dpkg", "-s"] and cmd[2] == "perftest":
+            R.stdout = (
+                "Package: perftest\n"
+                "Status: install ok installed\n"
+                "Priority: optional\n"
+                "Version: 24.04.0-0.41\n"
+                "Architecture: amd64\n"
+            )
+        return R()
+    monkeypatch.setattr(rdma_perf.subprocess, "run", fake_run)
+
+    v = rdma_perf._probe_perftest_version(tools)
+    assert v == "24.04.0-0.41"
+
+
+def test_probe_perftest_version_returns_none_when_all_probes_fail(monkeypatch):
+    """No --version, no dpkg, no rpm, no apk → return None (don't error;
+    the GUI should render 'perftest installed' without a version suffix)."""
+    tools = {"send_bw": "/usr/bin/ib_send_bw"}
+
+    def fake_run(cmd, **kw):
+        class R:
+            stdout = ""
+            stderr = ""
+            returncode = 1  # all probes fail
+        return R()
+    monkeypatch.setattr(rdma_perf.subprocess, "run", fake_run)
+
+    assert rdma_perf._probe_perftest_version(tools) is None
+
+
 def test_perftest_installed_partial(monkeypatch):
     """Some tools present, some not — installed=True, version probed."""
     def fake_which(name):

@@ -215,6 +215,54 @@ def _parse_state(raw: Optional[str]) -> str:
     return parts[1].strip() if len(parts) == 2 else raw.strip()
 
 
+# IB MTU enum (RFC 7146 §2.4 / IBA spec §3.5.3 / verbs <infiniband/verbs.h>):
+#   1 → 256 B   2 → 512 B   3 → 1024 B   4 → 2048 B   5 → 4096 B
+# Mellanox + most other vendors expose /sys/class/infiniband/<dev>/ports/<n>/
+# active_mtu as JUST the enum digit ("3\n") on modern kernels (5.x+). Older
+# kernels and some out-of-tree drivers wrote "3: 1024" or even bare "1024".
+# v0.3.13: handle all three formats; the v0.3.12 regex \d{3,5} required ≥3
+# digits so single-digit "3" returned 0 — the in-app RDMA Devices viewer
+# showed "0 B" MTU on every Mellanox NIC.
+_IB_MTU_ENUM_BYTES: Dict[int, int] = {1: 256, 2: 512, 3: 1024, 4: 2048, 5: 4096}
+
+
+def _parse_active_mtu(raw: Optional[str]) -> int:
+    """Return MTU in bytes (e.g. 4096), or 0 if unparseable / missing.
+
+    Accepts:
+      "3"          → 1024  (modern kernel: bare IB MTU enum)
+      "3: 1024"    → 1024  (older kernel: enum + bytes)
+      "1024"       → 1024  (driver wrote bytes directly)
+      "4096[B]"    → 4096  (perftest-style decoration; defensive)
+      ""/None      → 0
+    """
+    if not raw:
+        return 0
+    txt = raw.strip()
+    # Strip any "[B]"/"bytes" suffix some tools add.
+    txt = re.sub(r"\s*\[?[Bb](ytes)?\]?\s*$", "", txt).strip()
+    # If colon-separated "enum: bytes", prefer the bytes after the colon.
+    if ":" in txt:
+        right = txt.split(":", 1)[1].strip()
+        if right.isdigit():
+            n = int(right)
+            return n if n >= 256 else _IB_MTU_ENUM_BYTES.get(n, 0)
+    # Bare numeric. Single digit 1–5 → IB MTU enum; otherwise treat as bytes.
+    if txt.isdigit():
+        n = int(txt)
+        if n in _IB_MTU_ENUM_BYTES:
+            return _IB_MTU_ENUM_BYTES[n]
+        return n if n >= 256 else 0
+    # Embedded digits — pull the largest plausible bytes value (last fallback).
+    candidates = [int(m) for m in re.findall(r"\d+", txt)]
+    big = [c for c in candidates if c >= 256]
+    if big:
+        return max(big)
+    if candidates:
+        return _IB_MTU_ENUM_BYTES.get(candidates[0], 0)
+    return 0
+
+
 def list_rdma_devices() -> List[RdmaDevice]:
     """Enumerate every RDMA HCA on this host via /sys/class/infiniband.
 
@@ -263,16 +311,12 @@ def list_rdma_devices() -> List[RdmaDevice]:
                 link_layer = _read_sysfs(os.path.join(p_root, "link_layer")) or "Unknown"
                 rate = _read_sysfs(os.path.join(p_root, "rate")) or ""
                 mtu_raw = _read_sysfs(os.path.join(p_root, "active_mtu"))
-                # active_mtu reads as e.g. "5: 4096" — third token is bytes.
-                mtu = 0
-                if mtu_raw:
-                    # Pattern variants seen: "4096", "5: 4096", "4: 2048"
-                    m = re.search(r"(\d{3,5})", mtu_raw)
-                    if m:
-                        try:
-                            mtu = int(m.group(1))
-                        except ValueError:
-                            mtu = 0
+                # active_mtu format varies by kernel + driver. v0.3.13:
+                # delegate to _parse_active_mtu which handles all three
+                # forms (bare enum "3", "3: 1024", or raw bytes "1024").
+                # v0.3.12 had a regex \d{3,5} here that returned 0 for
+                # the modern bare-enum format Mellanox uses on 5.x+.
+                mtu = _parse_active_mtu(mtu_raw)
                 lid_raw = _read_sysfs(os.path.join(p_root, "lid"))
                 lid: Optional[int] = None
                 if lid_raw:
@@ -302,42 +346,117 @@ def perftest_installed() -> Dict[str, Any]:
     """Return ``{installed: bool, tools: {test_id: path|None}, version: str|None}``.
 
     ``installed`` is True iff at least one supported tool is on PATH.
-    Version is best-effort from ``ib_send_bw --version`` (perftest prints
-    its own version on that line).
+    Version is best-effort — perftest's own ``--version`` flag returns
+    no useful string on the builds shipped by current Debian/Ubuntu/
+    Mellanox (the run banner shows test name but not version), so we
+    fall back through several probes in order of cost.
     """
     tools: Dict[str, Optional[str]] = {}
     for test_id, binary in _SUPPORTED_TESTS.items():
         tools[test_id] = shutil.which(binary)
 
     installed = any(p is not None for p in tools.values())
-    version: Optional[str] = None
-    if installed:
-        # Probe whichever tool is present — they're all from the same
-        # perftest package and report identical version strings.
+    version: Optional[str] = None if not installed else _probe_perftest_version(tools)
+    return {"installed": installed, "tools": tools, "version": version}
+
+
+def _probe_perftest_version(tools: Dict[str, Optional[str]]) -> Optional[str]:
+    """Try several version-discovery paths in order — return the first hit.
+
+    Stop at the first probe that yields a non-empty version string.
+    Logs at debug level for each miss so the misbehaving probe can be
+    diagnosed without spamming WARNING noise on healthy hosts.
+
+    Probe order (cheapest first):
+      1. ``<tool> --version`` stdout/stderr (works on older perftest)
+      2. ``<tool> -V`` (some forks)
+      3. ``dpkg -s perftest`` (Debian/Ubuntu; ~30 ms; very reliable)
+      4. ``rpm -q perftest`` (RHEL/Fedora; ~30 ms; very reliable)
+      5. ``apk info -e perftest`` (Alpine; ~30 ms)
+
+    Returns None if every probe fails — the GUI then renders just
+    "perftest installed" without a version qualifier rather than
+    erroring out.
+    """
+    # 1 + 2: ask perftest itself.
+    for flag in ("--version", "-V"):
         for path in tools.values():
             if path is None:
                 continue
             try:
                 proc = subprocess.run(
-                    [path, "--version"],
+                    [path, flag],
                     capture_output=True, text=True, timeout=5,
                 )
-                # perftest prints version to stderr on some builds and
-                # stdout on others. Just grep both.
-                blob = (proc.stdout or "") + "\n" + (proc.stderr or "")
-                m = re.search(r"perftest[-\s]+(\S+)", blob, re.IGNORECASE)
-                if m:
-                    version = m.group(1)
-                    break
-                # Some builds print just a bare version like "6.3":
-                m2 = re.search(r"^\s*(\d+\.\d+(?:\.\d+)?)\s*$", blob, re.MULTILINE)
-                if m2:
-                    version = m2.group(1)
-                    break
             except (subprocess.SubprocessError, OSError) as exc:
-                logger.debug(f"[rdma] {path} --version failed: {exc}")
+                logger.debug(f"[rdma] {path} {flag} failed: {exc}")
                 continue
-    return {"installed": installed, "tools": tools, "version": version}
+            blob = (proc.stdout or "") + "\n" + (proc.stderr or "")
+            v = _extract_version_from_blob(blob)
+            if v:
+                return v
+        # Only try a few tools per flag — they all share the perftest
+        # package, so the first one that produces output decides.
+
+    # 3: dpkg -s perftest
+    try:
+        proc = subprocess.run(
+            ["dpkg", "-s", "perftest"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if proc.returncode == 0:
+            m = re.search(r"^Version:\s*(\S+)", proc.stdout, re.MULTILINE)
+            if m:
+                return m.group(1)
+    except (subprocess.SubprocessError, OSError, FileNotFoundError) as exc:
+        logger.debug(f"[rdma] dpkg -s perftest failed: {exc}")
+
+    # 4: rpm -q perftest
+    try:
+        proc = subprocess.run(
+            ["rpm", "-q", "--qf", "%{VERSION}-%{RELEASE}", "perftest"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            return proc.stdout.strip()
+    except (subprocess.SubprocessError, OSError, FileNotFoundError) as exc:
+        logger.debug(f"[rdma] rpm -q perftest failed: {exc}")
+
+    # 5: apk info -e perftest
+    try:
+        proc = subprocess.run(
+            ["apk", "info", "-v", "perftest"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if proc.returncode == 0:
+            m = re.search(r"^perftest-(\S+)", proc.stdout, re.MULTILINE)
+            if m:
+                return m.group(1)
+    except (subprocess.SubprocessError, OSError, FileNotFoundError) as exc:
+        logger.debug(f"[rdma] apk info perftest failed: {exc}")
+
+    return None
+
+
+def _extract_version_from_blob(blob: str) -> Optional[str]:
+    """Pure-string helper — pull a version number out of perftest's
+    version-flag output if one is present. Factored out so the dpkg/
+    rpm/apk fallbacks can stay independent of perftest's own output
+    format. Used by _probe_perftest_version."""
+    if not blob:
+        return None
+    # "perftest 6.2-1", "perftest-6.2", "Perftest version 6.10"
+    m = re.search(
+        r"perftest[-\s]+(?:version\s+)?v?(\d+(?:\.\d+)+(?:[-.]\S+)?)",
+        blob, re.IGNORECASE,
+    )
+    if m:
+        return m.group(1)
+    # Bare "6.10" or "6.2-1" alone on a line (some forks)
+    m = re.search(r"^\s*v?(\d+\.\d+(?:[-.]\S+)?)\s*$", blob, re.MULTILINE)
+    if m:
+        return m.group(1)
+    return None
 
 
 # ─────────────────────────────────────────────────────────── port allocator
