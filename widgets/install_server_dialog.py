@@ -2267,9 +2267,26 @@ class InstallServerDialog(QDialog):
         view = QPlainTextEdit(popout)
         view.setReadOnly(True)
         view.setDocument(self.log_view.document())
+        # v0.3.16+: inherit the inline log_view's stylesheet exactly,
+        # then layer popout-specific tweaks (larger font, padding).
+        # Pre-fix the popout used a hardcoded dark theme
+        # (background:#0f172a; color:#e2e8f0). The inline log_view
+        # has NO color override — it renders with the system default
+        # foreground (typically black) on the default background
+        # (typically white). When _classify_and_append calls
+        # appendPlainText(line) on the inline view, the line's
+        # foreground color attribute on the shared QTextDocument gets
+        # bound to the inline view's default (black). The popout
+        # shares the document but had a DARK background, so all those
+        # default-color info lines rendered as black-on-dark-blue —
+        # invisible. Only the appendHtml lines with explicit
+        # red/amber/green tags survived. Operator reported "popout
+        # does not show the progression logs similar to the log text
+        # area" — that's exactly what was happening: most lines
+        # silently vanished into the dark theme.
         view.setStyleSheet(
-            "QPlainTextEdit{font-family: ui-monospace, Menlo, Consolas, "
-            "monospace; font-size:12px; background:#0f172a; color:#e2e8f0;}"
+            self.log_view.styleSheet()
+            + " QPlainTextEdit { padding: 8px; font-size: 12px; }"
         )
         # Cap the popout's history too — without this, setDocument
         # would inherit the embedded view's maxBlockCount (good) but
