@@ -2,6 +2,46 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.3.14] - 2026-06-03
+
+**Help-guide refresh — the docs catch up to v0.3.13.** v0.3.13
+shipped parser fixes without touching the in-app guides; users
+running v0.3.13 saw correct MTU + perftest version in the actual
+features but the Help → What's New / Capabilities / API Guide /
+Install Guide entries were still describing v0.3.12 behaviour.
+
+### What changed
+
+- **What's New** gains a "0.3.13 highlights — RDMA parser fixes" block
+  above the v0.3.12 section. Explains the MTU enum issue + the
+  perftest version-probe fallback chain, with the lab-verified
+  316.48 Gbps benchmark as a credibility marker.
+- **Capabilities → RDMA workflow** section refreshed end-to-end:
+  pre-flight, the two paths, lab-verified facts, and a polished
+  "Common pitfalls" TABLE (was a 3-item bullet list) covering 8
+  failure modes with the GUI signal that surfaces each one and
+  the corresponding fix. Includes the cross-NIC "Failed to modify
+  QP to RTR" case (lab-confirmed) so operators recognise the
+  symptom when peer routing isn't set up.
+- **API Guide §RDMA** gains contract clarifications under
+  <code>/api/rdma/devices</code> (MTU field is always BYTES,
+  normalised from any sysfs format) and
+  <code>/api/rdma/perftest/installed</code> (5-stage version
+  fallback chain documented; explains why <code>version</code>
+  can be null even when <code>installed=true</code>).
+- **Install Guide §10** gains a "status check after install" muted
+  note: tells operators where to look in the GUI to confirm the
+  v0.3.13 parser fixes landed, vs the misleading v0.3.12 display.
+
+No functional changes. No code surface changes. Tests unchanged
+(74/74 RDMA, 1119/1119 full suite still green).
+
+### Files changed
+- `widgets/stream_dialog.py` (3 Help-guide HTML constants:
+  `_API_GUIDE_HTML`, `_FEATURE_GUIDE_HTML`, `_CAPABILITIES_GUIDE_HTML`)
+
+---
+
 ## [0.3.13] - 2026-06-03
 
 **RDMA parser fixes from live-hardware verification.** v0.3.12 shipped

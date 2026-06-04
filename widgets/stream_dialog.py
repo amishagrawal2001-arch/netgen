@@ -940,7 +940,16 @@ Recovery paths:</p>
       Tab 1 cleanly.</li>
 </ul>
 
-<h2>10. RDMA / perftest setup <span class="ok">NEW in 0.3.12</span></h2>
+<h2>10. RDMA / perftest setup <span class="ok">NEW in 0.3.12</span> <span class="ok">parser fixes 0.3.13</span></h2>
+
+<p class="muted"><b>Status check after install:</b> open
+<code>Tools → RDMA → RDMA Devices…</code>. v0.3.13+ shows the real
+<b>perftest version</b> (e.g. <code>perftest 24.04.0-0.41 present</code>
+on Ubuntu 24.04 + MOFED) and the real <b>per-port MTU</b> in bytes
+(e.g. 1024, 4096). Pre-v0.3.13 showed <code>perftest installed (?)</code>
+and <code>MTU: 0 B</code> due to parser bugs in
+<code>utils/rdma_perf.py</code> — upgrade the wheel to see correct
+values without changing any install state.</p>
 
 <p>RDMA traffic generation (<code>Tools → RDMA → Blast a RDMA Flow…</code>
 + per-stream <code>Engine: RDMA (perftest)</code>) shells out to the
@@ -1163,17 +1172,34 @@ companion — see §20.</p>
       <td>Server-side DPDK + tx_worker install. Async; tail via
           <code>/api/admin/install_dpdk/log</code>.</td></tr>
 
-  <tr><th colspan="3" style="background:#fef9c3;">RDMA / perftest (v0.3.12)</th></tr>
+  <tr><th colspan="3" style="background:#fef9c3;">RDMA / perftest (v0.3.12, hardened in v0.3.13)</th></tr>
   <tr><td class="method">GET</td> <td><code>/api/rdma/devices</code></td>
       <td>Enumerate RDMA HCAs via <code>/sys/class/infiniband</code>.
           Returns per-port state, link_layer (Ethernet vs InfiniBand),
           rate, active MTU, GIDs. Empty list when no RDMA support —
-          not an error.</td></tr>
+          not an error.
+          <br/><b>MTU contract (v0.3.13):</b> the <code>mtu</code> field
+          is always BYTES (e.g. 1024, 4096) regardless of how the
+          kernel writes <code>active_mtu</code>. Modern Mellanox /
+          mlx5 5.x+ kernels write a bare IB MTU enum digit
+          (<code>1</code> → 256 B … <code>5</code> → 4096 B per IBA
+          §3.5.3); v0.3.12 returned 0 for these. v0.3.13 normalises
+          all three sysfs formats (bare enum, "enum: bytes", raw
+          bytes) to a single bytes value.</td></tr>
   <tr><td class="method">GET</td> <td><code>/api/rdma/perftest/installed</code></td>
       <td>Probe PATH for <code>ib_send_bw</code>, <code>ib_write_bw</code>,
           <code>ib_read_bw</code>, and their <code>_lat</code> siblings.
           Returns <code>{installed: bool, tools: {test_id: path|null},
-          version: str|null}</code>.</td></tr>
+          version: str|null}</code>.
+          <br/><b>Version probe (v0.3.13):</b> five-stage fallback chain
+          — <code>&lt;tool&gt; --version</code> → <code>-V</code> →
+          <code>dpkg -s perftest</code> → <code>rpm -q perftest</code>
+          → <code>apk info -v perftest</code>. First non-empty result
+          wins. <code>version: null</code> only when <i>every</i> probe
+          fails (rare; GUI then renders "perftest installed" without
+          a version suffix). On the newer Ubuntu 24.04 + MOFED perftest
+          24.04.0-0.41 build, <code>--version</code> returns nothing
+          useful so the dpkg probe is what works in practice.</td></tr>
   <tr><td class="method">POST</td><td><code>/api/rdma/perftest/start</code></td>
       <td>Spawn a perftest job. Body: <code>{role: "server"|"client",
           test: "send_bw"|…|"read_lat", device, ib_port, peer_addr (client
@@ -3248,6 +3274,33 @@ _FEATURE_GUIDE_HTML = r"""
 organised so the menu / tab where you'll find each one is obvious. For
 the REST endpoint signatures see <strong>Help → API Guide</strong>.</p>
 
+<h2><span class="ver fix">0.3.13</span> highlights — RDMA parser fixes (lab-verified)</h2>
+<p>Two parsing gaps from v0.3.12 surfaced during bring-up on a
+Mellanox lab box (svl-d-ai-srv01, 6 mlx5 HCAs, perftest 24.04.0-0.41).
+Functional RDMA worked end-to-end (verified <b>316.48 Gbps</b> loopback
+Send-BW on a 400 G port + clean SIGTERM on Stop), but the
+<b>RDMA Devices</b> viewer was showing misleading info:</p>
+<ul>
+  <li><b>MTU correctly reported per port.</b> Modern Mellanox kernels
+      (5.x+) write <code>/sys/class/infiniband/&lt;dev&gt;/ports/&lt;n&gt;/
+      active_mtu</code> as a bare IB MTU enum digit (<code>1</code> →
+      256 B … <code>5</code> → 4096 B per IBA §3.5.3). v0.3.12's
+      regex required ≥3 digits and returned 0 for every NIC.
+      Now handles bare-enum / "enum: bytes" / raw-bytes / "[B]"-suffix
+      formats; 16 parameterised regression tests pin every variant.</li>
+  <li><b>perftest version detection actually works now.</b> The newer
+      Ubuntu 24.04 + Mellanox MOFED perftest builds (e.g.
+      <code>24.04.0-0.41</code>) don't print a useful version on
+      <code>--version</code>. v0.3.13 falls through:
+      <code>--version → -V → dpkg -s → rpm -q → apk info</code> —
+      first hit wins. RDMA Devices viewer now shows
+      <code>perftest 24.04.0-0.41 present</code> instead of
+      <code>perftest installed (?)</code>.</li>
+</ul>
+<p class="muted">No API surface change. Pure parser + Help-guide
+polish. Upgrade the wheel to see the corrected MTU + version in the
+RDMA Devices view.</p>
+
 <h2><span class="ver new">0.3.12</span> highlights — RDMA traffic generation</h2>
 <p>Brand-new <strong>RDMA</strong> submenu under <code>Tools → RDMA</code>,
 backed by <code>perftest</code> (the standard RDMA / RoCEv2 benchmarking
@@ -3782,67 +3835,118 @@ green after the fix.</p>
 <p>Each fix has its own regression test pinned in the test suite
 (now at <strong>622 tests</strong> vs 103 before this push).</p>
 
-<h2>RDMA workflow <span class="ver new">0.3.12</span></h2>
+<h2>RDMA workflow <span class="ver new">0.3.12</span> <span class="ver fix">refreshed 0.3.13</span></h2>
 <p>Two complementary entry points for RDMA / RoCEv2 traffic generation,
-both backed by <code>perftest</code>:</p>
+both backed by <code>perftest</code>. <b>Lab-verified end-to-end on a
+6-NIC Mellanox box (mlx5 driver, perftest 24.04.0-0.41):</b> 316.48 Gbps
+Send-BW loopback on a 400 G port, clean SIGTERM on Stop, dialog
+populated with all per-port state badges.</p>
 
-<h3>Pre-flight (always run first)</h3>
+<h3>Pre-flight (one-time per TG)</h3>
 <ol>
-  <li><code>apt install perftest rdma-core</code> on every TG you'll use.</li>
-  <li>Confirm the NIC reports <code>link_layer = Ethernet</code> (RoCEv2)
-      or <code>InfiniBand</code> in <code>Tools → RDMA → RDMA Devices…</code>
-      with <code>state = ACTIVE</code>.</li>
-  <li>For RoCEv2 across two TGs: an IPv4 subnet must be configured on
-      the RDMA NICs and reachable both ways (run <code>ping</code> first).
-      <code>perftest</code> exchanges QP info over a TCP socket on
-      its <code>-p</code> port (default 18515; netgen allocates from
-      18515 upward per concurrent job).</li>
+  <li>perftest + rdma-core are <b>auto-installed</b> by v0.3.12+
+      installs (via <code>install_ostg_complete.py</code> on every
+      path, plus <code>install_dpdk.sh</code> for DPDK hosts).
+      Pre-0.3.12 installs: <code>apt install perftest rdma-core</code>
+      manually — Install Guide §10·m has per-distro one-liners.</li>
+  <li>Open <code>Tools → RDMA → RDMA Devices…</code> for each TG.
+      Confirm each port you intend to use shows
+      <code>state = ACTIVE</code> + <code>link_layer = Ethernet</code>
+      (RoCEv2) or <code>InfiniBand</code>. Bottom of the per-server
+      block should say <code>[ok] perftest &lt;version&gt; present</code>.
+      <span class="muted">(v0.3.13: shows real version e.g.
+      <code>24.04.0-0.41</code> instead of <code>?</code>; shows real
+      MTU per port instead of <code>0 B</code>.)</span></li>
+  <li>For two-TG RoCEv2: an IPv4 subnet must be configured on the
+      RDMA NICs and reachable both ways. <code>ping</code> the peer
+      first. perftest exchanges QP info over a TCP socket on its
+      <code>-p</code> port (default 18515; netgen allocates upward
+      per concurrent job).</li>
 </ol>
 
 <h3>A — Ad-hoc benchmark (Blast a RDMA Flow)</h3>
 <p><code>Tools → RDMA → Blast a RDMA Flow…</code> — the orchestrator
-dialog. Select 1 TG (loopback test) or 2 TGs (first = server,
-second = client), open the dialog, pick devices on each side, pick
-a test (Send / Write / Read × BW / Latency), tweak params, click
-<b>Start</b>. The dialog brokers the handshake and polls live stats
-from both halves. Use this for one-off measurements and quick
-"does perftest work between TG-A and TG-B?" smoke tests.</p>
+dialog. Select <b>1 TG</b> (loopback test) or <b>2 TGs</b>
+(first = server, second = client) in the server tree first, then
+open the dialog. The device combos auto-populate from
+<code>/api/rdma/devices</code> on each selected TG, with per-port
+state badges so you can pick ACTIVE ports at a glance:
+<code>mlx5_3 [Ethernet, 400 Gb/sec (4X NDR), port1=ACTIVE]</code>.
+Pick devices, pick a test (Send / Write / Read × BW / Latency),
+tweak params, click <b>Start</b>. The dialog brokers the handshake
+and polls live stats from both halves every 2 s.</p>
+<p>Non-modal — open multiple to fan out across NIC pairs in parallel.
+Stop is wired end-to-end (lab-verified rc=-15 SIGTERM, pairing
+record dropped on Stop with <code>forget_pair=true</code>).</p>
 
 <h3>B — Per-stream RDMA (Streams tab)</h3>
 <p>For RDMA traffic in the same workflow as your other streams:</p>
 <ol>
-  <li>Add Stream → Runtime Engine tab → set <b>Engine</b> to
-      <code>RDMA (perftest)</code>.</li>
-  <li>RDMA params group becomes visible — fill <b>device</b>,
-      <b>peer address</b> (server-side TG's IP), test type, msg size,
-      QP count, duration, GID index.</li>
+  <li>Add Stream → Runtime Engine tab → set <b>Engine</b> dropdown to
+      <code>RDMA (perftest)</code>. This replaces the legacy
+      <code>Use DPDK</code> checkbox semantics with a 3-way picker
+      (Scapy / DPDK / RDMA).</li>
+  <li>RDMA params group becomes visible below — fill <b>device</b>
+      (e.g. <code>mlx5_3</code>), <b>peer address</b> (server-side
+      TG's IP from the GID list in Devices view), test type, msg
+      size, QP count, duration, GID index.</li>
   <li>Start a perftest <b>server</b> on the peer first (via Blast a
-      RDMA Flow with role=server, or via another stream on the peer).</li>
-  <li>Start your RDMA stream. The server side records it under a
-      <code>handshake_id</code> visible in
-      <code>Tools → RDMA → RDMA Jobs</code>.</li>
+      RDMA Flow with role=server, or via another RDMA stream on the
+      peer TG).</li>
+  <li>Start your RDMA stream. The Streams-tab Engine column renders
+      it in <b>purple</b> as <code>RDMA Send</code> / <code>RDMA Write</code> /
+      <code>RDMA ReadL</code> etc. (distinct from DPDK blue).
+      <code>Tools → RDMA → RDMA Jobs…</code> shows the pairing tagged
+      <code>stream:&lt;your-stream-id&gt;</code>.</li>
 </ol>
 <p class="muted">Limitations of the per-stream RDMA path:
   perftest reports terminal-style stats only (no per-packet TX
-  counter), so the Streams-tab TX bytes/sec shows polled bytes from
-  perftest's data row, refreshed every 2 s — not real-time per-frame
-  data like Scapy/DPDK streams. Latency tests report min / avg / p99.</p>
+  counter), so the Streams-tab TX bytes/sec shows polled bytes
+  synthesised from perftest's data row, refreshed every 2 s — not
+  real-time per-frame data like Scapy/DPDK streams. Latency tests
+  report min / avg / p99 in the Live-stats panel of Blast a RDMA
+  Flow (not the Streams-tab row).</p>
 
-<h3>Common gotchas</h3>
-<ul>
-  <li><b>"Unable to perform connection"</b> from perftest → wrong
-      GID index. Default is 3 (RoCEv2-IPv4 on Mellanox);
-      try 1 (RoCEv1) or 0 (InfiniBand link_layer) if RoCEv2 isn't
-      configured.</li>
-  <li><b>Bandwidth reads as 0</b> → check MTU. Setting <code>-m 5</code>
-      (4096 B) on a NIC whose <code>active_mtu</code> is 2048 fails
-      silently to negotiate. The Devices viewer shows
-      <code>active_mtu</code> per port.</li>
-  <li><b>"Address already in use"</b> on start → another perftest
-      server is bound to that <code>-p</code> port. The orchestrator
-      allocates from 18515 upward but raw <code>perftest</code> launched
-      out-of-band can collide. Stop the stray process and retry.</li>
-</ul>
+<h3>Common pitfalls + which GUI signal surfaces them</h3>
+<table>
+  <tr><th>Symptom in GUI</th><th>Likely cause</th><th>Fix</th></tr>
+  <tr><td>Device combo says "(no RDMA devices)"</td>
+      <td>Kernel missing RDMA support, or container has no
+          <code>/sys/class/infiniband</code> mount</td>
+      <td>Bare metal, or mount sysfs into the container</td></tr>
+  <tr><td><code>[!] perftest tools NOT installed</code> in Devices view</td>
+      <td>Pre-v0.3.12 install OR <code>--no-dpdk</code> with stale
+          installer</td>
+      <td>Upgrade wheel to v0.3.12+, OR
+          <code>apt install perftest</code> manually</td></tr>
+  <tr><td>Device shows <code>MTU: 0 B</code></td>
+      <td>Pre-v0.3.13 server (sysfs <code>active_mtu</code> parser
+          missed the bare IB MTU enum format)</td>
+      <td>Upgrade server wheel to v0.3.13+</td></tr>
+  <tr><td>Devices view says <code>perftest installed (?)</code></td>
+      <td>Pre-v0.3.13 client probed only
+          <code>&lt;tool&gt; --version</code> which returns nothing on
+          newer perftest builds</td>
+      <td>Upgrade client wheel to v0.3.13+ (adds dpkg/rpm/apk fallback)</td></tr>
+  <tr><td>BW reads as 0 mid-test</td>
+      <td>MTU mismatch — picked MTU &gt; <code>active_mtu</code></td>
+      <td>Devices view shows real <code>active_mtu</code> per port
+          (v0.3.13+); pick smaller</td></tr>
+  <tr><td>Error: <code>"Unable to perform connection"</code></td>
+      <td>Wrong GID index for the link_layer</td>
+      <td>Default 3 = RoCEv2-IPv4 on Mellanox; try 1 (RoCEv1) or
+          0 (InfiniBand)</td></tr>
+  <tr><td>Error: <code>"Failed to modify QP to RTR"</code></td>
+      <td>Peer not reachable at L2/L3/RoCEv2 layer (lab-confirmed
+          on cross-subnet test)</td>
+      <td><code>ping</code> the peer; fix routing or use a peer on
+          the same subnet</td></tr>
+  <tr><td>Start fails with <code>"Address already in use"</code></td>
+      <td>Another perftest already bound to that <code>-p</code> port
+          (raw shell launch, not via netgen)</td>
+      <td>Stop the stray process or let netgen allocate a different
+          port (allocator runs from 18515 upward)</td></tr>
+</table>
 
 <h2>Help &amp; reference</h2>
 <p class="muted">Listed in the same order they appear in the Help
