@@ -49,6 +49,16 @@ a = Analysis(
         ('traffic_client', 'traffic_client'),
         ('utils', 'utils'),
         ('server', 'server'),
+        # v0.3.16+: ship install_ostg_complete.py at the bundle root
+        # so Help → Install/Upgrade Server → Fresh Install can find
+        # it via _guess_installer_path()'s first candidate path
+        # (<widgets>/../install_ostg_complete.py, which resolves to
+        # <bundle>/install_ostg_complete.py inside a frozen
+        # PyInstaller app). Without this, the Installer field stays
+        # empty on every .exe install — operator has to download the
+        # file manually from the GitHub repo source, which is
+        # undocumented and version-skew-prone.
+        ('install_ostg_complete.py', '.'),
     ],
     excludes=['backup', 'backup.*', '*.backup.*', '*.tmp', '*.temp'],
     hiddenimports=[
