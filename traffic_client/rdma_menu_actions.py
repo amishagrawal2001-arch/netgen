@@ -275,6 +275,18 @@ class TrafficGenClientRDMAMenuActions:
                             "/sys/class/infiniband mount)"
                         )
                         return
+                    def _fmt_qp(n):
+                        """v0.3.15: pretty-print HCA capability ceilings.
+                        max_qp is typically 6 digits on modern Mellanox;
+                        comma-separated reads better than raw."""
+                        if n is None:
+                            return "?"
+                        if n >= 1_000_000:
+                            return f"{n/1_000_000:.1f}M"
+                        if n >= 1000:
+                            return f"{n:,}"
+                        return str(n)
+
                     lines = []
                     for d in devs:
                         lines.append(
@@ -282,6 +294,24 @@ class TrafficGenClientRDMAMenuActions:
                             f"vendor={d.get('vendor') or '-'}  "
                             f"fw={d.get('fw_version') or '-'}"
                         )
+                        # v0.3.15: HCA capability ceilings from ibv_devinfo
+                        # (max_qp + friends). Reads "(?)" when ibv_devinfo
+                        # isn't installed or perms blocked the probe.
+                        max_qp = d.get("max_qp")
+                        if max_qp is not None or d.get("max_cq") is not None:
+                            lines.append(
+                                f"  HCA caps:  max_qp={_fmt_qp(max_qp)}  "
+                                f"max_qp_wr={_fmt_qp(d.get('max_qp_wr'))}  "
+                                f"max_cq={_fmt_qp(d.get('max_cq'))}  "
+                                f"max_mr={_fmt_qp(d.get('max_mr'))}  "
+                                f"max_pd={_fmt_qp(d.get('max_pd'))}  "
+                                f"max_sge={_fmt_qp(d.get('max_sge'))}"
+                            )
+                        else:
+                            lines.append(
+                                "  HCA caps:  (ibv_devinfo not available "
+                                "— install rdma-core)"
+                            )
                         for p in d.get("ports") or []:
                             gids = p.get("gids") or []
                             lines.append(

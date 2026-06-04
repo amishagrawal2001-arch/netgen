@@ -262,12 +262,25 @@ class RdmaBlastFlowDialog(QDialog):
         form.addRow("Message size:", self._msg_size_spin)
 
         self._qp_count_spin = QSpinBox()
-        self._qp_count_spin.setRange(1, 1024)
+        # v0.3.15: raised 1024 → 131072 to match the typical Mellanox
+        # ConnectX-7 max_qp ceiling (visible per-device in
+        # Tools → RDMA → RDMA Devices). The actual HCA limit varies
+        # per board (CX-7 ~128K, older CX ~256K, irdma smaller); the
+        # GUI cap is a safety net. Operators rarely go above 128 for
+        # real measurement — 1–16 covers most BW tests, 32–128 for
+        # queue saturation. Beyond that you're CPU-bound on the
+        # perftest side before the HCA limit matters.
+        self._qp_count_spin.setRange(1, 131072)
         self._qp_count_spin.setValue(_DEFAULT_QP_COUNT)
         self._qp_count_spin.setToolTip(
             "Parallel QPs (-q). Increase to scale across multiple CPU "
             "cores on the HCA. >1 changes the BW report to per-QP "
-            "totals; check perftest output before interpreting."
+            "totals; check perftest output before interpreting.\n\n"
+            "Practical envelope:\n"
+            "  • 1–16: standard BW scaling\n"
+            "  • 32–128: queue saturation, CPU-bound\n"
+            "  • 256+: synthetic stress; HCA max_qp shown per device "
+            "in Tools → RDMA → RDMA Devices (v0.3.15+)"
         )
         form.addRow("QP count:", self._qp_count_spin)
 

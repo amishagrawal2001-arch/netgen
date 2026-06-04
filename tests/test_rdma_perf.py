@@ -6,6 +6,7 @@ so the suite runs on macOS / Linux without RDMA hardware or rdma-core.
 from __future__ import annotations
 
 import os
+import subprocess
 import threading
 import time
 from unittest import mock
@@ -199,6 +200,186 @@ def test_probe_perftest_version_falls_through_to_dpkg(monkeypatch):
     v = rdma_perf._probe_perftest_version(tools)
     assert v == "24.04.0-0.41"
 
+
+# ─────────────────────────────────────────── _parse_ibv_devinfo (v0.3.15)
+
+_IBV_DEVINFO_SAMPLE = """hca_id: mlx5_0
+        transport:                      InfiniBand (0)
+        fw_ver:                         28.36.1010
+        node_guid:                      8c91:3a03:0045:2f92
+        sys_image_guid:                 8c91:3a03:0045:2f92
+        vendor_id:                      0x02c9
+        vendor_part_id:                 4129
+        hw_ver:                         0x0
+        board_id:                       MT_0000000838
+        phys_port_cnt:                  1
+        max_mr_size:                    0xffffffffffffffff
+        page_size_cap:                  0xfffffffffffff000
+        max_qp:                         262144
+        max_qp_wr:                      32768
+        device_cap_flags:               0x00121c36
+        max_sge:                        30
+        max_sge_rd:                     30
+        max_cq:                         16777216
+        max_cqe:                        4194303
+        max_mr:                         16777216
+        max_pd:                         8388608
+        atomic_cap:                     ATOMIC_HCA (1)
+"""
+
+
+def test_parse_ibv_devinfo_extracts_caps():
+    out = rdma_perf._parse_ibv_devinfo(_IBV_DEVINFO_SAMPLE)
+    assert out["max_qp"] == 262144
+    assert out["max_qp_wr"] == 32768
+    assert out["max_cq"] == 16777216
+    assert out["max_cqe"] == 4194303
+    assert out["max_mr"] == 16777216
+    assert out["max_pd"] == 8388608
+    assert out["max_sge"] == 30
+
+
+def test_parse_ibv_devinfo_ignores_hex_bitfields():
+    """max_mr_size + page_size_cap are 0x... bitfields, not counts —
+    parser must skip them rather than mis-interpret as ints."""
+    out = rdma_perf._parse_ibv_devinfo(_IBV_DEVINFO_SAMPLE)
+    # These keys are NOT in the extraction list at all
+    assert "max_mr_size" not in out
+    assert "page_size_cap" not in out
+
+
+def test_parse_ibv_devinfo_handles_decorated_values():
+    """Some libibverbs builds tag values with '(decoration)' — strip."""
+    blob = "        max_qp:                         262144 (special)"
+    out = rdma_perf._parse_ibv_devinfo(blob)
+    assert out["max_qp"] == 262144
+
+
+def test_parse_ibv_devinfo_empty_returns_all_none():
+    out = rdma_perf._parse_ibv_devinfo("")
+    assert all(v is None for v in out.values())
+    out = rdma_perf._parse_ibv_devinfo(None)  # type: ignore
+    assert all(v is None for v in out.values())
+
+
+def test_parse_ibv_devinfo_missing_fields_stay_none():
+    """Only max_qp present in blob → other fields stay None, not 0."""
+    blob = "        max_qp:                         100\n"
+    out = rdma_perf._parse_ibv_devinfo(blob)
+    assert out["max_qp"] == 100
+    assert out["max_qp_wr"] is None
+    assert out["max_cq"] is None
+    assert out["max_mr"] is None
+
+
+def test_query_ibv_devinfo_graceful_when_binary_missing(monkeypatch):
+    """ibv_devinfo isn't installed on macOS / minimal containers —
+    must return all-None instead of raising."""
+    monkeypatch.setattr(rdma_perf.shutil, "which", lambda _: None)
+    out = rdma_perf._query_ibv_devinfo("mlx5_0")
+    assert all(v is None for v in out.values())
+
+
+def test_query_ibv_devinfo_graceful_when_empty_device_name():
+    out = rdma_perf._query_ibv_devinfo("")
+    assert all(v is None for v in out.values())
+
+
+def test_query_ibv_devinfo_graceful_when_subprocess_raises(monkeypatch):
+    """ibv_devinfo can hang on broken HCAs — subprocess timeout
+    must NOT propagate."""
+    monkeypatch.setattr(rdma_perf.shutil, "which",
+                        lambda _: "/usr/bin/ibv_devinfo")
+
+    def boom(*args, **kw):
+        raise subprocess.TimeoutExpired(cmd="ibv_devinfo", timeout=5)
+    monkeypatch.setattr(rdma_perf.subprocess, "run", boom)
+    out = rdma_perf._query_ibv_devinfo("mlx5_0")
+    assert all(v is None for v in out.values())
+
+
+def test_query_ibv_devinfo_parses_partial_output_on_nonzero_rc(monkeypatch):
+    """Even on rc != 0, partial stdout should be parsed — some HCA
+    failure modes still print useful fields before failing a probe."""
+    monkeypatch.setattr(rdma_perf.shutil, "which",
+                        lambda _: "/usr/bin/ibv_devinfo")
+
+    class FakeRes:
+        returncode = 1
+        stdout = "        max_qp:                         42\n"
+        stderr = ""
+    monkeypatch.setattr(rdma_perf.subprocess, "run",
+                        lambda *a, **kw: FakeRes())
+    out = rdma_perf._query_ibv_devinfo("mlx5_0")
+    assert out["max_qp"] == 42
+
+
+def test_list_rdma_devices_includes_max_qp_when_ibv_devinfo_available(
+    tmp_path, monkeypatch,
+):
+    """End-to-end: synthetic sysfs + mocked ibv_devinfo →
+    list_rdma_devices populates max_qp etc. on the RdmaDevice
+    dataclass."""
+    fake_root = tmp_path / "infiniband"
+    fake_root.mkdir()
+    dev = fake_root / "mlx5_99"
+    dev.mkdir()
+    (dev / "board_id").write_text("MT_TEST\n")
+    (dev / "fw_ver").write_text("99.99\n")
+    (dev / "node_guid").write_text("0000:0000:0000:0001\n")
+    port = dev / "ports" / "1"
+    port.mkdir(parents=True)
+    (port / "state").write_text("4: ACTIVE\n")
+    (port / "phys_state").write_text("5: LinkUp\n")
+    (port / "link_layer").write_text("Ethernet\n")
+    (port / "rate").write_text("400 Gb/sec\n")
+    (port / "active_mtu").write_text("5\n")
+    (port / "lid").write_text("0x0\n")
+    (port / "gids").mkdir()
+
+    monkeypatch.setattr(rdma_perf, "_IB_SYSFS_ROOT", str(fake_root))
+    monkeypatch.setattr(rdma_perf, "_query_ibv_devinfo",
+                        lambda _name: {
+                            "max_qp": 262144,
+                            "max_qp_wr": 32768,
+                            "max_cq": 16777216,
+                            "max_cqe": 4194303,
+                            "max_mr": 16777216,
+                            "max_pd": 8388608,
+                            "max_sge": 30,
+                        })
+    devs = rdma_perf.list_rdma_devices()
+    assert len(devs) == 1
+    d = devs[0]
+    assert d.name == "mlx5_99"
+    assert d.max_qp == 262144
+    assert d.max_qp_wr == 32768
+    assert d.max_cq == 16777216
+    assert d.max_pd == 8388608
+
+
+def test_list_rdma_devices_max_qp_stays_none_when_ibv_devinfo_missing(
+    tmp_path, monkeypatch,
+):
+    """ibv_devinfo binary missing → max_qp etc. land as None;
+    device list still returns successfully."""
+    fake_root = tmp_path / "infiniband"
+    fake_root.mkdir()
+    dev = fake_root / "mlx5_99"
+    dev.mkdir()
+    (dev / "board_id").write_text("MT_TEST\n")
+    (dev / "ports" / "1").mkdir(parents=True)
+
+    monkeypatch.setattr(rdma_perf, "_IB_SYSFS_ROOT", str(fake_root))
+    monkeypatch.setattr(rdma_perf.shutil, "which", lambda _: None)
+
+    devs = rdma_perf.list_rdma_devices()
+    assert len(devs) == 1
+    assert devs[0].max_qp is None
+    assert devs[0].max_cq is None
+
+
+# ─────────────────────────────────────────── continue (perftest version fall-through)
 
 def test_probe_perftest_version_returns_none_when_all_probes_fail(monkeypatch):
     """No --version, no dpkg, no rpm, no apk → return None (don't error;

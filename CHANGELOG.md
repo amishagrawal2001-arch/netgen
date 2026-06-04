@@ -2,6 +2,82 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.3.15] - 2026-06-03
+
+**RDMA HCA capability surfacing + raised QP ceiling.** Triggered by
+the operator question "how many QPs can the current implementation
+support?" — the answer needed both a docs/code change and a real
+hardware-cap surface to be honest.
+
+### What changed
+
+**Server — `utils/rdma_perf.py`**
+- New `_query_ibv_devinfo(device_name)` helper subprocess-calls
+  `ibv_devinfo -v -d <name>` (rdma-core, already a netgen install
+  prereq) and parses the verbose output for 7 capability fields:
+  `max_qp`, `max_qp_wr`, `max_cq`, `max_cqe`, `max_mr`, `max_pd`,
+  `max_sge`. Graceful all-None return when the binary is missing,
+  the subprocess times out, or the device name is empty — never
+  raises into the caller.
+- New `_parse_ibv_devinfo(blob)` pure-string parser; rejects hex
+  bitfields (`max_mr_size`, `page_size_cap`) and strips
+  "decorated" values like `262144 (special)` cleanly.
+- `RdmaDevice` dataclass gains 7 optional cap fields; populated by
+  `list_rdma_devices()` calling `_query_ibv_devinfo` per device.
+  ~30 ms per HCA — serial probe is fine for the 1–16 HCA-per-host
+  range; parallelise via ThreadPoolExecutor if you ever see 64+.
+- `/api/rdma/devices` response now includes the cap fields on
+  every device entry. Field doc'd in API Guide §RDMA.
+
+**Client — `traffic_client/rdma_menu_actions.py`**
+- `RDMA Devices…` viewer renders an "HCA caps" line per device
+  with the 6 visible cap counts, pretty-formatted
+  (`max_qp=262,144  max_cq=16.8M`). Falls back to
+  "(ibv_devinfo not available — install rdma-core)" when the
+  server returned all-None.
+
+**Client — GUI QP-count ceilings**
+- `widgets/rdma_blast_flow_dialog.py` — Blast a RDMA Flow QP-count
+  spinbox: `setRange(1, 1024)` → `setRange(1, 131072)`. Matches
+  typical Mellanox ConnectX-7 `max_qp`. Tooltip updated with the
+  practical envelope (1–16 BW, 32–128 saturation, 256+ stress).
+- `widgets/stream_dialog.py` — per-stream RDMA params QP-count
+  spinbox: same range bump + tooltip pointing at the new RDMA
+  Devices view for the per-HCA cap.
+
+**Help guides**
+- What's New: "0.3.15 highlights — RDMA QP ceiling visibility"
+  block at top.
+- API Guide §RDMA: `/api/rdma/devices` doc updated with the new
+  cap fields contract + graceful-None semantics.
+
+### Tests
+- 11 new tests in `tests/test_rdma_perf.py`:
+  - Parser correctness on the canonical ibv_devinfo blob
+  - Hex bitfield rejection (max_mr_size, page_size_cap)
+  - Decorated-value stripping
+  - Empty / None blob → all-None
+  - Missing-field handling (only max_qp present → siblings stay None)
+  - Binary-missing graceful degrade
+  - Empty device name graceful degrade
+  - Subprocess timeout doesn't propagate
+  - Partial output parsed on rc != 0
+  - End-to-end `list_rdma_devices` integration with mocked sysfs
+    + mocked ibv_devinfo (verifies caps land on the dataclass)
+  - Same integration with ibv_devinfo missing (verifies graceful
+    None pattern at the dataclass layer)
+- RDMA suite total: 70 → 85. Full repo: 1119 → 1130 tests passing.
+
+### Files changed
+- `utils/rdma_perf.py` (parser + helper + dataclass extension)
+- `traffic_client/rdma_menu_actions.py` (RDMA Devices viewer)
+- `widgets/rdma_blast_flow_dialog.py` (QP range + tooltip)
+- `widgets/stream_dialog.py` (3 places: per-stream QP range + API
+  guide §RDMA + What's New highlights block)
+- `tests/test_rdma_perf.py` (11 new tests)
+
+---
+
 ## [0.3.14] - 2026-06-03
 
 **Help-guide refresh — the docs catch up to v0.3.13.** v0.3.13

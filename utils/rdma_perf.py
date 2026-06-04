@@ -116,6 +116,21 @@ class RdmaDevice:
     fw_version: Optional[str]
     node_guid: Optional[str]
     ports: List[RdmaPort]
+    # v0.3.15: device-wide capability ceilings from ibv_devinfo. None
+    # when ibv_devinfo isn't installed, fails (e.g. perms in a
+    # container), or doesn't print the field. Surfaced in
+    # /api/rdma/devices so the GUI can show real HCA limits in the
+    # RDMA Devices viewer + clamp QP-count spinboxes intelligently.
+    # Values are RAW caps reported by libibverbs — actual usable
+    # numbers are typically smaller (memory, CPU bottlenecks hit
+    # first).
+    max_qp: Optional[int] = None        # device-wide QP ceiling
+    max_qp_wr: Optional[int] = None     # per-QP send/recv WR depth
+    max_cq: Optional[int] = None        # device-wide CQ ceiling
+    max_cqe: Optional[int] = None       # per-CQ entry ceiling
+    max_mr: Optional[int] = None        # device-wide MR ceiling
+    max_pd: Optional[int] = None        # device-wide PD ceiling
+    max_sge: Optional[int] = None       # per-WR scatter/gather ceiling
 
 
 @dataclass
@@ -263,6 +278,78 @@ def _parse_active_mtu(raw: Optional[str]) -> int:
     return 0
 
 
+# Fields we extract from ibv_devinfo's verbose output. Each maps to a
+# Python int after stripping the value side. Hex values (max_mr_size,
+# page_size_cap) are intentionally NOT parsed — they're bitfields, not
+# counts, and the GUI doesn't display them.
+_IBV_DEVINFO_INT_FIELDS = (
+    "max_qp", "max_qp_wr", "max_cq", "max_cqe",
+    "max_mr", "max_pd", "max_sge",
+)
+
+
+def _parse_ibv_devinfo(blob: str) -> Dict[str, Optional[int]]:
+    """Pure-string parser for ibv_devinfo -v output.
+
+    Returns a dict with the keys in _IBV_DEVINFO_INT_FIELDS; missing
+    fields land as None. Tolerant of formatting variation:
+      * Field name and value separated by any whitespace
+      * Value may have trailing "(decoration)" — strip and parse the
+        leading integer
+      * Hex values (max_mr_size, page_size_cap) are intentionally
+        NOT in the field list — they're bitfields, not counts
+    """
+    out: Dict[str, Optional[int]] = {k: None for k in _IBV_DEVINFO_INT_FIELDS}
+    if not blob:
+        return out
+    for line in blob.splitlines():
+        m = re.match(r"\s*(\w+)\s*:\s*(\S+)", line)
+        if not m:
+            continue
+        key, val = m.group(1), m.group(2)
+        if key not in _IBV_DEVINFO_INT_FIELDS:
+            continue
+        # Tolerate "262144" and "262144(...)" forms; reject hex.
+        if val.startswith("0x"):
+            continue
+        try:
+            out[key] = int(val.split("(")[0])
+        except (ValueError, TypeError):
+            continue
+    return out
+
+
+def _query_ibv_devinfo(device_name: str) -> Dict[str, Optional[int]]:
+    """Run ``ibv_devinfo -v -d <device>`` and parse out the integer
+    capability fields. Graceful Nones on every failure mode so
+    list_rdma_devices() can't crash on a missing binary or perms
+    error.
+
+    Failure modes handled:
+      * ibv_devinfo binary missing on PATH → all-None
+      * Permission denied (containerised, no rdma group) → all-None
+      * Timeout (rare; ibv_devinfo can hang on a broken HCA) → all-None
+      * Non-zero exit with diagnostic output → parse what we can
+    """
+    empty = {k: None for k in _IBV_DEVINFO_INT_FIELDS}
+    if not device_name:
+        return empty
+    if shutil.which("ibv_devinfo") is None:
+        logger.debug("[rdma] ibv_devinfo not on PATH; max_qp etc. unavailable")
+        return empty
+    try:
+        proc = subprocess.run(
+            ["ibv_devinfo", "-v", "-d", device_name],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        logger.debug(f"[rdma] ibv_devinfo -d {device_name} failed: {exc}")
+        return empty
+    # Even on rc != 0, parse what's in stdout — some failures still
+    # print partial output (e.g. one port down with another up).
+    return _parse_ibv_devinfo(proc.stdout or "")
+
+
 def list_rdma_devices() -> List[RdmaDevice]:
     """Enumerate every RDMA HCA on this host via /sys/class/infiniband.
 
@@ -330,12 +417,27 @@ def list_rdma_devices() -> List[RdmaDevice]:
                     link_layer=link_layer, rate=rate, mtu=mtu, gids=gids, lid=lid,
                 ))
 
+        # v0.3.15: query HCA capability ceilings via ibv_devinfo.
+        # Subprocess cost is ~30 ms per device; serial probe of N
+        # devices = ~N×30 ms. Acceptable for HCA counts in the
+        # 1–16 range typical of single hosts. If a future operator
+        # has 64+ HCAs and this is too slow, parallelise via a
+        # ThreadPoolExecutor in this loop.
+        caps = _query_ibv_devinfo(dev)
+
         devices.append(RdmaDevice(
             name=dev,
             vendor=vendor,
             fw_version=fw_version,
             node_guid=node_guid,
             ports=port_list,
+            max_qp=caps.get("max_qp"),
+            max_qp_wr=caps.get("max_qp_wr"),
+            max_cq=caps.get("max_cq"),
+            max_cqe=caps.get("max_cqe"),
+            max_mr=caps.get("max_mr"),
+            max_pd=caps.get("max_pd"),
+            max_sge=caps.get("max_sge"),
         ))
     return devices
 

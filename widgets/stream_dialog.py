@@ -1172,20 +1172,28 @@ companion — see §20.</p>
       <td>Server-side DPDK + tx_worker install. Async; tail via
           <code>/api/admin/install_dpdk/log</code>.</td></tr>
 
-  <tr><th colspan="3" style="background:#fef9c3;">RDMA / perftest (v0.3.12, hardened in v0.3.13)</th></tr>
+  <tr><th colspan="3" style="background:#fef9c3;">RDMA / perftest (v0.3.12, hardened in v0.3.13, HCA caps in v0.3.15)</th></tr>
   <tr><td class="method">GET</td> <td><code>/api/rdma/devices</code></td>
-      <td>Enumerate RDMA HCAs via <code>/sys/class/infiniband</code>.
-          Returns per-port state, link_layer (Ethernet vs InfiniBand),
-          rate, active MTU, GIDs. Empty list when no RDMA support —
-          not an error.
+      <td>Enumerate RDMA HCAs via <code>/sys/class/infiniband</code> +
+          <code>ibv_devinfo -v -d &lt;dev&gt;</code>. Returns per-port
+          state, link_layer (Ethernet vs InfiniBand), rate, active
+          MTU, GIDs. Empty list when no RDMA support — not an error.
           <br/><b>MTU contract (v0.3.13):</b> the <code>mtu</code> field
           is always BYTES (e.g. 1024, 4096) regardless of how the
           kernel writes <code>active_mtu</code>. Modern Mellanox /
           mlx5 5.x+ kernels write a bare IB MTU enum digit
           (<code>1</code> → 256 B … <code>5</code> → 4096 B per IBA
-          §3.5.3); v0.3.12 returned 0 for these. v0.3.13 normalises
-          all three sysfs formats (bare enum, "enum: bytes", raw
-          bytes) to a single bytes value.</td></tr>
+          §3.5.3); v0.3.12 returned 0 for these.
+          <br/><b>HCA caps (v0.3.15):</b> each device entry now
+          carries <code>max_qp</code>, <code>max_qp_wr</code>,
+          <code>max_cq</code>, <code>max_cqe</code>,
+          <code>max_mr</code>, <code>max_pd</code>,
+          <code>max_sge</code> — raw libibverbs caps from
+          <code>ibv_devinfo</code>. <code>None</code> when ibv_devinfo
+          isn't installed or perms blocked the probe (graceful
+          degrade; rest of the device payload is unaffected).
+          Surfaced in <code>Tools → RDMA → RDMA Devices…</code> as a
+          "HCA caps" line per device.</td></tr>
   <tr><td class="method">GET</td> <td><code>/api/rdma/perftest/installed</code></td>
       <td>Probe PATH for <code>ib_send_bw</code>, <code>ib_write_bw</code>,
           <code>ib_read_bw</code>, and their <code>_lat</code> siblings.
@@ -3273,6 +3281,39 @@ _FEATURE_GUIDE_HTML = r"""
 <p class="muted">A tour of the user-visible features added since 0.2.41,
 organised so the menu / tab where you'll find each one is obvious. For
 the REST endpoint signatures see <strong>Help → API Guide</strong>.</p>
+
+<h2><span class="ver new">0.3.15</span> highlights — RDMA QP ceiling visibility</h2>
+<p>Operators kept asking "how many QPs can my HCA actually handle?"
+The GUI had no answer — both Blast a RDMA Flow and the per-stream
+RDMA params capped at 1024 (a netgen-side guess) and the device
+viewer didn't show the hardware's real <code>max_qp</code>. Now it
+does:</p>
+<ul>
+  <li><b>HCA caps shown per device</b> in
+      <code>Tools → RDMA → RDMA Devices…</code> — new line per HCA:
+      <code>HCA caps: max_qp=262,144 max_qp_wr=32,768 max_cq=16.8M
+      max_mr=16.8M max_pd=8.4M max_sge=30</code>. Pulled from
+      <code>ibv_devinfo -v -d &lt;dev&gt;</code>, ~30 ms per probe.
+      Graceful "(ibv_devinfo not available)" when the binary isn't
+      installed or perms blocked the probe.</li>
+  <li><b>GUI QP-count ceiling raised 1024 → 131,072</b> in both
+      Blast a RDMA Flow + per-stream RDMA params. Matches typical
+      Mellanox ConnectX-7 <code>max_qp</code>. Operators who
+      legitimately want to stress test 64K+ QPs no longer have to
+      patch source.</li>
+  <li><b>New API field set</b> in <code>/api/rdma/devices</code>:
+      each device dict now carries <code>max_qp</code> plus 6
+      sibling cap fields. See API Guide for the full schema.</li>
+  <li><b>11 new tests</b> cover the parser (hex bitfield ignored,
+      decorated values stripped, partial output preserved across rc
+      ≠ 0), graceful failure paths (binary missing, subprocess
+      timeout, empty device name), and the end-to-end integration
+      via <code>list_rdma_devices</code> with mocked sysfs + mocked
+      ibv_devinfo.</li>
+</ul>
+<p class="muted">Practical envelope reminder: 1–16 QPs covers most
+BW tests, 32–128 for queue saturation, 256+ is synthetic stress.
+The new GUI ceiling is a safety net, not a recommendation.</p>
 
 <h2><span class="ver fix">0.3.13</span> highlights — RDMA parser fixes (lab-verified)</h2>
 <p>Two parsing gaps from v0.3.12 surfaced during bring-up on a
@@ -5550,8 +5591,16 @@ class AddStreamDialog(QDialog):
         rdma_form.addRow("Message size (-s):", self.rdma_msg_size_spin)
 
         self.rdma_qp_count_spin = QSpinBox()
-        self.rdma_qp_count_spin.setRange(1, 1024)
+        # v0.3.15: raised 1024 → 131072 to match the typical Mellanox
+        # ConnectX-7 max_qp ceiling. See Tools → RDMA → RDMA Devices
+        # for the per-HCA max_qp on your hardware.
+        self.rdma_qp_count_spin.setRange(1, 131072)
         self.rdma_qp_count_spin.setValue(1)
+        self.rdma_qp_count_spin.setToolTip(
+            "Parallel QPs (-q). 1–16 typical for BW; 32–128 for "
+            "queue saturation. Per-HCA max_qp visible in Tools → "
+            "RDMA → RDMA Devices (v0.3.15+)."
+        )
         rdma_form.addRow("QP count (-q):", self.rdma_qp_count_spin)
 
         self.rdma_duration_spin = QSpinBox()
