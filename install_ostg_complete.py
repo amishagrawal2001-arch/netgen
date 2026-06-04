@@ -606,7 +606,7 @@ class NetgenInstaller:
             if update_result.returncode != 0:
                 self.log("apt-get update had some issues after adding PPA, but continuing...", "WARNING")
             self.run_command("apt-get install -y python3.10 python3.10-venv python3.10-dev python3.10-distutils")
-            self.run_command("curl -sS https://bootstrap.pypa.io/get-pip.py | python3.10")
+            self._bootstrap_pip_for_python310()
         elif self.system_info["package_manager"] == "dnf":
             self.run_command("dnf install -y python3.10 python3.10-pip python3.10-devel")
         elif self.system_info["package_manager"] == "yum":
@@ -624,7 +624,93 @@ class NetgenInstaller:
         else:
             self.log("Failed to install Python 3.10", "ERROR")
             sys.exit(1)
-            
+
+    def _bootstrap_pip_for_python310(self):
+        """Install pip for the freshly-installed python3.10 interpreter.
+
+        Replaces the historical ``curl get-pip.py | python3.10`` one-liner,
+        which fails on Ubuntu 24.04 (Noble) with:
+
+            error: uninstall-no-record-file
+            × Cannot uninstall packaging 24.0
+            ╰─> The package's contents are unknown:
+                no RECORD file was found for packaging.
+            hint: The package was installed by debian.
+
+        Root cause: get-pip.py downloads the latest pip + wheel + a
+        bundled ``packaging`` and tries to UNINSTALL whatever it finds on
+        sys.path first. On Noble the system ships ``python3-packaging``
+        24.0 from apt — Debian-managed packages have no RECORD file
+        (pip's safety check) so the uninstall step refuses, aborting
+        the entire bootstrap. Reported in the field on the v0.3.16
+        SFTP+heartbeat fresh-install path.
+
+        Strategy (most-likely-to-work first):
+
+        1. ``python3.10 -m ensurepip --upgrade --default-pip`` — stdlib
+           bootstrapper bundled with ``python3.10-venv`` (already
+           installed by the previous apt line). No network needed.
+           Lands a working pip without touching the system packaging.
+
+        2. ``curl get-pip.py | python3.10 - --ignore-installed`` — the
+           old path with the ONE flag that suppresses the broken
+           uninstall step. Pip installs its own ``packaging`` /
+           ``wheel`` alongside the apt-managed copies; site-packages
+           order resolves the conflict per interpreter (python3.10's
+           site-packages takes precedence for ``python3.10``).
+
+        Either branch ends with a sanity check (``python3.10 -m pip
+        --version``) so callers see a clean ERROR if both bootstrap
+        paths fail rather than a cryptic later import failure.
+        """
+        self.log("Bootstrapping pip for python3.10...")
+        # Path 1: ensurepip. Fast, offline, no Debian-uninstall trap.
+        r = self.run_command(
+            "python3.10 -m ensurepip --upgrade --default-pip",
+            check=False, capture_output=True,
+        )
+        if r.returncode == 0:
+            self.log("  ✓ pip installed via ensurepip")
+        else:
+            self.log(
+                f"  ensurepip failed (rc={r.returncode}); "
+                f"falling back to get-pip.py --ignore-installed",
+                "WARNING",
+            )
+            # Path 2: get-pip.py BUT with --ignore-installed so pip
+            # doesn't try to uninstall the Debian-managed packaging.
+            r2 = self.run_command(
+                "curl -sS https://bootstrap.pypa.io/get-pip.py "
+                "| python3.10 - --ignore-installed",
+                check=False,
+            )
+            if r2.returncode != 0:
+                self.log(
+                    f"Both pip-bootstrap paths failed (ensurepip rc="
+                    f"{r.returncode}, get-pip.py rc={r2.returncode}). "
+                    "Install pip for python3.10 manually:\n"
+                    "  sudo apt install -y python3.10-pip   # or\n"
+                    "  sudo python3.10 -m ensurepip --upgrade",
+                    "ERROR",
+                )
+                sys.exit(1)
+            self.log("  ✓ pip installed via get-pip.py --ignore-installed")
+
+        # Sanity check — pip is callable from python3.10.
+        chk = self.run_command(
+            "python3.10 -m pip --version",
+            check=False, capture_output=True,
+        )
+        if chk.returncode == 0:
+            self.log(f"  ✓ {chk.stdout.strip()}")
+        else:
+            self.log(
+                f"pip bootstrapped but `python3.10 -m pip --version` "
+                f"failed (rc={chk.returncode}). stderr={chk.stderr!r}",
+                "ERROR",
+            )
+            sys.exit(1)
+
     def _fix_apt_gpg_keys(self):
         """Fix missing GPG keys for apt repositories"""
         self.log("Checking and fixing GPG keys for apt repositories...")
