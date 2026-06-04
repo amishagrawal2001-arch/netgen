@@ -469,7 +469,16 @@ step_install_dependencies() {
     # rebuild vfio-pci or to compile out-of-tree NIC PMD modules at runtime.
     # Cheap to install (~80 MB) and silent no-op when already present.
     local kernel_headers="linux-headers-$(uname -r 2>/dev/null || echo generic)"
-    local deps_install_cmd="apt-get install -y --option Acquire::http::Timeout=30 --option Acquire::ftp::Timeout=30 build-essential meson ninja-build pkg-config libnuma-dev libelf-dev libpcap-dev libibverbs-dev libmlx5-dev rdma-core perftest ${kernel_headers}"
+    # v0.3.16: pass dpkg --force-confdef + --force-confold so that an
+    # apt-get install never hangs on a CONFFILE prompt for a package
+    # whose default config differs from the system's existing copy.
+    # Without these flags, packages like containerd.io (whose
+    # /etc/containerd/config.toml conflicts with whatever the host
+    # had before) trigger an interactive dpkg prompt that EOFs in
+    # any nohup-detached install context. The DEBIAN_FRONTEND env
+    # var alone does NOT cover dpkg's own conffile prompt; the
+    # Dpkg::Options::= flags are mandatory for it.
+    local deps_install_cmd="DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold --option Acquire::http::Timeout=30 --option Acquire::ftp::Timeout=30 build-essential meson ninja-build pkg-config libnuma-dev libelf-dev libpcap-dev libibverbs-dev libmlx5-dev rdma-core perftest ${kernel_headers}"
     
     # v0.3.2: tighten umask around the temp-log tee so the file is
     # 0600 (owner-only) instead of the default 0644 (world-readable).

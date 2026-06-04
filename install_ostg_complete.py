@@ -258,10 +258,79 @@ class NetgenInstaller:
     def copy_file(self, local_path: str, remote_path: str):
         """Copy file to remote host"""
         if self.remote_install:
-            subprocess.run(f"sshpass -p '{self.remote_pass}' scp {local_path} {self.remote_user}@{self.remote_host}:{remote_path}", 
+            subprocess.run(f"sshpass -p '{self.remote_pass}' scp {local_path} {self.remote_user}@{self.remote_host}:{remote_path}",
                           shell=True, check=True)
         else:
             shutil.copy2(local_path, remote_path)
+
+    # ─────────────────────────────────────── apt helpers (v0.3.16+)
+    #
+    # Standard non-interactive incantation for apt-get install. Always
+    # use this wrapper, never bare `apt-get install -y`, because the
+    # `-y` flag does NOT cover all interactive prompts dpkg can throw.
+    # Specifically, dpkg's CONFFILE prompt (when a package's default
+    # config differs from a file on the system that was created by
+    # you or a previous install) is NOT controlled by
+    # DEBIAN_FRONTEND/UCF_FORCE_CONFFNEW — only by the
+    # `--force-confdef` / `--force-confold` dpkg flags passed via
+    # apt's `Dpkg::Options::=` mechanism.
+    #
+    # Triggering trace this method was born from (v0.3.16 fresh
+    # install on Ubuntu 24.04 Noble):
+    #
+    #   Setting up containerd.io ...
+    #   Configuration file '/etc/containerd/config.toml'
+    #     ==> File on system created by you or by a script.
+    #     ==> File also in package provided by package maintainer.
+    #       What would you like to do about it?
+    #   *** config.toml (Y/I/N/O/D/Z) [default=N] ?
+    #   dpkg: error processing package containerd.io (--configure):
+    #     end of file on stdin at conffile prompt
+    #   E: Sub-process /usr/bin/dpkg returned an error code (1)
+    #
+    # The `nohup`-detached install has no tty, so dpkg saw EOF on
+    # stdin and bailed. The fix is the `Dpkg::Options::=--force-*`
+    # flags below, which tell dpkg to auto-resolve conffile conflicts
+    # without prompting:
+    #   --force-confdef: if the diff is in the maintainer's defaults
+    #                    only (no local edits), take the new version
+    #   --force-confold: if there ARE local edits, preserve them
+    # Combined: a safe non-interactive default that respects operator
+    # customizations.
+    _APT_DPKG_FLAGS = (
+        "-o Dpkg::Options::=--force-confdef "
+        "-o Dpkg::Options::=--force-confold"
+    )
+
+    def _apt_install(self, packages: str, *, check: bool = True,
+                     extra_opts: str = ""):
+        """``apt-get install -y`` with the full non-interactive set.
+
+        Always use this instead of bare ``apt-get install -y`` so
+        the dpkg conffile prompt can never EOF-fail a non-interactive
+        install.
+
+        Args:
+          packages: space-separated package list (e.g. "docker-ce
+                    containerd.io"). Pass exactly the same string
+                    you'd pass to ``apt-get install``.
+          check:    same semantics as ``run_command`` — raise on rc≠0
+                    when True.
+          extra_opts: appended verbatim before the package list, for
+                    callers that need their own --option flags (e.g.
+                    Acquire timeouts).
+
+        ``run_command`` already exports DEBIAN_FRONTEND=noninteractive
+        in env, so we don't need to prepend it here. The dpkg flags
+        do need to be on the apt command line.
+        """
+        cmd = (
+            f"apt-get install -y {self._APT_DPKG_FLAGS} "
+            f"{extra_opts} {packages}"
+        ).strip()
+        # Collapse any double-spaces from empty extra_opts.
+        cmd = " ".join(cmd.split())
+        return self.run_command(cmd, check=check)
             
     def install_system_dependencies(self):
         """Install system dependencies based on the detected OS"""
@@ -341,9 +410,8 @@ class NetgenInstaller:
         self.log("Installing RDMA userspace + perftest (for Tools → RDMA)...")
         if pm == "apt":
             self._wait_for_apt_lock()
-            self.run_command(
-                "apt-get install -y perftest rdma-core "
-                "libibverbs-dev libmlx5-dev",
+            self._apt_install(
+                "perftest rdma-core libibverbs-dev libmlx5-dev",
                 check=False,
             )
         elif pm in ("dnf", "yum"):
@@ -425,7 +493,7 @@ class NetgenInstaller:
                 update_result = self.run_command(f"apt-get update", check=False)
                 if update_result.returncode != 0:
                     self.log("apt-get update had some issues, but continuing...", "WARNING")
-                self.run_command(f"apt-get install -y {' '.join(packages_to_install)}")
+                self._apt_install(" ".join(packages_to_install))
             except subprocess.CalledProcessError as e:
                 self.log(f"Package installation encountered issues: {e}", "WARNING")
                 # Try to fix broken packages
@@ -434,7 +502,7 @@ class NetgenInstaller:
                     self.log("Some packages may have dependency issues (e.g., NVIDIA drivers)", "WARNING")
                     self.log("This is usually non-critical. Continuing with installation...", "WARNING")
                 # Try installation again, but don't fail if it still has issues
-                retry_result = self.run_command(f"apt-get install -y {' '.join(packages_to_install)}", check=False)
+                retry_result = self._apt_install(" ".join(packages_to_install), check=False)
                 if retry_result.returncode != 0:
                     self.log("Some system packages could not be installed due to dependency conflicts", "WARNING")
                     self.log("This may be due to NVIDIA driver conflicts. Continuing with OSTG installation...", "WARNING")
@@ -600,12 +668,12 @@ class NetgenInstaller:
             update_result = self.run_command("apt-get update", check=False)
             if update_result.returncode != 0:
                 self.log("apt-get update had some issues, but continuing...", "WARNING")
-            self.run_command("apt-get install -y software-properties-common")
+            self._apt_install("software-properties-common")
             self.run_command("add-apt-repository -y ppa:deadsnakes/ppa")
             update_result = self.run_command("apt-get update", check=False)
             if update_result.returncode != 0:
                 self.log("apt-get update had some issues after adding PPA, but continuing...", "WARNING")
-            self.run_command("apt-get install -y python3.10 python3.10-venv python3.10-dev python3.10-distutils")
+            self._apt_install("python3.10 python3.10-venv python3.10-dev python3.10-distutils")
             self._bootstrap_pip_for_python310()
         elif self.system_info["package_manager"] == "dnf":
             self.run_command("dnf install -y python3.10 python3.10-pip python3.10-devel")
@@ -769,12 +837,19 @@ class NetgenInstaller:
                 # Try to fix GPG keys again and retry
                 self._fix_apt_gpg_keys()
                 self.run_command("apt-get update", check=False)
-            self.run_command("apt-get install -y ca-certificates curl gnupg lsb-release")
+            self._apt_install("ca-certificates curl gnupg lsb-release")
             self.run_command("mkdir -p /etc/apt/keyrings")
             self.run_command("curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg")
             self.run_command('echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null')
             self.run_command("apt-get update")
-            self.run_command("apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin")
+            # THIS was the v0.3.16 fresh-install failure site —
+            # containerd.io's config.toml conffile diff produced an
+            # interactive prompt that EOF'd the non-tty install.
+            # _apt_install adds --force-confdef + --force-confold to
+            # auto-resolve.
+            self._apt_install(
+                "docker-ce docker-ce-cli containerd.io docker-compose-plugin"
+            )
         elif self.system_info["package_manager"] == "dnf":
             # Fedora Docker installation
             self.run_command("dnf install -y dnf-plugins-core")
