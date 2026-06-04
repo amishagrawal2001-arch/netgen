@@ -1891,6 +1891,10 @@ WantedBy=timers.target
 
         self.log("✓ SSH connection successful")
 
+        # v0.3.16+: pre-flight self-heal — same as install_local().
+        # See _heal_dpkg_state docstring for full rationale.
+        self._heal_dpkg_state()
+
         # Run installation steps
         self.cleanup_old_install()
         self.install_system_dependencies()
@@ -1910,6 +1914,116 @@ WantedBy=timers.target
         self.verify_installation()
         self.test_frr_functionality()
 
+    def _heal_dpkg_state(self):
+        """Auto-recover from a half-configured dpkg state left by a
+        prior aborted install.
+
+        Context: when a previous install hit the dpkg conffile prompt
+        (the bug we fixed in v0.3.16) and bailed, apt left packages
+        stuck in 'iU' / 'iF' / half-configured limbo. Subsequent
+        ``apt-get install`` calls on those packages fail with
+        ``Internal Error, No file name for <pkg>:amd64`` because
+        apt's cache is out of sync with dpkg's state. The package
+        manager can't recover from this with ``--reinstall`` alone —
+        the half-state must be cleared first via
+        ``dpkg --remove --force-all`` before apt can install fresh.
+
+        This pre-flight detects the half-state and recovers
+        automatically so the operator never has to SSH in and run
+        recovery commands manually. Observed on svl-d-ai-srv04 in
+        the field — operator had a half-installed docker stack from
+        a pre-v0.3.16 install and netgen-server.service refused to
+        start (Requires=docker.service failed).
+
+        Recovery sequence:
+          1. ``dpkg --audit`` — what's half-configured?
+          2. Force-remove the docker stack (most likely culprit)
+          3. ``dpkg --configure -a --force-confdef --force-confold`` —
+             complete any other half-states non-interactively
+          4. ``apt-get clean`` + ``apt-get update`` — refresh metadata
+          5. Re-audit; warn if anything still broken but proceed
+             (main install path will get one more chance to recover
+             via its own --force-conf flags)
+
+        Idempotent + side-effect-light when dpkg is clean: just an
+        audit call that returns quickly with empty output.
+        """
+        pm = self.system_info["package_manager"]
+        if pm != "apt":
+            # Only apt has the conffile-prompt failure mode. dnf/yum
+            # use a different prompt mechanism with its own resolution.
+            return
+
+        audit = self.run_command(
+            "dpkg --audit", check=False, capture_output=True,
+        )
+        audit_out = ((audit.stdout or "") + (audit.stderr or "")).strip()
+        if not audit_out:
+            # Clean state — skip recovery entirely (the common case
+            # on every install except retries after a pre-v0.3.16
+            # conffile-prompt failure).
+            self.log("dpkg state clean (no half-configured packages)")
+            return
+
+        self.log(
+            "Detected packages in half-configured state from a prior "
+            "aborted install — auto-recovering before proceeding...",
+            "WARNING",
+        )
+        self.log(f"dpkg --audit:\n{audit_out}", "WARNING")
+
+        # Step 1: clean apt cache so it can re-fetch on the next install.
+        # The cache mismatch is what produces "Internal Error, No file
+        # name for <pkg>".
+        self._wait_for_apt_lock()
+        self.run_command("apt-get clean", check=False)
+
+        # Step 2: force-remove the docker stack. Safe because
+        # install_docker() will reinstall it cleanly later — the goal
+        # here is to clear the half-state, not preserve any of it.
+        # If docker isn't in the audit, this is a fast no-op.
+        docker_pkgs = (
+            "containerd.io docker-ce docker-ce-cli "
+            "docker-buildx-plugin docker-ce-rootless-extras "
+            "docker-compose-plugin"
+        )
+        self.log("Removing half-configured docker stack (will reinstall)...")
+        self.run_command(
+            f"dpkg --remove --force-all {docker_pkgs}",
+            check=False,
+        )
+
+        # Step 3: tell dpkg to finish configuring anything else that's
+        # stuck. The --force-confdef + --force-confold flags suppress
+        # the original conffile prompt that aborted the prior install.
+        self.run_command(
+            "DEBIAN_FRONTEND=noninteractive dpkg --configure -a "
+            "--force-confdef --force-confold",
+            check=False,
+        )
+
+        # Step 4: refresh apt metadata so the upcoming installs can
+        # find packages cleanly.
+        self._wait_for_apt_lock()
+        self.run_command("apt-get update", check=False)
+
+        # Step 5: re-audit and log final state. If anything still
+        # stuck, surface a WARNING but proceed — install_system_
+        # dependencies / install_docker each have their own retry
+        # logic that may pick up the slack.
+        audit2 = self.run_command(
+            "dpkg --audit", check=False, capture_output=True,
+        )
+        out2 = ((audit2.stdout or "") + (audit2.stderr or "")).strip()
+        if out2:
+            self.log(
+                "Some packages still half-configured after recovery — "
+                "main install path will attempt to finish them:\n" + out2,
+                "WARNING",
+            )
+        else:
+            self.log("✓ dpkg state recovered cleanly", "INFO")
+
     def install_local(self):
         """Install Netgen locally."""
         self.log(f"Installing {PRODUCT_NAME} locally...")
@@ -1918,6 +2032,17 @@ WantedBy=timers.target
         if os.geteuid() != 0:
             self.log("This script must be run as root for local installation", "ERROR")
             sys.exit(1)
+
+        # v0.3.16+: pre-flight self-heal. Detects + recovers from a
+        # half-configured dpkg state left by a prior aborted install
+        # (the conffile-prompt bug we fixed in this release). Without
+        # this, a retry of Fresh Install on a previously-failed host
+        # would fail again on `apt-get install` because of stuck
+        # packages — even though the v0.3.16 conffile fix would have
+        # prevented the original failure. Auto-recovery means the
+        # operator can just click Fresh Install again and the
+        # installer fixes the prior mess.
+        self._heal_dpkg_state()
 
         # Run installation steps
         self.cleanup_old_install()
