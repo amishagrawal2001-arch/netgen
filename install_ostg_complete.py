@@ -302,6 +302,65 @@ class NetgenInstaller:
         "-o Dpkg::Options::=--force-confold"
     )
 
+    def _install_apt_keyring(self, name: str, key_url: str,
+                             *, check: bool = True) -> None:
+        """Download an apt repository signing key + dearmor it into
+        ``/etc/apt/keyrings/<name>.gpg``.
+
+        v0.3.16+: replaces the historical
+        ``curl -fsSL <url> | gpg --dearmor -o ...`` one-liner, which
+        fails in a nohup-detached install with:
+
+            gpg: cannot open '/dev/tty': No such device or address
+            subprocess.CalledProcessError: ... returned non-zero exit
+            status 2.
+
+        Root cause: modern GnuPG 2.x defaults to interactive mode and
+        touches ``/dev/tty`` for pinentry even on operations like
+        ``--dearmor`` that don't need a passphrase. With no
+        controlling terminal (nohup detached), the open fails and
+        gpg exits 2.
+
+        Secondary problem: the original pipe ``curl | gpg`` returned
+        gpg's exit code, not curl's. A failed curl (network blip,
+        404 on the key URL) would still produce an empty .gpg file
+        and the next ``apt-get update`` would silently fail with
+        ``NO_PUBKEY`` instead of pointing at the real cause.
+
+        Fix:
+          1. Download key to a tmp file (curl failure surfaces here)
+          2. Dearmor with --batch --no-tty (never touches /dev/tty)
+          3. chmod the keyring to 0644 (apt's expected permissions)
+          4. Clean up the tmp file
+        """
+        keyring = f"/etc/apt/keyrings/{name}.gpg"
+        tmp = f"/tmp/.netgen-apt-key-{name}.asc"
+        self.run_command("mkdir -p /etc/apt/keyrings", check=check)
+        # Step 1: download. curl -f causes non-zero exit on HTTP
+        # errors; without it a 404 would silently produce an HTML
+        # error-page file that gpg would happily "dearmor" into
+        # garbage.
+        self.run_command(
+            f"curl -fsSL {key_url} -o {tmp}", check=check,
+        )
+        # Step 2: dearmor with the flags that suppress the
+        # /dev/tty + pinentry interaction.
+        #   --batch + --no-tty: never touch the terminal
+        #   --yes: don't prompt on existing output file
+        # Remove any stale keyring first so --yes never has to
+        # decide (some older gpg builds prompt on overwrite even
+        # with --yes if --batch is missing).
+        self.run_command(f"rm -f {keyring}", check=False)
+        self.run_command(
+            f"gpg --batch --no-tty --yes --dearmor -o {keyring} {tmp}",
+            check=check,
+        )
+        # Step 3: apt's expected perms — group-readable so
+        # _apt non-root user (when present) can read.
+        self.run_command(f"chmod 0644 {keyring}", check=False)
+        # Step 4: cleanup. Not catastrophic if it fails.
+        self.run_command(f"rm -f {tmp}", check=False)
+
     def _apt_install(self, packages: str, *, check: bool = True,
                      extra_opts: str = ""):
         """``apt-get install -y`` with the full non-interactive set.
@@ -787,13 +846,18 @@ class NetgenInstaller:
         result = self.run_command("grep -r 'repos.influxdata.com' /etc/apt/sources.list /etc/apt/sources.list.d/ 2>/dev/null", check=False, capture_output=True)
         if result.returncode == 0 and "influxdata" in result.stdout.lower():
             self.log("InfluxData repository detected, adding GPG key...")
-            # Add InfluxData GPG key using modern method (preferred for Ubuntu 22.04+)
-            self.run_command("mkdir -p /etc/apt/keyrings", check=False)
-            influx_key_cmd = "curl -fsSL https://repos.influxdata.com/influxdb.key | gpg --dearmor -o /etc/apt/keyrings/influxdb.gpg"
-            key_result = self.run_command(influx_key_cmd, check=False)
-            if key_result.returncode == 0:
+            # v0.3.16+: was an inline `curl | gpg --dearmor` pipe that
+            # fails in nohup-detached installs with `gpg: cannot open
+            # '/dev/tty'`. _install_apt_keyring adds --batch --no-tty
+            # + curl-failure-surfacing.
+            try:
+                self._install_apt_keyring(
+                    "influxdb",
+                    "https://repos.influxdata.com/influxdb.key",
+                    check=True,
+                )
                 self.log("✓ InfluxData GPG key added successfully")
-            else:
+            except subprocess.CalledProcessError:
                 # Try legacy method as fallback (for older Ubuntu versions)
                 self.log("Trying legacy method for InfluxData GPG key...", "WARNING")
                 legacy_cmd = "curl -fsSL https://repos.influxdata.com/influxdb.key | apt-key add -"
@@ -838,8 +902,16 @@ class NetgenInstaller:
                 self._fix_apt_gpg_keys()
                 self.run_command("apt-get update", check=False)
             self._apt_install("ca-certificates curl gnupg lsb-release")
-            self.run_command("mkdir -p /etc/apt/keyrings")
-            self.run_command("curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg")
+            # v0.3.16+: was an inline `curl | gpg --dearmor` pipe
+            # that failed in nohup-detached installs with
+            # `gpg: cannot open '/dev/tty': No such device or
+            # address`. _install_apt_keyring adds the --batch
+            # --no-tty flags and downloads-then-dearmors so curl
+            # failures surface cleanly.
+            self._install_apt_keyring(
+                "docker",
+                "https://download.docker.com/linux/ubuntu/gpg",
+            )
             self.run_command('echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" | tee /etc/apt/sources.list.d/docker.list > /dev/null')
             self.run_command("apt-get update")
             # THIS was the v0.3.16 fresh-install failure site —
