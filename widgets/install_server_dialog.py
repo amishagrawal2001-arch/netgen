@@ -434,6 +434,50 @@ class SshInstallWorker(QThread):
     def stop(self) -> None:
         self._stop = True
 
+    def _sftp_makedirs(self, sftp, remote_dir: str) -> None:
+        """``mkdir -p`` equivalent for SFTP — create remote_dir and any
+        missing ancestors.
+
+        ``paramiko.SFTPClient.mkdir`` has no -p semantics; calling
+        ``mkdir('/tmp/netgen_install/resources/dpdk')`` when
+        ``/tmp/netgen_install/resources`` doesn't exist yet raises
+        ``IOError`` / ``FileNotFoundError`` — and the caller's
+        ``except IOError: pass`` swallows it silently. Subsequent
+        ``sftp.put`` calls into the non-existent dir then fail with
+        ``[Errno 2] No such file``, which is exactly the symptom an
+        operator reported on Fresh Install (recursive upload of
+        ``resources/dpdk/`` failed because its parent
+        ``resources/`` was never created).
+
+        Walks the path components one at a time, calling mkdir on
+        each. Swallowing IOError on each one preserves the
+        "already-exists is fine" semantics while ensuring missing
+        ancestors get created.
+        """
+        # Normalise: strip duplicate / and trailing slash; force
+        # absolute (relative SFTP paths land in the SSH user's $HOME
+        # which silently breaks the layout the installer expects).
+        parts = [p for p in remote_dir.split("/") if p]
+        if not remote_dir.startswith("/"):
+            # Defensive — every caller in this file passes an
+            # absolute /tmp/... path but ensure we don't accidentally
+            # split a relative path differently.
+            parts = parts
+        current = "/" if remote_dir.startswith("/") else ""
+        for part in parts:
+            current = (current + "/" + part) if current and current != "/" \
+                      else current + part
+            try:
+                sftp.mkdir(current)
+            except IOError:
+                # Already exists OR permission denied — let the next
+                # iteration's mkdir (or the eventual put) be the
+                # authoritative failure signal. IOError covers both
+                # paramiko's old-style and Python-3's
+                # FileExistsError/PermissionError (subclasses of OSError
+                # which is aliased to IOError in Py3).
+                pass
+
     def _sftp_put_tree(self, sftp, local_dir: str, remote_dir: str) -> None:
         """Recursively sftp-upload `local_dir` to `remote_dir`.
 
@@ -442,15 +486,20 @@ class SshInstallWorker(QThread):
         (no __pycache__ / *.pyc). Files are uploaded one at a time —
         paramiko's sftp.put doesn't have a recursive mode.
 
+        v0.3.16-fix: uses ``_sftp_makedirs`` for parent-aware mkdir
+        so a deeply-nested remote_dir like
+        ``/tmp/netgen_install/resources/dpdk/tx_worker/build`` lands
+        even when no ancestor exists yet. Pre-fix, only the leaf
+        mkdir was attempted; if the parent didn't exist, mkdir
+        raised IOError → caught and ignored → subsequent
+        ``sftp.put`` failed with ``[Errno 2] No such file``.
+
         Helper used by the Fresh Install upload pass to ship
         resources/dpdk/, ostg_docker/, etc. alongside the wheel +
         install_ostg_complete.py — without these the installer
         warned-and-skipped DPDK + FRR Docker setup.
         """
-        try:
-            sftp.mkdir(remote_dir)
-        except IOError:
-            pass  # exists
+        self._sftp_makedirs(sftp, remote_dir)
         for entry in sorted(os.listdir(local_dir)):
             if entry.startswith(".") or entry == "__pycache__":
                 continue
