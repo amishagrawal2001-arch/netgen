@@ -14,6 +14,7 @@
 # faster to launch (no extract step); the one-file is what we ship
 # in the GitHub release.
 
+import glob
 import os
 import re
 
@@ -31,7 +32,26 @@ def _parse_version():
     return "0.0.0"
 
 
+def _discover_bundled_wheel():
+    """v0.3.16+: ship the wheel inside the .exe so a new-user Fresh
+    Install flow doesn't need a separate wheel download. Mirrors the
+    macOS spec's helper. See ostg_client.spec for full rationale."""
+    dist_dir = os.path.join(SPECPATH, "dist")
+    candidates = sorted(
+        glob.glob(os.path.join(dist_dir, "ostg_trafficgen-*.whl")),
+        key=os.path.getmtime,
+    )
+    if not candidates:
+        print(f"[spec] no wheel found in {dist_dir}/ — "
+              f".exe will ship without a bundled wheel")
+        return []
+    chosen = candidates[-1]
+    print(f"[spec] bundling wheel: {os.path.basename(chosen)}")
+    return [(chosen, ".")]
+
+
 VERSION = _parse_version()
+BUNDLED_WHEEL_DATA = _discover_bundled_wheel()
 # PyInstaller version-info needs a 4-tuple, default the 4th to 0.
 VTUP = tuple([int(p) for p in (VERSION.split(".") + ["0", "0", "0"])[:4]])
 ONEFILE = bool(os.environ.get("NETGEN_ONEFILE", "1"))
@@ -59,7 +79,7 @@ a = Analysis(
         # file manually from the GitHub repo source, which is
         # undocumented and version-skew-prone.
         ('install_ostg_complete.py', '.'),
-    ],
+    ] + BUNDLED_WHEEL_DATA,    # ← v0.3.16+: see _discover_bundled_wheel()
     excludes=['backup', 'backup.*', '*.backup.*', '*.tmp', '*.temp'],
     hiddenimports=[
         'PyQt5.QtCore',

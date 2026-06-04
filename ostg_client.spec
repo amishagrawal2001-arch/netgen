@@ -6,6 +6,7 @@
 # from pyproject.toml at build time so the .app's CFBundleVersion
 # matches the wheel exactly — no more hardcoded 0.1.52 surprises.
 
+import glob
 import os
 import re
 
@@ -24,7 +25,36 @@ def _parse_version():
     return "0.0.0"
 
 
+def _discover_bundled_wheel():
+    """Find the most recent ``dist/ostg_trafficgen-*.whl`` to bundle.
+
+    The .dmg ships the wheel inside the .app bundle so a new-user
+    Fresh Install flow doesn't need a separate wheel download. v0.3.16+:
+    spec auto-discovers the wheel at PyInstaller-run time rather than
+    requiring the build script to copy it post-build. If no wheel is
+    present in ``dist/``, return an empty list — the build still
+    succeeds, the Fresh Install dialog's Wheel field just stays
+    empty (operator falls back to manual browse).
+
+    Picks the most-recently-modified wheel so re-running the build
+    after bumping version always grabs the fresh artifact.
+    """
+    dist_dir = os.path.join(SPECPATH, "dist")
+    candidates = sorted(
+        glob.glob(os.path.join(dist_dir, "ostg_trafficgen-*.whl")),
+        key=os.path.getmtime,
+    )
+    if not candidates:
+        print(f"[spec] no wheel found in {dist_dir}/ — "
+              f".app will ship without a bundled wheel")
+        return []
+    chosen = candidates[-1]
+    print(f"[spec] bundling wheel: {os.path.basename(chosen)}")
+    return [(chosen, ".")]
+
+
 VERSION = _parse_version()
+BUNDLED_WHEEL_DATA = _discover_bundled_wheel()
 block_cipher = None
 
 
@@ -48,7 +78,7 @@ a = Analysis(
         # file manually from the GitHub repo source, which is
         # undocumented and version-skew-prone.
         ('install_ostg_complete.py', '.'),
-    ],
+    ] + BUNDLED_WHEEL_DATA,    # ← v0.3.16+: see _discover_bundled_wheel()
     excludes=['backup', 'backup.*', '*.backup.*', '*.tmp', '*.temp'],
     hiddenimports=[
         'PyQt5.QtCore',

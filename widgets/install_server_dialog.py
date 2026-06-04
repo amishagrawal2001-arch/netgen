@@ -1649,7 +1649,12 @@ class InstallServerDialog(QDialog):
 
         # Wheel + installer paths
         wheel_row = QHBoxLayout()
-        self.ssh_wheel = QLineEdit()
+        # v0.3.16+: auto-fill from the wheel bundled into the .dmg/.exe
+        # (or the dist/ dir in a working-tree dev checkout). Mirrors
+        # _guess_installer_path's behaviour for install_ostg_complete.py.
+        # Empty string when no wheel is found anywhere — operator still
+        # uses Browse... in that case.
+        self.ssh_wheel = QLineEdit(self._guess_wheel_path())
         self.ssh_wheel.setPlaceholderText("/path/to/ostg_trafficgen-<v>-py3-none-any.whl")
         wb = QPushButton("Browse...")
         wb.clicked.connect(lambda: self._browse_wheel(self.ssh_wheel))
@@ -1745,6 +1750,59 @@ class InstallServerDialog(QDialog):
             if os.path.isfile(candidate):
                 return os.path.abspath(candidate)
         return ""
+
+    def _guess_wheel_path(self) -> str:
+        """Find a bundled ``ostg_trafficgen-*.whl`` to default the
+        Wheel field to.
+
+        Search order (most specific first):
+          1. ``<bundle root>/ostg_trafficgen-*.whl`` — PyInstaller
+             drops the wheel here via the spec's
+             ``BUNDLED_WHEEL_DATA`` (v0.3.16+). This is the path
+             that works on a stock .dmg / .exe install.
+          2. ``<repo root>/dist/ostg_trafficgen-*.whl`` — developer
+             working tree.
+          3. ``/opt/netgen/`` and ``/opt/OSTG/`` — legacy install
+             locations.
+
+        Picks the most recently-modified wheel when multiple match
+        (e.g. dev tree with several version artifacts in dist/).
+        Returns ``""`` when nothing found — operator falls back to
+        the Browse... button.
+
+        v0.3.16+: closes the last gap in the new-user Fresh Install
+        flow. Without a bundled wheel + this helper, the Wheel field
+        was empty on every .dmg / .exe install and the operator had
+        to download the wheel manually from GitHub releases.
+        """
+        import glob
+        here = os.path.dirname(os.path.abspath(__file__))
+        # `here` is widgets/. The PyInstaller frozen bundle puts
+        # widgets/ at .app/Contents/Resources/widgets/, so the wheel
+        # lands at .app/Contents/Resources/ — one level up. Same
+        # one-level-up resolves to the repo root in a working-tree
+        # checkout. The "dist" subdir catches a freshly-built wheel
+        # in the dev tree.
+        candidate_dirs = [
+            os.path.join(here, ".."),               # bundle / repo root
+            os.path.join(here, "..", "dist"),       # dev-tree dist/
+            "/opt/netgen",
+            "/opt/OSTG",
+        ]
+        # Union across all candidates + pick the most recently modified.
+        # Dir-by-dir scan would surface a stale wheel sitting at repo
+        # root (e.g. an old v0.1.52 leftover from PyPI download) ahead
+        # of a freshly-built wheel in dist/ — operator then ships a
+        # version-mismatched wheel to the target host. Picking by
+        # mtime across the full union avoids the trap.
+        all_wheels = []
+        for d in candidate_dirs:
+            all_wheels.extend(
+                glob.glob(os.path.join(d, "ostg_trafficgen-*.whl"))
+            )
+        if not all_wheels:
+            return ""
+        return os.path.abspath(max(all_wheels, key=os.path.getmtime))
 
     def _start_ssh_install(self) -> None:
         if self._worker and self._worker.isRunning():

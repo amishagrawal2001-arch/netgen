@@ -68,6 +68,35 @@ rm -rf build_image/dist_macos/
 # Exclude backup folder from build
 log "Excluding backup folder from packaging..."
 
+# v0.3.16+: build the netgen wheel BEFORE PyInstaller so the spec's
+# _discover_bundled_wheel() picks it up. The spec auto-includes the
+# most-recent dist/ostg_trafficgen-*.whl in the .app bundle's root,
+# which the Fresh Install dialog auto-populates via
+# _guess_wheel_path(). Result: one-click Fresh Install for new users
+# — no separate wheel download needed.
+log "Building netgen wheel for bundling into the .app..."
+# Clear any stale wheels so _discover_bundled_wheel can't pick up an
+# old version by accident — picks the most-recent mtime which can
+# be wrong if dist/ holds a leftover from a prior version.
+rm -f dist/ostg_trafficgen-*.whl
+# Ensure `build` is available in this venv.
+if ! python -c "import build" 2>/dev/null; then
+    log "Installing the 'build' package..."
+    pip install build
+fi
+if python -m build --wheel; then
+    WHEEL_FOUND=$(ls dist/ostg_trafficgen-${OSTG_VERSION}-*.whl 2>/dev/null | head -1)
+    if [[ -n "$WHEEL_FOUND" ]]; then
+        log "✓ wheel built: $(basename "$WHEEL_FOUND")"
+    else
+        warn "Wheel built but no ostg_trafficgen-${OSTG_VERSION}-*.whl in dist/"
+        warn "— .app will still build but won't bundle a wheel."
+    fi
+else
+    warn "Wheel build failed — .app will still build, but new-user"
+    warn "Fresh Install will fall back to manual wheel browse."
+fi
+
 # Build the macOS apps
 log "Building macOS applications..."
 
