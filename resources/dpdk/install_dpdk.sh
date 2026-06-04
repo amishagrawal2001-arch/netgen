@@ -455,13 +455,21 @@ step_install_dependencies() {
     #   harmless on non-Mellanox boxes (just adds ~30 MB of unused libs),
     #   but skipping them on a Mellanox-equipped box silently disables the
     #   mlx5 PMD at meson-config time so DPDK can't drive those NICs at all.
+    # perftest (ib_send_bw / ib_write_bw / ib_read_bw + _lat variants):
+    #   needed by the v0.3.12 RDMA traffic-gen feature (Tools → RDMA
+    #   submenu + per-stream engine=rdma path). ~2 MB, harmless on
+    #   non-RDMA boxes. Included here so any host that gets DPDK
+    #   installed also gets RDMA capability — most TGs targeting one
+    #   want the other (both target high-throughput NICs). --no-dpdk
+    #   paths get perftest via install_ostg_complete.py's
+    #   _install_rdma_userspace() instead.
     # linux-headers-$(uname -r): vfio-pci is in-tree on stock Ubuntu / Debian
     # kernels, but cloud / minimal images (Azure, GCP, container-optimized)
     # frequently strip the modules and need the matching headers to either
     # rebuild vfio-pci or to compile out-of-tree NIC PMD modules at runtime.
     # Cheap to install (~80 MB) and silent no-op when already present.
     local kernel_headers="linux-headers-$(uname -r 2>/dev/null || echo generic)"
-    local deps_install_cmd="apt-get install -y --option Acquire::http::Timeout=30 --option Acquire::ftp::Timeout=30 build-essential meson ninja-build pkg-config libnuma-dev libelf-dev libpcap-dev libibverbs-dev libmlx5-dev rdma-core ${kernel_headers}"
+    local deps_install_cmd="apt-get install -y --option Acquire::http::Timeout=30 --option Acquire::ftp::Timeout=30 build-essential meson ninja-build pkg-config libnuma-dev libelf-dev libpcap-dev libibverbs-dev libmlx5-dev rdma-core perftest ${kernel_headers}"
     
     # v0.3.2: tighten umask around the temp-log tee so the file is
     # 0600 (owner-only) instead of the default 0644 (world-readable).

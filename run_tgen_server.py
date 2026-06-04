@@ -1085,6 +1085,41 @@ def start_traffic():
                 import time
                 time.sleep(0.5)
 
+            # v0.3.12: RDMA short-circuit. If the stream is configured
+            # for the perftest-based RDMA engine, route it through
+            # utils/rdma_stream_engine instead of the DPDK/Scapy
+            # pipeline. We do this BEFORE the DPDK pre-flight so we
+            # don't waste time on tx_worker fallback reasoning that
+            # doesn't apply to RDMA streams. The response keeps the
+            # same shape (actual_engine + stream_id) so the GUI's
+            # render path needs no changes.
+            try:
+                from utils.rdma_stream_engine import (
+                    should_use_rdma, start_rdma_stream,
+                )
+                if should_use_rdma(stream_data):
+                    rdma_result = start_rdma_stream(
+                        stream_data, interface_name,
+                        stop_event=threading.Event(),  # per-stream
+                        tracker=stream_tracker,
+                    )
+                    rdma_result["actual_engine"] = "rdma"
+                    # Skip the DPDK / Scapy launcher entirely.
+                    return jsonify({
+                        "status": rdma_result.get("status", "started"),
+                        "result": rdma_result,
+                        "stream_id": rdma_result.get("stream_id"),
+                        "stream_name": stream_name,
+                        "interface": interface_name,
+                        "actual_engine": "rdma",
+                    })
+            except Exception as _exc:
+                logging.warning(
+                    f"[RDMA] route-to-perftest failed for "
+                    f"'{stream_name}': {_exc}; falling through to "
+                    "DPDK/Scapy pipeline"
+                )
+
             # Pre-flight engine resolution. The DPDK fallback decision
             # used to happen invisibly in the worker thread — operators
             # enabled DPDK on a TCP / IPv6 / MPLS / QinQ stream, watched
@@ -14314,6 +14349,292 @@ def api_admin_health():
     out["health"] = "degraded" if issues else "healthy"
 
     return jsonify(out)
+
+
+# ─────────────────────────────────────────────────────────────────────
+# v0.3.12 — RDMA perftest orchestration routes.
+#
+# Standalone endpoints for the Blast RDMA Flow dialog + per-stream
+# "engine = RDMA" path. Backed by utils/rdma_perf.py (device + job
+# registry, perftest subprocess lifecycle) and utils/rdma_handshake.py
+# (per-pairing tag store so two TGs can correlate their halves).
+#
+# No hardware-side state lives in run_tgen_server itself — these are
+# thin Flask wrappers around the utils. Keep them that way: the GUI's
+# Multi-TG orchestration model needs each TG to be stateless except
+# for what utils/rdma_perf already tracks.
+# ─────────────────────────────────────────────────────────────────────
+
+@app.route("/api/rdma/devices", methods=["GET"])
+def api_rdma_devices():
+    """Enumerate every RDMA HCA on this server (read /sys/class/infiniband).
+
+    Returns ``{"devices": [{name, vendor, fw_version, node_guid,
+    ports: [{port, state, link_layer, rate, mtu, gids, lid}]}]}``.
+
+    Empty list (not error) when the kernel has no RDMA support or the
+    container lacks the sysfs mount — the GUI shows "no RDMA NICs"
+    instead of an unfriendly stack trace.
+    """
+    try:
+        from dataclasses import asdict
+        from utils.rdma_perf import list_rdma_devices
+        devs = [
+            {
+                **asdict(d),
+                "ports": [asdict(p) for p in d.ports],
+            }
+            for d in list_rdma_devices()
+        ]
+        return jsonify({"devices": devs})
+    except Exception as exc:
+        logging.exception("[rdma] /api/rdma/devices failed")
+        return jsonify({"devices": [], "error": str(exc)}), 500
+
+
+@app.route("/api/rdma/perftest/installed", methods=["GET"])
+def api_rdma_perftest_installed():
+    """Probe PATH for perftest binaries. Returns ``{installed: bool,
+    tools: {test_id: path|null}, version: str|null}``."""
+    try:
+        from utils.rdma_perf import perftest_installed
+        return jsonify(perftest_installed())
+    except Exception as exc:
+        logging.exception("[rdma] /api/rdma/perftest/installed failed")
+        return jsonify({"installed": False, "tools": {},
+                        "version": None, "error": str(exc)}), 500
+
+
+def _select_listen_addr_for(device: Optional[str], ib_port: Optional[int]) -> Optional[str]:
+    """Best-effort: derive the IPv4 the perftest server should advertise
+    to its peer. Walks /sys/class/net for an interface tied to the
+    requested RDMA device. Falls back to first global v4 if we can't
+    map the IB device → netdev (common on bonded RoCE setups).
+
+    Returns None when nothing usable is found; the GUI will then ask
+    the operator to fill peer_addr manually.
+    """
+    import socket
+    if device:
+        # Most Mellanox / Intel RoCE drivers expose the netdev as a
+        # symlink at /sys/class/infiniband/<dev>/device/net/<ifname>.
+        try:
+            net_dir = f"/sys/class/infiniband/{device}/device/net"
+            if os.path.isdir(net_dir):
+                for ifname in sorted(os.listdir(net_dir)):
+                    # First non-loopback IPv4 wins.
+                    try:
+                        import fcntl
+                        import struct
+                        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+                            packed = struct.pack('256s', ifname[:15].encode())
+                            ip_bytes = fcntl.ioctl(s.fileno(), 0x8915, packed)[20:24]
+                            return socket.inet_ntoa(ip_bytes)
+                    except (OSError, ImportError):
+                        continue
+        except OSError:
+            pass
+    # Generic fallback: any global v4 we can find via getaddrinfo.
+    try:
+        hostname = socket.gethostname()
+        for fam, _, _, _, sa in socket.getaddrinfo(hostname, None):
+            if fam == socket.AF_INET:
+                ip = sa[0]
+                if ip and not ip.startswith("127."):
+                    return ip
+    except (socket.gaierror, OSError):
+        pass
+    return None
+
+
+@app.route("/api/rdma/perftest/start", methods=["POST"])
+def api_rdma_perftest_start():
+    """Spawn a perftest job + register its half under a handshake_id.
+
+    Request body (JSON):
+      role           "server" | "client"  (required)
+      test           "send_bw" | "write_bw" | "read_bw" |
+                     "send_lat" | "write_lat" | "read_lat" |
+                     "atomic_bw" | "atomic_lat"            (required)
+      device         "mlx5_0"                              (recommended)
+      ib_port        int, default 1
+      peer_addr      str — REQUIRED on client role
+      listen_port    int, optional — server allocates if absent
+      gid_index      int, e.g. 3 for RoCEv2-IPv4
+      msg_size       int (bytes)
+      qp_count       int, default 1
+      duration       int (seconds) — preferred over iterations
+      iterations     int — used when duration is absent
+      mtu            int 1..5 (perftest encoding: 1=256B…5=4096B)
+      tx_depth       int
+      rx_depth       int
+      bidirectional  bool (only for _bw)
+      use_event      bool (interrupt mode)
+      inline         int (bytes)
+      cq_mod         int
+      cpu_util       bool
+      report_gbits   bool, default True
+      perf_extra     str | [str] — appended verbatim (escape hatch)
+      handshake_id   str — pairing tag; auto-allocated when absent
+      note           str — optional operator label
+
+    Response on success:
+      {status: "started", job_id, handshake_id,
+       listen_port, listen_addr (server only), cmd, tool, record}
+
+    Response on failure:
+      400 {status: "error", error: "<operator-readable reason>"}
+    """
+    try:
+        from utils.rdma_perf import start_perftest
+        from utils.rdma_handshake import register_half
+    except Exception as exc:
+        return jsonify({"status": "error",
+                        "error": f"RDMA modules unavailable: {exc}"}), 500
+
+    body = request.get_json(silent=True) or {}
+    role = body.get("role")
+    test = body.get("test")
+    if not role or not test:
+        return jsonify({"status": "error",
+                        "error": "role and test are required"}), 400
+
+    # The orchestrator already validates role/test, but we want to
+    # short-circuit the 'install missing' path BEFORE allocating a
+    # port so the operator-facing error is the install reason, not
+    # a port-allocator side effect.
+    opts: Dict[str, Any] = dict(body)
+    # Strip our own keys from opts before forwarding.
+    handshake_id = opts.pop("handshake_id", None)
+    note = opts.pop("note", None)
+    opts.pop("role", None)
+    opts.pop("test", None)
+
+    result = start_perftest(role, test, opts)
+    if result.get("status") != "started":
+        return jsonify(result), 400
+
+    # Derive listen_addr only for the server role; the client side
+    # doesn't need to advertise anything.
+    listen_addr: Optional[str] = None
+    if role == "server":
+        listen_addr = _select_listen_addr_for(
+            opts.get("device"), opts.get("ib_port"),
+        )
+
+    pairing = register_half(
+        handshake_id,
+        role=role,
+        job_id=result["job_id"],
+        test=test,
+        device=str(opts.get("device") or ""),
+        ib_port=int(opts.get("ib_port") or 1),
+        listen_port=result["listen_port"],
+        listen_addr=listen_addr,
+        peer_addr=opts.get("peer_addr") if role == "client" else None,
+        note=note,
+    )
+
+    return jsonify({
+        **result,
+        "handshake_id": pairing["handshake_id"],
+        "listen_addr": listen_addr,
+        "record": pairing["record"],
+    })
+
+
+@app.route("/api/rdma/perftest/stop", methods=["POST"])
+def api_rdma_perftest_stop():
+    """Stop a perftest job. Body: ``{job_id: str, forget_pair: bool}``.
+
+    If ``forget_pair`` is true, also drop the handshake record so it
+    no longer appears in /api/rdma/handshakes (the OTHER half on the
+    peer TG is NOT contacted — the GUI must call stop on each side).
+    """
+    try:
+        from utils.rdma_perf import stop_perftest
+        from utils.rdma_handshake import find_job_handshake, forget_handshake
+    except Exception as exc:
+        return jsonify({"status": "error",
+                        "error": f"RDMA modules unavailable: {exc}"}), 500
+
+    body = request.get_json(silent=True) or {}
+    job_id = body.get("job_id")
+    if not job_id:
+        return jsonify({"status": "error", "error": "job_id is required"}), 400
+    result = stop_perftest(job_id)
+    if body.get("forget_pair"):
+        hid = find_job_handshake(job_id)
+        if hid:
+            forget_handshake(hid)
+            result["forgot_handshake_id"] = hid
+    return jsonify(result)
+
+
+@app.route("/api/rdma/perftest/jobs", methods=["GET"])
+def api_rdma_perftest_jobs():
+    """List every perftest job (running + recently finished) on this TG.
+
+    Each job's dict is annotated with ``handshake_id`` (None for jobs
+    that were started without a pairing tag) so the GUI can group
+    halves of the same Blast RDMA Flow in one row.
+    """
+    try:
+        from utils.rdma_perf import list_perftest_jobs
+        from utils.rdma_handshake import find_job_handshake
+    except Exception as exc:
+        return jsonify({"jobs": [], "error": str(exc)}), 500
+
+    jobs = list_perftest_jobs()
+    for j in jobs:
+        j["handshake_id"] = find_job_handshake(j["job_id"])
+    return jsonify({"jobs": jobs})
+
+
+@app.route("/api/rdma/perftest/job/<job_id>", methods=["GET"])
+def api_rdma_perftest_job(job_id):
+    """Single job's full state (including stdout_tail for debugging)."""
+    try:
+        from utils.rdma_perf import get_perftest_job
+        from utils.rdma_handshake import find_job_handshake
+    except Exception as exc:
+        return jsonify({"job": None, "error": str(exc)}), 500
+
+    j = get_perftest_job(job_id)
+    if j is None:
+        return jsonify({"job": None,
+                        "error": f"unknown job_id {job_id}"}), 404
+    j["handshake_id"] = find_job_handshake(job_id)
+    return jsonify({"job": j})
+
+
+@app.route("/api/rdma/handshakes", methods=["GET"])
+def api_rdma_handshakes_list():
+    """List every active pairing tag on this TG."""
+    try:
+        from utils.rdma_handshake import list_handshakes
+        return jsonify({"handshakes": list_handshakes()})
+    except Exception as exc:
+        return jsonify({"handshakes": [], "error": str(exc)}), 500
+
+
+@app.route("/api/rdma/handshakes/<handshake_id>", methods=["GET", "DELETE"])
+def api_rdma_handshake_detail(handshake_id):
+    """GET → full pairing record; DELETE → forget the pairing (does
+    NOT stop the underlying perftest jobs — caller must do that)."""
+    try:
+        from utils.rdma_handshake import get_handshake, forget_handshake
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+
+    if request.method == "DELETE":
+        ok = forget_handshake(handshake_id)
+        return jsonify({"status": "forgotten" if ok else "noop",
+                        "handshake_id": handshake_id})
+    rec = get_handshake(handshake_id)
+    if rec is None:
+        return jsonify({"error": f"unknown handshake_id {handshake_id}"}), 404
+    return jsonify({"handshake": rec})
 
 
 @app.route("/api/admin/install_dpdk", methods=["POST"])

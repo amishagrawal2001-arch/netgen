@@ -2,6 +2,148 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.3.12] - 2026-06-03
+
+**RDMA traffic generation release.** Adds end-to-end RDMA support via
+the standard `perftest` suite (`ib_send_bw`, `ib_write_bw`, `ib_read_bw`
+plus `_lat` variants) — both as a standalone two-TG benchmark dialog
+and as a third per-stream engine alongside Scapy / DPDK.
+
+### What changed (by area)
+
+**Server — RDMA orchestrator**
+- New `utils/rdma_perf.py` — replaces the v0.2.x 44-line stub
+  (hardcoded `mlx5_0`, hardcoded test type, missing imports). Real
+  orchestrator: sysfs-based RDMA device discovery (`/sys/class/
+  infiniband/<dev>/ports/<p>/{state, link_layer, rate, active_mtu,
+  gids/*}`), perftest install probe via `shutil.which`, per-job
+  registry with thread-safe `Popen` lifecycle, stdout parsing for
+  both BW and latency data rows, port allocator from 18515 up, TTL
+  GC of finished jobs.
+- New `utils/rdma_handshake.py` — lightweight pairing-tag broker
+  that lets two TGs correlate their halves of a single Blast a
+  RDMA Flow via a shared `handshake_id`.
+- New `utils/rdma_stream_engine.py` — shim that bridges per-stream
+  `engine = rdma` into `start_perftest("client", ...)`. Registers
+  in `StreamTracker` so Streams-tab stats show running TX bytes/sec
+  (synthesised from perftest's data row, polled every 2 s).
+- Eight new `/api/rdma/*` routes in `run_tgen_server.py`:
+  `GET /api/rdma/devices`, `GET /api/rdma/perftest/installed`,
+  `POST /api/rdma/perftest/start`, `POST /api/rdma/perftest/stop`,
+  `GET /api/rdma/perftest/jobs`, `GET /api/rdma/perftest/job/<id>`,
+  `GET /api/rdma/handshakes`, `GET|DELETE /api/rdma/handshakes/<id>`.
+- `/api/traffic/start` short-circuits to `start_rdma_stream` when
+  `stream_data.engine == "rdma"`, bypassing the DPDK/Scapy
+  pipeline.
+
+**Client — Blast a RDMA Flow dialog (new)**
+- `widgets/rdma_blast_flow_dialog.py` — non-modal dialog that picks
+  a server-TG + RDMA device, a client-TG + device, a test type
+  (Send / Write / Read × BW / Latency), and a parameter set
+  (msg size, QP count, duration, MTU, GID index, bidirectional).
+  Brokers the peer handshake via /api/rdma/perftest/start on each
+  side, polls /api/rdma/perftest/job/<id> every 2 s, renders live
+  BW (Gbps) / Msg rate (Mpps) for BW tests or min/avg/p99 (µs) for
+  latency tests. Same multi-instance shape as Blast a DPDK Flow:
+  open multiple to fan out across NIC pairs. Loopback test when
+  only one TG is selected.
+- `traffic_client/rdma_menu_actions.py` — 3 menu handlers:
+  `show_rdma_blast_flow_dialog`, `show_rdma_devices_dialog`
+  (multi-server `/sys/class/infiniband` viewer + perftest install
+  state), `show_rdma_jobs_dialog` (active + finished jobs per TG).
+- New "RDMA" submenu under `Tools` in `traffic_client/main.py`,
+  sibling of the existing DPDK submenu.
+
+**Per-stream RDMA engine — Add Stream dialog refactor**
+- `widgets/stream_dialog.py` Runtime Engine tab: legacy
+  `Use DPDK (tx_worker)` checkbox is now a backward-compat bridge.
+  New authoritative **Engine** combo: Scapy / DPDK (tx_worker) /
+  RDMA (perftest). Picking RDMA reveals a params group (test
+  type, device, peer address, msg size, QPs, duration, GID index,
+  bidirectional) saved/loaded with the stream.
+- Backward compat: pre-v0.3.12 streams (only `dpdk_enable: true`)
+  load as `engine = dpdk`. Save writes both `engine` AND
+  `dpdk_enable` so older servers keep working.
+- Streams tab Engine column gains an RDMA branch — shows
+  "RDMA Send" / "RDMA Write" / "RDMA ReadL" etc. in purple
+  (distinct from DPDK blue), instead of falling through to the
+  default "Scapy" label.
+
+**RDMA stop-bug fix (caught during audit pass)**
+- `rdma_stream_engine.start_rdma_stream` was registering streams
+  in `StreamTracker` with `tracker.add_stream(interface, sid, name)`
+  — wrong signature (tracker expects a dict). And the
+  `threading.Event()` minted in `/api/traffic/start` was orphaned
+  — never landed in the tracker, so `/api/traffic/stop` couldn't
+  reach the poll thread and the perftest child kept running until
+  its full `--duration` expired. Fixed by passing the event into
+  `tracker.add_stream({"stop_event": ...})` matching the
+  DPDK/Scapy path exactly. Two regression tests pin it.
+
+**Install pipeline — perftest auto-installed**
+- `install_ostg_complete.py` gains `_install_rdma_userspace()`
+  called from `install_system_dependencies` (every install path,
+  including `--no-dpdk`). Installs `perftest rdma-core
+  libibverbs-dev libmlx5-dev` (apt) with analogous packages on
+  dnf/yum/apk/zypper. Wrapped in try/except so a missing package
+  on an exotic distro doesn't break the main install. Verifies
+  via `which ib_send_bw` post-install and logs a clear warning
+  if perftest didn't land.
+- `resources/dpdk/install_dpdk.sh` apt prereqs list appends
+  `perftest` alongside `libibverbs-dev libmlx5-dev rdma-core` —
+  any host that runs DPDK install or the Tools → DPDK → Install
+  DPDK admin action gets RDMA capability too. Duplication with
+  the python installer is intentional belt-and-suspenders
+  (apt-get install on already-installed packages is a fast no-op).
+
+**Help guides**
+- Install Guide §10 documents the auto-install + manual recovery
+  one-liners per distro, plus a RoCEv2 vs InfiniBand link-layer
+  table and 4 common install gotchas.
+- API Guide §28 lists all 8 `/api/rdma/*` endpoints with full
+  curl examples — including a bash polling script that
+  orchestrates a two-sided test end-to-end and the field table
+  for /api/rdma/perftest/start.
+- What's New gets a "0.3.12 highlights — RDMA traffic generation"
+  block at the top.
+- Capabilities (Supported Features): Quick-launch workflows table
+  gains a Blast a RDMA Flow row; L3/L4 backend matrix gains an
+  RDMA column with proper per-protocol marks.
+
+### Tests
+- 49 new tests across `test_rdma_perf.py`,
+  `test_rdma_handshake.py`, `test_rdma_stream_engine.py`,
+  `test_rdma_blast_flow_dialog.py` — all mock the subprocess so
+  the suite runs on macOS / Linux without RDMA hardware.
+- Argv builder pinned against all 8 supported perftest variants;
+  stdout parser pinned against real BW + LAT data rows.
+- Round-trip pins for the Engine combo: legacy `dpdk_enable=True`
+  loads as `engine=dpdk`; RDMA params survive save→load.
+- Two explicit regression tests for the stop-bug
+  (`stop_event` round-trips through tracker; `add_stream` is
+  called with dict shape).
+
+### Files changed
+- `utils/rdma_perf.py` (rewrite, replaces v0.2.x stub)
+- `utils/rdma_handshake.py` (new)
+- `utils/rdma_stream_engine.py` (new)
+- `widgets/rdma_blast_flow_dialog.py` (new)
+- `traffic_client/rdma_menu_actions.py` (new)
+- `traffic_client/main.py` (RDMA submenu wiring)
+- `widgets/stream_dialog.py` (Engine combo + RDMA params + 4 help
+  guides updated)
+- `traffic_client/statistics_section.py` (Engine column RDMA
+  branch + stats payload forwards `engine` + `rdma`)
+- `run_tgen_server.py` (8 routes + `engine=rdma` short-circuit)
+- `resources/dpdk/install_dpdk.sh` (perftest in apt list)
+- `install_ostg_complete.py` (`_install_rdma_userspace` helper)
+- `tests/test_rdma_perf.py` (new, 16 tests)
+- `tests/test_rdma_handshake.py` (new, 9 tests)
+- `tests/test_rdma_stream_engine.py` (new, 15 tests)
+- `tests/test_rdma_blast_flow_dialog.py` (new, 9 tests)
+
+---
+
 ## [0.3.11] - 2026-06-03
 
 **Operator-facing "easy DPDK + line rate" release.** Stops 0.3.10's

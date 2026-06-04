@@ -682,7 +682,13 @@ DPDK streams.</p>
           (<code>-Ddisable_drivers=net/mana</code>), builds with ninja,
           installs to <code>/usr/local/lib/x86_64-linux-gnu</code>,
           <code>ldconfig</code>, then compiles <code>tx_worker</code>
-          against the freshly-installed DPDK.</td></tr>
+          against the freshly-installed DPDK.<br/>
+          <b>RDMA note (0.3.12):</b> the apt prereqs list also installs
+          <code>perftest</code> alongside <code>libibverbs-dev</code> +
+          <code>libmlx5-dev</code> + <code>rdma-core</code>. Any DPDK
+          install therefore lands RDMA traffic-gen capability too —
+          see §10 for the workflow details and §10·m for manual
+          recovery if perftest install was suppressed.</td></tr>
   <tr><td><b>install_ai_dependencies</b></td>
       <td>Optional ML/AI helpers for the AI Assistant menu.</td></tr>
   <tr><td><b>install_ollama</b></td>
@@ -933,6 +939,126 @@ Recovery paths:</p>
       <code>sys</code> import is fixed. Subsequent upgrades can use
       Tab 1 cleanly.</li>
 </ul>
+
+<h2>10. RDMA / perftest setup <span class="ok">NEW in 0.3.12</span></h2>
+
+<p>RDMA traffic generation (<code>Tools → RDMA → Blast a RDMA Flow…</code>
++ per-stream <code>Engine: RDMA (perftest)</code>) shells out to the
+<b>perftest</b> suite (<code>ib_send_bw</code>, <code>ib_write_bw</code>,
+<code>ib_read_bw</code>, and the <code>_lat</code> variants). On fresh
+installs from 0.3.12+, perftest is <b>auto-installed</b> on both code
+paths:</p>
+
+<table>
+  <tr><th>Install path</th><th>Where perftest comes from</th></tr>
+  <tr><td><code>install_ostg_complete.py</code> (CLI, in-GUI SSH installer)</td>
+      <td><code>_install_rdma_userspace()</code> runs as part of
+          <code>install_system_dependencies</code> — installs
+          <code>perftest rdma-core libibverbs-dev libmlx5-dev</code>
+          (apt; analogous packages on dnf/yum/apk/zypper). Runs on
+          <i>every</i> install, including <code>--no-dpdk</code>.</td></tr>
+  <tr><td><code>install_dpdk.sh --auto</code> (called by the
+          <code>install_dpdk_runtime</code> step or the
+          <b>Tools → DPDK → Install DPDK</b> admin action)</td>
+      <td>Apt prereqs list includes <code>perftest</code> alongside
+          <code>libibverbs-dev libmlx5-dev rdma-core</code> — so any
+          DPDK install lands RDMA capability too.</td></tr>
+</table>
+
+<p>Either path leaves <code>ib_send_bw</code> on PATH. The installer
+runs <code>which ib_send_bw</code> after the package install and
+warns explicitly if it didn't land — surfaces the gap before the
+operator opens Tools → RDMA and gets a "perftest not installed"
+error.</p>
+
+<h3>10·m. Manual install (if the auto-install was skipped)</h3>
+
+<p>Pre-0.3.12 installs, or hosts where the auto-install warning fired
+because the distro's package mirror was missing perftest at the time:</p>
+
+<pre># Debian / Ubuntu
+apt install perftest rdma-core
+
+# RHEL 9+ / Fedora / Rocky 9+ — perftest in main repo
+dnf install perftest rdma-core
+
+# RHEL 7 / 8 / CentOS — perftest from EPEL
+yum install -y epel-release &amp;&amp; yum install -y perftest rdma-core
+
+# Alpine
+apk add perftest rdma-core
+
+# openSUSE
+zypper install -y perftest rdma-core</pre>
+
+<p class="muted">On hosts where DPDK is already installed, the
+<code>rdma-core</code> + <code>libibverbs-dev</code> +
+<code>libmlx5-dev</code> packages are typically already present (pulled
+in by DPDK's mlx5 PMD prereqs), so a manual install only needs
+<code>perftest</code> on top.</p>
+
+<h3>10a. Sanity-check after install</h3>
+
+<pre># perftest binaries on PATH?
+ssh root@&lt;server&gt; 'which ib_send_bw ib_write_bw ib_read_bw'
+# → /usr/bin/ib_send_bw, ...
+
+# What does the kernel see in /sys/class/infiniband?
+ssh root@&lt;server&gt; 'ls -1 /sys/class/infiniband/'
+# → mlx5_0   (or similar — empty list means no RDMA support loaded)
+
+# Per-port state + link layer + GIDs
+ssh root@&lt;server&gt; 'for d in /sys/class/infiniband/*/ports/*; do
+  echo "$d  state=$(cat $d/state)  link=$(cat $d/link_layer)
+        rate=$(cat $d/rate)  mtu=$(cat $d/active_mtu)"; done'</pre>
+
+<p>In the GUI, the same probes are surfaced under
+<code>Tools → RDMA → RDMA Devices…</code> — picks up the device list +
+checks perftest install state in one click per selected TG.</p>
+
+<h3>10b. RoCEv2 vs InfiniBand link layer</h3>
+
+<table>
+  <tr><th><code>link_layer</code></th><th>Means</th><th>Operator action</th></tr>
+  <tr><td><code>Ethernet</code></td>
+      <td><b>RoCEv2</b> — RDMA over IPv4/IPv6 UDP. Most common in
+          modern data centres.</td>
+      <td>Configure an IPv4 (or IPv6) address on the RDMA NIC. Confirm
+          the peer TG is reachable via plain <code>ping</code>. perftest
+          uses GID index 3 by default for RoCEv2-IPv4 on Mellanox.</td></tr>
+  <tr><td><code>InfiniBand</code></td>
+      <td><b>Native IB</b> — uses LID-based routing on an IB fabric.
+          Subnet manager (OpenSM) must be running somewhere on the
+          fabric.</td>
+      <td>No IP needed; pass the peer's LID instead of an IP. perftest
+          uses GID index 0 by default for native IB.</td></tr>
+</table>
+
+<h3>10c. Common install gotchas</h3>
+
+<ul>
+  <li><b><code>perftest</code> not found</b> after apt install →
+      the package landed but the binaries are under
+      <code>/usr/local/bin</code> or similar; rerun the install
+      with the distro's official package source, not a custom
+      build.</li>
+  <li><b><code>/sys/class/infiniband/</code> empty</b> on a host that
+      has an RDMA NIC → kernel modules not loaded. Run
+      <code>modprobe mlx5_ib ib_uverbs rdma_cm rdma_ucm</code> (Mellanox)
+      or <code>modprobe irdma ib_uverbs rdma_cm</code> (Intel).
+      Persist via <code>/etc/modules-load.d/rdma.conf</code>.</li>
+  <li><b>Containerised TG (Docker)</b> → mount
+      <code>/sys/class/infiniband</code> and
+      <code>/dev/infiniband</code> into the container with
+      <code>--device</code> and <code>-v</code>; without them the GUI
+      reports "no RDMA devices" even on hosts where the HCA works
+      fine outside the container.</li>
+  <li><b>Latency tests need root</b> on some HCAs that gate
+      <code>IBV_QPT_UD</code> / hardware timestamps. If <code>ib_send_lat</code>
+      runs cleanly from the shell but the per-stream engine returns
+      "perftest exited rc=1", make sure netgen-server is running as
+      root (which it is by default via the systemd unit).</li>
+</ul>
 """
 
 
@@ -1036,6 +1162,45 @@ companion — see §20.</p>
   <tr><td class="method">POST</td><td><code>/api/admin/install_dpdk</code></td>
       <td>Server-side DPDK + tx_worker install. Async; tail via
           <code>/api/admin/install_dpdk/log</code>.</td></tr>
+
+  <tr><th colspan="3" style="background:#fef9c3;">RDMA / perftest (v0.3.12)</th></tr>
+  <tr><td class="method">GET</td> <td><code>/api/rdma/devices</code></td>
+      <td>Enumerate RDMA HCAs via <code>/sys/class/infiniband</code>.
+          Returns per-port state, link_layer (Ethernet vs InfiniBand),
+          rate, active MTU, GIDs. Empty list when no RDMA support —
+          not an error.</td></tr>
+  <tr><td class="method">GET</td> <td><code>/api/rdma/perftest/installed</code></td>
+      <td>Probe PATH for <code>ib_send_bw</code>, <code>ib_write_bw</code>,
+          <code>ib_read_bw</code>, and their <code>_lat</code> siblings.
+          Returns <code>{installed: bool, tools: {test_id: path|null},
+          version: str|null}</code>.</td></tr>
+  <tr><td class="method">POST</td><td><code>/api/rdma/perftest/start</code></td>
+      <td>Spawn a perftest job. Body: <code>{role: "server"|"client",
+          test: "send_bw"|…|"read_lat", device, ib_port, peer_addr (client
+          only), msg_size, qp_count, duration, mtu, gid_index, tx_depth,
+          bidirectional, cpu_util, handshake_id?, note?}</code>.
+          Response on success: <code>{status: "started", job_id,
+          handshake_id, listen_port, listen_addr (server only), cmd,
+          tool, record}</code>.</td></tr>
+  <tr><td class="method">POST</td><td><code>/api/rdma/perftest/stop</code></td>
+      <td>SIGTERM the perftest child. Body: <code>{job_id, forget_pair: bool}</code>.
+          When <code>forget_pair</code> is true, also drops the pairing
+          tag from the handshake registry.</td></tr>
+  <tr><td class="method">GET</td> <td><code>/api/rdma/perftest/jobs</code></td>
+      <td>List every perftest job (running + recently-finished) on this
+          TG. Each entry annotated with <code>handshake_id</code> so the
+          GUI can group the two halves of one Blast RDMA Flow.</td></tr>
+  <tr><td class="method">GET</td> <td><code>/api/rdma/perftest/job/&lt;id&gt;</code></td>
+      <td>Single job's full state — including parsed BW / latency, local
+          + remote QPN/PSN/LID, and a capped stdout tail for debugging.</td></tr>
+  <tr><td class="method">GET</td> <td><code>/api/rdma/handshakes</code></td>
+      <td>Every active pairing tag on this TG.</td></tr>
+  <tr><td class="method">GET/DELETE</td>
+      <td><code>/api/rdma/handshakes/&lt;id&gt;</code></td>
+      <td>GET → full pairing record; DELETE → forget the pairing
+          (does <b>not</b> stop the underlying jobs — caller stops each
+          side via <code>/api/rdma/perftest/stop</code>).</td></tr>
+
   <tr><td class="method">POST</td><td><code>/api/rfc2544/start</code></td>
       <td>Kick off an RFC 2544 §26.1 throughput test (binary search per frame size).</td></tr>
   <tr><td class="method">GET</td> <td><code>/api/rfc2544/progress</code></td>
@@ -2797,6 +2962,252 @@ stack. The Stream Edit dialog has a "Label stack" text field (0.2.65)
 that accepts decimal or hex, comma-separated. The legacy scalar
 <code>mpls_label</code> field still works — pre-0.2.64 streams produce
 bit-identical bytes.</p>
+
+<h2>28. RDMA perftest endpoints <span style="background:#dcfce7; color:#166534;
+     padding:1px 8px; border-radius:10px; font-size:10px; font-weight:600;">0.3.12</span></h2>
+
+<p>Eight endpoints back the <code>Tools → RDMA</code> submenu and the
+per-stream <code>engine = rdma</code> path. All shell out to the
+standard <code>perftest</code> suite (<code>ib_*_bw</code>,
+<code>ib_*_lat</code>); the server registers each invocation in a
+per-TG job table and pairs related invocations via a
+<code>handshake_id</code>. See <strong>Help → Install Guide §10</strong>
+for the prereqs.</p>
+
+<h3>28a. Enumerate RDMA devices</h3>
+<pre>curl http://&lt;server&gt;:5050/api/rdma/devices
+
+# →
+# { "devices": [
+#     { "name": "mlx5_0",
+#       "vendor": "MT_0000000838",
+#       "fw_version": "28.36.1010",
+#       "node_guid": "0x9803:9b03:00d0:1234",
+#       "ports": [
+#         { "port": 1, "state": "ACTIVE",
+#           "physical_state": "LinkUp",
+#           "link_layer": "Ethernet",      // RoCEv2-capable
+#           "rate": "100 Gb/sec (4X EDR)",
+#           "mtu": 4096, "lid": 1,
+#           "gids": ["fe80::9803:9bff:fe03:1234",
+#                    "::ffff:10.0.0.1"] }
+#       ] } ] }</pre>
+
+<p>Empty <code>devices</code> list (not an error) when the kernel has
+no RDMA support loaded or <code>/sys/class/infiniband</code> isn't
+mounted in the container.</p>
+
+<h3>28b. Probe perftest install state</h3>
+<pre>curl http://&lt;server&gt;:5050/api/rdma/perftest/installed
+
+# →
+# { "installed": true,
+#   "tools": {
+#     "send_bw":  "/usr/bin/ib_send_bw",
+#     "write_bw": "/usr/bin/ib_write_bw",
+#     "read_bw":  "/usr/bin/ib_read_bw",
+#     "send_lat": "/usr/bin/ib_send_lat",
+#     "write_lat":"/usr/bin/ib_write_lat",
+#     "read_lat": "/usr/bin/ib_read_lat",
+#     "atomic_bw":null, "atomic_lat":null
+#   },
+#   "version": "6.2-1" }</pre>
+
+<h3>28c. Start a two-sided test (server then client)</h3>
+
+<p>Generate a UUID on the caller side, pass it as
+<code>handshake_id</code> to BOTH start calls so the two halves can
+be correlated via <code>/api/rdma/handshakes/&lt;id&gt;</code>.</p>
+
+<pre>HID=$(uuidgen)
+
+# Step 1 — start the server-side perftest on TG-A.
+curl -X POST http://tg-a:5050/api/rdma/perftest/start \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"role\":\"server\",
+    \"test\":\"send_bw\",
+    \"device\":\"mlx5_0\",
+    \"ib_port\":1,
+    \"msg_size\":65536,
+    \"qp_count\":1,
+    \"duration\":30,
+    \"gid_index\":3,
+    \"handshake_id\":\"$HID\",
+    \"note\":\"BW between TG-A and TG-B\"
+  }"
+
+# → { "status":"started",
+#     "job_id":"&lt;uuid&gt;",
+#     "handshake_id":"&lt;HID&gt;",
+#     "listen_addr":"10.0.0.1",
+#     "listen_port":18515,
+#     "tool":"/usr/bin/ib_send_bw",
+#     "cmd":["/usr/bin/ib_send_bw","-p","18515","-d","mlx5_0",...],
+#     "record":{ ... } }
+
+# Step 2 — start the client-side perftest on TG-B, pointing at TG-A.
+curl -X POST http://tg-b:5050/api/rdma/perftest/start \
+  -H "Content-Type: application/json" \
+  -d "{
+    \"role\":\"client\",
+    \"test\":\"send_bw\",
+    \"device\":\"mlx5_0\",
+    \"peer_addr\":\"10.0.0.1\",
+    \"listen_port\":18515,
+    \"msg_size\":65536,
+    \"duration\":30,
+    \"gid_index\":3,
+    \"handshake_id\":\"$HID\"
+  }"
+
+# → { "status":"started", "job_id":"&lt;uuid&gt;",
+#     "handshake_id":"&lt;HID&gt;", ... }</pre>
+
+<table>
+  <tr><th>Field</th><th>Type</th><th>Notes</th></tr>
+  <tr><td><code>role</code></td><td>"server" | "client" (required)</td>
+      <td>Client requires <code>peer_addr</code>.</td></tr>
+  <tr><td><code>test</code></td><td>str (required)</td>
+      <td>One of: <code>send_bw / write_bw / read_bw / send_lat /
+          write_lat / read_lat / atomic_bw / atomic_lat</code>.</td></tr>
+  <tr><td><code>device</code></td><td>str</td>
+      <td>e.g. <code>"mlx5_0"</code>. Defaults to perftest's
+          first-discovered HCA when omitted.</td></tr>
+  <tr><td><code>ib_port</code></td><td>int (default 1)</td>
+      <td>Physical port on the HCA.</td></tr>
+  <tr><td><code>peer_addr</code></td><td>str (client only)</td>
+      <td>IP of the server-side perftest.</td></tr>
+  <tr><td><code>listen_port</code></td><td>int</td>
+      <td>perftest's <code>-p</code> control port. Server allocates
+          from 18515 up when omitted.</td></tr>
+  <tr><td><code>msg_size</code></td><td>int (bytes)</td>
+      <td>Per-op payload (<code>-s</code>). Default 65536.</td></tr>
+  <tr><td><code>qp_count</code></td><td>int</td>
+      <td>Parallel QPs (<code>-q</code>). >1 changes BW row to per-QP totals.</td></tr>
+  <tr><td><code>duration</code></td><td>int (sec)</td>
+      <td><code>-D</code>. Mutually exclusive with
+          <code>iterations</code>; duration wins.</td></tr>
+  <tr><td><code>iterations</code></td><td>int</td>
+      <td><code>-n</code>. Used only when duration is absent.</td></tr>
+  <tr><td><code>mtu</code></td><td>int 1..5</td>
+      <td>perftest <code>-m</code> encoding: 1=256B, 2=512, 3=1024,
+          4=2048, 5=4096.</td></tr>
+  <tr><td><code>tx_depth</code></td><td>int</td>
+      <td>TX queue depth (<code>-t</code>). Default 128.</td></tr>
+  <tr><td><code>gid_index</code></td><td>int</td>
+      <td><code>-x</code>. RoCEv2-IPv4 on Mellanox is usually 3.
+          Native IB is 0. <code>show_gids</code> on the host
+          enumerates the slots.</td></tr>
+  <tr><td><code>bidirectional</code></td><td>bool</td>
+      <td><code>-b</code>. Only meaningful for the <code>_bw</code> tests.</td></tr>
+  <tr><td><code>use_event</code></td><td>bool</td>
+      <td><code>-e</code> — interrupt mode instead of polling.</td></tr>
+  <tr><td><code>cpu_util</code></td><td>bool</td>
+      <td><code>--cpu_util</code> — adds CPU% to perftest's row.</td></tr>
+  <tr><td><code>handshake_id</code></td><td>str (UUID)</td>
+      <td>Pairing tag. Auto-allocated server-side when absent.</td></tr>
+  <tr><td><code>note</code></td><td>str</td>
+      <td>Operator label stored on the handshake record.</td></tr>
+  <tr><td><code>perf_extra</code></td><td>str | [str]</td>
+      <td>Escape hatch — appended verbatim to argv. Use sparingly.</td></tr>
+</table>
+
+<h3>28d. Poll a job's live stats</h3>
+
+<pre>curl http://tg-a:5050/api/rdma/perftest/job/&lt;job_id&gt;
+
+# →
+# { "job": {
+#     "job_id":"...", "handshake_id":"...",
+#     "role":"server", "test":"send_bw",
+#     "tool":"/usr/bin/ib_send_bw",
+#     "device":"mlx5_0", "ib_port":1, "listen_port":18515,
+#     "running": true,
+#     "started_at": 1717440000.0,
+#     "finished_at": null,
+#     "local_qpn":"0x000014", "local_psn":"0x9b8a5f",
+#     "remote_qpn":"0x000015","remote_psn":"0x88af3c",
+#     // Populated once perftest emits its data row:
+#     "final_msg_size_bytes": 65536,
+#     "final_iterations":    1500000,
+#     "final_bw_avg_gbps":   96.40,
+#     "final_bw_peak_gbps":  96.43,
+#     "final_msg_rate_mpps": 0.183,
+#     // For _lat tests instead:
+#     "final_lat_min_us":  null, "final_lat_avg_us": null,
+#     "final_lat_max_us":  null, "final_lat_p99_us": null,
+#     "stdout_tail": [ ... last 5000 lines, capped ... ],
+#     "error": null
+# }}</pre>
+
+<h3>28e. List all jobs on this TG</h3>
+<pre>curl http://&lt;server&gt;:5050/api/rdma/perftest/jobs
+# → { "jobs": [ &lt;job dict&gt;, ... ] }</pre>
+
+<h3>28f. Stop a job</h3>
+<pre>curl -X POST http://&lt;server&gt;:5050/api/rdma/perftest/stop \
+  -H "Content-Type: application/json" \
+  -d '{ "job_id":"&lt;uuid&gt;", "forget_pair":true }'
+
+# → { "status":"stopped", "job":{...},
+#     "forgot_handshake_id":"..."  (when forget_pair was true) }</pre>
+
+<p>Stop is SIGTERM (with a 3 s grace before SIGKILL).
+<code>forget_pair</code> additionally drops the pairing record from
+the handshake registry, but does <b>not</b> contact the other half on
+the peer TG — caller must call stop on each side independently.</p>
+
+<h3>28g. Handshake pairing registry</h3>
+<pre># List all active pairings on this TG.
+curl http://&lt;server&gt;:5050/api/rdma/handshakes
+
+# Get one pairing (both halves, if both registered here).
+curl http://&lt;server&gt;:5050/api/rdma/handshakes/&lt;id&gt;
+
+# Drop a pairing tag (does NOT stop the underlying jobs).
+curl -X DELETE http://&lt;server&gt;:5050/api/rdma/handshakes/&lt;id&gt;</pre>
+
+<p class="muted"><b>What the handshake_id buys you:</b> when the
+two halves of one Blast RDMA Flow are on different TGs, the GUI
+queries each TG's <code>/api/rdma/perftest/jobs</code> and groups by
+shared <code>handshake_id</code> to render both sides in one row.
+Stop a pair from the Blast RDMA dialog → it issues
+<code>stop</code> on each side with <code>forget_pair: true</code>,
+then DELETEs the pairing record so it disappears from the registry.</p>
+
+<h3>28h. Polling pattern for a two-sided test</h3>
+<pre>#!/bin/bash
+HID=$(uuidgen)
+SRV=tg-a:5050
+CLI=tg-b:5050
+
+# Start server, capture job_id + listen_addr.
+S=$(curl -s -X POST http://$SRV/api/rdma/perftest/start \
+  -H "Content-Type: application/json" \
+  -d "{\"role\":\"server\",\"test\":\"send_bw\",\"device\":\"mlx5_0\",
+       \"duration\":30,\"handshake_id\":\"$HID\"}")
+SJID=$(echo $S | jq -r .job_id)
+LADDR=$(echo $S | jq -r .listen_addr)
+LPORT=$(echo $S | jq -r .listen_port)
+
+# Start client pointing at the server.
+C=$(curl -s -X POST http://$CLI/api/rdma/perftest/start \
+  -H "Content-Type: application/json" \
+  -d "{\"role\":\"client\",\"test\":\"send_bw\",\"device\":\"mlx5_0\",
+       \"peer_addr\":\"$LADDR\",\"listen_port\":$LPORT,
+       \"duration\":30,\"handshake_id\":\"$HID\"}")
+CJID=$(echo $C | jq -r .job_id)
+
+# Poll every 2 s for 35 s.
+for i in $(seq 1 18); do
+  echo "--- t=$((i*2))s"
+  curl -s http://$SRV/api/rdma/perftest/job/$SJID | jq '.job
+    | "server  bw_avg=\(.final_bw_avg_gbps) Gbps  mpps=\(.final_msg_rate_mpps)"'
+  curl -s http://$CLI/api/rdma/perftest/job/$CJID | jq '.job
+    | "client  bw_avg=\(.final_bw_avg_gbps) Gbps  mpps=\(.final_msg_rate_mpps)"'
+  sleep 2
+done</pre>
 """
 
 
@@ -2836,6 +3247,49 @@ _FEATURE_GUIDE_HTML = r"""
 <p class="muted">A tour of the user-visible features added since 0.2.41,
 organised so the menu / tab where you'll find each one is obvious. For
 the REST endpoint signatures see <strong>Help → API Guide</strong>.</p>
+
+<h2><span class="ver new">0.3.12</span> highlights — RDMA traffic generation</h2>
+<p>Brand-new <strong>RDMA</strong> submenu under <code>Tools → RDMA</code>,
+backed by <code>perftest</code> (the standard RDMA / RoCEv2 benchmarking
+suite). Covers both client-side and server-side orchestration across
+one or two TGs:</p>
+<ul>
+  <li><b>Blast a RDMA Flow</b> (<code>Tools → RDMA → Blast a RDMA Flow…</code>)
+      — pick a server-side TG + RDMA device, a client-side TG + device,
+      a test type (<b>Send / RDMA Write / RDMA Read × Bandwidth / Latency</b>),
+      and a parameter set (msg size, QP count, duration, MTU, GID
+      index). Both halves spawn in parallel; the dialog brokers the
+      peer-address handshake, polls live BW (Gbps) / message rate
+      (Mpps) / latency (µs / p99) from each side. Single-TG selection
+      runs a loopback test. Non-modal — open multiple to fan out across
+      NIC pairs.</li>
+  <li><b>RDMA as a per-stream engine</b> — Add Stream → Runtime Engine
+      tab now has a 3-way <b>Engine</b> dropdown: <code>Scapy</code> /
+      <code>DPDK (tx_worker)</code> / <code>RDMA (perftest)</code>.
+      Picking RDMA reveals a params group (test type, device, peer
+      address, msg size, QP count, duration, GID index, bidirectional)
+      that's saved/loaded with the stream. Starting an RDMA stream
+      spawns the perftest client and routes stats through the same
+      Streams-tab telemetry as Scapy/DPDK streams.</li>
+  <li><b>RDMA Devices</b> viewer (<code>Tools → RDMA → RDMA Devices…</code>)
+      — multi-server enumeration of <code>/sys/class/infiniband</code>:
+      per-port state (ACTIVE / DOWN), link_layer (Ethernet vs
+      InfiniBand), rate, active MTU, GIDs. Also shows whether perftest
+      is installed on each selected TG. Use as a pre-flight before
+      Blast a RDMA Flow.</li>
+  <li><b>RDMA Jobs</b> viewer (<code>Tools → RDMA → RDMA Jobs…</code>)
+      — list every active and recently-finished perftest invocation
+      per TG, annotated with <code>handshake_id</code> so the two
+      halves of one Blast RDMA Flow appear as a pair.</li>
+  <li><b>Eight new <code>/api/rdma/*</code> endpoints</b> — see Help
+      → API Guide for the full list, including device discovery,
+      perftest install probe, start/stop/list jobs, and the
+      handshake-pairing registry.</li>
+</ul>
+<p class="muted"><b>Prerequisites:</b>
+<code>apt install perftest rdma-core</code> on each TG. RDMA-capable NIC
+(Mellanox / Intel iRDMA / Broadcom). RoCEv2 requires a routable subnet
+between the two TGs.</p>
 
 <h2><span class="ver new">0.3.11</span> highlights</h2>
 <p>Major operator-facing additions this release:</p>
@@ -3328,6 +3782,68 @@ green after the fix.</p>
 <p>Each fix has its own regression test pinned in the test suite
 (now at <strong>622 tests</strong> vs 103 before this push).</p>
 
+<h2>RDMA workflow <span class="ver new">0.3.12</span></h2>
+<p>Two complementary entry points for RDMA / RoCEv2 traffic generation,
+both backed by <code>perftest</code>:</p>
+
+<h3>Pre-flight (always run first)</h3>
+<ol>
+  <li><code>apt install perftest rdma-core</code> on every TG you'll use.</li>
+  <li>Confirm the NIC reports <code>link_layer = Ethernet</code> (RoCEv2)
+      or <code>InfiniBand</code> in <code>Tools → RDMA → RDMA Devices…</code>
+      with <code>state = ACTIVE</code>.</li>
+  <li>For RoCEv2 across two TGs: an IPv4 subnet must be configured on
+      the RDMA NICs and reachable both ways (run <code>ping</code> first).
+      <code>perftest</code> exchanges QP info over a TCP socket on
+      its <code>-p</code> port (default 18515; netgen allocates from
+      18515 upward per concurrent job).</li>
+</ol>
+
+<h3>A — Ad-hoc benchmark (Blast a RDMA Flow)</h3>
+<p><code>Tools → RDMA → Blast a RDMA Flow…</code> — the orchestrator
+dialog. Select 1 TG (loopback test) or 2 TGs (first = server,
+second = client), open the dialog, pick devices on each side, pick
+a test (Send / Write / Read × BW / Latency), tweak params, click
+<b>Start</b>. The dialog brokers the handshake and polls live stats
+from both halves. Use this for one-off measurements and quick
+"does perftest work between TG-A and TG-B?" smoke tests.</p>
+
+<h3>B — Per-stream RDMA (Streams tab)</h3>
+<p>For RDMA traffic in the same workflow as your other streams:</p>
+<ol>
+  <li>Add Stream → Runtime Engine tab → set <b>Engine</b> to
+      <code>RDMA (perftest)</code>.</li>
+  <li>RDMA params group becomes visible — fill <b>device</b>,
+      <b>peer address</b> (server-side TG's IP), test type, msg size,
+      QP count, duration, GID index.</li>
+  <li>Start a perftest <b>server</b> on the peer first (via Blast a
+      RDMA Flow with role=server, or via another stream on the peer).</li>
+  <li>Start your RDMA stream. The server side records it under a
+      <code>handshake_id</code> visible in
+      <code>Tools → RDMA → RDMA Jobs</code>.</li>
+</ol>
+<p class="muted">Limitations of the per-stream RDMA path:
+  perftest reports terminal-style stats only (no per-packet TX
+  counter), so the Streams-tab TX bytes/sec shows polled bytes from
+  perftest's data row, refreshed every 2 s — not real-time per-frame
+  data like Scapy/DPDK streams. Latency tests report min / avg / p99.</p>
+
+<h3>Common gotchas</h3>
+<ul>
+  <li><b>"Unable to perform connection"</b> from perftest → wrong
+      GID index. Default is 3 (RoCEv2-IPv4 on Mellanox);
+      try 1 (RoCEv1) or 0 (InfiniBand link_layer) if RoCEv2 isn't
+      configured.</li>
+  <li><b>Bandwidth reads as 0</b> → check MTU. Setting <code>-m 5</code>
+      (4096 B) on a NIC whose <code>active_mtu</code> is 2048 fails
+      silently to negotiate. The Devices viewer shows
+      <code>active_mtu</code> per port.</li>
+  <li><b>"Address already in use"</b> on start → another perftest
+      server is bound to that <code>-p</code> port. The orchestrator
+      allocates from 18515 upward but raw <code>perftest</code> launched
+      out-of-band can collide. Stop the stray process and retry.</li>
+</ul>
+
 <h2>Help &amp; reference</h2>
 <p class="muted">Listed in the same order they appear in the Help
 menu — first group is reference / "what's this?", second is
@@ -3410,18 +3926,27 @@ backend the wire-side runs on. For version-by-version detail see
 <strong>Help → What's New</strong>; for the curl commands see
 <strong>Help → API Guide</strong>.</p>
 
-<h2>0. Quick-launch workflows <span class="ver new">0.3.11</span></h2>
-<p>Two one-click paths added in 0.3.11 — pick the right depth for the
-operator:</p>
+<h2>0. Quick-launch workflows <span class="ver new">0.3.11</span> <span class="ver new">0.3.12</span></h2>
+<p>One-click paths — pick the right depth for the operator:</p>
 <table>
   <tr><th>Workflow</th><th>Path</th><th>Use when</th></tr>
   <tr><td><b>Blast a DPDK Flow</b></td>
-      <td>DPDK menu → "Blast a Flow"</td>
+      <td>Tools → DPDK → "Blast a Flow"</td>
       <td>Smoke-test a NIC or demo line rate. One click does:
           bind a NIC → start a 1500 B UDP flow at line rate →
           show live tx_count / tx_rate. Non-modal so the main
           window stays usable; open multiple dialogs for
           parallel multi-NIC blasts.</td></tr>
+  <tr><td><b>Blast a RDMA Flow</b> <span class="ver new">0.3.12</span></td>
+      <td>Tools → RDMA → "Blast a RDMA Flow"</td>
+      <td>Run perftest between two TGs (or loopback on one).
+          Pick devices on each side, test type (Send / Write /
+          Read × BW / Latency), msg size / QPs / duration; the
+          dialog brokers the peer handshake and polls live BW
+          (Gbps), msg rate (Mpps), or latency (µs/p99). Non-modal
+          so multiple RDMA pairs can run in parallel across NIC
+          pairs. Requires <code>perftest + rdma-core</code> on
+          each TG — see Install Guide §10.</td></tr>
   <tr><td><b>Stream templates</b></td>
       <td>Add Stream → Template dropdown</td>
       <td>Standardised stream profiles for repeatable benchmarks.
@@ -3435,8 +3960,10 @@ operator:</p>
 
 <h2>1. Stream packet builder (Streams tab)</h2>
 <p>Per-stream packet construction. Each stream emits a single shape;
-combine streams for mixed traffic. Backend defaults to Scapy; opt
-into DPDK <code>tx_worker</code> per-stream for line-rate UDP.</p>
+combine streams for mixed traffic. Pick the backend via the
+<b>Engine</b> dropdown on the Runtime Engine tab — defaults to Scapy.
+DPDK <code>tx_worker</code> for line-rate UDP/IPv4; <b>RDMA
+(perftest)</b> for ib_*_bw / ib_*_lat against a peer TG.</p>
 
 <h3>L2 framing</h3>
 <table>
@@ -3449,16 +3976,46 @@ into DPDK <code>tx_worker</code> per-stream for line-rate UDP.</p>
       <td>Outer TPID <code>0x88a8</code> / inner <code>0x8100</code></td></tr>
 </table>
 
-<h3>L3 / L4 protocol stack</h3>
+<h3>L3 / L4 protocol stack — per-engine support</h3>
 <table>
-  <tr><th>Layer</th><th>Scapy</th><th>DPDK</th></tr>
-  <tr><td>IPv4 (DSCP/ECN/TTL/flags)</td><td class="yes">✓</td><td class="yes">✓</td></tr>
-  <tr><td>IPv6 (TC, flow label, hop limit)</td><td class="yes">✓</td><td class="no">—</td></tr>
-  <tr><td>UDP</td><td class="yes">✓</td><td class="yes">✓</td></tr>
-  <tr><td>TCP (full flags / seq / ack / window)</td><td class="yes">✓</td><td class="no">—</td></tr>
-  <tr><td>ICMP / ICMPv6 (echo, type/code)</td><td class="yes">✓</td><td class="no">—</td></tr>
-  <tr><td>IGMP v2 / v3 (membership reports)</td><td class="yes">✓</td><td class="no">—</td></tr>
+  <tr><th>Layer</th><th>Scapy</th><th>DPDK</th><th>RDMA <span class="muted">(0.3.12)</span></th></tr>
+  <tr><td>IPv4 (DSCP/ECN/TTL/flags)</td>
+      <td class="yes">✓</td><td class="yes">✓</td>
+      <td class="partial">via RoCEv2</td></tr>
+  <tr><td>IPv6 (TC, flow label, hop limit)</td>
+      <td class="yes">✓</td><td class="no">—</td>
+      <td class="partial">via RoCEv2 GID</td></tr>
+  <tr><td>UDP</td>
+      <td class="yes">✓</td><td class="yes">✓</td>
+      <td class="partial">UDP/4791 (RoCEv2 transport)</td></tr>
+  <tr><td>TCP (full flags / seq / ack / window)</td>
+      <td class="yes">✓</td><td class="no">—</td>
+      <td class="no">—</td></tr>
+  <tr><td>ICMP / ICMPv6 (echo, type/code)</td>
+      <td class="yes">✓</td><td class="no">—</td>
+      <td class="no">—</td></tr>
+  <tr><td>IGMP v2 / v3 (membership reports)</td>
+      <td class="yes">✓</td><td class="no">—</td>
+      <td class="no">—</td></tr>
+  <tr><td>RDMA Send (BTH/GRH on UDP/4791)</td>
+      <td class="partial">packet-craft only</td>
+      <td class="no">—</td>
+      <td class="yes">✓ ib_send_bw / ib_send_lat</td></tr>
+  <tr><td>RDMA Write (one-sided)</td>
+      <td class="no">—</td><td class="no">—</td>
+      <td class="yes">✓ ib_write_bw / ib_write_lat</td></tr>
+  <tr><td>RDMA Read (one-sided)</td>
+      <td class="no">—</td><td class="no">—</td>
+      <td class="yes">✓ ib_read_bw / ib_read_lat</td></tr>
 </table>
+<p class="muted"><b>RDMA column key:</b> "✓" means a real RDMA verbs
+operation goes on the wire (perftest spawned, QPs allocated, MRs
+registered). "via RoCEv2" means the underlying transport is L3/L4
+but the operator doesn't construct headers directly. "packet-craft
+only" (Scapy column) means we can emit BTH/GRH bytes via the L4=RoCEv2
+selector in Add Stream, but no RDMA queue is actually opened on the
+HCA — useful for fuzz / line-tester scenarios, not for measuring
+real RDMA bandwidth or latency.</p>
 
 <h3>Encapsulations</h3>
 <ul>
@@ -4635,6 +5192,41 @@ class AddStreamDialog(QDialog):
         header.setTextFormat(Qt.RichText)
         layout.addWidget(header)
 
+        # v0.3.12: engine picker — supersedes the binary DPDK checkbox
+        # below. The checkbox is retained as a backward-compat bridge
+        # (load reads dpdk_enable when engine isn't set; save writes
+        # both keys so old servers keep working). New code should read
+        # stream_data["engine"] which is one of:
+        #   "scapy"  → Python / scapy.sendp fallback
+        #   "dpdk"   → tx_worker C binary
+        #   "rdma"   → ib_*_bw / ib_*_lat via utils/rdma_perf (v0.3.12)
+        engine_row = QWidget()
+        engine_layout = QHBoxLayout(engine_row)
+        engine_layout.setContentsMargins(0, 0, 0, 0)
+        engine_layout.addWidget(QLabel("Engine:"))
+        self.engine_combo = QComboBox()
+        self.engine_combo.addItem("Scapy (kernel)",       "scapy")
+        self.engine_combo.addItem("DPDK (tx_worker)",     "dpdk")
+        self.engine_combo.addItem("RDMA (perftest)",      "rdma")
+        self.engine_combo.setToolTip(
+            "Pick how this stream gets pushed onto the wire.\n\n"
+            "  • Scapy   — Python frame builder. Works for every L3/L4 "
+            "combo the GUI supports. ~50–200 kpps single-core.\n"
+            "  • DPDK    — tx_worker C binary. UDP/IPv4 only, line "
+            "rate on 100G+. See the checkbox below for sub-options.\n"
+            "  • RDMA    — perftest (ib_*_bw / ib_*_lat). Requires "
+            "RDMA-capable NIC + perftest installed. Uses peer addr, "
+            "msg size, QPs from the RDMA params group below."
+        )
+        engine_layout.addWidget(self.engine_combo)
+        engine_layout.addStretch(1)
+        layout.addWidget(engine_row)
+        # Bidirectional sync with dpdk_enable_checkbox + show/hide RDMA
+        # params group. Wired below once all widgets exist.
+        self.engine_combo.currentIndexChanged.connect(
+            self._on_engine_combo_changed,
+        )
+
         # DPDK toggle
         self.dpdk_enable_checkbox = QCheckBox("Use DPDK (tx_worker)")
         self.dpdk_enable_checkbox.setToolTip(
@@ -4800,9 +5392,89 @@ class AddStreamDialog(QDialog):
         )
         read_more_button.clicked.connect(self._show_dpdk_usage_guide)
         layout.addWidget(read_more_button)
-        
+
+        # v0.3.12 — RDMA params group. Visible only when Engine = RDMA
+        # (controlled by _on_engine_combo_changed). Holds the perftest
+        # invocation params for the in-Streams-tab RDMA flow.
+        from PyQt5.QtWidgets import QGroupBox, QFormLayout
+        self.rdma_params_group = QGroupBox("RDMA (perftest) parameters")
+        rdma_form = QFormLayout(self.rdma_params_group)
+        rdma_form.setLabelAlignment(Qt.AlignRight)
+        rdma_form.setHorizontalSpacing(8)
+        rdma_form.setVerticalSpacing(6)
+
+        self.rdma_test_combo = QComboBox()
+        for tid, label in [
+            ("send_bw",   "Send — Bandwidth"),
+            ("write_bw",  "RDMA Write — Bandwidth"),
+            ("read_bw",   "RDMA Read — Bandwidth"),
+            ("send_lat",  "Send — Latency"),
+            ("write_lat", "RDMA Write — Latency"),
+            ("read_lat",  "RDMA Read — Latency"),
+        ]:
+            self.rdma_test_combo.addItem(label, tid)
+        self.rdma_test_combo.setToolTip(
+            "ib_*_bw drive bandwidth tests; ib_*_lat drive latency "
+            "tests (single-op ping-pong). The stream starts the client "
+            "side of perftest — pair it with a server-side perftest "
+            "running on the peer TG (start that via Tools → RDMA → "
+            "Blast a RDMA Flow with role=server, or from a separate "
+            "stream on the peer)."
+        )
+        rdma_form.addRow("Test type:", self.rdma_test_combo)
+
+        self.rdma_device_field = QLineEdit("mlx5_0")
+        self.rdma_device_field.setPlaceholderText("mlx5_0")
+        self.rdma_device_field.setToolTip(
+            "ib device name. Check Tools → RDMA → RDMA Devices on the "
+            "target server."
+        )
+        rdma_form.addRow("Device (-d):", self.rdma_device_field)
+
+        self.rdma_peer_field = QLineEdit("")
+        self.rdma_peer_field.setPlaceholderText("10.0.0.2 (server-side IP)")
+        self.rdma_peer_field.setToolTip(
+            "IP address of the peer TG running perftest in server mode."
+        )
+        rdma_form.addRow("Peer address:", self.rdma_peer_field)
+
+        self.rdma_msg_size_spin = QSpinBox()
+        self.rdma_msg_size_spin.setRange(2, 16 * 1024 * 1024)
+        self.rdma_msg_size_spin.setSingleStep(1024)
+        self.rdma_msg_size_spin.setValue(65536)
+        self.rdma_msg_size_spin.setSuffix(" B")
+        rdma_form.addRow("Message size (-s):", self.rdma_msg_size_spin)
+
+        self.rdma_qp_count_spin = QSpinBox()
+        self.rdma_qp_count_spin.setRange(1, 1024)
+        self.rdma_qp_count_spin.setValue(1)
+        rdma_form.addRow("QP count (-q):", self.rdma_qp_count_spin)
+
+        self.rdma_duration_spin = QSpinBox()
+        self.rdma_duration_spin.setRange(1, 3600)
+        self.rdma_duration_spin.setValue(30)
+        self.rdma_duration_spin.setSuffix(" sec")
+        rdma_form.addRow("Duration (-D):", self.rdma_duration_spin)
+
+        self.rdma_gid_index_spin = QSpinBox()
+        self.rdma_gid_index_spin.setRange(0, 255)
+        self.rdma_gid_index_spin.setValue(3)
+        rdma_form.addRow("GID index (-x):", self.rdma_gid_index_spin)
+
+        self.rdma_bidir_check = QCheckBox("Bidirectional (-b)")
+        rdma_form.addRow("", self.rdma_bidir_check)
+
+        self.rdma_params_group.setVisible(False)  # shown when engine=rdma
+        layout.addWidget(self.rdma_params_group)
+
         layout.addStretch(1)
         self.variable_fields_tab.setLayout(layout)
+        # Wire the dpdk_enable checkbox back into the combo so the two
+        # stay synced regardless of which the operator interacts with.
+        # Adding here (post-construction) so both widgets exist by now.
+        self.dpdk_enable_checkbox.toggled.connect(
+            self._on_dpdk_checkbox_toggled,
+        )
     
     def _resolve_server_address_for_tx_port(self) -> str:
         """
@@ -6836,6 +7508,73 @@ class AddStreamDialog(QDialog):
             truthy(stream_data.get("variable_fields", {}).get("dpdk_enable", False)),
         ))
 
+    def _resolve_engine(self, stream_data: dict) -> str:
+        """v0.3.12: read stream_data and pick one of {scapy, dpdk, rdma}.
+
+        Forward-compat: prefer the explicit ``engine`` key when set.
+        Backward-compat: if engine is absent, fall back to the legacy
+        ``dpdk_enable`` boolean (set by pre-v0.3.12 saves and by the
+        retained checkbox in the dialog). Default → 'scapy'.
+        """
+        for key_path in (
+            ("engine",),
+            ("protocol_selection", "engine"),
+            ("variable_fields", "engine"),
+        ):
+            cur = stream_data
+            ok = True
+            for k in key_path:
+                if not isinstance(cur, dict):
+                    ok = False
+                    break
+                cur = cur.get(k)
+            if ok and isinstance(cur, str) and cur.strip().lower() in ("scapy", "dpdk", "rdma"):
+                return cur.strip().lower()
+        # Legacy fallback.
+        return "dpdk" if self._resolve_dpdk_enable(stream_data) else "scapy"
+
+    def _on_engine_combo_changed(self, _idx: int) -> None:
+        """Engine combo is authoritative. Sync the DPDK checkbox and
+        show/hide the RDMA params group accordingly."""
+        engine = (self.engine_combo.currentData() or "scapy")
+        # Block recursive toggle while we mirror the checkbox state.
+        if hasattr(self, "dpdk_enable_checkbox"):
+            blocker = self.dpdk_enable_checkbox.blockSignals(True)
+            try:
+                self.dpdk_enable_checkbox.setChecked(engine == "dpdk")
+                self.dpdk_enable_checkbox.setEnabled(engine != "rdma")
+            finally:
+                self.dpdk_enable_checkbox.blockSignals(blocker)
+        if hasattr(self, "rdma_params_group"):
+            self.rdma_params_group.setVisible(engine == "rdma")
+
+    def _on_dpdk_checkbox_toggled(self, checked: bool) -> None:
+        """When the operator toggles the legacy DPDK checkbox directly,
+        keep the engine combo in sync so save / display stay coherent.
+
+        Doesn't fire when engine is RDMA — the checkbox is disabled in
+        that case so the toggle physically can't happen."""
+        if not hasattr(self, "engine_combo"):
+            return
+        current = self.engine_combo.currentData()
+        if current == "rdma":
+            return  # combo wins; checkbox shouldn't be toggleable anyway
+        want = "dpdk" if checked else "scapy"
+        if current == want:
+            return
+        idx = self.engine_combo.findData(want)
+        if idx >= 0:
+            # Set without triggering _on_engine_combo_changed → checkbox
+            # round-trip (we got here because the checkbox changed).
+            blocker = self.engine_combo.blockSignals(True)
+            try:
+                self.engine_combo.setCurrentIndex(idx)
+            finally:
+                self.engine_combo.blockSignals(blocker)
+            # Still show/hide the RDMA group based on final state.
+            if hasattr(self, "rdma_params_group"):
+                self.rdma_params_group.setVisible(want == "rdma")
+
     def _on_traffic_template_changed(self, idx: int):
         """Apply the selected traffic template to all tabs.
 
@@ -7131,6 +7870,47 @@ class AddStreamDialog(QDialog):
         # restore DPDK toggle from any supported location
         if hasattr(self, "dpdk_enable_checkbox"):
             self.dpdk_enable_checkbox.setChecked(self._resolve_dpdk_enable(stream_data))
+        # v0.3.12: engine combo + RDMA params group restore.
+        if hasattr(self, "engine_combo"):
+            engine = self._resolve_engine(stream_data)
+            idx = self.engine_combo.findData(engine)
+            if idx >= 0:
+                self.engine_combo.setCurrentIndex(idx)
+            # Restore RDMA params if engine was rdma.
+            rdma_cfg = stream_data.get("rdma") or {}
+            if isinstance(rdma_cfg, dict):
+                test = rdma_cfg.get("test", "send_bw")
+                ti = self.rdma_test_combo.findData(test) if hasattr(self, "rdma_test_combo") else -1
+                if ti >= 0:
+                    self.rdma_test_combo.setCurrentIndex(ti)
+                if hasattr(self, "rdma_device_field"):
+                    self.rdma_device_field.setText(str(rdma_cfg.get("device", "mlx5_0")))
+                if hasattr(self, "rdma_peer_field"):
+                    self.rdma_peer_field.setText(str(rdma_cfg.get("peer_addr", "")))
+                if hasattr(self, "rdma_msg_size_spin"):
+                    try:
+                        self.rdma_msg_size_spin.setValue(int(rdma_cfg.get("msg_size", 65536)))
+                    except (TypeError, ValueError):
+                        pass
+                if hasattr(self, "rdma_qp_count_spin"):
+                    try:
+                        self.rdma_qp_count_spin.setValue(int(rdma_cfg.get("qp_count", 1)))
+                    except (TypeError, ValueError):
+                        pass
+                if hasattr(self, "rdma_duration_spin"):
+                    try:
+                        self.rdma_duration_spin.setValue(int(rdma_cfg.get("duration", 30)))
+                    except (TypeError, ValueError):
+                        pass
+                if hasattr(self, "rdma_gid_index_spin"):
+                    try:
+                        self.rdma_gid_index_spin.setValue(int(rdma_cfg.get("gid_index", 3)))
+                    except (TypeError, ValueError):
+                        pass
+                if hasattr(self, "rdma_bidir_check"):
+                    self.rdma_bidir_check.setChecked(bool(rdma_cfg.get("bidirectional", False)))
+            # Trigger group show/hide based on restored engine.
+            self._on_engine_combo_changed(self.engine_combo.currentIndex())
         if hasattr(self, "dpdk_multi_instance_checkbox"):
             self.dpdk_multi_instance_checkbox.setChecked(
                 bool(stream_data.get("dpdk_multi_instance", False))
@@ -8032,6 +8812,29 @@ class AddStreamDialog(QDialog):
         duration_seconds = (self.stream_duration_field.text().strip() if hasattr(self,
                                                                                  "stream_duration_field") else "10") if duration_mode == "Seconds" else None
 
+        # v0.3.12: resolve engine from the combo (authoritative).
+        # When absent (test contexts that construct the dialog without
+        # the variable-fields tab fully built), fall back to the
+        # checkbox state for backward compatibility.
+        engine = "scapy"
+        if hasattr(self, "engine_combo"):
+            engine = (self.engine_combo.currentData() or "scapy")
+        elif getattr(self, "dpdk_enable_checkbox", None) and self.dpdk_enable_checkbox.isChecked():
+            engine = "dpdk"
+        # Compose RDMA sub-dict only when the operator picked rdma —
+        # always-empty otherwise so save shape stays compact.
+        rdma_cfg = None
+        if engine == "rdma" and hasattr(self, "rdma_test_combo"):
+            rdma_cfg = {
+                "test":         self.rdma_test_combo.currentData() or "send_bw",
+                "device":       self.rdma_device_field.text().strip() or "mlx5_0",
+                "peer_addr":    self.rdma_peer_field.text().strip(),
+                "msg_size":     int(self.rdma_msg_size_spin.value()),
+                "qp_count":     int(self.rdma_qp_count_spin.value()),
+                "duration":     int(self.rdma_duration_spin.value()),
+                "gid_index":    int(self.rdma_gid_index_spin.value()),
+                "bidirectional": bool(self.rdma_bidir_check.isChecked()),
+            }
         # final object
         stream_details = {
             "name": name,
@@ -8039,7 +8842,12 @@ class AddStreamDialog(QDialog):
             "details": details,
             "rx_port": rx_pick,  # "Same as TX Port" is OK; caller can replace with TX when needed
             "flow_tracking_enabled": flow_tracking,
-            "dpdk_enable": bool(getattr(self, "dpdk_enable_checkbox", None) and self.dpdk_enable_checkbox.isChecked()),
+            # v0.3.12: engine key is the new authoritative field; keep
+            # legacy dpdk_enable in sync so older servers + saved files
+            # remain compatible.
+            "engine": engine,
+            "rdma": rdma_cfg,
+            "dpdk_enable": bool(engine == "dpdk"),
             "dpdk_multi_instance": bool(getattr(self, "dpdk_multi_instance_checkbox", None) and self.dpdk_multi_instance_checkbox.isChecked()),
             "dpdk_tx_cores": int(self.dpdk_tx_cores_combo.currentData() or 1) if hasattr(self, "dpdk_tx_cores_combo") else 1,
             "enable_timestamps": bool(getattr(self, "enable_timestamps_checkbox", None) and self.enable_timestamps_checkbox.isChecked()),

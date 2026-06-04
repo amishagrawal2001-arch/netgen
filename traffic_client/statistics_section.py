@@ -1915,6 +1915,13 @@ class TrafficGenClientStatisticsSection():
                 # the common case.
                 "runtime_engine": stream.get("runtime_engine"),
                 "runtime_fallback_reason": stream.get("runtime_fallback_reason"),
+                # v0.3.12: forward the requested engine + RDMA config so
+                # the engine-column renderer (line ~1950) can pick up
+                # "RDMA Send"/"RDMA Write"/etc. labels instead of falling
+                # through to the default "Scapy" branch for engine=rdma
+                # streams.
+                "engine": stream.get("engine") or "",
+                "rdma": stream.get("rdma") or {},
                 # Latency-related: raw iface (for the per-iface latency
                 # join), the enable_timestamps flag (so the cell can show
                 # "off" when the stream wasn't sent with --enable-timestamps),
@@ -1947,12 +1954,34 @@ class TrafficGenClientStatisticsSection():
             # rc=100), render "Scapy ⚠ (was DPDK)" + the reason in the
             # tooltip so the operator doesn't have to grep journalctl
             # to find out why throughput is half of what it should be.
+            #
+            # v0.3.12: also recognise runtime_engine == "rdma" so per-
+            # stream RDMA (Engine: RDMA (perftest)) renders as such
+            # instead of falling through to the "Scapy" default branch.
+            # Read the requested engine from stream_data.engine (new
+            # field) with the legacy dpdk_enable fallback.
             runtime_engine = stream.get("runtime_engine")
             fallback_reason = stream.get("runtime_fallback_reason")
-            dpdk_requested = bool(stream.get("dpdk_enable"))
+            requested_engine = (stream.get("engine") or "").strip().lower()
+            dpdk_requested = (requested_engine == "dpdk"
+                              or bool(stream.get("dpdk_enable")))
+            rdma_requested = (requested_engine == "rdma"
+                              or runtime_engine == "rdma")
             if runtime_engine == "scapy" and dpdk_requested:
                 engine_label = "Scapy ⚠ (was DPDK)"
                 engine_color = QColor("#b45309")  # Amber — degraded
+            elif rdma_requested:
+                # v0.3.12: perftest-driven stream. Label with the
+                # test variant when known so the operator can tell
+                # send_bw vs write_lat at a glance.
+                rdma_cfg = stream.get("rdma") or {}
+                test = (rdma_cfg.get("test") or "").strip()
+                test_short = {
+                    "send_bw": "Send",   "write_bw": "Write",   "read_bw": "Read",
+                    "send_lat": "SendL", "write_lat": "WriteL", "read_lat": "ReadL",
+                }.get(test, "")
+                engine_label = f"RDMA {test_short}".strip()
+                engine_color = QColor("#7c3aed")  # Purple — distinct from DPDK blue
             elif dpdk_requested:
                 tx_cores = int(stream.get("dpdk_tx_cores") or 1)
                 if tx_cores > 1:

@@ -42,6 +42,7 @@ from traffic_client.statistics_section import TrafficGenClientStatisticsSection
 from traffic_client.stream_logic import TrafficGenClientStreamLogic
 from traffic_client.stream_control import TrafficGenClientStreamControl
 from traffic_client.dpdk_menu_actions import TrafficGenClientDPDKMenuActions
+from traffic_client.rdma_menu_actions import TrafficGenClientRDMAMenuActions
 from traffic_client.server_retry_workers import ServerRetryWorker, HealthCheckWorker, ConnectionManager
 from utils.server_manager import ServerManager
 from utils.device_server_migration import DeviceServerMigration
@@ -56,6 +57,7 @@ class TrafficGeneratorClient(
     TrafficGenClientStreamLogic,
     TrafficGenClientStreamControl,
     TrafficGenClientDPDKMenuActions,
+    TrafficGenClientRDMAMenuActions,
 ):
     # AI menu actions will be added via mixin
     pass
@@ -1447,6 +1449,47 @@ class TrafficGeneratorClient(
         )
         dpdk_load_modules_action.triggered.connect(self.load_vfio_modules)
         dpdk_menu.addAction(dpdk_load_modules_action)
+
+        # v0.3.12: RDMA submenu — sibling of DPDK. Drives perftest
+        # (ib_send_bw / ib_write_bw / ib_read_bw + _lat variants)
+        # across one or two selected TGs. No DPDK make-ready prereq —
+        # RDMA is always-on once rdma-core + perftest are installed,
+        # so this menu is a pure orchestrator.
+        rdma_menu = QMenu("RDMA", self)
+        rdma_menu.setToolTipsVisible(True)
+        tools_menu.addMenu(rdma_menu)
+
+        rdma_blast_action = QAction("Blast a RDMA Flow...", self)
+        rdma_blast_action.setToolTip(
+            "Two-TG (or loopback) perftest orchestrator. Pick a server-"
+            "side TG + RDMA device, a client-side TG + device, and a "
+            "test (Send / Write / Read × BW / Latency). Both halves run "
+            "via /api/rdma/perftest/start and report live stats. "
+            "Non-modal — open multiple to fan out across NIC pairs."
+        )
+        rdma_blast_action.triggered.connect(self.show_rdma_blast_flow_dialog)
+        rdma_menu.addAction(rdma_blast_action)
+
+        rdma_menu.addSeparator()
+
+        rdma_devices_action = QAction("RDMA Devices...", self)
+        rdma_devices_action.setToolTip(
+            "List RDMA HCAs/ports/GIDs from /sys/class/infiniband on the "
+            "selected server(s). Useful pre-flight before Blast a RDMA "
+            "Flow — checks state=ACTIVE, link_layer (Ethernet vs IB), "
+            "rate, MTU, and that perftest is installed."
+        )
+        rdma_devices_action.triggered.connect(self.show_rdma_devices_dialog)
+        rdma_menu.addAction(rdma_devices_action)
+
+        rdma_jobs_action = QAction("RDMA Jobs...", self)
+        rdma_jobs_action.setToolTip(
+            "List active + recently-finished perftest jobs on the "
+            "selected server(s). Annotated with handshake_id so two "
+            "halves of the same Blast RDMA Flow show as a pair."
+        )
+        rdma_jobs_action.triggered.connect(self.show_rdma_jobs_dialog)
+        rdma_menu.addAction(rdma_jobs_action)
 
         tools_menu.addSeparator()
 

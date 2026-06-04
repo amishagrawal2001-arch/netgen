@@ -266,7 +266,7 @@ class NetgenInstaller:
     def install_system_dependencies(self):
         """Install system dependencies based on the detected OS"""
         self.log("Installing system dependencies...")
-        
+
         try:
             if self.system_info["package_manager"] == "apt":
                 self._install_apt_packages()
@@ -296,7 +296,94 @@ class NetgenInstaller:
             elif self.system_info["package_manager"] == "zypper":
                 self.run_command("zypper verify", check=False)
             # Don't exit - allow installation to continue
-            
+
+        # v0.3.12: RDMA userspace + perftest. Independent of DPDK —
+        # even --no-dpdk hosts need these for the Tools → RDMA workflows
+        # (Blast a RDMA Flow + per-stream engine=rdma path). On DPDK
+        # hosts, install_dpdk.sh's apt install duplicates these names;
+        # apt-get install on already-present packages is a fast no-op
+        # so duplication is intentional belt-and-suspenders.
+        #
+        # Best-effort: wrapped in its own try/except so a missing
+        # perftest package on an exotic distro doesn't fail the whole
+        # install. On RHEL 7/8 perftest comes from EPEL, which
+        # _install_yum_packages already enables; on RHEL 9+/Fedora
+        # it's in the main repo; on stock Debian/Ubuntu/Alpine/openSUSE
+        # it's also in the main repo. Distros where it's genuinely
+        # absent: the operator falls back to Install Guide §10's
+        # manual one-liner.
+        try:
+            self._install_rdma_userspace()
+        except Exception as e:
+            self.log(f"RDMA userspace install skipped: {e}", "WARNING")
+            self.log("Tools → RDMA features will be disabled until "
+                     "perftest is installed manually — see Install Guide §10.",
+                     "WARNING")
+
+    def _install_rdma_userspace(self):
+        """Install perftest + verbs userspace for v0.3.12 RDMA traffic-gen.
+
+        Distro-specific package names:
+          apt  → perftest rdma-core libibverbs-dev libmlx5-dev
+          dnf  → perftest rdma-core libibverbs-devel libmlx5-devel
+          yum  → same as dnf (RHEL 7/8; perftest from EPEL, enabled
+                              earlier in _install_yum_packages)
+          apk  → perftest rdma-core libibverbs-dev
+                 (Alpine bundles libmlx5 into rdma-core; no separate package)
+          zypper → perftest rdma-core libibverbs-devel libmlx5-devel
+
+        check=False on every command so a partial set (e.g. perftest
+        present but libmlx5 absent on a niche distro) still installs
+        what it can. ~3 MB total when everything lands; rdma-core is
+        typically already present on modern distros.
+        """
+        pm = self.system_info["package_manager"]
+        self.log("Installing RDMA userspace + perftest (for Tools → RDMA)...")
+        if pm == "apt":
+            self._wait_for_apt_lock()
+            self.run_command(
+                "apt-get install -y perftest rdma-core "
+                "libibverbs-dev libmlx5-dev",
+                check=False,
+            )
+        elif pm in ("dnf", "yum"):
+            self.run_command(
+                f"{pm} install -y perftest rdma-core "
+                "libibverbs-devel libmlx5-devel",
+                check=False,
+            )
+        elif pm == "apk":
+            self.run_command(
+                "apk add perftest rdma-core libibverbs-dev",
+                check=False,
+            )
+        elif pm == "zypper":
+            self.run_command(
+                "zypper install -y perftest rdma-core "
+                "libibverbs-devel libmlx5-devel",
+                check=False,
+            )
+        else:
+            self.log(
+                f"No RDMA install path defined for package manager: {pm}. "
+                "Install perftest manually — see Install Guide §10.",
+                "WARNING",
+            )
+            return
+
+        # Verify what landed. perftest is the canonical signal — if
+        # ib_send_bw is on PATH, the rest is irrelevant for the GUI.
+        check = self.run_command("which ib_send_bw", check=False,
+                                 capture_output=True)
+        if check.returncode == 0:
+            self.log("RDMA userspace + perftest installed (Tools → RDMA "
+                     "is ready to use)", "INFO")
+        else:
+            self.log("perftest binary not on PATH after install — "
+                     "Tools → RDMA will report 'perftest not installed'. "
+                     "See Install Guide §10 for the manual install path.",
+                     "WARNING")
+
     def _install_apt_packages(self):
         """Install packages using apt"""
         packages = [
