@@ -2,6 +2,66 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.3.16] - 2026-06-03
+
+**Bug fix: duplicate TG-id when adding servers.** Operator reported
+adding two servers to the TGEN list and getting two rows both
+labelled "TG 1" (instead of "TG 1" + "TG 2"). User's
+`session.json` at time of report:
+
+```json
+{"server_interfaces": [{"tg_id": 1, "address": "http://svl-d-ai-srv01:5050"}]}
+```
+
+### Root cause
+
+Every "add server" callsite computed `tg_id = len(self.server_interfaces)`
+— the next ARRAY INDEX, not the next UNIQUE id. Brittle the moment
+the existing list isn't 0-indexed contiguous:
+
+- Session JSON saved with a non-zero `tg_id` (the user's case —
+  `tg_id=1` after a likely earlier remove), reloaded next launch.
+  `len([{tg_id:1}]) = 1` → new server gets `tg_id=1` too → both
+  render as "TG 1" in `server_section.py:1261`'s
+  `f"TG {server['tg_id']}"`.
+- Remove-then-readd: started with `[{tg_id:0}, {tg_id:1}]`, removed
+  the first → `[{tg_id:1}]`. Next add hits the same collision.
+
+### Fix
+
+New `traffic_client/menu_actions._next_tg_id(server_interfaces)` helper:
+- Empty list → 0 (fresh install start unchanged).
+- Else `max(s["tg_id"] for s in servers) + 1`.
+- Defensive: coerces string `tg_id` from JSON; ignores garbage values;
+  treats missing key as 0.
+- Pure function — does NOT renumber existing entries (would break
+  the session-persistence contract since saved streams + UI state
+  reference servers by tg_id).
+
+Applied at all 4 callsites that previously used the bare `len()`:
+- `menu_actions.py:125` — main path (add via dialog)
+- `menu_actions.py:201` — legacy two-step QInputDialog fallback
+- `menu_actions.py:344` — re-add of a previously-removed server
+- `main.py:410` — auto-add from env-var/default URL on startup
+
+### Tests
+- New `tests/test_next_tg_id.py` — 10 regression tests including:
+  - The exact user scenario (`[{tg_id:1}]` → next must be 2)
+  - Post-remove gap scenario
+  - Sparse / hand-edited tg_ids
+  - String-coerced JSON values
+  - Missing key / garbage values
+  - Sequential-add uniqueness across 3 operations
+  - Pin that existing entries are not mutated
+
+### Files changed
+- `traffic_client/menu_actions.py` (new `_next_tg_id` helper + 3
+  callsite replacements)
+- `traffic_client/main.py` (4th callsite — lazy-imports the helper)
+- `tests/test_next_tg_id.py` (new, 10 tests)
+
+---
+
 ## [0.3.15] - 2026-06-03
 
 **RDMA HCA capability surfacing + raised QP ceiling.** Triggered by

@@ -407,7 +407,13 @@ class TrafficGeneratorClient(
             # Server URL was set via environment variable or default, but not CLI
             # Check if this server was previously removed
             if self.server_url not in self.removed_servers:
-                tg_id = len(self.server_interfaces)  # Assign the next TG ID
+                # v0.3.16: use _next_tg_id helper instead of len() —
+                # see traffic_client/menu_actions.py::_next_tg_id docstring.
+                # Loading a session with non-contiguous tg_ids (e.g.
+                # one server saved with tg_id=1) + this auto-add path
+                # would otherwise collide.
+                from traffic_client.menu_actions import _next_tg_id
+                tg_id = _next_tg_id(self.server_interfaces)
                 server_entry = {"tg_id": tg_id, "address": self.server_url, "online": True}
                 self.server_interfaces.append(server_entry)
                 logger.info(f"Automatically added server: {self.server_url} (TG {tg_id})")

@@ -11,6 +11,39 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _next_tg_id(server_interfaces) -> int:
+    """Return the next-available unique tg_id for a freshly-added server.
+
+    v0.3.16 fix: previously every add-server callsite computed
+    ``tg_id = _next_tg_id(self.server_interfaces)``. That breaks the moment the
+    existing list isn't a contiguous 0-indexed range — which happens
+    routinely:
+
+      * Session JSON saved with only one server and tg_id=1 (or any
+        non-zero), reloaded on next launch. ``len([{tg_id:1}]) = 1``;
+        new server gets tg_id=1 too → both render as "TG 1".
+      * After a remove: started with [{tg_id:0}, {tg_id:1}],
+        removed the first → [{tg_id:1}]. ``len()`` = 1; new add
+        collides with tg_id=1.
+
+    Reported user-visibly as "two servers added but both labelled
+    TG 1" (one operator screenshot). Fix is the obvious next-unique:
+    max of existing + 1, with 0 fallback for an empty list. This also
+    keeps the FIRST add starting at 0 unchanged for fresh installs.
+    """
+    if not server_interfaces:
+        return 0
+    used = []
+    for s in server_interfaces:
+        try:
+            used.append(int(s.get("tg_id", 0)))
+        except (TypeError, ValueError):
+            continue
+    if not used:
+        return 0
+    return max(used) + 1
+
+
 def sanitize_for_json(obj):
     """Recursively convert non-serializable objects to JSON-safe formats."""
     # Check for PyQt objects first (they can't be serialized)
@@ -122,7 +155,7 @@ class TrafficGenClientMenuAction():
             connect_now = bool(entry.get("connect_now", True))
             online = connect_now
 
-            tg_id = len(self.server_interfaces)
+            tg_id = _next_tg_id(self.server_interfaces)
             server_entry = {"tg_id": tg_id, "address": full_url, "online": online}
             label = entry.get("label", "")
             if label:
@@ -198,7 +231,7 @@ class TrafficGenClientMenuAction():
             return
 
         if full_url not in [server["address"] for server in self.server_interfaces]:
-            tg_id = len(self.server_interfaces)
+            tg_id = _next_tg_id(self.server_interfaces)
             server_entry = {"tg_id": tg_id, "address": full_url, "online": True}
             self.server_interfaces.append(server_entry)
             if full_url in self.removed_servers:
@@ -341,7 +374,7 @@ class TrafficGenClientMenuAction():
                 self.removed_servers.discard(server_address)
                 
                 # Add back to server_interfaces with a new TG ID
-                tg_id = len(self.server_interfaces)  # Assign the next available TG ID
+                tg_id = _next_tg_id(self.server_interfaces)  # Assign the next available TG ID
                 server_entry = {"tg_id": tg_id, "address": server_address, "online": True}
                 self.server_interfaces.append(server_entry)
                 
