@@ -779,9 +779,48 @@ class SshInstallWorker(QThread):
                 return
 
         # Poll loop: read log incrementally + check process state.
+        # v0.3.16+: emit a periodic heartbeat + parse the latest
+        # [INFO]/[WARNING] line so the operator can see what step is
+        # running. Pre-fix the popup looked frozen during legitimate
+        # quiet stretches (DPDK build, FRR docker image build, apt with
+        # many large packages can each be 5–15 min with no log output);
+        # operator reported "popup doesn't show full install progress
+        # and something wrong" but the install was actually fine.
         self.status.emit("Install running on server — streaming log...")
         log_offset = 0
         idle_polls = 0
+        import re as _re
+        install_started_at = time.time()
+        last_emit_at = install_started_at
+        last_heartbeat_at = install_started_at
+        last_step_label = ""
+        # Match the installer's `[INFO] foo bar...` / `[WARNING] ...` /
+        # `[ERROR] ...` lines emitted by install_ostg_complete.py::log()
+        # (line ~145). We strip ANSI color codes the installer wraps
+        # them in before printing.
+        _ANSI = _re.compile(r"\x1b\[[0-9;]*m")
+        _STEP_LINE = _re.compile(
+            r"^\[(?:INFO|WARNING|ERROR|DEBUG)\]\s+(.+?)\s*$"
+        )
+        _HEARTBEAT_SECS = 30  # emit a "still alive" line every N idle s
+
+        def _update_step_from(chunk: str) -> None:
+            """Scan a freshly-read chunk for the most recent [INFO]/etc
+            line and update the status label so the operator sees the
+            current step even when the log popup is auto-scrolled away."""
+            nonlocal last_step_label
+            best = None
+            for raw in chunk.splitlines():
+                stripped = _ANSI.sub("", raw).strip()
+                m = _STEP_LINE.match(stripped)
+                if m:
+                    best = m.group(1)
+            if best and best != last_step_label:
+                last_step_label = best
+                # 80-char cap so the status bar doesn't wrap weirdly.
+                trimmed = best if len(best) <= 80 else best[:77] + "..."
+                self.status.emit(f"Install: {trimmed}")
+
         while not self._stop:
             try:
                 # Read new bytes since last offset. tail -c +N starts at
@@ -789,12 +828,51 @@ class SshInstallWorker(QThread):
                 tail_cmd = f"tail -c +{log_offset + 1} {log_path} 2>/dev/null"
                 _, tail_stdout, _ = client.exec_command(tail_cmd, timeout=15)
                 new = tail_stdout.read().decode("utf-8", errors="replace")
+                now = time.time()
                 if new:
                     self.log_chunk.emit(new)
                     log_offset += len(new.encode("utf-8"))
                     idle_polls = 0
+                    last_emit_at = now
+                    last_heartbeat_at = now
+                    _update_step_from(new)
                 else:
                     idle_polls += 1
+                    # Heartbeat: prove the poll loop is alive during
+                    # legitimate quiet stretches. The user's reported
+                    # symptom — "popup doesn't show full progress and
+                    # something wrong" — was a fully-working install
+                    # that LOOKED frozen because no log line landed for
+                    # several minutes (the DPDK meson+ninja build is
+                    # the worst offender; perftest auto-install + FRR
+                    # image build are other examples).
+                    if now - last_heartbeat_at >= _HEARTBEAT_SECS:
+                        elapsed_total = int(now - install_started_at)
+                        idle_secs = int(now - last_emit_at)
+                        em = f"{elapsed_total//60}m{elapsed_total%60:02d}s"
+                        im = f"{idle_secs//60}m{idle_secs%60:02d}s"
+                        heartbeat_lines = [
+                            f"[client] ⏱  poll heartbeat — install still "
+                            f"running (elapsed {em}, no new log for {im})\n"
+                        ]
+                        if last_step_label:
+                            heartbeat_lines.append(
+                                f"[client]    last step: {last_step_label}\n"
+                            )
+                        # Some steps are KNOWN slow — name the usual
+                        # suspects so the operator doesn't think it's
+                        # frozen.
+                        if idle_secs >= 60:
+                            heartbeat_lines.append(
+                                "[client]    (long quiet stretches are "
+                                "normal for: DPDK meson+ninja build "
+                                "[~10–15m], FRR Alpine docker image "
+                                "build [~3–5m], apt install of large "
+                                "packages [~2–5m].)\n"
+                            )
+                        for ln in heartbeat_lines:
+                            self.log_chunk.emit(ln)
+                        last_heartbeat_at = now
 
                 # Is the installer still alive?
                 exit_check = (
