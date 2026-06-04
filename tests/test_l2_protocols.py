@@ -295,7 +295,17 @@ def test_pim_hello_destination_is_all_pim_routers():
 def test_session_registry_round_trip():
     """The registry's list/get/stop wiring should work even with a
     fake session (we never spawn the thread). Locks down the contract
-    consumers depend on without needing a real network."""
+    consumers depend on without needing a real network.
+
+    v0.3.8 contract change: stop_session() also EVICTS the entry from
+    _SESSIONS to prevent unbounded growth on long-running servers.
+    The final counters are returned in the /api/l2/<proto>/stop
+    response body and observable on the local session reference;
+    they're NOT reachable via get_session() after stop. Pre-v0.3.8
+    this test asserted via get_session(after_stop)["counters"][...] —
+    that worked accidentally and the assertion crashed once eviction
+    landed. v0.3.12 update: assert the new contract explicitly so
+    the right behaviour is locked down."""
     from utils import l2_protocols
     sess = l2_protocols._Session(
         session_id="test-1",
@@ -319,8 +329,11 @@ def test_session_registry_round_trip():
         ok = l2_protocols.stop_session("test-1")
         assert ok is True
 
-        snap = l2_protocols.get_session("test-1")
-        assert snap["counters"]["stopped_at"] is not None
+        # v0.3.8 contract: entry is evicted from the registry.
+        assert l2_protocols.get_session("test-1") is None
+        # The counters were set on the local session before eviction —
+        # observable via the reference we held since registration.
+        assert sess.counters.stopped_at is not None
     finally:
         with l2_protocols._REG_LOCK:
             l2_protocols._SESSIONS.pop("test-1", None)
