@@ -358,6 +358,103 @@ def test_list_rdma_devices_includes_max_qp_when_ibv_devinfo_available(
     assert d.max_pd == 8388608
 
 
+def test_list_net_ifaces_picks_up_attached_netdevs(tmp_path, monkeypatch):
+    """Synth /sys/class/infiniband/<dev>/device/net/<ifname> and
+    verify _list_net_ifaces walks it correctly.
+
+    v0.3.16+: operator-visible field used to label the device combo
+    in Tools → RDMA → Blast a RDMA Flow. Without this, operators
+    saw abstract `mlx5_N` IDs and had to manually cross-reference
+    each HCA against `ip link` to know which port carries their
+    test traffic. Surfaces the netdev names like `enp4s0f0np0` so
+    the combo label reads `mlx5_0 [..., iface=enp4s0f0np0]`."""
+    fake_root = tmp_path / "infiniband"
+    fake_root.mkdir()
+    dev = fake_root / "mlx5_test"
+    dev.mkdir()
+    # The lookup walks <dev>/device/net/
+    net_dir = dev / "device" / "net"
+    net_dir.mkdir(parents=True)
+    (net_dir / "enp4s0f0np0").mkdir()
+    (net_dir / "enp4s0f1np1").mkdir()
+
+    monkeypatch.setattr(rdma_perf, "_IB_SYSFS_ROOT", str(fake_root))
+    out = rdma_perf._list_net_ifaces("mlx5_test")
+    assert out == ["enp4s0f0np0", "enp4s0f1np1"], (
+        f"expected both netdevs in sorted order, got {out}"
+    )
+
+
+def test_list_net_ifaces_returns_empty_when_dir_missing(tmp_path, monkeypatch):
+    """Containerised /sys mount often strips /device. Helper must
+    return [] rather than crash so the rest of list_rdma_devices
+    can continue."""
+    fake_root = tmp_path / "infiniband"
+    fake_root.mkdir()
+    (fake_root / "mlx5_test").mkdir()
+    monkeypatch.setattr(rdma_perf, "_IB_SYSFS_ROOT", str(fake_root))
+    assert rdma_perf._list_net_ifaces("mlx5_test") == []
+
+
+def test_list_net_ifaces_filters_hidden_entries(tmp_path, monkeypatch):
+    """Defensive: skip dotfiles. None expected in real sysfs but
+    keeps the helper robust against unusual mount overlays."""
+    fake_root = tmp_path / "infiniband"
+    fake_root.mkdir()
+    net_dir = fake_root / "mlx5_test" / "device" / "net"
+    net_dir.mkdir(parents=True)
+    (net_dir / ".hidden").mkdir()
+    (net_dir / "real_iface").mkdir()
+    monkeypatch.setattr(rdma_perf, "_IB_SYSFS_ROOT", str(fake_root))
+    assert rdma_perf._list_net_ifaces("mlx5_test") == ["real_iface"]
+
+
+def test_rdma_device_dataclass_has_net_ifaces_field():
+    """The RdmaDevice dataclass must carry net_ifaces so the field
+    survives the dataclass.asdict() serialisation that
+    /api/rdma/devices uses."""
+    from dataclasses import fields
+    field_names = {f.name for f in fields(rdma_perf.RdmaDevice)}
+    assert "net_ifaces" in field_names, (
+        "RdmaDevice missing net_ifaces field — the API response "
+        "won't include kernel netdev names and the dialog combo "
+        "label can't surface them."
+    )
+
+
+def test_list_rdma_devices_includes_net_ifaces_end_to_end(tmp_path, monkeypatch):
+    """End-to-end: synth a full sysfs HCA + monkeypatch ibv_devinfo
+    + verify the RdmaDevice constructor lands net_ifaces correctly."""
+    fake_root = tmp_path / "infiniband"
+    fake_root.mkdir()
+    dev = fake_root / "mlx5_99"
+    dev.mkdir()
+    (dev / "board_id").write_text("MT_TEST\n")
+    (dev / "fw_ver").write_text("99.99\n")
+    (dev / "node_guid").write_text("0:0:0:1\n")
+    port = dev / "ports" / "1"
+    port.mkdir(parents=True)
+    (port / "state").write_text("4: ACTIVE\n")
+    (port / "phys_state").write_text("5: LinkUp\n")
+    (port / "link_layer").write_text("Ethernet\n")
+    (port / "rate").write_text("400 Gb/sec\n")
+    (port / "active_mtu").write_text("5\n")
+    (port / "lid").write_text("0x0\n")
+    (port / "gids").mkdir()
+    # The new piece: /device/net/<ifname>
+    (dev / "device" / "net" / "enp4s0f0np0").mkdir(parents=True)
+
+    monkeypatch.setattr(rdma_perf, "_IB_SYSFS_ROOT", str(fake_root))
+    monkeypatch.setattr(rdma_perf, "_query_ibv_devinfo",
+                        lambda _: {k: None for k in rdma_perf._IBV_DEVINFO_INT_FIELDS})
+
+    devs = rdma_perf.list_rdma_devices()
+    assert len(devs) == 1
+    assert devs[0].net_ifaces == ["enp4s0f0np0"], (
+        f"expected ['enp4s0f0np0'], got {devs[0].net_ifaces}"
+    )
+
+
 def test_list_rdma_devices_max_qp_stays_none_when_ibv_devinfo_missing(
     tmp_path, monkeypatch,
 ):

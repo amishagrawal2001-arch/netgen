@@ -289,8 +289,16 @@ class TrafficGenClientRDMAMenuActions:
 
                     lines = []
                     for d in devs:
+                        # v0.3.16+: surface the kernel netdev name(s)
+                        # alongside the abstract HCA ID. Without it
+                        # operators can't correlate `mlx5_N` with
+                        # their `ip link` output / IP config.
+                        net_ifaces = d.get("net_ifaces") or []
+                        iface_str = ("+".join(net_ifaces)
+                                     if net_ifaces else "(no netdev)")
                         lines.append(
                             f"{d.get('name')}  "
+                            f"iface={iface_str}  "
                             f"vendor={d.get('vendor') or '-'}  "
                             f"fw={d.get('fw_version') or '-'}"
                         )

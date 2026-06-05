@@ -467,7 +467,16 @@ class RdmaBlastFlowDialog(QDialog):
             link = first.get("link_layer", "?")
             rate = first.get("rate", "?")
             state = first.get("state", "?")
-            label = f"{name}  [{link}, {rate}, port1={state}]"
+            # v0.3.16+: surface the kernel netdev name(s) so the
+            # operator can correlate the abstract `mlx5_N` ID with
+            # `ip link` / IP config. Without this, operators see
+            # only "mlx5_0", "mlx5_3", "mlx5_5" and have to manually
+            # cross-reference each HCA with their network topology
+            # to know which port carries the test traffic. Joined
+            # with `+` so dual-netdev HCAs (bonded, etc.) show both.
+            net_ifaces = dev.get("net_ifaces") or []
+            iface_tag = f", iface={'+'.join(net_ifaces)}" if net_ifaces else ""
+            label = f"{name}  [{link}, {rate}, port1={state}{iface_tag}]"
             combo.addItem(label, userData=name)
             if also_combo is not None:
                 also_combo.addItem(label, userData=name)

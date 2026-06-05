@@ -131,6 +131,17 @@ class RdmaDevice:
     max_mr: Optional[int] = None        # device-wide MR ceiling
     max_pd: Optional[int] = None        # device-wide PD ceiling
     max_sge: Optional[int] = None       # per-WR scatter/gather ceiling
+    # v0.3.16+: kernel netdev names attached to this RDMA device.
+    # Resolved by walking /sys/class/infiniband/<name>/device/net/.
+    # Operator-critical: without these the RDMA Devices view shows
+    # only abstract `mlx5_N` IDs, leaving the operator to manually
+    # cross-reference with `ip link` to know which port carries
+    # their test traffic. List rather than scalar because some HCAs
+    # (bonded mlx5_bond_*, or dual-port HCAs with separate netdevs)
+    # expose multiple netdevs. Empty list when the symlink dir is
+    # missing (kernel without netdev binding, or containerised
+    # /sys mount with /device stripped).
+    net_ifaces: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -199,6 +210,36 @@ def _read_sysfs(path: str) -> Optional[str]:
             return f.read().strip()
     except (OSError, IOError):
         return None
+
+
+def _list_net_ifaces(dev: str) -> List[str]:
+    """Return the kernel netdev names attached to an RDMA device.
+
+    Walks ``/sys/class/infiniband/<dev>/device/net/`` — each entry
+    in that directory is a symlink (or virtual directory) named
+    after a netdev that this HCA exposes. Mellanox single-port
+    HCAs typically have ONE entry (e.g. ``mlx5_0`` → ``enp4s0f0np0``);
+    bonded HCAs (``mlx5_bond_0``) expose the bond's netdev; some
+    dual-port configurations expose two.
+
+    Returns [] on:
+      * containerised /sys mount that strips /device/net
+      * kernel without the netdev binding for this HCA
+      * permission denied on the directory walk
+    The caller treats empty as "unknown" and renders accordingly
+    (operator can still pick the device, just won't see the
+    netdev name in the label).
+    """
+    net_dir = os.path.join(_IB_SYSFS_ROOT, dev, "device", "net")
+    if not os.path.isdir(net_dir):
+        return []
+    try:
+        names = sorted(os.listdir(net_dir))
+    except OSError as exc:
+        logger.debug(f"[rdma] _list_net_ifaces({dev}): {exc}")
+        return []
+    # Filter out hidden entries (none expected here, but defensive).
+    return [n for n in names if not n.startswith(".")]
 
 
 def _list_port_gids(dev: str, port: int) -> List[str]:
@@ -424,6 +465,10 @@ def list_rdma_devices() -> List[RdmaDevice]:
         # has 64+ HCAs and this is too slow, parallelise via a
         # ThreadPoolExecutor in this loop.
         caps = _query_ibv_devinfo(dev)
+        # v0.3.16+: surface kernel netdev names. Operator-critical
+        # for correlating mlx5_N with `ip link` / IP config when
+        # picking a device for Blast a RDMA Flow.
+        net_ifaces = _list_net_ifaces(dev)
 
         devices.append(RdmaDevice(
             name=dev,
@@ -438,6 +483,7 @@ def list_rdma_devices() -> List[RdmaDevice]:
             max_mr=caps.get("max_mr"),
             max_pd=caps.get("max_pd"),
             max_sge=caps.get("max_sge"),
+            net_ifaces=net_ifaces,
         ))
     return devices
 
