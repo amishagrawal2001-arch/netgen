@@ -2,6 +2,134 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.3.17] - 2026-06-05
+
+**Install hardening, RDMA netdev names, and a quiet pip trap.** Fresh
+install on a bare Ubuntu 24.04 box (`svl-d-ai-srv04`) surfaced 9
+distinct failure modes in the install path — every one operator-
+reported during a real upgrade, every one fixed without requiring the
+operator to SSH in for manual recovery. Plus a usability fix for the
+RDMA Blast device picker and one quiet pip trap that bites every
+same-version wheel rebuild.
+
+### Install path — fresh-install bugs squashed (Ubuntu 24.04)
+
+1. **SFTP recursive upload fails on parent-dir missing** — paramiko's
+   `sftp.put` has no `mkdir -p` semantics. Walking each path
+   component now in `_sftp_makedirs` before uploading the
+   `resources/dpdk/tx_worker/build/` tree.
+2. **Install dialog popup goes silent during legitimate quiet
+   stretches** — adaptive backoff was fine, but no visible
+   heartbeat. 30 s heartbeat line + `[INFO]`/`[WARNING]`/`[ERROR]`
+   step parser now updates the status label every chunk.
+3. **pip bootstrap fails on Ubuntu 24.04** with
+   "uninstall-no-record-file × Cannot uninstall packaging 24.0".
+   Replaced the curl get-pip.py pipe with an `ensurepip` →
+   distro `python3-pip` → `get-pip.py --ignore-installed`
+   fallback chain.
+4. **apt-get install fails on dpkg conffile prompt** — `apt-get
+   install -y` only auto-answers apt's prompts, not dpkg's
+   conffile diff prompts. New `_apt_install` wrapper appends
+   `-o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold`
+   to every install. `install_dpdk.sh` gets the same treatment
+   inline. The v0.3.16 docker-ce failure site (containerd.io's
+   config.toml diff) now installs cleanly.
+5. **gpg --dearmor fails in detached install** with `cannot open
+   '/dev/tty'`. Modern GnuPG 2.x defaults to interactive; new
+   `_install_apt_keyring(name, key_url)` helper downloads + dearmors
+   with `--batch --no-tty --yes` and chmods the keyring to 0644.
+   The Docker keyring install uses this helper now.
+6. **Installer self-heals from half-configured dpkg state on retry**
+   — operator hit "Dependency failed for netgen-server.service"
+   from a half-installed Docker stack left by a prior failed run.
+   New `_heal_dpkg_state()` pre-flight at the top of `install_local`/
+   `install_remote`: `dpkg --audit` → force-remove half-installed
+   Docker stack → `dpkg --configure -a --force-confdef --force-confold`
+   → `apt-get clean / update`. No more SSH-in manual recovery.
+7. **Install log popout shows blank** — invisible-text bug from a
+   hardcoded dark `#0f172a` background vs the default light text
+   color. Popout now inherits the inline view's stylesheet.
+8. **Install log popout — text overlap from shared-document font
+   mismatch** — QPlainTextEdit's shared QTextDocument computes
+   per-block line heights against the FIRST view's font. The
+   popout was appending its own `font-size: 12px` to the inline
+   view's 11px on the shared document. Dropped the font-size
+   override and added explicit `view.setFont(self.log_view.font())`.
+9. **libmlx5-dev all-or-nothing fails RDMA install on non-MOFED
+   hosts** — `_install_rdma_userspace` lumped 4 packages into one
+   `apt-get install`. apt is all-or-nothing per command, so on a
+   MOFED-less host, the entire batch failed even though 3 of 4
+   packages were in Ubuntu main. Now split into two passes:
+   CORE (`perftest rdma-core libibverbs-dev`, must succeed) +
+   MOFED-OPTIONAL (`libmlx5-dev`, warns on failure). Same split
+   in `install_dpdk.sh`'s build-deps command.
+
+### Install path — distribution fixes
+
+10. **Bundle install_ostg_complete.py into .dmg/.exe via PyInstaller
+    spec** — without this, the in-GUI Fresh Install dialog couldn't
+    find the installer on a fresh `.dmg`/`.exe` install. The spec
+    `datas=[]` now includes the installer script.
+11. **Fix B: bundle wheel in .dmg/.exe + `_guess_wheel_path()`
+    auto-fill** — the dialog's wheel field now auto-fills from
+    the wheel bundled inside the PyInstaller app bundle, with
+    mtime-newest-wins glob over `dist/`. New users on a fresh
+    `.dmg`/`.exe` install no longer need to know where the wheel
+    lives — Fresh Install becomes truly one-click.
+12. **pip3 install --force-reinstall --no-deps for same-version
+    wheel rebuilds** — without `--force-reinstall`, rebuilding the
+    wheel from current source (same version string, new contents —
+    the "Option A" rebuild path) is silently skipped by pip with
+    "Requirement already satisfied". Adds a separate deps-only
+    pass for fresh-install dep resolution. `--no-deps` keeps the
+    in-place artifact swap fast and avoids distutils conflicts
+    on OS-managed packages.
+
+### RDMA usability
+
+13. **Surface kernel netdev names in RDMA device picker + Devices
+    view.** Operators couldn't correlate abstract `mlx5_N` IDs
+    with their `ip link` output (`enp175s0f0`, `eth4`, etc.).
+    `utils/rdma_perf.py` gained `_list_net_ifaces(dev)` walking
+    `/sys/class/infiniband/<dev>/device/net/`; `RdmaDevice`
+    dataclass gained `net_ifaces: List[str]`; the combo label
+    in `widgets/rdma_blast_flow_dialog.py` and the Devices viewer
+    in `traffic_client/rdma_menu_actions.py` now render an
+    `iface=enp175s0f0` tag after the device name.
+
+### Tests + docs
+
+- **13 new test files, +90 tests** pinning every install-path fix
+  + the RDMA netdev surfacing. Test list:
+  `test_install_sftp_makedirs.py`, `test_install_dialog_progress.py`,
+  `test_pip_bootstrap.py`, `test_apt_noninteractive.py`,
+  `test_pyinstaller_spec_bundles_installer.py`,
+  `test_install_log_popout.py`, `test_dpkg_heal_preflight.py`,
+  `test_apt_keyring_helper.py`, `test_rdma_install_split.py`,
+  `test_pip_force_reinstall.py`.
+- **Install guide refresh** (in-app `_INSTALL_GUIDE_HTML` +
+  `INSTALL.md`): new §3a "What files do I actually need?", §3c
+  wheel-only disclaimer, rewritten §4 "What gets installed"
+  reflecting actual 0.3.16+ install methods (`_heal_dpkg_state`,
+  `_install_apt_keyring`, `_apt_install`, two-pass RDMA install,
+  `pip3 install --force-reinstall --no-deps`), §4a helper notes
+  cross-referencing the regression tests. `INSTALL.md`'s
+  "Server install" snippet no longer tells operators to clone
+  the whole repo just for one file.
+
+### Upgrade notes
+
+Same-version wheel installs (e.g. swapping a hot-fixed
+`0.3.17` wheel onto a 0.3.17 server) now actually take effect
+because of the pip `--force-reinstall` fix. Pre-0.3.17 you had
+to manually `pip3 uninstall ostg-trafficgen` first.
+
+Fresh installs on Ubuntu 24.04 should now complete without
+operator intervention. If `libmlx5-dev` fails on a non-Mellanox
+host, that's expected — log says `[WARNING] libmlx5-dev not
+available — skipping (host lacks Mellanox MOFED apt repo)`
+and the install continues.
+
 ## [0.3.16] - 2026-06-03
 
 **Bug fix: duplicate TG-id when adding servers.** Operator reported
