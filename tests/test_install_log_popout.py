@@ -134,3 +134,70 @@ def test_popout_subscribes_to_contents_changed_for_scroll():
         "Popout missing contentsChanged signal hookup — auto-scroll "
         "won't fire as new install log lines arrive."
     )
+
+
+def test_popout_does_not_override_font_size():
+    """Two QPlainTextEdits sharing a QTextDocument MUST render with
+    the same font, or block heights computed against the FIRST
+    view's font are wrong for the SECOND view → text overlaps into
+    adjacent block space.
+
+    The v0.3.16-a5e3961 fix appended ``font-size: 12px`` to the
+    popout's stylesheet while the inline view stayed at 11px → the
+    popout's lines rendered 1px taller than the document allocated
+    per block → consecutive lines visibly overlapped. Operator
+    reported "popout window is still not able to show the logs,
+    seems overlapping inside the window".
+
+    Guard: no font-size override should appear in the executable
+    code of the popout. (Comments may mention 'font-size' as part
+    of the regression-explanation.)"""
+    body = _toggle_popout_body()
+    # Strip docstrings + comments before checking
+    code_lines = []
+    in_docstring = False
+    docstring_marker = None
+    for line in body.split("\n"):
+        stripped = line.strip()
+        for marker in ('"""', "'''"):
+            if stripped.count(marker) == 1:
+                if not in_docstring:
+                    in_docstring = True
+                    docstring_marker = marker
+                elif marker == docstring_marker:
+                    in_docstring = False
+                    docstring_marker = None
+                continue
+        if in_docstring:
+            continue
+        if stripped.startswith("#"):
+            continue
+        if "#" in line:
+            code_lines.append(line.split("#", 1)[0])
+        else:
+            code_lines.append(line)
+    code_only = "\n".join(code_lines)
+
+    assert "font-size" not in code_only, (
+        "Popout sets a font-size override in executable code — the "
+        "shared QTextDocument's per-block line heights are computed "
+        "against the inline view's font metrics. If the popout's "
+        "font-size differs, text overlaps. Inherit the inline view's "
+        "stylesheet + font instead."
+    )
+
+
+def test_popout_uses_setfont_for_font_inheritance():
+    """Explicit ``view.setFont(self.log_view.font())`` ensures the
+    popout's QFont object IS the inline view's font, not just
+    similar-looking stylesheet font-family. setStyleSheet's
+    font-family rule alone can produce different QFont objects with
+    different metrics (especially around line-spacing), so we need
+    setFont() to copy the exact instance."""
+    body = _toggle_popout_body()
+    assert "setFont(self.log_view.font())" in body, (
+        "Popout must call setFont(self.log_view.font()) — without "
+        "an explicit font copy, the popout may resolve a similar-but-"
+        "different QFont that has slightly different line-height "
+        "metrics, causing the same overlap bug."
+    )

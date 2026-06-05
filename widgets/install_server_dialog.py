@@ -2267,27 +2267,33 @@ class InstallServerDialog(QDialog):
         view = QPlainTextEdit(popout)
         view.setReadOnly(True)
         view.setDocument(self.log_view.document())
-        # v0.3.16+: inherit the inline log_view's stylesheet exactly,
-        # then layer popout-specific tweaks (larger font, padding).
-        # Pre-fix the popout used a hardcoded dark theme
-        # (background:#0f172a; color:#e2e8f0). The inline log_view
-        # has NO color override — it renders with the system default
-        # foreground (typically black) on the default background
-        # (typically white). When _classify_and_append calls
-        # appendPlainText(line) on the inline view, the line's
-        # foreground color attribute on the shared QTextDocument gets
-        # bound to the inline view's default (black). The popout
-        # shares the document but had a DARK background, so all those
-        # default-color info lines rendered as black-on-dark-blue —
-        # invisible. Only the appendHtml lines with explicit
-        # red/amber/green tags survived. Operator reported "popout
-        # does not show the progression logs similar to the log text
-        # area" — that's exactly what was happening: most lines
-        # silently vanished into the dark theme.
-        view.setStyleSheet(
-            self.log_view.styleSheet()
-            + " QPlainTextEdit { padding: 8px; font-size: 12px; }"
-        )
+        # CRITICAL: inherit the inline view's stylesheet AND font
+        # OBJECT — NOT just styleSheet(). When two QPlainTextEdits
+        # share a QTextDocument, the document's per-block line
+        # heights are computed against the FIRST view's font metrics.
+        # If the popout uses a different font (e.g. font-size:12px in
+        # the popout vs 11px in the inline view), the popout renders
+        # text at 12px height but the document's blocks were
+        # allocated 11px of vertical space → text from line N+1
+        # overlaps into line N's space. Operator-visible symptom:
+        # "popout window is still not able to show the logs, seems
+        # overlapping inside the window" (the previous fix that
+        # tried to make the popout font BIGGER for readability is
+        # what re-broke it).
+        #
+        # Two pre-fix variants seen in the field:
+        #   v0.3.16-a5e3961 — appended ` QPlainTextEdit { padding: 8px;
+        #                     font-size: 12px; }` — overlap from the
+        #                     12px-vs-11px mismatch.
+        #   pre-v0.3.16     — hardcoded `background:#0f172a; color:
+        #                     #e2e8f0;` (dark theme) — different bug,
+        #                     invisible text on dark background.
+        #
+        # Correct behaviour: render IDENTICAL to the inline view.
+        # Same stylesheet, same font, same line metrics. The popout's
+        # only real difference is window size, not appearance.
+        view.setStyleSheet(self.log_view.styleSheet())
+        view.setFont(self.log_view.font())
         # Cap the popout's history too — without this, setDocument
         # would inherit the embedded view's maxBlockCount (good) but
         # explicit set documents the contract.
