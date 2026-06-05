@@ -2,6 +2,80 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.3.18] - 2026-06-05
+
+**Server-side auto-install of RDMA userspace closes the wheel-upgrade
+gap.** Operator on `svl-d-ai-srv04` upgraded from v0.3.15 → v0.3.17 via
+the Upgrade tab (wheel-only swap), then opened Tools → RDMA Blast and
+hit the red "perftest is NOT installed on server TG. Install with
+`apt install perftest`" banner. The wheel-only upgrade path doesn't
+re-run `install_ostg_complete.py`'s system-deps steps, so a server
+originally provisioned before v0.3.12 (when `_install_rdma_userspace`
+was added) ends up with the new RDMA Python runtime but no perftest
+binary. Per standing rule "user will not do such manual recovery",
+the fix had to be server-side and automatic — no operator SSH step.
+
+### What changed
+
+- **New `utils/system_deps.py`** with
+  `ensure_rdma_userspace_installed()` — daemon-thread-safe self-heal
+  that detects missing perftest and runs the distro-appropriate
+  install. Two-pass design from v0.3.17's `_install_rdma_userspace`
+  is preserved: CORE (`perftest rdma-core libibverbs-dev`) only.
+  `libmlx5-dev` (MOFED-only) is intentionally skipped — too easy to
+  break the install on non-Mellanox hosts; operators on MOFED hosts
+  still run Fresh Install for that header.
+- **Wired into `run_tgen_server.py` main()** via a daemon thread
+  right after the existing FRR REBUILD daemon-thread block. Mirrors
+  the v0.2.18 startup-hang lesson exactly — never block Flask
+  binding its port.
+- **`tests/test_system_deps_auto_install.py`** — 19 tests pinning
+  9 design properties (async/daemon-thread, once-per-uptime guard,
+  60s timeout, distro-aware, idempotent, dedicated log file,
+  kill-switch env var, never raises, non-root skip) + a wire-in
+  verification that `main()` actually spawns the thread.
+
+### Design properties (each pinned by tests)
+
+1. **Async off the Flask startup critical path** — daemon thread,
+   doesn't block port bind.
+2. **Once-per-uptime guard** via module-level `_attempted` flag +
+   threading.Lock — concurrent callers race on the lock but only
+   one invokes apt.
+3. **Time-bounded** — 60 s ceiling on every subprocess. Stuck
+   mirrors can't hang the thread forever.
+4. **Distro-aware** — apt / dnf / yum / apk / zypper. Mirrors
+   `install_ostg_complete.py._install_rdma_userspace` package
+   lists exactly.
+5. **Idempotent** — `shutil.which("ib_send_bw")` skip on
+   pre-installed hosts (zero apt cost on startup for the
+   common case).
+6. **Dedicated log** — `/var/log/netgen-auto-install.log`,
+   timestamped lines, separate from Flask request logs.
+7. **Kill-switch env var** — `NETGEN_AUTO_INSTALL=0` lets managed
+   systems opt out without changing the wheel. Accepts the common
+   off-spellings (`0`, `false`, `False`, `no`, `off`, `OFF`).
+8. **Never raises** — public API contract; daemon thread can't
+   crash the server on a malformed apt response.
+9. **Needs root** — server runs as root by default (VRF/DPDK
+   require it). Non-root invocation logs a WARNING and skips
+   rather than crashing on permission denied.
+
+### Operator impact
+
+- Upgrading any pre-existing server (any version) to v0.3.18 via the
+  Upgrade tab now automatically installs perftest + rdma-core +
+  libibverbs-dev on next service restart. No SSH step.
+- `svl-d-ai-srv04` specifically: upgrade from v0.3.17 → v0.3.18, the
+  daemon thread fires within the first ~2 sec of server start,
+  perftest lands within ~30 sec, Tools → RDMA Blast works
+  immediately without operator intervention.
+- Managed systems where apt changes by background processes are
+  disallowed: add `Environment=NETGEN_AUTO_INSTALL=0` to the
+  systemd unit override.
+- Audit trail: `tail -f /var/log/netgen-auto-install.log` shows
+  what was installed when.
+
 ## [0.3.17] - 2026-06-05
 
 **Install hardening, RDMA netdev names, and a quiet pip trap.** Fresh

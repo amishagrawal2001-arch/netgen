@@ -17077,6 +17077,44 @@ def main(argv=None):
     except Exception as e:
         logging.warning(f"[STARTUP FRR REBUILD] could not start refresh thread: {e}")
 
+    # v0.3.18 RDMA auto-install. The wheel-only upgrade path (Install
+    # Guide §9a) swaps Python code but DOESN'T re-run
+    # install_ostg_complete.py's system-deps steps. A server upgraded
+    # from a pre-v0.3.12 install (before _install_rdma_userspace existed)
+    # ends up with the new RDMA runtime code but no perftest binary —
+    # Tools → RDMA Blast pops "perftest is NOT installed" even though
+    # the operator just upgraded. utils.system_deps.ensure_rdma_userspace_installed
+    # detects this on startup and runs apt-get install -y perftest
+    # rdma-core libibverbs-dev (or distro equivalent). Idempotent —
+    # if perftest is already on PATH it returns immediately.
+    #
+    # Same daemon-thread pattern as the FRR REBUILD block above:
+    # MUST NOT block Flask binding its port (v0.2.18 startup-hang
+    # lesson). The function itself is guarded against exceptions
+    # internally; the outer try/except here is defence-in-depth in
+    # case the import itself fails on an older wheel/install combo.
+    #
+    # Operator opt-out: set NETGEN_AUTO_INSTALL=0 in the systemd
+    # unit's Environment= (managed systems where apt changes by
+    # background processes are disallowed).
+    try:
+        import threading as _threading
+
+        def _rdma_userspace_autoinstall():
+            try:
+                from utils.system_deps import ensure_rdma_userspace_installed
+                ensure_rdma_userspace_installed()
+            except Exception as e:
+                logging.warning(f"[STARTUP RDMA AUTO-INSTALL] failed: {e}")
+
+        _threading.Thread(
+            target=_rdma_userspace_autoinstall,
+            name="rdma-userspace-autoinstall",
+            daemon=True,
+        ).start()
+    except Exception as e:
+        logging.warning(f"[STARTUP RDMA AUTO-INSTALL] could not start thread: {e}")
+
     # Cleanup stale streams on startup (after reboot, no streams are actually running)
     try:
         running_streams = stream_db.get_all_streams(status="Running")
