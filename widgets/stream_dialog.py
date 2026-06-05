@@ -641,60 +641,164 @@ rate, no DPDK acceleration.</p>
 </table>
 
 <h2>3. CLI install (deep / scripted)</h2>
+
+<h3>3a. What files do I actually need?</h3>
+
+<p><b>Two files</b>, both must end up on the operator's machine before
+the install can start:</p>
+
+<table>
+  <tr><th>File</th><th>Why</th><th>Where it ships</th></tr>
+  <tr><td><code>ostg_trafficgen-&lt;v&gt;-py3-none-any.whl</code></td>
+      <td>The Python runtime (server, client, CLI, bundled
+          <code>resources/dpdk/</code> + <code>ostg_docker/</code> +
+          <code>Dockerfile.frr</code> as package data).</td>
+      <td>GitHub Releases asset; also bundled inside the
+          <code>.dmg</code> / <code>.exe</code> / AppImage.</td></tr>
+  <tr><td><code>install_ostg_complete.py</code></td>
+      <td>The OS-level orchestrator — installs Docker, Python 3.10,
+          perftest, rdma-core, DPDK build deps, systemd unit. <b>NOT
+          in the wheel today</b>; needs to be shipped alongside it.</td>
+      <td>Repo root (clone the repo or copy this single file out).
+          Also auto-uploaded by the in-GUI Fresh Install dialog from
+          its own bundled copy.</td></tr>
+</table>
+
+<p>The 4 optional files (<code>Dockerfile.frr</code>,
+<code>requirements.txt</code>, <code>resources/dpdk/</code>,
+<code>ostg_docker/</code>) are <i>extracted from inside the wheel</i>
+during the install if not present alongside the installer. Operator
+only needs to coordinate them when shipping patched versions for
+testing.</p>
+
+<h3>3b. One-shot run</h3>
+
 <pre># From a fresh checkout — build the wheel locally (gitignored)
 python3 -m build --wheel
 
 # Install on a target host (root credentials required)
 python3 install_ostg_complete.py -H &lt;host&gt; -p &lt;password&gt;</pre>
 
-<p>That's it. ~15-20 minutes on a fresh box (most of which is the DPDK build).
+<p>That's it. ~15-45 minutes on a fresh box (most of which is the DPDK build).
 At the end you have netgen-server running as a systemd unit, listening on
 port 5050, and a <code>tx_worker</code> binary ready to drive line-rate
 DPDK streams.</p>
 
+<h3>3c. Wheel-only path (today: not yet supported)</h3>
+
+<p>A user with ONLY <code>ostg_trafficgen-&lt;v&gt;-py3-none-any.whl</code>
+in hand can <code>pip install</code> it successfully, but
+<code>ostg-server</code> won't actually start — Docker, perftest,
+DPDK, the systemd unit, and Python 3.10 itself aren't there yet, and
+the wheel has no way to install them. Use one of the in-GUI Fresh
+Install flow (§1), the GitHub-release download flow (§2), or the
+git-clone CLI flow (§3b) for now.</p>
+
 <h2>4. What gets installed, in order</h2>
+
+<p>The orchestrator runs these steps in sequence on the target. Each
+shells out via the hardened <code>_apt_install</code> /
+<code>_install_apt_keyring</code> helpers (see notes at the end of this
+table) so noninteractive installs survive conffile prompts and modern
+GnuPG 2.x.</p>
 
 <table>
   <tr><th>Step</th><th>What it does</th></tr>
+  <tr><td><b>_heal_dpkg_state</b><br><span class="ok">NEW in 0.3.16</span></td>
+      <td>Pre-flight that recovers from a prior failed install:
+          <code>dpkg --audit</code> → force-remove half-installed
+          Docker stack if needed →
+          <code>dpkg --configure -a --force-confdef --force-confold</code>
+          → <code>apt-get clean / update</code>. No-op on a clean box.
+          Eliminates the "user must SSH in and run apt --fix-broken
+          install" recovery step after a failed run.</td></tr>
   <tr><td><b>cleanup_old_install</b></td>
       <td>Wipes legacy <code>/opt/OSTG/</code> artifacts and the old
-          <code>ostg-server.service</code> systemd unit. No-op on a fresh
-          box.</td></tr>
+          <code>ostg-server.service</code> systemd unit. No-op on a
+          fresh box.</td></tr>
   <tr><td><b>install_system_dependencies</b></td>
       <td>apt baseline: <code>python3-pip</code>, build-essential, git,
-          curl, wget, sshpass, etc.</td></tr>
+          curl, wget, gnupg, lsb-release, sshpass, etc. All apt installs
+          go through <code>_apt_install</code> which appends
+          <code>-o Dpkg::Options::=--force-confdef -o
+          Dpkg::Options::=--force-confold</code> to handle conffile
+          diffs without prompting.</td></tr>
+  <tr><td><b>_install_python_3_10</b></td>
+      <td>Adds deadsnakes PPA on Ubuntu →
+          <code>_apt_install("python3.10 python3.10-venv")</code>.
+          RHEL/Fedora use the distro's Python package directly.</td></tr>
+  <tr><td><b>_bootstrap_pip_for_python310</b></td>
+      <td>Three-step fallback chain to put pip on the new Python:
+          <code>python3.10 -m ensurepip --upgrade --default-pip</code>
+          → distro <code>python3-pip</code> via apt/dnf → final
+          fallback <code>get-pip.py --ignore-installed</code> (the
+          <code>--ignore-installed</code> avoids the "Cannot uninstall
+          packaging 24.0" failure on Debian-managed packages).</td></tr>
   <tr><td><b>install_python_dependencies</b></td>
-      <td>Python deps from <code>requirements.txt</code>.</td></tr>
-  <tr><td><b>install_docker</b></td>
-      <td>Docker Engine + buildx (used by the FRR sidecar containers for
-          BGP/OSPF/ISIS device emulation).</td></tr>
-  <tr><td><b>install_ostg</b></td>
-      <td>pip-installs the <code>ostg_trafficgen-X.Y.Z.whl</code> wheel,
-          deploys all <code>resources/dpdk/*.sh</code> helper scripts, and
-          critically — copies <code>resources/dpdk/tx_worker/</code>
-          (<code>tx_worker.c</code> + <code>meson.build</code>) so the
-          DPDK build step has source to compile.</td></tr>
+      <td>Python deps from <code>requirements.txt</code> (matches
+          wheel metadata).</td></tr>
+  <tr><td><b>install_docker</b><br><span class="ok">hardened in 0.3.16</span></td>
+      <td>Adds Docker's apt repo with the new
+          <code>_install_apt_keyring</code> helper —
+          <code>curl</code> the gpg key to a tmp file then
+          <code>gpg --batch --no-tty --yes --dearmor</code> to
+          <code>/etc/apt/keyrings/docker.gpg</code>. The
+          <code>--batch --no-tty</code> flags prevent the
+          "<code>gpg: cannot open '/dev/tty'</code>" failure on
+          nohup-detached installs. Then
+          <code>_apt_install("docker-ce docker-ce-cli containerd.io
+          docker-compose-plugin")</code> — the
+          <code>--force-confdef</code> flags handle
+          <code>containerd.io</code>'s <code>config.toml</code>
+          diff (the v0.3.16 fresh-install failure site).</td></tr>
+  <tr><td><b>_install_rdma_userspace</b><br><span class="ok">split in 0.3.16</span></td>
+      <td><b>Two-pass install</b> to handle Mellanox-MOFED-only
+          packages on hosts without the MOFED apt repo:<br/>
+          <b>Pass 1 (CORE, must succeed):</b>
+          <code>_apt_install("perftest rdma-core libibverbs-dev")</code>
+          — these are in Ubuntu main, so they always install on a
+          reachable box. <code>perftest</code> ships ib_send_bw,
+          ib_write_bw, ib_read_bw + their _lat variants.<br/>
+          <b>Pass 2 (MOFED-optional, warns on failure):</b>
+          <code>_apt_install("libmlx5-dev", check=False)</code> —
+          this header only lives in Mellanox's MOFED apt repo. Pre-fix,
+          all 4 packages were lumped together; apt's all-or-nothing
+          batching meant a MOFED-less host got NONE of them, breaking
+          RDMA entirely even though 3 of 4 were available.</td></tr>
   <tr><td><b>install_dpdk_runtime</b><br><span class="ok">★ default ON</span></td>
-      <td>Runs <code>install_dpdk.sh --auto</code> on the target. Installs
-          apt prereqs (<code>build-essential meson ninja-build pkg-config
-          libnuma-dev libelf-dev libpcap-dev libibverbs-dev libmlx5-dev
-          rdma-core</code>), clones DPDK source, configures with meson
+      <td>Runs <code>resources/dpdk/install_dpdk.sh --auto</code> on
+          the target. Installs apt prereqs (build-essential, meson,
+          ninja-build, pkg-config, libnuma-dev, libelf-dev, libpcap-dev,
+          libibverbs-dev), clones DPDK source, configures with meson
           (<code>-Ddisable_drivers=net/mana</code>), builds with ninja,
           installs to <code>/usr/local/lib/x86_64-linux-gnu</code>,
           <code>ldconfig</code>, then compiles <code>tx_worker</code>
-          against the freshly-installed DPDK.<br/>
-          <b>RDMA note (0.3.12):</b> the apt prereqs list also installs
-          <code>perftest</code> alongside <code>libibverbs-dev</code> +
-          <code>libmlx5-dev</code> + <code>rdma-core</code>. Any DPDK
-          install therefore lands RDMA traffic-gen capability too —
-          see §10 for the workflow details and §10·m for manual
-          recovery if perftest install was suppressed.</td></tr>
+          against the freshly-installed DPDK. The DPDK script ALSO has
+          the same <code>--force-confdef</code> / <code>--force-confold</code>
+          + a separate <code>mlx5_install_cmd</code> with
+          <code>log_warning</code> fallback, mirroring the Python-side
+          two-pass split.</td></tr>
   <tr><td><b>install_ai_dependencies</b></td>
       <td>Optional ML/AI helpers for the AI Assistant menu.</td></tr>
   <tr><td><b>install_ollama</b></td>
       <td>Local LLM runtime for the AI Assistant.</td></tr>
+  <tr><td><b>install_ostg (wheel install)</b><br><span class="ok">hardened in 0.3.17</span></td>
+      <td><code>pip3 install --force-reinstall --no-deps
+          &lt;wheel&gt;</code> — primary pass. The
+          <code>--force-reinstall</code> is critical for the case where
+          a developer rebuilds the same-version wheel (e.g. shipping a
+          fix without bumping the version): without it pip says
+          "Requirement already satisfied" and silently keeps the old
+          code on disk. <code>--no-deps</code> keeps the reinstall fast.
+          A separate deps-only pass (no <code>--no-deps</code>) handles
+          first-install dependency resolution. Falls back to
+          <code>--ignore-installed</code> if a Debian-managed
+          distutils package blocks uninstall.</td></tr>
   <tr><td><b>setup_docker_frr</b></td>
-      <td>Builds the FRR sidecar Docker image used by emulated devices.</td></tr>
+      <td>Builds the FRR sidecar Docker image used by emulated devices,
+          with <code>--network=host</code> so the build can reach
+          Alpine's apk mirrors on networks without a default Docker
+          bridge.</td></tr>
   <tr><td><b>create_systemd_services</b></td>
       <td>Drops <code>netgen-server.service</code> into
           <code>/etc/systemd/system/</code> and enables it.</td></tr>
@@ -702,11 +806,44 @@ DPDK streams.</p>
       <td><code>systemctl start netgen-server</code> + waits for the
           <code>/api/health</code> endpoint to come up.</td></tr>
   <tr><td><b>verify_installation</b></td>
-      <td>Sanity checks: pip list, systemctl status, /api/health 200.</td></tr>
+      <td>Sanity checks: pip list, systemctl status, /api/health 200,
+          <code>which perftest</code>, <code>ibv_devices</code>.</td></tr>
   <tr><td><b>test_frr_functionality</b></td>
-      <td>Smoke-test FRR Docker container can spawn (skipped if Docker is
-          missing).</td></tr>
+      <td>Smoke-test FRR Docker container can spawn (skipped if Docker
+          is missing).</td></tr>
 </table>
+
+<h3>4a. Helper notes</h3>
+
+<p>Three helpers carry the install's hardening — they're chokepoints
+for every install step that talks to apt or gpg, so a refactor can't
+silently regress to the old behavior. Each is pinned by tests under
+<code>tests/test_apt_noninteractive.py</code>,
+<code>tests/test_apt_keyring_helper.py</code>,
+<code>tests/test_dpkg_heal_preflight.py</code>,
+<code>tests/test_rdma_install_split.py</code>,
+<code>tests/test_pip_force_reinstall.py</code>:</p>
+
+<ul>
+  <li><b><code>_apt_install(packages, check=True, extra_opts="")</code></b>
+      — wraps every <code>apt-get install -y</code> with
+      <code>-o Dpkg::Options::=--force-confdef
+            -o Dpkg::Options::=--force-confold</code>.
+      Without these flags, conffile prompts from packages like
+      <code>containerd.io</code> EOF the nohup-detached install. Use
+      <code>check=False</code> for MOFED-optional packages.</li>
+  <li><b><code>_install_apt_keyring(name, key_url)</code></b> —
+      <code>curl</code> the gpg key to a tmp file, then
+      <code>gpg --batch --no-tty --yes --dearmor</code> to
+      <code>/etc/apt/keyrings/&lt;name&gt;.gpg</code>. The
+      <code>--batch --no-tty</code> avoids the
+      <code>cannot open '/dev/tty'</code> failure modern GnuPG 2.x
+      triggers in detached sessions.</li>
+  <li><b><code>_heal_dpkg_state()</code></b> — pre-flight that recovers
+      from prior failed installs (half-installed Docker stack,
+      pending conffile resolution). Removes the operator-must-SSH-in
+      manual recovery step entirely.</li>
+</ul>
 
 <h2>5. CLI flags</h2>
 

@@ -29,15 +29,39 @@ chmod +x Netgen-Client-*-linux-x86_64.AppImage
 ```
 
 **Server** (Linux box that owns the NICs):
+
+The server install needs **two files** on the operator's machine — the
+wheel and `install_ostg_complete.py` (the OS-level orchestrator that
+installs Docker, Python 3.10, perftest, rdma-core, DPDK build deps, and
+the systemd unit). The wheel by itself is not enough: `pip install` will
+succeed but `ostg-server` won't start because Docker, perftest, DPDK,
+and Python 3.10 aren't there yet, and the wheel has no way to install
+them.
+
+Recommended (no git clone — two release-asset downloads):
 ```bash
-# Download the wheel + the repo's install_ostg_complete.py
-wget https://github.com/amishagrawal2001-arch/netgen/releases/latest/download/ostg_trafficgen-VERSION-py3-none-any.whl
-git clone --depth 1 https://github.com/amishagrawal2001-arch/netgen.git netgen-installer
-sudo python3 netgen-installer/install_ostg_complete.py
+VER=$(curl -s https://api.github.com/repos/amishagrawal2001-arch/netgen/releases/latest \
+       | grep -oP '"tag_name": "v\K[^"]+')
+BASE=https://github.com/amishagrawal2001-arch/netgen/releases/latest/download
+wget $BASE/ostg_trafficgen-${VER}-py3-none-any.whl
+wget $BASE/install_ostg_complete.py            # ships as a release asset alongside the wheel
+sudo python3 install_ostg_complete.py --wheel ostg_trafficgen-${VER}-py3-none-any.whl
 ```
 
-That's it for Option A. For finer control or to customize before shipping,
-see Option B below.
+Alternative (clone the repo to grab the installer):
+```bash
+git clone --depth 1 https://github.com/amishagrawal2001-arch/netgen.git
+cd netgen
+wget https://github.com/amishagrawal2001-arch/netgen/releases/latest/download/ostg_trafficgen-VERSION-py3-none-any.whl
+sudo python3 install_ostg_complete.py --wheel ostg_trafficgen-VERSION-py3-none-any.whl
+```
+
+Easiest of all: use the in-GUI Fresh Install dialog from the client
+(`.dmg` / `.exe` / AppImage) — both files are bundled inside the app,
+the dialog auto-discovers them, SFTPs them to the target, and streams
+the install log. See **Option A → Quick install per platform** above.
+
+For finer control or to customize before shipping, see Option B below.
 
 ---
 

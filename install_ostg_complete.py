@@ -1215,17 +1215,58 @@ class NetgenInstaller:
             sys.exit(1)
             
         self.copy_file(local_wheel_path, remote_wheel_path)
-        
-        # Install wheel (retry with --ignore-installed if distutils-owned packages block uninstall)
-        pip_result = self.run_command(f"pip3 install {remote_wheel_path}", check=False, capture_output=True)
+
+        # Install wheel. ``--force-reinstall`` is REQUIRED so that
+        # rebuilding the same-version wheel (e.g. fresh source
+        # contents shipped without a version bump — Option A in the
+        # ship-or-rebuild decision tree) actually replaces the
+        # installed package. Without it, pip resolves the wheel
+        # filename to ``ostg_trafficgen==<version>``, sees that
+        # version already installed, and silently skips — leaving
+        # the server running stale code. ``--no-deps`` keeps the
+        # reinstall fast: the wheel's deps were resolved + installed
+        # on the first pass and don't need re-resolution for an
+        # in-place artifact swap.
+        #
+        # Retry with --ignore-installed if distutils-owned packages
+        # block uninstall (Debian-managed packaging shipped via dpkg
+        # can't be cleanly uninstalled by pip).
+        pip_result = self.run_command(
+            f"pip3 install --force-reinstall --no-deps {remote_wheel_path}",
+            check=False, capture_output=True,
+        )
         if pip_result.returncode != 0:
             err = (pip_result.stderr or "") + (pip_result.stdout or "")
             if "uninstall-distutils-installed-package" in err or "Cannot uninstall" in err:
                 self.log("Pip failed due to distutils-installed package conflict; retrying with --ignore-installed", "WARNING")
-                pip_result = self.run_command(f"pip3 install --ignore-installed {remote_wheel_path}", check=False, capture_output=True)
+                pip_result = self.run_command(
+                    f"pip3 install --force-reinstall --no-deps --ignore-installed {remote_wheel_path}",
+                    check=False, capture_output=True,
+                )
             if pip_result.returncode != 0:
                 self.log(f"Wheel install failed: {pip_result.stderr or pip_result.stdout or 'unknown'}", "ERROR")
                 raise SystemExit(1)
+
+        # First-install safety net: --no-deps above means the very
+        # first install would skip dependency resolution. Run a
+        # separate deps-only pass that's idempotent — if deps are
+        # already there it's a no-op; if this is a fresh host (no
+        # prior install) it installs them. Using ``--upgrade-strategy
+        # only-if-needed`` keeps already-satisfied deps in place.
+        deps_result = self.run_command(
+            f"pip3 install --upgrade-strategy only-if-needed {remote_wheel_path}",
+            check=False, capture_output=True,
+        )
+        if deps_result.returncode != 0:
+            # Non-fatal — the --force-reinstall --no-deps install
+            # above already succeeded. Most likely cause is a
+            # distutils-conflict on a dep that's also OS-managed;
+            # log and continue.
+            self.log(
+                "Deps pass had non-zero return — wheel itself installed OK, "
+                f"deps may already be satisfied: {(deps_result.stderr or deps_result.stdout or '').strip()[:200]}",
+                "WARNING",
+            )
 
         # Extract bundled assets from the wheel's site-packages to
         # /opt/netgen/ — covers the case where the operator's install
