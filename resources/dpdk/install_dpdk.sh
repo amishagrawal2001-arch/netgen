@@ -478,7 +478,16 @@ step_install_dependencies() {
     # any nohup-detached install context. The DEBIAN_FRONTEND env
     # var alone does NOT cover dpkg's own conffile prompt; the
     # Dpkg::Options::= flags are mandatory for it.
-    local deps_install_cmd="DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold --option Acquire::http::Timeout=30 --option Acquire::ftp::Timeout=30 build-essential meson ninja-build pkg-config libnuma-dev libelf-dev libpcap-dev libibverbs-dev libmlx5-dev rdma-core perftest ${kernel_headers}"
+    # v0.3.16+: libmlx5-dev split into a separate optional install.
+    # Pre-fix, putting libmlx5-dev in the SAME apt-get install batch
+    # as the rest meant `apt: Unable to locate package libmlx5-dev`
+    # on hosts without Mellanox MOFED apt repo configured (e.g.
+    # svl-d-ai-srv04) failed the entire batch with rc=100 → DPDK
+    # build deps + perftest + rdma-core also didn't install →
+    # cascading install failure. Split so the optional Mellanox
+    # package can fail independently without poisoning the core set.
+    local deps_install_cmd="DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold --option Acquire::http::Timeout=30 --option Acquire::ftp::Timeout=30 build-essential meson ninja-build pkg-config libnuma-dev libelf-dev libpcap-dev libibverbs-dev rdma-core perftest ${kernel_headers}"
+    local mlx5_install_cmd="DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold libmlx5-dev"
     
     # v0.3.2: tighten umask around the temp-log tee so the file is
     # 0600 (owner-only) instead of the default 0644 (world-readable).
@@ -513,6 +522,20 @@ step_install_dependencies() {
     fi
     
     rm -f /tmp/dpdk_deps_install.log
+
+    # v0.3.16+: Mellanox-optional pass. Only available with MOFED
+    # apt repo configured. Tolerate failure cleanly so non-Mellanox
+    # hosts (e.g. svl-d-ai-srv04) don't see this surface as an
+    # install error.
+    log_info "Attempting libmlx5-dev install (Mellanox MOFED-optional)..."
+    if eval "$mlx5_install_cmd" >/tmp/dpdk_mlx5_install.log 2>&1; then
+        log_success "libmlx5-dev installed (Mellanox PMD dev headers present)"
+    else
+        log_warning "libmlx5-dev not available — skipping (host lacks Mellanox MOFED apt repo)."
+        log_warning "RoCEv2 + perftest still work via libibverbs-dev; only Mellanox-specific"
+        log_warning "PMD build flags are missing. Add MOFED repo + re-run if you need them."
+    fi
+    rm -f /tmp/dpdk_mlx5_install.log
 }
 
 # Step 5: Build DPDK

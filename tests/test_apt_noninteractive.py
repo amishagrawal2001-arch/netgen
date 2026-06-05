@@ -220,8 +220,14 @@ def test_specific_callsites_converted_to_helper():
          "Python 3.10 + venv install (post deadsnakes PPA)"),
         ("ca-certificates curl gnupg lsb-release",
          "Docker repo prereqs install"),
-        ("perftest rdma-core libibverbs-dev libmlx5-dev",
-         "RDMA userspace install (v0.3.12 RDMA feature)"),
+        # v0.3.16+: the original 4-package list was split into
+        # CORE (perftest rdma-core libibverbs-dev) + MOFED-OPTIONAL
+        # (libmlx5-dev) — see _install_rdma_userspace docstring +
+        # tests/test_rdma_install_split.py. Pin the CORE list here;
+        # the libmlx5-dev split is covered by the dedicated test
+        # file.
+        ("perftest rdma-core libibverbs-dev",
+         "RDMA userspace install — core package set (v0.3.16+ split)"),
     ]
     for pkg_string, label in expected_via_helper:
         found = any(pkg_string in call for call in calls)

@@ -451,45 +451,101 @@ class NetgenInstaller:
     def _install_rdma_userspace(self):
         """Install perftest + verbs userspace for v0.3.12 RDMA traffic-gen.
 
-        Distro-specific package names:
-          apt  → perftest rdma-core libibverbs-dev libmlx5-dev
-          dnf  → perftest rdma-core libibverbs-devel libmlx5-devel
-          yum  → same as dnf (RHEL 7/8; perftest from EPEL, enabled
-                              earlier in _install_yum_packages)
-          apk  → perftest rdma-core libibverbs-dev
-                 (Alpine bundles libmlx5 into rdma-core; no separate package)
-          zypper → perftest rdma-core libibverbs-devel libmlx5-devel
+        Split into TWO passes so one missing package can't poison the
+        whole batch:
 
-        check=False on every command so a partial set (e.g. perftest
-        present but libmlx5 absent on a niche distro) still installs
-        what it can. ~3 MB total when everything lands; rdma-core is
-        typically already present on modern distros.
+          1. CORE — always-available everywhere in Ubuntu main /
+             Fedora / Alpine main / openSUSE main:
+                perftest, rdma-core, libibverbs-dev (libibverbs-devel)
+          2. MELLANOX-OPTIONAL — only in Mellanox MOFED's apt repo
+             (not Ubuntu main on stock images): libmlx5-dev
+
+        v0.3.16+ bug fix: pre-fix put all 4 packages in ONE
+        `apt-get install` command. When libmlx5-dev was missing
+        (host without Mellanox MOFED repo configured — e.g.
+        svl-d-ai-srv04), apt returned rc=100 and installed NONE of
+        the 4 packages — including the 3 that were available in
+        Ubuntu main. Operator's RDMA features stayed broken
+        ("perftest binary not on PATH after install") even though
+        ~75% of the package list was installable. Splitting the
+        batches isolates the failure to libmlx5-dev only.
+
+        Distro-specific names:
+          apt  CORE → perftest rdma-core libibverbs-dev
+          apt  MLX5 → libmlx5-dev
+          dnf  CORE → perftest rdma-core libibverbs-devel
+          dnf  MLX5 → libmlx5-devel
+          yum  same as dnf (RHEL 7/8; perftest from EPEL, enabled
+                            earlier in _install_yum_packages)
+          apk       → perftest rdma-core libibverbs-dev
+                      (Alpine bundles libmlx5 into rdma-core;
+                      no separate package to try)
+          zypper CORE → perftest rdma-core libibverbs-devel
+          zypper MLX5 → libmlx5-devel
+
+        check=False on every command so a Mellanox-only package
+        miss doesn't abort the install (the WARNING in the second
+        pass tells operators why their MOFED-specific package isn't
+        present).
         """
         pm = self.system_info["package_manager"]
         self.log("Installing RDMA userspace + perftest (for Tools → RDMA)...")
+        # Pass 1: core packages (always available in distro mainline).
+        # Pass 2: Mellanox-optional libmlx5-dev (only in MOFED repo).
         if pm == "apt":
             self._wait_for_apt_lock()
             self._apt_install(
-                "perftest rdma-core libibverbs-dev libmlx5-dev",
+                "perftest rdma-core libibverbs-dev",
                 check=False,
             )
+            # Mellanox-optional pass — separate so a missing package
+            # can't cascade-fail the core install.
+            r = self._apt_install("libmlx5-dev", check=False)
+            if getattr(r, "returncode", 0) != 0:
+                self.log(
+                    "libmlx5-dev not available — skipping (host lacks "
+                    "Mellanox MOFED apt repo). RDMA + perftest still "
+                    "work via libibverbs-dev; this only affects "
+                    "Mellanox-specific build flags. Add MOFED repo "
+                    "and re-run install for full Mellanox dev headers.",
+                    "WARNING",
+                )
         elif pm in ("dnf", "yum"):
             self.run_command(
-                f"{pm} install -y perftest rdma-core "
-                "libibverbs-devel libmlx5-devel",
+                f"{pm} install -y perftest rdma-core libibverbs-devel",
                 check=False,
             )
+            r = self.run_command(
+                f"{pm} install -y libmlx5-devel",
+                check=False, capture_output=True,
+            )
+            if r.returncode != 0:
+                self.log(
+                    "libmlx5-devel not available — skipping (no MOFED "
+                    "repo configured). Core RDMA install proceeded.",
+                    "WARNING",
+                )
         elif pm == "apk":
+            # Alpine bundles libmlx5 into rdma-core; nothing optional.
             self.run_command(
                 "apk add perftest rdma-core libibverbs-dev",
                 check=False,
             )
         elif pm == "zypper":
             self.run_command(
-                "zypper install -y perftest rdma-core "
-                "libibverbs-devel libmlx5-devel",
+                "zypper install -y perftest rdma-core libibverbs-devel",
                 check=False,
             )
+            r = self.run_command(
+                "zypper install -y libmlx5-devel",
+                check=False, capture_output=True,
+            )
+            if r.returncode != 0:
+                self.log(
+                    "libmlx5-devel not available — skipping (no MOFED "
+                    "repo configured). Core RDMA install proceeded.",
+                    "WARNING",
+                )
         else:
             self.log(
                 f"No RDMA install path defined for package manager: {pm}. "
