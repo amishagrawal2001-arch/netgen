@@ -80,6 +80,24 @@ _MTU_OPTIONS: List[Tuple[int, str]] = [
     (5,  "4096 B  (default)"),
 ]
 
+# v0.3.19: tooltip on the IB-port spinbox in the Devices group.
+# The field maps to perftest's -i flag and matters only on the
+# uncommon HCAs where ONE IB device exposes MULTIPLE physical ports.
+# Modern Mellanox CX-5/6/7 + Bluefield expose each port as its OWN
+# device (mlx5_0, mlx5_1, …), so the spinbox should stay at 1 for
+# the vast majority of users — this tooltip explains why.
+_PORT_FIELD_TOOLTIP = (
+    "Physical port on the HCA (perftest -i <N>).\n\n"
+    "Almost always 1 on modern Mellanox hardware:\n"
+    "ConnectX-5/6/7 + Bluefield expose each physical port as its "
+    "OWN IB device (mlx5_0, mlx5_1, …), so picking the device "
+    "already picks the port. Leave this at 1.\n\n"
+    "Only bump above 1 if your HCA exposes multiple ports under "
+    "ONE device (older ConnectX-3 in dual-port mode, some pure-IB "
+    "firmware, or Intel irdma cards). In that case the device "
+    "combo's label shows port2=ACTIVE alongside port1=ACTIVE."
+)
+
 
 # ─────────────────────────────────── small per-side helper
 
@@ -160,6 +178,31 @@ class RdmaBlastFlowDialog(QDialog):
         # Sibling iface guard — wired by the menu handler the same way
         # DpdkBlastFlowDialog does it.
         self._sibling_iface_provider = lambda: set()
+        # v0.3.19 perftest-retry state. When the initial probe finds
+        # perftest missing on a TG (server or client), we kick off
+        # this timer to re-probe every 5 sec for up to 2 min. Covers
+        # the window where v0.3.18's server-side auto-install
+        # (utils.system_deps.ensure_rdma_userspace_installed) is
+        # still landing perftest in the background. Without this,
+        # the red banner sticks until operator close+reopen even
+        # after the binary lands ~30 sec later.
+        self._perftest_retry_timer: Optional[QTimer] = None
+        self._perftest_retry_attempts: int = 0
+        self._perftest_missing_sides: set = set()
+        # v0.3.19 per-side finished tracking + render-dedup. Pre-fix
+        # ``_is_finished(side, job, want_side)`` returned False any
+        # time ``side != want_side`` — which meant the server's
+        # poll callback could only see the server's done state,
+        # never the client's, so ``_on_both_finished()`` never fired
+        # and the poll timer ran forever, re-appending the same
+        # "[server] done (rc=0) ..." line every 2 sec. The fix
+        # tracks each side independently on the instance, then the
+        # callback ANDs the two flags. _last_rendered_key dedups
+        # the chunk render so even an active poll doesn't spam the
+        # stats view with identical lines.
+        self._server_finished: bool = False
+        self._client_finished: bool = False
+        self._last_rendered_key: dict = {"server": None, "client": None}
 
         self._build_ui()
         self._probe_both_sides()
@@ -167,57 +210,93 @@ class RdmaBlastFlowDialog(QDialog):
     # ─────────── construction
 
     def _build_ui(self) -> None:
+        # v0.3.19 compact + professional refresh:
+        #   - Header trimmed from 4-sentence paragraph to title + 1-line subtitle.
+        #   - Tighter group-box stylesheet (smaller titles, 4-px paddings).
+        #   - Endpoints: single inline strip (no 2-row grid).
+        #   - Devices: 2 rows, fixed-width spinboxes for the IB-port field.
+        #   - Test params: 2-column grid (4 rows of pairs + 1 row of checkboxes)
+        #     instead of an 8-row vertical form — fits ~40% less vertical space.
+        #   - Action row: Start/Stop + inline status label on one row,
+        #     reclaims ~20px below.
+        # Functionality identical — every spinbox / combo / tooltip preserved.
         root = QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(6)
 
+        # ── Compact group-box stylesheet (apply to all subsequent
+        # QGroupBox instances in this dialog).
+        self.setStyleSheet(
+            "QGroupBox {"
+            "  font-weight: 600; color: #334155;"
+            "  border: 1px solid #cbd5e1; border-radius: 4px;"
+            "  margin-top: 9px; padding: 6px 8px 8px 8px;"
+            "}"
+            "QGroupBox::title {"
+            "  subcontrol-origin: margin; subcontrol-position: top left;"
+            "  left: 8px; padding: 0 4px;"
+            "}"
+            "QLabel { color: #1f2937; }"
+        )
+
+        # ── Header — title + one-line subtitle.
         hdr = QLabel(
-            "<b>Blast a RDMA Flow</b><br/>"
-            "<span style='color:#475569;'>"
-            "perftest orchestrator. Spawns the matching ib_*_bw / ib_*_lat "
-            "tool on each side via /api/rdma/perftest/start. Both halves "
-            "share a handshake_id so the GUI can correlate them. "
-            "No effect on the Streams tab — these are ephemeral "
-            "perftest invocations, not stream-engine streams."
+            "<span style='font-size:13px; font-weight:600; color:#0f172a;'>"
+            "Blast a RDMA Flow</span>"
+            "&nbsp;&nbsp;"
+            "<span style='color:#64748b; font-size:11px;'>"
+            "perftest orchestrator — ib_*_bw / ib_*_lat on each side, "
+            "correlated by handshake_id"
             "</span>"
         )
         hdr.setWordWrap(True)
         root.addWidget(hdr)
 
-        # ── TG endpoints group (URLs are passed in by the menu
-        # action; we DISPLAY them here so the operator knows which
-        # side is which, but we don't make them editable. To run
-        # against a different pair, close this and pick from the
-        # server tree.)
+        # ── Endpoints (compact inline strip). When loopback, collapse
+        # the Client TG line entirely since it's identical.
+        same_tg = self._server_tg_url == self._client_tg_url
         tg_box = QGroupBox("Endpoints")
         tg_grid = QGridLayout(tg_box)
-        tg_grid.setHorizontalSpacing(8)
-        tg_grid.setVerticalSpacing(6)
-        tg_grid.addWidget(QLabel("Server TG:"), 0, 0, Qt.AlignRight)
-        tg_grid.addWidget(QLabel(f"<code>{self._server_tg_label} → {self._server_tg_url}</code>"), 0, 1)
-        tg_grid.addWidget(QLabel("Client TG:"), 1, 0, Qt.AlignRight)
-        same_tg = self._server_tg_url == self._client_tg_url
-        client_label = (
-            f"<code>{self._client_tg_label} → {self._client_tg_url}</code>"
-            + ("  <i>(same as server — loopback test)</i>" if same_tg else "")
+        tg_grid.setHorizontalSpacing(6)
+        tg_grid.setVerticalSpacing(2)
+        tg_grid.setContentsMargins(8, 4, 8, 4)
+        tg_grid.addWidget(QLabel("<b>Server TG</b>"), 0, 0, Qt.AlignRight)
+        tg_grid.addWidget(
+            QLabel(f"<code>{self._server_tg_label} → {self._server_tg_url}</code>"),
+            0, 1,
         )
-        tg_grid.addWidget(QLabel(client_label), 1, 1)
+        if same_tg:
+            tg_grid.addWidget(
+                QLabel("<span style='color:#64748b;'>"
+                       "<i>(loopback — client TG is the same host)</i></span>"),
+                1, 0, 1, 2,
+            )
+        else:
+            tg_grid.addWidget(QLabel("<b>Client TG</b>"), 1, 0, Qt.AlignRight)
+            tg_grid.addWidget(
+                QLabel(f"<code>{self._client_tg_label} → {self._client_tg_url}</code>"),
+                1, 1,
+            )
+        tg_grid.setColumnStretch(1, 1)
         root.addWidget(tg_box)
 
-        # ── Device picks. Two combos — one per side. Populated
-        # asynchronously by _probe_both_sides() which calls
-        # /api/rdma/devices on each TG.
+        # ── Device picks. Two combos, fixed-width port spinboxes.
         dev_box = QGroupBox("RDMA Devices")
         dev_grid = QGridLayout(dev_box)
-        dev_grid.setHorizontalSpacing(8)
-        dev_grid.setVerticalSpacing(8)
+        dev_grid.setHorizontalSpacing(6)
+        dev_grid.setVerticalSpacing(4)
+        dev_grid.setContentsMargins(8, 4, 8, 4)
         dev_grid.addWidget(QLabel("Server device:"), 0, 0, Qt.AlignRight)
         self._server_device_combo = QComboBox()
         self._server_device_combo.setMinimumWidth(220)
         self._server_device_combo.addItem("(probing…)", userData=None)
         dev_grid.addWidget(self._server_device_combo, 0, 1)
-        dev_grid.addWidget(QLabel("IB port:"), 0, 2, Qt.AlignRight)
+        dev_grid.addWidget(QLabel("Port:"), 0, 2, Qt.AlignRight)
         self._server_port_spin = QSpinBox()
         self._server_port_spin.setRange(1, 8)
         self._server_port_spin.setValue(1)
+        self._server_port_spin.setFixedWidth(56)
+        self._server_port_spin.setToolTip(_PORT_FIELD_TOOLTIP)
         dev_grid.addWidget(self._server_port_spin, 0, 3)
 
         dev_grid.addWidget(QLabel("Client device:"), 1, 0, Qt.AlignRight)
@@ -225,20 +304,27 @@ class RdmaBlastFlowDialog(QDialog):
         self._client_device_combo.setMinimumWidth(220)
         self._client_device_combo.addItem("(probing…)", userData=None)
         dev_grid.addWidget(self._client_device_combo, 1, 1)
-        dev_grid.addWidget(QLabel("IB port:"), 1, 2, Qt.AlignRight)
+        dev_grid.addWidget(QLabel("Port:"), 1, 2, Qt.AlignRight)
         self._client_port_spin = QSpinBox()
         self._client_port_spin.setRange(1, 8)
         self._client_port_spin.setValue(1)
+        self._client_port_spin.setFixedWidth(56)
+        self._client_port_spin.setToolTip(_PORT_FIELD_TOOLTIP)
         dev_grid.addWidget(self._client_port_spin, 1, 3)
+        dev_grid.setColumnStretch(1, 1)
         root.addWidget(dev_box)
 
-        # ── Test + params group.
-        test_box = QGroupBox("Test")
-        form = QFormLayout(test_box)
-        form.setLabelAlignment(Qt.AlignRight)
-        form.setHorizontalSpacing(8)
-        form.setVerticalSpacing(6)
+        # ── Test parameters — 2-column grid. Was an 8-row vertical
+        # QFormLayout; now 4 rows of (label/widget, label/widget)
+        # pairs + 1 row for the two checkboxes. Same widgets, same
+        # tooltips, same handlers; just denser.
+        test_box = QGroupBox("Test parameters")
+        tg = QGridLayout(test_box)
+        tg.setHorizontalSpacing(8)
+        tg.setVerticalSpacing(4)
+        tg.setContentsMargins(8, 4, 8, 4)
 
+        # Pre-build every widget, then place them in pairs.
         self._test_combo = QComboBox()
         for tid, label, _group in _TESTS:
             self._test_combo.addItem(label, userData=tid)
@@ -247,52 +333,6 @@ class RdmaBlastFlowDialog(QDialog):
             "ib_send_lat / ib_write_lat / ib_read_lat drive latency tests "
             "(single-op ping-pong; pps will be low — that's the point)."
         )
-        form.addRow("Test type:", self._test_combo)
-
-        self._msg_size_spin = QSpinBox()
-        self._msg_size_spin.setRange(2, 16 * 1024 * 1024)
-        self._msg_size_spin.setSingleStep(1024)
-        self._msg_size_spin.setValue(_DEFAULT_MSG_SIZE)
-        self._msg_size_spin.setSuffix(" B")
-        self._msg_size_spin.setToolTip(
-            "Bytes per posted operation (-s). Larger = higher BW per op, "
-            "fewer ops/sec. 64 KiB is perftest's own default and a good "
-            "balance for RoCE/IB."
-        )
-        form.addRow("Message size:", self._msg_size_spin)
-
-        self._qp_count_spin = QSpinBox()
-        # v0.3.15: raised 1024 → 131072 to match the typical Mellanox
-        # ConnectX-7 max_qp ceiling (visible per-device in
-        # Tools → RDMA → RDMA Devices). The actual HCA limit varies
-        # per board (CX-7 ~128K, older CX ~256K, irdma smaller); the
-        # GUI cap is a safety net. Operators rarely go above 128 for
-        # real measurement — 1–16 covers most BW tests, 32–128 for
-        # queue saturation. Beyond that you're CPU-bound on the
-        # perftest side before the HCA limit matters.
-        self._qp_count_spin.setRange(1, 131072)
-        self._qp_count_spin.setValue(_DEFAULT_QP_COUNT)
-        self._qp_count_spin.setToolTip(
-            "Parallel QPs (-q). Increase to scale across multiple CPU "
-            "cores on the HCA. >1 changes the BW report to per-QP "
-            "totals; check perftest output before interpreting.\n\n"
-            "Practical envelope:\n"
-            "  • 1–16: standard BW scaling\n"
-            "  • 32–128: queue saturation, CPU-bound\n"
-            "  • 256+: synthetic stress; HCA max_qp shown per device "
-            "in Tools → RDMA → RDMA Devices (v0.3.15+)"
-        )
-        form.addRow("QP count:", self._qp_count_spin)
-
-        self._duration_spin = QSpinBox()
-        self._duration_spin.setRange(1, 3600)
-        self._duration_spin.setValue(_DEFAULT_DURATION_SECS)
-        self._duration_spin.setSuffix(" sec")
-        self._duration_spin.setToolTip(
-            "Test duration in seconds (-D). When set, takes precedence "
-            "over a fixed iteration count."
-        )
-        form.addRow("Duration:", self._duration_spin)
 
         self._mtu_combo = QComboBox()
         for code, label in _MTU_OPTIONS:
@@ -303,42 +343,114 @@ class RdmaBlastFlowDialog(QDialog):
             "ABOVE active_mtu and the run fails with a clear error from "
             "perftest. Default 4096 B works on most modern RoCE adapters."
         )
-        form.addRow("MTU:", self._mtu_combo)
+
+        self._msg_size_spin = QSpinBox()
+        self._msg_size_spin.setRange(2, 16 * 1024 * 1024)
+        self._msg_size_spin.setSingleStep(1024)
+        self._msg_size_spin.setValue(_DEFAULT_MSG_SIZE)
+        self._msg_size_spin.setSuffix(" B")
+        self._msg_size_spin.setFixedWidth(120)
+        self._msg_size_spin.setToolTip(
+            "Bytes per posted operation (-s). Larger = higher BW per op, "
+            "fewer ops/sec. 64 KiB is perftest's own default and a good "
+            "balance for RoCE/IB."
+        )
 
         self._tx_depth_spin = QSpinBox()
         self._tx_depth_spin.setRange(1, 4096)
         self._tx_depth_spin.setValue(_DEFAULT_TX_DEPTH)
+        self._tx_depth_spin.setFixedWidth(120)
         self._tx_depth_spin.setToolTip(
             "TX queue depth (-t). 128 is perftest's default; raise for "
             "more in-flight ops if the BW row shows the link unsaturated."
         )
-        form.addRow("TX depth:", self._tx_depth_spin)
+
+        self._qp_count_spin = QSpinBox()
+        # v0.3.15: raised 1024 → 131072 to match the typical Mellanox
+        # ConnectX-7 max_qp ceiling (visible per-device in
+        # Tools → RDMA → RDMA Devices).
+        self._qp_count_spin.setRange(1, 131072)
+        self._qp_count_spin.setValue(_DEFAULT_QP_COUNT)
+        self._qp_count_spin.setFixedWidth(120)
+        self._qp_count_spin.setToolTip(
+            "Parallel QPs (-q). Increase to scale across multiple CPU "
+            "cores on the HCA. >1 changes the BW report to per-QP "
+            "totals; check perftest output before interpreting.\n\n"
+            "Practical envelope:\n"
+            "  • 1–16: standard BW scaling\n"
+            "  • 32–128: queue saturation, CPU-bound\n"
+            "  • 256+: synthetic stress; HCA max_qp shown per device "
+            "in Tools → RDMA → RDMA Devices (v0.3.15+)"
+        )
 
         self._gid_index_spin = QSpinBox()
         self._gid_index_spin.setRange(0, 255)
         self._gid_index_spin.setValue(_DEFAULT_GID_INDEX)
+        self._gid_index_spin.setFixedWidth(120)
         self._gid_index_spin.setToolTip(
             "GID index (-x). On Mellanox RoCEv2-IPv4 the default is "
             "usually 3; check `show_gids` or the Devices list above. "
             "Wrong GID index → 'Unable to perform connection' from "
             "perftest."
         )
-        form.addRow("GID index:", self._gid_index_spin)
+
+        self._duration_spin = QSpinBox()
+        self._duration_spin.setRange(1, 3600)
+        self._duration_spin.setValue(_DEFAULT_DURATION_SECS)
+        self._duration_spin.setSuffix(" sec")
+        self._duration_spin.setFixedWidth(120)
+        self._duration_spin.setToolTip(
+            "Test duration in seconds (-D). When set, takes precedence "
+            "over a fixed iteration count."
+        )
 
         self._bidir_check = QCheckBox("Bidirectional (-b)")
         self._bidir_check.setToolTip(
             "Run BW in both directions simultaneously. Only meaningful "
             "for the _bw tests."
         )
-        form.addRow("", self._bidir_check)
-
         self._cpu_util_check = QCheckBox("Report CPU utilisation (--cpu_util)")
-        form.addRow("", self._cpu_util_check)
 
+        # Layout — 4 rows × 2 columns + 1 row of checkboxes.
+        # Row 0: Test type | MTU
+        tg.addWidget(QLabel("Test type:"), 0, 0, Qt.AlignRight)
+        tg.addWidget(self._test_combo,     0, 1)
+        tg.addWidget(QLabel("MTU:"),       0, 2, Qt.AlignRight)
+        tg.addWidget(self._mtu_combo,      0, 3)
+        # Row 1: Message size | TX depth
+        tg.addWidget(QLabel("Message size:"), 1, 0, Qt.AlignRight)
+        tg.addWidget(self._msg_size_spin,     1, 1)
+        tg.addWidget(QLabel("TX depth:"),     1, 2, Qt.AlignRight)
+        tg.addWidget(self._tx_depth_spin,     1, 3)
+        # Row 2: QP count | GID index
+        tg.addWidget(QLabel("QP count:"),  2, 0, Qt.AlignRight)
+        tg.addWidget(self._qp_count_spin,  2, 1)
+        tg.addWidget(QLabel("GID index:"), 2, 2, Qt.AlignRight)
+        tg.addWidget(self._gid_index_spin, 2, 3)
+        # Row 3: Duration | (free for the bidir checkbox to flow into
+        #                    the spacious slot)
+        tg.addWidget(QLabel("Duration:"),  3, 0, Qt.AlignRight)
+        tg.addWidget(self._duration_spin,  3, 1)
+        # Row 4: both checkboxes inline
+        cb_row = QHBoxLayout()
+        cb_row.setSpacing(16)
+        cb_row.addWidget(self._bidir_check)
+        cb_row.addWidget(self._cpu_util_check)
+        cb_row.addStretch(1)
+        cb_holder = QWidget()
+        cb_holder.setLayout(cb_row)
+        tg.addWidget(cb_holder, 4, 0, 1, 4)
+        # Stretch values get the widgets to be wide enough.
+        tg.setColumnStretch(1, 1)
+        tg.setColumnStretch(3, 1)
         root.addWidget(test_box)
 
-        # ── Start / Stop + status.
+        # ── Action row: Start, Stop, inline status label. One line
+        # instead of two (saves vertical space; status reads as part
+        # of the action zone, which is the natural place to look
+        # after clicking Start).
         action_row = QHBoxLayout()
+        action_row.setSpacing(8)
         self._start_btn = QPushButton("Start")
         self._start_btn.setDefault(True)
         self._start_btn.clicked.connect(self._on_start_clicked)
@@ -347,15 +459,14 @@ class RdmaBlastFlowDialog(QDialog):
         self._stop_btn.clicked.connect(self._on_stop_clicked)
         action_row.addWidget(self._start_btn)
         action_row.addWidget(self._stop_btn)
-        action_row.addStretch(1)
-        root.addLayout(action_row)
-
+        action_row.addSpacing(8)
         self._status_label = QLabel(
             "<span style='color:#64748b;'>Idle. Pick a device on each "
             "side and click Start.</span>"
         )
         self._status_label.setWordWrap(True)
-        root.addWidget(self._status_label)
+        action_row.addWidget(self._status_label, 1)
+        root.addLayout(action_row)
 
         # ── Live stats panel (populated by _poll_jobs).
         stats_box = QGroupBox("Live stats")
@@ -422,15 +533,84 @@ class RdmaBlastFlowDialog(QDialog):
                 f"{side} TG unreachable while probing perftest: "
                 f"{err or 'no data'}"
             )
+            # Don't start retry — server unreachable, not a transient
+            # missing-package situation. Operator needs to fix
+            # connectivity manually.
             return
         installed = bool(data.get("installed"))
         if not installed:
             self._set_status_error(
                 f"perftest is NOT installed on {side} TG. "
                 "Install with `apt install perftest` (or your distro's "
-                "equivalent) and reopen."
+                "equivalent). v0.3.18+ servers auto-install in the "
+                "background — this banner will clear automatically "
+                "within ~2 min if so."
             )
             self._start_btn.setEnabled(False)
+            self._perftest_missing_sides.add(side)
+            self._maybe_start_perftest_retry()
+            return
+        # Success path. If we were retrying because this side was
+        # previously missing, that's now resolved.
+        self._perftest_missing_sides.discard(side)
+        if not self._perftest_missing_sides and self._perftest_retry_timer is not None:
+            # Both sides now have perftest — stop retrying, clear the
+            # banner, re-enable Start. The device probe (which fired
+            # alongside us in _probe_both_sides) will set the proper
+            # ready-state status when its devices arrive.
+            self._stop_perftest_retry()
+            self._status_label.setText("")
+            self._start_btn.setEnabled(True)
+
+    def _maybe_start_perftest_retry(self) -> None:
+        """Begin re-probing /api/rdma/perftest/installed every 5 sec
+        while at least one TG reports perftest missing. Idempotent:
+        if a timer is already running (the OTHER side hit the missing
+        case first), this call is a no-op.
+
+        Capped at 24 ticks (2 min) — v0.3.18 server-side auto-install
+        completes in ~30 sec; if perftest still isn't there after 2 min
+        something else is broken (apt failure, kill-switch, wrong
+        distro) and re-probing is no longer informative."""
+        if self._perftest_retry_timer is not None:
+            return
+        self._perftest_retry_attempts = 0
+        self._perftest_retry_timer = QTimer(self)
+        self._perftest_retry_timer.timeout.connect(self._perftest_retry_tick)
+        self._perftest_retry_timer.start(5000)  # 5 sec
+
+    def _perftest_retry_tick(self) -> None:
+        """One retry beat. Re-probes both sides via the existing
+        _probe_both_sides() flow — _on_installed_resp handles success
+        (clear banner + stop timer) and continued failure (timer
+        keeps firing). Hits the 2-min cap → give up gracefully."""
+        self._perftest_retry_attempts += 1
+        if self._perftest_retry_attempts > 24:  # 24 * 5s = 2 min
+            self._stop_perftest_retry()
+            # Leave the existing red banner as-is — operator now
+            # knows auto-install didn't land within the expected
+            # window and should investigate
+            # /var/log/netgen-auto-install.log on the server.
+            return
+        self._probe_both_sides()
+
+    def _stop_perftest_retry(self) -> None:
+        """Idempotent timer teardown — called from success, max-attempts,
+        and closeEvent paths. Safe to call when the timer was never
+        started."""
+        if self._perftest_retry_timer is not None:
+            self._perftest_retry_timer.stop()
+            self._perftest_retry_timer = None
+        # Don't reset _perftest_missing_sides here — that state is
+        # cleared incrementally as each side reports installed=True
+        # in _on_installed_resp.
+
+    # NOTE: closeEvent override lives further down (~line 848) in this
+    # class — see the existing one that handles the "stop the running
+    # perftest job on close". The v0.3.19 retry-timer teardown is
+    # appended there to avoid two closeEvent defs (Python would let
+    # the second silently shadow the first — a real bug that bit us
+    # during initial implementation).
 
     def _on_devices_resp(self, side: str, data: Optional[dict], err: str) -> None:
         combo = (self._server_device_combo if side == "server"
@@ -543,6 +723,15 @@ class RdmaBlastFlowDialog(QDialog):
         test_id = self._test_combo.currentData()
         self._handshake_id = str(uuid.uuid4())
         opts = self._common_opts()
+
+        # v0.3.19: reset per-side finished tracking + render-dedup so
+        # a second run in the same dialog session doesn't see stale
+        # state from the previous run (would otherwise short-circuit
+        # _on_both_finished() immediately or suppress the first
+        # render).
+        self._server_finished = False
+        self._client_finished = False
+        self._last_rendered_key = {"server": None, "client": None}
 
         # Step 1: tell server TG to listen.
         server_body = {
@@ -676,27 +865,119 @@ class RdmaBlastFlowDialog(QDialog):
             self._stats_view.append(f"[{side}] poll failed: {err or 'no data'}")
             return
         job = data.get("job") or {}
-        self._render_job_into_stats(side, job)
-        # Stop polling once BOTH sides are done.
-        s_done = (self._server_job_id is None
-                  or self._is_finished(side, job, "server"))
-        c_done = (self._client_job_id is None
-                  or self._is_finished(side, job, "client"))
+
+        # v0.3.19: dedup the rendered chunk. Pre-fix the poll appended
+        # the SAME "[server] done (rc=0) size=65536B ..." line every
+        # 2-sec tick because the chunk content only depends on the
+        # job's terminal state (which doesn't change once done). Key
+        # off the fields that DO change between meaningful states so
+        # we render exactly once per transition (running-with-no-data
+        # → running-with-partial-data → done → done-with-error).
+        # While running-with-no-data, the elapsed-time changes — we
+        # WANT that ticking forward so the operator sees progress.
+        if bool(job.get("running")) and not any(
+            job.get(k) is not None for k in (
+                "final_msg_size_bytes", "final_iterations",
+                "final_bw_avg_gbps", "final_bw_peak_gbps",
+                "final_msg_rate_mpps",
+                "final_lat_avg_us", "final_lat_min_us",
+                "final_lat_max_us", "final_lat_p99_us",
+            )
+        ):
+            # Running, no data — let every tick render (elapsed time
+            # progress is the point).
+            self._render_job_into_stats(side, job)
+        else:
+            render_key = (
+                bool(job.get("running")),
+                job.get("returncode"),
+                job.get("final_msg_size_bytes"),
+                job.get("final_iterations"),
+                job.get("final_bw_avg_gbps"),
+                job.get("final_msg_rate_mpps"),
+                job.get("final_lat_avg_us"),
+                job.get("error"),
+            )
+            if self._last_rendered_key.get(side) != render_key:
+                self._render_job_into_stats(side, job)
+                self._last_rendered_key[side] = render_key
+
+        # v0.3.19: track each side's finished state on the instance —
+        # the previous _is_finished(side, job, want_side) returned
+        # False whenever side != want_side, which meant the server's
+        # poll callback couldn't see the client's done state and vice
+        # versa, so _on_both_finished was never called.
+        if job.get("finished_at") is not None:
+            if side == "server":
+                self._server_finished = True
+            elif side == "client":
+                self._client_finished = True
+
+        s_done = (self._server_job_id is None) or self._server_finished
+        c_done = (self._client_job_id is None) or self._client_finished
         if s_done and c_done:
             self._on_both_finished()
-
-    def _is_finished(self, side: str, job: dict, want_side: str) -> bool:
-        if side != want_side:
-            return False
-        return job.get("finished_at") is not None
 
     def _render_job_into_stats(self, side: str, job: dict) -> None:
         """Append a one-line summary to the live stats panel."""
         if not job:
             return
-        run_state = "running" if job.get("running") else f"done (rc={job.get('returncode')})"
+        running = bool(job.get("running"))
+        run_state = "running" if running else f"done (rc={job.get('returncode')})"
         is_lat = (job.get("test") or "").endswith("_lat")
+
+        # v0.3.19 fix: perftest's parsed metrics (final_bw_avg_gbps,
+        # final_msg_size_bytes, etc.) only populate AFTER perftest
+        # emits at least one data row. The setup phase (QP handshake,
+        # GID exchange, buffer alloc) can take 2-5 sec on the first
+        # sample. Before the parser hits a data row, every final_*
+        # field is None — formatting them produces a useless
+        # "size=NoneB ... BW avg=None Gbps ... MsgRate=None Mpps"
+        # line that operators see for the first several seconds of
+        # every run. Detect the no-data-yet state and show a clean
+        # message instead.
         if is_lat:
+            metrics = (
+                job.get("final_msg_size_bytes"),
+                job.get("final_iterations"),
+                job.get("final_lat_avg_us"),
+                job.get("final_lat_min_us"),
+                job.get("final_lat_max_us"),
+                job.get("final_lat_p99_us"),
+            )
+        else:
+            metrics = (
+                job.get("final_msg_size_bytes"),
+                job.get("final_iterations"),
+                job.get("final_bw_avg_gbps"),
+                job.get("final_bw_peak_gbps"),
+                job.get("final_msg_rate_mpps"),
+            )
+        has_data = any(m is not None for m in metrics)
+
+        if running and not has_data:
+            # perftest is BATCH-mode by default: it runs the test
+            # for `--duration` seconds (or N iterations), then prints
+            # the bandwidth + msg-rate summary on a single line AT
+            # THE END. There are no per-second data rows during the
+            # run. So every poll between t=0 and t=duration sees
+            # final_* = None — which the pre-v0.3.19 format string
+            # rendered as "size=NoneB iters=None BW avg=None Gbps
+            # peak=None MsgRate=None Mpps" on every poll. Show a
+            # clean progress line with elapsed time instead.
+            started_at = job.get("started_at")
+            elapsed = ""
+            if isinstance(started_at, (int, float)):
+                try:
+                    import time as _t
+                    elapsed = f" — {int(_t.time() - started_at)}s elapsed"
+                except Exception:
+                    pass
+            chunk = (
+                f"[{side}] {run_state}  (perftest emits results on "
+                f"completion, not during run{elapsed})"
+            )
+        elif is_lat:
             chunk = (
                 f"[{side}] {run_state}  size={job.get('final_msg_size_bytes')}B  "
                 f"iters={job.get('final_iterations')}  "
@@ -763,7 +1044,17 @@ class RdmaBlastFlowDialog(QDialog):
 
     def closeEvent(self, event) -> None:
         """Best-effort stop on close so a closed dialog doesn't leave
-        perftest hammering the wire."""
+        perftest hammering the wire.
+
+        v0.3.19: also tear down the perftest-retry timer and the
+        live-stats poll timer so Qt doesn't deliver tick events to
+        a deleted widget (classic SIGABRT cause we fought in
+        v0.2.20–v0.2.24)."""
         if self._server_job_id or self._client_job_id:
             self._on_stop_clicked()
+        # Timer teardown — idempotent / safe on never-started timers.
+        self._stop_perftest_retry()
+        if self._poll_timer is not None:
+            self._poll_timer.stop()
+            self._poll_timer = None
         event.accept()
