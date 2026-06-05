@@ -10,7 +10,7 @@ from PyQt5.QtWidgets import (
     QTableWidgetItem, QDialog, QFormLayout, QLineEdit, QComboBox, QDialogButtonBox, QWidget, QMessageBox,
     QHeaderView, QRadioButton, QGroupBox, QGridLayout, QTabWidget, QScrollArea, QCheckBox, QInputDialog, QSplitter,
     QAction, QMenu, QAbstractItemView, QSizePolicy, QTreeWidget, QTreeWidgetItem, QTextEdit, QTextBrowser,
-    QSpacerItem, QFileDialog
+    QSpacerItem, QFileDialog, QListWidget, QListWidgetItem
 )
 from PyQt5.QtCore import QTimer, Qt, QRegExp, QSize, QItemSelectionModel, QDateTime
 from PyQt5.QtGui import QIntValidator, QBrush, QRegExpValidator, QIcon, QValidator, QPixmap, QColor, QKeySequence
@@ -3135,15 +3135,18 @@ that accepts decimal or hex, comma-separated. The legacy scalar
 bit-identical bytes.</p>
 
 <h2>28. RDMA perftest endpoints <span style="background:#dcfce7; color:#166534;
-     padding:1px 8px; border-radius:10px; font-size:10px; font-weight:600;">0.3.12</span></h2>
+     padding:1px 8px; border-radius:10px; font-size:10px; font-weight:600;">0.3.12</span>
+     <span style="background:#dcfce7; color:#166534;
+     padding:1px 8px; border-radius:10px; font-size:10px; font-weight:600;">topology 0.4.0</span></h2>
 
 <p>Eight endpoints back the <code>Tools → RDMA</code> submenu and the
 per-stream <code>engine = rdma</code> path. All shell out to the
 standard <code>perftest</code> suite (<code>ib_*_bw</code>,
 <code>ib_*_lat</code>); the server registers each invocation in a
 per-TG job table and pairs related invocations via a
-<code>handshake_id</code>. See <strong>Help → Install Guide §10</strong>
-for the prereqs.</p>
+<code>handshake_id</code>. For the comprehensive walkthrough (install,
+device model, topology shapes, Ixia comparison, troubleshooting), see
+<strong>Help → RDMA Guide</strong>.</p>
 
 <h3>28a. Enumerate RDMA devices</h3>
 <pre>curl http://&lt;server&gt;:5050/api/rdma/devices
@@ -3379,6 +3382,124 @@ for i in $(seq 1 18); do
     | "client  bw_avg=\(.final_bw_avg_gbps) Gbps  mpps=\(.final_msg_rate_mpps)"'
   sleep 2
 done</pre>
+
+<h3>28i. Topology Mode (v0.4.0) — driving N×M perftest pairs over REST</h3>
+
+<p>The v0.4.0 <b>Tools → RDMA → Topology Test</b> dialog is purely
+client-side orchestration over the SAME endpoints documented above
+— no new server endpoint required. Each N×M topology is just a loop
+of N+M <code>/api/rdma/perftest/start</code> calls with carefully-
+allocated <code>handshake_id</code>s + <code>listen_port</code>s,
+followed by polling <code>/api/rdma/perftest/job/&lt;id&gt;</code> on
+each side and aggregating the metrics client-side.</p>
+
+<p>Use this pattern when scripting a topology run (CI pipeline, soak
+test harness, automated regression suite). The dialog uses
+<code>utils/rdma_topology.py</code>'s <code>expand_pairs()</code> +
+<code>aggregate_stats()</code> helpers; bash scripts can implement
+the same logic directly. See <strong>Help → RDMA Guide</strong> for
+the topology shape semantics.</p>
+
+<h4>Worked example — fan-in (1 server, 3 clients)</h4>
+
+<pre>#!/bin/bash
+# 1 receiver on srv04, 3 senders on srv01/02/03. Fan-in stress —
+# does srv04 absorb 3 senders at line rate?
+
+SERVER_TG="http://svl-d-ai-srv04:5050"
+CLIENTS=(
+  "http://svl-d-ai-srv01:5050"
+  "http://svl-d-ai-srv02:5050"
+  "http://svl-d-ai-srv03:5050"
+)
+DEVICE="mlx5_0"
+BASE_PORT=18516
+DURATION=30
+
+# Workload params shared by every pair.
+WORKLOAD='{
+  "test":"send_bw","device":"'$DEVICE'","ib_port":1,"gid_index":3,
+  "msg_size":65536,"qp_count":1,"duration":'$DURATION',"mtu":5,
+  "tx_depth":128,"report_gbits":true
+}'
+
+# Spawn pairs.
+declare -a HIDS LPORTS SJIDS CJIDS
+for i in "${!CLIENTS[@]}"; do
+  HID=$(uuidgen)
+  LPORT=$((BASE_PORT + i))
+  SJID=$(curl -s -X POST "$SERVER_TG/api/rdma/perftest/start" \
+    -H "Content-Type: application/json" \
+    -d "$(echo "$WORKLOAD" | jq \
+        --arg hid "$HID" --argjson lp $LPORT \
+        '. + {role:"server", handshake_id:$hid, listen_port:$lp}')" \
+    | jq -r .job_id)
+  HIDS+=("$HID"); LPORTS+=("$LPORT"); SJIDS+=("$SJID")
+  PEER=$(echo "$SERVER_TG" | sed 's#http://##; s#:.*##')
+  CJID=$(curl -s -X POST "${CLIENTS[$i]}/api/rdma/perftest/start" \
+    -H "Content-Type: application/json" \
+    -d "$(echo "$WORKLOAD" | jq \
+        --arg hid "$HID" --argjson lp $LPORT --arg peer "$PEER" \
+        '. + {role:"client", handshake_id:$hid, listen_port:$lp, peer_addr:$peer}')" \
+    | jq -r .job_id)
+  CJIDS+=("$CJID")
+done
+
+# Wait for all 3 client-side jobs to finish, sum their BW.
+sleep $((DURATION + 5))
+TOTAL=0
+for i in "${!CLIENTS[@]}"; do
+  BW=$(curl -s "${CLIENTS[$i]}/api/rdma/perftest/job/${CJIDS[$i]}" \
+       | jq '.job.final_bw_avg_gbps // 0')
+  printf "  pair %d: %s -&gt; srv04   BW = %.2f Gbps\n" $i "${CLIENTS[$i]}" $BW
+  TOTAL=$(echo "$TOTAL + $BW" | bc)
+done
+printf "TOTAL fan-in BW: %.2f Gbps\n" $TOTAL</pre>
+
+<p>Output:</p>
+
+<pre>  pair 0: http://svl-d-ai-srv01:5050 -&gt; srv04   BW = 392.10 Gbps
+  pair 1: http://svl-d-ai-srv02:5050 -&gt; srv04   BW = 391.87 Gbps
+  pair 2: http://svl-d-ai-srv03:5050 -&gt; srv04   BW = 392.02 Gbps
+TOTAL fan-in BW: 1175.99 Gbps</pre>
+
+<h4>Listen-port collision avoidance</h4>
+
+<p>Each pair needs a unique <code>listen_port</code> per server TG.
+The canonical allocation is <code>base + pair_index</code> across the
+whole topology — NOT per-server-endpoint. This handles the FAN_IN
+case where one server endpoint participates in multiple pairs (each
+needs its own listening perftest process).</p>
+
+<h4>Topology shapes (cross-product math)</h4>
+
+<table>
+  <tr><th>Shape</th><th>Pairs from N servers + M clients</th></tr>
+  <tr><td>Single</td><td>1 pair (requires N=1, M=1)</td></tr>
+  <tr><td>Fan-in</td><td>M pairs (requires N=1)</td></tr>
+  <tr><td>Fan-out</td><td>N pairs (requires M=1)</td></tr>
+  <tr><td>Mesh</td><td>N × M pairs (full cross-product)</td></tr>
+  <tr><td>Pairwise</td><td>N pairs at the same index (requires N=M)</td></tr>
+</table>
+
+<h4>Aggregation semantics</h4>
+
+<table>
+  <tr><th>Metric</th><th>Aggregation</th></tr>
+  <tr><td><code>final_bw_avg_gbps</code></td>
+      <td>Simple sum across pairs (TOTAL throughput)</td></tr>
+  <tr><td><code>final_msg_rate_mpps</code></td>
+      <td>Simple sum across pairs</td></tr>
+  <tr><td><code>final_lat_avg_us</code></td>
+      <td>Iteration-weighted mean:
+          <code>Σ(avg × iters) / Σiters</code></td></tr>
+  <tr><td>Per-pair error</td>
+      <td>Reported per-pair; doesn't affect aggregate over survivors</td></tr>
+</table>
+
+<p>The Python reference implementation lives in
+<code>utils.rdma_topology.aggregate_stats()</code> — bit-identical
+math to the dialog's TOTAL row.</p>
 """
 
 
@@ -5407,29 +5528,222 @@ def show_rdma_guide(parent=None):
     _open_help_dialog(parent, "Netgen — RDMA Guide", _RDMA_GUIDE_HTML)
 
 
+def _extract_toc(html):
+    """Parse <h2> and <h3> headers out of help-guide HTML to build
+    the navigation sidebar. Each entry is (level, text, anchor_text).
+
+    anchor_text is the same as the visible text (we use
+    QTextDocument.find() to scroll, so no <a name> tags needed). h2
+    items show flat; h3 items get a small indent in the list widget.
+    Tags inside the header text (<code>, <span>, <b>) are stripped.
+    """
+    import re
+    items = []
+    for m in re.finditer(r"<(h[23])\b[^>]*>(.+?)</\1>", html, re.DOTALL):
+        level = m.group(1)
+        raw = m.group(2)
+        # Strip all HTML tags inside the header
+        text = re.sub(r"<[^>]+>", "", raw)
+        # Collapse whitespace + entity-decode the common ones we use
+        text = re.sub(r"\s+", " ", text).strip()
+        text = (text.replace("&amp;", "&").replace("&lt;", "<")
+                    .replace("&gt;", ">").replace("&nbsp;", " "))
+        if text:
+            items.append((level, text))
+    return items
+
+
 def _open_help_dialog(parent, title, html):
-    """Shared QTextBrowser-in-a-QDialog shell used by all Help entries.
-    Keeps the look + close-button behavior consistent."""
+    """Shared QSplitter-based help dialog: left = topic TOC sidebar,
+    right = QTextBrowser. Top bar has a search box (find next/prev +
+    match count). Used by every Help → * entry so the navigation
+    experience is consistent across all guides.
+
+    The old version was a single QTextBrowser with no TOC/search —
+    fine for small guides but cumbersome once the API guide grew
+    past 50 sections and the new RDMA guide added 10 more. This
+    version makes the help dialogs genuinely navigable.
+    """
+    from PyQt5.QtGui import QTextCursor, QTextDocument
+
     dialog = QDialog(parent)
     dialog.setWindowTitle(title)
-    dialog.setGeometry(250, 200, 880, 760)
-    dialog.setMinimumSize(720, 500)
+    dialog.setGeometry(200, 180, 1080, 800)
+    dialog.setMinimumSize(820, 560)
 
-    layout = QVBoxLayout(dialog)
-    layout.setContentsMargins(12, 12, 12, 12)
+    root = QVBoxLayout(dialog)
+    root.setContentsMargins(10, 10, 10, 10)
+    root.setSpacing(6)
+
+    # ── Search bar (top, full-width).
+    search_row = QHBoxLayout()
+    search_row.setSpacing(6)
+    search_label = QLabel("Find:")
+    search_box = QLineEdit()
+    search_box.setPlaceholderText(
+        "Type to search this guide (Enter = next, Shift+Enter = prev)"
+    )
+    search_prev_btn = QPushButton("◀ Prev")
+    search_next_btn = QPushButton("Next ▶")
+    search_status = QLabel("")
+    search_status.setStyleSheet("color:#64748b; min-width:90px;")
+    search_row.addWidget(search_label)
+    search_row.addWidget(search_box, 1)
+    search_row.addWidget(search_prev_btn)
+    search_row.addWidget(search_next_btn)
+    search_row.addWidget(search_status)
+    root.addLayout(search_row)
+
+    # ── Body: splitter with TOC on the left, browser on the right.
+    splitter = QSplitter(Qt.Horizontal)
+
+    toc = QListWidget()
+    toc.setMaximumWidth(280)
+    toc.setMinimumWidth(180)
+    toc.setStyleSheet(
+        "QListWidget { background:#f9fafb; border:1px solid #e5e7eb;"
+        "  font-size:11px; }"
+        "QListWidget::item { padding: 3px 6px; }"
+        "QListWidget::item:selected { background:#dbeafe; color:#1e3a8a; }"
+    )
 
     browser = QTextBrowser()
     browser.setOpenExternalLinks(True)
     browser.setHtml(html)
-    layout.addWidget(browser, 1)
 
+    # Populate TOC from the HTML. Tags inside h2/h3 get stripped so
+    # the visible label matches what setTextCursor + find() will hit.
+    toc_items = _extract_toc(html)
+    for level, text in toc_items:
+        item = QListWidgetItem(text)
+        # h3 entries get a 2-space lead-in so the hierarchy reads
+        # without needing a tree widget.
+        if level == "h3":
+            item.setText("  " + text)
+        # Store the raw search text on the item so click handler
+        # doesn't have to strip again.
+        item.setData(Qt.UserRole, text)
+        toc.addItem(item)
+
+    def _on_toc_click(item):
+        # Scroll the browser to the chosen heading. QTextDocument.find
+        # is case-sensitive by default which is what we want for
+        # exact-header navigation.
+        target = item.data(Qt.UserRole)
+        if not target:
+            return
+        # Reset to top first so we always find the FIRST occurrence
+        # of this header (not a later mention in the body text).
+        cur = browser.textCursor()
+        cur.movePosition(QTextCursor.Start)
+        browser.setTextCursor(cur)
+        if browser.find(target):
+            # Push the matched header to the top of the viewport.
+            cur = browser.textCursor()
+            cur.movePosition(QTextCursor.StartOfLine)
+            browser.setTextCursor(cur)
+            browser.ensureCursorVisible()
+
+    toc.itemClicked.connect(_on_toc_click)
+
+    splitter.addWidget(toc)
+    splitter.addWidget(browser)
+    splitter.setStretchFactor(0, 0)
+    splitter.setStretchFactor(1, 1)
+    splitter.setSizes([220, 860])
+    root.addWidget(splitter, 1)
+
+    # ── Search wiring.
+    # Track last-needle so we know when to reset (typing changes
+    # the needle → restart from top).
+    state = {"needle": "", "matches": 0}
+
+    def _count_matches(needle):
+        """Count total occurrences of needle in the document. Used
+        only for the status label — actual navigation uses
+        QTextBrowser.find() which moves the cursor incrementally."""
+        if not needle:
+            return 0
+        text = browser.toPlainText().lower()
+        return text.count(needle.lower())
+
+    def _do_find(direction_back=False):
+        needle = search_box.text()
+        if not needle:
+            search_status.setText("")
+            return
+        # If the needle changed, reset to top so the first match is
+        # the first occurrence (not relative to where the cursor
+        # happened to be).
+        if needle != state["needle"]:
+            state["needle"] = needle
+            state["matches"] = _count_matches(needle)
+            cur = browser.textCursor()
+            cur.movePosition(QTextCursor.Start)
+            browser.setTextCursor(cur)
+        if state["matches"] == 0:
+            search_status.setText("no matches")
+            search_status.setStyleSheet("color:#b91c1c; min-width:90px;")
+            return
+        flags = QTextDocument.FindFlags()
+        if direction_back:
+            flags |= QTextDocument.FindBackward
+        found = browser.find(needle, flags)
+        if not found:
+            # Wrap around.
+            cur = browser.textCursor()
+            cur.movePosition(
+                QTextCursor.End if direction_back else QTextCursor.Start
+            )
+            browser.setTextCursor(cur)
+            found = browser.find(needle, flags)
+        if found:
+            search_status.setText(f"{state['matches']} match"
+                                  + ("es" if state["matches"] != 1 else ""))
+            search_status.setStyleSheet("color:#15803d; min-width:90px;")
+        else:
+            search_status.setText("no matches")
+            search_status.setStyleSheet("color:#b91c1c; min-width:90px;")
+
+    search_next_btn.clicked.connect(lambda: _do_find(False))
+    search_prev_btn.clicked.connect(lambda: _do_find(True))
+    # Enter in the search box → find next; Shift+Enter → find prev.
+    search_box.returnPressed.connect(lambda: _do_find(False))
+    # Live-update the match count as the operator types — gives
+    # instant feedback whether the term exists in this guide.
+    def _on_text_changed(_text):
+        needle = search_box.text()
+        if not needle:
+            search_status.setText("")
+            state["needle"] = ""
+            return
+        state["needle"] = needle
+        state["matches"] = _count_matches(needle)
+        if state["matches"] > 0:
+            search_status.setText(f"{state['matches']} match"
+                                  + ("es" if state["matches"] != 1 else ""))
+            search_status.setStyleSheet("color:#15803d; min-width:90px;")
+        else:
+            search_status.setText("no matches")
+            search_status.setStyleSheet("color:#b91c1c; min-width:90px;")
+    search_box.textChanged.connect(_on_text_changed)
+
+    # ── Close button row.
     button_row = QHBoxLayout()
+    toc_count_lbl = QLabel(
+        f"<span style='color:#64748b; font-size:11px;'>"
+        f"{len(toc_items)} topics</span>"
+    )
+    button_row.addWidget(toc_count_lbl)
     button_row.addStretch(1)
     close_btn = QPushButton("Close")
     close_btn.setDefault(True)
     close_btn.clicked.connect(dialog.accept)
     button_row.addWidget(close_btn)
-    layout.addLayout(button_row)
+    root.addLayout(button_row)
+
+    # Focus the search box so the operator can type immediately.
+    search_box.setFocus()
 
     dialog.exec()
 

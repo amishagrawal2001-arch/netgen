@@ -435,3 +435,82 @@ def test_rdma_guide_content_NOT_in_api_guide():
     assert "10e. RDMA Topology Test" not in _API_GUIDE_HTML, (
         "Topology Test help still misplaced in API guide"
     )
+
+
+def test_toc_extractor_parses_h2_h3_headers():
+    """v0.4.0 _extract_toc must parse h2 + h3 headers out of guide
+    HTML for the navigation sidebar. Returns (level, text) pairs
+    in document order."""
+    from widgets.stream_dialog import _extract_toc
+    html = """
+    <h1>Title</h1>
+    <h2>1. Foo</h2>
+    <p>body</p>
+    <h3>1a. Bar</h3>
+    <p>body</p>
+    <h2>2. Baz <code>qux</code></h2>
+    <h3>2a. Quux</h3>
+    """
+    items = _extract_toc(html)
+    assert len(items) == 4
+    assert items[0] == ("h2", "1. Foo")
+    assert items[1] == ("h3", "1a. Bar")
+    # Tags inside header text get stripped
+    assert items[2] == ("h2", "2. Baz qux")
+    assert items[3] == ("h3", "2a. Quux")
+
+
+def test_toc_extractor_strips_html_entities():
+    """Headers with &amp; / &lt; / &gt; entities decode in the TOC
+    label so the visible sidebar text matches what the operator
+    sees in the rendered body."""
+    from widgets.stream_dialog import _extract_toc
+    html = "<h2>Devices &amp; ports</h2><h3>10·m. Manual install</h3>"
+    items = _extract_toc(html)
+    assert items[0] == ("h2", "Devices & ports")
+    assert items[1] == ("h3", "10·m. Manual install")
+
+
+def test_toc_extractor_returns_empty_on_no_headers():
+    from widgets.stream_dialog import _extract_toc
+    assert _extract_toc("<p>Just a paragraph</p>") == []
+
+
+def test_install_guide_toc_has_real_entries():
+    """The Install Guide has dozens of h2/h3 headers; the TOC
+    extractor must surface them all so the sidebar is genuinely
+    useful, not just a token feature."""
+    from widgets.stream_dialog import _INSTALL_GUIDE_HTML, _extract_toc
+    items = _extract_toc(_INSTALL_GUIDE_HTML)
+    assert len(items) >= 20, (
+        f"Install guide should have ≥20 toc entries; got {len(items)}"
+    )
+    # First entry should be the §1 header
+    assert items[0][0] == "h2"
+
+
+def test_api_guide_topology_section_present():
+    """v0.4.0 §28i Topology Mode worked example must be in the API
+    guide so scripted users can find the curl pattern + listen-port
+    allocation rule + aggregation math."""
+    from widgets.stream_dialog import _API_GUIDE_HTML
+    assert "28i. Topology Mode" in _API_GUIDE_HTML
+    assert "Worked example — fan-in" in _API_GUIDE_HTML
+    assert "Listen-port collision avoidance" in _API_GUIDE_HTML
+    # Aggregation table mentions the iter-weighted latency mean
+    assert "iter" in _API_GUIDE_HTML.lower() and "weight" in _API_GUIDE_HTML.lower()
+
+
+def test_api_guide_rdma_section_cross_refs_rdma_guide():
+    """§28 should send operators to the dedicated RDMA Guide for
+    the full walkthrough, not to the now-stale Install Guide §10."""
+    from widgets.stream_dialog import _API_GUIDE_HTML
+    # Find the §28 header and the paragraph right after
+    import re
+    m = re.search(r"<h2>28\.[\s\S]*?</p>", _API_GUIDE_HTML)
+    assert m, "§28 header + intro paragraph not found"
+    intro = m.group(0)
+    assert "RDMA Guide" in intro, (
+        "§28 intro paragraph should send operators to Help → RDMA Guide; "
+        f"got: {intro[:300]!r}"
+    )
