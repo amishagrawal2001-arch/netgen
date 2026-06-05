@@ -5637,12 +5637,26 @@ def _open_help_dialog(parent, title, html):
         cur = browser.textCursor()
         cur.movePosition(QTextCursor.Start)
         browser.setTextCursor(cur)
-        if browser.find(target):
-            # Push the matched header to the top of the viewport.
-            cur = browser.textCursor()
-            cur.movePosition(QTextCursor.StartOfLine)
-            browser.setTextCursor(cur)
-            browser.ensureCursorVisible()
+        if not browser.find(target):
+            return
+        # Move cursor to the START of the matched block (h2/h3 lives
+        # in its own paragraph block). Then compute that block's
+        # absolute document Y via documentLayout, and set the
+        # vertical scrollbar directly so the heading lands AT THE TOP
+        # of the viewport — not at the bottom (the default behaviour
+        # of ensureCursorVisible() does the *minimum* scroll, which
+        # leaves the matched line wherever it was already partly
+        # visible, typically the bottom edge).
+        cur = browser.textCursor()
+        cur.movePosition(QTextCursor.StartOfBlock)
+        browser.setTextCursor(cur)
+        block = cur.block()
+        layout = browser.document().documentLayout()
+        block_rect = layout.blockBoundingRect(block)
+        # Small top margin so the header isn't flush against the
+        # viewport border — easier on the eye.
+        target_y = max(0, int(block_rect.y()) - 8)
+        browser.verticalScrollBar().setValue(target_y)
 
     toc.itemClicked.connect(_on_toc_click)
 

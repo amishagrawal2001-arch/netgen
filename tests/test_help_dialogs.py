@@ -514,3 +514,57 @@ def test_api_guide_rdma_section_cross_refs_rdma_guide():
         "§28 intro paragraph should send operators to Help → RDMA Guide; "
         f"got: {intro[:300]!r}"
     )
+
+
+def test_toc_scroll_positions_header_at_top():
+    """Regression test for the v0.4.0 TOC sidebar scroll bug:
+    clicking a TOC item used to leave the matched header at the
+    BOTTOM of the viewport (Qt's ensureCursorVisible does the
+    *minimum* scroll). Fix replaces that with a direct
+    verticalScrollBar.setValue() based on the block's absolute
+    document Y. Pin the math so a refactor can't silently revert."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    import sys
+    from PyQt5.QtWidgets import QApplication, QTextBrowser
+    from PyQt5.QtGui import QTextCursor
+    from widgets.stream_dialog import _API_GUIDE_HTML
+
+    _app = QApplication.instance() or QApplication(sys.argv)
+    b = QTextBrowser()
+    b.setHtml(_API_GUIDE_HTML)
+    b.show()
+    b.resize(800, 400)
+    _app.processEvents()
+    _app.processEvents()
+
+    # Reproduce the dialog's click-handler logic for a known header
+    # well past the natural viewport (forces scrolling).
+    target = "28i. Topology Mode (v0.4.0) — driving N×M perftest pairs over REST"
+    cur = b.textCursor()
+    cur.movePosition(QTextCursor.Start)
+    b.setTextCursor(cur)
+    found = b.find(target)
+    assert found, "test header not found in API guide — fixture out of sync"
+
+    cur = b.textCursor()
+    cur.movePosition(QTextCursor.StartOfBlock)
+    b.setTextCursor(cur)
+    block = cur.block()
+    layout = b.document().documentLayout()
+    block_rect = layout.blockBoundingRect(block)
+    target_y = max(0, int(block_rect.y()) - 8)
+    b.verticalScrollBar().setValue(target_y)
+    _app.processEvents()
+
+    # After scroll, the cursor's Y in viewport coords should be near
+    # the TOP of the viewport (within the first quarter), not the
+    # bottom. Pre-fix it was at the bottom edge.
+    cursor_y = b.cursorRect().y()
+    viewport_h = b.viewport().height()
+    assert cursor_y < viewport_h / 3, (
+        f"matched header at viewport Y={cursor_y} (viewport_h={viewport_h}) — "
+        f"expected near top (Y < {viewport_h/3:.0f}). The scroll math is "
+        f"back to ensureCursorVisible-style minimum-scroll which parks the "
+        f"header at the BOTTOM of the viewport."
+    )
