@@ -186,6 +186,59 @@ class TrafficGenClientRDMAMenuActions:
         dlg.raise_()
         dlg.activateWindow()
 
+    # ─────────────────────────────────────────── RDMA Topology Test
+
+    def show_rdma_topology_dialog(self):
+        """Open the v0.4.0 RDMA Topology Test dialog — N×M perftest
+        orchestrator (fan-in, fan-out, mesh, pairwise).
+
+        Unlike Blast a RDMA Flow (which is 1:1), this dialog manages
+        endpoint GROUPS + a topology shape, expanding to the right
+        cross-product of perftest pairs. Aggregates stats across all
+        pairs. See Help → Install Guide §10d for the Ixia comparison
+        that motivates this feature.
+
+        Non-blocking via show() — operator can run a topology stress
+        test in parallel with other RDMA / DPDK dialogs."""
+        from widgets.rdma_topology_dialog import RdmaTopologyDialog
+        dlg = RdmaTopologyDialog(parent=self)
+
+        # Pre-populate the endpoint editors with sensible starter
+        # text using the currently-selected servers' URLs (if any) +
+        # an mlx5_0 placeholder. Operator usually adjusts; this just
+        # saves them from typing the very first line by hand.
+        try:
+            selected = self._selected_servers() or []
+            if selected:
+                lines = []
+                for srv in selected:
+                    url, _label = self._server_url_label(srv)
+                    if url:
+                        lines.append(f"{url} mlx5_0")
+                if lines:
+                    dlg._server_edit.setPlainText("\n".join(lines))
+                    # And mirror for the client side as a starting
+                    # point (loopback) — operator can edit.
+                    dlg._client_edit.setPlainText("\n".join(lines))
+        except Exception:
+            # Pre-population is convenience, not contract — silently
+            # skip if the selection API doesn't exist on this build.
+            pass
+
+        if not hasattr(self, "_rdma_topology_dialogs"):
+            self._rdma_topology_dialogs = []
+        self._rdma_topology_dialogs.append(dlg)
+
+        def _on_closed(_result, _dlg=dlg):
+            try:
+                self._rdma_topology_dialogs.remove(_dlg)
+            except ValueError:
+                pass
+        dlg.finished.connect(_on_closed)
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
     # ─────────────────────────────────────────── RDMA Devices
 
     def show_rdma_devices_dialog(self):

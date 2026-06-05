@@ -2090,6 +2090,198 @@ in-flight stream, and the runner thread aborts within ~0.5s. Response:
 <code>{"ok": true, "was_running": true}</code>. Idempotent (returns
 <code>was_running: false</code> if no test is active).</p>
 
+<h3>10d. Comparison with hardware test equipment (Ixia, Spirent)</h3>
+
+<p>Operators familiar with Ixia <i>IxNetwork-RoCEv2</i> or
+Spirent <i>TestCenter-RoCE</i> often ask whether netgen can match
+the N×M endpoint-group topology testing those tools provide. Short
+answer: <b>not at hardware scale, but the topology semantics are
+available via v0.4.0+ Topology Mode</b> (Tools → RDMA →
+Topology Test…). The architectural difference is worth understanding
+before picking the tool for a given lab.</p>
+
+<table>
+  <tr><th>Capability</th>
+      <th>Ixia / Spirent (hardware)</th>
+      <th>netgen (software, perftest-based)</th></tr>
+  <tr><td><b>Endpoints per port</b></td>
+      <td>~1000+ — emulated in ASIC</td>
+      <td>~10s per host — each pair is a real OS-level perftest process pair</td></tr>
+  <tr><td><b>Topology object model</b></td>
+      <td>Endpoint Groups + Traffic Items + Workload Profiles</td>
+      <td>v0.4.0+: endpoint groups + topology shape (single / fan-in / fan-out / mesh / pairwise) + shared workload opts. Same conceptual model</td></tr>
+  <tr><td><b>Mesh / fan-in / fan-out</b></td>
+      <td>One Traffic Item with src×dst groups → N×M flows auto-generated</td>
+      <td>v0.4.0+: pick a shape, pick endpoint lists, dialog spawns the N×M perftest pairs</td></tr>
+  <tr><td><b>Per-flow stats aggregation</b></td>
+      <td>Always-on hardware counters; rolls up flow → port → chassis in real time</td>
+      <td>Per-pair BW from perftest summary at test end; client-side roll-up shows TOTAL across pairs</td></tr>
+  <tr><td><b>Line rate at high scale</b></td>
+      <td>Sustained 400 Gb/s per port × many ports</td>
+      <td>Per-host limited by Linux kernel + RDMA HCA; verified 392 Gb/s on a single ConnectX-7 loopback pair</td></tr>
+  <tr><td><b>Mixed protocols on same port</b></td>
+      <td>RoCE + TCP + UDP simultaneously</td>
+      <td>One perftest process per RDMA pair; mix achieved by combining with the Streams tab (DPDK/Scapy) on other interfaces</td></tr>
+  <tr><td><b>Workload profiles</b></td>
+      <td>Pre-canned SEND / WRITE / READ / NVMe-oF / custom</td>
+      <td>SEND / WRITE / READ + _lat variants via the test-type combo. NVMe-oF would require a different orchestrator (perftest doesn't speak NVMe)</td></tr>
+  <tr><td><b>Hardware cost</b></td>
+      <td>$$$$ — dedicated chassis + per-port licences</td>
+      <td>$ — runs on any Linux box with an RDMA-capable NIC</td></tr>
+  <tr><td><b>Control plane</b></td>
+      <td>IxNetwork Python/TCL API; IxLoad; IxOS</td>
+      <td>Flask REST API at <code>/api/rdma/perftest/*</code> and <code>/api/rdma/topology/*</code>; GUI from this same client</td></tr>
+</table>
+
+<h4>Why the architectural difference</h4>
+
+<p><b>Ixia/Spirent run the RDMA QP state machine in dedicated ASICs
+on the test chassis ports.</b> One physical port can emulate thousands
+of independent RDMA endpoints simultaneously because each endpoint's
+QP state lives in silicon, not as a Linux process. This is what
+enables 1000-endpoint stress tests from a single hardware chassis.</p>
+
+<p><b>netgen orchestrates real perftest processes on real Linux hosts.</b>
+Each test pair = one server-side perftest process + one client-side
+perftest process, each holding real kernel QPs via libibverbs.
+Scale is bounded by host CPU and kernel resources rather than ASIC
+state-machine count. The trade-off: lower max endpoint count, but
+zero hardware cost and bit-perfect fidelity (you're running THE
+canonical RDMA tool against THE production kernel verbs stack).</p>
+
+<h4>When to pick which</h4>
+
+<table>
+  <tr><th>Use case</th><th>Pick</th></tr>
+  <tr><td>Validate one link can hit line rate</td>
+      <td>Either — netgen's Blast RDMA dialog gives Ixia-level results</td></tr>
+  <tr><td>10–50 pair stress test (fan-in, mesh)</td>
+      <td>netgen Topology Mode (v0.4.0+) — sufficient + free</td></tr>
+  <tr><td>1000+ endpoint stress / fabric scaling</td>
+      <td>Ixia/Spirent — hardware count required</td></tr>
+  <tr><td>Production firmware/driver acceptance testing</td>
+      <td>netgen — runs against the actual kernel stack you ship</td></tr>
+  <tr><td>Continuous CI traffic generation in lab</td>
+      <td>netgen — REST API + free / no licence accounting</td></tr>
+  <tr><td>RFC-compliance protocol fuzzing</td>
+      <td>Ixia/Spirent — purpose-built field manipulation</td></tr>
+  <tr><td>NVMe-oF over RDMA testing</td>
+      <td>Ixia/Spirent — perftest doesn't speak NVMe (yet)</td></tr>
+</table>
+
+<p class="muted">Roadmap: closing the topology-model gap is the
+v0.4.0 milestone. NVMe-oF and per-flow real-time counters are
+candidates for v0.5+ if there's operator demand — neither is a
+fundamental architectural blocker, just additional orchestrator code
+(NVMe-oF would shell out to <code>nvme-cli</code> + <code>nvmetcli</code>
+rather than perftest; per-flow counters would parse perftest's
+<code>--out_json</code> mode and stream samples instead of waiting
+for the end-of-test summary).</p>
+
+<h2>10e. RDMA Topology Test (multi-pair, v0.4.0+)</h2>
+
+<p>The single-pair Blast a RDMA Flow dialog forces operators to open
+N separate windows to drive N test pairs. Topology Test
+(<b>Tools → RDMA → Topology Test…</b>) collapses that into one
+dialog with endpoint <b>groups</b> + a <b>topology shape</b>, mirroring
+Ixia's IxNetwork Topology + Traffic Item model (see §10d for the
+detailed comparison).</p>
+
+<h3>10e·1. Topology shapes</h3>
+
+<table>
+  <tr><th>Shape</th><th>Required endpoints</th><th>Generates</th><th>Use case</th></tr>
+  <tr><td><b>Single</b></td><td>1 server + 1 client</td><td>1 pair</td>
+      <td>Identical to the v0.3.x Blast dialog. Provided for spec
+          parity / scripted topology runs that want one code path.</td></tr>
+  <tr><td><b>Fan-in</b></td><td>1 server + N clients</td><td>N pairs</td>
+      <td>"Can one box receive from many" stress test. The classic
+          RoCE switch / fabric stress pattern.</td></tr>
+  <tr><td><b>Fan-out</b></td><td>N servers + 1 client</td><td>N pairs</td>
+      <td>"Can one box send to many." Useful when the client is the
+          sender (the role names follow perftest convention — server
+          listens, client drives traffic).</td></tr>
+  <tr><td><b>Mesh</b></td><td>N servers + M clients</td><td>N×M pairs</td>
+      <td>Full cross-product. Every server endpoint paired with every
+          client endpoint. Good fabric-wide saturation test.</td></tr>
+  <tr><td><b>Pairwise</b></td><td>N servers + N clients (equal)</td><td>N pairs</td>
+      <td>Parallel index-aligned pairing (s0↔c0, s1↔c1, …) — tests
+          parallel link saturation <i>without</i> cross-traffic
+          between pairs.</td></tr>
+</table>
+
+<h3>10e·2. Endpoint line format</h3>
+
+<p>The Server endpoints / Client endpoints text boxes accept one
+endpoint per line in the shape:</p>
+
+<pre>&lt;tg_url&gt; &lt;device&gt; [port=N] [gid=N] [label=NAME]</pre>
+
+<p>Examples:</p>
+
+<pre># Bare minimum — defaults: port=1, gid=3
+http://srv01:5050 mlx5_0
+
+# Override port + GID (e.g. older ConnectX-3 in dual-port mode,
+# or RoCEv2-IPv6)
+http://srv01:5050 mlx5_0 port=2 gid=4
+
+# Friendly label for the stats grid
+http://srv01:5050 mlx5_0 label=primary-rx
+
+# Comments start with #
+# Blank lines are ignored</pre>
+
+<p>Parse errors surface in the live "X pairs" preview label so
+operators see them BEFORE clicking Start.</p>
+
+<h3>10e·3. Listen-port allocation</h3>
+
+<p>Each pair needs a unique TCP port for perftest's control channel.
+The dialog allocates <code>base_listen_port + pair_index</code> for
+each pair (default base = 18516, perftest's own default 18515 + 1).
+So a 20-pair mesh occupies ports 18516–18535 on the server side(s).
+Operators running this in parallel with an ad-hoc Blast a RDMA Flow
+dialog can bump the base port to avoid collisions.</p>
+
+<h3>10e·4. Stats aggregation</h3>
+
+<p>The per-pair grid shows one row per pair: Server, Client, State,
+BW, MsgRate. The TOTAL row sums BW + MsgRate across all pairs that
+have reported data. Latency tests aggregate as iteration-weighted
+mean (a 10-iter pair shouldn't drag the average around as much as
+a 10K-iter one).</p>
+
+<p>perftest is batch-mode by default — the data row appears only at
+test end. While running, the row shows "running"; numbers appear
+once perftest emits the summary. See §10·notes for the timing
+breakdown.</p>
+
+<h3>10e·5. Sanity-check the spawned pairs</h3>
+
+<p>While a topology is running, use <b>Tools → RDMA → RDMA Jobs…</b>
+on each TG to see all the perftest processes spawned. Each pair has
+a unique <code>handshake_id</code>; the two halves (server-side +
+client-side) share that id so you can match them.</p>
+
+<h3>10e·6. Failure isolation</h3>
+
+<p>If one pair fails to start (server unreachable, perftest not
+installed, etc.), the dialog marks ONLY that row as
+<code>FAILED:&nbsp;&lt;reason&gt;</code> and continues running the rest.
+The TOTAL row aggregates over the surviving pairs.</p>
+
+<h3>10e·7. When NOT to use Topology Test</h3>
+
+<ul>
+  <li>One pair only — use Blast a RDMA Flow for the simpler UI.</li>
+  <li>1000+ endpoints — netgen tops out around 50 pairs per TG
+      before CPU starts dominating; for higher scale you need
+      hardware emulation (Ixia / Spirent — see §10d).</li>
+  <li>NVMe-oF / SR-IOV emulation — perftest doesn't speak those;
+      use the appropriate vendor tool.</li>
+</ul>
+
 <h2>10. One-way latency sampler</h2>
 
 <p>For streams sent with <code>"enable_timestamps": true</code>, tx_worker

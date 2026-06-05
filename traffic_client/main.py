@@ -1476,6 +1476,24 @@ class TrafficGeneratorClient(
         rdma_blast_action.triggered.connect(self.show_rdma_blast_flow_dialog)
         rdma_menu.addAction(rdma_blast_action)
 
+        # v0.4.0 RDMA Topology Test — N×M companion to Blast a RDMA Flow.
+        # Single dialog drives endpoint groups + a topology shape
+        # (fan-in / fan-out / mesh / pairwise) rather than the operator
+        # opening one dialog per pair. See Help → Install Guide §10d
+        # for the Ixia comparison that motivates this.
+        rdma_topology_action = QAction("Topology Test...", self)
+        rdma_topology_action.setToolTip(
+            "N×M perftest orchestrator. Add server-side + client-side "
+            "endpoints to groups, pick a topology shape "
+            "(single / fan-in / fan-out / mesh / pairwise), and the "
+            "dialog spawns the cross-product of perftest pairs with "
+            "aggregated stats. Use for fan-in stress testing, mesh "
+            "validation, or any scenario the 1:1 Blast dialog can't "
+            "cover in one shot."
+        )
+        rdma_topology_action.triggered.connect(self.show_rdma_topology_dialog)
+        rdma_menu.addAction(rdma_topology_action)
+
         rdma_menu.addSeparator()
 
         rdma_devices_action = QAction("RDMA Devices...", self)
