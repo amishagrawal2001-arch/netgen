@@ -398,3 +398,40 @@ def test_show_feature_guide_renders_html_into_textbrowser(qapp, monkeypatch):
     assert "What's New" in captured.get("html", "")
     # And it carries one of the new section headers we just pinned.
     assert "EVPN bulk-inject" in captured["html"]
+
+
+def test_rdma_guide_constant_present():
+    """v0.4.0 Help → RDMA Guide must exist as a standalone guide,
+    not buried inside the API Guide. Pin both the function + the
+    constant so a refactor can't silently revert."""
+    from widgets.stream_dialog import _RDMA_GUIDE_HTML, show_rdma_guide
+    # Function exists + callable
+    assert callable(show_rdma_guide)
+    # Guide HTML has the section headers we documented
+    assert "Netgen — RDMA Guide" in _RDMA_GUIDE_HTML
+    # Ixia comparison section
+    assert "Endpoint Groups + Traffic Items" in _RDMA_GUIDE_HTML
+    # All 5 topology shapes documented
+    for shape in ("Single", "Fan-in", "Fan-out", "Mesh", "Pairwise"):
+        assert f"<b>{shape}</b>" in _RDMA_GUIDE_HTML, (
+            f"Topology shape {shape!r} missing from RDMA guide"
+        )
+    # Auto-install / kill switch documented
+    assert "NETGEN_AUTO_INSTALL" in _RDMA_GUIDE_HTML
+    # REST surface documented
+    assert "/api/rdma/perftest/start" in _RDMA_GUIDE_HTML
+    assert "/api/rdma/devices" in _RDMA_GUIDE_HTML
+
+
+def test_rdma_guide_content_NOT_in_api_guide():
+    """The Topology + Ixia content used to be misplaced as §10d/§10e
+    in _API_GUIDE_HTML. After v0.4.0 cleanup, it should live ONLY in
+    _RDMA_GUIDE_HTML."""
+    from widgets.stream_dialog import _API_GUIDE_HTML
+    assert "10d. Comparison with hardware test equipment" not in _API_GUIDE_HTML, (
+        "Ixia comparison still misplaced in API guide — should be in "
+        "the dedicated RDMA guide only"
+    )
+    assert "10e. RDMA Topology Test" not in _API_GUIDE_HTML, (
+        "Topology Test help still misplaced in API guide"
+    )

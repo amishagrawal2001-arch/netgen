@@ -1565,6 +1565,24 @@ class TrafficGeneratorClient(
         help_menu.addAction(api_guide_action)
         self.addAction(api_guide_action)
 
+        # RDMA Guide — dedicated walkthrough for the RDMA feature set:
+        # install / auto-install, device model, both dialogs (Blast a
+        # Flow + Topology Test), stats aggregation semantics, Ixia
+        # comparison, troubleshooting, REST surface. Added in v0.4.0;
+        # previously the Topology + Ixia content lived buried inside
+        # the API Guide where operators couldn't find it.
+        rdma_guide_action = QAction("RDMA Guide...", self)
+        rdma_guide_action.setToolTip(
+            "Comprehensive RDMA walkthrough: install/auto-install "
+            "(v0.3.18+), device + port model, single-pair Blast vs "
+            "N×M Topology Test (v0.4.0+), stats aggregation, "
+            "comparison with Ixia/Spirent, troubleshooting, and the "
+            "REST surface for scripted runs."
+        )
+        rdma_guide_action.triggered.connect(self.show_rdma_guide)
+        help_menu.addAction(rdma_guide_action)
+        self.addAction(rdma_guide_action)
+
         # Supported Features — the capability matrix. Answers "can
         # this app do X?" — every packet type, protocol, emulator,
         # backend. Distinct from What's-New (release notes) and API
@@ -1712,6 +1730,18 @@ class TrafficGeneratorClient(
         try:
             from widgets.stream_dialog import show_api_guide
             show_api_guide(self)
+        except Exception as e:
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "Help unavailable", f"Could not open guide: {e}")
+
+    def show_rdma_guide(self):
+        """Open the dedicated RDMA Guide dialog from the Help menu.
+        Added in v0.4.0 — separate entry so the Topology + Ixia
+        content isn't buried inside the API Guide where operators
+        couldn't find it."""
+        try:
+            from widgets.stream_dialog import show_rdma_guide
+            show_rdma_guide(self)
         except Exception as e:
             from PyQt5.QtWidgets import QMessageBox
             QMessageBox.warning(self, "Help unavailable", f"Could not open guide: {e}")
