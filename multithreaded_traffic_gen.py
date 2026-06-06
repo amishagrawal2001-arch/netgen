@@ -641,6 +641,7 @@ def start_rx_counter(rx_interface, stream_name, stream_id, tracker: StreamTracke
     def lfilter(pkt):
         nonlocal seen_total, matched, sig_hits, tuple_hits, last_dbg, first_seen_ts, relaxed_now
         seen_total += 1
+        rx_debug["seen_total"] = seen_total
         if first_seen_ts is None:
             first_seen_ts = time.time()
 
@@ -648,6 +649,8 @@ def start_rx_counter(rx_interface, stream_name, stream_id, tracker: StreamTracke
         if _sig_present(pkt):
             sig_hits += 1
             matched += 1
+            rx_debug["sig_hits"] = sig_hits
+            rx_debug["matched"] = matched
             if matched <= 5:
                 logging.info(f"[RX-MATCH] signature on {sniff_iface} (seen={seen_total}, sig={sig_hits}, tuple={tuple_hits})")
             return True
@@ -656,6 +659,8 @@ def start_rx_counter(rx_interface, stream_name, stream_id, tracker: StreamTracke
         if _tuple_match(pkt):
             tuple_hits += 1
             matched += 1
+            rx_debug["tuple_hits"] = tuple_hits
+            rx_debug["matched"] = matched
             if matched <= 5:
                 logging.info(f"[RX-MATCH] tuple on {sniff_iface} (seen={seen_total}, sig={sig_hits}, tuple={tuple_hits}, relaxed={relaxed_now})")
             return True
@@ -663,6 +668,7 @@ def start_rx_counter(rx_interface, stream_name, stream_id, tracker: StreamTracke
         # 3) after 2s without matches, relax to any UDP (useful for RoCEv2)
         if auto_relax and not relaxed_now and first_seen_ts and (time.time() - first_seen_ts) >= 2.0 and matched == 0:
             relaxed_now = True
+            rx_debug["relaxed_now"] = True
             logging.warning(f"[RX] auto-relax enabled on {sniff_iface}: counting any UDP frames (no signature)")
 
         # periodic debug
@@ -685,6 +691,38 @@ def start_rx_counter(rx_interface, stream_name, stream_id, tracker: StreamTracke
     _seq_re = re.compile(
         rb"\[" + re.escape(stream_id.encode()) + rb"(?:/q\d+)?#(\d+)\]"
     )
+
+    # v0.4.3 rx_debug snapshot: a dict mirrored into the stream
+    # tracker entry so /api/streams/<id>/rx_debug can read it WITHOUT
+    # the sniffer thread having to expose its locals. Updated in
+    # lfilter via the existing counter increments. Bypassing the
+    # tracker lock here is safe because Python dict writes/reads of
+    # int values are atomic for CPython under the GIL and the
+    # REST handler only READS — staleness by a few ms is fine for
+    # an observability endpoint.
+    rx_debug = {
+        "sniff_iface": sniff_iface,
+        "base_iface": rx_interface,
+        "vlan_subif_created": created_vlan_subif,
+        "bpf": final_bpf,
+        "signature_pattern": sig_pattern.pattern.decode(errors="replace"),
+        "seen_total": 0,
+        "matched": 0,
+        "sig_hits": 0,
+        "tuple_hits": 0,
+        "relaxed_now": False,
+        "rescue_active": False,    # set True when rescue sniffer starts
+        "started_at": time.time(),
+    }
+    try:
+        # Attach to the tracker entry so the REST handler can find it.
+        for s in tracker.active_streams:
+            if s.get("stream_id") == stream_id and \
+                    s.get("interface") == rx_interface:
+                s["rx_debug"] = rx_debug
+                break
+    except Exception:
+        pass
 
     def _extract_seq(pkt) -> int | None:
         try:
@@ -751,6 +789,7 @@ def start_rx_counter(rx_interface, stream_name, stream_id, tracker: StreamTracke
                 promisc=True,
             )
             rescue_sniffer.start()
+            rx_debug["rescue_active"] = True
             logging.info(
                 f"[RX] Rescue sniffer started on base '{rx_interface}' "
                 f"(primary on '{sniff_iface}') — catches frames where TX "
@@ -966,6 +1005,94 @@ def _ensure_vlan_rx_visible(rx_iface: str, vlan_id: int) -> str | None:
         return sub
     except Exception:
         return None
+
+
+def _diagnose_tx_vlan(interface: str, sample_pkt, vlan_id_expected) -> None:
+    """v0.4.3 TX-side VLAN diagnostic.
+
+    Operator-reported bug from svl-d-ai-srv04: stream config said
+    VLAN:Tagged + vlan_id=10, but tcpdump on the receive side showed
+    untagged frames. The Scapy builder DOES add Dot1Q correctly
+    (verified by code reading + the per-packet test), so the tag
+    must be getting stripped somewhere downstream. The two known
+    culprits:
+
+      1. Mellanox / Intel hardware VLAN insertion offload
+         (``tx-vlan-offload: on`` in ethtool -k) — the NIC firmware
+         REMOVES the Dot1Q layer from the frame and re-inserts it
+         from skb->vlan_tci. If the kernel doesn't populate
+         vlan_tci (Scapy's raw sendp path doesn't), the tag is
+         lost entirely. This is the most common cause and the one
+         that bit the operator.
+      2. An intermediate switch / bridge stripping VLAN tags it
+         doesn't recognize.
+
+    This helper logs a one-shot diagnostic at stream startup so
+    operators see both the built-packet structure AND the iface
+    offload state and can correlate. No behaviour change, no extra
+    runtime cost (single log lines, runs once per stream).
+
+    Run it BEFORE the TX loop. Safe to call on any packet type;
+    just reads layer presence."""
+    import subprocess as _sp
+    try:
+        from scapy.layers.l2 import Dot1Q
+    except Exception:
+        return
+    try:
+        has_dot1q = (Dot1Q in sample_pkt) if sample_pkt is not None else False
+        wire_vid = None
+        if has_dot1q:
+            try:
+                wire_vid = int(sample_pkt[Dot1Q].vlan)
+            except Exception:
+                pass
+        if vlan_id_expected is not None and int(vlan_id_expected) > 0:
+            if not has_dot1q:
+                logging.warning(
+                    f"[TX-VLAN] stream config says VLAN tagged "
+                    f"(vlan_id={vlan_id_expected}) but the built packet "
+                    f"does NOT contain a Dot1Q layer — wire will be "
+                    f"untagged. Check the Scapy builder path."
+                )
+            else:
+                logging.info(
+                    f"[TX-VLAN] built packet carries Dot1Q vlan={wire_vid} "
+                    f"on iface={interface}"
+                )
+    except Exception as e:
+        logging.debug(f"[TX-VLAN] layer-check failed: {e}")
+
+    # Check ethtool offload state — if tx-vlan-offload is on, the NIC
+    # will strip the Dot1Q from the frame and re-insert from skb
+    # metadata, which Scapy's sendp path doesn't populate. Result:
+    # tag lost on wire.
+    try:
+        r = _sp.run(["ethtool", "-k", interface],
+                    capture_output=True, text=True, timeout=3)
+        if r.returncode == 0:
+            for line in r.stdout.splitlines():
+                if "tx-vlan-offload" in line.lower():
+                    state = line.split(":", 1)[-1].strip().split()[0].lower()
+                    if state == "on" and vlan_id_expected and int(vlan_id_expected) > 0:
+                        logging.warning(
+                            f"[TX-VLAN] iface {interface} has "
+                            f"tx-vlan-offload=on — Mellanox/Intel firmware "
+                            f"may strip Dot1Q tags from Scapy frames. "
+                            f"To force software tagging: "
+                            f"`ethtool -K {interface} txvlan off` "
+                            f"(then restart the stream)."
+                        )
+                    else:
+                        logging.info(
+                            f"[TX-VLAN] iface {interface} "
+                            f"tx-vlan-offload={state}"
+                        )
+                    break
+    except (FileNotFoundError, _sp.TimeoutExpired):
+        pass  # ethtool missing or slow — non-fatal
+    except Exception as e:
+        logging.debug(f"[TX-VLAN] ethtool check failed: {e}")
 
 
 def _release_vlan_subif(sub: str) -> None:
@@ -1730,6 +1857,27 @@ def generate_packets(stream_data, interface, stop_event):
         return
 
     logging.info("[Generic] TX loop enter")
+
+    # v0.4.3 TX-VLAN diagnostic — build a SAMPLE packet (one-shot, not
+    # in the hot path), check whether Dot1Q is present + whether the
+    # iface has tx-vlan-offload that might strip it. Logs at most 2
+    # lines per stream startup.
+    try:
+        _sample = build_generic_packet(
+            stream_data, pkt_cfg,
+            vlan_id=(pkt_cfg["vlan_ids"][0] if pkt_cfg.get("vlan_ids") else None),
+            src_mac=pkt_cfg["mac_src_list"][0] if pkt_cfg.get("mac_src_list") else None,
+            dst_mac=pkt_cfg["mac_dst_list"][0] if pkt_cfg.get("mac_dst_list") else None,
+            src_ip=pkt_cfg["ipv4_src_list"][0] if pkt_cfg.get("ipv4_src_list") else None,
+            dst_ip=pkt_cfg["ipv4_dst_list"][0] if pkt_cfg.get("ipv4_dst_list") else None,
+        )
+        _diagnose_tx_vlan(
+            interface, _sample,
+            pkt_cfg["vlan_ids"][0] if pkt_cfg.get("vlan_ids") else None,
+        )
+    except Exception as e:
+        logging.debug(f"[TX-VLAN] diagnostic skipped: {e}")
+
     index = 0
     
     # Use precise timing: track target time instead of fixed sleep

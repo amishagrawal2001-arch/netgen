@@ -742,36 +742,104 @@ def stream_stats():
         return jsonify({"active_streams": stats}), 200
 
 
-## check and updated if needed. #
-@app.route("/api/traffic/rx_monitor", methods=["POST"])
-def rx_monitor():
-    data = request.get_json()
-    interface = data.get("interface")
-    stream_name = data.get("stream_name")
+# v0.4.3: /api/streams/<stream_id>/rx_debug — exposes the RX sniffer's
+# internal state (sniff iface, BPF filter, signature pattern, seen +
+# matched + sig_hits + tuple_hits counters, rescue-sniffer status,
+# VLAN sub-iface refcount). Lets operators diagnose "rx_count stuck
+# at 0" cases without SSHing into the server. Made debugging the
+# user's flow-tracking case (multithreaded_traffic_gen.py:454 ff)
+# take ~1 second instead of ~15 min SSH-poking.
+@app.route("/api/streams/<stream_id>/rx_debug", methods=["GET"])
+def stream_rx_debug(stream_id):
+    """Return the RX sniffer's internal observability snapshot for a
+    running stream. Populated only when flow_tracking_enabled=true on
+    the stream; 404 otherwise.
 
-    if not interface or not stream_name:
-        return jsonify({"error": "Missing interface or stream name"}), 400
+    Returns:
+      {
+        "stream_id": "...",
+        "stream_name": "...",
+        "interface": "<tx_iface>",
+        "rx_interface": "<rx_iface>",
+        "flow_tracking_enabled": bool,
+        "rx_count": int,
+        "tx_count": int,
+        "rx_debug": {
+          "sniff_iface": "<sub-iface or base>",
+          "base_iface": "<rx_iface>",
+          "vlan_subif_created": "<sub-iface name or null>",
+          "bpf": "<libpcap filter>",
+          "signature_pattern": "<regex>",
+          "seen_total": int,        # all packets matching BPF
+          "matched": int,           # passed lfilter (sig + tuple paths)
+          "sig_hits": int,          # signature-matched
+          "tuple_hits": int,        # tuple-matched (sig fallback)
+          "relaxed_now": bool,      # auto-relax kicked in
+          "rescue_active": bool,    # v0.4.1 dual-sniff started
+          "started_at": float       # unix ts
+        },
+        "vlan_subif_refcount": int  # how many streams share the sub-iface
+      }
+    """
+    # Search active streams for this id
+    matched_stream = None
+    for s in stream_tracker.active_streams:
+        if s.get("stream_id") == stream_id:
+            matched_stream = s
+            break
+    if matched_stream is None:
+        return jsonify({
+            "ok": False,
+            "error": f"no active stream with id {stream_id}"
+        }), 404
 
-    stop_event = Event()
+    if not matched_stream.get("flow_tracking_enabled"):
+        return jsonify({
+            "ok": False,
+            "error": "flow_tracking_enabled=false on this stream — "
+                     "no RX sniffer to observe"
+        }), 404
 
-    match_criteria = {
-        "mac_src": data.get("mac_source_address"),
-        "ip_src": data.get("ipv4_source"),
-        "ipv6_src": data.get("ipv6_source")
-    }
+    rx_debug_snap = matched_stream.get("rx_debug") or {}
 
-    logging.info(f"🟢 RX monitor initializing on {interface} for stream '{stream_name}'")
-    logging.debug(f"🔎 Match criteria: {match_criteria}")
+    # Also surface the sub-iface refcount if applicable
+    refcount = None
+    try:
+        from multithreaded_traffic_gen import _VLAN_SUBIF_REFS, _VLAN_SUBIF_LOCK
+        sub = rx_debug_snap.get("vlan_subif_created")
+        if sub:
+            with _VLAN_SUBIF_LOCK:
+                refcount = _VLAN_SUBIF_REFS.get(sub)
+    except Exception:
+        pass
 
-    stream_tracker.add_stream({
-        "interface": interface,
-        "stream_name": stream_name,
-        "stop_event": stop_event,
-        "stream_id": data.get("stream_id", str(uuid.uuid4()))  # ✅ Ensure fallback stream_id
+    return jsonify({
+        "ok": True,
+        "stream_id": stream_id,
+        "stream_name": matched_stream.get("stream_name"),
+        "interface": matched_stream.get("interface"),
+        "rx_interface": matched_stream.get("rx_interface"),
+        "flow_tracking_enabled": matched_stream.get("flow_tracking_enabled"),
+        "rx_count": matched_stream.get("rx_count", 0),
+        "tx_count": matched_stream.get("tx_count", 0),
+        "rx_debug": rx_debug_snap,
+        "vlan_subif_refcount": refcount,
     })
 
-    start_rx_counter(interface, stream_name, stop_event, match_criteria)
-    return jsonify({"message": "RX monitoring started"}), 200
+
+# v0.4.3: removed the broken /api/traffic/rx_monitor endpoint.
+# Was wired to start_rx_counter with the WRONG arg count
+# (4 positional, function takes 6 required) — TypeError the moment
+# any client hit it. No client in this repo ever did, and the RX
+# sniffer is correctly orchestrated from generate_packets() via
+# launch_single_stream + /api/traffic/start, so the endpoint
+# served no real purpose beyond accumulating risk.
+#
+# If the operator's external tooling references this endpoint,
+# the 404 here is more honest than a 500 TypeError. The proper
+# way to start an RX sniffer is to POST a stream to /api/traffic/start
+# with flow_tracking_enabled=true; the server handles the sniffer
+# lifecycle from there.
 
 
 
@@ -16723,8 +16791,14 @@ def rfc2544_stop():
 
 
 @app.route("/api/rfc2544/progress", methods=["GET"])
+@app.route("/api/rfc2544/status", methods=["GET"])
 def rfc2544_progress():
-    """Poll for RFC 2544 test progress + per-frame-size results."""
+    """Poll for RFC 2544 test progress + per-frame-size results.
+
+    v0.4.3: ``/api/rfc2544/status`` added as an alias because curl
+    examples + early test scripts referenced ``/status`` and hit a
+    404 on a running test (the real endpoint was ``/progress``).
+    Both URLs return the same body."""
     with _RFC2544_LOCK:
         snap = {
             "running":      _RFC2544_STATE["running"],

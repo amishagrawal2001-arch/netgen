@@ -2,6 +2,94 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.4.3] - 2026-06-06
+
+**Audit batch: latent bugs + observability gap + TX-VLAN diagnostic.**
+Six small fixes surfaced by the audit after v0.4.2 shipped — each
+either silently broken before, or actively making future diagnostics
+harder.
+
+### Bugs squashed
+
+1. **`/api/traffic/rx_monitor` removed** — endpoint at line 773
+   called `start_rx_counter(interface, stream_name, stop_event,
+   match_criteria)` with 4 args, but the function takes 6 required.
+   TypeError if anyone hit it. No client in the repo did, but it was
+   a latent footgun. The endpoint served no real purpose (the RX
+   sniffer is correctly orchestrated by `generate_packets` via
+   `/api/traffic/start`), so it's deleted rather than fixed.
+
+2. **`/api/rfc2544/status` as alias for `/progress`** — operator hit
+   `/status` while diagnosing the test progression and got 404; the
+   real endpoint was `/progress`. Both routes now point at the same
+   view function. Doc snippets / curl examples that reference
+   `/status` no longer break.
+
+3. **Runtime state files gitignored** — `recent_sessions.json` added
+   to `.gitignore`; `session.json` + `server_interfaces.txt` already
+   listed but were TRACKED (added before .gitignore caught them) so
+   git rm --cached'd to actually drop them. No more `M session.json`
+   noise in every git status.
+
+4. **`pyproject.toml` excludes `build*` from packages.find** — local
+   `python -m build` invocations on the same checkout were nesting
+   `build/lib/build/lib/build/lib/...` inside the wheel
+   (8 levels deep on the artifact I inspected earlier in the session).
+   CI runners start fresh so don't see this; but local dev builds
+   would. Explicit `build*` exclude makes the wheel clean
+   regardless.
+
+### Observability gap closed
+
+5. **New `/api/streams/<stream_id>/rx_debug` endpoint** — exposes the
+   RX sniffer's internal state for a flow-tracking stream:
+   - `sniff_iface` + `base_iface` (primary listener + base, for
+     the v0.4.1 dual-sniff)
+   - `vlan_subif_created` + `vlan_subif_refcount`
+   - `bpf` filter actually applied
+   - `signature_pattern` regex
+   - `seen_total` / `matched` / `sig_hits` / `tuple_hits` counters
+     mirrored from the sniffer's local state every time lfilter
+     fires
+   - `relaxed_now` (auto-relax kicked in)
+   - `rescue_active` (v0.4.1 fallback sniffer started)
+
+   Diagnosing the v0.4.1 flow-tracking bug on `svl-d-ai-srv04` took
+   ~15 min of SSH spelunking + tcpdump + journalctl + ip-link
+   gymnastics; this endpoint would have made it a single `curl`.
+
+### Diagnostic
+
+6. **TX-VLAN startup diagnostic** — `_diagnose_tx_vlan(interface,
+   sample_pkt, vlan_id_expected)` runs once per stream at "TX loop
+   enter". Two things logged:
+   - Whether the built packet carries a Dot1Q layer when
+     `vlan_id_expected > 0` (catches a hypothetical builder regression)
+   - Whether `ethtool -k <iface> | grep tx-vlan-offload` shows `on`;
+     if so, WARNS with the operator-actionable fix
+     (`ethtool -K <iface> txvlan off`). Mellanox/Intel firmware
+     with `tx-vlan-offload=on` strips Dot1Q from Scapy frames and
+     re-inserts from `skb->vlan_tci` (which Scapy's sendp path
+     doesn't populate). This is almost certainly the root cause
+     of the operator-reported "VLAN tagged config → untagged
+     wire" bug from v0.4.1 — but rather than guess, the diagnostic
+     surfaces the state so operators know whether to disable the
+     offload or look elsewhere.
+
+   Logs at most 2 lines per stream startup. Zero hot-path cost
+   (single `ethtool -k` subprocess + a layer-presence check).
+
+### Tests
+
+`tests/test_v043_cleanups.py` — 10 new tests pinning each fix
+above. Most are static-analysis style (regex over source) for
+the endpoint removals + gitignore + pyproject excludes; the
+TX-VLAN diagnostic also has 3 behavior tests covering the
+no-Dot1Q warning, tx-vlan-offload-on warning, and the quiet
+case (no VLAN expected).
+
+Full suite: 1372 passed, 1 skipped.
+
 ## [0.4.2] - 2026-06-06
 
 **Stream statistics table shows the real name, not "Unnamed Stream".**

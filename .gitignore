@@ -83,3 +83,6 @@ vnc_improve_*.sh
 
 # Nested git repository — separate decision pending (submodule vs vendor)
 server_nic_linkdown_script/
+
+# v0.4.3: per-client recent-sessions cache
+recent_sessions.json

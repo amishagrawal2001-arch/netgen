@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ostg-trafficgen"
-version = "0.4.2"
+version = "0.4.3"
 description = "OSTG Traffic Generator - Advanced Network Traffic Generation with BGP/OSPF Support"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -42,7 +42,12 @@ ostg-docker-install = "setup_docker:main"
 netgen-cli = "netgen_cli:main"
 
 [tool.setuptools]
-packages.find = { exclude = ["backup*", "*.backup.*", "*.tmp", "*.temp"] }
+# v0.4.3: also exclude `build*` so successive `python -m build`
+# invocations on the same checkout don't nest build/lib/build/lib/
+# inside the wheel. CI runners start fresh so don't hit this; local
+# dev builds without `rm -rf build/` between runs were ending up
+# with 8-level-deep build/lib/ trees inside the published artifact.
+packages.find = { exclude = ["backup*", "*.backup.*", "*.tmp", "*.temp", "build*"] }
 py-modules = ["multithreaded_traffic_gen", "run_tgen_client", "run_tgen_server", "capture_client", "setup_docker", "netgen_cli"]
 
 [tool.setuptools.package-data]
