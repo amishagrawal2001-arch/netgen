@@ -221,3 +221,96 @@ def test_html_report_no_results_shows_message():
     html = build_rfc2544_html_report(_sample_params(), [])
     assert "no results" in html.lower()
     assert "<table class='results'>" not in html
+
+
+# ─────────────────────────────────── v0.4.0 Scapy pre-flight warning
+
+
+def _make_dialog_for_preflight():
+    """Construct dialog with a fake server_url + populated MAC/IP
+    fields so _on_start passes the MAC/IP validation gate and
+    reaches the Scapy pre-flight check."""
+    app = QApplication.instance() or QApplication([])
+    dlg = Rfc2544Dialog(server_url="http://10.0.0.1:5050")
+    dlg.tx_iface_field.setText("enp181s0f0np0")
+    dlg.mac_src_field.setText("02:00:00:00:00:01")
+    dlg.mac_dst_field.setText("02:00:00:00:00:02")
+    dlg.ip_src_field.setText("10.0.0.1")
+    dlg.ip_dst_field.setText("10.0.0.2")
+    return dlg
+
+
+def test_preflight_warns_when_scapy_selected(monkeypatch):
+    """Scapy + RFC2544_FRAME_SIZES (includes 64B) → warning fires.
+    Operator clicking No must abort _on_start before any POST."""
+    dlg = _make_dialog_for_preflight()
+    dlg.dpdk_checkbox.setChecked(False)
+
+    posted = []
+    monkeypatch.setattr("requests.post",
+                        lambda *a, **kw: posted.append((a, kw)) or MagicMock())
+
+    # Simulate operator clicking "No" on the warning
+    from PyQt5.QtWidgets import QMessageBox
+    monkeypatch.setattr(QMessageBox, "warning",
+                        lambda *a, **kw: QMessageBox.No)
+
+    dlg._on_start()
+    assert posted == [], (
+        "operator declined the Scapy warning but POST was sent anyway — "
+        "pre-flight check didn't gate the start"
+    )
+
+
+def test_preflight_does_not_warn_when_dpdk_enabled(monkeypatch):
+    """DPDK selected → no warning even with 64B frames. DPDK can
+    actually reach the rates the test probes."""
+    dlg = _make_dialog_for_preflight()
+    dlg.dpdk_checkbox.setChecked(True)
+
+    warned = []
+    from PyQt5.QtWidgets import QMessageBox
+    monkeypatch.setattr(QMessageBox, "warning",
+                        lambda *a, **kw: warned.append(a) or QMessageBox.No)
+    # Stub requests.post so we don't hit the network
+    monkeypatch.setattr("requests.post",
+                        lambda *a, **kw: MagicMock(json=lambda: {"status":"started"}))
+
+    dlg._on_start()
+    # The warning() helper is used for OTHER cases (e.g. server errors),
+    # but our pre-flight Scapy warning should NOT fire when DPDK is on.
+    for call_args in warned:
+        title = call_args[1] if len(call_args) > 1 else ""
+        assert "Scapy" not in str(title), (
+            f"Scapy-specific pre-flight warning fired despite DPDK enabled: "
+            f"title={title!r}"
+        )
+
+
+def test_preflight_continue_anyway_proceeds_to_post(monkeypatch):
+    """Operator clicking Yes on the Scapy warning means 'I know the
+    risks, run it anyway' → _on_start must proceed to POST."""
+    dlg = _make_dialog_for_preflight()
+    dlg.dpdk_checkbox.setChecked(False)
+
+    posted = []
+    fake_resp = MagicMock()
+    fake_resp.json = lambda: {"status": "started"}
+    monkeypatch.setattr(
+        "requests.post",
+        lambda *a, **kw: posted.append((a, kw)) or fake_resp,
+    )
+
+    # Simulate operator clicking Yes
+    from PyQt5.QtWidgets import QMessageBox
+    monkeypatch.setattr(QMessageBox, "warning",
+                        lambda *a, **kw: QMessageBox.Yes)
+
+    dlg._on_start()
+    assert len(posted) == 1, (
+        "operator clicked Yes ('continue anyway') but POST was not "
+        "issued — Yes path should proceed to start the test"
+    )
+    # And dpdk_enable=False made it into the payload
+    posted_body = posted[0][1].get("json", {})
+    assert posted_body.get("dpdk_enable") is False

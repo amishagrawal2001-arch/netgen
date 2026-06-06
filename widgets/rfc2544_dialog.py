@@ -418,6 +418,59 @@ class Rfc2544Dialog(QDialog):
             )
             return
 
+        # v0.4.0 pre-flight: warn the operator when Scapy is selected
+        # for a test that includes frame sizes small enough to require
+        # rates Scapy cannot generate. Operator scenario from the field:
+        # 400G Mellanox NIC + Scapy + 64B start → 595 Mpps line rate,
+        # ~0.5 Mpps Scapy ceiling → 100% loss on every probe → table
+        # of dashes after 60+ minutes of test time. By the time the
+        # operator looks at the results, they've wasted an hour on
+        # what was structurally a doomed test.
+        #
+        # The check is intentionally conservative: trigger only when
+        # the smallest frame size is ≤256B (high-pps regime) AND DPDK
+        # is unchecked. 1518B/1024B Scapy tests on 1G/10G links are
+        # still a valid use case so we don't warn there.
+        if not self.dpdk_checkbox.isChecked():
+            small_sizes = [s for s in RFC2544_FRAME_SIZES if s <= 256]
+            if small_sizes:
+                pps_envelope_kpps = 500  # generous upper bound for Scapy
+                # Rough rate the test will try at the smallest size on
+                # a 10G link — used only to make the message concrete.
+                example_pps_10g_64b = 14_880_000
+                msg = (
+                    "<b>Scapy is selected but the test includes frame "
+                    f"sizes ≤{max(small_sizes)} B.</b><br><br>"
+                    "Scapy's realistic TX ceiling is around <b>"
+                    f"{pps_envelope_kpps} kpps</b> per stream. "
+                    "RFC 2544 at 64 B probes at line rate — that's "
+                    f"~{example_pps_10g_64b // 1_000_000} Mpps on a "
+                    "10 G link, ~148 Mpps on 100 G, ~595 Mpps on 400 G "
+                    "(~1000× over Scapy's envelope).<br><br>"
+                    "Without DPDK the binary search will see 100% "
+                    "loss at every probe (TX can't reach the rate it's "
+                    "trying to test). Result: every frame size reports "
+                    "<code>max_no_drop_pps = 0</code> — a wall of "
+                    "dashes after 60+ minutes of test time.<br><br>"
+                    "<b>Three sensible paths:</b><br>"
+                    "1. <b>Enable DPDK</b> (the checkbox you unchecked) — "
+                    "requires DPDK installed on the target.<br>"
+                    "2. <b>Run only on a slow link</b> where Scapy can "
+                    "actually reach line rate (1 G + 1518 B = ~82 kpps; "
+                    "Scapy handles that).<br>"
+                    "3. <b>Continue anyway</b> — useful only if you're "
+                    "intentionally testing the TX path's small-frame "
+                    "ceiling, not measuring NIC/link performance."
+                )
+                resp = QMessageBox.warning(
+                    self, "Scapy + small frames — likely doomed test",
+                    msg,
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if resp != QMessageBox.Yes:
+                    return
+
         params = {
             "tx_iface": self.tx_iface_field.text().strip(),
             "rx_iface": self.rx_iface_field.text().strip() or None,
