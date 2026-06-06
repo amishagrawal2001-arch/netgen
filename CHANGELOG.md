@@ -2,6 +2,146 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.4.0] - 2026-06-06
+
+**Major release: RDMA Topology Test (N×M), RFC 2544 hardening, and a
+fully searchable Help system.** Eleven commits since v0.3.18 split across
+four operator-facing themes — each driven by real lab work on
+`svl-d-ai-srv04` (Ubuntu 24.04 + ConnectX-7).
+
+### RDMA Topology Test — N×M perftest orchestrator
+
+The single-pair Blast a RDMA Flow dialog forced operators to open N
+separate dialogs to drive N test pairs. Topology Test (Tools → RDMA →
+Topology Test…) collapses that into one dialog with endpoint groups +
+a topology shape, mirroring Ixia's IxNetwork Topology + Traffic Item
+model.
+
+- **New module** `utils/rdma_topology.py` (pure functions, no Qt) with
+  `RdmaTopologyEndpoint`, `RdmaTopologySpec`, `expand_pairs()`,
+  `validate_spec()`, `aggregate_stats()`. Bit-identical math to the
+  dialog's TOTAL row.
+- **New dialog** `widgets/rdma_topology_dialog.py` — compact layout, five
+  topology shapes (single / fan-in / fan-out / mesh / pairwise),
+  endpoint editors as plain-text panes (one endpoint per line:
+  `<tg_url> <device> [port=N] [gid=N] [label=NAME]`), live "X pairs"
+  preview label that surfaces validation errors as the operator types,
+  per-pair stats grid + TOTAL row aggregating BW + MsgRate across
+  pairs (iteration-weighted mean for latency tests).
+- **Listen-port allocation** is `base + pair_index` across the whole
+  topology — handles the FAN_IN case where one server endpoint
+  participates in multiple pairs (each needs its own listening
+  perftest process).
+- **45 tests** in `test_rdma_topology_spec.py` (27) and
+  `test_rdma_topology_dialog.py` (18) pinning shape correctness,
+  unique-port invariants, aggregation math, parser edge cases.
+
+### RDMA Blast dialog polish
+
+Six operator-reported issues from real-world testing on srv04:
+
+1. **perftest-retry poll** — when the initial probe sees
+   `installed: false` (operator opens dialog mid-v0.3.18-auto-install),
+   re-probe every 5 sec for up to 2 min so the red banner clears
+   automatically once the binary lands.
+2. **None wall-of-text** — perftest is batch-mode; final_* fields stay
+   None until test completes. Pre-fix the chunk renderer showed
+   `size=NoneB iters=None BW avg=None Gbps...` on every poll. Now
+   shows `(perftest emits results on completion, not during run —
+   12s elapsed)`.
+3. **Per-side finished tracking** — `_is_finished(side, job, want_side)`
+   returned False whenever side != want_side, so `_on_both_finished()`
+   was never called, the poll timer never stopped, and "done" lines
+   were re-appended every 2 sec forever. Fixed via instance-level
+   `_server_finished` + `_client_finished` flags.
+4. **Render dedup** — `_last_rendered_key` per side; only re-renders
+   on state transitions.
+5. **Compact + professional layout** — 4-sentence header → 1 line,
+   8-row Test params QFormLayout → 2-column 5-row grid, slate-200
+   GroupBox borders, fixed-width spinboxes.
+6. **Port spinbox tooltip** — "almost always 1 on modern Mellanox;
+   each port is its own IB device."
+
+### RFC 2544 — smart search + reachability + live progress + Scapy guard
+
+Operator-reported scenario (svl-d-ai-srv04, 400 G Mellanox NIC):
+started RFC 2544 with DPDK unchecked, frame_size=64. Got "Testing
+64B" then a wall of dashes 60 seconds later. Investigation: Scapy's
+TX ceiling is ~500 kpps; RFC 2544 at 64 B probes at line rate
+(~595 Mpps on 400 G). Scapy actually sent 80k packets in 60 sec
+(~1.3 kpps), RX=0 (peer unreachable), 100% loss → naive search:
+13 iterations × 60 sec wasted before converging to 0 pps.
+
+Four fixes:
+
+- **Pre-flight Scapy warning** — fires when DPDK is unchecked AND the
+  test includes frame sizes ≤256 B. Explains Scapy ceiling vs line
+  rate at this size, offers three sensible paths: enable DPDK / run
+  on a slow link / continue anyway. Operator override via Yes; default
+  No aborts without POST.
+- **Smart binary search** (new `utils/rfc2544._decide_step()`) detects
+  `tx_pps_actual < 10% of trying_pps` and uses the actually-achieved
+  rate as the new ceiling. Operator's case: converges in 1 iteration
+  (was 13) with diagnosis="tx_rate_limited" surfaced in the progress
+  payload so they know WHY it's 0.
+- **Reachability pre-flight** — best-effort ICMP ping via the test
+  interface (`ping -c 1 -W 2 -I <tx_iface> <ip_dst>`) before kicking
+  off the test thread. Returns HTTP 409 with
+  `{warning: "destination_unreachable"}` so the client can show a
+  confirm dialog. Auto-skipped on loopback (rx_iface == tx_iface or
+  unset). Overrides: `confirm_unreachable=true` (one-shot) or
+  `skip_reachability_probe=true` (always skip).
+- **Live in-flight row updates** — server now mirrors the running
+  attempts list + iteration counter into `_RFC2544_STATE["current_step"]`
+  after each iteration. Client renders the in-flight row as
+  `trying 74,404,761 / loss 100.0% / iter 3` instead of leaving it as
+  dashes for 13+ minutes. Resets to `—` when the search moves on.
+
+### Compact dialog layouts
+
+- **RFC 2544 dialog**: 9-row vertical QFormLayout → 2-column QGridLayout
+  (~150 px reclaimed), action+status+close inline on one row (was 2
+  rows), slate stylesheet matching RDMA Blast, results table now read-
+  only with hidden row headers. Geometry 820×640 → 900×560.
+
+### Help system overhaul
+
+- **New Help → RDMA Guide** menu entry with a 21 KB standalone guide
+  (architecture, install/auto-install, device model, both dialogs,
+  topology shapes, stats aggregation, operator workflows, Ixia/Spirent
+  comparison, troubleshooting, REST surface). Previously the Topology
+  + Ixia content was buried inside the API Guide as §10d/§10e where
+  operators couldn't find it — operator reported "I don't see the
+  Ixia comparison" + "I'm looking for a separate menu item for RDMA
+  in the help".
+- **TOC sidebar + search box on every help dialog** (Install, API,
+  RDMA, What's New, Supported Features, DPDK). `_open_help_dialog`
+  refactored to split into left-sidebar TOC populated from h2/h3
+  headers + top-bar search with Find Next/Prev, Enter/Shift+Enter
+  shortcuts, live match-count, wrap-around.
+- **TOC scroll-to-top fix** — operator reported clicking a TOC item
+  landed the heading at the BOTTOM of the viewport (Qt's
+  `ensureCursorVisible()` does the minimum scroll). Replaced with
+  direct `verticalScrollBar.setValue()` based on the matched block's
+  absolute document Y coordinate.
+- **API guide §28i** — "Topology Mode (v0.4.0) — driving N×M perftest
+  pairs over REST" with worked bash example for fan-in stress, listen-
+  port allocation rules, aggregation math table. §28 intro
+  cross-reference updated from stale "Install Guide §10" → "RDMA Guide".
+
+### Upgrade notes
+
+- Existing servers on v0.3.18 upgrading to v0.4.0 get all server-side
+  fixes automatically (smart search, reachability pre-flight, RDMA
+  topology endpoints — all live in the wheel).
+- Client running on v0.3.18 against a v0.4.0 server: backward-compatible.
+  Old client misses the live in-flight updates + Topology dialog +
+  RDMA Guide; new server still serves it.
+- New v0.4.0 client against a v0.3.18 server: Topology dialog works
+  (it's purely client-side over existing /api/rdma/perftest/* endpoints).
+  Live RFC 2544 in-flight updates degrade gracefully (current_step
+  fields missing → row stays as "—" same as before).
+
 ## [0.3.18] - 2026-06-05
 
 **Server-side auto-install of RDMA userspace closes the wheel-upgrade
