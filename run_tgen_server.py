@@ -874,8 +874,17 @@ def restart_stream():
 
 
 def launch_single_stream(stream_data, interface):
-    stream_name = stream_data.get("name", "Unnamed Stream")
+    # v0.4.2 fix: top-level "name" key isn't always present — clients
+    # sometimes store the name only inside protocol_selection (the
+    # operator-reported case from svl-d-ai-srv04 where the stats table
+    # showed "Unnamed Stream" instead of the actual stream name).
+    # Use the existing fallback-chain resolver from
+    # multithreaded_traffic_gen which already walks: top-level name /
+    # stream_name / display_name / title → protocol_selection.name /
+    # stream_name → port-L4-shortid composite.
     stream_id = stream_data.setdefault("stream_id", str(uuid.uuid4()))
+    from multithreaded_traffic_gen import _resolve_stream_name
+    stream_name = _resolve_stream_name(stream_data, interface, stream_id)
     stop_event = Event()
 
     # Normalize rx_port - handle "Same as TX Port" and various formats
@@ -986,8 +995,13 @@ def start_traffic():
         interface_name = normalize_iface(interface_label)
 
         for stream_data in stream_list:
-            stream_name = stream_data.get("name", "Unnamed Stream")
             stream_id = stream_data.setdefault("stream_id", str(uuid.uuid4()))
+            # v0.4.2 fix: same fallback as launch_single_stream — top-
+            # level "name" might not be set; check protocol_selection
+            # and a composite fallback before falling through to
+            # "Unnamed Stream".
+            from multithreaded_traffic_gen import _resolve_stream_name
+            stream_name = _resolve_stream_name(stream_data, interface_name, stream_id)
             flow_tracking = stream_data.setdefault("flow_tracking_enabled", False)
 
             # Check enabled flag - it might be at top level or in protocol_selection
