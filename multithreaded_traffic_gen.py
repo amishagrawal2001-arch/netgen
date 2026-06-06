@@ -1185,10 +1185,27 @@ def _build_rx_selector_for_stream(stream_data, force_udp=False, dpdk_hint=False)
                     stream_data.get("mac_destination_address"),
                     stream_data.get("mac_dst"), stream_data.get("mac_destination"))
 
-    vlan_id = _pick(vlan_pd.get("vlan_id"), stream_data.get("vlan_id"))
-    try:
-        vlan_id = int(vlan_id) if vlan_id not in (None, "", "0") else None
-    except Exception:
+    # v0.4.5: VLAN sub-interface should only be created when the stream
+    # is ACTUALLY configured as tagged. Pre-fix the selector pulled
+    # vlan_id from protocol_data.vlan.vlan_id regardless of the top-
+    # level `VLAN` field — and the GUI defaults vlan_id to "1" even
+    # for "VLAN: Untagged" streams. Result: every flow-tracking stream
+    # silently created a phantom `<rx_iface>.1` sub-interface that
+    # showed up in the Interface Stats table and confused operators.
+    # Now: only set vlan_id when stream's top-level VLAN field
+    # explicitly says Tagged / Stacked / TaggedStacked. For Untagged
+    # streams (or missing field), vlan_id=None → no sub-iface created.
+    vlan_field = (
+        (ps.get("VLAN") or stream_data.get("VLAN") or "")
+        .strip().lower()
+    )
+    if vlan_field in ("tagged", "stacked", "taggedstacked", "tagged+stacked"):
+        vlan_id = _pick(vlan_pd.get("vlan_id"), stream_data.get("vlan_id"))
+        try:
+            vlan_id = int(vlan_id) if vlan_id not in (None, "", "0") else None
+        except Exception:
+            vlan_id = None
+    else:
         vlan_id = None
 
     # IPv4 + IPv6 candidates

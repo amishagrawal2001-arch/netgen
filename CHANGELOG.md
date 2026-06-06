@@ -2,6 +2,77 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.4.5] - 2026-06-06
+
+**No more phantom `<rx_iface>.1` sub-interface on Untagged streams.**
+
+Operator-reported bug from svl-d-ai-srv04: started a Scapy stream
+with flow tracking on RX iface `enp181s0f0np0`. The Interface
+Statistics table started showing THREE interfaces — the expected
+`enp160s0f0np0` + `enp181s0f0np0`, plus a phantom
+`enp181s0f0np0.1`. The stream was configured `VLAN: Untagged`.
+
+Root cause: `_build_rx_selector_for_stream` always pulled
+`protocol_data.vlan.vlan_id` into the selector regardless of the
+top-level `VLAN` field. The GUI defaults `vlan_id` to `"1"` even
+for "VLAN: Untagged" streams, so the selector ended up with
+`vlan_id=1`. `start_rx_counter` then saw a non-None vlan_id and
+unconditionally called `_ensure_vlan_rx_visible(rx_iface, 1)`,
+which created the phantom `enp181s0f0np0.1` sub-interface and
+attempted to sniff on it. The stream's actual untagged frames
+arrived at the base interface, so the v0.4.1 rescue sniffer
+caught them (rx_count was correct), but the phantom interface
+cluttered the Stats table.
+
+### Fix
+
+Selector now reads the top-level `VLAN` field (from `stream_data` OR
+`protocol_selection`, case-insensitive) and only includes `vlan_id`
+when it's `Tagged` / `Stacked` / `TaggedStacked`. For Untagged
+streams (or missing field), `vlan_id=None` → no sub-iface gets
+created.
+
+### Tests
+
+`tests/test_v045_vlan_subif_only_when_tagged.py` — 5 tests
+pinning:
+
+- Untagged stream produces `vlan_id=None` in the selector (no
+  sub-iface)
+- Tagged stream still gets `vlan_id` honored (legitimate case)
+- Missing VLAN field defaults to untagged behaviour
+- VLAN field value is case-insensitive (Tagged / tagged / TAGGED)
+- VLAN field inside `protocol_selection` (not just top level) is
+  also honored
+
+Full suite: 1381 passed, 1 skipped.
+
+### Related: Problem 2 — `enp181` shows 0 RX while TX is flowing
+
+In the same screenshot, `enp181s0f0np0` showed 0 Received Frames
+during an active 986 fps send. This is most likely either:
+
+- **Polling-interval timing.** The Interface Stats dialog polls
+  `/api/interfaces` every ~5 sec; the screenshot may have caught the
+  table between polls or right at stream start. The v0.4.4
+  `psutil.net_io_counters` snapshot is realtime — the kernel
+  counter IS updating in `/proc/net/dev` continuously; the dialog
+  just hasn't pulled the latest yet.
+
+- **Mellanox HW VLAN offload stripping the tag.** If the v0.4.3
+  TX-VLAN diagnostic (`_diagnose_tx_vlan`) logged
+  `tx-vlan-offload=on` at stream start, the Dot1Q never made it
+  onto the wire — but with v0.4.5 the stream is now correctly
+  untagged on selector too, so the rescue sniffer on base catches
+  everything. The stream-level rx_count should be matching now.
+
+Neither needs a code fix in v0.4.5 — they're operator-side
+observability + hardware-configuration issues. The v0.4.3
+`/api/streams/<id>/rx_debug` endpoint surfaces sniffer state
+including counters; check that to confirm packets are being
+counted, then check `journalctl -u netgen-server | grep TX-VLAN`
+for the offload diagnostic.
+
 ## [0.4.4] - 2026-06-06
 
 **Two operator-reported bugs from `svl-d-ai-srv04`** — both root-caused
