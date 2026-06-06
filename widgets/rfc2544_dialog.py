@@ -571,12 +571,65 @@ class Rfc2544Dialog(QDialog):
                     f"{v:.1f}" if isinstance(v, (int, float)) else "—"
                 )
 
-        # Status line
+        # Status line + v0.4.0 in-flight row preview. The current_step
+        # dict carries the frame_size + trying_pps + iteration_count +
+        # last_attempt of the binary search that's actively running.
+        # Before v0.4.0 the operator stared at a row of dashes for
+        # 13+ minutes per frame size while the search converged; now
+        # we surface "iter N, trying X pps, loss Y%" mid-search so
+        # there's visible progress between completed frame sizes.
+        completed_sizes = {e.get("frame_size") for e in results}
         cs = data.get("current_step")
         if cs:
+            fs = cs.get("frame_size")
             self.status_label.setText(
-                f"Testing {cs.get('frame_size')}B — {cs.get('phase', '')}"
+                f"Testing {fs}B — {cs.get('phase', '')}"
             )
+            if fs is not None and fs not in completed_sizes:
+                try:
+                    row = RFC2544_FRAME_SIZES.index(fs)
+                except ValueError:
+                    row = None
+                if row is not None:
+                    last = cs.get("last_attempt") or {}
+                    iters = cs.get("iteration_count")
+                    trying = last.get("pps") or cs.get("trying_pps")
+                    loss = last.get("loss_pct")
+                    # Max no-drop pps: italicized "trying" hint
+                    if isinstance(trying, (int, float)):
+                        self.results_table.item(row, 1).setText(
+                            f"trying {int(trying):,}"
+                        )
+                    # Throughput + % of line rate stay blank during run
+                    self.results_table.item(row, 2).setText("—")
+                    self.results_table.item(row, 3).setText(
+                        f"loss {loss:.1f}%"
+                        if isinstance(loss, (int, float)) else "—"
+                    )
+                    # Attempts: iteration counter live
+                    if isinstance(iters, int):
+                        self.results_table.item(row, 4).setText(
+                            f"iter {iters}"
+                        )
+                    # Lat columns stay "—" — only sampled at convergence
+
+        # Reset in-flight rows when the search has moved on to a
+        # frame size further down the list. Without this the previous
+        # frame size's "trying X" line would linger until the next
+        # poll happens to land on a completed entry.
+        for row, fs in enumerate(RFC2544_FRAME_SIZES):
+            if fs in completed_sizes:
+                continue
+            if cs and cs.get("frame_size") == fs:
+                continue
+            # Frame size not yet started AND not currently running →
+            # reset any leftover "trying X" hint.
+            if self.results_table.item(row, 1) is not None:
+                txt = self.results_table.item(row, 1).text()
+                if txt.startswith("trying") or txt.startswith("iter"):
+                    self.results_table.item(row, 1).setText("—")
+                    self.results_table.item(row, 3).setText("—")
+                    self.results_table.item(row, 4).setText("—")
 
         # Done?
         if not data.get("running"):

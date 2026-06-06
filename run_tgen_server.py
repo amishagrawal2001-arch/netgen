@@ -16475,6 +16475,18 @@ def _rfc2544_run_step(tx_iface, rx_iface, frame_size, link_pps, duration_s,
         loss_pct = ((tx - rx) / tx * 100.0) if tx > 0 else 100.0
         attempts.append({"pps": trying_pps, "tx": tx, "rx": rx, "loss_pct": loss_pct})
 
+        # v0.4.0 live progress: expose the running attempts list +
+        # iteration counter so the client's poll loop can render
+        # the in-flight frame size's row mid-search instead of
+        # leaving it as dashes until the whole binary search
+        # converges. Operator gets visible feedback every 60 sec
+        # (per-iteration) instead of every ~13 min (per-frame-size).
+        with _RFC2544_LOCK:
+            if _RFC2544_STATE.get("current_step"):
+                _RFC2544_STATE["current_step"]["attempts_so_far"] = list(attempts)
+                _RFC2544_STATE["current_step"]["iteration_count"] = len(attempts)
+                _RFC2544_STATE["current_step"]["last_attempt"] = attempts[-1]
+
         # v0.4.0 smart-search step. Replaces the naive
         #   if loss<=target: lo=trying else: hi=trying
         # with a check that also detects TX-rate-limit

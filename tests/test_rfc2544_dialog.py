@@ -314,3 +314,99 @@ def test_preflight_continue_anyway_proceeds_to_post(monkeypatch):
     # And dpdk_enable=False made it into the payload
     posted_body = posted[0][1].get("json", {})
     assert posted_body.get("dpdk_enable") is False
+
+
+# ─────────────────────────────────── v0.4.0 live in-flight row updates
+
+
+def test_in_flight_row_renders_attempts_during_search():
+    """v0.4.0 fix: during the binary search for a frame size, the
+    client used to leave that row as dashes for 13+ minutes until
+    the whole search converged. Now the client surfaces
+    current_step.{iteration_count, last_attempt} as
+    'trying X pps' / 'loss Y%' / 'iter N' so the operator sees
+    visible progress every poll tick instead of staring at a row
+    of '—' for 13 minutes."""
+    from unittest.mock import patch
+    app = QApplication.instance() or QApplication([])
+    d = Rfc2544Dialog(server_url="http://10.0.0.1:5050")
+
+    fake = MagicMock()
+    fake.json = lambda: {
+        "running": True,
+        "progress": [],   # nothing completed yet
+        "current_step": {
+            "frame_size": 64,
+            "trying_pps": 297_619_047,
+            "phase": "testing 297,619,047 pps for 60s",
+            "iteration_count": 3,
+            "last_attempt": {
+                "pps": 74_404_761, "tx": 80_000, "rx": 0,
+                "loss_pct": 100.0,
+            },
+        },
+    }
+    with patch("requests.get", return_value=fake):
+        d._poll_progress()
+
+    row = RFC2544_FRAME_SIZES.index(64)
+    assert "trying" in d.results_table.item(row, 1).text()
+    assert "74,404,761" in d.results_table.item(row, 1).text()
+    assert "loss" in d.results_table.item(row, 3).text()
+    assert "100" in d.results_table.item(row, 3).text()
+    assert d.results_table.item(row, 4).text() == "iter 3"
+    # Rows for frame sizes not yet started must NOT have the
+    # "trying" hint contaminating them.
+    other_row = RFC2544_FRAME_SIZES.index(128)
+    assert d.results_table.item(other_row, 1).text() == "—"
+
+
+def test_in_flight_row_resets_when_search_moves_on():
+    """After the binary search moves from 64B to 128B, the 64B row
+    might still have a leftover 'trying X' label if the next
+    progress payload doesn't include 64B in the completed list AND
+    current_step has moved on. The poll loop should clear those
+    leftover labels."""
+    from unittest.mock import patch
+    app = QApplication.instance() or QApplication([])
+    d = Rfc2544Dialog(server_url="http://10.0.0.1:5050")
+
+    # First poll: 64B in flight
+    fake1 = MagicMock()
+    fake1.json = lambda: {
+        "running": True, "progress": [],
+        "current_step": {
+            "frame_size": 64, "trying_pps": 10_000_000,
+            "iteration_count": 2, "phase": "...",
+            "last_attempt": {"pps": 10_000_000, "loss_pct": 50.0},
+        },
+    }
+    with patch("requests.get", return_value=fake1):
+        d._poll_progress()
+    row64 = RFC2544_FRAME_SIZES.index(64)
+    assert "trying" in d.results_table.item(row64, 1).text()
+
+    # Second poll: 64B completed, 128B in flight, but 64B is in
+    # progress[] so it should render the FINAL values, not "trying".
+    fake2 = MagicMock()
+    fake2.json = lambda: {
+        "running": True,
+        "progress": [{
+            "frame_size": 64, "max_no_drop_pps": 5_000_000,
+            "max_no_drop_gbps": 2.56, "pct_of_line_rate": 0.84,
+            "attempts": [{}, {}, {}],
+        }],
+        "current_step": {
+            "frame_size": 128, "trying_pps": 5_000_000,
+            "iteration_count": 1, "phase": "...",
+            "last_attempt": {"pps": 5_000_000, "loss_pct": 0.0},
+        },
+    }
+    with patch("requests.get", return_value=fake2):
+        d._poll_progress()
+    # 64B now shows real numbers, not "trying" anymore
+    assert "trying" not in d.results_table.item(row64, 1).text()
+    assert "5,000,000" in d.results_table.item(row64, 1).text()
+    # 128B now shows the in-flight hint
+    row128 = RFC2544_FRAME_SIZES.index(128)
+    assert "trying" in d.results_table.item(row128, 1).text()
