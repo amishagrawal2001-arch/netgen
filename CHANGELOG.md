@@ -2,6 +2,52 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.4.2] - 2026-06-06
+
+**Stream statistics table shows the real name, not "Unnamed Stream".**
+Operator-reported bug from svl-d-ai-srv04: dialog had stream name
+'ICMP' set correctly, but Stream statistics table showed
+"Unnamed Stream" for the running row.
+
+### Root cause
+
+The client sent the stream payload with name 'ICMP' inside
+`protocol_selection` but NOT at the top level. Both
+`run_tgen_server.launch_single_stream` (line 877) and the streams
+loop in `restart_stream` (line 989) used the dumb fallback
+`stream_data.get("name", "Unnamed Stream")` and stored the row
+as "Unnamed Stream". The existing `_resolve_stream_name` helper
+in `multithreaded_traffic_gen.py` already walked the proper
+fallback chain (top-level name / stream_name / display_name /
+title → protocol_selection.name / stream_name → composite
+`<port> / <L4> [<short-id>]`) — but the server-side launch paths
+weren't using it.
+
+### Fix
+
+Both spots in `run_tgen_server.py` now delegate to
+`_resolve_stream_name`. The user's 'ICMP' stream now renders as
+'ICMP' in the stats table. Future clients that omit the top-level
+name (e.g. on restart from a saved snapshot where the name is
+nested) get a sensible composite, never "Unnamed Stream".
+
+### Tests
+
+`tests/test_stream_name_resolution.py` — 8 new tests pinning:
+
+- Top-level 'name' takes precedence over protocol_selection
+- Falls back to protocol_selection.name when top-level missing
+- 'stream_name' alias supported at top level
+- Placeholder 'Unnamed Stream' value treated as unset
+- Blank / whitespace-only names treated as unset
+- Composite fallback uses port / L4 / shortid
+- Composite uses interface when port not set
+- `run_tgen_server.py` has NO raw
+  `get("name", "Unnamed Stream")` assignments left + DOES import
+  and call `_resolve_stream_name`
+
+Full suite: 1362 passed, 1 skipped.
+
 ## [0.4.1] - 2026-06-06
 
 **Flow tracking on VLAN-tagged streams no longer stays at rx_count=0.**
