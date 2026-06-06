@@ -2,6 +2,74 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.4.4] - 2026-06-06
+
+**Two operator-reported bugs from `svl-d-ai-srv04`** — both root-caused
+and fixed.
+
+### Problem 1: TX != RX on stream stop (2.47% "loss" on a lossless link)
+
+Operator stopped a stream and saw TX=13,312 / RX=12,983 — 329-packet
+shortfall, ~2.47% "loss" on what should be a lossless lab loopback.
+
+Root cause: `stop_event` fires for BOTH the TX thread and the RX
+sniffer at the same moment. TX halts immediately, but its last-batch
+in-flight packets (already in the NIC TX ring + on the wire + in the
+RX-side kernel queue) take a few hundred milliseconds to work
+through to libpcap. The sniffer stops first → those in-flight
+packets never count.
+
+Fix: 2-second drain inside the sniffer's stopper closure. After
+`stop_event.wait()` returns, the background thread sleeps 2s
+BEFORE calling `sniffer.stop()` — gives libpcap time to deliver
+the last in-flight packets to the matching handler. 2 sec at typical
+500 pps Scapy speeds = 1000 packets of drain capacity, well above
+the observed 329-packet shortfall. Operator stop-click latency is
+unaffected (background thread runs after the main stopper returns).
+
+### Problem 2: TX iface shows RX packets, RX iface shows TX packets
+
+Operator's interface-stats table showed `enp160` (the TX side) with
+RX=12,544 packets and `enp181` (the RX side) with TX=12,566 packets.
+Backwards from physics — `enp160` is sending, `enp181` is receiving.
+
+Root cause: `/api/interfaces` was returning **literal random numbers**:
+
+```python
+tx = random.randint(100, 1000) if is_up else 0  # Transmitted packets
+rx = random.randint(50, 800) if is_up else 0   # Received packets
+sent_bytes = tx * random.randint(64, 1500)  # Simulate bytes sent
+received_bytes = rx * random.randint(64, 1500)  # Simulate bytes received
+errors = random.randint(0, 10) if is_up else 0  # Simulate errors
+```
+
+The comments literally said "Simulate". The random values happened
+to land near the stream's real TX count by coincidence, making the
+table look real but with TX/RX flipped.
+
+Fix: read REAL counters via `psutil.net_io_counters(pernic=True)` —
+`packets_sent` / `packets_recv` / `bytes_sent` / `bytes_recv` / 
+`errin + errout`. One snapshot per request, mapped through to the
+existing API shape. Now `enp160` shows actual TX, `enp181` shows
+actual RX, and they correlate with the stream-level counts the
+flow tracker maintains.
+
+### Tests
+
+`tests/test_v044_stats_fixes.py` — 4 new tests:
+
+- `/api/interfaces` source has NO `random.randint` calls for tx/rx/
+  bytes/errors (regression guard)
+- Source DOES reference `psutil.net_io_counters(pernic=True)` +
+  the four real field names
+- `start_rx_counter`'s stopper has a `time.sleep` between
+  `stop_event.wait()` and `sniffer.stop()`
+- Sleep value is >= 1 second (covers the typical in-flight window)
+- Sleep is positioned inside the stopper closure (background thread),
+  not inline (which would block the main caller)
+
+Full suite: 1376 passed, 1 skipped.
+
 ## [0.4.3] - 2026-06-06
 
 **Audit batch: latent bugs + observability gap + TX-VLAN diagnostic.**

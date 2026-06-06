@@ -802,6 +802,25 @@ def start_rx_counter(rx_interface, stream_name, stream_id, tracker: StreamTracke
     # ---- stopper cleanup ----
     def stopper():
         stop_event.wait()
+        # v0.4.4: drain period BEFORE stopping the sniffers. When the
+        # operator clicks Stop, TX thread halts immediately but in-flight
+        # packets from its last batch (and ones already in the NIC TX
+        # ring) take a moment to reach the wire + cross to the RX side
+        # + work through the kernel to libpcap. Without a drain, the
+        # sniffer stops first and those last packets never count.
+        #
+        # Operator-reported bug on svl-d-ai-srv04: TX=13,312 / RX=12,983
+        # (2.47% loss) on a stream that should be lossless. The 329-
+        # packet shortfall matches exactly the typical 200-500 packets
+        # in-flight when a ~500 pps Scapy stream is killed mid-batch.
+        #
+        # 2 sec at 500 pps = up to 1000 packets of drain capacity.
+        # Negligible delay on the operator's stop-click experience.
+        try:
+            import time as _t
+            _t.sleep(2.0)
+        except Exception:
+            pass
         # Stop primary
         try:
             sniffer.stop()

@@ -11042,6 +11042,19 @@ def get_interfaces():
     try:
         # Use psutil to fetch network interface details from host
         import re
+        # v0.4.4 BUG FIX: snapshot REAL per-interface IO counters from the
+        # kernel ONCE before the loop. Previously this endpoint returned
+        # random.randint() values for tx/rx/bytes/errors (literally —
+        # they were labelled "Simulate" in the comments). Operator-visible
+        # symptoms on svl-d-ai-srv04: TX interface (enp160) showed
+        # RX packets despite never receiving anything; RX interface
+        # (enp181) showed TX packets despite never sending. The numbers
+        # were just random.randint(50, 800) and (100, 1000) coincidentally
+        # landing near the real stream's TX/RX counts.
+        try:
+            _real_ctrs = psutil.net_io_counters(pernic=True)
+        except Exception:
+            _real_ctrs = {}
         for name, stats in psutil.net_if_stats().items():
             # Skip VLAN interfaces (vlan*), loopback (lo*), and other virtual interfaces
             # Skip VXLAN-style bridges (br followed by numbers) on host - these come from containers
@@ -11075,12 +11088,25 @@ def get_interfaces():
                 continue
                 
             is_up = stats.isup
-            # Simulate traffic statistics for demonstration purposes
-            tx = random.randint(100, 1000) if is_up else 0  # Transmitted packets
-            rx = random.randint(50, 800) if is_up else 0   # Received packets
-            sent_bytes = tx * random.randint(64, 1500)  # Simulate bytes sent
-            received_bytes = rx * random.randint(64, 1500)  # Simulate bytes received
-            errors = random.randint(0, 10) if is_up else 0  # Simulate errors
+            # v0.4.4: REAL counters from psutil.net_io_counters(pernic=True).
+            # Field mapping:
+            #   tx           ← packets_sent
+            #   rx           ← packets_recv
+            #   sent_bytes   ← bytes_sent
+            #   received_bytes ← bytes_recv
+            #   errors       ← errin + errout
+            # Falls back to 0 for an iface psutil doesn't track (rare —
+            # mostly virtual ifaces that net_io_counters omits but
+            # net_if_stats lists).
+            real = _real_ctrs.get(name)
+            if real is not None:
+                tx = int(real.packets_sent)
+                rx = int(real.packets_recv)
+                sent_bytes = int(real.bytes_sent)
+                received_bytes = int(real.bytes_recv)
+                errors = int(real.errin) + int(real.errout)
+            else:
+                tx = rx = sent_bytes = received_bytes = errors = 0
 
             interfaces.append({
                 "name": name,
