@@ -2,6 +2,83 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.4.1] - 2026-06-06
+
+**Flow tracking on VLAN-tagged streams no longer stays at rx_count=0.**
+Operator scenario from svl-d-ai-srv04: configured a Scapy stream with
+`VLAN: Tagged + vlan_id=10`, started TX on enp160 with flow tracking,
+RX interface enp181. tx_count incremented past 460k while
+rx_count stayed at 0 indefinitely.
+
+### Root causes (two compounding bugs)
+
+1. **TX side**: stream config said tagged, but `tcpdump -i enp181 -e`
+   showed UNTAGGED frames on the wire. Either Mellanox hardware VLAN
+   offload was stripping the tag before transmission, or the Scapy
+   builder path elided it for this specific stream config. Either
+   way, the wire format didn't match what the RX sniffer expected.
+2. **RX side**: the sniffer was bound to the temporary VLAN
+   sub-interface `enp181s0f0np0.10` created by `_ensure_vlan_rx_visible`.
+   Two issues:
+   - The sub-iface was **deleted while the sniffer was still using
+     it** (a previous stream's stop path raced ahead and ran
+     `ip link delete`). Sniffer became a zombie bound to a
+     non-existent device.
+   - Even if it stayed alive: the sub-iface only sees VLAN-10
+     frames, and there were none (per bug #1), so it had nothing
+     to count.
+
+### Fix — three pieces, all in `multithreaded_traffic_gen.py`
+
+* **Sub-interface ref-counting** (`_VLAN_SUBIF_REFS` + lock,
+  `_ensure_vlan_rx_visible` increments, new `_release_vlan_subif`
+  decrements). The actual `ip link delete` only runs when the
+  refcount reaches 0. Two streams sharing a VLAN can't blow each
+  other's sub-iface away anymore.
+* **Dual-sniff with rescue path**. When a VLAN sub-iface is
+  created, the RX path now ALSO starts a sniffer on the BASE
+  interface. So untagged frames (the bug #1 case) are still
+  counted. Both sniffers feed the same handler; per-`<seq>` dedup
+  prevents double-counting when both see the same packet.
+* **Per-seq dedup** in the sniffer's `on_pkt`. The Scapy TX path
+  embeds `[<stream_id>#<seq>]` in payload; we extract the seq and
+  only increment rx_count once per (stream, seq) tuple. Bounded
+  to ~50k seqs in memory (~5 MB max), trimmed by halves on
+  overflow.
+
+### Operator impact
+
+- Existing streams that were stuck at `rx_count=0` because of the
+  VLAN-tag mismatch now count correctly via the rescue sniffer on
+  the base interface.
+- Concurrent streams sharing the same VLAN no longer trample each
+  other's sub-iface lifecycle.
+- No behaviour change for streams without VLAN — the rescue sniffer
+  only starts when a sub-iface was actually created.
+
+### Known issue (not fixed in this release)
+
+- The TX side bug (Dot1Q layer not making it onto the wire despite
+  config saying tagged) is **NOT yet root-caused**. The fix above
+  works around it by always sniffing the base interface in parallel.
+  If you need the on-wire frame to actually carry the VLAN tag,
+  check the Mellanox hardware VLAN offload setting:
+  `ethtool -k <tx_iface> | grep tx-vlan-offload` and disable if
+  needed: `ethtool -K <tx_iface> txvlan off`.
+
+### Tests
+
+`tests/test_vlan_subif_refcount.py` — 6 new tests pinning:
+- Each `_ensure_vlan_rx_visible` call bumps the refcount
+- First release while refcount > 0 does NOT delete
+- Final release at refcount = 0 DOES delete and removes the entry
+- Releasing an unknown sub-iface is a safe no-op
+- Releasing empty string / None doesn't crash
+- End-to-end "two streams share VLAN" scenario: A stops first,
+  B keeps using the sub-iface; only B's stop actually deletes
+
+Full suite: 1354 passed, 1 skipped.
+
 ## [0.4.0] - 2026-06-06
 
 **Major release: RDMA Topology Test (N×M), RFC 2544 hardening, and a

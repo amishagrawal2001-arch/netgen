@@ -672,7 +672,47 @@ def start_rx_counter(rx_interface, stream_name, stream_id, tracker: StreamTracke
             logging.info(f"[RX-DBG] {sniff_iface}: seen={seen_total} matched={matched} sig={sig_hits} tuple={tuple_hits} relaxed={relaxed_now}")
         return False
 
+    # v0.4.1 per-seq dedup: when both the primary (sub-iface) and
+    # rescue (base) sniffers see the same packet, we don't want to
+    # double-count rx_count. Each Scapy-built packet carries
+    # `[<stream_id>#<seq>]` in payload (Raw); we extract the seq and
+    # only increment rx_count once per seq. Set is bounded to ~50k
+    # most-recent seqs to cap memory; on overflow we keep the
+    # newest half (rough LRU; cheap enough for the hot path).
+    _seen_seqs_set = set()
+    _seen_seqs_lock = threading.Lock()
+    _SEQ_CAP = 50_000
+    _seq_re = re.compile(
+        rb"\[" + re.escape(stream_id.encode()) + rb"(?:/q\d+)?#(\d+)\]"
+    )
+
+    def _extract_seq(pkt) -> int | None:
+        try:
+            if Raw not in pkt:
+                return None
+            load = bytes(pkt[Raw].load) if pkt[Raw].load else b""
+            if not load:
+                return None
+            m = _seq_re.search(load)
+            return int(m.group(1)) if m else None
+        except Exception:
+            return None
+
     def on_pkt(_pkt):
+        # Per-seq dedup so the dual-sniff doesn't inflate rx_count.
+        seq = _extract_seq(_pkt)
+        if seq is not None:
+            with _seen_seqs_lock:
+                if seq in _seen_seqs_set:
+                    return  # already counted from the other sniffer
+                _seen_seqs_set.add(seq)
+                if len(_seen_seqs_set) > _SEQ_CAP:
+                    # Bounded — drop oldest by clearing half.
+                    # Cheap O(n/2) cost amortised over 25k packets;
+                    # at 500 kpps that's every 50 ms, negligible.
+                    keep = set(list(_seen_seqs_set)[_SEQ_CAP // 2:])
+                    _seen_seqs_set.clear()
+                    _seen_seqs_set.update(keep)
         # Count against the original rx_interface key to keep UI stable
         tracker.update_rx(rx_interface, stream_name, stream_id)
 
@@ -688,23 +728,62 @@ def start_rx_counter(rx_interface, stream_name, stream_id, tracker: StreamTracke
     sniffer.start()
     logging.info(f"RX sniffer started on {sniff_iface} for stream '{stream_name}' (stream_id={stream_id})")
 
+    # v0.4.1 fallback sniffer: when we created a VLAN sub-interface
+    # and sniff on it, ALSO start a rescue sniffer on the base
+    # interface to handle the case where TX side didn't actually add
+    # the Dot1Q tag (operator-reported bug from the field: stream
+    # config said VLAN:Tagged but tcpdump on enp181 showed untagged
+    # frames; sub-iface sniffer saw nothing forever).
+    #
+    # Both sniffers feed into the same handler. Dedup happens by
+    # signature seq tracking (see the _handle_with_dedup wrapper
+    # below) — each [<stream_id>#<seq>] only contributes once to
+    # rx_count regardless of which sniffer caught it.
+    rescue_sniffer = None
+    if created_vlan_subif:
+        try:
+            rescue_sniffer = AsyncSniffer(
+                iface=rx_interface,        # the BASE interface
+                filter=final_bpf,
+                prn=on_pkt,
+                store=False,
+                lfilter=lfilter,
+                promisc=True,
+            )
+            rescue_sniffer.start()
+            logging.info(
+                f"[RX] Rescue sniffer started on base '{rx_interface}' "
+                f"(primary on '{sniff_iface}') — catches frames where TX "
+                f"didn't add the VLAN tag despite config saying tagged"
+            )
+        except Exception as e:
+            logging.warning(f"[RX] Rescue sniffer start failed on {rx_interface}: {e}")
+            rescue_sniffer = None
+
     # ---- stopper cleanup ----
     def stopper():
         stop_event.wait()
+        # Stop primary
         try:
             sniffer.stop()
         except Exception as e:
             logging.warning(f"[RX Sniffer] stop() error on {sniff_iface}: {e}")
-        finally:
+        # Stop rescue (if started)
+        if rescue_sniffer is not None:
+            try:
+                rescue_sniffer.stop()
+            except Exception as e:
+                logging.warning(f"[RX Sniffer] rescue stop() error on {rx_interface}: {e}")
+        try:
             tracker.unregister_sniffer(rx_interface, stream_id)
-            if created_vlan_subif:
-                try:
-                    subprocess.run(["ip", "link", "delete", created_vlan_subif],
-                                   check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                    logging.info(f"[RX] Removed temporary VLAN sub-interface '{created_vlan_subif}'")
-                except Exception:
-                    pass
-            logging.info(f"RX sniffer stopped on {sniff_iface} for '{stream_name}'")
+        except Exception:
+            pass
+        # v0.4.1: ref-counted release. Pre-fix raw `ip link delete`
+        # broke when two streams shared the same VLAN sub-iface — the
+        # second stream's sniffer became a zombie.
+        if created_vlan_subif:
+            _release_vlan_subif(created_vlan_subif)
+        logging.info(f"RX sniffer stopped on {sniff_iface} for '{stream_name}'")
 
     threading.Thread(target=stopper, daemon=True).start()
     return sniffer
@@ -842,11 +921,32 @@ def calculate_interval(rate_type, stream_data, default_size=64):
 # ---------------------------
 # RX selector builder (for DPDK path / no signature)
 # ---------------------------
+# v0.4.1: VLAN sub-interface lifecycle reference counting. The pre-fix
+# code created and deleted sub-interfaces 1-to-1 with stream start/stop
+# calls. If two streams both wanted VLAN-N visible on the same base
+# iface (e.g. stream B starts before stream A finishes), the FIRST stop
+# would delete the sub-iface while the second was still using it — its
+# sniffer became a zombie bound to a non-existent device, silently
+# stopped counting RX. The operator-observed bug: rx_count stayed at 0
+# even though traffic was flowing.
+#
+# Fix: ref-count by sub-interface name. _ensure_vlan_rx_visible
+# increments on each ensure; _release_vlan_subif decrements; the
+# actual `ip link delete` runs only when the count reaches 0.
+_VLAN_SUBIF_REFS: dict = {}
+_VLAN_SUBIF_LOCK = threading.Lock()
+
+
 def _ensure_vlan_rx_visible(rx_iface: str, vlan_id: int) -> str | None:
     """
     For drivers that drop VLAN-tagged frames unless the VLAN is configured, create
     an ephemeral VLAN sub-interface (rx_iface.<vlan_id>) and bring it up.
     Returns the created subif name or None.
+
+    v0.4.1: bumps a refcount per sub-iface name so concurrent streams
+    sharing the same VLAN don't fight over deletion. Caller MUST pair
+    each successful return with a _release_vlan_subif() call when its
+    sniffer stops.
     """
     import subprocess, os
     if vlan_id is None:
@@ -859,9 +959,41 @@ def _ensure_vlan_rx_visible(rx_iface: str, vlan_id: int) -> str | None:
             subprocess.run(["ip", "link", "add", "link", rx_iface, "name", sub, "type", "vlan", "id", str(int(vlan_id))],
                            check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         subprocess.run(["ip", "link", "set", sub, "up"], check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        with _VLAN_SUBIF_LOCK:
+            _VLAN_SUBIF_REFS[sub] = _VLAN_SUBIF_REFS.get(sub, 0) + 1
+            new_count = _VLAN_SUBIF_REFS[sub]
+        logging.debug(f"[VLAN-subif] {sub} refcount={new_count} after ensure")
         return sub
     except Exception:
         return None
+
+
+def _release_vlan_subif(sub: str) -> None:
+    """v0.4.1 lifecycle: decrement refcount on a VLAN sub-interface;
+    only run `ip link delete` when the count hits 0. Safe to call
+    with a sub name that was never ensured (no-op)."""
+    import subprocess
+    if not sub:
+        return
+    with _VLAN_SUBIF_LOCK:
+        count = _VLAN_SUBIF_REFS.get(sub, 0)
+        if count <= 1:
+            _VLAN_SUBIF_REFS.pop(sub, None)
+            should_delete = True
+        else:
+            _VLAN_SUBIF_REFS[sub] = count - 1
+            should_delete = False
+            new_count = count - 1
+    if should_delete:
+        try:
+            subprocess.run(["ip", "link", "delete", sub],
+                           check=False, stdout=subprocess.DEVNULL,
+                           stderr=subprocess.DEVNULL)
+            logging.info(f"[VLAN-subif] {sub} deleted (refcount reached 0)")
+        except Exception as e:
+            logging.warning(f"[VLAN-subif] delete failed for {sub}: {e}")
+    else:
+        logging.debug(f"[VLAN-subif] {sub} refcount={new_count} after release")
 
 def _kernel_driver_name(iface: str) -> str | None:
     import os
