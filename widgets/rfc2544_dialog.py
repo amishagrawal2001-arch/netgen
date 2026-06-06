@@ -20,10 +20,10 @@ import requests
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QColor, QFont, QKeySequence
 from PyQt5.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QLabel, QLineEdit,
-    QPushButton, QSpinBox, QDoubleSpinBox, QCheckBox, QTableWidget,
-    QTableWidgetItem, QGroupBox, QMessageBox, QFileDialog, QHeaderView,
-    QShortcut,
+    QDialog, QVBoxLayout, QHBoxLayout, QFormLayout, QGridLayout, QLabel,
+    QLineEdit, QPushButton, QSpinBox, QDoubleSpinBox, QCheckBox,
+    QTableWidget, QTableWidgetItem, QGroupBox, QMessageBox, QFileDialog,
+    QHeaderView, QShortcut, QWidget,
 )
 
 # v0.3.0: reuse the v0.2.96 Stream-dialog pure-function validators
@@ -47,8 +47,11 @@ class Rfc2544Dialog(QDialog):
     def __init__(self, parent=None, server_url: Optional[str] = None):
         super().__init__(parent)
         self.setWindowTitle("RFC 2544 Throughput Test")
-        self.setGeometry(200, 200, 820, 640)
-        self.setMinimumSize(720, 480)
+        # v0.4.0 compact refresh — tighter geometry now that the form
+        # is a 2-column grid instead of a single-column QFormLayout
+        # (~150px reclaimed for the results table).
+        self.setGeometry(200, 200, 900, 560)
+        self.setMinimumSize(760, 460)
         self.server_url = (server_url or "").rstrip("/")
         self._poll_timer: Optional[QTimer] = None
         self._build_ui()
@@ -56,50 +59,57 @@ class Rfc2544Dialog(QDialog):
     # ------------------------------------------------------------- UI
 
     def _build_ui(self):
+        # v0.4.0 compact + professional refresh — same widgets/handlers as
+        # before, just a 2-column grid instead of a single-column QFormLayout,
+        # plus the slate GroupBox stylesheet from RdmaBlastFlowDialog and
+        # fixed-width spinboxes. Net effect: ~40% less vertical space in
+        # the Test Parameters group, leaving more room for the results table.
         root = QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(6)
 
-        # Parameters group
+        self.setStyleSheet(
+            "QGroupBox {"
+            "  font-weight: 600; color: #334155;"
+            "  border: 1px solid #cbd5e1; border-radius: 4px;"
+            "  margin-top: 9px; padding: 6px 8px 8px 8px;"
+            "}"
+            "QGroupBox::title {"
+            "  subcontrol-origin: margin; subcontrol-position: top left;"
+            "  left: 8px; padding: 0 4px;"
+            "}"
+        )
+
+        # ── Test Parameters as a 2-column grid.
         params_box = QGroupBox("Test Parameters")
-        params_layout = QFormLayout(params_box)
+        pg = QGridLayout(params_box)
+        pg.setContentsMargins(8, 4, 8, 6)
+        pg.setHorizontalSpacing(8)
+        pg.setVerticalSpacing(4)
 
+        # Pre-build all the widgets, then place them in 2-col rows.
         self.tx_iface_field = QLineEdit("enp181s0f0np0")
         self.tx_iface_field.setToolTip(
             "Interface that will transmit traffic. Must be DPDK-capable "
             "(libdpdk + tx_worker built) for the line-rate tests."
         )
-        params_layout.addRow("TX interface:", self.tx_iface_field)
-
         self.rx_iface_field = QLineEdit("")
         self.rx_iface_field.setPlaceholderText("(defaults to TX iface — loopback)")
-        params_layout.addRow("RX interface:", self.rx_iface_field)
 
         # v0.3.11: MAC defaults unified with Blast a DPDK Flow dialog
         # + the Stream templates library (both use 02:00:00:00:00:01/02).
-        # Was aa:bb:cc:dd:ee:0x — operator running RFC 2544 then
-        # comparing captures with Blast a Flow saw different source
-        # MACs and lost confidence in the defaults. All three paths
-        # now produce identical-looking frames so captures align.
         self.mac_src_field = QLineEdit("02:00:00:00:00:01")
         self.mac_dst_field = QLineEdit("02:00:00:00:00:02")
-        params_layout.addRow("Source MAC:", self.mac_src_field)
-        params_layout.addRow("Destination MAC:", self.mac_dst_field)
 
         self.ip_src_field = QLineEdit("10.0.0.1")
         self.ip_dst_field = QLineEdit("10.0.0.2")
-        params_layout.addRow("Source IPv4:", self.ip_src_field)
-        params_layout.addRow("Destination IPv4:", self.ip_dst_field)
 
         # v0.3.11: default duration 10 → 60 s per RFC 2544 §26.1.
-        # 10 s was labelled "fast sanity check" but operators kept
-        # exporting "RFC 2544 Throughput Test Report" with 10-s
-        # measurements, which auditors then rejected as non-
-        # compliant. 60 s is the RFC's minimum for a certified run;
-        # operator can dial down to 10 s explicitly for a quick
-        # smoke check.
         self.duration_spin = QSpinBox()
         self.duration_spin.setRange(2, 600)
         self.duration_spin.setValue(60)
         self.duration_spin.setSuffix(" s")
+        self.duration_spin.setFixedWidth(110)
         self.duration_spin.setToolTip(
             "Per-step traffic duration. RFC 2544 §26.1 requires 60 s "
             "for a certified trial run; bump to 300 s+ for full "
@@ -107,45 +117,34 @@ class Rfc2544Dialog(QDialog):
             "sanity check — results below 60 s are NOT RFC 2544 "
             "compliant and should not be reported as such."
         )
-        params_layout.addRow("Duration per step:", self.duration_spin)
 
         self.loss_spin = QDoubleSpinBox()
         self.loss_spin.setRange(0.0, 50.0)
         self.loss_spin.setSingleStep(0.1)
         self.loss_spin.setValue(0.0)
         self.loss_spin.setSuffix(" %")
+        self.loss_spin.setFixedWidth(110)
         self.loss_spin.setToolTip(
             "Maximum acceptable packet-loss percentage for a step to be "
-            "'passing'. Computed as (frames_sent − frames_received) / "
-            "frames_sent × 100. Default 0.0 = strict no-drop per "
-            "RFC 2544 §26.1. Bump to 0.01 / 0.1 / 1.0 for relaxed "
-            "trials where you specifically want to characterise "
-            "above-line-rate behaviour."
+            "'passing'. Default 0.0 = strict no-drop per RFC 2544 §26.1."
         )
-        params_layout.addRow("Target loss:", self.loss_spin)
 
         self.resolution_spin = QSpinBox()
         self.resolution_spin.setRange(1000, 10_000_000)
         self.resolution_spin.setSingleStep(10_000)
         self.resolution_spin.setValue(100_000)
         self.resolution_spin.setSuffix(" pps")
+        self.resolution_spin.setFixedWidth(140)
         self.resolution_spin.setToolTip(
             "Binary-search resolution. Search stops when the rate band "
             "is narrower than this. Smaller = more accurate, longer test."
         )
-        params_layout.addRow("Binary-search resolution:", self.resolution_spin)
 
         self.dpdk_checkbox = QCheckBox("Use DPDK tx_worker (recommended)")
         self.dpdk_checkbox.setChecked(True)
-        params_layout.addRow("", self.dpdk_checkbox)
 
-        # RFC 2544 §26.2 — capture one-way latency at the determined
-        # throughput rate. Embeds NLAT timestamps in each frame so the
-        # rx-side sampler can decode them. Default off so the baseline
-        # §26.1 throughput test stays bit-for-bit identical to the prior
-        # release; opt in for full latency results.
         self.latency_checkbox = QCheckBox(
-            "Capture latency (RFC 2544 §26.2 — adds NLAT timestamps)"
+            "Capture latency (RFC 2544 §26.2)"
         )
         self.latency_checkbox.setChecked(False)
         self.latency_checkbox.setToolTip(
@@ -154,16 +153,53 @@ class Rfc2544Dialog(QDialog):
             "Requires the latency sampler to be running on the RX side "
             "(auto-started by the server)."
         )
-        params_layout.addRow("", self.latency_checkbox)
 
+        # Place pairs.
+        # Row 0: TX interface | RX interface
+        pg.addWidget(QLabel("TX interface:"),  0, 0, Qt.AlignRight)
+        pg.addWidget(self.tx_iface_field,      0, 1)
+        pg.addWidget(QLabel("RX interface:"),  0, 2, Qt.AlignRight)
+        pg.addWidget(self.rx_iface_field,      0, 3)
+        # Row 1: Source MAC | Destination MAC
+        pg.addWidget(QLabel("Source MAC:"),    1, 0, Qt.AlignRight)
+        pg.addWidget(self.mac_src_field,       1, 1)
+        pg.addWidget(QLabel("Destination MAC:"), 1, 2, Qt.AlignRight)
+        pg.addWidget(self.mac_dst_field,       1, 3)
+        # Row 2: Source IPv4 | Destination IPv4
+        pg.addWidget(QLabel("Source IPv4:"),   2, 0, Qt.AlignRight)
+        pg.addWidget(self.ip_src_field,        2, 1)
+        pg.addWidget(QLabel("Destination IPv4:"), 2, 2, Qt.AlignRight)
+        pg.addWidget(self.ip_dst_field,        2, 3)
+        # Row 3: Duration | Target loss
+        pg.addWidget(QLabel("Duration per step:"), 3, 0, Qt.AlignRight)
+        pg.addWidget(self.duration_spin,       3, 1)
+        pg.addWidget(QLabel("Target loss:"),   3, 2, Qt.AlignRight)
+        pg.addWidget(self.loss_spin,           3, 3)
+        # Row 4: Binary-search resolution | (free)
+        pg.addWidget(QLabel("Binary-search resolution:"), 4, 0, Qt.AlignRight)
+        pg.addWidget(self.resolution_spin,     4, 1)
+        # Row 5: checkboxes inline across the full width
+        cb_row = QHBoxLayout()
+        cb_row.setSpacing(16)
+        cb_row.addWidget(self.dpdk_checkbox)
+        cb_row.addWidget(self.latency_checkbox)
+        cb_row.addStretch(1)
+        cb_holder = QWidget()
+        cb_holder.setLayout(cb_row)
+        pg.addWidget(cb_holder, 5, 0, 1, 4)
+        # Stretch the input columns evenly.
+        pg.setColumnStretch(1, 1)
+        pg.setColumnStretch(3, 1)
         root.addWidget(params_box)
 
-        # Control buttons
+        # ── Action row: Start, Stop, Export CSV, Export HTML, status,
+        # Close — all on one row to reclaim vertical space.
         btn_row = QHBoxLayout()
+        btn_row.setSpacing(6)
         self.start_btn = QPushButton("Start Test")
         self.start_btn.setStyleSheet(
             "QPushButton { border: 1px solid #2563eb; border-radius: 5px; "
-            "padding: 6px 14px; background: #ffffff; color: #1d4ed8; "
+            "padding: 5px 12px; background: #ffffff; color: #1d4ed8; "
             "font-weight: 600; }"
             "QPushButton:hover { background: #eff6ff; }"
             "QPushButton:disabled { color: #9ca3af; border-color: #cbd5e1; }"
@@ -171,15 +207,11 @@ class Rfc2544Dialog(QDialog):
         self.start_btn.clicked.connect(self._on_start)
         btn_row.addWidget(self.start_btn)
 
-        # Stop button — cooperative cancel of an in-flight RFC 2544
-        # test. Server flips stop_requested=True and halts the active
-        # stream so the runner thread exits within ~0.5s. Disabled
-        # until Start fires.
         self.stop_btn = QPushButton("Stop Test")
         self.stop_btn.setEnabled(False)
         self.stop_btn.setStyleSheet(
             "QPushButton { border: 1px solid #dc2626; border-radius: 5px; "
-            "padding: 6px 14px; background: #ffffff; color: #dc2626; "
+            "padding: 5px 12px; background: #ffffff; color: #dc2626; "
             "font-weight: 600; }"
             "QPushButton:hover { background: #fef2f2; }"
             "QPushButton:disabled { color: #9ca3af; border-color: #cbd5e1; }"
@@ -192,9 +224,6 @@ class Rfc2544Dialog(QDialog):
         self.export_btn.clicked.connect(self._on_export_csv)
         btn_row.addWidget(self.export_btn)
 
-        # HTML report — self-contained, browser-printable test report with
-        # params + results table. No PDF dep; the browser's "Print → Save
-        # as PDF" handles the PDF need.
         self.export_html_btn = QPushButton("Export HTML Report")
         self.export_html_btn.setEnabled(False)
         self.export_html_btn.setToolTip(
@@ -205,17 +234,17 @@ class Rfc2544Dialog(QDialog):
         self.export_html_btn.clicked.connect(self._on_export_html)
         btn_row.addWidget(self.export_html_btn)
 
-        btn_row.addStretch(1)
+        btn_row.addSpacing(8)
         self.status_label = QLabel("Idle")
         self.status_label.setStyleSheet("color: #6b7280;")
-        btn_row.addWidget(self.status_label)
+        btn_row.addWidget(self.status_label, 1)
+
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        btn_row.addWidget(close_btn)
         root.addLayout(btn_row)
 
-        # Results table — one row per frame size. New in 0.2.59: three
-        # latency columns (p50/p95/p99 µs) populated from each progress
-        # entry's `latency` dict when Capture-latency was on. Render "—"
-        # when the dict is missing or the field is None (old server, or
-        # capture-latency disabled), so the columns are forward-compatible.
+        # ── Results table.
         self.results_table = QTableWidget()
         self.results_table.setColumnCount(8)
         self.results_table.setHorizontalHeaderLabels([
@@ -224,6 +253,8 @@ class Rfc2544Dialog(QDialog):
             "Lat p50 (µs)", "Lat p95 (µs)", "Lat p99 (µs)",
         ])
         self.results_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.results_table.verticalHeader().setVisible(False)
+        self.results_table.setEditTriggers(QTableWidget.NoEditTriggers)
         self.results_table.setRowCount(len(RFC2544_FRAME_SIZES))
         for i, fs in enumerate(RFC2544_FRAME_SIZES):
             item = QTableWidgetItem(str(fs))
@@ -232,14 +263,6 @@ class Rfc2544Dialog(QDialog):
             for c in range(1, self.results_table.columnCount()):
                 self.results_table.setItem(i, c, QTableWidgetItem("—"))
         root.addWidget(self.results_table, 1)
-
-        # Close button
-        close_row = QHBoxLayout()
-        close_row.addStretch(1)
-        close_btn = QPushButton("Close")
-        close_btn.clicked.connect(self.accept)
-        close_row.addWidget(close_btn)
-        root.addLayout(close_row)
 
         # v0.3.0: live red-border feedback on MAC + IPv4 fields. The
         # _on_start path already would have failed on garbage input,
