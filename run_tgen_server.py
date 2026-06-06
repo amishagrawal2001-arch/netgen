@@ -16335,14 +16335,27 @@ _RFC2544_STATE = {
 _RFC2544_LOCK = __import__("threading").Lock()
 
 
+# Pure helpers extracted to utils/rfc2544.py so they can be unit-
+# tested without triggering this module's import-time side effects
+# (device_db = DeviceDatabase() opens /opt/netgen/database.db which
+# doesn't exist in the test environment). Re-export under the long
+# names for backward compatibility + readability at call sites.
+from utils.rfc2544 import _decide_step as _rfc2544_decide_step  # noqa: E402
+from utils.rfc2544 import _check_reachable as _rfc2544_check_reachable  # noqa: E402
+
+
 def _rfc2544_run_step(tx_iface, rx_iface, frame_size, link_pps, duration_s,
                      target_loss_pct, resolution_pps, mac_src, mac_dst,
                      ip_src, ip_dst, dpdk_enable, dpdk_tx_cores,
                      capture_latency=False):
     """Binary-search the max no-drop rate at one frame size.
 
-    Returns (max_no_drop_pps, attempts) where `attempts` is a list of
-    (rate_pps, tx, rx, loss_pct) tuples for diagnostics."""
+    Returns (max_no_drop_pps, attempts, diagnosis) where `attempts`
+    is a list of {pps, tx, rx, loss_pct} dicts and `diagnosis` is
+    None on a normal converged run or a short tag like
+    ``"tx_rate_limited"`` when the smart-search logic detected an
+    early-bail condition (TX path can't reach the requested rate
+    — see _rfc2544_decide_step)."""
     import time as _t
     import uuid as _uuid
     import requests as _req
@@ -16352,6 +16365,7 @@ def _rfc2544_run_step(tx_iface, rx_iface, frame_size, link_pps, duration_s,
     lo_pps = 0
     hi_pps = max(int(link_pps), 1)
     last_good = 0
+    diagnosis = None  # set by _rfc2544_decide_step on TX-rate-limit
 
     while hi_pps - lo_pps > resolution_pps:
         # Cooperative cancel check between iterations — /api/rfc2544/stop
@@ -16461,13 +16475,25 @@ def _rfc2544_run_step(tx_iface, rx_iface, frame_size, link_pps, duration_s,
         loss_pct = ((tx - rx) / tx * 100.0) if tx > 0 else 100.0
         attempts.append({"pps": trying_pps, "tx": tx, "rx": rx, "loss_pct": loss_pct})
 
-        if loss_pct <= target_loss_pct:
-            last_good = trying_pps
-            lo_pps = trying_pps
-        else:
-            hi_pps = trying_pps
+        # v0.4.0 smart-search step. Replaces the naive
+        #   if loss<=target: lo=trying else: hi=trying
+        # with a check that also detects TX-rate-limit
+        # (Scapy ceiling, peer unreachable causing 0-tx, etc.) and
+        # uses the actually-achieved rate as the new ceiling
+        # instead of letting the search waste 10+ iterations
+        # halving an unreachable rate.
+        lo_pps, hi_pps, last_good, step_diag = _rfc2544_decide_step(
+            tx=tx, rx=rx, trying_pps=trying_pps,
+            lo_pps=lo_pps, hi_pps=hi_pps, last_good=last_good,
+            target_loss_pct=target_loss_pct,
+            duration_s=duration_s,
+        )
+        if step_diag and diagnosis is None:
+            # First diagnosis sticks — operator sees the explanation
+            # in the per-frame-size progress entry.
+            diagnosis = step_diag
 
-    return last_good, attempts
+    return last_good, attempts, diagnosis
 
 
 def _rfc2544_thread(params):
@@ -16497,7 +16523,7 @@ def _rfc2544_thread(params):
             l1_bytes = max(60, int(fs)) + 20  # preamble + IFG
             line_pps = max(1, (link_mbps * 1_000_000) // (l1_bytes * 8))
             capture_latency = bool(params.get("capture_latency", False))
-            max_pps, attempts = _rfc2544_run_step(
+            max_pps, attempts, diagnosis = _rfc2544_run_step(
                 tx_iface=tx_iface, rx_iface=rx_iface,
                 frame_size=fs, link_pps=line_pps,
                 duration_s=duration_s,
@@ -16534,6 +16560,11 @@ def _rfc2544_thread(params):
                     "pct_of_line_rate": round(100.0 * max_pps / line_pps, 1) if line_pps else 0,
                     "attempts": attempts,
                     "latency": latency,
+                    # v0.4.0: short tag explaining why the search
+                    # converged early when it bailed out due to
+                    # TX-rate-limit or peer-unreachable. None on
+                    # a clean converged run.
+                    "diagnosis": diagnosis,
                 })
     except Exception as e:
         with _RFC2544_LOCK:
@@ -16573,6 +16604,39 @@ def rfc2544_start():
             return jsonify({"ok": False, "error": "mac_src and mac_dst required"}), 400
         if not data.get("ip_src") or not data.get("ip_dst"):
             return jsonify({"ok": False, "error": "ip_src and ip_dst required"}), 400
+
+        # v0.4.0 reachability pre-flight. Best-effort ICMP ping to the
+        # destination IP catches the classic "peer doesn't exist" case
+        # (RX=0, every probe shows 100% loss) before burning 60+
+        # minutes of test time. Skipped on:
+        #   - skip_reachability_probe=true (operator-supplied for
+        #     lab-loopback scenarios where the dest IP isn't pingable
+        #     but the L2 path is still valid)
+        #   - rx_iface == tx_iface (loopback — frames echo back on
+        #     the same wire, IP-level ping is irrelevant)
+        # On ping failure we don't block; we surface a "warning"
+        # field in the response so the client can show a confirm
+        # dialog. Use ``confirm_unreachable=true`` to override.
+        if (not data.get("skip_reachability_probe")
+                and (data.get("rx_iface") or data.get("tx_iface")) != data.get("tx_iface")
+                and not data.get("confirm_unreachable")):
+            reachable, reach_msg = _rfc2544_check_reachable(
+                data.get("ip_dst", ""), data.get("tx_iface", ""),
+            )
+            if not reachable:
+                _RFC2544_STATE["running"] = False
+                return jsonify({
+                    "ok": False,
+                    "warning": "destination_unreachable",
+                    "message": reach_msg,
+                    "hint": "Pass confirm_unreachable=true to start "
+                            "anyway (e.g. for lab-loopback scenarios "
+                            "where the destination IP isn't pingable "
+                            "but the L2 path is valid), or "
+                            "skip_reachability_probe=true to suppress "
+                            "the check entirely.",
+                }), 409
+
         params = dict(data)
         params.setdefault("frame_sizes", [64, 128, 256, 512, 1024, 1280, 1518])
         params.setdefault("duration_per_step", 10)
