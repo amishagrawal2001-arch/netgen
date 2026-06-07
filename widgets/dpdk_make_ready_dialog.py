@@ -23,7 +23,7 @@ import logging
 import re
 from typing import List, Optional
 
-from PyQt5.QtCore import Qt, QThread, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
     QComboBox, QDialog, QDialogButtonBox, QGroupBox, QHBoxLayout,
@@ -418,6 +418,32 @@ class MakeDpdkReadyDialog(QDialog):
             self._close_btn.setText("Close")
             return
 
+        # v0.5.17: INSTALL_DPDK is special. The HTTP 200 from
+        # /api/admin/install_dpdk only confirms the script SPAWNED
+        # — install_dpdk.sh runs for 5-10 minutes in the background.
+        # Previously the wizard treated the immediate 200 as
+        # completion and marched forward; operator hit "all steps ✓"
+        # but the install was still running (or already failed
+        # silently). Verify Installation then showed everything
+        # missing.
+        #
+        # Now: keep the row in "running" state, start polling
+        # /api/admin/install_dpdk/log until `running=False`. Then
+        # check return_code to decide ✓ vs ✗.
+        if action.kind == ActionKind.INSTALL_DPDK:
+            # Don't set "ok" yet — script's still running. Show the
+            # spawn-confirmation in the detail pane and start the
+            # poll timer.
+            log_path = (data or {}).get("log_path") or "(no log path)"
+            self._detail.setText(
+                f"<b>Installing DPDK runtime + building tx_worker</b>"
+                f" — typically 5-10 minutes on a clean Ubuntu host.<br>"
+                f"<span class='muted'>Log: <code>{log_path}</code></span>"
+                f"<br>Polling for completion…"
+            )
+            self._start_install_dpdk_poll(action, row)
+            return
+
         row.set_state("ok")
         if action.needs_reboot:
             # IOMMU success — reboot then come back.
@@ -548,6 +574,170 @@ class MakeDpdkReadyDialog(QDialog):
             "— the wizard will skip the IOMMU step (now active) and "
             "continue from there."
         )
+
+    # ─────────────── INSTALL_DPDK completion polling (v0.5.17)
+
+    def _start_install_dpdk_poll(self, action: Action, row: _StepRow) -> None:
+        """v0.5.17: kick off a QTimer that polls
+        /api/admin/install_dpdk/log every 5 s until `running=False`,
+        then resumes the wizard via _on_install_dpdk_complete().
+
+        Why polling not a streamed log: the GET returns a JSON envelope
+        with `running` + `return_code` already parsed; we don't need
+        the log body for the wizard step (the detail pane only needs
+        progress phase if available). The Make DPDK Ready dialog
+        intentionally stays minimal — operators wanting the live log
+        can click Tools → DPDK → Show Install Log separately.
+
+        On each poll, update the detail pane with the parsed phase
+        from the server response (server-side already parses
+        Step N/total + ninja % from the log)."""
+        # Store enough context for the timer callback to resume the
+        # wizard state machine correctly when the install completes.
+        self._install_poll_action = action
+        self._install_poll_row = row
+        self._install_poll_consecutive_errors = 0
+        self._install_poll_log_offset = 0
+        # 5 s cadence: install_dpdk.sh is many minutes long; tighter
+        # would just generate noise.
+        self._install_poll_timer = QTimer(self)
+        self._install_poll_timer.setInterval(5000)
+        self._install_poll_timer.timeout.connect(self._poll_install_dpdk_log)
+        self._install_poll_timer.start()
+        # Fire once immediately too — no need to wait 5 s for the
+        # first phase update.
+        self._poll_install_dpdk_log()
+
+    def _poll_install_dpdk_log(self) -> None:
+        """Fire one GET against /api/admin/install_dpdk/log via the
+        existing async _api_worker, then dispatch to
+        _on_install_dpdk_log_response()."""
+        Worker = _api_worker()
+        # Pass `offset` so the server only ships bytes since last poll
+        # — the server already supports this (see api_admin_install_dpdk_log).
+        offset = getattr(self, "_install_poll_log_offset", 0)
+        w = Worker(
+            method="GET",
+            url=f"{self._server_url}/api/admin/install_dpdk/log?offset={offset}",
+            timeout=10,
+        )
+        w.done.connect(self._on_install_dpdk_log_response)
+        w.setParent(self)
+        self._workers.append(w)
+        w.start()
+
+    def _on_install_dpdk_log_response(self, data, err) -> None:
+        """Handle one /api/admin/install_dpdk/log response.
+
+        On running=False, stop the timer and resume the wizard:
+          - return_code == 0 → step ✓, advance
+          - return_code != 0 → step ✗, surface error in detail pane
+          - return_code == None (race) → wait one more tick
+
+        Tolerate transient request errors: if 3 polls in a row fail
+        with HTTP errors (server flapping, network blip), give up and
+        mark the step as ✗ with the error. Single transient errors
+        are absorbed silently."""
+        action = getattr(self, "_install_poll_action", None)
+        row = getattr(self, "_install_poll_row", None)
+        if action is None or row is None:
+            # Shouldn't happen — _start_install_dpdk_poll sets both.
+            return
+
+        if err:
+            self._install_poll_consecutive_errors += 1
+            if self._install_poll_consecutive_errors >= 3:
+                self._stop_install_dpdk_poll()
+                row.set_state("fail", f"log poll failed: {err}"[:120])
+                self._detail.setText(
+                    f"<span style='color:#b91c1c;'>"
+                    f"Lost contact with /api/admin/install_dpdk/log "
+                    f"after 3 consecutive errors: {err}<br>"
+                    f"The install MAY still be running on the server "
+                    f"— check <code>journalctl</code> or the log file "
+                    f"path shown earlier.</span>"
+                )
+                self._run_btn.setText("Retry")
+                self._run_btn.setEnabled(True)
+                self._close_btn.setText("Close")
+            return
+        # Successful response — reset the error counter.
+        self._install_poll_consecutive_errors = 0
+        data = data or {}
+
+        # Update phase in detail pane (server parses this from the
+        # log on its side).
+        phase = data.get("phase") or {}
+        if phase:
+            cur = phase.get("current_step")
+            total = phase.get("total_steps")
+            step_name = phase.get("step_name") or ""
+            ninja_pct = phase.get("ninja_progress")
+            overall_pct = phase.get("overall_pct")
+            bits = []
+            if cur and total:
+                bits.append(f"Step {cur}/{total}")
+            if step_name:
+                bits.append(step_name)
+            if ninja_pct is not None:
+                bits.append(f"ninja {ninja_pct}%")
+            if overall_pct is not None:
+                bits.append(f"~{overall_pct}% overall")
+            if bits:
+                self._detail.setText(
+                    f"<b>Installing DPDK runtime + building tx_worker</b><br>"
+                    f"{' · '.join(bits)}"
+                )
+
+        # Advance the log offset so the next poll only ships new bytes.
+        if "log_size" in data:
+            self._install_poll_log_offset = int(data.get("log_size") or 0)
+
+        # Still running? Keep polling.
+        if data.get("running"):
+            return
+
+        # Done. Stop the timer and decide ✓ vs ✗ based on return_code.
+        self._stop_install_dpdk_poll()
+        rc = data.get("return_code")
+        if rc == 0:
+            row.set_state("ok")
+            self._detail.setText(
+                f"<b>✓ DPDK installed.</b> Continuing with remaining steps."
+            )
+            self._step_idx += 1
+            self._advance()
+        elif rc is None:
+            # Race: server says not running but no return_code yet.
+            # Restart the timer and try once more. (Should be rare.)
+            self._install_poll_timer.start()
+        else:
+            row.set_state("fail", f"install_dpdk.sh exit {rc}")
+            self._detail.setText(
+                f"<span style='color:#b91c1c;'>"
+                f"<b>install_dpdk.sh exited with code {rc}.</b><br>"
+                f"Check the log on the server for the failure reason. "
+                f"Common causes: apt timeout, network unreachable "
+                f"during DPDK source clone, missing dev packages.<br>"
+                f"Log file path was shown when the step started."
+                f"</span>"
+            )
+            self._run_btn.setText("Retry")
+            self._run_btn.setEnabled(True)
+            self._close_btn.setText("Close")
+
+    def _stop_install_dpdk_poll(self) -> None:
+        """Stop the timer + clear the per-poll state. Safe to call
+        multiple times."""
+        try:
+            timer = getattr(self, "_install_poll_timer", None)
+            if timer is not None:
+                timer.stop()
+                self._install_poll_timer = None
+        except Exception:
+            pass
+        self._install_poll_action = None
+        self._install_poll_row = None
 
     # ─────────────────────────────── bind step (special: NIC picker)
 

@@ -2,6 +2,113 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.17] - 2026-06-07
+
+**Make DPDK Ready wizard now waits for `install_dpdk.sh` to ACTUALLY
+finish — not just for the subprocess to spawn.**
+
+Full suite: 1,580 passed, 1 skipped (+9 new tests).
+
+### Operator-reported
+
+> tried making server ready with dpdk using make server dpdk ready
+> and completed all the steps, however verify installation, shows
+> below..
+>
+>   DPDK Libraries: ✗
+>   DPDK Packet Generator (tx_worker): ✗
+>   Hugepages: ✗
+>   Kernel Modules: ✓
+
+### Root cause
+
+The wizard's `_on_step_done()` callback fired the moment
+`/api/admin/install_dpdk` returned HTTP 200. But that endpoint
+**only confirms the script was SPAWNED** — `install_dpdk.sh --auto`
+runs for 5-10 minutes in the background. The endpoint returns
+immediately with a `log_path` the client can poll.
+
+The wizard treated the immediate 200 as "step done" and marched
+forward through `ALLOCATE_HUGEPAGES` / `LOAD_VFIO` /
+`BIND_INTERFACE`. All shown ✓ in the wizard. But DPDK wasn't
+actually installed yet (still building). Verify Installation
+afterward exposed the truth.
+
+### Fix
+
+`widgets/dpdk_make_ready_dialog.py:_on_step_done` now special-cases
+`ActionKind.INSTALL_DPDK`:
+
+1. **Doesn't** call `row.set_state("ok")` on the spawn 200.
+2. Spawns a `QTimer(5000)` that polls `/api/admin/install_dpdk/log`.
+3. Each poll updates the detail pane with parsed phase
+   (current_step / total_steps / step_name / ninja % / overall %).
+4. On `running=False`:
+   * `return_code == 0` → mark ✓, advance to next step
+   * `return_code != 0` → mark ✗ with exit code, show Retry
+   * `return_code is None` → race (server polled between proc.poll()
+     and finished_at write); retry one more tick
+
+Plus:
+* Tolerates up to 3 consecutive HTTP errors against the log
+  endpoint before giving up (single network blip doesn't abort
+  the install)
+* `_stop_install_dpdk_poll()` is idempotent (no NoneType crashes
+  on dialog close)
+* Each GET passes `?offset=N` so the server only ships log bytes
+  appended since the last poll
+
+### Why this didn't surface in CI
+
+The wizard's pre-v0.5.17 behavior had a self-defeating test gap:
+* CI never actually runs `install_dpdk.sh` (it's a 10-min apt+meson+
+  ninja chain that needs root + bare-metal hardware for the tx_worker
+  link step)
+* The dialog smoke tests check construction, not endpoint completion
+  semantics
+* No mock for the `/api/admin/install_dpdk/log` polling contract
+
+So the wizard's "200 == done" assumption was untested against a
+slow-server response. Same class as the v0.5.7 false-positive
+("CI green because of staging-tree state that isn't on the
+operator's host") — different surface, same lesson.
+
+### Operator workflow improvement
+
+| Step | Before v0.5.17 | After v0.5.17 |
+|---|---|---|
+| Click Make DPDK Ready → Run | Same | Same |
+| Wizard hits Install DPDK | 200 returns in <1s | Same |
+| Wizard's row says... | "✓ Install DPDK runtime + build tx_worker" | "Step 5/8: Building DPDK · ninja 47%" |
+| Wizard advances | Immediately (BUG — install still running) | Only after `running=False && rc=0` |
+| Time to next step | <1s | ~5-10 min (real install duration) |
+| All steps ✓ shown | After ~30s total (lie) | After ~10 min total (truth) |
+| Verify Installation | All ✗ — DPDK still building | All ✓ — install actually done |
+
+### What this doesn't change
+
+* No server-side changes — uses the existing
+  `/api/admin/install_dpdk/log` endpoint
+* No changes to `install_dpdk.sh` itself
+* Other wizard steps (IOMMU, VFIO, hugepages, bind) keep their
+  immediate-completion semantics — they're synchronous HTTP endpoints
+  that block until done
+
+### Tests
+
+9 regression tests in `tests/test_v0517_install_dpdk_polling.py`
+pin:
+
+* `_on_step_done` special-cases `INSTALL_DPDK` before generic ✓ path
+* `_start_install_dpdk_poll` uses `QTimer` (UI stays responsive)
+* Poll endpoint is `/api/admin/install_dpdk/log`
+* Response handler advances on `rc == 0`
+* Response handler fails (with exit code) on `rc != 0`
+* Response handler keeps polling while `running=True`
+* Tolerates up to N consecutive HTTP errors (configurable threshold)
+* `_stop_install_dpdk_poll` is idempotent
+* Version ≥ 0.5.17
+
 ## [0.5.16] - 2026-06-07
 
 **Status LED flips red within seconds of Reboot Physical Server, and
