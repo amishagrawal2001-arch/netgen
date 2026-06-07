@@ -341,20 +341,43 @@ class SshUpgradeWorker(QThread):
             # endpoint) often still run `ostg-server`. Try the new name
             # first, fall back to the legacy unit so the restart doesn't
             # fail on an old box.
+            # v0.5.1: dispatch through the v0.5.0 tarball-install's
+            # bin/netgen-upgrade if present. The hardcoded
+            # `pip3 install` path WORKED on v0.4.x system installs
+            # (pip3 writes to /usr/lib/python3.X/dist-packages,
+            # systemd unit's ExecStart resolves via that path).
+            # On v0.5.0+ tarball installs the systemd unit's
+            # ExecStart points at /opt/netgen-server/netgen-venv/
+            # bin/ostg-server — a DIFFERENT Python. System pip3
+            # would install the wheel to /usr/lib/python3.12/...
+            # and the server would keep running the OLD version
+            # silently. The shell test below picks the right path
+            # at SSH-execution time without needing version
+            # detection in the client.
+            #
+            # netgen-upgrade itself runs pip in the bundled venv +
+            # systemctl restart + /api/health verify, so we don't
+            # need any of the cmd-tail steps when it's available.
             cmd_payload = (
-                f"pip3 install --upgrade --force-reinstall --no-deps "
+                f"if [ -x /opt/netgen-server/bin/netgen-upgrade ]; then "
+                f"  echo '[v0.5.0] dispatching via /opt/netgen-server/bin/netgen-upgrade'; "
+                f"  /opt/netgen-server/bin/netgen-upgrade {remote_wheel}; "
+                f"else "
+                f"  echo '[v0.4.x] legacy system-pip upgrade path'; "
+                f"  pip3 install --upgrade --force-reinstall --no-deps "
                 f"{remote_wheel} && "
-                f"(systemctl restart netgen-server 2>/dev/null || "
-                f"systemctl restart ostg-server) && "
-                f"sleep 2 && "
+                f"  (systemctl restart netgen-server 2>/dev/null || "
+                f"   systemctl restart ostg-server) && "
+                f"  sleep 2 && "
                 # grep (not `head -2`): grep consumes pip's whole stdout so
                 # pip never gets SIGPIPE. `head -2` closed the pipe early,
                 # making pip print a harmless-but-alarming
                 # "ERROR: Pipe to stdout was broken / BrokenPipeError" in
                 # the upgrade log even on a fully successful upgrade.
-                f"pip3 show ostg-trafficgen 2>/dev/null | "
-                f"grep -E '^(Name|Version):' && "
-                f"curl -fsS http://127.0.0.1:5050/api/health && echo"
+                f"  pip3 show ostg-trafficgen 2>/dev/null | "
+                f"  grep -E '^(Name|Version):' && "
+                f"  curl -fsS http://127.0.0.1:5050/api/health && echo; "
+                f"fi"
             )
             cmd = (
                 f"sudo sh -c {_shquote(cmd_payload)}"
@@ -1427,17 +1450,92 @@ class InstallServerDialog(QDialog):
             if hasattr(self, "ssh_port"):
                 self.ssh_port.setValue(port)
 
-    def _browse_wheel(self, line_edit: QLineEdit) -> None:
+    def _refresh_install_mode_indicator(self) -> None:
+        """v0.5.1 (#2 + #4): update the install-mode label AND
+        gate the installer-path field based on the current
+        wheel/tarball path's extension.
+
+        The label is the operator's at-a-glance feedback about
+        which install path will run — no guessing mid-install
+        about whether the legacy installer is in play. The
+        installer-path field gets disabled when a tarball is
+        picked (tarball ships its own install scripts; the
+        install_ostg_complete.py field is irrelevant)."""
+        if not hasattr(self, "_fresh_install_mode_label"):
+            return
+        path = (self.ssh_wheel.text() or "").strip().lower()
+        is_tarball = path.endswith(".tar.gz")
+        is_wheel = path.endswith(".whl")
+        if is_tarball:
+            self._fresh_install_mode_label.setText(
+                "<b style='color:#15803d;'>→ v0.5.0 tarball install</b> "
+                "<span style='color:#6b7280;'>(bundled venv, no system pip)</span>"
+            )
+        elif is_wheel:
+            self._fresh_install_mode_label.setText(
+                "<b style='color:#1d4ed8;'>→ Legacy wheel install</b> "
+                "<span style='color:#6b7280;'>"
+                "(install_ostg_complete.py path)</span>"
+            )
+        else:
+            self._fresh_install_mode_label.setText(
+                "<i style='color:#6b7280;'>Pick a wheel or tarball above.</i>"
+            )
+        # #4: hide / disable the installer-path field when a tarball
+        # is selected — it doesn't apply. We don't fully HIDE so
+        # the dialog layout doesn't jump; setEnabled(False) greys
+        # it out and a tooltip explains why.
+        if hasattr(self, "ssh_installer"):
+            self.ssh_installer.setEnabled(not is_tarball)
+        if hasattr(self, "_fresh_installer_browse_btn"):
+            self._fresh_installer_browse_btn.setEnabled(not is_tarball)
+        if hasattr(self, "ssh_installer"):
+            self.ssh_installer.setToolTip(
+                "Not used for tarball installs — the install scripts "
+                "ship inside the tarball."
+                if is_tarball else
+                "Path to install_ostg_complete.py (only used for "
+                "legacy wheel installs)."
+            )
+        # #3: same logic for the DPDK flags — they're install_ostg_
+        # complete.py-specific. bin/netgen-install doesn't understand
+        # them. Grey them out + tooltip when in tarball mode so the
+        # operator isn't confused that their click did nothing.
+        for flag_attr in ("flag_no_dpdk", "flag_skip_dpdk_build"):
+            w = getattr(self, flag_attr, None)
+            if w is None:
+                continue
+            w.setEnabled(not is_tarball)
+            w.setToolTip(
+                "Not applicable to tarball installs — netgen-install "
+                "handles DPDK availability via runtime detection."
+                if is_tarball else ""
+            )
+
+    def _browse_wheel(self, line_edit: QLineEdit,
+                      prefer_tarball: bool = False) -> None:
         # v0.5.0: file picker accepts both wheel AND server-tarball.
         # The dispatcher downstream (SshInstallWorker) detects the
         # file extension and chooses the install path automatically:
         #   .whl     → legacy install_ostg_complete.py
         #   .tar.gz  → v0.5.0 tarball install (extract + netgen-install)
+        #
+        # v0.5.1 (#5): prefer_tarball=True selects the tarball filter
+        # as the dialog's default — wheel-vs-tarball default depends
+        # on whether the operator is on the Fresh Install tab (tarball
+        # is the recommended fresh-install path) or the Upgrade tab
+        # (wheel is the routine upgrade artifact).
+        wheel_filter = "Python wheels (*.whl)"
+        tarball_filter = "Server tarballs (netgen-server-*-linux-*.tar.gz)"
+        all_filter = "All files (*)"
+        if prefer_tarball:
+            filt_str = f"{tarball_filter};;{wheel_filter};;{all_filter}"
+            selected = tarball_filter
+        else:
+            filt_str = f"{wheel_filter};;{tarball_filter};;{all_filter}"
+            selected = wheel_filter
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select wheel or server tarball", "",
-            "Python wheels (*.whl);;"
-            "Server tarballs (netgen-server-*-linux-*.tar.gz);;"
-            "All files (*)"
+            self, "Select wheel or server tarball", "", filt_str, selected,
         )
         if path:
             line_edit.setText(path)
@@ -1753,12 +1851,34 @@ class InstallServerDialog(QDialog):
         # Empty string when no wheel is found anywhere — operator still
         # uses Browse... in that case.
         self.ssh_wheel = QLineEdit(self._guess_wheel_path())
-        self.ssh_wheel.setPlaceholderText("/path/to/ostg_trafficgen-<v>-py3-none-any.whl")
+        # v0.5.1: placeholder updated to mention the tarball flow
+        # since the field accepts both .whl and .tar.gz now.
+        self.ssh_wheel.setPlaceholderText(
+            "/path/to/ostg_trafficgen-<v>-py3-none-any.whl "
+            "OR netgen-server-<v>-linux-x86_64.tar.gz"
+        )
         wb = QPushButton("Browse...")
-        wb.clicked.connect(lambda: self._browse_wheel(self.ssh_wheel))
+        # v0.5.1: route to the new fresh-install browse helper that
+        # defaults the file-filter to the tarball (Fresh Install is
+        # almost always a tarball-install in v0.5.0+).
+        wb.clicked.connect(
+            lambda: self._browse_wheel(self.ssh_wheel, prefer_tarball=True)
+        )
         wheel_row.addWidget(self.ssh_wheel, 1)
         wheel_row.addWidget(wb)
-        form.addRow("Wheel:", wheel_row)
+        form.addRow("Wheel / tarball:", wheel_row)
+
+        # v0.5.1: install-mode indicator (#2). One line under the
+        # file picker that updates whenever the path changes.
+        # Operator sees AT A GLANCE which install path will run:
+        #   .whl     → Legacy wheel install via install_ostg_complete.py
+        #   .tar.gz  → v0.5.0 tarball install (bundled venv)
+        # No surprise mid-install about which flow is active.
+        self._fresh_install_mode_label = QLabel(
+            "<i style='color:#6b7280;'>Pick a wheel or tarball above.</i>"
+        )
+        self._fresh_install_mode_label.setTextFormat(Qt.RichText)
+        form.addRow("", self._fresh_install_mode_label)
 
         installer_row = QHBoxLayout()
         self.ssh_installer = QLineEdit(self._guess_installer_path())
@@ -1767,7 +1887,19 @@ class InstallServerDialog(QDialog):
         ib.clicked.connect(lambda: self._browse_file(self.ssh_installer, "Python (*.py)"))
         installer_row.addWidget(self.ssh_installer, 1)
         installer_row.addWidget(ib)
+        # Keep a handle on the installer-row widgets so we can disable
+        # them when a tarball is picked (item #4 — the tarball ships
+        # its own install scripts, no install_ostg_complete.py needed).
+        self._fresh_installer_label_row = installer_row
+        self._fresh_installer_browse_btn = ib
         form.addRow("Installer:", installer_row)
+
+        # v0.5.1: live-update the install-mode label AND the
+        # installer-field enabled state whenever the wheel/tarball
+        # path changes.
+        self.ssh_wheel.textChanged.connect(self._refresh_install_mode_indicator)
+        # Run once now to pick up the initial guess_wheel_path value.
+        self._refresh_install_mode_indicator()
 
         # Flags — tightened from the default QGroupBox spacing which
         # made the two checkboxes consume ~80px and overflow onto the
@@ -1975,11 +2107,28 @@ class InstallServerDialog(QDialog):
                     )
                     return
 
+        # v0.5.1 (#3): --no-dpdk and --skip-dpdk-build are
+        # install_ostg_complete.py-specific. bin/netgen-install
+        # doesn't recognise them. For tarball installs we strip the
+        # flags AND log a one-line "ignored: ..." so the operator
+        # knows the checkbox state didn't carry forward.
         flags = []
+        is_tarball_mode = bool(wheel) and wheel.lower().endswith(".tar.gz")
         if self.flag_no_dpdk.isChecked():
-            flags.append("--no-dpdk")
+            if is_tarball_mode:
+                self.log_view.append(
+                    "[client] --no-dpdk: ignored on tarball install "
+                    "(netgen-install handles DPDK via runtime detection)"
+                )
+            else:
+                flags.append("--no-dpdk")
         if self.flag_skip_dpdk_build.isChecked():
-            flags.append("--skip-dpdk-build")
+            if is_tarball_mode:
+                self.log_view.append(
+                    "[client] --skip-dpdk-build: ignored on tarball install"
+                )
+            else:
+                flags.append("--skip-dpdk-build")
 
         self.log_view.clear()
         self._recent_errors.clear()

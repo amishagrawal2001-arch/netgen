@@ -2,6 +2,112 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.1] - 2026-06-07
+
+**Install/Upgrade Server dialog: full polish for the v0.5.0
+tarball flow. One critical bug fix + four UX cleanups.**
+
+Full suite: 1,476 passed, 1 skipped (+6 new tests).
+
+### Fix 1 — Upgrade now works on v0.5.0 tarball hosts (CRITICAL)
+
+Pre-v0.5.1 the Upgrade tab's shell payload was hardcoded to
+`pip3 install --upgrade --force-reinstall --no-deps <wheel>`.
+That worked on v0.4.x hosts: system pip3 wrote to
+`/usr/lib/python3.X/dist-packages/` and the systemd unit's
+ExecStart resolved through there.
+
+On a v0.5.0 tarball host, the systemd unit's ExecStart points at
+`/opt/netgen-server/netgen-venv/bin/ostg-server` — a DIFFERENT
+Python. System pip3 wrote the wheel to the system Python; the
+server kept running the OLD code; the operator never knew the
+upgrade had silently failed.
+
+Fix: the shell payload now tests `[ -x /opt/netgen-server/bin/
+netgen-upgrade ]` at SSH-execution time:
+
+  * If present (v0.5.0+ host) → dispatch through
+    `/opt/netgen-server/bin/netgen-upgrade <wheel>` (the script
+    inside the tarball already does pip-in-bundled-venv +
+    systemctl restart + /api/health verify).
+  * Else (v0.4.x host) → fall back to the legacy `pip3 install`
+    path — unchanged.
+
+The test branches with a one-line `[v0.5.0]` / `[v0.4.x]` log so
+the operator sees which path actually ran.
+
+### Fix 2 — Install-mode indicator under the file picker
+
+Operator picks a file; pre-v0.5.1 nothing told them which install
+path would run. A new live label under the wheel/tarball field
+updates as the path changes:
+
+```
+Wheel / tarball: [/path/to/netgen-server-0.5.0-linux-x86_64.tar.gz ] [Browse...]
+                 → v0.5.0 tarball install (bundled venv, no system pip)
+```
+
+vs:
+
+```
+Wheel / tarball: [/path/to/ostg_trafficgen-0.5.0-py3-none-any.whl   ] [Browse...]
+                 → Legacy wheel install (install_ostg_complete.py path)
+```
+
+No more guessing mid-install about which flow is active.
+
+### Fix 3 — DPDK flags no longer silently dropped
+
+`--no-dpdk` / `--skip-dpdk-build` are install_ostg_complete.py-
+specific flags. `bin/netgen-install` (inside the tarball) doesn't
+recognise them. Pre-v0.5.1 they were passed through and silently
+ignored.
+
+v0.5.1: when the operator picks a tarball, the click handler strips
+those flags AND logs:
+
+```
+[client] --no-dpdk: ignored on tarball install
+         (netgen-install handles DPDK via runtime detection)
+```
+
+So the checkbox state didn't carry forward AND the operator knows
+why.
+
+### Fix 4 — install_ostg_complete.py field disabled for tarball mode
+
+The "Installer:" row is only relevant to legacy wheel installs. The
+indicator logic now greys it out + adds a tooltip when a tarball is
+picked. Same for the two DPDK flag checkboxes.
+
+### Fix 5 — Fresh Install file picker defaults to tarball filter
+
+Pre-v0.5.1 the file dialog's default filter was always `*.whl`. On
+the Fresh Install tab (where tarball is the recommended artifact in
+v0.5.0+), `_browse_wheel` now accepts `prefer_tarball=True` and
+opens the dialog with the tarball filter selected. Operators on the
+Upgrade tab still see `*.whl` as the default.
+
+The wheel-row label also changed from "Wheel:" to "Wheel /
+tarball:" so the operator's first glance tells them both extensions
+are valid.
+
+### Tests
+
+`tests/test_v051_install_dialog_polish.py` — 6 tests pinning the
+shell-dispatch contract (executable test, both branches present),
+the indicator method + textChanged wiring, the DPDK flag-strip
+logic, the installer-field setEnabled gate, the
+`prefer_tarball=True` kwarg, and the updated row label.
+
+### Operator action
+
+Existing v0.5.0 hosts that haven't received a wheel-based upgrade
+yet are NOT affected — they were upgraded via the v0.4.x SSH path
+(if they were upgraded at all). The v0.5.1 client paired with a
+v0.5.0+ server is the working combo for routine upgrades going
+forward.
+
 ## [0.5.0] - 2026-06-07
 
 **Distribution-ready fresh install via a self-contained server
