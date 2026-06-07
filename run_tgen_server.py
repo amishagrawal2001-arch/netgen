@@ -17170,6 +17170,74 @@ def latency_stop():
     return jsonify({"ok": True, "stopped": stopped})
 
 
+@app.route("/api/system/restart_service", methods=["POST"])
+def system_restart_service():
+    """Restart the netgen-server systemd unit (or legacy ostg-server).
+
+    v0.5.3: introduced for the same operator-trust reason as
+    /api/system/reboot (v0.5.2) — the GUI's Restart TGEN Service
+    used `ssh root@host systemctl restart ...` which silently
+    failed on hosts without passwordless root SSH and exited
+    rc=0/255 indistinguishably from the "successful restart kicked
+    SSH" case.
+
+    Trick here: this endpoint is the WHOLE Flask process that's
+    about to be killed by `systemctl restart`. We can't `Popen`
+    the restart inline and wait for it — we'd be killed mid-flight
+    and the HTTP 200 would never reach the client.
+
+    Pattern: schedule the restart with a small delay (default 2s),
+    return HTTP 200 immediately. By the time the operator's client
+    sees the response, the Popen has detached; systemctl kicks in
+    a moment later. The client then polls /api/health to confirm
+    the unit came back up.
+
+    Body (optional JSON):
+      {"delay_s": 2, "unit": "netgen-server"}
+
+    Returns:
+      {"ok": True, "delay_s": <int>, "unit": "<str>"}
+    """
+    try:
+        import subprocess
+        import socket
+        data = request.get_json(silent=True) or {}
+        try:
+            delay_s = max(1, min(30, int(data.get("delay_s", 2))))
+        except (TypeError, ValueError):
+            delay_s = 2
+        # Try the canonical netgen-server unit first; fall back to
+        # the legacy ostg-server unit so unmigrated hosts work too.
+        # The shell does the existence check at restart time so
+        # we don't need to know the answer here.
+        restart_sh = (
+            f"sleep {delay_s} && "
+            f"if systemctl list-unit-files netgen-server.service "
+            f"   | grep -q netgen-server; then "
+            f"     systemctl restart netgen-server; "
+            f"elif systemctl list-unit-files ostg-server.service "
+            f"     | grep -q ostg-server; then "
+            f"     systemctl restart ostg-server; "
+            f"fi"
+        )
+        subprocess.Popen(
+            ["sh", "-c", restart_sh],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+        return jsonify({
+            "ok": True,
+            "delay_s": delay_s,
+            "unit": "netgen-server (fallback: ostg-server)",
+            "hostname": socket.gethostname(),
+        }), 200
+    except Exception as exc:
+        logger.error(f"[SYSTEM RESTART] failed to schedule: {exc}")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
 @app.route("/api/system/reboot", methods=["POST"])
 def system_reboot():
     """Schedule a physical reboot of the host this server runs on.

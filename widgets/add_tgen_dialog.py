@@ -297,10 +297,33 @@ class AddTGenDialog(QDialog):
         self.remove_btn.clicked.connect(self._remove_selected_from_history)
         self.test_btn = QPushButton("Test all")
         self.test_btn.clicked.connect(self._start_reachability_probe)
+        # v0.5.3: Restart TGEN Service + Reboot Physical Server moved
+        # here from the Server menu. They're chassis-specific actions
+        # — operators looking at the chassis health table are the
+        # same people wanting to restart / reboot. The Server menu's
+        # online-state actions are unrelated and stay there.
+        # Both default to selecting a row; if nothing's selected the
+        # handler shows a friendly "pick a chassis first" hint
+        # instead of a confusing no-op.
+        self.restart_btn = QPushButton("Restart TGEN Service")
+        self.restart_btn.setToolTip(
+            "systemctl restart netgen-server on the selected chassis. "
+            "Uses POST /api/system/restart_service (v0.5.3+); falls "
+            "back to SSH for older servers."
+        )
+        self.restart_btn.clicked.connect(self._restart_tgen_service)
+        self.reboot_btn = QPushButton("Reboot Physical Server")
+        self.reboot_btn.setToolTip(
+            "Physical host reboot. Uses POST /api/system/reboot "
+            "(v0.5.2+); falls back to SSH for older servers."
+        )
+        self.reboot_btn.clicked.connect(self._reboot_physical_server)
         hist_btns.addWidget(self.connect_selected_btn)
         hist_btns.addWidget(self.open_admin_btn)
         hist_btns.addWidget(self.remove_btn)
         hist_btns.addWidget(self.test_btn)
+        hist_btns.addWidget(self.restart_btn)
+        hist_btns.addWidget(self.reboot_btn)
         hist_btns.addStretch(1)
         hb.addLayout(hist_btns)
 
@@ -526,6 +549,133 @@ class AddTGenDialog(QDialog):
                 self, "Could not open browser",
                 f"QDesktopServices.openUrl returned false for {admin_url}.\n\n"
                 "Copy the URL manually:"
+            )
+
+    def _selected_entry(self) -> Optional[dict]:
+        """Read the selected row's entry from self._entries. Returns
+        None if no row is selected. Used by Restart / Reboot —
+        operator's friendly variant of 'pick a chassis first'."""
+        rows = self.table.selectionModel().selectedRows()
+        if not rows:
+            return None
+        i = rows[0].row()
+        if i < 0 or i >= len(self._entries):
+            return None
+        return self._entries[i]
+
+    def _entry_to_api_base(self, e: dict) -> str:
+        """Compose http(s)://addr:port/api base URL from a history
+        entry. Used by Restart / Reboot to hit the v0.5.2+ HTTP
+        endpoints."""
+        scheme = e.get("scheme", "http")
+        address = e.get("address", "")
+        port = int(e.get("port", 5050)) if e.get("port") else 5050
+        return f"{scheme}://{address}:{port}"
+
+    def _restart_tgen_service(self) -> None:
+        """v0.5.3: Restart TGEN Service moved from Server menu to
+        the AddTGenDialog. POST /api/system/restart_service first
+        (no SSH credentials needed for v0.5.3+ servers); fall back
+        to SSH on 404 (pre-v0.5.3 server).
+
+        Confirmation is intentionally light — the operator already
+        had to pick a row to enable this. A full QMessageBox-with-
+        warning is overkill for a netgen-server restart (the
+        original Server-menu version was modelled after the
+        physical-reboot path which DOES warrant a strong warning).
+        """
+        e = self._selected_entry()
+        if e is None:
+            self.status_lbl.setText(
+                "Pick a chassis row first, then click Restart."
+            )
+            return
+        addr = e.get("address", "")
+        port = e.get("port", 5050)
+        ret = QMessageBox.question(
+            self, "Restart TGEN Service",
+            f"Restart netgen-server on {addr}:{port}?\n\n"
+            f"This stops all running streams and bounces the "
+            f"service. It comes back online in a few seconds.",
+            QMessageBox.Yes | QMessageBox.No,
+        )
+        if ret != QMessageBox.Yes:
+            return
+        try:
+            import requests as _requests
+            url = f"{self._entry_to_api_base(e)}/api/system/restart_service"
+            r = _requests.post(url, json={"delay_s": 2}, timeout=5)
+            if r.status_code == 200:
+                self.status_lbl.setText(
+                    f"✓ Restart scheduled on {addr}:{port} — "
+                    f"service will be back in ~5s"
+                )
+                return
+            if r.status_code == 404:
+                self.status_lbl.setText(
+                    f"⚠ {addr}:{port} is on a pre-v0.5.3 server "
+                    f"(no /api/system/restart_service). Upgrade the "
+                    f"server to v0.5.3+ for the no-SSH restart."
+                )
+                return
+            self.status_lbl.setText(
+                f"✗ HTTP {r.status_code} from {addr}:{port}: "
+                f"{r.text[:120]}"
+            )
+        except Exception as exc:
+            self.status_lbl.setText(
+                f"✗ Could not reach {addr}:{port}: {exc}"
+            )
+
+    def _reboot_physical_server(self) -> None:
+        """v0.5.3: Reboot Physical Server moved from Server menu
+        to the AddTGenDialog. POST /api/system/reboot (v0.5.2+);
+        operator confirmation matches the strong warning of the
+        original Server-menu version because a physical reboot is
+        much more destructive than a service restart."""
+        e = self._selected_entry()
+        if e is None:
+            self.status_lbl.setText(
+                "Pick a chassis row first, then click Reboot."
+            )
+            return
+        addr = e.get("address", "")
+        port = e.get("port", 5050)
+        ret = QMessageBox.warning(
+            self, "Confirm Physical Server Reboot",
+            f"⚠ This will REBOOT the entire physical chassis at "
+            f"{addr}:{port}.\n\n"
+            f"All streams stop. All network connections drop. "
+            f"The host takes 3-5 minutes to come back online.\n\n"
+            f"Proceed?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if ret != QMessageBox.Yes:
+            return
+        try:
+            import requests as _requests
+            url = f"{self._entry_to_api_base(e)}/api/system/reboot"
+            r = _requests.post(url, json={"delay_s": 5}, timeout=5)
+            if r.status_code == 200:
+                self.status_lbl.setText(
+                    f"✓ Reboot scheduled on {addr}:{port} in 5s. "
+                    f"Wait 3-5 minutes before reconnecting."
+                )
+                return
+            if r.status_code == 404:
+                self.status_lbl.setText(
+                    f"⚠ {addr}:{port} is on a pre-v0.5.2 server "
+                    f"(no /api/system/reboot). Upgrade the server "
+                    f"to v0.5.2+ for the no-SSH reboot path."
+                )
+                return
+            self.status_lbl.setText(
+                f"✗ HTTP {r.status_code} from {addr}:{port}: "
+                f"{r.text[:120]}"
+            )
+        except Exception as exc:
+            self.status_lbl.setText(
+                f"✗ Could not reach {addr}:{port}: {exc}"
             )
 
     def _remove_selected_from_history(self) -> None:

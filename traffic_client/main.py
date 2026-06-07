@@ -1352,18 +1352,15 @@ class TrafficGeneratorClient(
         )
         server_menu.addAction(self.mark_server_offline_action)
 
-        server_menu.addSeparator()
-
-        restart_tgen_action = QAction("Restart TGEN Service...", self)
-        restart_tgen_action.triggered.connect(self.restart_server)
-        server_menu.addAction(restart_tgen_action)
-
-        reboot_server_action = QAction("Reboot Physical Server...", self)
-        reboot_server_action.setToolTip(
-            "Reboots the entire physical chassis. Requires explicit confirmation."
-        )
-        reboot_server_action.triggered.connect(self.reboot_server)
-        server_menu.addAction(reboot_server_action)
+        # v0.5.3: Restart TGEN Service and Reboot Physical Server
+        # moved from this Server menu to the AddTGenDialog ("Add
+        # TGEN Chassis..."). Both are chassis-specific actions —
+        # the AddTGenDialog already shows per-chassis health, LED,
+        # and version columns, so it's the natural home. The
+        # backing methods (self.restart_server / self.reboot_server)
+        # stay in menu_actions.py for backwards compat with any
+        # operator scripts that hooked them; only the menu entries
+        # are removed.
 
         # Show tooltips for menu items (Qt hides them by default in menus)
         server_menu.setToolTipsVisible(True)

@@ -2,6 +2,104 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.3] - 2026-06-07
+
+**Restart TGEN Service + Reboot Physical Server moved from
+the Server menu to the Add TGEN Chassis dialog. Both run
+via HTTP (no SSH).**
+
+Full suite: 1,495 passed, 1 skipped (+10 new tests).
+
+### Operator-stated rationale
+
+The Add TGEN Chassis dialog already shows per-chassis health
+(LED, version, health column — v0.2.33 / v0.2.34). Operators
+looking at chassis state are the same people who want to
+restart or reboot — keeping those actions in a global Server
+menu meant a context jump (select in tree → open menu → click)
+when a single dialog could do both.
+
+### Changes
+
+**1. New `POST /api/system/restart_service` endpoint.**
+
+Mirrors the v0.5.2 `/api/system/reboot` design:
+
+  * `Popen` (not `run`) so the HTTP 200 returns BEFORE the
+    `systemctl restart` kills the Flask thread.
+  * Default 2-second delay; clamped to `[1, 30]`.
+  * Tries `netgen-server` first, falls back to legacy
+    `ostg-server` so unmigrated hosts work too.
+
+**2. AddTGenDialog gains two buttons.**
+
+```
+[Connect Selected] [Open admin] [Remove from history] [Test all]
+[Restart TGEN Service] [Reboot Physical Server]
+```
+
+Each button reads the selected history-table row's entry,
+composes `<scheme>://<addr>:<port>/api/system/...`, and posts.
+
+  * HTTP 200 → status line shows `✓ Restart scheduled` /
+    `✓ Reboot scheduled in 5s. Wait 3-5 minutes...`.
+  * HTTP 404 → `⚠ <host> is on a pre-v0.5.3 server (no
+    /api/system/restart_service). Upgrade...` — actionable.
+  * No row selected → `Pick a chassis row first, then click
+    Restart.` — friendly, not a silent no-op.
+
+**Reboot uses `QMessageBox.warning` (not `.question`)** + the
+3-5 minute downtime message so operators have appropriate
+friction before confirming the destructive action. Restart
+uses the lighter `.question` style.
+
+**3. Server menu cleanup.**
+
+The two `QAction` entries are removed from `main.py`'s
+Server-menu setup. Add / Remove TGEN Chassis stay (v0.4.9
+contract preserved). New Server menu shape:
+
+```
+Server
+├── Add TGEN Chassis...       (Ctrl+N)
+├── Remove TGEN Chassis
+├── ─────────────
+├── Make Selected Servers Online
+└── Mark Selected Servers Offline
+```
+
+The backing methods `self.restart_server` and
+`self.reboot_server` remain in `menu_actions.py` — any
+operator script that hooked them keeps working. Only the
+menu entries are gone.
+
+### Tests
+
+`tests/test_v053_restart_reboot_in_dialog.py` — 10 tests
+pinning:
+
+  * Endpoint exists; uses `Popen` + sleep; tries netgen-server
+    AND ostg-server unit names
+  * Dialog has `restart_btn` + `reboot_btn`; both wired to
+    handlers
+  * Handlers POST the right endpoint; surface 404 with the
+    appropriate upgrade-hint version (v0.5.3 for restart,
+    v0.5.2 for reboot)
+  * Reboot uses `QMessageBox.warning` + mentions the 3-5
+    minute downtime
+  * Both handlers show a friendly hint when no row is selected
+  * Server menu no longer constructs the two QActions
+  * Add / Remove TGEN Chassis stay in the Server menu (v0.4.9
+    contract intact)
+
+### Operator action
+
+Upgrade servers to v0.5.3+ via the wheel-upgrade path. After
+upgrade, the Add TGEN Chassis dialog buttons work directly
+(HTTP, no SSH). Pre-v0.5.3 servers respond with HTTP 404 and
+the dialog surfaces a clear "upgrade to v0.5.3+" hint — no
+silent failures.
+
 ## [0.5.2] - 2026-06-07
 
 **Server → Reboot Physical Server actually reboots the server now.**
