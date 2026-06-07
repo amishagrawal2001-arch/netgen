@@ -237,6 +237,16 @@ class TrafficGenClientServerSection():
         self._selection_update_timer.timeout.connect(self._on_server_selection_changed_combined)
         self.server_tree.itemSelectionChanged.connect(self._debounced_selection_changed)
 
+        # v0.5.4: right-click context menu on interface (child) items.
+        # Offers Set Online / Set Offline → POST to the v0.5.4
+        # /api/interfaces/<iface>/admin endpoint. Tree-level (no-
+        # selection / right-click on a server item) shows nothing
+        # — keeps the existing left-click flows untouched.
+        self.server_tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.server_tree.customContextMenuRequested.connect(
+            self._on_server_tree_context_menu,
+        )
+
         # --- Action Buttons Section (grouped separately, aligned with Streams pattern) ---
         # Wrap the action row in a styled QFrame so it has a subtle grey
         # "footer" background distinguishing it from the tree above —
@@ -336,6 +346,125 @@ class TrafficGenClientServerSection():
         self._selection_update_timer.stop()
         self._selection_update_timer.start(0)  # 0ms = next event loop cycle - instant but non-blocking
     
+    def _on_server_tree_context_menu(self, pos):
+        """v0.5.4: right-click context menu on server-tree
+        interface items. Provides Set Online / Set Offline so the
+        operator can bring an interface up or down via
+        POST /api/interfaces/<name>/admin — no SSH needed.
+
+        Only shows the menu for INTERFACE items (children of a
+        server item). Right-clicking a server-level row (or empty
+        space) does nothing — keeps the existing left-click flows
+        on the parent rows untouched."""
+        item = self.server_tree.itemAt(pos)
+        if item is None:
+            return
+        parent = item.parent()
+        if parent is None:
+            # Right-clicked on a server (top-level) item or empty
+            # space — no actions apply. Future: could add a
+            # "Reboot Physical Server" entry here too, but that
+            # action already lives in the AddTGenDialog (v0.5.3)
+            # and we don't want to duplicate it.
+            return
+        # Extract interface name. The display label is "Port:
+        # <name>" or just "<name>" depending on the format the
+        # tree was populated with — strip the prefix robustly.
+        raw_label = (item.text(0) or "").strip()
+        iface_name = raw_label
+        for prefix in ("Port: ", "Port:", "🔵 ", "🟢 ", "🔴 ", "⚪ "):
+            if iface_name.startswith(prefix):
+                iface_name = iface_name[len(prefix):].strip()
+                break
+        if not iface_name:
+            return
+        # Resolve the server URL from the parent item. text(1) is
+        # the address column in the tree headers.
+        server_addr = (parent.text(1) or "").strip()
+        if not server_addr:
+            return
+
+        menu = QMenu(self.server_tree)
+        up_action = QAction(f"Set {iface_name} Online", menu)
+        up_action.setToolTip(
+            f"ip link set {iface_name} up via "
+            f"POST /api/interfaces/{iface_name}/admin"
+        )
+        up_action.triggered.connect(
+            lambda: self._set_interface_admin_state(server_addr, iface_name, "up"),
+        )
+        down_action = QAction(f"Set {iface_name} Offline", menu)
+        down_action.setToolTip(
+            f"ip link set {iface_name} down — STOPS any streams "
+            f"using this interface."
+        )
+        down_action.triggered.connect(
+            lambda: self._set_interface_admin_state(server_addr, iface_name, "down"),
+        )
+        menu.setToolTipsVisible(True)
+        menu.addAction(up_action)
+        menu.addAction(down_action)
+        menu.exec_(self.server_tree.viewport().mapToGlobal(pos))
+
+    def _set_interface_admin_state(self, server_addr, iface, state):
+        """v0.5.4: POST to /api/interfaces/<iface>/admin and surface
+        the result in a small QMessageBox. Confirmation for
+        state=down is intentionally required (it stops streams);
+        state=up has no confirmation (it's idempotent and safe)."""
+        try:
+            from PyQt5.QtWidgets import QMessageBox
+        except Exception:
+            return
+        # Down is destructive (stops streams on this iface). Up is
+        # safe / idempotent.
+        if state == "down":
+            ret = QMessageBox.warning(
+                self, "Set Interface Offline",
+                f"⚠ Set {iface} on {server_addr} OFFLINE?\n\n"
+                f"All streams using this interface will stop.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+            )
+            if ret != QMessageBox.Yes:
+                return
+        try:
+            import requests as _requests
+            base = server_addr.rstrip("/")
+            if "://" not in base:
+                base = f"http://{base}"
+            url = f"{base}/api/interfaces/{iface}/admin"
+            r = _requests.post(url, json={"state": state}, timeout=5)
+            if r.status_code == 200:
+                body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+                operstate = body.get("operstate", "unknown")
+                QMessageBox.information(
+                    self, "Interface state",
+                    f"✓ {iface} on {server_addr}:\n\n"
+                    f"  requested: {state}\n"
+                    f"  kernel says: {operstate}",
+                )
+                # Refresh the tree so the operator sees the new
+                # state without manually re-clicking.
+                if hasattr(self, "update_server_tree"):
+                    QTimer.singleShot(500, self.update_server_tree)
+            elif r.status_code == 404:
+                QMessageBox.warning(
+                    self, "Interface admin not supported",
+                    f"{server_addr} returned 404. The interface "
+                    f"admin endpoint is new in v0.5.4 — upgrade "
+                    f"the server to use Set Online / Offline.",
+                )
+            else:
+                QMessageBox.warning(
+                    self, "Interface admin failed",
+                    f"HTTP {r.status_code} from {server_addr}:\n\n"
+                    f"{r.text[:300]}",
+                )
+        except Exception as exc:
+            QMessageBox.warning(
+                self, "Interface admin failed",
+                f"Could not reach {server_addr}: {exc}",
+            )
+
     def _on_server_selection_changed_combined(self):
         """Update both stream and device tables on server tree selection change."""
         # Update main window server URL based on selection

@@ -2,6 +2,91 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.4] - 2026-06-07
+
+**Right-click an interface in the TGEN list to take it online /
+offline.**
+
+Full suite: 1,506 passed, 1 skipped (+11 new tests).
+
+### Operator request
+
+Bring an interface up or down without dropping to a shell. Same
+HTTP-first principle as the v0.5.2 reboot and v0.5.3
+restart-service work: the server already runs as root, so the
+client can hand off via REST.
+
+### Changes
+
+**1. New `POST /api/interfaces/<iface>/admin`.**
+
+```
+POST /api/interfaces/enp181s0f0np0/admin
+{"state": "down"}     →  200 {"ok":true, "operstate":"down"}
+                         400 if state isn't "up" / "down"
+                         404 if /sys/class/net/<iface> doesn't exist
+```
+
+Safety:
+
+  * `iface` validated via `/sys/class/net/<iface>` — operator-
+    controlled URL component can't reach `ip link set` unless
+    the kernel already knows about it.
+  * `state` strict whitelist of exactly `"up"` or `"down"`. No
+    free-form `set <iface> <whatever>` paths.
+  * `ip link set -- <iface> <state>` (double-dash) so an
+    interface starting with `-` can't be parsed as an option.
+  * Response includes kernel-observed `operstate` so the
+    operator sees what ACTUALLY happened (e.g. requested up,
+    got DORMANT because the link isn't connected) — not just
+    an echo of the request.
+
+**2. Server-tree right-click context menu.**
+
+Right-click on an **interface** item (child of a TG node) opens:
+
+```
+Set <iface> Online
+Set <iface> Offline
+```
+
+Right-click on a server-level row does nothing — keeps the
+existing left-click flows untouched.
+
+  * Set Offline → confirmation dialog (`QMessageBox.warning`)
+    because it stops any streams using the interface.
+  * Set Online → no confirmation (idempotent, safe; extra
+    dialog would slow down post-maintenance recovery).
+  * After success: the tree refreshes automatically so the
+    operator sees the new state without re-clicking the
+    chassis.
+  * On HTTP 404 (pre-v0.5.4 server): clear "upgrade the server
+    to use Set Online / Offline" hint — actionable, not
+    confusing.
+
+### Tests
+
+`tests/test_v054_interface_admin_context_menu.py` — 11 tests
+pinning:
+
+  * Endpoint registered + sysfs validation + strict state
+    whitelist + double-dash argv + operstate in response
+  * `server_tree.setContextMenuPolicy(CustomContextMenu)` +
+    signal wiring
+  * Handler returns when `parent is None` (skips server rows)
+  * Both Online + Offline actions present
+  * Offline requires confirmation; Online does not
+  * 404 surfaces a v0.5.4 upgrade hint
+  * Success refreshes the tree
+
+### Operator action
+
+Upgrade servers to v0.5.4+ via the wheel-upgrade path. After
+upgrade, right-click on any interface in the server tree to
+get the Online / Offline options. Pre-v0.5.4 servers respond
+404 and the client surfaces a clear upgrade hint — no silent
+failures.
+
 ## [0.5.3] - 2026-06-07
 
 **Restart TGEN Service + Reboot Physical Server moved from

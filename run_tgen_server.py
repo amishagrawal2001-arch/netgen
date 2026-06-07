@@ -17170,6 +17170,88 @@ def latency_stop():
     return jsonify({"ok": True, "stopped": stopped})
 
 
+@app.route("/api/interfaces/<iface>/admin", methods=["POST"])
+def interface_admin(iface):
+    """Set a network interface admin state to up or down.
+
+    v0.5.4: GUI server tree gained a right-click context menu on
+    interface items that offers Set Online / Set Offline. Those
+    options POST to this endpoint with {"state": "up"|"down"}.
+
+    Same operator-trust principle as v0.5.2 reboot + v0.5.3
+    restart-service: the previous pattern of "the client should
+    SSH and run ip link" only worked on hosts with passwordless
+    root SSH. We already have a privileged server running — use it.
+
+    Body (JSON, required):
+      {"state": "up"} | {"state": "down"}
+
+    Returns:
+      200 {"ok": true, "iface": "<name>", "state": "up|down",
+           "operstate": "<observed kernel state>"}
+      400 if body is missing or state isn't up/down
+      404 if the interface doesn't exist
+      500 if `ip link set` returns non-zero
+
+    Validation:
+      * `iface` must be a known kernel interface — we test
+        `/sys/class/net/<iface>` so we don't pass operator-typed
+        strings into `ip link set`. Defends against accidental
+        `enp0..; reboot` or similar injection.
+      * `state` must be exactly "up" or "down" — strict whitelist,
+        no `set <iface> <anything>` arbitrary-arg path.
+    """
+    try:
+        import os as _os
+        import subprocess as _sp
+        # Step 1 — interface existence sanity. Reject anything
+        # that isn't a real kernel interface (defends against
+        # injection via the URL path component).
+        sys_path = f"/sys/class/net/{iface}"
+        if not _os.path.isdir(sys_path):
+            return jsonify({
+                "ok": False,
+                "error": f"interface not found: {iface}",
+            }), 404
+        # Step 2 — state strictly whitelisted.
+        data = request.get_json(silent=True) or {}
+        state = (data.get("state") or "").strip().lower()
+        if state not in ("up", "down"):
+            return jsonify({
+                "ok": False,
+                "error": "state must be 'up' or 'down'",
+            }), 400
+        # Step 3 — apply via `ip link set`. -- prevents iface
+        # starting with - from being parsed as an option.
+        r = _sp.run(
+            ["ip", "link", "set", "--", iface, state],
+            capture_output=True, text=True, timeout=10,
+        )
+        if r.returncode != 0:
+            return jsonify({
+                "ok": False,
+                "error": (r.stderr or r.stdout or "ip link set failed").strip(),
+            }), 500
+        # Step 4 — read the kernel's view back so the client can
+        # show the operator what actually happened (not just what
+        # was asked).
+        operstate = "unknown"
+        try:
+            with open(f"{sys_path}/operstate", "r") as fh:
+                operstate = fh.read().strip()
+        except Exception:
+            pass
+        return jsonify({
+            "ok": True,
+            "iface": iface,
+            "state": state,
+            "operstate": operstate,
+        }), 200
+    except Exception as exc:
+        logger.error(f"[IFACE ADMIN] {iface} {state if 'state' in dir() else '?'}: {exc}")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
 @app.route("/api/system/restart_service", methods=["POST"])
 def system_restart_service():
     """Restart the netgen-server systemd unit (or legacy ostg-server).
