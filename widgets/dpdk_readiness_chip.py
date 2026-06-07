@@ -255,6 +255,17 @@ class DpdkReadinessChip(QLabel):
         self._last_payload = payload
         state, headline, tip = classify_dpdk_status(payload)
         self._state = state
+        # v0.5.18: populate the shared TTL cache so the Diagnostics
+        # dialog / Make DPDK Ready / etc. can render instantly from
+        # the same data the chip just polled.
+        try:
+            from traffic_client.dpdk_menu_actions import cache_dpdk_status
+            # _server_url is the per-chip target; only cache when set.
+            url = getattr(self, "_server_url", None)
+            if url:
+                cache_dpdk_status(url, payload)
+        except Exception:
+            pass
         self._paint(state, headline, tip)
 
     def mousePressEvent(self, ev):
@@ -349,11 +360,38 @@ def classify_dpdk_status(payload: Dict[str, Any]) -> "tuple[str, str, str]":
             f"{bound_count} (not shown in Server tree — Tools→DPDK→Status)",
         ))
 
-    tip = "DPDK readiness:\n" + "\n".join(
+    # v0.5.18: lead with a one-line "what's missing" summary so
+    # the operator doesn't have to read 5 rows to figure out the
+    # problem. Examples:
+    #   "Missing: DPDK libs, tx_worker — install required"
+    #   "Missing: hugepages, IOMMU — most NICs need these"
+    #   (omitted entirely if everything's fine)
+    missing_items = []
+    if not libdpdk:
+        missing_items.append("DPDK libs")
+    if not tx_worker:
+        missing_items.append("tx_worker")
+    if not hugepages:
+        missing_items.append("hugepages")
+    if not iommu:
+        missing_items.append("IOMMU")
+    if not vfio_pci:
+        missing_items.append("vfio-pci")
+    summary_line = ""
+    if missing_items:
+        summary_line = (
+            f"Missing: {', '.join(missing_items)} — "
+            f"click chip to open ★ Setup DPDK\n\n"
+        )
+
+    tip = summary_line + "DPDK readiness:\n" + "\n".join(
         f"  • {k}: {v}" for k, v in rows
     )
     # v0.3.11 fix #1: advertise the click-to-fix affordance.
-    tip += "\n\nClick this chip to open Make DPDK Ready…"
+    # v0.5.18: only repeat the call-to-action if we didn't already
+    # surface it in the summary line.
+    if not summary_line:
+        tip += "\n\nClick this chip to open ★ Setup DPDK…"
 
     if not libdpdk or not tx_worker:
         missing = []

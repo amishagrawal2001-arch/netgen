@@ -1,5 +1,6 @@
 # traffic_client/dpdk_menu_actions.py
 import logging
+import time as _time
 import requests
 from requests.exceptions import ConnectionError, Timeout
 from PyQt5.QtWidgets import (
@@ -11,6 +12,59 @@ from PyQt5.QtCore import Qt, QThread, pyqtSignal
 from PyQt5.QtGui import QFont
 
 logger = logging.getLogger(__name__)
+
+
+# ────────────────────────────────────────────────────────────────────
+# v0.5.18: shared in-process TTL cache for /api/dpdk/status.
+#
+# Multiple GUI surfaces (the readiness chip in the status bar polled
+# every 30s, the Make DPDK Ready survey, the Diagnostics dialog) all
+# hit this endpoint within seconds of each other when the operator
+# clicks around. A 30s TTL serves repeats instantly + cuts ~500ms
+# off each dialog open.
+#
+# Module-level so the chip widget (in the main window) and the menu
+# actions class can share. Stale-after-mutation: any code path that
+# changes server state (bind, unbind, install_dpdk, hugepages,
+# iommu) should call `invalidate_dpdk_status_cache()` so the next
+# read shows the new state.
+_DPDK_STATUS_CACHE: dict = {}  # server_url → (timestamp, parsed_dict)
+_DPDK_STATUS_CACHE_TTL_S = 30
+
+
+def get_cached_dpdk_status(server_url: str, ttl_s: int = _DPDK_STATUS_CACHE_TTL_S):
+    """Return cached /api/dpdk/status if fresh enough, else None.
+
+    Callers fetch fresh + then call ``cache_dpdk_status()`` on success.
+    """
+    if not server_url:
+        return None
+    entry = _DPDK_STATUS_CACHE.get(server_url)
+    if entry is None:
+        return None
+    ts, data = entry
+    if (_time.time() - ts) > ttl_s:
+        return None
+    return data
+
+
+def cache_dpdk_status(server_url: str, data: dict) -> None:
+    """Store a successful /api/dpdk/status response in the TTL cache.
+
+    No-op if the URL is empty or data isn't a dict (e.g. the worker
+    swallowed an exception)."""
+    if not server_url or not isinstance(data, dict):
+        return
+    _DPDK_STATUS_CACHE[server_url] = (_time.time(), data)
+
+
+def invalidate_dpdk_status_cache(server_url: str = None) -> None:
+    """Clear cache for one server (after a successful mutation) or
+    all (None)."""
+    if server_url is None:
+        _DPDK_STATUS_CACHE.clear()
+    else:
+        _DPDK_STATUS_CACHE.pop(server_url, None)
 
 
 class _DpdkApiWorker(QThread):
@@ -50,6 +104,18 @@ class _DpdkApiWorker(QThread):
                 data = {}
             data["_status_code"] = resp.status_code
             data["_full_text"] = resp.text or ""
+            # v0.5.18: any successful POST to a DPDK-mutating endpoint
+            # invalidates the shared /api/dpdk/status TTL cache so the
+            # next read shows the new state instead of stale data.
+            # Cheap (one dict.clear()), safe (worst case a 30s-stale
+            # refresh becomes 0s-stale).
+            if (self.method == "POST" and 200 <= resp.status_code < 300
+                    and ("/api/dpdk/" in self.url
+                         or "/api/admin/install_dpdk" in self.url)):
+                try:
+                    invalidate_dpdk_status_cache()
+                except Exception:
+                    pass
             self.done.emit(data, "")
         except Timeout as e:
             self.done.emit(None, f"Request timed out after {self.timeout}s ({e})")
@@ -265,6 +331,35 @@ class TrafficGenClientDPDKMenuActions():
             )
             return None, None
         return server, server_url
+
+    def show_dpdk_diagnostics(self):
+        """v0.5.18: open the merged Diagnostics dialog (Status + Verify
+        in tabs). Replaces the previous two-separate-menu-items UX where
+        operators wondered which one to click for what.
+        """
+        selected_servers = self._get_selected_servers()
+        if not selected_servers:
+            QMessageBox.warning(
+                self, "No Server Selected",
+                "Please select a server from the server tree."
+            )
+            return
+        try:
+            from widgets.dpdk_diagnostics_dialog import DpdkDiagnosticsDialog
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Cannot open Diagnostics",
+                f"Failed to import the dialog: {e}"
+            )
+            return
+        # Single server only for clarity. If multi-select, take first.
+        srv = selected_servers[0]
+        dlg = DpdkDiagnosticsDialog(
+            server_url=srv.get("address"),
+            auth_token=srv.get("auth_token"),
+            parent=self,
+        )
+        dlg.exec_()
 
     def show_dpdk_status(self):
         """Show DPDK status for selected server(s) — async fetch, dialog opens immediately."""

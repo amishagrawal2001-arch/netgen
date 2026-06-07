@@ -310,29 +310,34 @@ def test_dpdk_menu_mixin_exposes_handler():
 
 
 def test_main_py_wires_make_ready_menu_action():
-    """main.py's DPDK submenu must have the Make Ready action at the
-    TOP (before Status...), wired to show_dpdk_make_ready_dialog."""
+    """main.py's DPDK submenu must surface the make-ready orchestrator
+    as the FIRST item. v0.5.18 renamed the label from "Make DPDK
+    Ready..." to "★ Setup DPDK..." but the underlying handler
+    (show_dpdk_make_ready_dialog) is unchanged — same engine, clearer
+    entry point. Test pins: the action exists, points to the right
+    handler, and appears before Diagnostics in source order (= menu
+    insertion order)."""
     from pathlib import Path
     src = (
         Path(__file__).resolve().parent.parent
         / "traffic_client" / "main.py"
     ).read_text()
-    # The action label must appear
-    assert "Make DPDK Ready" in src, (
-        "Make DPDK Ready menu entry missing from main.py"
+    # The v0.5.18 entry-point label + handler.
+    assert "Setup DPDK" in src, (
+        "★ Setup DPDK menu entry missing from main.py (v0.5.18 "
+        "renamed from 'Make DPDK Ready')"
     )
-    # Wired to the right handler
     assert "show_dpdk_make_ready_dialog" in src, (
-        "Make Ready action not connected to its handler"
+        "Setup DPDK action not connected to its handler"
     )
-    # Order check — Make Ready must come BEFORE Status... in the
-    # source so the menu renders it first. (Position in the source
-    # = position in the menu via addAction() insertion order.)
-    pos_make_ready = src.find("Make DPDK Ready...")
-    pos_status = src.find('"Status..."')
-    assert pos_make_ready > 0 and pos_status > 0
-    assert pos_make_ready < pos_status, (
-        "Make DPDK Ready moved below Status... — the orchestrator "
+    # Order check — Setup DPDK must come before Diagnostics.
+    pos_setup = src.find("Setup DPDK")
+    pos_diag = src.find('"Diagnostics...')
+    assert pos_setup > 0 and pos_diag > 0, (
+        "Setup DPDK or Diagnostics entry missing"
+    )
+    assert pos_setup < pos_diag, (
+        "★ Setup DPDK moved below Diagnostics — the orchestrator "
         "is supposed to be the FIRST option operators see"
     )
 
@@ -1365,10 +1370,14 @@ def test_quick_start_wizard_mixin_handler_exposed():
 
 
 def test_main_py_wires_quick_start_wizard_menu():
-    """Wizard must be the FIRST menu entry — it's the friendliest
-    for newcomers, and 'first thing you see' is the right UX for
-    a wizard. (Make Ready and Blast a Flow come after for power
-    users.)"""
+    """Quick Start Wizard must still be reachable (it's a useful
+    alternative UI for the same engine) but v0.5.18 demoted it from
+    a top-level entry to the Advanced submenu so it doesn't compete
+    with ★ Setup DPDK for the operator's first-time attention.
+
+    Test pins: action exists, handler wired, AND appears under the
+    Advanced submenu definition (so we don't accidentally put it
+    back at top-level)."""
     from pathlib import Path
     src = (
         Path(__file__).resolve().parent.parent
@@ -1376,12 +1385,21 @@ def test_main_py_wires_quick_start_wizard_menu():
     ).read_text()
     assert "Quick Start Wizard..." in src
     assert "show_dpdk_quick_start_wizard" in src
+    # v0.5.18: Quick Start lives under the Advanced submenu now.
+    # The order constraint is: Advanced submenu defined first, then
+    # Quick Start added to it.
+    pos_advanced = src.find("dpdk_advanced_menu")
     pos_wizard = src.find("Quick Start Wizard...")
-    pos_make_ready = src.find("Make DPDK Ready...")
+    pos_setup = src.find("Setup DPDK")
     pos_blast = src.find("Blast a Flow...")
-    assert pos_wizard < pos_make_ready < pos_blast, (
-        f"Menu order regressed: Wizard ({pos_wizard}) → Make Ready "
-        f"({pos_make_ready}) → Blast ({pos_blast}) is required"
+    assert pos_advanced > 0, (
+        "v0.5.18 should have created a dpdk_advanced_menu — Quick "
+        "Start Wizard belongs in there, not at the top level."
+    )
+    assert pos_setup < pos_blast < pos_advanced < pos_wizard, (
+        f"Menu order regressed: ★ Setup DPDK ({pos_setup}) → "
+        f"Blast ({pos_blast}) → Advanced submenu ({pos_advanced}) → "
+        f"Quick Start within Advanced ({pos_wizard}) is required."
     )
 
 

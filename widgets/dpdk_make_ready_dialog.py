@@ -86,6 +86,13 @@ class _StepRow(QListWidgetItem):
         }.get(self._state, _PENDING)
         label = self._action.label
         note = getattr(self, "_note", "")
+        # v0.5.18: append ETA to pending/running rows so operators
+        # see "5-10 min" before clicking Run, not 8 minutes in.
+        # Once the step completes (ok/fail/skip) the ETA becomes
+        # irrelevant — drop it to keep the row clean.
+        eta = getattr(self._action, "eta", "") or ""
+        if eta and self._state in ("pending", "running"):
+            label = f"{label}  [{eta}]"
         suffix = f"  — {note}" if note else ""
         self.setText(f"  {icon}  {label}{suffix}")
         # Colour the state — green ok, red fail, grey skip.

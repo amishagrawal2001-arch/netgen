@@ -86,6 +86,11 @@ class Action:
     # us verify the action actually achieved its goal instead of
     # trusting the HTTP 200.
     satisfies_keys: List[str] = field(default_factory=list)
+    # v0.5.18: human-readable duration estimate shown in the wizard so
+    # operators know what they're getting into. Example values:
+    # "5-10 min" (DPDK build), "<1 sec" (modprobe), "few sec + REBOOT"
+    # (IOMMU). Empty string = no estimate displayed.
+    eta: str = ""
 
 
 # ─────────────────────────────────── decision tree
@@ -190,6 +195,7 @@ def plan(
             },
             needs_reboot=False,
             satisfies_keys=["dpdk_installed", "tx_worker_exists"],
+            eta="5-10 min (apt + DPDK clone + meson + ninja)",
         ))
 
     # 2. IOMMU. Required for vfio-pci to attach NICs. Touches the
@@ -213,6 +219,7 @@ def plan(
             body=iommu_body,
             needs_reboot=True,
             satisfies_keys=["iommu_enabled"],
+            eta="<5 sec + REBOOT (~1-2 min for host to come back)",
         ))
 
     # 3. Load vfio + vfio-pci modules. modprobe-based; takes effect
@@ -227,6 +234,7 @@ def plan(
             body={},
             needs_reboot=False,
             satisfies_keys=["vfio_loaded", "vfio_pci_loaded"],
+            eta="<1 sec (modprobe)",
         ))
 
     # 4. Allocate hugepages. /sys/kernel/mm/hugepages tunable —
@@ -264,6 +272,7 @@ def plan(
             },
             needs_reboot=False,
             satisfies_keys=["hugepages_configured"],
+            eta="<2 sec (write /sys + persist to /etc/sysctl.d)",
         ))
 
     # 5. Bind interface. ALWAYS included — even if there are bound
@@ -282,6 +291,7 @@ def plan(
         body={},  # GUI fills in "interface" before running
         needs_reboot=False,
         satisfies_keys=[],
+        eta="<5 sec (per NIC) + GUI picker time",
     ))
 
     return out

@@ -1395,36 +1395,37 @@ class TrafficGeneratorClient(
         dpdk_menu.setToolTipsVisible(True)
         tools_menu.addMenu(dpdk_menu)
 
-        # v0.3.11: three one-click DPDK orchestrators at the top of
-        # the menu — pick by user familiarity:
+        # v0.5.18: menu restructured from 10 flat items into 3 tiers
+        # (primary / diagnostics / advanced). Pre-v0.5.18 the menu had
+        # Quick Start Wizard + Make DPDK Ready as separate top-level
+        # items + 5 atomic actions cluttering the bottom — operator
+        # confusion about which to pick was operator-reported. After:
         #
-        #   * Quick Start Wizard — first-timer / guided. Multi-page
-        #     wizard explaining each step before it runs.
-        #   * Make DPDK Ready — power user / "do the right thing
-        #     and tell me when it's done".
-        #   * Blast a Flow — demo / smoke-test. Make ready + start
-        #     a sample 64 B UDP line-rate flow in one shot.
-        #
-        # All three share the same orchestrator engine
-        # (utils.dpdk_orchestrator) so behaviour is consistent.
-        dpdk_wizard_action = QAction("Quick Start Wizard...", self)
-        dpdk_wizard_action.setToolTip(
-            "First-timer setup. Multi-step wizard walks you through "
-            "DPDK install / IOMMU / VFIO / hugepages / NIC bind with "
-            "explanations and Skip options at each step."
-        )
-        dpdk_wizard_action.triggered.connect(self.show_dpdk_quick_start_wizard)
-        dpdk_menu.addAction(dpdk_wizard_action)
+        #   ★ Setup DPDK                  — primary entry point
+        #     Blast a Flow                — separate use case
+        #     ─────────
+        #     Diagnostics                 — merged Status + Verify
+        #     ─────────
+        #     Advanced ▸                  — submenu with atomic actions
+        #         Quick Start Wizard      —   guided per-step alternative
+        #         Bind / Unbind Interface
+        #         Configure Hugepages
+        #         Configure IOMMU
+        #         Load VFIO Modules
 
-        dpdk_make_ready_action = QAction("Make DPDK Ready...", self)
-        dpdk_make_ready_action.setToolTip(
-            "One-click orchestrator: surveys the server, then runs "
-            "install → IOMMU → VFIO modules → hugepages → bind a NIC "
-            "in sequence. Skips already-completed steps. Pauses on "
-            "reboot (IOMMU). For power users — no narrative; just runs."
+        # ─── primary: one-click setup ──────────────────────────────
+        dpdk_setup_action = QAction("★ Setup DPDK...", self)
+        dpdk_setup_action.setToolTip(
+            "One-click DPDK setup. Surveys the server, runs install → "
+            "IOMMU → VFIO → hugepages → NIC bind in sequence. Skips "
+            "already-completed steps. Pauses on reboot.\n\n"
+            "Total time: ~5-15 min on a fresh host (most of it is the "
+            "DPDK source build).\n\n"
+            "First-time / guided alternative: Advanced → Quick Start "
+            "Wizard."
         )
-        dpdk_make_ready_action.triggered.connect(self.show_dpdk_make_ready_dialog)
-        dpdk_menu.addAction(dpdk_make_ready_action)
+        dpdk_setup_action.triggered.connect(self.show_dpdk_make_ready_dialog)
+        dpdk_menu.addAction(dpdk_setup_action)
 
         dpdk_blast_flow_action = QAction("Blast a Flow...", self)
         dpdk_blast_flow_action.setToolTip(
@@ -1439,12 +1440,42 @@ class TrafficGeneratorClient(
 
         dpdk_menu.addSeparator()
 
-        dpdk_status_action = QAction("Status...", self)
-        dpdk_status_action.setToolTip(
-            "Show DPDK installation, hugepage, IOMMU, and per-NIC binding status on the selected server."
+        # ─── diagnostics (read-only) ───────────────────────────────
+        dpdk_diagnostics_action = QAction("Diagnostics...", self)
+        dpdk_diagnostics_action.setToolTip(
+            "Read-only DPDK status + verify. Two tabs:\n"
+            "  • Status — what's installed (libdpdk / IOMMU / VFIO / "
+            "hugepages / per-NIC binding)\n"
+            "  • Verify — check that DPDK binaries, drivers, and "
+            "tx_worker are present and functional\n\n"
+            "Doesn't change anything. Use Setup DPDK to fix issues."
         )
-        dpdk_status_action.triggered.connect(self.show_dpdk_status)
-        dpdk_menu.addAction(dpdk_status_action)
+        dpdk_diagnostics_action.triggered.connect(self.show_dpdk_diagnostics)
+        dpdk_menu.addAction(dpdk_diagnostics_action)
+
+        dpdk_menu.addSeparator()
+
+        # ─── advanced (atomic actions for scripted/manual use) ─────
+        dpdk_advanced_menu = QMenu("Advanced", self)
+        dpdk_advanced_menu.setToolTipsVisible(True)
+        dpdk_advanced_menu.setToolTip(
+            "Individual DPDK actions. Use these for scripted setups, "
+            "kernel-update recovery, or per-NIC tweaks. For first-time "
+            "or routine setup, use ★ Setup DPDK instead."
+        )
+        dpdk_menu.addMenu(dpdk_advanced_menu)
+
+        dpdk_wizard_action = QAction("Quick Start Wizard...", self)
+        dpdk_wizard_action.setToolTip(
+            "Guided per-step alternative to ★ Setup DPDK. Same engine, "
+            "but laid out as a multi-page wizard with Skip checkboxes "
+            "at each step. Use when you want to see/adjust each phase "
+            "before committing."
+        )
+        dpdk_wizard_action.triggered.connect(self.show_dpdk_quick_start_wizard)
+        dpdk_advanced_menu.addAction(dpdk_wizard_action)
+
+        dpdk_advanced_menu.addSeparator()
 
         dpdk_bind_action = QAction("Bind Interface...", self)
         dpdk_bind_action.setToolTip(
@@ -1452,23 +1483,16 @@ class TrafficGeneratorClient(
             "Requires IOMMU enabled."
         )
         dpdk_bind_action.triggered.connect(self.bind_interface_to_dpdk)
-        dpdk_menu.addAction(dpdk_bind_action)
+        dpdk_advanced_menu.addAction(dpdk_bind_action)
 
         dpdk_unbind_action = QAction("Unbind Interface...", self)
         dpdk_unbind_action.setToolTip(
             "Release a DPDK-bound NIC back to the kernel network driver."
         )
         dpdk_unbind_action.triggered.connect(self.unbind_interface_from_dpdk)
-        dpdk_menu.addAction(dpdk_unbind_action)
+        dpdk_advanced_menu.addAction(dpdk_unbind_action)
 
-        dpdk_menu.addSeparator()
-
-        dpdk_verify_action = QAction("Verify Installation", self)
-        dpdk_verify_action.setToolTip(
-            "Check that DPDK binaries, drivers, and tx_worker are present on the server."
-        )
-        dpdk_verify_action.triggered.connect(self.verify_dpdk)
-        dpdk_menu.addAction(dpdk_verify_action)
+        dpdk_advanced_menu.addSeparator()
 
         dpdk_hugepages_action = QAction("Configure Hugepages...", self)
         dpdk_hugepages_action.setToolTip(
@@ -1476,23 +1500,21 @@ class TrafficGeneratorClient(
             "memory available to other workloads (VMs, containers)."
         )
         dpdk_hugepages_action.triggered.connect(self.configure_hugepages)
-        dpdk_menu.addAction(dpdk_hugepages_action)
-
-        dpdk_menu.addSeparator()
+        dpdk_advanced_menu.addAction(dpdk_hugepages_action)
 
         dpdk_iommu_action = QAction("Configure IOMMU...", self)
         dpdk_iommu_action.setToolTip(
             "Enable IOMMU in the bootloader (intel_iommu=on / amd_iommu=on). Requires a server reboot."
         )
         dpdk_iommu_action.triggered.connect(self.configure_iommu)
-        dpdk_menu.addAction(dpdk_iommu_action)
+        dpdk_advanced_menu.addAction(dpdk_iommu_action)
 
         dpdk_load_modules_action = QAction("Load VFIO Modules", self)
         dpdk_load_modules_action.setToolTip(
             "modprobe vfio, vfio-pci, and vfio_iommu_type1 on the selected server."
         )
         dpdk_load_modules_action.triggered.connect(self.load_vfio_modules)
-        dpdk_menu.addAction(dpdk_load_modules_action)
+        dpdk_advanced_menu.addAction(dpdk_load_modules_action)
 
         # v0.3.12: RDMA submenu — sibling of DPDK. Drives perftest
         # (ib_send_bw / ib_write_bw / ib_read_bw + _lat variants)

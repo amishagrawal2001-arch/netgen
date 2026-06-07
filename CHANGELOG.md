@@ -2,6 +2,146 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.18] - 2026-06-07
+
+**Tools → DPDK menu restructured + 5 ergonomic optimizations.**
+Operator-driven cleanup of the menu we just spent v0.5.15→v0.5.17
+fixing functionally. Same engine — better menu / better feedback.
+
+Full suite: 1,596 passed, 1 skipped (+16 new tests in
+`test_v0518_dpdk_menu_optimizations.py`, 2 existing tests updated
+for new menu layout).
+
+### Why this release
+
+Operator question that prompted the work: "what is the difference
+between Make Server Ready, Quick Start, DPDK Status, Configure
+IOMMU, Load VFIO?" — there shouldn't BE a difference to think
+about. The menu had 10 flat items with overlapping responsibilities
+(two wizards doing the same thing, two read-only dialogs, 5 atomic
+actions cluttering the top level).
+
+### What changed
+
+**1. Menu restructured** — 10 flat items → 3 tiers:
+
+Before:
+```
+Tools → DPDK
+├── Quick Start Wizard...
+├── Make DPDK Ready...
+├── Blast a Flow...
+├── ─────────
+├── Status...
+├── Bind / Unbind Interface...
+├── ─────────
+├── Verify Installation
+├── Configure Hugepages...
+├── ─────────
+├── Configure IOMMU...
+└── Load VFIO Modules
+```
+
+After:
+```
+Tools → DPDK
+├── ★ Setup DPDK...              ← single canonical entry
+├── Blast a Flow...
+├── ─────────
+├── Diagnostics...               ← Status + Verify merged
+├── ─────────
+└── Advanced ▸                   ← atomic actions submenu
+    ├── Quick Start Wizard...    ← demoted (alternative UI)
+    ├── Bind / Unbind Interface...
+    ├── Configure Hugepages...
+    ├── Configure IOMMU...
+    └── Load VFIO Modules
+```
+
+`★ Setup DPDK` is `show_dpdk_make_ready_dialog` under the hood —
+zero engine changes. Quick Start Wizard is still reachable but
+under Advanced where first-time operators won't trip over the
+two-wizards confusion.
+
+**2. Diagnostics dialog** — new `widgets/dpdk_diagnostics_dialog.py`
+merges what were two separate dialogs (Status full, Verify quick
+4-check) into one with tabs. Operator opens one menu item, sees
+both views. No more "which one do I click?"
+
+**3. Time estimates in wizard rows** — `Action.eta` (new field on
+the orchestrator's dataclass) is rendered in the `_StepRow`
+pending/running label. So the wizard now shows:
+
+```
+●  Install DPDK runtime + build tx_worker  [5-10 min (apt + DPDK clone + meson + ninja)]
+○  Enable IOMMU in kernel cmdline  [<5 sec + REBOOT (~1-2 min for host to come back)]
+○  Load vfio + vfio-pci kernel modules  [<1 sec (modprobe)]
+○  Allocate 1024 × 2MB hugepages  [<2 sec (write /sys + persist to /etc/sysctl.d)]
+○  Bind a NIC to vfio-pci  [<5 sec (per NIC) + GUI picker time]
+```
+
+Operators see what they're getting into before clicking Run, not 8
+minutes in. Eta disappears once the row transitions to ok/fail/skip
+to keep the post-completion view clean.
+
+**4. Shared TTL cache for `/api/dpdk/status`** —
+`get_cached_dpdk_status` / `cache_dpdk_status` /
+`invalidate_dpdk_status_cache` in `traffic_client.dpdk_menu_actions`.
+
+* Status-bar chip's 30s poll populates the cache
+* Diagnostics dialog hits the cache before doing fresh HTTP
+* `_DpdkApiWorker.run()` auto-invalidates on any successful POST
+  to `/api/dpdk/*` or `/api/admin/install_dpdk` so stale state
+  doesn't survive a bind / unbind / hugepages-change
+
+Cuts ~500ms off dialog opens when the chip just polled. Mutation
+invalidation means the next read always reflects current state.
+
+**5. Status-bar chip tooltip leads with "Missing: ..."** — pre-
+v0.5.18 the tooltip enumerated each subsystem with its state
+(libdpdk: ok, tx_worker: missing, ...) — useful but you had to
+read all 5 rows to figure out what was wrong. Now:
+
+```
+Missing: DPDK libs, tx_worker — click chip to open ★ Setup DPDK
+
+DPDK readiness:
+  • DPDK libraries: missing
+  • tx_worker binary: missing
+  • Hugepages: not allocated
+  • IOMMU: off
+  • vfio-pci: not loaded
+```
+
+One-glance diagnosis instead of 5-row read.
+
+### What this doesn't change
+
+* No server-side changes (no new endpoints; cache is client-side
+  only; eta is client-side metadata)
+* Same orchestrator engine, same wizards, same atomic actions
+* Operators can still find every old menu item (Quick Start is
+  under Advanced, Status/Verify are inside Diagnostics)
+* No protocol or stream behavior changes
+
+### Tests
+
+16 new regression tests in
+`tests/test_v0518_dpdk_menu_optimizations.py` pin every contract:
+* Menu has ★ Setup DPDK at top, Diagnostics next, Advanced ▸
+  submenu at bottom
+* Advanced submenu contains Quick Start + all 5 atomic actions
+* `DpdkDiagnosticsDialog` exists with QTabWidget + queries both
+  endpoints + uses TTL cache
+* `Action.eta` field exists; INSTALL_DPDK has min/sec ETA; IOMMU
+  has REBOOT warning in ETA
+* `_StepRow._render` includes eta in pending/running labels
+* Cache helpers exist; TTL is sane (30s); POST mutations invalidate
+* Chip tooltip has "Missing:" summary line; chip populates cache
+
+2 existing tests updated for new menu layout (Make DPDK Ready
+renamed to ★ Setup DPDK; Quick Start moved to Advanced submenu).
+
 ## [0.5.17] - 2026-06-07
 
 **Make DPDK Ready wizard now waits for `install_dpdk.sh` to ACTUALLY
