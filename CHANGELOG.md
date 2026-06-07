@@ -2,6 +2,128 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.12] - 2026-06-07
+
+**ostg-server (and every other entry-point script pip installed)
+now has a shebang that actually resolves on the operator's host.**
+
+Full suite: 1,540 passed, 1 skipped (+4 new tests).
+
+### Operator-reported
+
+san-hp-srv06 after v0.5.11's FRR build + diagnostic dump landed. The
+install completed FRR cleanly, then `_verify_running()` timed out.
+The new v0.5.11 diagnostic dump made the cause obvious:
+
+```
+[VERIFY] Server did not respond on http://localhost:5050/api/health within 60s.
+[VERIFY] Diagnostic dump follows ──
+$ journalctl -u netgen-server.service -n 30 --no-pager
+Failed to execute /opt/netgen-server/netgen-venv/bin/ostg-server:
+  No such file or directory
+netgen-server.service: Main process exited, code=exited, status=203/EXEC
+$ ss -tlnp sport = :5050
+(empty — nothing listening)
+$ systemctl is-active ostg-server.service
+inactive
+```
+
+Exit code 203/EXEC is Linux's "shebang interpreter missing"
+signal. The `ostg-server` script existed; its shebang was:
+
+```
+#!/home/runner/work/netgen/netgen/netgen-server-0.5.11/netgen-venv/bin/python3
+```
+
+That path only exists on the GitHub Actions runner.
+
+### Root cause
+
+v0.5.7 fixed shebangs for `bin/netgen-install`, `bin/netgen-upgrade`,
+`bin/netgen-uninstall` — the three scripts the CI workflow's step
+5 explicitly rewrites with `sed -i '1s|.*|#!/opt/netgen-server/
+netgen-venv/bin/python|'`.
+
+That rewrite covered the install scripts but MISSED the dozens of
+entry-point scripts pip installs in `netgen-venv/bin/`:
+`ostg-server`, `ostg-client`, `netgen-cli`, `ostg-docker-install`,
+`pip`, `pip3`, `flask`, `pytest`, etc. All of those had CI-runner
+shebangs.
+
+systemd `ExecStart=/opt/netgen-server/netgen-venv/bin/ostg-server`
+→ kernel loads the script → reads `#!/home/runner/...` → execs
+that interpreter → ENOENT → 203/EXEC.
+
+### Fix
+
+CI workflow step 3b (new): after `pip install` lands the wheel,
+walk every file in `netgen-venv/bin/`, detect CI-runner shebangs,
+and rewrite them to `#!/opt/netgen-server/netgen-venv/bin/python`
+(which is a relative symlink to `../../python-runtime/bin/python3`
+thanks to v0.5.7, so it resolves at any extract location).
+
+Plus a post-rewrite guard: `grep -l '^#!/home/runner' netgen-venv/
+bin/*` must come up empty. If anything leaked through, fail the
+build loudly.
+
+Plus round-trip step (which extracts to a fresh location and
+revalidates): for each of `ostg-server`, `ostg-client`, `netgen-cli`,
+`ostg-docker-install`, confirm the shebang's interpreter is an
+executable file at the extract location. Mirrors what systemd's
+ExecStart will do — catches the regression class regardless of
+which specific shebang pattern slipped through.
+
+4 regression tests pin all three contracts.
+
+### Operator-side note
+
+When an operator runs `netgen-upgrade /path/to/new.whl`, pip
+generates fresh shebangs based on the venv's own python
+(`/opt/netgen-server/netgen-venv/bin/python`) — those are already
+correct. The bug only affected the CI initial-build flow's pip
+invocation, where pip's `sys.executable` was the staging path.
+
+### Operator workflow for srv06 right now
+
+Quick fix without re-downloading:
+
+```bash
+ssh root@san-hp-srv06 << 'EOF'
+for f in /opt/netgen-server/netgen-venv/bin/{ostg-server,ostg-client,netgen-cli,ostg-docker-install}; do
+  [ -f "$f" ] && sudo sed -i "1s|.*|#!/opt/netgen-server/netgen-venv/bin/python|" "$f"
+done
+systemctl restart netgen-server.service
+sleep 5
+curl -s http://localhost:5050/api/health
+EOF
+```
+
+That should return `{"netgen_version":"0.5.11", ...}` and srv06 is
+fully online. FRR is already built (from the v0.5.11 install run);
+the v0.5.11 install + this manual shebang fix = working v0.5.11
+server.
+
+For a clean v0.5.12 install: download Netgen-TrafficGenerator-0.5.12
+client, Fresh Install via SSH with the v0.5.12 tarball.
+
+### Pattern (continued)
+
+7th consecutive release this session. The v0.5.7 fix was correct
+for what it covered (the 3 install scripts in `bin/`), but missed
+the much larger surface in `netgen-venv/bin/`. CI didn't catch it
+because the round-trip step only verified `bin/netgen-install`'s
+shebang chain — not the entry-point scripts pip lays down inside
+the venv.
+
+Codified rule extension:
+
+> CI must validate the shebang of every script systemd or systemd-
+> like external tools could exec. Not just the install scripts.
+
+Round-trip step now does that for ostg-server (systemd ExecStart
+target), and the entry-point pattern covers any future pip-installed
+scripts that match the same shape.
+
 ## [0.5.11] - 2026-06-07
 
 **FRR Docker build now finds its sibling files. Plus install log

@@ -249,6 +249,71 @@ jobs:
           "$ROOT/netgen-venv/bin/pip" install --no-cache-dir --upgrade pip
           "$ROOT/netgen-venv/bin/pip" install --no-cache-dir --force-reinstall "$WHEEL"
 
+          # 3b. v0.5.12 fix: rewrite ALL CI-runner shebangs in
+          # netgen-venv/bin/* to point at the relocated install path.
+          #
+          # pip writes console_scripts entry points with the absolute
+          # path of whichever python created the venv:
+          #
+          #   $ head -1 netgen-venv/bin/ostg-server
+          #   #!/home/runner/work/netgen/netgen/netgen-server-X.Y.Z/
+          #     netgen-venv/bin/python3
+          #
+          # On the operator's host that path doesn't exist. systemd
+          # tries ExecStart=.../netgen-venv/bin/ostg-server, the
+          # kernel loads the script, reads the shebang, fails to
+          # exec /home/runner/... — reports:
+          #
+          #   ostg-server: No such file or directory
+          #   exit-code 203/EXEC
+          #
+          # Operator-reported on srv06 (v0.5.11) — netgen-install's
+          # _verify_running() diagnostic dump caught it:
+          #
+          #   journalctl shows: Failed to execute /opt/netgen-server/
+          #     netgen-venv/bin/ostg-server: No such file or directory
+          #
+          # v0.5.7 fixed the shebang for bin/netgen-install (and
+          # netgen-upgrade, netgen-uninstall) at step 5 below — but
+          # NOT for the dozens of entry-point scripts pip drops in
+          # netgen-venv/bin/ (ostg-server, ostg-client, netgen-cli,
+          # ostg-docker-install, pip, pip3, flask, etc.). All of
+          # those had CI-runner shebangs.
+          #
+          # Same fix shape as v0.5.7: rewrite to the canonical
+          # /opt/netgen-server/netgen-venv/bin/python (which is
+          # already a relative symlink to ../../python-runtime/bin/
+          # python3 thanks to v0.5.7, so it resolves at any extract
+          # location).
+          echo "Rewriting CI-runner shebangs in netgen-venv/bin/* ..."
+          REWROTE=0
+          for script in "$ROOT/netgen-venv/bin"/*; do
+            [ -f "$script" ] || continue
+            [ -L "$script" ] && continue
+            # Read first 4 bytes; bail if not a #! script.
+            head -c 2 "$script" 2>/dev/null | grep -q '^#!' || continue
+            shebang=$(head -1 "$script")
+            case "$shebang" in
+              *netgen-server-*/netgen-venv/bin/python*)
+                sed -i '1s|.*|#!/opt/netgen-server/netgen-venv/bin/python|' "$script"
+                REWROTE=$((REWROTE + 1))
+                ;;
+            esac
+          done
+          echo "  rewrote $REWROTE script shebangs"
+          # Verify NO scripts left with CI-runner shebangs.
+          LEAKED=$(
+            grep -l '^#!/home/runner' "$ROOT/netgen-venv/bin"/* 2>/dev/null || true
+          )
+          if [ -n "$LEAKED" ]; then
+            echo "ERROR: scripts still have CI-runner shebangs after rewrite:"
+            echo "$LEAKED" | while read -r f; do
+              echo "  $(basename "$f"): $(head -1 "$f")"
+            done
+            exit 1
+          fi
+          echo "  no CI-runner paths leaked through"
+
           # 4. Resources + Docker assets that the runtime expects.
           #
           # v0.5.10 fix: PRESERVE the `resources/` parent dir, not
@@ -646,6 +711,49 @@ jobs:
             exit 1
           fi
           echo "✓ FRR Docker build context complete"
+
+          # v0.5.12: verify the systemd ExecStart target shebang
+          # resolves. This is the exact path systemd will try to
+          # exec — if its shebang interpreter is missing, the
+          # service is dead before it ever opens port 5050.
+          #
+          # Operator-reported on srv06 (v0.5.11):
+          #   Failed to execute /opt/netgen-server/netgen-venv/bin/
+          #     ostg-server: No such file or directory (203/EXEC)
+          #
+          # Without this CI gate, the next operator hits the same
+          # trap on the next regression.
+          echo "Verifying ostg-server shebang resolves..."
+          for entry in ostg-server ostg-client netgen-cli ostg-docker-install; do
+            f="$EXTRACTED/netgen-venv/bin/$entry"
+            [ -f "$f" ] || continue
+            shebang=$(head -1 "$f")
+            case "$shebang" in
+              "#!/home/runner"*)
+                echo "ERROR: $entry shebang still points at CI runner:"
+                echo "       $shebang"
+                exit 1
+                ;;
+              "#!"*)
+                # Verify the interpreter path resolves to an actual
+                # executable file from the extracted location.
+                interp=${shebang#\#!}
+                # Strip any args (e.g. `python -u` → `python`).
+                interp=${interp%% *}
+                if [ ! -x "$interp" ]; then
+                  echo "ERROR: $entry shebang interpreter not executable:"
+                  echo "       interpreter: $interp"
+                  echo "       shebang:     $shebang"
+                  exit 1
+                fi
+                echo "  ✓ $entry → $interp (executable)"
+                ;;
+              *)
+                echo "ERROR: $entry has no shebang or is not a script"
+                exit 1
+                ;;
+            esac
+          done
 
           # Show the final size profile for sanity.
           du -sh "$EXTRACTED"
