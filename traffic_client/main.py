@@ -1169,20 +1169,14 @@ class TrafficGeneratorClient(
         """Set up the menu bar for server and stream management."""
         menu_bar = self.menuBar()
 
-        # File menu
+        # File menu — session + topology I/O. v0.4.9: Add/Remove
+        # TGen Chassis used to live here too (top of File menu), but
+        # they're chassis-management actions, not file actions —
+        # operators kept hunting for them under Server. Moved to the
+        # top of the Server menu (below). The Ctrl+N shortcut moves
+        # with them.
         file_menu = QMenu("&File", self)
         menu_bar.addMenu(file_menu)
-
-        add_server_action = QAction("Add TGEN Chassis...", self)
-        add_server_action.setShortcut(QKeySequence("Ctrl+N"))
-        add_server_action.triggered.connect(self.add_server_interface)
-        file_menu.addAction(add_server_action)
-
-        remove_server_action = QAction("Remove TGEN Chassis", self)
-        remove_server_action.triggered.connect(self.remove_selected_server)
-        file_menu.addAction(remove_server_action)
-
-        file_menu.addSeparator()
 
         save_session_action = QAction("Save Session", self)
         save_session_action.setShortcut(QKeySequence.Save)
@@ -1302,9 +1296,25 @@ class TrafficGeneratorClient(
         paste_device_action.triggered.connect(self.paste_device_to_interface)
         edit_menu.addAction(paste_device_action)
 
-        # Server menu — chassis-level actions (online state, restart, reboot)
+        # Server menu — chassis-level actions (add/remove, online
+        # state, restart, reboot). v0.4.9: Add/Remove TGen Chassis
+        # moved here from the File menu — they're chassis-management
+        # actions, not file I/O, and operators kept looking for them
+        # under Server (where every other TGen action lives). The
+        # Ctrl+N shortcut comes along for the ride.
         server_menu = QMenu("&Server", self)
         menu_bar.addMenu(server_menu)
+
+        add_server_action = QAction("Add TGEN Chassis...", self)
+        add_server_action.setShortcut(QKeySequence("Ctrl+N"))
+        add_server_action.triggered.connect(self.add_server_interface)
+        server_menu.addAction(add_server_action)
+
+        remove_server_action = QAction("Remove TGEN Chassis", self)
+        remove_server_action.triggered.connect(self.remove_selected_server)
+        server_menu.addAction(remove_server_action)
+
+        server_menu.addSeparator()
 
         self.make_server_online_action = QAction("Make Selected Servers Online", self)
         self.make_server_online_action.setEnabled(False)

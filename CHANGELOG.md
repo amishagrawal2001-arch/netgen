@@ -2,6 +2,80 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.4.9] - 2026-06-07
+
+**Two small fixes surfaced by the v0.4.8 fresh-install log: UX
+polish on the menu structure and a Ubuntu 24.04 apt-batch failure.**
+
+Full suite: **1,447 passed, 1 skipped** (+9 new tests).
+
+### Fix 1 — Add / Remove TGEN Chassis moved File → Server menu
+
+Operator-reported: kept hunting for "Add TGEN Chassis…" under
+the Server menu, since every other TGen-management action (Make
+Online / Mark Offline / Restart Service / Reboot Physical)
+already lives there. Top-of-File-menu was a leftover from when
+the app had only "Add Chassis" + "Save Session" and the
+distinction didn't matter.
+
+Moved both actions (plus the Ctrl+N shortcut) to the top of the
+Server menu, with a separator between them and the online-state
+actions. New Server menu shape:
+
+```
+Server
+├── Add TGEN Chassis...  (Ctrl+N)   ← was under File
+├── Remove TGEN Chassis              ← was under File
+├── ─────────────
+├── Make Selected Servers Online
+├── Mark Selected Servers Offline
+├── ─────────────
+├── Restart TGEN Service...
+└── Reboot Physical Server...
+```
+
+Pinned by `tests/test_v049_tgen_actions_under_server_menu.py`
+(6 tests): both QActions constructed inside the Server-menu
+source block, File menu has zero references, Ctrl+N stays
+adjacent to the action, ordering is Add → Remove → separator →
+online-state actions.
+
+### Fix 2 — `netcat` virtual-package failure on Ubuntu 24.04
+
+From the v0.4.8 fresh-install log on a clean Noble box:
+
+```
+E: Package 'netcat' has no installation candidate
+[WARNING] Package installation encountered issues:
+   ... returned non-zero exit status 100.
+```
+
+On Ubuntu 24.04 (Noble) `netcat` is a **virtual** package —
+provided by `netcat-openbsd` or `netcat-traditional` with no
+default. apt's batch install bails with rc=100 on the missing
+candidate, killing the whole 60-package system-deps install.
+
+The installer continued (failure here is correctly downgraded to
+WARNING since netgen doesn't strictly need every userspace tool),
+but the operator-facing log was confusing and some tools were
+silently missing.
+
+`install_ostg_complete.py:_install_apt_packages` already had this
+right in the apk (Alpine) branch with `netcat-openbsd`. v0.4.9
+aligns the apt branch. The zypper (openSUSE) branch's bare
+`netcat` stays — SUSE has a real package by that name, distinct
+from the Debian-family virtual-package split.
+
+Pinned by `tests/test_v049_netcat_package_noble.py` (3 tests):
+apt branch uses `netcat-openbsd`, apk branch keeps
+`netcat-openbsd`, zypper branch keeps bare `netcat`.
+
+### Operator action
+
+GUI Fresh Install on v0.4.9 will run a clean system-deps apt batch
+(no rc=100 warning) and the Add/Remove TGen actions land where
+operators look for them.
+
 ## [0.4.8] - 2026-06-07
 
 **Fresh install on a clean host now actually installs the wheel's

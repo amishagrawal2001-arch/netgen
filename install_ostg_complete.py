@@ -625,7 +625,15 @@ class NetgenInstaller:
             "libncurses5-dev", "libncursesw5-dev", "xz-utils", "tk-dev", "libxml2-dev",
             "libxmlsec1-dev", "liblzma-dev", "iputils-ping", "tcpdump", "wireshark-common",
             "vim", "nano", "htop", "tree", "jq", "unzip", "sysstat", "iotop",
-            "nmap", "netcat", "socat", "bridge-utils", "vlan", "nethogs", "iftop",
+            # v0.4.9: was bare "netcat" — on Ubuntu 24.04 (Noble) that's
+            # a virtual package with no install candidate, so
+            # `apt-get install ... netcat` returns rc=100 and the
+            # WHOLE batch fails. The other branches of this function
+            # already use netcat-openbsd; aligning this one too.
+            # Operator-reported on a fresh Noble install: the whole
+            # system-deps apt batch bailed with `E: Package 'netcat'
+            # has no installation candidate`.
+            "nmap", "netcat-openbsd", "socat", "bridge-utils", "vlan", "nethogs", "iftop",
             "yq", "zip", "tar", "gzip", "traceroute", "mtr-tiny", "openssh-client", "openssh-server"
         ]
         
