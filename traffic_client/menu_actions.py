@@ -152,6 +152,16 @@ class TrafficGenClientMenuAction():
             return self._add_server_interface_legacy()
 
         dlg = AddTGenDialog(self)
+        # v0.5.16: when operator clicks Reboot Physical Server, mark
+        # the matching server offline IMMEDIATELY so periodic pollers
+        # stop spamming the dead host while it reboots. Without this
+        # the LED stays green for ~60s (until health-fail-count
+        # threshold) and stats workers pile up issuing 7s-retrying
+        # requests = intermittent UI freezing.
+        try:
+            dlg.server_rebooted.connect(self._on_server_rebooted)
+        except Exception as e:
+            logger.debug(f"server_rebooted connect failed: {e}")
         dlg.exec_()
         # chosen_connections is the multi-target result list. Empty when
         # the user added entries to history only (clicked "Add to History"
@@ -233,6 +243,51 @@ class TrafficGenClientMenuAction():
                 self, "Already connected",
                 "These chassis were already in your active list and were "
                 "skipped:\n\n• " + "\n• ".join(skipped),
+            )
+
+    def _on_server_rebooted(self, host_port: str) -> None:
+        """v0.5.16: AddTGenDialog signaled that /api/system/reboot
+        returned 200 for `host_port`. Mark the matching server in
+        server_interfaces as offline IMMEDIATELY so:
+
+          * status LED flips red right away (operator sees the
+            server is going down — not still-green-and-lying)
+          * periodic stats / health pollers skip the dead host
+            (their filter is `online=True`), so workers stop
+            piling up issuing 7s-retrying requests against a
+            host that's about to disappear for 3-5 minutes
+        """
+        if not host_port:
+            return
+        try:
+            servers = getattr(self, "server_interfaces", []) or []
+        except Exception:
+            return
+        # The host_port format from the dialog is "<addr>:<port>".
+        # server_interfaces[i]["address"] is the full URL
+        # ("http://<addr>:<port>"). Match via substring.
+        target = host_port.strip()
+        flipped = 0
+        for srv in servers:
+            addr = srv.get("address") or ""
+            if target in addr:
+                srv["online"] = False
+                srv["health"] = None
+                srv["health_fail_count"] = 0  # reset so post-reboot
+                                              # health probes start fresh
+                try:
+                    if hasattr(self, "update_server_status_icon"):
+                        self.update_server_status_icon(srv, False)
+                except Exception as e:
+                    logger.debug(
+                        f"[REBOOT] status icon update failed for "
+                        f"{addr}: {e}"
+                    )
+                flipped += 1
+        if flipped:
+            logger.info(
+                f"[REBOOT] Marked {flipped} server(s) offline for "
+                f"{host_port} — pollers will skip until reachability returns"
             )
 
     def _add_server_interface_legacy(self):

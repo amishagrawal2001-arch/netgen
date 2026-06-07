@@ -31,10 +31,13 @@ else is plain JSON so it survives client upgrades / reinstalls.
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 from datetime import datetime
 from typing import Optional
+
+logger = logging.getLogger(__name__)
 
 from PyQt5.QtCore import Qt, QThread, QUrl, pyqtSignal
 from PyQt5.QtGui import QColor, QDesktopServices, QFont
@@ -200,6 +203,17 @@ class AddTGenDialog(QDialog):
     `chosen_auth`) are populated from the first entry of the list so
     callers from earlier in this branch keep working unchanged.
     """
+
+    # v0.5.16: emitted when /api/system/reboot returned 200. Carries
+    # the chassis address (host:port). The main window listens and
+    # marks the server offline immediately so pollers stop spamming
+    # the dead host while it reboots (3-5 min window). Without this,
+    # operators saw "app started freezing intermittently and server
+    # status still shows green" — the status LED only flipped after
+    # the periodic health poll's fail-count threshold (~60s post-
+    # reboot), and stats pollers kept burning 7s per request retrying
+    # against the unreachable server.
+    server_rebooted = pyqtSignal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -661,6 +675,18 @@ class AddTGenDialog(QDialog):
                     f"✓ Reboot scheduled on {addr}:{port} in 5s. "
                     f"Wait 3-5 minutes before reconnecting."
                 )
+                # v0.5.16: tell the main window this host is going
+                # away so pollers stop hitting it. Without this the
+                # status LED stays green for ~60s (until the health
+                # fail-count threshold kicks in) and stats workers
+                # pile up issuing 7s-retrying requests to the dead
+                # host, causing intermittent UI freezing.
+                try:
+                    self.server_rebooted.emit(f"{addr}:{port}")
+                except Exception as exc:
+                    logger.debug(
+                        f"[REBOOT] server_rebooted signal emit failed: {exc}"
+                    )
                 return
             if r.status_code == 404:
                 self.status_lbl.setText(

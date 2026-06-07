@@ -1803,15 +1803,37 @@ class TrafficGenClientServerSection():
                 # next rebuild fixes it.
                 continue
 
+    # v0.5.16: number of consecutive /api/admin/health failures
+    # before flipping a server to offline (LED red). With a 30s
+    # poll cadence this is ~60 s of unreachability before the LED
+    # changes — fast enough that a rebooting server (3-5 min) gets
+    # detected well before it returns, slow enough to absorb transient
+    # network blips without flicker.
+    HEALTH_OFFLINE_AFTER_N_FAILURES = 2
+
     def poll_server_health(self):
         """Periodic TGen service-health probe (fired by a timer in main.py).
 
         For each ONLINE server, fetch /api/admin/health in a background
-        thread and degrade its LED to amber when `degraded` is true (Flask
-        up but a subsystem unhealthy — e.g. DPDK installed with hugepages=0
-        or tx_worker missing). Reachability (green/red) is handled by the
-        interface-fetch probes; this only refines green↔amber for reachable
-        servers, so it never fights the offline detection.
+        thread.
+
+          * 200 + degraded=false → LED green (healthy)
+          * 200 + degraded=true → LED amber (degraded subsystem)
+          * non-200 / exception → counted toward health_fail_count;
+            at N consecutive failures the server flips to offline (LED
+            red). Reset to 0 on the next successful probe.
+
+        v0.5.16 fix: previously the exception path just `pass`ed,
+        leaving the LED green even when the server was unreachable
+        (e.g. mid-reboot). Operator-reported: "after server reboot
+        from the add tgen dialog, app started freezing intermittently
+        and server status still shows green". The fail-count threshold
+        below flips the LED to red after ~60s; stats pollers stop
+        spamming the dead host because they filter on online=True.
+
+        Also v0.5.16: uses ConnectionManager.quick_get() to skip the
+        Retry(total=3, backoff=1) cycle — was 7+s/request blocking
+        on a dead server.
         """
         try:
             servers = [s for s in getattr(self, "server_interfaces", []) if s.get("online")]
@@ -1821,7 +1843,8 @@ class TrafficGenClientServerSection():
             from PyQt5.QtCore import QThread, pyqtSignal
 
             class _ServerHealthWorker(QThread):
-                result = pyqtSignal(object, dict)  # (server_dict, health_json)
+                # (server_dict, health_json_or_None_on_failure, ok_bool)
+                result = pyqtSignal(object, object, bool)
 
                 def __init__(self, jobs, cm):
                     super().__init__()
@@ -1832,16 +1855,20 @@ class TrafficGenClientServerSection():
                     import requests as _rq
                     for srv, url in self._jobs:
                         try:
-                            if self._cm is not None:
+                            if self._cm is not None and hasattr(self._cm, "quick_get"):
+                                r = self._cm.quick_get(f"{url}/api/admin/health", timeout=4)
+                            elif self._cm is not None:
                                 r = self._cm.get(f"{url}/api/admin/health", timeout=4)
                             else:
                                 r = _rq.get(f"{url}/api/admin/health", timeout=4)
                             if r.status_code == 200:
-                                self.result.emit(srv, r.json() or {})
+                                self.result.emit(srv, r.json() or {}, True)
+                            else:
+                                self.result.emit(srv, None, False)
                         except Exception:
-                            # Unreachable mid-poll — leave reachability to
-                            # the interface probe; just skip health this tick.
-                            pass
+                            # Connection refused / DNS / timeout — count
+                            # as failure so the LED eventually flips.
+                            self.result.emit(srv, None, False)
 
             jobs = [(s, s.get("address")) for s in servers if s.get("address")]
             if not jobs:
@@ -1857,9 +1884,37 @@ class TrafficGenClientServerSection():
         except Exception as exc:
             logger.debug(f"[SERVER HEALTH] poll error: {exc}")
 
-    def _apply_server_health(self, server, health):
-        """Main-thread slot: store the health verdict + refresh the LED."""
+    def _apply_server_health(self, server, health, ok=True):
+        """Main-thread slot: store the health verdict + refresh the LED.
+
+        v0.5.16: third arg `ok` distinguishes a real 200 response from
+        a failure (connection refused, timeout, non-200). On failure
+        increment `health_fail_count`; flip offline at threshold.
+        """
         try:
+            if not ok:
+                # Failure — count toward offline threshold.
+                cur = int(server.get("health_fail_count") or 0) + 1
+                server["health_fail_count"] = cur
+                if cur >= self.HEALTH_OFFLINE_AFTER_N_FAILURES:
+                    if server.get("online"):
+                        logger.info(
+                            f"[SERVER HEALTH] {server.get('address')} "
+                            f"unreachable {cur}× — flipping offline"
+                        )
+                        server["online"] = False
+                        server["health"] = None
+                        try:
+                            self.update_server_status_icon(server, False)
+                        except Exception as exc:
+                            logger.debug(
+                                f"[SERVER HEALTH] status icon update "
+                                f"failed: {exc}"
+                            )
+                return
+            # Success path — reset the fail counter + apply health.
+            server["health_fail_count"] = 0
+            health = health or {}
             degraded = bool(health.get("degraded"))
             server["health"] = "degraded" if degraded else "healthy"
             server["health_issues"] = health.get("issues") or []

@@ -287,11 +287,37 @@ class ConnectionManager:
     def get(self, url: str, timeout: int = 5, **kwargs) -> requests.Response:
         """Make a GET request with connection pooling."""
         return self.session.get(url, timeout=timeout, **kwargs)
-    
+
+    def quick_get(self, url: str, timeout: int = 4, **kwargs) -> requests.Response:
+        """v0.5.16: NO-RETRY GET for periodic pollers.
+
+        Operator-reported: app freezes intermittently after rebooting
+        the server from Add TGen dialog. Root cause was the shared
+        session's Retry(total=3, backoff_factor=1) — each request to
+        the rebooting (= unreachable) server burned ~7 seconds before
+        failing. With multiple pollers firing every 2s, workers piled
+        up and the UI got starved on signal handling.
+
+        For periodic pollers (/api/admin/health, /api/streams/stats,
+        /api/interfaces during regular updates), we WANT fast failure
+        — the next tick will retry anyway. quick_get uses a fresh
+        request bypassing the retry-configured adapter, with a
+        DNS+connect+read timeout cap of `timeout` seconds (default 4).
+
+        User-initiated calls (test connection, manual probe) should
+        still use get() to benefit from retry on transient blips.
+        """
+        # requests.get without going through self.session = no
+        # mounted adapter = no Retry configuration. The cost: no
+        # connection pooling for these calls. Trade-off worth it
+        # because pollers are infrequent (every 2-30s) and pool
+        # reuse benefit is small vs. retry-induced freezing.
+        return requests.get(url, timeout=timeout, **kwargs)
+
     def post(self, url: str, timeout: int = 5, **kwargs) -> requests.Response:
         """Make a POST request with connection pooling."""
         return self.session.post(url, timeout=timeout, **kwargs)
-    
+
     def close(self):
         """Close the session and all connections."""
         self.session.close()

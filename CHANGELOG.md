@@ -2,6 +2,122 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.16] - 2026-06-07
+
+**Status LED flips red within seconds of Reboot Physical Server, and
+the app no longer freezes intermittently during the 3-5 min reboot
+window.**
+
+Full suite: 1,571 passed, 1 skipped (+11 new tests).
+
+### Operator-reported
+
+> after server reboot from the add tgen dialog, app started freezing
+> intermittently and server status still shows green
+
+### Two distinct root causes
+
+**1. Status LED stayed green** — `poll_server_health()` caught all
+exceptions and silently `pass`ed. The server's `online` flag never
+flipped, the LED kept showing green even though `/api/admin/health`
+was returning ECONNREFUSED.
+
+**2. App froze intermittently** —
+`ConnectionManager.get()` uses `Retry(total=3, backoff_factor=1)` on
+the shared session adapter. Each request to a dead server burned up
+to **~7 seconds** of retry-with-backoff before failing. With:
+
+* stats poll every 2 s → new worker spawns
+* health poll every 30 s → another worker
+* Each worker holds a session connection for ~7 s on a dead host
+* `pool_maxsize=20`, but workers signal back to the UI thread
+
+… the signal queue stacked up faster than the UI could drain it,
+producing the "intermittent freezing" feel during the entire reboot
+window.
+
+### Fix
+
+**A. `ConnectionManager.quick_get(url, timeout=4)`** — bypasses the
+retry-configured adapter entirely (uses bare `requests.get`). For
+periodic pollers where fast failure beats blocking retry. User-
+initiated calls (test connection, manual probe) keep using `get()`
+so they benefit from retry on transient blips.
+
+**B. `poll_server_health()` flips offline after N=2 failures** —
+worker now emits `(server, health_or_None, ok_bool)` instead of
+silently dropping the failure case. `_apply_server_health()`
+increments `server["health_fail_count"]` on `ok=False`; at the
+threshold (`HEALTH_OFFLINE_AFTER_N_FAILURES = 2`) it flips
+`online=False` and calls `update_server_status_icon(server, False)`.
+Successful probes reset the counter to 0, so transient blips don't
+accumulate over hours.
+
+With the 30 s health-poll cadence, this gives **~60 s from
+unreachability to LED-red on its own** — fast enough that operators
+don't sit staring at a green-LED-and-frozen-app, slow enough to
+absorb a single dropped packet.
+
+**C. `AddTGenDialog.server_rebooted` signal** — emitted on
+`/api/system/reboot` 200. The dialog now tells the parent main
+window that the host is going down, before the polling cadence can
+even fire once. `_on_server_rebooted(host_port)` in
+`menu_actions.py`:
+
+* finds the matching server by address substring
+* flips `online=False` + `health=None`
+* resets `health_fail_count=0` so when the server comes back, the
+  health-poller starts fresh (not stuck at N-1 failures that would
+  re-flip offline on the first post-reboot network blip)
+* calls `update_server_status_icon(server, False)` → LED instantly
+  goes red
+
+**Combined effect:** LED goes red **immediately** when operator
+clicks Reboot Physical Server (via signal); stats pollers
+auto-filter on `online=True` so they skip the dead host (no more 7s
+retries piling up); health poller fast-fails and resets state
+cleanly when the server returns.
+
+### Operator workflow improvement
+
+| Step | Before v0.5.16 | After v0.5.16 |
+|---|---|---|
+| Click "Reboot Physical Server" | OK | OK |
+| Confirm in dialog | OK | OK |
+| `/api/system/reboot` returns 200 | LED stays green | **LED → red immediately** |
+| Server starts rebooting | Stats pollers spam dead host (7s retry each) | Stats pollers skip (server marked offline) |
+| First minute | App freezes intermittently from signal-queue backup | App responsive — no workers hitting the dead host |
+| 30 s of unreachability | LED still green | LED already red from signal; health poll just confirms |
+| 60 s of unreachability | LED still green | LED already red |
+| 5 min: server comes back | Stats start working again | Stats start working again |
+| Manual retry click | OK | OK |
+
+### Tests
+
+11 regression tests in `tests/test_v0516_reboot_state_fixes.py`
+pin:
+
+* `ConnectionManager.quick_get` exists + uses bare `requests.get`
+  (not `self.session.get`) to bypass the retry adapter
+* `poll_server_health` uses `quick_get`
+* Worker emits `(server, health_or_None, ok_bool)` with failure path
+* `_apply_server_health` flips offline after N failures via
+  `update_server_status_icon`
+* Success path resets `health_fail_count`
+* `AddTGenDialog.server_rebooted` signal declared
+* `_reboot_physical_server` emits on HTTP 200
+* `menu_actions` connects the signal
+* `_on_server_rebooted` finds matching server + flips offline + calls
+  `update_server_status_icon`
+* `_on_server_rebooted` resets `health_fail_count`
+
+### What this doesn't change
+
+* No server-side changes — same `/api/system/reboot` endpoint
+* No changes to the periodic-poll cadence (still 30s health, 2s stats)
+* User-initiated `get()` still uses retry adapter (transient blips
+  on Test Connection still get the retry benefit)
+
 ## [0.5.15] - 2026-06-07
 
 **Make DPDK Ready wizard now offers inline reboot after enabling
