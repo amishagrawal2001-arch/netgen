@@ -1324,26 +1324,114 @@ class NetgenInstaller:
                 self.log(f"Wheel install failed: {pip_result.stderr or pip_result.stdout or 'unknown'}", "ERROR")
                 raise SystemExit(1)
 
-        # First-install safety net: --no-deps above means the very
-        # first install would skip dependency resolution. Run a
-        # separate deps-only pass that's idempotent — if deps are
-        # already there it's a no-op; if this is a fresh host (no
-        # prior install) it installs them. Using ``--upgrade-strategy
-        # only-if-needed`` keeps already-satisfied deps in place.
+        # v0.4.8: deps-install pass with --force-reinstall.
+        #
+        # Operator-reported on san-hp-srv06 (fresh install on a clean
+        # Noble host via the GUI client's Fresh Install tab):
+        #
+        #   netgen-server.service: Scheduled restart job, restart counter
+        #   is at 743.
+        #   [ostg-server] Failed to import run_tgen_server:
+        #   No module named 'flask'
+        #
+        # The wheel installed fine (step 1 with --no-deps), but the
+        # deps pass silently no-op'd. Pre-v0.4.8 the deps pass used
+        # `pip3 install --upgrade-strategy only-if-needed <wheel>`. When
+        # the wheel is ALREADY current (step 1 just installed it), pip
+        # can decide "package is at target version, nothing to do" and
+        # skip dependency resolution entirely — Flask + scapy + requests
+        # never land. Worse: the pre-v0.4.8 code treated deps-pass
+        # failure as non-fatal WARNING, so the installer reported
+        # success while the server crash-looped.
+        #
+        # Fix: use `--force-reinstall` to GUARANTEE pip re-resolves the
+        # full dependency graph. Already-satisfied deps are no-ops at
+        # the install level (pip detects same-version-on-disk and
+        # skips the actual install work), so the speed hit on a fresh
+        # host is negligible. Failure is now FATAL — a crash-looping
+        # service in production is worse than an install that bails
+        # loudly during setup.
+        self.log("Installing wheel dependencies (Flask, scapy, requests, ...)")
         deps_result = self.run_command(
-            f"pip3 install {pep668}--upgrade-strategy only-if-needed {remote_wheel_path}",
+            f"pip3 install {pep668}--force-reinstall {remote_wheel_path}",
             check=False, capture_output=True,
         )
         if deps_result.returncode != 0:
-            # Non-fatal — the --force-reinstall --no-deps install
-            # above already succeeded. Most likely cause is a
-            # distutils-conflict on a dep that's also OS-managed;
-            # log and continue.
+            err = (deps_result.stderr or "") + (deps_result.stdout or "")
+            # Apply the SAME safety-net retries as the wheel install —
+            # without them the deps pass would refuse to escape PEP 668
+            # on detection misses, or get blocked by distutils-owned
+            # packages that pip can't cleanly uninstall.
+            if "externally-managed" in err.lower() and not pep668:
+                self.log(
+                    "Deps pass refused install due to PEP 668; "
+                    "retrying with --break-system-packages",
+                    "WARNING",
+                )
+                deps_result = self.run_command(
+                    f"pip3 install --break-system-packages "
+                    f"--force-reinstall {remote_wheel_path}",
+                    check=False, capture_output=True,
+                )
+                err = (deps_result.stderr or "") + (deps_result.stdout or "")
+            if "uninstall-distutils-installed-package" in err or "Cannot uninstall" in err:
+                self.log(
+                    "Deps pass blocked by distutils-installed conflict; "
+                    "retrying with --ignore-installed",
+                    "WARNING",
+                )
+                deps_result = self.run_command(
+                    f"pip3 install {pep668}--force-reinstall "
+                    f"--ignore-installed {remote_wheel_path}",
+                    check=False, capture_output=True,
+                )
+            if deps_result.returncode != 0:
+                self.log(
+                    f"Deps install failed: "
+                    f"{(deps_result.stderr or deps_result.stdout or 'unknown').strip()[:500]}",
+                    "ERROR",
+                )
+                self.log(
+                    "Without dependencies the netgen-server systemd "
+                    "unit will crash-loop with `No module named 'flask'`. "
+                    "Failing the install loudly here so the operator "
+                    "doesn't deploy a broken server.",
+                    "ERROR",
+                )
+                raise SystemExit(1)
+
+        # v0.4.8: post-install sanity check. Verify the wheel's core
+        # deps are importable from the same python interpreter that
+        # the systemd unit will use. If they aren't (e.g. python
+        # version mismatch between `pip3` and `/usr/bin/python3`),
+        # the unit would crash-loop at first start — surface the
+        # problem now while the operator is still watching.
+        self.log("Verifying wheel deps are importable...")
+        verify_cmd = (
+            'python3 -c "import flask, scapy, requests; '
+            'print(\\"deps OK: flask=\\" + flask.__version__)"'
+        )
+        verify_result = self.run_command(
+            verify_cmd, check=False, capture_output=True,
+        )
+        if verify_result.returncode != 0:
+            err = (verify_result.stderr or verify_result.stdout or "").strip()
             self.log(
-                "Deps pass had non-zero return — wheel itself installed OK, "
-                f"deps may already be satisfied: {(deps_result.stderr or deps_result.stdout or '').strip()[:200]}",
-                "WARNING",
+                f"Post-install dep import check failed: {err[:300]}",
+                "ERROR",
             )
+            self.log(
+                "The wheel was installed but `python3 -c \"import flask\"` "
+                "fails — most likely cause is a python-version mismatch "
+                "(pip3 installs for a different python than /usr/bin/python3 "
+                "uses). Check `head -1 $(which pip3)` vs `/usr/bin/python3 "
+                "--version` on the target.",
+                "ERROR",
+            )
+            raise SystemExit(1)
+        verify_msg = (verify_result.stdout or "").strip()
+        if verify_msg:
+            self.log(f"  ✓ {verify_msg}")
 
         # Extract bundled assets from the wheel's site-packages to
         # /opt/netgen/ — covers the case where the operator's install

@@ -71,23 +71,38 @@ def test_primary_wheel_install_uses_force_reinstall():
 
 
 def test_force_reinstall_paired_with_no_deps():
-    """--force-reinstall reinstalls the wheel; --no-deps avoids
-    re-resolving the entire dependency graph (which is slow and
-    can trigger distutils-uninstall errors on OS-managed packages).
-    These flags must travel together on the primary install."""
+    """The FIRST `pip3 install ... {remote_wheel_path}` call (the
+    wheel-artifact-only install, line ~1295) must be paired with
+    --no-deps so the fast artifact swap doesn't re-resolve the
+    whole dependency graph.
+
+    v0.4.8 note: pre-v0.4.8 this test enforced 'every
+    --force-reinstall on a wheel install must have --no-deps'.
+    v0.4.8 INTENTIONALLY broke that for the deps-install pass:
+    `pip3 install {pep668}--force-reinstall {remote_wheel_path}`
+    (NO --no-deps) is the fix for the san-hp-srv06 silent
+    Flask-not-installed bug. Test updated to check only the FIRST
+    wheel-install call still has the --no-deps pairing."""
     code = _strip_strings_and_comments(_src())
-    # Every --force-reinstall on a wheel install must be paired
-    # with --no-deps.
+    # Find the first `pip3 install ... {remote_wheel_path}` line
+    # that includes --force-reinstall. That's the wheel-install
+    # step (step 1). It must still be paired with --no-deps.
+    first_match = None
     for line in code.split("\n"):
-        if "--force-reinstall" not in line:
-            continue
-        if "{remote_wheel_path}" not in line:
-            continue
-        assert "--no-deps" in line, (
-            f"--force-reinstall without --no-deps on wheel install — "
-            f"will needlessly re-resolve deps + risk distutils "
-            f"conflicts. Line: {line.strip()}"
-        )
+        if "pip3 install" in line and "--force-reinstall" in line and \
+                "{remote_wheel_path}" in line:
+            first_match = line
+            break
+    assert first_match is not None, (
+        "no `pip3 install --force-reinstall {remote_wheel_path}` "
+        "line found at all — wheel install step is missing."
+    )
+    assert "--no-deps" in first_match, (
+        "First --force-reinstall on the wheel install dropped "
+        f"--no-deps. Step 1 needs --no-deps for the fast artifact "
+        f"swap; the deps-install pass that follows resolves the "
+        f"dep graph. Line: {first_match.strip()}"
+    )
 
 
 def test_separate_deps_only_pass_exists():
@@ -113,15 +128,45 @@ def test_separate_deps_only_pass_exists():
 
 
 def test_distutils_retry_preserves_force_reinstall():
-    """The distutils-conflict retry branch must keep the
-    --force-reinstall + --no-deps flags. Pre-existing retry was
-    `pip3 install --ignore-installed <wheel>` — that loses the
-    force-reinstall semantics and re-triggers the same-version-
-    skip behavior."""
+    """The distutils-conflict retry branches must keep
+    --force-reinstall.
+
+    v0.4.8 note: the wheel-install retry (step 1) keeps both
+    --force-reinstall + --no-deps. The deps-install retry (step 2,
+    new in v0.4.8) keeps --force-reinstall WITHOUT --no-deps
+    because step 2's whole point is to resolve dependencies. So we
+    check `--force-reinstall` on every retry, but only require
+    `--no-deps` on retries that don't also include the
+    multi-line-friendly substring patterns from the deps-install
+    block. Also: the f-string can be split across lines, so we
+    join wrapped lines before matching."""
     code = _strip_strings_and_comments(_src())
-    # Find the retry call — has --ignore-installed
+    # Glue any sequence of consecutive lines that look like one
+    # multi-line f-string command — Python's implicit string
+    # concatenation lets us write
+    #   f"pip3 install {pep668}--force-reinstall "
+    #   f"--ignore-installed {remote_wheel_path}"
+    # and have it lex as one string. Test must match accordingly.
+    raw_lines = code.split("\n")
+    glued = []
+    i = 0
+    while i < len(raw_lines):
+        cur = raw_lines[i].rstrip()
+        # Pull in any following lines that ALSO start with f" / "
+        # at the same logical position (i.e. they're continuations
+        # of the same composed string).
+        j = i + 1
+        while j < len(raw_lines):
+            nxt = raw_lines[j].lstrip()
+            if nxt.startswith(("f\"", "\"")):
+                cur = cur + " " + raw_lines[j].strip()
+                j += 1
+            else:
+                break
+        glued.append(cur)
+        i = j if j > i + 1 else i + 1
     retry_lines = [
-        line for line in code.split("\n")
+        line for line in glued
         if "--ignore-installed" in line
         and "{remote_wheel_path}" in line
     ]
@@ -131,7 +176,7 @@ def test_distutils_retry_preserves_force_reinstall():
             f"distutils retry missing --force-reinstall — "
             f"same-version skip will re-bite. Line: {line.strip()}"
         )
-        assert "--no-deps" in line, (
-            f"distutils retry missing --no-deps — will needlessly "
-            f"re-resolve deps. Line: {line.strip()}"
-        )
+        # Note: --no-deps is no longer required on every retry. The
+        # wheel-install retry (step 1) has it; the deps-install
+        # retry (step 2, v0.4.8) deliberately omits it so deps
+        # actually get resolved on the retry too.

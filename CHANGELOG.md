@@ -2,6 +2,102 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.4.8] - 2026-06-07
+
+**Fresh install on a clean host now actually installs the wheel's
+dependencies. No more silent crash-loops.**
+
+Operator-reported on san-hp-srv06 (fresh install on a clean Ubuntu
+24.04 host via the GUI client's Fresh Install tab):
+
+```
+netgen-server.service: Scheduled restart job, restart counter is at 743.
+[ostg-server] Failed to import run_tgen_server: No module named 'flask'
+netgen-server.service: Main process exited, code=exited,
+                       status=2/INVALIDARGUMENT
+```
+
+The installer reported success. The wheel was on disk. But Flask +
+scapy + requests weren't installed, so systemd crash-looped the
+server 743+ times trying to import a Flask-based module.
+
+### Root cause
+
+Pre-v0.4.8 the install was a two-pass strategy:
+
+```python
+# Step 1 — wheel artifact only
+pip3 install --break-system-packages --force-reinstall --no-deps <wheel>
+
+# Step 2 — deps "if needed" (THE BUG)
+pip3 install --break-system-packages --upgrade-strategy only-if-needed <wheel>
+```
+
+Step 2 was supposed to install missing deps. But with the wheel
+already current (step 1 just installed it), pip's `--upgrade-strategy
+only-if-needed` can decide *"package is at target version, nothing
+to do"* and skip dependency resolution entirely. Flask + scapy +
+requests never land.
+
+Worse: pre-v0.4.8 step 2 failure was logged as a non-fatal
+`WARNING`. The installer printed `Netgen installation completed
+successfully!` while the server was about to crash-loop.
+
+### Fix
+
+Three changes to `install_ostg_complete.py:install_ostg()`:
+
+1. **Deps pass uses `--force-reinstall`** (not `--upgrade-strategy
+   only-if-needed`). This guarantees pip re-resolves the full
+   dependency graph. Already-installed deps at the right version
+   are no-ops at the install layer, so the speed hit on a fresh
+   host is negligible.
+2. **Deps-pass failure is now FATAL.** `raise SystemExit(1)` with
+   an explicit message hinting at the symptom (`No module named
+   'flask'`) so the operator doesn't have to dig through systemd
+   logs to understand what went wrong.
+3. **Post-install sanity check.** After both pip passes succeed,
+   the installer runs `python3 -c "import flask, scapy, requests"`
+   on the target. If the imports fail (deps missing, or python-
+   version mismatch between `pip3` and `/usr/bin/python3`), the
+   install fails loudly — better to surface during setup than to
+   ship a crash-looping service.
+
+Same PEP 668 belt-and-suspenders retry (added in v0.4.7 to the
+wheel install) now applies to the deps pass too.
+
+### Tests
+
+`tests/test_v048_installer_deps_resolution.py` — 6 tests pinning:
+
+- Deps pass uses `--force-reinstall` (not the broken `--upgrade-
+  strategy only-if-needed`)
+- Deps-pass failure is FATAL (raises `SystemExit`)
+- Same PEP 668 retry safety net on the deps pass
+- Post-install sanity check exists with `python3 -c "import flask"`
+- The check runs AFTER deps install (correct ordering)
+- The check failure is also FATAL
+- Both pip-install commands are present in the right shape
+  (regression for refactors that drop one half)
+
+Full suite: 1,438 passed, 1 skipped.
+
+### Operator action
+
+Existing v0.4.7 hosts that DID get a working install need no
+action — they have Flask installed. Fresh installs on v0.4.7 that
+ended up in the crash-loop state (san-hp-srv06 was one) need
+either v0.4.8's installer OR the one-time manual:
+
+```bash
+ssh root@<host> 'pip3 install --break-system-packages --force-reinstall \
+    /tmp/netgen_install/ostg_trafficgen-0.4.7-py3-none-any.whl && \
+  systemctl restart netgen-server'
+```
+
+The v0.4.8 GUI client's Fresh Install tab will run the fixed
+installer end-to-end.
+
 ## [0.4.7] - 2026-06-06
 
 **Seven operator-reported bugs + four feature gaps. Combined ship

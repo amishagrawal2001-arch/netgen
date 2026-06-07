@@ -96,15 +96,25 @@ def test_wheel_install_threads_the_pep668_flag():
 
 
 def test_deps_pass_threads_the_pep668_flag():
-    """The first-install safety net deps pass (line ~1257 pre-fix)
-    must also include the flag — without it, even if the wheel
-    install succeeds via fallback retry, this pass blocks the
-    install with the same PEP 668 error."""
+    """The deps pass must thread {pep668} too — without it, even if
+    the wheel install succeeds via fallback retry, this pass blocks
+    the install with the same PEP 668 error.
+
+    v0.4.8 note: pre-v0.4.8 the deps pass used `--upgrade-strategy
+    only-if-needed` which could silently no-op when the wheel was
+    already current (leaving Flask uninstalled — operator-reported
+    on san-hp-srv06). The deps pass now uses `--force-reinstall`.
+    This test updated to match — the {pep668} thread requirement is
+    unchanged."""
     src = _INSTALLER.read_text()
-    assert re.search(
-        r"pip3 install \{pep668\}--upgrade-strategy only-if-needed",
+    # Find the deps_result run_command call and verify it includes
+    # {pep668} in the same composed string.
+    m = re.search(
+        r"deps_result\s*=\s*self\.run_command\(\s*\n\s*"
+        r"f?\"pip3 install \{pep668\}--force-reinstall \{remote_wheel_path\}\"",
         src,
-    ), (
+    )
+    assert m, (
         "Deps-pass pip3 install missing {pep668} thread — fresh "
         "install will fail at the dependency-resolution step on "
         "Ubuntu 24.04+."
