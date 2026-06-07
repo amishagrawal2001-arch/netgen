@@ -2,6 +2,117 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.10] - 2026-06-07
+
+**Two latent bugs from v0.5.0 finally hit on srv06 after the clock-
+skew gate cleared:** the tarball was packing `resources/dpdk/` at
+the wrong path, and the runtime expected a `/opt/OSTG/` install
+location that the v0.5.0+ tarball never created.
+
+Full suite: 1,531 passed, 1 skipped (+6 new tests).
+
+### Operator-reported
+
+san-hp-srv06 after v0.5.9 clock fix let tar finally succeed:
+
+```
+[INFO] [STARTUP] Install root: /opt/netgen-server
+[INFO] [PRE-FLIGHT] Checking environment...
+[INFO]   - OS: ubuntu 24.04
+[ERROR] Install root /opt/netgen-server is missing expected files:
+[ERROR] - /opt/netgen-server/share/netgen/resources/dpdk
+[ERROR] The tarball must be extracted intact to a single root.
+[client] installer exit rc=3
+```
+
+### Bug 1 — CI path mismatch (latent since v0.5.0)
+
+netgen-install's `_preflight` check at line 197:
+```python
+required = [
+    install_root / "share" / "netgen" / "resources" / "dpdk",
+    install_root / "share" / "netgen" / "Dockerfile.frr",
+    ...
+]
+```
+
+But the CI workflow was doing:
+```bash
+cp -r resources/dpdk "$ROOT/share/netgen/"
+```
+
+That lands files at `share/netgen/dpdk/`, missing the `resources/`
+parent. Mismatch shipped in every tarball from v0.5.0 through
+v0.5.9.
+
+**Why CI never caught it:** the v0.5.7 round-trip step added
+`exec bin/netgen-install` smoke-test, but the script exits on
+`_require_root()` BEFORE the layout-check runs. The preflight was
+literally never validated in CI.
+
+Fix: workflow copies into `share/netgen/resources/` (with parent
+dir), AND round-trip step now explicitly checks all four required
+layout paths exist post-extract (mirroring `_preflight`'s contract
+without needing root).
+
+### Bug 2 — `/opt/OSTG` runtime path hardcodes (latent since rebrand)
+
+Even after fixing bug #1, the install would complete but DPDK ops
+would all fail at runtime. The runtime code hardcodes paths like:
+```python
+# run_tgen_server.py:12840
+"/opt/OSTG/resources/dpdk/tx_worker/build/tx_worker"
+# run_tgen_server.py:12963
+dpdk_bind_script = "/opt/OSTG/resources/dpdk/dpdk_bind.sh"
+```
+
+These date back to the pre-tarball system-pip era when
+`install_ostg_complete.py` deployed everything to `/opt/OSTG/`.
+The v0.5.0+ tarball installs to `/opt/netgen-server/` —
+`/opt/OSTG/` doesn't exist, all DPDK ops fail with "file not
+found".
+
+The right long-term fix is to rewrite the runtime to look at
+`/opt/netgen-server/share/netgen/resources/dpdk/...` (tracked as
+a follow-up). For v0.5.10, surgical fix: netgen-install creates
+a compat symlink:
+```python
+def _create_ostg_compat_symlink(install_root):
+    """/opt/OSTG → /opt/netgen-server/share/netgen"""
+```
+
+So the existing `/opt/OSTG/resources/dpdk/...` paths resolve
+correctly with zero runtime-code changes. Idempotent — re-running
+netgen-install doesn't stomp on an existing legacy `/opt/OSTG/`
+real directory if one's present.
+
+### Operator workflow
+
+`Netgen-TrafficGenerator-0.5.10.dmg` / `.AppImage` / `.exe` →
+File → Install/Upgrade Server → Fresh Install via SSH → pick
+`netgen-server-0.5.10-linux-x86_64.tar.gz`. This is the first
+v0.5.x tarball that actually completes a fresh install on an
+empty Ubuntu 24.04 host.
+
+### Lessons / the pattern (continued)
+
+This is the SECOND release I've shipped this hour where the bug
+was "CI was green, operator was red, because CI was testing
+something different from what the operator runs." Per-release
+tally so far this session:
+
+* v0.5.6: CI never validated the HTTP-API upgrade path → PEP 668
+* v0.5.7: CI false-positively passed because of leftover state
+* v0.5.8: CI committed at "now", tested by reading "now"
+* v0.5.9: CI mtime was "now", but operator's clock was behind
+* v0.5.10: CI smoke exits at require_root before validating layout
+
+The general theme: **CI must validate what the OPERATOR validates,
+under the same conditions the operator runs under.** Not "an
+approximation of what the operator does." Today's fix: round-trip
+now explicitly mirrors `_preflight`'s required-paths check,
+without needing root.
+
 ## [0.5.9] - 2026-06-07
 
 **Tarball mtimes are now hardcoded to 2020-01-01 UTC. v0.5.8's

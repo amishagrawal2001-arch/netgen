@@ -250,8 +250,24 @@ jobs:
           "$ROOT/netgen-venv/bin/pip" install --no-cache-dir --force-reinstall "$WHEEL"
 
           # 4. Resources + Docker assets that the runtime expects.
-          mkdir -p "$ROOT/share/netgen"
-          cp -r resources/dpdk "$ROOT/share/netgen/"
+          #
+          # v0.5.10 fix: PRESERVE the `resources/` parent dir, not
+          # just dpdk. netgen-install's preflight check (and the
+          # runtime's hardcoded paths) expect
+          # `share/netgen/resources/dpdk/...`, not
+          # `share/netgen/dpdk/...`. Operator-reported on srv06:
+          #
+          #   [ERROR] Install root /opt/netgen-server is missing
+          #     expected files:
+          #   [ERROR] - /opt/netgen-server/share/netgen/resources/dpdk
+          #   [client] installer exit rc=3
+          #
+          # Latent since v0.5.0. CI never caught it because the
+          # smoke test runs netgen-install but it bails on
+          # `_require_root()` before reaching the layout check —
+          # the missing path was only visible at first real install.
+          mkdir -p "$ROOT/share/netgen/resources"
+          cp -r resources/dpdk "$ROOT/share/netgen/resources/"
           cp -r ostg_docker "$ROOT/share/netgen/"
           cp Dockerfile.frr "$ROOT/share/netgen/"
 
@@ -555,6 +571,32 @@ jobs:
             echo "ERROR: no output from bin/netgen-install — exec(2) failure"
             exit 1
           fi
+
+          # v0.5.10 fix: verify the layout-check paths exist in the
+          # extracted tree. Without this, the missing-path bug from
+          # v0.5.0 stays latent until the operator hits root-level
+          # preflight. The shebang smoke EXITS at _require_root
+          # BEFORE this check, so the preflight never actually
+          # validated in CI. Pin the paths explicitly here.
+          #
+          # Operator-reported on srv06 (v0.5.9):
+          #   [ERROR] - /opt/netgen-server/share/netgen/resources/dpdk
+          #   [client] installer exit rc=3
+          #
+          # The CI smoke had been GREEN since v0.5.0.
+          echo "Verifying netgen-install's required layout paths exist..."
+          for required in \
+              "$EXTRACTED/python-runtime/bin/python3" \
+              "$EXTRACTED/netgen-venv/bin/ostg-server" \
+              "$EXTRACTED/share/netgen/resources/dpdk" \
+              "$EXTRACTED/share/netgen/Dockerfile.frr"; do
+            if [ ! -e "$required" ]; then
+              echo "ERROR: required layout path missing: $required"
+              echo "       (netgen-install's _preflight would reject this)"
+              exit 1
+            fi
+          done
+          echo "✓ All netgen-install layout paths present"
 
           # Show the final size profile for sanity.
           du -sh "$EXTRACTED"

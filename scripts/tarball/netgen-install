@@ -400,6 +400,51 @@ def _create_path_symlinks(install_root: Path) -> None:
         logger.info(f"[PATH] ✓ {dst} → {src}")
 
 
+def _create_ostg_compat_symlink(install_root: Path) -> None:
+    """v0.5.10: install_root/share/netgen → /opt/OSTG compat symlink.
+
+    The runtime code in run_tgen_server.py (and elsewhere) hardcodes
+    paths under /opt/OSTG/resources/dpdk/... and /opt/OSTG/
+    Dockerfile.frr — leftover from the pre-tarball, system-pip era
+    when install_ostg_complete.py deployed everything to /opt/OSTG/.
+
+    Without a compat symlink, an operator who fresh-installs from the
+    v0.5.0+ tarball gets a working server EXCEPT every DPDK bind/
+    unbind/start operation fails because the bind script
+    /opt/OSTG/resources/dpdk/dpdk_bind.sh doesn't exist. The error
+    surfaces only when the operator tries to USE DPDK, not at install.
+
+    The right long-term fix is to rewrite the runtime to look at
+    /opt/netgen-server/share/netgen/resources/dpdk/ etc. (tracked
+    as a separate follow-up). For now: symlink
+    /opt/OSTG → /opt/netgen-server/share/netgen so the existing
+    paths resolve correctly with zero code changes elsewhere.
+
+    Idempotent: if /opt/OSTG already exists as a real directory, we
+    leave it alone (might be a parallel legacy install) and log a
+    warning. If it's already the right symlink, no-op. Otherwise
+    create it.
+    """
+    legacy = Path("/opt/OSTG")
+    target = install_root / "share" / "netgen"
+    if legacy.is_symlink():
+        cur = legacy.resolve()
+        if cur == target.resolve():
+            logger.info(f"[COMPAT] ✓ /opt/OSTG → {target} (already correct)")
+            return
+        legacy.unlink()
+    elif legacy.is_dir():
+        logger.warning(
+            f"[COMPAT] /opt/OSTG exists as a real directory; not "
+            f"replacing. DPDK runtime calls will use the legacy "
+            f"path. To finish migration: `sudo rm -rf /opt/OSTG && "
+            f"sudo ln -s {target} /opt/OSTG`."
+        )
+        return
+    legacy.symlink_to(target)
+    logger.info(f"[COMPAT] ✓ /opt/OSTG → {target}")
+
+
 # ─────────────────────────────────────────────────── health check
 
 
@@ -446,6 +491,7 @@ def main() -> int:
     _build_frr_image(install_root)
     _write_systemd_unit(install_root)
     _create_path_symlinks(install_root)
+    _create_ostg_compat_symlink(install_root)
 
     if _verify_running():
         logger.info("=" * 60)
