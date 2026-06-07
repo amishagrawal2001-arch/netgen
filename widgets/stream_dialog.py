@@ -5945,6 +5945,35 @@ class AddStreamDialog(QDialog):
             self.template_combo.currentIndexChanged.connect(
                 self._on_traffic_template_changed
             )
+
+            # v0.4.7: type-to-search. The list grew from 14 → 23
+            # templates (v0.4.7 added 9 new gap-fill entries:
+            # source-MAC sweep, UDP/TCP src+dst port sweeps, TCP
+            # baseline + 5-tuple, IPv6 src). Scrolling a 24-item
+            # dropdown to find "scale · TCP src port sweep" gets
+            # tedious fast — substring search short-circuits that.
+            #
+            # Implementation: editable QComboBox + completer with
+            # case-insensitive MatchContains, so typing "tcp", "src",
+            # "rss", "vlan", "1024", "imix", etc. instantly narrows
+            # the popup to matching titles. Operator picks from the
+            # narrowed list → currentIndexChanged fires → existing
+            # _on_traffic_template_changed populates the dialog.
+            #
+            # NoInsert policy means typed-but-unmatched text is NOT
+            # added as a new combo item — the operator can't
+            # accidentally create a phantom template.
+            from PyQt5.QtWidgets import QCompleter, QComboBox as _QCB
+            self.template_combo.setEditable(True)
+            self.template_combo.setInsertPolicy(_QCB.NoInsert)
+            _le = self.template_combo.lineEdit()
+            if _le is not None:
+                _le.setPlaceholderText("Type to search templates…")
+            _comp = self.template_combo.completer()
+            if _comp is not None:
+                _comp.setCompletionMode(QCompleter.PopupCompletion)
+                _comp.setFilterMode(Qt.MatchContains)
+                _comp.setCaseSensitivity(Qt.CaseInsensitive)
             template_bar.addWidget(self.template_combo, 1)
             # v0.3.11 compact: the summary label starts EMPTY (no
             # default "Pick a template to pre-fill all tabs." row)

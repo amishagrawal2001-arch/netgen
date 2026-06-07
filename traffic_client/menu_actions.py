@@ -11,6 +11,31 @@ import logging
 logger = logging.getLogger(__name__)
 
 
+def _persist_current_session_path(path: str) -> None:
+    """Save the active session file path to QSettings.
+
+    v0.4.7: pre-fix, `_current_session_path` was set in memory but
+    never persisted. Save As / Load From… became one-shot: after a
+    restart the app silently snapped back to ``~/Documents/OSTG/
+    session.json`` (the default), which is empty for first-time
+    macOS-app users — operators saw their TGs / streams "disappear"
+    on restart, when in fact the work was sitting at the path they'd
+    Save As'd to and the app had forgotten.
+
+    Called from Save As + Load From… so any deliberate user action
+    that changes the active file gets persisted. Best-effort —
+    a QSettings write failure logs and moves on; the operator's
+    in-memory state is unaffected.
+    """
+    try:
+        from PyQt5.QtCore import QSettings
+        QSettings().setValue("current_session_path", path)
+    except Exception as exc:
+        logger.debug(
+            f"[SESSION PATH] persist to QSettings failed: {exc}"
+        )
+
+
 def _next_tg_id(server_interfaces) -> int:
     """Return the next-available unique tg_id for a freshly-added server.
 
@@ -1061,6 +1086,12 @@ class TrafficGenClientMenuAction():
             path = path + ".json"
 
         self._current_session_path = path
+        # v0.4.7: persist the active session path to QSettings so
+        # the next launch reopens it. Without this, Save As is a
+        # one-shot — restarting the app silently snaps back to the
+        # default ~/Documents/OSTG/session.json (which is usually
+        # empty), and the operator's work appears to vanish.
+        _persist_current_session_path(path)
         # Force a fresh write: the content-hash short-circuit in
         # _save_session_impl would otherwise treat this as a no-op
         # if the in-memory state matches the previous saved hash
@@ -1983,6 +2014,9 @@ class TrafficGenClientMenuAction():
             is_replace_load = bool(session_file_path)
             if session_file_path:
                 self._current_session_path = session_file_path
+                # v0.4.7: persist so the next launch reopens this
+                # file instead of snapping back to the default.
+                _persist_current_session_path(session_file_path)
                 # Wipe state that the startup merge path would
                 # otherwise leave dangling. Streams + all_devices
                 # already get cleared further down, but the server

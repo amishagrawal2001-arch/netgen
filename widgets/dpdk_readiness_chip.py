@@ -30,13 +30,56 @@ import os
 from typing import Any, Callable, Dict, Optional
 
 import requests
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import Qt, QTimer, QThread, pyqtSignal
 from PyQt5.QtWidgets import QLabel, QWidget
 
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_POLL_INTERVAL_MS = 30_000
+
+
+# v0.4.7: one-shot background thread that fetches /api/dpdk/status
+# off the UI thread. Pre-v0.4.7 the chip called requests.get() inline
+# in refresh() — a 5-sec timeout on the UI thread froze the whole
+# event loop when the server was slow / unreachable, and changing
+# TG selection felt sluggish because the chip's next poll would fire
+# against the new (possibly unreachable) URL and block clicks.
+#
+# Operator-reported: "dpdk check is slow when moving selection from
+# one TG to another TG". Symptom was the 5-sec timeout × any sluggish
+# response = visible UI hitches mid-click. Fix: move the fetch to
+# this thread; the chip emits a signal back to the UI thread when
+# the payload arrives.
+class _DpdkStatusFetchThread(QThread):
+    """Fetch `/api/dpdk/status` off the UI thread, emit the payload."""
+
+    payload_ready = pyqtSignal(dict)
+    failed = pyqtSignal(str)
+
+    def __init__(self, full_url: str, parent: Optional[QWidget] = None,
+                 *, timeout_s: float = 5.0):
+        super().__init__(parent)
+        self._url = full_url
+        self._timeout_s = timeout_s
+
+    def run(self) -> None:
+        try:
+            r = requests.get(
+                self._url, headers=_auth_headers(), timeout=self._timeout_s,
+            )
+        except Exception as exc:
+            self.failed.emit(f"fetch failed: {exc}")
+            return
+        if r.status_code != 200:
+            self.failed.emit(f"HTTP {r.status_code}")
+            return
+        try:
+            payload = r.json() or {}
+        except Exception as exc:
+            self.failed.emit(f"json decode failed: {exc}")
+            return
+        self.payload_ready.emit(payload)
 
 
 class DpdkReadinessChip(QLabel):
@@ -70,6 +113,13 @@ class DpdkReadinessChip(QLabel):
         self._poll_interval_ms = int(poll_interval_ms)
         self._last_payload: Dict[str, Any] = {}
         self._state = "gray"
+        # v0.4.7: in-flight fetch deduplication. Rapid TG-selection
+        # changes (operator clicking through 4 TGs in 2 sec) used to
+        # stack 4 synchronous fetches on the UI thread. Now refresh()
+        # checks this guard and skips spawning a new thread if one
+        # is still in flight — the in-flight one's result lands soon
+        # enough that a fresh fetch is wasted.
+        self._fetch_in_flight: Optional[_DpdkStatusFetchThread] = None
         self.setAlignment(Qt.AlignCenter)
         # v0.3.11: pointer cursor advertises clickability.
         self.setCursor(Qt.PointingHandCursor)
@@ -86,17 +136,59 @@ class DpdkReadinessChip(QLabel):
         QTimer.singleShot(300, self.refresh)
 
     # ──────────────────────────────────────────────── public API
-    def refresh(self) -> None:
-        """Fetch /api/dpdk/status and repaint. Safe to call from any
-        context — never raises, never blocks."""
+    def refresh(self, synchronous: bool = False) -> None:
+        """Fetch /api/dpdk/status and repaint.
+
+        v0.4.7: async by default. The fetch runs on a background
+        QThread; the result lands back via signal on the UI thread.
+        Operator-reported pre-v0.4.7: "dpdk check is slow when moving
+        selection from one TG to another TG" — root cause was a
+        synchronous `requests.get(..., timeout=5)` on the UI thread,
+        which froze the Qt event loop for up to 5 sec when the
+        server was sluggish or unreachable.
+
+        ``synchronous=True`` preserves the old blocking path; used
+        by tests that want to mock ``requests.get`` and assert the
+        chip state immediately after refresh(). Production callers
+        (timer, selection-change hook) should never pass it.
+        """
         url = self._get_server_url() or ""
         if not url:
             self._paint("gray", "DPDK: —", "No server selected yet.")
             return
+
+        full_url = f"{url.rstrip('/')}/api/dpdk/status"
+
+        if synchronous:
+            # Legacy blocking path — tests only. Production never
+            # hits this because synchronous defaults to False.
+            self._refresh_blocking(full_url)
+            return
+
+        # Dedupe: if a fetch is already in flight, skip. The in-flight
+        # one's result will repaint the chip within a few seconds; a
+        # second concurrent thread would just waste a connection.
+        if self._fetch_in_flight is not None:
+            return
+
+        thread = _DpdkStatusFetchThread(full_url, parent=self)
+        thread.payload_ready.connect(self._on_async_payload)
+        thread.failed.connect(self._on_async_failed)
+        # Self-cleanup. Both QThread cleanup AND clearing the dedup
+        # guard fire on the SAME `finished` signal — Qt delivers
+        # signal slots in connection order so deleteLater() runs
+        # after _clear_in_flight (which only touches the bool).
+        thread.finished.connect(self._clear_in_flight)
+        thread.finished.connect(thread.deleteLater)
+        self._fetch_in_flight = thread
+        thread.start()
+
+    def _refresh_blocking(self, full_url: str) -> None:
+        """Pre-v0.4.7 sync path — kept for tests that monkeypatch
+        ``requests.get``. Never called by production code."""
         try:
             r = requests.get(
-                f"{url.rstrip('/')}/api/dpdk/status",
-                headers=_auth_headers(), timeout=5,
+                full_url, headers=_auth_headers(), timeout=5,
             )
         except Exception as exc:
             logger.debug(f"[DPDK CHIP] fetch failed: {exc}")
@@ -110,9 +202,47 @@ class DpdkReadinessChip(QLabel):
             return
         self._apply(payload)
 
+    # ─────────────────────────────── async result slots
+    def _on_async_payload(self, payload: Dict[str, Any]) -> None:
+        """Slot — runs on UI thread when the worker delivers JSON."""
+        self._apply(payload)
+
+    def _on_async_failed(self, reason: str) -> None:
+        """Slot — silent on failure, just like the pre-v0.4.7 sync
+        path. The chip holds its previous state so a flaky link
+        doesn't flap the colour back to gray."""
+        logger.debug(f"[DPDK CHIP] async fetch: {reason}")
+
+    def _clear_in_flight(self) -> None:
+        """Slot — runs on UI thread after the worker thread finishes
+        (whether success or failure). Drops the dedup guard so the
+        next refresh() can spawn a fresh worker."""
+        self._fetch_in_flight = None
+
     def stop(self) -> None:
+        """Stop the periodic poll and wait briefly for any in-flight
+        worker thread to finish. v0.4.7: previously stop() only
+        stopped the QTimer — any worker still running at chip
+        destruction time triggered Qt's "QThread destroyed while
+        still running" abort. Bounded 2-sec wait covers a normal
+        HTTP timeout; if the worker is stuck longer, we'd rather
+        emit one cleanup warning than block the app forever."""
         try:
             self._timer.stop()
+        except Exception:
+            pass
+        try:
+            t = self._fetch_in_flight
+            if t is not None:
+                # requestInterruption is advisory; the worker is just
+                # a one-shot HTTP fetch with a 5-sec request timeout,
+                # so we wait for natural completion. 2 sec is enough
+                # for a healthy fetch + comfortably under the 5-sec
+                # HTTP timeout for a stuck one.
+                if hasattr(t, "requestInterruption"):
+                    t.requestInterruption()
+                if hasattr(t, "wait"):
+                    t.wait(2000)
         except Exception:
             pass
 

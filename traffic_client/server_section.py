@@ -340,18 +340,31 @@ class TrafficGenClientServerSection():
         """Update both stream and device tables on server tree selection change."""
         # Update main window server URL based on selection
         self._update_main_window_server_url()
-        
+
+        # v0.4.7: kick the DPDK readiness chip the moment the operator
+        # switches TGs. Pre-v0.4.7 the chip kept showing the previous
+        # TG's state until its own 30-sec poll fired — operators saw
+        # "green" for a known-bad server because the chip hadn't
+        # caught up yet. refresh() is now async (QThread-backed) so
+        # this call returns immediately; the UI doesn't block.
+        try:
+            chip = getattr(self, "dpdk_chip", None)
+            if chip is not None and hasattr(chip, "refresh"):
+                chip.refresh()
+        except Exception:
+            pass  # never break selection on a chip glitch
+
         # OPTIMIZATION: Update device table immediately for instant feedback
         if hasattr(self, "devices_tab") and hasattr(self, "all_devices"):
             self.devices_tab.update_device_table(self.all_devices)
-            
+
             # OPTIMIZATION: Defer protocol table updates to run after device table is displayed
             # This makes the device table appear instantly while protocol tables update in background
             QTimer.singleShot(0, lambda: self._update_protocol_tables())
-        
+
         # OPTIMIZATION: Defer stream table update to avoid blocking
         QTimer.singleShot(0, lambda: self._update_stream_table_if_exists())
-        
+
         # Update statistics when selection changes (to show stats for selected TG)
         if hasattr(self, "fetch_and_update_statistics"):
             QTimer.singleShot(50, lambda: self.fetch_and_update_statistics())

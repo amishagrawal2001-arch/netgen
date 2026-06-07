@@ -47,13 +47,21 @@ def test_get_template_returns_none_for_unknown_key():
 def test_apply_to_dialog_tolerates_missing_widgets():
     """`apply_to_dialog` should silently skip fields whose widgets don't
     exist on the dialog — the safety net that lets templates ship
-    ahead of form rearrangements."""
+    ahead of form rearrangements.
+
+    v0.4.7 note: the original test used `ibgp_peer` here, but v0.4.7
+    added a `post_apply` callback to that template (to drive the real
+    iBGP/eBGP protocol_dropdown — see the audit for why). post_apply
+    bumps `applied_any=True` even on a DummyDialog with zero widgets.
+    Switched to `ospf_backbone` which is the pre-v0.4.7 shape:
+    fields-only, no post_apply, so the test still proves the
+    'gracefully skip missing widgets' contract."""
 
     class DummyDialog:
         pass   # zero widgets
 
     # Should not raise, should return False (nothing was applied).
-    assert device_templates.apply_to_dialog(DummyDialog(), "ibgp_peer") is False
+    assert device_templates.apply_to_dialog(DummyDialog(), "ospf_backbone") is False
 
 
 def test_apply_to_dialog_handles_unknown_template():
@@ -121,12 +129,22 @@ def test_scale_template_family_complete():
     operator has to hand-build the equivalent stream every time."""
     keys = {m["key"] for m in traffic_templates.list_templates()}
     expected_scale = {
-        "mac_dst_sweep_1k",       # MAC table fill
-        "ipv4_dst_sweep_256",     # routing fan-out / ECMP dst hash
-        "ipv4_src_sweep_256",     # NAT pool / ECMP src hash
-        "ipv6_dst_sweep_64",      # v6 routing scale
-        "five_tuple_sweep_rss",   # RSS bucket spread
-        "vlan_id_sweep_4k",       # trunk VLAN scale
+        # v0.3.11 originals
+        "mac_dst_sweep_1k",         # MAC table fill (dst)
+        "ipv4_dst_sweep_256",       # routing fan-out / ECMP dst hash
+        "ipv4_src_sweep_256",       # NAT pool / ECMP src hash
+        "ipv6_dst_sweep_64",        # v6 routing scale
+        "five_tuple_sweep_rss",     # UDP RSS bucket spread
+        "vlan_id_sweep_4k",         # trunk VLAN scale
+        # v0.4.7 gap-fill additions
+        "mac_src_sweep_1k",         # MAC table fill (src) — operator ask
+        "mac_src_and_dst_sweep_1k", # both-ends MAC learning
+        "udp_src_port_sweep_1k",    # UDP src port — operator ask
+        "udp_dst_port_sweep_1k",    # UDP dst port — operator ask
+        "tcp_src_port_sweep_1k",    # TCP src port — operator ask
+        "tcp_dst_port_sweep_1k",    # TCP dst port — operator ask
+        "tcp_5tuple_sweep_rss",     # TCP RSS bucket spread
+        "ipv6_src_sweep_64",        # v6 source pool / NAT64
     }
     missing = expected_scale - keys
     assert not missing, (
@@ -143,8 +161,14 @@ def test_scale_templates_use_increment_mode():
     'scale'. Walk each one and assert at least one of the known
     increment-mode keys is set to 'Increment' / True."""
     scale_keys = [
+        # v0.3.11 originals
         "mac_dst_sweep_1k", "ipv4_dst_sweep_256", "ipv4_src_sweep_256",
         "ipv6_dst_sweep_64", "five_tuple_sweep_rss", "vlan_id_sweep_4k",
+        # v0.4.7 gap-fill additions
+        "mac_src_sweep_1k", "mac_src_and_dst_sweep_1k",
+        "udp_src_port_sweep_1k", "udp_dst_port_sweep_1k",
+        "tcp_src_port_sweep_1k", "tcp_dst_port_sweep_1k",
+        "tcp_5tuple_sweep_rss", "ipv6_src_sweep_64",
     ]
     for key in scale_keys:
         data = traffic_templates.get_stream_data(key)
@@ -153,7 +177,9 @@ def test_scale_templates_use_increment_mode():
         # Hunt for any "Increment" string OR True increment-bool in the
         # mode-bearing sub-dicts. If none, the template is mislabeled.
         is_incrementing = False
-        for proto in ("mac", "ipv4", "ipv6", "udp", "vlan"):
+        # v0.4.7: extended to include "tcp" since the new tcp_*_sweep
+        # templates use the TCP source/destination port increment flags.
+        for proto in ("mac", "ipv4", "ipv6", "udp", "tcp", "vlan"):
             sub = pd.get(proto, {})
             for k, v in sub.items():
                 if isinstance(v, str) and v == "Increment":
@@ -181,10 +207,16 @@ def test_scale_templates_use_unified_mac_defaults():
     from widgets.dpdk_blast_flow_dialog import (
         DEFAULT_DST_MAC, DEFAULT_SRC_MAC,
     )
-    # Skip mac_dst_sweep_1k — it varies dst MAC on purpose.
+    # Skip templates that vary MAC on purpose — their addresses are
+    # the START of the sweep, not the unified default.
     keys_keeping_fixed_dst_mac = [
+        # v0.3.11
         "ipv4_dst_sweep_256", "ipv4_src_sweep_256",
         "ipv6_dst_sweep_64", "five_tuple_sweep_rss", "vlan_id_sweep_4k",
+        # v0.4.7 — these sweep port / IP, not MAC
+        "udp_src_port_sweep_1k", "udp_dst_port_sweep_1k",
+        "tcp_src_port_sweep_1k", "tcp_dst_port_sweep_1k",
+        "tcp_5tuple_sweep_rss", "ipv6_src_sweep_64",
     ]
     for key in keys_keeping_fixed_dst_mac:
         data = traffic_templates.get_stream_data(key)

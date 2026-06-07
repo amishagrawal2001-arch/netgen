@@ -75,10 +75,20 @@ _TEMPLATES: List[_Template] = [
             "ipv4_checkbox": True,
             "ipv6_checkbox": False,
             "vlan_input": "10",
-            "bgp_protocol_type": "iBGP",
+            # v0.4.7 fix: pre-v0.4.7 set `bgp_protocol_type` which is
+            # NOT a widget — the real choice lives on
+            # `protocol_dropdown`. The `iBGP` / `eBGP` items only get
+            # added to that dropdown AFTER bgp_enable_checkbox is
+            # toggled on (line ~1113 in add_device_dialog.py), which
+            # apply_to_dialog wires via _on_protocol_enabled_changed().
+            # We use post_apply to: (1) force-cascade so the items
+            # exist, (2) select the right one, (3) tick
+            # use-loopback so the loopback-IP rows light up.
             "bgp_local_as_input": "65000",
             "bgp_remote_as_input": "65000",
+            "bgp_remote_loopback_ip_input": "192.168.250.1",
         },
+        post_apply=lambda d: _select_bgp_protocol(d, "iBGP"),
     ),
     _Template(
         key="ebgp_peer",
@@ -90,10 +100,13 @@ _TEMPLATES: List[_Template] = [
             "ipv4_checkbox": True,
             "ipv6_checkbox": False,
             "vlan_input": "10",
-            "bgp_protocol_type": "eBGP",
+            # v0.4.7 fix: same pattern as iBGP — use post_apply since
+            # protocol_dropdown items are dynamic on BGP-checkbox.
             "bgp_local_as_input": "65000",
             "bgp_remote_as_input": "65001",
+            "bgp_remote_loopback_ip_input": "192.168.250.1",
         },
+        post_apply=lambda d: _select_bgp_protocol(d, "eBGP"),
     ),
     _Template(
         key="ospf_backbone",
@@ -123,16 +136,23 @@ _TEMPLATES: List[_Template] = [
     ),
     _Template(
         key="isis_l12",
-        title="IS-IS Level-1-2 router",
-        summary="L1-L2 with NET 49.0001.0000.0000.0001.00 by default. "
-                "Adjust the system-id portion per device.",
+        title="IS-IS router (Area 49.0001)",
+        summary="IS-IS with NET prefix 49.0001 by default. System-ID "
+                "auto-assigned by the dialog. The IS-IS level is set "
+                "by the underlying engine — there's no GUI selector "
+                "for it in the current AddDeviceDialog.",
         protocols=["ISIS"],
         fields={
             "ipv4_checkbox": True,
             "ipv6_checkbox": True,
             "vlan_input": "10",
-            "isis_area_input": "49.0001",
-            "isis_level_combo": "Level-1-2",
+            # v0.4.7 fix: pre-v0.4.7 used `isis_area_input` (which
+            # doesn't exist) and `isis_level_combo` (no such widget
+            # in the dialog at all). Real widget is
+            # `isis_area_id_input`. Level selection isn't surfaced
+            # in the dialog — summary tones down the L1-L2 claim
+            # accordingly.
+            "isis_area_id_input": "49.0001",
         },
     ),
     _Template(
@@ -158,9 +178,148 @@ _TEMPLATES: List[_Template] = [
             "ipv4_checkbox": True,
             "ipv6_checkbox": False,
             "vlan_input": "10",
+            # v0.4.7 fix: pre-v0.4.7 the template summary promised
+            # specific VNI / UDP / Bridge SVI defaults but the
+            # fields dict ONLY set vlan_input. Result: operator
+            # picked vxlan_vtep, got an empty VXLAN config with
+            # the protocol enabled — looked broken. These four
+            # widgets exist in AddDeviceDialog (lines 972-1014):
+            "vxlan_vni_input": "10000",
+            "vxlan_udp_port_input": "4789",
+            "vxlan_bridge_svi_ip_input": "10.0.0.100/24",
+            "vxlan_local_ip_input": "10.0.250.1",
+            "vxlan_remote_input": "10.0.250.2",
+        },
+    ),
+
+    # ──────────────────────────────── v0.4.7 gap-fill templates
+    # The pre-v0.4.7 catalog covered iBGP / eBGP / OSPFv2 / OSPFv2+v3 /
+    # IS-IS / DHCP-client / VXLAN VTEP + bare host (8 entries). Four
+    # operator-frequent roles were missing — each one would otherwise
+    # be hand-built every time.
+
+    _Template(
+        key="rocev2_target",
+        title="RoCEv2 lossless target",
+        summary="RDMA target with DSCP=46 (EF/lossless), Priority=3 "
+                "(typical PFC TC), UDP/4791. Pair with a corresponding "
+                "client running ib_send_bw / ib_write_bw. Use as the "
+                "device side of an RDMA Blast flow.",
+        protocols=["ROCEV2"],
+        fields={
+            "ipv4_checkbox": True,
+            "ipv6_checkbox": False,
+            "vlan_input": "10",
+            # RoCEv2 widgets are at lines 937-951 of add_device_dialog.py
+            "rocev2_dscp_input": "46",       # EF / lossless DSCP
+            "rocev2_priority_input": "3",    # standard PFC TC for storage
+            "rocev2_udp_port_input": "4791", # IANA-assigned RoCEv2 UDP port
+        },
+    ),
+
+    _Template(
+        key="dhcp_server",
+        title="DHCP server (pool 192.168.30.10-200)",
+        summary="dnsmasq inside the device VRF. Pool 192.168.30.10–200, "
+                "gateway 192.168.30.0/24, 1-hour lease. Useful for "
+                "stressing DHCP relay / IPAM / client churn paths.",
+        protocols=["DHCP"],
+        fields={
+            "ipv4_checkbox": True,
+            "ipv6_checkbox": False,
+            "vlan_input": "10",
+            "dhcp_mode_combo": "Server",
+            # DHCP server widgets are at lines 845-863
+            "dhcp_pool_start_input": "192.168.30.10",
+            "dhcp_pool_end_input": "192.168.30.200",
+            "dhcp_gateway_route_input": "192.168.30.0/24",
+            "dhcp_lease_time_input": "3600",
+        },
+    ),
+
+    _Template(
+        key="bgp_ospf_pe",
+        title="PE router (eBGP external + OSPFv2 internal)",
+        summary="Classic provider-edge: eBGP to the upstream (AS 65000 "
+                "→ AS 65001), OSPFv2 area-0 to the internal fabric. "
+                "Loopback used as router-id for both protocols.",
+        protocols=["BGP", "OSPF"],
+        fields={
+            "ipv4_checkbox": True,
+            "ipv6_checkbox": False,
+            "vlan_input": "10",
+            "bgp_local_as_input": "65000",
+            "bgp_remote_as_input": "65001",
+            "bgp_remote_loopback_ip_input": "192.168.250.1",
+            "ospf_area_id_input": "0.0.0.0",
+        },
+        post_apply=lambda d: _select_bgp_protocol(d, "eBGP"),
+    ),
+
+    _Template(
+        key="ipv6_only_host",
+        title="IPv6-only host (no v4)",
+        summary="Plain host with IPv4 OFF, IPv6 ON. Address "
+                "2001:db8::2/64 with gateway 2001:db8::1. Useful for "
+                "v6-only deployment tests (NAT64, DNS64, MAP-E test "
+                "targets, v6-only stream sinks).",
+        protocols=[],
+        fields={
+            "ipv4_checkbox": False,
+            "ipv6_checkbox": True,
+            "vlan_input": "10",
+            # IPv6 widget defaults already match (2001:db8::2 etc.),
+            # but pin them explicitly so a future widget-default
+            # change doesn't silently drift the template.
+            "ipv6_input": "2001:db8::2",
+            "ipv6_mask_input": "64",
+            "ipv6_gateway_input": "2001:db8::1",
         },
     ),
 ]
+
+
+# ─────────────────────────────── v0.4.7 helpers
+#
+# `protocol_dropdown` items are populated DYNAMICALLY when BGP is
+# enabled (add_device_dialog.py:1095-1113 — "Add iBGP and eBGP as
+# separate protocol options when BGP is enabled"). A template that
+# wants to select iBGP / eBGP can't just call
+# `protocol_dropdown.setCurrentText` in its `fields` dict, because
+# apply_to_dialog applies protocols (step 1) BEFORE fields (step 2)
+# — and the cascading visibility update (which is what populates the
+# dropdown items) doesn't run until AFTER both, at the end of
+# apply_to_dialog.
+#
+# Workaround: this helper force-runs the cascade first, then sets
+# the dropdown. Called from `post_apply` of the iBGP / eBGP / PE
+# templates. The trailing cascade by apply_to_dialog is then a
+# no-op.
+
+
+def _select_bgp_protocol(dialog, choice: str) -> None:
+    """Force the protocol_dropdown to iBGP or eBGP after BGP is on.
+
+    Pre-v0.4.7 the iBGP / eBGP templates set a non-existent
+    `bgp_protocol_type` field which was silently dropped — so
+    operators picking the "iBGP peer" template ended up with eBGP
+    (or whatever the dropdown happened to default to). This helper
+    actually does the selection.
+    """
+    try:
+        if hasattr(dialog, "_on_protocol_enabled_changed"):
+            dialog._on_protocol_enabled_changed()
+        dropdown = getattr(dialog, "protocol_dropdown", None)
+        if dropdown is not None and hasattr(dropdown, "setCurrentText"):
+            dropdown.setCurrentText(choice)
+        # Also tick the "use loopback IP" checkbox so the
+        # bgp_remote_loopback_ip_input we filled becomes editable.
+        chk = getattr(dialog, "bgp_use_loopback_checkbox", None)
+        if chk is not None and hasattr(chk, "setChecked"):
+            chk.setChecked(True)
+    except Exception:
+        # Templates must never break the dialog — silent best-effort.
+        pass
 
 
 # ---------------------------------------------------------------- public API

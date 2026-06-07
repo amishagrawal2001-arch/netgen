@@ -1158,13 +1158,24 @@ class TrafficGenClientStatisticsSection():
                     merged_statistics[tx_iface]["send_fps"] += tx_rate
                     merged_statistics[tx_iface]["send_bps"] += tx_rate * frame_size * 8
 
-                    if flow_tracking:
-                        merged_statistics[tx_iface]["rx"] += rx
-                        merged_statistics[tx_iface]["received_bytes"] += rx * frame_size
-                        merged_statistics[tx_iface]["receive_fps"] += rx_rate
-                        merged_statistics[tx_iface]["receive_bps"] += rx_rate * frame_size * 8
+                    # v0.4.6: DO NOT add rx_count / rx_rate into the
+                    # TX-interface bucket. The pre-fix block did that
+                    # under `if flow_tracking:` — operator-reported on
+                    # svl-d-ai-srv04 that the TX iface's Received Frames /
+                    # Receive Frame Rate columns ended up mirroring the
+                    # RX iface (both columns showed identical 3,836 /
+                    # 397.36 fps for a stream where TX iface =
+                    # enp160s0f0np0 and RX iface = enp181s0f0np0).
+                    # The TX iface did not actually receive those
+                    # packets — the RX iface did. The RX-aggregation
+                    # block below correctly attributes them.
+                    # If tx_iface == rx_iface (loopback / single-port
+                    # test), the RX-aggregation block runs against the
+                    # same dict and adds RX exactly once — no
+                    # double-count.
 
-                # RX aggregation
+                # RX aggregation — the only place rx / received_bytes /
+                # receive_fps / receive_bps get added.
                 if rx_iface and rx_iface in merged_statistics:
                     frame_size = stream.get("frame_size", 64)
                     try:

@@ -193,7 +193,7 @@ def test_chip_starts_in_gray_state_when_no_server(qapp, monkeypatch):
                                  poll_interval_ms=0)
     # Constructor immediately paints gray "—" before any refresh.
     assert chip.state() == "gray"
-    chip.refresh()  # no-op: no URL
+    chip.refresh(synchronous=True)  # no-op: no URL
     assert chip.state() == "gray"
 
 
@@ -204,7 +204,7 @@ def test_chip_renders_green_on_ready_payload(make_chip):
         "hugepage_size": "2MB", "iommu_enabled": True,
         "iommu_details": "Intel IOMMU enabled", "vfio_pci_loaded": True,
     })
-    chip.refresh()
+    chip.refresh(synchronous=True)
     assert chip.state() == "green"
     assert "ready" in chip.text().lower()
 
@@ -215,7 +215,7 @@ def test_chip_renders_red_when_tx_worker_missing(make_chip):
         "hugepages_configured": True, "iommu_enabled": True,
         "vfio_pci_loaded": True,
     })
-    chip.refresh()
+    chip.refresh(synchronous=True)
     assert chip.state() == "red"
 
 
@@ -227,13 +227,13 @@ def test_chip_silent_on_http_failure(make_chip, monkeypatch):
         "hugepages_configured": True, "iommu_enabled": True,
         "vfio_pci_loaded": True,
     })
-    chip.refresh()
+    chip.refresh(synchronous=True)
     assert chip.state() == "green"
     # Flip to a raising mock and refresh again — state stays green.
     def boom(*a, **k):
         raise ConnectionError("server unreachable")
     monkeypatch.setattr(mod.requests, "get", boom)
-    chip.refresh()  # should not raise
+    chip.refresh(synchronous=True)  # should not raise
     assert chip.state() == "green"
 
 
@@ -243,10 +243,10 @@ def test_chip_silent_on_non_200(make_chip, monkeypatch):
         "hugepages_configured": False, "iommu_enabled": False,
         "vfio_pci_loaded": False,
     })
-    chip.refresh()
+    chip.refresh(synchronous=True)
     assert chip.state() == "amber"
     monkeypatch.setattr(mod.requests, "get",
                         lambda *a, **k: SimpleNamespace(
                             status_code=503, json=lambda: {}, text=""))
-    chip.refresh()
+    chip.refresh(synchronous=True)
     assert chip.state() == "amber"  # unchanged

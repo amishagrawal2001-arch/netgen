@@ -497,6 +497,371 @@ _TEMPLATES: List[_StreamTemplate] = [
         },
     ),
 
+    # v0.4.7: gap-fill scale templates. The v0.3.11 batch covered
+    # MAC-dst / IPv4 src+dst / IPv6 dst / 5-tuple / VLAN-ID but left
+    # five operator-frequent stress scenarios un-templated. Each one
+    # below is a one-click handoff: operator picks → dialog populates
+    # → Save. Without these, the operator hand-builds the equivalent
+    # stream every time (and gets the field names wrong half the
+    # time, because the dialog uses different mode-key shapes for
+    # MAC / IPv4 / UDP / TCP / VLAN — they look uniform but aren't).
+
+    _StreamTemplate(
+        key="mac_src_sweep_1k",
+        title="Scale · MAC src sweep · 1024 unique src MACs",
+        summary="Cycle SOURCE MAC across 1024 addresses starting at "
+                "02:00:00:00:01:00, step 1. Symmetric to the dst-MAC "
+                "sweep — useful for testing the SWITCH's MAC-learning "
+                "rate (it has to learn 1024 new entries) and any "
+                "DHCP / DAD / ARP-source uniqueness checks downstream. "
+                "Bump count to 16k/64k to stress switch MAC table size.",
+        stream_data={
+            "name": "scale-mac-src-1k",
+            "enabled": True,
+            "L3": "IPv4",
+            "L4": "UDP",
+            "frame_size": 128,
+            "stream_rate_type": "Line Rate",
+            "dpdk_enable": True,
+            "dpdk_tx_cores": 2,
+            "enable_timestamps": False,
+            "protocol_data": {
+                "mac": {
+                    "mac_source_mode": "Increment",
+                    "mac_source_address": "02:00:00:00:01:00",
+                    "mac_source_count": "1024",
+                    "mac_source_step": "1",
+                    "mac_destination_mode": "Fixed",
+                    "mac_destination_address": _DEFAULT_DST_MAC,
+                },
+                "ipv4": {
+                    "ipv4_source": _DEFAULT_SRC_IP4,
+                    "ipv4_destination": _DEFAULT_DST_IP4,
+                },
+                "udp": {
+                    "udp_source_port": "1234",
+                    "udp_destination_port": "4791",
+                },
+            },
+        },
+    ),
+
+    _StreamTemplate(
+        key="mac_src_and_dst_sweep_1k",
+        title="Scale · MAC src+dst sweep · 1024 each end",
+        summary="Cycle BOTH src and dst MAC simultaneously (1024 each). "
+                "Both ends of the switch fabric have to learn 1024 "
+                "entries. Closest analog of a real DC tenant with "
+                "many hosts on each ToR — exercises L2 fabric scaling "
+                "end-to-end, not just one direction.",
+        stream_data={
+            "name": "scale-mac-srcdst-1k",
+            "enabled": True,
+            "L3": "IPv4",
+            "L4": "UDP",
+            "frame_size": 128,
+            "stream_rate_type": "Line Rate",
+            "dpdk_enable": True,
+            "dpdk_tx_cores": 2,
+            "enable_timestamps": False,
+            "protocol_data": {
+                "mac": {
+                    "mac_source_mode": "Increment",
+                    "mac_source_address": "02:00:00:00:01:00",
+                    "mac_source_count": "1024",
+                    "mac_source_step": "1",
+                    "mac_destination_mode": "Increment",
+                    "mac_destination_address": "02:00:00:00:02:00",
+                    "mac_destination_count": "1024",
+                    "mac_destination_step": "1",
+                },
+                "ipv4": {
+                    "ipv4_source": _DEFAULT_SRC_IP4,
+                    "ipv4_destination": _DEFAULT_DST_IP4,
+                },
+                "udp": {
+                    "udp_source_port": "1234",
+                    "udp_destination_port": "4791",
+                },
+            },
+        },
+    ),
+
+    _StreamTemplate(
+        key="udp_src_port_sweep_1k",
+        title="Scale · UDP src port sweep · 1024 ports",
+        summary="Cycle UDP source port across 1024 values starting at "
+                "10000, step 1. Tests stateful NAT port-pool exhaustion, "
+                "connection-table allocation, and 5-tuple-hash diversity "
+                "on the source side alone. Pairs with a fixed dst port "
+                "to mirror a many-clients-one-service scenario.",
+        stream_data={
+            "name": "scale-udp-src-port-1k",
+            "enabled": True,
+            "L3": "IPv4",
+            "L4": "UDP",
+            "frame_size": 128,
+            "stream_rate_type": "Line Rate",
+            "dpdk_enable": True,
+            "dpdk_tx_cores": 2,
+            "enable_timestamps": False,
+            "protocol_data": {
+                "mac": {
+                    "mac_source_address": _DEFAULT_SRC_MAC,
+                    "mac_destination_address": _DEFAULT_DST_MAC,
+                },
+                "ipv4": {
+                    "ipv4_source": _DEFAULT_SRC_IP4,
+                    "ipv4_destination": _DEFAULT_DST_IP4,
+                },
+                "udp": {
+                    "udp_source_port": "10000",
+                    "udp_increment_source_port": True,
+                    "udp_source_port_step": "1",
+                    "udp_source_port_count": "1024",
+                    "udp_destination_port": "4791",
+                },
+            },
+        },
+    ),
+
+    _StreamTemplate(
+        key="udp_dst_port_sweep_1k",
+        title="Scale · UDP dst port sweep · 1024 ports",
+        summary="Cycle UDP destination port across 1024 values starting "
+                "at 10000, step 1. Useful for service-discovery / "
+                "port-scan workloads, stateful firewall per-port rule "
+                "evaluation, and load-balancer dst-port hashing. Bump "
+                "count to 65535 to walk the full UDP port space.",
+        stream_data={
+            "name": "scale-udp-dst-port-1k",
+            "enabled": True,
+            "L3": "IPv4",
+            "L4": "UDP",
+            "frame_size": 128,
+            "stream_rate_type": "Line Rate",
+            "dpdk_enable": True,
+            "dpdk_tx_cores": 2,
+            "enable_timestamps": False,
+            "protocol_data": {
+                "mac": {
+                    "mac_source_address": _DEFAULT_SRC_MAC,
+                    "mac_destination_address": _DEFAULT_DST_MAC,
+                },
+                "ipv4": {
+                    "ipv4_source": _DEFAULT_SRC_IP4,
+                    "ipv4_destination": _DEFAULT_DST_IP4,
+                },
+                "udp": {
+                    "udp_source_port": "1234",
+                    "udp_destination_port": "10000",
+                    "udp_increment_destination_port": True,
+                    "udp_destination_port_step": "1",
+                    "udp_destination_port_count": "1024",
+                },
+            },
+        },
+    ),
+
+    _StreamTemplate(
+        key="tcp_baseline",
+        title="TCP baseline · IPv4 / port 80",
+        summary="Plain TCP/IPv4 stream — src port 10000, dst port 80, "
+                "SYN flag set. This is the missing 'I want a TCP stream' "
+                "template. Use as the starter for any TCP-flavoured "
+                "test; layer modifiers / sweeps on top. Scapy path "
+                "(DPDK TX is UDP-only).",
+        stream_data={
+            "name": "tcp-baseline",
+            "enabled": True,
+            "L3": "IPv4",
+            "L4": "TCP",
+            "frame_size": 128,
+            "stream_rate_type": "Packets/sec",
+            "stream_rate_value": 1000,
+            "dpdk_enable": False,
+            "enable_timestamps": False,
+            "protocol_data": {
+                "mac": {
+                    "mac_source_address": _DEFAULT_SRC_MAC,
+                    "mac_destination_address": _DEFAULT_DST_MAC,
+                },
+                "ipv4": {
+                    "ipv4_source": _DEFAULT_SRC_IP4,
+                    "ipv4_destination": _DEFAULT_DST_IP4,
+                },
+                "tcp": {
+                    "tcp_source_port": "10000",
+                    "tcp_destination_port": "80",
+                    "tcp_flags": "SYN",
+                },
+            },
+        },
+    ),
+
+    _StreamTemplate(
+        key="tcp_src_port_sweep_1k",
+        title="Scale · TCP src port sweep · 1024 ports",
+        summary="Cycle TCP source port across 1024 values starting at "
+                "10000, step 1. Tests stateful firewall connection "
+                "table allocation, NAT pool exhaustion, and SYN-flood "
+                "resilience. Scapy path — DPDK TX is UDP-only today.",
+        stream_data={
+            "name": "scale-tcp-src-port-1k",
+            "enabled": True,
+            "L3": "IPv4",
+            "L4": "TCP",
+            "frame_size": 128,
+            "stream_rate_type": "Packets/sec",
+            "stream_rate_value": 10000,
+            "dpdk_enable": False,
+            "enable_timestamps": False,
+            "protocol_data": {
+                "mac": {
+                    "mac_source_address": _DEFAULT_SRC_MAC,
+                    "mac_destination_address": _DEFAULT_DST_MAC,
+                },
+                "ipv4": {
+                    "ipv4_source": _DEFAULT_SRC_IP4,
+                    "ipv4_destination": _DEFAULT_DST_IP4,
+                },
+                "tcp": {
+                    "tcp_source_port": "10000",
+                    "tcp_increment_source_port": True,
+                    "tcp_source_port_step": "1",
+                    "tcp_source_port_count": "1024",
+                    "tcp_destination_port": "80",
+                    "tcp_flags": "SYN",
+                },
+            },
+        },
+    ),
+
+    _StreamTemplate(
+        key="tcp_dst_port_sweep_1k",
+        title="Scale · TCP dst port sweep · 1024 ports",
+        summary="Cycle TCP destination port across 1024 values starting "
+                "at 1, step 1. The classic port-scan / service-discovery "
+                "workload — useful for firewall ACL coverage tests and "
+                "IDS / IPS signature exercising. Scapy path.",
+        stream_data={
+            "name": "scale-tcp-dst-port-1k",
+            "enabled": True,
+            "L3": "IPv4",
+            "L4": "TCP",
+            "frame_size": 128,
+            "stream_rate_type": "Packets/sec",
+            "stream_rate_value": 10000,
+            "dpdk_enable": False,
+            "enable_timestamps": False,
+            "protocol_data": {
+                "mac": {
+                    "mac_source_address": _DEFAULT_SRC_MAC,
+                    "mac_destination_address": _DEFAULT_DST_MAC,
+                },
+                "ipv4": {
+                    "ipv4_source": _DEFAULT_SRC_IP4,
+                    "ipv4_destination": _DEFAULT_DST_IP4,
+                },
+                "tcp": {
+                    "tcp_source_port": "10000",
+                    "tcp_destination_port": "1",
+                    "tcp_increment_destination_port": True,
+                    "tcp_destination_port_step": "1",
+                    "tcp_destination_port_count": "1024",
+                    "tcp_flags": "SYN",
+                },
+            },
+        },
+    ),
+
+    _StreamTemplate(
+        key="tcp_5tuple_sweep_rss",
+        title="Scale · TCP 5-tuple sweep · RSS bucket spread",
+        summary="TCP analog of the UDP 5-tuple sweep. Varies src IP, "
+                "dst IP, src port AND dst port together (256 each) "
+                "so the receiver's RSS hash distributes the TCP flow "
+                "across all queues. Stress-tests multi-queue NIC "
+                "capacity for TCP / stateful workloads. Scapy path.",
+        stream_data={
+            "name": "scale-tcp-5tuple-rss",
+            "enabled": True,
+            "L3": "IPv4",
+            "L4": "TCP",
+            "frame_size": 128,
+            "stream_rate_type": "Packets/sec",
+            "stream_rate_value": 50000,
+            "dpdk_enable": False,
+            "enable_timestamps": False,
+            "protocol_data": {
+                "mac": {
+                    "mac_source_address": _DEFAULT_SRC_MAC,
+                    "mac_destination_address": _DEFAULT_DST_MAC,
+                },
+                "ipv4": {
+                    "ipv4_source": "10.10.0.0",
+                    "ipv4_source_mode": "Increment",
+                    "ipv4_source_increment_step": "1",
+                    "ipv4_source_increment_count": "256",
+                    "ipv4_destination": "10.20.0.0",
+                    "ipv4_destination_mode": "Increment",
+                    "ipv4_destination_increment_step": "1",
+                    "ipv4_destination_increment_count": "256",
+                },
+                "tcp": {
+                    "tcp_source_port": "1024",
+                    "tcp_increment_source_port": True,
+                    "tcp_source_port_step": "1",
+                    "tcp_source_port_count": "256",
+                    "tcp_destination_port": "10000",
+                    "tcp_increment_destination_port": True,
+                    "tcp_destination_port_step": "1",
+                    "tcp_destination_port_count": "256",
+                    "tcp_flags": "SYN",
+                },
+            },
+        },
+    ),
+
+    _StreamTemplate(
+        key="ipv6_src_sweep_64",
+        title="Scale · IPv6 src sweep · 64 sources",
+        summary="Cycle src IPv6 across 64 addresses starting at "
+                "2001:db8:1::1, step 1. Symmetric to the v6 dst sweep — "
+                "exercises NAT64 / SLB-DR source binding, v6 stateful "
+                "firewall per-src rule eval, and v6 ECMP src-hash. "
+                "Bump count for larger v6 source pools.",
+        stream_data={
+            "name": "scale-ipv6-src-64",
+            "enabled": True,
+            "L3": "IPv6",
+            "L4": "UDP",
+            "frame_size": 128,
+            "stream_rate_type": "Line Rate",
+            "dpdk_enable": True,
+            "dpdk_tx_cores": 2,
+            "enable_timestamps": False,
+            "protocol_data": {
+                "mac": {
+                    "mac_source_address": _DEFAULT_SRC_MAC,
+                    "mac_destination_address": _DEFAULT_DST_MAC,
+                },
+                "ipv6": {
+                    "ipv6_source": "2001:db8:1::1",
+                    "ipv6_source_mode": "Increment",
+                    "ipv6_source_increment_step": "1",
+                    "ipv6_source_increment_count": "64",
+                    "ipv6_destination": "2001:db8::1",
+                    "ipv6_destination_mode": "Fixed",
+                },
+                "udp": {
+                    "udp_source_port": "1234",
+                    "udp_destination_port": "4791",
+                },
+            },
+        },
+    ),
+
     _StreamTemplate(
         key="vlan_id_sweep_4k",
         title="Scale · VLAN ID sweep · 4094 tags",

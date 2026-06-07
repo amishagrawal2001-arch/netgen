@@ -546,7 +546,18 @@ class AddTGenDialog(QDialog):
             return
         del self._entries[i]
         _save_history(self._entries)
-        self._populate_history_table()
+        # v0.4.7: surgical removeRow(i) instead of
+        # _populate_history_table(). The repopulate path setRowCount(0)s
+        # the whole table and rebuilds every row from scratch, which
+        # silently wipes the LED / version / health columns on every
+        # other row — those values live only in the QTableWidget items
+        # (the probe slots populate them post-construction), not in
+        # `self._entries`. Operator-reported: "when i removed TGen
+        # from the Add TGen chassis, other chassis lost the connection
+        # status". The right semantic: remove ONE row, leave the rest
+        # untouched. removeRow auto-shifts subsequent row indices down
+        # by one, which is exactly what we want here.
+        self.table.removeRow(i)
 
     # -- Reachability probe --------------------------------------------------
 

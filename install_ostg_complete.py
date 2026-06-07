@@ -302,6 +302,53 @@ class NetgenInstaller:
         "-o Dpkg::Options::=--force-confold"
     )
 
+    # ─────────────────────────────────────── pip helpers (v0.4.7+)
+    #
+    # Ubuntu 24.04+ ships the EXTERNALLY-MANAGED marker (PEP 668),
+    # which makes the system pip refuse `pip3 install <wheel>` with
+    # `error: externally-managed-environment` and a hint to use
+    # `apt install python3-xyz` or a venv. Neither fits our model:
+    # netgen lays down a systemd unit that runs the system python,
+    # and the wheel ships pure-python modules pip is uniquely
+    # positioned to manage. The correct PEP 668 escape is the
+    # `--break-system-packages` flag.
+    #
+    # The flag was added in pip 23.0 (Jan 2023). Older systems
+    # (Ubuntu 22.04 / Jammy: pip 22.0.2) don't recognize it AND
+    # don't enforce PEP 668, so blindly passing it breaks them.
+    # We detect by checking for EXTERNALLY-MANAGED on the remote
+    # — its presence is the canonical signal that the system pip
+    # both enforces PEP 668 AND understands the escape flag.
+    # Cached so we only do the one ls per install.
+    def _detect_pep668_break_flag(self) -> str:
+        """Return the pip flag string (with trailing space) needed
+        to escape PEP 668 on the target, or '' if the target
+        doesn't enforce it. Cached after first call."""
+        if hasattr(self, "_pep668_break_flag_cached"):
+            return self._pep668_break_flag_cached
+        try:
+            r = self.run_command(
+                "ls /usr/lib/python3*/EXTERNALLY-MANAGED 2>/dev/null",
+                check=False, capture_output=True,
+            )
+            enforced = bool((r.stdout or "").strip())
+        except Exception:
+            # Detection failure → assume not enforced. If the
+            # subsequent pip install fails with the PEP 668 error,
+            # the belt-and-suspenders retry in install_netgen()
+            # will catch it.
+            enforced = False
+        self._pep668_break_flag_cached = (
+            "--break-system-packages " if enforced else ""
+        )
+        if enforced:
+            self.log(
+                "Detected PEP 668 (EXTERNALLY-MANAGED) on target — "
+                "pip installs will pass --break-system-packages"
+            )
+        return self._pep668_break_flag_cached
+
+
     def _install_apt_keyring(self, name: str, key_url: str,
                              *, check: bool = True) -> None:
         """Download an apt repository signing key + dearmor it into
@@ -1228,19 +1275,49 @@ class NetgenInstaller:
         # on the first pass and don't need re-resolution for an
         # in-place artifact swap.
         #
+        # v0.4.7: Ubuntu 24.04+ enforces PEP 668 — system pip refuses
+        # to install without --break-system-packages. The
+        # `pep668_flag` helper detects the EXTERNALLY-MANAGED marker
+        # on the remote and returns the flag string (or '' on older
+        # systems where pip doesn't recognize the option).
+        # Operator-reported: fresh install on Noble failed with
+        # `error: externally-managed-environment` even after the
+        # wheel was successfully copied. netgen IS a system-wide
+        # install (it lays down a systemd unit that uses /usr/bin/
+        # python3), so the PEP 668 escape is the correct semantics
+        # here — not a venv.
+        #
         # Retry with --ignore-installed if distutils-owned packages
         # block uninstall (Debian-managed packaging shipped via dpkg
         # can't be cleanly uninstalled by pip).
+        pep668 = self._detect_pep668_break_flag()
         pip_result = self.run_command(
-            f"pip3 install --force-reinstall --no-deps {remote_wheel_path}",
+            f"pip3 install {pep668}--force-reinstall --no-deps {remote_wheel_path}",
             check=False, capture_output=True,
         )
         if pip_result.returncode != 0:
             err = (pip_result.stderr or "") + (pip_result.stdout or "")
+            # Belt-and-suspenders: if detection missed (e.g. an
+            # unconventional Python install path), the error
+            # message itself surfaces the PEP 668 signal. Retry
+            # with the flag.
+            if "externally-managed" in err.lower() and not pep668:
+                self.log(
+                    "Pip refused install due to PEP 668 / "
+                    "externally-managed-environment; retrying with "
+                    "--break-system-packages",
+                    "WARNING",
+                )
+                pip_result = self.run_command(
+                    f"pip3 install --break-system-packages "
+                    f"--force-reinstall --no-deps {remote_wheel_path}",
+                    check=False, capture_output=True,
+                )
+                err = (pip_result.stderr or "") + (pip_result.stdout or "")
             if "uninstall-distutils-installed-package" in err or "Cannot uninstall" in err:
                 self.log("Pip failed due to distutils-installed package conflict; retrying with --ignore-installed", "WARNING")
                 pip_result = self.run_command(
-                    f"pip3 install --force-reinstall --no-deps --ignore-installed {remote_wheel_path}",
+                    f"pip3 install {pep668}--force-reinstall --no-deps --ignore-installed {remote_wheel_path}",
                     check=False, capture_output=True,
                 )
             if pip_result.returncode != 0:
@@ -1254,7 +1331,7 @@ class NetgenInstaller:
         # prior install) it installs them. Using ``--upgrade-strategy
         # only-if-needed`` keeps already-satisfied deps in place.
         deps_result = self.run_command(
-            f"pip3 install --upgrade-strategy only-if-needed {remote_wheel_path}",
+            f"pip3 install {pep668}--upgrade-strategy only-if-needed {remote_wheel_path}",
             check=False, capture_output=True,
         )
         if deps_result.returncode != 0:
@@ -1546,10 +1623,14 @@ class NetgenInstaller:
             "numpy>=1.24.0"
         ]
         
-        # Install AI dependencies
+        # Install AI dependencies. v0.4.7: include the PEP 668
+        # escape flag if the remote enforces externally-managed-
+        # environment (Ubuntu 24.04+). Same rationale as the wheel
+        # install above.
+        pep668 = self._detect_pep668_break_flag()
         for package in ai_packages:
             try:
-                self.run_command(f"pip3 install {package}")
+                self.run_command(f"pip3 install {pep668}{package}")
                 self.log(f"✓ Installed {package}")
             except subprocess.CalledProcessError as e:
                 self.log(f"Failed to install {package}: {e}", "WARNING")

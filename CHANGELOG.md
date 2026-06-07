@@ -2,6 +2,201 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.4.7] - 2026-06-06
+
+**Seven operator-reported bugs + four feature gaps. Combined ship
+of what was internally v0.4.6 + v0.4.7.**
+
+Full suite: **1,432 passed, 1 skipped** (+46 new tests).
+
+---
+
+### Fix 1 — TX interface no longer mirrors RX columns (was v0.4.6)
+
+Operator-reported on svl-d-ai-srv04 with v0.4.5 installed: the
+Interface Statistics table showed the TX iface `enp160s0f0np0`
+with `Received Frames = 3,836`, `Receive Frame Rate = 397.36 fps`,
+and `Receive Bit Rate = 203.45 Kbps` — exact mirrors of the RX
+iface `enp181s0f0np0`. The TX iface didn't actually receive those
+packets; the bug was in the client-side aggregator
+`traffic_client/statistics_section.py:1161-1165`:
+
+```python
+# Pre-fix
+if flow_tracking:
+    merged_statistics[tx_iface]["rx"] += rx           # bug
+    merged_statistics[tx_iface]["received_bytes"] += rx * frame_size
+    merged_statistics[tx_iface]["receive_fps"] += rx_rate
+    merged_statistics[tx_iface]["receive_bps"] += rx_rate * frame_size * 8
+```
+
+The RX-aggregation block already attributed RX to the RX iface
+correctly — the TX-aggregation block was duplicating it onto the
+wrong interface. For loopback tests (TX iface == RX iface) the
+same lines double-counted RX (1,960 instead of 980 on a 1000-tx
+stream). Fix: delete the four mirror-lines. The RX-iface bucket is
+the sole place RX gets attributed.
+
+Pinned by `tests/test_v046_tx_iface_rx_mirror.py` (5 tests).
+
+### Fix 2 — DPDK readiness chip no longer freezes the UI
+
+Operator-reported: "dpdk check is slow when moving selection from
+one TG to another TG". Root cause: `DpdkReadinessChip.refresh()`
+did a synchronous `requests.get(..., timeout=5)` on the UI thread.
+Every poll (or selection-change) could block the Qt event loop for
+up to 5 sec when the server was sluggish.
+
+Refactored to async via a one-shot `QThread` worker
+(`_DpdkStatusFetchThread`); the chip emits a signal back to the UI
+thread when the payload arrives. Three additional improvements:
+
+- **Dedup guard** `_fetch_in_flight` — rapid TG-clicks (4 in 2 sec)
+  coalesce to ONE in-flight fetch, not four.
+- **Selection-change kick** — `_on_server_selection_changed_combined`
+  in `traffic_client/server_section.py` now calls `chip.refresh()` so
+  the chip switches state instantly when the TG changes, instead of
+  waiting up to 30 sec for the next poll.
+- **`stop()` waits the worker** (bounded 2 sec) so shutdown doesn't
+  trip Qt's "QThread destroyed while still running" abort.
+
+Pinned by `tests/test_v047_dpdk_chip_async.py` (7 tests).
+
+### Fix 3 — Session-file path persists across restarts
+
+Operator-reported: opened the client, expected streams + TGs from
+prior work, got "TG 0" with no streams and no other TGs. Root
+cause: `_current_session_path` was set when Save As / Load From…
+ran, but never persisted. On restart, `main.py:81` always reset it
+to the default `~/Documents/OSTG/session.json` (empty for first-
+time macOS-app users), so `load_session()` loaded that and the
+auto-add path tacked on a localhost TG 0.
+
+Fix: persist the path to `QSettings` whenever Save As / Load From
+changes it; on startup, read it back. Fall back to the default if
+the persisted file no longer exists (moved/deleted → no wedge).
+
+Pinned by `tests/test_v047_session_path_persistence.py` (6 tests).
+
+### Fix 4 — Removing one TGen no longer wipes others' connection status
+
+Operator-reported on the AddTGenDialog: had 3 chassis in the
+history table, all probed (✓ LEDs, version + health populated),
+clicked Remove on one — the other two reverted to "?" gray,
+version "?", health "—". Looked like the other chassis lost their
+connection.
+
+Root cause: `_remove_selected_from_history` called
+`_populate_history_table()` after deleting one entry. That helper
+`setRowCount(0)`s and rebuilds every row with default `"?"`
+placeholders — the LED / version / health items were never in
+`self._entries`, only in the QTableWidget items.
+
+Fix: surgical `self.table.removeRow(i)`. Qt shifts subsequent rows
+up by one and leaves their items untouched.
+
+Pinned by `tests/test_v047_add_tgen_remove_preserves_status.py` (3
+tests).
+
+### Fix 5 — Fresh install on Ubuntu 24.04+ (PEP 668)
+
+Operator-reported on a fresh Noble VM:
+
+```
+[ERROR] Wheel install failed: error: externally-managed-environment
+× This environment is externally managed
+╰─> To install Python packages system-wide, try apt install...
+hint: See PEP 668 for the detailed specification.
+[client] installer exit rc=1
+```
+
+Ubuntu 24.04+ ships `/usr/lib/python3*/EXTERNALLY-MANAGED` (PEP
+668), and the system pip refuses every `pip3 install` without
+`--break-system-packages`. The installer had 4 such callsites,
+none passing the flag.
+
+Fix: new `_detect_pep668_break_flag()` method runs `ls
+/usr/lib/python3*/EXTERNALLY-MANAGED` on the target once, caches
+the result. All 4 `pip3 install` callsites thread the flag (empty
+string on pre-PEP 668 systems whose pip doesn't recognize the
+option). Plus a belt-and-suspenders retry: if detection misses but
+pip's stderr says `externally-managed`, retry with the flag.
+
+Pinned by `tests/test_v047_installer_pep668.py` (6 tests).
+
+### Fix 6 — Device template audit (4 silent bugs)
+
+Audit of `utils/device_templates.py` against the actual
+`AddDeviceDialog` widget names surfaced four templates that
+referenced non-existent widgets. `apply_to_dialog` uses
+`getattr(dialog, name, None)` so the assignments were silently
+dropped — operator picked a template, got dialog defaults instead
+of the promised config.
+
+| Template | Pre-fix field | Real widget | Impact |
+|---|---|---|---|
+| `ibgp_peer` | `bgp_protocol_type` | `protocol_dropdown` | iBGP claim dropped |
+| `ebgp_peer` | `bgp_protocol_type` | `protocol_dropdown` | eBGP claim dropped |
+| `isis_l12` | `isis_area_input` | `isis_area_id_input` | Lucky non-bug (defaults matched) |
+| `isis_l12` | `isis_level_combo` | (no such widget) | Level claim dropped |
+| `vxlan_vtep` | (4 widgets unset) | All exist on dialog | Summary lied — VNI=5000 not 10000, Bridge SVI empty |
+
+`protocol_dropdown` items are populated *dynamically* when BGP is
+enabled, so a `fields` assignment can't drive it. Added a
+`_select_bgp_protocol(dialog, "iBGP"|"eBGP")` helper called from
+`post_apply` that force-runs the cascade then selects the right
+item AND ticks `bgp_use_loopback_checkbox`.
+
+Plus a catalog-wide invariant test
+(`test_every_template_field_references_a_real_widget`) that walks
+every field of every template against the dialog source — future
+drift surfaces here, not at the operator's chair.
+
+### Feature 1 — Nine new scale-stream templates
+
+Operator asked for templates covering source MAC, source/destination
+UDP and TCP ports. The pre-v0.4.7 catalog had MAC-dst / IPv4 src+dst
+/ IPv6 dst / 5-tuple (UDP) / VLAN-ID (six entries). New:
+
+- `mac_src_sweep_1k` — source-MAC sweep × 1024
+- `mac_src_and_dst_sweep_1k` — both-ends MAC learning
+- `udp_src_port_sweep_1k`, `udp_dst_port_sweep_1k`
+- `tcp_baseline` — the missing "I want TCP" starter
+- `tcp_src_port_sweep_1k`, `tcp_dst_port_sweep_1k`
+- `tcp_5tuple_sweep_rss` — TCP RSS bucket spread
+- `ipv6_src_sweep_64` — mirror of v0.3.11 IPv6 dst sweep
+
+Pinned by `tests/test_v047_scale_templates.py` (13 tests).
+
+### Feature 2 — Searchable template dropdown
+
+The catalog grew 14 → 23 entries; scrolling for the right scenario
+got tedious. Made the AddStreamDialog template combo editable with
+a case-insensitive `Qt.MatchContains` `QCompleter`. Typing "tcp"
+narrows to 4 templates, "src" to 6, "rss" to 2, "1024" to 5, etc.
+The dropdown still works as a regular combo (click the arrow).
+
+### Feature 3 — Four new device templates (gap-fill)
+
+- `rocev2_target` — RDMA target (DSCP=46 lossless, Priority=3,
+  UDP/4791)
+- `dhcp_server` — DHCP server (pool 192.168.30.10-200, 1h lease)
+- `bgp_ospf_pe` — PE router (eBGP external + OSPFv2 area-0)
+- `ipv6_only_host` — IPv6-only (v4 OFF, v6 ON)
+
+Pinned by `tests/test_v047_device_templates_audit.py` (11 tests).
+
+---
+
+### Operator action
+
+Upgrade target hosts to v0.4.7. The phantom `enp181s0f0np0.1`
+sub-iface from before v0.4.5 (if still present) persists at the
+kernel level — either run `sudo ip link delete enp181s0f0np0.1`
+once, or it'll get removed the next time a Tagged stream finishes.
+
+Fresh installs on Ubuntu 24.04+ now work out of the box (Fix 5).
+
 ## [0.4.5] - 2026-06-06
 
 **No more phantom `<rx_iface>.1` sub-interface on Untagged streams.**

@@ -76,9 +76,40 @@ class TrafficGeneratorClient(
         # the title shows the correct file from boot, and the menu
         # actions / save / load paths call _update_window_title()
         # whenever the path or dirty state changes.
+        #
+        # v0.4.7: restore from QSettings before falling back to the
+        # default. Operator-reported: opened the app, expected to see
+        # the streams + TGs they'd been working on, got TG 0 with
+        # nothing else. Root cause: they'd used Save As / Load From
+        # to point the active session at a non-default file (e.g.
+        # ~/Desktop/NetGen/session.json), but `_current_session_path`
+        # was reset to the default `~/Documents/OSTG/session.json`
+        # on every launch — so load_session() always opened the
+        # (empty) default file. The user's recent work was on disk,
+        # just at a different path the app had forgotten about.
         try:
             from utils.path_utils import get_session_file_path
-            self._current_session_path = get_session_file_path()
+            from PyQt5.QtCore import QSettings
+            import os as _os
+            default_path = get_session_file_path()
+            persisted = QSettings().value(
+                "current_session_path", "", type=str,
+            )
+            # Honor the persisted path only if it still exists on
+            # disk. A moved / deleted file would otherwise wedge the
+            # app at startup — better to silently fall back to the
+            # default and let the operator pick a new file via Load
+            # From… if they want.
+            if persisted and _os.path.exists(persisted):
+                self._current_session_path = persisted
+            else:
+                if persisted:
+                    logger.info(
+                        f"[STARTUP] persisted session path "
+                        f"{persisted!r} no longer exists; falling "
+                        f"back to default {default_path!r}"
+                    )
+                self._current_session_path = default_path
         except Exception:
             self._current_session_path = None
         # v0.3.11: auto-save opt-in. Default False so removing a row
