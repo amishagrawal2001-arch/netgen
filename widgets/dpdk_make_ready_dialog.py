@@ -421,24 +421,133 @@ class MakeDpdkReadyDialog(QDialog):
         row.set_state("ok")
         if action.needs_reboot:
             # IOMMU success — reboot then come back.
+            #
+            # v0.5.15: prompt with an inline "Reboot Now" button. The
+            # GRUB cmdline change doesn't take effect until reboot, so
+            # making the operator alt-tab to a terminal and run
+            # `sudo reboot` is friction. POST /api/system/reboot
+            # (v0.5.2+) lets us trigger the reboot from the dialog.
+            #
+            # Three-button choice:
+            #   Reboot Now        → POST /api/system/reboot, close dialog
+            #   I'll Reboot Later → just close (user reboots manually)
+            #   Cancel            → leave dialog open (user reviews log)
             self._detail.setText(
                 "<b>Reboot required.</b> IOMMU has been written to the "
                 "kernel cmdline. Reboot the server, then click "
                 "<i>Make DPDK Ready</i> again to continue from where "
                 "we left off."
             )
-            QMessageBox.information(
-                self, "Reboot Required",
-                f"IOMMU has been enabled on {self._server_url}.\n\n"
-                f"Reboot the server to activate it, then run "
-                f"Make DPDK Ready again — the wizard will skip the "
-                f"already-completed steps automatically.",
-            )
+            self._prompt_reboot(action)
             self._close_btn.setText("Close")
             return
 
         self._step_idx += 1
         self._advance()
+
+    def _prompt_reboot(self, action: Action) -> None:
+        """v0.5.15: prompt operator about the IOMMU-required reboot
+        and offer an inline 'Reboot Now' button that hits
+        /api/system/reboot. Falls back to a friendly message if the
+        server's too old to have the endpoint (pre-v0.5.2)."""
+        # parsing the server's host out of the URL for the body
+        host = self._server_url
+        for prefix in ("http://", "https://"):
+            if host.startswith(prefix):
+                host = host[len(prefix):]
+                break
+        host = host.rstrip("/").split(":")[0]
+
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Question)
+        msg.setWindowTitle("Reboot Required")
+        msg.setText(
+            f"<b>IOMMU has been enabled on {host}.</b>"
+        )
+        msg.setInformativeText(
+            "The kernel cmdline change doesn't take effect until the "
+            "host reboots. After it comes back up, run <b>Make DPDK "
+            "Ready</b> again — the wizard will skip the already-"
+            "completed steps automatically.\n\n"
+            "Reboot the server now?"
+        )
+        reboot_btn = msg.addButton(
+            "Reboot Now", QMessageBox.AcceptRole,
+        )
+        reboot_btn.setToolTip(
+            f"POST /api/system/reboot on {host}. Server schedules a "
+            f"systemd reboot ~3 s after replying so the HTTP response "
+            f"reaches the client cleanly."
+        )
+        later_btn = msg.addButton(
+            "I'll Reboot Later", QMessageBox.RejectRole,
+        )
+        later_btn.setToolTip(
+            "Close this dialog. Reboot the server manually (sudo reboot) "
+            "when you're ready, then re-run Make DPDK Ready."
+        )
+        msg.setDefaultButton(reboot_btn)
+        msg.exec_()
+
+        if msg.clickedButton() is reboot_btn:
+            self._trigger_reboot()
+
+    def _trigger_reboot(self) -> None:
+        """POST /api/system/reboot and surface the result. The server
+        replies first, then schedules the reboot — so we should see a
+        2xx, then the server goes away shortly after. Run async via
+        the same _api_worker to keep the UI responsive."""
+        self._detail.setText(
+            "<b>Reboot requested.</b> POST /api/system/reboot — server "
+            "will reply, then disappear ~3 s later. Wait for it to "
+            "come back, then re-run Make DPDK Ready."
+        )
+        Worker = _api_worker()
+        w = Worker(
+            method="POST",
+            url=f"{self._server_url}/api/system/reboot",
+            json={},
+            timeout=10,
+        )
+        w.done.connect(self._on_reboot_response)
+        w.setParent(self)
+        self._workers.append(w)
+        w.start()
+
+    def _on_reboot_response(self, data, err) -> None:
+        """Handle the reply from /api/system/reboot. 404 means the
+        server's too old (pre-v0.5.2) and the operator must reboot
+        manually."""
+        if err:
+            err_text = str(err)
+            if "404" in err_text:
+                # Pre-v0.5.2 server — no /api/system/reboot endpoint.
+                # Tell the operator how to reboot manually.
+                QMessageBox.warning(
+                    self, "Reboot Endpoint Missing",
+                    "This server is too old to support remote reboot "
+                    "(no /api/system/reboot — added in v0.5.2).\n\n"
+                    "Reboot manually:\n"
+                    f"  ssh root@{self._server_url} 'sudo reboot'\n\n"
+                    "Then re-run Make DPDK Ready.",
+                )
+            else:
+                QMessageBox.warning(
+                    self, "Reboot Request Failed",
+                    f"POST /api/system/reboot returned an error:\n\n"
+                    f"{err}\n\n"
+                    f"Reboot the server manually and re-run Make DPDK "
+                    f"Ready when it's back up.",
+                )
+            return
+        # Success — server is rebooting.
+        self._detail.setText(
+            "<b>✓ Reboot scheduled.</b> Server replied OK and will "
+            "restart in ~3 s. Wait for it to come back online "
+            "(typically 30–60 s), then re-run <i>Make DPDK Ready</i> "
+            "— the wizard will skip the IOMMU step (now active) and "
+            "continue from there."
+        )
 
     # ─────────────────────────────── bind step (special: NIC picker)
 

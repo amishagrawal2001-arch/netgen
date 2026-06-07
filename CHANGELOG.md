@@ -2,6 +2,101 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.15] - 2026-06-07
+
+**Make DPDK Ready wizard now offers inline reboot after enabling
+IOMMU — no more alt-tab to a terminal.**
+
+Full suite: 1,560 passed, 1 skipped (+7 new tests).
+
+### Operator request
+
+> when installing dpdk using make dpdk ready, it enables iommu
+> and prompt user to if reboot is required, also let user reboot
+> from the prompt it self.
+
+### Before
+
+After the wizard ran `/api/dpdk/iommu` (which writes
+`intel_iommu=on iommu=pt` / `amd_iommu=on iommu=pt` to
+`/etc/default/grub` + `update-grub`), the IOMMU kernel cmdline
+change doesn't take effect until reboot. The wizard's previous
+behavior was a `QMessageBox.information` saying "Reboot the server,
+then click Make DPDK Ready again." Operator had to:
+
+1. Close the dialog
+2. SSH into the server
+3. `sudo reboot`
+4. Wait for it to come back
+5. Re-open netgen, click Make DPDK Ready again
+
+### After (v0.5.15)
+
+`QMessageBox.Question` with three buttons:
+
+| Button | Role | What it does |
+|---|---|---|
+| **Reboot Now** (default, Enter) | AcceptRole | POST /api/system/reboot, dialog stays open showing live status |
+| **I'll Reboot Later** (Escape) | RejectRole | Just close — operator reboots manually from their terminal |
+| **Cancel** | (implicit) | Leave dialog open so operator reviews log first |
+
+The `Reboot Now` path uses the same `/api/system/reboot` endpoint
+the AddTGenDialog's "Reboot Physical Server" button uses (v0.5.2).
+Server replies 2xx first, then schedules `systemctl reboot` ~3 s
+later — so the HTTP response reaches the client cleanly before the
+host goes down.
+
+### Robustness — server-too-old handling
+
+If the target server predates v0.5.2 (no `/api/system/reboot`
+endpoint), POSTing returns 404. `_on_reboot_response()` catches that
+specifically and surfaces:
+
+```
+This server is too old to support remote reboot
+(no /api/system/reboot — added in v0.5.2).
+
+Reboot manually:
+  ssh root@<host> 'sudo reboot'
+
+Then re-run Make DPDK Ready.
+```
+
+Operator gets the exact command, not a generic "request failed".
+
+### Success messaging
+
+On 2xx, the dialog updates the detail pane:
+
+```
+✓ Reboot scheduled. Server replied OK and will restart in ~3 s.
+Wait for it to come back online (typically 30–60 s), then re-run
+Make DPDK Ready — the wizard will skip the IOMMU step (now active)
+and continue from there.
+```
+
+So operators don't wonder if the wizard hung when the server
+inevitably stops responding to subsequent polls during the reboot.
+
+### Tests
+
+7 regression tests in `tests/test_v0515_dpdk_reboot_prompt.py`:
+
+* `_prompt_reboot` helper exists (encapsulation)
+* Reboot Now button is AcceptRole + setDefaultButton (Enter fires it)
+* I'll Reboot Later is RejectRole (Escape dismisses)
+* `_trigger_reboot` POSTs to /api/system/reboot via async worker
+* 404 fallback mentions v0.5.2 + provides ssh command
+* Success path mentions waiting for server to come back online
+* `_on_step_done`'s `needs_reboot` branch invokes `_prompt_reboot`
+
+### What this doesn't change
+
+* No new server endpoint — reuses `/api/system/reboot` from v0.5.2
+* No changes to the IOMMU configure endpoint or GRUB write logic
+* No changes to the DPDK orchestrator / action plan
+* Only changed: the dialog UX after IOMMU success
+
 ## [0.5.14] - 2026-06-07
 
 **In-app Install Guide rewritten for the v0.5.x tarball architecture.
