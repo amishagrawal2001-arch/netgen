@@ -350,7 +350,22 @@ def _build_frr_image(install_root: Path) -> bool:
              str(context)],
             check=True,
         )
-        logger.info("[FRR] ✓ Image built")
+        # v0.5.13: also tag as ostg-frr:latest for legacy code paths.
+        # utils/frr_vrf.py:32 falls back to "ostg-frr:latest" when
+        # _resolve_frr_image() throws — a defensive fallback that
+        # otherwise dangles since netgen-install previously only
+        # tagged the new name. utils/frr_docker.py adds the same dual
+        # tag (line 183), but only when it builds via the lazy self-
+        # heal path. Mirror it here so installs that never trigger
+        # the lazy build still have the legacy tag available.
+        try:
+            _run(
+                ["docker", "tag", "netgen-frr:latest", "ostg-frr:latest"],
+                check=False,
+            )
+        except Exception as e:
+            logger.debug(f"[FRR] legacy ostg-frr tag failed (non-fatal): {e}")
+        logger.info("[FRR] ✓ Image built (tagged netgen-frr:latest + ostg-frr:latest)")
         return True
     except subprocess.CalledProcessError as exc:
         logger.warning(
@@ -430,6 +445,43 @@ def _create_path_symlinks(install_root: Path) -> None:
             dst.unlink()
         dst.symlink_to(src)
         logger.info(f"[PATH] ✓ {dst} → {src}")
+
+
+def _create_netgen_compat_symlink(install_root: Path) -> None:
+    """v0.5.13: /opt/netgen → install_root (typically /opt/netgen-server).
+
+    Runtime code in utils/device_database.py and run_tgen_server.py
+    defaults to /opt/netgen/database.db and /opt/netgen/.netgen_ai_
+    server_settings.env. With the v0.5.x tarball install at
+    /opt/netgen-server/, those defaults point at a non-existent
+    directory; sqlite open + env file write both fail.
+
+    On srv06 the legacy /opt/OSTG/ existed so the fallback resolution
+    worked, masking the bug. A fresh v0.5.x host with no legacy
+    /opt/OSTG would crash on first DB op — latent since the rebrand.
+
+    Same pattern as v0.5.10's /opt/OSTG symlink. Idempotent: leave
+    a pre-existing real /opt/netgen directory alone with a warning.
+    """
+    legacy = Path("/opt/netgen")
+    target = install_root  # /opt/netgen-server
+    if legacy.is_symlink():
+        cur = legacy.resolve()
+        if cur == target.resolve():
+            logger.info(f"[COMPAT] ✓ /opt/netgen → {target} (already correct)")
+            return
+        legacy.unlink()
+    elif legacy.is_dir():
+        logger.warning(
+            f"[COMPAT] /opt/netgen exists as a real directory; not "
+            f"replacing. Default DB/settings paths still point there "
+            f"— make sure they're maintained, or move them under "
+            f"{target} and `sudo rm -rf /opt/netgen && sudo ln -s "
+            f"{target} /opt/netgen`."
+        )
+        return
+    legacy.symlink_to(target)
+    logger.info(f"[COMPAT] ✓ /opt/netgen → {target}")
 
 
 def _create_ostg_compat_symlink(install_root: Path) -> None:
@@ -566,6 +618,7 @@ def main() -> int:
     _write_systemd_unit(install_root)
     _create_path_symlinks(install_root)
     _create_ostg_compat_symlink(install_root)
+    _create_netgen_compat_symlink(install_root)
 
     if _verify_running():
         logger.info("=" * 60)

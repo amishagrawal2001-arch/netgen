@@ -2,6 +2,112 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.13] - 2026-06-07
+
+**Proactive audit release. Closes two latent bugs that would have
+hit the next fresh-host install — found by reading the runtime
+code, not by an operator report.**
+
+Full suite: 1,545 passed, 1 skipped (+5 new tests).
+
+### Why this release exists (and what's NOT in it)
+
+After 6 consecutive operator-driven releases (v0.5.6 → v0.5.12), I
+audited every hardcoded absolute path in the runtime to surface
+what else could still bite. Two bugs found that srv06 didn't hit
+because srv06 has a legacy /opt/OSTG/ install — a fresh host
+without it would crash.
+
+### Bug 1 — Device database default path mismatch
+
+`utils/device_database._resolve_db_path()` resolution order:
+
+```
+1. NETGEN_DB_PATH env var       (unset on fresh install)
+2. OSTG_DB_PATH env var          (unset)
+3. /opt/netgen/database.db       (doesn't exist — install is at
+                                  /opt/netgen-server/)
+4. /opt/OSTG/device_database.db  (only exists on hosts with legacy
+                                  v0.4.x install)
+```
+
+On a fresh host with NEITHER `/opt/netgen/` NOR `/opt/OSTG/`,
+resolution returns `/opt/netgen/database.db` and the server tries
+to open it — parent dir doesn't exist → sqlite errors → server
+crashes on first DB operation.
+
+Same shape applies to `run_tgen_server.py`'s
+`_resolve_ai_settings_path()` (defaults to
+`/opt/netgen/.netgen_ai_server_settings.env`).
+
+srv06 didn't hit it because its legacy `/opt/OSTG/` provided the
+fallback path. **Any new host without that legacy dir would have
+hit this on first start.**
+
+### Bug 2 — FRR image legacy tag missing
+
+`utils/frr_vrf.py:32` falls back to `"ostg-frr:latest"` when the
+primary `_resolve_frr_image()` call throws:
+
+```python
+try:
+    from utils.frr_docker import _resolve_frr_image
+    self.image_name = _resolve_frr_image(self.client)
+except Exception:
+    self.image_name = "ostg-frr:latest"  # legacy fallback
+```
+
+`utils/frr_docker.py:183` adds the legacy tag when it builds via
+the lazy self-heal path, BUT only then. Installs that complete
+without ever triggering lazy build have only `netgen-frr:latest`
+— the fallback dangles, points at a non-existent image.
+
+### Fix
+
+```python
+# netgen-install: new compat symlink (mirrors v0.5.10 /opt/OSTG)
+def _create_netgen_compat_symlink(install_root):
+    """/opt/netgen → /opt/netgen-server"""
+
+# netgen-install: dual-tag FRR image after docker build
+docker tag netgen-frr:latest ostg-frr:latest
+```
+
+Mirrors `utils/frr_docker.py:183`'s existing dual-tag logic. Now
+the install-time path produces the same image tags as the lazy
+self-heal path.
+
+### What this DOESN'T fix (yet — documented for next round)
+
+Audit also found, with these severity ratings:
+
+* **Low** — `utils/dhcp.py` writes to `/etc/dnsmasq.d/`. Server
+  creates the dir if missing; works on most distros; might trip
+  SELinux. DHCP feature only.
+* **Low** — `run_tgen_server.py:14038` modifies `/etc/default/grub`
+  for DPDK hugepages. Standard for DPDK; not triggered without DPDK.
+* **OK** — All `/opt/OSTG/resources/dpdk/...` references resolve
+  correctly via v0.5.10's `/opt/OSTG → share/netgen` symlink.
+
+Codified rule for future maintainers: **before adding a new
+hardcoded path, check that the default works on a host with no
+legacy /opt/OSTG/.**
+
+### Pattern (final)
+
+v0.5.13 is the first release this session that DIDN'T come from an
+operator-reported bug. Every prior release in the v0.5.6→v0.5.12
+chain was reactive. The audit pattern goes:
+
+1. After a class of bug bites, add the regression test
+2. Then read the codebase looking for the same class
+3. Ship fixes for anything found preemptively
+
+v0.5.13 = step 2 + 3 for the "hardcoded paths from legacy era"
+class. The audit findings are catalogued above; future releases
+can pick up the remaining low-severity items if they become
+problematic.
+
 ## [0.5.12] - 2026-06-07
 
 **ostg-server (and every other entry-point script pip installed)
