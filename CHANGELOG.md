@@ -2,6 +2,49 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.5] - 2026-06-07
+
+**Cleaner interface context-menu labels.**
+
+Full suite: 1,506 passed, 1 skipped.
+
+### Change
+
+Right-click on an interface in the server tree showed:
+
+```
+Set enp181s0f0np0 Online
+Set enp181s0f0np0 Offline
+```
+
+The interface name is redundant — the operator already sees it
+in the row they right-clicked on. Repeating it inside the menu
+item is just noise.
+
+v0.5.5 simplifies to:
+
+```
+Online
+Offline
+```
+
+The tooltip on each item still includes the full target so the
+operator can hover-confirm before clicking:
+
+  `ip link set enp181s0f0np0 up via POST /api/interfaces/...`
+
+Server-side endpoint (`POST /api/interfaces/<iface>/admin`) and
+all the v0.5.4 safety / handler / confirmation logic are
+unchanged.
+
+### Tests
+
+`tests/test_v054_interface_admin_context_menu.py::test_context_
+menu_offers_both_up_and_down` updated to pin the clean label
+shape (`QAction("Online", ...)` instead of the verbose form) +
+forbid the v0.5.4 verbose form so a refactor that re-adds the
+prefix surfaces here.
+
 ## [0.5.4] - 2026-06-07
 
 **Right-click an interface in the TGEN list to take it online /

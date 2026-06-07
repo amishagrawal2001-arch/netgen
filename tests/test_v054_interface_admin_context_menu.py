@@ -175,19 +175,35 @@ def test_context_menu_handler_skips_server_level_items():
 
 
 def test_context_menu_offers_both_up_and_down():
-    """Two QActions: Set <iface> Online and Set <iface> Offline.
-    Without either one the menu is half a feature."""
+    """Two QActions: Online and Offline. Without either one the
+    menu is half a feature.
+
+    v0.5.5 note: labels were simplified from
+    `Set <iface> Online` to just `Online` — the operator
+    already sees the interface name in the row they
+    right-clicked. The tooltip still echoes the full target.
+    Test updated to pin the clean label."""
     src = _CLIENT.read_text()
     m = re.search(
         r"def _on_server_tree_context_menu\(self, pos\)[\s\S]+?(?=\n    def )",
         src,
     )
     body = m.group(0)
-    assert "Set {iface_name} Online" in body or "Online" in body, (
-        "Context menu missing the Online action"
+    # Match QAction("Online", ...) and QAction("Offline", ...)
+    assert re.search(r'QAction\(\s*["\']Online["\']\s*,', body), (
+        "Context menu missing the Online QAction with the clean "
+        "label. v0.5.5 dropped the `Set <iface>` prefix; expected "
+        "QAction(\"Online\", ...)."
     )
-    assert "Set {iface_name} Offline" in body or "Offline" in body, (
-        "Context menu missing the Offline action"
+    assert re.search(r'QAction\(\s*["\']Offline["\']\s*,', body), (
+        "Context menu missing the Offline QAction with the clean "
+        "label. Expected QAction(\"Offline\", ...)."
+    )
+    # Forbid the verbose v0.5.4 form so a refactor that re-adds
+    # the prefix surfaces here.
+    assert "Set {iface_name} Online" not in body, (
+        "Context menu re-introduced the verbose `Set <iface> "
+        "Online` label. v0.5.5 simplified to bare `Online`."
     )
 
 

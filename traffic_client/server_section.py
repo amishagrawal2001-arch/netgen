@@ -384,8 +384,14 @@ class TrafficGenClientServerSection():
         if not server_addr:
             return
 
+        # v0.5.5: clean menu labels — just "Online" / "Offline".
+        # Operator already sees the interface name in the row
+        # they right-clicked on; repeating it in the menu item
+        # ("Set enp181s0f0np0 Online") is noisy. The tooltip
+        # still echoes the full target so the operator can
+        # confirm before clicking.
         menu = QMenu(self.server_tree)
-        up_action = QAction(f"Set {iface_name} Online", menu)
+        up_action = QAction("Online", menu)
         up_action.setToolTip(
             f"ip link set {iface_name} up via "
             f"POST /api/interfaces/{iface_name}/admin"
@@ -393,7 +399,7 @@ class TrafficGenClientServerSection():
         up_action.triggered.connect(
             lambda: self._set_interface_admin_state(server_addr, iface_name, "up"),
         )
-        down_action = QAction(f"Set {iface_name} Offline", menu)
+        down_action = QAction("Offline", menu)
         down_action.setToolTip(
             f"ip link set {iface_name} down — STOPS any streams "
             f"using this interface."
