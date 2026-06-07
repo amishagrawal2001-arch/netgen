@@ -2,6 +2,194 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.0] - 2026-06-07
+
+**Distribution-ready fresh install via a self-contained server
+tarball. No more system-pip / apt-package / PEP-668 surface.**
+
+Full suite: **1,470 passed, 1 skipped** (+85 new tests across 4
+new test files).
+
+### Why this release exists
+
+This session shipped three reactive installer fixes:
+
+  * **v0.4.7** — Ubuntu 24.04 PEP 668 (`--break-system-packages`)
+  * **v0.4.8** — deps-install silent no-op → `No module named 'flask'`
+  * **v0.4.9** — `netcat` virtual-package failure on Noble
+
+Each fix only surfaced AFTER a different server hit it. With wider
+distribution starting, that whack-a-mole pattern doesn't scale:
+end users don't have CI catching install failures before they bite.
+
+v0.5.0 eliminates the **class** of bugs instead of patching each
+one. Operator picks a `.tar.gz` in the Fresh Install dialog;
+client uploads ONE file; target extracts to /opt/netgen-server and
+runs the bundled `bin/netgen-install`. Zero system pip, zero apt
+packages for the Python side, zero virtual-package guesswork.
+
+### Architecture
+
+The new artifact `netgen-server-0.5.0-linux-x86_64.tar.gz`
+contains:
+
+```
+netgen-server-0.5.0/
+├── python-runtime/       Bundled CPython 3.10.14
+│                         (from python-build-standalone)
+├── netgen-venv/          Pre-built venv with the wheel + all deps
+│                         (Flask, Scapy, requests, psutil, ...)
+├── share/netgen/         DPDK tx_worker source, Docker (FRR), etc.
+├── bin/
+│   ├── netgen-install    Pre-flight + systemd + FRR Docker + verify
+│   ├── netgen-upgrade    pip install wheel into bundled venv
+│   └── netgen-uninstall  Clean removal (+ --purge for full wipe)
+├── VERSION
+└── README.txt
+```
+
+The bundled venv's `pip` is the only pip the target ever runs.
+PEP 668's `EXTERNALLY-MANAGED` marker doesn't apply to it (PEP 668
+explicitly exempts venvs).
+
+### Operator workflow
+
+**Fresh install (Path A — direct on the server):**
+
+```bash
+wget .../v0.5.0/netgen-server-0.5.0-linux-x86_64.tar.gz
+sudo mkdir -p /opt/netgen-server
+sudo tar --strip-components=1 -xzf netgen-server-0.5.0-linux-x86_64.tar.gz \
+    -C /opt/netgen-server
+sudo /opt/netgen-server/bin/netgen-install
+```
+
+`netgen-install`'s pre-flight gate refuses unsupported distros
+with a concrete remediation (Ubuntu 22.04 + 24.04 only without
+`--force-install-unsupported`). Failures surface BEFORE state
+gets written.
+
+**Fresh install (Path B — from the GUI client):**
+
+Client → File → Install/Upgrade Server → Fresh Install → pick a
+`.tar.gz` instead of a `.whl`. The dispatcher auto-detects the
+extension and runs the right install path.
+
+**Routine upgrades (wheel-based, unchanged UX, ~30 sec):**
+
+```bash
+sudo netgen-upgrade ./ostg_trafficgen-0.5.1-py3-none-any.whl
+```
+
+`netgen-upgrade` runs `pip install --force-reinstall` inside the
+bundled venv (the v0.4.8 lesson stays — pip must not silently
+no-op). Post-upgrade import sanity check catches a bad wheel
+before systemd starts crash-looping.
+
+### What this eliminates permanently
+
+| Bug class from v0.4.x | v0.5.0 state |
+|---|---|
+| PEP 668 / `--break-system-packages` | Gone — bundled venv is exempt |
+| `netcat` / `libmlx5-dev` virtual packages | Gone — zero apt deps for the Python side |
+| Deps-install silent no-op (v0.4.8) | Gone — deps pre-installed at CI tarball-build time |
+| Python-version mismatch (pip3 vs /usr/bin/python3) | Gone — bundled Python is the only one |
+| `install_ostg_complete.py` Python-runtime drift | Gone — installer runs INSIDE the bundled venv |
+
+### Implementation phases (all in this release)
+
+**Phase 1a — Tarball build pipeline.** New
+`.github/workflows/build-server-tarball.yml`. CI downloads
+python-build-standalone, creates a venv against it, pip-installs
+the wheel + deps with `--force-reinstall`, packages everything into
+a tar.gz with `--owner=root:0 --group=root:0`. Smoke tests:
+imports flask + scapy + requests + psutil + run_tgen_server,
+round-trip extract + re-verify (catches build-side filesystem
+state contamination).
+
+**Phase 2 — In-tarball install scripts.** Three new scripts in
+`scripts/tarball/`, copied into the tarball's `bin/` at
+build-time with shebangs rewritten to point at the bundled venv's
+Python:
+
+  * `netgen-install` (~400 lines): pre-flight checks (OS gate, disk,
+    Docker, libpcap-via-Scapy import test), FRR Docker build,
+    systemd unit write + restart, `/usr/local/bin/` PATH symlinks,
+    `/api/health` verification. Mirrors logs to both stdout AND
+    `/var/log/netgen-install.log`. Idempotent on re-install.
+  * `netgen-upgrade <wheel>` (~150 lines): pip install
+    `--force-reinstall` inside bundled venv, post-upgrade import
+    check, systemctl restart, `/api/health` verification.
+  * `netgen-uninstall [--purge]` (~130 lines): systemd unit + PATH
+    symlinks removed by default; `--purge` also removes the install
+    tree, FRR Docker image, and install log. `--purge` has a
+    basename-whitelist guard against `--install-root` typos that
+    would `rmtree` `/home` or `/etc`.
+
+Venv slim drops `__pycache__`, `*.pyc`, `*.pyo`, `tests/` directories
+in site-packages, and `include/`. Saved ~157 MB; remaining
+optimization deferred to v0.5.1.
+
+**Phase 3 — GUI dispatcher + release wiring.** `SshInstallWorker`
+accepts a new `tarball_path` kwarg. When set, uploads ONE file
+(the tarball) and spawns the tar-extract + `bin/netgen-install`
+chain — skipping the entire wheel + installer + resources/dpdk +
+ostg_docker + Dockerfile.frr upload that the legacy path needed.
+The file picker accepts both `.whl` and `.tar.gz`; the click
+handler infers install path from extension.
+
+`build-server-tarball.yml` now also triggers on `v0.5.*` /
+`v0.[6-9].*` / `v[1-9].*` tag pushes and uses
+`softprops/action-gh-release@v2` (gated on
+`startsWith(github.ref, 'refs/tags/v')`) to attach the tarball to
+the same GH release `release.yml` is appending its wheel / .dmg /
+.exe / .AppImage to. `generate_release_notes: false` and
+`append_body: false` keep release.yml's CHANGELOG-driven notes
+authoritative; the tarball workflow only adds the asset.
+
+### Tests
+
+- `tests/test_v050_server_tarball_workflow.py` (14 tests) —
+  workflow pins python-build-standalone version, builds on
+  ubuntu-22.04 (older glibc floor → forward-compat), smoke-tests
+  critical imports, does round-trip extract verify, copies install
+  scripts + rewrites shebangs, slims the venv, preserves the wheel
+  alongside the tarball.
+- `tests/test_v050_phase3_gui_tarball_dispatch.py` (9 tests) —
+  `SshInstallWorker` accepts `tarball_path` with None default;
+  tarball branch skips wheel uploads and spawns
+  `bin/netgen-install` instead of `install_ostg_complete.py`;
+  file picker filter includes `.tar.gz`; validation skips
+  installer-path requirement for tarball installs; workflow
+  triggers on `v*` tags, attaches via softprops, doesn't clobber
+  release.yml's body.
+
+Static-source tests against the three install scripts (existence,
+shebang prefix, `SUPPORTED_DISTROS` gate, `--force-reinstall` in
+upgrade, `--purge` whitelist).
+
+### Legacy install_ostg_complete.py path
+
+UNTOUCHED in v0.5.0. Operators with v0.4.x systemd units keep
+running exactly the same. Migration to v0.5.0 is opt-in: pick a
+`.tar.gz` in the Fresh Install dialog instead of a `.whl`. The
+v0.4.x → v0.5.0 jump cleans up the old `/usr/local/lib/python3.10/
+dist-packages/` install side-by-side with `/opt/netgen-server/`;
+a future v0.5.1 migration helper can collapse the two.
+
+### Operator action on v0.5.0+ hosts
+
+Fresh hosts get the tarball path automatically. Existing v0.4.x
+hosts can:
+
+  * Stay on the legacy installer (no breakage)
+  * OR run a v0.5.0 tarball install — backs up the v0.4.x systemd
+    unit to `.service.bak`, writes the new one pointing at
+    `/opt/netgen-server/netgen-venv/bin/ostg-server`. Session state
+    in `~/Documents/OSTG/session.json` (or wherever
+    `_current_session_path` points) is preserved — it's outside
+    the install tree.
+
 ## [0.4.9] - 2026-06-07
 
 **Two small fixes surfaced by the v0.4.8 fresh-install log: UX
