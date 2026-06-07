@@ -2,6 +2,103 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.19] - 2026-06-07
+
+**Tier 2 DPDK UX — proactive detect + live install ETA.**
+
+Full suite: 1,607 passed, 1 skipped (+11 new tests).
+
+### Two items
+
+**7. Auto-detect "DPDK not ready" on server connect**
+
+When a new server is added via Add TGen Chassis dialog and connects
+successfully, we probe `/api/dpdk/status` asynchronously. If
+`is_dpdk_ready()` returns False, surface a non-blocking
+`QMessageBox.Information`:
+
+```
+DPDK Setup Suggested
+
+san-hp-srv06 isn't configured for DPDK yet.
+
+Missing: DPDK libraries, tx_worker binary, hugepages
+
+DPDK is required for line-rate stream generation. Without it,
+streams fall back to Scapy / kernel path (slower).
+
+Run ★ Setup DPDK now? Takes ~5-15 min on a fresh host, mostly
+building the DPDK source. You can also skip and run it later
+from Tools → DPDK → ★ Setup DPDK.
+
+         [ Setup Now ]  [ Skip — set up later ]
+```
+
+* `Setup Now` selects the server in the tree + opens the Make DPDK
+  Ready dialog directly. One click from "I just connected" to
+  "DPDK installing".
+* `Skip` dismisses. Doesn't persist — operator gets prompted again
+  on next add (by design; they might have intentionally skipped on
+  a VM but want the prompt on a real host).
+
+Closes the gap that prompted this whole sub-thread: operator did a
+fresh tarball install, opened Make DPDK Ready, the wizard claimed
+all-done in 30 seconds (v0.5.17 bug), Verify showed all ✗. With
+v0.5.19, the moment they connect the freshly-installed server,
+they see the prompt that says "DPDK isn't set up — want to fix
+that now?"
+
+Async probe via `_DpdkApiWorker` (UI doesn't freeze on the 4 s
+timeout). Probe failure is silent — if the server is too old to
+have `/api/dpdk/status` or there's a network blip, we don't badger
+the operator with an error they didn't ask for.
+
+**8. Live elapsed time + ETA in Make DPDK Ready during install**
+
+The v0.5.17 polling loop already showed phase progress (`Step 5/8:
+Building DPDK · ninja 47%`) but not "how much longer". For a 10-min
+install, that's the most useful information.
+
+v0.5.19 tracks `time.monotonic()` at install start, computes elapsed
+per poll, derives ETA from `overall_pct`. Detail pane now shows:
+
+```
+Installing DPDK runtime + building tx_worker
+Step 5/8 · Building DPDK · ninja 47% · ~52% overall · elapsed 3:24 · ETA ~3:08
+```
+
+ETA gated on `overall_pct >= 5` to avoid wildly-wrong estimates
+during apt+clone phase. Also capped to <60 min sanity check
+(prevents weird display if the install hangs). Uses `monotonic` not
+wall-clock so a clock jump during install doesn't poison the math
+(carry-over lesson from v0.5.9).
+
+`_fmt_mmss()` helper at module level — testable + reusable, returns
+"0:05" / "1:05" / "10:00" form.
+
+### Tests
+
+11 regression tests in `tests/test_v0519_autodetect_and_eta.py`
+pin every contract:
+
+* Add-server flow calls `_check_dpdk_and_suggest_setup` per added URL
+* Auto-detect uses `_DpdkApiWorker` (async)
+* Probe callback uses `is_dpdk_ready()` (no drift from wizard)
+* Banner offers "Setup Now" button wired to
+  `show_dpdk_make_ready_dialog`
+* Failure path is silent (no probe-error popups)
+* `_start_install_dpdk_poll` captures `monotonic` start
+* Response handler shows elapsed + ETA
+* ETA gated on `overall_pct >= 5`
+* `_fmt_mmss` exists at module level; pads correctly for sub-10 sec
+
+### What this doesn't change
+
+* No server-side changes
+* No new endpoints (reuses /api/dpdk/status + /api/admin/install_dpdk/log)
+* Banner is per-add-event, not periodic — doesn't nag if the
+  operator dismisses it
+
 ## [0.5.18] - 2026-06-07
 
 **Tools → DPDK menu restructured + 5 ergonomic optimizations.**

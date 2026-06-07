@@ -238,12 +238,140 @@ class TrafficGenClientMenuAction():
                     f"[ADD SERVER] Added {len(added_offline)} chassis (offline, no connect): "
                     f"{', '.join(added_offline)}"
                 )
+            # v0.5.19: probe DPDK readiness for each new online server.
+            # If not ready (libdpdk missing, no tx_worker, hugepages
+            # unset, etc.), show a non-blocking suggestion to run
+            # ★ Setup DPDK. Operator-driven feature: the original
+            # bug was "operator finished install, didn't know DPDK
+            # was a separate setup step, then was confused about why
+            # Verify Installation showed all ✗". The banner closes
+            # that gap.
+            try:
+                for url in added:
+                    self._check_dpdk_and_suggest_setup(url)
+            except Exception as e:
+                logger.debug(f"[ADD SERVER] DPDK auto-detect failed: {e}")
         if skipped:
             QMessageBox.information(
                 self, "Already connected",
                 "These chassis were already in your active list and were "
                 "skipped:\n\n• " + "\n• ".join(skipped),
             )
+
+    def _check_dpdk_and_suggest_setup(self, server_url: str) -> None:
+        """v0.5.19: probe /api/dpdk/status on a freshly-added server.
+        If not ready, fire a non-blocking notification suggesting the
+        operator run ★ Setup DPDK.
+
+        Async — uses _DpdkApiWorker so the UI thread doesn't block on
+        the probe. The notification appears via QMessageBox.information
+        with "Setup Now" + "Dismiss" buttons.
+
+        We're deliberately gentle: this fires ONCE per added server
+        (no nagging), and dismissed-state isn't persisted (operator
+        will get prompted again on next session start — by design,
+        since DPDK might have been intentionally skipped).
+        """
+        from traffic_client.dpdk_menu_actions import _DpdkApiWorker
+        try:
+            w = _DpdkApiWorker(
+                method="GET",
+                url=f"{server_url.rstrip('/')}/api/dpdk/status",
+                timeout=4,
+            )
+            w.done.connect(
+                lambda data, err, url=server_url: self._on_dpdk_probe_for_suggest(
+                    url, data, err
+                )
+            )
+            w.setParent(self)
+            # Keepalive — pattern from elsewhere in this file.
+            if hasattr(self, "_keepalive_worker"):
+                self._keepalive_worker(w)
+            w.start()
+        except Exception as e:
+            logger.debug(f"[DPDK AUTODETECT] worker spawn failed for {server_url}: {e}")
+
+    def _on_dpdk_probe_for_suggest(self, server_url: str, data, err) -> None:
+        """v0.5.19 callback: decide whether to surface the Setup
+        suggestion based on /api/dpdk/status. Skip silently on any
+        error (the operator didn't ask for this probe; failing
+        loudly would be hostile)."""
+        if err:
+            logger.debug(
+                f"[DPDK AUTODETECT] probe failed for {server_url}: {err}"
+            )
+            return
+        data = data or {}
+        # Use the same is_dpdk_ready() helper the wizard uses.
+        try:
+            from utils.dpdk_orchestrator import is_dpdk_ready
+            if is_dpdk_ready(data):
+                logger.debug(
+                    f"[DPDK AUTODETECT] {server_url} is DPDK-ready — no "
+                    f"banner needed."
+                )
+                return
+        except Exception as e:
+            logger.debug(f"[DPDK AUTODETECT] is_dpdk_ready check failed: {e}")
+            return
+        # Not ready — surface the suggestion. List what's missing for
+        # context (operator can decide if they care).
+        missing = []
+        if not data.get("dpdk_installed"):
+            missing.append("DPDK libraries")
+        if not data.get("tx_worker_exists"):
+            missing.append("tx_worker binary")
+        if not data.get("hugepages_configured"):
+            missing.append("hugepages")
+        if not data.get("iommu_enabled"):
+            missing.append("IOMMU")
+        if not data.get("vfio_pci_loaded"):
+            missing.append("vfio-pci")
+        missing_str = ", ".join(missing) if missing else "(unknown)"
+
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Information)
+        msg.setWindowTitle("DPDK Setup Suggested")
+        msg.setText(
+            f"<b>{server_url}</b> isn't configured for DPDK yet."
+        )
+        msg.setInformativeText(
+            f"Missing: {missing_str}\n\n"
+            f"DPDK is required for line-rate stream generation. "
+            f"Without it, streams fall back to Scapy / kernel path "
+            f"(slower).\n\n"
+            f"Run ★ Setup DPDK now? Takes ~5-15 min on a fresh "
+            f"host, mostly building the DPDK source. You can also "
+            f"skip and run it later from Tools → DPDK → ★ Setup DPDK."
+        )
+        setup_btn = msg.addButton("Setup Now", QMessageBox.AcceptRole)
+        msg.addButton("Skip — set up later", QMessageBox.RejectRole)
+        msg.setDefaultButton(setup_btn)
+        msg.exec_()
+        if msg.clickedButton() is setup_btn:
+            # Select this server in the tree first so the dialog
+            # targets it. The wizard reads from _get_selected_servers.
+            try:
+                self._select_server_in_tree(server_url)
+            except Exception:
+                pass
+            try:
+                self.show_dpdk_make_ready_dialog()
+            except Exception as e:
+                logger.error(f"[DPDK AUTODETECT] failed to open Setup: {e}")
+
+    def _select_server_in_tree(self, server_url: str) -> None:
+        """v0.5.19 helper: find the row in self.server_tree matching
+        server_url (col 1 has the URL) and select it so the next
+        menu action targets this server."""
+        if not hasattr(self, "server_tree"):
+            return
+        for i in range(self.server_tree.topLevelItemCount()):
+            item = self.server_tree.topLevelItem(i)
+            if item.text(1) == server_url:
+                self.server_tree.setCurrentItem(item)
+                return
 
     def _on_server_rebooted(self, host_port: str) -> None:
         """v0.5.16: AddTGenDialog signaled that /api/system/reboot

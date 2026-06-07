@@ -41,6 +41,13 @@ from utils.dpdk_orchestrator import (
 logger = logging.getLogger(__name__)
 
 
+def _fmt_mmss(seconds: int) -> str:
+    """v0.5.19: format seconds as m:ss for the wizard ETA labels.
+    Examples: 65 → '1:05', 600 → '10:00', 7 → '0:07'."""
+    seconds = max(0, int(seconds))
+    return f"{seconds // 60}:{seconds % 60:02d}"
+
+
 # Reuse the existing HTTP worker from dpdk_menu_actions — same auth
 # header handling + timeout semantics + signal shape. Importing here
 # keeps the dialog self-contained from the GUI mixin's POV.
@@ -605,6 +612,11 @@ class MakeDpdkReadyDialog(QDialog):
         self._install_poll_row = row
         self._install_poll_consecutive_errors = 0
         self._install_poll_log_offset = 0
+        # v0.5.19: track elapsed + compute ETA from progress %.
+        # `time.monotonic()` is wall-clock-independent so a host
+        # clock jump during the install doesn't poison the math.
+        import time as _t
+        self._install_poll_start_monotonic = _t.monotonic()
         # 5 s cadence: install_dpdk.sh is many minutes long; tighter
         # would just generate noise.
         self._install_poll_timer = QTimer(self)
@@ -690,6 +702,23 @@ class MakeDpdkReadyDialog(QDialog):
                 bits.append(f"ninja {ninja_pct}%")
             if overall_pct is not None:
                 bits.append(f"~{overall_pct}% overall")
+            # v0.5.19: append elapsed + ETA based on overall_pct
+            # progression. ETA = elapsed × (100 - pct) / pct.
+            # Skip the ETA before 5% (the early-build phase is
+            # apt + clone, doesn't progress overall_pct yet so
+            # the estimate would be wildly off).
+            import time as _t
+            start = getattr(self, "_install_poll_start_monotonic", None)
+            if start:
+                elapsed_s = int(_t.monotonic() - start)
+                elapsed_str = _fmt_mmss(elapsed_s)
+                bits.append(f"elapsed {elapsed_str}")
+                if overall_pct and overall_pct >= 5:
+                    remaining_s = int(
+                        elapsed_s * (100 - overall_pct) / overall_pct
+                    )
+                    if 0 < remaining_s < 3600:
+                        bits.append(f"ETA ~{_fmt_mmss(remaining_s)}")
             if bits:
                 self._detail.setText(
                     f"<b>Installing DPDK runtime + building tx_worker</b><br>"
