@@ -351,6 +351,188 @@ All three land the same wheel + DPDK runtime + systemd unit. Pick
 based on whether you have SSH creds, a working server, or just want
 a click-through experience.</p>
 
+<h2>0. v0.5.x install architecture <span class="ok">★ current</span></h2>
+
+<p>Starting at <b>v0.5.0</b>, fresh installs ship as a single
+self-contained tarball with a bundled Python interpreter and a
+pre-built venv. The legacy <code>install_ostg_complete.py</code>
+flow (system pip + apt + deadsnakes) still works for upgrades on
+existing v0.4.x hosts, but new installs use the tarball path.</p>
+
+<p>The shift was driven by a long-tail of operator-reported "install
+breaks on host X" bugs (PEP 668 on Noble, deadsnakes timeouts,
+silent no-op deps installs). Bundling the Python runtime eliminates
+those failure classes entirely — the install only depends on Docker
+(detected, not installed) plus a working systemd.</p>
+
+<h3>What the v0.5.13 tarball install drops on disk</h3>
+
+<table>
+  <tr><th>Path</th><th>Size</th><th>What</th></tr>
+  <tr><td><code>/opt/netgen-server/python-runtime/</code></td>
+      <td>~95 MB</td>
+      <td>Bundled CPython 3.10.14 from
+          <a href="https://github.com/astral-sh/python-build-standalone">
+          python-build-standalone</a>. No system Python touched.</td></tr>
+  <tr><td><code>/opt/netgen-server/netgen-venv/</code></td>
+      <td>~537 MB</td>
+      <td>Pre-built venv with the wheel + every dep installed.
+          Contains <code>bin/ostg-server</code> (the systemd
+          ExecStart target), <code>bin/ostg-client</code>,
+          <code>bin/netgen-cli</code>, and the entire
+          site-packages tree (Flask, Scapy, PyQt5, pandas, numpy,
+          scipy, sklearn, cryptography, pydantic, openai,
+          paramiko, docker, …).</td></tr>
+  <tr><td><code>/opt/netgen-server/share/netgen/</code></td>
+      <td>~1.1 MB</td>
+      <td><code>ostg_docker/</code> (FRR Dockerfile + sibling
+          files used as build context),
+          <code>resources/dpdk/</code> (DPDK scripts +
+          <code>tx_worker/</code> C source).</td></tr>
+  <tr><td><code>/opt/netgen-server/bin/</code></td>
+      <td>~80 KB</td>
+      <td><code>netgen-install</code>, <code>netgen-upgrade</code>,
+          <code>netgen-uninstall</code> — operator-facing wrappers
+          with shebangs rewritten to the bundled venv's python.</td></tr>
+  <tr><td><code>/etc/systemd/system/netgen-server.service</code></td>
+      <td>1 KB</td>
+      <td>Writes the unit; backs up any prior one to
+          <code>.service.bak</code>. ExecStart points at
+          <code>/opt/netgen-server/netgen-venv/bin/ostg-server</code>.
+          Caps: <code>CAP_NET_RAW</code> +
+          <code>CAP_NET_ADMIN</code>.</td></tr>
+  <tr><td><code>/usr/local/bin/netgen-{install,upgrade,uninstall}</code></td>
+      <td>symlinks</td>
+      <td>So operators can run <code>sudo netgen-upgrade
+          /tmp/wheel.whl</code> without the full path.</td></tr>
+  <tr><td><code>/opt/OSTG</code> (compat symlink, new hosts only)</td>
+      <td>symlink</td>
+      <td>→ <code>/opt/netgen-server/share/netgen</code>. Lets the
+          runtime's hardcoded
+          <code>/opt/OSTG/resources/dpdk/dpdk_bind.sh</code> +
+          peers resolve. <b>Skipped (warned) if
+          <code>/opt/OSTG</code> already exists as a real
+          directory</b> — typical on hosts with a legacy v0.4.x
+          install. <span class="ok">v0.5.10</span></td></tr>
+  <tr><td><code>/opt/netgen</code> (compat symlink, new hosts only)</td>
+      <td>symlink</td>
+      <td>→ <code>/opt/netgen-server</code>. Default device DB +
+          AI settings paths in the runtime resolve to
+          <code>/opt/netgen/database.db</code> +
+          <code>.netgen_ai_server_settings.env</code>; the symlink
+          maps them into the install root.
+          <span class="ok">v0.5.13</span></td></tr>
+  <tr><td>Docker: <code>netgen-frr:latest</code> +
+          <code>ostg-frr:latest</code></td>
+      <td>~94 MB</td>
+      <td>Built locally from
+          <code>share/netgen/ostg_docker/Dockerfile.frr</code>
+          (Alpine + FRR + dnsmasq + dhclient + tools). Dual-tagged
+          so both the new and legacy code paths find it.
+          <span class="ok">v0.5.13</span></td></tr>
+  <tr><td>Network: TCP <code>:5050</code></td>
+      <td>—</td>
+      <td>Flask app binds <code>0.0.0.0:5050</code>. <b>No firewall
+          rules added</b> by the installer.</td></tr>
+</table>
+
+<p><b>Total disk footprint: ~730 MB</b> (tarball download is 196 MB,
+extracted install is 633 MB, FRR image is 94 MB).</p>
+
+<h3>What the v0.5.x install does NOT touch</h3>
+
+<ul>
+  <li>No apt packages installed (bundled venv handles all Python
+      deps — no PEP 668 surface, no deadsnakes, no apt timeouts).</li>
+  <li>No changes to system <code>python3</code> or
+      <code>/usr/bin/python3</code>.</li>
+  <li>No user accounts (server runs as root via systemd).</li>
+  <li>No firewall rules.</li>
+  <li>No <code>PYTHONPATH</code> exports or shell-rc modifications.</li>
+  <li>No data import — fresh hosts get an empty DB unless legacy
+      <code>/opt/OSTG/device_database.db</code> exists, in which
+      case <code>_resolve_db_path()</code> falls through to it
+      automatically.</li>
+</ul>
+
+<h3>How to run a v0.5.x fresh install</h3>
+
+<p>Open this client → <b>File → Install/Upgrade Server</b> →
+<b>Fresh install via SSH</b> tab → browse to
+<code>netgen-server-X.Y.Z-linux-x86_64.tar.gz</code> (bundled with
+this client app, or downloadable from the GitHub release).</p>
+
+<p>The dialog sftp-uploads the tarball, extracts to
+<code>/opt/netgen-server.new</code>, atomically renames to
+<code>/opt/netgen-server</code>, then runs
+<code>bin/netgen-install</code>. Total time: ~2 min on a clean
+Ubuntu 24.04 host (first install) or ~30 s if the FRR Docker
+layers are cached from a prior install.</p>
+
+<p>Expected end-of-log on success:</p>
+
+<pre style="background:#f0fdf4; border-left:3px solid #15803d; padding:8px;">
+[INFO] [FRR] ✓ Image built (tagged netgen-frr:latest + ostg-frr:latest)
+[INFO] [SYSTEMD] ✓ netgen-server.service restarted
+[INFO] [PATH] ✓ /usr/local/bin/netgen-install → /opt/netgen-server/bin/netgen-install
+[INFO] [COMPAT] ✓ /opt/OSTG → /opt/netgen-server/share/netgen
+[INFO] [COMPAT] ✓ /opt/netgen → /opt/netgen-server
+[INFO] [VERIFY] ✓ Server responding: {"netgen_version":"0.5.13","status":"ok"}
+[INFO] netgen-server installation complete.</pre>
+
+<h3>The 7 contracts CI now validates (so you don't hit them)</h3>
+
+<p>Between v0.5.6 and v0.5.13, seven distinct "CI green, operator
+red" install-pipeline bugs were closed. Each one added a specific
+contract check to the CI round-trip step:</p>
+
+<table>
+  <tr><th>Release</th><th>Contract</th></tr>
+  <tr><td>v0.5.6</td>
+      <td><code>/api/admin/upgrade_wheel</code> handles PEP 668
+          on Noble/Debian 12 (detect <code>EXTERNALLY-MANAGED</code>,
+          dispatch to <code>netgen-upgrade</code> on tarball
+          installs).</td></tr>
+  <tr><td>v0.5.7</td>
+      <td>Venv is relocatable —
+          <code>pyvenv.cfg home</code> baked to
+          <code>/opt/netgen-server/python-runtime/bin</code>,
+          symlinks made relative.</td></tr>
+  <tr><td>v0.5.8 + v0.5.9</td>
+      <td>Tar mtimes hardcoded to <code>2020-01-01 UTC</code>
+          (was: CI-runner "now") so NTP-drifted hosts don't reject
+          files as "in the future".</td></tr>
+  <tr><td>v0.5.10</td>
+      <td>Tarball <code>share/netgen/resources/dpdk/</code> layout
+          matches <code>_preflight()</code>'s required-paths
+          contract.</td></tr>
+  <tr><td>v0.5.11</td>
+      <td>FRR Docker build context is
+          <code>share/netgen/ostg_docker/</code> (where the
+          Dockerfile's <code>COPY</code> sibling files actually
+          live).</td></tr>
+  <tr><td>v0.5.12</td>
+      <td>Every entry-point shebang in
+          <code>netgen-venv/bin/</code> rewritten from CI-runner
+          absolute path to <code>/opt/netgen-server/netgen-venv/
+          bin/python</code> (caught
+          <code>ostg-server</code> failing with
+          <code>203/EXEC</code>).</td></tr>
+  <tr><td>v0.5.13</td>
+      <td><code>/opt/netgen</code> compat symlink +
+          <code>ostg-frr:latest</code> dual-tag (proactive audit:
+          would have hit any fresh host without legacy
+          <code>/opt/OSTG/</code>).</td></tr>
+</table>
+
+<p>And from v0.5.11+, if <code>/api/health</code> doesn't respond
+within 60s, <code>_verify_running()</code> dumps inline:
+<code>journalctl</code> for the unit, who's holding port
+<code>:5050</code> (<code>ss -tlnp</code>), and whether legacy
+<code>ostg-server.service</code> is still active — with the exact
+remediation command in the install log itself. No second ssh
+round-trip required to diagnose.</p>
+
 <h2>1. In-GUI installer (NEW in 0.2.6) <span class="ok">★ recommended</span></h2>
 
 <p>You're in the client right now. Drive both install and upgrade
@@ -904,32 +1086,104 @@ all show green.</p>
 
 <h2>8. What lives where on the target</h2>
 
+<p class="muted">v0.5.0+ tarball install paths shown first. Legacy
+v0.4.x system-pip paths in the second table for hosts that
+haven't been migrated yet — those resolve via the
+<code>/opt/OSTG</code> + <code>/opt/netgen</code> compat symlinks
+when both layouts coexist.</p>
+
+<h3>v0.5.0+ tarball install (current)</h3>
+
 <table>
   <tr><th>Path</th><th>Contents</th></tr>
-  <tr><td><code>/opt/netgen/</code></td>
-      <td>Install root. Contains the wheel, systemd unit, FRR Docker artifacts.</td></tr>
-  <tr><td><code>/opt/netgen/resources/dpdk/</code></td>
-      <td>DPDK helper scripts (<code>dpdk_bind.sh</code>,
-          <code>install_dpdk.sh</code>, etc.) and the <code>tx_worker/</code>
-          source + build directory.</td></tr>
-  <tr><td><code>/opt/netgen/resources/dpdk/tx_worker/build/tx_worker</code></td>
-      <td>The compiled multi-queue tx_worker binary. The runtime path is
-          fixed; the launcher resolves it here first.</td></tr>
-  <tr><td><code>/usr/local/lib/python3.13/dist-packages/run_tgen_server.py</code></td>
-      <td>The Flask server, installed by <code>pip install</code>ing the
-          wheel.</td></tr>
-  <tr><td><code>/usr/local/lib/python3.13/dist-packages/utils/</code></td>
-      <td>Server-side Python modules (DPDK launcher, stream tracker,
-          SQLite database).</td></tr>
-  <tr><td><code>/usr/local/lib/x86_64-linux-gnu/librte_*.so*</code></td>
-      <td>DPDK runtime libraries (installed by <code>install_dpdk.sh</code>
-          via <code>meson install</code>).</td></tr>
+  <tr><td><code>/opt/netgen-server/</code></td>
+      <td><b>Install root.</b> Everything below is under here.</td></tr>
+  <tr><td><code>/opt/netgen-server/python-runtime/</code></td>
+      <td>Bundled CPython 3.10.14 (no system Python touched).</td></tr>
+  <tr><td><code>/opt/netgen-server/netgen-venv/bin/ostg-server</code></td>
+      <td>The Flask server entry point. <b>systemd ExecStart target.</b></td></tr>
+  <tr><td><code>/opt/netgen-server/netgen-venv/bin/{ostg-client,
+          netgen-cli,ostg-docker-install,pip,...}</code></td>
+      <td>Other entry-point scripts pip dropped in the venv. All
+          shebangs rewritten to <code>/opt/netgen-server/netgen-venv/
+          bin/python</code> (v0.5.12).</td></tr>
+  <tr><td><code>/opt/netgen-server/netgen-venv/lib/python3.10/
+          site-packages/</code></td>
+      <td>Server-side Python modules (run_tgen_server,
+          utils/, traffic_client/, server/, widgets/, ostg/) +
+          every dep (Flask, Scapy, PyQt5, paramiko, docker, pandas,
+          numpy, scipy, sklearn, cryptography, pydantic, openai, …).</td></tr>
+  <tr><td><code>/opt/netgen-server/share/netgen/resources/dpdk/</code></td>
+      <td>DPDK helper scripts + <code>tx_worker/</code> source.
+          v0.5.10 moved this under <code>resources/</code> to match
+          the runtime's expected layout.</td></tr>
+  <tr><td><code>/opt/netgen-server/share/netgen/resources/dpdk/
+          tx_worker/build/tx_worker</code></td>
+      <td>Compiled multi-queue tx_worker binary (built lazily by
+          <code>install_dpdk.sh</code> on first DPDK use).</td></tr>
+  <tr><td><code>/opt/netgen-server/share/netgen/ostg_docker/</code></td>
+      <td>FRR Dockerfile + sibling files
+          (<code>frr.conf.template</code>, <code>start-frr.sh</code>).
+          Used as the Docker build context.</td></tr>
+  <tr><td><code>/opt/netgen-server/bin/netgen-{install,upgrade,uninstall}</code></td>
+      <td>Operator-facing wrappers. Same scripts symlinked into
+          <code>/usr/local/bin/</code> for PATH access.</td></tr>
+  <tr><td><code>/opt/netgen-server/database.db</code><br>
+          <code>/opt/netgen-server/.netgen_ai_server_settings.env</code></td>
+      <td>Device DB + AI keys. Resolved via
+          <code>/opt/netgen → /opt/netgen-server</code> compat
+          symlink. Created lazily by the runtime on first write.</td></tr>
+  <tr><td><code>/opt/OSTG</code> (symlink) →
+          <code>/opt/netgen-server/share/netgen</code></td>
+      <td>Compat for legacy runtime hardcodes like
+          <code>/opt/OSTG/resources/dpdk/dpdk_bind.sh</code>. Created
+          by netgen-install only if <code>/opt/OSTG</code> doesn't
+          already exist as a real directory.</td></tr>
+  <tr><td><code>/opt/netgen</code> (symlink) →
+          <code>/opt/netgen-server</code></td>
+      <td>Compat for the default DB + AI settings paths. Same
+          idempotency rule as <code>/opt/OSTG</code>.</td></tr>
   <tr><td><code>/etc/systemd/system/netgen-server.service</code></td>
-      <td>Systemd unit. Runs <code>ostg-server</code> (entry point from the
-          wheel) on port 5050.</td></tr>
-  <tr><td><code>/var/log/netgen-install-dpdk.log</code></td>
-      <td>Stdout/stderr from <code>install_dpdk.sh</code>. Tail this if the
-          DPDK build acted up.</td></tr>
+      <td>Systemd unit. Type=simple, Restart=on-failure,
+          AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN. Pre-existing
+          unit backed up to <code>.service.bak</code>.</td></tr>
+  <tr><td><code>/var/log/netgen-install.log</code><br>
+          <code>/var/log/netgen-upgrade.log</code><br>
+          <code>/var/log/netgen-auto-install.log</code></td>
+      <td>Install / upgrade / DPDK aux installer logs. Tail any of
+          these if something went sideways.</td></tr>
+  <tr><td>Docker: <code>netgen-frr:latest</code> +
+          <code>ostg-frr:latest</code></td>
+      <td>Built locally from
+          <code>share/netgen/ostg_docker/Dockerfile.frr</code>
+          (Alpine + FRR + dnsmasq + dhclient). Dual-tagged so
+          both new and legacy code paths resolve it.</td></tr>
+</table>
+
+<h3>v0.4.x legacy paths (still active on un-migrated hosts)</h3>
+
+<table>
+  <tr><th>Path</th><th>Contents</th></tr>
+  <tr><td><code>/opt/OSTG/</code> (real directory)</td>
+      <td>Legacy install root. Contains
+          <code>resources/dpdk/</code> +
+          <code>device_database.db</code> +
+          <code>.ostg_ai_server_settings.env</code>. On a host
+          where this still exists as a real dir, the v0.5.x
+          compat symlink is skipped (warned).</td></tr>
+  <tr><td><code>/usr/local/lib/python3.{10,11,12,13}/dist-packages/
+          run_tgen_server.py</code></td>
+      <td>The Flask server, installed by
+          <code>install_ostg_complete.py</code>'s
+          <code>pip install</code>. Lives under whichever Python
+          minor the legacy installer picked.</td></tr>
+  <tr><td><code>/etc/systemd/system/ostg-server.service</code></td>
+      <td>Legacy systemd unit. <b>If active, it blocks the v0.5.x
+          netgen-server.service from binding port 5050</b> —
+          v0.5.11+ install log's
+          <code>_verify_running()</code> diagnostic dump surfaces
+          this with the exact <code>systemctl disable --now</code>
+          command.</td></tr>
 </table>
 
 <h2>9. Reinstall / upgrade</h2>
@@ -1205,6 +1459,122 @@ checks perftest install state in one click per selected TG.</p>
       "perftest exited rc=1", make sure netgen-server is running as
       root (which it is by default via the systemd unit).</li>
 </ul>
+
+<h2>11. v0.5.x troubleshooting recipes <span class="ok">★ from the v0.5.6 → v0.5.13 cascade</span></h2>
+
+<p>These are SSH one-liners for the install failure modes operators
+hit during the v0.5.x cascade. All have been fixed in v0.5.13+, but
+documented here for hosts mid-upgrade or for diagnosing what the
+fix actually does.</p>
+
+<h3>11a. Server not responding on /api/health</h3>
+
+<p>v0.5.11+ install log already dumps the diagnostic. If you missed
+it, reproduce manually:</p>
+
+<pre>ssh root&#x40;&lt;host&gt; '
+  journalctl -u netgen-server.service -n 30 --no-pager
+  ss -tlnp sport = :5050
+  systemctl is-active ostg-server.service
+'</pre>
+
+<p>If <code>ostg-server.service</code> is <b>active</b>, it's holding
+:5050 from the v0.4.x install. Disable it:</p>
+
+<pre>ssh root&#x40;&lt;host&gt; '
+  systemctl disable --now ostg-server.service
+  systemctl restart netgen-server.service
+  sleep 5; curl -s http://localhost:5050/api/health
+'</pre>
+
+<h3>11b. ostg-server: No such file or directory (exit 203/EXEC)</h3>
+
+<p>Pre-v0.5.12: entry-point shebangs in
+<code>netgen-venv/bin/</code> pointed at the CI runner's absolute
+path. Manually rewrite without re-downloading:</p>
+
+<pre>ssh root&#x40;&lt;host&gt; '
+  for f in /opt/netgen-server/netgen-venv/bin/{ostg-server,ostg-client,netgen-cli,ostg-docker-install}; do
+    [ -f "$f" ] && sed -i "1s|.*|#!/opt/netgen-server/netgen-venv/bin/python|" "$f"
+  done
+  systemctl restart netgen-server.service
+  sleep 5; curl -s http://localhost:5050/api/health
+'</pre>
+
+<h3>11c. tar: file is N seconds in the future / installer exit rc=3</h3>
+
+<p>Pre-v0.5.9: tarball mtimes matched the CI runner's clock. Hosts
+with NTP drift rejected the files. Either fix the host clock or
+extract with <code>--warning=no-timestamp</code>:</p>
+
+<pre>ssh root&#x40;&lt;host&gt; '
+  timedatectl set-ntp true
+  systemctl restart systemd-timesyncd
+  sleep 8; date -u
+'</pre>
+
+<p>Or if NTP isn't reachable:</p>
+
+<pre>ssh root&#x40;&lt;host&gt; "
+  cd /tmp/netgen_install
+  sudo rm -rf /opt/netgen-server.new /opt/netgen-server
+  sudo mkdir -p /opt/netgen-server
+  sudo tar --warning=no-timestamp --strip-components=1 \
+    -xzf netgen-server-*-linux-x86_64.tar.gz -C /opt/netgen-server
+  sudo /opt/netgen-server/bin/netgen-install
+"</pre>
+
+<h3>11d. Wheel upgrade fails with "externally-managed-environment"</h3>
+
+<p>v0.4.x server on Ubuntu 24.04 Noble (or Debian 12 Bookworm). The
+v0.5.6 server fixes the
+<code>/api/admin/upgrade_wheel</code> endpoint to detect
+<code>/usr/lib/python3*/EXTERNALLY-MANAGED</code> and pass
+<code>--break-system-packages</code> automatically. Manual unstick:</p>
+
+<pre>ssh root&#x40;&lt;host&gt; 'pip3 install --break-system-packages \
+  --force-reinstall /tmp/netgen_upgrade/ostg_trafficgen-*.whl
+  systemctl restart netgen-server'</pre>
+
+<p>After this, install v0.5.6+ and future wheel upgrades work
+through the GUI's Upgrade tab without manual intervention.</p>
+
+<h3>11e. Compat warnings on the install log</h3>
+
+<p>If <code>/opt/OSTG</code> or <code>/opt/netgen</code> exist as
+real directories (typical on hosts with a v0.4.x install), the
+v0.5.13 compat-symlink step warns and skips. Your install still
+works because runtime resolution falls through to the legacy paths.
+To consolidate everything under <code>/opt/netgen-server</code>:</p>
+
+<pre>ssh root&#x40;&lt;host&gt; "
+  # Migrate device DB to the new install root (if not already there)
+  [ -f /opt/OSTG/device_database.db ] &amp;&amp; [ ! -f /opt/netgen-server/database.db ] \
+    &amp;&amp; cp /opt/OSTG/device_database.db /opt/netgen-server/database.db
+  # AI settings if any
+  [ -f /opt/OSTG/.ostg_ai_server_settings.env ] &amp;&amp; [ ! -f /opt/netgen-server/.netgen_ai_server_settings.env ] \
+    &amp;&amp; cp /opt/OSTG/.ostg_ai_server_settings.env /opt/netgen-server/.netgen_ai_server_settings.env
+  # Replace real dirs with compat symlinks
+  rm -rf /opt/OSTG /opt/netgen
+  ln -s /opt/netgen-server/share/netgen /opt/OSTG
+  ln -s /opt/netgen-server /opt/netgen
+  systemctl restart netgen-server.service
+"</pre>
+
+<h3>11f. FRR Docker build fails: "frr.conf.template: not found"</h3>
+
+<p>Pre-v0.5.11 only. The Docker build context was
+<code>share/netgen/</code> but the sibling files live in
+<code>share/netgen/ostg_docker/</code>. v0.5.11+ uses
+<code>ostg_docker/</code> as both <code>-f</code> source and
+context. If your install hit this on a pre-v0.5.11 tarball:</p>
+
+<pre>ssh root&#x40;&lt;host&gt; '
+  cd /opt/netgen-server/share/netgen/ostg_docker
+  docker build -f Dockerfile.frr -t netgen-frr:latest .
+  docker tag netgen-frr:latest ostg-frr:latest
+  systemctl restart netgen-server.service
+'</pre>
 """
 
 

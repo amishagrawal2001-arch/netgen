@@ -2,6 +2,76 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.14] - 2026-06-07
+
+**In-app Install Guide rewritten for the v0.5.x tarball architecture.
+No code-path changes — documentation only.**
+
+Full suite: 1,545 passed, 1 skipped (no test deltas; existing TOC
+test still validates ≥20 sections, now ~30).
+
+### What changed
+
+`widgets/stream_dialog.py:_INSTALL_GUIDE_HTML` got three updates:
+
+**1. New §0 — v0.5.x install architecture (★ current)**
+
+Front-of-guide orientation for operators landing on the dialog
+without context. Covers:
+
+* What the v0.5.0+ tarball drops on disk (~730 MB total: 95 MB
+  bundled CPython, 537 MB venv, 94 MB FRR Docker image, plus
+  small bits).
+* What it does NOT touch (no apt, no system Python, no firewall,
+  no user accounts, no shell-rc).
+* Where to start in the dialog (Fresh Install → Tarball).
+* The 7 install-pipeline contracts CI now validates (v0.5.6→v0.5.13
+  cascade, table form), so future operators have a roadmap of
+  what's already hardened.
+* Expected end-of-log on success (paste-comparable).
+
+**2. §8 rewritten — What lives where on the target**
+
+Was: stale `/opt/netgen/` + `python3.13/dist-packages/` paths from
+the pre-v0.5.0 era. Now: two tables, current v0.5.x layout first
+(with row per artifact + v0.5.10/v0.5.12/v0.5.13 fix annotations)
+and legacy v0.4.x layout second (for un-migrated hosts).
+
+**3. New §11 — v0.5.x troubleshooting recipes**
+
+Six SSH one-liners for the failure modes operators hit during the
+v0.5.6→v0.5.13 cascade:
+
+* 11a. Server not responding on `/api/health` (port conflict /
+  legacy svc).
+* 11b. `ostg-server: No such file or directory (203/EXEC)` —
+  manual shebang rewrite for pre-v0.5.12 tarballs.
+* 11c. `tar: file is N seconds in the future` — fix the clock or
+  use `--warning=no-timestamp`.
+* 11d. Wheel upgrade `externally-managed-environment` — manual
+  `--break-system-packages` to get past the v0.5.5→v0.5.6 gap.
+* 11e. Compat warnings (legacy `/opt/OSTG/` and `/opt/netgen/`
+  exist) — consolidation recipe.
+* 11f. FRR Docker build "frr.conf.template: not found" — manual
+  rebuild with correct context for pre-v0.5.11 tarballs.
+
+All have been fixed in the install pipeline at v0.5.13+; the
+section is for operators still on intermediate tarballs or
+diagnosing what a given fix actually did.
+
+### Why ship a doc-only release
+
+Operator went through the full v0.5.6→v0.5.13 cascade hitting
+each bug live. The in-app Install Guide had been frozen at the
+v0.4.x flow (legacy `install_ostg_complete.py` end-to-end). Anyone
+reading the in-app help today would find guidance that doesn't
+match the install they're running. The audit-driven v0.5.13 closed
+the code gaps; this release closes the documentation gap.
+
+The legacy §1–§10 sections (Upgrade tab, prebuilt artifacts,
+`install_ostg_complete.py` deep-dive, RDMA setup) are unchanged —
+still accurate for upgrade flows and v0.4.x migration scenarios.
+
 ## [0.5.13] - 2026-06-07
 
 **Proactive audit release. Closes two latent bugs that would have
