@@ -42,7 +42,16 @@ on:
       - 'claude/**'
     paths:
       - '.github/workflows/build-server-tarball.yml'
+      - 'scripts/tarball/**'
       - 'pyproject.toml'
+    # v0.5.0+ tags trigger the tarball build AND release attachment.
+    # release.yml handles the wheel/.dmg/.exe/.AppImage attachments
+    # for the same tag — both workflows run in parallel and softprops
+    # updates the same GH release without conflict.
+    tags:
+      - 'v0.5.*'
+      - 'v0.[6-9].*'
+      - 'v[1-9].*'
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
@@ -370,6 +379,29 @@ jobs:
             dist/*.whl
           if-no-files-found: error
           retention-days: 7
+
+      # Attach the tarball to the GitHub release for v* tag pushes
+      # ONLY. The CI-artifact upload above stays in place for
+      # workflow_dispatch / branch-push runs so we can grab tarballs
+      # for ad-hoc testing without creating a release.
+      #
+      # softprops/action-gh-release is idempotent: release.yml is
+      # ALSO appending its wheel/.dmg/.exe/.AppImage to this same
+      # tag, and both workflows run in parallel. softprops handles
+      # concurrent appends without clobbering each other's files
+      # (they target different filenames). The body_path comment-
+      # only mode is intentional — release.yml owns the body.
+      - name: Attach tarball to GitHub release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: netgen-server-*-linux-x86_64.tar.gz
+          fail_on_unmatched_files: true
+          # Don't touch the release body — release.yml's CHANGELOG-
+          # driven notes are the authoritative content. We're only
+          # adding an asset.
+          generate_release_notes: false
+          append_body: false
 
       - name: Summary
         run: |

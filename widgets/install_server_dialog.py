@@ -413,6 +413,14 @@ class SshInstallWorker(QThread):
         extra_flags: list,
         resume_mode: bool = False,
         port: int = 22,
+        # v0.5.0: when set, install via tarball instead of the
+        # legacy wheel + install_ostg_complete.py path. The tarball
+        # ships its own bundled Python + venv + install scripts —
+        # the entire system-pip / apt-package surface that bit us
+        # through v0.4.7 / v0.4.8 / v0.4.9 disappears. Mutually
+        # exclusive with wheel_path / installer_path; if both are
+        # supplied, tarball_path wins.
+        tarball_path: Optional[str] = None,
     ):
         super().__init__()
         self.host = host
@@ -422,6 +430,7 @@ class SshInstallWorker(QThread):
         self.key_path = key_path
         self.wheel_path = wheel_path
         self.installer_path = installer_path
+        self.tarball_path = tarball_path
         self.extra_flags = extra_flags or []
         # When True, skip wheel/installer sftp + nohup spawn — assume an
         # install is already running on the target and jump straight to
@@ -580,36 +589,73 @@ class SshInstallWorker(QThread):
                     sftp.mkdir(remote_dir)
                 except IOError:
                     pass  # exists
-                self.status.emit(f"Copying wheel to {wheel_remote}...")
-                self.log_chunk.emit(f"[client] sftp put {self.wheel_path} → {wheel_remote}\n")
-                sftp.put(self.wheel_path, wheel_remote)
-                self.log_chunk.emit(f"[client] sftp put {self.installer_path} → {installer_remote}\n")
-                sftp.put(self.installer_path, installer_remote)
-                sftp.chmod(installer_remote, 0o755)
 
-                # Upload supporting files that install_ostg_complete.py
-                # expects to find alongside itself. Without these the
-                # installer prints "WARNING: resources/dpdk/ not found"
-                # and "ERROR: Dockerfile.frr: no such file or directory"
-                # — install still succeeds but DPDK + FRR Docker image
-                # never get deployed. Source paths resolved relative to
-                # the installer's parent dir (same shape as the git
-                # checkout layout).
-                src_root = os.path.dirname(os.path.abspath(self.installer_path))
-                # Top-level files: name → optional. Anything missing
-                # logs a [warn] but doesn't abort — operator may not
-                # need all features on a given install.
-                top_files = [
-                    "Dockerfile.frr",
-                    "requirements.txt",
-                ]
-                # Recursive directory uploads: (local_dir, remote_dir)
-                tree_uploads = [
-                    (os.path.join(src_root, "resources", "dpdk"),
-                     f"{remote_dir}/resources/dpdk"),
-                    (os.path.join(src_root, "ostg_docker"),
-                     f"{remote_dir}/ostg_docker"),
-                ]
+                # v0.5.0 tarball path: ship ONE file, extract on the
+                # target, run the bundled install script. Way less
+                # SFTP surface than the legacy wheel + installer +
+                # resources tree.
+                if self.tarball_path:
+                    tarball_remote = f"{remote_dir}/{os.path.basename(self.tarball_path)}"
+                    self.status.emit(f"Copying tarball to {tarball_remote}...")
+                    tb_size = os.path.getsize(self.tarball_path)
+                    self.log_chunk.emit(
+                        f"[client] sftp put {self.tarball_path} → "
+                        f"{tarball_remote} ({tb_size:,} bytes)\n"
+                    )
+                    sftp.put(self.tarball_path, tarball_remote)
+                    # Done with sftp — the tarball is the only thing
+                    # the install scripts need. Everything else
+                    # (resources, Docker assets, install scripts) is
+                    # inside the tarball.
+                    sftp.close()
+                    # Jump past the legacy wheel+installer+resources
+                    # upload — those don't apply to tarball installs.
+                    # The spawn step below detects tarball_path and
+                    # builds the right invocation.
+                    self._tarball_remote_for_spawn = tarball_remote
+                else:
+                    self._tarball_remote_for_spawn = None
+                    self.status.emit(f"Copying wheel to {wheel_remote}...")
+                    self.log_chunk.emit(f"[client] sftp put {self.wheel_path} → {wheel_remote}\n")
+                    sftp.put(self.wheel_path, wheel_remote)
+                    self.log_chunk.emit(f"[client] sftp put {self.installer_path} → {installer_remote}\n")
+                    sftp.put(self.installer_path, installer_remote)
+                    sftp.chmod(installer_remote, 0o755)
+
+                # Legacy supporting-files upload — only for the wheel
+                # path. The v0.5.0 tarball already ships these inside
+                # itself under share/netgen/, so we skip when
+                # tarball_path is set.
+                if self.tarball_path:
+                    src_root = None
+                    top_files: list = []
+                    tree_uploads: list = []
+                else:
+                    # install_ostg_complete.py expects these files
+                    # alongside itself. Without them the installer
+                    # prints "WARNING: resources/dpdk/ not found" and
+                    # "ERROR: Dockerfile.frr: no such file or
+                    # directory" — install still succeeds but DPDK +
+                    # FRR Docker image never get deployed. Source
+                    # paths resolved relative to the installer's
+                    # parent dir (same shape as the git checkout
+                    # layout).
+                    src_root = os.path.dirname(os.path.abspath(self.installer_path))
+                    # Top-level files: name → optional. Anything
+                    # missing logs a [warn] but doesn't abort —
+                    # operator may not need all features on a given
+                    # install.
+                    top_files = [
+                        "Dockerfile.frr",
+                        "requirements.txt",
+                    ]
+                    # Recursive directory uploads: (local_dir, remote_dir)
+                    tree_uploads = [
+                        (os.path.join(src_root, "resources", "dpdk"),
+                         f"{remote_dir}/resources/dpdk"),
+                        (os.path.join(src_root, "ostg_docker"),
+                         f"{remote_dir}/ostg_docker"),
+                    ]
 
                 for fname in top_files:
                     local = os.path.join(src_root, fname)
@@ -719,11 +765,45 @@ class SshInstallWorker(QThread):
         # `python3 -u` makes stdout unbuffered so each [INFO] print()
         # lands in /var/log/netgen-install.log immediately, and the
         # poll loop surfaces it within ~1-5 s.
-        installer_invocation = (
-            f"cd {remote_dir} && "
-            f"python3 -u install_ostg_complete.py "
-            f"--wheel {wheel_remote} {cmd_flags}"
-        ).strip()
+        # v0.5.0 tarball install: extract to /opt and run the
+        # bundled bin/netgen-install. No system pip touched.
+        # Legacy wheel install: python3 -u install_ostg_complete.py
+        # as before. install_ostg_complete.py is unchanged — we
+        # just don't invoke it for tarball installs.
+        if self.tarball_path:
+            tarball_remote = self._tarball_remote_for_spawn
+            tb_name = os.path.basename(tarball_remote)
+            # tar's --strip-components=0 + a separate mv handles the
+            # `netgen-server-<VERSION>` versioned dir-name the
+            # tarball expands to. Result is always /opt/netgen-server
+            # regardless of which version the operator's installing.
+            # Idempotent: if /opt/netgen-server exists, we move it to
+            # .bak first so re-installs don't merge with prior state.
+            installer_invocation = (
+                f"set -e; "
+                f"cd {remote_dir}; "
+                f"# Stage extract to a temp dir, then rename so the "
+                f"# final /opt/netgen-server appears atomic — operator "
+                f"# never sees a half-extracted tree.\n"
+                f"sudo rm -rf /opt/netgen-server.new; "
+                f"sudo mkdir -p /opt/netgen-server.new; "
+                f"sudo tar --strip-components=1 -xzf {tb_name} -C /opt/netgen-server.new; "
+                f"# Back up any prior install (v0.4.x system install OR "
+                f"# previous v0.5.x tarball); the netgen-install script "
+                f"# below will write a fresh systemd unit anyway.\n"
+                f"if [ -d /opt/netgen-server ]; then "
+                f"  sudo rm -rf /opt/netgen-server.bak; "
+                f"  sudo mv /opt/netgen-server /opt/netgen-server.bak; "
+                f"fi; "
+                f"sudo mv /opt/netgen-server.new /opt/netgen-server; "
+                f"sudo /opt/netgen-server/bin/netgen-install {cmd_flags}"
+            ).strip()
+        else:
+            installer_invocation = (
+                f"cd {remote_dir} && "
+                f"python3 -u install_ostg_complete.py "
+                f"--wheel {wheel_remote} {cmd_flags}"
+            ).strip()
         # Wrapper script that:
         #   1. Truncates the log file
         #   2. Writes its own pid to pid_path
@@ -1348,8 +1428,16 @@ class InstallServerDialog(QDialog):
                 self.ssh_port.setValue(port)
 
     def _browse_wheel(self, line_edit: QLineEdit) -> None:
+        # v0.5.0: file picker accepts both wheel AND server-tarball.
+        # The dispatcher downstream (SshInstallWorker) detects the
+        # file extension and chooses the install path automatically:
+        #   .whl     → legacy install_ostg_complete.py
+        #   .tar.gz  → v0.5.0 tarball install (extract + netgen-install)
         path, _ = QFileDialog.getOpenFileName(
-            self, "Select wheel file", "", "Python wheels (*.whl);;All files (*)"
+            self, "Select wheel or server tarball", "",
+            "Python wheels (*.whl);;"
+            "Server tarballs (netgen-server-*-linux-*.tar.gz);;"
+            "All files (*)"
         )
         if path:
             line_edit.setText(path)
@@ -1361,17 +1449,27 @@ class InstallServerDialog(QDialog):
             # downstream with a less-friendly "not a valid wheel"
             # error. Surface it now while the path is still on
             # screen.
+            #
+            # v0.5.0: relaxed to accept .tar.gz tarballs too — that's
+            # the new install path. Only warn for files that are
+            # NEITHER .whl NOR a server tarball.
             try:
                 import os as _os
-                if not path.lower().endswith(".whl"):
+                if not (path.lower().endswith(".whl")
+                        or path.lower().endswith(".tar.gz")):
                     QMessageBox.warning(
                         self,
-                        "Not a .whl file",
-                        f"The selected file doesn't have a .whl extension:\n\n"
+                        "Not a .whl or .tar.gz file",
+                        f"The selected file doesn't have a .whl or "
+                        f".tar.gz extension:\n\n"
                         f"  {_os.path.basename(path)}\n\n"
-                        "pip will reject it during install. Pick the wheel "
-                        "produced by `python -m build --wheel` (or the one "
-                        "attached to a GitHub release)."
+                        "Pick one of:\n"
+                        "  • A wheel (ostg_trafficgen-*.whl) for routine "
+                        "upgrades — pip will install it on the target.\n"
+                        "  • A server tarball "
+                        "(netgen-server-*-linux-*.tar.gz) for v0.5.0+ "
+                        "fresh installs — extracts into /opt/netgen-server.\n\n"
+                        "Both are attached to each GitHub release."
                     )
             except Exception:
                 pass
@@ -1851,16 +1949,31 @@ class InstallServerDialog(QDialog):
                 return
             resume_mode = True
 
-        # Wheel + installer paths only need validation when we're
-        # actually going to upload them.
+        # Wheel/tarball path only needs validation when we're actually
+        # going to upload it. v0.5.0 relaxation: the file picker can
+        # return a .whl OR a .tar.gz; the second installer-path field
+        # is only required for the legacy wheel install (the tarball
+        # carries its own install scripts inside it).
         if not resume_mode:
             if not wheel or not os.path.isfile(wheel):
-                QMessageBox.warning(self, "Missing", "Pick a valid wheel file.")
+                QMessageBox.warning(
+                    self, "Missing",
+                    "Pick a wheel (.whl) or server tarball "
+                    "(netgen-server-*-linux-*.tar.gz).",
+                )
                 return
-            if not installer or not os.path.isfile(installer):
-                QMessageBox.warning(self, "Missing",
-                                    "Pick install_ostg_complete.py from the repo checkout.")
-                return
+            _is_tarball_check = wheel.lower().endswith(".tar.gz")
+            if not _is_tarball_check:
+                # Legacy wheel install needs install_ostg_complete.py
+                if not installer or not os.path.isfile(installer):
+                    QMessageBox.warning(
+                        self, "Missing",
+                        "Pick install_ostg_complete.py from the repo "
+                        "checkout. (Not needed for server-tarball "
+                        "installs — the install scripts ship inside "
+                        "the tarball.)",
+                    )
+                    return
 
         flags = []
         if self.flag_no_dpdk.isChecked():
@@ -1874,10 +1987,18 @@ class InstallServerDialog(QDialog):
         self._set_status("Resuming monitoring..." if resume_mode else "Connecting...")
         self.ssh_btn.setEnabled(False)
 
+        # v0.5.0 dispatch: file picker can return a wheel OR a server
+        # tarball. The same UI field carries both — wire SshInstallWorker
+        # accordingly so the downstream install command branches on
+        # tarball_path vs wheel_path.
+        is_tarball = bool(wheel) and wheel.lower().endswith(".tar.gz")
         self._worker = SshInstallWorker(
             host=host, user=user, port=port,
             password=password, key_path=key_path,
-            wheel_path=wheel, installer_path=installer, extra_flags=flags,
+            wheel_path=("" if is_tarball else wheel),
+            installer_path=("" if is_tarball else installer),
+            tarball_path=(wheel if is_tarball else None),
+            extra_flags=flags,
             resume_mode=resume_mode,
         )
         self._worker.log_chunk.connect(self._append_log)
