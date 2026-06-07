@@ -598,6 +598,55 @@ jobs:
           done
           echo "✓ All netgen-install layout paths present"
 
+          # v0.5.11: the FRR Dockerfile's COPY directives reference
+          # sibling files. Pin that the build CONTEXT (the dir
+          # passed as the last `docker build` argument) actually
+          # contains every file the Dockerfile COPYs from.
+          #
+          # Operator-reported on srv06 (v0.5.10):
+          #   [4/7] COPY frr.conf.template /etc/frr/frr.conf.template
+          #   ERROR: failed to calculate checksum of ref ...:
+          #     "/frr.conf.template": not found
+          #
+          # netgen-install v0.5.11 uses share/netgen/ostg_docker/
+          # as the build context, where Dockerfile + siblings
+          # coexist. Verify the layout supports it.
+          FRR_CTX="$EXTRACTED/share/netgen/ostg_docker"
+          echo "Verifying FRR Docker build context at $FRR_CTX..."
+          for f in Dockerfile.frr frr.conf.template start-frr.sh; do
+            if [ ! -e "$FRR_CTX/$f" ]; then
+              echo "ERROR: FRR build context missing $FRR_CTX/$f"
+              echo "       (Dockerfile.frr's COPY $f would fail)"
+              exit 1
+            fi
+          done
+          # And derive the list of COPY src filenames from the
+          # Dockerfile itself — catches any future addition that
+          # references a new sibling. We don't run docker build
+          # in CI (would need root for some buildkit setups + 2-3 min
+          # of CI time), but pinning the static contract catches the
+          # most common regression.
+          missing_copies=$(
+            grep -E '^\s*COPY\s+\S+\s' "$FRR_CTX/Dockerfile.frr" \
+              | awk '{print $2}' \
+              | while read -r src; do
+                  case "$src" in
+                    /*) ;;  # absolute path inside image, skip
+                    *)
+                      if [ ! -e "$FRR_CTX/$src" ]; then
+                        echo "$src"
+                      fi
+                      ;;
+                  esac
+                done
+          )
+          if [ -n "$missing_copies" ]; then
+            echo "ERROR: Dockerfile.frr COPY references missing from build context:"
+            echo "$missing_copies"
+            exit 1
+          fi
+          echo "✓ FRR Docker build context complete"
+
           # Show the final size profile for sanity.
           du -sh "$EXTRACTED"
           du -sh "$EXTRACTED/python-runtime"

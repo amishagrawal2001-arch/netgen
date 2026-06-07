@@ -304,18 +304,50 @@ def _build_frr_image(install_root: Path) -> bool:
     """Build the netgen-frr:latest Docker image from Dockerfile.frr.
     Returns True on success, False on failure (logged but non-fatal —
     netgen still starts without FRR, just no DHCP/BGP/OSPF features).
+
+    v0.5.11 fix: use ostg_docker/ as both -f source AND build context.
+    The Dockerfile.frr's COPY directives reference sibling files
+    (frr.conf.template, start-frr.sh). Those files live in
+    share/netgen/ostg_docker/, NOT share/netgen/. Using share/netgen/
+    as the build context (v0.5.10) made every COPY fail:
+
+      [4/7] COPY frr.conf.template /etc/frr/frr.conf.template
+      ERROR: failed to calculate checksum of ref ...:
+        "/frr.conf.template": not found
+
+    The v0.5.0+ workflow copied Dockerfile.frr to BOTH locations
+    (share/netgen/ and share/netgen/ostg_docker/), but only
+    ostg_docker/ has the template+script siblings. Use the subdir
+    where everything coexists.
     """
     if shutil.which("docker") is None:
         logger.warning("[FRR] Docker not available — skipping FRR image build")
         return False
     logger.info("[FRR] Building netgen-frr:latest Docker image...")
-    dockerfile = install_root / "share" / "netgen" / "Dockerfile.frr"
+    # Prefer ostg_docker/ subdir (has all 3 files). Fall back to
+    # share/netgen/ for backward-compat with any imagined pre-v0.5.11
+    # tarball that put everything at share/netgen/ root.
+    ostg_docker = install_root / "share" / "netgen" / "ostg_docker"
+    legacy_root = install_root / "share" / "netgen"
+    if (ostg_docker / "Dockerfile.frr").exists() and \
+            (ostg_docker / "frr.conf.template").exists() and \
+            (ostg_docker / "start-frr.sh").exists():
+        dockerfile = ostg_docker / "Dockerfile.frr"
+        context = ostg_docker
+        logger.info(f"[FRR]   context: {context} (v0.5.11 layout)")
+    else:
+        dockerfile = legacy_root / "Dockerfile.frr"
+        context = legacy_root
+        logger.warning(
+            f"[FRR]   context: {context} (legacy layout — pre-v0.5.11; "
+            f"sibling files might be missing)"
+        )
     try:
         _run(
             ["docker", "build",
              "-f", str(dockerfile),
              "-t", "netgen-frr:latest",
-             str(dockerfile.parent)],
+             str(context)],
             check=True,
         )
         logger.info("[FRR] ✓ Image built")
@@ -467,8 +499,50 @@ def _verify_running(timeout_s: int = 60) -> bool:
             pass
         time.sleep(2)
     logger.error(
-        f"[VERIFY] Server did not respond on {url} within {timeout_s}s. "
-        f"Check: journalctl -u {SYSTEMD_UNIT_NAME} -n 50 --no-pager"
+        f"[VERIFY] Server did not respond on {url} within {timeout_s}s."
+    )
+    # v0.5.11: dump diagnostics RIGHT HERE so operators see the cause
+    # in the install log without a second ssh round-trip. The likely
+    # culprits on a v0.4.x → v0.5.x migration:
+    #   - legacy ostg-server.service still bound to :5050
+    #   - bundled Python import failure (Flask app couldn't construct)
+    #   - port 5050 held by something else (rare)
+    logger.error("[VERIFY] Diagnostic dump follows ──")
+    try:
+        # 30 lines of recent journal output from the unit.
+        _run(
+            ["journalctl", "-u", SYSTEMD_UNIT_NAME,
+             "-n", "30", "--no-pager"],
+            check=False,
+        )
+    except Exception as e:
+        logger.error(f"[VERIFY] journalctl failed: {e}")
+    # Who's holding port 5050? Often the missing puzzle piece.
+    try:
+        _run(
+            ["ss", "-tlnp", "sport", "=", ":5050"],
+            check=False,
+        )
+    except Exception:
+        # ss may not be available on every distro; fall back to lsof.
+        try:
+            _run(["lsof", "-i", ":5050"], check=False)
+        except Exception:
+            pass
+    # Legacy v0.4.x service was named ostg-server.service. If it
+    # exists and is still active, it's almost certainly the blocker.
+    try:
+        _run(
+            ["systemctl", "is-active", "ostg-server.service"],
+            check=False,
+        )
+    except Exception:
+        pass
+    logger.error("[VERIFY] ── end diagnostic dump")
+    logger.error(
+        f"[VERIFY] If 'ostg-server.service' is active above, run: "
+        f"sudo systemctl disable --now ostg-server.service && "
+        f"sudo systemctl restart {SYSTEMD_UNIT_NAME}"
     )
     return False
 

@@ -2,6 +2,118 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.11] - 2026-06-07
+
+**FRR Docker build now finds its sibling files. Plus install log
+self-diagnoses when /api/health fails to come up.**
+
+Full suite: 1,536 passed, 1 skipped (+5 new tests).
+
+### Operator-reported
+
+san-hp-srv06 after v0.5.10 cleared the preflight gate:
+
+```
+[4/7] COPY frr.conf.template /etc/frr/frr.conf.template
+ERROR: failed to calculate checksum of ref ...:
+  "/frr.conf.template": not found
+[6/7] COPY start-frr.sh /usr/local/bin/start-frr.sh
+ERROR: failed to calculate checksum of ref ...:
+  "/start-frr.sh": not found
+[WARNING] [FRR] Docker build failed: ... non-zero exit status 1.
+... (FRR is non-fatal; install continues)
+[VERIFY] Server did not respond on http://localhost:5050/api/health within 60s.
+[client] installer exit rc=1
+```
+
+### Fix 1 — FRR Docker build context
+
+The v0.5.0 workflow copied Dockerfile.frr to BOTH
+`share/netgen/Dockerfile.frr` (build context root) AND
+`share/netgen/ostg_docker/Dockerfile.frr` (subdir). But the
+`COPY frr.conf.template ...` directive resolves relative to the
+build context, and the template+startup-script siblings live in
+ostg_docker/, not at share/netgen/ root.
+
+netgen-install was using `share/netgen/Dockerfile.frr` with
+`share/netgen/` as context. Every COPY failed.
+
+v0.5.11 `_build_frr_image()` uses `share/netgen/ostg_docker/`
+as both `-f` source AND build context. All 3 files coexist there.
+With a precondition check that all 3 actually exist — so a corrupted
+tarball surfaces as a clear "FRR layout invalid" error, not a
+confusing docker build crash.
+
+### Fix 2 — Self-diagnosing /api/health timeout
+
+When `_verify_running()` times out, the install log used to say:
+
+```
+[VERIFY] Server did not respond on http://localhost:5050/api/health
+within 60s. Check: journalctl -u netgen-server.service -n 50 --no-pager
+```
+
+That puts the work on the operator. v0.5.11 does it inline:
+
+```
+[VERIFY] Server did not respond on http://localhost:5050/api/health within 60s.
+[VERIFY] Diagnostic dump follows ──
+$ journalctl -u netgen-server.service -n 30 --no-pager
+<full 30 lines>
+$ ss -tlnp sport = :5050
+<who's holding the port>
+$ systemctl is-active ostg-server.service
+active   ← AHA, that's the blocker
+[VERIFY] ── end diagnostic dump
+[VERIFY] If 'ostg-server.service' is active above, run:
+  sudo systemctl disable --now ostg-server.service && \
+  sudo systemctl restart netgen-server.service
+```
+
+The most common cause on v0.4.x → v0.5.x migration is the legacy
+`ostg-server.service` still bound to :5050. Operators now see this
+in the install log with the exact fix command.
+
+### CI gap closed
+
+Round-trip step now parses Dockerfile.frr's COPY directives and
+verifies every sibling file exists in the build context. Without
+this, the next sibling-file addition would silently break the next
+operator's install.
+
+Plus a source-tree-level test: any COPY src in Dockerfile.frr must
+exist as a real file in `ostg_docker/`. Catches the regression at
+edit time, before the commit even lands.
+
+### Operator workflow for srv06 right now
+
+```bash
+# 1. Diagnose
+ssh root@san-hp-srv06 'systemctl list-units --all "*ostg*" "*netgen*"'
+
+# 2. Most likely fix (legacy v0.4.x service still on :5050)
+ssh root@san-hp-srv06 'systemctl disable --now ostg-server.service; \
+  systemctl restart netgen-server.service; sleep 5; \
+  curl -s http://localhost:5050/api/health'
+```
+
+After that, the v0.5.11 install will succeed cleanly AND the FRR
+image will build correctly the first time.
+
+### Pattern (continued)
+
+6th consecutive release this hour where CI was green but the
+operator hit a real bug. This one was different shape: not "CI
+tested something the operator doesn't" but **"the CI smoke
+test was checking pre-bundled-venv import, not Docker build
+context"**. Round-trip now parses Dockerfile.frr's COPY directives —
+the only way to catch "Docker build context broken" without
+actually running docker build in CI.
+
+Codified rule: **for every external tool the install script calls
+(docker, systemctl, pip), CI must validate the contract that tool
+will check.** Not the python-import side of it.
+
 ## [0.5.10] - 2026-06-07
 
 **Two latent bugs from v0.5.0 finally hit on srv06 after the clock-
