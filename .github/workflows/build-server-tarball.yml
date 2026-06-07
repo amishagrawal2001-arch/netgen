@@ -173,6 +173,72 @@ jobs:
               ;;
           esac
 
+          # 2b. RELOCATE the venv internals — v0.5.7 fix for srv06.
+          #     `python -m venv` writes ABSOLUTE paths into:
+          #       - pyvenv.cfg's `home = ...` (used by Python at
+          #         startup to find sys.prefix → site-packages)
+          #       - bin/python3 symlink target (used as the
+          #         interpreter for the shebang chain)
+          #     Both end up pointing at the CI runner's filesystem
+          #     (/home/runner/work/...). On the operator's host
+          #     those paths don't exist, so:
+          #       sudo /opt/netgen-server/bin/netgen-install
+          #       → shebang #!/opt/netgen-server/netgen-venv/bin/python
+          #       → resolves to /opt/netgen-server/netgen-venv/bin/python3
+          #       → symlink target /home/runner/work/... missing
+          #       → kernel reports "No such file or directory"
+          #       → operator-reported on srv06 with v0.5.6 tarball.
+          #
+          #     Fix shape:
+          #       - Symlinks → relative paths (`../../python-runtime/
+          #         bin/python3`). Works at any install location.
+          #       - pyvenv.cfg → bake `/opt/netgen-server` since that
+          #         IS the documented install location; the round-
+          #         trip test below verifies it.
+          FINAL_PREFIX="/opt/netgen-server"
+          echo "Relocating venv to bake-in install prefix: $FINAL_PREFIX"
+          # pyvenv.cfg must be an absolute path — `home` is consulted
+          # by Python at startup, before any chdir.
+          sed -i "s|^home = .*|home = ${FINAL_PREFIX}/python-runtime/bin|" \
+            "$ROOT/netgen-venv/pyvenv.cfg"
+          echo "Rewrote pyvenv.cfg:"
+          cat "$ROOT/netgen-venv/pyvenv.cfg"
+          # Replace absolute symlinks with relative ones so the venv
+          # is portable enough for the round-trip test to catch any
+          # remaining absolute-path leaks.
+          for link_name in python3 python3.10 python; do
+            link="$ROOT/netgen-venv/bin/$link_name"
+            [ -L "$link" ] || continue
+            target=$(readlink "$link")
+            case "$target" in
+              /*)
+                # Absolute target — convert to relative.
+                # All three names end up pointing at the same
+                # bundled python3, just through different symlink
+                # chains. ../../python-runtime/bin/python3 resolves
+                # to <wherever-extracted>/python-runtime/bin/python3.
+                rm "$link"
+                ln -s "../../python-runtime/bin/python3" "$link"
+                echo "Relinked $link_name → ../../python-runtime/bin/python3"
+                ;;
+              *)
+                # Already relative (e.g. `python -> python3`); leave
+                # alone.
+                echo "Left $link_name relative: → $target"
+                ;;
+            esac
+          done
+          # Sanity check: every symlink in bin/ must now be either
+          # a relative one OR resolve to an existing file relative
+          # to the venv. No leftover absolute /home/runner paths.
+          for link in "$ROOT/netgen-venv/bin/python" "$ROOT/netgen-venv/bin/python3" "$ROOT/netgen-venv/bin/python3.10"; do
+            [ -L "$link" ] || continue
+            tgt=$(readlink "$link")
+            case "$tgt" in
+              /*) echo "ERROR: $link still absolute: $tgt"; exit 1 ;;
+            esac
+          done
+
           # 3. Install the wheel + deps into the venv. --no-cache-dir
           #    keeps the venv reproducible; --force-reinstall has the
           #    same rationale as install_ostg_complete.py:install_ostg
@@ -345,27 +411,113 @@ jobs:
           set -euo pipefail
           VERSION="${{ steps.ver.outputs.VERSION }}"
           TARBALL="netgen-server-${VERSION}-linux-x86_64.tar.gz"
+          ROOT="netgen-server-${VERSION}"
 
-          # Extract to a fresh location (not the staging dir we built
-          # in). Catches "the tarball is internally consistent only
-          # because of the build-side filesystem state" mistakes.
-          mkdir -p /tmp/tarball-roundtrip
-          tar -xzf "$TARBALL" -C /tmp/tarball-roundtrip
-          ls -la /tmp/tarball-roundtrip/
-          EXTRACTED="/tmp/tarball-roundtrip/netgen-server-${VERSION}"
+          # v0.5.7 fix: delete the staging tree BEFORE the round-trip
+          # extract test. The v0.5.6 round-trip false-positively passed
+          # because the venv's symlinks were absolute paths into the
+          # staging tree (/home/runner/work/netgen/netgen/netgen-server-
+          # 0.5.6/python-runtime/bin/python3). When the test extracted
+          # to /tmp/tarball-roundtrip and tried to run the venv python,
+          # the symlink resolved via the LEFTOVER staging tree on the
+          # CI filesystem — not via the extracted /tmp/ copy. Looked
+          # green; operator-broken.
+          #
+          # By deleting the staging tree first, the only thing on disk
+          # is the tarball. The test becomes representative.
+          echo "Deleting staging tree to prevent symlink-leakage false-positive:"
+          rm -rf "$ROOT"
+          rm -rf staging
+          ls -la
 
-          # Re-run the same imports against the EXTRACTED tree.
-          echo "Re-verifying imports after extract..."
+          # Extract to /opt/netgen-server — the DOCUMENTED install
+          # path. pyvenv.cfg's `home = /opt/netgen-server/python-
+          # runtime/bin` is now baked in (step 2b above), so this is
+          # the path that must work end-to-end.
+          sudo mkdir -p /opt/netgen-server
+          sudo tar --strip-components=1 -xzf "$TARBALL" -C /opt/netgen-server
+          sudo chown -R "$USER:$USER" /opt/netgen-server || true
+          EXTRACTED="/opt/netgen-server"
+
+          # Verify pyvenv.cfg's home now points at the install path.
+          # Catches a regression in the step-2b sed rewrite.
+          if ! grep -q "^home = /opt/netgen-server/python-runtime/bin" \
+                "$EXTRACTED/netgen-venv/pyvenv.cfg"; then
+            echo "ERROR: pyvenv.cfg's home was not rewritten to /opt/netgen-server"
+            cat "$EXTRACTED/netgen-venv/pyvenv.cfg"
+            exit 1
+          fi
+
+          # Verify the venv's python3 symlink resolves WITHOUT looking
+          # for any /home/runner/* path. This is the smoking-gun test
+          # for the v0.5.6 srv06 failure.
+          PY3_TARGET=$(readlink "$EXTRACTED/netgen-venv/bin/python3")
+          case "$PY3_TARGET" in
+            /home/runner/*)
+              echo "ERROR: venv/bin/python3 still points at CI runner: $PY3_TARGET"
+              exit 1
+              ;;
+            /*)
+              echo "ERROR: venv/bin/python3 is absolute: $PY3_TARGET (expected relative)"
+              exit 1
+              ;;
+          esac
+          echo "venv/bin/python3 → $PY3_TARGET (relative ✓)"
+          # And it must actually resolve to an existing file.
+          if [ ! -x "$EXTRACTED/netgen-venv/bin/python3" ]; then
+            echo "ERROR: venv/bin/python3 doesn't resolve to an executable file"
+            ls -la "$EXTRACTED/netgen-venv/bin/python3"
+            exit 1
+          fi
+
+          # Re-run the imports against the EXTRACTED tree. This is
+          # what the operator's first invocation would do.
+          echo "Re-verifying imports from /opt/netgen-server..."
           "$EXTRACTED/netgen-venv/bin/python" -c "
           import flask, scapy.all, requests, psutil, run_tgen_server
-          print('all imports OK from extracted tarball')
+          print('all imports OK from /opt/netgen-server')
           "
+
+          # And — the actual operator-reported failure mode — try to
+          # actually EXECUTE bin/netgen-install via its rewritten
+          # shebang. It has no --help flag, so we just invoke it
+          # without root. Without the v0.5.7 fix, the kernel returns
+          # "No such file or directory" because the shebang's python
+          # symlink target is missing. With the v0.5.7 fix, the
+          # interpreter loads, the script imports, and then exits
+          # non-zero on the _require_root() check — which means the
+          # shebang chain is intact (success for this test).
+          #
+          # We expect non-zero exit but with OUTPUT — proves the
+          # interpreter ran. If exec(2) itself failed, there'd be
+          # no Python-side output at all.
+          echo "Smoke-testing bin/netgen-install shebang chain..."
+          set +e
+          OUTPUT=$("$EXTRACTED/bin/netgen-install" 2>&1)
+          RC=$?
+          set -e
+          echo "exit=$RC output:"
+          echo "$OUTPUT"
+          if [ "$RC" -eq 127 ] || echo "$OUTPUT" | grep -qi "no such file"; then
+            echo "ERROR: shebang chain broken — operator on srv06 reported this exact failure mode"
+            exit 1
+          fi
+          # Must have produced Python-side output (require_root logger
+          # message). Empty output = exec(2) silently failed.
+          if [ -z "$OUTPUT" ]; then
+            echo "ERROR: no output from bin/netgen-install — exec(2) failure"
+            exit 1
+          fi
 
           # Show the final size profile for sanity.
           du -sh "$EXTRACTED"
           du -sh "$EXTRACTED/python-runtime"
           du -sh "$EXTRACTED/netgen-venv"
           du -sh "$EXTRACTED/share"
+
+          # Leave /opt/netgen-server in place so the next step (pack)
+          # doesn't re-extract; the artifact upload uses the original
+          # tarball file in the workspace.
 
       - name: Upload tarball as CI artifact
         uses: actions/upload-artifact@v4

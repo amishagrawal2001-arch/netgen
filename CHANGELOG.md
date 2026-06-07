@@ -2,6 +2,126 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.7] - 2026-06-07
+
+**Tarball venv is now actually relocatable. The v0.5.6 fresh-install
+broke at the operator's first `sudo /opt/netgen-server/bin/netgen-
+install`. v0.5.7 makes the round-trip CI test catch this — and adds
+the venv relocation step that should have been there since v0.5.0.**
+
+Full suite: 1,517 passed, 1 skipped (+6 new tests).
+
+### Operator-reported
+
+san-hp-srv06, attempting v0.5.5 → v0.5.6 fresh install via the GUI's
+Install/Upgrade Server → Fresh Install via SSH tab:
+
+```
+[client] sftp put netgen-server-0.5.6-linux-x86_64.tar.gz
+[client] spawn: sudo tar -xzf ...; sudo mv .new /opt/netgen-server;
+                sudo /opt/netgen-server/bin/netgen-install
+sudo: unable to execute /opt/netgen-server/bin/netgen-install:
+      No such file or directory
+[client] installer exit rc=1
+```
+
+The script file existed and was executable. The "No such file or
+directory" comes from Linux's classic mis-reporting: when a script's
+shebang interpreter is missing, the kernel reports the script itself
+as missing.
+
+### Root cause
+
+`python -m venv` writes ABSOLUTE paths into two places:
+
+1. `netgen-venv/pyvenv.cfg`:
+   ```
+   home = /home/runner/work/netgen/netgen/netgen-server-0.5.6/python-runtime/bin
+   ```
+   Python at startup reads `home` to compute `sys.prefix` →
+   site-packages location. Wrong `home` → broken imports.
+
+2. `netgen-venv/bin/python3` symlink target:
+   ```
+   /home/runner/work/netgen/netgen/netgen-server-0.5.6/python-runtime/bin/python3
+   ```
+   `netgen-install` shebang: `#!/opt/netgen-server/netgen-venv/bin/python`
+   → resolves to `bin/python3` symlink → CI-runner path that doesn't
+   exist on srv06 → kernel reports "No such file or directory".
+
+Both end up pointing at the CI runner's filesystem. The v0.5.6
+round-trip CI test passed despite this — it extracted to
+`/tmp/tarball-roundtrip/` while the staging tree was still on disk,
+so the absolute symlinks resolved through the LEFTOVER state.
+False-positive.
+
+### Fix
+
+**`.github/workflows/build-server-tarball.yml` — venv relocation step
+after `python -m venv` (new step 2b):**
+
+```bash
+FINAL_PREFIX="/opt/netgen-server"
+# 1. Rewrite pyvenv.cfg home to the documented install prefix.
+sed -i "s|^home = .*|home = ${FINAL_PREFIX}/python-runtime/bin|" \
+  netgen-venv/pyvenv.cfg
+# 2. Replace absolute bin/python3 symlinks with relative ones —
+#    portable across any extract location.
+for link_name in python3 python3.10 python; do
+  link=netgen-venv/bin/$link_name
+  [ -L "$link" ] || continue
+  target=$(readlink "$link")
+  case "$target" in
+    /*)  rm "$link"
+         ln -s ../../python-runtime/bin/python3 "$link" ;;
+  esac
+done
+# 3. Verify no absolute symlinks remain in netgen-venv/bin/.
+```
+
+**Strengthened round-trip test:**
+
+* `rm -rf` the staging tree BEFORE extracting. Without this,
+  absolute symlinks resolve through leftover state. v0.5.6's
+  false-positive ships from exactly this.
+* Extract to `/opt/netgen-server` (matching the baked
+  pyvenv.cfg). Any other path invalidates the bake-in.
+* Actually `exec` `bin/netgen-install` and check exit code +
+  output. rc=127 or "no such file" output now FAILS the build
+  — the exact srv06 signature.
+
+**Regression tests** (`tests/test_v057_tarball_venv_relocatable.py`)
+pin all four contract points so a future workflow refactor surfaces
+here.
+
+### Operator workflow for srv06 right now
+
+The failed v0.5.6 fresh-install left `/opt/netgen-server/` half-built
+on srv06, but the v0.5.5 system-pip install is still serving (the
+new systemd unit was never written because netgen-install never ran).
+To get unstuck:
+
+```bash
+ssh root@san-hp-srv06 'rm -rf /opt/netgen-server*'
+```
+
+Then in the v0.5.7 client → File → Install/Upgrade Server → Fresh
+Install via SSH → pick `netgen-server-0.5.7-linux-x86_64.tar.gz` →
+Install. This time the venv is portable, the script's shebang
+chain resolves, and the install completes cleanly.
+
+### Lessons / pattern
+
+This is the second time in three releases (v0.5.6, v0.5.7) where a
+CI test passed because of *something on the CI runner's filesystem
+that isn't on the operator's host*. The general rule that emerges:
+
+> CI round-trip tests must DELETE every input source before
+> extracting the artifact. If the test still passes, the artifact
+> is truly self-contained.
+
+Codified in the v0.5.7 workflow comment.
+
 ## [0.5.6] - 2026-06-07
 
 **HTTP wheel-upgrade now works on PEP 668 hosts AND on v0.5.0+
