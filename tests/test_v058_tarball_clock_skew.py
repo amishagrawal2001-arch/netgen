@@ -49,25 +49,44 @@ _CLIENT = (
 )
 
 
-def test_workflow_uses_source_date_epoch():
-    """The pack step must set SOURCE_DATE_EPOCH from git's latest
-    commit time. That's the reproducible-builds standard knob —
-    using it AT LEAST documents the intent (vs. a hardcoded
-    timestamp that'd look arbitrary)."""
+def test_workflow_uses_hardcoded_past_mtime():
+    """v0.5.9 lesson: SOURCE_DATE_EPOCH (= git commit time) was NOT
+    safely in the past for operators retrying within minutes of a
+    release being cut. Hardcode a date far enough back that no host
+    clock can plausibly be behind it (2020-01-01 = epoch 1577836800).
+
+    Trade-off: lose per-commit reproducibility of tar bytes, gain
+    unconditional clock-skew safety. The operator-visible behavior
+    is what matters; reproducibility was a side benefit, not the
+    primary goal.
+    """
+    src = _WORKFLOW.read_text()
+    assert "STABLE_MTIME=1577836800" in src or \
+           "STABLE_MTIME = 1577836800" in src, (
+        "Workflow doesn't set STABLE_MTIME=1577836800 (= 2020-01-01 "
+        "UTC). v0.5.8's SOURCE_DATE_EPOCH approach used commit time, "
+        "which was 'in the future' for srv06 retrying within minutes "
+        "of the release. A hardcoded past mtime is unconditionally safe."
+    )
+    # And the comment must explain WHY (so future maintainers don't
+    # 'fix' it back to SOURCE_DATE_EPOCH).
+    assert "2020" in src and ("clock" in src.lower() or "past" in src.lower()), (
+        "Workflow doesn't document WHY the mtime is hardcoded to "
+        "2020. A future maintainer might 'fix' it back to "
+        "SOURCE_DATE_EPOCH without realizing the operator-clock issue."
+    )
+
+
+def test_workflow_still_exports_source_date_epoch():
+    """SOURCE_DATE_EPOCH is the reproducible-builds standard knob.
+    Even though tar doesn't consume it anymore, exporting it lets
+    other tools (pip, setuptools, anything that respects the
+    convention) still benefit. It's effectively documentation."""
     src = _WORKFLOW.read_text()
     assert "SOURCE_DATE_EPOCH" in src, (
-        "Workflow doesn't reference SOURCE_DATE_EPOCH — the "
-        "reproducible-builds convention. Without this we can't "
-        "guarantee the tarball's mtimes are deterministic."
-    )
-    # Specifically from git commit time, not hardcoded.
-    assert re.search(
-        r"SOURCE_DATE_EPOCH=\$\(git\s+log\s+-1\s+--pretty=%ct\)",
-        src,
-    ), (
-        "SOURCE_DATE_EPOCH isn't derived from `git log -1 "
-        "--pretty=%ct`. Hardcoding a date would drift; deriving "
-        "from the commit makes the tarball reproducible per-tag."
+        "Workflow dropped SOURCE_DATE_EPOCH entirely. Keep exporting "
+        "it for any pip / setuptools / wheel-building tool that "
+        "respects the convention — even though tar uses STABLE_MTIME."
     )
 
 
@@ -83,14 +102,17 @@ def test_workflow_passes_mtime_to_tar_pack():
     )
     assert m, "Pack-tar invocation not found in workflow"
     pack_cmd = m.group(0)
+    # v0.5.9 swapped SOURCE_DATE_EPOCH → STABLE_MTIME. Accept either,
+    # but the test_workflow_uses_hardcoded_past_mtime check above
+    # forbids the SOURCE_DATE_EPOCH form going forward.
     assert re.search(
-        r'--mtime=["\']?@\$\{?SOURCE_DATE_EPOCH\}?["\']?',
+        r'--mtime=["\']?@\$\{?(STABLE_MTIME|SOURCE_DATE_EPOCH)\}?["\']?',
         pack_cmd,
     ), (
-        "Pack tar doesn't pass --mtime=@${SOURCE_DATE_EPOCH}. "
-        "Without it, on-disk mtimes (== build time) get baked "
-        "into the tarball. Hosts with NTP drift see every file "
-        "'in the future' and tar fails."
+        "Pack tar doesn't pass --mtime=@${STABLE_MTIME}. Without "
+        "it, on-disk mtimes (== build time) get baked into the "
+        "tarball. Hosts with NTP drift see every file 'in the "
+        "future' and tar fails."
     )
 
 

@@ -2,6 +2,94 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.9] - 2026-06-07
+
+**Tarball mtimes are now hardcoded to 2020-01-01 UTC. v0.5.8's
+SOURCE_DATE_EPOCH approach used git commit time, which was "in the
+future" for an operator retrying within minutes of the release.**
+
+Full suite: 1,525 passed, 1 skipped (+1 net new tests, replaces
+SOURCE_DATE_EPOCH-pinning test).
+
+### Operator-reported, same release-day, third occurrence
+
+san-hp-srv06, retrying with old v0.5.7 client + new v0.5.8 tarball
+within ~minutes of the v0.5.8 release being cut:
+
+```
+tar: python-runtime/lib/python3.10/__pycache__/traceback.cpython-310.pyc:
+     time stamp 2026-06-07 08:16:04 is 8.172710372 s in the future
+tar: python-runtime/lib/python3.10/site-packages/pip/_vendor/rich/traceback.py:
+     time stamp 2026-06-07 08:16:04 is 8.047231638 s in the future
+... [installer exit rc=3]
+```
+
+The v0.5.8 fix used SOURCE_DATE_EPOCH = git commit time. That's the
+reproducible-builds standard convention, but it has a fatal flaw
+for our threat model: **the commit time IS "now" at release-cut
+time.** An operator whose host clock is drifted seconds behind UTC,
+retrying within minutes of the release, STILL sees the mtimes as
+in the future.
+
+### Fix
+
+`.github/workflows/build-server-tarball.yml` swaps to a hardcoded
+past mtime:
+
+```bash
+# 2020-01-01 00:00:00 UTC — pre-pandemic, clearly stable,
+# no modern host clock can be behind this unless catastrophically
+# misconfigured (BIOS battery dead AND no NTP).
+STABLE_MTIME=1577836800
+tar -czf "$OUT" \
+  --owner=root:0 --group=root:0 \
+  --mtime="@${STABLE_MTIME}" \
+  --sort=name \
+  "$ROOT"
+```
+
+`SOURCE_DATE_EPOCH` is still exported for any pip/setuptools tooling
+that consumes it. Tar just doesn't use it anymore.
+
+### Trade-off
+
+We lose per-commit reproducibility of tar bytes (every v0.5.9+
+tarball has identical mtimes regardless of which commit produced
+it). We gain unconditional clock-skew safety — which is what
+operators actually care about.
+
+Reproducibility was a side benefit; not-failing-to-install is the
+primary goal. SOURCE_DATE_EPOCH was the wrong tool for THIS job,
+even though it's the right tool for "produce byte-identical
+artifacts across CI runs."
+
+### Lessons / what I got wrong
+
+I noted in the v0.5.8 release notes that the SOURCE_DATE_EPOCH
+approach could fail for very-recent commits. I should have shipped
+the hardcoded-past-mtime fix in v0.5.8 itself, not as a v0.5.9
+follow-up. The operator hit the exact failure mode I'd already
+identified in CHANGELOG prose.
+
+The bias I want to remember: **"this is borderline" is not a
+reason to ship a borderline fix.** If the failure mode is identified,
+fix it now, not next release.
+
+### Operator workflow for srv06 right now
+
+If srv06's host clock is still drifted, two paths to unstick today:
+
+```bash
+# Fastest — fix the clock once:
+ssh root@san-hp-srv06 'timedatectl set-ntp true; \
+  systemctl restart systemd-timesyncd; sleep 8; date -u'
+```
+
+Then retry with whatever client/tarball is already cached. OR:
+download the v0.5.9 client (which has the v0.5.8 `--warning=no-
+timestamp` flag AND the v0.5.9 hardcoded-past-mtime tarball), and
+the install Just Works regardless of clock drift.
+
 ## [0.5.8] - 2026-06-07
 
 **Tarball install no longer fails on hosts with NTP drift. v0.5.7

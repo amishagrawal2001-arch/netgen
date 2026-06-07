@@ -401,33 +401,51 @@ jobs:
           # runner's UID (which would surface as `1001` on the
           # target — operator-confusing).
           #
-          # v0.5.8 fix: bake a deterministic mtime into every header.
-          # Operator-reported on san-hp-srv06 (Ubuntu 24.04 with NTP
-          # drifted ~15 s behind UTC):
+          # v0.5.9 fix: bake a HARDCODED PAST mtime into every header.
           #
-          #   tar: bin/netgen-install: time stamp 2026-06-07 08:06:33
-          #        is 12.518725772 s in the future
+          # v0.5.8 used SOURCE_DATE_EPOCH = git commit time. That's the
+          # reproducible-builds standard, BUT it has a fatal flaw for
+          # our threat model: the commit time IS "now" at release-cut
+          # time. An operator retrying within minutes of the release
+          # being cut, on a host whose clock is drifted seconds behind
+          # UTC, STILL sees the mtimes as "in the future".
+          #
+          # Operator-reported sequence demonstrating this:
+          #
+          #   v0.5.8 released at 08:16 UTC (commit time).
+          #   srv06 retried with v0.5.7 client at ~08:16:00 srv06-time
+          #     (= ~08:16:15 actual UTC; clock 15 s behind).
+          #
+          #   tar: python-runtime/.../traceback.py: time stamp
+          #        2026-06-07 08:16:04 is 8.018637775 s in the future
           #   ...
-          #   [client] installer exit rc=3
+          #   [client] installer exit rc=3   ← SAME bug as v0.5.7
           #
-          # GNU tar emits a warning AND exits non-zero on future
-          # timestamps. The installer dialog uses `set -e`, so a
-          # single future-mtime warning aborts the install.
+          # The fix: hardcode a date FAR in the past. 2020-01-01 UTC
+          # works — no modern host clock is behind 2020 unless
+          # catastrophically misconfigured (BIOS battery dead AND no
+          # NTP), and the project didn't exist before that anyway, so
+          # the mtime is meaningless either way.
           #
-          # We pack with --mtime='@${SOURCE_DATE_EPOCH}' set to the
-          # latest git commit timestamp. This is:
-          #   * stable in the past (no clock can be "behind" it
-          #     unless the operator's host is mis-set by years)
-          #   * reproducible (same git ref → same tarball bytes)
-          #   * consistent with the reproducible-builds convention
-          #     (SOURCE_DATE_EPOCH is the standard knob)
+          # Trade-off vs SOURCE_DATE_EPOCH: we lose per-commit
+          # reproducibility (every tarball has the same mtimes,
+          # regardless of which commit packed it). But we GAIN
+          # unconditional clock-skew safety — which is what operators
+          # actually care about. Reproducibility was a side benefit;
+          # not-failing-to-install is the primary goal.
+          #
+          # SOURCE_DATE_EPOCH is still set for compatibility with any
+          # tool that consumes it, just not used by tar.
           SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)
           export SOURCE_DATE_EPOCH
-          echo "Packing tarball with SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH"
-          echo "(= $(date -u -d @$SOURCE_DATE_EPOCH '+%Y-%m-%d %H:%M:%S UTC'))"
+          # 2020-01-01 00:00:00 UTC = epoch 1577836800
+          STABLE_MTIME=1577836800
+          echo "Packing tarball with hardcoded past mtime:"
+          echo "  STABLE_MTIME=$STABLE_MTIME (= 2020-01-01 00:00:00 UTC)"
+          echo "  SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH (exported for tools, not used by tar)"
           tar -czf "$OUT" \
             --owner=root:0 --group=root:0 \
-            --mtime="@${SOURCE_DATE_EPOCH}" \
+            --mtime="@${STABLE_MTIME}" \
             --sort=name \
             "$ROOT"
           ls -la "$OUT"
