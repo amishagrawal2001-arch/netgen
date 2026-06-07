@@ -1,0 +1,137 @@
+#!/usr/bin/env python3
+"""netgen-uninstall — remove the netgen-server install.
+
+  sudo netgen-uninstall          # removes systemd unit + symlinks, KEEPS the install tree
+  sudo netgen-uninstall --purge  # removes EVERYTHING: install tree, FRR Docker image, install log
+
+By default the install tree at /opt/netgen-server/ is left in
+place — `netgen-install` from the same tarball will pick up where
+you left off. --purge wipes it entirely (the operator types this,
+so we don't gate it behind a second confirmation; if they want
+guardrails they can take a snapshot).
+
+Idempotent: rerunning on an already-uninstalled system is fine —
+each step skips quietly if its target is gone.
+"""
+from __future__ import annotations
+
+import logging
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+
+SYSTEMD_UNIT_PATH = Path("/etc/systemd/system/netgen-server.service")
+SYSTEMD_UNIT_NAME = "netgen-server.service"
+
+
+logger = logging.getLogger("netgen-uninstall")
+
+
+def _setup_logging() -> None:
+    logger.setLevel(logging.INFO)
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    logger.addHandler(sh)
+
+
+def _run(cmd: list[str], *, check: bool = False) -> subprocess.CompletedProcess:
+    logger.info(f"$ {' '.join(cmd)}")
+    return subprocess.run(cmd, check=check)
+
+
+def _require_root() -> None:
+    if os.geteuid() != 0:
+        logger.error("netgen-uninstall must run as root. Retry with: sudo netgen-uninstall")
+        sys.exit(1)
+
+
+def _resolve_install_root(argv: list[str]) -> Path:
+    if "--install-root" in argv:
+        i = argv.index("--install-root")
+        if i + 1 < len(argv):
+            return Path(argv[i + 1]).resolve()
+    return Path(__file__).resolve().parent.parent
+
+
+def main() -> int:
+    _setup_logging()
+    _require_root()
+
+    argv = sys.argv[1:]
+    purge = "--purge" in argv
+
+    install_root = _resolve_install_root(argv)
+    logger.info(f"[STARTUP] Install root: {install_root}")
+    logger.info(f"[STARTUP] Mode:         {'purge (full removal)' if purge else 'service-only (tree preserved)'}")
+
+    # 1. Stop + disable + remove the systemd unit.
+    if SYSTEMD_UNIT_PATH.exists():
+        _run(["systemctl", "stop", SYSTEMD_UNIT_NAME])
+        _run(["systemctl", "disable", SYSTEMD_UNIT_NAME])
+        SYSTEMD_UNIT_PATH.unlink()
+        logger.info(f"[SYSTEMD] ✓ Removed {SYSTEMD_UNIT_PATH}")
+        _run(["systemctl", "daemon-reload"])
+    else:
+        logger.info(f"[SYSTEMD] {SYSTEMD_UNIT_PATH} not present — skipping")
+
+    # 2. Remove PATH symlinks.
+    for name in ("netgen-install", "netgen-upgrade", "netgen-uninstall"):
+        dst = Path("/usr/local/bin") / name
+        if dst.is_symlink() or dst.exists():
+            try:
+                dst.unlink()
+                logger.info(f"[PATH] ✓ Removed {dst}")
+            except Exception as exc:
+                logger.warning(f"[PATH] Failed to remove {dst}: {exc}")
+
+    # 3. Purge mode: tear down everything else.
+    if purge:
+        # 3a. The bundled FRR Docker image.
+        if shutil.which("docker"):
+            _run(["docker", "image", "rm", "-f", "netgen-frr:latest"])
+            # Best effort; the user might not have built it.
+
+        # 3b. Install log.
+        log_path = Path("/var/log/netgen-install.log")
+        if log_path.exists():
+            try:
+                log_path.unlink()
+                logger.info(f"[LOG] ✓ Removed {log_path}")
+            except Exception as exc:
+                logger.warning(f"[LOG] Failed to remove {log_path}: {exc}")
+
+        # 3c. The install tree itself. Be defensive about /opt/netgen-server
+        # specifically — if the operator passed --install-root pointing at
+        # something dangerous (/, /home, /etc), refuse. Whitelist: the
+        # path must contain "netgen" in its basename.
+        if "netgen" not in install_root.name.lower():
+            logger.error(
+                f"Refusing to recursively delete {install_root} — its "
+                f"basename doesn't contain 'netgen'. If you really mean "
+                f"to purge this path, do it manually."
+            )
+            return 2
+        if install_root.exists():
+            logger.info(f"[TREE] Removing {install_root}...")
+            shutil.rmtree(install_root)
+            logger.info(f"[TREE] ✓ Removed {install_root}")
+    else:
+        logger.info(
+            f"[TREE] Install tree at {install_root} preserved. "
+            f"Run with --purge to remove it."
+        )
+
+    logger.info("=" * 60)
+    logger.info("netgen-server uninstall complete.")
+    if not purge:
+        logger.info("To remove the install tree + Docker image, re-run:")
+        logger.info("  sudo netgen-uninstall --purge")
+    logger.info("=" * 60)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

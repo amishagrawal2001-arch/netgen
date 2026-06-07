@@ -18,6 +18,7 @@ surfaces here, not at the operator's chair.
 """
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 
@@ -139,4 +140,135 @@ def test_workflow_preserves_wheel_alongside_tarball():
         "Workflow doesn't preserve the wheel alongside the tarball. "
         "v0.5.0 spec: wheel is the upgrade artifact, tarball is the "
         "fresh-install artifact. Both must ship."
+    )
+
+
+# ─────────────────────────────────────── Phase 2 contracts ─────────────────
+
+
+def test_install_scripts_exist_in_source():
+    """The three install scripts must exist in the source tree.
+    Without them the tarball workflow can't copy them in."""
+    root = Path(__file__).resolve().parents[1]
+    for name in ("netgen-install", "netgen-upgrade", "netgen-uninstall"):
+        p = root / "scripts" / "tarball" / name
+        assert p.exists(), (
+            f"scripts/tarball/{name} missing. Phase 2 deliverables "
+            f"include these three scripts inside the tarball's bin/."
+        )
+        # Must be executable in source (shebang gets rewritten in CI;
+        # the executable bit comes from chmod 0755 in the workflow).
+        text = p.read_text()
+        assert text.startswith("#!"), (
+            f"scripts/tarball/{name} doesn't start with a shebang"
+        )
+
+
+def test_workflow_copies_install_scripts_into_tarball():
+    """Each script must be copied from scripts/tarball/ into the
+    tarball's bin/ during the workflow's Assemble step."""
+    src = _WORKFLOW.read_text()
+    for name in ("netgen-install", "netgen-upgrade", "netgen-uninstall"):
+        # The for-loop in the workflow iterates these names — the
+        # variable substitution shows up as `for script in
+        # netgen-install netgen-upgrade netgen-uninstall`.
+        assert name in src, (
+            f"Workflow doesn't copy bin/{name} into the tarball. "
+            f"Without it, end users have nothing to run after extract."
+        )
+    assert 'cp "$src" "$dst"' in src, (
+        "Workflow doesn't actually copy script files into the tarball"
+    )
+    assert "chmod 0755" in src, (
+        "Workflow doesn't chmod the scripts executable in the tarball"
+    )
+
+
+def test_workflow_rewrites_shebang_to_bundled_python():
+    """The shebang must point at the bundled venv's Python, not
+    /usr/bin/env python3. On a target where /usr/bin/env can't find
+    python3 (or finds the wrong version), env-shebang scripts would
+    silently fail with a confusing error. The bundled-path shebang
+    sidesteps the entire system-Python question — which is the whole
+    point of v0.5.0."""
+    src = _WORKFLOW.read_text()
+    assert "/opt/netgen-server/netgen-venv/bin/python" in src, (
+        "Workflow doesn't rewrite shebangs to the bundled venv's "
+        "python path. Scripts would fall back to /usr/bin/env "
+        "python3 — defeating the whole 'no system Python' design."
+    )
+
+
+def test_workflow_slims_venv():
+    """Pre-Phase-2 the venv was 690 MB. The workflow must strip
+    __pycache__, tests/, and similar artifacts so the tarball stays
+    under ~150 MB compressed (Grafana-tier download size)."""
+    src = _WORKFLOW.read_text()
+    assert "__pycache__" in src, (
+        "Workflow doesn't strip __pycache__ from the venv. Python "
+        "recreates these on first import; shipping them is dead "
+        "weight (~30-40% of site-packages)."
+    )
+    # tests/ directories in installed packages are noise
+    assert re.search(r"-name tests", src) or re.search(r"-name 'tests'", src) \
+        or "-name 'tests'" in src, (
+        "Workflow doesn't strip `tests` directories from the venv. "
+        "Scapy's tests alone are ~30 MB."
+    )
+
+
+def test_install_script_has_preflight_gate():
+    """v0.5.0 design: refuse install on unsupported OS instead of
+    half-installing and failing later. Pin the supported-OS gate so
+    a refactor that drops it doesn't re-open the 'breaks on Debian'
+    failure surface."""
+    src = (Path(__file__).resolve().parents[1]
+           / "scripts" / "tarball" / "netgen-install").read_text()
+    assert "SUPPORTED_DISTROS" in src, (
+        "netgen-install has no SUPPORTED_DISTROS gate — anything "
+        "goes, install proceeds on whatever distro the operator "
+        "ran us on."
+    )
+    # Ubuntu 22.04 and 24.04 are the two we currently test the
+    # tarball on.
+    for codename in ("22.04", "24.04"):
+        assert codename in src, (
+            f"netgen-install's SUPPORTED_DISTROS missing Ubuntu {codename}"
+        )
+    # And the pre-flight must check it.
+    assert "_preflight" in src and "Unsupported OS" in src, (
+        "netgen-install's pre-flight doesn't surface 'Unsupported OS' "
+        "— operator gets generic failures instead of a clear refusal."
+    )
+
+
+def test_upgrade_script_uses_force_reinstall():
+    """v0.4.8 bug class: pip silently no-ops upgrades when it thinks
+    the version matches. netgen-upgrade must use --force-reinstall
+    to prevent the same trap."""
+    src = (Path(__file__).resolve().parents[1]
+           / "scripts" / "tarball" / "netgen-upgrade").read_text()
+    assert "--force-reinstall" in src, (
+        "netgen-upgrade missing --force-reinstall. Same bug class "
+        "as install_ostg_complete.py's v0.4.8 deps-pass silent "
+        "no-op: pip won't re-resolve the dep graph without it."
+    )
+    # And the post-upgrade sanity import — also a v0.4.8 design.
+    assert "import flask" in src or "flask" in src, (
+        "netgen-upgrade has no post-upgrade import check. A bad wheel "
+        "would land and the next systemd restart would crash-loop."
+    )
+
+
+def test_uninstall_script_refuses_unsafe_purge_paths():
+    """Defensive: --purge does rmtree on the install root. If the
+    operator passed --install-root pointing at /, /home, /etc, that's
+    catastrophic. Whitelist: basename must contain 'netgen'."""
+    src = (Path(__file__).resolve().parents[1]
+           / "scripts" / "tarball" / "netgen-uninstall").read_text()
+    assert "Refusing to recursively delete" in src or \
+           "netgen" in src.split("rmtree")[0][-500:], (
+        "netgen-uninstall --purge has no whitelist guard on the "
+        "rmtree target. Operator typo on --install-root could "
+        "delete /home or /etc."
     )

@@ -180,10 +180,35 @@ jobs:
           cp -r ostg_docker "$ROOT/share/netgen/"
           cp Dockerfile.frr "$ROOT/share/netgen/"
 
-          # 5. Placeholder for the install/upgrade scripts (Phase 2
-          #    materializes these). For Phase 1a we just stamp a
-          #    VERSION + README so the tarball isn't a black box.
+          # 5. Phase 2: install/upgrade/uninstall scripts. These live
+          #    in scripts/tarball/ in the source tree and get copied
+          #    into bin/ in the tarball. Shebangs are rewritten to
+          #    point at the BUNDLED venv's Python so the scripts run
+          #    against the tarball's interpreter, not whatever the
+          #    operator's system has installed.
           mkdir -p "$ROOT/bin"
+          for script in netgen-install netgen-upgrade netgen-uninstall; do
+            src="scripts/tarball/$script"
+            dst="$ROOT/bin/$script"
+            if [ ! -f "$src" ]; then
+              echo "ERROR: $src missing from source tree"
+              exit 1
+            fi
+            cp "$src" "$dst"
+            chmod 0755 "$dst"
+            # The shebang line in source uses `#!/usr/bin/env python3`
+            # for dev-convenience. At tarball-build time we rewrite
+            # to the bundled venv's python so the script picks the
+            # right interpreter even if /usr/bin/env python3 doesn't
+            # exist on the target. The veny's `python` is a relative
+            # symlink, so it resolves correctly regardless of where
+            # the operator extracts the tarball.
+            sed -i '1s|.*|#!/opt/netgen-server/netgen-venv/bin/python|' "$dst"
+            # Sanity check the rewrite landed.
+            head -1 "$dst"
+          done
+
+          # 6. README + VERSION stamp so the tarball is self-documenting.
           echo "${VERSION}" > "$ROOT/VERSION"
           cat > "$ROOT/README.txt" <<EOF
           Netgen Traffic Generator — Server Tarball ${VERSION}
@@ -192,14 +217,42 @@ jobs:
             python-runtime/   Bundled CPython ${PBS_PYTHON_VERSION} (no system Python required)
             netgen-venv/      Pre-built venv with the wheel + dependencies
             share/netgen/     DPDK, Docker (FRR), and other runtime resources
+            bin/              Install + upgrade + uninstall scripts
 
-          Phase 1a artifact — install scripts not yet packaged.
-          Phase 2 will add bin/netgen-install + bin/netgen-upgrade.
+          Install (Ubuntu 22.04 or 24.04):
+            sudo tar -xzf $(basename netgen-server-${VERSION}-linux-x86_64.tar.gz) -C /opt
+            sudo mv /opt/netgen-server-${VERSION} /opt/netgen-server
+            sudo /opt/netgen-server/bin/netgen-install
 
-          Manual install (for now):
-            tar -xzf $(basename netgen-server-${VERSION}-linux-x86_64.tar.gz) -C /opt
-            sudo /opt/netgen-server-${VERSION}/netgen-venv/bin/ostg-server
+          Routine upgrade (wheel-based, ~30 sec):
+            sudo /opt/netgen-server/bin/netgen-upgrade ostg_trafficgen-X.Y.Z-py3-none-any.whl
+
+          Uninstall:
+            sudo /opt/netgen-server/bin/netgen-uninstall          # leaves install tree
+            sudo /opt/netgen-server/bin/netgen-uninstall --purge  # removes everything
           EOF
+
+          # 7. Slim the venv. Operator-relevant artifact size; pre-slim
+          #    we were at 690 MB for the venv alone. Three cheap wins:
+          #
+          #    (a) __pycache__: Python rebuilds .pyc files on first
+          #        import. Dropping them shaves ~30-40% of site-packages.
+          #    (b) tests/ dirs in site-packages: ship-time noise.
+          #        Scapy's tests are ~30 MB on their own.
+          #    (c) *.pyc / *.pyo orphans: same as (a).
+          #
+          #    Pip + setuptools + wheel STAY — netgen-upgrade needs them.
+          echo "Pre-slim venv size:"
+          du -sh "$ROOT/netgen-venv"
+          find "$ROOT/netgen-venv" -type d -name __pycache__ -exec rm -rf {} +
+          find "$ROOT/netgen-venv" -type f \( -name "*.pyc" -o -name "*.pyo" \) -delete
+          find "$ROOT/netgen-venv/lib" -type d -name tests -prune -exec rm -rf {} + || true
+          find "$ROOT/netgen-venv/lib" -type d -name test -prune -exec rm -rf {} + || true
+          # The venv's include/ is only needed when compiling C ext
+          # modules INSIDE the venv (we don't).
+          rm -rf "$ROOT/netgen-venv/include" || true
+          echo "Post-slim venv size:"
+          du -sh "$ROOT/netgen-venv"
 
           ls -la "$ROOT"
           du -sh "$ROOT"
@@ -238,6 +291,25 @@ jobs:
           # already in the tarball, fail loudly here.
           echo "Verifying run_tgen_server is importable..."
           "$ROOT/netgen-venv/bin/python" -c "import run_tgen_server"
+
+          # Verify the install/upgrade/uninstall scripts at least
+          # parse + have the rewritten shebang. We can't actually
+          # RUN them on the CI runner (they require root + want to
+          # write /etc/systemd/...), but we can syntax-check.
+          for script in netgen-install netgen-upgrade netgen-uninstall; do
+            echo "Syntax-checking bin/$script..."
+            "$ROOT/netgen-venv/bin/python" -m py_compile "$ROOT/bin/$script"
+            # And confirm the shebang was rewritten to point at the
+            # bundled venv (not /usr/bin/env). Without this the
+            # rewrite step regression would surface only at the
+            # operator's first install.
+            grep -q '^#!/opt/netgen-server/netgen-venv/bin/python' \
+              "$ROOT/bin/$script" || {
+                echo "ERROR: bin/$script shebang not rewritten"
+                head -1 "$ROOT/bin/$script"
+                exit 1
+              }
+          done
 
       # ─────────────────────────────────────────────────── pack tarball
       - name: Pack tarball

@@ -1,0 +1,466 @@
+#!/usr/bin/env python3
+"""netgen-install — set up a netgen-server install from the tarball.
+
+Run as root from inside the extracted tarball:
+  sudo /opt/netgen-server/bin/netgen-install
+
+Or from anywhere if the tarball is extracted to /opt/netgen-server:
+  sudo netgen-install   (after PATH symlink is created — step 8 below)
+
+What this script does, in order:
+
+  1. Verify it's running as root (everything below needs it).
+  2. Pre-flight checks. Refuse to install on unsupported OS, surface
+     concrete remediation for fixable failures (low disk, no Docker,
+     etc.). Each check has a clear-error message — no mystery
+     failures deep in the install.
+  3. Resolve the install root. The tarball MUST be extracted to a
+     final-home location BEFORE this script runs; we don't move
+     ourselves around. /opt/netgen-server is the canonical home.
+  4. Build the FRR Docker image (existing Dockerfile.frr in share/).
+     Skipped with a WARNING if Docker isn't usable — netgen still
+     starts without it; only the DHCP / FRR features are disabled.
+  5. (Optional) Compile DPDK tx_worker against the host's libdpdk.
+     Skipped if DPDK prereqs aren't met (libdpdk-dev, meson, ninja,
+     etc.) — DPDK falls back to Scapy/kernel path at runtime.
+  6. Write /etc/systemd/system/netgen-server.service. The ExecStart
+     points directly at <install_root>/netgen-venv/bin/ostg-server,
+     so the unit is decoupled from anything system-pip ever did.
+     If a pre-v0.5.0 unit exists at this path, save it as .bak.
+  7. systemctl daemon-reload, enable, start.
+  8. Create /usr/local/bin/netgen-install / netgen-upgrade /
+     netgen-uninstall symlinks pointing into <install_root>/bin/
+     so operators can run them without typing the full path.
+  9. Verify /api/health responds with the expected version.
+
+What this script DOES NOT do (intentionally):
+
+  * Install system packages via apt. The tarball's bundled Python +
+    pre-built venv eliminates the Python-side apt dependency. The
+    only system tool we need that ISN'T bundled is Docker — and
+    Docker is detected, not installed. If it's missing, we direct
+    the operator to Docker's official install docs.
+  * Install Python 3.10 from deadsnakes. Bundled.
+  * Run `pip install` against system pip. Bundled venv has its own
+    pip; only used by netgen-upgrade.
+  * Touch PEP 668. The bundled venv is exempt from EXTERNALLY-
+    MANAGED by design.
+
+  All the failure modes from v0.4.7 / v0.4.8 / v0.4.9 (netcat
+  virtual package, deps install silent no-op, PEP 668) are
+  eliminated by this script being a thin install wrapper around
+  the bundled venv, not a system-environment rebuilder.
+
+Idempotency: re-running this script on an existing v0.5.0 install
+is safe — it stops the service, re-writes the unit, restarts.
+The bundled venv stays intact (it was already correct).
+"""
+from __future__ import annotations
+
+import logging
+import os
+import shutil
+import socket
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+from typing import Optional
+
+# ─────────────────────────────────────────────────── constants
+
+INSTALL_ROOT_DEFAULT = Path("/opt/netgen-server")
+SYSTEMD_UNIT_PATH = Path("/etc/systemd/system/netgen-server.service")
+SYSTEMD_UNIT_NAME = "netgen-server.service"  # matches v0.4.x for upgrade compat
+SERVER_PORT = 5050  # legacy convention; do not change without a migration plan
+LOG_PATH = Path("/var/log/netgen-install.log")
+
+# Supported OS matrix. The pre-flight gate refuses unsupported
+# distros with a clear remediation — operator can override with
+# --force, but they own the outcome at that point.
+SUPPORTED_DISTROS = {
+    ("ubuntu", "22.04"),
+    ("ubuntu", "24.04"),
+}
+
+
+# ─────────────────────────────────────────────────── logging
+
+logger = logging.getLogger("netgen-install")
+
+
+def _setup_logging() -> None:
+    """Mirror logs to both stdout AND /var/log/netgen-install.log so
+    operators can read along live AND we have a postmortem record."""
+    logger.setLevel(logging.INFO)
+    fmt = logging.Formatter("[%(levelname)s] %(message)s")
+    # stdout
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(fmt)
+    logger.addHandler(sh)
+    # file
+    try:
+        LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+        fh = logging.FileHandler(LOG_PATH, mode="w")
+        fh.setFormatter(logging.Formatter(
+            "%(asctime)s [%(levelname)s] %(message)s"
+        ))
+        logger.addHandler(fh)
+    except Exception as exc:
+        # File-log failure is non-fatal — we still have stdout.
+        logger.warning(f"Could not open log file {LOG_PATH}: {exc}")
+
+
+# ─────────────────────────────────────────────────── helpers
+
+
+def _run(cmd: list[str], *, check: bool = True,
+         capture: bool = False) -> subprocess.CompletedProcess:
+    """Thin wrapper that logs the command before running. Lets the
+    operator see what's about to happen instead of mysterious
+    silence."""
+    logger.info(f"$ {' '.join(cmd)}")
+    return subprocess.run(
+        cmd,
+        check=check,
+        capture_output=capture,
+        text=capture,
+    )
+
+
+def _require_root() -> None:
+    if os.geteuid() != 0:
+        logger.error(
+            "netgen-install must run as root. "
+            "Retry with: sudo netgen-install"
+        )
+        sys.exit(1)
+
+
+def _detect_distro() -> tuple[str, str]:
+    """Parse /etc/os-release. Returns (id, version_id) lowercased.
+    Returns (\"unknown\", \"\") if /etc/os-release is missing or
+    malformed."""
+    try:
+        kv = {}
+        for line in Path("/etc/os-release").read_text().splitlines():
+            if "=" in line:
+                k, _, v = line.partition("=")
+                kv[k.strip()] = v.strip().strip('"').strip("'")
+        return (kv.get("ID", "unknown").lower(),
+                kv.get("VERSION_ID", "").strip())
+    except Exception:
+        return ("unknown", "")
+
+
+def _resolve_install_root(argv: list[str]) -> Path:
+    """Install root is either --install-root <path> or this
+    script's parent's parent (e.g. /opt/netgen-server/bin/netgen-install
+    → /opt/netgen-server)."""
+    if "--install-root" in argv:
+        i = argv.index("--install-root")
+        if i + 1 < len(argv):
+            return Path(argv[i + 1]).resolve()
+    # __file__ is .../bin/netgen-install; parent.parent is the root.
+    return Path(__file__).resolve().parent.parent
+
+
+# ─────────────────────────────────────────────────── pre-flight
+
+
+def _preflight(install_root: Path, *, force: bool) -> None:
+    """Refuse to install if a hard prereq is missing. Each check
+    has a CONCRETE remediation message — never a generic "something
+    is wrong"."""
+    logger.info("[PRE-FLIGHT] Checking environment...")
+
+    # 1. OS supported?
+    distro, version = _detect_distro()
+    logger.info(f"  - OS: {distro} {version}")
+    if (distro, version) not in SUPPORTED_DISTROS and not force:
+        logger.error(
+            f"Unsupported OS: {distro} {version}. Supported: "
+            f"{', '.join(f'{d} {v}' for d, v in sorted(SUPPORTED_DISTROS))}."
+        )
+        logger.error(
+            "Override with --force-install-unsupported (no warranty)."
+        )
+        sys.exit(2)
+
+    # 2. Tarball layout sanity. If the operator extracted incorrectly
+    #    or pointed --install-root at the wrong place, fail HERE
+    #    instead of getting cryptic ImportError later.
+    required = [
+        install_root / "python-runtime" / "bin" / "python3",
+        install_root / "netgen-venv" / "bin" / "ostg-server",
+        install_root / "share" / "netgen" / "resources" / "dpdk",
+        install_root / "share" / "netgen" / "Dockerfile.frr",
+    ]
+    missing = [p for p in required if not p.exists()]
+    if missing:
+        logger.error(
+            f"Install root {install_root} is missing expected files:"
+        )
+        for m in missing:
+            logger.error(f"  - {m}")
+        logger.error(
+            "The tarball must be extracted intact to a single root. "
+            "Did you extract it to a different path than the one passed "
+            "to --install-root?"
+        )
+        sys.exit(3)
+    logger.info(f"  - Tarball layout: ✓ ({install_root})")
+
+    # 3. Disk space.
+    try:
+        st = shutil.disk_usage(install_root)
+        free_gb = st.free / (1024 ** 3)
+        logger.info(f"  - Disk free: {free_gb:.1f} GB")
+        if free_gb < 1.0:
+            logger.error(
+                f"Less than 1 GB free on {install_root}. "
+                f"systemd unit writes + log space need at least 1 GB."
+            )
+            sys.exit(4)
+    except Exception as exc:
+        logger.warning(f"  - Disk check failed: {exc}")
+
+    # 4. systemd availability.
+    if not Path("/run/systemd/system").exists():
+        logger.error(
+            "systemd not detected (no /run/systemd/system). This "
+            "installer writes a systemd unit; without systemd you'd "
+            "need to start ostg-server manually."
+        )
+        sys.exit(5)
+    logger.info("  - systemd: ✓")
+
+    # 5. Docker (warning only — netgen runs without it, just no FRR).
+    docker_ok = shutil.which("docker") is not None
+    if docker_ok:
+        try:
+            r = _run(["docker", "version", "--format", "{{.Server.Version}}"],
+                     check=False, capture=True)
+            if r.returncode == 0:
+                logger.info(f"  - Docker: ✓ ({r.stdout.strip()})")
+            else:
+                logger.warning(
+                    "  - Docker installed but daemon unreachable. "
+                    "FRR / DHCP features will be disabled until the "
+                    "Docker daemon is started: systemctl start docker"
+                )
+                docker_ok = False
+        except Exception:
+            docker_ok = False
+    else:
+        logger.warning(
+            "  - Docker not found. FRR / DHCP features will be "
+            "disabled. Install Docker via your distro's docs "
+            "(https://docs.docker.com/engine/install/) and re-run "
+            "netgen-install to enable them."
+        )
+
+    # 6. The bundled venv's Python must actually run.
+    venv_py = install_root / "netgen-venv" / "bin" / "python"
+    try:
+        r = _run([str(venv_py), "--version"], check=True, capture=True)
+        logger.info(f"  - Bundled Python: ✓ ({r.stdout.strip() or r.stderr.strip()})")
+    except Exception as exc:
+        logger.error(
+            f"Bundled Python at {venv_py} failed to run: {exc}. "
+            f"The tarball is corrupt or was extracted to a path with "
+            f"a different layout."
+        )
+        sys.exit(6)
+
+    # 7. Core deps importable from the bundled venv. Same check the
+    #    v0.5.0 tarball build workflow does — but the operator might
+    #    have extracted onto a system that lacks libpcap.so (Scapy
+    #    runtime dep on Debian/Ubuntu), so we surface it HERE
+    #    instead of letting the server crash-loop on it.
+    try:
+        _run(
+            [str(venv_py), "-c",
+             "import flask, scapy.all, requests, psutil"],
+            check=True, capture=True,
+        )
+        logger.info("  - Core deps importable: ✓ (flask, scapy, requests, psutil)")
+    except subprocess.CalledProcessError as exc:
+        logger.error(
+            f"Bundled venv can't import core dependencies. "
+            f"Most likely cause: Scapy needs libpcap on the host. "
+            f"Install with: apt install libpcap0.8\n"
+            f"Underlying error:\n{exc.stderr or exc.stdout}"
+        )
+        sys.exit(7)
+
+    return None  # all checks passed
+
+
+# ─────────────────────────────────────────────────── FRR Docker
+
+def _build_frr_image(install_root: Path) -> bool:
+    """Build the netgen-frr:latest Docker image from Dockerfile.frr.
+    Returns True on success, False on failure (logged but non-fatal —
+    netgen still starts without FRR, just no DHCP/BGP/OSPF features).
+    """
+    if shutil.which("docker") is None:
+        logger.warning("[FRR] Docker not available — skipping FRR image build")
+        return False
+    logger.info("[FRR] Building netgen-frr:latest Docker image...")
+    dockerfile = install_root / "share" / "netgen" / "Dockerfile.frr"
+    try:
+        _run(
+            ["docker", "build",
+             "-f", str(dockerfile),
+             "-t", "netgen-frr:latest",
+             str(dockerfile.parent)],
+            check=True,
+        )
+        logger.info("[FRR] ✓ Image built")
+        return True
+    except subprocess.CalledProcessError as exc:
+        logger.warning(
+            f"[FRR] Docker build failed: {exc}. FRR-dependent features "
+            f"(DHCP / BGP / OSPF / VXLAN device side) will be disabled. "
+            f"Re-run netgen-install after fixing Docker to enable them."
+        )
+        return False
+
+
+# ─────────────────────────────────────────────────── systemd unit
+
+
+def _write_systemd_unit(install_root: Path) -> None:
+    """Write /etc/systemd/system/netgen-server.service.
+
+    Backs up an existing unit (v0.4.x install) to .bak so we don't
+    silently overwrite an operator-edited unit."""
+    exec_start = install_root / "netgen-venv" / "bin" / "ostg-server"
+    unit = f"""[Unit]
+Description=Netgen Traffic Generator Server
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart={exec_start}
+Restart=on-failure
+RestartSec=10
+# Capabilities the data-plane needs. CAP_NET_RAW lets Scapy open
+# raw sockets without root; CAP_NET_ADMIN covers interface changes
+# (promisc, VLAN sub-interfaces from the v0.4.1 flow-tracking fix).
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+# v0.5.0 install root — independent of system Python.
+WorkingDirectory={install_root}
+# Forward stdout/stderr to journalctl so `journalctl -u netgen-server`
+# shows the server log inline with systemd events.
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+"""
+    if SYSTEMD_UNIT_PATH.exists():
+        bak = SYSTEMD_UNIT_PATH.with_suffix(".service.bak")
+        logger.info(f"[SYSTEMD] Backing up existing unit to {bak}")
+        shutil.copy2(SYSTEMD_UNIT_PATH, bak)
+    SYSTEMD_UNIT_PATH.write_text(unit)
+    logger.info(f"[SYSTEMD] ✓ Wrote {SYSTEMD_UNIT_PATH}")
+
+    _run(["systemctl", "daemon-reload"], check=True)
+    _run(["systemctl", "enable", SYSTEMD_UNIT_NAME], check=True)
+    # Use restart (not start) so a re-install on a live host
+    # actually picks up the new unit. start would no-op if already
+    # active.
+    _run(["systemctl", "restart", SYSTEMD_UNIT_NAME], check=True)
+    logger.info(f"[SYSTEMD] ✓ {SYSTEMD_UNIT_NAME} restarted")
+
+
+# ─────────────────────────────────────────────────── PATH symlinks
+
+
+def _create_path_symlinks(install_root: Path) -> None:
+    """Create /usr/local/bin/netgen-{install,upgrade,uninstall}
+    symlinks so the operator doesn't have to type the full
+    /opt/netgen-server/bin/... path. Idempotent — replaces any
+    existing symlink."""
+    bin_dir = Path("/usr/local/bin")
+    for name in ("netgen-install", "netgen-upgrade", "netgen-uninstall"):
+        src = install_root / "bin" / name
+        if not src.exists():
+            logger.warning(f"[PATH] {src} doesn't exist; skipping symlink")
+            continue
+        dst = bin_dir / name
+        if dst.exists() or dst.is_symlink():
+            dst.unlink()
+        dst.symlink_to(src)
+        logger.info(f"[PATH] ✓ {dst} → {src}")
+
+
+# ─────────────────────────────────────────────────── health check
+
+
+def _verify_running(timeout_s: int = 60) -> bool:
+    """Hit http://localhost:5050/api/health and parse the version.
+    Wait up to timeout_s for systemd to have brought the server up
+    (the unit `Restart=on-failure` could be retrying after a slow
+    start)."""
+    url = f"http://localhost:{SERVER_PORT}/api/health"
+    deadline = time.monotonic() + timeout_s
+    logger.info(f"[VERIFY] Waiting for {url} (up to {timeout_s}s)...")
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=2) as r:
+                body = r.read().decode("utf-8", "replace")
+                if "netgen_version" in body:
+                    logger.info(f"[VERIFY] ✓ Server responding: {body.strip()}")
+                    return True
+        except Exception:
+            pass
+        time.sleep(2)
+    logger.error(
+        f"[VERIFY] Server did not respond on {url} within {timeout_s}s. "
+        f"Check: journalctl -u {SYSTEMD_UNIT_NAME} -n 50 --no-pager"
+    )
+    return False
+
+
+# ─────────────────────────────────────────────────── main
+
+
+def main() -> int:
+    _setup_logging()
+    _require_root()
+
+    argv = sys.argv[1:]
+    force = "--force-install-unsupported" in argv or "--force" in argv
+
+    install_root = _resolve_install_root(argv)
+    logger.info(f"[STARTUP] Install root: {install_root}")
+    logger.info(f"[STARTUP] Log file: {LOG_PATH}")
+
+    _preflight(install_root, force=force)
+    _build_frr_image(install_root)
+    _write_systemd_unit(install_root)
+    _create_path_symlinks(install_root)
+
+    if _verify_running():
+        logger.info("=" * 60)
+        logger.info("netgen-server installation complete.")
+        logger.info("=" * 60)
+        logger.info(f"  Status: systemctl status {SYSTEMD_UNIT_NAME}")
+        logger.info(f"  Logs:   journalctl -u {SYSTEMD_UNIT_NAME} -f")
+        logger.info(f"  API:    http://<host>:{SERVER_PORT}/api/health")
+        logger.info("")
+        logger.info("To upgrade later (wheel-based, no full reinstall):")
+        logger.info("  sudo netgen-upgrade /path/to/ostg_trafficgen-*.whl")
+        return 0
+    else:
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
