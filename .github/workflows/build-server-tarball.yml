@@ -400,7 +400,36 @@ jobs:
           # --group=root so the extracted files don't carry the CI
           # runner's UID (which would surface as `1001` on the
           # target — operator-confusing).
-          tar -czf "$OUT" --owner=root:0 --group=root:0 "$ROOT"
+          #
+          # v0.5.8 fix: bake a deterministic mtime into every header.
+          # Operator-reported on san-hp-srv06 (Ubuntu 24.04 with NTP
+          # drifted ~15 s behind UTC):
+          #
+          #   tar: bin/netgen-install: time stamp 2026-06-07 08:06:33
+          #        is 12.518725772 s in the future
+          #   ...
+          #   [client] installer exit rc=3
+          #
+          # GNU tar emits a warning AND exits non-zero on future
+          # timestamps. The installer dialog uses `set -e`, so a
+          # single future-mtime warning aborts the install.
+          #
+          # We pack with --mtime='@${SOURCE_DATE_EPOCH}' set to the
+          # latest git commit timestamp. This is:
+          #   * stable in the past (no clock can be "behind" it
+          #     unless the operator's host is mis-set by years)
+          #   * reproducible (same git ref → same tarball bytes)
+          #   * consistent with the reproducible-builds convention
+          #     (SOURCE_DATE_EPOCH is the standard knob)
+          SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)
+          export SOURCE_DATE_EPOCH
+          echo "Packing tarball with SOURCE_DATE_EPOCH=$SOURCE_DATE_EPOCH"
+          echo "(= $(date -u -d @$SOURCE_DATE_EPOCH '+%Y-%m-%d %H:%M:%S UTC'))"
+          tar -czf "$OUT" \
+            --owner=root:0 --group=root:0 \
+            --mtime="@${SOURCE_DATE_EPOCH}" \
+            --sort=name \
+            "$ROOT"
           ls -la "$OUT"
           echo "TARBALL=$OUT" >> "$GITHUB_OUTPUT"
           echo "TARBALL_SIZE_MB=$(du -m "$OUT" | cut -f1)" >> "$GITHUB_OUTPUT"

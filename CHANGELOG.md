@@ -2,6 +2,160 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.8] - 2026-06-07
+
+**Tarball install no longer fails on hosts with NTP drift. v0.5.7
+worked on a freshly-NTP'd host but blew up on srv06 because the
+host clock was ~15 s behind UTC and tar refused to extract files
+"from the future".**
+
+Full suite: 1,524 passed, 1 skipped (+6 new tests).
+
+### Operator-reported
+
+san-hp-srv06 retrying fresh install with the (now-relocatable)
+v0.5.7 tarball:
+
+```
+[client] sftp put netgen-server-0.5.7-linux-x86_64.tar.gz
+[client] spawn: sudo tar --strip-components=1 -xzf ...; ...
+tar: bin/netgen-install: time stamp 2026-06-07 08:06:33
+     is 12.518725772 s in the future
+tar: bin/netgen-upgrade: time stamp 2026-06-07 08:06:33
+     is 12.518893021 s in the future
+... (one warning per file in the 19,000-file tarball) ...
+[client] installer exit rc=3
+```
+
+### Root cause
+
+GNU tar emits a warning AND exits non-zero on future-timestamp
+files. The install dialog's spawn script uses `set -e`, so a
+single future-mtime warning aborts the install before `mv` or
+`netgen-install` ever run.
+
+srv06's `systemd-timesyncd` had drifted ~15 s behind UTC. The
+v0.5.7 tarball was packed with "now" mtimes (CI runner's clock,
+NTP-accurate to ms). To srv06's tar, every file looked seconds in
+the future → cascade of warnings → non-zero exit → install died.
+
+This is **a class of bug, not a one-off** — any operator's host
+with NTP drift, frozen-clock VMs, suspended laptops, recently-
+restored snapshots, etc. would hit the same trap on any v0.5.7
+artifact.
+
+### Fix — two-pronged, mirroring v0.5.7's split
+
+**CI workflow — bake deterministic past mtime into every header:**
+
+```bash
+SOURCE_DATE_EPOCH=$(git log -1 --pretty=%ct)
+tar -czf "$OUT" \
+  --owner=root:0 --group=root:0 \
+  --mtime="@${SOURCE_DATE_EPOCH}" \
+  --sort=name \
+  "$ROOT"
+```
+
+`SOURCE_DATE_EPOCH` is the reproducible-builds convention. Using
+it here gives the tarball two properties at once:
+
+* Stable past mtime per git ref → no host's clock can be "behind"
+  it unless mis-set by years
+* Reproducible bytes → same tag → identical tarball → operator-
+  side verification is feasible
+
+`--sort=name` pairs with `--mtime` for byte-level reproducibility
+(without it, readdir ordering varies and the bytes wouldn't match
+across CI runs).
+
+**Client install_server_dialog.py — belt-and-braces:**
+
+```python
+f"sudo tar --warning=no-timestamp --strip-components=1 ..."
+```
+
+Suppresses GNU tar's future-timestamp warning AND its non-zero
+exit. This protects operators using a v0.5.8+ client to install
+OLDER tarballs (still packed with "now" mtimes). They get the
+v0.5.8 client benefit immediately without having to wait for a
+new server tarball.
+
+### Verification
+
+Regression tests in `tests/test_v058_tarball_clock_skew.py` pin:
+
+* Workflow sets `SOURCE_DATE_EPOCH` from `git log -1 --pretty=%ct`
+* Pack tar passes `--mtime=@${SOURCE_DATE_EPOCH}` AND `--sort=name`
+* Client extract passes `--warning=no-timestamp`
+* CHANGELOG documents the fix (so operators searching for the
+  symptom find this release)
+
+### Operator workflow for srv06 right now
+
+The v0.5.7 client's tar invocation lacks `--warning=no-timestamp`
+and the v0.5.7 tarball has CI-runner mtimes — both v0.5.7
+artifacts are affected. Three options to unstick:
+
+**Option A — fix the clock once, install with existing v0.5.7:**
+
+```bash
+ssh root@san-hp-srv06 'timedatectl set-ntp true; \
+  systemctl restart systemd-timesyncd; sleep 5; date -u'
+```
+
+Then retry Fresh Install in the v0.5.7 client.
+
+**Option B — upgrade to v0.5.8 client + v0.5.8 tarball:**
+
+Download the v0.5.8 client (`.dmg` / `.AppImage` / `.exe`),
+which has `--warning=no-timestamp` baked in AND ships the
+SOURCE_DATE_EPOCH-mtime v0.5.8 tarball. Either fix alone is
+sufficient; both together = belt-and-braces.
+
+**Option C — manual extract on srv06 once:**
+
+```bash
+ssh root@san-hp-srv06
+cd /tmp/netgen_install
+sudo rm -rf /opt/netgen-server.new /opt/netgen-server
+sudo mkdir -p /opt/netgen-server
+sudo tar --warning=no-timestamp --strip-components=1 \
+  -xzf netgen-server-0.5.7-linux-x86_64.tar.gz \
+  -C /opt/netgen-server
+sudo /opt/netgen-server/bin/netgen-install
+```
+
+### Lessons / pattern
+
+Third release-in-a-row where the same general class of bug bit
+us:
+
+* v0.5.6: missing PEP 668 detection in HTTP upgrade endpoint
+* v0.5.7: venv built with CI-runner absolute paths
+* v0.5.8: tarball mtimes match CI-runner clock, not operator's
+
+The underlying pattern: **artifacts that work on the CI runner
+because the CI runner is in a known-good state.** The fix in each
+case has been to harden the artifact so it works on *any*
+operator state — broken pip flag, weird install path, drifted
+clock.
+
+The general rule:
+
+> The artifact must be self-sufficient at the operator's host.
+> Anything baked in from the build environment (paths, clocks,
+> assumed system state) eventually trips on a host that doesn't
+> match. Bake in DETERMINISTIC values, not "whatever was true at
+> build time".
+
+Applied:
+
+* `--mtime=$SOURCE_DATE_EPOCH` (clock-independent, this release)
+* `pyvenv.cfg home = /opt/netgen-server/...` (path-independent, v0.5.7)
+* `--break-system-packages` detection (distro-independent, v0.5.6)
+* Round-trip extract test deletes staging tree (CI-state-independent, v0.5.7)
+
 ## [0.5.7] - 2026-06-07
 
 **Tarball venv is now actually relocatable. The v0.5.6 fresh-install

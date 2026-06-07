@@ -802,6 +802,19 @@ class SshInstallWorker(QThread):
             # regardless of which version the operator's installing.
             # Idempotent: if /opt/netgen-server exists, we move it to
             # .bak first so re-installs don't merge with prior state.
+            #
+            # v0.5.8 fix: --warning=no-timestamp suppresses GNU tar's
+            # future-timestamp warnings AND the non-zero exit that
+            # comes with them. Operator-reported on srv06 where the
+            # host clock was ~15 s behind UTC: tar emitted
+            #   "time stamp ... is 12.5 s in the future"
+            # for every file, set -e aborted, install never ran.
+            # The v0.5.8 CI bakes a deterministic past mtime into
+            # every tarball (SOURCE_DATE_EPOCH), so future tarballs
+            # don't trip the warning even if the host clock is way
+            # off. This client-side flag is belt-and-braces: protects
+            # operators using a v0.5.8+ client to install OLDER
+            # tarballs that were packed with "now" mtimes.
             installer_invocation = (
                 f"set -e; "
                 f"cd {remote_dir}; "
@@ -810,7 +823,7 @@ class SshInstallWorker(QThread):
                 f"# never sees a half-extracted tree.\n"
                 f"sudo rm -rf /opt/netgen-server.new; "
                 f"sudo mkdir -p /opt/netgen-server.new; "
-                f"sudo tar --strip-components=1 -xzf {tb_name} -C /opt/netgen-server.new; "
+                f"sudo tar --warning=no-timestamp --strip-components=1 -xzf {tb_name} -C /opt/netgen-server.new; "
                 f"# Back up any prior install (v0.4.x system install OR "
                 f"# previous v0.5.x tarball); the netgen-install script "
                 f"# below will write a fresh systemd unit anyway.\n"

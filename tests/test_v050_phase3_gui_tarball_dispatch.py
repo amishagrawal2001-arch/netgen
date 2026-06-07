@@ -100,8 +100,14 @@ def test_tarball_branch_spawns_netgen_install_not_install_ostg():
         src,
     )
     assert m, "tarball-aware installer_invocation branch not found"
-    # The tarball install command must extract + run the bundled script
-    assert "tar --strip-components=1 -xzf" in src, (
+    # The tarball install command must extract + run the bundled script.
+    # v0.5.8 added --warning=no-timestamp between `tar` and
+    # --strip-components=1 to survive NTP-drifted hosts (srv06 trap),
+    # so accept any flags between `tar` and the --strip / -xzf pair.
+    assert re.search(
+        r"tar\b[^;]*--strip-components=1[^;]*-xzf",
+        src,
+    ), (
         "Tarball spawn command missing tar -xzf — it should extract "
         "the tarball before running netgen-install."
     )
