@@ -1,0 +1,316 @@
+# Build a self-contained server tarball for v0.5.0+.
+#
+# Background — operator-reported pattern across v0.4.x:
+#   "different servers fail at different install points"
+#
+# Each fresh install on a different host kept hitting NEW failure
+# modes: PEP 668, virtual `netcat` package, deps-pass silent no-op,
+# python-version mismatch. The system-pip surface is too wide and
+# too distro-version-dependent to ever be reliable for wider
+# distribution.
+#
+# This workflow builds a NEW distribution artifact that's
+# self-contained: a tarball with a bundled Python interpreter
+# (from python-build-standalone), a pre-built venv with the wheel
+# + all dependencies installed, plus the install/upgrade/uninstall
+# scripts. End users extract and run `bin/netgen-install` — no
+# system pip ever touched.
+#
+# This Phase 1a workflow only PRODUCES the tarball and verifies it
+# extracts + imports cleanly. Attaching to the GH release + wiring
+# into the GUI's Install/Upgrade Server tab come in Phase 2.
+#
+# The wheel SURVIVES this change — it's still the artifact for
+# routine upgrades (pip install inside the bundled venv). Tarball
+# is just for fresh installs and major-version migrations.
+
+name: build-server-tarball
+
+# Phase 1a: manual trigger only. Once the build is proven on Noble
+# we'll wire it into release.yml so v0.5.0+ tags produce the
+# tarball as a release asset alongside the wheel.
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version string to bake into the tarball (defaults to pyproject.toml value)'
+        required: false
+        type: string
+        default: ''
+  push:
+    branches:
+      - 'claude/**'
+    paths:
+      - '.github/workflows/build-server-tarball.yml'
+      - 'pyproject.toml'
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
+
+  # python-build-standalone — pinned to a known-good build. These
+  # tarballs are designed for embedding: portable across glibc
+  # versions, ship their own libs, no system-Python coupling.
+  # Pin to a specific dated release so the build is reproducible —
+  # do NOT use "latest" which would pull a new Python every CI run.
+  #
+  # Source: https://github.com/astral-sh/python-build-standalone
+  # We pick the `install_only` flavor (full Python, optimized for
+  # embedding) over `full` (which includes debug + headers).
+  #
+  # 3.10.14 to match the existing installer's choice of Python 3.10.
+  # Bumping the Python minor is a separate decision — it would
+  # require operators to re-run a full tarball install (their
+  # existing wheel-based upgrades wouldn't carry forward to a
+  # different Python).
+  PBS_PYTHON_VERSION: '3.10.14'
+  PBS_RELEASE_DATE: '20240415'
+
+jobs:
+
+  # ─────────────────────────────────────────────────────────────────
+  # Build the tarball
+  # ─────────────────────────────────────────────────────────────────
+  tarball:
+    name: Server tarball (linux-x86_64)
+    # ubuntu-22.04 over 24.04 deliberately: building against older
+    # glibc produces a tarball that works on BOTH 22.04 and 24.04+
+    # (forward-compatible). Building on 24.04 would lock out Jammy.
+    # python-build-standalone Pythons are largely glibc-independent
+    # but our install script + DPDK build step still link against
+    # host glibc, so we keep the older floor.
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # Build the wheel first — the tarball INCLUDES it (pre-
+      # installed into the bundled venv). We deliberately don't
+      # download a previously-published wheel here: the tarball must
+      # be self-consistent within one CI run.
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Build wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel
+          ls -la dist/
+
+      - name: Resolve version
+        id: ver
+        run: |
+          # Honor manual override; otherwise parse pyproject.toml.
+          # Same logic install_ostg_complete.py uses at runtime, in
+          # shell. Single source of truth (pyproject.toml) avoids
+          # the historical "wheel built as X.Y.Z but installer
+          # looked for A.B.C" class of bug.
+          if [ -n "${{ inputs.version }}" ]; then
+            VERSION="${{ inputs.version }}"
+          else
+            VERSION=$(grep -E '^version *= *' pyproject.toml | head -1 \
+              | sed -E 's/version *= *"([^"]+)".*/\1/')
+          fi
+          if [ -z "$VERSION" ]; then
+            echo "Failed to resolve version from pyproject.toml or inputs"
+            exit 1
+          fi
+          echo "VERSION=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "Resolved version: $VERSION"
+
+      # ─────────────────────────────────────────────────── bundled Python
+      # python-build-standalone ships portable Python interpreters
+      # designed for embedding. No system Python is touched.
+      - name: Download python-build-standalone
+        run: |
+          set -euo pipefail
+          mkdir -p staging
+          cd staging
+          URL="https://github.com/astral-sh/python-build-standalone/releases/download/${PBS_RELEASE_DATE}/cpython-${PBS_PYTHON_VERSION}+${PBS_RELEASE_DATE}-x86_64-unknown-linux-gnu-install_only.tar.gz"
+          echo "Fetching: $URL"
+          curl -fSL "$URL" -o python-standalone.tar.gz
+          ls -la python-standalone.tar.gz
+          # The archive extracts to a `python/` directory by design.
+          tar -xzf python-standalone.tar.gz
+          ls -la python/bin/
+          # Sanity: the bundled Python must run before we go further.
+          ./python/bin/python3 --version
+
+      # ─────────────────────────────────────────────────── tarball layout
+      - name: Assemble tarball directory tree
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.ver.outputs.VERSION }}"
+          ROOT="netgen-server-${VERSION}"
+          mkdir -p "$ROOT"
+
+          # 1. Bundled Python — moves out of `staging/` into final
+          #    place. Symlinks inside the Python tree are preserved
+          #    by `mv` (they're relative).
+          mv staging/python "$ROOT/python-runtime"
+
+          # 2. Pre-built venv pointing at the bundled Python. The
+          #    venv's pip + ostg-server entry point go here.
+          "$ROOT/python-runtime/bin/python3" -m venv "$ROOT/netgen-venv"
+          # Verify the venv links back to the bundled Python (not the
+          # CI runner's /usr/bin/python3). This is the whole point.
+          VENV_PY_TARGET=$(readlink -f "$ROOT/netgen-venv/bin/python")
+          echo "Venv python -> $VENV_PY_TARGET"
+          case "$VENV_PY_TARGET" in
+            *netgen-server*/python-runtime/bin/*) ;;
+            *)
+              echo "ERROR: venv's python points outside the bundled runtime."
+              echo "Expected target inside $ROOT/python-runtime/bin/"
+              exit 1
+              ;;
+          esac
+
+          # 3. Install the wheel + deps into the venv. --no-cache-dir
+          #    keeps the venv reproducible; --force-reinstall has the
+          #    same rationale as install_ostg_complete.py:install_ostg
+          #    (v0.4.8 fix) — guarantee pip re-resolves the dep
+          #    graph instead of no-op'ing on a pre-existing entry.
+          WHEEL=$(ls dist/*.whl | head -1)
+          echo "Installing wheel: $WHEEL"
+          "$ROOT/netgen-venv/bin/pip" install --no-cache-dir --upgrade pip
+          "$ROOT/netgen-venv/bin/pip" install --no-cache-dir --force-reinstall "$WHEEL"
+
+          # 4. Resources + Docker assets that the runtime expects.
+          mkdir -p "$ROOT/share/netgen"
+          cp -r resources/dpdk "$ROOT/share/netgen/"
+          cp -r ostg_docker "$ROOT/share/netgen/"
+          cp Dockerfile.frr "$ROOT/share/netgen/"
+
+          # 5. Placeholder for the install/upgrade scripts (Phase 2
+          #    materializes these). For Phase 1a we just stamp a
+          #    VERSION + README so the tarball isn't a black box.
+          mkdir -p "$ROOT/bin"
+          echo "${VERSION}" > "$ROOT/VERSION"
+          cat > "$ROOT/README.txt" <<EOF
+          Netgen Traffic Generator — Server Tarball ${VERSION}
+
+          Self-contained bundle:
+            python-runtime/   Bundled CPython ${PBS_PYTHON_VERSION} (no system Python required)
+            netgen-venv/      Pre-built venv with the wheel + dependencies
+            share/netgen/     DPDK, Docker (FRR), and other runtime resources
+
+          Phase 1a artifact — install scripts not yet packaged.
+          Phase 2 will add bin/netgen-install + bin/netgen-upgrade.
+
+          Manual install (for now):
+            tar -xzf $(basename netgen-server-${VERSION}-linux-x86_64.tar.gz) -C /opt
+            sudo /opt/netgen-server-${VERSION}/netgen-venv/bin/ostg-server
+          EOF
+
+          ls -la "$ROOT"
+          du -sh "$ROOT"
+
+      # ─────────────────────────────────────────────────── smoke test
+      - name: Smoke-test the staged tree
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.ver.outputs.VERSION }}"
+          ROOT="netgen-server-${VERSION}"
+
+          # The bundled Python must be able to import every core dep
+          # — Flask (the server), scapy (the data plane), requests
+          # (outbound HTTP), psutil (interface counters in the
+          # v0.4.4 /api/interfaces fix). If ANY of these fail to
+          # import, the tarball is broken — fail the build.
+          echo "Verifying core deps import from the bundled venv..."
+          "$ROOT/netgen-venv/bin/python" -c "
+          import flask, scapy.all, requests, psutil
+          print(f'flask {flask.__version__}')
+          print(f'scapy {scapy.__version__}')
+          print(f'requests {requests.__version__}')
+          print(f'psutil {psutil.__version__}')
+          "
+
+          # The wheel's entry point must exist in the venv's bin/
+          # (created by pip when it installed the wheel). If this
+          # fails the wheel didn't declare its console_scripts or
+          # pip didn't run the entry-point creation step.
+          echo "Verifying entry points..."
+          ls "$ROOT/netgen-venv/bin/" | grep -E '(ostg-server|netgen-cli)'
+
+          # Verify the run_tgen_server module imports without
+          # raising — the v0.4.8 san-hp-srv06 bug was that this
+          # import failed at startup. If the same kind of bug is
+          # already in the tarball, fail loudly here.
+          echo "Verifying run_tgen_server is importable..."
+          "$ROOT/netgen-venv/bin/python" -c "import run_tgen_server"
+
+      # ─────────────────────────────────────────────────── pack tarball
+      - name: Pack tarball
+        id: pack
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.ver.outputs.VERSION }}"
+          ROOT="netgen-server-${VERSION}"
+          OUT="netgen-server-${VERSION}-linux-x86_64.tar.gz"
+
+          # `tar` is fine here; pigz would compress faster but the
+          # tarball is built once per release. Use --owner=root and
+          # --group=root so the extracted files don't carry the CI
+          # runner's UID (which would surface as `1001` on the
+          # target — operator-confusing).
+          tar -czf "$OUT" --owner=root:0 --group=root:0 "$ROOT"
+          ls -la "$OUT"
+          echo "TARBALL=$OUT" >> "$GITHUB_OUTPUT"
+          echo "TARBALL_SIZE_MB=$(du -m "$OUT" | cut -f1)" >> "$GITHUB_OUTPUT"
+
+      # ─────────────────────────────────────────────────── round-trip
+      - name: Verify tarball extracts cleanly + venv still works
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.ver.outputs.VERSION }}"
+          TARBALL="netgen-server-${VERSION}-linux-x86_64.tar.gz"
+
+          # Extract to a fresh location (not the staging dir we built
+          # in). Catches "the tarball is internally consistent only
+          # because of the build-side filesystem state" mistakes.
+          mkdir -p /tmp/tarball-roundtrip
+          tar -xzf "$TARBALL" -C /tmp/tarball-roundtrip
+          ls -la /tmp/tarball-roundtrip/
+          EXTRACTED="/tmp/tarball-roundtrip/netgen-server-${VERSION}"
+
+          # Re-run the same imports against the EXTRACTED tree.
+          echo "Re-verifying imports after extract..."
+          "$EXTRACTED/netgen-venv/bin/python" -c "
+          import flask, scapy.all, requests, psutil, run_tgen_server
+          print('all imports OK from extracted tarball')
+          "
+
+          # Show the final size profile for sanity.
+          du -sh "$EXTRACTED"
+          du -sh "$EXTRACTED/python-runtime"
+          du -sh "$EXTRACTED/netgen-venv"
+          du -sh "$EXTRACTED/share"
+
+      - name: Upload tarball as CI artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: server-tarball-linux-x86_64
+          # Capture both the tarball AND the wheel that produced it
+          # — Phase 2 will use the wheel as the upgrade artifact, so
+          # keeping them paired makes the relationship clear.
+          path: |
+            netgen-server-*-linux-x86_64.tar.gz
+            dist/*.whl
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Summary
+        run: |
+          set -euo pipefail
+          VERSION="${{ steps.ver.outputs.VERSION }}"
+          {
+            echo "## Server tarball build summary"
+            echo
+            echo "- Version: \`${VERSION}\`"
+            echo "- Bundled Python: \`${PBS_PYTHON_VERSION}\` (python-build-standalone ${PBS_RELEASE_DATE})"
+            echo "- Tarball: \`${{ steps.pack.outputs.TARBALL }}\` (${{ steps.pack.outputs.TARBALL_SIZE_MB }} MB)"
+            echo "- Smoke tests: ✓ imports, ✓ entry points, ✓ run_tgen_server"
+            echo "- Round-trip extract: ✓"
+            echo
+            echo "Download the \`server-tarball-linux-x86_64\` artifact below to test on a real Noble host."
+          } >> "$GITHUB_STEP_SUMMARY"
