@@ -2,6 +2,130 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.2] - 2026-06-07
+
+**Server → Reboot Physical Server actually reboots the server now.**
+
+Full suite: 1,485 passed, 1 skipped (+9 new tests).
+
+### Operator-reported
+
+Server menu → Reboot Physical Server showed
+`✅ Reboot initiated successfully` but no reboot happened. Silent
+failure — operators kept clicking, kept getting ✅, server kept
+running.
+
+### Root cause
+
+`traffic_client/menu_actions.py:_reboot_servers_list` used:
+
+```python
+cmd = ["ssh", f"root@{hostname}", "reboot"]
+result = subprocess.run(cmd, capture_output=True, ...)
+if result.returncode == 0 or result.returncode == 255:
+    results.append("✅ Reboot initiated successfully")
+```
+
+Two compounding bugs:
+
+  1. **Passwordless `ssh root@host` rarely works** in production
+     — operators don't have root SSH keys distributed. SSH falls
+     back to a password prompt, hits `subprocess.run`'s captured
+     stdin → exits with rc=255 "Permission denied".
+  2. **The code treated rc=255 as SUCCESS.** Original rationale was
+     "SSH disconnects during reboot is expected" — true for the
+     happy path, but rc=255 also catches "Permission denied" /
+     "Host key verification failed" / "Connection refused" — the
+     EXACT cases where no reboot happened. Operator sees ✅;
+     reality is ✗.
+
+### Fix — two halves
+
+**Server side: new `POST /api/system/reboot`.**
+
+The server already runs as root (per its systemd unit's
+ExecStart) so it can schedule its own reboot via
+`subprocess.Popen` — same pattern as the existing
+`/api/dpdk/iommu` reboot. No SSH credentials needed on the client.
+
+```python
+@app.route("/api/system/reboot", methods=["POST"])
+def system_reboot():
+    delay_s = max(1, min(60, int(data.get("delay_s", 5))))
+    subprocess.Popen(
+        ["sh", "-c",
+         f"sleep {delay_s} && "
+         f"(systemctl reboot 2>/dev/null || /sbin/reboot || reboot)"],
+        stdin=DEVNULL, stdout=DEVNULL, stderr=DEVNULL, close_fds=True,
+    )
+    return jsonify({"ok": True, "delay_s": delay_s,
+                    "reboot_at_unix": int(time()) + delay_s,
+                    "hostname": socket.gethostname()})
+```
+
+- `Popen` (not `run`) so the response reaches the client BEFORE
+  /sbin/reboot tears the network down.
+- 5-second default delay → HTTP 200 has time to land.
+- `delay_s` clamped to `[1, 60]` so a malicious `delay_s=99999`
+  request can't silently DoS the operator.
+- Three-fallback reboot command (`systemctl reboot` →
+  `/sbin/reboot` → bare `reboot`) covers systemd / non-systemd /
+  container hosts.
+
+**Client side: HTTP first, SSH only on 404.**
+
+```python
+r = requests.post(f"{api_base}/api/system/reboot",
+                  json={"delay_s": 5}, timeout=5)
+if r.status_code == 200:
+    results.append(f"✅ TG {tg_id}: Reboot scheduled in {delay}s (HTTP API)")
+    continue
+elif r.status_code == 404:
+    # pre-v0.5.1 server — fall through to SSH path
+    ...
+```
+
+The HTTP 200 IS the proof — endpoint only returns after `Popen`
+succeeds. No "success vs disconnected" ambiguity.
+
+The SSH fallback (for pre-v0.5.1 hosts) is now honest:
+
+  - Adds `ssh -o BatchMode=yes -o ConnectTimeout=5` so SSH
+    fails-fast on password prompts instead of hanging.
+  - Parses stderr for hard-failure markers (`permission denied`,
+    `host key verification failed`, `connection refused`, etc.).
+    rc=255 + hard-fail marker → reported as ✗, not ✓.
+  - rc=255 WITHOUT a hard-fail marker is the genuine "SSH
+    disconnected mid-reboot" case and stays a ✓.
+  - When SSH genuinely fails, the message includes
+    "Upgrade the server to v0.5.1+ to use the HTTP reboot
+    endpoint (no SSH required)" — actionable, not just ✗.
+
+### Tests
+
+`tests/test_v052_reboot_endpoint.py` — 9 tests pinning:
+
+  - Endpoint exists at `POST /api/system/reboot`
+  - Uses `Popen` (not blocking `subprocess.run`)
+  - Returns `ok:true` + `delay_s` in body
+  - Clamps `delay_s` with a numeric ceiling
+  - Three-fallback reboot command shape
+  - Client calls HTTP endpoint BEFORE SSH fallback
+  - Client falls back to SSH ONLY on 404 (not on 500 / network)
+  - SSH stderr check includes `permission denied` + other hard-
+    failure markers
+  - SSH command includes `BatchMode=yes`
+
+### Operator action
+
+Upgrade existing v0.4.x / v0.5.0 servers to v0.5.2 via the v0.5.1
+Upgrade tab. Once a server is on v0.5.2+, the Reboot Physical
+Server menu works without any SSH-side configuration.
+
+Pre-v0.5.2 servers still work via the (now honest) SSH fallback,
+which will surface the actual failure mode instead of silently
+reporting ✓.
+
 ## [0.5.1] - 2026-06-07
 
 **Install/Upgrade Server dialog: full polish for the v0.5.0

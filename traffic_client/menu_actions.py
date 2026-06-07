@@ -3075,31 +3075,136 @@ class TrafficGenClientMenuAction():
                 QMessageBox.warning(self, "Invalid Server Address", f"Could not extract hostname from '{address}'")
                 continue
             
-            # Reboot via SSH
+            # v0.5.2: reboot via HTTP POST to /api/system/reboot. The
+            # server runs as root and self-schedules the reboot.
+            # NO SSH credentials needed.
+            #
+            # Pre-v0.5.2 this path was `ssh root@host reboot` which
+            # assumed passwordless root SSH (rarely available) and
+            # treated SSH exit code 255 as SUCCESS — operators saw
+            # "✅ Reboot initiated successfully" with no actual
+            # reboot. Operator-reported pattern; classic silent-
+            # failure trap.
+            #
+            # On v0.5.1+ servers the new endpoint exists; on older
+            # servers we get 404 and fall back to the legacy SSH
+            # path. Operators on mixed-version fleets get the right
+            # behavior without per-host configuration.
             try:
-                # Use reboot command (with nohup to ensure it completes even if SSH disconnects)
-                cmd = ["ssh", f"root@{hostname}", "reboot"]
-                result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
-                
-                # Note: reboot command may disconnect SSH immediately, so we check if command was accepted
-                # Exit code 255 usually means SSH disconnected (which is expected during reboot)
-                if result.returncode == 0 or result.returncode == 255:
-                    results.append(f"✅ TG {tg_id} ({hostname}): Reboot initiated successfully")
-                    logger.info(f"[REBOOT SERVER] Successfully initiated reboot for server TG {tg_id} on {hostname}")
+                # The server entry may carry a scheme already (e.g.
+                # http://srv01:5050); reconstruct the API URL
+                # robustly even if the address is bare host:port.
+                api_base = address.rstrip("/")
+                if "://" not in api_base:
+                    api_base = f"http://{api_base}"
+                reboot_url = f"{api_base}/api/system/reboot"
+                # 5-second timeout — the endpoint returns quickly
+                # (Popen-and-return, doesn't wait for the actual
+                # reboot to start).
+                r = requests.post(reboot_url, json={"delay_s": 5}, timeout=5)
+                if r.status_code == 200:
+                    body = r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+                    delay = body.get("delay_s", 5)
+                    results.append(
+                        f"✅ TG {tg_id} ({hostname}): Reboot scheduled in {delay}s (HTTP API)"
+                    )
+                    logger.info(
+                        f"[REBOOT SERVER] HTTP API scheduled reboot for "
+                        f"TG {tg_id} on {hostname} in {delay}s"
+                    )
+                    continue
+                elif r.status_code == 404:
+                    # Pre-v0.5.1 server — endpoint doesn't exist.
+                    # Fall through to legacy SSH path.
+                    logger.info(
+                        f"[REBOOT SERVER] /api/system/reboot 404 on "
+                        f"TG {tg_id} — falling back to SSH (legacy server)"
+                    )
                 else:
-                    error_msg = result.stderr.strip() or result.stdout.strip() or "Unknown error"
-                    results.append(f"❌ TG {tg_id} ({hostname}): Failed - {error_msg}")
-                    logger.error(f"[REBOOT SERVER] Failed to reboot server TG {tg_id} on {hostname}: {error_msg}")
+                    # Server-side failure; surface to operator instead
+                    # of silently falling back (the SSH path would
+                    # probably ALSO fail).
+                    results.append(
+                        f"❌ TG {tg_id} ({hostname}): HTTP reboot failed "
+                        f"(HTTP {r.status_code} — {r.text[:120]})"
+                    )
+                    logger.error(
+                        f"[REBOOT SERVER] HTTP API returned {r.status_code} "
+                        f"for TG {tg_id}: {r.text[:300]}"
+                    )
+                    continue
+            except requests.exceptions.RequestException as exc:
+                # Network failure — could mean server is already
+                # offline. Try SSH as a fallback only if it might
+                # actually work (the operator may have keys); the
+                # fallback below distinguishes real "Permission
+                # denied" from network errors.
+                logger.info(
+                    f"[REBOOT SERVER] HTTP /api/system/reboot failed for "
+                    f"TG {tg_id} ({exc}); trying SSH fallback"
+                )
+
+            # Legacy SSH path — kept for v0.4.x servers that don't
+            # have /api/system/reboot. v0.5.2 makes the rc=255 check
+            # honest: rc=255 with stderr containing "Permission
+            # denied" / "Connection refused" is FAILURE, not the
+            # expected "SSH disconnected during reboot" success.
+            try:
+                cmd = ["ssh",
+                       "-o", "BatchMode=yes",
+                       "-o", "ConnectTimeout=5",
+                       f"root@{hostname}", "reboot"]
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+                stderr_lc = (result.stderr or "").lower()
+                # Real-success markers
+                hard_fail_markers = (
+                    "permission denied",
+                    "host key verification failed",
+                    "connection refused",
+                    "no route to host",
+                    "could not resolve hostname",
+                    "operation timed out",
+                )
+                hard_fail = any(m in stderr_lc for m in hard_fail_markers)
+                if result.returncode == 0 and not hard_fail:
+                    results.append(
+                        f"✅ TG {tg_id} ({hostname}): SSH reboot initiated"
+                    )
+                    logger.info(f"[REBOOT SERVER] SSH-init reboot for TG {tg_id}")
+                elif result.returncode == 255 and not hard_fail:
+                    # rc=255 WITHOUT a known-failure marker is the
+                    # genuine "SSH disconnected mid-reboot" case.
+                    results.append(
+                        f"✅ TG {tg_id} ({hostname}): SSH reboot initiated "
+                        f"(SSH disconnected — expected)"
+                    )
+                    logger.info(f"[REBOOT SERVER] SSH-init reboot rc=255 OK")
+                else:
+                    err = (result.stderr or result.stdout or "Unknown").strip()
+                    results.append(
+                        f"❌ TG {tg_id} ({hostname}): SSH reboot FAILED — "
+                        f"{err[:200]}\n"
+                        f"   Upgrade the server to v0.5.1+ to use the HTTP "
+                        f"reboot endpoint (no SSH required)."
+                    )
+                    logger.error(
+                        f"[REBOOT SERVER] SSH reboot failed for TG {tg_id}: {err}"
+                    )
             except subprocess.TimeoutExpired:
-                # Timeout is actually expected - SSH disconnects when server reboots
-                results.append(f"✅ TG {tg_id} ({hostname}): Reboot initiated (SSH disconnected - expected)")
-                logger.info(f"[REBOOT SERVER] Reboot initiated for server TG {tg_id} on {hostname} (SSH timeout expected)")
+                results.append(
+                    f"✅ TG {tg_id} ({hostname}): SSH reboot initiated "
+                    f"(SSH timed out — expected)"
+                )
+                logger.info(f"[REBOOT SERVER] SSH timeout for TG {tg_id} — expected")
             except FileNotFoundError:
-                results.append(f"❌ TG {tg_id} ({hostname}): SSH not found (install OpenSSH client)")
-                logger.info(f"[REBOOT SERVER] SSH command not found - OpenSSH client may not be installed")
+                results.append(
+                    f"❌ TG {tg_id} ({hostname}): SSH not found AND HTTP "
+                    f"endpoint unreachable. Upgrade the server to v0.5.1+ "
+                    f"OR install OpenSSH client locally."
+                )
             except Exception as e:
                 results.append(f"❌ TG {tg_id} ({hostname}): Error - {str(e)}")
-                logger.info(f"[REBOOT SERVER] Error rebooting server TG {tg_id} on {hostname}: {e}")
+                logger.info(f"[REBOOT SERVER] Error rebooting TG {tg_id}: {e}")
         
         # Show results
         result_text = "\n".join(results)

@@ -17170,6 +17170,80 @@ def latency_stop():
     return jsonify({"ok": True, "stopped": stopped})
 
 
+@app.route("/api/system/reboot", methods=["POST"])
+def system_reboot():
+    """Schedule a physical reboot of the host this server runs on.
+
+    Added in v0.5.2 to fix an operator-reported bug: the GUI's
+    Server → Reboot Physical Server menu was using passwordless
+    `ssh root@host reboot` AND treating SSH exit code 255
+    ("Permission denied" / "Connection refused" / etc.) as SUCCESS.
+    Operators saw "✅ Reboot initiated successfully" with no actual
+    reboot. Same pattern that bit srv04 fresh-install in v0.4.x —
+    silent failures are operator-trust-destroyers.
+
+    The server already runs as root (per the systemd unit's
+    ExecStart). Doing the reboot HERE means:
+      * No SSH credentials needed on the client side.
+      * No SSH-key distribution to operators.
+      * The HTTP 200 response is PROOF the reboot was scheduled —
+        it can only return after subprocess.Popen succeeded.
+
+    Body (optional JSON):
+      {"delay_s": 5}   — how many seconds to wait before reboot.
+                        Default 5 so the HTTP 200 response gets
+                        back to the client before /sbin/reboot
+                        tears the network down.
+
+    Returns:
+      {"ok": true, "delay_s": <int>, "reboot_at_unix": <int>,
+       "hostname": "<str>"}
+
+    Caveats:
+      * The shell uses `nohup` + `&` + `</dev/null` so the
+        subprocess survives this Flask thread tearing down. We
+        don't `wait()` — the subprocess outlives this request.
+      * If the host doesn't have /sbin/reboot (uncommon),
+        `systemctl reboot` is the fallback. The shell tries both.
+    """
+    try:
+        import subprocess
+        import socket
+        import time as _t
+        data = request.get_json(silent=True) or {}
+        # Clamp: 0 < delay_s ≤ 60. <0 makes no sense; >60 just
+        # delays the operator's pain pointlessly.
+        try:
+            delay_s = max(1, min(60, int(data.get("delay_s", 5))))
+        except (TypeError, ValueError):
+            delay_s = 5
+        # Single-shot detached subprocess. Mirrors the
+        # /api/dpdk/iommu reboot pattern (same file, line ~14146).
+        # `systemctl reboot` first; if not available (e.g. some
+        # container hosts), fall back to /sbin/reboot.
+        subprocess.Popen(
+            ["sh", "-c",
+             f"sleep {delay_s} && "
+             f"(systemctl reboot 2>/dev/null || /sbin/reboot || reboot)"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+        return jsonify({
+            "ok": True,
+            "delay_s": delay_s,
+            "reboot_at_unix": int(_t.time()) + delay_s,
+            "hostname": socket.gethostname(),
+        }), 200
+    except Exception as exc:
+        logger.error(f"[SYSTEM REBOOT] failed to schedule: {exc}")
+        return jsonify({
+            "ok": False,
+            "error": str(exc),
+        }), 500
+
+
 # ---- Explicit entry point used by 'ostg-server' ----
 def _resolve_ai_settings_path():
     """AI settings env file path with sensible defaults + legacy fallback.
