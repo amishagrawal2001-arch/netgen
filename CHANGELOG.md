@@ -2,6 +2,87 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.6] - 2026-06-07
+
+**HTTP wheel-upgrade now works on PEP 668 hosts AND on v0.5.0+
+tarball installs.**
+
+Full suite: 1,511 passed, 1 skipped (+5 new tests).
+
+### Operator-reported
+
+san-hp-srv06 (Ubuntu 24.04):
+
+```
+[client] POST http://san-hp-srv06:5050/api/admin/upgrade_wheel
+[upgrade] cmd: /usr/bin/python3 -m pip install --upgrade ...
+error: externally-managed-environment
+× This environment is externally managed
+[client] pip exited rc=1; aborting
+```
+
+Same operator-trust failure class we whacked through v0.4.7 /
+v0.4.8 / v0.4.9. v0.5.1's SshUpgradeWorker fix covered the SSH
+upgrade path (client → SSH → systemctl restart) but missed the
+HTTP API endpoint — different code path, same bug class.
+
+### Fix
+
+Two-branch dispatch in `/api/admin/upgrade_wheel`:
+
+**Branch 1 — v0.5.0+ tarball install.** If
+`/opt/netgen-server/bin/netgen-upgrade` exists (executable),
+dispatch through it. The script runs pip in the bundled venv
+(zero PEP 668 surface — venvs are exempt) AND handles
+`systemctl restart` inside itself.
+
+**Branch 2 — v0.4.x system install.** Use `sys.executable -m
+pip install` as before, but conditionally add
+`--break-system-packages` based on detection of
+`/usr/lib/python3*/EXTERNALLY-MANAGED` (the canonical PEP 668
+signal). Detection cached on the module so repeat upgrades
+don't re-stat the filesystem.
+
+Pre-PEP 668 hosts (Ubuntu 22.04 Jammy, etc.) have neither the
+marker NOR `--break-system-packages` support in their older
+pip — conditional detection is the only correct shape.
+
+Log lines record which branch ran:
+
+```
+[upgrade] cmd: ...
+[upgrade] mode: tarball:netgen-upgrade
+```
+
+or
+
+```
+[upgrade] mode: legacy:system-pip+break-system-packages
+```
+
+so when an operator-reported failure lands, the first line of
+`/var/log/netgen-upgrade.log` reveals which dispatch fired.
+
+### Tests
+
+`tests/test_v056_admin_upgrade_pep668.py` — 5 tests pinning:
+
+  * Endpoint checks `/opt/netgen-server/bin/netgen-upgrade`
+    with both `isfile` AND `access(X_OK)` (avoids dispatching
+    to a stale empty file)
+  * Legacy path detects `EXTERNALLY-MANAGED` marker
+  * `--break-system-packages` added ONLY when detected
+  * Detection cached at module level
+  * Both branches log `upgrade_mode` for diagnostic clarity
+
+### Operator action
+
+Upgrade srv06 (and any other host that hit this) to v0.5.6.
+The v0.5.6 wheel can be installed via the same Upgrade Server
+flow — the dispatch will detect EXTERNALLY-MANAGED on srv06,
+add the flag, and the install will succeed THIS time. On the
+next upgrade after that, the same dispatch keeps working.
+
 ## [0.5.5] - 2026-06-07
 
 **Cleaner interface context-menu labels.**

@@ -15184,26 +15184,61 @@ def api_admin_upgrade_wheel():
         log_path = os.path.join(wheel_dir, "upgrade.log")
         log_fh = open(log_path, "wb", buffering=0)
 
-    # Build pip command using the server's own interpreter so the new wheel
-    # lands in the same site-packages — critical when the server runs under
-    # a venv / pipx.
+    # v0.5.6: prefer the v0.5.0+ tarball's bundled netgen-upgrade
+    # script if it exists — it runs pip inside the bundled venv,
+    # which is exempt from PEP 668, AND it handles the systemctl
+    # restart inside the script. On v0.4.x system installs the
+    # script doesn't exist; fall back to the legacy
+    # `sys.executable -m pip install` path WITH
+    # --break-system-packages so Noble's externally-managed pip
+    # doesn't reject the install.
     #
-    # `import sys` is intentionally inline rather than at module level: this
-    # is a 15k+ LOC file with no other `sys` reference, and a NameError
-    # here (lurking since 0.2.6) bricked the entire upgrade flow with a
-    # bare 500. Inline keeps the blast radius to just this handler — and
-    # the import is essentially free (sys is already loaded; just rebinds
-    # the local name).
+    # `import sys` is intentionally inline rather than at module
+    # level: this is a 15k+ LOC file with no other `sys` reference,
+    # and a NameError here (lurking since 0.2.6) bricked the entire
+    # upgrade flow with a bare 500. Inline keeps the blast radius
+    # to just this handler.
     import sys
-    py = sys.executable or "python3"
-    cmd = [
-        py, "-m", "pip", "install",
-        "--upgrade", "--force-reinstall", "--no-deps",
-        wheel_path,
-    ]
+    NETGEN_UPGRADE_SCRIPT = "/opt/netgen-server/bin/netgen-upgrade"
+    if os.path.isfile(NETGEN_UPGRADE_SCRIPT) and \
+            os.access(NETGEN_UPGRADE_SCRIPT, os.X_OK):
+        # Tarball install (v0.5.0+). Script handles pip in bundled
+        # venv + systemctl restart + /api/health verify itself.
+        # We just dispatch and capture output.
+        cmd = [NETGEN_UPGRADE_SCRIPT, wheel_path]
+        upgrade_mode = "tarball:netgen-upgrade"
+    else:
+        # Legacy v0.4.x system install. Use sys.executable so we
+        # write to the same site-packages the running server uses.
+        # On Noble + Debian 12+ the system Python is PEP 668-managed:
+        # /usr/lib/python3.X/EXTERNALLY-MANAGED makes pip refuse the
+        # install without --break-system-packages. Detect the marker
+        # and add the flag only when present — pre-PEP 668 hosts
+        # (Ubuntu 22.04 etc.) don't have the marker AND their pip
+        # may be too old to recognize the flag, so we must NOT
+        # always pass it. Detection cached on the module to skip
+        # filesystem stat on every upgrade.
+        py = sys.executable or "python3"
+        global _PIP_BREAK_FLAG_DETECTED
+        if "_PIP_BREAK_FLAG_DETECTED" not in globals():
+            import glob as _glob
+            _PIP_BREAK_FLAG_DETECTED = bool(
+                _glob.glob("/usr/lib/python3*/EXTERNALLY-MANAGED")
+                or _glob.glob("/usr/local/lib/python3*/EXTERNALLY-MANAGED")
+            )
+        cmd = [py, "-m", "pip", "install"]
+        if _PIP_BREAK_FLAG_DETECTED:
+            cmd.append("--break-system-packages")
+        cmd += ["--upgrade", "--force-reinstall", "--no-deps", wheel_path]
+        upgrade_mode = (
+            "legacy:system-pip+break-system-packages"
+            if _PIP_BREAK_FLAG_DETECTED
+            else "legacy:system-pip"
+        )
     log_fh.write(f"[upgrade] {_dt.datetime.now().isoformat()} cmd: {' '.join(cmd)}\n".encode())
     log_fh.write(f"[upgrade] wheel: {wheel_path} ({os.path.getsize(wheel_path)} bytes)\n".encode())
-    log_fh.write(f"[upgrade] python: {py}\n".encode())
+    log_fh.write(f"[upgrade] mode: {upgrade_mode}\n".encode())
+    log_fh.write(f"[upgrade] python: {sys.executable}\n".encode())
     log_fh.flush()
 
     try:
