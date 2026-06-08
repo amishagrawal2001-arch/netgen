@@ -412,6 +412,57 @@ class TrafficGenClientServerSection():
         menu.addAction(down_action)
         menu.exec_(self.server_tree.viewport().mapToGlobal(pos))
 
+    def _update_iface_icon_for_operstate(self, server_addr, iface, operstate):
+        """v0.5.43: walk the server tree, find the port_item whose
+        parent matches `server_addr` and whose label matches `iface`,
+        and update its icon based on `operstate` from /sys/class/net.
+
+        operstate values:
+          "up"      — kernel says link is up → green dot
+          "down"    — kernel says down → red dot
+          "unknown" — virtual / loopback / driver doesn't report.
+                      Treat as "up" since the admin state IS up
+                      (operator just set it).
+
+        Falls through quietly if the tree structure doesn't match
+        the expected layout — the staggered update_server_tree()
+        calls scheduled after this serve as backup.
+        """
+        if not hasattr(self, "server_tree"):
+            return
+        # The port label may have had a "Port: ", emoji prefix, or
+        # both stripped earlier — match on suffix.
+        ops = (operstate or "").strip().lower()
+        if ops in ("up", "unknown"):
+            icon = QIcon(r_icon("icons/green_dot.png"))
+            tooltip_state = "Up"
+        elif ops == "down":
+            icon = QIcon(r_icon("icons/red_dot.png"))
+            tooltip_state = "Down"
+        else:
+            return
+        scaled = QIcon(icon.pixmap(12, 12))
+        root = self.server_tree.invisibleRootItem()
+        for i in range(root.childCount()):
+            srv_item = root.child(i)
+            srv_label = (srv_item.text(0) or "").lower()
+            if server_addr.lower() not in srv_label and \
+                    server_addr.split(":")[0].lower() not in srv_label:
+                continue
+            for j in range(srv_item.childCount()):
+                child = srv_item.child(j)
+                child_label = child.text(0) or ""
+                # Strip known prefixes the way line ~375 does.
+                stripped = child_label
+                for prefix in ("Port: ", "Port:", "🔵 ", "🟢 ",
+                               "🔴 ", "⚪ "):
+                    if stripped.startswith(prefix):
+                        stripped = stripped[len(prefix):]
+                if stripped.strip() == iface or stripped.endswith(iface):
+                    child.setIcon(0, scaled)
+                    child.setToolTip(0, f"{iface} - {tooltip_state}")
+                    return
+
     def _set_interface_admin_state(self, server_addr, iface, state):
         """v0.5.4: POST to /api/interfaces/<iface>/admin and surface
         the result in a small QMessageBox. Confirmation for
@@ -448,10 +499,36 @@ class TrafficGenClientServerSection():
                     f"  requested: {state}\n"
                     f"  kernel says: {operstate}",
                 )
-                # Refresh the tree so the operator sees the new
-                # state without manually re-clicking.
+                # v0.5.43: apply the operstate from the response
+                # DIRECTLY to the matching port_item's icon. Pre-
+                # fix the client waited for the next
+                # update_server_tree() poll to pick up the new
+                # state via /api/interfaces — but psutil's `isup`
+                # check requires carrier (IFF_RUNNING), which takes
+                # 2-10s on big NICs (Mellanox 100G). So a freshly-
+                # upped link stayed red in the GUI for several
+                # seconds even though admin state was correct.
+                #
+                # The admin endpoint reads /sys/.../operstate
+                # directly — same source we now use in
+                # /api/interfaces post-v0.5.43 — so the icon
+                # update is canonical immediately.
+                try:
+                    self._update_iface_icon_for_operstate(
+                        server_addr, iface, operstate,
+                    )
+                except Exception as e:
+                    logger.debug(
+                        f"[INTERFACE ADMIN] icon update failed: {e}"
+                    )
+                # v0.5.43: ALSO stagger refresh schedule. The 500ms
+                # one-shot misses slow carrier negotiation. Try at
+                # 500ms (catches operstate=up), 3s (catches typical
+                # carrier-up), 8s (catches the slow Mellanox case).
                 if hasattr(self, "update_server_tree"):
                     QTimer.singleShot(500, self.update_server_tree)
+                    QTimer.singleShot(3000, self.update_server_tree)
+                    QTimer.singleShot(8000, self.update_server_tree)
             elif r.status_code == 404:
                 QMessageBox.warning(
                     self, "Interface admin not supported",

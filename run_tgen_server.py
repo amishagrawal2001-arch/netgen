@@ -11108,9 +11108,45 @@ def get_interfaces():
             else:
                 tx = rx = sent_bytes = received_bytes = errors = 0
 
+            # v0.5.43: prefer sysfs operstate over psutil.isup. On
+            # Linux, psutil's `isup` ANDs IFF_UP + IFF_RUNNING — the
+            # RUNNING flag tracks carrier, which takes 2-10s to
+            # come up on Mellanox 100G after `ip link set up`. So
+            # a freshly-upped link reports "down" for several
+            # seconds via psutil even though the admin state and
+            # the kernel's operstate are both "up".
+            #
+            # Operator-reported on srv06 (Jun 8 2026): right-click
+            # Set Online succeeded (operstate=up) but the GUI link
+            # icon stayed red until carrier negotiated.
+            #
+            # /sys/class/net/<iface>/operstate is the canonical
+            # kernel-managed link state and reflects ip link's
+            # "state UP/DOWN/UNKNOWN" exactly:
+            #   up        — admin up AND carrier present
+            #   down      — admin down OR no carrier (logical link)
+            #   unknown   — virtual / loopback / driver doesn't report
+            #
+            # Treat "up" and "unknown" as green (admin-requested
+            # state is what the operator cares about). Falls back
+            # to psutil.isup when sysfs read fails (containers,
+            # macOS, etc.).
+            operstate = None
+            try:
+                with open(f"/sys/class/net/{name}/operstate", "r") as _of:
+                    operstate = _of.read().strip().lower()
+            except Exception:
+                pass
+            if operstate in ("up", "unknown"):
+                status = "up"
+            elif operstate == "down":
+                status = "down"
+            else:
+                status = "up" if is_up else "down"
             interfaces.append({
                 "name": name,
-                "status": "up" if is_up else "down",
+                "status": status,
+                "operstate": operstate or ("up" if is_up else "down"),
                 "mtu": stats.mtu,
                 "speed": stats.speed if hasattr(stats, 'speed') else "Unknown",
                 "ip_addresses": psutil.net_if_addrs().get(name, []),  # Add IP addresses if available

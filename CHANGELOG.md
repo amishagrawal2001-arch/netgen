@@ -2,6 +2,84 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.43] - 2026-06-08
+
+**Link status uses sysfs operstate + admin response drives icon
+immediately.** Operator-reported on srv06: "tried online
+interface, link is online but GUI link status shows red." Two-
+layer bug — both the server's status read and the client's
+post-action refresh schedule needed fixing.
+
+Full suite: **1,810 passed, 1 skipped** (+9 new tests).
+
+### Layer 1 — Server: psutil.isup is wrong for fast queries
+
+`psutil.net_if_stats().isup` on Linux returns `IFF_UP AND
+IFF_RUNNING`. The `IFF_RUNNING` flag tracks **carrier** —
+takes 2-10s on big NICs (Mellanox 100G especially) to come up
+after `ip link set up`. So a freshly-upped link reports "down"
+via psutil for several seconds even though `ip link show` says
+`state UP` (which reads from `operstate`).
+
+**Fix:** `/api/interfaces` now reads
+`/sys/class/net/<iface>/operstate` as the primary signal:
+
+| operstate | status returned |
+|---|---|
+| `up` | `up` |
+| `down` | `down` |
+| `unknown` (virtual / loopback / driver doesn't report) | `up` — operator-requested admin state respected |
+
+Falls back to `psutil.isup` when the sysfs read fails (macOS dev
+hosts, container with proc-only mounts, etc.).
+
+Response now also exposes the raw `operstate` field so clients
+can use it for debug or directly drive icons.
+
+### Layer 2 — Client: admin response thrown away
+
+The right-click `Set Online` action POSTed to
+`/api/interfaces/<iface>/admin` and the response already
+carried `operstate` from the **same** sysfs source. The client
+showed it in the QMessageBox then **threw it away** — the icon
+update waited for the next `/api/interfaces` poll, which (pre-
+Layer 1) was wrong anyway.
+
+**Fix:** new `_update_iface_icon_for_operstate(server_addr,
+iface, operstate)` helper walks the server tree, finds the
+matching port_item, applies the green/red dot icon immediately
+from the admin response's operstate. The polling cycle becomes
+a backup, not the primary path.
+
+### Layer 3 — Single refresh missed slow carrier
+
+The Set Online handler scheduled **one** `QTimer.singleShot(500,
+self.update_server_tree)`. Even with the operstate fix, a 500ms-
+later poll could still mid-negotiation. **Fix:** staggered to
+500ms + 3s + 8s, covering Mellanox 100G's worst case.
+
+### Outcome
+
+| Scenario | Before v0.5.43 | After v0.5.43 |
+|---|---|---|
+| Set Online on fast NIC (Intel/Broadcom 10G) | Icon flips green ~1s later (lucky polling) | Icon flips green ~immediately (admin response) |
+| Set Online on Mellanox 100G (slow carrier) | Icon stays red for 8-10s, sometimes indefinitely | Icon green immediately from admin response; staggered polls confirm |
+| Virtual / loopback iface | Icon may stay red (operstate=unknown → psutil.isup=False) | Icon green (unknown treated as up) |
+| Cable disconnected | Eventually red after polling | Eventually red after polling (correct) |
+
+### Tests
+
+9 new in `tests/test_v0543_link_status_operstate.py`:
+* `/api/interfaces` reads `/sys/class/net/<iface>/operstate`
+* `operstate=unknown` treated as up (virtual ifaces)
+* Falls back to `psutil.isup` on sysfs read failure
+* Response exposes `operstate` field
+* Set Online handler calls `_update_iface_icon_for_operstate`
+* Helper is defined (no AttributeError on click)
+* Helper treats `unknown` as up consistently with server
+* Handler schedules ≥ 3 `QTimer.singleShot` calls + at least one
+  past 5s (covers slow carrier)
+
 ## [0.5.42] - 2026-06-08
 
 **`/api/dpdk/load_modules` verify uses anchored regex (not
