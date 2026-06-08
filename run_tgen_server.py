@@ -15138,7 +15138,118 @@ _ADMIN_UPGRADE_STATE = {
     "finished_at": None,
     "return_code": None,
     "restart_scheduled": False,
+    # v0.5.23: when set, the upgrade runs in a detached systemd
+    # transient unit (its own cgroup). Track status via
+    # `systemctl is-active <unit>` + `systemctl show <unit>
+    # --property=ExecMainStatus` instead of proc.poll(). Required
+    # because the v0.5.22 "Connection reset mid-pip" failure mode
+    # on srv06 showed pip dying with rc=None — pip was a child of
+    # netgen-server's cgroup, so a Flask-side hiccup that dropped
+    # the server cascade-killed the pip subprocess via cgroup-kill.
+    "systemd_unit": None,
 }
+
+# v0.5.23: state file the server reloads on startup. We need this
+# because the upgrade now intentionally restarts the server (via
+# netgen-upgrade's own systemctl call) — the post-restart server's
+# in-memory _ADMIN_UPGRADE_STATE is empty, so without disk-persist
+# the next /api/admin/upgrade_wheel/log poll returns "no upgrade in
+# progress" even when one is actively finishing in its detached
+# cgroup. The client would log `pip exited rc=None; aborting` even
+# on a successful upgrade.
+_ADMIN_UPGRADE_STATE_FILE = "/var/lib/netgen-server/upgrade-state.json"
+
+
+def _admin_upgrade_state_snapshot():
+    """Return _ADMIN_UPGRADE_STATE minus the Popen object (non-pickleable)."""
+    return {
+        k: v for k, v in _ADMIN_UPGRADE_STATE.items()
+        if k != "process"
+    }
+
+
+def _admin_upgrade_persist():
+    """Atomically write the upgrade state snapshot to disk."""
+    import json as _json
+    try:
+        os.makedirs(os.path.dirname(_ADMIN_UPGRADE_STATE_FILE), exist_ok=True)
+        tmp = _ADMIN_UPGRADE_STATE_FILE + ".tmp"
+        with open(tmp, "w") as f:
+            _json.dump(_admin_upgrade_state_snapshot(), f)
+        os.replace(tmp, _ADMIN_UPGRADE_STATE_FILE)
+    except Exception:
+        # Best-effort; persistence failure must not break the upgrade.
+        pass
+
+
+def _admin_upgrade_load():
+    """On startup, reload the last persisted state. Lets the
+    post-restart server keep reporting upgrade status to the
+    polling client."""
+    import json as _json
+    try:
+        if not os.path.isfile(_ADMIN_UPGRADE_STATE_FILE):
+            return
+        with open(_ADMIN_UPGRADE_STATE_FILE) as f:
+            data = _json.load(f)
+        for k in (
+            "log_path", "wheel_path", "wheel_name", "started_at",
+            "finished_at", "return_code", "restart_scheduled",
+            "systemd_unit",
+        ):
+            if k in data:
+                _ADMIN_UPGRADE_STATE[k] = data[k]
+    except Exception:
+        pass
+
+
+# Reload persisted state at module import (one-shot; the file's
+# only role is bridging a restart, not periodic recovery).
+_admin_upgrade_load()
+
+
+def _systemd_run_available():
+    """Cached check for systemd-run. Used to decide whether the
+    upgrade wraps its pip subprocess in a detached transient unit.
+    Requires euid==0 because creating system-scope transient units
+    is privileged. Falls back gracefully on non-systemd hosts /
+    non-root processes / minimal containers."""
+    global _SYSTEMD_RUN_PATH_DETECTED
+    if "_SYSTEMD_RUN_PATH_DETECTED" not in globals():
+        import shutil as _shutil
+        path = _shutil.which("systemd-run")
+        _SYSTEMD_RUN_PATH_DETECTED = path if (path and os.geteuid() == 0) else None
+    return _SYSTEMD_RUN_PATH_DETECTED
+
+
+def _systemd_unit_state(unit: str):
+    """Return (running: bool, return_code: Optional[int]) for a
+    transient unit. `running` is True while is-active reports
+    active/activating; `return_code` is ExecMainStatus once the
+    unit has exited."""
+    try:
+        is_active = subprocess.run(
+            ["systemctl", "is-active", unit],
+            capture_output=True, text=True, timeout=4,
+        ).stdout.strip()
+    except Exception:
+        return (False, None)
+    if is_active in ("active", "activating", "reloading"):
+        return (True, None)
+    # Unit has exited (inactive / failed / collected). Pull
+    # ExecMainStatus for the actual rc. After --collect the unit
+    # is gone — that's still "not running" with unknown rc.
+    try:
+        rc_str = subprocess.run(
+            ["systemctl", "show", unit, "--property=ExecMainStatus"],
+            capture_output=True, text=True, timeout=4,
+        ).stdout.strip()
+        if "=" in rc_str:
+            rc = int(rc_str.split("=", 1)[1])
+            return (False, rc)
+    except Exception:
+        pass
+    return (False, None)
 
 
 def _allowed_wheel_name(name: str) -> bool:
@@ -15244,10 +15355,54 @@ def api_admin_upgrade_wheel():
             if _PIP_BREAK_FLAG_DETECTED
             else "legacy:system-pip"
         )
+    # v0.5.23: wrap the spawn in `systemd-run --no-block --collect
+    # --unit=netgen-upgrade-runner-<ts>.service` so pip runs in its
+    # own systemd transient unit (its own cgroup). Required because
+    # the v0.5.22 srv06 failure mode was:
+    #
+    #   pip uninstalled ostg-trafficgen 0.5.13 cleanly
+    #     → flask worker handled a stats poll, hit an ImportError
+    #       (file was just deleted)
+    #     → flask crashed, systemd reaped netgen-server.service
+    #     → systemd killed the WHOLE cgroup, including the pip
+    #       subprocess one fork-tree below
+    #   → pip exit rc=None (killed by signal mid-run)
+    #   → wheel never installed; site-packages left in a half-
+    #     uninstalled state; only manual SSH recovery possible.
+    #
+    # With systemd-run, pip lives in netgen-upgrade-runner-*.service
+    # cgroup. Even if netgen-server.service gets restarted, pip
+    # finishes, then netgen-upgrade itself calls `systemctl restart
+    # netgen-server` to bring the new code online.
+    #
+    # systemd-run output goes to journald by default; we redirect
+    # stdout/stderr to the same /var/log/netgen-upgrade.log so the
+    # client's existing log-tailing flow keeps working.
+    systemd_unit = None
+    systemd_run = _systemd_run_available()
+    if systemd_run:
+        import time as _t
+        ts = int(_t.time())
+        systemd_unit = f"netgen-upgrade-runner-{ts}.service"
+        cmd = [
+            systemd_run,
+            "--no-block",
+            "--collect",
+            f"--unit={systemd_unit}",
+            "--description=netgen wheel upgrade (detached)",
+            "--setenv=HOME=/root",
+            f"--property=StandardOutput=append:{log_path}",
+            f"--property=StandardError=append:{log_path}",
+            "--",
+        ] + cmd
+        upgrade_mode = upgrade_mode + "+detached"
+
     log_fh.write(f"[upgrade] {_dt.datetime.now().isoformat()} cmd: {' '.join(cmd)}\n".encode())
     log_fh.write(f"[upgrade] wheel: {wheel_path} ({os.path.getsize(wheel_path)} bytes)\n".encode())
     log_fh.write(f"[upgrade] mode: {upgrade_mode}\n".encode())
     log_fh.write(f"[upgrade] python: {sys.executable}\n".encode())
+    if systemd_unit:
+        log_fh.write(f"[upgrade] systemd_unit: {systemd_unit}\n".encode())
     log_fh.flush()
 
     try:
@@ -15270,7 +15425,9 @@ def api_admin_upgrade_wheel():
         "finished_at": None,
         "return_code": None,
         "restart_scheduled": False,
+        "systemd_unit": systemd_unit,
     })
+    _admin_upgrade_persist()
 
     return jsonify({
         "ok": True,
@@ -15278,6 +15435,7 @@ def api_admin_upgrade_wheel():
         "log_path": log_path,
         "wheel_name": f.filename,
         "started_at": _ADMIN_UPGRADE_STATE["started_at"],
+        "systemd_unit": systemd_unit,
     })
 
 
@@ -15288,22 +15446,39 @@ def api_admin_upgrade_wheel_log():
     if not log_path or not os.path.isfile(log_path):
         return jsonify({"running": False, "log": "", "log_path": None})
 
+    # v0.5.23: when the upgrade was spawned via systemd-run, track
+    # status via systemctl (the Popen handle reflects only
+    # systemd-run's dispatcher exit, not the actual pip process).
+    # When systemd_unit is None we fall back to proc.poll() — both
+    # the legacy code path and the not-as-root code path land here.
+    systemd_unit = _ADMIN_UPGRADE_STATE.get("systemd_unit")
     proc = _ADMIN_UPGRADE_STATE.get("process")
-    running = bool(proc and proc.poll() is None)
-    return_code = None
-    if proc is not None and not running:
-        return_code = proc.poll()
-        if _ADMIN_UPGRADE_STATE.get("finished_at") is None:
+    if systemd_unit:
+        running, return_code = _systemd_unit_state(systemd_unit)
+    else:
+        running = bool(proc and proc.poll() is None)
+        return_code = None
+        if proc is not None and not running:
+            return_code = proc.poll()
+
+    if not running and _ADMIN_UPGRADE_STATE.get("finished_at") is None:
+        # Only stamp finished_at once we genuinely have a tracked
+        # exit (proc handle, or systemd_unit set). If both are
+        # absent we're in the post-reload "no upgrade ever
+        # started" state — leave finished_at None.
+        if proc is not None or systemd_unit:
             import datetime as _dt
             _ADMIN_UPGRADE_STATE["finished_at"] = _dt.datetime.now().isoformat()
             _ADMIN_UPGRADE_STATE["return_code"] = return_code
 
-            # Pip succeeded — schedule a systemd restart. We use `at` /
-            # `nohup` to detach the restart command so the current process
-            # gets a fraction of a second to flush the HTTP response before
-            # systemd kills it. The client then polls /api/health for the
-            # new instance.
-            if return_code == 0 and not _ADMIN_UPGRADE_STATE.get("restart_scheduled"):
+            # v0.5.23: when systemd_unit is set, the detached
+            # netgen-upgrade script has already called
+            # `systemctl restart netgen-server` itself — don't
+            # double-restart. The legacy proc.poll() path keeps
+            # the inline restart trigger (no detached helper to
+            # do it for us).
+            if return_code == 0 and not systemd_unit and \
+                    not _ADMIN_UPGRADE_STATE.get("restart_scheduled"):
                 _ADMIN_UPGRADE_STATE["restart_scheduled"] = True
                 try:
                     with open(log_path, "ab") as lf:
@@ -15318,6 +15493,13 @@ def api_admin_upgrade_wheel_log():
                 except Exception as e:
                     with open(log_path, "ab") as lf:
                         lf.write(f"[upgrade] restart scheduling failed: {e}\n".encode())
+            elif return_code == 0 and systemd_unit:
+                # The netgen-upgrade script issues its own restart
+                # when pip + import-check + verify succeed. Flag
+                # restart_scheduled so the client knows to wait for
+                # /api/health instead of expecting more log output.
+                _ADMIN_UPGRADE_STATE["restart_scheduled"] = True
+            _admin_upgrade_persist()
 
     try:
         with open(log_path, "rb") as f:
