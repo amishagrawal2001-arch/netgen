@@ -48,12 +48,13 @@ MANDATORY = [
     "python3-pyelftools",
 ]
 
+# v0.5.27: libibverbs-dev, rdma-core, perftest moved to
+# install_rdma.sh — install_dpdk.sh's driver/lib list trims to
+# DPDK-only items. The Mellanox PMD support still works because
+# the operator runs install_rdma.sh first (or the wizard does).
 DRIVER_AND_LIB = [
     "libelf-dev",
     "libpcap-dev",
-    "libibverbs-dev",
-    "rdma-core",
-    "perftest",
 ]
 
 OPTIONAL_V0526 = [
@@ -115,19 +116,14 @@ def test_v0526_optional_packages_present():
 
 
 def test_optional_deps_in_core_batch_not_mlx5():
-    """The mlx5 batch is for the OPTIONAL Mellanox MOFED package
-    and can fail independently on hosts without the MOFED repo. ALL
-    of the v0.5.26 optionals belong in the core batch — they're
-    needed regardless of NIC vendor."""
+    """v0.5.27 update: mlx5_install_cmd moved to install_rdma.sh.
+    There IS no mlx5 batch in install_dpdk.sh anymore, so the
+    "make sure optionals aren't in it" check is now a "make sure
+    the batch is gone" check."""
     src = _INSTALL_DPDK.read_text()
-    mlx5_m = re.search(r'mlx5_install_cmd=["\']([^"\']+)["\']', src)
-    assert mlx5_m
-    mlx5_cmd = mlx5_m.group(1)
-    misplaced = [p for p in OPTIONAL_V0526 if p in mlx5_cmd]
-    assert not misplaced, (
-        f"Optional packages landed in mlx5_install_cmd: "
-        f"{misplaced}. Hosts without MOFED apt repo would skip "
-        f"the mlx5 batch and lose these too."
+    assert "mlx5_install_cmd" not in src, (
+        "mlx5_install_cmd resurrected in install_dpdk.sh — moved to "
+        "install_rdma.sh in v0.5.27."
     )
 
 

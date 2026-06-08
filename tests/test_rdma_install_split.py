@@ -30,6 +30,7 @@ two batches back together."""
 from __future__ import annotations
 
 import re
+from pathlib import Path
 
 _INSTALLER = "/Users/surajsharma/dev/netgen/install_ostg_complete.py"
 _DPDK_SH = "/Users/surajsharma/dev/netgen/resources/dpdk/install_dpdk.sh"
@@ -138,54 +139,49 @@ def test_rdma_userspace_warns_on_mlx5_failure():
     )
 
 
-def test_install_dpdk_sh_splits_libmlx5_from_core_deps():
-    """install_dpdk.sh's apt-get install of build deps must NOT
-    include libmlx5-dev in the same batch as build-essential / meson
-    / perftest. Otherwise ANY failure (including the MOFED case)
-    fails the entire DPDK build-deps install."""
+def test_install_dpdk_sh_no_longer_installs_libmlx5():
+    """v0.5.27 update: libmlx5-dev moved to install_rdma.sh entirely.
+    install_dpdk.sh must not reference it anymore — that's the RDMA
+    stack's territory now. Pre-v0.5.27 this test enforced libmlx5-dev
+    being in a SEPARATE batch from core deps; v0.5.27 enforces the
+    stronger 'not in install_dpdk.sh at all' invariant."""
     src = open(_DPDK_SH).read()
-    # Find the main deps_install_cmd assignment
-    m = re.search(
-        r'deps_install_cmd="[^"]+"',
-        src,
-    )
+    m = re.search(r'deps_install_cmd="[^"]+"', src)
     assert m, "deps_install_cmd not found in install_dpdk.sh"
     cmd = m.group(0)
     assert "libmlx5-dev" not in cmd, (
-        "libmlx5-dev appears in deps_install_cmd — must be split "
-        "into a separate optional install. Pre-fix bundling it "
-        "with build-essential + perftest meant MOFED-less hosts "
-        "failed the whole DPDK build-deps install."
+        "libmlx5-dev appears in deps_install_cmd — moved to "
+        "install_rdma.sh in v0.5.27. See test_v0527_rdma_install_split."
     )
-    # The new optional command must exist
-    assert "mlx5_install_cmd=" in src, (
-        "install_dpdk.sh missing mlx5_install_cmd — the split "
-        "Mellanox-optional pass must be a separate variable."
+    # mlx5_install_cmd must be gone entirely from install_dpdk.sh.
+    assert "mlx5_install_cmd" not in src, (
+        "install_dpdk.sh still has mlx5_install_cmd — moved to "
+        "install_rdma.sh in v0.5.27. The Mellanox optional pass "
+        "now happens during Setup RDMA, not Setup DPDK."
     )
-    # Both core + mlx5 must mention libibverbs-dev / libmlx5-dev
-    # respectively (sanity that the split is meaningful, not just
-    # an empty rename).
-    assert "libibverbs-dev" in cmd, \
-        "deps_install_cmd lost libibverbs-dev — split must preserve core"
-    mlx5_m = re.search(r'mlx5_install_cmd="[^"]+"', src)
-    assert mlx5_m and "libmlx5-dev" in mlx5_m.group(0), \
-        "mlx5_install_cmd must include libmlx5-dev"
 
 
-def test_install_dpdk_sh_tolerates_mlx5_install_failure():
-    """install_dpdk.sh must wrap the mlx5 install in a conditional
-    that warns on failure rather than aborting. Pre-fix the whole
-    deps batch was fatal if any package was missing."""
-    src = open(_DPDK_SH).read()
-    # Look for the conditional + log_warning fallback near
-    # mlx5_install_cmd
-    assert re.search(
-        r'if\s+eval\s+"\$mlx5_install_cmd"', src,
-    ), (
-        "install_dpdk.sh should conditionally eval $mlx5_install_cmd "
-        "and warn on failure (not abort the script)"
+def test_install_rdma_sh_handles_mlx5_install_failure():
+    """v0.5.27 update: the Mellanox-MOFED-optional libmlx5-dev install
+    now lives in install_rdma.sh. The fault-tolerant 'try to install,
+    warn if it fails' pattern moved with it. install_rdma.sh must
+    keep the same shape: separate batch + non-fatal failure."""
+    rdma_sh = Path(_DPDK_SH).parent / "install_rdma.sh"
+    src = rdma_sh.read_text()
+    # Mellanox-only batch must be a separate variable
+    assert "mlx5_apt_cmd" in src or "mlx5_install_cmd" in src, (
+        "install_rdma.sh doesn't split mlx5 into a separate apt batch "
+        "— failures on non-MOFED hosts would poison the core install."
     )
-    # Find the failure-branch log_warning
-    assert re.search(
-        r'log_warning\s+"libmlx5-dev not available', src,
-    ), "install_dpdk.sh missing operator-readable warning on mlx5 install failure"
+    # And the if/else around the optional install must log a warning
+    # rather than fail the script.
+    assert re.search(r"if\s+eval\s+\"\$mlx5_apt_cmd\"", src) or \
+           re.search(r"if\s+eval\s+\"\$mlx5_install_cmd\"", src), (
+        "install_rdma.sh should conditionally eval the mlx5 batch + "
+        "warn on failure (not abort the script)"
+    )
+    assert re.search(r"log_warning.*libmlx5-dev install failed", src, re.IGNORECASE) or \
+           re.search(r"log_warning.*MOFED", src), (
+        "install_rdma.sh missing operator-readable warning on mlx5 "
+        "install failure"
+    )

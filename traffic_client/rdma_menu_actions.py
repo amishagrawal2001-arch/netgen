@@ -109,6 +109,50 @@ class TrafficGenClientRDMAMenuActions:
             return url, f"TG {tg_id}"
         return server, f"TG {server}"
 
+    # ─────────────────────────────────────────── Setup RDMA (v0.5.27)
+
+    def show_setup_rdma_dialog(self):
+        """Open the Setup RDMA installer dialog for the selected server.
+
+        v0.5.27: operator-requested separation from DPDK install. The
+        RDMA stack (libibverbs-dev, rdma-core, perftest, ibverbs-utils,
+        infiniband-diags + optional libmlx5-dev) is now an independent
+        wizard rather than a side-effect of Setup DPDK. Drives
+        /api/admin/install_rdma on the selected server and tails the
+        log via /api/admin/install_rdma/log.
+
+        Single-server only (same shape as Make DPDK Ready) — pops a
+        warning if multiple TGs are selected.
+        """
+        servers = self._get_selected_servers()
+        if not servers:
+            QMessageBox.information(
+                self, "Setup RDMA",
+                "Select a server (TG) in the server tree first, then "
+                "open the dialog.",
+            )
+            return
+        if len(servers) > 1:
+            QMessageBox.information(
+                self, "Setup RDMA",
+                "Multiple servers selected. Setup RDMA operates on one "
+                "server at a time — please select a single TG in the "
+                "server tree and try again.",
+            )
+            return
+        server = servers[0]
+        server_url, _label = self._server_url_label(server)
+        if not server_url:
+            QMessageBox.warning(
+                self, "Setup RDMA",
+                "Could not resolve the selected server's URL.",
+            )
+            return
+
+        from widgets.setup_rdma_dialog import SetupRdmaDialog
+        dlg = SetupRdmaDialog(server_url, parent=self)
+        dlg.exec_()
+
     # ─────────────────────────────────────────── Blast a RDMA Flow
 
     def show_rdma_blast_flow_dialog(self):

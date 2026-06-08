@@ -466,20 +466,6 @@ step_install_dependencies() {
     fi
     
     log_info "Installing build dependencies..."
-    # Base toolchain + DPDK runtime libs needed by every PMD:
-    #   build-essential meson ninja-build pkg-config libnuma-dev libelf-dev libpcap-dev
-    # Mellanox / NVIDIA mlx5 PMD prereqs (libibverbs / libmlx5 / rdma-core):
-    #   harmless on non-Mellanox boxes (just adds ~30 MB of unused libs),
-    #   but skipping them on a Mellanox-equipped box silently disables the
-    #   mlx5 PMD at meson-config time so DPDK can't drive those NICs at all.
-    # perftest (ib_send_bw / ib_write_bw / ib_read_bw + _lat variants):
-    #   needed by the v0.3.12 RDMA traffic-gen feature (Tools → RDMA
-    #   submenu + per-stream engine=rdma path). ~2 MB, harmless on
-    #   non-RDMA boxes. Included here so any host that gets DPDK
-    #   installed also gets RDMA capability — most TGs targeting one
-    #   want the other (both target high-throughput NICs). --no-dpdk
-    #   paths get perftest via install_ostg_complete.py's
-    #   _install_rdma_userspace() instead.
     # linux-headers-$(uname -r): vfio-pci is in-tree on stock Ubuntu / Debian
     # kernels, but cloud / minimal images (Azure, GCP, container-optimized)
     # frequently strip the modules and need the matching headers to either
@@ -495,15 +481,21 @@ step_install_dependencies() {
     # any nohup-detached install context. The DEBIAN_FRONTEND env
     # var alone does NOT cover dpkg's own conffile prompt; the
     # Dpkg::Options::= flags are mandatory for it.
-    # v0.3.16+: libmlx5-dev split into a separate optional install.
-    # Pre-fix, putting libmlx5-dev in the SAME apt-get install batch
-    # as the rest meant `apt: Unable to locate package libmlx5-dev`
-    # on hosts without Mellanox MOFED apt repo configured (e.g.
-    # svl-d-ai-srv04) failed the entire batch with rc=100 → DPDK
-    # build deps + perftest + rdma-core also didn't install →
-    # cascading install failure. Split so the optional Mellanox
-    # package can fail independently without poisoning the core set.
-    # DPDK 23.11 apt dependency catalog (current as of v0.5.26):
+    #
+    # DPDK 23.11 apt dependency catalog (current as of v0.5.27):
+    #
+    # ─── v0.5.27 SPLIT ───────────────────────────────────────────────
+    # Operator request: "rdma install should be separate, it should
+    # not be part of dpdk install". RDMA stack (libibverbs-dev,
+    # rdma-core, perftest, libmlx5-dev) moved to install_rdma.sh —
+    # Tools → RDMA → Setup RDMA in the GUI, or sudo install_rdma.sh
+    # on CLI.
+    #
+    # If you intend to use DPDK with Mellanox NICs (drivers/net/mlx5),
+    # run install_rdma.sh BEFORE this script so the mlx5 PMD picks
+    # up libibverbs at meson configure time. On Intel / Broadcom /
+    # virtio hosts no RDMA stack is needed at all.
+    # ──────────────────────────────────────────────────────────────────
     #
     #   MANDATORY (meson setup fails without them):
     #     build-essential       — gcc/g++/make + C11 toolchain
@@ -517,11 +509,6 @@ step_install_dependencies() {
     #   STRONGLY RECOMMENDED (driver compile errors without them):
     #     libelf-dev            — BPF library
     #     libpcap-dev           — pcap PMD + pdump
-    #     libibverbs-dev        — Mellanox PMDs (mlx4/mlx5 ibverbs interface)
-    #     rdma-core             — Mellanox PMDs (full rdma stack)
-    #     perftest              — IB/RDMA perf testing (not DPDK per se,
-    #                             but netgen's rdma_perf orchestrator
-    #                             shells out to ib_send_bw etc.)
     #
     #   OPTIONAL — added v0.5.26 because `-Dexamples=all` (line ~592)
     #   transitively pulls in every example's deps, and DPDK 23.11
@@ -545,9 +532,8 @@ step_install_dependencies() {
     # ~20-40 MB of apt download/install but eliminates the "Make
     # DPDK Ready" surface for downstream feature requests (someone
     # wanting AF_XDP, telemetry export, etc. doesn't need a re-roll).
-    local deps_install_cmd="DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold --option Acquire::http::Timeout=30 --option Acquire::ftp::Timeout=30 build-essential meson ninja-build pkg-config libnuma-dev libelf-dev libpcap-dev libibverbs-dev rdma-core perftest python3-pyelftools libssl-dev libjansson-dev libbpf-dev libxdp-dev libbsd-dev zlib1g-dev libfdt-dev libarchive-dev ${kernel_headers}"
-    local mlx5_install_cmd="DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold libmlx5-dev"
-    
+    local deps_install_cmd="DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold --option Acquire::http::Timeout=30 --option Acquire::ftp::Timeout=30 build-essential meson ninja-build pkg-config libnuma-dev libelf-dev libpcap-dev python3-pyelftools libssl-dev libjansson-dev libbpf-dev libxdp-dev libbsd-dev zlib1g-dev libfdt-dev libarchive-dev ${kernel_headers}"
+
     # v0.3.2: tighten umask around the temp-log tee so the file is
     # 0600 (owner-only) instead of the default 0644 (world-readable).
     # apt-get output isn't high-sensitivity, but there's no reason
@@ -582,19 +568,30 @@ step_install_dependencies() {
     
     rm -f /tmp/dpdk_deps_install.log
 
-    # v0.3.16+: Mellanox-optional pass. Only available with MOFED
-    # apt repo configured. Tolerate failure cleanly so non-Mellanox
-    # hosts (e.g. svl-d-ai-srv04) don't see this surface as an
-    # install error.
-    log_info "Attempting libmlx5-dev install (Mellanox MOFED-optional)..."
-    if eval "$mlx5_install_cmd" >/tmp/dpdk_mlx5_install.log 2>&1; then
-        log_success "libmlx5-dev installed (Mellanox PMD dev headers present)"
-    else
-        log_warning "libmlx5-dev not available — skipping (host lacks Mellanox MOFED apt repo)."
-        log_warning "RoCEv2 + perftest still work via libibverbs-dev; only Mellanox-specific"
-        log_warning "PMD build flags are missing. Add MOFED repo + re-run if you need them."
+    # v0.5.27: libmlx5-dev (Mellanox PMD dev headers) and the full
+    # RDMA stack (libibverbs-dev, rdma-core, perftest) moved to
+    # install_rdma.sh. If you intend to drive Mellanox NICs with
+    # DPDK's mlx5 PMD, run install_rdma.sh BEFORE this script so
+    # the mlx5 PMD picks up libibverbs at meson configure time.
+    #
+    # Detect Mellanox hardware + warn if RDMA stack is missing —
+    # this is the most common surprise that DPDK Mellanox-PMD
+    # users hit.
+    if command -v lspci >/dev/null 2>&1 && lspci 2>/dev/null | grep -qi mellanox; then
+        if ! ldconfig -p 2>/dev/null | grep -q libibverbs; then
+            log_warning ""
+            log_warning "Mellanox NIC detected but libibverbs is NOT installed."
+            log_warning "DPDK's mlx5 PMD will be silently skipped at meson"
+            log_warning "configure time. To drive Mellanox NICs from DPDK:"
+            log_warning ""
+            log_warning "  1. Run install_rdma.sh first (sudo /opt/netgen-server/share/netgen/resources/dpdk/install_rdma.sh)"
+            log_warning "  2. Or use the GUI: Tools → RDMA → Setup RDMA"
+            log_warning "  3. Then re-run this script — mlx5 PMD will compile."
+            log_warning ""
+        else
+            log_info "Mellanox NIC + libibverbs detected — mlx5 PMD will compile."
+        fi
     fi
-    rm -f /tmp/dpdk_mlx5_install.log
 }
 
 # Step 5: Build DPDK

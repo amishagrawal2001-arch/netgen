@@ -15260,6 +15260,150 @@ def _allowed_wheel_name(name: str) -> bool:
     return bool(_re.match(r"^[A-Za-z0-9._+-]+\.whl$", name))
 
 
+# ──────────────────────── v0.5.27 install_rdma endpoints ──────────────
+#
+# Operator request: "rdma install should be separate, it should not
+# be part of dpdk install". install_rdma.sh handles the RDMA stack
+# (libibverbs-dev, rdma-core, perftest, ibverbs-utils, infiniband-
+# diags + Mellanox libmlx5-dev in a fail-tolerant separate batch)
+# without touching DPDK source / build / hugepages / VFIO. Endpoints
+# mirror install_dpdk's surface so the wizard can reuse the same
+# poll-the-log pattern.
+#
+# Resources: install_rdma.sh ships in resources/dpdk/ alongside
+# install_dpdk.sh (same wheel package-data) — _ensure_dpdk_tree_deployed
+# copies BOTH scripts to /opt/netgen/resources/dpdk/. No new
+# selfheal helper needed.
+
+_ADMIN_INSTALL_RDMA_STATE = {
+    "process": None,
+    "log_path": None,
+    "started_at": None,
+    "finished_at": None,
+    "return_code": None,
+}
+
+
+@app.route("/api/admin/install_rdma", methods=["POST"])
+def api_admin_install_rdma():
+    """Kick off install_rdma.sh --auto in the background.
+
+    Returns immediately with a log path the client can poll via
+    /api/admin/install_rdma/log. Refuses if an install is already
+    running. Distinct state from /api/admin/install_dpdk — both
+    can run sequentially or, in principle, in parallel (the apt
+    operations would serialize on dpkg-lock anyway).
+    """
+    import datetime as _dt
+
+    proc = _ADMIN_INSTALL_RDMA_STATE.get("process")
+    if proc and proc.poll() is None:
+        return jsonify({
+            "error": "RDMA install is already running",
+            "log_path": _ADMIN_INSTALL_RDMA_STATE.get("log_path"),
+        }), 409
+
+    # Same self-heal pattern as install_dpdk — wheel is the canonical
+    # source for resources/dpdk/install_rdma.sh.
+    _ensure_dpdk_tree_deployed()
+    candidates = [
+        "/opt/netgen/resources/dpdk/install_rdma.sh",
+        "/opt/OSTG/resources/dpdk/install_rdma.sh",
+    ]
+    script = next((p for p in candidates if os.path.isfile(p)), None)
+    if script is None:
+        return jsonify({
+            "error": (
+                "install_rdma.sh not found in /opt/netgen or /opt/OSTG, "
+                "and self-heal from wheel failed. Upgrade to "
+                "ostg-trafficgen >= 0.5.27 (which ships install_rdma.sh "
+                "as a separate script) and retry."
+            )
+        }), 404
+
+    timestamp = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+    log_path = f"/tmp/netgen_install_rdma_{timestamp}.log"
+
+    try:
+        log_fh = open(log_path, "w", buffering=1)
+        env = os.environ.copy()
+        env["AUTO_MODE"] = "1"
+        env["TERM"] = "xterm"
+        env["DEBIAN_FRONTEND"] = "noninteractive"
+        env["DEBIAN_PRIORITY"] = "critical"
+        # v0.5.21 trap: $HOME may be unset under systemd's clean env
+        # + `set -u` in the script. Defense-in-depth even though
+        # install_rdma.sh already does `: "${HOME:=/root}"`.
+        env.setdefault("HOME", "/root")
+        new_proc = subprocess.Popen(
+            ["bash", script, "--auto"],
+            stdout=log_fh, stderr=subprocess.STDOUT,
+            env=env, start_new_session=True,
+        )
+    except Exception as e:
+        return jsonify({"error": f"Failed to launch RDMA install: {e}"}), 500
+
+    _ADMIN_INSTALL_RDMA_STATE["process"] = new_proc
+    _ADMIN_INSTALL_RDMA_STATE["log_path"] = log_path
+    _ADMIN_INSTALL_RDMA_STATE["started_at"] = _dt.datetime.now().isoformat()
+    _ADMIN_INSTALL_RDMA_STATE["finished_at"] = None
+    _ADMIN_INSTALL_RDMA_STATE["return_code"] = None
+
+    return jsonify({
+        "started": True,
+        "pid": new_proc.pid,
+        "log_path": log_path,
+        "started_at": _ADMIN_INSTALL_RDMA_STATE["started_at"],
+    })
+
+
+@app.route("/api/admin/install_rdma/log", methods=["GET"])
+def api_admin_install_rdma_log():
+    """Tail the RDMA install log + report status.
+
+    Simpler shape than /api/admin/install_dpdk/log — install_rdma.sh
+    is a quick 4-step script (~1-2 minutes total), no need for the
+    multi-step phase parser or ninja-progress tracking.
+    """
+    log_path = _ADMIN_INSTALL_RDMA_STATE.get("log_path")
+    if not log_path or not os.path.isfile(log_path):
+        return jsonify({
+            "running": False, "log": "", "log_path": None, "log_size": 0,
+        })
+
+    proc = _ADMIN_INSTALL_RDMA_STATE.get("process")
+    running = bool(proc and proc.poll() is None)
+    return_code = None
+    if proc is not None and not running:
+        return_code = proc.poll()
+        if _ADMIN_INSTALL_RDMA_STATE.get("finished_at") is None:
+            import datetime as _dt
+            _ADMIN_INSTALL_RDMA_STATE["finished_at"] = _dt.datetime.now().isoformat()
+            _ADMIN_INSTALL_RDMA_STATE["return_code"] = return_code
+
+    # Read entire log — install_rdma logs are tiny (a few KB).
+    log_size = 0
+    data = ""
+    try:
+        with open(log_path, "rb") as f:
+            f.seek(0, 2)
+            log_size = f.tell()
+            f.seek(0)
+            data = f.read().decode("utf-8", errors="replace")
+    except Exception as e:
+        data = f"[error reading log: {e}]"
+
+    return jsonify({
+        "running": running,
+        "return_code": return_code,
+        "log_path": log_path,
+        "log_size": log_size,
+        "started_at": _ADMIN_INSTALL_RDMA_STATE.get("started_at"),
+        "finished_at": _ADMIN_INSTALL_RDMA_STATE.get("finished_at"),
+        "log": data,
+    })
+
+
 @app.route("/api/admin/upgrade_wheel", methods=["POST"])
 @require_role("admin")
 def api_admin_upgrade_wheel():

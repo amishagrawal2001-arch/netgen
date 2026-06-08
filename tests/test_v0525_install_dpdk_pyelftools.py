@@ -51,19 +51,22 @@ def test_apt_install_includes_pyelftools():
 
 
 def test_pyelftools_in_core_batch_not_mlx5_batch():
-    """python3-pyelftools must be in deps_install_cmd, NOT
-    mlx5_install_cmd. The mlx5 batch is for the OPTIONAL Mellanox
-    package and can fail independently on hosts without the MOFED
-    apt repo (svl-d-ai-srv04, etc.). If pyelftools landed in the
-    mlx5 batch, those hosts would silently lose pyelftools and DPDK
-    build would still fail."""
+    """v0.5.27 update: mlx5_install_cmd moved to install_rdma.sh
+    along with the rest of the RDMA stack. This test now just
+    confirms pyelftools is in deps_install_cmd (the only batch left
+    in install_dpdk.sh). Pre-v0.5.27 this test also enforced
+    pyelftools NOT being in the mlx5 batch — moot now that the
+    batch is gone."""
     src = _INSTALL_DPDK.read_text()
-    mlx5_m = re.search(r'mlx5_install_cmd=["\']([^"\']+)["\']', src)
-    assert mlx5_m, "mlx5_install_cmd assignment not found"
-    assert "python3-pyelftools" not in mlx5_m.group(1), (
-        "python3-pyelftools landed in mlx5_install_cmd — hosts "
-        "without MOFED apt repo would skip the mlx5 batch and "
-        "lose pyelftools too. Move to deps_install_cmd."
+    # mlx5_install_cmd MUST be gone — that's v0.5.27's contract.
+    assert "mlx5_install_cmd" not in src, (
+        "mlx5_install_cmd resurrected in install_dpdk.sh — moved to "
+        "install_rdma.sh in v0.5.27. See test_v0527_rdma_install_split."
+    )
+    # And pyelftools must be in the (sole) core batch.
+    m = re.search(r'deps_install_cmd=["\']([^"\']+)["\']', src)
+    assert m and "python3-pyelftools" in m.group(1), (
+        "python3-pyelftools missing from deps_install_cmd"
     )
 
 
@@ -73,6 +76,9 @@ def test_apt_install_preserves_core_dpdk_deps():
     src = _INSTALL_DPDK.read_text()
     m = re.search(r'deps_install_cmd=["\']([^"\']+)["\']', src)
     apt_cmd = m.group(1)
+    # v0.5.27: libibverbs-dev, rdma-core, perftest moved to
+    # install_rdma.sh. Mellanox MOFED-optional libmlx5-dev moved
+    # there too. install_dpdk.sh's required list is now DPDK-only.
     required = [
         "build-essential",
         "meson",
@@ -81,9 +87,6 @@ def test_apt_install_preserves_core_dpdk_deps():
         "libnuma-dev",
         "libelf-dev",
         "libpcap-dev",
-        "libibverbs-dev",
-        "rdma-core",
-        "perftest",
         "python3-pyelftools",
     ]
     missing = [pkg for pkg in required if pkg not in apt_cmd]

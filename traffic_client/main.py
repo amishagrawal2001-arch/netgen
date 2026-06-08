@@ -1518,12 +1518,29 @@ class TrafficGeneratorClient(
 
         # v0.3.12: RDMA submenu — sibling of DPDK. Drives perftest
         # (ib_send_bw / ib_write_bw / ib_read_bw + _lat variants)
-        # across one or two selected TGs. No DPDK make-ready prereq —
-        # RDMA is always-on once rdma-core + perftest are installed,
-        # so this menu is a pure orchestrator.
+        # across one or two selected TGs.
+        #
+        # v0.5.27: Setup RDMA entry pinned to the top of the menu.
+        # Operator request: "rdma install should be separate, it should
+        # not be part of dpdk install". Mirrors the DPDK Setup pattern
+        # (Setup DPDK is the entry-point of the DPDK submenu).
         rdma_menu = QMenu("RDMA", self)
         rdma_menu.setToolTipsVisible(True)
         tools_menu.addMenu(rdma_menu)
+
+        rdma_setup_action = QAction("Setup RDMA...", self)
+        rdma_setup_action.setToolTip(
+            "Install the RDMA stack on the selected server: "
+            "libibverbs-dev + rdma-core + perftest + ibverbs-utils + "
+            "infiniband-diags, plus libmlx5-dev (Mellanox MOFED, "
+            "optional). Loads ib_uverbs / rdma_cm / ib_umad kernel "
+            "modules and persists them across reboots. Required "
+            "before Blast a RDMA Flow / Topology Test on a fresh "
+            "server. ~1-2 minute install."
+        )
+        rdma_setup_action.triggered.connect(self.show_setup_rdma_dialog)
+        rdma_menu.addAction(rdma_setup_action)
+        rdma_menu.addSeparator()
 
         rdma_blast_action = QAction("Blast a RDMA Flow...", self)
         rdma_blast_action.setToolTip(

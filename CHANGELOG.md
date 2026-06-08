@@ -2,6 +2,124 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.27] - 2026-06-07
+
+**RDMA install split from DPDK install** — operator-requested
+separation. The RDMA stack (libibverbs-dev, rdma-core, perftest,
+ibverbs-utils, infiniband-diags + optional libmlx5-dev) is now
+its own wizard, not a side-effect of "Make DPDK Ready".
+
+Full suite: **1,683 passed, 1 skipped** (+17 new, 4 existing
+tests updated for the split).
+
+### Operator request
+
+> rdma install should be separate, it should not be part of dpdk install
+
+### Rationale for separation
+
+* **DPDK runs on any NIC** — Intel, Broadcom, virtio. Pre-v0.5.27
+  install_dpdk.sh dragged ~30 MB of RDMA stack onto Intel/Broadcom
+  hosts that didn't need it.
+* **RDMA testing is independent** — netgen's perftest orchestrator
+  (Tools → RDMA → Blast a RDMA Flow / Topology Test) just needs
+  libibverbs + perftest. Operators who only want RDMA tests
+  shouldn't have to run the 10-step DPDK build.
+* **Composable** — operators wanting DPDK on Mellanox NICs run
+  Setup RDMA first (gets libibverbs), then Setup DPDK (the mlx5
+  PMD picks up libibverbs at meson configure time). install_dpdk.sh
+  detects Mellanox NICs without libibverbs and prints a clear
+  pointer at Setup RDMA so the order isn't ambiguous.
+
+### What moved
+
+| Package | Before v0.5.27 | After v0.5.27 |
+|---|---|---|
+| `libibverbs-dev` | install_dpdk.sh core | install_rdma.sh core |
+| `rdma-core` | install_dpdk.sh core | install_rdma.sh core |
+| `perftest` | install_dpdk.sh core | install_rdma.sh core |
+| `libmlx5-dev` | install_dpdk.sh mlx5 batch (fail-tolerant) | install_rdma.sh mlx5 batch (fail-tolerant) |
+| `ibverbs-utils` | not installed | install_rdma.sh core (new) |
+| `infiniband-diags` | not installed | install_rdma.sh core (new) |
+
+`ibverbs-utils` (ibv_devices, ibv_devinfo, ibv_rc_pingpong) and
+`infiniband-diags` (ibstat, ibportstate) were missing pre-v0.5.27.
+Diagnostic blind spot — operators couldn't `ibv_devices` to confirm
+their RDMA stack was working.
+
+### New artifacts
+
+* **`resources/dpdk/install_rdma.sh`** — 220 LOC, 4 steps:
+  1. apt-install RDMA stack (core batch + Mellanox-optional batch)
+  2. modprobe ib_uverbs / rdma_cm / ib_umad + persist to
+     `/etc/modules-load.d/netgen-rdma.conf`
+  3. systemctl enable rdma-hw.target / rdma.service (whichever ships)
+  4. verify via `ibv_devices` + count detected RDMA HCAs
+* **`POST /api/admin/install_rdma`** — mirrors the install_dpdk
+  endpoint pattern (background Popen, distinct
+  `_ADMIN_INSTALL_RDMA_STATE`, defense-in-depth HOME setdefault per
+  v0.5.21 lesson)
+* **`GET /api/admin/install_rdma/log`** — simpler shape than
+  `/install_dpdk/log` (no multi-phase parsing; install_rdma is
+  short)
+* **`widgets/setup_rdma_dialog.py`** — focused 220 LOC wizard
+  (intro panel → Install button → live log view → status banner).
+  No IOMMU reboot prompt, no NIC bind step — RDMA doesn't need
+  either.
+* **Tools → RDMA → Setup RDMA…** — pinned at the top of the RDMA
+  submenu, before "Blast a RDMA Flow..." (mirrors Setup DPDK as
+  the entry-point of the DPDK submenu)
+
+### install_dpdk.sh slim-down
+
+The Mellanox NIC sanity check is the only new addition. If
+`lspci | grep mellanox` finds Mellanox hardware AND
+`ldconfig -p | grep libibverbs` returns nothing, install_dpdk.sh
+logs a warning pointing operators at Setup RDMA / install_rdma.sh.
+Otherwise it stays out of their way — Intel/Broadcom hosts don't
+see any RDMA references at all.
+
+### Tests
+
+17 new in `tests/test_v0527_rdma_install_split.py`:
+* install_rdma.sh exists + wheel package-data still globs `*.sh`
+* Core RDMA stack pkgs present (libibverbs-dev, rdma-core,
+  perftest, ibverbs-utils, infiniband-diags)
+* Mellanox `libmlx5-dev` kept in separate fail-tolerant batch
+* Kernel modules (ib_uverbs / rdma_cm / ib_umad) loaded +
+  persisted via /etc/modules-load.d/
+* End-of-script `ibv_devices` verify
+* Strict-mode (`set -euo pipefail`) + HOME-unbound defense
+* install_dpdk.sh no longer references libibverbs-dev /
+  rdma-core / perftest / libmlx5-dev / mlx5_install_cmd
+* install_dpdk.sh warns when Mellanox NIC detected without
+  libibverbs, pointing operators at Setup RDMA
+* `/api/admin/install_rdma` + `/log` endpoints exist
+* `_ADMIN_INSTALL_RDMA_STATE` distinct from
+  `_ADMIN_INSTALL_STATE` (no clobbering)
+* `HOME` env set in install_rdma Popen
+* `SetupRdmaDialog` exists + drives the install_rdma endpoints
+* Menu item "Setup RDMA…" wired in main.py + appears BEFORE
+  "Blast a RDMA Flow..." in the submenu
+* `show_setup_rdma_dialog` handler in rdma_menu_actions.py +
+  instantiates SetupRdmaDialog
+
+4 pre-existing tests updated to reflect the v0.5.27 split:
+* `test_v0525_install_dpdk_pyelftools::test_pyelftools_in_core_batch_not_mlx5_batch` — now confirms mlx5_install_cmd is GONE
+* `test_v0525_install_dpdk_pyelftools::test_apt_install_preserves_core_dpdk_deps` — required list trimmed to DPDK-only
+* `test_v0526_install_dpdk_full_deps::DRIVER_AND_LIB` — trimmed
+* `test_v0526_install_dpdk_full_deps::test_optional_deps_in_core_batch_not_mlx5` — now confirms mlx5_install_cmd is GONE
+* `test_rdma_install_split::*` — re-purposed from "split into 2 batches in install_dpdk.sh" to "split into separate install_rdma.sh"
+
+### Operator workflow recap
+
+| Goal | Steps |
+|---|---|
+| DPDK only (Intel/Broadcom NICs) | Tools → DPDK → Setup DPDK |
+| RDMA tests only (no DPDK) | Tools → RDMA → Setup RDMA |
+| DPDK on Mellanox NICs | Tools → RDMA → Setup RDMA (FIRST), then Tools → DPDK → Setup DPDK |
+| Both, sequentially | Setup RDMA → Setup DPDK (any order works; Mellanox PMD only links if libibverbs is present at DPDK build time) |
+
 ## [0.5.26] - 2026-06-07
 
 **Comprehensive DPDK 23.11 dep audit — install_dpdk.sh now apt-
