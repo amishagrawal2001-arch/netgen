@@ -2,6 +2,105 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.29] - 2026-06-08
+
+**install_dpdk.sh always runs `apt install` — early-return on stale
+7-package check removed.** Same `missing python module: elftools`
+recurred on srv06 in v0.5.28 because the script SKIPPED the apt
+step when its stale check passed — `python3-pyelftools` (v0.5.25
+add) + 8 v0.5.26 optional packages never installed on hosts that
+had run Setup DPDK in v0.5.13 or earlier.
+
+Full suite: **1,698 passed, 1 skipped** (+7 new tests).
+
+### Operator-reported failure (srv06, post v0.5.28 wheel upgrade)
+
+```
+Step 5: Building DPDK
+DPDK build directory exists, wiping and reconfiguring...
+buildtools/meson.build:58:8: ERROR: Problem encountered:
+    missing python module: elftools
+[x] DPDK meson setup failed
+```
+
+Same error v0.5.25 was supposed to fix. Why did it recur?
+
+### Root cause: stale check gate
+
+`step_install_dependencies()` started with:
+
+```bash
+if check_dpdk_dependencies; then
+    log_success "All DPDK dependencies are already installed"
+    return 0
+fi
+```
+
+`check_dpdk_dependencies` verified **only 7 packages** —
+`meson`, `ninja`, `pkg-config`, `gcc`, `libnuma-dev`, `libelf-dev`,
+`libpcap-dev`. The actual apt batch installs **16+ packages**
+including v0.5.25's `python3-pyelftools` and v0.5.26's 8
+optionals.
+
+An operator who'd run Make DPDK Ready in v0.5.13 (when only the
+7 packages mattered) had the check PASS on every subsequent
+v0.5.28 retry → apt-install SKIPPED → python3-pyelftools never
+installed → Step 5 meson errored.
+
+The check function was lying — saying "all installed" while the
+actual installable set had grown.
+
+### Fix: always run `apt install`
+
+Dropped the early-return. `step_install_dependencies` now always
+calls `eval "$deps_install_cmd"`, regardless of check result.
+`apt-get install` is idempotent for already-installed packages
+(logs "X is already the newest version" and moves on) — costs
+~5-10s on subsequent runs. Operator-trust invariant: **Make
+DPDK Ready installs every dep the script knows about, every
+time.**
+
+`check_dpdk_dependencies` stays — its diagnostic logging is
+useful — but no longer GATES apt. Augmented to also probe
+`python3 -c "import elftools"` (module-name probe, not
+distro-specific package-name probe — works across apt-installed,
+pip-installed, and non-Debian distros).
+
+### Auto-mode gate added
+
+Pre-fix, the early-return masked another bug: the `prompt_yes_no
+"Install missing dependencies?"` prompt would fire even in
+AUTO_MODE (which has no TTY) and hang the install_dpdk endpoint
+indefinitely. With the early-return gone, the prompt would fire
+unconditionally on every retry — so wrapped it in `[[
+"$AUTO_MODE" != "1" ]]` so the GUI / endpoint path runs the
+apt install silently.
+
+### Retry on srv06
+
+```
+Tools → DPDK → Setup DPDK → Make DPDK Ready
+```
+
+Script's idempotent. On the next run apt-install runs (Step 4),
+`python3-pyelftools` lands (along with libssl-dev, libjansson-dev,
+libbpf-dev, libxdp-dev, libbsd-dev, zlib1g-dev, libfdt-dev,
+libarchive-dev — anything missing from earlier runs), meson
+setup at Step 5 succeeds, build proceeds.
+
+### Tests
+
+7 new in `tests/test_v0529_install_dpdk_always_apt_install.py`:
+* Early-return on `check_dpdk_dependencies` success is GONE
+* `check_dpdk_dependencies` called as diagnostic only (with
+  `|| true`)
+* `prompt_yes_no` gated on `AUTO_MODE != 1` (no TTY hang)
+* `deps_install_cmd` invoked unconditionally
+* `check_dpdk_dependencies` probes `python3 -c "import elftools"`
+* Probe uses the importable MODULE name, not the distro-specific
+  package name (portable across apt / pip / non-Debian)
+* Version pinned at ≥ 0.5.29
+
 ## [0.5.28] - 2026-06-07
 
 **Comprehensive RDMA dep coverage in `install_rdma.sh`.** Operator

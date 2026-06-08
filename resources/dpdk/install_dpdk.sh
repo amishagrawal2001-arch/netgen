@@ -412,34 +412,70 @@ check_dpdk_dependencies() {
             missing=1
         fi
     done
-    
+
+    # v0.5.29: also probe the Python elftools module that DPDK 23.11
+    # meson hard-requires at buildtools/meson.build:58. Diagnostic
+    # only — the apt install runs unconditionally now, so the result
+    # doesn't gate anything, but the log line tells the operator
+    # whether the package is actually present.
+    if python3 -c "import elftools" 2>/dev/null; then
+        log_success "python3-pyelftools found (elftools module importable)"
+    else
+        log_warning "python3-pyelftools not found (elftools module missing)"
+        missing=1
+    fi
+
     return $missing
 }
 
 # Step 4: Install dependencies
 step_install_dependencies() {
     log_step "Step 4: Installing Build Dependencies"
-    
-    # Check if dependencies are already installed
-    if check_dpdk_dependencies; then
-        log_success "All DPDK dependencies are already installed"
-        return 0
-    fi
-    
-    log_info "Some DPDK dependencies are missing"
-    log_info "This will install: build-essential, meson, ninja-build, pkg-config, libnuma-dev, libelf-dev, libpcap-dev"
-    
-    if [[ $(prompt_yes_no "Install missing dependencies?") != "y" ]]; then
-        log_warning "Skipping dependency installation"
-        if ! check_dpdk_dependencies; then
-            log_error "Required dependencies are missing"
-            if [[ $(prompt_yes_no "Continue anyway? (may fail later)") != "y" ]]; then
-                exit 1
+
+    # v0.5.29: ALWAYS run apt install — do NOT early-return based on
+    # check_dpdk_dependencies. The check function only verifies 7
+    # packages (meson, ninja, pkg-config, gcc, libnuma-dev,
+    # libelf-dev, libpcap-dev) — the actual apt batch installs
+    # 16+ packages including python3-pyelftools (v0.5.25 add),
+    # libssl-dev / libjansson-dev / libbpf-dev / libxdp-dev /
+    # libbsd-dev / zlib1g-dev / libfdt-dev / libarchive-dev
+    # (v0.5.26 adds). Pre-fix, an operator who'd run Setup DPDK
+    # in v0.5.13 or earlier (which only installed the 7 checked
+    # packages) would have the check PASS post-upgrade-to-v0.5.28
+    # — apt-install would be SKIPPED — and the meson setup at
+    # Step 5 would fail with "missing python module: elftools"
+    # because python3-pyelftools never got installed.
+    #
+    # Real failure on srv06 (Jun 8 2026): Make DPDK Ready in
+    # v0.5.28 → Step 5 elftools error → infinite loop unless
+    # operator manually apt-installs.
+    #
+    # The fix: drop the early-return. apt-get install is idempotent
+    # for already-installed packages (it logs "X is already the
+    # newest version" and moves on), costs ~5-10s on subsequent
+    # runs. That's a tiny price for the operator-trust invariant:
+    # "Make DPDK Ready installs every dep the script knows about,
+    # every time, regardless of host state."
+    #
+    # check_dpdk_dependencies stays — its diagnostic logging is
+    # useful — but it no longer GATES the apt install.
+    check_dpdk_dependencies || true
+
+    log_info "Installing/refreshing all DPDK build dependencies (idempotent)..."
+
+    if [[ "$AUTO_MODE" != "1" ]]; then
+        if [[ $(prompt_yes_no "Run apt install for DPDK build dependencies?") != "y" ]]; then
+            log_warning "Skipping dependency installation"
+            if ! check_dpdk_dependencies; then
+                log_error "Required dependencies are missing"
+                if [[ $(prompt_yes_no "Continue anyway? (may fail later)") != "y" ]]; then
+                    exit 1
+                fi
             fi
+            return 0
         fi
-        return 0
     fi
-    
+
     log_info "Running dependency installation..."
     
     # Install dependencies directly
