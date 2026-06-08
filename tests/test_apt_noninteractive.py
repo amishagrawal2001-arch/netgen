@@ -174,16 +174,33 @@ def test_install_dpdk_sh_has_dpkg_force_flags():
 
 def test_install_dpdk_sh_no_bare_apt_get_install_y():
     """Same as the Python check but for the bash script: no bare
-    ``apt-get install -y`` without the dpkg force flags."""
+    ``apt-get install -y`` without the dpkg force flags.
+
+    v0.5.30 update: an `apt-get install -y` inside a quoted string
+    that's the argument to log_error / log_warning / log_info /
+    log_success / echo / printf isn't an EXECUTED command — it's
+    recovery text shown to the operator. v0.5.30 added a literal
+    `apt-get install -y python3-pyelftools` to its hard-gate error
+    message so operators can paste it; that shouldn't trip this test.
+    """
     src = open(_DPDK_SH_PATH).read()
-    # Look for `apt-get install -y` lines without `Dpkg::Options`
-    # before the next major delimiter (typically end of line in bash).
     for line in src.split("\n"):
-        if "apt-get install -y" in line and "#" not in line.split("apt-get install -y")[0]:
-            assert "Dpkg::Options::=" in line, (
-                f"install_dpdk.sh has apt-get install -y without "
-                f"Dpkg::Options flags: {line.strip()}"
-            )
+        if "apt-get install -y" not in line:
+            continue
+        before = line.split("apt-get install -y")[0]
+        if "#" in before:
+            continue
+        # Skip recovery-instruction text inside log/echo arguments.
+        stripped = line.lstrip()
+        if re.match(
+            r'^(log_(error|warning|info|success|step)|echo|printf)\b',
+            stripped,
+        ):
+            continue
+        assert "Dpkg::Options::=" in line, (
+            f"install_dpdk.sh has apt-get install -y without "
+            f"Dpkg::Options flags: {line.strip()}"
+        )
 
 
 def test_specific_callsites_converted_to_helper():
