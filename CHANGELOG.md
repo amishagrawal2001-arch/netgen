@@ -2,6 +2,125 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.23] - 2026-06-07
+
+**Wheel-upgrade survives the cgroup-kill death spiral.** Operator
+reported on srv06: pip uninstalled `ostg-trafficgen-0.5.13`, then
+"Connection reset by peer" and `pip exited rc=None; aborting`.
+Wheel never installed; site-packages half-uninstalled; recovery
+required SSH.
+
+Full suite: **1,642 passed, 1 skipped** (+18 new tests).
+
+### What happened
+
+Pip ran as a child of netgen-server's flask process, inside
+`netgen-server.service`'s cgroup. Pip uninstalled the
+ostg-trafficgen package cleanly. Some other flask worker (stats
+poll, healthcheck, anything) tripped an ImportError on the now-
+deleted code; flask crashed; systemd reaped the cgroup;
+**systemd killed pip too**, because cgroup-kill cascades to
+every PID in the cgroup regardless of process-group or session.
+
+The bug isn't pip. The bug isn't flask either. The bug is the
+shape — pip ran in the same cgroup as the service it was
+upgrading. `setsid` / `nohup` / `start_new_session=True` don't
+help: process group ≠ cgroup. systemd kills by cgroup.
+
+### Fix
+
+Wrap the pip spawn in a `systemd-run` transient unit:
+
+```python
+systemd_unit = f"netgen-upgrade-runner-{int(time.time())}.service"
+cmd = [
+    "systemd-run", "--no-block", "--collect",
+    f"--unit={systemd_unit}",
+    "--setenv=HOME=/root",
+    f"--property=StandardOutput=append:{log_path}",
+    f"--property=StandardError=append:{log_path}",
+    "--",
+] + cmd  # the original pip / netgen-upgrade invocation
+```
+
+Pip now lives in `netgen-upgrade-runner-*.service` (its own
+cgroup). Whatever happens to `netgen-server.service` no longer
+affects pip. The netgen-upgrade script itself triggers the
+post-install `systemctl restart netgen-server` — that cleanly
+cycles the server while the detached cgroup keeps pip alive.
+
+### Status tracking switch — `proc.poll()` → `systemctl`
+
+With `--no-block`, systemd-run's dispatcher exits in milliseconds
+(rc=0 = "unit queued"). The local Popen handle no longer reflects
+pip's actual lifecycle. The log endpoint now checks `systemctl
+is-active <unit>` + `systemctl show <unit>
+--property=ExecMainStatus` when `systemd_unit` is set, falling
+back to `proc.poll()` for the legacy code path (non-systemd
+hosts, non-root, Docker).
+
+The server-side "schedule restart on pip success" trigger is
+**skipped** when `systemd_unit` is set — the detached
+netgen-upgrade script handles its own restart; a double-restart
+would race with the in-flight script.
+
+### State persistence — `/var/lib/netgen-server/upgrade-state.json`
+
+The restart triggered by netgen-upgrade kills the in-memory
+`_ADMIN_UPGRADE_STATE` (it lived in the now-dead server process).
+The post-restart server starts with empty state, so the next
+`/api/admin/upgrade_wheel/log` poll would return `running: false,
+log_path: null, return_code: null` — and the client logs `pip
+exited rc=None; aborting` on a SUCCESSFUL upgrade.
+
+`_admin_upgrade_persist()` writes a snapshot (minus the
+non-pickleable Popen object) atomically (`tmp + os.replace`) on
+every transition. `_admin_upgrade_load()` runs at module import
+so the post-restart server picks up where the dead one left off.
+Both exception-swallowing — a corrupt state file must NOT brick
+server startup.
+
+### Recovery path for operators still on v0.5.22 with the bug
+
+```bash
+ssh root@<server> 'bash -s' <<'EOF'
+set -e
+WHEEL=$(ls -t /tmp/netgen_upgrade/*.whl | head -1)
+/opt/netgen-server/netgen-venv/bin/pip install \
+    --force-reinstall --no-cache-dir "$WHEEL"
+systemctl restart netgen-server
+EOF
+```
+
+Once recovered, v0.5.23+ wheel upgrades won't repeat the failure.
+
+### Tests
+
+18 new in `tests/test_v0523_upgrade_detached_cgroup.py` pin:
+detection cached + euid-gated; systemd-run wrap with --no-block
++ --collect + unit pattern; StandardOutput/Error redirect to log
+file; HOME set; +detached mode tag; systemd_unit in state +
+response; log endpoint branches on systemd_unit; `_systemd_unit_state`
+helper uses is-active + ExecMainStatus; server-side restart
+gated on `not systemd_unit`; restart_scheduled flipped True in
+detached mode; state file at /var/lib/netgen-server/; atomic
+write; snapshot excludes Popen; load called at module scope;
+loader tolerates missing/corrupt file; legacy proc.poll() path
+preserved.
+
+### Notes
+
+* **Why not change KillMode on the systemd unit?** Would require
+  reinstalling the unit on every upgrade — fragile state machine
+  on a hot path. systemd-run is stateless from netgen-server's
+  perspective.
+* **Why not setsid + double-fork?** Process group ≠ cgroup.
+  systemd kills by cgroup. We tested this in v0.4.x — didn't help.
+* **systemd-run absent / non-root**: helper returns None,
+  endpoint falls back to legacy path. Bug recurs on those hosts,
+  but they're a minority and the legacy path is what shipped
+  pre-v0.5.23.
+
 ## [0.5.22] - 2026-06-07
 
 **CI optimization: tarball workflow no longer auto-triggers on
