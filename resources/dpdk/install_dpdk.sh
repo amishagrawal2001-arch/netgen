@@ -601,7 +601,56 @@ step_install_dependencies() {
             fi
         fi
     fi
-    
+
+    # v0.5.30: HARD GATE on python3-pyelftools.
+    #
+    # srv06 trap (Jun 8 2026): even with v0.5.29's always-run apt
+    # install, the `if ... else ...` block above falls into a
+    # "Continue anyway?" prompt on apt failure. In AUTO_MODE that
+    # prompt returns "y" automatically → script continues → Step 5
+    # meson dies with the famous "missing python module: elftools"
+    # and the operator has no signal that apt is the actual cause.
+    #
+    # Hard gate the elftools probe AFTER apt runs:
+    #   - If the module is importable → proceed (apt did its job)
+    #   - If still missing → exit 1 with a precise diagnostic that
+    #     points at /tmp/dpdk_deps_install.log (PRESERVED, not rm'd)
+    #     so the operator can see what apt actually did.
+    #
+    # This converts the failure mode from "silent continuation
+    # → confusing meson error 100 lines later" to "loud,
+    # actionable error in Step 4 with the apt log right there."
+    if ! python3 -c "import elftools" 2>/dev/null; then
+        log_error ""
+        log_error "════════════════════════════════════════════════════════════"
+        log_error "  CRITICAL: python3-pyelftools is NOT installed."
+        log_error "  DPDK 23.11 meson setup hard-requires the `elftools`"
+        log_error "  Python module. Step 5 will fail with:"
+        log_error "    buildtools/meson.build:58:8: missing python module: elftools"
+        log_error ""
+        log_error "  Most likely cause: apt-install failed for pyelftools."
+        log_error "  See the apt install log at:"
+        log_error "    /tmp/dpdk_deps_install.log"
+        log_error ""
+        log_error "  Manual recovery:"
+        log_error "    apt-get update && apt-get install -y python3-pyelftools"
+        log_error ""
+        log_error "  Then re-run Make DPDK Ready."
+        log_error "════════════════════════════════════════════════════════════"
+        log_error ""
+        # Print the last 30 lines of the apt log inline so the GUI
+        # log tail (also last 30 lines) surfaces them automatically.
+        if [[ -r /tmp/dpdk_deps_install.log ]]; then
+            log_error "Last 30 lines of apt install log:"
+            tail -30 /tmp/dpdk_deps_install.log | while IFS= read -r line; do
+                log_error "  | $line"
+            done
+        fi
+        # Preserve the log — do NOT rm it.
+        exit 1
+    fi
+    log_success "python3-pyelftools verified (elftools module importable)"
+
     rm -f /tmp/dpdk_deps_install.log
 
     # v0.5.27: libmlx5-dev (Mellanox PMD dev headers) and the full

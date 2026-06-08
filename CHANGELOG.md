@@ -2,6 +2,122 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.30] - 2026-06-08
+
+**Hard gate on `python3-pyelftools` after Step 4 apt install.**
+Even with v0.5.29's always-run apt-install, the script's
+"Continue anyway?" prompt on apt-failure silently swallowed
+failures in AUTO_MODE → Step 5 meson still died with the same
+"missing python module: elftools" error. Operator saw the
+meson error but had no diagnostic for what apt actually did.
+
+v0.5.30 closes the loop: post-apt probe with `python3 -c "import
+elftools"`. If still missing, **exit Step 4 with a precise
+error + last 30 lines of the apt install log inlined into the
+install_dpdk log**. The GUI's "last 30 log lines" view now
+surfaces the apt failure directly instead of the downstream
+meson stack-trace.
+
+Full suite: **1,705 passed, 1 skipped** (+7 new tests).
+
+### What was broken in v0.5.29
+
+```bash
+# Pre-v0.5.30 Step 4 tail:
+if (umask 077 && eval "$deps_install_cmd" | tee /tmp/dpdk_deps_install.log); then
+    log_success "Dependencies installed successfully"
+else
+    ...
+    log_error "Dependency installation failed"
+    if [[ $(prompt_yes_no "Continue anyway?") != "y" ]]; then
+        exit 1
+    fi
+fi
+rm -f /tmp/dpdk_deps_install.log   # destroys the evidence
+```
+
+In AUTO_MODE (GUI / install_dpdk endpoint), `prompt_yes_no`
+returns "y" automatically. So an apt failure → `log_error`
+→ silent continuation → Step 5 → meson error. The apt log
+gets `rm -f`'d before the operator can see what failed.
+
+### v0.5.30 hard gate
+
+```bash
+if ! python3 -c "import elftools" 2>/dev/null; then
+    log_error "════════════════════════════════════════════════════════════"
+    log_error "  CRITICAL: python3-pyelftools is NOT installed."
+    log_error "  DPDK 23.11 meson setup hard-requires the elftools module."
+    log_error "  See /tmp/dpdk_deps_install.log for the apt install log."
+    log_error "  Manual recovery:"
+    log_error "    apt-get update && apt-get install -y python3-pyelftools"
+    log_error "════════════════════════════════════════════════════════════"
+    if [[ -r /tmp/dpdk_deps_install.log ]]; then
+        log_error "Last 30 lines of apt install log:"
+        tail -30 /tmp/dpdk_deps_install.log | while IFS= read -r line; do
+            log_error "  | $line"
+        done
+    fi
+    exit 1   # /tmp/dpdk_deps_install.log preserved for debugging
+fi
+log_success "python3-pyelftools verified (elftools module importable)"
+```
+
+### Failure-mode transition
+
+| Stage | Before v0.5.30 | After v0.5.30 |
+|---|---|---|
+| apt install fails on pyelftools | `log_error "Dependency installation failed"` → continue | Same |
+| Step 4 ends | proceeds to Step 5 with broken state | **HARD GATE: exit 1 with diagnostic** |
+| Step 5 meson | dies with `missing python module: elftools` | doesn't run |
+| Operator sees | confusing meson error 100+ lines later | **Step 4 elftools error + apt log tail right there** |
+| Apt install log | `rm -f`'d before operator can read | **preserved** at `/tmp/dpdk_deps_install.log` |
+| GUI "last 30 log lines" | meson stack-trace (unactionable) | **apt failure + recovery command** (actionable) |
+
+### Manual recovery (operator paste-able)
+
+The error message includes the literal apt-install command so an
+operator hit by this can:
+
+```bash
+ssh root@<server> 'apt-get update && apt-get install -y python3-pyelftools'
+```
+
+Then retry Make DPDK Ready. The script is idempotent — picks up
+at Step 4, sees pyelftools present, log_success "verified",
+proceeds to Step 5.
+
+### Diagnostic commands for current srv06 state
+
+```bash
+ssh root@san-hp-srv06 'bash -s' <<'EOF'
+echo "Is install_dpdk.sh v0.5.30?"
+grep -c "v0.5.30\|HARD GATE" /opt/netgen/resources/dpdk/install_dpdk.sh
+
+echo "Is pyelftools installed?"
+dpkg -l python3-pyelftools | tail -3
+python3 -c "import elftools; print(elftools.__file__)" 2>&1
+
+echo "Was apt-get install attempted in last run?"
+tail -80 /tmp/netgen_install_dpdk_*.log | grep -E "Updating|Installing|elftools|deps_install"
+EOF
+```
+
+### Tests
+
+7 new in `tests/test_v0530_install_dpdk_hard_gate_pyelftools.py`:
+* Post-apt `python3 -c "import elftools"` probe exists
+* Probe is in negated condition (`if !`) so failure path triggers
+* Probe followed by `exit 1` (not silent continuation)
+* Hard-gate failure branch does NOT `rm -f` the apt install log
+* Hard-gate failure branch `tail`s the apt log + inlines lines
+  through the script's own log channel (so GUI's last-30-lines
+  view surfaces them)
+* Failure message includes literal manual recovery command
+  (`apt-get install -y python3-pyelftools`)
+* Success path emits `log_success` with elftools / pyelftools in
+  the message (positive confirmation in the log)
+
 ## [0.5.29] - 2026-06-08
 
 **install_dpdk.sh always runs `apt install` — early-return on stale
