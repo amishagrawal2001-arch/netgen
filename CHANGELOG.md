@@ -2,6 +2,128 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.33] - 2026-06-08
+
+**install_dpdk + install_rdma endpoints escape the netgen-server
+cgroup via `systemd-run --wait --pipe --collect`.** v0.5.31's
+`APT::Sandbox::User=root` only fixed apt's internal privilege
+drop — the netgen-server.service systemd unit's OWN sandbox
+(`ProtectSystem=` / `ReadWritePaths=` / `RestrictNamespaces=` /
+similar) was still blocking root from writing to
+`/var/cache/apt/archives/partial`. Apt was hitting EPERM at the
+cgroup level, not the apt-options level.
+
+Full suite: **1,726 passed, 1 skipped** (+10 new tests).
+
+### The bug v0.5.31 missed
+
+v0.5.30's hard gate (post-apt elftools probe) did its job and
+v0.5.31's apt sandbox option got rid of the `setgroups EPERM`.
+But the operator's next attempt produced a different EPERM:
+
+```
+W: chmod 0700 of directory /var/cache/apt/archives/partial
+   failed - SetupAPTPartialDirectory (1: Operation not permitted)
+E: Failed to fetch http://archive.ubuntu.com/.../python3-pyelftools_0.30-1_all.deb
+   Could not open file .../partial/python3-pyelftools_0.30-1_all.deb
+   - open (13: Permission denied)
+```
+
+`chmod 0700` failing as **root** means it's a cgroup-level deny,
+not a Unix-perm deny. The netgen-server.service systemd unit has
+some combination of:
+
+* `ProtectSystem=strict` (or `=full`) — makes /var read-only
+* `ReadWritePaths=` not including /var/cache/apt
+* `RestrictNamespaces=true` — blocks the namespace ops apt's
+  fetcher does
+* `PrivateMounts=true` — apt's bind-mounts on its cache dir fail
+
+Apt's own options can't fix this — the kernel won't let the
+process touch the file regardless of which user it claims to be.
+
+### Fix: escape the cgroup
+
+Same pattern as v0.5.23's wheel-upgrade fix: wrap the script
+spawn in `systemd-run` so it runs in a fresh transient unit with
+**vanilla defaults** (no inherited sandbox).
+
+```python
+cmd = ["bash", script, "--auto"]
+if systemd_run:
+    cmd = [
+        systemd_run,
+        "--wait",                            # block until unit exits
+        "--pipe",                            # forward stdout/stderr
+        "--collect",                         # auto-cleanup unit on exit
+        f"--unit=netgen-install-dpdk-runner-{ts}.service",
+        "--setenv=HOME=/root",
+        "--setenv=AUTO_MODE=1",
+        "--setenv=TERM=xterm",
+        "--setenv=DEBIAN_FRONTEND=noninteractive",
+        "--setenv=DEBIAN_PRIORITY=critical",
+        "--",
+    ] + cmd
+```
+
+The transient unit:
+* Inherits **no sandbox** from netgen-server.service (systemd
+  starts each transient unit with defaults)
+* Has full root access to `/var/cache/apt/` (which is the whole
+  point)
+* Auto-cleans up on exit (`--collect`) so `systemctl
+  list-units` stays tidy
+* Auto-blocks netgen-server until install completes (`--wait`)
+  so `proc.poll()` tracking, log polling, and the v0.5.30
+  hard-gate post-mortem all work unchanged
+
+### Difference vs v0.5.23 (upgrade_wheel)
+
+| | v0.5.23 (upgrade_wheel) | v0.5.33 (install_dpdk + install_rdma) |
+|---|---|---|
+| Reason for systemd-run | Server restarts mid-install; need pip to survive cgroup-kill | Apt needs to escape sandbox to write /var/cache/apt |
+| systemd-run flags | `--no-block --collect` | `--wait --pipe --collect` |
+| Tracking | systemctl is-active + ExecMainStatus | proc.poll() (works unchanged with --wait) |
+| State persistence | yes (state file across restart) | no (server doesn't restart) |
+
+### Fallback
+
+When `_systemd_run_available()` returns None (non-systemd hosts,
+non-root, Docker), endpoints fall back to the bare Popen — same
+as v0.5.32. The sandbox bug doesn't apply on those hosts.
+
+### Tests
+
+10 new in `tests/test_v0533_install_endpoints_systemd_run_cgroup_escape.py`:
+* api_admin_install_dpdk wraps in `_systemd_run_available()` path
+* Wrap uses `--wait` + `--pipe` + `--collect` (all three)
+* Unit name is per-invocation timestamped f-string
+* All 5 env vars passed via `--setenv` (HOME, AUTO_MODE, TERM,
+  DEBIAN_FRONTEND, DEBIAN_PRIORITY)
+* Non-systemd hosts fall back to bare `["bash", script, "--auto"]`
+* api_admin_install_rdma uses the same systemd-run wrap
+* RDMA install uses `--wait` + `--pipe` + `--collect` too
+* RDMA unit name distinct from DPDK (eases `systemctl list-units`
+  / journalctl grep)
+* Endpoint has rationale comment referencing sandbox + v0.5.33
+
+### Retry on srv06 (after wheel upgrade to v0.5.33)
+
+```
+Tools → DPDK → Setup DPDK → Make DPDK Ready
+```
+
+This time apt will actually be able to download. Step 4 succeeds.
+The v0.5.30 hard gate's post-apt probe confirms pyelftools
+imports. Step 5 meson setup proceeds. Build runs for 10-30 min
+through compile / tx_worker / hugepages / VFIO.
+
+For RDMA, same flow: `Tools → RDMA → Setup RDMA…`. The full
+v0.5.28 dep set (libibverbs-dev, librdmacm-dev, libibmad-dev,
+libibumad-dev, libibnetdisc-dev, rdma-core, perftest,
+rdmacm-utils, ibverbs-utils, infiniband-diags, python3-pyverbs,
+opensm, mstflint, libmlx5-dev, libmlx4-dev) installs cleanly.
+
 ## [0.5.32] - 2026-06-08
 
 **Make DPDK Ready dialog log viewer is now scrollable + selectable.**

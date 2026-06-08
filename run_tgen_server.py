@@ -14832,8 +14832,53 @@ def api_admin_install_dpdk():
         # Worse, the host's sudoers has `use_pty`, which fails when there's
         # no TTY (we're a daemon) and exits rc=1 with no output captured.
         # Drop the sudo wrapper and exec bash directly.
+        #
+        # v0.5.33: wrap in `systemd-run --wait --pipe --collect` when
+        # systemd-run is available. Spawning install_dpdk.sh as a
+        # plain Popen makes it a child of netgen-server.service —
+        # which inherits the unit's sandbox restrictions
+        # (ProtectSystem=strict / ReadWritePaths= / similar). On
+        # srv06 (v0.5.31, post-`-o APT::Sandbox::User=root`) apt
+        # STILL failed with:
+        #   W: chmod 0700 of directory /var/cache/apt/archives/partial
+        #      failed - SetupAPTPartialDirectory (1: Operation not permitted)
+        #   E: Failed to fetch ... Could not open file ...
+        #      open (13: Permission denied)
+        # — meaning even root inside netgen-server's cgroup can't
+        # write to /var/cache/apt/. The fix is to ESCAPE the
+        # cgroup entirely, not to give apt more options.
+        #
+        # systemd-run spawns the script in a fresh transient unit
+        # with vanilla defaults (no inherited sandbox). With --wait
+        # --pipe, systemd-run blocks until the unit exits and
+        # forwards its stdout/stderr to ours — proc.poll() tracking
+        # works unchanged. With --collect the unit auto-cleans up on
+        # exit so we don't accumulate stale unit files.
+        #
+        # Same pattern as v0.5.23's upgrade_wheel fix, but here we
+        # use --wait (server stays alive during install, no need
+        # for detached state tracking).
+        cmd = ["bash", script, "--auto"]
+        systemd_run = _systemd_run_available()
+        if systemd_run:
+            import time as _t
+            unit_name = f"netgen-install-dpdk-runner-{int(_t.time())}.service"
+            cmd = [
+                systemd_run,
+                "--wait",
+                "--pipe",
+                "--collect",
+                f"--unit={unit_name}",
+                "--description=netgen install_dpdk.sh (cgroup-escape)",
+                "--setenv=HOME=/root",
+                "--setenv=AUTO_MODE=1",
+                "--setenv=TERM=xterm",
+                "--setenv=DEBIAN_FRONTEND=noninteractive",
+                "--setenv=DEBIAN_PRIORITY=critical",
+                "--",
+            ] + cmd
         new_proc = subprocess.Popen(
-            ["bash", script, "--auto"],
+            cmd,
             stdout=log_fh, stderr=subprocess.STDOUT,
             env=env, start_new_session=True,
         )
@@ -15335,8 +15380,32 @@ def api_admin_install_rdma():
         # + `set -u` in the script. Defense-in-depth even though
         # install_rdma.sh already does `: "${HOME:=/root}"`.
         env.setdefault("HOME", "/root")
+        # v0.5.33: same cgroup-escape as api_admin_install_dpdk.
+        # netgen-server.service's sandbox blocks apt from writing
+        # to /var/cache/apt/archives/partial even as root. Wrap in
+        # systemd-run --wait --pipe --collect so install_rdma.sh
+        # runs in a fresh transient unit with vanilla defaults.
+        cmd = ["bash", script, "--auto"]
+        systemd_run = _systemd_run_available()
+        if systemd_run:
+            import time as _t
+            unit_name = f"netgen-install-rdma-runner-{int(_t.time())}.service"
+            cmd = [
+                systemd_run,
+                "--wait",
+                "--pipe",
+                "--collect",
+                f"--unit={unit_name}",
+                "--description=netgen install_rdma.sh (cgroup-escape)",
+                "--setenv=HOME=/root",
+                "--setenv=AUTO_MODE=1",
+                "--setenv=TERM=xterm",
+                "--setenv=DEBIAN_FRONTEND=noninteractive",
+                "--setenv=DEBIAN_PRIORITY=critical",
+                "--",
+            ] + cmd
         new_proc = subprocess.Popen(
-            ["bash", script, "--auto"],
+            cmd,
             stdout=log_fh, stderr=subprocess.STDOUT,
             env=env, start_new_session=True,
         )
