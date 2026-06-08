@@ -61,7 +61,7 @@ from PyQt5.QtWidgets import (
     QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
     QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QRadioButton,
-    QSpinBox, QTabWidget, QVBoxLayout, QWidget,
+    QSizePolicy, QSpinBox, QTabWidget, QVBoxLayout, QWidget,
 )
 
 
@@ -1181,7 +1181,13 @@ class InstallServerDialog(QDialog):
     ):
         super().__init__(parent)
         self.setWindowTitle("Install / Upgrade Server")
-        self.setMinimumSize(820, 600)
+        # v0.5.40: bumped from 820x600 → 900x780 so the log_view
+        # below has visible room out of the box. Operator request:
+        # "increase the log text area vertical size, inside install/
+        # upgrade server dialog". Form fields above (auth + wheel
+        # picker + buttons) consume ~340px; the remaining ~440px
+        # comfortably shows ~36 lines at 11px monospace.
+        self.setMinimumSize(900, 780)
 
         self._worker: Optional[QThread] = None
         # Ring buffer of recent ERROR-tagged lines from the log stream.
@@ -1240,10 +1246,22 @@ class InstallServerDialog(QDialog):
         self.log_view = QPlainTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setMaximumBlockCount(5000)
+        # v0.5.40: setMinimumHeight floor + Expanding policy so the
+        # log area doesn't collapse to ~80px when the dialog is at
+        # its minimum size. ~25 lines at 11px monospace + line
+        # spacing fits in 280px. The widget still expands beyond
+        # that as the operator resizes the dialog (log_layout adds
+        # it with stretch=1 via layout.addWidget(log_box, 1) below).
+        self.log_view.setMinimumHeight(280)
+        self.log_view.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Expanding,
+        )
         self.log_view.setStyleSheet(
             "QPlainTextEdit{font-family: ui-monospace, Menlo, Consolas, monospace; font-size:11px;}"
         )
-        log_layout.addWidget(self.log_view)
+        # Stretch=1 in the inner layout so log_view gets every
+        # extra pixel inside log_box (not the status_lbl below).
+        log_layout.addWidget(self.log_view, 1)
         self.status_lbl = QLabel("Ready.")
         self.status_lbl.setStyleSheet("color:#475569; font-size:11px;")
         log_layout.addWidget(self.status_lbl)

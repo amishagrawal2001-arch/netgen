@@ -2,6 +2,41 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.40] - 2026-06-08
+
+**Install/Upgrade Server dialog log_view is taller by default.**
+Operator request: "increase the log text area vertical size,
+inside install/upgrade server dialog."
+
+Full suite: **1,789 passed, 1 skipped** (+6 new tests).
+
+### Sizing changes
+
+| Knob | Before | After |
+|---|---|---|
+| Dialog `setMinimumSize` | 820×600 | 900×780 |
+| `log_view.setMinimumHeight` | (none) | 280px |
+| `log_view.setSizePolicy` | (default) | Expanding × Expanding |
+| `log_layout.addWidget` stretch | 0 | 1 |
+
+### Outcome
+
+| Dialog state | Pre-v0.5.40 visible log lines | v0.5.40 |
+|---|---|---|
+| Default-opened (operator launch) | ~12-15 lines | ~36 lines |
+| Resized to minimum | ~5 lines | ~25 lines (the 280px floor) |
+| Resized to a tall window | grows but slowly (no stretch) | grows freely (stretch=1 + Expanding) |
+
+### Tests
+
+6 new in `tests/test_v0540_install_dialog_log_view_size.py`:
+* Dialog `setMinimumSize` is ≥ 900×720
+* `log_view.setMinimumHeight` is ≥ 240px
+* `log_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)`
+* `log_layout.addWidget(self.log_view, N)` has stretch ≥ 1
+* `QSizePolicy` imported (no NameError on construction)
+* Version pinned at ≥ 0.5.40
+
 ## [0.5.39] - 2026-06-08
 
 **DPDK install audit — 4 gaps closed.** Operator request after
