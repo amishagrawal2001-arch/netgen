@@ -2,6 +2,130 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.37] - 2026-06-08
+
+**DPDK runtime state survives reboots.** Operator on srv06 after
+testing the v0.5.34 Reboot Server button:
+
+```
+Diagnostics:
+  ✓ DPDK installed (libdpdk)
+  ✓ tx_worker binary
+  ✗ Hugepages configured       ← regressed
+  ✓ IOMMU enabled in kernel
+  ✓ vfio module loaded
+  ✗ vfio-pci module loaded     ← regressed
+```
+
+Both regressed because `/api/dpdk/hugepages` and
+`/api/dpdk/load_modules` made runtime-only changes — no
+persistence files written. Reboot wiped the sysfs allocations
+and the modprobe state.
+
+Full suite: **1,763 passed, 1 skipped** (+9 new tests).
+
+### Why install_dpdk.sh's persistence didn't help
+
+`install_dpdk.sh` writes
+`/etc/sysctl.d/99-netgen-hugepages.conf` itself. But the orchestrator's
+"Allocate 1024 × 2MB hugepages" and "Load vfio + vfio-pci kernel
+modules" steps **bypass install_dpdk.sh entirely** — they hit
+the REST endpoints directly, which were runtime-only.
+
+Pre-v0.5.37 paths:
+
+| Endpoint | What it did | Persistence |
+|---|---|---|
+| `/api/dpdk/hugepages` | `echo N > /sys/.../nr_hugepages` + mount /mnt/huge | **none** |
+| `/api/dpdk/load_modules` | `modprobe vfio && modprobe vfio-pci` | **none** |
+
+Both relied on the operator never rebooting after Make DPDK
+Ready ran. The v0.5.34 Reboot Server button made the regression
+trivially reproducible.
+
+### Fix
+
+Both endpoints now write canonical systemd persistence files at
+the end of their success path:
+
+**`/api/dpdk/hugepages` → `/etc/sysctl.d/99-netgen-hugepages.conf`**
+
+```
+# /etc/sysctl.d/99-netgen-hugepages.conf
+# Written by netgen-server /api/dpdk/hugepages (v0.5.37).
+vm.nr_hugepages = 1024
+```
+
+systemd-sysctl re-applies on every boot. Same path used by
+install_dpdk.sh's standalone hugepages step.
+
+**`/api/dpdk/load_modules` → `/etc/modules-load.d/netgen-dpdk.conf`**
+
+```
+# /etc/modules-load.d/netgen-dpdk.conf
+# Written by netgen-server /api/dpdk/load_modules (v0.5.37).
+vfio
+vfio-pci
+```
+
+systemd-modules-load auto-loads on boot.
+
+### Best-effort semantics
+
+Both writes are wrapped in try/except. If `/etc` isn't writable
+(read-only root, container, restrictive sandbox), the runtime
+change has ALREADY succeeded — we don't 500 on a persistence
+failure. Instead:
+
+1. Log a clear warning naming the path that wasn't written
+2. Return success with `persisted: false` in the JSON so the
+   client can warn the operator their config won't survive a
+   reboot
+
+Both responses gained a `persisted: bool` + `persist_path: str|null`
+field for client-side visibility.
+
+### Recovery for srv06 right now (no wheel upgrade needed)
+
+```bash
+ssh root@san-hp-srv06 'bash -s' <<'EOF'
+set -e
+# Hugepages persistence
+echo "vm.nr_hugepages = 1024" > /etc/sysctl.d/99-netgen-hugepages.conf
+sysctl --system >/dev/null
+
+# vfio modules persistence
+printf 'vfio\nvfio-pci\n' > /etc/modules-load.d/netgen-dpdk.conf
+modprobe vfio vfio-pci
+
+# Verify
+echo "HugePages_Total: $(grep HugePages_Total /proc/meminfo | awk '{print $2}')"
+lsmod | grep -E '^vfio|^vfio_pci'
+EOF
+```
+
+After running that, `Tools → DPDK → Diagnostics` should flip both
+to ✓. The state will now survive every future reboot — even
+WITHOUT upgrading to v0.5.37, because the files exist on disk.
+
+### Tests
+
+9 new in `tests/test_v0537_dpdk_runtime_state_persistence.py`:
+* `/api/dpdk/hugepages` writes `/etc/sysctl.d/99-netgen-hugepages.conf`
+  with `vm.nr_hugepages = N`
+* Persistence write happens AFTER the sysfs allocation (no
+  persisting a kernel rejected count)
+* Persistence write wrapped in try/except + logs warning on
+  failure (best-effort semantics)
+* Success response includes `persisted: bool` field
+* `/api/dpdk/load_modules` writes
+  `/etc/modules-load.d/netgen-dpdk.conf`
+* Persistence iterates `modules_to_load` (writes EACH module to
+  its own line)
+* Persistence write wrapped in try/except + logs warning
+* Success response includes `persisted: bool` field
+* Version pinned at ≥ 0.5.37
+
 ## [0.5.36] - 2026-06-08
 
 **Make DPDK Ready detail pane stays in sync with the action row

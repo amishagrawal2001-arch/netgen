@@ -13498,12 +13498,58 @@ def dpdk_hugepages():
             except Exception:
                 pass
 
+            # v0.5.37: persist the allocation to /etc/sysctl.d/ so
+            # systemd-sysctl reapplies it on every boot. Pre-v0.5.37
+            # `/sys/.../nr_hugepages` was written but no sysctl.d
+            # file existed → hugepages were lost on reboot →
+            # Diagnostics showed "✗ Hugepages configured" after
+            # a fresh boot even though Make DPDK Ready had just
+            # succeeded.
+            #
+            # Real failure on srv06 (Jun 8 2026): operator rebooted
+            # via the v0.5.34 button, Diagnostics flipped to
+            # ✗ Hugepages and ✗ vfio-pci.
+            #
+            # The file lives at /etc/sysctl.d/99-netgen-hugepages.conf
+            # so it loads AFTER any other sysctl-d files (the
+            # `99-` prefix). Same path used by install_dpdk.sh's
+            # standalone hugepages step.
+            persist_path = "/etc/sysctl.d/99-netgen-hugepages.conf"
+            persist_written = False
+            try:
+                with open(persist_path, "w") as pf:
+                    pf.write(
+                        "# /etc/sysctl.d/99-netgen-hugepages.conf\n"
+                        "# Written by netgen-server /api/dpdk/hugepages\n"
+                        "# (v0.5.37). Lets the kernel restore the "
+                        "DPDK hugepage\n"
+                        "# allocation on reboot via systemd-sysctl.\n"
+                        f"vm.nr_hugepages = {int(actual_allocated)}\n"
+                    )
+                persist_written = True
+                logging.info(
+                    f"[DPDK HUGEPAGES] Persisted "
+                    f"vm.nr_hugepages={actual_allocated} → "
+                    f"{persist_path}"
+                )
+            except Exception as pe:
+                # Best-effort. Runtime allocation already succeeded.
+                # Log loudly so operator can SSH-add the file by
+                # hand if needed.
+                logging.warning(
+                    f"[DPDK HUGEPAGES] Failed to persist to "
+                    f"{persist_path}: {pe}. Hugepages will be lost "
+                    f"on next reboot."
+                )
+
             return jsonify({
                 "success": True,
                 "message": f"Configured {num_pages} x {page_size} hugepages",
                 "requested": int(num_pages),
                 "actual_allocated": int(actual_allocated),
                 "page_size": page_size,
+                "persist_path": persist_path if persist_written else None,
+                "persisted": persist_written,
             }), 200
         except Exception as e:
             return jsonify({
@@ -14009,12 +14055,53 @@ def dpdk_load_modules():
                 "failed": failed_modules
             }), 500
         
+        # v0.5.37: persist module list to /etc/modules-load.d/ so
+        # systemd-modules-load reapplies on every boot. Pre-fix the
+        # `modprobe` calls above were runtime-only — operator
+        # rebooted, vfio-pci was gone, Diagnostics showed
+        # "✗ vfio-pci module loaded" again.
+        #
+        # Real failure on srv06 (Jun 8 2026): operator rebooted via
+        # the v0.5.34 button, Diagnostics flipped to ✗ Hugepages
+        # AND ✗ vfio-pci. Hugepages persistence fixed in the same
+        # release (sibling fix in /api/dpdk/hugepages).
+        #
+        # /etc/modules-load.d/netgen-dpdk.conf is the canonical
+        # location for systemd-modules-load. Lower-priority filename
+        # than 99-prefixed sysctl, but module-load doesn't have a
+        # numeric priority convention.
+        persist_path = "/etc/modules-load.d/netgen-dpdk.conf"
+        persist_written = False
+        try:
+            with open(persist_path, "w") as pf:
+                pf.write(
+                    "# /etc/modules-load.d/netgen-dpdk.conf\n"
+                    "# Written by netgen-server /api/dpdk/load_modules\n"
+                    "# (v0.5.37). systemd-modules-load auto-loads "
+                    "these on boot.\n"
+                )
+                for module in modules_to_load:
+                    pf.write(f"{module}\n")
+            persist_written = True
+            logging.info(
+                f"[DPDK LOAD MODULES] Persisted modules → "
+                f"{persist_path}"
+            )
+        except Exception as pe:
+            logging.warning(
+                f"[DPDK LOAD MODULES] Failed to persist to "
+                f"{persist_path}: {pe}. Modules will be lost on "
+                f"next reboot."
+            )
+
         return jsonify({
             "success": True,
             "message": f"Successfully loaded modules: {', '.join(loaded_modules)}",
-            "loaded": loaded_modules
+            "loaded": loaded_modules,
+            "persist_path": persist_path if persist_written else None,
+            "persisted": persist_written,
         }), 200
-        
+
     except Exception as e:
         logging.error(f"[DPDK LOAD MODULES ERROR] {e}")
         return jsonify({
