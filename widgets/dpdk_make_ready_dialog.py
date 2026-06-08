@@ -1063,6 +1063,19 @@ class MakeDpdkReadyDialog(QDialog):
 
         if picker.exec_() != QDialog.Accepted:
             row.set_state("skip", "cancelled by operator")
+            # v0.5.36: the action row updates to "cancelled by
+            # operator", but pre-fix the _detail pane below still
+            # said "Running: Bind a NIC to vfio-pci…" — operator-
+            # confusing because the dialog is no longer running
+            # anything. Update _detail to match the action-row
+            # state.
+            self._detail.setText(
+                "<b>NIC bind cancelled.</b> No NIC was bound to "
+                "vfio-pci. DPDK installation is complete but no "
+                "interface is available for high-rate TX. To bind "
+                "later, click <i>Run All Steps</i> again, or use "
+                "<b>Tools → DPDK → Advanced → Bind Interface…</b>."
+            )
             self._run_btn.setText("Run All Steps")
             self._run_btn.setEnabled(True)
             return
@@ -1070,6 +1083,11 @@ class MakeDpdkReadyDialog(QDialog):
         chosen = combo.currentData()
         if not chosen:
             row.set_state("fail", "no NIC selected")
+            self._detail.setText(
+                "<b>No NIC selected.</b> The picker returned an "
+                "empty selection. Click <i>Retry</i> to choose a "
+                "NIC from the dropdown, or <i>Cancel</i> to abort."
+            )
             self._run_btn.setText("Retry")
             self._run_btn.setEnabled(True)
             return

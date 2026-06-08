@@ -2,6 +2,79 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.36] - 2026-06-08
+
+**Make DPDK Ready detail pane stays in sync with the action row
+on NIC-bind cancel.** Operator screenshot from srv06 showed the
+action row correctly grayed `— cancelled by operator`, but the
+detail pane below still read `Running: Bind a NIC to vfio-pci…`.
+Operator-confusing — looked like the dialog was still working
+when it had stopped.
+
+Full suite: **1,754 passed, 1 skipped** (+7 new tests).
+
+### Bug
+
+`_run_action()` calls `self._detail.setText(f"Running: {action.label}…")`
+when an action starts. The NIC-bind action then opens a picker
+dialog (synchronous `picker.exec_()`). When the operator cancels
+the picker:
+
+```python
+if picker.exec_() != QDialog.Accepted:
+    row.set_state("skip", "cancelled by operator")
+    self._run_btn.setText("Run All Steps")
+    self._run_btn.setEnabled(True)
+    return                                            # ← _detail stays at "Running: …"
+```
+
+`row.set_state(...)` updates the action LIST row. But `_detail`
+(the wider status pane below the list, switched to QTextBrowser
+in v0.5.32) was never updated — operator continued to see
+`Running: Bind a NIC to vfio-pci…` even though nothing was
+running.
+
+Same bug in the empty-selection branch (`row.set_state("fail",
+"no NIC selected")`).
+
+### Fix
+
+Update `_detail.setText(...)` in both branches with state-specific
+recovery text:
+
+* **Cancel branch:**
+  > NIC bind cancelled. No NIC was bound to vfio-pci. DPDK
+  > installation is complete but no interface is available for
+  > high-rate TX. To bind later, click *Run All Steps* again, or
+  > use **Tools → DPDK → Advanced → Bind Interface…**.
+
+* **No-selection branch:**
+  > No NIC selected. The picker returned an empty selection.
+  > Click *Retry* to choose a NIC from the dropdown, or *Cancel*
+  > to abort.
+
+Both texts point at the recovery path so the operator isn't
+stranded.
+
+### Tests
+
+7 new in `tests/test_v0536_make_ready_cancel_detail_text.py`:
+* Cancel branch calls `self._detail.setText(...)`
+* Cancel text mentions cancellation (not just blank)
+* Cancel text points at recovery path (Run All Steps / Bind
+  Interface… / Advanced)
+* No-selection branch calls `self._detail.setText(...)`
+* No-selection text mentions Retry / "choose a NIC"
+* Cancel branch still calls `row.set_state("skip", ...)` (anti-
+  regression on the v0.5.36 build-on layer)
+* Version pinned at ≥ 0.5.36
+
+Test-helper note: the no-selection block extractor anchors the
+trailing `return` on word-boundary + start-of-line because the
+new prose text contains the literal `"The picker returned an
+empty selection."` — naive `[\s\S]+?return` matched the substring
+`return` inside the literal and stopped early.
+
 ## [0.5.35] - 2026-06-08
 
 **Canonical 7-phase user workflow folded into Help → Feature
