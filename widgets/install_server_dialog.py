@@ -1222,16 +1222,39 @@ class InstallServerDialog(QDialog):
         # Shared log pane (each tab writes here)
         log_box = QGroupBox("Log")
         log_layout = QVBoxLayout(log_box)
+        # v0.5.41: tighten internal margins so the header row
+        # doesn't eat ~30px of useless padding. Pre-fix the
+        # QGroupBox's default (11px) + QVBoxLayout's default
+        # (9px) added ~40px of empty gray above the Pop out button.
+        log_layout.setContentsMargins(8, 14, 8, 8)
+        log_layout.setSpacing(4)
 
-        # Header row above the log: pop-out button on the right so the
-        # operator can drag a much larger log window around alongside
-        # the install dialog (15-min DPDK builds with ~1000 lines of
-        # output deserve more than the cramped pane at the bottom of
-        # this dialog). The popout shares the same QTextDocument so
-        # appendHtml / appendPlainText calls show in both windows
-        # automatically — no manual mirroring needed.
+        # v0.5.41: combine the status label and Pop out button into
+        # ONE compact header row. Pre-fix there was a separate
+        # log_header row at top (just Pop out) AND a status_lbl row
+        # at the bottom of the group box. The status_lbl row sat
+        # immediately below log_view's bottom border, so "Ready."
+        # rendered visually INSIDE the white text area — operator-
+        # reported confusion.
+        #
+        # New layout:
+        #   [ status_lbl (left-grow) ] [ Pop out ↗ ]
+        #   [           log_view                  ]
+        #
+        # status_lbl stays read-only ("Ready." → "Uploading…" →
+        # "pip running on server…" etc.), Pop out keeps its
+        # tooltip and width, and the log_view gets ~30px more
+        # vertical space because the second row is gone.
         log_header = QHBoxLayout()
-        log_header.addStretch(1)
+        log_header.setContentsMargins(0, 0, 0, 0)
+        self.status_lbl = QLabel("Ready.")
+        self.status_lbl.setStyleSheet("color:#475569; font-size:11px;")
+        # Truncate long lines with an ellipsis — installation
+        # progress messages can run long.
+        self.status_lbl.setTextInteractionFlags(
+            Qt.TextSelectableByMouse,
+        )
+        log_header.addWidget(self.status_lbl, 1)
         self.popout_btn = QPushButton("Pop out ↗")
         self.popout_btn.setToolTip(
             "Open the log in a separate, freely-resizable window. "
@@ -1239,6 +1262,7 @@ class InstallServerDialog(QDialog):
             "to the log here appears there too."
         )
         self.popout_btn.setMaximumWidth(110)
+        self.popout_btn.setMaximumHeight(28)  # don't blow up the row
         self.popout_btn.clicked.connect(self._toggle_log_popout)
         log_header.addWidget(self.popout_btn)
         log_layout.addLayout(log_header)
@@ -1259,12 +1283,12 @@ class InstallServerDialog(QDialog):
         self.log_view.setStyleSheet(
             "QPlainTextEdit{font-family: ui-monospace, Menlo, Consolas, monospace; font-size:11px;}"
         )
-        # Stretch=1 in the inner layout so log_view gets every
-        # extra pixel inside log_box (not the status_lbl below).
+        # v0.5.41: status_lbl moved into the header row above (see
+        # log_header construction). The previous separate row below
+        # log_view caused "Ready." to render visually inside the
+        # log text area's bottom border. log_view now occupies all
+        # space inside log_box below the single header row.
         log_layout.addWidget(self.log_view, 1)
-        self.status_lbl = QLabel("Ready.")
-        self.status_lbl.setStyleSheet("color:#475569; font-size:11px;")
-        log_layout.addWidget(self.status_lbl)
         layout.addWidget(log_box, 1)
 
         # Holder for the popout window — created lazily on first click.

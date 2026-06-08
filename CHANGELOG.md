@@ -2,6 +2,74 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.41] - 2026-06-08
+
+**Install/Upgrade dialog log header compacted.** Operator
+follow-up to v0.5.40: "seems you are taking too much vertical
+space for pop out button, also i see Ready somewhere in the
+text area."
+
+Full suite: **1,795 passed, 1 skipped** (+6 new tests).
+
+### What was wrong
+
+Two issues from the screenshot, both rooted in the same layout
+mistake (using two rows where one would do):
+
+1. **Pop out button row took ~150px.** QGroupBox's default 11px
+   contentsMargins + QVBoxLayout's default 9px spacing + the
+   button's natural 30px height left a giant empty gray strip
+   around an otherwise small button.
+
+2. **"Ready." rendered inside log_view's bottom border.** The
+   `status_lbl` was in its own row immediately below
+   `log_view` — the label's gray text sat AT the boundary
+   between log_view's white background and the dialog's gray
+   surround. Operator read it as "text inside the log area".
+
+### Fix — one row instead of two
+
+```
+v0.5.40:                           v0.5.41:
+  log_header [ Pop out ↗ ]           log_header [ Ready. — — — — Pop out ↗ ]
+  log_view (white)                   log_view (white)
+  status_lbl [ Ready. ]              (no separate status row)
+```
+
+* `status_lbl` moved into the same `QHBoxLayout` as `popout_btn`,
+  added with stretch=1 so it grows horizontally and pushes the
+  Pop out button to the right edge.
+* Separate `log_layout.addWidget(self.status_lbl)` call below
+  log_view removed.
+* `log_layout.setContentsMargins(8, 14, 8, 8)` — trim the
+  group-box internal padding (was Qt default 11px on all sides).
+* `log_layout.setSpacing(4)` — tighter inter-row spacing.
+* `popout_btn.setMaximumHeight(28)` — button can't stretch to
+  fill the row.
+* `status_lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)`
+  — operator can select + copy the progress message if it
+  contains a path or URL.
+
+### Net effect
+
+log_view gets ~40px more vertical space because the second row
+is gone, AND the operator gets a clean single header row with
+status (left) + Pop out (right).
+
+### Tests
+
+6 new in `tests/test_v0541_install_log_header_compact.py`:
+* `log_layout.setContentsMargins(...)` — all four values ≤ 14px
+* `status_lbl` constructed + added inside `log_header` block
+  (not in its own row below log_view)
+* `status_lbl` added BEFORE `popout_btn` (status left, button
+  right)
+* `log_layout.addWidget(self.status_lbl, ...)` is **NOT**
+  present anywhere — the separate row is gone
+* `popout_btn.setMaximumHeight(...)` — button can't stretch
+* `status_lbl` added with stretch ≥ 1 — anchors Pop out to the
+  right edge
+
 ## [0.5.40] - 2026-06-08
 
 **Install/Upgrade Server dialog log_view is taller by default.**
