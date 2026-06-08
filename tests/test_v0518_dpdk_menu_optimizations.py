@@ -92,19 +92,24 @@ def test_menu_has_advanced_submenu():
         "clutter top-level DPDK menu."
     )
     # Quick Start should be under Advanced.
+    # v0.5.34: changed lookahead from `# v0\.` to `rdma_menu =`
+    # because the consolidation comment block now contains a `# v0.5.34`
+    # marker INSIDE the Advanced submenu — would stop the regex at
+    # the comment instead of at the menu end.
     m = re.search(
-        r"dpdk_advanced_menu\s*=\s*QMenu[\s\S]+?(?=dpdk_menu\.addSeparator|"
-        r"# v0\.|rdma_menu|class\s+)",
+        r"dpdk_advanced_menu\s*=\s*QMenu[\s\S]+?(?=rdma_menu\s*=|"
+        r"class\s+)",
         src,
     )
     assert m, "advanced submenu code block not found"
     advanced_body = m.group(0)
+    # v0.5.34: Configure Hugepages + Configure IOMMU removed —
+    # consolidated into Make DPDK Ready. See
+    # test_v0534_dpdk_menu_consolidation.py for the new contract.
     for item in (
         "Quick Start Wizard",
         "Bind Interface",
         "Unbind Interface",
-        "Configure Hugepages",
-        "Configure IOMMU",
         "Load VFIO Modules",
     ):
         assert item in advanced_body, (

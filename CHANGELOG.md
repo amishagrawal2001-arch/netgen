@@ -2,6 +2,122 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.34] - 2026-06-08
+
+**DPDK menu consolidation + persistent Reboot Server button.**
+Operator request after the v0.5.33 install close-out: "make
+[Configure Hugepages + Configure IOMMU] part of same install
+process make dpdk ready, and allow user to reboot the server
+from same window."
+
+Full suite: **1,738 passed, 1 skipped** (+11 new tests, 1
+existing test pattern updated for the menu reshape).
+
+### Menu consolidation
+
+`Tools → DPDK → Advanced` had four items pre-v0.5.34:
+
+```
+Tools → DPDK → Advanced
+  ├─ Quick Start Wizard...
+  ├─ Bind Interface...
+  ├─ Unbind Interface...
+  ├─ Configure Hugepages...   ← REMOVED
+  ├─ Configure IOMMU...        ← REMOVED
+  └─ Load VFIO Modules
+```
+
+`Configure Hugepages` and `Configure IOMMU` are already handled
+by `install_dpdk.sh` — hugepages at Step 7, IOMMU at Step 7 with
+the v0.5.15 inline reboot prompt. The standalone items were a
+**divergent-paths trap**:
+
+* Operator runs `Configure IOMMU` out-of-band → script edits
+  `/etc/default/grub` but doesn't prompt for reboot
+* Operator runs `Make DPDK Ready` later → orchestrator can't tell
+  whether the manual IOMMU run completed
+* IOMMU state drifts between what the orchestrator thinks and
+  what's actually in the kernel cmdline
+
+Removing them eliminates the divergence. Hugepages and IOMMU are
+always set up by `Make DPDK Ready` in the right order. State
+surfacing happens via `Diagnostics` (which reads the same state
+the orchestrator does, so any drift is visible).
+
+`Load VFIO Modules` stays — it's the one Advanced action with a
+legitimate standalone use case (custom-kernel hosts where Make
+DPDK Ready's `modprobe` doesn't auto-persist across boots).
+
+The standalone Python handlers (`configure_hugepages`,
+`configure_iommu`) remain in the codebase for any external
+caller — only the GUI wiring is removed. No behavior change for
+anything that called them programmatically.
+
+### Persistent "Reboot Server…" button
+
+v0.5.15 added an inline reboot prompt that fired AFTER an IOMMU
+step succeeded. That covered the canonical path but missed
+several legitimate cases:
+
+* Operator manually edited `/etc/default/grub` and wants to
+  reboot to test
+* Operator ran Setup DPDK earlier without IOMMU prompt (because
+  IOMMU was already set) but needs to reboot for a different
+  reason — kernel module sticky state, sysctl change, etc.
+* Operator wants to verify DPDK survives a reboot
+
+The new `Reboot Server…` button is in the dialog footer,
+between `Unbind NIC…` and `Close`. Visible at all times.
+
+Click flow:
+1. Generic confirmation dialog ("Reboot $host now?")
+2. Warning about in-flight TGen sessions / RDMA tests / DPDK
+   installs
+3. On confirm: POST `/api/system/reboot` (the v0.5.2 endpoint)
+4. Server replies, then schedules systemd reboot ~3 s later
+
+`_on_reboot_request` is a SEPARATE method from v0.5.15's
+`_prompt_reboot` — different messages, different triggers. The
+IOMMU-step prompt still fires when an IOMMU action succeeds;
+the manual button fires whenever the operator clicks it.
+
+### Why explicit confirmation (no one-click reboot)
+
+A full-host reboot terminates everything: in-flight TGen
+sessions (RFC 2544 runs, multi-stream tests), RDMA perftest
+jobs, ongoing DPDK installs, debug captures. One-click would be
+too destructive. The confirmation also calls out an important
+v0.5.33 caveat — the install_dpdk transient systemd unit
+survives a netgen-server restart but NOT a full host reboot,
+so the operator must cancel any in-flight install first.
+
+### Tests
+
+11 new in `tests/test_v0534_dpdk_menu_consolidation.py`:
+* `QAction("Configure Hugepages...")` no longer added to
+  Advanced submenu
+* `QAction("Configure IOMMU...")` no longer added to Advanced
+  submenu
+* `Load VFIO Modules` still added (regression guard)
+* Removal accompanied by a comment block referencing v0.5.34 +
+  consolidation / Make DPDK Ready
+* `self._reboot_btn` constructed as QPushButton
+* Reboot button added to `btns` (button box)
+* Button's `.clicked` connected to `_on_reboot_request`
+* `_on_reboot_request` slot is defined (no AttributeError on
+  click)
+* Handler calls `_trigger_reboot()` on confirm
+* Handler shows QMessageBox + gates the actual reboot on
+  `clickedButton() is reboot_btn` (Cancel doesn't reboot)
+* Both `_prompt_reboot` (v0.5.15 IOMMU prompt) and
+  `_on_reboot_request` (v0.5.34 manual button) exist
+
+1 existing test updated: `test_v0518_dpdk_menu_optimizations::test_menu_has_advanced_submenu`
+dropped `Configure Hugepages` and `Configure IOMMU` from its
+required-items list (those are v0.5.34's whole point), and its
+regex lookahead anchor changed from `# v0.` (now ambiguous
+inside the Advanced block) to `rdma_menu =`.
+
 ## [0.5.33] - 2026-06-08
 
 **install_dpdk + install_rdma endpoints escape the netgen-server

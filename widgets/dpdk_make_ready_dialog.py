@@ -344,6 +344,32 @@ class MakeDpdkReadyDialog(QDialog):
         )
         self._unbind_btn.clicked.connect(self._on_unbind_request)
         btns.addButton(self._unbind_btn, QDialogButtonBox.ActionRole)
+        # v0.5.34: persistent "Reboot Server…" button.
+        # Operator request after the v0.5.33 close-out: "allow user
+        # to reboot the server from same window".
+        # v0.5.15 added an inline reboot prompt that only appeared
+        # AFTER an IOMMU step succeeded. That covered the canonical
+        # path (Make DPDK Ready → IOMMU edit → reboot) but missed
+        # the recovery cases:
+        #   - operator manually edited /etc/default/grub and wants
+        #     to reboot to test
+        #   - operator ran Setup DPDK earlier without IOMMU prompt
+        #     (because it was already set) but needs to reboot for
+        #     a different reason (kernel module sticky-state etc.)
+        #   - operator wants to verify the DPDK install survives
+        #     a reboot
+        # Surfacing the reboot here removes the friction of
+        # alt-tabbing to a terminal for `sudo reboot`.
+        self._reboot_btn = QPushButton("Reboot Server…")
+        self._reboot_btn.setToolTip(
+            "Reboot the target server via POST /api/system/reboot. "
+            "Server replies first, then schedules the reboot ~3 s "
+            "later so the HTTP response reaches you cleanly. "
+            "Useful for picking up IOMMU / GRUB / sysctl changes "
+            "that need a fresh boot."
+        )
+        self._reboot_btn.clicked.connect(self._on_reboot_request)
+        btns.addButton(self._reboot_btn, QDialogButtonBox.ActionRole)
         self._close_btn = QPushButton("Close")
         self._close_btn.clicked.connect(self.reject)
         btns.addButton(self._close_btn, QDialogButtonBox.RejectRole)
@@ -564,6 +590,45 @@ class MakeDpdkReadyDialog(QDialog):
         msg.setDefaultButton(reboot_btn)
         msg.exec_()
 
+        if msg.clickedButton() is reboot_btn:
+            self._trigger_reboot()
+
+    def _on_reboot_request(self) -> None:
+        """v0.5.34: handler for the persistent 'Reboot Server…' button.
+
+        Distinct from _prompt_reboot (which is the IOMMU-step-success
+        prompt) because the manual button can fire at ANY time —
+        before a run, mid-run, or after a successful Make DPDK Ready.
+        The confirmation message is intentionally generic (no
+        IOMMU-specific framing) so it fits all use cases.
+        """
+        host = self._server_url
+        for prefix in ("http://", "https://"):
+            if host.startswith(prefix):
+                host = host[len(prefix):]
+                break
+        host = host.rstrip("/").split(":")[0]
+
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Warning)
+        msg.setWindowTitle("Reboot Server")
+        msg.setText(f"<b>Reboot {host} now?</b>")
+        msg.setInformativeText(
+            "POST /api/system/reboot will be sent. The server replies "
+            "first, then schedules a systemd reboot ~3 s later so the "
+            "HTTP response reaches you cleanly.\n\n"
+            "All in-flight traffic-generator sessions, RDMA tests, "
+            "and DPDK installs on this server will be terminated.\n\n"
+            "If a Make DPDK Ready install is currently running, you "
+            "MUST cancel it first — the script's transient systemd "
+            "unit (v0.5.33) survives a server-process restart but "
+            "NOT a full host reboot.\n\n"
+            "Proceed?"
+        )
+        reboot_btn = msg.addButton("Reboot Now", QMessageBox.AcceptRole)
+        cancel_btn = msg.addButton("Cancel", QMessageBox.RejectRole)
+        msg.setDefaultButton(cancel_btn)
+        msg.exec_()
         if msg.clickedButton() is reboot_btn:
             self._trigger_reboot()
 

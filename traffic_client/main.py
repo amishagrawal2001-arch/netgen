@@ -1492,26 +1492,30 @@ class TrafficGeneratorClient(
         dpdk_unbind_action.triggered.connect(self.unbind_interface_from_dpdk)
         dpdk_advanced_menu.addAction(dpdk_unbind_action)
 
-        dpdk_advanced_menu.addSeparator()
-
-        dpdk_hugepages_action = QAction("Configure Hugepages...", self)
-        dpdk_hugepages_action.setToolTip(
-            "Reserve hugepages required by DPDK. System-wide setting that affects "
-            "memory available to other workloads (VMs, containers)."
-        )
-        dpdk_hugepages_action.triggered.connect(self.configure_hugepages)
-        dpdk_advanced_menu.addAction(dpdk_hugepages_action)
-
-        dpdk_iommu_action = QAction("Configure IOMMU...", self)
-        dpdk_iommu_action.setToolTip(
-            "Enable IOMMU in the bootloader (intel_iommu=on / amd_iommu=on). Requires a server reboot."
-        )
-        dpdk_iommu_action.triggered.connect(self.configure_iommu)
-        dpdk_advanced_menu.addAction(dpdk_iommu_action)
+        # v0.5.34: Configure Hugepages + Configure IOMMU removed from
+        # Advanced submenu. Operator request: "make it part of same
+        # install process make dpdk ready". Both are already handled
+        # by install_dpdk.sh — hugepages at Step 7, IOMMU at Step 7
+        # too (via /etc/default/grub edit + offered reboot via
+        # MakeDpdkReadyDialog's inline prompt added in v0.5.15).
+        # Two parallel entry points were a UX trap: operators ran
+        # them standalone, IOMMU edited GRUB but didn't prompt for
+        # reboot, then Make DPDK Ready couldn't tell if the manual
+        # IOMMU run had been completed → orchestrator misreported
+        # IOMMU state. Removing them eliminates the divergence.
+        #
+        # The standalone handler methods (configure_hugepages /
+        # configure_iommu) remain in the codebase for any external
+        # caller, but no GUI entry point invokes them anymore.
+        # Status surfacing happens via Diagnostics (which reads the
+        # SAME state the orchestrator does, so any drift is visible).
 
         dpdk_load_modules_action = QAction("Load VFIO Modules", self)
         dpdk_load_modules_action.setToolTip(
-            "modprobe vfio, vfio-pci, and vfio_iommu_type1 on the selected server."
+            "modprobe vfio, vfio-pci, and vfio_iommu_type1 on the selected server. "
+            "Useful when IOMMU is configured but kernel modules aren't loaded after "
+            "a fresh boot (e.g., custom kernel without auto-load rules). Make DPDK "
+            "Ready also runs this as part of Step 8."
         )
         dpdk_load_modules_action.triggered.connect(self.load_vfio_modules)
         dpdk_advanced_menu.addAction(dpdk_load_modules_action)
