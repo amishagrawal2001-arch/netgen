@@ -412,11 +412,56 @@ class MakeDpdkReadyDialog(QDialog):
             )
             return
         if is_dpdk_ready(data):
+            # v0.5.39: build a positive summary of what's already in
+            # place. Pre-fix the dialog showed "✓ DPDK is already
+            # ready" + empty action list — operators were confused
+            # ("what does ready mean? what's running?"). The
+            # summary surfaces every component so the operator can
+            # see at a glance the full state.
+            rows_html = []
+            checks = [
+                ("DPDK installed (libdpdk)", data.get("dpdk_installed")),
+                ("tx_worker binary", data.get("tx_worker_exists")),
+                ("Hugepages allocated", data.get("hugepages_configured")),
+                ("Hugepages mounted (/mnt/huge)", data.get("hugepages_mounted")),
+                ("IOMMU enabled in kernel", data.get("iommu_enabled")),
+                ("vfio module loaded", data.get("vfio_loaded")),
+                ("vfio-pci module loaded", data.get("vfio_pci_loaded")),
+            ]
+            for label, ok in checks:
+                if ok is None:
+                    continue
+                icon = "✓" if ok else "✗"
+                color = "#166534" if ok else "#b91c1c"
+                rows_html.append(
+                    f"<li style='color:{color};'>{icon} {label}</li>"
+                )
+            n_bound = data.get("bound_interfaces_count")
+            if n_bound is not None:
+                color = "#166534" if n_bound > 0 else "#92400e"
+                rows_html.append(
+                    f"<li style='color:{color};'>NICs bound to "
+                    f"vfio-pci: {n_bound}</li>"
+                )
+            dpdk_ver = data.get("dpdk_version") or "?"
+            iommu_details = data.get("iommu_details") or ""
             self._detail.setText(
-                "<span style='color:#166534;'>✓ DPDK is already "
-                "ready on this server. No action needed.</span>"
+                "<b style='color:#166534;'>✓ DPDK is already ready "
+                "on this server.</b>"
+                f"<br><br>DPDK version: <code>{dpdk_ver}</code>"
+                f"<br>IOMMU: <code>{iommu_details}</code>"
+                "<br><br><b>Current state:</b>"
+                f"<ul>{''.join(rows_html)}</ul>"
+                "If you want to bind a (different) NIC, click "
+                "<b>Run All Steps</b> — the wizard will show only "
+                "the bind step. Otherwise close this dialog."
             )
-            self._run_btn.setText("Nothing to do")
+            # v0.5.39: keep Run All Steps ENABLED so the operator
+            # can still trigger a re-bind. Pre-fix it was disabled
+            # entirely (label "Nothing to do") — operator with a
+            # newly-added NIC had no entry point.
+            self._run_btn.setText("Bind another NIC…")
+            self._run_btn.setEnabled(True)
             return
         # Thread the operator's hugepage-size choice (1 GB vs 2 MB)
         # through the planner so the allocate-hugepages action body

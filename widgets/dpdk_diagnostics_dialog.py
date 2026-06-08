@@ -163,10 +163,17 @@ class DpdkDiagnosticsDialog(QDialog):
                 return "<span style='color:#b91c1c; font-weight:600;'>✗</span>"
             return "<span style='color:#9ca3af;'>—</span>"
 
+        # v0.5.39: surface hugetlbfs mount state separately. Hugepages
+        # can be allocated in sysfs (✓ Hugepages configured) but the
+        # /mnt/huge mount can be missing (✗ Hugepages mounted) after
+        # a reboot if /etc/fstab wasn't updated — DPDK then fails
+        # with "no free hugepages" even though /proc/meminfo says
+        # HugePages_Total > 0.
         rows = [
             ("DPDK installed (libdpdk)", status.get("dpdk_installed")),
             ("tx_worker binary", status.get("tx_worker_exists")),
             ("Hugepages configured", status.get("hugepages_configured")),
+            ("Hugepages mounted (/mnt/huge)", status.get("hugepages_mounted")),
             ("IOMMU enabled in kernel", status.get("iommu_enabled")),
             ("vfio module loaded", status.get("vfio_loaded")),
             ("vfio-pci module loaded", status.get("vfio_pci_loaded")),

@@ -374,13 +374,20 @@ def test_run_tgen_server_wires_in_autoinstall():
     thread is caught."""
     import re
     src = open("/Users/surajsharma/dev/netgen/run_tgen_server.py").read()
-    # Find main()
-    m = re.search(
+    # v0.5.39: take the LAST `^def main(` in the file. The real
+    # entry-point main() lives near the end. Earlier matches may
+    # come from raw-string embedded helper scripts (e.g. v0.5.39's
+    # netgen-dpdk-rebind helper script content embedded as a
+    # multi-line string literal in
+    # _ensure_dpdk_rebind_unit_installed — its own `def main():`
+    # is at column 0 inside the string literal and the multiline
+    # regex would have matched it first).
+    matches = list(re.finditer(
         r"^def main\(.*?(?=\n(?:def |if __name__|class ))",
         src, re.DOTALL | re.MULTILINE,
-    )
-    assert m, "main() not found in run_tgen_server.py"
-    main_body = m.group(0)
+    ))
+    assert matches, "main() not found in run_tgen_server.py"
+    main_body = matches[-1].group(0)
     # ensure_rdma_userspace_installed must be referenced inside
     # main() — caller wraps it in a daemon thread.
     assert "ensure_rdma_userspace_installed" in main_body, (

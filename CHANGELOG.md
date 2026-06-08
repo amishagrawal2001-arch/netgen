@@ -2,6 +2,166 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.39] - 2026-06-08
+
+**DPDK install audit — 4 gaps closed.** Operator request after
+the v0.5.38 close-out: "audit dpdk install and make sure all
+the steps are taken care, we need to provide user simple and
+easy install experience".
+
+Full suite: **1,783 passed, 1 skipped** (+14 new tests, 1
+existing test pattern updated).
+
+### Gap 1 — `/mnt/huge` mount lost on reboot
+
+Pre-v0.5.39, `/api/dpdk/hugepages` ran `mount -t hugetlbfs
+nodev /mnt/huge` but never wrote `/etc/fstab`. Reboot → mount
+gone → DPDK apps fail with `"no free hugepages"` even though
+`/proc/meminfo HugePages_Total > 0` (v0.5.37 persists the
+count via sysctl.d).
+
+**Fix:** append `nodev /mnt/huge hugetlbfs defaults 0 0` to
+`/etc/fstab` on the first successful mount. Idempotent (skips if
+the entry's already there).
+
+### Gap 2 — NIC vfio-pci bind lost on reboot
+
+`dpdk-devbind.py` writes runtime sysfs only — reboot returns
+the NIC to its kernel driver. Operator who'd just bound a NIC
+via Make DPDK Ready found "0 NICs bound" on next boot.
+
+**Fix:** persistence registry + systemd oneshot unit.
+
+* `/etc/netgen/dpdk-interfaces.json` — registry of every bound
+  NIC (PCI address + driver + iface name + bind timestamp).
+  Updated on every `/api/dpdk/bind` success; entry removed on
+  `/api/dpdk/unbind` success.
+* `/etc/systemd/system/netgen-dpdk-rebind.service` — oneshot
+  unit, ordered `After=systemd-modules-load.service` so vfio-pci
+  is loaded BEFORE the helper runs.
+* `/usr/local/sbin/netgen-dpdk-rebind` — Python helper script
+  that reads the registry + calls `dpdk-devbind.py --bind=<drv>
+  <pci>` for each entry on boot. Falls back gracefully if
+  `dpdk-devbind.py` isn't installed yet (e.g., before DPDK
+  install completes).
+
+Boot order:
+
+```
+systemd-modules-load.service     # loads vfio-pci (v0.5.37)
+   └─ netgen-dpdk-rebind.service # re-binds NICs from registry
+       └─ netgen-server.service  # starts last (uses the binds)
+```
+
+Bind endpoint auto-installs the unit + helper on first bind
+(idempotent — skips if files exist). No netgen-install step
+change needed; existing tarballs / wheels pick up the behaviour
+on the next operator bind.
+
+### Gap 3 — Diagnostics didn't surface `/mnt/huge` mount state
+
+Pre-fix, Diagnostics had a single `✓ Hugepages configured` row
+that read `/sys/.../nr_hugepages`. A mount-missing host would
+show ✓ on that row but still fail at DPDK app startup.
+
+**Fix:** `/api/dpdk/status` response gains
+`hugepages_mounted: bool` + `hugepages_mount_point: str`
+(scraped from `/proc/mounts` for `hugetlbfs`). Diagnostics dialog
+renders a new row `Hugepages mounted (/mnt/huge)` separate from
+the count check.
+
+### Gap 4 — "Already ready" UX showed empty action list
+
+When the orchestrator surveyed and found nothing pending,
+MakeDpdkReadyDialog set _detail to
+`"✓ DPDK is already ready"` and Run button to `"Nothing to do"`
+(disabled). Empty action list. Operator confusion: "what does
+ready mean? what's actually installed? how do I add a NIC?"
+
+**Fix:** the already-ready branch now renders a positive summary
+in the QTextBrowser:
+
+```
+✓ DPDK is already ready on this server.
+
+DPDK version: 23.11.0
+IOMMU: Intel IOMMU enabled (passthrough mode)
+
+Current state:
+  ✓ DPDK installed (libdpdk)
+  ✓ tx_worker binary
+  ✓ Hugepages allocated
+  ✓ Hugepages mounted (/mnt/huge)
+  ✓ IOMMU enabled in kernel
+  ✓ vfio module loaded
+  ✓ vfio-pci module loaded
+  NICs bound to vfio-pci: 2
+
+If you want to bind a (different) NIC, click Bind another NIC… —
+the wizard will show only the bind step. Otherwise close this dialog.
+```
+
+The Run button is re-labelled **Bind another NIC…** and stays
+**enabled** so the operator can re-bind a newly-added NIC without
+closing + re-opening the dialog.
+
+### Tests
+
+14 new in `tests/test_v0539_dpdk_install_audit.py`:
+* fstab fix: `/etc/fstab` reference + `hugetlbfs` filesystem type
+  + idempotent (reads existing content before append)
+* Bind persistence: `_dpdk_persist_bind` + `_dpdk_unpersist_bind`
+  helpers exist
+* Registry at canonical `/etc/netgen/dpdk-interfaces.json`
+* Systemd unit `netgen-dpdk-rebind.service` reference + installer
+  function
+* Unit orders `After=systemd-modules-load.service` (won't race)
+* Helper at canonical `/usr/local/sbin/netgen-dpdk-rebind`
+* `/api/dpdk/bind` calls `_dpdk_persist_bind` on success
+* `/api/dpdk/unbind` calls `_dpdk_unpersist_bind` on success
+* `/api/dpdk/status` includes `hugepages_mounted` from
+  `/proc/mounts`
+* Diagnostics dialog renders the `Hugepages mounted` row
+* Already-ready dialog shows summary (not empty list)
+* Already-ready Run button stays enabled + relabelled
+  `Bind another NIC…` so re-bind flow remains accessible
+
+1 existing test updated: `test_system_deps_auto_install::test_run_tgen_server_wires_in_autoinstall`
+now takes the LAST `^def main(` match in the file (the real
+entry-point) instead of the first — pre-fix the embedded helper
+script's own `def main():` inside a raw-string literal would
+match first and the test'd look at the wrong function body.
+
+### Recovery for existing servers (manual SSH, no wheel upgrade needed)
+
+```bash
+ssh root@<server> 'bash -s' <<'EOF'
+set -e
+# 1. fstab for /mnt/huge
+grep -q hugetlbfs /etc/fstab || \
+    echo "nodev /mnt/huge hugetlbfs defaults 0 0" >> /etc/fstab
+
+# 2. Hugepages + vfio persistence (from v0.5.37 — idempotent)
+grep -q vm.nr_hugepages /etc/sysctl.d/99-netgen-hugepages.conf 2>/dev/null || \
+    echo "vm.nr_hugepages = 1024" > /etc/sysctl.d/99-netgen-hugepages.conf
+test -f /etc/modules-load.d/netgen-dpdk.conf || \
+    printf 'vfio\nvfio-pci\n' > /etc/modules-load.d/netgen-dpdk.conf
+
+# 3. Verify all 3 persist
+sysctl --system >/dev/null
+modprobe vfio vfio-pci
+mountpoint -q /mnt/huge || mount -a
+grep HugePages_Total /proc/meminfo
+lsmod | grep -E '^vfio|^vfio_pci'
+mountpoint /mnt/huge
+EOF
+```
+
+For NIC bind persistence (Gap 2), the server needs to be on
+v0.5.39 — the registry + systemd unit are auto-installed by
+`/api/dpdk/bind` itself, so upgrading the wheel and doing one
+new bind via the GUI sets it all up.
+
 ## [0.5.38] - 2026-06-08
 
 **`ip link set` arg order — drop `--`, use `dev`.** Operator
