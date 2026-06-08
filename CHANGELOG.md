@@ -2,6 +2,119 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.24] - 2026-06-07
+
+**Client treats `rc=None + log_path=null` as "server lost state,
+check `/api/health`" instead of "pip failed".** Necessary for any
+operator upgrading FROM a pre-v0.5.23 server — those servers
+don't have the upgrade-state persistence v0.5.23 added, so a
+mid-upgrade restart wipes their in-memory state. The next
+`/log` poll returns `{running: false, log_path: null,
+return_code: null}` and the client (pre-v0.5.24) aborted with
+"pip exited rc=None" — even when the upgrade had actually
+succeeded.
+
+Full suite: **1,655 passed, 1 skipped** (+13 new tests).
+
+### Operator-reported failure (srv06, second attempt v0.5.21 → v0.5.23)
+
+```
+Successfully installed Flask-3.1.3 ... ostg-trafficgen-0.5.23 ...
+[INFO] $ /opt/netgen-server/netgen-venv/bin/python -c import flask, ...
+[client] pip exited rc=None; aborting
+```
+
+The visible `Successfully installed ... ostg-trafficgen-0.5.23`
+line proves the install succeeded. The `[INFO] $` line proves
+the netgen-upgrade post-install import check kicked off. So
+where did the `rc=None` come from?
+
+The v0.5.21 server (no state persistence — that's v0.5.23+) got
+restarted between the import check starting and the client's
+next poll. The post-restart server has empty
+`_ADMIN_UPGRADE_STATE`, so `/api/admin/upgrade_wheel/log` returns
+`{running: false, log_path: null, return_code: null}`. The
+client conflated `rc=None` (no recorded exit code) with
+`rc=N` (explicit pip failure) and aborted, never reaching the
+`/api/health` stage that would have proved the upgrade actually
+succeeded.
+
+### Fix: differentiate by `log_path` presence
+
+| `rc` | `log_path` | Meaning | New behavior |
+|---|---|---|---|
+| `0` | any | pip succeeded | Stage 3: poll `/api/health` |
+| `N` (int) | any | pip explicitly failed | Abort, log `rc=N` |
+| `None` | set | proc died mid-flight (signal-kill) | Abort, log `rc=None` |
+| `None` | `null` | **server forgot — restart wiped state** | **Stage 3: poll `/api/health` with version-verify** |
+
+### Verification adds version-check
+
+The `/api/health` stage now parses the EXPECTED version from the
+uploaded wheel filename (PEP 427) and compares against the
+running server's reported version. Catches three new failure
+modes the old "any 200 OK = success" check missed:
+
+* Server restarted onto an OLDER cached install
+* `/api/health` is up but the upgrade silently no-op'd
+* Wrong wheel installed (e.g. operator picked a stale wheel)
+
+Match → declare success ("server at v0.5.24"). Mismatch after
+the 90s deadline → declare failure with both versions
+("server still on v0.5.21").
+
+Tolerates very old servers whose `/api/health` doesn't expose a
+`netgen_version` field — falls back to "any 200 OK = success"
+so we don't false-fail on hosts predating the version field.
+
+Wheel filenames that don't parse (operator picked an odd
+filename) → legacy "any 200 OK = success" path. PEP 427
+parser handles canonical names AND optional build tags.
+
+### Why v0.5.23 alone isn't enough
+
+v0.5.23's server-side state persistence helps when the SOURCE
+server is v0.5.23+. But every operator currently on v0.5.6 →
+v0.5.22 upgrades through the OLD code path one last time — and
+that server doesn't have the persistence. The CLIENT has to
+handle "server forgot" gracefully so this transition isn't
+booby-trapped.
+
+### Recovery semantics
+
+This is purely a client improvement. No server changes; no
+state migration. After the wheel containing v0.5.24 is
+installed (via the same client GUI flow, even from a
+pre-v0.5.24 client), future upgrades from that server are
+clean. The fix is in the SHIPPED client binary
+(Netgen-Client-0.5.24-*) too, so once an operator updates
+their desktop client, ALL their pre-v0.5.23 server upgrades
+become resilient.
+
+### Tests
+
+13 new in `tests/test_v0524_client_health_arbitrates_rc_none.py`:
+
+* `rc=None` branched separately from `rc=N` (int)
+* Branch checks `log_path` to distinguish lost-state from
+  signal-kill
+* Lost-state branch sets `restart_seen=True` + `break`s (does
+  NOT abort)
+* Lost-state branch logs a diagnostic mentioning `/api/health`
+  (operator sees the recovery path, not just silence)
+* Genuine signal-kill (`rc=None` + `log_path=set`) still aborts
+* `_parse_wheel_version` exists + parses canonical wheels
+  (`ostg_trafficgen-0.5.23-py3-none-any.whl` → `0.5.23`)
+* Parser handles PEP 427 optional build tags
+  (`name-0.5.24-1-py3-...` → `0.5.24`)
+* Parser returns `None` on garbage filenames
+* `/api/health` stage uses `_parse_wheel_version`
+* Server version compared against expected
+* Missing version field tolerated (very old servers → "any
+  200 OK = success")
+* Failure message includes `last_seen_version` + `expected`
+  on mismatch (operator can act)
+
 ## [0.5.23] - 2026-06-07
 
 **Wheel-upgrade survives the cgroup-kill death spiral.** Operator

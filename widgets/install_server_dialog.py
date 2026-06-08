@@ -192,6 +192,39 @@ class WheelUploadWorker(QThread):
                             restart_seen = True
                             self.status.emit("pip ok — server restarting via systemd...")
                         break
+                    # v0.5.24: rc=None has two meanings:
+                    #
+                    #   (a) PIP REALLY FAILED with no recorded exit
+                    #       code (killed by signal, etc.)
+                    #   (b) THE SERVER GOT RESTARTED MID-UPGRADE and
+                    #       lost in-memory _ADMIN_UPGRADE_STATE — so
+                    #       /log returns {"running": false,
+                    #       "log_path": null, "return_code": null}.
+                    #       This is what every v0.5.21→v0.5.23+
+                    #       upgrade hits because the source server
+                    #       (pre-v0.5.23) had no state persistence.
+                    #
+                    # The (b) case might be a SUCCESSFUL upgrade —
+                    # the server restarted because netgen-upgrade
+                    # finished pip + import-check + systemctl restart.
+                    # Aborting here mis-reports it as failure.
+                    #
+                    # Differentiator: when log_path is null too, the
+                    # server has no record of THIS upgrade at all —
+                    # almost certainly the "state forgotten" case.
+                    # Fall through to /api/health polling and let the
+                    # version check arbitrate.
+                    #
+                    # (rc == None with log_path != null is a real
+                    # signal-kill — keep the old abort behavior.)
+                    elif rc is None and lb.get("log_path") is None:
+                        self.log_chunk.emit(
+                            "[client] server lost upgrade state (probably "
+                            "restarted) — checking /api/health to see if "
+                            "the upgrade actually succeeded...\n"
+                        )
+                        restart_seen = True
+                        break
                     else:
                         self.log_chunk.emit(
                             f"[client] pip exited rc={rc}; aborting\n"
@@ -207,24 +240,114 @@ class WheelUploadWorker(QThread):
             time.sleep(2)
 
         # 3. Wait for /api/health to come back (server reboot)
+        #
+        # v0.5.24: parse the expected version from the wheel
+        # filename so we can verify the running server actually
+        # picked up the new code. Two failure modes this catches:
+        #   - server restarted but loaded an OLDER version (e.g. wheel
+        #     install actually failed, systemd auto-restart loaded
+        #     the previous cached install)
+        #   - server is "healthy" on /api/health but still on the old
+        #     version (the upgrade silently no-op'd somewhere)
+        #
+        # When wheel filename doesn't parse (operator picked an
+        # unusual filename), we fall back to the pre-v0.5.24 "any
+        # 200 OK = success" semantic so we don't false-fail on
+        # operators with non-standard filenames.
+        expected_version = self._parse_wheel_version(wheel_name)
         self.status.emit("Waiting for server to come back...")
-        self.log_chunk.emit("[client] polling /api/health for restart...\n")
+        self.log_chunk.emit(
+            f"[client] polling /api/health for restart"
+            + (f" (expecting version {expected_version})..." if expected_version else "...")
+            + "\n"
+        )
         health_deadline = time.time() + 90
+        last_seen_version = None
         while time.time() < health_deadline and not self._stop:
             try:
                 hr = requests.get(f"{self.server_url}/api/health", timeout=4)
                 if hr.status_code == 200:
-                    self.log_chunk.emit("[client] server healthy — upgrade complete\n")
-                    self.status.emit("Upgrade complete — server back online")
-                    self.finished_ok.emit(True)
-                    return
+                    # Parse the server version when we can; tolerate
+                    # any payload shape — older servers return just
+                    # {"status": "ok"} with no version field.
+                    try:
+                        hb = hr.json()
+                    except Exception:
+                        hb = {}
+                    server_version = (
+                        hb.get("netgen_version")
+                        or hb.get("version")
+                        or hb.get("ostg_version")
+                    )
+                    last_seen_version = server_version
+                    if expected_version and server_version:
+                        if server_version == expected_version:
+                            self.log_chunk.emit(
+                                f"[client] server healthy at v{server_version} — "
+                                f"upgrade verified\n"
+                            )
+                            self.status.emit(
+                                f"Upgrade complete — server at v{server_version}"
+                            )
+                            self.finished_ok.emit(True)
+                            return
+                        # Server is up but reporting a different
+                        # version. It may still be mid-restart; keep
+                        # polling until the deadline. Don't spam the
+                        # log — just record we've seen it.
+                    elif expected_version and not server_version:
+                        # /api/health doesn't expose version (very old
+                        # server, or different shape). Trust the 200 OK
+                        # as success — caller can manually verify.
+                        self.log_chunk.emit(
+                            f"[client] server healthy but /api/health doesn't "
+                            f"expose version field — assuming upgrade succeeded\n"
+                        )
+                        self.status.emit("Upgrade complete — server back online")
+                        self.finished_ok.emit(True)
+                        return
+                    else:
+                        # No expected version parsed; legacy behavior.
+                        self.log_chunk.emit("[client] server healthy — upgrade complete\n")
+                        self.status.emit("Upgrade complete — server back online")
+                        self.finished_ok.emit(True)
+                        return
             except Exception:
                 pass
             time.sleep(2)
 
-        self.log_chunk.emit("[client] server did not return to health within 90s\n")
-        self.status.emit("Upgrade finished but server is not responding")
+        # Deadline passed. If the server came up but is on the
+        # WRONG version, say so explicitly — the operator's biggest
+        # confusion is "was it a no-op or a real failure?"
+        if last_seen_version and expected_version and \
+                last_seen_version != expected_version:
+            self.log_chunk.emit(
+                f"[client] server healthy at v{last_seen_version} but "
+                f"expected v{expected_version} — upgrade did NOT take "
+                f"effect (server may have rolled back, or installed a "
+                f"different wheel than uploaded). Check "
+                f"/var/log/netgen-upgrade.log on the server.\n"
+            )
+            self.status.emit(
+                f"Upgrade failed — server still on v{last_seen_version}"
+            )
+        else:
+            self.log_chunk.emit("[client] server did not return to health within 90s\n")
+            self.status.emit("Upgrade finished but server is not responding")
         self.finished_ok.emit(False)
+
+    @staticmethod
+    def _parse_wheel_version(wheel_filename: str):
+        """Extract the version from a wheel filename per PEP 427.
+        Returns None when the filename doesn't follow the pattern.
+
+        Example: ostg_trafficgen-0.5.23-py3-none-any.whl → '0.5.23'
+        """
+        import re as _re
+        # PEP 427: name-version-...-platform.whl
+        # Match the second segment between the first two hyphens.
+        m = _re.match(r"^[A-Za-z0-9_.+]+-([0-9][^-]*)-", wheel_filename)
+        return m.group(1) if m else None
 
 
 class SshUpgradeWorker(QThread):
