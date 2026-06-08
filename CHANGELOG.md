@@ -2,6 +2,96 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.32] - 2026-06-08
+
+**Make DPDK Ready dialog log viewer is now scrollable + selectable.**
+Operator-reported: "can [not] see the full logs due to no scroll
+on make dpdk, also copy is not allowed". The `_detail` widget was
+a `QLabel` — two UX bugs in one: no scrollbars (long log tails
+get cropped) and no text selection/copy (operator can't paste
+into bug reports).
+
+Full suite: **1,716 passed, 1 skipped** (+7 new tests, 1 existing
+test API-updated for the widget swap).
+
+### Bug
+
+The MakeDpdkReadyDialog rendered status text + the v0.5.20 inline
+log tail (30 lines of meson errors, apt failures, etc.) in a
+single `QLabel`. QLabel:
+
+* **No scroll.** Renders as a single block at whatever height the
+  layout gives it. A 30-line log tail with multi-line meson errors
+  and inlined apt log overflowed the label's area → operators saw
+  only the top ~10 lines.
+* **No text select / copy.** QLabel doesn't allow text-select by
+  default. Even `setTextInteractionFlags(Qt.TextSelectableByMouse)`
+  only enables click-drag — `Ctrl+C` and right-click-Copy don't
+  work because QLabel has no clipboard integration. Operators
+  couldn't paste failed logs into chat / bug reports.
+
+### Fix
+
+Swap `QLabel` → `QTextBrowser`:
+
+| Property | QLabel | QTextBrowser |
+|---|---|---|
+| Scrollbars | none | built-in vertical + horizontal |
+| Text selection | requires flag, only click-drag | **on by default in read-only mode** |
+| Ctrl+C / right-click-Copy | **broken** | **works** |
+| HTML rendering | yes (RichText) | yes |
+| `setText(html)` accepted | yes | yes (also `setHtml`) |
+| Read-only enforcement | implicit | `setReadOnly(True)` explicit |
+
+Existing `setText(...)` call sites work unchanged — QTextBrowser
+accepts HTML through `setText()` just like QLabel's RichText
+format.
+
+### Layout
+
+* `setMinimumHeight(180)` — ~12 lines of 11px text visible without
+  scroll (covers a typical action description + multi-line status)
+* `setMaximumHeight(360)` — caps the area on small screens so the
+  dialog doesn't grow unmanageably; operator scrolls within the
+  viewer for content past 360px
+* `outer.addWidget(self._detail, 1)` — stretch factor 1, expands
+  to fill available vertical space when the operator resizes the
+  dialog
+* `QSizePolicy(Expanding, Expanding)` — explicit expand policy
+* `setStyleSheet` adds a light-gray background + border + padding
+  so the log area visually distinguishes itself from the
+  surrounding controls (was previously just borderless gray text)
+
+### `DpdkBlastFlowDialog` gets the fix for free
+
+`DpdkBlastFlowDialog(MakeDpdkReadyDialog)` inherits `_detail`, so
+its log area also becomes scrollable + selectable without
+additional changes. One existing test
+(`test_blast_flow_stop_response_check_catches_zero_stopped`)
+updated from `dlg._detail.text()` (QLabel API) to
+`dlg._detail.toPlainText()` (QTextBrowser API).
+
+### `SetupRdmaDialog` was already correct
+
+v0.5.27's SetupRdmaDialog used `QTextEdit` from the start — it
+already scrolled and supported text selection. A v0.5.32 test
+confirms it wasn't regressed.
+
+### Tests
+
+7 new in `tests/test_v0532_dpdk_dialog_scroll_select.py`:
+* `_detail` is `QTextBrowser` or `QTextEdit` (NOT QLabel)
+* `_detail.setReadOnly(True)` is set
+* `_detail.setMinimumHeight(N)` with N ≥ 100 (enough log lines)
+* `_detail` added to layout with stretch ≥ 1
+* `QTextBrowser` / `QTextEdit` imported (no NameError on construct)
+* `SetupRdmaDialog`'s `log_view` is still a QTextEdit (no
+  regression of the already-correct dialog)
+* Version pinned at ≥ 0.5.32
+
+1 existing test updated: `test_blast_flow_stop_response_check_catches_zero_stopped`
+now reads the widget via `toPlainText()` instead of `text()`.
+
 ## [0.5.31] - 2026-06-08
 
 **Real fix: `-o APT::Sandbox::User=root` on every apt invocation.**

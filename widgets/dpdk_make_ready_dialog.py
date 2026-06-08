@@ -28,7 +28,8 @@ from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
     QComboBox, QDialog, QDialogButtonBox, QGroupBox, QHBoxLayout,
     QLabel, QListWidget, QListWidgetItem, QMessageBox, QPushButton,
-    QRadioButton, QSpinBox, QVBoxLayout, QWidget,
+    QRadioButton, QSizePolicy, QSpinBox, QTextBrowser, QVBoxLayout,
+    QWidget,
 )
 
 from utils.dpdk_orchestrator import (
@@ -283,12 +284,46 @@ class MakeDpdkReadyDialog(QDialog):
         outer.addWidget(self._list, 1)
 
         # Detail / log area for the most recent action.
-        self._detail = QLabel("Surveying server…")
-        self._detail.setWordWrap(True)
+        #
+        # v0.5.32: switched from QLabel → QTextBrowser. The QLabel
+        # had two operator-blocking UX bugs:
+        #   1. No scroll. A v0.5.20 inline log tail (30 lines of
+        #      meson errors, apt failures, etc.) overflowed the
+        #      label's fixed render area — operators could see
+        #      only the top ~10 lines.
+        #   2. No text selection. QLabel doesn't allow text-select
+        #      by default; even setTextInteractionFlags(
+        #      Qt.TextSelectableByMouse) only enables click-drag —
+        #      Ctrl+C / right-click-Copy still wouldn't work.
+        #      Operators couldn't paste log content into a chat /
+        #      bug report.
+        # QTextBrowser solves both: built-in scrollbars,
+        # text-selectable by default, Ctrl+C / right-click-Copy
+        # work out of the box, and setText() still accepts the
+        # rich HTML the existing setText calls send.
+        self._detail = QTextBrowser()
+        self._detail.setReadOnly(True)
+        self._detail.setOpenExternalLinks(True)  # Any <a> in the log links open in browser
+        self._detail.setText("Surveying server…")
         self._detail.setStyleSheet(
-            "color: #475569; font-size: 11px; padding: 4px 0;"
+            "QTextBrowser { "
+            "color: #475569; "
+            "font-size: 11px; "
+            "background: #f9fafb; "
+            "border: 1px solid #e5e7eb; "
+            "border-radius: 4px; "
+            "padding: 6px 8px; "
+            "}"
         )
-        outer.addWidget(self._detail)
+        # Min height ensures ~12 lines visible without scroll;
+        # max height lets the dialog stay reasonable on small
+        # screens (operator scrolls within the viewer for the rest).
+        self._detail.setMinimumHeight(180)
+        self._detail.setMaximumHeight(360)
+        self._detail.setSizePolicy(
+            QSizePolicy.Expanding, QSizePolicy.Expanding,
+        )
+        outer.addWidget(self._detail, 1)
 
         # Buttons. Run starts disabled — enabled after status fetch
         # populates the action list.

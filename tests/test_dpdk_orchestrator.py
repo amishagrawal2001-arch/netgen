@@ -990,10 +990,14 @@ def test_blast_flow_stop_response_check_catches_zero_stopped(qapp):
     # Simulate server returning success-ish HTTP but zero stops.
     dlg._on_blast_stopped({"stopped": []}, "")
     # Dialog should NOT claim success — operator must see the error.
-    assert "didn't actually stop" in dlg._detail.text() \
-        or "Stop reported success but" in dlg._detail.text(), (
+    # v0.5.32: _detail switched from QLabel to QTextBrowser to fix
+    # scroll + copy UX. QTextBrowser uses toPlainText() instead of
+    # QLabel's text() — neither has the other's API.
+    detail_text = dlg._detail.toPlainText()
+    assert "didn't actually stop" in detail_text \
+        or "Stop reported success but" in detail_text, (
         f"Dialog claimed success on a 0-stopped response: "
-        f"{dlg._detail.text()!r}"
+        f"{detail_text!r}"
     )
     # Run button must be re-enabled so operator can retry.
     assert dlg._run_btn.isEnabled()
