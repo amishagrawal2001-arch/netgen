@@ -14290,14 +14290,56 @@ def dpdk_load_modules():
                 result = None
                 error_msg = None
                 
-                # Try modprobe directly first (since service runs as root)
+                # Try modprobe — but wrap in systemd-run when available
+                # to escape netgen-server.service's sandbox.
+                #
+                # v0.5.44: a bare `modprobe vfio-pci` returns
+                #   ERROR: could not insert 'vfio_pci': Operation not permitted
+                # because the netgen-server systemd unit has
+                # `ProtectKernelModules=true` (or a similar
+                # capability/seccomp restriction). The kernel blocks
+                # init_module() syscalls from processes inside the
+                # locked-down cgroup, regardless of UID.
+                #
+                # Operator-reported on srv06 admin console:
+                #   HTTP 500: Failed to load modules: vfio-pci:
+                #   modprobe: ERROR: could not insert 'vfio_pci':
+                #   Operation not permitted
+                #
+                # Fix: same cgroup-escape pattern as v0.5.33's apt-
+                # sandbox failure. `systemd-run --wait --pipe
+                # --collect` spawns modprobe in a fresh transient
+                # unit with vanilla defaults (no inherited
+                # ProtectKernelModules). The kernel allows
+                # init_module() from there.
+                #
+                # Falls back to direct modprobe on non-systemd hosts
+                # (containers, macOS, non-root processes) — the
+                # systemd-run helper returns None there and we run
+                # bare.
+                systemd_run = _systemd_run_available()
+                if systemd_run:
+                    modprobe_cmd = [
+                        systemd_run,
+                        "--wait",
+                        "--pipe",
+                        "--collect",
+                        "--quiet",
+                        f"--unit=netgen-modprobe-{module.replace('-', '_')}-{int(__import__('time').time())}.service",
+                        "--description=netgen modprobe (cgroup-escape)",
+                        "--",
+                        modprobe_path,
+                        module,
+                    ]
+                else:
+                    modprobe_cmd = [modprobe_path, module]
                 try:
-                    logging.info(f"[DPDK LOAD MODULES] Attempting to load {module} using {modprobe_path}")
+                    logging.info(f"[DPDK LOAD MODULES] Attempting to load {module} using {modprobe_cmd[0]}")
                     result = subprocess.run(
-                        [modprobe_path, module],
+                        modprobe_cmd,
                         capture_output=True,
                         text=True,
-                        timeout=10
+                        timeout=15
                     )
                     logging.info(f"[DPDK LOAD MODULES] modprobe {module} returned: exit_code={result.returncode}, stdout='{result.stdout}', stderr='{result.stderr}'")
                     

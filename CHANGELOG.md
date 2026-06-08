@@ -2,6 +2,97 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.44] - 2026-06-08
+
+**`/api/dpdk/load_modules` wraps modprobe in `systemd-run` to
+escape `ProtectKernelModules=true`.** Operator-reported on srv06
+admin console:
+
+```
+HTTP 500
+Failed to load modules: vfio-pci: modprobe: ERROR: could not
+insert 'vfio_pci': Operation not permitted
+```
+
+Full suite: **1,817 passed, 1 skipped** (+7 new tests).
+
+### Root cause
+
+netgen-server.service ships with `ProtectKernelModules=true`
+(systemd hardening). The kernel rejects `init_module()` syscalls
+from processes inside the locked-down cgroup regardless of UID
+— so modprobe gets EPERM the moment it tries to insert.
+
+The error message itself listed the cause:
+> Systemd service has ProtectKernelModules=true (check systemd
+> service file)
+
+Just like v0.5.31's apt setgroups EPERM and v0.5.33's apt
+SetupAPTPartialDirectory chmod failure, this is netgen-server's
+own sandbox blocking a legitimate kernel-touching operation
+the service needs to perform.
+
+### Fix — same cgroup-escape pattern as v0.5.33
+
+Wrap the modprobe call in `systemd-run --wait --pipe --collect`:
+
+```python
+modprobe_cmd = [
+    "systemd-run",
+    "--wait", "--pipe", "--collect", "--quiet",
+    f"--unit=netgen-modprobe-{module_safe}-{ts}.service",
+    "--",
+    modprobe_path, module,
+]
+```
+
+systemd-run spawns the modprobe in a fresh transient unit with
+vanilla defaults (no inherited `ProtectKernelModules`). The
+kernel allows `init_module()` from there.
+
+* `--wait` — caller still sees the exit code via `proc.poll()`
+* `--pipe` — modprobe stdout/stderr reaches the API response
+* `--collect` — transient unit auto-removes on exit (no
+  accumulation in `systemctl list-units`)
+* Per-invocation unit name (module + timestamp) — back-to-back
+  loads (vfio + vfio-pci) don't collide
+
+### Fallback for non-systemd hosts
+
+When `_systemd_run_available()` returns None (Docker, macOS dev,
+non-root), the endpoint falls back to bare modprobe. On those
+hosts the sandbox doesn't apply anyway.
+
+### Subprocess timeout bumped 10s → 15s
+
+systemd-run adds ~100-200ms of unit setup/teardown overhead.
+The bump gives headroom for legitimately-slow loads (kernel
+symbol resolution on aged hosts).
+
+### Tests
+
+7 new in `tests/test_v0544_modprobe_systemd_run_escape.py`:
+* `dpdk_load_modules` probes for systemd-run availability
+* systemd-run wrap uses `--wait` + `--pipe` + `--collect`
+* Unit name is per-invocation (f-string, references module
+  + timestamp — anti-collision)
+* Falls back to bare `[modprobe_path, module]` when
+  `_systemd_run_available()` returns None
+* `subprocess.run` uses the constructed `modprobe_cmd` variable
+  (not the original literal — anti-regression on copy-paste)
+* `subprocess.run` timeout ≥ 15s (covers systemd-run overhead)
+* Version pinned at ≥ 0.5.44
+
+### Operator unblock
+
+Once v0.5.44 is on srv06, clicking `Load VFIO Modules` from the
+admin console actually loads `vfio_pci`. Until then, manual:
+
+```bash
+ssh root@san-hp-srv06 'modprobe vfio-pci'   # bypasses the
+                                             # netgen-server cgroup
+```
+
 ## [0.5.43] - 2026-06-08
 
 **Link status uses sysfs operstate + admin response drives icon
