@@ -2,6 +2,79 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.28] - 2026-06-07
+
+**Comprehensive RDMA dep coverage in `install_rdma.sh`.** Operator
+request right after v0.5.27 shipped: "make sure all the
+dependencies for rdma should be taken care during Setup RDMA".
+The v0.5.27 minimum-viable list missed several packages
+operators routinely need.
+
+Full suite: **1,691 passed, 1 skipped** (+8 new tests).
+
+### What v0.5.27 missed
+
+| Category | Missing | Why it matters |
+|---|---|---|
+| Userspace libs | `librdmacm-dev`, `libibmad-dev`, `libibumad-dev`, `libibnetdisc-dev` | RDMA-CM headers (needed to compile any RDMA-CM-using code) + MAD/fabric-discovery libs (needed by ibdiagnet, ibnetdiscover) |
+| Test tools | `rdmacm-utils` | rping / ucmatose / ucmd — RDMA-CM smoke tests, the operator's first "does my stack work" probe |
+| Python | `python3-pyverbs` | Python ibv_* bindings — used by diagnostic scripts and lets ops script probes without writing C |
+| Subnet manager | `opensm` | Required on native InfiniBand fabrics without a switch-resident SM. Installed but **disabled by default** — operator must explicitly `systemctl enable --now opensm` |
+| Firmware tools | `mstflint` | Mellanox firmware management (mstflint, mstconfig, mstfwreset) — query NIC FW version, change port mode (Ethernet ↔ InfiniBand), apply updates |
+| Older Mellanox | `libmlx4-dev` | ConnectX-3 / ConnectX-2 dev headers (still common in lab gear from 2014-2018). Pre-v0.5.28 mlx batch only had libmlx5-dev (ConnectX-4+) |
+| Kernel modules | `rdma_ucm`, `iw_cm` | `rdma_ucm` is the userspace bridge to `rdma_cm` — without it, librdmacm calls fail with EBADF on `/dev/infiniband/rdma_cm`. `iw_cm` for iWARP CM. |
+
+### `rdma_ucm` is the silent killer
+
+Pre-v0.5.28, install_rdma.sh loaded `ib_uverbs`, `rdma_cm`,
+`ib_umad` — but not `rdma_ucm`. That subtle absence meant
+`perftest`'s `ib_send_bw` (which uses RDMA-CM for connection
+establishment by default) would fail with cryptic EBADF errors
+on `/dev/infiniband/rdma_cm`. Operators would assume their NIC
+was broken when the actual issue was a missing kernel module.
+
+v0.5.28's expanded `rdma_modules` array fixes it: `("ib_uverbs"
+"rdma_cm" "rdma_ucm" "ib_umad" "iw_cm")`. The persisted
+`/etc/modules-load.d/netgen-rdma.conf` carries the same list so
+reboots don't regress.
+
+### `opensm` disabled-by-default safety
+
+OpenSM can take over fabric management on InfiniBand networks.
+On RoCE-only hosts that's harmless waste; on a fabric with a
+switch-resident SM or another OpenSM instance, having two SMs
+fight is destructive (state thrash, ARP storms, dropped
+connections).
+
+The script explicitly `systemctl disable --now opensm` after
+install. Operators with native IB fabrics that need OpenSM
+enable it manually. The disable is gated on the service
+existing (so non-opensm hosts don't see scary errors).
+
+### Wizard intro updated
+
+The Setup RDMA dialog's intro text now enumerates the full set
+grouped by category — operators can see at a glance what they're
+getting. Test pins references to the marquee additions so the
+dialog text can't silently drift from the script.
+
+### Tests
+
+8 new in `tests/test_v0528_install_rdma_full_coverage.py`:
+* All 13 core packages present in `core_apt_cmd`
+* All 2 Mellanox packages (`libmlx5-dev` + `libmlx4-dev`)
+  present in `mlx5_apt_cmd`
+* All 5 kernel modules (`ib_uverbs`, `rdma_cm`, `rdma_ucm`,
+  `ib_umad`, `iw_cm`) in `rdma_modules`
+* `opensm.service` disabled after install + gated on service
+  existing (avoids errors on hosts without opensm)
+* Wizard intro mentions `librdmacm-dev`, `rdmacm-utils`,
+  `python3-pyverbs`, `opensm`, `mstflint`, `libmlx4-dev`,
+  `rdma_ucm`, `iw_cm`
+* v0.5.27 core/mlx split invariant preserved (anti-collapse)
+* v0.5.27 Mellanox-fail-tolerant invariant preserved (anti-
+  regression on double-package mlx batch)
+
 ## [0.5.27] - 2026-06-07
 
 **RDMA install split from DPDK install** — operator-requested

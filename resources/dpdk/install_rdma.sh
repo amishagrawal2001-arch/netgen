@@ -90,28 +90,73 @@ fi
 
 log_step "Step 1: Install RDMA stack (apt)"
 
-# Core RDMA — always installable on Ubuntu/Debian. Splitting from
-# the Mellanox-only libmlx5-dev mirrors install_dpdk.sh's pattern:
-# Mellanox packages can fail independently on hosts without the
-# MOFED apt repo, and we don't want that to poison the core batch.
+# v0.5.28: comprehensive RDMA dep coverage. Operator request after
+# v0.5.27 split: "make sure all the dependencies for rdma should
+# be taken care during Setup RDMA". The v0.5.27 minimum-viable list
+# missed several pieces that operators routinely need:
+#
+#   librdmacm-dev    — RDMA Connection Manager userspace headers.
+#                      perftest binaries link librdmacm at runtime;
+#                      the -dev variant lets the operator compile
+#                      their own RDMA-CM-using code.
+#   libibmad-dev     — InfiniBand MAD (Management Datagram) library.
+#                      Required by ibdiagnet + many infiniband-diags
+#                      utilities at compile time.
+#   libibumad-dev    — userspace MAD interface (paired with libibmad).
+#   libibnetdisc-dev — IB network discovery (used by ibnetdiscover,
+#                      iblinkinfo for fabric topology).
+#   rdmacm-utils     — rping / ucmatose / ucmd — RDMA-CM smoke test
+#                      utilities. Operator's first "does my RDMA
+#                      stack even work" tool, complementing
+#                      ibv_devices for IB verbs.
+#   python3-pyverbs  — Python ibv_* bindings. Used by some RDMA
+#                      diagnostic scripts and lets operators script
+#                      their own probes without writing C.
+#   opensm           — OpenSM subnet manager. REQUIRED on native
+#                      InfiniBand fabrics that don't have a
+#                      switch-managed SM. Harmless on RoCE-only
+#                      hosts (service stays disabled, no traffic).
+#                      We explicitly disable the service so the
+#                      install doesn't take over fabric management
+#                      from any existing SM.
+#   mstflint         — Mellanox firmware management tools (mstflint,
+#                      mstconfig, mstfwreset). Used to query NIC
+#                      firmware version, change port modes
+#                      (Ethernet ↔ InfiniBand), and apply firmware
+#                      updates. Operator-facing necessity on Mellanox
+#                      hardware.
 core_apt_cmd="DEBIAN_FRONTEND=noninteractive apt-get install -y \
     -o Dpkg::Options::=--force-confdef \
     -o Dpkg::Options::=--force-confold \
     --option Acquire::http::Timeout=30 \
     libibverbs-dev \
+    librdmacm-dev \
+    libibmad-dev \
+    libibumad-dev \
+    libibnetdisc-dev \
     rdma-core \
     perftest \
     ibverbs-utils \
-    infiniband-diags"
+    rdmacm-utils \
+    infiniband-diags \
+    python3-pyverbs \
+    opensm \
+    mstflint"
 
 # Mellanox-only — may fail on hosts without MOFED. Failure here is
 # logged but doesn't fail the script: hosts without Mellanox NICs
 # don't need it, and hosts WITH Mellanox NICs but no MOFED repo
 # might already have a working Mellanox stack via in-kernel mlx5.
+#
+# v0.5.28: added libmlx4-dev for ConnectX-3 / ConnectX-2 hardware.
+# libmlx5-dev only covers ConnectX-4 and newer. Operators with
+# older Mellanox NICs (still common in lab gear from the 2014-2018
+# era) need the mlx4 headers separately.
 mlx5_apt_cmd="DEBIAN_FRONTEND=noninteractive apt-get install -y \
     -o Dpkg::Options::=--force-confdef \
     -o Dpkg::Options::=--force-confold \
-    libmlx5-dev"
+    libmlx5-dev \
+    libmlx4-dev"
 
 log_info "Updating apt index..."
 apt-get update -o Acquire::http::Timeout=30 2>&1 | tail -3 || {
@@ -119,11 +164,19 @@ apt-get update -o Acquire::http::Timeout=30 2>&1 | tail -3 || {
 }
 
 log_info "Installing core RDMA packages..."
-log_info "  libibverbs-dev — InfiniBand verbs library"
-log_info "  rdma-core      — Userspace RDMA stack (ib_uverbs etc.)"
-log_info "  perftest       — RDMA perf tools (ib_send_bw / read_bw / write_bw)"
-log_info "  ibverbs-utils  — ibv_devices, ibv_devinfo, ibv_rc_pingpong"
+log_info "  libibverbs-dev   — InfiniBand verbs library"
+log_info "  librdmacm-dev    — RDMA Connection Manager library"
+log_info "  libibmad-dev     — InfiniBand MAD library (mgmt datagrams)"
+log_info "  libibumad-dev    — Userspace MAD interface"
+log_info "  libibnetdisc-dev — IB network discovery (fabric topology)"
+log_info "  rdma-core        — Userspace RDMA stack (ib_uverbs etc.)"
+log_info "  perftest         — RDMA perf tools (ib_send_bw / read_bw / write_bw)"
+log_info "  rdmacm-utils     — rping / ucmatose (RDMA-CM smoke tests)"
+log_info "  ibverbs-utils    — ibv_devices, ibv_devinfo, ibv_rc_pingpong"
 log_info "  infiniband-diags — ibstat, ibportstate, iblinkinfo"
+log_info "  python3-pyverbs  — Python ibv_* bindings (diagnostic scripting)"
+log_info "  opensm           — InfiniBand subnet manager (disabled by default)"
+log_info "  mstflint         — Mellanox firmware tools (mstflint, mstconfig)"
 
 if ! eval "$core_apt_cmd" 2>&1; then
     log_error "Core RDMA package install failed."
@@ -131,6 +184,21 @@ if ! eval "$core_apt_cmd" 2>&1; then
     exit 2
 fi
 log_success "Core RDMA stack installed."
+
+# v0.5.28: opensm ships with an enabled-by-default service on some
+# distros. On RoCE-only / Soft-RoCE / no-RDMA-hardware hosts, an
+# unwanted opensm daemon is at best wasted memory, at worst takes
+# over fabric management from a switch-resident SM. Disable + stop
+# it; operators with native IB fabrics that need OpenSM can
+# explicitly `systemctl enable --now opensm`.
+if systemctl list-unit-files 2>/dev/null | grep -q '^opensm\.service'; then
+    if systemctl is-enabled opensm.service 2>/dev/null | grep -q 'enabled'; then
+        log_info "Disabling opensm.service (operator must enable explicitly if needed)"
+        systemctl disable --now opensm.service 2>&1 | tail -2 || true
+    else
+        log_info "opensm.service is installed but disabled (correct default)"
+    fi
+fi
 
 # Mellanox-specific
 log_info "Installing Mellanox-specific libmlx5-dev (optional)..."
@@ -146,7 +214,18 @@ fi
 # Step 2: load kernel modules
 log_step "Step 2: Load RDMA kernel modules"
 
-rdma_modules=("ib_uverbs" "rdma_cm" "ib_umad")
+# v0.5.28: expanded kernel module list.
+#   ib_uverbs  — userspace verbs interface (libibverbs needs this)
+#   rdma_cm    — kernel-side RDMA Connection Manager
+#   rdma_ucm   — userspace bridge to rdma_cm (librdmacm needs this;
+#                without it, ib_send_bw / rping / any RDMA-CM
+#                client call fails with EBADF on /dev/infiniband/rdma_cm)
+#   ib_umad    — userspace MAD interface (ibstat / ibportstate
+#                use this)
+#   iw_cm      — iWARP connection manager. Mostly harmless on hosts
+#                without iWARP hardware (Chelsio, Intel-some); load
+#                anyway so the userspace stack is universal.
+rdma_modules=("ib_uverbs" "rdma_cm" "rdma_ucm" "ib_umad" "iw_cm")
 for mod in "${rdma_modules[@]}"; do
     if lsmod | awk '{print $1}' | grep -qx "$mod"; then
         log_success "$mod already loaded"
