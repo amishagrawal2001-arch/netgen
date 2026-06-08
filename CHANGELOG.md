@@ -2,6 +2,130 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.21] - 2026-06-07
+
+**install_dpdk.sh no longer dies with `HOME: unbound variable`
+when systemd spawns it. Plus: removed a stale developer path
+that's been in the script since v0.2.x.**
+
+Full suite: 1,618 passed, 1 skipped (+5 new tests).
+
+### Operator-reported on srv06
+
+The v0.5.20 client surfaced the actual error via inline log tail:
+
+```
+install_dpdk.sh exited with code 1.
+Log file on server: /tmp/netgen_install_dpdk_20260608_011441.log
+
+Last 1 log lines:
+  /opt/netgen/resources/dpdk/install_dpdk.sh: line 23: HOME: unbound variable
+```
+
+The whole install died on the very first variable expansion. v0.5.20
+shipping the log inline let us see this in 5 seconds instead of
+"add ssh, tail file" round-trip — exactly what v0.5.20 was for.
+
+### Root cause
+
+`install_dpdk.sh` line 9:
+```bash
+set -euo pipefail
+```
+
+…and line 23:
+```bash
+DPDK_DIR="${DPDK_DIR:-$HOME/SURAJ/dpdk}"
+```
+
+Under `set -u`, even the `${DPDK_DIR:-$HOME/...}` default-substitution
+form dies if `$HOME` itself is unset — the inner reference is
+evaluated as part of the default expansion.
+
+systemd starts services with a minimal environment. The
+`netgen-server.service` unit doesn't set `Environment="HOME=..."`,
+so when `/api/admin/install_dpdk` calls `subprocess.Popen(["bash",
+script, "--auto"])`, the spawned bash has no `HOME` in env.
+
+Plus a separate code-hygiene issue: `$HOME/SURAJ/dpdk` is the
+original developer's local path (`SURAJ` was the dev's home
+directory name). Should never have been in production code; was
+slipping through because nobody had stepped through the script
+with strict-mode + no HOME until now.
+
+### Fix
+
+**1. Script-side (`resources/dpdk/install_dpdk.sh`):**
+
+```bash
+# Defaults HOME if unset; safe under set -u.
+: "${HOME:=/root}"
+# v0.5.21: was "$HOME/SURAJ/dpdk" — stale dev path.
+DPDK_DIR="${DPDK_DIR:-/opt/dpdk-build}"
+```
+
+`/opt/dpdk-build` matches the project's `/opt/*` convention
+(`/opt/netgen-server`, `/opt/OSTG`, `/opt/netgen`). Updated all 4
+sites in the script:
+* Line 23 (DPDK_DIR default)
+* `detect_dpdk_source()` candidates list
+* Operator-prompt default in `step_clone_dpdk()`
+* Documentation comment
+
+**2. Server-side (`run_tgen_server.py`):**
+
+```python
+env = os.environ.copy()
+env["TERM"] = "xterm"
+env["DEBIAN_FRONTEND"] = "noninteractive"
+...
+env.setdefault("HOME", "/root")   # v0.5.21
+```
+
+Defense-in-depth: even if a server is upgraded to v0.5.21 but
+running a stale install_dpdk.sh (e.g. operator put a local edit
+in `/opt/netgen/resources/dpdk/install_dpdk.sh`), the server-side
+HOME injection saves them.
+
+### Operator-side fix without waiting for v0.5.21
+
+```bash
+ssh root@san-hp-srv06 'HOME=/root nohup bash \
+  /opt/netgen/resources/dpdk/install_dpdk.sh --auto \
+  > /tmp/dpdk_install_retry.log 2>&1 & echo "PID: $!"'
+```
+
+The `HOME=/root` prefix sidesteps the bug on pre-v0.5.21 hosts.
+
+### Pattern observation
+
+This was a **5-second-to-diagnose / 30-second-to-fix** bug —
+exactly what v0.5.20's inline log tail was built for. Without
+v0.5.20 the operator would have:
+1. Seen "exit 1" with no context
+2. SSH'd to srv06
+3. `ls /tmp/netgen_install_dpdk_*.log`
+4. `tail` the latest one
+5. Find the HOME line
+6. (Then come back to me for the fix)
+
+With v0.5.20:
+1. Wizard showed the log tail inline → pasted to me
+2. Identified the bug + fix in one round
+
+v0.5.20 paid for itself on the first install failure after it
+shipped.
+
+### Tests
+
+5 regression tests in
+`tests/test_v0521_install_dpdk_home_unbound.py` pin:
+
+* Script has `: "${HOME:=/root}"` default
+* No `SURAJ` text in any active (non-comment) line of the script
+* `/opt/dpdk-build` is the new default DPDK source dir
+* Server's Popen env calls `env.setdefault("HOME", "/root")`
+
 ## [0.5.20] - 2026-06-07
 
 **Wizard now shows the install_dpdk.sh log tail inline on failure.**

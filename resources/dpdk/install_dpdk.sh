@@ -20,7 +20,18 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # Default values
-DPDK_DIR="${DPDK_DIR:-$HOME/SURAJ/dpdk}"
+# v0.5.21: HOME may be unset when the script is spawned by the
+# Flask server's /api/admin/install_dpdk endpoint — systemd
+# services don't inherit a user shell environment. Combined with
+# `set -u` at line 9, "$HOME" alone dies with "HOME: unbound
+# variable". Use ${HOME:-/root} so the reference is safe even
+# under strict mode.
+# Also: the old default was "$HOME/SURAJ/dpdk" — a stale dev path
+# from the original developer's machine. Replaced with /opt/dpdk-build
+# which is a sane system-wide location and matches the OPT-prefix
+# convention this project uses (/opt/netgen-server, /opt/OSTG).
+: "${HOME:=/root}"
+DPDK_DIR="${DPDK_DIR:-/opt/dpdk-build}"
 AUTO_MODE="${AUTO_MODE:-0}"
 SKIP_BUILD="${SKIP_BUILD:-0}"
 
@@ -148,11 +159,14 @@ prompt_input() {
 
 # Detect DPDK source location
 detect_dpdk_source() {
+    # v0.5.21: removed "$HOME/SURAJ/dpdk" (stale dev path); added
+    # "/opt/dpdk-build" (the new default DPDK_DIR). Search order:
+    # new default first → legacy locations from older installs.
     local possible_locations=(
-        "$HOME/SURAJ/dpdk"
-        "$HOME/dpdk"
+        "/opt/dpdk-build"
         "/opt/dpdk"
         "/usr/src/dpdk"
+        "${HOME}/dpdk"
     )
     
     for loc in "${possible_locations[@]}"; do
@@ -280,7 +294,9 @@ step_detect_dpdk_source() {
         DPDK_DIR="$detected"
     else
         log_warning "DPDK source not found"
-        DPDK_DIR=$(prompt_input "Enter DPDK source directory" "$HOME/SURAJ/dpdk")
+        # v0.5.21: prompt default is the new /opt/dpdk-build path,
+        # not the legacy "$HOME/SURAJ/dpdk" dev path.
+        DPDK_DIR=$(prompt_input "Enter DPDK source directory" "/opt/dpdk-build")
         
         if [[ ! -d "$DPDK_DIR" ]]; then
             log_error "Directory does not exist: $DPDK_DIR"
@@ -309,7 +325,8 @@ step_clone_dpdk() {
     fi
 
     # Make sure the parent dir exists before we cd into it. Default
-    # DPDK_DIR is $HOME/SURAJ/dpdk; on a fresh box with no SURAJ/
+    # DPDK_DIR is /opt/dpdk-build (v0.5.21 — was $HOME/SURAJ/dpdk
+    # which was a stale dev path); on a fresh box with no parent
     # directory, the old `cd "$target_dir"` failed with
     # "No such file or directory" and the install died at Step 3
     # before git ever ran — operators hit this from the /admin

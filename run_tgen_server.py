@@ -14819,6 +14819,15 @@ def api_admin_install_dpdk():
         # Force non-interactive APT / debconf during package installs.
         env["DEBIAN_FRONTEND"] = "noninteractive"
         env["DEBIAN_PRIORITY"] = "critical"
+        # v0.5.21: HOME is missing from systemd's clean environment.
+        # install_dpdk.sh has `set -u` + references "$HOME" — without
+        # HOME being set the script dies on line 23 with
+        # "HOME: unbound variable" before doing anything. Provide /root
+        # (the user the netgen-server service runs as).
+        # v0.5.21 ALSO patches the script itself with `${HOME:-/root}`,
+        # but this defense-in-depth handles pre-v0.5.21 install scripts
+        # on hosts that haven't been upgraded yet.
+        env.setdefault("HOME", "/root")
         # netgen-server.service already runs as root, so `sudo` is redundant.
         # Worse, the host's sudoers has `use_pty`, which fails when there's
         # no TTY (we're a daemon) and exits rc=1 with no output captured.
