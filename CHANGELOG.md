@@ -2,6 +2,69 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.35] - 2026-06-08
+
+**Canonical 7-phase user workflow folded into Help → Feature
+Guide.** Operator request after v0.5.34 close-out: "fold this
+into the in-app help guide".
+
+Full suite: **1,747 passed, 1 skipped** (+9 new tests).
+
+### What landed
+
+A new <b>User workflow</b> section at the TOP of
+<code>_FEATURE_GUIDE_HTML</code> — appears immediately after
+the guide's <h1> intro, before the version-by-version
+highlights. New operators opening Help → Feature Guide see the
+canonical flow FIRST, not a list of v0.3.13 bug fixes.
+
+### The 7 phases
+
+| Phase | What | Menu path |
+|---|---|---|
+| 1 | Install netgen-server on host | scp tarball → `netgen-install` |
+| 2 | Connect from desktop client | `Add TGen Chassis` → `<host>:5050` |
+| 3 | Provision the server (optional) | `Setup RDMA` / `Setup DPDK` (order matters for Mellanox) |
+| 4 | Add devices + streams | `Devices tab → +`, `Streams tab → +` |
+| 5 | Run traffic | `Start ▶` per-stream |
+| 6 | Specialised tests | RFC 2544, Blast RDMA, Topology, L2 emul, Stateful TCP |
+| 7 | Upgrade later | `Install Server → Upgrade Running Server` |
+
+Plus a compressed mental-model ASCII diagram showing the flow
+end-to-end at a glance.
+
+### Discoverability fixes embedded in the workflow
+
+* **Mellanox order dependency** — Setup RDMA must run BEFORE
+  Setup DPDK so the mlx5 PMD picks up libibverbs at meson
+  configure time. The workflow surfaces this explicitly so
+  operators don't hit the silent-PMD-skip trap.
+* **Reboot prompt** — Setup DPDK reboots the host when IOMMU is
+  enabled; the workflow tells operators to re-open Make DPDK
+  Ready post-reboot (orchestrator auto-skips already-done steps).
+* **Wheel upgrade IS the canonical update path** — tarball is
+  for fresh installs only. The workflow says so.
+* **Recent UX wins cited inline** — scrollable log (0.5.32),
+  inline apt-fail tail (0.5.30), Reboot Server button (0.5.34),
+  cgroup-detached upgrade (0.5.23), state-loss-resilient client
+  (0.5.24). Operators reading the guide know these features
+  exist.
+
+### Tests
+
+9 new in `tests/test_v0535_workflow_in_feature_guide.py`:
+* `User workflow` <h2> section present
+* Section appears BEFORE version highlights (positional check)
+* All 7 phases have <h3>Phase N — ...</h3> headers
+* Setup RDMA + Setup DPDK menu paths cited verbatim
+* Mellanox order dependency surfaced (Setup RDMA FIRST)
+* Phase 7 references "Upgrade Running Server"
+* Compressed mental model present + has all key nodes
+  (fresh host, Add TGen Chassis, Devices, Streams, Upgrade)
+* At least 2 recent-UX version stamps (0.5.23 / 24 / 30 / 32 /
+  34) cited near the workflow
+* Version pinned at ≥ 0.5.35
+
 ## [0.5.34] - 2026-06-08
 
 **DPDK menu consolidation + persistent Reboot Server button.**

@@ -3910,6 +3910,132 @@ _FEATURE_GUIDE_HTML = r"""
 organised so the menu / tab where you'll find each one is obvious. For
 the REST endpoint signatures see <strong>Help → API Guide</strong>.</p>
 
+<h2 id="workflow">User workflow <span class="ver new">0.5.34</span></h2>
+<p>The canonical end-to-end path from "fresh server" to "running
+traffic", reflecting all the consolidation through 0.5.34. Skim it
+once if you're new to netgen.</p>
+
+<h3>Phase 1 — Install netgen-server on the host</h3>
+<table>
+  <tr><th>Where</th><th>Action</th></tr>
+  <tr><td>GH Releases</td>
+      <td>Download <code>netgen-server-X.Y.Z-linux-x86_64.tar.gz</code></td></tr>
+  <tr><td>On the target host</td>
+      <td><code>scp</code> tarball over, then
+          <code>sudo tar -xzf netgen-server-*.tar.gz -C /opt/ &amp;&amp;
+          /opt/netgen-server/bin/netgen-install</code></td></tr>
+</table>
+<p class="muted">Self-contained tarball — bundled CPython 3.10 + venv +
+FRR Docker context. No system pip, no PEP 668. Installs systemd unit
+<code>netgen-server.service</code>, binds <code>0.0.0.0:5050</code>.</p>
+
+<h3>Phase 2 — Connect from the desktop client</h3>
+<table>
+  <tr><th>Where</th><th>Action</th></tr>
+  <tr><td>GH Releases</td>
+      <td>Download <code>Netgen-Client-X.Y.Z-*.{dmg,exe,AppImage}</code>
+          for your OS</td></tr>
+  <tr><td>Client → <span class="where">Add TGen Chassis</span></td>
+      <td>Enter <code>&lt;host&gt;:5050</code></td></tr>
+  <tr><td>Right panel</td>
+      <td>Status LED 🟢 when <code>/api/health</code> responds</td></tr>
+</table>
+
+<h3>Phase 3 — Provision the server for your traffic type</h3>
+<p>Pick the row that matches what you'll run. Order matters when you
+need both.</p>
+<table>
+  <tr><th>Goal</th><th>Menu path</th><th>Duration</th><th>Reboot?</th></tr>
+  <tr><td>RDMA tests only (Mellanox, no DPDK)</td>
+      <td><span class="where">Tools → RDMA → Setup RDMA…</span></td>
+      <td>~2 min</td><td>No</td></tr>
+  <tr><td>DPDK on Intel / Broadcom</td>
+      <td><span class="where">Tools → DPDK → Setup DPDK</span></td>
+      <td>~15 min</td><td>Yes — IOMMU</td></tr>
+  <tr><td>DPDK on Mellanox</td>
+      <td>Setup RDMA <b>first</b>, then Setup DPDK</td>
+      <td>~17 min</td><td>Yes — IOMMU</td></tr>
+  <tr><td>Just packet emulation (scapy / Flask)</td>
+      <td>— skip Phase 3</td><td>0</td><td>No</td></tr>
+</table>
+<p>Each wizard streams the install log live (scrollable + selectable
+since 0.5.32) and inlines failures with the apt log tail right there
+(0.5.30). The Reboot Server… button is always available (0.5.34).
+After Setup DPDK reboots the host, re-open Make DPDK Ready —
+Steps 1–3 auto-detect "already done" and skip to whatever's pending.</p>
+
+<h3>Phase 4 — Add devices + streams</h3>
+<table>
+  <tr><th>Where</th><th>Action</th></tr>
+  <tr><td><span class="where">Devices tab → +</span></td>
+      <td>Pick interface, set MAC/IP/VLAN, optional BGP/OSPF/ISIS/DHCP</td></tr>
+  <tr><td><span class="where">Streams tab → +</span></td>
+      <td>Frame size + rate + L2/L3/L4 fields</td></tr>
+  <tr><td>Per-stream engine combo</td>
+      <td><b>Scapy</b> (default), <b>DPDK</b> (line-rate UDP), or
+          <b>RDMA</b> (perftest-driven)</td></tr>
+</table>
+
+<h3>Phase 5 — Run traffic</h3>
+<table>
+  <tr><th>Where</th><th>Action</th></tr>
+  <tr><td>Stream row → ▶ Start</td>
+      <td>TX begins; live PPS / bps / Bytes counters</td></tr>
+  <tr><td>RX side</td>
+      <td>Sniffer auto-falls-back from sub-iface to base iface
+          (0.4.1)</td></tr>
+  <tr><td>Stop</td>
+      <td>Drains the RX queue before snapshotting (0.4.4)</td></tr>
+</table>
+
+<h3>Phase 6 — Specialised tests</h3>
+<table>
+  <tr><th>Test</th><th>Menu path</th></tr>
+  <tr><td>RFC 2544 throughput sweep</td>
+      <td><span class="where">Tools → RFC 2544 Throughput Test…</span>
+          (7 frame sizes, binary-search max no-drop)</td></tr>
+  <tr><td>1:1 RDMA pair</td>
+      <td><span class="where">Tools → RDMA → Blast a RDMA Flow…</span></td></tr>
+  <tr><td>N×M RDMA topology</td>
+      <td><span class="where">Tools → RDMA → Topology Test…</span></td></tr>
+  <tr><td>L2 emulation (BFD/IGMP/VRRP/PIM)</td>
+      <td><span class="where">L2 Emulation tab → Start new session</span></td></tr>
+  <tr><td>Stateful TCP</td>
+      <td><span class="where">Stateful TCP tab</span></td></tr>
+</table>
+
+<h3>Phase 7 — Upgrade the server later</h3>
+<table>
+  <tr><th>Where</th><th>Action</th></tr>
+  <tr><td>GH Releases</td>
+      <td>Download <code>ostg_trafficgen-X.Y.Z-py3-none-any.whl</code></td></tr>
+  <tr><td><span class="where">Install Server → Upgrade Running Server</span></td>
+      <td>Pick the wheel; client polls <code>/api/health</code>,
+          verifies new version</td></tr>
+</table>
+<p class="muted">Wheel-upgrade is cgroup-detached (0.5.23) — survives
+the brief server restart. Client handles state-loss gracefully (0.5.24).
+The tarball is for fresh installs; everything else is wheels.</p>
+
+<h3>Compressed mental model</h3>
+<pre style="background:#f9fafb; border:1px solid #e5e7eb; padding:10px;
+border-radius:4px; font-size:11px; line-height:1.5;">
+fresh host
+   ↓ scp tarball + netgen-install
+   ↓
+server up on :5050  ←──────────────  client connects via Add TGen Chassis
+   ↓
+[optional] Setup RDMA (Mellanox / RDMA tests)
+   ↓
+[optional] Setup DPDK (high-rate UDP)  →  reboot if IOMMU prompted  →  re-run
+   ↓
+add Devices + Streams
+   ↓
+Start ▶  →  traffic flows, RX matches
+   ↓
+[periodic] Upgrade Running Server  →  new wheel via GUI
+</pre>
+
 <h2><span class="ver new">0.3.15</span> highlights — RDMA QP ceiling visibility</h2>
 <p>Operators kept asking "how many QPs can my HCA actually handle?"
 The GUI had no answer — both Blast a RDMA Flow and the per-stream
