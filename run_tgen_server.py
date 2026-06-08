@@ -14266,7 +14266,28 @@ def dpdk_load_modules():
                     logging.info(f"[DPDK LOAD MODULES] modprobe {module} returned: exit_code={result.returncode}, stdout='{result.stdout}', stderr='{result.stderr}'")
                     
                     if result.returncode == 0:
-                        # Verify it's actually loaded
+                        # Verify it's actually loaded.
+                        #
+                        # v0.5.42: anchor the verify pattern just like
+                        # the skip check at line 14248. Pre-fix this
+                        # used a SUBSTRING match
+                        # (`module_pattern in verify_result.stdout.lower()`)
+                        # which matched `vfio_pci` inside `vfio_pci_core`
+                        # AND `pds_vfio_pci` — so `modprobe vfio-pci`
+                        # could rc=0 without actually loading the bare
+                        # `vfio_pci` module (kernel 6.8+ split / driver
+                        # collision with pds_vfio_pci) and verify would
+                        # still report success.
+                        #
+                        # Operator-reported on srv06: admin console
+                        # toast said "VFIO modules loaded" but Status
+                        # row still showed "vfio_pci: Not loaded"
+                        # — the status endpoint used anchored regex
+                        # `^vfio_pci\s` and got the right answer; this
+                        # one didn't.
+                        #
+                        # Anchored regex now matches the actual module
+                        # name on its own line, not as a substring.
                         verify_result = subprocess.run(
                             ["lsmod"],
                             capture_output=True,
@@ -14275,12 +14296,43 @@ def dpdk_load_modules():
                         )
                         if verify_result.returncode == 0:
                             module_pattern = module.replace("-", "_")
-                            if module_pattern in verify_result.stdout.lower():
+                            loaded_ok = bool(re.search(
+                                rf'^{module_pattern}\s',
+                                verify_result.stdout,
+                                re.MULTILINE | re.IGNORECASE,
+                            ))
+                            if loaded_ok:
                                 loaded_modules.append(module)
                                 logging.info(f"[DPDK LOAD MODULES] Successfully loaded and verified {module}")
                             else:
-                                # Module command succeeded but not in lsmod - might be a dependency issue
-                                error_msg = f"modprobe succeeded but module {module} not found in lsmod. Check dependencies: {result.stderr or result.stdout}"
+                                # modprobe rc=0 but the module isn't
+                                # in lsmod as its own line. Surface a
+                                # precise diagnostic so the operator
+                                # can act from the admin console
+                                # without SSHing — include what's in
+                                # lsmod for the module's family + the
+                                # stderr / stdout from modprobe.
+                                related_lines = [
+                                    ln for ln in verify_result.stdout.splitlines()
+                                    if module_pattern.split("_")[0] in ln.lower()
+                                ]
+                                related_summary = (
+                                    "; ".join(ln.split()[0] for ln in related_lines if ln)
+                                    or "(no related modules in lsmod)"
+                                )
+                                error_msg = (
+                                    f"modprobe rc=0 but `{module}` "
+                                    f"isn't loaded as its own module. "
+                                    f"Related lsmod entries: "
+                                    f"{related_summary}. "
+                                    f"modprobe stderr: "
+                                    f"{(result.stderr or '').strip() or '(empty)'}. "
+                                    f"Possible causes: kernel 6.8+ "
+                                    f"vfio-pci split + a driver like "
+                                    f"pds_vfio_pci using vfio_pci_core "
+                                    f"only. Try `modprobe -v vfio-pci` "
+                                    f"on the host for the verbose output."
+                                )
                                 logging.warning(f"[DPDK LOAD MODULES] {error_msg}")
                                 failed_modules.append({
                                     "module": module,

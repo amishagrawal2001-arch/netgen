@@ -2,6 +2,83 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.42] - 2026-06-08
+
+**`/api/dpdk/load_modules` verify uses anchored regex (not
+substring).** Operator-reported on srv06 (kernel 6.8.0-124):
+admin console "Load VFIO Modules" toast said "VFIO modules
+loaded" while the Status row continued to show
+`vfio_pci module: Not loaded`.
+
+Full suite: **1,801 passed, 1 skipped** (+6 new tests).
+
+### The bug
+
+Post-modprobe verify used a SUBSTRING match:
+
+```python
+if module_pattern in verify_result.stdout.lower():  # ← bug
+    loaded_modules.append(module)
+```
+
+`module_pattern = "vfio_pci"` substring-matches inside:
+* `vfio_pci_core` — always present when `pds_vfio_pci` is
+  loaded (AMD Pensando auto-loaded on srv06's hardware)
+* `pds_vfio_pci` itself
+
+So `modprobe vfio-pci` could rc=0 without actually loading the
+bare `vfio_pci` module — verify still reported success →
+admin toast lied → operator was confused why Status disagreed.
+
+### Why it diverged from Status
+
+The **same endpoint's** skip-already-loaded check (a few lines
+above) used the anchored regex `^{module_pattern}\s` and worked
+correctly. The status endpoint `/api/dpdk/status` also used
+anchored regex. Only the post-modprobe verify diverged — a
+copy-paste mistake that lived since the original endpoint.
+
+### Fix
+
+Verify now uses the same anchored regex as the skip check:
+
+```python
+loaded_ok = bool(re.search(
+    rf'^{module_pattern}\s',
+    verify_result.stdout,
+    re.MULTILINE | re.IGNORECASE,
+))
+```
+
+### Diagnostic context when verify fails
+
+When the anchored verify catches a false-success (modprobe rc=0
+but module isn't there), the error message now includes:
+
+* **Related lsmod entries** — enumerates which modules from the
+  same family ARE loaded (e.g. `vfio_pci_core; pds_vfio_pci;
+  vfio`), so the operator sees what's hogging the slot.
+* **modprobe stderr** — kernel rejection reasons (signing,
+  blacklist, version mismatch) reach the admin toast directly
+  instead of being lost to journalctl.
+* **Likely cause hint** — calls out kernel 6.8+ vfio-pci split
+  + pds_vfio_pci as the most common cause, with a copy-pasteable
+  `modprobe -v vfio-pci` diagnostic command.
+
+Operator can self-resolve from the admin console without SSHing.
+
+### Tests
+
+6 new in `tests/test_v0542_load_modules_verify_anchored.py`:
+* Verify uses anchored `re.search(rf'^{module_pattern}\s', ...)`
+* Buggy `module_pattern in verify_result.stdout.lower()` is GONE
+* Failure error message enumerates related lsmod entries
+  (`Related lsmod ...`)
+* Failure error message includes modprobe `stderr`
+* Skip-already-loaded check still uses the anchored regex
+  (anti-regression — would over-skip and never attempt modprobe)
+* Version pinned at ≥ 0.5.42
+
 ## [0.5.41] - 2026-06-08
 
 **Install/Upgrade dialog log header compacted.** Operator
