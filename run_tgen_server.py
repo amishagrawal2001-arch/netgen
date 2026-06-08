@@ -17747,10 +17747,25 @@ def interface_admin(iface):
                 "ok": False,
                 "error": "state must be 'up' or 'down'",
             }), 400
-        # Step 3 — apply via `ip link set`. -- prevents iface
-        # starting with - from being parsed as an option.
+        # Step 3 — apply via `ip link set`.
+        #
+        # v0.5.38: dropped the `--` end-of-options separator. iproute2
+        # DOES NOT grok the GNU `--` convention; passing it makes
+        # `ip` fail with:
+        #
+        #   Error: either "dev" is duplicate, or "ens3f0np0" is a garbage.
+        #
+        # Operator-reported on srv06 (Jun 8 2026): clicking "Set
+        # Online" in the right-click context menu (Interfaces tab)
+        # returned HTTP 500 with that exact iproute2 error.
+        #
+        # Use `dev <iface>` explicitly instead. This is iproute2's
+        # canonical disambiguation: `dev` tells `ip link set` that
+        # the next argument is the device name, NOT an option flag.
+        # Defends against iface starting with `-` the same way the
+        # original `--` was intended to.
         r = _sp.run(
-            ["ip", "link", "set", "--", iface, state],
+            ["ip", "link", "set", "dev", iface, state],
             capture_output=True, text=True, timeout=10,
         )
         if r.returncode != 0:

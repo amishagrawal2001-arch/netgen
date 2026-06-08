@@ -92,22 +92,39 @@ def test_interface_admin_strict_state_whitelist():
     )
 
 
-def test_interface_admin_uses_double_dash_to_separate_args():
-    """`ip link set` parses dashes as options. An iface named
-    `-rf` would be eaten as an option. `--` between subcommand
-    and args fixes it."""
+def test_interface_admin_uses_dev_keyword_not_double_dash():
+    """v0.5.38 INVERSION of the original v0.5.4 contract.
+
+    Originally this test enforced `--` between `set` and the iface
+    name (GNU end-of-options convention). But iproute2 does NOT
+    honour `--` — passing it makes `ip` fail with:
+
+      Error: either "dev" is duplicate, or "<iface>" is a garbage.
+
+    Operator-reported on srv06 (Jun 8 2026): right-click Set Online
+    → HTTP 500. The original v0.5.4 fix was the bug.
+
+    The correct disambiguation is the explicit `dev` keyword.
+    `ip link set dev <iface> <state>` tells iproute2 the next arg
+    is the device, AND still defends against iface names starting
+    with `-` (they're treated as device names, not flags).
+    """
     src = _SERVER.read_text()
     m = re.search(
         r"def interface_admin\(iface\)[\s\S]+?(?=\n@app\.route|\nclass )",
         src,
     )
     body = m.group(0)
-    # Look for the argv list with `--` after "set".
-    assert re.search(r'"ip",\s*"link",\s*"set",\s*"--"', body) or \
-           re.search(r"'ip',\s*'link',\s*'set',\s*'--'", body), (
-        "interface_admin's `ip link set` argv doesn't include "
-        "`--` after 'set'. An iface named '-rf' (or any name "
-        "starting with '-') would be parsed as a flag."
+    # Must use `dev` keyword.
+    assert re.search(r'"ip",\s*"link",\s*"set",\s*"dev"', body), (
+        "interface_admin's `ip link set` argv doesn't use the "
+        "`dev` keyword. iproute2 needs it to know which arg is "
+        "the device name."
+    )
+    # Must NOT use the `--` separator.
+    assert not re.search(r'"ip",\s*"link",\s*"set",\s*"--"', body), (
+        "interface_admin still passes `--` to `ip link set`. "
+        "iproute2 doesn't honour GNU `--` — see v0.5.38 fix."
     )
 
 

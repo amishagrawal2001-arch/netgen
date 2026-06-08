@@ -2,6 +2,66 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.38] - 2026-06-08
+
+**`ip link set` arg order — drop `--`, use `dev`.** Operator
+right-click Set Online on the Interfaces tab returned HTTP 500:
+
+```
+{"error": "Error: either \"dev\" is duplicate, or \"ens3f0np0\"
+ is a garbage.", "ok": false}
+```
+
+Full suite: **1,769 passed, 1 skipped** (+6 new tests, 1
+existing test inverted).
+
+### Root cause: iproute2 doesn't grok GNU `--`
+
+The v0.5.4 `interface_admin` endpoint constructed:
+
+```python
+["ip", "link", "set", "--", iface, state]
+```
+
+The `--` end-of-options separator is a GNU convention — `getopt` /
+`coreutils` honour it, iproute2 does NOT. When `ip link set` sees
+`--` it tries to parse it as a positional argument, collides with
+the next arg's role as device name, and errors out with that
+exact "either dev is duplicate, or X is a garbage" message.
+
+The original v0.5.4 intent was right (defend against iface names
+starting with `-` being parsed as flags). The implementation was
+wrong (wrong tool's convention).
+
+### Fix: explicit `dev` keyword
+
+```python
+["ip", "link", "set", "dev", iface, state]
+```
+
+iproute2's canonical disambiguation. `dev` tells `ip link set`
+that the next arg is the device name, regardless of whether it
+starts with `-`. Same defense the `--` was trying to provide,
+but in the dialect iproute2 actually speaks.
+
+### Tests
+
+6 new in `tests/test_v0538_interface_admin_iproute2_arg_order.py`:
+* Subprocess call uses the `dev` keyword
+* Subprocess call does NOT use the `--` separator
+* `dev` appears before `iface` in the arg list (`set dev <iface> <state>`,
+  not the wrong order)
+* Subprocess remains list-form (anti-regression on shell-injection
+  safety — no `shell=True`)
+* No other `ip ...` callsites pass `--` (sweep across the
+  repo)
+
+1 existing test inverted: `test_v054_interface_admin_context_menu::test_interface_admin_uses_double_dash_to_separate_args`
+renamed to `test_interface_admin_uses_dev_keyword_not_double_dash`.
+Pre-v0.5.38 it enforced the `--` (the bug); v0.5.38 enforces `dev`
++ absence of `--`. Comment in the test explains the inversion +
+links to the v0.5.38 fix.
+
 ## [0.5.37] - 2026-06-08
 
 **DPDK runtime state survives reboots.** Operator on srv06 after
