@@ -2,6 +2,101 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.31] - 2026-06-08
+
+**Real fix: `-o APT::Sandbox::User=root` on every apt invocation.**
+Three releases of "install python3-pyelftools" couldn't fix what
+v0.5.30's hard gate finally surfaced — apt was failing under
+systemd's syscall sandbox before any package could be downloaded.
+
+Full suite: **1,709 passed, 1 skipped** (+4 new tests).
+
+### Root cause finally pinned
+
+The v0.5.30 hard gate ran on srv06 and produced this from
+`/tmp/dpdk_deps_install.log`:
+
+```
+E: setgroups 65534 failed - setgroups (1: Operation not permitted)
+Err:15 ... Could not open file .../python3-pyelftools_0.30-1_all.deb
+    - open (13: Permission denied)
+W: chown to _apt:root of directory /var/cache/apt/archives/partial
+   failed - SetupAPTPartialDirectory (1: Operation not permitted)
+[✗] Dependency installation failed
+```
+
+By default `apt-get` drops privileges to the unprivileged `_apt`
+user for downloads (calls `setgroups()` then `setuid()`). When
+the netgen-server systemd unit's syscall filter or
+`RestrictSUIDSGID=true` blocks `setgroups()`, apt fails to drop
+privs → can't read/write `/var/cache/apt/archives/partial/` → the
+download fails silently → the entire install batch errors out.
+
+The script's "Continue anyway?" prompt auto-returned "y" in
+AUTO_MODE (v0.5.29 fix didn't catch this fall-through) → Step 5
+meson errored on the missing pyelftools.
+
+### Fix: `-o APT::Sandbox::User=root` on every apt call
+
+```bash
+DEBIAN_FRONTEND=noninteractive apt-get install -y \
+    -o Dpkg::Options::=--force-confdef \
+    -o Dpkg::Options::=--force-confold \
+    -o APT::Sandbox::User=root \           # ← v0.5.31
+    --option Acquire::http::Timeout=30 \
+    ...
+```
+
+Tells apt to skip the privilege drop entirely. Safe because
+netgen-server already runs as root. Sidesteps the systemd
+sandbox cleanly without needing to modify the systemd unit.
+
+Applied to:
+* `deps_install_cmd` in install_dpdk.sh (the main install)
+* `apt-get update -y` retry loop in install_dpdk.sh step 4
+* `core_apt_cmd` in install_rdma.sh
+* `mlx5_apt_cmd` in install_rdma.sh
+* `apt-get update` at top of install_rdma.sh
+
+### Why this took 3 releases to find
+
+* **v0.5.25** added `python3-pyelftools` to the apt batch
+* **v0.5.26** added 8 more optional packages
+* **v0.5.29** dropped the early-return that was skipping apt-install
+  entirely (`check_dpdk_dependencies` only verified 7 of 16+ packages)
+* **v0.5.30** added the hard-gate that finally PRESERVED the
+  apt log + inlined it into the failure dialog
+
+Without v0.5.30, the apt log got `rm -f`'d before the operator
+could read it. With v0.5.30's hard-gate diagnostic, the actual
+`setgroups EPERM` error became visible. v0.5.31 fixes the root
+cause.
+
+### Retry on srv06 (after wheel upgrade to v0.5.31)
+
+```
+Tools → DPDK → Setup DPDK → Make DPDK Ready
+```
+
+Step 4 will now succeed. Apt downloads complete. pyelftools
+installs. Step 5 meson setup proceeds without the missing-module
+error.
+
+### Tests
+
+4 new in `tests/test_v0531_apt_sandbox_user_root.py`:
+* Every apt-get invocation in install_dpdk.sh includes
+  `APT::Sandbox::User=root` (multi-line continuations covered)
+* Every apt-get invocation in install_rdma.sh includes it too
+* Option documented with rationale (must mention `setgroups`
+  or `RestrictSUIDSGID` or `systemd` near the use site so a
+  future refactor doesn't silently drop it)
+* Version pinned at ≥ 0.5.31
+
+The test helper deliberately skips lines where `apt-get` appears
+inside `log_error`/`echo`/`printf` strings — those are recovery
+text for operators, not executed commands.
+
 ## [0.5.30] - 2026-06-08
 
 **Hard gate on `python3-pyelftools` after Step 4 apt install.**

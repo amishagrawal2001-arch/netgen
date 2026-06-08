@@ -128,6 +128,7 @@ log_step "Step 1: Install RDMA stack (apt)"
 core_apt_cmd="DEBIAN_FRONTEND=noninteractive apt-get install -y \
     -o Dpkg::Options::=--force-confdef \
     -o Dpkg::Options::=--force-confold \
+    -o APT::Sandbox::User=root \
     --option Acquire::http::Timeout=30 \
     libibverbs-dev \
     librdmacm-dev \
@@ -155,11 +156,15 @@ core_apt_cmd="DEBIAN_FRONTEND=noninteractive apt-get install -y \
 mlx5_apt_cmd="DEBIAN_FRONTEND=noninteractive apt-get install -y \
     -o Dpkg::Options::=--force-confdef \
     -o Dpkg::Options::=--force-confold \
+    -o APT::Sandbox::User=root \
     libmlx5-dev \
     libmlx4-dev"
 
 log_info "Updating apt index..."
-apt-get update -o Acquire::http::Timeout=30 2>&1 | tail -3 || {
+# v0.5.31: -o APT::Sandbox::User=root — see comment block above
+# core_apt_cmd. Required when invoked from netgen-server.service
+# (systemd RestrictSUIDSGID blocks apt's _apt-user privilege drop).
+apt-get update -o APT::Sandbox::User=root -o Acquire::http::Timeout=30 2>&1 | tail -3 || {
     log_warning "apt-get update failed — continuing with cached index"
 }
 

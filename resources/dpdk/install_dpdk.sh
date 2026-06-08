@@ -485,7 +485,7 @@ step_install_dependencies() {
     APT_UPDATE_SUCCESS=0
     
     while [[ $RETRY_COUNT -lt $MAX_RETRIES ]]; do
-        if apt-get update -y --option Acquire::http::Timeout=30 --option Acquire::ftp::Timeout=30 2>&1 | grep -q "Reading package lists"; then
+        if apt-get update -y -o APT::Sandbox::User=root --option Acquire::http::Timeout=30 --option Acquire::ftp::Timeout=30 2>&1 | grep -q "Reading package lists"; then
             APT_UPDATE_SUCCESS=1
             break
         fi
@@ -568,7 +568,24 @@ step_install_dependencies() {
     # ~20-40 MB of apt download/install but eliminates the "Make
     # DPDK Ready" surface for downstream feature requests (someone
     # wanting AF_XDP, telemetry export, etc. doesn't need a re-roll).
-    local deps_install_cmd="DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold --option Acquire::http::Timeout=30 --option Acquire::ftp::Timeout=30 build-essential meson ninja-build pkg-config libnuma-dev libelf-dev libpcap-dev python3-pyelftools libssl-dev libjansson-dev libbpf-dev libxdp-dev libbsd-dev zlib1g-dev libfdt-dev libarchive-dev ${kernel_headers}"
+    # v0.5.31: -o APT::Sandbox::User=root disables apt's
+    # unprivileged-download sandbox. Required because the
+    # netgen-server systemd unit has RestrictSUIDSGID=true (and/or
+    # a seccomp filter blocking setgroups). When apt tries to drop
+    # to the `_apt` user for downloads, setgroups() returns EPERM
+    # and apt fails the entire batch with:
+    #
+    #   E: setgroups 65534 failed - Operation not permitted
+    #   E: Could not open file .../python3-pyelftools_0.30-1_all.deb
+    #      - open (13: Permission denied)
+    #
+    # Real failure on srv06 (Jun 8 2026, post v0.5.29): the apt
+    # batch failed silently → python3-pyelftools never installed →
+    # Step 5 meson errored out THREE upgrades in a row.
+    #
+    # Telling apt to stay root for downloads sidesteps it cleanly.
+    # Safe: netgen-server.service runs as root anyway.
+    local deps_install_cmd="DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o APT::Sandbox::User=root --option Acquire::http::Timeout=30 --option Acquire::ftp::Timeout=30 build-essential meson ninja-build pkg-config libnuma-dev libelf-dev libpcap-dev python3-pyelftools libssl-dev libjansson-dev libbpf-dev libxdp-dev libbsd-dev zlib1g-dev libfdt-dev libarchive-dev ${kernel_headers}"
 
     # v0.3.2: tighten umask around the temp-log tee so the file is
     # 0600 (owner-only) instead of the default 0644 (world-readable).
