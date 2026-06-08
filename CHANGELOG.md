@@ -2,6 +2,96 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.20] - 2026-06-07
+
+**Wizard now shows the install_dpdk.sh log tail inline on failure.**
+Operators no longer need to ssh in to find out WHY the install
+broke — last 30 lines + log path + retry button right in the
+dialog.
+
+Full suite: 1,613 passed, 1 skipped (+6 new tests).
+
+### Operator-reported
+
+[Screenshot showing Make DPDK Ready dialog with `Install DPDK
+runtime + build tx_worker — install_dpdk.sh exit 1` and a generic
+"Check the log on the server for the failure reason" message.]
+
+The v0.5.17 polling fix did its job — caught the actual exit code
+instead of falsely claiming success — but left the operator at
+"exit 1" with no context. The log on the server has the actual
+error; we just weren't showing it.
+
+### Fix
+
+`_on_install_dpdk_log_response()` already gets the last 64 KiB of
+log in the response (`data["log"]` — server-side included since
+v0.3.11 for the live log pane). The rc != 0 branch now:
+
+1. Extracts `log_full = data.get("log")`
+2. Renders the last 30 lines in a styled `<pre>` block
+3. HTML-escapes `&`/`<`/`>` so build output with shell syntax
+   doesn't break the dialog render
+4. Shows `log_path` so operators can ssh + tail for full context
+5. Keeps the Retry button (workflow: see error → fix → retry)
+
+### Detail pane after v0.5.20
+
+Before:
+```
+install_dpdk.sh exited with code 1.
+Check the log on the server for the failure reason. Common causes:
+apt timeout, network unreachable during DPDK source clone, missing
+dev packages.
+Log file path was shown when the step started.
+```
+
+After:
+```
+install_dpdk.sh exited with code 1.
+Log file on server: /tmp/netgen_install_dpdk_20260607_185342.log
+Common causes: apt timeout, network unreachable during DPDK source
+clone, missing dev packages, libpcap-dev/libnuma-dev not installed.
+
+Last 30 log lines:
+  ┌──────────────────────────────────────────────────────────┐
+  │ E: Unable to fetch some archives, maybe run apt update?  │
+  │ + apt-get -y install libpcap-dev libnuma-dev ...        │
+  │ Reading package lists...                                  │
+  │ E: Could not get lock /var/lib/apt/lists/lock - open ... │
+  │ E: Unable to lock directory /var/lib/apt/lists/          │
+  │ install_dpdk.sh: Step 2/8 failed (apt install)           │
+  └──────────────────────────────────────────────────────────┘
+
+Click Retry after fixing, or ssh to the server and tail
+/tmp/netgen_install_dpdk_20260607_185342.log for full context.
+```
+
+### Pattern
+
+Same shape as v0.5.11's `_verify_running()` diagnostic dump (which
+showed journalctl + port-5050 occupant + legacy svc status inline
+on /api/health timeout). Different surface, identical principle:
+**when something the operator needs is already in our response,
+render it — don't make them ssh to find what we have.**
+
+Codified rule: every "failed, see logs elsewhere" message in the
+GUI is a UX bug. If the logs are reachable via existing endpoints,
+show them inline.
+
+### Tests
+
+6 regression tests in
+`tests/test_v0520_install_failure_log_tail.py` pin:
+
+* Failure branch reads `data.get("log")` from response
+* Failure branch reads `data.get("log_path")` for the path display
+* HTML-escapes `&` and `<` (build output with `<` chars or shell
+  syntax doesn't corrupt the dialog)
+* Caps to last-N lines via `splitlines()[-N:]` so the dialog
+  doesn't grow unbounded
+* Retry button still works
+
 ## [0.5.19] - 2026-06-07
 
 **Tier 2 DPDK UX — proactive detect + live install ETA.**

@@ -749,14 +749,44 @@ class MakeDpdkReadyDialog(QDialog):
             self._install_poll_timer.start()
         else:
             row.set_state("fail", f"install_dpdk.sh exit {rc}")
+            # v0.5.20: render the log tail inline in the detail pane
+            # so the operator sees the actual failure reason without
+            # ssh-ing to the server. The server's response already
+            # includes a `log` field with the last 64 KiB; we render
+            # the last ~30 lines + path + exit code.
+            log_full = data.get("log") or ""
+            log_path = data.get("log_path") or "(unknown)"
+            # Keep last 30 lines (avoid drowning the dialog in build
+            # spew). Operators wanting more can ssh + cat the file.
+            tail_lines = log_full.splitlines()[-30:]
+            tail_html = (
+                "<pre style='background:#111827; color:#f3f4f6; "
+                "padding:8px; border-radius:4px; font-size:11px; "
+                "white-space:pre-wrap;'>"
+                + "\n".join(
+                    # Escape HTML so a stray '<' in the log doesn't
+                    # break the QTextBrowser render.
+                    line.replace("&", "&amp;")
+                        .replace("<", "&lt;")
+                        .replace(">", "&gt;")
+                    for line in tail_lines
+                )
+                + "</pre>"
+            )
             self._detail.setText(
                 f"<span style='color:#b91c1c;'>"
-                f"<b>install_dpdk.sh exited with code {rc}.</b><br>"
-                f"Check the log on the server for the failure reason. "
-                f"Common causes: apt timeout, network unreachable "
-                f"during DPDK source clone, missing dev packages.<br>"
-                f"Log file path was shown when the step started."
-                f"</span>"
+                f"<b>install_dpdk.sh exited with code {rc}.</b></span>"
+                f"<br><b>Log file on server:</b> "
+                f"<code>{log_path}</code>"
+                f"<br><b>Common causes:</b> apt timeout, network "
+                f"unreachable during DPDK source clone, missing dev "
+                f"packages, libpcap-dev/libnuma-dev not installed."
+                f"<br><br><b>Last {len(tail_lines)} log lines:</b>"
+                f"{tail_html}"
+                f"<p style='color:#6b7280; font-size:11px;'>"
+                f"Click <b>Retry</b> after fixing, or ssh to the "
+                f"server and tail "
+                f"<code>{log_path}</code> for full context.</p>"
             )
             self._run_btn.setText("Retry")
             self._run_btn.setEnabled(True)
