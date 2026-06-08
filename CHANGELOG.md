@@ -2,6 +2,99 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.22] - 2026-06-07
+
+**CI optimization: tarball workflow no longer auto-triggers on
+tags.** Per-release rebuild was burning ~5 min of CI on a 196 MB
+artifact most releases didn't change.
+
+Full suite: 1,624 passed, 1 skipped (+6 new tests, 1 existing test
+inverted).
+
+### Operator request
+
+> do not generate tar.gz at every release
+
+### Rationale
+
+* Tarball is ~196 MB; per-tag build cost ~5 min of CI (apt +
+  python-build-standalone download + venv build + pack)
+* Tarball is only consumed by **fresh installs**. Existing installs
+  upgrade via wheel through the GUI — they never touch the tarball.
+* The v0.5.6 → v0.5.21 cascade today touched code bundled in the
+  wheel (run_tgen_server.py, widgets, traffic_client, utils,
+  resources/dpdk/install_dpdk.sh). The tarball-only assets (bundled
+  CPython 3.10.14, FRR Docker context, the netgen-install /
+  netgen-upgrade / netgen-uninstall wrapper scripts) didn't change
+  in most of these releases.
+* Each unchanged-tarball rebuild was waste.
+
+### Change
+
+`.github/workflows/build-server-tarball.yml` — dropped the
+`tags:` trigger. Workflow now fires only on:
+
+1. **`workflow_dispatch`** — manual via `gh workflow run` or the
+   Actions UI's "Run workflow" button.
+2. **`push` to `claude/**`** with path filter on
+   `scripts/tarball/**`, the workflow file itself, or
+   `pyproject.toml` — auto-tests script edits during dev without
+   needing manual dispatch.
+
+`release.yml` (the wheel + .dmg + .exe + .AppImage workflow) is
+**unchanged** — it still auto-triggers on tags. Most of the
+release value (the wheel for upgrades + 3 client binaries) keeps
+its zero-touch publish flow.
+
+### When you DO need a tarball for a tag
+
+```bash
+gh workflow run build-server-tarball.yml --ref v0.5.22
+```
+
+Or via Actions UI: Workflows → build-server-tarball → Run workflow
+→ pick `v0.5.22` from the ref selector.
+
+Once it completes, the tarball auto-attaches to the existing GH
+release (softprops/action-gh-release is idempotent — it ADDs the
+asset without touching the existing wheel/client uploads).
+
+### Operator-side note
+
+If you have a workflow that always grabs the latest tarball, it
+will break (the v0.5.22 release won't have one until/unless
+manually built). Two workarounds:
+
+1. Pin to the last release with a tarball: v0.5.21 (always
+   available, doesn't change)
+2. Run `gh workflow run build-server-tarball.yml --ref vX.Y.Z`
+   before consuming the release
+
+### What this saves
+
+| | Before v0.5.22 | After v0.5.22 |
+|---|---|---|
+| CI minutes per tag push | ~8 min (wheel build + tarball build in parallel) | ~3 min (wheel + clients only) |
+| GitHub storage per release | ~196 MB tarball + ~50 MB clients | ~50 MB clients only (tarball on-demand) |
+| Releases per day (this session's pace) | 22 → ~3 GB extra storage | 22 → 0 extra |
+
+### Tests
+
+6 new regression tests in
+`tests/test_v0522_tarball_workflow_no_tag_trigger.py`:
+* Tag trigger absent from active YAML (comments allowed for
+  changelog context)
+* `workflow_dispatch` retained (manual dispatch must work)
+* Branch-push trigger + path filter retained (dev-loop)
+* Workflow comment explains WHY + HOW to build on demand
+* `release.yml` still triggers on tags (other artifacts unaffected)
+
+1 existing test inverted: `test_workflow_triggers_on_v_tags` in
+`test_v050_phase3_gui_tarball_dispatch.py` used to assert the tag
+trigger existed; now asserts it's absent + workflow_dispatch is
+present. Comment explains the v0.5.22 inversion + cross-references
+the dedicated v0.5.22 test.
+
 ## [0.5.21] - 2026-06-07
 
 **install_dpdk.sh no longer dies with `HOME: unbound variable`

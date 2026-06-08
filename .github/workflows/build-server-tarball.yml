@@ -44,14 +44,26 @@ on:
       - '.github/workflows/build-server-tarball.yml'
       - 'scripts/tarball/**'
       - 'pyproject.toml'
-    # v0.5.0+ tags trigger the tarball build AND release attachment.
-    # release.yml handles the wheel/.dmg/.exe/.AppImage attachments
-    # for the same tag — both workflows run in parallel and softprops
-    # updates the same GH release without conflict.
-    tags:
-      - 'v0.5.*'
-      - 'v0.[6-9].*'
-      - 'v[1-9].*'
+    # v0.5.22: dropped the tag-based auto-trigger. Operator request:
+    # "do not generate tar.gz at every release". Rationale:
+    #
+    #   * Tarball is ~196 MB; building costs ~5 min of CI per tag
+    #     (apt + python-build-standalone download + venv build + pack)
+    #   * The tarball is ONLY needed for fresh installs. Existing
+    #     installs upgrade via wheel through the GUI — they never
+    #     touch the tarball.
+    #   * Most releases (v0.5.6 → v0.5.21 cascade today) touched code
+    #     bundled in the wheel, not the tarball-only assets (bundled
+    #     CPython, install scripts, FRR Docker context). Rebuilding
+    #     for each was waste.
+    #
+    # When you DO need a fresh tarball for a tag:
+    #   gh workflow run build-server-tarball.yml --ref v0.5.22
+    # Or use the Actions UI's "Run workflow" button.
+    #
+    # The branch-push trigger above (path-filtered) still auto-builds
+    # when scripts/tarball/* changes during dev — operators wanting
+    # to test a script edit don't need to remember to dispatch.
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"

@@ -203,19 +203,36 @@ def test_dispatcher_routes_tar_gz_to_tarball_path():
 
 
 def test_workflow_triggers_on_v_tags():
-    """build-server-tarball.yml must trigger on v0.5.* tags
-    (and forward versions). Without this, v0.5.0 releases don't
-    get the tarball asset attached."""
+    """v0.5.22 update: the tarball workflow USED to auto-trigger
+    on v0.5.* tags. Operator request "do not generate tar.gz at
+    every release" dropped that trigger — per-tag rebuilds were
+    burning ~5 min of CI per release on a 196 MB artifact that
+    most releases didn't change anything in.
+
+    The workflow now triggers via:
+      1. workflow_dispatch (manual `gh workflow run`)
+      2. push to claude/** when scripts/tarball/** changes
+
+    This test was inverted — it now pins that the tag trigger is
+    GONE (was: ensures the tag trigger exists). Anyone re-adding
+    the tag trigger will trip test_v0522_tarball_workflow_no_tag_trigger
+    which explains the rationale + alternative dispatch path."""
     src = _WORKFLOW.read_text()
-    # The tags trigger must include v0.5.* (and equivalent for
-    # forward versions). Match the most-specific tag pattern.
-    assert "tags:" in src, "Workflow has no tags trigger"
-    assert "v0.5.*" in src, (
-        "Workflow doesn't fire on v0.5.* tags — the first v0.5.0 "
-        "release won't get the tarball attached. release.yml's "
-        "wheel/.dmg/.exe/.AppImage attach, but the tarball that "
-        "v0.5.0 SHIPS doesn't show up on the release page."
+    assert "workflow_dispatch:" in src, (
+        "workflow_dispatch trigger missing — operators have no "
+        "way to manually build a tarball for a specific tag."
     )
+    # Tags must NOT be in an active trigger position.
+    for line in src.splitlines():
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        assert not re.match(r'^tags\s*:\s*$', stripped), (
+            f"Tag trigger re-added to build-server-tarball.yml:\n"
+            f"  {line!r}\n"
+            f"See v0.5.22 CHANGELOG for why this was dropped + how "
+            f"to build tarballs on demand instead."
+        )
 
 
 def test_workflow_attaches_tarball_to_github_release_on_tag():
