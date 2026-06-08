@@ -503,7 +503,12 @@ step_install_dependencies() {
     # build deps + perftest + rdma-core also didn't install →
     # cascading install failure. Split so the optional Mellanox
     # package can fail independently without poisoning the core set.
-    local deps_install_cmd="DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold --option Acquire::http::Timeout=30 --option Acquire::ftp::Timeout=30 build-essential meson ninja-build pkg-config libnuma-dev libelf-dev libpcap-dev libibverbs-dev rdma-core perftest ${kernel_headers}"
+    # v0.5.25: python3-pyelftools required by DPDK 23.11's
+    # buildtools/meson.build:58 — without it `meson setup` fails
+    # with "missing python module: elftools". Reported on srv06/
+    # Ubuntu 24.04. Apt package supplies the `elftools` Python
+    # module to whichever python3 meson picks up.
+    local deps_install_cmd="DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold --option Acquire::http::Timeout=30 --option Acquire::ftp::Timeout=30 build-essential meson ninja-build pkg-config libnuma-dev libelf-dev libpcap-dev libibverbs-dev rdma-core perftest python3-pyelftools ${kernel_headers}"
     local mlx5_install_cmd="DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold libmlx5-dev"
     
     # v0.3.2: tighten umask around the temp-log tee so the file is

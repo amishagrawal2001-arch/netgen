@@ -2,6 +2,73 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.25] - 2026-06-07
+
+**install_dpdk.sh apt-installs `python3-pyelftools`.** DPDK 23.11
+meson setup fails with "missing python module: elftools" without
+it. Reported on srv06 (Ubuntu 24.04) — Step 5 (Building DPDK)
+errored out at `buildtools/meson.build:58:8`.
+
+Full suite: **1,659 passed, 1 skipped** (+4 new tests).
+
+### Operator-reported failure
+
+```
+Configuring DPDK build (disabling: net/mana)...
+Program python3 found: YES (/usr/bin/python3)
+buildtools/meson.build:58:8: ERROR: Problem encountered: missing python module: elftools
+A full log can be found at /opt/dpdk-build/build/meson-logs/meson-log.txt
+[x] DPDK meson setup failed
+```
+
+### Fix
+
+One-line addition to `deps_install_cmd` in
+`resources/dpdk/install_dpdk.sh` — `python3-pyelftools` joins the
+existing batch (`build-essential meson ninja-build pkg-config
+libnuma-dev libelf-dev libpcap-dev libibverbs-dev rdma-core
+perftest ${kernel_headers}`).
+
+### Why pyelftools
+
+DPDK 23.11's build system uses `pyelftools` for:
+- `buildtools/check-symbols.sh` — ABI-compatibility symbol checks
+- `buildtools/options-ibverbs-static.sh` — ibverbs static linkage helpers
+
+Both invoke Python with `from elftools.elf.elffile import ELFFile`
+to parse compiled binaries. Missing → meson setup hard-fails
+before any compilation runs.
+
+### Why pyelftools landed in the core batch, not the mlx5 batch
+
+The mlx5 batch (`libmlx5-dev`) was split out in an earlier
+release because hosts without the Mellanox MOFED apt repo
+(svl-d-ai-srv04, etc.) fail it with rc=100 → that would have
+poisoned the rest of the install if it were in one batch.
+pyelftools is not Mellanox-specific and is required by EVERY
+DPDK 23.11 build, so it stays in the always-required core
+batch.
+
+### Retry on srv06
+
+```
+Tools → DPDK → Setup DPDK → Make DPDK Ready
+```
+
+The wizard re-invokes `install_dpdk.sh`. The script's idempotent
+— it cd's into the existing `/opt/dpdk-build` and reruns
+`meson setup`. With `python3-pyelftools` installed this time,
+Step 5 will succeed and the build will proceed through
+compile / tx_worker / hugepages / vfio.
+
+### Tests
+
+4 new in `tests/test_v0525_install_dpdk_pyelftools.py`:
+- `deps_install_cmd` includes `python3-pyelftools`
+- It's in the core batch, NOT the optional mlx5 batch
+- The other 10 core deps weren't dropped by the refactor
+- Version pinned at ≥ 0.5.25
+
 ## [0.5.24] - 2026-06-07
 
 **Client treats `rc=None + log_path=null` as "server lost state,
