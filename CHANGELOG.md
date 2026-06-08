@@ -2,6 +2,107 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.26] - 2026-06-07
+
+**Comprehensive DPDK 23.11 dep audit — install_dpdk.sh now apt-
+installs the full transitive set for `-Dexamples=all` + default-
+enabled telemetry.** Eliminates the drip-feed of "missing
+package X" → ship → "missing package Y" cycle the v0.5.25
+pyelftools fix would have started.
+
+Full suite: **1,666 passed, 1 skipped** (+7 new tests).
+
+### Operator request
+
+> check full what other dependency is missing for dpdk
+
+After v0.5.25 unblocked DPDK meson setup with python3-pyelftools,
+audit the full dep surface against DPDK 23.11's actual
+requirements (mandatory + optional driver/feature deps).
+
+### Audit categories
+
+**Mandatory** (already had all of these by v0.5.25 — pinning for
+regression):
+
+| Package | Enables |
+|---|---|
+| `build-essential` | C11 compiler toolchain |
+| `meson` | Build system |
+| `ninja-build` | Build executor |
+| `pkg-config` | Library discovery |
+| `libnuma-dev` | EAL hard-requires NUMA topology |
+| `python3-pyelftools` | `buildtools/check-symbols.sh` ELF parsing |
+| `${kernel_headers}` | kmod / kni build |
+
+**Driver/library** (already had):
+
+| Package | Enables |
+|---|---|
+| `libelf-dev` | BPF library |
+| `libpcap-dev` | pcap PMD + pdump |
+| `libibverbs-dev` | Mellanox PMDs (ibverbs interface) |
+| `rdma-core` | Mellanox PMDs (full RDMA stack) |
+| `perftest` | netgen's RDMA orchestrator (ib_send_bw etc.) |
+
+**Optional — ADDED in v0.5.26** (needed by `-Dexamples=all` +
+default-enabled telemetry):
+
+| Package | Enables |
+|---|---|
+| `libssl-dev` | crypto PMDs + crypto examples (l2fwd-crypto, ipsec-secgw) |
+| `libjansson-dev` | telemetry JSON encoding (default-enabled in 23.11) |
+| `libbpf-dev` | BPF library + AF_XDP PMD |
+| `libxdp-dev` | AF_XDP PMD (paired with libbpf) |
+| `libbsd-dev` | BSD-isms (strlcpy etc.) used by some examples |
+| `zlib1g-dev` | compression PMDs (compress/zlib) |
+| `libfdt-dev` | Flattened Device Tree config (ARM-ish; harmless on x86) |
+| `libarchive-dev` | resource-pack tests + some examples |
+
+### Cost / benefit
+
+* **Apt download/install**: ~20-40 MB extra (one-time on Make
+  DPDK Ready).
+* **Build time impact**: negligible — meson silently no-ops
+  features whose corresponding deps aren't requested even when
+  installed; only the specific examples or PMDs needing each
+  dep change behavior.
+* **Benefit**: future feature requests (AF_XDP, telemetry
+  JSON export, crypto PMDs) don't require a new release cycle —
+  the deps are already there.
+
+### Rationale comment in install_dpdk.sh
+
+The dep list now has a multi-line comment block explaining what
+each package enables. A future refactor that wants to slim the
+list will see *why* each dep is there before deleting it. Test
+`test_dep_comment_explains_optional_rationale` enforces that
+the comment references the major feature areas (telemetry,
+AF_XDP, crypto, examples) so the explanation can't silently rot.
+
+### Retry on srv06
+
+```
+Tools → DPDK → Setup DPDK → Make DPDK Ready
+```
+
+Script's idempotent. The apt step now installs the full set;
+meson re-runs in `/opt/dpdk-build`; previous `meson-logs/` get
+overwritten with the new (successful) setup.
+
+### Tests
+
+7 new in `tests/test_v0526_install_dpdk_full_deps.py`:
+* All mandatory packages present in `deps_install_cmd`
+* All driver/lib packages present
+* All v0.5.26 audit packages present
+* Optional deps in CORE batch (not mlx5 batch — mlx5 batch can
+  fail independently on non-MOFED hosts)
+* No duplicate packages in apt list (catches refactor lapse)
+* Dep-catalog comment references telemetry / AF_XDP / crypto /
+  examples (rationale anti-rot)
+* Version pinned at ≥ 0.5.26
+
 ## [0.5.25] - 2026-06-07
 
 **install_dpdk.sh apt-installs `python3-pyelftools`.** DPDK 23.11

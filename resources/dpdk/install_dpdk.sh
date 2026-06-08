@@ -503,12 +503,49 @@ step_install_dependencies() {
     # build deps + perftest + rdma-core also didn't install →
     # cascading install failure. Split so the optional Mellanox
     # package can fail independently without poisoning the core set.
-    # v0.5.25: python3-pyelftools required by DPDK 23.11's
-    # buildtools/meson.build:58 — without it `meson setup` fails
-    # with "missing python module: elftools". Reported on srv06/
-    # Ubuntu 24.04. Apt package supplies the `elftools` Python
-    # module to whichever python3 meson picks up.
-    local deps_install_cmd="DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold --option Acquire::http::Timeout=30 --option Acquire::ftp::Timeout=30 build-essential meson ninja-build pkg-config libnuma-dev libelf-dev libpcap-dev libibverbs-dev rdma-core perftest python3-pyelftools ${kernel_headers}"
+    # DPDK 23.11 apt dependency catalog (current as of v0.5.26):
+    #
+    #   MANDATORY (meson setup fails without them):
+    #     build-essential       — gcc/g++/make + C11 toolchain
+    #     meson, ninja-build    — DPDK's build system
+    #     pkg-config            — library discovery
+    #     libnuma-dev           — EAL hard-requires NUMA topology
+    #     python3-pyelftools    — meson buildtools/check-symbols.sh
+    #                             (v0.5.25 — see meson.build:58)
+    #     ${kernel_headers}     — kmod / kni / KNI module build
+    #
+    #   STRONGLY RECOMMENDED (driver compile errors without them):
+    #     libelf-dev            — BPF library
+    #     libpcap-dev           — pcap PMD + pdump
+    #     libibverbs-dev        — Mellanox PMDs (mlx4/mlx5 ibverbs interface)
+    #     rdma-core             — Mellanox PMDs (full rdma stack)
+    #     perftest              — IB/RDMA perf testing (not DPDK per se,
+    #                             but netgen's rdma_perf orchestrator
+    #                             shells out to ib_send_bw etc.)
+    #
+    #   OPTIONAL — added v0.5.26 because `-Dexamples=all` (line ~592)
+    #   transitively pulls in every example's deps, and DPDK 23.11
+    #   enables telemetry by default:
+    #     libssl-dev            — crypto PMDs (drivers/crypto/openssl)
+    #                             + crypto examples (l2fwd-crypto,
+    #                             ipsec-secgw)
+    #     libjansson-dev        — telemetry JSON encoding (DPDK 23.11
+    #                             default-enables telemetry)
+    #     libbpf-dev            — BPF library + AF_XDP PMD
+    #     libxdp-dev            — AF_XDP PMD (paired with libbpf)
+    #     libbsd-dev            — BSD-isms (strlcpy/etc.) used by
+    #                             some examples + lib/eal portability
+    #     zlib1g-dev            — compression PMDs (compress/zlib)
+    #     libfdt-dev            — Flattened Device Tree config
+    #                             (mostly ARM, harmless on x86)
+    #     libarchive-dev        — resource-pack tests + some examples
+    #
+    # All optional deps are silently NO-OP'd by meson if the
+    # corresponding feature isn't requested — adding them costs
+    # ~20-40 MB of apt download/install but eliminates the "Make
+    # DPDK Ready" surface for downstream feature requests (someone
+    # wanting AF_XDP, telemetry export, etc. doesn't need a re-roll).
+    local deps_install_cmd="DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold --option Acquire::http::Timeout=30 --option Acquire::ftp::Timeout=30 build-essential meson ninja-build pkg-config libnuma-dev libelf-dev libpcap-dev libibverbs-dev rdma-core perftest python3-pyelftools libssl-dev libjansson-dev libbpf-dev libxdp-dev libbsd-dev zlib1g-dev libfdt-dev libarchive-dev ${kernel_headers}"
     local mlx5_install_cmd="DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold libmlx5-dev"
     
     # v0.3.2: tighten umask around the temp-log tee so the file is
