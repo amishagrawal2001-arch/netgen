@@ -15737,9 +15737,25 @@ def api_admin_health():
     except Exception:
         out["hugepages"] = {"total": 0, "free": 0}
 
-    # tx_worker binary
+    # tx_worker binary.
+    # v0.5.67: align candidates with /api/dpdk/status (which has
+    # always included /usr/local/bin/tx_worker). Pre-fix the admin
+    # console showed "tx_worker binary Not built" on srv06 because
+    # this health endpoint only looked at the wheel-internal build
+    # dirs while install_dpdk.sh's Step 6 installs the binary to
+    # `/usr/local/bin/tx_worker`. Operator-reported on srv06
+    # (v0.5.59) where /api/dpdk/verify found it but the admin
+    # health card showed it missing.
+    #
+    # Order matters: prefer the install-target path
+    # (/usr/local/bin) because that's the binary the rest of the
+    # server (e.g. start_traffic) actually invokes. Fall through
+    # to the build dirs for early-install hosts where Step 6
+    # hasn't yet copied the artifact out.
     candidates = [
+        "/usr/local/bin/tx_worker",
         "/opt/netgen/resources/dpdk/tx_worker/build/tx_worker",
+        "/opt/netgen-server/resources/dpdk/tx_worker/build/tx_worker",
         "/opt/OSTG/resources/dpdk/tx_worker/build/tx_worker",
     ]
     for p in candidates:

@@ -2,6 +2,50 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.67] - 2026-06-09
+
+**`/api/admin/health` now finds tx_worker at `/usr/local/bin/`.**
+Operator-reported on srv06 (v0.5.59) admin console:
+
+> DPDK Runtime
+> tx_worker binary    Not built
+
+But every other endpoint disagreed:
+* `/api/dpdk/verify` → "tx_worker found: /usr/local/bin/tx_worker"
+* `/api/dpdk/status` → `tx_worker_exists: true`, `tx_worker_built: "2026-06-08 04:47"`
+
+Full suite: **1,983 passed, 1 skipped** (+4 new tests).
+
+### Cause
+
+Two different code paths probing different locations. The admin
+health endpoint only checked:
+```
+/opt/netgen/resources/dpdk/tx_worker/build/tx_worker
+/opt/OSTG/resources/dpdk/tx_worker/build/tx_worker
+```
+
+But `install_dpdk.sh`'s Step 6 installs the built binary to
+`/usr/local/bin/tx_worker` — same path the rest of the server
+(e.g. `start_traffic`) actually invokes. The admin endpoint just
+never had this path in its list.
+
+### Fix
+
+```python
+candidates = [
+    "/usr/local/bin/tx_worker",                                       # install target (preferred)
+    "/opt/netgen/resources/dpdk/tx_worker/build/tx_worker",           # wheel-bundled build dir
+    "/opt/netgen-server/resources/dpdk/tx_worker/build/tx_worker",    # tarball-internal build dir
+    "/opt/OSTG/resources/dpdk/tx_worker/build/tx_worker",             # pre-v0.5 compat symlink
+]
+```
+
+`/usr/local/bin/` first because that's what `start_traffic`
+actually invokes — if the admin card says ✓, runtime works. The
+build-dir paths stay as fallbacks for early-install hosts where
+Step 6 hasn't run yet.
+
 ## [0.5.66] - 2026-06-09
 
 **Hugepages allocation: wrap `mount` in `systemd-run` to escape
