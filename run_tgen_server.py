@@ -13832,12 +13832,82 @@ def dpdk_hugepages():
         # Configure hugepages
         if page_size == "2MB":
             hugepage_file = "/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages"
+            _hp_sysfs_leaf = "hugepages-2048kB/nr_hugepages"
         else:
             return jsonify({"error": f"Unsupported page size: {page_size}"}), 400
-        
+
+        # v0.5.54 (audit H5): NUMA-aware allocation. Pre-fix wrote
+        # to the global `/sys/kernel/mm/hugepages/.../nr_hugepages`
+        # path. On dual-socket boxes the kernel opportunistically
+        # allocates whichever node has contiguous memory available
+        # — often NOT the NIC's NUMA node. DPDK then fails to
+        # allocate mbufs on `--socket-mem` against the NIC's node
+        # with a cryptic "Cannot allocate memory on socket X" even
+        # though /proc/meminfo shows the requested HugePages_Total.
+        #
+        # Fix: detect online NUMA nodes via
+        # `/sys/devices/system/node/online`. If >1 node, split the
+        # requested count evenly across nodes and write to
+        # per-node paths
+        # (`/sys/devices/system/node/nodeN/hugepages/...`). Single-
+        # node hosts keep the global-path behaviour.
+        numa_split = {}
+        numa_nodes = []
         try:
-            with open(hugepage_file, "w") as f:
-                f.write(str(num_pages))
+            with open("/sys/devices/system/node/online") as _f:
+                _online = _f.read().strip()
+            for chunk in _online.split(","):
+                if "-" in chunk:
+                    lo, hi = chunk.split("-")
+                    numa_nodes.extend(range(int(lo), int(hi) + 1))
+                elif chunk:
+                    numa_nodes.append(int(chunk))
+        except Exception as _ne:
+            logging.debug(
+                f"[DPDK HUGEPAGES] NUMA detection failed: {_ne}; "
+                f"using single-node fallback"
+            )
+            numa_nodes = []
+
+        try:
+            if len(numa_nodes) > 1:
+                # Multi-node: distribute as evenly as possible. Any
+                # remainder lands on node 0 (most common DPDK NIC
+                # home anyway).
+                base, rem = divmod(int(num_pages), len(numa_nodes))
+                for i, node in enumerate(numa_nodes):
+                    per_node = base + (1 if i == 0 else 0) * rem
+                    node_path = (
+                        f"/sys/devices/system/node/node{node}/"
+                        f"{_hp_sysfs_leaf}"
+                    )
+                    try:
+                        with open(node_path, "w") as f:
+                            f.write(str(per_node))
+                        # Read back actual allocation — kernel may
+                        # short-allocate under memory fragmentation.
+                        try:
+                            with open(node_path) as _rb:
+                                numa_split[f"node{node}"] = int(_rb.read().strip())
+                        except Exception:
+                            numa_split[f"node{node}"] = per_node
+                    except FileNotFoundError:
+                        logging.warning(
+                            f"[DPDK HUGEPAGES] {node_path} missing; "
+                            f"falling back to global path"
+                        )
+                        numa_split = {}
+                        numa_nodes = []
+                        break
+                if numa_split:
+                    logging.info(
+                        f"[DPDK HUGEPAGES] NUMA-split allocation: "
+                        f"{numa_split}"
+                    )
+            if not numa_split:
+                # Single-node OR per-node write failed → global path.
+                with open(hugepage_file, "w") as f:
+                    f.write(str(num_pages))
 
             # Mount hugepages if not already mounted.
             # v0.3.1: timeouts on every subprocess so a hung mount
@@ -14036,6 +14106,12 @@ def dpdk_hugepages():
                 "page_size": page_size,
                 "persist_path": persist_path if persist_written else None,
                 "persisted": persist_written,
+                # v0.5.54 (audit H5): NUMA distribution. Empty dict
+                # on single-node hosts; per-node counts on multi-
+                # node so the operator can see how the kernel
+                # actually placed pages.
+                "numa_split": numa_split,
+                "numa_nodes": numa_nodes,
             }), 200
         except Exception as e:
             return jsonify({

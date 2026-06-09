@@ -2,6 +2,75 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.54] - 2026-06-09
+
+**NUMA-aware hugepage allocation.** Audit finding H5.
+
+Full suite: **1,901 passed, 1 skipped** (+8 new tests).
+
+### The bug
+
+`/api/dpdk/hugepages` always wrote to the global:
+```
+/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages
+```
+
+On dual-socket boxes (typical lab DPDK hosts), the kernel
+opportunistically allocates pages on whichever NUMA node has
+contiguous memory available — often NOT the NIC's NUMA node.
+DPDK apps then fail with:
+```
+EAL: Cannot allocate memory on socket 1
+EAL: Failed to initialize memory pool
+```
+even though `/proc/meminfo` shows `HugePages_Total: 2048`.
+Allocation "succeeded" → 0 usable pages on the NIC's socket.
+
+### Fix
+
+1. **Read `/sys/devices/system/node/online`** to detect NUMA
+   topology. Handles both `0-1` range and `0,2,3` list formats.
+2. **Multi-node hosts: split evenly** using `divmod`. Any
+   remainder lands on node 0 (most common DPDK NIC home).
+3. **Write per-node sysfs paths:**
+   ```
+   /sys/devices/system/node/node0/hugepages/hugepages-2048kB/nr_hugepages
+   /sys/devices/system/node/node1/hugepages/hugepages-2048kB/nr_hugepages
+   ```
+4. **Read back** after each write — the kernel can short-
+   allocate under fragmentation, so response reflects actual
+   allocation, not just the request.
+5. **Single-node fallback** keeps the global-path behaviour for
+   UMA hosts and containers without per-node sysfs.
+
+### Response gains two fields
+
+```json
+{
+  "success": true,
+  "requested": 2048,
+  "actual_allocated": 2048,
+  "numa_split": {"node0": 1024, "node1": 1024},
+  "numa_nodes": [0, 1]
+}
+```
+
+The admin chip can now show the distribution — operator
+immediately sees whether allocation landed on the right
+socket.
+
+### Tests
+
+8 new in `tests/test_v0554_numa_hugepages.py`:
+* Reads `/sys/devices/system/node/online`
+* Parses both `-`-range and `,`-list forms
+* Writes per-node paths on multi-node hosts
+* `divmod` for even distribution
+* Reads back to detect short-alloc
+* Falls back to global path on single-node
+* Response includes `numa_split` + `numa_nodes`
+* Version pinned at ≥ 0.5.54
+
 ## [0.5.53] - 2026-06-09
 
 **Unbind restores the original kernel driver from the persistent
