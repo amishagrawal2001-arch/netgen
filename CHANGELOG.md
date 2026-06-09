@@ -2,6 +2,61 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.55] - 2026-06-09
+
+**Install scripts: real apt-update exit code + apt failure log.**
+Audit findings H6 + H7.
+
+Full suite: **1,907 passed, 1 skipped** (+6 new tests).
+
+### H6: `apt-get update` success detection
+
+Pre-fix:
+```bash
+apt-get update -y ... 2>&1 | grep -q "Reading package lists"
+```
+
+False-positives when apt prints that line then fails for an
+unrelated reason (DNS, repo signature, Hash mismatch) — we'd
+mark `APT_UPDATE_SUCCESS=1` and proceed against a broken cache.
+False-negatives when newer apt versions omit the literal string
+on fully-cached refreshes.
+
+Fix: pipe through `tail | sed` for log formatting; with `set -o
+pipefail` (enabled in the script header), apt's real exit code
+propagates through the pipeline. `if apt-get update ...; then`
+checks the actual rc.
+
+### H7: install_rdma.sh apt failure log
+
+Pre-fix:
+```bash
+if ! eval "$core_apt_cmd" 2>&1; then
+    log_error "Core RDMA package install failed."
+    exit 2
+fi
+```
+
+Failure output went to terminal only. The wizard's log capture
+showed `exit 2` with nothing else — operator had to SSH in and
+re-run apt to see the actual error. Directly contradicted the
+v0.5.30 lesson learned in install_dpdk.sh.
+
+Fix: `tee` output to `/tmp/rdma_deps_install.log` (matches
+install_dpdk.sh's `/tmp/dpdk_deps_install.log` convention).
+On failure: tail the log into the error output so the wizard
+captures it inline.
+
+### Tests
+
+6 new in `tests/test_v0555_install_apt_detect_and_log.py`:
+* `grep -q "Reading package lists"` removed from retry loop
+* Pipefail-propagated exit code check pattern present
+* install_rdma.sh apt install tees to a log file
+* Failure path tails the log into error output
+* Log path follows `/tmp/<thing>_deps_install.log` convention
+* Version pinned at ≥ 0.5.55
+
 ## [0.5.54] - 2026-06-09
 
 **NUMA-aware hugepage allocation.** Audit finding H5.

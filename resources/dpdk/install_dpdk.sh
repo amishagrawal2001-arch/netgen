@@ -484,8 +484,23 @@ step_install_dependencies() {
     RETRY_COUNT=0
     APT_UPDATE_SUCCESS=0
     
+    # v0.5.55 (audit H6): use exit code, NOT string-match. Pre-fix
+    # `apt-get update | grep -q "Reading package lists"` would:
+    #   (a) FALSE-positive when apt prints that line on stdout then
+    #       fails for an unrelated reason (DNS, repo signature 404,
+    #       Hash mismatch) — we mark APT_UPDATE_SUCCESS=1 anyway.
+    #   (b) FALSE-negative when apt succeeds but the output format
+    #       changes — newer apt versions sometimes omit the literal
+    #       string on fully-cached refreshes.
+    # With `set -o pipefail` (enabled in this script's header), the
+    # actual apt-get exit code propagates through the tail pipeline;
+    # check $? directly.
     while [[ $RETRY_COUNT -lt $MAX_RETRIES ]]; do
-        if apt-get update -y -o APT::Sandbox::User=root --option Acquire::http::Timeout=30 --option Acquire::ftp::Timeout=30 2>&1 | grep -q "Reading package lists"; then
+        if apt-get update -y \
+            -o APT::Sandbox::User=root \
+            --option Acquire::http::Timeout=30 \
+            --option Acquire::ftp::Timeout=30 2>&1 \
+            | tail -20 | sed 's/^/[apt-update] /'; then
             APT_UPDATE_SUCCESS=1
             break
         fi

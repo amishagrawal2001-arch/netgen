@@ -183,12 +183,20 @@ log_info "  python3-pyverbs  — Python ibv_* bindings (diagnostic scripting)"
 log_info "  opensm           — InfiniBand subnet manager (disabled by default)"
 log_info "  mstflint         — Mellanox firmware tools (mstflint, mstconfig)"
 
-if ! eval "$core_apt_cmd" 2>&1; then
+# v0.5.55 (audit H7): mirror the install_dpdk.sh v0.5.30 lesson —
+# preserve apt output to a file so the wizard / operator can grep
+# the actual failure. Pre-fix the `2>&1` went to terminal only;
+# the operator saw "exit 2" with no log to dig in.
+RDMA_APT_LOG=/tmp/rdma_deps_install.log
+log_info "apt log will be saved to: $RDMA_APT_LOG"
+if ! (umask 077 && eval "$core_apt_cmd" 2>&1 | tee "$RDMA_APT_LOG"); then
     log_error "Core RDMA package install failed."
+    log_error "Tail of install log ($RDMA_APT_LOG):"
+    tail -30 "$RDMA_APT_LOG" 2>/dev/null | sed 's/^/  /' || true
     log_error "Run \`apt-get install -f\` to repair broken deps, then retry."
     exit 2
 fi
-log_success "Core RDMA stack installed."
+log_success "Core RDMA stack installed (log: $RDMA_APT_LOG)."
 
 # v0.5.28: opensm ships with an enabled-by-default service on some
 # distros. On RoCE-only / Soft-RoCE / no-RDMA-hardware hosts, an
