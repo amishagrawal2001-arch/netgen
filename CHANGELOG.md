@@ -2,6 +2,76 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.68] - 2026-06-09
+
+**Admin security fortification.** Audit findings C1 + C2 + C3 + C4.
+
+Full suite: **1,993 passed, 1 skipped** (+10 new tests).
+
+### C1 — `@require_role("admin")` on 9 destructive endpoints
+
+Pre-fix only `/api/admin/upgrade_wheel` was gated. Added to:
+* `/api/dpdk/bind`, `/api/dpdk/unbind`
+* `/api/dpdk/hugepages`, `/api/dpdk/iommu`, `/api/dpdk/load_modules`
+* `/api/admin/install_dpdk`, `/api/admin/install_rdma`
+* `/api/admin/interface_ip`, `/api/admin/bind_history`
+
+When no auth env is set the role check no-ops, so existing
+lab deployments don't break. When auth IS configured, a viewer-
+token holder can no longer reboot the host or brick a NIC.
+
+### C2 — `/api/dpdk/iommu` reboot now requires literal True + confirm token
+
+Pre-fix `reboot = data.get("reboot", False)` then `if reboot
+and enable:` triggered `sh -c "sleep 10 && reboot"`. Any
+truthy value worked — including JSON `reboot: "false"` (a
+truthy string!). Now:
+1. `_strict_true(value)` returns `value is True` — only literal
+   JSON `true` passes
+2. Sibling `confirm: "REBOOT"` field required, else 400
+
+### C3 — `/api/dpdk/bind` `force` flag also strict
+
+Same shape as C2. `force: "no"` (truthy string) used to bypass
+the v0.2.76 bind-safety guard. Now `_strict_true(force)` rejects
+all non-`True` values.
+
+### C4 — MAX_CONTENT_LENGTH + wheel hardening
+
+* `app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024` —
+  body-size cap. Pre-fix any client could upload 50 GB and
+  ENOSPC `/tmp` (tmpfs).
+* `werkzeug.utils.secure_filename` on the uploaded wheel name
+  before joining with the save directory (defense in depth
+  over the existing `_allowed_wheel_name` regex check).
+* Wheel CONTENT validation:
+  - Open as `zipfile`
+  - Find `*.dist-info/METADATA`
+  - Parse `Name:` line; reject if not `ostg-trafficgen`
+  - On validation failure: unlink the saved file and 400
+
+Pre-fix an admin-token holder could upload e.g. `pwn-1.0-py3-
+none-any.whl` and pip would install it into the venv, replacing
+the running entry point.
+
+### Sandbox-EPERM hexalogy now closed at this layer
+
+(For audit traceability — v0.5.68 doesn't change the EPERM
+class, just notes that the security side is also locked down.)
+
+### Tests
+
+10 new in `tests/test_v0568_admin_security_fortification.py`:
+* 9 destructive endpoints carry `@require_role("admin")`
+* `MAX_CONTENT_LENGTH` set and within sane range
+* `_strict_true(v)` helper compares with `is True`
+* iommu reboot uses helper AND requires confirm token
+* bind force uses helper
+* Wheel upload uses `secure_filename`
+* Wheel content validated as zipfile with `ostg-trafficgen` METADATA
+* Failed-validation uploads unlinked
+* Version pinned at ≥ 0.5.68
+
 ## [0.5.67] - 2026-06-09
 
 **`/api/admin/health` now finds tx_worker at `/usr/local/bin/`.**

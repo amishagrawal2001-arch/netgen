@@ -33,6 +33,28 @@ from utils import vxlan as vxlan_utils
 
 # Initialize Flask app and CORS
 app = Flask(__name__)
+# v0.5.68 (audit C4): cap request body size at 200 MB. Real
+# wheels are <30 MB; admin bind_history POSTs are <16 KB. With
+# no cap pre-fix, a malicious wheel upload could fill /tmp
+# (tmpfs) until ENOSPC, crashing the server. 200 MB leaves
+# headroom for future wheel growth without enabling unbounded
+# uploads.
+app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024
+
+
+def _strict_true(value):
+    """v0.5.68 (audit C2, C3): accept ONLY literal JSON `true`.
+
+    Pre-fix `if data.get("reboot"):` triggered on `"false"`,
+    `"0"`, `"no"` — any truthy string. The /api/dpdk/iommu
+    endpoint reboots the host on a true-ish value with only
+    a 10 s warning. /api/dpdk/bind's `force` flag bypasses
+    v0.2.76's safety guard the same way.
+
+    Use this helper at every destructive boolean check. Rejects
+    every non-`True` value including `1`, `"true"`, `"yes"`.
+    """
+    return value is True
 
 
 def _bgp_router_clause(asn, device_id=None):
@@ -13476,6 +13498,7 @@ def _dpdk_unpersist_bind(pci):
 
 
 @app.route("/api/dpdk/bind", methods=["POST"])
+@require_role("admin")  # v0.5.68 (C1): bind can disconnect the management NIC
 def dpdk_bind():
     """Bind an interface to DPDK."""
     try:
@@ -13485,7 +13508,9 @@ def dpdk_bind():
         data = request.get_json() or {}
         interface = data.get("interface")
         pci = data.get("pci")
-        force = data.get("force", False)
+        # v0.5.68 (audit C3): strict bool. Pre-fix `force: "no"` (a
+        # truthy string) bypassed the v0.2.76 bind-safety guard.
+        force = _strict_true(data.get("force", False))
 
         if not interface and not pci:
             return jsonify({"error": "interface or pci required"}), 400
@@ -13626,6 +13651,7 @@ def dpdk_bind():
 
 
 @app.route("/api/dpdk/unbind", methods=["POST"])
+@require_role("admin")  # v0.5.68 (C1)
 def dpdk_unbind():
     """Unbind an interface from DPDK."""
     try:
@@ -13892,6 +13918,7 @@ def dpdk_verify():
 
 
 @app.route("/api/dpdk/hugepages", methods=["POST"])
+@require_role("admin")  # v0.5.68 (C1): sysfs write + mount
 def dpdk_hugepages():
     """Configure hugepages."""
     try:
@@ -14566,6 +14593,7 @@ def dpdk_cpu_vendor():
 
 
 @app.route("/api/dpdk/load_modules", methods=["POST"])
+@require_role("admin")  # v0.5.68 (C1): modprobe
 def dpdk_load_modules():
     """Load VFIO kernel modules (vfio-pci and vfio)."""
     logging.info("[DPDK LOAD MODULES] API endpoint called")
@@ -15014,6 +15042,7 @@ def dpdk_load_modules():
         }), 500
 
 @app.route("/api/dpdk/iommu", methods=["POST"])
+@require_role("admin")  # v0.5.68 (C1): edits /etc/default/grub + optional reboot
 def dpdk_configure_iommu():
     """Configure IOMMU in GRUB and optionally reboot."""
     try:
@@ -15034,7 +15063,20 @@ def dpdk_configure_iommu():
                 "success": False,
                 "error": f"Invalid cpu_vendor {cpu_vendor!r}; supported: 'intel', 'amd'",
             }), 400
-        reboot = data.get("reboot", False)
+        # v0.5.68 (audit C2): strict bool. Pre-fix `reboot: "false"`
+        # (a truthy string!) triggered `sh -c "sleep 10 && reboot"`.
+        # Now ONLY literal JSON `true` initiates a reboot. Plus
+        # require a sibling confirm field that's hard to send by
+        # accident.
+        reboot = _strict_true(data.get("reboot", False))
+        if reboot and data.get("confirm") != "REBOOT":
+            return jsonify({
+                "success": False,
+                "error": (
+                    "reboot=true requires `confirm: \"REBOOT\"` in "
+                    "the same JSON body. Refusing to reboot."
+                ),
+            }), 400
         
         grub_file = "/etc/default/grub"
         
@@ -16086,6 +16128,7 @@ def api_rdma_handshake_detail(handshake_id):
 
 
 @app.route("/api/admin/install_dpdk", methods=["POST"])
+@require_role("admin")  # v0.5.68 (C1): apt install + 20 min build
 def api_admin_install_dpdk():
     """Kick off install_dpdk.sh --auto in the background.
 
@@ -16670,6 +16713,7 @@ _ADMIN_INSTALL_RDMA_STATE = {
 
 
 @app.route("/api/admin/install_rdma", methods=["POST"])
+@require_role("admin")  # v0.5.68 (C1): apt install
 def api_admin_install_rdma():
     """Kick off install_rdma.sh --auto in the background.
 
@@ -16842,12 +16886,63 @@ def api_admin_upgrade_wheel():
             "error": f"Refusing upload: {f.filename!r} is not a wheel filename",
         }), 400
 
+    # v0.5.68 (audit C4): apply werkzeug.secure_filename even
+    # though _allowed_wheel_name blocks `/` and `..`. Defence-in-
+    # depth — secure_filename strips control chars and quirky
+    # bytes that filename regex could miss across werkzeug
+    # versions. We re-check _allowed_wheel_name on the SANITIZED
+    # name; if sanitisation broke the .whl shape, reject.
+    from werkzeug.utils import secure_filename as _secure_filename
+    safe_name = _secure_filename(f.filename)
+    if not safe_name or not _allowed_wheel_name(safe_name):
+        return jsonify({
+            "ok": False,
+            "error": (
+                f"Refusing upload: filename {f.filename!r} sanitised to "
+                f"{safe_name!r} which is not a valid wheel name"
+            ),
+        }), 400
+
     # Persist the wheel to a stable path before kicking pip — pip needs a
     # filesystem path, not a Werkzeug file stream.
     wheel_dir = "/tmp/netgen_upgrade"
     os.makedirs(wheel_dir, exist_ok=True)
-    wheel_path = os.path.join(wheel_dir, f.filename)
+    wheel_path = os.path.join(wheel_dir, safe_name)
     f.save(wheel_path)
+
+    # v0.5.68 (audit C4): cheap zipfile sanity check + project-
+    # name match. Pre-fix any `.whl` would install — including
+    # `pwn-1.0-py3-none-any.whl` which would replace the running
+    # entry point. Catches 0-byte uploads and wrong-project
+    # wheels before pip starts.
+    try:
+        import zipfile as _zipfile
+        with _zipfile.ZipFile(wheel_path) as _zf:
+            _metadata = None
+            for _name in _zf.namelist():
+                if _name.endswith(".dist-info/METADATA"):
+                    _metadata = _zf.read(_name).decode("utf-8", "replace")
+                    break
+            if not _metadata:
+                raise ValueError("wheel missing dist-info/METADATA")
+            _project = ""
+            for _ln in _metadata.splitlines():
+                if _ln.lower().startswith("name:"):
+                    _project = _ln.split(":", 1)[1].strip().lower().replace("_", "-")
+                    break
+            if _project != "ostg-trafficgen":
+                raise ValueError(
+                    f"wheel is for project {_project!r}, expected 'ostg-trafficgen'"
+                )
+    except Exception as _ze:
+        try:
+            os.unlink(wheel_path)
+        except Exception:
+            pass
+        return jsonify({
+            "ok": False,
+            "error": f"Wheel content validation failed: {_ze}",
+        }), 400
 
     log_path = "/var/log/netgen-upgrade.log"
     try:
@@ -18143,6 +18238,7 @@ def api_admin_interface_ips():
 
 
 @app.route("/api/admin/interface_ip", methods=["POST"])
+@require_role("admin")  # v0.5.68 (C1): ip addr add/del
 def api_admin_interface_ip():
     """Add or remove an IP address on an interface (transient — not persistent)."""
     data = request.get_json(silent=True) or {}
@@ -18188,6 +18284,7 @@ def api_admin_interface_ip():
 
 
 @app.route("/api/admin/bind_history", methods=["GET", "POST"])
+@require_role("admin")  # v0.5.68 (C1): POST mutates the persistent registry
 def api_admin_bind_history():
     """Track / fetch original kernel names of vfio-pci bound NICs.
 
