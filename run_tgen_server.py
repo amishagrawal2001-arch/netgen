@@ -17803,7 +17803,7 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
               <td><b>${name}</b></td>
               <td class="mono">${escapeHtml(pci)}</td>
               <td>${escapeHtml(vendor)}</td>
-              <td><span class="pill ${s.pillClass}">${escapeHtml(s.label)}</span></td>
+              <td><span class="pill ${s.pillClass}" aria-label="${escapeHtml(s.pillClass + ': ' + s.label)}">${({ok:'✓ ',bad:'✗ ',warn:'! '})[s.pillClass]||''}${escapeHtml(s.label)}</span></td>
               <td class="mono">${escapeHtml(kdrv)}</td>
               <td>${ipCell}</td>
               <td>${queuesCell}</td>
@@ -17811,10 +17811,12 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
             </tr>`;
         }).join('');
         wrap.innerHTML = `
+          <div style="overflow-x:auto">
           <table class="iface">
             <thead><tr><th>Interface</th><th>PCI</th><th>Vendor</th><th>State</th><th>Kernel driver</th><th>IP addresses</th><th>TX queues</th><th></th></tr></thead>
             <tbody>${rows}</tbody>
-          </table>`;
+          </table>
+          </div>`;
         // Stash the list so click handlers can look up by index.
         wrap._ifaces = list;
       } catch (e) {
@@ -18024,7 +18026,16 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
     // a list that rarely changes.
     refreshHealth();
     refreshInterfaces();
-    setInterval(refreshHealth, 30000);
+    // v0.5.65 (audit LOW): skip the polling refresh when the
+    // tab is hidden. Cheap on battery, less wasteful when an
+    // operator parks the admin page in a background tab while
+    // doing other work. Resumes immediately on visibilitychange.
+    setInterval(() => {
+      if (document.visibilityState === 'visible') refreshHealth();
+    }, 30000);
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible') refreshHealth();
+    });
   </script>
 </body>
 </html>
@@ -18066,7 +18077,13 @@ def api_admin_interface_ips():
                 # link-local addrs aren't a real workflow.
                 if not local.lower().startswith("fe80:"):
                     ipv6.append(cidr)
-        out[name] = {"ipv4": ipv4, "ipv6": ipv6, "operstate": entry.get("operstate", "UNKNOWN")}
+        # v0.5.65 (audit LOW): lowercase the operstate to match
+        # /api/interfaces (v0.5.43 standardised it to lowercase).
+        # Pre-fix /api/admin/interface_ips returned UP/DOWN/UNKNOWN
+        # uppercase; clients comparing case-sensitively against one
+        # endpoint's value broke against the other.
+        _op = (entry.get("operstate") or "UNKNOWN")
+        out[name] = {"ipv4": ipv4, "ipv6": ipv6, "operstate": _op.lower()}
     return jsonify({"interfaces": out})
 
 

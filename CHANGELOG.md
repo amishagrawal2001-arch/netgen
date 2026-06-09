@@ -2,6 +2,24 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.65] - 2026-06-09
+
+**LOW polish batch — operstate casing parity, visibility-aware
+polling, iface table overflow, accessible pill glyphs.**
+
+Full suite: **1,972 passed, 1 skipped** (+7 new tests).
+
+* `/api/admin/interface_ips` returns lowercase operstate to
+  match `/api/interfaces` (v0.5.43 standardised on lowercase;
+  this endpoint was the odd one out).
+* `setInterval(refreshHealth)` guards with
+  `document.visibilityState === 'visible'`. Resumes immediately
+  on `visibilitychange` instead of waiting up to 30 s.
+* Iface table wrapped in `<div style="overflow-x:auto">` so
+  narrow viewports keep the action column accessible.
+* Pills get a glyph prefix (`✓` / `✗` / `!`) plus `aria-label`
+  for color-blind operators + screen readers.
+
 ## [0.5.64] - 2026-06-09
 
 **Admin UI polish — tri-state hugepages pill, detailed error
