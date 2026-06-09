@@ -232,6 +232,20 @@ check_dpdk_installed() {
     if pkg-config --exists libdpdk 2>/dev/null; then
         local version=$(pkg-config --modversion libdpdk)
         log_success "DPDK is already installed (version $version)"
+        # v0.5.61 (audit M8): warn loudly when the installed
+        # version differs from what THIS install_dpdk.sh ships
+        # (currently 23.11.x). Pre-fix the prompt just said
+        # "reinstall?" with no version context — operators
+        # answered yes/no without knowing they were about to
+        # upgrade across an ABI boundary that would orphan
+        # tx_worker until the wheel rebuild reran.
+        local target_major_minor="23.11"
+        if [[ -n "$version" ]] \
+            && ! echo "$version" | grep -q "^${target_major_minor}"; then
+            log_warning "Installed DPDK version $version differs from this script's target ($target_major_minor)."
+            log_warning "tx_worker linked against the old ABI WILL break until rebuilt."
+            log_warning "If reinstalling, ensure Step 6 (tx_worker rebuild) runs afterward."
+        fi
         return 0
     fi
     return 1
@@ -249,15 +263,32 @@ step_preflight() {
 
     log_info "Checking system requirements..."
     
-    # Check disk space (need at least 2GB)
-    local available=$(df -BG / | tail -1 | awk '{print $4}' | sed 's/G//')
-    if [[ $available -lt 2 ]]; then
-        log_warning "Low disk space: ${available}GB available (recommended: 2GB+)"
+    # Check disk space (need at least 2GB).
+    # v0.5.61 (audit M7): pre-fix only checked `/`. On lab boxes
+    # where /opt (DPDK_DIR) and /usr/local (install target) are
+    # separate mounts, the check was meaningless. Walk the set of
+    # paths the install actually writes to.
+    local low_space=0
+    for path in / "/usr/local" "${DPDK_DIR:-/opt/dpdk-build}" "${DPDK_DIR:-/opt}"; do
+        if [[ ! -d "$path" ]]; then
+            # parent mount is what matters when the dir doesn't
+            # exist yet; df handles non-existent paths by walking
+            # up to the nearest mount point.
+            :
+        fi
+        local avail
+        avail=$(df -BG "$path" 2>/dev/null | tail -1 | awk '{print $4}' | sed 's/G//')
+        if [[ -n "$avail" ]] && [[ "$avail" =~ ^[0-9]+$ ]] && [[ $avail -lt 2 ]]; then
+            log_warning "Low disk space on $path: ${avail}GB available (recommended: 2GB+)"
+            low_space=1
+        fi
+    done
+    if [[ $low_space -eq 1 ]]; then
         if [[ $(prompt_yes_no "Continue anyway?") != "y" ]]; then
             exit 1
         fi
     else
-        log_success "Disk space OK: ${available}GB available"
+        log_success "Disk space OK on /, /usr/local, and DPDK build dir"
     fi
     
     # Check network connectivity
@@ -523,6 +554,21 @@ step_install_dependencies() {
     # rebuild vfio-pci or to compile out-of-tree NIC PMD modules at runtime.
     # Cheap to install (~80 MB) and silent no-op when already present.
     local kernel_headers="linux-headers-$(uname -r 2>/dev/null || echo generic)"
+    # v0.5.61 (audit M6): the precise `linux-headers-X.Y.Z-N-generic`
+    # package may NOT exist in apt on hosts running an older or
+    # out-of-band kernel (HWE rolled forward, custom kernel,
+    # snapshot rollback). If apt-cache can't find it, fall back
+    # to the meta-package `linux-headers-generic` which always
+    # tracks the latest stable kernel from the host's repo. Worst
+    # case: vfio-pci is in-tree on the running kernel and the
+    # fallback installs headers for a different kernel — the apt
+    # install still succeeds and the operator can manually
+    # `apt-get install linux-headers-$(uname -r)` later when the
+    # repo catches up.
+    if ! apt-cache show "$kernel_headers" >/dev/null 2>&1; then
+        log_warning "$kernel_headers not in apt repos; falling back to linux-headers-generic"
+        kernel_headers="linux-headers-generic"
+    fi
     # v0.3.16: pass dpkg --force-confdef + --force-confold so that an
     # apt-get install never hangs on a CONFFILE prompt for a package
     # whose default config differs from the system's existing copy.

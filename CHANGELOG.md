@@ -2,6 +2,24 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.61] - 2026-06-09
+
+**install_dpdk.sh polish — kernel-headers fallback, multi-mount
+disk-space check, version-mismatch warning.** Audit M6 + M7 + M8.
+
+Full suite: **1,947 passed, 1 skipped** (+4 new tests).
+
+* **M6:** `apt-cache show "linux-headers-$(uname -r)"` first;
+  fall back to `linux-headers-generic` when the precise version
+  isn't in the apt repo (out-of-band kernels, HWE roll-forward,
+  custom kernels, snapshot rollback).
+* **M7:** disk-space check now walks `/`, `/usr/local`, and the
+  DPDK build dir — separate `/opt` or `/usr/local` mounts no
+  longer bypass it.
+* **M8:** `check_dpdk_installed` warns when installed version
+  differs from 23.11 target, calling out that **tx_worker
+  linked against the old ABI will break until rebuilt**.
+
 ## [0.5.60] - 2026-06-09
 
 **IOMMU regex anchoring + cpu_vendor allowlist + PCI BDF
