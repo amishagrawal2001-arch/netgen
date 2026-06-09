@@ -2,6 +2,108 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.48] - 2026-06-08
+
+**CRITICAL — `/api/dpdk/load_modules` was reporting EVERY
+successful load as failed with "Unknown error".** Found during a
+fan-out audit the operator requested ("this area is too buggy").
+v0.5.46 polished the error wording without realising the error
+path was hit on every successful load.
+
+Full suite: **1,847 passed, 1 skipped** (+8 new tests).
+
+### Bug 1 — load_modules fall-through
+
+The `dpdk_load_modules` for-loop had this structure (paraphrased):
+
+```python
+for module in modules_to_load:
+    try:
+        result = subprocess.run([modprobe, module], ...)
+        if result.returncode == 0:
+            verify_result = subprocess.run([lsmod], ...)
+            if verify_result.returncode == 0 and loaded_ok:
+                loaded_modules.append(module)
+                # ⚠ NO continue
+            else:
+                failed_modules.append(...)  # ⚠ NO continue
+        else:
+            failed_modules.append(...)      # ⚠ NO continue
+    except (FileNotFoundError, TimeoutExpired, Exception) as e:
+        error_msg = str(e)
+        # (no append in handlers — intentional)
+
+    # sudo fallback
+    if error_msg and module not in loaded_modules and not is_root:
+        ...
+
+    # ⚠ UNCONDITIONAL append at the end of the loop body
+    failed_modules.append({
+        "module": module,
+        "error": error_msg or "Unknown error - check server logs"
+    })
+```
+
+On a successful load:
+- `loaded_modules` got `vfio_pci` (correct)
+- AND `failed_modules` got `{"module": "vfio_pci", "error":
+  "Unknown error - check server logs"}` because control fell
+  through to the unconditional bottom append
+
+`failed_modules` non-empty → endpoint returns HTTP 500 →
+operator sees "Failed to load modules: vfio-pci: Unknown error".
+
+v0.5.46's journalctl scrape NEVER FIRED because there was no
+real subprocess failure — the "Unknown error" string came
+directly from the hardcoded fallback in the bottom append.
+
+### Fix
+
+* `continue` after every explicit `failed_modules.append` and
+  after the success-path `loaded_modules.append`
+* Defense-in-depth guard on the bottom-of-loop append: only
+  fires when `module not in loaded_modules AND module not in
+  failed_modules`. If a future branch forgets to `continue`,
+  we still don't double-record
+
+### Bug 2 — dpdk_bind.sh hardcoded to legacy /opt/OSTG/
+
+Four endpoints (`/api/dpdk/bind`, `/api/dpdk/unbind`,
+`/api/dpdk/status`, `/api/dpdk/interfaces`) hardcoded:
+```python
+dpdk_bind_script = "/opt/OSTG/resources/dpdk/dpdk_bind.sh"
+```
+
+But the wheel install writes to `/opt/netgen/`. The
+`/api/admin/install_dpdk` endpoint already correctly probes both
+paths (since v0.5.14-ish). The bind/unbind/status/interfaces
+endpoints didn't get the same update.
+
+On srv06 the v0.5.10 `/opt/OSTG → /opt/netgen` compat symlink
+saves the day, but on any clean install with no symlink (typical
+of fresh netgen-only deployments) all four endpoints return:
+```
+404 dpdk_bind.sh not found
+```
+
+Fix: extracted `_resolve_dpdk_bind_script()` helper that probes
+`/opt/netgen/` first, then `/opt/OSTG/` as legacy fallback. All
+four endpoints now call the helper.
+
+### Tests
+
+8 new in `tests/test_v0548_load_modules_no_double_append.py`:
+* Success path has `continue` after `loaded_modules.append`
+* Verify-failed path has `continue`
+* modprobe-failed path has `continue`
+* Bottom-of-loop append has dedupe guard against double-record
+* "Unknown error" literal kept as last-resort fallback
+* `_resolve_dpdk_bind_script` helper exists
+* Helper probes `/opt/netgen/` BEFORE `/opt/OSTG/`
+* All 4 endpoints use the resolver, no remaining hardcoded
+  `/opt/OSTG/` literals
+* Version pinned at ≥ 0.5.48
+
 ## [0.5.47] - 2026-06-08
 
 **Admin console — kernel-driven NICs now get a Bind-to-DPDK

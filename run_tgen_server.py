@@ -13015,7 +13015,7 @@ def dpdk_status():
         
         # Get interface status using dpdk-devbind.py if available
         interfaces = []
-        dpdk_bind_script = "/opt/OSTG/resources/dpdk/dpdk_bind.sh"
+        dpdk_bind_script = _resolve_dpdk_bind_script()
         if os.path.exists(dpdk_bind_script):
             try:
                 result = subprocess.run(
@@ -13092,7 +13092,7 @@ def dpdk_interfaces():
         
         # Method 2: Try dpdk_bind.sh status
         if not interfaces:
-            dpdk_bind_script = "/opt/OSTG/resources/dpdk/dpdk_bind.sh"
+            dpdk_bind_script = _resolve_dpdk_bind_script()
             if os.path.exists(dpdk_bind_script):
                 try:
                     result = subprocess.run(
@@ -13445,7 +13445,7 @@ def dpdk_bind():
                 # parse `ip route`).
                 logging.debug(f"[DPDK BIND] safety check skipped: {_e}")
         
-        dpdk_bind_script = "/opt/OSTG/resources/dpdk/dpdk_bind.sh"
+        dpdk_bind_script = _resolve_dpdk_bind_script()
         if not os.path.exists(dpdk_bind_script):
             return jsonify({"error": "dpdk_bind.sh not found"}), 404
         
@@ -13523,7 +13523,7 @@ def dpdk_unbind():
         if not pci or ":" not in pci:
             return jsonify({"error": f"Could not determine PCI address for interface {interface}"}), 400
         
-        dpdk_bind_script = "/opt/OSTG/resources/dpdk/dpdk_bind.sh"
+        dpdk_bind_script = _resolve_dpdk_bind_script()
         if not os.path.exists(dpdk_bind_script):
             return jsonify({"error": "dpdk_bind.sh not found"}), 404
         
@@ -14409,6 +14409,25 @@ def dpdk_load_modules():
                             if loaded_ok:
                                 loaded_modules.append(module)
                                 logging.info(f"[DPDK LOAD MODULES] Successfully loaded and verified {module}")
+                                # v0.5.48: CRITICAL fix — without
+                                # `continue` control falls past the
+                                # sudo-fallback `if error_msg and ...`
+                                # block (no-op because error_msg is
+                                # None on success) AND THEN hits the
+                                # unconditional
+                                # `failed_modules.append(...)` at the
+                                # end of the loop body. That appended
+                                # EVERY successfully-loaded module to
+                                # failed_modules with the literal text
+                                # "Unknown error - check server logs",
+                                # which is what the operator saw on
+                                # srv06 after the v0.5.46 polish.
+                                # v0.5.46 fixed the error MESSAGE
+                                # without realising the error PATH was
+                                # tripping on success too. With the
+                                # continue, control skips to the next
+                                # module in the for-loop.
+                                continue
                             else:
                                 # modprobe rc=0 but the module isn't
                                 # in lsmod as its own line. Surface a
@@ -14443,6 +14462,11 @@ def dpdk_load_modules():
                                     "module": module,
                                     "error": error_msg
                                 })
+                                # v0.5.48: same fall-through bug as
+                                # the success path — without continue
+                                # we'd append AGAIN at the bottom of
+                                # the loop body with "Unknown error".
+                                continue
                         else:
                             error_msg = f"Failed to verify module load: lsmod failed"
                             logging.error(f"[DPDK LOAD MODULES] {error_msg}")
@@ -14450,6 +14474,7 @@ def dpdk_load_modules():
                                 "module": module,
                                 "error": error_msg
                             })
+                            continue  # v0.5.48: see above
                     else:
                         error_msg = result.stderr.strip() or result.stdout.strip()
                         # v0.5.46: when subprocess capture is empty
@@ -14504,6 +14529,7 @@ def dpdk_load_modules():
                             "module": module,
                             "error": error_msg
                         })
+                        continue  # v0.5.48: see above — bottom append would double-record
                 except FileNotFoundError:
                     error_msg = "modprobe command not found"
                     logging.error(f"[DPDK LOAD MODULES] {error_msg}")
@@ -14535,11 +14561,18 @@ def dpdk_load_modules():
                         error_msg = f"Both modprobe and sudo modprobe failed: {str(e)}"
                         logging.error(f"[DPDK LOAD MODULES] {error_msg}")
                 
-                # If we get here, loading failed
-                failed_modules.append({
-                    "module": module,
-                    "error": error_msg or "Unknown error - check server logs"
-                })
+                # If we get here, loading failed. v0.5.48: defense in
+                # depth — only the exception handlers (FileNotFound,
+                # TimeoutExpired, generic Exception) fall through to
+                # this point now that the other branches `continue`
+                # explicitly. Still, double-append guard in case some
+                # future branch forgets the continue.
+                if module not in loaded_modules and \
+                   not any(fm.get("module") == module for fm in failed_modules):
+                    failed_modules.append({
+                        "module": module,
+                        "error": error_msg or "Unknown error - check server logs"
+                    })
             except subprocess.TimeoutExpired:
                 failed_modules.append({
                     "module": module,
@@ -14803,6 +14836,34 @@ _ADMIN_INSTALL_STATE = {
     "finished_at": None,
     "return_code": None,
 }
+
+
+def _resolve_dpdk_bind_script():
+    """v0.5.48: probe for dpdk_bind.sh across known install roots.
+
+    Pre-fix, the bind/unbind/status/interfaces endpoints hardcoded
+    `/opt/OSTG/resources/dpdk/dpdk_bind.sh` — the legacy OSTG path.
+    The install_dpdk endpoint already probes
+    `/opt/netgen/resources/dpdk/` first with `/opt/OSTG/` as
+    fallback (see line 15394). Other endpoints didn't, so on a
+    clean netgen-only install (no /opt/OSTG/ compat symlink), all
+    four endpoints returned 404 "dpdk_bind.sh not found" — and
+    `/api/dpdk/status` silently dropped interfaces from its
+    response because the script existence check failed.
+
+    Returns the first existing path, or the canonical
+    `/opt/netgen/...` path if none found so the caller's
+    `os.path.exists()` check can still report a useful missing
+    file in error messages.
+    """
+    candidates = [
+        "/opt/netgen/resources/dpdk/dpdk_bind.sh",
+        "/opt/OSTG/resources/dpdk/dpdk_bind.sh",
+    ]
+    for p in candidates:
+        if os.path.exists(p):
+            return p
+    return candidates[0]
 
 
 def _ensure_dpdk_tree_deployed():
