@@ -2,6 +2,80 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.66] - 2026-06-09
+
+**Hugepages allocation: wrap `mount` in `systemd-run` to escape
+the CAP_SYS_ADMIN restriction.** Operator-reported on srv06
+(v0.5.59):
+
+```
+HTTP 500
+Failed to mount hugetlbfs at /mnt/huge: Command ['mount', '-t',
+'hugetlbfs', 'nodev', '/mnt/huge'] returned non-zero exit
+status 32. Sysfs allocation rolled back.
+```
+
+Full suite: **1,979 passed, 1 skipped** (+7 new tests).
+
+### Why
+
+`mount(2)` requires `CAP_SYS_ADMIN`. The v0.5.56 caps drop-in
+adds that — but only to **newly-started** processes. The
+v0.5.55 → v0.5.59 upgrade restarted netgen-server BEFORE the
+drop-in was written (same v0.5.49 catch-22). So the running
+process still has the pre-v0.5.56 cap set, and `mount` returns
+EPERM → exit 32 → endpoint rolls back the sysfs allocation.
+
+### Fix
+
+```python
+systemd_run = _systemd_run_available()
+if systemd_run:
+    _mount_cmd = [
+        systemd_run,
+        "--wait", "--pipe", "--collect",
+        f"--unit=netgen-mount-hugetlbfs-{int(time.time())}.service",
+        "--description=netgen mount hugetlbfs (cgroup-escape)",
+        "--",
+        "mount", "-t", "hugetlbfs", "nodev", mount_point,
+    ]
+else:
+    _mount_cmd = ["mount", "-t", "hugetlbfs", "nodev", mount_point]
+subprocess.run(_mount_cmd, check=True, timeout=15)
+```
+
+systemd-run spawns the mount in a fresh transient unit with
+vanilla caps — kernel grants CAP_SYS_ADMIN unconditionally. The
+hugepages allocation works regardless of the netgen-server
+process's own cap set. Same pattern as v0.5.33 (apt cache
+chmod) and v0.5.44 (modprobe init_module).
+
+### Sandbox-EPERM pentalogy
+
+| Release | Operation | Cause | Workaround |
+|---|---|---|---|
+| v0.5.31 | apt setgroups | RestrictSUIDSGID | -o APT::Sandbox::User=root |
+| v0.5.33 | apt cache chmod | ProtectSystem | systemd-run wrap |
+| v0.5.44 | modprobe init_module | ProtectKernelModules | systemd-run wrap |
+| v0.5.50 | sudo setresuid | CAP_SETUID missing | skip sudo when root |
+| **v0.5.66** | **mount(hugetlbfs)** | **CAP_SYS_ADMIN missing** | **systemd-run wrap** |
+
+The v0.5.56 cap drop-in is still the cleaner long-term answer
+— once netgen-server is restarted to pick up the new caps, the
+in-process mount would also work. v0.5.66 makes allocation
+work BEFORE that restart.
+
+### Tests
+
+7 new in `tests/test_v0566_mount_systemd_run.py`:
+* Mount call wrapped in systemd-run when available
+* Wrap uses --wait + --pipe + --collect
+* Falls back to bare mount when systemd-run unavailable
+* subprocess.run uses the constructed _mount_cmd variable
+* Transient unit name has unique timestamp suffix
+* subprocess timeout bumped to ≥ 15s for systemd-run overhead
+* Version pinned at ≥ 0.5.66
+
 ## [0.5.65] - 2026-06-09
 
 **LOW polish batch — operstate casing parity, visibility-aware

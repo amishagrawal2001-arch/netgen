@@ -14042,9 +14042,48 @@ def dpdk_hugepages():
                         ["mkdir", "-p", mount_point],
                         check=True, timeout=10,
                     )
+                    # v0.5.66: same sandbox-EPERM pattern as
+                    # v0.5.33 (apt cache chmod) and v0.5.44
+                    # (modprobe init_module). mount(2) requires
+                    # CAP_SYS_ADMIN — held in v0.5.56+ AFTER a
+                    # netgen-server restart picks up the caps
+                    # drop-in. But on the FIRST allocation after
+                    # the v0.5.56 upgrade, the running process
+                    # still uses old caps (caps are set at exec,
+                    # not runtime), so this mount fails with
+                    # exit 32 / "mount failure".
+                    #
+                    # Operator-reported on srv06 at v0.5.59:
+                    #   "Failed to mount hugetlbfs at /mnt/huge:
+                    #    ... mount ... returned non-zero exit
+                    #    status 32"
+                    #
+                    # systemd-run --wait --pipe --collect runs
+                    # the mount in a fresh transient unit with
+                    # vanilla caps — kernel grants CAP_SYS_ADMIN
+                    # to the unit unconditionally, so the mount
+                    # succeeds regardless of our own cap state.
+                    systemd_run = _systemd_run_available()
+                    if systemd_run:
+                        import time as _t
+                        mount_unit = (
+                            f"netgen-mount-hugetlbfs-{int(_t.time())}.service"
+                        )
+                        _mount_cmd = [
+                            systemd_run,
+                            "--wait", "--pipe", "--collect",
+                            f"--unit={mount_unit}",
+                            "--description=netgen mount hugetlbfs (cgroup-escape)",
+                            "--",
+                            "mount", "-t", "hugetlbfs", "nodev", mount_point,
+                        ]
+                    else:
+                        _mount_cmd = [
+                            "mount", "-t", "hugetlbfs", "nodev", mount_point,
+                        ]
                     subprocess.run(
-                        ["mount", "-t", "hugetlbfs", "nodev", mount_point],
-                        check=True, timeout=10,
+                        _mount_cmd,
+                        check=True, timeout=15,
                     )
                     # v0.5.39: persist the hugetlbfs mount in
                     # /etc/fstab so systemd's local-fs.target
