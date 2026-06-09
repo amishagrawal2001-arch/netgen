@@ -17098,7 +17098,24 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
 
     let pollLogTimer = null;
 
+    // v0.5.57 (audit H9): in-flight guards. Pre-fix, every
+    // bind/unbind/load-modules click fired refreshInterfaces() +
+    // refreshHealth() in their .finally; on a multi-NIC box the
+    // operator clicking several actions in quick succession (or
+    // the 30 s setInterval colliding with an action) had 8+
+    // parallel fetches racing. The slower response's
+    // innerHTML-overwrite won, occasionally showing stale data
+    // for a few seconds. Guard with simple flags + a rerun
+    // re-entry so a queued call only fires after the in-flight
+    // one settles.
+    let _healthInFlight = false;
+    let _healthRerun = false;
+    let _ifacesInFlight = false;
+    let _ifacesRerun = false;
+
     async function refreshHealth() {
+      if (_healthInFlight) { _healthRerun = true; return; }
+      _healthInFlight = true;
       try {
         const r = await fetch('/api/admin/health');
         const d = await r.json();
@@ -17127,6 +17144,9 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
         }
       } catch (e) {
         toast('Health fetch failed: ' + e);
+      } finally {
+        _healthInFlight = false;
+        if (_healthRerun) { _healthRerun = false; refreshHealth(); }
       }
     }
 
@@ -17457,6 +17477,9 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
     let _ifaceIPs = {};  // {ifname: {ipv4: [...], ipv6: [...]}} cache for the modal
 
     async function refreshInterfaces() {
+      // v0.5.57 (audit H9): in-flight guard mirroring refreshHealth.
+      if (_ifacesInFlight) { _ifacesRerun = true; return; }
+      _ifacesInFlight = true;
       const wrap = $('iface-table-wrap');
       wrap.innerHTML = '<div class="iface-empty">Loading…</div>';
       try {
@@ -17515,7 +17538,12 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
           let kdrv = i.kernel_driver || '—';
           const looksHeadless = !i.name || i.name === 'N/A' || /\(no interface\)/.test(i.name);
           if (looksHeadless && history[pci] && history[pci].name) {
-            name = `${history[pci].name} <span style="color: var(--muted); font-weight: normal;">(DPDK)</span>`;
+            // v0.5.57 (audit H10): escape history[pci].name —
+            // operator-POSTed value going into innerHTML. Pre-fix
+            // a bind_history record with name=`<img onerror=...>`
+            // would inject raw. Admin-token gated so the risk is
+            // bounded, but defense-in-depth costs nothing here.
+            name = `${escapeHtml(history[pci].name)} <span style="color: var(--muted); font-weight: normal;">(DPDK)</span>`;
             if (kdrv === '—' && history[pci].kernel_driver) kdrv = history[pci].kernel_driver;
           } else if (looksHeadless) {
             name = '<span style="color: var(--muted);">(no interface)</span>';
@@ -17592,6 +17620,9 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
         wrap._ifaces = list;
       } catch (e) {
         wrap.innerHTML = '<div class="iface-empty">Error: ' + escapeHtml(String(e)) + '</div>';
+      } finally {
+        _ifacesInFlight = false;
+        if (_ifacesRerun) { _ifacesRerun = false; refreshInterfaces(); }
       }
     }
 

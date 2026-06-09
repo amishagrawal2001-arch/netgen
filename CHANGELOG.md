@@ -2,6 +2,65 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.57] - 2026-06-09
+
+**Admin console JS — in-flight guards + bind-history XSS escape.**
+Audit findings H9 + H10.
+
+Full suite: **1,924 passed, 1 skipped** (+8 new tests).
+
+### H9: race on `refreshHealth` + `refreshInterfaces`
+
+Every bind / unbind / load-modules / configure-hugepages click
+fires both refreshes in `.finally`. Each refresh makes up to 4
+parallel `fetch()` calls. The 30 s `setInterval(refreshHealth,
+30000)` collides too.
+
+Multi-NIC operator clicking 3 actions in quick succession:
+12+ parallel fetches racing. Slower response's
+`innerHTML`-overwrite wins → table flickers to stale state for
+a few seconds.
+
+Fix: in-flight boolean + rerun flag.
+```javascript
+let _healthInFlight = false, _healthRerun = false;
+async function refreshHealth() {
+  if (_healthInFlight) { _healthRerun = true; return; }
+  _healthInFlight = true;
+  try { /* fetches */ }
+  finally {
+    _healthInFlight = false;
+    if (_healthRerun) { _healthRerun = false; refreshHealth(); }
+  }
+}
+```
+Same pattern for `refreshInterfaces`.
+
+### H10: `history[pci].name` XSS escape
+
+```javascript
+// Before
+name = `${history[pci].name} <span ...>(DPDK)</span>`;
+// After
+name = `${escapeHtml(history[pci].name)} <span ...>(DPDK)</span>`;
+```
+
+`history[pci].name` comes from operator-POSTed
+`/api/admin/bind_history`. Admin-token-gated so risk is bounded
+to privilege-escalation-from-already-admin, but defense-in-depth.
+
+### Tests
+
+8 new in `tests/test_v0557_admin_js_race_and_xss.py`:
+* `_healthInFlight` / `_ifacesInFlight` flags declared
+* refreshHealth early-returns on in-flight + sets rerun
+* refreshHealth clears the flag in `finally`
+* finally re-invokes refreshHealth if rerun was set
+* Same pattern for refreshInterfaces
+* `history[pci].name` wrapped in `escapeHtml`
+* No remaining raw `${history[pci].name}` interpolation
+* Version pinned at ≥ 0.5.57
+
 ## [0.5.56] - 2026-06-09
 
 **netgen-server.service now holds the capabilities DPDK
