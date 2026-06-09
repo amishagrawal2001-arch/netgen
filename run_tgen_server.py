@@ -13533,6 +13533,52 @@ def dpdk_bind():
         if not pci and interface:
             pci = _get_pci_from_interface(interface)
 
+        # v0.5.75: refuse bind when the current kernel driver has no
+        # matching DPDK PMD. tg3 (BCM5719/5720/5717), e1000, e1000e,
+        # r8169 etc. — vfio-pci will mechanically claim the device
+        # but DPDK apps can't use it. Pre-fix the operator clicked
+        # Bind on a tg3 card, watched the screen "hang" for the 30s
+        # subprocess.run window, then saw the card still not enabled
+        # for DPDK. ens10f3 (BCM5719) is the canonical bite. The
+        # operator can still force the bind with force=true — they
+        # may have a custom DPDK build with an out-of-tree PMD.
+        if not force and interface:
+            _drv = None
+            if pci:
+                try:
+                    # /sys/bus/pci/devices/<bdf>/driver is a symlink
+                    # to the driver module dir; basename = driver name.
+                    _drv = os.path.basename(
+                        os.readlink(f"/sys/bus/pci/devices/{pci}/driver")
+                    )
+                except Exception:
+                    pass
+            _NO_PMD_DRIVERS = {
+                "tg3",     # BCM5717/19/20 NetXtreme — bnxt only covers NetXtreme-E
+                "e1000",   # Legacy 82540/82573 — no DPDK PMD
+                "e1000e",  # I219/I218 — no DPDK PMD
+                "e100",    # ancient 82557/8/9
+                "r8169",   # Realtek — no PMD
+                "atlantic",  # Aquantia — no PMD
+            }
+            if _drv and _drv.lower() in _NO_PMD_DRIVERS:
+                logging.warning(
+                    f"[DPDK BIND] refused bind of '{interface}' on "
+                    f"{pci}: kernel driver '{_drv}' has no DPDK PMD"
+                )
+                return jsonify({
+                    "error": (
+                        f"{_drv}-driven NIC has no DPDK PMD in stock "
+                        f"DPDK. vfio-pci will claim it but DPDK apps "
+                        f"won't recognise the device. Use force=true "
+                        f"to override (for out-of-tree PMDs)."
+                    ),
+                    "code": "NO_PMD",
+                    "interface": interface,
+                    "driver": _drv,
+                    "can_force": True,
+                }), 409
+
         # v0.2.76: pre-flight safety guard. Binding the management
         # interface locks the operator out of the host; binding a NIC
         # with an active stream kills the test mid-flight. Refuse with
@@ -18345,15 +18391,29 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       // tooltip warns.
       const effectiveKDriver = driver || (iface.kernel_driver || '').toLowerCase();
       if (effectiveKDriver && effectiveKDriver !== 'unknown') {
-        const NO_PMD = new Set(['tg3', 'e1000', 'e100']);
-        const hint = NO_PMD.has(effectiveKDriver)
-          ? `${effectiveKDriver}-driven NIC has no DPDK PMD in stock DPDK — vfio-pci bind will succeed but DPDK apps won\\'t recognise the device.`
+        // v0.5.75: expanded NO_PMD set + mark unbindable, not just
+        // tooltipped. Pre-fix the Bind button stayed clickable on tg3
+        // cards; click triggered a 30s subprocess that "succeeded" at
+        // sysfs but DPDK couldn't use the card. Operator-bite: ens10f3
+        // (BCM5719) on srv06 — clicked Bind, screen hung, no DPDK.
+        const NO_PMD = new Set([
+          'tg3',       // BCM5717/19/20 NetXtreme (bnxt only covers NetXtreme-E)
+          'e1000',     // legacy 82540/82573
+          'e1000e',    // I219/I218
+          'e100',      // ancient 82557/8/9
+          'r8169',     // Realtek
+          'atlantic',  // Aquantia
+        ]);
+        const noPmd = NO_PMD.has(effectiveKDriver);
+        const hint = noPmd
+          ? `${effectiveKDriver} has no DPDK PMD in stock DPDK. vfio-pci will claim the device but DPDK apps won\\'t recognise it.`
           : null;
         return {
           label: 'Kernel (' + effectiveKDriver + ')',
           pillClass: 'bad',
           action: 'bind',
           hint: hint,
+          noPmd: noPmd,  // v0.5.75: surface flag for renderer
         };
       }
       // Truly unbound — no driver attached at all (rare; usually
@@ -18455,8 +18515,16 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
             // v0.5.47: pass through the no-PMD warning (tg3 et al)
             // as the button tooltip so the operator sees it BEFORE
             // clicking.
+            // v0.5.75: also DISABLE the button for no-PMD drivers
+            // and render a visible "no PMD" pill — pre-fix only the
+            // tooltip warned, but the button still clickable triggered
+            // a 30s subprocess that produced no usable DPDK result.
             const tip = s.hint ? ` title="${escapeHtml(s.hint)}"` : '';
-            actionBtn = `<button data-idx="${idx}" data-action="bind"${tip}>Bind to DPDK</button>`;
+            if (s.noPmd) {
+              actionBtn = `<button data-idx="${idx}" data-action="bind" disabled${tip} style="opacity: 0.5; cursor: not-allowed;">Bind (no PMD)</button>`;
+            } else {
+              actionBtn = `<button data-idx="${idx}" data-action="bind"${tip}>Bind to DPDK</button>`;
+            }
           } else if (s.action === 'unbind') {
             actionBtn = `<button data-idx="${idx}" data-action="unbind" class="secondary">Unbind</button>`;
           } else if (s.hint) {
@@ -18559,13 +18627,43 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       if (iface.pci && iface.pci !== 'N/A' && iface.pci.includes(':')) {
         payload.pci = iface.pci;
       }
-      const r = await fetch('/api/dpdk/bind', {
-        method: 'POST', headers: {'Content-Type': 'application/json'},
-        body: JSON.stringify(payload),
-      });
-      const text = await r.text();
+      // v0.5.75: immediate feedback toast so the screen doesn't feel
+      // "hung" during the 5-30s subprocess. Operator on srv06
+      // reported this exact symptom.
+      toast(`Binding ${iface.name || iface.pci}…`);
+      // v0.5.75: try/catch wraps the fetch. Pre-fix a network error
+      // (the bind disconnected the management NIC, or the server
+      // restarted mid-bind) threw out of the function with no toast
+      // — the .finally re-enabled the button silently, looking
+      // exactly like a "hang then nothing".
+      let r, text;
+      try {
+        r = await fetch('/api/dpdk/bind', {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify(payload),
+        });
+        text = await r.text();
+      } catch (e) {
+        toast(`Bind request failed: ${e} (server may have lost connectivity if the bound iface was the management NIC)`);
+        refreshInterfaces();
+        refreshHealth();
+        return;
+      }
       let data = {};
       try { data = JSON.parse(text); } catch (_) {}
+      // v0.5.75: surface the NO_PMD 409 with a tailored message
+      // and offer the force=true override before the generic
+      // active-routes path.
+      if (!force && r.status === 409 && data.code === 'NO_PMD') {
+        const proceed = confirm(
+          `${data.error}\n\nForce bind anyway?`
+        );
+        if (proceed) {
+          return bindInterface(iface, true);
+        }
+        toast('Bind cancelled');
+        return;
+      }
       const all = ((data.message || '') + ' ' + (data.output || '') + ' ' + text).toLowerCase();
 
       // Mirror the desktop client's safety prompt: if the server warns about

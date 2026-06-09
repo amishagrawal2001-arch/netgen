@@ -2,6 +2,64 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.75] - 2026-06-09
+
+**Refuse DPDK bind on tg3/e1000e/r8169 — no PMD, no hang.** Operator
+on srv06:
+
+> trying to bind dpdk on ens10f3 from admin console, screen seems
+> to be hanging and does not enable DPDK.
+
+### Root cause
+
+`ens10f3` is a BCM5719 (kernel driver `tg3`). DPDK's bnxt PMD only
+supports modern NetXtreme-E/Thor controllers — NOT the older
+NetXtreme/tg3 family (BCM5717/5719/5720). Click flow pre-fix:
+
+1. Operator clicks Bind. Tooltip warned but button stayed clickable
+   (v0.5.47 only added the tooltip).
+2. `bindInterface` POSTs `/api/dpdk/bind`. Server runs dpdk_bind.sh
+   for ~30 s — vfio-pci claims the device at sysfs level.
+3. Response returns, button re-enables, refresh shows status =
+   DPDK-bound — but no DPDK app can use the card. Operator's screen
+   "hangs" for 30s with no actionable result.
+
+Worse: `bindInterface` had no try/catch around `fetch`, so a network
+error during the bind (e.g. management iface disconnected) died
+silently — the `.finally` re-enabled the button without surfacing
+the error.
+
+### Fix
+
+**Server-side (`/api/dpdk/bind`):** new NO_PMD guard. Reads
+`/sys/bus/pci/devices/<bdf>/driver` symlink, checks against
+`{tg3, e1000, e1000e, e100, r8169, atlantic}`. Returns 409 with
+`code="NO_PMD"`, `can_force=True`, and a tailored error message.
+`force=true` overrides (operator may run an out-of-tree PMD).
+
+**JS:** Bind button renders **disabled** with label "Bind (no
+PMD)" for tg3-class drivers — not just tooltipped. Hint still
+shows on hover.
+
+**JS:** `bindInterface` fetch wrapped in try/catch. Network
+errors surface a toast explaining the bind may have disconnected
+the management NIC. Immediate "Binding <iface>…" toast on click
+so the 5–30 s subprocess wait doesn't feel like a hang.
+
+**JS:** 409 + `code=NO_PMD` surfaces a tailored confirm dialog
+("…vfio-pci will claim it but DPDK apps won't recognise the
+device. Force bind anyway?") — before the generic active-routes
+check.
+
+### What srv06 will see after upgrade
+
+| Iface | Vendor | Bind button |
+|---|---|---|
+| ens3f0np0 | NVIDIA Mellanox (ConnectX-?) | "no bind needed" (bifurcated) |
+| ens10f0–3 | Broadcom BCM5719 (tg3) | **Bind (no PMD)** disabled |
+
+11 new regression tests. Full suite: **2,056 passed, 1 skipped**.
+
 ## [0.5.74] - 2026-06-09
 
 **RDMA status in admin console + audit batch 1 (F1+F3+F6).** Operator
