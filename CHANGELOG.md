@@ -2,6 +2,32 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.59] - 2026-06-09
+
+**1GB hugepage support + num_pages input validation.** Audit
+finding M2.
+
+Full suite: **1,937 passed, 1 skipped** (+6 new tests).
+
+1GB hugepages are standard for ≥100 Gbps DPDK on AMD EPYC /
+Intel Sapphire Rapids. Pre-fix the endpoint flat-rejected
+`page_size: "1GB"` — operators had to set them via GRUB cmdline
+only (boot-time, no runtime resize). The sysfs path mirrors the
+2MB layout: `/sys/.../hugepages-1048576kB/nr_hugepages`.
+
+Plus: `num_pages` now validated as non-negative int up front
+instead of letting the kernel silently clamp negatives to 0.
+
+```python
+_HUGEPAGE_LEAVES = {
+    "2MB": "hugepages-2048kB/nr_hugepages",
+    "1GB": "hugepages-1048576kB/nr_hugepages",
+}
+```
+
+6 new tests pin the dict mapping, the error response with
+supported list, and the validation.
+
 ## [0.5.58] - 2026-06-09
 
 **Registry hygiene — atomic write + shared lock.** Audit findings

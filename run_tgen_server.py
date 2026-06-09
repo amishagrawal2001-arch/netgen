@@ -13840,12 +13840,39 @@ def dpdk_hugepages():
         if not num_pages:
             return jsonify({"error": "num_pages required"}), 400
         
-        # Configure hugepages
-        if page_size == "2MB":
-            hugepage_file = "/sys/kernel/mm/hugepages/hugepages-2048kB/nr_hugepages"
-            _hp_sysfs_leaf = "hugepages-2048kB/nr_hugepages"
-        else:
-            return jsonify({"error": f"Unsupported page size: {page_size}"}), 400
+        # v0.5.59 (audit M2): 1GB hugepages are the standard for
+        # ≥100 Gbps DPDK on AMD EPYC / Intel Sapphire Rapids. The
+        # /sys path mirrors the 2MB layout. Pre-fix this endpoint
+        # flat-rejected `page_size: "1GB"` and operators had to
+        # configure them through the kernel cmdline only (no
+        # runtime allocation). Accept both now.
+        _HUGEPAGE_LEAVES = {
+            "2MB": "hugepages-2048kB/nr_hugepages",
+            "1GB": "hugepages-1048576kB/nr_hugepages",
+        }
+        leaf = _HUGEPAGE_LEAVES.get(page_size)
+        if not leaf:
+            return jsonify({
+                "error": (
+                    f"Unsupported page size: {page_size}. "
+                    f"Supported: {', '.join(_HUGEPAGE_LEAVES)}"
+                ),
+            }), 400
+        hugepage_file = "/sys/kernel/mm/hugepages/" + leaf
+        _hp_sysfs_leaf = leaf
+
+        # v0.5.59 (audit M2 cont): validate num_pages is a non-
+        # negative int. Pre-fix `int(num_pages)` would accept
+        # negative values which the kernel may quietly clamp to
+        # 0 or reject with a non-obvious errno.
+        try:
+            num_pages = int(num_pages)
+            if num_pages < 0:
+                raise ValueError("must be >= 0")
+        except (TypeError, ValueError) as _ve:
+            return jsonify({
+                "error": f"num_pages must be a non-negative integer; got {data.get('num_pages')!r}",
+            }), 400
 
         # v0.5.54 (audit H5): NUMA-aware allocation. Pre-fix wrote
         # to the global `/sys/kernel/mm/hugepages/.../nr_hugepages`
