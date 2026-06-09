@@ -2,6 +2,38 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.60] - 2026-06-09
+
+**IOMMU regex anchoring + cpu_vendor allowlist + PCI BDF
+validation.** Audit findings M3 + M4.
+
+Full suite: **1,943 passed, 1 skipped** (+6 new tests).
+
+### M3: `/api/dpdk/iommu` substring → word-boundary regex
+
+Pre-fix `iommu_param not in current_cmdline` substring check.
+On a cmdline already containing `intel_iommu=on,igfx_off`
+(comma-flags form) the check matched but the boundary was
+wrong → duplicates accumulated on repeat calls.
+
+Fix: `re.search(rf'\b{re.escape(iommu_param)}\b', current_cmdline)`.
+
+Plus `cpu_vendor` now allowlisted — only `'intel'` / `'amd'`.
+Pre-fix any other string (typo like `'intl'`) fell through to
+the Intel branch and wrote Intel IOMMU params on AMD boxes.
+The AMD kernel quietly ignores them → IOMMU stays off →
+vfio-pci fails downstream.
+
+### M4: PCI BDF strict regex
+
+Pre-fix `/api/dpdk/bind` + `unbind` only checked `":" in pci`.
+`0000:01:00.0; rm -rf /` passed. subprocess.run uses a list (not
+shell=True) so no shell-injection, but the value poisoned
+dpdk_bind.sh's word-splitting → confusing downstream errors.
+
+Fix: `re.match(r"^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$", pci)`.
+Canonical lowercase BDF from sysfs is the only safe form.
+
 ## [0.5.59] - 2026-06-09
 
 **1GB hugepage support + num_pages input validation.** Audit

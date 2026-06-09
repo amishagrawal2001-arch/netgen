@@ -13447,7 +13447,17 @@ def dpdk_bind():
             return jsonify({"error": "interface or pci required"}), 400
 
         # Validate PCI format if provided (should be like 0000:XX:XX.X)
-        if pci and (pci == "N/A" or ":" not in pci):
+        # v0.5.60 (audit M4): strict PCI BDF regex. Pre-fix only
+        # checked `":" in pci` so e.g. `0000:01:00.0; rm -rf /`
+        # passed the check. We pass the value as a list arg to
+        # subprocess.run (not shell), so shell-injection is
+        # impossible, but the value gets word-split by dpdk_bind.sh
+        # internally and produces useless downstream errors.
+        # Canonical lowercase BDF from sysfs is the only safe form.
+        if pci and not re.match(
+            r"^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$",
+            pci,
+        ):
             pci = None  # Ignore invalid PCI
 
         # If PCI is invalid, try to get it from interface name
@@ -13584,7 +13594,17 @@ def dpdk_unbind():
         kernel_driver = data.get("kernel_driver", "")
 
         # Validate PCI format if provided
-        if pci and (pci == "N/A" or ":" not in pci):
+        # v0.5.60 (audit M4): strict PCI BDF regex. Pre-fix only
+        # checked `":" in pci` so e.g. `0000:01:00.0; rm -rf /`
+        # passed the check. We pass the value as a list arg to
+        # subprocess.run (not shell), so shell-injection is
+        # impossible, but the value gets word-split by dpdk_bind.sh
+        # internally and produces useless downstream errors.
+        # Canonical lowercase BDF from sysfs is the only safe form.
+        if pci and not re.match(
+            r"^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$",
+            pci,
+        ):
             pci = None
 
         # If we have interface name but no PCI, convert interface to PCI
@@ -14921,6 +14941,16 @@ def dpdk_configure_iommu():
         data = request.get_json() or {}
         enable = data.get("enable", True)
         cpu_vendor = data.get("cpu_vendor", "intel").lower()
+        # v0.5.60 (audit M3 cont): allowlist cpu_vendor — pre-fix
+        # any string other than "amd" silently fell through to
+        # the Intel branch, so a typo like "intl" wrote Intel
+        # IOMMU params on an AMD box (which the AMD kernel
+        # quietly ignores → IOMMU stays off → vfio-pci fails).
+        if cpu_vendor not in ("intel", "amd"):
+            return jsonify({
+                "success": False,
+                "error": f"Invalid cpu_vendor {cpu_vendor!r}; supported: 'intel', 'amd'",
+            }), 400
         reboot = data.get("reboot", False)
         
         grub_file = "/etc/default/grub"
@@ -14979,16 +15009,28 @@ def dpdk_configure_iommu():
                 current_cmdline = ""
         
         # Modify cmdline
+        # v0.5.60 (audit M3): word-boundary regex instead of bare
+        # `in` substring. Pre-fix `iommu_param not in
+        # current_cmdline` matched `intel_iommu=on,igfx_off` as
+        # "intel_iommu=on present", and on a kernel cmdline with
+        # `iommu=pt` already + a typo near `intel_iommu` we'd
+        # append a SECOND `intel_iommu=on iommu=pt` on every
+        # call → duplicates accumulate.
         if enable:
-            # Add IOMMU parameters if not present
-            if iommu_param not in current_cmdline:
+            # Anchored boundary check — matches the exact token,
+            # not a substring.
+            _has_iommu_param = bool(re.search(
+                rf'\b{re.escape(iommu_param)}\b',
+                current_cmdline,
+            ))
+            if not _has_iommu_param:
                 if current_cmdline:
                     new_cmdline = f"{current_cmdline} {iommu_params}"
                 else:
                     new_cmdline = iommu_params
             else:
-                # Already enabled, just ensure iommu=pt is there
-                if "iommu=pt" not in current_cmdline:
+                # Already enabled, just ensure iommu=pt is there.
+                if not re.search(r'\biommu=pt\b', current_cmdline):
                     new_cmdline = current_cmdline.replace(iommu_param, iommu_params)
                 else:
                     new_cmdline = current_cmdline  # Already configured
