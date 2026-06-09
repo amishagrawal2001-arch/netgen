@@ -1047,6 +1047,169 @@ step_configure_hugepages() {
 vm.nr_hugepages = $pages
 EOF
     log_success "Hugepages persisted: $sysctl_conf"
+
+    # v0.5.51: apply the sysctl now so the running kernel reflects
+    # the new value WITHOUT needing reboot. Pre-fix we only wrote
+    # the file; the running kernel kept the old nr_hugepages value
+    # until next reboot.
+    if command -v sysctl >/dev/null 2>&1; then
+        if sysctl --system >/dev/null 2>&1; then
+            log_success "sysctl --system reloaded; running kernel updated"
+        else
+            log_warning "sysctl --system failed; reboot to apply"
+            netgen_mark_reboot_required "sysctl --system reload failed"
+        fi
+    fi
+}
+
+# v0.5.51: track when the operator MUST reboot for changes to take
+# effect. step_summary surfaces the requirement; also touches
+# /var/run/netgen-reboot-required so /api/dpdk/status can pick it
+# up without re-scanning the install log.
+REBOOT_REQUIRED=0
+REBOOT_REASONS=()
+
+netgen_mark_reboot_required() {
+    local reason="$1"
+    REBOOT_REQUIRED=1
+    REBOOT_REASONS+=("$reason")
+    local marker=""
+    if [[ -d /run && -w /run ]]; then
+        marker="/run/netgen-reboot-required"
+    elif [[ -d /var/run && -w /var/run ]]; then
+        marker="/var/run/netgen-reboot-required"
+    fi
+    if [[ -n "$marker" ]]; then
+        {
+            echo "# Marker written by netgen install_dpdk.sh"
+            echo "# Reboot is required for these changes to take effect:"
+            for r in "${REBOOT_REASONS[@]}"; do
+                echo "#   - $r"
+            done
+        } > "$marker" 2>/dev/null || true
+    fi
+}
+
+# v0.5.51: enable IOMMU for vfio-pci by editing /etc/default/grub.
+# Pre-fix install_dpdk.sh bound NICs to vfio-pci (step 8) on hosts
+# where IOMMU was OFF, the kernel refused to attach vfio-pci to
+# any device ("No IOMMU support" or noiommu fallback), and DPDK
+# apps failed 1 second after "bind success". This step adds the
+# right kernel cmdline for the detected CPU vendor and surfaces a
+# reboot requirement when changes are made.
+step_configure_iommu() {
+    log_step "Step 7b: Configuring IOMMU (kernel cmdline)"
+
+    local vendor=""
+    if [[ -r /proc/cpuinfo ]]; then
+        if grep -qi "GenuineIntel" /proc/cpuinfo; then
+            vendor="intel"
+        elif grep -qi "AuthenticAMD" /proc/cpuinfo; then
+            vendor="amd"
+        fi
+    fi
+    if [[ -z "$vendor" ]]; then
+        log_warning "Could not detect CPU vendor; skipping IOMMU config"
+        return 0
+    fi
+    log_info "CPU vendor: $vendor"
+
+    local needed_param=""
+    case "$vendor" in
+        intel) needed_param="intel_iommu=on" ;;
+        amd)   needed_param="amd_iommu=on"   ;;
+    esac
+
+    # Already-on check via /proc/cmdline (live kernel).
+    local live_cmdline=""
+    [[ -r /proc/cmdline ]] && live_cmdline=$(cat /proc/cmdline 2>/dev/null)
+    if echo "$live_cmdline" | grep -qE "(^| )${needed_param}( |$)" \
+       && echo "$live_cmdline" | grep -qE "(^| )iommu=pt( |$)"; then
+        log_success "IOMMU already active in running kernel"
+        return 0
+    fi
+
+    local grub_file="/etc/default/grub"
+    if [[ ! -w "$grub_file" ]]; then
+        log_warning "$grub_file not writable; skipping IOMMU config"
+        log_warning "Add manually: GRUB_CMDLINE_LINUX_DEFAULT=\"... $needed_param iommu=pt\""
+        return 0
+    fi
+
+    # Anchored idempotency check against the file — covers the
+    # case where GRUB has the params but kernel hasn't been
+    # rebooted yet.
+    if grep -qE "GRUB_CMDLINE_LINUX[A-Z_]*=.*${needed_param}" "$grub_file" \
+       && grep -qE "GRUB_CMDLINE_LINUX[A-Z_]*=.*iommu=pt" "$grub_file"; then
+        log_warning "GRUB already has IOMMU params; reboot required to activate"
+        netgen_mark_reboot_required "IOMMU enabled in GRUB but not yet active"
+        return 0
+    fi
+
+    # Timestamped backup before edit. Damage to /etc/default/grub
+    # would leave the box unbootable; the backup gives the
+    # operator a known-good version to restore.
+    local backup="${grub_file}.netgen-bak.$(date +%s)"
+    if cp "$grub_file" "$backup" 2>/dev/null; then
+        log_info "Backed up $grub_file → $backup"
+    else
+        log_warning "Could not back up $grub_file; aborting GRUB edit"
+        return 0
+    fi
+
+    # Append to GRUB_CMDLINE_LINUX_DEFAULT (preferred) if present,
+    # else to GRUB_CMDLINE_LINUX. Anchored sed leaves unrelated
+    # lines untouched.
+    local applied=0
+    if grep -qE '^GRUB_CMDLINE_LINUX_DEFAULT=' "$grub_file"; then
+        sed -i.netgen-sed -E \
+            "s|^(GRUB_CMDLINE_LINUX_DEFAULT=\")(.*)\"|\1\2 ${needed_param} iommu=pt\"|" \
+            "$grub_file"
+        applied=1
+    elif grep -qE '^GRUB_CMDLINE_LINUX=' "$grub_file"; then
+        sed -i.netgen-sed -E \
+            "s|^(GRUB_CMDLINE_LINUX=\")(.*)\"|\1\2 ${needed_param} iommu=pt\"|" \
+            "$grub_file"
+        applied=1
+    fi
+    rm -f "${grub_file}.netgen-sed"
+
+    if [[ $applied -eq 1 ]]; then
+        log_success "Added '$needed_param iommu=pt' to GRUB cmdline"
+    else
+        log_warning "No GRUB_CMDLINE_LINUX[_DEFAULT] line in $grub_file"
+        log_warning "Restoring backup; configure IOMMU manually"
+        cp "$backup" "$grub_file"
+        return 0
+    fi
+
+    # update-grub on Debian/Ubuntu; grub2-mkconfig on RHEL.
+    local rebuilt=0
+    if command -v update-grub >/dev/null 2>&1; then
+        if update-grub 2>&1 | tail -5 | sed 's/^/[grub] /'; then
+            rebuilt=1
+        fi
+    elif command -v grub2-mkconfig >/dev/null 2>&1; then
+        local cfg="/boot/grub2/grub.cfg"
+        if [[ -d /boot/efi/EFI ]]; then
+            local efi_dir
+            efi_dir=$(ls /boot/efi/EFI 2>/dev/null | head -1)
+            [[ -n "$efi_dir" ]] && cfg="/boot/efi/EFI/${efi_dir}/grub.cfg"
+        fi
+        if grub2-mkconfig -o "$cfg" 2>&1 | tail -5 | sed 's/^/[grub] /'; then
+            rebuilt=1
+        fi
+    else
+        log_warning "No update-grub / grub2-mkconfig found; manual rebuild required"
+    fi
+
+    if [[ $rebuilt -eq 1 ]]; then
+        log_success "GRUB config rebuilt"
+        netgen_mark_reboot_required "IOMMU $needed_param + iommu=pt added to GRUB"
+    else
+        log_warning "GRUB config NOT rebuilt; restoring backup"
+        cp "$backup" "$grub_file"
+    fi
 }
 
 # Step 8: NIC binding (optional)
@@ -1325,6 +1488,30 @@ step_summary() {
     echo "  - README_ALL/DPDK_FIRST_TIME_INSTALLATION.md"
     echo "  - README_ALL/DPDK_SCRIPTS_USAGE_GUIDE.md"
     echo ""
+
+    # v0.5.51: if any step set REBOOT_REQUIRED, surface it loudly
+    # at the end so the operator (or the wizard parsing this log)
+    # doesn't miss it. The /var/run/netgen-reboot-required marker
+    # was already written by netgen_mark_reboot_required.
+    if [[ ${REBOOT_REQUIRED:-0} -eq 1 ]]; then
+        echo ""
+        echo -e "${YELLOW}╔═══════════════════════════════════════════════════════════╗${NC}"
+        echo -e "${YELLOW}║                  REBOOT REQUIRED                          ║${NC}"
+        echo -e "${YELLOW}╚═══════════════════════════════════════════════════════════╝${NC}"
+        echo ""
+        echo "The following changes only take effect after reboot:"
+        for r in "${REBOOT_REASONS[@]}"; do
+            echo "  - $r"
+        done
+        echo ""
+        echo "Reboot with: sudo systemctl reboot"
+        echo ""
+        # Exit code 75 = EX_TEMPFAIL (sysexits.h). Convention used
+        # for "operation succeeded but needs a follow-up". The
+        # /api/admin/install_dpdk endpoint parses this to surface
+        # "reboot needed" in the response.
+        exit 75
+    fi
 }
 
 # Main installation flow
@@ -1371,13 +1558,17 @@ main() {
         esac
     done
     
-    # Run installation steps
+    # Run installation steps. v0.5.51: step_configure_iommu runs
+    # between hugepages and NIC binding — binding to vfio-pci is
+    # the operation that needs IOMMU active, so the cmdline must
+    # be enqueued before we touch sysfs.
     step_preflight
     step_detect_dpdk_source
     step_install_dependencies
     step_build_dpdk
     step_build_tx_worker
     step_configure_hugepages
+    step_configure_iommu
     step_nic_binding
     step_configure_library_paths
     step_verification

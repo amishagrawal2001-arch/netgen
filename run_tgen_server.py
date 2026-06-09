@@ -13030,6 +13030,26 @@ def dpdk_status():
             except Exception as e:
                 logging.debug(f"[DPDK STATUS] Failed to get interface status: {e}")
         
+        # v0.5.51: surface the install_dpdk.sh reboot-required
+        # marker so the admin chip can warn even after the install
+        # log has scrolled off. The shell writes this file via
+        # netgen_mark_reboot_required() when it edits GRUB or the
+        # sysctl reload fails.
+        reboot_needed = False
+        reboot_reasons = []
+        for marker_path in ("/run/netgen-reboot-required",
+                            "/var/run/netgen-reboot-required"):
+            if os.path.isfile(marker_path):
+                reboot_needed = True
+                try:
+                    with open(marker_path) as f:
+                        for ln in f:
+                            ln = ln.strip()
+                            if ln.startswith("#   - "):
+                                reboot_reasons.append(ln[len("#   - "):])
+                except Exception:
+                    pass
+                break
         return jsonify({
             "dpdk_installed": dpdk_installed,
             "tx_worker_exists": tx_worker_exists,
@@ -13046,6 +13066,9 @@ def dpdk_status():
             # v0.2.77: ABI / build-freshness indicators.
             "dpdk_version": dpdk_version,
             "tx_worker_built": tx_worker_built,
+            # v0.5.51: install_dpdk.sh reboot-required signal
+            "reboot_needed": reboot_needed,
+            "reboot_reasons": reboot_reasons,
         }), 200
         
     except Exception as e:

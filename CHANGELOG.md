@@ -2,6 +2,82 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.51] - 2026-06-09
+
+**install_dpdk.sh now configures GRUB/IOMMU and signals reboot.**
+Closes audit findings C3 (CRITICAL: no IOMMU setup → vfio-pci
+binding succeeds but DPDK fails 1 second later with "No IOMMU
+support") and C4 (CRITICAL: no reboot-needed signal → sysctl
+persistence file written but running kernel keeps old value
+silently).
+
+Full suite: **1,878 passed, 1 skipped** (+12 new tests).
+
+### New `step_configure_iommu` (between hugepages and NIC bind)
+
+* Detects CPU vendor from `/proc/cpuinfo`
+  (`GenuineIntel` / `AuthenticAMD`)
+* Idempotent: if `/proc/cmdline` already has the params, skip
+* Backs up `/etc/default/grub` with timestamp
+  (`.netgen-bak.<epoch>`)
+* Appends `intel_iommu=on iommu=pt` or `amd_iommu=on iommu=pt`
+  to `GRUB_CMDLINE_LINUX_DEFAULT` (preferred) or
+  `GRUB_CMDLINE_LINUX`
+* Runs `update-grub` (Debian/Ubuntu) or `grub2-mkconfig` (RHEL)
+* On failure: restores backup so the box stays bootable
+* On success: marks reboot required + exits non-zero (75)
+
+### `netgen_mark_reboot_required(reason)` helper
+
+Tracks reboot-needed state across all install steps:
+
+* `REBOOT_REQUIRED=1`
+* Writes `/run/netgen-reboot-required` (or
+  `/var/run/netgen-reboot-required` fallback for older systems)
+* `step_summary` surfaces a yellow banner + lists every reason
+* Exit code 75 = `EX_TEMPFAIL` — admin endpoint can distinguish
+  "success but reboot needed" from plain success
+
+### `step_configure_hugepages` now applies `sysctl --system`
+
+Pre-fix the operator could set hugepages to 2048, write the
+sysctl file, see "Hugepages persisted", and then notice the
+running kernel still shows 1024. The fix runs `sysctl --system`
+after writing so the new value is live (or marks reboot
+required if the reload itself fails).
+
+### `/api/dpdk/status` exposes reboot state
+
+New fields:
+* `reboot_needed: bool`
+* `reboot_reasons: [str]` — from the marker file
+
+So the admin chip can warn the operator even after the install
+log has scrolled off.
+
+### Why srv06 was working anyway
+
+The operator's srv06 already had IOMMU active before install_dpdk
+ever ran (manual setup at machine prep time). New hosts won't be
+so lucky — that's exactly the C3 trap. v0.5.51 makes the install
+self-sufficient.
+
+### Tests
+
+12 new in `tests/test_v0551_iommu_and_reboot_signal.py`:
+* `step_configure_iommu()` defined
+* Wired between hugepages and NIC binding in main()
+* Detects Intel AND AMD vendors
+* Idempotency check against `/proc/cmdline`
+* Backs up `/etc/default/grub` before edit
+* Supports both `update-grub` and `grub2-mkconfig`
+* `netgen_mark_reboot_required()` helper exists
+* Writes `/run/netgen-reboot-required` + `/var/run/...` fallback
+* `step_summary` exits 75 when reboot required
+* `step_configure_hugepages` calls `sysctl --system`
+* `/api/dpdk/status` exposes `reboot_needed` + `reboot_reasons`
+* Version pinned at ≥ 0.5.51
+
 ## [0.5.50] - 2026-06-09
 
 **Don't call `sudo` from an already-root process.** Operator on
