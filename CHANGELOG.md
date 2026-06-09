@@ -2,6 +2,84 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.50] - 2026-06-09
+
+**Don't call `sudo` from an already-root process.** Operator on
+srv06 tried to bind `ens10f1` from the admin console (Jun 9
+2026):
+
+```
+HTTP 500
+sudo: PERM_SUDOERS: setresuid(-1, 1, -1): Operation not permitted
+sudo: unable to open /etc/sudoers: Operation not permitted
+sudo: error initializing audit plugin sudoers_audit
+```
+
+Full suite: **1,866 passed, 1 skipped** (+8 new tests).
+
+### Root cause
+
+`netgen-server.service` runs as root but its
+`CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN` caps what the
+process can hold — anything NOT in the list is permanently
+dropped, even though the process is UID 0. So:
+
+* `CAP_SETUID` dropped → `sudo`'s `setresuid(-1, 1, -1)` to
+  switch to the sudoers-parser UID returns EPERM
+* `CAP_DAC_OVERRIDE` dropped → can't open `/etc/sudoers` (mode
+  0440 root:root)
+
+The sudo binary fails BEFORE it ever runs the wrapped
+`dpdk_bind.sh`. The bind never starts. Same class as v0.5.31
+(apt setgroups EPERM) and v0.5.44 (modprobe init_module EPERM),
+but hitting sudo's privilege-drop instead of a privileged
+operation.
+
+### Fix — `_maybe_sudo()` helper
+
+```python
+def _maybe_sudo(cmd):
+    if os.geteuid() == 0:
+        return list(cmd)        # we're root — no sudo needed
+    return ["sudo"] + list(cmd)  # non-root install — sudo as before
+```
+
+Applied to **all 6** `["sudo", ...]` literals in DPDK paths:
+
+* 2× `/api/dpdk/interfaces` status reads
+* 1× `/api/dpdk/status` dpdk-devbind read
+* 1× `/api/dpdk/bind`
+* 1× `/api/dpdk/unbind`
+* 1× `/api/dpdk/load_modules` sudo-fallback
+
+On srv06 (where the unit runs as root) sudo is now bypassed
+entirely → no EPERM. On non-root installs (rare) sudo still
+runs as before.
+
+### Why not just add caps to the unit?
+
+The audit (H8) recommends adding `CAP_SYS_ADMIN
+CAP_SYS_MODULE CAP_SYS_BOOT CAP_SETUID CAP_DAC_OVERRIDE` to
+`netgen-server.service` so in-process syscalls (mount, modprobe,
+direct sysfs writes, reboot) work without the
+systemd-run/subprocess workarounds we've been piling up since
+v0.5.31. That's a follow-up — it requires editing the installed
+unit and reloading, which means a separate ship + tarball
+re-install. This v0.5.50 fix sidesteps the immediate EPERM
+without that surgery.
+
+### Tests
+
+8 new in `tests/test_v0550_dpdk_no_sudo_when_root.py`:
+* `_maybe_sudo()` helper defined
+* Returns cmd unchanged when `geteuid() == 0`
+* Still prepends `sudo` when non-root
+* No remaining `["sudo", ...]` literals in subprocess calls
+* `/api/dpdk/bind` uses helper
+* `/api/dpdk/unbind` uses helper
+* `load_modules` sudo-fallback uses helper
+* Version pinned at ≥ 0.5.50
+
 ## [0.5.49] - 2026-06-09
 
 **Self-heal `/opt/netgen-server/bin/netgen-upgrade` from the

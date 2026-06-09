@@ -13019,7 +13019,7 @@ def dpdk_status():
         if os.path.exists(dpdk_bind_script):
             try:
                 result = subprocess.run(
-                    ["sudo", dpdk_bind_script, "status"],
+                    _maybe_sudo([dpdk_bind_script, "status"]),
                     capture_output=True,
                     text=True,
                     timeout=10
@@ -13078,7 +13078,7 @@ def dpdk_interfaces():
         if dpdk_devbind:
             try:
                 result = subprocess.run(
-                    ["sudo", "python3", dpdk_devbind, "--status"],
+                    _maybe_sudo(["python3", dpdk_devbind, "--status"]),
                     capture_output=True,
                     text=True,
                     timeout=10
@@ -13096,7 +13096,7 @@ def dpdk_interfaces():
             if os.path.exists(dpdk_bind_script):
                 try:
                     result = subprocess.run(
-                        ["sudo", dpdk_bind_script, "status"],
+                        _maybe_sudo([dpdk_bind_script, "status"]),
                         capture_output=True,
                         text=True,
                         timeout=10
@@ -13458,7 +13458,7 @@ def dpdk_bind():
             return jsonify({"error": f"Could not determine PCI address for interface {interface}"}), 400
         
         # dpdk_bind.sh expects: bind <PCI> [--force]
-        cmd = ["sudo", dpdk_bind_script, "bind", pci]
+        cmd = _maybe_sudo([dpdk_bind_script, "bind", pci])
         if force:
             cmd.append("--force")
 
@@ -13528,7 +13528,7 @@ def dpdk_unbind():
             return jsonify({"error": "dpdk_bind.sh not found"}), 404
         
         # dpdk_bind.sh expects: unbind <PCI> [--kernel-driver <driver>]
-        cmd = ["sudo", dpdk_bind_script, "unbind", pci]
+        cmd = _maybe_sudo([dpdk_bind_script, "unbind", pci])
         if kernel_driver:
             cmd.extend(["--kernel-driver", kernel_driver])
 
@@ -14545,7 +14545,7 @@ def dpdk_load_modules():
                     try:
                         logging.info(f"[DPDK LOAD MODULES] Trying sudo modprobe {module} as fallback")
                         result = subprocess.run(
-                            ["sudo", modprobe_path, module],
+                            _maybe_sudo([modprobe_path, module]),
                             capture_output=True,
                             text=True,
                             timeout=10
@@ -14836,6 +14836,36 @@ _ADMIN_INSTALL_STATE = {
     "finished_at": None,
     "return_code": None,
 }
+
+
+def _maybe_sudo(cmd):
+    """v0.5.50: prepend sudo only when actually non-root.
+
+    Operator-reported on srv06 (Jun 9 2026):
+      bind ens10f1 →
+      sudo: PERM_SUDOERS: setresuid(-1, 1, -1): Operation not
+      permitted
+      sudo: unable to open /etc/sudoers: Operation not permitted
+
+    Root cause: netgen-server.service runs as root but its
+    `CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN` drops
+    `CAP_SETUID` (needed by sudo's setresuid to drop privs to
+    the sudoers parser UID) and `CAP_DAC_OVERRIDE` (needed to
+    read `/etc/sudoers` which is mode 0440 root:root). So sudo
+    fails before it even runs the wrapped command.
+
+    The wrapped commands don't NEED sudo — netgen-server already
+    runs as root. Stripping sudo when geteuid()==0 sidesteps
+    the EPERM entirely.
+
+    The only legitimate sudo path is when someone runs the server
+    as a non-root user — uncommon but possible. In that case the
+    caller has to have configured sudoers themselves; we keep
+    the sudo prefix.
+    """
+    if os.geteuid() == 0:
+        return list(cmd)
+    return ["sudo"] + list(cmd)
 
 
 def _resolve_dpdk_bind_script():
