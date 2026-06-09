@@ -2,6 +2,52 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.58] - 2026-06-09
+
+**Registry hygiene — atomic write + shared lock.** Audit findings
+M1 + M5.
+
+Full suite: **1,931 passed, 1 skipped** (+7 new tests).
+
+### M1: `/api/admin/bind_history` non-atomic write
+
+```python
+def _save_bind_history(history):
+    with open(_ADMIN_BIND_HISTORY_PATH, "w") as f:  # ⚠ truncates
+        json.dump(history, f, indent=2)
+```
+
+Two concurrent POSTs (operator UI + scripted client) raced:
+- Thread A: `open("w")` truncates the file
+- Thread B: `open("r")` reads → 0-byte file
+- Thread A: `json.dump` completes
+
+Thread B got `{}` instead of the real history → next rebind
+boot lost the original-driver memory.
+
+Fix: write to `.tmp` + `os.replace` (atomic rename).
+
+### M5: `_dpdk_persist_bind` / `_dpdk_unpersist_bind` no lock
+
+Already had atomic write (.tmp + os.replace) but no
+serialisation across calls. Two concurrent `/api/dpdk/bind`
+calls read-modify-write the same file — one bind's entry got
+lost.
+
+Fix: shared `threading.Lock()` (`_BIND_REGISTRY_LOCK`) held by
+all 4 sites (`_load_bind_history`, `_save_bind_history`,
+`_dpdk_persist_bind`, `_dpdk_unpersist_bind`). The lock cost is
+negligible in the common case; the race window is closed
+completely.
+
+### Tests
+
+7 new in `tests/test_v0558_registry_lock_and_atomic.py`:
+* Shared lock declared
+* `_save_bind_history` atomic write (.tmp + os.replace)
+* All 4 functions hold the lock
+* Version pinned at ≥ 0.5.58
+
 ## [0.5.57] - 2026-06-09
 
 **Admin console JS — in-flight guards + bind-history XSS escape.**

@@ -13345,39 +13345,47 @@ def _dpdk_persist_bind(pci, driver, iface_name, original_driver=None):
         return False
     try:
         os.makedirs(os.path.dirname(_DPDK_BIND_REGISTRY), exist_ok=True)
-        data = {"version": 1, "binds": []}
-        if os.path.isfile(_DPDK_BIND_REGISTRY):
-            try:
-                with open(_DPDK_BIND_REGISTRY) as f:
-                    data = _json.load(f)
-            except Exception:
-                pass
-        binds = data.get("binds") or []
-        # Replace any existing entry for the same PCI. But if the
-        # old entry HAD an original_driver and the new call
-        # doesn't, preserve the old one — repeat-bind calls
-        # shouldn't lose the kernel-driver memory.
-        prev = next(
-            (b for b in binds if b.get("pci") == pci),
-            None,
-        )
-        if original_driver is None and prev:
-            original_driver = prev.get("original_driver")
-        binds = [b for b in binds if b.get("pci") != pci]
-        entry = {
-            "pci": pci,
-            "driver": driver,
-            "iface_name": iface_name,
-            "bound_at": _dt.datetime.now().isoformat(),
-        }
-        if original_driver:
-            entry["original_driver"] = original_driver
-        binds.append(entry)
-        data["binds"] = binds
-        tmp = _DPDK_BIND_REGISTRY + ".tmp"
-        with open(tmp, "w") as f:
-            _json.dump(data, f, indent=2)
-        os.replace(tmp, _DPDK_BIND_REGISTRY)
+        # v0.5.58 (audit M5): serialise read-modify-write under
+        # the shared bind-registry lock so two concurrent
+        # /api/dpdk/bind calls (admin UI + scripted client) don't
+        # read-modify-stale against each other. The lock cost is
+        # negligible in the common case; the race window pre-fix
+        # was "open(w) truncated while peer was reading" → empty
+        # JSON breaks subsequent rebind boot.
+        with _BIND_REGISTRY_LOCK:
+            data = {"version": 1, "binds": []}
+            if os.path.isfile(_DPDK_BIND_REGISTRY):
+                try:
+                    with open(_DPDK_BIND_REGISTRY) as f:
+                        data = _json.load(f)
+                except Exception:
+                    pass
+            binds = data.get("binds") or []
+            # Replace any existing entry for the same PCI. But if
+            # the old entry HAD an original_driver and the new
+            # call doesn't, preserve the old one — repeat-bind
+            # calls shouldn't lose the kernel-driver memory.
+            prev = next(
+                (b for b in binds if b.get("pci") == pci),
+                None,
+            )
+            if original_driver is None and prev:
+                original_driver = prev.get("original_driver")
+            binds = [b for b in binds if b.get("pci") != pci]
+            entry = {
+                "pci": pci,
+                "driver": driver,
+                "iface_name": iface_name,
+                "bound_at": _dt.datetime.now().isoformat(),
+            }
+            if original_driver:
+                entry["original_driver"] = original_driver
+            binds.append(entry)
+            data["binds"] = binds
+            tmp = _DPDK_BIND_REGISTRY + ".tmp"
+            with open(tmp, "w") as f:
+                _json.dump(data, f, indent=2)
+            os.replace(tmp, _DPDK_BIND_REGISTRY)
         logging.info(
             f"[DPDK BIND PERSIST] Recorded {pci} → {driver} in "
             f"{_DPDK_BIND_REGISTRY}"
@@ -13397,17 +13405,20 @@ def _dpdk_unpersist_bind(pci):
     if not os.path.isfile(_DPDK_BIND_REGISTRY):
         return True
     try:
-        with open(_DPDK_BIND_REGISTRY) as f:
-            data = _json.load(f)
-        binds = data.get("binds") or []
-        new_binds = [b for b in binds if b.get("pci") != pci]
-        if len(new_binds) == len(binds):
-            return True  # nothing to remove
-        data["binds"] = new_binds
-        tmp = _DPDK_BIND_REGISTRY + ".tmp"
-        with open(tmp, "w") as f:
-            _json.dump(data, f, indent=2)
-        os.replace(tmp, _DPDK_BIND_REGISTRY)
+        # v0.5.58 (audit M5): mirror _dpdk_persist_bind — same
+        # bind-registry lock for read-modify-write atomicity.
+        with _BIND_REGISTRY_LOCK:
+            with open(_DPDK_BIND_REGISTRY) as f:
+                data = _json.load(f)
+            binds = data.get("binds") or []
+            new_binds = [b for b in binds if b.get("pci") != pci]
+            if len(new_binds) == len(binds):
+                return True  # nothing to remove
+            data["binds"] = new_binds
+            tmp = _DPDK_BIND_REGISTRY + ".tmp"
+            with open(tmp, "w") as f:
+                _json.dump(data, f, indent=2)
+            os.replace(tmp, _DPDK_BIND_REGISTRY)
         logging.info(
             f"[DPDK BIND PERSIST] Removed {pci} from "
             f"{_DPDK_BIND_REGISTRY}"
@@ -15452,20 +15463,46 @@ def _ensure_frr_assets_deployed():
 _ADMIN_BIND_HISTORY_PATH = "/tmp/netgen_admin_bind_history.json"
 
 
+# v0.5.58 (audit M1 + M5): single lock for ALL reads + writes
+# against the admin bind-history file AND the persistent
+# dpdk-interfaces.json registry. Pre-fix two concurrent /api/
+# admin/bind_history POSTs (operator + scripted client) raced
+# in `open("w") + json.dump` — one truncated the file while the
+# other was reading, producing a 0-byte JSON. Same risk on
+# /api/dpdk/bind + unbind hitting _dpdk_persist_bind /
+# _dpdk_unpersist_bind concurrently. The Lock costs nothing in
+# the common case and prevents the race entirely.
+import threading as _threading_module
+_BIND_REGISTRY_LOCK = _threading_module.Lock()
+
+
 def _load_bind_history():
-    try:
-        with open(_ADMIN_BIND_HISTORY_PATH, "r") as f:
-            return json.load(f)
-    except Exception:
-        return {}
+    with _BIND_REGISTRY_LOCK:
+        try:
+            with open(_ADMIN_BIND_HISTORY_PATH, "r") as f:
+                return json.load(f)
+        except Exception:
+            return {}
 
 
 def _save_bind_history(history):
-    try:
-        with open(_ADMIN_BIND_HISTORY_PATH, "w") as f:
-            json.dump(history, f, indent=2)
-    except Exception as e:
-        logging.warning(f"[ADMIN BIND HISTORY] save failed: {e}")
+    """v0.5.58: atomic write + lock. Pre-fix the open("w") /
+    json.dump combo truncated the file then wrote — concurrent
+    readers saw a 0-byte file or partial JSON during the
+    window. Atomic write via temp+rename closes the race
+    completely; the lock serialises the read-modify-write
+    cycle in the endpoint handler that calls us.
+    """
+    with _BIND_REGISTRY_LOCK:
+        try:
+            tmp = _ADMIN_BIND_HISTORY_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(history, f, indent=2)
+            os.replace(tmp, _ADMIN_BIND_HISTORY_PATH)
+        except Exception as e:
+            logging.warning(
+                f"[ADMIN BIND HISTORY] save failed: {e}"
+            )
 
 
 @app.route("/api/admin/health", methods=["GET"])
