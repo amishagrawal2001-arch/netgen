@@ -2,6 +2,29 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.72] - 2026-06-09
+
+**Admin UI polish + worker-stall fix.** Audit M6 + M8 + M11 +
+LOWs.
+
+Full suite: **2,026 passed, 1 skipped** (+8 new tests).
+
+* **M6** `_module_loaded` (inside `api_admin_health`) memoized
+  for 10 s — pre-fix 4 subprocs × up to 5s each blocked the
+  Flask worker every 30 s on contended boxes. Also: two-clause
+  builtin check parity with `/api/dpdk/verify` (`"(builtin)" in
+  stdout OR "filename:" not in stdout`).
+* **M8** per-row Bind / Unbind handlers use `toastFailDetailed`
+  instead of bare `'Bind failed: ' + d.message` — stderr no
+  longer lost.
+* **M11** `btn-refresh` wrapped in `withButtonBusy`.
+* **LOW** `document.title` set to `Netgen admin — <hostname>` so
+  multi-tab operators can distinguish servers; danger
+  `Configure IOMMU` button gets ⚠ glyph + `aria-label`.
+
+Final audit drive — all CRITICAL / HIGH / MEDIUM / LOW closed
+across the admin console audit.
+
 ## [0.5.71] - 2026-06-09
 
 **Operability batch — hugepages lock, rc=75 surface, install

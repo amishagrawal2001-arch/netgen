@@ -15774,24 +15774,49 @@ def api_admin_health():
     # VFIO modules — check both `modinfo` for "(builtin)" AND `lsmod` for
     # loadable modules. Ubuntu kernels often ship vfio_pci as builtin, in
     # which case it never appears in lsmod but is still always-available.
+    # v0.5.72 (audit M6): memoize lsmod + modinfo for 10 s.
+    # Pre-fix the admin polling loop (every 30 s) ran 4 subprocs
+    # each call: 2× modinfo + 2× lsmod, up to 5 s timeout each.
+    # On a host where lsmod hangs (kdump-contended /proc) the
+    # Flask worker stalled for 25 s. Cache stays consistent
+    # within a single response, plus survives across the 30 s
+    # poll cycle.
+    import time as _time
+    _now_ts = _time.time()
+    _MODULE_CACHE_TTL = 10.0
+    if not hasattr(api_admin_health, "_module_cache"):
+        api_admin_health._module_cache = {}  # type: ignore[attr-defined]
+
     def _module_loaded(name):
+        cache = api_admin_health._module_cache  # type: ignore[attr-defined]
+        ent = cache.get(name)
+        if ent and (_now_ts - ent[0]) < _MODULE_CACHE_TTL:
+            return ent[1]
+        result = False
         try:
             mi = subprocess.run(["modinfo", name], capture_output=True, text=True, timeout=5)
-            if mi.returncode == 0 and "(builtin)" in mi.stdout:
-                return True
+            if mi.returncode == 0:
+                # v0.5.72 (audit H5-class): mirror /api/dpdk/verify's
+                # two-clause builtin check. Some kernels' modinfo
+                # doesn't emit the "(builtin)" literal but omits the
+                # `filename:` line for built-in modules.
+                if "(builtin)" in mi.stdout or "filename:" not in mi.stdout:
+                    result = True
         except Exception:
             pass
-        try:
-            ls = subprocess.run(["lsmod"], capture_output=True, text=True, timeout=5)
-            if ls.returncode == 0:
-                import re as _re
-                # lsmod uses underscores in names regardless of how they're written
-                # in modinfo (vfio-pci → vfio_pci); normalise for the regex match.
-                normalised = name.replace("-", "_")
-                return bool(_re.search(rf"^{normalised}\s", ls.stdout, _re.MULTILINE))
-        except Exception:
-            pass
-        return False
+        if not result:
+            try:
+                ls = subprocess.run(["lsmod"], capture_output=True, text=True, timeout=5)
+                if ls.returncode == 0:
+                    import re as _re
+                    # lsmod uses underscores in names regardless of how they're written
+                    # in modinfo (vfio-pci → vfio_pci); normalise for the regex match.
+                    normalised = name.replace("-", "_")
+                    result = bool(_re.search(rf"^{normalised}\s", ls.stdout, _re.MULTILINE))
+            except Exception:
+                pass
+        cache[name] = (_now_ts, result)
+        return result
 
     out["vfio"] = {
         "vfio_loaded": _module_loaded("vfio"),
@@ -17595,7 +17620,8 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       <div class="row"><span class="label">vfio_pci module</span><span class="pill" id="p-vfiopci">…</span></div>
       <div class="actions">
         <button id="btn-load-modules" class="secondary">Load VFIO Modules</button>
-        <button id="btn-config-iommu" class="danger">Configure IOMMU (reboots host)</button>
+        <!-- v0.5.72 (audit LOW): glyph prefix + aria-label for color-blind operators -->
+        <button id="btn-config-iommu" class="danger" aria-label="Danger: configure IOMMU and reboot host">⚠ Configure IOMMU (reboots host)</button>
       </div>
     </div>
 
@@ -17708,6 +17734,9 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
         const r = await fetch('/api/admin/health');
         const d = await r.json();
         $('hostname').textContent = `${d.hostname} — port ${d.netgen_server.port}`;
+        // v0.5.72 (audit LOW): set the document title to include
+        // the hostname so multi-tab operators can tell servers apart.
+        document.title = `Netgen admin — ${d.hostname}`;
         pill($('p-dpdk'), !!d.dpdk.installed,
           d.dpdk.version ? `Installed (v${d.dpdk.version})` : 'Installed',
           'Not installed');
@@ -17912,7 +17941,11 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       if (pollLogTimer) { clearInterval(pollLogTimer); pollLogTimer = null; }
     }
 
-    $('btn-refresh').addEventListener('click', refreshHealth);
+    // v0.5.72 (audit M11): wrap btn-refresh in withButtonBusy so
+    // triple-clicks don't fire concurrent fetches.
+    $('btn-refresh').addEventListener('click', async () => {
+      await withButtonBusy('btn-refresh', refreshHealth);
+    });
 
     $('btn-install-dpdk').addEventListener('click', async () => {
       if (!confirm('Run install_dpdk.sh on this server? Takes 10–20 minutes.')) return;
@@ -18313,7 +18346,7 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       if (r.ok && data.success) {
         toast(`Bound ${iface.name} to DPDK`);
       } else {
-        toast(`Bind failed: ${data.message || data.error || 'HTTP ' + r.status}`);
+        toastFailDetailed(data, r.status);  // v0.5.72 (audit M8)
       }
       refreshInterfaces();
       refreshHealth();
@@ -18334,7 +18367,7 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
         if (r.ok && data.success) {
           toast(`Unbound ${iface.name || iface.pci}`);
         } else {
-          toast(`Unbind failed: ${data.message || data.error || 'HTTP ' + r.status}`);
+          toastFailDetailed(data, r.status);  // v0.5.72 (audit M8)
         }
       } catch (e) {
         toast('Unbind request failed: ' + e);
