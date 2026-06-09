@@ -2,6 +2,86 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.46] - 2026-06-08
+
+**`/api/dpdk/load_modules` surfaces the actual modprobe error.**
+Operator-reported on srv06 (right after v0.5.44 landed):
+
+> HTTP 500
+> Failed to load modules: vfio-pci: Unknown error - check server logs
+
+The v0.5.44 systemd-run wrap was applied correctly, the
+transient unit was created, and `modprobe vfio-pci` ran inside
+it — but the actual error message never reached the operator.
+
+### Why "Unknown error"
+
+The v0.5.44 wrap passed `--quiet` to systemd-run intending to
+suppress systemd-run's status output. On some systemd versions
+`--quiet` + `--pipe` ALSO suppresses the inner unit's stderr
+forwarding — modprobe's "Operation not permitted" message went
+to journald instead of subprocess.run. With both subprocess
+captures empty, `error_msg` fell through to the literal
+`"Unknown error"`.
+
+### Three-layer diagnostic chain
+
+1. **Drop `--quiet`** from the systemd-run modprobe wrap. With
+   `--pipe` alone, inner unit stderr flows back to
+   subprocess.run normally. Typical case: operator sees the
+   actual `modprobe: ERROR: could not insert 'vfio_pci':
+   Operation not permitted`.
+
+2. **journalctl scrape fallback.** When subprocess capture is
+   still empty, scrape `journalctl -u <unit> --no-pager -n 20
+   -o cat` for the transient unit's actual output. Last 5
+   non-blank lines surfaced in the API error response. Required
+   storing the unit name in a `modprobe_unit` variable so the
+   `--unit=` arg and the journalctl query reference the same
+   name.
+
+3. **`systemctl status` hint** when both subprocess and
+   journalctl come back empty (unit may have failed before
+   exec). Error message points at:
+   ```
+   systemctl status netgen-modprobe-<module>-<ts>.service
+   ```
+
+### Before → after
+
+Before v0.5.46:
+```
+Failed to load modules: vfio-pci: Unknown error - check server logs
+```
+
+After v0.5.46 (typical):
+```
+Failed to load modules: vfio-pci: modprobe: ERROR: could not
+insert 'vfio_pci': Operation not permitted
+```
+
+After v0.5.46 (journalctl fallback):
+```
+Failed to load modules: vfio-pci: modprobe rc=1; journalctl
+says: modprobe: FATAL: Module vfio_pci not found
+```
+
+Full suite: **1,831 passed, 1 skipped** (+7 new tests).
+
+### Tests
+
+7 new in `tests/test_v0546_load_modules_real_error_diagnostic.py`:
+* `--quiet` removed from systemd-run wrap
+* Unit name stored in `modprobe_unit` variable
+* journalctl invocation references `modprobe_unit` via `-u`
+* journalctl output trimmed to recent lines
+* Final fallback points at `systemctl status <unit>`
+* `"Unknown error"` literal removed from initial fallback
+* Version pinned at ≥ 0.5.46
+
+v0.5.44 regression test updated to accept variable-style unit
+name location.
+
 ## [0.5.45] - 2026-06-08
 
 **`netgen-upgrade` drops `--force-reinstall`.** Operator-reported

@@ -91,29 +91,50 @@ def test_modprobe_systemd_run_unit_name_is_unique():
     the unit name literal must be an f-string (contains `{`) AND
     include `netgen-modprobe-` prefix."""
     body = _load_modules_body()
-    # Find any `--unit=...` line near the modprobe wrap.
-    unit_m = re.search(
-        r"--unit=netgen-modprobe-[^\"']*",
+    # v0.5.46: the unit name was lifted out of the inline
+    # `--unit=...` arg into a `modprobe_unit` variable so the
+    # journalctl fallback could reference the SAME name. So the
+    # unit name lives either:
+    #   (a) inline `--unit=netgen-modprobe-{...}` (pre-v0.5.46), or
+    #   (b) in a `modprobe_unit = f"netgen-modprobe-..."` assignment
+    #       (v0.5.46+), with the wrap using `f"--unit={modprobe_unit}"`
+    inline_m = re.search(r"--unit=netgen-modprobe-[^\"']*", body)
+    var_m = re.search(
+        r'modprobe_unit\s*=\s*\(?\s*f["\']netgen-modprobe-[^"\']*',
         body,
     )
-    assert unit_m, (
-        "No --unit=netgen-modprobe-* in modprobe systemd-run "
-        "wrap — operator-visible: `systemctl list-units` won't "
-        "show modprobe units clearly."
+    assert inline_m or var_m, (
+        "No netgen-modprobe-* unit name in dpdk_load_modules — "
+        "operator-visible: `systemctl list-units` won't show "
+        "modprobe units clearly."
     )
-    # And the unit name must include an f-string interpolation
-    # (otherwise it's a fixed name and back-to-back calls collide).
-    snippet = body[max(0, unit_m.start() - 50):unit_m.end() + 50]
-    assert "{" in unit_m.group(0) and "}" in body[unit_m.start():unit_m.end() + 200], (
+    # Wherever it lives, the name must be an f-string
+    # (otherwise two back-to-back loads collide on a fixed name).
+    target_block = (
+        body[var_m.start():var_m.end() + 200] if var_m
+        else body[inline_m.start():inline_m.end() + 200]
+    )
+    assert "{" in target_block and "}" in target_block, (
         "Unit name has no f-string interpolation — back-to-back "
         "modprobe calls (vfio, vfio-pci) would collide on the "
         "same unit name."
     )
     # Module + timestamp give uniqueness.
-    assert "module" in snippet.lower() or "time" in snippet.lower(), (
-        "Unit name suffix doesn't reference module or timestamp — "
-        "may not be unique enough across rapid retries."
+    assert (
+        "module" in target_block.lower() or
+        "time" in target_block.lower()
+    ), (
+        "Unit name doesn't reference module or timestamp — may "
+        "not be unique enough across rapid retries."
     )
+    # v0.5.46: when the variable-style is used, the systemd-run
+    # wrap must reference modprobe_unit.
+    if var_m and not inline_m:
+        assert re.search(r'f["\']--unit=\{modprobe_unit\}', body), (
+            "modprobe_unit variable defined but systemd-run wrap "
+            "doesn't use `f\"--unit={modprobe_unit}\"` — wrap and "
+            "fallback would reference different unit names."
+        )
 
 
 def test_modprobe_falls_back_to_bare_when_no_systemd_run():

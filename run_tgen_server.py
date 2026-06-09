@@ -14318,14 +14318,41 @@ def dpdk_load_modules():
                 # systemd-run helper returns None there and we run
                 # bare.
                 systemd_run = _systemd_run_available()
+                # v0.5.46: remember the transient unit name so we
+                # can scrape journalctl for it when subprocess
+                # capture comes back empty (rc != 0 + stdout/
+                # stderr both empty → "Unknown error" — pre-fix
+                # the operator's only feedback).
+                modprobe_unit = None
                 if systemd_run:
+                    # v0.5.46: dropped --quiet. On some systemd
+                    # versions --quiet + --pipe interact badly —
+                    # --quiet suppresses systemd-run's status
+                    # output AND the inner unit's stderr
+                    # forwarding via --pipe, leaving subprocess.run
+                    # with empty captures even when modprobe
+                    # actually printed an error. Operator-reported:
+                    #
+                    #   "Failed to load modules: vfio-pci: Unknown
+                    #    error - check server logs"
+                    #
+                    # The "Unknown error" string comes from
+                    # `result.stderr.strip() or result.stdout.strip()
+                    # or "Unknown error"` — both were empty.
+                    # Without --quiet, the actual modprobe stderr
+                    # reaches subprocess.run.
+                    import time as _t
+                    modprobe_unit = (
+                        f"netgen-modprobe-"
+                        f"{module.replace('-', '_')}-"
+                        f"{int(_t.time())}.service"
+                    )
                     modprobe_cmd = [
                         systemd_run,
                         "--wait",
                         "--pipe",
                         "--collect",
-                        "--quiet",
-                        f"--unit=netgen-modprobe-{module.replace('-', '_')}-{int(__import__('time').time())}.service",
+                        f"--unit={modprobe_unit}",
                         "--description=netgen modprobe (cgroup-escape)",
                         "--",
                         modprobe_path,
@@ -14424,8 +14451,55 @@ def dpdk_load_modules():
                                 "error": error_msg
                             })
                     else:
-                        error_msg = result.stderr.strip() or result.stdout.strip() or "Unknown error"
-                        logging.error(f"[DPDK LOAD MODULES] modprobe {module} failed (exit code {result.returncode}): stderr='{result.stderr}', stdout='{result.stdout}'")
+                        error_msg = result.stderr.strip() or result.stdout.strip()
+                        # v0.5.46: when subprocess capture is empty
+                        # (rc != 0 but no stdout/stderr), the
+                        # transient unit's output went to journald
+                        # instead of being piped back. Scrape
+                        # journalctl -u <unit> for the last few
+                        # lines of the modprobe output so the
+                        # operator gets the actual rejection
+                        # reason instead of "Unknown error".
+                        if not error_msg and modprobe_unit:
+                            try:
+                                jr = subprocess.run(
+                                    ["journalctl",
+                                     "-u", modprobe_unit,
+                                     "--no-pager",
+                                     "-n", "20",
+                                     "-o", "cat"],
+                                    capture_output=True,
+                                    text=True,
+                                    timeout=5,
+                                )
+                                if jr.returncode == 0 and jr.stdout.strip():
+                                    # Trim to last ~5 lines; the unit
+                                    # rarely produces more than that.
+                                    journal_lines = [
+                                        ln for ln in jr.stdout.splitlines()
+                                        if ln.strip()
+                                    ][-5:]
+                                    error_msg = (
+                                        f"modprobe rc={result.returncode}; "
+                                        f"journalctl says: "
+                                        + " | ".join(journal_lines)
+                                    )
+                            except Exception as je:
+                                logging.debug(
+                                    f"[DPDK LOAD MODULES] journalctl "
+                                    f"fallback for {modprobe_unit} "
+                                    f"failed: {je}"
+                                )
+                        if not error_msg:
+                            error_msg = (
+                                f"modprobe rc={result.returncode} "
+                                f"with no stdout/stderr/journalctl "
+                                f"output. The systemd transient unit "
+                                f"may have failed before exec — "
+                                f"check `systemctl status "
+                                f"{modprobe_unit or 'netgen-modprobe-*'}`."
+                            )
+                        logging.error(f"[DPDK LOAD MODULES] modprobe {module} failed (exit code {result.returncode}): stderr='{result.stderr}', stdout='{result.stdout}', error_msg='{error_msg}'")
                         failed_modules.append({
                             "module": module,
                             "error": error_msg
