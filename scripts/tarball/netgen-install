@@ -395,11 +395,27 @@ Type=simple
 ExecStart={exec_start}
 Restart=on-failure
 RestartSec=10
-# Capabilities the data-plane needs. CAP_NET_RAW lets Scapy open
-# raw sockets without root; CAP_NET_ADMIN covers interface changes
-# (promisc, VLAN sub-interfaces from the v0.4.1 flow-tracking fix).
-AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
-CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN
+# v0.5.56 (audit H8): expanded capability set so DPDK
+# operations work in-process without the sudo + systemd-run
+# gymnastics we accumulated in v0.5.31/33/44/50.
+#   CAP_NET_RAW / CAP_NET_ADMIN — Scapy raw sockets + interface
+#     management (original v0.5.0 set).
+#   CAP_SYS_ADMIN — `mount -t hugetlbfs`, in-process writes to
+#     /sys/.../nr_hugepages, write to /etc/default/grub-class
+#     paths via systemd-run unit setup, etc.
+#   CAP_SYS_MODULE — `modprobe vfio-pci` from in-process
+#     subprocess. v0.5.44 wrapped this in systemd-run to escape
+#     ProtectKernelModules; with this cap held, the wrap can be
+#     skipped on non-hardened hosts.
+#   CAP_SYS_BOOT — `systemctl reboot` from /api/dpdk/iommu
+#     post-GRUB-edit flow.
+#   CAP_SETUID / CAP_SETGID — sudo's setresuid() / setresgid()
+#     pre-flight. v0.5.50 bypassed sudo when geteuid()==0 to
+#     dodge the EPERM; keep the cap so sudo paths also work.
+#   CAP_DAC_OVERRIDE / CAP_DAC_READ_SEARCH — read /etc/sudoers
+#     (mode 0440), read sysfs files owned by root with 0600 perms.
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_MODULE CAP_SYS_BOOT CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_MODULE CAP_SYS_BOOT CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
 # v0.5.0 install root — independent of system Python.
 WorkingDirectory={install_root}
 # Forward stdout/stderr to journalctl so `journalctl -u netgen-server`

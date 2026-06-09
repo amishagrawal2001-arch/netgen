@@ -2,6 +2,77 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.56] - 2026-06-09
+
+**netgen-server.service now holds the capabilities DPDK
+operations need.** Audit finding H8 — the cleaner fix that
+obsoletes the workarounds piled up in v0.5.31/33/44/50.
+
+Full suite: **1,916 passed, 1 skipped** (+9 new tests).
+
+### The sandbox-EPERM tetralogy in one fix
+
+| Workaround | Was for | Obsoleted by |
+|---|---|---|
+| v0.5.31 `-o APT::Sandbox::User=root` | apt setgroups() EPERM | CAP_SETUID + CAP_SETGID held |
+| v0.5.33 `systemd-run` for apt cache chmod | ProtectSystem-ish EPERM | CAP_DAC_OVERRIDE held |
+| v0.5.44 `systemd-run` for modprobe | ProtectKernelModules-equivalent EPERM | CAP_SYS_MODULE held |
+| v0.5.50 skip-sudo-when-root | sudo's own setresuid() EPERM | CAP_SETUID held |
+
+The workarounds **stay in the code** — they're correct for
+defense-in-depth and they cover sites where this self-heal
+hasn't run yet. But going forward, new DPDK operations don't
+need new gymnastics.
+
+### What gets deployed
+
+For **fresh tarball installs**, `scripts/tarball/netgen-install`
+now writes the expanded set directly in the main unit:
+
+```ini
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_MODULE CAP_SYS_BOOT CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_MODULE CAP_SYS_BOOT CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
+```
+
+For **existing installs** (srv06 included), the v0.5.56 server
+on startup writes a drop-in:
+
+```
+/etc/systemd/system/netgen-server.service.d/netgen-caps.conf
+```
+
+That overlays the main unit without modifying it — so tarball
+reinstalls don't conflict, and the operator can `rm` the
+drop-in to revert.
+
+### Catch-22 same as v0.5.49
+
+The v0.5.55 → v0.5.56 upgrade restart uses the OLD caps. The
+new caps apply on the NEXT restart after the self-heal writes
+the drop-in.
+
+To activate immediately on srv06:
+```bash
+ssh srv06 'systemctl restart netgen-server'
+```
+
+To verify the drop-in landed:
+```bash
+ssh srv06 'systemd-analyze cat-config netgen-server.service | grep -i Capability'
+```
+
+### Tests
+
+9 new in `tests/test_v0556_systemd_caps_override.py`:
+* Tarball installer writes expanded caps (Ambient + Bounding)
+* Self-heal helper defined
+* Uses drop-in path (not main unit edit)
+* Override content lists all required caps
+* SHA-compare skip when in sync
+* Runs `systemctl daemon-reload` after write
+* Helper called at startup
+* Version pinned at ≥ 0.5.56
+
 ## [0.5.55] - 2026-06-09
 
 **Install scripts: real apt-update exit code + apt failure log.**

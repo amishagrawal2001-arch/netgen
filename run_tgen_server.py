@@ -15108,6 +15108,114 @@ def _resolve_dpdk_bind_script():
     return candidates[0]
 
 
+_NETGEN_CAPS_OVERRIDE_PATH = (
+    "/etc/systemd/system/netgen-server.service.d/netgen-caps.conf"
+)
+_NETGEN_CAPS_OVERRIDE_CONTENT = """\
+# Written by netgen-server at startup (v0.5.56+).
+# Expands the v0.5.0 capability set so DPDK operations work
+# in-process without the sudo + systemd-run gymnastics
+# accumulated in v0.5.31/33/44/50. See audit finding H8.
+#
+# Operator override: drop a higher-priority file in this dir
+# (e.g. 99-override.conf) to lock down further.
+[Service]
+AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_MODULE CAP_SYS_BOOT CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
+CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_MODULE CAP_SYS_BOOT CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
+"""
+
+
+def _ensure_netgen_caps_override_deployed():
+    """v0.5.56 (audit H8): self-heal the systemd caps override.
+
+    Pre-fix: existing tarball installs (v0.5.0–v0.5.55) wrote the
+    netgen-server.service unit with only CAP_NET_RAW +
+    CAP_NET_ADMIN. That dropped CAP_SYS_ADMIN (mount), CAP_SYS_MODULE
+    (modprobe), CAP_SETUID (sudo), CAP_DAC_OVERRIDE (read
+    /etc/sudoers) — forcing us to layer workarounds:
+      v0.5.31 — apt sandbox-disable for setgroups()
+      v0.5.33 — systemd-run wrap for apt cache chmod
+      v0.5.44 — systemd-run wrap for modprobe init_module()
+      v0.5.50 — skip sudo when geteuid()==0 (sudo can't setresuid())
+
+    Each was a one-off bypass. This fix lifts the bound cap set
+    properly so future operations don't need new gymnastics.
+
+    We deploy via a drop-in (`netgen-server.service.d/
+    netgen-caps.conf`) rather than editing the main unit, so:
+      (a) v0.5.56 tarball reinstalls don't conflict
+      (b) operator can `rm` the drop-in to revert
+      (c) operator-edited main unit isn't touched
+
+    Catch-22 (same shape as v0.5.49 netgen-upgrade self-heal):
+    the current restart that landed v0.5.56 uses the OLD caps.
+    The drop-in we write here applies on the NEXT restart. So
+    the operator needs ONE manual `systemctl restart
+    netgen-server` (or the next wheel-upgrade) for the new caps
+    to take effect.
+    """
+    import hashlib
+    dst = _NETGEN_CAPS_OVERRIDE_PATH
+    dst_dir = os.path.dirname(dst)
+    # Detect tarball install — bail silently elsewhere (system
+    # Python install, container, dev checkout).
+    if not os.path.isdir("/opt/netgen-server"):
+        logging.debug(
+            "[NETGEN-CAPS SELFHEAL] /opt/netgen-server missing; "
+            "not a tarball install — skipping"
+        )
+        return
+    try:
+        os.makedirs(dst_dir, exist_ok=True)
+    except Exception as e:
+        logging.warning(
+            f"[NETGEN-CAPS SELFHEAL] couldn't mkdir {dst_dir}: "
+            f"{e}; skipping"
+        )
+        return
+    desired = _NETGEN_CAPS_OVERRIDE_CONTENT.encode("utf-8")
+    desired_sha = hashlib.sha256(desired).hexdigest()
+    existing = b""
+    if os.path.isfile(dst):
+        try:
+            with open(dst, "rb") as f:
+                existing = f.read()
+        except Exception:
+            pass
+    if hashlib.sha256(existing).hexdigest() == desired_sha:
+        logging.debug(
+            f"[NETGEN-CAPS SELFHEAL] {dst} already in sync"
+        )
+        return
+    try:
+        tmp = dst + ".new"
+        with open(tmp, "wb") as f:
+            f.write(desired)
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, dst)
+        logging.info(
+            f"[NETGEN-CAPS SELFHEAL] wrote {dst}; restart "
+            f"netgen-server.service for new caps to take effect"
+        )
+        # Best-effort daemon-reload so systemctl picks up the new
+        # file without operator intervention. The active process
+        # keeps its OLD caps until the next restart.
+        try:
+            import subprocess as _sp
+            _sp.run(
+                ["systemctl", "daemon-reload"],
+                capture_output=True, timeout=10,
+            )
+        except Exception as _de:
+            logging.debug(
+                f"[NETGEN-CAPS SELFHEAL] daemon-reload failed: {_de}"
+            )
+    except Exception as e:
+        logging.warning(
+            f"[NETGEN-CAPS SELFHEAL] couldn't write {dst}: {e}"
+        )
+
+
 def _ensure_netgen_upgrade_script_deployed():
     """v0.5.49: self-heal /opt/netgen-server/bin/netgen-upgrade
     from the wheel-bundled copy.
@@ -19000,6 +19108,16 @@ def main(argv=None):
     except Exception as e:
         logging.warning(
             f"[NETGEN-UPGRADE SELFHEAL] Unexpected error: {e}"
+        )
+
+    # v0.5.56 (audit H8): self-heal the systemd caps drop-in so
+    # existing tarball installs get the expanded capability set
+    # without a tarball reinstall.
+    try:
+        _ensure_netgen_caps_override_deployed()
+    except Exception as e:
+        logging.warning(
+            f"[NETGEN-CAPS SELFHEAL] Unexpected error: {e}"
         )
 
     # If a wheel upgrade changed Dockerfile.frr (e.g. v0.2.27 adding
