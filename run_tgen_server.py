@@ -13325,11 +13325,20 @@ if __name__ == "__main__":
         return False
 
 
-def _dpdk_persist_bind(pci, driver, iface_name):
+def _dpdk_persist_bind(pci, driver, iface_name, original_driver=None):
     """Record a bind in /etc/netgen/dpdk-interfaces.json + ensure
     the systemd rebind unit is in place. Best-effort — returns
     True on success, False on persistence failure (the runtime
-    bind has already succeeded by the time this is called)."""
+    bind has already succeeded by the time this is called).
+
+    v0.5.53 (audit H3): added `original_driver` so the unbind
+    path can restore the right kernel driver even after reboot.
+    Pre-fix the original-driver hint lived only in
+    /tmp/netgen_admin_bind_history.json which dies on reboot.
+    After a reboot, unbind fell back to the dpdk_bind.sh vendor-
+    ID heuristic which guesses `ice` for any Intel NIC — broken
+    for i40e/ixgbe/e1000-class hardware.
+    """
     import json as _json
     import datetime as _dt
     if not _ensure_dpdk_rebind_unit_installed():
@@ -13344,14 +13353,26 @@ def _dpdk_persist_bind(pci, driver, iface_name):
             except Exception:
                 pass
         binds = data.get("binds") or []
-        # Replace any existing entry for the same PCI.
+        # Replace any existing entry for the same PCI. But if the
+        # old entry HAD an original_driver and the new call
+        # doesn't, preserve the old one — repeat-bind calls
+        # shouldn't lose the kernel-driver memory.
+        prev = next(
+            (b for b in binds if b.get("pci") == pci),
+            None,
+        )
+        if original_driver is None and prev:
+            original_driver = prev.get("original_driver")
         binds = [b for b in binds if b.get("pci") != pci]
-        binds.append({
+        entry = {
             "pci": pci,
             "driver": driver,
             "iface_name": iface_name,
             "bound_at": _dt.datetime.now().isoformat(),
-        })
+        }
+        if original_driver:
+            entry["original_driver"] = original_driver
+        binds.append(entry)
         data["binds"] = binds
         tmp = _DPDK_BIND_REGISTRY + ".tmp"
         with open(tmp, "w") as f:
@@ -13502,8 +13523,24 @@ def dpdk_bind():
         if result.returncode == 0:
             # v0.5.39: persist the bind so it survives reboot.
             # Best-effort — the runtime bind has already succeeded.
+            #
+            # v0.5.53 (audit H3): capture the ORIGINAL kernel
+            # driver BEFORE dpdk_bind.sh swapped it for vfio-pci,
+            # via the bind_history snapshot we just took. The
+            # registry now records original_driver so the unbind
+            # path can restore the right driver after reboot —
+            # without this, /tmp/netgen_admin_bind_history.json
+            # dies on reboot and unbind falls back to a vendor-ID
+            # heuristic that's wrong for i40e/ixgbe.
+            _orig_drv = None
+            try:
+                _hist = _load_bind_history()
+                _orig_drv = (_hist.get(pci) or {}).get("kernel_driver")
+            except Exception:
+                pass
             persisted = _dpdk_persist_bind(
                 pci, "vfio-pci", interface or "",
+                original_driver=_orig_drv,
             )
             return jsonify({
                 "success": True,
@@ -13534,22 +13571,66 @@ def dpdk_unbind():
         interface = data.get("interface")
         pci = data.get("pci")
         kernel_driver = data.get("kernel_driver", "")
-        
+
         # Validate PCI format if provided
         if pci and (pci == "N/A" or ":" not in pci):
             pci = None
-        
+
         # If we have interface name but no PCI, convert interface to PCI
         if not pci and interface:
             pci = _get_pci_from_interface(interface)
-        
+
         if not pci or ":" not in pci:
             return jsonify({"error": f"Could not determine PCI address for interface {interface}"}), 400
-        
+
+        # v0.5.53 (audit H3): when the request body didn't include
+        # kernel_driver (typical — admin UI doesn't always send it),
+        # look up the ORIGINAL kernel driver in the persistent bind
+        # registry. Pre-fix this lookup was missing → dpdk_bind.sh
+        # fell back to a vendor-ID heuristic that picks `ice` for
+        # any Intel NIC. That's wrong for i40e (X710), ixgbe (X550),
+        # e1000-class hardware — the bind to "ice" would fail or
+        # restore the wrong driver, leaving the NIC half-bricked
+        # until manual modprobe.
+        #
+        # The registry's original_driver was captured at bind time
+        # from the bind_history client snapshot (see /api/dpdk/bind).
+        # Falls back to /tmp/netgen_admin_bind_history.json (in-session
+        # only) and finally to the heuristic if neither helps.
+        if not kernel_driver:
+            try:
+                import json as _json
+                if os.path.isfile(_DPDK_BIND_REGISTRY):
+                    with open(_DPDK_BIND_REGISTRY) as _f:
+                        _reg = _json.load(_f) or {}
+                    for _b in (_reg.get("binds") or []):
+                        if _b.get("pci") == pci:
+                            kernel_driver = _b.get("original_driver") or ""
+                            if kernel_driver:
+                                logging.info(
+                                    f"[DPDK UNBIND] Restoring "
+                                    f"original_driver={kernel_driver} "
+                                    f"from persistent registry"
+                                )
+                            break
+            except Exception as _re:
+                logging.debug(
+                    f"[DPDK UNBIND] registry lookup failed: {_re}"
+                )
+            # Fallback: /tmp history (in-session only).
+            if not kernel_driver:
+                try:
+                    _hist = _load_bind_history()
+                    kernel_driver = (
+                        (_hist.get(pci) or {}).get("kernel_driver") or ""
+                    )
+                except Exception:
+                    pass
+
         dpdk_bind_script = _resolve_dpdk_bind_script()
         if not os.path.exists(dpdk_bind_script):
             return jsonify({"error": "dpdk_bind.sh not found"}), 404
-        
+
         # dpdk_bind.sh expects: unbind <PCI> [--kernel-driver <driver>]
         cmd = _maybe_sudo([dpdk_bind_script, "unbind", pci])
         if kernel_driver:

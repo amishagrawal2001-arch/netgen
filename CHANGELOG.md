@@ -2,6 +2,63 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.53] - 2026-06-09
+
+**Unbind restores the original kernel driver from the persistent
+registry, even after reboot.** Audit finding H3.
+
+Full suite: **1,893 passed, 1 skipped** (+8 new tests).
+
+### The bug
+
+The original-driver hint lived only in
+`/tmp/netgen_admin_bind_history.json`, which dies on reboot.
+Post-reboot unbind:
+
+1. Read empty `kernel_driver` from request body
+2. /tmp history was wiped → fall through
+3. Call `dpdk_bind.sh unbind <PCI>` without `--kernel-driver`
+4. Script falls back to vendor-ID heuristic → picks `ice` for
+   vendor 0x8086 (Intel)
+
+`ice` is wrong for:
+* X710 / X722 → should be `i40e`
+* X550 / X540 → should be `ixgbe`
+* 82576 / 82574 → should be `igb` / `e1000e`
+
+Result: unbind fails OR restores the wrong driver → NIC stays
+driverless until the operator SSHs in and runs `modprobe i40e`
+manually.
+
+### Fix
+
+1. **Bind path captures original driver** from
+   `_load_bind_history()` (admin UI POSTs the current driver
+   right before bind) and passes it through to
+   `_dpdk_persist_bind(..., original_driver=...)`.
+
+2. **Registry stores it.** `/etc/netgen/dpdk-interfaces.json`
+   entries now have an `original_driver` field. Repeat-binds
+   for the same PCI preserve the old field if the new call
+   doesn't supply one.
+
+3. **Unbind path reads it.** When request body has no
+   `kernel_driver`, look up the registry's `original_driver`
+   first. Fall back to /tmp history (in-session legacy binds),
+   then to the dpdk_bind.sh heuristic.
+
+### Tests
+
+8 new in `tests/test_v0553_unbind_restores_original_driver.py`:
+* `_dpdk_persist_bind` accepts `original_driver` kwarg
+* Writes it to the registry entry
+* Preserves it on repeat-bind when not re-supplied
+* Bind handler captures from history before persist
+* Unbind handler reads from registry
+* Unbind falls back to /tmp history when registry empty
+* Logs the restoration so operator can trace it
+* Version pinned at ≥ 0.5.53
+
 ## [0.5.52] - 2026-06-09
 
 **Anchored regex in /api/dpdk/verify + fstab AND-not-OR
