@@ -2,6 +2,25 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.62] - 2026-06-09
+
+**install_rdma.sh refreshes modules-load file when module set
+has changed.** Audit M9.
+
+Full suite: **1,950 passed, 1 skipped** (+3 new tests).
+
+Pre-fix: `if [[ ! -f $modules_load_file ]]; then write; else
+skip`. v0.5.28 added `rdma_ucm` + `iw_cm` to the `rdma_modules`
+array. Hosts upgraded from v0.5.27 still had only the old three
+modules in their boot-time list. Step 2's modprobe loop loaded
+everything for the current session, but on the next reboot
+`rdma_ucm`-needing tools (`ib_send_bw`, `rping`) failed with
+EBADF on `/dev/infiniband/rdma_cm` until the operator noticed
+and manually modprobed.
+
+Fix: compare desired vs current content; rewrite on mismatch.
+File is ~80 bytes and we own it — no reason to skip.
+
 ## [0.5.61] - 2026-06-09
 
 **install_dpdk.sh polish — kernel-headers fallback, multi-mount

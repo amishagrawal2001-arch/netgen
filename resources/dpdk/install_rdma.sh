@@ -249,17 +249,30 @@ for mod in "${rdma_modules[@]}"; do
     fi
 done
 
-# Persist module loading across reboots
+# Persist module loading across reboots.
+# v0.5.62 (audit M9): pre-fix the script skipped this write
+# entirely when the file already existed — so an upgrade from
+# v0.5.27 (which had only "ib_uverbs rdma_cm ib_umad") to v0.5.28+
+# (which added "rdma_ucm" + "iw_cm" to the array above) NEVER
+# refreshed the boot-time module list. Step 2's modprobe loop
+# still loaded everything for the current session, but on the
+# next reboot rdma_ucm-needing tools (`ib_send_bw`, `rping`)
+# failed with EBADF on /dev/infiniband/rdma_cm until the operator
+# noticed and manually modprobe'd. Always rewrite the file —
+# it's owned by us, ~80 bytes, and we know the canonical set.
 modules_load_file="/etc/modules-load.d/netgen-rdma.conf"
-if [[ ! -f "$modules_load_file" ]]; then
-    log_info "Persisting RDMA modules across reboots: $modules_load_file"
-    {
-        echo "# netgen install_rdma.sh — auto-load RDMA modules at boot"
-        printf '%s\n' "${rdma_modules[@]}"
-    } > "$modules_load_file"
+desired_content=$( {
+    echo "# netgen install_rdma.sh — auto-load RDMA modules at boot"
+    printf '%s\n' "${rdma_modules[@]}"
+} )
+current_content=""
+[[ -f "$modules_load_file" ]] && current_content=$(cat "$modules_load_file" 2>/dev/null || true)
+if [[ "$desired_content" != "$current_content" ]]; then
+    log_info "Updating $modules_load_file with current RDMA module set"
+    printf '%s\n' "$desired_content" > "$modules_load_file"
     log_success "Wrote $modules_load_file"
 else
-    log_info "$modules_load_file already exists; leaving unchanged"
+    log_info "$modules_load_file already matches current module set"
 fi
 
 # Step 3: enable rdma-core service
