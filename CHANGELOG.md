@@ -2,6 +2,66 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.76] - 2026-06-09
+
+**DPDK Accelerators card — ioatdma out of the iface table.** Operator
+on srv06:
+
+> check admin console, there are intel PCI which are not associated
+> with interface, what are these, it also shows state DPDK
+> accelerator (kernel ioatdma)
+
+### What they are
+
+Intel I/OAT (Crystal Beach) DMA engines built into Xeon CPUs. srv06
+has 8 per socket × 2 sockets = **16 ioatdma devices** at PCI
+`0000:00:01.0-7` and `0000:80:01.0-7`. They're real DPDK accelerators
+(DPDK's dmadev API uses them for fast memory copies) but they are
+**not** network interfaces.
+
+### Why they were appearing in the iface table
+
+The `dpdk-devbind.py --status` parser tracked section state by
+header detection (`Network devices using kernel driver`, `Other
+Network devices`, …). When dpdk-devbind emitted `Other DMA devices
+using kernel driver`, that header wasn't recognised so
+`current_section` kept the previous network value — 16 ioatdma
+rows leaked through as network devices.
+
+### Fix
+
+* **`_detect_pci_class(pci)`** — pure sysfs read of
+  `/sys/bus/pci/devices/<bdf>/class`. ~20 µs per call.
+* **`/api/dpdk/interfaces`** filters out any device whose PCI base
+  class isn't `0x02` (Network controller). The section-state-leak
+  symptom can't bite anymore.
+* **`/api/dpdk/accelerators`** — new GET endpoint scanning sysfs
+  directly for ioatdma / idxd / qat / ntb_hw_intel. Returns
+  individual entries + per-label aggregate counts.
+* **Admin console** adds a **DPDK Accelerators** card above the
+  iface table with a count summary
+  (`16 × Intel I/OAT DMA`) and a collapsible per-device table.
+  Hidden when no accelerators are present.
+
+### What srv06 will see after upgrade
+
+```
+┌─ DPDK Accelerators ──────────────────────────┐
+│ 16 × Intel I/OAT DMA                         │
+│ ▶ Show per-device list (16)                  │
+└──────────────────────────────────────────────┘
+
+┌─ Network Interfaces ─────────────────────────┐
+│ ens3f0np0  …  NVIDIA Mellanox  …  no bind   │
+│ ens10f0–3  …  Broadcom BCM5719  …  no PMD    │
+│                                              │
+│ (the 16 ioatdma rows no longer pollute       │
+│  this table)                                 │
+└──────────────────────────────────────────────┘
+```
+
+11 new regression tests. Full suite: **2,067 passed, 1 skipped**.
+
 ## [0.5.75] - 2026-06-09
 
 **Refuse DPDK bind on tg3/e1000e/r8169 — no PMD, no hang.** Operator

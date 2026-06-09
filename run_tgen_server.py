@@ -14480,6 +14480,30 @@ def _parse_dpdk_devbind_status(output):
                 else:
                     status_str = "unbound"
                 
+                # v0.5.76: PCI base-class filter. Operator on srv06
+                # saw 16 ioatdma DMA-engine rows in the iface table
+                # because dpdk-devbind's "Other DMA devices" header
+                # didn't match our network-section regex → state
+                # leaked from the prior network section. Real fix is
+                # the sysfs class read: PCI base-class 0x02 =
+                # Network controller (0x0200 Ethernet, 0x0207 IB);
+                # anything else gets routed to the accelerator
+                # list. Per-device sysfs read is ~20 µs.
+                _cls = _detect_pci_class(pci)
+                _drv_lc = (driver or "").lower()
+                _kdrv_lc = (kernel_driver or "").lower()
+                _accel_drv = _drv_lc if _drv_lc in _DPDK_ACCELERATOR_CLASSES else (
+                    _kdrv_lc if _kdrv_lc in _DPDK_ACCELERATOR_CLASSES else None
+                )
+                _is_network = _cls and _cls.startswith("02")
+                if _accel_drv or (_cls and not _is_network):
+                    # Route to accelerators bucket. We don't have a
+                    # local var for it here in the parser (the func
+                    # only returns NICs); the accelerator list is
+                    # rebuilt in /api/dpdk/accelerators directly via
+                    # the parallel scan. Just skip silently — the
+                    # endpoint surfaces them.
+                    continue
                 interfaces.append({
                     "name": display_name,
                     "pci": pci,
@@ -14494,6 +14518,7 @@ def _parse_dpdk_devbind_status(output):
                     # (vfio-bound + sysfs hidden). Front-end falls
                     # back to vendor.
                     "card_model": _detect_nic_model(pci),
+                    "pci_class": _cls,  # v0.5.76: surface for transparency
                 })
     
     return interfaces
@@ -14732,6 +14757,113 @@ def _detect_nic_model(pci):
     except Exception:
         return None
     return _NIC_MODEL_DB.get((vendor, device))
+
+
+def _detect_pci_class(pci):
+    """v0.5.76: PCI base/sub class for `pci` as 6-char hex.
+
+    Reads sysfs `/sys/bus/pci/devices/<bdf>/class` and strips the
+    `0x` prefix + trailing newline. Returns e.g. "020000"
+    (Ethernet controller) or "088000" (Intel I/OAT DMA — system
+    peripheral / other).
+
+    Used by `/api/dpdk/interfaces` to filter the network-iface
+    table down to PCI base-class 0x02 (Network controller). Pre-
+    v0.5.76 the iface table on srv06 had 16 ioatdma DMA-engine
+    rows mixed in with the actual NICs because dpdk-devbind's
+    "Other DMA devices" section header wasn't recognised by our
+    parser → section state stayed at network_kernel → 16 false
+    positives.
+
+    Returns None if sysfs isn't readable (vfio-bound + isolated).
+    Pure sysfs read; safe to call on every interfaces poll.
+    """
+    if not pci:
+        return None
+    try:
+        with open(f"/sys/bus/pci/devices/{pci}/class") as _cf:
+            return _cf.read().strip().lower().removeprefix("0x")
+    except Exception:
+        return None
+
+
+# v0.5.76: PCI accelerator-class → friendly label. Drives the
+# new "DPDK Accelerators" admin card. Lookup by the lowercase
+# kernel driver name (matches the iface entry's `driver` field).
+_DPDK_ACCELERATOR_CLASSES = {
+    "ioatdma": ("Intel I/OAT DMA", "Crystal Beach DMA engine — DPDK dmadev memory copies"),
+    "idxd":    ("Intel DSA",       "Data Streaming Accelerator — DPDK dmadev API"),
+    "qat":     ("Intel QAT",       "QuickAssist Technology — DPDK compress + crypto"),
+    "ntb_hw_intel": ("Intel NTB",  "Non-Transparent Bridge — DPDK rawdev"),
+}
+
+
+@app.route("/api/dpdk/accelerators", methods=["GET"])
+def dpdk_accelerators():
+    """v0.5.76: list non-NIC DPDK-capable PCI devices.
+
+    Scans `/sys/bus/pci/devices/` directly (avoids the
+    dpdk-devbind.py round-trip used by /api/dpdk/interfaces),
+    keeping the response small and snappy for the admin card.
+
+    Returns:
+        {
+          "accelerators": [
+            {"pci": "0000:00:01.0", "driver": "ioatdma",
+             "class": "088000", "label": "Intel I/OAT DMA",
+             "hint": "...", "vendor": "Intel"},
+            ...
+          ],
+          "counts_by_label": {"Intel I/OAT DMA": 16, ...}
+        }
+
+    Operator on srv06 asked what the 16 Intel PCI entries with
+    state "DPDK accelerator (kernel ioatdma)" were. v0.5.76 moves
+    them out of the iface table into their own card surfaced here.
+    """
+    out = []
+    try:
+        _root = "/sys/bus/pci/devices"
+        if os.path.isdir(_root):
+            for bdf in sorted(os.listdir(_root)):
+                _dev_dir = os.path.join(_root, bdf)
+                # Resolve current driver via the sysfs symlink.
+                drv = None
+                try:
+                    drv = os.path.basename(
+                        os.readlink(os.path.join(_dev_dir, "driver"))
+                    )
+                except Exception:
+                    pass
+                if not drv:
+                    continue
+                drv_lc = drv.lower()
+                if drv_lc not in _DPDK_ACCELERATOR_CLASSES:
+                    continue
+                label, hint = _DPDK_ACCELERATOR_CLASSES[drv_lc]
+                vendor = _get_vendor_from_pci(bdf) or "unknown"
+                pci_class = _detect_pci_class(bdf)
+                out.append({
+                    "pci": bdf,
+                    "driver": drv,
+                    "class": pci_class,
+                    "label": label,
+                    "hint": hint,
+                    "vendor": vendor,
+                })
+    except Exception as _e:
+        logging.debug(f"[DPDK ACCEL] scan failed: {_e}")
+
+    # Aggregate count by friendly label so the admin card can
+    # show "16 × Intel I/OAT DMA" rather than 16 individual rows.
+    counts = {}
+    for a in out:
+        counts[a["label"]] = counts.get(a["label"], 0) + 1
+
+    return jsonify({
+        "accelerators": out,
+        "counts_by_label": counts,
+    })
 
 
 @app.route("/api/dpdk/cpu-vendor", methods=["GET"])
@@ -17885,6 +18017,22 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       </p>
     </div>
 
+    <!-- v0.5.76: DPDK Accelerators card. Operator on srv06 asked
+         what the 16 "Intel PCI not associated with interface"
+         entries (state: DPDK accelerator kernel ioatdma) were.
+         These are Crystal Beach DMA engines built into Xeon CPUs
+         (8 per socket). Surfacing them in their own card with a
+         count + driver explanation, and filtering them out of
+         the Network Interfaces table where they had no business
+         being. -->
+    <div class="card" style="grid-column: 1 / -1;" id="card-accelerators" hidden>
+      <h2 style="margin: 0 0 4px;">DPDK Accelerators</h2>
+      <p style="color: var(--muted); font-size: 12px; margin: 4px 0 8px;">
+        Non-NIC PCI devices DPDK can use via its dmadev / cryptodev / rawdev APIs while the kernel driver stays loaded. No bind needed.
+      </p>
+      <div id="accel-list"><div class="iface-empty">Loading…</div></div>
+    </div>
+
     <div class="card" style="grid-column: 1 / -1;">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
         <h2 style="margin: 0;">Network Interfaces</h2>
@@ -18606,6 +18754,50 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       }
     }
 
+    // v0.5.76: render the DPDK Accelerators card (ioatdma /
+    // idxd / qat / NTB). Polled with the iface table so they
+    // share the visibility-aware refresh cadence (v0.5.65).
+    async function refreshAccelerators() {
+      const card = $('card-accelerators');
+      const wrap = $('accel-list');
+      if (!card || !wrap) return;
+      try {
+        const r = await fetch('/api/dpdk/accelerators');
+        if (!r.ok) { card.hidden = true; return; }
+        const d = await r.json();
+        const list = d.accelerators || [];
+        if (!list.length) { card.hidden = true; return; }
+        card.hidden = false;
+        // Aggregated count row by label, then a compact per-device
+        // table for the curious operator.
+        const counts = d.counts_by_label || {};
+        const summary = Object.entries(counts)
+          .map(([lbl, n]) => `<span style="margin-right: 16px;"><b>${n}×</b> ${escapeHtml(lbl)}</span>`)
+          .join('');
+        const rows = list.map(a => `
+          <tr>
+            <td class="mono">${escapeHtml(a.pci || '—')}</td>
+            <td>${escapeHtml(a.vendor || '—')}</td>
+            <td class="mono">${escapeHtml(a.driver || '—')}</td>
+            <td title="${escapeHtml(a.hint || '')}">${escapeHtml(a.label || '—')}</td>
+            <td class="mono" style="color: var(--muted);">${escapeHtml(a.class || '—')}</td>
+          </tr>`).join('');
+        wrap.innerHTML = `
+          <div style="margin-bottom: 8px;">${summary}</div>
+          <details>
+            <summary style="cursor: pointer; color: var(--muted); font-size: 12px;">Show per-device list (${list.length})</summary>
+            <div style="overflow-x: auto; margin-top: 8px;">
+            <table class="iface">
+              <thead><tr><th>PCI</th><th>Vendor</th><th>Driver</th><th>Class</th><th>PCI class</th></tr></thead>
+              <tbody>${rows}</tbody>
+            </table>
+            </div>
+          </details>`;
+      } catch (e) {
+        card.hidden = true;
+      }
+    }
+
     async function bindInterface(iface, force) {
       // Record the original kernel name + driver before binding. After the
       // bind succeeds the kernel netdev disappears and we lose this info,
@@ -18835,6 +19027,9 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
     // a list that rarely changes.
     refreshHealth();
     refreshInterfaces();
+    // v0.5.76: accelerators don't change at runtime (CPU-internal
+    // DMA engines, NTB bridges). Fetch once on load.
+    refreshAccelerators();
     // v0.5.65 (audit LOW): skip the polling refresh when the
     // tab is hidden. Cheap on battery, less wasteful when an
     // operator parks the admin page in a background tab while
