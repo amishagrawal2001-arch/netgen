@@ -16102,6 +16102,65 @@ def api_admin_health():
     out["reboot_needed"] = _reboot_needed
     out["reboot_reasons"] = _reboot_reasons
 
+    # v0.5.74 (audit F6): RDMA stack status.
+    # Pre-fix /api/admin/health surfaced DPDK / vfio / hugepages /
+    # tx_worker / IOMMU but NOTHING about RDMA. The admin console
+    # couldn't tell the operator if perftest was installed, if the
+    # RDMA modules were loaded, or if any HCA ports were active —
+    # they had to poll /api/rdma/devices + something we didn't have
+    # for module state.
+    rdma = {
+        "perftest_installed": False,
+        "tools": {},
+        "modules_loaded": {},
+        "hca_count": 0,
+        "ports_active": 0,
+        "ports_total": 0,
+    }
+    try:
+        # perftest CLI tools — same list install_rdma.sh installs.
+        for tool in ("ib_send_bw", "ib_write_bw", "ib_read_bw",
+                     "ib_send_lat", "rping"):
+            import shutil as _sh
+            rdma["tools"][tool] = bool(_sh.which(tool))
+        rdma["perftest_installed"] = rdma["tools"].get(
+            "ib_send_bw", False
+        )
+        # RDMA kernel modules — same list install_rdma.sh writes
+        # to /etc/modules-load.d/netgen-rdma.conf (v0.5.62 sync'd
+        # this to the canonical set).
+        for mod in ("ib_uverbs", "rdma_cm", "rdma_ucm",
+                    "ib_umad", "iw_cm"):
+            rdma["modules_loaded"][mod] = _module_loaded(mod)
+        # HCA + port count from /sys/class/infiniband.
+        try:
+            _ib_root = "/sys/class/infiniband"
+            if os.path.isdir(_ib_root):
+                _hcas = [
+                    h for h in os.listdir(_ib_root)
+                    if os.path.isdir(os.path.join(_ib_root, h))
+                ]
+                rdma["hca_count"] = len(_hcas)
+                for hca in _hcas:
+                    _ports_dir = os.path.join(_ib_root, hca, "ports")
+                    if not os.path.isdir(_ports_dir):
+                        continue
+                    for port in os.listdir(_ports_dir):
+                        rdma["ports_total"] += 1
+                        try:
+                            with open(os.path.join(_ports_dir, port, "state")) as _sf:
+                                state = _sf.read().strip()
+                            # State format: "4: ACTIVE" / "1: DOWN"
+                            if "ACTIVE" in state.upper():
+                                rdma["ports_active"] += 1
+                        except Exception:
+                            pass
+        except Exception:
+            pass
+    except Exception as _re:
+        logging.debug(f"[ADMIN HEALTH] RDMA probe failed: {_re}")
+    out["rdma"] = rdma
+
     # v0.5.69 (audit H1): version-vs-target match for libdpdk.
     # The install_dpdk.sh script targets 23.11 (v0.5.61 added the
     # mismatch warning to the install path). Surface the same
@@ -16148,7 +16207,24 @@ def api_admin_health():
             issues.append("hugepages allocated but hugetlbfs not mounted")
         if not out["tx_worker"].get("present"):
             issues.append("DPDK installed but tx_worker binary missing")
-        if out["dpdk"].get("version_mismatch"):
+    # v0.5.74 (audit F6): RDMA degraded-state checks.
+    if out["rdma"].get("perftest_installed"):
+        _miss_mods = [
+            m for m, loaded in out["rdma"]["modules_loaded"].items()
+            if not loaded
+        ]
+        if _miss_mods:
+            issues.append(
+                f"RDMA installed but kernel modules missing: "
+                f"{', '.join(_miss_mods)}"
+            )
+        if out["rdma"]["hca_count"] > 0 and out["rdma"]["ports_active"] == 0:
+            issues.append(
+                f"RDMA: 0/{out['rdma']['ports_total']} ports active "
+                f"(check cables / port admin state)"
+            )
+
+    if out["dpdk"].get("version_mismatch"):
             # v0.5.69 (audit H1): libdpdk != 23.11 target →
             # tx_worker may have ABI mismatch. Pre-fix this only
             # warned at install time.
@@ -16260,6 +16336,7 @@ def _select_listen_addr_for(device: Optional[str], ib_port: Optional[int]) -> Op
 
 
 @app.route("/api/rdma/perftest/start", methods=["POST"])
+@require_role("operator")  # v0.5.74 (audit F1): spawns long-running perftest subprocess
 def api_rdma_perftest_start():
     """Spawn a perftest job + register its half under a handshake_id.
 
@@ -16356,6 +16433,7 @@ def api_rdma_perftest_start():
 
 
 @app.route("/api/rdma/perftest/stop", methods=["POST"])
+@require_role("operator")  # v0.5.74 (audit F1): kills a perftest job
 def api_rdma_perftest_stop():
     """Stop a perftest job. Body: ``{job_id: str, forget_pair: bool}``.
 
@@ -16375,7 +16453,9 @@ def api_rdma_perftest_stop():
     if not job_id:
         return jsonify({"status": "error", "error": "job_id is required"}), 400
     result = stop_perftest(job_id)
-    if body.get("forget_pair"):
+    # v0.5.74 (audit F3): strict bool. Pre-fix `forget_pair: "no"`
+    # (truthy string) silently purged the handshake registry.
+    if _strict_true(body.get("forget_pair", False)):
         hid = find_job_handshake(job_id)
         if hid:
             forget_handshake(hid)
@@ -16431,6 +16511,7 @@ def api_rdma_handshakes_list():
 
 
 @app.route("/api/rdma/handshakes/<handshake_id>", methods=["GET", "DELETE"])
+@require_role("operator")  # v0.5.74 (audit F1): DELETE mutates the handshake registry
 def api_rdma_handshake_detail(handshake_id):
     """GET → full pairing record; DELETE → forget the pairing (does
     NOT stop the underlying perftest jobs — caller must do that)."""
@@ -17744,6 +17825,20 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       </div>
     </div>
 
+    <!-- v0.5.74 (audit F6): RDMA stack card. Operator-requested
+         "admin console should show the status of RDMA". Mirrors
+         the DPDK Runtime + Kernel Prereqs cards. -->
+    <div class="card">
+      <h2>RDMA Stack</h2>
+      <div class="row"><span class="label">perftest CLI</span><span class="pill" id="p-rdma-perftest">…</span></div>
+      <div class="row"><span class="label">Kernel modules</span><span class="pill" id="p-rdma-mods">…</span></div>
+      <div class="row"><span class="label">HCA devices</span><span id="p-rdma-hca-count">…</span></div>
+      <div class="row"><span class="label">Active ports</span><span id="p-rdma-ports">…</span></div>
+      <p style="color: var(--muted); font-size: 11px; margin: 8px 0 0;">
+        Required modules: ib_uverbs, rdma_cm, rdma_ucm, ib_umad, iw_cm. Run "Setup RDMA…" from the desktop client or set up manually with install_rdma.sh.
+      </p>
+    </div>
+
     <div class="card" style="grid-column: 1 / -1;">
       <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
         <h2 style="margin: 0;">Network Interfaces</h2>
@@ -17863,6 +17958,33 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
         pill($('p-iommu'), !!d.iommu.enabled, 'Enabled', 'Disabled');
         pill($('p-vfio'), !!d.vfio.vfio_loaded, 'Loaded', 'Not loaded');
         pill($('p-vfiopci'), !!d.vfio.vfio_pci_loaded, 'Loaded', 'Not loaded');
+        // v0.5.74 (audit F6): render the RDMA card.
+        const rdma = d.rdma || {};
+        pill($('p-rdma-perftest'), !!rdma.perftest_installed, 'Installed', 'Missing');
+        const mods = rdma.modules_loaded || {};
+        const modKeys = Object.keys(mods);
+        const modOk = modKeys.length > 0 && modKeys.every(k => mods[k]);
+        const missing = modKeys.filter(k => !mods[k]);
+        if (modOk) {
+          pill($('p-rdma-mods'), true, `All ${modKeys.length} loaded`, '');
+        } else if (modKeys.length === 0) {
+          pill($('p-rdma-mods'), false, '', 'Unknown');
+        } else {
+          const p = $('p-rdma-mods');
+          p.textContent = `Missing: ${missing.join(', ')}`;
+          p.className = 'pill bad';
+          p.setAttribute('aria-label', `RDMA modules missing: ${missing.join(', ')}`);
+        }
+        $('p-rdma-hca-count').textContent = String(rdma.hca_count ?? 0);
+        const portsTotal = rdma.ports_total ?? 0;
+        const portsActive = rdma.ports_active ?? 0;
+        const portsEl = $('p-rdma-ports');
+        portsEl.textContent = `${portsActive} / ${portsTotal}`;
+        portsEl.style.color = (
+          portsTotal === 0 ? 'var(--muted)' :
+          (portsActive === 0 ? 'var(--bad)' :
+          (portsActive < portsTotal ? 'var(--warn)' : 'var(--ink)'))
+        );
 
         if (d.install_running && !pollLogTimer) {
           // Auto-resume polling — operator just loaded the page mid-install,

@@ -712,10 +712,18 @@ def _build_perftest_cmd(
     if rx_depth:
         cmd += ["--rx_depth", str(rx_depth)]
 
-    if opts.get("bidirectional") and test.endswith("_bw"):
+    # v0.5.74 (audit F3): strict bool. Pre-fix
+    # `bidirectional: "false"` (truthy string) enabled `-b`. Same
+    # class as v0.5.68 C2/C3 — the helper is duplicated here
+    # rather than imported from run_tgen_server to keep utils
+    # standalone.
+    def _opt_true(v):
+        return v is True
+
+    if _opt_true(opts.get("bidirectional")) and test.endswith("_bw"):
         cmd += ["-b"]
 
-    if opts.get("use_event"):
+    if _opt_true(opts.get("use_event")):
         cmd += ["-e"]
 
     inline = opts.get("inline")
@@ -726,11 +734,15 @@ def _build_perftest_cmd(
     if cq_mod:
         cmd += ["-Q", str(cq_mod)]
 
-    if opts.get("cpu_util"):
+    if _opt_true(opts.get("cpu_util")):
         cmd += ["--cpu_util"]
 
     # Always prefer gbits for _bw tests so our parser knows the unit.
-    if test.endswith("_bw") and opts.get("report_gbits", True):
+    # v0.5.74 (audit F3): default-True via `is True` check —
+    # operator can disable by explicitly passing `false` (literal
+    # Python `False`, not the truthy string).
+    _rg = opts.get("report_gbits", True)
+    if test.endswith("_bw") and (_rg is True or _rg is None):
         cmd += ["--report_gbits"]
 
     # Force tabular output so parsing is stable across perftest versions.
