@@ -2,6 +2,70 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.52] - 2026-06-09
+
+**Anchored regex in /api/dpdk/verify + fstab AND-not-OR
+idempotency.** Closes audit findings H1 + H2.
+
+Full suite: **1,885 passed, 1 skipped** (+7 new tests).
+
+### H1: `/api/dpdk/verify` module-detection regex anchoring
+
+Pre-fix code:
+```python
+if "vfio" in output or "uio" in output:
+    modules_loaded = True
+```
+
+Same bug class as v0.5.42 (fixed in `/api/dpdk/load_modules`) but
+in a sibling endpoint. On srv06's kernel 6.8 with the vfio-pci
+split, `vfio_pci_core` and `pds_vfio_pci` are loaded but bare
+`vfio` and `vfio_pci` aren't — substring match returned True
+anyway. Diagnostics would then claim `kernel_modules: true` and
+skip the actual load step, leaving the operator stuck.
+
+Fix: explicit per-module list with anchored regex:
+```python
+for _mod in ("vfio", "vfio_pci", "uio_pci_generic"):
+    if re.search(rf'^{_mod}\s', result.stdout, re.MULTILINE):
+        ...
+```
+Plus the message-building branch now reports the precise
+detected list, not the same broken substring re-check.
+
+### H2: fstab idempotency
+
+Pre-fix:
+```python
+if mount_point not in existing or "hugetlbfs" not in existing:
+    append
+```
+
+The OR was wrong. On systems where systemd's
+`dev-hugepages.mount` already wrote `none /dev/hugepages
+hugetlbfs ...` to fstab, the first clause was True (our
+`/mnt/huge` isn't present) AND the second clause was False
+(hugetlbfs IS present). The OR returned True → we appended a
+duplicate entry on every `/api/dpdk/hugepages` call.
+
+Fix: walk lines, skip comment lines, match a single non-comment
+line that contains BOTH the mount point AND hugetlbfs. Also fix
+trailing-newline glue when the existing fstab doesn't end with a
+newline.
+
+### Tests
+
+7 new in `tests/test_v0552_verify_anchored_fstab_and.py`:
+* Substring `"vfio" in ...` removed from verify executable code
+  (commented documentation of the old bug is allowed)
+* Anchored regex `re.search(rf'^{mod}\s', ...)` used
+* Message builder uses the per-module detection list
+* fstab no longer uses the top-level OR pattern
+* Per-line AND check (mount_point + hugetlbfs in same line)
+* Comment lines (`#`) skipped during the walk
+* Trailing-newline check before our header
+* Version pinned at ≥ 0.5.52
+
 ## [0.5.51] - 2026-06-09
 
 **install_dpdk.sh now configures GRUB/IOMMU and signals reboot.**

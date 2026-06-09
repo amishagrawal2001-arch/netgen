@@ -13674,11 +13674,20 @@ def dpdk_verify():
                 text=True,
                 timeout=5
             )
+            # v0.5.52 (audit H1): anchored regex per module, NOT
+            # substring. Pre-fix `"vfio" in output` matched
+            # `vfio_pci_core` and `pds_vfio_pci` even when bare
+            # `vfio` and `vfio_pci` weren't loaded — same bug class
+            # as v0.5.42 in /api/dpdk/load_modules, but this sibling
+            # endpoint still had it. Anchored regex matches the
+            # module name on its own line in lsmod output.
             modules_loaded = False
+            _detected_modules = []
             if result.returncode == 0:
-                output = result.stdout.lower()
-                if "vfio" in output or "uio" in output:
-                    modules_loaded = True
+                for _mod in ("vfio", "vfio_pci", "uio_pci_generic"):
+                    if re.search(rf'^{_mod}\s', result.stdout, re.MULTILINE):
+                        modules_loaded = True
+                        _detected_modules.append(_mod)
             
             # Check for builtin modules using modinfo
             builtin_modules = []
@@ -13700,14 +13709,14 @@ def dpdk_verify():
                 kernel_modules = True
                 if builtin_modules:
                     messages.append(f"DPDK kernel modules: {', '.join(builtin_modules)} (builtin)")
-                if modules_loaded:
-                    loaded_list = []
-                    if "vfio" in result.stdout.lower():
-                        loaded_list.append("vfio")
-                    if "uio" in result.stdout.lower():
-                        loaded_list.append("uio")
-                    if loaded_list:
-                        messages.append(f"DPDK kernel modules loaded: {', '.join(loaded_list)}")
+                if _detected_modules:
+                    # v0.5.52: use the precise list of modules
+                    # detected via anchored regex (vfio vs
+                    # vfio_pci vs uio_pci_generic). Pre-fix this
+                    # always reported "vfio, uio" from substring
+                    # matches even on hosts that only had
+                    # vfio_pci_core (kernel 6.8+ split).
+                    messages.append(f"DPDK kernel modules loaded: {', '.join(_detected_modules)}")
             else:
                 messages.append("DPDK kernel modules not loaded (vfio-pci, vfio, uio_pci_generic)")
         except Exception as e:
@@ -13803,13 +13812,36 @@ def dpdk_hugepages():
                                 existing = f.read()
                         except FileNotFoundError:
                             existing = ""
-                        # Idempotent — only append if not present
-                        # (operator may have already added it).
-                        if (
-                            mount_point not in existing
-                            or "hugetlbfs" not in existing
-                        ):
+                        # v0.5.52 (audit H2): the pre-fix check used
+                        # OR (`mount_point not in existing OR
+                        # "hugetlbfs" not in existing`). For a host
+                        # with a different hugetlbfs entry already
+                        # (e.g., the systemd-default
+                        # `dev-hugepages.mount` writes `none
+                        # /dev/hugepages hugetlbfs ...`), the first
+                        # condition was True (our mount_point not
+                        # present) and we appended a DUPLICATE on
+                        # every call.
+                        #
+                        # Correct check: this exact mount point
+                        # AT hugetlbfs already configured. Match any
+                        # line containing both the mount point AND
+                        # the hugetlbfs fs-type. AND-not-OR.
+                        already_persisted = False
+                        for ln in existing.splitlines():
+                            if ln.lstrip().startswith("#"):
+                                continue
+                            if (mount_point in ln
+                                    and "hugetlbfs" in ln):
+                                already_persisted = True
+                                break
+                        if not already_persisted:
+                            # Ensure fstab ends with a newline
+                            # before our header — old hand-edited
+                            # files sometimes don't.
                             with open(fstab_path, "a") as f:
+                                if existing and not existing.endswith("\n"):
+                                    f.write("\n")
                                 f.write(
                                     "# netgen-server "
                                     "/api/dpdk/hugepages "
