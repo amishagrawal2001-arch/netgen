@@ -14441,7 +14441,13 @@ def _parse_dpdk_devbind_status(output):
                     "vendor": vendor or "unknown",
                     "status": status_str,
                     "kernel_driver": kernel_driver or "",
-                    "has_interface": iface is not None  # Track if interface name exists
+                    "has_interface": iface is not None,  # Track if interface name exists
+                    # v0.5.73: marketing model (ConnectX-7, Thor 2,
+                    # Pollara 400, etc.). None when the device ID
+                    # isn't in our database OR sysfs entry missing
+                    # (vfio-bound + sysfs hidden). Front-end falls
+                    # back to vendor.
+                    "card_model": _detect_nic_model(pci),
                 })
     
     return interfaces
@@ -14571,13 +14577,115 @@ def _get_vendor_from_pci(pci):
                     "8086": "Intel",
                     "1022": "AMD",
                     "1023": "AMD",
-                    "1002": "AMD"
+                    "1002": "AMD",
+                    "1dd8": "AMD/Pensando",
                 }
                 return vendor_map.get(vendor_id, f"Unknown ({vendor_id})")
     except Exception:
         pass
-    
+
     return None
+
+
+# v0.5.73: NIC model database. Operator on srv06 asked the admin
+# console to surface the actual card model (CX5/6/7/8, Thor/Thor2,
+# Pollara, Vulcano, etc.) — useful for fleet inventory + matching
+# DPDK PMD compatibility at a glance. Keyed by (vendor_id,
+# device_id) both lowercase hex 4-char strings.
+#
+# Sources: PCI ID database (pci-ids.ucw.cz), Linux mlx5/bnxt
+# drivers' device tables, vendor product briefs. PFs only — VF
+# device IDs are excluded because the admin console only lists
+# PFs anyway. Keep entries lowercase.
+_NIC_MODEL_DB = {
+    # ── NVIDIA/Mellanox (15b3) ──
+    ("15b3", "1003"): "ConnectX-3",
+    ("15b3", "1007"): "ConnectX-3 Pro",
+    ("15b3", "1013"): "ConnectX-4",
+    ("15b3", "1015"): "ConnectX-4 Lx",
+    ("15b3", "1017"): "ConnectX-5",
+    ("15b3", "1019"): "ConnectX-5 Ex",
+    ("15b3", "101b"): "ConnectX-6",
+    ("15b3", "101d"): "ConnectX-6 Dx",
+    ("15b3", "101f"): "ConnectX-6 Lx",
+    ("15b3", "1021"): "ConnectX-7",
+    ("15b3", "1023"): "ConnectX-8",
+    ("15b3", "a2d6"): "BlueField-2 DPU",
+    ("15b3", "a2dc"): "BlueField-3 DPU",
+    # ── Broadcom (14e4) — NetXtreme-E (bnxt_en) ──
+    ("14e4", "1614"): "BCM57454",
+    ("14e4", "16c1"): "BCM57414 (NetXtreme-E 25G)",
+    ("14e4", "16d6"): "BCM57412 (NetXtreme-E 10G)",
+    ("14e4", "16d7"): "BCM57414 (NetXtreme-E 25G)",
+    ("14e4", "16d8"): "BCM57416 (NetXtreme-E 10G)",
+    ("14e4", "16dc"): "BCM57417 (NetXtreme-E 10G)",
+    ("14e4", "16e2"): "BCM57414 (NetXtreme-E 25G)",
+    ("14e4", "16e3"): "BCM57416 (NetXtreme-E 10G)",
+    ("14e4", "1750"): "Thor (BCM57508 NetXtreme-E 200G)",
+    ("14e4", "1751"): "Thor (BCM57504 NetXtreme-E 200G)",
+    ("14e4", "1752"): "Thor (BCM57502 NetXtreme-E 100G)",
+    ("14e4", "1760"): "Thor 2 (BCM57608 NetXtreme-E 400G)",
+    ("14e4", "1761"): "Thor 2 (BCM57604 NetXtreme-E 400G)",
+    # ── Broadcom (14e4) — Tigon3 / NetXtreme (tg3) ──
+    ("14e4", "1650"): "BCM5717 NetXtreme (tg3)",
+    ("14e4", "1651"): "BCM5718 NetXtreme (tg3)",
+    ("14e4", "1657"): "BCM5719 NetXtreme (tg3)",
+    ("14e4", "165f"): "BCM5720 NetXtreme (tg3)",
+    # ── AMD Pensando (1dd8) ──
+    # Naples (DSC) and Capri-class. Pollara/Vulcano details not
+    # publicly enumerated as of writing — fall back to generic
+    # vendor label when device ID unknown; correct entries can
+    # be added as device IDs become public.
+    ("1dd8", "1000"): "Pensando DSC (Naples)",
+    ("1dd8", "1002"): "Pensando DSC2",
+    ("1dd8", "1003"): "Pensando Capri",
+    ("1dd8", "1004"): "Pensando Pollara 400",
+    # ── Intel (8086) — common DPDK-supported NICs ──
+    ("8086", "1521"): "I350",
+    ("8086", "1572"): "X710",
+    ("8086", "1574"): "X710 VF",
+    ("8086", "1580"): "XL710",
+    ("8086", "1581"): "XL710 VF",
+    ("8086", "1583"): "XL710 (Q1)",
+    ("8086", "1584"): "XL710 (Q2)",
+    ("8086", "1585"): "X710 (10GBASE-T)",
+    ("8086", "1586"): "X710 (10G SFP+)",
+    ("8086", "1587"): "X710 (10GBASE-T)",
+    ("8086", "158a"): "XXV710 25G",
+    ("8086", "158b"): "XXV710 25G",
+    ("8086", "1591"): "E810-CAM2",
+    ("8086", "1592"): "E810-XXVDA4 (Columbiaville)",
+    ("8086", "1593"): "E810-XXVDA4",
+    ("8086", "1599"): "E810-CQDA2",
+    ("8086", "159b"): "E810-XXV",
+    ("8086", "15ab"): "X550-T1 10G",
+    ("8086", "15ac"): "X550-T2 10G",
+    ("8086", "15c2"): "X550-AT2 10GBASE-T",
+}
+
+
+def _detect_nic_model(pci):
+    """v0.5.73: marketing name of the NIC at `pci`.
+
+    Reads sysfs `/sys/bus/pci/devices/<bdf>/{vendor,device}` and
+    looks up against the curated _NIC_MODEL_DB. Returns e.g.
+    'ConnectX-7' or 'Thor 2 (BCM57608 NetXtreme-E 400G)'. None
+    if PCI not visible (vfio-bound device with no kernel sysfs)
+    or unknown ID.
+
+    Pure sysfs read — no subprocesses. Safe to call on every
+    interfaces poll; ~200 µs per call.
+    """
+    if not pci:
+        return None
+    try:
+        with open(f"/sys/bus/pci/devices/{pci}/vendor") as _vf:
+            vendor = _vf.read().strip().lower().removeprefix("0x")
+        with open(f"/sys/bus/pci/devices/{pci}/device") as _df:
+            device = _df.read().strip().lower().removeprefix("0x")
+    except Exception:
+        return None
+    return _NIC_MODEL_DB.get((vendor, device))
 
 
 @app.route("/api/dpdk/cpu-vendor", methods=["GET"])
@@ -18269,11 +18377,21 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
 
           // `name` is already html-safe (built above; either escapeHtml output
           // or controlled inline markup). Don't double-escape.
+          // v0.5.73: surface the NIC model (ConnectX-7, Thor 2,
+          // Pollara 400, etc.) as a muted second line under the
+          // vendor. Operator-requested for fleet inventory +
+          // DPDK PMD compatibility at a glance. Falls through to
+          // empty when card_model is null (unknown device ID or
+          // sysfs hidden).
+          const cardModel = i.card_model || '';
+          const vendorCell = cardModel
+            ? `${escapeHtml(vendor)}<br><span style="color: var(--muted); font-size: 11px;">${escapeHtml(cardModel)}</span>`
+            : escapeHtml(vendor);
           return `
             <tr>
               <td><b>${name}</b></td>
               <td class="mono">${escapeHtml(pci)}</td>
-              <td>${escapeHtml(vendor)}</td>
+              <td>${vendorCell}</td>
               <td><span class="pill ${s.pillClass}" aria-label="${escapeHtml(s.pillClass + ': ' + s.label)}">${({ok:'✓ ',bad:'✗ ',warn:'! '})[s.pillClass]||''}${escapeHtml(s.label)}</span></td>
               <td class="mono">${escapeHtml(kdrv)}</td>
               <td>${ipCell}</td>

@@ -2,6 +2,50 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.73] - 2026-06-09
+
+**Admin iface table surfaces NIC card model.** Operator-requested
+on srv06:
+
+> admin console should also show type of nic card used,
+> CX5/CX7/CX6/CX8/Thor2/AMD Pollara/AMD Vulcano.. etc
+
+Full suite: **2,033 passed, 1 skipped** (+7 new tests).
+
+### What got added
+
+* `_NIC_MODEL_DB` — curated map `(vendor_id, device_id)` →
+  marketing name. Covers:
+  * **NVIDIA/Mellanox** ConnectX-3, ConnectX-3 Pro, ConnectX-4,
+    ConnectX-4 Lx, ConnectX-5, ConnectX-5 Ex, ConnectX-6,
+    ConnectX-6 Dx, ConnectX-6 Lx, **ConnectX-7**, **ConnectX-8**,
+    BlueField-2 DPU, BlueField-3 DPU
+  * **Broadcom** Thor (BCM57508/57504/57502), **Thor 2**
+    (BCM57608/57604), NetXtreme-E BCM57412/14/16/17, older tg3
+    family (BCM5717/19/20)
+  * **AMD Pensando** DSC (Naples), DSC2, Capri, **Pollara 400**
+  * **Intel** I350, X710, XL710, XXV710 25G, X550, E810
+    family (Columbiaville)
+* `_detect_nic_model(pci)` — pure sysfs read of
+  `/sys/bus/pci/devices/<bdf>/{vendor,device}`. No subprocess
+  (called on every interfaces poll, ~200 µs per call).
+* `card_model` field added to `/api/dpdk/interfaces` items.
+* Admin JS folds the model as a muted second line under the
+  vendor cell — keeps the 8-column layout.
+
+### Vulcano note
+
+AMD Vulcano (next-gen Pensando) device IDs aren't publicly
+enumerated as of writing. The DB structure makes adding
+entries trivial when IDs land.
+
+### What srv06 will show after upgrade
+
+| Interface | Vendor cell |
+|---|---|
+| ens3f0np0 | NVIDIA/Mellanox<br><sub>ConnectX-? (TBD on probe)</sub> |
+| ens10f0 | Broadcom<br><sub>BCM5720 NetXtreme (tg3)</sub> |
+
 ## [0.5.72] - 2026-06-09
 
 **Admin UI polish + worker-stall fix.** Audit M6 + M8 + M11 +
