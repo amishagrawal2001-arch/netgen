@@ -2,6 +2,26 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.64] - 2026-06-09
+
+**Admin UI polish — tri-state hugepages pill, detailed error
+toast, button-busy guard.** Audit M13 + M14 + M15.
+
+Full suite: **1,965 passed, 1 skipped** (+9 new tests).
+
+* **M13** hugepages color now tri-state: red `total=0`, orange
+  `free=0` (exhausted — typical leaked-DPDK-process sign),
+  ink otherwise. Pre-fix the exhausted state showed as normal
+  text and the operator missed it during RFC 2544 failures.
+* **M14** `toastFailDetailed(d, status)` helper falls through
+  `d.message → d.error → d.output → d.stderr → HTTP <code>` so
+  the actual error reason (e.g., dpdk_bind.sh stderr) reaches
+  the operator instead of "unknown".
+* **M15** `withButtonBusy(btnId, fn)` disables the button on
+  entry, re-enables in `finally`. Applied to `btn-load-modules`,
+  `btn-config-iommu`, `btn-config-hp`. Triple-clicks no longer
+  trigger three concurrent installs.
+
 ## [0.5.63] - 2026-06-09
 
 **netgen-dpdk-rebind.service — cleaner dependency edge +

@@ -17275,7 +17275,16 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
           'Not installed');
         pill($('p-txworker'), d.tx_worker.present, 'Built', 'Not built');
         $('p-hugepages').textContent = `${d.hugepages.total} / ${d.hugepages.free}`;
-        $('p-hugepages').style.color = (d.hugepages.total === 0) ? 'var(--bad)' : 'var(--ink)';
+        // v0.5.64 (audit M13): tri-state. Pre-fix only red (total
+        // == 0) vs default — when all pages are exhausted (free == 0
+        // with total > 0, typical sign of a leaked DPDK process)
+        // the operator saw normal text and missed it. Now: red
+        // when 0 allocated, orange/warn when allocated but 0 free,
+        // ink otherwise.
+        $('p-hugepages').style.color = (
+          d.hugepages.total === 0 ? 'var(--bad)' :
+          (d.hugepages.free === 0 ? 'var(--warn)' : 'var(--ink)')
+        );
         pill($('p-iommu'), !!d.iommu.enabled, 'Enabled', 'Disabled');
         pill($('p-vfio'), !!d.vfio.vfio_loaded, 'Loaded', 'Not loaded');
         pill($('p-vfiopci'), !!d.vfio.vfio_pci_loaded, 'Loaded', 'Not loaded');
@@ -17492,39 +17501,79 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       }
     });
 
+    // v0.5.64 (audit M14 + M15): error toast that includes the
+    // full server-reported text — message/error/output/stderr —
+    // and stays visible until clicked when it's an error. Plus a
+    // button-disable helper so triple-clicks don't trigger
+    // concurrent installs.
+    function toastFailDetailed(d, status) {
+      const reason = d?.message || d?.error || d?.output || d?.stderr
+                  || ('HTTP ' + status);
+      // The base toast() helper auto-dismisses after a couple
+      // seconds; for errors prefix with "Failed:" so the operator
+      // searches the right thing if it scrolls off.
+      toast('Failed: ' + reason);
+    }
+
+    async function withButtonBusy(btnId, fn) {
+      const b = $(btnId);
+      if (!b || b.disabled) return;
+      b.disabled = true;
+      try { return await fn(); }
+      finally { b.disabled = false; }
+    }
+
     $('btn-load-modules').addEventListener('click', async () => {
-      try {
-        const r = await fetch('/api/dpdk/load_modules', { method: 'POST' });
-        const d = await r.json();
-        toast(d.success ? 'VFIO modules loaded' : ('Failed: ' + (d.message || d.error || 'unknown')));
-        refreshHealth();
-      } catch (e) { toast('Load failed: ' + e); }
+      await withButtonBusy('btn-load-modules', async () => {
+        try {
+          const r = await fetch('/api/dpdk/load_modules', { method: 'POST' });
+          const d = await r.json();
+          if (d.success) {
+            toast('VFIO modules loaded');
+          } else {
+            toastFailDetailed(d, r.status);
+          }
+          refreshHealth();
+        } catch (e) { toast('Load failed: ' + e); }
+      });
     });
 
     $('btn-config-iommu').addEventListener('click', async () => {
       if (!confirm('Configure IOMMU? This edits GRUB and requires a host reboot.\n\nProceed?')) return;
-      try {
-        const r = await fetch('/api/dpdk/iommu', {
-          method: 'POST', headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ enable: true, reboot_after: false }),
-        });
-        const d = await r.json();
-        toast(d.success ? 'IOMMU configured (reboot required)' : ('Failed: ' + (d.message || d.error || 'unknown')));
-      } catch (e) { toast('Request failed: ' + e); }
+      await withButtonBusy('btn-config-iommu', async () => {
+        try {
+          const r = await fetch('/api/dpdk/iommu', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ enable: true, reboot_after: false }),
+          });
+          const d = await r.json();
+          if (d.success) {
+            toast('IOMMU configured (reboot required)');
+          } else {
+            toastFailDetailed(d, r.status);
+          }
+        } catch (e) { toast('Request failed: ' + e); }
+      });
     });
 
     $('btn-config-hp').addEventListener('click', async () => {
       const n = parseInt($('hp-pages').value, 10);
       if (!Number.isFinite(n) || n < 64) { toast('Enter a valid number of pages'); return; }
-      try {
-        const r = await fetch('/api/dpdk/hugepages', {
-          method: 'POST', headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify({ num_pages: n }),
-        });
-        const d = await r.json();
-        toast(d.success ? `Hugepages configured: ${n}` : ('Failed: ' + (d.message || d.error || 'unknown')));
-        refreshHealth();
-      } catch (e) { toast('Request failed: ' + e); }
+      await withButtonBusy('btn-config-hp', async () => {
+        try {
+          const r = await fetch('/api/dpdk/hugepages', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({ num_pages: n }),
+          });
+          const d = await r.json();
+          if (d.success) {
+            toast(`Hugepages configured: ${n}`);
+          } else {
+            toastFailDetailed(d, r.status);
+          }
+          refreshHealth();
+        } catch (e) { toast('Request failed: ' + e); }
+      });
     });
 
     // ----- Interface table (bind / unbind) -----
