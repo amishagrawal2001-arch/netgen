@@ -145,15 +145,46 @@ def main() -> int:
     logger.info(f"[STARTUP] Install root: {install_root}")
     logger.info(f"[STARTUP] Wheel:        {wheel}")
 
-    # Install. --force-reinstall mirrors install_ostg_complete.py's
-    # v0.4.8 fix rationale: pip must re-resolve the dep graph instead
-    # of silently no-op'ing because the version matches.
+    # v0.5.45: dropped --force-reinstall in favour of --upgrade.
+    # Pre-fix, every wheel upgrade uninstalled + reinstalled all
+    # 67 transitive deps — the operator saw a 100+ line log of
+    # `Successfully uninstalled X-Y.Z` followed by
+    # `Successfully installed X-Y.Z` for ~65 packages that DIDN'T
+    # change version. Just wasted time + disk churn + log noise.
+    #
+    # Real operator complaint (Jun 8 2026, v0.5.43 → v0.5.44):
+    # "seems when upgrading the new version it uninstalls first
+    #  then installs again.. pls check if this is necessary?"
+    #
+    # Actual changed-version packages on that upgrade: 2 of 67
+    # (ostg-trafficgen + Flask-Cors).
+    #
+    # `pip install --upgrade <wheel>` with the default
+    # `--upgrade-strategy=only-if-needed` does the right thing:
+    # only touches packages whose installed version doesn't
+    # satisfy the new constraint. Untouched deps keep their
+    # existing site-packages entries.
+    #
+    # Why --force-reinstall was there originally (v0.4.8):
+    # if an operator REBUILT a wheel with the same version
+    # number (typical lab-dev workflow), pip would no-op because
+    # the installed version matched. The fix made every install
+    # re-fetch + replace. But operator-shipped upgrades always
+    # bump the version, so the lab-dev case doesn't apply.
+    #
+    # For the rare "I rebuilt a same-version wheel" case the
+    # operator can pass --force-reinstall as an explicit flag:
+    #   sudo netgen-upgrade --force-reinstall my-rebuilt.whl
+    force_reinstall = "--force-reinstall" in argv
+    pip_cmd = [str(venv_pip), "install", "--no-cache-dir"]
+    if force_reinstall:
+        pip_cmd.append("--force-reinstall")
+        logger.info("[INSTALL] --force-reinstall requested via CLI")
+    else:
+        pip_cmd.append("--upgrade")
+    pip_cmd.append(str(wheel))
     try:
-        _run(
-            [str(venv_pip), "install",
-             "--force-reinstall", "--no-cache-dir", str(wheel)],
-            check=True,
-        )
+        _run(pip_cmd, check=True)
     except subprocess.CalledProcessError as exc:
         logger.error(f"pip install failed: {exc}")
         return 2

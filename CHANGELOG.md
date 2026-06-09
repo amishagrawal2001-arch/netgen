@@ -2,6 +2,87 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.45] - 2026-06-08
+
+**`netgen-upgrade` drops `--force-reinstall`.** Operator-reported
+on srv06 (v0.5.43 → v0.5.44 upgrade): "seems when upgrading the
+new version it uninstalls first then installs again.. pls check
+if this is necessary?"
+
+Full suite: **1,824 passed, 1 skipped** (+7 new tests).
+
+### The waste
+
+The v0.5.43 → v0.5.44 upgrade log showed **67 packages
+uninstalled and reinstalled**. Only **2 actually changed
+version**:
+
+* `ostg-trafficgen` 0.5.43 → 0.5.44 — the actual upgrade
+* `Flask-Cors` 6.0.4 → 6.0.5 — minor dep update
+
+The other 65 packages went `X.Y.Z` → `X.Y.Z`. Identical version
+reinstalled for no reason. ~100 lines of useless `Successfully
+uninstalled X` / `Successfully installed X` pairs in the log,
+~3 minutes of unnecessary disk churn.
+
+### Cause
+
+`netgen-upgrade` script ran:
+```bash
+pip install --force-reinstall --no-cache-dir <wheel>
+```
+
+`--force-reinstall` forces every dep through the
+uninstall→reinstall cycle regardless of whether the installed
+version satisfies the new constraint.
+
+The flag was added in v0.4.8 because pip would no-op on
+**same-version** installs (a lab-dev rebuild scenario: rebuild a
+wheel locally without bumping the version → pip sees same
+version → doesn't install the new code). But operator-shipped
+upgrades always bump the version, so the original motivation
+never applies in production.
+
+### Fix
+
+`pip install --upgrade --no-cache-dir <wheel>` — pip's default
+`--upgrade-strategy=only-if-needed` touches only packages whose
+installed version doesn't satisfy the new constraint. Untouched
+deps keep their existing site-packages entries.
+
+### Lab-dev escape hatch retained
+
+For the rare "I rebuilt a wheel with the same version" case,
+pass `--force-reinstall` on the CLI:
+
+```bash
+sudo netgen-upgrade --force-reinstall my-rebuilt-0.5.45.whl
+```
+
+The script detects the flag in argv and re-enables the v0.4.8
+behaviour for that one invocation.
+
+### Outcome
+
+| Scenario | Before v0.5.45 | After v0.5.45 |
+|---|---|---|
+| Normal release upgrade (vX → vY) | 67 packages uninstalled+reinstalled | Only changed packages touched (typically 2-5) |
+| Log volume | ~140 lines | ~10-20 lines |
+| Wall-clock | ~3 min | ~30s |
+| Disk write churn | full reinstall of every dep | only the changed wheels |
+
+### Tests
+
+7 new in `tests/test_v0545_netgen_upgrade_no_force_reinstall.py`:
+* Default path uses `--upgrade` (not `--force-reinstall`)
+* `--force-reinstall` literal absent from default pip command
+* `--force-reinstall` CLI flag still parsed from argv
+* CLI flag actually appends to pip_cmd (not just parsed)
+* `--no-cache-dir` preserved across the refactor
+* Rationale comment present (operator-complaint + upgrade-strategy
+  reference)
+* Version pinned at ≥ 0.5.45
+
 ## [0.5.44] - 2026-06-08
 
 **`/api/dpdk/load_modules` wraps modprobe in `systemd-run` to
