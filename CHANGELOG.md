@@ -2,6 +2,63 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.74] - 2026-06-09
+
+**RDMA status in admin console + audit batch 1 (F1+F3+F6).** Operator
+on srv06:
+
+> also audit full rdma and make sure admin console should show
+> the status of RDMA
+
+Three independent audit fan-outs returned 32 findings across the
+RDMA REST surface, support modules, and GUI client. This release
+ships the operator-explicit ask (F6 — RDMA status in admin
+console) plus the two security findings that mirror v0.5.68's
+DPDK fortification.
+
+Full suite: **2,045 passed, 1 skipped** (+12 new tests).
+
+### F1 — auth gates on destructive RDMA endpoints
+
+`@require_role("operator")` added to:
+- `POST /api/rdma/perftest/start` (spawns long-running perftest
+  subprocess; pre-fix any viewer token could DoS the box by
+  spinning up the 64-job cap and holding QPs)
+- `POST /api/rdma/perftest/stop` (kills a perftest job)
+- `DELETE /api/rdma/handshakes/<id>` (mutates the registry)
+
+Mirrors v0.5.68's DPDK gating exactly.
+
+### F3 — strict bool on perftest flags
+
+Pre-fix `{"bidirectional": "false"}` (string) silently enabled
+`-b` on `ib_send_bw` — the truthy-string class that bit DPDK in
+v0.5.68. Applied to `bidirectional`, `use_event`, `cpu_util`,
+`report_gbits`, `forget_pair`.
+
+### F6 — RDMA stack in /api/admin/health + admin console card
+
+Operator-requested. `/api/admin/health` previously surfaced DPDK
+state but **nothing** about RDMA. Now reports `out["rdma"]` with
+`perftest_installed`, `tools`, `modules_loaded` (ib_uverbs,
+rdma_cm, rdma_ucm, ib_umad, iw_cm), `hca_count`, `ports_active`,
+`ports_total`. Two new degraded-state `issues` entries.
+
+New **"RDMA Stack"** card in the admin HTML alongside DPDK
+Runtime / Kernel Prereqs / Hugepages.
+
+### Remaining audit findings (deferred to v0.5.75+)
+
+29 findings stayed off this release. Categorized list ready
+for the audit-release drive:
+
+- **HIGH:** F2 device-name regex, F4 perftest watchdog +
+  zombie reaper, F5 stderr surfacing, M4 perftest stdio
+  buffering, M5 spawn/register race, G1 QThread parent
+  ownership
+- **MEDIUM:** F7-F11, M1-M3, M6-M10, G2-G10
+- **LOW:** F12 ibv_devinfo memoize, sundry polish
+
 ## [0.5.73] - 2026-06-09
 
 **Admin iface table surfaces NIC card model.** Operator-requested
