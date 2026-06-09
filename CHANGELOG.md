@@ -2,6 +2,38 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.63] - 2026-06-09
+
+**netgen-dpdk-rebind.service — cleaner dependency edge +
+survives NIC hot-remove.** Audit findings M11 + M12.
+
+Full suite: **1,956 passed, 1 skipped** (+6 new tests).
+
+### M11: unit hygiene
+
+* Dropped `Wants=systemd-modules-load.service` — redundant
+  (target is already `WantedBy=sysinit.target`).
+* Added `ConditionPathExists=/etc/netgen/dpdk-interfaces.json`
+  so hosts that never ran DPDK setup skip the unit cleanly
+  instead of logging "nothing to do" every boot.
+
+### M12: hot-remove survival
+
+Pre-fix: a single failed bind set `rc=1` → unit went to
+"failed" → systemctl `After=netgen-dpdk-rebind.service`
+consumers blocked. After a NIC hot-remove or BIOS PCI
+renumber the operator woke up to a wedged boot.
+
+Fix in the helper script:
+1. Pre-check `/sys/bus/pci/devices/<bdf>`. If missing → log
+   SKIP, add to `missing` list (don't even try dpdk-devbind).
+2. Track per-entry success / failure / missing.
+3. **Prune** missing entries from
+   `/etc/netgen/dpdk-interfaces.json` so subsequent boots don't
+   keep tripping over them. Atomic write (tmp + os.replace).
+4. Return 0 if ANY bind succeeded OR we pruned anything —
+   downstream services stay unblocked.
+
 ## [0.5.62] - 2026-06-09
 
 **install_rdma.sh refreshes modules-load file when module set

@@ -13192,12 +13192,18 @@ def _ensure_dpdk_rebind_unit_installed():
     NICs from /etc/netgen/dpdk-interfaces.json on boot. Idempotent —
     safe to call on every bind. Returns True if the unit is in
     place (created or pre-existing), False on failure."""
+    # v0.5.63 (audit M11): drop Wants=systemd-modules-load.service
+    # (After= alone is the right ordering edge — Wants would add
+    # nothing because systemd-modules-load is already WantedBy=
+    # sysinit.target). Add ConditionPathExists for the registry
+    # so the unit cleanly skips on hosts that never ran DPDK
+    # setup, instead of logging "nothing to do" every boot.
     unit_content = """[Unit]
 Description=netgen — re-bind DPDK NICs from registry
 Documentation=https://github.com/amishagrawal2001-arch/netgen
 After=systemd-modules-load.service
-Wants=systemd-modules-load.service
 Before=netgen-server.service network.target
+ConditionPathExists=/etc/netgen/dpdk-interfaces.json
 
 [Service]
 Type=oneshot
@@ -13250,11 +13256,27 @@ def main():
         print("netgen-dpdk-rebind: dpdk-devbind.py not found; skipping",
               file=sys.stderr)
         return 0  # not fatal — DPDK not installed yet
-    rc = 0
+    # v0.5.63 (audit M12): track success/failure per entry, but
+    # return 0 if AT LEAST ONE bind succeeded. Pre-fix any single
+    # failed bind made the unit go to "failed" state →
+    # systemctl `After=netgen-dpdk-rebind.service` consumers
+    # would block. After a NIC hot-remove or BIOS PCI renumber
+    # the operator wakes up to a wedged boot.
+    succeeded = []
+    failed = []
+    missing = []
     for entry in binds:
         pci = entry.get("pci")
         driver = entry.get("driver", "vfio-pci")
         if not pci:
+            continue
+        sysfs_path = f"/sys/bus/pci/devices/{pci}"
+        if not os.path.isdir(sysfs_path):
+            # PCI device gone — hot-remove or BIOS renumber.
+            print(f"netgen-dpdk-rebind: SKIP {pci} (not in /sys/bus/pci) — "
+                  f"hot-removed or renumbered; will be cleaned from registry",
+                  file=sys.stderr)
+            missing.append(pci)
             continue
         try:
             r = subprocess.run(
@@ -13263,16 +13285,38 @@ def main():
             )
             if r.returncode == 0:
                 print(f"netgen-dpdk-rebind: {pci} → {driver}")
+                succeeded.append(pci)
             else:
                 print(f"netgen-dpdk-rebind: FAILED {pci} → {driver}: "
                       f"{r.stderr.strip() or r.stdout.strip()}",
                       file=sys.stderr)
-                rc = 1
+                failed.append(pci)
         except Exception as e:
             print(f"netgen-dpdk-rebind: exception binding {pci}: {e}",
                   file=sys.stderr)
-            rc = 1
-    return rc
+            failed.append(pci)
+    # Prune missing entries from the registry so they don't trip
+    # every boot.
+    if missing:
+        try:
+            data["binds"] = [b for b in binds if b.get("pci") not in missing]
+            tmp = REGISTRY + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, REGISTRY)
+            print(f"netgen-dpdk-rebind: pruned {len(missing)} missing "
+                  f"entries from registry: {', '.join(missing)}")
+        except Exception as e:
+            print(f"netgen-dpdk-rebind: registry prune failed: {e}",
+                  file=sys.stderr)
+    # Unit exit policy: succeed unless EVERY bind failed AND we
+    # had no missing-prune to do. A partial success keeps
+    # downstream services unblocked.
+    print(f"netgen-dpdk-rebind: summary — ok={len(succeeded)} "
+          f"failed={len(failed)} pruned={len(missing)}")
+    if succeeded or missing:
+        return 0
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":
