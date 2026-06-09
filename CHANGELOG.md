@@ -2,6 +2,56 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.69] - 2026-06-09
+
+**`/api/admin/health` schema parity.** Audit H1.
+
+Full suite: **2,001 passed, 1 skipped** (+8 new tests). Crossed
+2,000 ✓.
+
+The admin console polls this endpoint every 30s. Over the last
+20 releases we added fields to `/api/dpdk/status` that never
+made it to the consolidated health endpoint — so the admin chip
+could (and did) show "healthy" while one of these subsystems
+was wrong.
+
+### New fields
+
+```json
+{
+  "reboot_needed": false,
+  "reboot_reasons": [],
+  "hugepages": {
+    "total": 1024,
+    "free": 1024,
+    "mounted": true,                  // v0.5.39 trap detection
+    "mount_point": "/dev/hugepages",
+    "per_size": {"2MB": 1024, "1GB": 0},          // v0.5.59
+    "per_node": {"node0": {"2MB": 512, "1GB": 0}, // v0.5.54
+                 "node1": {"2MB": 512, "1GB": 0}}
+  },
+  "dpdk": {
+    "installed": true,
+    "version": "23.11.0",
+    "target_version": "23.11",        // v0.5.61 target
+    "version_mismatch": false
+  },
+  "rdma_install_running": false,
+  "upgrade_running": false
+}
+```
+
+### New degraded-state checks
+
+The `issues` list now flags:
+* `host reboot required` (from the v0.5.51 marker)
+* `hugepages allocated but hugetlbfs not mounted` (v0.5.39 trap)
+* `DPDK X != target 23.11 (tx_worker may need rebuild)` (v0.5.61)
+
+### Tests
+
+8 new in `tests/test_v0569_admin_health_schema_parity.py`.
+
 ## [0.5.68] - 2026-06-09
 
 **Admin security fortification.** Audit findings C1 + C2 + C3 + C4.

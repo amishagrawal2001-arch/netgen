@@ -15779,6 +15779,77 @@ def api_admin_health():
     except Exception:
         out["hugepages"] = {"total": 0, "free": 0}
 
+    # v0.5.69 (audit H1): hugepages mount + 1GB + NUMA breakdown.
+    # Pre-fix the health endpoint only reported the global
+    # HugePages_Total from /proc/meminfo (which is the default-
+    # page-size count) — so 1GB hugepages (v0.5.59) were invisible
+    # and the mount-evaporated-on-reboot case (v0.5.39) wasn't
+    # caught either. Now mirror /api/dpdk/status's full picture.
+    try:
+        _mount_point = None
+        _hp_mounted = False
+        # Iterate /proc/mounts looking for hugetlbfs.
+        try:
+            with open("/proc/mounts", "r") as _mf:
+                for _ln in _mf:
+                    _parts = _ln.split()
+                    if len(_parts) >= 3 and _parts[2] == "hugetlbfs":
+                        _hp_mounted = True
+                        _mount_point = _parts[1]
+                        break
+        except Exception:
+            pass
+        out["hugepages"]["mounted"] = _hp_mounted
+        out["hugepages"]["mount_point"] = _mount_point
+    except Exception:
+        out["hugepages"]["mounted"] = False
+        out["hugepages"]["mount_point"] = None
+
+    # Per-page-size breakdown (2MB + 1GB).
+    try:
+        _per_size = {}
+        for _label, _leaf in (
+            ("2MB", "hugepages-2048kB"),
+            ("1GB", "hugepages-1048576kB"),
+        ):
+            _path = f"/sys/kernel/mm/hugepages/{_leaf}/nr_hugepages"
+            try:
+                with open(_path) as _hf:
+                    _per_size[_label] = int(_hf.read().strip())
+            except FileNotFoundError:
+                _per_size[_label] = 0
+            except Exception:
+                _per_size[_label] = None  # unknown — distinct from 0
+        out["hugepages"]["per_size"] = _per_size
+    except Exception:
+        pass
+
+    # Per-NUMA-node breakdown (v0.5.54 added per-node allocation;
+    # without surfacing it here the operator can't see if pages
+    # landed on the NIC's node).
+    try:
+        _per_node = {}
+        for _entry in os.listdir("/sys/devices/system/node"):
+            if _entry.startswith("node") and _entry[4:].isdigit():
+                _nid = _entry[4:]
+                _per_node_size = {}
+                for _label, _leaf in (
+                    ("2MB", "hugepages-2048kB"),
+                    ("1GB", "hugepages-1048576kB"),
+                ):
+                    _p = f"/sys/devices/system/node/{_entry}/hugepages/{_leaf}/nr_hugepages"
+                    try:
+                        with open(_p) as _hf:
+                            _per_node_size[_label] = int(_hf.read().strip())
+                    except FileNotFoundError:
+                        _per_node_size[_label] = 0
+                    except Exception:
+                        _per_node_size[_label] = None
+                _per_node[f"node{_nid}"] = _per_node_size
+        out["hugepages"]["per_node"] = _per_node
+    except Exception:
+        pass
+
     # tx_worker binary.
     # v0.5.67: align candidates with /api/dpdk/status (which has
     # always included /usr/local/bin/tx_worker). Pre-fix the admin
@@ -15805,10 +15876,76 @@ def api_admin_health():
             out["tx_worker"] = {"present": True, "path": p}
             break
 
-    # Install state
+    # Install state. v0.5.69 (audit H1): also report
+    # rdma_install_running and upgrade_running. Pre-fix the
+    # admin chip flipped green while a wheel upgrade was still
+    # in-flight (the v0.5.22 srv06 wedge ancestor) — operator
+    # might queue a destructive action against a half-upgraded
+    # site-packages tree.
     proc = _ADMIN_INSTALL_STATE.get("process")
     out["install_running"] = bool(proc and proc.poll() is None)
     out["install_log_path"] = _ADMIN_INSTALL_STATE.get("log_path")
+
+    try:
+        _rdma_proc = _ADMIN_INSTALL_RDMA_STATE.get("process")
+        out["rdma_install_running"] = bool(
+            _rdma_proc and _rdma_proc.poll() is None
+        )
+    except Exception:
+        out["rdma_install_running"] = False
+
+    try:
+        _upg_proc = _ADMIN_UPGRADE_STATE.get("process")
+        # Match api_admin_upgrade_wheel_log: even after proc
+        # exits, the detached systemd unit may still be running.
+        # Use the per-unit state probe if we have a unit name.
+        _unit = _ADMIN_UPGRADE_STATE.get("systemd_unit")
+        _upg_running = bool(_upg_proc and _upg_proc.poll() is None)
+        if _unit and not _upg_running:
+            try:
+                _upg_running = (
+                    _systemd_unit_state(_unit).get("active") is True
+                )
+            except Exception:
+                pass
+        out["upgrade_running"] = _upg_running
+    except Exception:
+        out["upgrade_running"] = False
+
+    # v0.5.69 (audit H1): surface the reboot-required marker that
+    # /api/dpdk/status has read since v0.5.51. Pre-fix an operator
+    # who edited IOMMU via /api/dpdk/iommu got `health: healthy`
+    # back from the admin chip and never knew the reboot was
+    # required to activate `intel_iommu=on`.
+    _reboot_needed = False
+    _reboot_reasons = []
+    for _marker_path in ("/run/netgen-reboot-required",
+                          "/var/run/netgen-reboot-required"):
+        if os.path.isfile(_marker_path):
+            _reboot_needed = True
+            try:
+                with open(_marker_path) as _mf:
+                    for _ln in _mf:
+                        _ln = _ln.strip()
+                        if _ln.startswith("#   - "):
+                            _reboot_reasons.append(_ln[len("#   - "):])
+            except Exception:
+                pass
+            break
+    out["reboot_needed"] = _reboot_needed
+    out["reboot_reasons"] = _reboot_reasons
+
+    # v0.5.69 (audit H1): version-vs-target match for libdpdk.
+    # The install_dpdk.sh script targets 23.11 (v0.5.61 added the
+    # mismatch warning to the install path). Surface the same
+    # check at runtime so an operator who updated libdpdk via
+    # apt without rebuilding tx_worker sees a degraded state.
+    out["dpdk"]["target_version"] = "23.11"
+    _installed_ver = (out["dpdk"].get("version") or "").strip()
+    out["dpdk"]["version_mismatch"] = bool(
+        _installed_ver
+        and not _installed_ver.startswith("23.11")
+    )
 
     # Overall health verdict for the client's TGen status LED. The client
     # shows green when reachable+healthy, amber when reachable but
@@ -15824,16 +15961,34 @@ def api_admin_health():
     issues = []
     if out["install_running"]:
         issues.append("install/build in progress")
+    if out.get("rdma_install_running"):
+        issues.append("RDMA install in progress")
+    if out.get("upgrade_running"):
+        issues.append("wheel upgrade in progress")
+    if out.get("reboot_needed"):
+        issues.append("host reboot required")
     if out["dpdk"].get("installed"):
-        # Only the two high-signal, low-false-positive DPDK failure modes —
-        # both are the actual cause of the real "stream starts and stops"
-        # incident. vfio is deliberately NOT checked here: vfio_pci is
+        # Only the high-signal, low-false-positive DPDK failure modes.
+        # vfio is deliberately NOT checked here: vfio_pci is
         # frequently a builtin the module probe can't see, which would
         # produce spurious amber on a perfectly healthy DPDK host.
         if int(out["hugepages"].get("total", 0) or 0) == 0:
             issues.append("DPDK installed but no hugepages allocated")
+        elif not out["hugepages"].get("mounted"):
+            # v0.5.69 (audit H1): hugepages allocated but mount
+            # evaporated — DPDK will fail with "no free hugepages"
+            # despite total>0. Catches the v0.5.39 trap.
+            issues.append("hugepages allocated but hugetlbfs not mounted")
         if not out["tx_worker"].get("present"):
             issues.append("DPDK installed but tx_worker binary missing")
+        if out["dpdk"].get("version_mismatch"):
+            # v0.5.69 (audit H1): libdpdk != 23.11 target →
+            # tx_worker may have ABI mismatch. Pre-fix this only
+            # warned at install time.
+            issues.append(
+                f"DPDK {out['dpdk'].get('version')} != target 23.11 "
+                f"(tx_worker may need rebuild)"
+            )
     out["issues"] = issues
     out["degraded"] = bool(issues)
     out["health"] = "degraded" if issues else "healthy"
