@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ostg-trafficgen"
-version = "0.5.48"
+version = "0.5.49"
 description = "OSTG Traffic Generator - Advanced Network Traffic Generation with BGP/OSPF Support"
 readme = "README.md"
 requires-python = ">=3.9"
@@ -71,6 +71,12 @@ py-modules = ["multithreaded_traffic_gen", "run_tgen_client", "run_tgen_server",
     "tx_worker/*.h",
     "tx_worker/meson.build",
 ]
+# v0.5.49: bundle netgen-upgrade so the running server can
+# self-heal /opt/netgen-server/bin/netgen-upgrade on startup.
+# Without this, fixes to the upgrade-driver script (v0.5.45's
+# --force-reinstall → --upgrade) never reach an installed
+# tarball because pip can't touch files outside the venv.
+"resources.tarball" = ["netgen-upgrade", "__init__.py"]
 "ostg_docker" = ["**/*"]
 
 [tool.pytest.ini_options]

@@ -2,6 +2,80 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.49] - 2026-06-09
+
+**Self-heal `/opt/netgen-server/bin/netgen-upgrade` from the
+wheel-bundled copy.** Operator-reported on srv06 after upgrading
+v0.5.47 → v0.5.48 via the admin UI:
+
+> seems upgrade still doing uninstall and install.
+> [INFO] $ pip install --force-reinstall --no-cache-dir <wheel>
+> Attempting uninstall: pytz ... (65 packages)
+
+v0.5.45 was supposed to fix exactly this — drop
+`--force-reinstall`, use `--upgrade` instead. The fix landed in
+`scripts/tarball/netgen-upgrade` in the source repo. But the
+script that ACTUALLY runs upgrades on srv06 is at
+`/opt/netgen-server/bin/netgen-upgrade`, written by the tarball
+installer at server-install time months ago. **Wheel installs
+rewrite the venv's site-packages but never touch files outside
+the venv.** So v0.5.45's fix sat in the wheel doing nothing
+while the months-old --force-reinstall script kept running on
+every upgrade.
+
+Full suite: **1,858 passed, 1 skipped** (+11 new tests).
+
+### Fix — bundle + self-heal
+
+1. **Bundle in the wheel.** Copy
+   `scripts/tarball/netgen-upgrade` →
+   `resources/tarball/netgen-upgrade` and add to
+   `pyproject.toml`'s package-data so it ships with the wheel.
+
+2. **Self-heal at startup.**
+   `_ensure_netgen_upgrade_script_deployed()` runs at server
+   boot:
+   - Reads the bundled copy via `importlib.resources.files()`
+   - SHA-256-compares against `/opt/netgen-server/bin/netgen-upgrade`
+   - If different: backup old → `<dst>.bak.<sha8>`, atomic write
+     new (`tmp` + `os.replace`), `chmod 0o755`
+   - Idempotent: identical content = no-op (skips on every
+     subsequent restart)
+
+3. **Sync test** pins `scripts/tarball/netgen-upgrade` and
+   `resources/tarball/netgen-upgrade` byte-identical. A future
+   edit that touches one without the other fails CI.
+
+### Catch-22 disclosure
+
+**The v0.5.48 → v0.5.49 upgrade itself will STILL be noisy.**
+The self-heal runs in the NEW server process AFTER the upgrade
+already landed via the OLD script. There's no way around this —
+the script can't update itself mid-execution. But once v0.5.49
+is up, the script on disk is refreshed, and v0.5.49 → v0.5.50
+(and every upgrade after) will be clean:
+
+| Upgrade | Self-heal status | Upgrade behaviour |
+|---|---|---|
+| 0.5.47 → 0.5.48 | old script | noisy (uninstall+reinstall 65 pkgs) |
+| 0.5.48 → 0.5.49 | **last noisy one** | old script runs, self-heal refreshes for next time |
+| 0.5.49 → 0.5.50 | refreshed | clean — only changed packages touched |
+
+### Tests
+
+11 new in `tests/test_v0549_netgen_upgrade_selfheal.py`:
+* Wheel ships `resources/tarball/netgen-upgrade`
+* `resources/tarball/` is a discoverable package
+* Sync test: scripts/tarball/ and resources/tarball/ copies are byte-identical
+* `pyproject.toml` lists `resources.tarball` in package-data
+* Helper `_ensure_netgen_upgrade_script_deployed()` defined
+* Helper called from startup (not dead code)
+* Self-heal uses SHA-256 compare (skips when in sync)
+* Old script backed up before overwrite (`.bak.<sha8>`)
+* Write is atomic via `os.replace()`
+* Written script gets `chmod 0o755`
+* Version pinned at ≥ 0.5.49
+
 ## [0.5.48] - 2026-06-08
 
 **CRITICAL — `/api/dpdk/load_modules` was reporting EVERY

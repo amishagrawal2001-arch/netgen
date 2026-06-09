@@ -14866,6 +14866,125 @@ def _resolve_dpdk_bind_script():
     return candidates[0]
 
 
+def _ensure_netgen_upgrade_script_deployed():
+    """v0.5.49: self-heal /opt/netgen-server/bin/netgen-upgrade
+    from the wheel-bundled copy.
+
+    Pre-fix problem (operator-reported on srv06 after v0.5.48
+    landed): the v0.5.45 `--force-reinstall` → `--upgrade` fix
+    in `scripts/tarball/netgen-upgrade` lived only in the source
+    repo. The script that ACTUALLY runs upgrades on srv06 is
+    `/opt/netgen-server/bin/netgen-upgrade`, written by the
+    tarball installer at server-install time months ago. Pip
+    wheel install rewrites the venv's site-packages but NEVER
+    touches files outside the venv — so the v0.5.45 fix would
+    never reach an installed tarball without something doing the
+    sync.
+
+    Result: every upgrade still ran with --force-reinstall,
+    uninstalling + reinstalling 65 unchanged packages on every
+    bump (~3 min of pointless churn).
+
+    Fix: the wheel now ships `resources/tarball/netgen-upgrade`
+    as package data. At startup we compare its content against
+    what's at `/opt/netgen-server/bin/netgen-upgrade` and replace
+    if different. Backup of the old version goes to
+    `/opt/netgen-server/bin/netgen-upgrade.bak.<sha8>` so the
+    operator can diff or revert if they'd customised it.
+
+    Idempotent: SHA-256 comparison means no-op if already in
+    sync. Best-effort: any failure is logged and swallowed so a
+    permissions issue or read-only mount doesn't break server
+    startup.
+
+    Catch-22 note: the CURRENT upgrade can't benefit (the
+    self-heal runs in the new server process AFTER the upgrade
+    landed via the old script). The NEXT upgrade reads the
+    refreshed script. So the first v0.5.49+ deployment still
+    sees the noisy --force-reinstall behaviour; subsequent ones
+    are clean.
+    """
+    import hashlib
+    dst = "/opt/netgen-server/bin/netgen-upgrade"
+    if not os.path.isdir(os.path.dirname(dst)):
+        # Not a tarball install — nothing to self-heal.
+        logging.debug(
+            f"[NETGEN-UPGRADE SELFHEAL] {os.path.dirname(dst)} "
+            f"missing; not a tarball install — skipping"
+        )
+        return
+    # Read the wheel-bundled copy via importlib.resources. This
+    # works whether netgen runs from the installed wheel or from
+    # a dev checkout, because either way `resources.tarball` is a
+    # discoverable package.
+    try:
+        try:
+            # py3.9+: importlib.resources.files()
+            from importlib.resources import files as _ir_files
+            bundled_bytes = (
+                _ir_files("resources.tarball")
+                .joinpath("netgen-upgrade")
+                .read_bytes()
+            )
+        except Exception:
+            # Fallback for older python or odd packaging.
+            import pkgutil
+            bundled_bytes = pkgutil.get_data(
+                "resources.tarball", "netgen-upgrade"
+            )
+            if bundled_bytes is None:
+                raise RuntimeError("pkgutil.get_data returned None")
+    except Exception as e:
+        logging.warning(
+            f"[NETGEN-UPGRADE SELFHEAL] couldn't read bundled "
+            f"copy: {e} — skipping self-heal"
+        )
+        return
+    bundled_sha = hashlib.sha256(bundled_bytes).hexdigest()
+    existing_bytes = b""
+    if os.path.isfile(dst):
+        try:
+            with open(dst, "rb") as f:
+                existing_bytes = f.read()
+        except Exception as e:
+            logging.warning(
+                f"[NETGEN-UPGRADE SELFHEAL] couldn't read {dst}: "
+                f"{e} — will try to replace"
+            )
+    existing_sha = hashlib.sha256(existing_bytes).hexdigest()
+    if existing_sha == bundled_sha:
+        logging.debug(
+            f"[NETGEN-UPGRADE SELFHEAL] {dst} already in sync "
+            f"(sha {bundled_sha[:8]})"
+        )
+        return
+    # Out of date — back up and replace.
+    try:
+        if existing_bytes:
+            backup_path = f"{dst}.bak.{existing_sha[:8]}"
+            if not os.path.exists(backup_path):
+                with open(backup_path, "wb") as f:
+                    f.write(existing_bytes)
+                logging.info(
+                    f"[NETGEN-UPGRADE SELFHEAL] backed up old "
+                    f"version to {backup_path}"
+                )
+        # Atomic write: write to temp then rename.
+        tmp = f"{dst}.new"
+        with open(tmp, "wb") as f:
+            f.write(bundled_bytes)
+        os.chmod(tmp, 0o755)
+        os.replace(tmp, dst)
+        logging.info(
+            f"[NETGEN-UPGRADE SELFHEAL] updated {dst} "
+            f"(old sha {existing_sha[:8]} → new sha {bundled_sha[:8]})"
+        )
+    except Exception as e:
+        logging.warning(
+            f"[NETGEN-UPGRADE SELFHEAL] couldn't write {dst}: {e}"
+        )
+
+
 def _ensure_dpdk_tree_deployed():
     """Sync /opt/netgen/resources/dpdk/ from the wheel's pip-install
     location. Always overwrites — wheel is the canonical source.
@@ -18628,6 +18747,18 @@ def main(argv=None):
         _ensure_frr_assets_deployed()
     except Exception as e:
         logging.warning(f"[STARTUP FRR SELFHEAL] Unexpected error: {e}")
+
+    # v0.5.49: self-heal /opt/netgen-server/bin/netgen-upgrade
+    # from the wheel-bundled copy. Without this, fixes shipped in
+    # `scripts/tarball/netgen-upgrade` (like v0.5.45's drop of
+    # --force-reinstall) only exist in the wheel's source and
+    # never reach the actual upgrade script on the server.
+    try:
+        _ensure_netgen_upgrade_script_deployed()
+    except Exception as e:
+        logging.warning(
+            f"[NETGEN-UPGRADE SELFHEAL] Unexpected error: {e}"
+        )
 
     # If a wheel upgrade changed Dockerfile.frr (e.g. v0.2.27 adding
     # dhclient/dnsmasq for DHCP), the running netgen-frr image is stale —

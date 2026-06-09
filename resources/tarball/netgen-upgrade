@@ -1,0 +1,226 @@
+#!/usr/bin/env python3
+"""netgen-upgrade — install a new wheel into the bundled venv.
+
+The wheel-based routine-upgrade path. Operator-stated requirement
+(v0.5.0 design decision):
+
+  tarball = fresh install / major version bump
+  wheel   = routine patch & minor upgrades  ← this script
+
+Usage:
+  sudo netgen-upgrade /path/to/ostg_trafficgen-0.5.1-py3-none-any.whl
+
+What this script does:
+
+  1. Verify root.
+  2. Verify the wheel path exists and is readable.
+  3. Detect the install root (parent.parent of this script, just
+     like netgen-install).
+  4. pip install --upgrade --force-reinstall <wheel> INSIDE the
+     bundled venv. --force-reinstall preserves the v0.4.8 lesson:
+     pip must not silently no-op when it thinks the version matches.
+  5. Verify the new version's deps still import (in case the wheel
+     pulled in new mandatory deps the bundled venv doesn't have).
+  6. systemctl restart netgen-server so the new code loads.
+  7. Verify /api/health responds with the expected new version.
+
+Why this is dramatically simpler than netgen-install:
+
+  - No system pip touched. The bundled venv has its own pip.
+  - No PEP 668 / EXTERNALLY-MANAGED to escape.
+  - No Docker build, no systemd unit changes, no PATH symlinks.
+  - The systemd unit's ExecStart still points at the same path
+    (<install_root>/netgen-venv/bin/ostg-server); pip replacing the
+    underlying script is transparent to systemd.
+
+This script is intentionally KEPT SHORT — most operator upgrades
+should take <30 seconds vs the multi-minute fresh install.
+"""
+from __future__ import annotations
+
+import logging
+import os
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+
+SYSTEMD_UNIT_NAME = "netgen-server.service"
+SERVER_PORT = 5050
+
+
+logger = logging.getLogger("netgen-upgrade")
+
+
+def _setup_logging() -> None:
+    logger.setLevel(logging.INFO)
+    sh = logging.StreamHandler(sys.stdout)
+    sh.setFormatter(logging.Formatter("[%(levelname)s] %(message)s"))
+    logger.addHandler(sh)
+
+
+def _run(cmd: list[str], *, check: bool = True,
+         capture: bool = False) -> subprocess.CompletedProcess:
+    logger.info(f"$ {' '.join(cmd)}")
+    return subprocess.run(cmd, check=check, capture_output=capture, text=capture)
+
+
+def _require_root() -> None:
+    if os.geteuid() != 0:
+        logger.error("netgen-upgrade must run as root. Retry with: sudo netgen-upgrade <wheel>")
+        sys.exit(1)
+
+
+def _resolve_install_root(argv: list[str]) -> Path:
+    if "--install-root" in argv:
+        i = argv.index("--install-root")
+        if i + 1 < len(argv):
+            return Path(argv[i + 1]).resolve()
+    # __file__ is .../bin/netgen-upgrade; parent.parent is the root.
+    return Path(__file__).resolve().parent.parent
+
+
+def _verify_new_version(timeout_s: int = 30) -> bool:
+    """Confirm the server came back up post-restart."""
+    url = f"http://localhost:{SERVER_PORT}/api/health"
+    deadline = time.monotonic() + timeout_s
+    logger.info(f"[VERIFY] Waiting for {url}...")
+    while time.monotonic() < deadline:
+        try:
+            with urllib.request.urlopen(url, timeout=2) as r:
+                body = r.read().decode("utf-8", "replace")
+                if "netgen_version" in body:
+                    logger.info(f"[VERIFY] ✓ Server back up: {body.strip()}")
+                    return True
+        except Exception:
+            pass
+        time.sleep(2)
+    logger.error(
+        f"[VERIFY] Server did not respond on {url} within {timeout_s}s. "
+        f"Check: journalctl -u {SYSTEMD_UNIT_NAME} -n 50 --no-pager"
+    )
+    return False
+
+
+def main() -> int:
+    _setup_logging()
+    _require_root()
+
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+
+    # First non-flag arg is the wheel path.
+    wheel_path: str | None = None
+    for a in argv:
+        if a.startswith("--"):
+            continue
+        wheel_path = a
+        break
+    if not wheel_path:
+        logger.error("No wheel path supplied. Usage: netgen-upgrade <wheel>")
+        return 1
+    wheel = Path(wheel_path).resolve()
+    if not wheel.exists() or not wheel.is_file():
+        logger.error(f"Wheel not found or not a file: {wheel}")
+        return 1
+    if not wheel.suffix == ".whl":
+        logger.error(f"Not a wheel file (expected .whl extension): {wheel}")
+        return 1
+
+    install_root = _resolve_install_root(argv)
+    venv_pip = install_root / "netgen-venv" / "bin" / "pip"
+    venv_py = install_root / "netgen-venv" / "bin" / "python"
+    if not venv_pip.exists():
+        logger.error(
+            f"Bundled venv pip not found at {venv_pip}. Is this a "
+            f"v0.5.0 tarball install? Pre-v0.5.0 installs (system "
+            f"pip) should use the legacy upgrade flow."
+        )
+        return 1
+
+    logger.info(f"[STARTUP] Install root: {install_root}")
+    logger.info(f"[STARTUP] Wheel:        {wheel}")
+
+    # v0.5.45: dropped --force-reinstall in favour of --upgrade.
+    # Pre-fix, every wheel upgrade uninstalled + reinstalled all
+    # 67 transitive deps — the operator saw a 100+ line log of
+    # `Successfully uninstalled X-Y.Z` followed by
+    # `Successfully installed X-Y.Z` for ~65 packages that DIDN'T
+    # change version. Just wasted time + disk churn + log noise.
+    #
+    # Real operator complaint (Jun 8 2026, v0.5.43 → v0.5.44):
+    # "seems when upgrading the new version it uninstalls first
+    #  then installs again.. pls check if this is necessary?"
+    #
+    # Actual changed-version packages on that upgrade: 2 of 67
+    # (ostg-trafficgen + Flask-Cors).
+    #
+    # `pip install --upgrade <wheel>` with the default
+    # `--upgrade-strategy=only-if-needed` does the right thing:
+    # only touches packages whose installed version doesn't
+    # satisfy the new constraint. Untouched deps keep their
+    # existing site-packages entries.
+    #
+    # Why --force-reinstall was there originally (v0.4.8):
+    # if an operator REBUILT a wheel with the same version
+    # number (typical lab-dev workflow), pip would no-op because
+    # the installed version matched. The fix made every install
+    # re-fetch + replace. But operator-shipped upgrades always
+    # bump the version, so the lab-dev case doesn't apply.
+    #
+    # For the rare "I rebuilt a same-version wheel" case the
+    # operator can pass --force-reinstall as an explicit flag:
+    #   sudo netgen-upgrade --force-reinstall my-rebuilt.whl
+    force_reinstall = "--force-reinstall" in argv
+    pip_cmd = [str(venv_pip), "install", "--no-cache-dir"]
+    if force_reinstall:
+        pip_cmd.append("--force-reinstall")
+        logger.info("[INSTALL] --force-reinstall requested via CLI")
+    else:
+        pip_cmd.append("--upgrade")
+    pip_cmd.append(str(wheel))
+    try:
+        _run(pip_cmd, check=True)
+    except subprocess.CalledProcessError as exc:
+        logger.error(f"pip install failed: {exc}")
+        return 2
+
+    # Post-install verify (mirrors v0.4.8 install_ostg sanity check):
+    # core deps must still be importable from the venv. New wheels
+    # SHOULDN'T introduce missing deps (we'd have caught that in
+    # CI) but the check is cheap insurance.
+    try:
+        _run(
+            [str(venv_py), "-c",
+             "import flask, scapy.all, requests, psutil, run_tgen_server"],
+            check=True, capture=True,
+        )
+        logger.info("[VERIFY] ✓ Imports still work post-upgrade")
+    except subprocess.CalledProcessError as exc:
+        logger.error(
+            f"Post-upgrade import check failed:\n{exc.stderr or exc.stdout}"
+        )
+        logger.error(
+            "The wheel installed but the venv is now broken. Roll "
+            "back by reinstalling the previous wheel, or do a full "
+            "tarball reinstall."
+        )
+        return 3
+
+    # Restart the unit so the new code is loaded.
+    _run(["systemctl", "restart", SYSTEMD_UNIT_NAME], check=True)
+
+    if _verify_new_version():
+        logger.info("=" * 60)
+        logger.info("netgen-server upgrade complete.")
+        logger.info("=" * 60)
+        return 0
+    return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
