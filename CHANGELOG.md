@@ -2,6 +2,31 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.71] - 2026-06-09
+
+**Operability batch — hugepages lock, rc=75 surface, install
+mutex, kill switch, log pruning.** Audit M1+M2+M3+M4+M5.
+
+Full suite: **2,018 passed, 1 skipped** (+7 new tests).
+
+* **M1** `/api/dpdk/hugepages` non-blocking try-acquires
+  `_DPDK_BIND_LOCK` → 409 on contention instead of racing the
+  sysfs write. `finally:` releases.
+* **M2** `/api/admin/install_dpdk/log` now reports
+  `reboot_required: true` and `success: true` when the script
+  exits 75 (v0.5.51's EX_TEMPFAIL "success, reboot needed"
+  convention). Operator sees green "reboot required" instead
+  of red "rc=75".
+* **M3** install_dpdk and install_rdma 409 each other when the
+  other is running (dpkg-lock contention otherwise wedges).
+* **M4** `?force=1` (or `{"force": true}`) SIGTERMs a wedged
+  install/upgrade and proceeds with the new spawn. Recovery
+  without SSH.
+* **M5** `/tmp/netgen_install_*.log` older than 7 days pruned on
+  spawn. Best-effort.
+
+7 new tests in `tests/test_v0571_operability.py`.
+
 ## [0.5.70] - 2026-06-09
 
 **Input validation hardening on 3 admin endpoints.** Audit

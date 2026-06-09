@@ -13921,9 +13921,22 @@ def dpdk_verify():
 @require_role("admin")  # v0.5.68 (C1): sysfs write + mount
 def dpdk_hugepages():
     """Configure hugepages."""
+    # v0.5.71 (audit M1): serialise hugepages allocation. Pre-fix
+    # two concurrent allocations from different browser tabs raced
+    # the sysfs write — loser silently overwrote winner. Use a
+    # blocking try-acquire on the existing _DPDK_BIND_LOCK so a
+    # racing request returns 409 instead of queueing for minutes.
+    if not _DPDK_BIND_LOCK.acquire(blocking=False):
+        return jsonify({
+            "success": False,
+            "error": (
+                "another hugepages or bind operation is in flight; "
+                "wait for it to complete then retry"
+            ),
+        }), 409
     try:
         import subprocess
-        
+
         data = request.get_json() or {}
         num_pages = data.get("num_pages")
         page_size = data.get("page_size", "2MB")
@@ -14303,6 +14316,14 @@ def dpdk_hugepages():
     except Exception as e:
         logging.error(f"[DPDK HUGEPAGES] Error: {e}")
         return jsonify({"error": str(e)}), 500
+    finally:
+        # v0.5.71 (audit M1): release the lock acquired at the
+        # top of the handler. Released here so an exception path
+        # doesn't leak the lock and lock out future requests.
+        try:
+            _DPDK_BIND_LOCK.release()
+        except Exception:
+            pass
 
 
 def _parse_dpdk_devbind_status(output):
@@ -16305,12 +16326,68 @@ def api_admin_install_dpdk():
     """
     import datetime as _dt
 
+    # v0.5.71 (audit M4): kill switch. Pre-fix a wedged install
+    # (pip stalled on flaky mirror, apt waiting on dpkg lock from
+    # another process) left the endpoint in 409 forever; only
+    # SSH could recover. With `?force=1` we SIGTERM the previous
+    # process, wait, then proceed. We also let DELETE on this
+    # route do just the kill without restarting.
     proc = _ADMIN_INSTALL_STATE.get("process")
+    force = (
+        request.args.get("force") == "1"
+        or (request.get_json(silent=True) or {}).get("force") is True
+    )
     if proc and proc.poll() is None:
+        if force:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            logging.warning(
+                "[ADMIN INSTALL DPDK] force-killed previous "
+                "install process (was wedged?)"
+            )
+        else:
+            return jsonify({
+                "error": "DPDK install is already running",
+                "log_path": _ADMIN_INSTALL_STATE.get("log_path"),
+                "hint": "pass ?force=1 to terminate the wedged install",
+            }), 409
+
+    # v0.5.71 (audit M3): mutual exclusion with install_rdma.
+    # Both invoke apt-get install which contends on dpkg lock;
+    # parallel runs block each other for minutes and the
+    # progress UI looks frozen.
+    rdma_proc = _ADMIN_INSTALL_RDMA_STATE.get("process")
+    if rdma_proc and rdma_proc.poll() is None:
         return jsonify({
-            "error": "DPDK install is already running",
-            "log_path": _ADMIN_INSTALL_STATE.get("log_path"),
+            "error": (
+                "RDMA install is in progress; both install paths "
+                "contend on the dpkg lock. Wait for RDMA to "
+                "finish, then retry."
+            ),
+            "rdma_log_path": _ADMIN_INSTALL_RDMA_STATE.get("log_path"),
         }), 409
+
+    # v0.5.71 (audit M5): prune /tmp install logs older than 7
+    # days. Pre-fix one log file per install accumulated forever
+    # until reboot. Best-effort; failures are non-fatal.
+    try:
+        import glob as _glob
+        import time as _time
+        _now = _time.time()
+        for _old in _glob.glob("/tmp/netgen_install_*.log"):
+            try:
+                if _now - os.path.getmtime(_old) > 7 * 86400:
+                    os.unlink(_old)
+            except Exception:
+                pass
+    except Exception:
+        pass
 
     # ALWAYS sync /opt/netgen/resources/dpdk/ from the wheel before
     # launching the script — the wheel is the canonical source.
@@ -16695,6 +16772,16 @@ def api_admin_install_dpdk_log():
     response = {
         "running": running,
         "return_code": return_code,
+        # v0.5.71 (audit M2): surface install_dpdk.sh's
+        # convention of exiting 75 (EX_TEMPFAIL) on "success but
+        # reboot required" (v0.5.51). Pre-fix the client got
+        # "exit code 75" red-banner; now it can render
+        # "✓ install OK — reboot required" distinctly.
+        "reboot_required": return_code == 75,
+        "success": (
+            return_code == 0 or return_code == 75
+            if return_code is not None else None
+        ),
         "log_path": log_path,
         "started_at": started_at,
         "finished_at": _ADMIN_INSTALL_STATE.get("finished_at"),
@@ -16893,11 +16980,44 @@ def api_admin_install_rdma():
     """
     import datetime as _dt
 
+    # v0.5.71 (audit M3 + M4): mirror install_dpdk's mutex +
+    # force flag. RDMA install also runs `apt-get install`, so
+    # parallel runs with install_dpdk wedge on dpkg-lock.
     proc = _ADMIN_INSTALL_RDMA_STATE.get("process")
+    force = (
+        request.args.get("force") == "1"
+        or (request.get_json(silent=True) or {}).get("force") is True
+    )
     if proc and proc.poll() is None:
+        if force:
+            try:
+                proc.terminate()
+                proc.wait(timeout=5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            logging.warning(
+                "[ADMIN INSTALL RDMA] force-killed previous install"
+            )
+        else:
+            return jsonify({
+                "error": "RDMA install is already running",
+                "log_path": _ADMIN_INSTALL_RDMA_STATE.get("log_path"),
+                "hint": "pass ?force=1 to terminate the wedged install",
+            }), 409
+
+    # Mutual exclusion with install_dpdk (dpkg-lock contention).
+    dpdk_proc = _ADMIN_INSTALL_STATE.get("process")
+    if dpdk_proc and dpdk_proc.poll() is None:
         return jsonify({
-            "error": "RDMA install is already running",
-            "log_path": _ADMIN_INSTALL_RDMA_STATE.get("log_path"),
+            "error": (
+                "DPDK install is in progress; both install paths "
+                "contend on the dpkg lock. Wait for DPDK to "
+                "finish, then retry."
+            ),
+            "dpdk_log_path": _ADMIN_INSTALL_STATE.get("log_path"),
         }), 409
 
     # Same self-heal pattern as install_dpdk — wheel is the canonical
