@@ -2,6 +2,93 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.47] - 2026-06-08
+
+**Admin console — kernel-driven NICs now get a Bind-to-DPDK
+button, not a dangerous Unbind button.** Operator on srv06 saw
+this in the admin console interface table:
+
+| Interface | Driver | State | Action button |
+|---|---|---|---|
+| ens10f3 | tg3 | **Unbound** (yellow) | **Unbind** |
+| ens10f1 | tg3 | **Unbound** (yellow) | **Unbind** |
+| ens3f0np0 | mlx5_core | DPDK-ready | no bind needed |
+
+Two bugs:
+
+1. **Wrong label.** A NIC with `tg3` kernel driver loaded is
+   NOT unbound. The state column was misreporting because
+   `/api/dpdk/interfaces` returns `status: 'unbound'` for ANY
+   NIC not bound to vfio-pci/uio_pci_generic — which includes
+   every kernel-driven NIC.
+
+2. **Dangerous action.** Clicking "Unbind" would hit
+   `/api/dpdk/unbind`, detaching the NIC from its current
+   driver. For a tg3-driven NIC, that leaves it driverless —
+   the interface goes down and stays down until reboot or
+   manual rebind.
+
+Full suite: **1,839 passed, 1 skipped** (+8 new tests).
+
+### Fix
+
+Reordered `ifaceState()` checks in the admin HTML JS:
+
+1. **Bifurcated kernel drivers** (mlx5_core, mlx4_core, idxd,
+   ioatdma) → DPDK-ready, no action button
+2. **vfio-pci / uio_pci_generic / status=dpdk-bound** →
+   DPDK-bound, **Unbind** action
+3. **NEW: any other real kernel driver** → `Kernel (tg3)` (or
+   whichever), **Bind to DPDK** action
+4. **Truly unbound** (no driver at all) → `Unbound (no driver)`,
+   **Bind to DPDK** action (NOT unbind — can't unbind nothing)
+
+The pre-fix `if (status === 'unbound')` check was too greedy:
+it captured both genuinely-driverless NICs AND kernel-driven
+NICs. The new branch checks the effective kernel driver first.
+
+### No-PMD warning for tg3 / e1000 / e100
+
+Stock DPDK doesn't have a PMD for the Tigon3-era Broadcom
+chips (tg3) or the old Intel 8254x/82559 chips (e1000/e100).
+vfio-pci will still claim them — the bind succeeds
+mechanically — but no DPDK app will recognize them, so
+testpmd / tx_worker would say "no usable device found".
+
+To prevent the operator from chasing this for an hour, the
+Bind button now shows a hover tooltip:
+
+> tg3-driven NIC has no DPDK PMD in stock DPDK — vfio-pci bind
+> will succeed but DPDK apps won't recognise the device.
+
+The button still renders — the operator may have a custom
+PMD or be testing something specific — but they see the
+warning BEFORE clicking.
+
+### What srv06 will look like after upgrade
+
+| Interface | Driver | State | Action button |
+|---|---|---|---|
+| ens10f3 | tg3 | **Kernel (tg3)** (red) | **Bind to DPDK** (with tooltip warning) |
+| ens10f1 | tg3 | **Kernel (tg3)** (red) | **Bind to DPDK** (with tooltip warning) |
+| ens3f0np0 | mlx5_core | DPDK-ready | no bind needed |
+
+The Mellanox 100G NICs (which are the actual DPDK targets on
+srv06) stay unchanged. The Broadcom management NICs now
+correctly show their actual state.
+
+### Tests
+
+8 new in `tests/test_v0547_iface_state_kernel_driver_priority.py`:
+* Kernel-driven NIC routes to `action: 'bind'` (not `'unbind'`)
+* Legacy `status === 'unbound' → action: 'unbind'` branch GONE
+* `effectiveKDriver` check runs BEFORE `if (status === 'unbound')`
+* Truly-unbound branch (no driver at all) gets `'bind'` action
+* NO_PMD set includes tg3 with `DPDK PMD` warning text
+* Bind button renders `s.hint` as `title=` tooltip
+* vfio-pci NICs still get Unbind button (regression guard)
+* Version pinned at ≥ 0.5.47
+
 ## [0.5.46] - 2026-06-08
 
 **`/api/dpdk/load_modules` surfaces the actual modprobe error.**

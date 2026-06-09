@@ -16870,11 +16870,52 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       if (driver === 'vfio-pci' || driver === 'uio_pci_generic' || status === 'dpdk-bound') {
         return { label: 'DPDK (' + driver + ')', pillClass: 'ok', action: 'unbind' };
       }
-      if (status === 'unbound' || (!driver && iface.kernel_driver)) {
-        return { label: 'Unbound', pillClass: 'warn', action: 'unbind' };
+      // v0.5.47: kernel-driven NICs (tg3, e1000e, bnxt_en, ixgbe,
+      // i40e, etc.) take priority over the `status === 'unbound'`
+      // check below. /api/dpdk/interfaces returns status='unbound'
+      // for ANY NIC not bound to vfio-pci/uio_pci_generic — that
+      // includes kernel-bound NICs, which obviously ARE bound, just
+      // not to DPDK. Pre-fix the operator on srv06 saw Broadcom
+      // tg3-driven management NICs labelled "Unbound" with an
+      // "Unbind" button — confusing AND dangerous, since clicking
+      // it would detach the NIC from tg3 and break the interface.
+      //
+      // A kernel driver is "real" when `driver` (or `kernel_driver`
+      // as a fallback) is set to anything other than the DPDK
+      // userspace shims handled above. For these, the action is
+      // "Bind to DPDK" (server-side handler does the
+      // unbind-from-current-driver + bind-to-vfio-pci dance).
+      //
+      // PMD-support caveat: not every kernel driver has a matching
+      // DPDK PMD. tg3-era Broadcom chips don't (only newer bnxt_en
+      // ones do). vfio-pci will claim them mechanically but no
+      // DPDK PMD will recognise them, so apps can't use them.
+      // We surface the button anyway — the operator may know
+      // something we don't (PMD updates, custom builds) — but the
+      // tooltip warns.
+      const effectiveKDriver = driver || (iface.kernel_driver || '').toLowerCase();
+      if (effectiveKDriver && effectiveKDriver !== 'unknown') {
+        const NO_PMD = new Set(['tg3', 'e1000', 'e100']);
+        const hint = NO_PMD.has(effectiveKDriver)
+          ? `${effectiveKDriver}-driven NIC has no DPDK PMD in stock DPDK — vfio-pci bind will succeed but DPDK apps won\\'t recognise the device.`
+          : null;
+        return {
+          label: 'Kernel (' + effectiveKDriver + ')',
+          pillClass: 'bad',
+          action: 'bind',
+          hint: hint,
+        };
       }
-      // Kernel-bound (default case)
-      return { label: 'Kernel (' + (driver || 'unknown') + ')', pillClass: 'bad', action: 'bind' };
+      // Truly unbound — no driver attached at all (rare; usually
+      // means PCI hot-remove or a kernel driver crashed). Offer
+      // bind, NOT unbind (can't unbind what isn't bound).
+      if (status === 'unbound') {
+        return { label: 'Unbound (no driver)', pillClass: 'warn', action: 'bind' };
+      }
+      // Last-resort fallback: shouldn't reach here given the
+      // checks above, but keep the legacy "Kernel (unknown)" so
+      // the row still gets a sensible button.
+      return { label: 'Kernel (unknown)', pillClass: 'bad', action: 'bind' };
     }
 
     function escapeHtml(s) {
@@ -16953,7 +16994,11 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
           }
           let actionBtn = '';
           if (s.action === 'bind') {
-            actionBtn = `<button data-idx="${idx}" data-action="bind">Bind to DPDK</button>`;
+            // v0.5.47: pass through the no-PMD warning (tg3 et al)
+            // as the button tooltip so the operator sees it BEFORE
+            // clicking.
+            const tip = s.hint ? ` title="${escapeHtml(s.hint)}"` : '';
+            actionBtn = `<button data-idx="${idx}" data-action="bind"${tip}>Bind to DPDK</button>`;
           } else if (s.action === 'unbind') {
             actionBtn = `<button data-idx="${idx}" data-action="unbind" class="secondary">Unbind</button>`;
           } else if (s.hint) {
