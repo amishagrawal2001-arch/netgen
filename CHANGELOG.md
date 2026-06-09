@@ -2,6 +2,41 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.70] - 2026-06-09
+
+**Input validation hardening on 3 admin endpoints.** Audit
+findings H2 + H3 + M7.
+
+Full suite: **2,011 passed, 1 skipped** (+10 new tests).
+
+### H2: `/api/admin/bind_history` POST
+
+* PCI BDF regex (same as v0.5.60)
+* `name` ≤ 64 chars, `[A-Za-z0-9._:-]+`
+* `kernel_driver` ≤ 64 chars, `[A-Za-z0-9_]+`
+* Registry capped at 256 entries
+* Read-modify-write held inside `_BIND_REGISTRY_LOCK` for the
+  whole window (v0.5.58 fixed the helpers; the public POST
+  handler did the cycle outside the lock and lost concurrent
+  writes)
+
+### H3: `/api/admin/interface_ip` address
+
+* Parsed via `ipaddress.ip_interface(f"{address}/{prefix}")`
+* CR, LF, and TAB added to the metachar denylist
+  (`0.0.0.0\r\nGET /` used to slip through and inject a line
+  into the request log)
+* 45-char length cap (IPv6 textual max)
+
+### M7: `/api/dpdk/hugepages` num_pages
+
+* Upper bound 65536 — 32 GiB of 2MB pages, 64 TiB of 1GB pages,
+  well above any real workload. Error message states the max.
+
+### Tests
+
+10 new in `tests/test_v0570_input_validation.py`.
+
 ## [0.5.69] - 2026-06-09
 
 **`/api/admin/health` schema parity.** Audit H1.

@@ -13964,6 +13964,19 @@ def dpdk_hugepages():
             return jsonify({
                 "error": f"num_pages must be a non-negative integer; got {data.get('num_pages')!r}",
             }), 400
+        # v0.5.70 (audit M7): upper bound. 32 GiB of 2MB pages or
+        # 64 TiB of 1GB pages — well above any real workload. Pre-
+        # fix `num_pages: 999999999` was accepted; the kernel
+        # mostly clamps but huge ints trip surprising int-truncation
+        # paths in `str(per_node)` and ENOMEM-style kernel reclaim
+        # storms.
+        if num_pages > 65536:
+            return jsonify({
+                "error": (
+                    f"num_pages {num_pages} exceeds maximum 65536 "
+                    f"(32 GiB of 2MB pages / 64 TiB of 1GB pages)"
+                ),
+            }), 400
 
         # v0.5.54 (audit H5): NUMA-aware allocation. Pre-fix wrote
         # to the global `/sys/kernel/mm/hugepages/.../nr_hugepages`
@@ -18410,15 +18423,33 @@ def api_admin_interface_ip():
         return jsonify({"error": f"invalid iface name: {iface!r}"}), 400
     if not address:
         return jsonify({"error": "address required"}), 400
+    # v0.5.70 (audit H3): bound address length BEFORE further
+    # validation. Pre-fix a 10k-char address went all the way to
+    # the `ip` subprocess and showed up in error logs.
+    if len(address) > 45:
+        return jsonify({
+            "error": "address too long (max 45 chars — IPv6 textual limit)",
+        }), 400
     try:
         prefix = int(prefix_raw)
     except (TypeError, ValueError):
         return jsonify({"error": "prefix_len must be an integer"}), 400
     if not (1 <= prefix <= 128):
         return jsonify({"error": "prefix_len out of range (1..128)"}), 400
-    # `ip` is fine validating address syntax; reject only obvious shell metas
-    # to keep the input space tight even though we never invoke a shell.
-    if any(c in address for c in (";", "&", "|", "`", "$", "(", ")", "<", ">", "\n")):
+    # v0.5.70 (audit H3): parse address via `ipaddress` so we reject
+    # garbage early. Pre-fix `999.999.999.999` and `0.0.0.0\r\nGET /`
+    # (CRLF — not in the previous denylist) reached the `ip`
+    # subprocess; the CRLF case in particular injected a line into
+    # the request log via the `cmd` echo in the error response.
+    import ipaddress as _ipaddress
+    try:
+        _ipaddress.ip_interface(f"{address}/{prefix}")
+    except ValueError as _ve:
+        return jsonify({"error": f"invalid address: {_ve}"}), 400
+    # Defense-in-depth: explicit metachars denylist including
+    # CR + LF + tabs (which `ipaddress.ip_interface` happens to
+    # reject anyway, but belt-and-braces).
+    if any(c in address for c in (";", "&", "|", "`", "$", "(", ")", "<", ">", "\n", "\r", "\t")):
         return jsonify({"error": "invalid characters in address"}), 400
 
     cmd = ["ip", "addr", "add" if action == "add" else "del", f"{address}/{prefix}", "dev", iface]
@@ -18446,21 +18477,84 @@ def api_admin_bind_history():
     POST {pci, name, kernel_driver} — record before binding.
     GET                              — return the full history dict.
     """
-    history = _load_bind_history()
     if request.method == "POST":
         data = request.get_json(silent=True) or {}
         pci = data.get("pci")
         if not pci:
             return jsonify({"error": "pci required"}), 400
-        import datetime as _dt
-        history[pci] = {
-            "name": data.get("name") or "",
-            "kernel_driver": data.get("kernel_driver") or "",
-            "bound_at": _dt.datetime.now().isoformat(),
-        }
-        _save_bind_history(history)
+        # v0.5.70 (audit H2): strict PCI BDF validation. Pre-fix
+        # `pci: "../../etc/passwd"` became a registry key that
+        # the GET endpoint echoed back. The bind/unbind side
+        # already validated via the v0.5.60 regex; the history
+        # POST endpoint didn't.
+        if not re.match(
+            r"^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]$",
+            pci,
+        ):
+            return jsonify({
+                "error": f"invalid PCI BDF: {pci!r}",
+            }), 400
+        # v0.5.70 (audit H2): bound the free-form fields.
+        # `name` came back through innerHTML pre-v0.5.57 escape;
+        # even with escape, multi-MB strings could OOM the
+        # admin UI render.
+        _name = (data.get("name") or "")
+        _kdrv = (data.get("kernel_driver") or "")
+        if len(_name) > 64 or len(_kdrv) > 64:
+            return jsonify({
+                "error": "name and kernel_driver must be ≤64 chars",
+            }), 400
+        if _name and not re.match(r"^[A-Za-z0-9._:-]+$", _name):
+            return jsonify({
+                "error": f"invalid name: {_name!r} (alphanumeric + ._:- only)",
+            }), 400
+        if _kdrv and not re.match(r"^[A-Za-z0-9_]+$", _kdrv):
+            return jsonify({
+                "error": f"invalid kernel_driver: {_kdrv!r}",
+            }), 400
+        # v0.5.70 (audit H2): hold the shared registry lock for
+        # the whole read-modify-write window. v0.5.58 introduced
+        # the lock but only inside _load/_save individually — two
+        # concurrent POSTs could still load the same baseline and
+        # lose each other's writes.
+        with _BIND_REGISTRY_LOCK:
+            history = {}
+            try:
+                with open(_ADMIN_BIND_HISTORY_PATH, "r") as _f:
+                    history = json.load(_f)
+            except Exception:
+                pass
+            # Cap the total registry size so a runaway client
+            # can't bloat the JSON file.
+            if len(history) >= 256 and pci not in history:
+                return jsonify({
+                    "error": (
+                        "bind_history registry full (256 entries). "
+                        "Old entries must be cleared before adding more."
+                    ),
+                }), 409
+            import datetime as _dt
+            history[pci] = {
+                "name": _name,
+                "kernel_driver": _kdrv,
+                "bound_at": _dt.datetime.now().isoformat(),
+            }
+            # Atomic write inside the same locked window — pulled
+            # from _save_bind_history but inline so we don't drop
+            # the lock between the in-memory mutation and the
+            # disk write.
+            try:
+                _tmp = _ADMIN_BIND_HISTORY_PATH + ".tmp"
+                with open(_tmp, "w") as _f:
+                    json.dump(history, _f, indent=2)
+                os.replace(_tmp, _ADMIN_BIND_HISTORY_PATH)
+            except Exception as _se:
+                logging.warning(
+                    f"[ADMIN BIND HISTORY] save failed: {_se}"
+                )
         return jsonify({"recorded": True, "pci": pci, "history_size": len(history)})
     # GET
+    history = _load_bind_history()
     return jsonify({"history": history})
 
 
