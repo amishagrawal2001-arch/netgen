@@ -300,6 +300,80 @@ def _preflight(install_root: Path, *, force: bool) -> None:
 
 # ─────────────────────────────────────────────────── FRR Docker
 
+def _setup_lldpd() -> None:
+    """v0.5.82: install + enable lldpd so the admin console can show
+    LLDP neighbors per network interface.
+
+    Operator-requested: 'enable lldp on the server and lldp package
+    should be part of tar.gz fresh installer'.
+
+    This is the only apt-based step in the installer. Justification:
+    lldpd is a tiny package (~100 KB binary, single dependency
+    libsnmp), it's universally available in apt for every Debian /
+    Ubuntu release netgen supports, and the alternative (operator
+    runs `apt install lldpd` separately, then `systemctl enable
+    --now lldpd`, then edits `/etc/lldpd.d/` to enable on all NICs)
+    is exactly the kind of multi-step shoulder-tap netgen-install
+    exists to avoid.
+
+    Best-effort: failure is logged + skipped (operator can install
+    later) — does NOT abort the install. The admin console
+    gracefully shows '(no LLDP)' per row when lldpcli isn't present.
+    """
+    logger.info("[LLDP] Installing lldpd + enabling system-wide LLDP discovery")
+
+    # Install package (idempotent — apt skips if already present).
+    apt_res = _run(
+        ["apt-get", "install", "-y", "-o", "APT::Sandbox::User=root",
+         "lldpd"],
+        check=False, capture=True,
+    )
+    if apt_res.returncode != 0:
+        logger.warning(
+            f"[LLDP] apt-get install lldpd failed (rc={apt_res.returncode}). "
+            f"Skipping LLDP setup — admin console will show '(no LLDP)' per "
+            f"iface row. Manual install: `apt install lldpd && systemctl "
+            f"enable --now lldpd`."
+        )
+        if apt_res.stderr:
+            logger.warning(f"[LLDP] apt stderr: {apt_res.stderr.strip()[:500]}")
+        return
+
+    # Configure: receive AND send LLDP, advertise system info on all
+    # interfaces. Default lldpd config is "receive only on most
+    # boxes" — we want both directions so neighbor switches can also
+    # see this host.
+    conf_dir = Path("/etc/lldpd.d")
+    try:
+        conf_dir.mkdir(parents=True, exist_ok=True)
+        conf_file = conf_dir / "netgen-server.conf"
+        conf_file.write_text(
+            "# Written by netgen-install — enables LLDP TX + RX on all\n"
+            "# Ethernet ports. Operators on srv06+ asked for this so\n"
+            "# the admin console can show neighbor switch info per port.\n"
+            "configure system platform 'netgen-server'\n"
+            "configure system description 'netgen traffic generator'\n"
+            "configure lldp tx-interval 30\n"
+            "configure lldp tx-hold 4\n"
+        )
+        logger.info(f"[LLDP] Wrote config: {conf_file}")
+    except Exception as exc:
+        logger.warning(f"[LLDP] Could not write {conf_dir}: {exc}")
+
+    # Enable + start. Idempotent.
+    _run(["systemctl", "enable", "--now", "lldpd"], check=False)
+    res = _run(["systemctl", "is-active", "lldpd"],
+               check=False, capture=True)
+    if res.stdout and res.stdout.strip() == "active":
+        logger.info("[LLDP] lldpd is active — admin console will show "
+                    "neighbors as switches advertise.")
+    else:
+        logger.warning(
+            "[LLDP] lldpd may not be running. Check: "
+            "`systemctl status lldpd`."
+        )
+
+
 def _build_frr_image(install_root: Path) -> bool:
     """Build the netgen-frr:latest Docker image from Dockerfile.frr.
     Returns True on success, False on failure (logged but non-fatal —
@@ -630,6 +704,7 @@ def main() -> int:
     logger.info(f"[STARTUP] Log file: {LOG_PATH}")
 
     _preflight(install_root, force=force)
+    _setup_lldpd()  # v0.5.82: install + enable lldpd for neighbor discovery
     _build_frr_image(install_root)
     _write_systemd_unit(install_root)
     _create_path_symlinks(install_root)

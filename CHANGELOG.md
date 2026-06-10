@@ -2,6 +2,78 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.82] - 2026-06-10
+
+**LLDP neighbor in admin iface table + lldpd in fresh installer.**
+Operator-requested:
+
+> also enable lldp on the server and lldp package should be part
+> of tar.tgz fresh installer. also allow admin console to see the
+> lldp neighbor in the network interface table
+
+Three additions:
+
+### 1. Fresh installer (`scripts/tarball/netgen-install`)
+
+New `_setup_lldpd()` step runs between preflight and FRR-image
+build:
+- `apt-get install -y lldpd` (only apt-based step in the installer
+  — justified because lldpd is universally available, tiny, and
+  the alternative is a multi-step shoulder-tap operators don't
+  want)
+- Writes `/etc/lldpd.d/netgen-server.conf` with `tx-interval 30`,
+  `tx-hold 4`, sets a friendly platform/system-descr
+- `systemctl enable --now lldpd`
+- Best-effort: failure logs a warning + continues — does NOT
+  abort the install
+
+### 2. Existing servers (`resources/dpdk/install_dpdk.sh`)
+
+Added `lldpd` to the apt-deps list. Servers running "Make DPDK
+Ready" pick it up automatically. No separate dance for srv06.
+
+### 3. Backend + admin console
+
+* `_LLDP_CACHE` (30s TTL, threading.Lock-guarded) caches the
+  parsed `lldpcli show neighbors -f json` output sliced per-iface
+  — one lldpcli fork per ~30s instead of N forks per refresh.
+* `_refresh_lldp_cache()` runs lldpcli with 4s timeout, parses
+  the JSON (handles both flat and wrapped shapes across lldpd
+  versions), catches `FileNotFoundError` so the iface table
+  still renders on hosts without lldpcli.
+* `/api/dpdk/interfaces` items get a new `lldp_neighbor` field:
+
+```json
+"lldp_neighbor": {
+  "sys_name": "leaf-sw-01",
+  "sys_descr": "Arista EOS 4.30.5M",
+  "chassis_id": "fc:bd:67:..",
+  "port_id": "Ethernet5/1",
+  "port_descr": "to:srv06 ens3f0",
+  "mgmt_ips": ["10.0.0.1"]
+}
+```
+
+* New **LLDP neighbor** column in the iface table between IP
+  addresses and TX queues:
+
+| LLDP neighbor |
+|---|
+| **leaf-sw-01**<br><sub>Ethernet5/1 · 10.0.0.1</sub> |
+| — |
+
+Hover for full chassis ID + sys descr + port descr + all mgmt IPs.
+
+Full suite: **2,128 passed, 1 skipped** (+14 new tests).
+
+### Operator action
+
+- **Fresh installs**: just untar + run installer; lldpd handled.
+- **srv06 (existing)**: wheel-upgrade to v0.5.82 + either
+  re-run "Make DPDK Ready" (gets lldpd via apt-deps), OR
+  `apt install -y lldpd && systemctl enable --now lldpd`
+  manually + restart netgen-server.
+
 ## [0.5.81] - 2026-06-09
 
 **Hot-fix: admin console stuck on "Loading…" (JS SyntaxError).**

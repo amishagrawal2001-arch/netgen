@@ -646,7 +646,12 @@ step_install_dependencies() {
     #
     # Telling apt to stay root for downloads sidesteps it cleanly.
     # Safe: netgen-server.service runs as root anyway.
-    local deps_install_cmd="DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o APT::Sandbox::User=root --option Acquire::http::Timeout=30 --option Acquire::ftp::Timeout=30 build-essential meson ninja-build pkg-config libnuma-dev libelf-dev libpcap-dev python3-pyelftools libssl-dev libjansson-dev libbpf-dev libxdp-dev libbsd-dev zlib1g-dev libfdt-dev libarchive-dev ${kernel_headers}"
+    # v0.5.82: include lldpd in the apt-deps list so existing
+    # netgen servers running "Make DPDK Ready" get LLDP installed
+    # too (fresh installs get it via netgen-install's _setup_lldpd
+    # step). Tiny package, no real cost; admin console iface table
+    # surfaces neighbors as soon as lldpcli is on PATH.
+    local deps_install_cmd="DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o APT::Sandbox::User=root --option Acquire::http::Timeout=30 --option Acquire::ftp::Timeout=30 build-essential meson ninja-build pkg-config libnuma-dev libelf-dev libpcap-dev python3-pyelftools libssl-dev libjansson-dev libbpf-dev libxdp-dev libbsd-dev zlib1g-dev libfdt-dev libarchive-dev lldpd ${kernel_headers}"
 
     # v0.3.2: tighten umask around the temp-log tee so the file is
     # 0600 (owner-only) instead of the default 0644 (world-readable).

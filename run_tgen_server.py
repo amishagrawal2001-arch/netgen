@@ -14534,6 +14534,13 @@ def _parse_dpdk_devbind_status(output):
                         (driver or "").lower() not in _NO_PMD_DRIVERS
                         and (kernel_driver or "").lower() not in _NO_PMD_DRIVERS
                     ),
+                    # v0.5.82: operator-requested LLDP neighbor
+                    # ("admin console should see the lldp neighbor in
+                    # the network interface table"). None when lldpd
+                    # isn't installed/running OR no neighbor on this
+                    # port. Cached 30s; lldpcli runs at most ~once
+                    # per refresh cycle.
+                    "lldp_neighbor": _get_lldp_neighbor(iface) if iface else None,
                 })
     
     return interfaces
@@ -14814,6 +14821,100 @@ _NO_PMD_DRIVERS = {
     "r8169",     # Realtek
     "atlantic",  # Aquantia
 }
+
+
+# v0.5.82: LLDP neighbor cache. lldpcli is a subprocess (~30ms per
+# call) and the iface table can be polled every 30s × N interfaces;
+# we'd rather hit lldpcli once and slice the result per-iface than
+# fork it N times. TTL keeps it cheap and avoids stale data when
+# switches reboot. Single global dict; protected by a lock against
+# concurrent /api/dpdk/interfaces calls.
+_LLDP_CACHE = {"ts": 0.0, "by_iface": {}}
+_LLDP_CACHE_TTL = 30.0
+_LLDP_CACHE_LOCK = threading.Lock()
+
+
+def _refresh_lldp_cache():
+    """Pull `lldpcli show neighbors -f json` and slice per-iface.
+
+    Returns the cached dict; no-op if cache is fresh. Failures
+    (lldpd not installed, no neighbors, JSON parse error) leave
+    the cache empty — the front-end gracefully shows '(no LLDP)'.
+    """
+    import time as _time
+    now = _time.monotonic()
+    with _LLDP_CACHE_LOCK:
+        if now - _LLDP_CACHE["ts"] < _LLDP_CACHE_TTL:
+            return _LLDP_CACHE["by_iface"]
+        _LLDP_CACHE["ts"] = now
+        _LLDP_CACHE["by_iface"] = {}
+        try:
+            _r = subprocess.run(
+                ["lldpcli", "-f", "json", "show", "neighbors"],
+                capture_output=True, text=True, timeout=4,
+            )
+            if _r.returncode != 0:
+                return _LLDP_CACHE["by_iface"]
+            import json as _json
+            data = _json.loads(_r.stdout) if _r.stdout.strip() else {}
+            # lldpcli JSON shape:
+            #   {"lldp": [{"interface": [{"name": "eno1", "chassis": {
+            #     "id": "...", "name": "switch1", "descr": "...",
+            #     "mgmt-ip": [...]}, "port": {"id": "...",
+            #     "descr": "Ethernet1/3"}}]}]}
+            # OR a flatter form on some versions.
+            top = data.get("lldp", data)
+            if isinstance(top, list):
+                # Wrapped in {"lldp": [...]}.
+                items = top
+            elif isinstance(top, dict) and "interface" in top:
+                items = [top]
+            else:
+                items = []
+            for item in items:
+                ifaces = item.get("interface", []) if isinstance(item, dict) else []
+                if isinstance(ifaces, dict):
+                    ifaces = [ifaces]
+                for entry in ifaces:
+                    name = entry.get("name") or entry.get("via")
+                    if not name:
+                        continue
+                    chassis = entry.get("chassis") or {}
+                    if isinstance(chassis, dict) and len(chassis) == 1:
+                        # Some lldpd versions wrap chassis under the
+                        # chassis name as the dict key.
+                        _k, _v = next(iter(chassis.items()))
+                        chassis = _v if isinstance(_v, dict) else chassis
+                    port = entry.get("port") or {}
+                    mgmt_ips = chassis.get("mgmt-ip", [])
+                    if isinstance(mgmt_ips, str):
+                        mgmt_ips = [mgmt_ips]
+                    _LLDP_CACHE["by_iface"][name] = {
+                        "sys_name": chassis.get("name") or "",
+                        "sys_descr": (chassis.get("descr") or "")[:200],
+                        "chassis_id": str(chassis.get("id") or "")[:80],
+                        "port_id": str((port.get("id") or {}).get("value")
+                                       if isinstance(port.get("id"), dict)
+                                       else port.get("id") or "")[:80],
+                        "port_descr": (port.get("descr") or "")[:120],
+                        "mgmt_ips": mgmt_ips[:4],
+                    }
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+        except Exception as _e:
+            logging.debug(f"[LLDP] cache refresh failed: {_e}")
+        return _LLDP_CACHE["by_iface"]
+
+
+def _get_lldp_neighbor(iface_name):
+    """Return the cached LLDP neighbor for `iface_name`, or None.
+
+    Refreshes the cache on demand (TTL-gated).
+    """
+    if not iface_name:
+        return None
+    by_iface = _refresh_lldp_cache()
+    return by_iface.get(iface_name)
 
 
 def _get_link_info(iface_name):
@@ -19072,6 +19173,31 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
             ipCell = `<div class="ip-cell">${lines}<button class="ip-manage" data-iface="${escapeHtml(kernelName)}">Manage</button></div>`;
           }
 
+          // v0.5.82: LLDP neighbor cell. Operator-requested. Shows
+          // a 2-line summary: "<switch> / <port>" with mgmt-IP and
+          // full chassis/port detail in the title tooltip. Falls
+          // back to muted "—" when lldpd hasn't seen a neighbor on
+          // this port (or isn't installed/running).
+          let lldpCell = '<span style="color: var(--muted);" title="No LLDP neighbor seen on this port (or lldpd not running). Verify with: lldpcli show neighbors">—</span>';
+          const lldp = i.lldp_neighbor;
+          if (lldp && (lldp.sys_name || lldp.port_id)) {
+            const sysName = lldp.sys_name || lldp.chassis_id || '?';
+            const portId = lldp.port_descr || lldp.port_id || '?';
+            const mgmtIp = (lldp.mgmt_ips && lldp.mgmt_ips.length) ? lldp.mgmt_ips[0] : '';
+            const tipParts = [
+              lldp.sys_name ? `Switch: ${lldp.sys_name}` : null,
+              lldp.chassis_id ? `Chassis: ${lldp.chassis_id}` : null,
+              lldp.port_id ? `Port: ${lldp.port_id}` : null,
+              lldp.port_descr ? `Port descr: ${lldp.port_descr}` : null,
+              lldp.sys_descr ? `Sys: ${lldp.sys_descr}` : null,
+              mgmtIp ? `Mgmt IP: ${mgmtIp}` : null,
+            ].filter(Boolean).join('\\n');
+            lldpCell = `<div class="lldp-cell" title="${escapeHtml(tipParts)}">
+              <div style="font-weight: 500;">${escapeHtml(sysName)}</div>
+              <div style="color: var(--muted); font-size: 11px;">${escapeHtml(portId)}${mgmtIp ? ' · ' + escapeHtml(mgmtIp) : ''}</div>
+            </div>`;
+          }
+
           // TX queues badge: shows "DPDK ×N" when this interface has at least
           // one active multi-queue tx_worker stream; "DPDK" for single-queue;
           // "—" otherwise. Uses the kernel name for lookup (vfio-bound rows
@@ -19130,6 +19256,7 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
               <td><span class="pill ${s.pillClass}" aria-label="${escapeHtml(s.pillClass + ': ' + s.label)}">${({ok:'✓ ',bad:'✗ ',warn:'! '})[s.pillClass]||''}${escapeHtml(s.label)}</span>${linkLine ? '<br>' + linkLine : ''}</td>
               <td class="mono">${escapeHtml(kdrv)}</td>
               <td>${ipCell}</td>
+              <td>${lldpCell}</td>
               <td>${queuesCell}</td>
               <td>${actionBtn}</td>
             </tr>`;
@@ -19137,7 +19264,7 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
         wrap.innerHTML = `
           <div style="overflow-x:auto">
           <table class="iface">
-            <thead><tr><th>Interface</th><th>PCI</th><th>Vendor</th><th>State</th><th>Kernel driver</th><th>IP addresses</th><th>TX queues</th><th></th></tr></thead>
+            <thead><tr><th>Interface</th><th>PCI</th><th>Vendor</th><th>State</th><th>Kernel driver</th><th>IP addresses</th><th>LLDP neighbor</th><th>TX queues</th><th></th></tr></thead>
             <tbody>${rows}</tbody>
           </table>
           </div>`;
