@@ -14954,8 +14954,26 @@ def _refresh_lldp_cache():
                     else:
                         pairs.append((ifaces.get("name") or "", ifaces))
                 elif isinstance(ifaces, list):
+                    # v0.5.87 hotfix: srv06's lldpd emits a HYBRID
+                    # shape — `"interface": [{"ens10f0": {...}},
+                    # {"ens2f0np0": {...}}]`. Each list element is
+                    # a single-key dict where the KEY is the iface
+                    # name and the VALUE is the entry. The v0.5.86
+                    # parser only handled (entry has "name" field)
+                    # or (dict-keyed-by-name) — this third shape
+                    # leaked through as all-empty rows.
+                    _entry_keys = {"name", "chassis", "port", "via",
+                                   "rid", "age", "ttl"}
                     for entry in ifaces:
-                        if isinstance(entry, dict):
+                        if not isinstance(entry, dict):
+                            continue
+                        # Hybrid: list element is {iface_name: {...}}.
+                        if (len(entry) == 1
+                                and next(iter(entry.keys())) not in _entry_keys
+                                and isinstance(next(iter(entry.values())), dict)):
+                            _n, _e = next(iter(entry.items()))
+                            pairs.append((_n, _e))
+                        else:
                             pairs.append((entry.get("name") or "", entry))
             for name, entry in pairs:
                 if not name:
@@ -18587,18 +18605,43 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
       margin: 0; padding: 24px; background: var(--bg); color: var(--ink);
     }
-    /* Operator-requested compact mode (Jun 10 2026): tightened
-       paddings, smaller headings, denser rows. Total dashboard
-       height roughly 30% shorter without losing any data. */
-    h1 { margin: 0 0 2px; font-size: 18px; }
-    .sub { color: var(--muted); margin-bottom: 12px; font-size: 11px; }
-    .grid { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
+    /* v0.5.87 professional refresh: cleaner typography, subtle
+       depth, refined collapsibles. Stays compact but reads more
+       deliberate. */
+    h1 { margin: 0 0 2px; font-size: 19px; font-weight: 600; letter-spacing: -0.2px; }
+    .sub { color: var(--muted); margin-bottom: 14px; font-size: 12px; }
+    .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
     .card {
-      background: var(--card); border: 1px solid var(--border); border-radius: 6px;
-      padding: 10px 12px; box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+      background: var(--card); border: 1px solid var(--border); border-radius: 8px;
+      padding: 12px 14px; box-shadow: 0 1px 2px rgba(15, 23, 42, 0.04), 0 1px 1px rgba(15, 23, 42, 0.03);
     }
-    .card h2 { margin: 0 0 6px; font-size: 13px; font-weight: 600; }
-    .card h3 { margin: 8px 0 4px; font-size: 12px; font-weight: 600; }
+    .card h2 {
+      margin: 0 0 8px; font-size: 13px; font-weight: 600;
+      color: #1e293b; letter-spacing: -0.1px;
+      padding-bottom: 6px; border-bottom: 1px solid #f1f5f9;
+    }
+    .card h3 { margin: 10px 0 4px; font-size: 12px; font-weight: 600; color: #334155; letter-spacing: -0.05px; }
+    /* v0.5.87 collapsible section pattern (operator-requested):
+       <details class="collapse"><summary>...</summary>...</details>
+       Renders a clickable header that expands/collapses native-
+       style with a chevron. No JS needed. */
+    details.collapse { margin-top: 6px; }
+    details.collapse > summary {
+      cursor: pointer; list-style: none;
+      padding: 6px 8px; margin: 0 -8px; border-radius: 5px;
+      font-size: 12px; font-weight: 600; color: #334155;
+      display: flex; align-items: center; gap: 6px;
+      transition: background 0.15s;
+    }
+    details.collapse > summary::-webkit-details-marker { display: none; }
+    details.collapse > summary::before {
+      content: '▸'; font-size: 10px; color: var(--muted);
+      transition: transform 0.15s; display: inline-block;
+    }
+    details.collapse[open] > summary::before { transform: rotate(90deg); }
+    details.collapse > summary:hover { background: #f8fafc; }
+    details.collapse[open] > summary { color: #1e293b; }
+    details.collapse .meta { color: var(--muted); font-weight: 500; font-size: 11px; margin-left: auto; }
     .row { display: flex; justify-content: space-between; align-items: center; padding: 3px 0; border-bottom: 1px dashed var(--border); font-size: 12px; }
     .row:last-child { border-bottom: 0; }
     .row .label { color: var(--muted); }
@@ -18689,34 +18732,41 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
   <div class="sub" id="hostname">Loading…</div>
 
   <div class="grid">
-    <!-- Operator-requested (Jun 10): host hardware info — CPU,
-         memory, kernel/distro, per-mount disk free.
-         v0.5.85: moved to top per operator. -->
+    <!-- v0.5.87: collapsible sections for System Info / Disks
+         (mounted) / Block devices (operator-requested). Native
+         <details>/<summary> with refined CSS in .collapse. -->
     <div class="card" style="grid-column: 1 / -1;" id="card-system-info">
       <h2 style="margin-top: 0;">System Info</h2>
-      <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px;">
-        <div>
-          <div class="row"><span class="label">Distro</span><span id="p-sys-distro">…</span></div>
-          <div class="row"><span class="label">Kernel</span><span id="p-sys-kernel">…</span></div>
-          <div class="row"><span class="label">Architecture</span><span id="p-sys-arch">…</span></div>
-          <div class="row"><span class="label">Host uptime</span><span id="p-sys-uptime">…</span></div>
+      <details class="collapse" open>
+        <summary>Host hardware <span class="meta" id="p-sys-summary">…</span></summary>
+        <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px; padding: 6px 0 4px;">
+          <div>
+            <div class="row"><span class="label">Distro</span><span id="p-sys-distro">…</span></div>
+            <div class="row"><span class="label">Kernel</span><span id="p-sys-kernel">…</span></div>
+            <div class="row"><span class="label">Architecture</span><span id="p-sys-arch">…</span></div>
+            <div class="row"><span class="label">Host uptime</span><span id="p-sys-uptime">…</span></div>
+          </div>
+          <div>
+            <div class="row"><span class="label">CPU</span><span id="p-sys-cpu-model" style="font-size: 11px;">…</span></div>
+            <div class="row"><span class="label">Cores (physical / logical)</span><span id="p-sys-cores">…</span></div>
+            <div class="row"><span class="label">Load avg (1m / 5m / 15m)</span><span id="p-sys-load">…</span></div>
+          </div>
+          <div>
+            <div class="row"><span class="label">Memory total</span><span id="p-sys-mem-total">…</span></div>
+            <div class="row"><span class="label">Memory used</span><span id="p-sys-mem-used">…</span></div>
+            <div class="row"><span class="label">Memory free</span><span id="p-sys-mem-free">…</span></div>
+            <div class="row"><span class="label">Swap (used / total)</span><span id="p-sys-swap">…</span></div>
+          </div>
         </div>
-        <div>
-          <div class="row"><span class="label">CPU</span><span id="p-sys-cpu-model" style="font-size: 11px;">…</span></div>
-          <div class="row"><span class="label">Cores (physical / logical)</span><span id="p-sys-cores">…</span></div>
-          <div class="row"><span class="label">Load avg (1m / 5m / 15m)</span><span id="p-sys-load">…</span></div>
-        </div>
-        <div>
-          <div class="row"><span class="label">Memory total</span><span id="p-sys-mem-total">…</span></div>
-          <div class="row"><span class="label">Memory used</span><span id="p-sys-mem-used">…</span></div>
-          <div class="row"><span class="label">Memory free</span><span id="p-sys-mem-free">…</span></div>
-          <div class="row"><span class="label">Swap (used / total)</span><span id="p-sys-swap">…</span></div>
-        </div>
-      </div>
-      <h3 style="margin: 14px 0 4px; font-size: 13px;">Disks (mounted)</h3>
-      <div id="p-sys-disks" style="overflow-x: auto;">…</div>
-      <h3 style="margin: 12px 0 4px; font-size: 13px;">Block devices</h3>
-      <div id="p-sys-blockdev" style="overflow-x: auto;">…</div>
+      </details>
+      <details class="collapse">
+        <summary>Disks (mounted) <span class="meta" id="p-sys-disks-meta">…</span></summary>
+        <div id="p-sys-disks" style="overflow-x: auto;">…</div>
+      </details>
+      <details class="collapse">
+        <summary>Block devices <span class="meta" id="p-sys-blockdev-meta">…</span></summary>
+        <div id="p-sys-blockdev" style="overflow-x: auto;">…</div>
+      </details>
     </div>
 
     <div class="card" id="dpdk-card">
@@ -19084,6 +19134,16 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
           if (mb >= 1024) return `${(mb / 1024).toFixed(1)} GiB`;
           return `${mb} MiB`;
         };
+        // v0.5.87: one-line summary next to the collapsed header
+        // so operators can see key state without expanding.
+        const sumEl = $('p-sys-summary');
+        if (sumEl) {
+          const parts = [];
+          if (sys.cpu && sys.cpu.cores_logical) parts.push(`${sys.cpu.cores_logical} cores`);
+          if (sys.memory && sys.memory.total_mb) parts.push(`${(sys.memory.total_mb / 1024).toFixed(0)} GiB RAM`);
+          if (sys.distro) parts.push(sys.distro.split(' ')[0]);
+          sumEl.textContent = parts.length ? parts.join(' · ') : '';
+        }
         $('p-sys-distro').textContent = sys.distro || '—';
         $('p-sys-kernel').textContent = sys.kernel || '—';
         $('p-sys-arch').textContent = sys.arch || '—';
@@ -19113,6 +19173,10 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
         // Disks table.
         const mounts = ((d.disk || {}).mounts) || [];
         const disksEl = $('p-sys-disks');
+        const disksMetaEl = $('p-sys-disks-meta');
+        if (disksMetaEl) {
+          disksMetaEl.textContent = mounts.length ? `${mounts.length} mount${mounts.length === 1 ? '' : 's'}` : 'none';
+        }
         if (mounts.length) {
           const rows = mounts.map(m => {
             const usedColor = m.used_pct >= 95 ? 'var(--bad)'
@@ -19138,6 +19202,13 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
         // ALL disks and partitions (mounted or not).
         const blockDevs = ((d.disk || {}).block_devices) || [];
         const bdEl = $('p-sys-blockdev');
+        const bdMetaEl = $('p-sys-blockdev-meta');
+        if (bdMetaEl) {
+          const disksCount = blockDevs.filter(b => !b.parent).length;
+          bdMetaEl.textContent = blockDevs.length
+            ? `${disksCount} disk${disksCount === 1 ? '' : 's'}, ${blockDevs.length} device${blockDevs.length === 1 ? '' : 's'}`
+            : 'none';
+        }
         if (blockDevs.length) {
           const fmtSize = (b) => {
             if (!b) return '—';

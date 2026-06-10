@@ -2,6 +2,73 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.87] - 2026-06-10
+
+**LLDP hot-fix (hybrid shape) + collapsible System Info + polish.**
+
+Operator on srv06:
+
+> lldp neighbor is still not seen after upgrading to 5.86, and
+> provide collapse view for System info, and Disk(mounted),
+> Block Devices, also make it more professional look.
+
+### LLDP hybrid-shape fix
+
+The v0.5.86 `/api/admin/lldp_raw` diagnostic revealed srv06's
+lldpd emits a THIRD shape neither v0.5.82 nor v0.5.86 caught:
+
+```json
+"interface": [
+  {"ens10f0":   {"chassis": ..., "port": ...}},
+  {"ens2f0np0": {"chassis": ..., "port": ...}}
+]
+```
+
+A **list** where each element is a **single-key dict** with the
+iface name as the key. v0.5.86's list branch did
+`entry.get("name")` which returned None on every row → silent
+"(no LLDP)" everywhere.
+
+Fix: when a list element is a single-key dict and the key isn't
+a known entry field (`name/chassis/port/via/rid/age/ttl`), treat
+the key as iface name and the value as the entry.
+
+After this fix srv06 will show:
+- `ens10f0` → sd-mgmt-a22.englab.juniper.net · ge-0/0/12 · 10.83.38.209
+- `ens2f0np0` → ny-q5130-03.englab.juniper.net · et-0/0/29:1 · 10.83.6.63
+- plus the others reported in the journal dump.
+
+### Collapsible System Info
+
+Three native `<details>` blocks for Host hardware / Disks
+(mounted) / Block devices. "Host hardware" is open by default;
+the two disk tables collapse. Each summary line carries a one-
+line meta hint:
+
+```
+▾ Host hardware            64 cores · 252 GiB RAM · Ubuntu
+▸ Disks (mounted)          3 mounts
+▸ Block devices            4 disks, 14 devices
+```
+
+Custom CSS (`.collapse`) hides the native disclosure triangle
+and uses a rotating chevron, hover background, slate-700 text
+when open. No JS needed — `<details>` is the native pattern.
+
+### Professional polish
+
+* Card H2 gets a faint bottom border (`#f1f5f9`) for a clearer
+  section line.
+* Card H2 text → slate-700 (`#1e293b`); H3 → slate-600 (`#334155`).
+* H1 18 → 19 px, -0.2px letter-spacing for a more deliberate feel.
+* Cards: extra subtle second-layer shadow for depth.
+* Grid: 10 → 12 px gap.
+* Card padding: 10/12 → 12/14.
+
+7 new regression tests including the hybrid-shape round-trip.
+
+Full suite: **2,167 passed, 1 skipped** (+7 new).
+
 ## [0.5.86] - 2026-06-10
 
 **LLDP parser handles json0 shape (Juniper) + all block devices.**
