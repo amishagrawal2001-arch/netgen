@@ -2,6 +2,98 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.86] - 2026-06-10
+
+**LLDP parser handles json0 shape (Juniper) + all block devices.**
+
+Operator on srv06 after upgrading to v0.5.85:
+
+> i am not seeing lldp neighbor on the admin console, however i
+> can see on server
+>
+> [paste of qfx5130-32cd neighbor on ens2f1np1]
+
+And:
+
+> also i want to see all the disks available on the server and
+> usage. [paste of fdisk showing /dev/sda1..3]
+
+### LLDP parser fix
+
+The v0.5.82 parser only handled lldpd's older `json` shape (array
+of interfaces with a "name" field). srv06's lldpd talking to a
+Juniper qfx5130 emits the newer `json0` shape:
+
+```json
+{
+  "lldp": {
+    "interface": {
+      "ens2f1np1": {                           ← iface name as KEY
+        "via": "LLDP",
+        "chassis": {
+          "ny-q5130-03.englab.juniper.net": {  ← sys-name as KEY
+            "id": {"type": "mac",
+                   "value": "20:ed:47:10:b4:7d"},  ← typed-dict id
+            "descr": "Juniper Networks qfx5130-32cd",
+            "mgmt-ip": ["10.83.6.63"]
+          }
+        },
+        "port": {
+          "id": {"type": "local", "value": "689"},
+          "descr": "et-0/0/29:0"
+        }
+      }
+    }
+  }
+}
+```
+
+Three new helpers handle both shapes:
+
+* `_lldp_extract_id_value(node)` — bare string OR `{type, value}` typed dict
+* `_lldp_normalise_chassis(node)` — list shape OR json0 sys-name-as-key
+* `_lldp_normalise_port(node)` — list shape OR json0 typed-id
+
+`_refresh_lldp_cache` now walks both shapes via a single
+`(name, entry)` pair list. Heuristic: if a dict's keys aren't
+in the known entry-field set (`name/chassis/port/via/rid/...`),
+treat them as iface name → entry mapping.
+
+### Diagnostic: `GET /api/admin/lldp_raw`
+
+Returns raw `lldpcli -f json show neighbors` stdout. So next time
+a different lldpd version emits an unexpected shape, the operator
+can hit the endpoint from the browser to inspect — no SSH needed.
+
+### Block devices in admin dashboard
+
+`/api/admin/health` `disk` block gains `block_devices` (list of
+all real disks + partitions from `lsblk -J -b`):
+
+```json
+"block_devices": [
+  {"name": "sda", "parent": null, "type": "disk",
+   "size_bytes": 999898038272, "fstype": "",
+   "mountpoint": "", "model": "INTEL SSDSCKKB", "serial": "BTYS..."},
+  {"name": "sda1", "parent": "sda", "type": "part",
+   "size_bytes": 1127219200, "fstype": "vfat",
+   "mountpoint": "/boot/efi", "model": "", "serial": ""},
+  ...
+]
+```
+
+* Skips loop + ramdisks (operator cares about real disks).
+* Capped at 64 entries.
+
+Admin HTML adds a "Block devices" table under the existing
+"Disks (mounted)" table. Partitions indented under their parent
+disk; sizes auto-formatted as GiB/TiB. The Disks (mounted) table
+shows utilization; Block devices shows the full inventory.
+
+11 new regression tests including a Juniper-shape parser round-trip.
+
+Full suite: **2,160 passed, 1 skipped** (+11 new).
+
 ## [0.5.85] - 2026-06-10
 
 **Hot-fix: /api/admin/health 500 + System Info card at top.**

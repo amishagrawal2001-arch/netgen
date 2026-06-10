@@ -14834,12 +14834,86 @@ _LLDP_CACHE_TTL = 30.0
 _LLDP_CACHE_LOCK = threading.Lock()
 
 
-def _refresh_lldp_cache():
-    """Pull `lldpcli show neighbors -f json` and slice per-iface.
+def _lldp_extract_id_value(node):
+    """v0.5.86: lldpcli JSON id fields can be either a bare string
+    or a typed dict like {"type": "mac", "value": "20:ed:47:..."}.
+    Return the string value."""
+    if isinstance(node, dict):
+        return str(node.get("value") or node.get("id") or "")
+    if node is None:
+        return ""
+    return str(node)
 
-    Returns the cached dict; no-op if cache is fresh. Failures
-    (lldpd not installed, no neighbors, JSON parse error) leave
-    the cache empty — the front-end gracefully shows '(no LLDP)'.
+
+def _lldp_normalise_chassis(chassis):
+    """The chassis subtree comes in two shapes:
+
+    json shape (older lldpd):
+       "chassis": [{"name": "sw1", "id": "...", "descr": "..."}]
+        OR
+       "chassis": {"name": "sw1", "id": "...", "descr": "..."}
+
+    json0 shape (newer lldpd — what srv06's Juniper-talking
+    lldpd emits):
+       "chassis": {
+         "ny-q5130-03.englab.juniper.net": {
+           "id": {"type": "mac", "value": "20:ed:47:10:b4:7d"},
+           "descr": "Juniper Networks...",
+           "mgmt-ip": ["10.83.6.63"]
+         }
+       }
+
+    Returns a flat dict with sys_name, id, descr, mgmt_ips.
+    """
+    if isinstance(chassis, list):
+        chassis = chassis[0] if chassis else {}
+    if not isinstance(chassis, dict):
+        return {}
+    # json0: single key that's NOT a known field → that key is the
+    # sys-name and the value carries the rest.
+    _known = {"id", "name", "descr", "mgmt-ip", "ttl", "capability"}
+    sys_name = chassis.get("name", "") or ""
+    if not sys_name and len(chassis) == 1:
+        _k, _v = next(iter(chassis.items()))
+        if _k not in _known and isinstance(_v, dict):
+            sys_name = _k
+            chassis = _v
+    mgmt_ips = chassis.get("mgmt-ip", [])
+    if isinstance(mgmt_ips, str):
+        mgmt_ips = [mgmt_ips]
+    return {
+        "sys_name": sys_name,
+        "id": _lldp_extract_id_value(chassis.get("id")),
+        "descr": chassis.get("descr") or "",
+        "mgmt_ips": [str(x) for x in (mgmt_ips or [])][:4],
+    }
+
+
+def _lldp_normalise_port(port):
+    """Port shape mirrors chassis — can be list/dict with id as
+    str or dict {type, value}, descr at the same level."""
+    if isinstance(port, list):
+        port = port[0] if port else {}
+    if not isinstance(port, dict):
+        return {}
+    return {
+        "id": _lldp_extract_id_value(port.get("id")),
+        "descr": port.get("descr") or "",
+    }
+
+
+def _refresh_lldp_cache():
+    """Pull `lldpcli -f json show neighbors` and slice per-iface.
+
+    Returns the cached dict; no-op if cache is fresh.
+
+    v0.5.86 (operator-bite Jun 10): srv06 talking to a Juniper
+    qfx5130 emitted `json0`-style JSON with iface name as outer
+    DICT KEY, not a list of entries with a "name" field. The
+    v0.5.82 parser only handled the older "array of interfaces
+    with name field" shape, so srv06 admin console silently
+    showed (no LLDP) for every row despite lldpcli on the box
+    showing all neighbors. Rewrite handles both shapes.
     """
     import time as _time
     now = _time.monotonic()
@@ -14857,52 +14931,51 @@ def _refresh_lldp_cache():
                 return _LLDP_CACHE["by_iface"]
             import json as _json
             data = _json.loads(_r.stdout) if _r.stdout.strip() else {}
-            # lldpcli JSON shape:
-            #   {"lldp": [{"interface": [{"name": "eno1", "chassis": {
-            #     "id": "...", "name": "switch1", "descr": "...",
-            #     "mgmt-ip": [...]}, "port": {"id": "...",
-            #     "descr": "Ethernet1/3"}}]}]}
-            # OR a flatter form on some versions.
             top = data.get("lldp", data)
-            if isinstance(top, list):
-                # Wrapped in {"lldp": [...]}.
-                items = top
-            elif isinstance(top, dict) and "interface" in top:
-                items = [top]
-            else:
-                items = []
-            for item in items:
-                ifaces = item.get("interface", []) if isinstance(item, dict) else []
+            # Normalise: produce a list of (iface_name, entry_dict).
+            pairs = []
+            # Two outer-wrapper shapes:
+            #   json:  {"lldp": [{"interface": [...]}]}
+            #   json0: {"lldp": {"interface": {...}}}  OR  {"lldp": {"interface": [...]}}
+            outer_items = top if isinstance(top, list) else [top]
+            for outer in outer_items:
+                if not isinstance(outer, dict):
+                    continue
+                ifaces = outer.get("interface", outer)
                 if isinstance(ifaces, dict):
-                    ifaces = [ifaces]
-                for entry in ifaces:
+                    # If keys look like iface names (not "name"/"chassis"/...) treat
+                    # as name→entry mapping. Otherwise it's a single entry dict.
+                    _entry_keys = {"name", "chassis", "port", "via",
+                                   "rid", "age", "ttl"}
+                    if ifaces and all(k not in _entry_keys for k in ifaces.keys()):
+                        for _n, _e in ifaces.items():
+                            if isinstance(_e, dict):
+                                pairs.append((_n, _e))
+                    else:
+                        pairs.append((ifaces.get("name") or "", ifaces))
+                elif isinstance(ifaces, list):
+                    for entry in ifaces:
+                        if isinstance(entry, dict):
+                            pairs.append((entry.get("name") or "", entry))
+            for name, entry in pairs:
+                if not name:
                     name = entry.get("name") or entry.get("via")
-                    if not name:
-                        continue
-                    chassis = entry.get("chassis") or {}
-                    if isinstance(chassis, dict) and len(chassis) == 1:
-                        # Some lldpd versions wrap chassis under the
-                        # chassis name as the dict key.
-                        _k, _v = next(iter(chassis.items()))
-                        chassis = _v if isinstance(_v, dict) else chassis
-                    port = entry.get("port") or {}
-                    mgmt_ips = chassis.get("mgmt-ip", [])
-                    if isinstance(mgmt_ips, str):
-                        mgmt_ips = [mgmt_ips]
-                    _LLDP_CACHE["by_iface"][name] = {
-                        "sys_name": chassis.get("name") or "",
-                        "sys_descr": (chassis.get("descr") or "")[:200],
-                        "chassis_id": str(chassis.get("id") or "")[:80],
-                        "port_id": str((port.get("id") or {}).get("value")
-                                       if isinstance(port.get("id"), dict)
-                                       else port.get("id") or "")[:80],
-                        "port_descr": (port.get("descr") or "")[:120],
-                        "mgmt_ips": mgmt_ips[:4],
-                    }
+                if not name:
+                    continue
+                chassis = _lldp_normalise_chassis(entry.get("chassis"))
+                port = _lldp_normalise_port(entry.get("port"))
+                _LLDP_CACHE["by_iface"][name] = {
+                    "sys_name": chassis.get("sys_name") or "",
+                    "sys_descr": (chassis.get("descr") or "")[:200],
+                    "chassis_id": (chassis.get("id") or "")[:80],
+                    "port_id": (port.get("id") or "")[:80],
+                    "port_descr": (port.get("descr") or "")[:120],
+                    "mgmt_ips": chassis.get("mgmt_ips", [])[:4],
+                }
         except (subprocess.TimeoutExpired, FileNotFoundError):
             pass
         except Exception as _e:
-            logging.debug(f"[LLDP] cache refresh failed: {_e}")
+            logging.warning(f"[LLDP] cache refresh failed: {_e}")
         return _LLDP_CACHE["by_iface"]
 
 
@@ -15054,6 +15127,32 @@ _DPDK_ACCELERATOR_CLASSES = {
     "qat":     ("Intel QAT",       "QuickAssist Technology — DPDK compress + crypto"),
     "ntb_hw_intel": ("Intel NTB",  "Non-Transparent Bridge — DPDK rawdev"),
 }
+
+
+@app.route("/api/admin/lldp_raw", methods=["GET"])
+@require_role("viewer")
+def admin_lldp_raw():
+    """v0.5.86 diagnostic — returns the raw stdout of
+    `lldpcli -f json show neighbors` so operators (and future
+    parser fixes) can inspect the actual JSON shape lldpd
+    emits on this host. Cap 64 KB to avoid huge dumps.
+    """
+    try:
+        _r = subprocess.run(
+            ["lldpcli", "-f", "json", "show", "neighbors"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return jsonify({
+            "returncode": _r.returncode,
+            "stdout": _r.stdout[:65536],
+            "stderr": _r.stderr[:8192],
+        })
+    except FileNotFoundError:
+        return jsonify({"error": "lldpcli not installed"}), 404
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "lldpcli timed out (5s)"}), 504
+    except Exception as _e:
+        return jsonify({"error": str(_e)}), 500
 
 
 @app.route("/api/admin/journal", methods=["GET"])
@@ -16811,6 +16910,56 @@ def api_admin_health():
     except Exception as _de:
         logging.debug(f"[DISK] /proc/mounts read failed: {_de}")
     disk["mounts"] = mounts
+    # Operator-requested (Jun 10): show ALL block devices on the
+    # server, not just mounted partitions. lsblk -J emits a JSON
+    # tree of devices + their children (partitions). We flatten
+    # to a list with name / size / type / fstype / mountpoint /
+    # parent so the dashboard can group partitions under their
+    # parent disk.
+    block_devices = []
+    try:
+        _r = subprocess.run(
+            ["lsblk", "-J", "-b",
+             "-o", "NAME,TYPE,SIZE,FSTYPE,MOUNTPOINT,MODEL,SERIAL"],
+            capture_output=True, text=True, timeout=4,
+        )
+        if _r.returncode == 0 and _r.stdout.strip():
+            import json as _json
+            _bd = _json.loads(_r.stdout)
+            def _walk(nodes, parent=None):
+                for n in nodes or []:
+                    if not isinstance(n, dict):
+                        continue
+                    name = n.get("name") or ""
+                    if not name:
+                        continue
+                    # Skip loop devices + ramdisks — operator
+                    # cares about real disks + partitions.
+                    if name.startswith("loop") or name.startswith("ram"):
+                        continue
+                    try:
+                        size = int(n.get("size") or 0)
+                    except (TypeError, ValueError):
+                        size = 0
+                    entry = {
+                        "name": name,
+                        "parent": parent,
+                        "type": n.get("type") or "",
+                        "size_bytes": size,
+                        "fstype": n.get("fstype") or "",
+                        "mountpoint": n.get("mountpoint") or "",
+                        "model": (n.get("model") or "").strip(),
+                        "serial": (n.get("serial") or "").strip(),
+                    }
+                    block_devices.append(entry)
+                    _walk(n.get("children"), parent=name)
+            _walk(_bd.get("blockdevices"))
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        pass
+    except Exception as _be:
+        logging.debug(f"[DISK] lsblk failed: {_be}")
+    # Cap to a sane upper bound.
+    disk["block_devices"] = block_devices[:64]
     out["disk"] = disk
     # Stash disk warnings — the main `issues` list isn't created
     # until later in the function. Merged in below.
@@ -18564,8 +18713,10 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
           <div class="row"><span class="label">Swap (used / total)</span><span id="p-sys-swap">…</span></div>
         </div>
       </div>
-      <h3 style="margin: 14px 0 4px; font-size: 13px;">Disks</h3>
+      <h3 style="margin: 14px 0 4px; font-size: 13px;">Disks (mounted)</h3>
       <div id="p-sys-disks" style="overflow-x: auto;">…</div>
+      <h3 style="margin: 12px 0 4px; font-size: 13px;">Block devices</h3>
+      <div id="p-sys-blockdev" style="overflow-x: auto;">…</div>
     </div>
 
     <div class="card" id="dpdk-card">
@@ -18981,6 +19132,40 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
           </table>`;
         } else {
           disksEl.textContent = '—';
+        }
+
+        // Operator-requested (Jun 10): block devices table — shows
+        // ALL disks and partitions (mounted or not).
+        const blockDevs = ((d.disk || {}).block_devices) || [];
+        const bdEl = $('p-sys-blockdev');
+        if (blockDevs.length) {
+          const fmtSize = (b) => {
+            if (!b) return '—';
+            if (b >= (1024 ** 4)) return (b / (1024 ** 4)).toFixed(1) + ' TiB';
+            if (b >= (1024 ** 3)) return (b / (1024 ** 3)).toFixed(1) + ' GiB';
+            if (b >= (1024 ** 2)) return (b / (1024 ** 2)).toFixed(1) + ' MiB';
+            return b + ' B';
+          };
+          const rows = blockDevs.map(b => {
+            // Indent partitions under their parent disk.
+            const indent = b.parent ? '<span style="color: var(--muted);">└─ </span>' : '';
+            const nameCol = b.parent ? `${indent}${escapeHtml(b.name)}` : `<b>${escapeHtml(b.name)}</b>`;
+            const modelStr = b.model ? `${b.model}${b.serial ? ' · ' + b.serial.substring(0, 16) : ''}` : '';
+            return `<tr>
+              <td class="mono">/dev/${nameCol}</td>
+              <td class="mono" style="color: var(--muted);">${escapeHtml(b.type || '')}</td>
+              <td style="text-align: right;">${fmtSize(b.size_bytes)}</td>
+              <td class="mono" style="color: var(--muted);">${escapeHtml(b.fstype || '')}</td>
+              <td class="mono">${escapeHtml(b.mountpoint || '—')}</td>
+              <td style="color: var(--muted); font-size: 11px;" title="${escapeHtml(modelStr)}">${escapeHtml(modelStr.substring(0, 32))}</td>
+            </tr>`;
+          }).join('');
+          bdEl.innerHTML = `<table class="iface" style="margin-top: 4px;">
+            <thead><tr><th>Device</th><th>Type</th><th style="text-align: right;">Size</th><th>FS</th><th>Mountpoint</th><th>Model / Serial</th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>`;
+        } else {
+          bdEl.textContent = '—';
         }
 
         if (d.install_running && !pollLogTimer) {
