@@ -2,6 +2,99 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.77] - 2026-06-09
+
+**Link status + audit batch 2 (HIGH operability gaps).** Operator
+on srv06:
+
+> also show the link status of interface on admin console, also
+> check any further gaps and bugs in admin console
+
+Two parallel audit fan-outs returned **27 findings** across the
+admin HTML/JS and the /api/admin/* + /api/dpdk/* REST surface.
+This release ships the operator-explicit ask plus the three
+HIGH findings that were dropping payload on the floor.
+
+Full suite: **2,076 passed, 1 skipped** (+9 new tests).
+
+### Link status (operator ask)
+
+`/api/dpdk/interfaces` items now include a `link` block:
+
+```json
+"link": {
+  "carrier": true,
+  "speed_mbps": 25000,
+  "duplex": "full"
+}
+```
+
+Sourced from sysfs `/sys/class/net/<iface>/{carrier,speed,duplex}`.
+No ethtool subprocess (~50ms saved per call). Renders as a muted
+second line under the State pill so the table column count is
+unchanged:
+
+| State |
+|---|
+| ✓ DPDK-ready (kernel mlx5_core)<br><sub>↑ 25 Gb/s full</sub> |
+| ✗ Kernel (tg3)<br><sub>↓ link down</sub> |
+
+### Audit HIGH #1 — reboot_needed banner
+
+`/api/admin/health` has reported `reboot_needed` + `reboot_reasons[]`
+since v0.5.69 (after Configure IOMMU, after kernel-module changes)
+but the JS never read either field. Operator saw a green toast,
+walked away thinking it took effect. New gold sticky banner:
+
+```
+⚠ Host reboot required: IOMMU enable applied, vfio-pci modules
+  reloaded
+```
+
+### Audit HIGH #2 — install/upgrade-in-progress banner
+
+`/api/admin/health` exposes `install_running`, `rdma_install_running`,
+`upgrade_running`. JS only consumed the first → operators
+clicking destructive actions mid-wheel-upgrade raced and lost.
+New blue sticky banner:
+
+```
+⟳ Wheel upgrade in progress — destructive actions are blocked
+  until it finishes.
+```
+
+### Audit endpoint #1 — install lock (HIGH TOCTOU)
+
+`/api/admin/install_dpdk` had a check-then-set race:
+
+```
+POST A reads state → sees idle
+POST B reads state → sees idle
+POST A spawns Popen, writes state
+POST B spawns Popen, OVERWRITES state ← orphans A's process
+```
+
+New `_ADMIN_INSTALL_LOCK` held around the **re-check + Popen +
+state-set** window. If the slot is claimed during the window,
+the late request gets a clean 409.
+
+### Remaining audit findings (24 deferred to v0.5.78+)
+
+Categorized for the next drive:
+
+- **HIGH operability:** netgen-server service status card (#4),
+  innerHTML driver/PCI validation (#3)
+- **MEDIUM**: toast queue overlap (#5), connection-lost banner
+  (#6), modal a11y (#7), NIC table MAC/MTU/NUMA (#8), disk-space
+  visibility (#9), active-streams strip (#10), journalctl
+  download (#11), bind confirm shows IPs/streams/route (#12),
+  iommu reboot scheduling (#7-end), unbounded paginated lists
+  (#9-end), GET endpoints leaking PCI topology unauthed (#5-end)
+- **LOW:** accel empty-state visibility on AMD (#13), refresh
+  button feedback (#14), hugepages JS bounds (#15), tighten
+  PCI class 0x02 to {0200, 0207} (#8-end), `_NO_PMD_DRIVERS`
+  hoist to module scope for iface preemptive flagging (#12-end)
+
 ## [0.5.76] - 2026-06-09
 
 **DPDK Accelerators card — ioatdma out of the iface table.** Operator

@@ -14519,6 +14519,13 @@ def _parse_dpdk_devbind_status(output):
                     # back to vendor.
                     "card_model": _detect_nic_model(pci),
                     "pci_class": _cls,  # v0.5.76: surface for transparency
+                    # v0.5.77: link status (carrier + speed + duplex).
+                    # Operator on srv06: "also show the link status of
+                    # interface on admin console". Sysfs read; None on
+                    # vfio-bound rows where the kernel netdev is gone.
+                    "link": _get_link_info(iface) if iface else {
+                        "carrier": None, "speed_mbps": None, "duplex": None,
+                    },
                 })
     
     return interfaces
@@ -14785,6 +14792,44 @@ def _detect_pci_class(pci):
             return _cf.read().strip().lower().removeprefix("0x")
     except Exception:
         return None
+
+
+def _get_link_info(iface_name):
+    """v0.5.77: read link state for a kernel netdev from sysfs.
+
+    Returns a dict:
+      {"carrier": bool|None, "speed_mbps": int|None, "duplex": str|None}
+
+    None values mean sysfs couldn't be read (device removed, sub-iface
+    state mid-flap, vfio-pci bound netdev gone, etc.). Pure sysfs;
+    no ethtool subprocess (saves ~50ms per call).
+    """
+    if not iface_name or iface_name == "N/A":
+        return {"carrier": None, "speed_mbps": None, "duplex": None}
+    base = f"/sys/class/net/{iface_name}"
+    out = {"carrier": None, "speed_mbps": None, "duplex": None}
+    try:
+        with open(f"{base}/carrier") as _f:
+            out["carrier"] = _f.read().strip() == "1"
+    except Exception:
+        pass
+    try:
+        with open(f"{base}/speed") as _f:
+            _s = _f.read().strip()
+            # Kernel returns -1 (or EINVAL → not a number) for down
+            # links and non-Ethernet ports. Surface as None.
+            _i = int(_s)
+            out["speed_mbps"] = _i if _i > 0 else None
+    except Exception:
+        pass
+    try:
+        with open(f"{base}/duplex") as _f:
+            _d = _f.read().strip().lower()
+            if _d in ("full", "half"):
+                out["duplex"] = _d
+    except Exception:
+        pass
+    return out
 
 
 # v0.5.76: PCI accelerator-class → friendly label. Drives the
@@ -15573,6 +15618,14 @@ _ADMIN_INSTALL_STATE = {
     "finished_at": None,
     "return_code": None,
 }
+
+# v0.5.77 (audit endpoint #1): mutex around the check-then-spawn
+# of install_dpdk.sh / install_rdma.sh / wheel upgrade. Pre-fix
+# `if proc.poll() is None` was an unsynchronised read; two
+# parallel POSTs both saw the idle state and both spawned —
+# overwriting state dict, orphaning the first install. Held only
+# across the read + Popen, not the full install lifetime.
+_ADMIN_INSTALL_LOCK = threading.Lock()
 
 
 def _maybe_sudo(cmd):
@@ -16897,19 +16950,34 @@ def api_admin_install_dpdk():
                 "--setenv=DEBIAN_PRIORITY=critical",
                 "--",
             ] + cmd
-        new_proc = subprocess.Popen(
-            cmd,
-            stdout=log_fh, stderr=subprocess.STDOUT,
-            env=env, start_new_session=True,
-        )
+        # v0.5.77 (audit endpoint #1): re-check + spawn + commit
+        # state under _ADMIN_INSTALL_LOCK to close the check-then-
+        # set TOCTOU window. Pre-fix two parallel POSTs both saw
+        # `proc.poll() is None` at the early check, both reached
+        # this point, both spawned — second overwrote first's
+        # state dict, orphaning the first process.
+        with _ADMIN_INSTALL_LOCK:
+            _proc_now = _ADMIN_INSTALL_STATE.get("process")
+            if _proc_now and _proc_now.poll() is None:
+                return jsonify({
+                    "error": (
+                        "another install began while we were "
+                        "preparing this one"
+                    ),
+                    "log_path": _ADMIN_INSTALL_STATE.get("log_path"),
+                }), 409
+            new_proc = subprocess.Popen(
+                cmd,
+                stdout=log_fh, stderr=subprocess.STDOUT,
+                env=env, start_new_session=True,
+            )
+            _ADMIN_INSTALL_STATE["process"] = new_proc
+            _ADMIN_INSTALL_STATE["log_path"] = log_path
+            _ADMIN_INSTALL_STATE["started_at"] = _dt.datetime.now().isoformat()
+            _ADMIN_INSTALL_STATE["finished_at"] = None
+            _ADMIN_INSTALL_STATE["return_code"] = None
     except Exception as e:
         return jsonify({"error": f"Failed to launch install: {e}"}), 500
-
-    _ADMIN_INSTALL_STATE["process"] = new_proc
-    _ADMIN_INSTALL_STATE["log_path"] = log_path
-    _ADMIN_INSTALL_STATE["started_at"] = _dt.datetime.now().isoformat()
-    _ADMIN_INSTALL_STATE["finished_at"] = None
-    _ADMIN_INSTALL_STATE["return_code"] = None
 
     return jsonify({
         "started": True,
@@ -18134,6 +18202,52 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
         // v0.5.72 (audit LOW): set the document title to include
         // the hostname so multi-tab operators can tell servers apart.
         document.title = `Netgen admin — ${d.hostname}`;
+
+        // v0.5.77 (audit batch HIGH #1): reboot-required banner.
+        // /api/admin/health has reported reboot_needed since v0.5.69
+        // but the JS never rendered it. After "Configure IOMMU" the
+        // operator saw a green toast and walked away thinking it
+        // took effect — the IOMMU change actually needs a host
+        // reboot to activate.
+        let banner = $('banner-reboot');
+        if (!banner) {
+          banner = document.createElement('div');
+          banner.id = 'banner-reboot';
+          banner.style.cssText = 'grid-column: 1 / -1; padding: 10px 14px; background: #fff3cd; color: #664d03; border: 1px solid #ffc107; border-radius: 6px; margin-bottom: 12px; font-weight: 500; display: none;';
+          const g = document.querySelector('.grid');
+          if (g) g.insertBefore(banner, g.firstChild);
+        }
+        if (d.reboot_needed) {
+          const reasons = (d.reboot_reasons || []).join(', ') || 'pending kernel-level change';
+          banner.innerHTML = `⚠ <b>Host reboot required:</b> ${escapeHtml(reasons)}`;
+          banner.style.display = 'block';
+        } else {
+          banner.style.display = 'none';
+        }
+
+        // v0.5.77 (audit batch HIGH #2): install/upgrade-running
+        // indicator. /api/admin/health reports install_running,
+        // rdma_install_running, upgrade_running — JS only consumed
+        // install_running so operators clicking destructive actions
+        // mid-wheel-upgrade or mid-RDMA-install raced and lost.
+        let inflightBanner = $('banner-inflight');
+        if (!inflightBanner) {
+          inflightBanner = document.createElement('div');
+          inflightBanner.id = 'banner-inflight';
+          inflightBanner.style.cssText = 'grid-column: 1 / -1; padding: 10px 14px; background: #cfe2ff; color: #052c65; border: 1px solid #6ea8fe; border-radius: 6px; margin-bottom: 12px; font-weight: 500; display: none;';
+          const g = document.querySelector('.grid');
+          if (g) g.insertBefore(inflightBanner, g.firstChild);
+        }
+        const running = [];
+        if (d.install_running) running.push('DPDK install');
+        if (d.rdma_install_running) running.push('RDMA install');
+        if (d.upgrade_running) running.push('Wheel upgrade');
+        if (running.length) {
+          inflightBanner.innerHTML = `⟳ <b>${escapeHtml(running.join(', '))}</b> in progress — destructive actions are blocked until it finishes.`;
+          inflightBanner.style.display = 'block';
+        } else {
+          inflightBanner.style.display = 'none';
+        }
         pill($('p-dpdk'), !!d.dpdk.installed,
           d.dpdk.version ? `Installed (v${d.dpdk.version})` : 'Installed',
           'Not installed');
@@ -18725,12 +18839,31 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
           const vendorCell = cardModel
             ? `${escapeHtml(vendor)}<br><span style="color: var(--muted); font-size: 11px;">${escapeHtml(cardModel)}</span>`
             : escapeHtml(vendor);
+          // v0.5.77: operator-requested link status. Sysfs carrier
+          // + speed + duplex. Renders as a muted second line under
+          // the state pill so the table column count is unchanged.
+          // Format: "↑ 25 Gb/s full" / "↓ link down" / "—" when
+          // unknown (vfio-bound device, sub-iface mid-flap).
+          const link = i.link || {};
+          let linkLine = '';
+          if (link.carrier === true) {
+            const spd = link.speed_mbps;
+            const spdStr = spd == null ? ''
+              : (spd >= 1000 ? `${(spd / 1000).toFixed(0)} Gb/s` : `${spd} Mb/s`);
+            const dpx = link.duplex ? ` ${link.duplex}` : '';
+            linkLine = `<span style="color: var(--ok, #2a8); font-size: 11px;" title="link up${spd? ', ' + spd + ' Mbps':''}${dpx}">↑ ${escapeHtml(spdStr + dpx).trim() || 'link up'}</span>`;
+          } else if (link.carrier === false) {
+            linkLine = `<span style="color: var(--bad, #c44); font-size: 11px;" title="link down (no carrier)">↓ link down</span>`;
+          } else if (i.has_interface === false || !i.name || /\(no interface\)/.test(i.name || '')) {
+            // vfio-bound or netdev gone — no link info available.
+            linkLine = `<span style="color: var(--muted); font-size: 11px;" title="device has no kernel netdev — link status unavailable">— no netdev</span>`;
+          }
           return `
             <tr>
               <td><b>${name}</b></td>
               <td class="mono">${escapeHtml(pci)}</td>
               <td>${vendorCell}</td>
-              <td><span class="pill ${s.pillClass}" aria-label="${escapeHtml(s.pillClass + ': ' + s.label)}">${({ok:'✓ ',bad:'✗ ',warn:'! '})[s.pillClass]||''}${escapeHtml(s.label)}</span></td>
+              <td><span class="pill ${s.pillClass}" aria-label="${escapeHtml(s.pillClass + ': ' + s.label)}">${({ok:'✓ ',bad:'✗ ',warn:'! '})[s.pillClass]||''}${escapeHtml(s.label)}</span>${linkLine ? '<br>' + linkLine : ''}</td>
               <td class="mono">${escapeHtml(kdrv)}</td>
               <td>${ipCell}</td>
               <td>${queuesCell}</td>
