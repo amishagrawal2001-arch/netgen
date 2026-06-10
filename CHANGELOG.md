@@ -2,6 +2,37 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.78] - 2026-06-09
+
+**Service card + disk + connection-lost + driver allowlist + PCI
+tighten + hugepages bounds.** Continuing the "go" drive. 6 audit
+findings closed in one release.
+
+Full suite: **2,090 passed, 1 skipped** (+14 new tests).
+
+* **HIGH #4** — netgen-server service card. Pre-fix the admin
+  console showed nothing about the systemd unit serving it.
+  Now: `Service / PID-RSS / Uptime / Disk free` row pills via
+  `systemctl show` + `/proc/<pid>/stat`. Disk row colors warn
+  <1 GB, bad <100 MB.
+* **MEDIUM #6** — connection-lost banner. Tracks
+  `_lastHealthOkMs`; if stale >90s (3× the 30s poll) a sticky
+  red banner appears: `⚠ Connection lost — last update Xm Ys ago.
+  Reconnecting…`
+* **MEDIUM #9** — disk-space in `/api/admin/health`:
+  `disk: {tmp, var_lib_netgen, opt_netgen}` each with `free_mb` +
+  `total_mb`. Issues entries at <1 GB / <100 MB free.
+* **HIGH #3** — driver-name allowlist regex
+  `^[A-Za-z0-9_-]{1,32}$` before label-string interpolation in
+  JS. Defense-in-depth against unusual sysfs symlink values
+  reaching the iface table render.
+* **LOW endpoint #8** — iface-table PCI class filter tightened
+  from `startswith("02")` to `{0200, 0207}`. Excludes the rare
+  class 0280 ("other network controller", sometimes onboard
+  management chips).
+* **LOW #15** — hugepages JS bounds: typed values like `100000`
+  used to silently pass to server; now caught at `n > 65536`.
+
 ## [0.5.77] - 2026-06-09
 
 **Link status + audit batch 2 (HIGH operability gaps).** Operator

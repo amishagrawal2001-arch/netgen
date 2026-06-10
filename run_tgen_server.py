@@ -14495,7 +14495,13 @@ def _parse_dpdk_devbind_status(output):
                 _accel_drv = _drv_lc if _drv_lc in _DPDK_ACCELERATOR_CLASSES else (
                     _kdrv_lc if _kdrv_lc in _DPDK_ACCELERATOR_CLASSES else None
                 )
-                _is_network = _cls and _cls.startswith("02")
+                # v0.5.78 (audit LOW endpoint #8): tighten from
+                # `startswith("02")` to whitelist Ethernet (0200) +
+                # InfiniBand (0207) only. Pre-fix class 0280 ("Other
+                # network controller" — sometimes onboard management
+                # controllers) leaked through. NICs the operator
+                # actually traffic-generates with are always 0200/0207.
+                _is_network = _cls and _cls[:4] in ("0200", "0207")
                 if _accel_drv or (_cls and not _is_network):
                     # Route to accelerators bucket. We don't have a
                     # local var for it here in the parser (the func
@@ -16333,6 +16339,89 @@ def api_admin_health():
     out["reboot_needed"] = _reboot_needed
     out["reboot_reasons"] = _reboot_reasons
 
+    # v0.5.78 (audit HIGH #4): service status. The admin console is
+    # SERVED BY the netgen-server unit but displays nothing about
+    # it — operators can't see "active since X" or "last journal
+    # line" without SSH. Best-effort: systemctl show + journal tail.
+    service = {
+        "active": None, "since_iso": None, "pid": None,
+        "uptime_sec": None, "mem_mb": None,
+    }
+    try:
+        _r = subprocess.run(
+            ["systemctl", "show", "netgen-server",
+             "--property=ActiveState,ActiveEnterTimestamp,MainPID,MemoryCurrent"],
+            capture_output=True, text=True, timeout=3,
+        )
+        if _r.returncode == 0:
+            _kv = {}
+            for _line in _r.stdout.splitlines():
+                if "=" in _line:
+                    _k, _v = _line.split("=", 1)
+                    _kv[_k.strip()] = _v.strip()
+            service["active"] = (_kv.get("ActiveState") == "active")
+            service["since_iso"] = _kv.get("ActiveEnterTimestamp") or None
+            try:
+                service["pid"] = int(_kv.get("MainPID") or 0) or None
+            except Exception:
+                pass
+            try:
+                _mem = int(_kv.get("MemoryCurrent") or 0)
+                service["mem_mb"] = round(_mem / 1024 / 1024, 1) if _mem else None
+            except Exception:
+                pass
+    except Exception:
+        pass
+    # Uptime from /proc/<pid>/stat if we found the PID.
+    if service.get("pid"):
+        try:
+            with open("/proc/uptime") as _uf:
+                _sys_uptime = float(_uf.read().split()[0])
+            with open(f"/proc/{service['pid']}/stat") as _sf:
+                _starttime_jiffies = int(_sf.read().split()[21])
+            _hz = os.sysconf("SC_CLK_TCK")
+            service["uptime_sec"] = max(
+                0, int(_sys_uptime - _starttime_jiffies / _hz)
+            )
+        except Exception:
+            pass
+    out["service"] = service
+
+    # v0.5.78 (audit MEDIUM #9): disk-space visibility on the install
+    # + log paths. A full /tmp silently aborts install_dpdk.sh step
+    # 5; a full /var/lib/netgen corrupts bind_history.json's atomic
+    # rename. Operator has no warning until something fails.
+    disk = {}
+    import shutil as _shutil
+    for _label, _path in (
+        ("tmp", "/tmp"),
+        ("var_lib_netgen", "/var/lib/netgen"),
+        ("opt_netgen", "/opt/netgen-server"),
+    ):
+        try:
+            _u = _shutil.disk_usage(_path)
+            disk[_label] = {
+                "free_mb": _u.free // (1024 * 1024),
+                "total_mb": _u.total // (1024 * 1024),
+            }
+        except Exception:
+            disk[_label] = None
+    out["disk"] = disk
+    # Stash disk warnings — the main `issues` list isn't created
+    # until later in the function. Merged in below.
+    _disk_issues = []
+    for _label, _info in disk.items():
+        if not _info:
+            continue
+        if _info["free_mb"] < 100:
+            _disk_issues.append(
+                f"Disk critical: {_label} only {_info['free_mb']} MB free"
+            )
+        elif _info["free_mb"] < 1024:
+            _disk_issues.append(
+                f"Disk low: {_label} only {_info['free_mb']} MB free"
+            )
+
     # v0.5.74 (audit F6): RDMA stack status.
     # Pre-fix /api/admin/health surfaced DPDK / vfio / hugepages /
     # tx_worker / IOMMU but NOTHING about RDMA. The admin console
@@ -16416,6 +16505,8 @@ def api_admin_health():
     # the real "stream starts and stops" incident, so surfacing them on the
     # LED is genuinely useful.
     issues = []
+    # v0.5.78: merge disk-space warnings stashed above.
+    issues.extend(_disk_issues)
     if out["install_running"]:
         issues.append("install/build in progress")
     if out.get("rdma_install_running"):
@@ -18074,6 +18165,17 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
     <!-- v0.5.74 (audit F6): RDMA stack card. Operator-requested
          "admin console should show the status of RDMA". Mirrors
          the DPDK Runtime + Kernel Prereqs cards. -->
+    <!-- v0.5.78 (audit HIGH #4): netgen-server service status. The
+         admin console is served by the very systemd unit it claims
+         to administer; pre-fix it surfaced nothing about it. -->
+    <div class="card">
+      <h2>Server</h2>
+      <div class="row"><span class="label">Service</span><span class="pill" id="p-svc-state">…</span></div>
+      <div class="row"><span class="label">PID / RSS</span><span id="p-svc-pid">…</span></div>
+      <div class="row"><span class="label">Uptime</span><span id="p-svc-uptime">…</span></div>
+      <div class="row"><span class="label">Disk free (/tmp)</span><span id="p-disk-tmp">…</span></div>
+    </div>
+
     <div class="card">
       <h2>RDMA Stack</h2>
       <div class="row"><span class="label">perftest CLI</span><span class="pill" id="p-rdma-perftest">…</span></div>
@@ -18192,12 +18294,41 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
     let _ifacesInFlight = false;
     let _ifacesRerun = false;
 
+    // v0.5.78 (audit MEDIUM #6): connection-lost banner. Pre-fix a
+    // single fetch failure flashed a toast that dismissed in 2.5s
+    // — operator returning to a stale-green page had no signal
+    // the data was 10 minutes old. Track lastSuccessfulFetch; show
+    // sticky red banner if >90s (3× the 30s poll).
+    let _lastHealthOkMs = Date.now();
+    function _renderConnLost() {
+      let b = $('banner-conn-lost');
+      if (!b) {
+        b = document.createElement('div');
+        b.id = 'banner-conn-lost';
+        b.style.cssText = 'grid-column: 1 / -1; padding: 10px 14px; background: #f8d7da; color: #58151c; border: 1px solid #ea868f; border-radius: 6px; margin-bottom: 12px; font-weight: 500; display: none;';
+        const g = document.querySelector('.grid');
+        if (g) g.insertBefore(b, g.firstChild);
+      }
+      const elapsed = (Date.now() - _lastHealthOkMs) / 1000;
+      if (elapsed > 90) {
+        const mins = Math.floor(elapsed / 60);
+        b.textContent = `⚠ Connection lost — last update ${mins ? mins + 'm ' : ''}${Math.floor(elapsed % 60)}s ago. Reconnecting…`;
+        b.style.display = 'block';
+      } else {
+        b.style.display = 'none';
+      }
+    }
+    setInterval(_renderConnLost, 5000);
+
     async function refreshHealth() {
       if (_healthInFlight) { _healthRerun = true; return; }
       _healthInFlight = true;
       try {
         const r = await fetch('/api/admin/health');
         const d = await r.json();
+        // v0.5.78 (audit MEDIUM #6): stamp last-successful so the
+        // connection-lost banner can compute staleness.
+        _lastHealthOkMs = Date.now();
         $('hostname').textContent = `${d.hostname} — port ${d.netgen_server.port}`;
         // v0.5.72 (audit LOW): set the document title to include
         // the hostname so multi-tab operators can tell servers apart.
@@ -18293,6 +18424,35 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
           (portsActive === 0 ? 'var(--bad)' :
           (portsActive < portsTotal ? 'var(--warn)' : 'var(--ink)'))
         );
+
+        // v0.5.78 (audit HIGH #4): render the Server card with
+        // systemctl + disk info from /api/admin/health.
+        const svc = d.service || {};
+        pill($('p-svc-state'), svc.active === true, 'active', svc.active === false ? 'inactive' : 'unknown');
+        $('p-svc-pid').textContent = svc.pid
+          ? `${svc.pid}${svc.mem_mb != null ? ' • ' + svc.mem_mb + ' MB' : ''}`
+          : '—';
+        if (svc.uptime_sec != null) {
+          const u = svc.uptime_sec;
+          const d_ = Math.floor(u / 86400);
+          const h = Math.floor((u % 86400) / 3600);
+          const m = Math.floor((u % 3600) / 60);
+          $('p-svc-uptime').textContent = d_ ? `${d_}d ${h}h` : (h ? `${h}h ${m}m` : `${m}m`);
+        } else {
+          $('p-svc-uptime').textContent = '—';
+        }
+        const _diskTmp = (d.disk || {}).tmp;
+        const _diskEl = $('p-disk-tmp');
+        if (_diskTmp && _diskTmp.free_mb != null) {
+          const _gb = (_diskTmp.free_mb / 1024).toFixed(1);
+          _diskEl.textContent = `${_gb} GB`;
+          _diskEl.style.color = (
+            _diskTmp.free_mb < 100 ? 'var(--bad)' :
+            (_diskTmp.free_mb < 1024 ? 'var(--warn)' : 'var(--ink)')
+          );
+        } else {
+          _diskEl.textContent = '—';
+        }
 
         if (d.install_running && !pollLogTimer) {
           // Auto-resume polling — operator just loaded the page mid-install,
@@ -18567,7 +18727,11 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
 
     $('btn-config-hp').addEventListener('click', async () => {
       const n = parseInt($('hp-pages').value, 10);
-      if (!Number.isFinite(n) || n < 64) { toast('Enter a valid number of pages'); return; }
+      // v0.5.78 (audit LOW #15): mirror the server's upper bound
+      // in JS. Pre-fix the `<input max=65536>` only constrained
+      // spinner clicks — typed values like 100000 passed through
+      // and the server-side 400 came back as a generic "Failed:".
+      if (!Number.isFinite(n) || n < 64 || n > 65536) { toast('Pages must be 64..65536'); return; }
       await withButtonBusy('btn-config-hp', async () => {
         try {
           const r = await fetch('/api/dpdk/hugepages', {
@@ -18651,7 +18815,19 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       // We surface the button anyway — the operator may know
       // something we don't (PMD updates, custom builds) — but the
       // tooltip warns.
-      const effectiveKDriver = driver || (iface.kernel_driver || '').toLowerCase();
+      // v0.5.78 (audit HIGH #3): driver-name allowlist. Pre-fix
+      // server-supplied driver strings flowed into label-string
+      // interpolation (`'Kernel (' + driver + ')'`). The values
+      // come from `/sys/bus/pci/.../driver` symlinks — defense-
+      // in-depth says whitelist before string-interpolating in
+      // case a future kernel exposes an unusual name.
+      const _VALID_DRIVER_RE = /^[A-Za-z0-9_-]{1,32}$/;
+      const _safeDriver = (s) =>
+        (typeof s === 'string' && _VALID_DRIVER_RE.test(s)) ? s : 'unknown';
+
+      const effectiveKDriver = _safeDriver(driver) !== 'unknown'
+        ? _safeDriver(driver)
+        : _safeDriver((iface.kernel_driver || '').toLowerCase());
       if (effectiveKDriver && effectiveKDriver !== 'unknown') {
         // v0.5.75: expanded NO_PMD set + mark unbindable, not just
         // tooltipped. Pre-fix the Bind button stayed clickable on tg3
