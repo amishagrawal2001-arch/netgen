@@ -2,6 +2,36 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.83] - 2026-06-10
+
+**Help → Install Guide updated for v0.5.82 LLDP additions.**
+Operator-requested:
+
+> update the netgen server installation guide under help menu
+
+Three updates to `widgets/stream_dialog.py`'s
+`_INSTALL_GUIDE_HTML`:
+
+* **Disk footprint table** gets a new `/etc/lldpd.d/netgen-server.conf`
+  + `lldpd` package row, marked v0.5.82 — operators reading the
+  guide know what footprint to expect.
+* **"What v0.5.x install does NOT touch"** bullet list — the
+  "No apt packages installed" claim is qualified with the
+  v0.5.82 exception (single non-fatal `apt install -y lldpd`).
+  Stops the guide from misleading anyone diff-ing fresh installs
+  against the docs.
+* **New "LLDP neighbor discovery" subsection** explains what
+  lldpd does, what the admin console renders (`sys_name` /
+  port descr / mgmt IP per row, full chassis details in
+  tooltip), and how existing servers pick lldpd up (Make DPDK
+  Ready apt-deps OR manual `apt install -y lldpd`).
+* **Expected end-of-log success snippet** gets the LLDP install
+  lines and bumps the verify-OK version to 0.5.82.
+
+5 new regression tests guarding the documentation edits.
+
+Full suite: **2,133 passed, 1 skipped** (+5 new).
+
 ## [0.5.82] - 2026-06-10
 
 **LLDP neighbor in admin iface table + lldpd in fresh installer.**

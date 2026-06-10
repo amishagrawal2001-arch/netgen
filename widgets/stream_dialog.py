@@ -434,6 +434,16 @@ those failure classes entirely — the install only depends on Docker
       <td>—</td>
       <td>Flask app binds <code>0.0.0.0:5050</code>. <b>No firewall
           rules added</b> by the installer.</td></tr>
+  <tr><td><code>/etc/lldpd.d/netgen-server.conf</code> +
+          <code>lldpd</code> package <span class="ok">★ v0.5.82</span></td>
+      <td>~120 KB pkg</td>
+      <td>The installer runs <code>apt install -y lldpd</code>
+          (best-effort — failure logged + skipped, does NOT abort
+          the install) and writes a config snippet enabling
+          TX + RX with <code>tx-interval 30 / tx-hold 4</code>,
+          then <code>systemctl enable --now lldpd</code>. The
+          admin console iface table surfaces neighbors per port
+          (Switch / Eth1/0/3 / mgmt-IP) once frames arrive.</td></tr>
 </table>
 
 <p><b>Total disk footprint: ~730 MB</b> (tarball download is 196 MB,
@@ -442,8 +452,14 @@ extracted install is 633 MB, FRR image is 94 MB).</p>
 <h3>What the v0.5.x install does NOT touch</h3>
 
 <ul>
-  <li>No apt packages installed (bundled venv handles all Python
-      deps — no PEP 668 surface, no deadsnakes, no apt timeouts).</li>
+  <li>No apt packages installed for the Python runtime (bundled
+      venv handles all Python deps — no PEP 668 surface, no
+      deadsnakes, no apt timeouts). <b>Exception</b>:
+      <span class="ok">v0.5.82</span> adds a single
+      <code>apt install -y lldpd</code> call for neighbor
+      discovery — failure is non-fatal and the admin console
+      gracefully shows "(no LLDP)" per row when lldpcli isn't
+      present.</li>
   <li>No changes to system <code>python3</code> or
       <code>/usr/bin/python3</code>.</li>
   <li>No user accounts (server runs as root via systemd).</li>
@@ -454,6 +470,46 @@ extracted install is 633 MB, FRR image is 94 MB).</p>
       case <code>_resolve_db_path()</code> falls through to it
       automatically.</li>
 </ul>
+
+<h3>LLDP neighbor discovery <span class="ok">★ v0.5.82</span></h3>
+
+<p>The installer now ships <code>lldpd</code> as an integrated step
+so the admin console's iface table can show what switch + port each
+NIC is connected to — like Cisco IOS <code>show lldp neighbors</code>
+per port, but per row. Useful for fleet inventory, lab cable
+audits, and confirming the right port came up.</p>
+
+<p>What the installer does:</p>
+<ol>
+  <li><code>apt-get install -y lldpd</code> (~120 KB pkg, single
+      dep on libsnmp).</li>
+  <li>Writes <code>/etc/lldpd.d/netgen-server.conf</code> enabling
+      both TX and RX with sane defaults (<code>tx-interval 30</code>,
+      <code>tx-hold 4</code>) plus a friendly platform string
+      (<code>netgen-server</code>) so neighbor switches can identify
+      this host.</li>
+  <li><code>systemctl enable --now lldpd</code>.</li>
+</ol>
+
+<p>What the admin console does with it: the
+<code>/api/dpdk/interfaces</code> endpoint enriches each iface
+with the cached <code>lldpcli show neighbors -f json</code>
+output (30s TTL, threading-locked — one fork per refresh, not N).
+The iface table renders an <b>LLDP neighbor</b> column showing the
+switch <code>sys_name</code> and port descr/ID on a two-line cell,
+with the full chassis ID + system descr + mgmt IPs on hover.</p>
+
+<p>If lldpd fails to install (best-effort on the installer side)
+or no neighbor has been seen on a port, the cell shows
+<code>—</code> with a tooltip explaining the cause. The rest of
+the iface table works normally.</p>
+
+<p>Existing v0.5.x servers picking up v0.5.82 by wheel upgrade
+also get lldpd via the <b>Tools → DPDK → Make DPDK Ready</b> path
+— the DPDK installer's apt-deps list now includes
+<code>lldpd</code>. Or install it manually with
+<code>apt install -y lldpd &amp;&amp; systemctl enable --now
+lldpd</code> + restart netgen-server.</p>
 
 <h3>How to run a v0.5.x fresh install</h3>
 
@@ -472,12 +528,15 @@ layers are cached from a prior install.</p>
 <p>Expected end-of-log on success:</p>
 
 <pre style="background:#f0fdf4; border-left:3px solid #15803d; padding:8px;">
+[INFO] [LLDP] Installing lldpd + enabling system-wide LLDP discovery
+[INFO] [LLDP] Wrote config: /etc/lldpd.d/netgen-server.conf
+[INFO] [LLDP] lldpd is active — admin console will show neighbors as switches advertise.
 [INFO] [FRR] ✓ Image built (tagged netgen-frr:latest + ostg-frr:latest)
 [INFO] [SYSTEMD] ✓ netgen-server.service restarted
 [INFO] [PATH] ✓ /usr/local/bin/netgen-install → /opt/netgen-server/bin/netgen-install
 [INFO] [COMPAT] ✓ /opt/OSTG → /opt/netgen-server/share/netgen
 [INFO] [COMPAT] ✓ /opt/netgen → /opt/netgen-server
-[INFO] [VERIFY] ✓ Server responding: {"netgen_version":"0.5.13","status":"ok"}
+[INFO] [VERIFY] ✓ Server responding: {"netgen_version":"0.5.82","status":"ok"}
 [INFO] netgen-server installation complete.</pre>
 
 <h3>The 7 contracts CI now validates (so you don't hit them)</h3>
