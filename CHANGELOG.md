@@ -2,6 +2,125 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.84] - 2026-06-10
+
+**Admin dashboard: System Info card, Mellanox link-speed fix,
+compact CSS.** Three operator-requested changes from a single
+"go" session — combined here on release.
+
+Full suite: **2,145 passed, 1 skipped** (+12 new tests).
+
+### 1. Mellanox link-speed fix
+
+Operator on srv06:
+
+> i also see some interface are not showing speed and some are,
+> ens6np0 ... ConnectX-7 ... DPDK-ready ... [no speed shown],
+> ens2f1np1 ... ConnectX-6 ... [↑ 200 Gb/s full]
+
+Probe confirmed `_get_link_info` returned `carrier: None +
+speed_mbps: None` for srv06's ConnectX-7 ports while ConnectX-6
+ports came through fine. Root cause: sysfs
+`/sys/class/net/<n>/carrier` returns EINVAL (raises `OSError` on
+read) when `operstate=unknown` — common with mlx5 ports in
+some bonding / SR-IOV / IB-attached configurations.
+
+Fix:
+* Per-file `OSError` catches (not bare `Exception`) — one
+  failure no longer blanks the whole struct.
+* New `_ethtool_link_fallback(iface)` runs `ethtool <iface>`,
+  parses Link / Speed / Duplex, 30s TTL cache, 2s subprocess
+  timeout, `FileNotFoundError`-tolerant.
+* `_get_link_info` reads `operstate` first (always populated),
+  then falls back to ethtool for any field sysfs left `None`.
+* Admin JS treats `carrier=null + speed-present` as "link up"
+  (so the ethtool fallback actually surfaces) and adds a
+  "link state unknown" branch for the rare cases where both
+  sysfs and ethtool come up empty.
+
+### 2. System Info card
+
+Operator:
+
+> pls include additional information about the server in admin
+> dashboard, like total memory/free, total cpu/cores, total disk
+> and space/free per disk... etc
+
+`/api/admin/health` gains `system` block + extends `disk`:
+
+```json
+"system": {
+  "kernel": "5.15.0-105-generic",
+  "distro": "Ubuntu 22.04.4 LTS",
+  "arch": "x86_64",
+  "host_uptime_sec": 1056382,
+  "cpu": {
+    "model": "Intel(R) Xeon(R) Gold 6346",
+    "cores_physical": 32,
+    "cores_logical": 64,
+    "load_avg": [0.42, 0.38, 0.34]
+  },
+  "memory": {
+    "total_mb": 258512,
+    "free_mb": 163277,
+    "available_mb": 169045,
+    "used_mb": 89467,
+    "buffers_mb": 1820,
+    "cached_mb": 28432,
+    "swap_total_mb": 8192,
+    "swap_free_mb": 8192
+  }
+},
+"disk": {
+  "tmp": {...},
+  "var_lib_netgen": {...},
+  "opt_netgen": {...},
+  "mounts": [
+    {"mountpoint": "/", "device": "/dev/nvme0n1p2",
+     "fstype": "ext4", "total_mb": 102400,
+     "free_mb": 62100, "used_pct": 39},
+    ...
+  ]
+}
+```
+
+* CPU model + cores from `/proc/cpuinfo` (physical = sockets ×
+  cores-per-socket; logical = `processor :` line count).
+* Memory from `/proc/meminfo` (total/free/available/used/buffers/
+  cached/swap).
+* Kernel/distro/arch from `platform` + `/etc/os-release`.
+* Host uptime from `/proc/uptime`.
+* Disk mounts enumerated from `/proc/mounts`. Skips pseudo-FS
+  (`tmpfs`, `proc`, `sysfs`, `overlay`, `cgroup*`, ...) and
+  docker container mounts. Each row gets
+  mountpoint/device/fstype/total_mb/free_mb/used_pct. Sorted
+  largest-first, capped at 16 entries.
+
+Admin HTML adds a **System Info** card with three column groups
+(Host / CPU / Memory) plus a Disks table; rendered with
+human-readable units (GiB / MiB / d h m), `used_pct` colored
+amber ≥85%, red ≥95%.
+
+### 3. Compact admin CSS
+
+Operator screenshot + "make it compact". Tightened across the
+board — roughly 30% shorter dashboard without losing any data:
+
+| Element | Before | After |
+|---|---|---|
+| H1 | 22 px | 18 px |
+| Card padding | 16/18 | 10/12 |
+| Card H2 | 15 px, mb 10 | 13 px, mb 6 |
+| Row padding | 6 px | 3 px |
+| Pill | 2/8, 11 px | 1/7, 10 px |
+| Button | 8/14, 13 px | 5/11, 12 px |
+| Iface table padding | 8/10 | 4/8 |
+| Grid gap | 16 px | 10 px |
+| Min column | 360 px | 320 px |
+
+12 new regression tests guarding the link fallback + system
+info shape.
+
 ## [0.5.83] - 2026-06-10
 
 **Help → Install Guide updated for v0.5.82 LLDP additions.**
