@@ -13553,14 +13553,8 @@ def dpdk_bind():
                     )
                 except Exception:
                     pass
-            _NO_PMD_DRIVERS = {
-                "tg3",     # BCM5717/19/20 NetXtreme — bnxt only covers NetXtreme-E
-                "e1000",   # Legacy 82540/82573 — no DPDK PMD
-                "e1000e",  # I219/I218 — no DPDK PMD
-                "e100",    # ancient 82557/8/9
-                "r8169",   # Realtek — no PMD
-                "atlantic",  # Aquantia — no PMD
-            }
+            # v0.5.80: use the module-scope _NO_PMD_DRIVERS set
+            # (formerly duplicated inline here).
             if _drv and _drv.lower() in _NO_PMD_DRIVERS:
                 logging.warning(
                     f"[DPDK BIND] refused bind of '{interface}' on "
@@ -14532,6 +14526,14 @@ def _parse_dpdk_devbind_status(output):
                     "link": _get_link_info(iface) if iface else {
                         "carrier": None, "speed_mbps": None, "duplex": None,
                     },
+                    # v0.5.80 (audit LOW endpoint #12): preemptively
+                    # flag drivers with no DPDK PMD so the GUI can
+                    # disable the Bind button without round-tripping.
+                    # Mirrors the v0.5.75 /api/dpdk/bind 409 guard.
+                    "pmd_supported": (
+                        (driver or "").lower() not in _NO_PMD_DRIVERS
+                        and (kernel_driver or "").lower() not in _NO_PMD_DRIVERS
+                    ),
                 })
     
     return interfaces
@@ -14800,6 +14802,20 @@ def _detect_pci_class(pci):
         return None
 
 
+# v0.5.80 (audit LOW endpoint #12): hoist the no-PMD driver set to
+# module scope so /api/dpdk/interfaces can mark rows preemptively
+# (instead of only learning when the bind 409s). Same set as the
+# v0.5.75 /api/dpdk/bind guard; centralized here.
+_NO_PMD_DRIVERS = {
+    "tg3",       # BCM5717/19/20 NetXtreme — bnxt only covers NetXtreme-E
+    "e1000",     # legacy 82540/82573
+    "e1000e",    # I219/I218
+    "e100",      # ancient 82557/8/9
+    "r8169",     # Realtek
+    "atlantic",  # Aquantia
+}
+
+
 def _get_link_info(iface_name):
     """v0.5.77: read link state for a kernel netdev from sysfs.
 
@@ -14849,6 +14865,45 @@ _DPDK_ACCELERATOR_CLASSES = {
 }
 
 
+@app.route("/api/admin/journal", methods=["GET"])
+@require_role("viewer")  # v0.5.80 (audit MEDIUM #11): journal can leak PCI topology
+def admin_journal():
+    """v0.5.80 (audit MEDIUM #11): tail of netgen-server's journal.
+
+    Operator-requested observability — pre-fix the only way to
+    inspect server logs was SSH. Returns last `lines` lines
+    (capped at 500) of `journalctl -u netgen-server -n <lines>`.
+
+    Output is verbatim journal text; the admin console renders
+    it in a <pre> with monospace + scroll. No structured
+    parsing — operator reads raw.
+    """
+    try:
+        lines = int(request.args.get("lines", 50))
+    except (TypeError, ValueError):
+        lines = 50
+    lines = max(1, min(500, lines))
+    try:
+        _r = subprocess.run(
+            ["journalctl", "-u", "netgen-server",
+             "-n", str(lines), "--no-pager", "--output=short"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if _r.returncode != 0:
+            return jsonify({
+                "error": (_r.stderr or "journalctl failed").strip(),
+                "lines": [],
+            }), 500
+        return jsonify({
+            "lines": _r.stdout.splitlines(),
+            "count": len(_r.stdout.splitlines()),
+        })
+    except subprocess.TimeoutExpired:
+        return jsonify({"error": "journalctl timed out (5s)", "lines": []}), 504
+    except Exception as _e:
+        return jsonify({"error": str(_e), "lines": []}), 500
+
+
 @app.route("/api/dpdk/accelerators", methods=["GET"])
 def dpdk_accelerators():
     """v0.5.76: list non-NIC DPDK-capable PCI devices.
@@ -14872,11 +14927,19 @@ def dpdk_accelerators():
     state "DPDK accelerator (kernel ioatdma)" were. v0.5.76 moves
     them out of the iface table into their own card surfaced here.
     """
+    # v0.5.80 (audit LOW endpoint #9): cap the response so a
+    # pathological host with 1000s of PCI accelerators can't
+    # blow up the JSON payload + the admin renderer.
+    _ACCEL_CAP = 256
     out = []
+    _truncated = False
     try:
         _root = "/sys/bus/pci/devices"
         if os.path.isdir(_root):
             for bdf in sorted(os.listdir(_root)):
+                if len(out) >= _ACCEL_CAP:
+                    _truncated = True
+                    break
                 _dev_dir = os.path.join(_root, bdf)
                 # Resolve current driver via the sysfs symlink.
                 drv = None
@@ -14914,6 +14977,8 @@ def dpdk_accelerators():
     return jsonify({
         "accelerators": out,
         "counts_by_label": counts,
+        "truncated": _truncated,
+        "cap": _ACCEL_CAP,
     })
 
 
@@ -19099,10 +19164,21 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       if (!card || !wrap) return;
       try {
         const r = await fetch('/api/dpdk/accelerators');
-        if (!r.ok) { card.hidden = true; return; }
+        if (!r.ok) {
+          // v0.5.80 (audit LOW #13): differentiate fetch failure
+          // (hide card; console.warn) from genuine empty list
+          // (show card with informational note).
+          card.hidden = true;
+          console.warn('Accelerators endpoint failed:', r.status);
+          return;
+        }
         const d = await r.json();
         const list = d.accelerators || [];
-        if (!list.length) { card.hidden = true; return; }
+        if (!list.length) {
+          card.hidden = false;
+          wrap.innerHTML = '<div class="iface-empty" style="color: var(--muted); font-style: italic;">No DPDK accelerators detected on this host. Intel I/OAT DMA and DSA are CPU-internal — AMD CPUs and most non-Xeon Intel CPUs don\\'t expose them.</div>';
+          return;
+        }
         card.hidden = false;
         // Aggregated count row by label, then a compact per-device
         // table for the curious operator.
@@ -19437,6 +19513,7 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
 
 
 @app.route("/api/admin/interface_ips", methods=["GET"])
+@require_role("viewer")  # v0.5.80 (audit MEDIUM endpoint #5): leaks per-iface IPs
 def api_admin_interface_ips():
     """Return IPv4 + IPv6 addresses on every kernel-visible interface."""
     try:
@@ -19546,6 +19623,7 @@ def api_admin_interface_ip():
 
 
 @app.route("/api/admin/bind_history", methods=["GET", "POST"])
+@require_role("viewer")  # v0.5.80 (audit MEDIUM endpoint #5): leaks PCI topology + driver names
 @require_role("admin")  # v0.5.68 (C1): POST mutates the persistent registry
 def api_admin_bind_history():
     """Track / fetch original kernel names of vfio-pci bound NICs.

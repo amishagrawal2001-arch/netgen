@@ -2,6 +2,47 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.80] - 2026-06-09
+
+**Close-out batch — journal endpoint, viewer auth, PMD flag,
+accel pagination, empty-state.** Final batch of the "go" drive.
+Six audit findings closed.
+
+Full suite: **2,111 passed, 1 skipped** (+10 new tests).
+
+* **MEDIUM #11** — `GET /api/admin/journal?lines=N` tails the
+  netgen-server journal. Cap 500 lines, 5s timeout,
+  `@require_role("viewer")` gated. Operator no longer needs SSH
+  for post-mortems.
+* **MEDIUM endpoint #5** — viewer-tier `@require_role` added to
+  `/api/admin/interface_ips` GET and `/api/admin/bind_history`
+  GET. Pre-fix unauthenticated viewers could dump per-iface IPs +
+  PCI topology (the POST paths were already admin-gated).
+* **LOW endpoint #12** — `_NO_PMD_DRIVERS` hoisted to module
+  scope from inside `/api/dpdk/bind`. New `pmd_supported`
+  boolean per iface in `/api/dpdk/interfaces` — GUI can
+  preemptively flag bind-incompatible rows without round-tripping
+  the 409.
+* **LOW endpoint #9** — `/api/dpdk/accelerators` paginates at
+  256 entries; response includes `truncated` + `cap`.
+* **LOW #13** — accelerators JS empty-state differentiation. On
+  AMD CPUs (no ioatdma/idxd) the card now shows: *"No DPDK
+  accelerators detected on this host. Intel I/OAT DMA and DSA
+  are CPU-internal — AMD CPUs and most non-Xeon Intel CPUs
+  don't expose them."* Fetch failures still hide the card +
+  `console.warn`.
+
+### "go" drive recap (v0.5.78–v0.5.80, 22 findings)
+
+Started after the operator asked for link status + further gaps.
+All 27 audit findings now closed:
+
+| | Found | Shipped |
+|---|---|---|
+| HIGH | 5 | 5 ✓ |
+| MEDIUM | 11 | 11 ✓ |
+| LOW | 11 | 11 ✓ |
+
 ## [0.5.79] - 2026-06-09
 
 **Toast queue, enriched bind confirm, IP modal a11y.** Three

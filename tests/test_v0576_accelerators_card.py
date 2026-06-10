@@ -188,19 +188,22 @@ def test_admin_js_renders_accelerators_card():
 
 
 def test_admin_js_hides_card_when_no_accelerators():
-    """Most lab boxes don't have ioatdma — the card should be
-    hidden by default, only shown when the response has > 0
-    entries."""
+    """v0.5.80 changed the behavior: on empty list, the card now
+    SHOWS with an informational message (so AMD users know it's
+    not just missing). The card is still hidden on a fetch error
+    so we don't render anything when the endpoint is down."""
     src = _src()
     idx = src.find("async function refreshAccelerators(")
-    body = src[idx:idx + 2000]
+    body = src[idx:idx + 3000]
+    # The fetch-error path still hides the card.
     assert "card.hidden = true" in body, (
-        "Accelerators card not hidden when empty"
+        "Accelerators card not hidden on fetch error"
     )
-    assert re.search(
-        r"if\s*\(!list\.length\)\s*\{\s*card\.hidden\s*=\s*true",
-        body,
-    ), "No empty-list early return that hides the card"
+    # And the empty-list path now shows an informational message
+    # (v0.5.80 audit LOW #13).
+    assert "No DPDK accelerators detected" in body, (
+        "Empty-state doesn't surface a message"
+    )
 
 
 def test_pyproject_version_at_least_0576():

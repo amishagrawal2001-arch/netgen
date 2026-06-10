@@ -64,21 +64,23 @@ def _src() -> str:
 
 def test_dpdk_bind_refuses_no_pmd_drivers():
     src = _src()
-    # Find the dpdk_bind() function body.
+    # v0.5.80 hoisted _NO_PMD_DRIVERS to module scope. The bind
+    # function still references it for the 409 guard; the set
+    # itself lives outside the function now.
     m = re.search(
         r"def dpdk_bind\(\)[\s\S]+?(?=\n@app\.route|\ndef [a-z_])",
         src,
     )
     assert m
     body = m.group(0)
-    # The NO_PMD_DRIVERS set must include the canonical no-PMD
-    # drivers the operator's fleet runs.
     assert "_NO_PMD_DRIVERS" in body, (
-        "dpdk_bind doesn't define the no-PMD driver set"
+        "dpdk_bind doesn't reference the no-PMD driver set"
     )
+    # And the module-scope definition must exist and include the
+    # canonical no-PMD drivers.
     for drv in ("tg3", "e1000", "e1000e", "r8169"):
-        assert f'"{drv}"' in body, (
-            f"NO_PMD set missing {drv}"
+        assert f'"{drv}"' in src, (
+            f"_NO_PMD_DRIVERS missing {drv}"
         )
 
 
