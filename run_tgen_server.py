@@ -16814,9 +16814,13 @@ def api_admin_health():
     out["disk"] = disk
     # Stash disk warnings — the main `issues` list isn't created
     # until later in the function. Merged in below.
+    # v0.5.85 hot-fix: `disk` now has a "mounts" key (list) too,
+    # not just the three (tmp / var_lib_netgen / opt_netgen)
+    # dict entries. Skip non-dict values — the mounts list has
+    # its own per-row used_pct in the rendering layer.
     _disk_issues = []
     for _label, _info in disk.items():
-        if not _info:
+        if not isinstance(_info, dict):
             continue
         if _info["free_mb"] < 100:
             _disk_issues.append(
@@ -18536,6 +18540,34 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
   <div class="sub" id="hostname">Loading…</div>
 
   <div class="grid">
+    <!-- Operator-requested (Jun 10): host hardware info — CPU,
+         memory, kernel/distro, per-mount disk free.
+         v0.5.85: moved to top per operator. -->
+    <div class="card" style="grid-column: 1 / -1;" id="card-system-info">
+      <h2 style="margin-top: 0;">System Info</h2>
+      <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px;">
+        <div>
+          <div class="row"><span class="label">Distro</span><span id="p-sys-distro">…</span></div>
+          <div class="row"><span class="label">Kernel</span><span id="p-sys-kernel">…</span></div>
+          <div class="row"><span class="label">Architecture</span><span id="p-sys-arch">…</span></div>
+          <div class="row"><span class="label">Host uptime</span><span id="p-sys-uptime">…</span></div>
+        </div>
+        <div>
+          <div class="row"><span class="label">CPU</span><span id="p-sys-cpu-model" style="font-size: 11px;">…</span></div>
+          <div class="row"><span class="label">Cores (physical / logical)</span><span id="p-sys-cores">…</span></div>
+          <div class="row"><span class="label">Load avg (1m / 5m / 15m)</span><span id="p-sys-load">…</span></div>
+        </div>
+        <div>
+          <div class="row"><span class="label">Memory total</span><span id="p-sys-mem-total">…</span></div>
+          <div class="row"><span class="label">Memory used</span><span id="p-sys-mem-used">…</span></div>
+          <div class="row"><span class="label">Memory free</span><span id="p-sys-mem-free">…</span></div>
+          <div class="row"><span class="label">Swap (used / total)</span><span id="p-sys-swap">…</span></div>
+        </div>
+      </div>
+      <h3 style="margin: 14px 0 4px; font-size: 13px;">Disks</h3>
+      <div id="p-sys-disks" style="overflow-x: auto;">…</div>
+    </div>
+
     <div class="card" id="dpdk-card">
       <h2>DPDK Runtime</h2>
       <div class="row"><span class="label">DPDK libraries</span><span class="pill" id="p-dpdk">…</span></div>
@@ -18583,33 +18615,6 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       <div class="row"><span class="label">PID / RSS</span><span id="p-svc-pid">…</span></div>
       <div class="row"><span class="label">Uptime</span><span id="p-svc-uptime">…</span></div>
       <div class="row"><span class="label">Disk free (/tmp)</span><span id="p-disk-tmp">…</span></div>
-    </div>
-
-    <!-- Operator-requested (Jun 10): host hardware info — CPU,
-         memory, kernel/distro, per-mount disk free. -->
-    <div class="card" style="grid-column: 1 / -1;" id="card-system-info">
-      <h2 style="margin-top: 0;">System Info</h2>
-      <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px;">
-        <div>
-          <div class="row"><span class="label">Distro</span><span id="p-sys-distro">…</span></div>
-          <div class="row"><span class="label">Kernel</span><span id="p-sys-kernel">…</span></div>
-          <div class="row"><span class="label">Architecture</span><span id="p-sys-arch">…</span></div>
-          <div class="row"><span class="label">Host uptime</span><span id="p-sys-uptime">…</span></div>
-        </div>
-        <div>
-          <div class="row"><span class="label">CPU</span><span id="p-sys-cpu-model" style="font-size: 11px;">…</span></div>
-          <div class="row"><span class="label">Cores (physical / logical)</span><span id="p-sys-cores">…</span></div>
-          <div class="row"><span class="label">Load avg (1m / 5m / 15m)</span><span id="p-sys-load">…</span></div>
-        </div>
-        <div>
-          <div class="row"><span class="label">Memory total</span><span id="p-sys-mem-total">…</span></div>
-          <div class="row"><span class="label">Memory used</span><span id="p-sys-mem-used">…</span></div>
-          <div class="row"><span class="label">Memory free</span><span id="p-sys-mem-free">…</span></div>
-          <div class="row"><span class="label">Swap (used / total)</span><span id="p-sys-swap">…</span></div>
-        </div>
-      </div>
-      <h3 style="margin: 14px 0 4px; font-size: 13px;">Disks</h3>
-      <div id="p-sys-disks" style="overflow-x: auto;">…</div>
     </div>
 
     <div class="card">

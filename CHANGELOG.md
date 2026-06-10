@@ -2,6 +2,45 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.85] - 2026-06-10
+
+**Hot-fix: /api/admin/health 500 + System Info card at top.**
+Operator on srv06:
+
+> missing system info, and also move the system info on the
+> top , also seeing Loading... on top.
+
+### Root cause (found via dogfooded /api/admin/journal)
+
+```
+File "run_tgen_server.py", line 16821, in api_admin_health
+TypeError: list indices must be integers or slices, not str
+```
+
+v0.5.84 added `disk["mounts"] = [...]` (a list) to enumerate
+real filesystems. The pre-existing disk-warnings loop iterated
+ALL of `disk.items()` and did `_info["free_mb"]` on each value
+— fine for the three named dict entries, but `_info["free_mb"]`
+on the mounts list raised TypeError → entire health endpoint
+500'd → admin console JS silently failed on the first field
+assignment → hostname stayed at "Loading…", System Info card
+stayed at "…" placeholders, all the other pills froze too.
+
+### Fix
+
+* `for _label, _info in disk.items()` now skips non-dict entries
+  via `isinstance(_info, dict)`. The mounts list has its own
+  per-row used_pct surfaced through the disks table render.
+* System Info card relocated to be the **first** card in the
+  grid (operator-requested in the same message).
+* Full suite: **2,149 passed, 1 skipped** (+4 regression tests).
+
+### Why dogfooding paid off
+
+This was found in ~3 minutes via the v0.5.80
+`/api/admin/journal` endpoint — no SSH to srv06 required. The
+3-line traceback was enough to point at the exact line.
+
 ## [0.5.84] - 2026-06-10
 
 **Admin dashboard: System Info card, Mellanox link-speed fix,
