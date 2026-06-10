@@ -18434,25 +18434,29 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       font: 14px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
       margin: 0; padding: 24px; background: var(--bg); color: var(--ink);
     }
-    h1 { margin: 0 0 4px; font-size: 22px; }
-    .sub { color: var(--muted); margin-bottom: 24px; font-size: 12px; }
-    .grid { display: grid; gap: 16px; grid-template-columns: repeat(auto-fit, minmax(360px, 1fr)); }
+    /* Operator-requested compact mode (Jun 10 2026): tightened
+       paddings, smaller headings, denser rows. Total dashboard
+       height roughly 30% shorter without losing any data. */
+    h1 { margin: 0 0 2px; font-size: 18px; }
+    .sub { color: var(--muted); margin-bottom: 12px; font-size: 11px; }
+    .grid { display: grid; gap: 10px; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); }
     .card {
-      background: var(--card); border: 1px solid var(--border); border-radius: 8px;
-      padding: 16px 18px; box-shadow: 0 1px 2px rgba(0,0,0,0.04);
+      background: var(--card); border: 1px solid var(--border); border-radius: 6px;
+      padding: 10px 12px; box-shadow: 0 1px 2px rgba(0,0,0,0.04);
     }
-    .card h2 { margin: 0 0 10px; font-size: 15px; font-weight: 600; }
-    .row { display: flex; justify-content: space-between; align-items: center; padding: 6px 0; border-bottom: 1px dashed var(--border); }
+    .card h2 { margin: 0 0 6px; font-size: 13px; font-weight: 600; }
+    .card h3 { margin: 8px 0 4px; font-size: 12px; font-weight: 600; }
+    .row { display: flex; justify-content: space-between; align-items: center; padding: 3px 0; border-bottom: 1px dashed var(--border); font-size: 12px; }
     .row:last-child { border-bottom: 0; }
     .row .label { color: var(--muted); }
-    .pill { padding: 2px 8px; border-radius: 999px; font-size: 11px; font-weight: 600; }
+    .pill { padding: 1px 7px; border-radius: 999px; font-size: 10px; font-weight: 600; }
     .pill.ok { background: #d1fae5; color: #065f46; }
     .pill.bad { background: #fee2e2; color: #991b1b; }
     .pill.warn { background: #fef3c7; color: #92400e; }
-    .actions { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
+    .actions { display: flex; gap: 6px; margin-top: 8px; flex-wrap: wrap; }
     button {
-      background: var(--accent); color: white; border: 0; border-radius: 6px;
-      padding: 8px 14px; font-size: 13px; font-weight: 500; cursor: pointer;
+      background: var(--accent); color: white; border: 0; border-radius: 5px;
+      padding: 5px 11px; font-size: 12px; font-weight: 500; cursor: pointer;
     }
     button.secondary { background: #6b7280; }
     button.danger { background: var(--bad); }
@@ -18464,17 +18468,17 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       font: 12px/1.5 ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
       white-space: pre-wrap; word-wrap: break-word;
     }
-    input[type=number] { padding: 6px 8px; border: 1px solid var(--border); border-radius: 4px; width: 100px; }
-    .install-status { font-size: 12px; color: var(--muted); margin-top: 8px; }
-    table.iface { width: 100%; border-collapse: collapse; font-size: 12px; margin-top: 4px; }
+    input[type=number] { padding: 4px 6px; border: 1px solid var(--border); border-radius: 4px; width: 80px; font-size: 12px; }
+    .install-status { font-size: 11px; color: var(--muted); margin-top: 6px; }
+    table.iface { width: 100%; border-collapse: collapse; font-size: 11px; margin-top: 4px; }
     table.iface th, table.iface td {
-      text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border);
+      text-align: left; padding: 4px 8px; border-bottom: 1px solid var(--border);
       vertical-align: middle;
     }
-    table.iface th { background: #f9fafb; color: var(--muted); font-weight: 600; font-size: 11px; text-transform: uppercase; letter-spacing: 0.4px; }
+    table.iface th { background: #f9fafb; color: var(--muted); font-weight: 600; font-size: 10px; text-transform: uppercase; letter-spacing: 0.4px; }
     table.iface td.mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace; font-size: 11px; }
     table.iface tr:hover td { background: #f9fafb; }
-    table.iface button { padding: 4px 10px; font-size: 12px; }
+    table.iface button { padding: 3px 8px; font-size: 11px; }
     .iface-empty { padding: 16px; color: var(--muted); text-align: center; font-style: italic; }
     .ip-cell { font-family: ui-monospace, monospace; font-size: 11px; line-height: 1.5; max-width: 240px; }
     .ip-cell .ip-line { display: block; }
