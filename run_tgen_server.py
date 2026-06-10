@@ -14917,41 +14917,131 @@ def _get_lldp_neighbor(iface_name):
     return by_iface.get(iface_name)
 
 
-def _get_link_info(iface_name):
-    """v0.5.77: read link state for a kernel netdev from sysfs.
+_ETHTOOL_CACHE = {}  # iface → (ts, dict)
+_ETHTOOL_CACHE_TTL = 30.0
+_ETHTOOL_LOCK = threading.Lock()
 
-    Returns a dict:
-      {"carrier": bool|None, "speed_mbps": int|None, "duplex": str|None}
 
-    None values mean sysfs couldn't be read (device removed, sub-iface
-    state mid-flap, vfio-pci bound netdev gone, etc.). Pure sysfs;
-    no ethtool subprocess (saves ~50ms per call).
+def _ethtool_link_fallback(iface_name):
+    """Operator-bite (Jun 10 2026): some Mellanox ConnectX-7 ports
+    on srv06 (ens6np0, ens7f0/1) returned `carrier: None` from
+    sysfs while ConnectX-6 cards (ens2f0/1) returned full data.
+
+    Root cause: sysfs `carrier` / `speed` files return -EINVAL
+    (raises OSError on open() in some kernels) when the kernel
+    netdev's operstate is `unknown` — common with mlx5 ports in
+    certain bonding / SR-IOV / IB-attached configurations.
+    `ethtool <iface>` queries the driver directly via
+    ETHTOOL_GLINKSETTINGS ioctl, which works in those cases.
+
+    Cached 30s — same TTL as LLDP. Returns
+    `{carrier: bool|None, speed_mbps: int|None, duplex: str|None}`.
     """
     if not iface_name or iface_name == "N/A":
-        return {"carrier": None, "speed_mbps": None, "duplex": None}
+        return {}
+    import time as _time
+    now = _time.monotonic()
+    with _ETHTOOL_LOCK:
+        ent = _ETHTOOL_CACHE.get(iface_name)
+        if ent and (now - ent[0]) < _ETHTOOL_CACHE_TTL:
+            return ent[1]
+        out = {}
+        try:
+            _r = subprocess.run(
+                ["ethtool", iface_name],
+                capture_output=True, text=True, timeout=2,
+            )
+            if _r.returncode == 0:
+                for line in _r.stdout.splitlines():
+                    line = line.strip()
+                    if line.startswith("Link detected:"):
+                        out["carrier"] = line.split(":", 1)[1].strip().lower() == "yes"
+                    elif line.startswith("Speed:"):
+                        # e.g. "Speed: 200000Mb/s" or "Speed: Unknown!"
+                        _v = line.split(":", 1)[1].strip()
+                        m = re.match(r"(\d+)\s*[GM]?b/s", _v, re.IGNORECASE)
+                        if m:
+                            n = int(m.group(1))
+                            # Heuristic: ethtool typically prints
+                            # Mb/s, but some kernels print "200G".
+                            if "Gb/s" in _v or "GB" in _v.upper():
+                                n *= 1000
+                            out["speed_mbps"] = n if n > 0 else None
+                    elif line.startswith("Duplex:"):
+                        _d = line.split(":", 1)[1].strip().lower()
+                        if _d in ("full", "half"):
+                            out["duplex"] = _d
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+        except Exception as _e:
+            logging.debug(f"[ETHTOOL] {iface_name}: {_e}")
+        _ETHTOOL_CACHE[iface_name] = (now, out)
+        return out
+
+
+def _get_link_info(iface_name):
+    """Read link state for a kernel netdev.
+
+    v0.5.77 original: sysfs only.
+    v0.5.84 (operator-bite Jun 10): adds operstate, individual-
+    file OSError tolerance, and ethtool fallback for fields sysfs
+    couldn't read. Fixes srv06 Mellanox ConnectX-7 ports showing
+    no speed.
+
+    Returns a dict:
+      {
+        "carrier": bool|None,
+        "speed_mbps": int|None,
+        "duplex": str|None,
+        "operstate": str|None  # "up"|"down"|"unknown"|None
+      }
+
+    None values mean both sysfs AND ethtool couldn't determine
+    the field. Front-end shows a contextual placeholder.
+    """
+    if not iface_name or iface_name == "N/A":
+        return {"carrier": None, "speed_mbps": None,
+                "duplex": None, "operstate": None}
     base = f"/sys/class/net/{iface_name}"
-    out = {"carrier": None, "speed_mbps": None, "duplex": None}
+    out = {"carrier": None, "speed_mbps": None,
+           "duplex": None, "operstate": None}
+    # operstate is the most reliable read — even unmanaged drivers
+    # populate it.
+    try:
+        with open(f"{base}/operstate") as _f:
+            _o = _f.read().strip().lower()
+            if _o:
+                out["operstate"] = _o
+    except OSError:
+        pass
+    # carrier may EINVAL on operstate=unknown — catch individually.
     try:
         with open(f"{base}/carrier") as _f:
             out["carrier"] = _f.read().strip() == "1"
-    except Exception:
+    except OSError:
         pass
     try:
         with open(f"{base}/speed") as _f:
-            _s = _f.read().strip()
-            # Kernel returns -1 (or EINVAL → not a number) for down
-            # links and non-Ethernet ports. Surface as None.
-            _i = int(_s)
+            _i = int(_f.read().strip())
             out["speed_mbps"] = _i if _i > 0 else None
-    except Exception:
+    except (OSError, ValueError):
         pass
     try:
         with open(f"{base}/duplex") as _f:
             _d = _f.read().strip().lower()
             if _d in ("full", "half"):
                 out["duplex"] = _d
-    except Exception:
+    except OSError:
         pass
+
+    # ethtool fallback for ANY field sysfs left as None. Only forks
+    # ethtool when we genuinely need it (and caches 30s).
+    if out["carrier"] is None or out["speed_mbps"] is None or out["duplex"] is None:
+        ethtool = _ethtool_link_fallback(iface_name)
+        for k in ("carrier", "speed_mbps", "duplex"):
+            if out[k] is None and ethtool.get(k) is not None:
+                out[k] = ethtool[k]
+
     return out
 
 
@@ -16553,6 +16643,99 @@ def api_admin_health():
             pass
     out["service"] = service
 
+    # Operator-requested (Jun 10 2026): expose host hardware in the
+    # admin dashboard — total/free memory, CPU model + core count,
+    # per-mount disk free, kernel/distro, host uptime. Cheap reads
+    # (all /proc + shutil + platform), no subprocess except a
+    # one-time read of /etc/os-release.
+    system = {
+        "kernel": None, "distro": None, "arch": None,
+        "host_uptime_sec": None,
+        "cpu": {"model": None, "cores_physical": None,
+                "cores_logical": None, "load_avg": None},
+        "memory": {"total_mb": None, "free_mb": None,
+                   "available_mb": None, "used_mb": None,
+                   "buffers_mb": None, "cached_mb": None,
+                   "swap_total_mb": None, "swap_free_mb": None},
+    }
+    try:
+        import platform as _plat
+        system["kernel"] = _plat.release()
+        system["arch"] = _plat.machine()
+    except Exception:
+        pass
+    # Distro from /etc/os-release.
+    try:
+        with open("/etc/os-release") as _of:
+            for line in _of:
+                if line.startswith("PRETTY_NAME="):
+                    system["distro"] = line.split("=", 1)[1].strip().strip('"')
+                    break
+    except Exception:
+        pass
+    # Host uptime — different from service uptime; spans the kernel.
+    try:
+        with open("/proc/uptime") as _f:
+            system["host_uptime_sec"] = int(float(_f.read().split()[0]))
+    except Exception:
+        pass
+    # CPU model + core counts.
+    try:
+        with open("/proc/cpuinfo") as _f:
+            _content = _f.read()
+        # First "model name" wins — all sockets typically identical.
+        m = re.search(r"^model name\s*:\s*(.+)$", _content, re.MULTILINE)
+        if m:
+            system["cpu"]["model"] = m.group(1).strip()
+        # cores per socket × sockets = physical cores.
+        sockets = len(set(re.findall(
+            r"^physical id\s*:\s*(\d+)$", _content, re.MULTILINE
+        )))
+        cores_each = re.search(
+            r"^cpu cores\s*:\s*(\d+)$", _content, re.MULTILINE
+        )
+        if sockets and cores_each:
+            system["cpu"]["cores_physical"] = sockets * int(cores_each.group(1))
+        # Logical = all "processor :" lines.
+        system["cpu"]["cores_logical"] = len(re.findall(
+            r"^processor\s*:", _content, re.MULTILINE
+        ))
+    except Exception:
+        pass
+    try:
+        system["cpu"]["load_avg"] = list(os.getloadavg())
+    except Exception:
+        pass
+    # Memory from /proc/meminfo. All values in kB.
+    try:
+        meminfo = {}
+        with open("/proc/meminfo") as _f:
+            for line in _f:
+                k, _, rest = line.partition(":")
+                _v = rest.strip().split()
+                if _v:
+                    try:
+                        meminfo[k.strip()] = int(_v[0])
+                    except ValueError:
+                        pass
+        def _to_mb(k):
+            return meminfo[k] // 1024 if k in meminfo else None
+        system["memory"]["total_mb"] = _to_mb("MemTotal")
+        system["memory"]["free_mb"] = _to_mb("MemFree")
+        system["memory"]["available_mb"] = _to_mb("MemAvailable")
+        system["memory"]["buffers_mb"] = _to_mb("Buffers")
+        system["memory"]["cached_mb"] = _to_mb("Cached")
+        system["memory"]["swap_total_mb"] = _to_mb("SwapTotal")
+        system["memory"]["swap_free_mb"] = _to_mb("SwapFree")
+        if system["memory"]["total_mb"] and system["memory"]["available_mb"] is not None:
+            system["memory"]["used_mb"] = (
+                system["memory"]["total_mb"]
+                - system["memory"]["available_mb"]
+            )
+    except Exception:
+        pass
+    out["system"] = system
+
     # v0.5.78 (audit MEDIUM #9): disk-space visibility on the install
     # + log paths. A full /tmp silently aborts install_dpdk.sh step
     # 5; a full /var/lib/netgen corrupts bind_history.json's atomic
@@ -16572,6 +16755,62 @@ def api_admin_health():
             }
         except Exception:
             disk[_label] = None
+    # Operator-requested (Jun 10): enumerate every real mounted
+    # filesystem so the dashboard shows per-disk free/total, not
+    # just the three netgen-relevant paths.
+    mounts = []
+    try:
+        # Skip pseudo-FS types — they're not "disks" in the
+        # operator's mental model.
+        _skip_types = {
+            "tmpfs", "devtmpfs", "proc", "sysfs", "cgroup",
+            "cgroup2", "pstore", "bpf", "tracefs", "debugfs",
+            "securityfs", "configfs", "fusectl", "mqueue",
+            "hugetlbfs", "ramfs", "rpc_pipefs", "autofs",
+            "binfmt_misc", "selinuxfs", "fuse.snapfuse",
+            "fuse.gvfsd-fuse", "nsfs", "overlay", "squashfs",
+        }
+        _seen_devices = set()
+        with open("/proc/mounts") as _mf:
+            for line in _mf:
+                parts = line.split()
+                if len(parts) < 3:
+                    continue
+                device, mountpoint, fstype = parts[0], parts[1], parts[2]
+                if fstype in _skip_types:
+                    continue
+                # Dedupe bind mounts pointing at the same device.
+                if device.startswith("/dev/") and device in _seen_devices:
+                    continue
+                _seen_devices.add(device)
+                # Filter to mountpoints rooted in / (skip
+                # /var/lib/docker/overlay2/* containers).
+                if "/docker/" in mountpoint or "/containers/" in mountpoint:
+                    continue
+                try:
+                    _u = _shutil.disk_usage(mountpoint)
+                except Exception:
+                    continue
+                mounts.append({
+                    "mountpoint": mountpoint,
+                    "device": device,
+                    "fstype": fstype,
+                    "total_mb": _u.total // (1024 * 1024),
+                    "free_mb": _u.free // (1024 * 1024),
+                    "used_pct": (
+                        int(100 * (_u.total - _u.free) / _u.total)
+                        if _u.total else 0
+                    ),
+                })
+        # Sort largest-first so the boot disk floats to the top.
+        mounts.sort(key=lambda m: -m["total_mb"])
+        # Cap to 16 entries — enterprise boxes with many LUNs
+        # don't need to spam the dashboard.
+        if len(mounts) > 16:
+            mounts = mounts[:16]
+    except Exception as _de:
+        logging.debug(f"[DISK] /proc/mounts read failed: {_de}")
+    disk["mounts"] = mounts
     out["disk"] = disk
     # Stash disk warnings — the main `issues` list isn't created
     # until later in the function. Merged in below.
@@ -18342,6 +18581,33 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       <div class="row"><span class="label">Disk free (/tmp)</span><span id="p-disk-tmp">…</span></div>
     </div>
 
+    <!-- Operator-requested (Jun 10): host hardware info — CPU,
+         memory, kernel/distro, per-mount disk free. -->
+    <div class="card" style="grid-column: 1 / -1;" id="card-system-info">
+      <h2 style="margin-top: 0;">System Info</h2>
+      <div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 16px;">
+        <div>
+          <div class="row"><span class="label">Distro</span><span id="p-sys-distro">…</span></div>
+          <div class="row"><span class="label">Kernel</span><span id="p-sys-kernel">…</span></div>
+          <div class="row"><span class="label">Architecture</span><span id="p-sys-arch">…</span></div>
+          <div class="row"><span class="label">Host uptime</span><span id="p-sys-uptime">…</span></div>
+        </div>
+        <div>
+          <div class="row"><span class="label">CPU</span><span id="p-sys-cpu-model" style="font-size: 11px;">…</span></div>
+          <div class="row"><span class="label">Cores (physical / logical)</span><span id="p-sys-cores">…</span></div>
+          <div class="row"><span class="label">Load avg (1m / 5m / 15m)</span><span id="p-sys-load">…</span></div>
+        </div>
+        <div>
+          <div class="row"><span class="label">Memory total</span><span id="p-sys-mem-total">…</span></div>
+          <div class="row"><span class="label">Memory used</span><span id="p-sys-mem-used">…</span></div>
+          <div class="row"><span class="label">Memory free</span><span id="p-sys-mem-free">…</span></div>
+          <div class="row"><span class="label">Swap (used / total)</span><span id="p-sys-swap">…</span></div>
+        </div>
+      </div>
+      <h3 style="margin: 14px 0 4px; font-size: 13px;">Disks</h3>
+      <div id="p-sys-disks" style="overflow-x: auto;">…</div>
+    </div>
+
     <div class="card">
       <h2>RDMA Stack</h2>
       <div class="row"><span class="label">perftest CLI</span><span class="pill" id="p-rdma-perftest">…</span></div>
@@ -18641,6 +18907,71 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
           );
         } else {
           _diskEl.textContent = '—';
+        }
+
+        // Operator-requested (Jun 10): system info card render.
+        // CPU / memory / kernel / per-mount disk usage.
+        const sys = d.system || {};
+        const fmtUptime = (s) => {
+          if (!Number.isFinite(s)) return '—';
+          const d_ = Math.floor(s / 86400);
+          const h = Math.floor((s % 86400) / 3600);
+          const m = Math.floor((s % 3600) / 60);
+          return d_ ? `${d_}d ${h}h ${m}m` : (h ? `${h}h ${m}m` : `${m}m`);
+        };
+        const fmtMb = (mb) => {
+          if (mb == null) return '—';
+          if (mb >= 1024) return `${(mb / 1024).toFixed(1)} GiB`;
+          return `${mb} MiB`;
+        };
+        $('p-sys-distro').textContent = sys.distro || '—';
+        $('p-sys-kernel').textContent = sys.kernel || '—';
+        $('p-sys-arch').textContent = sys.arch || '—';
+        $('p-sys-uptime').textContent = fmtUptime(sys.host_uptime_sec);
+        const cpu = sys.cpu || {};
+        const cpuEl = $('p-sys-cpu-model');
+        cpuEl.textContent = cpu.model || '—';
+        cpuEl.title = cpu.model || '';
+        $('p-sys-cores').textContent =
+          (cpu.cores_physical != null && cpu.cores_logical != null)
+            ? `${cpu.cores_physical} / ${cpu.cores_logical}`
+            : (cpu.cores_logical != null ? `— / ${cpu.cores_logical}` : '—');
+        $('p-sys-load').textContent = Array.isArray(cpu.load_avg)
+          ? cpu.load_avg.map(v => v.toFixed(2)).join(' / ')
+          : '—';
+        const mem = sys.memory || {};
+        $('p-sys-mem-total').textContent = fmtMb(mem.total_mb);
+        $('p-sys-mem-used').textContent =
+          (mem.used_mb != null && mem.total_mb)
+            ? `${fmtMb(mem.used_mb)} (${Math.round(100 * mem.used_mb / mem.total_mb)}%)`
+            : '—';
+        $('p-sys-mem-free').textContent = fmtMb(mem.available_mb != null ? mem.available_mb : mem.free_mb);
+        $('p-sys-swap').textContent =
+          (mem.swap_total_mb != null && mem.swap_free_mb != null && mem.swap_total_mb > 0)
+            ? `${fmtMb(mem.swap_total_mb - mem.swap_free_mb)} / ${fmtMb(mem.swap_total_mb)}`
+            : 'none';
+        // Disks table.
+        const mounts = ((d.disk || {}).mounts) || [];
+        const disksEl = $('p-sys-disks');
+        if (mounts.length) {
+          const rows = mounts.map(m => {
+            const usedColor = m.used_pct >= 95 ? 'var(--bad)'
+                            : (m.used_pct >= 85 ? 'var(--warn)' : 'inherit');
+            return `<tr>
+              <td class="mono">${escapeHtml(m.mountpoint)}</td>
+              <td class="mono" style="color: var(--muted);">${escapeHtml(m.device || '')}</td>
+              <td class="mono" style="color: var(--muted);">${escapeHtml(m.fstype || '')}</td>
+              <td style="text-align: right;">${fmtMb(m.total_mb)}</td>
+              <td style="text-align: right;">${fmtMb(m.free_mb)}</td>
+              <td style="text-align: right; color: ${usedColor};">${m.used_pct}%</td>
+            </tr>`;
+          }).join('');
+          disksEl.innerHTML = `<table class="iface" style="margin-top: 4px;">
+            <thead><tr><th>Mount</th><th>Device</th><th>FS</th><th style="text-align: right;">Total</th><th style="text-align: right;">Free</th><th style="text-align: right;">Used</th></tr></thead>
+            <tbody>${rows}</tbody>
+          </table>`;
+        } else {
+          disksEl.textContent = '—';
         }
 
         if (d.install_running && !pollLogTimer) {
@@ -19236,14 +19567,25 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
           // unknown (vfio-bound device, sub-iface mid-flap).
           const link = i.link || {};
           let linkLine = '';
-          if (link.carrier === true) {
-            const spd = link.speed_mbps;
-            const spdStr = spd == null ? ''
-              : (spd >= 1000 ? `${(spd / 1000).toFixed(0)} Gb/s` : `${spd} Mb/s`);
-            const dpx = link.duplex ? ` ${link.duplex}` : '';
-            linkLine = `<span style="color: var(--ok, #2a8); font-size: 11px;" title="link up${spd? ', ' + spd + ' Mbps':''}${dpx}">↑ ${escapeHtml(spdStr + dpx).trim() || 'link up'}</span>`;
+          // Operator-bite (Jun 10 2026): Mellanox ConnectX-7 ports on
+          // srv06 had carrier=null + speed=null while the link was
+          // visibly up. v0.5.84 added ethtool fallback so speed comes
+          // through even when sysfs carrier file EINVALs. If carrier
+          // is still null but we got a speed back, render it as up.
+          const _spd = link.speed_mbps;
+          const _dpx = link.duplex;
+          const _hasSpeed = _spd != null && _spd > 0;
+          if (link.carrier === true || (link.carrier == null && _hasSpeed)) {
+            const spdStr = _spd == null ? ''
+              : (_spd >= 1000 ? `${(_spd / 1000).toFixed(0)} Gb/s` : `${_spd} Mb/s`);
+            const dpxStr = _dpx ? ` ${_dpx}` : '';
+            linkLine = `<span style="color: var(--ok, #2a8); font-size: 11px;" title="link up${_spd? ', ' + _spd + ' Mbps':''}${dpxStr}">↑ ${escapeHtml(spdStr + dpxStr).trim() || 'link up'}</span>`;
           } else if (link.carrier === false) {
             linkLine = `<span style="color: var(--bad, #c44); font-size: 11px;" title="link down (no carrier)">↓ link down</span>`;
+          } else if (link.operstate === 'unknown') {
+            // sysfs + ethtool both inconclusive — Mellanox in IB
+            // mode, bonded slave, etc.
+            linkLine = `<span style="color: var(--muted); font-size: 11px;" title="operstate=unknown — likely bonded, IB-mode, or driver doesn't report carrier">link state unknown</span>`;
           } else if (i.has_interface === false || !i.name || /\(no interface\)/.test(i.name || '')) {
             // vfio-bound or netdev gone — no link info available.
             linkLine = `<span style="color: var(--muted); font-size: 11px;" title="device has no kernel netdev — link status unavailable">— no netdev</span>`;
