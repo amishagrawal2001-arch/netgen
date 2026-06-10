@@ -18932,7 +18932,7 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
         ]);
         const noPmd = NO_PMD.has(effectiveKDriver);
         const hint = noPmd
-          ? `${effectiveKDriver} has no DPDK PMD in stock DPDK. vfio-pci will claim the device but DPDK apps won\\'t recognise it.`
+          ? `${effectiveKDriver} has no DPDK PMD in stock DPDK. vfio-pci will claim the device but DPDK apps won't recognise it.`
           : null;
         return {
           label: 'Kernel (' + effectiveKDriver + ')',
@@ -19176,7 +19176,17 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
         const list = d.accelerators || [];
         if (!list.length) {
           card.hidden = false;
-          wrap.innerHTML = '<div class="iface-empty" style="color: var(--muted); font-style: italic;">No DPDK accelerators detected on this host. Intel I/OAT DMA and DSA are CPU-internal — AMD CPUs and most non-Xeon Intel CPUs don\\'t expose them.</div>';
+          // v0.5.81: avoid the JS apostrophe-escape trap. The
+          // previous wording used a backslash-escaped apostrophe.
+          // The Python source (regular non-raw triple-quoted
+          // string) collapsed the double backslash, and the
+          // browser saw a backslash-apostrophe pair inside a
+          // single-quoted JS string. JS read the backslash as
+          // an escape, then the apostrophe terminated the string
+          // prematurely. Result: SyntaxError, all admin JS dead,
+          // console stuck on Loading. Operator-bite on srv06.
+          // Fix: backtick template literal sidesteps escaping.
+          wrap.innerHTML = `<div class="iface-empty" style="color: var(--muted); font-style: italic;">No DPDK accelerators detected on this host. Intel I/OAT DMA and DSA are CPU-internal — AMD CPUs and most non-Xeon Intel CPUs do not expose them.</div>`;
           return;
         }
         card.hidden = false;

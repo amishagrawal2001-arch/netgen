@@ -2,6 +2,52 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.81] - 2026-06-09
+
+**Hot-fix: admin console stuck on "Loading…" (JS SyntaxError).**
+Operator on srv06:
+
+> failing to load admin console and stuck in Loading…
+
+### Root cause
+
+v0.5.80's accelerators empty-state used a single-quoted JS string
+containing the English contraction `don't`. The Python source had
+backslash-apostrophe written as `\\'` to escape both backslash and
+apostrophe. Python's regular triple-quoted string then collapsed
+`\\` → `\`, so the JS source contained `don\\'t`. JS parsed `\\`
+as one literal backslash and the following `'` terminated the
+string prematurely:
+
+```
+SyntaxError: Unexpected identifier 't'
+```
+
+→ entire admin JS dead → all pills/banners/iface table stuck on
+the initial "Loading…" placeholders. No console errors visible
+because the script tag never ran past the SyntaxError.
+
+### Fix
+
+* Accelerators empty-state innerHTML now uses a backtick template
+  literal and reworded to "do not" to remove the apostrophe
+  entirely — belt and suspenders.
+* v0.5.75's NO_PMD tooltip (template literal but had the same
+  `\\'` pattern) cleaned up to plain apostrophe.
+
+### Regression guard
+
+New tests/test_v0581_admin_js_syntax_guard.py scans the entire
+file for `\\'` patterns (the canonical trap) and fails CI if any
+appear.
+
+Full suite: **2,114 passed, 1 skipped** (+3 new tests).
+
+### Operator action
+
+Wheel-upgrade srv06 to v0.5.81 + restart netgen-server. Admin
+console will populate normally.
+
 ## [0.5.80] - 2026-06-09
 
 **Close-out batch — journal endpoint, viewer auth, PMD flag,
