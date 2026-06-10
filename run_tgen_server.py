@@ -18272,9 +18272,32 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       if (ok === true) { el.classList.add('ok'); el.textContent = okText || '✓'; }
       else { el.classList.add('bad'); el.textContent = badText || '✗'; }
     };
+    // v0.5.79 (audit MEDIUM #5): toast queue. Pre-fix toast() used
+    // a single fixed DOM node with one clearTimeout slot — two
+    // rapid calls (e.g. `Binding…` then `Bind failed: ...`)
+    // overwrote each other before the operator could read the
+    // first. Now each call creates a child node in a stacked
+    // container; auto-dismiss 2.5s for success, sticky-until-click
+    // for failure (text starts with "Failed:" or "✗ ").
     const toast = (msg) => {
-      const t = $('toast'); t.textContent = msg; t.classList.add('show');
-      clearTimeout(toast._h); toast._h = setTimeout(() => t.classList.remove('show'), 2500);
+      let host = $('toast-host');
+      if (!host) {
+        host = document.createElement('div');
+        host.id = 'toast-host';
+        host.style.cssText = 'position: fixed; bottom: 24px; right: 24px; display: flex; flex-direction: column-reverse; gap: 8px; z-index: 9999; pointer-events: none;';
+        document.body.appendChild(host);
+      }
+      const n = document.createElement('div');
+      const sticky = /^(failed:|✗ |⚠ )/i.test(msg || '');
+      n.className = 'toast show' + (sticky ? ' toast-sticky' : '');
+      n.style.cssText = 'background:#222; color:#fff; padding:10px 14px; border-radius:6px; font-size:13px; max-width: 480px; box-shadow: 0 4px 12px rgba(0,0,0,0.3); pointer-events: auto; cursor: pointer;';
+      if (sticky) n.style.background = '#722';
+      n.textContent = msg;
+      n.addEventListener('click', () => n.remove());
+      host.appendChild(n);
+      if (!sticky) {
+        setTimeout(() => { try { n.remove(); } catch (_) {} }, 3000);
+      }
     };
 
     let pollLogTimer = null;
@@ -19055,6 +19078,10 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
           </div>`;
         // Stash the list so click handlers can look up by index.
         wrap._ifaces = list;
+        // v0.5.79 (audit MEDIUM #12): also stash streamSummary so
+        // the bind-confirm dialog can show "N running streams will
+        // be disrupted" before the operator commits.
+        wrap._streamSummary = streamSummary;
       } catch (e) {
         wrap.innerHTML = '<div class="iface-empty">Error: ' + escapeHtml(String(e)) + '</div>';
       } finally {
@@ -19224,7 +19251,24 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       if (!iface) return;
       const action = btn.dataset.action;
       if (action === 'bind') {
-        if (!confirm(`Bind ${iface.name || iface.pci} to vfio-pci? It will become invisible to the kernel.`)) return;
+        // v0.5.79 (audit MEDIUM #12): enrich the confirm with what
+        // the bind will actually break — IPs configured, running
+        // streams, default-route status. Pre-fix the operator only
+        // saw "It will become invisible to the kernel"; the server-
+        // side safety guard caught route conflicts with a 409 after
+        // the click, but other surprises (running streams, IPs that
+        // would vanish) had to be discovered the hard way.
+        const ips = (_ifaceIPs || {})[iface.name] || { ipv4: [], ipv6: [] };
+        const ipCount = (ips.ipv4 || []).length + (ips.ipv6 || []).length;
+        // Streams summary is rebuilt every refreshInterfaces() —
+        // safe to look up directly.
+        const wrapEl = $('iface-table-wrap');
+        const summary = (wrapEl && wrapEl._streamSummary) || {};
+        const sCount = (summary[iface.name] || {}).count || 0;
+        const lines = [`Bind ${iface.name || iface.pci} to vfio-pci? It will become invisible to the kernel.`];
+        if (ipCount) lines.push(`• ${ipCount} IP address${ipCount === 1 ? '' : 'es'} configured — will vanish`);
+        if (sCount) lines.push(`• ${sCount} running stream${sCount === 1 ? '' : 's'} — will be disrupted`);
+        if (!confirm(lines.join('\n'))) return;
         btn.disabled = true;
         bindInterface(iface, false).finally(() => { btn.disabled = false; });
       } else if (action === 'unbind') {
@@ -19237,17 +19281,54 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
 
     // ----- IP management modal -----
     let _modalIface = null;
+    // v0.5.79 (audit MEDIUM #7): a11y. Remember where focus came
+    // from so we can restore it on close. Track a keydown handler
+    // so Escape closes; Tab cycles within the modal.
+    let _modalReturnFocus = null;
+    let _modalKeyHandler = null;
 
     function openIpModal(ifname) {
       _modalIface = ifname;
+      _modalReturnFocus = document.activeElement;
       $('ip-modal-iface').textContent = ifname;
       $('ip-modal-input').value = '';
-      $('ip-modal-backdrop').classList.add('show');
+      const backdrop = $('ip-modal-backdrop');
+      backdrop.classList.add('show');
+      // Focus the input so screen readers and keyboard users land
+      // somewhere useful immediately.
+      setTimeout(() => { try { $('ip-modal-input').focus(); } catch (_) {} }, 0);
+      // Trap focus + Escape close.
+      _modalKeyHandler = (ev) => {
+        if (ev.key === 'Escape') { ev.preventDefault(); closeIpModal(); return; }
+        if (ev.key === 'Tab') {
+          const focusables = backdrop.querySelectorAll(
+            'button, input, [href], select, textarea, [tabindex]:not([tabindex="-1"])'
+          );
+          if (!focusables.length) return;
+          const first = focusables[0];
+          const last = focusables[focusables.length - 1];
+          if (ev.shiftKey && document.activeElement === first) {
+            ev.preventDefault(); last.focus();
+          } else if (!ev.shiftKey && document.activeElement === last) {
+            ev.preventDefault(); first.focus();
+          }
+        }
+      };
+      document.addEventListener('keydown', _modalKeyHandler);
       renderModalIPs();
     }
     function closeIpModal() {
       $('ip-modal-backdrop').classList.remove('show');
       _modalIface = null;
+      if (_modalKeyHandler) {
+        document.removeEventListener('keydown', _modalKeyHandler);
+        _modalKeyHandler = null;
+      }
+      // Restore focus to the element that opened the modal.
+      if (_modalReturnFocus && _modalReturnFocus.focus) {
+        try { _modalReturnFocus.focus(); } catch (_) {}
+      }
+      _modalReturnFocus = null;
     }
     async function renderModalIPs() {
       const list = $('ip-modal-list');

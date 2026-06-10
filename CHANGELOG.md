@@ -2,6 +2,27 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.79] - 2026-06-09
+
+**Toast queue, enriched bind confirm, IP modal a11y.** Three
+MEDIUM audit findings closed. Full suite: **2,101 passed, 1
+skipped** (+11 new tests).
+
+* **MEDIUM #5** — toast queue: pre-fix toast() used a single
+  DOM node with one clearTimeout; two rapid calls overwrote
+  each other before the operator could read the first.
+  Stacked container at bottom-right, each call creates a child
+  node. Sticky red for failure-leading messages
+  (`Failed:` / `✗ ` / `⚠ `), auto-dismissed after 3s for
+  success.
+* **MEDIUM #12** — bind confirm enrichment. Pre-fix the only
+  warning was "It will become invisible to the kernel". Now
+  includes "N IP addresses configured — will vanish" + "M
+  running streams — will be disrupted" when applicable.
+* **MEDIUM #7** — IP modal a11y: Escape closes, Tab cycles
+  inside, focus restored to opener on close, input
+  auto-focused on open.
+
 ## [0.5.78] - 2026-06-09
 
 **Service card + disk + connection-lost + driver allowlist + PCI
