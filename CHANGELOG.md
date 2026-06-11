@@ -2,6 +2,158 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.102] - 2026-06-11
+
+**v0.5.101 bug fix: tx_worker rebuild + Mellanox rlimits via wheel-upgrade.**
+
+### Operator-reported symptom (srv06, post-v0.5.101-upgrade)
+
+`netgen-upgrade ostg_trafficgen-0.5.101-py3-none-any.whl`
+completed. PID changed (so restart fired). But on the next
+stream-launch attempt:
+
+```
+/usr/local/bin/tx_worker: unrecognized option '--tx-cores'
+```
+
+— the exact bug v0.5.101's `_rebuild_tx_worker` was supposed
+to fix. Binary still stale.
+
+### Root cause #1 — v0.5.101 source-lookup imported a non-package
+
+The v0.5.101 `_rebuild_tx_worker` used:
+
+```python
+subprocess.run([str(venv_py), "-c",
+    "import resources.dpdk.tx_worker, os; "
+    "print(os.path.dirname(resources.dpdk.tx_worker.__file__))"])
+```
+
+But `resources/dpdk/tx_worker/` has no `__init__.py` — it's a
+data subdir of the `resources.dpdk` Python package, not a
+package itself. The wheel ships `tx_worker/tx_worker.c`,
+`tx_worker/meson.build`, etc. as package data (see
+pyproject.toml `[tool.setuptools.package-data]`), but tx_worker
+is NOT an importable Python module.
+
+`import resources.dpdk.tx_worker` raised ModuleNotFoundError,
+the `rc.returncode != 0` branch logged
+`"could not locate wheel-shipped source; skipping rebuild"`,
+and the function returned. The rebuild silently never ran on
+any v0.5.101 upgrade — not just srv06.
+
+### Fix #1 — locate the source via the package directory
+
+```python
+"import resources.dpdk, os; "
+"print(os.path.dirname(resources.dpdk.__file__))"
+```
+
+Then join the `tx_worker` subdir and sanity-check
+`tx_worker.c` + `meson.build` exist before invoking meson.
+If either is missing (theoretical: wheel loses the data
+globs), log a clear warning + return. Source-location
+success now logs `[TX_WORKER] source located at <path>` so
+operators see the rebuild actually progressing.
+
+Skipping or failing the rebuild now uses `logger.warning`
+(was `logger.info`) so the line is visible in default-level
+upgrade logs.
+
+### Root cause #2 — wheel upgrades never touched the systemd unit
+
+v0.5.101 added `LimitMEMLOCK=infinity` (the Mellanox mlx5 PMD
+canonical requirement) to `scripts/tarball/netgen-install`'s
+systemd unit template. But that template is only written by
+the tarball installer on fresh installs. `netgen-upgrade`
+does `pip install <wheel>` + `systemctl restart` — it never
+rewrites `/etc/systemd/system/netgen-server.service`.
+
+Pre-v0.5.101 servers upgrading via wheel still hit
+`mlx5dv_dr_create_domain failed — Cannot allocate memory`
+because the live unit had no LimitMEMLOCK setting (default
+~64 KiB locked-memory cap). Operators were forced to manually
+drop in the conf, daemon-reload, and restart.
+
+### Fix #2 — drop-in conf via `_ensure_rlimits_dropin`
+
+`netgen-upgrade` now idempotently writes:
+
+```
+/etc/systemd/system/netgen-server.service.d/10-netgen-rlimits.conf
+```
+
+containing the three Mellanox-required rlimits:
+
+```ini
+LimitMEMLOCK=infinity
+LimitNOFILE=1048576
+LimitNPROC=infinity
+```
+
+The `10-` prefix ensures alphabetic precedence before any
+operator-named drop-ins. Idempotent: re-running netgen-upgrade
+with identical content is a no-op (content-equality check
+before write). `systemctl daemon-reload` fires explicitly so
+the subsequent `systemctl restart netgen-server` picks up the
+new limits.
+
+Order in `main()`:
+
+```
+pip install --upgrade <wheel>
+_verify_imports()
+_rebuild_tx_worker()             # ← now actually rebuilds
+_ensure_rlimits_dropin()         # ← new
+systemctl restart netgen-server  # ← picks up rlimits + new binary
+_verify_new_version()
+```
+
+Drop-in MUST fire before restart — otherwise the
+freshly-started process would inherit the old (un-dropped-in)
+rlimits.
+
+### Operator workflow
+
+For already-installed servers:
+
+```bash
+sudo netgen-upgrade ostg_trafficgen-0.5.102-py3-none-any.whl
+```
+
+Watch for these lines in the log:
+
+```
+[TX_WORKER] source located at /opt/netgen-server/netgen-venv/lib/python3.X/site-packages/resources/dpdk/tx_worker
+[TX_WORKER] ✓ Rebuilt and installed to /usr/local/bin/tx_worker
+[RLIMITS] ✓ Wrote /etc/systemd/system/netgen-server.service.d/10-netgen-rlimits.conf (Mellanox mlx5 PMD MEMLOCK fix)
+```
+
+After upgrade, verify:
+
+```bash
+PID=$(systemctl show -p MainPID netgen-server.service --value)
+grep 'Max locked memory' /proc/$PID/limits   # expect: unlimited  unlimited
+/usr/local/bin/tx_worker --help 2>&1 | grep tx-cores  # expect: [--tx-cores N]
+```
+
+### Tests
+
+7 new regression guards added to
+`tests/test_mellanox_memlock_and_tx_worker_rebuild.py`:
+
+- v0.5.101 buggy import form must NOT appear in netgen-upgrade
+- Fixed form `import resources.dpdk` IS present
+- Rebuild sanity-checks tx_worker.c + meson.build exist
+- `_ensure_rlimits_dropin` is called from main()
+- Drop-in path is canonical (10-netgen-rlimits.conf)
+- Drop-in content includes LimitMEMLOCK=infinity
+- Drop-in is idempotent (content-equality, mkdir exist_ok,
+  explicit daemon-reload)
+- Drop-in fires BEFORE systemctl restart
+
+Full suite: **2,313 passed**, 1 skipped (+7 new).
+
 ## [0.5.101] - 2026-06-11
 
 **Mellanox MEMLOCK rlimit + netgen-upgrade rebuilds tx_worker.**

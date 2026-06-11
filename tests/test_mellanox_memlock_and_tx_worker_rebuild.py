@@ -139,3 +139,112 @@ def test_rebuild_tx_worker_called_before_service_restart():
     assert rebuild_pos > 0 and restart_pos > rebuild_pos, (
         "Rebuild must come before systemctl restart"
     )
+
+
+# ─── v0.5.102: source-lookup bug fix ───
+
+
+def test_rebuild_uses_resources_dpdk_not_tx_worker_subpkg():
+    """v0.5.101 bug: imported `resources.dpdk.tx_worker` as a
+    Python package, but tx_worker is a data subdir of the
+    resources.dpdk package (no __init__.py). Import raised
+    ModuleNotFoundError, function returned silently, binary
+    stayed stale on srv06. Fix: import `resources.dpdk`
+    instead and join tx_worker subdir."""
+    src = _UPGRADE.read_text()
+    # The buggy form must be GONE.
+    assert "import resources.dpdk.tx_worker" not in src, (
+        "v0.5.101 bug: importing resources.dpdk.tx_worker as a "
+        "package fails (no __init__.py). Use resources.dpdk + "
+        "path join."
+    )
+    # The fixed form must be present.
+    assert "import resources.dpdk" in src
+    assert "tx_worker" in src  # joined as path, not import
+
+
+def test_rebuild_sanity_checks_source_files_exist():
+    """After locating the source dir, verify tx_worker.c +
+    meson.build are actually there. Defends against a wheel
+    that loses the source-data globs."""
+    src = _UPGRADE.read_text()
+    import re
+    m = re.search(
+        r"def _rebuild_tx_worker[\s\S]+?(?=\ndef [a-z_])",
+        src,
+    )
+    body = m.group(0)
+    assert "tx_worker.c" in body and "meson.build" in body, (
+        "Rebuild should sanity-check expected source files "
+        "exist before invoking meson"
+    )
+
+
+# ─── v0.5.102: rlimits drop-in for wheel-upgraded servers ───
+
+
+def test_upgrade_ensures_rlimits_dropin():
+    """v0.5.101 added LimitMEMLOCK=infinity to the netgen-install
+    systemd unit (fresh installs only). Wheel-upgrades skipped
+    /etc/systemd/system/netgen-server.service entirely, so
+    pre-v0.5.101 servers upgraded via wheel still hit the
+    Mellanox 'Cannot allocate memory' bite. Fix: netgen-upgrade
+    drops in /etc/systemd/system/netgen-server.service.d/
+    10-netgen-rlimits.conf."""
+    src = _UPGRADE.read_text()
+    assert "_ensure_rlimits_dropin" in src, (
+        "netgen-upgrade doesn't ensure rlimits drop-in — "
+        "wheel-upgraded servers won't get the Mellanox fix"
+    )
+
+
+def test_rlimits_dropin_path_correct():
+    """Drop-in must live at the canonical systemd path so the
+    main unit file isn't touched."""
+    src = _UPGRADE.read_text()
+    assert "/etc/systemd/system/netgen-server.service.d/" in src
+    # 10- prefix so this drop-in is processed before any
+    # operator-named drop-ins (alphabetic order).
+    assert "10-netgen-rlimits.conf" in src
+
+
+def test_rlimits_dropin_contains_memlock_infinity():
+    """The drop-in content must include the Mellanox-required
+    LimitMEMLOCK=infinity."""
+    src = _UPGRADE.read_text()
+    assert "LimitMEMLOCK=infinity" in src, (
+        "Drop-in content missing LimitMEMLOCK=infinity"
+    )
+
+
+def test_rlimits_dropin_is_idempotent():
+    """Repeated runs of netgen-upgrade should be safe — no
+    duplicate writes, no permission churn."""
+    src = _UPGRADE.read_text()
+    import re
+    m = re.search(
+        r"def _ensure_rlimits_dropin[\s\S]+?(?=\ndef [a-z_])",
+        src,
+    )
+    assert m, "_ensure_rlimits_dropin not found"
+    body = m.group(0)
+    # Idempotency: content-equality check before writing.
+    assert "already current" in body or "== RLIMITS_DROPIN_CONTENT" in body
+    # mkdir parents=True, exist_ok=True
+    assert "exist_ok=True" in body
+    # daemon-reload so the new drop-in is picked up by the
+    # subsequent systemctl restart.
+    assert "daemon-reload" in body
+
+
+def test_rlimits_dropin_fires_before_systemctl_restart():
+    """If the drop-in landed AFTER the restart, the
+    freshly-started process would have been spawned WITHOUT
+    the new rlimits (drop-in → daemon-reload → already-started
+    process unaffected). Drop in first, restart second."""
+    src = _UPGRADE.read_text()
+    dropin_pos = src.find("_ensure_rlimits_dropin()")
+    restart_pos = src.find('systemctl", "restart"', dropin_pos)
+    assert dropin_pos > 0 and restart_pos > dropin_pos, (
+        "Drop-in must land before systemctl restart"
+    )

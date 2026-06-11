@@ -104,6 +104,66 @@ def _verify_new_version(timeout_s: int = 30) -> bool:
     return False
 
 
+RLIMITS_DROPIN_PATH = Path(
+    "/etc/systemd/system/netgen-server.service.d/10-netgen-rlimits.conf"
+)
+RLIMITS_DROPIN_CONTENT = """# Managed by netgen-upgrade. Mellanox mlx5 PMD needs unlimited
+# locked memory to mlock NIC queue + flow-table memory; without
+# LimitMEMLOCK=infinity, mlx5dv_dr_create_domain fails with
+# 'Cannot allocate memory' and every DPDK stream dies at probe.
+# v0.5.101 added these to the netgen-install systemd unit
+# template (fresh installs); v0.5.102 drops them in via
+# netgen-upgrade so wheel-upgraded servers get the same fix.
+[Service]
+LimitMEMLOCK=infinity
+LimitNOFILE=1048576
+LimitNPROC=infinity
+"""
+
+
+def _ensure_rlimits_dropin() -> None:
+    """Idempotently install /etc/systemd/system/netgen-server.service.d/
+    10-netgen-rlimits.conf with the Mellanox-required rlimits."""
+    parent = RLIMITS_DROPIN_PATH.parent
+    try:
+        parent.mkdir(parents=True, exist_ok=True)
+    except Exception as exc:
+        logger.warning(
+            f"[RLIMITS] could not create {parent}: {exc}. "
+            f"Manually drop in LimitMEMLOCK=infinity if Mellanox "
+            f"mlx5 PMD fails with 'Cannot allocate memory'."
+        )
+        return
+
+    # Idempotent: only write if content differs.
+    if RLIMITS_DROPIN_PATH.exists():
+        try:
+            if RLIMITS_DROPIN_PATH.read_text() == RLIMITS_DROPIN_CONTENT:
+                logger.info(
+                    f"[RLIMITS] ✓ {RLIMITS_DROPIN_PATH} already current"
+                )
+                return
+        except Exception:
+            pass  # fall through to overwrite
+
+    try:
+        RLIMITS_DROPIN_PATH.write_text(RLIMITS_DROPIN_CONTENT)
+        # daemon-reload is implicit in the systemctl restart that
+        # follows, but be explicit so the rlimits are picked up
+        # even if a subsequent change races the restart.
+        _run(["systemctl", "daemon-reload"], check=False)
+        logger.info(
+            f"[RLIMITS] ✓ Wrote {RLIMITS_DROPIN_PATH}"
+            f" (Mellanox mlx5 PMD MEMLOCK fix)"
+        )
+    except Exception as exc:
+        logger.warning(
+            f"[RLIMITS] could not write {RLIMITS_DROPIN_PATH}: "
+            f"{exc}. Manually drop in LimitMEMLOCK=infinity if "
+            f"Mellanox mlx5 PMD fails."
+        )
+
+
 def _rebuild_tx_worker(install_root: Path, venv_py: Path) -> None:
     """Rebuild tx_worker.c against the locally-installed DPDK.
 
@@ -116,23 +176,54 @@ def _rebuild_tx_worker(install_root: Path, venv_py: Path) -> None:
     # Find the wheel-extracted tx_worker source. After pip
     # install the resources/ tree is under
     # <venv>/lib/python3.X/site-packages/resources/dpdk/tx_worker.
+    #
+    # v0.5.101 bug (fixed here in v0.5.102): we imported
+    # `resources.dpdk.tx_worker` as a Python package, but it's
+    # not — the tx_worker subdir has no __init__.py, it's a data
+    # subdir under the `resources.dpdk` package. The import
+    # raised ModuleNotFoundError, _rebuild_tx_worker silently
+    # returned, and srv06's binary stayed stale. Operator hit
+    # `unrecognized option '--tx-cores'` on every stream launch
+    # post-v0.5.101-upgrade.
+    #
+    # Fix: locate the `resources.dpdk` package directory (which
+    # IS importable), then join the `tx_worker` subdir and
+    # sanity-check tx_worker.c + meson.build are present.
     try:
         rc = subprocess.run(
             [str(venv_py), "-c",
-             "import resources.dpdk.tx_worker, os; "
-             "print(os.path.dirname(resources.dpdk.tx_worker.__file__))"],
+             "import resources.dpdk, os; "
+             "print(os.path.dirname(resources.dpdk.__file__))"],
             capture_output=True, text=True, timeout=10,
         )
         if rc.returncode != 0 or not rc.stdout.strip():
-            logger.info(
-                "[TX_WORKER] could not locate wheel-shipped source; "
-                "skipping rebuild. If DPDK streams fail with "
-                "'unrecognized option' errors, re-run install_dpdk.sh."
+            logger.warning(
+                "[TX_WORKER] could not locate resources.dpdk package "
+                "in the venv; skipping rebuild. If DPDK streams fail "
+                "with 'unrecognized option' errors, re-run "
+                "install_dpdk.sh manually."
             )
             return
-        src_dir = Path(rc.stdout.strip())
+        src_dir = Path(rc.stdout.strip()) / "tx_worker"
+        if not (src_dir / "tx_worker.c").exists():
+            logger.warning(
+                f"[TX_WORKER] {src_dir}/tx_worker.c not found — the "
+                f"wheel may not have shipped the source. Skipping "
+                f"rebuild. Re-run install_dpdk.sh from a fresh "
+                f"tarball install to recover."
+            )
+            return
+        if not (src_dir / "meson.build").exists():
+            logger.warning(
+                f"[TX_WORKER] {src_dir}/meson.build not found; "
+                f"skipping rebuild. Re-run install_dpdk.sh manually."
+            )
+            return
+        logger.info(f"[TX_WORKER] source located at {src_dir}")
     except Exception as exc:
-        logger.info(f"[TX_WORKER] source lookup failed: {exc}; skipping rebuild")
+        logger.warning(
+            f"[TX_WORKER] source lookup failed: {exc}; skipping rebuild"
+        )
         return
 
     # Build deps check — if libdpdk-dev / meson / ninja isn't
@@ -320,6 +411,19 @@ def main() -> int:
     # build deps aren't present (libdpdk-dev missing) we WARN
     # and continue; the launcher can still run Scapy streams.
     _rebuild_tx_worker(install_root, venv_py)
+
+    # v0.5.102: drop in the Mellanox rlimits conf for already-
+    # installed servers. v0.5.101 added LimitMEMLOCK=infinity
+    # etc. to the netgen-install systemd unit template, but
+    # netgen-upgrade only does pip install — it never rewrites
+    # /etc/systemd/system/netgen-server.service. Operators
+    # upgrading from <v0.5.101 wheels would never pick up the
+    # Mellanox fix and hit the same mlx5dv_dr_create_domain
+    # failure that motivated v0.5.101. A drop-in conf is safer
+    # than rewriting the unit (preserves operator customizations
+    # of the main file) and idempotent (re-running creates
+    # identical content).
+    _ensure_rlimits_dropin()
 
     # Restart the unit so the new code is loaded.
     _run(["systemctl", "restart", SYSTEMD_UNIT_NAME], check=True)
