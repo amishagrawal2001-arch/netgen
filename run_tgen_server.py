@@ -19753,6 +19753,21 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
           } else if (s.hint) {
             actionBtn = `<span style="color: var(--muted); font-size: 11px;" title="${escapeHtml(s.hint)}">no bind needed</span>`;
           }
+          // v0.5.88: per-row iface control buttons (Up / Down /
+          // Reset). Operator-requested. Only shown for rows that
+          // have a kernel netdev name (vfio-bound rows can't be
+          // controlled via `ip link set`). Compact button group.
+          let lifecycleBtn = '';
+          if (i.name && i.name !== 'N/A' && !/\(no interface\)/.test(i.name)) {
+            const up = link.carrier === true;
+            const _name = escapeHtml(i.name);
+            lifecycleBtn = `<span class="iface-ctl" style="display: inline-flex; gap: 3px; margin-left: 4px;">
+              <button data-idx="${idx}" data-iface-action="up"    title="Bring ${_name} up"    style="padding: 2px 6px; font-size: 11px;"${up ? ' disabled style="padding: 2px 6px; font-size: 11px; opacity: 0.4;"' : ''}>↑</button>
+              <button data-idx="${idx}" data-iface-action="down"  title="Bring ${_name} down"  style="padding: 2px 6px; font-size: 11px;" class="secondary"${!up ? ' disabled style="padding: 2px 6px; font-size: 11px; opacity: 0.4;"' : ''}>↓</button>
+              <button data-idx="${idx}" data-iface-action="reset" title="Reset ${_name} (down → 1s → up)" style="padding: 2px 6px; font-size: 11px;" class="secondary">↻</button>
+            </span>`;
+            actionBtn = actionBtn + lifecycleBtn;
+          }
           // IP cell: show IPv4/IPv6 lines + a Manage button. Only kernel-
           // visible interfaces have IPs; vfio-pci rows show "—".
           let ipCell = '<span style="color: var(--muted);">—</span>';
@@ -20099,6 +20114,65 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       }
     });
 
+    // v0.5.88: separate click handler for the Up/Down/Reset
+    // per-row buttons (data-iface-action attribute). Wraps fetch
+    // in try/catch + immediate-feedback toast pattern from v0.5.75.
+    async function ifaceLifecycle(iface, action, force) {
+      const url = `/api/admin/iface/${encodeURIComponent(iface.name)}/${action}`;
+      const verbing = {up: 'Bringing up', down: 'Bringing down', reset: 'Resetting'}[action];
+      toast(`${verbing} ${iface.name}…`);
+      let r, text;
+      try {
+        r = await fetch(url, {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ force: !!force }),
+        });
+        text = await r.text();
+      } catch (e) {
+        toast(`${action} request failed: ${e}`);
+        refreshInterfaces();
+        return;
+      }
+      let data = {};
+      try { data = JSON.parse(text); } catch (_) {}
+      // 409 IFACE_DOWN_UNSAFE / IFACE_RESET_UNSAFE → operator confirm.
+      if (!force && r.status === 409 && (
+        data.code === 'IFACE_DOWN_UNSAFE' || data.code === 'IFACE_RESET_UNSAFE'
+      )) {
+        const proceed = confirm(`${data.error}\\n\\nForce ${action} anyway?`);
+        if (proceed) return ifaceLifecycle(iface, action, true);
+        toast(`${action} cancelled`);
+        return;
+      }
+      if (r.ok && data.success) {
+        toast(`${iface.name}: ${action} OK`);
+      } else {
+        toastFailDetailed(data, r.status);
+      }
+      // Brief delay so the kernel commits the link state before
+      // we re-render.
+      setTimeout(() => { refreshInterfaces(); refreshHealth(); }, 700);
+    }
+
+    document.addEventListener('click', (ev) => {
+      const btn = ev.target.closest('button[data-iface-action]');
+      if (!btn) return;
+      const wrap = $('iface-table-wrap');
+      const idx = parseInt(btn.dataset.idx, 10);
+      const iface = (wrap._ifaces || [])[idx];
+      if (!iface || !iface.name) return;
+      // dataset converts kebab to camel: data-iface-action → ifaceAction.
+      const realAction = btn.dataset.ifaceAction;
+      if (!realAction) return;
+      // Confirm for the destructive ones (down/reset).
+      if (realAction === 'down' || realAction === 'reset') {
+        const verb = realAction === 'reset' ? 'Reset (down → 1s → up)' : 'Bring down';
+        if (!confirm(`${verb} ${iface.name}?`)) return;
+      }
+      btn.disabled = true;
+      ifaceLifecycle(iface, realAction, false).finally(() => { btn.disabled = false; });
+    });
+
     // ----- IP management modal -----
     let _modalIface = null;
     // v0.5.79 (audit MEDIUM #7): a11y. Remember where focus came
@@ -20300,6 +20374,169 @@ def api_admin_interface_ips():
         _op = (entry.get("operstate") or "UNKNOWN")
         out[name] = {"ipv4": ipv4, "ipv6": ipv6, "operstate": _op.lower()}
     return jsonify({"interfaces": out})
+
+
+# v0.5.88: validate iface names before they reach `ip link set`.
+# Mirrors the v0.5.60 PCI BDF regex pattern — kernel net device
+# names match `[A-Za-z0-9_.-]{1,15}` (IFNAMSIZ-1). Tighter than
+# the v0.5.70 IP regex.
+_RE_IFACE_NAME = re.compile(r"^[A-Za-z0-9_.\-]{1,15}$")
+
+
+def _iface_action_safety_check(iface, action):
+    """v0.5.88: refuse iface up/down/reset on the management NIC
+    OR an iface with active streams unless force=true.
+
+    Returns (refusal_str, status_code) when unsafe, else (None, 0).
+    The check shape mirrors the v0.2.76 bind-safety guard so the
+    GUI's force=true confirm dialog pattern can be reused.
+
+    Down + reset are the destructive operations — up is harmless
+    so we skip the check for it (only flagged for symmetry in
+    case a future operator wants up-time UX consistency).
+    """
+    if action == "up":
+        return None, 0
+    try:
+        from utils.dpdk_bind_safety import (
+            collect_default_route_iface,
+            collect_ssh_client_iface,
+        )
+        default_iface = collect_default_route_iface()
+        ssh_iface = collect_ssh_client_iface(
+            os.environ.get("SSH_CLIENT")
+        )
+        if iface in (default_iface, ssh_iface):
+            return (
+                f"{iface} carries the default route or this SSH "
+                f"session. {action} would disconnect the management "
+                f"plane. Use force=true to override."
+            ), 409
+        try:
+            for s in stream_tracker.get_stream_stats() or []:
+                if s.get("interface") == iface:
+                    return (
+                        f"{iface} has an active stream. {action} "
+                        f"would disrupt the test. Use force=true "
+                        f"to override."
+                    ), 409
+        except Exception:
+            pass
+    except Exception as _e:
+        # Safety check failure is itself non-fatal — log and
+        # proceed (don't lock out a user because we couldn't
+        # parse `ip route`).
+        logging.debug(f"[IFACE-SAFETY] check skipped: {_e}")
+    return None, 0
+
+
+def _run_ip_link(iface, action):
+    """Wrap `ip link set <iface> <up|down>` with a 5s timeout.
+    Returns (success, stdout, stderr)."""
+    cmd = _maybe_sudo(["ip", "link", "set", "dev", iface, action])
+    try:
+        _r = subprocess.run(
+            cmd, capture_output=True, text=True, timeout=5,
+        )
+        return _r.returncode == 0, _r.stdout, _r.stderr
+    except subprocess.TimeoutExpired:
+        return False, "", f"`ip link set {iface} {action}` timed out (5s)"
+    except FileNotFoundError:
+        return False, "", "iproute2 (ip) not installed"
+    except Exception as _e:
+        return False, "", str(_e)
+
+
+@app.route("/api/admin/iface/<iface>/up", methods=["POST"])
+@require_role("admin")
+def api_admin_iface_up(iface):
+    """v0.5.88: bring an iface up via `ip link set <n> up`. Mostly
+    safe (worst case: a port comes up unexpectedly); no safety
+    guard needed."""
+    if not _RE_IFACE_NAME.match(iface or ""):
+        return jsonify({"error": "invalid iface name"}), 400
+    ok, _so, _se = _run_ip_link(iface, "up")
+    if not ok:
+        return jsonify({
+            "error": _se.strip() or "failed",
+            "interface": iface,
+        }), 500
+    return jsonify({"success": True, "interface": iface, "action": "up"})
+
+
+@app.route("/api/admin/iface/<iface>/down", methods=["POST"])
+@require_role("admin")
+def api_admin_iface_down(iface):
+    """v0.5.88: bring an iface down via `ip link set <n> down`.
+
+    Refuses with 409 + can_force=true when the iface carries the
+    default route, the SSH session, or has an active stream.
+    Body `{"force": true}` overrides.
+    """
+    if not _RE_IFACE_NAME.match(iface or ""):
+        return jsonify({"error": "invalid iface name"}), 400
+    body = request.get_json(silent=True) or {}
+    force = _strict_true(body.get("force", False))
+    if not force:
+        refusal, code = _iface_action_safety_check(iface, "down")
+        if refusal:
+            return jsonify({
+                "error": refusal,
+                "code": "IFACE_DOWN_UNSAFE",
+                "interface": iface,
+                "can_force": True,
+            }), code
+    ok, _so, _se = _run_ip_link(iface, "down")
+    if not ok:
+        return jsonify({
+            "error": _se.strip() or "failed",
+            "interface": iface,
+        }), 500
+    return jsonify({"success": True, "interface": iface, "action": "down"})
+
+
+@app.route("/api/admin/iface/<iface>/reset", methods=["POST"])
+@require_role("admin")
+def api_admin_iface_reset(iface):
+    """v0.5.88: cycle an iface — `ip link set <n> down`, brief
+    sleep so the kernel sees the carrier change, then `up`.
+
+    Same safety guard as `down`: refuses on management iface or
+    active stream unless force=true. Useful for clearing stuck
+    link states, re-negotiating speed, etc.
+    """
+    if not _RE_IFACE_NAME.match(iface or ""):
+        return jsonify({"error": "invalid iface name"}), 400
+    body = request.get_json(silent=True) or {}
+    force = _strict_true(body.get("force", False))
+    if not force:
+        refusal, code = _iface_action_safety_check(iface, "reset")
+        if refusal:
+            return jsonify({
+                "error": refusal,
+                "code": "IFACE_RESET_UNSAFE",
+                "interface": iface,
+                "can_force": True,
+            }), code
+    ok_d, _so_d, _se_d = _run_ip_link(iface, "down")
+    if not ok_d:
+        return jsonify({
+            "error": f"down failed: {_se_d.strip()}",
+            "interface": iface,
+        }), 500
+    import time as _time
+    _time.sleep(1.0)
+    ok_u, _so_u, _se_u = _run_ip_link(iface, "up")
+    if not ok_u:
+        return jsonify({
+            "error": (
+                f"iface was brought down but `up` failed: "
+                f"{_se_u.strip()}. Manual: `ip link set "
+                f"{iface} up`."
+            ),
+            "interface": iface,
+        }), 500
+    return jsonify({"success": True, "interface": iface, "action": "reset"})
 
 
 @app.route("/api/admin/interface_ip", methods=["POST"])

@@ -2,6 +2,66 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.88] - 2026-06-10
+
+**Interface control: on / off / reset from admin console.**
+
+Operator-requested (Jun 10 2026):
+
+> also allow user to on/off/reset network interfaces from admin
+> console
+
+First batch of the iface-table enhancement drive (v0.5.88-v0.5.90).
+This release covers **lifecycle control**; v0.5.89 covers
+diagnostics+ID (Flash LED, driver/fw, click-row-to-expand);
+v0.5.90 covers live ops + structure reshape (sparklines,
+auto-refresh, SR-IOV/VLAN/bond nesting).
+
+### Three new admin endpoints
+
+```
+POST /api/admin/iface/<name>/up      — ip link set <n> up
+POST /api/admin/iface/<name>/down    — ip link set <n> down
+POST /api/admin/iface/<name>/reset   — down → 1s sleep → up
+```
+
+All `@require_role("admin")`-gated. Iface name validated against
+`^[A-Za-z0-9_.-]{1,15}$` (kernel IFNAMSIZ rules) before reaching
+`ip link set`. 5s subprocess timeout.
+
+### Safety guard (matches v0.2.76 bind pattern)
+
+`down` and `reset` refuse with HTTP 409 + JSON `{"code":
+"IFACE_DOWN_UNSAFE"|"IFACE_RESET_UNSAFE", "can_force": true}`
+when the iface:
+- carries the host's default route (would kill connectivity)
+- carries this SSH session (would kill connectivity)
+- has an active stream attached
+
+GUI re-prompts with `"Force action anyway?"`; operator's confirm
+re-posts with `{"force": true}`. `up` is harmless so it skips
+the check.
+
+### Admin console: per-row Up/Down/Reset buttons
+
+Three compact glyph buttons `↑ ↓ ↻` next to the existing
+Bind/Unbind on each row that has a kernel netdev name (vfio-pci
+bound rows naturally can't be controlled via `ip link`):
+
+- `↑` Bring up — disabled when carrier already up
+- `↓` Bring down — secondary style, disabled when already down,
+  prompts confirm
+- `↻` Reset (down → 1s → up) — secondary style, prompts confirm
+
+Click handler wraps fetch in try/catch + immediate-feedback
+toast (`Bringing down ens6np0…`). Auto-refreshes the iface
+table 700ms after the action so the operator sees the link
+state update.
+
+14 new regression tests.
+
+Full suite: **2,181 passed, 1 skipped** (+14 new).
+
 ## [0.5.87] - 2026-06-10
 
 **LLDP hot-fix (hybrid shape) + collapsible System Info + polish.**
