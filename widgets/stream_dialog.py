@@ -352,9 +352,42 @@ Run the wizard once via <code>netgen-install</code>, then the
 admin console handles DPDK readiness with a single click.
 </div>
 
-<h2>Quickstart — 3 commands</h2>
+<h2>Quickstart — pick one</h2>
 
-<p>On the Linux server (the one with the NICs you want to drive):</p>
+<h3>Path A — Install from the client (easiest, no SSH typing)</h3>
+
+<p>If you have a Linux box you can SSH into + your operator
+laptop, the client can drive the whole install for you:</p>
+
+<ol>
+<li><b>Install the client</b> on your laptop — download from the
+    latest GH release:
+    <ul>
+    <li>macOS — <code>Netgen-TrafficGenerator-&lt;v&gt;.dmg</code>
+        (drag to Applications)</li>
+    <li>Windows — <code>Netgen-Client-&lt;v&gt;-windows.exe</code>
+        (double-click)</li>
+    <li>Linux —
+        <code>Netgen-Client-&lt;v&gt;-linux-x86_64.AppImage</code>
+        (<code>chmod +x</code> + run)</li>
+    </ul>
+</li>
+<li><b>Launch the client</b> and open
+    <b>Help → Install / Upgrade Server…</b></li>
+<li>Switch to the <b>Fresh install via SSH</b> tab</li>
+<li>Enter the target Linux host + SSH user + key/password</li>
+<li>Click <b>Install</b>. The dialog SFTPs the bundled tarball
+    assets to the host, runs <code>netgen-install</code> over
+    SSH, and streams the live log inline (with error extraction
+    so failures don't make you scroll a 1000-line log)</li>
+<li>When done, <b>Tools → Add TGen Chassis</b> → enter the server
+    URL → green LED = ready</li>
+</ol>
+
+<p>The wheel + tarball are bundled inside every client artifact,
+so step 1 covers everything — no separate download.</p>
+
+<h3>Path B — Direct on the Linux server (no laptop needed)</h3>
 
 <pre>VER=$(curl -s https://api.github.com/repos/amishagrawal2001-arch/netgen/releases/latest \
        | grep -oP '"tag_name": "v\K[^"]+')
@@ -368,10 +401,13 @@ sudo mkdir -p /opt/netgen-server &amp;&amp; \
 <pre>systemctl status netgen-server
 curl -s http://localhost:5050/api/admin/health | jq .health   # "healthy"</pre>
 
-<p>Then browse to <code>http://&lt;server&gt;:5050/admin</code> and run
+<h3>Then — DPDK readiness (both paths)</h3>
+
+<p>After the server is running, browse to
+<code>http://&lt;server&gt;:5050/admin</code> and click
 <b>Tools → DPDK → Make DPDK Ready</b> to allocate hugepages,
-load vfio, build <code>tx_worker</code>, and (if needed) flip the
-IOMMU GRUB cmdline. Reboot if prompted.</p>
+load vfio, build <code>tx_worker</code>, and (if needed) flip
+the IOMMU GRUB cmdline. Reboot if prompted.</p>
 
 <h2>Prerequisites</h2>
 

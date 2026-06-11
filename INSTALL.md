@@ -1,8 +1,24 @@
 # Netgen Install Guide
 
-## Quickstart — 3 commands
+## Quickstart — pick one
 
-Linux NIC host (server) — fresh install via tarball:
+### Path A — Install from the client (easiest, no SSH typing)
+
+If you have a Linux box you can SSH into + your operator laptop, the client can drive the whole install for you:
+
+1. **Install the client** on your laptop — download from the latest GH release:
+   - macOS — `Netgen-TrafficGenerator-<v>.dmg` (drag to Applications)
+   - Windows — `Netgen-Client-<v>-windows.exe` (double-click)
+   - Linux — `Netgen-Client-<v>-linux-x86_64.AppImage` (`chmod +x` + run)
+2. **Launch the client** and open **Help → Install / Upgrade Server…**
+3. Switch to the **Fresh install via SSH** tab
+4. Enter the target Linux host + SSH user + key/password
+5. Click **Install**. The dialog SFTPs the bundled tarball assets to the host, runs `netgen-install` over SSH, and streams the live log inline (with error extraction so failures don't make you scroll a 1000-line log)
+6. When done, **Tools → Add TGen Chassis** → enter the server URL → green LED = ready
+
+The wheel + tarball are bundled inside every client artifact, so step 1 covers everything — no separate download.
+
+### Path B — Direct on the Linux server (no laptop needed)
 
 ```bash
 VER=$(curl -s https://api.github.com/repos/amishagrawal2001-arch/netgen/releases/latest \
@@ -13,16 +29,16 @@ sudo mkdir -p /opt/netgen-server && \
   sudo /opt/netgen-server/bin/netgen-install
 ```
 
-Verify the server came up:
+Verify:
 
 ```bash
 systemctl status netgen-server
 curl -s http://localhost:5050/api/admin/health | jq .health   # "healthy"
 ```
 
-Then browse to `http://<server>:5050/admin` and run **Tools → DPDK → Make DPDK Ready** to allocate hugepages, load vfio, build `tx_worker`, and (if needed) flip the IOMMU GRUB cmdline. Reboot if prompted.
+### Then — DPDK readiness (both paths)
 
-That's it for the server. Client install below.
+After the server is running, browse to `http://<server>:5050/admin` and click **Tools → DPDK → Make DPDK Ready** to allocate hugepages, load vfio, build `tx_worker`, and (if needed) flip the IOMMU GRUB cmdline. Reboot if prompted.
 
 ---
 
