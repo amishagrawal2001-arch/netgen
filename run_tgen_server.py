@@ -20918,6 +20918,29 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
         <strong>Firmware:</strong> ${escapeHtml(dv.fw_version || '—')} ·
         <strong>Bus:</strong> ${escapeHtml(dv.bus_info || '—')}
       </div>`;
+      // v0.5.104: Live counters section — works even when iface
+      // is vfio-bound (Mellanox sysfs fallback). Polls every 2s
+      // while the drawer is open; cleaned up on drawer close.
+      const ctrId = `counters-${iface.name.replace(/[^A-Za-z0-9]/g, '_')}`;
+      html += `<div id="${ctrId}" style="margin: 8px 0 10px; padding: 8px;
+                 background: #fff; border: 1px solid #cbd5e1; border-radius: 4px;
+                 font-size: 12px;">
+        <div style="display: flex; align-items: center; gap: 8px; margin-bottom: 4px;">
+          <strong style="color: #1e293b;">Live counters</strong>
+          <span class="ctr-source" style="font-size: 11px; color: var(--muted);">sampling…</span>
+        </div>
+        <div class="ctr-grid" style="display: grid; grid-template-columns: auto auto auto auto; gap: 4px 14px;">
+          <span style="color: var(--muted);">RX pps</span><span class="ctr-rxpps">—</span>
+          <span style="color: var(--muted);">TX pps</span><span class="ctr-txpps">—</span>
+          <span style="color: var(--muted);">RX bps</span><span class="ctr-rxbps">—</span>
+          <span style="color: var(--muted);">TX bps</span><span class="ctr-txbps">—</span>
+          <span style="color: var(--muted);">RX packets</span><span class="ctr-rxpkt">—</span>
+          <span style="color: var(--muted);">TX packets</span><span class="ctr-txpkt">—</span>
+          <span style="color: var(--muted);">RX errors</span><span class="ctr-rxerr">—</span>
+          <span style="color: var(--muted);">TX dropped</span><span class="ctr-txdrop">—</span>
+        </div>
+        <div class="ctr-warn" style="font-size: 11px; color: var(--bad); margin-top: 6px;"></div>
+      </div>`;
       const _labels = {
         link: 'Link settings (ethtool)',
         drvinfo: 'Driver info (ethtool -i)',
@@ -20949,6 +20972,84 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
         }
       }
       td.innerHTML = html;
+      // v0.5.104: kick off counter polling. Lives in a closure
+      // so the timer ID can be cleared when the drawer closes.
+      const ctrWrap = td.querySelector(`#counters-${iface.name.replace(/[^A-Za-z0-9]/g, '_')}`);
+      if (ctrWrap) startCounterPoll(iface.name, ctrWrap, drawer);
+    }
+
+    // v0.5.104: counter polling — one interval per open drawer.
+    // Stops when the drawer is removed (MutationObserver tracks
+    // detachment; cheaper than per-drawer ID bookkeeping).
+    const _fmtCount = (n) => {
+      if (n === null || n === undefined) return '—';
+      if (n < 1000) return String(n);
+      if (n < 1e6)  return (n / 1e3).toFixed(1) + 'K';
+      if (n < 1e9)  return (n / 1e6).toFixed(2) + 'M';
+      return (n / 1e9).toFixed(2) + 'G';
+    };
+    const _fmtBps = (bps) => {
+      if (bps === null || bps === undefined) return '—';
+      if (bps < 1000) return bps.toFixed(0) + ' bps';
+      if (bps < 1e6)  return (bps / 1e3).toFixed(1) + ' Kbps';
+      if (bps < 1e9)  return (bps / 1e6).toFixed(2) + ' Mbps';
+      return (bps / 1e9).toFixed(2) + ' Gbps';
+    };
+    async function startCounterPoll(ifaceName, ctrWrap, drawer) {
+      let prev = null;
+      const tick = async () => {
+        if (!document.body.contains(drawer)) return;  // drawer closed
+        try {
+          const r = await fetch(`/api/admin/iface/${encodeURIComponent(ifaceName)}/counters`);
+          const d = await r.json();
+          // Update source label + warnings
+          const src = ctrWrap.querySelector('.ctr-source');
+          if (src) src.textContent = d.source
+            ? `source: ${d.source}${d.binding === 'vfio-pci' ? ' (vfio-bound)' : ''}`
+            : 'no counter source';
+          const warn = ctrWrap.querySelector('.ctr-warn');
+          if (warn) {
+            warn.textContent = (d.warnings || []).join(' · ');
+          }
+          // Raw integers (always shown — useful before delta lands)
+          const setText = (cls, val) => {
+            const el = ctrWrap.querySelector('.' + cls);
+            if (el) el.textContent = val;
+          };
+          setText('ctr-rxpkt', _fmtCount(d.rx_packets));
+          setText('ctr-txpkt', _fmtCount(d.tx_packets));
+          setText('ctr-rxerr', _fmtCount(d.rx_errors));
+          setText('ctr-txdrop', _fmtCount(d.tx_dropped));
+          // Delta-based rates (requires two samples)
+          if (prev && prev.ts_ns && d.ts_ns) {
+            const elapsed = (d.ts_ns - prev.ts_ns) / 1e9;
+            if (elapsed > 0) {
+              const safeRate = (a, b) => (a !== null && b !== null && b >= a)
+                ? (b - a) / elapsed : null;
+              const rxPps = safeRate(prev.rx_packets, d.rx_packets);
+              const txPps = safeRate(prev.tx_packets, d.tx_packets);
+              const rxBps = safeRate(prev.rx_bytes, d.rx_bytes);
+              const txBps = safeRate(prev.tx_bytes, d.tx_bytes);
+              setText('ctr-rxpps', rxPps === null ? '—' : _fmtCount(Math.round(rxPps)) + '/s');
+              setText('ctr-txpps', txPps === null ? '—' : _fmtCount(Math.round(txPps)) + '/s');
+              setText('ctr-rxbps', _fmtBps(rxBps === null ? null : rxBps * 8));
+              setText('ctr-txbps', _fmtBps(txBps === null ? null : txBps * 8));
+            }
+          }
+          prev = d;
+        } catch (e) {
+          const warn = ctrWrap.querySelector('.ctr-warn');
+          if (warn) warn.textContent = 'fetch failed: ' + String(e);
+        }
+      };
+      await tick();
+      const id = setInterval(async () => {
+        if (!document.body.contains(drawer)) {
+          clearInterval(id);
+          return;
+        }
+        await tick();
+      }, 2000);
     }
 
     // ----- IP management modal -----
@@ -21638,6 +21739,63 @@ def _iface_sysfs_dump(iface):
         pass
     out["statistics"] = stats
     return out
+
+
+@app.route("/api/admin/iface/<iface>/counters", methods=["GET"])
+@require_role("viewer")  # counters are integers; no PII surface
+def admin_iface_counters(iface):
+    """v0.5.104: live RX/TX counter snapshot for an iface.
+
+    Works for BOTH kernel-bound and vfio-bound interfaces. For
+    Mellanox NICs in vfio-pci, the InfiniBand sysfs counters
+    (which survive vfio bind because they're at the PCI layer,
+    not the netdev layer) are the data source — operator can
+    finally see whether DPDK packets are actually leaving the
+    wire.
+
+    Returned shape (see utils.nic_counters.read_counters):
+        {
+          "source": "kernel" | "mellanox-sysfs" | null,
+          "iface": str,
+          "pci_bdf": str | null,
+          "binding": "kernel" | "vfio-pci" | "unknown",
+          "ts_ns": int,
+          "rx_packets" / "tx_packets" / "rx_bytes" / "tx_bytes" / ...,
+          "extra": { source-specific raw counter dict },
+          "warnings": [str, ...]
+        }
+
+    Operator workflow:
+      - Client polls every 2s
+      - Compute delta + elapsed → live pps gauge
+      - For srv06 RX=0 mystery: shows whether TX side is
+        actually transmitting at the wire even when kernel
+        netdev is gone (vfio-bound).
+
+    Iface validation: same regex netgen uses everywhere else
+    (IFNAMSIZ + linux valid charset).
+    """
+    if not re.match(r"^[A-Za-z0-9_.-]{1,15}$", iface):
+        return jsonify({"error": "invalid iface name"}), 400
+
+    pci_bdf = request.args.get("pci_bdf")
+    # If client passes a pci_bdf override (because iface name is
+    # gone post-vfio-bind), require valid BDF format.
+    if pci_bdf is not None:
+        if not re.match(r"^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9]$",
+                        pci_bdf):
+            return jsonify({"error": "invalid pci_bdf format"}), 400
+
+    try:
+        from utils.nic_counters import read_counters
+    except Exception as _e:
+        return jsonify({"error": f"nic_counters import: {_e}"}), 500
+    try:
+        snap = read_counters(iface, pci_bdf=pci_bdf)
+    except Exception as _e:
+        logger.exception("[admin] counters read failed")
+        return jsonify({"error": f"counter read failed: {_e}"}), 500
+    return jsonify(snap)
 
 
 @app.route("/api/admin/iface/<iface>/sysfs", methods=["GET"])
