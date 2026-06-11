@@ -2,6 +2,61 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.91] - 2026-06-10
+
+**Iface table: Diagnostics + ID batch.**
+
+Continuation of the iface-table enhancement drive (the
+planned-but-postponed v0.5.89 batch — v0.5.89 and v0.5.90 were
+both consumed by hot-fixes).
+
+### Driver / firmware version badge
+
+Each row's "Kernel driver" cell now carries an inline `· fw <ver>`
+badge with the firmware version. Hover the badge to see full
+`driver / version / firmware` in a tooltip.
+
+Backed by a new `_ethtool_drvinfo()` helper that parses
+`ethtool -i <name>` (60s TTL cache). Universal across Mellanox,
+Broadcom, AMD-Pensando, Intel kernel drivers.
+
+### Flash LED button (💡)
+
+New per-row button. Click → `POST /api/admin/iface/<name>/flash`
+runs `ethtool -p <name> 5` (5 sec by default, body `{"seconds":
+int}` overrides 1–60). Spawns via `Popen` so the API returns
+immediately while the LED blinks in the background. Standard
+ops trick for matching kernel iface name → physical cable.
+
+### Click-row-to-expand drawer (ℹ️)
+
+New per-row button. Click → fetches `GET /api/admin/iface/<name>/
+details` and renders a drawer below the clicked row containing
+collapsible `<details>` blocks for:
+
+- Link settings (`ethtool <n>`) — open by default
+- Driver info (`ethtool -i`)
+- Feature flags (`ethtool -k`)
+- Interrupt coalescing (`ethtool -c`)
+- Ring parameters (`ethtool -g`)
+- Driver statistics (`ethtool -S`)
+- Permanent MAC (`ethtool -P`)
+
+Each section is best-effort — missing ones report `(ethtool
+returned rc=N)` inline. Drawer is cached per iface (in-memory)
+so re-toggling is instant.
+
+### Refactoring
+
+- `_RE_IFACE_NAME` moved to module scope (above the helpers that
+  validate against it) — earlier callers couldn't see it.
+- v0.5.88's duplicate `_RE_IFACE_NAME` in the iface-action
+  endpoint section deduplicated.
+
+18 new regression tests.
+
+Full suite: **2,207 passed, 1 skipped** (+18 new).
+
 ## [0.5.90] - 2026-06-10
 
 **Hot-fix: full page reload on Up/Down/Reset click.**

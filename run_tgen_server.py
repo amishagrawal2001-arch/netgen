@@ -14519,6 +14519,11 @@ def _parse_dpdk_devbind_status(output):
                     # back to vendor.
                     "card_model": _detect_nic_model(pci),
                     "pci_class": _cls,  # v0.5.76: surface for transparency
+                    # v0.5.91 (Diagnostics+ID): driver + firmware
+                    # version from `ethtool -i`. Operator on srv06:
+                    # "show driver/fw version column". Empty dict
+                    # on rows with no kernel netdev (vfio-bound).
+                    "drvinfo": _ethtool_drvinfo(iface) if iface else {},
                     # v0.5.77: link status (carrier + speed + duplex).
                     # Operator on srv06: "also show the link status of
                     # interface on admin console". Sysfs read; None on
@@ -15068,6 +15073,128 @@ def _ethtool_link_fallback(iface_name):
             logging.debug(f"[ETHTOOL] {iface_name}: {_e}")
         _ETHTOOL_CACHE[iface_name] = (now, out)
         return out
+
+
+# v0.5.91 (Diagnostics+ID): `ethtool -i` driver/fw cache. Separate
+# from _ETHTOOL_CACHE because the TTL is different (60s — driver
+# and firmware versions don't change during a session) and the
+# parser shape differs.
+_DRVINFO_CACHE = {}  # iface → (ts, dict)
+_DRVINFO_CACHE_TTL = 60.0
+_DRVINFO_LOCK = threading.Lock()
+
+
+def _ethtool_drvinfo(iface_name):
+    """Parse `ethtool -i <iface>` → driver/fw info.
+
+    v0.5.91 — operator-requested column in the iface table. The
+    output is identical across Mellanox/Broadcom/Pensando/Intel
+    kernel drivers (defined by the kernel ethtool spec), so the
+    parser is universal.
+
+    Returns:
+      {
+        "driver":      "mlx5_core",
+        "version":     "24.07-0.6.1",
+        "fw_version":  "28.43.1014",
+        "bus_info":    "0000:84:00.0",
+        "rom_version": "",  # may be empty for many cards
+      }
+
+    Empty dict on any failure (iface gone, ethtool absent, parse
+    error). 60s TTL.
+    """
+    if not iface_name or iface_name == "N/A":
+        return {}
+    if not _RE_IFACE_NAME.match(iface_name):
+        return {}
+    import time as _time
+    now = _time.monotonic()
+    with _DRVINFO_LOCK:
+        ent = _DRVINFO_CACHE.get(iface_name)
+        if ent and (now - ent[0]) < _DRVINFO_CACHE_TTL:
+            return ent[1]
+        out = {}
+        try:
+            _r = subprocess.run(
+                ["ethtool", "-i", iface_name],
+                capture_output=True, text=True, timeout=2,
+            )
+            if _r.returncode == 0:
+                _kmap = {
+                    "driver": "driver",
+                    "version": "version",
+                    "firmware-version": "fw_version",
+                    "bus-info": "bus_info",
+                    "expansion-rom-version": "rom_version",
+                }
+                for line in _r.stdout.splitlines():
+                    if ":" not in line:
+                        continue
+                    k, _, v = line.partition(":")
+                    k = k.strip().lower()
+                    if k in _kmap:
+                        out[_kmap[k]] = v.strip()
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            pass
+        except Exception as _e:
+            logging.debug(f"[DRVINFO] {iface_name}: {_e}")
+        _DRVINFO_CACHE[iface_name] = (now, out)
+        return out
+
+
+def _ethtool_full_dump(iface_name):
+    """v0.5.91: collect a structured dump of every standard
+    ethtool view that's useful in the click-row-to-expand drawer.
+    Returns a dict of section → raw stdout (parsed at render
+    time client-side):
+
+      {
+        "link":       "...output of `ethtool <n>`...",
+        "drvinfo":    "...output of `ethtool -i <n>`...",
+        "features":   "...output of `ethtool -k <n>`...",
+        "coalesce":   "...output of `ethtool -c <n>`...",
+        "ring":       "...output of `ethtool -g <n>`...",
+        "stats":      "...output of `ethtool -S <n>`...",
+        "perm_addr":  "...output of `ethtool -P <n>`...",
+      }
+
+    Each section is best-effort — a missing one means ethtool
+    declined for that NIC (some cards don't support every query).
+    No caching here; this is invoked on operator click only.
+    """
+    if not iface_name or not _RE_IFACE_NAME.match(iface_name):
+        return {}
+    sections = {
+        "link": [],
+        "drvinfo": ["-i"],
+        "features": ["-k"],
+        "coalesce": ["-c"],
+        "ring": ["-g"],
+        "stats": ["-S"],
+        "perm_addr": ["-P"],
+    }
+    out = {}
+    for label, extra in sections.items():
+        try:
+            _r = subprocess.run(
+                ["ethtool", *extra, iface_name],
+                capture_output=True, text=True, timeout=3,
+            )
+            if _r.returncode == 0:
+                out[label] = _r.stdout
+            else:
+                out[label] = (
+                    f"(ethtool returned rc={_r.returncode}: "
+                    f"{_r.stderr.strip()[:120]})"
+                )
+        except subprocess.TimeoutExpired:
+            out[label] = "(ethtool timed out)"
+        except FileNotFoundError:
+            out[label] = "(ethtool not installed)"
+        except Exception as _e:
+            out[label] = f"(error: {_e})"
+    return out
 
 
 def _get_link_info(iface_name):
@@ -16005,6 +16132,13 @@ _ADMIN_INSTALL_STATE = {
 # overwriting state dict, orphaning the first install. Held only
 # across the read + Popen, not the full install lifetime.
 _ADMIN_INSTALL_LOCK = threading.Lock()
+
+
+# v0.5.91: moved here from the v0.5.88 admin-endpoint section
+# so earlier callers (`_ethtool_drvinfo`, `_ethtool_full_dump`)
+# can validate iface names before reaching into `ethtool`.
+# Matches kernel IFNAMSIZ rules: 1-15 chars, [A-Za-z0-9_.-].
+_RE_IFACE_NAME = re.compile(r"^[A-Za-z0-9_.\-]{1,15}$")
 
 
 def _maybe_sudo(cmd):
@@ -19719,6 +19853,19 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
           // so the user can identify which physical port was bound.
           let name;
           let kdrv = i.kernel_driver || '—';
+          // v0.5.91 (Diagnostics+ID): firmware version badge,
+          // rendered inline next to the kernel-driver cell.
+          // Operator-requested. We build the badge HTML separately
+          // (kdrv stays a plain string so the existing
+          // escapeHtml(kdrv) at the cell render still works).
+          let fwBadge = '';
+          if (i.drvinfo && i.drvinfo.fw_version) {
+            const _fw = escapeHtml(i.drvinfo.fw_version);
+            const _drv = escapeHtml(i.drvinfo.driver || '');
+            const _ver = escapeHtml(i.drvinfo.version || '');
+            const _title = `driver: ${_drv}${_ver ? '\nversion: ' + _ver : ''}\nfirmware: ${_fw}`;
+            fwBadge = ` <span class="meta" title="${_title}" style="font-weight: 400;">· fw ${_fw}</span>`;
+          }
           const looksHeadless = !i.name || i.name === 'N/A' || /\(no interface\)/.test(i.name);
           if (looksHeadless && history[pci] && history[pci].name) {
             // v0.5.57 (audit H10): escape history[pci].name —
@@ -19776,6 +19923,8 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
               <button type="button" data-idx="${idx}" data-iface-action="up"    title="Bring ${_name} up"    style="${up ? _dimStyle : _baseStyle}"${up ? ' disabled' : ''}>↑</button>
               <button type="button" data-idx="${idx}" data-iface-action="down"  title="Bring ${_name} down"  style="${!up ? _dimStyle : _baseStyle}" class="secondary"${!up ? ' disabled' : ''}>↓</button>
               <button type="button" data-idx="${idx}" data-iface-action="reset" title="Reset ${_name} (down → 1s → up)" style="${_baseStyle}" class="secondary">↻</button>
+              <button type="button" data-idx="${idx}" data-iface-action="flash" title="Flash ${_name} link LED (5s)" style="${_baseStyle}" class="secondary">💡</button>
+              <button type="button" data-idx="${idx}" data-iface-action="details" title="Show full ethtool dump for ${_name}" style="${_baseStyle}" class="secondary">ℹ️</button>
             </span>`;
             actionBtn = actionBtn + lifecycleBtn;
           }
@@ -19887,7 +20036,7 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
               <td class="mono">${escapeHtml(pci)}</td>
               <td>${vendorCell}</td>
               <td><span class="pill ${s.pillClass}" aria-label="${escapeHtml(s.pillClass + ': ' + s.label)}">${({ok:'✓ ',bad:'✗ ',warn:'! '})[s.pillClass]||''}${escapeHtml(s.label)}</span>${linkLine ? '<br>' + linkLine : ''}</td>
-              <td class="mono">${escapeHtml(kdrv)}</td>
+              <td class="mono">${escapeHtml(kdrv)}${fwBadge}</td>
               <td>${ipCell}</td>
               <td>${lldpCell}</td>
               <td>${queuesCell}</td>
@@ -20179,6 +20328,28 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       // dataset converts kebab to camel: data-iface-action → ifaceAction.
       const realAction = btn.dataset.ifaceAction;
       if (!realAction) return;
+      // v0.5.91: Flash LED — short-circuit before the
+      // up/down/reset lifecycle handler runs. Different
+      // endpoint shape (no force flow).
+      if (realAction === 'flash') {
+        btn.disabled = true;
+        toast(`Flashing ${iface.name} LED for 5s…`);
+        fetch(`/api/admin/iface/${encodeURIComponent(iface.name)}/flash`, {
+          method: 'POST', headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ seconds: 5 }),
+        }).then(r => r.json()).then(d => {
+          if (d.success) toast(`${iface.name}: LED blinking (5s)`);
+          else toastFailDetailed(d, 500);
+        }).catch(e => toast(`Flash request failed: ${e}`))
+          .finally(() => { btn.disabled = false; });
+        return;
+      }
+      // v0.5.91: Details drawer — toggle expand/collapse for
+      // this row. Fetched lazily on first open + cached.
+      if (realAction === 'details') {
+        ifaceDetailsToggle(iface, btn);
+        return;
+      }
       // Confirm for the destructive ones (down/reset).
       if (realAction === 'down' || realAction === 'reset') {
         const verb = realAction === 'reset' ? 'Reset (down → 1s → up)' : 'Bring down';
@@ -20187,6 +20358,72 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       btn.disabled = true;
       ifaceLifecycle(iface, realAction, false).finally(() => { btn.disabled = false; });
     });
+
+    // v0.5.91 Diagnostics drawer: click ℹ️ on a row to fetch and
+    // display the full ethtool dump in a collapsible panel below
+    // the row. Cached per iface (in-memory) so repeated toggles
+    // are instant. The drawer is a sibling row inserted after the
+    // clicked one — keeps layout simple.
+    const _ifaceDetailsCache = {};
+    async function ifaceDetailsToggle(iface, btn) {
+      const tr = btn.closest('tr');
+      if (!tr) return;
+      const existing = tr.nextElementSibling;
+      if (existing && existing.classList.contains('iface-details-drawer')) {
+        existing.remove();
+        btn.textContent = 'ℹ️';
+        return;
+      }
+      const drawer = document.createElement('tr');
+      drawer.className = 'iface-details-drawer';
+      const td = document.createElement('td');
+      const colCount = tr.children.length;
+      td.colSpan = colCount;
+      td.style.cssText = 'background: #f8fafc; padding: 12px 16px; border-top: 1px solid #e2e8f0;';
+      td.innerHTML = `<div style="color: var(--muted); font-size: 11px;">Loading ethtool dump for <code>${escapeHtml(iface.name)}</code>…</div>`;
+      drawer.appendChild(td);
+      tr.parentNode.insertBefore(drawer, tr.nextSibling);
+      btn.textContent = '✕';
+      let data = _ifaceDetailsCache[iface.name];
+      if (!data) {
+        try {
+          const r = await fetch(`/api/admin/iface/${encodeURIComponent(iface.name)}/details`);
+          data = await r.json();
+          _ifaceDetailsCache[iface.name] = data;
+        } catch (e) {
+          td.innerHTML = `<div style="color: #b91c1c;">Failed: ${escapeHtml(String(e))}</div>`;
+          return;
+        }
+      }
+      // Render: header with drvinfo + a <details> per section.
+      const dv = data.drvinfo || {};
+      const sections = data.sections || {};
+      let html = '';
+      html += `<div style="font-size: 12px; color: #1e293b; margin-bottom: 10px;">
+        <strong>Driver:</strong> ${escapeHtml(dv.driver || '—')} ·
+        <strong>Version:</strong> ${escapeHtml(dv.version || '—')} ·
+        <strong>Firmware:</strong> ${escapeHtml(dv.fw_version || '—')} ·
+        <strong>Bus:</strong> ${escapeHtml(dv.bus_info || '—')}
+      </div>`;
+      const _labels = {
+        link: 'Link settings (ethtool)',
+        drvinfo: 'Driver info (ethtool -i)',
+        features: 'Feature flags (ethtool -k)',
+        coalesce: 'Interrupt coalescing (ethtool -c)',
+        ring: 'Ring parameters (ethtool -g)',
+        stats: 'Driver statistics (ethtool -S)',
+        perm_addr: 'Permanent address (ethtool -P)',
+      };
+      for (const k of ['link', 'drvinfo', 'features', 'coalesce', 'ring', 'stats', 'perm_addr']) {
+        if (!sections[k]) continue;
+        const isOpen = (k === 'link') ? ' open' : '';
+        html += `<details class="collapse"${isOpen} style="margin-top: 6px;">
+          <summary style="cursor: pointer; font-size: 12px; color: #334155; padding: 4px 0;">${_labels[k]}</summary>
+          <pre style="background: #fff; border: 1px solid #e2e8f0; border-radius: 4px; padding: 8px; font-size: 11px; max-height: 280px; overflow: auto; margin: 4px 0 0 0;">${escapeHtml(sections[k])}</pre>
+        </details>`;
+      }
+      td.innerHTML = html;
+    }
 
     // ----- IP management modal -----
     let _modalIface = null;
@@ -20392,10 +20629,9 @@ def api_admin_interface_ips():
 
 
 # v0.5.88: validate iface names before they reach `ip link set`.
-# Mirrors the v0.5.60 PCI BDF regex pattern — kernel net device
-# names match `[A-Za-z0-9_.-]{1,15}` (IFNAMSIZ-1). Tighter than
-# the v0.5.70 IP regex.
-_RE_IFACE_NAME = re.compile(r"^[A-Za-z0-9_.\-]{1,15}$")
+# v0.5.91: moved to earlier in the file — see comment near the
+# definition. The duplicate definition here is removed; we
+# already have _RE_IFACE_NAME at module scope.
 
 
 def _iface_action_safety_check(iface, action):
@@ -20552,6 +20788,62 @@ def api_admin_iface_reset(iface):
             "interface": iface,
         }), 500
     return jsonify({"success": True, "interface": iface, "action": "reset"})
+
+
+@app.route("/api/admin/iface/<iface>/flash", methods=["POST"])
+@require_role("admin")
+def api_admin_iface_flash(iface):
+    """v0.5.91: blink the iface's link LED — `ethtool -p <n> 5`.
+
+    Lets the operator find which physical port a given iface
+    name corresponds to. 5-second blink is the default. Body
+    `{"seconds": int}` overrides (1-60 range).
+    """
+    if not _RE_IFACE_NAME.match(iface or ""):
+        return jsonify({"error": "invalid iface name"}), 400
+    body = request.get_json(silent=True) or {}
+    secs = body.get("seconds", 5)
+    try:
+        secs = int(secs)
+    except (TypeError, ValueError):
+        secs = 5
+    secs = max(1, min(60, secs))
+    try:
+        # Don't capture / wait: `ethtool -p` blocks for the full
+        # duration. Use Popen + brief wait so the API returns
+        # immediately and the LED keeps blinking in the
+        # background.
+        subprocess.Popen(
+            _maybe_sudo([
+                "ethtool", "-p", iface, str(secs)
+            ]),
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            close_fds=True,
+        )
+    except FileNotFoundError:
+        return jsonify({"error": "ethtool not installed"}), 500
+    except Exception as _e:
+        return jsonify({"error": str(_e)}), 500
+    return jsonify({
+        "success": True, "interface": iface, "seconds": secs,
+    })
+
+
+@app.route("/api/admin/iface/<iface>/details", methods=["GET"])
+@require_role("admin")
+def api_admin_iface_details(iface):
+    """v0.5.91: full ethtool dump for the click-row-to-expand
+    drawer. Returns structured per-section text + parsed driver
+    info so the client can render each section as a collapsible
+    block."""
+    if not _RE_IFACE_NAME.match(iface or ""):
+        return jsonify({"error": "invalid iface name"}), 400
+    return jsonify({
+        "interface": iface,
+        "drvinfo": _ethtool_drvinfo(iface),
+        "sections": _ethtool_full_dump(iface),
+    })
 
 
 @app.route("/api/admin/interface_ip", methods=["POST"])
