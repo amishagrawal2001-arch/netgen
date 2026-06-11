@@ -490,6 +490,21 @@ RestartSec=10
 #     (mode 0440), read sysfs files owned by root with 0600 perms.
 AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_MODULE CAP_SYS_BOOT CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
 CapabilityBoundingSet=CAP_NET_RAW CAP_NET_ADMIN CAP_SYS_ADMIN CAP_SYS_MODULE CAP_SYS_BOOT CAP_SETUID CAP_SETGID CAP_DAC_OVERRIDE CAP_DAC_READ_SEARCH
+# Operator-bite caught on srv06 (Jun 11 2026): without these
+# rlimits, Mellanox mlx5 PMD probe fails with
+#   mlx5_net: ingress mlx5dv_dr_create_domain failed
+#   mlx5_net: probe of PCI device 0000:2b:00.0 aborted —
+#     Cannot allocate memory
+# because the PMD needs to mlock NIC queue + flow-table memory
+# and the default systemd locked-memory cap (~64 KiB) is way
+# short. LimitMEMLOCK=infinity is the canonical Mellanox DPDK
+# requirement; LimitNOFILE is bumped so per-queue fd counts
+# don't hit EMFILE on high-queue NICs (Mellanox 200G can want
+# 1k+ fds); LimitNPROC=infinity lets the multi-instance
+# tx_worker fork its worker threads without nproc throttling.
+LimitMEMLOCK=infinity
+LimitNOFILE=1048576
+LimitNPROC=infinity
 # v0.5.0 install root — independent of system Python.
 WorkingDirectory={install_root}
 # Forward stdout/stderr to journalctl so `journalctl -u netgen-server`

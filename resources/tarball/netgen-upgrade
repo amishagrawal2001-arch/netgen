@@ -104,6 +104,101 @@ def _verify_new_version(timeout_s: int = 30) -> bool:
     return False
 
 
+def _rebuild_tx_worker(install_root: Path, venv_py: Path) -> None:
+    """Rebuild tx_worker.c against the locally-installed DPDK.
+
+    Calls into install_dpdk.sh's dpdk_tx_worker.sh helper if
+    available, otherwise falls back to a direct meson invoke.
+    On success installs the freshly-built binary to
+    /usr/local/bin/tx_worker (the canonical resolver path —
+    see utils/dpdk_tx_worker.py:_resolve_tx_worker_bin).
+    """
+    # Find the wheel-extracted tx_worker source. After pip
+    # install the resources/ tree is under
+    # <venv>/lib/python3.X/site-packages/resources/dpdk/tx_worker.
+    try:
+        rc = subprocess.run(
+            [str(venv_py), "-c",
+             "import resources.dpdk.tx_worker, os; "
+             "print(os.path.dirname(resources.dpdk.tx_worker.__file__))"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if rc.returncode != 0 or not rc.stdout.strip():
+            logger.info(
+                "[TX_WORKER] could not locate wheel-shipped source; "
+                "skipping rebuild. If DPDK streams fail with "
+                "'unrecognized option' errors, re-run install_dpdk.sh."
+            )
+            return
+        src_dir = Path(rc.stdout.strip())
+    except Exception as exc:
+        logger.info(f"[TX_WORKER] source lookup failed: {exc}; skipping rebuild")
+        return
+
+    # Build deps check — if libdpdk-dev / meson / ninja isn't
+    # there, skip with a clear message rather than erroring out
+    # the upgrade.
+    missing = []
+    for tool in ("meson", "ninja"):
+        if subprocess.run(["which", tool], capture_output=True).returncode != 0:
+            missing.append(tool)
+    if subprocess.run(
+        ["pkg-config", "--exists", "libdpdk"],
+        capture_output=True,
+    ).returncode != 0:
+        missing.append("libdpdk-dev (pkg-config)")
+    if missing:
+        logger.warning(
+            f"[TX_WORKER] build deps missing: {', '.join(missing)}. "
+            f"Skipping tx_worker rebuild — the binary at "
+            f"/usr/local/bin/tx_worker may be stale. Run "
+            f"`sudo bash {install_root}/resources/dpdk/install_dpdk.sh` "
+            f"to install build deps + rebuild."
+        )
+        return
+
+    build_dir = src_dir / "build"
+    try:
+        # Wipe stale build dir; meson setup is fast.
+        if build_dir.exists():
+            subprocess.run(
+                ["rm", "-rf", str(build_dir)],
+                check=True, timeout=10,
+            )
+        _run(["meson", "setup", str(build_dir), str(src_dir)],
+             check=True)
+        _run(["meson", "compile", "-C", str(build_dir)], check=True)
+    except subprocess.CalledProcessError as exc:
+        logger.warning(
+            f"[TX_WORKER] rebuild failed: {exc}. "
+            f"Binary at /usr/local/bin/tx_worker may be stale; "
+            f"DPDK streams could fail. Re-run install_dpdk.sh "
+            f"to recover."
+        )
+        return
+
+    built = build_dir / "tx_worker"
+    if not built.exists():
+        logger.warning(
+            f"[TX_WORKER] meson reported success but {built} is "
+            f"missing. Skipping install."
+        )
+        return
+
+    try:
+        _run(["install", "-m755", str(built), "/usr/local/bin/tx_worker"],
+             check=True)
+        logger.info(
+            "[TX_WORKER] ✓ Rebuilt and installed to /usr/local/bin/tx_worker"
+        )
+    except subprocess.CalledProcessError as exc:
+        logger.warning(
+            f"[TX_WORKER] install to /usr/local/bin/ failed: {exc}. "
+            f"The freshly-built binary is at {built}; you can copy "
+            f"it manually."
+        )
+
+
 def main() -> int:
     _setup_logging()
     _require_root()
@@ -210,6 +305,21 @@ def main() -> int:
             "tarball reinstall."
         )
         return 3
+
+    # Operator-bite caught on srv06 (Jun 11 2026): the new
+    # wheel's launcher (utils/dpdk_tx_worker.py) passes flags
+    # like `--tx-cores N` that may not exist in the tx_worker
+    # binary at /usr/local/bin/tx_worker, which was built when
+    # the PREVIOUS wheel installed via install_dpdk.sh Step 6.
+    # Result: every DPDK stream launch errors with
+    #   /usr/local/bin/tx_worker: unrecognized option '--tx-cores'
+    # AND every stream falls back to Scapy at ~10x slower.
+    #
+    # Rebuild tx_worker from the wheel-shipped source so the
+    # binary always matches the launcher. Best-effort: if the
+    # build deps aren't present (libdpdk-dev missing) we WARN
+    # and continue; the launcher can still run Scapy streams.
+    _rebuild_tx_worker(install_root, venv_py)
 
     # Restart the unit so the new code is loaded.
     _run(["systemctl", "restart", SYSTEMD_UNIT_NAME], check=True)
