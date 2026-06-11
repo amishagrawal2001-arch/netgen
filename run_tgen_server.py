@@ -399,24 +399,14 @@ from utils.dhcp_monitor import DHCPClientMonitor
 dhcp_client_monitor = DHCPClientMonitor(device_db)
 
 # Add request logging middleware
-@app.before_request
-def log_request_info():
-    logging.info(f"[REQUEST] {request.method} {request.path} from {request.remote_addr}")
-    if request.method in ['POST', 'PUT', 'PATCH']:
-        try:
-            # Log request data (truncated for security)
-            data = request.get_json()
-            if data:
-                # Only log non-sensitive fields
-                safe_data = {k: v for k, v in data.items() if 'password' not in k.lower() and 'token' not in k.lower()}
-                logging.debug(f"[REQUEST DATA] {safe_data}")
-        except Exception as e:
-            logging.debug(f"[REQUEST DATA] Could not parse JSON: {e}")
-
-@app.after_request
-def log_response_info(response):
-    logging.info(f"[RESPONSE] {response.status_code} for {request.method} {request.path}")
-    return response
+# v0.5.98 (audit L3): the duplicate `log_request_info` +
+# `log_response_info` hooks here used to fire AFTER the older
+# `_log_request_info` / `_log_response_info` (lines 306/319),
+# so every request was logged twice in journalctl. Deleted.
+# The earlier pair already covers ISIS-payload logging; this
+# pair added [REQUEST DATA] for POST/PUT/PATCH which is more
+# noise than signal at info level. If we want safe-data
+# debug-level logging we can fold it back in there.
 
 # Thread pool and active streams tracking
 executor = ThreadPoolExecutor(max_workers=10)
@@ -15088,7 +15078,12 @@ def _ethtool_link_fallback(iface_name):
         except (subprocess.TimeoutExpired, FileNotFoundError):
             pass
         except Exception as _e:
-            logging.debug(f"[ETHTOOL] {iface_name}: {_e}")
+            # v0.5.98 (audit M13): non-timeout / non-missing
+            # ethtool errors (e.g. unexpected OSError, parse
+            # crash) deserve warning level — at debug they're
+            # invisible by default and an operator chasing a
+            # mysterious "no link info" never sees them.
+            logging.warning(f"[ETHTOOL] {iface_name}: {_e}")
         _ETHTOOL_CACHE[iface_name] = (now, out)
         return out
 
@@ -20015,7 +20010,13 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       if (_ifacesInFlight) { _ifacesRerun = true; return; }
       _ifacesInFlight = true;
       const wrap = $('iface-table-wrap');
-      wrap.innerHTML = '<div class="iface-empty">Loading…</div>';
+      // v0.5.98 (audit polish): only show "Loading…" on the
+      // initial render. Subsequent refreshes keep the existing
+      // table visible until the new render is ready — no more
+      // jarring 700ms-after-action flicker.
+      if (!wrap.firstChild || wrap.querySelector('.iface-empty')) {
+        wrap.innerHTML = '<div class="iface-empty">Loading…</div>';
+      }
       try {
         // Four parallel fetches:
         //   /api/dpdk/interfaces      — base list
@@ -20140,7 +20141,11 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
             // screen readers. Pre-fix the glyph-only buttons
             // were announced as "up arrow button" with no
             // context.
-            lifecycleBtn = `<span class="iface-ctl" style="display: inline-flex; gap: 3px; margin-left: 4px;">
+            // v0.5.98 (audit polish): flex-wrap so the 5
+            // buttons drop to a second line gracefully at
+            // narrow viewport widths instead of forcing the
+            // whole action column off-screen.
+            lifecycleBtn = `<span class="iface-ctl" style="display: inline-flex; gap: 3px; margin-left: 4px; flex-wrap: wrap;">
               <button type="button" data-idx="${idx}" data-iface-action="up"    title="Bring ${_name} up"                   aria-label="Bring ${_name} up"                   style="${up ? _dimStyle : _baseStyle}"${up ? ' disabled' : ''}>↑</button>
               <button type="button" data-idx="${idx}" data-iface-action="down"  title="Bring ${_name} down"                 aria-label="Bring ${_name} down"                 style="${!up ? _dimStyle : _baseStyle}" class="secondary"${!up ? ' disabled' : ''}>↓</button>
               <button type="button" data-idx="${idx}" data-iface-action="reset" title="Reset ${_name} (down → 1s → up)"     aria-label="Reset ${_name} (down then up)"       style="${_baseStyle}" class="secondary">↻</button>
@@ -20675,7 +20680,10 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
           data = await r.json();
           _ifaceDetailsCache[iface.name] = { data, ts: Date.now() };
         } catch (e) {
-          td.innerHTML = `<div style="color: #b91c1c;">Failed: ${escapeHtml(String(e))}</div>`;
+          // v0.5.98 (audit polish): use var(--bad) instead of
+          // raw hex so the error tone matches the rest of the
+          // admin's red elements.
+          td.innerHTML = `<div style="color: var(--bad);">Failed: ${escapeHtml(String(e))}</div>`;
           return;
         }
       }

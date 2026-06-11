@@ -2,6 +2,66 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.98] - 2026-06-11
+
+**Admin console audit batch #7 (final): LOW polish.**
+
+Closes the 7-release audit drive that started with v0.5.92.
+Consolidates the remaining LOW findings.
+
+### L3 — Duplicate request loggers deleted
+
+Two `@app.before_request` hooks at lines 306 and 402 were both
+emitting `[REQUEST] <method> <path>` for every incoming
+request — every line appeared twice in journalctl. The
+v0.5.92 audit caught this. Deleted the newer pair that added
+verbose `[REQUEST DATA]` debug logging (more noise than
+signal at info level).
+
+### M13 — `_ethtool_link_fallback` non-timeout errors → warning
+
+Pre-fix `logging.debug(f"[ETHTOOL] ...")` on unexpected
+errors. Default log level is INFO, so real OSError / parse
+crashes were invisible — operator chasing "no link info"
+never saw the underlying cause. Bumped to `logging.warning`.
+
+### UX polish
+
+- **Drawer "Failed:" color** — was raw hex `#b91c1c`. Now
+  `var(--bad)` so the error tone matches the rest of the
+  admin's red elements.
+- **Lifecycle button container** — gains `flex-wrap: wrap`
+  so ↑/↓/↻/💡/ℹ️ drops to a second line gracefully at narrow
+  viewport widths instead of forcing the action column
+  off-screen.
+- **Loading flicker fix** — `refreshInterfaces()` now skips
+  the `<div class="iface-empty">Loading…</div>` placeholder
+  when the table already has rendered content. Pre-fix the
+  700ms post-action refresh briefly replaced the populated
+  table with "Loading…" — jarring and uninformative since
+  the operator already saw the action toast.
+
+### Tests
+
+7 new regression tests for the polish.
+
+Full suite: **2,290 passed, 1 skipped** (+7 new).
+
+### Audit drive summary
+
+| Release | Theme | New tests |
+|---|---|---|
+| v0.5.92 | Auth + audit trail | +16 |
+| v0.5.93 | Cache + race fixes | +10 |
+| v0.5.94 | Toast + drawer UX | +8 |
+| v0.5.95 | Recovery + integration tests | +12 |
+| v0.5.96 | Diagnostic endpoints + caching | +17 |
+| v0.5.97 | Operability fortification | +13 |
+| v0.5.98 | LOW polish | +7 |
+
+Total: 83 new regression tests across the audit batch.
+Suite size: 2,207 → 2,290 (+83).
+
 ## [0.5.97] - 2026-06-11
 
 **Admin console audit batch #6: operability fortification.**
