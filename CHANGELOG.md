@@ -2,6 +2,64 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.99] - 2026-06-11
+
+**Fix: `start_stream` cross-contaminated stream_id across
+same-name streams → both streams started together.**
+
+Operator:
+
+> trying to run two streams, when trying to start the selected
+> stream both the stream are starting together. check start
+> and stop selected stream.
+
+### Two interacting bugs
+
+**Bug 1.** `start_stream` matched the selected row by NAME only:
+
+```python
+matched_stream = next(
+    (s for s in self.streams.get(port_key, [])
+     if s.get("name") == stream_name),
+    None
+)
+```
+
+When two streams on the same port shared a name, `next(...)`
+picked the FIRST one — not the operator-selected row. (`stop_stream`
+has used the table cell's `UserRole` stream_id since v0.2.84;
+`start_stream` was never updated to match.)
+
+**Bug 2.** The sync block that ran AFTER the lookup forced
+every same-name stream on the port to take the new stream_id:
+
+```python
+for s in self.streams.get(port_key, []):
+    if s.get("name") == matched_stream.get("name"):
+        s["stream_id"] = stream_id    # cross-contamination
+```
+
+With both streams now sharing one stream_id, the stats-poll
+path bound BOTH rows to the single server-side stream — both
+rows appeared running.
+
+### Fix
+
+- Mirror `stop_stream`'s lookup pattern: read
+  `name_item.data(Qt.UserRole)` for the unique stream_id and
+  match by that first. Name fallback only when the cell
+  carries no stream_id (legacy rows / imported configs).
+- Sync ONLY the matched_stream object's identity fields, not
+  every same-name sibling on the port.
+
+### Tests
+
+7 new regression tests guarding the stream_id-first lookup,
+the gated name fallback, and the no-sibling-cross-contamination
+sync.
+
+Full suite: **2,297 passed, 1 skipped** (+7 new).
+
 ## [0.5.98] - 2026-06-11
 
 **Admin console audit batch #7 (final): LOW polish.**

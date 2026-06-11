@@ -558,13 +558,38 @@ class TrafficGenClientStreamLogic:
                 )
                 continue
 
-            matched_stream = next(
-                (s for s in self.streams.get(port_key, [])
-                 if s.get("name") == stream_name or s.get("protocol_selection", {}).get("name") == stream_name),
-                None
-            )
+            # v0.5.99: match by stream_id stashed in the table cell's
+            # UserRole FIRST. Pre-fix the match was name-only, so two
+            # streams with the same name on the same port would have
+            # `next(...)` pick the WRONG one (first in the list, not
+            # the one the operator selected). Combined with the sync
+            # block below which cascaded the new stream_id onto every
+            # same-name stream, this caused both rows to register as
+            # running on stat-poll — exactly the operator's "both
+            # streams start when only one selected" report.
+            # `stop_stream` has used this pattern since v0.2.84.
+            stream_id_from_table = name_item.data(Qt.UserRole)
+            matched_stream = None
+            if stream_id_from_table:
+                for s in self.streams.get(port_key, []):
+                    if s.get("stream_id") == stream_id_from_table:
+                        matched_stream = s
+                        break
+            # Name fallback if the cell has no stream_id (rows added
+            # before stream_id became required, or imported configs).
             if not matched_stream:
-                logger.error(f"Stream '{stream_name}' not found in port '{port_key}'")
+                matched_stream = next(
+                    (s for s in self.streams.get(port_key, [])
+                     if s.get("name") == stream_name
+                     or s.get("protocol_selection", {}).get("name") == stream_name),
+                    None
+                )
+            if not matched_stream:
+                logger.error(
+                    f"[START] Stream '{stream_name}' "
+                    f"(stream_id={stream_id_from_table!r}) not found "
+                    f"in port '{port_key}'"
+                )
                 continue
 
             # Check enabled flag - sync from table combo box first, then check both locations
@@ -603,11 +628,15 @@ class TrafficGenClientStreamLogic:
             matched_stream["interface"] = normalized_interface
             matched_stream["port"] = port_key  # keep full label
 
-            # sync master list entry
-            for s in self.streams.get(port_key, []):
-                if s.get("name") == matched_stream.get("name"):
-                    s["interface"] = normalized_interface
-                    s["stream_id"] = stream_id
+            # v0.5.99: sync ONLY the matched stream — pre-fix this
+            # block looped every same-name stream on the port and
+            # forced them ALL to share the new stream_id. With two
+            # rows for two streams that happened to share a name,
+            # both rows then bound to the same server-side stream
+            # and appeared to be running together. Now we mutate
+            # only the matched object's identity fields.
+            matched_stream["interface"] = normalized_interface
+            matched_stream["stream_id"] = stream_id
 
             # find server for this TG
             try:
