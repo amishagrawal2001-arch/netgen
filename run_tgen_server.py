@@ -15431,6 +15431,87 @@ def admin_journal():
         return jsonify({"error": str(_e), "lines": []}), 500
 
 
+@app.route("/api/admin/diag_bundle", methods=["GET"])
+@require_role("viewer")  # contains lspci + ifaces + journal — same
+                         # surface as /api/admin/journal (viewer ok)
+def admin_diag_bundle():
+    """v0.5.104: one-button "Export Diagnostics" — captures
+    system state into a tar.gz.
+
+    Operator-requested after srv06 took 3 release-roundtrips to
+    sort out (v0.5.101 → v0.5.103). Each round needed one more
+    piece of system state: kernel version, dpkg list, ethtool
+    output, /proc/<pid>/limits, etc. This endpoint collapses
+    that to a single click.
+
+    The bundle includes:
+      - system: uname, /proc/cmdline, meminfo, free, cpuinfo
+      - packages: dpkg -l filtered to dpdk/mlx/rdma-core/...
+      - pci: lspci network controllers
+      - dpdk: tx_worker --help + stat, hugepages, /mnt/huge
+      - interfaces (per iface): ethtool -i/-k/-g/-S + sysfs
+      - firmware: mlxfwmanager --query, ibstat, ibv_devinfo
+      - systemd: unit + drop-ins + /proc/<MainPID>/limits
+        (definitive proof of LimitMEMLOCK=infinity)
+      - api: /api/admin/health, /api/dpdk/status, /api/interfaces
+      - journal: last hour of netgen-server + dmesg
+        (filtered to network-relevant lines)
+      - netgen: pip-show + netgen-upgrade head
+
+    The journal is passed through _redact_journal_secrets()
+    before inclusion. Returned as a tar.gz with a filename
+    that includes the hostname + UTC timestamp so operators
+    don't accidentally overwrite a previous capture.
+    """
+    from datetime import datetime, timezone
+    from flask import Response
+
+    try:
+        from utils.diag_bundle import build_bundle
+    except Exception as _e:
+        return jsonify({"error": f"diag_bundle import failed: {_e}"}), 500
+
+    # In-process API fetcher — no HTTP roundtrip to localhost.
+    # Uses test_client() so we run through the same Flask
+    # routing/auth/serialization as a real request.
+    client = app.test_client()
+
+    def _fetch(path: str) -> dict:
+        r = client.get(path)
+        # Some endpoints return non-JSON on error; tolerate.
+        try:
+            return r.get_json(force=True) or {"_status": r.status_code,
+                                              "_body": r.get_data(as_text=True)[:8192]}
+        except Exception:
+            return {"_status": r.status_code,
+                    "_body": r.get_data(as_text=True)[:8192]}
+
+    try:
+        blob = build_bundle(
+            api_fetcher=_fetch,
+            journal_redactor=_redact_journal_secrets,
+        )
+    except Exception as _e:
+        logger.exception("[diag] bundle build failed")
+        return jsonify({"error": f"diag bundle build failed: {_e}"}), 500
+
+    host = (subprocess.run(
+        ["hostname", "-s"], capture_output=True, text=True, timeout=2,
+    ).stdout.strip() or "netgen") if True else "netgen"
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    fname = f"netgen-diag-{host}-{ts}.tar.gz"
+    return Response(
+        blob,
+        status=200,
+        mimetype="application/gzip",
+        headers={
+            "Content-Disposition": f'attachment; filename="{fname}"',
+            "Content-Length": str(len(blob)),
+            "X-Netgen-Diag-Bundle-Size": str(len(blob)),
+        },
+    )
+
+
 @app.route("/api/dpdk/accelerators", methods=["GET"])
 def dpdk_accelerators():
     """v0.5.76: list non-NIC DPDK-capable PCI devices.
@@ -19149,6 +19230,23 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       </details>
     </div>
 
+    <!-- v0.5.104: Diagnostic bundle — one-click export of
+         everything support needs (uname, dpkg, lspci, ethtool,
+         /proc/<pid>/limits, journal, /api/* snapshots). Drops
+         a tar.gz the operator can attach to a bug report. -->
+    <div class="card" id="support-card">
+      <h2>Support</h2>
+      <p style="color: var(--muted); font-size: 12px; margin-top: 0;">
+        Capture system state into a tar.gz: NIC drivers, hugepages,
+        firmware, journal, /proc/&lt;pid&gt;/limits, API snapshots.
+        Safe to share — tokens redacted from journal.
+      </p>
+      <div class="actions">
+        <button id="btn-diag-bundle">⬇ Export Diagnostics</button>
+      </div>
+      <div id="diag-status" style="color: var(--muted); font-size: 11px; margin-top: 8px;"></div>
+    </div>
+
     <div class="card" id="dpdk-card">
       <h2>DPDK Runtime</h2>
       <div class="row"><span class="label">DPDK libraries</span><span class="pill" id="p-dpdk">…</span></div>
@@ -19855,6 +19953,48 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
     // triple-clicks don't fire concurrent fetches.
     $('btn-refresh').addEventListener('click', async () => {
       await withButtonBusy('btn-refresh', refreshHealth);
+    });
+
+    // v0.5.104: Export Diagnostics. Fetches /api/admin/diag_bundle
+    // (returns tar.gz) and triggers a browser download via a
+    // temporary <a download>. ~3-10 seconds to build server-side
+    // depending on iface count + journal length.
+    $('btn-diag-bundle').addEventListener('click', async () => {
+      const btn = $('btn-diag-bundle');
+      const status = $('diag-status');
+      btn.disabled = true;
+      const oldText = btn.textContent;
+      btn.textContent = 'Building bundle…';
+      status.textContent = 'Capturing system state — typically 5-10s';
+      try {
+        const r = await fetch('/api/admin/diag_bundle');
+        if (!r.ok) {
+          // Try to parse JSON error; fall back to status text.
+          let msg = r.statusText;
+          try { const j = await r.json(); msg = j.error || msg; } catch (_) {}
+          throw new Error(msg);
+        }
+        const blob = await r.blob();
+        // Pull filename from Content-Disposition; fall back to ts.
+        let fname = 'netgen-diag.tar.gz';
+        const cd = r.headers.get('Content-Disposition') || '';
+        const m = cd.match(/filename="?([^"]+)"?/);
+        if (m) fname = m[1];
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = fname;
+        document.body.appendChild(a); a.click(); a.remove();
+        URL.revokeObjectURL(url);
+        const sizeKB = Math.round(blob.size / 1024);
+        status.textContent = `✓ Downloaded ${fname} (${sizeKB} KB)`;
+        toast(`Diagnostics bundle: ${fname} (${sizeKB} KB)`);
+      } catch (e) {
+        status.textContent = '⚠ Failed: ' + e.message;
+        toast('Diag bundle failed: ' + e.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = oldText;
+      }
     });
 
     $('btn-install-dpdk').addEventListener('click', async () => {
