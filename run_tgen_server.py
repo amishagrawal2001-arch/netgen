@@ -16673,6 +16673,7 @@ def _save_bind_history(history):
 def api_admin_health():
     """Consolidated server health for the admin portal."""
     import socket
+    import shutil as _shutil
     out = {
         "hostname": socket.gethostname(),
         "netgen_server": {"port": int(os.environ.get("PORT", "5050"))},
@@ -16682,6 +16683,25 @@ def api_admin_health():
         "hugepages": {},
         "tx_worker": {"present": False, "path": None},
         "install_running": False,
+        # v0.5.96 (audit M10): expose which CLI tools the
+        # admin actions depend on. Pre-fix the operator only
+        # learned `ethtool` / `iproute2` / `lldpcli` were
+        # missing on first click (e.g. Down → 500 "iproute2
+        # not installed"). Now /health surfaces it up front
+        # and the admin console can warn before any click.
+        "tools_present": {
+            "ip": bool(_shutil.which("ip")),
+            "ethtool": bool(_shutil.which("ethtool")),
+            "lldpcli": bool(_shutil.which("lldpcli")),
+            "lspci": bool(_shutil.which("lspci")),
+            "ibv_devinfo": bool(_shutil.which("ibv_devinfo")),
+            "perftest": bool(_shutil.which("ib_send_bw")),
+            "dpdk_devbind": bool(
+                _shutil.which("dpdk-devbind.py")
+                or os.path.isfile("/usr/local/bin/dpdk-devbind.py")
+                or os.path.isfile("/opt/netgen/resources/dpdk/dpdk-devbind.py")
+            ),
+        },
     }
     # DPDK libs presence
     try:
@@ -21182,22 +21202,173 @@ def api_admin_iface_flash(iface):
     })
 
 
+# v0.5.96 (audit M2 + SEC M3): TTL cache for the iface details
+# response. Each call forks 7 ethtool subprocesses; a tight
+# loop wedges Flask workers. 10s TTL bounds the bursting cost
+# without hiding real changes (the operator's typical iface-
+# debug loop is multi-second between clicks).
+_IFACE_DETAILS_CACHE = {}
+_IFACE_DETAILS_CACHE_TTL = 10.0
+_IFACE_DETAILS_LOCK = threading.Lock()
+
+
+def _iface_details_cached(iface):
+    """Cached wrapper around _ethtool_drvinfo + _ethtool_full_dump."""
+    import time as _time
+    now = _time.monotonic()
+    with _IFACE_DETAILS_LOCK:
+        ent = _IFACE_DETAILS_CACHE.get(iface)
+        if ent and (now - ent[0]) < _IFACE_DETAILS_CACHE_TTL:
+            return ent[1]
+        payload = {
+            "drvinfo": _ethtool_drvinfo(iface),
+            "sections": _ethtool_full_dump(iface),
+        }
+        _IFACE_DETAILS_CACHE[iface] = (now, payload)
+        return payload
+
+
 @app.route("/api/admin/iface/<iface>/details", methods=["GET"])
 @require_role("admin")
 def api_admin_iface_details(iface):
     """v0.5.91: full ethtool dump for the click-row-to-expand
     drawer. Returns structured per-section text + parsed driver
     info so the client can render each section as a collapsible
-    block."""
+    block.
+
+    v0.5.96 (audit M2): 10s server-side cache + iface-name
+    regex gate prevents a tight client loop from wedging Flask
+    workers via 7 ethtool subprocesses per call.
+    """
     if not _RE_IFACE_NAME.match(iface or ""):
         _admin_audit("iface_details", iface, rc="invalid_name")
         return jsonify({"error": "invalid iface name"}), 400
     _admin_audit("iface_details", iface, rc="ok")
+    payload = _iface_details_cached(iface)
     return jsonify({
         "interface": iface,
-        "drvinfo": _ethtool_drvinfo(iface),
-        "sections": _ethtool_full_dump(iface),
+        "drvinfo": payload["drvinfo"],
+        "sections": payload["sections"],
     })
+
+
+# v0.5.96 (audit M15): per-iface sysfs dump. Operator debugging
+# a flapping link can read /sys/class/net/<n>/ stats without
+# SSH. Read-only, viewer-level.
+def _iface_sysfs_dump(iface):
+    if not iface or not _RE_IFACE_NAME.match(iface):
+        return {}
+    base = f"/sys/class/net/{iface}"
+    if not os.path.isdir(base):
+        return {"error": f"no sysfs entry for {iface}"}
+    # Read a fixed set of leaves; ignore missing/EINVAL.
+    leaves = [
+        "address", "carrier", "duplex", "mtu", "operstate",
+        "speed", "tx_queue_len", "ifindex", "type",
+    ]
+    out = {}
+    for leaf in leaves:
+        try:
+            with open(f"{base}/{leaf}", "r") as f:
+                out[leaf] = f.read().strip()
+        except Exception:
+            out[leaf] = None
+    # Statistics counters.
+    stats = {}
+    try:
+        for n in os.listdir(f"{base}/statistics"):
+            try:
+                with open(f"{base}/statistics/{n}", "r") as f:
+                    stats[n] = int(f.read().strip())
+            except Exception:
+                pass
+    except Exception:
+        pass
+    out["statistics"] = stats
+    return out
+
+
+@app.route("/api/admin/iface/<iface>/sysfs", methods=["GET"])
+@require_role("viewer")  # read-only; viewer can read /sys/class/net
+def api_admin_iface_sysfs(iface):
+    """v0.5.96 (audit M15): structured /sys/class/net/<iface>/ dump."""
+    if not _RE_IFACE_NAME.match(iface or ""):
+        return jsonify({"error": "invalid iface name"}), 400
+    return jsonify({
+        "interface": iface,
+        "sysfs": _iface_sysfs_dump(iface),
+    })
+
+
+# v0.5.96 (audit M14): cache state dump + flush.
+# Operator debugging a stale-cache bug (e.g. v0.5.87 LLDP) had
+# no way to inspect cache contents OR force-invalidate from
+# the admin console.
+@app.route("/api/admin/caches", methods=["GET"])
+@require_role("viewer")
+def api_admin_caches():
+    """List per-cache stats: count + age of newest entry."""
+    import time as _time
+    now = _time.monotonic()
+
+    def _age(ts):
+        return round(now - ts, 1) if ts else None
+
+    out = {
+        "ethtool": {
+            "count": len(_ETHTOOL_CACHE),
+            "ttl_s": _ETHTOOL_CACHE_TTL,
+            "keys": sorted(_ETHTOOL_CACHE.keys())[:30],
+        },
+        "drvinfo": {
+            "count": len(_DRVINFO_CACHE),
+            "ttl_s": _DRVINFO_CACHE_TTL,
+            "keys": sorted(_DRVINFO_CACHE.keys())[:30],
+        },
+        "iface_details": {
+            "count": len(_IFACE_DETAILS_CACHE),
+            "ttl_s": _IFACE_DETAILS_CACHE_TTL,
+            "keys": sorted(_IFACE_DETAILS_CACHE.keys())[:30],
+        },
+        "lldp": {
+            "count": len(_LLDP_CACHE.get("by_iface", {})),
+            "ttl_s": _LLDP_CACHE_TTL,
+            "age_s": _age(_LLDP_CACHE.get("ts")),
+        },
+    }
+    return jsonify(out)
+
+
+@app.route("/api/admin/caches/flush", methods=["POST"])
+@require_role("admin")
+def api_admin_caches_flush():
+    """Drop all per-iface caches. Forces the next iface-table
+    render to re-query everything from sysfs / ethtool /
+    lldpcli. Useful after sysadmin-side changes (driver reload,
+    NIC bringup) that the cached state would otherwise mask."""
+    body = request.get_json(silent=True) or {}
+    which = body.get("which") or "all"
+    cleared = []
+    if which in ("all", "ethtool"):
+        with _ETHTOOL_LOCK:
+            _ETHTOOL_CACHE.clear()
+        cleared.append("ethtool")
+    if which in ("all", "drvinfo"):
+        with _DRVINFO_LOCK:
+            _DRVINFO_CACHE.clear()
+        cleared.append("drvinfo")
+    if which in ("all", "iface_details"):
+        with _IFACE_DETAILS_LOCK:
+            _IFACE_DETAILS_CACHE.clear()
+        cleared.append("iface_details")
+    if which in ("all", "lldp"):
+        with _LLDP_CACHE_LOCK:
+            _LLDP_CACHE["by_iface"] = {}
+            _LLDP_CACHE["ts"] = 0
+        cleared.append("lldp")
+    _admin_audit("caches_flush", None, which=which,
+                 cleared=",".join(cleared))
+    return jsonify({"success": True, "cleared": cleared})
 
 
 @app.route("/api/admin/interface_ip", methods=["POST"])

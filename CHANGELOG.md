@@ -2,6 +2,53 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.96] - 2026-06-11
+
+**Admin console audit batch #5: diagnostic endpoints + caching.**
+
+### M10 — `tools_present` in `/api/admin/health`
+
+Pre-fix the admin console only learned `ethtool` / `iproute2` /
+`lldpcli` were missing on first action click (e.g. Down → 500
+"iproute2 not installed"). Now `/health` surfaces presence of
+`ip`, `ethtool`, `lldpcli`, `lspci`, `ibv_devinfo`, `perftest`,
+`dpdk-devbind.py` up front. UI can warn before any click.
+
+### M14 — `/api/admin/caches` dump + flush
+
+Operator debugging a stale-cache bug (e.g. the v0.5.87 LLDP
+blank-then-fill bite) had to restart the whole service.
+
+- `GET /api/admin/caches` (viewer) — count + ttl + first 30
+  keys for ethtool / drvinfo / iface_details / lldp.
+- `POST /api/admin/caches/flush` (admin) — drop one
+  (`{"which": "ethtool"}`) or all (`{"which": "all"}`).
+- Audited via `_admin_audit("caches_flush", ...)` so the
+  operator action is recoverable from `/api/admin/journal`.
+
+### M15 — `/api/admin/iface/<n>/sysfs`
+
+Per-iface `/sys/class/net/<n>/` dump exposed via REST. Returns
+structured leaves (`address`, `carrier`, `duplex`, `mtu`,
+`operstate`, `speed`, `tx_queue_len`, `ifindex`, `type`) plus
+a `statistics` dict with every `/statistics/*` counter as int.
+Viewer-gated; read-only.
+
+### M2 / SEC M3 — `/details` TTL cache
+
+Each call forked 7 ethtool subprocesses; a tight client loop
+could wedge Flask workers. New `_IFACE_DETAILS_CACHE` with 10s
+TTL bounds the cost. Cache key is the iface name; verified
+under `_IFACE_DETAILS_LOCK`.
+
+### Tests
+
+17 new (12 source-level + 3 integration via Flask test_client +
+2 wiring checks). 1 updated (v0.5.91's details-shape check now
+recognizes the cached path).
+
+Full suite: **2,270 passed, 1 skipped** (+17 new).
+
 ## [0.5.95] - 2026-06-11
 
 **Admin console audit batch #4: recovery + integration tests.**

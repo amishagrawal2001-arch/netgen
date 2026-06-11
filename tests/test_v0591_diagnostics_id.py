@@ -172,8 +172,18 @@ def test_details_endpoint_returns_drvinfo_and_sections():
         src,
     )
     body = m.group(0)
-    assert '"drvinfo": _ethtool_drvinfo(iface)' in body
-    assert '"sections": _ethtool_full_dump(iface)' in body
+    # v0.5.96 (audit M2): the handler now delegates through
+    # `_iface_details_cached(iface)` which calls
+    # `_ethtool_drvinfo` + `_ethtool_full_dump` internally and
+    # bounds the cost behind a 10s TTL. Verify the response
+    # still surfaces both keys (the response builder unpacks
+    # the cached payload).
+    assert "_iface_details_cached(iface)" in body or (
+        '_ethtool_drvinfo(iface)' in body
+        and '_ethtool_full_dump(iface)' in body
+    )
+    assert '"drvinfo"' in body
+    assert '"sections"' in body
 
 
 # ─── JS surface ───
