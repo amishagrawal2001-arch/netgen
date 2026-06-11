@@ -2,6 +2,128 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.103] - 2026-06-11
+
+**netgen-upgrade self-updates from the wheel before doing anything else.**
+
+### Operator-reported symptom (srv06, post-v0.5.102-upgrade, third time)
+
+After running v0.5.102's wheel-upgrade, the next stream-launch
+attempt STILL hit:
+
+```
+/usr/local/bin/tx_worker: unrecognized option '--tx-cores'
+```
+
+But the MEMLOCK fix (also new in v0.5.102) did land — PID
+changed, mlx5 PMD probe succeeded. Only the rebuild step
+seemed inert.
+
+### Root cause — self-heal timing race
+
+The v0.5.49 self-heal mechanism copies the wheel's bundled
+`netgen-upgrade` to `/opt/netgen-server/bin/netgen-upgrade`
+**at server startup**, AFTER any in-flight upgrade completes:
+
+```
+1. sudo netgen-upgrade <0.5.102-wheel>
+2. ↳ OLD netgen-upgrade (pre-v0.5.102) runs
+3. ↳ pip install replaces the wheel on disk
+4. ↳ systemctl restart netgen-server
+5. ↳ Server starts → self-heals netgen-upgrade to v0.5.102
+6. Done. Binary stale. v0.5.102's _rebuild_tx_worker only
+   takes effect on the NEXT upgrade.
+```
+
+So the v0.5.101 → v0.5.102 upgrade ran the v0.5.101 (broken)
+script. v0.5.102 → v0.5.103 would run v0.5.102 — but
+v0.5.102's rebuild logic still won't fire until the operator
+runs another upgrade after the self-heal.
+
+Every release that touches netgen-upgrade hits this same
+delayed-effect bite.
+
+### Fix — self-update + re-exec BEFORE main install
+
+`netgen-upgrade` now reads its own bundled copy from the wheel
+(via `zipfile`) at startup, compares bytes against
+`Path(__file__).read_bytes()`, and if they differ:
+
+1. Writes the wheel's copy atomically (via `.new` + rename).
+2. `chmod 0755`.
+3. `os.execv` re-executes with the same argv + `--no-self-update`.
+
+The wheel's logic takes effect on the **first** upgrade
+attempt, not the second. Idempotent — if bytes match, no
+write, no re-exec.
+
+`--no-self-update` prevents infinite re-exec loops in the
+unlikely case the wheel's copy still differs after a write
+(it shouldn't — bytewise compare).
+
+### Order in `main()` (now)
+
+```
+1. _require_root()
+2. parse wheel path
+3. _maybe_self_update_and_reexec(wheel, argv)  ← NEW
+   (everything below this point runs from the wheel's logic)
+4. pip install --upgrade <wheel>
+5. _verify_imports()
+6. _rebuild_tx_worker()
+7. _ensure_rlimits_dropin()
+8. systemctl restart netgen-server
+9. _verify_new_version()
+```
+
+### Operator workflow
+
+```bash
+sudo netgen-upgrade ostg_trafficgen-0.5.103-py3-none-any.whl 2>&1 | tee /tmp/upgrade.log
+```
+
+Watch for:
+
+```
+[SELF-UPDATE] wheel's netgen-upgrade differs from /opt/netgen-server/bin/netgen-upgrade; updating and re-executing
+[SELF-UPDATE] re-exec: /opt/netgen-server/bin/netgen-upgrade <wheel> --no-self-update
+...
+[TX_WORKER] ✓ Rebuilt and installed to /usr/local/bin/tx_worker
+[RLIMITS] ✓ Wrote /etc/systemd/system/netgen-server.service.d/10-netgen-rlimits.conf
+```
+
+On future re-runs of the same wheel:
+
+```
+[SELF-UPDATE] ✓ wheel's netgen-upgrade matches running version; no self-update needed
+```
+
+### Manual unblock for already-broken srv06 (only needed once)
+
+Before v0.5.103 propagates, the operator can run:
+
+```bash
+sudo bash /opt/netgen-server/resources/dpdk/install_dpdk.sh
+```
+
+which rebuilds tx_worker (Step 6) and installs to
+`/usr/local/bin/tx_worker`. Takes ~30 seconds. From v0.5.103
+onward this is no longer needed — the wheel upgrade does it.
+
+### Tests
+
+5 new regression guards in
+`tests/test_mellanox_memlock_and_tx_worker_rebuild.py`:
+
+- `_maybe_self_update_and_reexec` is defined
+- Reads `resources/tarball/netgen-upgrade` from the wheel zip
+- Bytewise compare before replacing self
+- Re-exec passes `--no-self-update` to prevent recursion
+- Self-update fires BEFORE pip install (so the wheel's logic
+  drives every subsequent step)
+
+Full suite: **2,318 passed**, 1 skipped (+5 new).
+
 ## [0.5.102] - 2026-06-11
 
 **v0.5.101 bug fix: tx_worker rebuild + Mellanox rlimits via wheel-upgrade.**

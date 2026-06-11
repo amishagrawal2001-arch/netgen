@@ -104,6 +104,81 @@ def _verify_new_version(timeout_s: int = 30) -> bool:
     return False
 
 
+def _maybe_self_update_and_reexec(wheel: Path, argv: list[str]) -> None:
+    """If the wheel's bundled netgen-upgrade differs from this
+    running script, overwrite this script with the bundled copy
+    and re-exec so the new logic takes effect immediately.
+
+    Re-exec passes ``--no-self-update`` to prevent infinite
+    self-update loops in the unlikely case the wheel's copy
+    still differs after a write (it shouldn't).
+    """
+    import zipfile
+
+    self_path = Path(__file__).resolve()
+    try:
+        with zipfile.ZipFile(str(wheel)) as zf:
+            # The wheel bundles netgen-upgrade at
+            # resources/tarball/netgen-upgrade (pyproject.toml
+            # package-data declaration).
+            wheel_names = [
+                n for n in zf.namelist()
+                if n.endswith("/resources/tarball/netgen-upgrade")
+                or n.endswith("resources/tarball/netgen-upgrade")
+            ]
+            if not wheel_names:
+                logger.info(
+                    "[SELF-UPDATE] wheel doesn't bundle "
+                    "netgen-upgrade; running with current version"
+                )
+                return
+            new_bytes = zf.read(wheel_names[0])
+    except Exception as exc:
+        logger.warning(
+            f"[SELF-UPDATE] could not read netgen-upgrade from "
+            f"wheel: {exc}. Running with current version."
+        )
+        return
+
+    try:
+        current_bytes = self_path.read_bytes()
+    except Exception as exc:
+        logger.warning(
+            f"[SELF-UPDATE] could not read self at {self_path}: "
+            f"{exc}. Running with current version."
+        )
+        return
+
+    if new_bytes == current_bytes:
+        logger.info(
+            "[SELF-UPDATE] ✓ wheel's netgen-upgrade matches "
+            "running version; no self-update needed"
+        )
+        return
+
+    logger.info(
+        f"[SELF-UPDATE] wheel's netgen-upgrade differs from "
+        f"{self_path}; updating and re-executing"
+    )
+    try:
+        # Atomic-ish: write to .new, rename over.
+        new_path = self_path.with_suffix(".new")
+        new_path.write_bytes(new_bytes)
+        new_path.chmod(0o755)
+        new_path.replace(self_path)
+    except Exception as exc:
+        logger.warning(
+            f"[SELF-UPDATE] write failed: {exc}. Running with "
+            f"current (stale) version."
+        )
+        return
+
+    # Re-exec with --no-self-update so we don't recurse.
+    new_argv = [str(self_path)] + argv + ["--no-self-update"]
+    logger.info(f"[SELF-UPDATE] re-exec: {' '.join(new_argv)}")
+    os.execv(str(self_path), new_argv)
+
+
 RLIMITS_DROPIN_PATH = Path(
     "/etc/systemd/system/netgen-server.service.d/10-netgen-rlimits.conf"
 )
@@ -330,6 +405,27 @@ def main() -> int:
 
     logger.info(f"[STARTUP] Install root: {install_root}")
     logger.info(f"[STARTUP] Wheel:        {wheel}")
+
+    # v0.5.103: self-update from the wheel BEFORE running the
+    # main install logic.
+    #
+    # Operator-bite caught on srv06 (Jun 11 2026): v0.5.101 had
+    # a broken _rebuild_tx_worker (silent ModuleNotFoundError).
+    # v0.5.102 fixed it. But operators upgrading v0.5.101 →
+    # v0.5.102 saw the binary stay stale anyway — because the
+    # OLD (v0.5.101) netgen-upgrade ran the upgrade, and the
+    # v0.5.49 self-heal that copies the new netgen-upgrade from
+    # the wheel onto /opt/netgen-server/bin/ only fires at
+    # server startup, AFTER the upgrade is already done.
+    # Result: new logic doesn't take effect until the NEXT
+    # upgrade.
+    #
+    # Fix: read the wheel's own copy of netgen-upgrade. If it
+    # differs from us (this running script), overwrite ourselves
+    # and re-exec with the same argv. The wheel's logic runs on
+    # the FIRST upgrade attempt, not the second.
+    if not any(a == "--no-self-update" for a in argv):
+        _maybe_self_update_and_reexec(wheel, argv)
 
     # v0.5.45: dropped --force-reinstall in favour of --upgrade.
     # Pre-fix, every wheel upgrade uninstalled + reinstalled all

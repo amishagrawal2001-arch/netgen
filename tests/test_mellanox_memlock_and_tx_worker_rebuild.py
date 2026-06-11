@@ -237,6 +237,81 @@ def test_rlimits_dropin_is_idempotent():
     assert "daemon-reload" in body
 
 
+# ─── v0.5.103: self-update before main install ───
+
+
+def test_upgrade_has_self_update_function():
+    """v0.5.102 fixed the rebuild logic but operators upgrading
+    v0.5.101 → v0.5.102 ran v0.5.101's BROKEN netgen-upgrade
+    (still on disk; self-heal only fires at next server startup,
+    AFTER the upgrade). v0.5.103 self-updates from the wheel
+    BEFORE running the main install, so new logic takes effect
+    on the FIRST upgrade attempt."""
+    src = _UPGRADE.read_text()
+    assert "_maybe_self_update_and_reexec" in src, (
+        "netgen-upgrade lacks self-update — operators will keep "
+        "hitting stale-script bugs on every release that touches "
+        "netgen-upgrade"
+    )
+
+
+def test_self_update_reads_wheel_zipfile():
+    """The wheel is a zip; the bundled netgen-upgrade lives at
+    resources/tarball/netgen-upgrade inside it."""
+    src = _UPGRADE.read_text()
+    import re
+    m = re.search(
+        r"def _maybe_self_update_and_reexec[\s\S]+?(?=\ndef [A-Z_])",
+        src,
+    )
+    assert m, "_maybe_self_update_and_reexec not found"
+    body = m.group(0)
+    assert "zipfile" in body
+    assert "resources/tarball/netgen-upgrade" in body
+
+
+def test_self_update_compares_bytes_before_replacing():
+    """If the wheel's copy matches what's already on disk, no
+    write + no re-exec (avoids unnecessary churn + re-exec
+    loops)."""
+    src = _UPGRADE.read_text()
+    import re
+    m = re.search(
+        r"def _maybe_self_update_and_reexec[\s\S]+?(?=\ndef [A-Z_])",
+        src,
+    )
+    body = m.group(0)
+    # Bytewise comparison before deciding to write.
+    assert "new_bytes == current_bytes" in body or "current_bytes == new_bytes" in body
+
+
+def test_self_update_reexec_passes_no_self_update_flag():
+    """After re-execing, the new script must NOT try to
+    self-update again (already up to date by construction).
+    Pass --no-self-update to short-circuit."""
+    src = _UPGRADE.read_text()
+    assert "--no-self-update" in src
+    import re
+    m = re.search(
+        r"def _maybe_self_update_and_reexec[\s\S]+?(?=\ndef [A-Z_])",
+        src,
+    )
+    body = m.group(0)
+    assert "os.execv" in body
+
+
+def test_self_update_fires_before_pip_install():
+    """Self-update must happen BEFORE any other upgrade work —
+    otherwise pip / restart / rebuild all run from the stale
+    code path."""
+    src = _UPGRADE.read_text()
+    self_update_pos = src.find("_maybe_self_update_and_reexec(wheel")
+    pip_install_pos = src.find('pip_cmd.append(str(wheel))', self_update_pos)
+    assert self_update_pos > 0 and pip_install_pos > self_update_pos, (
+        "Self-update must fire before pip install"
+    )
+
+
 def test_rlimits_dropin_fires_before_systemctl_restart():
     """If the drop-in landed AFTER the restart, the
     freshly-started process would have been spawned WITHOUT
