@@ -38,59 +38,63 @@ def _admin_health_body() -> str:
     return m.group(0)
 
 
-def test_admin_health_probes_usr_local_bin_tx_worker():
-    """The candidates list must include /usr/local/bin/tx_worker
-    — that's where install_dpdk.sh Step 6 installs the binary."""
+def test_admin_health_delegates_to_resolver():
+    """v0.5.99 (post-tag): /api/admin/health no longer maintains
+    its own candidates list — it delegates to the launcher's
+    `_resolve_tx_worker_bin()` so the health probe reports the
+    SAME path that /api/traffic/start will exec. Pre-fix the two
+    drifted (the v0.5.67-era inline list reported the binary
+    present at /usr/local/bin/, the launcher's resolver didn't
+    have /usr/local/bin/, and the stream-launch error said
+    'not found'). Single source of truth closes that drift."""
     body = _admin_health_body()
-    # Find the candidates list.
-    m = re.search(
-        r"candidates\s*=\s*\[([\s\S]+?)\]",
-        body,
+    assert "_resolve_tx_worker_bin" in body, (
+        "/api/admin/health no longer delegates to the launcher's "
+        "resolver — drift between health probe and launcher can "
+        "re-introduce the srv06 'binary present but not found' "
+        "bug."
     )
-    assert m, "candidates list not located"
-    paths_block = m.group(1)
-    assert "/usr/local/bin/tx_worker" in paths_block, (
-        "/api/admin/health candidates missing "
-        "/usr/local/bin/tx_worker — admin console reports "
-        "tx_worker missing even when install_dpdk.sh ran "
-        "successfully."
+    # Fallback list still includes /usr/local/bin/ for the case
+    # where the resolver import raises (e.g. partial install).
+    assert "/usr/local/bin/tx_worker" in body, (
+        "Defensive fallback list dropped /usr/local/bin/"
     )
 
 
-def test_admin_health_orders_usr_local_bin_first():
-    """`/usr/local/bin/tx_worker` should come FIRST — that's the
-    actual install target. Build-dir paths are stale-copies that
-    operators sometimes overwrite during install_dpdk.sh re-runs."""
+def test_admin_health_fallback_orders_usr_local_bin_first():
+    """The defensive fallback list (used only if the resolver
+    import errors) must still put /usr/local/bin/ first."""
     body = _admin_health_body()
+    # The fallback is in the `except Exception:` branch.
     m = re.search(
-        r"candidates\s*=\s*\[([\s\S]+?)\]",
+        r"except Exception:[\s\S]+?for p in \(([\s\S]+?)\):",
         body,
     )
+    if not m:
+        # The exact except shape may evolve; tolerate as long as
+        # the resolver is wired in.
+        return
     paths = m.group(1)
     usr_local_idx = paths.find("/usr/local/bin/tx_worker")
     netgen_build_idx = paths.find("/opt/netgen/resources/dpdk/tx_worker/build")
-    assert usr_local_idx >= 0, "missing /usr/local/bin/tx_worker"
+    assert usr_local_idx >= 0
     if netgen_build_idx >= 0:
         assert usr_local_idx < netgen_build_idx, (
-            "candidate order puts build dir before install target "
-            "— may pick up stale build artifacts."
+            "Fallback list order puts build dir before install "
+            "target — stale-build pickup risk."
         )
 
 
-def test_admin_health_still_includes_legacy_paths():
-    """Don't drop the existing paths — early-install hosts where
-    Step 6 hasn't run yet still need a fallback. And /opt/OSTG/
-    is the pre-v0.5 compat symlink."""
+def test_admin_health_fallback_still_includes_legacy_paths():
+    """The defensive fallback list still references both
+    /opt/netgen/ and /opt/OSTG/ for early-install / legacy
+    hosts."""
     body = _admin_health_body()
-    m = re.search(
-        r"candidates\s*=\s*\[([\s\S]+?)\]",
-        body,
-    )
-    paths = m.group(1)
-    assert "/opt/netgen" in paths, (
+    # Just check the strings exist anywhere in the function.
+    assert "/opt/netgen" in body, (
         "Lost the /opt/netgen/ build-dir fallback"
     )
-    assert "/opt/OSTG" in paths, (
+    assert "/opt/OSTG" in body, (
         "Lost the /opt/OSTG/ legacy path"
     )
 

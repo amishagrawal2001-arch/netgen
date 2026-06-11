@@ -12883,18 +12883,35 @@ def dpdk_status():
         except Exception:
             pass
         
-        # Check for tx_worker binary
-        tx_worker_paths = [
-            "/opt/OSTG/resources/dpdk/tx_worker/build/tx_worker",
-            "/usr/local/bin/tx_worker",
-            "./resources/dpdk/tx_worker/build/tx_worker"
-        ]
-        tx_worker_path_found = None
-        for path in tx_worker_paths:
-            if os.path.exists(path):
+        # v0.5.99 (post-tag): use the launcher's resolver as the
+        # single source of truth. Pre-fix this endpoint had its own
+        # 3-path list while utils/dpdk_tx_worker.py had a different
+        # 7-path list — and /api/admin/health had yet another. On
+        # srv06 the binary lived at /usr/local/bin/tx_worker, which
+        # the launcher's list (pre-fix) missed. /api/dpdk/status
+        # reported tx_worker_exists=true (this path list had it)
+        # while the launcher errored 'binary not found'. Operator
+        # spent the diagnosis cycle on a real bug masked by drift.
+        # Now every site delegates to _resolve_tx_worker_bin().
+        try:
+            from utils.dpdk_tx_worker import _resolve_tx_worker_bin
+            _bin = _resolve_tx_worker_bin()
+            if _bin and os.path.exists(_bin):
                 tx_worker_exists = True
-                tx_worker_path_found = path
-                break
+                tx_worker_path_found = _bin
+        except Exception:
+            # Defensive — never let resolver import crash
+            # /api/dpdk/status. Fall through to the old in-line
+            # check.
+            for path in (
+                "/usr/local/bin/tx_worker",
+                "/opt/netgen/resources/dpdk/tx_worker/build/tx_worker",
+                "/opt/OSTG/resources/dpdk/tx_worker/build/tx_worker",
+            ):
+                if os.path.exists(path):
+                    tx_worker_exists = True
+                    tx_worker_path_found = path
+                    break
 
         # v0.2.77: ABI version indicators. Surface BOTH the libdpdk
         # version the system has AND the binary's mtime as a proxy
@@ -13851,19 +13868,28 @@ def dpdk_verify():
         except Exception as e:
             messages.append(f"Error checking DPDK libraries: {e}")
         
-        # Check tx_worker binary
-        tx_worker_paths = [
-            "/opt/OSTG/resources/dpdk/tx_worker/build/tx_worker",
-            "/usr/local/bin/tx_worker",
-            "./resources/dpdk/tx_worker/build/tx_worker"
-        ]
-        for path in tx_worker_paths:
-            if os.path.exists(path):
+        # v0.5.99 (post-tag): delegate to the launcher's resolver
+        # (single source of truth). See the matching comment in
+        # /api/dpdk/status above for the srv06 bite that prompted
+        # the refactor.
+        try:
+            from utils.dpdk_tx_worker import _resolve_tx_worker_bin
+            _bin = _resolve_tx_worker_bin()
+            if _bin and os.path.exists(_bin):
                 tx_worker_binary = True
-                messages.append(f"tx_worker found: {path}")
-                break
+                messages.append(f"tx_worker found: {_bin}")
+        except Exception:
+            for path in (
+                "/usr/local/bin/tx_worker",
+                "/opt/netgen/resources/dpdk/tx_worker/build/tx_worker",
+                "/opt/OSTG/resources/dpdk/tx_worker/build/tx_worker",
+            ):
+                if os.path.exists(path):
+                    tx_worker_binary = True
+                    messages.append(f"tx_worker found: {path}")
+                    break
         if not tx_worker_binary:
-            messages.append("tx_worker binary not found")
+            messages.append("tx_worker binary not found (resolver path missing)")
         
         # Check hugepages
         try:
@@ -16916,16 +16942,33 @@ def api_admin_health():
     # server (e.g. start_traffic) actually invokes. Fall through
     # to the build dirs for early-install hosts where Step 6
     # hasn't yet copied the artifact out.
-    candidates = [
-        "/usr/local/bin/tx_worker",
-        "/opt/netgen/resources/dpdk/tx_worker/build/tx_worker",
-        "/opt/netgen-server/resources/dpdk/tx_worker/build/tx_worker",
-        "/opt/OSTG/resources/dpdk/tx_worker/build/tx_worker",
-    ]
-    for p in candidates:
-        if os.path.isfile(p) and os.access(p, os.X_OK):
-            out["tx_worker"] = {"present": True, "path": p}
-            break
+    # v0.5.99 (post-tag): delegate to the launcher's resolver so
+    # this admin probe reports the SAME presence that
+    # /api/traffic/start sees. Pre-refactor this endpoint had its
+    # own list of candidate paths, which is what made the srv06
+    # bite possible — the launcher's resolver missed
+    # /usr/local/bin/tx_worker while this list (and the verify
+    # endpoint, and /api/dpdk/status) had it. Operator saw
+    # "present:true" but every actual stream-start failed with
+    # "binary not found". Single source of truth closes the
+    # drift class entirely.
+    try:
+        from utils.dpdk_tx_worker import _resolve_tx_worker_bin
+        _bin = _resolve_tx_worker_bin()
+        if _bin and os.path.isfile(_bin) and os.access(_bin, os.X_OK):
+            out["tx_worker"] = {"present": True, "path": _bin}
+    except Exception:
+        # Defensive fallback — never let a resolver import error
+        # break the health endpoint.
+        for p in (
+            "/usr/local/bin/tx_worker",
+            "/opt/netgen/resources/dpdk/tx_worker/build/tx_worker",
+            "/opt/netgen-server/resources/dpdk/tx_worker/build/tx_worker",
+            "/opt/OSTG/resources/dpdk/tx_worker/build/tx_worker",
+        ):
+            if os.path.isfile(p) and os.access(p, os.X_OK):
+                out["tx_worker"] = {"present": True, "path": p}
+                break
 
     # Install state. v0.5.69 (audit H1): also report
     # rdma_install_running and upgrade_running. Pre-fix the
@@ -19393,7 +19436,45 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
         pill($('p-dpdk'), !!d.dpdk.installed,
           d.dpdk.version ? `Installed (v${d.dpdk.version})` : 'Installed',
           'Not installed');
+        // v0.5.99 (post-tag): show the resolved path next to the
+        // tx_worker pill — pre-fix the operator had no way to see
+        // WHERE the server thinks the binary is, vs WHERE it
+        // actually exists. On srv06 the two diverged and the
+        // bug took a full diagnosis cycle. Now: green pill +
+        // path on hover, OR red pill + "no resolved path" hint
+        // pointing at the install_dpdk.sh Step 6 docs.
         pill($('p-txworker'), d.tx_worker.present, 'Built', 'Not built');
+        const _txwPath = (d.tx_worker || {}).path;
+        const _txwRow = $('p-txworker') && $('p-txworker').parentElement;
+        if (_txwRow) {
+          let _pathHint = _txwRow.querySelector('.txw-path-hint');
+          if (!_pathHint) {
+            _pathHint = document.createElement('span');
+            _pathHint.className = 'meta txw-path-hint';
+            _pathHint.style.cssText = 'font-size: 11px; margin-left: 6px;';
+            $('p-txworker').after(_pathHint);
+          }
+          if (d.tx_worker.present && _txwPath) {
+            _pathHint.textContent = '· ' + _txwPath;
+            _pathHint.style.color = 'var(--muted)';
+            _pathHint.title = (
+              'Resolved by utils/dpdk_tx_worker.py:' +
+              '_resolve_tx_worker_bin() — this is the SAME path ' +
+              '/api/traffic/start will exec. If the stream-launch ' +
+              'log says "binary not found at <X>" where X ≠ this ' +
+              'path, the resolver and the launcher have drifted.'
+            );
+          } else if (!d.tx_worker.present) {
+            _pathHint.textContent = '· not on any resolver path';
+            _pathHint.style.color = 'var(--bad)';
+            _pathHint.title = (
+              'No tx_worker found at /usr/local/bin/, /opt/netgen/' +
+              '..., /opt/OSTG/..., or the wheel resource. ' +
+              'Run install_dpdk.sh Step 6, or set $TX_WORKER_BIN ' +
+              'to override.'
+            );
+          }
+        }
         $('p-hugepages').textContent = `${d.hugepages.total} / ${d.hugepages.free}`;
         // v0.5.64 (audit M13): tri-state. Pre-fix only red (total
         // == 0) vs default — when all pages are exhausted (free == 0
