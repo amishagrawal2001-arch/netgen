@@ -821,7 +821,20 @@ def _resolve_tx_worker_bin() -> str:
         LOG.debug("[dpdk] TX_WORKER_BIN=%s", p)
         return os.path.abspath(p)
 
-    # 2-3) install-dir binaries (rebuilt by install_dpdk.sh against current DPDK)
+    # 2) /usr/local/bin/tx_worker — operator-bite caught on srv06
+    # (Jun 11 2026): install_dpdk.sh Step 6 `make install` lands the
+    # rebuilt binary here, the v0.5.67 health probe checks here,
+    # AND it's the first thing on $PATH. But the launcher's search
+    # order skipped it, so /api/dpdk/status reported tx_worker_exists
+    # while the stream launch said "binary not found". Promoted to
+    # priority 2 so install_dpdk.sh's authoritative copy wins over
+    # the wheel-shipped stale-ABI fallback.
+    cand = "/usr/local/bin/tx_worker"
+    if os.path.exists(cand):
+        LOG.debug("[dpdk] using /usr/local/bin/tx_worker (install_dpdk.sh)")
+        return cand
+
+    # 3-4) install-dir binaries (rebuilt by install_dpdk.sh against current DPDK)
     for install_dir in ("/opt/netgen", "/opt/OSTG"):
         cand = os.path.join(install_dir, "resources", "dpdk", "tx_worker", "build", "tx_worker")
         if os.path.exists(cand):
