@@ -15192,6 +15192,17 @@ def _ethtool_full_dump(iface_name):
         "stats": ["-S"],
         "perm_addr": ["-P"],
     }
+    # v0.5.95 (audit H5): pre-fix mixed `(ethtool rc=2: …)` error
+    # markers into the same string slot as real stdout. The
+    # client couldn't tell "section unavailable" from "section
+    # legitimately empty". Now each section is structured:
+    #
+    #     {"stdout": "...", "error": null}     # ok
+    #     {"stdout": "",    "error": "ethtool returned rc=2: …"}
+    #
+    # The JS renderer can colour error rows differently and
+    # omit them from "this driver doesn't support feature X"
+    # noise.
     out = {}
     for label, extra in sections.items():
         try:
@@ -15200,18 +15211,21 @@ def _ethtool_full_dump(iface_name):
                 capture_output=True, text=True, timeout=3,
             )
             if _r.returncode == 0:
-                out[label] = _r.stdout
+                out[label] = {"stdout": _r.stdout, "error": None}
             else:
-                out[label] = (
-                    f"(ethtool returned rc={_r.returncode}: "
-                    f"{_r.stderr.strip()[:120]})"
-                )
+                out[label] = {
+                    "stdout": "",
+                    "error": (
+                        f"ethtool returned rc={_r.returncode}: "
+                        f"{_r.stderr.strip()[:200]}"
+                    ),
+                }
         except subprocess.TimeoutExpired:
-            out[label] = "(ethtool timed out)"
+            out[label] = {"stdout": "", "error": "ethtool timed out"}
         except FileNotFoundError:
-            out[label] = "(ethtool not installed)"
+            out[label] = {"stdout": "", "error": "ethtool not installed"}
         except Exception as _e:
-            out[label] = f"(error: {_e})"
+            out[label] = {"stdout": "", "error": f"{type(_e).__name__}: {_e}"}
     return out
 
 
@@ -20624,12 +20638,25 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
         perm_addr: 'Permanent address (ethtool -P)',
       };
       for (const k of ['link', 'drvinfo', 'features', 'coalesce', 'ring', 'stats', 'perm_addr']) {
-        if (!sections[k]) continue;
+        const _sec = sections[k];
+        if (!_sec) continue;
+        // v0.5.95 (audit H5): sections are now {stdout, error}.
+        // Backward-compat: if a server still returns a raw string,
+        // treat it as stdout.
+        const _stdout = (typeof _sec === 'string') ? _sec : (_sec.stdout || '');
+        const _error = (typeof _sec === 'string') ? null : (_sec.error || null);
+        if (!_stdout && !_error) continue;
         const isOpen = (k === 'link') ? ' open' : '';
-        html += `<details class="collapse"${isOpen} style="margin-top: 6px;">
-          <summary style="cursor: pointer; font-size: 12px; color: #334155; padding: 4px 0;">${_labels[k]}</summary>
-          <pre style="background: #fff; border: 1px solid #e2e8f0; border-radius: 4px; padding: 8px; font-size: 11px; max-height: 280px; overflow: auto; margin: 4px 0 0 0;">${escapeHtml(sections[k])}</pre>
-        </details>`;
+        if (_error) {
+          html += `<details class="collapse"${isOpen} style="margin-top: 6px;">
+            <summary style="cursor: pointer; font-size: 12px; color: var(--muted); padding: 4px 0;">${_labels[k]} <span style="color: var(--bad);">· ${escapeHtml(_error)}</span></summary>
+          </details>`;
+        } else {
+          html += `<details class="collapse"${isOpen} style="margin-top: 6px;">
+            <summary style="cursor: pointer; font-size: 12px; color: #334155; padding: 4px 0;">${_labels[k]}</summary>
+            <pre style="background: #fff; border: 1px solid #e2e8f0; border-radius: 4px; padding: 8px; font-size: 11px; max-height: 280px; overflow: auto; margin: 4px 0 0 0;">${escapeHtml(_stdout)}</pre>
+          </details>`;
+        }
       }
       td.innerHTML = html;
     }
@@ -20872,16 +20899,30 @@ def _iface_action_safety_check(iface, action):
                 f"session. {action} would disconnect the management "
                 f"plane. Use force=true to override."
             ), 409
+        # v0.5.95 (audit H4): pre-fix this was `except Exception:
+        # pass`. If the stream-tracker is broken (transient state
+        # corruption, unrelated import-time failure), the safety
+        # check silently reported "no active streams" and allowed
+        # a down on a NIC with running streams. Fail SAFE — refuse
+        # the action and tell the operator to use force=true.
         try:
-            for s in stream_tracker.get_stream_stats() or []:
-                if s.get("interface") == iface:
-                    return (
-                        f"{iface} has an active stream. {action} "
-                        f"would disrupt the test. Use force=true "
-                        f"to override."
-                    ), 409
-        except Exception:
-            pass
+            _streams = stream_tracker.get_stream_stats() or []
+        except Exception as _se:
+            logging.warning(
+                f"[IFACE-SAFETY] stream-tracker query failed: "
+                f"{_se}; refusing {action} without force"
+            )
+            return (
+                f"stream tracker unavailable, can't verify "
+                f"{iface} is idle. Use force=true to override."
+            ), 503
+        for s in _streams:
+            if s.get("interface") == iface:
+                return (
+                    f"{iface} has an active stream. {action} "
+                    f"would disrupt the test. Use force=true "
+                    f"to override."
+                ), 409
     except Exception as _e:
         # Safety check failure is itself non-fatal — log and
         # proceed (don't lock out a user because we couldn't
@@ -21068,12 +21109,20 @@ def api_admin_iface_reset(iface):
         _admin_audit("iface_reset", iface, force=force,
                      rc="fail_up_after_down",
                      err=_se_u.strip()[:120])
+        # v0.5.95 (audit H7): pre-fix message said `Manual: ip
+        # link set <n> up` — an SSH instruction. The operator
+        # has the ↑ button right there in the row. New message
+        # points at that. Also signals to the JS via the
+        # `recoverable_via` field so the toast can render an
+        # action link.
         return jsonify({
             "error": (
-                f"iface was brought down but `up` failed: "
-                f"{_se_u.strip()}. Manual: `ip link set "
-                f"{iface} up`."
+                f"{iface} is now down but `up` failed: "
+                f"{_se_u.strip()}. Click the ↑ button in the "
+                f"row to retry."
             ),
+            "code": "IFACE_RESET_HALF_DONE",
+            "recoverable_via": "iface_up",
             "interface": iface,
         }), 500
     _invalidate_iface_caches(iface)  # v0.5.93 (audit M3)

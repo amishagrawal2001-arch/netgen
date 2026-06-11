@@ -2,6 +2,79 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.95] - 2026-06-11
+
+**Admin console audit batch #4: recovery + integration tests.**
+
+### H4 — Safety check swallowed stream-tracker errors
+
+Pre-fix `_iface_action_safety_check` had `except Exception:
+pass` around `stream_tracker.get_stream_stats()`. If the
+tracker was broken, the safety check silently said "no active
+streams" — operator could down a NIC carrying live traffic
+with no warning.
+
+Fix: fail SAFE. On tracker error, log + return 503
+`"stream tracker unavailable, can't verify <iface> is idle.
+Use force=true to override."` — operator gets an explicit
+signal that the safety system didn't run.
+
+### H5 — `_ethtool_full_dump` mixed errors into stdout
+
+Pre-fix sections were strings like `"(ethtool returned rc=2:
+...)"`. Client couldn't distinguish "section unavailable"
+from "section legitimately empty".
+
+Fix: each section is now a structured dict
+`{"stdout": "...", "error": null}` (or
+`{"stdout": "", "error": "ethtool returned rc=2: ..."}`).
+JS renderer shows error sections with a muted summary line
+and no `<pre>` — failures stand out from data. Backward-
+compat preserved (raw string still rendered as stdout).
+
+### H7 — Reset's "down ok / up failed" pointed at SSH
+
+Pre-fix error: `"... Manual: ip link set <n> up."`. That's an
+SSH instruction. The operator has the ↑ button right there
+in the row.
+
+Fix: new error reads `"<iface> is now down but \`up\` failed:
+<stderr>. Click the ↑ button in the row to retry."` plus
+structured signals `code: "IFACE_RESET_HALF_DONE"` and
+`recoverable_via: "iface_up"` so the JS can offer an action
+chip later.
+
+### H8 — Integration tests via Flask test_client
+
+Pre-fix tests were 100% regex-presence — a typo in the JSON
+response shape, a regression on `_strict_true`, or a missing
+`force` field would all pass. Now exercise the real handlers
+with mocked subprocesses:
+
+- `test_iface_up_endpoint_routes` — 200 + correct payload
+- `test_iface_down_refuses_without_force_on_default_route` —
+  409 with `code: IFACE_DOWN_UNSAFE`, `can_force: true`
+- `test_iface_down_force_true_skips_safety_check` — proves
+  the safety helper is NOT called when `force=true`
+- `test_iface_reset_runs_down_then_up` — verifies the
+  sequence order
+- `test_iface_reset_down_ok_up_failed_returns_recovery_hint` —
+  verifies the new `IFACE_RESET_HALF_DONE` code +
+  `recoverable_via` field
+- `test_iface_invalid_name_rejected` — regex gate fires
+  before subprocess
+- `test_iface_flash_endpoint_clamps_seconds` — 999s → 60s
+
+Module-scoped client fixture sets `NETGEN_DB_PATH` to a
+tmpdir so module-load doesn't try to `mkdir /opt/netgen` on
+dev machines without root.
+
+### Tests
+
+12 new (5 source-level + 7 Flask test_client).
+
+Full suite: **2,253 passed, 1 skipped** (+12 new).
+
 ## [0.5.94] - 2026-06-11
 
 **Admin console audit batch #3: toast + drawer UX.**
