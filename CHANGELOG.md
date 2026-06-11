@@ -2,6 +2,88 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.92] - 2026-06-11
+
+**Admin console audit batch #1: auth fortification + audit trail.**
+
+From the 4-agent fan-out audit of the admin console. Addresses
+the highest-value HIGH/MEDIUM findings; sets up v0.5.93–v0.5.98
+for the remaining batches.
+
+### H1 — 4 admin endpoints had no `@require_role` decorator
+
+`/api/admin/health`, `/install_dpdk/log`, `/install_rdma/log`,
+`/upgrade_wheel/log` were all anonymously readable in any
+auth-enabled deployment because the bearer middleware only
+checks "is the token known"; per-endpoint role enforcement is
+layered on top via `@require_role`. Added `@require_role("viewer")`
+to all four — leaks hostname, kernel cmdline, mounts,
+hugepages, install build logs, wheel paths.
+
+### M1 — `bind_history` had stacked `@require_role` decorators
+
+v0.5.80 added `@require_role("viewer")` outside v0.5.68's
+`@require_role("admin")`. Python applies decorators bottom-up so
+only the innermost gate ever ran; the outer one was dead code.
+De-stacked to a single `@require_role("viewer")` and added an
+explicit `_role_for_request() == "admin"` branch inside the POST
+arm. GET viewable, POST admin — what v0.5.80 thought it was
+shipping.
+
+### H6 — Lifecycle/flash/details endpoints had no audit trail
+
+`grep '[ADMIN]'` in v0.5.91 returned **zero** hits across the
+whole codebase. v0.5.88-v0.5.91 lifecycle endpoints emitted
+nothing beyond the generic `[REQUEST]` per-request line —
+operators couldn't reconstruct who reset which iface from
+journalctl.
+
+New `_admin_audit(action, iface, **fields)` helper emits one
+INFO line per admin mutation:
+
+```
+[ADMIN] action=iface_down iface=ens6np0 remote=10.83.6.41
+        role=admin force=False rc=ok
+```
+
+Wired into all 5 v0.5.88-v0.5.91 endpoints
+(up/down/reset/flash/details), every exit branch. `force=`
+captured on down/reset so post-incident reconstruction can
+distinguish operator-intent from safety-override.
+
+### M11 — `/api/admin/journal` token redaction
+
+The endpoint returned `journalctl -u netgen-server` verbatim.
+Two existing `logging.debug(dict(request.headers))` sites in
+the ISIS code path would dump `Authorization: Bearer <token>`
+into the journal if `OSTG_LOG_LEVEL=DEBUG` is ever set. Added
+three scrubber regexes (`Bearer <tok>`, `Authorization:`,
+`NETGEN_AUTH_TOKEN[S]=<tok>`) and applied them before returning.
+Best-effort + idempotent.
+
+### M12 — GRUB backup `cp` calls had no timeout
+
+Three `subprocess.run(["cp", grub_file, backup_file], check=True)`
+calls in the IOMMU config path could hang the Flask worker
+forever on a stuck FS / NFS mount. Added `timeout=10` to all
+three (initial backup, success-path restore, exception-path
+restore).
+
+### SEC L1 — Flash error response leaked `str(e)`
+
+The v0.5.91 flash handler had `jsonify({"error": str(_e)})`
+catching the Popen exception. `PermissionError` would leak the
+resolved `ethtool` binary path. Changed to return generic
+`"failed to start ethtool"` and log full detail server-side.
+
+### Tests
+
+16 new regression tests + 1 updated (v0.5.68's destructive-
+route audit now recognizes bind_history's viewer-with-internal-
+admin-gate pattern).
+
+Full suite: **2,223 passed, 1 skipped** (+16 new).
+
 ## [0.5.91] - 2026-06-10
 
 **Iface table: Diagnostics + ID batch.**

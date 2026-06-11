@@ -50,9 +50,37 @@ _DESTRUCTIVE_ROUTES = [
 
 def test_destructive_endpoints_have_admin_decorator():
     """Every destructive endpoint must have @require_role("admin")
-    immediately after its @app.route line."""
+    immediately after its @app.route line.
+
+    Exception: /api/admin/bind_history serves GET to viewers and
+    POST to admins (v0.5.92 audit M1 — was stacked-decorator dead
+    code before). For that route we verify the viewer decorator
+    + an internal _role_for_request() admin gate on POST.
+    """
     src = _src()
     for route in _DESTRUCTIVE_ROUTES:
+        if route == "/api/admin/bind_history":
+            # v0.5.92 (audit M1): GET=viewer, POST=admin via
+            # internal branch.
+            m = re.search(
+                r'@app\.route\("' + re.escape(route)
+                + r'"[\s\S]{0,500}?@require_role\([\s"\']*viewer',
+                src,
+            )
+            assert m, (
+                f"Route {route} lost its viewer decorator."
+            )
+            # Internal admin gate on POST.
+            handler = re.search(
+                r"def api_admin_bind_history\(\)[\s\S]+?"
+                r"(?=\ndef [a-z_]|\n@app\.route)",
+                src,
+            )
+            assert handler
+            body = handler.group(0)
+            assert "_role_for_request" in body
+            assert "admin" in body
+            continue
         # Pattern: @app.route("ROUTE"... followed by @require_role("admin")
         # within the next ~150 chars.
         m = re.search(

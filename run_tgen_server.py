@@ -15300,6 +15300,41 @@ def admin_lldp_raw():
         return jsonify({"error": str(_e)}), 500
 
 
+# v0.5.92 (audit M11): redact bearer tokens before returning
+# journal text. If OSTG_LOG_LEVEL=DEBUG ever gets set, two
+# `logging.debug(dict(request.headers))` sites would dump live
+# `Authorization: Bearer <token>` lines into the journal. The
+# /api/admin/journal endpoint reads journal verbatim, so a
+# viewer with admin-token-after-rotation could exfil the
+# old-but-still-valid token.
+_RE_BEARER_TOKEN = re.compile(
+    r"(Bearer\s+)[A-Za-z0-9._\-+/=]+", re.IGNORECASE,
+)
+_RE_AUTH_HEADER = re.compile(
+    r"(Authorization['\":\s]+)['\"]?Bearer\s+[^'\",\s]+",
+    re.IGNORECASE,
+)
+_RE_AUTH_TOKEN_ENV = re.compile(
+    r"(NETGEN_AUTH_TOKEN[S]?(?:_JSON)?\s*=\s*)['\"]?[^'\"\s]+",
+    re.IGNORECASE,
+)
+
+
+def _redact_journal_secrets(text):
+    """Strip auth tokens out of journal text. Best-effort; the
+    first time an unknown shape leaks we add another regex.
+    Idempotent — safe to apply twice."""
+    if not text:
+        return text
+    try:
+        text = _RE_BEARER_TOKEN.sub(r"\1[REDACTED]", text)
+        text = _RE_AUTH_HEADER.sub(r"\1Bearer [REDACTED]", text)
+        text = _RE_AUTH_TOKEN_ENV.sub(r"\1[REDACTED]", text)
+        return text
+    except Exception:
+        return text
+
+
 @app.route("/api/admin/journal", methods=["GET"])
 @require_role("viewer")  # v0.5.80 (audit MEDIUM #11): journal can leak PCI topology
 def admin_journal():
@@ -15329,9 +15364,13 @@ def admin_journal():
                 "error": (_r.stderr or "journalctl failed").strip(),
                 "lines": [],
             }), 500
+        # v0.5.92 (audit M11): pass through token-redaction
+        # before returning.
+        _scrubbed = _redact_journal_secrets(_r.stdout)
+        _split = _scrubbed.splitlines()
         return jsonify({
-            "lines": _r.stdout.splitlines(),
-            "count": len(_r.stdout.splitlines()),
+            "lines": _split,
+            "count": len(_split),
         })
     except subprocess.TimeoutExpired:
         return jsonify({"error": "journalctl timed out (5s)", "lines": []}), 504
@@ -16044,8 +16083,12 @@ def dpdk_configure_iommu():
         # Write back to file
         try:
             # Create backup
+            # v0.5.92 (audit M12): explicit 10s timeout — `cp`
+            # against a stuck FS / NFS mount would otherwise
+            # hang the worker forever.
             backup_file = f"{grub_file}.backup.{int(time.time())}"
-            subprocess.run(["cp", grub_file, backup_file], check=True)
+            subprocess.run(["cp", grub_file, backup_file],
+                           check=True, timeout=10)
             
             # Write new content
             with open(grub_file, "w") as f:
@@ -16061,7 +16104,9 @@ def dpdk_configure_iommu():
             
             if result.returncode != 0:
                 # Restore backup on failure
-                subprocess.run(["cp", backup_file, grub_file], check=True)
+                # v0.5.92 (audit M12): timeout on restore too.
+                subprocess.run(["cp", backup_file, grub_file],
+                               check=True, timeout=10)
                 return jsonify({
                     "success": False,
                     "message": f"Failed to update GRUB: {result.stderr}"
@@ -16089,7 +16134,11 @@ def dpdk_configure_iommu():
             # Try to restore backup
             try:
                 if 'backup_file' in locals():
-                    subprocess.run(["cp", backup_file, grub_file], check=True)
+                    # v0.5.92 (audit M12): timeout here too.
+                    subprocess.run(
+                        ["cp", backup_file, grub_file],
+                        check=True, timeout=10,
+                    )
             except Exception:
                 pass
             
@@ -16586,6 +16635,9 @@ def _save_bind_history(history):
 
 
 @app.route("/api/admin/health", methods=["GET"])
+@require_role("viewer")  # v0.5.92 (audit H1): leaks hostname / kernel
+# cmdline / mounts / hugepage state. Anonymous reads gave passive
+# topology mapping to any process that could reach the port.
 def api_admin_health():
     """Consolidated server health for the admin portal."""
     import socket
@@ -17877,6 +17929,10 @@ def _parse_install_phase(log_text: str):
 
 
 @app.route("/api/admin/install_dpdk/log", methods=["GET"])
+@require_role("viewer")  # v0.5.92 (audit H1): build log can leak NIC
+# topology, kernel paths, OS minor versions. POST endpoint that
+# starts the install already requires admin; gating reads at
+# viewer keeps the wizard UI usable.
 def api_admin_install_dpdk_log():
     """Return install state + log tail. Supports incremental fetch.
 
@@ -18360,6 +18416,8 @@ def api_admin_install_rdma():
 
 
 @app.route("/api/admin/install_rdma/log", methods=["GET"])
+@require_role("viewer")  # v0.5.92 (audit H1): same rationale as
+# install_dpdk/log — build output leaks NIC + kernel info.
 def api_admin_install_rdma_log():
     """Tail the RDMA install log + report status.
 
@@ -18637,6 +18695,9 @@ def api_admin_upgrade_wheel():
 
 
 @app.route("/api/admin/upgrade_wheel/log", methods=["GET"])
+@require_role("viewer")  # v0.5.92 (audit H1): leaks wheel paths +
+# pip output. Restart-trigger logic stays admin-only via internal
+# guards.
 def api_admin_upgrade_wheel_log():
     """Tail the upgrade log + report status. Triggers restart when pip done."""
     log_path = _ADMIN_UPGRADE_STATE.get("log_path")
@@ -20698,6 +20759,44 @@ def _run_ip_link(iface, action):
         return False, "", str(_e)
 
 
+# v0.5.92 (audit H6): structured [ADMIN] audit log. Pre-fix
+# v0.5.88-v0.5.91 lifecycle endpoints produced zero log lines
+# of their own — operators couldn't reconstruct who issued
+# what action from journalctl. This helper standardises the
+# format so all admin mutations grep cleanly.
+def _admin_audit(action, iface=None, **fields):
+    """Emit one INFO line per admin mutation. Format:
+
+        [ADMIN] action=<verb> iface=<n> remote=<ip> role=<r>
+                force=<bool> rc=<status> ... <extra k=v pairs>
+
+    Used by iface lifecycle / flash / details / bind / unbind /
+    bind_history / hugepages / load_modules / install_dpdk /
+    install_rdma / upgrade_wheel."""
+    try:
+        parts = [f"action={action}"]
+        if iface:
+            parts.append(f"iface={iface}")
+        try:
+            parts.append(f"remote={request.remote_addr or '-'}")
+        except Exception:
+            parts.append("remote=-")
+        try:
+            parts.append(f"role={_role_for_request() or '-'}")
+        except Exception:
+            parts.append("role=-")
+        for k, v in fields.items():
+            parts.append(f"{k}={v}")
+        logging.info("[ADMIN] " + " ".join(parts))
+    except Exception as _e:
+        # Audit logging is best-effort — must NEVER crash the
+        # handler. Print to stderr if logging is broken.
+        try:
+            print(f"[ADMIN AUDIT FAILED] {_e}", flush=True)
+        except Exception:
+            pass
+
+
 @app.route("/api/admin/iface/<iface>/up", methods=["POST"])
 @require_role("admin")
 def api_admin_iface_up(iface):
@@ -20705,13 +20804,16 @@ def api_admin_iface_up(iface):
     safe (worst case: a port comes up unexpectedly); no safety
     guard needed."""
     if not _RE_IFACE_NAME.match(iface or ""):
+        _admin_audit("iface_up", iface, rc="invalid_name")
         return jsonify({"error": "invalid iface name"}), 400
     ok, _so, _se = _run_ip_link(iface, "up")
     if not ok:
+        _admin_audit("iface_up", iface, rc="fail", err=_se.strip()[:120])
         return jsonify({
             "error": _se.strip() or "failed",
             "interface": iface,
         }), 500
+    _admin_audit("iface_up", iface, rc="ok")
     return jsonify({"success": True, "interface": iface, "action": "up"})
 
 
@@ -20725,12 +20827,15 @@ def api_admin_iface_down(iface):
     Body `{"force": true}` overrides.
     """
     if not _RE_IFACE_NAME.match(iface or ""):
+        _admin_audit("iface_down", iface, rc="invalid_name")
         return jsonify({"error": "invalid iface name"}), 400
     body = request.get_json(silent=True) or {}
     force = _strict_true(body.get("force", False))
     if not force:
         refusal, code = _iface_action_safety_check(iface, "down")
         if refusal:
+            _admin_audit("iface_down", iface, force=False,
+                         rc="refused_unsafe")
             return jsonify({
                 "error": refusal,
                 "code": "IFACE_DOWN_UNSAFE",
@@ -20739,10 +20844,13 @@ def api_admin_iface_down(iface):
             }), code
     ok, _so, _se = _run_ip_link(iface, "down")
     if not ok:
+        _admin_audit("iface_down", iface, force=force, rc="fail",
+                     err=_se.strip()[:120])
         return jsonify({
             "error": _se.strip() or "failed",
             "interface": iface,
         }), 500
+    _admin_audit("iface_down", iface, force=force, rc="ok")
     return jsonify({"success": True, "interface": iface, "action": "down"})
 
 
@@ -20757,12 +20865,15 @@ def api_admin_iface_reset(iface):
     link states, re-negotiating speed, etc.
     """
     if not _RE_IFACE_NAME.match(iface or ""):
+        _admin_audit("iface_reset", iface, rc="invalid_name")
         return jsonify({"error": "invalid iface name"}), 400
     body = request.get_json(silent=True) or {}
     force = _strict_true(body.get("force", False))
     if not force:
         refusal, code = _iface_action_safety_check(iface, "reset")
         if refusal:
+            _admin_audit("iface_reset", iface, force=False,
+                         rc="refused_unsafe")
             return jsonify({
                 "error": refusal,
                 "code": "IFACE_RESET_UNSAFE",
@@ -20771,6 +20882,8 @@ def api_admin_iface_reset(iface):
             }), code
     ok_d, _so_d, _se_d = _run_ip_link(iface, "down")
     if not ok_d:
+        _admin_audit("iface_reset", iface, force=force, rc="fail_down",
+                     err=_se_d.strip()[:120])
         return jsonify({
             "error": f"down failed: {_se_d.strip()}",
             "interface": iface,
@@ -20779,6 +20892,9 @@ def api_admin_iface_reset(iface):
     _time.sleep(1.0)
     ok_u, _so_u, _se_u = _run_ip_link(iface, "up")
     if not ok_u:
+        _admin_audit("iface_reset", iface, force=force,
+                     rc="fail_up_after_down",
+                     err=_se_u.strip()[:120])
         return jsonify({
             "error": (
                 f"iface was brought down but `up` failed: "
@@ -20787,6 +20903,7 @@ def api_admin_iface_reset(iface):
             ),
             "interface": iface,
         }), 500
+    _admin_audit("iface_reset", iface, force=force, rc="ok")
     return jsonify({"success": True, "interface": iface, "action": "reset"})
 
 
@@ -20800,6 +20917,7 @@ def api_admin_iface_flash(iface):
     `{"seconds": int}` overrides (1-60 range).
     """
     if not _RE_IFACE_NAME.match(iface or ""):
+        _admin_audit("iface_flash", iface, rc="invalid_name")
         return jsonify({"error": "invalid iface name"}), 400
     body = request.get_json(silent=True) or {}
     secs = body.get("seconds", 5)
@@ -20822,9 +20940,20 @@ def api_admin_iface_flash(iface):
             close_fds=True,
         )
     except FileNotFoundError:
+        _admin_audit("iface_flash", iface, rc="fail",
+                     err="ethtool_missing")
         return jsonify({"error": "ethtool not installed"}), 500
     except Exception as _e:
-        return jsonify({"error": str(_e)}), 500
+        # v0.5.92 (audit SEC L1): don't leak the resolved binary
+        # path or other Popen internals. Log full detail; return
+        # generic.
+        logging.warning(
+            f"[ADMIN] iface_flash {iface} spawn failed: {_e}"
+        )
+        _admin_audit("iface_flash", iface, rc="fail",
+                     err=type(_e).__name__)
+        return jsonify({"error": "failed to start ethtool"}), 500
+    _admin_audit("iface_flash", iface, seconds=secs, rc="ok")
     return jsonify({
         "success": True, "interface": iface, "seconds": secs,
     })
@@ -20838,7 +20967,9 @@ def api_admin_iface_details(iface):
     info so the client can render each section as a collapsible
     block."""
     if not _RE_IFACE_NAME.match(iface or ""):
+        _admin_audit("iface_details", iface, rc="invalid_name")
         return jsonify({"error": "invalid iface name"}), 400
+    _admin_audit("iface_details", iface, rc="ok")
     return jsonify({
         "interface": iface,
         "drvinfo": _ethtool_drvinfo(iface),
@@ -20911,8 +21042,11 @@ def api_admin_interface_ip():
 
 
 @app.route("/api/admin/bind_history", methods=["GET", "POST"])
-@require_role("viewer")  # v0.5.80 (audit MEDIUM endpoint #5): leaks PCI topology + driver names
-@require_role("admin")  # v0.5.68 (C1): POST mutates the persistent registry
+# v0.5.92 (audit M1): the v0.5.80 + v0.5.68 fixes both registered
+# @require_role decorators but Python applies them bottom-up so
+# only the innermost (admin) ever fired — the viewer gating was
+# dead code. Collapse to a single decorator and branch inside.
+@require_role("viewer")
 def api_admin_bind_history():
     """Track / fetch original kernel names of vfio-pci bound NICs.
 
@@ -20920,6 +21054,18 @@ def api_admin_bind_history():
     GET                              — return the full history dict.
     """
     if request.method == "POST":
+        # v0.5.92 (audit M1): POST mutates the persistent bind
+        # registry — must be admin. Pre-fix the stacked
+        # @require_role decorator chain made the viewer outer
+        # one dead code; after de-stacking we need an explicit
+        # admin check on POST. _role_for_request() is the same
+        # helper @require_role uses, so the semantics match.
+        _r = _role_for_request()
+        if _r != "admin":
+            return jsonify({
+                "ok": False,
+                "error": "insufficient role: POST requires 'admin'",
+            }), 403
         data = request.get_json(silent=True) or {}
         pci = data.get("pci")
         if not pci:
