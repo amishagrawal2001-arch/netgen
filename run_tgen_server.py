@@ -19757,9 +19757,12 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
           // Reset). Operator-requested. Only shown for rows that
           // have a kernel netdev name (vfio-bound rows can't be
           // controlled via `ip link set`). Compact button group.
+          // v0.5.89 hot-fix: do NOT reference the `link` const
+          // declared further down — TDZ ReferenceError. Read
+          // i.link directly here.
           let lifecycleBtn = '';
           if (i.name && i.name !== 'N/A' && !/\(no interface\)/.test(i.name)) {
-            const up = link.carrier === true;
+            const up = (i.link || {}).carrier === true;
             const _name = escapeHtml(i.name);
             lifecycleBtn = `<span class="iface-ctl" style="display: inline-flex; gap: 3px; margin-left: 4px;">
               <button data-idx="${idx}" data-iface-action="up"    title="Bring ${_name} up"    style="padding: 2px 6px; font-size: 11px;"${up ? ' disabled style="padding: 2px 6px; font-size: 11px; opacity: 0.4;"' : ''}>↑</button>

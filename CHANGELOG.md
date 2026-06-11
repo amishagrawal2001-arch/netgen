@@ -2,6 +2,38 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.89] - 2026-06-10
+
+**Hot-fix: TDZ ReferenceError on `link` after v0.5.88 upgrade.**
+
+Operator on srv06:
+
+> post upgrade Error: ReferenceError: Cannot access 'link'
+> before initialization
+
+v0.5.88 added a `lifecycleBtn` block for the new Up/Down/Reset
+buttons. That block read `link.carrier === true` — but `const
+link = i.link || {}` is declared further down in the same row-
+render function. JavaScript `const`/`let` has a temporal-dead-
+zone: referencing the binding before its declaration line
+throws ReferenceError at *runtime*. `node --check` (syntactic)
+does NOT catch this — the browser was the first thing to
+exercise it.
+
+Fix: read `(i.link || {}).carrier === true` directly inside
+the lifecycleBtn block. No dependency on declaration order.
+The whole iface table render comes back instantly after
+restart.
+
+3 new regression tests guarding the specific pattern.
+
+Full suite: **2,184 passed, 1 skipped** (+3 new).
+
+### Operator action
+
+`sudo netgen-upgrade && sudo systemctl restart netgen-server`,
+then reload the admin page.
+
 ## [0.5.88] - 2026-06-10
 
 **Interface control: on / off / reset from admin console.**
