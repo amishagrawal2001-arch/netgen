@@ -2,6 +2,105 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.100] - 2026-06-11
+
+**tx_worker presence: single source of truth + DPDK Runtime
+tile shows resolved path.**
+
+### Operator-reported symptom
+
+UDP DPDK stream on srv06 (Mellanox ConnectX-6 bifurcated)
+started and died in under 1 second with `tx_count=0`. Journal:
+
+```
+ERROR:dpdk_tx_worker:[dpdk] tx_worker binary not found at
+  /opt/netgen-server/resources/dpdk/tx_worker/build/tx_worker
+```
+
+But `/api/admin/health` reported `tx_worker.present=true` with
+`path=/usr/local/bin/tx_worker`, and `/api/dpdk/status` also
+reported `tx_worker_exists=true`. Two presence-checks said yes,
+the launcher said no.
+
+### Root cause
+
+Four independent tx_worker candidate lists across the codebase:
+
+| Site | Pre-fix list |
+|---|---|
+| `/api/dpdk/status` | `/opt/OSTG/`, `/usr/local/bin/`, `./resources/` |
+| DPDK verify endpoint | `/opt/OSTG/`, `/usr/local/bin/`, `./resources/` |
+| `/api/admin/health` (v0.5.67) | `/usr/local/bin/`, `/opt/netgen/`, `/opt/netgen-server/`, `/opt/OSTG/` |
+| `_resolve_tx_worker_bin()` (the launcher) | env, `/opt/netgen/`, `/opt/OSTG/`, wheel, relative, cwd, legacy — **NO `/usr/local/bin/`** |
+
+The launcher was the odd one out. On srv06, `install_dpdk.sh`
+Step 6 successfully installed to `/usr/local/bin/tx_worker` and
+the three presence-checks confirmed it, but the launcher walked
+right past that path and reported "not found".
+
+### Fixes
+
+#### Resolver gains `/usr/local/bin/` at priority 2
+
+`_resolve_tx_worker_bin()` in `utils/dpdk_tx_worker.py` now
+checks `/usr/local/bin/tx_worker` immediately after the
+`$TX_WORKER_BIN` env override and before the install-dir
+candidates. The wheel-shipped fallback (with stale DPDK ABI)
+stays last.
+
+`dpdk_tx_worker_multi.py` imports the same resolver, so the
+fix covers both single + multi-instance launch paths.
+
+#### Single source of truth — three sites delegate to the resolver
+
+`/api/dpdk/status`, the DPDK verify endpoint, and
+`/api/admin/health` now all call `_resolve_tx_worker_bin()`
+instead of maintaining their own lists. They retain a small
+defensive in-line fallback (that ALSO includes `/usr/local/bin/`
+first) for the rare case where the resolver import errors.
+
+Drift class closed: future tx_worker presence reports across
+the admin console always match what the launcher will exec.
+
+#### DPDK Runtime tile shows the resolved path
+
+The "tx_worker binary" pill now carries a muted inline path
+(` · /usr/local/bin/tx_worker`) on success, OR a red
+` · not on any resolver path` hint with a tooltip pointing
+at `install_dpdk.sh` Step 6 and the `$TX_WORKER_BIN` env
+override on failure.
+
+Operator can now see WHERE the server thinks the binary is
+without crawling APIs or the journal.
+
+### Fresh install impact
+
+`install_dpdk.sh` Step 6.2 was always the most reliable step
+(`install -m755 /usr/local/bin/tx_worker`). Pre-fix, this
+binary was effectively orphaned — the launcher couldn't see
+it. Now it's the canonical first-choice install-dir target.
+Fresh installs become robust regardless of whether the
+`/opt/netgen/...` symlinks succeed.
+
+### Tests
+
+- 4 v0.5.99 follow-up tests for `_resolve_tx_worker_bin()`
+  (path present, env override still wins, ordered before
+  wheel fallback, docstring).
+- 5 new SSOT tests verifying every site delegates to the
+  resolver AND defensive fallbacks include `/usr/local/bin/`
+  AND the DPDK Runtime tile renders the path hint.
+- v0.5.67 admin-health tests updated to verify the new
+  delegation pattern.
+
+Full suite: **2,306 passed, 1 skipped** (+9 new this release).
+
+### Operator action
+
+`sudo netgen-upgrade && sudo systemctl restart netgen-server`
+on srv06 — the env-var workaround drop-in is no longer
+needed (the resolver now finds the binary directly).
+
 ## [0.5.99] - 2026-06-11
 
 **Fix: `start_stream` cross-contaminated stream_id across
