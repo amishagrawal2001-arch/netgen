@@ -2,6 +2,39 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.90] - 2026-06-10
+
+**Hot-fix: full page reload on Up/Down/Reset click.**
+
+Operator on srv06:
+
+> seems entire page is getting refreshed, when trying interface
+> related activity up/down/reset... etc.
+
+Root cause: a `<button>` with no explicit `type` defaults to
+`type="submit"`. The admin page itself isn't currently wrapped
+in a `<form>`, but the default-submit + browser-implementation
+quirks can still trigger a full reload depending on what
+ancestor handlers exist. Bind/Unbind happens to avoid it; the
+new lifecycle buttons hit it.
+
+### Fixes (defense-in-depth)
+
+1. **`type="button"`** added to every Up / Down / Reset
+   button in the lifecycle template.
+2. **`ev.preventDefault()` + `ev.stopPropagation()`** added to
+   the click handler.
+3. **Duplicate `style=""` attribute fix.** v0.5.88's disabled
+   state emitted `style="..." disabled style="..."` — HTML5
+   parser drops the second one silently, so dimmed buttons
+   weren't actually dimmed. Collapsed into a single style
+   attr that switches base/dim based on carrier state.
+4. **`cursor: not-allowed`** on disabled buttons.
+
+5 new regression tests guarding all four.
+
+Full suite: **2,189 passed, 1 skipped** (+5 new).
+
 ## [0.5.89] - 2026-06-10
 
 **Hot-fix: TDZ ReferenceError on `link` after v0.5.88 upgrade.**
