@@ -14925,14 +14925,23 @@ def _refresh_lldp_cache():
     with _LLDP_CACHE_LOCK:
         if now - _LLDP_CACHE["ts"] < _LLDP_CACHE_TTL:
             return _LLDP_CACHE["by_iface"]
-        _LLDP_CACHE["ts"] = now
-        _LLDP_CACHE["by_iface"] = {}
+        # v0.5.93 (audit H2): build into a LOCAL dict and only
+        # commit on success. Pre-fix we set ts=now + by_iface={}
+        # before the subprocess, so a `TimeoutExpired` /
+        # non-zero rc blanked the cache for 30s — operator saw
+        # "(no LLDP)" for every row after one transient blip.
+        # That's the exact v0.5.87-style failure mode.
+        new_by_iface = {}
         try:
             _r = subprocess.run(
                 ["lldpcli", "-f", "json", "show", "neighbors"],
                 capture_output=True, text=True, timeout=4,
             )
             if _r.returncode != 0:
+                # Leave the prior cache intact. Bump ts so we
+                # don't hammer lldpcli on every refresh, but
+                # don't blank good neighbor data.
+                _LLDP_CACHE["ts"] = now
                 return _LLDP_CACHE["by_iface"]
             import json as _json
             data = _json.loads(_r.stdout) if _r.stdout.strip() else {}
@@ -14987,7 +14996,7 @@ def _refresh_lldp_cache():
                     continue
                 chassis = _lldp_normalise_chassis(entry.get("chassis"))
                 port = _lldp_normalise_port(entry.get("port"))
-                _LLDP_CACHE["by_iface"][name] = {
+                new_by_iface[name] = {
                     "sys_name": chassis.get("sys_name") or "",
                     "sys_descr": (chassis.get("descr") or "")[:200],
                     "chassis_id": (chassis.get("id") or "")[:80],
@@ -14995,10 +15004,19 @@ def _refresh_lldp_cache():
                     "port_descr": (port.get("descr") or "")[:120],
                     "mgmt_ips": chassis.get("mgmt_ips", [])[:4],
                 }
+            # v0.5.93 (audit H2): success — commit the fresh
+            # dict + ts atomically. Until this line the prior
+            # good cache is untouched.
+            _LLDP_CACHE["by_iface"] = new_by_iface
+            _LLDP_CACHE["ts"] = now
         except (subprocess.TimeoutExpired, FileNotFoundError):
-            pass
+            # v0.5.93 (audit H2): bump ts so we don't retry on
+            # every refresh, but leave by_iface as-is. Operator
+            # sees stale-but-correct LLDP instead of "(no LLDP)".
+            _LLDP_CACHE["ts"] = now
         except Exception as _e:
             logging.warning(f"[LLDP] cache refresh failed: {_e}")
+            _LLDP_CACHE["ts"] = now
         return _LLDP_CACHE["by_iface"]
 
 
@@ -18149,6 +18167,14 @@ _ADMIN_UPGRADE_STATE = {
     "systemd_unit": None,
 }
 
+# v0.5.93 (audit M5): pre-fix _ADMIN_UPGRADE_STATE was mutated
+# from multiple sites without a lock. v0.5.71's install_dpdk
+# fix paired _ADMIN_INSTALL_LOCK with _ADMIN_INSTALL_STATE; the
+# same shape was missed for the upgrade path. Two concurrent
+# /api/admin/upgrade_wheel POSTs (or POST racing with a state-
+# write thread) could double-Popen pip.
+_ADMIN_UPGRADE_LOCK = threading.Lock()
+
 # v0.5.23: state file the server reloads on startup. We need this
 # because the upgrade now intentionally restarts the server (via
 # netgen-upgrade's own systemctl call) — the post-restart server's
@@ -18300,42 +18326,48 @@ def api_admin_install_rdma():
     # v0.5.71 (audit M3 + M4): mirror install_dpdk's mutex +
     # force flag. RDMA install also runs `apt-get install`, so
     # parallel runs with install_dpdk wedge on dpkg-lock.
-    proc = _ADMIN_INSTALL_RDMA_STATE.get("process")
+    # v0.5.93 (audit H3): pre-fix the check-then-spawn was
+    # OUTSIDE `_ADMIN_INSTALL_LOCK`. Two concurrent POSTs both
+    # saw `proc is None` and both Popen'd, orphaning the first.
+    # install_dpdk got this lock in v0.5.71; install_rdma was
+    # missed.
     force = (
         request.args.get("force") == "1"
         or (request.get_json(silent=True) or {}).get("force") is True
     )
-    if proc and proc.poll() is None:
-        if force:
-            try:
-                proc.terminate()
-                proc.wait(timeout=5)
-            except Exception:
+    with _ADMIN_INSTALL_LOCK:
+        proc = _ADMIN_INSTALL_RDMA_STATE.get("process")
+        if proc and proc.poll() is None:
+            if force:
                 try:
-                    proc.kill()
+                    proc.terminate()
+                    proc.wait(timeout=5)
                 except Exception:
-                    pass
-            logging.warning(
-                "[ADMIN INSTALL RDMA] force-killed previous install"
-            )
-        else:
-            return jsonify({
-                "error": "RDMA install is already running",
-                "log_path": _ADMIN_INSTALL_RDMA_STATE.get("log_path"),
-                "hint": "pass ?force=1 to terminate the wedged install",
-            }), 409
+                    try:
+                        proc.kill()
+                    except Exception:
+                        pass
+                logging.warning(
+                    "[ADMIN INSTALL RDMA] force-killed previous install"
+                )
+            else:
+                return jsonify({
+                    "error": "RDMA install is already running",
+                    "log_path": _ADMIN_INSTALL_RDMA_STATE.get("log_path"),
+                    "hint": "pass ?force=1 to terminate the wedged install",
+                }), 409
 
-    # Mutual exclusion with install_dpdk (dpkg-lock contention).
-    dpdk_proc = _ADMIN_INSTALL_STATE.get("process")
-    if dpdk_proc and dpdk_proc.poll() is None:
-        return jsonify({
-            "error": (
-                "DPDK install is in progress; both install paths "
-                "contend on the dpkg lock. Wait for DPDK to "
-                "finish, then retry."
-            ),
-            "dpdk_log_path": _ADMIN_INSTALL_STATE.get("log_path"),
-        }), 409
+        # Mutual exclusion with install_dpdk (dpkg-lock contention).
+        dpdk_proc = _ADMIN_INSTALL_STATE.get("process")
+        if dpdk_proc and dpdk_proc.poll() is None:
+            return jsonify({
+                "error": (
+                    "DPDK install is in progress; both install paths "
+                    "contend on the dpkg lock. Wait for DPDK to "
+                    "finish, then retry."
+                ),
+                "dpdk_log_path": _ADMIN_INSTALL_STATE.get("log_path"),
+            }), 409
 
     # Same self-heal pattern as install_dpdk — wheel is the canonical
     # source for resources/dpdk/install_rdma.sh.
@@ -18393,19 +18425,39 @@ def api_admin_install_rdma():
                 "--setenv=DEBIAN_PRIORITY=critical",
                 "--",
             ] + cmd
-        new_proc = subprocess.Popen(
-            cmd,
-            stdout=log_fh, stderr=subprocess.STDOUT,
-            env=env, start_new_session=True,
-        )
+        # v0.5.93 (audit H3): re-acquire the lock for the
+        # Popen + state mutation so two concurrent POSTs can't
+        # both commit `_ADMIN_INSTALL_RDMA_STATE["process"]`.
+        # Cheap to acquire twice (we released it briefly to
+        # build cmd) — the dpkg-lock contention check already
+        # caught most of the race.
+        with _ADMIN_INSTALL_LOCK:
+            # Defense in depth: a thread that won the first
+            # lock-protected check then blocked on log_fh.open
+            # could be racing another POST through. Re-verify
+            # that no install is now running before spawning.
+            _existing = _ADMIN_INSTALL_RDMA_STATE.get("process")
+            if _existing and _existing.poll() is None and not force:
+                try:
+                    log_fh.close()
+                except Exception:
+                    pass
+                return jsonify({
+                    "error": "RDMA install is already running",
+                    "log_path": _ADMIN_INSTALL_RDMA_STATE.get("log_path"),
+                }), 409
+            new_proc = subprocess.Popen(
+                cmd,
+                stdout=log_fh, stderr=subprocess.STDOUT,
+                env=env, start_new_session=True,
+            )
+            _ADMIN_INSTALL_RDMA_STATE["process"] = new_proc
+            _ADMIN_INSTALL_RDMA_STATE["log_path"] = log_path
+            _ADMIN_INSTALL_RDMA_STATE["started_at"] = _dt.datetime.now().isoformat()
+            _ADMIN_INSTALL_RDMA_STATE["finished_at"] = None
+            _ADMIN_INSTALL_RDMA_STATE["return_code"] = None
     except Exception as e:
         return jsonify({"error": f"Failed to launch RDMA install: {e}"}), 500
-
-    _ADMIN_INSTALL_RDMA_STATE["process"] = new_proc
-    _ADMIN_INSTALL_RDMA_STATE["log_path"] = log_path
-    _ADMIN_INSTALL_RDMA_STATE["started_at"] = _dt.datetime.now().isoformat()
-    _ADMIN_INSTALL_RDMA_STATE["finished_at"] = None
-    _ADMIN_INSTALL_RDMA_STATE["return_code"] = None
 
     return jsonify({
         "started": True,
@@ -18474,13 +18526,17 @@ def api_admin_upgrade_wheel():
     background; clients poll /api/admin/upgrade_wheel/log for progress.
     """
     import datetime as _dt
-    proc = _ADMIN_UPGRADE_STATE.get("process")
-    if proc is not None and proc.poll() is None:
-        return jsonify({
-            "ok": False,
-            "error": "Upgrade already in progress",
-            "started_at": _ADMIN_UPGRADE_STATE.get("started_at"),
-        }), 409
+    # v0.5.93 (audit M5): take the lock for the check-then-spawn
+    # window. The Popen and state mutation further down also
+    # re-acquire it. Same pattern as install_dpdk's mutex.
+    with _ADMIN_UPGRADE_LOCK:
+        proc = _ADMIN_UPGRADE_STATE.get("process")
+        if proc is not None and proc.poll() is None:
+            return jsonify({
+                "ok": False,
+                "error": "Upgrade already in progress",
+                "started_at": _ADMIN_UPGRADE_STATE.get("started_at"),
+            }), 409
 
     if "wheel" not in request.files:
         return jsonify({"ok": False, "error": "Missing 'wheel' file field"}), 400
@@ -18660,29 +18716,45 @@ def api_admin_upgrade_wheel():
         log_fh.write(f"[upgrade] systemd_unit: {systemd_unit}\n".encode())
     log_fh.flush()
 
-    try:
-        proc = subprocess.Popen(
-            cmd,
-            stdout=log_fh,
-            stderr=subprocess.STDOUT,
-            close_fds=True,
-        )
-    except Exception as e:
-        log_fh.close()
-        return jsonify({"ok": False, "error": f"Failed to spawn pip: {e}"}), 500
+    # v0.5.93 (audit M5): re-take the lock for Popen + state
+    # update so a concurrent POST can't slip between our
+    # original check and this point.
+    with _ADMIN_UPGRADE_LOCK:
+        # Defense-in-depth re-check.
+        _existing = _ADMIN_UPGRADE_STATE.get("process")
+        if _existing is not None and _existing.poll() is None:
+            try:
+                log_fh.close()
+            except Exception:
+                pass
+            return jsonify({
+                "ok": False,
+                "error": "Upgrade already in progress",
+                "started_at": _ADMIN_UPGRADE_STATE.get("started_at"),
+            }), 409
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                stdout=log_fh,
+                stderr=subprocess.STDOUT,
+                close_fds=True,
+            )
+        except Exception as e:
+            log_fh.close()
+            return jsonify({"ok": False, "error": f"Failed to spawn pip: {e}"}), 500
 
-    _ADMIN_UPGRADE_STATE.update({
-        "process": proc,
-        "log_path": log_path,
-        "wheel_path": wheel_path,
-        "wheel_name": f.filename,
-        "started_at": _dt.datetime.now().isoformat(),
-        "finished_at": None,
-        "return_code": None,
-        "restart_scheduled": False,
-        "systemd_unit": systemd_unit,
-    })
-    _admin_upgrade_persist()
+        _ADMIN_UPGRADE_STATE.update({
+            "process": proc,
+            "log_path": log_path,
+            "wheel_path": wheel_path,
+            "wheel_name": f.filename,
+            "started_at": _dt.datetime.now().isoformat(),
+            "finished_at": None,
+            "return_code": None,
+            "restart_scheduled": False,
+            "systemd_unit": systemd_unit,
+        })
+        _admin_upgrade_persist()
 
     return jsonify({
         "ok": True,
@@ -20367,6 +20439,11 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       }
       if (r.ok && data.success) {
         toast(`${iface.name}: ${action} OK`);
+        // v0.5.93 (audit M4): drop the client-side details
+        // cache for this iface so the next ℹ️ open re-fetches
+        // — server-side _invalidate_iface_caches dropped the
+        // ethtool cache already.
+        _invalidateIfaceDetails(iface.name);
       } else {
         toastFailDetailed(data, r.status);
       }
@@ -20425,7 +20502,15 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
     // the row. Cached per iface (in-memory) so repeated toggles
     // are instant. The drawer is a sibling row inserted after the
     // clicked one — keeps layout simple.
-    const _ifaceDetailsCache = {};
+    // v0.5.93 (audit M4): cache entries TTL after 15 seconds
+    // so an iface that just went down doesn't keep showing
+    // the pre-down `Link detected: yes` on re-open. Also
+    // invalidated by lifecycle actions via _invalidateIfaceDetails.
+    const _ifaceDetailsCache = {};  // { name: {data, ts} }
+    const _IFACE_DETAILS_TTL_MS = 15000;
+    function _invalidateIfaceDetails(name) {
+      if (name) delete _ifaceDetailsCache[name];
+    }
     async function ifaceDetailsToggle(iface, btn) {
       const tr = btn.closest('tr');
       if (!tr) return;
@@ -20445,12 +20530,15 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       drawer.appendChild(td);
       tr.parentNode.insertBefore(drawer, tr.nextSibling);
       btn.textContent = '✕';
-      let data = _ifaceDetailsCache[iface.name];
+      // v0.5.93 (audit M4): TTL-aware cache lookup.
+      const _entry = _ifaceDetailsCache[iface.name];
+      const _fresh = _entry && (Date.now() - _entry.ts < _IFACE_DETAILS_TTL_MS);
+      let data = _fresh ? _entry.data : null;
       if (!data) {
         try {
           const r = await fetch(`/api/admin/iface/${encodeURIComponent(iface.name)}/details`);
           data = await r.json();
-          _ifaceDetailsCache[iface.name] = data;
+          _ifaceDetailsCache[iface.name] = { data, ts: Date.now() };
         } catch (e) {
           td.innerHTML = `<div style="color: #b91c1c;">Failed: ${escapeHtml(String(e))}</div>`;
           return;
@@ -20759,6 +20847,29 @@ def _run_ip_link(iface, action):
         return False, "", str(_e)
 
 
+# v0.5.93 (audit M3): drop the per-iface ethtool / drvinfo
+# caches after a lifecycle action so the next iface table
+# render shows fresh link state. Pre-fix the operator clicked
+# Down, the table refreshed 700ms later but kept showing
+# carrier=true and the old speed for up to 30s.
+def _invalidate_iface_caches(iface):
+    """Drop cached ethtool + drvinfo entries for one iface.
+    Holds the corresponding locks; safe to call from any
+    handler thread."""
+    if not iface:
+        return
+    try:
+        with _ETHTOOL_LOCK:
+            _ETHTOOL_CACHE.pop(iface, None)
+    except Exception:
+        pass
+    try:
+        with _DRVINFO_LOCK:
+            _DRVINFO_CACHE.pop(iface, None)
+    except Exception:
+        pass
+
+
 # v0.5.92 (audit H6): structured [ADMIN] audit log. Pre-fix
 # v0.5.88-v0.5.91 lifecycle endpoints produced zero log lines
 # of their own — operators couldn't reconstruct who issued
@@ -20813,6 +20924,7 @@ def api_admin_iface_up(iface):
             "error": _se.strip() or "failed",
             "interface": iface,
         }), 500
+    _invalidate_iface_caches(iface)  # v0.5.93 (audit M3)
     _admin_audit("iface_up", iface, rc="ok")
     return jsonify({"success": True, "interface": iface, "action": "up"})
 
@@ -20850,6 +20962,7 @@ def api_admin_iface_down(iface):
             "error": _se.strip() or "failed",
             "interface": iface,
         }), 500
+    _invalidate_iface_caches(iface)  # v0.5.93 (audit M3)
     _admin_audit("iface_down", iface, force=force, rc="ok")
     return jsonify({"success": True, "interface": iface, "action": "down"})
 
@@ -20903,6 +21016,7 @@ def api_admin_iface_reset(iface):
             ),
             "interface": iface,
         }), 500
+    _invalidate_iface_caches(iface)  # v0.5.93 (audit M3)
     _admin_audit("iface_reset", iface, force=force, rc="ok")
     return jsonify({"success": True, "interface": iface, "action": "reset"})
 

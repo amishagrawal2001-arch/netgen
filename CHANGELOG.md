@@ -2,6 +2,69 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.93] - 2026-06-11
+
+**Admin console audit batch #2: cache + race fixes.**
+
+### H2 — LLDP cache wiped good data on transient lldpcli blip
+
+Pre-fix `_LLDP_CACHE["ts"] = now; _LLDP_CACHE["by_iface"] = {}`
+ran BEFORE the `lldpcli -f json show neighbors` subprocess.
+On `TimeoutExpired` / non-zero rc the cache was already blanked
+— operator saw "(no LLDP)" for every row for the next 30s.
+Exact shape of the v0.5.87 srv06 failure.
+
+Build into a local `new_by_iface = {}`. Only commit
+`_LLDP_CACHE["by_iface"] = new_by_iface` after successful parse.
+On failure, bump `ts` so we don't hammer lldpcli on every
+refresh — but leave the prior good neighbor data intact.
+
+### H3 — install_rdma check-then-spawn outside `_ADMIN_INSTALL_LOCK`
+
+v0.5.71 fixed this exact race for install_dpdk; install_rdma
+was missed. Two concurrent POSTs could both see `proc is None`
+and both `Popen`. State-dict committed by the first; the
+second's process orphaned in the dpkg lock queue.
+
+Wrapped the check-then-spawn-then-state-write block in
+`_ADMIN_INSTALL_LOCK` (the same lock install_dpdk uses — they
+contend on dpkg-lock anyway, so single-lock is correct).
+Defense-in-depth re-check before the inner Popen.
+
+### M3 — Stale `_ETHTOOL_CACHE` + `_DRVINFO_CACHE` after lifecycle
+
+Operator clicks Down → 700ms refresh fires → cached carrier=true
++ pre-down speed re-rendered for up to 30s (ethtool TTL) or 60s
+(drvinfo TTL). New `_invalidate_iface_caches(iface)` helper
+called from up/down/reset on the success path drops both
+caches under their respective locks.
+
+### M4 — JS `_ifaceDetailsCache` had no TTL + no invalidation
+
+Once a drawer was opened, every subsequent toggle served the
+stale entry forever. After a lifecycle action the operator saw
+the pre-action `ethtool` dump indefinitely.
+
+Cache entries now expire after 15 seconds. New
+`_invalidateIfaceDetails(name)` is called from the lifecycle
+success path so re-opening the drawer after Down/Reset always
+re-fetches.
+
+### M5 — `_ADMIN_UPGRADE_STATE` mutated without a lock
+
+Same shape as install_dpdk's pre-v0.5.71 race — missed for the
+wheel upgrade path. New `_ADMIN_UPGRADE_LOCK` wraps the initial
+check + the Popen + the state-dict update. Two concurrent POSTs
+now serialise; the second returns 409.
+
+### Tests
+
+10 new regression tests; updated 1 regex for the LLDP-cache
+function-body extraction (early-return + bailout branches
+required full-function capture).
+
+Full suite: **2,233 passed, 1 skipped** (+10 new).
+
 ## [0.5.92] - 2026-06-11
 
 **Admin console audit batch #1: auth fortification + audit trail.**
