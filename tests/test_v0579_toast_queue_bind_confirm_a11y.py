@@ -34,7 +34,9 @@ def test_toast_uses_host_container():
     assert "'toast-host'" in src or "id = 'toast-host'" in src
     idx = src.find("const toast = (msg) =>")
     assert idx > 0
-    body = src[idx:idx + 1500]
+    # v0.5.94: window grown from 1500 → 2500 to accommodate the
+    # comment block added to the sticky regex.
+    body = src[idx:idx + 2500]
     assert "appendChild" in body
     assert "document.createElement" in body, (
         "toast() doesn't create individual child nodes"
@@ -44,7 +46,9 @@ def test_toast_uses_host_container():
 def test_toast_sticky_pattern_for_failures():
     src = _src()
     idx = src.find("const toast = (msg) =>")
-    body = src[idx:idx + 1500]
+    # v0.5.94: window grown from 1500 → 2500 to accommodate the
+    # comment block added to the sticky regex.
+    body = src[idx:idx + 2500]
     # Failures detected by the leading "Failed:" / "✗ " / "⚠ ".
     assert re.search(r"\^.*failed:.*\|", body, re.IGNORECASE), (
         "Toast doesn't detect failure-leading patterns"
@@ -55,7 +59,9 @@ def test_toast_sticky_pattern_for_failures():
 def test_toast_auto_dismiss_for_success():
     src = _src()
     idx = src.find("const toast = (msg) =>")
-    body = src[idx:idx + 1500]
+    # v0.5.94: window grown from 1500 → 2500 to accommodate the
+    # comment block added to the sticky regex.
+    body = src[idx:idx + 2500]
     # 3s timeout on the non-sticky path.
     assert re.search(r"setTimeout\([^,]+,\s*3000\)", body), (
         "Success toasts don't auto-dismiss after 3s"
@@ -127,7 +133,9 @@ def test_ip_modal_restores_focus_on_close():
     )
     # close path calls .focus() on the saved element.
     idx = src.find("function closeIpModal(")
-    body = src[idx:idx + 1500]
+    # v0.5.94: window grown from 1500 → 2500 to accommodate the
+    # comment block added to the sticky regex.
+    body = src[idx:idx + 2500]
     assert "_modalReturnFocus" in body and "focus()" in body, (
         "closeIpModal doesn't restore focus"
     )

@@ -2,6 +2,75 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.94] - 2026-06-11
+
+**Admin console audit batch #3: toast + drawer UX.**
+
+### H9 — Most error toasts auto-dismissed in 3 seconds
+
+The v0.5.79 sticky-detection regex was `/^(failed:|✗ |⚠ )/i` —
+matches the START of the message only. Every natural-language
+call site says `toast('X request failed: ' + e)` which starts
+with the action verb, not "Failed:" — so the sticky flag was
+false and the error vanished in 3s. Operator walked away
+thinking the action succeeded.
+
+New regex catches " failed:" / " error[:.]" mid-string too:
+
+```
+/(^(failed:|✗ |⚠ |error[:.]))|(\s(failed|error)[:.])/i
+```
+
+### H10 — Open ℹ️ Details drawer was destroyed on every refresh
+
+`refreshInterfaces()` replaces `wrap.innerHTML` so the drawer
+sibling row disappeared on every 700ms post-action refresh.
+The diagnostic tool blew itself away mid-diagnosis — exactly
+when an operator was investigating a problem and clicking
+↑/↓/↻ on the same row.
+
+Now tracked in `_openIfaceDrawers` (Set keyed on iface name).
+`refreshInterfaces()`'s `finally` block re-opens each drawer
+after the re-render — instant since the data is in
+`_ifaceDetailsCache`.
+
+### M7 — Down/Reset confirm enriched with IPs + streams
+
+Pre-fix: `Bring down ens6np0?`.
+Post-fix:
+
+```
+Bring down ens6np0?
+• 2 IP addresses on this port
+• 5 running streams will be disrupted
+(reverts on reboot)
+```
+
+Mirrors the Bind confirm's enrichment. Operator gets the same
+disruption summary regardless of which lifecycle action they're
+about to take.
+
+### M8 — `aria-label` on all 5 lifecycle buttons
+
+Pre-fix the glyph-only ↑/↓/↻/💡/ℹ️ buttons were announced as
+"up arrow button" by screen readers. Added `aria-label` mirroring
+the existing `title` so the announcement carries iface context
+("Bring ens6np0 up", "Show full ethtool dump for ens6np0").
+
+### L5 — Force-confirm `\\n\\n` rendered as literal `\n`
+
+v0.5.88's `confirm(\`${data.error}\\n\\nForce ${action} anyway?\`)`
+used `\\n` which in the raw-string-served template is a
+literal 2-char `\n` text, not a newline. Operator saw the
+error and the force-prompt squashed on one line. Fixed to `\n`.
+
+### Tests
+
+8 new regression tests + 1 updated (v0.5.79's toast-window
+grown from 1500 → 2500 chars to fit the new comment block).
+
+Full suite: **2,241 passed, 1 skipped** (+8 new).
+
 ## [0.5.93] - 2026-06-11
 
 **Admin console audit batch #2: cache + race fixes.**

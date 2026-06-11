@@ -19197,7 +19197,16 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
         document.body.appendChild(host);
       }
       const n = document.createElement('div');
-      const sticky = /^(failed:|✗ |⚠ )/i.test(msg || '');
+      // v0.5.94 (audit H9): the pre-fix regex only matched
+      // messages STARTING with "Failed:" / "✗ " / "⚠ ", so all
+      // the natural-language `toast('X request failed: ' + e)`
+      // call sites auto-dismissed in 3s. Operators walked away
+      // thinking the action succeeded. New regex matches
+      // " failed:" anywhere (case-insensitive) plus the original
+      // prefixes — covers "Bind request failed:", "Flash request
+      // failed:", "Health fetch failed:", etc.
+      const sticky = /(^(failed:|✗ |⚠ |error[:.]))|(\s(failed|error)[:.])/i
+        .test(msg || '');
       n.className = 'toast show' + (sticky ? ' toast-sticky' : '');
       n.style.cssText = 'background:#222; color:#fff; padding:10px 14px; border-radius:6px; font-size:13px; max-width: 480px; box-shadow: 0 4px 12px rgba(0,0,0,0.3); pointer-events: auto; cursor: pointer;';
       if (sticky) n.style.background = '#722';
@@ -20052,12 +20061,16 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
             const _name = escapeHtml(i.name);
             const _baseStyle = 'padding: 2px 6px; font-size: 11px;';
             const _dimStyle = _baseStyle + ' opacity: 0.4; cursor: not-allowed;';
+            // v0.5.94 (audit M8): aria-label mirrors title for
+            // screen readers. Pre-fix the glyph-only buttons
+            // were announced as "up arrow button" with no
+            // context.
             lifecycleBtn = `<span class="iface-ctl" style="display: inline-flex; gap: 3px; margin-left: 4px;">
-              <button type="button" data-idx="${idx}" data-iface-action="up"    title="Bring ${_name} up"    style="${up ? _dimStyle : _baseStyle}"${up ? ' disabled' : ''}>↑</button>
-              <button type="button" data-idx="${idx}" data-iface-action="down"  title="Bring ${_name} down"  style="${!up ? _dimStyle : _baseStyle}" class="secondary"${!up ? ' disabled' : ''}>↓</button>
-              <button type="button" data-idx="${idx}" data-iface-action="reset" title="Reset ${_name} (down → 1s → up)" style="${_baseStyle}" class="secondary">↻</button>
-              <button type="button" data-idx="${idx}" data-iface-action="flash" title="Flash ${_name} link LED (5s)" style="${_baseStyle}" class="secondary">💡</button>
-              <button type="button" data-idx="${idx}" data-iface-action="details" title="Show full ethtool dump for ${_name}" style="${_baseStyle}" class="secondary">ℹ️</button>
+              <button type="button" data-idx="${idx}" data-iface-action="up"    title="Bring ${_name} up"                   aria-label="Bring ${_name} up"                   style="${up ? _dimStyle : _baseStyle}"${up ? ' disabled' : ''}>↑</button>
+              <button type="button" data-idx="${idx}" data-iface-action="down"  title="Bring ${_name} down"                 aria-label="Bring ${_name} down"                 style="${!up ? _dimStyle : _baseStyle}" class="secondary"${!up ? ' disabled' : ''}>↓</button>
+              <button type="button" data-idx="${idx}" data-iface-action="reset" title="Reset ${_name} (down → 1s → up)"     aria-label="Reset ${_name} (down then up)"       style="${_baseStyle}" class="secondary">↻</button>
+              <button type="button" data-idx="${idx}" data-iface-action="flash" title="Flash ${_name} link LED (5s)"        aria-label="Flash ${_name} link LED for 5 seconds" style="${_baseStyle}" class="secondary">💡</button>
+              <button type="button" data-idx="${idx}" data-iface-action="details" title="Show full ethtool dump for ${_name}" aria-label="Show full ethtool dump for ${_name}" style="${_baseStyle}" class="secondary">ℹ️</button>
             </span>`;
             actionBtn = actionBtn + lifecycleBtn;
           }
@@ -20194,6 +20207,27 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       } finally {
         _ifacesInFlight = false;
         if (_ifacesRerun) { _ifacesRerun = false; refreshInterfaces(); }
+        // v0.5.94 (audit H10): re-open any ℹ️ drawers that
+        // were expanded before this refresh blew away the
+        // <tbody>. Lookup uses the in-memory _ifaceDetailsCache
+        // so it's a zero-network restore.
+        if (_openIfaceDrawers && _openIfaceDrawers.size) {
+          for (const _name of Array.from(_openIfaceDrawers)) {
+            const _btn = document.querySelector(
+              `button[data-iface-action="details"][title*="${_name}"]`
+            );
+            if (_btn) {
+              const _idx = parseInt(_btn.dataset.idx, 10);
+              const _wrap = $('iface-table-wrap');
+              const _iface = (_wrap._ifaces || [])[_idx];
+              if (_iface) {
+                // Drop from set first so toggle re-adds it.
+                _openIfaceDrawers.delete(_name);
+                ifaceDetailsToggle(_iface, _btn);
+              }
+            }
+          }
+        }
       }
     }
 
@@ -20432,7 +20466,11 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       if (!force && r.status === 409 && (
         data.code === 'IFACE_DOWN_UNSAFE' || data.code === 'IFACE_RESET_UNSAFE'
       )) {
-        const proceed = confirm(`${data.error}\\n\\nForce ${action} anyway?`);
+        // v0.5.94 (audit L5): pre-fix used `\\n\\n` which is a
+        // literal `\n` text in the raw-string-served template
+        // — confirm() showed the operator `IFACE_DOWN_UNSAFE:
+        // ...\n\nForce down anyway?` on one line.
+        const proceed = confirm(`${data.error}\n\nForce ${action} anyway?`);
         if (proceed) return ifaceLifecycle(iface, action, true);
         toast(`${action} cancelled`);
         return;
@@ -20489,9 +20527,22 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
         return;
       }
       // Confirm for the destructive ones (down/reset).
+      // v0.5.94 (audit M7): enrich the confirm with the same
+      // IP-count + stream-count summary the Bind confirm
+      // already shows. Bringing down a NIC carrying running
+      // streams is just as disruptive as binding it.
       if (realAction === 'down' || realAction === 'reset') {
         const verb = realAction === 'reset' ? 'Reset (down → 1s → up)' : 'Bring down';
-        if (!confirm(`${verb} ${iface.name}?`)) return;
+        const ips = (_ifaceIPs || {})[iface.name] || { ipv4: [], ipv6: [] };
+        const ipCount = (ips.ipv4 || []).length + (ips.ipv6 || []).length;
+        const wrapEl = $('iface-table-wrap');
+        const summary = (wrapEl && wrapEl._streamSummary) || {};
+        const sCount = (summary[iface.name] || {}).count || 0;
+        const lines = [`${verb} ${iface.name}?`];
+        if (ipCount) lines.push(`• ${ipCount} IP address${ipCount === 1 ? '' : 'es'} on this port`);
+        if (sCount) lines.push(`• ${sCount} running stream${sCount === 1 ? '' : 's'} will be disrupted`);
+        lines.push('(reverts on reboot)');
+        if (!confirm(lines.join('\n'))) return;
       }
       btn.disabled = true;
       ifaceLifecycle(iface, realAction, false).finally(() => { btn.disabled = false; });
@@ -20511,6 +20562,13 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
     function _invalidateIfaceDetails(name) {
       if (name) delete _ifaceDetailsCache[name];
     }
+    // v0.5.94 (audit H10): track which ℹ️ drawers were open so
+    // refreshInterfaces() can restore them after the table
+    // re-renders. Pre-fix the operator's diagnostic drawer was
+    // destroyed on every 700ms post-action refresh — the tool
+    // built for diagnosing the problem blew itself away mid-
+    // diagnosis.
+    const _openIfaceDrawers = new Set();
     async function ifaceDetailsToggle(iface, btn) {
       const tr = btn.closest('tr');
       if (!tr) return;
@@ -20518,8 +20576,10 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       if (existing && existing.classList.contains('iface-details-drawer')) {
         existing.remove();
         btn.textContent = 'ℹ️';
+        _openIfaceDrawers.delete(iface.name);  // v0.5.94 (audit H10)
         return;
       }
+      _openIfaceDrawers.add(iface.name);  // v0.5.94 (audit H10)
       const drawer = document.createElement('tr');
       drawer.className = 'iface-details-drawer';
       const td = document.createElement('td');
