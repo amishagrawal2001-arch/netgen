@@ -477,15 +477,17 @@ def test_toc_extractor_returns_empty_on_no_headers():
 
 
 def test_install_guide_toc_has_real_entries():
-    """The Install Guide has dozens of h2/h3 headers; the TOC
-    extractor must surface them all so the sidebar is genuinely
-    useful, not just a token feature."""
+    """Slimmed install guide (post-Jun 11 2026 rewrite) has ≥7
+    h2 sections — Quickstart, Prereqs, Step 2 DPDK, Step 3
+    Client, Upgrades, Uninstall, Auth, Troubleshooting,
+    Variations, See also. The TOC extractor must surface them
+    all so the sidebar is useful."""
     from widgets.stream_dialog import _INSTALL_GUIDE_HTML, _extract_toc
     items = _extract_toc(_INSTALL_GUIDE_HTML)
-    assert len(items) >= 20, (
-        f"Install guide should have ≥20 toc entries; got {len(items)}"
+    assert len(items) >= 7, (
+        f"Install guide should have ≥7 toc entries; got {len(items)}"
     )
-    # First entry should be the §1 header
+    # First entry should be a top-level header
     assert items[0][0] == "h2"
 
 

@@ -334,1306 +334,227 @@ _INSTALL_GUIDE_HTML = r"""
          font-size: 11px; color: #1e3a8a; }
   pre { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
         background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 4px;
-        padding: 10px; font-size: 11px; color: #111827; }
-  table { border-collapse: collapse; margin-top: 6px; font-size: 11px; }
-  th, td { border: 1px solid #d1d5db; padding: 5px 9px; text-align: left;
-           vertical-align: top; }
-  th { background: #f3f4f6; color: #374151; font-weight: 600; }
-  .ok { color: #15803d; font-weight: 600; }
-  .muted { color: #6b7280; font-size: 11px; }
+        padding: 10px; font-size: 11px; color: #111827;
+        white-space: pre-wrap; }
+  table { border-collapse: collapse; margin: 6px 0; }
+  th, td { padding: 4px 10px; border: 1px solid #e5e7eb; text-align: left;
+           font-size: 11px; }
+  th { background: #f3f4f6; color: #1f2937; font-weight: 600; }
+  .lede { background: #eff6ff; border-left: 3px solid #1e40af;
+          padding: 8px 12px; margin: 8px 0 12px; border-radius: 3px; }
 </style>
 
-<h1>Netgen Server — Installation Guide</h1>
-<p class="muted">Three paths: in-GUI installer (no terminal), prebuilt
-release artifacts (download &amp; double-click), or the
-<code>install_ostg_complete.py</code> CLI for scripted provisioning.
-All three land the same wheel + DPDK runtime + systemd unit. Pick
-based on whether you have SSH creds, a working server, or just want
-a click-through experience.</p>
+<h1>Netgen — Installation Guide</h1>
 
-<h2>0. v0.5.x install architecture <span class="ok">★ current</span></h2>
+<div class="lede">
+Fresh install in 3 commands on the Linux box that owns the NICs.
+Run the wizard once via <code>netgen-install</code>, then the
+admin console handles DPDK readiness with a single click.
+</div>
 
-<p>Starting at <b>v0.5.0</b>, fresh installs ship as a single
-self-contained tarball with a bundled Python interpreter and a
-pre-built venv. The legacy <code>install_ostg_complete.py</code>
-flow (system pip + apt + deadsnakes) still works for upgrades on
-existing v0.4.x hosts, but new installs use the tarball path.</p>
+<h2>Quickstart — 3 commands</h2>
 
-<p>The shift was driven by a long-tail of operator-reported "install
-breaks on host X" bugs (PEP 668 on Noble, deadsnakes timeouts,
-silent no-op deps installs). Bundling the Python runtime eliminates
-those failure classes entirely — the install only depends on Docker
-(detected, not installed) plus a working systemd.</p>
+<p>On the Linux server (the one with the NICs you want to drive):</p>
 
-<h3>What the v0.5.13 tarball install drops on disk</h3>
+<pre>VER=$(curl -s https://api.github.com/repos/amishagrawal2001-arch/netgen/releases/latest \
+       | grep -oP '"tag_name": "v\K[^"]+')
+wget https://github.com/amishagrawal2001-arch/netgen/releases/latest/download/netgen-server-${VER}.tar.gz
+sudo mkdir -p /opt/netgen-server &amp;&amp; \
+  sudo tar -xzf netgen-server-*.tar.gz -C /opt/netgen-server --strip-components=1 &amp;&amp; \
+  sudo /opt/netgen-server/bin/netgen-install</pre>
+
+<p>Verify:</p>
+
+<pre>systemctl status netgen-server
+curl -s http://localhost:5050/api/admin/health | jq .health   # "healthy"</pre>
+
+<p>Then browse to <code>http://&lt;server&gt;:5050/admin</code> and run
+<b>Tools → DPDK → Make DPDK Ready</b> to allocate hugepages,
+load vfio, build <code>tx_worker</code>, and (if needed) flip the
+IOMMU GRUB cmdline. Reboot if prompted.</p>
+
+<h2>Prerequisites</h2>
 
 <table>
-  <tr><th>Path</th><th>Size</th><th>What</th></tr>
-  <tr><td><code>/opt/netgen-server/python-runtime/</code></td>
-      <td>~95 MB</td>
-      <td>Bundled CPython 3.10.14 from
-          <a href="https://github.com/astral-sh/python-build-standalone">
-          python-build-standalone</a>. No system Python touched.</td></tr>
-  <tr><td><code>/opt/netgen-server/netgen-venv/</code></td>
-      <td>~537 MB</td>
-      <td>Pre-built venv with the wheel + every dep installed.
-          Contains <code>bin/ostg-server</code> (the systemd
-          ExecStart target), <code>bin/ostg-client</code>,
-          <code>bin/netgen-cli</code>, and the entire
-          site-packages tree (Flask, Scapy, PyQt5, pandas, numpy,
-          scipy, sklearn, cryptography, pydantic, openai,
-          paramiko, docker, …).</td></tr>
-  <tr><td><code>/opt/netgen-server/share/netgen/</code></td>
-      <td>~1.1 MB</td>
-      <td><code>ostg_docker/</code> (FRR Dockerfile + sibling
-          files used as build context),
-          <code>resources/dpdk/</code> (DPDK scripts +
-          <code>tx_worker/</code> C source).</td></tr>
-  <tr><td><code>/opt/netgen-server/bin/</code></td>
-      <td>~80 KB</td>
-      <td><code>netgen-install</code>, <code>netgen-upgrade</code>,
-          <code>netgen-uninstall</code> — operator-facing wrappers
-          with shebangs rewritten to the bundled venv's python.</td></tr>
-  <tr><td><code>/etc/systemd/system/netgen-server.service</code></td>
-      <td>1 KB</td>
-      <td>Writes the unit; backs up any prior one to
-          <code>.service.bak</code>. ExecStart points at
-          <code>/opt/netgen-server/netgen-venv/bin/ostg-server</code>.
-          Caps: <code>CAP_NET_RAW</code> +
-          <code>CAP_NET_ADMIN</code>.</td></tr>
-  <tr><td><code>/usr/local/bin/netgen-{install,upgrade,uninstall}</code></td>
-      <td>symlinks</td>
-      <td>So operators can run <code>sudo netgen-upgrade
-          /tmp/wheel.whl</code> without the full path.</td></tr>
-  <tr><td><code>/opt/OSTG</code> (compat symlink, new hosts only)</td>
-      <td>symlink</td>
-      <td>→ <code>/opt/netgen-server/share/netgen</code>. Lets the
-          runtime's hardcoded
-          <code>/opt/OSTG/resources/dpdk/dpdk_bind.sh</code> +
-          peers resolve. <b>Skipped (warned) if
-          <code>/opt/OSTG</code> already exists as a real
-          directory</b> — typical on hosts with a legacy v0.4.x
-          install. <span class="ok">v0.5.10</span></td></tr>
-  <tr><td><code>/opt/netgen</code> (compat symlink, new hosts only)</td>
-      <td>symlink</td>
-      <td>→ <code>/opt/netgen-server</code>. Default device DB +
-          AI settings paths in the runtime resolve to
-          <code>/opt/netgen/database.db</code> +
-          <code>.netgen_ai_server_settings.env</code>; the symlink
-          maps them into the install root.
-          <span class="ok">v0.5.13</span></td></tr>
-  <tr><td>Docker: <code>netgen-frr:latest</code> +
-          <code>ostg-frr:latest</code></td>
-      <td>~94 MB</td>
-      <td>Built locally from
-          <code>share/netgen/ostg_docker/Dockerfile.frr</code>
-          (Alpine + FRR + dnsmasq + dhclient + tools). Dual-tagged
-          so both the new and legacy code paths find it.
-          <span class="ok">v0.5.13</span></td></tr>
-  <tr><td>Network: TCP <code>:5050</code></td>
-      <td>—</td>
-      <td>Flask app binds <code>0.0.0.0:5050</code>. <b>No firewall
-          rules added</b> by the installer.</td></tr>
-  <tr><td><code>/etc/lldpd.d/netgen-server.conf</code> +
-          <code>lldpd</code> package <span class="ok">★ v0.5.82</span></td>
-      <td>~120 KB pkg</td>
-      <td>The installer runs <code>apt install -y lldpd</code>
-          (best-effort — failure logged + skipped, does NOT abort
-          the install) and writes a config snippet enabling
-          TX + RX with <code>tx-interval 30 / tx-hold 4</code>,
-          then <code>systemctl enable --now lldpd</code>. The
-          admin console iface table surfaces neighbors per port
-          (Switch / Eth1/0/3 / mgmt-IP) once frames arrive.</td></tr>
+<tr><th>Component</th><th>Minimum</th></tr>
+<tr><td>Server OS</td><td>Ubuntu 22.04 / 24.04</td></tr>
+<tr><td>Server disk</td><td>4 GB</td></tr>
+<tr><td>Server RAM</td><td>4 GB (8 GB recommended)</td></tr>
+<tr><td>Server NIC</td><td>Any with DPDK PMD. Mellanox / Broadcom / AMD
+    bifurcate (no bind). Intel needs vfio bind.</td></tr>
+<tr><td>Client OS</td><td>macOS 12+ / Windows 10+ / any modern Linux</td></tr>
+<tr><td>Network</td><td>Outbound HTTPS for apt + DPDK source
+    (only during DPDK install step)</td></tr>
 </table>
 
-<p><b>Total disk footprint: ~730 MB</b> (tarball download is 196 MB,
-extracted install is 633 MB, FRR image is 94 MB).</p>
+<p>The tarball ships a bundled Python 3.10 venv with the wheel
+pre-installed. <b>No system pip, no PEP 668, no apt deps for
+Python.</b> Only system tools needed at install time are
+<code>bash</code>, <code>tar</code>, and (optionally)
+<code>docker</code> for the FRR / DHCP features.</p>
 
-<h3>What the v0.5.x install does NOT touch</h3>
+<h2>Step 2 — DPDK readiness (one click)</h2>
 
-<ul>
-  <li>No apt packages installed for the Python runtime (bundled
-      venv handles all Python deps — no PEP 668 surface, no
-      deadsnakes, no apt timeouts). <b>Exception</b>:
-      <span class="ok">v0.5.82</span> adds a single
-      <code>apt install -y lldpd</code> call for neighbor
-      discovery — failure is non-fatal and the admin console
-      gracefully shows "(no LLDP)" per row when lldpcli isn't
-      present.</li>
-  <li>No changes to system <code>python3</code> or
-      <code>/usr/bin/python3</code>.</li>
-  <li>No user accounts (server runs as root via systemd).</li>
-  <li>No firewall rules.</li>
-  <li>No <code>PYTHONPATH</code> exports or shell-rc modifications.</li>
-  <li>No data import — fresh hosts get an empty DB unless legacy
-      <code>/opt/OSTG/device_database.db</code> exists, in which
-      case <code>_resolve_db_path()</code> falls through to it
-      automatically.</li>
-</ul>
+<p>After the tarball install, the DPDK Runtime tile in the admin
+console will be red on a fresh box. Click <b>Tools → DPDK → Make
+DPDK Ready</b>. The wizard:</p>
 
-<h3>LLDP neighbor discovery <span class="ok">★ v0.5.82</span></h3>
-
-<p>The installer now ships <code>lldpd</code> as an integrated step
-so the admin console's iface table can show what switch + port each
-NIC is connected to — like Cisco IOS <code>show lldp neighbors</code>
-per port, but per row. Useful for fleet inventory, lab cable
-audits, and confirming the right port came up.</p>
-
-<p>What the installer does:</p>
 <ol>
-  <li><code>apt-get install -y lldpd</code> (~120 KB pkg, single
-      dep on libsnmp).</li>
-  <li>Writes <code>/etc/lldpd.d/netgen-server.conf</code> enabling
-      both TX and RX with sane defaults (<code>tx-interval 30</code>,
-      <code>tx-hold 4</code>) plus a friendly platform string
-      (<code>netgen-server</code>) so neighbor switches can identify
-      this host.</li>
-  <li><code>systemctl enable --now lldpd</code>.</li>
+<li>apt-installs DPDK build deps (meson, ninja, pyelftools, libnuma-dev, …)</li>
+<li>Builds DPDK 23.11 from source against your kernel</li>
+<li>Loads <code>vfio</code> + <code>vfio_pci</code> (persists in
+    <code>/etc/modules-load.d/</code>)</li>
+<li>Allocates 2 MiB hugepages (persists in <code>/etc/fstab</code>
+    + sysctl)</li>
+<li>Builds <code>tx_worker</code> + installs to
+    <code>/usr/local/bin/tx_worker</code></li>
+<li>Configures IOMMU GRUB cmdline if missing → prompts reboot</li>
 </ol>
 
-<p>What the admin console does with it: the
-<code>/api/dpdk/interfaces</code> endpoint enriches each iface
-with the cached <code>lldpcli show neighbors -f json</code>
-output (30s TTL, threading-locked — one fork per refresh, not N).
-The iface table renders an <b>LLDP neighbor</b> column showing the
-switch <code>sys_name</code> and port descr/ID on a two-line cell,
-with the full chassis ID + system descr + mgmt IPs on hover.</p>
+<p>Total time on a fresh Ubuntu 24.04 box: 10–15 minutes (most
+of it the DPDK source build).</p>
 
-<p>If lldpd fails to install (best-effort on the installer side)
-or no neighbor has been seen on a port, the cell shows
-<code>—</code> with a tooltip explaining the cause. The rest of
-the iface table works normally.</p>
+<p>For perftest-based RDMA streams, also run <b>Tools → Setup
+RDMA…</b>. Installs <code>rdma-core</code>, <code>perftest</code>,
+<code>infiniband-diags</code>.</p>
 
-<p>Existing v0.5.x servers picking up v0.5.82 by wheel upgrade
-also get lldpd via the <b>Tools → DPDK → Make DPDK Ready</b> path
-— the DPDK installer's apt-deps list now includes
-<code>lldpd</code>. Or install it manually with
-<code>apt install -y lldpd &amp;&amp; systemctl enable --now
-lldpd</code> + restart netgen-server.</p>
+<h2>Step 3 — Client (operator laptop)</h2>
 
-<h3>How to run a v0.5.x fresh install</h3>
-
-<p>Open this client → <b>File → Install/Upgrade Server</b> →
-<b>Fresh install via SSH</b> tab → browse to
-<code>netgen-server-X.Y.Z-linux-x86_64.tar.gz</code> (bundled with
-this client app, or downloadable from the GitHub release).</p>
-
-<p>The dialog sftp-uploads the tarball, extracts to
-<code>/opt/netgen-server.new</code>, atomically renames to
-<code>/opt/netgen-server</code>, then runs
-<code>bin/netgen-install</code>. Total time: ~2 min on a clean
-Ubuntu 24.04 host (first install) or ~30 s if the FRR Docker
-layers are cached from a prior install.</p>
-
-<p>Expected end-of-log on success:</p>
-
-<pre style="background:#f0fdf4; border-left:3px solid #15803d; padding:8px;">
-[INFO] [LLDP] Installing lldpd + enabling system-wide LLDP discovery
-[INFO] [LLDP] Wrote config: /etc/lldpd.d/netgen-server.conf
-[INFO] [LLDP] lldpd is active — admin console will show neighbors as switches advertise.
-[INFO] [FRR] ✓ Image built (tagged netgen-frr:latest + ostg-frr:latest)
-[INFO] [SYSTEMD] ✓ netgen-server.service restarted
-[INFO] [PATH] ✓ /usr/local/bin/netgen-install → /opt/netgen-server/bin/netgen-install
-[INFO] [COMPAT] ✓ /opt/OSTG → /opt/netgen-server/share/netgen
-[INFO] [COMPAT] ✓ /opt/netgen → /opt/netgen-server
-[INFO] [VERIFY] ✓ Server responding: {"netgen_version":"0.5.82","status":"ok"}
-[INFO] netgen-server installation complete.</pre>
-
-<h3>The 7 contracts CI now validates (so you don't hit them)</h3>
-
-<p>Between v0.5.6 and v0.5.13, seven distinct "CI green, operator
-red" install-pipeline bugs were closed. Each one added a specific
-contract check to the CI round-trip step:</p>
+<p>Download the matching client artifact from the same GH release:</p>
 
 <table>
-  <tr><th>Release</th><th>Contract</th></tr>
-  <tr><td>v0.5.6</td>
-      <td><code>/api/admin/upgrade_wheel</code> handles PEP 668
-          on Noble/Debian 12 (detect <code>EXTERNALLY-MANAGED</code>,
-          dispatch to <code>netgen-upgrade</code> on tarball
-          installs).</td></tr>
-  <tr><td>v0.5.7</td>
-      <td>Venv is relocatable —
-          <code>pyvenv.cfg home</code> baked to
-          <code>/opt/netgen-server/python-runtime/bin</code>,
-          symlinks made relative.</td></tr>
-  <tr><td>v0.5.8 + v0.5.9</td>
-      <td>Tar mtimes hardcoded to <code>2020-01-01 UTC</code>
-          (was: CI-runner "now") so NTP-drifted hosts don't reject
-          files as "in the future".</td></tr>
-  <tr><td>v0.5.10</td>
-      <td>Tarball <code>share/netgen/resources/dpdk/</code> layout
-          matches <code>_preflight()</code>'s required-paths
-          contract.</td></tr>
-  <tr><td>v0.5.11</td>
-      <td>FRR Docker build context is
-          <code>share/netgen/ostg_docker/</code> (where the
-          Dockerfile's <code>COPY</code> sibling files actually
-          live).</td></tr>
-  <tr><td>v0.5.12</td>
-      <td>Every entry-point shebang in
-          <code>netgen-venv/bin/</code> rewritten from CI-runner
-          absolute path to <code>/opt/netgen-server/netgen-venv/
-          bin/python</code> (caught
-          <code>ostg-server</code> failing with
-          <code>203/EXEC</code>).</td></tr>
-  <tr><td>v0.5.13</td>
-      <td><code>/opt/netgen</code> compat symlink +
-          <code>ostg-frr:latest</code> dual-tag (proactive audit:
-          would have hit any fresh host without legacy
-          <code>/opt/OSTG/</code>).</td></tr>
+<tr><th>OS</th><th>File</th></tr>
+<tr><td>macOS</td><td><code>Netgen-TrafficGenerator-&lt;v&gt;.dmg</code>
+    — drag to Applications</td></tr>
+<tr><td>Windows</td><td><code>Netgen-Client-&lt;v&gt;-windows.exe</code>
+    — double-click</td></tr>
+<tr><td>Linux</td><td><code>Netgen-Client-&lt;v&gt;-linux-x86_64.AppImage</code>
+    — <code>chmod +x</code> and run</td></tr>
 </table>
 
-<p>And from v0.5.11+, if <code>/api/health</code> doesn't respond
-within 60s, <code>_verify_running()</code> dumps inline:
-<code>journalctl</code> for the unit, who's holding port
-<code>:5050</code> (<code>ss -tlnp</code>), and whether legacy
-<code>ostg-server.service</code> is still active — with the exact
-remediation command in the install log itself. No second ssh
-round-trip required to diagnose.</p>
+<p>First launch → <b>Tools → Add TGen Chassis</b> → enter
+<code>http://&lt;server&gt;:5050</code> → Save. Green LED next to
+the server name = healthy. Add stream → Apply → Start.</p>
 
-<h2>1. In-GUI installer (NEW in 0.2.6) <span class="ok">★ recommended</span></h2>
+<h2>Upgrades</h2>
 
-<p>You're in the client right now. Drive both install and upgrade
-without leaving it:</p>
+<p>From the admin console: <b>Tools → Upgrade Wheel</b> → drag the
+new <code>.whl</code> in. Server restarts itself when pip is done.</p>
 
-<p><b>Help → Install / Upgrade Server...</b></p>
+<p>From a shell on the server:</p>
 
-<table>
-  <tr><th>Tab</th><th>When to use</th><th>What it does</th></tr>
-  <tr><td><b>Upgrade running server</b><br><span class="muted">HTTP or SSH, ~30–60 s</span></td>
-      <td>Server is already running an older wheel; you want to roll a
-          new release onto it.</td>
-      <td>The Upgrade tab has <b>two</b> buttons (see §1a below):
-          <b>Upload &amp;&amp; Upgrade</b> (HTTP) and
-          <b>Upgrade via SSH (manual)</b>. Both land the new wheel via
-          <code>pip install --upgrade --force-reinstall --no-deps</code>
-          then restart the service; the client polls
-          <code>/api/health</code> for the new instance.</td></tr>
-  <tr><td><b>Fresh install via SSH</b><br><span class="muted">paramiko, 15–45 min, <b>detached</b></span></td>
-      <td>Bare Linux host. No netgen, no Docker, no DPDK yet.</td>
-      <td>Connects (password OR SSH key, configurable port) → sftp-copies
-          the wheel + <code>install_ostg_complete.py</code> to
-          <code>/tmp/netgen_install/</code> → spawns the installer
-          <i>detached</i> via <code>nohup</code> on the target →
-          polls <code>/var/log/netgen-install.log</code> for live
-          output. Optional flags: <code>--no-dpdk</code>,
-          <code>--skip-dpdk-build</code>.</td></tr>
-</table>
+<pre>sudo netgen-upgrade /path/to/ostg_trafficgen-&lt;new-version&gt;-py3-none-any.whl</pre>
 
-<h3>1a. Two ways to upgrade a running server</h3>
+<p>Both paths share the same state machinery (locked, persists
+across server restart).</p>
 
-<p>On the <b>Upgrade running server</b> tab, fill in the server URL +
-wheel (+ optional auth token), then pick a button:</p>
+<h2>Uninstall</h2>
 
-<table>
-  <tr><th>Button</th><th>Path</th><th>Use when</th></tr>
-  <tr><td><b>Upload &amp;&amp; Upgrade</b></td>
-      <td>HTTP <code>POST /api/admin/upgrade_wheel</code> → server
-          pip-installs &amp; restarts itself. <b>No SSH needed.</b></td>
-      <td>Normal case — the server is on 0.2.6+ (has the upgrade
-          endpoint). If the endpoint is missing/erroring and you've
-          filled in the SSH box, it <i>auto-falls back</i> to SSH
-          (see below).</td></tr>
-  <tr><td><b>Upgrade via SSH (manual)</b><br><span class="muted">NEW in 0.2.35</span></td>
-      <td>Skips HTTP entirely: sftp the wheel →
-          <code>pip install --upgrade --force-reinstall --no-deps</code>
-          → restart the service. Uses the SSH credentials on the tab.</td>
-      <td><b>OLD servers</b> that predate the
-          <code>/api/admin/upgrade_wheel</code> endpoint (pre-0.2.6), or
-          whenever you just prefer the direct path. No 404 round-trip.</td></tr>
-</table>
+<pre># Linux server
+sudo systemctl stop netgen-server
+sudo /opt/netgen-server/bin/netgen-uninstall
+sudo rm -rf /opt/netgen-server
 
-<div class="warn"><b>Old server without the HTTP upgrade endpoint?</b>
-Use <b>Upgrade via SSH (manual)</b>. (As of 0.2.34, <b>Upload &amp;&amp;
-Upgrade</b> also auto-detects the missing endpoint — HTTP 404 — and
-offers the SSH fallback, provided you've entered SSH credentials.) The
-SSH restart tries <code>systemctl restart netgen-server</code> and falls
-back to the legacy <code>ostg-server</code> unit, so it works on both
-new and old installs.</div>
+# macOS client
+rm -rf "/Applications/Netgen Client.app"
 
-<p class="muted">Equivalent manual one-liner (if you'd rather use a
-terminal): <code>scp ostg_trafficgen-&lt;ver&gt;.whl root@&lt;host&gt;:/tmp/
-&amp;&amp; ssh root@&lt;host&gt; 'pip3 install --upgrade --force-reinstall
---no-deps /tmp/ostg_trafficgen-&lt;ver&gt;.whl &amp;&amp; (systemctl
-restart netgen-server || systemctl restart ostg-server)'</code>. Once on
-0.2.28+, the server's startup self-heal redeploys the FRR/DHCP assets and
-rebuilds the container image automatically.</p>
+# Linux client
+rm Netgen-Client-*-linux-x86_64.AppImage
+rm -rf ~/.config/netgen-client
 
-<h3>Test Connection + pre-flight checks (NEW in 0.2.9)</h3>
+# Windows client — Settings → Apps → Netgen Client → Uninstall</pre>
 
-<p>The Fresh Install tab grew a <b>Test Connection</b> button next
-to <b>Install</b>. Run it first to verify SSH credentials work and
-the target meets the install's prerequisites — saves a 15-min
-install round-trip when the password's wrong or Python is too old.
-2–3 seconds total budget. Four probes after the SSH connect:</p>
+<h2>Auth (optional)</h2>
 
-<table>
-  <tr><th>Probe</th><th>What it checks</th><th>Why</th></tr>
-  <tr><td><b>Python ≥ 3.9</b></td>
-      <td><code>python3 --version</code> → parses major/minor</td>
-      <td><code>install_python_dependencies</code> needs ≥3.9 for
-          f-strings + type hints in the wheel</td></tr>
-  <tr><td><b>Sudo capability</b></td>
-      <td><code>sudo -n true</code> (skipped when user is root)</td>
-      <td>Non-root installs that hit a password prompt block
-          forever — paramiko has no terminal to type into</td></tr>
-  <tr><td><b>Free disk ≥ 4 GB on /var</b></td>
-      <td><code>df -BG --output=avail /var</code></td>
-      <td>DPDK build + FRR Docker image + apt cache all land under
-          <code>/var</code>; smaller boxes crash mid-meson</td></tr>
-  <tr><td><b>netgen-server already active?</b></td>
-      <td><code>systemctl is-active netgen-server.service</code></td>
-      <td>If yes, hints to switch to the <b>Upgrade running server</b>
-          tab — a 30s round-trip instead of a 15-min full install</td></tr>
-</table>
+<p>By default the server is open. To require a bearer token, drop
+in a systemd override:</p>
 
-<p>Results stream into the log pane as <code>[test] ✓ / ✗</code>
-lines. Tail QMessageBox shows either <b>"All checks passed — safe
-to click Install"</b> or <b>"Some checks failed — install will
-likely fail too"</b> with the failing bullet list. The Install
-button still works without first clicking Test, but Test catches
-the obvious bugs in 2 s instead of 30 s into spawn.</p>
+<pre>sudo mkdir -p /etc/systemd/system/netgen-server.service.d
+sudo tee /etc/systemd/system/netgen-server.service.d/auth.conf &lt;&lt;EOF
+[Service]
+Environment=NETGEN_AUTH_TOKEN=$(openssl rand -hex 32)
+EOF
+sudo systemctl daemon-reload &amp;&amp; sudo systemctl restart netgen-server</pre>
 
-<h3>SSH port + host configuration</h3>
+<p>Clients pass <code>Authorization: Bearer &lt;token&gt;</code> headers.
+Per-endpoint role gating (admin / operator / viewer) is enforced
+by <code>@require_role</code>.</p>
 
-<p>The Host row exposes <b>address / user / port</b> — port
-defaults to 22 but lab boxes behind jump hosts or alternate
-sshd configs (2222 / 22000 / etc.) were unreachable before. Both
-the connect step and the pid-probe / pre-flight probes use the
-configured port.</p>
+<h2>Troubleshooting</h2>
 
-<h3>Error surfacing (NEW in 0.2.9)</h3>
-
-<p>The log pane is now <b>color-coded</b> as output streams in:</p>
+<p>The admin console exposes everything needed to diagnose without
+SSH:</p>
 
 <ul>
-  <li><span style="color:#dc2626;">red</span> — <code>[ERROR]</code>,
-      <code>error</code>, <code>exception</code>, <code>failed</code>,
-      <code>fatal</code>, <code>traceback</code>, <code>-E-</code>,
-      <code>✗</code></li>
-  <li><span style="color:#d97706;">amber</span> — <code>[WARNING]</code>,
-      <code>warn</code>, <code>⚠</code></li>
-  <li><span style="color:#15803d;">green</span> — <code>✓</code>,
-      <code>success</code>, <code>OK</code></li>
-  <li>neutral — everything else</li>
+<li><b>Server health</b> — admin page top banner names concrete
+    degraded items</li>
+<li><b>Logs</b> — <b>Tools → Server Journal</b> or
+    <code>GET /api/admin/journal?lines=300</code></li>
+<li><b>DPDK install log</b> — streamed inline by the wizard</li>
+<li><b>Per-iface diagnostics</b> — click ℹ️ on any iface row for
+    the full <code>ethtool</code> dump</li>
+<li><b>Cache inspection</b> —
+    <code>GET /api/admin/caches</code></li>
+<li><b>Tool presence</b> —
+    <code>GET /api/admin/health.tools_present</code></li>
 </ul>
 
-<p>Cleanup-style messages from <code>install_ostg_complete.py</code>
-that aren't real errors (<code>Failed to stop ostg-server: Unit
-not loaded</code>, <code>No such image: ostg-frr:latest</code>,
-etc.) get filtered out of the error color so the operator's eye
-isn't drawn to "this is fine" cleanup spam.</p>
-
-<p>On failure, the dialog now pops a <b>QMessageBox.critical</b>
-with the last 6 captured error lines bullet-listed — no more
-scrolling a 1000-line log to find the actual cause. Example:</p>
-
-<pre style="background:#fef2f2; border-left:3px solid #dc2626; padding:8px;">
-Install failed
-
-The fresh install did not complete. Most recent errors from the log:
-
- • install_ostg_complete.py: error: unrecognized arguments: -w
- • [ERROR] Wheel file not found: dist/ostg_trafficgen-0.0.0-py3-none-any.whl
-</pre>
-
-<p>Errors are also reset between runs — a failed install doesn't
-leak its captured errors into the next attempt's failure dialog.</p>
-
-<h3>Detached install — what survives client exit</h3>
-
-<p>The fresh-install path runs the installer under
-<code>nohup</code> on the target, with stdout/stderr redirected to
-a log file. <b>Close the dialog, lose WiFi, crash the client —
-the install keeps running.</b> The state lives in three target-side
-files:</p>
-
 <table>
-  <tr><th>Path</th><th>Purpose</th></tr>
-  <tr><td><code>/var/log/netgen-install.log</code></td>
-      <td>Full installer stdout+stderr. Permanent record; survives
-          reboot. <code>tail -F</code>-able alongside the GUI.</td></tr>
-  <tr><td><code>/var/run/netgen-install.pid</code></td>
-      <td>Wrapper script's PID while the install is alive. Removed
-          when the installer exits.</td></tr>
-  <tr><td><code>/var/run/netgen-install.exit</code></td>
-      <td>Installer's exit code, written by the wrapper when the
-          install finishes (0 = success, non-zero = failure).</td></tr>
+<tr><th>Symptom</th><th>Likely cause</th><th>Fix</th></tr>
+<tr><td><code>netgen-install</code> exits with "Docker missing"</td>
+    <td>No Docker; FRR/DHCP features won't work</td>
+    <td>Install Docker, or pass <code>--skip-docker</code></td></tr>
+<tr><td>Make-Ready hangs at "Building DPDK"</td>
+    <td>apt mirror slow; first install only</td>
+    <td>Wait — log streams live</td></tr>
+<tr><td><code>tx_worker binary</code> tile red</td>
+    <td>install_dpdk.sh didn't finish, or wrong path</td>
+    <td>Tile tooltip names the fix; <code>$TX_WORKER_BIN</code>
+        env override is the escape hatch</td></tr>
+<tr><td>Stream starts, dies in &lt;1s, <code>tx_count=0</code></td>
+    <td>DPDK init failed</td>
+    <td>Journal has <code>[dpdk]</code> error lines naming the cause</td></tr>
+<tr><td>Wrong port physically</td>
+    <td>Operator forgot which cable is which</td>
+    <td>Click 💡 button on the row → blinks LED for 5s</td></tr>
+<tr><td>Concurrent operators interfere</td>
+    <td>Two browser tabs on same iface</td>
+    <td>Per-iface lock returns <code>409 IFACE_BUSY</code> — retry</td></tr>
 </table>
 
-<p>Re-open the dialog and click Install against the same host:
-the client probes for the pid file, finds the live install, and
-prompts <b>"Resume monitoring its log?"</b> The worker switches
-into resume mode — skips SFTP upload + spawn entirely, jumps
-straight to polling the log from byte 0. One click to reattach
-to an install you walked away from an hour ago.</p>
+<h2>Variations (less common)</h2>
 
-<p>Closing the dialog mid-install prompts: <i>"The fresh install
-is running detached on the target — closing this dialog will stop
-monitoring the log, but the install itself will continue to
-completion."</i> The upgrade tab (HTTP-based) still uses the old
-"abort-on-close" prompt because there's no way to detach an HTTP
-upload mid-flight.</p>
+<p><b>Same-host Linux turnkey</b> — server + client on the same
+Linux box:</p>
 
-<p><b>Safety properties:</b></p>
-<ul>
-  <li>Upgrade tab: overlapping wheel uploads return HTTP 409;
-      filenames other than <code>*.whl</code> return HTTP 400
-      (no path traversal); server pip-installs into its own
-      Python via <code>sys.executable -m pip</code>.</li>
-  <li>Fresh-install tab: <code>nohup</code> + redirected stdin
-      so no PTY → no SIGHUP on disconnect; pre-flight pid check
-      refuses to start a second install on the same target while
-      one's already running.</li>
-  <li>SSH password lives only in the dialog field for the
-      operation's duration (never written to disk). SSH keys
-      are read from the chosen file at connection time.</li>
-  <li>Cancelling reads the right copy depending on the tab —
-      detached SSH says "monitoring stops, install continues",
-      foreground HTTP says "abort and may leave server
-      inconsistent".</li>
-</ul>
+<pre>git clone https://github.com/amishagrawal2001-arch/netgen.git &amp;&amp; cd netgen
+sudo ./install_turnkey.sh   # builds wheel + installs server + drops desktop launcher</pre>
 
-<p class="muted">The dialog uses HTTP (Tab 1) and paramiko (Tab 2);
-no Python toolchain required on the target. Pre-fills Server URL
-from the current client connection and auth token from
-<code>$NETGEN_AUTH_TOKEN</code>. Adaptive log-poll backoff: 1 s
-while output is flowing, 5 s when idle — keeps SSH churn low
-during the 15+ min DPDK build.</p>
+<p><b>macOS dev box</b> — server in Docker Desktop, client native.
+DPDK / VRF / kernel features unavailable; use only for protocol
+work against the Scapy engine.</p>
 
-<h2>2. Prebuilt release artifacts</h2>
+<p><b>WSL2 on Windows</b> — server inside WSL2, client native
+Windows. DPDK works but performance is bridge-bound. Same install
+commands as Linux server, executed inside the WSL2 distro.</p>
 
-<p>Every tagged release on GitHub ships four CI-built artifacts under
-<a href="https://github.com/amishagrawal2001-arch/netgen/releases/latest">releases/latest</a>.
-They're not interchangeable — pick by <i>what you're trying to install
-where</i>, not by your laptop's OS:</p>
+<p><b>Building from source</b> — for developers patching netgen
+itself:</p>
 
-<table>
-  <tr><th>File</th><th>Contains</th><th>Runs on</th></tr>
-  <tr><td><code>ostg_trafficgen-&lt;v&gt;-py3-none-any.whl</code><br>
-          <span class="muted">~1.4 MB</span></td>
-      <td><b>Both</b> server + client + CLI (Python source). Four entry
-          points: <code>ostg-server</code>, <code>ostg-client</code>,
-          <code>netgen-cli</code>, <code>ostg-docker-install</code>.</td>
-      <td>Any platform with Python ≥3.9. <b>Server only runs on Linux
-          (DPDK, VRFs, systemd are Linux-only).</b></td></tr>
-  <tr><td><code>Netgen-TrafficGenerator-&lt;v&gt;.dmg</code><br>
-          <span class="muted">~59 MB</span></td>
-      <td><b>Client GUI only.</b> Single bundle:
-          <code>Netgen Client.app</code> (PyQt5 + Python frozen).
-          No Server.app on purpose — see below.</td>
-      <td>macOS only</td></tr>
-  <tr><td><code>Netgen-Client-&lt;v&gt;-windows.exe</code><br>
-          <span class="muted">~73 MB</span></td>
-      <td><b>Client GUI only</b> — PyInstaller one-file installer.</td>
-      <td>Windows only</td></tr>
-  <tr><td><code>Netgen-Client-&lt;v&gt;-linux-x86_64.AppImage</code><br>
-          <span class="muted">~92 MB</span></td>
-      <td><b>Client GUI only</b> — single-file portable.</td>
-      <td>Any modern Linux distro</td></tr>
-</table>
+<pre>git clone https://github.com/amishagrawal2001-arch/netgen.git &amp;&amp; cd netgen
+./rebuild_quick.sh                   # builds the wheel
+sudo ./install_turnkey.sh            # full local install</pre>
 
-<h3>Pick the right one</h3>
-
-<table>
-  <tr><th>If you want to...</th><th>Download</th></tr>
-  <tr><td>GUI on macOS, point at an existing server</td><td>the <b>DMG</b></td></tr>
-  <tr><td>GUI on Windows</td><td>the <b>EXE</b></td></tr>
-  <tr><td>GUI on Linux</td><td>the <b>AppImage</b></td></tr>
-  <tr><td>Install or upgrade the server itself</td>
-      <td>the <b>wheel</b> — use <code>install_ostg_complete.py</code>
-          or the in-GUI <b>Help → Install / Upgrade Server</b> dialog</td></tr>
-  <tr><td>Headless CLI / Docker / CI / scripted client install</td>
-      <td>the <b>wheel</b> — <code>pip install</code> it directly</td></tr>
-</table>
-
-<h3>Why no Server bundle in the DMG / EXE / AppImage?</h3>
-
-<p>The DMG was deliberately stripped of <code>Netgen Server.app</code>
-in 0.2.5 (commit <code>e03bccf</code>). Netgen-server depends on
-Linux-only kernel features that don't exist on macOS or Windows:</p>
+<h2>See also</h2>
 
 <ul>
-  <li>DPDK kernel modules (<code>vfio-pci</code>, <code>uio_pci_generic</code>)</li>
-  <li>Per-device Linux VRFs (<code>ip link add type vrf</code>)</li>
-  <li><code>iproute2</code> for VLAN / VXLAN subinterfaces</li>
-  <li>systemd for service management</li>
-  <li>FRR Docker containers (work on Docker Desktop but cross-platform is slow + restricted)</li>
+<li><b>This guide</b> is mirrored as <code>INSTALL.md</code> in
+    the GitHub repo.</li>
+<li><b>What's New</b> — Help menu → What's New</li>
+<li><b>API reference</b> —
+    <code>http://&lt;server&gt;:5050/admin/api-guide</code></li>
+<li><b>CHANGELOG</b> — <code>CHANGELOG.md</code> in the repo</li>
 </ul>
-
-<p>Shipping a <code>Server.app</code> would mislead operators into
-thinking they could run a full Netgen server on a Mac. The wheel
-<i>does</i> contain the server code, but on macOS / Windows
-<code>ostg-server</code> only works with <code>--no-dpdk</code>
-(Scapy-only fallback) for protocol-correctness testing — no line
-rate, no DPDK acceleration.</p>
-
-<table>
-  <tr><th>Command</th><th>macOS</th><th>Windows</th><th>Linux</th></tr>
-  <tr><td><code>ostg-client</code></td><td>✅</td><td>✅</td><td>✅</td></tr>
-  <tr><td><code>netgen-cli</code></td><td>✅</td><td>✅</td><td>✅</td></tr>
-  <tr><td><code>ostg-server --no-dpdk</code> (Scapy)</td>
-      <td>⚠️ protocol-correctness only</td>
-      <td>⚠️ same caveat</td>
-      <td>✅ full</td></tr>
-  <tr><td><code>ostg-server</code> (DPDK)</td>
-      <td>❌</td><td>❌</td><td>✅</td></tr>
-</table>
-
-<h2>3. CLI install (deep / scripted)</h2>
-
-<h3>3a. What files do I actually need?</h3>
-
-<p><b>Two files</b>, both must end up on the operator's machine before
-the install can start:</p>
-
-<table>
-  <tr><th>File</th><th>Why</th><th>Where it ships</th></tr>
-  <tr><td><code>ostg_trafficgen-&lt;v&gt;-py3-none-any.whl</code></td>
-      <td>The Python runtime (server, client, CLI, bundled
-          <code>resources/dpdk/</code> + <code>ostg_docker/</code> +
-          <code>Dockerfile.frr</code> as package data).</td>
-      <td>GitHub Releases asset; also bundled inside the
-          <code>.dmg</code> / <code>.exe</code> / AppImage.</td></tr>
-  <tr><td><code>install_ostg_complete.py</code></td>
-      <td>The OS-level orchestrator — installs Docker, Python 3.10,
-          perftest, rdma-core, DPDK build deps, systemd unit. <b>NOT
-          in the wheel today</b>; needs to be shipped alongside it.</td>
-      <td>Repo root (clone the repo or copy this single file out).
-          Also auto-uploaded by the in-GUI Fresh Install dialog from
-          its own bundled copy.</td></tr>
-</table>
-
-<p>The 4 optional files (<code>Dockerfile.frr</code>,
-<code>requirements.txt</code>, <code>resources/dpdk/</code>,
-<code>ostg_docker/</code>) are <i>extracted from inside the wheel</i>
-during the install if not present alongside the installer. Operator
-only needs to coordinate them when shipping patched versions for
-testing.</p>
-
-<h3>3b. One-shot run</h3>
-
-<pre># From a fresh checkout — build the wheel locally (gitignored)
-python3 -m build --wheel
-
-# Install on a target host (root credentials required)
-python3 install_ostg_complete.py -H &lt;host&gt; -p &lt;password&gt;</pre>
-
-<p>That's it. ~15-45 minutes on a fresh box (most of which is the DPDK build).
-At the end you have netgen-server running as a systemd unit, listening on
-port 5050, and a <code>tx_worker</code> binary ready to drive line-rate
-DPDK streams.</p>
-
-<h3>3c. Wheel-only path (today: not yet supported)</h3>
-
-<p>A user with ONLY <code>ostg_trafficgen-&lt;v&gt;-py3-none-any.whl</code>
-in hand can <code>pip install</code> it successfully, but
-<code>ostg-server</code> won't actually start — Docker, perftest,
-DPDK, the systemd unit, and Python 3.10 itself aren't there yet, and
-the wheel has no way to install them. Use one of the in-GUI Fresh
-Install flow (§1), the GitHub-release download flow (§2), or the
-git-clone CLI flow (§3b) for now.</p>
-
-<h2>4. What gets installed, in order</h2>
-
-<p>The orchestrator runs these steps in sequence on the target. Each
-shells out via the hardened <code>_apt_install</code> /
-<code>_install_apt_keyring</code> helpers (see notes at the end of this
-table) so noninteractive installs survive conffile prompts and modern
-GnuPG 2.x.</p>
-
-<table>
-  <tr><th>Step</th><th>What it does</th></tr>
-  <tr><td><b>_heal_dpkg_state</b><br><span class="ok">NEW in 0.3.16</span></td>
-      <td>Pre-flight that recovers from a prior failed install:
-          <code>dpkg --audit</code> → force-remove half-installed
-          Docker stack if needed →
-          <code>dpkg --configure -a --force-confdef --force-confold</code>
-          → <code>apt-get clean / update</code>. No-op on a clean box.
-          Eliminates the "user must SSH in and run apt --fix-broken
-          install" recovery step after a failed run.</td></tr>
-  <tr><td><b>cleanup_old_install</b></td>
-      <td>Wipes legacy <code>/opt/OSTG/</code> artifacts and the old
-          <code>ostg-server.service</code> systemd unit. No-op on a
-          fresh box.</td></tr>
-  <tr><td><b>install_system_dependencies</b></td>
-      <td>apt baseline: <code>python3-pip</code>, build-essential, git,
-          curl, wget, gnupg, lsb-release, sshpass, etc. All apt installs
-          go through <code>_apt_install</code> which appends
-          <code>-o Dpkg::Options::=--force-confdef -o
-          Dpkg::Options::=--force-confold</code> to handle conffile
-          diffs without prompting.</td></tr>
-  <tr><td><b>_install_python_3_10</b></td>
-      <td>Adds deadsnakes PPA on Ubuntu →
-          <code>_apt_install("python3.10 python3.10-venv")</code>.
-          RHEL/Fedora use the distro's Python package directly.</td></tr>
-  <tr><td><b>_bootstrap_pip_for_python310</b></td>
-      <td>Three-step fallback chain to put pip on the new Python:
-          <code>python3.10 -m ensurepip --upgrade --default-pip</code>
-          → distro <code>python3-pip</code> via apt/dnf → final
-          fallback <code>get-pip.py --ignore-installed</code> (the
-          <code>--ignore-installed</code> avoids the "Cannot uninstall
-          packaging 24.0" failure on Debian-managed packages).</td></tr>
-  <tr><td><b>install_python_dependencies</b></td>
-      <td>Python deps from <code>requirements.txt</code> (matches
-          wheel metadata).</td></tr>
-  <tr><td><b>install_docker</b><br><span class="ok">hardened in 0.3.16</span></td>
-      <td>Adds Docker's apt repo with the new
-          <code>_install_apt_keyring</code> helper —
-          <code>curl</code> the gpg key to a tmp file then
-          <code>gpg --batch --no-tty --yes --dearmor</code> to
-          <code>/etc/apt/keyrings/docker.gpg</code>. The
-          <code>--batch --no-tty</code> flags prevent the
-          "<code>gpg: cannot open '/dev/tty'</code>" failure on
-          nohup-detached installs. Then
-          <code>_apt_install("docker-ce docker-ce-cli containerd.io
-          docker-compose-plugin")</code> — the
-          <code>--force-confdef</code> flags handle
-          <code>containerd.io</code>'s <code>config.toml</code>
-          diff (the v0.3.16 fresh-install failure site).</td></tr>
-  <tr><td><b>_install_rdma_userspace</b><br><span class="ok">split in 0.3.16</span></td>
-      <td><b>Two-pass install</b> to handle Mellanox-MOFED-only
-          packages on hosts without the MOFED apt repo:<br/>
-          <b>Pass 1 (CORE, must succeed):</b>
-          <code>_apt_install("perftest rdma-core libibverbs-dev")</code>
-          — these are in Ubuntu main, so they always install on a
-          reachable box. <code>perftest</code> ships ib_send_bw,
-          ib_write_bw, ib_read_bw + their _lat variants.<br/>
-          <b>Pass 2 (MOFED-optional, warns on failure):</b>
-          <code>_apt_install("libmlx5-dev", check=False)</code> —
-          this header only lives in Mellanox's MOFED apt repo. Pre-fix,
-          all 4 packages were lumped together; apt's all-or-nothing
-          batching meant a MOFED-less host got NONE of them, breaking
-          RDMA entirely even though 3 of 4 were available.</td></tr>
-  <tr><td><b>install_dpdk_runtime</b><br><span class="ok">★ default ON</span></td>
-      <td>Runs <code>resources/dpdk/install_dpdk.sh --auto</code> on
-          the target. Installs apt prereqs (build-essential, meson,
-          ninja-build, pkg-config, libnuma-dev, libelf-dev, libpcap-dev,
-          libibverbs-dev), clones DPDK source, configures with meson
-          (<code>-Ddisable_drivers=net/mana</code>), builds with ninja,
-          installs to <code>/usr/local/lib/x86_64-linux-gnu</code>,
-          <code>ldconfig</code>, then compiles <code>tx_worker</code>
-          against the freshly-installed DPDK. The DPDK script ALSO has
-          the same <code>--force-confdef</code> / <code>--force-confold</code>
-          + a separate <code>mlx5_install_cmd</code> with
-          <code>log_warning</code> fallback, mirroring the Python-side
-          two-pass split.</td></tr>
-  <tr><td><b>install_ai_dependencies</b></td>
-      <td>Optional ML/AI helpers for the AI Assistant menu.</td></tr>
-  <tr><td><b>install_ollama</b></td>
-      <td>Local LLM runtime for the AI Assistant.</td></tr>
-  <tr><td><b>install_ostg (wheel install)</b><br><span class="ok">hardened in 0.3.17</span></td>
-      <td><code>pip3 install --force-reinstall --no-deps
-          &lt;wheel&gt;</code> — primary pass. The
-          <code>--force-reinstall</code> is critical for the case where
-          a developer rebuilds the same-version wheel (e.g. shipping a
-          fix without bumping the version): without it pip says
-          "Requirement already satisfied" and silently keeps the old
-          code on disk. <code>--no-deps</code> keeps the reinstall fast.
-          A separate deps-only pass (no <code>--no-deps</code>) handles
-          first-install dependency resolution. Falls back to
-          <code>--ignore-installed</code> if a Debian-managed
-          distutils package blocks uninstall.</td></tr>
-  <tr><td><b>setup_docker_frr</b></td>
-      <td>Builds the FRR sidecar Docker image used by emulated devices,
-          with <code>--network=host</code> so the build can reach
-          Alpine's apk mirrors on networks without a default Docker
-          bridge.</td></tr>
-  <tr><td><b>create_systemd_services</b></td>
-      <td>Drops <code>netgen-server.service</code> into
-          <code>/etc/systemd/system/</code> and enables it.</td></tr>
-  <tr><td><b>start_ostg_services</b></td>
-      <td><code>systemctl start netgen-server</code> + waits for the
-          <code>/api/health</code> endpoint to come up.</td></tr>
-  <tr><td><b>verify_installation</b></td>
-      <td>Sanity checks: pip list, systemctl status, /api/health 200,
-          <code>which perftest</code>, <code>ibv_devices</code>.</td></tr>
-  <tr><td><b>test_frr_functionality</b></td>
-      <td>Smoke-test FRR Docker container can spawn (skipped if Docker
-          is missing).</td></tr>
-</table>
-
-<h3>4a. Helper notes</h3>
-
-<p>Three helpers carry the install's hardening — they're chokepoints
-for every install step that talks to apt or gpg, so a refactor can't
-silently regress to the old behavior. Each is pinned by tests under
-<code>tests/test_apt_noninteractive.py</code>,
-<code>tests/test_apt_keyring_helper.py</code>,
-<code>tests/test_dpkg_heal_preflight.py</code>,
-<code>tests/test_rdma_install_split.py</code>,
-<code>tests/test_pip_force_reinstall.py</code>:</p>
-
-<ul>
-  <li><b><code>_apt_install(packages, check=True, extra_opts="")</code></b>
-      — wraps every <code>apt-get install -y</code> with
-      <code>-o Dpkg::Options::=--force-confdef
-            -o Dpkg::Options::=--force-confold</code>.
-      Without these flags, conffile prompts from packages like
-      <code>containerd.io</code> EOF the nohup-detached install. Use
-      <code>check=False</code> for MOFED-optional packages.</li>
-  <li><b><code>_install_apt_keyring(name, key_url)</code></b> —
-      <code>curl</code> the gpg key to a tmp file, then
-      <code>gpg --batch --no-tty --yes --dearmor</code> to
-      <code>/etc/apt/keyrings/&lt;name&gt;.gpg</code>. The
-      <code>--batch --no-tty</code> avoids the
-      <code>cannot open '/dev/tty'</code> failure modern GnuPG 2.x
-      triggers in detached sessions.</li>
-  <li><b><code>_heal_dpkg_state()</code></b> — pre-flight that recovers
-      from prior failed installs (half-installed Docker stack,
-      pending conffile resolution). Removes the operator-must-SSH-in
-      manual recovery step entirely.</li>
-</ul>
-
-<h2>5. CLI flags</h2>
-
-<table>
-  <tr><th>Flag</th><th>Effect</th></tr>
-  <tr><td><code>-H, --host</code></td>
-      <td>Remote host to install on. Omit for local install (must run as
-          root).</td></tr>
-  <tr><td><code>-u, --user</code></td><td>Remote user (default: <code>root</code>).</td></tr>
-  <tr><td><code>-p, --password</code></td><td>Remote password (required when
-          <code>-H</code> is given).</td></tr>
-  <tr><td><code>--no-dpdk</code></td>
-      <td>Skip the DPDK runtime install step entirely. Pass this on hosts
-          that won't generate traffic — devbox-only installs, hosts with no
-          DPDK-capable NIC.</td></tr>
-  <tr><td><code>--skip-dpdk-build</code></td>
-      <td>Install DPDK apt prerequisites only — don't compile DPDK or
-          tx_worker. Useful when DPDK is already installed system-wide and
-          you just want netgen-server's apt deps in place. The tx_worker
-          binary won't be built; you can build it later from the
-          <code>/admin</code> portal.</td></tr>
-</table>
-
-<p class="muted">Defaults preserve "install DPDK" behavior — no flag needed
-for normal use.</p>
-
-<h2>6. Tolerant of failures</h2>
-
-<p>If the DPDK build fails (kernel-header / libibverbs version mismatch,
-flaky apt mirror, NIC vendor lib missing), the rest of the install
-<i>continues</i>. You'll see in the log:</p>
-
-<pre>WARNING: DPDK install exited rc=N. Continuing — netgen-server will
-         start fine without DPDK; streams that need it will fall back
-         to the Scapy/kernel path.
-WARNING: Diagnose with: ssh root@&lt;host&gt; 'tail -200 /var/log/netgen-install-dpdk.log'
-WARNING: Or retry from the /admin portal once netgen-server is up.</pre>
-
-<p>Even worst-case, you get a working netgen-server with two clear DPDK
-recovery paths:</p>
-<ol>
-  <li>Read the log on the target: <code>tail -f /var/log/netgen-install-dpdk.log</code></li>
-  <li>Open <code>http://&lt;server&gt;:5050/admin</code> → Card "DPDK Runtime"
-      → click <b>Install DPDK</b>. Same script, retried interactively.</li>
-</ol>
-
-<h2>7. Sanity-check after install</h2>
-
-<pre>ssh root@&lt;server&gt; 'systemctl is-active netgen-server'      # active
-ssh root@&lt;server&gt; 'curl -s http://localhost:5050/api/health' # 200 OK
-ssh root@&lt;server&gt; 'ls -la /opt/netgen/resources/dpdk/tx_worker/build/tx_worker'
-                                                            # tx_worker binary present
-ssh root@&lt;server&gt; 'pkg-config --modversion libdpdk'         # e.g. 23.11.0</pre>
-
-<p>Then open <code>http://&lt;server&gt;:5050/admin</code> in a browser to
-confirm the runtime cards (DPDK Runtime, Hugepages, Network Interfaces)
-all show green.</p>
-
-<h2>8. What lives where on the target</h2>
-
-<p class="muted">v0.5.0+ tarball install paths shown first. Legacy
-v0.4.x system-pip paths in the second table for hosts that
-haven't been migrated yet — those resolve via the
-<code>/opt/OSTG</code> + <code>/opt/netgen</code> compat symlinks
-when both layouts coexist.</p>
-
-<h3>v0.5.0+ tarball install (current)</h3>
-
-<table>
-  <tr><th>Path</th><th>Contents</th></tr>
-  <tr><td><code>/opt/netgen-server/</code></td>
-      <td><b>Install root.</b> Everything below is under here.</td></tr>
-  <tr><td><code>/opt/netgen-server/python-runtime/</code></td>
-      <td>Bundled CPython 3.10.14 (no system Python touched).</td></tr>
-  <tr><td><code>/opt/netgen-server/netgen-venv/bin/ostg-server</code></td>
-      <td>The Flask server entry point. <b>systemd ExecStart target.</b></td></tr>
-  <tr><td><code>/opt/netgen-server/netgen-venv/bin/{ostg-client,
-          netgen-cli,ostg-docker-install,pip,...}</code></td>
-      <td>Other entry-point scripts pip dropped in the venv. All
-          shebangs rewritten to <code>/opt/netgen-server/netgen-venv/
-          bin/python</code> (v0.5.12).</td></tr>
-  <tr><td><code>/opt/netgen-server/netgen-venv/lib/python3.10/
-          site-packages/</code></td>
-      <td>Server-side Python modules (run_tgen_server,
-          utils/, traffic_client/, server/, widgets/, ostg/) +
-          every dep (Flask, Scapy, PyQt5, paramiko, docker, pandas,
-          numpy, scipy, sklearn, cryptography, pydantic, openai, …).</td></tr>
-  <tr><td><code>/opt/netgen-server/share/netgen/resources/dpdk/</code></td>
-      <td>DPDK helper scripts + <code>tx_worker/</code> source.
-          v0.5.10 moved this under <code>resources/</code> to match
-          the runtime's expected layout.</td></tr>
-  <tr><td><code>/opt/netgen-server/share/netgen/resources/dpdk/
-          tx_worker/build/tx_worker</code></td>
-      <td>Compiled multi-queue tx_worker binary (built lazily by
-          <code>install_dpdk.sh</code> on first DPDK use).</td></tr>
-  <tr><td><code>/opt/netgen-server/share/netgen/ostg_docker/</code></td>
-      <td>FRR Dockerfile + sibling files
-          (<code>frr.conf.template</code>, <code>start-frr.sh</code>).
-          Used as the Docker build context.</td></tr>
-  <tr><td><code>/opt/netgen-server/bin/netgen-{install,upgrade,uninstall}</code></td>
-      <td>Operator-facing wrappers. Same scripts symlinked into
-          <code>/usr/local/bin/</code> for PATH access.</td></tr>
-  <tr><td><code>/opt/netgen-server/database.db</code><br>
-          <code>/opt/netgen-server/.netgen_ai_server_settings.env</code></td>
-      <td>Device DB + AI keys. Resolved via
-          <code>/opt/netgen → /opt/netgen-server</code> compat
-          symlink. Created lazily by the runtime on first write.</td></tr>
-  <tr><td><code>/opt/OSTG</code> (symlink) →
-          <code>/opt/netgen-server/share/netgen</code></td>
-      <td>Compat for legacy runtime hardcodes like
-          <code>/opt/OSTG/resources/dpdk/dpdk_bind.sh</code>. Created
-          by netgen-install only if <code>/opt/OSTG</code> doesn't
-          already exist as a real directory.</td></tr>
-  <tr><td><code>/opt/netgen</code> (symlink) →
-          <code>/opt/netgen-server</code></td>
-      <td>Compat for the default DB + AI settings paths. Same
-          idempotency rule as <code>/opt/OSTG</code>.</td></tr>
-  <tr><td><code>/etc/systemd/system/netgen-server.service</code></td>
-      <td>Systemd unit. Type=simple, Restart=on-failure,
-          AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN. Pre-existing
-          unit backed up to <code>.service.bak</code>.</td></tr>
-  <tr><td><code>/var/log/netgen-install.log</code><br>
-          <code>/var/log/netgen-upgrade.log</code><br>
-          <code>/var/log/netgen-auto-install.log</code></td>
-      <td>Install / upgrade / DPDK aux installer logs. Tail any of
-          these if something went sideways.</td></tr>
-  <tr><td>Docker: <code>netgen-frr:latest</code> +
-          <code>ostg-frr:latest</code></td>
-      <td>Built locally from
-          <code>share/netgen/ostg_docker/Dockerfile.frr</code>
-          (Alpine + FRR + dnsmasq + dhclient). Dual-tagged so
-          both new and legacy code paths resolve it.</td></tr>
-</table>
-
-<h3>v0.4.x legacy paths (still active on un-migrated hosts)</h3>
-
-<table>
-  <tr><th>Path</th><th>Contents</th></tr>
-  <tr><td><code>/opt/OSTG/</code> (real directory)</td>
-      <td>Legacy install root. Contains
-          <code>resources/dpdk/</code> +
-          <code>device_database.db</code> +
-          <code>.ostg_ai_server_settings.env</code>. On a host
-          where this still exists as a real dir, the v0.5.x
-          compat symlink is skipped (warned).</td></tr>
-  <tr><td><code>/usr/local/lib/python3.{10,11,12,13}/dist-packages/
-          run_tgen_server.py</code></td>
-      <td>The Flask server, installed by
-          <code>install_ostg_complete.py</code>'s
-          <code>pip install</code>. Lives under whichever Python
-          minor the legacy installer picked.</td></tr>
-  <tr><td><code>/etc/systemd/system/ostg-server.service</code></td>
-      <td>Legacy systemd unit. <b>If active, it blocks the v0.5.x
-          netgen-server.service from binding port 5050</b> —
-          v0.5.11+ install log's
-          <code>_verify_running()</code> diagnostic dump surfaces
-          this with the exact <code>systemctl disable --now</code>
-          command.</td></tr>
-</table>
-
-<h2>9. Reinstall / upgrade</h2>
-
-<p>Four paths, fastest to heaviest:</p>
-
-<table>
-  <tr><th>Method</th><th>Time</th><th>When to use</th></tr>
-  <tr><td><b>Help → Install / Upgrade Server → Upgrade tab</b><br>
-          <span class="muted">(NEW in 0.2.6)</span></td>
-      <td>30–60 s</td>
-      <td>Just rolling a new wheel onto a running server. No SSH, no
-          re-running the full provisioning flow. See section&nbsp;1
-          above.</td></tr>
-  <tr><td><b>Manual SSH one-liner</b> ★</td>
-      <td>~30 s</td>
-      <td>The Upgrade tab is broken or unreachable
-          (firewall, proxy, server version with the latent
-          <code>NameError</code> bug); scripted CI/CD pipelines that
-          want explicit control over each step.</td></tr>
-  <tr><td><b>Step-by-step on the box</b></td>
-      <td>~1 min</td>
-      <td>Production lab box where you want to see each step's output
-          before proceeding — confirm version before, verify after,
-          have a clean rollback path ready.</td></tr>
-  <tr><td><b><code>install_ostg_complete.py</code> rerun</b></td>
-      <td>5–10 min</td>
-      <td>Full re-provision (idempotent — <code>cleanup_old_install</code>
-          wipes legacy artifacts). Use when you've also changed DPDK
-          config, systemd unit, or the FRR Docker image.</td></tr>
-</table>
-
-<h3>9a. Manual SSH one-liner</h3>
-
-<p>One terminal, two commands:</p>
-
-<pre>scp ~/Downloads/ostg_trafficgen-&lt;v&gt;-py3-none-any.whl root@&lt;host&gt;:/tmp/
-ssh root@&lt;host&gt; 'pip3 install --upgrade --force-reinstall --no-deps \
-  /tmp/ostg_trafficgen-&lt;v&gt;-py3-none-any.whl \
-  &amp;&amp; systemctl restart netgen-server \
-  &amp;&amp; sleep 2 \
-  &amp;&amp; curl -fsS http://127.0.0.1:5050/api/health &amp;&amp; echo'</pre>
-
-<p>What each piece does:</p>
-<ul>
-  <li><code>scp</code> — copies the wheel to <code>/tmp/</code> on the
-      target.</li>
-  <li><code>pip3 install --upgrade --force-reinstall --no-deps</code>
-      — installs the new wheel using the system Python (matches what
-      the server runs under). <code>--no-deps</code> skips
-      re-resolving / re-installing dependencies (faster + safer:
-      your existing deps are already correct).</li>
-  <li><code>systemctl restart netgen-server</code> — bounces the
-      running process so it loads the new code in memory.
-      <b>Critical:</b> without this, pip-installing the new wheel
-      only updates files on disk; the live process keeps running
-      the OLD code until restart.</li>
-  <li><code>curl /api/health</code> — confirms the new instance came
-      back up.</li>
-</ul>
-
-<h3>9b. Step-by-step on the box</h3>
-
-<p>SSH in first, then run each step interactively so you can see
-what's happening:</p>
-
-<pre>ssh root@&lt;host&gt;</pre>
-
-<pre><span style="color:#6b7280;"># 1. Confirm current version</span>
-pip3 show ostg-trafficgen | head -2
-<span style="color:#6b7280"># Name: ostg-trafficgen
-# Version: 0.2.9        ← what's installed now</span>
-
-<span style="color:#6b7280"># 2. Fetch the new wheel from GitHub releases (or scp from laptop)</span>
-wget -O /tmp/ostg_trafficgen-0.2.11-py3-none-any.whl \
-  https://github.com/amishagrawal2001-arch/netgen/releases/download/v0.2.11/ostg_trafficgen-0.2.11-py3-none-any.whl
-
-<span style="color:#6b7280"># 3. Confirm the wheel is valid + peek at its metadata</span>
-ls -la /tmp/ostg_trafficgen-*.whl
-unzip -p /tmp/ostg_trafficgen-*.whl '*/METADATA' | head -10
-
-<span style="color:#6b7280"># 4. Upgrade</span>
-pip3 install --upgrade --force-reinstall --no-deps \
-  /tmp/ostg_trafficgen-0.2.11-py3-none-any.whl
-
-<span style="color:#6b7280"># 5. Verify pip sees the new version</span>
-pip3 show ostg-trafficgen | head -2
-<span style="color:#6b7280"># Version: 0.2.11       ← upgraded ✓</span>
-
-<span style="color:#6b7280"># 6. Restart so the running process loads the new code</span>
-systemctl restart netgen-server
-
-<span style="color:#6b7280"># 7. Confirm the new instance is healthy</span>
-systemctl status netgen-server --no-pager | head -7
-curl -fsS http://127.0.0.1:5050/api/health</pre>
-
-<p>The critical step is <b>#6</b> — <code>pip3 install</code> alone
-leaves the running server unchanged. Skipping the restart was a real
-footgun until 0.2.8 added auto-restart to
-<code>install_ostg_complete.py</code>.</p>
-
-<h3>9c. Rollback</h3>
-
-<p>Wheels stick around forever (in <code>~/Downloads/</code> on your
-laptop and on GitHub Releases). Rollback is always one
-<code>pip install</code> away:</p>
-
-<pre>ssh root@&lt;host&gt; 'pip3 install --upgrade --force-reinstall --no-deps \
-  /tmp/ostg_trafficgen-&lt;previous-version&gt;-py3-none-any.whl \
-  &amp;&amp; systemctl restart netgen-server'</pre>
-
-<p>Tip: keep the last two or three wheels in
-<code>/tmp/</code> on the target box — they're tiny (~1.4 MB each)
-and instant to install when you need to bisect a regression.</p>
-
-<h3>9d. Full re-provision (rare)</h3>
-
-<pre><span style="color:#6b7280"># Bump pyproject.toml version locally, then:</span>
-python3 -m build --wheel
-python3 install_ostg_complete.py -H &lt;host&gt; -p &lt;password&gt;</pre>
-
-<p class="muted">For a quick redeploy without re-running the entire
-flow, the file-by-file <code>scp</code> +
-<code>systemctl restart netgen-server</code> pattern still works
-during development.</p>
-
-<h3>9e. When the Upgrade tab is broken</h3>
-
-<p>The Upgrade tab calls <code>/api/admin/upgrade_wheel</code> on the
-server. If that endpoint is broken (e.g. the
-<code>NameError: name 'sys' is not defined</code> bug latent in
-0.2.6 → 0.2.10), the dialog can't fix itself — chicken and egg.
-Recovery paths:</p>
-
-<ul>
-  <li><b>Manual SSH one-liner (9a)</b> — bypasses the broken endpoint
-      entirely; uses pip directly on the target.</li>
-  <li><b>Fresh Install via SSH tab</b> — also bypasses the broken
-      endpoint. Uses <code>install_ostg_complete.py</code> end-to-end
-      via paramiko/sftp. The auto-restart in
-      <code>start_ostg_services</code> (0.2.8+) handles the
-      "running process needs to bounce" step.</li>
-  <li><b>Once on 0.2.11+, the Upgrade tab works again</b> — the
-      <code>sys</code> import is fixed. Subsequent upgrades can use
-      Tab 1 cleanly.</li>
-</ul>
-
-<h2>10. RDMA / perftest setup <span class="ok">NEW in 0.3.12</span> <span class="ok">parser fixes 0.3.13</span></h2>
-
-<p class="muted"><b>Status check after install:</b> open
-<code>Tools → RDMA → RDMA Devices…</code>. v0.3.13+ shows the real
-<b>perftest version</b> (e.g. <code>perftest 24.04.0-0.41 present</code>
-on Ubuntu 24.04 + MOFED) and the real <b>per-port MTU</b> in bytes
-(e.g. 1024, 4096). Pre-v0.3.13 showed <code>perftest installed (?)</code>
-and <code>MTU: 0 B</code> due to parser bugs in
-<code>utils/rdma_perf.py</code> — upgrade the wheel to see correct
-values without changing any install state.</p>
-
-<p>RDMA traffic generation (<code>Tools → RDMA → Blast a RDMA Flow…</code>
-+ per-stream <code>Engine: RDMA (perftest)</code>) shells out to the
-<b>perftest</b> suite (<code>ib_send_bw</code>, <code>ib_write_bw</code>,
-<code>ib_read_bw</code>, and the <code>_lat</code> variants). On fresh
-installs from 0.3.12+, perftest is <b>auto-installed</b> on both code
-paths:</p>
-
-<table>
-  <tr><th>Install path</th><th>Where perftest comes from</th></tr>
-  <tr><td><code>install_ostg_complete.py</code> (CLI, in-GUI SSH installer)</td>
-      <td><code>_install_rdma_userspace()</code> runs as part of
-          <code>install_system_dependencies</code> — installs
-          <code>perftest rdma-core libibverbs-dev libmlx5-dev</code>
-          (apt; analogous packages on dnf/yum/apk/zypper). Runs on
-          <i>every</i> install, including <code>--no-dpdk</code>.</td></tr>
-  <tr><td><code>install_dpdk.sh --auto</code> (called by the
-          <code>install_dpdk_runtime</code> step or the
-          <b>Tools → DPDK → Install DPDK</b> admin action)</td>
-      <td>Apt prereqs list includes <code>perftest</code> alongside
-          <code>libibverbs-dev libmlx5-dev rdma-core</code> — so any
-          DPDK install lands RDMA capability too.</td></tr>
-</table>
-
-<p>Either path leaves <code>ib_send_bw</code> on PATH. The installer
-runs <code>which ib_send_bw</code> after the package install and
-warns explicitly if it didn't land — surfaces the gap before the
-operator opens Tools → RDMA and gets a "perftest not installed"
-error.</p>
-
-<h3>10·m. Manual install (if the auto-install was skipped)</h3>
-
-<p>Pre-0.3.12 installs, or hosts where the auto-install warning fired
-because the distro's package mirror was missing perftest at the time:</p>
-
-<pre># Debian / Ubuntu
-apt install perftest rdma-core
-
-# RHEL 9+ / Fedora / Rocky 9+ — perftest in main repo
-dnf install perftest rdma-core
-
-# RHEL 7 / 8 / CentOS — perftest from EPEL
-yum install -y epel-release &amp;&amp; yum install -y perftest rdma-core
-
-# Alpine
-apk add perftest rdma-core
-
-# openSUSE
-zypper install -y perftest rdma-core</pre>
-
-<p class="muted">On hosts where DPDK is already installed, the
-<code>rdma-core</code> + <code>libibverbs-dev</code> +
-<code>libmlx5-dev</code> packages are typically already present (pulled
-in by DPDK's mlx5 PMD prereqs), so a manual install only needs
-<code>perftest</code> on top.</p>
-
-<h3>10a. Sanity-check after install</h3>
-
-<pre># perftest binaries on PATH?
-ssh root@&lt;server&gt; 'which ib_send_bw ib_write_bw ib_read_bw'
-# → /usr/bin/ib_send_bw, ...
-
-# What does the kernel see in /sys/class/infiniband?
-ssh root@&lt;server&gt; 'ls -1 /sys/class/infiniband/'
-# → mlx5_0   (or similar — empty list means no RDMA support loaded)
-
-# Per-port state + link layer + GIDs
-ssh root@&lt;server&gt; 'for d in /sys/class/infiniband/*/ports/*; do
-  echo "$d  state=$(cat $d/state)  link=$(cat $d/link_layer)
-        rate=$(cat $d/rate)  mtu=$(cat $d/active_mtu)"; done'</pre>
-
-<p>In the GUI, the same probes are surfaced under
-<code>Tools → RDMA → RDMA Devices…</code> — picks up the device list +
-checks perftest install state in one click per selected TG.</p>
-
-<h3>10b. RoCEv2 vs InfiniBand link layer</h3>
-
-<table>
-  <tr><th><code>link_layer</code></th><th>Means</th><th>Operator action</th></tr>
-  <tr><td><code>Ethernet</code></td>
-      <td><b>RoCEv2</b> — RDMA over IPv4/IPv6 UDP. Most common in
-          modern data centres.</td>
-      <td>Configure an IPv4 (or IPv6) address on the RDMA NIC. Confirm
-          the peer TG is reachable via plain <code>ping</code>. perftest
-          uses GID index 3 by default for RoCEv2-IPv4 on Mellanox.</td></tr>
-  <tr><td><code>InfiniBand</code></td>
-      <td><b>Native IB</b> — uses LID-based routing on an IB fabric.
-          Subnet manager (OpenSM) must be running somewhere on the
-          fabric.</td>
-      <td>No IP needed; pass the peer's LID instead of an IP. perftest
-          uses GID index 0 by default for native IB.</td></tr>
-</table>
-
-<h3>10c. Common install gotchas</h3>
-
-<ul>
-  <li><b><code>perftest</code> not found</b> after apt install →
-      the package landed but the binaries are under
-      <code>/usr/local/bin</code> or similar; rerun the install
-      with the distro's official package source, not a custom
-      build.</li>
-  <li><b><code>/sys/class/infiniband/</code> empty</b> on a host that
-      has an RDMA NIC → kernel modules not loaded. Run
-      <code>modprobe mlx5_ib ib_uverbs rdma_cm rdma_ucm</code> (Mellanox)
-      or <code>modprobe irdma ib_uverbs rdma_cm</code> (Intel).
-      Persist via <code>/etc/modules-load.d/rdma.conf</code>.</li>
-  <li><b>Containerised TG (Docker)</b> → mount
-      <code>/sys/class/infiniband</code> and
-      <code>/dev/infiniband</code> into the container with
-      <code>--device</code> and <code>-v</code>; without them the GUI
-      reports "no RDMA devices" even on hosts where the HCA works
-      fine outside the container.</li>
-  <li><b>Latency tests need root</b> on some HCAs that gate
-      <code>IBV_QPT_UD</code> / hardware timestamps. If <code>ib_send_lat</code>
-      runs cleanly from the shell but the per-stream engine returns
-      "perftest exited rc=1", make sure netgen-server is running as
-      root (which it is by default via the systemd unit).</li>
-</ul>
-
-<h2>11. v0.5.x troubleshooting recipes <span class="ok">★ from the v0.5.6 → v0.5.13 cascade</span></h2>
-
-<p>These are SSH one-liners for the install failure modes operators
-hit during the v0.5.x cascade. All have been fixed in v0.5.13+, but
-documented here for hosts mid-upgrade or for diagnosing what the
-fix actually does.</p>
-
-<h3>11a. Server not responding on /api/health</h3>
-
-<p>v0.5.11+ install log already dumps the diagnostic. If you missed
-it, reproduce manually:</p>
-
-<pre>ssh root&#x40;&lt;host&gt; '
-  journalctl -u netgen-server.service -n 30 --no-pager
-  ss -tlnp sport = :5050
-  systemctl is-active ostg-server.service
-'</pre>
-
-<p>If <code>ostg-server.service</code> is <b>active</b>, it's holding
-:5050 from the v0.4.x install. Disable it:</p>
-
-<pre>ssh root&#x40;&lt;host&gt; '
-  systemctl disable --now ostg-server.service
-  systemctl restart netgen-server.service
-  sleep 5; curl -s http://localhost:5050/api/health
-'</pre>
-
-<h3>11b. ostg-server: No such file or directory (exit 203/EXEC)</h3>
-
-<p>Pre-v0.5.12: entry-point shebangs in
-<code>netgen-venv/bin/</code> pointed at the CI runner's absolute
-path. Manually rewrite without re-downloading:</p>
-
-<pre>ssh root&#x40;&lt;host&gt; '
-  for f in /opt/netgen-server/netgen-venv/bin/{ostg-server,ostg-client,netgen-cli,ostg-docker-install}; do
-    [ -f "$f" ] && sed -i "1s|.*|#!/opt/netgen-server/netgen-venv/bin/python|" "$f"
-  done
-  systemctl restart netgen-server.service
-  sleep 5; curl -s http://localhost:5050/api/health
-'</pre>
-
-<h3>11c. tar: file is N seconds in the future / installer exit rc=3</h3>
-
-<p>Pre-v0.5.9: tarball mtimes matched the CI runner's clock. Hosts
-with NTP drift rejected the files. Either fix the host clock or
-extract with <code>--warning=no-timestamp</code>:</p>
-
-<pre>ssh root&#x40;&lt;host&gt; '
-  timedatectl set-ntp true
-  systemctl restart systemd-timesyncd
-  sleep 8; date -u
-'</pre>
-
-<p>Or if NTP isn't reachable:</p>
-
-<pre>ssh root&#x40;&lt;host&gt; "
-  cd /tmp/netgen_install
-  sudo rm -rf /opt/netgen-server.new /opt/netgen-server
-  sudo mkdir -p /opt/netgen-server
-  sudo tar --warning=no-timestamp --strip-components=1 \
-    -xzf netgen-server-*-linux-x86_64.tar.gz -C /opt/netgen-server
-  sudo /opt/netgen-server/bin/netgen-install
-"</pre>
-
-<h3>11d. Wheel upgrade fails with "externally-managed-environment"</h3>
-
-<p>v0.4.x server on Ubuntu 24.04 Noble (or Debian 12 Bookworm). The
-v0.5.6 server fixes the
-<code>/api/admin/upgrade_wheel</code> endpoint to detect
-<code>/usr/lib/python3*/EXTERNALLY-MANAGED</code> and pass
-<code>--break-system-packages</code> automatically. Manual unstick:</p>
-
-<pre>ssh root&#x40;&lt;host&gt; 'pip3 install --break-system-packages \
-  --force-reinstall /tmp/netgen_upgrade/ostg_trafficgen-*.whl
-  systemctl restart netgen-server'</pre>
-
-<p>After this, install v0.5.6+ and future wheel upgrades work
-through the GUI's Upgrade tab without manual intervention.</p>
-
-<h3>11e. Compat warnings on the install log</h3>
-
-<p>If <code>/opt/OSTG</code> or <code>/opt/netgen</code> exist as
-real directories (typical on hosts with a v0.4.x install), the
-v0.5.13 compat-symlink step warns and skips. Your install still
-works because runtime resolution falls through to the legacy paths.
-To consolidate everything under <code>/opt/netgen-server</code>:</p>
-
-<pre>ssh root&#x40;&lt;host&gt; "
-  # Migrate device DB to the new install root (if not already there)
-  [ -f /opt/OSTG/device_database.db ] &amp;&amp; [ ! -f /opt/netgen-server/database.db ] \
-    &amp;&amp; cp /opt/OSTG/device_database.db /opt/netgen-server/database.db
-  # AI settings if any
-  [ -f /opt/OSTG/.ostg_ai_server_settings.env ] &amp;&amp; [ ! -f /opt/netgen-server/.netgen_ai_server_settings.env ] \
-    &amp;&amp; cp /opt/OSTG/.ostg_ai_server_settings.env /opt/netgen-server/.netgen_ai_server_settings.env
-  # Replace real dirs with compat symlinks
-  rm -rf /opt/OSTG /opt/netgen
-  ln -s /opt/netgen-server/share/netgen /opt/OSTG
-  ln -s /opt/netgen-server /opt/netgen
-  systemctl restart netgen-server.service
-"</pre>
-
-<h3>11f. FRR Docker build fails: "frr.conf.template: not found"</h3>
-
-<p>Pre-v0.5.11 only. The Docker build context was
-<code>share/netgen/</code> but the sibling files live in
-<code>share/netgen/ostg_docker/</code>. v0.5.11+ uses
-<code>ostg_docker/</code> as both <code>-f</code> source and
-context. If your install hit this on a pre-v0.5.11 tarball:</p>
-
-<pre>ssh root&#x40;&lt;host&gt; '
-  cd /opt/netgen-server/share/netgen/ostg_docker
-  docker build -f Dockerfile.frr -t netgen-frr:latest .
-  docker tag netgen-frr:latest ostg-frr:latest
-  systemctl restart netgen-server.service
-'</pre>
 """
 
 

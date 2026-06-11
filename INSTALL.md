@@ -1,508 +1,193 @@
 # Netgen Install Guide
 
-Two install methods, six deployment scenarios.
+## Quickstart — 3 commands
 
-## Option A — Pre-built installer (fastest)
+Linux NIC host (server) — fresh install via tarball:
 
-Download from the latest **[GitHub release](https://github.com/amishagrawal2001-arch/netgen/releases/latest)**.
-Every tagged release ships four artifacts built by CI:
-
-| File | Use for |
-|------|---------|
-| `Netgen-Client-<v>-windows.exe`           | Windows client, no Python install needed |
-| `Netgen-TrafficGenerator-<v>.dmg`         | macOS client, drag-to-Applications |
-| `Netgen-Client-<v>-linux-x86_64.AppImage` | Linux client, single-file, works on any modern distro |
-| `ostg_trafficgen-<v>-py3-none-any.whl`    | Universal wheel — for the server install + scripted client installs |
-
-### Quick install per platform (Option A)
-
-**Windows**:  download the `.exe` → double-click → done. The bundled
-Python + PyQt5 + all deps make it a single-file install.
-
-**macOS**:  download the `.dmg` → mount → drag **Netgen Client.app**
-to `Applications` → launch from Spotlight or Launchpad.
-
-**Linux** (any modern distro):
-```bash
-chmod +x Netgen-Client-*-linux-x86_64.AppImage
-./Netgen-Client-*-linux-x86_64.AppImage -s http://lab-box:5050
-```
-
-**Server** (Linux box that owns the NICs):
-
-The server install needs **two files** on the operator's machine — the
-wheel and `install_ostg_complete.py` (the OS-level orchestrator that
-installs Docker, Python 3.10, perftest, rdma-core, DPDK build deps, and
-the systemd unit). The wheel by itself is not enough: `pip install` will
-succeed but `ostg-server` won't start because Docker, perftest, DPDK,
-and Python 3.10 aren't there yet, and the wheel has no way to install
-them.
-
-Recommended (no git clone — two release-asset downloads):
 ```bash
 VER=$(curl -s https://api.github.com/repos/amishagrawal2001-arch/netgen/releases/latest \
        | grep -oP '"tag_name": "v\K[^"]+')
-BASE=https://github.com/amishagrawal2001-arch/netgen/releases/latest/download
-wget $BASE/ostg_trafficgen-${VER}-py3-none-any.whl
-wget $BASE/install_ostg_complete.py            # ships as a release asset alongside the wheel
-sudo python3 install_ostg_complete.py --wheel ostg_trafficgen-${VER}-py3-none-any.whl
+wget https://github.com/amishagrawal2001-arch/netgen/releases/latest/download/netgen-server-${VER}.tar.gz
+sudo mkdir -p /opt/netgen-server && \
+  sudo tar -xzf netgen-server-*.tar.gz -C /opt/netgen-server --strip-components=1 && \
+  sudo /opt/netgen-server/bin/netgen-install
 ```
 
-Alternative (clone the repo to grab the installer):
+Verify the server came up:
+
 ```bash
-git clone --depth 1 https://github.com/amishagrawal2001-arch/netgen.git
-cd netgen
-wget https://github.com/amishagrawal2001-arch/netgen/releases/latest/download/ostg_trafficgen-VERSION-py3-none-any.whl
-sudo python3 install_ostg_complete.py --wheel ostg_trafficgen-VERSION-py3-none-any.whl
+systemctl status netgen-server
+curl -s http://localhost:5050/api/admin/health | jq .health   # "healthy"
 ```
 
-Easiest of all: use the in-GUI Fresh Install dialog from the client
-(`.dmg` / `.exe` / AppImage) — both files are bundled inside the app,
-the dialog auto-discovers them, SFTPs them to the target, and streams
-the install log. See **Option A → Quick install per platform** above.
+Then browse to `http://<server>:5050/admin` and run **Tools → DPDK → Make DPDK Ready** to allocate hugepages, load vfio, build `tx_worker`, and (if needed) flip the IOMMU GRUB cmdline. Reboot if prompted.
 
-For finer control or to customize before shipping, see Option B below.
+That's it for the server. Client install below.
 
 ---
-
-## Option B — Build from source (full control)
-
-Pick the row that matches your deployment and follow the linked steps.
-
-## Quick chooser
-
-| # | Profile | Server runs on | Client runs on | Status |
-|---|---------|----------------|----------------|--------|
-| 1 | **Turnkey** | Linux         | Linux (same host) | ✅ Full — `install_turnkey.sh` |
-| 2 | **Turnkey** | macOS         | macOS (same host) | ⚠️ Limited — Docker Desktop, scapy fallback, no DPDK / VRF |
-| 3 | **Turnkey** | WSL2 Linux    | Windows (same host) | ⚠️ Hybrid — server lives inside WSL2 |
-| 4 | **Split**   | Linux server  | Linux laptop      | ✅ Full — `install_ostg_complete.py` + `install_client.sh` |
-| 5 | **Split**   | Linux server  | macOS laptop      | ✅ Full — `install_ostg_complete.py` + `install_client.sh` |
-| 6 | **Split**   | Linux server  | Windows laptop    | ✅ Full — `install_ostg_complete.py` + `install_client.ps1` / `install_client.bat` |
-
-**The server is fundamentally a Linux workload.** It depends on:
-- Per-device Linux VRFs (kernel feature)
-- DPDK (Linux kernel modules + hugepages + Mellanox/Intel drivers)
-- `iproute2` for VLAN subinterfaces and VXLAN tunnels
-- systemd for service management
-- FRR Docker containers (works on Docker Desktop too, but cross-platform is slower)
-
-The **client** is plain Python + PyQt5 and runs everywhere.
 
 ## Prerequisites
 
 | Component | Minimum |
 |---|---|
-| Python (server) | 3.10 (matches Ubuntu 22.04 default) |
-| Python (client) | 3.9 |
-| OS (server, native) | Ubuntu 22.04 / Debian 12 / RHEL 9 / Rocky 9 / Fedora 38+ |
-| OS (server, Docker Desktop fallback) | macOS 12+ or Windows 10 / 11 with WSL2 |
-| Disk | 4 GB (server with FRR image + DPDK) / 500 MB (client) |
-| RAM | 4 GB minimum / 8 GB recommended |
-| Network | Outbound HTTPS to PyPI for dependency install |
+| Server OS | Ubuntu 22.04 / 24.04 (others work but unsupported) |
+| Server disk | 4 GB |
+| Server RAM | 4 GB (8 GB recommended) |
+| Server NIC | Anything with a DPDK PMD; Mellanox / Broadcom / AMD bifurcate (no bind); Intel needs vfio bind |
+| Client OS | macOS 12+ / Windows 10+ / any modern Linux |
+| Network | Outbound HTTPS for apt + DPDK source download (only during DPDK install) |
+
+The tarball ships a bundled Python 3.10 venv with the wheel pre-installed. **No system pip, no PEP 668, no apt deps for Python.** The only system tools needed at install time are `bash`, `tar`, and (optionally) `docker` for the FRR / DHCP features.
 
 ---
 
-## 1. Turnkey Linux (server + GUI on one Linux host)
+## Step 2: DPDK readiness (one click)
 
-```bash
-git clone https://github.com/amishagrawal2001-arch/netgen.git
-cd netgen
-./rebuild_quick.sh                  # build the wheel
-sudo ./install_turnkey.sh           # full install + desktop launcher
-```
+After the tarball install, the DPDK Runtime tile in the admin console will be red on a fresh box. Click **Tools → DPDK → Make DPDK Ready**. The wizard:
 
-`install_turnkey.sh` runs `install_ostg_complete.py` (Python venv,
-Docker, FRR image, DPDK, systemd unit) and then drops an XDG desktop
-entry for `ostg-client` pointed at `localhost:5050`.
+1. apt-installs DPDK build deps (`meson`, `ninja`, `pyelftools`, `libnuma-dev`, …)
+2. Builds DPDK 23.11 from source against your kernel
+3. Loads `vfio` + `vfio_pci` (persists in `/etc/modules-load.d/`)
+4. Allocates 2 MiB hugepages (persists in `/etc/fstab` + sysctl)
+5. Builds `tx_worker` + installs to `/usr/local/bin/tx_worker`
+6. Configures IOMMU GRUB cmdline if missing → prompts reboot
 
-After install:
-- Server: `systemctl status netgen-server`
-- GUI: Applications menu → Network → Netgen Client (or `ostg-client`)
+Wait for green tiles. Total time on a fresh Ubuntu 24.04 box: 10–15 min (most of it `meson build`).
 
-Flags:
-```bash
-sudo ./install_turnkey.sh --no-dpdk            # devbox without a DPDK NIC
-sudo ./install_turnkey.sh --skip-dpdk-build    # apt deps only, no DPDK compile
-```
+If you want perftest-based RDMA streams too, also run **Tools → Setup RDMA…**. Installs `rdma-core`, `perftest`, `infiniband-diags`, etc.
 
 ---
 
-## 2. Turnkey macOS (limited — same host, Docker Desktop)
+## Step 3: Client (operator laptop)
 
-⚠️ **Use case**: developer running Netgen against itself for protocol
-correctness tests. **Not** a production setup — macOS has no DPDK and
-no Linux VRFs, so line-rate generation and per-device isolation
-aren't available.
+Download the matching client artifact from the same GH release:
 
-What works:
-- The full GUI (PyQt5 is native on macOS)
-- FRR Docker containers via Docker Desktop
-- Scapy-based packet generation at moderate pps (no DPDK)
-- Stateful TCP, DNS, SIP, HTTP at full L7 fidelity
-- BGP / OSPF / IS-IS control plane via FRR (single-instance, no per-device VRF)
-- L2 frame generators (LACP / LLDP / VRRP / IGMP / PIM) need root on
-  macOS for raw sockets
+| OS | File |
+|---|---|
+| macOS | `Netgen-TrafficGenerator-<v>.dmg` — drag to Applications |
+| Windows | `Netgen-Client-<v>-windows.exe` — double-click |
+| Linux | `Netgen-Client-<v>-linux-x86_64.AppImage` — `chmod +x` and run |
 
-What doesn't work:
-- DPDK line-rate streams (Linux-only kernel modules)
-- Per-device VRF isolation (kernel-feature absent)
-- Multi-device scale tests (no VRF means one BGP daemon per port max)
-
-Install (Docker Desktop must be installed and running first):
-
-```bash
-brew install python@3.12 docker
-open -a "Docker Desktop"   # wait for whale icon to settle
-
-git clone https://github.com/amishagrawal2001-arch/netgen.git
-cd netgen
-./rebuild_quick.sh
-sudo python3 install_ostg_complete.py --no-dpdk
-
-# Launch server manually (no systemd on macOS):
-ostg-server &
-
-# Launch GUI:
-ostg-client -s http://127.0.0.1:5050
-```
-
-L2 frame generators need root + scapy's BPF access on macOS — if you
-see `PermissionError` in the L2 Emulation tab's Last Error column,
-either run the server as root or follow scapy's macOS BPF setup guide.
+First launch → **Tools → Add TGen Chassis** → enter `http://<server>:5050` → Save. Green LED next to the server name means healthy. Add stream → Apply → Start.
 
 ---
 
-## 3. Turnkey Windows (WSL2 + GUI on Windows host)
+## Upgrades
 
-⚠️ **The server inside WSL2 IS a Linux server.** This is "Turnkey
-Linux" with the Linux running inside WSL2 — but the GUI side is
-Windows-native.
+From the admin console: **Tools → Upgrade Wheel** → drag the new `.whl` in. Server restarts itself when pip is done.
 
-Steps:
-
-```powershell
-# 1. Enable WSL2 + install Ubuntu 22.04
-wsl --install -d Ubuntu-22.04
-# (reboot if first time)
-
-# 2. Inside WSL2 — same as Turnkey Linux
-wsl -d Ubuntu-22.04
-git clone https://github.com/amishagrawal2001-arch/netgen.git
-cd netgen
-./rebuild_quick.sh
-sudo ./install_turnkey.sh --no-dpdk
-
-# DPDK in WSL2 needs DPDK + hugepages + NIC passthrough config —
-# usually not worth it for WSL2; --no-dpdk is the sensible default.
-
-# Verify from WSL2 shell:
-curl http://127.0.0.1:5050/api/health
-```
-
-Then install the client **on Windows** (not inside WSL2) so the GUI
-runs as a native Windows app talking to the WSL2 server:
-
-```powershell
-# Back on Windows:
-cd path\to\netgen
-.\install_client.bat -Server http://localhost:5050
-```
-
-(WSL2 forwards `localhost:5050` to the Linux host inside WSL by
-default. If you've changed networking modes, use the WSL2 IP from
-`wsl hostname -I`.)
-
----
-
-## 4. Split — Linux server + Linux laptop client
-
-### On the Linux server (one-time setup):
+From a shell on the server:
 
 ```bash
-git clone https://github.com/amishagrawal2001-arch/netgen.git
-cd netgen
-./rebuild_quick.sh
-sudo python3 install_ostg_complete.py
+sudo netgen-upgrade /path/to/ostg_trafficgen-<new-version>-py3-none-any.whl
 ```
 
-Or from your laptop, push the install:
-```bash
-python3 install_ostg_complete.py -H lab-box -u root -p password
-```
-
-The script copies the wheel, installs everything, builds the FRR
-Docker image, sets up DPDK, and starts `netgen-server.service`.
-
-### On your Linux laptop:
-
-```bash
-git clone https://github.com/amishagrawal2001-arch/netgen.git
-cd netgen
-./rebuild_quick.sh
-./install_client.sh -s http://lab-box:5050
-```
-
-`install_client.sh` builds a per-user venv at `~/.netgen-client` (no
-root) and drops `~/.local/share/applications/netgen-client.desktop`
-for the GNOME / KDE / XFCE app menu.
-
----
-
-## 5. Split — Linux server + macOS laptop client
-
-### Server: same as scenario #4.
-
-### Client (macOS):
-
-```bash
-git clone https://github.com/amishagrawal2001-arch/netgen.git
-cd netgen
-./rebuild_quick.sh
-./install_client.sh -s http://lab-box:5050
-```
-
-Drops `~/Applications/Netgen Client.command` — double-click from
-Finder to launch.
-
-**Alternative for sharing with non-dev users**: build a `.dmg`:
-
-```bash
-./build_dmg.sh                   # quick DMG with .app inside
-./build_macos_installer.sh       # full installer DMG with wheel + docs
-```
-
-Output lands in `build_image/Netgen-TrafficGenerator-<version>.dmg`.
-Ship the DMG to your users — they drag the .app into Applications and
-launch it normally.
-
----
-
-## 6. Split — Linux server + Windows laptop client
-
-### Server: same as scenario #4.
-
-### Client (Windows 10 / 11):
-
-Prerequisites: Python 3.9+ on PATH (install from
-<https://www.python.org/downloads/windows/>, check **"Add python.exe
-to PATH"** during install).
-
-**Option A: PowerShell (recommended)**
-```powershell
-cd path\to\netgen
-.\install_client.ps1 -Server http://lab-box:5050
-```
-
-If you hit "execution of scripts is disabled":
-```powershell
-Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
-```
-
-**Option B: Double-click the .bat (no PowerShell knowledge needed)**
-
-`install_client.bat` wraps the .ps1 with `-ExecutionPolicy Bypass`.
-Edit the `.bat` once to bake in your server URL, then double-click it
-from Explorer.
-
-The installer drops both **Desktop** and **Start Menu** shortcuts
-named "Netgen Client". Double-click to launch the GUI.
-
----
-
-## Updating an existing install
-
-### From the GUI (operators) — recommended
-
-**Help → Install / Upgrade Server… → Upgrade running server** tab. Enter
-the server URL + pick the new `.whl`, then click one of:
-
-- **Upload && Upgrade** — HTTP path (`POST /api/admin/upgrade_wheel`); the
-  server pip-installs the wheel and restarts itself. Auto-falls back to
-  SSH if the endpoint is missing (HTTP 404) or erroring, provided you've
-  filled in the SSH credentials.
-- **Upgrade via SSH (manual)** — skips HTTP entirely: sftp the wheel,
-  `pip install --upgrade --force-reinstall --no-deps`, restart the
-  service. Use this for **old servers** that predate the
-  `/api/admin/upgrade_wheel` endpoint (pre-0.2.6), or whenever you prefer
-  the direct path. The restart tries `netgen-server` and falls back to the
-  legacy `ostg-server` unit.
-
-Manual one-liner equivalent (terminal):
-
-```bash
-scp ostg_trafficgen-<ver>-py3-none-any.whl root@<host>:/tmp/
-ssh root@<host> 'pip3 install --upgrade --force-reinstall --no-deps \
-    /tmp/ostg_trafficgen-<ver>-py3-none-any.whl && \
-    (systemctl restart netgen-server || systemctl restart ostg-server)'
-```
-
-On 0.2.28+, the server's startup self-heal redeploys the FRR/DHCP assets
-to `/opt/netgen/` and rebuilds the container image automatically when the
-bundled `Dockerfile.frr` changes — so a wheel-only upgrade is self-sufficient.
-
-### From the repo scripts (developers)
-
-Bump the version in `pyproject.toml`, then on each host:
-
-```bash
-# Linux server (or from a laptop via -H):
-./rebuild_quick.sh
-SERVER_HOST=lab-box ./deploy.sh -t wheel-only
-
-# Linux / macOS client:
-./install_client.sh --upgrade
-
-# Windows client:
-.\install_client.ps1 -Upgrade
-```
-
-Every build script auto-detects the version from `pyproject.toml` —
-you bump it in one place and all five (`deploy.sh`, `rebuild_quick.sh`,
-`rebuild_wheel.sh`, `build_dmg.sh`, `build_macos_installer.sh`,
-`install_ostg_complete.py`) pick it up automatically. Same for the
-client installers (`install_client.sh` and `install_client.ps1`) —
-they glob the freshest wheel from `dist/`.
+Both paths share the same state machinery (locked, persists across server restart).
 
 ---
 
 ## Uninstall
 
-### Linux server
 ```bash
+# Linux server
 sudo systemctl stop netgen-server
-sudo systemctl disable netgen-server
-sudo rm /etc/systemd/system/netgen-server.service
-sudo rm -rf /opt/netgen
-sudo docker rmi netgen-frr:latest
+sudo /opt/netgen-server/bin/netgen-uninstall
+sudo rm -rf /opt/netgen-server
 ```
 
-### Linux / macOS client
 ```bash
-rm -rf ~/.netgen-client
-rm -f ~/.local/share/applications/netgen-client.desktop   # Linux
-rm -f ~/Applications/Netgen\ Client.command               # macOS
-```
+# macOS client
+rm -rf "/Applications/Netgen Client.app"
 
-### Windows client
-```powershell
-Remove-Item -Recurse -Force "$env:USERPROFILE\.netgen-client"
-Remove-Item "$env:USERPROFILE\Desktop\Netgen Client.lnk" -ErrorAction SilentlyContinue
-Remove-Item "$env:APPDATA\Microsoft\Windows\Start Menu\Programs\Netgen Client.lnk" -ErrorAction SilentlyContinue
+# Linux client
+rm Netgen-Client-*-linux-x86_64.AppImage
+rm -rf ~/.config/netgen-client
+
+# Windows client
+# Settings → Apps → Netgen Client → Uninstall
 ```
 
 ---
 
-## Authentication
+## Auth (optional)
 
-The server's auth is opt-in. Two modes:
+By default the server is open. To require a bearer token:
 
-**Single token** (back-compat):
 ```bash
-# On the server:
-export NETGEN_AUTH_TOKEN=your-secret
-# Or via systemd:
-sudo systemctl edit netgen-server
-# add: Environment=NETGEN_AUTH_TOKEN=your-secret
-sudo systemctl restart netgen-server
-
-# On the client (any platform):
-export NETGEN_AUTH_TOKEN=your-secret   # macOS / Linux
-$env:NETGEN_AUTH_TOKEN="your-secret"   # Windows PowerShell
-setx NETGEN_AUTH_TOKEN your-secret     # Windows persistent
+# In /etc/systemd/system/netgen-server.service.d/auth.conf
+[Service]
+Environment=NETGEN_AUTH_TOKEN=$(openssl rand -hex 32)
 ```
 
-**Per-role tokens** (`viewer` / `operator` / `admin` hierarchy):
 ```bash
-# On the server:
-export NETGEN_AUTH_TOKENS_JSON='{"abc...":"admin","def...":"operator","ghi...":"viewer"}'
+sudo systemctl daemon-reload && sudo systemctl restart netgen-server
 ```
 
-The GUI client and `netgen-cli` auto-inject the header from
-`$NETGEN_AUTH_TOKEN`. `/api/health` is always exempt so probes don't
-need credentials.
-
-See **API_GUIDE.md** § Authentication for the full role hierarchy
-and endpoint matrix.
+Then clients pass `Authorization: Bearer <token>` headers. Per-endpoint role gating (admin / operator / viewer) is wired in via `@require_role`.
 
 ---
 
 ## Troubleshooting
 
-| Symptom | Likely cause | Fix |
-|---------|--------------|-----|
-| `pip install` fails with PyQt5 errors on macOS | Building from source instead of using prebuilt wheels | `pip install --find-links https://download.qt.io/snapshots/ci/pyqt5/5.15/wheels/ PyQt5` |
-| `Could not find the Qt platform plugin 'cocoa'` | PyQt5 installed from source | Same fix as above |
-| GUI starts but stays grey/blank | X server not available (Linux / WSL2) | Install Xorg / use VcXsrv on WSL2 / consider WSLg on Windows 11 |
-| `/api/l2/sessions` returns 404 | Server is older than 0.2.4 | `git pull` + `SERVER_HOST=<host> ./deploy.sh -t wheel-only` |
-| L2 Emulation "Permission Error" in Last Error | scapy needs raw sockets | Linux: `setcap cap_net_raw=eip $(readlink -f $(which python3))` then restart server. macOS: run server as root. Windows: install Npcap and run client as Administrator. |
-| `ostg-client` not found on PATH (Linux) | Venv not activated, or pip installed without entry-point support | `source ~/.netgen-client/bin/activate` first; or reinstall with `--upgrade` |
-| Wheel build fails with `error: invalid command 'bdist_wheel'` | `wheel` package missing | `pip install build wheel` |
-| Install hangs at "Building Docker FRR image" | First-time FRR build pulling base images | Be patient — first build is 5-10 min. `docker logs $(docker ps -lq)` from another shell shows progress. |
-| `python3 install_ostg_complete.py` complains version mismatch | Stale `egg-info/` cache from old build | `rm -rf ostg_trafficgen.egg-info build dist && ./rebuild_quick.sh` |
+The admin console exposes everything needed to diagnose without SSH:
 
-For anything else, the server logs are the first place to look:
+- **Server health** — `http://<server>:5050/admin` → top-of-page banner shows degraded state with concrete issues
+- **Logs** — `GET /api/admin/journal?lines=300` or in-app **Tools → Server Journal**
+- **DPDK install log** — streamed inline by the Make-Ready wizard
+- **Per-iface diagnostics** — click the **ℹ️** button on any iface row for full `ethtool` dump
+- **Cache inspection** — `GET /api/admin/caches` (debugging stale-data bugs)
+- **Tool presence** — `GET /api/admin/health.tools_present` confirms `ip` / `ethtool` / `lldpcli` / `lspci` / `dpdk-devbind.py` are reachable
+
+Common failure modes:
+
+| Symptom | Likely cause | Fix |
+|---|---|---|
+| `netgen-install` exits early with "Docker missing" | No Docker; FRR/DHCP features won't work | Install Docker, or pass `--skip-docker` (other features still run) |
+| Make-Ready hangs at "Building DPDK" | apt mirror slow; first install only | Wait — log streams live |
+| `tx_worker binary` tile shows red | install_dpdk.sh didn't finish, or wrong path | Tile tooltip names the fix; `$TX_WORKER_BIN` env override is the escape hatch |
+| Stream starts, dies in <1s, `tx_count=0` | DPDK init failed for this stream | Journal contains the error (`[dpdk]` lines); usually iface state or PMD |
+| Wrong port physically | Operator forgot which cable is which | Click **💡** button on the row → blinks the LED for 5s |
+| Concurrent operators interfere | Same lab box, two browser tabs | Per-iface lock (v0.5.97) returns `409 IFACE_BUSY` — wait + retry |
+
+---
+
+## Variations (less common)
+
+**Same-host Linux turnkey** — server + client on the same Linux box:
+
 ```bash
-journalctl -u netgen-server -n 100 --no-pager   # Linux systemd
-# Or directly: tail -f /var/log/netgen/server.log
+# After server install above, also install the AppImage client
+chmod +x Netgen-Client-*-linux-x86_64.AppImage
+./Netgen-Client-*-linux-x86_64.AppImage -s http://localhost:5050
 ```
 
-GUI client logs go to stderr — launch from a terminal to see them:
+Or use the convenience script in the repo:
+
 ```bash
-ostg-client -s http://lab-box:5050   # Linux / macOS
-# Or on Windows:
-& "$env:USERPROFILE\.netgen-client\Scripts\ostg-client.exe"
+git clone https://github.com/amishagrawal2001-arch/netgen.git && cd netgen
+sudo ./install_turnkey.sh   # builds wheel + installs server + drops desktop launcher
+```
+
+**macOS dev box** — server in Docker Desktop, client native:
+
+Server side runs but DPDK / VRF / kernel features are unavailable. Use this for protocol development against Scapy only. See [docs/macOS.md](docs/macOS.md) if it exists; otherwise just `pip install ostg_trafficgen-*.whl` into a venv and run `ostg-server`.
+
+**WSL2 on Windows** — server inside WSL2, client native Windows:
+
+WSL2 sees host network adapters via virtio bridge — DPDK works but performance is bridge-bound. Same install commands as Linux server, executed inside the WSL2 distro.
+
+**Building from source** — for developers patching netgen itself:
+
+```bash
+git clone https://github.com/amishagrawal2001-arch/netgen.git && cd netgen
+./rebuild_quick.sh                   # builds the wheel
+sudo ./install_turnkey.sh            # full local install
 ```
 
 ---
 
-## Building installers from source
+## See also
 
-If you're cutting a customer-shippable release locally (or want to
-build a variant the GitHub Actions CI doesn't produce), each platform
-has its own build script.
-
-| Platform | Build script | Output |
-|---|---|---|
-| **Windows** (PyInstaller .exe) | `.\build_windows.ps1`               | `dist\Netgen-Client-<v>-windows.exe`               |
-| **macOS** (drag-to-Applications .dmg) | `./build_dmg.sh`            | `build_image/Netgen-TrafficGenerator-<v>.dmg`      |
-| **macOS** (full installer DMG) | `./build_macos_installer.sh`         | `build_image/Netgen-TrafficGenerator-<v>-macOS.dmg` (includes wheel + docs) |
-| **Linux** (universal AppImage) | `./build_appimage.sh`                | `dist/Netgen-Client-<v>-linux-<arch>.AppImage`     |
-
-All build scripts auto-detect the version from `pyproject.toml`. Bump
-the version once and every script re-builds correctly.
-
-Constraints:
-- **PyInstaller is OS-native** — no cross-builds. To produce a
-  Windows .exe you need a Windows build host. Same for macOS → .dmg
-  and Linux → .AppImage. The GitHub Actions workflow handles this by
-  matrix-running across `windows-latest`, `macos-latest`, and
-  `ubuntu-latest`; trigger it with a `git tag v<x.y.z> && git push --tags`.
-- **AppImage requires FUSE on the build host** (`apt install fuse libfuse2`).
-- **Code-signing is not currently wired up** — macOS users will see
-  the "unidentified developer" warning on first launch (right-click →
-  Open). Windows users get a SmartScreen warning. Signing identities
-  can be added later via env-var secrets in the GitHub Actions
-  workflow.
-
-### Continuous-integration release flow
-
-`.github/workflows/release.yml` runs the full build matrix on every
-tag push:
-
-```bash
-# Bump pyproject.toml, then:
-git tag -a v0.2.5 -m "v0.2.5"
-git push target v0.2.5
-```
-
-The workflow:
-1. Builds the universal wheel on Ubuntu
-2. Builds the .dmg on macOS
-3. Builds the .exe on Windows
-4. Builds the .AppImage on Ubuntu
-5. Pulls release notes from `CHANGELOG.md`
-6. Creates the GitHub release with all four artifacts attached
-
-Customers can `wget` the platform installer they want straight from
-the release page.
+- **In-app help** — Help → Installation Guide (this same content, rendered in the client)
+- **CHANGELOG** — `CHANGELOG.md` in the repo
+- **API reference** — `http://<server>:5050/admin/api-guide`
