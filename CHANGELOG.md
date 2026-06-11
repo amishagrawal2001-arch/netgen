@@ -2,6 +2,118 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.101] - 2026-06-11
+
+**Mellanox MEMLOCK rlimit + netgen-upgrade rebuilds tx_worker.**
+
+### Operator-reported symptom (srv06, Mellanox ConnectX-6 bifurcated)
+
+After upgrading to v0.5.100 (tx_worker resolver SSOT), the very
+next UDP DPDK stream launch failed with TWO distinct errors in
+the same `journalctl -u netgen-server` excerpt:
+
+```
+mlx5_net: ingress mlx5dv_dr_create_domain failed
+mlx5_net: probe of PCI device 0000:2b:00.0 aborted —
+  Cannot allocate memory
+EAL: Bus (pci) probe failed.
+/usr/local/bin/tx_worker: unrecognized option '--tx-cores'
+```
+
+Stream status: exit code 1, tx_count=0.
+
+### Root cause #1 — systemd unit had no LimitMEMLOCK
+
+The netgen-server.service template in scripts/tarball/netgen-install
+set capabilities (v0.5.56 audit H8) but never set rlimits. Default
+`ulimit -l` under systemd is ~64 KiB. The Mellanox mlx5 PMD needs
+to `mlock()` NIC queue + flow-table memory; without
+`LimitMEMLOCK=infinity` the probe bails with `Cannot allocate
+memory`. This is the canonical Mellanox DPDK requirement
+documented in every NVIDIA / OFED guide.
+
+### Root cause #2 — tx_worker binary drifted from the launcher
+
+`/usr/local/bin/tx_worker` on srv06 was built Jun 8 by the v0.5.99
+wheel's install_dpdk.sh Step 6. The v0.5.100 wheel's launcher
+(`utils/dpdk_tx_worker.py`) passes `--tx-cores N` for multi-queue
+TX scaling. The stale binary has no such flag — `getopt_long`
+errors with `unrecognized option`, exit code 1.
+
+netgen-upgrade was only running `pip install --upgrade <wheel>`
+then restarting systemd — never rebuilding the tx_worker binary.
+Every wheel-style upgrade that touches the tx_worker source could
+hit the same drift.
+
+### Fixes
+
+**1. scripts/tarball/netgen-install** — systemd unit template gains:
+
+```ini
+LimitMEMLOCK=infinity
+LimitNOFILE=1048576
+LimitNPROC=infinity
+```
+
+with an inline comment quoting the operator-visible error string
+so a future `grep -r mlx5dv_dr_create_domain` lands here.
+
+**2. resources/tarball/netgen-upgrade + scripts/tarball/netgen-upgrade**
+gain a `_rebuild_tx_worker()` step:
+
+- Fires AFTER pip-install + import-verify, BEFORE the
+  `systemctl restart` (so the freshly-started server uses the
+  fresh binary on its first stream launch).
+- Locates the wheel-shipped source via
+  `importlib resources.dpdk.tx_worker`.
+- Checks for build deps (`meson`, `ninja`, `pkg-config libdpdk`).
+  If missing, logs `[TX_WORKER] build deps missing: …` and
+  continues without erroring — Scapy streams still work; operator
+  can re-run `install_dpdk.sh` to install deps + rebuild.
+- `meson setup` + `meson compile` + `install -m755` to
+  `/usr/local/bin/tx_worker` (the canonical resolver path per
+  v0.5.99's `_resolve_tx_worker_bin()`).
+
+Both netgen-upgrade copies stay byte-identical
+(v0.5.49 self-heal requirement, guarded by
+`test_v0549_netgen_upgrade_selfheal.py`).
+
+### Operator workaround for already-installed servers
+
+Pre-v0.5.101 installs need a one-time fix-up:
+
+```bash
+sudo tee /etc/systemd/system/netgen-server.service.d/mlx5-rlimits.conf <<'EOF'
+[Service]
+LimitMEMLOCK=infinity
+LimitNOFILE=1048576
+LimitNPROC=infinity
+EOF
+sudo bash /opt/netgen-server/resources/dpdk/install_dpdk.sh   # rebuilds tx_worker
+sudo systemctl daemon-reload
+sudo systemctl restart netgen-server
+```
+
+Fresh v0.5.101 installs (and routine v0.5.101+ wheel upgrades)
+get both fixes automatically.
+
+### Tests
+
+`tests/test_mellanox_memlock_and_tx_worker_rebuild.py` — 8 new
+regression guards covering:
+
+- `LimitMEMLOCK=infinity` present in unit template
+- `LimitNOFILE` bumped to ≥65536
+- `LimitNPROC=infinity` present
+- Mellanox-bite docstring comment guards the operator-error
+  string
+- netgen-upgrade calls `_rebuild_tx_worker`
+- Rebuild targets `/usr/local/bin/tx_worker`
+- Rebuild gracefully skips on missing build deps (warns, returns)
+- Rebuild fires BEFORE systemctl restart
+
+Full suite: **2,306 passed**, 1 skipped (+8 new).
+
 ## [0.5.100] - 2026-06-11
 
 **tx_worker presence: single source of truth + DPDK Runtime
