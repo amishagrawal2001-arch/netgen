@@ -281,6 +281,16 @@ def test_iface_flash_endpoint_clamps_seconds(client):
 
         class _P:
             pid = 12345
+
+            def wait(self, *_a, **_kw):
+                # v0.5.97 (audit L4): the flash handler now
+                # spawns a daemon thread to wait+reap the
+                # Popen. Mock must satisfy `.wait()`.
+                return 0
+
+            def poll(self, *_a, **_kw):
+                return 0
+
         return _P()
 
     with mock.patch("subprocess.Popen", side_effect=_fake_popen):

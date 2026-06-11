@@ -16621,7 +16621,34 @@ def _ensure_frr_assets_deployed():
 # /api/dpdk/interfaces returns name="(no interface)" — the user loses sight
 # of what was bound. Recording the original name at bind time lets the
 # portal still show "eno12399np0 (DPDK)" in the table.
-_ADMIN_BIND_HISTORY_PATH = "/tmp/netgen_admin_bind_history.json"
+#
+# v0.5.97 (audit H12): primary path is /var/lib/netgen-server/ so the
+# history survives reboots. /tmp/ kept as a fallback for non-root
+# deployments + test runs where /var/lib isn't writable. On startup
+# we read both and prefer the persistent one; on write we try
+# persistent first and fall back to /tmp if the dir isn't writable.
+_ADMIN_BIND_HISTORY_PATH = "/var/lib/netgen-server/admin_bind_history.json"
+_ADMIN_BIND_HISTORY_FALLBACK = "/tmp/netgen_admin_bind_history.json"
+
+
+def _admin_bind_history_path():
+    """Return the bind-history path to use for the next write.
+    Prefer /var/lib (persistent across reboot). Fall back to /tmp
+    if the persistent dir can't be created (e.g. unprivileged
+    test run on macOS dev machine)."""
+    try:
+        os.makedirs(
+            os.path.dirname(_ADMIN_BIND_HISTORY_PATH),
+            exist_ok=True,
+        )
+        # Touch-write to verify writability; immediately unlink.
+        _probe = _ADMIN_BIND_HISTORY_PATH + ".probe"
+        with open(_probe, "w") as _f:
+            _f.write("")
+        os.unlink(_probe)
+        return _ADMIN_BIND_HISTORY_PATH
+    except (PermissionError, OSError):
+        return _ADMIN_BIND_HISTORY_FALLBACK
 
 
 # v0.5.58 (audit M1 + M5): single lock for ALL reads + writes
@@ -16639,11 +16666,18 @@ _BIND_REGISTRY_LOCK = _threading_module.Lock()
 
 def _load_bind_history():
     with _BIND_REGISTRY_LOCK:
-        try:
-            with open(_ADMIN_BIND_HISTORY_PATH, "r") as f:
-                return json.load(f)
-        except Exception:
-            return {}
+        # v0.5.97 (audit H12): try persistent path first; fall
+        # back to /tmp so legacy installs keep working.
+        for path in (_ADMIN_BIND_HISTORY_PATH,
+                     _ADMIN_BIND_HISTORY_FALLBACK):
+            try:
+                with open(path, "r") as f:
+                    return json.load(f)
+            except (FileNotFoundError, json.JSONDecodeError):
+                continue
+            except Exception:
+                continue
+        return {}
 
 
 def _save_bind_history(history):
@@ -16653,13 +16687,20 @@ def _save_bind_history(history):
     window. Atomic write via temp+rename closes the race
     completely; the lock serialises the read-modify-write
     cycle in the endpoint handler that calls us.
+
+    v0.5.97 (audit H12): primary write target is
+    /var/lib/netgen-server/admin_bind_history.json so the
+    audit trail survives reboots. _admin_bind_history_path()
+    falls back to /tmp/ if the persistent dir isn't writable
+    (test runs, unprivileged deployments).
     """
     with _BIND_REGISTRY_LOCK:
         try:
-            tmp = _ADMIN_BIND_HISTORY_PATH + ".tmp"
+            target = _admin_bind_history_path()
+            tmp = target + ".tmp"
             with open(tmp, "w") as f:
                 json.dump(history, f, indent=2)
-            os.replace(tmp, _ADMIN_BIND_HISTORY_PATH)
+            os.replace(tmp, target)
         except Exception as e:
             logging.warning(
                 f"[ADMIN BIND HISTORY] save failed: {e}"
@@ -20951,6 +20992,27 @@ def _iface_action_safety_check(iface, action):
     return None, 0
 
 
+# v0.5.97 (audit H11/M9): per-iface lock for lifecycle actions.
+# Pre-fix two operators in two browser tabs both clicking Reset
+# on ens6np0 could interleave the down/sleep/up sequences. Now
+# one wins, the other waits + completes serially. Lock is held
+# only for the brief sequence (worst case ~2s); we use a dict
+# keyed by iface name so different ifaces still parallelise.
+_IFACE_LIFECYCLE_LOCKS = {}
+_IFACE_LIFECYCLE_LOCKS_MUTEX = threading.Lock()
+
+
+def _iface_lifecycle_lock(iface):
+    """Lazily-create + return a per-iface threading.Lock.
+    Single creator-side lock guards the dict itself."""
+    with _IFACE_LIFECYCLE_LOCKS_MUTEX:
+        lock = _IFACE_LIFECYCLE_LOCKS.get(iface)
+        if lock is None:
+            lock = threading.Lock()
+            _IFACE_LIFECYCLE_LOCKS[iface] = lock
+        return lock
+
+
 def _run_ip_link(iface, action):
     """Wrap `ip link set <iface> <up|down>` with a 5s timeout.
     Returns (success, stdout, stderr)."""
@@ -21038,7 +21100,25 @@ def api_admin_iface_up(iface):
     if not _RE_IFACE_NAME.match(iface or ""):
         _admin_audit("iface_up", iface, rc="invalid_name")
         return jsonify({"error": "invalid iface name"}), 400
-    ok, _so, _se = _run_ip_link(iface, "up")
+    # v0.5.97 (audit H11/M9): per-iface lock + non-blocking
+    # acquire. If another operator is mid-action on the same
+    # iface, return 409 IFACE_BUSY immediately rather than
+    # queueing.
+    _lock = _iface_lifecycle_lock(iface)
+    if not _lock.acquire(blocking=False):
+        _admin_audit("iface_up", iface, rc="busy")
+        return jsonify({
+            "error": (
+                f"{iface} has an in-flight lifecycle action "
+                f"from another session. Try again in a moment."
+            ),
+            "code": "IFACE_BUSY",
+            "interface": iface,
+        }), 409
+    try:
+        ok, _so, _se = _run_ip_link(iface, "up")
+    finally:
+        _lock.release()
     if not ok:
         _admin_audit("iface_up", iface, rc="fail", err=_se.strip()[:120])
         return jsonify({
@@ -21075,7 +21155,22 @@ def api_admin_iface_down(iface):
                 "interface": iface,
                 "can_force": True,
             }), code
-    ok, _so, _se = _run_ip_link(iface, "down")
+    # v0.5.97 (audit H11/M9): per-iface lock — see iface_up.
+    _lock = _iface_lifecycle_lock(iface)
+    if not _lock.acquire(blocking=False):
+        _admin_audit("iface_down", iface, rc="busy")
+        return jsonify({
+            "error": (
+                f"{iface} has an in-flight lifecycle action "
+                f"from another session. Try again in a moment."
+            ),
+            "code": "IFACE_BUSY",
+            "interface": iface,
+        }), 409
+    try:
+        ok, _so, _se = _run_ip_link(iface, "down")
+    finally:
+        _lock.release()
     if not ok:
         _admin_audit("iface_down", iface, force=force, rc="fail",
                      err=_se.strip()[:120])
@@ -21114,17 +21209,35 @@ def api_admin_iface_reset(iface):
                 "interface": iface,
                 "can_force": True,
             }), code
-    ok_d, _so_d, _se_d = _run_ip_link(iface, "down")
-    if not ok_d:
-        _admin_audit("iface_reset", iface, force=force, rc="fail_down",
-                     err=_se_d.strip()[:120])
+    # v0.5.97 (audit H11/M9): per-iface lock around the entire
+    # down→sleep→up sequence — pre-fix two concurrent resets
+    # could interleave (one's down, the other's up). Hold the
+    # lock for the full ~1s; second caller gets 409 immediately.
+    _lock = _iface_lifecycle_lock(iface)
+    if not _lock.acquire(blocking=False):
+        _admin_audit("iface_reset", iface, rc="busy")
         return jsonify({
-            "error": f"down failed: {_se_d.strip()}",
+            "error": (
+                f"{iface} has an in-flight lifecycle action "
+                f"from another session. Try again in a moment."
+            ),
+            "code": "IFACE_BUSY",
             "interface": iface,
-        }), 500
-    import time as _time
-    _time.sleep(1.0)
-    ok_u, _so_u, _se_u = _run_ip_link(iface, "up")
+        }), 409
+    try:
+        ok_d, _so_d, _se_d = _run_ip_link(iface, "down")
+        if not ok_d:
+            _admin_audit("iface_reset", iface, force=force, rc="fail_down",
+                         err=_se_d.strip()[:120])
+            return jsonify({
+                "error": f"down failed: {_se_d.strip()}",
+                "interface": iface,
+            }), 500
+        import time as _time
+        _time.sleep(1.0)
+        ok_u, _so_u, _se_u = _run_ip_link(iface, "up")
+    finally:
+        _lock.release()
     if not ok_u:
         _admin_audit("iface_reset", iface, force=force,
                      rc="fail_up_after_down",
@@ -21174,7 +21287,13 @@ def api_admin_iface_flash(iface):
         # duration. Use Popen + brief wait so the API returns
         # immediately and the LED keeps blinking in the
         # background.
-        subprocess.Popen(
+        # v0.5.97 (audit L4): start a daemon thread to wait()
+        # on the Popen so the kernel reaps it as a zombie when
+        # `ethtool -p` finishes. Pre-fix the Popen was orphaned;
+        # CPython's _cleanup() reaps opportunistically on the
+        # NEXT Popen call, but between calls the zombie sits in
+        # the process table.
+        _proc = subprocess.Popen(
             _maybe_sudo([
                 "ethtool", "-p", iface, str(secs)
             ]),
@@ -21182,6 +21301,10 @@ def api_admin_iface_flash(iface):
             stderr=subprocess.DEVNULL,
             close_fds=True,
         )
+        threading.Thread(
+            target=_proc.wait, daemon=True,
+            name=f"flash-reap-{iface}",
+        ).start()
     except FileNotFoundError:
         _admin_audit("iface_flash", iface, rc="fail",
                      err="ethtool_missing")

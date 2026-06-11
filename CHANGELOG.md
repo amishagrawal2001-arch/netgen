@@ -2,6 +2,59 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.97] - 2026-06-11
+
+**Admin console audit batch #6: operability fortification.**
+
+### H11 / M9 — Per-iface lifecycle lock
+
+Pre-fix two operators in two browser tabs both clicking Reset
+on `ens6np0` could interleave the down→sleep→up sequences.
+One operator's `down` could fire between the other's `down`
+and `up` — leaving the iface in unexpected states.
+
+New `_iface_lifecycle_lock(iface)` returns a per-iface
+`threading.Lock` (dict guarded by `_IFACE_LIFECYCLE_LOCKS_MUTEX`).
+Lifecycle handlers `acquire(blocking=False)` — second caller
+gets `HTTP 409 + code: IFACE_BUSY` immediately rather than
+queueing. Different ifaces still parallelise; only same-iface
+contention serialises.
+
+### H12 — `bind_history` survives reboots
+
+Pre-fix `_ADMIN_BIND_HISTORY_PATH = "/tmp/..."` died on every
+reboot. The audit trail of who bound what to vfio — the only
+persistent record — was lost across `systemctl restart` and
+any reboot.
+
+New primary path `/var/lib/netgen-server/admin_bind_history.json`.
+`_admin_bind_history_path()` probes writability of the
+persistent dir and falls back to `/tmp/` if unwritable (test
+runs on dev machines without root). `_load_bind_history()`
+reads both locations on startup, preferring the persistent
+one.
+
+### L4 — Flash `Popen` reaped immediately
+
+Pre-fix the `subprocess.Popen` for `ethtool -p` was orphaned —
+CPython's `subprocess._cleanup()` reaped opportunistically on
+subsequent Popen calls, but between calls the zombie sat in
+the process table. On a quiet srv06 with one flash click and
+no other Popen, the zombie persisted indefinitely.
+
+Now spawn a daemon `threading.Thread(target=p.wait,
+daemon=True)` after the Popen — kernel reaps the child as
+soon as `ethtool -p` exits.
+
+### Tests
+
+13 new (9 source-level + 2 integration verifying the per-iface
+lock blocks same-iface concurrent + lets different-iface
+parallelise) + 1 updated (v0.5.95 flash mock gained `.wait()`
+to satisfy the new reaper thread).
+
+Full suite: **2,283 passed, 1 skipped** (+13 new).
+
 ## [0.5.96] - 2026-06-11
 
 **Admin console audit batch #5: diagnostic endpoints + caching.**
