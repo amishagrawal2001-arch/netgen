@@ -19760,14 +19760,22 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
           // v0.5.89 hot-fix: do NOT reference the `link` const
           // declared further down — TDZ ReferenceError. Read
           // i.link directly here.
+          // v0.5.90 hot-fix: add type="button" on every button to
+          // prevent default <button>='submit' behavior. Operator
+          // reported "entire page is getting refreshed" on click.
+          // Also collapse the disabled-state into a single style
+          // attribute (duplicate style="" was being dropped by
+          // the HTML parser so disabled rows weren't dimmed).
           let lifecycleBtn = '';
           if (i.name && i.name !== 'N/A' && !/\(no interface\)/.test(i.name)) {
             const up = (i.link || {}).carrier === true;
             const _name = escapeHtml(i.name);
+            const _baseStyle = 'padding: 2px 6px; font-size: 11px;';
+            const _dimStyle = _baseStyle + ' opacity: 0.4; cursor: not-allowed;';
             lifecycleBtn = `<span class="iface-ctl" style="display: inline-flex; gap: 3px; margin-left: 4px;">
-              <button data-idx="${idx}" data-iface-action="up"    title="Bring ${_name} up"    style="padding: 2px 6px; font-size: 11px;"${up ? ' disabled style="padding: 2px 6px; font-size: 11px; opacity: 0.4;"' : ''}>↑</button>
-              <button data-idx="${idx}" data-iface-action="down"  title="Bring ${_name} down"  style="padding: 2px 6px; font-size: 11px;" class="secondary"${!up ? ' disabled style="padding: 2px 6px; font-size: 11px; opacity: 0.4;"' : ''}>↓</button>
-              <button data-idx="${idx}" data-iface-action="reset" title="Reset ${_name} (down → 1s → up)" style="padding: 2px 6px; font-size: 11px;" class="secondary">↻</button>
+              <button type="button" data-idx="${idx}" data-iface-action="up"    title="Bring ${_name} up"    style="${up ? _dimStyle : _baseStyle}"${up ? ' disabled' : ''}>↑</button>
+              <button type="button" data-idx="${idx}" data-iface-action="down"  title="Bring ${_name} down"  style="${!up ? _dimStyle : _baseStyle}" class="secondary"${!up ? ' disabled' : ''}>↓</button>
+              <button type="button" data-idx="${idx}" data-iface-action="reset" title="Reset ${_name} (down → 1s → up)" style="${_baseStyle}" class="secondary">↻</button>
             </span>`;
             actionBtn = actionBtn + lifecycleBtn;
           }
@@ -20160,6 +20168,10 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
     document.addEventListener('click', (ev) => {
       const btn = ev.target.closest('button[data-iface-action]');
       if (!btn) return;
+      // v0.5.90 hot-fix: belt-and-braces — also stop the click
+      // here in case some ancestor is intercepting it for nav.
+      ev.preventDefault();
+      ev.stopPropagation();
       const wrap = $('iface-table-wrap');
       const idx = parseInt(btn.dataset.idx, 10);
       const iface = (wrap._ifaces || [])[idx];
