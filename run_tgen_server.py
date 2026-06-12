@@ -542,6 +542,25 @@ def increment_value(base, step, count, is_ip=False):
 # config "rx_engine: dpdk" actually wires up the rx_worker without
 # the operator having to hit the admin endpoint twice.
 
+# v0.5.105 AUDIT FIX: ensure rx_worker processes don't orphan when
+# netgen-server exits (systemd's KillMode=control-group already
+# cleans up child processes on full unit teardown, but `systemctl
+# stop` without --kill-mode + future deployments under uwsgi or
+# gunicorn might not get the same cleanup). Explicit atexit hook
+# is cheap insurance; runs before Python's interpreter teardown.
+import atexit as _atexit
+try:
+    from utils.dpdk_rx_manager import registry as _rx_registry_for_atexit
+    _atexit.register(
+        lambda: _rx_registry_for_atexit().stop_all(timeout_s=2.0)
+    )
+except Exception:
+    # Don't break server startup if the manager isn't importable
+    # for some reason — operator can still manage workers manually
+    # via the admin endpoints; they just won't auto-stop on exit.
+    pass
+
+
 def _maybe_start_dpdk_rx_for_stream(
     *, stream_id: str, rx_interface: str, stream_data: dict,
 ) -> None:
@@ -1258,24 +1277,6 @@ def start_traffic():
                 rx_interface = interface_name
             stream_data["rx_interface"] = rx_interface
 
-            # v0.5.105 Phase B (auto-lifecycle): if the stream's
-            # rx_engine is "dpdk", spawn a matching rx_worker before
-            # we hand off to the TX path. The rx_worker captures
-            # frames from the wire directly (kernel netdev bypass)
-            # so srv06-style 24M-pps streams don't drop everything
-            # at the netdev backlog.
-            #
-            # Best-effort: failure to start rx_worker (binary missing,
-            # iface PCI BDF unresolvable, etc.) is logged but does
-            # NOT block the stream start. Operator's TX side still
-            # runs; RX falls back to Scapy and stats just won't
-            # reflect DPDK accuracy.
-            _maybe_start_dpdk_rx_for_stream(
-                stream_id=stream_id,
-                rx_interface=rx_interface,
-                stream_data=stream_data,
-            )
-
             # Prevent duplicates - check by stream_id first
             existing = stream_tracker.find_stream_by_id(interface_name, stream_id)
             if existing:
@@ -1381,6 +1382,29 @@ def start_traffic():
                     f"'{stream_name}': {_exc}; falling through to "
                     "DPDK/Scapy pipeline"
                 )
+
+            # v0.5.105 Phase B (auto-lifecycle): if the stream's
+            # rx_engine is "dpdk", spawn a matching rx_worker.
+            #
+            # AUDIT FIX: placed here (after duplicate checks + RDMA
+            # short-circuit) instead of before. Pre-fix bug: spawning
+            # before the dup check leaked a registered rx_worker when
+            # the new stream was abandoned because its stream_id or
+            # name was already running. RDMA short-circuit also
+            # returns early; rx_engine is meaningless for RDMA
+            # streams anyway (verbs-based, no L2/L3/L4 to filter
+            # on the wire), so skipping is correct.
+            #
+            # Best-effort: failure to start rx_worker (binary missing,
+            # iface PCI BDF unresolvable, etc.) is logged but does
+            # NOT block the stream start. Operator's TX side still
+            # runs; RX falls back to Scapy and stats just won't
+            # reflect DPDK accuracy.
+            _maybe_start_dpdk_rx_for_stream(
+                stream_id=stream_id,
+                rx_interface=rx_interface,
+                stream_data=stream_data,
+            )
 
             # Pre-flight engine resolution. The DPDK fallback decision
             # used to happen invisibly in the worker thread — operators
