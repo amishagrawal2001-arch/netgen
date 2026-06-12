@@ -22295,6 +22295,257 @@ def api_admin_dpdk_rx_latest(stream_id):
     return jsonify(snap), 200
 
 
+@app.route("/api/admin/dpdk/rx/probe", methods=["POST"])
+@require_role("operator")
+def api_admin_dpdk_rx_probe():
+    """v0.5.109: one-shot RX verdict probe.
+
+    Spawns an rx_worker matching the supplied filter, samples for
+    duration_s seconds, stops the worker, and returns a structured
+    verdict the operator can act on without reading raw counters.
+
+    Body:
+      {
+        "rx_iface": "ens2f1np1",      ← required
+        "rx_pci_bdf": "0000:2b:00.1", ← optional override
+        "duration_s": 10,             ← default 10, capped 1..120
+        "expected_pps": 100000,       ← optional, drives the verdict
+        "vlan": 100,                  ← optional filter dim
+        "dst_port": 4791,             ← optional
+        "src_port": 1234,             ← optional
+        "src_ip": "10.0.0.1",         ← optional
+        "dst_ip": "10.0.0.2"          ← optional
+      }
+
+    Workflow:
+      1. Operator has a TX stream already running (their own
+         responsibility — separate concern)
+      2. Hits this endpoint with matching filter + duration
+      3. Server spawns rx_worker via the manager with a unique
+         probe-only stream_id so it doesn't collide with any
+         active-stream rx_workers
+      4. Polls latest() each second for duration_s
+      5. Stops the rx_worker (which captures the final summary)
+      6. Computes verdict:
+         - "rx_active"     → packets are arriving; wire works
+         - "rx_silent"     → 0 packets + 0 hw drops → wire is broken
+         - "hw_drops"      → hw_imissed > 0 → NIC queue/mempool
+         - "rate_limited"  → rx_pps << expected_pps → switch cap
+         - "needs_diag"    → ambiguous; operator should look at raw
+      7. Returns the verdict + raw counters + suggested next actions
+
+    This collapses the manual "start, sleep, curl, stop, compute,
+    interpret" loop into a single API call.
+    """
+    try:
+        data = request.get_json(force=True) or {}
+    except Exception:
+        return jsonify({"error": "invalid JSON"}), 400
+
+    rx_iface = (data.get("rx_iface") or "").strip()
+    if not rx_iface or not _RE_IFACE_NAME.match(rx_iface):
+        return jsonify({"error": "rx_iface required"}), 400
+
+    rx_pci_bdf = (data.get("rx_pci_bdf") or "").strip().lower()
+    if rx_pci_bdf and not re.match(
+        r"^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9]$", rx_pci_bdf,
+    ):
+        return jsonify({"error": "invalid rx_pci_bdf"}), 400
+
+    # Resolve PCI BDF if not given. Same logic as auto-lifecycle.
+    if not rx_pci_bdf:
+        try:
+            from utils.nic_counters import iface_to_pci_bdf
+            rx_pci_bdf = (iface_to_pci_bdf(rx_iface) or "").lower()
+        except Exception as exc:
+            return jsonify({
+                "error": f"could not resolve pci_bdf for {rx_iface}: {exc}",
+                "hint": "iface may be vfio-bound; pass rx_pci_bdf explicitly",
+            }), 400
+    if not rx_pci_bdf:
+        return jsonify({
+            "error": f"no PCI BDF available for {rx_iface}",
+            "hint": "iface is likely vfio-bound and has no kernel netdev; "
+                    "pass rx_pci_bdf explicitly in the request body",
+        }), 400
+
+    def _opt_int(key, lo, hi):
+        v = data.get(key)
+        if v is None:
+            return None
+        try:
+            iv = int(v)
+        except (TypeError, ValueError):
+            return None
+        return iv if lo <= iv <= hi else None
+
+    duration_s = _opt_int("duration_s", 1, 120) or 10
+    expected_pps = _opt_int("expected_pps", 0, 1_000_000_000)
+
+    # Probe-only stream_id so we don't collide with any registered
+    # auto-lifecycle rx_worker for an actual stream.
+    import uuid as _uuid
+    probe_sid = f"probe-{_uuid.uuid4().hex[:12]}"
+
+    try:
+        from utils.dpdk_rx_manager import registry as _rx_registry
+    except Exception as _e:
+        return jsonify({"error": f"rx_manager import: {_e}"}), 500
+
+    reg = _rx_registry()
+    try:
+        info = reg.start(
+            stream_id=probe_sid,
+            pci_bdf=rx_pci_bdf,
+            vlan=_opt_int("vlan", 0, 4095),
+            dst_port=_opt_int("dst_port", 0, 65535),
+            src_port=_opt_int("src_port", 0, 65535),
+            src_ip=data.get("src_ip"),
+            dst_ip=data.get("dst_ip"),
+            # duration_s on the worker itself is a safety net — the
+            # server-side polling drives the real stop.
+            duration_s=duration_s + 5,
+        )
+    except FileNotFoundError as _e:
+        return jsonify({
+            "error": str(_e),
+            "hint": "run install_dpdk.sh or upgrade to v0.5.105+ to "
+                    "build /usr/local/bin/rx_worker",
+        }), 503
+    except Exception as _e:
+        logger.exception("[probe] start failed")
+        return jsonify({"error": f"probe spawn failed: {_e}"}), 500
+
+    # Poll for duration_s seconds. The rx_worker emits a heartbeat
+    # per second; we sample at the same cadence.
+    import time as _t
+    t_start = _t.monotonic()
+    first_snap = None
+    last_snap = None
+    samples = []
+    try:
+        while True:
+            elapsed = _t.monotonic() - t_start
+            if elapsed >= duration_s:
+                break
+            _t.sleep(1.0)
+            snap = reg.latest_for(probe_sid)
+            if snap:
+                samples.append({
+                    "t": round(_t.monotonic() - t_start, 2),
+                    "rx_pkts": snap.get("rx_pkts", 0),
+                    "matched_pkts": snap.get("matched_pkts", 0),
+                    "rx_pps": snap.get("rx_pps", 0),
+                    "hw_imissed": snap.get("hw_imissed", 0),
+                })
+                if first_snap is None:
+                    first_snap = snap
+                last_snap = snap
+    finally:
+        # Always stop the probe, even on exception.
+        try:
+            reg.stop(probe_sid, timeout_s=3.0)
+        except Exception as _e:
+            logger.warning(f"[probe] cleanup stop failed: {_e}")
+
+    if last_snap is None:
+        return jsonify({
+            "verdict": "needs_diag",
+            "summary": (f"rx_worker spawned (pid {info['pid']}) but never "
+                        f"emitted a heartbeat in {duration_s}s. Likely "
+                        f"early EAL failure — check journalctl -u "
+                        f"netgen-server."),
+            "actions": [
+                "Verify rx iface is vfio-bound or has bifurcated PMD support",
+                "Check hugepages: cat /proc/meminfo | grep Huge",
+                "Check journal for EAL errors around this probe attempt",
+            ],
+        }), 200
+
+    rx_pkts = int(last_snap.get("rx_pkts") or 0)
+    matched_pkts = int(last_snap.get("matched_pkts") or 0)
+    hw_imissed = int(last_snap.get("hw_imissed") or 0)
+    hw_ierrors = int(last_snap.get("hw_ierrors") or 0)
+
+    # Effective rate over the probe window.
+    effective_pps = round(rx_pkts / duration_s, 1) if duration_s else 0.0
+    expected_total = (expected_pps * duration_s) if expected_pps else None
+    delivery_pct = None
+    if expected_total and expected_total > 0:
+        delivery_pct = round(100.0 * rx_pkts / expected_total, 2)
+
+    # Verdict heuristics
+    verdict = "needs_diag"
+    summary = ""
+    actions = []
+
+    if rx_pkts == 0 and hw_imissed == 0:
+        verdict = "rx_silent"
+        summary = (f"Zero packets reached {rx_iface}'s hardware over "
+                   f"{duration_s}s. NIC chip never received a frame.")
+        actions = [
+            "Confirm TX stream is actually running (check tx_count climbing)",
+            "Verify cable connects TX iface → RX iface "
+            "(or both go through a switch with the right bridging)",
+            "Try direct loopback cable between TX and RX ports",
+            "Check switch ACL / VLAN / port-isolation settings",
+        ]
+    elif hw_imissed > 0 and rx_pkts == 0:
+        verdict = "hw_drops"
+        summary = (f"NIC dropped {hw_imissed} packets at hardware queue "
+                   f"level; 0 reached user space. Mempool / queue config "
+                   f"issue on the PMD.")
+        actions = [
+            "Check rx_queues / mempool size on the rx_worker",
+            "Look for 'rx_nombuf' or queue overflow in dmesg",
+            "Reduce TX rate and re-probe",
+        ]
+    elif rx_pkts > 0 and expected_total and rx_pkts < (0.5 * expected_total):
+        verdict = "rate_limited"
+        summary = (f"Wire delivers but at {delivery_pct}% of expected "
+                   f"rate ({rx_pkts:,} / {expected_total:,} packets in "
+                   f"{duration_s}s). Switch is likely rate-limiting "
+                   f"unknown-unicast at this pps.")
+        actions = [
+            "Check switch storm-control or rate-limit policy on the RX port",
+            "Try direct loopback cable to bypass the switch",
+            "Lower the TX rate to confirm linear delivery below the cap",
+        ]
+    elif rx_pkts > 0:
+        verdict = "rx_active"
+        pct_str = f" ({delivery_pct}% of expected)" if delivery_pct else ""
+        summary = (f"Wire delivers: {rx_pkts:,} packets in {duration_s}s "
+                   f"= {effective_pps:,.0f} pps{pct_str}. "
+                   f"hw_imissed={hw_imissed}, hw_ierrors={hw_ierrors}.")
+        if expected_total and rx_pkts < expected_total:
+            actions.append(
+                f"Some loss vs expected — at line rate this would be "
+                f"larger; consider also running the 'DPDK blast · "
+                f"end-to-end' template to confirm line-rate headroom."
+            )
+        else:
+            actions.append("Wire path validated. Safe to move to line-rate test.")
+
+    return jsonify({
+        "verdict": verdict,
+        "summary": summary,
+        "actions": actions,
+        "rx_iface": rx_iface,
+        "rx_pci_bdf": rx_pci_bdf,
+        "probe_stream_id": probe_sid,
+        "duration_s": duration_s,
+        "expected_pps": expected_pps,
+        "expected_total": expected_total,
+        "rx_pkts": rx_pkts,
+        "matched_pkts": matched_pkts,
+        "effective_pps": effective_pps,
+        "delivery_pct": delivery_pct,
+        "hw_imissed": hw_imissed,
+        "hw_ierrors": hw_ierrors,
+        "samples": samples,
+    }), 200
+
+
 @app.route("/api/admin/iface/<iface>/sysfs", methods=["GET"])
 @require_role("viewer")  # read-only; viewer can read /sys/class/net
 def api_admin_iface_sysfs(iface):

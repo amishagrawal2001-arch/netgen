@@ -2,6 +2,131 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.109] - 2026-06-12
+
+**One-shot RX verdict probe — `POST /api/admin/dpdk/rx/probe`.**
+
+The srv06 saga's final diagnostic step. After the v0.5.107 templates
+landed and v0.5.108 fixed the auto-lifecycle crash, the remaining
+question is "does the wire actually deliver DPDK-rate packets to RX?"
+— which v0.5.107's `dpdk_loopback_check` template was designed to
+answer. But that still required the operator to:
+
+1. Start the TX template stream
+2. Sleep N seconds
+3. Curl `/api/streams/stats`
+4. Eyeball `rx_count` vs an expected number
+5. Interpret what `hw_imissed > 0` vs `rx_pkts > 0` means
+
+This release collapses that loop into a single API call.
+
+### Endpoint
+
+`POST /api/admin/dpdk/rx/probe` (operator role)
+
+Body:
+```json
+{
+  "rx_iface": "ens2f1np1",
+  "rx_pci_bdf": "0000:2b:00.1",   // optional override for vfio-bound
+  "duration_s": 10,                // 1..120, default 10
+  "expected_pps": 100000,          // drives the verdict
+  "vlan": 100,                     // optional filter dims
+  "dst_port": 4791,
+  "src_port": 1234,
+  "src_ip": "10.0.0.1",
+  "dst_ip": "10.0.0.2"
+}
+```
+
+Server-side flow:
+1. Resolve PCI BDF (via `iface_to_pci_bdf` or explicit override)
+2. Spawn rx_worker with a unique `probe-<uuid>` stream_id (so it
+   never collides with an active-stream rx_worker registered by
+   the auto-lifecycle helper)
+3. Poll `latest()` each second for `duration_s` seconds, collecting
+   per-second samples
+4. Stop the rx_worker; always cleans up even on exception path
+5. Compute verdict and return
+
+### Verdicts
+
+| Verdict | Trigger | Operator action |
+|---|---|---|
+| `rx_active` | `rx_pkts > 0` and matches `expected_pps` | Wire works — move to line-rate test |
+| `rate_limited` | `rx_pkts > 0` but < 50% of `expected_pps × duration` | Switch storm-control / rate-limit (the srv06 line-rate case) |
+| `rx_silent` | `rx_pkts = 0` and `hw_imissed = 0` | Cable doesn't deliver; check ACL/VLAN or move to direct loopback |
+| `hw_drops` | `hw_imissed > 0` and `rx_pkts = 0` | NIC PMD mempool / queue config — try smaller bursts or fewer queues |
+| `needs_diag` | No heartbeat from rx_worker | EAL failure, hugepages missing, etc.; check journal |
+
+Every verdict comes with a human-readable `summary` and an
+`actions` array — the operator gets actionable guidance, not just
+raw counters.
+
+### Operator workflow on srv06
+
+```bash
+# 1. Start the TX stream from a DPDK template (e.g., dpdk_loopback_check)
+#    via the client UI — Save + Start
+
+# 2. Hit the probe with the same filter the stream is using:
+curl -sX POST localhost:5050/api/admin/dpdk/rx/probe \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "rx_iface": "ens2f1np1",
+    "duration_s": 10,
+    "expected_pps": 100000,
+    "vlan": 100,
+    "dst_port": 4791,
+    "src_ip": "10.0.0.1",
+    "dst_ip": "10.0.0.2"
+  }' | jq
+
+# 3. Read verdict + summary + actions
+```
+
+Response example (`rate_limited` case):
+```json
+{
+  "verdict": "rate_limited",
+  "summary": "Wire delivers but at 12.3% of expected rate
+              (123,000 / 1,000,000 packets in 10s). Switch is
+              likely rate-limiting unknown-unicast at this pps.",
+  "actions": [
+    "Check switch storm-control or rate-limit policy on the RX port",
+    "Try direct loopback cable to bypass the switch",
+    "Lower the TX rate to confirm linear delivery below the cap"
+  ],
+  "rx_iface": "ens2f1np1",
+  "rx_pkts": 123000,
+  "effective_pps": 12300.0,
+  "delivery_pct": 12.3,
+  "hw_imissed": 0,
+  "samples": [...]
+}
+```
+
+### Tests
+
+13 new in `test_v0510x_rx_probe.py`:
+- Input validation (missing iface, bad iface, bad BDF, clamped
+  duration)
+- All five verdict heuristics with mocked rx_worker stdout
+- Worker cleanup after every probe (no zombies even after 10x
+  in a row)
+- 503 when rx_worker binary missing (with install_dpdk.sh hint)
+- 400 when PCI BDF unresolvable (with rx_pci_bdf hint)
+- Per-second `samples` array exposed in response
+
+Full suite: **2,453 passed**, 1 skipped (+13 new).
+
+### Not yet wired
+
+A "Run probe" button in the admin console's iface drawer next to
+the existing "Start rx_worker (60s)" button would be the natural
+UI surface. Deferred to v0.5.110 — the endpoint is the substance;
+the UI shell is mechanical.
+
 ## [0.5.108] - 2026-06-12
 
 **Hot-fix: `_maybe_start_dpdk_rx_for_stream` 500'd on the real
