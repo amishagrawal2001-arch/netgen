@@ -93,7 +93,10 @@ def test_drawer_handles_structured_sections():
     src = _src()
     idx = src.find("async function ifaceDetailsToggle(")
     assert idx > 0
-    body = src[idx:idx + 5000]
+    # v0.5.105: the drawer body grew (Live counters tile + RX-drop
+    # surfacing). Widen the window so the test sees the entire
+    # function, not a truncated slice.
+    body = src[idx:idx + 12000]
     # JS reads either {stdout, error} or backward-compat raw string.
     assert "_sec.stdout" in body
     assert "_sec.error" in body

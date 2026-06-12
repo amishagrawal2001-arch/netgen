@@ -365,6 +365,89 @@ def _rebuild_tx_worker(install_root: Path, venv_py: Path) -> None:
         )
 
 
+def _rebuild_rx_worker(install_root: Path, venv_py: Path) -> None:
+    """Rebuild rx_worker.c against the locally-installed DPDK.
+
+    v0.5.105 — RX-side DPDK worker for line-rate accurate capture.
+    Mirrors _rebuild_tx_worker exactly. The same prereqs and skip
+    conditions apply; we don't double up on the meson/ninja/libdpdk
+    checks since if tx rebuild ran, the deps are there.
+
+    Best-effort: missing source dir = wheel didn't ship rx_worker
+    (pre-v0.5.105 wheels). Skip + warn; no DPDK RX feature, falls
+    back to Scapy RX automatically.
+    """
+    try:
+        rc = subprocess.run(
+            [str(venv_py), "-c",
+             "import resources.dpdk, os; "
+             "print(os.path.dirname(resources.dpdk.__file__))"],
+            capture_output=True, text=True, timeout=10,
+        )
+        if rc.returncode != 0 or not rc.stdout.strip():
+            logger.info(
+                "[RX_WORKER] could not locate resources.dpdk package; "
+                "skipping rebuild (Scapy RX still works)."
+            )
+            return
+        src_dir = Path(rc.stdout.strip()) / "rx_worker"
+        if not (src_dir / "rx_worker.c").exists():
+            logger.info(
+                f"[RX_WORKER] {src_dir}/rx_worker.c not present "
+                f"(wheel predates v0.5.105). Skipping; DPDK RX "
+                f"unavailable until a v0.5.105+ wheel is installed."
+            )
+            return
+        if not (src_dir / "meson.build").exists():
+            logger.warning(
+                f"[RX_WORKER] {src_dir}/meson.build missing; skipping."
+            )
+            return
+        logger.info(f"[RX_WORKER] source located at {src_dir}")
+    except Exception as exc:
+        logger.warning(
+            f"[RX_WORKER] source lookup failed: {exc}; skipping rebuild"
+        )
+        return
+
+    build_dir = src_dir / "build"
+    try:
+        if build_dir.exists():
+            subprocess.run(
+                ["rm", "-rf", str(build_dir)],
+                check=True, timeout=10,
+            )
+        _run(["meson", "setup", str(build_dir), str(src_dir)],
+             check=True)
+        _run(["meson", "compile", "-C", str(build_dir)], check=True)
+    except subprocess.CalledProcessError as exc:
+        logger.warning(
+            f"[RX_WORKER] rebuild failed: {exc}. DPDK RX feature "
+            f"unavailable; Scapy RX still works."
+        )
+        return
+
+    built = build_dir / "rx_worker"
+    if not built.exists():
+        logger.warning(
+            f"[RX_WORKER] meson reported success but {built} is "
+            f"missing. Skipping install."
+        )
+        return
+
+    try:
+        _run(["install", "-m755", str(built), "/usr/local/bin/rx_worker"],
+             check=True)
+        logger.info(
+            "[RX_WORKER] ✓ Rebuilt and installed to /usr/local/bin/rx_worker"
+        )
+    except subprocess.CalledProcessError as exc:
+        logger.warning(
+            f"[RX_WORKER] install to /usr/local/bin/ failed: {exc}. "
+            f"The freshly-built binary is at {built}."
+        )
+
+
 def main() -> int:
     _setup_logging()
     _require_root()
@@ -507,6 +590,10 @@ def main() -> int:
     # build deps aren't present (libdpdk-dev missing) we WARN
     # and continue; the launcher can still run Scapy streams.
     _rebuild_tx_worker(install_root, venv_py)
+    # v0.5.105: rebuild rx_worker too — symmetric companion that
+    # enables line-rate accurate RX counting without going through
+    # the kernel netdev (which overflows at 24M+ pps; see srv06).
+    _rebuild_rx_worker(install_root, venv_py)
 
     # v0.5.102: drop in the Mellanox rlimits conf for already-
     # installed servers. v0.5.101 added LimitMEMLOCK=infinity

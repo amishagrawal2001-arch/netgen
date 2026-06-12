@@ -70,6 +70,12 @@ py-modules = ["multithreaded_traffic_gen", "run_tgen_client", "run_tgen_server",
     "tx_worker/*.c",
     "tx_worker/*.h",
     "tx_worker/meson.build",
+    # v0.5.105: rx_worker — symmetric DPDK RX counter for line-
+    # rate accurate capture. Same whitelist approach as tx_worker:
+    # build artifacts (build/) are per-host so don't ship them.
+    "rx_worker/*.c",
+    "rx_worker/*.h",
+    "rx_worker/meson.build",
 ]
 # v0.5.49: bundle netgen-upgrade so the running server can
 # self-heal /opt/netgen-server/bin/netgen-upgrade on startup.

@@ -1058,6 +1058,59 @@ EOF
     fi
 }
 
+# Step 6.5 (v0.5.105): Build rx_worker — symmetric companion to
+# tx_worker, line-rate accurate RX counter without going through
+# the kernel netdev. Built the simple way (direct meson) instead
+# of using dpdk_tx_worker.sh's ABI-detection ceremony — rx_worker
+# is brand new so there's no legacy ABI to navigate.
+#
+# Failure is non-fatal: rx_worker enables the DPDK RX engine; if
+# the build fails, the Scapy RX engine still works. Operators
+# can re-run install_dpdk.sh to retry.
+step_build_rx_worker() {
+    log_step "Step 6.5: Building rx_worker Application"
+
+    local rx_src="$SCRIPT_DIR/rx_worker"
+    if [[ ! -d "$rx_src" || ! -f "$rx_src/rx_worker.c" ]]; then
+        log_warning "rx_worker sources not found at $rx_src — skipping."
+        log_info "  (Pre-v0.5.105 layouts don't ship rx_worker; that's expected.)"
+        return 0
+    fi
+
+    log_info "Building rx_worker from $rx_src..."
+    export PKG_CONFIG_PATH="/usr/local/lib/x86_64-linux-gnu/pkgconfig:/usr/local/lib/pkgconfig:${PKG_CONFIG_PATH:-}"
+
+    if [[ -d "$rx_src/build" ]]; then
+        rm -rf "$rx_src/build"
+    fi
+
+    if ! meson setup "$rx_src/build" "$rx_src" 2>&1; then
+        log_warning "rx_worker meson setup failed (DPDK RX feature unavailable; "
+        log_warning "Scapy RX still works). Re-run install_dpdk.sh to retry."
+        return 0
+    fi
+    if ! meson compile -C "$rx_src/build" 2>&1; then
+        log_warning "rx_worker compile failed (DPDK RX feature unavailable)."
+        return 0
+    fi
+
+    local rx_bin="$rx_src/build/rx_worker"
+    if [[ ! -x "$rx_bin" ]]; then
+        log_warning "rx_worker build reported success but $rx_bin missing."
+        return 0
+    fi
+
+    # Install to /usr/local/bin/ — canonical resolver path used by
+    # utils/dpdk_rx_worker.py:_resolve_rx_worker_bin (same pattern as
+    # tx_worker).
+    if install -m755 "$rx_bin" /usr/local/bin/rx_worker 2>/dev/null; then
+        log_success "Installed rx_worker to /usr/local/bin/rx_worker"
+    else
+        log_warning "install to /usr/local/bin/ failed (non-fatal); the binary"
+        log_warning "is at $rx_bin and can be copied manually."
+    fi
+}
+
 # Step 7: Configure hugepages
 step_configure_hugepages() {
     log_step "Step 7: Configuring Hugepages"
@@ -1633,6 +1686,10 @@ main() {
     step_install_dependencies
     step_build_dpdk
     step_build_tx_worker
+    # v0.5.105: rx_worker is the companion to tx_worker. Failure is
+    # non-fatal (DPDK RX engine becomes unavailable; Scapy RX still
+    # works), so we don't gate Step 7+ on its success.
+    step_build_rx_worker
     step_configure_hugepages
     step_configure_iommu
     step_nic_binding

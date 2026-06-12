@@ -20938,6 +20938,8 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
           <span style="color: var(--muted);">TX packets</span><span class="ctr-txpkt">—</span>
           <span style="color: var(--muted);">RX errors</span><span class="ctr-rxerr">—</span>
           <span style="color: var(--muted);">TX dropped</span><span class="ctr-txdrop">—</span>
+          <span style="color: var(--muted);">RX dropped</span><span class="ctr-rxdrop" title="Packets reached the NIC but dropped at the netdev — usually kernel backlog overflow at high pps">—</span>
+          <span style="color: var(--muted);">RX drop pps</span><span class="ctr-rxdroppps" title="Delta rate of rx_dropped; non-zero means TX is overwhelming the kernel netdev">—</span>
         </div>
         <div class="ctr-warn" style="font-size: 11px; color: var(--bad); margin-top: 6px;"></div>
       </div>`;
@@ -21020,6 +21022,11 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
           setText('ctr-txpkt', _fmtCount(d.tx_packets));
           setText('ctr-rxerr', _fmtCount(d.rx_errors));
           setText('ctr-txdrop', _fmtCount(d.tx_dropped));
+          // v0.5.105: rx_dropped surfaced after srv06 saga revealed
+          // 250M cumulative drops were hiding behind the existing
+          // counters. Big rx_drop_pps = kernel netdev overflow,
+          // need DPDK RX or lower TX rate.
+          setText('ctr-rxdrop', _fmtCount(d.rx_dropped));
           // Delta-based rates (requires two samples)
           if (prev && prev.ts_ns && d.ts_ns) {
             const elapsed = (d.ts_ns - prev.ts_ns) / 1e9;
@@ -21030,10 +21037,26 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
               const txPps = safeRate(prev.tx_packets, d.tx_packets);
               const rxBps = safeRate(prev.rx_bytes, d.rx_bytes);
               const txBps = safeRate(prev.tx_bytes, d.tx_bytes);
+              const rxDropPps = safeRate(prev.rx_dropped, d.rx_dropped);
               setText('ctr-rxpps', rxPps === null ? '—' : _fmtCount(Math.round(rxPps)) + '/s');
               setText('ctr-txpps', txPps === null ? '—' : _fmtCount(Math.round(txPps)) + '/s');
               setText('ctr-rxbps', _fmtBps(rxBps === null ? null : rxBps * 8));
               setText('ctr-txbps', _fmtBps(txBps === null ? null : txBps * 8));
+              // v0.5.105: rx drop rate. Non-zero = kernel netdev
+              // overflow — operator should know to either drop the
+              // TX rate or switch to DPDK RX engine.
+              const rxDropEl = ctrWrap.querySelector('.ctr-rxdroppps');
+              if (rxDropEl) {
+                if (rxDropPps === null || rxDropPps === 0) {
+                  rxDropEl.textContent = rxDropPps === 0 ? '0/s' : '—';
+                  rxDropEl.style.color = '';
+                } else {
+                  rxDropEl.textContent = _fmtCount(Math.round(rxDropPps)) + '/s';
+                  // Red when actively dropping — operator-visible
+                  // alarm without needing to read the number.
+                  rxDropEl.style.color = 'var(--bad)';
+                }
+              }
             }
           }
           prev = d;

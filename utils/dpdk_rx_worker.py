@@ -1,0 +1,268 @@
+"""DPDK RX worker launcher + stdout-tail counter integration.
+
+Solves the srv06 problem (Jun 12 2026): kernel netdev RX overflow at
+24M pps. tx_worker pushes line-rate, the wire delivers, but the
+kernel's `netdev_max_backlog` overflows in microseconds and Scapy's
+AF_PACKET sniffer never sees a single packet.
+
+DPDK RX captures frames straight off the PMD's RX queues — zero
+kernel involvement, hardware-accurate, line-rate-capable. Works for
+any TX source: Scapy, DPDK, external host. The PMD doesn't care.
+
+Mirrors utils/dpdk_tx_worker.py's structure:
+  - `_resolve_rx_worker_bin()` — same search order as tx
+  - `start_rx_worker(...)` → returns RxHandle (process + line reader)
+  - `stop_rx_worker(handle)` → SIGTERM + drain + final summary
+  - Latest counters available via `handle.latest()` — non-blocking
+
+Worker stdout is one JSON line per second + a `{"final":true,...}`
+on exit. The launcher's background thread parses each line into the
+handle's `_latest` dict. Callers read `handle.latest()` to surface
+counters via the existing /api/streams/stats endpoint with no schema
+change — DPDK RX just becomes another stats source.
+
+For srv06 specifically: TX side stays as today (tx_worker on
+ens2f0np0, vfio-bound). RX side gains rx_worker on ens2f1np1 —
+which on Mellanox can run in BIFURCATED mode (kernel netdev stays
+present + DPDK PMD attaches simultaneously). On Intel/Broadcom the
+RX iface must be vfio-bound; tcpdump won't work on it while netgen
+has it, same trade-off DPDK TX makes today.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import os
+import shlex
+import signal
+import subprocess
+import threading
+import time
+from dataclasses import dataclass, field
+from typing import Optional
+
+LOG = logging.getLogger(__name__)
+
+_LATEST_LOCK = threading.Lock()
+
+
+def _resolve_rx_worker_bin() -> Optional[str]:
+    """Same priority chain as _resolve_tx_worker_bin (see
+    utils/dpdk_tx_worker.py): env override → /usr/local/bin →
+    install dirs → wheel-shipped. Returns None if nothing found —
+    callers should fall back to Scapy with an explanatory warning."""
+    p = os.environ.get("RX_WORKER_BIN")
+    if p and os.path.exists(p):
+        LOG.debug("[dpdk-rx] RX_WORKER_BIN=%s", p)
+        return os.path.abspath(p)
+
+    cand = "/usr/local/bin/rx_worker"
+    if os.path.exists(cand):
+        LOG.debug("[dpdk-rx] using /usr/local/bin/rx_worker")
+        return cand
+
+    for install_dir in ("/opt/netgen", "/opt/OSTG", "/opt/netgen-server"):
+        cand = os.path.join(install_dir, "resources", "dpdk",
+                            "rx_worker", "build", "rx_worker")
+        if os.path.exists(cand):
+            LOG.debug("[dpdk-rx] using install-dir rx_worker: %s", cand)
+            return os.path.abspath(cand)
+
+    # Wheel-shipped fallback — likely stale ABI but better than
+    # nothing on a CI host or fresh install before install_dpdk.sh.
+    try:
+        from importlib.resources import files as _res_files
+        rp = _res_files("resources.dpdk.rx_worker") / "build" / "rx_worker"
+        if rp and os.path.exists(rp.as_posix()):
+            LOG.debug("[dpdk-rx] wheel fallback %s (may have stale ABI)",
+                      rp.as_posix())
+            return rp.as_posix()
+    except Exception:
+        pass
+
+    LOG.debug("[dpdk-rx] no rx_worker binary found anywhere")
+    return None
+
+
+@dataclass
+class RxHandle:
+    """Live handle to a running rx_worker child."""
+    stream_id: str
+    proc: subprocess.Popen
+    cmd: list[str]
+    started_at: float
+    # Updated by the stdout-reader thread on every heartbeat line.
+    # Always read via .latest() (which copies under the lock).
+    _latest: dict = field(default_factory=dict)
+    _final: Optional[dict] = None
+    _reader: Optional[threading.Thread] = None
+
+    def latest(self) -> dict:
+        """Non-blocking snapshot of the most recent counter heartbeat
+        from the worker. Returns empty dict if no heartbeat yet."""
+        with _LATEST_LOCK:
+            return dict(self._latest)
+
+    def final(self) -> Optional[dict]:
+        """The `{"final":true,...}` line emitted on exit. None until
+        the worker has stopped + emitted it."""
+        with _LATEST_LOCK:
+            return dict(self._final) if self._final else None
+
+    def is_running(self) -> bool:
+        return self.proc.poll() is None
+
+
+def _stdout_reader(handle: RxHandle) -> None:
+    """Tail the worker's stdout; parse one JSON line at a time and
+    stash into the handle's _latest / _final fields. Runs in its own
+    thread (daemon) until the worker exits.
+
+    Resilient to non-JSON lines (rare; worker stderrs everything that
+    isn't JSON, but EAL spew can still slip out on a bad day)."""
+    try:
+        for raw in handle.proc.stdout:
+            line = raw.strip()
+            if not line:
+                continue
+            if line[0] != "{":
+                LOG.debug("[dpdk-rx %s] non-json: %s",
+                          handle.stream_id, line[:120])
+                continue
+            try:
+                d = json.loads(line)
+            except json.JSONDecodeError as exc:
+                LOG.debug("[dpdk-rx %s] parse: %s | line=%s",
+                          handle.stream_id, exc, line[:120])
+                continue
+            with _LATEST_LOCK:
+                if d.get("final"):
+                    handle._final = d
+                else:
+                    handle._latest = d
+    except Exception as exc:
+        LOG.warning("[dpdk-rx %s] reader thread crashed: %s",
+                    handle.stream_id, exc)
+
+
+def start_rx_worker(
+    *,
+    stream_id: str,
+    pci_bdf: str,
+    lcores: str = "0,1,2,3",
+    file_prefix: Optional[str] = None,
+    rx_queues: int = 1,
+    vlan: Optional[int] = None,
+    dst_port: Optional[int] = None,
+    src_port: Optional[int] = None,
+    src_ip: Optional[str] = None,
+    dst_ip: Optional[str] = None,
+    duration_s: int = 0,
+    extra_eal_args: Optional[list[str]] = None,
+) -> RxHandle:
+    """Spawn rx_worker as a subprocess capturing stdout. Returns a
+    RxHandle the caller polls for counter updates.
+
+    pci_bdf: the RX port's PCI BDF (e.g. 0000:2b:00.1). Required.
+    lcores: comma-separated lcore list. Must include enough cores
+        for main + rx_queues workers.
+    file_prefix: DPDK multi-instance prefix. Defaults to
+        f"rxw_{stream_id}". Mandatory if tx_worker is also running
+        on the same host — different prefixes give different
+        /var/run/dpdk dirs and avoid collisions.
+    rx_queues: how many RX queues to set up. Multi-queue spreads
+        work across cores via RSS for >40Gbps line rates.
+    vlan / dst_port / src_port / src_ip / dst_ip: optional filter
+        spec — if any are set, only matched_pkts grows. rx_pkts
+        always counts every frame the port receives (useful for
+        validating "did the wire deliver?").
+    duration_s: 0 = run until SIGTERM; >0 = self-stop after N sec.
+    """
+    binary = _resolve_rx_worker_bin()
+    if not binary:
+        raise FileNotFoundError(
+            "rx_worker binary not found — re-run install_dpdk.sh, "
+            "or wait for v0.5.105's netgen-upgrade to rebuild it"
+        )
+    if not pci_bdf:
+        raise ValueError("pci_bdf is required for DPDK RX")
+
+    if file_prefix is None:
+        # Same naming convention as tx_worker for log greppability.
+        file_prefix = f"rxw_{stream_id[:8]}_{os.getpid()}_{int(time.time()*1000)}"
+
+    eal = [binary,
+           "-l", lcores,
+           "-n", "4",
+           "--file-prefix", file_prefix,
+           "-a", pci_bdf]
+    if extra_eal_args:
+        eal.extend(extra_eal_args)
+
+    app = ["--", "--stream-id", stream_id, "--rx-queues", str(rx_queues)]
+    if vlan is not None:
+        app.extend(["--vlan", str(int(vlan))])
+    if dst_port is not None:
+        app.extend(["--dst-port", str(int(dst_port))])
+    if src_port is not None:
+        app.extend(["--src-port", str(int(src_port))])
+    if src_ip:
+        app.extend(["--src-ip", str(src_ip)])
+    if dst_ip:
+        app.extend(["--dst-ip", str(dst_ip)])
+    if duration_s > 0:
+        app.extend(["--duration", str(int(duration_s))])
+
+    cmd = eal + app
+    LOG.info("[dpdk-rx] exec: %s", " ".join(shlex.quote(a) for a in cmd))
+
+    # text=True so we get str lines, not bytes — matches tx_worker
+    # pattern. bufsize=1 → line-buffered so we get heartbeats with
+    # 1-second granularity, not after some big stdout buffer fills.
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        text=True, bufsize=1,
+    )
+    handle = RxHandle(
+        stream_id=stream_id, proc=proc, cmd=cmd,
+        started_at=time.monotonic(),
+    )
+    t = threading.Thread(
+        target=_stdout_reader, args=(handle,),
+        daemon=True, name=f"rx-reader-{stream_id[:8]}",
+    )
+    handle._reader = t
+    t.start()
+    return handle
+
+
+def stop_rx_worker(handle: RxHandle, timeout_s: float = 5.0) -> dict:
+    """Stop the worker cleanly. Returns the final summary dict (or
+    empty if the worker died before emitting one).
+
+    Sequence: SIGTERM → wait up to timeout_s → SIGKILL fallback.
+    SIGTERM lets the worker drain its current burst and emit the
+    `{"final":true,...}` line; SIGKILL is the last-resort backstop
+    for a wedged worker."""
+    if handle.proc.poll() is None:
+        try:
+            handle.proc.send_signal(signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            handle.proc.wait(timeout=timeout_s)
+        except subprocess.TimeoutExpired:
+            LOG.warning("[dpdk-rx %s] SIGTERM ignored, sending SIGKILL",
+                        handle.stream_id)
+            handle.proc.kill()
+            try:
+                handle.proc.wait(timeout=2)
+            except subprocess.TimeoutExpired:
+                pass
+
+    # Reader thread holds onto stdout until proc closes the FD; join
+    # briefly to let it parse the final line if any.
+    if handle._reader and handle._reader.is_alive():
+        handle._reader.join(timeout=2)
+
+    return handle.final() or {}
