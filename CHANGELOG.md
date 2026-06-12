@@ -2,6 +2,98 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.107] - 2026-06-12
+
+**DPDK templates pair TX + RX engines. Two new dedicated templates for end-to-end DPDK.**
+
+The Add/Edit Stream dialog's template dropdown has been a one-click
+way to seed sensible stream configs since v0.3.11. But the 15+
+DPDK-enabled templates all pre-date v0.5.105's `rx_engine` field —
+picking any of them silently defaulted to Scapy RX, dropping at
+high pps. Every operator using a DPDK template as a starter would
+re-discover srv06's RX=0 saga. Closed.
+
+### Updated existing DPDK templates
+
+All templates with `dpdk_enable: True` now also set
+`rx_engine: "dpdk"` so the auto-lifecycle helper spawns rx_worker
+on stream start. 15 templates touched:
+
+`udp_line_rate_64b`, `udp_line_rate_1500b`, `udp_imix`,
+`lag_hash_test`, `latency_probe`, `vxlan_encap`,
+`vlan_tagged_udp`, `mac_dst_sweep_1k`, `mac_src_sweep_1k`,
+`mac_src_and_dst_sweep_1k`, `ipv4_dst_sweep_256`,
+`ipv4_src_sweep_256`, `ipv6_dst_sweep_64`,
+`five_tuple_sweep_rss`, `udp_src_port_sweep_1k`,
+`udp_dst_port_sweep_1k`.
+
+### New dedicated templates
+
+**`dpdk_blast_e2e` — "DPDK blast · end-to-end (TX + RX both line-rate)"**
+
+The natural pairing of v0.5.105's tx_worker + rx_worker. Saturates
+the wire AND captures every frame on the RX side at hardware
+accuracy — kernel netdev bypassed on both sides. Stats surface
+`hw_imissed` and `hw_ierrors` so operators see whether the NIC
+chip itself is dropping. 128 B frames balance pps stress against
+bps headroom. Hardware timestamps on for one-way latency.
+
+**`dpdk_loopback_check` — "DPDK loopback validation · 100 Kpps (safe rate)"**
+
+Same DPDK e2e path as the blast template, throttled to 100,000 pps —
+well under any typical switch storm-control cap. Use BEFORE
+line-rate tests to confirm the TX→RX wire path actually delivers
+DPDK-generated frames.
+
+The summary teaches the diagnostic flow inline:
+- RX climbs at 100K but flatlines at line rate → switch is
+  rate-limiting unknown-unicast (the srv06 bite)
+- RX stays at 0 even at 100K → cable doesn't connect the two ports
+  at all; check ACLs / VLAN / direct loopback
+
+### Cross-template invariant
+
+The test suite gains a guardrail: any template with
+`dpdk_enable: True` MUST also have `rx_engine: "dpdk"`. Future
+maintainers adding a new DPDK template will see the test fail
+until they pair the engines. Closes the class of bug that
+otherwise reintroduces srv06's RX=0 for every new DPDK template.
+
+### Tests
+
+11 new in `test_v0510x_dpdk_templates.py`:
+
+- Both legacy line-rate templates wire rx_engine correctly
+- `dpdk_blast_e2e` exists + has both engines + standard
+  MACs/IPs (consistency with sibling templates)
+- `dpdk_loopback_check` exists + throttles to ≤1Mpps + uses both
+  DPDK engines + summary mentions the srv06 use case
+- Cross-template invariant: every `dpdk_enable=True` template has
+  `rx_engine="dpdk"`
+- New entries are discoverable via `list_templates()` (so the
+  dialog dropdown picks them up)
+
+Full suite: **2,433 passed**, 1 skipped (+11 new).
+
+### Operator workflow
+
+```
+1. Open client → Add/Edit stream dialog
+2. Template dropdown → "DPDK loopback validation · 100 Kpps"
+   (or "DPDK blast · end-to-end", or any of the now-fixed
+   legacy DPDK templates)
+3. Save + Start
+4. rx_worker auto-spawns matching the stream's filter
+5. /api/streams/stats shows rx_engine=dpdk + hw_imissed/ierrors
+6. RX climbs immediately (if the wire works)
+```
+
+For srv06's specific debug flow: use **dpdk_loopback_check** first
+to confirm the wire delivers AT ALL, then switch to
+**dpdk_blast_e2e** for the line-rate validation. If only the
+loopback-check template's RX climbs, that's a definitive
+"switch is rate-limiting" verdict.
+
 ## [0.5.106] - 2026-06-12
 
 **Audit fixes for v0.5.105 — rx_worker leak paths closed.**
