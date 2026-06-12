@@ -746,6 +746,49 @@ def stream_stats():
                 "last_update": stream.get("last_update")
             })
         
+        # v0.5.105 Phase B: fold DPDK rx_worker counters into stream
+        # stats. When an operator has manually started rx_worker via
+        # /api/admin/dpdk/rx/start for a stream_id, the kernel-netdev
+        # rx_count is unreliable at high pps (250M cumulative drops
+        # was the srv06 bite). Prefer the worker's matched_pkts.
+        try:
+            from utils.dpdk_rx_manager import registry as _rx_registry
+            _rxreg = _rx_registry()
+            for s in active_streams:
+                sid = s.get("stream_id")
+                if not sid:
+                    s["rx_engine"] = "scapy"
+                    continue
+                snap = _rxreg.latest_for(sid)
+                if snap is None:
+                    # No rx_worker for this stream → kernel Scapy
+                    # path; leave rx_count/rx_rate as-is.
+                    s["rx_engine"] = "scapy"
+                    continue
+                # rx_worker reports matched_pkts (filter-passed) and
+                # rx_pkts (all received). Prefer matched because the
+                # operator set the filter to target this stream.
+                matched = snap.get("matched_pkts")
+                if matched is not None:
+                    s["rx_count"] = int(matched)
+                    # rx_pps is the wire rate of all frames; matched
+                    # rate has to be derived from matched_pkts deltas
+                    # which we don't have without two samples. Leave
+                    # rx_rate alone for now — UI's secondary metric.
+                pps = snap.get("rx_pps")
+                if pps is not None:
+                    s["rx_rate"] = float(pps)
+                s["rx_engine"] = "dpdk"
+                s["rx_engine_detail"] = {
+                    "hw_imissed": snap.get("hw_imissed"),
+                    "hw_ierrors": snap.get("hw_ierrors"),
+                    "hw_rx_nombuf": snap.get("hw_rx_nombuf"),
+                }
+        except Exception as _rxe:
+            # Best-effort fold; if it crashes, stats endpoint still
+            # returns the existing shape. Log once per failure mode.
+            logging.warning(f"[STATS] rx_worker fold failed: {_rxe}")
+
         return jsonify({"active_streams": active_streams}), 200
     except Exception as e:
         logging.error(f"[STATS] Error getting stream statistics: {e}")
@@ -21819,6 +21862,165 @@ def admin_iface_counters(iface):
         logger.exception("[admin] counters read failed")
         return jsonify({"error": f"counter read failed: {_e}"}), 500
     return jsonify(snap)
+
+
+# ─── v0.5.105 Phase B: DPDK RX worker control endpoints ─────────
+#
+# Manual rx_worker lifecycle so operators can attach line-rate-
+# accurate RX visibility to any vfio-bound port without going
+# through the full stream flow. Useful for:
+#   - "I just want to see if 24M pps is actually arriving on
+#     ens2f1np1 — start an rx_worker for 60s and tell me"
+#   - Bridge between Phase A (built worker) and Phase B (per-
+#     stream rx_engine routing) — gives the feature value before
+#     the schema work lands
+#
+# Endpoints:
+#   POST /api/admin/dpdk/rx/start  → spawn (operator role)
+#   POST /api/admin/dpdk/rx/stop   → terminate (operator role)
+#   GET  /api/admin/dpdk/rx/list   → all running + latest counters
+#                                     (viewer role)
+#   GET  /api/admin/dpdk/rx/latest/<stream_id> → one stream's snapshot
+
+
+_RE_RX_STREAM_ID = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+_RE_PCI_BDF = re.compile(r"^[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-9]$")
+
+
+@app.route("/api/admin/dpdk/rx/start", methods=["POST"])
+@require_role("operator")  # spawns a privileged process that grabs
+                            # a PCI port; same surface as install_dpdk
+def api_admin_dpdk_rx_start():
+    """Spawn an rx_worker. Body:
+      {"stream_id": "udp-test", "pci_bdf": "0000:2b:00.1",
+       "vlan": 100, "dst_port": 4791, "src_ip": "10.0.0.1",
+       "duration_s": 60, "rx_queues": 1, "lcores": "0,1,2"}
+
+    Required: stream_id, pci_bdf. All filter fields are optional;
+    omitted = no filter on that dimension (worker counts every
+    frame that hits the port)."""
+    try:
+        data = request.get_json(force=True) or {}
+    except Exception:
+        return jsonify({"error": "invalid JSON"}), 400
+
+    sid = data.get("stream_id")
+    pci = data.get("pci_bdf")
+    if not sid or not _RE_RX_STREAM_ID.match(str(sid)):
+        return jsonify({"error": "invalid stream_id"}), 400
+    if not pci or not _RE_PCI_BDF.match(str(pci).lower()):
+        return jsonify({"error": "invalid pci_bdf"}), 400
+
+    # Bounded integer extractors — defends against negative or
+    # absurd values that could crash rx_worker or overflow the
+    # build of meson's lcore mask.
+    def _opt_int(key, lo, hi):
+        v = data.get(key)
+        if v is None:
+            return None
+        try:
+            iv = int(v)
+        except (TypeError, ValueError):
+            return None
+        if iv < lo or iv > hi:
+            return None
+        return iv
+
+    kwargs = dict(
+        stream_id=str(sid),
+        pci_bdf=str(pci).lower(),
+        lcores=str(data.get("lcores", "0,1,2,3")),
+        rx_queues=_opt_int("rx_queues", 1, 16) or 1,
+        duration_s=_opt_int("duration_s", 0, 86400) or 0,
+        vlan=_opt_int("vlan", 0, 4095),
+        dst_port=_opt_int("dst_port", 0, 65535),
+        src_port=_opt_int("src_port", 0, 65535),
+        src_ip=data.get("src_ip"),
+        dst_ip=data.get("dst_ip"),
+    )
+
+    try:
+        from utils.dpdk_rx_manager import registry as _rx_registry
+    except Exception as _e:
+        return jsonify({"error": f"rx_manager import: {_e}"}), 500
+    try:
+        info = _rx_registry().start(**kwargs)
+    except ValueError as _e:
+        # Already running — operator-facing 409 is more honest
+        # than a 400 (the request itself was well-formed).
+        return jsonify({"error": str(_e)}), 409
+    except FileNotFoundError as _e:
+        # rx_worker binary missing — guide the operator at the
+        # fix instead of just 500ing.
+        return jsonify({
+            "error": str(_e),
+            "hint": ("run install_dpdk.sh to build + install "
+                     "/usr/local/bin/rx_worker, or upgrade to a "
+                     "v0.5.105+ wheel which triggers the rebuild"),
+        }), 503
+    except Exception as _e:
+        logger.exception("[dpdk-rx] start failed")
+        return jsonify({"error": f"start failed: {_e}"}), 500
+    return jsonify({"ok": True, **info}), 200
+
+
+@app.route("/api/admin/dpdk/rx/stop", methods=["POST"])
+@require_role("operator")
+def api_admin_dpdk_rx_stop():
+    """Stop an rx_worker. Body: {"stream_id": "..."}.
+
+    Idempotent — returns {"status": "unknown"} if the stream_id
+    isn't registered, {"status": "not_running"} if it's gone but
+    the handle was still cached, {"status": "stopped"} on a real
+    stop. final summary is included when available."""
+    try:
+        data = request.get_json(force=True) or {}
+    except Exception:
+        return jsonify({"error": "invalid JSON"}), 400
+    sid = data.get("stream_id")
+    if not sid or not _RE_RX_STREAM_ID.match(str(sid)):
+        return jsonify({"error": "invalid stream_id"}), 400
+    try:
+        from utils.dpdk_rx_manager import registry as _rx_registry
+    except Exception as _e:
+        return jsonify({"error": f"rx_manager import: {_e}"}), 500
+    try:
+        result = _rx_registry().stop(str(sid))
+    except Exception as _e:
+        logger.exception("[dpdk-rx] stop failed")
+        return jsonify({"error": f"stop failed: {_e}"}), 500
+    return jsonify(result), 200
+
+
+@app.route("/api/admin/dpdk/rx/list", methods=["GET"])
+@require_role("viewer")
+def api_admin_dpdk_rx_list():
+    """Snapshot of all running rx_workers + their latest counters.
+    Empty list when nothing is running."""
+    try:
+        from utils.dpdk_rx_manager import registry as _rx_registry
+    except Exception as _e:
+        return jsonify({"error": f"rx_manager import: {_e}"}), 500
+    return jsonify({"workers": _rx_registry().list()}), 200
+
+
+@app.route("/api/admin/dpdk/rx/latest/<stream_id>", methods=["GET"])
+@require_role("viewer")
+def api_admin_dpdk_rx_latest(stream_id):
+    """The most-recent heartbeat from one rx_worker. Returns 404
+    if the stream_id isn't registered — operator distinguishes
+    'I haven't started one yet' from 'it's been running but
+    silent'."""
+    if not _RE_RX_STREAM_ID.match(stream_id or ""):
+        return jsonify({"error": "invalid stream_id"}), 400
+    try:
+        from utils.dpdk_rx_manager import registry as _rx_registry
+    except Exception as _e:
+        return jsonify({"error": f"rx_manager import: {_e}"}), 500
+    snap = _rx_registry().latest_for(stream_id)
+    if snap is None:
+        return jsonify({"error": "no rx_worker for that stream_id"}), 404
+    return jsonify(snap), 200
 
 
 @app.route("/api/admin/iface/<iface>/sysfs", methods=["GET"])
