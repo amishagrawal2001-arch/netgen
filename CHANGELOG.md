@@ -2,6 +2,104 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.108] - 2026-06-12
+
+**Hot-fix: `_maybe_start_dpdk_rx_for_stream` 500'd on the real
+production payload — wrong field-path assumption.**
+
+### Operator-reported symptom (srv06)
+
+After upgrading to v0.5.107 and starting a stream from the new
+"DPDK loopback validation" template (or any DPDK stream with
+`rx_engine: "dpdk"` set):
+
+```
+AttributeError: 'str' object has no attribute 'get'
+  at run_tgen_server.py:614, vlan=_int_or_none(vlan_cfg.get("vlan_id"), 0, 4095)
+```
+
+`/api/traffic/start` returned 500. Stream never started. Hit any
+operator on v0.5.105–v0.5.107 who exercised the auto-lifecycle.
+
+### Root cause
+
+v0.5.105's `_maybe_start_dpdk_rx_for_stream` assumed
+`stream_data["L3"]`, `["L4"]`, `["VLAN"]` were dicts holding
+per-protocol fields. They're not — they're top-level **string
+flags** in the real payload:
+
+```json
+"L1": "None",
+"VLAN": "Untagged",       ← string, not dict
+"L2": "None",
+"L3": "IPv4",             ← string, not dict
+"L4": "UDP",              ← string, not dict
+"protocol_data": {        ← THIS is where the dict lives
+    "vlan": {"vlan_id": "1", ...},
+    "ipv4": {"ipv4_source": "10.0.0.1", ...},
+    "udp": {"udp_destination_port": "4791", ...}
+}
+```
+
+`.get()` on a string raised AttributeError instantly. The
+existing unit test used a fabricated `{"L3": {"dst_ip": "..."}}`
+payload shape that doesn't match what the dialog actually
+sends, so the bug never surfaced in CI.
+
+### Fix
+
+Field extraction now reads the correct nested path:
+
+| Filter dim | Pre-fix path (broken) | Post-fix path (correct) |
+|---|---|---|
+| VLAN id | `stream_data["VLAN"]["vlan_id"]` | `protocol_data.vlan.vlan_id` (only when top-level `"VLAN"=="Tagged"`) |
+| UDP dst port | `stream_data["L4"]["dst_port"]` | `protocol_data.udp.udp_destination_port` |
+| UDP src port | `stream_data["L4"]["src_port"]` | `protocol_data.udp.udp_source_port` |
+| IPv4 dst | `stream_data["L3"]["dst_ip"]` | `protocol_data.ipv4.ipv4_destination` |
+| IPv4 src | `stream_data["L3"]["src_ip"]` | `protocol_data.ipv4.ipv4_source` |
+
+Defensive: every nested-dict access checks `isinstance(_, dict)`
+first and falls back to `{}` so pathological payloads (malformed
+client, hand-crafted API call) don't 500 — the helper is always
+best-effort.
+
+Also fixed the VLAN logic to **honor the top-level "Tagged" /
+"Untagged" flag** — pre-fix, every stream picked up
+`protocol_data.vlan.vlan_id=1` (the default field value the
+dialog seeds even on untagged streams) and the rx_worker would
+filter for VLAN 1, missing every untagged frame on the wire.
+
+### Tests
+
+7 new in `test_v0510x_rx_engine_payload_shape.py`. Test data is a
+verbatim slice of srv06's failing payload captured from the
+journal — any future refactor of the dialog's payload shape
+will fail this test instantly with a clear "you broke the
+production contract" diagnostic.
+
+- Captured payload doesn't crash the helper (the reproducer)
+- UDP dst/src ports extracted from `protocol_data.udp`
+- IPv4 src/dst extracted from `protocol_data.ipv4`
+- Untagged stream does NOT pass `--vlan` to rx_worker
+- Tagged stream picks up `protocol_data.vlan.vlan_id`
+- Missing `protocol_data` doesn't crash (defensive coerce)
+- String `protocol_data` doesn't crash (defensive coerce)
+
+Full suite: **2,440 passed**, 1 skipped (+7 new).
+
+### Operator workflow
+
+Upgrade and the templates work as documented in v0.5.107:
+
+```bash
+VER=0.5.108
+wget https://github.com/amishagrawal2001-arch/netgen/releases/download/v${VER}/ostg_trafficgen-${VER}-py3-none-any.whl
+sudo netgen-upgrade ostg_trafficgen-${VER}-py3-none-any.whl
+```
+
+Then: Edit/Add stream → Template dropdown → "DPDK loopback
+validation · 100 Kpps" → Save → Start. No more 500.
+
 ## [0.5.107] - 2026-06-12
 
 **DPDK templates pair TX + RX engines. Two new dedicated templates for end-to-end DPDK.**

@@ -605,18 +605,54 @@ def _maybe_start_dpdk_rx_for_stream(
             return None
         return iv if lo <= iv <= hi else None
 
-    l3 = stream_data.get("L3") or {}
-    l4 = stream_data.get("L4") or {}
-    vlan_cfg = stream_data.get("VLAN") or {}
+    # v0.5.108 hot-fix: stream_data["L3"], ["L4"], ["VLAN"] are top-
+    # level STRING FLAGS ("IPv4", "UDP", "Untagged"/"Tagged") — NOT
+    # nested dicts. The actual per-protocol fields live under
+    # stream_data["protocol_data"]["ipv4"] / "udp" / "vlan". Pre-
+    # fix code did `stream_data.get("L3").get("dst_ip")` which
+    # crashed with AttributeError: 'str' object has no attribute
+    # 'get' the moment any operator started a DPDK template stream.
+    #
+    # Defensive: any of these fields might be missing or non-dict
+    # on edge cases (legacy saved streams, hand-crafted API calls),
+    # so coerce via `isinstance(_, dict) else {}` so the helper is
+    # always best-effort and never raises into start_traffic's
+    # 500 path.
+    pdata = stream_data.get("protocol_data") or {}
+    if not isinstance(pdata, dict):
+        pdata = {}
+    ipv4 = pdata.get("ipv4") if isinstance(pdata.get("ipv4"), dict) else {}
+    udp = pdata.get("udp") if isinstance(pdata.get("udp"), dict) else {}
+    vlan_cfg = pdata.get("vlan") if isinstance(pdata.get("vlan"), dict) else {}
+
+    # Honor the top-level "VLAN" string flag — only apply the vlan
+    # filter when the operator explicitly tagged the stream. Without
+    # this gate, every "Untagged" stream would pick up
+    # protocol_data.vlan.vlan_id=1 (the default field value) and the
+    # rx_worker would filter for VLAN 1 — wrong.
+    vlan_mode = str(stream_data.get("VLAN") or "").strip().lower()
+    vlan_value = None
+    if vlan_mode == "tagged":
+        vlan_value = _int_or_none(vlan_cfg.get("vlan_id"), 0, 4095)
+    # Fallback: stream_data["vlan"] (lowercase) is the legacy
+    # shape some saved streams use.
+    if vlan_value is None:
+        vlan_value = _int_or_none(stream_data.get("vlan"), 0, 4095)
+
     kwargs = dict(
         stream_id=stream_id,
         pci_bdf=pci_bdf,
-        vlan=_int_or_none(vlan_cfg.get("vlan_id"), 0, 4095)
-              or _int_or_none(stream_data.get("vlan"), 0, 4095),
-        dst_port=_int_or_none(l4.get("dst_port") or l4.get("dport")),
-        src_port=_int_or_none(l4.get("src_port") or l4.get("sport")),
-        src_ip=l3.get("src_ip") or l3.get("sip"),
-        dst_ip=l3.get("dst_ip") or l3.get("dip"),
+        vlan=vlan_value,
+        dst_port=_int_or_none(
+            udp.get("udp_destination_port") or udp.get("dst_port")
+            or udp.get("dport")
+        ),
+        src_port=_int_or_none(
+            udp.get("udp_source_port") or udp.get("src_port")
+            or udp.get("sport")
+        ),
+        src_ip=ipv4.get("ipv4_source") or ipv4.get("src_ip") or ipv4.get("sip"),
+        dst_ip=ipv4.get("ipv4_destination") or ipv4.get("dst_ip") or ipv4.get("dip"),
     )
 
     try:
