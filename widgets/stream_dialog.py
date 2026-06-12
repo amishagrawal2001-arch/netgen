@@ -5852,6 +5852,32 @@ class AddStreamDialog(QDialog):
             "msg size, QPs from the RDMA params group below."
         )
         engine_layout.addWidget(self.engine_combo)
+        # v0.5.105: RX engine combo. The TX engine combo above sets
+        # how packets get pushed onto the wire; this sets how netgen
+        # COUNTS what comes back. Default Scapy preserves legacy
+        # behavior (AF_PACKET sniffer through the kernel netdev).
+        # DPDK spawns rx_worker via the manager — bypasses the
+        # netdev backlog entirely so 24M+ pps streams report
+        # accurate counters instead of 0 (the srv06 saga lesson).
+        engine_layout.addSpacing(12)
+        engine_layout.addWidget(QLabel("RX:"))
+        self.rx_engine_combo = QComboBox()
+        self.rx_engine_combo.addItem("Scapy (kernel sniffer)", "scapy")
+        self.rx_engine_combo.addItem("DPDK (rx_worker)",        "dpdk")
+        self.rx_engine_combo.setToolTip(
+            "Pick how this stream's RX side is counted.\n\n"
+            "  • Scapy — AF_PACKET sniffer on the kernel netdev. "
+            "Easy, works for any iface. Drops at the netdev backlog "
+            "when TX > ~1 Mpps (this is the srv06 RX=0 case).\n"
+            "  • DPDK  — rx_worker bypasses the kernel and reads "
+            "frames straight from the PMD's RX queue. Line-rate "
+            "accurate. Requires rx_worker built (run install_dpdk.sh "
+            "Step 6.5) and the RX iface's PCI BDF reachable.\n\n"
+            "If the RX iface is vfio-bound, the server auto-resolves "
+            "the PCI BDF; if it's kernel-bound, the resolver uses "
+            "/sys/class/net/<iface>/device. Either works."
+        )
+        engine_layout.addWidget(self.rx_engine_combo)
         engine_layout.addStretch(1)
         layout.addWidget(engine_row)
         # Bidirectional sync with dpdk_enable_checkbox + show/hide RDMA
@@ -8517,6 +8543,16 @@ class AddStreamDialog(QDialog):
             idx = self.engine_combo.findData(engine)
             if idx >= 0:
                 self.engine_combo.setCurrentIndex(idx)
+        # v0.5.105: RX engine combo restore — separate from TX.
+        # Default "scapy" preserves legacy behavior for saved
+        # streams that pre-date this field.
+        if hasattr(self, "rx_engine_combo"):
+            rx_engine = str(stream_data.get("rx_engine") or "scapy").strip().lower()
+            if rx_engine not in ("scapy", "dpdk"):
+                rx_engine = "scapy"
+            rxi = self.rx_engine_combo.findData(rx_engine)
+            if rxi >= 0:
+                self.rx_engine_combo.setCurrentIndex(rxi)
             # Restore RDMA params if engine was rdma.
             rdma_cfg = stream_data.get("rdma") or {}
             if isinstance(rdma_cfg, dict):
@@ -9487,6 +9523,14 @@ class AddStreamDialog(QDialog):
             # legacy dpdk_enable in sync so older servers + saved files
             # remain compatible.
             "engine": engine,
+            # v0.5.105: RX engine — separate dim from TX engine. The
+            # server's _maybe_start_dpdk_rx_for_stream helper reads
+            # this and spawns rx_worker when set to "dpdk".
+            "rx_engine": (
+                self.rx_engine_combo.currentData()
+                if hasattr(self, "rx_engine_combo")
+                else "scapy"
+            ) or "scapy",
             "rdma": rdma_cfg,
             "dpdk_enable": bool(engine == "dpdk"),
             "dpdk_multi_instance": bool(getattr(self, "dpdk_multi_instance_checkbox", None) and self.dpdk_multi_instance_checkbox.isChecked()),

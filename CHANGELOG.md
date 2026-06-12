@@ -2,6 +2,171 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.105] - 2026-06-12
+
+**DPDK RX: ship the worker, make it usable end-to-end.**
+
+Operator triggered after the srv06 saga revealed kernel netdev RX
+overflow at 24M pps (250M cumulative drops, netgen stream rx_count
+stuck at 0). This release adds a symmetric DPDK-side RX path so
+TX at line rate produces accurate RX counts.
+
+### Phase 1 — The worker itself
+
+**`resources/dpdk/rx_worker/rx_worker.c`** (new, ~370 LOC) — symmetric
+to tx_worker:
+
+- Per-lcore RX queue worker (RSS-distributed multi-queue at line rate)
+- Per-queue counters, 64-byte aligned (no false sharing)
+- Software filter for VLAN / src+dst port / src+dst IP (cheap, post-RX)
+- Promiscuous mode auto-enabled so dst-MAC mismatch doesn't drop frames
+- JSON heartbeat stdout (one line/sec) + `{"final":true,...}` on exit
+- Signal-driven shutdown (SIGINT/SIGTERM) so final summary always emits
+
+**`utils/dpdk_rx_worker.py`** (new, ~250 LOC) — Python launcher
+mirroring the tx side:
+
+- `_resolve_rx_worker_bin()` with the same priority chain as tx
+- `start_rx_worker(...)` → `RxHandle` (process + stdout reader thread)
+- `RxHandle.latest()` / `.final()` — non-blocking snapshot accessors
+- `stop_rx_worker()` — SIGTERM → wait → SIGKILL fallback
+- Resilient to garbage on stdout (EAL spew, etc.)
+
+**Build pipeline:**
+- `pyproject.toml` package-data extended to ship rx_worker sources
+- `netgen-upgrade` rebuilds rx_worker after tx_worker (non-fatal:
+  if rx build fails, DPDK RX feature is unavailable; Scapy RX still
+  works)
+- `install_dpdk.sh` Step 6.5 builds rx_worker on fresh installs
+  (also non-fatal)
+
+### Phase 2 — Process registry + admin endpoints
+
+**`utils/dpdk_rx_manager.py`** (new, ~150 LOC):
+- Thread-safe by-stream_id `RxRegistry` singleton
+- Idempotent `stop()` (status=unknown/not_running/stopped)
+- Double-start → `ValueError` → HTTP 409
+- Reaps dead handles on re-start
+- `stop_all()` for clean shutdown
+
+**Flask routes:**
+- `POST /api/admin/dpdk/rx/start` (operator) — body: `{stream_id,
+  pci_bdf, vlan?, dst_port?, src_port?, src_ip?, dst_ip?,
+  rx_queues?, duration_s?, lcores?}` → 200/409/503
+- `POST /api/admin/dpdk/rx/stop` (operator) — idempotent
+- `GET /api/admin/dpdk/rx/list` (viewer) — all running workers
+- `GET /api/admin/dpdk/rx/latest/<stream_id>` (viewer) — one snapshot
+
+Input validated: stream_id matches IFNAMSIZ-like regex; pci_bdf is
+strict BDF format; integer args bounded.
+
+### Phase 3 — `/api/streams/stats` folds rx_worker counters
+
+When a `stream_id` has a registered rx_worker, the active_streams
+response overrides `rx_count` from worker's `matched_pkts` and
+`rx_rate` from `rx_pps`. Hardware drop counters (`hw_imissed`,
+`hw_ierrors`, `hw_rx_nombuf`) surface via a new `rx_engine_detail`
+object. Adds `rx_engine: "scapy" | "dpdk"` to every stream row.
+
+Fold is best-effort: if the manager crashes, the endpoint still
+returns the pre-fold shape (never 500s the stats path because of an
+rx_worker bug).
+
+### Phase 4 — Auto-lifecycle: stream start spawns rx_worker
+
+When a stream's `rx_engine` is `"dpdk"`, `/api/traffic/start`
+auto-spawns a matching rx_worker via the manager. `/api/traffic/stop`
+auto-terminates it. Both directions are best-effort — failure logs a
+warning, TX continues, Scapy RX is the fallback.
+
+Helpers `_maybe_start_dpdk_rx_for_stream` and
+`_maybe_stop_dpdk_rx_for_stream` live in `run_tgen_server.py`:
+
+- PCI BDF resolution: explicit `rx_pci_bdf` field wins; otherwise
+  via `utils.nic_counters.iface_to_pci_bdf` (works for kernel-bound;
+  vfio-bound RX needs the explicit override)
+- Filter args derived from L3/L4/VLAN sections of stream config
+- All 7 failure modes (missing binary, unresolvable BDF, already
+  running, etc.) handled with warning logs, never raise
+
+### Phase 5 — Stream dialog RX engine combo
+
+`widgets/stream_dialog.py` gains an "RX:" combo next to the existing
+TX engine picker:
+
+- Scapy (kernel sniffer) — default, legacy behavior
+- DPDK (rx_worker) — auto-spawns rx_worker on stream start
+
+Saves to `rx_engine` field in stream JSON; restores from saved
+streams. Tooltip explains the trade-off (Scapy easy / drops at high
+pps; DPDK accurate / needs rx_worker built).
+
+### Phase 6 — Per-iface admin console button
+
+The Live counters tile in the iface drawer gains:
+
+- **▶ Start rx_worker (60s)** button — one-click line-rate
+  visibility on the selected iface for 60 seconds (auto-stops)
+- **■ Stop** button (visible while running)
+- Status line showing worker pid + auto-stop countdown
+
+The JS handler resolves the iface's PCI BDF via
+`/api/admin/iface/<iface>/counters` (works for both kernel- and
+vfio-bound) before posting to `/api/admin/dpdk/rx/start`. Operator
+can spin up rx_worker on ANY iface without touching the CLI.
+
+### Tests
+
+**+62 new tests** across this release:
+- `test_dpdk_rx_worker.py` (20) — C source contract + Python
+  launcher unit
+- `test_dpdk_rx_manager_endpoints.py` (14) — registry +
+  admin endpoint integration
+- `test_stream_stats_rx_engine.py` (4) — stats fold integration
+- `test_rx_worker_e2e.py` (3) — real-subprocess end-to-end
+- `test_rx_engine_auto_lifecycle.py` (13) — auto-spawn helpers
+  + dialog + admin UI presence
+- 1 widening of v0.5.95's drawer-test window (Live counters
+  tile growth)
+
+Full suite: **2,415 passed**, 1 skipped (+62 new across the
+release).
+
+### Operator workflow
+
+After upgrading to v0.5.105:
+
+**Option A — auto (default for new stream configs):**
+1. Open stream config dialog → set RX combo to "DPDK (rx_worker)"
+2. Save + Start stream as usual
+3. /api/streams/stats automatically shows `rx_engine="dpdk"` +
+   accurate counts
+
+**Option B — manual (existing streams):**
+```bash
+curl -sX POST localhost:5050/api/admin/dpdk/rx/start \
+     -H 'Content-Type: application/json' \
+     -d '{"stream_id":"udp-test","pci_bdf":"0000:2b:00.1",
+          "vlan":100,"dst_port":4791,"duration_s":60}'
+```
+
+**Option C — admin console button:**
+1. Open admin → click ℹ️ on the RX iface → drawer expands
+2. Click **▶ Start rx_worker (60s)** in the Live counters tile
+3. Watch RX pps climb live; auto-stops in 60s or click Stop
+
+### Notes
+
+- `rx_worker` requires `vfio-pci` (Intel/Broadcom) or bifurcated PMD
+  (Mellanox). Same prereqs as `tx_worker`.
+- For Mellanox bifurcated, the kernel netdev stays present alongside
+  rx_worker — `tcpdump` / `ethtool` still work on the same port.
+- The C binary is rebuilt by `install_dpdk.sh` or
+  `netgen-upgrade` against the host's DPDK ABI (avoids the
+  `librte_ethdev.so.X` mismatch that bit v0.5.10).
+- v0.5.104 features (diagnostic bundle, Live counters tile, RX
+  dropped column) are unchanged.
+
 ## [0.5.104] - 2026-06-11
 
 **Operator support tooling: diagnostic bundle + live counters for vfio-bound ports.**

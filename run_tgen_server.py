@@ -537,6 +537,113 @@ def increment_value(base, step, count, is_ip=False):
 
 
 # --- Add Save/Load Routes ---
+# v0.5.105 Phase B: auto-lifecycle helpers — invoked from
+# /api/traffic/start and /api/traffic/stop so the operator's stream
+# config "rx_engine: dpdk" actually wires up the rx_worker without
+# the operator having to hit the admin endpoint twice.
+
+def _maybe_start_dpdk_rx_for_stream(
+    *, stream_id: str, rx_interface: str, stream_data: dict,
+) -> None:
+    """Best-effort rx_worker spawn for a stream whose rx_engine is
+    "dpdk". Failure is non-fatal — TX proceeds, Scapy RX fallback
+    kicks in, stats won't show DPDK accuracy but everything else
+    works."""
+    rx_engine = str(stream_data.get("rx_engine", "") or "").strip().lower()
+    if rx_engine != "dpdk":
+        return  # no-op for the default (Scapy) case
+
+    # Resolve PCI BDF. Prefer an explicit override from stream
+    # config (operator sets it when iface is already vfio-bound and
+    # iface_to_pci_bdf would return None). Else look up via sysfs.
+    pci_bdf = (stream_data.get("rx_pci_bdf") or "").strip().lower()
+    if not pci_bdf:
+        try:
+            from utils.nic_counters import iface_to_pci_bdf
+            pci_bdf = (iface_to_pci_bdf(rx_interface) or "").lower()
+        except Exception as exc:
+            logging.warning(
+                f"[DPDK-RX] pci_bdf lookup for {rx_interface} failed: {exc}"
+            )
+            return
+    if not pci_bdf:
+        logging.warning(
+            f"[DPDK-RX] cannot resolve pci_bdf for rx_interface "
+            f"{rx_interface!r} (iface may be vfio-bound — operator "
+            f"should pass rx_pci_bdf in stream config). Skipping "
+            f"rx_worker spawn; stats will fall back to Scapy."
+        )
+        return
+
+    # Derive filter args from stream config. dst_port commonly comes
+    # from L4; vlan from VLAN_sel; src/dst IP from L3. Pull them
+    # defensively — partial config (only some filter dims set) is
+    # totally fine; missing dims = match-anything.
+    def _int_or_none(v, lo=0, hi=65535):
+        try:
+            iv = int(v)
+        except (TypeError, ValueError):
+            return None
+        return iv if lo <= iv <= hi else None
+
+    l3 = stream_data.get("L3") or {}
+    l4 = stream_data.get("L4") or {}
+    vlan_cfg = stream_data.get("VLAN") or {}
+    kwargs = dict(
+        stream_id=stream_id,
+        pci_bdf=pci_bdf,
+        vlan=_int_or_none(vlan_cfg.get("vlan_id"), 0, 4095)
+              or _int_or_none(stream_data.get("vlan"), 0, 4095),
+        dst_port=_int_or_none(l4.get("dst_port") or l4.get("dport")),
+        src_port=_int_or_none(l4.get("src_port") or l4.get("sport")),
+        src_ip=l3.get("src_ip") or l3.get("sip"),
+        dst_ip=l3.get("dst_ip") or l3.get("dip"),
+    )
+
+    try:
+        from utils.dpdk_rx_manager import registry as _rx_registry
+        info = _rx_registry().start(**kwargs)
+        logging.info(
+            f"[DPDK-RX] auto-spawned rx_worker for stream {stream_id} "
+            f"on {rx_interface} (pid={info.get('pid')})"
+        )
+    except FileNotFoundError as exc:
+        logging.warning(
+            f"[DPDK-RX] rx_worker binary missing: {exc}. "
+            f"Re-run install_dpdk.sh or upgrade to a v0.5.105+ wheel. "
+            f"Stream {stream_id} TX continues; RX falls back to Scapy."
+        )
+    except ValueError as exc:
+        # Already running for this stream_id — keep using the
+        # existing handle. Most common when operator hits Start
+        # twice (idempotent restart UX).
+        logging.info(
+            f"[DPDK-RX] rx_worker already running for {stream_id}: {exc}"
+        )
+    except Exception as exc:
+        logging.warning(
+            f"[DPDK-RX] auto-spawn failed for {stream_id}: {exc}. "
+            f"TX continues; RX uses Scapy."
+        )
+
+
+def _maybe_stop_dpdk_rx_for_stream(*, stream_id: str) -> None:
+    """Best-effort rx_worker termination for a stream being stopped.
+    Idempotent — no-op if no rx_worker was registered for this
+    stream_id."""
+    try:
+        from utils.dpdk_rx_manager import registry as _rx_registry
+        result = _rx_registry().stop(stream_id)
+        if result.get("status") == "stopped":
+            logging.info(
+                f"[DPDK-RX] terminated rx_worker for stream {stream_id}"
+            )
+    except Exception as exc:
+        logging.warning(
+            f"[DPDK-RX] auto-stop failed for {stream_id}: {exc}"
+        )
+
+
 @app.route("/api/streams/save", methods=["GET"])
 def save_session():
     import json
@@ -1151,6 +1258,24 @@ def start_traffic():
                 rx_interface = interface_name
             stream_data["rx_interface"] = rx_interface
 
+            # v0.5.105 Phase B (auto-lifecycle): if the stream's
+            # rx_engine is "dpdk", spawn a matching rx_worker before
+            # we hand off to the TX path. The rx_worker captures
+            # frames from the wire directly (kernel netdev bypass)
+            # so srv06-style 24M-pps streams don't drop everything
+            # at the netdev backlog.
+            #
+            # Best-effort: failure to start rx_worker (binary missing,
+            # iface PCI BDF unresolvable, etc.) is logged but does
+            # NOT block the stream start. Operator's TX side still
+            # runs; RX falls back to Scapy and stats just won't
+            # reflect DPDK accuracy.
+            _maybe_start_dpdk_rx_for_stream(
+                stream_id=stream_id,
+                rx_interface=rx_interface,
+                stream_data=stream_data,
+            )
+
             # Prevent duplicates - check by stream_id first
             existing = stream_tracker.find_stream_by_id(interface_name, stream_id)
             if existing:
@@ -1372,6 +1497,13 @@ def stop_traffic():
         if not interface or not stream_id:
             logging.warning(f"⚠️ Invalid stop entry: {entry}")
             continue
+
+        # v0.5.105 Phase B: terminate any auto-spawned rx_worker
+        # for this stream. Idempotent — if the operator didn't
+        # configure dpdk RX (or it failed to start), stop is a
+        # no-op. Runs BEFORE the TX stop so the rx_worker's final
+        # summary is captured into the stream's final stats row.
+        _maybe_stop_dpdk_rx_for_stream(stream_id=stream_id)
 
         # Normalize interface name (remove "Port: " prefix and "TG X - " prefix if present)
         def normalize_iface(iface_str):
@@ -20985,6 +21117,12 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
           <span style="color: var(--muted);">RX drop pps</span><span class="ctr-rxdroppps" title="Delta rate of rx_dropped; non-zero means TX is overwhelming the kernel netdev">—</span>
         </div>
         <div class="ctr-warn" style="font-size: 11px; color: var(--bad); margin-top: 6px;"></div>
+        <!-- v0.5.105: one-click rx_worker for line-rate visibility -->
+        <div style="margin-top: 8px; display: flex; gap: 8px; align-items: center;">
+          <button class="rxw-start" style="font-size: 11px; padding: 3px 10px;">▶ Start rx_worker (60s)</button>
+          <button class="rxw-stop" style="font-size: 11px; padding: 3px 10px; display: none;" disabled>■ Stop</button>
+          <span class="rxw-status" style="font-size: 11px; color: var(--muted);"></span>
+        </div>
       </div>`;
       const _labels = {
         link: 'Link settings (ethtool)',
@@ -21021,6 +21159,80 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       // so the timer ID can be cleared when the drawer closes.
       const ctrWrap = td.querySelector(`#counters-${iface.name.replace(/[^A-Za-z0-9]/g, '_')}`);
       if (ctrWrap) startCounterPoll(iface.name, ctrWrap, drawer);
+      // v0.5.105: wire rx_worker start/stop buttons.
+      if (ctrWrap) wireRxWorkerButtons(iface, ctrWrap);
+    }
+
+    // v0.5.105: one-click rx_worker control from the iface drawer.
+    // Stream-id naming: "iface-rxw-<iface>" so the manager registers
+    // a deterministic key — operator hitting Start twice from the
+    // same drawer collapses to a 409 (handled below).
+    function wireRxWorkerButtons(iface, ctrWrap) {
+      const startBtn = ctrWrap.querySelector('.rxw-start');
+      const stopBtn = ctrWrap.querySelector('.rxw-stop');
+      const status = ctrWrap.querySelector('.rxw-status');
+      if (!startBtn) return;
+      const sid = `iface-rxw-${iface.name}`;
+      startBtn.addEventListener('click', async () => {
+        startBtn.disabled = true;
+        status.textContent = 'starting…';
+        try {
+          // Resolve iface → PCI BDF via the counters response we
+          // just rendered. If still unknown (no kernel netdev,
+          // operator didn't set explicit pci_bdf), surface an
+          // actionable error.
+          const cr = await fetch(`/api/admin/iface/${encodeURIComponent(iface.name)}/counters`);
+          const cd = await cr.json();
+          if (!cd.pci_bdf) {
+            status.textContent = 'no pci_bdf available for this iface';
+            status.style.color = 'var(--bad)';
+            startBtn.disabled = false;
+            return;
+          }
+          const r = await fetch('/api/admin/dpdk/rx/start', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({
+              stream_id: sid, pci_bdf: cd.pci_bdf, duration_s: 60,
+            }),
+          });
+          const d = await r.json();
+          if (!r.ok) {
+            status.textContent = 'failed: ' + (d.error || r.status);
+            status.style.color = 'var(--bad)';
+            startBtn.disabled = false;
+            return;
+          }
+          status.textContent = `running (pid ${d.pid}, auto-stops in 60s)`;
+          status.style.color = '';
+          startBtn.style.display = 'none';
+          stopBtn.style.display = '';
+          stopBtn.disabled = false;
+        } catch (e) {
+          status.textContent = 'request failed: ' + String(e);
+          status.style.color = 'var(--bad)';
+          startBtn.disabled = false;
+        }
+      });
+      stopBtn.addEventListener('click', async () => {
+        stopBtn.disabled = true;
+        status.textContent = 'stopping…';
+        try {
+          const r = await fetch('/api/admin/dpdk/rx/stop', {
+            method: 'POST', headers: {'Content-Type': 'application/json'},
+            body: JSON.stringify({stream_id: sid}),
+          });
+          const d = await r.json();
+          status.textContent = (d.status === 'stopped' ? 'stopped' : d.status);
+          status.style.color = '';
+          stopBtn.style.display = 'none';
+          startBtn.style.display = '';
+          startBtn.disabled = false;
+        } catch (e) {
+          status.textContent = 'stop failed: ' + String(e);
+          status.style.color = 'var(--bad)';
+          stopBtn.disabled = false;
+        }
+      });
     }
 
     // v0.5.104: counter polling — one interval per open drawer.
