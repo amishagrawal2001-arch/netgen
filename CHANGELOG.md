@@ -2,6 +2,88 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.106] - 2026-06-12
+
+**Audit fixes for v0.5.105 — rx_worker leak paths closed.**
+
+Self-review of v0.5.105 found two real defects in the auto-lifecycle
+path. v0.5.105's CI shipped clean, but operators heavily exercising
+the new Start-Stop-Edit-Start loops would accumulate orphaned
+rx_worker processes. This release folds both fixes.
+
+### Bug 1 — Auto-start ordering leak
+
+`_maybe_start_dpdk_rx_for_stream` ran BEFORE the duplicate-stream
+checks (by id, by name) and BEFORE the RDMA short-circuit
+early-return in `/api/traffic/start`'s per-stream loop. Three
+leak paths resulted:
+
+- **Duplicate by stream_id** (operator hits Start twice): rx_worker
+  spawned, then `continue` skipped the TX launch. The operator's
+  next stop_traffic targets the OTHER instance; this rx_worker
+  stays in the registry forever.
+- **Duplicate by stream_name** (operator edited a field, hit
+  Start again): same.
+- **RDMA stream with rx_engine=dpdk**: rx_worker spawned, then
+  the RDMA early-return skipped past the helper's stop path.
+  rx_worker captures nothing relevant (RDMA is verbs-based, no
+  L2/L3/L4 packets on the wire) and runs until `duration_s`
+  expires.
+
+**Fix**: moved the call to AFTER both duplicate checks AND after
+the RDMA short-circuit. All three paths closed.
+
+### Bug 2 — No atexit shutdown hook
+
+`RxRegistry` holds `RxHandle` references; each wraps a
+`subprocess.Popen` child. systemd's default `KillMode=control-group`
+reaps these on `systemctl stop`, but:
+
+- Operators sometimes override to `KillMode=process`
+- uwsgi / gunicorn deployments don't use systemd at all
+- `systemctl restart` has a window where children could linger
+
+**Fix**: `atexit.register(_rx_registry.stop_all)`. Wrapped in
+try/except so a corrupt install doesn't crash server startup.
+
+### Tests
+
+7 new in `test_audit_v0510x_rx_leaks.py`:
+
+- Source ordering: auto-start after dup-by-id check
+- Source ordering: auto-start after dup-by-name check
+- Source ordering: auto-start after RDMA short-circuit return
+- atexit hook IS registered + targets the rx manager
+- atexit hook is wrapped in try/except (defensive)
+- Runtime: `stop_all` actually terminates every registered handle
+- Sanity: helper still skips when rx_engine unset (no regression)
+
+Full suite: **2,422 passed**, 1 skipped (+7 new).
+
+### Upgrade path
+
+Same as any v0.5.103+ release:
+
+```bash
+VER=0.5.106
+wget https://github.com/amishagrawal2001-arch/netgen/releases/download/v${VER}/ostg_trafficgen-${VER}-py3-none-any.whl
+sudo netgen-upgrade ostg_trafficgen-${VER}-py3-none-any.whl
+```
+
+The self-update + tx_worker/rx_worker rebuild + rlimits drop-in all
+fire automatically.
+
+### Known gaps deferred
+
+(Not in scope for this audit-fix release; tracked for v0.5.107+)
+
+- `rx_engine_actual` not in `/api/traffic/start` response (mirror
+  of v0.2.75's TX `actual_engine`; needs client toast wiring too)
+- Stats fold logs `warning` on every `/api/streams/stats` request
+  if manager import fails (need once-per-failure-mode rate limit)
+- rx_engine combo visible in stream dialog even when TX engine is
+  RDMA (UX polish; not a correctness issue)
+
 ## [0.5.105] - 2026-06-12
 
 **DPDK RX: ship the worker, make it usable end-to-end.**
