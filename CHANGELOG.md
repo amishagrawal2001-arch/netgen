@@ -2,6 +2,135 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.104] - 2026-06-11
+
+**Operator support tooling: diagnostic bundle + live counters for vfio-bound ports.**
+
+After the srv06 saga (v0.5.101 → v0.5.103 took three release-roundtrips
+because each round needed one more piece of system state), operator
+asked: "DPDK seems flaky — works on one server, breaks on another.
+What can we do?" This release ships two operator-support tools that
+collapse triage roundtrips and give visibility into the previously-
+opaque vfio bind state.
+
+### Feature 1 — One-click diagnostic bundle
+
+**Endpoint:** `GET /api/admin/diag_bundle` (viewer role)
+returns a tar.gz of system state.
+
+**Admin UI:** New **Support** card at the top of the admin
+console with an **⬇ Export Diagnostics** button.
+
+**Captures** (each section best-effort; missing tools are silent):
+
+| Section | Files |
+|---|---|
+| system | uname, /proc/cmdline (GRUB IOMMU verify), meminfo, free, cpuinfo |
+| packages | dpkg -l filtered to dpdk / mlx / rdma-core / libibverbs / meson / ninja |
+| pci | lspci -vvv filtered to Ethernet / InfiniBand controllers |
+| dpdk | tx_worker --help (confirms --tx-cores flag landed), stat (build date), per-NUMA hugepages, /mnt/huge findmnt |
+| interfaces | ethtool -i / -k / -g / -S per iface + sysfs operstate / carrier / speed / address / mtu + PCI driver symlink |
+| firmware | mlxfwmanager --query, ibstat, ibv_devinfo -v |
+| systemd | netgen-server unit + drop-ins (proves v0.5.103 rlimits drop-in landed), systemctl show, /proc/&lt;MainPID&gt;/limits (definitive proof of LimitMEMLOCK=infinity) |
+| api | 4 JSON snapshots: /api/admin/health, /api/dpdk/status, /api/interfaces, /api/streams/stats (via in-process Flask test_client — no localhost HTTP, no auth roundtrip) |
+| journal | netgen-server last hour + dmesg tail filtered to mlx5 / vfio / iommu / dpdk lines |
+| netgen | pip show ostg-trafficgen, netgen-upgrade head (confirms which script self-updated) |
+
+**Privacy:**
+- Journal is passed through `_redact_journal_secrets` before
+  inclusion → tokens scrubbed
+- 19 tests guard against `/etc/shadow`, ssh keys, sudoers
+- Per-file cap 256 KiB (truncation marker), total 16 MiB
+- All tarinfo mtimes = 0 → reproducible, no host-clock leakage
+- No MACs / IPs / hostnames in the counter dicts
+- Pluggable `journal_redactor` closure; production wires the
+  existing redactor
+
+**Resilience:**
+- Pluggable `api_fetcher` closure → in-process Flask test_client
+  (no HTTP roundtrip, no auth surprises)
+- Individual collector crash isolated to `errors/<name>.txt`;
+  bundle still ships
+- Tail-truncate for log-like commands so the most-recent
+  content survives the per-file cap
+
+### Feature 2 — Live RX/TX counters that work for vfio-bound ports
+
+**Module:** `utils/nic_counters.py` (new).
+
+When a NIC is bound to vfio-pci, the kernel netdev disappears.
+`ip link show` returns "No such device", `ethtool` and `tcpdump`
+have nothing to attach to. Until this release, operators had no
+admin-console way to confirm whether DPDK packets were leaving
+the wire on a vfio-bound port — the original srv06 RX=0 mystery.
+
+This module exposes a unified counter API that picks the right
+source based on the binding state:
+
+| Binding state | NIC vendor | Source path | Action |
+|---|---|---|---|
+| kernel-bound | any | `/sys/class/net/<iface>/statistics/*` | universal kernel netdev stats |
+| vfio-bound | Mellanox ConnectX-4+ | `/sys/class/infiniband/mlx5_N/ports/1/counters/*` | InfiniBand sysfs survives vfio bind because it's at the PCI layer |
+| vfio-bound | Intel / Broadcom | n/a yet | returns `source: null` + actionable warning; DPDK telemetry passthrough is v0.5.105 territory |
+
+**Endpoint:** `GET /api/admin/iface/<iface>/counters` (viewer
+role; integers + metadata only, no PII surface). Optional
+`?pci_bdf=DDDD:BB:DD.F` query for ifaces whose netdev is gone
+post-vfio-bind.
+
+**Admin UI:** Click ℹ️ on any iface row → drawer expands → new
+**Live counters** tile under the driver header. Polls every 2s
+while drawer is open; cleaned up automatically on close. Shows:
+
+- RX/TX pps (delta-computed client-side from two samples)
+- RX/TX bps (auto-scaling Kbps / Mbps / Gbps)
+- RX packets, TX packets, RX errors, TX dropped (raw cumulative)
+- Source label: e.g. `mellanox-sysfs (vfio-bound)`
+- Actionable warnings: e.g. `iface ens2f0np0 is vfio-bound;
+  counters come from Mellanox InfiniBand sysfs (mlx5_2) —
+  kernel netdev path is unavailable while DPDK has the port`
+
+### How this changes srv06 triage
+
+Before this release: a vfio-bound port RX=0 investigation needed
+~5 round-trips for me to ask "what's the binding state? lspci?
+dmesg? mlxfwmanager?". With these two features:
+
+- One click → tarball with everything support needs (no chat
+  roundtrip)
+- Open both iface drawers (TX + RX) → see if TX pps climbs and
+  RX pps stays at 0 → localize the issue to the wire / cable /
+  VLAN filter in 10 seconds without leaving the browser
+
+### Tests
+
+43 new (19 diag bundle + 19 nic_counters + 5 endpoint):
+- Bundle: valid gzipped tar, MANIFEST, tolerates missing
+  commands, no path traversal, mtimes=0, no /etc/shadow/ssh
+  keys/sudoers, caps enforced, tail-truncate keeps log tail,
+  api_fetcher + journal_redactor are called, exceptions don't
+  kill the bundle, individual collector crash isolated, iface
+  filter excludes lo/docker/veth/br-, dpkg filter is network-
+  related only
+- nic_counters: PCI BDF resolution for kernel + vfio bindings,
+  PCI → IB resolution survives vfio, binding detection, kernel
+  + Mellanox sysfs readers, top-level source selection, pps
+  math (basic / zero-elapsed / None fields / counter reset),
+  no PII regex sweep
+- Endpoint: shape, iface validation, BDF query validation,
+  warning passthrough, exception → 500
+
+Full suite: **2,361 passed**, 1 skipped (+43 new).
+
+### Not in this release
+
+- DPDK telemetry passthrough for Intel/Broadcom DPDK ports
+  (v0.5.105 candidate)
+- Vendor-aware "Make DPDK Ready" wizard (Mellanox vs Intel
+  vs Broadcom branches) — proposed as future work
+- Pcap capture from vfio-bound port (would require a DPDK
+  rx-tap helper)
+
 ## [0.5.103] - 2026-06-11
 
 **netgen-upgrade self-updates from the wheel before doing anything else.**
