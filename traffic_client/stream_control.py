@@ -1382,6 +1382,21 @@ class TrafficGenClientStreamControl:
                 if not edited_rx or edited_rx == "Same as TX Port":
                     edited["rx_port"] = tx_port
 
+                # v0.5.112: keys that MUST live at the top level of
+                # the stream dict — the server's /api/traffic/start
+                # reads them from there. Pre-fix the iteration loop
+                # below routed every dialog top-level key into
+                # protocol_selection, so the operator's "RX: DPDK
+                # (rx_worker)" selection silently degraded to Scapy
+                # (server's _maybe_start_dpdk_rx_for_stream reads
+                # stream_data.get("rx_engine") at the top level —
+                # protocol_selection.rx_engine was invisible to it).
+                # Promote all engine + DPDK config keys explicitly.
+                _TOP_LEVEL_ENGINE_KEYS = (
+                    "engine", "rx_engine", "dpdk_enable",
+                    "dpdk_multi_instance", "dpdk_tx_cores",
+                    "rx_pci_bdf", "enable_timestamps", "rdma",
+                )
                 updated = {
                     "stream_id": original.get("stream_id"),
                     "status": original.get("status", "stopped"),
@@ -1394,12 +1409,18 @@ class TrafficGenClientStreamControl:
                     "override_settings": edited.get("override_settings", {}),
                     "stream_rate_control": edited.get("stream_rate_control", {})
                 }
+                # Carry over engine/dpdk/rx config when the dialog
+                # produced it. Skip absent keys so we don't overwrite
+                # legitimately unset values with None.
+                for _k in _TOP_LEVEL_ENGINE_KEYS:
+                    if _k in edited:
+                        updated[_k] = edited[_k]
 
                 for k, v in edited.items():
                     if k not in updated and k not in {
                         "protocol_data", "rocev2", "uec", "override_settings",
                         "stream_rate_control", "rx_port", "stream_id", "status", "flow_tracking_enabled"
-                    }:
+                    } and k not in _TOP_LEVEL_ENGINE_KEYS:
                         updated["protocol_selection"][k] = v
 
                 # Preserve protocol_selection fields from the original

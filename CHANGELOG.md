@@ -2,6 +2,79 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.112] - 2026-06-13
+
+**Edit Stream now actually saves rx_engine + Auto button for
+Destination MAC.**
+
+The srv06 saga continued past v0.5.111: with the Auto button
+working, the operator still saw rx_count=0. Two distinct bugs.
+
+### Bug 1: rx_engine never made it out of the dialog
+
+`stream_control.py:edit_selected_stream` builds its `updated`
+dict with a strict list of top-level keys (`stream_id`,
+`rx_port`, etc.), then iterates the dialog's edited dict and
+routes every OTHER top-level key into `protocol_selection`.
+`rx_engine` / `engine` / `dpdk_enable` were never on the
+top-level list → got buried at
+`stream["protocol_selection"]["rx_engine"]`. But the server's
+`_maybe_start_dpdk_rx_for_stream` reads
+`stream_data.get("rx_engine")` from the TOP level — saw
+nothing, no `rx_worker` spawned, RX engine silently degraded
+to Scapy. The dialog said "DPDK (rx_worker)", the saved stream
+said "scapy."
+
+Fix: explicit `_TOP_LEVEL_ENGINE_KEYS` tuple — `engine`,
+`rx_engine`, `dpdk_enable`, `dpdk_multi_instance`,
+`dpdk_tx_cores`, `rx_pci_bdf`, `enable_timestamps`, `rdma` —
+promoted to top level before the protocol_selection routing.
+
+### Bug 2: only Source MAC had an Auto button
+
+v0.5.110 added Auto only on Source MAC. Empirically on srv06:
+TX with real src MAC + synthetic dst MAC (`00:00:...` or the
+template's `02:00:...`) → switch treats as unknown unicast,
+floods or drops → ~22% delivery. With both MACs real → ~100%
+delivery (verified via direct API call earlier in the saga).
+
+Fix: symmetric Auto button on the Destination MAC row. Reads
+the iface name from the RX-port dropdown (canonical "TG N -
+Port: <iface>" format; falls back to TX iface when set to
+"Same as TX Port") and fetches that iface's burned-in MAC from
+the same `/api/interfaces/<iface>/mac` endpoint v0.5.110
+shipped.
+
+### Tests
+
+* `tests/test_v05112_engine_propagation.py` (4) — pins
+  rx_engine + engine + dpdk_enable top-level survival across
+  the edit-save updater; absent keys don't write None at top
+  level; non-engine dialog fields still route into
+  protocol_selection (no behavioral regression).
+* `tests/test_v05112_dst_mac_autopopulate.py` (5) — dst Auto
+  button exists, follows RX-port dropdown, falls back to TX
+  iface on "Same as TX Port", refuses to write all-zeros MAC,
+  iface-name parser handles canonical + bare + legacy formats.
+
+Full suite: 2483 passed, 1 skipped.
+
+### Migration notes
+
+Once srv06 is on v0.5.112, the operator's workflow is:
+
+1. Edit Stream_1 → Protocol Data tab
+2. Click **Auto** on Source row → fills `5c:25:73:3f:30:56`
+3. Click **Auto** on Destination row → fills
+   `5c:25:73:3f:30:57` (since rx_port = ens2f1np1)
+4. Stream Control tab → RX engine combo = "DPDK (rx_worker)"
+5. Save → Apply → Start
+
+The saved stream will then carry `rx_engine: dpdk` at the top
+level, `_maybe_start_dpdk_rx_for_stream` will spawn the worker,
+and the switch will route the unicast frames directly to
+ens2f1np1 instead of dropping them.
+
 ## [0.5.111] - 2026-06-13
 
 **v0.5.110 hot-fix: Auto-MAC button "Could not fetch" error in the

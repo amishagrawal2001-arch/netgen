@@ -6957,6 +6957,30 @@ class AddStreamDialog(QDialog):
         self.mac_destination_mode.currentTextChanged.connect(
             lambda mode: self.toggle_mac_fields(mode, self.mac_destination_count, self.mac_destination_step)
         )
+        # v0.5.112: Auto for Destination MAC — symmetric to the
+        # Source button. Reads the selected RX iface's burned-in
+        # MAC. Without this, the switch sees the template's
+        # synthetic dst MAC (e.g. 00:00:00:00:00:00 or
+        # 02:00:00:00:00:02), treats the frame as "unknown
+        # unicast," and either floods (= partial delivery) or
+        # drops outright. With the real dst MAC, the switch's
+        # MAC table sends it directly to the RX port. Verified
+        # on srv06: source-Auto alone got ~22% delivery, both
+        # MACs corrected got ~100%.
+        self.mac_destination_auto_btn = QPushButton("Auto")
+        self.mac_destination_auto_btn.setToolTip(
+            "Populate Destination MAC from the selected RX "
+            "interface's burned-in hardware address.\n\n"
+            "Pair with Auto on Source MAC for proper unicast "
+            "delivery — without a real dst MAC, the switch "
+            "treats the frame as unknown unicast and may flood "
+            "or drop it."
+        )
+        self.mac_destination_auto_btn.setMaximumWidth(64)
+        self.mac_destination_auto_btn.clicked.connect(
+            self._on_autopopulate_dst_mac,
+        )
+        mac_layout.addWidget(self.mac_destination_auto_btn, 0, 7)
 
         # Source - reorganize to fit better
         mac_layout.addWidget(QLabel("Source:"), 1, 0)
@@ -9323,6 +9347,77 @@ class AddStreamDialog(QDialog):
         self.mac_source_address.setText(mac)
         # textChanged will fire _refresh_mac_mismatch_warning,
         # which will hide the chip now that the field matches.
+
+    def _resolve_rx_iface_name(self):
+        """Extract the iface name from the RX-port dropdown's
+        current selection. Format is typically "TG N - Port:
+        <iface>" or "Same as TX Port". Returns bare iface name
+        or empty string."""
+        if not hasattr(self, "rx_port_dropdown"):
+            return ""
+        txt = (self.rx_port_dropdown.currentText() or "").strip()
+        if not txt or txt == "Same as TX Port":
+            return self.tx_port_name or ""
+        # Split on " - Port: " — the canonical format. Fall
+        # through to whatever is after the last colon/slash for
+        # legacy/hand-edited stream files.
+        if " - Port:" in txt:
+            return txt.split(" - Port:", 1)[-1].strip()
+        return txt.split(":")[-1].strip()
+
+    def _on_autopopulate_dst_mac(self):
+        """v0.5.112: Auto button for Destination MAC. Resolves
+        the RX iface from the dropdown, hits /api/interfaces/
+        <rx_iface>/mac on the same TG, and writes it into
+        mac_destination_address.
+
+        Why a separate button per row: the operator may want
+        scaling on one side (e.g. Source = Increment for MAC
+        learning stress) but a real burned-in MAC on the other
+        (so the switch routes the frame instead of flooding).
+        Two buttons keep each row independent.
+        """
+        rx_iface = self._resolve_rx_iface_name()
+        if not rx_iface:
+            self._mac_mismatch_label.setText(
+                "Cannot determine RX interface — set RX Port "
+                "in the Stream Control tab before clicking Auto."
+            )
+            self._mac_mismatch_label.setStyleSheet(
+                "QLabel { background: #fee2e2; border: 1px solid "
+                "#ef4444; border-radius: 4px; padding: 4px 8px; "
+                "color: #991b1b; font-size: 11px; }"
+            )
+            self._mac_mismatch_label.show()
+            return
+        base = self._resolve_server_base_for_tx()
+        if not base:
+            return
+        try:
+            import requests as _req
+            resp = _req.get(
+                f"{base}/api/interfaces/{rx_iface}/mac",
+                timeout=3,
+            )
+            if not resp.ok:
+                self._mac_mismatch_label.setText(
+                    f"Could not fetch {rx_iface}'s MAC from the "
+                    f"server. Type it manually."
+                )
+                self._mac_mismatch_label.setStyleSheet(
+                    "QLabel { background: #fee2e2; border: 1px "
+                    "solid #ef4444; border-radius: 4px; padding: "
+                    "4px 8px; color: #991b1b; font-size: 11px; }"
+                )
+                self._mac_mismatch_label.show()
+                return
+            mac = ((resp.json() or {}).get("mac_address") or "").strip().lower()
+            if mac and mac != "00:00:00:00:00:00":
+                self.mac_destination_address.setText(mac)
+        except Exception as exc:
+            logging.debug(
+                f"[stream_dialog] dst MAC fetch failed: {exc}"
+            )
 
     def _refresh_mac_mismatch_warning(self):
         """Show/hide the inline warning chip based on whether
