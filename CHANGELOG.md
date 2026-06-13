@@ -2,6 +2,46 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.121] - 2026-06-13
+
+**Hot-fix: v0.5.120's VLAN-mode check looked in the wrong place.**
+
+v0.5.120 added a check for `stream_data.get("VLAN")` to respect
+the "Untagged" radio. But the Edit-Save path in
+`traffic_client/stream_control.py` routes the dialog's VLAN field
+into `stream_data["protocol_selection"]["VLAN"]` — because "VLAN"
+isn't in the `_TOP_LEVEL_ENGINE_KEYS` promotion list. So the
+v0.5.120 check found nothing at the top level and fell through to
+the legacy vlan_id path. Result: tx_worker cmdline on srv06 v0.5.120
+**still** showed `--vlan 100` after the operator picked "Untagged".
+
+### Fix
+
+Look in `protocol_selection.VLAN` first, then top-level `VLAN`.
+Mirrors the scapy code at `multithreaded_traffic_gen.py:1199`
+which has always used `(ps.get("VLAN") or stream_data.get("VLAN"))`.
+
+### Tests
+
+`tests/test_v05121_vlan_in_protocol_selection.py` — 6 cases:
+
+* `protocol_selection.VLAN == "Untagged"` drops vlan_id (the fix)
+* `protocol_selection.VLAN == "Tagged"` keeps vlan_id
+* Top-level VLAN still works (don't regress v0.5.120's lookup)
+* protocol_selection takes precedence over a stale top-level VLAN
+* Programmatic / API-direct streams without protocol_selection still work
+* Truly legacy streams with no VLAN field anywhere fall through to vlan_id
+
+Full suite: 2542 passed, 1 skipped.
+
+### Lessons
+
+The v0.5.120 commit message claimed "THE actual root cause" of the
+srv06 saga. It was 90% right — the FIX wired through the wrong
+location. Should have grep'd the scapy lookup pattern verbatim
+(`ps.get("VLAN")`) instead of inferring from comments. Trust the
+working code, not the docstring.
+
 ## [0.5.120] - 2026-06-13
 
 **Fix: DPDK tx_worker ignored the `VLAN: Untagged` mode toggle.**

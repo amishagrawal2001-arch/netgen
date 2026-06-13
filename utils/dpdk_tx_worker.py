@@ -994,9 +994,19 @@ def _resolve_l2_l3_l4(stream_data: Dict[str, Any]) -> Dict[str, Any]:
     # toggle back without re-typing the VID — but the launcher must
     # NOT emit --vlan in that case, or every frame goes on the wire
     # with a Dot1Q tag that the switch's access port silently drops.
-    # srv06 saga: cost 8 versions to diagnose; tx_worker cmdline
-    # showed --vlan 100 even after operator picked "Untagged" radio.
-    vlan_mode = str(stream_data.get("VLAN") or "").strip().lower()
+    # v0.5.121: also check protocol_selection.VLAN — Edit-Save's
+    # promotion list at stream_control.py:_TOP_LEVEL_ENGINE_KEYS
+    # does NOT include "VLAN", so the dialog's choice lands at
+    # `stream_data["protocol_selection"]["VLAN"]`, not top level.
+    # Mirrors the scapy side's lookup in multithreaded_traffic_gen
+    # at line 1199. Pre-fix tx_worker cmdline still showed --vlan
+    # 100 even though the operator picked "Untagged" — the v0.5.120
+    # check found nothing at the top level and fell through to the
+    # vlan_id path.
+    ps = stream_data.get("protocol_selection") or {}
+    vlan_mode = str(
+        ps.get("VLAN") or stream_data.get("VLAN") or ""
+    ).strip().lower()
     if vlan_mode == "untagged":
         vlan_id = None
     else:
