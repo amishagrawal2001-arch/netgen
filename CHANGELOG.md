@@ -2,6 +2,56 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.117] - 2026-06-13
+
+**App icon margin fix — matches Apple HIG sizing so the icon
+renders at the same visual size as other Dock apps.**
+
+Operator screenshot after v0.5.116 showed the netgen icon
+rendering visibly smaller than neighboring Apple-supplied
+icons in the macOS Dock — our rounded square filled the full
+1024×1024 canvas, while standard Apple icons sit within a
+centered ~824×824 area inside the canvas, leaving ~10%
+transparent margin on each side. The Dock uses that consistent
+margin to align every icon at the same visual size.
+
+### Fix
+
+`scripts/generate_app_icon.py:_draw_icon()` now insets the
+icon shape inside the canvas at sizes ≥ 64 px:
+
+* Margin: ~9.8% of canvas (matches Apple's Big Sur template)
+* Icon shape: centered at `canvas - 2 * margin`
+* Corner radius: 22.4% of icon shape (Apple's squircle ratio)
+* Margin area is fully transparent (alpha 0) so the Dock's
+  shadow + rounding stay correct
+
+Sizes < 64 px skip the inset — the 1-pixel margin gives up
+visible icon area without a perceptible benefit at that scale.
+
+### Regenerated artifacts
+
+* All `resources/icons/netgen-{16…1024}.png`
+* `resources/icons/netgen.png` (256 alias)
+* `resources/icons/netgen.icns`
+* `resources/icons/netgen.ico`
+
+### Tests
+
+`tests/test_v05116_app_icon_wiring.py` gains 2 cases pinning:
+
+* Sizes ≥ 64 px have corner-pixel alpha == 0 (margin present)
+* Sizes ≤ 32 px have probe-pixel alpha ≥ 200 (inset skipped)
+
+Full suite: 2518 passed, 1 skipped.
+
+### Migration notes
+
+The PNG / `.icns` / `.ico` containers are regenerated in place
+— no consumer-side code changes needed. The next CI build of
+the macOS DMG will produce an `.app` whose Dock icon visually
+matches Apple's sizing convention.
+
 ## [0.5.116] - 2026-06-13
 
 **Speedometer + packet app icon. End-to-end build wiring + v1

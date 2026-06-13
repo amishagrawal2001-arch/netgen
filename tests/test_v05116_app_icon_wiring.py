@@ -124,6 +124,55 @@ def test_client_entry_sets_window_icon():
     )
 
 
+def test_large_pngs_have_transparent_margin():
+    """v0.5.117 fix: at 64+ px sizes, the icon shape must be
+    inset inside the canvas with a transparent margin so it
+    matches the visual size of Apple-supplied Dock icons. Pre-
+    fix the rounded square filled the full canvas → ours
+    rendered visibly smaller than other apps' Dock icons
+    because we lacked the breathing-room margin Apple applies.
+
+    Verify by checking corner pixel alpha — should be 0 at
+    sizes ≥ 64."""
+    from PIL import Image
+    for size in (64, 128, 256, 512, 1024):
+        img = Image.open(ICONS_DIR / f"netgen-{size}.png").convert("RGBA")
+        corner_alpha = img.getpixel((0, 0))[3]
+        center_alpha = img.getpixel((size // 2, size // 2))[3]
+        assert corner_alpha == 0, (
+            f"netgen-{size}.png corner alpha must be 0 (margin "
+            f"required by Apple HIG); got {corner_alpha}"
+        )
+        assert center_alpha == 255, (
+            f"netgen-{size}.png center alpha must be 255 (icon "
+            f"shape is opaque); got {center_alpha}"
+        )
+
+
+def test_small_pngs_skip_inset():
+    """At 16 / 32 px the margin would be ≤ 1 px — not worth
+    sacrificing the visible icon area. The generator skips the
+    inset at those sizes, so corner alpha at 16 should be
+    near-opaque (the rounded-square's corner curve still
+    creates a tiny transparent edge, but center+corner are both
+    inside the rounded square)."""
+    from PIL import Image
+    # At 16/32 the rounded-square's corner curve produces an
+    # alpha gradient near (0,0). Sample a pixel a few pixels in
+    # from the corner — that should be opaque if the inset was
+    # skipped. (At v0.5.116 with no inset, the same pixel was
+    # opaque; at v0.5.117 with inset > 0, it would be
+    # transparent.)
+    for size, probe in ((16, 4), (32, 8)):
+        img = Image.open(ICONS_DIR / f"netgen-{size}.png").convert("RGBA")
+        a = img.getpixel((probe, probe))[3]
+        assert a >= 200, (
+            f"netgen-{size}.png probe at ({probe},{probe}) "
+            f"should be (nearly) opaque — inset must be skipped "
+            f"at small sizes; got alpha {a}"
+        )
+
+
 def test_generator_script_present_and_runnable():
     """The PIL-based generator script lives under scripts/. We
     don't run it from tests (would create files in resources/),

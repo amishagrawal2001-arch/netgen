@@ -109,11 +109,50 @@ def _arc(
 
 
 def _draw_icon(size: int) -> Image.Image:
-    """Render the icon at the requested square size. All
-    coordinates derived from the 360-unit source SVG by `s`, the
-    pixels-per-source-unit scale factor."""
-    s = size / 360.0
-    img = Image.new("RGB", (size, size), PALETTE["bg"])
+    """Render the icon at the requested square size.
+
+    Apple's Big Sur app-icon template (and the equivalent
+    Windows / Linux conventions, by convergence) centers the
+    icon shape inside the canvas with ~10% transparent margin
+    on each side, then applies a corner radius of ~22.4% of the
+    icon shape's side length. This is what gives macOS Dock
+    icons their consistent visual size — every app icon sits at
+    the same effective size because they all share the inset.
+
+    Pre-v0.5.117 we filled the canvas edge-to-edge with the
+    rounded square, which made the netgen icon render smaller
+    than other Dock icons (operator screenshot showed clearly
+    visible breathing room around ours while Apple-supplied
+    icons go to the Dock-slot edges). Fix: inset the icon
+    shape, leaving transparent margin around it.
+
+    The 16 / 32 px sizes skip the inset — at those scales the
+    margin would be ≤ 1 px and gives up valuable detail without
+    a visible benefit.
+    """
+    use_inset = size >= 64
+    if use_inset:
+        margin = max(1, round(size * 0.098))
+    else:
+        margin = 0
+    icon_side = size - 2 * margin
+
+    # All design coordinates are derived from a 360-unit
+    # reference (matches resources/icons/netgen.svg). When the
+    # icon is inset, `s` shrinks accordingly so the gauge etc.
+    # stay proportional inside the smaller icon shape.
+    s = icon_side / 360.0
+
+    # Composite onto a fully-transparent canvas — the margin
+    # area MUST be transparent (alpha 0), not the bg color, or
+    # the Dock-slot rounding/shadow gets cropped wrong.
+    canvas = Image.new("RGBA", (size, size), (0, 0, 0, 0))
+
+    # Work in a smaller buffer sized to the icon shape itself,
+    # then paste onto the transparent canvas at the inset
+    # offset. Cleaner than rewriting every draw call with an
+    # offset.
+    img = Image.new("RGB", (icon_side, icon_side), PALETTE["bg"])
     draw = ImageDraw.Draw(img, "RGBA")
 
     # Top-half shine — light tint to mimic the Big Sur app-icon
@@ -199,14 +238,20 @@ def _draw_icon(size: int) -> Image.Image:
             fill=PALETTE["packet"] + (89,),
         )
 
-    # Clip to the rounded-square silhouette. macOS Dock + Windows
-    # taskbar don't always honor non-square icons; the corner
-    # transparency is what makes the icon read as a proper app
-    # icon and not a flat-cropped rectangle.
-    radius = int(80 * s) if size >= 64 else max(2, int(0.22 * size))
-    rounded = Image.new("RGBA", (size, size), (0, 0, 0, 0))
-    rounded.paste(img, (0, 0), _rounded_rect_mask((size, size), radius))
-    return rounded
+    # Clip the icon-shape buffer to the rounded-square
+    # silhouette. Apple's Big Sur squircle ratio is ~22.37% of
+    # the icon shape's side length; the pre-v0.5.117 80/360
+    # ratio (22.2%) was already close, retained here for
+    # consistency with the source SVG.
+    radius = max(2, int(round(icon_side * 0.224)))
+    icon_layer = Image.new("RGBA", (icon_side, icon_side), (0, 0, 0, 0))
+    icon_layer.paste(img, (0, 0), _rounded_rect_mask(
+        (icon_side, icon_side), radius,
+    ))
+
+    # Composite onto the transparent canvas at the inset.
+    canvas.paste(icon_layer, (margin, margin), icon_layer)
+    return canvas
 
 
 SIZES = (16, 32, 64, 128, 256, 512, 1024)
