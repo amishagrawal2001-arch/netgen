@@ -193,6 +193,53 @@ def test_rx_engine_combo_value_in_get_stream_details(qapp):
         d.deleteLater()
 
 
+def test_autopopulate_finds_address_via_parent_chain(qapp, monkeypatch):
+    """v0.5.111 regression: edit-stream flow strips `address`
+    from server_interfaces (transforms to {tg_id, ports}). The
+    dialog must fall back to the parent widget's
+    server_interfaces, which keeps the full shape with address.
+    Pre-fix the dialog returned None and the operator saw
+    "Could not fetch" instead of the iface MAC."""
+    from PyQt5.QtWidgets import QWidget
+    from widgets.stream_dialog import AddStreamDialog
+
+    # Parent widget with the full server shape — this is what
+    # the host StreamControl mixin actually carries.
+    parent = QWidget()
+    parent.server_interfaces = [{
+        "tg_id": "0",
+        "address": "http://parent-host:5050",
+        "online": True,
+    }]
+
+    # Dialog gets the post-transform shape — no `address`.
+    dlg = AddStreamDialog(
+        parent=parent,
+        interface="TG 0 - Port: ens2f0np0",
+        stream_data=None,
+        server_interfaces=[{"tg_id": "0", "ports": ["ens2f1np1"]}],
+    )
+    try:
+        captured = {}
+        class _R:
+            ok = True
+            def json(self): return {"mac_address": "5c:25:73:3f:30:56"}
+        def _capture_get(url, *a, **kw):
+            captured["url"] = url
+            return _R()
+        monkeypatch.setattr("requests.get", _capture_get)
+
+        dlg._on_autopopulate_src_mac()
+
+        assert dlg.mac_source_address.text() == "5c:25:73:3f:30:56"
+        # Confirm we hit the parent's URL, not nothing.
+        assert "parent-host:5050" in captured["url"]
+        assert "/api/interfaces/ens2f0np0/mac" in captured["url"]
+    finally:
+        dlg.deleteLater()
+        parent.deleteLater()
+
+
 def test_autopopulate_does_not_crash_when_server_unreachable(qapp, monkeypatch):
     """Edge case: TG server is unreachable (requests.get raises).
     Auto button must surface a hint, not propagate the exception."""

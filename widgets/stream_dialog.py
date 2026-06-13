@@ -9215,8 +9215,16 @@ class AddStreamDialog(QDialog):
         """Return the http://host:port for the TG that owns the
         TX iface. Best-effort; returns None when we can't pin
         down a server URL (tests, dialogs opened outside the
-        main flow). The dialog stores server_interfaces from the
-        host caller — use it.
+        main flow).
+
+        v0.5.111: the edit-stream flow strips `address` from
+        server_interfaces before constructing the dialog (it
+        transforms each entry to {tg_id, ports} to feed the
+        RX-port dropdown), so the dialog's own server_interfaces
+        is shape-incompatible with the URL lookup. Fall back to
+        the parent widget chain — the host StreamControl /
+        ServerSection mixins keep the full {tg_id, address,
+        online, ...} shape on their `.server_interfaces`.
         """
         tg_id = None
         try:
@@ -9228,14 +9236,35 @@ class AddStreamDialog(QDialog):
             return None
         if tg_id is None:
             return None
-        for s in (self.server_interfaces or []):
-            try:
-                if int(s.get("tg_id")) == tg_id:
-                    addr = (s.get("address") or "").rstrip("/")
-                    if addr:
-                        return addr
-            except (TypeError, ValueError):
-                continue
+
+        # Collect candidate server_interfaces lists, dialog's own
+        # first, then walk up the Qt parent chain. Stop at the
+        # first one that yields a matching tg_id with an address.
+        candidates = [self.server_interfaces or []]
+        try:
+            p = self.parent()
+            for _ in range(8):  # 8 levels is more than enough
+                if p is None:
+                    break
+                sl = getattr(p, "server_interfaces", None)
+                if isinstance(sl, list):
+                    candidates.append(sl)
+                p = p.parent() if hasattr(p, "parent") else None
+        except Exception:
+            pass
+
+        for source in candidates:
+            for s in source:
+                if not isinstance(s, dict):
+                    continue
+                try:
+                    if int(s.get("tg_id")) != tg_id:
+                        continue
+                except (TypeError, ValueError):
+                    continue
+                addr = (s.get("address") or "").rstrip("/")
+                if addr:
+                    return addr
         return None
 
     def _fetch_iface_mac_from_server(self):

@@ -2,6 +2,39 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.111] - 2026-06-13
+
+**v0.5.110 hot-fix: Auto-MAC button "Could not fetch" error in the
+Edit Stream dialog.**
+
+Empirically reproduced on srv06: clicking Auto in the Edit dialog
+surfaced "Could not fetch the TX interface's MAC from the server"
+even though `GET /api/interfaces/<iface>/mac` worked perfectly when
+called directly. Root cause: the Edit Stream flow at
+`stream_control.py:1338-1373` transforms each server entry from
+`{tg_id, address, online, ...}` to `{tg_id, ports}` before passing
+to the dialog (the transform feeds the RX-port dropdown's per-server
+iface list). My v0.5.110 helper read `s["address"]` to build the URL
+→ None → no fetch.
+
+### Fix
+
+`_resolve_server_base_for_tx` now walks up the Qt parent chain (up
+to 8 levels) looking for a widget whose `.server_interfaces` carries
+the full shape with `address`. The host StreamControl /
+ServerSection mixins keep that shape unmodified, so the dialog
+reaches them and resolves the URL correctly.
+
+Tests: 1 new regression case (`test_autopopulate_finds_address_via_parent_chain`)
+pinning the parent-chain fallback; all 9 dialog tests + full suite
+green.
+
+### Migration notes
+
+Once you upgrade srv06 to v0.5.111, the Auto button works in Edit
+Stream the same way it would have in Add Stream. No config change
+required.
+
 ## [0.5.110] - 2026-06-12
 
 **MAC autopopulate + RX fallback observability — the srv06 RX=0 fix
