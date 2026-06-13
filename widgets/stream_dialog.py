@@ -303,6 +303,96 @@ that the bottleneck is per-queue PMD throughput / PCIe overhead, not software.</
   }'</pre>
 
 <p class="muted">Six clicks (or one curl) from a fresh stream to 100G saturated.</p>
+
+<h2>8. Troubleshooting: RX = 0 with DPDK <span class="ver new">0.5.114</span></h2>
+
+<p>If TX is firing but RX shows 0 (or implausibly low), walk this checklist
+top to bottom. It encodes the srv06 saga — every step here cost real hours.</p>
+
+<h3>8.1 Are the source &amp; destination MACs real?</h3>
+
+<p>The most common cause. DPDK puts whatever MACs you configured straight
+on the wire. Switches with port-security, sticky-MAC, or MAC-limit policies
+drop frames carrying synthetic MACs like <code>02:00:00:00:00:01</code>
+(common template defaults).</p>
+
+<ul>
+  <li>Open the stream's <b>Edit</b> dialog → <b>Protocol Data</b> tab</li>
+  <li>Click <b>Auto</b> next to <i>Source MAC</i> — fills the TX iface's
+      burned-in MAC</li>
+  <li>Click <b>Auto</b> next to <i>Destination MAC</i> — fills the RX iface's
+      burned-in MAC (resolved from the RX Port dropdown)</li>
+  <li>Save → Apply → Start. If the warning chip below the MAC row turns
+      yellow, fix what it points at before continuing.</li>
+</ul>
+
+<p class="muted">As of <span class="ver new">0.5.113</span>, opening Add Stream on a fresh
+template auto-populates both MACs immediately — no clicks needed.</p>
+
+<h3>8.2 Is your RX engine right for the NIC?</h3>
+
+<p>On <b>Mellanox bifurcated kernel-bound mode</b> (mlx5_core driver,
+infiniband devnode present), setting <i>rx_engine = DPDK (rx_worker)</i>
+reliably breaks RX:</p>
+
+<ol>
+  <li><code>rx_worker</code> grabs the chip's RX queue via DPDK PMD</li>
+  <li>Frames arriving at the chip route to <code>rx_worker</code>'s queue → kernel
+      netdev's queue gets nothing → kernel rx counter stops incrementing</li>
+  <li><code>rx_worker</code> dies (startup race, not yet root-caused)</li>
+  <li>Chip flow steering still points at the dead worker. Kernel stays blind</li>
+  <li>Stream stats read from the dead <code>rx_worker</code> → reports 0 RX forever</li>
+</ol>
+
+<p>The dialog detects this NIC class on render and defaults
+<b>rx_engine = Scapy</b>. If you override to DPDK, a red warning chip
+appears below the engine combo. Heed it — flip back to Scapy.</p>
+
+<p class="muted">Proper fix (<code>rte_flow</code> rules in <code>rx_worker.c</code> to selectively
+steer matching traffic while leaving the kernel queue intact) is tracked for
+a future release. Until then, on Mellanox bifurcated NICs: <b>DPDK TX +
+Scapy RX</b> is the working combo.</p>
+
+<h3>8.3 Is the switch capping RX at some pps threshold?</h3>
+
+<p>Access ports in storm-control'd or MAC-limit configs typically pass
+a few hundred kpps before the switch starts dropping. Above the cap,
+TX continues but wire delivery flattens at the cap rate regardless of
+how hard you push.</p>
+
+<p>Stream stats now surface this via the <code>wire_delivery_warning</code> field
+(<span class="ver new">0.5.114</span>). When TX is firing but RX is essentially zero,
+the stats endpoint annotates with TX/RX rates and the most likely causes.</p>
+
+<p>Verified on srv06's QFX5130 access port:</p>
+
+<table>
+<tr><th>TX target</th><th>Delivered</th><th>%</th></tr>
+<tr><td class="num">100k pps</td><td class="num">103k pps</td><td class="num">101%</td></tr>
+<tr><td class="num">250k pps</td><td class="num">251k pps</td><td class="num">98%</td></tr>
+<tr><td class="num">500k pps</td><td class="num">375k pps</td><td class="num">74%</td></tr>
+<tr><td class="num">1M pps</td><td class="num">603k pps</td><td class="num">59%</td></tr>
+<tr><td class="num">2M+ pps</td><td class="num">~650k pps</td><td class="num">capped</td></tr>
+</table>
+
+<p>To go past the cap, either configure storm-control to raise the threshold
+on the access port, or move the port into a trunk with appropriate
+broadcast/unknown-unicast caps. This is a switch config change, nothing
+netgen can do.</p>
+
+<h3>8.4 Did a previous high-pps blast trip switch port-security?</h3>
+
+<p>Once tripped, port-security or MAC-flap protection may keep the port
+in violation state until the violation timer ages out OR the port is
+bounced from the switch CLI. Symptoms: all traffic (including low-rate
+Scapy) drops at the switch port. Fix: <code>shutdown / no shutdown</code> the port,
+or wait 5–30 minutes for the violation timer (vendor-dependent).</p>
+
+<p>The <code>dpdk_blast_e2e</code> template fires at chip line rate (~22 Mpps on
+ConnectX-6); on shared lab infrastructure this can trip the switch port
+immediately. As of <span class="ver new">0.5.113</span> the dialog auto-populates real
+iface MACs on template apply, which mitigates the MAC-violation half;
+the high-pps half still needs operator awareness.</p>
 """
 
 
@@ -5880,10 +5970,31 @@ class AddStreamDialog(QDialog):
         engine_layout.addWidget(self.rx_engine_combo)
         engine_layout.addStretch(1)
         layout.addWidget(engine_row)
+        # v0.5.114: warning chip rendered when rx_engine override
+        # contradicts the server's recommended value. Filled in
+        # by _refresh_rx_engine_advice() — populated lazily on
+        # first rx_engine combo change or on dialog open.
+        self._rx_engine_advice_label = QLabel("")
+        self._rx_engine_advice_label.setTextFormat(Qt.RichText)
+        self._rx_engine_advice_label.setWordWrap(True)
+        self._rx_engine_advice_label.setStyleSheet(
+            "QLabel { background: #fef3c7; border: 1px solid "
+            "#f59e0b; border-radius: 4px; padding: 4px 8px; "
+            "color: #92400e; font-size: 11px; }"
+        )
+        self._rx_engine_advice_label.hide()
+        layout.addWidget(self._rx_engine_advice_label)
+        # Cached advice — {"recommended": str, "reason": str,
+        # "bifurcated_mellanox": bool} keyed by iface. None when
+        # fetch failed; ("",None,...) signals "not yet fetched."
+        self._rx_engine_advice_cache = None
         # Bidirectional sync with dpdk_enable_checkbox + show/hide RDMA
         # params group. Wired below once all widgets exist.
         self.engine_combo.currentIndexChanged.connect(
             self._on_engine_combo_changed,
+        )
+        self.rx_engine_combo.currentIndexChanged.connect(
+            lambda _i: self._refresh_rx_engine_advice(),
         )
 
         # DPDK toggle
@@ -8644,6 +8755,15 @@ class AddStreamDialog(QDialog):
             rxi = self.rx_engine_combo.findData(rx_engine)
             if rxi >= 0:
                 self.rx_engine_combo.setCurrentIndex(rxi)
+            # v0.5.114: on Add Stream (no explicit rx_engine in
+            # stream_data), upgrade the default from "scapy" to
+            # whatever the server recommends for this NIC. On
+            # normal NICs that's "dpdk"; on Mellanox bifurcated
+            # it stays "scapy" (the safe pick documented in
+            # project_srv06_rx_worker_blindness). Also refresh
+            # the warning chip after the restore.
+            self._maybe_apply_rx_engine_default(stream_data)
+            self._refresh_rx_engine_advice()
             # Restore RDMA params if engine was rdma.
             rdma_cfg = stream_data.get("rdma") or {}
             if isinstance(rdma_cfg, dict):
@@ -9379,6 +9499,110 @@ class AddStreamDialog(QDialog):
                 f"[stream_dialog] iface MAC fetch failed: {exc}"
             )
         return None
+
+    def _fetch_rx_engine_advice(self):
+        """v0.5.114: hit /api/interfaces/<tx_iface>/rx_engine_advice
+        and cache. Returns the response dict or None on failure.
+        The advice tells the dialog what rx_engine should default
+        to on this NIC — Scapy on Mellanox bifurcated mode (to
+        avoid the rx_worker chip-grab + die trap), DPDK
+        elsewhere. See project_srv06_rx_worker_blindness."""
+        if self._rx_engine_advice_cache is not None:
+            return self._rx_engine_advice_cache
+        base = self._resolve_server_base_for_tx()
+        iface = self.tx_port_name
+        if not base or not iface:
+            return None
+        try:
+            import requests as _req
+            resp = _req.get(
+                f"{base}/api/interfaces/{iface}/rx_engine_advice",
+                timeout=3,
+            )
+            if resp.ok:
+                self._rx_engine_advice_cache = resp.json() or {}
+                return self._rx_engine_advice_cache
+        except Exception as exc:
+            logging.debug(
+                f"[stream_dialog] rx_engine advice fetch failed: {exc}"
+            )
+        return None
+
+    def _refresh_rx_engine_advice(self):
+        """Show / hide the warning chip based on whether the
+        current rx_engine combo selection contradicts the
+        server's recommendation."""
+        if not hasattr(self, "_rx_engine_advice_label"):
+            return
+        advice = self._fetch_rx_engine_advice()
+        if not advice:
+            self._rx_engine_advice_label.hide()
+            return
+        recommended = advice.get("recommended") or "dpdk"
+        current = (self.rx_engine_combo.currentData() or "scapy")
+        if current == recommended:
+            self._rx_engine_advice_label.hide()
+            return
+        # Operator overrode the recommendation. Show why the
+        # server thinks the other engine is right.
+        reason = advice.get("reason") or ""
+        bifurcated = bool(advice.get("bifurcated_mellanox"))
+        if bifurcated and current == "dpdk":
+            # The big warning — operator picked the broken combo.
+            self._rx_engine_advice_label.setText(
+                "<b>RX engine override on Mellanox bifurcated NIC.</b> "
+                "rx_worker grabs the chip queue via DPDK PMD and "
+                "leaves the kernel blind, often dropping all RX "
+                "counters to 0. Use <b>Scapy</b> on this NIC until "
+                "rte_flow rules land in rx_worker."
+            )
+            self._rx_engine_advice_label.setStyleSheet(
+                "QLabel { background: #fee2e2; border: 1px solid "
+                "#ef4444; border-radius: 4px; padding: 4px 8px; "
+                "color: #991b1b; font-size: 11px; }"
+            )
+        else:
+            # Generic mismatch — yellow chip.
+            self._rx_engine_advice_label.setText(
+                f"Server recommends <b>{recommended}</b> for this "
+                f"interface. {reason}"
+            )
+            self._rx_engine_advice_label.setStyleSheet(
+                "QLabel { background: #fef3c7; border: 1px solid "
+                "#f59e0b; border-radius: 4px; padding: 4px 8px; "
+                "color: #92400e; font-size: 11px; }"
+            )
+        self._rx_engine_advice_label.show()
+
+    def _maybe_apply_rx_engine_default(self, stream_data):
+        """v0.5.114: on Add Stream (no saved rx_engine in
+        stream_data), set the combo to the server's recommended
+        engine. Pre-fix the default was always Scapy. On
+        Mellanox bifurcated NICs that's the safe default; on
+        normal NICs operators have to manually switch to DPDK
+        every time they want line-rate accurate counting.
+
+        Skip if stream_data carries an explicit rx_engine — the
+        operator (or template) decided already, respect it."""
+        if not hasattr(self, "rx_engine_combo"):
+            return
+        # If the apply path already populated rx_engine from
+        # stream_data, don't overwrite. Edit Stream + template
+        # apply both go through this path; they have explicit
+        # values worth preserving.
+        if str(stream_data.get("rx_engine") or "").strip().lower() in (
+            "scapy", "dpdk",
+        ):
+            return
+        advice = self._fetch_rx_engine_advice()
+        if not advice:
+            return
+        recommended = (advice.get("recommended") or "").strip().lower()
+        if recommended not in ("scapy", "dpdk"):
+            return
+        idx = self.rx_engine_combo.findData(recommended)
+        if idx >= 0:
+            self.rx_engine_combo.setCurrentIndex(idx)
 
     def _on_autopopulate_src_mac(self):
         """Slot for the Auto button + mismatch-chip link click.

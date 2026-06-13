@@ -154,6 +154,50 @@ def pci_bdf_binding(pci_bdf: str) -> str:
     return "kernel"
 
 
+def is_mellanox_bifurcated_kernel(iface: str) -> bool:
+    """v0.5.114: detect the srv06-class trap: a Mellanox iface
+    bound to mlx5_core (kernel) but where DPDK PMD CAN claim the
+    chip's RX queue via bifurcated mode.
+
+    On this configuration, setting rx_engine="dpdk" reliably
+    breaks RX counting:
+      1. rx_worker grabs the chip's default RX queue via DPDK PMD
+      2. Frames arriving at the chip get routed to rx_worker's
+         DPDK queue → kernel netdev's queue gets nothing → kernel
+         rx counter stops incrementing
+      3. rx_worker dies (startup race we haven't root-caused)
+      4. Chip flow steering still points at the dead worker's
+         queue. Kernel stays blind even though chip is receiving
+      5. Stream stats reads from rx_worker registry → reports 0
+         RX forever, even at line-rate ingress
+
+    This is documented in project_srv06_rx_worker_blindness. The
+    proper fix is rte_flow rules in rx_worker.c (deferred to a
+    future release). The pragmatic workaround is to default
+    rx_engine to "scapy" on these NICs.
+
+    Detection rule: driver = mlx5_core AND infiniband device
+    exists (mlx5 / ConnectX series). Other vendors are not
+    affected.
+    """
+    pci_bdf = iface_to_pci_bdf(iface)
+    if not pci_bdf:
+        return False
+    drv_link = f"/sys/bus/pci/devices/{pci_bdf}/driver"
+    try:
+        target = os.readlink(drv_link)
+        drv_name = os.path.basename(target)
+    except (OSError, FileNotFoundError):
+        return False
+    if drv_name != "mlx5_core":
+        return False
+    # InfiniBand devnode existing under the PCI BDF confirms
+    # Mellanox ConnectX-class — that's the chip family where
+    # bifurcated PMD steals the RX queue from the kernel.
+    ib_dir = f"/sys/bus/pci/devices/{pci_bdf}/infiniband"
+    return os.path.isdir(ib_dir)
+
+
 # ─── Counter readers — one per source path ───
 
 

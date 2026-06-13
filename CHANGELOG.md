@@ -2,6 +2,94 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.114] - 2026-06-13
+
+**Saga close-out — three follow-ups codifying srv06 lessons so
+the next operator (or you, tomorrow) finds the answers in the
+GUI instead of in chat history.**
+
+### Smart rx_engine default + override warning
+
+New helper `is_mellanox_bifurcated_kernel(iface)` in
+`utils/nic_counters.py` detects the specific NIC config that
+broke the srv06 saga: `mlx5_core` driver bound, infiniband
+devnode present, kernel and DPDK PMD share the chip.
+
+New endpoint `GET /api/interfaces/<iface>/rx_engine_advice`
+returns the recommended engine + reason for that iface. On a
+bifurcated Mellanox NIC: `recommended: scapy`, reason names
+the rx_worker chip-grab + die trap. Standard NICs: `dpdk`.
+
+Dialog wires it in two places:
+
+1. **On Add Stream** (no saved `rx_engine`), the combo defaults
+   to whatever the server recommends — no more "the default is
+   Scapy and you have to remember to flip to DPDK every time."
+2. **On override** (operator picks the non-recommended engine
+   anyway), a warning chip appears below the engine combo. Red
+   chip when overriding the Mellanox bifurcated recommendation
+   (the one that costs hours when missed); yellow chip for
+   other mismatches.
+
+Edit path respects explicit saved values — operator's choice
+always wins over the advice.
+
+### Wire-delivery warning in stream stats
+
+`/api/streams/stats` now annotates each `active_streams` entry
+with a `wire_delivery_warning` field when TX is firing
+(≥ 100 pps) but RX is essentially zero (< 5% of TX). The
+warning carries the TX/RX rates and a summary naming the three
+most likely causes ordered by what we actually hit on srv06:
+switch storm-control cap, synthetic source MAC, wrong
+destination MAC.
+
+Closes the operator's "is it MAC, VLAN, or switch?" 5-hour
+debugging loop. Stats now point at the cause instead of leaving
+the operator to bisect.
+
+### In-app DPDK Workflow Guide — section 8 "Troubleshooting"
+
+Added to `widgets/stream_dialog.py:_DPDK_GUIDE_HTML`. Covers:
+
+* MAC autopopulate workflow (Auto button + auto-prefill on
+  template apply)
+* Mellanox bifurcated rx_engine=scapy workaround with the chip-
+  grab mechanism explanation
+* Switch storm-control awareness with srv06's measured cap
+  table (verified 2026-06-13: ~650 kpps before the QFX5130
+  access port starts dropping)
+* Port-security violation recovery: shut/no-shut on the switch
+  or wait for the violation timer
+
+Accessible from Help → DPDK Workflow Guide or the Read More
+button in the stream dialog's Variable Fields tab.
+
+### Tests
+
+* `tests/test_v05114_rx_engine_advice.py` (10) — detector
+  contract across NIC families, endpoint shape, dialog
+  default-on-add + respect-explicit-on-edit + warning-on-
+  override behaviors
+* `tests/test_v05114_wire_delivery_warning.py` (7) — detector
+  threshold (fires < 5%, skips ≥ 5%), skipped on idle / no-rx-
+  iface, endpoint shape preservation
+
+Full suite: 2505 passed, 1 skipped.
+
+### Migration notes
+
+* No config changes required. Existing saved streams keep their
+  explicit `rx_engine` values; the smart-default only applies
+  to fresh Add Stream.
+* The wire-delivery warning is purely additive — old clients
+  that don't render `wire_delivery_warning` just ignore the
+  field. New clients can surface it in the stream table.
+* The proper rx_worker fix (rte_flow rules for selective queue
+  steering) is still tracked for a future release; v0.5.114 is
+  the workaround-and-documentation layer that lets operators
+  use the system safely until then.
+
 ## [0.5.113] - 2026-06-13
 
 **Auto-prefill iface MACs on Add Stream + fix dst Auto silent

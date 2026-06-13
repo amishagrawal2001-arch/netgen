@@ -1014,6 +1014,54 @@ def stream_stats():
             # returns the existing shape. Log once per failure mode.
             logging.warning(f"[STATS] rx_worker fold failed: {_rxe}")
 
+        # v0.5.114: switch-cap detector. When the stream's
+        # TX is firing but the RX iface's kernel counter is
+        # flat, the wire is dropping frames — switch storm-
+        # control, MAC-limit, port-security violation, etc.
+        # Surface a hint in stream stats so the client doesn't
+        # have to bisect MAC vs VLAN vs switch from scratch
+        # (the srv06 saga's 5-hour rabbit hole). Best-effort,
+        # never blocks the stats response.
+        try:
+            for s in active_streams:
+                rx_iface = (s.get("rx_interface") or "").strip()
+                tx_rate = float(s.get("tx_rate") or 0.0)
+                rx_rate = float(s.get("rx_rate") or 0.0)
+                # Only fire when TX is at least 100 pps (filter
+                # out idle / stopping streams) AND there's a
+                # massive TX/RX divergence (RX < 5% of TX).
+                # Threshold is intentionally permissive so we
+                # don't false-positive when legitimate test
+                # configurations have low expected RX (e.g.
+                # one-way blast).
+                if tx_rate < 100 or rx_iface in ("", None):
+                    continue
+                if rx_rate >= tx_rate * 0.05:
+                    continue
+                # TX is firing and RX is essentially zero.
+                # Hint at the most likely causes ordered by
+                # what we actually saw in the srv06 saga.
+                s["wire_delivery_warning"] = {
+                    "tx_rate": tx_rate,
+                    "rx_rate": rx_rate,
+                    "summary": (
+                        f"TX is at {tx_rate:.0f} pps but RX on "
+                        f"{rx_iface} is at {rx_rate:.0f} pps — "
+                        f"wire is dropping ~"
+                        f"{(1 - rx_rate / tx_rate) * 100:.0f}% "
+                        f"of frames. Likely causes: "
+                        f"(1) switch storm-control / pps cap "
+                        f"(common at line-rate, "
+                        f"verified ~650kpps on srv06's QFX); "
+                        f"(2) source MAC is synthetic — see "
+                        f"the dialog's Auto button; "
+                        f"(3) destination MAC doesn't match "
+                        f"the RX iface — also use Auto."
+                    ),
+                }
+        except Exception as _wde:
+            logging.debug(f"[STATS] wire-delivery hint failed: {_wde}")
+
         return jsonify({"active_streams": active_streams}), 200
     except Exception as e:
         logging.error(f"[STATS] Error getting stream statistics: {e}")
@@ -11697,6 +11745,57 @@ def get_interface_mac(iface_name):
         "interface": iface_name,
         "mac_address": mac,
         "source": src,
+    })
+
+
+@app.route("/api/interfaces/<iface_name>/rx_engine_advice", methods=["GET"])
+def get_interface_rx_engine_advice(iface_name):
+    """v0.5.114: tell the client what rx_engine should default to
+    on this iface, and surface the reason. Closes the srv06 saga's
+    most painful detour — operator picks rx_engine=DPDK on a
+    Mellanox bifurcated kernel-bound NIC, rx_worker grabs the
+    chip queue + dies, kernel goes blind, stream stats show RX=0
+    forever even at line-rate ingress.
+
+    Response shape:
+      {
+        "interface": "<name>",
+        "recommended": "scapy" | "dpdk",
+        "reason": "<short string>",
+        "bifurcated_mellanox": bool
+      }
+
+    The dialog reads this on render and:
+      1. Defaults the rx_engine combo to `recommended`
+      2. Shows a yellow chip when the operator overrides the
+         recommendation, naming the reason.
+    """
+    import re
+    if not re.fullmatch(r"[A-Za-z0-9_.\-]{1,15}", iface_name or ""):
+        return jsonify({"error": "Invalid interface name"}), 400
+    try:
+        from utils.nic_counters import is_mellanox_bifurcated_kernel
+        bifurcated = is_mellanox_bifurcated_kernel(iface_name)
+    except Exception:
+        bifurcated = False
+    if bifurcated:
+        return jsonify({
+            "interface": iface_name,
+            "recommended": "scapy",
+            "reason": (
+                "Mellanox bifurcated kernel-bound NIC. rx_worker "
+                "would grab the chip's RX queue via DPDK PMD and "
+                "leave the kernel blind. Use Scapy until rte_flow "
+                "rules land in rx_worker (tracked for future "
+                "release)."
+            ),
+            "bifurcated_mellanox": True,
+        })
+    return jsonify({
+        "interface": iface_name,
+        "recommended": "dpdk",
+        "reason": "Standard NIC — DPDK rx_worker is reliable here.",
+        "bifurcated_mellanox": False,
     })
 
 
