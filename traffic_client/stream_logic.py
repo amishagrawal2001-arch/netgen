@@ -717,6 +717,12 @@ class TrafficGenClientStreamLogic:
         # which streams had their TX-cores bumped by the server so the operator
         # knows the engine actually ran multi-queue.
         dpdk_autopick_info: list = []  # [(stream_name, cores), ...]
+        # v0.5.110: RX fallback warnings — operator picked
+        # rx_engine="dpdk" but the spawn fell back to Scapy
+        # (binary missing, pci_bdf unresolvable on a kernel-bound
+        # iface, etc). Surface these so the operator stops chasing
+        # phantom "stream started but RX counter is 0" bugs.
+        rx_fallback_warnings: list = []  # [(stream_name, reason), ...]
 
         def _collect_dpdk_warnings(started_entries):
             for e in (started_entries or []):
@@ -729,6 +735,17 @@ class TrafficGenClientStreamLogic:
                     cores = e.get("actual_tx_cores")
                     if cores:
                         dpdk_autopick_info.append((name, cores))
+                # v0.5.110: rx_engine fallback (requested dpdk,
+                # got scapy) — separate dimension from the TX
+                # fallback above; both can fire on the same
+                # stream and the messages mean different things.
+                if (e.get("rx_engine_requested") == "dpdk" and
+                        e.get("rx_engine_actual") != "dpdk"):
+                    rx_reason = (e.get("rx_engine_fallback_reason")
+                                 or "rx_worker did not spawn "
+                                 "(reason unavailable — check the "
+                                 "server log)")
+                    rx_fallback_warnings.append((name, rx_reason))
 
         for server_url, per_port in server_payload_map.items():
             try:
@@ -883,6 +900,36 @@ class TrafficGenClientStreamLogic:
                     f"'{name}' (set TX Cores explicitly in the editor "
                     f"to override)"
                 )
+
+        # v0.5.110: RX fallback — operator selected rx_engine=dpdk
+        # but rx_worker didn't spawn. Separate dialog from TX
+        # fallback so the message stays focused. Common reasons:
+        # rx_worker binary missing (install_dpdk.sh Step 6.5 not
+        # run), pci_bdf unresolvable on a kernel-bound iface
+        # (rare; explicit rx_pci_bdf in stream config fixes it),
+        # or a spawn race. Streams ARE running and counting via
+        # Scapy — the dialog explains why DPDK RX accuracy didn't
+        # kick in.
+        if rx_fallback_warnings:
+            rx_lines = [f"• {name}: {reason}"
+                        for name, reason in rx_fallback_warnings]
+            logger.info(
+                f"[DPDK-RX] {len(rx_fallback_warnings)} stream(s) "
+                f"requested DPDK RX but fell back to Scapy"
+            )
+            for name, reason in rx_fallback_warnings:
+                logger.info(f"[DPDK-RX] '{name}' on Scapy RX: {reason}")
+            QMessageBox.information(
+                self,
+                "DPDK RX fallback",
+                f"{len(rx_fallback_warnings)} stream(s) requested "
+                f"rx_engine=dpdk but are counting RX via Scapy:\n\n"
+                + "\n".join(rx_lines) +
+                "\n\nThe streams are still running — only RX accuracy "
+                "is affected. Common fixes: re-run install_dpdk.sh "
+                "Step 6.5 (rx_worker binary), or pass rx_pci_bdf in "
+                "the stream config when the iface is vfio-bound.",
+            )
 
         # 5) refresh (session save removed - only save on explicit user action)
         self.update_stream_table()

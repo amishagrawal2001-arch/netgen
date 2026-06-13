@@ -6983,13 +6983,75 @@ class AddStreamDialog(QDialog):
         self.mac_source_mode.currentTextChanged.connect(
             lambda mode: self.toggle_mac_fields(mode, self.mac_source_count, self.mac_source_step)
         )
+        # v0.5.110: "Auto" — one-click populate of source MAC from
+        # the TX interface's burned-in hw_addr. The srv06 RX=0 saga
+        # confirmed this empirically: when DPDK frames go out with
+        # a synthetic source MAC (default 00:00:00:00:00:00 or
+        # template's 02:00:00:00:00:01), switches with port-security
+        # / sticky-MAC silently drop them. Frames carrying the
+        # iface's real MAC pass. Modifier still steps from this
+        # base — set Source mode = Increment + Count = N + Step = 1
+        # to scale, just remember each scaled MAC must also be
+        # authorized at the switch.
+        self.mac_source_auto_btn = QPushButton("Auto")
+        self.mac_source_auto_btn.setToolTip(
+            "Populate Source MAC from the TX interface's "
+            "burned-in hardware address.\n\n"
+            "Use this when a switch with port-security or "
+            "sticky-MAC is dropping your DPDK frames. Synthetic "
+            "MACs (00:00:00:00:00:00 / 02:00:00:00:00:01) get "
+            "silently filtered on the wire; the iface's real MAC "
+            "passes.\n\n"
+            "Scaling (Source mode = Increment) still works — the "
+            "modifier steps from the Auto-populated base. If your "
+            "switch enforces port-security on every MAC, authorize "
+            "the full range there too."
+        )
+        self.mac_source_auto_btn.setMaximumWidth(64)
+        self.mac_source_auto_btn.clicked.connect(self._on_autopopulate_src_mac)
+        mac_layout.addWidget(self.mac_source_auto_btn, 1, 7)
+
+        # v0.5.110: MAC-mismatch hint chip. Shows when source MAC
+        # diverges from the TX iface's burned-in MAC AND the
+        # engine is DPDK (Scapy uses AF_PACKET which rewrites the
+        # src MAC to the iface MAC anyway, so the warning would
+        # be a false alarm there). The chip is clickable: tapping
+        # it Autopopulates the field — same effect as the Auto
+        # button but discoverable from the warning itself.
+        self._mac_mismatch_label = QLabel("")
+        self._mac_mismatch_label.setTextFormat(Qt.RichText)
+        self._mac_mismatch_label.setOpenExternalLinks(False)
+        self._mac_mismatch_label.setWordWrap(True)
+        self._mac_mismatch_label.setStyleSheet(
+            "QLabel { background: #fef3c7; border: 1px solid "
+            "#f59e0b; border-radius: 4px; padding: 4px 8px; "
+            "color: #92400e; font-size: 11px; }"
+        )
+        self._mac_mismatch_label.hide()
+        self._mac_mismatch_label.linkActivated.connect(
+            lambda _href: self._on_autopopulate_src_mac()
+        )
+        mac_layout.addWidget(self._mac_mismatch_label, 2, 0, 1, 8)
+        # Cached iface MAC so we can compare cheaply on every
+        # textChanged tick without re-fetching from the server.
+        # Populated lazily on first need (Auto click or first
+        # mismatch check) and cached for the dialog's lifetime.
+        self._cached_iface_mac = None
+        # Trigger mismatch recheck whenever the source MAC field
+        # changes — covers operator typing, template apply, and
+        # load-from-saved.
+        self.mac_source_address.textChanged.connect(
+            lambda _t: self._refresh_mac_mismatch_warning()
+        )
 
         # Info
         mac_info_label = QLabel(
-            "To use MAC resolution, configure a corresponding device on the port with matching VLAN and IP."
+            "To use MAC resolution, configure a corresponding device on the port with matching VLAN and IP. "
+            "If a switch with port-security drops your DPDK frames, click <b>Auto</b> next to Source to "
+            "use the TX interface's real MAC (modifier scaling still works from that base)."
         )
         mac_info_label.setWordWrap(True)
-        mac_layout.addWidget(mac_info_label, 2, 0, 1, 7)
+        mac_layout.addWidget(mac_info_label, 3, 0, 1, 8)
 
         mac_group.setLayout(mac_layout)
         # Store reference for grid layout organization
@@ -8214,6 +8276,11 @@ class AddStreamDialog(QDialog):
                 self.dpdk_enable_checkbox.blockSignals(blocker)
         if hasattr(self, "rdma_params_group"):
             self.rdma_params_group.setVisible(engine == "rdma")
+        # v0.5.110: MAC-mismatch chip is engine-conditional —
+        # only DPDK shows it (Scapy goes through AF_PACKET which
+        # the kernel rewrites). Recheck whenever the engine flips.
+        if hasattr(self, "_refresh_mac_mismatch_warning"):
+            self._refresh_mac_mismatch_warning()
 
     def _on_dpdk_checkbox_toggled(self, checked: bool) -> None:
         """When the operator toggles the legacy DPDK checkbox directly,
@@ -9141,6 +9208,160 @@ class AddStreamDialog(QDialog):
             "enable_spray": self.uec_enable_spray_checkbox.isChecked(),
             "enable_rocev2": self.uec_enable_rocev2_checkbox.isChecked(),
         }
+
+    # v0.5.110 helpers — autopopulate src MAC + mismatch warning.
+
+    def _resolve_server_base_for_tx(self):
+        """Return the http://host:port for the TG that owns the
+        TX iface. Best-effort; returns None when we can't pin
+        down a server URL (tests, dialogs opened outside the
+        main flow). The dialog stores server_interfaces from the
+        host caller — use it.
+        """
+        tg_id = None
+        try:
+            if " - " in (self.tx_port or ""):
+                first = self.tx_port.split(" - ", 1)[0].strip()
+                if first.upper().startswith("TG "):
+                    tg_id = int(first.split()[-1])
+        except (ValueError, IndexError):
+            return None
+        if tg_id is None:
+            return None
+        for s in (self.server_interfaces or []):
+            try:
+                if int(s.get("tg_id")) == tg_id:
+                    addr = (s.get("address") or "").rstrip("/")
+                    if addr:
+                        return addr
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    def _fetch_iface_mac_from_server(self):
+        """Hit /api/interfaces/<iface>/mac on the TG that owns
+        the TX iface. Returns the MAC string (lowercase, colon-
+        separated) or None on any failure. Cached for the
+        dialog's lifetime in self._cached_iface_mac.
+        """
+        if self._cached_iface_mac:
+            return self._cached_iface_mac
+        base = self._resolve_server_base_for_tx()
+        iface = self.tx_port_name
+        if not base or not iface:
+            return None
+        try:
+            import requests as _req
+            resp = _req.get(
+                f"{base}/api/interfaces/{iface}/mac",
+                timeout=3,
+            )
+            if not resp.ok:
+                return None
+            mac = (resp.json() or {}).get("mac_address") or ""
+            mac = mac.strip().lower()
+            if mac and mac != "00:00:00:00:00:00":
+                self._cached_iface_mac = mac
+                return mac
+        except Exception as exc:
+            logging.debug(
+                f"[stream_dialog] iface MAC fetch failed: {exc}"
+            )
+        return None
+
+    def _on_autopopulate_src_mac(self):
+        """Slot for the Auto button + mismatch-chip link click.
+        Fetches the TX iface's MAC and stuffs it into the source
+        MAC field. On failure, surface a hint instead of failing
+        silently (operator clicked it for a reason; tell them
+        why nothing happened).
+        """
+        mac = self._fetch_iface_mac_from_server()
+        if not mac:
+            self._mac_mismatch_label.setText(
+                "Could not fetch the TX interface's MAC from the "
+                "server (interface may be down or vfio-bound — "
+                "MAC is hidden from the kernel after vfio-pci "
+                "bind). Type the iface's burned-in MAC manually."
+            )
+            self._mac_mismatch_label.setStyleSheet(
+                "QLabel { background: #fee2e2; border: 1px solid "
+                "#ef4444; border-radius: 4px; padding: 4px 8px; "
+                "color: #991b1b; font-size: 11px; }"
+            )
+            self._mac_mismatch_label.show()
+            return
+        self.mac_source_address.setText(mac)
+        # textChanged will fire _refresh_mac_mismatch_warning,
+        # which will hide the chip now that the field matches.
+
+    def _refresh_mac_mismatch_warning(self):
+        """Show/hide the inline warning chip based on whether
+        the operator's typed src MAC matches the TX iface's MAC.
+        Only fires for DPDK streams — Scapy goes through
+        AF_PACKET which the kernel rewrites to the iface MAC
+        anyway, so a synthetic src MAC there is harmless.
+        """
+        if not hasattr(self, "_mac_mismatch_label"):
+            return
+        # Only relevant when engine = DPDK. Pull from the combo
+        # if it exists; default to scapy when missing (test paths).
+        engine = "scapy"
+        try:
+            if hasattr(self, "engine_combo"):
+                engine = (self.engine_combo.currentData() or "scapy")
+        except Exception:
+            pass
+        if engine != "dpdk":
+            self._mac_mismatch_label.hide()
+            return
+        typed = (self.mac_source_address.text() or "").strip().lower()
+        # Defaults aren't a "mismatch" per se — they're "you
+        # never set this." Treat them the same as a mismatch so
+        # the chip nudges the operator toward Auto.
+        is_default = typed in (
+            "", "00:00:00:00:00:00", "02:00:00:00:00:01",
+        )
+        iface_mac = self._fetch_iface_mac_from_server()
+        if not iface_mac:
+            # We can't validate without the iface MAC. Don't
+            # spam the operator; only show the chip when we have
+            # something useful to say (when DPDK is selected with
+            # an obviously synthetic default).
+            if is_default:
+                self._mac_mismatch_label.setText(
+                    "<b>DPDK + default src MAC.</b> Many switches "
+                    "drop frames whose source MAC isn't learned on "
+                    "the egress port. "
+                    "<a href='auto'>Auto-populate from TX iface</a>"
+                )
+                self._mac_mismatch_label.setStyleSheet(
+                    "QLabel { background: #fef3c7; border: 1px solid "
+                    "#f59e0b; border-radius: 4px; padding: 4px 8px; "
+                    "color: #92400e; font-size: 11px; }"
+                )
+                self._mac_mismatch_label.show()
+            else:
+                self._mac_mismatch_label.hide()
+            return
+        if typed == iface_mac:
+            self._mac_mismatch_label.hide()
+            return
+        # Mismatch with a known iface MAC — strongest signal,
+        # warn explicitly and link to autopopulate.
+        self._mac_mismatch_label.setText(
+            f"<b>Source MAC differs from interface MAC</b> "
+            f"({iface_mac}). DPDK writes this MAC straight onto "
+            f"the wire — a switch with port-security or sticky-"
+            f"MAC may silently drop these frames. "
+            f"<a href='auto'>Use the interface's MAC</a>"
+        )
+        self._mac_mismatch_label.setStyleSheet(
+            "QLabel { background: #fef3c7; border: 1px solid "
+            "#f59e0b; border-radius: 4px; padding: 4px 8px; "
+            "color: #92400e; font-size: 11px; }"
+        )
+        self._mac_mismatch_label.show()
 
     def _collect_mac_pd(self):
         return {

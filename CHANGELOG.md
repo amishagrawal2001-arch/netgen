@@ -2,6 +2,93 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.110] - 2026-06-12
+
+**MAC autopopulate + RX fallback observability — the srv06 RX=0 fix
+chain, end to end.**
+
+The Scapy-vs-DPDK controlled test on san-hp-srv06 confirmed the
+MAC theory empirically: with the iface's burned-in MAC on the wire
+(Scapy via AF_PACKET's kernel rewrite), frames deliver at ~100%;
+with the DPDK template's synthetic `02:00:00:00:00:01`, frames
+deliver at ~0.05%. The switch between srv06 ports is dropping
+synthetic-MAC frames — classic port-security / sticky-MAC behavior.
+v0.5.110 ships the operator-facing fix.
+
+### One-click Auto-MAC button in the stream dialog
+
+The Source MAC row in the Protocol Data tab gains an **Auto** button
+next to the address field. It hits a new
+`GET /api/interfaces/<iface>/mac` endpoint, reads
+`/sys/class/net/<iface>/address`, and stuffs the result into
+`mac_source_address`. The Source modifier knobs (Increment / Decrement /
+Count / Step) are not touched — scaling still steps from the
+Auto-populated base.
+
+The endpoint validates the iface name shape (alnum + . _ -, max 15
+chars = `IFNAMSIZ-1`) before any sysfs read so a future loosening of
+the regex can't reintroduce a path-traversal hole.
+
+Why a button instead of automatic prefill: the dialog opens with the
+last-saved MAC (or template default), and silently overwriting it on
+load would break flows that legitimately use synthetic MACs (loopback
+testing, MAC-learning verification, port-security stress).
+
+### MAC-mismatch warning chip
+
+Below the MAC row, a yellow chip surfaces when the operator picks
+DPDK + a source MAC that differs from the TX iface's burned-in MAC.
+The chip names the iface MAC inline and offers a clickable
+"Use the interface's MAC" link (same effect as the Auto button).
+
+Chip is engine-conditional — it stays hidden under Scapy because the
+kernel rewrites the src MAC at AF_PACKET send time anyway, so the
+synthetic MAC never reaches the wire. Toggling the TX engine combo
+re-evaluates the chip on every flip.
+
+### RX-engine fallback surfaced in the start response
+
+`_maybe_start_dpdk_rx_for_stream` now returns a structured outcome
+dict — `{requested, actual, reason, pid}` — instead of just logging
+a warning. `/api/traffic/start` folds the outcome into each
+`started_streams` entry as `rx_engine_requested`, `rx_engine_actual`,
+`rx_engine_fallback_reason`. The client renders a new "DPDK RX
+fallback" dialog (separate from the existing TX fallback dialog)
+when actual != requested.
+
+Pre-fix the rx_worker spawn outcome only lived in the server log,
+which is exactly why the srv06 saga kept asking "is rx_worker even
+running?" — there was no UI signal that the spawn was attempted.
+Now the operator sees the binary-missing / pci_bdf-unresolvable /
+spawn-error reasons inline.
+
+### iface mac_address field on `/api/interfaces`
+
+Same sysfs read is folded into the existing `/api/interfaces`
+response so the admin console + dialogs that already poll iface
+state can show the burned-in MAC without a second round-trip.
+
+### Tests
+
+* `tests/test_v05110_iface_mac_endpoint.py` (5) — endpoint contract,
+  path-traversal rejection, malformed-MAC guard
+* `tests/test_v05110_rx_engine_outcome.py` (7) — outcome dict shape
+  across every spawn branch + defensive contract (never raises)
+* `tests/test_v05110_dialog_autopopulate.py` (8) — Auto button,
+  modifier preservation, mismatch chip engine-conditional + branch
+  coverage, server-unreachable handling
+
+### Migration notes
+
+No config changes required. Existing saved streams with synthetic
+src MACs will trigger the mismatch chip on edit if DPDK is selected
+— that's the intended nudge, not a regression.
+
+The autopopulate-vs-scaling tradeoff: scaling on a port-security
+switch only works if the operator authorizes the full MAC range on
+the switch port. The chip + tooltip flag this; netgen can't change
+switch policy.
+
 ## [0.5.109] - 2026-06-12
 
 **One-shot RX verdict probe — `POST /api/admin/dpdk/rx/probe`.**

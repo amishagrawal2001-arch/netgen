@@ -563,14 +563,34 @@ except Exception:
 
 def _maybe_start_dpdk_rx_for_stream(
     *, stream_id: str, rx_interface: str, stream_data: dict,
-) -> None:
+) -> dict:
     """Best-effort rx_worker spawn for a stream whose rx_engine is
     "dpdk". Failure is non-fatal — TX proceeds, Scapy RX fallback
     kicks in, stats won't show DPDK accuracy but everything else
-    works."""
+    works.
+
+    v0.5.110: returns a small status dict so the caller can fold
+    the outcome into /api/traffic/start's response body. Pre-fix
+    the spawn outcome lived only in the server log, leaving the
+    operator wondering why their rx_engine="dpdk" stream still
+    showed 0 RX (the srv06 saga repeatedly bit on this — the
+    spawn was silently skipped because pci_bdf resolved to None,
+    and the only signal was a logging.warning in /var/log).
+
+    Return shape:
+      {"requested": True/False,
+       "actual": "dpdk" | "scapy",
+       "reason": <short str or None>,
+       "pid": <int or None>}
+    """
     rx_engine = str(stream_data.get("rx_engine", "") or "").strip().lower()
     if rx_engine != "dpdk":
-        return  # no-op for the default (Scapy) case
+        return {
+            "requested": False,
+            "actual": "scapy",
+            "reason": None,
+            "pid": None,
+        }  # no-op for the default (Scapy) case
 
     # Resolve PCI BDF. Prefer an explicit override from stream
     # config (operator sets it when iface is already vfio-bound and
@@ -584,7 +604,14 @@ def _maybe_start_dpdk_rx_for_stream(
             logging.warning(
                 f"[DPDK-RX] pci_bdf lookup for {rx_interface} failed: {exc}"
             )
-            return
+            return {
+                "requested": True,
+                "actual": "scapy",
+                "reason": (
+                    f"pci_bdf lookup error for {rx_interface}: {exc}"
+                ),
+                "pid": None,
+            }
     if not pci_bdf:
         logging.warning(
             f"[DPDK-RX] cannot resolve pci_bdf for rx_interface "
@@ -592,7 +619,16 @@ def _maybe_start_dpdk_rx_for_stream(
             f"should pass rx_pci_bdf in stream config). Skipping "
             f"rx_worker spawn; stats will fall back to Scapy."
         )
-        return
+        return {
+            "requested": True,
+            "actual": "scapy",
+            "reason": (
+                f"pci_bdf unresolvable for {rx_interface} "
+                f"(iface may be vfio-bound — pass rx_pci_bdf in "
+                f"stream config to override)"
+            ),
+            "pid": None,
+        }
 
     # Derive filter args from stream config. dst_port commonly comes
     # from L4; vlan from VLAN_sel; src/dst IP from L3. Pull them
@@ -662,12 +698,27 @@ def _maybe_start_dpdk_rx_for_stream(
             f"[DPDK-RX] auto-spawned rx_worker for stream {stream_id} "
             f"on {rx_interface} (pid={info.get('pid')})"
         )
+        return {
+            "requested": True,
+            "actual": "dpdk",
+            "reason": None,
+            "pid": info.get("pid"),
+        }
     except FileNotFoundError as exc:
         logging.warning(
             f"[DPDK-RX] rx_worker binary missing: {exc}. "
             f"Re-run install_dpdk.sh or upgrade to a v0.5.105+ wheel. "
             f"Stream {stream_id} TX continues; RX falls back to Scapy."
         )
+        return {
+            "requested": True,
+            "actual": "scapy",
+            "reason": (
+                "rx_worker binary missing — re-run install_dpdk.sh "
+                "Step 6.5 or upgrade to a v0.5.105+ wheel"
+            ),
+            "pid": None,
+        }
     except ValueError as exc:
         # Already running for this stream_id — keep using the
         # existing handle. Most common when operator hits Start
@@ -675,11 +726,23 @@ def _maybe_start_dpdk_rx_for_stream(
         logging.info(
             f"[DPDK-RX] rx_worker already running for {stream_id}: {exc}"
         )
+        return {
+            "requested": True,
+            "actual": "dpdk",
+            "reason": "rx_worker already running for this stream",
+            "pid": None,
+        }
     except Exception as exc:
         logging.warning(
             f"[DPDK-RX] auto-spawn failed for {stream_id}: {exc}. "
             f"TX continues; RX uses Scapy."
         )
+        return {
+            "requested": True,
+            "actual": "scapy",
+            "reason": f"rx_worker spawn failed: {exc}",
+            "pid": None,
+        }
 
 
 def _maybe_stop_dpdk_rx_for_stream(*, stream_id: str) -> None:
@@ -1436,7 +1499,13 @@ def start_traffic():
             # NOT block the stream start. Operator's TX side still
             # runs; RX falls back to Scapy and stats just won't
             # reflect DPDK accuracy.
-            _maybe_start_dpdk_rx_for_stream(
+            # v0.5.110: capture the rx_worker outcome so we can
+            # fold it into the start response. Pre-fix the outcome
+            # only lived in the server log, and operators with
+            # rx_engine="dpdk" + a kernel-bound iface saw zero RX
+            # counters with no UI signal that the spawn was even
+            # attempted (the srv06 saga repeatedly hit this).
+            _rx_outcome = _maybe_start_dpdk_rx_for_stream(
                 stream_id=stream_id,
                 rx_interface=rx_interface,
                 stream_data=stream_data,
@@ -1486,6 +1555,30 @@ def start_traffic():
                     if actual_tx_cores is not None:
                         result["actual_tx_cores"] = actual_tx_cores
                         result["tx_cores_auto_picked"] = tx_cores_auto_picked
+                    # v0.5.110: surface the RX-engine outcome alongside
+                    # actual_engine. Symmetric to the TX side: if the
+                    # operator picked rx_engine="dpdk" but the spawn
+                    # fell back (binary missing, pci_bdf unresolvable,
+                    # spawn error), the client renders a toast pointing
+                    # them at the reason instead of leaving them to
+                    # diff /var/log against the iface configuration.
+                    try:
+                        if isinstance(_rx_outcome, dict):
+                            result["rx_engine_requested"] = (
+                                "dpdk" if _rx_outcome.get("requested")
+                                else "scapy"
+                            )
+                            result["rx_engine_actual"] = (
+                                _rx_outcome.get("actual") or "scapy"
+                            )
+                            if _rx_outcome.get("reason"):
+                                result["rx_engine_fallback_reason"] = (
+                                    _rx_outcome["reason"]
+                                )
+                            if _rx_outcome.get("pid"):
+                                result["rx_engine_pid"] = _rx_outcome["pid"]
+                    except Exception:
+                        pass
 
                 # Register stream in database only if launch was successful
                 if result and result.get("status") == "started" and not result.get("error"):
@@ -11390,6 +11483,28 @@ def get_interfaces():
                 status = "down"
             else:
                 status = "up" if is_up else "down"
+            # v0.5.110: include the iface's burned-in MAC so the
+            # stream-dialog Auto-MAC button can populate the src
+            # MAC field without a second round-trip. sysfs is the
+            # canonical source (psutil.net_if_addrs is fine too,
+            # but sysfs is what the kernel uses for AF_PACKET
+            # source-MAC rewriting anyway).
+            mac_address = ""
+            try:
+                with open(f"/sys/class/net/{name}/address", "r") as _af:
+                    mac_address = _af.read().strip().lower()
+            except (OSError, FileNotFoundError):
+                # psutil fallback for macOS / dev hosts where
+                # /sys/class/net/* doesn't exist
+                try:
+                    for _addr in psutil.net_if_addrs().get(name, []):
+                        if getattr(_addr, "family", None) and _addr.family.name in (
+                            "AF_PACKET", "AF_LINK"
+                        ):
+                            mac_address = (_addr.address or "").lower()
+                            break
+                except Exception:
+                    pass
             interfaces.append({
                 "name": name,
                 "status": status,
@@ -11397,6 +11512,7 @@ def get_interfaces():
                 "mtu": stats.mtu,
                 "speed": stats.speed if hasattr(stats, 'speed') else "Unknown",
                 "ip_addresses": psutil.net_if_addrs().get(name, []),  # Add IP addresses if available
+                "mac_address": mac_address,
                 "tx": tx,
                 "rx": rx,
                 "sent_bytes": sent_bytes,
@@ -11521,6 +11637,67 @@ def get_interfaces():
         logging.error(f"Error fetching interfaces: {e}")
         return jsonify({"error": "Unable to fetch interfaces"}), 500
 
+
+@app.route("/api/interfaces/<iface_name>/mac", methods=["GET"])
+def get_interface_mac(iface_name):
+    """v0.5.110: focused iface MAC lookup for the stream dialog's
+    Auto-MAC button. Reads /sys/class/net/<iface>/address — the
+    canonical kernel-visible hw_addr.
+
+    Why this exists: when a DPDK stream goes out with a synthetic
+    source MAC (e.g. 02:00:00:00:00:01) the chip writes that
+    straight onto the wire, bypassing the kernel's AF_PACKET
+    source-MAC rewrite. A switch with port-security or sticky-MAC
+    drops those frames silently. The Auto-MAC button gives the
+    operator a one-click way to use the iface's burned-in MAC so
+    the frames pass switch policy. See the srv06 RX=0 saga; this
+    fix was empirically confirmed against san-hp-srv06.
+    """
+    import re
+    # Validate iface name shape — typical Linux netdev names are
+    # alphanumerics + '_' / '-' / '.', max 15 chars (IFNAMSIZ-1).
+    # Reject anything else to keep the sysfs path traversal-proof.
+    if not re.fullmatch(r"[A-Za-z0-9_.\-]{1,15}", iface_name or ""):
+        return jsonify({"error": "Invalid interface name"}), 400
+
+    mac = ""
+    src = ""
+    try:
+        with open(f"/sys/class/net/{iface_name}/address", "r") as _af:
+            mac = _af.read().strip().lower()
+            src = "sysfs"
+    except (OSError, FileNotFoundError):
+        try:
+            for _addr in psutil.net_if_addrs().get(iface_name, []):
+                fam = getattr(_addr, "family", None)
+                if fam and fam.name in ("AF_PACKET", "AF_LINK"):
+                    mac = (_addr.address or "").lower()
+                    src = "psutil"
+                    break
+        except Exception:
+            pass
+
+    if not mac:
+        return jsonify({
+            "interface": iface_name,
+            "mac_address": "",
+            "error": "Interface not found or has no MAC",
+        }), 404
+
+    # MAC shape sanity — accept "aa:bb:cc:dd:ee:ff" or "aa-bb-..."
+    if not re.fullmatch(r"[0-9a-f]{2}([:-][0-9a-f]{2}){5}", mac):
+        return jsonify({
+            "interface": iface_name,
+            "mac_address": mac,
+            "error": "MAC has unexpected format",
+            "source": src,
+        }), 500
+
+    return jsonify({
+        "interface": iface_name,
+        "mac_address": mac,
+        "source": src,
+    })
 
 
 ## Packet Capture CODE
