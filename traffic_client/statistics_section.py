@@ -1941,6 +1941,14 @@ class TrafficGenClientStatisticsSection():
                 "_raw_iface": interface,
                 "enable_timestamps": bool(stream.get("enable_timestamps") or stream.get("latency_enabled")),
                 "_latency": stream.get("_latency"),
+                # v0.5.115: server-side wire-delivery warning. Set
+                # by /api/streams/stats when TX is firing but RX
+                # is essentially zero on the configured rx_iface.
+                # The RX-count cell renderer surfaces this as an
+                # amber ⚠ prefix with the summary in the tooltip.
+                # Absent in the common case — when RX matches TX
+                # the warning is None.
+                "wire_delivery_warning": stream.get("wire_delivery_warning"),
             })
         
         # Sort by interface, then by stream name
@@ -2034,10 +2042,33 @@ class TrafficGenClientStatisticsSection():
                 rx_display = "N/A"
             else:
                 rx_display = format_number(rx_count)
+            # v0.5.115: prefix ⚠ when the server's switch-cap
+            # detector flagged this stream — TX is firing but RX
+            # is essentially zero. Tooltip carries the full
+            # summary (named causes ordered by what we hit in
+            # the srv06 saga). Cell stays in the same column so
+            # row layout is unaffected; the indicator is purely
+            # informational.
+            wdw = stream.get("wire_delivery_warning")
+            if wdw and isinstance(wdw, dict):
+                rx_display = f"⚠ {rx_display}"
             rx_item = QTableWidgetItem(rx_display)
             rx_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
             if stream["flow_tracking"] and isinstance(rx_count, int) and stream["tx_count"] > 0 and rx_count == 0:
                 rx_item.setForeground(QColor("#ef4444"))  # Red for 100% loss
+            if wdw and isinstance(wdw, dict):
+                # Amber wins over the red "100% loss" foreground
+                # because the warning IS the explanation for the
+                # loss — both stem from the same observation but
+                # the warning gives the operator something to
+                # act on instead of just stating the symptom.
+                rx_item.setForeground(QColor("#b45309"))
+                summary = wdw.get("summary") or "Wire is dropping frames."
+                rx_item.setToolTip(
+                    f"⚠ Wire delivery warning\n\n{summary}\n\n"
+                    f"See Help → DPDK Workflow Guide → "
+                    f"Troubleshooting: RX = 0 with DPDK."
+                )
             self.stream_statistics_table.setItem(row, 4, rx_item)
 
             # TX Rate — bold + blue to match the Interface Statistics tab's

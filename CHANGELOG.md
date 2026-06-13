@@ -2,6 +2,78 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.115] - 2026-06-13
+
+**Statistics tab surfaces the v0.5.114 wire-delivery warning +
+What's New entries for the v0.5.110-115 RX saga.**
+
+### Statistics tab — ⚠ on RX cell when wire delivery is broken
+
+The v0.5.114 server-side `wire_delivery_warning` field was
+invisible to GUI operators — they'd see rx_count=0 but no hint
+about why, same as before. This release wires the warning
+through to the per-stream Statistics table:
+
+* RX-count cell prefixes ⚠ when the warning is present
+* Cell foreground turns amber (#b45309), distinct from the
+  red (#ef4444) "100% loss" indicator — amber wins when both
+  apply because the warning IS the explanation for the loss
+* Tooltip carries the full summary (named causes) + pointer to
+  Help → DPDK Workflow Guide → Troubleshooting
+
+Closes the loop from "server detects the symptom" → "client
+operator can act on it".
+
+### What's New entries for the v0.5.110-115 saga
+
+`_FEATURE_GUIDE_HTML` in `widgets/stream_dialog.py` gains a new
+section covering the six releases of MAC/RX/switch work:
+
+* Auto-MAC buttons on Source + Destination rows
+* Auto-prefill of real iface MACs on Add Stream
+* Smart rx_engine default based on the server's per-iface
+  advice endpoint (Mellanox bifurcated → Scapy)
+* RX-engine telemetry + edit-save engine-key promotion fix
+* Wire-delivery warning in stats + Statistics-tab surface
+* Pointer to the DPDK Workflow Guide troubleshooting section
+
+Last release before this batch was v0.5.74, so the What's New
+was carrying a 41-release gap on user-visible MAC/RX
+functionality. Closed.
+
+### Memory consolidation
+
+Three project memory files updated to reflect what actually
+shipped (vs. what was tentatively tracked when the saga was
+in progress):
+
+* `project_srv06_rx_worker_blindness` — replaced the
+  "v0.5.114+ tracking" placeholder with concrete "Status as
+  of v0.5.115" listing what shipped + what's still TODO (the
+  rte_flow C fix)
+* `project_dpdk_blast_template_footgun` — expanded v0.5.113
+  mitigation note to cover the full 113-115 chain
+* `MEMORY.md` index entries sharpened to <150 chars naming
+  shipped fixes + pending work
+
+### Tests
+
+* `tests/test_v05115_wire_delivery_ui.py` (4) — pins the
+  client-side renderer contract: wire_delivery_warning
+  threaded through all_streams, ⚠ prefix only when warning
+  is a truthy dict, tooltip references the DPDK guide, amber
+  color used in the RX-cell branch (not just engine column).
+
+Full suite: 2509 passed, 1 skipped.
+
+### Migration notes
+
+* Older clients (pre-v0.5.115) just ignore the new
+  `wire_delivery_warning` field — additive change, no breakage.
+* v0.5.114 servers + v0.5.115 clients = warnings visible.
+  v0.5.115 servers + v0.5.114 clients = warning emitted but
+  not rendered (was the v0.5.114 state). Either combo is safe.
+
 ## [0.5.114] - 2026-06-13
 
 **Saga close-out — three follow-ups codifying srv06 lessons so

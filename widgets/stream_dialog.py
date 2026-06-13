@@ -3016,6 +3016,93 @@ _FEATURE_GUIDE_HTML = r"""
 organised so the menu / tab where you'll find each one is obvious. For
 the REST endpoint signatures see <strong>Help → API Guide</strong>.</p>
 
+<h2 id="rx-saga">DPDK RX accuracy + switch awareness <span class="ver new">0.5.110</span>
+<span class="ver new">0.5.111</span> <span class="ver new">0.5.112</span>
+<span class="ver new">0.5.113</span> <span class="ver new">0.5.114</span>
+<span class="ver new">0.5.115</span></h2>
+
+<p>Six releases of fixes hammered out during the srv06 RX=0 saga,
+collapsed into a single end-to-end workflow. The summary:</p>
+
+<ul>
+  <li><b>Source MAC</b> on the wire must match the TX interface's
+      burned-in MAC (or be authorized at the switch). Synthetic
+      template defaults like <code>02:00:00:00:00:01</code> get
+      filtered by switch port-security / MAC-limit policies.</li>
+  <li><b>Destination MAC</b> must match the RX iface's burned-in
+      MAC. Otherwise the switch sees unknown unicast and either
+      floods or drops.</li>
+  <li><b>rx_engine</b> on Mellanox bifurcated NICs should be
+      <code>scapy</code>, not <code>dpdk</code>. rx_worker grabs
+      the chip's RX queue via DPDK PMD and dies, leaving the
+      kernel blind. Tracked for a future C-side fix; for now the
+      dialog defaults to the safe pick automatically.</li>
+  <li><b>Switch storm-control / pps caps</b> on access ports
+      typically kick in around a few hundred kpps. Above that,
+      the switch caps and drops the excess.</li>
+</ul>
+
+<h3>Auto-MAC buttons in the stream dialog <span class="ver new">0.5.110</span>
+<span class="ver new">0.5.112</span></h3>
+<p>Two Auto buttons in the Source / Destination MAC rows
+(Protocol Data tab). One click each pulls the iface's burned-in
+MAC from <code>GET /api/interfaces/&lt;iface&gt;/mac</code> — sysfs-
+backed, path-traversal-validated. A yellow chip below the row
+warns when source MAC differs from the TX iface MAC under DPDK
+(red branch for known synthetic defaults).
+<span class="where">Where: Edit Stream → Protocol Data → MAC.</span></p>
+
+<h3>Auto-prefill on Add Stream <span class="ver new">0.5.113</span></h3>
+<p>The dialog detects known-synthetic default MACs
+(<code>00:00:00:00:00:00</code>, the <code>02:00:00:00:00:01</code>-class
+template defaults, the historical test fixtures) and auto-
+populates real iface MACs on open. No clicks required for the
+common path. Real saved MACs from older streams are not
+overwritten — per-field gate.</p>
+
+<h3>Smart rx_engine default <span class="ver new">0.5.114</span></h3>
+<p>New endpoint
+<code>GET /api/interfaces/&lt;iface&gt;/rx_engine_advice</code>
+detects bifurcated Mellanox kernel-bound NICs (mlx5_core driver
++ infiniband devnode present) and recommends <code>scapy</code> for
+RX. The dialog defaults the rx_engine combo to whatever the
+server recommends; an override surfaces a warning chip with the
+reason. Red chip explicitly when overriding the bifurcated-
+Mellanox recommendation — that's the override that costs hours
+when missed.
+<span class="where">Where: stream dialog → Variable Fields tab.</span></p>
+
+<h3>RX-engine telemetry + edit-save fix <span class="ver new">0.5.110</span>
+<span class="ver new">0.5.112</span></h3>
+<p>Start response now carries <code>rx_engine_requested</code> /
+<code>rx_engine_actual</code> / <code>rx_engine_fallback_reason</code> alongside
+the existing TX-side actual_engine. The client renders a
+"DPDK RX fallback" dialog separate from the TX fallback when
+the spawn fell back to Scapy. Edit-save promotes
+<code>engine</code> / <code>rx_engine</code> / <code>dpdk_enable</code> and friends
+to the stream's top level so the server actually sees them
+(pre-fix they were buried in <code>protocol_selection</code> and
+the operator's "DPDK RX" selection silently degraded to Scapy).</p>
+
+<h3>Wire-delivery warning in stats <span class="ver new">0.5.114</span>
+<span class="ver new">0.5.115</span></h3>
+<p><code>/api/streams/stats</code> annotates each active stream with a
+<code>wire_delivery_warning</code> field when TX is firing
+(≥ 100 pps) and RX is essentially zero (&lt; 5% of TX). Summary
+names the three most likely causes ordered by what we hit on
+srv06: switch storm-control cap, synthetic source MAC, wrong
+destination MAC. The Statistics tab's RX-count cell prefixes a
+⚠ when this fires, with the full summary in the tooltip.
+<span class="where">Where: Statistics tab → Streams table → RX
+column.</span></p>
+
+<h3>Help: DPDK troubleshooting section <span class="ver new">0.5.114</span></h3>
+<p><strong>Help → DPDK Workflow Guide → section 8</strong> covers MAC
+autopopulate workflow, Mellanox bifurcated rx_engine=scapy
+workaround with chip-grab mechanism, switch storm-control with
+srv06's measured cap table (~650 kpps before the QFX5130 access
+port drops), and port-security violation recovery.</p>
+
 <h2 id="workflow">User workflow <span class="ver new">0.5.34</span></h2>
 <p>The canonical end-to-end path from "fresh server" to "running
 traffic", reflecting all the consolidation through 0.5.34. Skim it
