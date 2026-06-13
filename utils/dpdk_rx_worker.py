@@ -96,6 +96,17 @@ class RxHandle:
     _latest: dict = field(default_factory=dict)
     _final: Optional[dict] = None
     _reader: Optional[threading.Thread] = None
+    # v0.5.118: rolling tail of stderr lines from the worker. Read
+    # via .stderr_tail(). Bounded to STDERR_TAIL_LINES; older
+    # lines drop off. The drainer thread is essential — without
+    # it, a worker that emits more than ~64 KB of EAL spew blocks
+    # on write to its stderr pipe and deadlocks. Even when the
+    # pipe doesn't fill, the lines are what tells us WHY rx_worker
+    # died (rte_eth_dev_configure failure, mempool exhaustion,
+    # hugepage allocation error, etc.) — pre-v0.5.118 these died
+    # invisibly into a pipe that nothing read.
+    _stderr_lines: list = field(default_factory=list)
+    _stderr_reader: Optional[threading.Thread] = None
 
     def latest(self) -> dict:
         """Non-blocking snapshot of the most recent counter heartbeat
@@ -111,6 +122,52 @@ class RxHandle:
 
     def is_running(self) -> bool:
         return self.proc.poll() is None
+
+    def stderr_tail(self, n: int = 50) -> list:
+        """Last n lines of stderr from the worker. Useful when the
+        worker died without emitting a final summary — the death
+        cause typically lives in the last few stderr lines."""
+        with _LATEST_LOCK:
+            return list(self._stderr_lines[-n:])
+
+
+# v0.5.118: stderr capture cap. The DPDK EAL spew at startup is
+# bounded (~40 lines on a stock mlx5 init); 200 covers that plus
+# any runtime warnings + a final death message.
+STDERR_TAIL_LINES = 200
+
+
+def _stderr_reader(handle: RxHandle) -> None:
+    """v0.5.118: drain the worker's stderr pipe into a bounded
+    in-memory ring so it (a) doesn't block on write when the pipe
+    fills and (b) is queryable post-mortem via handle.stderr_tail().
+
+    Pre-fix the rx_worker's stderr was captured to PIPE but never
+    read. EAL spew (~40 lines on mlx5 init) fits in the 64 KB
+    pipe so most workers stayed alive — but workers that emitted
+    a stack-trace or repeated warnings deadlocked silently. And
+    even when they didn't deadlock, post-mortem diagnostics
+    required journalctl on the host because the captured stderr
+    was discarded on process exit.
+    """
+    try:
+        for raw in handle.proc.stderr:
+            line = raw.rstrip("\n")
+            if not line:
+                continue
+            with _LATEST_LOCK:
+                handle._stderr_lines.append(line)
+                if len(handle._stderr_lines) > STDERR_TAIL_LINES:
+                    # Drop oldest lines — preserve the LAST N which
+                    # is what diagnostics actually need.
+                    del handle._stderr_lines[:-STDERR_TAIL_LINES]
+            # Log at INFO so the operator can see it streaming in
+            # netgen-server's journalctl without enabling debug.
+            LOG.info("[dpdk-rx %s stderr] %s",
+                     handle.stream_id, line)
+    except Exception as exc:
+        LOG.warning("[dpdk-rx %s] stderr reader crashed: %s",
+                    handle.stream_id, exc)
 
 
 def _stdout_reader(handle: RxHandle) -> None:
@@ -233,6 +290,17 @@ def start_rx_worker(
     )
     handle._reader = t
     t.start()
+    # v0.5.118: drain stderr in parallel. Without this thread the
+    # worker either deadlocks on a full pipe OR exits with stderr
+    # lost into the void. With it, the lines are queryable
+    # post-mortem via handle.stderr_tail() and live-streamed to
+    # netgen-server's log so journalctl shows them.
+    et = threading.Thread(
+        target=_stderr_reader, args=(handle,),
+        daemon=True, name=f"rx-errs-{stream_id[:8]}",
+    )
+    handle._stderr_reader = et
+    et.start()
     return handle
 
 

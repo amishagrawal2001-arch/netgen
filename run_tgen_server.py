@@ -698,6 +698,38 @@ def _maybe_start_dpdk_rx_for_stream(
             f"[DPDK-RX] auto-spawned rx_worker for stream {stream_id} "
             f"on {rx_interface} (pid={info.get('pid')})"
         )
+        # v0.5.118: give the worker ~600 ms to either start emitting
+        # heartbeats OR die. If it died, capture its stderr tail
+        # into the outcome so the operator sees the cause in the
+        # start response instead of having to journalctl. The
+        # heartbeat-emit path is fine — the worker stays alive
+        # and we report actual=dpdk normally.
+        try:
+            import time as _t
+            _reg = _rx_registry()
+            _t.sleep(0.6)
+            _handle = _reg._handles.get(stream_id)
+            if _handle is not None and not _handle.is_running():
+                tail = _handle.stderr_tail(n=8)
+                tail_str = " | ".join(tail) if tail else "(no stderr)"
+                exit_code = _handle.proc.poll()
+                logging.warning(
+                    f"[DPDK-RX] rx_worker for {stream_id} died within "
+                    f"600ms (rc={exit_code}). stderr tail: {tail_str}"
+                )
+                return {
+                    "requested": True,
+                    "actual": "scapy",
+                    "reason": (
+                        f"rx_worker died immediately (rc={exit_code}). "
+                        f"Last stderr: {tail_str[:400]}"
+                    ),
+                    "pid": info.get("pid"),
+                }
+        except Exception as _diag_exc:
+            logging.debug(
+                f"[DPDK-RX] post-spawn liveness check failed: {_diag_exc}"
+            )
         return {
             "requested": True,
             "actual": "dpdk",

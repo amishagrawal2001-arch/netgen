@@ -110,7 +110,7 @@ class RxRegistry:
             items = list(self._handles.items())
         out = []
         for sid, h in items:
-            out.append({
+            entry = {
                 "stream_id": sid,
                 "pid": h.proc.pid,
                 "is_running": h.is_running(),
@@ -118,7 +118,22 @@ class RxRegistry:
                 "uptime_s": max(0.0, time.monotonic() - h.started_at),
                 "latest": h.latest(),
                 "final": h.final(),
-            })
+            }
+            # v0.5.118: surface stderr tail for dead-but-not-yet-
+            # reaped workers. When `is_running=False` and `final
+            # is None`, the worker died without emitting its
+            # final summary — stderr is the only place the death
+            # cause survives. Live workers also get it (last N
+            # lines, useful for "why is rx_pps suddenly 0?"
+            # debugging).
+            tail = h.stderr_tail(n=20)
+            if tail:
+                entry["stderr_tail"] = tail
+                # Best-effort exit-code surface — if the process
+                # exited, `proc.poll()` is its return code; live
+                # workers see None.
+                entry["exit_code"] = h.proc.poll()
+            out.append(entry)
         return out
 
     def latest_for(self, stream_id: str) -> Optional[dict]:

@@ -2,6 +2,72 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.118] - 2026-06-13
+
+**rx_worker stderr capture + post-spawn liveness check — surfaces
+the actual death cause of DPDK RX workers instead of leaving the
+operator to journalctl.**
+
+Live srv06 state showed the auto-lifecycle path's rx_worker dying
+at T+2s with `running=False, latest={}` while the `/api/admin/dpdk/
+rx/probe` endpoint worked fine in the same configuration. Death
+cause was invisible: `start_rx_worker()` set `stderr=subprocess.
+PIPE` but never drained the pipe — a deadlock risk for any worker
+that wrote >64 KB of EAL output, and a complete loss of the death
+cause for short-lived dying workers (the pipe was discarded on
+process exit before anyone read from it).
+
+### Fix
+
+* `utils/dpdk_rx_worker.py`: new `STDERR_TAIL_LINES = 200` constant,
+  `RxHandle` gains `_stderr_lines` + `_stderr_reader` fields and a
+  `stderr_tail(n)` accessor. `start_rx_worker()` spawns a second
+  daemon thread alongside the stdout reader to drain stderr into a
+  bounded in-memory ring.
+* `utils/dpdk_rx_manager.py`: `list()` surfaces `stderr_tail`
+  (last 20 lines) + `exit_code` on each entry when stderr lines
+  exist, so `/api/admin/dpdk/rx/list` reports the death cause for
+  dead-but-not-yet-reaped handles. Live workers with clean startup
+  don't get the field — keeps the common-case response shape
+  unchanged.
+* `run_tgen_server.py`: `_maybe_start_dpdk_rx_for_stream` does a
+  600 ms post-spawn liveness check. If the worker died within
+  that window, the outcome's `actual` flips to `scapy` and the
+  `reason` field folds in the stderr tail — so `/api/traffic/
+  start`'s response carries the actual death cause directly back
+  to the operator without requiring a journalctl session.
+
+### Why this matters
+
+On srv06 with `rx_engine=dpdk` selected for a stream, the start
+toast previously said "rx_worker spawned (pid 12345)" while the
+process was already dead in the background. Operator saw 0 RX
+packets and had no surface-level signal pointing at the cause.
+v0.5.118 turns that into "rx_worker died within 600ms:
+mlx5_common: probe device(0000:2b:00.1) failed | Cannot init pmd"
+in the same start response — the actual EAL/PMD bring-up error
+makes it to the UI.
+
+This is observability-only. The underlying death cause (likely a
+queue-grab conflict with the kernel-bound mlx5 PMD in the
+bifurcated Mellanox config; see [memories/project_srv06_rx_worker_blindness.md])
+is not addressed here — v0.5.118 captures the failure so the next
+operator session on srv06 can see what rx_worker actually says,
+which informs whether the real fix is rte_flow rules in
+rx_worker.c, a different queue selection strategy, or something
+simpler.
+
+### Tests
+
+* `tests/test_v05118_rx_stderr_capture.py` — 6 cases pinning:
+  RxHandle gained stderr fields, STDERR_TAIL_LINES bound 50..1000,
+  manager `list()` surfaces tail + exit_code when present, manager
+  `list()` omits tail for clean live workers, auto-lifecycle
+  surfaces stderr in reason on quick death (with assertion that
+  actual=scapy + stderr substring appears), auto-lifecycle
+  unchanged for healthy worker.
+* Full suite: 2524 passed, 1 skipped.
+
 ## [0.5.117] - 2026-06-13
 
 **App icon margin fix — matches Apple HIG sizing so the icon
