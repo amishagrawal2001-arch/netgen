@@ -2,6 +2,84 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.119] - 2026-06-13
+
+**Fix: DPDK pre-launch sweep was friendly-firing the rx_worker.**
+
+v0.5.118's stderr diagnostic on srv06 surfaced the real cause of
+the DPDK RX=0 saga. It wasn't bifurcated-Mellanox queue-grab, MAC
+mismatch, or switch storm-control — those were red herrings. It
+was our own TX-side pre-launch sweep.
+
+### Root cause
+
+`utils/dpdk_tx_worker.py` runs a `pgrep -f` sweep before launching
+`tx_worker` to catch orphaned tx_worker processes from a previous
+crashed start (would otherwise blast at line rate alongside the
+new instance with no telemetry). Pre-fix the regex was just:
+
+```python
+_pat = f"--stream-id {stream_id}"
+```
+
+That string appears in **both** `tx_worker` and `rx_worker`
+cmdlines, because both binaries take the same `--stream-id <uuid>`
+argument. So the sweep would find the rx_worker (that the
+launcher had spawned ~1 second earlier as part of the same stream
+start) and pkill -TERM it as collateral damage.
+
+srv06 captured timeline:
+```
+T+0.0s  rx_worker spawned, EAL clean, "launched 1 queue worker(s) on port 0"
+T+1.0s  TX backend pre-launch sweep: pgrep matches rx_worker by --stream-id
+        WARNING: pre-launch: 1 stale tx_worker(s) ... pids=<rx_worker pid>
+        pkill -TERM hits rx_worker
+T+1.165s  rx_worker exits cleanly (signal handler), exit_code=0, duration=0.165s
+T+1.2s  tx_worker actually starts and runs normally
+```
+
+Operator saw `rx_pkts=0` because the rx_worker was dead before
+any traffic arrived. Scapy fallback worked because Scapy's
+sniffer thread doesn't go through this sweep.
+
+### Fix
+
+Anchor the regex on `tx_worker` in the binary path:
+
+```python
+_pat = f"tx_worker.*--stream-id {stream_id}"
+```
+
+`rx_worker` cmdlines (`/usr/local/bin/rx_worker -l ... -- --stream-id ...`)
+never contain the literal `tx_worker`, so the sweep now only
+finds real stale tx_workers. Keeps the original orphan-tx-worker
+protection intact.
+
+### Tests
+
+`tests/test_v05119_prelaunch_sweep_anchor.py` — 5 cases using
+verbatim srv06 cmdlines:
+
+* New pattern STILL matches a real tx_worker cmdline (regression
+  guard against over-narrowing)
+* New pattern does NOT match an rx_worker cmdline (the bug fix)
+* Legacy pattern DOES match rx_worker (pins the bug in test form
+  so the lesson survives even if the fix is reverted)
+* Source file confirms the anchored pattern is in place
+* Sweep for stream A doesn't match stream B's cmdline (UUID
+  substring-collision guard)
+
+Full suite: 2529 passed, 1 skipped.
+
+### Notes
+
+* v0.5.118's `stderr_tail` + `exit_code` diagnostic on `/api/admin/
+  dpdk/rx/list` is what made this debuggable — without it the
+  death looked indistinguishable from a Mellanox EAL crash.
+* `project_srv06_rx_worker_blindness` memory is now obsolete (the
+  bug wasn't bifurcated-Mellanox specific — it would have killed
+  rx_worker on any host). Updating that file separately.
+
 ## [0.5.118] - 2026-06-13
 
 **rx_worker stderr capture + post-spawn liveness check — surfaces

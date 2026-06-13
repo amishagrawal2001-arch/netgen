@@ -480,7 +480,15 @@ def run_stream(
     # rate, tracker only follows half, the per-stream rate display is
     # 50% of reality. Catch it here before we Popen.
     try:
-        _pat = f"--stream-id {stream_id}"
+        # v0.5.119: anchor the match on `tx_worker` in the binary
+        # name. Pre-fix the pattern was just "--stream-id <id>",
+        # which also matched the rx_worker because both binaries
+        # share that argv. Result: every dpdk-rx start would
+        # cleanly die ~165ms after launch because the SAME stream's
+        # tx-launch sweep would SIGTERM it as a "stale tx_worker".
+        # Operator saw RX=0 + dpdk_rx_worker exit_code=0; no error
+        # in stderr because the death was a clean signal handler.
+        _pat = f"tx_worker.*--stream-id {stream_id}"
         _check = subprocess.run(["pgrep", "-f", "--", _pat], capture_output=True, text=True, timeout=3)
         if _check.returncode == 0 and _check.stdout.strip():
             _stale_pids = _check.stdout.strip().split()
