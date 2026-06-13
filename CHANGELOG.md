@@ -2,6 +2,70 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.120] - 2026-06-13
+
+**Fix: DPDK tx_worker ignored the `VLAN: Untagged` mode toggle.**
+
+The actual root cause of the srv06 RX=0 saga, after 10 versions
+of investigation. The kicker: the SAME bug was fixed on the
+scapy side in v0.4.5 — the DPDK path was just never patched.
+
+### Root cause
+
+The stream dialog keeps two independent VLAN fields:
+
+* `VLAN` mode — radio: `Untagged` / `Tagged` / `Stacked`
+* `vlan_id` — numeric VID, persisted even in Untagged mode so
+  the operator can toggle back without re-typing
+
+`utils/dpdk_tx_worker.py:_resolve_l2_l3_l4()` read only `vlan_id`
+and emitted `--vlan` whenever it was non-zero. So a stream whose
+mode was "Untagged" with vlan_id still sitting at "100" (the
+previous Tagged value) would put VLAN-100-tagged frames on the
+wire — and any switch port in access mode silently dropped every
+frame.
+
+srv06's QFX5130 port was configured as access. Every test for the
+last 10 versions (MAC autopopulate, RX engine outcome surfacing,
+NLAT, bifurcated Mellanox, pre-launch sweep friendly-fire,
+rx_worker stderr capture) was downstream of this: tx_worker
+ALWAYS emitted `--vlan 100`, switch always dropped, RX always 0.
+
+The operator caught it via `ps aux | grep tx_worker` showing
+`--vlan 100` after picking "Untagged" in the UI.
+
+### Fix
+
+`utils/dpdk_tx_worker.py:_resolve_l2_l3_l4()` now reads the top-
+level `VLAN` field FIRST. If it lowercases to `untagged`, vlan_id
+is forced to None regardless of what's in `protocol_data.vlan.
+vlan_id`. Other modes (Tagged / Stacked / missing) fall through
+to the existing vlan_id resolution.
+
+This mirrors v0.4.5's scapy fix
+(`multithreaded_traffic_gen.py:1188`) — both engines now respect
+the VLAN mode toggle identically.
+
+### Tests
+
+* `tests/test_v05120_dpdk_vlan_untagged.py` — 7 cases pinning:
+  Untagged + vlan_id=100 → None (the bug fix), Tagged + vlan_id=
+  100 → 100 (regression guard), Stacked → kept, missing mode →
+  falls through (back-compat for old stream JSON), zero vlan_id
+  stays None, case-insensitive match, and a symmetry test that
+  pins DPDK and scapy to accept the same taggable mode strings.
+* Full suite: 2536 passed, 1 skipped.
+
+### Why this is shipped as a fix not a feature
+
+The dialog already correctly persists the `VLAN: Untagged` mode.
+The server's DPDK launcher was the only place that ignored it.
+Every operator who toggled Tagged → Untagged after v0.4.5
+(when the dialog stopped clearing vlan_id) was silently sending
+tagged frames from the DPDK engine. Likely many quiet bug
+reports we didn't connect to this until srv06 forced a deep
+look.
+
 ## [0.5.119] - 2026-06-13
 
 **Fix: DPDK pre-launch sweep was friendly-firing the rx_worker.**

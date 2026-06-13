@@ -989,11 +989,22 @@ def _resolve_l2_l3_l4(stream_data: Dict[str, Any]) -> Dict[str, Any]:
                            stream_data.get("udp_dport"),
                            default=4791)
 
-    vlan_id = _first_from((vlan_pd, "vlan_id"), (stream_data, "vlan_id"))
-    try:
-        vlan_id = int(vlan_id) if vlan_id not in (None, "", "0") else None
-    except Exception:
+    # v0.5.120: respect the VLAN mode toggle. The dialog persists
+    # vlan_id even when the operator picks "Untagged" so they can
+    # toggle back without re-typing the VID — but the launcher must
+    # NOT emit --vlan in that case, or every frame goes on the wire
+    # with a Dot1Q tag that the switch's access port silently drops.
+    # srv06 saga: cost 8 versions to diagnose; tx_worker cmdline
+    # showed --vlan 100 even after operator picked "Untagged" radio.
+    vlan_mode = str(stream_data.get("VLAN") or "").strip().lower()
+    if vlan_mode == "untagged":
         vlan_id = None
+    else:
+        vlan_id = _first_from((vlan_pd, "vlan_id"), (stream_data, "vlan_id"))
+        try:
+            vlan_id = int(vlan_id) if vlan_id not in (None, "", "0") else None
+        except Exception:
+            vlan_id = None
 
     try:
         frame_size = int(stream_data.get("frame_size", 64))
