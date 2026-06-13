@@ -125,7 +125,7 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon='resources/icons/add.png',
+    icon='resources/icons/netgen.icns',
 )
 
 coll = COLLECT(
@@ -142,7 +142,7 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name='Netgen Client.app',
-    icon='resources/icons/add.png',
+    icon='resources/icons/netgen.icns',
     bundle_identifier='com.netgen.trafficgen.client',
     info_plist={
         'CFBundleName': 'Netgen Client',

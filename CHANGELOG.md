@@ -2,6 +2,84 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.116] - 2026-06-13
+
+**Speedometer + packet app icon. End-to-end build wiring + v1
+rasters so DMG / EXE / AppImage all carry the icon from this
+release forward.**
+
+The pre-v0.5.116 builds used the toolbar `add.png` as a
+placeholder app icon — a green plus-circle on the dock that did
+not communicate the product. v0.5.116 ships a real app icon and
+wires every distribution channel to find it by canonical name,
+so a future designer pass can replace the rasters without
+touching any build scripts.
+
+### Design
+
+Speedometer with a three-segment color arc (gray → blue →
+purple, mapping to Scapy → DPDK → RDMA engines in the existing
+UI palette), white needle pointing toward the high end, and a
+fading purple packet trail across the top. Rounded-square
+silhouette in Big Sur style.
+
+Source of truth: `resources/icons/netgen.svg`. PIL-based
+generator at `scripts/generate_app_icon.py` rasterizes to all
+required sizes + bundles the macOS `.icns` and Windows `.ico`
+containers. Re-runnable any time the SVG changes.
+
+### Assets shipped under `resources/icons/`
+
+* `netgen.svg` — source
+* `netgen.png` — 256×256 (canonical alias for AppImage)
+* `netgen-{16,32,64,128,256,512,1024}.png` — discrete sizes
+* `netgen.icns` — macOS bundle (built via /usr/bin/iconutil)
+* `netgen.ico` — Windows bundle (6 embedded sizes via PIL)
+
+### Build pipeline wiring
+
+* `ostg_client.spec` → `icon='resources/icons/netgen.icns'`
+  (was the `add.png` placeholder)
+* `ostg_client_windows.spec` → lookup tuple prefers
+  `netgen.ico`, retains older fallbacks for partial-rebuild
+  safety
+* `build_appimage.sh` → both the embedded PyInstaller spec and
+  the AppDir icon lookup point at `netgen.png`
+* `run_tgen_client.py` → `QApplication.setWindowIcon(QIcon(
+  resources/icons/netgen.png))` — covers PyQt's title-bar /
+  alt-tab / taskbar icon (separate from the Dock icon, which
+  comes from the `.icns`)
+
+### Tests
+
+`tests/test_v05116_app_icon_wiring.py` (7) — pins:
+
+* All five canonical icon files exist (svg / png / ico / icns /
+  netgen-1024.png)
+* Every size in the iconset has a corresponding PNG
+* macOS spec points at netgen.icns, not add.png
+* Windows spec lookup tuple prefers netgen.ico over fallbacks
+* AppImage script prefers netgen.png over fallbacks
+* run_tgen_client.py wires setWindowIcon
+* Generator script references every iconset size
+
+Full suite: 2516 passed, 1 skipped.
+
+### Designer handoff
+
+The SVG is treated as the design source. To replace the v1
+icon:
+
+1. Edit `resources/icons/netgen.svg` (or replace with a polished
+   redraw at 360×360 viewBox)
+2. Update the equivalent drawing code in
+   `scripts/generate_app_icon.py` (Pillow doesn't read SVG;
+   the script renders the design via Pillow primitives)
+3. Run `venv/bin/python scripts/generate_app_icon.py`
+4. Commit the regenerated PNGs + `.icns` + `.ico`
+
+No build-script edits needed — file paths are stable.
+
 ## [0.5.115] - 2026-06-13
 
 **Statistics tab surfaces the v0.5.114 wire-delivery warning +

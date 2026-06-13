@@ -46,6 +46,28 @@ def launch(server_url: str, fullscreen: bool, server_explicitly_provided: bool =
     app.setOrganizationDomain("netgen.local")
     app.setApplicationName("netgen-client")
 
+    # v0.5.116: set the in-app window icon. Picks
+    # resources/icons/netgen.png as the canonical 256×256; the
+    # macOS Dock icon, Windows taskbar icon, and Linux WM icon
+    # come from the platform bundle (.icns / .ico / .desktop+png)
+    # built in the PyInstaller spec or AppImage scripts, not from
+    # this call — but Qt's window-titlebar icon + alt-tab icon
+    # come from QApplication.setWindowIcon. Without this, the
+    # PyQt default (a generic computer glyph) shows in the
+    # title bar even when the Dock has the right .icns.
+    try:
+        from PyQt5.QtGui import QIcon as _QIcon
+        _icon_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "resources", "icons",
+        )
+        _icon_path = os.path.join(_icon_dir, "netgen.png")
+        if os.path.exists(_icon_path):
+            app.setWindowIcon(_QIcon(_icon_path))
+    except Exception as _e:
+        # Best-effort — a missing icon is cosmetic, not fatal.
+        print(f"[WARN] window icon load failed: {_e}", file=sys.stderr)
+
     # Optional bearer-token auth — mirror of the server-side
     # NETGEN_AUTH_TOKEN gate in run_tgen_server.py. When set in the
     # client's environment, every `requests.{get,post,put,…}` call

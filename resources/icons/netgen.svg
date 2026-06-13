@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Netgen app icon — speedometer + packet concept (v0.5.116, 2026-06-13).
+
+  Source of truth for the application icon. Treat this file as the
+  designer-handoff target: edit here, regenerate the PNGs via
+  `scripts/generate_app_icon.py`, then rebuild .icns / .ico through
+  the existing build pipeline (build_dmg.sh, ostg_client_windows.spec,
+  build_appimage.sh).
+
+  Design rationale:
+    * Speedometer arc + needle = performance / throughput tool
+    * Three-segment color ramp (gray → blue → purple) maps the gauge
+      to the engine palette already used in the UI:
+        - gray  = Scapy (idle / baseline)
+        - blue  = DPDK  (#60a5fa, matches existing chip color)
+        - purple = RDMA  (#c084fc, matches existing engine label color)
+    * Packet trail at top removes ambiguity ("we measure packet rate,
+      not lap times")
+    * Top half is lighter to mimic the Big-Sur app-icon shine
+      convention; rounded corners use rx=80 on a 360 viewBox which is
+      ~22% of side length (Apple's HIG sweet spot).
+
+  Bake-in caveats for whoever takes this to a polished version:
+    * The arc segments are stroked, not a single path with
+      `stroke-dasharray` — this preserves the three explicit colors
+      but means the joins between segments are visible at small
+      sizes. Consider a single arc with a `<linearGradient>` for
+      production.
+    * The needle is a flat line. A real designer would taper it.
+    * 16×16 menu-bar version should be drawn by hand, not scaled
+      from this. The current 16×16 collapses to "the purple arc +
+      a dot" which is fine but not great.
+-->
+<svg width="360" height="360" viewBox="0 0 360 360" role="img" xmlns="http://www.w3.org/2000/svg">
+  <title>Netgen</title>
+  <desc>A speedometer with a colored arc ramping from gray through blue to purple, a white needle pointing toward the high end, and a fading purple packet trail above.</desc>
+
+  <rect width="360" height="360" rx="80" fill="#0f172a"/>
+  <rect width="360" height="200" rx="80" fill="#ffffff" fill-opacity="0.06"/>
+
+  <path d="M 60 250 A 120 120 0 0 1 300 250" fill="none" stroke="#1e293b" stroke-width="22" stroke-linecap="round"/>
+  <path d="M 60 250 A 120 120 0 0 1 145 145" fill="none" stroke="#64748b" stroke-width="14" stroke-linecap="round"/>
+  <path d="M 145 145 A 120 120 0 0 1 233 153" fill="none" stroke="#60a5fa" stroke-width="14" stroke-linecap="round"/>
+  <path d="M 233 153 A 120 120 0 0 1 300 250" fill="none" stroke="#c084fc" stroke-width="14" stroke-linecap="round"/>
+
+  <line x1="60"  y1="250" x2="78"  y2="250" stroke="#94a3b8" stroke-width="3" stroke-linecap="round"/>
+  <line x1="95"  y1="174" x2="108" y2="183" stroke="#94a3b8" stroke-width="3" stroke-linecap="round"/>
+  <line x1="180" y1="130" x2="180" y2="148" stroke="#94a3b8" stroke-width="3" stroke-linecap="round"/>
+  <line x1="265" y1="174" x2="252" y2="183" stroke="#94a3b8" stroke-width="3" stroke-linecap="round"/>
+  <line x1="300" y1="250" x2="282" y2="250" stroke="#94a3b8" stroke-width="3" stroke-linecap="round"/>
+
+  <line x1="180" y1="250" x2="270" y2="180" stroke="#f8fafc" stroke-width="6" stroke-linecap="round"/>
+  <circle cx="180" cy="250" r="11" fill="#f8fafc"/>
+  <circle cx="180" cy="250" r="5"  fill="#0f172a"/>
+
+  <rect x="118" y="80" width="44" height="12" rx="3" fill="#c084fc"/>
+  <rect x="170" y="82" width="34" height="10" rx="3" fill="#c084fc" fill-opacity="0.75"/>
+  <rect x="212" y="84" width="22" height="8"  rx="2" fill="#c084fc" fill-opacity="0.5"/>
+  <circle cx="244" cy="88" r="2.5" fill="#c084fc" fill-opacity="0.35"/>
+</svg>
