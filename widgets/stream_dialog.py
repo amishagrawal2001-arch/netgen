@@ -8763,6 +8763,64 @@ class AddStreamDialog(QDialog):
             # enable/disable count/step per mode
             self.toggle_mac_fields(self.mac_source_mode.currentText(),
                                    self.mac_source_count, self.mac_source_step)
+
+            # v0.5.113: when the MACs are obviously synthetic
+            # defaults (no saved data OR a template that ships
+            # synthetic placeholder MACs), auto-populate from the
+            # real iface MACs *immediately* — no button click
+            # required. Pre-fix the dpdk_blast_e2e template put
+            # `02:00:00:00:00:01` on the wire by default, which
+            # the srv06 saga proved tripped switch port-security
+            # at line rate and required a full switch-port
+            # bounce to recover. Auto-populating closes that
+            # footgun: by the time the operator clicks Apply,
+            # the wire is already carrying real iface MACs.
+            #
+            # Logic: only auto-populate fields that are still at
+            # a known synthetic default. If the operator's saved
+            # stream has a real burned-in MAC, leave it alone.
+            # Same gate for src and dst independently.
+            _SYNTHETIC_MACS = (
+                "00:00:00:00:00:00",
+                "02:00:00:00:00:01",
+                "02:00:00:00:00:02",
+                "aa:bb:cc:dd:ee:01",
+                "aa:bb:cc:dd:ee:02",
+                "8c:91:3a:d6:1b:7a",
+                "8c:91:3a:d6:1b:7b",
+                "00:00:00:00:00:01",
+                "00:00:00:00:00:02",
+            )
+            _src_now = self.mac_source_address.text().strip().lower()
+            _dst_now = self.mac_destination_address.text().strip().lower()
+            if _src_now in _SYNTHETIC_MACS:
+                _real_src = self._fetch_iface_mac_from_server()
+                if _real_src:
+                    self.mac_source_address.setText(_real_src)
+            if _dst_now in _SYNTHETIC_MACS:
+                # Resolve RX iface from the rx_port_dropdown — set
+                # by the host when the dialog opens. Reuses the
+                # same helpers the Auto button does.
+                _rx_iface = self._resolve_rx_iface_name()
+                _base = self._resolve_server_base_for_tx()
+                if _rx_iface and _base:
+                    try:
+                        import requests as _req
+                        _r = _req.get(
+                            f"{_base}/api/interfaces/{_rx_iface}/mac",
+                            timeout=3,
+                        )
+                        if _r.ok:
+                            _real_dst = ((_r.json() or {}).get(
+                                "mac_address") or "").strip().lower()
+                            if _real_dst and _real_dst not in (
+                                "00:00:00:00:00:00", "",
+                            ):
+                                self.mac_destination_address.setText(_real_dst)
+                    except Exception as _exc:
+                        logging.debug(
+                            f"[stream_dialog] dst auto-prefill failed: {_exc}"
+                        )
         except Exception as e:
             logger.warning("populate_stream_fields: failed to load MAC section: %s", e)
 
@@ -9392,6 +9450,20 @@ class AddStreamDialog(QDialog):
             return
         base = self._resolve_server_base_for_tx()
         if not base:
+            # v0.5.113: pre-fix this silently no-op'd, leaving the
+            # operator confused about whether the click registered.
+            # Same red error chip src Auto uses on resolve failure.
+            self._mac_mismatch_label.setText(
+                "Could not resolve server URL for the TX interface "
+                "— the parent widget's server_interfaces lookup "
+                "failed. Type the RX iface's burned-in MAC manually."
+            )
+            self._mac_mismatch_label.setStyleSheet(
+                "QLabel { background: #fee2e2; border: 1px solid "
+                "#ef4444; border-radius: 4px; padding: 4px 8px; "
+                "color: #991b1b; font-size: 11px; }"
+            )
+            self._mac_mismatch_label.show()
             return
         try:
             import requests as _req

@@ -2,6 +2,89 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.113] - 2026-06-13
+
+**Auto-prefill iface MACs on Add Stream + fix dst Auto silent
+no-op. Closes the synthetic-MAC footgun the srv06 saga exposed.**
+
+### Bug 1: Dialog defaults synthetic MACs and operators don't notice
+
+The dpdk_blast_e2e template (and several others) shipped with
+synthetic MAC defaults like `02:00:00:00:00:01`. The operator
+clicked the template, hit Apply, and the wire carried 22 Mpps
+of synthetic-MAC frames. On srv06's switch this was enough to
+trip port-security and put the port into a state where even
+real-MAC frames got dropped — a full switch-port bounce was
+needed to recover.
+
+v0.5.110 added an Auto button per row, but it was opt-in. The
+operator didn't see a problem until the wire counter was
+already flat. By then the switch was already toast.
+
+Fix: `populate_stream_fields` now auto-prefills the Source and
+Destination MAC fields from `/api/interfaces/<iface>/mac` when
+the field is at a known synthetic default. Per-field gate —
+real saved MACs from older streams are not overwritten. Server
+unreachable / fetch failure = silent leave-as-is, no crash;
+the operator can still click Auto manually or the existing
+v0.5.110 mismatch chip will warn them on Apply.
+
+The synthetic-default list covers the all-zero default, the
+`02:00:00:00:00:01`-class IANA "locally administered" MACs
+that templates use, the historical `aa:bb:cc:dd:ee:01` /
+`8c:91:3a:d6:1b:7a` from the test fixtures, and the
+`00:00:00:00:00:01`-class trivial counts. Anything else stays
+untouched.
+
+### Bug 2: dst Auto button silent no-op when server URL can't resolve
+
+v0.5.112's dst Auto button mirrored the src Auto path EXCEPT
+on `_resolve_server_base_for_tx` returning None — src showed a
+red error chip, dst silently returned. Operators clicked Auto,
+nothing happened, no signal that the click registered. (The
+srv06 saga screenshots showed this exact behavior — operator
+typed the synthetic MAC manually thinking Auto failed.)
+
+Fix: dst Auto now shows the same red error chip src Auto does
+when the server URL can't be resolved. Wording explains the
+parent-widget lookup failure and suggests typing the MAC
+manually.
+
+### Tests
+
+* `tests/test_v05113_auto_prefill.py` (5) — auto-prefill on
+  empty Add, auto-prefill replaces synthetic template MACs,
+  real saved MACs are NOT overwritten, server-unreachable
+  fallback is graceful, dst Auto shows error chip on
+  server-URL-resolve failure.
+
+Full suite: 2488 passed, 1 skipped.
+
+### Migration notes
+
+After upgrading the client to v0.5.113:
+
+* New Add Stream (or template apply) will land in the dialog
+  with the real iface MACs already filled in. No clicks
+  required, no synthetic-MAC blast possible by accident.
+* Existing saved streams with real MACs are untouched — the
+  per-field gate only triggers on synthetic defaults.
+* If the operator wants to use synthetic MACs deliberately
+  (port-security testing, MAC-learning verification), just
+  edit the field after open — the auto-prefill only fires
+  once, during populate_stream_fields, then it's the
+  operator's value.
+
+### Switch-state addendum
+
+The srv06 saga also surfaced that **once a switch port is in
+port-security-violation state, no amount of netgen-side fixes
+will deliver frames** — neither DPDK nor Scapy, regardless of
+MAC. Recovery requires bouncing the switch port or waiting
+for the violation timer to age out. v0.5.113 prevents getting
+INTO that state in the first place; it does not unstick a
+port that's already locked down.
+
 ## [0.5.112] - 2026-06-13
 
 **Edit Stream now actually saves rx_engine + Auto button for
