@@ -2,6 +2,64 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.122] - 2026-06-14
+
+**Fix: RX BPF was clamping non-DPDK ICMP/TCP streams to UDP.**
+
+Found on srv06 after the v0.5.121 VLAN-tagging fix landed: two
+side-by-side scapy streams with the same dst IP, same untagged
+mode, same MACs — only L4 differed. The UDP stream's RX counter
+ticked perfectly. The ICMP stream's RX counter stayed at zero.
+
+### Root cause
+
+`multithreaded_traffic_gen.py` decided the RX-side `force_udp` +
+`dpdk_hint` based on `should_use_dpdk(stream_data)`, which
+returns True whenever the opt-in `dpdk_enable` flag is truthy —
+**regardless** of whether the TX side is actually going to run
+on DPDK.
+
+The UEC stream had `dpdk_enable=True` lingering from earlier UI
+testing but its actual engine was scapy and its L4 was ICMP.
+The launcher built `force_udp=True` for the RX side anyway,
+which clamped the BPF to UDP-only and silently dropped every
+ICMP packet the sniffer saw.
+
+### Fix
+
+Use `resolve_engine()` instead of `should_use_dpdk()`. That's the
+same call the TX launcher makes, and it correctly returns
+`scapy` when the stream isn't actually compatible with the DPDK
+worker (e.g. L4≠UDP, IPv6, multi-protocol). So the RX-side BPF
+mirrors what's really on the wire instead of what was originally
+requested.
+
+### Tests
+
+`tests/test_v05122_rx_bpf_uses_resolved_engine.py` — 4 cases:
+
+* scapy ICMP + stale `dpdk_enable=True` → BPF builds ICMP (the bug)
+* scapy UDP + stale `dpdk_enable=True` → BPF stays UDP (regression guard)
+* DPDK UDP → BPF clamps to UDP (original force_udp intent preserved)
+* DPDK requested for ICMP (compat rejects) → falls back to scapy
+  + ICMP BPF (the second-order safety net)
+
+Full suite: 2546 passed, 1 skipped.
+
+### Saga close-out
+
+This is the 7th fix in the srv06 RX=0 series. The full chain:
+
+| Version | Real bug |
+|---------|----------|
+| v0.5.118 | rx_worker stderr capture (made everything below diagnosable) |
+| v0.5.119 | TX pre-launch sweep friendly-fired rx_worker via shared `--stream-id` argv |
+| v0.5.120 | DPDK tx_worker ignored `VLAN: Untagged` mode (top-level lookup) |
+| v0.5.121 | VLAN mode actually lives in `protocol_selection`, not top level |
+| v0.5.122 | RX BPF clamped to UDP for non-DPDK streams via stale `dpdk_enable` flag |
+
+All real bugs. All test-pinned.
+
 ## [0.5.121] - 2026-06-13
 
 **Hot-fix: v0.5.120's VLAN-mode check looked in the wrong place.**

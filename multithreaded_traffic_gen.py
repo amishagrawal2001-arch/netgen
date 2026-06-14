@@ -1339,10 +1339,23 @@ def generate_packets(stream_data, interface, stop_event):
         if rx_interface == interface:
             logging.warning(f"[RX] RX interface equals TX ('{interface}'); disabling flow tracking")
         elif is_interface_up(rx_interface):
-            # Build a tolerant selector; enable DPDK hints if backend will be used
+            # Build a tolerant selector; enable DPDK hints only if TX
+            # backend WILL actually be DPDK. v0.5.122: pre-fix used
+            # should_use_dpdk() which returns True whenever the opt-in
+            # `dpdk_enable` flag is set — regardless of whether the
+            # stream is actually compatible. A scapy-engine ICMP stream
+            # with a stale dpdk_enable=true (left over from earlier UI
+            # testing) would get the BPF clamped to UDP-only, and
+            # never match any ICMP packets on the wire. rx_count
+            # stayed at 0 with no visible error. resolve_engine()
+            # returns the actual decided engine — fall back to scapy
+            # when the stream isn't compatible — so the BPF mirrors
+            # what the wire really carries.
             use_dpdk = False
             try:
-                use_dpdk = bool(_DPDK_AVAILABLE and _dpdk_backend.should_use_dpdk(stream_data))
+                if _DPDK_AVAILABLE:
+                    _eng, _ = _dpdk_backend.resolve_engine(stream_data)
+                    use_dpdk = (_eng == "dpdk")
             except Exception:
                 use_dpdk = False
 
