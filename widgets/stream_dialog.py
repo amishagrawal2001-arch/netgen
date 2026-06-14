@@ -5451,6 +5451,73 @@ def _open_help_dialog(parent, title, html):
     dialog.exec()
 
 
+def _coerce_count(v) -> int:
+    """v0.5.130: count fields are string ints in the dialog ('1',
+    '64', possibly empty). Coerce to int safely; bad inputs → 1
+    (means 'no cycling') so normalization treats them as off."""
+    try:
+        n = int(v)
+    except (TypeError, ValueError):
+        return 1
+    return n if n >= 1 else 1
+
+
+def _normalize_increment_flags(stream_details: dict) -> None:
+    """v0.5.130: enforce checkbox/mode == (count >= 2) consistency
+    across the persisted stream config. The DPDK tx_worker
+    (utils/dpdk_tx_worker._resolve_count_flags) gates cycling on
+    the count value alone, while the scapy path (utils/generic.py)
+    gates on the checkbox/mode. Pre-fix the two were inconsistent
+    when a stream was edited — operators saw the count value
+    persist but cycling did/did-not happen depending on which
+    path actually ran. Mutates in place.
+
+    Order of precedence: count value is authoritative. A count >=2
+    means 'cycle' for BOTH engines; count of 1 means 'no cycle'
+    for both.
+
+    Covers: UDP src/dst, TCP src/dst, VLAN. IPv4/v6/MAC use a
+    Fixed/Increment/Decrement combo (not a binary checkbox), so
+    we leave the mode alone unless count >=2 AND mode == 'Fixed'
+    (silent contradiction) — in that case promote to 'Increment'.
+    A user-chosen Decrement is respected even with count >= 2."""
+    pd = stream_details.get("protocol_data") or {}
+
+    # --- UDP / TCP / VLAN: simple binary checkbox gates ---
+    binaries = [
+        ("udp",  "udp_increment_source_port",       "udp_source_port_count"),
+        ("udp",  "udp_increment_destination_port",  "udp_destination_port_count"),
+        ("tcp",  "tcp_increment_source_port",       "tcp_source_port_count"),
+        ("tcp",  "tcp_increment_destination_port",  "tcp_destination_port_count"),
+        ("vlan", "vlan_increment",                  "vlan_increment_count"),
+    ]
+    for proto, flag_key, count_key in binaries:
+        section = pd.get(proto)
+        if not isinstance(section, dict):
+            continue
+        section[flag_key] = _coerce_count(section.get(count_key)) >= 2
+
+    # --- IPv4 / IPv6 / MAC: combo gates (Fixed/Increment/Decrement).
+    # Don't override Decrement; only promote Fixed → Increment when
+    # count >= 2 is set (clear silent contradiction). Symmetric on
+    # the other side: count == 1 with mode = Increment isn't a bug,
+    # it's just a no-op cycle, so leave mode alone.
+    combos = [
+        ("ipv4", "ipv4_source_mode",       "ipv4_source_increment_count"),
+        ("ipv4", "ipv4_destination_mode",  "ipv4_destination_increment_count"),
+        ("ipv6", "ipv6_source_mode",       "ipv6_source_increment_count"),
+        ("ipv6", "ipv6_destination_mode",  "ipv6_destination_increment_count"),
+        ("mac",  "mac_source_mode",        "mac_source_count"),
+        ("mac",  "mac_destination_mode",   "mac_destination_count"),
+    ]
+    for proto, mode_key, count_key in combos:
+        section = pd.get(proto)
+        if not isinstance(section, dict):
+            continue
+        if _coerce_count(section.get(count_key)) >= 2 and section.get(mode_key) == "Fixed":
+            section[mode_key] = "Increment"
+
+
 class AddStreamDialog(QDialog):
     def __init__(self, parent=None, interface=None, stream_data=None, server_interfaces=None):
         super().__init__(parent)
@@ -10311,6 +10378,16 @@ class AddStreamDialog(QDialog):
             "dpdk_enable": stream_details["dpdk_enable"],
             "pcap_stream": pcap_stream,  # keep here too for backward-compat populate
         }
+
+        # v0.5.130: sync increment-checkbox bools to their count values
+        # so the persisted data is self-consistent across the scapy + DPDK
+        # consumers. Pre-fix scapy (utils/generic.py) gated cycling on the
+        # checkbox while dpdk_tx_worker._resolve_count_flags gated only on
+        # count >= 2. Operators who set count=64 with the box unchecked
+        # got DPDK cycling but no scapy cycling (and vice versa for
+        # count=1 + box=checked). Normalize so both consumers see the
+        # same intent. Op-precedence: the count value is authoritative.
+        _normalize_increment_flags(stream_details)
 
         return stream_details
 

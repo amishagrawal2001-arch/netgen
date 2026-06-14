@@ -2,6 +2,61 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.130] - 2026-06-14
+
+**Fix: stream dialog normalizes increment-flag ↔ count consistency.**
+
+Follow-up audit after the v0.5.128 dst_port_count operator
+report. Audited every increment/count field in the Add/Edit
+Stream dialog (11 fields across MAC, VLAN, IPv4, IPv6, TCP, UDP)
+and confirmed all 11 round-trip correctly through save/load.
+
+### Root cause (real but separate from v0.5.128)
+
+scapy and DPDK engines disagreed on what "cycle" means:
+- `utils/dpdk_tx_worker._resolve_count_flags` — gates cycling on
+  the **count value** (`>= 2`); ignores the increment checkbox
+- `utils/generic.py` (scapy) — gates cycling on the **checkbox**
+  `udp_increment_destination_port`; count is read only if checkbox=True
+
+So a saved stream with `(count=64, checkbox=False)` cycled under
+DPDK but stayed single-flow under scapy. Inverse: `(count=1,
+checkbox=True)` "cycled" scapy by 1 port (no-op) but didn't cycle
+DPDK. The persisted data could be in an internally inconsistent
+state depending on dialog interaction order.
+
+### Fix
+
+`get_stream_details()` now invokes `_normalize_increment_flags()`
+before returning the dict. Logic:
+- UDP / TCP / VLAN (binary checkbox): force `checkbox = (count >= 2)`.
+- IPv4 / IPv6 / MAC (Fixed/Increment/Decrement combo): only
+  promote `Fixed → Increment` when count >= 2 (silent
+  contradiction). User-chosen `Decrement` is respected. count=1
+  with mode=Increment is left alone (a no-op cycle is a valid
+  configuration, not a bug).
+
+Count value is now authoritative for both engines.
+
+### Files touched
+
+- `widgets/stream_dialog.py` — `_normalize_increment_flags()` +
+  `_coerce_count()` module-level helpers; called at the tail of
+  `get_stream_details()`
+- `tests/test_v05130_increment_normalization.py` — 18 cases:
+  UDP/TCP/VLAN promote+demote, IPv4/v6/MAC combo promotion,
+  Decrement preservation, garbage coercion, missing-section
+  defensive paths, full Qt round-trip
+
+### Operator-visible impact
+
+If you saw the v0.5.128 srv06 symptom (count=64 in dialog, live
+config shows count=1) it was **not** a save bug — round-trip
+works. The likely path was: Edit dialog closed via Cancel/X
+instead of OK, or stream needed stop → edit → start. After
+v0.5.130, any save where the user typed a count without
+matching the checkbox will still produce consistent data.
+
 ## [0.5.129] - 2026-06-14
 
 **Fix: rx_worker port-filter treats `0` as "no filter", not literal port 0.**
