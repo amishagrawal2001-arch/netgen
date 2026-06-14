@@ -22,9 +22,15 @@ def generate_uec_rocev2_packet(src_mac, dst_mac, qp, pasid, stream_data, src_ip=
     src_mac = src_mac or mac_cfg.get("mac_source_address") or "00:00:00:00:00:02"
     dst_mac = dst_mac or mac_cfg.get("mac_destination_address") or "00:00:00:00:00:01"
 
-    # VLAN
-    vlan_id_str = str(vlan_cfg.get("vlan_id", "")).strip()
-    vlan_id = int(vlan_id_str) if vlan_id_str.isdigit() else 0
+    # VLAN — v0.5.124: use the shared resolver so UEC respects the
+    # operator's Untagged/Tagged toggle. Pre-fix this site only
+    # checked `vlan_id > 0`, so a stream toggled from Tagged to
+    # Untagged kept its stale vlan_id in protocol_data and got
+    # tagged on the wire. Same shape as the srv06 srv06 saga
+    # surface fixed in v0.5.121 (DPDK) and v0.5.123 (scapy generic).
+    from utils.vlan_helpers import resolve_tx_vlan_id
+    _vid = resolve_tx_vlan_id(stream_data)
+    vlan_id = int(_vid) if _vid is not None else 0
     pcp = int(vlan_cfg.get("vlan_priority", 0)) & 0x7
     dei = int(vlan_cfg.get("vlan_cfi_dei", 0)) & 0x1
     tpid_override = bool(stream_data.get("override_settings", {}).get("override_vlan_tpid", False))

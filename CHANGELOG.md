@@ -2,6 +2,71 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.124] - 2026-06-14
+
+**VLAN-mode sweep audit — shared `resolve_tx_vlan_id()` helper +
+two more "same shape" bugs caught.**
+
+The srv06 saga forced the "respect VLAN:Untagged" check to be
+fixed four separate times in adjacent code paths (v0.5.120/121/
+122/123). Each fix was correct but the bug shape kept hiding in
+a new builder. v0.5.124 centralizes the resolution into one
+helper and migrates every TX-side call-site to it — so the next
+new TX builder can't accidentally reintroduce the bug.
+
+### New helper
+
+`utils/vlan_helpers.py:resolve_tx_vlan_id(stream_data)` — canon
+resolver. Lookup order matches the scapy RX side at
+`multithreaded_traffic_gen.py:1199`:
+
+1. `protocol_selection.VLAN` (dialog's live state — winner)
+2. top-level `VLAN` (back-compat / API-direct callers)
+3. fall through to `vlan_id` if no mode field (legacy pre-v0.4.5)
+
+Returns `None` when untagged or vlan_id invalid; an `int` VID
+(1..4094) when tagged. Defensive: never crashes on garbage input.
+
+### Migrated to the helper
+
+| File | Previous state |
+|------|----------------|
+| `utils/dpdk_tx_worker.py` | inlined since v0.5.121 |
+| `utils/generic.py` | inlined since v0.5.123 |
+| `utils/uec.py` | **bug**: only checked `vlan_id > 0`, missed mode |
+| `utils/rocev2.py` | **bug**: only honored `mode == "Tagged"`, missed Stacked / case mismatch |
+
+`utils/arp.py` uses a separate `vlan_tagged` flag (never set by
+the dialog → never tags); not in this audit's scope.
+`utils/l2_protocols.py` is L2 emulation, different code path.
+
+### Tests
+
+`tests/test_v05124_vlan_helper_sweep.py` — 16 cases:
+
+* 10 helper-direct (mode resolution, precedence, case
+  insensitivity, defensive garbage handling)
+* 6 per-call-site (dpdk_tx_worker, generic, uec, rocev2 all
+  honor Untagged + Tagged + Stacked correctly via the helper)
+
+Full suite: 2571 passed, 1 skipped.
+
+### Saga summary (final, 9 fixes)
+
+| Version | Real bug |
+|---------|----------|
+| v0.5.118 | rx_worker stderr capture (the diagnostic that broke the saga open) |
+| v0.5.119 | TX pre-launch sweep friendly-fire on rx_worker (`--stream-id` argv collision) |
+| v0.5.120 | DPDK tx_worker ignored `VLAN:Untagged` (top-level only) |
+| v0.5.121 | DPDK look in protocol_selection too |
+| v0.5.122 | RX BPF clamped to UDP for non-DPDK streams via stale dpdk_enable |
+| v0.5.123 | scapy TX builder ignored `VLAN:Untagged` (same shape, third surface) |
+| v0.5.124 | UEC + RoCEv2 had the same bug shape; shared helper makes it structurally impossible |
+
+Plus the operator-discovered config issue: UEC stream's dst MAC
+was wrong (`5c:25:73:3f:30:56` = src MAC) — fixed via the Auto
+button shipped in v0.5.112.
+
 ## [0.5.123] - 2026-06-14
 
 **Fix: scapy TX ignored VLAN:Untagged mode — third surface of the

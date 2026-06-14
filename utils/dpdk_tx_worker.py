@@ -989,32 +989,14 @@ def _resolve_l2_l3_l4(stream_data: Dict[str, Any]) -> Dict[str, Any]:
                            stream_data.get("udp_dport"),
                            default=4791)
 
-    # v0.5.120: respect the VLAN mode toggle. The dialog persists
-    # vlan_id even when the operator picks "Untagged" so they can
-    # toggle back without re-typing the VID — but the launcher must
-    # NOT emit --vlan in that case, or every frame goes on the wire
-    # with a Dot1Q tag that the switch's access port silently drops.
-    # v0.5.121: also check protocol_selection.VLAN — Edit-Save's
-    # promotion list at stream_control.py:_TOP_LEVEL_ENGINE_KEYS
-    # does NOT include "VLAN", so the dialog's choice lands at
-    # `stream_data["protocol_selection"]["VLAN"]`, not top level.
-    # Mirrors the scapy side's lookup in multithreaded_traffic_gen
-    # at line 1199. Pre-fix tx_worker cmdline still showed --vlan
-    # 100 even though the operator picked "Untagged" — the v0.5.120
-    # check found nothing at the top level and fell through to the
-    # vlan_id path.
-    ps = stream_data.get("protocol_selection") or {}
-    vlan_mode = str(
-        ps.get("VLAN") or stream_data.get("VLAN") or ""
-    ).strip().lower()
-    if vlan_mode == "untagged":
-        vlan_id = None
-    else:
-        vlan_id = _first_from((vlan_pd, "vlan_id"), (stream_data, "vlan_id"))
-        try:
-            vlan_id = int(vlan_id) if vlan_id not in (None, "", "0") else None
-        except Exception:
-            vlan_id = None
+    # v0.5.124: use the shared resolver. Originally inlined in
+    # v0.5.120/121; v0.5.124 hoists to utils/vlan_helpers so the
+    # exact same logic governs every TX-side packet builder
+    # (generic, uec, rocev2, dpdk_tx_worker). One reviewable
+    # source of truth makes the bug shape structurally impossible
+    # — see the saga summary in the v0.5.123 CHANGELOG.
+    from utils.vlan_helpers import resolve_tx_vlan_id
+    vlan_id = resolve_tx_vlan_id(stream_data)
 
     try:
         frame_size = int(stream_data.get("frame_size", 64))

@@ -187,14 +187,20 @@ def generate_rocev2_packet(stream_data, pkt_cfg=None, index=0):
         dst_mac = mac.get("mac_destination_address", "ff:ff:ff:ff:ff:ff")
 
     l3 = ps.get("L3", "IPv4")
-    vlan_mode = ps.get("VLAN", "Untagged")
-    vlan_id = int(vlan_cfg.get("vlan_id", 0) or 0)
+    # v0.5.124: use the shared resolver. Pre-fix this site only
+    # accepted mode == "Tagged" (case-sensitive!), silently
+    # dropping the Dot1Q tag for "Stacked" / "TaggedStacked"
+    # variants. Also missed top-level VLAN field for API-direct
+    # callers. Shared helper handles all three correctly.
+    from utils.vlan_helpers import resolve_tx_vlan_id
+    _vid = resolve_tx_vlan_id(stream_data)
+    vlan_id = int(_vid) if _vid is not None else 0
     pcp = int(vlan_cfg.get("vlan_priority", 0) or 0) & 0x7
     dei = int(vlan_cfg.get("vlan_cfi_dei", 0) or 0) & 0x1
 
     # L2
     eth = Ether(src=src_mac, dst=dst_mac)
-    if vlan_mode == "Tagged" and vlan_id > 0:
+    if vlan_id > 0:
         eth /= Dot1Q(vlan=vlan_id, prio=pcp, id=dei)
 
     # L3 - use increment lists if available
