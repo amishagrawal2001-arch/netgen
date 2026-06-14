@@ -2,6 +2,65 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.136] - 2026-06-14
+
+**Fix: stream-stats table TX/RX Bit Rate cells use real frame_size.**
+
+Operator screenshot caught it: UEC stream firing at 23.77 Mpps
+with frame_size=1000 showed "TX Bit Rate = 12.17 Gbps" in the
+Stream Statistics table. Backsolving: `12.17e9 / (23.77e6 × 8)
+= 64 bytes/pkt` — the renderer's fallback default.
+
+### Root cause
+
+`update_stream_statistics_table()` in `statistics_section.py`
+builds `all_streams` from `/api/streams/stats`. The per-row
+dict copied `tx_rate`, `rx_rate`, `tx_count`, `rx_count`,
+`status`, `engine` — but **not `frame_size`**. The render loop
+at line ~2106 did `stream.get("frame_size") or 64` and always
+fell back to 64.
+
+### Fix
+
+The per-row dict now includes `frame_size`:
+
+```python
+all_streams.append({
+    ...
+    "frame_size": stream.get("frame_size", 64),
+})
+```
+
+The API entry already carries it (we use it in the
+`merged_statistics` aggregation above — line 1148, 1180); just
+forward it into the row dict the renderer reads.
+
+### Operator-visible result (srv06 UEC, 23.77 Mpps, 1000B):
+
+Pre-fix:  TX Bit Rate = 12.17 Gbps  (frame_size dropped, used 64)
+Post-fix: TX Bit Rate = ~190 Gbps   (frame_size = 1000 honored)
+
+That brings the stream-stats column in line with the Interface
+stats panel (which already shows ~190 Gbps from the wire
+counter side).
+
+### Falls back cleanly
+
+- Missing `frame_size` in API entry → still falls back to 64
+  (no regression vs pre-v0.5.136).
+- String `frame_size` ("1000" from dialog persistence) →
+  coerced to int safely.
+- Garbage value → falls back to 64.
+
+### Files touched
+
+- `traffic_client/statistics_section.py` — add `frame_size` to
+  the per-row dict in `update_stream_statistics_table()`.
+- `tests/test_v05136_stream_frame_size_propagation.py` — 7
+  cases: the exact srv06 UEC scenario (23.77 Mpps × 1000B →
+  ~190 Gbps); 512B / 1500B frame sizes; RX uses frame_size
+  too; missing / string / garbage / zero defensive cases.
+
 ## [0.5.135] - 2026-06-14
 
 **Fix: /api/interfaces uses Mellanox PHY counters when available.**

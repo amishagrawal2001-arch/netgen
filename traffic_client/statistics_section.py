@@ -1949,6 +1949,13 @@ class TrafficGenClientStatisticsSection():
                 # Absent in the common case — when RX matches TX
                 # the warning is None.
                 "wire_delivery_warning": stream.get("wire_delivery_warning"),
+                # v0.5.136: frame_size for the TX/RX Bit Rate cells.
+                # Pre-fix the render loop fell back to 64 → on srv06
+                # a 1000-byte UEC stream firing at 23.77 Mpps showed
+                # "12.17 Gbps" (23.77M × 64 × 8) instead of the
+                # actual ~190 Gbps. /api/streams/stats already
+                # includes frame_size; just forward it.
+                "frame_size": stream.get("frame_size", 64),
             })
         
         # Sort by interface, then by stream name
