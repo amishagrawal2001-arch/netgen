@@ -127,7 +127,10 @@ def _count_active_dpdk_rx() -> int:
         return 0
 
 
-def _pick_rx_lcores(pci_bdf: str, queue_count: int) -> str:
+def _pick_rx_lcores(
+    pci_bdf: str, queue_count: int,
+    reserved: set[int] | None = None,
+) -> str:
     """v0.5.132: pick rx_worker lcores from the NIC's NUMA node so
     every lcore is one hop from the NIC's memory. Returns a comma-
     separated string of `queue_count + 1` lcore ids (1 main loop +
@@ -135,17 +138,48 @@ def _pick_rx_lcores(pci_bdf: str, queue_count: int) -> str:
     info is unavailable — matches pre-v0.5.132 behavior on lean or
     non-Linux hosts.
 
-    Pre-fix the auto-scaler hardcoded range(cap + 1). On a dual-
-    socket box with the NIC on node 0, that picked sequential ids
-    0..N which crossed into node 1's CPUs (16..31 on srv06) once
-    the queue count exceeded the per-node CPU count. Operator saw
-    per-queue throughput halve when lcore 16 landed on the wrong
-    node — every RX poll cost a QPI/UPI hop."""
+    v0.5.134: `reserved` is the set of lcore ids already claimed by
+    other running DPDK workers. Two DPDK processes pinned to the
+    same lcore get scheduled by Linux, not by EAL — every context
+    switch reaches into the wrong PMD's hot path. Operator saw
+    srv06 multi-stream rx_rate collapse to 14 Mpps (vs 24 Mpps
+    solo) with imissed=5.8B because two rx_workers both used
+    lcores 0-16. Skip reserved cores so each rx_worker gets
+    exclusive ownership."""
     needed = queue_count + 1
     cpus = _numa_cpulist_for_pci(pci_bdf)
+    if cpus and reserved:
+        cpus = [c for c in cpus if c not in reserved]
     if not cpus or len(cpus) < needed:
         return ",".join(str(i) for i in range(needed))
     return ",".join(str(i) for i in cpus[:needed])
+
+
+def _collect_used_lcores() -> set[int]:
+    """v0.5.134: union of lcore ids already pinned by running
+    rx_workers. Read by parsing each registered handle's cmd list
+    for the `-l <comma-sep-list>` flag. Returns an empty set on any
+    lookup failure or in lean test contexts."""
+    out: set[int] = set()
+    try:
+        from utils.dpdk_rx_manager import registry as _rx_reg
+        handles = list(_rx_reg()._handles.values())
+    except Exception:
+        return out
+    for h in handles:
+        try:
+            cmd = list(getattr(h, "cmd", None) or [])
+            # cmd shape: ["rx_worker", "-l", "0,1,2,...", "-n", "4", ...]
+            for i, tok in enumerate(cmd):
+                if tok == "-l" and i + 1 < len(cmd):
+                    for piece in str(cmd[i + 1]).split(","):
+                        piece = piece.strip()
+                        if piece:
+                            out.add(int(piece))
+                    break
+        except (ValueError, TypeError):
+            continue
+    return out
 
 
 def _strict_true(value):
@@ -825,7 +859,11 @@ def _maybe_start_dpdk_rx_for_stream(
             # already consumed most hugepages with 16-queue mempools.
             active = _count_active_dpdk_rx()
             cap = _line_rate_queue_cap(pci_bdf, active_dpdk_streams=active)
-            return cap, _pick_rx_lcores(pci_bdf, cap)
+            # v0.5.134: skip lcores already pinned by other rx_workers
+            # so two DPDK processes never share the same physical CPU.
+            return cap, _pick_rx_lcores(
+                pci_bdf, cap, reserved=_collect_used_lcores(),
+            )
         if pps >= 18_000_000:
             return 4, "0,1,2,3,4"
         if pps >= 6_000_000:

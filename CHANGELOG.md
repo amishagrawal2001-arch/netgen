@@ -2,6 +2,57 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.134] - 2026-06-14
+
+**Fix: rx_worker lcore picker excludes lcores held by other workers.**
+
+After v0.5.131-133, srv06 multi-stream still pinned two rx_workers
+to the same lcore set `0,1,...,16`. Two DPDK processes sharing
+physical CPUs means the Linux scheduler ping-pongs them — every
+context switch reaches into the wrong PMD hot path.
+
+Operator state at v0.5.131:
+- UEC: tx=21.87 Mpps, rx=13.98 Mpps, hw_imissed=5.8B
+- UDP: similar overlap
+
+### Fix
+
+`_pick_rx_lcores` gains a `reserved: set[int]` param. The lcores
+in that set are skipped over when picking from the NUMA cpulist.
+
+New helper `_collect_used_lcores()` parses each registered
+rx_worker's cmd list for its `-l` arg and unions the lcore sets.
+The auto-scaler passes the result as `reserved` so each new
+rx_worker gets exclusive ownership of its CPUs.
+
+### Behavior on srv06
+
+| Scenario           | v0.5.133                     | v0.5.134                                |
+|--------------------|------------------------------|------------------------------------------|
+| 1st stream         | lcores 0..16 (16q)           | lcores 0..16 (unchanged)                 |
+| 2nd stream         | lcores 0..8 (OVERLAP!)       | lcores 9..15,32,33 (disjoint, NUMA-local)|
+| 3rd stream         | lcores 0..5 (OVERLAP × 3)    | lcores 32..37 (disjoint, SMT siblings)   |
+
+### Fallback contracts preserved
+
+- No reserved set / empty → identical to v0.5.132/133 behavior.
+- NUMA unavailable → fallback to `range(needed)`, reserved
+  ignored (no notion of which lcore is which without sysfs).
+- After exclusion not enough cores remain → fallback to
+  `range(needed)`, accepting overlap rather than under-provisioning.
+
+### Files touched
+
+- `run_tgen_server.py` — `_pick_rx_lcores` gains `reserved` param;
+  new `_collect_used_lcores()` helper; line-rate auto-scaler
+  passes the reserved set on every new stream spawn.
+- `tests/test_v05134_lcore_no_overlap.py` — 13 cases: picker
+  with reserved (happy path, NUMA chunks, fallback when too few
+  free, no-reserved unchanged, fallback path ignores reserved);
+  collector (empty / single / union / lookup failure / malformed
+  cmd); e2e first stream unchanged + second stream disjoint +
+  third stream disjoint across both prior reservations.
+
 ## [0.5.133] - 2026-06-14
 
 **Fix: rx_queue cap divides by concurrent DPDK stream count.**
