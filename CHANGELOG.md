@@ -2,6 +2,57 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.128] - 2026-06-14
+
+**Fix: DPDK tx_worker count-field flags read from protocol_data.**
+
+v0.5.126/127 auto-scaled rx_worker to 8 queues for line-rate
+streams, but the matching TX-side knobs to actually cycle the
+5-tuple (so RSS distributes across queues) never made it to
+tx_worker.
+
+### Root cause
+
+`run_stream()`'s count-flag block read only top-level short
+names: `stream_data["dst_port_count"]`. The dialog stores its
+value under `protocol_data.udp.udp_destination_port_count`
+(nested + longer). So every dialog-driven stream's UI setting
+of `dst_port_count=64` was silently discarded → tx_worker fired
+with a single 5-tuple → RSS hashed everything to queue 0 →
+multi-queue rx_worker provided zero benefit (saw 5.2 Mpps with
+8 queues vs 6.4 Mpps with 1 queue, because the 7 idle lcores
+were eating PCIe bandwidth).
+
+### Fix
+
+Extracted `_resolve_count_flags(stream_data)` as a module-level
+helper. Reads both top-level (API-direct convention) and
+`protocol_data.{ipv4,udp}` (dialog convention). Top-level wins
+when set; otherwise nested value applies. Same shape of fix as
+the VLAN-mode resolver helper (v0.5.124).
+
+| field | top-level | protocol_data path |
+|-------|-----------|---------------------|
+| `--src-ip-count` | `src_ip_count` | `protocol_data.ipv4.ipv4_source_increment_count` |
+| `--dst-ip-count` | `dst_ip_count` | `protocol_data.ipv4.ipv4_destination_increment_count` |
+| `--src-port-count` | `src_port_count` | `protocol_data.udp.udp_source_port_count` |
+| `--dst-port-count` | `dst_port_count` | `protocol_data.udp.udp_destination_port_count` |
+
+### Tests
+
+`tests/test_v05128_count_field_resolution.py` — 10 cases:
+
+* Each of the 4 fields reads from protocol_data (the bug fix)
+* Top-level short form still works (back-compat)
+* Top-level takes precedence over protocol_data
+* Count of 0 or 1 yields no flag
+* Garbage value silently skips (no crash)
+* All four at once
+* No protocol_data → no flags (defensive)
+
+Full suite: 2595 passed (+ 1 pre-existing order-dependent flake
+in test_rx_worker_e2e, passes in isolation, not from this change).
+
 ## [0.5.127] - 2026-06-14
 
 **Hot-fix: rx_worker auto-scale picks max queues for Line Rate

@@ -353,18 +353,7 @@ def run_stream(
     # tx_worker can bump src_ip / dst_ip / src_port / dst_port across N
     # packets — required for hashing/RSS tests where the DUT distributes
     # flows by 5-tuple. count=0 or 1 means "fixed" (the default).
-    for cli_flag, json_key in (
-        ("--src-ip-count",   "src_ip_count"),
-        ("--dst-ip-count",   "dst_ip_count"),
-        ("--src-port-count", "src_port_count"),
-        ("--dst-port-count", "dst_port_count"),
-    ):
-        try:
-            n = int(stream_data.get(json_key) or 0)
-        except (TypeError, ValueError):
-            n = 0
-        if n >= 2:
-            cmd += [cli_flag, str(n)]
+    cmd += _resolve_count_flags(stream_data)
 
     # One-way latency timestamping. When enabled, tx_worker embeds a
     # 16-byte NLAT header at the start of each UDP payload — the
@@ -1095,6 +1084,50 @@ def _resolve_tx_cores(stream_data: Dict[str, Any]) -> int:
         except Exception:
             pass
     return 1
+
+
+def _resolve_count_flags(stream_data: Dict[str, Any]) -> list:
+    """v0.5.128: build the --src/dst-{ip,port}-count cmd flags from
+    a stream's config. Look in both top-level (API-direct convention)
+    and protocol_data.{ipv4,udp} (dialog convention). Top-level wins
+    when set explicitly; otherwise the dialog's nested value applies.
+
+    Pre-v0.5.128 only the top-level short form was read, so dialog-
+    driven streams that set dst_port_count=64 (via
+    protocol_data.udp.udp_destination_port_count) got no flag → TX
+    cycled nothing → RSS landed every packet on queue 0 →
+    multi-queue rx_worker provided no benefit.
+
+    Returns a flat list ready to extend the tx_worker argv.
+    """
+    pd = stream_data.get("protocol_data") or {}
+    udp = pd.get("udp") or {}
+    ipv4 = pd.get("ipv4") or {}
+    pairs = (
+        ("--src-ip-count",
+         stream_data.get("src_ip_count"),
+         ipv4.get("ipv4_source_increment_count")),
+        ("--dst-ip-count",
+         stream_data.get("dst_ip_count"),
+         ipv4.get("ipv4_destination_increment_count")),
+        ("--src-port-count",
+         stream_data.get("src_port_count"),
+         udp.get("udp_source_port_count")),
+        ("--dst-port-count",
+         stream_data.get("dst_port_count"),
+         udp.get("udp_destination_port_count")),
+    )
+    out = []
+    for cli_flag, top_val, pd_val in pairs:
+        # Top-level wins when set; fall through to protocol_data.
+        chosen = top_val if top_val not in (None, "") else pd_val
+        try:
+            n = int(chosen or 0)
+        except (TypeError, ValueError):
+            n = 0
+        if n >= 2:
+            out += [cli_flag, str(n)]
+    return out
 
 
 def _resolve_target_pps(stream_data: Dict[str, Any]) -> int:
