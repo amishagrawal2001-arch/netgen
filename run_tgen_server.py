@@ -675,10 +675,57 @@ def _maybe_start_dpdk_rx_for_stream(
     if vlan_value is None:
         vlan_value = _int_or_none(stream_data.get("vlan"), 0, 4095)
 
+    # v0.5.126: scale RX queues + lcores based on target pps.
+    # One DPDK lcore saturates around ~6-7 Mpps for 512B frames
+    # on a ConnectX-6 chip; above that the NIC's RX ring fills
+    # before software can consume → hw_imissed climbs into the
+    # billions (srv06 saw 3.4B drops at 46 Mpps). Multi-queue +
+    # multi-lcore + RSS spreads the load. Explicit operator
+    # override via stream_data["rx_queues"] / ["rx_lcores"] wins;
+    # otherwise auto-pick from the stream's target_pps.
+    def _auto_rx_queues_for_pps(pps: int) -> tuple[int, str]:
+        # Conservative pps-per-queue ceiling on ConnectX-6 with
+        # 512B frames. Real measured ~6.4 Mpps at single queue
+        # (srv06 v0.5.125 test). Use 6 Mpps as the threshold.
+        if pps >= 30_000_000:
+            return 8, "0,1,2,3,4,5,6,7,8"
+        if pps >= 18_000_000:
+            return 4, "0,1,2,3,4"
+        if pps >= 6_000_000:
+            return 2, "0,1,2"
+        return 1, "0,1"
+    explicit_rxq = stream_data.get("rx_queues")
+    explicit_lcores = stream_data.get("rx_lcores")
+    if explicit_rxq is not None:
+        try:
+            auto_rx_queues = max(1, min(16, int(explicit_rxq)))
+        except (TypeError, ValueError):
+            auto_rx_queues = 1
+        auto_lcores = (
+            str(explicit_lcores)
+            if explicit_lcores
+            else ",".join(str(i) for i in range(auto_rx_queues + 1))
+        )
+    else:
+        try:
+            from utils.dpdk_tx_worker import _resolve_target_pps
+            _tgt_pps = int(_resolve_target_pps(stream_data) or 0)
+        except Exception:
+            _tgt_pps = 0
+        auto_rx_queues, auto_lcores = _auto_rx_queues_for_pps(_tgt_pps)
+        if auto_rx_queues > 1:
+            logging.info(
+                f"[DPDK-RX] auto-scaling rx_queues={auto_rx_queues} "
+                f"lcores={auto_lcores} for target {_tgt_pps:,} pps "
+                f"(single queue caps at ~6 Mpps for 512B frames)"
+            )
+
     kwargs = dict(
         stream_id=stream_id,
         pci_bdf=pci_bdf,
         vlan=vlan_value,
+        rx_queues=auto_rx_queues,
+        lcores=auto_lcores,
         dst_port=_int_or_none(
             udp.get("udp_destination_port") or udp.get("dst_port")
             or udp.get("dport")

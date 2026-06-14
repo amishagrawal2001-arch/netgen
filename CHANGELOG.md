@@ -2,6 +2,64 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.126] - 2026-06-14
+
+**Fix: rx_worker auto-scales queues + lcores based on target pps.**
+
+Caught on srv06 at 46 Mpps (line-rate-ish on 200G with 512B
+frames): single-queue rx_worker hit
+`hw_imissed: 3,397,304,661` — 3.4 BILLION packets dropped at the
+chip's RX ring before software could consume.
+
+### Root cause
+
+`_maybe_start_dpdk_rx_for_stream` hardcoded `rx_queues=1`.
+One DPDK lcore caps at ~6-7 Mpps for 512B frames on ConnectX-6;
+beyond that the NIC ring overflows. Operator sees a huge TX/RX
+divergence in the Interface Stats table without any signal in
+the netgen UI pointing at the queue count.
+
+### Fix
+
+Auto-scale based on the stream's `target_pps`:
+
+| target pps | rx_queues | lcores |
+|-----------|-----------|--------|
+| < 6 Mpps | 1 | 0,1 |
+| 6..<18 Mpps | 2 | 0,1,2 |
+| 18..<30 Mpps | 4 | 0,1,2,3,4 |
+| >= 30 Mpps | 8 | 0,1,2,3,4,5,6,7,8 |
+
+Operator can override explicitly via `stream_data["rx_queues"]`
+and `stream_data["rx_lcores"]` for advanced tuning. Explicit
+values clamp to 1..16 (the rx_worker.c MAX_RX_QUEUES limit);
+invalid values fall back to 1 instead of crashing.
+
+When auto-scale fires, the log line names the threshold so the
+operator can correlate: `"[DPDK-RX] auto-scaling rx_queues=4
+lcores=0,1,2,3,4 for target 20,000,000 pps"`.
+
+### Tests
+
+`tests/test_v05126_rx_queue_autoscale.py` — 8 cases:
+
+* Each pps bucket (100k, 6M, 18M, 46M) picks the right tier
+* Operator override (rx_queues, rx_lcores) wins over auto
+* Garbage input clamps safely (16 → 16, 0 → 1, "bogus" → 1)
+* Missing stream_pps_rate falls back to single-queue default
+
+Full suite: 2585 passed, 1 skipped.
+
+### Notes
+
+* The thresholds are conservative (6 Mpps per queue). They
+  match what the v0.5.125 srv06 test measured. On other chip
+  generations or smaller frame sizes the per-queue ceiling
+  differs — operators can override with explicit values.
+* RSS hashing across N queues requires the rx_worker.c side to
+  enable RSS in its `rte_eth_dev_configure` (which it already
+  does). No C-side change needed.
+
 ## [0.5.125] - 2026-06-14
 
 **Fix: `wire_delivery_warning` falsely accused the wire when
