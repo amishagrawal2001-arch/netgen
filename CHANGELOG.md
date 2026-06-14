@@ -2,6 +2,44 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.127] - 2026-06-14
+
+**Hot-fix: rx_worker auto-scale picks max queues for Line Rate
+streams (target_pps == 0).**
+
+v0.5.126 keyed the auto-scale off `_resolve_target_pps()`, but
+streams configured as **Line Rate** (or with no explicit
+`stream_pps_rate`) resolve to 0. The pre-fix bucket logic then
+treated 0 the same as 100k and picked `rx_queues=1` — the
+single-queue default that the whole v0.5.126 change was trying
+to avoid. Result on srv06: tx_worker fired at ~24 Mpps with
+`--pps 0`, rx_worker stayed single-queue, `hw_imissed` climbed
+to 1.1 BILLION inside two minutes.
+
+### Fix
+
+Treat `pps == 0` the same as the top bucket (≥ 30 Mpps) — assume
+Line Rate, max out queues and lcores. Operator can override
+down via `stream_data["rx_queues"]` if they want fewer.
+
+### Tests
+
+`tests/test_v05126_rx_queue_autoscale.py` extended:
+
+* pps=0 (explicit) → 8 queues
+* No stream_pps_rate field → 8 queues (was: 1 queue)
+* Other 7 cases preserved (low pps → 1, 6M → 2, 18M → 4, 30M+ → 8, overrides, clamps).
+
+Full suite: 2586 passed, 1 skipped.
+
+### Lesson
+
+When auto-scaling on a runtime value, `0` almost always means
+"unset / take the safe default." For a rate threshold, the safe
+default is the TOP bucket, not the bottom — undersized is
+silent (hw_imissed drops invisibly), oversized is just a few
+unused lcores.
+
 ## [0.5.126] - 2026-06-14
 
 **Fix: rx_worker auto-scales queues + lcores based on target pps.**

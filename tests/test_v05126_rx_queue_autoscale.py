@@ -136,11 +136,21 @@ def test_explicit_override_clamps_to_safe_range():
     assert kw["rx_queues"] == 1, "Invalid value falls back to 1, not crash"
 
 
-def test_zero_or_missing_pps_keeps_default():
-    """No stream_pps_rate field → can't auto-scale → 1 queue.
-    Same as the historical default."""
+def test_zero_or_missing_pps_picks_max_queues():
+    """v0.5.127: pps == 0 means Line Rate (or unset). Tx_worker
+    fires at max chip rate (~25-46 Mpps on 200G ConnectX-6).
+    Pre-v0.5.127 the 0 fell into the < 6 Mpps bucket → single
+    queue → hw_imissed=1.1 BILLION at line rate. Now treat 0
+    the same as the top bucket so Line Rate works out of the
+    box."""
     s = _stream(0)
     del s["stream_pps_rate"]
     kw = _call_and_capture_kwargs(s)
-    assert kw["rx_queues"] == 1
-    assert kw["lcores"] == "0,1"
+    assert kw["rx_queues"] == 8
+    assert kw["lcores"] == "0,1,2,3,4,5,6,7,8"
+
+
+def test_explicit_zero_pps_also_picks_max_queues():
+    """Same fix applies when stream_pps_rate is explicitly 0."""
+    kw = _call_and_capture_kwargs(_stream(0))
+    assert kw["rx_queues"] == 8

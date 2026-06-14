@@ -687,7 +687,15 @@ def _maybe_start_dpdk_rx_for_stream(
         # Conservative pps-per-queue ceiling on ConnectX-6 with
         # 512B frames. Real measured ~6.4 Mpps at single queue
         # (srv06 v0.5.125 test). Use 6 Mpps as the threshold.
-        if pps >= 30_000_000:
+        # v0.5.127: pps == 0 means "Line Rate" stream rate mode
+        # (or unset) — the tx_worker fires at max chip TX, which
+        # on a 200 Gbps ConnectX-6 lands somewhere in 25–46 Mpps
+        # depending on frame size. Pre-fix the 0 fell into the
+        # `< 6 Mpps` bucket and picked single-queue → hw_imissed
+        # at 1B+ on every Line Rate stream. Treat 0 the same as
+        # the top bucket: max queues, max lcores. Operator can
+        # override down if they don't want the full fleet.
+        if pps == 0 or pps >= 30_000_000:
             return 8, "0,1,2,3,4,5,6,7,8"
         if pps >= 18_000_000:
             return 4, "0,1,2,3,4"
