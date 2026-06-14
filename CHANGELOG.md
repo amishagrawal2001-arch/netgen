@@ -2,6 +2,52 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.129] - 2026-06-14
+
+**Fix: rx_worker port-filter treats `0` as "no filter", not literal port 0.**
+
+After v0.5.128 went out, srv06 UEC stream still showed rx_count=0
+despite tx_worker firing at 17 Mpps. Live debug via `ps aux | grep
+rx_worker` revealed the UEC rx_worker was launched with
+`--dst-port 0 --src-port 0`. The rx_worker honors those literally
+— it requires every frame to have port==0 → silently rejects every
+packet on the wire.
+
+### Root cause
+
+`_maybe_start_dpdk_rx_for_stream` in `run_tgen_server.py` reads
+the UDP port fields from `protocol_data.udp` and forwards them as
+`dst_port` / `src_port` kwargs to `rx_registry.start()`. The
+stream dialog persists UDP fields as `"0"` for streams whose L4
+isn't actually UDP — UEC emulation and ICMP fill in their own
+protocol fields, not the udp.* fields. Pre-fix the auto-lifecycle
+passed those zeros to rx_worker which then required every frame
+to have port=0. RX counters stuck at 0 for the entire test.
+
+### Fix
+
+Added `_port_filter_or_none(v)` helper that coerces `0` (and
+None / non-numeric / out-of-range) to None. None at the rx_worker
+launcher means "skip the port-filter clause" — match any port.
+Real ports (1-65535) pass through unchanged so UDP streams keep
+their tight BPF.
+
+### Files touched
+
+- `run_tgen_server.py` — `_port_filter_or_none` helper + wire it
+  into `_maybe_start_dpdk_rx_for_stream`'s dst_port/src_port
+  kwargs
+- `tests/test_v05129_zero_port_filter.py` — 8 cases: zero → None,
+  real port passes through, missing udp section safe, garbage
+  coerced, edge cases (port 1, 65535)
+
+### Operational note
+
+This bug predates v0.5.128 — UEC/ICMP streams in DPDK rx_engine
+mode have been silently rejected since the auto-lifecycle landed.
+The TX side was always firing correctly; only the matched_pkts
+counter was broken.
+
 ## [0.5.128] - 2026-06-14
 
 **Fix: DPDK tx_worker count-field flags read from protocol_data.**

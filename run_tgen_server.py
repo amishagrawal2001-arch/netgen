@@ -641,6 +641,16 @@ def _maybe_start_dpdk_rx_for_stream(
             return None
         return iv if lo <= iv <= hi else None
 
+    def _port_filter_or_none(v):
+        """v0.5.129: coerce 0/None/invalid → None so the rx_worker
+        skips the port-filter clause entirely. Port 0 isn't a real
+        UDP port; the dialog leaves UDP fields at 0 for streams
+        that aren't actually UDP (UEC, ICMP). Pre-fix every such
+        stream got rx_count stuck at 0 because rx_worker required
+        port=0 on every frame."""
+        n = _int_or_none(v)
+        return n if (n is not None and n > 0) else None
+
     # v0.5.108 hot-fix: stream_data["L3"], ["L4"], ["VLAN"] are top-
     # level STRING FLAGS ("IPv4", "UDP", "Untagged"/"Tagged") — NOT
     # nested dicts. The actual per-protocol fields live under
@@ -734,11 +744,18 @@ def _maybe_start_dpdk_rx_for_stream(
         vlan=vlan_value,
         rx_queues=auto_rx_queues,
         lcores=auto_lcores,
-        dst_port=_int_or_none(
+        # v0.5.129: coerce port 0 → None (== "no port filter").
+        # Port 0 isn't a real UDP port; the dialog leaves UDP fields
+        # at "0" for streams that aren't actually UDP (UEC emulation,
+        # ICMP). Pre-fix the auto-lifecycle passed 0 to rx_worker
+        # which then required every frame to have port=0 → silently
+        # rejected every packet → rx_count stuck at 0 even though
+        # the wire was delivering line-rate.
+        dst_port=_port_filter_or_none(
             udp.get("udp_destination_port") or udp.get("dst_port")
             or udp.get("dport")
         ),
-        src_port=_int_or_none(
+        src_port=_port_filter_or_none(
             udp.get("udp_source_port") or udp.get("src_port")
             or udp.get("sport")
         ),
