@@ -2,6 +2,65 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.132] - 2026-06-14
+
+**Fix: rx_worker lcores picked from NIC's NUMA cpulist, not range(N).**
+
+srv06 v0.5.131 follow-up. With the bucket cap lifted to 16, the
+auto-scaler picked lcores `0,1,2,...,16` for the rx_worker. On a
+dual-socket box that silently lands lcore 16 on **the wrong NUMA
+node** (srv06's NUMA node 0 is CPUs `0-15,32-47`; lcore 16 is on
+node 1 — one full QPI/UPI hop from the NIC's memory).
+
+Operator saw per-queue throughput halve as cap went from 8 → 16:
+single-queue rate dropped 2.2 → 1.1 Mpps. Total stayed around
+17 Mpps so the bump appeared neutral — but the wasted budget
+was 50% per lcore.
+
+### Fix
+
+New helper `_numa_cpulist_for_pci(bdf)` returns the actual CPU
+ID list from `/sys/devices/system/node/node<N>/cpulist`. Replaces
+the count-only `_numa_cores_for_pci` (which is now a thin
+wrapper).
+
+New helper `_pick_rx_lcores(pci_bdf, queue_count)` picks
+`queue_count + 1` lcores from that cpulist. Falls back to
+`range(N)` when sysfs is unavailable (Mac / CI / single-socket).
+
+On srv06: instead of `0..16` (one wrong-NUMA core) the auto-
+scaler now picks `0..15, 32` — all 17 lcores on NUMA node 0.
+
+### Operator-visible impact (srv06)
+
+Pre-fix at line rate (v0.5.131): rx_rate ≈ 17.5 Mpps, per-queue
+≈ 1.1 Mpps with one lcore on wrong NUMA.
+
+Expected post-fix: per-queue rate restored to ~2.2 Mpps × 16
+queues → headroom for ~35 Mpps line-rate absorption.
+
+### Falls back cleanly
+
+- Mac / CI runners: no `/sys/bus/pci` → `_numa_cpulist_for_pci`
+  returns None → `_pick_rx_lcores` falls back to `range(N)` → no
+  behavior change.
+- Single-socket boxes (`numa_node = -1`): same fallback.
+- NUMA node with fewer cores than the queue count needs: also
+  falls back to `range(N)` rather than under-provisioning lcores.
+
+### Files touched
+
+- `run_tgen_server.py` — `_numa_cpulist_for_pci` (new),
+  `_numa_cores_for_pci` (refactored to wrapper), `_pick_rx_lcores`
+  (new). Line-rate auto-scaler branch now calls `_pick_rx_lcores`
+  instead of building `range(cap + 1)` inline.
+- `tests/test_v05132_numa_lcore_selection.py` — 15 cases: sysfs
+  parser (dense, SMT-interleaved, single-cpu, single-socket,
+  missing); picker (NUMA-aware happy path, fallback when NUMA
+  absent, fallback when NUMA too small, NIC on node 1 symmetry);
+  end-to-end through auto-scaler verifying NO lcore lands on the
+  wrong NUMA node.
+
 ## [0.5.131] - 2026-06-14
 
 **Fix: NUMA-aware rx_queue cap lifts line-rate auto-scaler from 8 to up to 16.**

@@ -42,18 +42,21 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024
 
 
-def _numa_cores_for_pci(bdf: str) -> int | None:
-    """v0.5.131: count CPU cores on the NUMA node the NIC at `bdf`
-    is attached to. None on any read failure — callers fall back
-    to the conservative pre-NUMA cap (8). Used to scale the
-    rx_worker line-rate bucket beyond 8 queues when the host has
-    enough local cores to absorb full chip TX.
+def _numa_cpulist_for_pci(bdf: str) -> list[int] | None:
+    """v0.5.131/132: return the sorted CPU id list on the NUMA node
+    the NIC at `bdf` is attached to. None on any read failure —
+    callers fall back to the conservative pre-NUMA defaults.
 
     Read from sysfs:
       /sys/bus/pci/devices/<bdf>/numa_node          → NUMA node #
       /sys/devices/system/node/node<N>/cpulist      → "0-15,32-47"
     cpulist is parsed as a comma-separated list of either single
-    cpus ("4") or inclusive ranges ("0-15"). Returns the cpu count.
+    cpus ("4") or inclusive ranges ("0-15"). Returns the actual cpu
+    ids (NOT range(count)) — v0.5.132 needed this because picking
+    DPDK lcores from range(N) on a dual-socket box silently lands
+    some lcores on the wrong NUMA node (one full QPI/UPI hop from
+    the NIC's memory). Operator saw 50% per-queue throughput drop
+    on srv06 when lcore 16 fell on NUMA node 1.
     """
     try:
         with open(f"/sys/bus/pci/devices/{bdf}/numa_node") as f:
@@ -62,17 +65,26 @@ def _numa_cores_for_pci(bdf: str) -> int | None:
             return None
         with open(f"/sys/devices/system/node/node{node}/cpulist") as f:
             cpulist = f.read().strip()
-        count = 0
+        cpus: list[int] = []
         for chunk in cpulist.split(","):
             chunk = chunk.strip()
             if "-" in chunk:
                 lo, hi = chunk.split("-")
-                count += int(hi) - int(lo) + 1
+                cpus.extend(range(int(lo), int(hi) + 1))
             elif chunk:
-                count += 1
-        return count or None
+                cpus.append(int(chunk))
+        return sorted(cpus) or None
     except (OSError, ValueError):
         return None
+
+
+def _numa_cores_for_pci(bdf: str) -> int | None:
+    """v0.5.131: count CPU cores on the NIC's NUMA node. Used to
+    scale the rx_worker line-rate bucket beyond 8 queues when the
+    host has enough local cores to absorb full chip TX. Thin
+    wrapper around `_numa_cpulist_for_pci` (post-v0.5.132 refactor)."""
+    cpus = _numa_cpulist_for_pci(bdf)
+    return len(cpus) if cpus else None
 
 
 def _line_rate_queue_cap(pci_bdf: str) -> int:
@@ -85,6 +97,27 @@ def _line_rate_queue_cap(pci_bdf: str) -> int:
     if not n:
         return 8
     return max(8, min(16, n - 2))
+
+
+def _pick_rx_lcores(pci_bdf: str, queue_count: int) -> str:
+    """v0.5.132: pick rx_worker lcores from the NIC's NUMA node so
+    every lcore is one hop from the NIC's memory. Returns a comma-
+    separated string of `queue_count + 1` lcore ids (1 main loop +
+    N data lcores). Falls back to range(queue_count + 1) when NUMA
+    info is unavailable — matches pre-v0.5.132 behavior on lean or
+    non-Linux hosts.
+
+    Pre-fix the auto-scaler hardcoded range(cap + 1). On a dual-
+    socket box with the NIC on node 0, that picked sequential ids
+    0..N which crossed into node 1's CPUs (16..31 on srv06) once
+    the queue count exceeded the per-node CPU count. Operator saw
+    per-queue throughput halve when lcore 16 landed on the wrong
+    node — every RX poll cost a QPI/UPI hop."""
+    needed = queue_count + 1
+    cpus = _numa_cpulist_for_pci(pci_bdf)
+    if not cpus or len(cpus) < needed:
+        return ",".join(str(i) for i in range(needed))
+    return ",".join(str(i) for i in cpus[:needed])
 
 
 def _strict_true(value):
@@ -759,7 +792,7 @@ def _maybe_start_dpdk_rx_for_stream(
         # override down if they don't want the full fleet.
         if pps == 0 or pps >= 30_000_000:
             cap = _line_rate_queue_cap(pci_bdf)
-            return cap, ",".join(str(i) for i in range(cap + 1))
+            return cap, _pick_rx_lcores(pci_bdf, cap)
         if pps >= 18_000_000:
             return 4, "0,1,2,3,4"
         if pps >= 6_000_000:
