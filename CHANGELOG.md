@@ -2,6 +2,68 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.125] - 2026-06-14
+
+**Fix: `wire_delivery_warning` falsely accused the wire when
+flow tracking was disabled.**
+
+When the operator turns off Flow Tracking on a stream, netgen
+doesn't run an RX sniffer for that stream — rx_rate stays 0 by
+design. But the pre-fix `wire_delivery_warning` triggered on
+`tx_rate > 100 AND rx_rate < 5% of tx_rate` without checking
+WHY rx was zero. Result: every stream with Flow Tracking off
+got "wire is dropping ~100% of frames" attached to its stats,
+pointing at non-existent switch problems.
+
+Cost: one wasted debug session today where the operator's
+tcpdump proved the wire was delivering fine, but the netgen
+warning kept insisting the switch was broken.
+
+### Fix
+
+Split the trigger. When `flow_tracking_enabled == false`, emit
+a different warning with `reason: "flow_tracking_disabled"` and
+a message that points at the Flow Tracking toggle in the dialog
+instead of mentioning the switch:
+
+> *"TX is at N pps but RX counter is 0 because Flow Tracking is
+> DISABLED for this stream. The wire may be delivering fine —
+> netgen just isn't counting. Enable Flow Tracking in the Edit
+> Stream dialog to start counting RX packets."*
+
+When `flow_tracking_enabled == true` and rx_rate < 5%, the
+original wire-drop warning fires unchanged.
+
+### Tests
+
+`tests/test_v05125_wire_warning_flow_tracking.py` — 6 cases:
+
+* flow_tracking=false + flat rx → reason=flow_tracking_disabled,
+  no switch language
+* flow_tracking=true + flat rx → original wire-drop warning
+* rx ≈ tx → no warning either way
+* idle TX (rate < 100) → no warning
+* rx_interface unset → no warning
+* source code carries the `flow_tracking_disabled` marker
+  (regression guard against future refactors)
+
+Full suite: 2577 passed, 1 skipped.
+
+### Lesson for the saga
+
+The wire_delivery_warning was added in v0.5.114 as part of the
+srv06 saga's UX layer — to point operators at switch issues
+without having to bisect MAC vs VLAN vs storm-control from
+scratch. Today it bit the saga itself: the message confidently
+named switch storm-control + MAC as the likely cause, the
+operator's tcpdump proved that wrong, and the agent (me) wasted
+a round chasing a switch-asymmetry diagnosis that didn't exist.
+
+Lesson: any warning that names specific failure causes must
+gate on those causes being LIKELY, not just possible. The
+diagnostic block here now checks the most basic mode toggle
+(Flow Tracking) before suggesting anything else.
+
 ## [0.5.124] - 2026-06-14
 
 **VLAN-mode sweep audit — shared `resolve_tx_vlan_id()` helper +

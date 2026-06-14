@@ -1070,6 +1070,33 @@ def stream_stats():
                     continue
                 if rx_rate >= tx_rate * 0.05:
                     continue
+                # v0.5.125: don't fire the warning when flow
+                # tracking is disabled. In that case rx_rate is
+                # zero BY DESIGN — netgen isn't running an RX
+                # sniffer for the stream — so the wire isn't
+                # the culprit. The pre-fix warning ("wire is
+                # dropping ~100% of frames") wasted a debug
+                # session chasing a non-existent switch bug
+                # when the operator just hadn't enabled flow
+                # tracking. Surfacing a different hint is
+                # better than a false accusation.
+                flow_on = bool(s.get("flow_tracking_enabled"))
+                if not flow_on:
+                    s["wire_delivery_warning"] = {
+                        "tx_rate": tx_rate,
+                        "rx_rate": rx_rate,
+                        "summary": (
+                            f"TX is at {tx_rate:.0f} pps but RX "
+                            f"counter is 0 because Flow Tracking "
+                            f"is DISABLED for this stream. The "
+                            f"wire may be delivering fine — netgen "
+                            f"just isn't counting. Enable Flow "
+                            f"Tracking in the Edit Stream dialog "
+                            f"to start counting RX packets."
+                        ),
+                        "reason": "flow_tracking_disabled",
+                    }
+                    continue
                 # TX is firing and RX is essentially zero.
                 # Hint at the most likely causes ordered by
                 # what we actually saw in the srv06 saga.
