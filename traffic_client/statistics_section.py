@@ -1891,8 +1891,34 @@ class TrafficGenClientStatisticsSection():
             # The renderer at line ~2108 now treats None as the muted
             # "—" placeholder so the operator sees "not yet measured"
             # instead of false-positive green.
+            #
+            # v0.5.137: prefer rate-based loss when the stream is
+            # running. The cumulative count loss `(tx - rx) / tx`
+            # gives nonsense answers when the TX and RX counters
+            # started at different times. Operator saw "Loss 99.39%"
+            # on srv06 UEC despite tx_rate=23.71M and rx_rate=20.57M
+            # (real instantaneous loss ~13%) because rx_worker was
+            # re-spawned (lcore reallocation post-v0.5.131/132/134)
+            # while tx_worker kept its old counter — RX had been
+            # counting for <1 second; TX for ~135 seconds.
+            #
+            # Rate-based loss answers the operator's real question:
+            # "of what I'm sending right now, what fraction is being
+            # dropped?" — independent of when each counter started.
+            # Fall back to cumulative for stopped streams (where both
+            # rates are 0 but cumulative still has meaning).
             if isinstance(tx_count, int) and tx_count > 0:
-                if isinstance(rx_count, int):
+                if tx_rate and tx_rate > 0 and rx_rate is not None:
+                    # Running stream — use rates. Clamp the rare
+                    # rx_rate > tx_rate case (sample-window phase
+                    # offset between rx_worker and tx_worker poll
+                    # cycles) to 0 so we don't flash a negative
+                    # "loss" that confuses the operator.
+                    _diff = tx_rate - rx_rate
+                    loss_pct = max(0.0, (_diff / tx_rate) * 100.0)
+                elif isinstance(rx_count, int):
+                    # Stopped / zero-rate — cumulative count loss
+                    # still useful as a session summary.
                     loss_pct = ((tx_count - rx_count) / tx_count * 100)
                 else:
                     loss_pct = 100.0 if flow_tracking else None

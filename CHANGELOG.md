@@ -2,6 +2,65 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.137] - 2026-06-14
+
+**Fix: stream-stats Loss % uses rates when running.**
+
+Operator screenshot: UEC stream showed Loss = 99.39% despite
+TX rate 23.71 Mpps and RX rate 20.57 Mpps. Real instantaneous
+loss `= (23.71 − 20.57) / 23.71 = 13.2%`.
+
+The 99.39% came from cumulative counts:
+- TX 3,218,807,168 cumulative
+- RX 19,481,462 cumulative
+- `(TX − RX) / TX = 99.39%` ✓ arithmetic, but meaningless
+
+### Root cause
+
+TX had been counting for `3.2B / 23.71M = ~135 seconds`. RX had
+been counting for `19.5M / 20.57M = ~0.95 seconds`. The
+rx_worker was respawned (lcore reallocation post-v0.5.131/132/134)
+and started its counter fresh, while tx_worker kept its history.
+Cumulative loss is meaningless when the two counters started at
+different times.
+
+### Fix
+
+Stream-stats Loss % column now prefers rate-based loss when the
+stream is running:
+
+```python
+if tx_rate > 0 and rx_rate is not None:
+    loss = max(0.0, (tx_rate - rx_rate) / tx_rate * 100)
+elif isinstance(rx_count, int):
+    # stopped / zero-rate — cumulative still useful as session summary
+    loss = (tx_count - rx_count) / tx_count * 100
+```
+
+Rate-based answers the operator's real question: "of what I'm
+sending right now, what fraction is being dropped?" — independent
+of counter start times.
+
+### Edge cases handled
+
+- **rx_rate > tx_rate** (sample-window phase offset between
+  rx/tx_worker poll cycles): clamped to 0 so the cell doesn't
+  flash a confusing negative loss.
+- **TX rate = 0** (stopped stream): falls back to cumulative —
+  that's the session summary the operator wants on stopped rows.
+- **TX count = 0** (warmup): None → muted "—" placeholder.
+- **flow_tracking off** (no rx_count): None.
+
+### Files touched
+
+- `traffic_client/statistics_section.py` — loss_pct calculation
+  in `update_stream_statistics_table()` now uses rates first.
+- `tests/test_v05137_rate_based_loss.py` — 11 cases: the exact
+  srv06 UEC scenario; equal rates → 0; rx_rate=0 → 100%;
+  negative clamped; stopped fallback; tx_rate=0 fallback;
+  tx_count=0 → None; rx_rate=None fallback; small 2% loss;
+  50% loss; flow_tracking off → None.
+
 ## [0.5.136] - 2026-06-14
 
 **Fix: stream-stats table TX/RX Bit Rate cells use real frame_size.**
