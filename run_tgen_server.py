@@ -182,6 +182,61 @@ def _collect_used_lcores() -> set[int]:
     return out
 
 
+_PHY_CTRS_CACHE: dict[str, tuple[float, dict[str, int]]] = {}
+_PHY_CTRS_TTL_S = 0.5
+
+
+def _mellanox_phy_counters(iface: str) -> dict[str, int] | None:
+    """v0.5.135: read Mellanox PHY-level HW counters via `ethtool -S`.
+
+    Returns a dict with `rx_packets_phy`, `tx_packets_phy`,
+    `rx_bytes_phy`, `tx_bytes_phy` when available, or None on any
+    failure (non-Mellanox NIC, ethtool absent, parse error). These
+    counters are at the PHY layer — they see ALL traffic regardless
+    of who's driving the queues, which is what makes them right for
+    measuring DPDK bps where the kernel netdev path is blind.
+
+    Cached briefly (~500 ms) so calls from `/api/interfaces` don't
+    fork an ethtool per iface per request when the GUI polls every
+    second. The cache is intentionally process-local (no lock) —
+    duplicate ethtool calls during a stampede are harmless."""
+    import time as _time
+    now = _time.monotonic()
+    cached = _PHY_CTRS_CACHE.get(iface)
+    if cached and now - cached[0] < _PHY_CTRS_TTL_S:
+        return cached[1]
+    import subprocess as _sp
+    try:
+        result = _sp.run(
+            ["ethtool", "-S", iface],
+            capture_output=True, text=True, timeout=2.0,
+        )
+    except (FileNotFoundError, OSError, _sp.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    out: dict[str, int] = {}
+    for line in result.stdout.splitlines():
+        line = line.strip()
+        if ":" not in line:
+            continue
+        k, _, v = line.partition(":")
+        k = k.strip()
+        if k not in (
+            "rx_packets_phy", "tx_packets_phy",
+            "rx_bytes_phy", "tx_bytes_phy",
+        ):
+            continue
+        try:
+            out[k] = int(v.strip())
+        except ValueError:
+            continue
+    if not out:
+        return None
+    _PHY_CTRS_CACHE[iface] = (now, out)
+    return out
+
+
 def _strict_true(value):
     """v0.5.68 (audit C2, C3): accept ONLY literal JSON `true`.
 
@@ -11783,6 +11838,35 @@ def get_interfaces():
                 errors = int(real.errin) + int(real.errout)
             else:
                 tx = rx = sent_bytes = received_bytes = errors = 0
+
+            # v0.5.135: prefer Mellanox PHY counters when available.
+            # psutil reads /proc/net/dev which is the kernel netdev
+            # path — on srv06 the kernel TX counter sees only
+            # ~3M packets over the iface lifetime even though DPDK
+            # has fired billions of frames. The DPDK PMD bypasses
+            # the kernel TX queue, so iface stats massively under-
+            # count TX bps vs stream stats (which read tx_worker
+            # directly).
+            #
+            # `ethtool -S <iface>` exposes Mellanox-specific PHY
+            # counters (`tx_packets_phy`, `tx_bytes_phy`, etc.)
+            # that are HARDWARE-level — they see ALL traffic
+            # regardless of who's driving the queues. On srv06
+            # tx_packets_phy = 140 BILLION vs kernel tx_packets =
+            # 3 million. Use the higher value when both are present.
+            try:
+                phy = _mellanox_phy_counters(name)
+                if phy:
+                    if phy.get("rx_bytes_phy") and phy["rx_bytes_phy"] > received_bytes:
+                        received_bytes = phy["rx_bytes_phy"]
+                    if phy.get("tx_bytes_phy") and phy["tx_bytes_phy"] > sent_bytes:
+                        sent_bytes = phy["tx_bytes_phy"]
+                    if phy.get("rx_packets_phy") and phy["rx_packets_phy"] > rx:
+                        rx = phy["rx_packets_phy"]
+                    if phy.get("tx_packets_phy") and phy["tx_packets_phy"] > tx:
+                        tx = phy["tx_packets_phy"]
+            except Exception:
+                pass
 
             # v0.5.43: prefer sysfs operstate over psutil.isup. On
             # Linux, psutil's `isup` ANDs IFF_UP + IFF_RUNNING — the

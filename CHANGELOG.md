@@ -2,6 +2,75 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.135] - 2026-06-14
+
+**Fix: /api/interfaces uses Mellanox PHY counters when available.**
+
+Operator audit on srv06 found Interface stats bps disagreed with
+Stream stats bps. Root cause: `/api/interfaces` reads
+`psutil.net_io_counters()` which goes through `/proc/net/dev`
+(the kernel netdev path). On Mellanox kernel-bound NICs, DPDK
+PMD bypasses the kernel TX queue → kernel TX byte counter is
+blind to DPDK traffic.
+
+srv06 ground truth (over iface lifetime):
+- kernel `tx_packets` = 3.2 M
+- PHY `tx_packets_phy` = **140 BILLION** (DPDK + scapy combined)
+- kernel `tx_bytes` = 404 MB
+- PHY `tx_bytes_phy` = **109 TB**
+
+That's why the Interface stats panel showed TX bps near zero
+while Stream stats showed 100+ Gbps — same wire, two views,
+one measurement source was blind.
+
+### Fix
+
+`/api/interfaces` now also reads Mellanox PHY counters via
+`ethtool -S <iface>` and prefers them when present:
+- `rx_packets_phy`, `tx_packets_phy`
+- `rx_bytes_phy`, `tx_bytes_phy`
+
+These are HARDWARE-level counters that see ALL traffic regardless
+of who's driving the queues. Use the higher of the two values per
+metric (PHY ≥ kernel always; kernel never sees more than HW saw).
+
+### Falls back cleanly
+
+- Non-Mellanox NICs (Intel, Broadcom): `_phy` fields don't appear
+  in `ethtool -S` output → helper returns None → caller falls
+  back to kernel netdev counts (pre-v0.5.135 behavior).
+- No `ethtool` binary (rare): same fallback.
+- `ethtool -S` timeout / error: same fallback.
+- Cached briefly (500 ms TTL) so GUI polling doesn't fork an
+  ethtool per iface per request.
+
+### Files touched
+
+- `run_tgen_server.py` — new `_mellanox_phy_counters(iface)`
+  helper with 500 ms cache. `/api/interfaces` calls it and
+  promotes the four PHY values when they exceed the kernel
+  numbers.
+- `tests/test_v05135_mellanox_phy_counters.py` — 8 cases:
+  parser extracts only `_phy` keys; returns None when ethtool
+  missing / nonzero exit / no PHY keys; ignores malformed lines;
+  caches briefly (suppresses repeat calls); per-iface cache
+  separation; timeout handling.
+
+### Other bit-rate audit findings (NOT bugs, just gotchas)
+
+1. **Neither bps formula includes wire overhead** (preamble 7 +
+   SFD 1 + IFG 12 = 20 bytes/pkt). Both show L2 bps. "200 Gbps"
+   target shows as ~196 Gbps on a 1000B-frame stream.
+2. **FCS asymmetry**: kernel netdev TX usually includes FCS,
+   RX usually doesn't. Stream stats use raw `frame_size`
+   (tx_worker `--size`, no FCS). 4 bytes/pkt difference.
+3. **Multi-stream aggregation**: iface counts ALL wire bytes;
+   stream stats sums only known streams. Background traffic
+   (LLDP, ARP, multicast) shows in iface but not stream.
+4. **Frame padding to 60B**: tx_worker pads frames below the
+   Ethernet 60-byte minimum. Configured `frame_size=40` → wire
+   frame is 60B + FCS.
+
 ## [0.5.134] - 2026-06-14
 
 **Fix: rx_worker lcore picker excludes lcores held by other workers.**
