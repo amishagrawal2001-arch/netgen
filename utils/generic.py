@@ -375,12 +375,29 @@ def get_packet_config(stream_data):
     udp  = protocol_data.get("udp", {})  or {}
 
     # VLANs
-    vlan_id_str = str(vlan.get("vlan_id", "")).strip()
-    vlan_id = int(vlan_id_str) if vlan_id_str.isdigit() else 1
-    vlan_count = int(vlan.get("vlan_increment_count", 1))
-    vlan_step  = int(vlan.get("vlan_increment_value", 1))
-    vlan_increment = bool(vlan.get("vlan_increment", False))
-    vlan_ids = [vlan_id + i * vlan_step for i in range(vlan_count)] if vlan_increment else [vlan_id]
+    # v0.5.123: respect the VLAN mode toggle. The dialog leaves
+    # vlan_id populated even when the operator picks "Untagged"
+    # (so the value survives a Tagged→Untagged→Tagged toggle).
+    # Pre-fix this function unconditionally read vlan_id and
+    # passed it down; build_generic_packet() then added a Dot1Q
+    # tag with vlan=1 (the dialog default). On srv06's QFX5130
+    # access port, every tagged frame was dropped → rx_count=0.
+    # Mirrors the scapy RX fix at multithreaded_traffic_gen.py:
+    # 1188 (v0.4.5) and the DPDK fix at utils/dpdk_tx_worker.py
+    # (v0.5.120/121). Same bug shape, third surface.
+    ps = stream_data.get("protocol_selection") or {}
+    vlan_mode = str(
+        ps.get("VLAN") or stream_data.get("VLAN") or ""
+    ).strip().lower()
+    if vlan_mode == "untagged":
+        vlan_ids = [None]
+    else:
+        vlan_id_str = str(vlan.get("vlan_id", "")).strip()
+        vlan_id = int(vlan_id_str) if vlan_id_str.isdigit() else 1
+        vlan_count = int(vlan.get("vlan_increment_count", 1))
+        vlan_step  = int(vlan.get("vlan_increment_value", 1))
+        vlan_increment = bool(vlan.get("vlan_increment", False))
+        vlan_ids = [vlan_id + i * vlan_step for i in range(vlan_count)] if vlan_increment else [vlan_id]
 
     # MACs - with defaults and validation
     mac_src_default = mac.get("mac_source_address") or "00:00:00:00:00:02"

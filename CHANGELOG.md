@@ -2,6 +2,74 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.123] - 2026-06-14
+
+**Fix: scapy TX ignored VLAN:Untagged mode — third surface of the
+same bug shape that's bitten us 3 times now.**
+
+Captured on srv06 via tcpdump: every scapy frame went out
+**VLAN-tagged with VID=1, DEI bit set** even though the dialog
+showed `VLAN: Untagged`. The QFX5130 access port dropped every
+tagged frame → rx_count stayed at 0.
+
+### Root cause
+
+`utils/generic.py:get_packet_config()` read `vlan_id` from
+`protocol_data.vlan.vlan_id` with a default of **1** and never
+checked the top-level `VLAN` mode field. The downstream
+`build_generic_packet()` correctly skips Dot1Q when `vlan_id is
+None or vlan_id <= 0`, but the upstream config builder always
+fed it a positive integer.
+
+### Fix
+
+`get_packet_config()` now checks `protocol_selection.VLAN` first,
+then top-level `VLAN`. If "untagged" → `vlan_ids = [None]`. The
+existing guard in `build_generic_packet()` skips the Dot1Q
+attach for None vlan_id, so no Dot1Q ever reaches the wire.
+
+Mirrors the same fix shape applied previously:
+* **v0.4.5** — scapy RX sub-iface creator
+* **v0.5.120** — DPDK tx_worker (top-level lookup)
+* **v0.5.121** — DPDK look in protocol_selection
+* **v0.5.123** — scapy TX packet builder ← this commit
+
+### Tests
+
+`tests/test_v05123_scapy_tx_vlan_untagged.py` — 9 cases:
+
+* Untagged in protocol_selection → vlan_ids=[None] (the bug fix)
+* Untagged + vlan_id=1 (the exact srv06 trip) → [None]
+* Tagged → keeps vlan_id (regression guard)
+* Stacked → keeps vlan_id
+* Top-level VLAN field still respected (back-compat)
+* protocol_selection takes precedence over stale top-level
+* Missing VLAN field falls through (legacy back-compat)
+* Tagged + increment expansion unchanged
+* End-to-end: `build_generic_packet()` produces no Dot1Q layer
+  when given vlan_id=None
+
+Full suite: 2555 passed, 1 skipped.
+
+### Saga summary so far (8 fixes, all real)
+
+| Version | Real bug |
+|---------|----------|
+| v0.5.118 | rx_worker stderr capture (the diagnostic that broke the saga open) |
+| v0.5.119 | TX pre-launch sweep friendly-fire on rx_worker |
+| v0.5.120 | DPDK tx_worker ignored `VLAN:Untagged` (top-level) |
+| v0.5.121 | DPDK look in protocol_selection too |
+| v0.5.122 | RX BPF clamped to UDP for non-DPDK streams via stale dpdk_enable |
+| v0.5.123 | Scapy TX builder ignored `VLAN:Untagged` (same shape, third surface) |
+
+Plus the operator-discovered config issue: UEC stream's dst MAC
+was wrong (`5c:25:73:3f:30:56` = src MAC) — fixed via the Auto
+button. The pattern of these "same shape, different surface"
+fixes argues for a sweep audit pass next: every place that reads
+`vlan_id` should check the VLAN mode field. A single shared
+helper `resolve_vlan_id(stream_data)` would make this regression
+impossible — worth doing in v0.5.124+.
+
 ## [0.5.122] - 2026-06-14
 
 **Fix: RX BPF was clamping non-DPDK ICMP/TCP streams to UDP.**
