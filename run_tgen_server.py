@@ -42,6 +42,51 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 200 * 1024 * 1024
 
 
+def _numa_cores_for_pci(bdf: str) -> int | None:
+    """v0.5.131: count CPU cores on the NUMA node the NIC at `bdf`
+    is attached to. None on any read failure — callers fall back
+    to the conservative pre-NUMA cap (8). Used to scale the
+    rx_worker line-rate bucket beyond 8 queues when the host has
+    enough local cores to absorb full chip TX.
+
+    Read from sysfs:
+      /sys/bus/pci/devices/<bdf>/numa_node          → NUMA node #
+      /sys/devices/system/node/node<N>/cpulist      → "0-15,32-47"
+    cpulist is parsed as a comma-separated list of either single
+    cpus ("4") or inclusive ranges ("0-15"). Returns the cpu count.
+    """
+    try:
+        with open(f"/sys/bus/pci/devices/{bdf}/numa_node") as f:
+            node = int(f.read().strip())
+        if node < 0:  # -1 means "no NUMA topology" (single-socket box)
+            return None
+        with open(f"/sys/devices/system/node/node{node}/cpulist") as f:
+            cpulist = f.read().strip()
+        count = 0
+        for chunk in cpulist.split(","):
+            chunk = chunk.strip()
+            if "-" in chunk:
+                lo, hi = chunk.split("-")
+                count += int(hi) - int(lo) + 1
+            elif chunk:
+                count += 1
+        return count or None
+    except (OSError, ValueError):
+        return None
+
+
+def _line_rate_queue_cap(pci_bdf: str) -> int:
+    """v0.5.131: max rx_queues for the line-rate auto-scaler bucket.
+    NUMA-aware on hosts with the cores; falls back to 8 on lean
+    hosts or when sysfs reads fail. Reserves 2 cores for system +
+    rx_worker main loop. Hard-capped at 16 to match rx_worker.c's
+    MAX_RX_QUEUES."""
+    n = _numa_cores_for_pci(pci_bdf)
+    if not n:
+        return 8
+    return max(8, min(16, n - 2))
+
+
 def _strict_true(value):
     """v0.5.68 (audit C2, C3): accept ONLY literal JSON `true`.
 
@@ -693,6 +738,13 @@ def _maybe_start_dpdk_rx_for_stream(
     # multi-lcore + RSS spreads the load. Explicit operator
     # override via stream_data["rx_queues"] / ["rx_lcores"] wins;
     # otherwise auto-pick from the stream's target_pps.
+
+    # v0.5.131: at line rate the bucket cap was 8 queues. Even
+    # with port cycling that left 28% of TX un-absorbed on srv06
+    # (rx_rate=17.5 Mpps vs tx_rate=24 Mpps). Bump the cap to 16
+    # when the NIC's NUMA node has the cores to spare, leaving 2
+    # for system + main-loop. NUMA-bind avoids the QPI penalty
+    # for cross-socket lcore→queue traffic.
     def _auto_rx_queues_for_pps(pps: int) -> tuple[int, str]:
         # Conservative pps-per-queue ceiling on ConnectX-6 with
         # 512B frames. Real measured ~6.4 Mpps at single queue
@@ -706,7 +758,8 @@ def _maybe_start_dpdk_rx_for_stream(
         # the top bucket: max queues, max lcores. Operator can
         # override down if they don't want the full fleet.
         if pps == 0 or pps >= 30_000_000:
-            return 8, "0,1,2,3,4,5,6,7,8"
+            cap = _line_rate_queue_cap(pci_bdf)
+            return cap, ",".join(str(i) for i in range(cap + 1))
         if pps >= 18_000_000:
             return 4, "0,1,2,3,4"
         if pps >= 6_000_000:

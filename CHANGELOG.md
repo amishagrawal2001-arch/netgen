@@ -2,6 +2,62 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.131] - 2026-06-14
+
+**Fix: NUMA-aware rx_queue cap lifts line-rate auto-scaler from 8 to up to 16.**
+
+After v0.5.128 (count flags) + v0.5.130 (dialog norm) shipped,
+the srv06 UDP stream still showed a ~28% TX/RX gap at line rate:
+- `tx_rate`: 24 Mpps, `rx_rate`: 17 Mpps  
+- 5-tuple cycling at `dst_port_count=128` was correctly spreading
+  RSS across all 8 rx_queues. Per-queue rate ~2.2 Mpps × 8 = 17.5
+  Mpps total — exactly what the operator measured.
+
+The bottleneck had moved from "single queue" to "per-lcore RX
+throughput × queue count". srv06 has 64 cores / 2 NUMA nodes /
+16 cores per socket, but the rx_worker was using only 8 queues
++ 9 lcores.
+
+### Fix
+
+`_maybe_start_dpdk_rx_for_stream` line-rate bucket cap is now
+NUMA-aware. Two new module-level helpers:
+
+- `_numa_cores_for_pci(bdf)` — reads
+  `/sys/bus/pci/devices/<bdf>/numa_node` and
+  `/sys/devices/system/node/node<N>/cpulist` to count CPUs on
+  the NIC's NUMA node. Returns None on any failure.
+- `_line_rate_queue_cap(pci_bdf)` — `max(8, min(16, numa_cores - 2))`.
+  Reserves 2 cores for system + rx_worker main loop. Hard-cap
+  at 16 to match rx_worker.c's `MAX_RX_QUEUES`.
+
+Lean hosts / sysfs failures fall back to 8 — no regression for
+small boxes or any host where the NIC's NUMA node can't be
+determined.
+
+### Operator-visible impact (srv06)
+
+Before: line-rate cap = 8 queues, 9 lcores → 17.5 Mpps RX
+After:  line-rate cap = 14 queues, 15 lcores → ~30+ Mpps RX
+expected (per-queue rate × 14 instead of × 8)
+
+### Files touched
+
+- `run_tgen_server.py` — `_numa_cores_for_pci` + `_line_rate_queue_cap`
+  helpers; line-rate bucket in `_auto_rx_queues_for_pps` now uses
+  the cap
+- `tests/test_v05131_numa_aware_queue_cap.py` — 15 cases: sysfs
+  parser (dense, SMT-paired, single-CPU, single-socket, garbage,
+  missing); cap function (fallback, lean host, srv06 16-core,
+  hard 16 ceiling, SMT 32); end-to-end through autoscaler at line
+  rate + lower buckets unchanged
+
+### Lower buckets unchanged
+
+The 6 / 18 Mpps buckets still pick 2 / 4 queues. Operators with
+explicit `target_pps` below the line-rate threshold won't see
+surprise lcore inflation.
+
 ## [0.5.130] - 2026-06-14
 
 **Fix: stream dialog normalizes increment-flag ↔ count consistency.**
