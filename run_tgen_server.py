@@ -87,16 +87,44 @@ def _numa_cores_for_pci(bdf: str) -> int | None:
     return len(cpus) if cpus else None
 
 
-def _line_rate_queue_cap(pci_bdf: str) -> int:
+def _line_rate_queue_cap(pci_bdf: str, active_dpdk_streams: int = 0) -> int:
     """v0.5.131: max rx_queues for the line-rate auto-scaler bucket.
     NUMA-aware on hosts with the cores; falls back to 8 on lean
     hosts or when sysfs reads fail. Reserves 2 cores for system +
     rx_worker main loop. Hard-capped at 16 to match rx_worker.c's
-    MAX_RX_QUEUES."""
+    MAX_RX_QUEUES.
+
+    v0.5.133: when multiple DPDK streams run concurrently each
+    spawns its own tx_worker + rx_worker, and each worker reserves
+    its OWN mempool (~16 mempools × 8K mbufs × 2KB ≈ 256 MB per
+    worker). Pre-v0.5.133 srv06 saw EAL "Cause: mbuf_pool" when
+    starting a 2nd DPDK stream — hugepage budget exhausted because
+    the v0.5.131 bump doubled per-stream memory.
+
+    Divide the cap by (active_dpdk_streams + 1) so the total
+    rx_queue count across all concurrent streams stays bounded.
+    Floor at 2 queues so even 8+ concurrent streams keep some
+    benefit from RSS spread.
+    """
     n = _numa_cores_for_pci(pci_bdf)
-    if not n:
-        return 8
-    return max(8, min(16, n - 2))
+    base = 8 if not n else max(8, min(16, n - 2))
+    if active_dpdk_streams <= 0:
+        return base
+    return max(2, base // (active_dpdk_streams + 1))
+
+
+def _count_active_dpdk_rx() -> int:
+    """v0.5.133: how many DPDK rx_workers are running right now.
+    Read from the in-memory `_handles` map of the rx registry. Used
+    by the auto-scaler to back off the per-stream queue cap so
+    concurrent streams don't blow the hugepage budget. Returns 0
+    on any import / lookup failure (lean test contexts) — the
+    autoscaler then behaves as if this is the first stream."""
+    try:
+        from utils.dpdk_rx_manager import registry as _rx_reg
+        return len(_rx_reg()._handles)
+    except Exception:
+        return 0
 
 
 def _pick_rx_lcores(pci_bdf: str, queue_count: int) -> str:
@@ -791,7 +819,12 @@ def _maybe_start_dpdk_rx_for_stream(
         # the top bucket: max queues, max lcores. Operator can
         # override down if they don't want the full fleet.
         if pps == 0 or pps >= 30_000_000:
-            cap = _line_rate_queue_cap(pci_bdf)
+            # v0.5.133: count concurrent DPDK streams BEFORE this
+            # one. Pre-v0.5.133 a 2nd stream's tx_worker EAL would
+            # fail with "Cause: mbuf_pool" because the 1st stream
+            # already consumed most hugepages with 16-queue mempools.
+            active = _count_active_dpdk_rx()
+            cap = _line_rate_queue_cap(pci_bdf, active_dpdk_streams=active)
             return cap, _pick_rx_lcores(pci_bdf, cap)
         if pps >= 18_000_000:
             return 4, "0,1,2,3,4"

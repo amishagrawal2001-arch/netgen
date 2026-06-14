@@ -2,6 +2,68 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.133] - 2026-06-14
+
+**Fix: rx_queue cap divides by concurrent DPDK stream count.**
+
+After v0.5.131 bumped the line-rate cap to 16 queues, srv06 saw
+EAL `Cause: mbuf_pool` when starting a 2nd concurrent DPDK
+stream. Each rx_worker and tx_worker reserves its own mempool
+(~256 MB per worker at 16 queues). 2 streams × (rx + tx) ≈ 1 GB
+hugepages — over budget on hosts with the default allocation.
+
+```
+tx_worker[2413045]: EAL: Error - exiting with code: 1
+                    Cause:
+                    mbuf_pool
+ERROR:dpdk_tx_worker:[dpdk] stream 'UDP' failed with exit code 1
+```
+
+### Fix
+
+`_line_rate_queue_cap` now accepts `active_dpdk_streams`. When N
+streams are already running, the new stream's cap becomes
+`base_cap // (N + 1)`. Floor at 2 so RSS still helps even with
+many concurrent streams.
+
+New helper `_count_active_dpdk_rx()` reads
+`utils.dpdk_rx_manager.registry()._handles` and returns the
+number of rx_workers currently registered. The auto-scaler calls
+it BEFORE picking the cap so the new stream knows the budget.
+
+### Behavior matrix
+
+| Scenario                          | base=14 (srv06) | base=8 (lean) |
+|-----------------------------------|-----------------|---------------|
+| First DPDK stream                 | 14 queues       | 8 queues      |
+| Second concurrent stream          | 7 queues        | 4 queues      |
+| Fourth concurrent stream          | 3 queues        | 2 queues      |
+| Many streams (10+)                | 2 (floor)       | 2 (floor)     |
+
+### Explicit operator override unaffected
+
+`stream_data["rx_queues"] = N` bypasses the backoff entirely —
+operators with explicit values know their hugepage budget.
+
+### Mid-rate buckets unaffected
+
+The 6/18 Mpps buckets still pick their original 2/4 queues. The
+backoff only applies to the line-rate bucket because that's the
+one v0.5.131 inflated.
+
+### Files touched
+
+- `run_tgen_server.py` — `_line_rate_queue_cap` gains
+  `active_dpdk_streams` param; new `_count_active_dpdk_rx`
+  helper. Line-rate auto-scaler counts active streams before
+  picking the cap.
+- `tests/test_v05133_concurrent_stream_mempool_backoff.py` —
+  16 cases: cap divides by stream count, floor at 2, fallback
+  path also backs off; counter handles lookup failure / empty
+  registry / populated; e2e first/second/third stream + lcore
+  string matches new queue count + explicit override bypasses
+  + mid-rate buckets untouched.
+
 ## [0.5.132] - 2026-06-14
 
 **Fix: rx_worker lcores picked from NIC's NUMA cpulist, not range(N).**
