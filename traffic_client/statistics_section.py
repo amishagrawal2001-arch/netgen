@@ -1985,14 +1985,25 @@ class TrafficGenClientStatisticsSection():
                 self._latched_loss_pct = {}
                 _latched = self._latched_loss_pct
 
+            # v0.5.142: defensive init — `_stream_baselines` is
+            # normally set by the Clear Stats handler in main.py,
+            # but on a cold-start client (no Clear Stats clicked
+            # yet) it doesn't exist. The bookkeeping for the loss
+            # latch's counter-reset detection needs a dict to
+            # hang `_last_tx_for_latch` off; create it lazily.
+            _baselines = getattr(self, "_stream_baselines", None)
+            if not isinstance(_baselines, dict):
+                self._stream_baselines = {}
+                _baselines = self._stream_baselines
+
             # Detect counter reset → new session → drop the latch.
-            _prev_tx = self._stream_baselines.setdefault(
+            _prev_tx = _baselines.setdefault(
                 stream_id, {}).get("_last_tx_for_latch")
             if (stream_id and _prev_tx is not None
                     and isinstance(raw_tx, int) and raw_tx < _prev_tx):
                 _latched.pop(stream_id, None)
             if stream_id:
-                self._stream_baselines.setdefault(stream_id, {})[
+                _baselines.setdefault(stream_id, {})[
                     "_last_tx_for_latch"] = raw_tx
 
             if (isinstance(tx_count, int) and tx_count > 0

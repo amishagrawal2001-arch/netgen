@@ -2,6 +2,49 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.142] - 2026-06-15
+
+**Hotfix: cold-start client AttributeError on _stream_baselines.**
+
+Operator hit on first launch after upgrading:
+
+```
+File "traffic_client/statistics_section.py", line 1989, in
+update_stream_statistics_table
+    _prev_tx = self._stream_baselines.setdefault(
+AttributeError: 'TrafficGeneratorClient' object has no attribute
+                '_stream_baselines'
+zsh: abort      venv/bin/python run_tgen_client.py
+```
+
+v0.5.140's loss-latch code directly accessed
+`self._stream_baselines.setdefault(...)`. That dict is normally
+created by `main.py`'s Clear Stats handler — but on a fresh
+client (no Clear Stats clicked yet) the attribute doesn't exist
+→ AttributeError → GUI aborts on the first poll cycle.
+
+### Fix
+
+Lazy init of `_stream_baselines` in the latch block, mirroring
+the `_latched_loss_pct` pattern already in v0.5.140:
+
+```python
+_baselines = getattr(self, "_stream_baselines", None)
+if not isinstance(_baselines, dict):
+    self._stream_baselines = {}
+    _baselines = self._stream_baselines
+```
+
+### Files touched
+
+- `traffic_client/statistics_section.py` — lazy-init guard
+  before the latch's counter-reset bookkeeping.
+- `tests/test_v05142_cold_start_no_baselines.py` — 6 cases:
+  source no longer has the crashing direct-access pattern;
+  lazy-init present; cold-start first poll doesn't raise; later
+  polls reuse the same dict; latch on stop still works on
+  cold-start; non-dict attr value is overwritten not crashed on.
+
 ## [0.5.141] - 2026-06-15
 
 **Fix: Blast RDMA Flow + Topology Test jobs appear in the Streams tab.**
