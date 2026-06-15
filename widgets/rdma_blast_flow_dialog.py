@@ -505,12 +505,15 @@ class RdmaBlastFlowDialog(QDialog):
         # v0.5.152: compact further — operator wanted more vertical
         # room for the Live stats panel below. Tighten spacings and
         # margins; shrink the spinbox fixed widths.
-        # v0.5.159: bump vertical spacing 2 → 8 — the v0.5.152
-        # value crammed adjacent rows so tightly that the QSpinBox
-        # baselines kissed each other on a Retina display.
-        tg.setVerticalSpacing(8)
+        # v0.5.160: operator screenshot showed v0.5.159's bump to
+        # 8 was adding visible whitespace, not the kissing I
+        # imagined. Back to 2 (the v0.5.152 baseline). Buttons in
+        # row 2/3 (Verify, Max BW) get their row height capped
+        # below so they don't push the rows taller than the bare
+        # spinbox rows.
+        tg.setVerticalSpacing(2)
         tg.setHorizontalSpacing(6)
-        tg.setContentsMargins(8, 6, 8, 6)
+        tg.setContentsMargins(8, 4, 8, 4)
 
         # Pre-build every widget, then place them in pairs.
         self._test_combo = QComboBox()
@@ -628,6 +631,12 @@ class RdmaBlastFlowDialog(QDialog):
         # min width and let Qt size up naturally for the platform's
         # font metrics.
         self._qp_verify_btn.setMinimumWidth(96)
+        # v0.5.160: cap height so the QP-count row matches the
+        # bare-spinbox row heights above and below. QPushButton's
+        # default sizeHint includes more vertical padding than
+        # QSpinBox on macOS — without this cap the QP count row
+        # ends up ~6 px taller than the others.
+        self._qp_verify_btn.setMaximumHeight(28)
         self._qp_verify_btn.setToolTip(
             "Open a help panel showing commands to verify that "
             "perftest is actually creating qp_count QPs on the "
@@ -673,6 +682,10 @@ class RdmaBlastFlowDialog(QDialog):
         # clipped "Max BW". Use min width so Qt picks per-platform
         # font metrics.
         self._max_bw_btn.setMinimumWidth(108)
+        # v0.5.160: cap height so the Parallel-workers row matches
+        # the bare-spinbox row heights. Same reason as the QP
+        # Verify button cap.
+        self._max_bw_btn.setMaximumHeight(28)
         self._max_bw_btn.setToolTip(
             "Query the server's NUMA topology, find the HCA's "
             "home node, and set Parallel workers = number of CPU "

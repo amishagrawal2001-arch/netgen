@@ -446,6 +446,9 @@ class RdmaTopologyDialog(QDialog):
         # v0.5.159: was setFixedWidth(82) which clipped "Max BW"
         # on macOS. Use min width so Qt sizes for the platform.
         self._max_bw_btn.setMinimumWidth(108)
+        # v0.5.160: cap height so the workers row matches the
+        # bare-spinbox row heights.
+        self._max_bw_btn.setMaximumHeight(28)
         self._max_bw_btn.setToolTip(
             "Query the first endpoint's host topology, find its "
             "HCA's NUMA-local core count, divide by pair count, "

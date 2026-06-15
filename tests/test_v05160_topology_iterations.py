@@ -36,6 +36,9 @@ SRC = (REPO / "widgets" / "rdma_topology_dialog.py").read_text()
 # ───── #1: UI polish ────────────────────────────────────────────────────
 
 
+SRC_BLAST = (REPO / "widgets" / "rdma_blast_flow_dialog.py").read_text()
+
+
 def test_workload_grid_vertical_spacing_compacted():
     """Operator wanted "more compact" — back to 4 (the v0.5.156
     baseline) from the v0.5.159 bump to 8."""
@@ -47,6 +50,25 @@ def test_stats_table_minimum_height_bumped():
     assert "self._stats_table.setMinimumHeight(360)" in SRC
     # Old value gone.
     assert "self._stats_table.setMinimumHeight(160)" not in SRC
+
+
+def test_blast_test_params_vertical_spacing_reverted():
+    """v0.5.159's bump to 8 added whitespace; v0.5.160 reverts to
+    v0.5.152's 2."""
+    assert "tg.setVerticalSpacing(2)" in SRC_BLAST
+    assert "tg.setVerticalSpacing(8)" not in SRC_BLAST
+
+
+def test_blast_button_heights_capped():
+    """The fix for button-bearing rows being visibly taller than
+    bare-spinbox rows: cap the buttons to 28 px (matches QSpinBox
+    height on macOS)."""
+    assert "self._qp_verify_btn.setMaximumHeight(28)" in SRC_BLAST
+    assert "self._max_bw_btn.setMaximumHeight(28)" in SRC_BLAST
+
+
+def test_topology_max_bw_button_height_capped():
+    assert "self._max_bw_btn.setMaximumHeight(28)" in SRC
 
 
 # ───── #2a: Iterations spinbox ──────────────────────────────────────────

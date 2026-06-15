@@ -139,10 +139,14 @@ def test_topology_max_bw_button_uses_min_width():
 
 
 def test_blast_test_params_vertical_spacing_loosened():
-    """v0.5.152 set it to 2 (rows kissed). v0.5.159 bumps to 8."""
-    # The exact "tg.setVerticalSpacing(2)" line is gone.
-    assert "tg.setVerticalSpacing(2)" not in SRC_BLAST
-    assert "tg.setVerticalSpacing(8)" in SRC_BLAST
+    """v0.5.159 bumped vertical to 8; v0.5.160 reverted to 2 after
+    operator screenshot showed the bump was adding whitespace, not
+    fixing kissing. Button heights are capped instead (see
+    test_v05160_blast_button_heights_capped) so the button-bearing
+    rows stay the same height as bare-spinbox rows."""
+    assert "tg.setVerticalSpacing(2)" in SRC_BLAST
+    # The wrong-direction v0.5.159 value is gone.
+    assert "tg.setVerticalSpacing(8)" not in SRC_BLAST
 
 
 def test_topology_test_params_vertical_spacing_loosened():

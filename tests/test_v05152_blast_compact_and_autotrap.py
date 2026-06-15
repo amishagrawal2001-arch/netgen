@@ -34,14 +34,13 @@ SRC_TOP = (REPO / "widgets" / "rdma_topology_dialog.py").read_text()
 
 
 def test_test_params_grid_compacted():
-    """v0.5.152 compacted the QGridLayout; v0.5.159 loosened
-    vertical spacing back to 8 (the v0.5.152 value of 2 made
-    spinbox baselines kiss on Retina). The margins are also
-    bumped back. The intent — claim less vertical space than the
-    original (8, 4, 8, 4) but more than v0.5.152 — survives in
-    the (8, 6, 8, 6) compromise."""
-    assert "tg.setVerticalSpacing(8)" in SRC_BLAST
-    assert "tg.setContentsMargins(8, 6, 8, 6)" in SRC_BLAST
+    """v0.5.152 set vertical=2 + margins (6, 2, 6, 2). v0.5.159
+    bumped to 8 (wrong call — added visible whitespace, not
+    fixing kissing). v0.5.160 reverts to 2 + (8, 4, 8, 4) and
+    caps button heights to keep button-bearing rows the same
+    height as bare-spinbox rows."""
+    assert "tg.setVerticalSpacing(2)" in SRC_BLAST
+    assert "tg.setContentsMargins(8, 4, 8, 4)" in SRC_BLAST
 
 
 def test_spinbox_widths_shrunk():
