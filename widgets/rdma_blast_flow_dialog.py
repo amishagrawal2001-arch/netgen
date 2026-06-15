@@ -203,6 +203,9 @@ class RdmaBlastFlowDialog(QDialog):
         self._server_finished: bool = False
         self._client_finished: bool = False
         self._last_rendered_key: dict = {"server": None, "client": None}
+        # v0.5.150: state_ids from any pre-flight Apply. Cleaned
+        # up on dialog close so test IPs never outlive the test.
+        self._preflight_state_ids: set = set()
 
         self._build_ui()
         self._probe_both_sides()
@@ -529,6 +532,18 @@ class RdmaBlastFlowDialog(QDialog):
         # after clicking Start).
         action_row = QHBoxLayout()
         action_row.setSpacing(8)
+        # v0.5.150: pre-flight check button. Probes both endpoints
+        # for port state / IPs / GIDs / same-subnet trap and
+        # offers to apply temporary test IPs.
+        self._preflight_btn = QPushButton("🔍 Pre-flight check")
+        self._preflight_btn.setToolTip(
+            "Probe both endpoints for port state, link layer, "
+            "IP addresses, and RoCEv2 GIDs. Detects the same-host "
+            "same-subnet routing trap and offers temporary test "
+            "IPs (runtime only — gone on reboot)."
+        )
+        self._preflight_btn.clicked.connect(self._on_preflight_clicked)
+        action_row.addWidget(self._preflight_btn)
         self._start_btn = QPushButton("Start")
         self._start_btn.setDefault(True)
         self._start_btn.clicked.connect(self._on_start_clicked)
@@ -766,6 +781,50 @@ class RdmaBlastFlowDialog(QDialog):
             "cpu_util": bool(self._cpu_util_check.isChecked()),
             "report_gbits": True,
         }
+
+    # ───────── v0.5.150 pre-flight check
+
+    def _on_preflight_clicked(self) -> None:
+        """Open the RDMA pre-flight dialog. Probes both endpoints,
+        surfaces port state / IPs / GIDs / same-subnet trap,
+        offers temporary test IPs."""
+        srv_dev = self._server_device_combo.currentData()
+        cli_dev = self._client_device_combo.currentData()
+        if not srv_dev or not cli_dev:
+            QMessageBox.information(
+                self, "Pre-flight check",
+                "Pick a device on both sides first (combos are "
+                "still probing).",
+            )
+            return
+        endpoints = [
+            ("Server", self._server_tg_url, srv_dev,
+             int(self._server_port_spin.value())),
+            ("Client", self._client_tg_url, cli_dev,
+             int(self._client_port_spin.value())),
+        ]
+        from widgets.rdma_preflight_dialog import RdmaPreflightDialog
+        # Same-host config goes through whichever TG actually
+        # owns the kernel ifaces. For Blast that's the server's
+        # TG URL (server and client are on the same host in the
+        # interesting case).
+        dlg = RdmaPreflightDialog(
+            endpoints=endpoints,
+            config_url=self._server_tg_url,
+            parent=self,
+        )
+        dlg.exec_()
+        # If the operator applied a test config, remember the
+        # state_id so we clean it up on dialog close / Stop. (We
+        # don't clean immediately — they may want to actually
+        # run the perftest while the test IPs are live.)
+        sid = dlg.applied_state_id()
+        if sid:
+            self._preflight_state_ids.add(sid)
+            self._set_status_ok(
+                f"Pre-flight applied test IPs (state_id={sid[:8]}). "
+                f"Cleanup will fire when this dialog closes."
+            )
 
     def _pick_other_hca_for_client(self) -> None:
         """v0.5.149: same-host two-HCA shortcut. Picks the device
@@ -1207,4 +1266,28 @@ class RdmaBlastFlowDialog(QDialog):
         if self._poll_timer is not None:
             self._poll_timer.stop()
             self._poll_timer = None
+        # v0.5.150: clean up any pre-flight test IPs the operator
+        # applied during this dialog's lifetime. Fire-and-forget
+        # — operator already accepted the dialog close, no point
+        # blocking on the cleanup result.
+        self._cleanup_preflight_state_ids()
         event.accept()
+
+    def _cleanup_preflight_state_ids(self) -> None:
+        """POST cleanup for every applied state_id. Idempotent —
+        re-cleaning a state_id that's already gone is a no-op
+        on the server side."""
+        sids = list(self._preflight_state_ids)
+        if not sids:
+            return
+        self._preflight_state_ids.clear()
+        for sid in sids:
+            try:
+                _post_async(
+                    self,
+                    f"{self._server_tg_url}/api/rdma/test_ifaces/cleanup",
+                    {"state_id": sid},
+                    lambda *_a: None,
+                )
+            except Exception:
+                pass

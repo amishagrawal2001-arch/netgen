@@ -18459,6 +18459,122 @@ def api_rdma_devices():
         return jsonify({"devices": [], "error": str(exc)}), 500
 
 
+# ─────────────────────────────────────────── v0.5.150 RDMA preflight
+
+@app.route("/api/rdma/probe", methods=["GET"])
+def api_rdma_probe():
+    """Per-HCA probe for the v0.5.150 preflight dialog. Returns
+    everything the operator needs to decide whether the device is
+    ready for a perftest run:
+
+        {hca, ib_port, kernel_iface, state, link_layer, rate,
+         ip_addresses, rp_filter, gids}
+
+    Bad CIDR / missing HCA → 400.
+    """
+    device = (request.args.get("device") or "").strip()
+    try:
+        ib_port = int(request.args.get("port") or "1")
+    except ValueError:
+        return jsonify({"error": "port must be an integer"}), 400
+    if not device:
+        return jsonify({"error": "missing device"}), 400
+    # Reject obvious path-traversal attempts before sysfs reads.
+    if "/" in device or ".." in device:
+        return jsonify({"error": "invalid device name"}), 400
+    try:
+        from utils.rdma_test_ifaces import probe_device
+        return jsonify(probe_device(device, ib_port))
+    except Exception as exc:
+        logging.exception("[rdma] /api/rdma/probe failed")
+        return jsonify({"error": str(exc)}), 500
+
+
+@app.route("/api/rdma/test_ifaces/validate", methods=["POST"])
+def api_rdma_test_ifaces_validate():
+    """Validate operator-proposed (iface, CIDR) entries WITHOUT
+    applying. Returns the same shape `apply` would refuse —
+    {ok, issues:[{iface, cidr, severity, message}, ...]}."""
+    body = request.get_json(silent=True) or {}
+    entries = body.get("ifaces") or []
+    if not isinstance(entries, list):
+        return jsonify({"ok": False, "issues": [
+            {"iface": "", "cidr": "", "severity": "error",
+             "message": "`ifaces` must be a list"},
+        ]}), 400
+    try:
+        from utils.rdma_test_ifaces import validate_user_ips
+        return jsonify(validate_user_ips(entries))
+    except Exception as exc:
+        logging.exception("[rdma] /api/rdma/test_ifaces/validate failed")
+        return jsonify({"ok": False, "issues": [
+            {"iface": "", "cidr": "", "severity": "error",
+             "message": str(exc)},
+        ]}), 500
+
+
+@app.route("/api/rdma/test_ifaces/configure", methods=["POST"])
+def api_rdma_test_ifaces_configure():
+    """Apply runtime test IPs. Always validates first; refuses
+    apply on any error-severity issue. On success returns the
+    state_id for cleanup tracking."""
+    body = request.get_json(silent=True) or {}
+    entries = body.get("ifaces") or []
+    disable_rp_filter = bool(body.get("disable_rp_filter", True))
+    if not isinstance(entries, list) or not entries:
+        return jsonify({"ok": False, "error":
+                        "`ifaces` must be a non-empty list"}), 400
+    try:
+        from utils.rdma_test_ifaces import (
+            apply_test_config, validate_user_ips,
+        )
+        validation = validate_user_ips(entries)
+        if not validation.get("ok"):
+            return jsonify({
+                "ok": False,
+                "issues": validation.get("issues") or [],
+                "error": "validation failed; nothing applied",
+            }), 400
+        record = apply_test_config(entries, disable_rp_filter)
+        return jsonify({
+            "ok": True,
+            "state_id": record["state_id"],
+            "applied": record["applied"],
+            "errors": record.get("errors") or [],
+        })
+    except Exception as exc:
+        logging.exception("[rdma] /api/rdma/test_ifaces/configure failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/api/rdma/test_ifaces/cleanup", methods=["POST"])
+def api_rdma_test_ifaces_cleanup():
+    """Undo a configure. `state_id` cleans one record; omit it to
+    clean ALL netgen-applied test IPs (operator-triggered
+    blast-radius reset)."""
+    body = request.get_json(silent=True) or {}
+    state_id = body.get("state_id")
+    try:
+        from utils.rdma_test_ifaces import cleanup_test_config
+        return jsonify(cleanup_test_config(state_id=state_id))
+    except Exception as exc:
+        logging.exception("[rdma] /api/rdma/test_ifaces/cleanup failed")
+        return jsonify({"ok": False, "error": str(exc)}), 500
+
+
+@app.route("/api/rdma/test_ifaces/orphans", methods=["GET"])
+def api_rdma_test_ifaces_orphans():
+    """Crash-recovery: list test IPs carrying the `<iface>:netgen`
+    label that aren't in our state file. Operator can clean these
+    up via cleanup with state_id=null + a follow-up `ip addr del`."""
+    try:
+        from utils.rdma_test_ifaces import find_orphan_test_ips
+        return jsonify({"orphans": find_orphan_test_ips()})
+    except Exception as exc:
+        logging.exception("[rdma] /api/rdma/test_ifaces/orphans failed")
+        return jsonify({"orphans": [], "error": str(exc)}), 500
+
+
 @app.route("/api/rdma/perftest/installed", methods=["GET"])
 def api_rdma_perftest_installed():
     """Probe PATH for perftest binaries. Returns ``{installed: bool,

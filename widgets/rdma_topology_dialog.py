@@ -168,6 +168,9 @@ class RdmaTopologyDialog(QDialog):
         # main window's registered server set. Empty list = no picker
         # button rendered (operator still types lines by hand).
         self._known_servers: List[Tuple[str, str]] = list(known_servers or [])
+        # v0.5.150: per-TG state_ids from any pre-flight Apply.
+        # Cleaned up on dialog close.
+        self._preflight_state_ids: Dict[str, set] = {}
 
         self._build_ui()
 
@@ -443,6 +446,18 @@ class RdmaTopologyDialog(QDialog):
         # ── Action row
         action_row = QHBoxLayout()
         action_row.setSpacing(8)
+        # v0.5.150: pre-flight check button. Probes every parsed
+        # endpoint, surfaces same-subnet trap + DOWN ports, and
+        # offers temporary test IPs.
+        self._preflight_btn = QPushButton("🔍 Pre-flight check")
+        self._preflight_btn.setToolTip(
+            "Probe every endpoint for port state, link layer, IP "
+            "addresses, and RoCEv2 GIDs. Detects the same-host "
+            "same-subnet routing trap and offers temporary test "
+            "IPs (runtime only — gone on reboot)."
+        )
+        self._preflight_btn.clicked.connect(self._on_preflight_clicked)
+        action_row.addWidget(self._preflight_btn)
         self._start_btn = QPushButton("Start topology")
         self._start_btn.setDefault(True)
         self._start_btn.clicked.connect(self._on_start_clicked)
@@ -491,6 +506,62 @@ class RdmaTopologyDialog(QDialog):
             if rb.isChecked():
                 return sid
         return SHAPE_MESH
+
+    # ────────────────────────── v0.5.150 pre-flight ─────────────────
+
+    def _on_preflight_clicked(self) -> None:
+        """Parse the current endpoint editors, open the pre-flight
+        dialog for them. Same-host groups share one TG URL for
+        the test-IP config endpoint."""
+        srv_eps, srv_errs = parse_endpoint_block(self._server_edit.toPlainText())
+        cli_eps, cli_errs = parse_endpoint_block(self._client_edit.toPlainText())
+        if srv_errs or cli_errs:
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self, "Pre-flight check",
+                "Fix endpoint parse errors before running pre-flight."
+                + ("\n\nServer:\n" + "\n".join(srv_errs) if srv_errs else "")
+                + ("\n\nClient:\n" + "\n".join(cli_errs) if cli_errs else ""),
+            )
+            return
+        if not srv_eps or not cli_eps:
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.information(
+                self, "Pre-flight check",
+                "Fill in at least one server endpoint and one "
+                "client endpoint.",
+            )
+            return
+        endpoints: List[Tuple[str, str, str, int]] = []
+        for i, ep in enumerate(srv_eps):
+            endpoints.append(
+                (f"Server {i}", ep.tg_url, ep.device, ep.ib_port))
+        for i, ep in enumerate(cli_eps):
+            endpoints.append(
+                (f"Client {i}", ep.tg_url, ep.device, ep.ib_port))
+        # Group by tg_url so we apply test IPs ONCE per host. The
+        # operator can re-open the preflight if they want to apply
+        # per a different TG.
+        by_url: Dict[str, List[Tuple[str, str, str, int]]] = {}
+        for label, url, hca, port in endpoints:
+            by_url.setdefault(url, []).append((label, url, hca, port))
+        from widgets.rdma_preflight_dialog import RdmaPreflightDialog
+        for url, eps in by_url.items():
+            dlg = RdmaPreflightDialog(
+                endpoints=eps,
+                config_url=url,
+                parent=self,
+            )
+            dlg.exec_()
+            sid = dlg.applied_state_id()
+            if sid:
+                self._preflight_state_ids.setdefault(url, set()).add(sid)
+                self._pair_count_label.setText(
+                    f"<span style='color:#15803d;'>"
+                    f"Pre-flight applied test IPs on {url} "
+                    f"(state_id={sid[:8]}). Cleanup on close."
+                    f"</span>"
+                )
 
     # ────────────────────────── v0.5.147 loopback picker ──────────────
 
@@ -924,8 +995,23 @@ class RdmaTopologyDialog(QDialog):
 
     def closeEvent(self, event) -> None:
         """Stop the poll timer on close so Qt doesn't deliver ticks
-        to a deleted widget (the SIGABRT-pattern lesson)."""
+        to a deleted widget (the SIGABRT-pattern lesson).
+
+        v0.5.150: also clean up any pre-flight test IPs we applied.
+        Fire-and-forget per TG URL."""
         self._stop_poll()
+        for url, sids in self._preflight_state_ids.items():
+            for sid in sids:
+                try:
+                    _post_async(
+                        self,
+                        f"{url.rstrip('/')}/api/rdma/test_ifaces/cleanup",
+                        {"state_id": sid},
+                        lambda *_a: None,
+                    )
+                except Exception:
+                    pass
+        self._preflight_state_ids.clear()
         super().closeEvent(event)
 
 

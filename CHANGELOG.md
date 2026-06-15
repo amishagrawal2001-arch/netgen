@@ -2,6 +2,124 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.150] - 2026-06-15
+
+**RDMA Pre-flight check + user-controllable temporary test IPs.**
+
+Operator: "go and also provide user flexibility to select the ip
+address and check correct subnet configured by user."
+
+Closes the deferred gap from v0.5.149. The earlier "Failed to
+modify QP to RTR" failure on `rocep43s0f0 ↔ rocep43s0f1` was
+the classic same-host same-subnet routing trap — both kernel
+ifaces in one subnet → Linux routes via `lo` → RoCEv2 packets
+never cross the wire. Operators had to drop to SSH and run
+`ip addr add … && sysctl … && ip route add …`. v0.5.150 makes
+this a button click with full validation.
+
+### Server side
+
+* **`utils/rdma_test_ifaces.py`** — new pure-helpers module:
+  - `probe_device(hca)` → port state, link layer, kernel iface,
+    IPs, rp_filter, RoCEv1/v2 GIDs.
+  - `auto_pick_subnets()` — suggest non-conflicting RFC 1918
+    /24s by scanning the routing table.
+  - `validate_user_ips(ifaces)` — catches bad CIDR, missing
+    iface, **same-subnet trap on the same host**, existing-
+    route overlaps. Warnings vs hard errors.
+  - `apply_test_config()` — `ip addr add … label <iface>:ng`,
+    optional `sysctl rp_filter=0`, records state for cleanup.
+  - `cleanup_test_config(state_id)` — restores exactly what we
+    added; idempotent.
+  - `find_orphan_test_ips()` — crash-recovery: scans `ip -br
+    addr` for `<iface>:ng` labels not in our state.
+  - State file: `/etc/netgen/rdma-test-ifaces.json` (atomic
+    tmp+os.replace, same convention as the DPDK bind registry).
+  - Label suffix `:ng` (2 chars) fits within Linux's IFNAMSIZ
+    label cap for every modern predictable iface name.
+* **5 new routes** in `run_tgen_server.py`:
+  - `GET  /api/rdma/probe?device=<hca>&port=<n>`
+  - `POST /api/rdma/test_ifaces/validate`
+  - `POST /api/rdma/test_ifaces/configure`  (always validates
+    first, refuses on hard errors)
+  - `POST /api/rdma/test_ifaces/cleanup`  (specific state_id or
+    omit for blast-radius reset)
+  - `GET  /api/rdma/test_ifaces/orphans`  (crash recovery)
+  - `device` query param sanitized against path traversal
+    before any sysfs read.
+
+### Client side
+
+* **`widgets/rdma_preflight_dialog.py`** — new
+  `RdmaPreflightDialog`:
+  - Per-endpoint probe table (port state colored green/red, RoCEv2
+    GIDs, IPs).
+  - Verdict banner:
+    - 🔴 **BLOCKER** when any port is DOWN.
+    - 🟠 **Same-subnet trap detected** with the fix in plain
+      English.
+    - 🟠 IP missing when GIDs can't form.
+    - 🟢 Pre-flight OK.
+  - **User-editable CIDR field** per iface with auto-suggested
+    value (different /24 per side so loopback trap doesn't get
+    re-introduced).
+  - **"Validate" button** — checks the operator's CIDRs WITHOUT
+    applying. Surfaces errors inline next to each row.
+  - **"Apply (temporary)" button** — POSTs configure (which
+    validates again server-side, refuses on error). Marks each
+    row applied in green; status banner shows the `state_id`.
+  - **"Clean up applied" button** — undoes the last apply.
+  - **rp_filter checkbox** (default on) — relaxes reverse-path
+    filtering on the test ifaces, restored on cleanup.
+
+### Wiring
+
+* **"🔍 Pre-flight check"** button in the action row of BOTH
+  Blast a RDMA Flow and RDMA Topology Test dialogs.
+* Applied `state_id`s are tracked per-TG-URL on each parent
+  dialog; **`closeEvent` fires cleanup automatically** (fire-
+  and-forget POST) so test IPs never outlive the test.
+
+### Diagnostic flow for the srv06 operator
+
+1. Open RDMA Topology Test, pick `rocep43s0f0 ↔ rocep43s0f1`,
+   click **🔍 Pre-flight check**.
+2. Dialog shows port state ACTIVE on both, IPs in same subnet,
+   verdict: **Same-subnet trap detected**.
+3. Pre-populated CIDRs: `10.42.0.1/24` and `10.42.0.2/24` (or
+   operator edits to whatever they want).
+4. Click **Validate** → "Validation passed — safe to Apply."
+5. Click **Apply (temporary)**. Server runs:
+   `ip addr add 10.42.0.1/24 dev ens2f0np0 label ens2f0np0:ng`
+   `ip addr add 10.42.0.2/24 dev ens2f1np1 label ens2f1np1:ng`
+   `sysctl -w net.ipv4.conf.{f0,f1}.rp_filter=0`
+6. Close preflight, run Start. perftest's QP→RTR transition
+   now finds a working path. BW + msg-rate populate.
+7. Close the Topology dialog → cleanup fires automatically,
+   the test IPs vanish, rp_filter restored.
+8. Reboot → no trace; nothing was persisted.
+
+### Files changed
+- `utils/rdma_test_ifaces.py` (new, ~370 lines).
+- `widgets/rdma_preflight_dialog.py` (new, ~430 lines).
+- `run_tgen_server.py` (+~110 lines: 5 new routes).
+- `widgets/rdma_blast_flow_dialog.py` (+pre-flight button +
+  state tracking + closeEvent cleanup).
+- `widgets/rdma_topology_dialog.py` (same).
+- `pyproject.toml` (0.5.149 → 0.5.150).
+- `tests/test_v05150_rdma_preflight.py` (30 tests).
+
+### Verified
+```
+$ ./venv/bin/pytest tests/test_v05150_rdma_preflight.py -q
+30 passed in 0.08s
+
+$ ./venv/bin/pytest tests/ -q
+2867 passed, 1 skipped in 83.28s
+```
+
+---
+
 ## [0.5.149] - 2026-06-15
 
 **Blast RDMA Flow dialog — closes three v0.5.143-148 parity gaps.**
