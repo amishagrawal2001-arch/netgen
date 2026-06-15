@@ -446,12 +446,12 @@ class TrafficGenClientStatisticsSection():
         
         # Interface Statistics Table
         self.statistics_table = QTableWidget()
-        self.statistics_table.setRowCount(10)
+        self.statistics_table.setRowCount(12)
         self.statistics_table.setColumnCount(0)
         self.statistics_table.setVerticalHeaderLabels([
             "Status", "Sent Frames", "Received Frames", "Sent Bytes", "Received Bytes",
             "Send Frame Rate (fps)", "Receive Frame Rate (fps)", "Send Bit Rate (bps)",
-            "Receive Bit Rate (bps)", "Errors"
+            "Receive Bit Rate (bps)", "Errors", "Packets Lost", "Loss %"
         ])
         
         # Apply professional styling — bumped for readability:
@@ -1094,6 +1094,15 @@ class TrafficGenClientStatisticsSection():
                     "send_bps": 0,
                     "receive_bps": 0,
                     "errors": interface.get("errors", 0),
+                    # v0.5.139: per-iface cumulative loss aggregation.
+                    # tx_for_loss = sum of stream tx_counts associated with
+                    # this iface (either as TX or RX side of the stream).
+                    # rx_for_loss = sum of stream rx_counts for those same
+                    # streams (only counted when flow_tracking is on).
+                    # Loss = tx_for_loss - rx_for_loss, persists after the
+                    # stream stops because both numbers are cumulative.
+                    "tx_for_loss": 0,
+                    "rx_for_loss": 0,
                     "streams": {}
                 }
         
@@ -1158,6 +1167,15 @@ class TrafficGenClientStatisticsSection():
                     merged_statistics[tx_iface]["send_fps"] += tx_rate
                     merged_statistics[tx_iface]["send_bps"] += tx_rate * frame_size * 8
 
+                    # v0.5.139: contribute this stream's TX/RX counts to
+                    # the iface's loss totals. The TX side knows what was
+                    # sent; we pair it with the same stream's rx at the
+                    # rx_iface block below. The cumulative deltas persist
+                    # after stream stop.
+                    merged_statistics[tx_iface]["tx_for_loss"] += tx
+                    if flow_tracking and isinstance(rx, int):
+                        merged_statistics[tx_iface]["rx_for_loss"] += rx
+
                     # v0.4.6: DO NOT add rx_count / rx_rate into the
                     # TX-interface bucket. The pre-fix block did that
                     # under `if flow_tracking:` — operator-reported on
@@ -1187,6 +1205,14 @@ class TrafficGenClientStatisticsSection():
                     merged_statistics[rx_iface]["received_bytes"] += rx * frame_size
                     merged_statistics[rx_iface]["receive_fps"] += rx_rate
                     merged_statistics[rx_iface]["receive_bps"] += rx_rate * frame_size * 8
+
+                    # v0.5.139: same loss totals on the RX-iface column so
+                    # operators see the SAME "lost N packets" number under
+                    # both ifaces of a back-to-back pair (the streams sent
+                    # X, the peer received Y → lost X-Y, both sides agree).
+                    merged_statistics[rx_iface]["tx_for_loss"] += tx
+                    if flow_tracking and isinstance(rx, int):
+                        merged_statistics[rx_iface]["rx_for_loss"] += rx
 
                     stream_entry = merged_statistics[rx_iface]["streams"].setdefault(stream_name, {})
                     stream_entry["rx_count"] = rx
@@ -1621,7 +1647,7 @@ class TrafficGenClientStatisticsSection():
         base_rows = [
             "Status", "Sent Frames", "Received Frames", "Sent Bytes", "Received Bytes",
             "Send Frame Rate (fps)", "Receive Frame Rate (fps)", "Send Bit Rate (bps)",
-            "Receive Bit Rate (bps)", "Errors"
+            "Receive Bit Rate (bps)", "Errors", "Packets Lost", "Loss %"
         ]
 
         total_rows = len(base_rows)
@@ -1758,6 +1784,47 @@ class TrafficGenClientStatisticsSection():
             if errors > 0:
                 errors_item.setForeground(QColor("#ef4444"))  # Red for errors
             self.statistics_table.setItem(9, col, errors_item)
+
+            # (10) Packets Lost — cumulative count, persists after stream
+            # stop. v0.5.139: tx_for_loss and rx_for_loss are aggregated
+            # from the per-stream counts (lines 1141+, 1179+). Both
+            # numbers are cumulative so the diff stays around after
+            # stream stop until Clear Stats is clicked.
+            #
+            # Baseline-subtract both halves separately so Clear Stats
+            # resets the "lost" count cleanly without making the diff
+            # negative.
+            adj_tx = adjusted(iface_name, stats, "tx_for_loss")
+            adj_rx = adjusted(iface_name, stats, "rx_for_loss")
+            lost = max(0, adj_tx - adj_rx)
+            lost_item = QTableWidgetItem(format_number(lost) if adj_tx > 0 else "—")
+            lost_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            if lost > 0:
+                lost_item.setForeground(QColor("#ef4444"))  # red — same as errors
+            self.statistics_table.setItem(10, col, lost_item)
+
+            # (11) Loss % — cumulative percentage. Same baseline treatment.
+            # Never shows for ifaces with zero TX activity (avoids dividing
+            # by zero and avoids confusing operators by showing 0.00% for
+            # a pure-RX interface).
+            if adj_tx > 0:
+                loss_pct_iface = lost / adj_tx * 100.0
+                loss_text = f"{loss_pct_iface:.2f}%"
+            else:
+                loss_pct_iface = 0.0
+                loss_text = "—"
+            loss_pct_item = QTableWidgetItem(loss_text)
+            loss_pct_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            # Same color scale as the stream-stats Loss % cell for
+            # consistency: >50% red, >10% amber, >0% muted dark.
+            if loss_pct_iface > 50:
+                loss_pct_item.setForeground(QColor("#ef4444"))
+                loss_pct_item.setFont(QFont("", 11, QFont.Bold))
+            elif loss_pct_iface > 10:
+                loss_pct_item.setForeground(QColor("#f59e0b"))
+            elif loss_pct_iface > 0:
+                loss_pct_item.setForeground(QColor("#374151"))
+            self.statistics_table.setItem(11, col, loss_pct_item)
 
         # print(f"✅ Traffic statistics updated: {len(statistics)} interfaces, {max_streams} max streams.")
 

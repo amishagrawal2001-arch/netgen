@@ -2,6 +2,75 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.139] - 2026-06-14
+
+**Feature: Interface stats panel gains Packets Lost + Loss % rows.**
+
+Companion to v0.5.138. The stream-stats Loss % went None-on-stopped
+in v0.5.138 (correctly — cumulative loss there is misleading
+because rx_worker counter resets). But the operator still wants
+to see the **session loss** somewhere, and have it **persist
+after stop**.
+
+The Interface stats panel is the right place: it already shows
+cumulative byte/packet counts that persist across stop/restart.
+Two new rows fit naturally there.
+
+### New rows
+
+**Packets Lost** — `tx_for_loss − rx_for_loss`, summed across
+all streams whose TX or RX iface is this one. Cumulative count
+(persists). Red foreground when > 0.
+
+**Loss %** — `packets_lost / tx_for_loss × 100`. Color scale
+matches the stream-stats Loss % cell:
+- > 50% — red, bold
+- > 10% — amber
+- > 0% — muted dark
+- = 0% — neutral
+- iface with no TX activity (pure RX peer or idle iface): "—"
+
+Both numbers respect Clear Stats — baseline-subtracted via the
+same `adjusted()` helper as the other cumulative rows.
+
+### Aggregation logic
+
+For each running stream, the merger contributes its `tx_count`
+to BOTH ifaces' `tx_for_loss` (TX iface and RX iface), and its
+`rx_count` (when flow_tracking is on) to BOTH ifaces' `rx_for_loss`.
+
+That way, in a back-to-back pair (ens2f0np0 ↔ ens2f1np1) the
+SAME "lost N packets" appears under both columns — operators
+can read it from either side and get the same answer.
+
+### Behavior on srv06 after stream stop
+
+Operator's previous screenshot (3 stopped streams) will now show:
+- ens2f0np0: Packets Lost = (sum across all stopped streams)
+- ens2f0np0: Loss % = (cumulative %)
+- ens2f1np1: same numbers (matching back-to-back pair)
+
+Numbers stay until operator clicks Clear Stats.
+
+### Files touched
+
+- `traffic_client/statistics_section.py`:
+  - `merged_statistics[iface]` now initializes `tx_for_loss = 0`
+    and `rx_for_loss = 0`.
+  - TX-iface aggregation block adds the stream's tx_count and
+    rx_count (when flow_tracking on) to those totals.
+  - RX-iface aggregation block does the same.
+  - `statistics_table.setRowCount(12)` (was 10).
+  - Vertical header labels gain "Packets Lost" and "Loss %"
+    (both init at line ~449 and rebuild at line ~1621).
+  - Render loop adds row 10 (Packets Lost) and row 11 (Loss %)
+    cells with baseline-subtraction + color scale.
+- `tests/test_v05139_iface_loss_stats.py` — 11 cases: row
+  labels in both header lists, row count bumped, merged stats
+  initializes the loss counters, both TX and RX aggregation
+  blocks contribute, render math (zero traffic → "—", no loss,
+  partial, full, clamp-on-RX>TX, persists after stop).
+
 ## [0.5.138] - 2026-06-14
 
 **Fix: Loss % shows "—" for stopped streams (cumulative fallback removed).**
