@@ -940,7 +940,8 @@ class TrafficGenClientStatisticsSection():
 
         # 2. Persistent display caches keyed by "TG <id> - <iface>"
         if tg_prefix is not None:
-            for cache_attr in ("_last_statistics", "_iface_baselines", "_stream_baselines"):
+            for cache_attr in ("_last_statistics", "_iface_baselines",
+                               "_stream_baselines", "_latched_loss_pct"):
                 try:
                     cache = getattr(self, cache_attr, None)
                     if isinstance(cache, dict):
@@ -1959,32 +1960,41 @@ class TrafficGenClientStatisticsSection():
             # "—" placeholder so the operator sees "not yet measured"
             # instead of false-positive green.
             #
-            # v0.5.137: prefer rate-based loss when the stream is
-            # running. The cumulative count loss `(tx - rx) / tx`
-            # gives nonsense answers when the TX and RX counters
-            # started at different times.
+            # v0.5.137/138/140: rate-based loss + Spirent-style latch.
             #
-            # v0.5.138: drop the cumulative fallback entirely. When
-            # the stream is stopped, the cumulative loss is almost
-            # always misleading:
+            # When the stream is running with both rates observable,
+            # compute rate-based loss `(tx_rate - rx_rate) / tx_rate`
+            # — that answers the operator's real question, "what
+            # fraction of what I'm sending is being dropped?"
             #
-            #   - rx_worker may have stopped before tx_worker
-            #     finished flushing → huge false loss.
-            #   - rx_worker counter may have been zeroed when
-            #     re-spawned post-config-change → false loss.
-            #   - cumulative may reflect an OLD config the operator
-            #     has since changed → wrong.
+            # v0.5.140 — Spirent-style latching: when the stream is
+            # not actively running (rates went to 0, or rx_rate is
+            # None), KEEP showing the last observed loss value
+            # instead of dropping to "—". Spirent panels behave the
+            # same way: the loss column freezes on the final value
+            # so the operator can see how the test ended without
+            # racing to read it before the cell wipes.
             #
-            # Operator saw stopped streams showing 99-100% loss
-            # because of these races. Better to show None ("—")
-            # for stopped streams than a number that's almost
-            # certainly wrong. The TX Count / RX Count columns
-            # are still there if the operator wants to do the
-            # math themselves.
-            #
-            # Rate-based loss only fires when tx_rate > 0 (stream
-            # actually emitting packets) AND rx_rate is observable.
-            # Everything else → None → muted "—" in the cell.
+            # Cache is keyed by stream_id and cleared when:
+            #   - The operator clicks Clear Stats (cache purged
+            #     alongside _stream_baselines / _iface_baselines).
+            #   - tx_count drops below the previous reading
+            #     (counter reset = stream restart = new session).
+            _latched = getattr(self, "_latched_loss_pct", None)
+            if _latched is None:
+                self._latched_loss_pct = {}
+                _latched = self._latched_loss_pct
+
+            # Detect counter reset → new session → drop the latch.
+            _prev_tx = self._stream_baselines.setdefault(
+                stream_id, {}).get("_last_tx_for_latch")
+            if (stream_id and _prev_tx is not None
+                    and isinstance(raw_tx, int) and raw_tx < _prev_tx):
+                _latched.pop(stream_id, None)
+            if stream_id:
+                self._stream_baselines.setdefault(stream_id, {})[
+                    "_last_tx_for_latch"] = raw_tx
+
             if (isinstance(tx_count, int) and tx_count > 0
                     and tx_rate and tx_rate > 0
                     and rx_rate is not None):
@@ -1995,10 +2005,17 @@ class TrafficGenClientStatisticsSection():
                 # "loss" that confuses the operator.
                 _diff = tx_rate - rx_rate
                 loss_pct = max(0.0, (_diff / tx_rate) * 100.0)
+                if stream_id:
+                    _latched[stream_id] = loss_pct
+            elif stream_id and stream_id in _latched:
+                # Spirent-style latch: surface the final loss seen
+                # during the most recent running window. Stays put
+                # until the operator clears stats or restarts the
+                # stream (counter reset above).
+                loss_pct = _latched[stream_id]
             else:
-                # Stopped, warming up, or rates unavailable — no
-                # honest loss measurement exists. Renderer shows
-                # this as the muted "—" placeholder.
+                # Never had a running sample → no honest loss to
+                # report. Renderer shows the muted "—" placeholder.
                 loss_pct = None
             
             # Format interface name with TG ID if available

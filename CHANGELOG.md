@@ -2,6 +2,59 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.140] - 2026-06-15
+
+**Feature: Loss % latches the final value on stream stop (Spirent-like).**
+
+Operator referenced Spirent's behavior. In Spirent panels, when
+a stream stops the Loss % column **freezes** on the last
+observed value rather than blanking. Operator wants the same —
+read the final test result without racing to catch the cell
+before it wipes.
+
+### Behavior
+
+Stream-stats Loss % now follows this lifecycle:
+
+| State                              | Cell shows                  |
+|------------------------------------|-----------------------------|
+| Never ran (warmup, tx_count == 0)  | `—`                         |
+| Running with rates                 | rate-based loss (live)      |
+| Stopped (rates went to 0)          | **last rate-based value**   |
+| Stream restarted (counter reset)   | recompute from new session  |
+| Clear Stats clicked                | `—` again                   |
+
+The cache `self._latched_loss_pct[stream_id]` holds each stream's
+most recent rate-based loss. It's:
+
+- Updated on every running sample.
+- Surfaced when rates aren't observable (stream stopped).
+- Dropped when `tx_count` drops below the previous reading
+  (counter reset = stream restart = fresh session).
+- Purged alongside `_stream_baselines` when the operator clicks
+  Clear Stats.
+
+### Why this fits the saga
+
+v0.5.137 made loss rate-based instead of cumulative (no more
+99.39% from out-of-sync rx_worker counters). v0.5.138 hid it
+entirely on stop (cumulative was misleading). v0.5.139 moved
+the cumulative loss to the iface stats panel (where it persists
+naturally). v0.5.140 brings stream-stats in line with Spirent
+behavior — last value latched on stop.
+
+### Files touched
+
+- `traffic_client/statistics_section.py`:
+  - Loss-pct block in `update_stream_statistics_table()` gains
+    the latch lookup/update + counter-reset detection.
+  - Clear Stats purge loop includes `_latched_loss_pct`.
+- `tests/test_v05140_spirent_loss_latch.py` — 9 cases:
+  running computes + caches; stop latches; never-ran → None;
+  restart drops latch + recomputes; per-stream isolation; jitter
+  tracked; srv06 UEC scenario; zero loss latches zero; Clear
+  Stats purge.
+
 ## [0.5.139] - 2026-06-14
 
 **Feature: Interface stats panel gains Packets Lost + Loss % rows.**
