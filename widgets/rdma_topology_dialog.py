@@ -32,10 +32,11 @@ from typing import Dict, List, Optional, Tuple
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
-    QButtonGroup, QCheckBox, QComboBox, QDialog, QGridLayout, QGroupBox,
-    QHBoxLayout, QHeaderView, QLabel, QPlainTextEdit, QPushButton,
-    QRadioButton, QSpinBox, QTableWidget, QTableWidgetItem, QVBoxLayout,
-    QWidget,
+    QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
+    QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
+    QPlainTextEdit, QPushButton, QRadioButton, QScrollArea, QSpinBox,
+    QTableWidget, QTableWidgetItem, QTreeWidget, QTreeWidgetItem,
+    QVBoxLayout, QWidget,
 )
 
 from utils.rdma_topology import (
@@ -146,7 +147,12 @@ class RdmaTopologyDialog(QDialog):
     single-pair RdmaBlastFlowDialog, but with endpoint groups +
     a topology shape + per-pair stats aggregation."""
 
-    def __init__(self, parent=None) -> None:
+    def __init__(
+        self,
+        parent=None,
+        *,
+        known_servers: Optional[List[Tuple[str, str]]] = None,
+    ) -> None:
         super().__init__(parent)
         self.setWindowTitle("RDMA Topology Test")
         self.setMinimumSize(720, 640)
@@ -157,6 +163,11 @@ class RdmaTopologyDialog(QDialog):
         self._latest_jobs: Dict[str, Optional[dict]] = {}
         # Polling.
         self._poll_timer: Optional[QTimer] = None
+        # v0.5.143: list of (url, label) tuples for the "Pick from
+        # servers…" picker. Populated by the menu handler from the
+        # main window's registered server set. Empty list = no picker
+        # button rendered (operator still types lines by hand).
+        self._known_servers: List[Tuple[str, str]] = list(known_servers or [])
 
         self._build_ui()
 
@@ -221,8 +232,38 @@ class RdmaTopologyDialog(QDialog):
         eg.setHorizontalSpacing(8)
         eg.setVerticalSpacing(4)
 
-        eg.addWidget(QLabel("<b>Server endpoints</b>"), 0, 0)
-        eg.addWidget(QLabel("<b>Client endpoints</b>"), 0, 1)
+        # v0.5.143: Each side gets a header row with a "Pick from
+        # servers…" button so the operator doesn't have to type
+        # `http://srv01:5050 mlx5_0` by hand. The picker fetches
+        # /api/rdma/devices on each known TG and presents checkboxes
+        # for every (server, HCA) pair.
+        def _make_side_header(title: str, side: str) -> QWidget:
+            box = QWidget()
+            h = QHBoxLayout(box)
+            h.setContentsMargins(0, 0, 0, 0)
+            h.setSpacing(6)
+            h.addWidget(QLabel(f"<b>{title}</b>"))
+            h.addStretch(1)
+            btn = QPushButton("Pick from servers…")
+            btn.setEnabled(bool(self._known_servers))
+            if not self._known_servers:
+                btn.setToolTip(
+                    "No registered TGs visible from this dialog. "
+                    "Add servers via the main window's Server Tree, "
+                    "then reopen this dialog to use the picker."
+                )
+            else:
+                btn.setToolTip(
+                    "Browse RDMA HCAs on every registered TG and "
+                    "append selected (server, device) lines to this "
+                    "list."
+                )
+            btn.clicked.connect(lambda _=False, s=side: self._open_endpoint_picker(s))
+            h.addWidget(btn)
+            return box
+
+        eg.addWidget(_make_side_header("Server endpoints", "server"), 0, 0)
+        eg.addWidget(_make_side_header("Client endpoints", "client"), 0, 1)
 
         self._server_edit = QPlainTextEdit()
         self._server_edit.setPlaceholderText(
@@ -247,6 +288,23 @@ class RdmaTopologyDialog(QDialog):
 
         eg.addWidget(self._server_edit, 1, 0)
         eg.addWidget(self._client_edit, 1, 1)
+
+        # v0.5.143: tiny inline note clarifying that the second token
+        # is the RDMA HCA name (mlx5_0, mlx5_1, …), NOT an Ethernet
+        # interface (ens2f0np0). perftest addresses the HCA directly
+        # via libibverbs — the Ethernet iface dropdowns elsewhere in
+        # the GUI (DPDK / scapy) are not the same thing.
+        hint = QLabel(
+            "<span style='color:#64748b; font-size:11px;'>"
+            "<b>device</b> = RDMA HCA name (e.g. <code>mlx5_0</code>) — "
+            "this is the InfiniBand verbs device, NOT an Ethernet "
+            "interface (<code>ens2f0np0</code>). perftest addresses "
+            "the HCA directly via libibverbs."
+            "</span>"
+        )
+        hint.setWordWrap(True)
+        eg.addWidget(hint, 2, 0, 1, 2)
+
         eg.setColumnStretch(0, 1)
         eg.setColumnStretch(1, 1)
         root.addWidget(endpoints_box)
@@ -389,6 +447,40 @@ class RdmaTopologyDialog(QDialog):
             if rb.isChecked():
                 return sid
         return SHAPE_MESH
+
+    # ────────────────────────── v0.5.143 endpoint picker ──────────────
+
+    def _open_endpoint_picker(self, side: str) -> None:
+        """Open the multi-server endpoint picker for the given side.
+
+        side: "server" or "client" — determines which QPlainTextEdit
+        receives the appended lines on accept.
+        """
+        if side not in ("server", "client"):
+            return
+        if not self._known_servers:
+            return
+        target = self._server_edit if side == "server" else self._client_edit
+        title = (
+            "Pick Server endpoints" if side == "server"
+            else "Pick Client endpoints"
+        )
+        picker = _EndpointPickerDialog(
+            servers=self._known_servers,
+            title=title,
+            parent=self,
+        )
+        if picker.exec_() != QDialog.Accepted:
+            return
+        chosen = picker.selected_lines()
+        if not chosen:
+            return
+        existing = target.toPlainText().rstrip()
+        merged = chosen if not existing else existing + "\n" + "\n".join(chosen)
+        if existing:
+            target.setPlainText(merged)
+        else:
+            target.setPlainText("\n".join(chosen))
 
     def _refresh_pair_count(self) -> None:
         """Live-update the "X pairs" label as the operator types or
@@ -763,3 +855,164 @@ class RdmaTopologyDialog(QDialog):
         to a deleted widget (the SIGABRT-pattern lesson)."""
         self._stop_poll()
         super().closeEvent(event)
+
+
+# ─────────────────────────────────── v0.5.143 endpoint picker dialog ──
+
+
+class _EndpointPickerDialog(QDialog):
+    """Multi-server RDMA endpoint picker.
+
+    Renders a tree: one top-level row per known TG, lazily populated
+    with one checkable child per RDMA HCA via /api/rdma/devices. On
+    accept, ``selected_lines()`` returns the list of
+    ``"<tg_url> <device>"`` strings ready to drop into the parent
+    dialog's QPlainTextEdit.
+
+    Stays narrow on purpose: device name only. Operators who need
+    port/gid/label can still type those by hand after pasting — the
+    common case (one port, one GID per HCA) doesn't need ceremony.
+    """
+
+    def __init__(
+        self,
+        servers: List[Tuple[str, str]],
+        *,
+        title: str = "Pick RDMA endpoints",
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumSize(540, 420)
+        self._servers: List[Tuple[str, str]] = list(servers)
+        self._selected: List[str] = []
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(6)
+
+        hdr = QLabel(
+            "<span style='color:#475569;'>"
+            "Select one or more <b>(server, HCA)</b> pairs. Accepted "
+            "rows append to the endpoint list as "
+            "<code>&lt;tg_url&gt; &lt;device&gt;</code> lines."
+            "</span>"
+        )
+        hdr.setWordWrap(True)
+        root.addWidget(hdr)
+
+        self._tree = QTreeWidget()
+        self._tree.setColumnCount(3)
+        self._tree.setHeaderLabels(["Endpoint", "State", "Vendor / FW"])
+        self._tree.setRootIsDecorated(True)
+        self._tree.setUniformRowHeights(True)
+        root.addWidget(self._tree, 1)
+
+        self._status = QLabel("")
+        self._status.setStyleSheet("color: #64748b; font-size: 11px;")
+        root.addWidget(self._status)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+        )
+        btns.accepted.connect(self._on_accept)
+        btns.rejected.connect(self.reject)
+        root.addWidget(btns)
+
+        for url, label in self._servers:
+            self._add_server_row(url, label)
+
+        # Kick off the probes after the dialog is shown so we don't
+        # block exec_.
+        QTimer.singleShot(0, self._probe_all)
+
+    def _add_server_row(self, url: str, label: str) -> None:
+        item = QTreeWidgetItem([f"{label} — {url}", "(probing…)", ""])
+        item.setData(0, Qt.UserRole, ("server", url))
+        # Top-level rows aren't selectable/checkable — only the
+        # devices under them are.
+        item.setExpanded(True)
+        self._tree.addTopLevelItem(item)
+
+    def _probe_all(self) -> None:
+        for i in range(self._tree.topLevelItemCount()):
+            item = self._tree.topLevelItem(i)
+            _, url = item.data(0, Qt.UserRole)
+            self._probe_one(item, url)
+
+    def _probe_one(self, parent_item: QTreeWidgetItem, url: str) -> None:
+        # Late import — avoid pulling _DpdkApiWorker at module-load
+        # time so pure-test envs without PyQt's network plumbing
+        # can still import this module.
+        from widgets.rdma_blast_flow_dialog import _get_async
+
+        def _on_done(data, err, _parent=parent_item, _url=url):
+            # Qt may have already deleted the dialog by the time the
+            # response lands (closeEvent during in-flight probe).
+            try:
+                parent_text = _parent.text(0)
+            except RuntimeError:
+                return
+            if err:
+                _parent.setText(1, "error")
+                _parent.setToolTip(1, str(err))
+                self._set_status(
+                    f"{_url}: {err}", error=True,
+                )
+                return
+            devices = (data or {}).get("devices") or []
+            if not devices:
+                _parent.setText(1, "no HCAs")
+                return
+            _parent.setText(1, f"{len(devices)} HCA(s)")
+            for dev in devices:
+                name = dev.get("name", "?")
+                vendor = dev.get("vendor", "") or ""
+                fw = dev.get("fw_version", "") or ""
+                ports = dev.get("ports") or []
+                if ports:
+                    p = ports[0]
+                    state = (p.get("state") or "").upper()
+                    rate = p.get("rate") or ""
+                    state_str = f"{state} {rate}".strip()
+                else:
+                    state_str = ""
+                child = QTreeWidgetItem([
+                    name, state_str,
+                    (vendor + " / " + fw).strip(" /"),
+                ])
+                child.setFlags(child.flags() | Qt.ItemIsUserCheckable)
+                child.setCheckState(0, Qt.Unchecked)
+                child.setData(0, Qt.UserRole, ("device", _url, name))
+                _parent.addChild(child)
+            _parent.setExpanded(True)
+
+        _get_async(
+            self, f"{url.rstrip('/')}/api/rdma/devices", _on_done,
+            timeout=6.0,
+        )
+
+    def _set_status(self, msg: str, *, error: bool = False) -> None:
+        colour = "#b91c1c" if error else "#64748b"
+        self._status.setText(
+            f"<span style='color:{colour};'>{msg}</span>"
+        )
+
+    def _on_accept(self) -> None:
+        chosen: List[str] = []
+        for i in range(self._tree.topLevelItemCount()):
+            srv = self._tree.topLevelItem(i)
+            for j in range(srv.childCount()):
+                child = srv.child(j)
+                if child.checkState(0) != Qt.Checked:
+                    continue
+                data = child.data(0, Qt.UserRole)
+                if not data or data[0] != "device":
+                    continue
+                _, url, dev = data
+                chosen.append(f"{url} {dev}")
+        self._selected = chosen
+        self.accept()
+
+    def selected_lines(self) -> List[str]:
+        return list(self._selected)

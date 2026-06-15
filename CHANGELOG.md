@@ -2,6 +2,74 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.143] - 2026-06-14
+
+**RDMA Topology Test: pick endpoints from registered TGs + clarify
+"device" naming.**
+
+Operator (screenshot of the RDMA Topology Test dialog):
+
+> "allow user to pick server and client endpoints from the existing
+> server, also how does interface is selected from the menu?"
+
+Two related gaps in `widgets/rdma_topology_dialog.py`:
+
+1. The Server/Client endpoint text areas required hand-typing
+   `http://srv01:5050 mlx5_0` per line. No way to enumerate the
+   registered TG fleet. Unlike Blast a RDMA Flow (which gets the
+   server URL handed in by the menu), Topology Test asks for a list,
+   and the list was operator-typed.
+2. The second token's role was ambiguous. Operators conflated it
+   with the Ethernet iface picker used elsewhere in the GUI
+   (`ens2f0np0`), when really it's the RDMA HCA name (`mlx5_0`)
+   addressed directly via libibverbs.
+
+Plus a latent bug: the pre-populate path called
+`self._selected_servers()` (typo). The surrounding `try/except`
+swallowed the AttributeError, so the starter line never showed up.
+
+### What's new
+
+* **New "Pick from servers…" button** next to each side header.
+  Opens a multi-server picker (`_EndpointPickerDialog`) that:
+    - Lists every registered TG (from `self.server_interfaces`).
+    - Lazily fetches `/api/rdma/devices` per server (async — doesn't
+      block the GUI thread).
+    - Renders a tree: server → checkboxes per HCA, showing state +
+      vendor/FW so the operator can see at a glance which HCA is
+      Active / Down.
+    - On accept, appends `<tg_url> <device>` lines to the parent
+      text area (preserves any lines already there).
+  Button is disabled with a tooltip when no TGs are registered yet.
+* **Inline help line** under the endpoint editors:
+  > **device** = RDMA HCA name (e.g. `mlx5_0`) — this is the
+  > InfiniBand verbs device, NOT an Ethernet interface
+  > (`ens2f0np0`). perftest addresses the HCA directly via
+  > libibverbs.
+* **Menu wiring**: `traffic_client/rdma_menu_actions.py` now passes
+  the registered-TG set into the dialog via the new
+  `known_servers=[(url, label), …]` kwarg.
+* **Typo fix**: `self._selected_servers()` →
+  `self._get_selected_servers()` so the starter-line
+  pre-populate now actually runs when one or more servers are
+  highlighted in the tree.
+
+### Files changed
+- `widgets/rdma_topology_dialog.py` (constructor kwarg, picker
+  button, inline help, new `_EndpointPickerDialog` class).
+- `traffic_client/rdma_menu_actions.py` (pass `known_servers`,
+  fix typo).
+- `pyproject.toml` (0.5.142 → 0.5.143).
+- `tests/test_v05143_topology_endpoint_picker.py` (19 tests).
+
+### Verified
+```
+$ ./venv/bin/pytest tests/test_v05143_topology_endpoint_picker.py -q
+19 passed in 0.06s
+```
+
+---
+
 ## [0.5.142] - 2026-06-15
 
 **Hotfix: cold-start client AttributeError on _stream_baselines.**

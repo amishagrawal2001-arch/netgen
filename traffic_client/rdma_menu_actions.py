@@ -245,14 +245,27 @@ class TrafficGenClientRDMAMenuActions:
         Non-blocking via show() — operator can run a topology stress
         test in parallel with other RDMA / DPDK dialogs."""
         from widgets.rdma_topology_dialog import RdmaTopologyDialog
-        dlg = RdmaTopologyDialog(parent=self)
+
+        # v0.5.143: pass the full registered-TG set into the dialog so
+        # its new "Pick from servers…" buttons can offer every known
+        # endpoint, not just the ones currently highlighted in the
+        # server tree. Falls back to an empty list if the host hasn't
+        # populated server_interfaces yet (the picker buttons gray out).
+        known_servers = []
+        for srv in getattr(self, "server_interfaces", []) or []:
+            url, label = self._server_url_label(srv)
+            if url:
+                known_servers.append((url, label))
+
+        dlg = RdmaTopologyDialog(parent=self, known_servers=known_servers)
 
         # Pre-populate the endpoint editors with sensible starter
         # text using the currently-selected servers' URLs (if any) +
         # an mlx5_0 placeholder. Operator usually adjusts; this just
         # saves them from typing the very first line by hand.
+        # (v0.5.143: fixed latent typo — was self._selected_servers().)
         try:
-            selected = self._selected_servers() or []
+            selected = self._get_selected_servers() or []
             if selected:
                 lines = []
                 for srv in selected:
