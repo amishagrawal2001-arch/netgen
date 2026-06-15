@@ -2,6 +2,74 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.157] - 2026-06-15
+
+**Slice B: Blast + Topology multi-worker hygiene.**
+
+Operator: "go A first then B, and then C" — this is slice B,
+closing the four bugs the v0.5.156 ship surfaced in the parallel-
+worker code paths.
+
+### #1 — `_host_info_cache` reset on every Start
+
+Before: the cache was populated once (by the 🚀 Max BW button)
+and lived for the lifetime of the dialog. Choosing a different
+HCA between Starts kept the previous HCA's NUMA snapshot —
+workers got pinned to the wrong NUMA node, hitting the cross-
+NUMA penalty we fixed in v0.5.131.
+
+Now both `_proceed_with_start` (Blast) and
+`_proceed_with_topology_start` (Topology) drop the cache on
+every Start. The next 🚀 Max BW click re-queries `/api/rdma/
+host_info` against the current HCA.
+
+### #2 — TOTAL line includes worker 0
+
+Before: `_maybe_emit_total` only summed extras 1..N-1 and printed
+"extras only — worker 0 line above is separate". Operator had to
+add the "[client] done ... BW=X" row to the "[TOTAL extras only]"
+row by hand.
+
+Now: `_on_job_resp` captures worker 0's `final_bw_avg_gbps` and
+`final_msg_rate_mpps` into `_client_bw` / `_client_msgrate` when
+the client side finishes. `_maybe_emit_total` adds those to the
+extras sum and emits one canonical
+`[TOTAL across N worker(s)] BW=X Gbps  MsgRate=Y Mpps`.
+
+Single-worker runs also benefit: TOTAL now fires after worker 0
+finishes even when `_extra_workers` is empty.
+
+### #3 — `closeEvent` resets multi-worker state
+
+Before: closing the Blast dialog and reopening it kept stale
+entries in `_extra_workers` (poll loop would tick against
+dead job_ids), kept `_total_emitted=True` (suppressed the next
+run's summary), and kept the previous HCA's `_host_info_cache`.
+
+Now both `closeEvent` paths reset: `_extra_workers = []`,
+`_total_emitted = False`, `_client_bw = None`,
+`_client_msgrate = None`, `_host_info_cache = None`/`{}`.
+Topology also clears `_pair_extra_workers`.
+
+### #4 — `cpu_pin` clamped to `cpu_count - 1`
+
+Before: when `host_info_cache` was missing OR
+`pick_workers_for_hca` fell back to a linear range, the dialog
+could pass `cpu_pin=32` on a 16-core host. `taskset` rejects with
+"Invalid argument" and the worker silently fails to start.
+
+Now both `_start_extra_workers` (Blast) and
+`_start_pair_extra_workers` (Topology) clamp every picked CPU to
+`cpu_count - 1` whenever `host_info` has a cpu_count. Multiple
+workers land on the same top CPU — perftest's per-QP isolation
+still gives real parallelism even when the taskset arg collides.
+
+### Tests
+
+`tests/test_v05157_blast_multiworker_hygiene.py` — 11 new tests
+covering every fix above. Combined RDMA regression sweep (Slice A,
+v0.5.155, v0.5.153, v0.5.152, v0.5.150 + this slice): 124 passing.
+
 ## [0.5.156] - 2026-06-15
 
 **Slice A: Topology dialog gains Blast's v0.5.152-155 quality

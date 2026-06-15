@@ -1240,6 +1240,20 @@ class RdmaBlastFlowDialog(QDialog):
                 cpus = list(range(worker_count))
         else:
             cpus = list(range(worker_count))
+        # v0.5.157: clamp every CPU ID to the host's actual
+        # cpu_count-1 ceiling. When the host_info cache is empty
+        # OR pick_workers_for_hca falls back to linear range, we
+        # can otherwise pin to a CPU that doesn't exist (e.g.
+        # operator typed 32 workers on a 16-core host) — taskset
+        # then errors out with "Invalid argument" and the worker
+        # fails to start. Clamping here makes that case spawn N
+        # workers on the same top CPU (still useful — perftest
+        # picks distinct QPs) rather than failing silently.
+        cpu_count = None
+        if info:
+            cpu_count = info.get("cpu_count")
+        if isinstance(cpu_count, int) and cpu_count > 0:
+            cpus = [min(int(c), cpu_count - 1) for c in cpus]
 
         from urllib.parse import urlparse as _urlparse
         # Worker 0 already running (started via the main flow).
@@ -1508,6 +1522,18 @@ class RdmaBlastFlowDialog(QDialog):
         }
         # Reset extra-workers tracking for this run.
         self._extra_workers = []
+        # v0.5.157: also reset the TOTAL-emit guard and worker-0
+        # final stats so each new Start gets a clean slate. Without
+        # these, a 2nd Start in the same dialog session would skip
+        # the TOTAL line (idempotency guard from the prior run) and
+        # carry stale worker-0 BW/MsgRate into the new sum.
+        self._total_emitted = False
+        self._client_bw = None
+        self._client_msgrate = None
+        # v0.5.157: refresh the host_info cache per-Start so a HCA
+        # change between Starts re-queries NUMA topology instead of
+        # quietly reusing the previous HCA's home node.
+        self._host_info_cache = None
 
         # v0.3.19: reset per-side finished tracking + render-dedup so
         # a second run in the same dialog session doesn't see stale
@@ -1712,13 +1738,20 @@ class RdmaBlastFlowDialog(QDialog):
         # Compute the TOTAL. Only sum the CLIENT-side BW (the
         # server-side BW row from perftest is usually identical to
         # the client's; double-counting would mislead).
+        # v0.5.157: include worker 0's client BW + MsgRate in the
+        # sum so operators see one grand-total line instead of
+        # having to add the "[client] done" row to a separate
+        # "extras-only" row manually.
         total_bw = 0.0
         total_mr = 0.0
         n = 0
-        # Worker 0 final stats live on the latest job dicts cached
-        # by the per-worker `_on_job_resp`. For simplicity we leave
-        # worker 0's stats to be visible in its own [client] done
-        # line and only sum extras explicitly.
+        w0_bw = getattr(self, "_client_bw", None)
+        w0_mr = getattr(self, "_client_msgrate", None)
+        if isinstance(w0_bw, (int, float)):
+            total_bw += float(w0_bw)
+            n += 1
+        if isinstance(w0_mr, (int, float)):
+            total_mr += float(w0_mr)
         for w in self._extra_workers:
             bw = w.get("client_bw")
             mr = w.get("client_msgrate")
@@ -1730,11 +1763,9 @@ class RdmaBlastFlowDialog(QDialog):
         if n == 0:
             return
         self._stats_view.append(
-            f"\n[TOTAL across {n + 1} workers] (extras only — "
-            f"worker 0 line above is separate) "
-            f"extra-workers BW={total_bw:.2f} Gbps  "
-            f"MsgRate={total_mr:.4f} Mpps. Add to worker 0's line "
-            f"for grand total."
+            f"\n[TOTAL across {n} worker(s)] "
+            f"BW={total_bw:.2f} Gbps  "
+            f"MsgRate={total_mr:.4f} Mpps"
         )
         self._total_emitted = True
 
@@ -1808,11 +1839,26 @@ class RdmaBlastFlowDialog(QDialog):
                 self._server_finished = True
             elif side == "client":
                 self._client_finished = True
+                # v0.5.157: capture worker-0 client final stats so
+                # the TOTAL summary can include this worker, not
+                # just extras 1..N-1. The extras pipeline already
+                # stores client_bw / client_msgrate on each extra-
+                # worker dict; worker 0 lives on the parent dialog
+                # state, mirror the same field names.
+                if job.get("final_bw_avg_gbps") is not None:
+                    self._client_bw = job.get("final_bw_avg_gbps")
+                if job.get("final_msg_rate_mpps") is not None:
+                    self._client_msgrate = job.get("final_msg_rate_mpps")
 
         s_done = (self._server_job_id is None) or self._server_finished
         c_done = (self._client_job_id is None) or self._client_finished
         if s_done and c_done:
             self._on_both_finished()
+        # v0.5.157: worker 0 done might be the last thing we were
+        # waiting for to emit the TOTAL line. _maybe_emit_total is
+        # idempotent — the early-return on _total_emitted protects
+        # against double-emission.
+        self._maybe_emit_total()
 
     def _render_job_into_stats(self, side: str, job: dict) -> None:
         """Append a one-line summary to the live stats panel."""
@@ -1984,6 +2030,16 @@ class RdmaBlastFlowDialog(QDialog):
         # — operator already accepted the dialog close, no point
         # blocking on the cleanup result.
         self._cleanup_preflight_state_ids()
+        # v0.5.157: drop all multi-worker state so a reopen via
+        # the menu lands on a clean dialog. Without this, a 2nd
+        # session would carry stale worker dicts in _extra_workers
+        # (polled forever against a closed perftest job_id) and the
+        # TOTAL-emit guard would suppress the next Start's summary.
+        self._extra_workers = []
+        self._total_emitted = False
+        self._client_bw = None
+        self._client_msgrate = None
+        self._host_info_cache = None
         event.accept()
 
     def _cleanup_preflight_state_ids(self) -> None:

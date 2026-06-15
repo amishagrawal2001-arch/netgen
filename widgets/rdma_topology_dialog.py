@@ -969,6 +969,14 @@ class RdmaTopologyDialog(QDialog):
         self._pair_jobs = {p.pair_index: {"server": None, "client": None}
                            for p in plans}
         self._latest_jobs = {}
+        # v0.5.157: drop the previous run's per-pair extras + the
+        # cached host_info so an HCA change between Starts re-
+        # queries NUMA topology. Same fix as Blast _proceed_with_
+        # start. Without these, polling loops keep ticking against
+        # the previous run's stale job_ids.
+        if hasattr(self, "_pair_extra_workers"):
+            self._pair_extra_workers.clear()
+        self._host_info_cache = {}
         self._populate_stats_table_skeleton(plans)
         self._start_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
@@ -1116,6 +1124,15 @@ class RdmaTopologyDialog(QDialog):
             cpus = pick.get("cpus") or list(range(worker_count))
         except Exception:
             cpus = list(range(worker_count))
+        # v0.5.157: clamp to cpu_count - 1 so a high worker_count
+        # on a small-core host doesn't ask taskset for a CPU that
+        # doesn't exist (matches the Blast _start_extra_workers
+        # fix). Multiple workers can land on the same top CPU —
+        # perftest's QP-per-worker isolation still gives us real
+        # parallelism even if the taskset arg collides.
+        cpu_count = info.get("cpu_count")
+        if isinstance(cpu_count, int) and cpu_count > 0:
+            cpus = [min(int(c), cpu_count - 1) for c in cpus]
 
         if not hasattr(self, "_pair_extra_workers"):
             self._pair_extra_workers: Dict[int, List[Dict[str, Any]]] = {}
@@ -1403,6 +1420,11 @@ class RdmaTopologyDialog(QDialog):
                 except Exception:
                     pass
         self._preflight_state_ids.clear()
+        # v0.5.157: drop per-pair extras + cached host_info so a
+        # reopen via the menu starts clean.
+        if hasattr(self, "_pair_extra_workers"):
+            self._pair_extra_workers.clear()
+        self._host_info_cache = {}
         super().closeEvent(event)
 
 
