@@ -2,6 +2,121 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.153] - 2026-06-15
+
+**Blast RDMA Flow: consistency bug sweep.**
+
+Operator: "check all the bugs in Blast RDMA flows, seems there are
+some inconsistancy issue what error is reporting and what is
+configured."
+
+An Explore-agent audit found 8 inconsistencies between configured
+state and reported state. v0.5.153 ships the top 6 operator-
+blocking + resource-leak fixes.
+
+### #1 — Pre-flight auto-suggest stops creating the trap
+
+Was hardcoding `10.42.0.1/24 + 10.42.0.2/24` for the 2-iface case
+— same subnet, the literal trap pre-flight exists to prevent.
+Validator caught it on Validate (operator screenshot), but the
+dialog shouldn't have proposed it.
+
+The rewritten `_populate_config_rows()`:
+- Walks every probe's existing IPv4 subnets, collects them in
+  `occupied`.
+- For each iface that doesn't have an IPv4, picks the next
+  `10.N.0.0/24` not in `occupied` AND not already proposed
+  to any sibling iface.
+- Skips ifaces that already have an IPv4 — those don't need a
+  test CIDR; the box stays empty with a clarifying note
+  ("already has IPv4 (10.43.0.2/24); leave empty to skip").
+- Each empty CIDR box gets a placeholder ("(leave empty to
+  skip)") so empty ≠ broken.
+
+### #2 — Pre-flight "Pre-flight OK" verdict + Test CIDR section consistency
+
+When the verdict is green, the Test CIDR fields are empty AND
+the status line says "All endpoints already have IPv4 addresses
+in non-conflicting subnets. Apply is only needed if you want to
+add additional test IPs." No more "OK but here's auto-fill that
+fails Validate" contradiction.
+
+### #3 — Auto-apply-on-Start validates before configure
+
+Was POSTing `/configure` directly. If `10.43.0.0/24` was already
+a kernel route, the apply silently failed AFTER the operator
+committed to Start. Now `_apply_test_ips_then_start()`:
+1. POST `/api/rdma/test_ifaces/validate` with the picked CIDRs.
+2. If any issue has `severity: "error"` → abort with the
+   first error message, point at Pre-flight.
+3. Only on validate-ok → POST `/configure` → on success →
+   proceed with perftest start.
+
+### #4 — Start-probe blocker detection is now comprehensive
+
+`_detect_same_subnet_trap()` only caught subnet collisions.
+DOWN ports and missing IPs returned False → Start fired → perftest
+died with "QP→RTR" → operator saw same error string with the
+wrong root cause.
+
+New `_detect_start_blockers()` catches four reason codes in
+priority order:
+- `probe_failed` — either probe errored (timeout, server down).
+- `down_port`    — at least one port is not ACTIVE.
+- `missing_ip`   — at least one iface has no IPv4.
+- `same_subnet`  — both ifaces in one subnet on same host.
+
+### #5 — Confirm dialog is now contextual
+
+Renamed `_SameSubnetTrapConfirmDialog` →
+`_StartBlockerConfirmDialog` (old name kept as alias). Builds
+its title, body text, and button set per reason:
+- Auto-fixable reasons (`missing_ip`, `same_subnet`) offer
+  **Apply & Start** / **Continue anyway** / **Cancel**.
+- Non-fixable reasons (`down_port`, `probe_failed`) offer
+  **Open Pre-flight…** / **Continue anyway** / **Cancel** —
+  netgen can't bring a link up or revive a dead server, so
+  routing the operator into Pre-flight for manual investigation
+  is the right affordance.
+
+The new "Open Pre-flight" choice on the confirm dialog routes
+the operator's flow into the Pre-flight panel without aborting
+the test setup entirely.
+
+### #6 — Stop button fires preflight cleanup
+
+`_on_stop_clicked()` now invokes `_cleanup_preflight_state_ids()`
+(same code path as `closeEvent`). Apply IPs → Start → Stop now
+leaves the wire clean instead of waiting for dialog close.
+
+### Files changed
+- `widgets/rdma_blast_flow_dialog.py` (~150 lines: new
+  `_detect_start_blockers`, generalized `_StartBlockerConfirmDialog`,
+  validate-then-configure auto-apply, Stop cleanup).
+- `widgets/rdma_preflight_dialog.py` (~70 lines: smart
+  CIDR suggester + idle status banner + placeholder).
+- `pyproject.toml` (0.5.152 → 0.5.153).
+- `tests/test_v05153_blast_consistency_sweep.py` (19 tests).
+- `tests/test_v05152_blast_compact_and_autotrap.py` (4 tests
+  updated for the rename).
+
+### Deferred to v0.5.154
+Audit also flagged BUG #4 (Keep checkbox needs a manual cleanup
+affordance on the Blast dialog), BUG #6 (status-label staleness
+on rapid close), and BUG #8 (Loopback port-count clamp). Plus
+the DOWN-port color-coding in the device picker combo.
+
+### Verified
+```
+$ ./venv/bin/pytest tests/test_v05153_blast_consistency_sweep.py -q
+19 passed in 0.08s
+
+$ ./venv/bin/pytest tests/ -q -k "rdma or blast or topology or perftest or qp"
+403 passed, 2522 deselected
+```
+
+---
+
 ## [0.5.152] - 2026-06-15
 
 **Blast RDMA dialog: compact params, taller stats, auto-trap-

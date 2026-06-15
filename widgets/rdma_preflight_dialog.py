@@ -441,26 +441,85 @@ class RdmaPreflightDialog(QDialog):
     # ──────────────────────────── temporary-IP config UI
 
     def _populate_config_rows(self) -> None:
-        # Build rows for each unique kernel iface seen across all
-        # endpoints. Auto-suggest a CIDR from the v0.5.150
-        # auto-picker. Operator can override any cell.
+        """v0.5.153 rewrite: walk every probe's existing IPv4
+        subnets, propose CIDRs that
+          (a) don't collide with any existing iface IP,
+          (b) don't share a subnet with any sibling iface's
+              suggestion (the exact trap operators are escaping),
+          (c) skip ifaces that already have a valid IPv4 — those
+              don't need a test CIDR; the suggestion box is empty
+              with a clarifying note.
+
+        Was: hardcoded `10.42.0.1/24 + 10.42.0.2/24` for the
+        2-iface case → SAME subnet, the literal trap. Operator
+        screenshot showed the validate banner rejecting the dialog's
+        own auto-fill."""
+        import ipaddress as _ip
+
         seen: List[Tuple[str, str]] = []  # (url, iface)
+        existing_v4: Dict[str, List[_ip.IPv4Network]] = {}
         for (url, _hca), p in self._probes.items():
             iface = p.get("kernel_iface")
             if iface and (url, iface) not in seen:
                 seen.append((url, iface))
+            # Collect existing IPv4 networks per iface for both the
+            # "already has IP" detection and the avoid-collision
+            # picker below.
+            if iface:
+                nets = existing_v4.setdefault(iface, [])
+                for cidr in p.get("ip_addresses") or []:
+                    if ":" in cidr.split("/")[0]:
+                        continue
+                    try:
+                        nets.append(_ip.IPv4Interface(cidr).network)
+                    except Exception:
+                        continue
 
-        # Suggest one /24 per iface — sequential within
-        # 10.42.0.0/16.
+        # Build the global occupied-subnet set — every existing
+        # IPv4 network across all probed ifaces. Used to skip
+        # those /24s when proposing fresh ones.
+        occupied: set = set()
+        for nets in existing_v4.values():
+            for n in nets:
+                occupied.add(n)
+
+        # Sequential /24s in 10.42.0.0/16 → 10.43, 10.44, … each
+        # iface that NEEDS a test IP gets the next one not in
+        # `occupied` AND not already proposed for a sibling.
         suggestions: Dict[Tuple[str, str], str] = {}
-        for i, (url, iface) in enumerate(seen):
-            suggestions[(url, iface)] = f"10.42.{i}.{1 + (i % 2)}/24"
-        # Better: alternate .1 / .2 within the same subnet for the
-        # FIRST pair so the operator's typical 2-iface case gets a
-        # subnet pair out of the box.
-        if len(seen) == 2:
-            suggestions[seen[0]] = "10.42.0.1/24"
-            suggestions[seen[1]] = "10.42.0.2/24"
+        proposed_nets: set = set()
+        next_octet = 42
+        for url, iface in seen:
+            if existing_v4.get(iface):
+                # Already has an IPv4 — leave the CIDR empty so
+                # Apply doesn't try to add yet another IP.
+                continue
+            # Walk forward through 10.<n>.0.0/24 until we find one
+            # not occupied and not proposed.
+            while next_octet < 200:
+                cand = _ip.IPv4Network(f"10.{next_octet}.0.0/24")
+                if (cand not in occupied
+                        and cand not in proposed_nets):
+                    suggestions[(url, iface)] = f"10.{next_octet}.0.1/24"
+                    proposed_nets.add(cand)
+                    break
+                next_octet += 1
+            next_octet += 1
+
+        # Surface whether any iface needs a fix at all. If every
+        # iface already has an IPv4 in a non-conflicting subnet
+        # (i.e. the verdict was "Pre-flight OK"), we still render
+        # the rows but all CIDRs start empty and the note column
+        # explains why.
+        needs_fix = any((url, iface) in suggestions for url, iface in seen)
+        if not needs_fix:
+            self._status.setText(
+                "<span style='color:#0369a1; font-size:11px;'>"
+                "All endpoints already have IPv4 addresses in "
+                "non-conflicting subnets. Apply is only needed if "
+                "you want to add additional test IPs."
+                "</span>"
+            )
 
         # Clear existing rows below the header.
         for row_dict in self._config_rows:
@@ -476,9 +535,23 @@ class RdmaPreflightDialog(QDialog):
             cidr_edit = QLineEdit(suggestions.get((url, iface), ""))
             cidr_edit.setMinimumWidth(160)
             cidr_edit.setFont(QFont("Menlo"))
+            cidr_edit.setPlaceholderText(
+                "(leave empty to skip)")
             note_lbl = QLabel("")
             note_lbl.setStyleSheet("color:#64748b; font-size:11px;")
             note_lbl.setWordWrap(True)
+            existing = existing_v4.get(iface) or []
+            if existing:
+                # v0.5.153: explicit note so the operator knows
+                # WHY the CIDR field is empty by default. No more
+                # "already on, will be skipped" surprise on
+                # Validate.
+                note_lbl.setText(
+                    f"<span style='color:#0369a1;'>"
+                    f"already has IPv4 ({existing[0]}); "
+                    f"leave empty to skip"
+                    f"</span>"
+                )
             self._config_grid.addWidget(iface_lbl, i, 0)
             self._config_grid.addWidget(cidr_edit, i, 1)
             self._config_grid.addWidget(note_lbl, i, 2)

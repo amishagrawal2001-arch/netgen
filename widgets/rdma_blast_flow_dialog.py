@@ -132,8 +132,8 @@ def _detect_same_subnet_trap(srv_probe: dict, cli_probe: dict):
     "10.10.0.0/24") to surface in the confirm dialog.
 
     Treats DOWN ports as "no trap" — there's a different problem
-    to fix first (link state), and the start path will already
-    surface that via perftest's own error.
+    to fix first (link state). v0.5.153: `_detect_start_blockers`
+    catches DOWN ports and missing IPs separately.
     """
     import ipaddress as _ip
     srv_ips = (srv_probe or {}).get("ip_addresses") or []
@@ -160,6 +160,55 @@ def _detect_same_subnet_trap(srv_probe: dict, cli_probe: dict):
         if net in srv_nets:
             return True, net
     return False, None
+
+
+def _detect_start_blockers(srv_probe: dict, cli_probe: dict):
+    """v0.5.153: broader detection. Returns (reason, detail) where
+    reason is one of:
+      * `"probe_failed"` — either probe had an error key (network
+        flake, server down, etc).
+      * `"down_port"`    — at least one port is not ACTIVE; perftest
+        will fail at QP→RTR with no auto-fix possible.
+      * `"missing_ip"`   — at least one iface has no IPv4 address;
+        perftest needs an IP for RoCEv2 GID resolution. AUTO-fixable
+        via test_ifaces/configure.
+      * `"same_subnet"`  — both ifaces in one IPv4 subnet on the
+        same host; routing-via-lo trap. AUTO-fixable.
+      * `None`           — clean; proceed with start.
+
+    `detail` is a short string the confirm dialog substitutes into
+    its message (the shared subnet, the DOWN port name, etc).
+
+    Order matters: probe_failed and down_port are surfaced BEFORE
+    missing_ip / same_subnet because they can't be auto-fixed.
+    """
+    # 1. Probe errors take precedence.
+    for side, p in (("server", srv_probe), ("client", cli_probe)):
+        if not p or p.get("error"):
+            return "probe_failed", f"{side}: {p.get('error') if p else 'no data'}"
+    # 2. DOWN ports — no auto-fix.
+    for side, p in (("server", srv_probe), ("client", cli_probe)):
+        state = (p.get("state") or "").upper()
+        if state and state != "ACTIVE":
+            return "down_port", (
+                f"{p.get('hca', '?')} on {side} is {state}"
+            )
+    # 3. Missing IPv4 — auto-fixable.
+    def _has_v4(p):
+        for cidr in p.get("ip_addresses") or []:
+            if ":" not in cidr.split("/")[0]:
+                return True
+        return False
+    for side, p in (("server", srv_probe), ("client", cli_probe)):
+        if not _has_v4(p):
+            return "missing_ip", (
+                f"{p.get('kernel_iface', '?')} on {side} has no IPv4"
+            )
+    # 4. Same-subnet trap.
+    trapped, net = _detect_same_subnet_trap(srv_probe, cli_probe)
+    if trapped:
+        return "same_subnet", net
+    return None, None
 
 
 def _get_async(parent: QObject, url: str, on_done, *, timeout: float = 5.0) -> None:
@@ -942,23 +991,22 @@ class RdmaBlastFlowDialog(QDialog):
     def _on_auto_probe_complete(
         self, server_dev: str, client_dev: str,
     ) -> None:
-        """Both probes returned. Look for the same-subnet trap;
-        otherwise proceed."""
+        """Both probes returned. v0.5.153: use the broader
+        `_detect_start_blockers()` instead of subnet-only check —
+        also catches DOWN ports, missing IPs, and probe failures
+        and routes each to a contextual confirm."""
         srv_probe = self._probe_buffer.get("server", {}) or {}
         cli_probe = self._probe_buffer.get("client", {}) or {}
-        trapped, conflict_net = _detect_same_subnet_trap(
-            srv_probe, cli_probe,
-        )
-        if not trapped:
+        reason, detail = _detect_start_blockers(srv_probe, cli_probe)
+        if reason is None:
             self._proceed_with_start(server_dev, client_dev)
             return
 
-        # Trap detected. Pop the 3-way confirm.
         srv_iface = srv_probe.get("kernel_iface") or "<server-iface>"
         cli_iface = cli_probe.get("kernel_iface") or "<client-iface>"
-        dlg = _SameSubnetTrapConfirmDialog(
+        dlg = _StartBlockerConfirmDialog(
+            reason=reason, detail=detail,
             srv_iface=srv_iface, cli_iface=cli_iface,
-            shared_net=conflict_net,
             parent=self,
         )
         result = dlg.exec_()
@@ -968,13 +1016,20 @@ class RdmaBlastFlowDialog(QDialog):
             self._set_status_ok("Start cancelled.")
             return
         if choice == "continue":
-            # Operator opted to run anyway.
             self._proceed_with_start(server_dev, client_dev)
             return
-        # choice == "apply"
-        # Auto-pick two different /24s from the v0.5.150 helper,
-        # apply them via /api/rdma/test_ifaces/configure, then
-        # proceed once the apply returns.
+        if choice == "open_preflight":
+            # Operator wants to investigate manually — open the
+            # Pre-flight dialog and re-enable Start. They can
+            # apply fixes and click Start again.
+            self._start_btn.setEnabled(True)
+            self._set_status_ok("Opening Pre-flight…")
+            self._on_preflight_clicked()
+            return
+        # choice == "apply" — only valid for missing_ip and
+        # same_subnet. For down_port / probe_failed the dialog
+        # doesn't offer Apply, so the operator can only Continue
+        # / Cancel / Open Pre-flight.
         self._apply_test_ips_then_start(
             srv_iface=srv_iface, cli_iface=cli_iface,
             server_dev=server_dev, client_dev=client_dev,
@@ -985,21 +1040,53 @@ class RdmaBlastFlowDialog(QDialog):
         srv_iface: str, cli_iface: str,
         server_dev: str, client_dev: str,
     ) -> None:
-        """Auto-pick two /24 CIDRs, POST configure, on success
-        track the state_id and proceed with Start."""
-        # Hard-code a pair of /24s the server-side validator will
-        # accept (the server's auto_pick_subnets() is the canonical
-        # source — but for an immediate single-pair use case the
-        # 10.42.0.0/24 / 10.43.0.0/24 pair almost always works).
+        """Auto-pick CIDRs, VALIDATE, then POST configure. On
+        success track the state_id and proceed with Start.
+
+        v0.5.153 fix: previous version POSTed configure directly
+        without validating. If 10.43.0.0/24 was already a kernel
+        route, the apply failed AFTER the operator already
+        committed to Start. Now we validate first and refuse on
+        any hard error issue (route overlap, existing IP, bad
+        CIDR), telling the operator to open Pre-flight for manual
+        resolution.
+        """
         cidr_pair = ("10.42.0.1/24", "10.43.0.1/24")
-        body = {
-            "ifaces": [
-                {"name": srv_iface, "cidr": cidr_pair[0]},
-                {"name": cli_iface, "cidr": cidr_pair[1]},
-            ],
-            "disable_rp_filter": True,
-        }
-        self._set_status_ok("Applying temporary test IPs…")
+        ifaces = [
+            {"name": srv_iface, "cidr": cidr_pair[0]},
+            {"name": cli_iface, "cidr": cidr_pair[1]},
+        ]
+        self._set_status_ok("Validating test IPs…")
+
+        def _on_validated(data, err):
+            if err:
+                self._start_btn.setEnabled(True)
+                self._set_status_error(
+                    f"Validate failed: {err}. Open Pre-flight."
+                )
+                return
+            if not (data or {}).get("ok"):
+                issues = (data or {}).get("issues") or []
+                err_lines = [
+                    f"{i.get('iface', '?')}: {i.get('message', '')}"
+                    for i in issues
+                    if i.get("severity") == "error"
+                ]
+                msg = "; ".join(err_lines) or "validation failed"
+                self._start_btn.setEnabled(True)
+                self._set_status_error(
+                    f"Auto-apply blocked: {msg}. Open Pre-flight "
+                    f"to pick non-conflicting CIDRs."
+                )
+                return
+            # Validation passed — now configure.
+            self._set_status_ok("Applying temporary test IPs…")
+            _post_async(
+                self,
+                f"{self._server_tg_url}/api/rdma/test_ifaces/configure",
+                {"ifaces": ifaces, "disable_rp_filter": True},
+                _on_applied,
+            )
 
         def _on_applied(data, err):
             if err or not (data or {}).get("ok"):
@@ -1022,8 +1109,8 @@ class RdmaBlastFlowDialog(QDialog):
 
         _post_async(
             self,
-            f"{self._server_tg_url}/api/rdma/test_ifaces/configure",
-            body, _on_applied,
+            f"{self._server_tg_url}/api/rdma/test_ifaces/validate",
+            {"ifaces": ifaces}, _on_validated,
         )
 
     # ───────── v0.5.151 QP-verify help
@@ -1490,6 +1577,11 @@ class RdmaBlastFlowDialog(QDialog):
 
     def _on_stop_clicked(self) -> None:
         self._stop_btn.setEnabled(False)
+        # v0.5.153: Stop also fires preflight cleanup. Previously
+        # only closeEvent did, so operator hitting Stop and leaving
+        # the dialog open kept stale test IPs around indefinitely.
+        # Cleanup is idempotent; re-cleaning a state_id is a no-op.
+        self._cleanup_preflight_state_ids()
         # Stop both halves; forget pair on each side (idempotent).
         if self._server_job_id:
             _post_async(
@@ -1773,60 +1865,63 @@ class _QpVerifyHelpDialog(QDialog):
 # ─────────────────────────────────── v0.5.152 same-subnet trap confirm ──
 
 
-class _SameSubnetTrapConfirmDialog(QDialog):
-    """Pops on Start when the auto-probe detects the same-subnet
-    trap. Three choices:
+class _StartBlockerConfirmDialog(QDialog):
+    """v0.5.153: generalized from v0.5.152's
+    `_SameSubnetTrapConfirmDialog`. Pops on Start when the auto-
+    probe detects any of four blockers:
 
-      * **Apply & Start** — auto-pick test CIDRs, configure, then
-        proceed with perftest start.
-      * **Continue anyway** — operator overrides; perftest will
-        almost certainly fail at QP→RTR, but maybe they want to
-        see the error themselves or have an out-of-band fix.
-      * **Cancel** — abort Start.
+      * `probe_failed` — one of the probes errored (timeout, server
+        down, etc). Only Cancel / Continue offered (no auto-fix).
+      * `down_port`    — at least one port is not ACTIVE. Only
+        Cancel / Continue (auto-fix can't bring a link up).
+      * `missing_ip`   — at least one iface has no IPv4. Apply auto-
+        configures test IPs (auto-fixable).
+      * `same_subnet`  — same-subnet routing trap. Apply auto-
+        reconfigures with non-conflicting CIDRs (auto-fixable).
 
-    Operator's choice is exposed via `choice()` after `exec_()`.
+    Operator's choice via `choice()` after `exec_()`: one of
+    "apply" / "continue" / "cancel". `apply` is only offered for
+    auto-fixable reasons.
     """
+
+    _TITLES = {
+        "probe_failed": "Endpoint probe failed",
+        "down_port":    "Port is not ACTIVE",
+        "missing_ip":   "Missing IPv4 address",
+        "same_subnet":  "Same-subnet routing trap",
+    }
+
+    _AUTOFIXABLE = {"missing_ip", "same_subnet"}
 
     def __init__(
         self,
         *,
-        srv_iface: str, cli_iface: str,
-        shared_net: str,
+        reason: str,
+        detail: str,
+        srv_iface: str,
+        cli_iface: str,
         parent=None,
     ):
         super().__init__(parent)
-        self.setWindowTitle("Same-subnet trap detected")
-        self.setMinimumWidth(540)
+        self.setWindowTitle(self._TITLES.get(reason, "Start blocker"))
+        self.setMinimumWidth(560)
         self._choice = "cancel"
+        self._reason = reason
 
         root = QVBoxLayout(self)
         root.setContentsMargins(12, 12, 12, 12)
         root.setSpacing(10)
 
         title = QLabel(
-            "<span style='font-size:13px; font-weight:600; color:#b45309;'>"
-            "⚠️  Same-subnet routing trap detected</span>"
+            f"<span style='font-size:13px; font-weight:600; "
+            f"color:#b45309;'>"
+            f"⚠️  {self._TITLES.get(reason, 'Start blocker')}</span>"
         )
         root.addWidget(title)
 
-        body = QLabel(
-            f"<p>Both kernel ifaces are in the same subnet "
-            f"<code>{shared_net}</code>:</p>"
-            f"<ul>"
-            f"<li><code>{srv_iface}</code> (server side)</li>"
-            f"<li><code>{cli_iface}</code> (client side)</li>"
-            f"</ul>"
-            f"<p>Linux will route traffic between them via "
-            f"<code>lo</code> instead of out the wire → "
-            f"perftest's QP can't reach RTR → 'Failed to modify "
-            f"QP to RTR'.</p>"
-            f"<p><b>Apply &amp; Start</b> will quietly add "
-            f"temporary test IPs on different subnets "
-            f"(<code>10.42.0.1/24</code> + <code>10.43.0.1/24</code> "
-            f"with the <code>&lt;iface&gt;:ng</code> label) and "
-            f"start perftest. Cleanup runs when this dialog "
-            f"closes.</p>"
-        )
+        body_text = self._body_for(
+            reason, detail, srv_iface, cli_iface)
+        body = QLabel(body_text)
         body.setWordWrap(True)
         body.setTextFormat(Qt.RichText)
         root.addWidget(body)
@@ -1842,24 +1937,94 @@ class _SameSubnetTrapConfirmDialog(QDialog):
 
         continue_btn = QPushButton("Continue anyway")
         continue_btn.setToolTip(
-            "Skip the auto-fix. perftest will start with the "
-            "current iface config — almost certainly will fail "
-            "at QP→RTR. Use this only if you have an out-of-band "
-            "route or you want to capture the failure."
+            "Skip the auto-fix and run perftest as configured. "
+            "It will almost certainly fail at QP→RTR, but useful "
+            "if you have an out-of-band fix or want to capture "
+            "the failure for debugging."
         )
         continue_btn.clicked.connect(self._on_continue)
         btn_row.addWidget(continue_btn)
 
-        apply_btn = QPushButton("Apply && Start")
-        apply_btn.setDefault(True)
-        apply_btn.setStyleSheet(
-            "QPushButton { background-color: #0ea5e9; color: white; "
-            "padding: 4px 12px; border-radius: 3px; font-weight: 600; }"
-        )
-        apply_btn.clicked.connect(self._on_apply)
-        btn_row.addWidget(apply_btn)
+        if reason in self._AUTOFIXABLE:
+            apply_btn = QPushButton("Apply && Start")
+            apply_btn.setDefault(True)
+            apply_btn.setStyleSheet(
+                "QPushButton { background-color: #0ea5e9; "
+                "color: white; padding: 4px 12px; "
+                "border-radius: 3px; font-weight: 600; }"
+            )
+            apply_btn.clicked.connect(self._on_apply)
+            btn_row.addWidget(apply_btn)
+        else:
+            # Non-fixable — surface an Open Pre-flight affordance
+            # so the operator can investigate manually. (We don't
+            # auto-open it from here — keep the choice in the
+            # operator's hands.)
+            open_btn = QPushButton("Open Pre-flight…")
+            open_btn.setToolTip(
+                "Close this dialog and inspect the probe details "
+                "(port state, GIDs, IPs) via the Pre-flight panel."
+            )
+            open_btn.clicked.connect(self._on_open_preflight)
+            btn_row.addWidget(open_btn)
 
         root.addLayout(btn_row)
+
+    @staticmethod
+    def _body_for(
+        reason: str, detail: str,
+        srv_iface: str, cli_iface: str,
+    ) -> str:
+        if reason == "probe_failed":
+            return (
+                f"<p>One of the endpoint probes failed:</p>"
+                f"<pre>{detail}</pre>"
+                f"<p>perftest needs a working probe response to "
+                f"validate the setup. Common causes: TG server "
+                f"down, network flake, RDMA stack not installed. "
+                f"Open Pre-flight to inspect both endpoints, or "
+                f"Continue anyway to fire perftest blind.</p>"
+            )
+        if reason == "down_port":
+            return (
+                f"<p>{detail}.</p>"
+                f"<p>perftest can't bring a QP to RTR through a "
+                f"port without link carrier. This isn't auto-"
+                f"fixable from netgen — bring the link up "
+                f"(<code>ip link set &lt;iface&gt; up</code>, "
+                f"check cable / SFP / switch port) and try "
+                f"again.</p>"
+            )
+        if reason == "missing_ip":
+            return (
+                f"<p>{detail}.</p>"
+                f"<p>perftest needs an IPv4 address on the kernel "
+                f"iface to form a RoCEv2 GID. Without one, the QP "
+                f"can't resolve the peer's GID and fails at RTR.</p>"
+                f"<p><b>Apply &amp; Start</b> adds a temporary "
+                f"test IPv4 (<code>&lt;iface&gt;:ng</code> labeled, "
+                f"runtime-only) and starts perftest. Cleanup runs "
+                f"when this dialog closes.</p>"
+            )
+        if reason == "same_subnet":
+            return (
+                f"<p>Both kernel ifaces share IPv4 subnet "
+                f"<code>{detail}</code>:</p>"
+                f"<ul>"
+                f"<li><code>{srv_iface}</code> (server)</li>"
+                f"<li><code>{cli_iface}</code> (client)</li>"
+                f"</ul>"
+                f"<p>Linux routes traffic between them via "
+                f"<code>lo</code> instead of out the wire → "
+                f"perftest's QP can't reach RTR.</p>"
+                f"<p><b>Apply &amp; Start</b> adds test IPs on "
+                f"different subnets "
+                f"(<code>10.42.0.1/24</code> + "
+                f"<code>10.43.0.1/24</code>), validates them "
+                f"server-side, then starts perftest. Cleanup runs "
+                f"on dialog close.</p>"
+            )
+        return f"<p>{detail}</p>"
 
     def _on_apply(self) -> None:
         self._choice = "apply"
@@ -1873,5 +2038,17 @@ class _SameSubnetTrapConfirmDialog(QDialog):
         self._choice = "cancel"
         self.reject()
 
+    def _on_open_preflight(self) -> None:
+        """For non-auto-fixable reasons. Caller can detect this
+        via `choice() == 'open_preflight'` and route the operator
+        into the Pre-flight dialog."""
+        self._choice = "open_preflight"
+        self.accept()
+
     def choice(self) -> str:
         return self._choice
+
+
+# v0.5.153: keep a backwards-compat alias in case anything outside
+# the dialog itself imported the old name.
+_SameSubnetTrapConfirmDialog = _StartBlockerConfirmDialog

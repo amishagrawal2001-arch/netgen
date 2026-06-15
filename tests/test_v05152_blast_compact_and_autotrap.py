@@ -178,13 +178,21 @@ def test_auto_apply_tracks_state_id_on_success():
 
 
 def test_confirm_dialog_class_exists():
-    assert "class _SameSubnetTrapConfirmDialog(" in SRC_BLAST
+    # v0.5.153 renamed the class to _StartBlockerConfirmDialog
+    # (covers DOWN port / missing IP / probe failure too) and
+    # kept the v0.5.152 name as an alias.
+    assert (
+        "class _StartBlockerConfirmDialog(" in SRC_BLAST
+        or "class _SameSubnetTrapConfirmDialog(" in SRC_BLAST
+    )
 
 
 def test_confirm_dialog_has_three_choices():
     """Apply & Start / Continue anyway / Cancel — three buttons,
     three string options on the choice() return."""
-    cls = _extract_class(SRC_BLAST, "_SameSubnetTrapConfirmDialog")
+    # v0.5.153 renamed; both class names extract the same body
+    # since the old name is now just an alias.
+    cls = _extract_class(SRC_BLAST, "_StartBlockerConfirmDialog")
     assert '"Apply && Start"' in cls
     assert '"Continue anyway"' in cls
     assert '"Cancel"' in cls
@@ -197,14 +205,21 @@ def test_confirm_dialog_has_three_choices():
 def test_confirm_dialog_explains_the_trap():
     """The body text must explain WHY this is happening so the
     operator can make an informed decision."""
-    cls = _extract_class(SRC_BLAST, "_SameSubnetTrapConfirmDialog")
-    assert "Linux will route" in cls
+    # v0.5.153 renamed; both class names extract the same body
+    # since the old name is now just an alias.
+    cls = _extract_class(SRC_BLAST, "_StartBlockerConfirmDialog")
+    # v0.5.153 reworded slightly ("Linux routes" vs "Linux will
+    # route") when generalizing the class to cover four blocker
+    # types.
+    assert ("Linux routes" in cls or "Linux will route" in cls)
     assert "<code>lo</code>" in cls
-    assert "QP to RTR" in cls
+    assert "QP" in cls and "RTR" in cls
 
 
 def test_confirm_dialog_choice_method_returns_string():
-    cls = _extract_class(SRC_BLAST, "_SameSubnetTrapConfirmDialog")
+    # v0.5.153 renamed; both class names extract the same body
+    # since the old name is now just an alias.
+    cls = _extract_class(SRC_BLAST, "_StartBlockerConfirmDialog")
     assert "def choice(self) -> str" in cls
 
 
