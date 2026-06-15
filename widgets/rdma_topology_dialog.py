@@ -274,19 +274,22 @@ class RdmaTopologyDialog(QDialog):
         # / driver) rather than link reachability between two
         # ports.
         self._loopback_btn = QPushButton(
-            "↔  Loopback test (same HCA on both sides)"
+            "↔  Same-host test (loopback or two HCAs)"
         )
         self._loopback_btn.setEnabled(bool(self._known_servers))
         self._loopback_btn.setToolTip(
-            "Sets both endpoint lists to a single line using the "
-            "SAME (TG, HCA) on server and client. perftest's verbs "
-            "layer bounces packets internally — no wire, switch, "
-            "or peer NIC needed.\n\n"
-            "Use this first when troubleshooting RDMA. If "
-            "single-HCA loopback works, the stack is healthy and "
-            "any failure between two different HCAs is a path/"
-            "config issue. If single-HCA loopback fails too, the "
-            "issue is in the driver / GID / port state itself."
+            "Opens a same-host RDMA test picker with two modes:\n\n"
+            "• Same-HCA loopback (default) — both sides bind to "
+            "the same HCA. perftest's verbs layer bounces packets "
+            "internally; no wire, switch, or peer NIC needed. "
+            "Use this first when troubleshooting — if it fails, "
+            "the issue is in the driver / GID / port state.\n\n"
+            "• Two HCAs same host (toggle) — server and client "
+            "perftest bind to different RoCE devices on one TG "
+            "(e.g. rocep43s0f0 ↔ rocep43s0f1). Exercises the "
+            "wire/driver path between sibling devices. Requires a "
+            "loopback cable, shared switch, or firmware internal "
+            "port-to-port loopback."
         )
         if not self._known_servers:
             self._loopback_btn.setToolTip(
@@ -492,11 +495,17 @@ class RdmaTopologyDialog(QDialog):
     # ────────────────────────── v0.5.147 loopback picker ──────────────
 
     def _open_loopback_picker(self) -> None:
-        """One-click loopback setup: pick a single (TG, HCA) and
-        write the SAME line into both endpoint editors. This is the
-        canonical RDMA smoke test — if it fails, the operator knows
-        the issue is in the RDMA stack (driver/GID/port state), not
-        link reachability between two ports."""
+        """One-click same-host setup. Two modes inside the picker:
+
+          * Same-HCA loopback (default) — both endpoint editors
+            get the SAME line. Canonical RDMA smoke test.
+          * Two-HCA same-host (toggle in picker) — server and
+            client editors get DIFFERENT device tokens on the same
+            TG URL. Exercises the wire/driver path between sibling
+            HCAs (e.g. `rocep…f0` ↔ `rocep…f1`).
+
+        Either way: focused smoke test, replaces existing editor
+        content rather than appending."""
         if not self._known_servers:
             return
         picker = _LoopbackPickerDialog(
@@ -505,15 +514,11 @@ class RdmaTopologyDialog(QDialog):
         )
         if picker.exec_() != QDialog.Accepted:
             return
-        choice = picker.selected_line()
-        if not choice:
+        srv_line, cli_line = picker.selected_lines()
+        if not srv_line or not cli_line:
             return
-        # BOTH editors get the same single line — that's the whole
-        # point of "loopback". We replace existing content rather
-        # than append (loopback is a focused smoke test; appending
-        # to a multi-endpoint config would be confusing).
-        self._server_edit.setPlainText(choice)
-        self._client_edit.setPlainText(choice)
+        self._server_edit.setPlainText(srv_line)
+        self._client_edit.setPlainText(cli_line)
 
     # ────────────────────────── v0.5.143 endpoint picker ──────────────
 
@@ -1089,13 +1094,23 @@ class _EndpointPickerDialog(QDialog):
 
 
 class _LoopbackPickerDialog(QDialog):
-    """Single-(TG, HCA) picker for one-click loopback setup.
+    """Same-host RDMA test picker — covers two related modes:
 
-    Smaller than `_EndpointPickerDialog` on purpose: loopback only
-    needs ONE choice (server + HCA), and both perftest sides get
-    the same line. The operator just wants to confirm "does this
-    HCA's RDMA stack work at all?" — picking one HCA via a server
-    combo + device combo is the most direct UX.
+      1. **Same-HCA loopback** (default): the canonical smoke test.
+         Both perftest sides use the SAME HCA on the same TG.
+         Verbs bounces internally; no wire needed.
+      2. **Same-host different HCAs** (toggle the checkbox):
+         server + client perftest processes run on the same TG
+         but bind to DIFFERENT HCAs (e.g. dual-port NIC
+         `rocep43s0f0` ↔ `rocep43s0f1`). Exercises the wire +
+         driver path between sibling devices. Whether this works
+         depends on whether the two ports are cabled / share a
+         switch / have firmware internal-loopback enabled.
+
+    Returns one or two `<tg_url> <hca>` lines via
+    `selected_lines() → (server_line, client_line)`. In same-HCA
+    mode both strings are identical; in two-HCA mode they differ
+    only in the device token.
     """
 
     def __init__(
@@ -1105,10 +1120,13 @@ class _LoopbackPickerDialog(QDialog):
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
-        self.setWindowTitle("Loopback Test — Pick HCA")
-        self.setMinimumWidth(420)
+        self.setWindowTitle("Same-host RDMA Test — Pick HCA(s)")
+        self.setMinimumWidth(460)
         self._servers = list(servers)
-        self._chosen_line: str = ""
+        # v0.5.148: tuple of two lines. In same-HCA mode they're
+        # identical; in different-HCA mode they share the URL but
+        # have different device tokens.
+        self._chosen_lines: Tuple[str, str] = ("", "")
 
         root = QVBoxLayout(self)
         root.setContentsMargins(10, 10, 10, 10)
@@ -1116,10 +1134,11 @@ class _LoopbackPickerDialog(QDialog):
 
         hdr = QLabel(
             "<span style='color:#475569;'>"
-            "Pick one <b>(TG, RDMA HCA)</b>. Both endpoint lists "
-            "in the parent dialog will be set to this same line — "
-            "perftest's verbs layer bounces packets internally, "
-            "no wire/switch needed."
+            "Pick one <b>(TG, HCA)</b> for a same-HCA loopback "
+            "(default), or check <b>two HCAs (same host)</b> to "
+            "exercise the wire/driver path between two RoCE "
+            "devices on one TG (e.g. <code>rocep43s0f0</code> "
+            "↔ <code>rocep43s0f1</code>)."
             "</span>"
         )
         hdr.setWordWrap(True)
@@ -1134,13 +1153,44 @@ class _LoopbackPickerDialog(QDialog):
         for url, label in self._servers:
             self._server_combo.addItem(f"{label} — {url}", userData=url)
         self._server_combo.currentIndexChanged.connect(self._probe_devices)
-        grid.addWidget(self._server_combo, 0, 1)
+        grid.addWidget(self._server_combo, 0, 1, 1, 2)
 
-        grid.addWidget(QLabel("RDMA HCA:"), 1, 0, Qt.AlignRight)
-        self._device_combo = QComboBox()
-        self._device_combo.setMinimumWidth(220)
-        self._device_combo.addItem("(probing…)", userData=None)
-        grid.addWidget(self._device_combo, 1, 1)
+        # v0.5.148: server-side HCA combo. Renamed from the v0.5.147
+        # `_device_combo` so the two-HCA mode can refer to it
+        # unambiguously.
+        grid.addWidget(QLabel("Server HCA:"), 1, 0, Qt.AlignRight)
+        self._server_device_combo = QComboBox()
+        self._server_device_combo.setMinimumWidth(220)
+        self._server_device_combo.addItem("(probing…)", userData=None)
+        grid.addWidget(self._server_device_combo, 1, 1, 1, 2)
+
+        # v0.5.148: mode toggle. Hidden by default — operator opts
+        # in. When checked the client HCA row enables.
+        self._two_hca_check = QCheckBox(
+            "Use a DIFFERENT HCA on the client side "
+            "(same-host two-port test)"
+        )
+        self._two_hca_check.setToolTip(
+            "Server and client perftest run on the same TG but "
+            "bind to different RDMA HCAs. Tests the path between "
+            "two RoCE devices on one host (loopback cable, shared "
+            "switch, or firmware internal port-to-port "
+            "loopback). Use this when you've confirmed single-HCA "
+            "loopback works and want to validate the wire too."
+        )
+        self._two_hca_check.toggled.connect(self._on_two_hca_toggled)
+        grid.addWidget(self._two_hca_check, 2, 0, 1, 3)
+
+        # v0.5.148: client-side HCA combo, only enabled when the
+        # two-HCA checkbox is set.
+        self._client_hca_label = QLabel("Client HCA:")
+        self._client_hca_label.setEnabled(False)
+        grid.addWidget(self._client_hca_label, 3, 0, Qt.AlignRight)
+        self._client_device_combo = QComboBox()
+        self._client_device_combo.setMinimumWidth(220)
+        self._client_device_combo.setEnabled(False)
+        self._client_device_combo.addItem("(probing…)", userData=None)
+        grid.addWidget(self._client_device_combo, 3, 1, 1, 2)
 
         grid.setColumnStretch(1, 1)
         root.addLayout(grid)
@@ -1161,29 +1211,104 @@ class _LoopbackPickerDialog(QDialog):
         # Kick off the first probe.
         QTimer.singleShot(0, self._probe_devices)
 
+    def _on_two_hca_toggled(self, checked: bool) -> None:
+        """v0.5.148: enable/disable the client HCA row when the
+        toggle changes. We auto-pick a sensible default for the
+        client side (the NEXT device after the server's pick) so
+        the operator doesn't have to think about it for the common
+        dual-port case."""
+        self._client_hca_label.setEnabled(checked)
+        self._client_device_combo.setEnabled(checked)
+        if checked:
+            # Default: pick a different device than the server's
+            # current selection when there are at least two.
+            self._auto_pick_client_device()
+        self._refresh_ok_button()
+
+    def _auto_pick_client_device(self) -> None:
+        """When two-HCA mode is enabled, pre-select the next
+        device after the server's pick — common dual-port case
+        (rocep…f0 + rocep…f1) becomes one-click."""
+        if self._client_device_combo.count() == 0:
+            return
+        srv_dev = self._server_device_combo.currentData()
+        if not srv_dev:
+            return
+        srv_idx = self._client_device_combo.findData(srv_dev)
+        # Pick the next index; wrap to 0 if at end.
+        if srv_idx < 0:
+            target = 0
+        else:
+            target = (srv_idx + 1) % self._client_device_combo.count()
+        # Skip placeholder items (userData=None).
+        for off in range(self._client_device_combo.count()):
+            idx = (target + off) % self._client_device_combo.count()
+            if self._client_device_combo.itemData(idx) is not None:
+                self._client_device_combo.setCurrentIndex(idx)
+                break
+
+    def _refresh_ok_button(self) -> None:
+        """OK enabled when:
+          * server HCA combo has a real selection, AND
+          * if two-HCA mode is on, client HCA combo also has a
+            real selection that's different from the server's.
+        """
+        srv_dev = self._server_device_combo.currentData()
+        if not srv_dev:
+            self._ok_btn.setEnabled(False)
+            return
+        if not self._two_hca_check.isChecked():
+            self._ok_btn.setEnabled(True)
+            return
+        cli_dev = self._client_device_combo.currentData()
+        if not cli_dev:
+            self._ok_btn.setEnabled(False)
+            return
+        # Same device on both sides in two-HCA mode is a UX bug —
+        # operator wanted DIFFERENT HCAs. Fall back to disabling
+        # OK with a status hint rather than silently writing the
+        # same line twice.
+        if srv_dev == cli_dev:
+            self._status.setText(
+                "<span style='color:#b91c1c;'>"
+                "Two-HCA mode needs different devices — pick a "
+                "different Client HCA, or uncheck the box to use "
+                "the same HCA on both sides."
+                "</span>"
+            )
+            self._ok_btn.setEnabled(False)
+            return
+        self._ok_btn.setEnabled(True)
+
     def _probe_devices(self) -> None:
         """Fetch /api/rdma/devices on the currently-selected TG.
-        Repopulates the device combo with the response. No-op if
-        the combo isn't ready yet (init order race)."""
-        if not hasattr(self, "_device_combo"):
+        Repopulates BOTH device combos (server + client) with the
+        response. v0.5.148: was single-combo before."""
+        if not hasattr(self, "_server_device_combo"):
             return
         from widgets.rdma_blast_flow_dialog import _get_async
 
         url = self._server_combo.currentData()
         if not url:
             return
-        self._device_combo.clear()
-        self._device_combo.addItem("(probing…)", userData=None)
+        self._server_device_combo.clear()
+        self._server_device_combo.addItem("(probing…)", userData=None)
+        self._client_device_combo.clear()
+        self._client_device_combo.addItem("(probing…)", userData=None)
         self._ok_btn.setEnabled(False)
 
         def _on_done(data, err, _url=url):
             try:
-                self._device_combo.count()
+                self._server_device_combo.count()
             except RuntimeError:
                 return
-            self._device_combo.clear()
+            self._server_device_combo.clear()
+            self._client_device_combo.clear()
             if err:
-                self._device_combo.addItem(f"error: {err}", userData=None)
+                self._server_device_combo.addItem(
+                    f"error: {err}", userData=None)
+                self._client_device_combo.addItem(
+                    f"error: {err}", userData=None)
                 self._status.setText(
                     f"<span style='color:#b91c1c;'>{_url}: {err}</span>"
                 )
@@ -1191,7 +1316,10 @@ class _LoopbackPickerDialog(QDialog):
                 return
             devices = (data or {}).get("devices") or []
             if not devices:
-                self._device_combo.addItem("(no HCAs)", userData=None)
+                self._server_device_combo.addItem(
+                    "(no HCAs)", userData=None)
+                self._client_device_combo.addItem(
+                    "(no HCAs)", userData=None)
                 self._status.setText(
                     "<span style='color:#b91c1c;'>"
                     "No RDMA HCAs on this TG — verify RDMA is "
@@ -1207,24 +1335,74 @@ class _LoopbackPickerDialog(QDialog):
                 if ports:
                     p = ports[0]
                     state = f"  ({(p.get('state') or '').upper()})"
-                self._device_combo.addItem(f"{name}{state}", userData=name)
-            self._status.setText(
-                f"<span style='color:#64748b;'>"
-                f"{len(devices)} HCA(s) on {_url}."
-                f"</span>"
-            )
-            self._ok_btn.setEnabled(True)
+                self._server_device_combo.addItem(
+                    f"{name}{state}", userData=name)
+                self._client_device_combo.addItem(
+                    f"{name}{state}", userData=name)
+            # v0.5.148: hint when only one HCA is present — the
+            # two-HCA mode is meaningless then. Don't disable
+            # the checkbox (operator might want to swap TGs);
+            # just nudge.
+            if len(devices) < 2:
+                self._status.setText(
+                    f"<span style='color:#f59e0b;'>"
+                    f"{len(devices)} HCA on {_url}. "
+                    f"Two-HCA mode needs at least 2 HCAs on the "
+                    f"same TG."
+                    f"</span>"
+                )
+            else:
+                self._status.setText(
+                    f"<span style='color:#64748b;'>"
+                    f"{len(devices)} HCA(s) on {_url}."
+                    f"</span>"
+                )
+            # If two-HCA mode is already on, re-pick the client
+            # default (the response just arrived).
+            if self._two_hca_check.isChecked():
+                self._auto_pick_client_device()
+            # And signal-wire the server combo so the auto-pick
+            # tracks the operator's choice.
+            try:
+                self._server_device_combo.currentIndexChanged.disconnect()
+            except (TypeError, RuntimeError):
+                pass
+            self._server_device_combo.currentIndexChanged.connect(
+                self._on_server_device_changed)
+            self._client_device_combo.currentIndexChanged.connect(
+                self._refresh_ok_button)
+            self._refresh_ok_button()
 
         _get_async(self, f"{url.rstrip('/')}/api/rdma/devices",
                    _on_done, timeout=6.0)
 
+    def _on_server_device_changed(self, *_args) -> None:
+        """When the operator changes the server-side HCA, if
+        two-HCA mode is on, slide the client pick to the next
+        device. Same one-click ergonomics."""
+        if self._two_hca_check.isChecked():
+            self._auto_pick_client_device()
+        self._refresh_ok_button()
+
     def _on_accept(self) -> None:
         url = self._server_combo.currentData()
-        dev = self._device_combo.currentData()
-        if not url or not dev:
+        srv_dev = self._server_device_combo.currentData()
+        if not url or not srv_dev:
             return
-        self._chosen_line = f"{url} {dev}"
+        srv_line = f"{url} {srv_dev}"
+        if self._two_hca_check.isChecked():
+            cli_dev = self._client_device_combo.currentData()
+            if not cli_dev or cli_dev == srv_dev:
+                # Defensive — _refresh_ok_button should have
+                # blocked this, but don't trust UI invariants.
+                return
+            cli_line = f"{url} {cli_dev}"
+        else:
+            cli_line = srv_line
+        self._chosen_lines = (srv_line, cli_line)
         self.accept()
 
-    def selected_line(self) -> str:
-        return self._chosen_line
+    def selected_lines(self) -> Tuple[str, str]:
+        """Return the (server_line, client_line) pair. In same-HCA
+        loopback mode both strings are identical."""
+        return self._chosen_lines

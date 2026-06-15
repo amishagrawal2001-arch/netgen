@@ -97,9 +97,13 @@ def test_blast_mirror_adds_missing_device_if_client_still_probing():
 
 
 def test_topology_loopback_button_exists():
-    """The Topology dialog grew a "Loopback test" button under
-    the endpoints group."""
-    assert "Loopback test (same HCA on both sides)" in SRC_TOP
+    """The Topology dialog grew a same-host test button under
+    the endpoints group. v0.5.148 renamed it to cover both
+    loopback and two-HCA modes."""
+    assert (
+        "Same-host test (loopback or two HCAs)" in SRC_TOP
+        or "Loopback test (same HCA on both sides)" in SRC_TOP
+    )
 
 
 def test_topology_loopback_button_disabled_without_servers():
@@ -115,12 +119,14 @@ def test_topology_loopback_opens_picker():
     assert "self._loopback_btn.clicked.connect(self._open_loopback_picker)" in SRC_TOP
 
 
-def test_topology_loopback_writes_same_line_to_both_editors():
-    """The whole point: ONE picker selection → SAME line in
-    BOTH server_edit and client_edit."""
+def test_topology_loopback_writes_lines_to_both_editors():
+    """v0.5.148: picker now returns a (server_line, client_line)
+    tuple. Same-HCA mode → both strings identical; two-HCA mode →
+    same URL, different device tokens."""
     body = _extract_method(SRC_TOP, "_open_loopback_picker")
-    assert "self._server_edit.setPlainText(choice)" in body
-    assert "self._client_edit.setPlainText(choice)" in body
+    assert "self._server_edit.setPlainText(srv_line)" in body
+    assert "self._client_edit.setPlainText(cli_line)" in body
+    assert "picker.selected_lines()" in body
 
 
 def test_topology_loopback_replaces_rather_than_appends():
@@ -142,14 +148,55 @@ def test_loopback_picker_class_exists():
 
 
 def test_loopback_picker_uses_combos_not_tree():
-    """One-shot single-pick UX — two combos (TG, HCA), not a
-    tree. The multi-server picker uses a tree because it's
-    multi-select; loopback is single-select."""
+    """Two combos (TG, HCA), not a tree. The multi-server picker
+    uses a tree because it's multi-select; loopback is single-
+    select. v0.5.148 renamed `_device_combo` → `_server_device_combo`
+    when the two-HCA mode added a sibling `_client_device_combo`."""
     body = _extract_class(SRC_TOP, "_LoopbackPickerDialog")
     assert "_server_combo = QComboBox" in body
-    assert "_device_combo = QComboBox" in body
+    assert "_server_device_combo = QComboBox" in body
     # Definitely NOT a tree.
     assert "QTreeWidget" not in body
+
+
+def test_loopback_picker_has_two_hca_toggle():
+    """v0.5.148: a checkbox lets the operator switch to two-HCA
+    same-host mode."""
+    body = _extract_class(SRC_TOP, "_LoopbackPickerDialog")
+    assert "_two_hca_check" in body
+    assert "_client_device_combo" in body
+
+
+def test_loopback_picker_client_combo_disabled_by_default():
+    """Same-HCA loopback is the safer default — the client combo
+    must start disabled and only enable when the operator opts in."""
+    body = _extract_class(SRC_TOP, "_LoopbackPickerDialog")
+    # The setup block disables both the client label + combo.
+    assert "self._client_hca_label.setEnabled(False)" in body
+    assert "self._client_device_combo.setEnabled(False)" in body
+
+
+def test_loopback_picker_two_hca_mode_auto_picks_different_device():
+    """When the operator flips the toggle, the dialog should pre-
+    populate the client side with a DIFFERENT device — typically
+    the next HCA index. This is the dual-port case (rocep…f0 →
+    rocep…f1) becoming one click."""
+    body = _extract_class(SRC_TOP, "_LoopbackPickerDialog")
+    assert "_auto_pick_client_device" in body
+    # And the toggle calls it.
+    assert (
+        "self._auto_pick_client_device()" in body
+    )
+
+
+def test_loopback_picker_blocks_same_device_in_two_hca_mode():
+    """If the operator manually picks the same HCA on both sides
+    while two-HCA mode is on, OK must disable + a hint must
+    appear. Otherwise we'd silently emit a same-HCA loopback when
+    the operator wanted two HCAs."""
+    body = _extract_class(SRC_TOP, "_LoopbackPickerDialog")
+    assert "srv_dev == cli_dev" in body
+    assert "different Client HCA" in body or "different devices" in body
 
 
 def test_loopback_picker_reprobes_on_server_change():
@@ -171,11 +218,14 @@ def test_loopback_picker_disables_ok_until_devices_load():
     assert "self._ok_btn.setEnabled(True)" in body
 
 
-def test_loopback_picker_selected_line_format():
-    """selected_line() returns `<url> <device>` — the same format
-    the topology parser already understands."""
+def test_loopback_picker_selected_lines_returns_tuple():
+    """v0.5.148: selected_lines() returns (server_line,
+    client_line). In same-HCA mode both strings are identical; in
+    two-HCA mode they share the URL but differ in device token."""
     body = _extract_class(SRC_TOP, "_LoopbackPickerDialog")
-    assert 'f"{url} {dev}"' in body or "'{url} {dev}'" in body
+    assert "def selected_lines" in body
+    # Line format unchanged: <url> <device>.
+    assert 'f"{url} {srv_dev}"' in body or 'f"{url} {cli_dev}"' in body
 
 
 def test_loopback_picker_surfaces_no_hcas_clearly():

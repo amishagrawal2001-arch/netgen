@@ -2,6 +2,77 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.148] - 2026-06-14
+
+**Topology dialog's same-host picker gains "two HCAs same host"
+mode.**
+
+Operator after v0.5.147 shipped:
+
+> "also allow same host different roce interfaces."
+
+v0.5.147's Loopback button only handled the SAME-HCA case (both
+sides bind to `mlx5_0`, verbs bounces internally). The operator's
+real diagnostic interest is the dual-HCA case — `rocep43s0f0` ↔
+`rocep43s0f1` on srv06 — which tests the wire/driver path between
+sibling RoCE devices. That's the same test that hit "Failed to
+modify QP to RTR" earlier; one-click setup helps operators
+quickly verify whether the SAME issue persists after they fix
+PFC / GID / port-state config.
+
+### What's new
+
+* The picker (now titled "Same-host RDMA Test — Pick HCA(s)")
+  has a checkbox: **"Use a DIFFERENT HCA on the client side
+  (same-host two-port test)"**.
+* When checked, a second HCA combo enables for the client side.
+  Auto-picks the NEXT device after the server's pick — common
+  dual-port case (`rocep…f0` → `rocep…f1`) is one click.
+* Switching the server-side HCA re-slides the client default so
+  the two stay different by construction.
+* OK button disables when both combos select the same device in
+  two-HCA mode, with an inline hint asking the operator to pick
+  different devices or uncheck the box.
+* "(N HCAs) — Two-HCA mode needs at least 2" amber hint when the
+  selected TG has only one HCA.
+* Parent dialog button relabeled "↔ Same-host test (loopback or
+  two HCAs)" with a tooltip explaining both modes.
+* Picker API: `selected_line()` (single string) →
+  `selected_lines()` returning `(server_line, client_line)`. In
+  same-HCA mode both strings are identical; in two-HCA mode they
+  share the URL but have different device tokens.
+
+### Diagnostic flow
+
+1. Click the button → check **single-HCA loopback** first
+   (default mode). If that fails, the RDMA stack itself is
+   broken — fix GID / port state / driver before anything else.
+2. If single-HCA loopback works, flip the toggle → run **two
+   HCAs same host**. If THAT fails, the issue is wire reachability
+   (cable / shared switch / PFC / firmware loopback support) —
+   not the RDMA stack.
+
+Splits the failure surface cleanly into "stack" vs "wire."
+
+### Files changed
+- `widgets/rdma_topology_dialog.py` (picker refactor, toggle,
+  client combo + status invariants, parent button label/tooltip).
+- `pyproject.toml` (0.5.147 → 0.5.148).
+- `tests/test_v05147_loopback_buttons.py` (21 tests — 17 from
+  v0.5.147 updated to the tuple API + 4 new ones pinning the
+  two-HCA mode's invariants).
+
+### Verified
+```
+$ ./venv/bin/pytest tests/test_v05147_loopback_buttons.py -q
+21 passed in 0.05s
+
+$ ./venv/bin/pytest tests/ -q -k "rdma or perftest or topology"
+264 passed, 2562 deselected
+```
+
+---
+
 ## [0.5.147] - 2026-06-14
 
 **One-click Loopback buttons in Blast + Topology RDMA dialogs.**
