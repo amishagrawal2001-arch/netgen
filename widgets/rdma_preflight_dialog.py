@@ -241,6 +241,30 @@ class RdmaPreflightDialog(QDialog):
 
         btn_row.addStretch(1)
         cfg.addLayout(btn_row)
+
+        # v0.5.152: Option C-A: "📌 Keep" toggle. When checked, the
+        # parent dialog's closeEvent SKIPS the auto-cleanup for any
+        # state_id applied via this preflight session. Lets the
+        # operator iterate on test params without re-applying IPs
+        # every time. Cleanup then happens manually via the button
+        # above, the orphans endpoint, or reboot.
+        keep_row = QHBoxLayout()
+        self._keep_check = QCheckBox(
+            "📌 Keep these test IPs after this dialog closes"
+        )
+        self._keep_check.setToolTip(
+            "When checked, the parent Blast/Topology dialog will "
+            "NOT auto-clean these test IPs on close. The IPs stay "
+            "applied until you click 'Clean up applied' above, run "
+            "POST /api/rdma/test_ifaces/cleanup with state_id=null, "
+            "or reboot the server.\n\n"
+            "Useful when iterating on test params — saves the "
+            "round-trip of re-applying IPs every Start."
+        )
+        keep_row.addWidget(self._keep_check)
+        keep_row.addStretch(1)
+        cfg.addLayout(keep_row)
+
         root.addWidget(cfg_box)
 
         # Status line + close button.
@@ -649,6 +673,20 @@ class RdmaPreflightDialog(QDialog):
         """Caller pulls this on close to know whether to schedule
         cleanup. None = nothing applied (or already cleaned)."""
         return self._applied_state_id
+
+    def keep_applied(self) -> bool:
+        """v0.5.152: caller reads this on close. When True, the
+        parent dialog must NOT auto-clean the applied state_id —
+        operator wants the IPs to persist until they manually
+        clean (via the dialog's Clean-up button or the orphans
+        endpoint).
+
+        Returns False when the checkbox doesn't exist yet (init
+        order race) or wasn't ticked."""
+        try:
+            return bool(self._keep_check.isChecked())
+        except (AttributeError, RuntimeError):
+            return False
 
     def closeEvent(self, event) -> None:
         # Don't auto-cleanup here — the parent dialog may want to

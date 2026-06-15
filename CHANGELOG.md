@@ -2,6 +2,105 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.152] - 2026-06-15
+
+**Blast RDMA dialog: compact params, taller stats, auto-trap-
+detect on Start, Keep-IPs option.**
+
+Operator (after the same-subnet trap returned because v0.5.150's
+auto-cleanup ran on the previous dialog close):
+
+> "option C, and also make test paramter section compact and
+> increase Live stats log vertical area"
+
+### UI compaction
+
+* Test-params grid: `setVerticalSpacing(2)` (was 4),
+  `setContentsMargins(6, 2, 6, 2)` (was 8, 4, 8, 4).
+* Spinboxes shrunk from 120 px → 100 px (5 of them: msg_size,
+  tx_depth, qp_count, gid_index, duration).
+* Live stats `setMinimumHeight(280)` (was 160), added stretch
+  factor 1 on `addWidget` so it claims the freed vertical room.
+
+Net effect: ~80 px reclaimed for the Live stats panel.
+
+### Auto-detect-on-Start (Option C-B)
+
+Click Start. If the server + client TGs are the same host AND no
+preflight test IPs are already in play, the dialog probes both
+endpoints via `/api/rdma/probe` (~200 ms). If both kernel ifaces
+share an IPv4 subnet → pop `_SameSubnetTrapConfirmDialog` with
+three buttons:
+
+* **Apply & Start** (default) — auto-picks `10.42.0.1/24` +
+  `10.43.0.1/24`, POSTs `/api/rdma/test_ifaces/configure`,
+  tracks the state_id, then proceeds with perftest start.
+* **Continue anyway** — operator overrides; perftest will
+  almost certainly fail at QP→RTR, but they get to see it.
+* **Cancel** — abort.
+
+Probe runs in parallel for both endpoints. Skipped entirely
+when:
+- TGs are different hosts (trap is impossible across hosts).
+- Operator already applied test IPs via Pre-flight this
+  session.
+
+Pure helper `_detect_same_subnet_trap(srv_probe, cli_probe)` at
+module level — testable without Qt. Skips IPv6 (different trap
+shape).
+
+### 📌 Keep-IPs checkbox (Option C-A)
+
+Pre-flight dialog grew a **"📌 Keep these test IPs after this
+dialog closes"** checkbox under the Apply/Cleanup buttons. When
+checked, `RdmaPreflightDialog.keep_applied()` returns True; the
+parent (Blast or Topology) skips adding the state_id to the
+auto-cleanup set. Operator manages cleanup explicitly via the
+dialog's button, `POST /api/rdma/test_ifaces/cleanup` with
+`state_id=null`, or reboot.
+
+Both Blast and Topology dialogs honor this signal.
+
+### Diagnostic flow for the srv06 operator (now)
+
+1. Open Blast a RDMA Flow.
+2. Pick `rocep43s0f0` server / `rocep43s0f1` client (one click
+   each thanks to v0.5.147 mirror / v0.5.149 OTHER-HCA).
+3. Click **Start**.
+4. Same-subnet trap detected automatically → confirm dialog
+   pops → click **Apply & Start**.
+5. Test IPs applied, perftest fires, 171 Gbps result row.
+6. Iterate on test params (msg_size, qp_count) and Start
+   again — second run skips the probe (state_id is already
+   tracked).
+7. Close the Blast dialog → cleanup fires automatically.
+
+If you want IPs to persist across multiple dialog opens:
+- Pre-flight → ✅ 📌 Keep checkbox before clicking Apply.
+- Cleanup is now your responsibility.
+
+### Files changed
+- `widgets/rdma_blast_flow_dialog.py` (compact UI, taller
+  stats, `_detect_same_subnet_trap`, `_auto_probe_then_start`,
+  `_apply_test_ips_then_start`, `_proceed_with_start`,
+  `_SameSubnetTrapConfirmDialog`, keep_applied honor).
+- `widgets/rdma_preflight_dialog.py` (Keep checkbox +
+  `keep_applied()` method).
+- `widgets/rdma_topology_dialog.py` (keep_applied honor).
+- `pyproject.toml` (0.5.151 → 0.5.152).
+- `tests/test_v05152_blast_compact_and_autotrap.py` (23 tests).
+
+### Verified
+```
+$ ./venv/bin/pytest tests/test_v05152_blast_compact_and_autotrap.py -q
+23 passed in 0.11s
+
+$ ./venv/bin/pytest tests/ -q -k "rdma or blast or topology or qp or perftest"
+384 passed, 2522 deselected
+```
+
+---
+
 ## [0.5.151] - 2026-06-15
 
 **Blast RDMA Flow dialog: in-place QP-verify help.**

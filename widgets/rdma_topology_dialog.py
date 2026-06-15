@@ -555,13 +555,25 @@ class RdmaTopologyDialog(QDialog):
             dlg.exec_()
             sid = dlg.applied_state_id()
             if sid:
-                self._preflight_state_ids.setdefault(url, set()).add(sid)
-                self._pair_count_label.setText(
-                    f"<span style='color:#15803d;'>"
-                    f"Pre-flight applied test IPs on {url} "
-                    f"(state_id={sid[:8]}). Cleanup on close."
-                    f"</span>"
-                )
+                # v0.5.152: honor the "📌 Keep" checkbox — don't
+                # track the state_id for auto-cleanup when set.
+                if dlg.keep_applied():
+                    self._pair_count_label.setText(
+                        f"<span style='color:#0369a1;'>"
+                        f"Pre-flight applied IPs on {url} "
+                        f"(state_id={sid[:8]}). 📌 Keep ON — "
+                        f"manual cleanup required."
+                        f"</span>"
+                    )
+                else:
+                    self._preflight_state_ids.setdefault(
+                        url, set()).add(sid)
+                    self._pair_count_label.setText(
+                        f"<span style='color:#15803d;'>"
+                        f"Pre-flight applied test IPs on {url} "
+                        f"(state_id={sid[:8]}). Cleanup on close."
+                        f"</span>"
+                    )
 
     # ────────────────────────── v0.5.147 loopback picker ──────────────
 

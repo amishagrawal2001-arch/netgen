@@ -122,6 +122,46 @@ def _post_async(parent: QObject, url: str, body: dict, on_done) -> None:
     w.start()
 
 
+def _detect_same_subnet_trap(srv_probe: dict, cli_probe: dict):
+    """v0.5.152: given two `/api/rdma/probe` responses, detect if
+    their kernel ifaces share an IPv4 subnet — the classic same-
+    host loopback routing trap that prevents QP→RTR.
+
+    Returns (trapped: bool, shared_net: str | None). When True,
+    `shared_net` is the offending CIDR network string (e.g.
+    "10.10.0.0/24") to surface in the confirm dialog.
+
+    Treats DOWN ports as "no trap" — there's a different problem
+    to fix first (link state), and the start path will already
+    surface that via perftest's own error.
+    """
+    import ipaddress as _ip
+    srv_ips = (srv_probe or {}).get("ip_addresses") or []
+    cli_ips = (cli_probe or {}).get("ip_addresses") or []
+    if not srv_ips or not cli_ips:
+        return False, None
+    srv_nets = set()
+    for cidr in srv_ips:
+        # Skip IPv6 — RoCEv2-IPv4 GIDs are the common case and
+        # IPv6 GIDs don't suffer this trap in the same way.
+        if ":" in cidr.split("/")[0]:
+            continue
+        try:
+            srv_nets.add(str(_ip.IPv4Interface(cidr).network))
+        except Exception:
+            continue
+    for cidr in cli_ips:
+        if ":" in cidr.split("/")[0]:
+            continue
+        try:
+            net = str(_ip.IPv4Interface(cidr).network)
+        except Exception:
+            continue
+        if net in srv_nets:
+            return True, net
+    return False, None
+
+
 def _get_async(parent: QObject, url: str, on_done, *, timeout: float = 5.0) -> None:
     W = _api_worker()
     w = W("GET", url, timeout=timeout)
@@ -402,8 +442,12 @@ class RdmaBlastFlowDialog(QDialog):
         test_box = QGroupBox("Test parameters")
         tg = QGridLayout(test_box)
         tg.setHorizontalSpacing(8)
-        tg.setVerticalSpacing(4)
-        tg.setContentsMargins(8, 4, 8, 4)
+        # v0.5.152: compact further — operator wanted more vertical
+        # room for the Live stats panel below. Tighten spacings and
+        # margins; shrink the spinbox fixed widths.
+        tg.setVerticalSpacing(2)
+        tg.setHorizontalSpacing(4)
+        tg.setContentsMargins(6, 2, 6, 2)
 
         # Pre-build every widget, then place them in pairs.
         self._test_combo = QComboBox()
@@ -430,7 +474,7 @@ class RdmaBlastFlowDialog(QDialog):
         self._msg_size_spin.setSingleStep(1024)
         self._msg_size_spin.setValue(_DEFAULT_MSG_SIZE)
         self._msg_size_spin.setSuffix(" B")
-        self._msg_size_spin.setFixedWidth(120)
+        self._msg_size_spin.setFixedWidth(100)
         self._msg_size_spin.setToolTip(
             "Bytes per posted operation (-s). Larger = higher BW per op, "
             "fewer ops/sec. 64 KiB is perftest's own default and a good "
@@ -440,7 +484,7 @@ class RdmaBlastFlowDialog(QDialog):
         self._tx_depth_spin = QSpinBox()
         self._tx_depth_spin.setRange(1, 4096)
         self._tx_depth_spin.setValue(_DEFAULT_TX_DEPTH)
-        self._tx_depth_spin.setFixedWidth(120)
+        self._tx_depth_spin.setFixedWidth(100)
         self._tx_depth_spin.setToolTip(
             "TX queue depth (-t). 128 is perftest's default; raise for "
             "more in-flight ops if the BW row shows the link unsaturated."
@@ -452,7 +496,7 @@ class RdmaBlastFlowDialog(QDialog):
         # Tools → RDMA → RDMA Devices).
         self._qp_count_spin.setRange(1, 131072)
         self._qp_count_spin.setValue(_DEFAULT_QP_COUNT)
-        self._qp_count_spin.setFixedWidth(120)
+        self._qp_count_spin.setFixedWidth(100)
         self._qp_count_spin.setToolTip(
             "Parallel QPs (-q). Increase to scale across multiple CPU "
             "cores on the HCA. >1 changes the BW report to per-QP "
@@ -467,7 +511,7 @@ class RdmaBlastFlowDialog(QDialog):
         self._gid_index_spin = QSpinBox()
         self._gid_index_spin.setRange(0, 255)
         self._gid_index_spin.setValue(_DEFAULT_GID_INDEX)
-        self._gid_index_spin.setFixedWidth(120)
+        self._gid_index_spin.setFixedWidth(100)
         self._gid_index_spin.setToolTip(
             "GID index (-x). On Mellanox RoCEv2-IPv4 the default is "
             "usually 3; check `show_gids` or the Devices list above. "
@@ -479,7 +523,7 @@ class RdmaBlastFlowDialog(QDialog):
         self._duration_spin.setRange(1, 3600)
         self._duration_spin.setValue(_DEFAULT_DURATION_SECS)
         self._duration_spin.setSuffix(" sec")
-        self._duration_spin.setFixedWidth(120)
+        self._duration_spin.setFixedWidth(100)
         self._duration_spin.setToolTip(
             "Test duration in seconds (-D). When set, takes precedence "
             "over a fixed iteration count."
@@ -583,19 +627,23 @@ class RdmaBlastFlowDialog(QDialog):
         root.addLayout(action_row)
 
         # ── Live stats panel (populated by _poll_jobs).
+        # v0.5.152: bumped min-height 160 → 280 + addWidget stretch
+        # factor 1 so the panel claims the freed-up vertical room
+        # from the compacted test-params section above.
         stats_box = QGroupBox("Live stats")
         sv = QVBoxLayout(stats_box)
+        sv.setContentsMargins(6, 4, 6, 6)
         self._stats_view = QTextEdit()
         self._stats_view.setReadOnly(True)
         mono = QFont("Menlo")
         mono.setStyleHint(QFont.Monospace)
         self._stats_view.setFont(mono)
-        self._stats_view.setMinimumHeight(160)
+        self._stats_view.setMinimumHeight(280)
         self._stats_view.setPlaceholderText(
             "Stats appear here once perftest is running on both sides."
         )
         sv.addWidget(self._stats_view)
-        root.addWidget(stats_box)
+        root.addWidget(stats_box, 1)
 
         # Close button at the bottom — uses Qt's standard button box so
         # macOS / Windows / X11 conventions all behave correctly.
@@ -841,11 +889,142 @@ class RdmaBlastFlowDialog(QDialog):
         # run the perftest while the test IPs are live.)
         sid = dlg.applied_state_id()
         if sid:
-            self._preflight_state_ids.add(sid)
-            self._set_status_ok(
-                f"Pre-flight applied test IPs (state_id={sid[:8]}). "
-                f"Cleanup will fire when this dialog closes."
+            # v0.5.152: respect the "📌 Keep" checkbox. When set,
+            # we DON'T track the state_id — closeEvent's auto-
+            # cleanup will skip it. Operator must clean manually
+            # later (Pre-flight → Clean up applied / Tools →
+            # cleanup orphans / reboot).
+            if dlg.keep_applied():
+                self._set_status_ok(
+                    f"Pre-flight applied test IPs (state_id="
+                    f"{sid[:8]}). 📌 Keep is ON — cleanup will "
+                    f"NOT fire on close; clean manually."
+                )
+            else:
+                self._preflight_state_ids.add(sid)
+                self._set_status_ok(
+                    f"Pre-flight applied test IPs (state_id="
+                    f"{sid[:8]}). Cleanup will fire on close."
+                )
+
+    # ───────── v0.5.152 auto-detect same-subnet trap on Start
+
+    def _auto_probe_then_start(
+        self, *, server_dev: str, client_dev: str,
+    ) -> None:
+        """Probe both endpoints via /api/rdma/probe, decide whether
+        the same-subnet trap is in play, and either:
+          * proceed directly with start (trap NOT present),
+          * pop a 3-way confirm: Apply & Start / Continue / Cancel.
+        """
+        self._probe_buffer: Dict[str, Dict[str, Any]] = {}
+        self._probe_targets = [
+            ("server", self._server_tg_url, server_dev,
+             int(self._server_port_spin.value())),
+            ("client", self._client_tg_url, client_dev,
+             int(self._client_port_spin.value())),
+        ]
+
+        def _done(side: str, data, err):
+            self._probe_buffer[side] = data or {"error": err}
+            if len(self._probe_buffer) < len(self._probe_targets):
+                return
+            self._on_auto_probe_complete(server_dev, client_dev)
+
+        for side, url, hca, port in self._probe_targets:
+            _get_async(
+                self,
+                f"{url.rstrip('/')}/api/rdma/probe?device={hca}&port={port}",
+                lambda data, err, _s=side: _done(_s, data, err),
+                timeout=4.0,
             )
+
+    def _on_auto_probe_complete(
+        self, server_dev: str, client_dev: str,
+    ) -> None:
+        """Both probes returned. Look for the same-subnet trap;
+        otherwise proceed."""
+        srv_probe = self._probe_buffer.get("server", {}) or {}
+        cli_probe = self._probe_buffer.get("client", {}) or {}
+        trapped, conflict_net = _detect_same_subnet_trap(
+            srv_probe, cli_probe,
+        )
+        if not trapped:
+            self._proceed_with_start(server_dev, client_dev)
+            return
+
+        # Trap detected. Pop the 3-way confirm.
+        srv_iface = srv_probe.get("kernel_iface") or "<server-iface>"
+        cli_iface = cli_probe.get("kernel_iface") or "<client-iface>"
+        dlg = _SameSubnetTrapConfirmDialog(
+            srv_iface=srv_iface, cli_iface=cli_iface,
+            shared_net=conflict_net,
+            parent=self,
+        )
+        result = dlg.exec_()
+        choice = dlg.choice()
+        if result != QDialog.Accepted or choice == "cancel":
+            self._start_btn.setEnabled(True)
+            self._set_status_ok("Start cancelled.")
+            return
+        if choice == "continue":
+            # Operator opted to run anyway.
+            self._proceed_with_start(server_dev, client_dev)
+            return
+        # choice == "apply"
+        # Auto-pick two different /24s from the v0.5.150 helper,
+        # apply them via /api/rdma/test_ifaces/configure, then
+        # proceed once the apply returns.
+        self._apply_test_ips_then_start(
+            srv_iface=srv_iface, cli_iface=cli_iface,
+            server_dev=server_dev, client_dev=client_dev,
+        )
+
+    def _apply_test_ips_then_start(
+        self, *,
+        srv_iface: str, cli_iface: str,
+        server_dev: str, client_dev: str,
+    ) -> None:
+        """Auto-pick two /24 CIDRs, POST configure, on success
+        track the state_id and proceed with Start."""
+        # Hard-code a pair of /24s the server-side validator will
+        # accept (the server's auto_pick_subnets() is the canonical
+        # source — but for an immediate single-pair use case the
+        # 10.42.0.0/24 / 10.43.0.0/24 pair almost always works).
+        cidr_pair = ("10.42.0.1/24", "10.43.0.1/24")
+        body = {
+            "ifaces": [
+                {"name": srv_iface, "cidr": cidr_pair[0]},
+                {"name": cli_iface, "cidr": cidr_pair[1]},
+            ],
+            "disable_rp_filter": True,
+        }
+        self._set_status_ok("Applying temporary test IPs…")
+
+        def _on_applied(data, err):
+            if err or not (data or {}).get("ok"):
+                msg = err or (data or {}).get(
+                    "error", "configure failed")
+                self._start_btn.setEnabled(True)
+                self._set_status_error(
+                    f"Auto-apply failed: {msg}. Open Pre-flight "
+                    f"to fix manually."
+                )
+                return
+            sid = (data or {}).get("state_id")
+            if sid:
+                self._preflight_state_ids.add(sid)
+            self._set_status_ok(
+                f"Test IPs applied (state_id={sid[:8] if sid else '?'}). "
+                f"Starting perftest…"
+            )
+            self._proceed_with_start(server_dev, client_dev)
+
+        _post_async(
+            self,
+            f"{self._server_tg_url}/api/rdma/test_ifaces/configure",
+            body, _on_applied,
+        )
 
     # ───────── v0.5.151 QP-verify help
 
@@ -980,6 +1159,41 @@ class RdmaBlastFlowDialog(QDialog):
         if not self._check_sibling_conflict("client", self._client_tg_url, client_dev):
             return
 
+        # v0.5.152 Option C-B: auto-detect the same-subnet routing
+        # trap BEFORE firing perftest. The trap is a same-host
+        # configuration where the kernel routes intra-host traffic
+        # via lo and the QP can't reach RTR. We hit this in the
+        # operator's srv06 testing twice — once because the pre-
+        # flight test IPs were cleaned up between runs.
+        #
+        # Skip the probe if either:
+        #   * we already have applied test IPs in this dialog
+        #     session (the operator went through Pre-flight already),
+        #   * server and client TGs are different hosts (same-host
+        #     trap is impossible),
+        #   * the operator just unchecked the auto-detect option
+        #     (configurable; see _preflight_autocheck_default).
+        same_host = (self._server_tg_url == self._client_tg_url)
+        already_applied = bool(self._preflight_state_ids)
+        if same_host and not already_applied:
+            self._set_status_ok(
+                "Probing endpoints for same-subnet trap…"
+            )
+            self._start_btn.setEnabled(False)
+            self._auto_probe_then_start(
+                server_dev=server_dev,
+                client_dev=client_dev,
+            )
+            return
+        # No same-host trap risk OR operator already fixed it via
+        # Pre-flight — go straight to the perftest start.
+        self._proceed_with_start(server_dev, client_dev)
+
+    def _proceed_with_start(self, server_dev: str, client_dev: str) -> None:
+        """Actually fire the perftest start sequence. Extracted from
+        the original `_on_start_clicked` body so the v0.5.152 auto-
+        trap-detect can defer this step behind an optional confirm
+        dialog."""
         test_id = self._test_combo.currentData()
         self._handshake_id = str(uuid.uuid4())
         opts = self._common_opts()
@@ -1554,3 +1768,110 @@ class _QpVerifyHelpDialog(QDialog):
                 cb.setText(text)
         except Exception:
             pass
+
+
+# ─────────────────────────────────── v0.5.152 same-subnet trap confirm ──
+
+
+class _SameSubnetTrapConfirmDialog(QDialog):
+    """Pops on Start when the auto-probe detects the same-subnet
+    trap. Three choices:
+
+      * **Apply & Start** — auto-pick test CIDRs, configure, then
+        proceed with perftest start.
+      * **Continue anyway** — operator overrides; perftest will
+        almost certainly fail at QP→RTR, but maybe they want to
+        see the error themselves or have an out-of-band fix.
+      * **Cancel** — abort Start.
+
+    Operator's choice is exposed via `choice()` after `exec_()`.
+    """
+
+    def __init__(
+        self,
+        *,
+        srv_iface: str, cli_iface: str,
+        shared_net: str,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Same-subnet trap detected")
+        self.setMinimumWidth(540)
+        self._choice = "cancel"
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(12, 12, 12, 12)
+        root.setSpacing(10)
+
+        title = QLabel(
+            "<span style='font-size:13px; font-weight:600; color:#b45309;'>"
+            "⚠️  Same-subnet routing trap detected</span>"
+        )
+        root.addWidget(title)
+
+        body = QLabel(
+            f"<p>Both kernel ifaces are in the same subnet "
+            f"<code>{shared_net}</code>:</p>"
+            f"<ul>"
+            f"<li><code>{srv_iface}</code> (server side)</li>"
+            f"<li><code>{cli_iface}</code> (client side)</li>"
+            f"</ul>"
+            f"<p>Linux will route traffic between them via "
+            f"<code>lo</code> instead of out the wire → "
+            f"perftest's QP can't reach RTR → 'Failed to modify "
+            f"QP to RTR'.</p>"
+            f"<p><b>Apply &amp; Start</b> will quietly add "
+            f"temporary test IPs on different subnets "
+            f"(<code>10.42.0.1/24</code> + <code>10.43.0.1/24</code> "
+            f"with the <code>&lt;iface&gt;:ng</code> label) and "
+            f"start perftest. Cleanup runs when this dialog "
+            f"closes.</p>"
+        )
+        body.setWordWrap(True)
+        body.setTextFormat(Qt.RichText)
+        root.addWidget(body)
+
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(8)
+
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self._on_cancel)
+        btn_row.addWidget(cancel_btn)
+
+        btn_row.addStretch(1)
+
+        continue_btn = QPushButton("Continue anyway")
+        continue_btn.setToolTip(
+            "Skip the auto-fix. perftest will start with the "
+            "current iface config — almost certainly will fail "
+            "at QP→RTR. Use this only if you have an out-of-band "
+            "route or you want to capture the failure."
+        )
+        continue_btn.clicked.connect(self._on_continue)
+        btn_row.addWidget(continue_btn)
+
+        apply_btn = QPushButton("Apply && Start")
+        apply_btn.setDefault(True)
+        apply_btn.setStyleSheet(
+            "QPushButton { background-color: #0ea5e9; color: white; "
+            "padding: 4px 12px; border-radius: 3px; font-weight: 600; }"
+        )
+        apply_btn.clicked.connect(self._on_apply)
+        btn_row.addWidget(apply_btn)
+
+        root.addLayout(btn_row)
+
+    def _on_apply(self) -> None:
+        self._choice = "apply"
+        self.accept()
+
+    def _on_continue(self) -> None:
+        self._choice = "continue"
+        self.accept()
+
+    def _on_cancel(self) -> None:
+        self._choice = "cancel"
+        self.reject()
+
+    def choice(self) -> str:
+        return self._choice
