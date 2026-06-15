@@ -311,6 +311,38 @@ class RdmaBlastFlowDialog(QDialog):
         self._client_port_spin.setFixedWidth(56)
         self._client_port_spin.setToolTip(_PORT_FIELD_TOOLTIP)
         dev_grid.addWidget(self._client_port_spin, 1, 3)
+
+        # v0.5.147: Loopback shortcut. Same-host loopback is the
+        # canonical RDMA smoke test (`ib_send_bw -d mlx5_0` on both
+        # sides). Operator wanted one-click setup rather than
+        # picking the same device twice manually. The button copies
+        # the server-side selection (device + IB port) onto the
+        # client side. Only meaningful when server and client TG
+        # are the same host — disabled otherwise via the
+        # `same_tg` check above.
+        self._loopback_btn = QPushButton(
+            "↔  Use server device for loopback "
+            "(same HCA on both sides)"
+        )
+        self._loopback_btn.setToolTip(
+            "Mirrors the server-side device + IB port onto the "
+            "client side. The canonical RDMA smoke test: both "
+            "perftest processes use the SAME HCA, the verbs layer "
+            "bounces packets internally, no wire/switch needed.\n\n"
+            "Use this first when troubleshooting — if same-HCA "
+            "loopback fails, the issue is in the RDMA stack itself "
+            "(GID, port state, driver) not link reachability."
+        )
+        self._loopback_btn.setEnabled(same_tg)
+        if not same_tg:
+            self._loopback_btn.setToolTip(
+                "Disabled: loopback requires server and client TG "
+                "to be the same host. Select one TG in the server "
+                "tree and reopen this dialog."
+            )
+        self._loopback_btn.clicked.connect(self._mirror_server_to_client)
+        dev_grid.addWidget(self._loopback_btn, 2, 0, 1, 4)
+
         dev_grid.setColumnStretch(1, 1)
         root.addWidget(dev_box)
 
@@ -688,6 +720,30 @@ class RdmaBlastFlowDialog(QDialog):
             "cpu_util": bool(self._cpu_util_check.isChecked()),
             "report_gbits": True,
         }
+
+    def _mirror_server_to_client(self) -> None:
+        """v0.5.147 Loopback button: copy the server-side device
+        selection + IB port onto the client side. The canonical
+        RDMA smoke test runs both perftest processes against the
+        same HCA — verbs bounces internally, no fabric required.
+
+        If the server combo hasn't probed yet (`(probing…)` /
+        userData is None), no-op silently — the user can click
+        again once devices show up.
+        """
+        srv_dev = self._server_device_combo.currentData()
+        if not srv_dev:
+            return
+        idx = self._client_device_combo.findData(srv_dev)
+        if idx < 0:
+            # Client side hasn't received this device yet (still
+            # probing). Add a placeholder so we don't drop the
+            # selection — _on_devices_resp will pick the right
+            # index on its next pass.
+            self._client_device_combo.addItem(srv_dev, userData=srv_dev)
+            idx = self._client_device_combo.findData(srv_dev)
+        self._client_device_combo.setCurrentIndex(idx)
+        self._client_port_spin.setValue(self._server_port_spin.value())
 
     def _check_sibling_conflict(self, side: str, tg_url: str, device: str) -> bool:
         """Return True if OK to proceed; False if operator cancelled."""

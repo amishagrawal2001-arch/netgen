@@ -2,6 +2,77 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.147] - 2026-06-14
+
+**One-click Loopback buttons in Blast + Topology RDMA dialogs.**
+
+Operator (after v0.5.146 exposed the real perftest error on a
+same-host two-HCA `rocep43s0f0 ↔ rocep43s0f1` setup that wasn't
+actually a working loopback):
+
+> "add an explicit 'Loopback test'"
+
+Same-host loopback IS supported by perftest — it's the canonical
+RDMA smoke test (`ib_send_bw -d mlx5_0` on both sides). Until
+v0.5.147 the operator had to type the same device into two text
+areas (Topology) or pick the same combo entry twice (Blast). Now
+it's one button.
+
+### Blast a RDMA Flow dialog
+
+* New **"↔ Use server device for loopback (same HCA on both sides)"**
+  button below the device combos. Click → server's device combo +
+  IB-port spin are mirrored onto the client side.
+* Disabled when `server_tg_url != client_tg_url` (loopback only
+  makes sense between processes on the same host). Tooltip
+  explains why.
+* Handles the probe race: if the client combo hasn't received
+  devices yet, the mirror adds the entry with the right userData
+  rather than dropping the selection.
+
+### RDMA Topology Test dialog
+
+* New **"↔ Loopback test (same HCA on both sides)"** button
+  beneath the endpoints box.
+* Click → opens `_LoopbackPickerDialog`: pick a TG, pick a HCA,
+  click OK. Both Server-endpoints AND Client-endpoints text areas
+  are set to the SAME `<tg_url> <device>` line.
+* Replaces rather than appends — loopback is a focused smoke
+  test; tacking it onto an existing multi-endpoint config would
+  confuse the topology expander.
+* Surfaces "(no HCAs)" + a pointer to Setup RDMA when
+  `/api/rdma/devices` returns empty.
+* OK button is disabled until the device probe completes — no
+  accidental accept on `(probing…)`.
+
+### Why this matters
+
+The canonical troubleshooting path for RDMA failures:
+
+1. Click Loopback → run on a single HCA. If it works, the RDMA
+   stack on this server is healthy.
+2. Switch to the two-HCA configuration. If THAT fails, the issue
+   is link reachability / GID / PFC config, not the RDMA stack.
+
+Splits the diagnostic surface so operators know whether to look
+at the driver or at the wire.
+
+### Files changed
+- `widgets/rdma_blast_flow_dialog.py` (`_loopback_btn`,
+  `_mirror_server_to_client`).
+- `widgets/rdma_topology_dialog.py` (`_loopback_btn`,
+  `_open_loopback_picker`, new `_LoopbackPickerDialog` class).
+- `pyproject.toml` (0.5.146 → 0.5.147).
+- `tests/test_v05147_loopback_buttons.py` (17 tests).
+
+### Verified
+```
+$ ./venv/bin/pytest tests/test_v05147_loopback_buttons.py -q
+17 passed in 0.05s
+```
+
+---
+
 ## [0.5.146] - 2026-06-14
 
 **perftest rc!=0 error filters out the config-dump banner so

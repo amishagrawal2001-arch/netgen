@@ -265,6 +265,37 @@ class RdmaTopologyDialog(QDialog):
         eg.addWidget(_make_side_header("Server endpoints", "server"), 0, 0)
         eg.addWidget(_make_side_header("Client endpoints", "client"), 0, 1)
 
+        # v0.5.147: one-click loopback row (added at the BOTTOM of
+        # the endpoints box, below the hint label — see the
+        # eg.addWidget(loopback_row, 3, ...) call after the hint).
+        # Pick a single (TG, HCA) and have both editors set to the
+        # same line. The canonical RDMA smoke test — if this fails,
+        # the problem is in the RDMA stack itself (GID / port state
+        # / driver) rather than link reachability between two
+        # ports.
+        self._loopback_btn = QPushButton(
+            "↔  Loopback test (same HCA on both sides)"
+        )
+        self._loopback_btn.setEnabled(bool(self._known_servers))
+        self._loopback_btn.setToolTip(
+            "Sets both endpoint lists to a single line using the "
+            "SAME (TG, HCA) on server and client. perftest's verbs "
+            "layer bounces packets internally — no wire, switch, "
+            "or peer NIC needed.\n\n"
+            "Use this first when troubleshooting RDMA. If "
+            "single-HCA loopback works, the stack is healthy and "
+            "any failure between two different HCAs is a path/"
+            "config issue. If single-HCA loopback fails too, the "
+            "issue is in the driver / GID / port state itself."
+        )
+        if not self._known_servers:
+            self._loopback_btn.setToolTip(
+                "Disabled: no registered TGs visible. Add servers "
+                "via the main window's Server Tree, then reopen "
+                "this dialog."
+            )
+        self._loopback_btn.clicked.connect(self._open_loopback_picker)
+
         self._server_edit = QPlainTextEdit()
         self._server_edit.setPlaceholderText(
             "http://srv01:5050 mlx5_0\n"
@@ -304,6 +335,16 @@ class RdmaTopologyDialog(QDialog):
         )
         hint.setWordWrap(True)
         eg.addWidget(hint, 2, 0, 1, 2)
+
+        # v0.5.147: loopback row sits at the BOTTOM of the
+        # endpoints box, right-aligned so it sits below the
+        # Client editor without crowding the labels above.
+        loopback_row = QWidget()
+        _lh = QHBoxLayout(loopback_row)
+        _lh.setContentsMargins(0, 0, 0, 0)
+        _lh.addStretch(1)
+        _lh.addWidget(self._loopback_btn)
+        eg.addWidget(loopback_row, 3, 0, 1, 2)
 
         eg.setColumnStretch(0, 1)
         eg.setColumnStretch(1, 1)
@@ -447,6 +488,32 @@ class RdmaTopologyDialog(QDialog):
             if rb.isChecked():
                 return sid
         return SHAPE_MESH
+
+    # ────────────────────────── v0.5.147 loopback picker ──────────────
+
+    def _open_loopback_picker(self) -> None:
+        """One-click loopback setup: pick a single (TG, HCA) and
+        write the SAME line into both endpoint editors. This is the
+        canonical RDMA smoke test — if it fails, the operator knows
+        the issue is in the RDMA stack (driver/GID/port state), not
+        link reachability between two ports."""
+        if not self._known_servers:
+            return
+        picker = _LoopbackPickerDialog(
+            servers=self._known_servers,
+            parent=self,
+        )
+        if picker.exec_() != QDialog.Accepted:
+            return
+        choice = picker.selected_line()
+        if not choice:
+            return
+        # BOTH editors get the same single line — that's the whole
+        # point of "loopback". We replace existing content rather
+        # than append (loopback is a focused smoke test; appending
+        # to a multi-endpoint config would be confusing).
+        self._server_edit.setPlainText(choice)
+        self._client_edit.setPlainText(choice)
 
     # ────────────────────────── v0.5.143 endpoint picker ──────────────
 
@@ -1016,3 +1083,148 @@ class _EndpointPickerDialog(QDialog):
 
     def selected_lines(self) -> List[str]:
         return list(self._selected)
+
+
+# ─────────────────────────────────── v0.5.147 loopback picker dialog ──
+
+
+class _LoopbackPickerDialog(QDialog):
+    """Single-(TG, HCA) picker for one-click loopback setup.
+
+    Smaller than `_EndpointPickerDialog` on purpose: loopback only
+    needs ONE choice (server + HCA), and both perftest sides get
+    the same line. The operator just wants to confirm "does this
+    HCA's RDMA stack work at all?" — picking one HCA via a server
+    combo + device combo is the most direct UX.
+    """
+
+    def __init__(
+        self,
+        servers: List[Tuple[str, str]],
+        *,
+        parent: Optional[QWidget] = None,
+    ) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Loopback Test — Pick HCA")
+        self.setMinimumWidth(420)
+        self._servers = list(servers)
+        self._chosen_line: str = ""
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(8)
+
+        hdr = QLabel(
+            "<span style='color:#475569;'>"
+            "Pick one <b>(TG, RDMA HCA)</b>. Both endpoint lists "
+            "in the parent dialog will be set to this same line — "
+            "perftest's verbs layer bounces packets internally, "
+            "no wire/switch needed."
+            "</span>"
+        )
+        hdr.setWordWrap(True)
+        root.addWidget(hdr)
+
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(6)
+        grid.setVerticalSpacing(4)
+
+        grid.addWidget(QLabel("Server (TG):"), 0, 0, Qt.AlignRight)
+        self._server_combo = QComboBox()
+        for url, label in self._servers:
+            self._server_combo.addItem(f"{label} — {url}", userData=url)
+        self._server_combo.currentIndexChanged.connect(self._probe_devices)
+        grid.addWidget(self._server_combo, 0, 1)
+
+        grid.addWidget(QLabel("RDMA HCA:"), 1, 0, Qt.AlignRight)
+        self._device_combo = QComboBox()
+        self._device_combo.setMinimumWidth(220)
+        self._device_combo.addItem("(probing…)", userData=None)
+        grid.addWidget(self._device_combo, 1, 1)
+
+        grid.setColumnStretch(1, 1)
+        root.addLayout(grid)
+
+        self._status = QLabel("")
+        self._status.setStyleSheet("color: #64748b; font-size: 11px;")
+        root.addWidget(self._status)
+
+        btns = QDialogButtonBox(
+            QDialogButtonBox.Ok | QDialogButtonBox.Cancel
+        )
+        self._ok_btn = btns.button(QDialogButtonBox.Ok)
+        self._ok_btn.setEnabled(False)
+        btns.accepted.connect(self._on_accept)
+        btns.rejected.connect(self.reject)
+        root.addWidget(btns)
+
+        # Kick off the first probe.
+        QTimer.singleShot(0, self._probe_devices)
+
+    def _probe_devices(self) -> None:
+        """Fetch /api/rdma/devices on the currently-selected TG.
+        Repopulates the device combo with the response. No-op if
+        the combo isn't ready yet (init order race)."""
+        if not hasattr(self, "_device_combo"):
+            return
+        from widgets.rdma_blast_flow_dialog import _get_async
+
+        url = self._server_combo.currentData()
+        if not url:
+            return
+        self._device_combo.clear()
+        self._device_combo.addItem("(probing…)", userData=None)
+        self._ok_btn.setEnabled(False)
+
+        def _on_done(data, err, _url=url):
+            try:
+                self._device_combo.count()
+            except RuntimeError:
+                return
+            self._device_combo.clear()
+            if err:
+                self._device_combo.addItem(f"error: {err}", userData=None)
+                self._status.setText(
+                    f"<span style='color:#b91c1c;'>{_url}: {err}</span>"
+                )
+                self._ok_btn.setEnabled(False)
+                return
+            devices = (data or {}).get("devices") or []
+            if not devices:
+                self._device_combo.addItem("(no HCAs)", userData=None)
+                self._status.setText(
+                    "<span style='color:#b91c1c;'>"
+                    "No RDMA HCAs on this TG — verify RDMA is "
+                    "installed (Tools → RDMA → Setup RDMA…)."
+                    "</span>"
+                )
+                self._ok_btn.setEnabled(False)
+                return
+            for dev in devices:
+                name = dev.get("name", "?")
+                ports = dev.get("ports") or []
+                state = ""
+                if ports:
+                    p = ports[0]
+                    state = f"  ({(p.get('state') or '').upper()})"
+                self._device_combo.addItem(f"{name}{state}", userData=name)
+            self._status.setText(
+                f"<span style='color:#64748b;'>"
+                f"{len(devices)} HCA(s) on {_url}."
+                f"</span>"
+            )
+            self._ok_btn.setEnabled(True)
+
+        _get_async(self, f"{url.rstrip('/')}/api/rdma/devices",
+                   _on_done, timeout=6.0)
+
+    def _on_accept(self) -> None:
+        url = self._server_combo.currentData()
+        dev = self._device_combo.currentData()
+        if not url or not dev:
+            return
+        self._chosen_line = f"{url} {dev}"
+        self.accept()
+
+    def selected_line(self) -> str:
+        return self._chosen_line
