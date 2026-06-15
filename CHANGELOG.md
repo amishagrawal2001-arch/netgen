@@ -2,6 +2,47 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.145] - 2026-06-14
+
+**Hotfix: v0.5.144 iface-loss renderer crashed on cold start.**
+
+Operator hit, immediately after upgrading to v0.5.144:
+
+```
+File "traffic_client/statistics_section.py", line 1874, in
+update_statistics_table
+    peer = filtered_statistics.get(peer_name) or
+           merged_statistics.get(peer_name)
+NameError: name 'filtered_statistics' is not defined
+zsh: abort      venv/bin/python run_tgen_client.py
+```
+
+`filtered_statistics` and `merged_statistics` are local variables
+in `_on_stats_fetch_finished` — the call site that builds the
+dict and hands the filtered version to `update_statistics_table`.
+Inside the renderer, the dict is named `statistics` (the
+parameter). My v0.5.144 patch wrote the wrong names; static
+analysis happily compiled it but the first call site exploded.
+
+### Fix
+
+`peer = statistics.get(peer_name)` — one-line scope correction.
+
+### Files changed
+- `traffic_client/statistics_section.py` (one line)
+- `pyproject.toml` (0.5.144 → 0.5.145)
+- `tests/test_v05145_iface_loss_scope_hotfix.py` (5 tests pinning
+  the renderer source + an inline-stub behavioral test)
+
+### Verified
+```
+$ ./venv/bin/pytest tests/test_v05145_iface_loss_scope_hotfix.py \
+                    tests/test_v05144_iface_loss_phy_pair.py -q
+20 passed in 0.19s
+```
+
+---
+
 ## [0.5.144] - 2026-06-14
 
 **Iface Packets Lost / Loss % now use PHY pair counters, not the

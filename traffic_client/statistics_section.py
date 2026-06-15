@@ -1868,10 +1868,15 @@ class TrafficGenClientStatisticsSection():
             own_phy_rx = stats.get("phy_rx", 0)
             peers = stats.get("peer_ifaces") or set()
 
+            # v0.5.145 hotfix: peer lookup uses the renderer's input
+            # dict (`statistics`), not `filtered_statistics` /
+            # `merged_statistics`. Those names live in
+            # `_on_stats_fetch_finished` — they're out of scope here
+            # (NameError on cold start, operator-reported).
             peer_phy_tx = 0
             peer_phy_rx = 0
             for peer_name in peers:
-                peer = filtered_statistics.get(peer_name) or merged_statistics.get(peer_name)
+                peer = statistics.get(peer_name)
                 if not peer:
                     continue
                 peer_phy_tx = max(peer_phy_tx, peer.get("phy_tx", 0))
