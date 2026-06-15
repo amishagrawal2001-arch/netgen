@@ -170,15 +170,12 @@ def test_detect_start_blockers_returns_none_on_clean():
 
 
 def test_confirm_dialog_renamed():
-    """v0.5.153 renames `_SameSubnetTrapConfirmDialog` to the
-    broader `_StartBlockerConfirmDialog`. Old name kept as alias
-    for back-compat."""
+    """v0.5.153 renamed `_SameSubnetTrapConfirmDialog` →
+    `_StartBlockerConfirmDialog`. v0.5.158 removed the back-compat
+    alias since nothing else imported it."""
     assert "class _StartBlockerConfirmDialog(" in SRC_BLAST
-    # And the alias.
-    assert (
-        "_SameSubnetTrapConfirmDialog = _StartBlockerConfirmDialog"
-        in SRC_BLAST
-    )
+    # Dead alias gone.
+    assert "_SameSubnetTrapConfirmDialog =" not in SRC_BLAST
 
 
 def test_confirm_dialog_handles_all_four_reasons():

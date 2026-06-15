@@ -2,6 +2,47 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.158] - 2026-06-15
+
+**Slice C: polish — dead-alias cleanup + fallback warning
+surface.**
+
+Operator: "go A first then B, and then C" — final slice.
+
+### #1 — Dead `_SameSubnetTrapConfirmDialog` alias removed
+
+v0.5.153 renamed the v0.5.152 class to `_StartBlockerConfirmDialog`
+and kept the old name as `_SameSubnetTrapConfirmDialog =
+_StartBlockerConfirmDialog` for back-compat. Nothing in the
+codebase imported the old name; the alias just confused new
+readers. Dropped. Tests updated to assert the alias is gone.
+
+### #2 — Host-info fallback surfaced to operator
+
+Before: when `_host_info_cache` was empty (operator didn't click
+🚀 Max BW) OR `pick_workers_for_hca` couldn't find the HCA in
+the host's NUMA map, `_start_extra_workers` (Blast) and
+`_start_pair_extra_workers` (Topology) silently fell back to
+`list(range(N))` — no NUMA pin, cross-NUMA RAM access, aggregate
+BW capped. Operator had no signal this was happening and would
+chase phantom wire issues.
+
+Now both code paths build a `fallback_reason` string and
+`_stats_view.append(f"[workers] ⚠ {reason}")` (Blast) or
+`[pair #N] ⚠ {reason}` (Topology). Three concrete reasons:
+
+* `no host_info cached (operator skipped 🚀 Max BW) — linear CPU
+  ordering, no NUMA pin. Cross-NUMA RAM access may cap aggregate
+  BW.`
+* `HCA <name> not in host's NUMA map — linear CPU ordering, no
+  NUMA pin`
+* `pick_workers_for_hca failed: <exc>`
+
+### Tests
+
+`tests/test_v05158_slice_c_polish.py` — 5 new. Combined RDMA
+regression sweep with Slice C: 129 passing.
+
 ## [0.5.157] - 2026-06-15
 
 **Slice B: Blast + Topology multi-worker hygiene.**

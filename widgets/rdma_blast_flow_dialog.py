@@ -1226,6 +1226,7 @@ class RdmaBlastFlowDialog(QDialog):
         # Pick the CPU IDs for workers 1..N-1.
         info = self._host_info_cache
         numa_pin = None
+        fallback_reason = None
         if info:
             try:
                 from utils.rdma_host_info import pick_workers_for_hca
@@ -1236,10 +1237,27 @@ class RdmaBlastFlowDialog(QDialog):
                 )
                 cpus = pick.get("cpus") or list(range(worker_count))
                 numa_pin = pick.get("numa_pin")
-            except Exception:
+                if numa_pin is None:
+                    fallback_reason = (
+                        f"HCA {server_dev} not in host's NUMA map — "
+                        f"linear CPU ordering, no NUMA pin"
+                    )
+            except Exception as exc:
                 cpus = list(range(worker_count))
+                fallback_reason = f"pick_workers_for_hca failed: {exc}"
         else:
             cpus = list(range(worker_count))
+            fallback_reason = (
+                "no host_info cached (operator skipped 🚀 Max BW) — "
+                "linear CPU ordering, no NUMA pin. Cross-NUMA RAM "
+                "access may cap aggregate BW."
+            )
+        # v0.5.158: surface the fallback to the operator so a slow
+        # run doesn't get misdiagnosed as a perftest / wire issue.
+        if fallback_reason:
+            self._stats_view.append(
+                f"[workers] ⚠ {fallback_reason}"
+            )
         # v0.5.157: clamp every CPU ID to the host's actual
         # cpu_count-1 ceiling. When the host_info cache is empty
         # OR pick_workers_for_hca falls back to linear range, we
@@ -2451,8 +2469,3 @@ class _StartBlockerConfirmDialog(QDialog):
 
     def choice(self) -> str:
         return self._choice
-
-
-# v0.5.153: keep a backwards-compat alias in case anything outside
-# the dialog itself imported the old name.
-_SameSubnetTrapConfirmDialog = _StartBlockerConfirmDialog

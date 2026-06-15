@@ -178,13 +178,9 @@ def test_auto_apply_tracks_state_id_on_success():
 
 
 def test_confirm_dialog_class_exists():
-    # v0.5.153 renamed the class to _StartBlockerConfirmDialog
-    # (covers DOWN port / missing IP / probe failure too) and
-    # kept the v0.5.152 name as an alias.
-    assert (
-        "class _StartBlockerConfirmDialog(" in SRC_BLAST
-        or "class _SameSubnetTrapConfirmDialog(" in SRC_BLAST
-    )
+    # v0.5.153 renamed to _StartBlockerConfirmDialog; v0.5.158
+    # dropped the back-compat alias.
+    assert "class _StartBlockerConfirmDialog(" in SRC_BLAST
 
 
 def test_confirm_dialog_has_three_choices():

@@ -1113,6 +1113,7 @@ class RdmaTopologyDialog(QDialog):
         info = self._host_info_cache or {}
         numa_pin = None
         cpus: List[int] = []
+        fallback_reason = None
         try:
             from utils.rdma_host_info import pick_workers_for_hca
             pick = pick_workers_for_hca(
@@ -1122,8 +1123,25 @@ class RdmaTopologyDialog(QDialog):
             )
             numa_pin = pick.get("numa_pin")
             cpus = pick.get("cpus") or list(range(worker_count))
-        except Exception:
+            if not info:
+                fallback_reason = (
+                    "no host_info cached (operator skipped 🚀 Max BW) — "
+                    "linear CPU ordering, no NUMA pin"
+                )
+            elif numa_pin is None:
+                fallback_reason = (
+                    f"HCA {plan.server.device} not in host's NUMA map — "
+                    f"linear CPU ordering, no NUMA pin"
+                )
+        except Exception as exc:
             cpus = list(range(worker_count))
+            fallback_reason = f"pick_workers_for_hca failed: {exc}"
+        # v0.5.158: surface the fallback so cross-NUMA penalty
+        # doesn't get misdiagnosed as a wire issue.
+        if fallback_reason:
+            self._stats_view.append(
+                f"[pair #{plan.pair_index}] ⚠ {fallback_reason}"
+            )
         # v0.5.157: clamp to cpu_count - 1 so a high worker_count
         # on a small-core host doesn't ask taskset for a CPU that
         # doesn't exist (matches the Blast _start_extra_workers
