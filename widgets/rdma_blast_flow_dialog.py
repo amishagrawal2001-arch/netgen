@@ -262,6 +262,17 @@ class RdmaBlastFlowDialog(QDialog):
         self._handshake_id: Optional[str] = None
         self._server_job_id: Optional[str] = None
         self._client_job_id: Optional[str] = None
+        # v0.5.155 parallel-worker BW scaling. Worker 0 stays in
+        # `_server_job_id`/`_client_job_id` (back-compat with all
+        # the existing single-worker code paths). Workers 1..N-1
+        # land in `_extra_workers`, each as
+        # {server: jid, client: jid, cpu_pin: int, worker_idx: int}.
+        # Poll/stop loops iterate worker 0 + extras. Stats display
+        # prefixes extras with [worker N].
+        self._extra_workers: list = []
+        # Cached `/api/rdma/host_info` snapshot (populated lazily
+        # when the operator opens the Max-BW picker).
+        self._host_info_cache: Optional[dict] = None
         # Live stats panel state.
         self._poll_timer: Optional[QTimer] = None
         # Sibling iface guard — wired by the menu handler the same way
@@ -622,10 +633,47 @@ class RdmaBlastFlowDialog(QDialog):
         tg.addWidget(_qp_row, 2, 1)
         tg.addWidget(QLabel("GID index:"), 2, 2, Qt.AlignRight)
         tg.addWidget(self._gid_index_spin, 2, 3)
-        # Row 3: Duration | (free for the bidir checkbox to flow into
-        #                    the spacious slot)
+        # Row 3: Duration | Parallel workers (v0.5.155)
         tg.addWidget(QLabel("Duration:"),  3, 0, Qt.AlignRight)
         tg.addWidget(self._duration_spin,  3, 1)
+        # v0.5.155: Parallel workers spinbox + 🚀 Max BW button.
+        # perftest is single-threaded — for genuine multi-core BW
+        # scaling you spawn N processes, each pinned to a
+        # different core via taskset. The button auto-picks
+        # NUMA-local cores so the worker's CPU + RAM + HCA all
+        # share a NUMA node (avoids the cross-NUMA penalty).
+        tg.addWidget(QLabel("Parallel workers:"), 3, 2, Qt.AlignRight)
+        self._parallel_workers_spin = QSpinBox()
+        self._parallel_workers_spin.setRange(1, 64)
+        self._parallel_workers_spin.setValue(1)
+        self._parallel_workers_spin.setFixedWidth(100)
+        self._parallel_workers_spin.setToolTip(
+            "Number of perftest processes spawned in parallel, "
+            "each pinned to a different CPU core via taskset. For "
+            "genuine BW scaling on a single HCA — perftest itself "
+            "is single-threaded, so >1 here is the ONLY way to "
+            "exceed single-core line rate.\n\n"
+            "Click 🚀 Max BW to auto-pick the optimal count based "
+            "on the HCA's NUMA topology."
+        )
+        _pw_row = QWidget()
+        _pwh = QHBoxLayout(_pw_row)
+        _pwh.setContentsMargins(0, 0, 0, 0)
+        _pwh.setSpacing(4)
+        _pwh.addWidget(self._parallel_workers_spin)
+        self._max_bw_btn = QPushButton("🚀 Max BW")
+        self._max_bw_btn.setFixedWidth(86)
+        self._max_bw_btn.setToolTip(
+            "Query the server's NUMA topology, find the HCA's "
+            "home node, and set Parallel workers = number of CPU "
+            "cores on that node. Workers run with "
+            "`numactl --cpunodebind --membind taskset -c <core>` "
+            "so CPU, RAM, and PCIe path all align with the HCA."
+        )
+        self._max_bw_btn.clicked.connect(self._on_max_bw_clicked)
+        _pwh.addWidget(self._max_bw_btn)
+        _pwh.addStretch(1)
+        tg.addWidget(_pw_row, 3, 3)
         # Row 4: both checkboxes inline
         cb_row = QHBoxLayout()
         cb_row.setSpacing(16)
@@ -1113,6 +1161,172 @@ class RdmaBlastFlowDialog(QDialog):
             {"ifaces": ifaces}, _on_validated,
         )
 
+    # ───────── v0.5.155 Parallel workers + 🚀 Max BW
+
+    def _on_max_bw_clicked(self) -> None:
+        """Query /api/rdma/host_info on the server-side TG and
+        auto-pick the optimal worker count via
+        `pick_workers_for_hca`. Sets the spinbox; doesn't fire
+        Start (operator confirms via the Start button)."""
+        hca = self._server_device_combo.currentData()
+        if not hca:
+            self._set_status_error(
+                "Pick a server-side device first.")
+            return
+        self._set_status_ok("Querying host topology…")
+
+        def _on_info(data, err):
+            if err or not data:
+                self._set_status_error(
+                    f"host_info failed: {err or 'no data'}. Set "
+                    f"Parallel workers manually.")
+                return
+            self._host_info_cache = data
+            try:
+                from utils.rdma_host_info import pick_workers_for_hca
+                pick = pick_workers_for_hca(
+                    hca=hca, requested=None, info=data)
+            except Exception as exc:
+                self._set_status_error(
+                    f"pick_workers failed: {exc}")
+                return
+            wc = int(pick.get("worker_count") or 1)
+            # Cap to the spinbox max.
+            wc = max(1, min(wc, 64))
+            self._parallel_workers_spin.setValue(wc)
+            self._set_status_ok(
+                f"🚀 {pick.get('reason', f'{wc} worker(s)')}"
+            )
+
+        _get_async(
+            self,
+            f"{self._server_tg_url}/api/rdma/host_info",
+            _on_info, timeout=4.0,
+        )
+
+    def _start_extra_workers(
+        self, *,
+        test_id: str,
+        server_dev: str, client_dev: str,
+        opts: Dict[str, Any],
+    ) -> None:
+        """v0.5.155: after worker 0's (server, client) pair is up
+        and running, fan out workers 1..N-1 with cpu_pin set per
+        worker. Workers run concurrently — total BW = sum of all
+        worker BWs.
+
+        Uses the cached host_info (populated by the 🚀 Max BW
+        button) when present to pick NUMA-local cores. Falls back
+        to linear cores 0..N-1 when no cache is available.
+        """
+        worker_count = int(self._parallel_workers_spin.value())
+        if worker_count <= 1:
+            return  # single-worker case — nothing to do here.
+
+        # Pick the CPU IDs for workers 1..N-1.
+        info = self._host_info_cache
+        numa_pin = None
+        if info:
+            try:
+                from utils.rdma_host_info import pick_workers_for_hca
+                pick = pick_workers_for_hca(
+                    hca=server_dev,
+                    requested=worker_count,
+                    info=info,
+                )
+                cpus = pick.get("cpus") or list(range(worker_count))
+                numa_pin = pick.get("numa_pin")
+            except Exception:
+                cpus = list(range(worker_count))
+        else:
+            cpus = list(range(worker_count))
+
+        from urllib.parse import urlparse as _urlparse
+        # Worker 0 already running (started via the main flow).
+        # Spawn 1..N-1 here.
+        for worker_idx in range(1, worker_count):
+            cpu = cpus[worker_idx] if worker_idx < len(cpus) else worker_idx
+            worker_handshake = f"{self._handshake_id}-w{worker_idx}"
+            base_port = int(opts.get("base_port") or 0)
+            extra_port = base_port + worker_idx if base_port else None
+
+            srv_body = {
+                "role": "server",
+                "test": test_id,
+                "device": server_dev,
+                "ib_port": int(self._server_port_spin.value()),
+                "handshake_id": worker_handshake,
+                "note": f"Blast RDMA Flow / {test_id} / worker {worker_idx}",
+                "cpu_pin": cpu,
+                "numa_pin": numa_pin,
+                **opts,
+            }
+            if extra_port:
+                srv_body["listen_port"] = extra_port
+
+            def _on_extra_server_started(
+                data, err,
+                _w=worker_idx, _cpu=cpu,
+                _client_dev=client_dev, _test_id=test_id,
+                _hand=worker_handshake, _opts=opts,
+            ):
+                if err or not data or data.get("status") != "started":
+                    self._stats_view.append(
+                        f"[worker {_w}/server] start failed: "
+                        f"{err or (data and data.get('error'))}"
+                    )
+                    return
+                srv_jid = data.get("job_id")
+                cli_body = {
+                    "role": "client",
+                    "test": _test_id,
+                    "device": _client_dev,
+                    "ib_port": int(self._client_port_spin.value()),
+                    "handshake_id": _hand,
+                    "note": f"Blast RDMA Flow / {_test_id} / worker {_w}",
+                    "cpu_pin": _cpu,
+                    "numa_pin": numa_pin,
+                    "peer_addr": _urlparse(self._server_tg_url).hostname,
+                    **_opts,
+                }
+
+                def _on_extra_client_started(
+                    cdata, cerr, _w2=_w, _srv_jid=srv_jid,
+                    _cpu2=_cpu,
+                ):
+                    if cerr or not cdata or cdata.get("status") != "started":
+                        self._stats_view.append(
+                            f"[worker {_w2}/client] start failed: "
+                            f"{cerr or (cdata and cdata.get('error'))}"
+                        )
+                        return
+                    cli_jid = cdata.get("job_id")
+                    self._extra_workers.append({
+                        "worker_idx": _w2,
+                        "cpu_pin": _cpu2,
+                        "server": _srv_jid,
+                        "client": cli_jid,
+                        "server_finished": False,
+                        "client_finished": False,
+                    })
+                    self._stats_view.append(
+                        f"[worker {_w2}] both halves running "
+                        f"(cpu={_cpu2}, server_job={_srv_jid[:8]} "
+                        f"client_job={cli_jid[:8]})"
+                    )
+
+                _post_async(
+                    self,
+                    f"{self._client_tg_url}/api/rdma/perftest/start",
+                    cli_body, _on_extra_client_started,
+                )
+
+            _post_async(
+                self,
+                f"{self._server_tg_url}/api/rdma/perftest/start",
+                srv_body, _on_extra_server_started,
+            )
+
     # ───────── v0.5.151 QP-verify help
 
     def _show_qp_verify_help(self) -> None:
@@ -1284,6 +1498,16 @@ class RdmaBlastFlowDialog(QDialog):
         test_id = self._test_combo.currentData()
         self._handshake_id = str(uuid.uuid4())
         opts = self._common_opts()
+        # v0.5.155: stash so `_on_client_started` can fan out extras
+        # for parallel-worker BW scaling.
+        self._last_start_params = {
+            "test_id": test_id,
+            "server_dev": server_dev,
+            "client_dev": client_dev,
+            "opts": dict(opts),
+        }
+        # Reset extra-workers tracking for this run.
+        self._extra_workers = []
 
         # v0.3.19: reset per-side finished tracking + render-dedup so
         # a second run in the same dialog session doesn't see stale
@@ -1393,6 +1617,26 @@ class RdmaBlastFlowDialog(QDialog):
         )
         self._stop_btn.setEnabled(True)
         self._start_poll_timer()
+        # v0.5.155: fan out workers 1..N-1 for parallel BW scaling.
+        # No-op when Parallel workers = 1.
+        try:
+            wc = int(self._parallel_workers_spin.value())
+        except (AttributeError, RuntimeError):
+            wc = 1
+        if wc > 1 and getattr(self, "_last_start_params", None):
+            p = self._last_start_params
+            self._stats_view.append(
+                f"[worker 0] both halves running "
+                f"(server_job={self._server_job_id[:8]} "
+                f"client_job={self._client_job_id[:8]}). "
+                f"Spawning {wc - 1} extra worker(s)…"
+            )
+            self._start_extra_workers(
+                test_id=p["test_id"],
+                server_dev=p["server_dev"],
+                client_dev=p["client_dev"],
+                opts=p["opts"],
+            )
 
     def _start_poll_timer(self) -> None:
         if self._poll_timer is not None:
@@ -1405,7 +1649,98 @@ class RdmaBlastFlowDialog(QDialog):
         # 2 s tick.
         self._poll_jobs()
 
+    def _poll_extras(self) -> None:
+        """v0.5.155: poll every extra worker's (server, client)
+        pair. On completion we let _on_job_resp track per-worker
+        finished state via the worker dict's flags."""
+        for w in list(self._extra_workers):
+            if w.get("server"):
+                _get_async(
+                    self,
+                    f"{self._server_tg_url}/api/rdma/perftest/job/{w['server']}",
+                    lambda data, err, _w=w:
+                        self._on_extra_job_resp("server", _w, data, err),
+                )
+            if w.get("client"):
+                _get_async(
+                    self,
+                    f"{self._client_tg_url}/api/rdma/perftest/job/{w['client']}",
+                    lambda data, err, _w=w:
+                        self._on_extra_job_resp("client", _w, data, err),
+                )
+
+    def _on_extra_job_resp(
+        self, side: str, w: Dict[str, Any],
+        data: Optional[dict], err: str,
+    ) -> None:
+        """Per-extra-worker completion tracking. Renders a short
+        line when each half finishes; sums BW into the TOTAL once
+        every worker is done."""
+        if err or not data:
+            return
+        if data.get("finished_at") is not None:
+            done_key = f"{side}_finished"
+            if not w.get(done_key):
+                w[done_key] = True
+                wi = w.get("worker_idx", "?")
+                rc = data.get("returncode")
+                bw = data.get("final_bw_avg_gbps")
+                mr = data.get("final_msg_rate_mpps")
+                self._stats_view.append(
+                    f"[worker {wi}/{side}] done (rc={rc})  "
+                    f"BW avg={bw} Gbps  MsgRate={mr} Mpps"
+                )
+                # Stash final stats for the TOTAL summary.
+                w.setdefault(f"{side}_bw", bw)
+                w.setdefault(f"{side}_msgrate", mr)
+                w[f"{side}_rc"] = rc
+                self._maybe_emit_total()
+
+    def _maybe_emit_total(self) -> None:
+        """If every (worker 0 + extras) half is done, append a
+        TOTAL row summing BW + MsgRate. Idempotent — guarded by
+        `_total_emitted` so re-polls don't append duplicates."""
+        if getattr(self, "_total_emitted", False):
+            return
+        # Worker 0 done?
+        if not (self._server_finished and self._client_finished):
+            return
+        # Every extra worker done on both halves?
+        for w in self._extra_workers:
+            if not (w.get("server_finished") and w.get("client_finished")):
+                return
+        # Compute the TOTAL. Only sum the CLIENT-side BW (the
+        # server-side BW row from perftest is usually identical to
+        # the client's; double-counting would mislead).
+        total_bw = 0.0
+        total_mr = 0.0
+        n = 0
+        # Worker 0 final stats live on the latest job dicts cached
+        # by the per-worker `_on_job_resp`. For simplicity we leave
+        # worker 0's stats to be visible in its own [client] done
+        # line and only sum extras explicitly.
+        for w in self._extra_workers:
+            bw = w.get("client_bw")
+            mr = w.get("client_msgrate")
+            if isinstance(bw, (int, float)):
+                total_bw += float(bw)
+                n += 1
+            if isinstance(mr, (int, float)):
+                total_mr += float(mr)
+        if n == 0:
+            return
+        self._stats_view.append(
+            f"\n[TOTAL across {n + 1} workers] (extras only — "
+            f"worker 0 line above is separate) "
+            f"extra-workers BW={total_bw:.2f} Gbps  "
+            f"MsgRate={total_mr:.4f} Mpps. Add to worker 0's line "
+            f"for grand total."
+        )
+        self._total_emitted = True
+
     def _poll_jobs(self) -> None:
+        # v0.5.155: poll extras alongside worker 0.
+        self._poll_extras()
         if self._server_job_id:
             _get_async(
                 self,
@@ -1597,9 +1932,22 @@ class RdmaBlastFlowDialog(QDialog):
                 {"job_id": self._client_job_id, "forget_pair": True},
                 lambda *_: None,
             )
+        # v0.5.155: stop every extra worker.
+        for w in self._extra_workers:
+            for url, jid in (
+                (self._server_tg_url, w.get("server")),
+                (self._client_tg_url, w.get("client")),
+            ):
+                if jid:
+                    _post_async(
+                        self,
+                        f"{url}/api/rdma/perftest/stop",
+                        {"job_id": jid, "forget_pair": True},
+                        lambda *_: None,
+                    )
         if self._poll_timer is not None:
             self._poll_timer.stop()
-        self._set_status_warn("Stop requested. Both halves will tear down.")
+        self._set_status_warn("Stop requested. All workers will tear down.")
         self._start_btn.setEnabled(True)
 
     def _teardown_server_only(self) -> None:

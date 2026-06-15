@@ -18459,6 +18459,37 @@ def api_rdma_devices():
         return jsonify({"devices": [], "error": str(exc)}), 500
 
 
+# ─────────────────────────────────────────── v0.5.155 RDMA host info
+
+@app.route("/api/rdma/host_info", methods=["GET"])
+def api_rdma_host_info():
+    """Topology snapshot for the Blast dialog's parallel-worker
+    feature. Shape:
+
+        {cpu_count: int,
+         numa_nodes: [{node_id, cpus: [...]}, ...],
+         hca_numa:   {hca_name: node_id, ...}}
+
+    Used by the client to:
+      * cap the Parallel-workers spinbox at cpu_count,
+      * resolve the "🚀 Max BW" button — `pick_workers_for_hca`
+        picks NUMA-local cores to avoid the cross-NUMA penalty
+        from v0.5.131.
+
+    Pure sysfs read — never raises (synthesizes a flat single-
+    node 0 on hosts without /sys/devices/system/node/).
+    """
+    try:
+        from utils.rdma_host_info import host_info
+        return jsonify(host_info())
+    except Exception as exc:
+        logging.exception("[rdma] /api/rdma/host_info failed")
+        return jsonify({
+            "cpu_count": 1, "numa_nodes": [], "hca_numa": {},
+            "error": str(exc),
+        }), 500
+
+
 # ─────────────────────────────────────────── v0.5.150 RDMA preflight
 
 @app.route("/api/rdma/probe", methods=["GET"])

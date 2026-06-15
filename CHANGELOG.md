@@ -2,6 +2,108 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.155] - 2026-06-15
+
+**Parallel workers + 🚀 Max BW: true single-HCA BW scaling via CPU
++ NUMA pinning.**
+
+Operator: "how can we add parallel cpus for BW scale?" → "go max"
+(Layer 2 + Layer 3 in one ship).
+
+perftest is single-threaded — single-process QP scaling tops out
+at one CPU's worth of work (~171 Gbps on srv06's 200 GbE). v0.5.155
+spawns N independent perftest processes per side, each pinned to a
+different core. Pinning all workers to the HCA's home NUMA node
+aligns CPU + RAM + PCIe (avoids the cross-NUMA penalty from
+v0.5.131).
+
+### Server side
+
+* **`start_perftest()` accepts `cpu_pin` + `numa_pin`** in `opts`.
+  When set, the perftest spawn is wrapped in
+  `numactl --cpunodebind=<N> --membind=<N> -- taskset -c <N>
+  <perftest> …`.
+* **New `utils/rdma_host_info.py`**:
+  - `host_info()` → `{cpu_count, numa_nodes, hca_numa}` snapshot
+    from sysfs (`/sys/devices/system/node/`,
+    `/sys/class/infiniband/<hca>/device/numa_node`).
+  - `pick_workers_for_hca(hca, requested?, info?)` →
+    `{worker_count, numa_pin, cpus, reason}`. Picks NUMA-local
+    cores; caps at 16 (past that, marginal BW drops and HCA QP
+    context cache thrashes).
+  - Synthesizes a flat `node 0` when sysfs is absent
+    (containers, dev machines).
+* **New `GET /api/rdma/host_info`** route. Returns the safe
+  `{cpu_count:1, numa_nodes:[], hca_numa:{}}` skeleton on any
+  internal failure — never raises.
+
+### Client side
+
+* **"Parallel workers"** spinbox in the Test parameters grid
+  (range 1–64, default 1).
+* **"🚀 Max BW"** button next to it. Click → `GET host_info` →
+  `pick_workers_for_hca(server_hca)` → spinbox auto-fills with
+  the NUMA-local CPU count. Status banner shows the rationale
+  ("12 worker(s) pinned to NUMA node 0 (HCA mlx5_0's home node).").
+* **Worker fan-out**: when Parallel workers > 1, after worker 0
+  (the existing `_server_job_id`/`_client_job_id`) is up,
+  `_start_extra_workers()` spawns workers 1..N-1 — each with:
+  - Unique `cpu_pin` (next NUMA-local core),
+  - Shared `numa_pin` (the HCA's home node),
+  - Unique `listen_port` (`base_port + worker_idx`),
+  - Unique `handshake_id` (`<base>-w<N>` so netgen's handshake
+    broker doesn't cross-wire workers).
+* **Stop / Close** tear down all workers (worker 0 +
+  `_extra_workers`).
+* **Poll loop** iterates worker 0 + extras.
+* **Live stats**: per-worker `[worker N/server|client] done
+  (rc=0)  BW avg=… Gbps  MsgRate=… Mpps` lines. Once every
+  worker half is done, an inline **TOTAL** line sums BW + MsgRate
+  across extras.
+
+### What you'd see on srv06
+
+Click "🚀 Max BW" with `rocep43s0f0` selected:
+- Spinbox auto-fills to (e.g.) 12 if the HCA is on a 12-core
+  NUMA node.
+- Click Start → 12 perftest pairs spawn, each on a distinct
+  core, all NUMA-local.
+- Expected total BW: ~10× single-worker (with diminishing
+  returns above ~10 workers due to PCIe-Gen5 x16 ceiling at
+  ~500 Gbps practical). The 200 Gbps wire is your real cap
+  long before CPU is.
+
+### Files changed
+- `utils/rdma_perf.py` (~30 lines: cpu_pin + numa_pin wrappers).
+- `utils/rdma_host_info.py` (NEW, ~220 lines).
+- `run_tgen_server.py` (+~25 lines: `/api/rdma/host_info`).
+- `widgets/rdma_blast_flow_dialog.py` (+~250 lines: UI controls,
+  `_on_max_bw_clicked`, `_start_extra_workers`, `_poll_extras`,
+  `_on_extra_job_resp`, `_maybe_emit_total`, Stop iteration).
+- `pyproject.toml` (0.5.154 → 0.5.155).
+- `tests/test_v05155_parallel_workers.py` (25 tests).
+
+### Deferred
+* **Aggregate worker 0 into the TOTAL line** — currently the
+  TOTAL summary only sums extras (worker 0's stats appear in
+  the existing single-worker output). v0.5.156 if you want a
+  single Grand Total line.
+* **Topology dialog** parallel-worker mode — same fan-out shape
+  but per-pair. Not in v0.5.155 because Topology already supports
+  multi-pair via its endpoint editors, which gives similar
+  scaling at the cost of typing more endpoint lines.
+
+### Verified
+```
+$ ./venv/bin/pytest tests/test_v05155_parallel_workers.py -q
+25 passed in 0.08s
+
+$ ./venv/bin/pytest tests/ -q -k "rdma or blast or topology or perftest or qp or preflight"
+509 passed, 2455 deselected
+```
+
+---
+
 ## [0.5.154] - 2026-06-15
 
 **Pre-flight Test CIDR + Notes are now inline in the Endpoint

@@ -997,6 +997,32 @@ def start_perftest(role: str, test: str, opts: Dict[str, Any]) -> Dict[str, Any]
     listen_port = int(listen_port)
 
     cmd = _build_perftest_cmd(tool_path, role, test, listen_port, opts)
+
+    # v0.5.155: CPU + NUMA pinning for parallel-worker BW scaling.
+    # Layer 2 (cpu_pin) wraps perftest in `taskset -c <N>`.
+    # Layer 3 (numa_pin) additionally wraps in
+    # `numactl --cpunodebind=<N> --membind=<N>` so the worker's
+    # CPU, RAM, AND its HCA's NUMA node all align — eliminates the
+    # cross-NUMA penalty from v0.5.131. The two prefixes compose
+    # left-to-right: numactl → taskset → perftest.
+    cpu_pin = opts.get("cpu_pin")
+    numa_pin = opts.get("numa_pin")
+    if numa_pin is not None:
+        try:
+            cmd = [
+                "numactl",
+                f"--cpunodebind={int(numa_pin)}",
+                f"--membind={int(numa_pin)}",
+                "--",
+            ] + cmd
+        except (TypeError, ValueError):
+            pass
+    if cpu_pin is not None:
+        try:
+            cmd = ["taskset", "-c", str(int(cpu_pin))] + cmd
+        except (TypeError, ValueError):
+            pass
+
     job_id = str(uuid.uuid4())
 
     # Spawn.
