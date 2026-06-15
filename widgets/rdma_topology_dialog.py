@@ -363,11 +363,15 @@ class RdmaTopologyDialog(QDialog):
         # the single-pair dialog
         test_box = QGroupBox("Shared workload (applies to every pair)")
         tg = QGridLayout(test_box)
-        # v0.5.159: bumped vertical spacing 4 → 8 + margins so the
-        # spinbox baselines no longer kiss.
-        tg.setContentsMargins(8, 6, 8, 6)
+        # v0.5.159: bumped vertical spacing 4 → 8 so spinbox
+        # baselines no longer kiss.
+        # v0.5.160: operator wanted "more compact" — dial vertical
+        # back to 4 (the v0.5.156 baseline) and tighten margins.
+        # The Retina-kissing was on Blast's busier layout; Topology
+        # has fewer rows so 4 is fine.
+        tg.setContentsMargins(8, 4, 8, 4)
         tg.setHorizontalSpacing(8)
-        tg.setVerticalSpacing(8)
+        tg.setVerticalSpacing(4)
 
         self._test_combo = QComboBox()
         for tid, label, _group in _TESTS:
@@ -450,6 +454,26 @@ class RdmaTopologyDialog(QDialog):
         )
         self._max_bw_btn.clicked.connect(self._on_max_bw_clicked)
 
+        # v0.5.160: number of full topology-run iterations. Each
+        # iteration spawns every pair fresh (new perftest, new
+        # handshakes, new ports = base + iter * pair_count) and
+        # records one row per pair in the Per-pair stats table,
+        # labeled "#<iter>.<pair>". After all iterations finish,
+        # a Σ summary row shows avg / min / max BW across them.
+        self._iterations_spin = QSpinBox()
+        self._iterations_spin.setRange(1, 1000)
+        self._iterations_spin.setValue(1)
+        self._iterations_spin.setMinimumWidth(80)
+        self._iterations_spin.setToolTip(
+            "Number of full topology runs. Each iteration re-runs "
+            "every pair, recording a new row in the Per-pair stats "
+            "table. After all iterations finish, a Σ summary row "
+            "shows avg / min / max BW across them.\n\n"
+            "Useful for variance characterization (RoCE BW can "
+            "swing 5–10% between runs from fabric / NIC PFC "
+            "interactions). 5–20 iterations is a sensible range."
+        )
+
         # Cache for /api/rdma/host_info. Populated lazily when the
         # 🚀 Max BW button is clicked.
         self._host_info_cache: Dict[str, Any] = {}
@@ -472,6 +496,9 @@ class RdmaTopologyDialog(QDialog):
         tg.addWidget(QLabel("Base port:"), 3, 2, Qt.AlignRight)
         tg.addWidget(self._base_port_spin, 3, 3)
         # v0.5.156: parallel workers row
+        # v0.5.160: Iterations spinbox added alongside Parallel
+        # workers — operator wanted N-run iteration support so
+        # variance can be characterized in one click.
         tg.addWidget(QLabel("Parallel workers:"), 4, 0, Qt.AlignRight)
         _pw_row = QWidget()
         _pwh = QHBoxLayout(_pw_row)
@@ -480,7 +507,9 @@ class RdmaTopologyDialog(QDialog):
         _pwh.addWidget(self._parallel_workers_spin)
         _pwh.addWidget(self._max_bw_btn)
         _pwh.addStretch(1)
-        tg.addWidget(_pw_row, 4, 1, 1, 3)
+        tg.addWidget(_pw_row, 4, 1)
+        tg.addWidget(QLabel("Iterations:"), 4, 2, Qt.AlignRight)
+        tg.addWidget(self._iterations_spin, 4, 3)
         cb_row = QHBoxLayout()
         cb_row.setSpacing(16)
         cb_row.addWidget(self._bidir_check)
@@ -538,7 +567,10 @@ class RdmaTopologyDialog(QDialog):
         hh = self._stats_table.horizontalHeader()
         hh.setSectionResizeMode(1, QHeaderView.Stretch)
         hh.setSectionResizeMode(2, QHeaderView.Stretch)
-        self._stats_table.setMinimumHeight(160)
+        # v0.5.160: bumped 160 → 360. With Iterations > 1 we now
+        # append rows per (iteration, pair); operator wanted the
+        # full run visible without resizing the dialog.
+        self._stats_table.setMinimumHeight(360)
         sv.addWidget(self._stats_table)
         self._total_label = QLabel(
             "<span style='color:#475569;'>(no run yet)</span>"
@@ -965,14 +997,22 @@ class RdmaTopologyDialog(QDialog):
         plans: List[RdmaPairPlan],
         spec: RdmaTopologySpec,
     ) -> None:
-        """The original per-pair start sequence. Extracted from
-        `_on_start_clicked` so the v0.5.156 auto-detect can defer
-        this step behind an optional confirm dialog."""
-        # Reset per-run state
+        """v0.5.156: extracted from `_on_start_clicked` so the
+        auto-detect can defer this step behind an optional confirm
+        dialog. v0.5.160: now sets up an iteration loop instead of
+        firing perftest once. _run_one_iteration() does the actual
+        per-pair start; we re-enter it from `_on_job_resp` after
+        each iteration completes."""
         self._plans = plans
-        self._pair_jobs = {p.pair_index: {"server": None, "client": None}
-                           for p in plans}
-        self._latest_jobs = {}
+        self._spec = spec
+        self._iterations_total = max(1, int(self._iterations_spin.value()))
+        self._iteration_idx = 0
+        # Reset the Stop flag so a previous run's Stop click
+        # doesn't suppress this run's iteration loop.
+        self._stop_requested = False
+        # Accumulated per-iteration snapshots — used to render the
+        # Σ summary row at the end.
+        self._iteration_results: List[List[Dict[str, Any]]] = []
         # v0.5.157: drop the previous run's per-pair extras so
         # polling loops don't keep ticking against the previous
         # run's stale job_ids.
@@ -983,11 +1023,35 @@ class RdmaTopologyDialog(QDialog):
         # operator's 🚀 Max BW click. host_info is a HOST-LEVEL
         # snapshot (NUMA topology + hca_numa map for all HCAs);
         # reusing it across Starts is correct. Leave the cache.
-        self._populate_stats_table_skeleton(plans)
+        # Clear the table for a fresh run.
+        self._stats_table.setRowCount(0)
         self._start_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
+        self._run_one_iteration()
+
+    def _run_one_iteration(self) -> None:
+        """v0.5.160: start one iteration of the topology run.
+        Appends one row per pair to the stats table labeled
+        `#<iter>.<pair>`, then fires the server-side perftest
+        starts. When every pair completes, `_on_job_resp` snapshots
+        the iteration's results and either calls back here (next
+        iteration) or emits the Σ summary row."""
+        plans = self._plans
+        spec = self._spec
+        # Fresh per-iteration job state — old job_ids must not
+        # leak into the next iteration's polling.
+        self._pair_jobs = {p.pair_index: {"server": None, "client": None}
+                           for p in plans}
+        self._latest_jobs = {}
+        # Append one row per pair, capturing the base row so
+        # _update_pair_row can write to the right spot.
+        self._current_iter_base_row = self._stats_table.rowCount()
+        self._populate_stats_table_skeleton(plans)
+        self._stats_table.scrollToBottom()
         self._set_status_neutral(
-            f"Starting {len(plans)} pair{'s' if len(plans) != 1 else ''}…"
+            f"Iteration {self._iteration_idx + 1}/"
+            f"{self._iterations_total} — starting "
+            f"{len(plans)} pair{'s' if len(plans) != 1 else ''}…"
         )
 
         # Fire server-side starts first; client-side starts go in the
@@ -1258,6 +1322,10 @@ class RdmaTopologyDialog(QDialog):
         # Best-effort stop on every job we know about. Don't wait for
         # responses — the operator wants the dialog state cleaned up
         # immediately.
+        # v0.5.160: also signal the iteration loop in _on_job_resp
+        # to NOT spawn the next iteration when this one's pairs
+        # finish.
+        self._stop_requested = True
         for jobs in self._pair_jobs.values():
             for side, job_id in jobs.items():
                 if not job_id:
@@ -1283,23 +1351,40 @@ class RdmaTopologyDialog(QDialog):
     # ────────────────────────── stats table ──────────────────────────
 
     def _populate_stats_table_skeleton(self, plans: List[RdmaPairPlan]) -> None:
-        self._stats_table.setRowCount(len(plans))
+        """v0.5.160: append rows for THIS iteration. The table now
+        carries every iteration's results stacked vertically — each
+        pair's row sits at `_current_iter_base_row + pair_index`."""
+        base = self._current_iter_base_row
+        self._stats_table.setRowCount(base + len(plans))
+        iter_idx = self._iteration_idx
+        # In single-iteration mode use just the pair index for
+        # back-compat. With Iterations > 1 use `<iter>.<pair>`.
+        single_iter = self._iterations_total == 1
         for p in plans:
-            self._stats_table.setItem(p.pair_index, 0,
-                                       QTableWidgetItem(str(p.pair_index)))
-            self._stats_table.setItem(p.pair_index, 1,
+            row = base + p.pair_index
+            label = (str(p.pair_index) if single_iter
+                     else f"{iter_idx}.{p.pair_index}")
+            self._stats_table.setItem(row, 0, QTableWidgetItem(label))
+            self._stats_table.setItem(row, 1,
                                        QTableWidgetItem(p.server.display()))
-            self._stats_table.setItem(p.pair_index, 2,
+            self._stats_table.setItem(row, 2,
                                        QTableWidgetItem(p.client.display()))
-            self._stats_table.setItem(p.pair_index, 3,
-                                       QTableWidgetItem("queued"))
-            self._stats_table.setItem(p.pair_index, 4, QTableWidgetItem("—"))
-            self._stats_table.setItem(p.pair_index, 5, QTableWidgetItem("—"))
-        self._total_label.setText(
-            f"<span style='color:#475569;'>"
-            f"{len(plans)} pair{'s' if len(plans) != 1 else ''} queued. "
-            f"Waiting for first stats…</span>"
-        )
+            self._stats_table.setItem(row, 3, QTableWidgetItem("queued"))
+            self._stats_table.setItem(row, 4, QTableWidgetItem("—"))
+            self._stats_table.setItem(row, 5, QTableWidgetItem("—"))
+        if single_iter:
+            self._total_label.setText(
+                f"<span style='color:#475569;'>"
+                f"{len(plans)} pair{'s' if len(plans) != 1 else ''}"
+                f" queued. Waiting for first stats…</span>"
+            )
+        else:
+            self._total_label.setText(
+                f"<span style='color:#475569;'>"
+                f"Iteration {iter_idx + 1}/{self._iterations_total} — "
+                f"{len(plans)} pair{'s' if len(plans) != 1 else ''}"
+                f" queued.</span>"
+            )
 
     def _maybe_start_poll(self) -> None:
         if self._poll_timer is not None:
@@ -1347,14 +1432,28 @@ class RdmaTopologyDialog(QDialog):
             self._update_pair_row(plan.pair_index)
             break
         self._refresh_totals()
-        # If all pairs are done, stop polling.
+        # If all pairs are done, the iteration is complete.
         if self._all_pairs_done():
             self._stop_poll()
-            self._start_btn.setEnabled(True)
-            self._stop_btn.setEnabled(False)
-            self._set_status_ok(
-                f"All {len(self._plans)} pair(s) finished."
-            )
+            self._snapshot_iteration_results()
+            self._iteration_idx += 1
+            stop_requested = getattr(self, "_stop_requested", False)
+            if (self._iteration_idx < self._iterations_total
+                    and not stop_requested):
+                # Brief pause so the user sees the iteration's
+                # done state, then kick off the next.
+                QTimer.singleShot(500, self._run_one_iteration)
+            else:
+                # All iterations finished (or operator hit Stop).
+                self._append_summary_row()
+                self._start_btn.setEnabled(True)
+                self._stop_btn.setEnabled(False)
+                self._stop_requested = False
+                msg = (f"All {self._iteration_idx} iteration(s) × "
+                       f"{len(self._plans)} pair(s) finished.")
+                if stop_requested:
+                    msg = f"Stopped after {self._iteration_idx} iteration(s)."
+                self._set_status_ok(msg)
 
     def _update_pair_row(self, pair_index: int) -> None:
         jobs_info = self._pair_jobs[pair_index]
@@ -1373,15 +1472,83 @@ class RdmaTopologyDialog(QDialog):
             state = f"done (rc={rc})" if rc is not None else "?"
         bw = primary.get("final_bw_avg_gbps")
         mr = primary.get("final_msg_rate_mpps")
-        self._stats_table.setItem(pair_index, 3, QTableWidgetItem(state))
+        # v0.5.160: rows for iteration N start at
+        # `_current_iter_base_row`. Earlier iterations' rows are
+        # below; never overwrite them.
+        row = getattr(self, "_current_iter_base_row", 0) + pair_index
+        self._stats_table.setItem(row, 3, QTableWidgetItem(state))
         self._stats_table.setItem(
-            pair_index, 4,
+            row, 4,
             QTableWidgetItem(f"{bw:.2f}" if isinstance(bw, (int, float)) else "—"),
         )
         self._stats_table.setItem(
-            pair_index, 5,
+            row, 5,
             QTableWidgetItem(f"{mr:.4f}" if isinstance(mr, (int, float)) else "—"),
         )
+
+    def _snapshot_iteration_results(self) -> None:
+        """v0.5.160: capture the just-finished iteration's per-pair
+        client-side stats. Used to render the Σ summary row at the
+        end of the full run."""
+        snap: List[Dict[str, Any]] = []
+        for plan in self._plans:
+            cj_id = self._pair_jobs[plan.pair_index].get("client")
+            job = self._latest_jobs.get(cj_id) if cj_id else None
+            snap.append({
+                "iter": self._iteration_idx,
+                "pair_index": plan.pair_index,
+                "bw": (job.get("final_bw_avg_gbps")
+                       if isinstance(job, dict) else None),
+                "msgrate": (job.get("final_msg_rate_mpps")
+                            if isinstance(job, dict) else None),
+                "rc": (job.get("returncode")
+                       if isinstance(job, dict) else None),
+            })
+        self._iteration_results.append(snap)
+
+    def _append_summary_row(self) -> None:
+        """v0.5.160: render a Σ row showing avg / min / max BW and
+        MsgRate across all (iteration, pair) samples. Skipped for
+        single-iteration runs (would just duplicate the lone row)."""
+        results = getattr(self, "_iteration_results", [])
+        if not results or self._iterations_total < 2:
+            return
+        bws = [r["bw"] for snap in results for r in snap
+               if isinstance(r.get("bw"), (int, float))]
+        mrs = [r["msgrate"] for snap in results for r in snap
+               if isinstance(r.get("msgrate"), (int, float))]
+        if not bws and not mrs:
+            return
+        row = self._stats_table.rowCount()
+        self._stats_table.setRowCount(row + 1)
+        self._stats_table.setItem(row, 0, QTableWidgetItem("Σ"))
+        self._stats_table.setItem(
+            row, 1, QTableWidgetItem(f"{len(results)} iterations"))
+        self._stats_table.setItem(
+            row, 2,
+            QTableWidgetItem(f"{len(bws)} samples"))
+        self._stats_table.setItem(row, 3, QTableWidgetItem("summary"))
+        if bws:
+            avg = sum(bws) / len(bws)
+            self._stats_table.setItem(
+                row, 4,
+                QTableWidgetItem(
+                    f"avg={avg:.2f} "
+                    f"min={min(bws):.2f} "
+                    f"max={max(bws):.2f}"
+                ),
+            )
+        if mrs:
+            avg = sum(mrs) / len(mrs)
+            self._stats_table.setItem(
+                row, 5,
+                QTableWidgetItem(
+                    f"avg={avg:.4f} "
+                    f"min={min(mrs):.4f} "
+                    f"max={max(mrs):.4f}"
+                ),
+            )
+        self._stats_table.scrollToBottom()
 
     def _refresh_totals(self) -> None:
         # Use CLIENT-side jobs for aggregation (those report the

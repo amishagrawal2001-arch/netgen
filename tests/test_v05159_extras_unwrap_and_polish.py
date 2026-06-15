@@ -146,10 +146,10 @@ def test_blast_test_params_vertical_spacing_loosened():
 
 
 def test_topology_test_params_vertical_spacing_loosened():
-    # Topology was at 4; v0.5.159 bumps to 8 for parity.
-    # Verify the 8 entry is present (file has multiple grids; the
-    # test_params one is the relevant bump).
-    assert "tg.setVerticalSpacing(8)" in SRC_TOPO
+    # v0.5.159 bumped to 8; v0.5.160 dialled back to 4 after
+    # operator said "more compact". Topology has fewer rows than
+    # Blast, so 4 is acceptable here.
+    assert "tg.setVerticalSpacing(4)" in SRC_TOPO
 
 
 def test_blast_stats_view_auto_scrolls():

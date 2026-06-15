@@ -2,6 +2,65 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.160] - 2026-06-15
+
+**Topology dialog UI polish + N-run iteration loop.**
+
+Triggered by operator's Topology Test screenshot ("UI polish is
+needed for RDMA topology test also, Shared workload input section
+can be more compact, increase stats section vertical size, add
+number of iterations to run in the shared workload section so that
+when user start topology test it iterate through and record the
+results in the per pair stats section #0, #1.. etc.").
+
+NOT YET RELEASED — bump + commit only, awaiting operator approval.
+
+### UI polish
+
+* Shared workload grid: vertical spacing 8 → 4 (operator wanted
+  "more compact"; the v0.5.159 bump to 8 was for Blast's busier
+  layout). Margins tightened to (8, 4, 8, 4).
+* Per-pair stats table: `setMinimumHeight` 160 → 360. With
+  Iterations × pairs the table can grow long; the bigger min
+  height makes the full run visible without resizing.
+
+### Iterations feature
+
+* New "Iterations" spinbox in Shared workload (range 1–1000,
+  default 1). Tooltip explains the variance-characterization use
+  case (RoCE BW can swing 5–10% between runs).
+* `_proceed_with_topology_start` now sets up the iteration loop
+  state and dispatches to a new `_run_one_iteration()` method.
+  Each iteration:
+  * Resets `_pair_jobs` and `_latest_jobs` so the next iteration's
+    polling doesn't pick up stale job_ids.
+  * Captures the current row offset as `_current_iter_base_row`.
+  * Appends one row per pair to the table labeled `#<iter>.<pair>`
+    (single-iteration mode keeps the old `<pair>` label).
+  * Fires server-side perftest starts; client-side starts chain
+    in the response callbacks (existing flow).
+* `_update_pair_row(pair_index)` writes to row
+  `_current_iter_base_row + pair_index` — previous iterations'
+  rows are never overwritten.
+* After `_all_pairs_done()`, `_on_job_resp` snapshots the
+  iteration's per-pair stats, bumps `_iteration_idx`, and either
+  schedules `_run_one_iteration()` via `QTimer.singleShot(500)`
+  for the next iteration or emits a Σ summary row when all done.
+* `_append_summary_row()` adds an "Σ" row showing avg/min/max BW
+  and MsgRate across all (iter, pair) samples. Skipped when
+  Iterations = 1 (single row would just be duplicated).
+* `_on_stop_clicked` sets `_stop_requested = True` so the
+  iteration loop halts after the current iteration's pairs
+  finish.
+
+### Tests
+
+`tests/test_v05160_topology_iterations.py` — 14 new tests covering
+the spinbox, iteration state setup, per-iteration row offset, row
+labeling, snapshot capture, summary row math, and Stop semantics.
+v0.5.159 test updated for the v0.5.160 spacing revert. Combined
+RDMA regression sweep: 156 passing.
+
 ## [0.5.159] - 2026-06-15
 
 **Critical extras-unwrap fix + v0.5.157 regression revert + UI
