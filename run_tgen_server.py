@@ -18603,6 +18603,44 @@ def api_rdma_perftest_start():
         note=note,
     )
 
+    # v0.5.141: register the CLIENT-role job with stream_tracker so
+    # Blast RDMA Flow + Topology Test dialogs' flows appear in the
+    # unified Stream Stats panel. Pre-fix these jobs lived only in
+    # `/api/rdma/perftest/jobs` and never in `/api/streams/stats` →
+    # operator reported "I don't see RDMA flows" because the
+    # Streams tab was the source of truth they were checking.
+    #
+    # Only register the client side (it's the TX initiator). The
+    # server half is a passive listener; mirroring it would
+    # duplicate the row.
+    if role == "client":
+        try:
+            from utils.rdma_stream_engine import register_perftest_with_tracker
+            _stop_evt = threading.Event()
+            # Use the device name as a synthetic "interface" so the
+            # Streams tab groups Blast-driven RDMA flows under the
+            # RDMA HCA rather than mixing them with Ethernet ifaces.
+            _iface = str(opts.get("device") or "rdma")
+            register_perftest_with_tracker(
+                tracker=stream_tracker,
+                stream_id=result["job_id"],
+                job_id=result["job_id"],
+                interface=_iface,
+                stream_name=note or f"rdma-{test}-{result['job_id'][:8]}",
+                test=test,
+                msg_size=int(opts.get("msg_size") or 65536),
+                stop_event=_stop_evt,
+                peer_addr=opts.get("peer_addr"),
+                note=note,
+            )
+        except Exception as exc:
+            logging.warning(
+                f"[rdma] tracker registration failed for job "
+                f"{result.get('job_id')}: {exc} — the perftest job "
+                f"itself is still running; only the Stream Stats row "
+                f"is missing"
+            )
+
     return jsonify({
         **result,
         "handshake_id": pairing["handshake_id"],

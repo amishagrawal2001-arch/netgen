@@ -83,6 +83,112 @@ def _opts_from_stream(stream_data: Dict[str, Any]) -> Dict[str, Any]:
     return opts
 
 
+def register_perftest_with_tracker(
+    *,
+    tracker,
+    stream_id: str,
+    job_id: str,
+    interface: str,
+    stream_name: str,
+    test: str,
+    msg_size: int,
+    stop_event: threading.Event,
+    peer_addr: Optional[str] = None,
+    rx_interface: Optional[str] = None,
+    note: Optional[str] = None,
+) -> None:
+    """v0.5.141: shared helper that registers a perftest job in
+    stream_tracker AND spawns a poll thread that mirrors its stats
+    into the tracker.
+
+    Used by:
+      * `start_rdma_stream` (per-stream `engine=rdma` path) — registers
+        on stream creation.
+      * `/api/rdma/perftest/start` for client-role jobs (Blast RDMA
+        Flow + Topology Test dialogs) — pre-v0.5.141 those jobs only
+        appeared in `/api/rdma/perftest/jobs`; the unified Streams
+        Stats panel never saw them.
+
+    Tracker entry shape mirrors the DPDK / Scapy launch paths. The
+    poll thread translates perftest job stats (final iterations ×
+    msg_size) into tx_count deltas so the Streams tab's TX Count
+    column shows a non-zero, climbing value.
+    """
+    from utils.rdma_perf import get_perftest_job, stop_perftest
+
+    try:
+        if hasattr(tracker, "add_stream"):
+            display_name = (
+                stream_name
+                or note
+                or f"rdma-{test}-{job_id[:8]}"
+            )
+            tracker.add_stream({
+                "stream_id":   stream_id,
+                "interface":   interface,
+                "stream_name": display_name,
+                "stop_event":  stop_event,
+                "rx_thread":   None,
+                "rx_interface": rx_interface or interface,
+                # perftest does its own RX counting internally;
+                # flow tracking is meaningless here.
+                "flow_tracking_enabled": False,
+                "frame_size":  int(msg_size or 65536),
+                # v0.5.141: stash the perftest test variant so the
+                # stream-stats Engine column can render "RDMA Send"
+                # etc. (it already reads stream.rdma.test).
+                "rdma": {
+                    "test": test,
+                    "peer_addr": peer_addr,
+                    "msg_size": int(msg_size or 65536),
+                    "job_id": job_id,
+                },
+                "engine": "rdma",
+            })
+        if hasattr(tracker, "mark_runtime_engine"):
+            tracker.mark_runtime_engine(
+                interface, stream_id, runtime_engine="rdma",
+            )
+    except Exception as exc:
+        logger.debug(f"[rdma-stream] tracker init: {exc}")
+
+    def _poll():
+        last_bytes = 0
+        while not stop_event.is_set():
+            time.sleep(2.0)
+            job = get_perftest_job(job_id)
+            if job is None:
+                break
+            try:
+                msg = job.get("final_msg_size_bytes")
+                iters = job.get("final_iterations")
+                if msg and iters:
+                    total_bytes = int(msg) * int(iters)
+                    delta = max(0, total_bytes - last_bytes)
+                    last_bytes = total_bytes
+                    if hasattr(tracker, "update_tx_by_id"):
+                        try:
+                            tracker.update_tx_by_id(interface, stream_id, delta)
+                        except Exception:
+                            pass
+                if job.get("finished_at") is not None:
+                    break
+            except Exception as exc:
+                logger.debug(f"[rdma-stream] poll: {exc}")
+                break
+        if stop_event.is_set():
+            try:
+                stop_perftest(job_id)
+            except Exception as exc:
+                logger.debug(f"[rdma-stream] stop: {exc}")
+
+    t = threading.Thread(
+        target=_poll, daemon=True,
+        name=f"rdma-stream-poll-{stream_id[:8]}",
+    )
+    t.start()
+
+
 def start_rdma_stream(
     stream_data: Dict[str, Any],
     interface: str,
@@ -135,73 +241,23 @@ def start_rdma_stream(
 
     # Register in tracker so the Streams tab sees it as running AND
     # so /api/traffic/stop can reach our stop_event when the operator
-    # hits Stop. The DPDK/Scapy path mints its event in
-    # run_tgen_server.launch_single_stream and registers it via
-    # add_stream({"stop_event": ...}); we mirror that here. (Without
-    # this, the orphaned threading.Event() the caller hands us is
-    # never set externally — the perftest child runs to its full
-    # --duration and the GUI's Stop button silently no-ops.)
+    # hits Stop. v0.5.141: this used to be inline; extracted into
+    # `register_perftest_with_tracker` so Blast RDMA Flow / Topology
+    # dialogs (which hit /api/rdma/perftest/start directly) can use
+    # the same tracker plumbing.
     sid = stream_data.get("stream_id") or job_id
-    try:
-        if hasattr(tracker, "add_stream"):
-            tracker.add_stream({
-                "stream_id":   sid,
-                "interface":   interface,
-                "stream_name": stream_data.get("name") or "rdma",
-                "stop_event":  stop_event,
-                "rx_thread":   None,
-                "rx_interface": stream_data.get("rx_interface") or interface,
-                "flow_tracking_enabled": False,  # perftest does its own RX
-                "frame_size":  int((stream_data.get("rdma") or {}).get("msg_size") or 65536),
-            })
-        if hasattr(tracker, "mark_runtime_engine"):
-            tracker.mark_runtime_engine(
-                interface, sid, runtime_engine="rdma",
-            )
-    except Exception as exc:
-        logger.debug(f"[rdma-stream] tracker init: {exc}")
-
-    # Poll thread — runs until the job finishes OR stop_event is set.
-    def _poll():
-        last_bytes = 0
-        while not stop_event.is_set():
-            time.sleep(2.0)
-            job = get_perftest_job(job_id)
-            if job is None:
-                break
-            try:
-                # Synthesize TX byte count from final iterations + size
-                # when present so the Streams tab shows non-zero.
-                bw_avg = job.get("final_bw_avg_gbps")
-                msg = job.get("final_msg_size_bytes")
-                iters = job.get("final_iterations")
-                if msg and iters:
-                    total_bytes = int(msg) * int(iters)
-                    delta = max(0, total_bytes - last_bytes)
-                    last_bytes = total_bytes
-                    if hasattr(tracker, "update_tx_by_id"):
-                        # delta is in BYTES, not frames; the tracker
-                        # is byte-agnostic so adding it works for
-                        # display purposes.
-                        try:
-                            tracker.update_tx_by_id(interface, sid, delta)
-                        except Exception:
-                            pass
-                if job.get("finished_at") is not None:
-                    break
-            except Exception as exc:
-                logger.debug(f"[rdma-stream] poll: {exc}")
-                break
-        # Stop event triggered → kill the perftest child.
-        if stop_event.is_set():
-            try:
-                stop_perftest(job_id)
-            except Exception as exc:
-                logger.debug(f"[rdma-stream] stop: {exc}")
-
-    t = threading.Thread(target=_poll, daemon=True,
-                         name=f"rdma-stream-poll-{sid[:8]}")
-    t.start()
+    register_perftest_with_tracker(
+        tracker=tracker,
+        stream_id=sid,
+        job_id=job_id,
+        interface=interface,
+        stream_name=stream_data.get("name") or "rdma",
+        test=test,
+        msg_size=int((stream_data.get("rdma") or {}).get("msg_size") or 65536),
+        stop_event=stop_event,
+        peer_addr=opts.get("peer_addr"),
+        rx_interface=stream_data.get("rx_interface"),
+    )
 
     return {
         "status": "started",

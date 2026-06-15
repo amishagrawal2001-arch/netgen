@@ -2,6 +2,87 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.141] - 2026-06-15
+
+**Fix: Blast RDMA Flow + Topology Test jobs appear in the Streams tab.**
+
+Operator report: "i don't see RDMA flows pls check the gap in RDMA"
+
+### Root cause
+
+Two RDMA paths in the server, only ONE registered with `stream_tracker`:
+
+1. **Per-stream `engine=rdma`** (Add Stream dialog → engine combo
+   "RDMA"): handled by `utils/rdma_stream_engine.start_rdma_stream`
+   which DID call `stream_tracker.add_stream(...)`. Streams tab saw it.
+
+2. **Standalone RDMA flows** (Tools → RDMA → Blast a RDMA Flow /
+   Topology Test): dialogs POST directly to
+   `/api/rdma/perftest/start`. That route only touched
+   `utils.rdma_perf` job registry + `utils.rdma_handshake`. It
+   NEVER touched `stream_tracker`. So flows from these dialogs
+   appeared only in `/api/rdma/perftest/jobs` — invisible in the
+   main Streams tab that operators were checking.
+
+Confirmed on srv06: `curl /api/streams/stats?status=all` showed 4
+streams, **zero tagged RDMA**, despite an operator having tried
+to start one.
+
+### Fix
+
+Extracted the tracker-registration plumbing from
+`start_rdma_stream` into a shared helper
+`register_perftest_with_tracker(tracker, stream_id, job_id,
+interface, stream_name, test, msg_size, stop_event, ...)`.
+
+- Per-stream path still uses it (refactor; no behavior change).
+- `/api/rdma/perftest/start` now calls it for **client-role** jobs.
+  Server-role is skipped — server is a passive listener; mirroring
+  it would duplicate every Blast pair row.
+
+### Streams tab now shows for Blast / Topology flows
+
+- **Stream Name**: `note` from the dialog (or synthetic
+  `rdma-{test}-{job_id[:8]}` fallback)
+- **Interface**: the RDMA device (e.g. `mlx5_0`) — groups under
+  the HCA rather than mixing with Ethernet ifaces
+- **Engine**: `RDMA {Send|Write|Read|SendL|WriteL|ReadL}` (purple,
+  the existing v0.3.12 RDMA label)
+- **TX Count**: synthesized from `final_iterations × msg_size_bytes`
+  as the poll thread sees the perftest job progress
+- **Status**: Running → Stopped tracks the perftest lifecycle
+
+### Why client-only
+
+Each Blast pair spawns TWO perftest jobs: a client and a server.
+The client is the TX initiator (it sends BW or LAT iterations);
+the server is a passive listener that mirrors. Registering both
+would put two rows in the Streams tab for one logical flow.
+Operators see the client's row; the handshake_id links them in
+the RDMA Jobs dialog for paired views.
+
+### Failure tolerance
+
+If tracker registration raises (e.g., duplicate stream_id), the
+helper logs + continues. The perftest job itself still runs;
+only the Streams row is missing. Better to surface the flow's
+perftest stats via the existing RDMA Jobs dialog than to kill
+the whole start because of a row-rendering hiccup.
+
+### Files touched
+
+- `utils/rdma_stream_engine.py` — new `register_perftest_with_tracker`
+  helper; `start_rdma_stream` refactored to delegate.
+- `run_tgen_server.py` — `/api/rdma/perftest/start` calls the
+  helper for client-role jobs.
+- `tests/test_v05141_rdma_blast_in_stream_stats.py` — 9 cases:
+  helper exported; per-stream path delegates (no double-add);
+  perftest/start route calls helper inside `if role == "client":`
+  guard; helper shape (stream_id / interface / frame_size / engine
+  / rdma sub-dict); runtime_engine marked rdma; synthetic name
+  fallback; tracker failure swallowed; missing
+  mark_runtime_engine tolerated.
+
 ## [0.5.140] - 2026-06-15
 
 **Feature: Loss % latches the final value on stream stop (Spirent-like).**
