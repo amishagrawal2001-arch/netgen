@@ -130,19 +130,37 @@ class RdmaPreflightDialog(QDialog):
         hdr.setWordWrap(True)
         root.addWidget(hdr)
 
-        # Per-endpoint probe table.
-        probe_box = QGroupBox("Endpoint probes")
+        # v0.5.154: per-endpoint probe table is now the single
+        # source of truth — Test CIDR + Notes columns inline
+        # (operator no longer scrolls to a separate config
+        # GroupBox to fix IPs).
+        probe_box = QGroupBox("Endpoints")
         pl = QVBoxLayout(probe_box)
         pl.setContentsMargins(6, 4, 6, 6)
+        pl.addWidget(QLabel(
+            "<span style='color:#475569; font-size:11px;'>"
+            "Edit <b>Test CIDR</b> on any row to override the "
+            "auto-suggested fix. The CIDR is applied with "
+            "<code>ip addr add &lt;cidr&gt; dev &lt;iface&gt; "
+            "label &lt;iface&gt;:ng</code> — the "
+            "<code>ng</code> label tags every IP we add so "
+            "cleanup never touches operator-managed addresses."
+            "</span>"
+        ))
         self._probe_table = QTableWidget()
-        self._probe_table.setColumnCount(7)
+        # v0.5.154: columns 7 → 9: added Test CIDR + Notes.
+        self._probe_table.setColumnCount(9)
         self._probe_table.setHorizontalHeaderLabels([
             "Endpoint", "HCA", "Iface", "Port state",
-            "Link", "IPs", "RoCEv2 GIDs",
+            "Link", "Existing IPs", "RoCEv2 GIDs",
+            "Test CIDR", "Notes",
         ])
         self._probe_table.horizontalHeader().setSectionResizeMode(
             QHeaderView.Interactive)
         self._probe_table.horizontalHeader().setStretchLastSection(True)
+        # v0.5.154: row height set to fit the QLineEdit cell
+        # widget without scrolling.
+        self._probe_table.verticalHeader().setDefaultSectionSize(28)
         self._probe_table.setRowCount(len(self._endpoints))
         for r, ep in enumerate(self._endpoints):
             label, url, hca, ib_port = ep
@@ -163,32 +181,11 @@ class RdmaPreflightDialog(QDialog):
         )
         root.addWidget(self._verdict)
 
-        # Temporary-IP config section.
-        cfg_box = QGroupBox(
-            "Temporary IP configuration (runtime only — gone on reboot)"
-        )
-        cfg = QVBoxLayout(cfg_box)
-        cfg.setContentsMargins(6, 4, 6, 6)
-        cfg.setSpacing(6)
-
-        cfg.addWidget(QLabel(
-            "<span style='color:#475569; font-size:11px;'>"
-            "Edit either side to override. The CIDR is "
-            "applied with <code>ip addr add &lt;cidr&gt; dev "
-            "&lt;iface&gt; label &lt;iface&gt;:netgen</code> — "
-            "the <code>netgen</code> label tags every IP we add "
-            "so cleanup never touches operator-managed addresses."
-            "</span>"
-        ))
-
-        self._config_grid = QGridLayout()
-        self._config_grid.setHorizontalSpacing(6)
-        self._config_grid.setVerticalSpacing(4)
-        self._config_grid.addWidget(QLabel("<b>Iface</b>"), 0, 0)
-        self._config_grid.addWidget(QLabel("<b>Test CIDR</b>"), 0, 1)
-        self._config_grid.addWidget(QLabel("<b>Notes</b>"), 0, 2)
+        # v0.5.154: the separate "Temporary IP configuration"
+        # GroupBox is gone — Test CIDR + Notes are now columns 7
+        # and 8 of the probe table. Only the action row + options
+        # remain.
         self._config_rows: List[Dict[str, Any]] = []  # populated by _populate_config
-        cfg.addLayout(self._config_grid)
 
         opts_row = QHBoxLayout()
         self._rp_check = QCheckBox(
@@ -204,14 +201,15 @@ class RdmaPreflightDialog(QDialog):
         )
         opts_row.addWidget(self._rp_check)
         opts_row.addStretch(1)
-        cfg.addLayout(opts_row)
+        root.addLayout(opts_row)
 
         btn_row = QHBoxLayout()
         self._validate_btn = QPushButton("Validate")
         self._validate_btn.setToolTip(
-            "Check the proposed CIDRs without applying. Surfaces "
-            "format errors, same-subnet trap, existing route "
-            "conflicts."
+            "Check the proposed CIDRs (in the Test CIDR column) "
+            "without applying. Surfaces format errors, same-"
+            "subnet trap, existing route conflicts. Results "
+            "appear inline in the Notes column."
         )
         self._validate_btn.clicked.connect(self._on_validate)
         btn_row.addWidget(self._validate_btn)
@@ -224,7 +222,7 @@ class RdmaPreflightDialog(QDialog):
         )
         self._apply_btn.setToolTip(
             "Validate, then apply the test IPs via `ip addr add` "
-            "with `<iface>:netgen` labels. Runtime only — nothing "
+            "with `<iface>:ng` labels. Runtime only — nothing "
             "is written to /etc/network or netplan."
         )
         self._apply_btn.clicked.connect(self._on_apply)
@@ -240,7 +238,7 @@ class RdmaPreflightDialog(QDialog):
         btn_row.addWidget(self._cleanup_btn)
 
         btn_row.addStretch(1)
-        cfg.addLayout(btn_row)
+        root.addLayout(btn_row)
 
         # v0.5.152: Option C-A: "📌 Keep" toggle. When checked, the
         # parent dialog's closeEvent SKIPS the auto-cleanup for any
@@ -263,9 +261,7 @@ class RdmaPreflightDialog(QDialog):
         )
         keep_row.addWidget(self._keep_check)
         keep_row.addStretch(1)
-        cfg.addLayout(keep_row)
-
-        root.addWidget(cfg_box)
+        root.addLayout(keep_row)
 
         # Status line + close button.
         self._status = QLabel("")
@@ -521,47 +517,58 @@ class RdmaPreflightDialog(QDialog):
                 "</span>"
             )
 
-        # Clear existing rows below the header.
-        for row_dict in self._config_rows:
-            for w in row_dict.values():
-                if hasattr(w, "deleteLater"):
-                    w.deleteLater()
+        # v0.5.154: inline the Test CIDR + Notes widgets directly
+        # in the probe table. The probe response already populated
+        # rows 0-6; we attach a QLineEdit at column 7 and a QLabel
+        # at column 8 keyed by the iface name. `_config_rows` keeps
+        # tracking refs so collect/clear/issues can read/write
+        # them — same shape as before, just different parent
+        # widget.
         self._config_rows.clear()
 
-        for i, (url, iface) in enumerate(seen, start=1):
-            iface_lbl = QLabel(f"<code>{iface}</code><br>"
-                               f"<small style='color:#94a3b8;'>{url}</small>")
-            iface_lbl.setTextFormat(Qt.RichText)
+        # Build a quick (iface) → row-index map by walking the
+        # probes (same order they were inserted into the table).
+        url_iface_by_row: List[Tuple[str, str]] = []
+        for (url, _hca), p in self._probes.items():
+            iface = p.get("kernel_iface") or ""
+            url_iface_by_row.append((url, iface))
+
+        for row_idx, (url, iface) in enumerate(url_iface_by_row):
+            if not iface:
+                continue
             cidr_edit = QLineEdit(suggestions.get((url, iface), ""))
-            cidr_edit.setMinimumWidth(160)
             cidr_edit.setFont(QFont("Menlo"))
-            cidr_edit.setPlaceholderText(
-                "(leave empty to skip)")
+            cidr_edit.setPlaceholderText("(leave empty to skip)")
+            cidr_edit.setStyleSheet(
+                "QLineEdit { border: 1px solid #cbd5e1; "
+                "padding: 2px 4px; border-radius: 3px; }"
+            )
             note_lbl = QLabel("")
-            note_lbl.setStyleSheet("color:#64748b; font-size:11px;")
+            note_lbl.setStyleSheet(
+                "color:#64748b; font-size:11px; padding: 2px 4px;"
+            )
             note_lbl.setWordWrap(True)
             existing = existing_v4.get(iface) or []
             if existing:
-                # v0.5.153: explicit note so the operator knows
-                # WHY the CIDR field is empty by default. No more
-                # "already on, will be skipped" surprise on
-                # Validate.
                 note_lbl.setText(
                     f"<span style='color:#0369a1;'>"
                     f"already has IPv4 ({existing[0]}); "
                     f"leave empty to skip"
                     f"</span>"
                 )
-            self._config_grid.addWidget(iface_lbl, i, 0)
-            self._config_grid.addWidget(cidr_edit, i, 1)
-            self._config_grid.addWidget(note_lbl, i, 2)
+            # v0.5.154: install widgets at columns 7 (Test CIDR)
+            # and 8 (Notes) of the probe table itself.
+            self._probe_table.setCellWidget(row_idx, 7, cidr_edit)
+            self._probe_table.setCellWidget(row_idx, 8, note_lbl)
             self._config_rows.append({
                 "url": url,
                 "iface": iface,
-                "iface_label": iface_lbl,
+                "row_idx": row_idx,
                 "cidr_edit": cidr_edit,
                 "note": note_lbl,
             })
+        # Re-fit columns after the new widgets land.
+        self._probe_table.resizeColumnsToContents()
 
     def _collect_entries(self) -> List[Dict[str, str]]:
         out = []
@@ -575,7 +582,12 @@ class RdmaPreflightDialog(QDialog):
     def _clear_notes(self) -> None:
         for r in self._config_rows:
             r["note"].setText("")
-            r["cidr_edit"].setStyleSheet("")
+            # v0.5.154: restore the default border (was bordered
+            # red/amber on previous failures).
+            r["cidr_edit"].setStyleSheet(
+                "QLineEdit { border: 1px solid #cbd5e1; "
+                "padding: 2px 4px; border-radius: 3px; }"
+            )
 
     def _apply_issues_to_rows(
         self, issues: List[Dict[str, str]]
@@ -595,7 +607,8 @@ class RdmaPreflightDialog(QDialog):
                         existing + ("<br>" if existing else "") + line
                     )
                     r["cidr_edit"].setStyleSheet(
-                        f"border: 1px solid {colour};"
+                        f"QLineEdit {{ border: 1px solid {colour};"
+                        f" padding: 2px 4px; border-radius: 3px; }}"
                     )
 
     # ──────────────────────────── Validate

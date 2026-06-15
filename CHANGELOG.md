@@ -2,6 +2,63 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.154] - 2026-06-15
+
+**Pre-flight Test CIDR + Notes are now inline in the Endpoint
+probe table.**
+
+Operator: "allow user to modify ips in the Endpoint probe table
+itself insted of seprate temp ip config section."
+
+v0.5.150-v0.5.153 had two parallel views of the same endpoint:
+the read-only **Endpoint probes** table on top and the editable
+**Temporary IP configuration** grid below. They duplicated the
+iface name and required the operator to look in two places to
+read state vs propose a fix.
+
+v0.5.154 folds them into one table.
+
+### What changed
+
+* Probe table columns: 7 → 9. New columns at the right edge:
+  - **Test CIDR** (column 7) — a QLineEdit per iface, populated
+    with the auto-suggested non-conflicting /24 (empty if the
+    iface already has an IPv4; placeholder "(leave empty to
+    skip)").
+  - **Notes** (column 8) — a QLabel per iface that shows
+    auto-suggest notes ("already has IPv4 (X); leave empty to
+    skip") and inline validation results after Validate/Apply.
+* The **IPs** column is renamed **Existing IPs** so the operator
+  sees existing-vs-proposed side by side on the same row.
+* The standalone **"Temporary IP configuration"** GroupBox is
+  gone. Its rp_filter checkbox, Validate / Apply / Cleanup
+  buttons, and 📌 Keep checkbox now sit directly below the
+  verdict banner — same widgets, less chrome.
+* The validation-failure border styling (red/amber) is rewritten
+  with the `QLineEdit { … }` selector so it actually paints when
+  the widget lives inside a QTableWidget cell. (The old bare
+  `border: …` rule didn't always apply through the cell-widget
+  proxy.)
+
+Net: one row per endpoint = one mental model. Less scrolling,
+fewer columns of iface labels, cleaner failure surface.
+
+### Files changed
+- `widgets/rdma_preflight_dialog.py` (~150 lines).
+- `pyproject.toml` (0.5.153 → 0.5.154).
+- `tests/test_v05154_preflight_inline_cidr.py` (14 tests).
+
+### Verified
+```
+$ ./venv/bin/pytest tests/test_v05154_preflight_inline_cidr.py -q
+14 passed in 0.06s
+
+$ ./venv/bin/pytest tests/ -q -k "rdma or blast or topology or preflight or qp or perftest"
+507 passed, 2432 deselected
+```
+
+---
+
 ## [0.5.153] - 2026-06-15
 
 **Blast RDMA Flow: consistency bug sweep.**
