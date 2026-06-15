@@ -27,7 +27,7 @@ from __future__ import annotations
 
 import shlex
 import uuid
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from PyQt5.QtCore import Qt, QTimer
 from PyQt5.QtGui import QFont
@@ -51,6 +51,9 @@ from widgets.rdma_blast_flow_dialog import (
     _DEFAULT_MTU_CODE, _DEFAULT_QP_COUNT, _DEFAULT_TX_DEPTH,
     _MTU_OPTIONS, _PORT_FIELD_TOOLTIP, _TESTS,
     _get_async, _post_async,
+    # v0.5.156: reuse Blast's blocker detection + confirm dialog
+    # to give Topology the same v0.5.152/v0.5.153 auto-fix UX.
+    _detect_start_blockers, _StartBlockerConfirmDialog,
 )
 
 
@@ -414,6 +417,39 @@ class RdmaTopologyDialog(QDialog):
         self._bidir_check = QCheckBox("Bidirectional (-b)")
         self._cpu_util_check = QCheckBox("Report CPU utilisation (--cpu_util)")
 
+        # v0.5.156 Slice A: Parallel workers — per-pair worker
+        # count for true multi-core BW scaling. Each pair spawns
+        # K perftest processes per side, each pinned to a
+        # different CPU core. With M pairs and K workers each,
+        # total perftest processes = 2 × M × K — the picker caps
+        # this against NUMA-local core count.
+        self._parallel_workers_spin = QSpinBox()
+        self._parallel_workers_spin.setRange(1, 64)
+        self._parallel_workers_spin.setValue(1)
+        self._parallel_workers_spin.setFixedWidth(80)
+        self._parallel_workers_spin.setToolTip(
+            "Per-pair worker count. Each pair spawns N perftest "
+            "processes on each side, each pinned to a different "
+            "CPU core via taskset. For true BW scaling beyond "
+            "single-core line rate.\n\n"
+            "Total perftest processes = 2 × (pair count) × "
+            "(workers). Click 🚀 Max BW to auto-pick a value that "
+            "fits the HCA's NUMA-local core count."
+        )
+        self._max_bw_btn = QPushButton("🚀 Max BW")
+        self._max_bw_btn.setFixedWidth(82)
+        self._max_bw_btn.setToolTip(
+            "Query the first endpoint's host topology, find its "
+            "HCA's NUMA-local core count, divide by pair count, "
+            "and set Workers = the result. Pinning all workers "
+            "to the HCA's home NUMA node aligns CPU + RAM + PCIe."
+        )
+        self._max_bw_btn.clicked.connect(self._on_max_bw_clicked)
+
+        # Cache for /api/rdma/host_info. Populated lazily when the
+        # 🚀 Max BW button is clicked.
+        self._host_info_cache: Dict[str, Any] = {}
+
         # 2-col grid
         tg.addWidget(QLabel("Test type:"), 0, 0, Qt.AlignRight)
         tg.addWidget(self._test_combo,     0, 1)
@@ -431,6 +467,16 @@ class RdmaTopologyDialog(QDialog):
         tg.addWidget(self._duration_spin,  3, 1)
         tg.addWidget(QLabel("Base port:"), 3, 2, Qt.AlignRight)
         tg.addWidget(self._base_port_spin, 3, 3)
+        # v0.5.156: parallel workers row
+        tg.addWidget(QLabel("Parallel workers:"), 4, 0, Qt.AlignRight)
+        _pw_row = QWidget()
+        _pwh = QHBoxLayout(_pw_row)
+        _pwh.setContentsMargins(0, 0, 0, 0)
+        _pwh.setSpacing(4)
+        _pwh.addWidget(self._parallel_workers_spin)
+        _pwh.addWidget(self._max_bw_btn)
+        _pwh.addStretch(1)
+        tg.addWidget(_pw_row, 4, 1, 1, 3)
         cb_row = QHBoxLayout()
         cb_row.setSpacing(16)
         cb_row.addWidget(self._bidir_check)
@@ -438,7 +484,7 @@ class RdmaTopologyDialog(QDialog):
         cb_row.addStretch(1)
         cb_holder = QWidget()
         cb_holder.setLayout(cb_row)
-        tg.addWidget(cb_holder, 4, 0, 1, 4)
+        tg.addWidget(cb_holder, 5, 0, 1, 4)
         tg.setColumnStretch(1, 1)
         tg.setColumnStretch(3, 1)
         root.addWidget(test_box)
@@ -748,6 +794,176 @@ class RdmaTopologyDialog(QDialog):
             self._set_status_error(str(e))
             return
 
+        # v0.5.156 Slice A: probe same-host pairs for DOWN ports /
+        # missing IPs / same-subnet trap BEFORE firing perftest.
+        # If a blocker is detected, surface the same confirm
+        # dialog Blast uses (v0.5.152/v0.5.153). Skip if every
+        # pair is cross-host (trap impossible) OR the operator
+        # already applied IPs via Pre-flight.
+        same_host_plans = [
+            p for p in plans if p.server.tg_url == p.client.tg_url
+        ]
+        already_applied = bool(self._preflight_state_ids)
+        if same_host_plans and not already_applied:
+            self._set_status_neutral(
+                "Probing endpoints for same-subnet trap / DOWN port…"
+            )
+            self._start_btn.setEnabled(False)
+            self._topology_probe_then_start(plans, spec, same_host_plans[0])
+            return
+        # No same-host trap risk or operator already fixed it →
+        # proceed directly.
+        self._proceed_with_topology_start(plans, spec)
+
+    def _topology_probe_then_start(
+        self, plans: List[RdmaPairPlan],
+        spec: RdmaTopologySpec,
+        sample_plan: RdmaPairPlan,
+    ) -> None:
+        """v0.5.156: probe the FIRST same-host pair's two endpoints.
+        If a blocker is detected, pop the confirm dialog; otherwise
+        proceed. We sample one pair rather than all pairs because:
+          (a) blockers tend to be host-wide (DOWN port, missing
+              IP, subnet config), not pair-specific,
+          (b) probing all pairs would compound latency for the
+              common "many same-host pairs" mesh case."""
+        url = sample_plan.server.tg_url
+        srv_hca = sample_plan.server.device
+        cli_hca = sample_plan.client.device
+        srv_port = sample_plan.server.ib_port
+        cli_port = sample_plan.client.ib_port
+
+        self._topology_probe_buf: Dict[str, Dict[str, Any]] = {}
+
+        def _done(side: str, data, err):
+            self._topology_probe_buf[side] = data or {"error": err}
+            if len(self._topology_probe_buf) < 2:
+                return
+            self._topology_on_probe_complete(plans, spec, sample_plan)
+
+        for side, hca, port in (
+            ("server", srv_hca, srv_port),
+            ("client", cli_hca, cli_port),
+        ):
+            _get_async(
+                self,
+                f"{url.rstrip('/')}/api/rdma/probe?device={hca}&port={port}",
+                lambda data, err, _s=side: _done(_s, data, err),
+                timeout=4.0,
+            )
+
+    def _topology_on_probe_complete(
+        self,
+        plans: List[RdmaPairPlan],
+        spec: RdmaTopologySpec,
+        sample_plan: RdmaPairPlan,
+    ) -> None:
+        srv = self._topology_probe_buf.get("server") or {}
+        cli = self._topology_probe_buf.get("client") or {}
+        reason, detail = _detect_start_blockers(srv, cli)
+        if reason is None:
+            self._proceed_with_topology_start(plans, spec)
+            return
+
+        srv_iface = srv.get("kernel_iface") or "<server-iface>"
+        cli_iface = cli.get("kernel_iface") or "<client-iface>"
+        dlg = _StartBlockerConfirmDialog(
+            reason=reason, detail=detail,
+            srv_iface=srv_iface, cli_iface=cli_iface,
+            parent=self,
+        )
+        result = dlg.exec_()
+        choice = dlg.choice()
+        if result != QDialog.Accepted or choice == "cancel":
+            self._start_btn.setEnabled(True)
+            self._set_status_neutral("Start cancelled.")
+            return
+        if choice == "continue":
+            self._proceed_with_topology_start(plans, spec)
+            return
+        if choice == "open_preflight":
+            self._start_btn.setEnabled(True)
+            self._set_status_neutral("Opening Pre-flight…")
+            self._on_preflight_clicked()
+            return
+        # choice == "apply" — auto-pick CIDRs, configure on the
+        # sample plan's TG (host-wide fix), then proceed.
+        self._topology_apply_test_ips_then_start(
+            plans, spec, sample_plan, srv_iface, cli_iface,
+        )
+
+    def _topology_apply_test_ips_then_start(
+        self,
+        plans: List[RdmaPairPlan],
+        spec: RdmaTopologySpec,
+        sample_plan: RdmaPairPlan,
+        srv_iface: str,
+        cli_iface: str,
+    ) -> None:
+        url = sample_plan.server.tg_url
+        ifaces = [
+            {"name": srv_iface, "cidr": "10.42.0.1/24"},
+            {"name": cli_iface, "cidr": "10.43.0.1/24"},
+        ]
+        self._set_status_neutral("Validating test IPs…")
+
+        def _on_validated(data, err):
+            if err or not (data or {}).get("ok"):
+                issues = (data or {}).get("issues") or []
+                err_lines = [
+                    f"{i.get('iface', '?')}: {i.get('message', '')}"
+                    for i in issues
+                    if i.get("severity") == "error"
+                ]
+                msg = "; ".join(err_lines) or (
+                    err or "validation failed")
+                self._start_btn.setEnabled(True)
+                self._set_status_error(
+                    f"Auto-apply blocked: {msg}. Open Pre-flight "
+                    f"to pick non-conflicting CIDRs."
+                )
+                return
+            self._set_status_neutral("Applying temporary test IPs…")
+            _post_async(
+                self,
+                f"{url.rstrip('/')}/api/rdma/test_ifaces/configure",
+                {"ifaces": ifaces, "disable_rp_filter": True},
+                _on_applied,
+            )
+
+        def _on_applied(data, err):
+            if err or not (data or {}).get("ok"):
+                msg = err or (data or {}).get(
+                    "error", "configure failed")
+                self._start_btn.setEnabled(True)
+                self._set_status_error(
+                    f"Auto-apply failed: {msg}. Open Pre-flight."
+                )
+                return
+            sid = (data or {}).get("state_id")
+            if sid:
+                self._preflight_state_ids.setdefault(
+                    url, set()).add(sid)
+            self._set_status_neutral(
+                f"Test IPs applied (state_id="
+                f"{sid[:8] if sid else '?'}). Starting topology…"
+            )
+            self._proceed_with_topology_start(plans, spec)
+
+        _post_async(
+            self,
+            f"{url.rstrip('/')}/api/rdma/test_ifaces/validate",
+            {"ifaces": ifaces}, _on_validated,
+        )
+
+    def _proceed_with_topology_start(
+        self,
+        plans: List[RdmaPairPlan],
+        spec: RdmaTopologySpec,
+    ) -> None:
+        """The original per-pair start sequence. Extracted from
+        `_on_start_clicked` so the v0.5.156 auto-detect can defer
+        this step behind an optional confirm dialog."""
         # Reset per-run state
         self._plans = plans
         self._pair_jobs = {p.pair_index: {"server": None, "client": None}
@@ -816,6 +1032,169 @@ class RdmaTopologyDialog(QDialog):
         self._set_status_neutral(
             f"{started} / {len(self._plans)} pairs started…"
         )
+        # v0.5.156 Slice A: fan out parallel workers for this pair.
+        try:
+            wc = int(self._parallel_workers_spin.value())
+        except (AttributeError, RuntimeError):
+            wc = 1
+        if wc > 1:
+            self._start_pair_extra_workers(plan, wc)
+
+    # ─────────── v0.5.156 Slice A: parallel workers per pair
+
+    def _on_max_bw_clicked(self) -> None:
+        """Probe the first server endpoint's host topology, derive
+        per-pair worker count = floor(NUMA-local cores / pair_count).
+        Capped at 16. Falls back to 1 on probe failure."""
+        srv_eps, srv_errs = parse_endpoint_block(self._server_edit.toPlainText())
+        cli_eps, cli_errs = parse_endpoint_block(self._client_edit.toPlainText())
+        if srv_errs or cli_errs or not srv_eps:
+            self._set_status_error(
+                "Fill in valid endpoints first.")
+            return
+        # Number of pairs the shape will produce — drives the cap.
+        try:
+            spec = self._spec_from_ui(srv_eps, cli_eps)
+            plans = expand_pairs(spec)
+            pair_count = max(1, len(plans))
+        except Exception:
+            pair_count = 1
+        sample = srv_eps[0]
+        url = sample.tg_url.rstrip("/")
+        hca = sample.device
+
+        self._set_status_neutral("Querying host topology…")
+
+        def _on_info(data, err, _hca=hca, _pair_count=pair_count):
+            if err or not data:
+                self._set_status_error(
+                    f"host_info failed: {err or 'no data'}. "
+                    f"Set Parallel workers manually."
+                )
+                return
+            self._host_info_cache = data
+            try:
+                from utils.rdma_host_info import pick_workers_for_hca
+                pick = pick_workers_for_hca(
+                    hca=_hca, requested=None, info=data)
+            except Exception as exc:
+                self._set_status_error(f"pick_workers failed: {exc}")
+                return
+            # Divide NUMA-local cores by pair count so we don't
+            # oversubscribe (each pair will spawn `per_pair` workers
+            # on each side).
+            per_pair = max(1, int(pick.get("worker_count") or 1)
+                           // _pair_count)
+            per_pair = min(per_pair, 16)
+            self._parallel_workers_spin.setValue(per_pair)
+            self._set_status_neutral(
+                f"🚀 {per_pair} worker(s)/pair × {_pair_count} "
+                f"pair(s) = {per_pair * _pair_count} total. "
+                f"{pick.get('reason', '')}"
+            )
+
+        _get_async(self, f"{url}/api/rdma/host_info",
+                   _on_info, timeout=4.0)
+
+    def _start_pair_extra_workers(
+        self, plan: RdmaPairPlan, worker_count: int,
+    ) -> None:
+        """Spawn workers 1..N-1 for this pair. Each gets a unique
+        cpu_pin, shared numa_pin (matches plan.server's HCA), and
+        unique listen_port (plan.base_listen_port + worker_idx)."""
+        info = self._host_info_cache or {}
+        numa_pin = None
+        cpus: List[int] = []
+        try:
+            from utils.rdma_host_info import pick_workers_for_hca
+            pick = pick_workers_for_hca(
+                hca=plan.server.device,
+                requested=worker_count,
+                info=info,
+            )
+            numa_pin = pick.get("numa_pin")
+            cpus = pick.get("cpus") or list(range(worker_count))
+        except Exception:
+            cpus = list(range(worker_count))
+
+        if not hasattr(self, "_pair_extra_workers"):
+            self._pair_extra_workers: Dict[int, List[Dict[str, Any]]] = {}
+        self._pair_extra_workers.setdefault(plan.pair_index, [])
+
+        spec_workload = (self._plans[0]
+                         and self._plans[0])  # placeholder to satisfy lint
+        # Re-derive workload from UI (the same path
+        # _proceed_with_topology_start uses).
+        test_id = self._test_combo.currentData()
+
+        peer_host = plan.server.tg_url.replace("http://", "") \
+            .replace("https://", "").split(":")[0]
+
+        for worker_idx in range(1, worker_count):
+            cpu = cpus[worker_idx] if worker_idx < len(cpus) else worker_idx
+            extra_port = plan.base_listen_port + worker_idx
+            worker_handshake = (
+                f"{plan.pair_index}-w{worker_idx}-"
+                f"{uuid.uuid4().hex[:6]}"
+            )
+
+            srv_body = {
+                "role": "server",
+                "test": test_id,
+                "device": plan.server.device,
+                "ib_port": plan.server.ib_port,
+                "handshake_id": worker_handshake,
+                "note": f"Topology pair {plan.pair_index} / worker {worker_idx}",
+                "listen_port": extra_port,
+                "cpu_pin": cpu,
+                "numa_pin": numa_pin,
+                "gid_index": plan.server.gid_index,
+            }
+
+            def _on_extra_srv(
+                data, err,
+                _w=worker_idx, _cpu=cpu, _plan=plan,
+                _hand=worker_handshake, _peer=peer_host,
+                _port=extra_port,
+            ):
+                if err or not data or data.get("status") != "started":
+                    return
+                srv_jid = data.get("job_id")
+                cli_body = {
+                    "role": "client",
+                    "test": test_id,
+                    "device": _plan.client.device,
+                    "ib_port": _plan.client.ib_port,
+                    "handshake_id": _hand,
+                    "note": f"Topology pair {_plan.pair_index} / worker {_w}",
+                    "cpu_pin": _cpu,
+                    "numa_pin": numa_pin,
+                    "peer_addr": _peer,
+                    "peer_port": _port,
+                    "gid_index": _plan.client.gid_index,
+                }
+
+                def _on_extra_cli(cdata, cerr, _w2=_w, _srv_jid=srv_jid,
+                                  _plan2=_plan):
+                    if cerr or not cdata or cdata.get("status") != "started":
+                        return
+                    self._pair_extra_workers[_plan2.pair_index].append({
+                        "worker_idx": _w2,
+                        "server": _srv_jid,
+                        "client": cdata.get("job_id"),
+                    })
+
+                _post_async(
+                    self,
+                    f"{plan.client.tg_url}/api/rdma/perftest/start",
+                    cli_body, _on_extra_cli,
+                )
+
+            _post_async(
+                self,
+                f"{plan.server.tg_url}/api/rdma/perftest/start",
+                srv_body, _on_extra_srv,
+            )
 
     def _mark_pair_failed(self, pair_index: int, reason: str) -> None:
         if pair_index >= self._stats_table.rowCount():

@@ -2,6 +2,88 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.156] - 2026-06-15
+
+**Slice A: Topology dialog gains Blast's v0.5.152-155 quality
+features (audit BUG #1 + #2).**
+
+Operator: "go A first then B, and then C" (after the v0.5.155
+audit).
+
+The audit found two operator-blocking gaps in Topology vs Blast:
+
+### #1 — Auto-detect on Start
+
+Before: `_on_start_clicked` fired perftest immediately on every
+pair. Same-host configurations hit the QP→RTR routing trap silently
+with no recovery path.
+
+Now:
+* Reuses Blast's `_detect_start_blockers` +
+  `_StartBlockerConfirmDialog` (imported from
+  `widgets/rdma_blast_flow_dialog.py` — no logic duplication).
+* On Start, if any pair has `server.tg_url == client.tg_url` AND
+  no Pre-flight state was already applied → probe the FIRST
+  same-host pair's two endpoints in parallel.
+* If a blocker is detected (`probe_failed` / `down_port` /
+  `missing_ip` / `same_subnet`) → pop the contextual confirm with
+  Apply & Start / Continue / Cancel / Open Pre-flight.
+* On Apply → POST `/validate` then `/configure` then proceed.
+* Refactored: original per-pair start moved into
+  `_proceed_with_topology_start(plans, spec)`.
+
+### #2 — Parallel workers + 🚀 Max BW
+
+Before: each pair ran 1 perftest per side. No multi-core BW
+scaling.
+
+Now:
+* **Parallel workers** spinbox (range 1–64, default 1) in the
+  Shared workload group.
+* **🚀 Max BW** button: queries the first server endpoint's
+  `/api/rdma/host_info` → calls `pick_workers_for_hca` → divides
+  by pair count → sets the spinbox.
+* Per-pair fan-out: after each pair's worker 0 is up,
+  `_start_pair_extra_workers(plan, N)` spawns workers 1..N-1 with:
+  - Unique `cpu_pin` (next NUMA-local core),
+  - Shared `numa_pin` (HCA's home node),
+  - Unique `listen_port` (`plan.base_listen_port + worker_idx`),
+  - Unique `handshake_id` (`<pair>-w<N>-<uuid6>` so netgen's
+    handshake broker pairs the right server with the right client).
+* `_pair_extra_workers: Dict[pair_index, List[worker]]` tracks
+  extras per pair.
+
+### Why divide by pair count
+
+Topology can spawn many pairs (e.g., mesh shape). If each pair
+spawned 12 workers, a 4-pair mesh × 12 = 48 workers per side =
+96 perftest processes on one host. The picker divides NUMA-local
+cores by `pair_count` so the total stays bounded.
+
+### Files changed
+- `widgets/rdma_topology_dialog.py` (~280 lines: auto-detect
+  flow + Parallel workers UI + per-pair fan-out).
+- `pyproject.toml` (0.5.155 → 0.5.156).
+- `tests/test_v05156_topology_parity.py` (16 tests).
+
+### Deferred (next ships)
+- Slice B (v0.5.157): Blast multi-worker hygiene — `_host_info_cache`
+  staleness, TOTAL line includes worker 0, `_extra_workers` cleanup
+  on close, cpu_pin validation.
+- Slice C (v0.5.158): Polish — remove dead alias, log on
+  host_info fallback.
+
+### Verified
+```
+$ ./venv/bin/pytest tests/test_v05156_topology_parity.py -q
+16 passed in 0.07s
+
+$ ./venv/bin/pytest tests/ -q -k "rdma or blast or topology or perftest or qp or preflight"
+525 passed, 2455 deselected
+```
+
+---
+
 ## [0.5.155] - 2026-06-15
 
 **Parallel workers + 🚀 Max BW: true single-HCA BW scaling via CPU
