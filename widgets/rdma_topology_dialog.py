@@ -363,9 +363,11 @@ class RdmaTopologyDialog(QDialog):
         # the single-pair dialog
         test_box = QGroupBox("Shared workload (applies to every pair)")
         tg = QGridLayout(test_box)
-        tg.setContentsMargins(8, 4, 8, 4)
+        # v0.5.159: bumped vertical spacing 4 → 8 + margins so the
+        # spinbox baselines no longer kiss.
+        tg.setContentsMargins(8, 6, 8, 6)
         tg.setHorizontalSpacing(8)
-        tg.setVerticalSpacing(4)
+        tg.setVerticalSpacing(8)
 
         self._test_combo = QComboBox()
         for tid, label, _group in _TESTS:
@@ -426,7 +428,7 @@ class RdmaTopologyDialog(QDialog):
         self._parallel_workers_spin = QSpinBox()
         self._parallel_workers_spin.setRange(1, 64)
         self._parallel_workers_spin.setValue(1)
-        self._parallel_workers_spin.setFixedWidth(80)
+        self._parallel_workers_spin.setMinimumWidth(80)
         self._parallel_workers_spin.setToolTip(
             "Per-pair worker count. Each pair spawns N perftest "
             "processes on each side, each pinned to a different "
@@ -437,7 +439,9 @@ class RdmaTopologyDialog(QDialog):
             "fits the HCA's NUMA-local core count."
         )
         self._max_bw_btn = QPushButton("🚀 Max BW")
-        self._max_bw_btn.setFixedWidth(82)
+        # v0.5.159: was setFixedWidth(82) which clipped "Max BW"
+        # on macOS. Use min width so Qt sizes for the platform.
+        self._max_bw_btn.setMinimumWidth(108)
         self._max_bw_btn.setToolTip(
             "Query the first endpoint's host topology, find its "
             "HCA's NUMA-local core count, divide by pair count, "
@@ -969,14 +973,16 @@ class RdmaTopologyDialog(QDialog):
         self._pair_jobs = {p.pair_index: {"server": None, "client": None}
                            for p in plans}
         self._latest_jobs = {}
-        # v0.5.157: drop the previous run's per-pair extras + the
-        # cached host_info so an HCA change between Starts re-
-        # queries NUMA topology. Same fix as Blast _proceed_with_
-        # start. Without these, polling loops keep ticking against
-        # the previous run's stale job_ids.
+        # v0.5.157: drop the previous run's per-pair extras so
+        # polling loops don't keep ticking against the previous
+        # run's stale job_ids.
         if hasattr(self, "_pair_extra_workers"):
             self._pair_extra_workers.clear()
-        self._host_info_cache = {}
+        # v0.5.159 REGRESSION FIX: v0.5.157 also reset
+        # _host_info_cache = {} here, which silently discarded the
+        # operator's 🚀 Max BW click. host_info is a HOST-LEVEL
+        # snapshot (NUMA topology + hca_numa map for all HCAs);
+        # reusing it across Starts is correct. Leave the cache.
         self._populate_stats_table_skeleton(plans)
         self._start_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
@@ -1138,10 +1144,20 @@ class RdmaTopologyDialog(QDialog):
             fallback_reason = f"pick_workers_for_hca failed: {exc}"
         # v0.5.158: surface the fallback so cross-NUMA penalty
         # doesn't get misdiagnosed as a wire issue.
+        # v0.5.159: was self._stats_view.append — that attribute
+        # only exists on the Blast dialog. Topology has _stats_table
+        # + _status_label. Use the status label (rendered in red
+        # by _set_status_error so the operator sees it) — falling
+        # back to NUMA-blind workers is a soft warning, not an
+        # error, but operator-visible matters more than the colour
+        # nuance.
         if fallback_reason:
-            self._stats_view.append(
-                f"[pair #{plan.pair_index}] ⚠ {fallback_reason}"
-            )
+            try:
+                self._set_status_error(
+                    f"⚠ pair #{plan.pair_index}: {fallback_reason}"
+                )
+            except Exception:
+                pass
         # v0.5.157: clamp to cpu_count - 1 so a high worker_count
         # on a small-core host doesn't ask taskset for a CPU that
         # doesn't exist (matches the Blast _start_extra_workers
@@ -1438,11 +1454,13 @@ class RdmaTopologyDialog(QDialog):
                 except Exception:
                     pass
         self._preflight_state_ids.clear()
-        # v0.5.157: drop per-pair extras + cached host_info so a
-        # reopen via the menu starts clean.
+        # v0.5.157: drop per-pair extras so a reopen via the menu
+        # starts clean.
+        # v0.5.159: dropped the _host_info_cache = {} reset — Qt
+        # destroys the widget on close anyway, and the cache is
+        # host-level (stable across sessions).
         if hasattr(self, "_pair_extra_workers"):
             self._pair_extra_workers.clear()
-        self._host_info_cache = {}
         super().closeEvent(event)
 
 

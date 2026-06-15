@@ -2,6 +2,79 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.159] - 2026-06-15
+
+**Critical extras-unwrap fix + v0.5.157 regression revert + UI
+polish.**
+
+Triggered by operator's 16-worker Blast run on srv06 that showed:
+worker 0 finished at 156 Gbps, zero per-worker done lines for
+extras 1-15, no TOTAL line, and the v0.5.158 "no host_info cached"
+warning firing even though 🚀 Max BW had been clicked.
+
+NOT YET RELEASED — bump + commit only, awaiting operator approval.
+
+### #1 — CRITICAL: extras never marked finished (since v0.5.155)
+
+`_on_extra_job_resp` read `data.get("finished_at")` directly. But
+`/api/rdma/perftest/job/<id>` wraps the job in `{"job": {...}}` —
+`_on_job_resp` (worker 0) correctly unwraps it; the extras path
+never did. So every extra worker sat in `_extra_workers` forever
+with `server_finished=False, client_finished=False`,
+`_maybe_emit_total` bailed at the "every extra done?" check, and
+per-worker done rows were silently swallowed. Bug present since
+v0.5.155's parallel-worker introduction.
+
+Fix: unwrap `data["job"]` and read `final_bw_avg_gbps` /
+`final_msg_rate_mpps` / `returncode` / `finished_at` from there.
+
+### #2 — REGRESSION: v0.5.157 wiped `_host_info_cache` on Start
+
+v0.5.157 added `self._host_info_cache = None` (Blast) and
+`= {}` (Topology) in `_proceed_with_*_start` and `closeEvent`.
+The reasoning was "HCA change between Starts kept previous HCA's
+NUMA snapshot." That reasoning was wrong — `host_info` is a
+HOST-LEVEL fact (NUMA topology + full `hca_numa` map for every
+HCA on the box, not just the currently-selected one). Wiping it
+silently discarded the operator's 🚀 Max BW click; the next Start
+fell back to `list(range(N))` with no `numa_pin`, and v0.5.158's
+"(operator skipped 🚀 Max BW)" warning fired even when they
+hadn't.
+
+Fix: drop all four cache resets. The cache is fine to reuse —
+operator clicks 🚀 again for fresh info.
+
+### #3 — LATENT: v0.5.158 AttributeError in Topology fallback
+
+v0.5.158 added `self._stats_view.append(...)` to Topology's
+`_start_pair_extra_workers` to surface the NUMA-blind fallback.
+But Topology has `_stats_table` + `_status_label`, not
+`_stats_view` — that path would AttributeError if hit. Redirected
+to `_set_status_error` (which writes the operator-visible status
+label).
+
+### #4 — UI polish (operator screenshot)
+
+* `Verify` button widened: `setFixedWidth(78)` → `setMinimumWidth
+  (96)`. Was clipping "Verify" on macOS Big Sur+.
+* `🚀 Max BW` button widened: 86/82 px → `setMinimumWidth(108)`
+  in both dialogs. Was clipping "Max BW" on macOS.
+* Test parameters grid vertical spacing: 2 → 8 (Blast),
+  4 → 8 (Topology). Spinbox baselines were kissing on Retina.
+* Live stats `setMinimumHeight`: 280 → 320. With 16 workers the
+  "[worker N] both halves running" lines pushed the `[client]
+  done` row below the visible area.
+* Live stats auto-scroll: connect `textChanged` →
+  `_scroll_stats_to_bottom`. Default Qt only auto-scrolls when
+  the bar is already at max; after ~270 running-tick lines, the
+  `[client] done` summary was clipped at the bottom.
+
+### Tests
+
+`tests/test_v05159_extras_unwrap_and_polish.py` — 14 new tests.
+v0.5.152, v0.5.157, v0.5.158 tests updated to match the
+intentional reverts. Combined RDMA regression sweep: 143 passing.
+
 ## [0.5.158] - 2026-06-15
 
 **Slice C: polish — dead-alias cleanup + fallback warning

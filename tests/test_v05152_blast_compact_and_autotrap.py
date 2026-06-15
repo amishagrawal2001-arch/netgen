@@ -34,12 +34,14 @@ SRC_TOP = (REPO / "widgets" / "rdma_topology_dialog.py").read_text()
 
 
 def test_test_params_grid_compacted():
-    """Tighten the QGridLayout spacing/margins so the test-params
-    section claims less vertical space, freeing room for Live
-    stats. v0.5.152: setVerticalSpacing(2) (was 4),
-    setContentsMargins(6, 2, 6, 2) (was (8, 4, 8, 4))."""
-    assert "tg.setVerticalSpacing(2)" in SRC_BLAST
-    assert "tg.setContentsMargins(6, 2, 6, 2)" in SRC_BLAST
+    """v0.5.152 compacted the QGridLayout; v0.5.159 loosened
+    vertical spacing back to 8 (the v0.5.152 value of 2 made
+    spinbox baselines kiss on Retina). The margins are also
+    bumped back. The intent — claim less vertical space than the
+    original (8, 4, 8, 4) but more than v0.5.152 — survives in
+    the (8, 6, 8, 6) compromise."""
+    assert "tg.setVerticalSpacing(8)" in SRC_BLAST
+    assert "tg.setContentsMargins(8, 6, 8, 6)" in SRC_BLAST
 
 
 def test_spinbox_widths_shrunk():
@@ -65,10 +67,11 @@ def test_spinbox_widths_shrunk():
 
 
 def test_live_stats_minheight_bumped():
-    """Live stats panel was minHeight=160 → 280 (v0.5.152). And
-    the panel is added with stretch=1 so it claims any freed
-    vertical room."""
-    assert "self._stats_view.setMinimumHeight(280)" in SRC_BLAST
+    """Live stats panel was minHeight=160 → 280 (v0.5.152) →
+    320 (v0.5.159) — operator wanted the [client] done row
+    visible after the ~270 running-tick lines. Stretch=1 still
+    intact so the panel claims any freed vertical room."""
+    assert "self._stats_view.setMinimumHeight(320)" in SRC_BLAST
     assert "root.addWidget(stats_box, 1)" in SRC_BLAST
 
 

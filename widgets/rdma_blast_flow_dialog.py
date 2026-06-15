@@ -505,9 +505,12 @@ class RdmaBlastFlowDialog(QDialog):
         # v0.5.152: compact further — operator wanted more vertical
         # room for the Live stats panel below. Tighten spacings and
         # margins; shrink the spinbox fixed widths.
-        tg.setVerticalSpacing(2)
-        tg.setHorizontalSpacing(4)
-        tg.setContentsMargins(6, 2, 6, 2)
+        # v0.5.159: bump vertical spacing 2 → 8 — the v0.5.152
+        # value crammed adjacent rows so tightly that the QSpinBox
+        # baselines kissed each other on a Retina display.
+        tg.setVerticalSpacing(8)
+        tg.setHorizontalSpacing(6)
+        tg.setContentsMargins(8, 6, 8, 6)
 
         # Pre-build every widget, then place them in pairs.
         self._test_combo = QComboBox()
@@ -620,7 +623,11 @@ class RdmaBlastFlowDialog(QDialog):
         _qph.setSpacing(4)
         _qph.addWidget(self._qp_count_spin)
         self._qp_verify_btn = QPushButton("❓ Verify")
-        self._qp_verify_btn.setFixedWidth(78)
+        # v0.5.159: was setFixedWidth(78) which clipped "Verify" on
+        # macOS Big Sur+ once the system font went taller. Use a
+        # min width and let Qt size up naturally for the platform's
+        # font metrics.
+        self._qp_verify_btn.setMinimumWidth(96)
         self._qp_verify_btn.setToolTip(
             "Open a help panel showing commands to verify that "
             "perftest is actually creating qp_count QPs on the "
@@ -662,7 +669,10 @@ class RdmaBlastFlowDialog(QDialog):
         _pwh.setSpacing(4)
         _pwh.addWidget(self._parallel_workers_spin)
         self._max_bw_btn = QPushButton("🚀 Max BW")
-        self._max_bw_btn.setFixedWidth(86)
+        # v0.5.159: was setFixedWidth(86) — too narrow on macOS,
+        # clipped "Max BW". Use min width so Qt picks per-platform
+        # font metrics.
+        self._max_bw_btn.setMinimumWidth(108)
         self._max_bw_btn.setToolTip(
             "Query the server's NUMA topology, find the HCA's "
             "home node, and set Parallel workers = number of CPU "
@@ -735,10 +745,19 @@ class RdmaBlastFlowDialog(QDialog):
         mono = QFont("Menlo")
         mono.setStyleHint(QFont.Monospace)
         self._stats_view.setFont(mono)
-        self._stats_view.setMinimumHeight(280)
+        # v0.5.159: bumped 280 → 320. With 16 parallel workers the
+        # "[worker N] both halves running" lines push the [client]
+        # done summary below the visible area; the extra ~40 px
+        # lets the operator see the BW row without scrolling.
+        self._stats_view.setMinimumHeight(320)
         self._stats_view.setPlaceholderText(
             "Stats appear here once perftest is running on both sides."
         )
+        # v0.5.159: auto-scroll to bottom on every append. Without
+        # this, the QTextEdit only scrolls when the scrollbar is
+        # already at max — long histories from the running-tick
+        # spam left the [client] done line clipped at the bottom.
+        self._stats_view.textChanged.connect(self._scroll_stats_to_bottom)
         sv.addWidget(self._stats_view)
         root.addWidget(stats_box, 1)
 
@@ -947,6 +966,21 @@ class RdmaBlastFlowDialog(QDialog):
             "cpu_util": bool(self._cpu_util_check.isChecked()),
             "report_gbits": True,
         }
+
+    # ───────── v0.5.159 stats view auto-scroll
+
+    def _scroll_stats_to_bottom(self) -> None:
+        """Pin the QTextEdit's vertical scrollbar to its maximum
+        every time the contents change. The default Qt behavior
+        only auto-scrolls when the bar is already at the bottom;
+        after the running-tick spam (~270s × 2 sides ≈ 270 lines)
+        operators want the final BW row visible without manually
+        scrolling."""
+        try:
+            bar = self._stats_view.verticalScrollBar()
+            bar.setValue(bar.maximum())
+        except Exception:
+            pass
 
     # ───────── v0.5.150 pre-flight check
 
@@ -1548,10 +1582,16 @@ class RdmaBlastFlowDialog(QDialog):
         self._total_emitted = False
         self._client_bw = None
         self._client_msgrate = None
-        # v0.5.157: refresh the host_info cache per-Start so a HCA
-        # change between Starts re-queries NUMA topology instead of
-        # quietly reusing the previous HCA's home node.
-        self._host_info_cache = None
+        # v0.5.159 REGRESSION FIX: v0.5.157 cleared the host-info
+        # cache here on every Start. That was wrong — host_info is
+        # a HOST-LEVEL fact (NUMA topology + full hca_numa map for
+        # every HCA on the box). Clearing it meant the operator's
+        # 🚀 Max BW click was silently discarded by the next Start,
+        # _start_extra_workers fell back to list(range(N)) with no
+        # numa_pin, and the v0.5.158 "(operator skipped 🚀 Max BW)"
+        # warning fired even when they hadn't. Leave the cache
+        # alone — if the operator wants fresh info they click 🚀
+        # again.
 
         # v0.3.19: reset per-side finished tracking + render-dedup so
         # a second run in the same dialog session doesn't see stale
@@ -1719,17 +1759,27 @@ class RdmaBlastFlowDialog(QDialog):
     ) -> None:
         """Per-extra-worker completion tracking. Renders a short
         line when each half finishes; sums BW into the TOTAL once
-        every worker is done."""
+        every worker is done.
+
+        v0.5.159 CRITICAL FIX: the response from
+        /api/rdma/perftest/job/<id> is `{"job": {...}}`. Pre-fix we
+        read `data.get("finished_at")` directly — which was always
+        None, so extras NEVER transitioned to finished, _maybe_
+        emit_total never fired the TOTAL line, and per-worker done
+        rows were silently swallowed. `_on_job_resp` for worker 0
+        unwraps `data["job"]` correctly; mirror that here.
+        """
         if err or not data:
             return
-        if data.get("finished_at") is not None:
+        job = data.get("job") or {}
+        if job.get("finished_at") is not None:
             done_key = f"{side}_finished"
             if not w.get(done_key):
                 w[done_key] = True
                 wi = w.get("worker_idx", "?")
-                rc = data.get("returncode")
-                bw = data.get("final_bw_avg_gbps")
-                mr = data.get("final_msg_rate_mpps")
+                rc = job.get("returncode")
+                bw = job.get("final_bw_avg_gbps")
+                mr = job.get("final_msg_rate_mpps")
                 self._stats_view.append(
                     f"[worker {wi}/{side}] done (rc={rc})  "
                     f"BW avg={bw} Gbps  MsgRate={mr} Mpps"
@@ -2053,11 +2103,15 @@ class RdmaBlastFlowDialog(QDialog):
         # session would carry stale worker dicts in _extra_workers
         # (polled forever against a closed perftest job_id) and the
         # TOTAL-emit guard would suppress the next Start's summary.
+        # v0.5.159: keep _host_info_cache across close — but
+        # that's a non-issue here since closeEvent destroys the
+        # widget anyway. The other resets ARE still needed for
+        # in-session safety; we just don't need to special-case
+        # _host_info_cache because Qt's deletion handles it.
         self._extra_workers = []
         self._total_emitted = False
         self._client_bw = None
         self._client_msgrate = None
-        self._host_info_cache = None
         event.accept()
 
     def _cleanup_preflight_state_ids(self) -> None:

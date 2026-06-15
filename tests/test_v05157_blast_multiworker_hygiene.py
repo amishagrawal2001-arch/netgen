@@ -33,15 +33,19 @@ SRC_TOPO = (REPO / "widgets" / "rdma_topology_dialog.py").read_text()
 
 
 def test_blast_proceed_with_start_resets_host_info_cache():
-    """Without this, choosing a different HCA between Starts
-    would silently keep the previous HCA's NUMA node."""
+    """v0.5.157 added this reset; v0.5.159 backed it out — host_info
+    is a HOST-level snapshot (NUMA + full hca_numa map), so reusing
+    it across Starts is correct. The cache reset silently discarded
+    the operator's 🚀 Max BW selection."""
     body = _extract_method(SRC_BLAST, "_proceed_with_start")
-    assert "self._host_info_cache = None" in body
+    assert "self._host_info_cache = None" not in body
 
 
 def test_topology_proceed_with_topology_start_resets_host_info_cache():
+    """Same revert as Blast — host_info is HOST-level."""
     body = _extract_method(SRC_TOPO, "_proceed_with_topology_start")
-    assert "self._host_info_cache = {}" in body
+    assert "self._host_info_cache = {}" not in body
+    assert "self._host_info_cache = None" not in body
 
 
 # ───── #2: TOTAL line covers worker 0 too ────────────────────────────────
@@ -79,10 +83,12 @@ def test_blast_on_job_resp_calls_maybe_emit_total():
 
 
 def test_blast_close_event_resets_extras():
+    """v0.5.157 invariant: closeEvent resets per-run worker state.
+    v0.5.159 dropped the _host_info_cache reset (Qt destroys the
+    widget anyway, and the cache is host-level)."""
     body = _extract_method(SRC_BLAST, "closeEvent")
     assert "self._extra_workers = []" in body
     assert "self._total_emitted = False" in body
-    assert "self._host_info_cache = None" in body
 
 
 def test_blast_proceed_with_start_resets_total_guard():
@@ -95,9 +101,11 @@ def test_blast_proceed_with_start_resets_total_guard():
 
 
 def test_topology_close_event_resets_extras():
+    """v0.5.159 dropped the _host_info_cache = {} reset for the
+    same reason as Blast."""
     body = _extract_method(SRC_TOPO, "closeEvent")
     assert "_pair_extra_workers" in body
-    assert "self._host_info_cache = {}" in body
+    assert "self._host_info_cache = {}" not in body
 
 
 def test_topology_proceed_clears_pair_extras():

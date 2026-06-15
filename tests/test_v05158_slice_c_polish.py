@@ -67,12 +67,19 @@ def test_blast_emits_fallback_warning_when_hca_not_in_numa_map():
 
 
 def test_topology_emits_per_pair_fallback_warning():
+    """v0.5.159: the warning routes through _set_status_error
+    (Topology has no _stats_view; the v0.5.158 .append() would
+    AttributeError). The fallback_reason strings + per-pair
+    prefix still live in the method body."""
     body = _extract_method(SRC_TOPO, "_start_pair_extra_workers")
     assert "fallback_reason" in body
     # Per-pair labeling.
-    assert "[pair #" in body
+    assert "[pair #" in body or "pair #" in body
     assert "no host_info cached" in body
     assert "not in host's NUMA map" in body
+    # The .append path is gone; warnings go through the status
+    # label instead.
+    assert "_set_status_error" in body
 
 
 # ───── helpers ──────────────────────────────────────────────────────────
