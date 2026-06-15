@@ -505,7 +505,28 @@ class RdmaBlastFlowDialog(QDialog):
         tg.addWidget(self._tx_depth_spin,     1, 3)
         # Row 2: QP count | GID index
         tg.addWidget(QLabel("QP count:"),  2, 0, Qt.AlignRight)
-        tg.addWidget(self._qp_count_spin,  2, 1)
+        # v0.5.151: pair the QP spinbox with a "❓ Verify" button
+        # that pops a help dialog containing concrete `rdma
+        # resource show qp` commands pre-filled with the currently-
+        # selected HCAs. Lets the operator confirm that perftest
+        # is actually using N QPs without leaving netgen.
+        _qp_row = QWidget()
+        _qph = QHBoxLayout(_qp_row)
+        _qph.setContentsMargins(0, 0, 0, 0)
+        _qph.setSpacing(4)
+        _qph.addWidget(self._qp_count_spin)
+        self._qp_verify_btn = QPushButton("❓ Verify")
+        self._qp_verify_btn.setFixedWidth(78)
+        self._qp_verify_btn.setToolTip(
+            "Open a help panel showing commands to verify that "
+            "perftest is actually creating qp_count QPs on the "
+            "selected HCAs. Commands are pre-filled with the "
+            "host + device + port you picked above."
+        )
+        self._qp_verify_btn.clicked.connect(self._show_qp_verify_help)
+        _qph.addWidget(self._qp_verify_btn)
+        _qph.addStretch(1)
+        tg.addWidget(_qp_row, 2, 1)
         tg.addWidget(QLabel("GID index:"), 2, 2, Qt.AlignRight)
         tg.addWidget(self._gid_index_spin, 2, 3)
         # Row 3: Duration | (free for the bidir checkbox to flow into
@@ -825,6 +846,44 @@ class RdmaBlastFlowDialog(QDialog):
                 f"Pre-flight applied test IPs (state_id={sid[:8]}). "
                 f"Cleanup will fire when this dialog closes."
             )
+
+    # ───────── v0.5.151 QP-verify help
+
+    def _show_qp_verify_help(self) -> None:
+        """Pop a help panel with concrete `rdma resource show qp`
+        commands the operator can run to verify that perftest is
+        actually using qp_count QPs.
+
+        Pre-fills commands with the currently-selected (host, HCA,
+        IB port, qp_count). Falls back to `<hca>` / `<server>`
+        placeholders when nothing is picked yet — the panel is
+        still informative as a reference doc.
+        """
+        from urllib.parse import urlparse
+
+        def _host(url: str) -> str:
+            try:
+                return urlparse(url).hostname or url
+            except Exception:
+                return url
+
+        srv_host = _host(self._server_tg_url)
+        cli_host = _host(self._client_tg_url)
+        srv_dev = self._server_device_combo.currentData() or "<server-hca>"
+        cli_dev = self._client_device_combo.currentData() or "<client-hca>"
+        srv_port = int(self._server_port_spin.value())
+        cli_port = int(self._client_port_spin.value())
+        qp_n = int(self._qp_count_spin.value())
+        same_host = srv_host == cli_host
+
+        dlg = _QpVerifyHelpDialog(
+            srv_host=srv_host, cli_host=cli_host,
+            srv_dev=srv_dev, cli_dev=cli_dev,
+            srv_port=srv_port, cli_port=cli_port,
+            qp_n=qp_n, same_host=same_host,
+            parent=self,
+        )
+        dlg.exec_()
 
     def _pick_other_hca_for_client(self) -> None:
         """v0.5.149: same-host two-HCA shortcut. Picks the device
@@ -1291,3 +1350,207 @@ class RdmaBlastFlowDialog(QDialog):
                 )
             except Exception:
                 pass
+
+
+# ─────────────────────────────────── v0.5.151 QP-verify help dialog ──
+
+
+class _QpVerifyHelpDialog(QDialog):
+    """Modal showing how to verify perftest is using the operator's
+    requested QP count. Substitutes the current dialog state
+    (host, HCA, IB port, qp_count) into the command templates so
+    copy-paste is one click.
+
+    Pure reference doc — no async calls, no side effects. Closes
+    the SSH-vs-curl gap left by v0.5.150: operators have a
+    button-driven test runner AND a button-driven verification
+    path.
+    """
+
+    def __init__(
+        self,
+        *,
+        srv_host: str, cli_host: str,
+        srv_dev: str, cli_dev: str,
+        srv_port: int, cli_port: int,
+        qp_n: int, same_host: bool,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.setWindowTitle("Verify Active QPs")
+        self.setMinimumSize(720, 580)
+
+        root = QVBoxLayout(self)
+        root.setContentsMargins(10, 10, 10, 10)
+        root.setSpacing(8)
+
+        intro = QLabel(
+            "<span style='font-size:13px; font-weight:600; color:#0f172a;'>"
+            "Verify Active QPs</span>"
+            "&nbsp;&nbsp;"
+            "<span style='color:#64748b; font-size:11px;'>"
+            f"qp_count = <b>{qp_n}</b>. perftest doesn't print its "
+            "QP table by default — these commands let you see it "
+            "from the outside while the test is running."
+            "</span>"
+        )
+        intro.setWordWrap(True)
+        root.addWidget(intro)
+
+        # Cache the SSH/raw command pairs so the buttons can copy
+        # exactly what's rendered.
+        self._cmd_pairs: list = []
+
+        def _add_section(
+            title: str, blurb: str, commands: list
+        ) -> None:
+            box = QGroupBox(title)
+            v = QVBoxLayout(box)
+            v.setContentsMargins(8, 4, 8, 6)
+            v.setSpacing(4)
+            blurb_lbl = QLabel(
+                f"<span style='color:#475569; font-size:11px;'>"
+                f"{blurb}</span>"
+            )
+            blurb_lbl.setWordWrap(True)
+            v.addWidget(blurb_lbl)
+            for cmd in commands:
+                row = QHBoxLayout()
+                row.setSpacing(6)
+                edit = QLineEdit(cmd)
+                edit.setReadOnly(True)
+                edit.setFont(QFont("Menlo"))
+                edit.setStyleSheet(
+                    "background:#f1f5f9; border:1px solid #cbd5e1; "
+                    "padding:4px; border-radius:3px;"
+                )
+                row.addWidget(edit, 1)
+                btn = QPushButton("Copy")
+                btn.setFixedWidth(54)
+                btn.clicked.connect(
+                    lambda _=False, e=edit: self._copy_to_clipboard(e.text()))
+                row.addWidget(btn)
+                v.addLayout(row)
+                self._cmd_pairs.append(cmd)
+            root.addWidget(box)
+
+        # Build the ssh-wrapped form for each command. If the
+        # operator is on the same host (rare but possible), still
+        # show ssh — they can drop the prefix mentally.
+        def _ssh(host: str, cmd: str) -> str:
+            return f"ssh {host} '{cmd}'"
+
+        # ── Section 1: count.
+        _add_section(
+            "1. Count active QPs",
+            (
+                f"Should be ≈ <b>{qp_n}</b> on each side (perftest "
+                f"adds 1 control QP during setup). Run WHILE the "
+                f"test is running."
+            ),
+            [
+                _ssh(srv_host,
+                     f"rdma resource show qp link {srv_dev}/{srv_port} | wc -l"),
+            ] + ([
+                _ssh(cli_host,
+                     f"rdma resource show qp link {cli_dev}/{cli_port} | wc -l"),
+            ] if not same_host or srv_dev != cli_dev else []),
+        )
+
+        # ── Section 2: detail.
+        _add_section(
+            "2. QP detail (state, PD, owning process)",
+            (
+                "Each row is one QP. Look for <code>state RTS</code> "
+                "(Ready To Send) on every QP — anything stuck in "
+                "<code>INIT</code> or <code>RTR</code> is failing "
+                "to transition. <code>pid</code> should be perftest."
+            ),
+            [
+                _ssh(srv_host,
+                     f"rdma resource show qp link {srv_dev}/{srv_port} -d"),
+            ] + ([
+                _ssh(cli_host,
+                     f"rdma resource show qp link {cli_dev}/{cli_port} -d"),
+            ] if not same_host or srv_dev != cli_dev else []),
+        )
+
+        # ── Section 3: JSON (machine-parseable).
+        _add_section(
+            "3. JSON (for scripts)",
+            (
+                "Same info as section 2 but JSON. Useful when "
+                "scripting verification or piping into <code>jq</code>."
+            ),
+            [
+                _ssh(srv_host,
+                     f"rdma resource show qp link {srv_dev}/{srv_port} -jp"),
+            ],
+        )
+
+        # ── Section 4: perftest verbose.
+        _add_section(
+            "4. perftest verbose mode (-v)",
+            (
+                "Alternative: re-run with <code>-v</code> and "
+                "perftest itself will print every QP's QPN as it "
+                "creates them. Pass via the API escape hatch:"
+            ),
+            [
+                (
+                    f"curl -X POST http://{srv_host}:5050"
+                    f"/api/rdma/perftest/start "
+                    f"-H 'Content-Type: application/json' "
+                    f"-d '{{\"role\":\"server\",\"device\":\"{srv_dev}\","
+                    f"\"test\":\"send_bw\",\"qp_count\":{qp_n},"
+                    f"\"perf_extra\":[\"-v\"]}}'"
+                ),
+                (
+                    f"# Then fetch stdout_tail from the job "
+                    f"endpoint:\n"
+                    f"curl http://{srv_host}:5050/api/rdma/perftest/job/<job_id>"
+                ),
+            ],
+        )
+
+        # ── Section 5: cross-check via PHY counters.
+        _add_section(
+            "5. Wire-level cross-check (ethtool PHY counters)",
+            (
+                "Independent confirmation that the QPs are doing "
+                "work. Sample twice, 5s apart; delta / 5 = pps. "
+                "Should match the perftest result row's MsgRate."
+            ),
+            [
+                _ssh(srv_host,
+                     f"ethtool -S $(ls /sys/class/infiniband/{srv_dev}"
+                     f"/device/net | head -1) "
+                     f"| grep -E 'tx_packets_phy|tx_bytes_phy'"),
+            ],
+        )
+
+        # Footer: "copy all" + close.
+        btn_row = QHBoxLayout()
+        copy_all = QPushButton("Copy all commands")
+        copy_all.setToolTip(
+            "Copy every command above to the clipboard, one per "
+            "line. Useful for pasting into a single SSH session."
+        )
+        copy_all.clicked.connect(lambda: self._copy_to_clipboard(
+            "\n".join(self._cmd_pairs)))
+        btn_row.addWidget(copy_all)
+        btn_row.addStretch(1)
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        btn_row.addWidget(close_btn)
+        root.addLayout(btn_row)
+
+    @staticmethod
+    def _copy_to_clipboard(text: str) -> None:
+        try:
+            from PyQt5.QtWidgets import QApplication
+            cb = QApplication.clipboard()
+            if cb is not None:
+                cb.setText(text)
+        except Exception:
+            pass

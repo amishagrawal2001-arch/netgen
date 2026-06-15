@@ -2,6 +2,74 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.151] - 2026-06-15
+
+**Blast RDMA Flow dialog: in-place QP-verify help.**
+
+Operator (after successfully running 171 Gbps with `qp_count=10`):
+
+> "increased QP=10, how do i verify what QPs being used to send
+> roce traffic ?"
+
+perftest doesn't print its QP inventory by default. The answer
+is `rdma resource show qp link <hca>/<port>`, but the operator
+shouldn't have to remember the syntax, look up the HCA name,
+and re-type the IB port — all three are already on the dialog.
+
+### What's new
+
+* **"❓ Verify" button** next to the QP-count spinbox.
+* Click → opens new `_QpVerifyHelpDialog` with five sections, each
+  containing copy-paste-ready SSH-wrapped commands pre-filled
+  with the operator's current dialog state:
+
+  1. **Count** — `rdma resource show qp link <hca>/<port> | wc -l`
+     ≈ qp_count + 1 control QP.
+  2. **Detail** — `… -d` (state, PD, pid). Look for state `RTS`
+     on every QP; `INIT`/`RTR` means the QP is stuck.
+  3. **JSON** — `… -jp` for scripting / `jq` piping.
+  4. **perftest verbose** — same job re-run via the `perf_extra`
+     escape hatch with `["-v"]`. Verbose stdout shows every
+     QP's QPN as it's created.
+  5. **Wire cross-check** — `ethtool -S … | grep tx_packets_phy`
+     sampled twice → pps. Should match the result row's MsgRate.
+
+* Per-command **Copy** buttons + a **Copy all commands** button
+  for one-shot SSH sessions.
+* Loopback-aware: when server and client share the same (host,
+  HCA), the duplicate client command is suppressed.
+
+### Why it matters
+
+netgen had a button-driven test runner (Start) and a
+button-driven test-IP applier (v0.5.150 Pre-flight) but
+verification was still SSH-only. v0.5.151 closes that loop —
+the operator can now design, run, AND verify entirely from the
+Blast dialog.
+
+### Files changed
+- `widgets/rdma_blast_flow_dialog.py` (+QP-row button +
+  `_show_qp_verify_help` + `_QpVerifyHelpDialog` class).
+- `pyproject.toml` (0.5.150 → 0.5.151).
+- `tests/test_v05151_qp_verify_help.py` (15 tests).
+
+### Verified
+```
+$ ./venv/bin/pytest tests/test_v05151_qp_verify_help.py -q
+15 passed in 0.05s
+
+$ ./venv/bin/pytest tests/ -q -k "blast or rdma or qp"
+322 passed, 2561 deselected
+```
+
+### Future
+Same affordance could land on the Topology dialog (per-pair QP
+inventory). Holding off until you ask — Topology is N×M so the
+help dialog needs to enumerate every pair's HCA, which is a
+different UX.
+
+---
+
 ## [0.5.150] - 2026-06-15
 
 **RDMA Pre-flight check + user-controllable temporary test IPs.**
