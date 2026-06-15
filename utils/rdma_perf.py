@@ -786,6 +786,90 @@ _RE_LAT_DATA_ROW = re.compile(
     r"(?P<tstdev>[\d.]+)\s+(?P<p99>[\d.]+)(?:\s+(?P<p999>[\d.]+))?\s*$"
 )
 
+# v0.5.146: perftest dumps a config block before the test starts
+# ("CQ Moderation : 1", "Mtu : 1024[B]", "Link type : Ethernet",
+# "CPU freq : 2394[MHz]", "GID index : N", "Connection type : RC",
+# etc). When perftest fails to even start a transfer, these lines
+# ARE the last 10 in stdout — and the previous error builder
+# (`tail = stdout_tail[-10:]`) surfaced them as the diagnostic.
+# Operator screenshot showed exactly this red wall of header text.
+#
+# This regex matches "<Title-Case Words> : <value>" lines, which is
+# the precise shape perftest uses for the config dump. We also
+# tag a few specific words that always appear ONLY in the header
+# (Mtu/Link type/CPU freq/GID index/CQ Moderation) — the structural
+# match alone would also strip lines like "remote address: ..."
+# which are legitimate data, so we anchor on the bracket-or-keyword
+# heuristic too.
+_RE_PERFTEST_HEADER_LINE = re.compile(
+    # Structural match for perftest's config-dump banner shape:
+    # 1-5 short tokens (letters / digits / .*_/-), then a colon,
+    # then a value. Header titles are short and verb-free; this
+    # pattern fires on "Mtu : 1024[B]", "PCIe relax order: ON",
+    # "ibv_wr* API : ON", "Data ex. method : Ethernet", etc.
+    #
+    # The negative anchor (_RE_PERFTEST_ERROR_HINT) below keeps
+    # legitimate error lines that happen to look structurally
+    # similar (e.g. "Status : Connection refused").
+    r"^\s*[A-Za-z][A-Za-z0-9_./*-]*"
+    r"(?:\s+[A-Za-z][A-Za-z0-9_./*-]*){0,4}"
+    r"\s*:\s+\S",
+)
+
+# Negative anchor — lines that LOOK structurally like headers
+# but actually carry the real diagnostic. perftest's failure
+# messages reliably include one of these words; preserve them
+# even if they superficially match a "Word : Value" shape.
+_RE_PERFTEST_ERROR_HINT = re.compile(
+    r"\b(?:error|fail|failed|couldn't|cannot|can't|unable|"
+    r"refused|denied|invalid|no such|not found|timed? ?out|"
+    r"closed|reset by peer|broken pipe|address (?:in use|already)|"
+    r"resource temporarily unavailable)\b",
+    re.IGNORECASE,
+)
+
+
+def _filter_perftest_noise(lines: List[str]) -> List[str]:
+    """Drop perftest's config-dump 'Title : value' header lines so
+    the rc!=0 error tail surfaces real diagnostics, not the banner.
+
+    Lines containing operator-actionable hints
+    (error/fail/couldn't/timeout/...) are always kept, even when
+    they superficially look like header lines.
+    """
+    kept: List[str] = []
+    for raw in lines:
+        line = raw.rstrip("\n")
+        if not line.strip():
+            continue
+        if _RE_PERFTEST_ERROR_HINT.search(line):
+            kept.append(line)
+            continue
+        if _RE_PERFTEST_HEADER_LINE.match(line):
+            continue
+        kept.append(line)
+    return kept
+
+
+def _format_rc_error(rc: int, stdout_tail: List[str]) -> str:
+    """Build the operator-visible `perftest exited rc=N: ...`
+    message. v0.5.146: filter out the config-dump noise first; if
+    nothing actionable remains, say so explicitly so the operator
+    knows to look at the full log instead of squinting at header
+    text."""
+    filtered = _filter_perftest_noise(stdout_tail[-30:] if stdout_tail else [])
+    if not filtered:
+        return (
+            f"perftest exited rc={rc} with no diagnostic on stdout/stderr "
+            f"— check the full job log via "
+            f"/api/rdma/perftest/job/<id>. Common causes: PFC/ECN "
+            f"mismatch, wrong GID index, RoCEv2 disabled on the NIC, "
+            f"or peer firewall blocking the perftest control TCP "
+            f"port."
+        )
+    tail = "\n".join(filtered[-6:])
+    return f"perftest exited rc={rc}: {tail[-400:]}"
+
 
 def _reader_thread(job: PerftestJob, proc: subprocess.Popen) -> None:
     """Stream stdout, parse address + data rows, update job in place."""
@@ -859,9 +943,12 @@ def _reader_thread(job: PerftestJob, proc: subprocess.Popen) -> None:
             job.returncode = rc
             job.pid = None
             if rc != 0 and not job.error:
-                # Grab last few stderr-ish lines from the tail for context.
-                tail = "\n".join(job.stdout_tail[-10:]) if job.stdout_tail else ""
-                job.error = f"perftest exited rc={rc}: {tail[-400:]}"
+                # v0.5.146: surface the real failure reason. Was:
+                # `tail = stdout_tail[-10:]` which on fast-failing
+                # perftest is the config-dump banner ("Mtu : 1024
+                # [B] Link type : Ethernet CPU freq : 2394 [MHz] …"
+                # — exactly what the operator screenshot showed).
+                job.error = _format_rc_error(rc, job.stdout_tail)
 
 
 def _gc_old_jobs() -> None:

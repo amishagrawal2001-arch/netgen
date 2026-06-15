@@ -2,6 +2,65 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.146] - 2026-06-14
+
+**perftest rc!=0 error filters out the config-dump banner so
+operators see the actual diagnostic.**
+
+Operator screenshot (RDMA Topology Test status bar):
+
+```
+1 pair | 0 running | 1 done | err: perftest exited rc=1:
+CQ Moderation : 1 CQE Poll Batch : 16 Mtu : 1024[B]
+Link type : Ethernet CPU freq : 2394[MHz] GID index …
+```
+
+None of that is an error. It's perftest's CONFIG DUMP banner —
+the `Title : value` block it prints to stdout before the data
+rows start. When perftest fails to even begin a transfer, those
+banner lines are the last content in stdout, and the v0.4.0 error
+builder (`tail = stdout_tail[-10:]`) surfaced them verbatim. An
+ib_send_bw that died because of a PFC mismatch or wrong GID
+index looked like a wall of meaningless config text.
+
+### Fix
+
+* New helper `_filter_perftest_noise(lines)` in
+  `utils/rdma_perf.py`. Drops lines matching the structural
+  banner pattern `<title-case tokens> : <value>` (Mtu, CPU freq,
+  Link type, GID index, Connection type, CQ Moderation, …). Lines
+  carrying actionable hints (`error` / `fail` / `couldn't` /
+  `refused` / `denied` / `timed out` / `unable` / `no such` / …)
+  are always preserved, even when they superficially look like
+  headers — so `Status : Connection refused` survives.
+* `_format_rc_error(rc, stdout_tail)` builds the `job.error`
+  string. When the filtered tail is non-empty, joins the last 6
+  lines, clipped to 400 chars. When EVERYTHING was banner noise,
+  returns a clear:
+  > perftest exited rc=N with no diagnostic on stdout/stderr —
+  > check the full job log via /api/rdma/perftest/job/<id>.
+  > Common causes: PFC/ECN mismatch, wrong GID index, RoCEv2
+  > disabled on the NIC, or peer firewall blocking the perftest
+  > control TCP port.
+* The rc!=0 finalize block in `_reader_thread` now calls the
+  helper instead of slicing raw stdout.
+
+### Files changed
+- `utils/rdma_perf.py` (~50 lines: regexes, two helpers, wiring).
+- `pyproject.toml` (0.5.145 → 0.5.146).
+- `tests/test_v05146_perftest_error_filter.py` (14 tests).
+
+### Verified
+```
+$ ./venv/bin/pytest tests/test_v05146_perftest_error_filter.py -q
+14 passed in 0.05s
+
+$ ./venv/bin/pytest tests/ -q -k "rdma or perftest"
+239 passed, 2566 deselected
+```
+
+---
+
 ## [0.5.145] - 2026-06-14
 
 **Hotfix: v0.5.144 iface-loss renderer crashed on cold start.**
