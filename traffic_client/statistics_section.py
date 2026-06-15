@@ -18,6 +18,48 @@ from utils.table_sort_state import capture_sort_state, restore_sort_state
 logger = logging.getLogger(__name__)
 
 
+# v0.5.144: iface-level packet-loss helper.
+#
+# Why this exists (and why v0.5.139's per-stream rx_count aggregation
+# was wrong): when a stream is blasted at line rate, the RX-engine
+# sniffer (scapy / DPDK rx_worker / etc.) drops a large fraction of
+# what actually arrives on the wire. So `stream.rx_count` reports
+# ~5M while the iface PHY counter shows ~820M actually received.
+# v0.5.139 fed `stream.rx_count` into the iface's `rx_for_loss`,
+# producing the operator-reported "99.37% loss" on a link that was
+# really losing ~1%.
+#
+# The fix: ground-truth iface loss on the iface PHY counters that
+# v0.5.135 already populates in /api/interfaces (interface.tx,
+# interface.rx — these are `tx_packets_phy` / `rx_packets_phy` from
+# ethtool -S when the NIC is Mellanox). Pair the two halves of a
+# back-to-back link via the streams that traverse them, and display
+# the SAME pair_loss number on both halves.
+def compute_iface_pair_loss(own_phy_tx, own_phy_rx, peer_phy_tx, peer_phy_rx):
+    """Pure helper: given the iface's own PHY counters and its peer's,
+    return (lost, loss_pct).
+
+    Args:
+      own_phy_tx, own_phy_rx: this iface's PHY TX/RX counts.
+      peer_phy_tx, peer_phy_rx: the peer iface's PHY TX/RX counts.
+        For a loopback (no peer), pass own_phy_tx / own_phy_rx as the
+        peer values too.
+
+    Returns:
+      (lost, loss_pct). `loss_pct` is in 0..100 and 0.0 when there's
+      no TX activity to measure against. Negative diffs clamp to 0 —
+      the wire can't deliver more than was sent; any "excess RX" is
+      noise (CRC frames the PHY counter also bins).
+    """
+    pair_tx = max(int(own_phy_tx or 0), int(peer_phy_tx or 0))
+    pair_rx = max(int(own_phy_rx or 0), int(peer_phy_rx or 0))
+    lost = max(0, pair_tx - pair_rx)
+    if pair_tx <= 0:
+        return 0, 0.0
+    loss_pct = (lost / pair_tx) * 100.0
+    return lost, loss_pct
+
+
 class ThroughputChart(QWidget):
     """Lightweight rolling-line chart for live throughput.
 
@@ -1095,13 +1137,21 @@ class TrafficGenClientStatisticsSection():
                     "send_bps": 0,
                     "receive_bps": 0,
                     "errors": interface.get("errors", 0),
+                    # v0.5.144: iface PHY counters from the server
+                    # (post-v0.5.135 these are tx_packets_phy /
+                    # rx_packets_phy on Mellanox NICs — wire-truth,
+                    # not undercounted-by-sniffer). The loss row
+                    # renderer pairs these across the streams'
+                    # tx_iface ↔ rx_iface and displays a single
+                    # pair-loss number on BOTH halves.
+                    "phy_tx": int(interface.get("tx", 0) or 0),
+                    "phy_rx": int(interface.get("rx", 0) or 0),
+                    "peer_ifaces": set(),
                     # v0.5.139: per-iface cumulative loss aggregation.
-                    # tx_for_loss = sum of stream tx_counts associated with
-                    # this iface (either as TX or RX side of the stream).
-                    # rx_for_loss = sum of stream rx_counts for those same
-                    # streams (only counted when flow_tracking is on).
-                    # Loss = tx_for_loss - rx_for_loss, persists after the
-                    # stream stops because both numbers are cumulative.
+                    # Retained for back-compat (other callers may
+                    # still inspect them), but no longer used by the
+                    # iface loss renderer — v0.5.144 uses phy_tx/rx +
+                    # peer pairing instead.
                     "tx_for_loss": 0,
                     "rx_for_loss": 0,
                     "streams": {}
@@ -1131,6 +1181,15 @@ class TrafficGenClientStatisticsSection():
                 tx_iface = f"TG {tg_id} - {tx_port}"
                 rx_port_clean = rx_port_raw.split(":")[-1].strip() if rx_port_raw else None
                 rx_iface = f"TG {tg_id} - {rx_port_clean}" if rx_port_clean else None
+
+                # v0.5.144: record the pair so the loss renderer can
+                # ground-truth iface loss against the peer's PHY RX,
+                # not the stream's undercounted rx_count.
+                if (rx_iface
+                        and tx_iface in merged_statistics
+                        and rx_iface in merged_statistics):
+                    merged_statistics[tx_iface]["peer_ifaces"].add(rx_iface)
+                    merged_statistics[rx_iface]["peer_ifaces"].add(tx_iface)
 
                 # The server reports per-stream tx_rate / rx_rate already in
                 # frames-per-second (delta-based, computed from successive
@@ -1278,7 +1337,11 @@ class TrafficGenClientStatisticsSection():
                 # natural value when traffic isn't flowing IS 0. Preserving
                 # them was the bug that left "32 Mfps / 395 Gbps" visible
                 # after the user clicked Stop.
-                for key in ("tx", "rx", "sent_bytes", "received_bytes"):
+                for key in ("tx", "rx", "sent_bytes", "received_bytes",
+                           # v0.5.144: PHY counters drive the loss
+                           # row — same monotonic invariant, same
+                           # flicker-protection treatment.
+                           "phy_tx", "phy_rx"):
                     if stats.get(key, 0) == 0 and prev.get(key, 0) > 0:
                         stats[key] = prev[key]
 
@@ -1786,30 +1849,52 @@ class TrafficGenClientStatisticsSection():
                 errors_item.setForeground(QColor("#ef4444"))  # Red for errors
             self.statistics_table.setItem(9, col, errors_item)
 
-            # (10) Packets Lost — cumulative count, persists after stream
-            # stop. v0.5.139: tx_for_loss and rx_for_loss are aggregated
-            # from the per-stream counts (lines 1141+, 1179+). Both
-            # numbers are cumulative so the diff stays around after
-            # stream stop until Clear Stats is clicked.
+            # (10) Packets Lost — v0.5.144 rewrite: ground-truth iface
+            # loss on PHY counters + cross-iface pair detection.
             #
-            # Baseline-subtract both halves separately so Clear Stats
-            # resets the "lost" count cleanly without making the diff
-            # negative.
-            adj_tx = adjusted(iface_name, stats, "tx_for_loss")
-            adj_rx = adjusted(iface_name, stats, "rx_for_loss")
-            lost = max(0, adj_tx - adj_rx)
-            lost_item = QTableWidgetItem(format_number(lost) if adj_tx > 0 else "—")
+            # v0.5.139 used `tx_for_loss / rx_for_loss` aggregated
+            # from per-stream tx_count / rx_count. That's wrong: the
+            # stream's rx_count comes from the RX engine (scapy
+            # sniffer / DPDK rx_worker) which DROPS under line-rate
+            # blast — operator reported 824M "lost" out of 830M when
+            # the wire actually delivered ~820M. The iface PHY
+            # counters (post-v0.5.135) see real frames on the wire.
+            #
+            # The pair logic: each iface knows its peer ifaces (built
+            # in stream loop above from tx_iface ↔ rx_iface). Loss
+            # on a pair = max(self.phy_tx, peer.phy_tx) - max(self.phy_rx,
+            # peer.phy_rx). Same number on both halves.
+            own_phy_tx = stats.get("phy_tx", 0)
+            own_phy_rx = stats.get("phy_rx", 0)
+            peers = stats.get("peer_ifaces") or set()
+
+            peer_phy_tx = 0
+            peer_phy_rx = 0
+            for peer_name in peers:
+                peer = filtered_statistics.get(peer_name) or merged_statistics.get(peer_name)
+                if not peer:
+                    continue
+                peer_phy_tx = max(peer_phy_tx, peer.get("phy_tx", 0))
+                peer_phy_rx = max(peer_phy_rx, peer.get("phy_rx", 0))
+
+            lost, loss_pct_iface = compute_iface_pair_loss(
+                own_phy_tx, own_phy_rx, peer_phy_tx, peer_phy_rx,
+            )
+
+            # When neither this iface nor any peer has TX activity,
+            # the loss row is meaningless — show em-dashes. This
+            # avoids the historical "100% loss on pure-RX ifaces"
+            # confusion.
+            has_traffic = max(own_phy_tx, peer_phy_tx) > 0
+            lost_text = format_number(lost) if has_traffic else "—"
+            lost_item = QTableWidgetItem(lost_text)
             lost_item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            if lost > 0:
+            if has_traffic and lost > 0:
                 lost_item.setForeground(QColor("#ef4444"))  # red — same as errors
             self.statistics_table.setItem(10, col, lost_item)
 
-            # (11) Loss % — cumulative percentage. Same baseline treatment.
-            # Never shows for ifaces with zero TX activity (avoids dividing
-            # by zero and avoids confusing operators by showing 0.00% for
-            # a pure-RX interface).
-            if adj_tx > 0:
-                loss_pct_iface = lost / adj_tx * 100.0
+            # (11) Loss % — same source numbers, formatted as percent.
+            if has_traffic:
                 loss_text = f"{loss_pct_iface:.2f}%"
             else:
                 loss_pct_iface = 0.0

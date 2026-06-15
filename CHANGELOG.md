@@ -2,6 +2,78 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.144] - 2026-06-14
+
+**Iface Packets Lost / Loss % now use PHY pair counters, not the
+undercounted per-stream rx_count.**
+
+Operator (screenshot of Interface Statistics):
+
+```
+TG 0 - ens2f0np0    TG 0 - ens2f1np1
+TX 23.66 Mfps       TX 0 fps
+RX 0 fps            RX 20.55 Mfps
+…
+Packets Lost: 824,561,154    824,561,154    ← both halves
+Loss %:        99.37%         99.37%        ← wildly wrong
+```
+
+The TX iface really sent 830M frames and the RX iface really
+received ~820M on the wire — true loss ~1.2%, not 99%.
+
+### Root cause
+
+v0.5.139 fed the iface loss math from `stream.tx_count` and
+`stream.rx_count`. But `stream.rx_count` is whatever the RX engine
+(scapy sniffer / DPDK rx_worker / etc.) was able to count — and
+under line-rate blast, that engine drops most frames before
+binning them (the entire srv06 saga from v0.5.114 onward).
+
+So the math became:
+- `tx_for_loss` = 830M (real — DPDK tx_worker is accurate)
+- `rx_for_loss` = 5.2M (per-stream rx_count — wildly undercounted)
+- lost = 825M → 99.37% loss displayed
+
+The PHY counters that v0.5.135 already wires into
+`/api/interfaces` (`tx_packets_phy` / `rx_packets_phy` from
+`ethtool -S` on Mellanox) see what actually crossed the wire. We
+just weren't using them for the loss row.
+
+### Fix
+
+* New pure helper `compute_iface_pair_loss(own_phy_tx, own_phy_rx,
+  peer_phy_tx, peer_phy_rx)` in `traffic_client/statistics_section.py`.
+  Returns `(lost, loss_pct)` where `pair_tx = max(own.tx, peer.tx)`
+  and `pair_rx = max(own.rx, peer.rx)`. Clamps negatives to zero.
+* `merged_statistics[iface]` now seeds `phy_tx` / `phy_rx` from
+  `interface.get("tx" / "rx", 0)` (wire-truth) and tracks a
+  `peer_ifaces: set()` populated as streams are processed
+  (`tx_iface ↔ rx_iface` learn about each other).
+* The (10)/(11) renderer block calls the helper with own + peer
+  PHY counters. BOTH halves of a back-to-back pair display the
+  same loss number.
+* PHY counters added to the cumulative-counter preservation tuple
+  so a single-fetch glitch doesn't blank the loss row.
+* When no peer + no traffic: cell shows "—" (not 0, not 100%).
+
+### Files changed
+- `traffic_client/statistics_section.py` (~70 lines: helper, seed,
+  peer wiring, renderer rewrite, preservation).
+- `pyproject.toml` (0.5.143 → 0.5.144).
+- `tests/test_v05144_iface_loss_phy_pair.py` (15 tests).
+
+### Verified
+```
+$ ./venv/bin/pytest tests/test_v05144_iface_loss_phy_pair.py -q
+15 passed in 0.25s
+```
+
+The screenshot-scenario test pins the operator's exact numbers:
+830M PHY-tx, 820M PHY-rx → 10M lost, 1.20% loss, identical on
+both halves.
+
+---
+
 ## [0.5.143] - 2026-06-14
 
 **RDMA Topology Test: pick endpoints from registered TGs + clarify
