@@ -28,16 +28,16 @@ if str(REPO) not in sys.path:
 
 
 def _compute_loss(tx_count, rx_count, tx_rate, rx_rate, flow_tracking=True):
-    """Mirror the v0.5.137 loss-pct branch inline so the test
-    pins the contract without dragging in Qt."""
-    if isinstance(tx_count, int) and tx_count > 0:
-        if tx_rate and tx_rate > 0 and rx_rate is not None:
-            _diff = tx_rate - rx_rate
-            return max(0.0, (_diff / tx_rate) * 100.0)
-        elif isinstance(rx_count, int):
-            return ((tx_count - rx_count) / tx_count * 100)
-        else:
-            return 100.0 if flow_tracking else None
+    """Mirror the v0.5.137/138 loss-pct branch inline so the test
+    pins the contract without dragging in Qt.
+
+    v0.5.138: dropped the cumulative fallback. Loss is None for any
+    state that isn't actively running with measurable rates."""
+    if (isinstance(tx_count, int) and tx_count > 0
+            and tx_rate and tx_rate > 0
+            and rx_rate is not None):
+        _diff = tx_rate - rx_rate
+        return max(0.0, (_diff / tx_rate) * 100.0)
     return None
 
 
@@ -92,27 +92,28 @@ def test_negative_loss_clamped_to_zero():
 
 # ----- stopped / zero-rate fallback ---------------------------------------
 
-def test_stopped_stream_falls_back_to_cumulative():
-    """When the stream is stopped (both rates are 0), the
-    cumulative count loss IS the right number — that's the
-    session summary the operator wants on the "Status: Stopped"
-    row."""
+def test_stopped_stream_returns_none():
+    """v0.5.138: dropped cumulative fallback. When the stream is
+    stopped (both rates are 0), cumulative loss is almost always
+    misleading because rx_worker may have stopped early or its
+    counter may have been zeroed. Return None instead — the
+    renderer shows "—"."""
     loss = _compute_loss(
         tx_count=1_000_000, rx_count=900_000,
         tx_rate=0, rx_rate=0,
     )
-    assert abs(loss - 10.0) < 0.01
+    assert loss is None
 
 
-def test_tx_rate_zero_rx_rate_nonzero_falls_back():
-    """Defensive: tx_rate=0 but rx_rate>0 (rare, but possible if
-    we sampled mid-stop). Don't divide by zero — fall back to
-    cumulative."""
+def test_tx_rate_zero_rx_rate_nonzero_returns_none():
+    """Defensive: tx_rate=0 means stream isn't actively emitting.
+    Even with rx_rate>0 (sampled mid-stop), don't compute a
+    misleading loss — return None."""
     loss = _compute_loss(
         tx_count=1_000_000, rx_count=900_000,
         tx_rate=0, rx_rate=100,
     )
-    assert abs(loss - 10.0) < 0.01
+    assert loss is None
 
 
 def test_tx_count_zero_returns_none():
@@ -126,14 +127,14 @@ def test_tx_count_zero_returns_none():
     assert loss is None
 
 
-def test_rx_rate_none_falls_through():
-    """When the server didn't report rx_rate at all (older API),
-    fall back to cumulative."""
+def test_rx_rate_none_returns_none():
+    """v0.5.138: when rx_rate is None (older API or RX not yet
+    sampled), no honest loss measurement exists. Return None."""
     loss = _compute_loss(
         tx_count=1_000_000, rx_count=900_000,
         tx_rate=20_000_000, rx_rate=None,
     )
-    assert abs(loss - 10.0) < 0.01
+    assert loss is None
 
 
 # ----- realistic cases ---------------------------------------------------

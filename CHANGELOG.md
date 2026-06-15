@@ -2,6 +2,66 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.138] - 2026-06-14
+
+**Fix: Loss % shows "—" for stopped streams (cumulative fallback removed).**
+
+Operator screenshot showed three stopped streams with bogus loss %:
+
+| Stream | TX Count    | RX Count | Loss %   | Status  |
+|--------|-------------|----------|----------|---------|
+| ICMP   | 2,600       | 368      | 85.85%   | Stopped |
+| UEC    | 330,752     | 4        | 100.00%  | Stopped |
+| UDP    | 136,678,720 | 8,906    | 99.99%   | Stopped |
+
+All three came from v0.5.137's cumulative fallback: `(TX − RX) / TX × 100`.
+Arithmetically correct, but meaningless because the rx_worker
+counter at shutdown isn't aligned with the tx_worker counter.
+
+### Why cumulative loss is almost always wrong
+
+- rx_worker stops before tx_worker finishes flushing → false loss
+- rx_worker counter is zeroed on re-spawn (post-config-change,
+  lcore reallocation post-v0.5.131/132/134) → false loss
+- cumulative reflects OLD config if operator changed it mid-test
+  → wrong
+
+### Fix
+
+v0.5.138 drops the cumulative fallback entirely. Loss % is now
+computed only when:
+
+- `tx_count > 0` (stream has emitted at least one packet)
+- `tx_rate > 0` (stream is currently emitting)
+- `rx_rate is not None` (RX counter is observable)
+
+All else → `None` → renderer shows muted `—`. The TX Count and
+RX Count columns are still displayed for operators who want to
+do the math themselves and know the counters are aligned.
+
+### Behavior matrix
+
+| Stream state                           | Pre-fix | Post-fix |
+|----------------------------------------|---------|----------|
+| Running, rate-based loss observable    | rate %  | rate %   |
+| Running, no RX rate yet (warmup)       | cumul   | —        |
+| Stopped, both rates 0                  | cumul   | —        |
+| Just stopped, rates still in last poll | rate %  | rate %   |
+| TX never fired (tx_count = 0)          | —       | —        |
+
+### Files touched
+
+- `traffic_client/statistics_section.py` — loss_pct branch
+  simplified; cumulative fallback removed.
+- `tests/test_v05137_rate_based_loss.py` — updated 3 tests that
+  asserted cumulative fallback behavior to assert None instead.
+- `tests/test_v05138_no_loss_when_stopped.py` — 11 new cases:
+  the exact ICMP / UEC / UDP screenshot scenarios; running
+  cases still work; transition states; defensive (tx_count=0,
+  negative, flow_tracking off).
+- `tests/test_v0_3_7_polish.py` — updated the formula-pin test
+  to match v0.5.137/138's rate-based formula.
+
 ## [0.5.137] - 2026-06-14
 
 **Fix: stream-stats Loss % uses rates when running.**

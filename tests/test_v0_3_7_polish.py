@@ -70,11 +70,13 @@ def test_v0_3_7_renderer_handles_none_loss(stats_src):
     ), "renderer missing 'elif loss_pct is None: → \"—\"' branch"
 
 
-def test_v0_3_7_loss_pct_unchanged_when_tx_positive(stats_src):
-    """Backward-compat: when tx_count > 0 the math is unchanged.
-    Pin the formula so a refactor can't quietly drop the
-    (tx-rx)/tx*100 calculation."""
-    assert "(tx_count - rx_count) / tx_count * 100" in stats_src
+def test_v0_3_7_loss_pct_uses_rate_based_formula(stats_src):
+    """v0.5.137/138: loss is now rate-based, not cumulative. The
+    pre-v0.5.137 (tx_count - rx_count) / tx_count * 100 formula
+    was dropped because cumulative counts give nonsense answers
+    when TX and RX counters started at different times (rx_worker
+    re-spawn). Pin the new rate-based formula instead."""
+    assert "(_diff / tx_rate) * 100.0" in stats_src
 
 
 # ─────────────────────────────────── .whl extension warning
