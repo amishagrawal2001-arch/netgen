@@ -2,6 +2,87 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.149] - 2026-06-15
+
+**Blast RDMA Flow dialog — closes three v0.5.143-148 parity gaps.**
+
+Operator: "check the gap in RDMA blast test and fix them."
+
+An audit of `widgets/rdma_blast_flow_dialog.py` against the
+recent Topology dialog improvements (v0.5.143 endpoint picker /
+device clarity, v0.5.146 perftest error filter, v0.5.147 + 148
+loopback / two-HCA buttons) surfaced three concrete gaps that
+mattered to operator UX:
+
+### A + F: error display no longer clips at 120 chars
+
+**Before**: `chunk += f"  err={job.get('error')[:120]}"` clipped
+the diagnostic the operator saw. v0.5.146's server-side
+`_format_rc_error` already filters the perftest banner AND clips
+its inner tail to ~400 chars — re-clipping to 120 chars on the
+client meant any diagnostic past the first 120 chars was lost
+even after the filter rescued it.
+
+**After**: `chunk += f"\n  err={job.get('error')}"`. Multi-line
+render through the existing `_stats_view` QTextEdit which
+already wraps + scrolls. Operator sees the full cleaned message.
+
+### C: "device = RDMA HCA" inline hint
+
+**Before**: the device combos were labelled bare "Server device:"
+/ "Client device:". Operators conflated the HCA name with the
+Ethernet iface picker elsewhere in the GUI.
+
+**After**: a small hint label under the device grid:
+> **device** = RDMA HCA name (e.g. `mlx5_0`) — this is the
+> InfiniBand verbs device, NOT an Ethernet interface
+> (`ens2f0np0`). perftest addresses the HCA directly via
+> libibverbs.
+
+Same wording as the Topology dialog's v0.5.143 hint.
+
+### B: "↔ Use OTHER HCA (same host two-port test)" button
+
+**Before**: v0.5.147 added the same-HCA mirror button. The
+two-HCA case (server=`rocep…f0`, client=`rocep…f1` for a dual-
+port loopback or sibling-NIC test) still required manual combo
+fiddling.
+
+**After**: a second button next to the loopback mirror —
+auto-picks the next available device on the client side. The
+typical dual-port case becomes one click. Edge cases:
+* Server combo still on `(probing…)` → no-op.
+* Server device not yet on the client combo (asymmetric probe
+  response) → falls back to the mirror so the operator at
+  least gets a valid same-HCA loopback config.
+* Only one real HCA on the client combo → no-op (two-HCA is
+  meaningless with a single device).
+* Skips placeholder entries (`(probing…)`, `(no HCAs)`) when
+  walking the combo.
+
+### Files changed
+- `widgets/rdma_blast_flow_dialog.py` (HCA hint label, drop the
+  `[:120]` clip, second `_other_hca_btn` + `_pick_other_hca_for_client`).
+- `pyproject.toml` (0.5.148 → 0.5.149).
+- `tests/test_v05149_blast_dialog_gaps.py` (12 tests pinning
+  each gap fix).
+
+### Deferred
+Gap G from the audit — pre-flight `ibv_devinfo` PORT_DOWN / GID
+mismatch check before Start — needs a server-side route, queued
+for v0.5.150.
+
+### Verified
+```
+$ ./venv/bin/pytest tests/test_v05149_blast_dialog_gaps.py -q
+12 passed in 0.04s
+
+$ ./venv/bin/pytest tests/ -q -k "rdma or perftest or topology or blast"
+316 passed, 2522 deselected
+```
+
+---
+
 ## [0.5.148] - 2026-06-14
 
 **Topology dialog's same-host picker gains "two HCAs same host"

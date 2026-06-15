@@ -312,6 +312,21 @@ class RdmaBlastFlowDialog(QDialog):
         self._client_port_spin.setToolTip(_PORT_FIELD_TOOLTIP)
         dev_grid.addWidget(self._client_port_spin, 1, 3)
 
+        # v0.5.149: inline hint clarifying that the "device"
+        # combos are RDMA HCA names (mlx5_0, rocep…), not the
+        # Ethernet iface picker used elsewhere in the GUI. Same
+        # clarification the Topology dialog gained in v0.5.143.
+        _hca_hint = QLabel(
+            "<span style='color:#64748b; font-size:11px;'>"
+            "<b>device</b> = RDMA HCA name (e.g. <code>mlx5_0</code>) "
+            "— this is the InfiniBand verbs device, NOT an Ethernet "
+            "interface (<code>ens2f0np0</code>). perftest addresses "
+            "the HCA directly via libibverbs."
+            "</span>"
+        )
+        _hca_hint.setWordWrap(True)
+        dev_grid.addWidget(_hca_hint, 2, 0, 1, 4)
+
         # v0.5.147: Loopback shortcut. Same-host loopback is the
         # canonical RDMA smoke test (`ib_send_bw -d mlx5_0` on both
         # sides). Operator wanted one-click setup rather than
@@ -341,7 +356,38 @@ class RdmaBlastFlowDialog(QDialog):
                 "tree and reopen this dialog."
             )
         self._loopback_btn.clicked.connect(self._mirror_server_to_client)
-        dev_grid.addWidget(self._loopback_btn, 2, 0, 1, 4)
+        dev_grid.addWidget(self._loopback_btn, 3, 0, 1, 2)
+
+        # v0.5.149: Two-HCA same-host shortcut. Matches the toggle
+        # added to the Topology dialog's same-host picker in
+        # v0.5.148. When the operator wants to test the path
+        # between sibling RoCE devices on one box (rocep…f0 ↔
+        # rocep…f1), this button picks the NEXT available device
+        # on the client side relative to the server's pick.
+        self._other_hca_btn = QPushButton(
+            "↔  Use OTHER HCA (same host two-port test)"
+        )
+        self._other_hca_btn.setToolTip(
+            "Same TG, DIFFERENT HCAs. Picks the next available "
+            "device on the client side (e.g. server=rocep…f0 → "
+            "client=rocep…f1). Tests the wire/driver path between "
+            "two RoCE devices on one host — requires a loopback "
+            "cable, shared switch, or firmware internal port-to-"
+            "port loopback.\n\n"
+            "Use this AFTER same-HCA loopback succeeds. If "
+            "loopback works but this fails, the RDMA stack is "
+            "healthy and the issue is link reachability between "
+            "the two HCAs (PFC config, cabling, GID mismatch)."
+        )
+        self._other_hca_btn.setEnabled(same_tg)
+        if not same_tg:
+            self._other_hca_btn.setToolTip(
+                "Disabled: same-host two-HCA test requires server "
+                "and client TG to be the same host. Select one "
+                "TG in the server tree and reopen this dialog."
+            )
+        self._other_hca_btn.clicked.connect(self._pick_other_hca_for_client)
+        dev_grid.addWidget(self._other_hca_btn, 3, 2, 1, 2)
 
         dev_grid.setColumnStretch(1, 1)
         root.addWidget(dev_box)
@@ -721,6 +767,46 @@ class RdmaBlastFlowDialog(QDialog):
             "report_gbits": True,
         }
 
+    def _pick_other_hca_for_client(self) -> None:
+        """v0.5.149: same-host two-HCA shortcut. Picks the device
+        AFTER the server-side selection on the client combo. Wraps
+        to index 0 if the server picked the last device.
+
+        Skips placeholder entries (userData=None) so the operator
+        doesn't accidentally end up with `(probing…)` or
+        `(no HCAs)` selected.
+
+        If the client combo only has one real entry, no-op — the
+        same-host two-HCA test is impossible with a single HCA;
+        the operator would just see same-HCA loopback.
+        """
+        srv_dev = self._server_device_combo.currentData()
+        if not srv_dev:
+            return
+        # Find the server's index on the client combo.
+        srv_idx = self._client_device_combo.findData(srv_dev)
+        if srv_idx < 0:
+            # Server-side device not present on client (race or
+            # asymmetric probe response). Fall back to mirror — at
+            # least the operator gets a valid same-HCA loopback.
+            self._mirror_server_to_client()
+            return
+        # Count real devices (skipping placeholders).
+        real_indices = [
+            i for i in range(self._client_device_combo.count())
+            if self._client_device_combo.itemData(i) is not None
+        ]
+        if len(real_indices) < 2:
+            # Only one real HCA — two-HCA test is meaningless.
+            return
+        # Pick the next real device after srv_idx (wrap).
+        pos_in_reals = real_indices.index(srv_idx) if srv_idx in real_indices else 0
+        target = real_indices[(pos_in_reals + 1) % len(real_indices)]
+        self._client_device_combo.setCurrentIndex(target)
+        # IB port: keep client port at its current value. Sibling
+        # ports of a dual-port NIC are exposed as separate HCAs
+        # with their own ib_port=1 — the spinbox stays at 1.
+
     def _mirror_server_to_client(self) -> None:
         """v0.5.147 Loopback button: copy the server-side device
         selection + IB port onto the client side. The canonical
@@ -1051,7 +1137,15 @@ class RdmaBlastFlowDialog(QDialog):
                 f"MsgRate={job.get('final_msg_rate_mpps')} Mpps"
             )
         if job.get("error"):
-            chunk += f"  err={job.get('error')[:120]}"
+            # v0.5.149: drop the 120-char client clip. v0.5.146's
+            # server-side `_format_rc_error` already filters the
+            # config-dump banner and clips its inner tail to ~400
+            # chars — clipping AGAIN here threw away whatever real
+            # diagnostic survived the filter. The QTextEdit already
+            # wraps + scrolls, so a multi-line error is rendered
+            # cleanly without the operator having to dig into the
+            # server log.
+            chunk += f"\n  err={job.get('error')}"
         self._stats_view.append(chunk)
 
     def _on_both_finished(self) -> None:
