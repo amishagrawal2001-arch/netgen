@@ -37,6 +37,8 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from PyQt5.QtCore import Qt, QTimer
+from html import escape
+
 from PyQt5.QtGui import QFont, QTextCursor
 from PyQt5.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
@@ -808,6 +810,27 @@ class RdmaBlastFlowDialog(QDialog):
         self._progress_widget.setVisible(False)
         root.addWidget(self._progress_widget)
 
+        # ── v0.5.165: post-run summary card. After every Start
+        # cycle settles, this card shows the headline result with
+        # big-number typography so operators don't have to squint
+        # through 270 lines of "running" spam to find the [client]
+        # done row. Hidden by default; populated and shown by
+        # `_render_results_card`; hidden again on next Start.
+        self._results_card = QLabel("")
+        self._results_card.setWordWrap(True)
+        self._results_card.setTextFormat(Qt.RichText)
+        self._results_card.setStyleSheet(
+            "QLabel {"
+            "  background: #ecfdf5;"
+            "  border: 1px solid #10b981;"
+            "  border-radius: 6px;"
+            "  padding: 10px 14px;"
+            "  color: #064e3b;"
+            "}"
+        )
+        self._results_card.setVisible(False)
+        root.addWidget(self._results_card)
+
         # ── Live stats panel (populated by _poll_jobs).
         # v0.5.152: bumped min-height 160 → 280 + addWidget stretch
         # factor 1 so the panel claims the freed-up vertical room
@@ -1102,6 +1125,84 @@ class RdmaBlastFlowDialog(QDialog):
             self._progress_label.setText("")
         except Exception:
             pass
+
+    # ───────── v0.5.165 post-run summary card
+
+    def _render_results_card(self) -> None:
+        """Build a headline summary from the just-appended _run_log
+        entry and show it above the Live stats. Quietly hides if
+        no run is in the log (defensive)."""
+        log = getattr(self, "_run_log", []) or []
+        if not log:
+            return
+        run = log[-1]
+        params = run.get("params") or {}
+        summary = run.get("summary") or {}
+        rows = run.get("rows") or []
+        # Decide the headline number — Σ avg if multi-sample, else
+        # the lone row's BW.
+        if isinstance(summary.get("bw_avg_gbps"), (int, float)) \
+                and summary.get("samples", 0) > 1:
+            headline_bw = float(summary["bw_avg_gbps"])
+            headline_label = (
+                f"average across {int(summary['samples'])} samples"
+            )
+        else:
+            bws = [r["bw_gbps"] for r in rows
+                   if isinstance(r.get("bw_gbps"), (int, float))]
+            headline_bw = max(bws) if bws else None
+            headline_label = "final"
+        if isinstance(summary.get("msgrate_avg_mpps"), (int, float)):
+            mr = float(summary["msgrate_avg_mpps"])
+        else:
+            mrs = [r["msgrate_mpps"] for r in rows
+                   if isinstance(r.get("msgrate_mpps"), (int, float))]
+            mr = mrs[-1] if mrs else None
+
+        bw_txt = (f"{headline_bw:.2f}" if isinstance(headline_bw, float)
+                  else "—")
+        mr_txt = f"{mr:.4f}" if isinstance(mr, float) else "—"
+        extras = []
+        if summary.get("samples", 0) > 1:
+            extras.append(
+                f"min {summary['bw_min_gbps']:.2f} / "
+                f"max {summary['bw_max_gbps']:.2f} Gbps"
+            )
+        if params.get("parallel_workers", 1) > 1:
+            extras.append(f"{params['parallel_workers']} workers")
+        if params.get("iterations", 1) > 1:
+            extras.append(f"{params['iterations']} iterations")
+        if params.get("duration_s"):
+            extras.append(f"{params['duration_s']}s per run")
+
+        bullets = " &middot; ".join(extras) if extras else ""
+
+        html = (
+            f"<div style='font-size:11px; color:#065f46; "
+            f"text-transform:uppercase; letter-spacing:0.5px;'>"
+            f"✓ Test completed &middot; {escape(run.get('test') or '?')}"
+            f"</div>"
+            f"<div style='margin-top:6px; display:flex; "
+            f"align-items:baseline; gap:18px;'>"
+            f"  <span style='font-size:28px; font-weight:700; "
+            f"color:#064e3b;'>{bw_txt}</span>"
+            f"  <span style='font-size:13px; color:#065f46;'>Gbps "
+            f"<span style='color:#10b981;'>BW</span></span>"
+            f"  <span style='font-size:13px; color:#475569;'>"
+            f"|</span>"
+            f"  <span style='font-size:18px; font-weight:600; "
+            f"color:#064e3b;'>{mr_txt}</span>"
+            f"  <span style='font-size:13px; color:#065f46;'>Mpps "
+            f"<span style='color:#10b981;'>MsgRate</span></span>"
+            f"</div>"
+            f"<div style='margin-top:4px; font-size:11px; "
+            f"color:#047857;'>"
+            f"{escape(headline_label)}"
+            f"{(' &middot; ' + bullets) if bullets else ''}"
+            f"</div>"
+        )
+        self._results_card.setText(html)
+        self._results_card.setVisible(True)
 
     # ───────── v0.5.150 pre-flight check
 
@@ -1719,6 +1820,12 @@ class RdmaBlastFlowDialog(QDialog):
         }
         # Reset extra-workers tracking for this run.
         self._extra_workers = []
+        # v0.5.165: hide the previous run's results card so the
+        # new run starts visually clean.
+        try:
+            self._results_card.setVisible(False)
+        except Exception:
+            pass
         # v0.5.157: also reset the TOTAL-emit guard and worker-0
         # final stats so each new Start gets a clean slate. Without
         # these, a 2nd Start in the same dialog session would skip
@@ -2202,6 +2309,10 @@ class RdmaBlastFlowDialog(QDialog):
         self._append_run_log_entry()
         # v0.5.164: hide progress bar when the run settles.
         self._reset_progress_widget()
+        # v0.5.165: render the post-run summary card using the
+        # _run_log entry we just appended (single source of truth
+        # for "what happened in this run").
+        self._render_results_card()
         self._set_status_ok(
             "Both halves finished. Click Stop to forget the pairing "
             "(or close this dialog)."

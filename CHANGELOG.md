@@ -2,6 +2,45 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.165] - 2026-06-16
+
+**Post-run results summary card — headline BW + MsgRate above
+the per-pair grid.**
+
+Operator: "post run complete visualizaiton, this is also not
+good." After a run finished, the dialog just dumped raw
+`[client] done (rc=0) ... BW avg=172.22 Gbps` lines at the
+bottom of Live stats — wrapped awkwardly, easy to miss the
+actual number.
+
+### What's added
+
+Both dialogs grew a green pill card between the progress strip
+and the Live stats / Results panel:
+
+* Big-number BW (28px) + Gbps label
+* MsgRate (18px) + Mpps label
+* Run summary line — `final` for one-shot runs, or `average
+  across N samples` for multi-iteration / multi-pair runs
+* Extras line — min/max BW, pair count, iterations, workers,
+  duration
+
+The card consumes the same `_run_log` entry that the Export
+Report button uses, so the headline can never drift from the
+exported report. Hidden by default; shown on completion; cleared
+on next Start.
+
+### Files touched
+
+* `widgets/rdma_blast_flow_dialog.py` — `_results_card` QLabel,
+  `_render_results_card()`, hide-on-Start, hook in
+  `_on_both_finished`
+* `widgets/rdma_topology_dialog.py` — same wiring; topology card
+  surfaces pair count + shape in addition to Blast's fields
+* `tests/test_v05165_results_card.py` — 10 source-level
+  assertions covering widget presence, HTML escape, hide-on-
+  Start, and topology-specific extras
+
 ## [0.5.164] - 2026-06-16
 
 **Live progress visualization while perftest is running.**

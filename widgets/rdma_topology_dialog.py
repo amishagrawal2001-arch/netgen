@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import shlex
 import uuid
+from html import escape
 from typing import Any, Dict, List, Optional, Tuple
 
 from PyQt5.QtCore import Qt, QTimer
@@ -595,6 +596,24 @@ class RdmaTopologyDialog(QDialog):
         self._progress_widget.setVisible(False)
         root.addWidget(self._progress_widget)
 
+        # ── v0.5.165: post-run summary card. Mirrors Blast's
+        # headline display so operators see the big-number result
+        # without scrolling through the per-pair grid.
+        self._results_card = QLabel("")
+        self._results_card.setWordWrap(True)
+        self._results_card.setTextFormat(Qt.RichText)
+        self._results_card.setStyleSheet(
+            "QLabel {"
+            "  background: #ecfdf5;"
+            "  border: 1px solid #10b981;"
+            "  border-radius: 6px;"
+            "  padding: 10px 14px;"
+            "  color: #064e3b;"
+            "}"
+        )
+        self._results_card.setVisible(False)
+        root.addWidget(self._results_card)
+
         # ── Per-pair stats grid + TOTAL row
         stats_box = QGroupBox("Results")
         sv = QVBoxLayout(stats_box)
@@ -1067,6 +1086,9 @@ class RdmaTopologyDialog(QDialog):
         # reusing it across Starts is correct. Leave the cache.
         # Clear the table for a fresh run.
         self._stats_table.setRowCount(0)
+        # v0.5.165: hide the previous run's results card so the
+        # operator doesn't confuse the old summary with this run.
+        self._results_card.setVisible(False)
         self._start_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
         self._run_one_iteration()
@@ -1519,6 +1541,10 @@ class RdmaTopologyDialog(QDialog):
                 # All iterations finished (or operator hit Stop).
                 self._append_summary_row()
                 self._append_run_log_entry()
+                # v0.5.165: render the headline summary card so the
+                # operator sees the big-number result without
+                # scrolling through the per-pair grid.
+                self._render_results_card()
                 # v0.5.164: hide the progress widget.
                 self._reset_progress_widget()
                 self._start_btn.setEnabled(True)
@@ -1687,6 +1713,92 @@ class RdmaTopologyDialog(QDialog):
             "summary": summary,
         }
         self._run_log.append(entry)
+
+    # ───────── v0.5.165 post-run summary card
+
+    def _render_results_card(self) -> None:
+        """Build a headline summary from the just-appended _run_log
+        entry and show it above the per-pair grid. Mirrors Blast's
+        card with topology-specific extras (pairs / iterations)."""
+        log = getattr(self, "_run_log", []) or []
+        if not log:
+            return
+        run = log[-1]
+        params = run.get("params") or {}
+        summary = run.get("summary") or {}
+        rows = run.get("rows") or []
+        if isinstance(summary.get("bw_avg_gbps"), (int, float)) \
+                and summary.get("samples", 0) > 1:
+            headline_bw = float(summary["bw_avg_gbps"])
+            headline_label = (
+                f"average across {int(summary['samples'])} samples"
+            )
+        else:
+            bws = [r["bw_gbps"] for r in rows
+                   if isinstance(r.get("bw_gbps"), (int, float))]
+            headline_bw = max(bws) if bws else None
+            headline_label = "final"
+        if isinstance(summary.get("msgrate_avg_mpps"), (int, float)):
+            mr = float(summary["msgrate_avg_mpps"])
+        else:
+            mrs = [r["msgrate_mpps"] for r in rows
+                   if isinstance(r.get("msgrate_mpps"), (int, float))]
+            mr = mrs[-1] if mrs else None
+
+        bw_txt = (f"{headline_bw:.2f}" if isinstance(headline_bw, float)
+                  else "—")
+        mr_txt = f"{mr:.4f}" if isinstance(mr, float) else "—"
+
+        extras = []
+        if summary.get("samples", 0) > 1:
+            extras.append(
+                f"min {summary['bw_min_gbps']:.2f} / "
+                f"max {summary['bw_max_gbps']:.2f} Gbps"
+            )
+        n_pairs = len((run.get("endpoints") or {}).get("pairs") or [])
+        if n_pairs:
+            extras.append(
+                f"{n_pairs} pair{'s' if n_pairs != 1 else ''}"
+            )
+        if params.get("iterations", 1) > 1:
+            extras.append(f"{params['iterations']} iterations")
+        if params.get("parallel_workers", 1) > 1:
+            extras.append(
+                f"{params['parallel_workers']} workers/pair"
+            )
+        if params.get("duration_s"):
+            extras.append(f"{params['duration_s']}s per run")
+
+        bullets = " &middot; ".join(extras) if extras else ""
+
+        html = (
+            f"<div style='font-size:11px; color:#065f46; "
+            f"text-transform:uppercase; letter-spacing:0.5px;'>"
+            f"✓ Topology run finished &middot; "
+            f"{escape(run.get('test') or '?')} &middot; "
+            f"{escape(str(params.get('shape') or '?'))}"
+            f"</div>"
+            f"<div style='margin-top:6px; display:flex; "
+            f"align-items:baseline; gap:18px;'>"
+            f"  <span style='font-size:28px; font-weight:700; "
+            f"color:#064e3b;'>{bw_txt}</span>"
+            f"  <span style='font-size:13px; color:#065f46;'>Gbps "
+            f"<span style='color:#10b981;'>BW</span></span>"
+            f"  <span style='font-size:13px; color:#475569;'>"
+            f"|</span>"
+            f"  <span style='font-size:18px; font-weight:600; "
+            f"color:#064e3b;'>{mr_txt}</span>"
+            f"  <span style='font-size:13px; color:#065f46;'>Mpps "
+            f"<span style='color:#10b981;'>MsgRate</span></span>"
+            f"</div>"
+            f"<div style='margin-top:4px; font-size:11px; "
+            f"color:#047857;'>"
+            f"{escape(headline_label)}"
+            f"{(' &middot; ' + bullets) if bullets else ''}"
+            f"</div>"
+        )
+        self._results_card.setText(html)
+        self._results_card.setVisible(True)
 
     def _update_progress_from_jobs(self) -> None:
         """v0.5.164: derive elapsed/duration from the active
