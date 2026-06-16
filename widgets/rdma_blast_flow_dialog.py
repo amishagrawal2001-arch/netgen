@@ -697,7 +697,27 @@ class RdmaBlastFlowDialog(QDialog):
         _pwh.addWidget(self._max_bw_btn)
         _pwh.addStretch(1)
         tg.addWidget(_pw_row, 3, 3)
-        # Row 4: both checkboxes inline
+        # Row 4: Iterations spinbox (v0.5.160 followup — operator
+        # wanted the same N-run capability Topology grew). When
+        # > 1 the dialog runs perftest N times back-to-back and
+        # appends per-iteration BW + a final Σ summary row to
+        # Live stats.
+        tg.addWidget(QLabel("Iterations:"), 4, 0, Qt.AlignRight)
+        self._iterations_spin = QSpinBox()
+        self._iterations_spin.setRange(1, 1000)
+        self._iterations_spin.setValue(1)
+        self._iterations_spin.setMinimumWidth(80)
+        self._iterations_spin.setToolTip(
+            "Number of back-to-back perftest runs. After each run "
+            "completes its [client] done line, a new run starts "
+            "automatically. After all iterations finish, a Σ "
+            "summary line shows avg / min / max BW across them.\n\n"
+            "Useful for variance characterization (RoCE BW can "
+            "swing 5–10% between runs from fabric / PFC effects). "
+            "5–20 iterations is a sensible range."
+        )
+        tg.addWidget(self._iterations_spin, 4, 1)
+        # Row 5: both checkboxes inline
         cb_row = QHBoxLayout()
         cb_row.setSpacing(16)
         cb_row.addWidget(self._bidir_check)
@@ -705,7 +725,7 @@ class RdmaBlastFlowDialog(QDialog):
         cb_row.addStretch(1)
         cb_holder = QWidget()
         cb_holder.setLayout(cb_row)
-        tg.addWidget(cb_holder, 4, 0, 1, 4)
+        tg.addWidget(cb_holder, 5, 0, 1, 4)
         # Stretch values get the widgets to be wide enough.
         tg.setColumnStretch(1, 1)
         tg.setColumnStretch(3, 1)
@@ -1583,7 +1603,21 @@ class RdmaBlastFlowDialog(QDialog):
         """Actually fire the perftest start sequence. Extracted from
         the original `_on_start_clicked` body so the v0.5.152 auto-
         trap-detect can defer this step behind an optional confirm
-        dialog."""
+        dialog.
+
+        v0.5.160 followup: when called for iteration 0, this also
+        sets up the iteration-loop state (total, results list, stop
+        flag). Subsequent iterations re-enter via
+        `_start_next_iteration` and skip the setup."""
+        if not getattr(self, "_iteration_in_progress", False):
+            self._iteration_total = max(
+                1, int(self._iterations_spin.value()))
+            self._iteration_idx = 0
+            self._iteration_results: List[Dict[str, Any]] = []
+            self._iteration_stop_requested = False
+            self._iteration_server_dev = server_dev
+            self._iteration_client_dev = client_dev
+            self._iteration_in_progress = True
         test_id = self._test_combo.currentData()
         self._handshake_id = str(uuid.uuid4())
         opts = self._common_opts()
@@ -2042,13 +2076,83 @@ class RdmaBlastFlowDialog(QDialog):
     def _on_both_finished(self) -> None:
         if self._poll_timer is not None:
             self._poll_timer.stop()
+        # v0.5.160 followup: capture this iteration's final BW +
+        # MsgRate, then either fire the next iteration or emit the
+        # Σ summary.
+        total = int(getattr(self, "_iteration_total", 1))
+        if total > 1:
+            idx = int(getattr(self, "_iteration_idx", 0))
+            self._iteration_results.append({
+                "iter": idx,
+                "bw": getattr(self, "_client_bw", None),
+                "msgrate": getattr(self, "_client_msgrate", None),
+            })
+            self._iteration_idx = idx + 1
+            self._stats_view.append(
+                f"\n— Iteration {idx + 1}/{total} done"
+            )
+            stop = bool(getattr(self, "_iteration_stop_requested", False))
+            if self._iteration_idx < total and not stop:
+                self._set_status_ok(
+                    f"Iteration {idx + 1}/{total} done. "
+                    f"Next iteration starts in 1 s…"
+                )
+                QTimer.singleShot(1000, self._start_next_iteration)
+                return
+            # All iterations done — emit Σ summary, then settle.
+            self._emit_iteration_summary()
+            self._iteration_in_progress = False
         self._set_status_ok(
             "Both halves finished. Click Stop to forget the pairing "
             "(or close this dialog)."
         )
 
+    def _start_next_iteration(self) -> None:
+        """v0.5.160 followup: fire iteration N+1 without going
+        through `_on_start_clicked` again (no need to re-validate
+        endpoints / re-check trap). Re-enters `_proceed_with_start`
+        with the cached server/client device pair."""
+        if not getattr(self, "_iteration_in_progress", False):
+            return
+        self._proceed_with_start(
+            getattr(self, "_iteration_server_dev", "") or "",
+            getattr(self, "_iteration_client_dev", "") or "",
+        )
+
+    def _emit_iteration_summary(self) -> None:
+        """v0.5.160 followup: append an avg/min/max line across
+        all iteration final-BW samples. Skipped for single-
+        iteration runs (the lone done line is already the answer)."""
+        results = getattr(self, "_iteration_results", [])
+        if len(results) < 2:
+            return
+        bws = [r["bw"] for r in results
+               if isinstance(r.get("bw"), (int, float))]
+        mrs = [r["msgrate"] for r in results
+               if isinstance(r.get("msgrate"), (int, float))]
+        if not bws:
+            return
+        avg = sum(bws) / len(bws)
+        parts = [f"\n[Σ across {len(results)} iterations]"]
+        parts.append(
+            f"BW: avg={avg:.2f} min={min(bws):.2f} "
+            f"max={max(bws):.2f} Gbps"
+        )
+        if mrs:
+            mr_avg = sum(mrs) / len(mrs)
+            parts.append(
+                f"MsgRate: avg={mr_avg:.4f} min={min(mrs):.4f} "
+                f"max={max(mrs):.4f} Mpps"
+            )
+        self._stats_view.append("  ".join(parts))
+
     def _on_stop_clicked(self) -> None:
         self._stop_btn.setEnabled(False)
+        # v0.5.160 followup: halt the iteration loop so the next
+        # Σ summary fires (with whatever's been captured) rather
+        # than queueing the next iteration.
+        self._iteration_stop_requested = True
+        self._iteration_in_progress = False
         # v0.5.153: Stop also fires preflight cleanup. Previously
         # only closeEvent did, so operator hitting Stop and leaving
         # the dialog open kept stale test IPs around indefinitely.
@@ -2135,6 +2239,12 @@ class RdmaBlastFlowDialog(QDialog):
         self._total_emitted = False
         self._client_bw = None
         self._client_msgrate = None
+        # v0.5.160 followup: also reset iteration state so a
+        # reopen of the dialog starts clean.
+        self._iteration_in_progress = False
+        self._iteration_stop_requested = False
+        self._iteration_idx = 0
+        self._iteration_results = []
         event.accept()
 
     def _cleanup_preflight_state_ids(self) -> None:

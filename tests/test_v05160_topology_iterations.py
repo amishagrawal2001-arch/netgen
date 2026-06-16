@@ -71,6 +71,59 @@ def test_topology_max_bw_button_height_capped():
     assert "self._max_bw_btn.setMaximumHeight(28)" in SRC
 
 
+# ───── #3: Blast also gains the Iterations field + loop ─────────────────
+
+
+def test_blast_iterations_spinbox_added():
+    """Operator: "also don't see number of iterations input" —
+    Blast now has its own Iterations spinbox in the Test
+    parameters section."""
+    assert "self._iterations_spin = QSpinBox()" in SRC_BLAST
+    assert "self._iterations_spin.setRange(1, 1000)" in SRC_BLAST
+
+
+def test_blast_proceed_with_start_sets_up_iteration_state():
+    """First call (iteration 0) sets the loop state; subsequent
+    iterations re-enter via `_start_next_iteration` and reuse the
+    cached state."""
+    body = _extract_method(SRC_BLAST, "_proceed_with_start")
+    assert "_iteration_in_progress" in body
+    assert "_iteration_total" in body
+    assert "_iteration_results" in body
+    assert "_iteration_stop_requested" in body
+
+
+def test_blast_on_both_finished_advances_iteration():
+    """At end of each run, capture the iteration's BW + either
+    schedule the next iteration via QTimer.singleShot or emit
+    the Σ summary."""
+    body = _extract_method(SRC_BLAST, "_on_both_finished")
+    assert "_iteration_idx" in body
+    assert "_iteration_results.append" in body
+    assert "QTimer.singleShot" in body
+    assert "_start_next_iteration" in body
+    assert "_emit_iteration_summary" in body
+
+
+def test_blast_start_next_iteration_method_exists():
+    assert "def _start_next_iteration(" in SRC_BLAST
+
+
+def test_blast_emit_iteration_summary_renders_avg_min_max():
+    body = _extract_method(SRC_BLAST, "_emit_iteration_summary")
+    assert "min(bws)" in body
+    assert "max(bws)" in body
+    assert "Σ across" in body
+
+
+def test_blast_stop_clicked_halts_iteration_loop():
+    """Operator-driven Stop must terminate the loop, not just
+    stop the current iteration's perftest jobs."""
+    body = _extract_method(SRC_BLAST, "_on_stop_clicked")
+    assert "_iteration_stop_requested = True" in body
+    assert "_iteration_in_progress = False" in body
+
+
 # ───── #2a: Iterations spinbox ──────────────────────────────────────────
 
 
