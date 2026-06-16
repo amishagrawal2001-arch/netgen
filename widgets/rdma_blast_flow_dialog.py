@@ -324,16 +324,20 @@ class RdmaBlastFlowDialog(QDialog):
         #     reclaims ~20px below.
         # Functionality identical — every spinbox / combo / tooltip preserved.
         root = QVBoxLayout(self)
-        root.setContentsMargins(10, 10, 10, 10)
-        root.setSpacing(6)
+        # v0.5.160 followup compaction: tighter root margins +
+        # spacing matching the Topology dialog's pass.
+        root.setContentsMargins(8, 6, 8, 6)
+        root.setSpacing(4)
 
         # ── Compact group-box stylesheet (apply to all subsequent
         # QGroupBox instances in this dialog).
+        # v0.5.160 followup: margin-top 9 → 7, inner padding
+        # 6/8/8/8 → 4/6/6/6 — saves ~12 px across the 4 groups.
         self.setStyleSheet(
             "QGroupBox {"
             "  font-weight: 600; color: #334155;"
             "  border: 1px solid #cbd5e1; border-radius: 4px;"
-            "  margin-top: 9px; padding: 6px 8px 8px 8px;"
+            "  margin-top: 7px; padding: 4px 6px 6px 6px;"
             "}"
             "QGroupBox::title {"
             "  subcontrol-origin: margin; subcontrol-position: top left;"
@@ -342,18 +346,10 @@ class RdmaBlastFlowDialog(QDialog):
             "QLabel { color: #1f2937; }"
         )
 
-        # ── Header — title + one-line subtitle.
-        hdr = QLabel(
-            "<span style='font-size:13px; font-weight:600; color:#0f172a;'>"
-            "Blast a RDMA Flow</span>"
-            "&nbsp;&nbsp;"
-            "<span style='color:#64748b; font-size:11px;'>"
-            "perftest orchestrator — ib_*_bw / ib_*_lat on each side, "
-            "correlated by handshake_id"
-            "</span>"
-        )
-        hdr.setWordWrap(True)
-        root.addWidget(hdr)
+        # v0.5.160 followup: dropped the header banner — the
+        # window title already says "Blast a RDMA Flow", and the
+        # ib_*_bw / handshake_id subtitle belonged in Help, not
+        # stealing a row of vertical real estate.
 
         # ── Endpoints (compact inline strip). When loopback, collapse
         # the Client TG line entirely since it's identical.
@@ -384,7 +380,7 @@ class RdmaBlastFlowDialog(QDialog):
         root.addWidget(tg_box)
 
         # ── Device picks. Two combos, fixed-width port spinboxes.
-        dev_box = QGroupBox("RDMA Devices")
+        dev_box = QGroupBox("Devices")
         dev_grid = QGridLayout(dev_box)
         dev_grid.setHorizontalSpacing(6)
         dev_grid.setVerticalSpacing(4)
@@ -415,19 +411,22 @@ class RdmaBlastFlowDialog(QDialog):
         self._client_port_spin.setToolTip(_PORT_FIELD_TOOLTIP)
         dev_grid.addWidget(self._client_port_spin, 1, 3)
 
-        # v0.5.149: inline hint clarifying that the "device"
-        # combos are RDMA HCA names (mlx5_0, rocep…), not the
-        # Ethernet iface picker used elsewhere in the GUI. Same
-        # clarification the Topology dialog gained in v0.5.143.
+        # v0.5.160 followup: dropped the long HCA-vs-iface
+        # paragraph. The clarification now lives in a one-line
+        # footer + combobox tooltips. Same compaction the
+        # Topology dialog received.
+        _hca_tip = (
+            "device = RDMA HCA name (e.g. mlx5_0) — the InfiniBand "
+            "verbs device, NOT an Ethernet interface (ens2f0np0). "
+            "perftest addresses the HCA directly via libibverbs."
+        )
+        self._server_device_combo.setToolTip(_hca_tip)
+        self._client_device_combo.setToolTip(_hca_tip)
         _hca_hint = QLabel(
             "<span style='color:#64748b; font-size:11px;'>"
-            "<b>device</b> = RDMA HCA name (e.g. <code>mlx5_0</code>) "
-            "— this is the InfiniBand verbs device, NOT an Ethernet "
-            "interface (<code>ens2f0np0</code>). perftest addresses "
-            "the HCA directly via libibverbs."
+            "device = RDMA HCA (mlx5_0), not iface (ens2f0np0)."
             "</span>"
         )
-        _hca_hint.setWordWrap(True)
         dev_grid.addWidget(_hca_hint, 2, 0, 1, 4)
 
         # v0.5.147: Loopback shortcut. Same-host loopback is the
@@ -438,10 +437,9 @@ class RdmaBlastFlowDialog(QDialog):
         # client side. Only meaningful when server and client TG
         # are the same host — disabled otherwise via the
         # `same_tg` check above.
-        self._loopback_btn = QPushButton(
-            "↔  Use server device for loopback "
-            "(same HCA on both sides)"
-        )
+        # v0.5.160 followup: shorter label — tooltip still
+        # explains the full semantics.
+        self._loopback_btn = QPushButton("↔  Same-HCA loopback")
         self._loopback_btn.setToolTip(
             "Mirrors the server-side device + IB port onto the "
             "client side. The canonical RDMA smoke test: both "
@@ -467,9 +465,7 @@ class RdmaBlastFlowDialog(QDialog):
         # between sibling RoCE devices on one box (rocep…f0 ↔
         # rocep…f1), this button picks the NEXT available device
         # on the client side relative to the server's pick.
-        self._other_hca_btn = QPushButton(
-            "↔  Use OTHER HCA (same host two-port test)"
-        )
+        self._other_hca_btn = QPushButton("↔  Two-HCA same host")
         self._other_hca_btn.setToolTip(
             "Same TG, DIFFERENT HCAs. Picks the next available "
             "device on the client side (e.g. server=rocep…f0 → "
@@ -499,7 +495,7 @@ class RdmaBlastFlowDialog(QDialog):
         # QFormLayout; now 4 rows of (label/widget, label/widget)
         # pairs + 1 row for the two checkboxes. Same widgets, same
         # tooltips, same handlers; just denser.
-        test_box = QGroupBox("Test parameters")
+        test_box = QGroupBox("Parameters")
         tg = QGridLayout(test_box)
         tg.setHorizontalSpacing(8)
         # v0.5.152: compact further — operator wanted more vertical
@@ -599,12 +595,16 @@ class RdmaBlastFlowDialog(QDialog):
             "over a fixed iteration count."
         )
 
-        self._bidir_check = QCheckBox("Bidirectional (-b)")
+        # v0.5.160 followup: shorter labels — perftest flags moved
+        # to tooltips. Operator-facing names stay clear.
+        self._bidir_check = QCheckBox("Bidirectional")
+        self._bidir_check.setToolTip("perftest -b")
         self._bidir_check.setToolTip(
             "Run BW in both directions simultaneously. Only meaningful "
             "for the _bw tests."
         )
-        self._cpu_util_check = QCheckBox("Report CPU utilisation (--cpu_util)")
+        self._cpu_util_check = QCheckBox("CPU util")
+        self._cpu_util_check.setToolTip("perftest --cpu_util")
 
         # Layout — 4 rows × 2 columns + 1 row of checkboxes.
         # Row 0: Test type | MTU
