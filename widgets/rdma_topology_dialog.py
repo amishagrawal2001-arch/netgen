@@ -58,11 +58,11 @@ from widgets.rdma_blast_flow_dialog import (
 
 
 _SHAPE_LABELS = [
-    (SHAPE_SINGLE,   "Single (1 ↔ 1)"),
-    (SHAPE_FAN_IN,   "Fan-in (N clients → 1 server)"),
-    (SHAPE_FAN_OUT,  "Fan-out (1 server → N clients)"),
-    (SHAPE_MESH,     "Mesh (N × M cross-product)"),
-    (SHAPE_PAIRWISE, "Pairwise (N ↔ N parallel)"),
+    (SHAPE_SINGLE,   "Single  1↔1"),
+    (SHAPE_FAN_IN,   "Fan-in  N→1"),
+    (SHAPE_FAN_OUT,  "Fan-out  1→N"),
+    (SHAPE_MESH,     "Mesh  N×M"),
+    (SHAPE_PAIRWISE, "Pairwise  N↔N"),
 ]
 
 
@@ -181,15 +181,20 @@ class RdmaTopologyDialog(QDialog):
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
-        root.setContentsMargins(10, 10, 10, 10)
-        root.setSpacing(6)
+        # v0.5.160 followup: tighter root margins + spacing so the
+        # dialog packs more densely on a 1280×800 laptop screen.
+        root.setContentsMargins(8, 6, 8, 6)
+        root.setSpacing(4)
 
-        # Same compact GroupBox stylesheet as the single-pair dialog.
+        # v0.5.160 followup: tighter group-box chrome — smaller
+        # top margin (was 9 → 7), tighter inner padding
+        # (was 6/8/8/8 → 4/6/6/6). Each saved px multiplies across
+        # the four group boxes.
         self.setStyleSheet(
             "QGroupBox {"
             "  font-weight: 600; color: #334155;"
             "  border: 1px solid #cbd5e1; border-radius: 4px;"
-            "  margin-top: 9px; padding: 6px 8px 8px 8px;"
+            "  margin-top: 7px; padding: 4px 6px 6px 6px;"
             "}"
             "QGroupBox::title {"
             "  subcontrol-origin: margin; subcontrol-position: top left;"
@@ -197,25 +202,16 @@ class RdmaTopologyDialog(QDialog):
             "}"
         )
 
-        # Header
-        hdr = QLabel(
-            "<span style='font-size:13px; font-weight:600; color:#0f172a;'>"
-            "RDMA Topology Test</span>"
-            "&nbsp;&nbsp;"
-            "<span style='color:#64748b; font-size:11px;'>"
-            "N×M perftest orchestrator — endpoint groups + topology shape, "
-            "aggregated stats. See Help → Install Guide §10d for the "
-            "Ixia comparison."
-            "</span>"
-        )
-        hdr.setWordWrap(True)
-        root.addWidget(hdr)
+        # v0.5.160 followup: dropped the verbose header banner —
+        # the window title already says "RDMA Topology Test", and
+        # the Install Guide §10d reference belongs in the Help
+        # menu, not stealing a row of vertical real estate.
 
         # ── Topology shape picker + pair-count preview
         shape_box = QGroupBox("Topology")
         sh = QHBoxLayout(shape_box)
-        sh.setContentsMargins(8, 4, 8, 4)
-        sh.setSpacing(12)
+        sh.setContentsMargins(6, 2, 6, 2)
+        sh.setSpacing(10)
         self._shape_group = QButtonGroup(self)
         self._shape_buttons: Dict[str, QRadioButton] = {}
         for sid, slabel in _SHAPE_LABELS:
@@ -232,11 +228,14 @@ class RdmaTopologyDialog(QDialog):
         root.addWidget(shape_box)
 
         # ── Endpoint editors — two side-by-side text panes
-        endpoints_box = QGroupBox("Endpoints (one per line: <tg_url> <device> [port=N] [gid=N] [label=NAME])")
+        # v0.5.160 followup: shorter title; format hint lives in
+        # the textarea placeholder where the operator actually
+        # needs it.
+        endpoints_box = QGroupBox("Endpoints")
         eg = QGridLayout(endpoints_box)
-        eg.setContentsMargins(8, 4, 8, 6)
+        eg.setContentsMargins(8, 4, 8, 4)
         eg.setHorizontalSpacing(8)
-        eg.setVerticalSpacing(4)
+        eg.setVerticalSpacing(3)
 
         # v0.5.143: Each side gets a header row with a "Pick from
         # servers…" button so the operator doesn't have to type
@@ -279,9 +278,7 @@ class RdmaTopologyDialog(QDialog):
         # the problem is in the RDMA stack itself (GID / port state
         # / driver) rather than link reachability between two
         # ports.
-        self._loopback_btn = QPushButton(
-            "↔  Same-host test (loopback or two HCAs)"
-        )
+        self._loopback_btn = QPushButton("↔  Same-host test…")
         self._loopback_btn.setEnabled(bool(self._known_servers))
         self._loopback_btn.setToolTip(
             "Opens a same-host RDMA test picker with two modes:\n\n"
@@ -305,13 +302,15 @@ class RdmaTopologyDialog(QDialog):
             )
         self._loopback_btn.clicked.connect(self._open_loopback_picker)
 
+        # v0.5.160 followup: shorter placeholders (the format
+        # hint moved into the textarea so it disappears once
+        # operator starts typing) + tighter max-height.
         self._server_edit = QPlainTextEdit()
         self._server_edit.setPlaceholderText(
-            "http://srv01:5050 mlx5_0\n"
-            "http://srv01:5050 mlx5_1\n"
-            "# comment lines start with #"
+            "http://srv01:5050 mlx5_0  [port=1 gid=3 label=NAME]\n"
+            "# blank/# lines ignored"
         )
-        self._server_edit.setMaximumHeight(110)
+        self._server_edit.setMaximumHeight(80)
         self._server_edit.textChanged.connect(self._refresh_pair_count)
         mono = QFont("Menlo")
         mono.setStyleHint(QFont.Monospace)
@@ -320,40 +319,39 @@ class RdmaTopologyDialog(QDialog):
         self._client_edit = QPlainTextEdit()
         self._client_edit.setPlaceholderText(
             "http://srv04:5050 mlx5_0\n"
-            "http://srv05:5050 mlx5_0\n"
+            "http://srv05:5050 mlx5_0"
         )
-        self._client_edit.setMaximumHeight(110)
+        self._client_edit.setMaximumHeight(80)
         self._client_edit.textChanged.connect(self._refresh_pair_count)
         self._client_edit.setFont(mono)
 
         eg.addWidget(self._server_edit, 1, 0)
         eg.addWidget(self._client_edit, 1, 1)
 
-        # v0.5.143: tiny inline note clarifying that the second token
-        # is the RDMA HCA name (mlx5_0, mlx5_1, …), NOT an Ethernet
-        # interface (ens2f0np0). perftest addresses the HCA directly
-        # via libibverbs — the Ethernet iface dropdowns elsewhere in
-        # the GUI (DPDK / scapy) are not the same thing.
-        hint = QLabel(
-            "<span style='color:#64748b; font-size:11px;'>"
-            "<b>device</b> = RDMA HCA name (e.g. <code>mlx5_0</code>) — "
-            "this is the InfiniBand verbs device, NOT an Ethernet "
-            "interface (<code>ens2f0np0</code>). perftest addresses "
-            "the HCA directly via libibverbs."
-            "</span>"
+        # v0.5.160 followup: dropped the long inline HCA-vs-iface
+        # note (now lives in the textarea tooltips below and in
+        # Help → Install Guide §10d). The compact footer row
+        # carries just the same-host shortcut + a one-line
+        # device-clarification hint.
+        self._server_edit.setToolTip(
+            "device = RDMA HCA name (e.g. mlx5_0) — the InfiniBand "
+            "verbs device, NOT an Ethernet interface (ens2f0np0). "
+            "perftest addresses the HCA directly via libibverbs."
         )
-        hint.setWordWrap(True)
-        eg.addWidget(hint, 2, 0, 1, 2)
+        self._client_edit.setToolTip(self._server_edit.toolTip())
 
-        # v0.5.147: loopback row sits at the BOTTOM of the
-        # endpoints box, right-aligned so it sits below the
-        # Client editor without crowding the labels above.
-        loopback_row = QWidget()
-        _lh = QHBoxLayout(loopback_row)
-        _lh.setContentsMargins(0, 0, 0, 0)
-        _lh.addStretch(1)
-        _lh.addWidget(self._loopback_btn)
-        eg.addWidget(loopback_row, 3, 0, 1, 2)
+        footer_row = QWidget()
+        _fh = QHBoxLayout(footer_row)
+        _fh.setContentsMargins(0, 0, 0, 0)
+        _fh.setSpacing(6)
+        _fh.addWidget(QLabel(
+            "<span style='color:#64748b; font-size:11px;'>"
+            "device = RDMA HCA (mlx5_0), not iface (ens2f0np0)."
+            "</span>"
+        ))
+        _fh.addStretch(1)
+        _fh.addWidget(self._loopback_btn)
+        eg.addWidget(footer_row, 2, 0, 1, 2)
 
         eg.setColumnStretch(0, 1)
         eg.setColumnStretch(1, 1)
@@ -361,7 +359,7 @@ class RdmaTopologyDialog(QDialog):
 
         # ── Shared workload params — same compact 2-column grid as
         # the single-pair dialog
-        test_box = QGroupBox("Shared workload (applies to every pair)")
+        test_box = QGroupBox("Workload (per pair)")
         tg = QGridLayout(test_box)
         # v0.5.159: bumped vertical spacing 4 → 8 so spinbox
         # baselines no longer kiss.
@@ -425,8 +423,13 @@ class RdmaTopologyDialog(QDialog):
             "Default 18516 (perftest default 18515 + 1)."
         )
 
-        self._bidir_check = QCheckBox("Bidirectional (-b)")
-        self._cpu_util_check = QCheckBox("Report CPU utilisation (--cpu_util)")
+        # v0.5.160 followup: shorter labels — perftest flags live in
+        # tooltips. The bare "Bidirectional" / "CPU util" is the
+        # operator-facing name.
+        self._bidir_check = QCheckBox("Bidirectional")
+        self._bidir_check.setToolTip("perftest -b")
+        self._cpu_util_check = QCheckBox("CPU util")
+        self._cpu_util_check.setToolTip("perftest --cpu_util")
 
         # v0.5.156 Slice A: Parallel workers — per-pair worker
         # count for true multi-core BW scaling. Each pair spawns
@@ -563,7 +566,7 @@ class RdmaTopologyDialog(QDialog):
         root.addLayout(action_row)
 
         # ── Per-pair stats grid + TOTAL row
-        stats_box = QGroupBox("Per-pair stats")
+        stats_box = QGroupBox("Results")
         sv = QVBoxLayout(stats_box)
         sv.setContentsMargins(8, 4, 8, 4)
         self._stats_table = QTableWidget(0, 6)
@@ -575,10 +578,11 @@ class RdmaTopologyDialog(QDialog):
         hh = self._stats_table.horizontalHeader()
         hh.setSectionResizeMode(1, QHeaderView.Stretch)
         hh.setSectionResizeMode(2, QHeaderView.Stretch)
-        # v0.5.160: bumped 160 → 360. With Iterations > 1 we now
-        # append rows per (iteration, pair); operator wanted the
-        # full run visible without resizing the dialog.
-        self._stats_table.setMinimumHeight(360)
+        # v0.5.160 followup: 360 was excessive on the empty state.
+        # Drop to 200 (enough to comfortably show ~8 rows) and let
+        # the stretch=1 below grow it when needed. Stretch already
+        # claims any freed vertical room.
+        self._stats_table.setMinimumHeight(200)
         sv.addWidget(self._stats_table)
         self._total_label = QLabel(
             "<span style='color:#475569;'>(no run yet)</span>"

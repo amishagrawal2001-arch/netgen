@@ -46,10 +46,13 @@ def test_workload_grid_vertical_spacing_compacted():
 
 
 def test_stats_table_minimum_height_bumped():
-    """160 → 360 so iterations × pairs fits without resizing."""
-    assert "self._stats_table.setMinimumHeight(360)" in SRC
-    # Old value gone.
+    """v0.5.160 bumped 160 → 360; the compaction pass landed on
+    200 (enough for ~8 rows; the stretch=1 below claims any freed
+    vertical room when there are more)."""
+    assert "self._stats_table.setMinimumHeight(200)" in SRC
+    # Old values gone.
     assert "self._stats_table.setMinimumHeight(160)" not in SRC
+    assert "self._stats_table.setMinimumHeight(360)" not in SRC
 
 
 def test_blast_test_params_vertical_spacing_reverted():
