@@ -524,6 +524,9 @@ class RdmaBlastFlowDialog(QDialog):
             "ib_send_lat / ib_write_lat / ib_read_lat drive latency tests "
             "(single-op ping-pong; pps will be low — that's the point)."
         )
+        # v0.5.160 followup: cap so the col 1 stretch doesn't pull
+        # the combo across half the dialog. Same fix as Topology.
+        self._test_combo.setMaximumWidth(300)
 
         self._mtu_combo = QComboBox()
         for code, label in _MTU_OPTIONS:
@@ -534,6 +537,7 @@ class RdmaBlastFlowDialog(QDialog):
             "ABOVE active_mtu and the run fails with a clear error from "
             "perftest. Default 4096 B works on most modern RoCE adapters."
         )
+        self._mtu_combo.setMaximumWidth(300)
 
         self._msg_size_spin = QSpinBox()
         self._msg_size_spin.setRange(2, 16 * 1024 * 1024)

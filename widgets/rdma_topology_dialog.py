@@ -376,11 +376,16 @@ class RdmaTopologyDialog(QDialog):
         self._test_combo = QComboBox()
         for tid, label, _group in _TESTS:
             self._test_combo.addItem(label, userData=tid)
+        # v0.5.160 followup: cap so the col 1 stretch doesn't pull
+        # the combo across half the dialog. Content is short
+        # ("Send — Bandwidth" et al.); 300 px is plenty.
+        self._test_combo.setMaximumWidth(300)
 
         self._mtu_combo = QComboBox()
         for code, label in _MTU_OPTIONS:
             self._mtu_combo.addItem(label, userData=code)
         self._mtu_combo.setCurrentIndex(len(_MTU_OPTIONS) - 1)
+        self._mtu_combo.setMaximumWidth(300)
 
         self._msg_size_spin = QSpinBox()
         self._msg_size_spin.setRange(2, 16 * 1024 * 1024)
