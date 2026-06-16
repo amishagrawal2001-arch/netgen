@@ -753,6 +753,20 @@ class RdmaBlastFlowDialog(QDialog):
         )
         self._preflight_btn.clicked.connect(self._on_preflight_clicked)
         action_row.addWidget(self._preflight_btn)
+        # v0.5.163: per-session append-only run log + Export button.
+        # Operators wanted to archive the test results; we keep
+        # every Start's outcome in memory and let them dump the
+        # whole session as a self-contained HTML file.
+        self._run_log: List[Dict[str, Any]] = []
+        self._export_btn = QPushButton("📄 Export report…")
+        self._export_btn.setToolTip(
+            "Save a self-contained HTML report of every run "
+            "completed since this dialog opened. Includes per-run "
+            "parameters, endpoints, per-worker BW / MsgRate, and "
+            "the Σ summary line. Open the file in any browser."
+        )
+        self._export_btn.clicked.connect(self._on_export_report_clicked)
+        action_row.addWidget(self._export_btn)
         self._start_btn = QPushButton("Start")
         self._start_btn.setDefault(True)
         self._start_btn.clicked.connect(self._on_start_clicked)
@@ -2116,6 +2130,10 @@ class RdmaBlastFlowDialog(QDialog):
             # All iterations done — emit Σ summary, then settle.
             self._emit_iteration_summary()
             self._iteration_in_progress = False
+        # v0.5.163: snapshot the just-finished run (single iter OR
+        # the whole iterate-N session) into _run_log for the
+        # Export Report button.
+        self._append_run_log_entry()
         self._set_status_ok(
             "Both halves finished. Click Stop to forget the pairing "
             "(or close this dialog)."
@@ -2159,6 +2177,111 @@ class RdmaBlastFlowDialog(QDialog):
                 f"max={max(mrs):.4f} Mpps"
             )
         self._stats_view.append("  ".join(parts))
+
+    def _append_run_log_entry(self) -> None:
+        """v0.5.163: capture the just-finished Start cycle as one
+        entry in `_run_log` so the operator can export the whole
+        session as HTML."""
+        import datetime as _dt
+        params = {
+            "test": self._test_combo.currentText(),
+            "msg_size": int(self._msg_size_spin.value()),
+            "qp_count": int(self._qp_count_spin.value()),
+            "duration_s": int(self._duration_spin.value()),
+            "tx_depth": int(self._tx_depth_spin.value()),
+            "gid_index": int(self._gid_index_spin.value()),
+            "mtu": self._mtu_combo.currentText(),
+            "bidirectional": bool(self._bidir_check.isChecked()),
+            "cpu_util": bool(self._cpu_util_check.isChecked()),
+            "parallel_workers": int(self._parallel_workers_spin.value()),
+            "iterations": int(self._iterations_spin.value()),
+        }
+        rows: List[Dict[str, Any]] = []
+        # Multi-iteration: one row per (iter), then per-worker.
+        iter_results = getattr(self, "_iteration_results", [])
+        for r in iter_results:
+            rows.append({
+                "label": f"iter #{r.get('iter', '?')}",
+                "state": "done",
+                "bw_gbps": r.get("bw"),
+                "msgrate_mpps": r.get("msgrate"),
+            })
+        # Per-extra-worker rows (only meaningful for parallel runs).
+        for w in getattr(self, "_extra_workers", []):
+            rows.append({
+                "label": f"worker {w.get('worker_idx', '?')}",
+                "state": "done"
+                if (w.get("client_finished") and w.get("server_finished"))
+                else "?",
+                "bw_gbps": w.get("client_bw"),
+                "msgrate_mpps": w.get("client_msgrate"),
+            })
+        # Worker 0's final BW.
+        rows.append({
+            "label": "worker 0",
+            "state": "done",
+            "bw_gbps": getattr(self, "_client_bw", None),
+            "msgrate_mpps": getattr(self, "_client_msgrate", None),
+        })
+        # Σ summary across iterations (if any).
+        summary = None
+        bws = [r["bw_gbps"] for r in rows
+               if isinstance(r.get("bw_gbps"), (int, float))]
+        mrs = [r["msgrate_mpps"] for r in rows
+               if isinstance(r.get("msgrate_mpps"), (int, float))]
+        if bws:
+            summary = {
+                "samples": len(bws),
+                "bw_avg_gbps": sum(bws) / len(bws),
+                "bw_min_gbps": min(bws),
+                "bw_max_gbps": max(bws),
+                "msgrate_avg_mpps":
+                    (sum(mrs) / len(mrs)) if mrs else None,
+            }
+        entry = {
+            "kind": "blast",
+            "started_at": _dt.datetime.now().isoformat(timespec="seconds"),
+            "test": self._test_combo.currentData(),
+            "params": params,
+            "endpoints": {
+                "server":
+                    f"{self._server_tg_label} {self._server_device_combo.currentData() or '?'}",
+                "client":
+                    f"{self._client_tg_label} {self._client_device_combo.currentData() or '?'}",
+            },
+            "rows": rows,
+            "summary": summary,
+        }
+        self._run_log.append(entry)
+
+    def _on_export_report_clicked(self) -> None:
+        """v0.5.163: dump the session's run log to a self-contained
+        HTML file via a Save-As dialog."""
+        import datetime as _dt
+        from PyQt5.QtWidgets import QFileDialog
+        from utils.rdma_report import build_html_report
+        ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        default = f"netgen-blast-report-{ts}.html"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Blast RDMA report", default,
+            "HTML files (*.html);;All files (*)",
+        )
+        if not path:
+            return
+        html = build_html_report(
+            title="Blast a RDMA Flow — Session Report",
+            runs=list(self._run_log),
+            generated_at=_dt.datetime.now().isoformat(timespec="seconds"),
+        )
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(html)
+        except OSError as exc:
+            self._set_status_error(f"Failed to write report: {exc}")
+            return
+        self._set_status_ok(
+            f"Wrote {len(self._run_log)} run(s) to {path}"
+        )
 
     def _on_stop_clicked(self) -> None:
         self._stop_btn.setEnabled(False)

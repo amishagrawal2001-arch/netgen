@@ -548,6 +548,18 @@ class RdmaTopologyDialog(QDialog):
         )
         self._preflight_btn.clicked.connect(self._on_preflight_clicked)
         action_row.addWidget(self._preflight_btn)
+        # v0.5.163: per-session run log + Export button (same as
+        # the Blast dialog).
+        self._run_log: List[Dict[str, Any]] = []
+        self._export_btn = QPushButton("📄 Export report…")
+        self._export_btn.setToolTip(
+            "Save a self-contained HTML report of every topology "
+            "run completed since this dialog opened. Includes the "
+            "topology shape, parameters, per-pair × per-iteration "
+            "rows, and the Σ summary."
+        )
+        self._export_btn.clicked.connect(self._on_export_report_clicked)
+        action_row.addWidget(self._export_btn)
         self._start_btn = QPushButton("Start topology")
         self._start_btn.setDefault(True)
         self._start_btn.clicked.connect(self._on_start_clicked)
@@ -1481,6 +1493,7 @@ class RdmaTopologyDialog(QDialog):
             else:
                 # All iterations finished (or operator hit Stop).
                 self._append_summary_row()
+                self._append_run_log_entry()
                 self._start_btn.setEnabled(True)
                 self._stop_btn.setEnabled(False)
                 self._stop_requested = False
@@ -1584,6 +1597,97 @@ class RdmaTopologyDialog(QDialog):
                 ),
             )
         self._stats_table.scrollToBottom()
+
+    def _append_run_log_entry(self) -> None:
+        """v0.5.163: capture the finished topology run for the
+        Export Report button."""
+        import datetime as _dt
+        params = {
+            "test": self._test_combo.currentText(),
+            "msg_size": int(self._msg_size_spin.value()),
+            "qp_count": int(self._qp_count_spin.value()),
+            "duration_s": int(self._duration_spin.value()),
+            "tx_depth": int(self._tx_depth_spin.value()),
+            "gid_index": int(self._gid_index_spin.value()),
+            "mtu": self._mtu_combo.currentText(),
+            "base_port": int(self._base_port_spin.value()),
+            "bidirectional": bool(self._bidir_check.isChecked()),
+            "cpu_util": bool(self._cpu_util_check.isChecked()),
+            "parallel_workers": int(
+                self._parallel_workers_spin.value()),
+            "iterations": int(self._iterations_spin.value()),
+            "shape": self._current_shape(),
+        }
+        pairs = [
+            {
+                "idx": p.pair_index,
+                "server": p.server.display(),
+                "client": p.client.display(),
+            }
+            for p in (self._plans or [])
+        ]
+        rows: List[Dict[str, Any]] = []
+        for snap in getattr(self, "_iteration_results", []):
+            for r in snap:
+                rows.append({
+                    "label": f"#{r.get('iter', '?')}.{r.get('pair_index', '?')}",
+                    "state": (f"rc={r.get('rc')}"
+                              if r.get("rc") is not None else "?"),
+                    "bw_gbps": r.get("bw"),
+                    "msgrate_mpps": r.get("msgrate"),
+                })
+        summary = None
+        bws = [r["bw_gbps"] for r in rows
+               if isinstance(r.get("bw_gbps"), (int, float))]
+        mrs = [r["msgrate_mpps"] for r in rows
+               if isinstance(r.get("msgrate_mpps"), (int, float))]
+        if bws:
+            summary = {
+                "samples": len(bws),
+                "bw_avg_gbps": sum(bws) / len(bws),
+                "bw_min_gbps": min(bws),
+                "bw_max_gbps": max(bws),
+                "msgrate_avg_mpps":
+                    (sum(mrs) / len(mrs)) if mrs else None,
+            }
+        entry = {
+            "kind": "topology",
+            "started_at": _dt.datetime.now().isoformat(timespec="seconds"),
+            "test": self._test_combo.currentData(),
+            "params": params,
+            "endpoints": {"pairs": pairs},
+            "rows": rows,
+            "summary": summary,
+        }
+        self._run_log.append(entry)
+
+    def _on_export_report_clicked(self) -> None:
+        """v0.5.163: export the session log as HTML."""
+        import datetime as _dt
+        from PyQt5.QtWidgets import QFileDialog
+        from utils.rdma_report import build_html_report
+        ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+        default = f"netgen-topology-report-{ts}.html"
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save Topology RDMA report", default,
+            "HTML files (*.html);;All files (*)",
+        )
+        if not path:
+            return
+        html = build_html_report(
+            title="RDMA Topology Test — Session Report",
+            runs=list(self._run_log),
+            generated_at=_dt.datetime.now().isoformat(timespec="seconds"),
+        )
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                fh.write(html)
+        except OSError as exc:
+            self._set_status_error(f"Failed to write report: {exc}")
+            return
+        self._set_status_ok(
+            f"Wrote {len(self._run_log)} run(s) to {path}"
+        )
 
     def _refresh_totals(self) -> None:
         # Use CLIENT-side jobs for aggregation (those report the

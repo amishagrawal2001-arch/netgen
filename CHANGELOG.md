@@ -2,6 +2,54 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.163] - 2026-06-16
+
+**HTML report export in both Blast and Topology dialogs.**
+
+Operator: "also allow user to generate report for this test both
+in via blast test and topology test". Confirmed format = HTML,
+scope = all runs since the dialog opened.
+
+### Shared builder
+
+`utils/rdma_report.py` — pure function `build_html_report(title,
+runs, generated_at, client_version=None)` that renders a self-
+contained HTML doc with inline CSS. No external assets, no JS.
+Operators can email / archive the file as-is.
+
+### Per-dialog wiring
+
+Both dialogs gained:
+* `_run_log: List[Dict]` — append-only, reset on dialog construction
+* `📄 Export report…` button next to Pre-flight check
+* `_append_run_log_entry()` called after every Start cycle
+  completes (single iteration OR the full iterate-N session) —
+  captures params, endpoints, per-iteration / per-worker /
+  per-pair rows, and the Σ summary.
+* `_on_export_report_clicked()` — Save-As dialog with a
+  timestamped default filename
+  (`netgen-blast-report-YYYYMMDD_HHMMSS.html` /
+  `netgen-topology-report-...`), then writes the rendered HTML.
+
+### Report contents
+
+For each run:
+* Title + per-run kind pill (blast/topology) + test ID
+* Started-at timestamp
+* Parameters table (msg_size, qp_count, mtu, duration, parallel
+  workers, iterations, bidirectional, cpu_util, ...)
+* Endpoints (server/client for Blast; pair list for Topology)
+* Results table: per-iteration or per-pair rows + Σ summary row
+  (avg/min/max BW + avg MsgRate). Lat tests get a separate
+  layout (avg / p99 columns).
+
+### Tests
+
+`tests/test_v05163_html_report.py` — 6 new (builder smoke,
+empty-runs path, BW + Lat rendering, HTML-escape safety, both
+dialogs grew the export button + run log). Combined RDMA
+regression sweep: 178 passing.
+
 ## [0.5.162] - 2026-06-16
 
 **CRITICAL: --cpu_util adds a 6th column; parser was anchored
