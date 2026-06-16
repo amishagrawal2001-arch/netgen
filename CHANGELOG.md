@@ -2,6 +2,65 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.169] - 2026-06-16
+
+**Orphan prevention (systemd-scope) + auto-detect status-bar chip.**
+
+v0.5.168 made orphans visible + reapable. v0.5.169 closes the
+loop on both ends:
+
+1. **Prevention** — each tx/rx_worker spawn now goes through
+   `systemd-run --scope --unit=netgen-{tx,rx}-<stream_id>.scope`.
+   The kernel guarantees lifecycle tracking: a stop is signal
+   delivery via cgroup (no PID guessing, no pgrep racing); after
+   an ostg-server crash, surviving units are enumerable via
+   `systemctl list-units 'netgen-{tx,rx}-*.scope'` so the next
+   reaper finds every previous-session orphan in one call.
+2. **Auto-detect** — a `🧟 N orphans` permanent status-bar chip
+   polls every registered TG's `/api/streams/orphans` every 10 s.
+   Hidden when zero. Click → enumeration + Reap-All dialog.
+   Operators no longer need to ssh + ps to discover untracked
+   workers eating their HCAs.
+
+### Files touched
+
+* `utils/systemd_scope.py` (new) — pure-function `has_systemd_run`,
+  `sanitise_unit_name`, `build_systemd_run_prefix`,
+  `stop_scope_for_stream`, `list_netgen_scopes`. Hosts without
+  systemd-run get an empty prefix → naked Popen fallback (v0.5.168
+  reactive reap still applies).
+* `utils/dpdk_tx_worker.py` — wraps the main tx_worker Popen.
+* `utils/dpdk_rx_worker.py` — wraps the rx_worker Popen.
+* `utils/dpdk_tx_worker_multi.py` — per-instance scope wrap so
+  multi-instance fan-out gives each tx_worker its own unit.
+* `widgets/orphan_chip.py` (new) — `OrphanChip` permanent status-
+  bar widget + `OrphanReapDialog` modal that lists orphans
+  (PID/role/stream-id/BDF/etime/cmdline) and reaps them all in
+  one POST.
+* `traffic_client/main.py` — wires the chip into `statusBar()`
+  alongside the existing DPDK readiness chip.
+* `tests/test_v05169_systemd_scope.py` — 21 source-level +
+  unittest.mock + widget construction assertions.
+
+### Flags chosen for systemd-run
+
+* `--scope` — direct ancestor cgroup, no service unit layer.
+* `--collect` — auto-cleanup the unit when the scope exits
+  (otherwise systemd keeps a failed-state record indefinitely).
+* `--unit=netgen-{tx,rx}-<sid>` — predictable name we can
+  `systemctl stop` later without grepping `list-units`.
+* `--quiet` — no "Running scope as unit..." log spam.
+
+### Operator UX
+
+* **Before**: orphan eats HCA → operator's next test silently
+  drops BW from 200 G to 68 G → 30 min of debugging → SSH +
+  ps + manual `kill -9`.
+* **Now**: status bar shows `🧟 1 orphan` within 10 s of opening
+  the GUI → one click → list → Reap All → done. Or just don't
+  notice until Start All / Stop All sweeps them automatically
+  (v0.5.168).
+
 ## [0.5.168] - 2026-06-16
 
 **Orphan tx_worker / rx_worker handling — Stop-All sweeps, Start

@@ -271,6 +271,14 @@ def start_rx_worker(
         app.extend(["--duration", str(int(duration_s))])
 
     cmd = eal + app
+    # v0.5.169: wrap in systemd-run --scope for cgroup lifecycle
+    # tracking (see utils/dpdk_tx_worker.py for the rationale).
+    try:
+        from utils import systemd_scope
+        cmd = systemd_scope.build_systemd_run_prefix(
+            role="rx", stream_id=stream_id) + cmd
+    except Exception as _e:
+        LOG.debug("[dpdk-rx] systemd_scope import failed: %s", _e)
     LOG.info("[dpdk-rx] exec: %s", " ".join(shlex.quote(a) for a in cmd))
 
     # text=True so we get str lines, not bytes — matches tx_worker

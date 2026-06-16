@@ -210,6 +210,33 @@ class TrafficGeneratorClient(
         except Exception as _e:
             logging.warning(f"[MAIN] DPDK readiness chip unavailable: {_e}")
 
+        # v0.5.169: orphan-worker status chip. Polls every registered
+        # TG's /api/streams/orphans every 10 s, shows "🧟 N orphans"
+        # when any are detected. Click → reap dialog. Hidden when
+        # zero. Operator no longer needs to ssh + ps to discover
+        # untracked tx/rx_worker procs eating their HCAs.
+        try:
+            from widgets.orphan_chip import OrphanChip
+
+            def _resolve_all_server_urls():
+                try:
+                    urls = []
+                    for s in (getattr(self, "server_interfaces",
+                                      None) or []):
+                        addr = s.get("address")
+                        if addr:
+                            urls.append(str(addr))
+                    return urls
+                except Exception:
+                    return []
+
+            self.orphan_chip = OrphanChip(
+                _resolve_all_server_urls, parent=self)
+            self.statusBar().addPermanentWidget(self.orphan_chip)
+        except Exception as _e:
+            logging.warning(
+                f"[MAIN] Orphan chip unavailable: {_e}")
+
 
         # Setup AI menu (if available)
         try:

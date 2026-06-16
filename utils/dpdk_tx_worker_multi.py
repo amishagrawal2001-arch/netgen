@@ -297,7 +297,21 @@ def run_stream_multi_instance(
             child_env = os.environ.copy()
             if env:
                 child_env.update(env)
-            
+
+            # v0.5.169: cgroup-track each instance under a unique
+            # netgen-tx-<instance_id>.scope unit. systemd handles
+            # name collisions if the same instance_id ever appears
+            # twice (rare but possible after a server crash + same-
+            # second restart).
+            try:
+                from utils import systemd_scope
+                cmd = systemd_scope.build_systemd_run_prefix(
+                    role="tx", stream_id=instance_id) + cmd
+            except Exception as _e:
+                LOG.debug(
+                    "[dpdk-multi] systemd_scope import failed: %s",
+                    _e)
+
             proc = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,

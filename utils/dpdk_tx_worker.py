@@ -493,6 +493,23 @@ def run_stream(
     except Exception as _e:
         LOG.debug("[dpdk] pre-launch sweep for %s failed: %s", stream_id, _e)
 
+    # v0.5.169: wrap in `systemd-run --scope --unit=netgen-tx-<sid>`
+    # when available. Puts tx_worker in its own cgroup unit so:
+    #   * `systemctl stop netgen-tx-<sid>.scope` is a kernel-
+    #     guaranteed stop — no pgrep racing, no PID guessing.
+    #   * If ostg-server dies, the unit survives but is enumerable
+    #     via `systemctl list-units 'netgen-tx-*.scope'`, so the
+    #     next-startup reaper finds every previous-session orphan
+    #     in one call.
+    # Empty prefix on hosts without systemd-run — falls back to the
+    # naked Popen (v0.5.168's reactive reap still applies).
+    try:
+        from utils import systemd_scope
+        cmd = systemd_scope.build_systemd_run_prefix(
+            role="tx", stream_id=stream_id) + cmd
+    except Exception as _e:
+        LOG.debug("[dpdk] systemd_scope import failed: %s", _e)
+
     LOG.info("[dpdk] exec: %s", shlex.join(cmd))
     LOG.info("[dpdk] LD_LIBRARY_PATH=%s", child_env.get("LD_LIBRARY_PATH", "not set"))
     # start_new_session=True puts tx_worker in its own session/process group
