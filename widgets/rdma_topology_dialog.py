@@ -1182,7 +1182,8 @@ class RdmaTopologyDialog(QDialog):
     ) -> None:
         """Spawn workers 1..N-1 for this pair. Each gets a unique
         cpu_pin, shared numa_pin (matches plan.server's HCA), and
-        unique listen_port (plan.base_listen_port + worker_idx)."""
+        unique listen_port (collision-safe across pairs — see
+        port-scheme note below)."""
         info = self._host_info_cache or {}
         numa_pin = None
         cpus: List[int] = []
@@ -1248,9 +1249,22 @@ class RdmaTopologyDialog(QDialog):
         peer_host = plan.server.tg_url.replace("http://", "") \
             .replace("https://", "").split(":")[0]
 
+        # v0.5.160 followup CRASH FIX: pre-fix referenced
+        # `plan.base_listen_port`, which doesn't exist —
+        # base_listen_port lives on the SPEC (config), not the
+        # plan (per-pair assignment). The plan has `listen_port`
+        # (= spec.base_listen_port + pair_index). That AttributeError
+        # killed every multi-pair multi-worker run.
+        # Port scheme: stride each extra worker by `pair_count` to
+        # avoid colliding with the NEXT pair's listen_port. Pair P
+        # worker W gets port `plan.listen_port + W * pair_count`,
+        # so the worker-0 ports (W=0) are the existing
+        # base + P assignments, and worker-W ports for any pair
+        # land in their own stride band.
+        pair_count = max(1, len(self._plans))
         for worker_idx in range(1, worker_count):
             cpu = cpus[worker_idx] if worker_idx < len(cpus) else worker_idx
-            extra_port = plan.base_listen_port + worker_idx
+            extra_port = plan.listen_port + worker_idx * pair_count
             worker_handshake = (
                 f"{plan.pair_index}-w{worker_idx}-"
                 f"{uuid.uuid4().hex[:6]}"

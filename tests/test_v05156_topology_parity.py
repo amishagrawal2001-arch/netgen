@@ -138,10 +138,21 @@ def test_extra_workers_get_cpu_pin_and_numa_pin():
 
 
 def test_extras_use_distinct_listen_ports():
-    """Each pair worker gets `base_listen_port + worker_idx` so
-    perftest's control TCP doesn't collide."""
+    """v0.5.156 pinned `plan.base_listen_port + worker_idx` —
+    that attribute doesn't exist on RdmaPairPlan (only on the
+    spec). v0.5.160 followup uses `plan.listen_port + worker_idx
+    * pair_count` so workers don't collide with other pairs'
+    listen_ports. Strip the comment block before checking — the
+    fix comment naturally mentions the old buggy attribute."""
     body = _extract_method(SRC, "_start_pair_extra_workers")
-    assert "plan.base_listen_port + worker_idx" in body
+    code = "\n".join(
+        ln for ln in body.splitlines()
+        if not ln.lstrip().startswith("#")
+    )
+    assert "plan.listen_port" in code
+    assert "worker_idx * pair_count" in code
+    # The buggy attribute is gone from the live code.
+    assert "plan.base_listen_port" not in code
 
 
 def test_extras_use_unique_handshakes():
