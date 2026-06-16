@@ -2,6 +2,52 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.161] - 2026-06-16
+
+**CRITICAL: extras' perftest client never knew which port to
+dial — instant rc=1 on every multi-worker run.**
+
+Operator screenshot from 16-worker BW run: worker 0 finished at
+171 Gbps, all 15 extra clients reported `done (rc=1) BW avg=None`
+within ~2 seconds of "both halves running". Both dialogs affected.
+
+### Blast: extras client body never set `listen_port`
+
+`_on_extra_server_started` POSTed the server start, got back a
+job_id + listen_port in the response, and then built the client
+body WITHOUT copying the listen_port through. The server bound
+to whatever port `_allocate_port()` picked; the client's
+perftest called `_allocate_port()` again and got a DIFFERENT
+random port; perftest's `-p` arg disagreed; client couldn't
+reach server; exit rc=1.
+
+Worker 0's path has done this correctly since v0.4.0
+(`_on_server_started` → `listen_port: listen_port` in client
+body). The v0.5.155 extras-fan-out code just forgot.
+
+Fix: extract `data.get("listen_port")` from the server response
+and pass it as `listen_port` in the client body. Mirror worker 0.
+
+### Topology: wrong key name (`peer_port` instead of `listen_port`)
+
+`_on_extra_srv` built the client body with `"peer_port": _port`
+— but the server's `/api/rdma/perftest/start` route has NO
+`peer_port` key (only `peer_addr` + `listen_port`). The client's
+perftest got no port hint; `_allocate_port()` picked a random
+port; same failure mode as Blast above.
+
+Fix: rename `peer_port` → `listen_port`. The server already binds
+to `extra_port` via `"listen_port": extra_port`; the client now
+connects to the same port.
+
+### Test asserts
+
+Added `tests/test_v05161_extras_listen_port.py` (3 tests) that
+greps both dialogs' `_start_extra_workers` / `_start_pair_extra_
+workers` for `listen_port` in the client-body construction, and
+confirms `peer_port` is gone from the Topology body. Combined RDMA
+regression sweep: 168 passing.
+
 ## [0.5.160] - 2026-06-15
 
 **Topology dialog UI polish + N-run iteration loop.**

@@ -1390,6 +1390,15 @@ class RdmaBlastFlowDialog(QDialog):
                     )
                     return
                 srv_jid = data.get("job_id")
+                # v0.5.161 CRASH FIX: extract listen_port from the
+                # server's response and pass it to the client so
+                # perftest's `-p` arg matches on both sides. Pre-
+                # fix the client body had no listen_port; perftest
+                # called _allocate_port() and picked a different
+                # random port from the server → client never
+                # connects → exits rc=1 instantly. Same plumbing
+                # worker 0 uses (see `_on_server_started`).
+                srv_listen_port = data.get("listen_port")
                 cli_body = {
                     "role": "client",
                     "test": _test_id,
@@ -1400,6 +1409,7 @@ class RdmaBlastFlowDialog(QDialog):
                     "cpu_pin": _cpu,
                     "numa_pin": numa_pin,
                     "peer_addr": _urlparse(self._server_tg_url).hostname,
+                    "listen_port": srv_listen_port,
                     **_opts,
                 }
 

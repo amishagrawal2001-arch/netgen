@@ -1301,6 +1301,15 @@ class RdmaTopologyDialog(QDialog):
                 if err or not data or data.get("status") != "started":
                     return
                 srv_jid = data.get("job_id")
+                # v0.5.161 CRASH FIX: was `"peer_port": _port` —
+                # but the server API has no `peer_port` key. The
+                # client's perftest port comes from `listen_port`
+                # (perftest's `-p` arg, used as the connect port
+                # in client mode). Pre-fix the server bound to
+                # extra_port but the client was told nothing about
+                # which port to dial; it _allocate_port()d a fresh
+                # random port and exited rc=1. Match the API and
+                # the worker-0 pattern.
                 cli_body = {
                     "role": "client",
                     "test": test_id,
@@ -1311,7 +1320,7 @@ class RdmaTopologyDialog(QDialog):
                     "cpu_pin": _cpu,
                     "numa_pin": numa_pin,
                     "peer_addr": _peer,
-                    "peer_port": _port,
+                    "listen_port": _port,
                     "gid_index": _plan.client.gid_index,
                 }
 
