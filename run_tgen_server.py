@@ -1498,6 +1498,98 @@ def stream_rx_debug(stream_id):
     })
 
 
+# ─────────────────────────────────────────── v0.5.168 orphan workers
+
+@app.route("/api/streams/orphans", methods=["GET"])
+def api_streams_orphans():
+    """Enumerate tx_worker / rx_worker processes not tracked by
+    `stream_tracker`. Returned shape:
+
+        {
+          "orphans":         [{pid, role, stream_id, bdf, file_prefix,
+                               etime_seconds, cmdline}, ...],
+          "known_stream_ids": ["uuid", "uuid", ...],
+          "total_workers":    int   # total live workers seen
+        }
+
+    Orphans happen when:
+      * GUI session disconnects without stopping its streams.
+      * Stop's backstop pkill matched 0 procs (race / encoding).
+      * ostg-server restart left the worker process alive.
+
+    The GUI polls this every ~5 s, surfaces orphan rows in the
+    Stream Stats table with a 🧟 ORPHAN badge, and shows them in
+    the Stop-All confirm dialog. Pre-flight on Start also calls
+    this to refuse against a BDF that's already being hammered.
+
+    A query string `bdf=0000:2b:00.0` filters to orphans bound to
+    that one device — used by the Start-time pre-flight check."""
+    try:
+        from utils.dpdk_orphans import find_orphans, find_orphans_for_bdf
+        known = {s.get("stream_id")
+                 for s in stream_tracker.get_stream_stats()
+                 if s.get("stream_id")}
+        bdf_filter = request.args.get("bdf")
+        if bdf_filter:
+            orphans = find_orphans_for_bdf(bdf_filter, known)
+        else:
+            orphans = find_orphans(known)
+        return jsonify({
+            "orphans": [w.to_dict() for w in orphans],
+            "known_stream_ids": sorted(known),
+            "total_workers":
+                len(__import__("utils.dpdk_orphans",
+                               fromlist=["find_dpdk_workers"])
+                    .find_dpdk_workers()),
+        })
+    except Exception as exc:
+        logging.exception("[orphans] /api/streams/orphans failed")
+        return jsonify({"orphans": [], "error": str(exc)}), 500
+
+
+@app.route("/api/streams/orphans/reap", methods=["POST"])
+def api_streams_orphans_reap():
+    """SIGTERM the specified PIDs, wait 1 s, SIGKILL anything
+    still alive. Body: `{"pids": [3194868, 3194724]}`.
+
+    Returns `{terminated, killed, failed}` — `terminated` always
+    includes successful SIGTERMs (even if the proc was already
+    dead, treated as success); `killed` lists PIDs that needed
+    SIGKILL escalation; `failed` lists PIDs we couldn't signal
+    at all (EPERM).
+
+    Idempotent: re-reaping a dead PID is a no-op. Safe to call
+    repeatedly from the GUI's confirm dialog if the operator
+    fat-fingers.
+
+    Without an explicit pids list the endpoint refuses (400) — we
+    never reap silently. The GUI must build the list from the
+    `/api/streams/orphans` response first."""
+    body = request.get_json(force=True, silent=True) or {}
+    pids = body.get("pids")
+    if not isinstance(pids, list) or not pids:
+        return jsonify({
+            "error": "request body must include {'pids': [<int>, ...]}",
+        }), 400
+    bad_pids = [p for p in pids if not isinstance(p, int) or p <= 0]
+    if bad_pids:
+        return jsonify({
+            "error": f"invalid pids in request: {bad_pids}",
+        }), 400
+    try:
+        from utils.dpdk_orphans import reap_workers
+        result = reap_workers(pids)
+        logging.warning(
+            f"[orphans] reap requested pids={pids} "
+            f"terminated={result['terminated']} "
+            f"killed={result['killed']} failed={result['failed']}"
+        )
+        return jsonify(result)
+    except Exception as exc:
+        logging.exception("[orphans] reap failed")
+        return jsonify({"error": str(exc)}), 500
+
+
 # v0.4.3: removed the broken /api/traffic/rx_monitor endpoint.
 # Was wired to start_rx_counter with the WRONG arg count
 # (4 positional, function takes 6 required) — TypeError the moment

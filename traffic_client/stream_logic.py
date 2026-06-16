@@ -747,7 +747,60 @@ class TrafficGenClientStreamLogic:
                                  "server log)")
                     rx_fallback_warnings.append((name, rx_reason))
 
+        # v0.5.168: pre-flight orphan check. For each server, look up
+        # any orphan tx/rx_worker on its interfaces in this batch.
+        # If one is bound to a NIC we're about to start on, refuse
+        # silently (after operator confirmation) — the orphan would
+        # starve the new stream and tank throughput. Operator gets a
+        # modal with "Reap & start" / "Cancel" per affected server.
+        cancelled_servers: set = set()
         for server_url, per_port in server_payload_map.items():
+            orphans = self._fetch_orphans(server_url)
+            if not orphans:
+                continue
+            target_ifaces: set = set()
+            for port_key, items in per_port.items():
+                for st, _ in items:
+                    iface = (st.get("interface")
+                             or _normalize_interface(port_key))
+                    if iface:
+                        target_ifaces.add(iface)
+            collisions: list = []
+            for iface in target_ifaces:
+                matching = self._orphans_touch_iface(orphans, iface)
+                if matching:
+                    collisions.extend(matching)
+            # Dedupe by PID to avoid showing the same orphan twice.
+            seen_pids = set()
+            uniq_collisions = []
+            for o in collisions:
+                pid = o.get("pid")
+                if pid in seen_pids:
+                    continue
+                seen_pids.add(pid)
+                uniq_collisions.append(o)
+            if not uniq_collisions:
+                continue
+            label = ", ".join(sorted(target_ifaces))
+            if not self._confirm_reap_before_start(
+                    server_url, label, uniq_collisions):
+                # Operator cancelled — drop this server from the
+                # start batch entirely so we don't half-fire.
+                cancelled_servers.add(server_url)
+                for items in per_port.values():
+                    for st, r in items:
+                        sid = st.get("stream_id")
+                        if sid:
+                            in_flight.discard(sid)
+                        if r is not None:
+                            try:
+                                self.update_stream_status(r, "red")
+                            except Exception:
+                                pass
+
+        for server_url, per_port in server_payload_map.items():
+            if server_url in cancelled_servers:
+                continue
             try:
                 payload = {"streams": {p: [s for (s, _) in items] for p, items in per_port.items()}}
                 # Debug: Log what streams are being sent
@@ -1233,9 +1286,34 @@ class TrafficGenClientStreamLogic:
                     })
                     total_running += 1
 
-            if total_running == 0:
-                QMessageBox.information(self, "Stop All", "No running streams found to stop.")
+            # v0.5.168: probe every known server for orphan
+            # tx/rx_worker processes. Even if total_running == 0 the
+            # operator may want to reap orphans (the whole point of
+            # this feature — the GUI shows 0 streams but the host is
+            # being eaten by an untracked worker).
+            unique_server_urls = {
+                str(s.get("address"))
+                for s in (getattr(self, "server_interfaces", None) or [])
+                if s.get("address")
+            }
+            unique_server_urls.update(stop_requests.keys())
+            orphans_by_server = {}
+            for srv_url in unique_server_urls:
+                orphs = self._fetch_orphans(srv_url)
+                if orphs:
+                    orphans_by_server[srv_url] = orphs
+
+            total_orphans = sum(len(v) for v in orphans_by_server.values())
+            if total_running == 0 and total_orphans == 0:
+                QMessageBox.information(
+                    self, "Stop All",
+                    "No running streams found to stop.")
                 return
+
+            if total_orphans > 0:
+                if not self._confirm_stop_with_orphans(
+                        total_running, orphans_by_server):
+                    return  # operator cancelled
 
             for server_url, items in stop_requests.items():
                 try:
@@ -1280,6 +1358,36 @@ class TrafficGenClientStreamLogic:
                         logger.error(f"[STOP-ALL] Server {server_url} failed: {resp.status_code} {resp.text[:200]}")
                 except Exception as e:
                     logger.error(f"[STOP-ALL] Could not reach {server_url}: {e}")
+
+            # v0.5.168: reap orphans on every server that had any.
+            # The confirm dialog upstream gave the operator their
+            # chance to cancel; getting here means they accepted.
+            reap_failures: list = []
+            for srv_url, orphs in orphans_by_server.items():
+                pids = [o.get("pid") for o in orphs
+                        if isinstance(o.get("pid"), int)]
+                if not pids:
+                    continue
+                result = self._reap_orphans(srv_url, pids)
+                failed = result.get("failed") or []
+                if failed:
+                    reap_failures.append((srv_url, failed))
+                logger.info(
+                    f"[ORPHANS] reaped on {srv_url}: "
+                    f"terminated={result.get('terminated', [])} "
+                    f"killed={result.get('killed', [])} "
+                    f"failed={failed}"
+                )
+            if reap_failures:
+                detail = "\n".join(
+                    f"• {srv}: PIDs {pids}"
+                    for srv, pids in reap_failures
+                )
+                QMessageBox.warning(
+                    self, "Some orphans survived",
+                    "Reap failed for these PIDs (check server log):\n\n"
+                    + detail,
+                )
 
             # Session save removed - only save on explicit user action (Save Session menu or Apply button)
 
@@ -2020,3 +2128,180 @@ class TrafficGenClientStreamLogic:
         except Exception as e:
             logger.error(f"[UPLOAD] Could not parse response JSON: {e}")
             return None
+
+    # ───────── v0.5.168 orphan worker handling ─────────
+
+    def _fetch_orphans(self, server_url: str, bdf: str = "") -> list:
+        """Return the list of orphan tx/rx_worker dicts on `server_url`.
+
+        Returns [] on any error (server unreachable, endpoint 404
+        on a pre-v0.5.168 server). The Stop-All / Start pre-flight
+        flows treat empty silently — operator only sees the confirm
+        dialog if there's actually something to surface."""
+        try:
+            qs = f"?bdf={bdf}" if bdf else ""
+            url = f"{server_url.rstrip('/')}/api/streams/orphans{qs}"
+            resp = self._get_async(url, timeout=4)
+            if not resp or not resp.ok:
+                return []
+            data = resp.json() or {}
+            return data.get("orphans", []) or []
+        except Exception as exc:
+            logger.debug(f"[ORPHANS] {server_url}: probe failed: {exc}")
+            return []
+
+    def _reap_orphans(self, server_url: str, pids: list) -> dict:
+        """SIGTERM→SIGKILL the given PIDs via the reap endpoint.
+        Returns the server's response dict or {} on failure.
+
+        Doesn't go through `_post_traffic_async` because that helper
+        hard-codes `/api/traffic/<action>`; the reap endpoint lives
+        under `/api/streams/orphans/reap`. Reuses _TrafficPostWorker
+        directly so we still get the off-UI-thread + keepalive
+        guarantees."""
+        if not pids:
+            return {}
+        url = f"{server_url.rstrip('/')}/api/streams/orphans/reap"
+        loop = QEventLoop()
+        worker = _TrafficPostWorker(url, {"pids": list(pids)}, 8)
+        worker.finished.connect(loop.quit)
+        worker.start()
+        loop.exec_()
+        worker.wait()
+        if hasattr(self, "_keepalive_worker"):
+            self._keepalive_worker(worker)
+        resp = worker.response
+        if worker.error or not resp or not resp.ok:
+            logger.warning(
+                f"[ORPHANS] reap on {server_url} failed: "
+                f"err={worker.error} "
+                f"http={getattr(resp, 'status_code', '?')}"
+            )
+            return {}
+        try:
+            return resp.json() or {}
+        except Exception as exc:
+            logger.warning(f"[ORPHANS] reap json parse: {exc}")
+            return {}
+
+    @staticmethod
+    def _orphans_touch_iface(orphans: list, iface: str) -> list:
+        """Filter `orphans` to those whose cmdline references `iface`
+        (via DPDK's --file-prefix or the literal device arg). Used by
+        the Start pre-flight to refuse against a NIC that's already
+        being hammered by an untracked worker."""
+        if not iface:
+            return []
+        tag = str(iface).strip()
+        matched = []
+        for o in orphans or []:
+            cmd = o.get("cmdline") or ""
+            fp = o.get("file_prefix") or ""
+            if tag in cmd or tag in fp:
+                matched.append(o)
+        return matched
+
+    @staticmethod
+    def _format_orphan_line(o: dict) -> str:
+        sid = o.get("stream_id") or "—"
+        bdf = o.get("bdf") or "?"
+        role = o.get("role") or "?"
+        pid = o.get("pid")
+        etime = o.get("etime_seconds")
+        elapsed = f"{etime}s" if isinstance(etime, int) else "?"
+        return (f"PID {pid} ({role}_worker)  ·  BDF {bdf}  ·  "
+                f"stream {sid[:8]}…  ·  running {elapsed}")
+
+    def _confirm_stop_with_orphans(
+        self, tracked_count: int, orphans_by_server: dict
+    ) -> bool:
+        """Modal dialog that enumerates what Stop-All will kill on
+        each server (tracked streams + orphans). Returns True iff
+        the operator accepts. With zero tracked + zero orphans this
+        is a no-op caller-side; we always have at least one.
+
+        The dialog uses StandardButton.Yes as the primary so a
+        muscle-memory Enter confirms — matches the existing
+        QMessageBox patterns elsewhere in the client."""
+        from PyQt5.QtWidgets import QMessageBox
+        total_orphans = sum(len(v) for v in orphans_by_server.values())
+        if total_orphans == 0:
+            # Nothing to confirm beyond the existing semantics —
+            # let the caller proceed without the extra modal.
+            return True
+        body = []
+        if tracked_count > 0:
+            body.append(
+                f"Stop {tracked_count} running stream"
+                f"{'s' if tracked_count != 1 else ''}."
+            )
+        body.append(
+            f"Reap {total_orphans} orphan worker"
+            f"{'s' if total_orphans != 1 else ''}:"
+        )
+        for srv, orphs in orphans_by_server.items():
+            if not orphs:
+                continue
+            body.append(f"\n• {srv}")
+            for o in orphs:
+                body.append(f"    {self._format_orphan_line(o)}")
+        body.append(
+            "\n\nOrphans are untracked tx/rx_worker processes that "
+            "outlived their stream. They eat CPU + PCIe on the "
+            "same NIC and drop other tests' throughput.\n\n"
+            "Continue?"
+        )
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Stop All Streams")
+        msg.setIcon(QMessageBox.Warning)
+        msg.setText("Stop tracked streams and reap orphans?")
+        msg.setInformativeText("\n".join(body))
+        msg.setStandardButtons(QMessageBox.Yes | QMessageBox.Cancel)
+        msg.setDefaultButton(QMessageBox.Yes)
+        return msg.exec_() == QMessageBox.Yes
+
+    def _confirm_reap_before_start(
+        self, server_url: str, iface: str, orphans: list
+    ) -> bool:
+        """Start-time pre-flight modal: an orphan worker is already
+        bound to the iface we're about to start on. Offer to reap
+        first. Returns True on accept (reap was performed), False
+        on cancel.
+
+        This is the killer feature — without it the new stream
+        spawns alongside the orphan and they fight for the HCA,
+        which is exactly the BW-drop case the operator hit."""
+        from PyQt5.QtWidgets import QMessageBox
+        lines = [self._format_orphan_line(o) for o in orphans]
+        msg = QMessageBox(self)
+        msg.setWindowTitle("Orphan worker on this interface")
+        msg.setIcon(QMessageBox.Warning)
+        msg.setText(
+            f"{len(orphans)} orphan worker"
+            f"{'s' if len(orphans) != 1 else ''} already running "
+            f"on {iface}."
+        )
+        msg.setInformativeText(
+            "\n".join(lines)
+            + "\n\nStarting a new stream against this NIC while "
+            "the orphan is alive will starve both. Reap orphans "
+            "and start the new stream?"
+        )
+        reap_btn = msg.addButton(
+            "🧹 Reap && Start", QMessageBox.AcceptRole)
+        msg.addButton(QMessageBox.Cancel)
+        msg.setDefaultButton(reap_btn)
+        msg.exec_()
+        if msg.clickedButton() is not reap_btn:
+            return False
+        pids = [o.get("pid") for o in orphans if isinstance(
+            o.get("pid"), int)]
+        result = self._reap_orphans(server_url, pids)
+        failed = result.get("failed") or []
+        if failed:
+            QMessageBox.warning(
+                self, "Reap incomplete",
+                f"Could not signal PIDs {failed}. Start may still "
+                "fight the orphan — check the server log.",
+            )
+        return True

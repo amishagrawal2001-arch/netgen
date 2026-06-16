@@ -2,6 +2,85 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.168] - 2026-06-16
+
+**Orphan tx_worker / rx_worker handling — Stop-All sweeps, Start
+pre-flight blocks collisions.**
+
+Operator hit this on srv06: a DPDK Blast stream left a tx_worker
+(897% CPU) + rx_worker (798% CPU) running after the prior GUI
+session disconnected. The orphans were pinned to the same HCA
+the operator was using for RDMA — ~17 cores on NUMA 0 + PCIe
+contention on BDF 0000:2b:00.0 — and dropped the RDMA BW from
+171 Gbps to 68.59 Gbps. The GUI's "Stop All" had no idea the
+workers were alive (untracked stream_id), so it couldn't help.
+
+### What's added
+
+* **`utils/dpdk_orphans.py`** — pure-function module. Walks
+  `/proc/*/cmdline`, classifies tx_worker / rx_worker by argv[0]
+  basename, parses `--stream-id` / `-a <BDF>` / `--file-prefix`
+  via tight regexes. `find_orphans(tracker_ids)` cross-references
+  against the active StreamTracker; `find_orphans_for_bdf(bdf)`
+  narrows to one device. `reap_workers(pids)` does
+  SIGTERM → 1 s wait → SIGKILL with detailed `{terminated,
+  killed, failed}` return.
+* **`GET /api/streams/orphans`** — returns
+  `{orphans, known_stream_ids, total_workers}`. Optional
+  `?bdf=0000:2b:00.0` query narrows to one PCI device for
+  Start-time pre-flight collision checks.
+* **`POST /api/streams/orphans/reap`** — body `{pids: [...]}`,
+  refuses empty or non-int pids with 400. Idempotent — re-reaping
+  a dead PID is a no-op. Logs every reap with PID set so
+  post-mortems are possible.
+
+### GUI changes
+
+* **Stop All Streams** now probes every registered server for
+  orphans BEFORE deciding "nothing to stop". If any are found, a
+  confirm dialog enumerates per-server:
+  > Stop 3 running streams.
+  > Reap 2 orphan workers:
+  > • http://san-hp-srv06:5050
+  >     PID 3194868 (tx_worker) · BDF 0000:2b:00.0 · stream
+  >     3ede73ca… · running 13m
+  >     PID 3194724 (rx_worker) · BDF 0000:2b:00.1 · stream
+  >     3ede73ca… · running 13m
+  >
+  > Continue?
+
+  On confirm, tracked streams are stopped + orphan PIDs are
+  reaped on each server. Any reap failures surface in a follow-up
+  warning so the operator isn't misled into thinking the host is
+  clean.
+
+* **Start Stream** now probes for orphan workers bound to the
+  target NIC before firing the start request. If a collision is
+  detected, a "🧹 Reap && Start" / "Cancel" modal asks the
+  operator. Cancel drops that server from the start batch (UI
+  flips back to red) so the new stream never spawns alongside
+  the orphan — the BW-drop case is prevented at the source.
+
+### Files touched
+
+* `utils/dpdk_orphans.py` (new)
+* `run_tgen_server.py` — two new routes
+* `traffic_client/stream_logic.py` — 6 new helpers
+  (`_fetch_orphans`, `_reap_orphans`, `_orphans_touch_iface`,
+  `_format_orphan_line`, `_confirm_stop_with_orphans`,
+  `_confirm_reap_before_start`); Stop-All + Start wiring
+* `tests/test_v05168_orphans.py` — 20 source-level + filesystem-
+  mock + real-subprocess assertions
+
+### Known limitation (separate ship, v0.5.169)
+
+Orphans still happen because tx_worker / rx_worker spawn as
+detached children — a server crash or signal loss can leak
+them. v0.5.169 will wrap each spawn in `systemd-run --scope
+--unit=netgen-tx-<stream_id>.scope` so the kernel guarantees
+lifecycle tracking (Stop always works; survives ostg-server
+restart; orphans become structurally impossible).
+
 ## [0.5.167] - 2026-06-16
 
 **Enriched + redesigned HTML session report — NIC details +
