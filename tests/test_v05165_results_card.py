@@ -59,11 +59,13 @@ def test_card_html_escapes_test_label():
 
 
 def test_card_carries_big_number_styling():
-    """Operator should see a headline-style BW figure (28px) +
-    MsgRate (18px) — that's the whole point of the card."""
+    """Operator should see a headline-style BW figure (18px) +
+    MsgRate (14px) — v0.5.166 shrunk from 28px/18px after the
+    operator complained the card wasted vertical space, but the
+    point of the card remains: BW is the visual anchor."""
     for src in (SRC_BLAST, SRC_TOPO):
-        assert "font-size:28px" in src
         assert "font-size:18px" in src
+        assert "font-size:14px" in src
 
 
 def test_topology_card_includes_pair_and_shape_context():

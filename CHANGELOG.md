@@ -2,6 +2,41 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.166] - 2026-06-16
+
+**Compact the v0.5.165 results card + status text — single-line
+layout instead of three vertical sections.**
+
+Operator screenshot: "wasting lot of space in the dialog, make
+it compact." The card was 3 stacked rows (uppercase label /
+big-number / extras) plus generous 10×14 padding; the
+"Both halves running. handshake=… server_job=… client_job=…"
+status wrapped to 3 lines.
+
+### What's compact now
+
+* **Results card** — one row: `✓ <test>  <BW> Gbps | <MsgRate>
+  Mpps  <tail>`; padding 4×8 (was 10×14); border-radius 4
+  (was 6); BW headline 18px (was 28px); MsgRate 14px (was 18px)
+* **Running status** — `Running · hs=… · sjob=… · cjob=…`
+  (was a multi-line "Both halves running. handshake=…" block)
+* **Finished status** — `Run finished — click Stop or close to
+  forget the pairing.` (was a 2-line "Both halves finished.
+  Click Stop to forget the pairing (or close this dialog).")
+
+The card still reads from the same `_run_log` entry the Export
+Report button uses; no data path changes.
+
+### Files touched
+
+* `widgets/rdma_blast_flow_dialog.py` — card stylesheet padding/
+  radius, render HTML rewritten to single inline row, running +
+  finished status strings
+* `widgets/rdma_topology_dialog.py` — same card stylesheet +
+  render HTML
+* `tests/test_v05165_results_card.py` — updated headline-font
+  test (28/18 → 18/14) to match compaction
+
 ## [0.5.165] - 2026-06-16
 
 **Post-run results summary card — headline BW + MsgRate above

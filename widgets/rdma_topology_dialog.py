@@ -606,8 +606,8 @@ class RdmaTopologyDialog(QDialog):
             "QLabel {"
             "  background: #ecfdf5;"
             "  border: 1px solid #10b981;"
-            "  border-radius: 6px;"
-            "  padding: 10px 14px;"
+            "  border-radius: 4px;"
+            "  padding: 4px 8px;"
             "  color: #064e3b;"
             "}"
         )
@@ -1769,33 +1769,31 @@ class RdmaTopologyDialog(QDialog):
         if params.get("duration_s"):
             extras.append(f"{params['duration_s']}s per run")
 
-        bullets = " &middot; ".join(extras) if extras else ""
+        # v0.5.166: single-line layout — same compaction as Blast.
+        tail_bits = [
+            escape(str(params.get('shape') or '?')),
+            escape(headline_label),
+        ]
+        tail_bits.extend(escape(b) for b in extras)
+        tail = " · ".join(tail_bits)
 
         html = (
-            f"<div style='font-size:11px; color:#065f46; "
-            f"text-transform:uppercase; letter-spacing:0.5px;'>"
-            f"✓ Topology run finished &middot; "
-            f"{escape(run.get('test') or '?')} &middot; "
-            f"{escape(str(params.get('shape') or '?'))}"
-            f"</div>"
-            f"<div style='margin-top:6px; display:flex; "
-            f"align-items:baseline; gap:18px;'>"
-            f"  <span style='font-size:28px; font-weight:700; "
+            f"<span style='font-size:11px; color:#065f46; "
+            f"font-weight:600;'>✓ "
+            f"{escape(run.get('test') or '?')}</span>"
+            f" &nbsp; "
+            f"<span style='font-size:18px; font-weight:700; "
             f"color:#064e3b;'>{bw_txt}</span>"
-            f"  <span style='font-size:13px; color:#065f46;'>Gbps "
-            f"<span style='color:#10b981;'>BW</span></span>"
-            f"  <span style='font-size:13px; color:#475569;'>"
-            f"|</span>"
-            f"  <span style='font-size:18px; font-weight:600; "
+            f"<span style='font-size:11px; color:#065f46;'>"
+            f" Gbps</span>"
+            f" &nbsp;|&nbsp; "
+            f"<span style='font-size:14px; font-weight:600; "
             f"color:#064e3b;'>{mr_txt}</span>"
-            f"  <span style='font-size:13px; color:#065f46;'>Mpps "
-            f"<span style='color:#10b981;'>MsgRate</span></span>"
-            f"</div>"
-            f"<div style='margin-top:4px; font-size:11px; "
-            f"color:#047857;'>"
-            f"{escape(headline_label)}"
-            f"{(' &middot; ' + bullets) if bullets else ''}"
-            f"</div>"
+            f"<span style='font-size:11px; color:#065f46;'>"
+            f" Mpps</span>"
+            f" &nbsp; "
+            f"<span style='font-size:11px; color:#047857;'>"
+            f"{tail}</span>"
         )
         self._results_card.setText(html)
         self._results_card.setVisible(True)
