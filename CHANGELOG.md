@@ -2,6 +2,59 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.170] - 2026-06-16
+
+**Report: PCIe Gen + NUMA + IPv4 + NIC model + line-rate
+efficiency.**
+
+Operator: "report should also capture the PCI gen used, example
+gen4/5/6..etc in the Endpoints. also check if there is anything
+else missing in the reports." This release adds the explicit
+PCIe ask plus four more high-signal fields the audit surfaced.
+
+### New endpoint columns
+
+| Column | Source | Why it matters |
+|--------|--------|----------------|
+| **Model** | board_id mapped via lookup | Operators read "ConnectX-7", not `MT_0000000838`. Mellanox MT_0000000200 → ConnectX-3 Pro through MT_0000001019 → ConnectX-8, plus Broadcom Thor/Thor2 and AMD Pollara. Falls through to `—` when unknown. |
+| **PCIe** | `/sys/bus/pci/devices/<BDF>/current_link_*` | `Gen4 x16`. When the slot trained below its cap (e.g. Gen5 slot stuck at Gen4 x16, or x16 slot stuck at x8), shows `Gen4 x16 (max Gen5 x16)` with a yellow `.pcie-warn` badge — operator-critical signal that explains BW shortfalls without an SSH session. |
+| **NUMA** | `/sys/bus/pci/devices/<BDF>/numa_node` | `node 0`. Lets operators correlate worker placement with HCA NUMA — cross-NUMA single-QP RoCE is a known perf cliff. |
+| **IPv4** | `psutil.net_if_addrs()` on the HCA's netdev(s) | `10.43.0.2/24`. Operators cross-reference IPs not GIDs. Picks the first IPv4 across all bonded netdevs. |
+
+### New headline element
+
+* **Line-rate efficiency** — appends `· 86.1% of 200 G line rate`
+  to the headline tail. The rate is the SLOWEST endpoint in the
+  pair (a 200 G ↔ 100 G run is capped at 100 G end-to-end). One
+  glance answers the operator's #1 post-run question: "did we
+  hit line rate?"
+
+### Files touched
+
+* `utils/rdma_perf.py` — RdmaDevice gains `pcie_current_speed_gts`,
+  `pcie_current_width`, `pcie_max_speed_gts`, `pcie_max_width`,
+  `pcie_gen`, `pcie_max_gen`, `pcie_downgraded`, `numa_node`,
+  `netdev_ips`. Helpers: `_read_pcie_link`, `_read_numa_node`,
+  `_read_iface_ips` (psutil-based), `_resolve_bdf_for_hca`,
+  `_parse_link_speed_gts`, `_gts_to_gen`. Flows through
+  `/api/rdma/devices` via the existing `asdict` — no route
+  change needed.
+* `utils/rdma_report.py` — endpoint table gains 4 new columns,
+  PCIe downgrade CSS badge, `_resolve_nic_model` board_id
+  mapping, `_extract_line_rate_gbps`, headline efficiency line.
+* `tests/test_v05170_pcie_numa_ip.py` — 24 source + sysfs-mock +
+  render assertions including downgrade detection and
+  slowest-endpoint line-rate cap.
+
+### Considered but not added (operator can ask)
+
+* Per-iteration timestamps (would bloat multi-iter reports).
+* perftest stderr tail on rc!=0 (not always available client-side
+  — would need a server-side capture).
+* CPU utilization column when cpu_util enabled (perftest's number
+  is a single host-level percentage, not per-core).
+* Hostname / kernel / netgen version (already in the header line).
+
 ## [0.5.169] - 2026-06-16
 
 **Orphan prevention (systemd-scope) + auto-detect status-bar chip.**

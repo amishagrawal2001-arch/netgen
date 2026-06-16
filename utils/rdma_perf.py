@@ -150,6 +150,30 @@ class RdmaDevice:
     # HTML session report so operators can tell at a glance which
     # driver stack ran the test.
     driver: Optional[str] = None
+    # v0.5.170: PCIe link state. `current_*` is what the HCA
+    # actually trained to; `max_*` is what the slot can do.
+    # `downgraded=True` when the trained link is below the slot's
+    # max — operator-critical signal (a Gen5 ConnectX-7 stuck at
+    # Gen4 x16 still works but tops out at half its theoretical
+    # bandwidth). All values are best-effort; missing sysfs nodes
+    # leave them None, and the report renders a `—`.
+    pcie_current_speed_gts: Optional[float] = None
+    pcie_current_width: Optional[int] = None
+    pcie_max_speed_gts: Optional[float] = None
+    pcie_max_width: Optional[int] = None
+    pcie_gen: Optional[int] = None           # derived: 1/2/3/4/5/6
+    pcie_max_gen: Optional[int] = None
+    pcie_downgraded: bool = False
+    # v0.5.170: NUMA node the HCA sits on. Lets the report flag
+    # cross-NUMA test placements (worker on node 0, HCA on node 1
+    # is a known perf cliff). -1 in /sys means "no NUMA info"; we
+    # surface that as None.
+    numa_node: Optional[int] = None
+    # v0.5.170: IPv4 / IPv6 addresses on each netdev bound to this
+    # HCA. Operators read IPs not GIDs when cross-referencing with
+    # `ip addr`; surfacing them in the report cuts a manual SSH.
+    # Shape: {iface_name: ["10.42.0.1/24", "fe80::5e25:73ff:fe3f:3056/64"]}
+    netdev_ips: Dict[str, List[str]] = field(default_factory=dict)
 
 
 @dataclass
@@ -269,6 +293,239 @@ def _read_driver_name(dev: str) -> Optional[str]:
         return None
     name = os.path.basename(target.rstrip("/"))
     return name or None
+
+
+# ───── v0.5.170 PCIe link + NUMA + netdev IP readers ─────────────
+
+
+_PCI_SYSFS_ROOT = "/sys/bus/pci/devices"
+
+# v0.5.170: PCIe encoded-bitrate → generation map. The kernel
+# emits speeds like "16.0 GT/s PCIe" — we parse the float and
+# look it up. Rounding tolerates the half-step values some BIOS
+# vendors emit (e.g. "5.0 GT/s" + "8.0 GT/s" can be reported as
+# "5.0 GT/s PCIe" or just "5 GT/s").
+_PCIE_GEN_TABLE = (
+    (2.5, 1),
+    (5.0, 2),
+    (8.0, 3),
+    (16.0, 4),
+    (32.0, 5),
+    (64.0, 6),
+)
+
+
+def _gts_to_gen(gts: Optional[float]) -> Optional[int]:
+    """Map a GT/s float to its PCIe generation number. Returns
+    None when the input is missing or doesn't map to a known gen
+    (future-proofing — Gen7 = 128 GT/s isn't shipping yet)."""
+    if gts is None:
+        return None
+    # Pick the highest gen whose nominal rate is <= the reported
+    # rate + a 10% tolerance. PCIe rates double per gen so the
+    # tolerance never causes collision.
+    best: Optional[int] = None
+    for rate, gen in _PCIE_GEN_TABLE:
+        if gts + 0.5 >= rate:
+            best = gen
+    return best
+
+
+def _parse_link_speed_gts(raw: Optional[str]) -> Optional[float]:
+    """Extract the GT/s number from the kernel's link-speed string.
+
+    Examples:
+      "16.0 GT/s PCIe" → 16.0
+      "8 GT/s"         → 8.0
+      "Unknown"        → None
+    """
+    if not raw:
+        return None
+    m = re.search(r"([0-9]+(?:\.[0-9]+)?)\s*GT/s", raw, re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        return float(m.group(1))
+    except ValueError:
+        return None
+
+
+def _read_pcie_link(
+    bdf: str,
+    *,
+    pci_root: str = _PCI_SYSFS_ROOT,
+) -> Dict[str, Any]:
+    """v0.5.170: read PCIe link state from sysfs.
+
+    Returns a dict with current/max speed+width+gen and a
+    `downgraded` flag. All keys may be None if sysfs doesn't
+    expose them (containerised /sys with /bus/pci stripped, or
+    virtualised devices where the kernel can't see the slot).
+
+    The `downgraded` flag is critical operator signal: a Gen5
+    ConnectX-7 stuck at Gen4 x16 still trains and works, but
+    runs at half its theoretical BW. The report shows this with
+    a red badge so the operator doesn't waste time wondering why
+    they didn't hit line rate."""
+    out: Dict[str, Any] = {
+        "current_speed_gts": None,
+        "current_width": None,
+        "max_speed_gts": None,
+        "max_width": None,
+        "gen": None,
+        "max_gen": None,
+        "downgraded": False,
+    }
+    base = os.path.join(pci_root, bdf)
+    if not os.path.isdir(base):
+        return out
+    out["current_speed_gts"] = _parse_link_speed_gts(
+        _read_sysfs(os.path.join(base, "current_link_speed")))
+    out["max_speed_gts"] = _parse_link_speed_gts(
+        _read_sysfs(os.path.join(base, "max_link_speed")))
+    cw = _read_sysfs(os.path.join(base, "current_link_width"))
+    mw = _read_sysfs(os.path.join(base, "max_link_width"))
+    try:
+        out["current_width"] = int(cw) if cw else None
+    except ValueError:
+        out["current_width"] = None
+    try:
+        out["max_width"] = int(mw) if mw else None
+    except ValueError:
+        out["max_width"] = None
+    out["gen"] = _gts_to_gen(out["current_speed_gts"])
+    out["max_gen"] = _gts_to_gen(out["max_speed_gts"])
+    # Downgraded when EITHER speed OR width is below the cap.
+    # Both must be known to claim downgrade — unknown values
+    # default to False rather than crying wolf.
+    if (out["gen"] is not None and out["max_gen"] is not None
+            and out["gen"] < out["max_gen"]):
+        out["downgraded"] = True
+    if (out["current_width"] is not None
+            and out["max_width"] is not None
+            and out["current_width"] < out["max_width"]):
+        out["downgraded"] = True
+    return out
+
+
+def _read_numa_node(
+    bdf: str,
+    *,
+    pci_root: str = _PCI_SYSFS_ROOT,
+) -> Optional[int]:
+    """Return the NUMA node the PCI device sits on. -1 in sysfs
+    (no NUMA topology, or single-socket box) becomes None — the
+    report renders that as `—`."""
+    raw = _read_sysfs(os.path.join(pci_root, bdf, "numa_node"))
+    if not raw:
+        return None
+    try:
+        node = int(raw)
+        return node if node >= 0 else None
+    except ValueError:
+        return None
+
+
+def _read_iface_ips(ifaces: List[str]) -> Dict[str, List[str]]:
+    """Return `{iface: [ip/prefix, ...]}` for each iface bound to
+    an HCA. IPv4 + IPv6 in the same list — operators want both.
+
+    Uses psutil if available (deterministic, no subprocess).
+    Falls back to an empty dict if psutil isn't there or the
+    iface isn't in the host's net stack. Never raises."""
+    out: Dict[str, List[str]] = {}
+    if not ifaces:
+        return out
+    try:
+        import psutil
+        import socket
+    except ImportError:
+        return out
+    try:
+        all_addrs = psutil.net_if_addrs()
+    except Exception as exc:
+        logger.debug(f"[rdma] psutil.net_if_addrs failed: {exc}")
+        return out
+    for iface in ifaces:
+        addrs = all_addrs.get(iface, [])
+        ip_list: List[str] = []
+        for a in addrs:
+            fam = getattr(a, "family", None)
+            ip = getattr(a, "address", None)
+            mask = getattr(a, "netmask", None)
+            if fam == socket.AF_INET and ip:
+                # IPv4 mask is dotted; convert to prefix length.
+                prefix = _ipv4_mask_to_prefix(mask)
+                ip_list.append(
+                    f"{ip}/{prefix}" if prefix is not None else ip)
+            elif fam == socket.AF_INET6 and ip:
+                # Strip the scope-id suffix (`%iface`) — operators
+                # don't need it.
+                ip6 = ip.split("%", 1)[0]
+                prefix = _ipv6_mask_to_prefix(mask)
+                ip_list.append(
+                    f"{ip6}/{prefix}" if prefix is not None else ip6)
+        if ip_list:
+            out[iface] = ip_list
+    return out
+
+
+def _ipv4_mask_to_prefix(mask: Optional[str]) -> Optional[int]:
+    """Dotted IPv4 netmask → prefix length. Returns None on
+    malformed input (None / empty / non-dotted)."""
+    if not mask or "." not in mask:
+        return None
+    try:
+        octets = [int(o) for o in mask.split(".")]
+        if len(octets) != 4:
+            return None
+        bits = 0
+        for o in octets:
+            if not 0 <= o <= 255:
+                return None
+            bits += bin(o).count("1")
+        return bits
+    except ValueError:
+        return None
+
+
+def _ipv6_mask_to_prefix(mask: Optional[str]) -> Optional[int]:
+    """psutil emits IPv6 netmask as `ffff:ffff:ffff:ffff::` —
+    count the 1-bits across the 8 hextets. None on bad input."""
+    if not mask or ":" not in mask:
+        return None
+    try:
+        bits = 0
+        for hx in mask.split(":"):
+            if not hx:
+                continue
+            v = int(hx, 16)
+            if not 0 <= v <= 0xFFFF:
+                return None
+            bits += bin(v).count("1")
+        return bits
+    except ValueError:
+        return None
+
+
+def _resolve_bdf_for_hca(dev: str) -> Optional[str]:
+    """Resolve the canonical PCI BDF for an HCA name by reading
+    `/sys/class/infiniband/<dev>/device` (symlink whose target's
+    basename is the BDF, e.g. `0000:2b:00.0`).
+
+    Used to plumb sysfs/pci lookups (link speed, NUMA, ifaddrs)
+    from the HCA-side enumerator into the PCI-side helpers."""
+    link = os.path.join(_IB_SYSFS_ROOT, dev, "device")
+    try:
+        target = os.readlink(link)
+    except OSError:
+        return None
+    bdf = os.path.basename(target.rstrip("/"))
+    if not re.fullmatch(
+            r"[0-9a-f]{4}:[0-9a-f]{2}:[0-9a-f]{2}\.[0-7]",
+            bdf, re.IGNORECASE):
+        return None
+    return bdf.lower()
 
 
 def _list_port_gids(dev: str, port: int) -> List[str]:
@@ -514,8 +771,33 @@ def list_rdma_devices() -> List[RdmaDevice]:
             max_sge=caps.get("max_sge"),
             net_ifaces=net_ifaces,
             driver=_read_driver_name(dev),
+            # v0.5.170: PCIe / NUMA / netdev IPs. Resolved via the
+            # BDF symlink — bail gracefully when sysfs is partial.
+            **_collect_pcie_numa_ips(dev, net_ifaces),
         ))
     return devices
+
+
+def _collect_pcie_numa_ips(
+    dev: str, net_ifaces: List[str],
+) -> Dict[str, Any]:
+    """v0.5.170: bundle the new PCIe/NUMA/netdev_ips reads so the
+    list_rdma_devices call site stays readable."""
+    bdf = _resolve_bdf_for_hca(dev)
+    if not bdf:
+        return {"netdev_ips": _read_iface_ips(net_ifaces)}
+    pcie = _read_pcie_link(bdf)
+    return {
+        "pcie_current_speed_gts": pcie["current_speed_gts"],
+        "pcie_current_width": pcie["current_width"],
+        "pcie_max_speed_gts": pcie["max_speed_gts"],
+        "pcie_max_width": pcie["max_width"],
+        "pcie_gen": pcie["gen"],
+        "pcie_max_gen": pcie["max_gen"],
+        "pcie_downgraded": pcie["downgraded"],
+        "numa_node": _read_numa_node(bdf),
+        "netdev_ips": _read_iface_ips(net_ifaces),
+    }
 
 
 # ─────────────────────────────────────────────────────────── perftest probe

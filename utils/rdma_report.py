@@ -49,6 +49,7 @@ Operators can email / archive the file as-is.
 """
 from __future__ import annotations
 
+import re
 from html import escape
 from typing import Any, Dict, List, Optional
 
@@ -234,6 +235,15 @@ def _render_head(title: str) -> str:
         .badge-state.up { background: #d1fae5; color: var(--ok); }
         .badge-state.down { background: #fee2e2; color: var(--err); }
         .badge-state.init { background: #fef3c7; color: var(--warn); }
+        /* v0.5.170: PCIe downgrade warning — operator-critical
+           signal. Yellow background draws the eye without
+           screaming red (the link is working, just not at full
+           capability). */
+        .pcie-warn {
+          background: #fef3c7;
+          color: var(--warn);
+          font-weight: 600;
+        }
         footer { color: var(--muted); font-size: 11px; margin-top: 32px;
           padding-top: 12px; border-top: 1px solid var(--line);
         }
@@ -296,11 +306,43 @@ def _render_run_section(idx: int, run: Dict[str, Any]) -> str:
     )
 
 
+_RATE_RE = re.compile(r"([0-9]+(?:\.[0-9]+)?)\s*Gb/sec",
+                       re.IGNORECASE)
+
+
+def _extract_line_rate_gbps(run: Dict[str, Any]) -> Optional[float]:
+    """v0.5.170: pull a line-rate number from the endpoint details
+    so we can show `BW / line-rate %` in the headline. Uses the
+    SLOWEST endpoint as the cap — a 200 G ↔ 100 G run is capped
+    at 100 G end-to-end. Returns None when we can't parse any
+    endpoint's rate (legacy run_log entries without details)."""
+    details = run.get("endpoint_details") or []
+    rates: List[float] = []
+    for d in details:
+        dev = d.get("device") or {}
+        ports = dev.get("ports") or []
+        for p in ports:
+            r = (p.get("rate") or "")
+            m = _RATE_RE.search(r)
+            if m:
+                try:
+                    rates.append(float(m.group(1)))
+                    break
+                except ValueError:
+                    pass
+    return min(rates) if rates else None
+
+
 def _render_headline(run: Dict[str, Any]) -> str:
     """v0.5.167: key-result callout at the top of the run card.
     Pulls the headline BW + MsgRate from `summary` (or the lone
     `rows` entry for one-shot runs). Mirrors the dialog's post-run
-    card so the export carries the same first-glance number."""
+    card so the export carries the same first-glance number.
+
+    v0.5.170: appends `· X% of N G` line-rate efficiency when the
+    endpoint table can supply a rate. Lets operators tell at a
+    glance whether the test hit line rate (>90% = good).
+    """
     summary = run.get("summary") or {}
     rows = run.get("rows") or []
     if (isinstance(summary.get("bw_avg_gbps"), (int, float))
@@ -330,6 +372,13 @@ def _render_headline(run: Dict[str, Any]) -> str:
             f"min {summary['bw_min_gbps']:.2f} / "
             f"max {summary['bw_max_gbps']:.2f} Gbps"
         )
+    # v0.5.170: line-rate efficiency. Operators ask this every
+    # run: "did we hit line rate?" Show the % up front.
+    line_rate = _extract_line_rate_gbps(run)
+    if isinstance(bw, float) and line_rate and line_rate > 0:
+        pct = (bw / line_rate) * 100.0
+        extras.append(
+            f"{pct:.1f}% of {line_rate:g} G line rate")
     tail_html = escape(tail)
     if extras:
         tail_html += " &middot; " + " &middot; ".join(escape(b) for b in extras)
@@ -377,9 +426,98 @@ def _format_param_value(key: str, value: Any) -> str:
 
 
 _ENDPOINT_HEADERS = (
-    "Side", "TG", "HCA", "Link", "Rate", "MTU", "State",
-    "NetDev", "Driver", "Vendor", "FW", "GID",
+    "Side", "TG", "HCA", "Model", "Link", "Rate", "MTU", "State",
+    "PCIe", "NUMA", "NetDev", "IPv4", "Driver", "Vendor", "FW",
+    "GID",
 )
+
+
+# v0.5.170: Mellanox board_id → friendly product name. Operators
+# read "ConnectX-7" not "MT_0000000838". Mirrors the mapping the
+# admin console uses (v0.5.73). Falls through to the raw board_id
+# when unknown — adding a missing prefix later is a one-line
+# diff. The mapping is *prefix*-based; revisions append digits
+# but the first 4-6 hex digits identify the product family.
+_BOARD_ID_TO_MODEL = {
+    "MT_0000000200": "ConnectX-3 Pro",
+    "MT_0000000418": "ConnectX-5",
+    "MT_0000000414": "ConnectX-5",
+    "MT_0000000437": "ConnectX-6",
+    "MT_0000000591": "ConnectX-6 Dx",
+    "MT_0000000610": "ConnectX-6 Lx",
+    "MT_0000000838": "ConnectX-7",
+    "MT_0000000883": "ConnectX-7",
+    "MT_0000001019": "ConnectX-8",
+    # Broadcom (Thor / Thor2)
+    "BCM5755X": "BCM Thor",
+    "BCM5760X": "BCM Thor2",
+    # AMD Pollara
+    "ATI0001":   "Pollara 400",
+}
+
+
+def _resolve_nic_model(vendor: Optional[str]) -> str:
+    """Return a friendly product name for the HCA, or `—` when we
+    don't recognise the board_id. The mapping is prefix-based so
+    future revisions of an existing product still match."""
+    if not vendor:
+        return "—"
+    v = str(vendor).strip().upper()
+    # Exact match first.
+    if v in _BOARD_ID_TO_MODEL:
+        return _BOARD_ID_TO_MODEL[v]
+    # Prefix match — board_ids sometimes append a revision suffix.
+    for key, model in _BOARD_ID_TO_MODEL.items():
+        if v.startswith(key):
+            return model
+    return "—"
+
+
+def _format_pcie_cell(dev: Dict[str, Any]) -> str:
+    """`Gen4 x16` or `Gen4 x16 (max Gen5 x16)` when downgraded.
+    `—` when the HCA didn't report PCIe info."""
+    gen = dev.get("pcie_gen")
+    width = dev.get("pcie_current_width")
+    if not gen and not width:
+        return "—"
+    cur = f"Gen{gen}" if gen else "Gen?"
+    if width:
+        cur += f" x{width}"
+    if dev.get("pcie_downgraded"):
+        max_gen = dev.get("pcie_max_gen")
+        max_w = dev.get("pcie_max_width")
+        cap_bits = []
+        if max_gen:
+            cap_bits.append(f"Gen{max_gen}")
+        if max_w:
+            cap_bits.append(f"x{max_w}")
+        if cap_bits:
+            cur += f" (max {' '.join(cap_bits)})"
+    return cur
+
+
+def _format_pcie_badge_class(dev: Dict[str, Any]) -> str:
+    """CSS class for the PCIe cell — `pcie-warn` when downgraded
+    so the operator's eye snaps to it."""
+    return "pcie-warn" if dev.get("pcie_downgraded") else ""
+
+
+def _format_ipv4_cell(dev: Dict[str, Any]) -> str:
+    """Pick the first IPv4 across the HCA's netdevs. Most HCAs
+    expose one netdev; bonded HCAs expose multiple — we show
+    only the first to keep the column narrow. The remaining IPs
+    are still in the JSON payload for power users."""
+    ips_by_iface = dev.get("netdev_ips") or {}
+    for iface, ip_list in ips_by_iface.items():
+        for ip in ip_list:
+            if "." in ip.split("/", 1)[0]:
+                return ip
+    return "—"
+
+
+def _format_numa_cell(dev: Dict[str, Any]) -> str:
+    n = dev.get("numa_node")
+    return f"node {n}" if isinstance(n, int) else "—"
 
 
 def _render_endpoints(
@@ -454,6 +592,12 @@ def _render_endpoint_row(d: Dict[str, Any]) -> str:
     vendor = dev.get("vendor") or "—"
     fw = dev.get("fw_version") or "—"
     gid = _first_gid(port)
+    # v0.5.170 new cells
+    model = _resolve_nic_model(vendor)
+    pcie = _format_pcie_cell(dev)
+    pcie_cls = _format_pcie_badge_class(dev)
+    numa = _format_numa_cell(dev)
+    ipv4 = _format_ipv4_cell(dev)
     link_html = (
         f"<span class='badge-link'>{escape(link)}</span>"
         if link not in ("—", "Unknown") else escape(link)
@@ -463,11 +607,15 @@ def _render_endpoint_row(d: Dict[str, Any]) -> str:
         f"<td class='{side_css}'>{escape(side_disp)}</td>"
         f"<td class='dim'>{escape(str(tg))}</td>"
         f"<td class='code'>{escape(str(hca))}</td>"
+        f"<td>{escape(model)}</td>"
         f"<td>{link_html}</td>"
         f"<td class='code'>{escape(rate)}</td>"
         f"<td class='code'>{escape(mtu_txt)}</td>"
         f"<td>{state_html}</td>"
+        f"<td class='code {pcie_cls}'>{escape(pcie)}</td>"
+        f"<td class='code'>{escape(numa)}</td>"
         f"<td class='code'>{escape(net)}</td>"
+        f"<td class='code'>{escape(ipv4)}</td>"
         f"<td class='code'>{escape(driver)}</td>"
         f"<td class='code'>{escape(vendor)}</td>"
         f"<td class='code'>{escape(fw)}</td>"
