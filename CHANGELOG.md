@@ -2,6 +2,76 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.171] - 2026-06-16
+
+**Admin portal: one-click HTML report export.**
+
+Operator: "also allow user to generate report for admin portal
+http://san-hp-srv06:5050/admin"
+
+The admin page already had **Export Diagnostics** for a tar.gz
+of raw artefacts (lspci, ethtool, journal slices) — meant for
+engineering deep-dives. v0.5.171 adds a sibling **📄 Export
+Report** button for a human-readable HTML snapshot of the
+admin-portal state, designed for incident triage, sharing, and
+archival.
+
+### What's in the report
+
+* **Header** — hostname, server port, netgen version, generated_at
+* **Server health** — DPDK installed? IOMMU enabled? vfio-pci /
+  vfio_iommu_type1 loaded? tx_worker binary present? Install
+  running? Each row has a green-OK / red-MISSING pill.
+* **CLI tools present** — `ip`, `ethtool`, `lldpcli`, `lspci`,
+  `ibv_devinfo`, `perftest`, `dpdk-devbind`. Same pill scheme.
+* **Hugepages** — per-NUMA total / free / page size.
+* **Network interfaces** — iface, driver, MAC, IPv4, speed, MTU,
+  link state (UP/DOWN/UNKNOWN badge), NUMA, PCIe (Gen4 x16 with
+  yellow `pcie-warn` badge when downgraded), NIC model.
+* **RDMA HCAs** — HCA, model, driver, vendor, FW, link layer,
+  link rate, MTU, port state, NUMA, PCIe, netdevs, IPv4, GID.
+* **DPDK bind history** — last 40 bind/unbind events with
+  timestamp + from/to driver.
+* **🧟 Orphan workers** — rendered only when any exist; PID,
+  role, stream-id, BDF, elapsed time, cmdline. Cross-references
+  v0.5.168/169's orphan handling.
+
+### Files touched
+
+* `utils/admin_report.py` (new) — pure-function
+  `build_admin_report_html(snapshot, generated_at,
+  server_version)`. Section-per-helper structure mirrors
+  `utils/rdma_report.py`. Self-contained CSS (inline `<style>`
+  block), no external assets. Reuses `_resolve_nic_model` from
+  the RDMA report for the board_id → product-name mapping.
+* `run_tgen_server.py`:
+  * `GET /api/admin/report.html` route — uses Flask
+    `test_client()` to fan-fetch `/api/admin/health`,
+    `/api/interfaces`, `/api/rdma/devices`,
+    `/api/admin/bind_history`, `/api/streams/orphans`. Merges
+    into one snapshot and hands to the renderer. Returns the
+    HTML as `text/html` with a `Content-Disposition: attachment`
+    header so the browser downloads it instead of rendering
+    inline. Filename: `netgen-admin-report-<hostname>-<ts>.html`.
+  * Admin page (`_ADMIN_HTML`): adds `📄 Export Report` button
+    next to `Export Diagnostics`, plus a click handler that
+    fetches the endpoint, pulls the filename from
+    `Content-Disposition`, and triggers a browser download via
+    `URL.createObjectURL` + `<a>.download`.
+* `tests/test_v05171_admin_report.py` — 19 assertions covering
+  full + empty snapshots, per-section content, HTML escape,
+  route source-level checks, and admin-page wiring.
+
+### Why a separate endpoint from `/api/admin/diag_bundle`?
+
+* `diag_bundle` = tar.gz of raw artefacts (lspci, ethtool dumps,
+  journal slices, /proc snapshots). Optimised for engineering
+  deep-dives — operators forward to support tickets.
+* `report.html` = human-readable HTML rendered for a quick scan.
+  Mirrors the RDMA session report's design vocabulary.
+
+Both stay — one click per intent.
+
 ## [0.5.170] - 2026-06-16
 
 **Report: PCIe Gen + NUMA + IPv4 + NIC model + line-rate

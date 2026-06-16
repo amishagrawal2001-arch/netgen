@@ -16406,6 +16406,93 @@ def admin_journal():
         return jsonify({"error": str(_e), "lines": []}), 500
 
 
+@app.route("/api/admin/report.html", methods=["GET"])
+@require_role("viewer")  # same surface as /admin and diag_bundle
+def admin_report_html():
+    """v0.5.171: render a self-contained HTML report of the admin
+    portal state. One-click "Export Report" companion to the
+    diag_bundle endpoint.
+
+    diag_bundle = tar.gz of raw artefacts (lspci, ethtool dumps,
+    journal slices) for engineering deep-dives.
+    This endpoint = human-readable rendered HTML for incident
+    triage, sharing, archival.
+
+    Internally fans /api/admin/health + /api/interfaces +
+    /api/rdma/devices + /api/admin/bind_history + /api/streams/
+    orphans via Flask test_client (no HTTP round-trip to
+    localhost). The merged snapshot is passed to
+    `utils/admin_report.build_admin_report_html`."""
+    from datetime import datetime, timezone
+    from flask import Response
+
+    try:
+        from utils.admin_report import build_admin_report_html
+    except Exception as exc:
+        return jsonify({"error": f"admin_report import failed: {exc}"}), 500
+
+    # In-process API fetcher — same pattern as diag_bundle. Each
+    # GET runs through the same Flask routing + auth + serialisers
+    # as a real request.
+    client = app.test_client()
+
+    def _get_json(path: str, default):
+        try:
+            r = client.get(path)
+            if r.status_code != 200:
+                return default
+            return r.get_json(force=True) or default
+        except Exception as exc:
+            logger.debug(f"[admin-report] {path}: {exc}")
+            return default
+
+    health = _get_json("/api/admin/health", {})
+    interfaces = (_get_json("/api/interfaces", {}) or {}
+                  ).get("interfaces", [])
+    rdma_devices = (_get_json("/api/rdma/devices", {}) or {}
+                    ).get("devices", [])
+    bind_history = (_get_json("/api/admin/bind_history", {}) or {}
+                    ).get("history", [])
+    orphans = (_get_json("/api/streams/orphans", {}) or {}
+               ).get("orphans", [])
+
+    snapshot = {
+        "health": health,
+        "interfaces": interfaces,
+        "rdma_devices": rdma_devices,
+        "bind_history": bind_history,
+        "orphans": orphans,
+    }
+
+    # Best-effort server version — read from pyproject.toml that
+    # gets bundled with the wheel.
+    server_version = None
+    try:
+        from importlib.metadata import version as _v
+        server_version = _v("ostg-trafficgen")
+    except Exception:
+        pass
+
+    generated_at = datetime.now(timezone.utc).strftime(
+        "%Y-%m-%d %H:%M:%S UTC")
+    html = build_admin_report_html(
+        snapshot=snapshot,
+        generated_at=generated_at,
+        server_version=server_version,
+    )
+    host = (health.get("hostname") or "netgen").replace(".", "-")
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    fname = f"netgen-admin-report-{host}-{ts}.html"
+    return Response(
+        html,
+        status=200,
+        mimetype="text/html",
+        headers={
+            "Content-Disposition": f'attachment; filename="{fname}"',
+        },
+    )
+
+
 @app.route("/api/admin/diag_bundle", methods=["GET"])
 @require_role("viewer")  # contains lspci + ifaces + journal — same
                          # surface as /api/admin/journal (viewer ok)
@@ -20403,6 +20490,7 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       </p>
       <div class="actions">
         <button id="btn-diag-bundle">⬇ Export Diagnostics</button>
+        <button id="btn-export-report">📄 Export Report</button>
       </div>
       <div id="diag-status" style="color: var(--muted); font-size: 11px; margin-top: 8px;"></div>
     </div>
@@ -21151,6 +21239,45 @@ _ADMIN_HTML = r"""<!DOCTYPE html>
       } catch (e) {
         status.textContent = '⚠ Failed: ' + e.message;
         toast('Diag bundle failed: ' + e.message);
+      } finally {
+        btn.disabled = false;
+        btn.textContent = oldText;
+      }
+    });
+
+    // v0.5.171: human-readable HTML report companion to the
+    // tar.gz diag bundle. Same download mechanics — pull blob
+    // out of fetch, create object URL, trigger anchor click.
+    $('btn-export-report').addEventListener('click', async () => {
+      const btn = $('btn-export-report');
+      const status = $('diag-status');
+      btn.disabled = true;
+      const oldText = btn.textContent;
+      btn.textContent = 'Building report…';
+      status.textContent = 'Rendering current admin-portal state';
+      try {
+        const r = await fetch('/api/admin/report.html');
+        if (!r.ok) {
+          let msg = r.statusText;
+          try { const j = await r.json(); msg = j.error || msg; } catch (_) {}
+          throw new Error(msg);
+        }
+        const blob = await r.blob();
+        let fname = 'netgen-admin-report.html';
+        const cd = r.headers.get('Content-Disposition') || '';
+        const m = cd.match(/filename="?([^"]+)"?/);
+        if (m) fname = m[1];
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url; a.download = fname;
+        document.body.appendChild(a); a.click(); a.remove();
+        URL.revokeObjectURL(url);
+        const sizeKB = Math.round(blob.size / 1024);
+        status.textContent = `✓ Downloaded ${fname} (${sizeKB} KB)`;
+        toast(`Admin report: ${fname} (${sizeKB} KB)`);
+      } catch (e) {
+        status.textContent = '⚠ Failed: ' + e.message;
+        toast('Report export failed: ' + e.message);
       } finally {
         btn.disabled = false;
         btn.textContent = oldText;
