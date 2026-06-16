@@ -142,6 +142,14 @@ class RdmaDevice:
     # missing (kernel without netdev binding, or containerised
     # /sys mount with /device stripped).
     net_ifaces: List[str] = field(default_factory=list)
+    # v0.5.167: kernel driver name (e.g. "mlx5_core", "irdma",
+    # "bnxt_re"). Resolved by readlink of
+    # `/sys/class/infiniband/<name>/device/driver`. None when the
+    # symlink is missing (containerised /sys with /device stripped,
+    # or built-in driver without a bus tie-in). Surfaced in the
+    # HTML session report so operators can tell at a glance which
+    # driver stack ran the test.
+    driver: Optional[str] = None
 
 
 @dataclass
@@ -240,6 +248,27 @@ def _list_net_ifaces(dev: str) -> List[str]:
         return []
     # Filter out hidden entries (none expected here, but defensive).
     return [n for n in names if not n.startswith(".")]
+
+
+def _read_driver_name(dev: str) -> Optional[str]:
+    """v0.5.167: return the kernel driver bound to an RDMA HCA.
+
+    `/sys/class/infiniband/<dev>/device/driver` is a symlink whose
+    basename is the driver module name (mlx5_core, irdma, bnxt_re,
+    qedr, hns_roce, …). Surfaced in the session report so operators
+    can tell the driver stack at a glance.
+
+    Returns None when the symlink is missing — happens in containers
+    with a stripped /device subtree, and for the handful of HCAs that
+    expose to /sys/class/infiniband without a /sys/bus tie-in.
+    """
+    link = os.path.join(_IB_SYSFS_ROOT, dev, "device", "driver")
+    try:
+        target = os.readlink(link)
+    except OSError:
+        return None
+    name = os.path.basename(target.rstrip("/"))
+    return name or None
 
 
 def _list_port_gids(dev: str, port: int) -> List[str]:
@@ -484,6 +513,7 @@ def list_rdma_devices() -> List[RdmaDevice]:
             max_pd=caps.get("max_pd"),
             max_sge=caps.get("max_sge"),
             net_ifaces=net_ifaces,
+            driver=_read_driver_name(dev),
         ))
     return devices
 

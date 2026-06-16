@@ -2,6 +2,64 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.167] - 2026-06-16
+
+**Enriched + redesigned HTML session report — NIC details +
+visibility pass.**
+
+Operator: "also add more details in the report, example NIC
+type, BW, driver,... etc. and also improve the visibility of
+report." The v0.5.163 report had two problems: (1) almost no
+device detail beyond `TG 0 rocep43s0f0`, and (2) the
+`<dl class='params'>` grid with `auto-fill` columns spread `<dt>`
+and `<dd>` as independent cells, interleaving labels and values.
+
+### What's new
+
+* **Endpoint detail table** — per-side row showing HCA, link
+  layer (Ethernet / IB), link rate (e.g. `200 Gb/sec`), active
+  MTU, port state badge, kernel netdev names, driver, board
+  vendor, FW version, and the first GID.
+* **`RdmaDevice.driver`** — read from
+  `/sys/class/infiniband/X/device/driver` symlink and surfaced
+  via `/api/rdma/devices` so the GUI gets it for free.
+* **Device payload cache** in both dialogs:
+  * Blast: `_device_payloads[side][hca]` populated from each
+    `/api/rdma/devices` response.
+  * Topology: `_endpoint_device_cache[tg_url][hca]` populated by
+    a lazy prefetch on Start (one probe per unique TG, runs in
+    parallel with perftest).
+* **Run-log entry** gains an `endpoint_details` list with the
+  rich per-side device dump.
+
+### Visibility pass
+
+* Param table now uses paired `<tr>` rows (not the buggy grid).
+* Human labels + units — `Message size` 65536 B, `Duration` 30 s.
+* bool fields render as `yes` / `no` instead of `True` / `False`.
+* Key-result callout at the top of each run card — mirrors the
+  in-app post-run summary card (28px BW + MsgRate headline).
+* Run card gets a left accent stripe — clear visual divider in
+  multi-run reports.
+* Zebra-stripe endpoint + result tables.
+* Color-coded port-state badge (ACTIVE / INIT / DOWN).
+* Self-contained footer.
+
+### Files touched
+
+* `utils/rdma_perf.py` — `RdmaDevice.driver` field +
+  `_read_driver_name()` sysfs helper.
+* `utils/rdma_report.py` — full rewrite (CSS + render path).
+* `widgets/rdma_blast_flow_dialog.py` — `_device_payloads` cache
+  + `endpoint_details` in run-log entries.
+* `widgets/rdma_topology_dialog.py` — `_endpoint_device_cache`
+  + `_prefetch_endpoint_devices` + `endpoint_details` (deduped
+  by side+tg+hca across pairs).
+* `tests/test_v05167_report_details.py` — 14 source-level +
+  filesystem-mock assertions.
+* `tests/test_v05163_html_report.py` — updated to match the new
+  `Message size` label (was `msg_size`).
+
 ## [0.5.166] - 2026-06-16
 
 **Compact the v0.5.165 results card + status text — single-line

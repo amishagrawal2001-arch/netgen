@@ -60,8 +60,9 @@ def test_bw_run_renders_summary_and_rows():
     # Per-run shape.
     assert "Run #1" in html
     assert "ib_send_bw" in html
-    # Params rendered.
-    assert "msg_size" in html
+    # Params rendered (v0.5.167 swapped raw keys for human labels —
+    # operators read "Message size" not "msg_size" in the report).
+    assert "Message size" in html
     assert "65536" in html
     # Rows + numeric BW.
     assert "171.21" in html

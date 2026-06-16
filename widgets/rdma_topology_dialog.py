@@ -175,6 +175,11 @@ class RdmaTopologyDialog(QDialog):
         # v0.5.150: per-TG state_ids from any pre-flight Apply.
         # Cleaned up on dialog close.
         self._preflight_state_ids: Dict[str, set] = {}
+        # v0.5.167: cache of /api/rdma/devices payloads keyed by
+        # (tg_url, hca name). Populated lazily on Start so the HTML
+        # session report can attach NIC type / driver / link rate /
+        # MTU / FW / GIDs to each endpoint without re-probing.
+        self._endpoint_device_cache: Dict[str, Dict[str, Dict[str, Any]]] = {}
 
         self._build_ui()
 
@@ -1089,6 +1094,10 @@ class RdmaTopologyDialog(QDialog):
         # v0.5.165: hide the previous run's results card so the
         # operator doesn't confuse the old summary with this run.
         self._results_card.setVisible(False)
+        # v0.5.167: prefetch /api/rdma/devices for each unique TG in
+        # the plans so the post-run HTML report can attach rich
+        # endpoint details.
+        self._prefetch_endpoint_devices(plans)
         self._start_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
         self._run_one_iteration()
@@ -1703,16 +1712,77 @@ class RdmaTopologyDialog(QDialog):
                 "msgrate_avg_mpps":
                     (sum(mrs) / len(mrs)) if mrs else None,
             }
+        # v0.5.167: rich per-endpoint details (NIC type, driver,
+        # link rate, MTU, FW, GIDs). Dedup by (tg_url, hca) so the
+        # report doesn't show the same HCA twice when N pairs share
+        # an endpoint.
+        endpoint_details: List[Dict[str, Any]] = []
+        seen: set = set()
+        for p in (self._plans or []):
+            for side, ep in (("server", p.server), ("client", p.client)):
+                if not ep:
+                    continue
+                key = (side, ep.tg_url, ep.hca)
+                if key in seen:
+                    continue
+                seen.add(key)
+                payload = (self._endpoint_device_cache
+                           .get(ep.tg_url, {})
+                           .get(ep.hca))
+                endpoint_details.append({
+                    "side": side,
+                    "tg": ep.tg_url,
+                    "hca": ep.hca,
+                    "device": payload,
+                    "pair_index": p.pair_index,
+                })
         entry = {
             "kind": "topology",
             "started_at": _dt.datetime.now().isoformat(timespec="seconds"),
             "test": self._test_combo.currentData(),
             "params": params,
             "endpoints": {"pairs": pairs},
+            "endpoint_details": endpoint_details,
             "rows": rows,
             "summary": summary,
         }
         self._run_log.append(entry)
+
+    # ───────── v0.5.167 endpoint device prefetch
+
+    def _prefetch_endpoint_devices(
+        self, plans: List[RdmaPairPlan]
+    ) -> None:
+        """Fire /api/rdma/devices for each unique tg_url in plans so
+        `_append_run_log_entry` can attach NIC type / driver / link
+        rate / MTU / FW / GIDs to every endpoint in the HTML report.
+
+        Async + lazy by design: a perftest run takes ~30 sec, the
+        probe responds in ~50 ms, so the cache is always warm by
+        the time the run-log entry assembles. If a probe fails the
+        report degrades gracefully — the endpoint shows tg+hca only,
+        no device block."""
+        from widgets.rdma_blast_flow_dialog import _get_async
+        urls: set = set()
+        for p in plans:
+            for ep in (p.server, p.client):
+                if ep and ep.tg_url:
+                    urls.add(ep.tg_url)
+
+        def _on_done(data, err, _url):
+            if err or not data:
+                return
+            self._endpoint_device_cache[_url] = {
+                (d.get("name") or "?"): d
+                for d in (data.get("devices") or [])
+            }
+
+        for url in urls:
+            _get_async(
+                self, f"{url.rstrip('/')}/api/rdma/devices",
+                lambda d, e, _u=url: _on_done(d, e, _u),
+                timeout=6.0,
+            )
 
     # ───────── v0.5.165 post-run summary card
 

@@ -275,6 +275,13 @@ class RdmaBlastFlowDialog(QDialog):
         # Cached `/api/rdma/host_info` snapshot (populated lazily
         # when the operator opens the Max-BW picker).
         self._host_info_cache: Optional[dict] = None
+        # v0.5.167: per-side cache of the rich device payload dicts
+        # from /api/rdma/devices, keyed by HCA name. Used when
+        # building the run-log entry so the HTML session report
+        # can show NIC type, driver, link rate, MTU, FW, GIDs.
+        self._device_payloads: Dict[str, Dict[str, Dict[str, Any]]] = {
+            "server": {}, "client": {},
+        }
         # Live stats panel state.
         self._poll_timer: Optional[QTimer] = None
         # Sibling iface guard — wired by the menu handler the same way
@@ -1014,6 +1021,14 @@ class RdmaBlastFlowDialog(QDialog):
                 also_combo.addItem("(no RDMA devices)", userData=None)
             return
 
+        # v0.5.167: cache the raw payloads so the run-log entry can
+        # attach rich endpoint details (NIC type, driver, link rate,
+        # MTU, FW, GIDs) when the operator exports the report.
+        self._device_payloads[side] = {
+            (d.get("name") or "?"): d for d in devices
+        }
+        if also_combo is not None:
+            self._device_payloads["client"] = self._device_payloads[side]
         for dev in devices:
             name = dev.get("name") or "?"
             ports = dev.get("ports") or []
@@ -2415,17 +2430,26 @@ class RdmaBlastFlowDialog(QDialog):
                 "msgrate_avg_mpps":
                     (sum(mrs) / len(mrs)) if mrs else None,
             }
+        srv_hca = self._server_device_combo.currentData() or "?"
+        cli_hca = self._client_device_combo.currentData() or "?"
+        srv_dev_payload = self._device_payloads.get("server", {}).get(srv_hca)
+        cli_dev_payload = self._device_payloads.get("client", {}).get(cli_hca)
         entry = {
             "kind": "blast",
             "started_at": _dt.datetime.now().isoformat(timespec="seconds"),
             "test": self._test_combo.currentData(),
             "params": params,
             "endpoints": {
-                "server":
-                    f"{self._server_tg_label} {self._server_device_combo.currentData() or '?'}",
-                "client":
-                    f"{self._client_tg_label} {self._client_device_combo.currentData() or '?'}",
+                "server": f"{self._server_tg_label} {srv_hca}",
+                "client": f"{self._client_tg_label} {cli_hca}",
             },
+            # v0.5.167: rich endpoint details for the HTML report.
+            "endpoint_details": [
+                {"side": "server", "tg": self._server_tg_label,
+                 "hca": srv_hca, "device": srv_dev_payload},
+                {"side": "client", "tg": self._client_tg_label,
+                 "hca": cli_hca, "device": cli_dev_payload},
+            ],
             "rows": rows,
             "summary": summary,
         }
