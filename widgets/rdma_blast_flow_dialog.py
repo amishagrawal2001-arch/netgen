@@ -37,7 +37,7 @@ import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
 from PyQt5.QtCore import Qt, QTimer
-from PyQt5.QtGui import QFont
+from PyQt5.QtGui import QFont, QTextCursor
 from PyQt5.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
     QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
@@ -983,15 +983,25 @@ class RdmaBlastFlowDialog(QDialog):
     # ───────── v0.5.159 stats view auto-scroll
 
     def _scroll_stats_to_bottom(self) -> None:
-        """Pin the QTextEdit's vertical scrollbar to its maximum
-        every time the contents change. The default Qt behavior
-        only auto-scrolls when the bar is already at the bottom;
-        after the running-tick spam (~270s × 2 sides ≈ 270 lines)
-        operators want the final BW row visible without manually
-        scrolling."""
+        """Pin the QTextEdit to the document end every time the
+        contents change. The default Qt behavior only auto-scrolls
+        when the bar is already at the bottom; after the running-
+        tick spam (~270s × 2 sides ≈ 270 lines) operators want the
+        final BW row visible without manually scrolling.
+
+        v0.5.161: moved from `verticalScrollBar().setValue(max)`
+        to `moveCursor(End) + QTimer.singleShot(0, ensureCursor
+        Visible)`. The scrollbar's maximum is computed BEFORE the
+        last wrapped line is laid out — the synchronous setValue
+        was missing the wrap-line's vertical room, so the
+        "MsgRate=…" continuation got clipped. Deferring to a
+        zero-tick timer lets Qt's document layout settle first."""
         try:
-            bar = self._stats_view.verticalScrollBar()
-            bar.setValue(bar.maximum())
+            cur = self._stats_view.textCursor()
+            cur.movePosition(QTextCursor.End)
+            self._stats_view.setTextCursor(cur)
+            QTimer.singleShot(
+                0, self._stats_view.ensureCursorVisible)
         except Exception:
             pass
 

@@ -157,8 +157,11 @@ def test_topology_test_params_vertical_spacing_loosened():
 
 
 def test_blast_stats_view_auto_scrolls():
-    """Connecting textChanged → _scroll_stats_to_bottom snaps the
-    scrollbar to max after every append."""
+    """Connecting textChanged → _scroll_stats_to_bottom keeps the
+    final line visible. v0.5.161 reworked the body from
+    scrollbar.setValue(max) to moveCursor(End) +
+    QTimer.singleShot(0, ensureCursorVisible) so wrapped lines
+    aren't clipped — but the connection is unchanged."""
     assert (
         "self._stats_view.textChanged.connect("
         "self._scroll_stats_to_bottom)" in SRC_BLAST
