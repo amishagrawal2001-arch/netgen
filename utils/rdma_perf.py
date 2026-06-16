@@ -773,17 +773,25 @@ _RE_REMOTE_ADDR = re.compile(
 )
 # BW data row: "  65536      1000     96.43      96.40     0.18"
 # Tokens: bytes, iterations, BW peak, BW average, MsgRate
+# v0.5.162: with `--cpu_util` perftest appends a 6th column
+# (CPU_util[%]). The pre-fix regex was anchored to 5 columns, so
+# enabling CPU util made every BW run report None across the
+# board (rc=0 but no parsed values). Make the CPU util column
+# optional.
 _RE_BW_DATA_ROW = re.compile(
     r"^\s*(?P<bytes>\d+)\s+(?P<iters>\d+)\s+"
-    r"(?P<peak>[\d.]+)\s+(?P<avg>[\d.]+)\s+(?P<mrate>[\d.]+)\s*$"
+    r"(?P<peak>[\d.]+)\s+(?P<avg>[\d.]+)\s+(?P<mrate>[\d.]+)"
+    r"(?:\s+(?P<cpu_util>[\d.]+))?\s*$"
 )
 # Latency data row: "  2     1000     1.50     2.10     5.30  ... 2.95"
 # perftest lat tools print: bytes iter t_min t_max t_typical t_avg t_stdev 99% 99.9%
+# v0.5.162: same `--cpu_util` trailing-column tolerance as BW.
 _RE_LAT_DATA_ROW = re.compile(
     r"^\s*(?P<bytes>\d+)\s+(?P<iters>\d+)\s+"
     r"(?P<tmin>[\d.]+)\s+(?P<tmax>[\d.]+)\s+"
     r"(?P<ttyp>[\d.]+)\s+(?P<tavg>[\d.]+)\s+"
-    r"(?P<tstdev>[\d.]+)\s+(?P<p99>[\d.]+)(?:\s+(?P<p999>[\d.]+))?\s*$"
+    r"(?P<tstdev>[\d.]+)\s+(?P<p99>[\d.]+)(?:\s+(?P<p999>[\d.]+))?"
+    r"(?:\s+(?P<cpu_util>[\d.]+))?\s*$"
 )
 
 # v0.5.146: perftest dumps a config block before the test starts

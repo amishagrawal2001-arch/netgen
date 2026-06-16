@@ -2,6 +2,38 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.162] - 2026-06-16
+
+**CRITICAL: --cpu_util adds a 6th column; parser was anchored
+to 5. Enabling "CPU util" made every BW run report None across
+the board (rc=0 but no parsed BW / iters / msg_rate).**
+
+Operator screenshot showed exactly the symptom: `[server] done
+(rc=0) size=NoneB iters=None BW avg=None ... peak=None MsgRate=
+None Mpps` for both halves.
+
+perftest BW data row WITHOUT `--cpu_util`:
+  `65536  5244904  171.55  171.21  0.327198`
+   bytes  iters    peak    avg     mrate
+
+perftest BW data row WITH `--cpu_util`:
+  `65536  5244904  171.55  171.21  0.327198  12.34`
+   bytes  iters    peak    avg     mrate     cpu%
+
+`_RE_BW_DATA_ROW` ended with `(?P<mrate>[\\d.]+)\\s*$` — anchored
+to end-of-line. The trailing CPU util column made the regex miss
+the row entirely; final_* fields stayed None.
+
+Fix: make the 6th column optional on both BW and Lat regexes
+(`(?:\\s+(?P<cpu_util>[\\d.]+))?\\s*$`). Lat tests use `--cpu_util`
+identically — perftest appends a column there too.
+
+### Tests
+
+`tests/test_v05162_cpu_util_parser.py` — 4 new (BW with/without
+cpu_util, Lat with/without). Combined RDMA regression sweep:
+172 passing.
+
 ## [0.5.161] - 2026-06-16
 
 **CRITICAL: extras' perftest client never knew which port to
