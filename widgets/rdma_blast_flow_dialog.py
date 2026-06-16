@@ -41,7 +41,7 @@ from PyQt5.QtGui import QFont, QTextCursor
 from PyQt5.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout,
     QGridLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
-    QPushButton, QSpinBox, QTextEdit, QVBoxLayout, QWidget,
+    QProgressBar, QPushButton, QSpinBox, QTextEdit, QVBoxLayout, QWidget,
 )
 
 
@@ -784,6 +784,30 @@ class RdmaBlastFlowDialog(QDialog):
         action_row.addWidget(self._status_label, 1)
         root.addLayout(action_row)
 
+        # ── v0.5.164: live progress widget. Operator's screenshot
+        # showed ~270 identical "running" lines — they had no idea
+        # whether perftest was close to completing. We now derive
+        # elapsed-vs-duration from the polled `started_at` and the
+        # operator-set Duration, render as a QProgressBar with a
+        # label showing iteration + elapsed/total. Hidden until
+        # the first job report comes back; reset on Stop / new Start.
+        prog_row = QHBoxLayout()
+        prog_row.setSpacing(8)
+        self._progress_label = QLabel("")
+        self._progress_label.setStyleSheet(
+            "color: #1f2937; font-weight: 600;"
+        )
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setRange(0, 100)
+        self._progress_bar.setTextVisible(True)
+        self._progress_bar.setMaximumHeight(14)
+        self._progress_widget = QWidget()
+        self._progress_widget.setLayout(prog_row)
+        prog_row.addWidget(self._progress_label)
+        prog_row.addWidget(self._progress_bar, 1)
+        self._progress_widget.setVisible(False)
+        root.addWidget(self._progress_widget)
+
         # ── Live stats panel (populated by _poll_jobs).
         # v0.5.152: bumped min-height 160 → 280 + addWidget stretch
         # factor 1 so the panel claims the freed-up vertical room
@@ -1040,6 +1064,42 @@ class RdmaBlastFlowDialog(QDialog):
             self._stats_view.setTextCursor(cur)
             QTimer.singleShot(
                 0, self._stats_view.ensureCursorVisible)
+        except Exception:
+            pass
+
+    # ───────── v0.5.164 live progress widget
+
+    def _update_progress_widget(self, elapsed_secs: Optional[float]) -> None:
+        """Drive the progress bar + label above Live stats. Called
+        from `_render_job_into_stats` on every running-poll tick."""
+        if elapsed_secs is None:
+            return
+        try:
+            duration = max(1, int(self._duration_spin.value()))
+        except Exception:
+            duration = 1
+        pct = int(min(100, (elapsed_secs / duration) * 100))
+        # Iteration context (1-based) — only meaningful for
+        # iterate-N runs; single-iter just shows "running".
+        total = int(getattr(self, "_iteration_total", 1) or 1)
+        idx = int(getattr(self, "_iteration_idx", 0))
+        if total > 1:
+            head = f"Iteration {idx + 1}/{total}"
+        else:
+            head = "Running"
+        self._progress_label.setText(
+            f"{head} • {int(elapsed_secs)}s / {duration}s"
+        )
+        self._progress_bar.setValue(pct)
+        self._progress_widget.setVisible(True)
+
+    def _reset_progress_widget(self) -> None:
+        """Hide + zero the progress bar. Called when a run settles
+        or the operator hits Stop."""
+        try:
+            self._progress_widget.setVisible(False)
+            self._progress_bar.setValue(0)
+            self._progress_label.setText("")
         except Exception:
             pass
 
@@ -2062,12 +2122,18 @@ class RdmaBlastFlowDialog(QDialog):
             # clean progress line with elapsed time instead.
             started_at = job.get("started_at")
             elapsed = ""
+            elapsed_secs: Optional[float] = None
             if isinstance(started_at, (int, float)):
                 try:
                     import time as _t
-                    elapsed = f" — {int(_t.time() - started_at)}s elapsed"
+                    elapsed_secs = max(0.0, _t.time() - started_at)
+                    elapsed = f" — {int(elapsed_secs)}s elapsed"
                 except Exception:
                     pass
+            # v0.5.164: drive the progress widget on the SAME poll
+            # so the operator gets visible feedback above the Live
+            # stats spam.
+            self._update_progress_widget(elapsed_secs)
             chunk = (
                 f"[{side}] {run_state}  (perftest emits results on "
                 f"completion, not during run{elapsed})"
@@ -2134,6 +2200,8 @@ class RdmaBlastFlowDialog(QDialog):
         # the whole iterate-N session) into _run_log for the
         # Export Report button.
         self._append_run_log_entry()
+        # v0.5.164: hide progress bar when the run settles.
+        self._reset_progress_widget()
         self._set_status_ok(
             "Both halves finished. Click Stop to forget the pairing "
             "(or close this dialog)."
@@ -2290,6 +2358,8 @@ class RdmaBlastFlowDialog(QDialog):
         # than queueing the next iteration.
         self._iteration_stop_requested = True
         self._iteration_in_progress = False
+        # v0.5.164: hide the progress widget on stop.
+        self._reset_progress_widget()
         # v0.5.153: Stop also fires preflight cleanup. Previously
         # only closeEvent did, so operator hitting Stop and leaving
         # the dialog open kept stale test IPs around indefinitely.

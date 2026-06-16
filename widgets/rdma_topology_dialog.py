@@ -34,8 +34,8 @@ from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
     QButtonGroup, QCheckBox, QComboBox, QDialog, QDialogButtonBox,
     QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
-    QPlainTextEdit, QPushButton, QRadioButton, QScrollArea, QSpinBox,
-    QTableWidget, QTableWidgetItem, QTreeWidget, QTreeWidgetItem,
+    QPlainTextEdit, QProgressBar, QPushButton, QRadioButton, QScrollArea,
+    QSpinBox, QTableWidget, QTableWidgetItem, QTreeWidget, QTreeWidgetItem,
     QVBoxLayout, QWidget,
 )
 
@@ -576,6 +576,24 @@ class RdmaTopologyDialog(QDialog):
         self._status_label.setWordWrap(True)
         action_row.addWidget(self._status_label, 1)
         root.addLayout(action_row)
+
+        # ── v0.5.164: live progress widget — same as Blast.
+        prog_row = QHBoxLayout()
+        prog_row.setSpacing(8)
+        self._progress_label = QLabel("")
+        self._progress_label.setStyleSheet(
+            "color: #1f2937; font-weight: 600;"
+        )
+        self._progress_bar = QProgressBar()
+        self._progress_bar.setRange(0, 100)
+        self._progress_bar.setTextVisible(True)
+        self._progress_bar.setMaximumHeight(14)
+        self._progress_widget = QWidget()
+        self._progress_widget.setLayout(prog_row)
+        prog_row.addWidget(self._progress_label)
+        prog_row.addWidget(self._progress_bar, 1)
+        self._progress_widget.setVisible(False)
+        root.addWidget(self._progress_widget)
 
         # ── Per-pair stats grid + TOTAL row
         stats_box = QGroupBox("Results")
@@ -1391,6 +1409,8 @@ class RdmaTopologyDialog(QDialog):
                     {"job_id": job_id}, lambda *_: None,
                 )
         self._stop_poll()
+        # v0.5.164: hide the progress widget on Stop.
+        self._reset_progress_widget()
         self._start_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
         self._set_status_neutral("Stop requested — see per-pair grid.")
@@ -1478,6 +1498,11 @@ class RdmaTopologyDialog(QDialog):
                 continue
             self._update_pair_row(plan.pair_index)
             break
+        # v0.5.164: drive the progress widget. Use the most-
+        # advanced `started_at` across the active pairs (max
+        # elapsed) — all pairs run concurrently with the same
+        # duration so they're aligned to within polling jitter.
+        self._update_progress_from_jobs()
         self._refresh_totals()
         # If all pairs are done, the iteration is complete.
         if self._all_pairs_done():
@@ -1494,6 +1519,8 @@ class RdmaTopologyDialog(QDialog):
                 # All iterations finished (or operator hit Stop).
                 self._append_summary_row()
                 self._append_run_log_entry()
+                # v0.5.164: hide the progress widget.
+                self._reset_progress_widget()
                 self._start_btn.setEnabled(True)
                 self._stop_btn.setEnabled(False)
                 self._stop_requested = False
@@ -1660,6 +1687,45 @@ class RdmaTopologyDialog(QDialog):
             "summary": summary,
         }
         self._run_log.append(entry)
+
+    def _update_progress_from_jobs(self) -> None:
+        """v0.5.164: derive elapsed/duration from the active
+        client-side jobs and update the progress bar."""
+        import time as _t
+        starts: List[float] = []
+        for plan in (self._plans or []):
+            cj = self._latest_jobs.get(
+                (self._pair_jobs.get(plan.pair_index) or {}).get(
+                    "client") or "")
+            if isinstance(cj, dict):
+                started_at = cj.get("started_at")
+                if isinstance(started_at, (int, float)):
+                    starts.append(float(started_at))
+        if not starts:
+            return
+        elapsed = max(0.0, _t.time() - min(starts))
+        duration = max(1, int(self._duration_spin.value()))
+        pct = int(min(100, (elapsed / duration) * 100))
+        total = int(getattr(self, "_iterations_total", 1) or 1)
+        idx = int(getattr(self, "_iteration_idx", 0))
+        n_pairs = len(self._plans or [])
+        head = (
+            f"Iteration {idx + 1}/{total} • {n_pairs} pair(s)"
+            if total > 1 else f"{n_pairs} pair(s) running"
+        )
+        self._progress_label.setText(
+            f"{head} • {int(elapsed)}s / {duration}s"
+        )
+        self._progress_bar.setValue(pct)
+        self._progress_widget.setVisible(True)
+
+    def _reset_progress_widget(self) -> None:
+        try:
+            self._progress_widget.setVisible(False)
+            self._progress_bar.setValue(0)
+            self._progress_label.setText("")
+        except Exception:
+            pass
 
     def _on_export_report_clicked(self) -> None:
         """v0.5.163: export the session log as HTML."""

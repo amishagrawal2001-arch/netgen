@@ -2,6 +2,42 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.164] - 2026-06-16
+
+**Live progress visualization while perftest is running.**
+
+Operator: "see the visualization during test running" — Live
+stats was just spamming ~270 identical "running" lines with no
+indication of progress.
+
+### What's added
+
+Both dialogs grew a progress strip between the action row and the
+Live stats / Results panel:
+* `QProgressBar` (0-100%) — bar shows `elapsed / duration × 100`
+* `QLabel` heading with iteration context and the raw seconds:
+  * Blast: `Running • 247s / 600s` or
+    `Iteration 2/5 • 247s / 600s` for iterate-N runs
+  * Topology: `2 pair(s) running • 247s / 600s` or
+    `Iteration 2/5 • 3 pair(s) • 247s / 600s`
+
+### How it works
+
+Both dialogs already polled every 2 s and got back the perftest
+job's `started_at` timestamp. The new `_update_progress_widget`
+(Blast) / `_update_progress_from_jobs` (Topology) helpers
+compute elapsed against the operator-set Duration and push to
+the bar. Hidden by default; shown on first running-poll;
+hidden again when the run settles (`_on_both_finished` /
+`_all_pairs_done`) or the operator hits Stop.
+
+### Tests
+
+`tests/test_v05164_live_progress.py` — 5 new (progress widget
+declared in both dialogs, update helper present, reset on
+finish/stop, hidden by default). Combined RDMA regression
+sweep: 183 passing.
+
 ## [0.5.163] - 2026-06-16
 
 **HTML report export in both Blast and Topology dialogs.**
