@@ -1163,6 +1163,19 @@ class RdmaBlastFlowDialog(QDialog):
         params = run.get("params") or {}
         summary = run.get("summary") or {}
         rows = run.get("rows") or []
+        # v0.5.176: dispatch on lat vs bw test. Latency runs carry
+        # `lat_avg_us` in their rows (and summary); BW runs carry
+        # `bw_gbps`. Operator hit the bug where send_lat /
+        # write_lat / read_lat fell through to BW rendering with
+        # all `—` cells.
+        is_lat_run = isinstance(summary.get("lat_avg_us"),
+                                (int, float)) or any(
+            isinstance(r.get("lat_avg_us"), (int, float))
+            for r in rows
+        )
+        if is_lat_run:
+            self._render_lat_results_card(run, params, summary, rows)
+            return
         # Decide the headline number — Σ avg if multi-sample, else
         # the lone row's BW.
         if isinstance(summary.get("bw_avg_gbps"), (int, float)) \
@@ -1220,6 +1233,64 @@ class RdmaBlastFlowDialog(QDialog):
             f"color:#064e3b;'>{mr_txt}</span>"
             f"<span style='font-size:11px; color:#065f46;'>"
             f" Mpps</span>"
+            f" &nbsp; "
+            f"<span style='font-size:11px; color:#047857;'>"
+            f"{tail}</span>"
+        )
+        self._results_card.setText(html)
+        self._results_card.setVisible(True)
+
+    def _render_lat_results_card(self, run, params, summary, rows):
+        """v0.5.176: latency-flavoured headline. `avg` is the
+        marquee value; `p99` rides shotgun (operators tracking
+        tail latency want it visible)."""
+        # Headline avg: prefer summary (multi-iter) else last row.
+        if isinstance(summary.get("lat_avg_us"), (int, float)):
+            avg_us = float(summary["lat_avg_us"])
+            headline_label = (
+                f"average across {int(summary.get('samples', 1))} samples"
+                if summary.get("samples", 0) > 1 else "final"
+            )
+        else:
+            lats = [r["lat_avg_us"] for r in rows
+                    if isinstance(r.get("lat_avg_us"), (int, float))]
+            avg_us = lats[-1] if lats else None
+            headline_label = "final"
+        # p99 — best-effort from the trailing row.
+        p99_rows = [r.get("lat_p99_us") for r in rows
+                    if isinstance(r.get("lat_p99_us"), (int, float))]
+        p99_us = p99_rows[-1] if p99_rows else None
+        avg_txt = f"{avg_us:.2f}" if isinstance(avg_us, float) else "—"
+        p99_txt = f"{p99_us:.2f}" if isinstance(p99_us, float) else "—"
+        extras = []
+        if isinstance(summary.get("lat_min_us"), (int, float)) \
+                and isinstance(summary.get("lat_max_us"), (int, float)) \
+                and summary.get("samples", 0) > 1:
+            extras.append(
+                f"min {summary['lat_min_us']:.2f} / "
+                f"max {summary['lat_max_us']:.2f} µs"
+            )
+        if params.get("iterations", 1) > 1:
+            extras.append(f"{params['iterations']} iterations")
+        if params.get("duration_s"):
+            extras.append(f"{params['duration_s']}s per run")
+        tail_bits = [escape(headline_label)]
+        tail_bits.extend(escape(b) for b in extras)
+        tail = " · ".join(tail_bits)
+        html = (
+            f"<span style='font-size:11px; color:#065f46; "
+            f"font-weight:600;'>✓ "
+            f"{escape(run.get('test') or '?')}</span>"
+            f" &nbsp; "
+            f"<span style='font-size:18px; font-weight:700; "
+            f"color:#064e3b;'>{avg_txt}</span>"
+            f"<span style='font-size:11px; color:#065f46;'>"
+            f" µs avg</span>"
+            f" &nbsp;|&nbsp; "
+            f"<span style='font-size:14px; font-weight:600; "
+            f"color:#064e3b;'>{p99_txt}</span>"
+            f"<span style='font-size:11px; color:#065f46;'>"
+            f" µs p99</span>"
             f" &nbsp; "
             f"<span style='font-size:11px; color:#047857;'>"
             f"{tail}</span>"
@@ -1863,6 +1934,17 @@ class RdmaBlastFlowDialog(QDialog):
         self._total_emitted = False
         self._client_bw = None
         self._client_msgrate = None
+        # v0.5.176: latency-test captures — operator reported
+        # send_lat / read_lat / write_lat results weren't surfacing
+        # in the HTML report. Root cause: the dialog only stashed
+        # _client_bw / _client_msgrate when the client side
+        # finished, so the run-log entry's iter rows had no
+        # `lat_avg_us` field and the report's `has_lat` dispatch
+        # fell through to BW rendering with "—" everywhere.
+        self._client_lat_avg_us = None
+        self._client_lat_min_us = None
+        self._client_lat_max_us = None
+        self._client_lat_p99_us = None
         # v0.5.159 REGRESSION FIX: v0.5.157 cleared the host-info
         # cache here on every Start. That was wrong — host_info is
         # a HOST-LEVEL fact (NUMA topology + full hca_numa map for
@@ -2198,6 +2280,16 @@ class RdmaBlastFlowDialog(QDialog):
                     self._client_bw = job.get("final_bw_avg_gbps")
                 if job.get("final_msg_rate_mpps") is not None:
                     self._client_msgrate = job.get("final_msg_rate_mpps")
+                # v0.5.176: also stash lat fields so send_lat /
+                # write_lat / read_lat runs surface in the report.
+                if job.get("final_lat_avg_us") is not None:
+                    self._client_lat_avg_us = job.get("final_lat_avg_us")
+                if job.get("final_lat_min_us") is not None:
+                    self._client_lat_min_us = job.get("final_lat_min_us")
+                if job.get("final_lat_max_us") is not None:
+                    self._client_lat_max_us = job.get("final_lat_max_us")
+                if job.get("final_lat_p99_us") is not None:
+                    self._client_lat_p99_us = job.get("final_lat_p99_us")
 
         s_done = (self._server_job_id is None) or self._server_finished
         c_done = (self._client_job_id is None) or self._client_finished
@@ -2329,6 +2421,13 @@ class RdmaBlastFlowDialog(QDialog):
                 "iter": idx,
                 "bw": getattr(self, "_client_bw", None),
                 "msgrate": getattr(self, "_client_msgrate", None),
+                # v0.5.176: include lat fields so iterate-N runs of
+                # send_lat / write_lat / read_lat carry per-iter
+                # latency data into the report's rows table.
+                "lat_avg_us": getattr(self, "_client_lat_avg_us", None),
+                "lat_min_us": getattr(self, "_client_lat_min_us", None),
+                "lat_max_us": getattr(self, "_client_lat_max_us", None),
+                "lat_p99_us": getattr(self, "_client_lat_p99_us", None),
             })
             self._iteration_idx = idx + 1
             self._stats_view.append(
@@ -2420,12 +2519,21 @@ class RdmaBlastFlowDialog(QDialog):
         # Multi-iteration: one row per (iter), then per-worker.
         iter_results = getattr(self, "_iteration_results", [])
         for r in iter_results:
-            rows.append({
+            row = {
                 "label": f"iter #{r.get('iter', '?')}",
                 "state": "done",
                 "bw_gbps": r.get("bw"),
                 "msgrate_mpps": r.get("msgrate"),
-            })
+            }
+            # v0.5.176: forward lat fields so the report's
+            # `has_lat = any(... "lat_avg_us" ...)` dispatch flips
+            # to the latency columns.
+            if r.get("lat_avg_us") is not None:
+                row["lat_avg_us"] = r.get("lat_avg_us")
+                row["lat_min_us"] = r.get("lat_min_us")
+                row["lat_max_us"] = r.get("lat_max_us")
+                row["lat_p99_us"] = r.get("lat_p99_us")
+            rows.append(row)
         # Per-extra-worker rows (only meaningful for parallel runs).
         extras = getattr(self, "_extra_workers", [])
         for w in extras:
@@ -2453,19 +2561,49 @@ class RdmaBlastFlowDialog(QDialog):
         # in.
         already_have_iter_rows = bool(iter_results)
         if extras or not already_have_iter_rows:
-            rows.append({
+            w0_row = {
                 "label": "worker 0",
                 "state": "done",
                 "bw_gbps": getattr(self, "_client_bw", None),
                 "msgrate_mpps": getattr(self, "_client_msgrate", None),
-            })
+            }
+            # v0.5.176: also include lat fields for single-iter
+            # latency runs so the report dispatches to lat columns.
+            lat_avg = getattr(self, "_client_lat_avg_us", None)
+            if lat_avg is not None:
+                w0_row["lat_avg_us"] = lat_avg
+                w0_row["lat_min_us"] = getattr(
+                    self, "_client_lat_min_us", None)
+                w0_row["lat_max_us"] = getattr(
+                    self, "_client_lat_max_us", None)
+                w0_row["lat_p99_us"] = getattr(
+                    self, "_client_lat_p99_us", None)
+            rows.append(w0_row)
         # Σ summary across iterations (if any).
         summary = None
         bws = [r["bw_gbps"] for r in rows
                if isinstance(r.get("bw_gbps"), (int, float))]
         mrs = [r["msgrate_mpps"] for r in rows
                if isinstance(r.get("msgrate_mpps"), (int, float))]
-        if bws:
+        # v0.5.176: also aggregate latency for *_lat tests. The
+        # report's renderer dispatches on `has_lat` so we need
+        # `lat_avg_us` etc. in the summary too.
+        lats = [r["lat_avg_us"] for r in rows
+                if isinstance(r.get("lat_avg_us"), (int, float))]
+        if lats:
+            summary = {
+                "samples": len(lats),
+                "lat_avg_us": sum(lats) / len(lats),
+                "lat_min_us": min(
+                    (r.get("lat_min_us") for r in rows
+                     if isinstance(r.get("lat_min_us"), (int, float))),
+                    default=min(lats)),
+                "lat_max_us": max(
+                    (r.get("lat_max_us") for r in rows
+                     if isinstance(r.get("lat_max_us"), (int, float))),
+                    default=max(lats)),
+            }
+        elif bws:
             summary = {
                 "samples": len(bws),
                 "bw_avg_gbps": sum(bws) / len(bws),
@@ -2623,6 +2761,11 @@ class RdmaBlastFlowDialog(QDialog):
         self._total_emitted = False
         self._client_bw = None
         self._client_msgrate = None
+        # v0.5.176: latency-test captures — see _proceed_with_start.
+        self._client_lat_avg_us = None
+        self._client_lat_min_us = None
+        self._client_lat_max_us = None
+        self._client_lat_p99_us = None
         # v0.5.160 followup: also reset iteration state so a
         # reopen of the dialog starts clean.
         self._iteration_in_progress = False

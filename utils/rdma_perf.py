@@ -1091,8 +1091,15 @@ _RE_REMOTE_ADDR = re.compile(
 # board (rc=0 but no parsed values). Make the CPU util column
 # optional.
 _RE_BW_DATA_ROW = re.compile(
+    # v0.5.176: loosen the peak column to also accept the textual
+    # placeholders some perftest builds emit for ib_read_bw —
+    # specifically `N/A` (or a bare `-`) when the tool can't
+    # compute peak for one-sided operations. Pre-fix, the strict
+    # `[\d.]+` peak regex rejected the entire data row, leaving
+    # final_bw_avg_gbps as None and the report showing all `—`
+    # cells for read_bw runs.
     r"^\s*(?P<bytes>\d+)\s+(?P<iters>\d+)\s+"
-    r"(?P<peak>[\d.]+)\s+(?P<avg>[\d.]+)\s+(?P<mrate>[\d.]+)"
+    r"(?P<peak>[\d.]+|N/A|-)\s+(?P<avg>[\d.]+)\s+(?P<mrate>[\d.]+)"
     r"(?:\s+(?P<cpu_util>[\d.]+))?\s*$"
 )
 # Latency data row: "  2     1000     1.50     2.10     5.30  ... 2.95"
@@ -1239,7 +1246,16 @@ def _reader_thread(job: PerftestJob, proc: subprocess.Popen) -> None:
                         try:
                             job.final_msg_size_bytes = int(m.group("bytes"))
                             job.final_iterations = int(m.group("iters"))
-                            job.final_bw_peak_gbps = float(m.group("peak"))
+                            # v0.5.176: peak column may be 'N/A' / '-'
+                            # for ib_read_bw on some perftest builds —
+                            # treat that as None rather than crashing
+                            # the whole match (which would wipe avg +
+                            # msgrate too).
+                            peak_raw = m.group("peak")
+                            try:
+                                job.final_bw_peak_gbps = float(peak_raw)
+                            except (TypeError, ValueError):
+                                job.final_bw_peak_gbps = None
                             job.final_bw_avg_gbps = float(m.group("avg"))
                             job.final_msg_rate_mpps = float(m.group("mrate"))
                         except (TypeError, ValueError):

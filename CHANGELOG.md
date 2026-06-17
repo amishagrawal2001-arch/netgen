@@ -2,6 +2,88 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.176] - 2026-06-17
+
+**Two RDMA report bugs: lat tests and read_bw.**
+
+Operator: "check the report, seems read_bw and send_lat is not
+working correctly also check other Test types if they are
+working fine."
+
+### Bug 1 — latency tests showed all dashes
+
+The Blast dialog only stashed `_client_bw` and `_client_msgrate`
+when the client side finished. It never captured the lat fields.
+The run-log iter rows therefore had no `lat_avg_us` field; the
+report's `has_lat = any(... "lat_avg_us" ...)` dispatch fell
+through to BW rendering with all `—` cells for every latency
+run (`send_lat`, `write_lat`, `read_lat`).
+
+Fix:
+
+* New `_client_lat_avg_us` / `_client_lat_min_us` /
+  `_client_lat_max_us` / `_client_lat_p99_us` instance vars,
+  cleared in `_proceed_with_start` and `closeEvent`.
+* Each per-iter `_iteration_results.append(...)` now carries
+  the lat fields alongside bw/msgrate.
+* `_append_run_log_entry` forwards lat fields into the row
+  dicts when present.
+* Summary aggregator computes lat avg/min/max samples for
+  iterate-N lat runs.
+* `_render_results_card` now dispatches on `is_lat_run` and
+  routes to a new `_render_lat_results_card` that renders the
+  marquee as `X.YZ µs avg | A.BC µs p99 · …` instead of BW.
+
+### Bug 2 — read_bw also showed dashes
+
+Some perftest builds emit the BW-peak column as `N/A` for
+`ib_read_bw` because peak isn't computed for one-sided RDMA
+ops. The strict `[\d.]+` peak regex rejected the entire data
+row, leaving `final_bw_avg_gbps` as None.
+
+Fix:
+
+* `_RE_BW_DATA_ROW` peak group widened to `[\d.]+|N/A|-`.
+* The stdout reader wraps `float(peak_raw)` in a try/except —
+  `N/A` / `-` becomes `final_bw_peak_gbps = None`, but
+  `final_bw_avg_gbps` and `final_msg_rate_mpps` are still
+  populated, so the report shows the real avg + msgrate.
+
+### Cross-test-type sanity test
+
+Bundled test iterates every supported `_SUPPORTED_TESTS` entry
+through `_build_perftest_cmd` and asserts:
+
+* The tool binary basename matches (`ib_send_bw`, `ib_read_bw`,
+  `ib_send_lat`, etc).
+* `--report_gbits` is added for `_bw` tests AND ONLY for `_bw`
+  tests. (Lat tools reject the flag.)
+* The peer-address tail is appended for client invocations.
+
+Prevents future regressions where one test type silently drops
+out of the cmd builder.
+
+### Files touched
+
+* `widgets/rdma_blast_flow_dialog.py` — lat instance vars +
+  capture from client job + thread into iter_results + forward
+  into rows + summary aggregator + `_render_lat_results_card`.
+* `utils/rdma_perf.py` — `_RE_BW_DATA_ROW` peak alternation +
+  defensive `float(peak_raw)` in the stdout reader.
+* `tests/test_v05176_lat_capture_and_read_bw.py` — 12
+  assertions covering both bugs + the cross-test cmd sanity.
+
+### Test-type matrix after this release
+
+| Test         | BW report   | Latency report   | Status |
+|--------------|-------------|------------------|--------|
+| send_bw      | works       | n/a              | ✓      |
+| write_bw     | works       | n/a              | ✓      |
+| read_bw      | **fixed**   | n/a              | ✓      |
+| send_lat     | n/a         | **fixed**        | ✓      |
+| write_lat    | n/a         | **fixed**        | ✓      |
+| read_lat     | n/a         | **fixed**        | ✓      |
+
 ## [0.5.175] - 2026-06-17
 
 **Stop DNS-resolution hangs from freezing the GUI.**
