@@ -2,6 +2,26 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.174] - 2026-06-17
+
+**Blast RDMA Flow dialog widened to 920 px.**
+
+Operator screenshot showed the results card headline
+(`✓ send_bw 162.76 Gbps | 0.3104 Mpps average across 3 samples
+· min 162.67 / max 162.93 Gbps · 2 iterations · 30s per run`)
+wrapping into two lines, and the "Wrote 2 run(s) to
+/Users/.../netgen-blast-report-<ts>.html" status banner
+wrapping into three.
+
+Bumped `setMinimumWidth(720) → setMinimumWidth(920)` in the
+Blast dialog constructor. 920 keeps the Parameters grid
+balanced across 2 columns without forcing horizontal scroll on
+stock macOS 13/14 windows.
+
+### Files touched
+
+* `widgets/rdma_blast_flow_dialog.py` — minimum width 720→920.
+
 ## [0.5.173] - 2026-06-17
 
 **Blast report: drop the redundant worker 0 row when iter rows

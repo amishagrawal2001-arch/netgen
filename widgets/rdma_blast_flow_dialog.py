@@ -248,7 +248,16 @@ class RdmaBlastFlowDialog(QDialog):
     ):
         super().__init__(parent)
         self.setWindowTitle("Blast a RDMA Flow")
-        self.setMinimumWidth(720)
+        # v0.5.174: widened from 720 → 920 so the results card
+        # headline ("✓ send_bw 162.76 Gbps | 0.3104 Mpps average
+        # across N samples · min … / max … Gbps · N iterations ·
+        # 30s per run") fits on a single line, and the Export
+        # status banner ("Wrote 2 run(s) to /Users/.../netgen-
+        # blast-report-<ts>.html") stops wrapping into 3 lines.
+        # 920 also keeps the Parameters grid balanced across 2
+        # columns without forcing horizontal scroll on stock
+        # macOS 13/14 windows.
+        self.setMinimumWidth(920)
         # Non-modal so multiple Blast RDMA dialogs can run in parallel
         # (matches Blast DPDK Flow shape; operator can fan out tests
         # across NIC pairs without leaving the menu).
