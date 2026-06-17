@@ -364,9 +364,27 @@ def _render_headline(run: Dict[str, Any]) -> str:
     v0.5.170: appends `· X% of N G` line-rate efficiency when the
     endpoint table can supply a rate. Lets operators tell at a
     glance whether the test hit line rate (>90% = good).
+
+    v0.5.180 (re-audit H-RE-3): dispatch on summary/row shape.
+    Pre-fix this always rendered the BW headline; lat runs
+    showed "— Gbps | — Mpps" in the green callout box despite
+    the per-row table (in `_render_rows_table`) correctly
+    dispatching to lat columns. The v0.5.179 fix landed the row
+    dispatch but never updated the headline.
     """
     summary = run.get("summary") or {}
     rows = run.get("rows") or []
+    # v0.5.180: lat vs BW dispatch — match `_render_rows_table`'s
+    # `has_lat` predicate so the headline can't disagree with
+    # the table below it.
+    has_lat = (
+        isinstance(summary.get("lat_avg_us"), (int, float))
+        or any(isinstance(r.get("lat_avg_us"), (int, float))
+               for r in rows)
+    )
+    if has_lat:
+        return _render_lat_headline(run, summary, rows)
+
     if (isinstance(summary.get("bw_avg_gbps"), (int, float))
             and summary.get("samples", 0) > 1):
         bw = float(summary["bw_avg_gbps"])
@@ -396,6 +414,11 @@ def _render_headline(run: Dict[str, Any]) -> str:
         )
     # v0.5.170: line-rate efficiency. Operators ask this every
     # run: "did we hit line rate?" Show the % up front.
+    # v0.5.180 (re-audit M-RE-2): gate on `bw is float`. The lat
+    # branch above already returns; the residual safety here is
+    # for runs where `_render_headline` somehow ends up here with
+    # neither bw nor lat data, where bw stays None and the calc
+    # would multiply None.
     line_rate = _extract_line_rate_gbps(run)
     if isinstance(bw, float) and line_rate and line_rate > 0:
         pct = (bw / line_rate) * 100.0
@@ -411,6 +434,62 @@ def _render_headline(run: Dict[str, Any]) -> str:
         f"<span class='sep'>|</span>"
         f"<span class='num mr'>{mr_txt}</span>"
         f"<span class='unit'> Mpps</span>"
+        f"<span class='tail'>&middot; {tail_html}</span>"
+        f"</div>"
+    )
+
+
+def _render_lat_headline(
+    run: Dict[str, Any],
+    summary: Dict[str, Any],
+    rows: List[Dict[str, Any]],
+) -> str:
+    """v0.5.180 (re-audit H-RE-3): latency-flavoured headline.
+    Mirrors the BW headline's shape — same green callout box,
+    same `<span class='num'>` styling — so the report's visual
+    rhythm is uniform across BW and lat runs. The unit just
+    swaps from Gbps/Mpps to µs avg / µs p99.
+
+    Line-rate efficiency calc is SKIPPED for lat runs: a `% of
+    line rate` number against a latency µs value is meaningless
+    (lat tests intentionally don't fill the wire)."""
+    if (isinstance(summary.get("lat_avg_us"), (int, float))
+            and summary.get("samples", 0) > 1):
+        avg_us = float(summary["lat_avg_us"])
+        tail = (f"average across "
+                f"{int(summary['samples'])} samples")
+    else:
+        lats = [r["lat_avg_us"] for r in rows
+                if isinstance(r.get("lat_avg_us"), (int, float))]
+        avg_us = lats[-1] if lats else None
+        tail = "final"
+    p99_rows = [r.get("lat_p99_us") for r in rows
+                if isinstance(r.get("lat_p99_us"), (int, float))]
+    p99_us = p99_rows[-1] if p99_rows else None
+    if avg_us is None and p99_us is None:
+        return ""
+    avg_txt = (f"{avg_us:.2f}" if isinstance(avg_us, float)
+               else "—")
+    p99_txt = (f"{p99_us:.2f}" if isinstance(p99_us, float)
+               else "—")
+    extras = []
+    if (isinstance(summary.get("lat_min_us"), (int, float))
+            and isinstance(summary.get("lat_max_us"), (int, float))
+            and summary.get("samples", 0) > 1):
+        extras.append(
+            f"min {summary['lat_min_us']:.2f} / "
+            f"max {summary['lat_max_us']:.2f} µs")
+    tail_html = escape(tail)
+    if extras:
+        tail_html += (" &middot; "
+                      + " &middot; ".join(escape(b) for b in extras))
+    return (
+        f"<div class='headline'>"
+        f"<span class='num'>{avg_txt}</span>"
+        f"<span class='unit'> µs avg</span>"
+        f"<span class='sep'>|</span>"
+        f"<span class='num mr'>{p99_txt}</span>"
+        f"<span class='unit'> µs p99</span>"
         f"<span class='tail'>&middot; {tail_html}</span>"
         f"</div>"
     )

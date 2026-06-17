@@ -2,6 +2,127 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.180] - 2026-06-17
+
+**Topology dialog lat reporting pipeline — full fix bundle.**
+
+Operator hit two reports back-to-back on srv06:
+
+1. After v0.5.178: "for RDMA topology test, latency test
+   failing every time, check the logs … latency test works
+   from RDMA blast test." Report showed `rc=0` (perftest
+   succeeded) but every result cell rendered `—`.
+2. After diagnosing #1 and shipping a partial fix: "i already
+   asked to audit rdma topology test, how did you miss this
+   bug, pls audit again and find any other bugs."
+
+This release bundles both the original bug fix (v0.5.179 work)
+and the deeper re-audit that caught five more lat-pipeline gaps
+the v0.5.178 audit missed.
+
+### v0.5.179 work — three sites where lat was being dropped
+
+The v0.5.176 fix made the Blast dialog forward lat fields end-
+to-end. The Topology dialog was never updated; lat runs lost
+their data at three pipeline sites:
+
+* **`_snapshot_iteration_results`** captured only `bw` /
+  `msgrate` from each per-pair job dict. Added
+  `lat_avg_us` / `lat_min_us` / `lat_max_us` / `lat_p99_us` /
+  `iters` to the snap.
+* **`_append_run_log_entry`** row builder forwarded only the BW
+  fields. Now mirrors the Blast pattern: `if r.get("lat_avg_us")
+  is not None: row["lat_avg_us"] = …` plus a lat-shaped summary
+  (`lat_avg_us` / `lat_min_us` / `lat_max_us` / `samples`) when
+  any per-pair row carried lat data.
+* **`_render_results_card`** dialog headline now dispatches on
+  `is_lat_run` and falls to a new `_render_lat_results_card`
+  that mirrors Blast's "X.XX µs avg | Y.YY µs p99 · …" layout.
+
+### v0.5.180 re-audit — five sites the v0.5.178 audit missed
+
+After the v0.5.179 fix landed, operator (correctly) called out
+that the v0.5.178 audit should have caught these. The audit had
+focused on code shape (state init, race conditions, probe
+correctness) and never traced data flow from `PerftestJob.final_*`
+→ poll → snapshot → render. Re-audit caught:
+
+* **H-RE-1 · `_update_pair_row`**: pre-fix wrote
+  `final_bw_avg_gbps` and `final_msg_rate_mpps` to live grid
+  columns 4+5 unconditionally. Lat tests showed `—` for the
+  ENTIRE run — even though the data was being captured into
+  `_latest_jobs`. Now sniffs `final_lat_avg_us` and writes µs
+  values when present.
+* **H-RE-2 · `_append_summary_row`**: pre-fix had
+  `if not bws and not mrs: return` which swallowed every lat
+  run's Σ summary row. Lat samples now flow through too.
+* **H-RE-3 · `utils/rdma_report._render_headline`**: pre-fix
+  always rendered the BW headline — the green callout box at
+  the top of every run card said "— Gbps | — Mpps" for lat
+  runs even after v0.5.179's per-row dispatch fix. Now routes
+  to a new `_render_lat_headline` that carries µs units.
+* **H-RE-4 · stats table column headers** (line 654): static
+  "BW Gbps / MsgRate Mpps" set once at construction; never
+  re-labeled. Even with lat values written into cells, the
+  COLUMN labels misled operators. New
+  `_refresh_stats_column_headers(is_lat=True/False)` flips the
+  labels based on actual data.
+* **M-RE-2 · line-rate efficiency calc**: previously ran
+  unconditionally; safe today because `bw is None` on lat runs,
+  but a stale value would render "% of N G line rate" against
+  a µs number. Lat headline now skips the calc entirely.
+
+Plus L-RE-1 (probe-error surface), L-RE-2 (small polish).
+
+### Audit-method debt I'm now carrying
+
+The re-audit was needed because the v0.5.178 audit was missing
+two systematic passes:
+
+1. **Data-flow trace per output field** — for each of
+   `bw_gbps`, `msgrate_mpps`, `lat_avg_us`, `lat_min_us`,
+   `lat_max_us`, `lat_p99_us`, `iters`, `error`: walk
+   `PerftestJob.final_*` → REST → `_latest_jobs` → snapshot →
+   row dict → summary → renderer (dialog card + report). Any
+   gap = bug.
+2. **Sibling parity diff** — for parallel widgets (Blast ↔
+   Topology, Stream ↔ DPDK Status), every recent fix in one
+   is a candidate bug in the other.
+
+Future audits start with these two passes.
+
+### Deferred
+
+* **M-RE-1 · Topology dialog sweep checkbox** — Blast has
+  v0.5.177's "Sweep sizes (RFC 2544)" checkbox; Topology
+  doesn't. This is a feature gap, not a bug; adding the
+  per-pair × per-size sweep matrix renderer deserves its own
+  scope. Filed for a future release.
+
+### Tests
+
+16 new tests across two files; 200 pass across the topology +
+lat-pipeline regression sweep:
+
+* `tests/test_v05179_topology_lat_report.py` — 7 tests pinning
+  the three Blast-parity sites
+* `tests/test_v05180_topology_lat_re_audit.py` — 9 tests
+  pinning the re-audit fixes (live grid dispatch, summary row
+  lat, report headline lat, column header relabel, line-rate
+  gate, probe-error surface)
+
+Sample report rendered to
+`/tmp/netgen-topology-lat-v05180-sample.html` for visual
+review.
+
+### Verification status
+
+Code-level: 200/200 pass. End-to-end on srv06 lands when this
+wheel is installed there. The operator's failing report from
+v0.5.178 (`rc=0` + every cell `—`) will render correctly:
+green "5.54 µs avg | 8.10 µs p99" headline + 5-column lat table
+with real numbers.
+
 ## [0.5.178] - 2026-06-17
 
 **Three operator-reported RDMA Topology bugs + full audit pass.**

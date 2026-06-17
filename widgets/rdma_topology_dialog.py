@@ -1063,6 +1063,26 @@ class RdmaTopologyDialog(QDialog):
         The first hit wins (the confirm dialog can only show one
         reason); if no tuples have a blocker, proceed directly."""
         results = list(self._topology_probe_buf.values())
+        # v0.5.180 (re-audit L-RE-1): if every probe returned an
+        # error AND no probe surfaced a usable kernel_iface, the
+        # operator should see WHY rather than a silent proceed.
+        # Surface the first error string in the status label.
+        # We still proceed to perftest start — the err might be
+        # transient and the start itself will give a better
+        # diagnosis if there's really a problem.
+        errs = [p.get("error") for p in results
+                if isinstance(p, dict) and p.get("error")
+                and not p.get("kernel_iface")]
+        if errs and len(errs) == len(results):
+            # All probes errored. Show the first error and
+            # continue (next-best is operator-visible "this
+            # probe failed", followed by perftest's own error
+            # if start also fails).
+            self._set_status_neutral(
+                f"All {len(results)} probe(s) errored: "
+                f"{str(errs[0])[:140]}. Proceeding to start "
+                f"anyway — perftest will give the definitive "
+                f"diagnosis.")
         # Pair probes by tg_url so _detect_start_blockers gets a
         # "server" + "client" pair to compare. For the sample_plan
         # we look up the two probes we know exist.
@@ -1792,46 +1812,114 @@ class RdmaTopologyDialog(QDialog):
         else:
             rc = primary.get("returncode")
             state = f"done (rc={rc})" if rc is not None else "?"
-        bw = primary.get("final_bw_avg_gbps")
-        mr = primary.get("final_msg_rate_mpps")
         # v0.5.160: rows for iteration N start at
         # `_current_iter_base_row`. Earlier iterations' rows are
         # below; never overwrite them.
         row = getattr(self, "_current_iter_base_row", 0) + pair_index
         self._stats_table.setItem(row, 3, QTableWidgetItem(state))
-        self._stats_table.setItem(
-            row, 4,
-            QTableWidgetItem(f"{bw:.2f}" if isinstance(bw, (int, float)) else "—"),
-        )
-        self._stats_table.setItem(
-            row, 5,
-            QTableWidgetItem(f"{mr:.4f}" if isinstance(mr, (int, float)) else "—"),
-        )
+        # v0.5.180 (re-audit H-RE-1): write lat values into cols
+        # 4+5 for lat tests. Pre-fix the columns were hardcoded
+        # BW + MsgRate; lat tests showed `—` for every cell
+        # during the entire run even though `final_lat_avg_us`
+        # was being captured. Detection sniffs the data, NOT the
+        # combo's currentData(): the operator may have changed
+        # the combo between Start and now, and the data on the
+        # wire is the source of truth.
+        lat_avg = primary.get("final_lat_avg_us")
+        lat_p99 = primary.get("final_lat_p99_us")
+        is_lat = (lat_avg is not None or lat_p99 is not None)
+        if is_lat:
+            self._stats_table.setItem(
+                row, 4,
+                QTableWidgetItem(
+                    f"{lat_avg:.2f}"
+                    if isinstance(lat_avg, (int, float)) else "—"))
+            self._stats_table.setItem(
+                row, 5,
+                QTableWidgetItem(
+                    f"{lat_p99:.2f}"
+                    if isinstance(lat_p99, (int, float)) else "—"))
+            self._refresh_stats_column_headers(is_lat=True)
+        else:
+            bw = primary.get("final_bw_avg_gbps")
+            mr = primary.get("final_msg_rate_mpps")
+            self._stats_table.setItem(
+                row, 4,
+                QTableWidgetItem(
+                    f"{bw:.2f}"
+                    if isinstance(bw, (int, float)) else "—"))
+            self._stats_table.setItem(
+                row, 5,
+                QTableWidgetItem(
+                    f"{mr:.4f}"
+                    if isinstance(mr, (int, float)) else "—"))
+            self._refresh_stats_column_headers(is_lat=False)
+
+    def _refresh_stats_column_headers(self, *, is_lat: bool) -> None:
+        """v0.5.180 (re-audit H-RE-4): re-label the BW columns to
+        Lat avg / Lat p99 when the data on the wire is lat data.
+        Pre-fix the headers said "BW Gbps / MsgRate Mpps" forever
+        — even with lat values written into the cells, the column
+        labels misled the operator into reading µs as Gbps.
+
+        Cheap to call every poll — `setHorizontalHeaderLabels` on
+        QTableWidget is a no-op when text is unchanged."""
+        if is_lat:
+            labels = ["#", "Server", "Client", "State",
+                      "Lat avg (µs)", "Lat p99 (µs)"]
+        else:
+            labels = ["#", "Server", "Client", "State",
+                      "BW Gbps", "MsgRate Mpps"]
+        # Track to avoid spurious re-paints; the actual setter
+        # below short-circuits internally but the .text() check
+        # keeps logs / change events quiet.
+        current = self._stats_table.horizontalHeaderItem(4)
+        if current is not None and current.text() == labels[4]:
+            return
+        self._stats_table.setHorizontalHeaderLabels(labels)
 
     def _snapshot_iteration_results(self) -> None:
         """v0.5.160: capture the just-finished iteration's per-pair
         client-side stats. Used to render the Σ summary row at the
-        end of the full run."""
+        end of the full run.
+
+        v0.5.179: also capture latency fields. Pre-fix, only `bw` /
+        `msgrate` were stashed → `_append_run_log_entry`'s row
+        builder had nothing lat-flavoured to forward → the HTML
+        report dispatched every Topology `*_lat` run to its BW
+        column renderer and showed `—` for every cell despite
+        perftest returning rc=0 with real µs data. Same class of
+        bug v0.5.176 fixed for the Blast dialog; Topology was
+        never updated."""
         snap: List[Dict[str, Any]] = []
         for plan in self._plans:
             cj_id = self._pair_jobs[plan.pair_index].get("client")
             job = self._latest_jobs.get(cj_id) if cj_id else None
+            j = job if isinstance(job, dict) else {}
             snap.append({
                 "iter": self._iteration_idx,
                 "pair_index": plan.pair_index,
-                "bw": (job.get("final_bw_avg_gbps")
-                       if isinstance(job, dict) else None),
-                "msgrate": (job.get("final_msg_rate_mpps")
-                            if isinstance(job, dict) else None),
-                "rc": (job.get("returncode")
-                       if isinstance(job, dict) else None),
+                "bw": j.get("final_bw_avg_gbps"),
+                "msgrate": j.get("final_msg_rate_mpps"),
+                "lat_avg_us": j.get("final_lat_avg_us"),
+                "lat_min_us": j.get("final_lat_min_us"),
+                "lat_max_us": j.get("final_lat_max_us"),
+                "lat_p99_us": j.get("final_lat_p99_us"),
+                "iters": j.get("final_iterations"),
+                "rc": j.get("returncode"),
             })
         self._iteration_results.append(snap)
 
     def _append_summary_row(self) -> None:
         """v0.5.160: render a Σ row showing avg / min / max BW and
         MsgRate across all (iteration, pair) samples. Skipped for
-        single-iteration runs (would just duplicate the lone row)."""
+        single-iteration runs (would just duplicate the lone row).
+
+        v0.5.180 (re-audit H-RE-2): also produces a lat Σ row when
+        the just-finished run was a `*_lat`. Pre-fix the early
+        return at `if not bws and not mrs` swallowed every lat
+        run's summary — operators running multi-iteration lat
+        tests never saw the aggregate."""
         results = getattr(self, "_iteration_results", [])
         if not results or self._iterations_total < 2:
             return
@@ -1839,37 +1927,58 @@ class RdmaTopologyDialog(QDialog):
                if isinstance(r.get("bw"), (int, float))]
         mrs = [r["msgrate"] for snap in results for r in snap
                if isinstance(r.get("msgrate"), (int, float))]
-        if not bws and not mrs:
+        # v0.5.180: collect lat samples too. Data-sniff (not test-
+        # combo) for the same reason as _update_pair_row.
+        lat_avgs = [r["lat_avg_us"] for snap in results for r in snap
+                    if isinstance(r.get("lat_avg_us"), (int, float))]
+        lat_p99s = [r["lat_p99_us"] for snap in results for r in snap
+                    if isinstance(r.get("lat_p99_us"), (int, float))]
+        if not bws and not mrs and not lat_avgs:
             return
         row = self._stats_table.rowCount()
         self._stats_table.setRowCount(row + 1)
         self._stats_table.setItem(row, 0, QTableWidgetItem("Σ"))
         self._stats_table.setItem(
             row, 1, QTableWidgetItem(f"{len(results)} iterations"))
+        # Samples column shows whichever metric we actually have.
+        n_samples = len(lat_avgs) if lat_avgs else len(bws)
         self._stats_table.setItem(
-            row, 2,
-            QTableWidgetItem(f"{len(bws)} samples"))
+            row, 2, QTableWidgetItem(f"{n_samples} samples"))
         self._stats_table.setItem(row, 3, QTableWidgetItem("summary"))
-        if bws:
-            avg = sum(bws) / len(bws)
+        # v0.5.180: lat-flavoured Σ when lat samples exist.
+        if lat_avgs:
+            avg = sum(lat_avgs) / len(lat_avgs)
             self._stats_table.setItem(
                 row, 4,
                 QTableWidgetItem(
                     f"avg={avg:.2f} "
-                    f"min={min(bws):.2f} "
-                    f"max={max(bws):.2f}"
-                ),
-            )
-        if mrs:
-            avg = sum(mrs) / len(mrs)
-            self._stats_table.setItem(
-                row, 5,
-                QTableWidgetItem(
-                    f"avg={avg:.4f} "
-                    f"min={min(mrs):.4f} "
-                    f"max={max(mrs):.4f}"
-                ),
-            )
+                    f"min={min(lat_avgs):.2f} "
+                    f"max={max(lat_avgs):.2f}"))
+            if lat_p99s:
+                p99_avg = sum(lat_p99s) / len(lat_p99s)
+                self._stats_table.setItem(
+                    row, 5,
+                    QTableWidgetItem(
+                        f"avg={p99_avg:.2f} "
+                        f"min={min(lat_p99s):.2f} "
+                        f"max={max(lat_p99s):.2f}"))
+        else:
+            if bws:
+                avg = sum(bws) / len(bws)
+                self._stats_table.setItem(
+                    row, 4,
+                    QTableWidgetItem(
+                        f"avg={avg:.2f} "
+                        f"min={min(bws):.2f} "
+                        f"max={max(bws):.2f}"))
+            if mrs:
+                avg = sum(mrs) / len(mrs)
+                self._stats_table.setItem(
+                    row, 5,
+                    QTableWidgetItem(
+                        f"avg={avg:.4f} "
+                        f"min={min(mrs):.4f} "
+                        f"max={max(mrs):.4f}"))
         self._stats_table.scrollToBottom()
 
     def _append_run_log_entry(self) -> None:
@@ -1903,19 +2012,51 @@ class RdmaTopologyDialog(QDialog):
         rows: List[Dict[str, Any]] = []
         for snap in getattr(self, "_iteration_results", []):
             for r in snap:
-                rows.append({
+                row: Dict[str, Any] = {
                     "label": f"#{r.get('iter', '?')}.{r.get('pair_index', '?')}",
                     "state": (f"rc={r.get('rc')}"
                               if r.get("rc") is not None else "?"),
                     "bw_gbps": r.get("bw"),
                     "msgrate_mpps": r.get("msgrate"),
-                })
+                }
+                # v0.5.179: forward lat fields. The HTML report's
+                # `has_lat = any(... "lat_avg_us" ...)` dispatch
+                # flips to the latency columns iff at least one
+                # row carries `lat_avg_us`. Pre-fix the Topology
+                # report ALWAYS rendered BW columns → lat runs
+                # showed `—` everywhere.
+                if r.get("lat_avg_us") is not None:
+                    row["lat_avg_us"] = r.get("lat_avg_us")
+                    row["lat_min_us"] = r.get("lat_min_us")
+                    row["lat_max_us"] = r.get("lat_max_us")
+                    row["lat_p99_us"] = r.get("lat_p99_us")
+                if r.get("iters") is not None:
+                    row["iters"] = r.get("iters")
+                rows.append(row)
+        # v0.5.179: aggregate lat-flavoured summary when the run
+        # was a *_lat. Mirrors the Blast v0.5.176 path so the
+        # report's `_render_lat_summary` gets the same shape.
         summary = None
         bws = [r["bw_gbps"] for r in rows
                if isinstance(r.get("bw_gbps"), (int, float))]
         mrs = [r["msgrate_mpps"] for r in rows
                if isinstance(r.get("msgrate_mpps"), (int, float))]
-        if bws:
+        lats = [r["lat_avg_us"] for r in rows
+                if isinstance(r.get("lat_avg_us"), (int, float))]
+        if lats:
+            summary = {
+                "samples": len(lats),
+                "lat_avg_us": sum(lats) / len(lats),
+                "lat_min_us": min(
+                    (r.get("lat_min_us") for r in rows
+                     if isinstance(r.get("lat_min_us"), (int, float))),
+                    default=min(lats)),
+                "lat_max_us": max(
+                    (r.get("lat_max_us") for r in rows
+                     if isinstance(r.get("lat_max_us"), (int, float))),
+                    default=max(lats)),
+            }
+        elif bws:
             summary = {
                 "samples": len(bws),
                 "bw_avg_gbps": sum(bws) / len(bws),
@@ -2014,7 +2155,13 @@ class RdmaTopologyDialog(QDialog):
     def _render_results_card(self) -> None:
         """Build a headline summary from the just-appended _run_log
         entry and show it above the per-pair grid. Mirrors Blast's
-        card with topology-specific extras (pairs / iterations)."""
+        card with topology-specific extras (pairs / iterations).
+
+        v0.5.179: dispatch on lat vs BW. Pre-fix this method
+        rendered a "X.XX Gbps | Y.YY Mpps" headline for every
+        run including `*_lat`, which showed "— Gbps | — Mpps"
+        because lat jobs don't populate bw/msgrate. Now lat runs
+        get "X.XX µs avg | Y.YY µs p99 · …" headlines instead."""
         log = getattr(self, "_run_log", []) or []
         if not log:
             return
@@ -2022,6 +2169,17 @@ class RdmaTopologyDialog(QDialog):
         params = run.get("params") or {}
         summary = run.get("summary") or {}
         rows = run.get("rows") or []
+        # v0.5.179: lat vs BW dispatch. Same logic as Blast's
+        # `_render_results_card` at widgets/rdma_blast_flow_dialog.py.
+        is_lat_run = (
+            isinstance(summary.get("lat_avg_us"), (int, float))
+            or any(isinstance(r.get("lat_avg_us"), (int, float))
+                   for r in rows)
+        )
+        if is_lat_run:
+            self._render_lat_results_card(run, params, summary, rows)
+            return
+
         if isinstance(summary.get("bw_avg_gbps"), (int, float)) \
                 and summary.get("samples", 0) > 1:
             headline_bw = float(summary["bw_avg_gbps"])
@@ -2092,6 +2250,77 @@ class RdmaTopologyDialog(QDialog):
             f"color:#064e3b;'>{mr_txt}</span>"
             f"<span style='font-size:11px; color:#065f46;'>"
             f" Mpps</span>"
+            f" &nbsp; "
+            f"<span style='font-size:11px; color:#047857;'>"
+            f"{tail}</span>"
+        )
+        self._results_card.setText(html)
+        self._results_card.setVisible(True)
+
+    def _render_lat_results_card(self, run, params, summary, rows):
+        """v0.5.179: latency-flavoured headline. Mirrors the Blast
+        dialog's `_render_lat_results_card` shape so operators
+        looking at a Topology lat report see the same format
+        they're already familiar with from Blast."""
+        if isinstance(summary.get("lat_avg_us"), (int, float)):
+            avg_us = float(summary["lat_avg_us"])
+            headline_label = (
+                f"average across {int(summary.get('samples', 1))} samples"
+                if summary.get("samples", 0) > 1 else "final"
+            )
+        else:
+            lats = [r["lat_avg_us"] for r in rows
+                    if isinstance(r.get("lat_avg_us"), (int, float))]
+            avg_us = lats[-1] if lats else None
+            headline_label = "final"
+        p99_rows = [r.get("lat_p99_us") for r in rows
+                    if isinstance(r.get("lat_p99_us"), (int, float))]
+        p99_us = p99_rows[-1] if p99_rows else None
+        avg_txt = (f"{avg_us:.2f}" if isinstance(avg_us, float)
+                   else "—")
+        p99_txt = (f"{p99_us:.2f}" if isinstance(p99_us, float)
+                   else "—")
+
+        extras = []
+        if (isinstance(summary.get("lat_min_us"), (int, float))
+                and isinstance(summary.get("lat_max_us"), (int, float))
+                and summary.get("samples", 0) > 1):
+            extras.append(
+                f"min {summary['lat_min_us']:.2f} / "
+                f"max {summary['lat_max_us']:.2f} µs")
+        n_pairs = len(
+            (run.get("endpoints") or {}).get("pairs") or [])
+        if n_pairs:
+            extras.append(
+                f"{n_pairs} pair{'s' if n_pairs != 1 else ''}")
+        if params.get("iterations", 1) > 1:
+            extras.append(f"{params['iterations']} iterations")
+        if params.get("parallel_workers", 1) > 1:
+            extras.append(
+                f"{params['parallel_workers']} workers/pair")
+        if params.get("duration_s"):
+            extras.append(f"{params['duration_s']}s per run")
+
+        tail_bits = [
+            escape(str(params.get('shape') or '?')),
+            escape(headline_label),
+        ]
+        tail_bits.extend(escape(b) for b in extras)
+        tail = " · ".join(tail_bits)
+        html = (
+            f"<span style='font-size:11px; color:#065f46; "
+            f"font-weight:600;'>✓ "
+            f"{escape(run.get('test') or '?')}</span>"
+            f" &nbsp; "
+            f"<span style='font-size:18px; font-weight:700; "
+            f"color:#064e3b;'>{avg_txt}</span>"
+            f"<span style='font-size:11px; color:#065f46;'>"
+            f" µs avg</span>"
+            f" &nbsp;|&nbsp; "
+            f"<span style='font-size:14px; font-weight:600; "
+            f"color:#064e3b;'>{p99_txt}</span>"
+            f"<span style='font-size:11px; color:#065f46;'>"
+            f" µs p99</span>"
             f" &nbsp; "
             f"<span style='font-size:11px; color:#047857;'>"
             f"{tail}</span>"
