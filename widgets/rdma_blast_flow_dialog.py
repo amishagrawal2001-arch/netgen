@@ -624,6 +624,38 @@ class RdmaBlastFlowDialog(QDialog):
         self._cpu_util_check = QCheckBox("CPU util")
         self._cpu_util_check.setToolTip("perftest --cpu_util")
 
+        # v0.5.177: Spirent/Ixia-style latency-vs-size sweep. Adds
+        # `-a` to perftest so it runs every power-of-2 size from
+        # 2 B → 8 MB and emits one row per size with full
+        # min/typ/avg/max/stdev/p99/p99.9. Only meaningful for the
+        # _lat tests — for _bw a sweep makes the run minutes long
+        # without adding insight, so we hide the checkbox there.
+        self._sweep_sizes_check = QCheckBox("Sweep sizes (RFC 2544)")
+        self._sweep_sizes_check.setToolTip(
+            "Run an RFC 2544-style latency characterization: "
+            "perftest -a sweeps every power-of-2 message size from "
+            "2 B to 8 MB and reports min / typ / avg / max / stdev / "
+            "p99 / p99.9 at each size. Spirent/Ixia call this a "
+            "'latency-vs-size curve'.\n\n"
+            "When enabled: Message size + Duration are ignored; "
+            "iterations-per-size from the spinbox to the right is "
+            "used instead. Only available on the *_lat tests."
+        )
+        self._sweep_sizes_check.toggled.connect(self._on_sweep_toggled)
+        self._sweep_iters_spin = QSpinBox()
+        self._sweep_iters_spin.setRange(100, 100_000)
+        self._sweep_iters_spin.setValue(5000)
+        self._sweep_iters_spin.setFixedWidth(110)
+        self._sweep_iters_spin.setSuffix(" /size")
+        self._sweep_iters_spin.setToolTip(
+            "Iterations per message size (perftest -n). 5000 is "
+            "enough to stabilise t_avg + p99 at small sizes without "
+            "the 8 MB tail blowing past 30 s. Drop to 1000 for a "
+            "quick characterization; raise to 20000+ for paper-"
+            "grade jitter analysis."
+        )
+        self._sweep_iters_spin.setEnabled(False)  # gated by checkbox
+
         # Layout — 4 rows × 2 columns + 1 row of checkboxes.
         # Row 0: Test type | MTU
         tg.addWidget(QLabel("Test type:"), 0, 0, Qt.AlignRight)
@@ -739,15 +771,26 @@ class RdmaBlastFlowDialog(QDialog):
             "5–20 iterations is a sensible range."
         )
         tg.addWidget(self._iterations_spin, 4, 1)
-        # Row 5: both checkboxes inline
+        # Row 5: checkboxes + sweep controls inline. Order chosen so
+        # the latency-sweep group reads as ONE block ("sweep sizes:
+        # N per size") rather than two unrelated controls.
         cb_row = QHBoxLayout()
         cb_row.setSpacing(16)
         cb_row.addWidget(self._bidir_check)
         cb_row.addWidget(self._cpu_util_check)
+        cb_row.addSpacing(20)
+        cb_row.addWidget(self._sweep_sizes_check)
+        cb_row.addWidget(self._sweep_iters_spin)
         cb_row.addStretch(1)
         cb_holder = QWidget()
         cb_holder.setLayout(cb_row)
         tg.addWidget(cb_holder, 5, 0, 1, 4)
+        # Sweep controls visibility is gated on test type — only
+        # *_lat tests benefit from -a. Hook the test combo so the
+        # sweep group disables/re-greys when the operator switches.
+        self._test_combo.currentIndexChanged.connect(
+            self._refresh_sweep_visibility)
+        self._refresh_sweep_visibility()
         # Stretch values get the widgets to be wide enough.
         tg.setColumnStretch(1, 1)
         tg.setColumnStretch(3, 1)
@@ -1077,7 +1120,7 @@ class RdmaBlastFlowDialog(QDialog):
 
     def _common_opts(self) -> Dict[str, Any]:
         """Compose the test params that go on BOTH sides verbatim."""
-        return {
+        opts = {
             "msg_size": int(self._msg_size_spin.value()),
             "qp_count": int(self._qp_count_spin.value()),
             "duration": int(self._duration_spin.value()),
@@ -1088,6 +1131,37 @@ class RdmaBlastFlowDialog(QDialog):
             "cpu_util": bool(self._cpu_util_check.isChecked()),
             "report_gbits": True,
         }
+        # v0.5.177: latency-vs-size sweep. Backend ignores msg_size +
+        # duration when sweep_sizes=True, but we send them anyway so
+        # the legacy parser still has a fallback if the operator
+        # toggles back to a normal run mid-job.
+        if (self._sweep_sizes_check.isChecked()
+                and self._sweep_sizes_check.isVisibleTo(self)):
+            opts["sweep_sizes"] = True
+            opts["iterations_per_size"] = int(
+                self._sweep_iters_spin.value())
+        return opts
+
+    def _on_sweep_toggled(self, checked: bool) -> None:
+        """v0.5.177: when the sweep checkbox flips on, grey out the
+        Message size + Duration fields (perftest -a ignores both)
+        and enable the per-size iterations spinbox so it's clear
+        what governs the run."""
+        self._sweep_iters_spin.setEnabled(checked)
+        self._msg_size_spin.setEnabled(not checked)
+        self._duration_spin.setEnabled(not checked)
+
+    def _refresh_sweep_visibility(self) -> None:
+        """Hide the sweep group entirely when a *_bw test is picked
+        (sweep on BW just makes a 12-minute run with no extra signal
+        vs single-size). For *_lat tests the group is the whole
+        reason this feature exists."""
+        is_lat = (self._test_combo.currentData() or "").endswith("_lat")
+        for w in (self._sweep_sizes_check, self._sweep_iters_spin):
+            w.setVisible(is_lat)
+        if not is_lat and self._sweep_sizes_check.isChecked():
+            # Un-tick so the next *_lat selection starts fresh.
+            self._sweep_sizes_check.setChecked(False)
 
     # ───────── v0.5.159 stats view auto-scroll
 
@@ -1945,6 +2019,12 @@ class RdmaBlastFlowDialog(QDialog):
         self._client_lat_min_us = None
         self._client_lat_max_us = None
         self._client_lat_p99_us = None
+        # v0.5.177: RFC 2544-style latency-vs-size sweep. When the
+        # operator ticks "Sweep sizes", the server-side parser
+        # accumulates per-size rows into job["final_lat_sweep"];
+        # we mirror that here so the run-log entry + HTML report
+        # can render the chart.
+        self._client_lat_sweep = None
         # v0.5.159 REGRESSION FIX: v0.5.157 cleared the host-info
         # cache here on every Start. That was wrong — host_info is
         # a HOST-LEVEL fact (NUMA topology + full hca_numa map for
@@ -2290,6 +2370,10 @@ class RdmaBlastFlowDialog(QDialog):
                     self._client_lat_max_us = job.get("final_lat_max_us")
                 if job.get("final_lat_p99_us") is not None:
                     self._client_lat_p99_us = job.get("final_lat_p99_us")
+                # v0.5.177: sweep payload (one entry per message size).
+                sweep = job.get("final_lat_sweep")
+                if sweep:
+                    self._client_lat_sweep = sweep
 
         s_done = (self._server_job_id is None) or self._server_finished
         c_done = (self._client_job_id is None) or self._client_finished
@@ -2502,6 +2586,11 @@ class RdmaBlastFlowDialog(QDialog):
         entry in `_run_log` so the operator can export the whole
         session as HTML."""
         import datetime as _dt
+        # v0.5.177: sweep flag + per-size iterations carried in
+        # params so the HTML report renderer can pick the right
+        # section ("RFC 2544-style sweep" vs "single-size run").
+        is_sweep = bool(self._sweep_sizes_check.isChecked()
+                        and self._sweep_sizes_check.isVisibleTo(self))
         params = {
             "test": self._test_combo.currentText(),
             "msg_size": int(self._msg_size_spin.value()),
@@ -2514,6 +2603,9 @@ class RdmaBlastFlowDialog(QDialog):
             "cpu_util": bool(self._cpu_util_check.isChecked()),
             "parallel_workers": int(self._parallel_workers_spin.value()),
             "iterations": int(self._iterations_spin.value()),
+            "sweep_sizes": is_sweep,
+            "iterations_per_size": (
+                int(self._sweep_iters_spin.value()) if is_sweep else None),
         }
         rows: List[Dict[str, Any]] = []
         # Multi-iteration: one row per (iter), then per-worker.
@@ -2634,6 +2726,12 @@ class RdmaBlastFlowDialog(QDialog):
             ],
             "rows": rows,
             "summary": summary,
+            # v0.5.177: sweep payload (Spirent/Ixia-style lat-vs-size
+            # curve). Present iff the operator ticked "Sweep sizes"
+            # AND perftest produced -a's per-size rows. Each entry:
+            # {bytes, iters, lat_min_us, lat_max_us, lat_typ_us,
+            # lat_avg_us, lat_stdev_us, lat_p99_us, lat_p999_us}.
+            "lat_sweep": getattr(self, "_client_lat_sweep", None),
         }
         self._run_log.append(entry)
 

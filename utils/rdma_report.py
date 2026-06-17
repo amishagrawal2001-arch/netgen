@@ -310,12 +310,20 @@ def _render_run_section(idx: int, run: Dict[str, Any]) -> str:
         run.get("rows") or [],
         run.get("summary") or None,
     )
+    # v0.5.177: RFC 2544-style latency-vs-size curve. Appended when
+    # the run carries `lat_sweep` (Spirent/Ixia-style). Empty string
+    # for single-size runs so the legacy layout is unchanged.
+    sweep_section = _render_lat_sweep_section(
+        run.get("lat_sweep") or [],
+        run.get("params") or {},
+    )
     return (
         f"<section class='run-card'>"
         f"{head}{headline}"
         f"<h3>Parameters</h3>{params}"
         f"<h3>Endpoints</h3>{endpoints}"
         f"<h3>Results</h3>{rows}"
+        f"{sweep_section}"
         f"</section>"
     )
 
@@ -782,3 +790,235 @@ def _fmt(v: Any, places: int) -> str:
     if isinstance(v, (int, float)):
         return f"{float(v):.{places}f}"
     return "—"
+
+
+# ───── v0.5.177 RFC 2544-style latency-vs-size sweep ─────────────
+
+
+def _fmt_bytes(n: int) -> str:
+    """Human-readable message size: 2 B, 64 B, 1 KiB, 1 MiB."""
+    if n < 1024:
+        return f"{n} B"
+    if n < 1024 * 1024:
+        return f"{n // 1024} KiB"
+    return f"{n // (1024 * 1024)} MiB"
+
+
+def _render_lat_sweep_section(
+    sweep: List[Dict[str, Any]],
+    params: Dict[str, Any],
+) -> str:
+    """RFC 2544-style latency-vs-size table + inline SVG line chart.
+
+    Operators reading this section want one thing fast: the
+    latency curve as a function of message size. We render the
+    table first (sortable in any browser by copy-paste) and put
+    the chart above it as a visual orientation. The chart is
+    inline SVG so the report file stays self-contained — no JS,
+    no external assets.
+
+    Empty sweep → empty string (no section header). Single-row
+    sweeps still render but the chart degrades to one point — the
+    table is the carrier in that case.
+    """
+    if not sweep:
+        return ""
+    # Sort by message size so the chart x-axis is monotonic even if
+    # perftest emitted rows out of order on a recovery / retry path.
+    rows = sorted(sweep, key=lambda r: int(r.get("bytes") or 0))
+    per_size = params.get("iterations_per_size")
+    per_size_txt = (
+        f" · {per_size} iters/size" if per_size else "")
+    header = (
+        "<h3 style='margin-top:18px;'>"
+        "Latency vs Message Size "
+        "<span style='font-size:12px; color:#6b7280; font-weight:400;'>"
+        f"(RFC 2544-style{per_size_txt})</span>"
+        "</h3>"
+    )
+    chart = _render_lat_sweep_chart(rows)
+    table = _render_lat_sweep_table(rows)
+    return f"{header}{chart}{table}"
+
+
+def _render_lat_sweep_chart(rows: List[Dict[str, Any]]) -> str:
+    """Inline SVG: log-x message size, linear-y µs. One line for
+    avg latency, lighter band for min↔max envelope. No JS — pure
+    SVG so the report stays self-contained when archived."""
+    sizes = [int(r["bytes"]) for r in rows if r.get("bytes")]
+    avgs = [r.get("lat_avg_us") for r in rows]
+    mins = [r.get("lat_min_us") for r in rows]
+    maxs = [r.get("lat_max_us") for r in rows]
+    p99s = [r.get("lat_p99_us") for r in rows]
+    if not sizes or not any(isinstance(a, (int, float)) for a in avgs):
+        return ""
+    import math as _m
+    # Plot box.
+    W, H = 700, 280
+    PAD_L, PAD_R, PAD_T, PAD_B = 56, 20, 18, 40
+    plot_w = W - PAD_L - PAD_R
+    plot_h = H - PAD_T - PAD_B
+    # Log-x — perftest sizes are powers of two so log2 spans evenly.
+    log_min = _m.log2(min(sizes))
+    log_max = _m.log2(max(sizes))
+    log_span = max(log_max - log_min, 1.0)
+    # Linear-y, padded 5%.
+    valid_lats: List[float] = []
+    for vals in (mins, avgs, maxs, p99s):
+        valid_lats.extend(
+            v for v in vals if isinstance(v, (int, float)))
+    y_min = 0.0
+    y_max = max(valid_lats) * 1.10 if valid_lats else 1.0
+
+    def x_of(b: int) -> float:
+        return PAD_L + ((_m.log2(b) - log_min) / log_span) * plot_w
+
+    def y_of(v: float) -> float:
+        return PAD_T + plot_h - ((v - y_min) / (y_max - y_min)) * plot_h
+    # Y axis gridlines at 5 evenly-spaced µs values.
+    grid_lines = []
+    for i in range(5):
+        v = y_min + (i / 4.0) * (y_max - y_min)
+        y = y_of(v)
+        grid_lines.append(
+            f"<line x1='{PAD_L}' y1='{y:.1f}' x2='{W - PAD_R}' "
+            f"y2='{y:.1f}' stroke='#e5e7eb' stroke-width='1'/>"
+            f"<text x='{PAD_L - 6}' y='{y + 4:.1f}' "
+            f"text-anchor='end' font-size='10' fill='#6b7280'>"
+            f"{v:.1f}</text>"
+        )
+    # X axis size labels — every other power-of-two so the labels
+    # don't overlap on dense sweeps.
+    x_labels = []
+    for i, b in enumerate(sizes):
+        if i % 2 == 0 or i == len(sizes) - 1:
+            x = x_of(b)
+            x_labels.append(
+                f"<text x='{x:.1f}' y='{H - PAD_B + 14}' "
+                f"text-anchor='middle' font-size='10' fill='#6b7280'>"
+                f"{_fmt_bytes(b)}</text>"
+            )
+    # Min/max envelope.
+    envelope_parts: List[str] = []
+    have_envelope = (
+        any(isinstance(v, (int, float)) for v in mins)
+        and any(isinstance(v, (int, float)) for v in maxs))
+    if have_envelope:
+        # Forward (min) then reverse (max) → closed polygon.
+        fwd = " ".join(
+            f"{x_of(b):.1f},{y_of(float(v)):.1f}"
+            for b, v in zip(sizes, mins)
+            if isinstance(v, (int, float)))
+        rev = " ".join(
+            f"{x_of(b):.1f},{y_of(float(v)):.1f}"
+            for b, v in reversed(list(zip(sizes, maxs)))
+            if isinstance(v, (int, float)))
+        envelope_parts.append(
+            f"<polygon points='{fwd} {rev}' fill='#a7f3d0' "
+            f"fill-opacity='0.45' stroke='none'/>"
+        )
+    # Avg line.
+    avg_pts = [
+        f"{x_of(b):.1f},{y_of(float(v)):.1f}"
+        for b, v in zip(sizes, avgs)
+        if isinstance(v, (int, float))
+    ]
+    avg_line = (
+        f"<polyline fill='none' stroke='#059669' stroke-width='2' "
+        f"points='{' '.join(avg_pts)}'/>" if avg_pts else "")
+    # Avg circles.
+    avg_dots = "".join(
+        f"<circle cx='{x_of(b):.1f}' cy='{y_of(float(v)):.1f}' "
+        f"r='3' fill='#065f46'/>"
+        for b, v in zip(sizes, avgs)
+        if isinstance(v, (int, float))
+    )
+    # p99 line (dashed) if available.
+    p99_pts = [
+        f"{x_of(b):.1f},{y_of(float(v)):.1f}"
+        for b, v in zip(sizes, p99s)
+        if isinstance(v, (int, float))
+    ]
+    p99_line = (
+        f"<polyline fill='none' stroke='#b45309' stroke-width='1.5' "
+        f"stroke-dasharray='4,3' points='{' '.join(p99_pts)}'/>"
+        if p99_pts else "")
+    # Legend.
+    legend = (
+        f"<g transform='translate({PAD_L + 8},{PAD_T + 4})' "
+        f"font-size='10' fill='#374151'>"
+        f"<line x1='0' y1='4' x2='14' y2='4' stroke='#059669' "
+        f"stroke-width='2'/>"
+        f"<text x='18' y='8'>avg</text>"
+    )
+    legend_x = 46
+    if p99_pts:
+        legend += (
+            f"<line x1='{legend_x}' y1='4' x2='{legend_x + 14}' "
+            f"y2='4' stroke='#b45309' stroke-width='1.5' "
+            f"stroke-dasharray='4,3'/>"
+            f"<text x='{legend_x + 18}' y='8'>p99</text>"
+        )
+        legend_x += 50
+    if have_envelope:
+        legend += (
+            f"<rect x='{legend_x}' y='0' width='14' height='8' "
+            f"fill='#a7f3d0' fill-opacity='0.55'/>"
+            f"<text x='{legend_x + 18}' y='8'>min–max</text>"
+        )
+    legend += "</g>"
+    # Y axis label.
+    y_label = (
+        f"<text x='{PAD_L - 38}' y='{PAD_T + plot_h / 2}' "
+        f"transform='rotate(-90 {PAD_L - 38} {PAD_T + plot_h / 2})' "
+        f"text-anchor='middle' font-size='11' fill='#374151' "
+        f"font-weight='600'>Latency (µs)</text>"
+    )
+    return (
+        f"<div style='margin:8px 0 14px 0; "
+        f"border:1px solid #e5e7eb; border-radius:6px; "
+        f"padding:6px 4px;'>"
+        f"<svg viewBox='0 0 {W} {H}' width='100%' "
+        f"style='max-width:{W}px; display:block;'>"
+        f"{''.join(grid_lines)}"
+        f"{''.join(envelope_parts)}"
+        f"{avg_line}{p99_line}{avg_dots}"
+        f"{''.join(x_labels)}"
+        f"{y_label}{legend}"
+        f"</svg></div>"
+    )
+
+
+def _render_lat_sweep_table(rows: List[Dict[str, Any]]) -> str:
+    header = (
+        "<tr>"
+        "<th>Size</th>"
+        "<th class='num'>Iters</th>"
+        "<th class='num'>Min (µs)</th>"
+        "<th class='num'>Typ (µs)</th>"
+        "<th class='num'>Avg (µs)</th>"
+        "<th class='num'>Max (µs)</th>"
+        "<th class='num'>StdDev (µs)</th>"
+        "<th class='num'>p99 (µs)</th>"
+        "<th class='num'>p99.9 (µs)</th>"
+        "</tr>"
+    )
+    body = "".join(
+        "<tr>"
+        f"<td>{_fmt_bytes(int(r.get('bytes') or 0))}</td>"
+        f"<td class='num'>{r.get('iters', '—')}</td>"
+        f"<td class='num'>{_fmt(r.get('lat_min_us'), 2)}</td>"
+        f"<td class='num'>{_fmt(r.get('lat_typ_us'), 2)}</td>"
+        f"<td class='num'>{_fmt(r.get('lat_avg_us'), 2)}</td>"
+        f"<td class='num'>{_fmt(r.get('lat_max_us'), 2)}</td>"
+        f"<td class='num'>{_fmt(r.get('lat_stdev_us'), 2)}</td>"
+        f"<td class='num'>{_fmt(r.get('lat_p99_us'), 2)}</td>"
+        f"<td class='num'>{_fmt(r.get('lat_p999_us'), 2)}</td>"
+        "</tr>"
+        for r in rows
+    )
+    return (
+        f"<table class='results'>"
+        f"<thead>{header}</thead>"
+        f"<tbody>{body}</tbody></table>"
+    )

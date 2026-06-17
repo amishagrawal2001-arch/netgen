@@ -2,6 +2,101 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.177] - 2026-06-17
+
+**Spirent/Ixia-style RDMA latency characterization + send_lat
+duration-mode parser fix.**
+
+Operator: "lets implement spirent/ixia type behavior for rdma
+latency test and provide clear reporting" — plus end-to-end
+verification on srv06 had already proved that even single-size
+latency runs were silently dropping every sample because the
+existing parser only recognised perftest's 9-column
+iteration-mode output, not the 4-column shape `-D N` actually
+emits.
+
+### 1 — send_lat / read_lat / write_lat parser fix
+
+Real srv06 stdout for `ib_send_lat -D 30`:
+
+```
+#bytes        #iterations       t_avg[usec]    tps average
+2             1577611            1.90           262864.28
+```
+
+Only 4 columns — no min / max / typ / stdev / p99 / p99.9. The
+existing `_RE_LAT_DATA_ROW` required all 9 columns, so every
+single-size latency run from the Blast dialog left every
+`final_lat_*` field as `None`. v0.5.176's client-side capture
+was correct but had nothing to capture.
+
+Fix: new `_RE_LAT_DATA_ROW_DURATION` regex with a duration-mode
+fallback in the stdout reader. When the 9-col regex misses, the
+4-col regex matches and populates `final_lat_avg_us`. min/max/
+p99 stay `None` and render as `—` (honest), instead of being
+silently dropped along with avg.
+
+### 2 — RFC 2544-style latency-vs-size sweep
+
+`perftest -a` cycles through every power-of-two message size
+from 2 B to 8 MB and emits one row per size with the full
+min/typ/avg/max/stdev/p99/p99.9 spread. This is what Spirent
+and Ixia call a "latency-vs-size curve" and is the right way
+to characterise an RDMA fabric.
+
+* **Backend** (`utils/rdma_perf.py`): new `sweep_sizes: bool`
+  + `iterations_per_size: int` start-req fields. When set, cmd
+  builder appends `-a -n <N>` and suppresses `-D` and `-s`.
+  Stdout reader accumulates EVERY 9-col row into
+  `PerftestJob.final_lat_sweep: List[Dict]`, each entry
+  carrying bytes / iters / lat_min / lat_max / lat_typ /
+  lat_avg / lat_stdev / lat_p99 / lat_p999.
+* **GUI** (`widgets/rdma_blast_flow_dialog.py`): new
+  "Sweep sizes (RFC 2544)" checkbox + iterations-per-size
+  spinbox (default 5000). Visible only when test type is a
+  `*_lat`. When ticked, Message size + Duration grey out
+  (perftest ignores both under `-a`). Auto-unticks if the
+  operator switches back to a `*_bw` test.
+* **HTML report** (`utils/rdma_report.py`): new section
+  "Latency vs Message Size (RFC 2544-style)" with an inline
+  SVG line chart (log-x message size, linear-y µs, solid
+  green avg line, dashed amber p99, light green min↔max
+  envelope) followed by a per-size 9-column table
+  (Size · Iters · Min · Typ · Avg · Max · StdDev · p99 ·
+  p99.9). No JS, no external assets — the report stays
+  self-contained for archival.
+* **Plumbing**: dialog mirrors `final_lat_sweep` into a new
+  `_client_lat_sweep` instance var, the run-log entry carries
+  the sweep payload, and the report builder appends the
+  sweep section only when present (legacy / single-size runs
+  unchanged).
+
+### Tests (87 lat-related, all green)
+
+* `tests/test_v05177_lat_duration_mode_regex.py`: pinned to
+  srv06's verbatim 4-col stdout, asserts the new regex
+  extracts `t_avg=1.90`; verifies the 9-col regex still
+  matches its old shape and does NOT match the 4-col shape.
+* `tests/test_v05177_lat_sweep.py`: regex matches each row in
+  a multi-size sweep; cmd builder emits `-a -n N` (not `-D`
+  / `-s`) under sweep mode; default `iterations_per_size`
+  = 5000; `PerftestJob.final_lat_sweep` round-trips through
+  `to_public_dict`.
+* `tests/test_v05177_lat_sweep_report.py`: full
+  `build_html_report` integration — sweep run renders the
+  chart + 9-column table; non-sweep BW run leaves no sweep
+  section (no "Latency vs Message Size" header on every
+  BW report). Chart degrades to avg-only when min/max
+  absent. No `<script>` or `<img>` tags — self-contained.
+
+### Verification status
+
+Code-level: 87/87 tests pass. Regex matches the exact srv06
+duration-mode stdout. Sample sweep report rendered to
+`/tmp/netgen-lat-sweep-sample.html` for visual review.
+
+End-to-end on srv06 lands when this wheel is installed there.
+
 ## [0.5.176] - 2026-06-17
 
 **Two RDMA report bugs: lat tests and read_bw.**

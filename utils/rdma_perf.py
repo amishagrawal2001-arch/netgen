@@ -211,6 +211,13 @@ class PerftestJob:
     final_lat_avg_us: Optional[float] = None
     final_lat_max_us: Optional[float] = None
     final_lat_p99_us: Optional[float] = None
+    # v0.5.177: Spirent/Ixia-style latency-vs-size sweep. One entry
+    # per message size when perftest is run with `-a -n N`. Each
+    # entry: {bytes, iters, lat_min_us, lat_max_us, lat_typ_us,
+    # lat_avg_us, lat_stdev_us, lat_p99_us, lat_p999_us}. None
+    # values are preserved as None rather than 0.0 so the report
+    # renders `—` for unreported columns.
+    final_lat_sweep: Optional[List[Dict[str, Any]]] = None
     # Running stdout buffer (capped):
     stdout_tail: List[str] = field(default_factory=list)
 
@@ -997,8 +1004,18 @@ def _build_perftest_cmd(
     if gid_index is not None:
         cmd += ["-x", str(gid_index)]
 
+    # v0.5.177: Spirent/Ixia-style message-size sweep. When the
+    # operator picks "Sweep message sizes", we let perftest cycle
+    # through every power-of-2 size (2 B → 8 MB) and emit one row
+    # per size. -a forces sweep mode; we MUST also switch from
+    # -D (duration) to -n (iterations per size) because perftest
+    # uses -n's count as the per-size sample budget. Suppressing
+    # -s here is deliberate — when -a is on, -s is ignored and a
+    # user-set -s would just clutter the cmdline.
+    sweep_sizes = opts.get("sweep_sizes") is True
+
     msg_size = opts.get("msg_size")
-    if msg_size:
+    if msg_size and not sweep_sizes:
         cmd += ["-s", str(msg_size)]
 
     qp_count = opts.get("qp_count")
@@ -1007,8 +1024,16 @@ def _build_perftest_cmd(
 
     duration = opts.get("duration")
     iterations = opts.get("iterations")
-    # perftest rejects -D and -n together; prefer duration if both set.
-    if duration:
+    if sweep_sizes:
+        cmd += ["-a"]
+        # iterations_per_size has Spirent-style semantics: "this
+        # many ping-pongs at each size". Defaults to 5000 — enough
+        # to stabilise t_avg / p99 without dragging the whole sweep
+        # past 30 s on a healthy HCA.
+        per_size = int(opts.get("iterations_per_size") or 5000)
+        cmd += ["-n", str(per_size)]
+    elif duration:
+        # perftest rejects -D and -n together; prefer duration.
         cmd += ["-D", str(duration)]
     elif iterations:
         cmd += ["-n", str(iterations)]
@@ -1110,6 +1135,25 @@ _RE_LAT_DATA_ROW = re.compile(
     r"(?P<tmin>[\d.]+)\s+(?P<tmax>[\d.]+)\s+"
     r"(?P<ttyp>[\d.]+)\s+(?P<tavg>[\d.]+)\s+"
     r"(?P<tstdev>[\d.]+)\s+(?P<p99>[\d.]+)(?:\s+(?P<p999>[\d.]+))?"
+    r"(?:\s+(?P<cpu_util>[\d.]+))?\s*$"
+)
+
+# v0.5.177: abbreviated 4-column lat row that perftest emits in
+# DURATION mode (`-D N`). The Blast dialog always uses -D, so the
+# 9-column regex above never matched a real run — operator hit
+# this on srv06 with `final_lat_*` staying None across every
+# send_lat / write_lat / read_lat run.
+#
+# Format observed on srv06 (perftest from Ubuntu 22.04 repo):
+#   #bytes        #iterations       t_avg[usec]    tps average
+#   2             1577611            1.90           262864.28
+#
+# Just bytes / iters / t_avg / tps — no min, max, p99 etc.
+# When matched, only `final_lat_avg_us` populates; min/max/p99
+# stay None and the report renders them as `—`.
+_RE_LAT_DATA_ROW_DURATION = re.compile(
+    r"^\s*(?P<bytes>\d+)\s+(?P<iters>\d+)\s+"
+    r"(?P<tavg>[\d.]+)\s+(?P<tps>[\d.]+)"
     r"(?:\s+(?P<cpu_util>[\d.]+))?\s*$"
 )
 
@@ -1237,8 +1281,56 @@ def _reader_thread(job: PerftestJob, proc: subprocess.Popen) -> None:
                             p99 = m.group("p99")
                             if p99:
                                 job.final_lat_p99_us = float(p99)
+                            # v0.5.177: In sweep mode (`-a -n N`)
+                            # perftest emits one 9-col row per size.
+                            # Accumulate each into final_lat_sweep so
+                            # the GUI / report can draw the lat-vs-
+                            # size curve. The final_lat_* scalars
+                            # above keep getting overwritten with the
+                            # last row (largest size) — backward
+                            # compatible with the headline card and
+                            # also a sensible default since 8 MB
+                            # latency is what RDMA workloads actually
+                            # care about.
+                            if job.final_lat_sweep is None:
+                                job.final_lat_sweep = []
+                            p999 = m.group("p999")
+                            job.final_lat_sweep.append({
+                                "bytes": int(m.group("bytes")),
+                                "iters": int(m.group("iters")),
+                                "lat_min_us": float(m.group("tmin")),
+                                "lat_max_us": float(m.group("tmax")),
+                                "lat_typ_us": float(m.group("ttyp")),
+                                "lat_avg_us": float(m.group("tavg")),
+                                "lat_stdev_us": float(m.group("tstdev")),
+                                "lat_p99_us": (float(p99)
+                                               if p99 else None),
+                                "lat_p999_us": (float(p999)
+                                                if p999 else None),
+                            })
                         except (TypeError, ValueError):
                             pass
+                else:
+                    # v0.5.177: fall back to the 4-column duration-mode
+                    # format. perftest emits only bytes/iters/t_avg/tps
+                    # when invoked with -D N (which the Blast dialog
+                    # always does). Without this branch, every
+                    # send_lat / read_lat / write_lat run from the GUI
+                    # left every final_lat_* field as None.
+                    m = _RE_LAT_DATA_ROW_DURATION.match(line)
+                    if m:
+                        with _jobs_lock:
+                            try:
+                                job.final_msg_size_bytes = int(
+                                    m.group("bytes"))
+                                job.final_iterations = int(
+                                    m.group("iters"))
+                                job.final_lat_avg_us = float(
+                                    m.group("tavg"))
+                                # min/max/p99 stay None — perftest
+                                # didn't emit them in duration mode.
+                            except (TypeError, ValueError):
+                                pass
             else:
                 m = _RE_BW_DATA_ROW.match(line)
                 if m:
