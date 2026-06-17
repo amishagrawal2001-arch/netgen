@@ -2,6 +2,52 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.173] - 2026-06-17
+
+**Blast report: drop the redundant worker 0 row when iter rows
+already cover it.**
+
+Operator: "ran itr 1, than ran two itrs, however report picked
+up first and last."
+
+The 2-iter Run #2 was producing rows:
+
+  - iter #0  = 162.93
+  - iter #1  = 162.67
+  - **worker 0 = 162.67**  ← duplicate of iter #1's value
+
+The trailing "worker 0" row always ran the latest `_client_bw`
+through, so for iterate-N runs it just duplicated the last
+iter's value. Operator visually parsed this as "first" (iter #0)
+and "last" (worker 0) — the middle iter #1 row was swallowed
+visually because it had the same value as the worker 0 row that
+followed it.
+
+Also broke the Σ samples count — for a 2-iter run it showed
+"3 samples avg=162.76 min=162.67 max=162.93" instead of
+"2 samples avg=162.80 min=162.67 max=162.93".
+
+### Fix
+
+`_append_run_log_entry` now only emits the trailing worker 0 row
+when it adds information:
+
+  1. **Single-iter run without extras** — worker 0 IS the result
+     (iter rows produced nothing). Row emitted.
+  2. **Parallel run with extras** — worker 0 is the
+     iteration-0 half of the per-worker breakdown the extras
+     started. Row emitted.
+  3. **Iterate-N without extras** — iter rows are the complete
+     breakdown. **Row suppressed.**
+
+### Files touched
+
+* `widgets/rdma_blast_flow_dialog.py` — `_append_run_log_entry`
+  gates the trailing worker 0 row on
+  `extras or not already_have_iter_rows`.
+* `tests/test_v05173_no_dup_worker0_row.py` — 6 assertions
+  covering single-iter, iterate-N, parallel, and mixed cases.
+
 ## [0.5.172] - 2026-06-17
 
 **Three operator-reported fixes.**

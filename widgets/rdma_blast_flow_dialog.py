@@ -2418,7 +2418,8 @@ class RdmaBlastFlowDialog(QDialog):
                 "msgrate_mpps": r.get("msgrate"),
             })
         # Per-extra-worker rows (only meaningful for parallel runs).
-        for w in getattr(self, "_extra_workers", []):
+        extras = getattr(self, "_extra_workers", [])
+        for w in extras:
             rows.append({
                 "label": f"worker {w.get('worker_idx', '?')}",
                 "state": "done"
@@ -2427,13 +2428,28 @@ class RdmaBlastFlowDialog(QDialog):
                 "bw_gbps": w.get("client_bw"),
                 "msgrate_mpps": w.get("client_msgrate"),
             })
-        # Worker 0's final BW.
-        rows.append({
-            "label": "worker 0",
-            "state": "done",
-            "bw_gbps": getattr(self, "_client_bw", None),
-            "msgrate_mpps": getattr(self, "_client_msgrate", None),
-        })
+        # v0.5.173: only emit the trailing "worker 0" row when it
+        # adds information. Two cases where it does:
+        #   1. Single-iter run with no parallel extras — it IS the
+        #      result (the iter rows loop above produced nothing).
+        #   2. Parallel run (extras present) — it's the worker-0
+        #      half of the per-worker breakdown that the extras
+        #      rows started.
+        # Operator saw the redundant copy as "report picked up
+        # first and last" — the iter #N row and the worker 0 row
+        # showed the same BW (worker 0 == last iter's value), so
+        # the iter #N row looked like a "first" entry and worker
+        # 0 looked like a separate "last" entry. The Σ samples
+        # count also drifted because the dup was being averaged
+        # in.
+        already_have_iter_rows = bool(iter_results)
+        if extras or not already_have_iter_rows:
+            rows.append({
+                "label": "worker 0",
+                "state": "done",
+                "bw_gbps": getattr(self, "_client_bw", None),
+                "msgrate_mpps": getattr(self, "_client_msgrate", None),
+            })
         # Σ summary across iterations (if any).
         summary = None
         bws = [r["bw_gbps"] for r in rows
