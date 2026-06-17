@@ -2,6 +2,57 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.175] - 2026-06-17
+
+**Stop DNS-resolution hangs from freezing the GUI.**
+
+Operator pasted a traceback ending in `KeyboardInterrupt` inside
+`socket.getaddrinfo` — the EVPN active-injections chip was doing
+a sync `requests.get(timeout=5)` on the UI thread every 30 s.
+When `san-hp-srv06` stopped resolving (VPN dropped / lab host
+off network), macOS `getaddrinfo` blocked for 30+ seconds at the
+OS level, freezing Qt's event loop. The `timeout=5` arg only
+bounds the post-resolve connect+read; it doesn't touch
+`getaddrinfo` itself. Operator had to Ctrl+C the GUI to recover.
+
+### Two fixes
+
+**1. EVPN chip moved to async fetch** — same pattern as the DPDK
+readiness chip (v0.4.7) and the orphan chip (v0.5.169):
+`_EvpnFetchThread` runs the GET on a one-shot QThread; results
+land back on the UI thread via signal. `_fetch_in_flight` dedup
+guard prevents rapid timer ticks (or DNS slow-fail stacking)
+from queueing concurrent fetches. Transient failures leave the
+previous count visible — no UX blink.
+
+**2. Global socket timeout in client entry** —
+`socket.setdefaulttimeout(8.0)` at the top of `main()` in
+`run_tgen_client.py`. Bounds DNS-resolution time at 8 s for
+ANY remaining sync path (one-shot dialogs, future widgets that
+haven't been audited yet). 8 s is tight enough to never freeze
+the GUI noticeably, generous enough to survive a slow LAN.
+
+### Files touched
+
+* `widgets/evpn_active_chip.py` — `_EvpnFetchThread` class +
+  async `refresh()`. The synchronous request path is gone.
+* `run_tgen_client.py` — `socket.setdefaulttimeout(8.0)` at the
+  top of `main()`.
+* `tests/test_v05175_evpn_chip_async_and_socket_timeout.py` —
+  7 assertions: source-level (no sync request in `refresh()`,
+  dedup guard present, transient-failure UX), widget
+  construction smoke (refresh returns immediately), and the
+  global-timeout call signature.
+
+### Audit notes (not addressed here)
+
+Other periodic-poll widgets that already use the async pattern
+and don't freeze: `dpdk_readiness_chip.py`, `orphan_chip.py`.
+One-shot dialog widgets that still use sync `requests.get` are
+defended by the global socket timeout — if they hang, the cap
+is 8 s, not 30+. A broader async-fetch sweep across all
+widgets is a separate follow-up.
+
 ## [0.5.174] - 2026-06-17
 
 **Blast RDMA Flow dialog widened to 920 px.**

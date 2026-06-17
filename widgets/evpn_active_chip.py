@@ -24,13 +24,56 @@ import os
 from typing import Any, Callable, Dict, List, Optional
 
 import requests
-from PyQt5.QtCore import Qt, QTimer, pyqtSignal
+from PyQt5.QtCore import Qt, QThread, QTimer, pyqtSignal
 from PyQt5.QtWidgets import QLabel, QWidget
 
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_POLL_INTERVAL_MS = 30_000
+
+
+class _EvpnFetchThread(QThread):
+    """v0.5.175: off-UI-thread fetcher for the EVPN active list.
+
+    Pre-fix, `EvpnActiveChip.refresh()` ran `requests.get(timeout=5)`
+    DIRECTLY on the UI thread every 30 s. When the configured
+    server name didn't resolve (lab box off network, VPN dropped),
+    `getaddrinfo()` blocked for the OS-level DNS timeout — 30+ s
+    on macOS — and the entire Qt event loop froze. Operator hit
+    Ctrl+C to recover. Traceback bottomed out in `socket.py`.
+
+    Same pattern as `widgets/dpdk_readiness_chip.py` (v0.4.7) and
+    `widgets/orphan_chip.py` (v0.5.169) — the fetch runs on a
+    one-shot QThread; the chip stays responsive. The thread's
+    finished signal carries the parsed JSON payload back to the
+    UI thread for repaint.
+    """
+
+    payload_ready = pyqtSignal(list)   # items list (possibly empty)
+    failed = pyqtSignal(str)            # error string
+
+    def __init__(self, url: str, *, timeout_s: float = 5.0,
+                 parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self._url = url
+        self._timeout_s = timeout_s
+
+    def run(self) -> None:
+        try:
+            r = requests.get(
+                self._url, headers=_auth_headers(),
+                timeout=self._timeout_s)
+            if r.status_code != 200:
+                self.failed.emit(f"HTTP {r.status_code}")
+                return
+            payload = r.json() or {}
+            items = (payload.get("injections")
+                     or payload.get("items") or [])
+            self.payload_ready.emit(
+                items if isinstance(items, list) else [])
+        except Exception as exc:
+            self.failed.emit(str(exc))
 
 
 class EvpnActiveChip(QLabel):
@@ -51,6 +94,9 @@ class EvpnActiveChip(QLabel):
         self._get_server_url = server_url_provider
         self._poll_interval_ms = int(poll_interval_ms)
         self._count = 0
+        # v0.5.175: dedup so rapid timer ticks don't stack fetches
+        # while one is in flight (would happen when DNS slow-fails).
+        self._fetch_in_flight: Optional[_EvpnFetchThread] = None
         self.setAlignment(Qt.AlignCenter)
         self.setCursor(Qt.PointingHandCursor)
         self.setToolTip(
@@ -71,8 +117,9 @@ class EvpnActiveChip(QLabel):
 
     # ────────────────────────────────────────────────── public API
     def refresh(self) -> None:
-        """Fetch /api/evpn/type2/list, recount, repaint. Safe to call
-        from any context — never raises."""
+        """Fetch /api/evpn/type2/list async, recount, repaint. Safe
+        to call from any context — never raises, never blocks the
+        UI thread."""
         url = self._get_server_url() or ""
         if not url:
             # No server → reset to idle but keep cursor + tooltip so a
@@ -80,25 +127,35 @@ class EvpnActiveChip(QLabel):
             # show its own "select a server" warning).
             self._paint(0)
             return
-        try:
-            r = requests.get(
-                f"{url.rstrip('/')}/api/evpn/type2/list",
-                headers=_auth_headers(), timeout=5,
-            )
-        except Exception as exc:
-            logger.debug(f"[EVPN CHIP] fetch failed: {exc}")
+        # v0.5.175: skip if a previous fetch is still running — it
+        # will land soon enough; another concurrent thread would
+        # only waste a connection.
+        if self._fetch_in_flight is not None:
             return
-        if r.status_code != 200:
-            logger.debug(f"[EVPN CHIP] HTTP {r.status_code}")
-            return
-        try:
-            payload = r.json() or {}
-        except Exception:
-            return
-        items: List[Dict[str, Any]] = (
-            payload.get("injections") or payload.get("items") or []
-        )
-        self._paint(len(items) if isinstance(items, list) else 0)
+        full_url = f"{url.rstrip('/')}/api/evpn/type2/list"
+        thread = _EvpnFetchThread(full_url, parent=self)
+        thread.payload_ready.connect(self._on_payload)
+        thread.failed.connect(self._on_failed)
+        # Cleanup signals — both clear the in-flight guard AND
+        # schedule deleteLater. Connection order matters: clear
+        # first so a new refresh() can fire before the wrapper
+        # actually deletes.
+        thread.finished.connect(self._clear_in_flight)
+        thread.finished.connect(thread.deleteLater)
+        self._fetch_in_flight = thread
+        thread.start()
+
+    def _on_payload(self, items: list) -> None:
+        self._paint(len(items))
+
+    def _on_failed(self, err: str) -> None:
+        logger.debug(f"[EVPN CHIP] fetch failed: {err}")
+        # Leave previous count in place — defensive: if we're seeing
+        # transient failures, don't blink the chip to idle. Reset
+        # only when the operator explicitly clears the server URL.
+
+    def _clear_in_flight(self) -> None:
+        self._fetch_in_flight = None
 
     def stop(self) -> None:
         try:

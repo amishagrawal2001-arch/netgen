@@ -123,6 +123,20 @@ def launch(server_url: str, fullscreen: bool, server_explicitly_provided: bool =
         return 1
 
 def main(argv=None):
+    # v0.5.175: defensive global socket timeout — any blocking
+    # socket op (incl. getaddrinfo via _socket.getaddrinfo) caps
+    # at this many seconds. Without it, macOS DNS lookups for an
+    # unresolvable lab hostname (VPN dropped, host off network)
+    # block 30+ seconds at the OS level, freezing the Qt event
+    # loop. Operator hit this on `san-hp-srv06` and had to Ctrl+C
+    # the GUI. The per-request `timeout=5` arg in `requests.get()`
+    # only covers connect/read AFTER DNS resolves — it doesn't
+    # bound the getaddrinfo call itself. socket.setdefaulttimeout
+    # does, at the cost of also bounding intentionally-long-lived
+    # connections (we have none in the client).
+    import socket
+    socket.setdefaulttimeout(8.0)
+
     # Check if -s or --server was explicitly provided before parsing
     if argv is None:
         check_argv = sys.argv[1:]  # Skip script name
