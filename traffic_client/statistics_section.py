@@ -1864,8 +1864,23 @@ class TrafficGenClientStatisticsSection():
             # in stream loop above from tx_iface ↔ rx_iface). Loss
             # on a pair = max(self.phy_tx, peer.phy_tx) - max(self.phy_rx,
             # peer.phy_rx). Same number on both halves.
-            own_phy_tx = stats.get("phy_tx", 0)
-            own_phy_rx = stats.get("phy_rx", 0)
+            # v0.5.172: subtract the Clear-Stats PHY baseline so
+            # the Lost / Loss % columns reflect "delta since the
+            # button was clicked", consistent with every other
+            # cumulative column. `_iface_baselines` is populated by
+            # `clear_cached_statistics`; empty when Clear hasn't
+            # been clicked, in which case max(0, raw - 0) = raw and
+            # behaviour is unchanged.
+            baselines = getattr(self, "_iface_baselines", {}) or {}
+            own_base = baselines.get(iface_name, {})
+            own_phy_tx = max(
+                0,
+                int(stats.get("phy_tx", 0) or 0)
+                - int(own_base.get("phy_tx", 0) or 0))
+            own_phy_rx = max(
+                0,
+                int(stats.get("phy_rx", 0) or 0)
+                - int(own_base.get("phy_rx", 0) or 0))
             peers = stats.get("peer_ifaces") or set()
 
             # v0.5.145 hotfix: peer lookup uses the renderer's input
@@ -1879,8 +1894,19 @@ class TrafficGenClientStatisticsSection():
                 peer = statistics.get(peer_name)
                 if not peer:
                     continue
-                peer_phy_tx = max(peer_phy_tx, peer.get("phy_tx", 0))
-                peer_phy_rx = max(peer_phy_rx, peer.get("phy_rx", 0))
+                # Subtract the peer's baseline too — otherwise a
+                # Clear-Stats on this iface tares its own counters
+                # but the peer's raw cumulative dominates the
+                # pair_tx, so Lost still looks huge.
+                peer_base = baselines.get(peer_name, {})
+                peer_phy_tx = max(
+                    peer_phy_tx,
+                    max(0, int(peer.get("phy_tx", 0) or 0)
+                        - int(peer_base.get("phy_tx", 0) or 0)))
+                peer_phy_rx = max(
+                    peer_phy_rx,
+                    max(0, int(peer.get("phy_rx", 0) or 0)
+                        - int(peer_base.get("phy_rx", 0) or 0)))
 
             lost, loss_pct_iface = compute_iface_pair_loss(
                 own_phy_tx, own_phy_rx, peer_phy_tx, peer_phy_rx,
@@ -2714,6 +2740,16 @@ class TrafficGenClientStatisticsSection():
                 "sent_bytes": int(stats.get("sent_bytes", 0) or 0),
                 "received_bytes": int(stats.get("received_bytes", 0) or 0),
                 "errors": int(stats.get("errors", 0) or 0),
+                # v0.5.172: also baseline the PHY counters that
+                # drive the Packets Lost / Loss % columns. Pre-fix,
+                # `compute_iface_pair_loss` was reading the RAW
+                # cumulative-since-boot phy_tx/phy_rx from each
+                # poll's stats dict, so the Lost cell kept showing
+                # trillions of packets after Clear Stats. Loss %
+                # then computed (24M / 1T) * 100 ≈ 0.00% — operator-
+                # reported inconsistency on srv06.
+                "phy_tx": int(stats.get("phy_tx", 0) or 0),
+                "phy_rx": int(stats.get("phy_rx", 0) or 0),
             }
 
         # Per-stream baselines for the Stream Statistics tab.

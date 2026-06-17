@@ -244,6 +244,20 @@ def _render_head(title: str) -> str:
           color: var(--warn);
           font-weight: 600;
         }
+        /* v0.5.172: horizontal scroll for the endpoint table
+           when the 16 columns don't fit the run-card width. The
+           wrapper keeps the run-card border tidy and the table
+           pans within it instead of spilling. The native
+           browser scrollbar appears only when needed. */
+        .endpoint-scroll {
+          overflow-x: auto;
+          max-width: 100%;
+          margin-top: 6px;
+        }
+        .endpoint-scroll table.endpoints {
+          margin-top: 0;
+          min-width: max-content;
+        }
         footer { color: var(--muted); font-size: 11px; margin-top: 32px;
           padding-top: 12px; border-top: 1px solid var(--line);
         }
@@ -440,6 +454,12 @@ _ENDPOINT_HEADERS = (
 # but the first 4-6 hex digits identify the product family.
 _BOARD_ID_TO_MODEL = {
     "MT_0000000200": "ConnectX-3 Pro",
+    "MT_0000000225": "ConnectX-6",   # v0.5.172: FW 20.40.x
+                                       # family seen on srv02 lab
+                                       # boxes; operator-reported
+                                       # board_id was rendering as
+                                       # `—` despite the HCA being
+                                       # a known ConnectX-6 part.
     "MT_0000000418": "ConnectX-5",
     "MT_0000000414": "ConnectX-5",
     "MT_0000000437": "ConnectX-6",
@@ -556,9 +576,18 @@ def _render_endpoint_table(details: List[Dict[str, Any]]) -> str:
         return "<p class='meta'>—</p>"
     header = "".join(f"<th>{h}</th>" for h in _ENDPOINT_HEADERS)
     body = "".join(_render_endpoint_row(d) for d in details)
+    # v0.5.172: wrap in overflow-x:auto. The endpoint table grew
+    # to 16 columns (Side / TG / HCA / Model / Link / Rate / MTU
+    # / State / PCIe / NUMA / NetDev / IPv4 / Driver / Vendor /
+    # FW / GID) in v0.5.167+v0.5.170, which exceeds the run-card
+    # max-width on most viewports. Without the wrapper, the
+    # rightmost columns spilled outside the run-card border —
+    # operator-reported.
     return (
+        f"<div class='endpoint-scroll'>"
         f"<table class='endpoints'><thead><tr>{header}</tr></thead>"
         f"<tbody>{body}</tbody></table>"
+        f"</div>"
     )
 
 

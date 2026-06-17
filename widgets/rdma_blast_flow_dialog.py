@@ -1840,6 +1840,12 @@ class RdmaBlastFlowDialog(QDialog):
             self._results_card.setVisible(False)
         except Exception:
             pass
+        # v0.5.172: clear the _finalised guard from any prior run so
+        # _on_both_finished can fire (exactly once) for THIS run.
+        # Without this, a 2nd Start in the same dialog session
+        # would short-circuit on the stale guard and never append
+        # a run-log entry / never render the post-run card.
+        self._finalised = False
         # v0.5.157: also reset the TOTAL-emit guard and worker-0
         # final stats so each new Start gets a clean slate. Without
         # these, a 2nd Start in the same dialog session would skip
@@ -2289,6 +2295,19 @@ class RdmaBlastFlowDialog(QDialog):
         self._stats_view.append(chunk)
 
     def _on_both_finished(self) -> None:
+        # v0.5.172: idempotency guard. Pre-fix, after the poll
+        # timer was stopped (line below) any callbacks already
+        # queued in Qt's event loop kept firing — each one re-
+        # evaluated `s_done and c_done` (both True now) and re-
+        # entered _on_both_finished, which re-ran the iteration
+        # logic AND re-appended a second run-log entry. Operator
+        # reported "exported report shows two runs though i ran
+        # only once". One `_finalised` flag short-circuits the
+        # re-entry; cleared on every fresh Start (see
+        # `_proceed_with_start`).
+        if getattr(self, "_finalised", False):
+            return
+        self._finalised = True
         if self._poll_timer is not None:
             self._poll_timer.stop()
         # v0.5.160 followup: capture this iteration's final BW +

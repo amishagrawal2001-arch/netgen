@@ -2,6 +2,74 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.172] - 2026-06-17
+
+**Three operator-reported fixes.**
+
+### 1. Clear Stats now actually clears Packets Lost / Loss %
+
+`clear_cached_statistics` snapshotted tx/rx/sent_bytes/
+received_bytes/errors as the tare baseline, but missed `phy_tx`
+and `phy_rx` — which is what drives the Packets Lost / Loss %
+columns. The loss math (`(pair_tx - pair_rx) / pair_tx × 100`)
+kept reading cumulative-since-iface-up PHY counters, so:
+
+* **Packets Lost** showed millions left over from prior runs.
+* **Loss %** computed `(24 M / multi-trillion-since-boot) × 100`,
+  which rounded to `0.00%` with the 2-decimal format — the
+  inconsistency the operator hit on srv06.
+
+Fix: `_iface_baselines` now also tares `phy_tx` + `phy_rx`. The
+loss renderer (line ~1867 of `statistics_section.py`) subtracts
+both the iface's own baseline and each peer's baseline before
+calling `compute_iface_pair_loss`. After Clear Stats both
+columns now read "delta since the click" like every other
+cumulative column.
+
+### 2. Blast report no longer shows duplicate runs
+
+`_on_both_finished` had no idempotency guard. Once the poll
+timer was stopped, Qt-queued poll callbacks already in the
+event loop kept entering the function — each re-evaluated
+`s_done and c_done` (both True now), re-fired iteration logic,
+and **re-appended a second entry to `_run_log`**. Operator ran
+one test, got two runs in the exported report.
+
+Fix: short-circuit at the top of `_on_both_finished` on a
+`_finalised` flag. `_proceed_with_start` clears it on every
+fresh Start so each new run can fire exactly once.
+
+### 3. Endpoint table no longer overflows the run-card
+
+The endpoint table grew to 16 columns in v0.5.167 + v0.5.170
+(Side / TG / HCA / Model / Link / Rate / MTU / State / PCIe /
+NUMA / NetDev / IPv4 / Driver / Vendor / FW / GID). On the
+default 1180px run-card width the rightmost columns spilled
+past the border.
+
+Fix: wrap the table in a `<div class='endpoint-scroll'>` with
+`overflow-x: auto` + `min-width: max-content` on the inner
+table. The run-card border stays tidy and the table pans inside
+it. Native browser scrollbar shows only when needed.
+
+### Bonus — board_id map gained ConnectX-6
+
+Operator's lab HCA reported `MT_0000000225` (FW 20.40.x) and
+the Model column rendered as `—`. Added the mapping — now shows
+`ConnectX-6` like the other revisions.
+
+### Files touched
+
+* `traffic_client/statistics_section.py` — PHY baseline in
+  `clear_cached_statistics` + own/peer subtraction in the loss
+  renderer.
+* `widgets/rdma_blast_flow_dialog.py` — `_finalised` guard +
+  reset on Start.
+* `utils/rdma_report.py` — `endpoint-scroll` wrapper + CSS,
+  `MT_0000000225` → `ConnectX-6`.
+* `tests/test_v05172_clear_stats_and_report_fixes.py` — 9
+  assertions across all three fixes + the new board_id.
+
 ## [0.5.171] - 2026-06-16
 
 **Admin portal: one-click HTML report export.**
