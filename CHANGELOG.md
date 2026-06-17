@@ -2,6 +2,89 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.181] - 2026-06-17
+
+**Blast + Topology RDMA — Σ row polish, Topology sweep parity, Run-all
+queue, SUM aggregation, Max-BW visibility, and the v0.5.181-rc
+gap-recheck batch.**
+
+This release closes the v0.5.180 follow-ups operator surfaced after
+seeing the live srv06 reports, plus a self-audit batch (B-1/B-2/B-3 +
+P-1 + G-1/G-4) that ran before ship to catch silent regressions the
+initial pass missed.
+
+### Σ row polish (#3 / #4 / #5)
+
+- Same-value spread collapses: `avg 156.65 (min 156.65, max 156.65)` →
+  `avg 156.65`. Less noise in single-sample runs.
+- MsgRate Σ now mirrors BW format: `avg 0.30 (min 0.28, max 0.32)` not
+  bare `0.30`.
+- Iters Σ column carries `iters_sum` across samples instead of `—`.
+
+### Topology sweep parity (M-RE-1)
+
+- "Sweep sizes (RFC 2544)" checkbox + iterations-per-size spin added to
+  the Topology dialog. Visibility gated on `*_lat` test type, mirrors
+  Blast.
+
+### Run-all queue mode
+
+- "Run all tests" checkbox in both dialogs cycles `send_bw → write_bw →
+  read_bw → send_lat → write_lat → read_lat`, each running `iterations`
+  iterations. Combo + checkbox lock while the queue runs; Stop clears
+  the queue and re-enables UI.
+
+### SUM aggregation + Max-BW visibility
+
+- Σ summary now dispatches on `aggregation_mode`: parallel workers /
+  parallel pairs use SUM (total wire throughput); iterations stay AVG
+  (variance). Operator saw `avg 10.28 Gbps` on a 16-parallel-worker
+  run when true total was 113 Gbps — root cause: pre-fix code used
+  AVG for everything.
+- `workers_attempted` / `pairs_attempted` surface "N of M reported"
+  honesty when some workers/pairs don't return data.
+- 🚀 Max BW button + extras spawn log the picked cpu set + numa pin so
+  the operator can see why a fallback (e.g. srv06's NUMA-local
+  `[0-15]` equalling the linear `[0-15]`) doesn't change the rate.
+
+### Re-audit catches (H-RE-1 through L-RE-1)
+
+- Live grid header reflects the actual test type (was "BW (Gbps)" for
+  lat runs).
+- Σ row, results card, and report headline switch to lat columns when
+  the run was `*_lat`.
+- Line-rate efficiency gate skips lat tests (the % was meaningless on
+  ping-pong workloads).
+- Topology probe error surface now distinguishes "errored" from
+  "timed out" + degrades gracefully when partial.
+
+### Gap-recheck batch (v0.5.181-rc audit)
+
+Self-audit of the above caught five silent bugs before ship:
+
+- **B-1**: sweep checkbox unticked when Run-all crossed `*_bw` tests
+  in the queue, losing operator's preference for the later `*_lat`
+  tests. Fix: skip auto-untick while a Run-all queue is active.
+- **B-2**: Stop during the 1.5 s inter-test pause didn't cancel the
+  pending `QTimer.singleShot`, so the next test fired anyway. Fix:
+  track the timer reference and `.stop()` it on Stop.
+- **B-3**: Blast `iters_sum` always summed to zero because no row
+  carried `iters`. Fix: thread `final_iterations` through worker-0,
+  per-iter, and per-extra-worker state into the row builders.
+- **P-1**: Topology Max-BW button logged the worker math but not the
+  picked cpus + numa at click-time. Fix: sibling parity with Blast.
+- **G-1**: Run-all progress text was "5 more in queue" — opaque. Fix:
+  "Test 2/6 done — next: write_bw".
+- **G-4**: Topology summary had no `pairs_attempted` analog to Blast's
+  `workers_attempted`. Fix: thread it through summary + report
+  renderer ("total across 3 of 4 pairs").
+
+### Tests
+
+35+ new tests across `test_v05181_polish_and_topology_sweep.py`,
+`test_v05181_run_all_tests.py`, `test_v05181_aggregation_and_visibility.py`,
+and the gap-recheck batch in `test_v05181_gap_recheck_fixes.py`.
+
 ## [0.5.180] - 2026-06-17
 
 **Topology dialog lat reporting pipeline — full fix bundle.**

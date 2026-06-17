@@ -542,6 +542,27 @@ class RdmaBlastFlowDialog(QDialog):
         # the combo across half the dialog. Same fix as Topology.
         self._test_combo.setMaximumWidth(300)
 
+        # v0.5.181 M-RE-1 followup: "Run all test types" mode.
+        # Tick → dialog cycles through ALL six perftest tests in
+        # _TESTS order, each repeated `iterations` times. Total
+        # runs = 6 × iterations. Each test's results land as its
+        # own run-card in the exported report — operators get a
+        # Spirent/Ixia-style "test suite" pass in one click.
+        self._run_all_check = QCheckBox("Run all tests")
+        self._run_all_check.setToolTip(
+            "Cycle through every perftest test type (send_bw, "
+            "write_bw, read_bw, send_lat, write_lat, read_lat) "
+            "in sequence. Each test is repeated by the "
+            "Iterations spinbox, so iterations=3 + Run all = "
+            "18 total runs.\n\n"
+            "Test combo is disabled while the queue runs; the "
+            "combo updates to show the current test for visual "
+            "feedback. Sweep stays on for *_lat, silently "
+            "ignored on *_bw."
+        )
+        # Queue state — populated on Start when checkbox is on.
+        self._remaining_tests: List[str] = []
+
         self._mtu_combo = QComboBox()
         for code, label in _MTU_OPTIONS:
             self._mtu_combo.addItem(label, userData=code)
@@ -659,7 +680,16 @@ class RdmaBlastFlowDialog(QDialog):
         # Layout — 4 rows × 2 columns + 1 row of checkboxes.
         # Row 0: Test type | MTU
         tg.addWidget(QLabel("Test type:"), 0, 0, Qt.AlignRight)
-        tg.addWidget(self._test_combo,     0, 1)
+        # v0.5.181 M-RE-1 followup: pack Test type combo + Run all
+        # checkbox into one cell so the layout stays tidy.
+        _tt_row = QWidget()
+        _tth = QHBoxLayout(_tt_row)
+        _tth.setContentsMargins(0, 0, 0, 0)
+        _tth.setSpacing(8)
+        _tth.addWidget(self._test_combo)
+        _tth.addWidget(self._run_all_check)
+        _tth.addStretch(1)
+        tg.addWidget(_tt_row,              0, 1)
         tg.addWidget(QLabel("MTU:"),       0, 2, Qt.AlignRight)
         tg.addWidget(self._mtu_combo,      0, 3)
         # Row 1: Message size | TX depth
@@ -1155,11 +1185,23 @@ class RdmaBlastFlowDialog(QDialog):
         """Hide the sweep group entirely when a *_bw test is picked
         (sweep on BW just makes a 12-minute run with no extra signal
         vs single-size). For *_lat tests the group is the whole
-        reason this feature exists."""
+        reason this feature exists.
+
+        v0.5.181 B-1: preserve the operator's sweep preference when
+        Run-all is auto-cycling the test type. Pre-fix, the queue
+        pumping the combo from `read_bw` → `send_lat` would untick
+        sweep on every BW hop, losing the operator's intent for the
+        lat tests later in the queue. Only auto-untick on operator-
+        initiated combo change (run-all inactive)."""
         is_lat = (self._test_combo.currentData() or "").endswith("_lat")
         for w in (self._sweep_sizes_check, self._sweep_iters_spin):
             w.setVisible(is_lat)
-        if not is_lat and self._sweep_sizes_check.isChecked():
+        run_all_active = (
+            bool(getattr(self, "_remaining_tests", None))
+            or not self._run_all_check.isEnabled())
+        if (not is_lat
+                and self._sweep_sizes_check.isChecked()
+                and not run_all_active):
             # Un-tick so the next *_lat selection starts fresh.
             self._sweep_sizes_check.setChecked(False)
 
@@ -1587,6 +1629,32 @@ class RdmaBlastFlowDialog(QDialog):
 
     # ───────── v0.5.155 Parallel workers + 🚀 Max BW
 
+    def _fmt_cpu_list(self, cpus) -> str:
+        """v0.5.181 followup: compact "[0,1,2,3]" → "[0-3]" range
+        notation for the status panel. Keeps cpus=[0,1,2,3,5,6]
+        readable as "[0-3,5-6]".
+        """
+        if not cpus:
+            return "[]"
+        try:
+            sorted_cpus = sorted(int(c) for c in cpus)
+        except (TypeError, ValueError):
+            return f"[{','.join(str(c) for c in cpus)}]"
+        # Collapse contiguous runs.
+        runs = []
+        run_start = sorted_cpus[0]
+        prev = run_start
+        for c in sorted_cpus[1:]:
+            if c == prev + 1:
+                prev = c
+                continue
+            runs.append((run_start, prev))
+            run_start = c
+            prev = c
+        runs.append((run_start, prev))
+        parts = [f"{a}" if a == b else f"{a}-{b}" for a, b in runs]
+        return "[" + ",".join(parts) + "]"
+
     def _on_max_bw_clicked(self) -> None:
         """Query /api/rdma/host_info on the server-side TG and
         auto-pick the optimal worker count via
@@ -1618,9 +1686,23 @@ class RdmaBlastFlowDialog(QDialog):
             # Cap to the spinbox max.
             wc = max(1, min(wc, 64))
             self._parallel_workers_spin.setValue(wc)
+            # v0.5.181 followup: surface what Max BW actually
+            # picked so operators can compare against the linear
+            # fallback. On single-socket hosts the NUMA-aware
+            # picks often match the linear range — operator's
+            # observation that "no difference" was correct on
+            # srv06 specifically. Show the cpus + numa so the
+            # equivalence is visible, not invisible.
+            cpus = pick.get("cpus") or []
+            numa = pick.get("numa_pin")
+            cpu_summary = self._fmt_cpu_list(cpus)
+            self._stats_view.append(
+                f"[max-bw] picked workers={wc} "
+                f"cpus={cpu_summary} numa={numa}\n"
+                f"  reason: {pick.get('reason', '?')}")
             self._set_status_ok(
-                f"🚀 {pick.get('reason', f'{wc} worker(s)')}"
-            )
+                f"🚀 {wc} worker(s) · "
+                f"cpus={cpu_summary} numa={numa}")
 
         _get_async(
             self,
@@ -1682,6 +1764,18 @@ class RdmaBlastFlowDialog(QDialog):
             self._stats_view.append(
                 f"[workers] ⚠ {fallback_reason}"
             )
+        # v0.5.181 followup: ALWAYS log the picked cpu set + numa
+        # pin so the operator can SEE what's being applied — not
+        # just the fallback case. On single-socket hosts the
+        # Max-BW picks often match the linear fallback (NUMA-0
+        # cores ARE 0..N-1), which is why operators reported "no
+        # difference" between Max BW on/off — the equivalence
+        # was invisible. Now it's logged.
+        self._stats_view.append(
+            f"[workers] spawning {worker_count} workers · "
+            f"cpus={self._fmt_cpu_list(cpus)} · "
+            f"numa={numa_pin if numa_pin is not None else 'unpinned'}"
+        )
         # v0.5.157: clamp every CPU ID to the host's actual
         # cpu_count-1 ceiling. When the host_info cache is empty
         # OR pick_workers_for_hca falls back to linear range, we
@@ -1912,6 +2006,80 @@ class RdmaBlastFlowDialog(QDialog):
             return ans == QMessageBox.Yes
         return True
 
+    def _maybe_populate_run_all_queue(self) -> None:
+        """v0.5.181 M-RE-1 followup: when 'Run all tests' is on,
+        seed `_remaining_tests` with every perftest test type
+        (except the first, which runs as the current click), lock
+        the combo, and set the combo to the first test.
+
+        Idempotent: short-circuits when a queue is already
+        running (signalled by the disabled checkbox), so the
+        next-test path can safely re-enter _on_start_clicked
+        without re-seeding."""
+        if not self._run_all_check.isEnabled():
+            return
+        if not self._run_all_check.isChecked():
+            self._remaining_tests = []
+            return
+        all_tids = [tid for tid, _l, _g in _TESTS]
+        # Run the FIRST entry now, queue the rest.
+        first, *rest = all_tids
+        self._remaining_tests = rest
+        # v0.5.181 G-1: capture queue length for "Test N of M"
+        # progress text after each test finishes.
+        self._run_all_total = len(all_tids)
+        # Update combo to show first test (visual feedback).
+        for i in range(self._test_combo.count()):
+            if self._test_combo.itemData(i) == first:
+                self._test_combo.blockSignals(True)
+                self._test_combo.setCurrentIndex(i)
+                self._test_combo.blockSignals(False)
+                # Force-refresh sweep visibility for the new
+                # test type — bypassed by blockSignals above.
+                self._refresh_sweep_visibility()
+                break
+        # Lock combo while queue runs.
+        self._test_combo.setEnabled(False)
+        self._run_all_check.setEnabled(False)
+
+    def _start_next_test_in_queue(self) -> None:
+        """v0.5.181 M-RE-1 followup: pop next test type, update
+        combo, reset iteration state, re-enter _proceed_with_start.
+        Re-uses the SAME server/client devs the operator picked."""
+        if not self._remaining_tests:
+            return
+        next_test = self._remaining_tests.pop(0)
+        for i in range(self._test_combo.count()):
+            if self._test_combo.itemData(i) == next_test:
+                self._test_combo.blockSignals(True)
+                self._test_combo.setCurrentIndex(i)
+                self._test_combo.blockSignals(False)
+                self._refresh_sweep_visibility()
+                break
+        # Reset iteration loop state so _proceed_with_start
+        # initialises fresh counters for this new test.
+        self._iteration_in_progress = False
+        self._iteration_idx = 0
+        # 1.5 s pause so operator can see the just-finished
+        # result before the next test kicks off.
+        #
+        # v0.5.181 B-2: keep a reference to the pending timer so
+        # _on_stop_clicked can cancel it. Pre-fix, Stop cleared the
+        # queue but the in-flight singleShot still fired and
+        # _proceed_with_start ran the next test anyway — a race
+        # the operator could win by clicking Stop in the 1.5 s gap.
+        prev_timer = getattr(self, "_run_all_pending_timer", None)
+        if prev_timer is not None and prev_timer.isActive():
+            prev_timer.stop()
+        self._run_all_pending_timer = QTimer(self)
+        self._run_all_pending_timer.setSingleShot(True)
+        self._run_all_pending_timer.timeout.connect(
+            lambda: self._proceed_with_start(
+                getattr(self, "_iteration_server_dev", "") or "",
+                getattr(self, "_iteration_client_dev", "") or "",
+            ))
+        self._run_all_pending_timer.start(1500)
+
     def _on_start_clicked(self) -> None:
         server_dev = self._server_device_combo.currentData()
         client_dev = self._client_device_combo.currentData()
@@ -1925,6 +2093,12 @@ class RdmaBlastFlowDialog(QDialog):
             return
         if not self._check_sibling_conflict("client", self._client_tg_url, client_dev):
             return
+
+        # v0.5.181 M-RE-1 followup: seed the Run-all queue if
+        # checked. Updates the combo to the first test in the
+        # canonical _TESTS order; subsequent tests are popped
+        # off after each iteration loop finishes.
+        self._maybe_populate_run_all_queue()
 
         # v0.5.152 Option C-B: auto-detect the same-subnet routing
         # trap BEFORE firing perftest. The trap is a same-host
@@ -2008,6 +2182,8 @@ class RdmaBlastFlowDialog(QDialog):
         self._total_emitted = False
         self._client_bw = None
         self._client_msgrate = None
+        # v0.5.181 B-3: per-run iter count reset.
+        self._client_iters = None
         # v0.5.176: latency-test captures — operator reported
         # send_lat / read_lat / write_lat results weren't surfacing
         # in the HTML report. Root cause: the dialog only stashed
@@ -2223,6 +2399,7 @@ class RdmaBlastFlowDialog(QDialog):
                 rc = job.get("returncode")
                 bw = job.get("final_bw_avg_gbps")
                 mr = job.get("final_msg_rate_mpps")
+                iters = job.get("final_iterations")
                 self._stats_view.append(
                     f"[worker {wi}/{side}] done (rc={rc})  "
                     f"BW avg={bw} Gbps  MsgRate={mr} Mpps"
@@ -2230,6 +2407,9 @@ class RdmaBlastFlowDialog(QDialog):
                 # Stash final stats for the TOTAL summary.
                 w.setdefault(f"{side}_bw", bw)
                 w.setdefault(f"{side}_msgrate", mr)
+                # v0.5.181 B-3: per-extra iters → row builder so the
+                # Σ Iters column sums across all workers, not zero.
+                w.setdefault(f"{side}_iters", iters)
                 w[f"{side}_rc"] = rc
                 self._maybe_emit_total()
 
@@ -2360,6 +2540,12 @@ class RdmaBlastFlowDialog(QDialog):
                     self._client_bw = job.get("final_bw_avg_gbps")
                 if job.get("final_msg_rate_mpps") is not None:
                     self._client_msgrate = job.get("final_msg_rate_mpps")
+                # v0.5.181 B-3: thread perftest's final iteration
+                # count to the report's Σ Iters column. Without
+                # this, every Blast row carried `iters=None` and
+                # the Σ row showed `—`.
+                if job.get("final_iterations") is not None:
+                    self._client_iters = job.get("final_iterations")
                 # v0.5.176: also stash lat fields so send_lat /
                 # write_lat / read_lat runs surface in the report.
                 if job.get("final_lat_avg_us") is not None:
@@ -2512,6 +2698,8 @@ class RdmaBlastFlowDialog(QDialog):
                 "lat_min_us": getattr(self, "_client_lat_min_us", None),
                 "lat_max_us": getattr(self, "_client_lat_max_us", None),
                 "lat_p99_us": getattr(self, "_client_lat_p99_us", None),
+                # v0.5.181 B-3: per-iter perftest iter count.
+                "iters": getattr(self, "_client_iters", None),
             })
             self._iteration_idx = idx + 1
             self._stats_view.append(
@@ -2538,6 +2726,28 @@ class RdmaBlastFlowDialog(QDialog):
         # _run_log entry we just appended (single source of truth
         # for "what happened in this run").
         self._render_results_card()
+        # v0.5.181 M-RE-1 followup: if Run-all queue has more
+        # tests, advance to the next instead of settling. Each
+        # finished test left its own card in _run_log; the next
+        # test starts ~1.5 s later so the operator can read the
+        # just-finished result.
+        stop = bool(getattr(self, "_iteration_stop_requested", False))
+        if self._remaining_tests and not stop:
+            # v0.5.181 G-1: show "Test N of M" progress instead of
+            # the opaque "5 more in queue" count.
+            remaining = len(self._remaining_tests)
+            total = int(getattr(self, "_run_all_total", remaining + 1))
+            current = total - remaining
+            next_tid = self._remaining_tests[0]
+            self._set_status_ok(
+                f"Test {current}/{total} done — next: {next_tid}. "
+                f"Starting in ~1.5 s…")
+            self._start_next_test_in_queue()
+            return
+        # Run-all queue done (or never seeded) — restore UI.
+        if not self._test_combo.isEnabled():
+            self._test_combo.setEnabled(True)
+            self._run_all_check.setEnabled(True)
         self._set_status_ok(
             "Run finished — click Stop or close to forget the pairing."
         )
@@ -2625,18 +2835,25 @@ class RdmaBlastFlowDialog(QDialog):
                 row["lat_min_us"] = r.get("lat_min_us")
                 row["lat_max_us"] = r.get("lat_max_us")
                 row["lat_p99_us"] = r.get("lat_p99_us")
+            if r.get("iters") is not None:
+                row["iters"] = r.get("iters")
             rows.append(row)
         # Per-extra-worker rows (only meaningful for parallel runs).
         extras = getattr(self, "_extra_workers", [])
         for w in extras:
-            rows.append({
+            row = {
                 "label": f"worker {w.get('worker_idx', '?')}",
                 "state": "done"
                 if (w.get("client_finished") and w.get("server_finished"))
                 else "?",
                 "bw_gbps": w.get("client_bw"),
                 "msgrate_mpps": w.get("client_msgrate"),
-            })
+            }
+            # v0.5.181 B-3: include each extra's iter count so the
+            # Σ Iters column sums across all workers.
+            if w.get("client_iters") is not None:
+                row["iters"] = w.get("client_iters")
+            rows.append(row)
         # v0.5.173: only emit the trailing "worker 0" row when it
         # adds information. Two cases where it does:
         #   1. Single-iter run with no parallel extras — it IS the
@@ -2659,6 +2876,10 @@ class RdmaBlastFlowDialog(QDialog):
                 "bw_gbps": getattr(self, "_client_bw", None),
                 "msgrate_mpps": getattr(self, "_client_msgrate", None),
             }
+            # v0.5.181 B-3: worker 0's iter count for the Σ sum.
+            w0_iters = getattr(self, "_client_iters", None)
+            if w0_iters is not None:
+                w0_row["iters"] = w0_iters
             # v0.5.176: also include lat fields for single-iter
             # latency runs so the report dispatches to lat columns.
             lat_avg = getattr(self, "_client_lat_avg_us", None)
@@ -2682,6 +2903,22 @@ class RdmaBlastFlowDialog(QDialog):
         # `lat_avg_us` etc. in the summary too.
         lats = [r["lat_avg_us"] for r in rows
                 if isinstance(r.get("lat_avg_us"), (int, float))]
+        # v0.5.181 polish #5: sum iters for the Σ Iters column.
+        iters_sum = sum(r["iters"] for r in rows
+                        if isinstance(r.get("iters"), (int, float)))
+        # v0.5.181 followup: detect parallel-worker rows so the BW
+        # aggregation can SUM (workers contribute to total) instead
+        # of AVG (iterations characterise variance). Operator saw
+        # this on srv06: 16 workers × ~10 Gbps each, headline
+        # said "avg 10.28" (wrong) when reality was "sum ≈ 113".
+        worker_rows = [r for r in rows
+                       if str(r.get("label", "")).startswith("worker ")]
+        iter_rows = [r for r in rows
+                     if str(r.get("label", "")).startswith("iter ")]
+        # Total worker count attempted (rows present), regardless
+        # of whether they reported data — surfaces "11 of 16
+        # reported" honesty.
+        workers_attempted = len(worker_rows) if worker_rows else None
         if lats:
             summary = {
                 "samples": len(lats),
@@ -2694,16 +2931,60 @@ class RdmaBlastFlowDialog(QDialog):
                     (r.get("lat_max_us") for r in rows
                      if isinstance(r.get("lat_max_us"), (int, float))),
                     default=max(lats)),
+                "iters_sum": iters_sum or None,
             }
+            if workers_attempted:
+                summary["workers_attempted"] = workers_attempted
         elif bws:
-            summary = {
-                "samples": len(bws),
-                "bw_avg_gbps": sum(bws) / len(bws),
-                "bw_min_gbps": min(bws),
-                "bw_max_gbps": max(bws),
-                "msgrate_avg_mpps":
-                    (sum(mrs) / len(mrs)) if mrs else None,
-            }
+            # v0.5.181 polish #4: include msgrate min/max so the
+            # report's MsgRate Σ cell renders with the same parens
+            # format as BW.
+            #
+            # v0.5.181 followup: SUM bws across workers when rows
+            # are workers. Mixed iter+worker mode: SUM all (best
+            # approximation — the multi-iter × multi-worker case
+            # is genuinely ambiguous and operator-set, and SUM
+            # matches what the OPERATOR's "total throughput on
+            # the wire" mental model is).
+            is_worker_mode = bool(worker_rows) and not iter_rows
+            if is_worker_mode:
+                # Workers: SUM. Min/max are the per-worker
+                # outliers (informative for fairness).
+                bw_total = sum(bws)
+                mr_total = sum(mrs) if mrs else None
+                summary = {
+                    "samples": len(bws),
+                    "bw_avg_gbps": bw_total,
+                    "bw_min_gbps": min(bws),
+                    "bw_max_gbps": max(bws),
+                    "msgrate_avg_mpps": mr_total,
+                    "msgrate_min_mpps":
+                        min(mrs) if mrs else None,
+                    "msgrate_max_mpps":
+                        max(mrs) if mrs else None,
+                    "iters_sum": iters_sum or None,
+                    "workers_attempted": workers_attempted,
+                    "aggregation_mode": "sum_workers",
+                }
+            else:
+                # Iterations (or only worker 0 in single-worker
+                # mode): AVG, original behaviour.
+                summary = {
+                    "samples": len(bws),
+                    "bw_avg_gbps": sum(bws) / len(bws),
+                    "bw_min_gbps": min(bws),
+                    "bw_max_gbps": max(bws),
+                    "msgrate_avg_mpps":
+                        (sum(mrs) / len(mrs)) if mrs else None,
+                    "msgrate_min_mpps":
+                        min(mrs) if mrs else None,
+                    "msgrate_max_mpps":
+                        max(mrs) if mrs else None,
+                    "iters_sum": iters_sum or None,
+                    "aggregation_mode": "avg_iterations",
+                }
+                if workers_attempted:
+                    summary["workers_attempted"] = workers_attempted
         srv_hca = self._server_device_combo.currentData() or "?"
         cli_hca = self._client_device_combo.currentData() or "?"
         srv_dev_payload = self._device_payloads.get("server", {}).get(srv_hca)
@@ -2771,6 +3052,18 @@ class RdmaBlastFlowDialog(QDialog):
         # than queueing the next iteration.
         self._iteration_stop_requested = True
         self._iteration_in_progress = False
+        # v0.5.181 M-RE-1 followup: cancel any pending Run-all
+        # tests and re-enable the combo + checkbox.
+        if self._remaining_tests:
+            self._remaining_tests = []
+        # v0.5.181 B-2: cancel the 1.5 s inter-test pause so Stop
+        # during the gap doesn't let the next test fire anyway.
+        pending = getattr(self, "_run_all_pending_timer", None)
+        if pending is not None and pending.isActive():
+            pending.stop()
+        if not self._test_combo.isEnabled():
+            self._test_combo.setEnabled(True)
+            self._run_all_check.setEnabled(True)
         # v0.5.164: hide the progress widget on stop.
         self._reset_progress_widget()
         # v0.5.153: Stop also fires preflight cleanup. Previously

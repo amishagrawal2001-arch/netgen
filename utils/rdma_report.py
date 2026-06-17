@@ -385,10 +385,30 @@ def _render_headline(run: Dict[str, Any]) -> str:
     if has_lat:
         return _render_lat_headline(run, summary, rows)
 
+    # v0.5.181 followup: headline label reflects aggregation mode.
+    # `sum_workers` / `sum_pairs` → "total across N", `avg_iterations`
+    # → "average across N samples".
+    mode = summary.get("aggregation_mode") or "avg_iterations"
+    is_sum = mode in ("sum_workers", "sum_pairs")
     if (isinstance(summary.get("bw_avg_gbps"), (int, float))
             and summary.get("samples", 0) > 1):
         bw = float(summary["bw_avg_gbps"])
-        tail = f"average across {int(summary['samples'])} samples"
+        n = int(summary["samples"])
+        # v0.5.181 G-4: pairs_attempted is the sibling for the
+        # sum_pairs mode (Topology) — same "N of M reported" honesty.
+        if mode == "sum_pairs":
+            attempted = summary.get("pairs_attempted")
+        else:
+            attempted = summary.get("workers_attempted")
+        if is_sum:
+            unit = ("workers" if mode == "sum_workers" else "pairs")
+            if (isinstance(attempted, int) and attempted
+                    and n < attempted):
+                tail = f"total across {n} of {attempted} {unit}"
+            else:
+                tail = f"total across {n} {unit}"
+        else:
+            tail = f"average across {n} samples"
     else:
         bws = [r["bw_gbps"] for r in rows
                if isinstance(r.get("bw_gbps"), (int, float))]
@@ -839,28 +859,106 @@ def _render_lat_row(r: Dict[str, Any]) -> str:
 
 
 def _render_bw_summary(s: Dict[str, Any]) -> str:
+    """v0.5.181 polish:
+      (#3) Collapse `avg X (min X, max X)` to `avg X` when spread
+           is zero — repeating the same value three times was just
+           noise (every single-sample run rendered that way).
+      (#4) MsgRate column now mirrors the BW column's avg/min/max
+           format when min + max are present.
+      (#5) Iters column shows the SUM across samples instead of `—`
+           (total work done is a useful diagnostic for a run that
+           varied per-iteration).
+
+    v0.5.181 followup:
+      • `aggregation_mode` (`sum_workers` / `sum_pairs` /
+        `avg_iterations`) drives the cell prefix: "total" for
+        SUM, "avg" for AVG. Operator's "10.28 → 113" confusion
+        on srv06 came from labelling a SUM as `avg`.
+      • `workers_attempted` surfaces "N of M reported" when fewer
+        workers reported data than were spawned — the partial-
+        success case where some workers never completed.
+    """
     avg = _fmt(s.get("bw_avg_gbps"), 2)
     mn = _fmt(s.get("bw_min_gbps"), 2)
     mx = _fmt(s.get("bw_max_gbps"), 2)
     mr_avg = _fmt(s.get("msgrate_avg_mpps"), 4)
+    mr_min = _fmt(s.get("msgrate_min_mpps"), 4)
+    mr_max = _fmt(s.get("msgrate_max_mpps"), 4)
+    iters_sum = s.get("iters_sum")
+    iters_txt = (str(int(iters_sum))
+                 if isinstance(iters_sum, (int, float))
+                 else "—")
     n = s.get("samples") or s.get("n") or len(s.get("rows") or []) or "?"
+    # v0.5.181 followup: aggregation-mode-aware prefix.
+    mode = s.get("aggregation_mode") or "avg_iterations"
+    is_sum = mode in ("sum_workers", "sum_pairs")
+    prefix = "total" if is_sum else "avg"
+    bw_cell = _fmt_summary_cell(
+        avg, mn, mx, unit_after_max="", prefix=prefix)
+    mr_cell = _fmt_summary_cell(
+        mr_avg, mr_min, mr_max, unit_after_max="", prefix=prefix)
+    # Samples column: include attempted count when partial.
+    # v0.5.181 G-4: sum_pairs mode (Topology) uses pairs_attempted.
+    if mode == "sum_pairs":
+        attempted = s.get("pairs_attempted")
+        unit = "pairs"
+    else:
+        attempted = s.get("workers_attempted")
+        unit = "workers"
+    if (isinstance(attempted, int) and attempted
+            and isinstance(n, int) and n < attempted):
+        samples_txt = f"{n} of {attempted} {unit}"
+    else:
+        samples_txt = f"{escape(str(n))} samples"
     return (
         f"<tr class='summary'><td>Σ</td>"
-        f"<td>{escape(str(n))} samples</td>"
-        f"<td class='num'>avg {avg} (min {mn}, max {mx})</td>"
-        f"<td class='num'>{mr_avg}</td>"
-        f"<td class='num'>—</td></tr>"
+        f"<td>{samples_txt}</td>"
+        f"<td class='num'>{bw_cell}</td>"
+        f"<td class='num'>{mr_cell}</td>"
+        f"<td class='num'>{escape(iters_txt)}</td></tr>"
     )
 
 
+def _fmt_summary_cell(
+    avg: str, mn: str, mx: str,
+    *, unit_after_max: str = "",
+    prefix: str = "avg",
+) -> str:
+    """v0.5.181 #3: render a Σ-row cell. Drops the `(min X, max X)`
+    parens when the spread is zero OR when min/max are unavailable
+    (the `—` case). Three distinct outputs:
+      • spread zero / no min-max → `<prefix> X`
+      • spread present          → `<prefix> X (min Y, max Z)`
+      • no avg either           → `—`
+
+    v0.5.181 followup: `prefix` is "avg" for iteration-averaging
+    or "total" for worker-sum (parallel-worker BW aggregation).
+    """
+    if avg == "—":
+        return "—"
+    if mn == "—" or mx == "—" or mn == avg == mx:
+        return f"{prefix} {avg}{unit_after_max}"
+    return (f"{prefix} {avg} "
+            f"(min {mn}, max {mx}){unit_after_max}")
+
+
 def _render_lat_summary(s: Dict[str, Any]) -> str:
+    """v0.5.181 polish: parity with BW Σ — collapse same-value
+    parens, include Iters sum."""
     avg = _fmt(s.get("lat_avg_us"), 2)
+    mn = _fmt(s.get("lat_min_us"), 2)
+    mx = _fmt(s.get("lat_max_us"), 2)
+    iters_sum = s.get("iters_sum")
+    iters_txt = (str(int(iters_sum))
+                 if isinstance(iters_sum, (int, float))
+                 else "—")
     n = s.get("samples") or s.get("n") or "?"
+    avg_cell = _fmt_summary_cell(avg, mn, mx, unit_after_max="")
     return (
         f"<tr class='summary'><td>Σ</td>"
         f"<td>{escape(str(n))} samples</td>"
-        f"<td class='num'>—</td>"
-        f"<td class='num'>avg {avg}</td>"
+        f"<td class='num'>{escape(iters_txt)}</td>"
+        f"<td class='num'>{avg_cell}</td>"
         f"<td class='num'>—</td></tr>"
     )
 

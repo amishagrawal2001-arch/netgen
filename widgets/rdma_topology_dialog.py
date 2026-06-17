@@ -521,9 +521,76 @@ class RdmaTopologyDialog(QDialog):
         # 🚀 Max BW button is clicked.
         self._host_info_cache: Dict[str, Any] = {}
 
+        # v0.5.181 M-RE-1: RFC 2544-style sweep checkbox. Same
+        # pattern as the Blast dialog v0.5.177 implementation —
+        # operators running Topology for fan-out / mesh lat
+        # characterization want the per-size curve too. Each
+        # pair runs `-a -n N` independently; the report's
+        # existing per-pair section gets one chart + table per
+        # pair (a 2x2 mesh = 4 rendered curves).
+        self._sweep_sizes_check = QCheckBox("Sweep sizes (RFC 2544)")
+        self._sweep_sizes_check.setToolTip(
+            "Run an RFC 2544-style latency characterization. "
+            "Every pair runs perftest -a, which cycles through "
+            "every power-of-2 message size from 2 B to 8 MB and "
+            "reports min / typ / avg / max / stdev / p99 / p99.9 "
+            "at each size.\n\n"
+            "When enabled: Message size + Duration are ignored. "
+            "iterations-per-size from the spinbox to the right "
+            "is used instead. Only available on *_lat tests."
+        )
+        self._sweep_sizes_check.toggled.connect(self._on_sweep_toggled)
+        self._sweep_iters_spin = QSpinBox()
+        self._sweep_iters_spin.setRange(100, 100_000)
+        self._sweep_iters_spin.setValue(5000)
+        self._sweep_iters_spin.setFixedWidth(110)
+        self._sweep_iters_spin.setSuffix(" /size")
+        self._sweep_iters_spin.setToolTip(
+            "Iterations per message size (perftest -n). 5000 is "
+            "enough to stabilise t_avg + p99 at small sizes; the "
+            "8 MB tail dominates wall-clock. Drop to 1000 for a "
+            "quick run; raise to 20000+ for paper-grade jitter "
+            "analysis."
+        )
+        self._sweep_iters_spin.setEnabled(False)
+
+        # v0.5.181 M-RE-1 followup: "Run all tests" cycles through
+        # every perftest test type. Same semantics as Blast: each
+        # test runs `iterations` times, then queue advances. With
+        # 6 tests × iterations = total runs.
+        self._run_all_check = QCheckBox("Run all tests")
+        self._run_all_check.setToolTip(
+            "Cycle through every perftest test type (send_bw, "
+            "write_bw, read_bw, send_lat, write_lat, read_lat) "
+            "in sequence. Each test runs `iterations` times "
+            "across every pair. Total runs = 6 × iterations × "
+            "pairs.\n\n"
+            "Test combo is disabled while the queue runs; the "
+            "combo updates to show the current test for visual "
+            "feedback."
+        )
+        # Queue state — populated on Start when checkbox is on.
+        self._remaining_tests: List[str] = []
+        # Canonical test ordering (mirrors Blast _TESTS order):
+        # BW first, then lat. Operators get a complete BW
+        # characterization before lat starts.
+        self._all_perftest_tests: List[str] = [
+            "send_bw", "write_bw", "read_bw",
+            "send_lat", "write_lat", "read_lat",
+        ]
+
         # 2-col grid
         tg.addWidget(QLabel("Test type:"), 0, 0, Qt.AlignRight)
-        tg.addWidget(self._test_combo,     0, 1)
+        # v0.5.181 M-RE-1 followup: pack Test type combo + Run-all
+        # checkbox into one cell so the layout stays tidy.
+        _tt_row = QWidget()
+        _tth = QHBoxLayout(_tt_row)
+        _tth.setContentsMargins(0, 0, 0, 0)
+        _tth.setSpacing(8)
+        _tth.addWidget(self._test_combo)
+        _tth.addWidget(self._run_all_check)
+        _tth.addStretch(1)
+        tg.addWidget(_tt_row,              0, 1)
         tg.addWidget(QLabel("MTU:"),       0, 2, Qt.AlignRight)
         tg.addWidget(self._mtu_combo,      0, 3)
         tg.addWidget(QLabel("Message size:"), 1, 0, Qt.AlignRight)
@@ -557,12 +624,21 @@ class RdmaTopologyDialog(QDialog):
         cb_row.setSpacing(16)
         cb_row.addWidget(self._bidir_check)
         cb_row.addWidget(self._cpu_util_check)
+        # v0.5.181 M-RE-1: sweep widgets inline on the checkbox row.
+        # Visibility gated on test type via _refresh_sweep_visibility.
+        cb_row.addSpacing(20)
+        cb_row.addWidget(self._sweep_sizes_check)
+        cb_row.addWidget(self._sweep_iters_spin)
         cb_row.addStretch(1)
         cb_holder = QWidget()
         cb_holder.setLayout(cb_row)
         tg.addWidget(cb_holder, 5, 0, 1, 4)
         tg.setColumnStretch(1, 1)
         tg.setColumnStretch(3, 1)
+        # Sweep group visibility flips with test type (BW vs lat).
+        self._test_combo.currentIndexChanged.connect(
+            self._refresh_sweep_visibility)
+        self._refresh_sweep_visibility()
         root.addWidget(test_box)
 
         # ── Action row
@@ -863,7 +939,7 @@ class RdmaTopologyDialog(QDialog):
 
     def _common_opts(self) -> dict:
         """Shared workload params passed to every per-pair start."""
-        return {
+        opts = {
             "msg_size": int(self._msg_size_spin.value()),
             "qp_count": int(self._qp_count_spin.value()),
             "duration": int(self._duration_spin.value()),
@@ -874,6 +950,41 @@ class RdmaTopologyDialog(QDialog):
             "cpu_util": bool(self._cpu_util_check.isChecked()),
             "report_gbits": True,
         }
+        # v0.5.181 M-RE-1: sweep workload opts. Same shape as Blast
+        # so the backend cmd builder (utils/rdma_perf.py) handles
+        # both dialogs identically.
+        if (self._sweep_sizes_check.isChecked()
+                and self._sweep_sizes_check.isVisibleTo(self)):
+            opts["sweep_sizes"] = True
+            opts["iterations_per_size"] = int(
+                self._sweep_iters_spin.value())
+        return opts
+
+    def _on_sweep_toggled(self, checked: bool) -> None:
+        """v0.5.181 M-RE-1: greys out Message size + Duration
+        when sweep is on (perftest -a ignores both)."""
+        self._sweep_iters_spin.setEnabled(checked)
+        self._msg_size_spin.setEnabled(not checked)
+        self._duration_spin.setEnabled(not checked)
+
+    def _refresh_sweep_visibility(self) -> None:
+        """Hide sweep group on *_bw tests — same rationale as
+        Blast: a BW sweep is multi-minute with no extra signal
+        vs single-size BW.
+
+        v0.5.181 B-1: preserve operator's sweep preference when
+        Run-all is pumping the combo through BW + lat tests. Only
+        auto-untick on operator-initiated combo change."""
+        is_lat = (self._test_combo.currentData() or "").endswith("_lat")
+        for w in (self._sweep_sizes_check, self._sweep_iters_spin):
+            w.setVisible(is_lat)
+        run_all_active = (
+            bool(getattr(self, "_remaining_tests", None))
+            or not self._run_all_check.isEnabled())
+        if (not is_lat
+                and self._sweep_sizes_check.isChecked()
+                and not run_all_active):
+            self._sweep_sizes_check.setChecked(False)
 
     def _spec_from_ui(self, srv_eps, cli_eps) -> RdmaTopologySpec:
         return RdmaTopologySpec(
@@ -902,6 +1013,74 @@ class RdmaTopologyDialog(QDialog):
             f"<span style='color:#475569;'>{text}</span>"
         )
 
+    def _maybe_populate_run_all_queue(self) -> None:
+        """v0.5.181 M-RE-1 followup: seed `_remaining_tests` with
+        every perftest test type when Run-all is checked. First
+        test fires now, rest queue up. Locks combo + checkbox.
+
+        Idempotent: when called from inside an active queue (the
+        next-test path re-enters _on_start_clicked), the disabled
+        checkbox short-circuits re-seeding so we don't undo our
+        own pop."""
+        # Skip if a queue is already running (signalled by the
+        # disabled checkbox).
+        if not self._run_all_check.isEnabled():
+            return
+        if not self._run_all_check.isChecked():
+            self._remaining_tests = []
+            return
+        first, *rest = self._all_perftest_tests
+        self._remaining_tests = rest
+        # v0.5.181 G-1: capture queue length for "Test N of M".
+        self._run_all_total = len(self._all_perftest_tests)
+        for i in range(self._test_combo.count()):
+            if self._test_combo.itemData(i) == first:
+                self._test_combo.blockSignals(True)
+                self._test_combo.setCurrentIndex(i)
+                self._test_combo.blockSignals(False)
+                self._refresh_sweep_visibility()
+                break
+        self._test_combo.setEnabled(False)
+        self._run_all_check.setEnabled(False)
+
+    def _start_next_test_in_queue(self) -> None:
+        """v0.5.181 M-RE-1 followup: pop next test, update combo,
+        reset iteration state, re-enter the topology start path.
+        Reuses the cached spec from the previous run."""
+        if not self._remaining_tests:
+            return
+        next_test = self._remaining_tests.pop(0)
+        for i in range(self._test_combo.count()):
+            if self._test_combo.itemData(i) == next_test:
+                self._test_combo.blockSignals(True)
+                self._test_combo.setCurrentIndex(i)
+                self._test_combo.blockSignals(False)
+                self._refresh_sweep_visibility()
+                break
+        # Reset iteration counter; _proceed_with_topology_start
+        # will pick the new test from the combo and rebuild spec.
+        self._iteration_idx = 0
+        # v0.5.181 B-2: track the inter-test timer so Stop during
+        # the 1.5 s pause cancels it instead of firing the next
+        # test anyway.
+        prev_timer = getattr(self, "_run_all_pending_timer", None)
+        if prev_timer is not None and prev_timer.isActive():
+            prev_timer.stop()
+        self._run_all_pending_timer = QTimer(self)
+        self._run_all_pending_timer.setSingleShot(True)
+        self._run_all_pending_timer.timeout.connect(
+            self._restart_with_current_test)
+        self._run_all_pending_timer.start(1500)
+
+    def _restart_with_current_test(self) -> None:
+        """Re-enter the start path with the same endpoints +
+        current combo selection. Doesn't re-parse the endpoint
+        text panes — the operator hasn't changed them."""
+        # Just kick _on_start_clicked again; it re-validates,
+        # re-builds spec, but parsed endpoints haven't changed
+        # and validation is cheap.
+        self._on_start_clicked()
+
     def _on_start_clicked(self) -> None:
         srv_eps, srv_errs = parse_endpoint_block(self._server_edit.toPlainText())
         cli_eps, cli_errs = parse_endpoint_block(self._client_edit.toPlainText())
@@ -921,6 +1100,26 @@ class RdmaTopologyDialog(QDialog):
         except ValueError as e:
             self._set_status_error(str(e))
             return
+
+        # v0.5.181 M-RE-1 followup: seed the Run-all queue. Spec
+        # rebuilds with the new test_combo selection between
+        # tests, so we need to populate AFTER the first spec is
+        # built (above) but BEFORE proceeding. Note: when
+        # _start_next_test_in_queue re-enters this method via
+        # _restart_with_current_test, the spec is rebuilt from
+        # the updated combo, so the new test propagates.
+        self._maybe_populate_run_all_queue()
+        # Rebuild spec after seeding — first test in queue may
+        # differ from operator's combo selection if the combo
+        # was on a different test type than the first queue
+        # item (it shouldn't, but defensive).
+        if self._remaining_tests or not self._run_all_check.isEnabled():
+            spec = self._spec_from_ui(srv_eps, cli_eps)
+            err = validate_spec(spec)
+            if err:
+                self._set_status_error(err)
+                return
+            plans = expand_pairs(spec)
 
         # v0.5.156 Slice A: probe same-host pairs for DOWN ports /
         # missing IPs / same-subnet trap BEFORE firing perftest.
@@ -1416,6 +1615,25 @@ class RdmaTopologyDialog(QDialog):
 
     # ─────────── v0.5.156 Slice A: parallel workers per pair
 
+    def _fmt_cpu_list(self, cpus) -> str:
+        """v0.5.181 followup: same range-collapse helper as Blast."""
+        if not cpus:
+            return "[]"
+        try:
+            s = sorted(int(c) for c in cpus)
+        except (TypeError, ValueError):
+            return f"[{','.join(str(c) for c in cpus)}]"
+        runs = []
+        start = s[0]; prev = start
+        for c in s[1:]:
+            if c == prev + 1:
+                prev = c
+                continue
+            runs.append((start, prev)); start = c; prev = c
+        runs.append((start, prev))
+        return "[" + ",".join(
+            f"{a}" if a == b else f"{a}-{b}" for a, b in runs) + "]"
+
     def _on_max_bw_clicked(self) -> None:
         """Probe the first server endpoint's host topology, derive
         per-pair worker count = floor(NUMA-local cores / pair_count).
@@ -1461,10 +1679,17 @@ class RdmaTopologyDialog(QDialog):
                            // _pair_count)
             per_pair = min(per_pair, 16)
             self._parallel_workers_spin.setValue(per_pair)
+            # v0.5.181 P-1: log the picked cpus + numa pin at
+            # click-time so the operator sees what Max BW chose
+            # WITHOUT having to wait for the run to start. Sibling
+            # parity with Blast's _on_max_bw_clicked.
+            picked_cpus = pick.get("cpus") or []
+            numa_pin = pick.get("numa_pin")
             self._set_status_neutral(
                 f"🚀 {per_pair} worker(s)/pair × {_pair_count} "
-                f"pair(s) = {per_pair * _pair_count} total. "
-                f"{pick.get('reason', '')}"
+                f"pair(s) = {per_pair * _pair_count} total · "
+                f"cpus={self._fmt_cpu_list(picked_cpus)} · "
+                f"numa={numa_pin}. {pick.get('reason', '')}"
             )
 
         _get_async(self, f"{url}/api/rdma/host_info",
@@ -1519,6 +1744,16 @@ class RdmaTopologyDialog(QDialog):
                 )
             except Exception:
                 pass
+        # v0.5.181 followup: log the picked cpu set + numa pin so
+        # operator can see what the workers actually got.
+        try:
+            self._set_status_neutral(
+                f"[pair #{plan.pair_index}] "
+                f"workers={worker_count} · "
+                f"cpus={self._fmt_cpu_list(cpus)} · "
+                f"numa={numa_pin if numa_pin is not None else 'unpinned'}")
+        except Exception:
+            pass
         # v0.5.157: clamp to cpu_count - 1 so a high worker_count
         # on a small-core host doesn't ask taskset for a CPU that
         # doesn't exist (matches the Blast _start_extra_workers
@@ -1651,6 +1886,18 @@ class RdmaTopologyDialog(QDialog):
         # to NOT spawn the next iteration when this one's pairs
         # finish.
         self._stop_requested = True
+        # v0.5.181 M-RE-1 followup: cancel any pending Run-all
+        # tests and re-enable the combo + checkbox.
+        if self._remaining_tests:
+            self._remaining_tests = []
+        # v0.5.181 B-2: cancel the 1.5 s inter-test pause so Stop
+        # during the gap doesn't let the next test fire anyway.
+        pending = getattr(self, "_run_all_pending_timer", None)
+        if pending is not None and pending.isActive():
+            pending.stop()
+        if not self._test_combo.isEnabled():
+            self._test_combo.setEnabled(True)
+            self._run_all_check.setEnabled(True)
         for jobs in self._pair_jobs.values():
             for side, job_id in jobs.items():
                 if not job_id:
@@ -1788,6 +2035,27 @@ class RdmaTopologyDialog(QDialog):
                 self._render_results_card()
                 # v0.5.164: hide the progress widget.
                 self._reset_progress_widget()
+                # v0.5.181 M-RE-1 followup: advance Run-all queue
+                # if active. Each finished test left its own card
+                # in _run_log; the next test fires ~1.5 s later.
+                if self._remaining_tests and not stop_requested:
+                    # v0.5.181 G-1: show "Test N of M" progress.
+                    remaining = len(self._remaining_tests)
+                    total = int(
+                        getattr(self, "_run_all_total",
+                                remaining + 1))
+                    current = total - remaining
+                    next_tid = self._remaining_tests[0]
+                    self._stop_requested = False
+                    self._set_status_ok(
+                        f"Test {current}/{total} done — "
+                        f"next: {next_tid}. Starting in ~1.5 s…")
+                    self._start_next_test_in_queue()
+                    return
+                # Run-all done (or never seeded) — restore UI.
+                if not self._test_combo.isEnabled():
+                    self._test_combo.setEnabled(True)
+                    self._run_all_check.setEnabled(True)
                 self._start_btn.setEnabled(True)
                 self._stop_btn.setEnabled(False)
                 self._stop_requested = False
@@ -2043,6 +2311,28 @@ class RdmaTopologyDialog(QDialog):
                if isinstance(r.get("msgrate_mpps"), (int, float))]
         lats = [r["lat_avg_us"] for r in rows
                 if isinstance(r.get("lat_avg_us"), (int, float))]
+        # v0.5.181 polish #5: sum iters across all samples so the
+        # Σ row shows total work done.
+        iters_sum = sum(r["iters"] for r in rows
+                        if isinstance(r.get("iters"), (int, float)))
+        # v0.5.181 followup: Topology rows are one per (iter, pair),
+        # labeled `#<iter>.<pair>`. Multi-pair runs are de-facto
+        # parallel-worker mode — the pairs run concurrently on the
+        # same fabric, so SUM is the wire-throughput aggregate.
+        # Single-pair multi-iter is variance characterisation,
+        # AVG is right. Detect by counting unique pair_indices in
+        # the snapshot.
+        unique_pair_indices = set()
+        for snap in getattr(self, "_iteration_results", []):
+            for r in snap:
+                unique_pair_indices.add(r.get("pair_index"))
+        is_parallel_pairs = len(unique_pair_indices) > 1
+        # v0.5.181 G-4: total pair count attempted across the run
+        # (regardless of whether they reported data). Mirrors
+        # Blast's `workers_attempted` honesty so the report can
+        # render "N of M pairs reported".
+        pairs_attempted = (len(unique_pair_indices)
+                           if unique_pair_indices else None)
         if lats:
             summary = {
                 "samples": len(lats),
@@ -2055,16 +2345,49 @@ class RdmaTopologyDialog(QDialog):
                     (r.get("lat_max_us") for r in rows
                      if isinstance(r.get("lat_max_us"), (int, float))),
                     default=max(lats)),
+                "iters_sum": iters_sum or None,
             }
+            if pairs_attempted:
+                summary["pairs_attempted"] = pairs_attempted
         elif bws:
-            summary = {
-                "samples": len(bws),
-                "bw_avg_gbps": sum(bws) / len(bws),
-                "bw_min_gbps": min(bws),
-                "bw_max_gbps": max(bws),
-                "msgrate_avg_mpps":
-                    (sum(mrs) / len(mrs)) if mrs else None,
-            }
+            # v0.5.181 polish #4: include msgrate min/max.
+            # v0.5.181 followup: SUM bws when running multiple
+            # pairs (each pair is an independent perftest stream
+            # on the same fabric — total wire throughput = SUM
+            # of per-pair BWs).
+            if is_parallel_pairs:
+                summary = {
+                    "samples": len(bws),
+                    "bw_avg_gbps": sum(bws),
+                    "bw_min_gbps": min(bws),
+                    "bw_max_gbps": max(bws),
+                    "msgrate_avg_mpps":
+                        sum(mrs) if mrs else None,
+                    "msgrate_min_mpps":
+                        min(mrs) if mrs else None,
+                    "msgrate_max_mpps":
+                        max(mrs) if mrs else None,
+                    "iters_sum": iters_sum or None,
+                    "aggregation_mode": "sum_pairs",
+                    "pairs_attempted": pairs_attempted,
+                }
+            else:
+                summary = {
+                    "samples": len(bws),
+                    "bw_avg_gbps": sum(bws) / len(bws),
+                    "bw_min_gbps": min(bws),
+                    "bw_max_gbps": max(bws),
+                    "msgrate_avg_mpps":
+                        (sum(mrs) / len(mrs)) if mrs else None,
+                    "msgrate_min_mpps":
+                        min(mrs) if mrs else None,
+                    "msgrate_max_mpps":
+                        max(mrs) if mrs else None,
+                    "iters_sum": iters_sum or None,
+                    "aggregation_mode": "avg_iterations",
+                }
+                if pairs_attempted:
+                    summary["pairs_attempted"] = pairs_attempted
         # v0.5.167: rich per-endpoint details (NIC type, driver,
         # link rate, MTU, FW, GIDs). Dedup by (tg_url, device) so
         # the report doesn't show the same HCA twice when N pairs

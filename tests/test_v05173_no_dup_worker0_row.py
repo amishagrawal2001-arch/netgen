@@ -38,10 +38,13 @@ def test_append_run_log_skips_worker0_when_iter_rows_exist():
     """Source-level check: the trailing worker 0 append is
     gated by `extras or not already_have_iter_rows`."""
     src = (REPO / "widgets" / "rdma_blast_flow_dialog.py").read_text()
-    # Find the _append_run_log_entry function body.
+    # Find the _append_run_log_entry function body. Slice to the
+    # next sibling def — v0.5.181 polish + B-3 grew the function
+    # past the original 4000-byte window.
     idx = src.find("def _append_run_log_entry")
     assert idx > 0
-    body = src[idx:idx + 4000]
+    end = src.index("\n    def ", idx + 10)
+    body = src[idx:end]
     # The gate must be present.
     assert "already_have_iter_rows" in body
     assert "if extras or not already_have_iter_rows" in body
@@ -52,7 +55,8 @@ def test_single_iter_run_still_emits_worker0():
     worker 0 row IS the result and must still appear."""
     src = (REPO / "widgets" / "rdma_blast_flow_dialog.py").read_text()
     idx = src.find("def _append_run_log_entry")
-    body = src[idx:idx + 4000]
+    end = src.index("\n    def ", idx + 10)
+    body = src[idx:end]
     # The fallback path (the trailing rows.append) is the worker 0
     # case. Must still be there.
     assert '"label": "worker 0"' in body
