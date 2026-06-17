@@ -50,11 +50,24 @@ def test_on_start_clicked_defers_when_same_host_pair_exists():
 
 
 def test_probe_method_polls_both_endpoints():
-    """Probe SERVER and CLIENT of the sample pair in parallel."""
+    """Probe SERVER and CLIENT (and any other same-host pair's
+    endpoints) in parallel.
+
+    v0.5.178: pre-fix this asserted the v0.5.156 two-side shape
+    (`for side, hca, port in`). The v0.5.178 audit fixed H3 by
+    fanning out across every unique (tg_url, device, ib_port)
+    tuple in the same-host plan set so a mesh with multiple
+    same-host HCAs catches per-iface blockers (DOWN port, etc.)
+    on HCAs the sample plan didn't touch. The probe still uses
+    `_get_async` against `/api/rdma/probe`; the loop variable
+    just changes from `side, hca, port` to `key`."""
     body = _extract_method(SRC, "_topology_probe_then_start")
     assert "/api/rdma/probe" in body
-    # Two-side probe loop.
-    assert "for side, hca, port in" in body
+    # The fan-out probe loop iterates over (tg_url, device,
+    # ib_port) tuples now.
+    assert "for key in tuples" in body
+    # And dedups via a set keyed by the same triple.
+    assert "seen_tuples" in body
 
 
 def test_on_probe_complete_routes_to_confirm():

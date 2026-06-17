@@ -1018,8 +1018,18 @@ def _build_perftest_cmd(
     if msg_size and not sweep_sizes:
         cmd += ["-s", str(msg_size)]
 
+    # Multiple QPs are a perftest *_bw flag only — `ib_send_lat`,
+    # `ib_write_lat`, `ib_read_lat` reject `-q N` with
+    # "Multiple QPs only available on bw tests" and exit rc=1
+    # before any data row. Pre-fix, the dialog's qp_count spinbox
+    # value rode through to lat tests too, blowing up any sweep
+    # the operator started after a multi-QP BW run had bumped
+    # the spinbox > 1. Gate `-q` on test.endswith("_bw") so the
+    # lat tests silently get whatever single-QP setup perftest
+    # uses by default.
     qp_count = opts.get("qp_count")
-    if qp_count and int(qp_count) > 1:
+    if (qp_count and int(qp_count) > 1
+            and test.endswith("_bw")):
         cmd += ["-q", str(qp_count)]
 
     duration = opts.get("duration")

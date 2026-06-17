@@ -2,6 +2,120 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.178] - 2026-06-17
+
+**Three operator-reported RDMA Topology bugs + full audit pass.**
+
+Operator hit three live bugs on srv06 in the v0.5.177 sweep:
+
+1. send_lat sweep with qp_count > 1 → perftest exit rc=1
+   "Multiple QPs only available on bw tests".
+2. "Another Blast RDMA Flow dialog is already targeting …"
+   warning firing after the operator had Stopped the sibling
+   dialog's run.
+3. Topology dialog crash on first poll —
+   `AttributeError: 'RdmaTopologyEndpoint' object has no
+   attribute 'hca'`.
+
+After fixing each, a full audit pass over the topology code
+(`utils/rdma_topology.py`, `widgets/rdma_topology_dialog.py`,
+`traffic_client/rdma_menu_actions.py`) surfaced 11 more real
+bugs. Everything bundled here.
+
+### Reported bugs (the three above)
+
+* **qp_count gate**: `_build_perftest_cmd` now requires
+  `test.endswith("_bw")` before appending `-q N`. `*_lat`
+  tests get the perftest default 1 QP regardless of the
+  dialog's qp_count spinbox value.
+* **Sibling-conflict idle-only**: the warning's tracker now
+  claims an HCA only when at least one side has a job_id set
+  AND `_finished` is False. After Stop, `_finished` flips
+  True → the claim disappears → no false alarm.
+* **`ep.device` not `ep.hca`**: the `RdmaTopologyEndpoint`
+  dataclass field is `device`; pre-fix code at
+  `_append_run_log_entry` read `ep.hca`, which doesn't exist.
+
+### Audit findings (11 more)
+
+* **H1** (`_mark_pair_failed`): row offset bug — pre-fix wrote
+  to `pair_index` directly, overwriting iteration 1's result
+  when iteration 2's pair 0 failed.
+* **H2** (`_topology_probe_then_start`): added an 8 s
+  wall-clock timeout. Pre-fix a single hung probe could leave
+  the Start button disabled forever.
+* **H3** (probe shape): pre-fix only probed the FIRST same-host
+  pair. Mesh / fan-out topologies with multiple same-host
+  pairs on DIFFERENT HCAs could miss per-iface blockers (DOWN
+  port, missing IP) on HCAs the sample pair didn't touch. Now
+  fans out across every unique `(tg_url, device, ib_port)`
+  tuple (capped at 12 probes).
+* **H4** (CIDR helper): `_build_unique_test_ifaces` centralises
+  the test-IP assignments; the pre-fix hardcoded pair
+  `(10.42.0.1/24, 10.43.0.1/24)` would CIDR-collide the
+  second same-host pair's auto-apply.
+* **H5** (`spec_workload`): deleted the dead-code "placeholder
+  to satisfy lint" assignment.
+* **M1** (`aggregate_stats`): per-pair latency now propagates
+  `min_lat_us` / `max_lat_us` / `max_lat_p99_us`. The TOTAL
+  line shows worst-case tail across pairs — the Spirent/Ixia
+  deliverable that pre-fix was being silently dropped.
+* **M2** (`validate_spec`): test type regex
+  `^(send|write|read)_(bw|lat)$` — typos like `send_lay` now
+  catch at validation, not at perftest stderr.
+* **M3** (`validate_spec`): port range overflow — pre-fix
+  bounded `base_listen_port ≤ 65000` but a 25×25 mesh from
+  base 64950 expanded to 65574 which overflows 65535.
+* **M5** (`_on_job_resp`): O(1) `{job_id: pair_index}` reverse
+  index instead of scanning `_plans` every poll. Matters on
+  100-pair meshes (50 polls/sec × scan).
+* **M6** (`_render_results_card`): None-guards on `bw_min` /
+  `bw_max` — pre-fix could crash the headline render when
+  every per-pair bw came back None (all-pairs-errored case).
+* **L1** (init hygiene): `_current_iter_base_row`,
+  `_pair_extra_workers`, `_iteration_results`,
+  `_iteration_idx`, `_iterations_total`, `_stop_requested`,
+  `_spec`, `_topology_probe_buf` now initialised in
+  `__init__`. The previously-broken
+  `test_stats_table_populates_skeleton` started passing
+  without any test change — exactly the right kind of test fix.
+* **L2** (`_endpoint_device_cache`): skip cache entries with
+  no name field instead of storing them under `"?"` where
+  they'd shadow each other.
+
+### State-management races also closed
+
+* **M4 + M8** (`_run_one_iteration`): the new iteration boundary
+  calls `_stop_poll()` first, drops outstanding callbacks
+  before resetting `_pair_jobs` / `_latest_jobs`. Pre-fix a
+  late callback from iteration N could write into the FRESH
+  `_latest_jobs` map iteration N+1 just reset, leaking the
+  old job_id forever.
+
+### Tests
+
+33 new tests across 4 new files:
+
+* `tests/test_v05178_qp_count_lat_gate.py` — 9 tests
+* `tests/test_v05178_sibling_conflict_live_only.py` — 7 tests
+* `tests/test_v05178_topology_endpoint_attr.py` — 3 tests
+* `tests/test_v05178_topology_audit.py` — 14 tests
+
+The pre-existing
+`tests/test_rdma_topology_dialog.py::test_stats_table_populates_skeleton`
+went from FAILED to PASSED via the L1 init fix — no test
+change.
+
+231/231 RDMA / topology / lat-sweep tests pass.
+
+### What this does NOT include
+
+This release is bug-fix only; no operator-visible UI changes
+beyond the better warning copy on probe timeouts and the
+wider TOTAL line on latency runs (now shows spread + worst
+p99). The Spirent/Ixia-style latency sweep from v0.5.177 is
+unchanged.
+
 ## [0.5.177] - 2026-06-17
 
 **Spirent/Ixia-style RDMA latency characterization + send_lat

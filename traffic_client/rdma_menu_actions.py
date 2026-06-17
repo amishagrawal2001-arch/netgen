@@ -201,10 +201,33 @@ class TrafficGenClientRDMAMenuActions:
 
         # Sibling-device conflict guard — surface (tg_url, device)
         # pairs already claimed by other RDMA blast dialogs.
+        #
+        # v0.5.178: Only claim from siblings that have a CURRENTLY
+        # RUNNING perftest. Pre-fix, an idle dialog window with the
+        # HCA still selected (e.g. after the operator clicked Stop)
+        # tripped the warning on every subsequent Start in another
+        # dialog. Operators reported the false alarm as a bug — the
+        # tracker was over-eagerly conflating "dialog window open"
+        # with "HCA is busy".
+        #
+        # A dialog is actively contending iff at least one side has
+        # a job_id (Start fired) AND that side hasn't yet flipped
+        # to finished. Both sides idle / closed / both finished =
+        # the dialog is no longer competing for HCA resources, so
+        # we don't claim its selection.
+        def _is_live(d):
+            srv_live = (getattr(d, "_server_job_id", None)
+                        and not getattr(d, "_server_finished", False))
+            cli_live = (getattr(d, "_client_job_id", None)
+                        and not getattr(d, "_client_finished", False))
+            return bool(srv_live or cli_live)
+
         def _siblings(excluding=dlg):
             claimed = set()
             for d in self._rdma_blast_dialogs:
                 if d is excluding:
+                    continue
+                if not _is_live(d):
                     continue
                 # Server side
                 sd = d._server_device_combo.currentData() if hasattr(d, "_server_device_combo") else None

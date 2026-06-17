@@ -61,9 +61,19 @@ weighted averages across pairs.
 """
 from __future__ import annotations
 
+import re
 import uuid
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
+
+
+# v0.5.178 audit M2: the operator-facing test combo enumerates
+# {send,write,read}_{bw,lat}. We validate up front so a typo
+# (`send_lay`, `wirte_bw`) doesn't sail through to perftest, which
+# rejects with a cryptic stderr that surfaces to the dialog as
+# "rc=2: unknown option" — operator wastes a probe + start cycle
+# before figuring out where the bad value came from.
+_RE_PERFTEST_TEST = re.compile(r"^(send|write|read)_(bw|lat)$")
 
 
 # Topology shape sentinels — string constants so they serialize cleanly
@@ -164,6 +174,11 @@ def validate_spec(spec: RdmaTopologySpec) -> Optional[str]:
         return "at least one client endpoint required"
     if not spec.test:
         return "test type required (send_bw / write_bw / read_bw / *_lat)"
+    # v0.5.178 audit M2: catch typos at validate time.
+    if not _RE_PERFTEST_TEST.match(spec.test):
+        return (f"unknown test {spec.test!r} — must be one of "
+                f"send_bw, write_bw, read_bw, send_lat, "
+                f"write_lat, read_lat")
 
     s, c = len(spec.server_endpoints), len(spec.client_endpoints)
     if spec.shape == SHAPE_SINGLE and (s != 1 or c != 1):
@@ -180,6 +195,31 @@ def validate_spec(spec: RdmaTopologySpec) -> Optional[str]:
     if spec.base_listen_port < 1024 or spec.base_listen_port > 65000:
         return (f"base_listen_port {spec.base_listen_port} out of "
                 f"sensible range (1024-65000)")
+    # v0.5.178 audit M3: expand_pairs allocates listen_port =
+    # base + pair_index, but pre-fix validate_spec only bounded
+    # the base. A 20×20 mesh from base=64800 produces ports up
+    # to 65199, which overflows 65535 silently and double-binds
+    # / EADDRINUSE in perftest. Pre-compute the highest port the
+    # expansion would allocate.
+    if spec.shape == SHAPE_SINGLE:
+        highest = spec.base_listen_port
+    elif spec.shape == SHAPE_FAN_IN:
+        highest = spec.base_listen_port + c - 1
+    elif spec.shape == SHAPE_FAN_OUT:
+        highest = spec.base_listen_port + s - 1
+    elif spec.shape == SHAPE_MESH:
+        highest = spec.base_listen_port + (s * c) - 1
+    elif spec.shape == SHAPE_PAIRWISE:
+        highest = spec.base_listen_port + s - 1
+    else:
+        highest = spec.base_listen_port
+    if highest > 65535:
+        n_pairs = highest - spec.base_listen_port + 1
+        return (f"port range overflows 65535: shape={spec.shape} "
+                f"with {n_pairs} pairs starting at "
+                f"{spec.base_listen_port} would extend to "
+                f"{highest}. Lower base_listen_port or split "
+                f"the topology.")
 
     return None
 
@@ -310,6 +350,12 @@ def aggregate_stats(jobs: List[Dict[str, Any]],
     means (a true weighted average needs per-pair iteration counts,
     which we DO have — final_iterations — so we use that).
 
+    v0.5.178 audit M1: latency runs now also propagate per-pair
+    spread — min-of-mins, max-of-maxes, max-of-p99s. The TOTAL
+    line / HTML report can now answer "what was the worst-case
+    tail across all pairs in this topology?" — the deliverable
+    Spirent/Ixia call "worst-case latency under load."
+
     Returns:
       {
         "pair_count": int,
@@ -319,6 +365,9 @@ def aggregate_stats(jobs: List[Dict[str, Any]],
         "total_bw_avg_gbps": float | None,
         "total_msg_rate_mpps": float | None,
         "weighted_lat_avg_us": float | None,
+        "min_lat_us": float | None,      # v0.5.178: min-of-mins
+        "max_lat_us": float | None,      # v0.5.178: max-of-maxes
+        "max_lat_p99_us": float | None,  # v0.5.178: tail of tails
         "any_error": str | None,
       }
     """
@@ -330,6 +379,9 @@ def aggregate_stats(jobs: List[Dict[str, Any]],
         "total_bw_avg_gbps": None,
         "total_msg_rate_mpps": None,
         "weighted_lat_avg_us": None,
+        "min_lat_us": None,
+        "max_lat_us": None,
+        "max_lat_p99_us": None,
         "any_error": None,
     }
     if not jobs:
@@ -342,6 +394,10 @@ def aggregate_stats(jobs: List[Dict[str, Any]],
     lat_weighted_num = 0.0
     lat_weight_denom = 0
     lat_has = False
+    # v0.5.178 audit M1: per-pair lat spread propagation.
+    lat_mins: List[float] = []
+    lat_maxs: List[float] = []
+    lat_p99s: List[float] = []
     for j in jobs:
         if not isinstance(j, dict):
             continue
@@ -369,6 +425,20 @@ def aggregate_stats(jobs: List[Dict[str, Any]],
                 lat_weight_denom += int(iters)
                 lat_has = True
                 out["pairs_with_data"] += 1
+            # v0.5.178 audit M1: collect min/max/p99 unconditionally
+            # — they're per-pair stats independent of avg + iters
+            # weighting and useful even if avg / iters didn't land
+            # (some perftest builds emit fewer columns; v0.5.177's
+            # duration-mode regex is one such example).
+            m = j.get("final_lat_min_us")
+            if isinstance(m, (int, float)):
+                lat_mins.append(float(m))
+            mx = j.get("final_lat_max_us")
+            if isinstance(mx, (int, float)):
+                lat_maxs.append(float(mx))
+            p99 = j.get("final_lat_p99_us")
+            if isinstance(p99, (int, float)):
+                lat_p99s.append(float(p99))
 
     if bw_has:
         out["total_bw_avg_gbps"] = round(bw_sum, 3)
@@ -376,7 +446,12 @@ def aggregate_stats(jobs: List[Dict[str, Any]],
         out["total_msg_rate_mpps"] = round(mr_sum, 6)
     if lat_has and lat_weight_denom > 0:
         out["weighted_lat_avg_us"] = round(
-            lat_weighted_num / lat_weight_denom, 3,
-        )
+            lat_weighted_num / lat_weight_denom, 3)
+    if lat_mins:
+        out["min_lat_us"] = round(min(lat_mins), 3)
+    if lat_maxs:
+        out["max_lat_us"] = round(max(lat_maxs), 3)
+    if lat_p99s:
+        out["max_lat_p99_us"] = round(max(lat_p99s), 3)
 
     return out

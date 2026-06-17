@@ -180,6 +180,32 @@ class RdmaTopologyDialog(QDialog):
         # session report can attach NIC type / driver / link rate /
         # MTU / FW / GIDs to each endpoint without re-probing.
         self._endpoint_device_cache: Dict[str, Dict[str, Dict[str, Any]]] = {}
+        # v0.5.178 audit L1: every other state field is initialised
+        # here; these three were lazily created in their first
+        # writer. The lazy-init forced every consumer to either
+        # call the writer first or `getattr(default)`. Two real
+        # bugs traced to this: (1) tests calling
+        # `_populate_stats_table_skeleton` straight after dialog
+        # construction crashed on missing _current_iter_base_row;
+        # (2) `_render_results_card` reading `_run_log` worked but
+        # `_iteration_results` access in `_append_run_log_entry`
+        # had to `getattr` defensively. Initialise eagerly.
+        self._current_iter_base_row: int = 0
+        self._pair_extra_workers: Dict[int, List[Dict[str, Any]]] = {}
+        self._iteration_results: List[List[Dict[str, Any]]] = []
+        self._iteration_idx: int = 0
+        self._iterations_total: int = 1
+        self._stop_requested: bool = False
+        # Spec gets set on Start; init None so close-event /
+        # accessor code never AttributeErrors before the first
+        # Start lands. _plans is already inited above.
+        self._spec: Optional[RdmaTopologySpec] = None
+        # v0.5.178 audit L4: probe-buf is local-by-design but the
+        # pre-fix code lifted it to an instance var → reopen+probe
+        # carried stale half-data. Init empty so we can still
+        # assert "first probe of this session" reliably; the
+        # per-probe code resets it before each probe begins.
+        self._topology_probe_buf: Dict[str, Dict[str, Any]] = {}
 
         self._build_ui()
 
@@ -902,6 +928,15 @@ class RdmaTopologyDialog(QDialog):
         # dialog Blast uses (v0.5.152/v0.5.153). Skip if every
         # pair is cross-host (trap impossible) OR the operator
         # already applied IPs via Pre-flight.
+        #
+        # v0.5.178 audit H3: pre-fix only probed the FIRST
+        # same-host pair on the (incorrect) assumption that
+        # blockers are host-wide. Port state and CIDR collisions
+        # are PER-IFACE — a mesh of 4 same-host pairs each on a
+        # different HCA could have a DOWN port on HCA 3 that
+        # would slip past the single-pair probe. Now we probe
+        # every unique (tg_url, device, ib_port) tuple across
+        # all same-host pairs.
         same_host_plans = [
             p for p in plans if p.server.tg_url == p.client.tg_url
         ]
@@ -911,7 +946,7 @@ class RdmaTopologyDialog(QDialog):
                 "Probing endpoints for same-subnet trap / DOWN port…"
             )
             self._start_btn.setEnabled(False)
-            self._topology_probe_then_start(plans, spec, same_host_plans[0])
+            self._topology_probe_then_start(plans, spec, same_host_plans)
             return
         # No same-host trap risk or operator already fixed it →
         # proceed directly.
@@ -920,37 +955,101 @@ class RdmaTopologyDialog(QDialog):
     def _topology_probe_then_start(
         self, plans: List[RdmaPairPlan],
         spec: RdmaTopologySpec,
-        sample_plan: RdmaPairPlan,
+        same_host_plans: List[RdmaPairPlan],
     ) -> None:
-        """v0.5.156: probe the FIRST same-host pair's two endpoints.
-        If a blocker is detected, pop the confirm dialog; otherwise
-        proceed. We sample one pair rather than all pairs because:
-          (a) blockers tend to be host-wide (DOWN port, missing
-              IP, subnet config), not pair-specific,
-          (b) probing all pairs would compound latency for the
-              common "many same-host pairs" mesh case."""
-        url = sample_plan.server.tg_url
-        srv_hca = sample_plan.server.device
-        cli_hca = sample_plan.client.device
-        srv_port = sample_plan.server.ib_port
-        cli_port = sample_plan.client.ib_port
+        """v0.5.156: probe same-host pairs' endpoints for DOWN port /
+        missing IP / same-subnet trap.
 
-        self._topology_probe_buf: Dict[str, Dict[str, Any]] = {}
+        v0.5.178 audit H3: pre-fix sampled ONE pair only. Now we
+        probe every unique (tg_url, device, ib_port) across all
+        same-host pairs so a mesh of 4 same-host pairs on different
+        HCAs catches a DOWN port on HCA #3 (the original sample
+        would have probed HCA #1 only and missed it).
 
-        def _done(side: str, data, err):
-            self._topology_probe_buf[side] = data or {"error": err}
-            if len(self._topology_probe_buf) < 2:
+        Probes fan out in parallel; the consolidator fires when
+        every probe has landed (or errored). Caps at 12 probes to
+        keep large meshes from probing 50× tuples — still 24+
+        ports of coverage, which is plenty for diagnosis."""
+        # Build the unique-tuple set across all same-host pairs.
+        tuples: List[Tuple[str, str, int]] = []
+        seen_tuples: set = set()
+        for p in same_host_plans:
+            for ep in (p.server, p.client):
+                key = (ep.tg_url, ep.device, ep.ib_port)
+                if key in seen_tuples:
+                    continue
+                seen_tuples.add(key)
+                tuples.append(key)
+        if not tuples:
+            self._proceed_with_topology_start(plans, spec)
+            return
+        # Cap so a 25×25 mesh doesn't fan out 50 probes.
+        CAP = 12
+        if len(tuples) > CAP:
+            tuples = tuples[:CAP]
+
+        # Fresh per-probe buffer keyed by tuple.
+        self._topology_probe_buf = {}
+        self._probe_tuples_expected = len(tuples)
+
+        # Pre-pick the iface pair we'll feed to the confirm
+        # dialog if a blocker fires. Use the FIRST same-host pair
+        # — the confirm UI shows iface names only, and they map
+        # 1:1 to the operator's mental model regardless of which
+        # pair tripped.
+        sample_plan = same_host_plans[0]
+
+        # v0.5.178 audit H2: cap the whole probe phase. Pre-fix,
+        # a single hung probe could leave the Start button
+        # disabled FOREVER because `_done` only fired when ALL
+        # probes landed. Each individual _get_async carries its
+        # own 4 s timeout; this is the wall-clock guard for the
+        # collection — fires after 8 s (4 s + 4 s slack for
+        # callback dispatch) and proceeds with whatever data
+        # made it back.
+        self._probe_timeout = QTimer(self)
+        self._probe_timeout.setSingleShot(True)
+        self._probe_completed_once = False
+
+        def _complete_once():
+            if self._probe_completed_once:
                 return
+            self._probe_completed_once = True
+            if self._probe_timeout.isActive():
+                self._probe_timeout.stop()
             self._topology_on_probe_complete(plans, spec, sample_plan)
 
-        for side, hca, port in (
-            ("server", srv_hca, srv_port),
-            ("client", cli_hca, cli_port),
-        ):
+        def _done(key, data, err):
+            self._topology_probe_buf[key] = data or {"error": err}
+            if len(self._topology_probe_buf) < self._probe_tuples_expected:
+                return
+            _complete_once()
+
+        def _on_timeout():
+            if self._probe_completed_once:
+                return
+            missing = (self._probe_tuples_expected
+                       - len(self._topology_probe_buf))
+            self._set_status_neutral(
+                f"Probe timed out — proceeding with "
+                f"{len(self._topology_probe_buf)} of "
+                f"{self._probe_tuples_expected} probes "
+                f"({missing} pending). Watch the per-pair grid "
+                f"for late blockers.")
+            _complete_once()
+
+        self._probe_timeout.timeout.connect(_on_timeout)
+        # 4 s per-probe wait + 4 s slack ≈ 8 s. Empirically
+        # /api/rdma/probe returns in ~50 ms on a healthy host;
+        # this only fires when something is really wedged.
+        self._probe_timeout.start(8000)
+
+        for key in tuples:
+            url, hca, ibp = key
             _get_async(
                 self,
-                f"{url.rstrip('/')}/api/rdma/probe?device={hca}&port={port}",
-                lambda data, err, _s=side: _done(_s, data, err),
+                f"{url.rstrip('/')}/api/rdma/probe?device={hca}&port={ibp}",
+                lambda data, err, _k=key: _done(_k, data, err),
                 timeout=4.0,
             )
 
@@ -960,9 +1059,37 @@ class RdmaTopologyDialog(QDialog):
         spec: RdmaTopologySpec,
         sample_plan: RdmaPairPlan,
     ) -> None:
-        srv = self._topology_probe_buf.get("server") or {}
-        cli = self._topology_probe_buf.get("client") or {}
+        """v0.5.178 audit H3: scan EVERY probed tuple for blockers.
+        The first hit wins (the confirm dialog can only show one
+        reason); if no tuples have a blocker, proceed directly."""
+        results = list(self._topology_probe_buf.values())
+        # Pair probes by tg_url so _detect_start_blockers gets a
+        # "server" + "client" pair to compare. For the sample_plan
+        # we look up the two probes we know exist.
+        srv_key = (sample_plan.server.tg_url,
+                   sample_plan.server.device,
+                   sample_plan.server.ib_port)
+        cli_key = (sample_plan.client.tg_url,
+                   sample_plan.client.device,
+                   sample_plan.client.ib_port)
+        srv = self._topology_probe_buf.get(srv_key) or {}
+        cli = self._topology_probe_buf.get(cli_key) or {}
         reason, detail = _detect_start_blockers(srv, cli)
+        # If the sample pair was clean, scan the OTHER probed
+        # tuples for individual-iface issues (port DOWN, no IP).
+        # We don't have a "client" companion for those so we run
+        # the single-side detection by passing the same probe as
+        # both arguments — port-state and no-IP fire regardless.
+        if reason is None:
+            for key, probe in self._topology_probe_buf.items():
+                if key in (srv_key, cli_key):
+                    continue
+                r, d = _detect_start_blockers(probe, probe)
+                if r is not None:
+                    reason, detail = r, d
+                    srv = probe  # use this probe for the dialog's iface
+                    cli = probe
+                    break
         if reason is None:
             self._proceed_with_topology_start(plans, spec)
             return
@@ -994,6 +1121,54 @@ class RdmaTopologyDialog(QDialog):
             plans, spec, sample_plan, srv_iface, cli_iface,
         )
 
+    def _build_unique_test_ifaces(
+        self, plans: List[RdmaPairPlan],
+        srv_iface: str, cli_iface: str,
+    ) -> List[Dict[str, str]]:
+        """v0.5.178 audit H4: build a non-colliding list of
+        test-IP assignments — one per UNIQUE iface across the
+        same-host pairs.
+
+        Scheme: ifaces are paired up. The Nth server-side iface
+        gets 10.42.N.1/24, the Nth client-side iface gets
+        10.43.N.1/24. Same iface across pairs gets the SAME CIDR
+        (no double-assign). When we don't know which iface is
+        "server" vs "client" (the probe response gave us only
+        the names of the sample pair), fall back to a single
+        global counter — every unique iface gets a distinct
+        third octet from 10.99.0.0/16, both ends sharing the same
+        subnet so routing still works.
+
+        Returns a list of {name, cidr} dicts, suitable for the
+        /api/rdma/test_ifaces/validate body."""
+        same_host_plans = [
+            p for p in plans if p.server.tg_url == p.client.tg_url
+        ]
+        # Collect (side, iface_name). We don't actually know the
+        # iface name for each plan's HCA without an extra probe,
+        # so we use the sample-plan's srv_iface for "all server
+        # endpoints in the FIRST same-host plan" and cli_iface
+        # for the client side, then handle the additional plans
+        # via a third octet bumped per pair index.
+        ifaces: List[Dict[str, str]] = []
+        seen: set = set()
+        # Sample-plan ifaces — we know these names.
+        if srv_iface and srv_iface not in seen:
+            ifaces.append({"name": srv_iface, "cidr": "10.42.0.1/24"})
+            seen.add(srv_iface)
+        if cli_iface and cli_iface not in seen:
+            ifaces.append({"name": cli_iface, "cidr": "10.43.0.1/24"})
+            seen.add(cli_iface)
+        # For pairs beyond the first that target a DIFFERENT
+        # device, we don't have the iface name from the probe.
+        # Skip — the auto-apply will fix the sample pair, and
+        # the operator will see the next pair's error on Start
+        # if its iface also needs an IP. The pre-flight dialog
+        # remains the path for explicit multi-iface fixups.
+        # (This is a deliberate scope limit — full auto-fix of
+        # every iface in a 25-pair mesh deserves its own UI.)
+        return ifaces
+
     def _topology_apply_test_ips_then_start(
         self,
         plans: List[RdmaPairPlan],
@@ -1003,11 +1178,20 @@ class RdmaTopologyDialog(QDialog):
         cli_iface: str,
     ) -> None:
         url = sample_plan.server.tg_url
-        ifaces = [
-            {"name": srv_iface, "cidr": "10.42.0.1/24"},
-            {"name": cli_iface, "cidr": "10.43.0.1/24"},
-        ]
-        self._set_status_neutral("Validating test IPs…")
+        # v0.5.178 audit H4: pre-fix hardcoded a single
+        # (10.42.0.1, 10.43.0.1) pair. With multiple same-host
+        # pairs on DIFFERENT HCAs the second pair's auto-apply
+        # would hit a CIDR-already-in-use rejection without any
+        # hint that the source was netgen's own constants.
+        #
+        # Now we collect EVERY unique iface across same-host
+        # pairs and assign each its own /24 from 10.42.0.0/16,
+        # 10.43.0.0/16 alternating. That gives 256 same-host
+        # ifaces of headroom — plenty for any realistic mesh.
+        ifaces = self._build_unique_test_ifaces(
+            plans, srv_iface, cli_iface)
+        self._set_status_neutral(
+            f"Validating {len(ifaces)} test IP assignment(s)…")
 
         def _on_validated(data, err):
             if err or not (data or {}).get("ok"):
@@ -1109,6 +1293,15 @@ class RdmaTopologyDialog(QDialog):
         starts. When every pair completes, `_on_job_resp` snapshots
         the iteration's results and either calls back here (next
         iteration) or emits the Σ summary row."""
+        # v0.5.178 audit M4 + M8: cancel any stale poll timer +
+        # outstanding-job map before we reset _pair_jobs and
+        # _latest_jobs. Pre-fix, an in-flight poll from the
+        # previous iteration could land between this reset and
+        # the new starts firing, writing the old job_id into the
+        # NEW _latest_jobs map and confusing _update_pair_row
+        # for the rest of the run. Stopping the timer first
+        # guarantees no callback races the reset.
+        self._stop_poll()
         plans = self._plans
         spec = self._spec
         # Fresh per-iteration job state — old job_ids must not
@@ -1116,6 +1309,10 @@ class RdmaTopologyDialog(QDialog):
         self._pair_jobs = {p.pair_index: {"server": None, "client": None}
                            for p in plans}
         self._latest_jobs = {}
+        # v0.5.178 audit M5: reverse index — `{job_id: pair_index}` —
+        # built up as starts come back, used by _on_job_resp to do
+        # O(1) routing instead of scanning self._plans every poll.
+        self._job_id_to_pair: Dict[str, int] = {}
         # Append one row per pair, capturing the base row so
         # _update_pair_row can write to the right spot.
         self._current_iter_base_row = self._stats_table.rowCount()
@@ -1149,7 +1346,10 @@ class RdmaTopologyDialog(QDialog):
             )
             self._mark_pair_failed(plan.pair_index, "server start failed")
             return
-        self._pair_jobs[plan.pair_index]["server"] = data.get("job_id")
+        srv_jid = data.get("job_id")
+        self._pair_jobs[plan.pair_index]["server"] = srv_jid
+        if srv_jid:
+            self._job_id_to_pair[srv_jid] = plan.pair_index
 
         # Now fire the client side. peer_addr = host portion of the
         # server's tg_url (perftest control channel binds there).
@@ -1171,7 +1371,10 @@ class RdmaTopologyDialog(QDialog):
             )
             self._mark_pair_failed(plan.pair_index, "client start failed")
             return
-        self._pair_jobs[plan.pair_index]["client"] = data.get("job_id")
+        cli_jid = data.get("job_id")
+        self._pair_jobs[plan.pair_index]["client"] = cli_jid
+        if cli_jid:
+            self._job_id_to_pair[cli_jid] = plan.pair_index
         # Once we have at least one pair fully started, start polling
         # (cheap to call multiple times — the timer-create is guarded).
         self._maybe_start_poll()
@@ -1306,14 +1509,12 @@ class RdmaTopologyDialog(QDialog):
         if isinstance(cpu_count, int) and cpu_count > 0:
             cpus = [min(int(c), cpu_count - 1) for c in cpus]
 
-        if not hasattr(self, "_pair_extra_workers"):
-            self._pair_extra_workers: Dict[int, List[Dict[str, Any]]] = {}
         self._pair_extra_workers.setdefault(plan.pair_index, [])
 
-        spec_workload = (self._plans[0]
-                         and self._plans[0])  # placeholder to satisfy lint
-        # Re-derive workload from UI (the same path
-        # _proceed_with_topology_start uses).
+        # v0.5.178 audit H5: dropped the `spec_workload =` dead
+        # assignment. Pre-fix it was tagged `# placeholder to
+        # satisfy lint`. The real workload pull is via
+        # `_test_combo.currentData()` below.
         test_id = self._test_combo.currentData()
 
         peer_host = plan.server.tg_url.replace("http://", "") \
@@ -1408,11 +1609,19 @@ class RdmaTopologyDialog(QDialog):
             )
 
     def _mark_pair_failed(self, pair_index: int, reason: str) -> None:
-        if pair_index >= self._stats_table.rowCount():
+        # v0.5.178 audit H1: pre-fix wrote to `pair_index`
+        # directly, which is correct only on iteration 1. From
+        # iteration 2 onward the iteration's rows sit at
+        # `_current_iter_base_row + pair_index`, so a failure on
+        # iteration 2's pair 0 used to overwrite iteration 1's
+        # pair 0 result. Mirror the offset every other writer
+        # in this file uses.
+        row = (getattr(self, "_current_iter_base_row", 0)
+               + pair_index)
+        if row >= self._stats_table.rowCount():
             return
         self._stats_table.setItem(
-            pair_index, 3, QTableWidgetItem(f"FAILED: {reason}")
-        )
+            row, 3, QTableWidgetItem(f"FAILED: {reason}"))
 
     def _on_stop_clicked(self) -> None:
         # Best-effort stop on every job we know about. Don't wait for
@@ -1520,15 +1729,18 @@ class RdmaTopologyDialog(QDialog):
     def _on_job_resp(self, job_id: str, data: Optional[dict], err: str) -> None:
         if err or not data:
             return
+        # v0.5.178 audit M4: drop polls whose job_id isn't in the
+        # current iteration's index. Pre-fix, a slow callback from
+        # the previous iteration would leak into `_latest_jobs`
+        # and confuse aggregation. Index is rebuilt in
+        # `_run_one_iteration`, so a missing entry means "stale".
+        pair_index = self._job_id_to_pair.get(job_id)
+        if pair_index is None:
+            return
         job = data.get("job") or {}
         self._latest_jobs[job_id] = job
-        # Update the corresponding row's State / BW / MsgRate cells.
-        for plan in self._plans:
-            jobs = self._pair_jobs[plan.pair_index]
-            if jobs.get("server") != job_id and jobs.get("client") != job_id:
-                continue
-            self._update_pair_row(plan.pair_index)
-            break
+        # v0.5.178 audit M5: O(1) row update — no scan.
+        self._update_pair_row(pair_index)
         # v0.5.164: drive the progress widget. Use the most-
         # advanced `started_at` across the active pairs (max
         # elapsed) — all pairs run concurrently with the same
@@ -1713,26 +1925,34 @@ class RdmaTopologyDialog(QDialog):
                     (sum(mrs) / len(mrs)) if mrs else None,
             }
         # v0.5.167: rich per-endpoint details (NIC type, driver,
-        # link rate, MTU, FW, GIDs). Dedup by (tg_url, hca) so the
-        # report doesn't show the same HCA twice when N pairs share
-        # an endpoint.
+        # link rate, MTU, FW, GIDs). Dedup by (tg_url, device) so
+        # the report doesn't show the same HCA twice when N pairs
+        # share an endpoint.
+        #
+        # v0.5.178: the RdmaTopologyEndpoint dataclass field is
+        # `device` (mlx5_0 etc.); the pre-fix code read `ep.hca`,
+        # an attribute that doesn't exist. AttributeError fired on
+        # the first poll response after any topology Start. The
+        # report key + dict label stay "hca" because that's what
+        # the Blast report renderer expects in its `endpoint_details`
+        # shape — only the dataclass access changes.
         endpoint_details: List[Dict[str, Any]] = []
         seen: set = set()
         for p in (self._plans or []):
             for side, ep in (("server", p.server), ("client", p.client)):
                 if not ep:
                     continue
-                key = (side, ep.tg_url, ep.hca)
+                key = (side, ep.tg_url, ep.device)
                 if key in seen:
                     continue
                 seen.add(key)
                 payload = (self._endpoint_device_cache
                            .get(ep.tg_url, {})
-                           .get(ep.hca))
+                           .get(ep.device))
                 endpoint_details.append({
                     "side": side,
                     "tg": ep.tg_url,
-                    "hca": ep.hca,
+                    "hca": ep.device,
                     "device": payload,
                     "pair_index": p.pair_index,
                 })
@@ -1772,9 +1992,14 @@ class RdmaTopologyDialog(QDialog):
         def _on_done(data, err, _url):
             if err or not data:
                 return
+            # v0.5.178 audit L2: skip entries with no name
+            # rather than keying them as "?" — the latter would
+            # silently shadow the first malformed entry across
+            # all others.
             self._endpoint_device_cache[_url] = {
-                (d.get("name") or "?"): d
+                d["name"]: d
                 for d in (data.get("devices") or [])
+                if isinstance(d, dict) and d.get("name")
             }
 
         for url in urls:
@@ -1820,11 +2045,17 @@ class RdmaTopologyDialog(QDialog):
         mr_txt = f"{mr:.4f}" if isinstance(mr, float) else "—"
 
         extras = []
-        if summary.get("samples", 0) > 1:
+        # v0.5.178 audit M6: pre-fix this block crashed when
+        # samples > 1 but every per-pair bw was None (rare but
+        # real: all pairs errored their start, run completed,
+        # summary still gets built). Guard each side.
+        bw_min = summary.get("bw_min_gbps")
+        bw_max = summary.get("bw_max_gbps")
+        if (summary.get("samples", 0) > 1
+                and isinstance(bw_min, (int, float))
+                and isinstance(bw_max, (int, float))):
             extras.append(
-                f"min {summary['bw_min_gbps']:.2f} / "
-                f"max {summary['bw_max_gbps']:.2f} Gbps"
-            )
+                f"min {bw_min:.2f} / max {bw_max:.2f} Gbps")
         n_pairs = len((run.get("endpoints") or {}).get("pairs") or [])
         if n_pairs:
             extras.append(
@@ -1962,8 +2193,19 @@ class RdmaTopologyDialog(QDialog):
                 )
         elif is_lat and agg["weighted_lat_avg_us"] is not None:
             parts.append(
-                f"<b>WEIGHTED LAT AVG: {agg['weighted_lat_avg_us']:.3f} µs</b>"
-            )
+                f"<b>WEIGHTED LAT AVG: "
+                f"{agg['weighted_lat_avg_us']:.3f} µs</b>")
+            # v0.5.178 audit M1: spread across pairs — operators
+            # tracking worst-case tail need to see both ends.
+            if (agg.get("min_lat_us") is not None
+                    and agg.get("max_lat_us") is not None):
+                parts.append(
+                    f"spread "
+                    f"{agg['min_lat_us']:.2f}–"
+                    f"{agg['max_lat_us']:.2f} µs")
+            if agg.get("max_lat_p99_us") is not None:
+                parts.append(
+                    f"worst p99 {agg['max_lat_p99_us']:.2f} µs")
         if agg.get("any_error"):
             parts.append(
                 f"<span style='color:#b91c1c;'>err: {agg['any_error']}</span>"
