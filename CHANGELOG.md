@@ -2,6 +2,97 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.182] - 2026-06-18
+
+**RDMA recheck-audit batch: NB-1 through NB-12 — every gap operator
+surfaced from the v0.5.181 srv06 Run-all report.**
+
+Operator ran v0.5.181's Run-all queue with 16 parallel workers on
+srv06, exported the report, and surfaced 12 distinct issues spanning
+data correctness, queue mechanics, and presentation. This release
+fixes every one. The whole batch went through a second independent
+self-review before ship — findings from that review are folded in
+too (MED-2 spinner restore on Stop, NB-6 behavioural smoke test).
+
+### Data-correctness fixes (HIGH severity)
+
+- **NB-2**: Multi-worker latency tests now capture per-extra
+  `lat_avg_us` / `lat_min_us` / `lat_max_us` / `lat_p99_us` —
+  previously only worker 0's lat reached the Σ, so a 16-parallel
+  lat run averaged 1 sample instead of 16.
+- **NB-6**: Run-all queue advances now wait for every extra worker
+  to finish, not just worker 0. Operator saw a staircase across
+  Run #4/#5/#6 (1/15/16 of 16 done) because the queue advance was
+  killing in-flight extras when the next test's Start fired. The
+  finalize logic split into `_finalize_run()` is gated by
+  `_maybe_emit_total`'s all-workers-done signal.
+- **NB-8**: Latency tests now use `-n` (iter count) instead of
+  `-D` (duration). Duration mode silently strips perftest's
+  9-column output (which carries p99 / min / max / stdev), so
+  every srv06 lat report had `p99 = —`. The dialog still respects
+  operator's iter count if set.
+- **NB-12**: Params snapshot at Start time → `_iteration_params`
+  (Blast + Topology). Pre-fix, `_append_run_log_entry` re-read
+  spinners at report time — if operator changed a spinner mid-run
+  (likely in Run-all's 1.5 s inter-test gap), the report
+  misrepresented what was actually used. Likely root of NB-1
+  (Run #3 read_bw said Parallel=16 but only 1 worker reported).
+
+### Measurement-quality fixes (HIGH severity)
+
+- **NB-4**: Run-all queue now auto-tunes spinners crossing into
+  `*_lat` tests: msg_size→2 B, parallel_workers→1, tx_depth→2.
+  Restores the operator's BW-shaped baseline when returning to
+  `*_bw`. Operator's "41 µs send_lat" was loaded-latency-under-
+  contention (16 flows × 65536 B), not idle. Idle lat on ConnectX-6
+  is ~1.5–3 µs; the auto-tune surfaces that number.
+- **NB-5**: Status banner explains the auto-tune at lat-test start
+  so the operator sees what changed and why.
+
+### Presentation fixes (MED severity)
+
+- **NB-3**: Lat Σ row dispatches on `aggregation_mode` +
+  `workers_attempted` / `pairs_attempted` — partial-reporting honesty.
+  "1 samples" becomes "1 of 16 workers" when 15 were spawned.
+- **NB-7**: Lat Σ row now renders min/max (parens format) when
+  the spread is non-zero — operator could not previously see
+  jitter without scrolling the per-row table.
+- **NB-9**: Endpoint table MTU column populated from `ibv_devinfo`.
+  Pre-fix the device payload was cached at dialog-open and never
+  refreshed; ports that came up after dialog-open showed `—`.
+- **NB-10**: Endpoint table IPv4 column populated from the post-
+  preflight test IPs. Same root cause as NB-9 — added a
+  `_refresh_device_payloads()` call at Start time in Blast (Topology
+  already prefetched per-run via `_prefetch_endpoint_devices`).
+- **NB-11**: Single-worker BW headline says "total across 1 worker"
+  instead of opaque "final" — consistent with the multi-worker
+  phrasing.
+
+### Self-review catches (folded in pre-ship)
+
+- **review MED-2**: Stop mid-queue restores the operator's spinner
+  baseline. Previously, stopping inside a `*_lat` test left the
+  spinners at msg_size=2 / parallel=1 / tx_depth=2.
+- **review LOW-2**: Added a behavioural smoke test for the NB-6
+  finalize ordering (stubbed `_finalize_run`, verified
+  `_pending_finalize` gate fires correctly).
+
+### Tests
+
+23 new tests in `test_v05182_recheck_audit_batch.py` (including the
+behavioural NB-6 smoke). Touched but kept-green: every prior
+`test_v05181_*.py` suite, plus `test_v05177_lat_sweep.py` (updated
+to recognise the new `-n` over `-D` semantics for lat tests).
+
+### Known limitations (deferred to follow-up release)
+
+- Topology multi-worker-per-pair lat tests still surface "1 sample"
+  Σ — same gap as Blast NB-2/NB-6 but in `_pair_extra_workers`
+  instead of `_extra_workers`. Out-of-scope for this batch since
+  the operator's report didn't exercise it; the NB-4 auto-tune
+  forces parallel=1 for lat so this only matters if a user
+  manually forces multi-worker lat outside Run-all.
+
 ## [0.5.181] - 2026-06-17
 
 **Blast + Topology RDMA — Σ row polish, Topology sweep parity, Run-all

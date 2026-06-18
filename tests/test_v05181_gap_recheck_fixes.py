@@ -186,7 +186,10 @@ def test_topology_max_bw_logs_picked_cpus_at_click_time():
 
 
 def test_blast_run_all_progress_uses_n_of_m():
-    body_start = BLAST_SRC.index("def _on_both_finished")
+    # v0.5.182 NB-6: the Run-all advance logic was extracted from
+    # _on_both_finished into _finalize_run, which now hosts the
+    # progress-text + queue-advance code. Look there instead.
+    body_start = BLAST_SRC.index("def _finalize_run")
     body_end = BLAST_SRC.index("\n    def ", body_start)
     body = BLAST_SRC[body_start:body_end]
     assert "_run_all_total" in body

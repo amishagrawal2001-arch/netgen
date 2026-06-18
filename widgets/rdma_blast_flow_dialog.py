@@ -965,6 +965,27 @@ class RdmaBlastFlowDialog(QDialog):
 
     # ─────────── probing
 
+    def _refresh_device_payloads(self) -> None:
+        """v0.5.182 NB-9 + NB-10: re-probe device payloads at Start
+        time so the run-log entry's endpoint table reflects post-
+        preflight state — MTU once the port has come up, IPv4 once
+        preflight applied the test IPs. Pre-fix, payloads were
+        cached at dialog-open time and never refreshed; operator's
+        srv06 report showed MTU `—` + IPv4 `—` despite preflight
+        having configured them."""
+        _get_async(
+            self,
+            f"{self._server_tg_url}/api/rdma/devices",
+            lambda data, err: self._on_devices_resp("server", data, err),
+        )
+        if self._client_tg_url != self._server_tg_url:
+            _get_async(
+                self,
+                f"{self._client_tg_url}/api/rdma/devices",
+                lambda data, err: self._on_devices_resp(
+                    "client", data, err),
+            )
+
     def _probe_both_sides(self) -> None:
         """Fire /api/rdma/perftest/installed + /api/rdma/devices on
         each TG to populate the combos."""
@@ -2028,6 +2049,20 @@ class RdmaBlastFlowDialog(QDialog):
         # v0.5.181 G-1: capture queue length for "Test N of M"
         # progress text after each test finishes.
         self._run_all_total = len(all_tids)
+        # v0.5.182 NB-4: snapshot the operator's CURRENT spinner
+        # values so we can restore them when the queue advances
+        # from a *_lat test back to a *_bw test (or settles).
+        # Lat tests get auto-tuned to small-message single-flow
+        # defaults via _apply_test_type_defaults — operators
+        # don't want a 65536-B 16-worker contention measurement
+        # represented as "send_lat avg 41 µs"; they want the true
+        # idle lat number.
+        self._run_all_baseline_spins = {
+            "msg_size": int(self._msg_size_spin.value()),
+            "parallel_workers": int(
+                self._parallel_workers_spin.value()),
+            "tx_depth": int(self._tx_depth_spin.value()),
+        }
         # Update combo to show first test (visual feedback).
         for i in range(self._test_combo.count()):
             if self._test_combo.itemData(i) == first:
@@ -2038,9 +2073,58 @@ class RdmaBlastFlowDialog(QDialog):
                 # test type — bypassed by blockSignals above.
                 self._refresh_sweep_visibility()
                 break
+        # v0.5.182 NB-4: apply test-type-appropriate defaults to
+        # the first test in the queue.
+        self._apply_test_type_defaults(first)
         # Lock combo while queue runs.
         self._test_combo.setEnabled(False)
         self._run_all_check.setEnabled(False)
+
+    def _apply_test_type_defaults(self, test_id: str) -> None:
+        """v0.5.182 NB-4: when Run-all crosses into a *_lat test,
+        auto-tune msg_size + parallel_workers + tx_depth to
+        lat-appropriate idle-measurement defaults. When crossing
+        into a *_bw test, restore the operator's baseline values.
+
+        Without this, the Run-all queue carries the BW-test
+        defaults (msg_size=65536, parallel=16, tx_depth=128) into
+        the lat tests — producing "loaded latency under
+        contention" not "idle latency", and silently invalidating
+        the measurement. Operator reported `41 µs` send_lat that
+        should have been ~2 µs."""
+        baseline = getattr(self, "_run_all_baseline_spins", None)
+        if not baseline:
+            return
+        is_lat = (test_id or "").endswith("_lat")
+        if is_lat:
+            # Idle-lat: small message, single flow.
+            target = {
+                "msg_size": 2,
+                "parallel_workers": 1,
+                "tx_depth": 2,
+            }
+            # NB-5: tell the operator we did this.
+            self._set_status_ok(
+                "⚙ Lat test — auto-tuned msg_size=2 B, "
+                "parallel=1, tx_depth=2 for idle latency. "
+                "(BW settings restored when queue returns to BW.)"
+            )
+        else:
+            target = baseline
+        for spin, key in (
+            (self._msg_size_spin, "msg_size"),
+            (self._parallel_workers_spin, "parallel_workers"),
+            (self._tx_depth_spin, "tx_depth"),
+        ):
+            v = target.get(key)
+            if v is None:
+                continue
+            spin.blockSignals(True)
+            try:
+                spin.setValue(int(v))
+            except Exception:
+                pass
+            spin.blockSignals(False)
 
     def _start_next_test_in_queue(self) -> None:
         """v0.5.181 M-RE-1 followup: pop next test type, update
@@ -2056,6 +2140,8 @@ class RdmaBlastFlowDialog(QDialog):
                 self._test_combo.blockSignals(False)
                 self._refresh_sweep_visibility()
                 break
+        # v0.5.182 NB-4: re-tune params for the new test type.
+        self._apply_test_type_defaults(next_test)
         # Reset iteration loop state so _proceed_with_start
         # initialises fresh counters for this new test.
         self._iteration_in_progress = False
@@ -2149,6 +2235,42 @@ class RdmaBlastFlowDialog(QDialog):
             self._iteration_server_dev = server_dev
             self._iteration_client_dev = client_dev
             self._iteration_in_progress = True
+            # v0.5.182 NB-9 + NB-10: refresh device payloads so
+            # the run-log's endpoint table picks up post-preflight
+            # MTU + IPv4 instead of the stale dialog-open snapshot.
+            # Fire-and-forget; the test takes seconds-to-minutes
+            # so the async fetch lands long before
+            # _append_run_log_entry reads payloads.
+            self._refresh_device_payloads()
+            # v0.5.182 NB-12: snapshot spinner state at Start time
+            # so the run-log entry's `params` dict reflects what
+            # was ACTUALLY used by this run, not what the operator
+            # may have changed the spinner to mid-run (especially
+            # likely in Run-all mode where the operator can tweak
+            # values during the 1.5 s inter-test pause).
+            self._iteration_params = {
+                "test": self._test_combo.currentText(),
+                "test_id": self._test_combo.currentData(),
+                "msg_size": int(self._msg_size_spin.value()),
+                "qp_count": int(self._qp_count_spin.value()),
+                "duration_s": int(self._duration_spin.value()),
+                "tx_depth": int(self._tx_depth_spin.value()),
+                "gid_index": int(self._gid_index_spin.value()),
+                "mtu": self._mtu_combo.currentText(),
+                "bidirectional": bool(self._bidir_check.isChecked()),
+                "cpu_util": bool(self._cpu_util_check.isChecked()),
+                "parallel_workers": int(
+                    self._parallel_workers_spin.value()),
+                "iterations": int(self._iterations_spin.value()),
+                "sweep_sizes": bool(
+                    self._sweep_sizes_check.isChecked()
+                    and self._sweep_sizes_check.isVisibleTo(self)),
+                "iterations_per_size": (
+                    int(self._sweep_iters_spin.value())
+                    if (self._sweep_sizes_check.isChecked()
+                        and self._sweep_sizes_check.isVisibleTo(self))
+                    else None),
+            }
         test_id = self._test_combo.currentData()
         self._handshake_id = str(uuid.uuid4())
         opts = self._common_opts()
@@ -2174,6 +2296,10 @@ class RdmaBlastFlowDialog(QDialog):
         # would short-circuit on the stale guard and never append
         # a run-log entry / never render the post-run card.
         self._finalised = False
+        # v0.5.182 NB-6: also clear the new finalize guards so
+        # each Start can complete its own _finalize_run.
+        self._run_finalised = False
+        self._pending_finalize = False
         # v0.5.157: also reset the TOTAL-emit guard and worker-0
         # final stats so each new Start gets a clean slate. Without
         # these, a 2nd Start in the same dialog session would skip
@@ -2410,6 +2536,20 @@ class RdmaBlastFlowDialog(QDialog):
                 # v0.5.181 B-3: per-extra iters → row builder so the
                 # Σ Iters column sums across all workers, not zero.
                 w.setdefault(f"{side}_iters", iters)
+                # v0.5.182 NB-2: also stash per-extra latency fields
+                # so multi-worker lat tests carry every worker's
+                # lat_avg / lat_min / lat_max / lat_p99 to the
+                # report rows. Pre-fix only worker 0 had lat — the
+                # Σ averaged a single sample even though N workers
+                # ran ping-pong.
+                w.setdefault(f"{side}_lat_avg_us",
+                             job.get("final_lat_avg_us"))
+                w.setdefault(f"{side}_lat_min_us",
+                             job.get("final_lat_min_us"))
+                w.setdefault(f"{side}_lat_max_us",
+                             job.get("final_lat_max_us"))
+                w.setdefault(f"{side}_lat_p99_us",
+                             job.get("final_lat_p99_us"))
                 w[f"{side}_rc"] = rc
                 self._maybe_emit_total()
 
@@ -2459,6 +2599,12 @@ class RdmaBlastFlowDialog(QDialog):
             f"MsgRate={total_mr:.4f} Mpps"
         )
         self._total_emitted = True
+        # v0.5.182 NB-6: if _on_both_finished deferred the run-log
+        # capture + Run-all advance (because extras were still in
+        # flight), finalize now that every worker has reported.
+        if getattr(self, "_pending_finalize", False):
+            self._pending_finalize = False
+            self._finalize_run()
 
     def _poll_jobs(self) -> None:
         # v0.5.155: poll extras alongside worker 0.
@@ -2716,6 +2862,34 @@ class RdmaBlastFlowDialog(QDialog):
             # All iterations done — emit Σ summary, then settle.
             self._emit_iteration_summary()
             self._iteration_in_progress = False
+        # v0.5.182 NB-6: when extras are still in flight, defer
+        # the run-log capture + card render + queue advance until
+        # _maybe_emit_total fires (after every extra has called
+        # its done callback). Pre-fix, worker 0's done immediately
+        # advanced the queue, killing 15 in-flight extras and
+        # silently dropping their measurements.
+        extras = getattr(self, "_extra_workers", [])
+        all_extras_done = all(
+            (w.get("client_finished") and w.get("server_finished"))
+            for w in extras
+        ) if extras else True
+        if not all_extras_done:
+            self._pending_finalize = True
+            self._set_status_ok(
+                "Worker 0 done — waiting for parallel workers "
+                "to finish before advancing…"
+            )
+            return
+        self._finalize_run()
+
+    def _finalize_run(self) -> None:
+        """v0.5.182 NB-6: the second half of _on_both_finished —
+        run-log snapshot, results card, Run-all queue advance.
+        Extracted so _maybe_emit_total can fire it once every
+        worker (including extras) has reported done."""
+        if getattr(self, "_run_finalised", False):
+            return
+        self._run_finalised = True
         # v0.5.163: snapshot the just-finished run (single iter OR
         # the whole iterate-N session) into _run_log for the
         # Export Report button.
@@ -2796,27 +2970,39 @@ class RdmaBlastFlowDialog(QDialog):
         entry in `_run_log` so the operator can export the whole
         session as HTML."""
         import datetime as _dt
-        # v0.5.177: sweep flag + per-size iterations carried in
-        # params so the HTML report renderer can pick the right
-        # section ("RFC 2544-style sweep" vs "single-size run").
-        is_sweep = bool(self._sweep_sizes_check.isChecked()
-                        and self._sweep_sizes_check.isVisibleTo(self))
-        params = {
-            "test": self._test_combo.currentText(),
-            "msg_size": int(self._msg_size_spin.value()),
-            "qp_count": int(self._qp_count_spin.value()),
-            "duration_s": int(self._duration_spin.value()),
-            "tx_depth": int(self._tx_depth_spin.value()),
-            "gid_index": int(self._gid_index_spin.value()),
-            "mtu": self._mtu_combo.currentText(),
-            "bidirectional": bool(self._bidir_check.isChecked()),
-            "cpu_util": bool(self._cpu_util_check.isChecked()),
-            "parallel_workers": int(self._parallel_workers_spin.value()),
-            "iterations": int(self._iterations_spin.value()),
-            "sweep_sizes": is_sweep,
-            "iterations_per_size": (
-                int(self._sweep_iters_spin.value()) if is_sweep else None),
-        }
+        # v0.5.182 NB-12: prefer the params snapshotted at Start
+        # time (_iteration_params) over re-reading the spinners.
+        # The spinners may have been changed by the operator mid-
+        # run (especially in Run-all mode) — re-reading them would
+        # misrepresent what was ACTUALLY used.
+        snap = dict(getattr(self, "_iteration_params", {}) or {})
+        if snap:
+            # Drop helper keys that don't belong in the public
+            # params dict.
+            snap.pop("test_id", None)
+            params = snap
+        else:
+            # Fallback for dialog paths that didn't go through
+            # _proceed_with_start (defensive — shouldn't happen).
+            is_sweep = bool(self._sweep_sizes_check.isChecked()
+                            and self._sweep_sizes_check.isVisibleTo(self))
+            params = {
+                "test": self._test_combo.currentText(),
+                "msg_size": int(self._msg_size_spin.value()),
+                "qp_count": int(self._qp_count_spin.value()),
+                "duration_s": int(self._duration_spin.value()),
+                "tx_depth": int(self._tx_depth_spin.value()),
+                "gid_index": int(self._gid_index_spin.value()),
+                "mtu": self._mtu_combo.currentText(),
+                "bidirectional": bool(self._bidir_check.isChecked()),
+                "cpu_util": bool(self._cpu_util_check.isChecked()),
+                "parallel_workers": int(self._parallel_workers_spin.value()),
+                "iterations": int(self._iterations_spin.value()),
+                "sweep_sizes": is_sweep,
+                "iterations_per_size": (
+                    int(self._sweep_iters_spin.value())
+                    if is_sweep else None),
+            }
         rows: List[Dict[str, Any]] = []
         # Multi-iteration: one row per (iter), then per-worker.
         iter_results = getattr(self, "_iteration_results", [])
@@ -2853,6 +3039,14 @@ class RdmaBlastFlowDialog(QDialog):
             # Σ Iters column sums across all workers.
             if w.get("client_iters") is not None:
                 row["iters"] = w.get("client_iters")
+            # v0.5.182 NB-2: forward per-extra lat fields so multi-
+            # worker lat tests' Σ averages across every worker that
+            # reported, not just worker 0.
+            if w.get("client_lat_avg_us") is not None:
+                row["lat_avg_us"] = w.get("client_lat_avg_us")
+                row["lat_min_us"] = w.get("client_lat_min_us")
+                row["lat_max_us"] = w.get("client_lat_max_us")
+                row["lat_p99_us"] = w.get("client_lat_p99_us")
             rows.append(row)
         # v0.5.173: only emit the trailing "worker 0" row when it
         # adds information. Two cases where it does:
@@ -3061,6 +3255,26 @@ class RdmaBlastFlowDialog(QDialog):
         pending = getattr(self, "_run_all_pending_timer", None)
         if pending is not None and pending.isActive():
             pending.stop()
+        # v0.5.182 review MED-2: restore spinner baseline if Stop
+        # fires mid-lat-test. Pre-fix, the operator was left with
+        # msg_size=2 / parallel=1 / tx_depth=2 after stopping a
+        # Run-all queue inside a *_lat test.
+        baseline = getattr(self, "_run_all_baseline_spins", None)
+        if baseline:
+            for spin, key in (
+                (self._msg_size_spin, "msg_size"),
+                (self._parallel_workers_spin, "parallel_workers"),
+                (self._tx_depth_spin, "tx_depth"),
+            ):
+                v = baseline.get(key)
+                if v is None:
+                    continue
+                spin.blockSignals(True)
+                try:
+                    spin.setValue(int(v))
+                except Exception:
+                    pass
+                spin.blockSignals(False)
         if not self._test_combo.isEnabled():
             self._test_combo.setEnabled(True)
             self._run_all_check.setEnabled(True)

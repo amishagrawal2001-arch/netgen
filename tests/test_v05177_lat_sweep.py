@@ -93,10 +93,12 @@ def test_build_cmd_no_sweep_preserves_legacy_behaviour():
         },
     )
     assert "-a" not in cmd
-    assert "-D" in cmd
     assert "-s" in cmd
-    d_idx = cmd.index("-D")
-    assert cmd[d_idx + 1] == "30"
+    # v0.5.182 NB-8: lat tests now prefer -n (iter count) over -D
+    # (duration) so perftest emits the 9-column row that carries
+    # p99 / min / max. The default iter count is 10000.
+    assert "-D" not in cmd
+    assert "-n" in cmd
 
 
 def test_perftest_job_dataclass_has_sweep_field():

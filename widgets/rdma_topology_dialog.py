@@ -1033,6 +1033,15 @@ class RdmaTopologyDialog(QDialog):
         self._remaining_tests = rest
         # v0.5.181 G-1: capture queue length for "Test N of M".
         self._run_all_total = len(self._all_perftest_tests)
+        # v0.5.182 NB-4 (sibling parity with Blast): snapshot the
+        # operator's BW-shaped spinner values so we can restore
+        # them when the queue returns from a *_lat test.
+        self._run_all_baseline_spins = {
+            "msg_size": int(self._msg_size_spin.value()),
+            "parallel_workers": int(
+                self._parallel_workers_spin.value()),
+            "tx_depth": int(self._tx_depth_spin.value()),
+        }
         for i in range(self._test_combo.count()):
             if self._test_combo.itemData(i) == first:
                 self._test_combo.blockSignals(True)
@@ -1040,8 +1049,51 @@ class RdmaTopologyDialog(QDialog):
                 self._test_combo.blockSignals(False)
                 self._refresh_sweep_visibility()
                 break
+        self._apply_test_type_defaults(first)
         self._test_combo.setEnabled(False)
         self._run_all_check.setEnabled(False)
+
+    def _apply_test_type_defaults(self, test_id: str) -> None:
+        """v0.5.182 NB-4: auto-tune spinners for lat tests so the
+        Run-all queue captures idle latency instead of "loaded
+        latency under contention" carried over from the BW tests
+        earlier in the queue. Sibling parity with Blast.
+
+        Without this, the operator's srv06 Run-all reported
+        `41 µs send_lat` at 65536-B 16-parallel — that's contention
+        latency, not idle. The true RDMA idle lat on ConnectX-6 is
+        ~1.5–3 µs."""
+        baseline = getattr(self, "_run_all_baseline_spins", None)
+        if not baseline:
+            return
+        is_lat = (test_id or "").endswith("_lat")
+        if is_lat:
+            target = {
+                "msg_size": 2,
+                "parallel_workers": 1,
+                "tx_depth": 2,
+            }
+            self._set_status_ok(
+                "⚙ Lat test — auto-tuned msg_size=2 B, "
+                "parallel=1, tx_depth=2 for idle latency. "
+                "(BW settings restored when queue returns to BW.)"
+            )
+        else:
+            target = baseline
+        for spin, key in (
+            (self._msg_size_spin, "msg_size"),
+            (self._parallel_workers_spin, "parallel_workers"),
+            (self._tx_depth_spin, "tx_depth"),
+        ):
+            v = target.get(key)
+            if v is None:
+                continue
+            spin.blockSignals(True)
+            try:
+                spin.setValue(int(v))
+            except Exception:
+                pass
+            spin.blockSignals(False)
 
     def _start_next_test_in_queue(self) -> None:
         """v0.5.181 M-RE-1 followup: pop next test, update combo,
@@ -1057,6 +1109,8 @@ class RdmaTopologyDialog(QDialog):
                 self._test_combo.blockSignals(False)
                 self._refresh_sweep_visibility()
                 break
+        # v0.5.182 NB-4: re-tune params for the new test type.
+        self._apply_test_type_defaults(next_test)
         # Reset iteration counter; _proceed_with_topology_start
         # will pick the new test from the combo and rebuild spec.
         self._iteration_idx = 0
@@ -1479,6 +1533,33 @@ class RdmaTopologyDialog(QDialog):
         # Reset the Stop flag so a previous run's Stop click
         # doesn't suppress this run's iteration loop.
         self._stop_requested = False
+        # v0.5.182 NB-12: snapshot spinner state at Start time so
+        # _append_run_log_entry's params dict reflects what was
+        # ACTUALLY used (not whatever the operator may have
+        # adjusted mid-run via spinner). Sibling parity with Blast.
+        self._iteration_params = {
+            "shape": self._current_shape(),
+            "test": spec.test,
+            "iterations": int(self._iterations_spin.value()),
+            "parallel_workers": int(
+                self._parallel_workers_spin.value()),
+            "msg_size": int(self._msg_size_spin.value()),
+            "qp_count": int(self._qp_count_spin.value()),
+            "duration_s": int(self._duration_spin.value()),
+            "tx_depth": int(self._tx_depth_spin.value()),
+            "gid_index": int(self._gid_index_spin.value()),
+            "mtu": self._mtu_combo.currentText(),
+            "bidirectional": bool(self._bidir_check.isChecked()),
+            "cpu_util": bool(self._cpu_util_check.isChecked()),
+            "sweep_sizes": bool(
+                self._sweep_sizes_check.isChecked()
+                and self._sweep_sizes_check.isVisibleTo(self)),
+            "iterations_per_size": (
+                int(self._sweep_iters_spin.value())
+                if (self._sweep_sizes_check.isChecked()
+                    and self._sweep_sizes_check.isVisibleTo(self))
+                else None),
+        }
         # Accumulated per-iteration snapshots — used to render the
         # Σ summary row at the end.
         self._iteration_results: List[List[Dict[str, Any]]] = []
@@ -2253,22 +2334,32 @@ class RdmaTopologyDialog(QDialog):
         """v0.5.163: capture the finished topology run for the
         Export Report button."""
         import datetime as _dt
-        params = {
-            "test": self._test_combo.currentText(),
-            "msg_size": int(self._msg_size_spin.value()),
-            "qp_count": int(self._qp_count_spin.value()),
-            "duration_s": int(self._duration_spin.value()),
-            "tx_depth": int(self._tx_depth_spin.value()),
-            "gid_index": int(self._gid_index_spin.value()),
-            "mtu": self._mtu_combo.currentText(),
-            "base_port": int(self._base_port_spin.value()),
-            "bidirectional": bool(self._bidir_check.isChecked()),
-            "cpu_util": bool(self._cpu_util_check.isChecked()),
-            "parallel_workers": int(
-                self._parallel_workers_spin.value()),
-            "iterations": int(self._iterations_spin.value()),
-            "shape": self._current_shape(),
-        }
+        # v0.5.182 NB-12: prefer Start-time snapshot over re-reading
+        # spinners — the operator may have nudged a spinner mid-run.
+        snap = dict(getattr(self, "_iteration_params", {}) or {})
+        if snap:
+            # base_port lives outside _iteration_params (it's set once
+            # at start_clicked, never changes mid-run); read it now.
+            snap.setdefault(
+                "base_port", int(self._base_port_spin.value()))
+            params = snap
+        else:
+            params = {
+                "test": self._test_combo.currentText(),
+                "msg_size": int(self._msg_size_spin.value()),
+                "qp_count": int(self._qp_count_spin.value()),
+                "duration_s": int(self._duration_spin.value()),
+                "tx_depth": int(self._tx_depth_spin.value()),
+                "gid_index": int(self._gid_index_spin.value()),
+                "mtu": self._mtu_combo.currentText(),
+                "base_port": int(self._base_port_spin.value()),
+                "bidirectional": bool(self._bidir_check.isChecked()),
+                "cpu_util": bool(self._cpu_util_check.isChecked()),
+                "parallel_workers": int(
+                    self._parallel_workers_spin.value()),
+                "iterations": int(self._iterations_spin.value()),
+                "shape": self._current_shape(),
+            }
         pairs = [
             {
                 "idx": p.pair_index,

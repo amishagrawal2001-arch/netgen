@@ -1034,6 +1034,7 @@ def _build_perftest_cmd(
 
     duration = opts.get("duration")
     iterations = opts.get("iterations")
+    is_lat = test.endswith("_lat")
     if sweep_sizes:
         cmd += ["-a"]
         # iterations_per_size has Spirent-style semantics: "this
@@ -1042,6 +1043,15 @@ def _build_perftest_cmd(
         # past 30 s on a healthy HCA.
         per_size = int(opts.get("iterations_per_size") or 5000)
         cmd += ["-n", str(per_size)]
+    elif is_lat:
+        # v0.5.182 NB-8: lat tests must use iterations mode (-n)
+        # to get perftest's 9-column output (min / max / t_typical
+        # / stdev / 99% percentile). Duration mode (-D) shrinks
+        # the output to 4 columns (bytes / iters / t_avg / tps),
+        # silently dropping p99. Operator hit this on srv06's
+        # send_lat / write_lat / read_lat: p99 always rendered
+        # as `—` in the report.
+        cmd += ["-n", str(int(iterations) if iterations else 10000)]
     elif duration:
         # perftest rejects -D and -n together; prefer duration.
         cmd += ["-D", str(duration)]

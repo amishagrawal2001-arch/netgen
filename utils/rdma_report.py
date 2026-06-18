@@ -413,7 +413,16 @@ def _render_headline(run: Dict[str, Any]) -> str:
         bws = [r["bw_gbps"] for r in rows
                if isinstance(r.get("bw_gbps"), (int, float))]
         bw = max(bws) if bws else None
-        tail = "final"
+        # v0.5.182 NB-11: single-sample sum_workers / sum_pairs runs
+        # (e.g. a 1-parallel-worker BW test) read `total X · final` —
+        # inconsistent with the multi-worker phrase. Say
+        # "total across 1 worker / pair" instead so the language
+        # matches across worker counts.
+        if is_sum and summary.get("samples") == 1:
+            unit = ("worker" if mode == "sum_workers" else "pair")
+            tail = f"total across 1 {unit}"
+        else:
+            tail = "final"
     if isinstance(summary.get("msgrate_avg_mpps"), (int, float)):
         mr: Optional[float] = float(summary["msgrate_avg_mpps"])
     else:
@@ -473,16 +482,35 @@ def _render_lat_headline(
     Line-rate efficiency calc is SKIPPED for lat runs: a `% of
     line rate` number against a latency µs value is meaningless
     (lat tests intentionally don't fill the wire)."""
+    # v0.5.182 NB-3: surface "X of N workers" honesty when a
+    # multi-worker lat run had partial reporting (operator's srv06
+    # send_lat showed 1 of 16 workers done; tail used to say
+    # `final` masking the gap).
+    mode = summary.get("aggregation_mode") or ""
+    if mode == "sum_pairs":
+        attempted = summary.get("pairs_attempted")
+        unit = "pairs"
+    else:
+        attempted = summary.get("workers_attempted")
+        unit = "workers"
     if (isinstance(summary.get("lat_avg_us"), (int, float))
             and summary.get("samples", 0) > 1):
         avg_us = float(summary["lat_avg_us"])
-        tail = (f"average across "
-                f"{int(summary['samples'])} samples")
+        n = int(summary["samples"])
+        if (isinstance(attempted, int) and attempted
+                and n < attempted):
+            tail = f"average across {n} of {attempted} {unit}"
+        else:
+            tail = f"average across {n} samples"
     else:
         lats = [r["lat_avg_us"] for r in rows
                 if isinstance(r.get("lat_avg_us"), (int, float))]
         avg_us = lats[-1] if lats else None
-        tail = "final"
+        if (isinstance(attempted, int) and attempted
+                and len(lats) < attempted):
+            tail = f"{len(lats)} of {attempted} {unit} reported"
+        else:
+            tail = "final"
     p99_rows = [r.get("lat_p99_us") for r in rows
                 if isinstance(r.get("lat_p99_us"), (int, float))]
     p99_us = p99_rows[-1] if p99_rows else None
@@ -944,22 +972,49 @@ def _fmt_summary_cell(
 
 def _render_lat_summary(s: Dict[str, Any]) -> str:
     """v0.5.181 polish: parity with BW Σ — collapse same-value
-    parens, include Iters sum."""
+    parens, include Iters sum.
+
+    v0.5.182 NB-3 + NB-7: dispatch on aggregation_mode + show
+    workers_attempted partial honesty (multi-worker lat tests now
+    capture every worker's lat; the samples count should reflect
+    the actual reporting workers, not the misleading "1 samples"
+    operator saw on srv06). Min/max also rendered when present so
+    operator can read jitter without scrolling the per-row table."""
     avg = _fmt(s.get("lat_avg_us"), 2)
     mn = _fmt(s.get("lat_min_us"), 2)
     mx = _fmt(s.get("lat_max_us"), 2)
+    p99 = _fmt(s.get("lat_p99_us"), 2)
     iters_sum = s.get("iters_sum")
     iters_txt = (str(int(iters_sum))
                  if isinstance(iters_sum, (int, float))
                  else "—")
     n = s.get("samples") or s.get("n") or "?"
     avg_cell = _fmt_summary_cell(avg, mn, mx, unit_after_max="")
+    # v0.5.182 NB-3: pick the workers_attempted / pairs_attempted
+    # surface based on the aggregation mode. Lat tests across N
+    # parallel workers should show "X of Y workers" honesty so a
+    # partial-reporting run isn't masked as "1 sample".
+    mode = s.get("aggregation_mode") or ""
+    if mode == "sum_pairs":
+        attempted = s.get("pairs_attempted")
+        unit = "pairs"
+    else:
+        attempted = s.get("workers_attempted")
+        unit = "workers"
+    if (isinstance(attempted, int) and attempted
+            and isinstance(n, int) and n < attempted):
+        samples_txt = f"{n} of {attempted} {unit}"
+    elif (isinstance(attempted, int) and attempted
+          and isinstance(n, int)):
+        samples_txt = f"{n} {unit}"
+    else:
+        samples_txt = f"{escape(str(n))} samples"
     return (
         f"<tr class='summary'><td>Σ</td>"
-        f"<td>{escape(str(n))} samples</td>"
+        f"<td>{samples_txt}</td>"
         f"<td class='num'>{escape(iters_txt)}</td>"
         f"<td class='num'>{avg_cell}</td>"
-        f"<td class='num'>—</td></tr>"
+        f"<td class='num'>{p99}</td></tr>"
     )
 
 

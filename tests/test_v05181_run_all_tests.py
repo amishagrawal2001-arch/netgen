@@ -62,10 +62,14 @@ def test_blast_populate_queue_idempotent():
 
 
 def test_blast_finalize_advances_queue():
-    """The Σ-summary / "Run finished" branch in _on_both_finished
-    must check `_remaining_tests` and call
-    `_start_next_test_in_queue` when non-empty."""
-    body_start = BLAST_SRC.index("def _on_both_finished")
+    """The Σ-summary / "Run finished" branch must check
+    `_remaining_tests` and call `_start_next_test_in_queue`
+    when non-empty.
+
+    v0.5.182 NB-6: the queue-advance logic moved from
+    _on_both_finished to _finalize_run so it runs only after
+    every extra has reported, not just worker 0."""
+    body_start = BLAST_SRC.index("def _finalize_run")
     body_end = BLAST_SRC.index("\n    def ", body_start)
     body = BLAST_SRC[body_start:body_end]
     assert "if self._remaining_tests and not stop:" in body
