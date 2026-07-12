@@ -13,6 +13,16 @@ PyQt5>=5.15.0
 # HTTP client and utilities
 requests>=2.31.0
 
+# License JWT verification (v0.5.183+). Verifies RS256 offline codes
+# issued by tlink-license-server against a bundled RSA public key.
+PyJWT>=2.8.0
+cryptography>=41.0.0
+
+# Renders the device fingerprint as a QR code in the activation
+# dialog so the license issuer can scan it from a phone instead of
+# copy-pasting a 64-char hex string.
+qrcode>=7.4
+
 # Configuration and data handling
 PyYAML>=6.0.0
 

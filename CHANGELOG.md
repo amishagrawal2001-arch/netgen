@@ -2,6 +2,86 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.183] - 2026-07-12
+
+**Client-side licensing — verified against tlink-license-server offline
+codes (RS256 JWT). Plus 30-day self-serve trial, auto-start-streams
+gated OFF by default, status-bar chip, top-of-window banner, and an
+`netgen-cli license …` subcommand for headless/CI activation.**
+
+Netgen now ships with a bundled RSA public key at
+`resources/license/tlink-public.pem`. On launch, a blocking activation
+dialog reads the JWT the operator pastes (or loads from file), verifies
+the RS256 signature, checks product_code, expiry, and device
+fingerprint, then caches the token at `~/.netgen/license.jwt`. The
+license unlocks the four flagship features — DPDK Blast, RDMA Blast,
+RDMA Topology, RFC 2544. Non-gated features (scapy streams, admin
+console, help) stay open regardless.
+
+### New — activation flow
+* `widgets/license_activation_dialog.py` — screenshot-shaped blocking
+  gate at launch. Multi-line paste area, Load-from-file, Activate,
+  Start-30-day-trial, Buy link, fingerprint field with Copy + QR
+  buttons (fingerprint is the exact string operators need to paste
+  into the tlink-license-server admin UI).
+* `widgets/license_dialog.py` — Help → License Status. Read-only view
+  of the currently-loaded license (email, tier, billing, start, end,
+  session, fingerprint) plus Renew License… (opens `NETGEN_LICENSE_BUY_URL`)
+  and Deactivate. Renew gets urgent blue styling when the license is
+  ≤30 days from expiry or in the grace period.
+* `widgets/license_banner.py` — top-of-window banner shown when the
+  license needs attention (≤7 days from expiry, in the post-expiry
+  7-day grace period, or invalid). Dismissible per-day. Emits a
+  `renew_clicked` signal wired to the buy URL.
+* `widgets/license_chip.py` — status-bar pill; 6 states: ✓ Licensed
+  (green), ⏱ Trial · Nd left (amber), ⚠ License · Nd (amber),
+  ⚠ Unlicensed (red), ⛔ Grace period (red), ⛔ Trial/License expired
+  (red). Refreshes every 60 s and on any license mutation.
+
+### New — trial
+* `utils/license.start_trial()` — 30-day self-service trial persisted
+  as `~/.netgen/trial.json` plus a `~/.netgen/trial-used.marker` so a
+  second start returns `already used`. Trial passes `is_activated()`
+  and unlocks every gated feature.
+
+### New — headless / CI
+* `netgen-cli license status | activate --token <JWT> | activate --file <path> | deactivate | trial | fingerprint`
+  wraps the same `utils.license` module the GUI uses. Exit code 0/1
+  reflects `is_valid`.
+* `NETGEN_LICENSE_TOKEN` env var — take precedence over
+  `~/.netgen/license.jwt` for kiosk/CI deployments.
+* `NETGEN_LICENSE_FILE` env var — alt file location.
+* `/etc/netgen/license.jwt` — machine-wide file fallback.
+
+### New — resilience
+* 7-day post-expiry grace period: an entitlement whose `end_date`
+  passed within the last 7 days still loads, but flagged as in-grace
+  so the banner + chip nag until the operator renews. > 7 days past
+  expiry → hard-denied.
+* `~/.netgen/license-audit.log` — records every activate/deactivate
+  with ISO timestamps, useful for compliance audits.
+* Pubkey loader uses `importlib.resources` so it works from wheel,
+  tarball, PyInstaller bundle, and repo checkout. Env override for
+  operators rotating keys.
+
+### Traffic streams no longer auto-start on launch
+Per operator ask 2026-07: streams saved in a session no longer restart
+automatically 3 s after the client boots. Gated behind
+`QSettings("Netgen", "netgen-client").value("auto_start_streams_on_launch", False)`.
+Operators who want the old behaviour flip that key.
+
+### Deps
+* PyJWT>=2.8.0, cryptography>=41.0.0, qrcode>=7.4 added to
+  `requirements.txt`.
+
+### Tests
+* 58 tests in `tests/test_v05183_license.py` covering JWT verify,
+  tamper detection, product-code mismatch, session vs entitlement
+  expiry, fingerprint match/mismatch, trial start/refuse-restart,
+  discovery order (env token / env file / disk), grace-period
+  entitlement, audit log persistence, chip states, banner visibility,
+  activation dialog + CLI subcommand smoke.
+
 ## [0.5.182] - 2026-06-18
 
 **RDMA recheck-audit batch: NB-1 through NB-12 — every gap operator

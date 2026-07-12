@@ -91,6 +91,22 @@ def launch(server_url: str, fullscreen: bool, server_explicitly_provided: bool =
             except Exception:
                 pass
 
+    # v0.5.183: license gate. If the user has no cached license, or
+    # the cached one has expired / been tampered with, show the
+    # blocking activation dialog. Cancel/X → exit 0, no window.
+    try:
+        from widgets.license_activation_dialog import (
+            run_activation_gate,
+        )
+        if not run_activation_gate(parent=None):
+            return 0
+    except Exception as _e:
+        # A blown-up license dialog should NOT lock the operator
+        # out of their tool — fall back to legacy behaviour with a
+        # loud warning. Server-side gates would still enforce this
+        # if we add them later.
+        print(f"[WARN] license gate failed: {_e}", file=sys.stderr)
+
     try:
         # Preferred: widget takes server_url and explicit flag
         try:

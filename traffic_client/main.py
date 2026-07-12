@@ -183,6 +183,20 @@ class TrafficGeneratorClient(
         self.setCentralWidget(self.central_widget)
         self.main_layout = QVBoxLayout(self.central_widget)
 
+        # v0.5.183: license expiry banner at the top of the window.
+        # Hidden unless the license is in the ≤7-day / grace / invalid
+        # zone. Dismissible per-day.
+        try:
+            from widgets.license_banner import LicenseBanner
+            self.license_banner = LicenseBanner(parent=self)
+            self.license_banner.renew_clicked.connect(
+                self.show_license_dialog)
+            self.main_layout.addWidget(self.license_banner)
+            self.license_banner.refresh()
+        except Exception as _e:
+            logging.warning(
+                f"[MAIN] License banner unavailable: {_e}")
+
         self.setup_menu_bar()
 
         # DPDK readiness chip in the status bar (right-aligned). Polls
@@ -236,6 +250,23 @@ class TrafficGeneratorClient(
         except Exception as _e:
             logging.warning(
                 f"[MAIN] Orphan chip unavailable: {_e}")
+
+        # v0.5.183: license status chip. Green = licensed, amber =
+        # trial or ≤30 days remaining, red = unlicensed/expired.
+        # Click opens Help → License Status.
+        try:
+            from widgets.license_chip import LicenseChip
+            self.license_chip = LicenseChip(parent=self)
+            try:
+                self.license_chip.clicked.connect(
+                    self.show_license_dialog)
+            except Exception as _e:
+                logging.debug(
+                    f"[MAIN] License chip click wiring failed: {_e}")
+            self.statusBar().addPermanentWidget(self.license_chip)
+        except Exception as _e:
+            logging.warning(
+                f"[MAIN] License chip unavailable: {_e}")
 
 
         # Setup AI menu (if available)
@@ -1464,6 +1495,8 @@ class TrafficGeneratorClient(
         )
         dpdk_blast_flow_action.triggered.connect(self.show_dpdk_blast_flow_dialog)
         dpdk_menu.addAction(dpdk_blast_flow_action)
+        # v0.5.183: license-gated. See _refresh_licensed_actions().
+        self._dpdk_blast_action = dpdk_blast_flow_action
 
         dpdk_menu.addSeparator()
 
@@ -1583,6 +1616,8 @@ class TrafficGeneratorClient(
         )
         rdma_blast_action.triggered.connect(self.show_rdma_blast_flow_dialog)
         rdma_menu.addAction(rdma_blast_action)
+        # v0.5.183: license-gated.
+        self._rdma_blast_action = rdma_blast_action
 
         # v0.4.0 RDMA Topology Test — N×M companion to Blast a RDMA Flow.
         # Single dialog drives endpoint groups + a topology shape
@@ -1601,6 +1636,8 @@ class TrafficGeneratorClient(
         )
         rdma_topology_action.triggered.connect(self.show_rdma_topology_dialog)
         rdma_menu.addAction(rdma_topology_action)
+        # v0.5.183: license-gated.
+        self._rdma_topology_action = rdma_topology_action
 
         rdma_menu.addSeparator()
 
@@ -1636,6 +1673,15 @@ class TrafficGeneratorClient(
         )
         rfc2544_action.triggered.connect(self.show_rfc2544_dialog)
         tools_menu.addAction(rfc2544_action)
+        # v0.5.183: license-gated.
+        self._rfc2544_action = rfc2544_action
+
+        # v0.5.183: gate the licensed menu items based on the
+        # currently-loaded license. Runs at menu-build time.
+        try:
+            self._refresh_licensed_actions()
+        except Exception:
+            pass
 
         # Help menu — guides + about
         # NOTE: on macOS, a menu literally named "Help" gets absorbed into the
@@ -1721,6 +1767,20 @@ class TrafficGeneratorClient(
         feature_guide_action.triggered.connect(self.show_feature_guide)
         help_menu.addAction(feature_guide_action)
         self.addAction(feature_guide_action)
+
+        help_menu.addSeparator()
+
+        # License Status — client-side simple license (v0.5.183+).
+        # Shows tier + expiry + customer, load/deactivate a key.
+        license_action = QAction("License Status…", self)
+        license_action.setToolTip(
+            "Show your netgen license — tier (Community/Pro), expiry, "
+            "and which features are unlocked. Paste or load a key to "
+            "activate."
+        )
+        license_action.triggered.connect(self.show_license_dialog)
+        help_menu.addAction(license_action)
+        self.addAction(license_action)
 
         help_menu.addSeparator()
 
@@ -1864,6 +1924,77 @@ class TrafficGeneratorClient(
         except Exception as e:
             from PyQt5.QtWidgets import QMessageBox
             QMessageBox.warning(self, "Help unavailable", f"Could not open guide: {e}")
+
+    def show_license_dialog(self):
+        """Open the License Status dialog. Refreshes locked/unlocked
+        state of the licensed menu items after the dialog closes so
+        an activation takes effect immediately."""
+        try:
+            from widgets.license_dialog import show_license_dialog
+            show_license_dialog(self)
+        except Exception as e:
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self, "License dialog unavailable",
+                f"Could not open the license dialog: {e}")
+            return
+        # v0.5.183: re-check every feature-gated QAction so a fresh
+        # activation flips menus from grey to enabled without a
+        # restart. Same call as menu-build time, driven by
+        # `utils.license.is_feature_licensed`.
+        try:
+            self._refresh_licensed_actions()
+        except Exception:
+            pass
+        # v0.5.183: repaint the status-bar chip so an in-session
+        # Deactivate / re-activate reflects immediately.
+        try:
+            if hasattr(self, "license_chip"):
+                self.license_chip.refresh()
+        except Exception:
+            pass
+        try:
+            if hasattr(self, "license_banner"):
+                self.license_banner.refresh()
+        except Exception:
+            pass
+
+    def _refresh_licensed_actions(self) -> None:
+        """v0.5.183: gate the four licensed menu actions based on
+        the currently-loaded license. Runs at menu-build time and
+        after Help → License Status… closes so a mid-session
+        Deactivate flips menus back to disabled without a restart.
+
+        Uses `is_feature_licensed(...)` — the tier logic collapses
+        to a single "activated?" check in the JWT-based scheme.
+        Kept as a defence-in-depth even though the startup blocking
+        dialog already prevents a stray unlicensed session."""
+        from utils.license import (
+            is_feature_licensed, tooltip_for_locked_feature, load,
+        )
+        lic = load()
+        pairs = (
+            (getattr(self, "_dpdk_blast_action", None), "dpdk_blast"),
+            (getattr(self, "_rdma_blast_action", None), "rdma_blast"),
+            (getattr(self, "_rdma_topology_action", None),
+             "rdma_topology"),
+            (getattr(self, "_rfc2544_action", None), "rfc2544"),
+        )
+        for action, feature in pairs:
+            if action is None:
+                continue
+            unlocked = is_feature_licensed(feature, lic)
+            action.setEnabled(unlocked)
+            if unlocked:
+                original = action.property("_licensed_tooltip")
+                if isinstance(original, str):
+                    action.setToolTip(original)
+            else:
+                if action.property("_licensed_tooltip") is None:
+                    action.setProperty(
+                        "_licensed_tooltip", action.toolTip())
+                action.setToolTip(
+                    tooltip_for_locked_feature(feature, lic))
 
     def show_capabilities_guide(self):
         """Open the Supported Features / Capabilities Guide from the

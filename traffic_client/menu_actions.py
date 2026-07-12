@@ -2547,35 +2547,65 @@ class TrafficGenClientMenuAction():
             if valid_ports:
                 logger.debug(f"[DEBUG LOAD] Valid ports discovered: {sorted(valid_ports)}")
             
-            # Auto-start enabled streams that were previously running (after server restart or client restart)
-            # Wait a moment for servers to be ready, then start enabled streams
+            # v0.5.183: auto-start on launch is OFF by default. The
+            # client used to auto-fire every enabled/running stream
+            # from session.json 3 s after boot — but operator asked
+            # for the app to sit at the loaded (paused) state until
+            # the user hits Start explicitly. This matches how every
+            # other traffic-gen GUI (Ixia, Spirent) behaves.
+            #
+            # Power users who want the old behaviour back can flip
+            # a QSettings key:
+            #     QSettings("Netgen", "netgen-client")
+            #     .setValue("auto_start_streams_on_launch", True)
+            # or from a terminal on macOS:
+            #     defaults write com.netgen.netgen-client \
+            #       auto_start_streams_on_launch -bool true
             if stream_count > 0 and hasattr(self, "start_all_streams"):
-                from PyQt5.QtCore import QTimer
-                # Count enabled streams that should be auto-started
+                from PyQt5.QtCore import QSettings, QTimer
+                auto_start_enabled = QSettings(
+                    "Netgen", "netgen-client"
+                ).value(
+                    "auto_start_streams_on_launch",
+                    False, type=bool,
+                )
+                # Count enabled streams that WOULD auto-start so the
+                # log is honest about what we skipped.
                 enabled_streams_count = 0
                 for port_label, stream_list in self.streams.items():
                     for stream in stream_list:
-                        # Check if stream is enabled (either explicitly or was running)
                         is_enabled = stream.get("enabled", False)
                         if not is_enabled:
-                            # Check protocol_selection
                             ps = stream.get("protocol_selection", {})
                             is_enabled = ps.get("enabled", False)
-                        # Also check if stream was running (status="running")
-                        was_running = stream.get("status", "").lower() == "running"
+                        was_running = (
+                            stream.get("status", "").lower()
+                            == "running")
                         if is_enabled or was_running:
                             enabled_streams_count += 1
-                
-                if enabled_streams_count > 0:
-                    logger.info(f"[AUTO-START] Found {enabled_streams_count} enabled/running stream(s) to auto-start")
-                    # Delay auto-start to ensure servers and UI are ready (wait 3 seconds)
-                    # This gives time for:
-                    # - Server connections to be established
-                    # - Stream table to be populated
-                    # - Statistics polling to initialize
-                    QTimer.singleShot(3000, lambda: self._auto_start_streams_from_session())
+
+                if enabled_streams_count == 0:
+                    logger.info(
+                        "[AUTO-START] No enabled streams found "
+                        "to auto-start")
+                elif not auto_start_enabled:
+                    logger.info(
+                        f"[AUTO-START] Skipping auto-start of "
+                        f"{enabled_streams_count} enabled stream(s) "
+                        f"— auto-start on launch is disabled "
+                        f"(default). Set "
+                        f"auto_start_streams_on_launch=True in "
+                        f"QSettings to re-enable.")
                 else:
-                    logger.info(f"[AUTO-START] No enabled streams found to auto-start")
+                    logger.info(
+                        f"[AUTO-START] Found "
+                        f"{enabled_streams_count} enabled/running "
+                        f"stream(s) to auto-start")
+                    # Delay to give servers + UI + stats polling
+                    # time to settle.
+                    QTimer.singleShot(
+                        3000,
+                        lambda: self._auto_start_streams_from_session())
         
         except FileNotFoundError:
             logger.info("No session file found. Starting fresh.")

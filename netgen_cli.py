@@ -335,6 +335,90 @@ def cmd_tcp(args) -> int:
     return 0
 
 
+# ---------------------------------------------------------------- license
+
+
+def cmd_license_status(args) -> int:
+    """Print the currently-loaded License in a shell-friendly form."""
+    from utils import license as _lic
+    result = _lic.load()
+    days = result.days_until_expiry()
+    print(f"valid:            {result.is_valid}")
+    print(f"reason:           {result.reason}")
+    print(f"tier / billing:   {result.license_type or '?'} / {result.billing_type or '?'}")
+    print(f"email:            {result.email or '?'}")
+    print(f"end_date:         "
+          f"{result.end_date.isoformat() if result.end_date else '?'}")
+    print(f"session_expires:  "
+          f"{result.expiry.isoformat(timespec='seconds') if result.expiry else '?'}")
+    print(f"days_remaining:   {days if days is not None else '?'}")
+    print(f"in_grace_period:  {result.in_grace_period()}")
+    print(f"fingerprint:      {_lic.machine_fingerprint()}")
+    return 0 if result.is_valid else 1
+
+
+def cmd_license_activate(args) -> int:
+    """Save a JWT from --token or --file."""
+    from utils import license as _lic
+    token = ""
+    if args.token and args.file:
+        print("error: --token and --file are mutually exclusive",
+              file=sys.stderr)
+        return 2
+    if args.token:
+        token = args.token.strip()
+    elif args.file:
+        try:
+            token = open(args.file, "r", encoding="utf-8").read().strip()
+        except OSError as exc:
+            print(f"error: cannot read {args.file}: {exc}",
+                  file=sys.stderr)
+            return 2
+    else:
+        print("error: pass --token OR --file", file=sys.stderr)
+        return 2
+    # Sanity check BEFORE clobbering ~/.netgen/license.jwt.
+    check = _lic.verify_jwt(token)
+    if not check.is_valid:
+        print(f"error: license rejected — {check.reason}",
+              file=sys.stderr)
+        return 1
+    saved = _lic.save(token)
+    print(f"activated: tier={saved.license_type or '?'} "
+          f"billing={saved.billing_type or '?'} "
+          f"expires={saved.end_date.isoformat() if saved.end_date else '?'}")
+    return 0
+
+
+def cmd_license_deactivate(args) -> int:
+    from utils import license as _lic
+    if not _lic.LICENSE_FILE.exists():
+        print("no license loaded; nothing to do")
+        return 0
+    _lic.remove()
+    print("deactivated")
+    return 0
+
+
+def cmd_license_trial(args) -> int:
+    from utils import license as _lic
+    result = _lic.start_trial()
+    if not result.is_valid:
+        print(f"error: {result.reason}", file=sys.stderr)
+        return 1
+    days = result.days_until_expiry()
+    print(f"trial started: expires "
+          f"{result.end_date.isoformat() if result.end_date else '?'} "
+          f"({days} day(s) from now)")
+    return 0
+
+
+def cmd_license_fingerprint(args) -> int:
+    from utils import license as _lic
+    print(_lic.machine_fingerprint())
+    return 0
+
+
 # --------------------------------------------------------------------- main
 
 
@@ -351,6 +435,41 @@ def main(argv=None) -> int:
 
     p_health = sub.add_parser("health", help="Probe /api/health + /api/monitors/health")
     p_health.set_defaults(func=cmd_health)
+
+    # v0.5.183: license subcommands — activate / status / deactivate.
+    # Same underlying `utils.license` module as the GUI dialog. For
+    # headless / CI: `netgen-cli license activate --token <jwt>`.
+    p_lic = sub.add_parser(
+        "license", help="Manage the local netgen license")
+    lic_sub = p_lic.add_subparsers(dest="action", required=True)
+
+    p_lic_status = lic_sub.add_parser(
+        "status", help="Print the currently loaded license")
+    p_lic_status.set_defaults(func=cmd_license_status)
+
+    p_lic_activate = lic_sub.add_parser(
+        "activate",
+        help="Save + verify a license JWT (from --token or --file)")
+    p_lic_activate.add_argument(
+        "--token",
+        help="The raw JWT string (mutually exclusive with --file)")
+    p_lic_activate.add_argument(
+        "--file",
+        help="Path to a file containing the JWT")
+    p_lic_activate.set_defaults(func=cmd_license_activate)
+
+    p_lic_deactivate = lic_sub.add_parser(
+        "deactivate", help="Remove the local license file")
+    p_lic_deactivate.set_defaults(func=cmd_license_deactivate)
+
+    p_lic_trial = lic_sub.add_parser(
+        "trial", help="Start the local 30-day trial")
+    p_lic_trial.set_defaults(func=cmd_license_trial)
+
+    p_lic_fp = lic_sub.add_parser(
+        "fingerprint",
+        help="Print this device's fingerprint (to send to your license issuer)")
+    p_lic_fp.set_defaults(func=cmd_license_fingerprint)
 
     p_list = sub.add_parser("list", help="List devices from the DB")
     p_list.set_defaults(func=cmd_list)
