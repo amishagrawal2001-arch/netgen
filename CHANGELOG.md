@@ -2,6 +2,36 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.184] - 2026-07-12
+
+**In-trial license upgrade — Help → License Status gains an
+"Activate License…" button so a trial-mode operator can paste a paid
+JWT without waiting for the trial to expire.**
+
+Before v0.5.184, the activation dialog was only reachable via the
+boot gate. Once a trial was live, `is_activated()` returned True →
+the gate short-circuited → the only way to load a paid key was to
+wait ~30 days for the trial to expire. Not good.
+
+* [widgets/license_dialog.py](widgets/license_dialog.py) now shows
+  an `Activate License…` button alongside Renew and Deactivate.
+  Click opens the same `LicenseActivationDialog` used at boot — the
+  operator pastes their JWT, `save_license()` writes
+  `~/.netgen/license.jwt`, and `load()` prefers the JWT over the
+  trial (invariant already covered by
+  `test_valid_jwt_takes_priority_over_trial`).
+* In trial / grace / invalid states, the Activate button is
+  promoted to primary-blue styling with a tooltip explaining the
+  upgrade path — same visual weight the Renew button gets when
+  close to expiry.
+* On successful activation, the License Status dialog refreshes
+  in-place (no restart). The main window's chip and banner refresh
+  when the dialog closes via the existing v0.5.183 wiring.
+* 3 new tests in
+  [tests/test_v05183_license.py](tests/test_v05183_license.py):
+  trial → paid mid-session, Activate-button urgency in trial,
+  Activate-button neutral styling under paid.
+
 ## [0.5.183] - 2026-07-12
 
 **Client-side licensing — verified against tlink-license-server offline

@@ -31,7 +31,12 @@ from utils.license import (
 
 
 class LicenseDialog(QDialog):
-    """Read-only status dialog."""
+    """Read-only status dialog with Activate/Renew/Deactivate
+    actions. v0.5.184: added inline Activate so a trial-mode
+    operator can upgrade to a paid JWT without waiting for the trial
+    to expire (previously the activation flow was only reachable at
+    startup, which meant `~/.netgen/trial.json` present → no path to
+    paste a paid key)."""
 
     def __init__(self, parent: Optional[QWidget] = None) -> None:
         super().__init__(parent)
@@ -85,6 +90,15 @@ class LicenseDialog(QDialog):
         outer.addWidget(self._features_label)
 
         buttons = QDialogButtonBox()
+        # v0.5.184: Activate — reachable from trial/paid/no-license
+        # so the operator can paste a fresh JWT any time (trial
+        # upgrade, mid-cycle key rotation, or just to load a new
+        # end_date). Reuses the same LicenseActivationDialog the
+        # boot gate uses; cancel closes without side effects.
+        self._activate_btn = QPushButton("Activate License…")
+        self._activate_btn.clicked.connect(self._on_activate)
+        buttons.addButton(self._activate_btn,
+                          QDialogButtonBox.ActionRole)
         # v0.5.183: Renew — open the buy URL. Shown always but
         # highlighted amber when license is ≤30 days or in-grace.
         self._renew_btn = QPushButton("Renew License…")
@@ -167,6 +181,51 @@ class LicenseDialog(QDialog):
                 "RDMA Topology, RFC 2544."
             )
         self._deactivate_btn.setEnabled(bool(lic.jwt_token))
+        # v0.5.184: when running under a trial, promote Activate to
+        # the primary CTA so the operator sees "here's where I paste
+        # my paid key" without hunting. Also highlight it if we're
+        # in-grace or invalid so recovery is one click away.
+        activate_urgent = (
+            lic.is_trial() or lic.in_grace_period() or not lic.is_valid
+        )
+        if activate_urgent:
+            self._activate_btn.setStyleSheet(
+                "QPushButton {"
+                "  background: #1e40af; color: white;"
+                "  padding: 6px 14px; font-weight: 600;"
+                "  border: none; border-radius: 4px;"
+                "}"
+                "QPushButton:hover { background: #1e3a8a; }"
+            )
+            if lic.is_trial():
+                self._activate_btn.setToolTip(
+                    "You're on a trial. Click to paste a paid "
+                    "license JWT and switch over immediately.")
+            elif lic.in_grace_period():
+                self._activate_btn.setToolTip(
+                    "License expired — running under grace period. "
+                    "Paste a renewed license to clear the warning.")
+            else:
+                self._activate_btn.setToolTip(
+                    "Paste a license JWT to activate this device.")
+        else:
+            self._activate_btn.setStyleSheet("")
+            self._activate_btn.setToolTip(
+                "Paste a different license JWT (e.g. after key "
+                "rotation or renewal).")
+
+    def _on_activate(self) -> None:
+        """Open the same LicenseActivationDialog used at boot.
+        v0.5.184: primary path for trial → paid upgrade without
+        waiting for the trial to expire."""
+        from widgets.license_activation_dialog import (
+            LicenseActivationDialog,
+        )
+        dlg = LicenseActivationDialog(self)
+        if dlg.exec_() == QDialog.Accepted:
+            # Re-read from disk (JWT wins over trial in load()).
+            self._license = load_license()
+            self._refresh()
 
     def _on_renew(self) -> None:
         """Open the buy URL in the default browser."""

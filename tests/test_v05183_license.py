@@ -855,6 +855,95 @@ def test_cli_license_fingerprint_prints_hex():
     assert all(c in "0123456789abcdef" for c in fp)
 
 
+def test_license_dialog_activate_during_trial(
+        rsa_keypair, tmp_path, monkeypatch):
+    """v0.5.184: operator on trial can click Activate in the License
+    Status dialog and paste a paid JWT; loaded license wins over
+    trial without an app restart."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt5.QtWidgets import QApplication, QMessageBox
+    _app = QApplication.instance() or QApplication(sys.argv)
+    monkeypatch.setattr(lic, "LICENSE_DIR", tmp_path)
+    monkeypatch.setattr(lic, "LICENSE_FILE",
+                        tmp_path / "license.jwt")
+    monkeypatch.setattr(lic, "TRIAL_FILE",
+                        tmp_path / "trial.json")
+    monkeypatch.setattr(lic, "TRIAL_USED_MARKER",
+                        tmp_path / "trial-used.marker")
+    # Suppress the "activated" info box so exec_ returns.
+    monkeypatch.setattr(QMessageBox, "information",
+                        lambda *a, **kw: None)
+    # Start the operator on trial.
+    lic.start_trial()
+    assert lic.load().billing_type == lic.BILLING_TRIAL
+    from widgets.license_dialog import LicenseDialog
+    dlg = LicenseDialog()
+    # Activate button exists and is present as a widget.
+    assert hasattr(dlg, "_activate_btn")
+    # Simulate what _on_activate does: open the activation dialog,
+    # paste a JWT, click Activate, then re-refresh.
+    from widgets.license_activation_dialog import (
+        LicenseActivationDialog,
+    )
+    subdlg = LicenseActivationDialog(dlg)
+    subdlg._key_edit.setPlainText(_mint_token(rsa_keypair["priv_pem"]))
+    subdlg._on_activate()
+    # The trial-upgraded license now wins.
+    dlg._license = lic.load()
+    dlg._refresh()
+    assert dlg._license.billing_type == "PAID"
+    assert dlg._license.is_valid
+    # Trial file may still exist on disk but load() prefers JWT —
+    # that's the "test_valid_jwt_takes_priority_over_trial"
+    # invariant re-asserted from the dialog's perspective.
+
+
+def test_license_dialog_activate_button_urgent_in_trial(
+        tmp_path, monkeypatch):
+    """The Activate CTA gets urgent-blue styling in trial mode so
+    the operator sees where to upgrade without hunting."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt5.QtWidgets import QApplication
+    _app = QApplication.instance() or QApplication(sys.argv)
+    monkeypatch.setattr(lic, "LICENSE_DIR", tmp_path)
+    monkeypatch.setattr(lic, "LICENSE_FILE",
+                        tmp_path / "license.jwt")
+    monkeypatch.setattr(lic, "TRIAL_FILE",
+                        tmp_path / "trial.json")
+    monkeypatch.setattr(lic, "TRIAL_USED_MARKER",
+                        tmp_path / "trial-used.marker")
+    lic.start_trial()
+    from widgets.license_dialog import LicenseDialog
+    dlg = LicenseDialog()
+    # Urgent styling → contains the primary-blue background rule.
+    assert "#1e40af" in dlg._activate_btn.styleSheet()
+    # Tooltip mentions the trial → paid upgrade path.
+    assert "trial" in dlg._activate_btn.toolTip().lower()
+
+
+def test_license_dialog_activate_button_not_urgent_when_paid(
+        rsa_keypair, tmp_path, monkeypatch):
+    """A valid paid license leaves the Activate button in neutral
+    styling — no urgency, but still clickable for key rotation."""
+    import os
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt5.QtWidgets import QApplication
+    _app = QApplication.instance() or QApplication(sys.argv)
+    monkeypatch.setattr(lic, "LICENSE_FILE",
+                        tmp_path / "license.jwt")
+    monkeypatch.setattr(lic, "TRIAL_FILE",
+                        tmp_path / "trial.json")
+    monkeypatch.setattr(lic, "TRIAL_USED_MARKER",
+                        tmp_path / "trial-used.marker")
+    lic.save(_mint_token(rsa_keypair["priv_pem"]))
+    from widgets.license_dialog import LicenseDialog
+    dlg = LicenseDialog()
+    assert dlg._activate_btn.styleSheet() == ""
+    assert dlg._activate_btn.isEnabled()
+
+
 def test_cli_license_status_prints_no_license(tmp_path, monkeypatch):
     """`netgen-cli license status` on a machine with no license
     returns non-zero and prints reason='no license'."""
