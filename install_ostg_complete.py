@@ -1299,8 +1299,19 @@ class NetgenInstaller:
         # block uninstall (Debian-managed packaging shipped via dpkg
         # can't be cleanly uninstalled by pip).
         pep668 = self._detect_pep668_break_flag()
+        # v0.5.188: pin pip to the SAME python the systemd unit +
+        # verify step use (/usr/bin/python3). Operator on srv01
+        # (Ubuntu 22.04) hit the exact "pip3 shims to a different
+        # python" case v0.4.8's warning was written for: my v0.5.187
+        # backfill for `certifi` used `pip3 install …`, pip3 reported
+        # success, but certifi never landed at /usr/local/lib/
+        # python3.10/dist-packages/ because pip3 was pointing at a
+        # different interpreter. Verify then failed with
+        # `ModuleNotFoundError: No module named 'certifi'`.
+        # Explicit `/usr/bin/python3 -m pip` closes that failure mode.
+        PIP = "/usr/bin/python3 -m pip"
         pip_result = self.run_command(
-            f"pip3 install {pep668}--force-reinstall --no-deps {remote_wheel_path}",
+            f"{PIP} install {pep668}--force-reinstall --no-deps {remote_wheel_path}",
             check=False, capture_output=True,
         )
         if pip_result.returncode != 0:
@@ -1317,7 +1328,7 @@ class NetgenInstaller:
                     "WARNING",
                 )
                 pip_result = self.run_command(
-                    f"pip3 install --break-system-packages "
+                    f"{PIP} install --break-system-packages "
                     f"--force-reinstall --no-deps {remote_wheel_path}",
                     check=False, capture_output=True,
                 )
@@ -1325,7 +1336,7 @@ class NetgenInstaller:
             if "uninstall-distutils-installed-package" in err or "Cannot uninstall" in err:
                 self.log("Pip failed due to distutils-installed package conflict; retrying with --ignore-installed", "WARNING")
                 pip_result = self.run_command(
-                    f"pip3 install {pep668}--force-reinstall --no-deps --ignore-installed {remote_wheel_path}",
+                    f"{PIP} install {pep668}--force-reinstall --no-deps --ignore-installed {remote_wheel_path}",
                     check=False, capture_output=True,
                 )
             if pip_result.returncode != 0:
@@ -1361,7 +1372,7 @@ class NetgenInstaller:
         # loudly during setup.
         self.log("Installing wheel dependencies (Flask, scapy, requests, ...)")
         deps_result = self.run_command(
-            f"pip3 install {pep668}--force-reinstall {remote_wheel_path}",
+            f"{PIP} install {pep668}--force-reinstall {remote_wheel_path}",
             check=False, capture_output=True,
         )
         if deps_result.returncode != 0:
@@ -1377,7 +1388,7 @@ class NetgenInstaller:
                     "WARNING",
                 )
                 deps_result = self.run_command(
-                    f"pip3 install --break-system-packages "
+                    f"{PIP} install --break-system-packages "
                     f"--force-reinstall {remote_wheel_path}",
                     check=False, capture_output=True,
                 )
@@ -1389,7 +1400,7 @@ class NetgenInstaller:
                     "WARNING",
                 )
                 deps_result = self.run_command(
-                    f"pip3 install {pep668}--force-reinstall "
+                    f"{PIP} install {pep668}--force-reinstall "
                     f"--ignore-installed {remote_wheel_path}",
                     check=False, capture_output=True,
                 )
@@ -1429,20 +1440,61 @@ class NetgenInstaller:
             "(certifi, urllib3, charset-normalizer, idna)..."
         )
         transitive_result = self.run_command(
-            f"pip3 install {pep668}--force-reinstall "
+            f"{PIP} install {pep668}--force-reinstall "
             f"certifi urllib3 'charset-normalizer' idna",
             check=False, capture_output=True,
         )
+        # v0.5.188: backfill is now FATAL on non-zero rc. v0.5.187
+        # logged only a WARNING here, but when pip3 (the shim) and
+        # /usr/bin/python3 (the verify's interpreter) diverged on
+        # srv01, the backfill lied about success (rc=0) yet certifi
+        # never landed at /usr/local/lib/python3.10/dist-packages/
+        # and the verify blew up several steps later. Killing loud
+        # here is better than a misleading crash later. We use
+        # `{PIP}` (= /usr/bin/python3 -m pip) instead of `pip3` so
+        # this class of mismatch can't recur.
+        _t_err = (transitive_result.stderr
+                  or transitive_result.stdout or "").strip()
         if transitive_result.returncode != 0:
-            # Non-fatal — the verify step below will catch a real
-            # break. Log so the operator can eyeball what happened.
-            _t_err = (transitive_result.stderr
-                      or transitive_result.stdout or "unknown").strip()
             self.log(
-                "Transitive-dep backfill returned non-zero (verify "
-                f"step will catch a real break):\n{_t_err[:2000]}",
-                "WARNING",
+                "Transitive-dep backfill FAILED:\n"
+                f"{_t_err[:4000]}",
+                "ERROR",
             )
+            raise SystemExit(1)
+        # v0.5.188: post-pip sanity check — pip has been known to
+        # report rc=0 while a package silently doesn't land. Import
+        # each backfilled module from the SAME interpreter to prove
+        # they're actually usable before we hand off to the wider
+        # verify below.
+        sanity = self.run_command(
+            "/usr/bin/python3 -c 'import certifi, urllib3, "
+            "charset_normalizer, idna; "
+            "print(\"backfill sanity ok:\", certifi.where())'",
+            check=False, capture_output=True,
+        )
+        if sanity.returncode != 0:
+            _s_err = (sanity.stderr or sanity.stdout or "").strip()
+            self.log(
+                "Backfilled deps reported install-success but one "
+                "or more still don't import from /usr/bin/python3. "
+                f"This usually means pip and /usr/bin/python3 point "
+                "at different interpreters. Traceback:\n"
+                f"{_s_err[:4000]}",
+                "ERROR",
+            )
+            self.log(
+                "Debug on target:\n"
+                "  which pip3\n"
+                "  head -1 $(which pip3)     # #! line points at the pip's python\n"
+                "  /usr/bin/python3 --version\n"
+                "  ls /usr/local/lib/python3.*/dist-packages/certifi 2>/dev/null",
+                "ERROR",
+            )
+            raise SystemExit(1)
+        self.log(
+            f"  ✓ {(sanity.stdout or '').strip()}"
+        )
 
         # v0.4.8: post-install sanity check. Verify the wheel's core
         # deps are importable from the same python interpreter that

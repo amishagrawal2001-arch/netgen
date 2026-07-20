@@ -2,6 +2,35 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.188] - 2026-07-19
+
+**Installer: pin pip to `/usr/bin/python3 -m pip` so backfilled deps
+land in the same interpreter the verify step uses. Backfill is
+FATAL on failure. Post-backfill sanity check imports the modules
+from the same interpreter to catch pip's "rc=0 but nothing landed"
+lies.**
+
+v0.5.187's certifi backfill still failed on srv01 (Ubuntu 22.04)
+because it invoked bare `pip3`, which shimmed to a different
+Python than the verify's `/usr/bin/python3`. pip reported success,
+certifi went to the wrong site-packages, verify blew up with
+`ModuleNotFoundError: No module named 'certifi'`, and the WARNING-
+level fallback message never surfaced.
+
+Fixes in [install_ostg_complete.py](install_ostg_complete.py):
+
+* Every `pip3 install …` inside `install_ostg` now uses the local
+  `PIP` variable set to `/usr/bin/python3 -m pip`. This includes
+  the wheel-install, the deps-install-with-force-reinstall, the
+  transitive-dep backfill, and their PEP 668 / distutils retries.
+  No more shim mismatch.
+* Backfill is FATAL on non-zero rc (was WARNING, which hid the
+  problem).
+* New post-backfill sanity check runs
+  `/usr/bin/python3 -c 'import certifi, urllib3, charset_normalizer, idna; print(certifi.where())'`
+  and hard-fails with a diagnostic pointing at the exact
+  interpreter mismatch if pip's rc=0 turns out to be a lie.
+
 ## [0.5.187] - 2026-07-12
 
 **Two fixes: installer force-installs requests' transitive deps,
