@@ -13272,17 +13272,21 @@ def get_device_arp_status(device_id):
         # local variable 'subprocess' where it is not associated
         # with a value". Verified the hard way.
         #
-        # Pinging the device's OWN local IP: do NOT VRF-wrap. With
-        # `ip vrf exec <vrf> ping 192.168.0.2`, the kernel's "local"
-        # route for that address points to global lo (which is in the
-        # default VRF, not vrf-<id>) and the ping loops back across
-        # VRFs and fails with 100% loss — even though the IP is
-        # perfectly configured on vlan10 inside the VRF. Self-pings
-        # are kernel-loopback ops and don't need the VRF context;
-        # we save it for external targets (gateway).
+        # Self-ping to the device's OWN IP: MUST run inside the VRF.
+        # Each Linux VRF has its own "local" table (255-in-VRF) that
+        # holds `local 192.168.0.2 dev vlanN`. From the default netns
+        # there is no route to that /24, so a bare `ping 192.168.0.2`
+        # returns "Network is unreachable" even though the address is
+        # perfectly configured. v0.5.193 fix — a prior comment here
+        # claimed the local route pointed to global lo and that VRF-
+        # wrapping caused a loopback failure. Verified on srv01 that
+        # the per-VRF local table works correctly: `ip vrf exec vrf-X
+        # ping 192.168.200.2` succeeds in 0.024ms while the unwrapped
+        # form returns 100% loss. The old behaviour left arp_status
+        # yellow forever on any multi-device (VRF) deployment.
         if ipv4_address:
             try:
-                result = subprocess.run(["ping", "-c", "1", "-W", "1", ipv4_address],
+                result = subprocess.run(ping_prefix + ["ping", "-c", "1", "-W", "1", ipv4_address],
                                       capture_output=True, text=True, timeout=5)
                 arp_results["arp_ipv4_resolved"] = result.returncode == 0
                 arp_results["details"]["ipv4_ping"] = "success" if result.returncode == 0 else "failed"
@@ -13296,15 +13300,12 @@ def get_device_arp_status(device_id):
             except Exception as e:
                 arp_results["details"]["ipv4_ping"] = f"error: {e}"
 
-        # Check IPv6 NDP. Same VRF/self-ping rule as IPv4: probe in
-        # the VRF when targeting the gateway (external), in default
-        # netns when targeting the device's own address.
+        # Check IPv6 NDP. v0.5.193: same VRF fix as IPv4 — self-ping
+        # runs inside the VRF because the local table is per-VRF.
         if ipv6_address or ipv6_gateway:
             try:
                 ipv6_target = ipv6_gateway or ipv6_address
-                ipv6_targets_self = ipv6_gateway in ("", None) and bool(ipv6_address)
-                _ping6_prefix = [] if ipv6_targets_self else ping_prefix
-                ping6_cmd = _ping6_prefix + ["ping6", "-c", "1", "-W", "1", ipv6_target]
+                ping6_cmd = ping_prefix + ["ping6", "-c", "1", "-W", "1", ipv6_target]
                 result = subprocess.run(ping6_cmd, capture_output=True, text=True, timeout=5)
                 arp_results["arp_ipv6_resolved"] = result.returncode == 0
                 arp_results["details"]["ipv6_ping_target"] = ipv6_target
@@ -13340,30 +13341,17 @@ def get_device_arp_status(device_id):
             except Exception as e:
                 arp_results["details"]["gateway_ping"] = f"error: {e}"
         
-        # Determine which address families should be considered mandatory
+        # v0.5.193: `requires_ipv6` must be gated by whether an IPv6
+        # address is actually configured on the device — protocol
+        # flags like `bgp_config.ipv6_enabled` are dual-stack defaults
+        # that leak IPv6 requirements onto IPv4-only devices, which
+        # then can never resolve (no target to probe) and pin ARP
+        # status to yellow forever. Same for the ipv4 counterpart.
+        # Rule: an address family is *required* iff the device has an
+        # address in it. Protocol flags without a matching address
+        # are treated as misconfiguration and ignored for status.
         requires_ipv4 = bool(ipv4_address)
         requires_ipv6 = bool(ipv6_address or ipv6_gateway)
-        try:
-            ospf_cfg = device.get("ospf_config") or {}
-            if isinstance(ospf_cfg, dict):
-                requires_ipv4 = requires_ipv4 or bool(ospf_cfg.get("ipv4_enabled"))
-                requires_ipv6 = requires_ipv6 or bool(ospf_cfg.get("ipv6_enabled"))
-        except Exception:
-            pass
-        try:
-            isis_cfg = device.get("isis_config") or {}
-            if isinstance(isis_cfg, dict):
-                requires_ipv4 = requires_ipv4 or bool(isis_cfg.get("ipv4_enabled"))
-                requires_ipv6 = requires_ipv6 or bool(isis_cfg.get("ipv6_enabled"))
-        except Exception:
-            pass
-        try:
-            bgp_cfg = device.get("bgp_config") or {}
-            if isinstance(bgp_cfg, dict):
-                requires_ipv4 = requires_ipv4 or bool(bgp_cfg.get("ipv4_enabled"))
-                requires_ipv6 = requires_ipv6 or bool(bgp_cfg.get("ipv6_enabled"))
-        except Exception:
-            pass
 
         # Determine overall ARP status - all required families must succeed
         overall_ipv4 = (not requires_ipv4) or arp_results["arp_ipv4_resolved"]

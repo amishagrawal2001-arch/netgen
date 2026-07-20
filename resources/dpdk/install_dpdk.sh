@@ -276,8 +276,17 @@ step_preflight() {
             # up to the nearest mount point.
             :
         fi
-        local avail
-        avail=$(df -BG "$path" 2>/dev/null | tail -1 | awk '{print $4}' | sed 's/G//')
+        # v0.5.191: `df | tail -1 | awk | sed` under `set -euo pipefail`
+        # dies immediately because `tail -1` closes stdin before df
+        # finishes writing, sending SIGPIPE to df, pipefail catches the
+        # non-zero, and set -e kills the whole script — silently, since
+        # avail= assignment is on the same line so nothing reaches the
+        # log after "Checking system requirements...". Trailing
+        # `|| true` neutralises the pipe failure without hiding real
+        # errors (avail just ends up empty, which the [[ -n ]] guard
+        # below already handles).
+        local avail=""
+        avail=$(df -BG "$path" 2>/dev/null | tail -1 | awk '{print $4}' | sed 's/G//' || true)
         if [[ -n "$avail" ]] && [[ "$avail" =~ ^[0-9]+$ ]] && [[ $avail -lt 2 ]]; then
             log_warning "Low disk space on $path: ${avail}GB available (recommended: 2GB+)"
             low_space=1
@@ -651,7 +660,20 @@ step_install_dependencies() {
     # too (fresh installs get it via netgen-install's _setup_lldpd
     # step). Tiny package, no real cost; admin console iface table
     # surfaces neighbors as soon as lldpcli is on PATH.
-    local deps_install_cmd="DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o APT::Sandbox::User=root --option Acquire::http::Timeout=30 --option Acquire::ftp::Timeout=30 build-essential meson ninja-build pkg-config libnuma-dev libelf-dev libpcap-dev python3-pyelftools libssl-dev libjansson-dev libbpf-dev libxdp-dev libbsd-dev zlib1g-dev libfdt-dev libarchive-dev lldpd ${kernel_headers}"
+    # v0.5.192: split deps into REQUIRED (all-or-fail) and OPTIONAL
+    # (best-effort, missing → warning, not fatal). AF_XDP support
+    # is the poster child: `libxdp-dev` and `libbpf-dev` enable the
+    # AF_XDP PMD which most operators don't need, but they live in
+    # Ubuntu's `universe` repo which isn't always enabled on
+    # locked-down lab boxes. Pre-fix, ONE `apt-get install` line
+    # bundled everything, so `E: Unable to locate package libxdp-dev`
+    # blew away the whole install even though 99% of the packages
+    # were fetchable. Operator hit this on san-ft-ai-srv01
+    # 2026-07-19 (Ubuntu 22.04.5, universe not fully populated).
+    local apt_common="DEBIAN_FRONTEND=noninteractive apt-get install -y -o Dpkg::Options::=--force-confdef -o Dpkg::Options::=--force-confold -o APT::Sandbox::User=root --option Acquire::http::Timeout=30 --option Acquire::ftp::Timeout=30"
+    local deps_required="build-essential meson ninja-build pkg-config libnuma-dev libelf-dev libpcap-dev python3-pyelftools libssl-dev libjansson-dev libbsd-dev zlib1g-dev libfdt-dev libarchive-dev lldpd ${kernel_headers}"
+    local deps_optional="libbpf-dev libxdp-dev"   # AF_XDP PMD
+    local deps_install_cmd="$apt_common $deps_required"
 
     # v0.3.2: tighten umask around the temp-log tee so the file is
     # 0600 (owner-only) instead of the default 0644 (world-readable).
@@ -659,9 +681,20 @@ step_install_dependencies() {
     # to leak package names + error fragments to every user on the
     # host. The (subshell) keeps the umask change scoped — outer
     # process umask is untouched after the block exits.
-    # Try to install dependencies
+    # Try to install REQUIRED dependencies
     if (umask 077 && eval "$deps_install_cmd" 2>&1 | tee /tmp/dpdk_deps_install.log); then
-        log_success "Dependencies installed successfully"
+        log_success "Required dependencies installed successfully"
+
+        # v0.5.192: try the optional AF_XDP set separately, don't fail
+        # the whole install if it can't be found.
+        log_info "Installing optional AF_XDP deps ($deps_optional)..."
+        if (umask 077 && eval "$apt_common $deps_optional" 2>&1 | tee -a /tmp/dpdk_deps_install.log); then
+            log_success "Optional AF_XDP deps installed"
+        else
+            log_warning "Optional AF_XDP deps unavailable — AF_XDP PMD will be missing but DPDK builds fine without it."
+            log_warning "If AF_XDP is needed, enable Ubuntu 'universe' repo:"
+            log_warning "  sudo add-apt-repository universe && sudo apt-get update"
+        fi
     else
         # Check if it's just unrelated package issues (like NVIDIA drivers)
         if grep -q "nvidia\|unmet dependencies" /tmp/dpdk_deps_install.log 2>/dev/null; then
@@ -707,7 +740,7 @@ step_install_dependencies() {
         log_error ""
         log_error "════════════════════════════════════════════════════════════"
         log_error "  CRITICAL: python3-pyelftools is NOT installed."
-        log_error "  DPDK 23.11 meson setup hard-requires the `elftools`"
+        log_error "  DPDK 23.11 meson setup hard-requires the 'elftools'"
         log_error "  Python module. Step 5 will fail with:"
         log_error "    buildtools/meson.build:58:8: missing python module: elftools"
         log_error ""

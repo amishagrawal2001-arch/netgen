@@ -290,16 +290,21 @@ class BGPStatusMonitor:
                 'last_bgp_check': bgp_status['last_check']
             })
             
-            # Update main devices table with BGP status
-            # Note: 'bgp_established' and 'last_bgp_check' columns don't exist in devices table
-            # Only bgp_ipv4_established, bgp_ipv6_established, bgp_ipv4_state, bgp_ipv6_state exist
+            # Update main devices table with BGP status.
+            # v0.5.193: an earlier comment claimed `bgp_established`
+            # and `last_bgp_check` were missing columns; they exist
+            # (devices schema lines ~296+301 of utils/device_database
+            # .py). Skipping them left the top-level rollup pinned at
+            # `bgp_established=0` forever — so any UI reading the
+            # devices table saw BGP-down even when IPv4 was
+            # Established, driving the BGP chip yellow.
             update_data = {
-                # 'bgp_established': bgp_status['bgp_established'],  # Removed - column doesn't exist in devices table
+                'bgp_established': bgp_status['bgp_established'],
                 'bgp_ipv4_established': bgp_status['bgp_ipv4_established'],
                 'bgp_ipv6_established': bgp_status['bgp_ipv6_established'],
                 'bgp_ipv4_state': bgp_status['bgp_ipv4_state'],
                 'bgp_ipv6_state': bgp_status['bgp_ipv6_state'],
-                # 'last_bgp_check': bgp_status['last_check']  # Removed - column doesn't exist in devices table (only in device_stats)
+                'last_bgp_check': bgp_status['last_check'],
             }
             
             # Clear manual override flag when monitor takes over

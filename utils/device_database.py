@@ -886,8 +886,11 @@ class DeviceDatabase:
                     'dhcp_lease_subnet': 'dhcp_lease_subnet',
                     'last_dhcp_check': 'last_dhcp_check',
                     'status': 'status',
-                    # Note: 'bgp_established' column doesn't exist in database, only bgp_ipv4_established and bgp_ipv6_established
-                    # 'bgp_established': 'bgp_established',  # Removed - column doesn't exist
+                    # v0.5.193: `bgp_established` column exists in
+                    # the `devices` schema (see CREATE TABLE ~L296);
+                    # the old note here misread the schema and led
+                    # `get_all_devices` to always report False.
+                    'bgp_established': 'bgp_established',
                     'bgp_ipv4_established': 'bgp_ipv4_established',
                     'bgp_ipv6_established': 'bgp_ipv6_established',
                     'bgp_ipv4_state': 'bgp_ipv4_state',

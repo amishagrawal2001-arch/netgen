@@ -2,6 +2,82 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.193] - 2026-07-20
+
+**Device status chips no longer stuck yellow for multi-device / VRF
+deployments and IPv4-only dual-stack configs.**
+
+Three independent bugs in the status monitors, all surfacing as the
+same UX symptom (ARP/BGP chip stays yellow even when routing works).
+Verified live on san-ft-ai-srv01 with a VLAN-200 BGP session: before
+the fix `arp_status=Failed, arp_ipv4_resolved=0, bgp_established=0`
+despite `bgp_ipv4_state=Established`; after: `arp_status=Resolved,
+arp_ipv4_resolved=1, bgp_established=1`.
+
+**Bug 1 — `get_device_arp_status` skipped `ip vrf exec` on self-ping.**
+Old code deliberately unwrapped the VRF prefix when pinging the
+device's own IP, based on a comment claiming self-ping would loop
+across VRFs and fail. That's false: each Linux VRF has its own
+`local` table, so the bare `ping 192.168.0.2` in the default netns
+returns `Network is unreachable` when the address only lives inside
+the VRF. Verified on srv01: `ping 192.168.200.2` fails 100%,
+`ip vrf exec vrf-c2d ping 192.168.200.2` succeeds in 0.024 ms. Fix
+wraps every ARP-probe ping in the device's VRF context.
+
+**Bug 2 — `requires_ipv6` was inferred from protocol dual-stack
+flags.** Netgen's Add-Device dialog defaults BGP / OSPF / ISIS to
+dual-stack (`ipv4_enabled=True, ipv6_enabled=True`) even when the
+operator only fills in an IPv4 address. `get_device_arp_status`
+then set `requires_ipv6=True` from those flags and demanded an
+IPv6 probe that could never succeed (no target). Overall ARP
+status became `Failed` forever, chip yellow. Fix: require IPv6
+only when `ipv6_address` or `ipv6_gateway` is actually set —
+protocol flags without a matching address are treated as
+misconfiguration and ignored for status purposes.
+
+**Bug 3 — `bgp_established` never landed in the `devices` table.**
+The column exists in the schema (`utils/device_database.py` line
+296), but `utils/bgp_monitor.py._update_device_bgp_status` skipped
+it based on a wrong comment ("column doesn't exist"). Similarly
+`utils/device_database.py update_device`'s field-mapping had the
+same key commented out. Consequence: the top-level BGP rollup that
+`get_all_devices` reads was pinned at False forever, driving the
+BGP chip yellow even when IPv4 was Established. Fix: uncomment
+both spots and correct the misleading comments.
+
+**Files touched:**
+- `run_tgen_server.py` — `get_device_arp_status` self-ping VRF
+  wrap + `requires_ipv6` gate
+- `utils/bgp_monitor.py` — write `bgp_established` and
+  `last_bgp_check` to devices table (already-correct sub-flags
+  kept)
+- `utils/device_database.py` — allow `bgp_established` through
+  `update_device` field-mapping
+- `tests/test_v05193_arp_status.py` — 4 regression tests: VRF
+  self-ping wrap, IPv4-only dual-stack no-longer-yellow,
+  bgp_established in update_device field-mapping, bgp_monitor
+  writes bgp_established
+
+**Rolled up from 0.5.191/0.5.192 (never tagged, verified via
+wheel deploys on srv01):**
+
+- `resources/dpdk/install_dpdk.sh` — Step 1 disk-space check
+  died silently under `set -euo pipefail` because
+  `df | tail -1 | awk | sed` sent SIGPIPE to df, pipefail
+  caught it, and set -e killed the script before any warning
+  reached the log. Fixed with `|| true` on the pipeline and
+  `local avail=""` pre-init.
+- `resources/dpdk/install_dpdk.sh` — split apt install into
+  required + optional. Required deps are all-or-fail as before;
+  optional AF_XDP deps (`libbpf-dev`, `libxdp-dev`) are now
+  best-effort — a missing package emits a warning instead of
+  failing the whole install. Ubuntu 22.04 lab boxes without
+  `universe` enabled were losing the entire DPDK install to a
+  single "unable to locate package libxdp-dev" line.
+- `resources/dpdk/install_dpdk.sh` — replaced a backtick-in-
+  double-quoted-string that ran `elftools` as a shell command
+  during the critical-dep error path.
+
 ## [0.5.190] - 2026-07-19
 
 **DPDK build no longer explodes at `pmdinfogen` on x86_64 Ubuntu 22.04
