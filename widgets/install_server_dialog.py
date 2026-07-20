@@ -1947,8 +1947,34 @@ class InstallServerDialog(QDialog):
     # -- Tab 2: SSH fresh install -------------------------------------------
 
     def _build_fresh_install_tab(self) -> QWidget:
+        # v0.5.185: wrap the form in a QScrollArea so a narrow /
+        # small dialog window scrolls the fields instead of visually
+        # overlapping them (operator screenshot showed the Wheel /
+        # Installer / flags-box rows painting on top of each other
+        # at 900px width). The scroll area only kicks in when the
+        # form's sizeHint exceeds the tab; at the design width the
+        # form fills naturally and no scrollbar shows.
+        from PyQt5.QtWidgets import QScrollArea
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(scroll.NoFrame)
         w = QWidget()
+        scroll.setWidget(w)
         form = QFormLayout(w)
+        # v0.5.185: without explicit spacing the form inherits the
+        # style default (0-6px on some platforms), which is what
+        # caused the Wheel / Installer row overlap in the screenshot.
+        # 10px vertical + 12px horizontal gives every row breathing
+        # room without inflating the whole dialog.
+        form.setVerticalSpacing(10)
+        form.setHorizontalSpacing(12)
+        form.setLabelAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        # Fields (right column) grow to consume slack width; the
+        # label column stays sized to its longest label. Without
+        # this the label column was eating half the dialog width
+        # on macOS, squeezing "Browse..." partially behind the
+        # QLineEdit and producing the visual overlap.
+        form.setFieldGrowthPolicy(QFormLayout.ExpandingFieldsGrow)
 
         host_row = QHBoxLayout()
         # Host — editable combobox seeded from chassis_history.json.
@@ -2083,13 +2109,20 @@ class InstallServerDialog(QDialog):
         # made the two checkboxes consume ~80px and overflow onto the
         # info paragraph below. Now ~40px total.
         flags_box = QGroupBox("install_ostg_complete.py flags (optional)")
+        # v0.5.185: title clearance fix — the earlier `padding-top:6px`
+        # was smaller than the title glyph height so the checkboxes
+        # below rendered right under (and visually into) the title
+        # text. Bumped to 14px which is the Qt default for a titled
+        # groupbox on macOS/Linux/Windows. `margin-top` reserves the
+        # gap above the frame so the title sits in it rather than on
+        # top of the first child.
         flags_box.setStyleSheet(
-            "QGroupBox{margin-top:6px; padding-top:6px;}"
+            "QGroupBox{margin-top:14px; padding-top:14px;}"
             "QGroupBox::title{subcontrol-origin:margin; left:8px;}"
         )
         flags_layout = QVBoxLayout(flags_box)
-        flags_layout.setContentsMargins(8, 4, 8, 4)
-        flags_layout.setSpacing(2)
+        flags_layout.setContentsMargins(10, 8, 10, 8)
+        flags_layout.setSpacing(4)
         self.flag_no_dpdk = QCheckBox("--no-dpdk  (skip DPDK install entirely)")
         self.flag_skip_dpdk_build = QCheckBox(
             "--skip-dpdk-build  (apt deps only, no 10–30 min meson build)"
@@ -2128,7 +2161,8 @@ class InstallServerDialog(QDialog):
         action_row.addStretch(1)
         form.addRow("", action_row)
 
-        return w
+        # v0.5.185: return the scroll area, not the raw form widget.
+        return scroll
 
     def _update_auth_visibility(self) -> None:
         # Hide rather than disable: setEnabled left both rows visible

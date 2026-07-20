@@ -2,6 +2,36 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.185] - 2026-07-12
+
+**Install / Upgrade Server dialog — Fresh install via SSH tab no
+longer overlaps rows when the dialog is narrow.**
+
+Operator screenshot showed the Wheel / tarball, Installer, and
+install_ostg_complete.py flags rows painting on top of each other
+at ~900 px width, with the flags QGroupBox title clipping into the
+first checkbox. Three root causes fixed:
+
+* [widgets/install_server_dialog.py](widgets/install_server_dialog.py)
+  `_build_fresh_install_tab` — the QFormLayout had no explicit
+  spacing, so it inherited the style default (0-6 px on some
+  platforms). Set `verticalSpacing(10)` and `horizontalSpacing(12)`
+  so rows always breathe.
+* Same file — the flags QGroupBox stylesheet had
+  `padding-top:6px + margin-top:6px`, smaller than the title-glyph
+  height. Bumped both to 14 px (Qt platform default) so the title
+  sits above the first checkbox instead of overlapping it.
+* Same file — wrapped the whole form in a `QScrollArea` so a
+  user-resized narrow dialog scrolls the fields instead of
+  clipping the buttons.
+* Field-growth policy set to `ExpandingFieldsGrow` and label
+  alignment to right/vcenter so the label column stays sized to
+  the longest label instead of eating half the dialog width on
+  macOS.
+
+4 regression tests in
+[tests/test_v05185_install_dialog_layout.py](tests/test_v05185_install_dialog_layout.py).
+
 ## [0.5.184] - 2026-07-12
 
 **In-trial license upgrade — Help → License Status gains an
