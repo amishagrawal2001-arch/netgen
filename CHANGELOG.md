@@ -2,6 +2,49 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.190] - 2026-07-19
+
+**DPDK build no longer explodes at `pmdinfogen` on x86_64 Ubuntu 22.04
+— NXP DPAA/fslmc ARM-only drivers now disabled at meson configure.**
+
+Operator hit this on san-ft-ai-srv01 during Make DPDK Ready:
+
+```
+subprocess.CalledProcessError: Command '['meson', 'runpython',
+'../buildtools/pmdinfogen.py', 'elf',
+'/opt/dpdk/build/drivers/libtmp_rte_bus_fslmc.a.p/bus_fslmc_fslmc_bus.c.o',
+…]' returned non-zero exit status 2.
+ERROR: Unhandled python exception
+    This is a Meson bug and should be reported!
+ninja: build stopped: subcommand failed.
+```
+
+Root cause: `pmdinfogen.py` (part of the DPDK build) uses `pyelftools`
+to parse driver `.o` files. On Ubuntu 22.04's stock `python3-pyelftools`
+0.27 + DPDK 23.11, parsing the fslmc bus driver `.o` files crashes
+with an unhandled exception. fslmc is NXP's DPAA2/QorIQ **ARM SoC**
+bus — building it on x86_64 makes zero sense in the first place, and
+the crash is 100% reproducible on this platform combo.
+
+Fix in
+[resources/dpdk/install_dpdk.sh](resources/dpdk/install_dpdk.sh):
+extend `meson_disable` from `net/mana` to also cover the full
+NXP DPAA family:
+
+```
+net/mana,
+bus/fslmc, bus/dpaa,
+net/dpaa2, net/dpaa,
+mempool/dpaa2, mempool/dpaa,
+event/dpaa2, event/dpaa,
+crypto/dpaa2_sec, crypto/dpaa_sec,
+raw/dpaa2_qdma, raw/dpaa2_cmdif
+```
+
+Explicit driver list (instead of just `bus/fslmc,bus/dpaa` and
+letting meson auto-drop dependents) is safer against future meson
+dependency-resolution changes.
+
 ## [0.5.189] - 2026-07-19
 
 **INSTALL.md audit — 4 factual errors fixed, 5 troubleshooting rows added,

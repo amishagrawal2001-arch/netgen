@@ -785,12 +785,33 @@ step_build_dpdk() {
     # Build DPDK using meson and ninja
     cd "$DPDK_DIR"
     
-    # Drivers we always disable:
-    #   net/mana — Microsoft Azure NIC PMD; requires IBVERBS_PRIVATE_34 symbols
-    #              which Ubuntu 22.04's libibverbs doesn't ship, so the link
-    #              step fails with "undefined reference to ibv_cmd_query_*".
-    #              No real Azure mana NIC = nothing lost by skipping.
+    # Drivers we always disable on x86_64:
+    #   net/mana         — Microsoft Azure NIC PMD; requires IBVERBS_PRIVATE_34
+    #                      symbols which Ubuntu 22.04's libibverbs doesn't ship,
+    #                      so the link step fails with "undefined reference to
+    #                      ibv_cmd_query_*". No real Azure mana NIC = nothing
+    #                      lost by skipping.
+    #   NXP fslmc / DPAA — DPAA2/QorIQ ARM SoC bus + drivers. Build fine on ARM
+    #                      but on x86_64 pmdinfogen.py crashes parsing the
+    #                      generated .o files (DPDK 23.11 + pyelftools 0.27 on
+    #                      Ubuntu 22.04). Operator-reported on san-ft-ai-srv01
+    #                      2026-07-19: ninja step 720/3719 failed at
+    #                      `meson runpython pmdinfogen.py elf libtmp_rte_bus_fslmc.a.p/*.o`
+    #                      with `subprocess exit 2 / Unhandled python exception
+    #                      This is a Meson bug and should be reported!`.
+    #                      Disable at meson configure time — these drivers
+    #                      target NXP QorIQ ARM boards, useless on x86 anyway.
+    #                      Full family (bus + net + mempool + event + crypto +
+    #                      raw) all depend on bus/fslmc or bus/dpaa; disabling
+    #                      those two would work but explicit is safer against
+    #                      meson dependency-resolution changes.
     local meson_disable="net/mana"
+    meson_disable+=",bus/fslmc,bus/dpaa"
+    meson_disable+=",net/dpaa2,net/dpaa"
+    meson_disable+=",mempool/dpaa2,mempool/dpaa"
+    meson_disable+=",event/dpaa2,event/dpaa"
+    meson_disable+=",crypto/dpaa2_sec,crypto/dpaa_sec"
+    meson_disable+=",raw/dpaa2_qdma,raw/dpaa2_cmdif"
     local meson_opts=("-Dexamples=all" "-Ddisable_drivers=${meson_disable}")
 
     if [[ ! -d "build" ]]; then
