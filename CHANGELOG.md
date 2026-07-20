@@ -2,6 +2,44 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.189] - 2026-07-19
+
+**INSTALL.md audit — 4 factual errors fixed, 5 troubleshooting rows added,
+license activation + advanced/workarounds sections added.**
+
+Driven by an operator install session on 2026-07-19 where the guide's
+claims diverged sharply from reality and left the operator stuck for
+hours. Audit of everything the operator hit + everything they would
+have hit if they'd followed the docs literally:
+
+### Fixed (factual errors)
+
+* [INSTALL.md](INSTALL.md) Path A no longer claims the client bundles a
+  tarball — the client bundles only a wheel + `install_ostg_complete.py`.
+* Path A's SFTP description now names what actually gets sent (wheel
+  + installer, into `/tmp/netgen_install/`), not the imaginary
+  "bundled tarball assets".
+* Path B's `wget` URL corrected to the versioned release-download path
+  (previous form 404s), and now warns that tags v0.5.22–v0.5.186 have
+  no tarball on their release page (the auto-build was disabled during
+  that window; only v0.5.187+ have it back).
+* Every "Add TGen Chassis" renamed to the current "Add Server" menu
+  label.
+
+### Added (topics we hit today)
+
+* **License activation** section — first-launch flow, trial path,
+  status pill legend, `netgen-cli license` recipes, `NETGEN_LICENSE_*`
+  envs. Was completely missing.
+* Troubleshooting rows for: health=degraded/tx_worker missing (srv01's
+  exact case), `ModuleNotFoundError: certifi` with the manual unblock,
+  fresh-install-runs-old-installer client-SFTP overwrite gotcha,
+  `/api/interfaces` all-nulls, gated menu items greyed out.
+* **Advanced / workarounds** section: force a specific installer via
+  raw.githubusercontent.com, backfill a tarball for an existing tag
+  via `gh workflow run build-server-tarball.yml`, headless license
+  activation.
+
 ## [0.5.188] - 2026-07-19
 
 **Installer: pin pip to `/usr/bin/python3 -m pip` so backfilled deps

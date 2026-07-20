@@ -10,22 +10,23 @@ If you have a Linux box you can SSH into + your operator laptop, the client can 
    - macOS — `Netgen-TrafficGenerator-<v>.dmg` (drag to Applications)
    - Windows — `Netgen-Client-<v>-windows.exe` (double-click)
    - Linux — `Netgen-Client-<v>-linux-x86_64.AppImage` (`chmod +x` + run)
-2. **Launch the client** and open **Help → Install / Upgrade Server…**
-3. Switch to the **Fresh install via SSH** tab
-4. Enter the target Linux host + SSH user + key/password
-5. Click **Install**. The dialog SFTPs the bundled tarball assets to the host, runs `netgen-install` over SSH, and streams the live log inline (with error extraction so failures don't make you scroll a 1000-line log)
-6. When done, **Tools → Add TGen Chassis** → enter the server URL → green LED = ready
+2. **Launch the client** and (if prompted) activate the license — see [License activation](#license-activation)
+3. Open **Help → Install / Upgrade Server…**
+4. Switch to the **Fresh install via SSH** tab
+5. Enter the target Linux host + SSH user + key/password
+6. Click **Install**. The dialog SFTPs the bundled **wheel** (`ostg_trafficgen-<v>-py3-none-any.whl`) and the bundled `install_ostg_complete.py` to `/tmp/netgen_install/` on the host, runs the installer over SSH, and streams the live log inline
+7. When done, **Tools → Add Server** → enter the server URL → green LED = ready
 
-The wheel + tarball are bundled inside every client artifact, so step 1 covers everything — no separate download.
+The client bundles the wheel + installer script, so step 1 covers everything — no separate download. **For the bundled-venv tarball flow (recommended for v0.5.x), use Path B or point the "Wheel / tarball" field at a `netgen-server-*.tar.gz` you download separately.**
 
 ### Path B — Direct on the Linux server (no laptop needed)
 
 ```bash
 VER=$(curl -s https://api.github.com/repos/amishagrawal2001-arch/netgen/releases/latest \
        | grep -oP '"tag_name": "v\K[^"]+')
-wget https://github.com/amishagrawal2001-arch/netgen/releases/latest/download/netgen-server-${VER}.tar.gz
+wget https://github.com/amishagrawal2001-arch/netgen/releases/download/v${VER}/netgen-server-${VER}-linux-x86_64.tar.gz
 sudo mkdir -p /opt/netgen-server && \
-  sudo tar -xzf netgen-server-*.tar.gz -C /opt/netgen-server --strip-components=1 && \
+  sudo tar -xzf netgen-server-*-linux-x86_64.tar.gz -C /opt/netgen-server --strip-components=1 && \
   sudo /opt/netgen-server/bin/netgen-install
 ```
 
@@ -36,9 +37,38 @@ systemctl status netgen-server
 curl -s http://localhost:5050/api/admin/health | jq .health   # "healthy"
 ```
 
+**If `wget` 404s:** the tarball auto-build was disabled between v0.5.22 and v0.5.186; only v0.5.187+ tags produce a tarball on the release page automatically. For older tags, an operator with repo write access can trigger a one-off build:
+
+```bash
+gh workflow run build-server-tarball.yml --repo amishagrawal2001-arch/netgen --ref vX.Y.Z
+# takes ~5 min; then the .tar.gz appears on the vX.Y.Z release page
+```
+
 ### Then — DPDK readiness (both paths)
 
-After the server is running, browse to `http://<server>:5050/admin` and click **Tools → DPDK → Make DPDK Ready** to allocate hugepages, load vfio, build `tx_worker`, and (if needed) flip the IOMMU GRUB cmdline. Reboot if prompted.
+After the server is running, in the client click **Tools → DPDK → Make DPDK Ready** to allocate hugepages, load vfio, build `tx_worker`, and (if needed) flip the IOMMU GRUB cmdline. Reboot if prompted.
+
+Full details in [Step 2 below](#step-2-dpdk-readiness-one-click).
+
+---
+
+## License activation
+
+<a id="license-activation"></a>
+
+On first launch the client shows a blocking activation dialog:
+
+- **Paste a paid license JWT** you received from your license issuer, OR
+- Click **Start 30-day free trial** to unlock every feature for a month (single-use per device), OR
+- Click **Buy a license** to open the purchase portal
+
+A trial can be upgraded to a paid license at any time: **Help → License Status… → Activate License…**
+
+The bottom-of-window pill shows the current state (✓ Licensed / ⏱ Trial · N days left / ⛔ Grace period / ⛔ Unlicensed). A top-of-window banner appears when you're ≤7 days from expiry.
+
+Non-gated features (scapy streams, admin console, DPDK setup, RDMA setup) always work regardless of license state. Gated features: **DPDK Blast, RDMA Blast, RDMA Topology, RFC 2544**.
+
+For headless/CI use, activate from the shell with `netgen-cli license activate --token <JWT>`.
 
 ---
 
@@ -56,6 +86,8 @@ After the server is running, browse to `http://<server>:5050/admin` and click **
 The tarball ships a bundled Python 3.10 venv with the wheel pre-installed. **No system pip, no PEP 668, no apt deps for Python.** The only system tools needed at install time are `bash`, `tar`, and (optionally) `docker` for the FRR / DHCP features.
 
 ---
+
+<a id="step-2-dpdk-readiness-one-click"></a>
 
 ## Step 2: DPDK readiness (one click)
 
@@ -84,7 +116,7 @@ Download the matching client artifact from the same GH release:
 | Windows | `Netgen-Client-<v>-windows.exe` — double-click |
 | Linux | `Netgen-Client-<v>-linux-x86_64.AppImage` — `chmod +x` and run |
 
-First launch → **Tools → Add TGen Chassis** → enter `http://<server>:5050` → Save. Green LED next to the server name means healthy. Add stream → Apply → Start.
+First launch → activate the license (see [above](#license-activation)) → **Tools → Add Server** → enter `http://<server>:5050` → Save. Green LED next to the server name means healthy. Add stream → Apply → Start.
 
 ---
 
@@ -160,10 +192,14 @@ Common failure modes:
 |---|---|---|
 | `netgen-install` exits early with "Docker missing" | No Docker; FRR/DHCP features won't work | Install Docker, or pass `--skip-docker` (other features still run) |
 | Make-Ready hangs at "Building DPDK" | apt mirror slow; first install only | Wait — log streams live |
-| `tx_worker binary` tile shows red | install_dpdk.sh didn't finish, or wrong path | Tile tooltip names the fix; `$TX_WORKER_BIN` env override is the escape hatch |
+| Health = **degraded**, `tx_worker binary missing` | DPDK userspace installed but the `tx_worker` build step didn't run | **Tools → DPDK → Make DPDK Ready** — the wizard detects everything else already-done (green) and only runs the tx_worker build (~1 min). `$TX_WORKER_BIN` env is the escape hatch if it's built at a non-standard path. |
+| Install fails with `ModuleNotFoundError: No module named 'certifi'` (or urllib3 / charset_normalizer / idna) | Wheel install path silently skipped a transitive dep, OR `pip3` and `/usr/bin/python3` point at different interpreters | Fixed in v0.5.188 installer. If stuck on older, manual unblock on target: `sudo /usr/bin/python3 -m pip install --force-reinstall certifi urllib3 charset-normalizer idna && sudo systemctl restart netgen-server`. Verify: `head -1 $(which pip3)` should match `/usr/bin/python3 --version`. |
+| Fresh install via SSH runs the OLD installer even after you `wget` a newer one to `/tmp/netgen_install/` | The client SFTPs its own bundled `install_ostg_complete.py`, overwriting anything you placed there | Either upgrade the client so its bundled installer is current, OR bypass the GUI and SSH directly: `wget https://raw.githubusercontent.com/amishagrawal2001-arch/netgen/vX.Y.Z/install_ostg_complete.py && sudo python3 install_ostg_complete.py --wheel <wheel>` |
+| `/api/interfaces` returns NICs with all attributes `null` (mac, driver, operstate all missing) | Server-side iface probe exceptioned silently; `psutil` or `/sys/class/net` read failed | First: `sudo systemctl restart netgen-server` and refresh the admin page. If it persists: `journalctl -u netgen-server -n 200 | grep -iE "traceback\|interface\|psutil"` — that traceback is the real bug |
 | Stream starts, dies in <1s, `tx_count=0` | DPDK init failed for this stream | Journal contains the error (`[dpdk]` lines); usually iface state or PMD |
 | Wrong port physically | Operator forgot which cable is which | Click **💡** button on the row → blinks the LED for 5s |
 | Concurrent operators interfere | Same lab box, two browser tabs | Per-iface lock (v0.5.97) returns `409 IFACE_BUSY` — wait + retry |
+| Gated menu items (DPDK Blast / RDMA / RFC 2544) greyed out | License invalid, expired, or in grace period | **Help → License Status…** — the dialog surfaces the exact reason and gives Activate / Renew buttons |
 
 ---
 
@@ -199,6 +235,50 @@ git clone https://github.com/amishagrawal2001-arch/netgen.git && cd netgen
 ./rebuild_quick.sh                   # builds the wheel
 sudo ./install_turnkey.sh            # full local install
 ```
+
+---
+
+## Advanced / workarounds
+
+### Force a specific installer version (bypass the bundled one)
+
+If your client is older than the fix you need, don't fight the SFTP overwrite — install directly on the target:
+
+```bash
+cd /tmp && sudo rm -rf /tmp/netgen_install && mkdir -p /tmp/netgen_install && cd /tmp/netgen_install
+
+# Pick any tag that has the fix
+wget https://raw.githubusercontent.com/amishagrawal2001-arch/netgen/vX.Y.Z/install_ostg_complete.py
+
+# Any current wheel works — the installer only reads pyproject metadata for logging
+wget https://github.com/amishagrawal2001-arch/netgen/releases/download/vX.Y.Z/ostg_trafficgen-X.Y.Z-py3-none-any.whl
+
+sudo /usr/bin/python3 install_ostg_complete.py --wheel ostg_trafficgen-*.whl
+```
+
+### Build a tarball for a tag that's missing one
+
+Between v0.5.22 and v0.5.186 the tarball workflow didn't auto-fire on tags. To backfill:
+
+```bash
+gh workflow run build-server-tarball.yml --repo amishagrawal2001-arch/netgen --ref vX.Y.Z
+# Watch it:
+gh run list --repo amishagrawal2001-arch/netgen --workflow build-server-tarball.yml --limit 3
+```
+
+~5 min. The `.tar.gz` appears on the `vX.Y.Z` release page when done.
+
+### Headless license activation
+
+```bash
+netgen-cli license fingerprint                           # send this to your license issuer
+netgen-cli license activate --token '<JWT>'              # or --file <path>
+netgen-cli license status                                # confirm
+netgen-cli license trial                                 # start 30-day trial instead
+netgen-cli license deactivate                            # remove
+```
+
+Alternate: set `NETGEN_LICENSE_TOKEN=<JWT>` in the environment (kiosk / CI use) — it overrides `~/.netgen/license.jwt`. `NETGEN_LICENSE_FILE=<path>` also works.
 
 ---
 
