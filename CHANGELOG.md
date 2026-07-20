@@ -2,6 +2,29 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.187] - 2026-07-12
+
+**Installer force-installs requests' transitive deps (certifi,
+urllib3, charset-normalizer, idna) so the post-install verify
+doesn't blow up with `ModuleNotFoundError: No module named
+'certifi'`.**
+
+Confirmed on srv01 after the v0.5.186 diagnostic improvements
+surfaced the actual root cause. Pip installed the wheel + its
+direct deps (flask, scapy, requests) but skipped certifi — a
+transitive of requests — because an apt-installed
+`python3-certifi` was previously on the box and pip's resolver
+decided to keep the system-managed one instead of reinstalling.
+Then something else removed it. Result: requests couldn't
+`from certifi import where`.
+
+Fix in [install_ostg_complete.py](install_ostg_complete.py):
+between the wheel-deps install and the verify step, run
+`pip3 install --force-reinstall certifi urllib3 charset-normalizer
+idna` explicitly. ~500 KB total, idempotent when everything is
+already correct, non-fatal on error (verify step catches real
+breaks).
+
 ## [0.5.186] - 2026-07-12
 
 **Fresh install log: full traceback + accurate diagnostic when the

@@ -1414,6 +1414,36 @@ class NetgenInstaller:
                 )
                 raise SystemExit(1)
 
+        # v0.5.187: force-install the transitive deps that
+        # `requests` needs but pip sometimes doesn't pull through
+        # when an apt-installed `python3-requests` is on the box.
+        # Operator hit this on srv01/22.04 with the v0.3.16 wheel:
+        # requests + flask + scapy landed, but certifi (a transitive
+        # of requests) was missing → ModuleNotFoundError at first
+        # `import requests`. Same root cause is possible for
+        # urllib3, charset-normalizer, idna — install them all
+        # explicitly so pip can't decide to skip any.
+        # The list is cheap (~500KB total) and idempotent.
+        self.log(
+            "Backfilling requests' transitive deps "
+            "(certifi, urllib3, charset-normalizer, idna)..."
+        )
+        transitive_result = self.run_command(
+            f"pip3 install {pep668}--force-reinstall "
+            f"certifi urllib3 'charset-normalizer' idna",
+            check=False, capture_output=True,
+        )
+        if transitive_result.returncode != 0:
+            # Non-fatal — the verify step below will catch a real
+            # break. Log so the operator can eyeball what happened.
+            _t_err = (transitive_result.stderr
+                      or transitive_result.stdout or "unknown").strip()
+            self.log(
+                "Transitive-dep backfill returned non-zero (verify "
+                f"step will catch a real break):\n{_t_err[:2000]}",
+                "WARNING",
+            )
+
         # v0.4.8: post-install sanity check. Verify the wheel's core
         # deps are importable from the same python interpreter that
         # the systemd unit will use. If they aren't (e.g. python
