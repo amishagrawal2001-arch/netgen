@@ -2,6 +2,37 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.186] - 2026-07-12
+
+**Fresh install log: full traceback + accurate diagnostic when the
+post-install dep-import check fails.**
+
+Operator hit `Post-install dep import check failed: Traceback …
+File "requests/utils.py", line 24, in <module> from .` — traceback
+cut mid-line at the exact position that told them what actually
+broke, and the installer then blamed a python-version mismatch that
+the traceback itself proved wasn't the cause.
+
+Fixes in
+[install_ostg_complete.py](install_ostg_complete.py):
+
+* Truncation raised 300 → 8000 chars so full tracebacks survive.
+  Same fix on the earlier `deps_result` log (500 → 8000).
+* Verify command now imports each dep on its own line and prints
+  `py:` / `site-packages:` prefixes, so the log tells you *which*
+  module actually failed AND which python/site-packages resolved
+  it — no more guessing.
+* Full stderr+stdout is also persisted to
+  `/tmp/netgen_install/dep-check-failure.log` on the target, so
+  the operator can `less` it after the fact even if the client
+  log-viewer scrollback rolled off.
+* Rewrote the diagnostic message. The old one only mentioned
+  python-version mismatch. The new one enumerates the three real
+  likely causes in priority order (broken transitive dep like
+  urllib3 v2 on old OpenSSL, actual python-version mismatch,
+  missing system library) with the exact shell command that
+  isolates each one.
+
 ## [0.5.185] - 2026-07-12
 
 **Install / Upgrade Server dialog — Fresh install via SSH tab no

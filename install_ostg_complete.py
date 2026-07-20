@@ -1394,9 +1394,15 @@ class NetgenInstaller:
                     check=False, capture_output=True,
                 )
             if deps_result.returncode != 0:
+                # v0.5.186: was [:500] which cut off pip's "Could
+                # not find version that satisfies …" lines mid-
+                # package-name. 8000 is comfortably longer than
+                # every pip failure mode we've seen.
+                _deps_err = (
+                    deps_result.stderr or deps_result.stdout or "unknown"
+                ).strip()
                 self.log(
-                    f"Deps install failed: "
-                    f"{(deps_result.stderr or deps_result.stdout or 'unknown').strip()[:500]}",
+                    f"Deps install failed:\n{_deps_err[:8000]}",
                     "ERROR",
                 )
                 self.log(
@@ -1415,25 +1421,86 @@ class NetgenInstaller:
         # the unit would crash-loop at first start — surface the
         # problem now while the operator is still watching.
         self.log("Verifying wheel deps are importable...")
+        # v0.5.186: import each dep on its own line so a failure
+        # points at exactly which one broke (previously all three
+        # were on one line — a broken transitive dep of `requests`
+        # looked identical to a broken `flask`). Also compute
+        # site-packages + python-exe so a mismatch shows in the log
+        # even when the traceback itself is inconclusive.
         verify_cmd = (
-            'python3 -c "import flask, scapy, requests; '
-            'print(\\"deps OK: flask=\\" + flask.__version__)"'
+            "python3 - <<'PY'\n"
+            "import sys, traceback\n"
+            "print('py:', sys.executable, sys.version.split()[0])\n"
+            "print('site-packages:', [p for p in sys.path if 'site-packages' in p or 'dist-packages' in p])\n"
+            "for mod in ('flask', 'scapy', 'requests'):\n"
+            "    try:\n"
+            "        __import__(mod)\n"
+            "        print('ok:', mod)\n"
+            "    except Exception:\n"
+            "        print('FAIL:', mod)\n"
+            "        traceback.print_exc()\n"
+            "        sys.exit(1)\n"
+            "PY"
         )
         verify_result = self.run_command(
             verify_cmd, check=False, capture_output=True,
         )
         if verify_result.returncode != 0:
-            err = (verify_result.stderr or verify_result.stdout or "").strip()
+            # v0.5.186: previously we truncated to 300 chars, which
+            # cut the traceback mid-line at the exact spot an operator
+            # needs to see (`from .compat import …` → snipped after
+            # `from .`). Log the full stderr+stdout inline (up to
+            # 8000 chars, enough for any real Python traceback), and
+            # persist the raw output to the target so it survives
+            # log-viewer scrollback / SSH clipboard loss.
+            stderr = verify_result.stderr or ""
+            stdout = verify_result.stdout or ""
+            combined = (stderr + ("\n---stdout---\n" if stdout else "")
+                        + stdout).strip()
+            # Persist full trace to a fixed path so `less` on the
+            # target box is always an option.
+            trace_path = f"{INSTALL_DIR}/dep-check-failure.log"
+            try:
+                self.run_command(
+                    f"cat > {trace_path} <<'NETGENEOF'\n"
+                    f"{combined}\n"
+                    f"NETGENEOF",
+                    check=False,
+                )
+                self.log(
+                    f"Full traceback saved to {trace_path} on the target",
+                    "ERROR",
+                )
+            except Exception:
+                pass
             self.log(
-                f"Post-install dep import check failed: {err[:300]}",
+                f"Post-install dep import check failed. Full output:\n"
+                f"{combined[:8000]}",
                 "ERROR",
             )
+            # v0.5.186: reworked diagnostic — the old blame message
+            # only mentioned python-version mismatch, which is often
+            # NOT the cause. A traceback showing the package DID
+            # load from the same python's dist-packages proves that.
+            # Enumerate the real likely causes so the operator has
+            # somewhere to look.
             self.log(
-                "The wheel was installed but `python3 -c \"import flask\"` "
-                "fails — most likely cause is a python-version mismatch "
-                "(pip3 installs for a different python than /usr/bin/python3 "
-                "uses). Check `head -1 $(which pip3)` vs `/usr/bin/python3 "
-                "--version` on the target.",
+                "Likely causes (in order):\n"
+                "  1. Broken transitive dep (urllib3 v2 on older\n"
+                "     OpenSSL, charset_normalizer/chardet binary\n"
+                "     mismatch, corrupted .dist-info). Test with:\n"
+                "       /usr/bin/python3 -c 'import requests'\n"
+                "     If the traceback points inside urllib3, run:\n"
+                "       pip3 install --force-reinstall 'urllib3<2' "
+                "requests charset-normalizer certifi\n"
+                "  2. Actual python-version mismatch. Check:\n"
+                "       head -1 $(which pip3)\n"
+                "       /usr/bin/python3 --version\n"
+                "  3. Missing system library (openssl, libffi, "
+                "libssl-dev). Try:\n"
+                "       apt-get install -y libssl-dev libffi-dev\n"
+                "Then re-run this installer — dep pip install steps\n"
+                "are idempotent.",
                 "ERROR",
             )
             raise SystemExit(1)
