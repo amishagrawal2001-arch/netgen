@@ -2,6 +2,35 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.194] - 2026-07-20
+
+**Tools → Clear All Devices on Server — bulk cleanup path.**
+
+When the client restarts, the server-side FRR containers, VRFs,
+and device rows persist. If the client's transient view of
+per-device state gets out of sync (or an operator wants a
+"reset this server" button after a lab reshuffle), the fix
+before this release was to right-click each row and Delete —
+tedious past a handful of devices.
+
+- **New endpoint** `POST /api/devices/clear_all` (admin-role):
+  loops `device_db.get_all_devices()` and re-enters
+  `/api/device/remove` via `app.test_client()` for each. Reuses
+  the exact production removal path — container stop, VXLAN
+  teardown, DHCP cancel, OSPF cleanup, DB purge, IP-mapping
+  cleanup. Returns `{total, removed, failed, results}` with
+  per-device status codes + response bodies so partial failures
+  are debuggable.
+- **New client action** `Tools → Clear All Devices on Server…`
+  with a typed-CLEAR confirmation (destructive; the count in
+  the confirmation is fetched fresh from
+  `/api/device/database/devices`), success/partial toast, and
+  automatic Devices-tab refresh on completion.
+- **Tests** `tests/test_v05194_clear_all_devices.py` — empty
+  DB, multi-device dispatch through the shared handler, and a
+  lock-in test that the URL rule + `@require_role("admin")`
+  don't get silently downgraded by a rename.
+
 ## [0.5.193] - 2026-07-20
 
 **Device status chips no longer stuck yellow for multi-device / VRF

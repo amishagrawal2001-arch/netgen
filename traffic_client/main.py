@@ -1662,6 +1662,24 @@ class TrafficGeneratorClient(
 
         tools_menu.addSeparator()
 
+        # v0.5.194: bulk-clear all devices on the selected server.
+        # Operator report — after a client restart the server still
+        # holds device rows with stale VRFs / dead FRR containers;
+        # right-clicking 20 rows one-by-one is tedious. This runs
+        # the same removal path as per-row Delete, just looped.
+        clear_devices_action = QAction("Clear All Devices on Server...", self)
+        clear_devices_action.setToolTip(
+            "Remove every device on the selected server: stops each "
+            "FRR container, tears down VXLAN + VRF, cancels DHCP, and "
+            "purges DB rows. Destructive — the confirmation dialog "
+            "requires typing CLEAR to proceed. Use after a client "
+            "restart if the Devices table shows stale entries."
+        )
+        clear_devices_action.triggered.connect(self.clear_all_devices_on_server)
+        tools_menu.addAction(clear_devices_action)
+
+        tools_menu.addSeparator()
+
         # RFC 2544 throughput test — standard frame-size sweep that
         # binary-searches the max no-drop rate at each of the 7 standard
         # frame sizes (64/128/256/512/1024/1280/1518 bytes).
@@ -1862,6 +1880,123 @@ class TrafficGeneratorClient(
             default_auth_token=default_token,
         )
         dlg.exec_()
+
+    def clear_all_devices_on_server(self):
+        """Tools → Clear All Devices — bulk cleanup on the selected server.
+
+        Prompts for a typed CLEAR confirmation, then POSTs to
+        /api/devices/clear_all. That endpoint loops every device
+        through the same removal path used by per-row Delete
+        (container stop → VXLAN teardown → DHCP cancel → OSPF
+        cleanup → DB purge). Ends with a devices-table refresh.
+        """
+        from PyQt5.QtWidgets import QMessageBox, QInputDialog
+        import requests
+
+        server_url = None
+        try:
+            if hasattr(self, "get_server_url"):
+                server_url = self.get_server_url(silent=True)
+        except Exception:
+            server_url = None
+        if not server_url:
+            server_url = getattr(self, "server_url", None)
+        if not server_url:
+            QMessageBox.warning(
+                self, "No server",
+                "Select a server (in the Servers panel) before clearing devices."
+            )
+            return
+
+        # Peek at count so the confirmation names a number.
+        count = None
+        try:
+            r = requests.get(
+                f"{server_url}/api/device/database/devices", timeout=5
+            )
+            if r.status_code == 200:
+                count = int(r.json().get("count") or 0)
+        except Exception:
+            count = None
+
+        prompt = (
+            f"This will remove <b>{count}</b> device(s) on "
+            f"<code>{server_url}</code>.<br><br>"
+            if count is not None else
+            f"This will remove <b>every</b> device on "
+            f"<code>{server_url}</code>.<br><br>"
+        )
+        prompt += (
+            "For each device the server will stop its FRR container, "
+            "tear down VXLAN + VRF, cancel DHCP, and delete the DB row. "
+            "This cannot be undone.<br><br>"
+            "Type <b>CLEAR</b> below to confirm."
+        )
+
+        typed, ok = QInputDialog.getText(
+            self, "Clear all devices?", prompt
+        )
+        if not ok or typed.strip() != "CLEAR":
+            return
+
+        try:
+            resp = requests.post(
+                f"{server_url}/api/devices/clear_all", timeout=120
+            )
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Clear failed",
+                f"Request to {server_url} failed:\n{e}"
+            )
+            return
+
+        if resp.status_code != 200:
+            body = ""
+            try:
+                body = resp.json().get("error") or resp.text[:400]
+            except Exception:
+                body = resp.text[:400]
+            QMessageBox.critical(
+                self, "Clear failed",
+                f"Server returned {resp.status_code}:\n{body}"
+            )
+            return
+
+        try:
+            data = resp.json() or {}
+        except Exception:
+            data = {}
+        total = int(data.get("total") or 0)
+        removed = int(data.get("removed") or 0)
+        failed = int(data.get("failed") or 0)
+
+        # Refresh the Devices tab so the operator sees the empty state.
+        try:
+            if hasattr(self, "devices_tab") and self.devices_tab:
+                self.devices_tab.reload_devices_from_server()
+        except Exception:
+            pass
+
+        if failed == 0:
+            QMessageBox.information(
+                self, "Devices cleared",
+                f"Removed {removed} of {total} device(s) on\n{server_url}."
+            )
+        else:
+            # Surface the failed device names so the operator can dig in.
+            bad = [
+                r.get("device_name") or r.get("device_id")
+                for r in (data.get("results") or [])
+                if r.get("status_code") != 200
+            ][:10]
+            more = "" if len(bad) < failed else ""
+            if failed > len(bad):
+                more = f"\n… and {failed - len(bad)} more"
+            QMessageBox.warning(
+                self, "Partial cleanup",
+                f"Removed {removed} of {total} device(s).\n"
+                f"{failed} failed:\n" + "\n".join(f"  • {b}" for b in bad) + more
+            )
 
     def show_rfc2544_dialog(self):
         """Open the RFC 2544 throughput test dialog from Tools menu."""

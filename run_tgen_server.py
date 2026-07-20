@@ -6480,6 +6480,95 @@ def remove_device():
         return jsonify({"error": str(e)}), 500
 
 
+@app.route("/api/devices/clear_all", methods=["POST"])
+@require_role("admin")
+def clear_all_devices():
+    """Bulk-remove every device on this server.
+
+    Loops over `device_db.get_all_devices()` and re-enters the
+    existing `/api/device/remove` view via `app.test_client()` so
+    the removal logic (VXLAN teardown → FRR container stop → DHCP
+    cleanup → OSPF cleanup → DB delete → IP-mapping purge) stays
+    in exactly one place. Any drift in `remove_device` is picked
+    up automatically here.
+
+    Motivation: after a client restart the server may still hold
+    device rows whose VRFs / FRR containers are stale. Operators
+    reported wanting a one-click "reset this server's devices"
+    action so they don't have to right-click 20 rows.
+
+    Response shape:
+        {
+            "total":   int,
+            "removed": int,
+            "failed":  int,
+            "results": [{"device_id","device_name","status_code","body"}, ...]
+        }
+    """
+    try:
+        devices = device_db.get_all_devices() or []
+    except Exception as e:
+        logging.error(f"[CLEAR-ALL] Failed to list devices: {e}")
+        return jsonify({"error": f"failed to list devices: {e}"}), 500
+
+    if not devices:
+        return jsonify({
+            "total": 0,
+            "removed": 0,
+            "failed": 0,
+            "results": [],
+            "note": "no devices to clear",
+        }), 200
+
+    # Forward the caller's Authorization header so re-entering
+    # /api/device/remove passes the @require_role gate even when
+    # auth is enabled. When auth is off the header is absent and
+    # the middleware falls through.
+    auth_header = request.headers.get("Authorization")
+    fwd_headers = {"Authorization": auth_header} if auth_header else {}
+
+    results = []
+    with app.test_client() as client:
+        for dev in devices:
+            did = dev.get("device_id")
+            dname = dev.get("device_name", "")
+            if not did:
+                continue
+            try:
+                resp = client.post(
+                    "/api/device/remove",
+                    json={"device_id": did, "device_name": dname},
+                    headers=fwd_headers,
+                )
+                body = {}
+                try:
+                    body = resp.get_json() or {}
+                except Exception:
+                    body = {"raw": resp.get_data(as_text=True)[:400]}
+                results.append({
+                    "device_id": did,
+                    "device_name": dname,
+                    "status_code": resp.status_code,
+                    "body": body,
+                })
+            except Exception as e:
+                logging.error(f"[CLEAR-ALL] remove failed for {did}: {e}")
+                results.append({
+                    "device_id": did,
+                    "device_name": dname,
+                    "status_code": 500,
+                    "body": {"error": str(e)},
+                })
+
+    removed = sum(1 for r in results if r["status_code"] == 200)
+    return jsonify({
+        "total": len(devices),
+        "removed": removed,
+        "failed": len(devices) - removed,
+        "results": results,
+    }), 200
+
+
 @app.route("/api/device/dhcp/status", methods=["GET"])
 def get_dhcp_status():
     """Return DHCP status snapshots for all devices."""
