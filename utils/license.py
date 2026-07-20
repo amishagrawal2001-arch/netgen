@@ -601,10 +601,29 @@ def load(path: Optional[Path] = None) -> License:
         except OSError as exc:
             return License(reason=f"unreadable: {exc}")
         return _maybe_grace(verify_jwt(token))
+    # v0.5.195: an invalid `license.jwt` (expired past grace,
+    # tampered, wrong fingerprint) must NOT shadow a still-live
+    # trial. Pre-fix this function returned `_maybe_grace
+    # (verify_jwt(token))` verbatim the moment any license.jwt
+    # existed, so a stale paid-license file blocked startup even
+    # though a valid trial.json sat next to it — operator report
+    # 2026-07-20 on san-hp-srv06's client. Rule: fall through to
+    # the trial when the JWT can't authorise the session on its
+    # own, and only surface the JWT's reason if the trial can't
+    # either.
     token = _discover_license_source()
-    if token:
-        return _maybe_grace(verify_jwt(token))
+    jwt_lic = _maybe_grace(verify_jwt(token)) if token else None
+    if jwt_lic and jwt_lic.is_valid:
+        return jwt_lic
     trial = _load_trial()
+    if trial is not None and trial.is_valid:
+        return trial
+    # Neither can authorise. Prefer the JWT's error message (it's
+    # more actionable — "expired 12 Jul" beats "no trial") when a
+    # JWT was present; else the expired-trial License; else the
+    # generic no-license default.
+    if jwt_lic is not None:
+        return jwt_lic
     if trial is not None:
         return trial
     return License(reason="no license")

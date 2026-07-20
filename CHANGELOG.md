@@ -2,6 +2,42 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.195] - 2026-07-20
+
+**Client restart no longer bounces trial users to the activation
+dialog when a stale `license.jwt` sits alongside a live trial.**
+
+Operator report: "even though license is active for 30 days
+trial, after restart it is again asking license activation and
+does not start the app."
+
+Root cause — [utils/license.py:604-610](utils/license.py:604)
+returned `_maybe_grace(verify_jwt(token))` verbatim the moment
+`~/.netgen/license.jwt` existed. If the JWT couldn't
+authorise (past-grace expiry, tampered signature, bound to a
+different device fingerprint), `load()` returned the invalid
+License and the caller (`is_activated()`) rejected the session.
+The perfectly-valid `~/.netgen/trial.json` living next to it
+was never consulted. Once a paid activation existed on a
+machine, any later breakage of that JWT permanently shadowed
+the trial.
+
+Fix — `load()` now:
+  1. verifies the JWT (if present) → returns it iff `is_valid`
+  2. otherwise reads the trial file → returns it iff `is_valid`
+  3. only when both are unusable does it surface a reason
+     (JWT's — more actionable than "trial expired" — if a JWT
+     existed at all, else the trial's, else `no license`)
+
+**Files:**
+- `utils/license.py` — `load()` rewritten as a priority ladder
+  (valid JWT > valid trial > invalid JWT > expired trial > no
+  license)
+- `tests/test_v05195_license_trial_fallback.py` — 7 tests
+  covering every rung of the ladder, including the two forms
+  of "invalid JWT shadows valid trial" (past entitlement,
+  tampered signature).
+
 ## [0.5.194] - 2026-07-20
 
 **Tools → Clear All Devices on Server — bulk cleanup path.**
