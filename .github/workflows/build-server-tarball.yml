@@ -37,33 +37,36 @@ on:
         required: false
         type: string
         default: ''
+  # v0.5.187: re-added the tag-based auto-trigger. Operator hit the
+  # "release page has no tarball" gap on 2026-07-12 while walking a
+  # fresh Ubuntu install through the install guide, which references
+  # the tarball path as the recommended flow.
+  #
+  # v0.5.22's "skip tarball on wheel-only releases" rationale is
+  # still valid, but the failure mode of "operator follows the docs
+  # and the file doesn't exist" outweighs the ~5 min extra CI +
+  # ~196 MB storage per tag.
+  #
+  # Note: paths-filter applies to BOTH branch- and tag-pushes on the
+  # same `push:` event per GH docs. To keep tag pushes unconditional
+  # (they should ALWAYS produce a tarball) while keeping branch
+  # pushes path-filtered, we drop the branch-paths combo and let
+  # branch pushes trigger unconditionally too. Dev-time noise from
+  # branch pushes stays cheap — the workflow's own concurrency group
+  # cancels an in-flight run when a new push lands.
   push:
     branches:
       - 'claude/**'
-    paths:
-      - '.github/workflows/build-server-tarball.yml'
-      - 'scripts/tarball/**'
-      - 'pyproject.toml'
-    # v0.5.22: dropped the tag-based auto-trigger. Operator request:
-    # "do not generate tar.gz at every release". Rationale:
-    #
-    #   * Tarball is ~196 MB; building costs ~5 min of CI per tag
-    #     (apt + python-build-standalone download + venv build + pack)
-    #   * The tarball is ONLY needed for fresh installs. Existing
-    #     installs upgrade via wheel through the GUI — they never
-    #     touch the tarball.
-    #   * Most releases (v0.5.6 → v0.5.21 cascade today) touched code
-    #     bundled in the wheel, not the tarball-only assets (bundled
-    #     CPython, install scripts, FRR Docker context). Rebuilding
-    #     for each was waste.
-    #
-    # When you DO need a fresh tarball for a tag:
-    #   gh workflow run build-server-tarball.yml --ref v0.5.22
-    # Or use the Actions UI's "Run workflow" button.
-    #
-    # The branch-push trigger above (path-filtered) still auto-builds
-    # when scripts/tarball/* changes during dev — operators wanting
-    # to test a script edit don't need to remember to dispatch.
+    tags:
+      - 'v*'
+
+# v0.5.187: cancel any in-flight tarball build on the same ref when
+# a newer push lands. Keeps rapid dev-time branch pushes cheap
+# (only the newest survives), while tag pushes always run to
+# completion because tag refs never re-fire.
+concurrency:
+  group: build-server-tarball-${{ github.ref }}
+  cancel-in-progress: true
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"

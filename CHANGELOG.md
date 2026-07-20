@@ -4,6 +4,29 @@ All notable changes to OSTG / Netgen Traffic Generator will be documented in thi
 
 ## [0.5.187] - 2026-07-12
 
+**Two fixes: installer force-installs requests' transitive deps,
+AND tarball workflow re-fires on tag pushes so `.tar.gz` shows up
+on every release page.**
+
+Both surfaced during a single operator install session on 2026-07:
+the fresh install broke on missing certifi, and when we recommended
+"switch to the tarball flow", the tarball wasn't on the release
+page because v0.5.22 had disabled the tag-trigger for the tarball
+workflow to save CI time.
+
+### Tarball workflow — tag trigger re-enabled
+
+* [.github/workflows/build-server-tarball.yml](.github/workflows/build-server-tarball.yml)
+  `push.tags: ['v*']` re-added. v0.5.22's "skip on wheel-only
+  releases" rationale is real, but the failure mode of "operator
+  follows the docs and the tarball doesn't exist" outweighs the
+  ~5 min extra CI + ~196 MB storage per tag.
+* Added a `concurrency` group keyed on `github.ref` so dev-time
+  branch pushes cancel each other in-flight (tag pushes are safe
+  because tag refs never re-fire).
+
+### Installer — force-install transitive deps
+
 **Installer force-installs requests' transitive deps (certifi,
 urllib3, charset-normalizer, idna) so the post-install verify
 doesn't blow up with `ModuleNotFoundError: No module named
