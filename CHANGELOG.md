@@ -2,6 +2,79 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.199] - 2026-08-23
+
+**BGP route-pool changes now withdraw old prefixes from the peer.**
+
+Operator report follow-up to v0.5.198 on san-hp-srv06: attached
+[p2, p5] → applied (peer got 9 prefixes ✓), then swapped to
+[p6] only → applied. Peer's `show bgp summary` still counted
+30 prefixes received — the old 5 (p2) + 4 (p5) never got
+withdrawn even though FRR's prefix-list and config looked
+correct. The routes sat in FRR's BGP RIB and kept being
+re-advertised.
+
+Two coupled bugs, both fixed:
+
+**Bug 1 — cleanup only ran when attach list went empty.**
+
+`configure_bgp` had two branches for its pool loop: empty
+attach → run cleanup; non-empty attach → run configure. There
+was no "attach changed" path — swapping `[p2,p5] → [p6]` fell
+straight into configure and just added p6 on top. Fix: wrap
+cleanup + configure into a single `_cleanup_then_configure`
+worker so every apply for a neighbor starts by wiping any
+prior route-pool state (cleanup iterates the full `all_pools
+_db` so it removes stale routes from ANY prior pool, not just
+the currently-attached set).
+
+**Bug 2 — cleanup's vtysh here-doc was single-command.**
+
+`cleanup_bgp_route_advertisement` shipped its 49 vtysh commands
+as a single `docker exec … vtysh -c "<multi-line-string>"`.
+vtysh's `-c` treats its argument as ONE command, so after the
+first `configure terminal` succeeded (exit 0), every `no ip
+route …` / `no ip prefix-list …` after it was silently ignored.
+Operator saw `Command exit code: 0` + `✅ All cleanup commands
+executed successfully` while FRR still had every stale route.
+
+Fix: match the pattern
+`configure_bgp_route_advertisement` already uses reliably —
+`bash -c "vtysh << EOF ... EOF"` (a real shell heredoc; vtysh
+reads each command from stdin line by line). Same behaviour
+as the manual `docker exec … vtysh -c "cmd1" -c "cmd2"` an
+operator would type by hand.
+
+**Live verification on srv06** (same operator payload,
+[p2,p5] → [p6] swap):
+
+Before v0.5.199:
+```
+static routes in VRF: 29 (2.2.x + 5.5.x + p6)
+FRR BGP RIB:          30
+PfxSnt to peer:       30
+```
+
+After v0.5.199:
+```
+static routes in VRF: 20 (only 6.6.x — p6)
+FRR BGP RIB:          21 (p6 + connected)
+PfxSnt to peer:       21
+```
+
+**Files:**
+- `run_tgen_server.py` — `configure_bgp` known-pools branch
+  now dispatches `_cleanup_then_configure` (cleanup wrapped in
+  try/except so a cleanup failure doesn't block the configure
+  step); `cleanup_bgp_route_advertisement` switched from
+  `docker exec … vtysh -c "<here-doc>"` to
+  `container.exec_run(["bash","-c", "vtysh << 'EOF' … EOF"])`
+- `tests/test_v05199_cleanup_before_configure.py` — 4 source-
+  level lock-in tests: `_cleanup_then_configure` present +
+  ordered before configure, try/except around cleanup so
+  configure still runs, cleanup iterates `all_pools_db`, VRF-
+  suffix guard.
+
 ## [0.5.198] - 2026-08-23
 
 **BGP route-pool attachment now works end-to-end without a

@@ -8606,25 +8606,29 @@ def cleanup_bgp_route_advertisement(device_id, device_name, bgp_asn, neighbor_ip
         ])
         
         logging.info(f"[BGP ROUTE CLEANUP] About to execute {len(cleanup_commands)} cleanup commands")
-        
-        # Execute cleanup commands using here document approach
-        import subprocess
-        here_doc = "\n".join(cleanup_commands)
-        
-        cmd = [
-            "docker", "exec", container_name, "vtysh", "-c", here_doc
-        ]
-        
+
+        # v0.5.199: previously the here-doc was passed as a single
+        # `docker exec ... vtysh -c "<multi-line-string>"` — vtysh's
+        # `-c` treats its argument as ONE command, so all commands
+        # after the first `configure terminal` silently no-op'd.
+        # Exit code was 0 (because line 1 succeeded) → operator saw
+        # "cleanup successful" while stale routes remained in FRR.
+        # Match the pattern that `configure_bgp_route_advertisement`
+        # already uses (works reliably): pipe the commands into
+        # `vtysh << EOF ... EOF` via `bash -c` so vtysh reads each
+        # command from stdin one line at a time.
+        config_commands = "\n".join(cleanup_commands)
+        exec_cmd = f"vtysh << 'EOF'\n{config_commands}\nEOF"
+
         logging.info(f"[BGP ROUTE CLEANUP] Executing BGP route cleanup commands using here document")
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-        
-        if result.returncode == 0:
-            logging.info(f"[BGP ROUTE CLEANUP] Command exit code: {result.returncode}")
+        result = container.exec_run(["bash", "-c", exec_cmd])
+
+        if result.exit_code == 0:
+            logging.info(f"[BGP ROUTE CLEANUP] Command exit code: {result.exit_code}")
             logging.info(f"[BGP ROUTE CLEANUP] ✅ All cleanup commands executed successfully")
         else:
-            logging.warning(f"[BGP ROUTE CLEANUP] Command exit code: {result.returncode}")
-            logging.warning(f"[BGP ROUTE CLEANUP] stderr: {result.stderr}")
-            logging.warning(f"[BGP ROUTE CLEANUP] stdout: {result.stdout}")
+            logging.warning(f"[BGP ROUTE CLEANUP] Command exit code: {result.exit_code}")
+            logging.warning(f"[BGP ROUTE CLEANUP] output: {result.output.decode(errors='replace')[:1500]}")
         
         # Clear BGP session to force route withdrawal (only for the specified AF)
         try:
@@ -9747,13 +9751,35 @@ def configure_bgp():
 
             if known_pools:
                 logging.info(f"[BGP CONFIGURE] Configuring route advertisement for neighbor {current_neighbor_ip} with {len(known_pools)} known pool(s)")
-                def _configure_routes(neighbor_ip=current_neighbor_ip, pools=known_pools):
+
+                # v0.5.199: cleanup BEFORE configure so pool changes
+                # (add / remove / change increment_type) don't leave
+                # stale static routes + BGP RIB entries + advertised
+                # prefixes. Pre-fix, cleanup only fired when the
+                # attached list went EMPTY — swapping `[p2,p5] →
+                # [p6]` skipped cleanup entirely and the peer kept
+                # seeing p2+p5 routes because nobody sent BGP
+                # withdrawals. Cleanup is idempotent (no-op removes
+                # if the static route was never there) and iterates
+                # all_pools_db so stale routes from any prior pool
+                # get wiped, not just the currently-attached set.
+                # Operator report on san-hp-srv06 2026-08-23.
+                def _cleanup_then_configure(neighbor_ip=current_neighbor_ip, pools=known_pools):
+                    try:
+                        cleanup_bgp_route_advertisement(
+                            device_id, device_name, bgp_asn, neighbor_ip
+                        )
+                    except Exception as _clean_exc:
+                        logging.warning(
+                            f"[BGP CONFIGURE] Pre-configure cleanup for "
+                            f"neighbor {neighbor_ip} failed (continuing): {_clean_exc}"
+                        )
                     configure_bgp_route_advertisement(
                         device_id, device_name, bgp_asn, neighbor_ip,
                         pools, all_pools
                     )
                 import threading
-                threading.Thread(target=_configure_routes, daemon=True).start()
+                threading.Thread(target=_cleanup_then_configure, daemon=True).start()
             else:
                 # Every attached pool was unknown — clean up any stale advertisement
                 logging.info(f"[BGP CONFIGURE] All attached pools were unknown for neighbor {current_neighbor_ip} - cleaning up any stale advertisement")
