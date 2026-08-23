@@ -619,6 +619,41 @@
          <code>/api/health</code> stays exempt so k8s / HAProxy
          probes don't need credentials.</p>
     </div>
+    <div class="feature">
+      <div class="ico">🚀</div>
+      <h3>RDMA perftest orchestrator <span class="pill ok" style="font-size:10px;margin-left:6px;">NEW</span></h3>
+      <p>Two dialogs on top of <code>perftest</code> — <strong>Blast a
+         RDMA Flow</strong> for 1×1 send/write/read (BW + latency)
+         between a server-side HCA and a client-side HCA, and
+         <strong>Topology Test</strong> for N×M shapes (single /
+         fan-in / fan-out / mesh / pairwise) with aggregated stats.
+         Sweep across message sizes, auto-detect topology on Start,
+         parallel workers, 🚀 Max BW button that picks pinning from
+         <code>/api/rdma/host_info</code>.</p>
+    </div>
+    <div class="feature">
+      <div class="ico">🔑</div>
+      <h3>Client licensing <span class="pill ok" style="font-size:10px;margin-left:6px;">NEW</span></h3>
+      <p>Startup activation gate with a self-service 60-day trial and
+         offline RS256 paid JWTs minted by <code>tlink-license-server</code>.
+         Verified locally against a bundled public key — no call-home.
+         Gates the four flagship menu items (DPDK Blast, RDMA Blast,
+         RDMA Topology, RFC 2544); everything else stays free. Help →
+         License Status shows tier / expiry / device fingerprint;
+         <code>netgen-cli license</code> exposes the same from a
+         terminal.</p>
+    </div>
+    <div class="feature">
+      <div class="ico">🧹</div>
+      <h3>Bulk device cleanup <span class="pill ok" style="font-size:10px;margin-left:6px;">NEW</span></h3>
+      <p>Tools → Clear All Devices on Server tears down every FRR
+         container, VXLAN, VRF, DHCP client, and DB row on the
+         selected server in one call. Typed-CLEAR confirmation guards
+         against a stray click. Reuses the per-row remove path via
+         <code>app.test_client()</code> so behaviour stays in one
+         place. Handy after a client restart when the Devices table
+         shows stale entries from a crashed session.</p>
+    </div>
   </div>
 </section>
 
@@ -677,200 +712,222 @@
 
 <!-- What's new -->
 <section class="block quickstart" id="whats-new">
-  <h2>What's new in 0.2.5.</h2>
-  <p>0.2.5 is a packaging release: prebuilt installers for Windows /
-     macOS / Linux drop on every tag via CI, and the Linux DPDK install
-     path picks up <code>linux-headers</code>, persistent hugepages,
-     and a smaller wheel. The 0.2.x line as a whole lands operator-
-     grade visibility, real-socket stateful traffic with four L7
-     protocols, live event push via Server-Sent Events, per-role auth,
-     one-click templates, and a self-contained <code>/admin</code>
-     server console.</p>
+  <h2>What's new in 0.5.</h2>
+  <p>The 0.5 line is a big jump from 0.2: RDMA perftest orchestration
+     for RoCE fabrics, RFC 2544 as a first-class dialog, NLAT one-way
+     latency measurement, a client-side licensing gate with 60-day
+     trial + offline paid JWTs, a rebuilt DPDK setup wizard that
+     handles apt-deps → IOMMU → hugepages → VFIO → NIC-bind in one
+     click, a self-relocating server tarball for lab hosts without
+     Python-package internet, an admin console that surfaces every
+     runtime dependency (with export-report), and dozens of protocol
+     / status-chip / observability fixes distilled from the
+     srv06 / srv01 lab sagas. Highlights below; the full ledger is
+     in <a href="https://github.com/DAY-Advisor/NetGenI/blob/main/CHANGELOG.md">CHANGELOG.md</a>.</p>
 
   <div class="features" style="grid-template-columns: 1fr 1fr;">
 
     <div class="feature">
-      <div class="ico">📦</div>
-      <h3>Prebuilt installers — Windows / macOS / Linux <span class="pill ok" style="font-size:10px;margin-left:6px;">0.2.5</span></h3>
-      <p>Every tagged release on GitHub now ships four CI-built
-         artifacts: <code>Netgen-Client-&lt;v&gt;-windows.exe</code>,
-         <code>Netgen-TrafficGenerator-&lt;v&gt;.dmg</code>,
-         <code>Netgen-Client-&lt;v&gt;-linux-x86_64.AppImage</code>,
-         and the universal
-         <code>ostg_trafficgen-&lt;v&gt;-py3-none-any.whl</code>.
-         Operators no longer need a Python toolchain — download the
-         right file, double-click, point at the server URL. Matrix
-         build runs on <code>ubuntu-latest</code> /
-         <code>macos-latest</code> / <code>windows-latest</code>;
-         CHANGELOG release notes attach automatically.</p>
+      <div class="ico">🚀</div>
+      <h3>RDMA perftest orchestration — Blast + Topology <span class="pill ok" style="font-size:10px;margin-left:6px;">0.3 / 0.4</span></h3>
+      <p>Full <code>perftest</code> orchestrator (<code>ib_send_bw</code>,
+         <code>ib_write_bw</code>, <code>ib_read_bw</code> plus each
+         <code>_lat</code> variant) driven by two GUI dialogs.
+         <strong>Blast a RDMA Flow</strong> picks a
+         server-side TG + HCA and a client-side TG + HCA — both halves
+         spawn via <code>/api/rdma/perftest/start</code>, aggregate stats
+         land live. <strong>Topology Test</strong> is the N×M companion:
+         add server + client endpoints, pick a shape (single / fan-in /
+         fan-out / mesh / pairwise), and it spawns the cross-product of
+         pairs with an aggregated view. Sweep-mode across message sizes,
+         auto-detect topology on Start, parallel workers + a 🚀 Max BW
+         button that picks pinning based on <code>/api/rdma/host_info</code>.</p>
     </div>
 
     <div class="feature">
-      <div class="ico">🛠️</div>
-      <h3>DPDK install: kernel-headers, persistent hugepages, slimmer wheel <span class="pill ok" style="font-size:10px;margin-left:6px;">0.2.5</span></h3>
-      <p><code>install_dpdk.sh</code>'s apt list now includes
-         <code>linux-headers-$(uname -r)</code> so vfio-pci loads on
-         cloud / minimal kernels that strip the module. Hugepages
-         survive reboots via
-         <code>/etc/sysctl.d/99-netgen-hugepages.conf</code> — no
-         more "EAL: No free hugepages" after the host bounces. The
-         wheel dropped ~190 KB (1.55 MB → 1.36 MB) by excluding the
-         stale prebuilt <code>tx_worker/build/</code> tree —
-         <code>install_dpdk.sh</code> step 6 rebuilds it against the
-         host's libdpdk anyway, so shipping the dev-machine binary
-         was both dead weight and an ABI-mismatch footgun.</p>
+      <div class="ico">📊</div>
+      <h3>RFC 2544 throughput as a first-class dialog <span class="pill ok" style="font-size:10px;margin-left:6px;">0.4</span></h3>
+      <p>Standard §26.1 frame-size sweep as a dedicated dialog under
+         Tools → RFC 2544 Throughput Test. Binary-searches the max
+         no-drop rate at each of the 7 standard sizes (64 / 128 / 256 /
+         512 / 1024 / 1280 / 1518 B) on a TX/RX port pair. Live
+         progress via <code>/api/rfc2544/progress</code>, timestamped
+         HTML report export, cooperative Stop button.</p>
+    </div>
+
+    <div class="feature">
+      <div class="ico">⏱️</div>
+      <h3>One-way latency (NLAT) <span class="pill ok" style="font-size:10px;margin-left:6px;">0.5</span></h3>
+      <p>Every UDP payload carries an NLAT header with a wire-format
+         nanosecond timestamp. A dedicated RX-side sampler
+         (<code>utils/latency_sampler.py</code>) reads those bits off
+         each captured frame and computes min / avg / p50 / p99 / max
+         over a rolling 10 K-sample window. Cross-server pair for real
+         one-way (not RTT/2) numbers on a shared clock; loopback for
+         quick sub-microsecond sanity checks. Runs on the RX server —
+         out-of-the-box error messages when pointed at the wrong host.</p>
+    </div>
+
+    <div class="feature">
+      <div class="ico">🔑</div>
+      <h3>Client licensing — 60-day trial + offline paid JWTs <span class="pill ok" style="font-size:10px;margin-left:6px;">0.5.183</span></h3>
+      <p>Startup activation gate blocks the four flagship menu items
+         (DPDK Blast, RDMA Blast, RDMA Topology, RFC 2544) until the
+         client sees a valid license. Paid licenses are RS256 JWTs
+         minted by <code>tlink-license-server</code>'s offline-code
+         flow — the client verifies them against a bundled public key
+         (<code>resources/license/tlink-public.pem</code>), no
+         call-home. A self-service 60-day trial writes
+         <code>~/.netgen/trial.json</code> and unlocks the same set.
+         Help → License Status shows tier / expiry / device
+         fingerprint with a copy button for support cases; a stale
+         paid JWT no longer shadows a live trial (fixed 0.5.195).</p>
+    </div>
+
+    <div class="feature">
+      <div class="ico">★</div>
+      <h3>DPDK Setup wizard — one click, three tiers <span class="pill ok" style="font-size:10px;margin-left:6px;">0.5</span></h3>
+      <p>Tools → DPDK → ★ Setup DPDK is the primary entry. Surveys
+         the server, then runs apt-deps → IOMMU → VFIO → hugepages →
+         NIC bind in sequence, skipping steps already done, pausing
+         for reboot if IOMMU had to be enabled. Menu is tiered into
+         primary (Setup / Blast), Diagnostics (Status + Verify merged),
+         and Advanced (atomic actions for scripted / recovery use).
+         DPDK Ready dialog surfaces a live install log with ETA, an
+         inline "Reboot Server" button, and NUMA-aware hugepage
+         allocation.</p>
+    </div>
+
+    <div class="feature">
+      <div class="ico">🛡️</div>
+      <h3>DPDK orphan detection + reap <span class="pill ok" style="font-size:10px;margin-left:6px;">0.5</span></h3>
+      <p>Every <code>tx_worker</code> / <code>rx_worker</code> spawn
+         is wrapped in a <code>systemd-run</code> transient scope so
+         crashes leave the process in a cgroup the server can reap
+         cleanly. Stream Stats shows orphan rows with a Stop-All
+         confirm, per-BDF start-time pre-flight refuses to launch a
+         second worker on a NIC that already has one, and a
+         status-bar chip surfaces the count. No more "why is the
+         wire full when I never started a stream" mysteries.</p>
+    </div>
+
+    <div class="feature">
+      <div class="ico">📦</div>
+      <h3>Self-relocating server tarball <span class="pill ok" style="font-size:10px;margin-left:6px;">0.5</span></h3>
+      <p><code>netgen-server-&lt;v&gt;-linux-x86_64.tar.gz</code> is a
+         portable, offline-installable server bundle for lab hosts
+         with no internet or a locked-down pip. Ships a pre-relocated
+         venv, the wheel, FRR Dockerfile + assets, and
+         <code>bin/netgen-upgrade</code> for in-place wheel updates.
+         Companion to the wheel path — pick per host what fits the
+         security posture better. CI builds it on every tag alongside
+         the DMG / EXE / AppImage.</p>
     </div>
 
     <div class="feature">
       <div class="ico">🖥️</div>
-      <h3>Server admin portal — <code>/admin</code> <span class="pill ok" style="font-size:10px;margin-left:6px;">0.2.x</span></h3>
-      <p>Single-page web UI baked into the server at
-         <code>http://&lt;host&gt;:5050/admin</code>. Inline HTML/JS —
-         no static assets, no template files. Shows libdpdk version,
-         IOMMU state, vfio module state, hugepages, tx_worker
-         presence; lists NICs with per-row vfio-pci bind / rebind
-         buttons; tails <code>install_dpdk.sh</code> live with an
-         "Install DPDK" trigger button. Auth-exempt so it works
-         before <code>NETGEN_AUTH_TOKEN</code> is set. Consolidated
-         JSON at <code>GET /api/admin/health</code> for Prometheus /
-         Nagios scraping.</p>
+      <h3>Server admin console — evolved <span class="pill ok" style="font-size:10px;margin-left:6px;">0.5</span></h3>
+      <p>The <code>/admin</code> portal now covers RDMA state, NIC
+         model detection (ConnectX-5/6/7/8, Thor / Thor2, Pollara),
+         real interface counters + operstate from sysfs (not psutil),
+         TX-queue depth, RDMA status alongside DPDK, bind history
+         with original-driver restore, and a
+         <code>GET /api/admin/report.html</code> export button that
+         drops a self-contained snapshot of the host's DPDK + RDMA +
+         hugepages + IOMMU + NIC state. Live install log tail with
+         Retry / Popout / Reboot buttons.</p>
     </div>
 
     <div class="feature">
-      <div class="ico">📡</div>
-      <h3>Live updates via Server-Sent Events <span class="pill ok" style="font-size:10px;margin-left:6px;">0.2.2</span></h3>
-      <p>The GUI no longer polls. A long-lived HTTP stream pushes every
-         protocol-state transition (BGP up, OSPF Full, ARP resolved, …)
-         as it happens. Topology canvas LEDs and chip colours re-render
-         within 750 ms of the event landing on the wire. Heartbeats
-         every 15 s keep proxies happy on quiet fabrics.
-         <code>curl -N /api/events/stream</code> works for debugging;
-         the Qt client auto-reconnects on drop.</p>
+      <div class="ico">🧹</div>
+      <h3>Tools → Clear All Devices <span class="pill ok" style="font-size:10px;margin-left:6px;">0.5.194</span></h3>
+      <p>Bulk-cleanup path for the server's device DB: stops each FRR
+         container, tears down VXLAN + VRF, cancels DHCP, and purges
+         the DB row for every device in one go. Typed-CLEAR
+         confirmation guards against a stray click; the endpoint
+         (<code>POST /api/devices/clear_all</code>) re-enters the
+         per-row remove path via Flask's test client so behaviour
+         stays in one place. Use after a client restart when the
+         Devices table shows stale entries from a crashed session.</p>
+    </div>
+
+    <div class="feature">
+      <div class="ico">🟢</div>
+      <h3>Accurate ARP + BGP status chips <span class="pill ok" style="font-size:10px;margin-left:6px;">0.5.193</span></h3>
+      <p>Three long-standing "chip stuck yellow" bugs fixed at once:
+         self-ping now runs inside the device's VRF (per-VRF local
+         table is real), <code>requires_ipv6</code> derives from
+         whether an IPv6 address is actually configured (not from
+         dual-stack protocol defaults), and <code>bgp_established</code>
+         lands in the <code>devices</code> table for the top-level
+         rollup. IPv4-only devices with dual-stack BGP defaults now
+         flip Green as soon as the peer comes up, not never.</p>
     </div>
 
     <div class="feature">
       <div class="ico">🗺️</div>
-      <h3>Topology tab</h3>
-      <p>IXNetwork-style canvas. Green port-lane badges at the bottom
-         (one per server interface), device cards stacked above with
-         vertical protocol-stack chips (ETH / IPv4 / IPv6 / BGP / OSPF /
-         ISIS / DHCP), status LEDs driven by rolled-up protocol health,
-         cubic-Bezier cables from each card to its port, and
-         protocol-coloured peer edges between cards. Right-side property
-         panel updates on selection. Live SSE-driven auto-refresh on
-         state changes. Hierarchical / circular layout toggle,
-         cursor-anchored zoom, per-mode position persistence.</p>
+      <h3>Topology canvas</h3>
+      <p>IXNetwork-style layout. Port-lane badges at the bottom,
+         device cards stacked above with vertical protocol-stack
+         chips (ETH / IPv4 / IPv6 / BGP / OSPF / ISIS / DHCP / VXLAN),
+         LEDs driven by rolled-up protocol health, cubic-Bezier cables
+         from each card to its port, protocol-coloured peer edges
+         between cards. Right-side property panel updates on
+         selection with the state-history timeline. Live SSE-driven
+         auto-refresh on state changes.</p>
     </div>
 
     <div class="feature">
-      <div class="ico">⚡</div>
-      <h3>One-click templates <span class="pill ok" style="font-size:10px;margin-left:6px;">0.2.1</span></h3>
-      <p>Skip the "click 14 checkboxes" prelude every test setup starts
-         with. Add Device dialog ships with 8 ready-made device profiles
-         (Bare host, iBGP / eBGP peer, OSPFv2 backbone, dual-stack
-         OSPFv2+v3, IS-IS L1-L2, DHCP client, VXLAN VTEP). Add Stream
-         dialog ships with 7 traffic profiles (UDP line-rate 64 B,
-         UDP IMIX, LAG/RSS/ECMP modifier mix, NLAT latency probe, VXLAN
-         encap, ICMP flood, VLAN-tagged UDP). Pick from a dropdown,
-         tweak IPs to match your lab, apply.</p>
+      <div class="ico">📡</div>
+      <h3>Live updates via Server-Sent Events</h3>
+      <p>No polling. A long-lived HTTP stream pushes every
+         protocol-state transition (BGP up, OSPF Full, ARP resolved,
+         RDMA job done) as it happens. Topology LEDs and chip colours
+         re-render within 750 ms. Heartbeats every 15 s keep proxies
+         happy on quiet fabrics; <code>curl -N
+         /api/events/stream</code> works for debugging; the Qt client
+         auto-reconnects on drop.</p>
     </div>
 
     <div class="feature">
       <div class="ico">🔌</div>
       <h3>Stateful TCP — four L7 protocols</h3>
       <p>Real sockets, actual 3-way handshakes, graceful close.
-         Per-session counters for conns attempted / established /
-         failed, bytes tx / rx, handshake-ms, userspace + kernel-
-         reported RTT (<code>TCP_INFO</code>, Linux). Linux
+         Per-session counters for conns / bytes / handshake-ms /
+         userspace + kernel-reported RTT
+         (<code>TCP_INFO</code>). Linux
          <code>SO_BINDTODEVICE</code> for per-VRF source pinning.
          Four L7 modes: <strong>raw</strong> byte echo,
-         <strong>HTTP/1.1</strong> with Content-Length framing,
-         <strong>DNS-over-TCP</strong> (RFC 7766) with per-RCODE
-         counters, and <strong>SIP-over-TCP</strong> (RFC 3261) with
-         REGISTER messages and per-status-class counters. Opt-in TLS
-         on both ends.</p>
-    </div>
-
-    <div class="feature">
-      <div class="ico">🔐</div>
-      <h3>Per-role auth <span class="pill ok" style="font-size:10px;margin-left:6px;">0.2.1</span></h3>
-      <p>Three roles in a hierarchy: <strong>viewer</strong> (read-
-         only), <strong>operator</strong> (mutating non-destructive),
-         <strong>admin</strong> (everything). 40 endpoints currently
-         annotated — traffic start/stop, device CRUD, BGP/OSPF/IS-IS
-         lifecycle, stateful-TCP control, monitor force-checks.
-         Single-token deployments (0.2.0 default) keep working as
-         admin — multi-token mapping is opt-in via
-         <code>NETGEN_AUTH_TOKENS_JSON</code>.</p>
-    </div>
-
-    <div class="feature">
-      <div class="ico">⏳</div>
-      <h3>State-history timeline</h3>
-      <p>Every protocol monitor writes a row on each observed state
-         change, de-duped against the previous row so steady-state
-         polls don't bloat the DB.
-         <strong>Ctrl+H</strong> in the GUI shows a per-protocol
-         tabbed view;
-         <code>/api/device/database/devices/&lt;id&gt;/history</code>
-         returns the change-only timeline as JSON. State changes are
-         also published to the SSE bus for live consumers.</p>
+         <strong>HTTP/1.1</strong>, <strong>DNS-over-TCP</strong>
+         (RFC 7766) with per-RCODE counters, <strong>SIP-over-TCP</strong>
+         (RFC 3261) with REGISTER + per-status-class counters. Opt-in
+         TLS on both ends.</p>
     </div>
 
     <div class="feature">
       <div class="ico">⌨️</div>
-      <h3>netgen-cli (headless)</h3>
-      <p>Companion CLI for CI / tmux / SSH workflows.
+      <h3>netgen-cli + license subcommand</h3>
+      <p>Companion CLI for CI / tmux / SSH.
          <code>health</code>, <code>list</code>, <code>export</code>,
          <code>import</code>, <code>apply --wait</code>,
          <code>status</code>, <code>wait</code>, plus full
-         <code>tcp</code> session control with all four L7 protocols.
-         Auto-injects bearer-token auth via
-         <code>NETGEN_AUTH_TOKEN</code>. Drops into Jenkins, GitHub
-         Actions, or GitLab — gate merges on the JSON it prints.</p>
-    </div>
-
-    <div class="feature">
-      <div class="ico">🔍</div>
-      <h3>View Device Config (Ctrl+J)</h3>
-      <p>Read-only viewer for a device's full server-side JSON
-         configuration. Monospace pretty-print, copy-to-clipboard. Same
-         dialog from both the Devices tab (Ctrl+J on the selected row)
-         and the Topology tab (double-click a card).</p>
-    </div>
-
-    <div class="feature">
-      <div class="ico">📤</div>
-      <h3>Device export / import</h3>
-      <p>Round-trip the entire device topology as JSON via
-         <code>GET /api/devices/export</code> and
-         <code>POST /api/devices/import</code>. Pairs with
-         <code>netgen-cli export</code> / <code>import</code> for a
-         "snapshot this lab, restore on another box" workflow.
-         <code>--wait</code> blocks until ARP resolves on each device.</p>
-    </div>
-
-    <div class="feature">
-      <div class="ico">🏗️</div>
-      <h3>Server modularization <span class="pill ok" style="font-size:10px;margin-left:6px;">0.2.1+</span></h3>
-      <p>The 18,500-line <code>run_tgen_server.py</code> monolith is
-         being broken up one Blueprint at a time. Three route groups
-         extracted so far: stateful-TCP, device-DB queries
-         (events/history/statistics), and live events. Each Blueprint
-         takes the role-decorator and DB instance via
-         <code>configure()</code> so auth stays decoupled. Pattern is
-         set; the rest of the migration is incremental.</p>
+         <code>tcp</code> session control and a
+         <code>license</code> subcommand
+         (<code>activate</code> / <code>status</code> /
+         <code>deactivate</code> / <code>trial</code> /
+         <code>fingerprint</code>). Auto-injects
+         <code>NETGEN_AUTH_TOKEN</code>. Drops into Jenkins / GitHub
+         Actions / GitLab.</p>
     </div>
 
   </div>
 
   <p class="muted" style="margin-top: 28px;">
-    70 pytest cases ride along — VRF naming, stateful-TCP loopback
-    echo, TLS handshake (self-signed cert generated on the fly),
-    HTTP/1.1 framing, DNS-over-TCP rcode counters, SIP REGISTER status
-    class binning, SSE event-bus backpressure, per-role auth
-    hierarchy, device + traffic template registry invariants, plus
-    all legacy helpers. See
+    3 400+ pytest cases ride along — RDMA parser + orchestrator +
+    handshake, RFC 2544 progress polling, license JWT verification,
+    trial fallback ladder, DPDK orphan reap, hugepages NUMA
+    allocation, admin auth fortification, per-VRF ARP status, plus
+    every legacy fixture. See
     <a href="https://github.com/DAY-Advisor/NetGenI/blob/main/CHANGELOG.md">CHANGELOG.md</a>
     for the full diff.
   </p>
@@ -1202,7 +1259,7 @@ sudo systemctl status netgen-server
       <div class="ico">📥</div>
       <h3>Option 1 — Download prebuilt</h3>
       <p><strong>For operators who just want the GUI.</strong> Every
-         tagged GitHub release ships four CI-built artifacts. Grab
+         tagged GitHub release ships five CI-built artifacts. Grab
          the one for your OS, double-click, point at the server URL.
          No Python toolchain. No git clone.</p>
 <pre><code><span style="color:#94a3b8"># From the release page:</span>
@@ -1210,10 +1267,15 @@ Netgen-Client-&lt;v&gt;-windows.exe
 Netgen-TrafficGenerator-&lt;v&gt;.dmg
 Netgen-Client-&lt;v&gt;-linux-x86_64.AppImage
 ostg_trafficgen-&lt;v&gt;-py3-none-any.whl
+netgen-server-&lt;v&gt;-linux-x86_64.tar.gz   <span style="color:#94a3b8"># offline server bundle</span>
 
-<span style="color:#94a3b8"># Linux:</span>
+<span style="color:#94a3b8"># Linux client:</span>
 chmod +x Netgen-Client-*.AppImage
-./Netgen-Client-*.AppImage -s http://lab-box:5050</code></pre>
+./Netgen-Client-*.AppImage -s http://lab-box:5050
+
+<span style="color:#94a3b8"># Offline server install (no pip / internet):</span>
+tar xzf netgen-server-*-linux-x86_64.tar.gz
+cd netgen-server-*/ &amp;&amp; sudo ./install.sh</code></pre>
     </div>
 
     <div class="feature">

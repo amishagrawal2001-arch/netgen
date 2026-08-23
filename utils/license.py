@@ -64,8 +64,9 @@ PRODUCT_CODE = "netgen"
 LICENSE_DIR = Path.home() / ".netgen"
 LICENSE_FILE = LICENSE_DIR / "license.jwt"
 
-# v0.5.183: self-service trial.
-TRIAL_DAYS = 30
+# v0.5.183: self-service trial. v0.5.196: extended 30 → 60 days
+# so evaluators have a full test cycle before needing a paid JWT.
+TRIAL_DAYS = 60
 TRIAL_FILE = LICENSE_DIR / "trial.json"
 TRIAL_USED_MARKER = LICENSE_DIR / "trial-used.marker"
 
@@ -476,7 +477,7 @@ def _load_trial(
             end_date=expires_dt.date(),
             is_valid=False,
             reason="trial expired — request a paid license",
-            notes=["Your 30-day trial has ended."],
+            notes=[f"Your {TRIAL_DAYS}-day trial has ended."],
         )
     days_left = (expires_dt - now).days
     return License(

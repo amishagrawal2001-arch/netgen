@@ -463,7 +463,7 @@ def main(argv=None) -> int:
     p_lic_deactivate.set_defaults(func=cmd_license_deactivate)
 
     p_lic_trial = lic_sub.add_parser(
-        "trial", help="Start the local 30-day trial")
+        "trial", help="Start the local self-service trial")
     p_lic_trial.set_defaults(func=cmd_license_trial)
 
     p_lic_fp = lic_sub.add_parser(

@@ -2,6 +2,39 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.196] - 2026-07-21
+
+**Default self-service trial extended from 30 → 60 days.**
+
+Operator asked for a way to activate the client for 60 days.
+After weighing four shapes (mint a paid 60-day JWT via
+tlink-license-server, ship a client-side master code that
+unlocks an extended trial, add an in-repo `netgen-cli license
+mint`, or just raise the default trial), the simplest option
+won: everyone who clicks "Start trial" now gets 60 days on
+first use instead of 30. The trial-used marker still enforces
+one-per-install; paid JWT flow is unchanged.
+
+- `utils/license.py` — `TRIAL_DAYS = 30 → 60`; the "trial
+  ended" note now interpolates the constant instead of
+  hardcoding 30.
+- `netgen_cli.py` — `license trial --help` no longer says
+  "30-day".
+- `docs/index.html` — refreshed the "What's new in 0.5"
+  section for the 0.5.x feature wave (RDMA, RFC 2544, one-way
+  latency, licensing, DPDK setup wizard, DPDK orphan reap,
+  server tarball, evolved admin console, Tools → Clear All
+  Devices, ARP + BGP status chip fixes). Added feature cards
+  for RDMA / License / Bulk cleanup, and the server tarball
+  as the 5th release artifact. 30-day mentions → 60-day.
+- `tests/test_v05196_trial_60_days.py` — locks in the new
+  constant, verifies `start_trial` writes ~60d out, and grep-
+  guards the three user-facing modules against a future
+  regression to hardcoded "30-day" strings.
+
+Existing v0.5.183 (61 tests) and v0.5.195 (7 tests) suites
+still pass unchanged.
+
 ## [0.5.195] - 2026-07-20
 
 **Client restart no longer bounces trial users to the activation
