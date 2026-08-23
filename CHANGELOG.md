@@ -2,6 +2,84 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.198] - 2026-08-23
+
+**BGP route-pool attachment now works end-to-end without a
+separate "Save pools" step.** Fixes the operator-reported gap on
+san-hp-srv06: attach pools p2 (5 prefixes) + p5 (4 prefixes),
+click Apply — switch received all 9 prefixes on the peer's next
+update (previously: 0 received).
+
+Two coupled bugs fixed together — the v0.5.197 fix surfaced them
+but did not close the loop.
+
+**Bug 1 — server threw away the client's pool definitions.**
+
+The Add-Device / Edit-BGP dialog already includes every pool
+definition in the request body under `all_route_pools: [{name,
+subnet, count, first_host, last_host, increment_type}, ...]`.
+The server's `configure_bgp` was ignoring that field and
+consulting only its own DB, so any workflow that skipped a
+separate `Save to Database` step in the Manage Route Pools
+dialog ended up with attach names referencing pools the server
+had never heard of. v0.5.197 surfaced this with a WARNING; v0.5
+.198 closes it by iterating `all_route_pools` and calling
+`add_route_pool()` for each row (which delegates to
+`update_route_pool` on duplicate names, so it's idempotent and
+safe to run every Apply).
+
+**Bug 2 — static routes landed in the wrong VRF.**
+
+`configure_bgp_route_advertisement` emits `ip route X null0` to
+create blackhole prefixes that `redistribute static` in the
+BGP-per-VRF instance is supposed to advertise. But the commands
+were unscoped — they landed in the default routing table, while
+`router bgp <asn> vrf <name>` searches only its own VRF's table.
+Result: the routes existed but never made it into BGP's RIB
+(`show bgp vrf <name> summary` showed `PfxSnt: 1` — just the
+connected). Fix: suffix each `ip route` and `ipv6 route`
+command with ` vrf <name>` when the device has a per-device VRF
+wired up (matches the same VRF resolution `_bgp_router_clause`
+uses). Cleanup path gets the matching suffix so removal doesn't
+leak.
+
+**Live verification on san-hp-srv06:**
+
+Before v0.5.198:
+```
+show bgp vrf vrf-5bd1df3a1f5 ipv4 unicast
+ *> 192.168.0.0/24   0.0.0.0   0   32768 i    ← 1 prefix (connected only)
+PfxSnt: 1
+```
+
+After v0.5.198 (same operator payload, no separate save step):
+```
+show bgp vrf vrf-5bd1df3a1f5 ipv4 unicast
+ *> 2.2.2.0/24  ...  ?     ← from pool p2
+ *> 2.2.3.0/24  ...  ?
+ ... (5 rows for p2)
+ *> 5.5.5.0/24  ...  ?     ← from pool p5
+ ... (4 rows for p5)
+ *> 192.168.0.0/24 ... i
+Displayed 10 routes and 10 total paths
+PfxSnt: 10
+```
+
+**Files:**
+- `run_tgen_server.py` — `configure_bgp` iterates
+  `all_route_pools` from payload and calls `add_route_pool()` for
+  each (field-name translation: `count → route_count`, `first
+  _host → first_host_ip`, `last_host → last_host_ip`);
+  `configure_bgp_route_advertisement` + `cleanup_bgp_route
+  _advertisement` both compute a `_vrf_route_suffix` from
+  `FRRDockerManager.vrf_name_for_device()` and append it to
+  every `ip route` / `ipv6 route` (and `no ip route` etc.)
+  command.
+- `tests/test_v05198_pool_autopersist.py` — 7 source-level
+  lock-in tests: `all_route_pools` extraction, `add_route_pool`
+  wiring, field-name translation, idempotency, and both VRF-
+  suffix guards (advertise + cleanup).
+
 ## [0.5.197] - 2026-08-23
 
 **BGP Apply no longer silently drops route-pool attachments when

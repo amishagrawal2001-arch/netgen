@@ -8069,6 +8069,33 @@ def configure_bgp_route_advertisement(device_id, device_name, bgp_asn, neighbor_
             " match ipv6 address prefix-list PL-IMPORT",
         ])
         
+        # v0.5.198: scope static routes to the device's VRF so
+        # `redistribute static` inside `router bgp <asn> vrf <name>`
+        # actually sees them. Pre-fix, static routes landed in the
+        # default routing table but redistribute-static in the VRF-
+        # BGP instance searched only its own VRF's table — the
+        # routes existed but weren't advertised. Operator report
+        # san-hp-srv06 2026-08-23: pool p2 (5 prefixes) + p5 (4
+        # prefixes) generated 9 static routes but `show bgp
+        # summary` on the switch showed `#PfxRcd = 1` (just the
+        # connected). Suffix each `ip route` with `vrf <name>` when
+        # the device has one; fall back to global-table for legacy
+        # single-device deployments.
+        _vrf_route_suffix = ""
+        try:
+            from utils.frr_docker import FRRDockerManager as _FRR
+            _vrf_name = _FRR().vrf_name_for_device(device_id)
+            if _vrf_name:
+                _check = subprocess.run(
+                    ["ip", "-o", "link", "show", _vrf_name],
+                    capture_output=True, text=True, timeout=2,
+                )
+                if _check.returncode == 0 and (_check.stdout or "").strip():
+                    _vrf_route_suffix = f" vrf {_vrf_name}"
+                    logging.info(f"[BGP ROUTE ADV] Static routes will be scoped to VRF {_vrf_name}")
+        except Exception as _vrf_exc:
+            logging.debug(f"[BGP ROUTE ADV] VRF lookup failed: {_vrf_exc}")
+
         # Add static routes for each route (so BGP can advertise them)
         for pool_name in route_pools:
             pool = next((p for p in all_pools if p["name"] == pool_name), None)
@@ -8076,11 +8103,11 @@ def configure_bgp_route_advertisement(device_id, device_name, bgp_asn, neighbor_
                 subnet = pool["subnet"]
                 count = pool["count"]
                 increment_type = pool.get("increment_type", "host")  # Default to host for backward compatibility
-                
+
                 # Generate routes based on increment type
                 try:
                     network = ipaddress.ip_network(subnet, strict=False)
-                    
+
                     if increment_type == "network":
                         # Generate network routes using increment logic
                         generated_routes = generate_network_routes_from_pool(network, count)
@@ -8089,13 +8116,13 @@ def configure_bgp_route_advertisement(device_id, device_name, bgp_asn, neighbor_
                         # Generate individual host routes (default behavior)
                         generated_routes = generate_host_routes_from_pool(network, count)
                         logging.info(f"[BGP ROUTE ADV] Adding {len(generated_routes)} host static routes for pool {pool_name}")
-                    
+
                     for route in generated_routes:
                         if network.version == 6:
-                            vtysh_commands.append(f"ipv6 route {route} null0")
+                            vtysh_commands.append(f"ipv6 route {route} null0{_vrf_route_suffix}")
                         else:
-                            vtysh_commands.append(f"ip route {route} null0")
-                            
+                            vtysh_commands.append(f"ip route {route} null0{_vrf_route_suffix}")
+
                 except Exception as e:
                     logging.error(f"[BGP ROUTE ADV] Error generating static routes for pool {pool_name}: {e}")
                     continue
@@ -8487,35 +8514,51 @@ def cleanup_bgp_route_advertisement(device_id, device_name, bgp_asn, neighbor_ip
         is_ipv6_only = af_type == "IPv6"
         is_ipv4_only = af_type == "IPv4"
         
+        # v0.5.198: match the VRF suffix that was used when we added
+        # the routes — otherwise `no ip route X null0` in the global
+        # table leaves the VRF-scoped ones behind.
+        _vrf_route_suffix = ""
+        try:
+            _vrf_name = frr_manager.vrf_name_for_device(device_id)
+            if _vrf_name:
+                _check = subprocess.run(
+                    ["ip", "-o", "link", "show", _vrf_name],
+                    capture_output=True, text=True, timeout=2,
+                )
+                if _check.returncode == 0 and (_check.stdout or "").strip():
+                    _vrf_route_suffix = f" vrf {_vrf_name}"
+        except Exception as _vrf_exc:
+            logging.debug(f"[BGP ROUTE CLEANUP] VRF lookup failed: {_vrf_exc}")
+
         # Get all route pools from database to remove their static routes
         from utils.device_database import DeviceDatabase
         all_pools_db = device_db.get_all_route_pools()
-        
+
         # Remove static routes for all pools (both IPv4 and IPv6, or filtered by af_type)
         for pool in all_pools_db:
             pool_name = pool["pool_name"]
             subnet = pool["subnet"]
             count = pool["route_count"]
             increment_type = pool.get("increment_type", "host")
-            
+
             try:
                 import ipaddress
                 network = ipaddress.ip_network(subnet, strict=False)
-                
+
                 if increment_type == "network":
                     # Generate network routes using increment logic
                     generated_routes = generate_network_routes_from_pool(network, count)
                 else:
                     # Generate individual host routes (default behavior)
                     generated_routes = generate_host_routes_from_pool(network, count)
-                
+
                 # Add removal commands for each generated route (only for the specified AF)
                 for route in generated_routes:
                     if network.version == 6 and not is_ipv4_only:
-                        cleanup_commands.append(f"no ipv6 route {route} null0")
+                        cleanup_commands.append(f"no ipv6 route {route} null0{_vrf_route_suffix}")
                     elif network.version == 4 and not is_ipv6_only:
-                        cleanup_commands.append(f"no ip route {route} null0")
-                        
+                        cleanup_commands.append(f"no ip route {route} null0{_vrf_route_suffix}")
+
             except Exception as e:
                 logging.warning(f"[BGP ROUTE CLEANUP] Failed to generate routes for pool {pool_name}: {e}")
                 continue
@@ -9598,7 +9641,50 @@ def configure_bgp():
                 device_db.remove_device_route_pools(device_id, neighbor_ip)
                 logging.info(f"[BGP CONFIGURE] Removed all route pool attachments for device {device_id} and neighbor {neighbor_ip}")
         
-        # Get route pools from database instead of request data
+        # v0.5.198: auto-persist any route pool DEFINITIONS the
+        # client sent in the request body. The Add-Device / Edit-BGP
+        # dialog already includes `all_route_pools: [{name, subnet,
+        # count, first_host, last_host, increment_type}, ...]` in
+        # the payload — pre-fix the server only read pools from the
+        # DB, so a workflow that skipped a separate "Save to
+        # Database" step silently ended up with attached names that
+        # referenced no pool → zero prefix-lists → zero advertised
+        # routes. v0.5.197 surfaced this via a WARNING; v0.5.198
+        # closes the loop by persisting whatever the client sent so
+        # the client-side Save step becomes optional. Operator
+        # report on san-hp-srv06 2026-08-23.
+        payload_pools = data.get("all_route_pools") or []
+        if payload_pools:
+            for _p in payload_pools:
+                if not isinstance(_p, dict) or not _p.get("name"):
+                    continue
+                # Translate client field names (`count`, `first_host`,
+                # `last_host`) to the DB shape (`route_count`,
+                # `first_host_ip`, `last_host_ip`). add_route_pool
+                # detects an existing name and delegates to update,
+                # so this is safe to run every Apply.
+                _pool_data = {
+                    "name": _p["name"],
+                    "subnet": _p.get("subnet", ""),
+                    "route_count": _p.get("count", _p.get("route_count", 1)),
+                    "first_host_ip": _p.get("first_host", _p.get("first_host_ip", "")),
+                    "last_host_ip": _p.get("last_host", _p.get("last_host_ip", "")),
+                    "increment_type": _p.get("increment_type", "host"),
+                }
+                try:
+                    device_db.add_route_pool(_pool_data)
+                except Exception as _pool_exc:
+                    logging.warning(
+                        f"[BGP CONFIGURE] Failed to auto-persist pool "
+                        f"'{_p.get('name')}' from payload: {_pool_exc}"
+                    )
+            logging.info(
+                f"[BGP CONFIGURE] Auto-persisted {len(payload_pools)} "
+                f"route pool definition(s) from request payload."
+            )
+
+        # Get route pools from database (now includes any that the
+        # payload just persisted above).
         all_pools_db = device_db.get_all_route_pools()
         all_pools = []
         for pool in all_pools_db:
@@ -9610,7 +9696,7 @@ def configure_bgp():
                 "last_host": pool["last_host_ip"],
                 "increment_type": pool.get("increment_type", "host")
             })
-        
+
         logging.info(f"[BGP ROUTE DEBUG] Checking route advertisement conditions:")
         logging.info(f"[BGP ROUTE DEBUG] - route_pools_per_neighbor: {route_pools_per_neighbor}")
         logging.info(f"[BGP ROUTE DEBUG] - all_pools from database: {len(all_pools)} pools")
