@@ -2,6 +2,52 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.203] - 2026-08-23
+
+**Add OSPF / Add ISIS now show up in the protocol table
+immediately (client-side).**
+
+Operator report: selected a device, clicked Add OSPF, filled
+the dialog, clicked Add — nothing appeared in the OSPF table.
+Same shape for ISIS.
+
+Root cause — [widgets/devices_tab.py:9467](widgets/devices_tab.py:9467)
+in `_update_device_protocol`:
+
+```python
+elif protocol == "OSPF":
+    ...
+    pass          # ← did nothing. Table never refreshed.
+elif protocol == "IS-IS" or protocol == "ISIS":
+    ...
+    pass          # ← same story.
+```
+
+Both branches were literally `pass`, with a comment claiming
+the table would "refresh on the next periodic update or when
+Apply is clicked". Result: the added `ospf_config` /
+`isis_config` sat in `device_info` waiting for a periodic tick
+(30–60 s away, sometimes never), and the operator saw a dead
+UI and assumed the Add had failed.
+
+**Fix** — mirror the BGP branch that got fixed in v0.5.202:
+disconnect the `cellChanged` signal, call
+`update_ospf_table()` / `update_isis_table()` to rebuild
+immediately, then reconnect BOTH the DevicesTab-level stub
+AND the real handler in `OSPFHandler`/`ISISHandler`. The
+double-reconnect is what keeps inline edits (area-id,
+neighbor timers, redistribute settings) persisting after the
+rebuild — same class of disconnect-race the BGP fix closed.
+
+**Files:**
+- `widgets/devices_tab.py` — OSPF + ISIS branches of the
+  `_update_device_protocol` refresh-per-protocol dispatch
+  each get the disconnect / refresh / reconnect-both pattern.
+- `tests/test_v05203_ospf_isis_add_refresh.py` — 5 source-
+  level lock-ins: OSPF+ISIS branches call their refresh, both
+  reconnect stub + real handler, and v0.5.202's BGP fix is
+  still in place.
+
 ## [0.5.202] - 2026-08-23
 
 **BGP row inline edits (hold-time, keepalive, source, neighbor,

@@ -9465,18 +9465,33 @@ class DevicesTab(QWidget):
             self.bgp_table.cellChanged.connect(self.on_bgp_table_cell_changed)
             self.bgp_table.cellChanged.connect(self.bgp_handler.on_bgp_table_cell_changed)
         elif protocol == "OSPF":
-            # Don't refresh the table immediately after editing - let the user finish
-            # The table will refresh on the next periodic update or when Apply is clicked
-            # This prevents overwriting user edits and ensures the edit is saved first
-            # Temporarily disconnect to prevent infinite loop (but don't refresh yet)
-            # Just reconnect to prevent issues
-            pass
+            # v0.5.203: the old body here was literally `pass` with a
+            # comment claiming the table would "refresh on the next
+            # periodic update or when Apply is clicked". Result: the
+            # operator hit Add OSPF, filled the dialog, clicked add,
+            # and saw NOTHING appear in the OSPF table — the added
+            # config was silently sitting in device_info["ospf_config"]
+            # waiting for a periodic tick. Mirror the BGP fix: refresh
+            # the table now, and reconnect both stub + real handler so
+            # inline edits still persist after the rebuild.
+            try:
+                self.ospf_table.cellChanged.disconnect()
+            except TypeError:
+                pass
+            self.update_ospf_table()
+            self.ospf_table.cellChanged.connect(self.on_ospf_table_cell_changed)
+            self.ospf_table.cellChanged.connect(self.ospf_handler.on_ospf_table_cell_changed)
         elif protocol == "IS-IS" or protocol == "ISIS":
-            # Don't refresh the table immediately after editing - let the user finish
-            # The table will refresh on the next periodic update or when Apply is clicked
-            # This prevents infinite loops and overwriting user edits
-            # Skip table refresh for ISIS to prevent recursion
-            pass
+            # v0.5.203: same fix for ISIS — was `pass`, now refresh
+            # the table + reconnect both handlers so Add ISIS shows
+            # up in the table immediately.
+            try:
+                self.isis_table.cellChanged.disconnect()
+            except TypeError:
+                pass
+            self.update_isis_table()
+            self.isis_table.cellChanged.connect(self.on_isis_table_cell_changed)
+            self.isis_table.cellChanged.connect(self.isis_handler.on_isis_table_cell_changed)
         
         # Save session
         if hasattr(self.main_window, "save_session"):
