@@ -9451,8 +9451,19 @@ class DevicesTab(QWidget):
             # Temporarily disconnect to prevent infinite loop
             self.bgp_table.cellChanged.disconnect()
             self.update_bgp_table()
-            # Reconnect after update
+            # v0.5.202: BGPHandler.__init__ wires the REAL edit
+            # handler (self.bgp_handler.on_bgp_table_cell_changed)
+            # to cellChanged — that's the one that actually writes
+            # timer / neighbor / source edits back into bgp_config.
+            # The disconnect() above blows away every connected slot;
+            # pre-fix the reconnect below only wired the DevicesTab
+            # `pass`-only stub, so every inline edit after the first
+            # protocol-update pass got silently dropped (operator
+            # symptom: hold-time reverts to default 90 on Apply).
+            # Reconnect BOTH the stub (harmless) and the real handler
+            # so persistence survives update_bgp_table.
             self.bgp_table.cellChanged.connect(self.on_bgp_table_cell_changed)
+            self.bgp_table.cellChanged.connect(self.bgp_handler.on_bgp_table_cell_changed)
         elif protocol == "OSPF":
             # Don't refresh the table immediately after editing - let the user finish
             # The table will refresh on the next periodic update or when Apply is clicked

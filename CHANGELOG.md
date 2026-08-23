@@ -2,6 +2,53 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.202] - 2026-08-23
+
+**BGP row inline edits (hold-time, keepalive, source, neighbor,
+ASN) now actually persist to bgp_config again.**
+
+Operator report: modified `bgp_hold_time` in the BGP table's
+inline column 11, clicked Apply — value reverted to default 90.
+Confirmed on srv06 that every Apply payload was still carrying
+`bgp_hold_time='90'` even after the operator typed a new
+value; the edit never made it into `device_info["bgp_config"]`.
+
+Root cause — [widgets/devices_tab.py:9452](widgets/devices_tab.py:9452)
+in `update_protocol`:
+
+```python
+self.bgp_table.cellChanged.disconnect()   # ← wipes ALL slots
+self.update_bgp_table()
+self.bgp_table.cellChanged.connect(self.on_bgp_table_cell_changed)
+# ↑ only re-wires the pass-only STUB in DevicesTab
+```
+
+`disconnect()` with no args disconnects every slot bound to
+`cellChanged`, including the REAL edit handler that
+`BGPHandler.__init__` wires at
+`utils/devices_tab_bgp.py:54`. Only the DevicesTab-level stub
+(`def on_bgp_table_cell_changed(self, row, col): pass`) got
+reconnected afterwards. Once `update_protocol` ran once (which
+happens on any protocol-state event → very often), inline
+edits fired only into the stub and were silently dropped.
+The apply payload then re-serialized the untouched
+bgp_config and shipped the defaults.
+
+**Fix**: reconnect BOTH the stub AND the real handler after
+`disconnect()`. The stub is a no-op; the real handler in
+BGPHandler writes the edited value back into
+`device_info["bgp_config"]`.
+
+**Files:**
+- `widgets/devices_tab.py` — the protocol-update reconnect now
+  wires both `self.on_bgp_table_cell_changed` (stub) and
+  `self.bgp_handler.on_bgp_table_cell_changed` (real work).
+- `tests/test_v05202_bgp_inline_edit_persist.py` — 3 source-
+  level lock-in tests: both reconnects present, the real
+  handler still contains the hold-time persist-write, and the
+  DevicesTab-level stub remains a `pass` so nobody accidentally
+  moves logic into the wrong side.
+
 ## [0.5.201] - 2026-08-23
 
 **BGP partial-apply no longer wipes neighbors in the address
