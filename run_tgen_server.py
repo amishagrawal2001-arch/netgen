@@ -9331,8 +9331,24 @@ def configure_bgp():
                     old_ipv6_list = [n.strip() for n in old_ipv6_neighbors_str.split(",") if n.strip()] if old_ipv6_neighbors_str else []
                     new_ipv6_list = [n.strip() for n in new_ipv6_neighbors_str.split(",") if n.strip()] if new_ipv6_neighbors_str else []
                     
+                    # v0.5.201: partial-apply must not touch neighbors
+                    # in an address family the client didn't select.
+                    # Pre-fix, a v6-only apply's payload didn't carry
+                    # `bgp_neighbor_ipv4`, so new_ipv4_list=[], the
+                    # diff computed "remove all existing v4 neighbors",
+                    # and the operator's live v4 BGP session got wiped
+                    # from FRR. Skip the ipv4 diff entirely when the
+                    # partial-apply flag says v4 is out of scope.
+                    if is_partial_apply and "ipv4" not in apply_address_families:
+                        logging.info(
+                            f"[BGP DIFF] Skipping IPv4 diff — partial apply "
+                            f"scope is {apply_address_families}"
+                        )
+                        ipv4_to_remove = []
+                        ipv4_to_add = []
+                        ipv4_to_check = []
                     # Only process diff if IPv4 is still enabled (not already handled above)
-                    if ipv4_enabled and (old_ipv4_list or new_ipv4_list):
+                    elif ipv4_enabled and (old_ipv4_list or new_ipv4_list):
                         # Find neighbors to remove (in old but not in new)
                         ipv4_to_remove = [n for n in old_ipv4_list if n not in new_ipv4_list]
                         
@@ -9394,8 +9410,20 @@ def configure_bgp():
                         if ipv4_to_add:
                             logging.info(f"[BGP DIFF] New IPv4 neighbors to add: {ipv4_to_add}")
                     
+                    # v0.5.201: symmetric guard for the v6 diff — same
+                    # bug in the other direction (a v4-only apply's
+                    # payload didn't carry `bgp_neighbor_ipv6`, so the
+                    # diff would wipe existing v6 neighbors).
+                    if is_partial_apply and "ipv6" not in apply_address_families:
+                        logging.info(
+                            f"[BGP DIFF] Skipping IPv6 diff — partial apply "
+                            f"scope is {apply_address_families}"
+                        )
+                        ipv6_to_remove = []
+                        ipv6_to_add = []
+                        ipv6_to_check = []
                     # Only process diff if IPv6 is still enabled (not already handled above)
-                    if ipv6_enabled and (old_ipv6_list or new_ipv6_list):
+                    elif ipv6_enabled and (old_ipv6_list or new_ipv6_list):
                         # Find neighbors to remove (in old but not in new)
                         ipv6_to_remove = [n for n in old_ipv6_list if n not in new_ipv6_list]
                         
@@ -9540,8 +9568,31 @@ def configure_bgp():
         ipv4_full = f"{ipv4}/{data.get('ipv4_mask', '24')}" if ipv4 else None
         ipv6_full = f"{ipv6}/{data.get('ipv6_mask', '64')}" if ipv6 else None
         
+        # v0.5.201: partial-apply must hand configure_bgp_for_device
+        # the MERGED config (payload overlaid on existing) so it sees
+        # both address families' neighbor state — otherwise the raw
+        # payload's empty `bgp_neighbor_ipv4` (on a v6-only apply)
+        # would look like "no v4 config" and configure_bgp_for_device
+        # would tear the running v4 neighbor down. Full applies keep
+        # the raw payload as before.
         from utils.bgp import configure_bgp_for_device
-        bgp_success = configure_bgp_for_device(device_id, bgp_config, ipv4_full, ipv6_full, device_name)
+        if is_partial_apply:
+            _bgp_config_for_frr = existing_bgp_config.copy()
+            _bgp_config_for_frr.update(bgp_config)
+            # Honour the calculated (existing-preserving) enabled flags
+            # so the FRR path sees the same view the diff loop used.
+            _bgp_config_for_frr["ipv4_enabled"] = ipv4_enabled
+            _bgp_config_for_frr["ipv6_enabled"] = ipv6_enabled
+            if "ipv4" not in apply_address_families:
+                _bgp_config_for_frr["bgp_neighbor_ipv4"] = existing_bgp_config.get("bgp_neighbor_ipv4", "")
+                _bgp_config_for_frr["bgp_update_source_ipv4"] = existing_bgp_config.get("bgp_update_source_ipv4", "")
+            if "ipv6" not in apply_address_families:
+                _bgp_config_for_frr["bgp_neighbor_ipv6"] = existing_bgp_config.get("bgp_neighbor_ipv6", "")
+                _bgp_config_for_frr["bgp_update_source_ipv6"] = existing_bgp_config.get("bgp_update_source_ipv6", "")
+            _bgp_config_for_frr.pop("_apply_address_families", None)
+        else:
+            _bgp_config_for_frr = bgp_config
+        bgp_success = configure_bgp_for_device(device_id, _bgp_config_for_frr, ipv4_full, ipv6_full, device_name)
         
         if not bgp_success:
             logging.error(f"[BGP CONFIGURE] Failed to configure BGP for device {device_name}")

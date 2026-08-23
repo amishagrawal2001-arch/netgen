@@ -2,6 +2,57 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.201] - 2026-08-23
+
+**BGP partial-apply no longer wipes neighbors in the address
+family the operator wasn't editing.**
+
+Operator report on san-hp-srv06: existing IPv4 BGP session
+(peer 192.168.0.1 Established). Opened the GUI, added an IPv6
+BGP row, hit Apply — the v4 session went down. Client did the
+right thing (partial-apply payload with `_apply_address
+_families = ['ipv6']`), and the server-side DB merge also
+did the right thing. But two FRR-facing paths didn't respect
+the partial-apply scope.
+
+**Bug 1** — the diff-reconfig block at [run_tgen_server.py
+:9335](run_tgen_server.py:9335) read `bgp_config.get(
+"bgp_neighbor_ipv4")` straight from the raw payload. A v6-
+only apply doesn't carry the v4 neighbor field (client sends
+only the row it was editing), so `new_ipv4_list = []`. The
+diff then computed `ipv4_to_remove = [all existing v4
+neighbors]` and issued `no neighbor 192.168.0.1 activate` +
+`no neighbor 192.168.0.1` to FRR. Session gone.
+
+**Fix**: guard both diff blocks (v4 + v6) with
+`is_partial_apply and "<af>" not in apply_address_families`
+so the diff is skipped entirely when the address family isn't
+in scope.
+
+**Bug 2** — `configure_bgp_for_device(device_id, bgp_config,
+...)` at line 9572 was called with the raw payload too. On a
+v6-only apply the payload has `ipv4_enabled=False` and
+`bgp_neighbor_ipv4=""`, so `configure_bgp_for_device` would
+independently reason "no v4 config" and tear down the v4
+neighbor from its side.
+
+**Fix**: on partial-apply, hand it a MERGED config —
+`existing_bgp_config.copy(); .update(bgp_config); ` then
+overlay the calculated (existing-preserving) `ipv4_enabled` /
+`ipv6_enabled` flags and preserve the neighbor / update-
+source fields for the out-of-scope address family.
+
+**Files:**
+- `run_tgen_server.py` — v4-diff + v6-diff guarded by
+  partial-apply scope; `_bgp_config_for_frr` merged view
+  handed to `configure_bgp_for_device` on partial applies.
+- `tests/test_v05201_bgp_partial_apply.py` — 5 source-level
+  lock-in tests covering both diff guards, the merged-config
+  passthrough, and the calculated-flag override.
+
+**Verified live on srv06**: existing v4 session survives an
+IPv6-add partial apply (previously wiped immediately).
+
 ## [0.5.200] - 2026-08-23
 
 **Audit follow-up: OSPF & ISIS get parity with the BGP fixes
