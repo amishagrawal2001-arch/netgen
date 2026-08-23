@@ -2,6 +2,85 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.200] - 2026-08-23
+
+**Audit follow-up: OSPF & ISIS get parity with the BGP fixes
+from v0.5.198–v0.5.199, and two P1 filter/cleanup bugs that
+made BGP route advertisement silently over-permissive get closed.**
+
+Motivated by the operator's "what other bugs does BGP have"
+audit after the four-fix v0.5.196–v0.5.199 batch. Four scans
+found four issues — all shipped in v0.5.200.
+
+**P0 — OSPF & ISIS mirror the BGP VRF-suffix bug.**
+`configure_ospf_route_advertisement` / `configure_isis
+_route_advertisement` emitted `ip route X null0` without the
+per-device VRF suffix. Same shape as the BGP bug fixed in
+v0.5.198: static routes landed in the default routing table,
+but `router ospf` / `router isis CORE` inside a per-device
+VRF searched only its own VRF's table for redistribute-static
+→ nothing advertised. Symmetric fix — compute
+`_vrf_route_suffix` from `FRRDockerManager.vrf_name_for_device`
+and append to every `ip route` / `ipv6 route`. Cleanup paths
+get the matching suffix so removal doesn't leak.
+
+**P1 — `route-map RM-EXPORT permit 20` catch-all defeated the
+prefix-list filter.**
+
+Configure emitted:
+```
+route-map RM-EXPORT permit 10
+ match ip address prefix-list PL-EXPORT
+route-map RM-EXPORT permit 20   ← no match = permit ALL
+```
+
+The second sequence had no match clause, so it permitted
+everything — anything in FRR's redistribute-static input got
+advertised regardless of `PL-EXPORT`. Fix: delete the `permit
+20` (implicit deny handles non-matches correctly) and prefix
+each apply with `no route-map RM-EXPORT` so a stale sequence
+from a pre-v0.5.200 install gets wiped on the next apply.
+Same for `RM-EXPORT-IPV6`.
+
+**Behavioural note**: before v0.5.200, the connected `network
+<subnet>/N` statement was also advertised through the catch-
+all → operators counted `PfxSnt = N pool + 1 connected`. After
+v0.5.200, only the pool prefixes go out. If you want the
+connected too, define it as a pool.
+
+**P1 — cleanup's prefix-list seq range was hardcoded 5–50.**
+Configure generates `seq += 5` per route with no cap: a pool
+with 20 routes lands at seq 100, 50 routes at seq 250. The
+old cleanup's `for seq in range(5, 55, 5)` loop left every
+seq past 50 as an orphan. On the next apply the fresh entries
+overwrote seq 5–50 but the orphan tail persisted forever.
+Fix: single wildcard `no ip prefix-list PL-EXPORT` (drops the
+whole list); configure recreates only the sequences it needs.
+
+**Live verification on san-hp-srv06:**
+
+```
+before v0.5.200 (with catch-all):     PfxSnt = 21  (20 pool + 1 connected via catch-all)
+after v0.5.200:                        PfxSnt = 20  (20 pool only — connected filtered)
+route-map RM-EXPORT: only permit 10 (no permit 20 catch-all)
+prefix-list PL-EXPORT: 20 entries, all 6.6.x, no orphan tail
+```
+
+**Files:**
+- `run_tgen_server.py` — `configure_ospf_route_advertisement`,
+  `configure_isis_route_advertisement`, `cleanup_ospf_route
+  _advertisement`, `cleanup_isis_route_advertisement` all get
+  the `_vrf_route_suffix` computation + append it to every
+  `ip route` / `ipv6 route` / `no ip route` / `no ipv6 route`
+  command. `configure_bgp_route_advertisement` drops the
+  `permit 20` catch-all + prefixes with `no route-map` for a
+  clean rebuild. `cleanup_bgp_route_advertisement` replaces
+  the hardcoded seq loop with a single wildcard drop.
+- `tests/test_v05200_ospf_isis_parity.py` — 7 source-level
+  lock-in tests: OSPF + ISIS advertise + cleanup VRF-suffix,
+  BGP catch-all removal, BGP `no route-map` prefix, cleanup
+  wildcard drop.
+
 ## [0.5.199] - 2026-08-23
 
 **BGP route-pool changes now withdraw old prefixes from the peer.**

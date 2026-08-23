@@ -8034,12 +8034,22 @@ def configure_bgp_route_advertisement(device_id, device_name, bgp_asn, neighbor_
                     device_ipv6 = bgp_config_from_db.get("bgp_update_source_ipv6", "").strip()
         
         # Configure route-maps
+        # v0.5.200: previously appended `route-map RM-EXPORT permit
+        # 20` (a catch-all with no match clause = permit everything)
+        # AFTER the PL-EXPORT-filtered permit 10 entry, which
+        # defeated the whole prefix-list filter — every static route
+        # in FRR's table got redistributed regardless of PL-EXPORT.
+        # Explains why operators saw 30 prefixes advertised when
+        # only the 20 that matched PL-EXPORT should have been. The
+        # catch-all is dropped; implicit deny handles non-matching
+        # routes correctly.
         vtysh_commands.extend([
+            "no route-map RM-EXPORT",
             "route-map RM-EXPORT permit 10",
             " match ip address prefix-list PL-EXPORT",
-            "route-map RM-EXPORT permit 20",
             "route-map RM-IMPORT permit 10",
             " match ip address prefix-list PL-IMPORT",
+            "no route-map RM-EXPORT-IPV6",
             "route-map RM-EXPORT-IPV6 permit 10",
             " match ipv6 address prefix-list PL-EXPORT",
         ])
@@ -8062,9 +8072,10 @@ def configure_bgp_route_advertisement(device_id, device_name, bgp_asn, neighbor_
             # No IPv6 pools or not IPv6 neighbor, still need to exit the route-map block
             vtysh_commands.append("exit")
         
-        # Continue with remaining route-map configurations
+        # Continue with remaining route-map configurations.
+        # v0.5.200: removed the RM-EXPORT-IPV6 permit 20 catch-all
+        # for the same reason as its IPv4 twin above.
         vtysh_commands.extend([
-            "route-map RM-EXPORT-IPV6 permit 20",
             "route-map RM-IMPORT-IPV6 permit 10",
             " match ipv6 address prefix-list PL-IMPORT",
         ])
@@ -8230,17 +8241,36 @@ def configure_ospf_route_advertisement(device_id, device_name, area_id, route_po
     """Configure OSPF route advertisement by creating static routes and redistributing them."""
     try:
         from utils.frr_docker import FRRDockerManager
-        
+
         logging.info(f"[OSPF ROUTE ADV] Configuring route advertisement for device {device_name}, area {area_id}, AF={af_type}")
         logging.info(f"[OSPF ROUTE ADV] Route pools: {route_pools}")
         logging.info(f"[OSPF ROUTE ADV] All pools: {all_pools}")
-        
+
         # Determine address family
         is_ipv6 = af_type == "IPv6"
-        
+
         frr_manager = FRRDockerManager()
         container_name = frr_manager._get_container_name(device_id, device_name)
         container = frr_manager.client.containers.get(container_name)
+
+        # v0.5.200: OSPF parity with v0.5.198 BGP fix — static routes
+        # emitted without a VRF suffix land in the default routing
+        # table but `router ospf` inside a per-device VRF searches
+        # only its own VRF's static-route table for redistribute-
+        # static. Compute the suffix once and append it below.
+        _vrf_route_suffix = ""
+        try:
+            _vrf_name = frr_manager.vrf_name_for_device(device_id)
+            if _vrf_name:
+                _check = subprocess.run(
+                    ["ip", "-o", "link", "show", _vrf_name],
+                    capture_output=True, text=True, timeout=2,
+                )
+                if _check.returncode == 0 and (_check.stdout or "").strip():
+                    _vrf_route_suffix = f" vrf {_vrf_name}"
+                    logging.info(f"[OSPF ROUTE ADV] Static routes scoped to VRF {_vrf_name}")
+        except Exception as _vrf_exc:
+            logging.debug(f"[OSPF ROUTE ADV] VRF lookup failed: {_vrf_exc}")
         
         # Wait a bit for OSPF to be fully configured
         import time
@@ -8308,13 +8338,13 @@ def configure_ospf_route_advertisement(device_id, device_name, area_id, route_po
                 
                 logging.info(f"[OSPF ROUTE ADV] Generated {len(generated_routes)} routes for pool {pool_name}")
                 
-                # Add static routes
+                # Add static routes (VRF-scoped when device has one)
                 for route in generated_routes:
                     if network.version == 6:
-                        vtysh_commands.append(f"ipv6 route {route} null0")
+                        vtysh_commands.append(f"ipv6 route {route} null0{_vrf_route_suffix}")
                     else:
-                        vtysh_commands.append(f"ip route {route} null0")
-                
+                        vtysh_commands.append(f"ip route {route} null0{_vrf_route_suffix}")
+
                 # Add routes to prefix-list based on address family
                 for route in generated_routes:
                     seq_num = len(vtysh_commands) + 100
@@ -8322,7 +8352,7 @@ def configure_ospf_route_advertisement(device_id, device_name, area_id, route_po
                         vtysh_commands.append(f"ipv6 prefix-list PL-OSPF6-EXPORT seq {seq_num} permit {route}")
                     elif network.version == 4 and not is_ipv6:
                         vtysh_commands.append(f"ip prefix-list PL-OSPF-EXPORT seq {seq_num} permit {route}")
-                
+
             except Exception as e:
                 logging.error(f"[OSPF ROUTE ADV] Error processing pool {pool_name}: {e}")
                 continue
@@ -8389,40 +8419,56 @@ def cleanup_ospf_route_advertisement(device_id, device_name, area_id, af_type=No
         # Get all route pools from database to remove their static routes
         from utils.device_database import DeviceDatabase
         all_pools_db = device_db.get_all_route_pools()
-        
+
         # Determine if we should filter by address family
         is_ipv6_only = af_type == "IPv6"
         is_ipv4_only = af_type == "IPv4"
-        
+
+        # v0.5.200: OSPF parity with BGP v0.5.198 fix — match the
+        # VRF suffix the advertise path used, else `no ip route X`
+        # in global-VRF no-ops while VRF-scoped routes leak forever.
+        _vrf_route_suffix = ""
+        try:
+            _vrf_name = frr_manager.vrf_name_for_device(device_id)
+            if _vrf_name:
+                _check = subprocess.run(
+                    ["ip", "-o", "link", "show", _vrf_name],
+                    capture_output=True, text=True, timeout=2,
+                )
+                if _check.returncode == 0 and (_check.stdout or "").strip():
+                    _vrf_route_suffix = f" vrf {_vrf_name}"
+        except Exception as _vrf_exc:
+            logging.debug(f"[OSPF ROUTE CLEANUP] VRF lookup failed: {_vrf_exc}")
+
         # Remove static routes for all pools (both IPv4 and IPv6, or filtered by af_type)
         for pool in all_pools_db:
             pool_name = pool["pool_name"]
             subnet = pool["subnet"]
             count = pool["route_count"]
             increment_type = pool.get("increment_type", "host")
-            
+
             try:
                 import ipaddress
                 network = ipaddress.ip_network(subnet, strict=False)
-                
+
                 if increment_type == "network":
                     # Generate network routes using increment logic
                     generated_routes = generate_network_routes_from_pool(network, count)
                 else:
                     # Generate individual host routes (default behavior)
                     generated_routes = generate_host_routes_from_pool(network, count)
-                
+
                 # Add removal commands for each generated route (only for the specified AF)
                 for route in generated_routes:
                     if network.version == 6 and not is_ipv4_only:
-                        cleanup_commands.append(f"no ipv6 route {route} null0")
+                        cleanup_commands.append(f"no ipv6 route {route} null0{_vrf_route_suffix}")
                     elif network.version == 4 and not is_ipv6_only:
-                        cleanup_commands.append(f"no ip route {route} null0")
-                        
+                        cleanup_commands.append(f"no ip route {route} null0{_vrf_route_suffix}")
+
             except Exception as e:
                 logging.warning(f"[OSPF ROUTE CLEANUP] Failed to generate routes for pool {pool_name}: {e}")
                 continue
-        
+
         # Remove prefix-list and route-map based on AF
         if not is_ipv6_only:
             cleanup_commands.extend([
@@ -8563,14 +8609,18 @@ def cleanup_bgp_route_advertisement(device_id, device_name, bgp_asn, neighbor_ip
                 logging.warning(f"[BGP ROUTE CLEANUP] Failed to generate routes for pool {pool_name}: {e}")
                 continue
         
-        # Remove prefix-list entries based on AF
+        # Remove prefix-list entries based on AF.
+        # v0.5.200: previously enumerated seq 5..50 explicitly. But
+        # configure generates seq += 5 per route with NO cap — a
+        # pool with 20 routes hits seq 100, a pool with 50 hits
+        # seq 250. The 5..50 loop left everything past seq 50 as
+        # an orphan tail. Wildcard-drop the whole prefix-list in
+        # one shot; configure will re-create just what's needed.
         if not is_ipv6_only:
-            for seq in range(5, 55, 5):  # seq 5, 10, 15, ..., 50
-                cleanup_commands.append(f"no ip prefix-list PL-EXPORT seq {seq}")
-        
+            cleanup_commands.append("no ip prefix-list PL-EXPORT")
+
         if not is_ipv4_only:
-            for seq in range(5, 55, 5):  # seq 5, 10, 15, ..., 50
-                cleanup_commands.append(f"no ipv6 prefix-list PL-EXPORT seq {seq}")
+            cleanup_commands.append("no ipv6 prefix-list PL-EXPORT")
         
         # Remove route-maps based on AF
         if not is_ipv6_only:
@@ -8663,17 +8713,33 @@ def configure_isis_route_advertisement(device_id, device_name, area_id, route_po
     """Configure ISIS route advertisement by creating static routes and redistributing them."""
     try:
         from utils.frr_docker import FRRDockerManager
-        
+
         logging.info(f"[ISIS ROUTE ADV] Configuring route advertisement for device {device_name}, area {area_id}, AF={af_type}")
         logging.info(f"[ISIS ROUTE ADV] Route pools: {route_pools}")
         logging.info(f"[ISIS ROUTE ADV] All pools: {all_pools}")
-        
+
         # Determine address family
         is_ipv6 = af_type == "IPv6"
-        
+
         frr_manager = FRRDockerManager()
         container_name = frr_manager._get_container_name(device_id, device_name)
         container = frr_manager.client.containers.get(container_name)
+
+        # v0.5.200: ISIS parity with v0.5.198 BGP fix — same VRF-
+        # scoping issue as OSPF above.
+        _vrf_route_suffix = ""
+        try:
+            _vrf_name = frr_manager.vrf_name_for_device(device_id)
+            if _vrf_name:
+                _check = subprocess.run(
+                    ["ip", "-o", "link", "show", _vrf_name],
+                    capture_output=True, text=True, timeout=2,
+                )
+                if _check.returncode == 0 and (_check.stdout or "").strip():
+                    _vrf_route_suffix = f" vrf {_vrf_name}"
+                    logging.info(f"[ISIS ROUTE ADV] Static routes scoped to VRF {_vrf_name}")
+        except Exception as _vrf_exc:
+            logging.debug(f"[ISIS ROUTE ADV] VRF lookup failed: {_vrf_exc}")
         
         # Wait a bit for ISIS to be fully configured
         import time
@@ -8741,13 +8807,13 @@ def configure_isis_route_advertisement(device_id, device_name, area_id, route_po
                 
                 logging.info(f"[ISIS ROUTE ADV] Generated {len(generated_routes)} routes for pool {pool_name}")
                 
-                # Add static routes
+                # Add static routes (VRF-scoped when device has one)
                 for route in generated_routes:
                     if network.version == 6:
-                        vtysh_commands.append(f"ipv6 route {route} null0")
+                        vtysh_commands.append(f"ipv6 route {route} null0{_vrf_route_suffix}")
                     else:
-                        vtysh_commands.append(f"ip route {route} null0")
-                
+                        vtysh_commands.append(f"ip route {route} null0{_vrf_route_suffix}")
+
                 # Add routes to prefix-list based on address family
                 for route in generated_routes:
                     seq_num = len(vtysh_commands) + 100
@@ -8755,7 +8821,7 @@ def configure_isis_route_advertisement(device_id, device_name, area_id, route_po
                         vtysh_commands.append(f"ipv6 prefix-list PL-ISIS6-EXPORT seq {seq_num} permit {route}")
                     elif network.version == 4 and not is_ipv6:
                         vtysh_commands.append(f"ip prefix-list PL-ISIS-EXPORT seq {seq_num} permit {route}")
-                
+
             except Exception as e:
                 logging.error(f"[ISIS ROUTE ADV] Error processing pool {pool_name}: {e}")
                 continue
@@ -8811,38 +8877,53 @@ def cleanup_isis_route_advertisement(device_id, device_name, area_id, af_type=No
         time.sleep(2)
         
         cleanup_commands = ["configure terminal"]
-        
+
         is_ipv6_only = af_type == "IPv6"
         is_ipv4_only = af_type == "IPv4"
-        
+
+        # v0.5.200: ISIS parity with BGP v0.5.198 fix — remove VRF-
+        # scoped routes match the suffix the advertise path used.
+        _vrf_route_suffix = ""
+        try:
+            _vrf_name = frr_manager.vrf_name_for_device(device_id)
+            if _vrf_name:
+                _check = subprocess.run(
+                    ["ip", "-o", "link", "show", _vrf_name],
+                    capture_output=True, text=True, timeout=2,
+                )
+                if _check.returncode == 0 and (_check.stdout or "").strip():
+                    _vrf_route_suffix = f" vrf {_vrf_name}"
+        except Exception as _vrf_exc:
+            logging.debug(f"[ISIS ROUTE CLEANUP] VRF lookup failed: {_vrf_exc}")
+
         from utils.device_database import DeviceDatabase
         all_pools_db = device_db.get_all_route_pools()
-        
+
         for pool in all_pools_db:
             pool_name = pool["pool_name"]
             subnet = pool["subnet"]
             count = pool["route_count"]
             increment_type = pool.get("increment_type", "host")
-            
+
             try:
                 import ipaddress
                 network = ipaddress.ip_network(subnet, strict=False)
-                
+
                 if increment_type == "network":
                     generated_routes = generate_network_routes_from_pool(network, count)
                 else:
                     generated_routes = generate_host_routes_from_pool(network, count)
-                
+
                 for route in generated_routes:
                     if network.version == 6 and not is_ipv4_only:
-                        cleanup_commands.append(f"no ipv6 route {route} null0")
+                        cleanup_commands.append(f"no ipv6 route {route} null0{_vrf_route_suffix}")
                     elif network.version == 4 and not is_ipv6_only:
-                        cleanup_commands.append(f"no ip route {route} null0")
-                        
+                        cleanup_commands.append(f"no ip route {route} null0{_vrf_route_suffix}")
+
             except Exception as e:
                 logging.warning(f"[ISIS ROUTE CLEANUP] Failed to generate routes for pool {pool_name}: {e}")
                 continue
-        
+
         if not is_ipv6_only:
             cleanup_commands.extend([
                 "no ip prefix-list PL-ISIS-EXPORT",
