@@ -9614,25 +9614,63 @@ def configure_bgp():
         logging.info(f"[BGP ROUTE DEBUG] Checking route advertisement conditions:")
         logging.info(f"[BGP ROUTE DEBUG] - route_pools_per_neighbor: {route_pools_per_neighbor}")
         logging.info(f"[BGP ROUTE DEBUG] - all_pools from database: {len(all_pools)} pools")
-        
+
+        # v0.5.197: previously an `if attached_pools and all_pools:`
+        # gate silently took the cleanup branch whenever a device
+        # attached pool NAMES that were never saved to the server's
+        # pool table — the client's UX gave no indication that no
+        # routes had been advertised. Now: split attached into known
+        # vs unknown, warn loudly on the unknown set, advertise the
+        # known subset (partial success beats silent no-op), and
+        # collect a `warnings` payload so the client can toast.
+        known_pool_names = {p["name"] for p in all_pools}
+        apply_warnings = []
+
         # Process ALL neighbors that have route pools attached
         for current_neighbor_ip, attached_pools in route_pools_per_neighbor.items():
             logging.info(f"[BGP ROUTE DEBUG] Processing neighbor: {current_neighbor_ip}")
             logging.info(f"[BGP ROUTE DEBUG] - attached_pools: {attached_pools}")
-            
-            if attached_pools and all_pools:
-                logging.info(f"[BGP CONFIGURE] Configuring route advertisement for neighbor {current_neighbor_ip}")
-                # Run in background to avoid blocking
-                def _configure_routes(neighbor_ip=current_neighbor_ip, pools=attached_pools):
+
+            if not attached_pools:
+                logging.info(f"[BGP ROUTE DEBUG] No attached pools - cleaning up existing route advertisement for neighbor {current_neighbor_ip}")
+                def _cleanup_routes(neighbor_ip=current_neighbor_ip):
+                    cleanup_bgp_route_advertisement(
+                        device_id, device_name, bgp_asn, neighbor_ip
+                    )
+                import threading
+                threading.Thread(target=_cleanup_routes, daemon=True).start()
+                continue
+
+            unknown_pools = [n for n in attached_pools if n not in known_pool_names]
+            known_pools = [n for n in attached_pools if n in known_pool_names]
+
+            if unknown_pools:
+                warning_msg = (
+                    f"Neighbor {current_neighbor_ip}: attached pool(s) "
+                    f"{unknown_pools} do not exist on the server. Save "
+                    f"them in Tools → BGP → Manage Route Pools before "
+                    f"applying BGP, then re-apply."
+                )
+                logging.warning(f"[BGP CONFIGURE] {warning_msg}")
+                apply_warnings.append({
+                    "code": "unknown_pools",
+                    "neighbor": current_neighbor_ip,
+                    "unknown_pools": unknown_pools,
+                    "message": warning_msg,
+                })
+
+            if known_pools:
+                logging.info(f"[BGP CONFIGURE] Configuring route advertisement for neighbor {current_neighbor_ip} with {len(known_pools)} known pool(s)")
+                def _configure_routes(neighbor_ip=current_neighbor_ip, pools=known_pools):
                     configure_bgp_route_advertisement(
-                        device_id, device_name, bgp_asn, neighbor_ip, 
+                        device_id, device_name, bgp_asn, neighbor_ip,
                         pools, all_pools
                     )
                 import threading
                 threading.Thread(target=_configure_routes, daemon=True).start()
             else:
-                logging.info(f"[BGP ROUTE DEBUG] No attached pools - cleaning up existing route advertisement for neighbor {current_neighbor_ip}")
-                # Run cleanup in background to avoid blocking
+                # Every attached pool was unknown — clean up any stale advertisement
+                logging.info(f"[BGP CONFIGURE] All attached pools were unknown for neighbor {current_neighbor_ip} - cleaning up any stale advertisement")
                 def _cleanup_routes(neighbor_ip=current_neighbor_ip):
                     cleanup_bgp_route_advertisement(
                         device_id, device_name, bgp_asn, neighbor_ip
@@ -9664,9 +9702,13 @@ def configure_bgp():
             "device_name": device_name,
             "neighbor_ip": bgp_config.get("bgp_neighbor_ipv4", ""),
             "neighbor_as": bgp_config.get("bgp_remote_asn", ""),
-            "route_added": route_added
+            "route_added": route_added,
+            # v0.5.197: non-fatal issues the client can toast — for
+            # example a route pool that's attached to the device but
+            # doesn't exist on the server yet. Empty list when clean.
+            "warnings": apply_warnings,
         }), 200
-        
+
     except Exception as e:
         logging.error(f"[BGP CONFIGURE ERROR] {e}")
         return jsonify({"error": str(e)}), 500
@@ -10304,14 +10346,32 @@ def start_bgp():
                         "increment_type": pool.get("increment_type", "host")
                     })
                 
+                # v0.5.197: split attached into known / unknown so a
+                # stale attachment (pool since deleted, or attach
+                # committed without saving the pool) doesn't silently
+                # skip everything. Advertise the known subset; log a
+                # WARNING for the unknown one(s).
+                known_pool_names = {p["name"] for p in all_pools}
+
                 # Restore route pool configurations for each neighbor
                 for neighbor_ip, attached_pools in route_pools_per_neighbor.items():
-                    if attached_pools and all_pools:
-                        logging.info(f"[BGP START] Restoring route pools for neighbor {neighbor_ip}: {attached_pools}")
+                    if not attached_pools:
+                        continue
+                    known_pools = [n for n in attached_pools if n in known_pool_names]
+                    unknown_pools = [n for n in attached_pools if n not in known_pool_names]
+                    if unknown_pools:
+                        logging.warning(
+                            f"[BGP START] Neighbor {neighbor_ip}: attached "
+                            f"pool(s) {unknown_pools} do not exist on the "
+                            f"server — skipping. Re-create them via Manage "
+                            f"Route Pools and re-apply BGP."
+                        )
+                    if known_pools:
+                        logging.info(f"[BGP START] Restoring route pools for neighbor {neighbor_ip}: {known_pools}")
                         # Run route advertisement configuration in background
-                        def _restore_routes(neighbor_ip=neighbor_ip, pools=attached_pools):
+                        def _restore_routes(neighbor_ip=neighbor_ip, pools=known_pools):
                             configure_bgp_route_advertisement(
-                                device_id, device_name, bgp_asn, neighbor_ip, 
+                                device_id, device_name, bgp_asn, neighbor_ip,
                                 pools, all_pools
                             )
                         import threading

@@ -438,7 +438,22 @@ class MultiDeviceApplyWorker(QThread):
                     # Protocol configuration is now handled in _apply_device_to_server_sync
                     # No need for duplicate calls here
 
-                    message = f"✅ {device_name}: Device applied successfully"
+                    # v0.5.197: server-returned non-fatal warnings
+                    # (e.g. attached BGP route pool not defined on
+                    # server). Fold them into the success message so
+                    # the operator sees them in the Apply Results
+                    # dialog without having to dig into logs.
+                    warnings = device_info.get("_apply_warnings") or []
+                    if warnings:
+                        warn_lines = "\n  ".join(
+                            w.get("message", str(w)) for w in warnings
+                        )
+                        message = (
+                            f"⚠ {device_name}: Applied with warnings:\n  "
+                            f"{warn_lines}"
+                        )
+                    else:
+                        message = f"✅ {device_name}: Device applied successfully"
                     self.device_applied.emit(device_name, True, message)
                     return (message, True)
                 else:

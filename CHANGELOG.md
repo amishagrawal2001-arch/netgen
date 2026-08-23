@@ -2,6 +2,68 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.197] - 2026-08-23
+
+**BGP Apply no longer silently drops route-pool attachments when
+the pool doesn't exist on the server.**
+
+Operator report on san-hp-srv06: attached two IPv4 route pools
+(`p2`, `p5`) to a BGP neighbor via the GUI, hit Apply, saw the
+peer come up but zero prefixes received. The pools were saved
+in `bgp_config.route_pools` but were never POSTed to
+`/api/bgp/pools`, so the server's pool table was empty when
+`configure_bgp()` ran.
+
+Root cause — [run_tgen_server.py:9623](run_tgen_server.py:9623)
+had a single-line gate:
+
+    if attached_pools and all_pools:
+        # advertise
+    else:
+        # SILENTLY cleanup — no log, no toast, no error
+        _cleanup_routes(...)
+
+When `attached_pools=['p2','p5']` (truthy) and `all_pools=[]`
+(empty), the code hit the else branch and silently removed any
+route advertisement. There was no signal to the operator that
+the attachment names were unknown.
+
+Fix — priority ladder replaces the silent gate:
+
+  * Split `attached_pools` into `known` (exists in pool table)
+    and `unknown` (attached name is unknown).
+  * For `unknown`: log a WARNING with the pool names + append
+    to `apply_warnings` list. Payload includes
+    `{code: "unknown_pools", neighbor, unknown_pools, message}`.
+  * For `known`: advertise them (partial success beats silent
+    no-op — one working pool + one missing beats "silently drop
+    all of them").
+  * The response now returns `"warnings": [...]`; the client's
+    sync BGP-apply picks the list up and stashes it on
+    `device_info["_apply_warnings"]`; the Devices tab's Apply
+    Results dialog folds them into a `⚠ Applied with warnings`
+    line so the operator sees `attached pool 'p2' does not
+    exist on the server — save it in Manage Route Pools first`
+    without opening the log file.
+  * The BGP-start restore path
+    ([run_tgen_server.py:10308](run_tgen_server.py:10308)) had
+    the same shape and gets the same split-and-warn treatment
+    (log-only; not called from a client-visible response).
+
+**Files:**
+- `run_tgen_server.py` — `configure_bgp` split-and-warn + new
+  `warnings` field in the 200 response; BGP-start restore path
+  logs a WARNING for unknown attached pools instead of silently
+  skipping the whole restore
+- `utils/devices_tab_bgp.py` — sync BGP apply parses
+  `response.json().warnings` and stashes on device_info
+- `widgets/devices_tab.py` — Apply Results renders
+  `_apply_warnings` as a `⚠ Applied with warnings:` line
+- `tests/test_v05197_bgp_pool_warnings.py` — 6 tests: silent-
+  gate absence (source-level lock-in), split-and-warn contract,
+  response shape, BGP-start restore parity, client stash +
+  Apply Results surfacing
+
 ## [0.5.196] - 2026-07-21
 
 **Default self-service trial extended from 30 → 60 days.**

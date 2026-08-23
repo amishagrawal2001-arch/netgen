@@ -888,6 +888,21 @@ class BGPHandler:
             # Make synchronous request to the configure endpoint
             response = requests.post(f"{server_url}/api/device/bgp/configure", json=bgp_payload, timeout=30)
             if response.status_code == 200:
+                # v0.5.197: server now returns non-fatal `warnings`
+                # (e.g. attached pool doesn't exist on server). Stash
+                # them on device_info so the outer apply path can
+                # surface a toast — same pattern as _apply_error.
+                try:
+                    body = response.json() or {}
+                    warnings = body.get("warnings") or []
+                    if warnings:
+                        device_info["_apply_warnings"] = warnings
+                        logger.warning(
+                            f"[BGP APPLY] {device_name} configure returned "
+                            f"{len(warnings)} warning(s): {warnings}"
+                        )
+                except Exception:
+                    pass
                 return True
 
             # Surface the actual server error so the caller can show
