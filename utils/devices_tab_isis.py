@@ -507,13 +507,87 @@ class ISISHandler:
                         else:
                             devices_to_apply_isis.append(device)
 
-        # Apply ISIS configurations
-        if devices_to_apply_isis:
-            self._apply_isis_to_devices(devices_to_apply_isis, server_url)
-        
-        # Remove ISIS configurations
-        if devices_to_remove_isis:
-            self._remove_isis_from_devices(devices_to_remove_isis, server_url)
+        # v0.5.214: run the network-heavy apply+remove work in a
+        # background QThread with a modal QProgressDialog wrapping
+        # both. Pre-fix the two `_apply_isis_to_devices` /
+        # `_remove_isis_from_devices` calls ran synchronously in
+        # the UI thread — for a handful of devices they blocked
+        # the whole client for the duration of every `requests
+        # .post(..., timeout=30)`, and the operator saw a frozen
+        # window with no indication that anything was in flight.
+        # OSPF (utils/devices_tab_ospf.py:2563) and BGP (utils/
+        # devices_tab_bgp.py:2135) already wrap apply this way;
+        # ISIS was the parity gap. Operator report on JNPR-MAC-
+        # HWXVX1 2026-08-23: "when applied isis config, apply
+        # config progress bar is not visible similar to ospf and
+        # bgp."
+        if not devices_to_apply_isis and not devices_to_remove_isis:
+            return
+
+        from PyQt5.QtCore import QThread, pyqtSignal
+        from PyQt5.QtWidgets import QProgressDialog
+
+        class ApplyISISWorker(QThread):
+            finished = pyqtSignal(dict)  # {apply, remove} → each: {results, success, failed}
+
+            def __init__(self, handler, apply_list, remove_list, url):
+                super().__init__()
+                self.handler = handler
+                self.apply_list = apply_list
+                self.remove_list = remove_list
+                self.url = url
+
+            def run(self):
+                out = {"apply": None, "remove": None}
+                if self.apply_list:
+                    out["apply"] = self.handler._apply_isis_network(
+                        self.apply_list, self.url)
+                if self.remove_list:
+                    out["remove"] = self.handler._remove_isis_network(
+                        self.remove_list, self.url)
+                self.finished.emit(out)
+
+        # Progress dialog — modal, immediate, no cancel button
+        # (matches OSPF; interrupting a partially-applied config
+        # leaves the FRR container in a half-configured state).
+        summary_msg = "Applying ISIS configurations..."
+        if devices_to_apply_isis and devices_to_remove_isis:
+            summary_msg = (
+                f"Applying ISIS ({len(devices_to_apply_isis)}) + "
+                f"removing ({len(devices_to_remove_isis)})..."
+            )
+        elif devices_to_remove_isis and not devices_to_apply_isis:
+            summary_msg = f"Removing ISIS from {len(devices_to_remove_isis)} device(s)..."
+        else:
+            summary_msg = f"Applying ISIS to {len(devices_to_apply_isis)} device(s)..."
+
+        progress = QProgressDialog(summary_msg, "Cancel", 0, 0, self.parent)
+        progress.setWindowModality(2)  # Qt.WindowModal
+        progress.setCancelButton(None)
+        progress.setMinimumDuration(0)
+        progress.show()
+
+        worker = ApplyISISWorker(self, devices_to_apply_isis,
+                                 devices_to_remove_isis, server_url)
+        worker.setParent(self.parent)
+        worker.finished.connect(
+            lambda out: self._on_isis_apply_finished(out, progress))
+        # OSPF's guard against "QThread: Destroyed while thread is
+        # still running" on PyQt5 5.15.11 + Python 3.14 — hold a
+        # ref on `self._isis_apply_workers` for lifetime pinning.
+        worker.start()
+
+        if not hasattr(self, "_isis_apply_workers"):
+            self._isis_apply_workers = []
+        self._isis_apply_workers.append(worker)
+
+        def _still_running(w):
+            try:
+                return w.isRunning()
+            except RuntimeError:
+                return False
+        self._isis_apply_workers = [
+            w for w in self._isis_apply_workers if _still_running(w)]
 
 
     def _apply_isis_to_devices(self, devices, server_url):
@@ -773,6 +847,211 @@ class ISISHandler:
                 logger.warning(
                     f"[ISIS REMOVE] could not show results dialog: {dlg_exc}"
                 )
+
+
+    # ── v0.5.214: network-only helpers for the threaded apply path ──
+    # These do the exact same HTTP work `_apply_isis_to_devices` /
+    # `_remove_isis_from_devices` do but WITHOUT touching Qt (no
+    # MultiDeviceResultsDialog.exec_(), no update_isis_table()) — so
+    # they're safe to invoke from an ApplyISISWorker.run() on a
+    # background thread. The UI wrappers above still work for any
+    # direct caller; the new `apply_isis_configurations` calls
+    # these instead and handles UI on the finished signal.
+
+    def _apply_isis_network(self, devices, server_url):
+        """Run the ISIS-apply HTTP calls; return
+        `{"results": [...], "success_count": N, "failed_count": N}`.
+        Safe to call from a QThread.run()."""
+        results = []
+        success_count = 0
+        failed_count = 0
+        for device in devices:
+            device_id = device.get("device_id")
+            device_name = device.get("Device Name", "Unknown")
+            per_device_server_url = self.parent._get_server_url_from_interface(
+                device.get("Interface", "")) or server_url
+
+            isis_config = device.get("isis_config", {}) or device.get("is_is_config", {})
+            if not isis_config and isinstance(device.get("protocols"), dict):
+                proto = device.get("protocols", {})
+                isis_config = proto.get("ISIS", {}) or proto.get("isis", {})
+
+            if not device_id or not isis_config:
+                results.append(
+                    f"ℹ️ {device_name}: skipped (missing "
+                    f"device_id or isis_config)"
+                )
+                continue
+
+            all_route_pools = getattr(self.parent.main_window,
+                                      'bgp_route_pools', [])
+            isis_data = {
+                "device_id": device_id,
+                "device_name": device_name,
+                "interface": device.get("Interface", ""),
+                "vlan": device.get("VLAN", "0"),
+                "ipv4": device.get("IPv4", ""),
+                "ipv6": device.get("IPv6", ""),
+                "ipv4_gateway": device.get("IPv4 Gateway", ""),
+                "ipv6_gateway": device.get("IPv6 Gateway", ""),
+                "isis_config": isis_config,
+                "route_pools_per_area": {},
+                "all_route_pools": all_route_pools,
+            }
+
+            if not per_device_server_url:
+                results.append(
+                    f"ℹ️ {device_name}: skipped (no server URL "
+                    f"resolved from interface)"
+                )
+                continue
+
+            post_url = f"{per_device_server_url}/api/device/isis/configure"
+            try:
+                response = requests.post(post_url, json=isis_data, timeout=30)
+            except Exception as e:
+                logger.error(f"[ISIS POST] Exception posting to {post_url}: {e}")
+                results.append(f"❌ {device_name}: network error — {e}")
+                failed_count += 1
+                continue
+
+            if response.status_code == 200:
+                results.append(f"✅ {device_name}: ISIS configuration applied")
+                success_count += 1
+            else:
+                try:
+                    error_msg = response.json().get("error", response.text)
+                except Exception:
+                    error_msg = response.text
+                short = (error_msg or "")[:200]
+                results.append(
+                    f"❌ {device_name}: HTTP {response.status_code} — {short}")
+                failed_count += 1
+
+        return {"results": results, "success_count": success_count,
+                "failed_count": failed_count}
+
+    def _remove_isis_network(self, devices, server_url):
+        """Run the ISIS-remove HTTP calls + local-only cleanup;
+        return `{"results": [...], "success_count": N,
+        "failed_count": N}`. Safe to call from a QThread.run().
+
+        Local-only cleanup (mutating the client's `all_devices`
+        dict) is still done here rather than deferred to the UI
+        thread — dict mutation isn't a Qt call and doesn't need
+        the main thread. If concurrency ever becomes an issue
+        this'd need moving to `_on_isis_apply_finished`.
+        """
+        results = []
+        success_count = 0
+        failed_count = 0
+        for device in devices:
+            device_id = device.get("device_id")
+            device_name = device.get("Device Name", "Unknown")
+            isis_config = device.get("isis_config", {}) or device.get("is_is_config", {})
+
+            if not device_id:
+                results.append(f"ℹ️ {device_name}: skipped (no device_id)")
+                continue
+
+            server_removal_success = False
+            if server_url:
+                try:
+                    isis_data = {"device_id": device_id,
+                                 "device_name": device_name,
+                                 "isis_config": isis_config}
+                    response = requests.post(f"{server_url}/api/device/isis/stop",
+                                             json=isis_data, timeout=10)
+                    if response.status_code == 200:
+                        server_removal_success = True
+                    else:
+                        try:
+                            error_msg = response.json().get("error", "Unknown error")
+                        except Exception:
+                            error_msg = response.text
+                        logger.error(f"Server ISIS removal failed for {device_name}: {error_msg}")
+                except requests.exceptions.RequestException as e:
+                    logger.warning(f"Network error removing ISIS from server for {device_name}: {e}")
+
+            # Always remove from client's all_devices — legacy behavior.
+            if isinstance(device.get("protocols"), dict):
+                device["protocols"].pop("IS-IS", None)
+            else:
+                device.pop("is_is_config", None)
+                device.pop("isis_config", None)
+                protocols = device.get("protocols", [])
+                if isinstance(protocols, list) and "IS-IS" in protocols:
+                    protocols.remove("IS-IS")
+
+            if server_removal_success:
+                results.append(f"✅ {device_name}: ISIS removed (server + local)")
+            else:
+                results.append(
+                    f"⚠️ {device_name}: ISIS removed locally only "
+                    f"(server removal skipped or failed; check logs)")
+            success_count += 1
+
+        return {"results": results, "success_count": success_count,
+                "failed_count": failed_count}
+
+    def _on_isis_apply_finished(self, out, progress):
+        """UI-thread handler: close progress, refresh table, show
+        MultiDeviceResultsDialog(s). Called via the ApplyISISWorker's
+        `finished` signal so all Qt calls stay on the main thread.
+        """
+        try:
+            progress.close()
+        except Exception:
+            pass
+
+        # Reap our worker keepalive list.
+        if hasattr(self, "_isis_apply_workers"):
+            def _still_running(w):
+                try:
+                    return w.isRunning()
+                except RuntimeError:
+                    return False
+            self._isis_apply_workers = [
+                w for w in self._isis_apply_workers if _still_running(w)]
+
+        # Refresh table once (used to happen inside both underlying
+        # methods; now consolidated).
+        try:
+            self.update_isis_table()
+        except Exception as exc:
+            logger.warning(f"[ISIS APPLY] table refresh failed: {exc}")
+        if hasattr(self.parent, "main_window") and hasattr(
+                self.parent.main_window, "save_session"):
+            try:
+                self.parent.main_window.save_session()
+            except Exception:
+                pass
+
+        # Results dialogs — apply and remove get separate summaries
+        # (same shape the old sync path used).
+        from widgets.devices_tab import MultiDeviceResultsDialog
+        for kind, payload in (("apply", out.get("apply")),
+                              ("remove", out.get("remove"))):
+            if not payload or not payload.get("results"):
+                continue
+            success = payload["success_count"]
+            failed = payload["failed_count"]
+            if kind == "apply":
+                verb, past = "Applied", "Applied"
+                title_ok = "ISIS Configuration Applied"
+                title_partial = "ISIS Configuration Partially Applied"
+            else:
+                verb, past = "Removed", "Removed"
+                title_ok = "ISIS Configuration Removed"
+                title_partial = "ISIS Configuration Removal Partial"
+            summary = f"{past} ISIS configuration: {success} succeeded, {failed} failed"
+            title = title_ok if failed == 0 else title_partial
+            try:
+                MultiDeviceResultsDialog(title, summary,
+                                         payload["results"], self.parent).exec_()
+            except Exception as dlg_exc:
+                logger.warning(
+                    f"[ISIS APPLY] could not show {kind} results dialog: {dlg_exc}")
 
 
     def refresh_isis_status(self):

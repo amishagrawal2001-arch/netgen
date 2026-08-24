@@ -2,6 +2,64 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.214] - 2026-08-23
+
+**ISIS Apply now shows a QProgressDialog and runs in a
+background thread — parity with OSPF and BGP.**
+
+Operator report on JNPR-MAC-HWXVX1 2026-08-23 (following
+v0.5.213's route-pool UI): "when applied isis config, apply
+config progress bar is not visible similar to ospf and bgp."
+
+Root cause: `apply_isis_configurations` called
+`_apply_isis_to_devices` / `_remove_isis_from_devices`
+synchronously in the UI thread. Each `requests.post(...,
+timeout=30)` blocked the whole client for the duration; the
+operator saw a frozen window with no indication anything was
+in flight. OSPF (utils/devices_tab_ospf.py:2563) and BGP
+(utils/devices_tab_bgp.py:2135) already wrap apply this way —
+ISIS was the parity gap.
+
+Fix:
+- New `_apply_isis_network(devices, server_url)` and
+  `_remove_isis_network(devices, server_url)` helpers do the
+  HTTP work only (no `MultiDeviceResultsDialog.exec_()`, no
+  `update_isis_table()`) — safe to call from a worker thread.
+- New `ApplyISISWorker(QThread)` nested inside
+  `apply_isis_configurations` runs the network helpers and
+  emits a `finished(dict)` signal.
+- `QProgressDialog("Applying ISIS ...", "Cancel", 0, 0,
+  self.parent)` wraps the run — modal, no cancel (interrupting
+  a partial apply leaves the FRR container in a half-configured
+  state; same policy OSPF and BGP use).
+- `_on_isis_apply_finished` UI-thread handler closes the
+  progress dialog, refreshes the ISIS table, saves the
+  session, and shows the `MultiDeviceResultsDialog`(s) for
+  apply + remove separately — all Qt calls stay on the main
+  thread.
+- Worker keepalive list `self._isis_apply_workers` mirrors
+  OSPF's PyQt5 5.15.11 + Python 3.14 SIGABRT guard against
+  "QThread: Destroyed while thread is still running".
+
+The old `_apply_isis_to_devices` and `_remove_isis_from_devices`
+methods are unchanged — they still work for any direct caller
+(they're just no longer on the path the Apply button takes).
+
+Files touched:
+- `utils/devices_tab_isis.py` — `apply_isis_configurations`
+  rewritten around the QThread + QProgressDialog pattern.
+  New `_apply_isis_network`, `_remove_isis_network`, and
+  `_on_isis_apply_finished` helpers.
+
+Tests: `tests/test_v05214_isis_apply_progress.py` — 9 source-
+level lock-ins (QProgressDialog present, QThread worker
+present, worker uses network helpers, helpers exist + return
+correct shape + don't touch Qt UI, finished handler closes
+dialog + refreshes + shows results, worker keepalive list).
+
+**Client-side fix** — install the new wheel on the macOS
+client. No server change needed.
+
 ## [0.5.213] - 2026-08-23
 
 **IS-IS Attach / Detach Route Pools — client UI now on par
