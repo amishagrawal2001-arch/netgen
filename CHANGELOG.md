@@ -2,6 +2,57 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.208] - 2026-08-23
+
+**OSPF table's Interface column no longer reads "Unknown" when
+the adjacency is up.**
+
+Operator report on JNPR-MAC-HWXVX1 2026-08-23 (immediately
+after the v0.5.207 upgrade): OSPF row rendered green with
+`Full/Backup` — adjacency real, DB fresh — but the Interface
+column said "Unknown".
+
+Root cause: `widgets/add_ospf_dialog.py:get_values()` doesn't
+emit an `interface` key (it emits area_id, graceful_restart,
+router_id, hello/dead intervals, and post-v0.5.205 the AF
+flags — no interface). So any ospf_config produced by Add OSPF
+lacks the field. The render loop in
+`utils/devices_tab_ospf.py` around line 452 computed
+`ospf_interface = "Unknown"` unless `ospf_config["interface"]`
+was set, then reused that single string for every AF row.
+Meanwhile FRR's `show ip ospf neighbor` output **includes the
+interface** (parsed at `utils/ospf.py:1105-1114` into each
+neighbor dict's `interface` field), and the per-neighbor
+render loop happily pulled `neighbor_id`, `state`, `priority`,
+`dead_time`, `up_time` — but silently dropped
+`neighbor.interface`.
+
+Fixes:
+- Rename the pre-loop compute to `ospf_interface_fallback` so
+  it's obvious it's just a fallback.
+- Inside the per-neighbor loop, prefer
+  `neighbor.get("interface")` when a live neighbor is present.
+  `ospf_interface = live_iface or ospf_interface_fallback`.
+- Improved the fallback for configs that lack an `interface`
+  key: derive from the device's VLAN (`vlan{N}`) or physical
+  interface string (`iface.split(" - ")[1]`) — matches what
+  `configure_ospf` on the server would pick. Only when nothing
+  is derivable does the column read "Unknown".
+
+Files touched:
+- `utils/devices_tab_ospf.py` — `update_ospf_table` render loop.
+
+Tests: `tests/test_v05208_ospf_interface_column.py` — 4
+source-level lock-ins (per-row prefers live neighbor,
+fallback exists and starts Unknown, fallback derives from
+iface when config lacks key, column-4 setItem reads the
+per-row variable).
+
+**Operator-visible symptom after upgrade:** the Interface
+column now shows the actual OSPF interface (`ens4np0`,
+`vlan200`, etc.) whenever FRR reports an adjacency, or a
+sensible derived value when the adjacency isn't yet formed.
+
 ## [0.5.207] - 2026-08-23
 
 **Cross-protocol audit bundle — four bugs adjacent to the

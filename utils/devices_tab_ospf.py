@@ -449,18 +449,46 @@ class OSPFHandler:
                         #         # Silently fail - use in-memory config as fallback
                         #         pass
                         
-                        # Get the actual OSPF interface name from ospf_config
-                        ospf_interface = "Unknown"
+                        # Compute a fallback OSPF interface from static
+                        # sources (config + device iface string).
+                        # v0.5.208: the per-neighbor loop below now
+                        # PREFERS the interface reported by FRR
+                        # itself (`neighbor.interface`) when we have
+                        # live neighbor data — pre-fix that value was
+                        # parsed by utils/ospf.py:1105 but thrown
+                        # away here, so the Interface column read
+                        # "Unknown" for any config the Add OSPF
+                        # dialog produced (dialog never sets an
+                        # `interface` key). This fallback is what
+                        # renders when there's no live neighbor to
+                        # crib from.
+                        ospf_interface_fallback = "Unknown"
                         if ospf_config and "interface" in ospf_config:
-                            ospf_interface = ospf_config["interface"]
-                            
+                            ospf_interface_fallback = ospf_config["interface"]
+
                             # If VLAN is 0, use the physical interface name instead of vlan0
                             vlan_id = device.get("VLAN", "0")
-                            if vlan_id == "0" and ospf_interface.startswith("vlan"):
+                            if vlan_id == "0" and ospf_interface_fallback.startswith("vlan"):
                                 # Extract physical interface from the iface string (e.g., "TG 1 - ens4np0" -> "ens4np0")
                                 iface_parts = iface.split(" - ")
                                 if len(iface_parts) >= 2:
-                                    ospf_interface = iface_parts[1]  # Get the physical interface name
+                                    ospf_interface_fallback = iface_parts[1]  # Get the physical interface name
+                        else:
+                            # No `interface` in ospf_config (typical
+                            # for configs produced by the Add OSPF
+                            # dialog — get_values never emits it).
+                            # Derive from the outer iface loop
+                            # variable: "TG 1 - ens4np0" → "ens4np0",
+                            # or "vlanN" when the device is on a
+                            # tagged VLAN. Matches what configure_ospf
+                            # on the server would pick.
+                            vlan_id = device.get("VLAN", "0")
+                            if vlan_id and vlan_id != "0":
+                                ospf_interface_fallback = f"vlan{vlan_id}"
+                            else:
+                                iface_parts = iface.split(" - ")
+                                if len(iface_parts) >= 2:
+                                    ospf_interface_fallback = iface_parts[1]
                         
                         # Get Area ID from OSPF config
                         # Support separate area IDs for IPv4 and IPv6, with backward compatibility
@@ -517,7 +545,14 @@ class OSPFHandler:
                         for protocol_type in protocols_to_show:
                             # Get status for this protocol type
                             neighbors_for_type = ospf_status_data.get(protocol_type, [])
-                            
+
+                            # v0.5.208: prefer FRR's neighbor.interface
+                            # over the static fallback so the column
+                            # shows the actual OSPF interface the
+                            # adjacency formed on (ens4np0, vlan200,
+                            # etc.) rather than "Unknown".
+                            ospf_interface = ospf_interface_fallback
+
                             # Determine OSPF status based on neighbors or overall OSPF status
                             if neighbors_for_type:
                                 # Use the first neighbor's information for this type
@@ -526,6 +561,9 @@ class OSPFHandler:
                                 state = neighbor.get("state", "Down")
                                 priority = neighbor.get("priority", "1")
                                 dead_timer = neighbor.get("dead_time", "40")
+                                live_iface = (neighbor.get("interface") or "").strip()
+                                if live_iface:
+                                    ospf_interface = live_iface
                                 ospf_status = "Up" if any(state.startswith(s) for s in ["Full", "2-Way"]) else "Down"
                             else:
                                 # No neighbors found for this type - check if OSPF is running
