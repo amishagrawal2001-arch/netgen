@@ -997,7 +997,30 @@ class OSPFHandler:
                                   f"Click 'Apply OSPF' button to save and apply the configuration to the server.")
     
     def prompt_delete_ospf(self):
-        """Delete OSPF configuration for selected device."""
+        """Delete OSPF configuration for the row-selected device / AF.
+
+        v0.5.205: scope the delete to the selected row's address
+        family. Pre-fix the handler read only column 0 (device
+        name) and blew away the whole ospf_config + called
+        /api/ospf/cleanup unconditionally — so a click on the
+        IPv6 row also tore down the IPv4 side (operator report:
+        `Full/Backup` v4 neighbor vanished when the "No
+        Neighbors" v6 row was deleted).
+
+        New semantics:
+          * If both AFs are enabled and only one row is being
+            deleted: flip that AF's `*_enabled` flag to False,
+            save session, refresh table. The server-side
+            /api/ospf/cleanup call is intentionally SKIPPED —
+            the whole-device cleanup would drop the surviving
+            AF's peer as well. Next Apply OSPF Configuration
+            will diff-reconcile via the v0.5.199 cleanup-then-
+            configure path.
+          * If the deleted row is the last enabled AF: full
+            removal, same shape as before (protocol removed
+            from `protocols`, ospf_config marked for removal,
+            /api/ospf/cleanup fired).
+        """
         selected_items = self.parent.ospf_table.selectedItems()
         if not selected_items:
             QMessageBox.warning(self.parent, "No Selection", "Please select an OSPF configuration to delete.")
@@ -1005,15 +1028,13 @@ class OSPFHandler:
 
         row = selected_items[0].row()
         device_name = self.parent.ospf_table.item(row, 0).text()  # Device column
-        
-        # Confirm deletion
-        reply = QMessageBox.question(self.parent, "Confirm Deletion", 
-                                   f"Are you sure you want to delete OSPF configuration for '{device_name}'?",
-                                   QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        
-        if reply != QMessageBox.Yes:
-            return
-        
+        # Column 3 is Neighbor Type (IPv4 / IPv6) — see update_ospf_table.
+        # Defensive lookup: an older session or an in-flight
+        # rebuild could leave the cell blank; treat that as
+        # "unscoped" and fall through to full-removal.
+        protocol_type_item = self.parent.ospf_table.item(row, 3)
+        protocol_type = protocol_type_item.text() if protocol_type_item else ""
+
         # Find the device in all_devices and remove OSPF configuration
         device_info = None
         for iface, devices in self.parent.main_window.all_devices.items():
@@ -1023,7 +1044,7 @@ class OSPFHandler:
                     break
             if device_info:
                 break
-        
+
         # Check if device has OSPF configuration (handle both old and new formats)
         has_ospf = False
         if device_info and "protocols" in device_info:
@@ -1031,59 +1052,96 @@ class OSPFHandler:
                 has_ospf = True
             elif isinstance(device_info["protocols"], dict) and "OSPF" in device_info["protocols"]:
                 has_ospf = True
-        
-        if has_ospf:
-            device_id = device_info.get("device_id")
-            
-            if device_id:
-                # Remove OSPF configuration from server first
-                server_url = self.parent.get_server_url()
-                if server_url:
-                    try:
-                        # Call server OSPF cleanup endpoint
-                        response = requests.post(f"{server_url}/api/ospf/cleanup", 
-                                               json={"device_id": device_id}, 
-                                               timeout=10)
-                        
-                        if response.status_code == 200:
-                            logger.info(f"OSPF configuration removed from server for {device_name}")
-                        else:
-                            error_msg = response.json().get("error", "Unknown error")
-                            logger.error(f"Server OSPF cleanup failed for {device_name}: {error_msg}")
-                            # Continue with client-side cleanup even if server fails
-                    except requests.exceptions.RequestException as e:
-                        logger.warning(f"Network error removing OSPF from server for {device_name}: {str(e)}")
-                        # Continue with client-side cleanup even if server fails
-                else:
-                    logger.warning("No server URL available, removing OSPF configuration locally only")
-            
-            # Mark OSPF for removal instead of immediately deleting it
-            # This allows the user to apply the changes to the server later
-            if "protocols" in device_info:
-                if isinstance(device_info["protocols"], list):
-                    # New format: protocols is a list like ["BGP", "OSPF"]
-                    if "OSPF" in device_info["protocols"]:
-                        device_info["protocols"].remove("OSPF")
-                    # Mark OSPF config for removal
-                    device_info["ospf_config"] = {"_marked_for_removal": True}
-                elif isinstance(device_info["protocols"], dict):
-                    # Old format: protocols is a dict like {"OSPF": {...}}
-                    if isinstance(device_info["protocols"], dict):
-                        device_info["protocols"]["OSPF"] = {"_marked_for_removal": True}
-                    else:
-                        device_info["ospf_config"] = {"_marked_for_removal": True}
-            
-            # Update the OSPF table to show the device as marked for removal
+
+        if not has_ospf:
+            QMessageBox.warning(self.parent, "No OSPF Configuration", f"No OSPF configuration found for device '{device_name}'.")
+            return
+
+        # Read current AF flags. Fall back to device-address
+        # inference so pre-v0.5.205 sessions (no flags in
+        # ospf_config) still behave sensibly — matches the
+        # display fallback in update_ospf_table.
+        ospf_config = device_info.get("ospf_config") or {}
+        device_ipv4 = (device_info.get("IPv4", "") or "").strip()
+        device_ipv6 = (device_info.get("IPv6", "") or "").strip()
+        ipv4_enabled = bool(ospf_config.get("ipv4_enabled", bool(device_ipv4))) \
+            if "ipv4_enabled" in ospf_config else bool(device_ipv4)
+        ipv6_enabled = bool(ospf_config.get("ipv6_enabled", bool(device_ipv6))) \
+            if "ipv6_enabled" in ospf_config else bool(device_ipv6)
+        both_enabled = ipv4_enabled and ipv6_enabled
+
+        # Per-AF disable path — only when BOTH AFs are enabled
+        # and the operator clicked exactly one of them.
+        if both_enabled and protocol_type in ("IPv4", "IPv6"):
+            reply = QMessageBox.question(
+                self.parent, "Confirm Deletion",
+                f"Disable {protocol_type} OSPF for '{device_name}'?\n\n"
+                f"The other address family will keep running.\n"
+                f"Click 'Apply OSPF Configuration' after to sync.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
+                return
+            # Mutate the flag in place; keep OSPF in `protocols`.
+            new_config = dict(ospf_config)
+            if protocol_type == "IPv4":
+                new_config["ipv4_enabled"] = False
+            else:
+                new_config["ipv6_enabled"] = False
+            device_info["ospf_config"] = new_config
+
             self.update_ospf_table()
-            
-            # Save session
             if hasattr(self.parent.main_window, "save_session"):
                 self.parent.main_window.save_session()
-            
-            QMessageBox.information(self.parent, "OSPF Configuration Marked for Removal", 
-                                  f"OSPF configuration for '{device_name}' has been marked for removal. Click 'Apply OSPF Configuration' to remove it from the server.")
-        else:
-            QMessageBox.warning(self.parent, "No OSPF Configuration", f"No OSPF configuration found for device '{device_name}'.")
+
+            QMessageBox.information(
+                self.parent, f"{protocol_type} OSPF Disabled",
+                f"{protocol_type} OSPF for '{device_name}' has been "
+                f"disabled. Click 'Apply OSPF Configuration' to "
+                f"sync the change to the server."
+            )
+            return
+
+        # Full removal path — deleting the last (or only) enabled
+        # AF, or a row with no scope info. Same shape as pre-fix.
+        reply = QMessageBox.question(
+            self.parent, "Confirm Deletion",
+            f"Are you sure you want to delete OSPF configuration for '{device_name}'?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+
+        device_id = device_info.get("device_id")
+        if device_id:
+            server_url = self.parent.get_server_url()
+            if server_url:
+                try:
+                    response = requests.post(f"{server_url}/api/ospf/cleanup",
+                                             json={"device_id": device_id},
+                                             timeout=10)
+                    if response.status_code == 200:
+                        logger.info(f"OSPF configuration removed from server for {device_name}")
+                    else:
+                        error_msg = response.json().get("error", "Unknown error")
+                        logger.error(f"Server OSPF cleanup failed for {device_name}: {error_msg}")
+                except requests.exceptions.RequestException as e:
+                    logger.warning(f"Network error removing OSPF from server for {device_name}: {str(e)}")
+            else:
+                logger.warning("No server URL available, removing OSPF configuration locally only")
+
+        if "protocols" in device_info:
+            if isinstance(device_info["protocols"], list):
+                if "OSPF" in device_info["protocols"]:
+                    device_info["protocols"].remove("OSPF")
+                device_info["ospf_config"] = {"_marked_for_removal": True}
+            elif isinstance(device_info["protocols"], dict):
+                device_info["protocols"]["OSPF"] = {"_marked_for_removal": True}
+
+        self.update_ospf_table()
+        if hasattr(self.parent.main_window, "save_session"):
+            self.parent.main_window.save_session()
+
+        QMessageBox.information(self.parent, "OSPF Configuration Marked for Removal",
+                                f"OSPF configuration for '{device_name}' has been marked for removal. Click 'Apply OSPF Configuration' to remove it from the server.")
     
     def on_p2p_checkbox_changed(self, checkbox, state):
         """Handle P2P checkbox state change."""

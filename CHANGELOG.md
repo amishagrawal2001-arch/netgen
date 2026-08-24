@@ -2,6 +2,63 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.205] - 2026-08-23
+
+**Add OSPF now honors the AF the user picked; Delete OSPF is
+row-scoped instead of nuking the whole device.**
+
+Operator report on JNPR-MAC-HWXVX1 2026-08-23: selected device1
+(has both v4 + v6 addresses), clicked Add OSPF, filled the form,
+hit Add. Two rows appeared in the OSPF table — an IPv4 row with
+a real `Full/Backup` neighbor and an IPv6 row that said "No
+Neighbors" (because OSPFv3 was never actually configured on the
+router). Then clicking Delete on the v6 row also killed the v4
+row and lost the working neighbor.
+
+Root causes:
+
+1. **`AddOspfDialog.get_values()` never emitted
+   `ipv4_enabled`/`ipv6_enabled`.** The OSPF table's fallback in
+   `utils/devices_tab_ospf.py:475-482` filled the missing keys
+   from `bool(device_ipv4)` / `bool(device_ipv6)` — so any
+   device with both addresses got two rows regardless of what
+   the user wanted.
+2. **`prompt_delete_ospf` read only column 0 (device name).**
+   Column 3 (Neighbor Type — IPv4/IPv6) was ignored, and the
+   handler unconditionally fired `POST /api/ospf/cleanup` for
+   the whole device, wiping BOTH AFs.
+
+Fixes:
+
+- `widgets/add_ospf_dialog.py`
+  - New "Address Families" `QGroupBox` with `Enable IPv4` and
+    `Enable IPv6` checkboxes (both default checked).
+  - `get_values()` returns `ipv4_enabled` and `ipv6_enabled` in
+    Add mode. In Edit mode the group is hidden and the two keys
+    are omitted so the merge in `_update_device_protocol`
+    doesn't clobber the caller's stored flags.
+  - `_validate()` rejects "neither AF checked" with a helpful
+    dialog — a zero-AF OSPF config never renders and Apply is a
+    silent no-op, which would just look broken.
+- `utils/devices_tab_ospf.py:prompt_delete_ospf`
+  - Reads `protocol_type` from row column 3.
+  - If both AFs are enabled and the operator clicks one row:
+    flip only that AF's `*_enabled` flag off, save session,
+    refresh table. The `POST /api/ospf/cleanup` call is
+    intentionally SKIPPED (whole-device cleanup would drop the
+    surviving AF's peer too); the operator's next Apply OSPF
+    Configuration reconciles via the v0.5.199 cleanup-then-
+    configure path.
+  - If only one AF is enabled (this row is the last one):
+    full-removal path — same shape as pre-fix, fires
+    `/api/ospf/cleanup`.
+
+Tests: `tests/test_v05205_ospf_af_scoped.py` — 11 tests
+(dialog default both, v4-only, v6-only, zero-AF rejection,
+edit-mode-hides-group; per-AF disable for v4 and v6 rows,
+last-AF fires full cleanup, cancel is a no-op; source-level
+lock-ins for `get_values` and `prompt_delete_ospf`).
+
 ## [0.5.204] - 2026-08-23
 
 **Paid licenses stop getting silently invalidated on every VPN

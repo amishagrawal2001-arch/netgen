@@ -1,6 +1,6 @@
 from PyQt5.QtWidgets import (QDialog, QVBoxLayout, QFormLayout, QHBoxLayout,
                              QLineEdit, QCheckBox, QGroupBox, QDialogButtonBox,
-                             QWidget, QMessageBox)
+                             QWidget, QMessageBox, QLabel)
 from PyQt5.QtGui import QIntValidator
 import ipaddress
 
@@ -22,8 +22,11 @@ class AddOspfDialog(QDialog):
         # Set window title based on mode
         title = f"Edit OSPF Configuration - {device_name}" if self.edit_mode else f"Add OSPF Configuration - {device_name}"
         self.setWindowTitle(title)
-        self.setFixedSize(400, 300)
-        
+        # v0.5.205: taller — needs room for the Address Families
+        # group. Pre-fix the dialog was 300px tall; the extra AF
+        # checkboxes push the total past that.
+        self.setFixedSize(420, 380)
+
         self.layout = QVBoxLayout()
         self.setup_ospf_form()
         
@@ -46,6 +49,41 @@ class AddOspfDialog(QDialog):
         """Setup OSPF configuration form."""
         form_widget = QWidget()
         layout = QFormLayout(form_widget)
+
+        # v0.5.205: Address Families group. Pre-fix the dialog
+        # emitted no `ipv4_enabled`/`ipv6_enabled` at all, so the
+        # OSPF table's fallback path (utils/devices_tab_ospf.py
+        # around line 475) inferred BOTH AFs whenever the device
+        # had both a v4 and a v6 address — the operator got two
+        # rows per device after a single Add OSPF click, and the
+        # v6 row said "No Neighbors" because it was never really
+        # configured. Now the user picks the AFs up front and the
+        # dialog carries that choice into ospf_config.
+        # In edit mode the group is hidden — `prompt_edit_ospf`
+        # scopes to one AF's fields (area_id, graceful_restart)
+        # via the row's AF column, so re-toggling AFs from the
+        # edit dialog would be surprising.
+        self._af_group = QGroupBox("Address Families")
+        af_layout = QVBoxLayout(self._af_group)
+        self.enable_ipv4_checkbox = QCheckBox("Enable IPv4")
+        self.enable_ipv4_checkbox.setChecked(True)
+        self.enable_ipv4_checkbox.setToolTip(
+            "Configure OSPFv2 for IPv4 on this device."
+        )
+        self.enable_ipv6_checkbox = QCheckBox("Enable IPv6")
+        self.enable_ipv6_checkbox.setChecked(True)
+        self.enable_ipv6_checkbox.setToolTip(
+            "Configure OSPFv3 for IPv6 on this device."
+        )
+        af_layout.addWidget(self.enable_ipv4_checkbox)
+        af_layout.addWidget(self.enable_ipv6_checkbox)
+        self.layout.addWidget(self._af_group)
+        if self.edit_mode:
+            # Edit dialog scopes to one AF at a time; toggling AFs
+            # here would fight the row-scoped edit path in
+            # prompt_edit_ospf. Hide the group entirely rather than
+            # leave it visible-but-ignored.
+            self._af_group.hide()
 
         # Area ID
         self.area_id_input = QLineEdit("0.0.0.0")
@@ -192,14 +230,28 @@ class AddOspfDialog(QDialog):
             self.dead_interval_input.setText(str(dead_interval))
 
     def get_values(self):
-        """Get OSPF configuration values."""
-        return {
+        """Get OSPF configuration values.
+
+        v0.5.205: emit `ipv4_enabled`/`ipv6_enabled` from the
+        Address Families group in Add mode. In Edit mode the group
+        is hidden and both checkboxes stay at their default `True`
+        — the merge in `_update_device_protocol` (OSPF branch)
+        would then overwrite the caller's existing flags with
+        `True`/`True`, which is exactly the bug we're fixing.
+        So in edit mode we omit both keys and let the merge
+        preserve whatever was already stored.
+        """
+        values = {
             "area_id": self.area_id_input.text().strip(),
             "graceful_restart": self.graceful_restart_checkbox.isChecked(),
             "router_id": self.router_id_input.text().strip(),
             "hello_interval": self.hello_interval_input.text().strip(),
-            "dead_interval": self.dead_interval_input.text().strip()
+            "dead_interval": self.dead_interval_input.text().strip(),
         }
+        if not self.edit_mode:
+            values["ipv4_enabled"] = self.enable_ipv4_checkbox.isChecked()
+            values["ipv6_enabled"] = self.enable_ipv6_checkbox.isChecked()
+        return values
 
     def accept(self):
         """Validate and accept the dialog."""
@@ -209,6 +261,21 @@ class AddOspfDialog(QDialog):
 
     def _validate(self):
         """Validate OSPF configuration."""
+        # v0.5.205: at least one address family must be enabled
+        # when adding. Zero-AF OSPF configs are meaningless and
+        # would produce an OSPF row that never rendered — and
+        # since Apply is a no-op with no AFs, it'd feel like the
+        # button was broken.
+        if not self.edit_mode:
+            if not (self.enable_ipv4_checkbox.isChecked() or
+                    self.enable_ipv6_checkbox.isChecked()):
+                QMessageBox.warning(
+                    self, "No Address Family Selected",
+                    "Select at least one address family "
+                    "(IPv4 and/or IPv6) to enable OSPF for."
+                )
+                return False
+
         # Validate Area ID format
         area_id = self.area_id_input.text().strip()
         if area_id:
