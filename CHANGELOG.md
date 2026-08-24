@@ -2,6 +2,50 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.216] - 2026-08-23
+
+**Ping test (Devices tab) now shows a per-device progress
+dialog and runs in a background QThread.**
+
+Operator ask on JNPR-MAC-HWXVX1 2026-08-23: "also add a
+progress for ping test under devices tab." Pre-fix
+`ping_selected_device` ran the per-device ping loop
+synchronously in the UI thread. Each `requests.post(...,
+timeout=15)` blocked the client, so pinging N devices froze
+the whole app for up to N × 15 s with no visual feedback.
+
+Fix:
+- New nested `PingWorker(QThread)` with `progress =
+  pyqtSignal(int, str)` (index, device_name) and `finished =
+  pyqtSignal(list, int, int, int)` (results, success_count,
+  failed_count, arp_not_resolved_count).
+- Determinate `QProgressDialog(0..N)` with per-device label
+  ("Pinging 3 of 5: device2"). Unlike OSPF/BGP/ISIS Apply
+  (which disable Cancel because interrupting a partial apply
+  leaves the FRR container in a half-configured state), Ping
+  is safe to interrupt — the Cancel button is enabled and
+  flips the worker's `_should_stop` flag. The currently-in-
+  flight ping still completes (its 15 s timeout can't be
+  cancelled cleanly without threading around requests.post),
+  but the next queued device is skipped.
+- Finished handler closes the progress dialog and shows the
+  same `MultiDeviceResultsDialog` the sync path used.
+- Worker keepalive on `self._ping_workers` mirrors the PyQt5
+  5.15.11 + Python 3.14 SIGABRT guard OSPF/BGP/ISIS use.
+
+Files touched:
+- `widgets/devices_tab.py:ping_selected_device` — rewritten
+  around the QThread + QProgressDialog pattern.
+
+Tests: `tests/test_v05216_ping_progress.py` — 7 source-level
+lock-ins (progress dialog present, determinate 0..N, QThread
+worker present, Cancel wired, per-iteration stop check,
+finished handler closes dialog + shows results,
+per-device label updates, worker keepalive).
+
+**Client-side fix** — install new wheel on macOS client. No
+server change needed.
+
 ## [0.5.215] - 2026-08-23
 
 **Device Status column transitions from "Starting..." to

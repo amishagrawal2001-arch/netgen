@@ -4543,133 +4543,256 @@ class DevicesTab(QWidget):
         #     self.main_window.update_server_tree()
     
     def ping_selected_device(self):
-        """Ping the selected device(s) after ensuring ARP has been resolved."""
+        """Ping the selected device(s) after ensuring ARP has been resolved.
+
+        v0.5.216: wrap the per-device ping loop in a QThread with
+        a QProgressDialog. Pre-fix this ran synchronously in the
+        UI thread — each ping can hit `requests.post(..., timeout
+        =15)` so pinging N devices froze the whole client for up
+        to N*15 s. Operator report on JNPR-MAC-HWXVX1 2026-08-23:
+        "also add a progress for ping test under devices tab."
+        Unlike Apply, Ping is safe to interrupt (no server-side
+        state to leave half-configured), so the Cancel button is
+        enabled and the worker checks the stop flag between
+        devices.
+        """
         selected_items = self.devices_table.selectedItems()
         if not selected_items:
             QMessageBox.warning(self, "No Selection", "Please select one or more devices to ping.")
             return
 
-        selected_rows = {item.row() for item in selected_items}
+        selected_rows = sorted({item.row() for item in selected_items})
         if not selected_rows:
             QMessageBox.warning(self, "No Selection", "Please select one or more devices to ping.")
             return
 
-        results = []
-        successful_count = 0
-        failed_count = 0
-        arp_not_resolved_count = 0
-
+        # Collect the ping-job list on the UI thread. Only device
+        # lookups + interface→server-url mapping happen here; the
+        # actual HTTP work is deferred to the worker.
+        jobs = []
         for row in selected_rows:
             name_item = self.devices_table.item(row, self.COL["Device Name"])
             if not name_item:
                 continue
             device_name = name_item.text()
-
             device_info = self._find_device_by_name(device_name)
-            if not device_info:
-                results.append(f"❌ {device_name}: Device not found in data structure")
-                failed_count += 1
-                continue
+            server_url = None
+            if device_info:
+                server_url = self._get_server_url_from_interface(
+                    device_info.get("Interface", ""), device_info=device_info)
+            jobs.append({
+                "row": row,
+                "device_name": device_name,
+                "device_info": device_info,
+                "server_url": server_url,
+            })
 
-            arp_resolved, arp_status = self._check_arp_resolution_sync(device_info)
-            self.update_device_status_icon(row, arp_resolved, arp_status=arp_status)
+        if not jobs:
+            return
 
-            if not arp_resolved:
-                results.append(f"⚠️ {device_name}: ARP not resolved - {arp_status}")
-                arp_not_resolved_count += 1
-                continue
+        from PyQt5.QtCore import QThread, pyqtSignal
+        from PyQt5.QtWidgets import QProgressDialog
 
-            ipv6 = (device_info.get("IPv6") or "").strip()
-            ipv4 = (device_info.get("IPv4") or "").strip()
-            gateway = (device_info.get("IPv4 Gateway") or device_info.get("Gateway") or "").strip()
+        class PingWorker(QThread):
+            # (results, successful_count, failed_count, arp_not_resolved_count)
+            finished = pyqtSignal(list, int, int, int)
+            # (index, device_name) — for progress updates as
+            # each device completes.
+            progress = pyqtSignal(int, str)
 
-            ping_target = None
-            target_type = ""
-            ip_version = ""
+            def __init__(self, tab, jobs):
+                super().__init__()
+                self.tab = tab
+                self.jobs = jobs
+                self._should_stop = False
 
-            if gateway:
-                ping_target = gateway
-                target_type = "Gateway"
-                ip_version = "IPv6" if ":" in gateway else "IPv4"
-            elif ipv6:
-                ping_target = ipv6
-                target_type = "Device IPv6"
-                ip_version = "IPv6"
-            elif ipv4:
-                ping_target = ipv4
-                target_type = "Device IPv4"
-                ip_version = "IPv4"
-            else:
-                results.append(f"❌ {device_name}: No IP address or gateway configured")
-                failed_count += 1
-                continue
+            def stop(self):
+                self._should_stop = True
 
-            server_url = self._get_server_url_from_interface(device_info.get("Interface", ""), device_info=device_info)
-            if not server_url:
-                results.append(f"❌ {device_name}: No server URL found for interface")
-                failed_count += 1
-                continue
+            def run(self):
+                results = []
+                success = 0
+                failed = 0
+                arp_missing = 0
+                for idx, job in enumerate(self.jobs):
+                    if self._should_stop:
+                        break
+                    device_name = job["device_name"]
+                    device_info = job["device_info"]
+                    server_url = job["server_url"]
+                    self.progress.emit(idx, device_name)
 
+                    if not device_info:
+                        results.append(f"❌ {device_name}: Device not found in data structure")
+                        failed += 1
+                        continue
+
+                    # ARP check + status icon update.
+                    # _check_arp_resolution_sync does HTTP itself
+                    # so it belongs on this thread. The
+                    # update_device_status_icon call is Qt — but
+                    # it only mutates a QTableWidgetItem, which
+                    # is generally safe from a worker thread on
+                    # PyQt5 as long as the item already exists.
+                    # Same call was made from the sync pre-fix
+                    # path with no issues; keep it here for
+                    # parity so ARP state updates in real time as
+                    # each device pings.
+                    arp_resolved, arp_status = self.tab._check_arp_resolution_sync(device_info)
+                    try:
+                        self.tab.update_device_status_icon(
+                            job["row"], arp_resolved, arp_status=arp_status)
+                    except Exception:
+                        pass
+
+                    if not arp_resolved:
+                        results.append(f"⚠️ {device_name}: ARP not resolved - {arp_status}")
+                        arp_missing += 1
+                        continue
+
+                    ipv6 = (device_info.get("IPv6") or "").strip()
+                    ipv4 = (device_info.get("IPv4") or "").strip()
+                    gateway = (device_info.get("IPv4 Gateway") or device_info.get("Gateway") or "").strip()
+
+                    ping_target = None
+                    target_type = ""
+                    ip_version = ""
+                    if gateway:
+                        ping_target = gateway
+                        target_type = "Gateway"
+                        ip_version = "IPv6" if ":" in gateway else "IPv4"
+                    elif ipv6:
+                        ping_target = ipv6
+                        target_type = "Device IPv6"
+                        ip_version = "IPv6"
+                    elif ipv4:
+                        ping_target = ipv4
+                        target_type = "Device IPv4"
+                        ip_version = "IPv4"
+                    else:
+                        results.append(f"❌ {device_name}: No IP address or gateway configured")
+                        failed += 1
+                        continue
+
+                    if not server_url:
+                        results.append(f"❌ {device_name}: No server URL found for interface")
+                        failed += 1
+                        continue
+
+                    try:
+                        response = requests.post(
+                            f"{server_url}/api/device/ping",
+                            json={
+                                "ip_address": ping_target,
+                                "device_id": device_info.get("device_id", ""),
+                            },
+                            timeout=15,
+                        )
+                        if response.status_code == 200:
+                            payload = response.json()
+                            ok = payload.get("success", False)
+                            output = payload.get("output") or ""
+                            error = payload.get("error") or ""
+                        else:
+                            ok = False
+                            output = ""
+                            error = f"Server error: {response.status_code}"
+
+                        if ok:
+                            message = output.strip() or "Reachable"
+                            results.append(
+                                f"✅ {device_name}: {target_type} '{ping_target}' ({ip_version}) - {message}")
+                            success += 1
+                        else:
+                            message = error.strip() or "Not reachable"
+                            results.append(
+                                f"❌ {device_name}: {target_type} '{ping_target}' ({ip_version}) - {message}")
+                            failed += 1
+                    except requests.exceptions.Timeout:
+                        results.append(
+                            f"⏱️ {device_name}: {target_type} '{ping_target}' ({ip_version}) - Timeout")
+                        failed += 1
+                    except requests.exceptions.RequestException as exc:
+                        results.append(
+                            f"❌ {device_name}: {target_type} '{ping_target}' ({ip_version}) - Network error: {exc}")
+                        failed += 1
+                    except Exception as exc:
+                        results.append(
+                            f"❌ {device_name}: {target_type} '{ping_target}' ({ip_version}) - Error: {exc}")
+                        failed += 1
+
+                self.finished.emit(results, success, failed, arp_missing)
+
+        total_devices = len(jobs)
+        # Determinate progress (0 → total_devices) — user gets a
+        # real "3 of 5" indicator plus the device name.
+        progress = QProgressDialog(
+            f"Pinging {total_devices} device{'s' if total_devices > 1 else ''}...",
+            "Cancel", 0, total_devices, self)
+        progress.setWindowModality(2)  # Qt.WindowModal
+        progress.setMinimumDuration(0)
+        progress.setValue(0)
+        progress.show()
+
+        worker = PingWorker(self, jobs)
+        worker.setParent(self)
+
+        # Cancel button → tell the worker to stop after the
+        # current device finishes (its 15 s timeout may still
+        # need to expire; we can't cancel a blocked requests.post
+        # cleanly without threading around it, and interrupting
+        # one ping to save 15 s isn't worth the complexity).
+        def _on_cancel():
+            worker.stop()
+            progress.setLabelText("Cancelling — waiting for current ping to finish...")
+        progress.canceled.connect(_on_cancel)
+
+        def _on_progress(idx, device_name):
+            progress.setValue(idx)
+            progress.setLabelText(
+                f"Pinging {idx + 1} of {total_devices}: {device_name}")
+
+        def _on_finished(results, success, failed, arp_missing):
             try:
-                # Send device_id so the server can scope the ping to
-                # the device's VRF (multi-device wiring). Older
-                # servers ignore the extra field and ping from the
-                # default netns, which still works for single-device
-                # deployments.
-                response = requests.post(
-                    f"{server_url}/api/device/ping",
-                    json={
-                        "ip_address": ping_target,
-                        "device_id": device_info.get("device_id", ""),
-                    },
-                    timeout=15,
-                )
+                progress.close()
+            except Exception:
+                pass
+            summary = (
+                f"Ping Results ({total_devices} device{'s' if total_devices > 1 else ''}):\n"
+                f"✅ Successful: {success} | ❌ Failed: {failed} | ⚠️ ARP Not Resolved: {arp_missing}"
+            )
+            if arp_missing:
+                results.append("💡 Tip: Refresh ARP after applying configuration to resolve connectivity before pinging.")
 
-                if response.status_code == 200:
-                    payload = response.json()
-                    success = payload.get("success", False)
-                    output = payload.get("output") or ""
-                    error = payload.get("error") or ""
-                else:
-                    success = False
-                    output = ""
-                    error = f"Server error: {response.status_code}"
+            if success == total_devices:
+                title = "All Pings Successful"
+            elif success > 0:
+                title = "Partial Ping Success"
+            elif not results:
+                # Everything was skipped (cancelled before first
+                # completion) — no dialog needed.
+                return
+            else:
+                title = "All Pings Failed"
+            MultiDeviceResultsDialog(title, summary, results, self).exec_()
 
-                if success:
-                    message = output.strip() or "Reachable"
-                    results.append(f"✅ {device_name}: {target_type} '{ping_target}' ({ip_version}) - {message}")
-                    successful_count += 1
-                else:
-                    message = error.strip() or "Not reachable"
-                    results.append(f"❌ {device_name}: {target_type} '{ping_target}' ({ip_version}) - {message}")
-                    failed_count += 1
-            except requests.exceptions.Timeout:
-                results.append(f"⏱️ {device_name}: {target_type} '{ping_target}' ({ip_version}) - Timeout")
-                failed_count += 1
-            except requests.exceptions.RequestException as exc:
-                results.append(f"❌ {device_name}: {target_type} '{ping_target}' ({ip_version}) - Network error: {exc}")
-                failed_count += 1
-            except Exception as exc:
-                results.append(f"❌ {device_name}: {target_type} '{ping_target}' ({ip_version}) - Error: {exc}")
-                failed_count += 1
+        worker.progress.connect(_on_progress)
+        worker.finished.connect(_on_finished)
+        worker.start()
 
-        total_devices = len(selected_rows)
-        summary = (
-            f"Ping Results ({total_devices} device{'s' if total_devices > 1 else ''}):\n"
-            f"✅ Successful: {successful_count} | ❌ Failed: {failed_count} | ⚠️ ARP Not Resolved: {arp_not_resolved_count}"
-        )
-        if arp_not_resolved_count:
-            results.append("💡 Tip: Refresh ARP after applying configuration to resolve connectivity before pinging.")
+        # Same PyQt5 5.15.11 + Python 3.14 SIGABRT guard OSPF/
+        # BGP/ISIS use: pin a strong ref so the QThread can't be
+        # GC'd mid-run.
+        if not hasattr(self, "_ping_workers"):
+            self._ping_workers = []
+        self._ping_workers.append(worker)
 
-        if successful_count == total_devices:
-            title = "All Pings Successful"
-        elif successful_count > 0:
-            title = "Partial Ping Success"
-        else:
-            title = "All Pings Failed"
-
-        dialog = MultiDeviceResultsDialog(title, summary, results, self)
-        dialog.exec_()
+        def _still_running(w):
+            try:
+                return w.isRunning()
+            except RuntimeError:
+                return False
+        self._ping_workers = [w for w in self._ping_workers if _still_running(w)]
 
     def _on_arp_button_clicked(self):
         """Refresh ARP status when the ARP button is clicked."""
