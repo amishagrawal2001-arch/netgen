@@ -9386,6 +9386,13 @@ class DevicesTab(QWidget):
                                     merged_config["ipv4_enabled"] = existing_config["ipv4_enabled"]
                                 if "ipv6_enabled" not in config and "ipv6_enabled" in existing_config:
                                     merged_config["ipv6_enabled"] = existing_config["ipv6_enabled"]
+                                # v0.5.213: preserve route_pools attachments when editing config —
+                                # parity with the OSPF branch below. Without this the Attach Route
+                                # Pools dialog's pool selections get silently wiped whenever the
+                                # operator edits any other ISIS field (system_id, area_id, hello…)
+                                # via Add/Edit dialog or inline cell edit.
+                                if "route_pools" not in config and "route_pools" in existing_config:
+                                    merged_config["route_pools"] = existing_config["route_pools"]
                                 # v0.5.209: additive Add — a fresh
                                 # Add IS-IS call must not silently
                                 # disable an AF that's already up.

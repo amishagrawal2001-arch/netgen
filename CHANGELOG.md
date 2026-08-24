@@ -2,6 +2,105 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.213] - 2026-08-23
+
+**IS-IS Attach / Detach Route Pools — client UI now on par
+with the OSPF sub-tab. Operators can attach route pools per
+AF directly from the IS-IS table, see them in a new "Route
+Pools" column, and Apply IS-IS pushes them to the server for
+advertisement.**
+
+Operator report on JNPR-MAC-HWXVX1 2026-08-23 (follow-on to
+v0.5.211 / v0.5.212 which fixed the SERVER side of IS-IS
+route-pool advertisement): "OSPF has 'Attach / Detach Route
+Pools' buttons and a Route Pools column in its table, IS-IS
+doesn't. There's no way to point IS-IS at a pool from the
+UI." Server-side `configure_isis_route_advertisement` was
+already correct after v0.5.212 — the gap was purely on the
+client:
+
+- The IS-IS sub-tab toolbar (`utils/devices_tab_isis.py`) had
+  no Attach / Detach Route Pools buttons.
+- `isis_headers` had 11 columns and no "Route Pools" column,
+  so even when a pool was attached via manual DB edit the
+  operator had no visibility.
+- The apply payload built by `_apply_isis_to_devices` and
+  `_apply_isis_to_server_sync` sent only `isis_config` —
+  missing `route_pools_per_area` and `all_route_pools` fields
+  that the server `configure_isis_route_advertisement` reads
+  to build the per-pool prefix-list + route-map.
+- `_update_device_protocol`'s IS-IS branch (widgets/
+  devices_tab.py) preserved `ipv4_enabled` / `ipv6_enabled`
+  across edits but NOT `route_pools`, so any subsequent inline
+  edit or Add / Edit IS-IS dialog would silently wipe pool
+  attachments.
+
+Fix (client-only, straight port of the OSPF v0.5.213 UX
+pattern):
+
+- **New "Route Pools" column** (index 11) in `isis_headers`.
+  A helper `_set_isis_route_pools_cell(row, isis_config,
+  protocol_type)` reads `isis_config["route_pools"]` under
+  the "IPv4" / "IPv6" AF key and renders a comma-joined list
+  per row, with a tooltip. Marked-for-removal rows stay
+  blank. Old flat-list `route_pools` format is attributed to
+  the IPv4 row only so we don't double-render.
+- **Two new toolbar buttons** — `attach_isis_route_pools_
+  button` (readd icon) and `detach_isis_route_pools_button`
+  (remove icon) — wired to new `prompt_attach_route_pools` /
+  `prompt_detach_route_pools` methods on `ISISHandler`.
+  Buttons sit in the config-group next to Delete IS-IS.
+- **`prompt_attach_route_pools`** — ported from
+  `OSPFHandler.prompt_attach_route_pools`. Same behaviour:
+  single-select uses the shared `AttachRoutePoolsDialog`
+  (BGP dialog reused, filters pools by AF); multi-select
+  uses a bulk dialog grouped by AF; empty selection with
+  pools available = detach; every write updates both
+  `isis_config` and the legacy `is_is_config` mirror; sets
+  `_needs_apply=True` and saves session.
+  Column-index diff from OSPF: reads Neighbor Type from
+  column 2 (OSPF has it at column 3 — different table
+  layout).
+- **`prompt_detach_route_pools`** — same port from OSPF,
+  same column-index and dual-mirror discipline.
+- **Apply payload** — `_apply_isis_to_devices` and
+  `_apply_isis_to_server_sync` now include
+  `route_pools_per_area: {}` (server populates from
+  `isis_config["route_pools"]`) and `all_route_pools`
+  (BGP-shared pool store from the main window).
+- **`_update_device_protocol` IS-IS branch** — new preserve
+  clause: `if "route_pools" not in config and "route_pools"
+  in existing_config: merged_config["route_pools"] =
+  existing_config["route_pools"]`. Same shape the OSPF
+  branch has had since the OSPF route-pool feature landed.
+
+Files touched:
+- `utils/devices_tab_isis.py` — headers + Route Pools column
+  width, two new buttons + wiring, helper
+  `_set_isis_route_pools_cell`, three render sites in
+  `update_isis_table` (per-neighbor loop, no-neighbor first
+  row, IPv6 second row), payload additions in both apply
+  paths, new `prompt_attach_route_pools` and
+  `prompt_detach_route_pools` methods.
+- `widgets/devices_tab.py` — `route_pools` preservation in
+  the IS-IS branch of `_update_device_protocol` (mirrors the
+  OSPF branch at the same site).
+- `pyproject.toml` — version bump 0.5.212 → 0.5.213.
+
+Tests: `tests/test_v05213_isis_route_pool_ui.py` — source-
+level lock-ins covering: (1) "Route Pools" column present in
+`isis_headers`, (2) attach / detach button attributes wired
+to the right handler methods, (3) `prompt_attach_route_
+pools` and `prompt_detach_route_pools` methods exist on
+`ISISHandler`, (4) apply payload includes
+`route_pools_per_area` and `all_route_pools`, (5) the IS-IS
+branch of `_update_device_protocol` preserves `route_pools`.
+
+**Client-side change** — netgen-server on srv06 does NOT
+need a restart. Operator upgrades the client wheel, restarts
+the client, and the Attach Route Pools flow becomes
+available.
+
 ## [0.5.212] - 2026-08-23
 
 **OSPF / IS-IS route-pool advertisement now filters correctly

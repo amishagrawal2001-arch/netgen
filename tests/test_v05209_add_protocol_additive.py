@@ -178,7 +178,9 @@ def test_source_isis_branch_has_additive_preserve():
     src = (REPO / "widgets" / "devices_tab.py").read_text()
     idx = src.find('if protocol in ["IS-IS", "ISIS"]:')
     assert idx >= 0, "ISIS merge branch marker moved"
-    body = src[idx:idx + 2500]
+    # v0.5.213 route_pools preserve block extended this section; widen
+    # the window so the additive-preserve pattern stays in scope.
+    body = src[idx:idx + 4000]
     assert re.search(
         r'if existing_config\.get\(["\']ipv4_enabled["\']\)\s*:\s*\n\s*merged_config\[["\']ipv4_enabled["\']\]\s*=\s*True',
         body,

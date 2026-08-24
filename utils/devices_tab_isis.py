@@ -36,10 +36,12 @@ class ISISHandler:
         layout.setSpacing(2)
 
         # ISIS Neighbors Table with requested columns
-        isis_headers = ["Device", "ISIS Status", "Neighbor Type", "Neighbor Hostname", "Interface", "ISIS Area", "Level", "ISIS Net", "System ID", "Hello Interval", "Multiplier"]
+        # v0.5.213: added "Route Pools" column (parity with OSPF) so
+        # attached pool names for each address family are visible.
+        isis_headers = ["Device", "ISIS Status", "Neighbor Type", "Neighbor Hostname", "Interface", "ISIS Area", "Level", "ISIS Net", "System ID", "Hello Interval", "Multiplier", "Route Pools"]
         self.parent.isis_table = QTableWidget(0, len(isis_headers))
         self.parent.isis_table.setHorizontalHeaderLabels(isis_headers)
-        
+
         # Set column widths for better visibility
         self.parent.isis_table.setColumnWidth(0, 120)  # Device
         self.parent.isis_table.setColumnWidth(1, 100)  # ISIS Status
@@ -52,6 +54,7 @@ class ISISHandler:
         self.parent.isis_table.setColumnWidth(8, 120)  # System ID
         self.parent.isis_table.setColumnWidth(9, 100)  # Hello Interval
         self.parent.isis_table.setColumnWidth(10, 100)  # Multiplier
+        self.parent.isis_table.setColumnWidth(11, 180)  # Route Pools
         
         # Enable inline editing for the ISIS table
         self.parent.isis_table.setEditTriggers(QTableWidget.DoubleClicked | QTableWidget.EditKeyPressed)
@@ -189,9 +192,12 @@ class ISISHandler:
             return b
 
         # Config group (left)
-        self.parent.add_isis_button     = _isis_btn("add.png",    "Add IS-IS")
-        self.parent.edit_isis_button    = _isis_btn("edit.png",   "Edit ISIS Configuration")
-        self.parent.delete_isis_button  = _isis_btn("remove.png", "Delete ISIS Configuration")
+        self.parent.add_isis_button                = _isis_btn("add.png",    "Add IS-IS")
+        self.parent.edit_isis_button               = _isis_btn("edit.png",   "Edit ISIS Configuration")
+        self.parent.delete_isis_button             = _isis_btn("remove.png", "Delete ISIS Configuration")
+        # v0.5.213: Attach/Detach Route Pools — parity with OSPF UI.
+        self.parent.attach_isis_route_pools_button = _isis_btn("readd.png",  "Attach Route Pools to IS-IS Device")
+        self.parent.detach_isis_route_pools_button = _isis_btn("remove.png", "Detach Route Pools from IS-IS Device")
 
         # Runtime group (right)
         self.parent.apply_isis_button   = _isis_btn("apply.png",   "Apply ISIS configurations to server", style=BTN_APPLY)
@@ -203,13 +209,17 @@ class ISISHandler:
         self.parent.add_isis_button.clicked.connect(self.prompt_add_isis)
         self.parent.edit_isis_button.clicked.connect(self.prompt_edit_isis)
         self.parent.delete_isis_button.clicked.connect(self.prompt_delete_isis)
+        self.parent.attach_isis_route_pools_button.clicked.connect(self.prompt_attach_route_pools)
+        self.parent.detach_isis_route_pools_button.clicked.connect(self.prompt_detach_route_pools)
         self.parent.apply_isis_button.clicked.connect(self.apply_isis_configurations)
         self.parent.isis_start_button.clicked.connect(self.start_isis_protocol)
         self.parent.isis_stop_button.clicked.connect(self.stop_isis_protocol)
         self.parent.isis_refresh_button.clicked.connect(self.refresh_isis_status)
 
         for b in (self.parent.add_isis_button, self.parent.edit_isis_button,
-                  self.parent.delete_isis_button):
+                  self.parent.delete_isis_button,
+                  self.parent.attach_isis_route_pools_button,
+                  self.parent.detach_isis_route_pools_button):
             isis_controls.addWidget(b)
 
         sep = QLabel()
@@ -543,6 +553,12 @@ class ISISHandler:
                     continue
 
                 # Prepare ISIS configuration data using the configure endpoint (similar to OSPF)
+                # v0.5.213: include route_pools_per_area + all_route_pools
+                # so the server-side `configure_isis_route_advertisement`
+                # can generate the static routes / prefix-list / route-map
+                # for pools the operator attached via the Attach Route
+                # Pools UI. Same shape OSPF uses.
+                all_route_pools = getattr(self.parent.main_window, 'bgp_route_pools', [])
                 isis_data = {
                     "device_id": device_id,
                     "device_name": device_name,
@@ -552,7 +568,9 @@ class ISISHandler:
                     "ipv6": device.get("IPv6", ""),
                     "ipv4_gateway": device.get("IPv4 Gateway", ""),
                     "ipv6_gateway": device.get("IPv6 Gateway", ""),
-                    "isis_config": isis_config
+                    "isis_config": isis_config,
+                    "route_pools_per_area": {},  # Will be populated by server from isis_config["route_pools"]
+                    "all_route_pools": all_route_pools,
                 }
                 
                 # Ensure per-device server URL exists
@@ -1017,6 +1035,12 @@ class ISISHandler:
                             multiplier_item = QTableWidgetItem(str(multiplier))
                             multiplier_item.setFlags(multiplier_item.flags() | Qt.ItemIsEditable)  # Ensure editable
                             self.parent.isis_table.setItem(row, 10, multiplier_item)
+
+                            # Route Pools (column 11) — attached pool names
+                            # for this specific address family. v0.5.213
+                            # parity with OSPF (`ospf_config["route_pools"]`
+                            # dict with "IPv4"/"IPv6" keys).
+                            self._set_isis_route_pools_cell(row, isis_config, protocol_type)
                     else:
                         # No neighbors found or marked for removal, show device status
                         row = self.parent.isis_table.rowCount()
@@ -1111,7 +1135,19 @@ class ISISHandler:
                         multiplier_item = QTableWidgetItem(str(isis_config.get("hello_multiplier", "3")))
                         multiplier_item.setFlags(multiplier_item.flags() | Qt.ItemIsEditable)  # Ensure editable
                         self.parent.isis_table.setItem(row, 10, multiplier_item)
-                        
+
+                        # Route Pools (column 11) — attached pool names
+                        # for this AF. v0.5.213 parity with OSPF. On the
+                        # marked-for-removal row it stays blank so the
+                        # UI reads correctly ("Pending Removal").
+                        if is_marked_for_removal:
+                            self._set_isis_route_pools_cell(row, isis_config, None)
+                        else:
+                            # First row is IPv4 when both are enabled,
+                            # else whichever single AF is enabled.
+                            first_row_af = "IPv4" if ipv4_enabled else ("IPv6" if ipv6_enabled else None)
+                            self._set_isis_route_pools_cell(row, isis_config, first_row_af)
+
                         # If both IPv4 and IPv6 are enabled, create a second row for IPv6
                         if ipv4_enabled and ipv6_enabled and not is_marked_for_removal:
                             row = self.parent.isis_table.rowCount()
@@ -1167,7 +1203,11 @@ class ISISHandler:
                             multiplier_item = QTableWidgetItem(str(isis_config.get("hello_multiplier", "3")))
                             multiplier_item.setFlags(multiplier_item.flags() | Qt.ItemIsEditable)  # Ensure editable
                             self.parent.isis_table.setItem(row, 10, multiplier_item)
-                    
+
+                            # Route Pools (column 11) — IPv6 second-row.
+                            # v0.5.213 parity with OSPF.
+                            self._set_isis_route_pools_cell(row, isis_config, "IPv6")
+
         except Exception as e:
             logger.error(f"Error updating ISIS table: {e}")
         finally:
@@ -1180,6 +1220,42 @@ class ISISHandler:
                 reapply_filter(getattr(self.parent, "_isis_filter_input", None))
             except Exception:
                 pass
+
+
+    def _set_isis_route_pools_cell(self, row, isis_config, protocol_type):
+        """Populate the Route Pools column (index 11) for one ISIS row.
+
+        v0.5.213: mirrors the OSPF handler's per-row Route Pools
+        render (utils/devices_tab_ospf.py:680-697). Reads the
+        `route_pools` dict from `isis_config` under the AF key
+        ("IPv4"/"IPv6"), joins with ", ", and drops a tooltip.
+
+        Args:
+            row: table row index
+            isis_config: the device's ISIS config dict (may be empty)
+            protocol_type: "IPv4", "IPv6", or None (marked-for-removal
+                / no-AF rows get an empty cell)
+        """
+        route_pools_str = ""
+        if isis_config and protocol_type in ("IPv4", "IPv6") and "route_pools" in isis_config:
+            route_pools = isis_config.get("route_pools", {})
+            if isinstance(route_pools, dict):
+                pools_for_family = route_pools.get(protocol_type, [])
+                if isinstance(pools_for_family, list):
+                    route_pools_str = ", ".join(pools_for_family) if pools_for_family else ""
+            elif isinstance(route_pools, list):
+                # Old format — attribute the flat list to IPv4 only so
+                # we don't double-count when both rows are rendered.
+                if protocol_type == "IPv4":
+                    route_pools_str = ", ".join(route_pools) if route_pools else ""
+
+        pool_item = QTableWidgetItem(route_pools_str)
+        if protocol_type in ("IPv4", "IPv6"):
+            pool_item.setToolTip(
+                f"Attached route pools for {protocol_type}: "
+                f"{route_pools_str if route_pools_str else 'None'}"
+            )
+        self.parent.isis_table.setItem(row, 11, pool_item)
 
 
     def set_isis_status_icon(self, row, status, tooltip):
@@ -1307,6 +1383,10 @@ class ISISHandler:
                 return True  # No ISIS config to apply
             
             # Prepare ISIS payload using the configure endpoint
+            # v0.5.213: same route_pools_per_area / all_route_pools
+            # additions as the sync apply path — server needs both to
+            # rebuild the per-pool prefix-list + route-map.
+            all_route_pools = getattr(self.parent.main_window, 'bgp_route_pools', [])
             isis_payload = {
                 "device_id": device_id,
                 "device_name": device_name,
@@ -1316,7 +1396,9 @@ class ISISHandler:
                 "ipv6": device_info.get("IPv6", ""),
                 "ipv4_gateway": device_info.get("IPv4 Gateway", ""),
                 "ipv6_gateway": device_info.get("IPv6 Gateway", ""),
-                "isis_config": isis_config
+                "isis_config": isis_config,
+                "route_pools_per_area": {},  # populated server-side from isis_config["route_pools"]
+                "all_route_pools": all_route_pools,
             }
             
             # Make synchronous request to the configure endpoint
@@ -1763,6 +1845,659 @@ class ISISHandler:
             # Always clear the processing flag, even if there was an error
             if hasattr(self, '_processing_isis_cell_change'):
                 self.parent._processing_isis_cell_change = False
+
+
+    def prompt_attach_route_pools(self):
+        """Open dialog to attach route pools to selected IS-IS devices.
+
+        v0.5.213: ported from utils/devices_tab_ospf.py:prompt_attach_route_pools.
+        Column layout differs: ISIS neighbor-type is column 2 (OSPF has
+        it at column 3). Also preserves the ISIS backward-compat mirror
+        `is_is_config` on every write.
+        """
+        # Get selection from ISIS table (not devices table)
+        selected_items = self.parent.isis_table.selectedItems()
+        if not selected_items:
+            # No rows selected - select all rows
+            total_rows = self.parent.isis_table.rowCount()
+            if total_rows > 0:
+                self.parent.isis_table.selectAll()
+                logger.info(f"[ISIS TABLE] All {total_rows} rows selected")
+                return
+            else:
+                QMessageBox.warning(self.parent, "No IS-IS Devices", "No IS-IS devices are configured. Please add IS-IS configuration first.")
+                return
+
+        # Reuse the BGP route-pool store (same shared pool table used by
+        # BGP and OSPF; no separate ISIS pool store).
+        if not hasattr(self.parent.main_window, 'bgp_route_pools'):
+            self.parent.main_window.bgp_route_pools = []
+
+        available_pools = self.parent.main_window.bgp_route_pools
+
+        if not available_pools:
+            QMessageBox.warning(self.parent, "No Route Pools",
+                              "No route pools have been defined.\n\n"
+                              "Please use \U0001F5C2️ 'Manage Route Pools' button (in Devices tab) to create pools first.")
+            return
+
+        # Collect all selected IS-IS devices with their address families
+        selected_devices = []
+        processed_devices = set()
+
+        for item in selected_items:
+            row = item.row()
+            device_name = self.parent.isis_table.item(row, 0).text()  # Device column
+            # Column 2 is Neighbor Type in the ISIS table (OSPF uses col 3).
+            neighbor_type_item = self.parent.isis_table.item(row, 2)
+            neighbor_type = neighbor_type_item.text() if neighbor_type_item else "IPv4"
+
+            # Clean device name - remove any suffixes like "(Pending Removal)"
+            clean_device_name = device_name.split(" (")[0].strip()
+            if clean_device_name != device_name:
+                device_name = clean_device_name
+
+            # Create unique key for device + address family
+            device_key = f"{device_name}:{neighbor_type}"
+            if device_key in processed_devices:
+                continue
+            processed_devices.add(device_key)
+
+            # Find device in all_devices using safe helper
+            device_info = self.parent._find_device_by_name(device_name)
+
+            if not device_info:
+                logger.warning(f"[ISIS ROUTE POOLS] Warning: Could not find device '{device_name}'")
+                continue
+
+            # Ensure device_info is a dictionary - handle list case
+            if not isinstance(device_info, dict):
+                logger.warning(f"[ISIS ROUTE POOLS] Warning: device_info is not a dict for '{device_name}', it's {type(device_info)}")
+                if isinstance(device_info, list) and len(device_info) > 0:
+                    logger.info(f"[ISIS ROUTE POOLS] Attempting to extract dict from list...")
+                    device_info = device_info[0] if isinstance(device_info[0], dict) else None
+                    if device_info is None:
+                        continue
+                else:
+                    continue
+
+            if not isinstance(device_info, dict):
+                logger.error(f"[ISIS ROUTE POOLS] Final check failed: device_info is still not a dict for '{device_name}'")
+                continue
+
+            # Check that IS-IS is in the protocols list. Accept both
+            # "IS-IS" and "ISIS" — both spellings appear in the codebase.
+            protocols = device_info.get("protocols", [])
+            if isinstance(protocols, str):
+                try:
+                    import json
+                    protocols = json.loads(protocols)
+                except Exception:
+                    protocols = []
+
+            has_isis = False
+            if isinstance(protocols, list):
+                has_isis = "IS-IS" in protocols or "ISIS" in protocols
+            elif isinstance(protocols, dict):
+                has_isis = "IS-IS" in protocols or "ISIS" in protocols
+            if not has_isis:
+                logger.warning(f"[ISIS ROUTE POOLS] Warning: Device '{device_name}' does not have IS-IS configured")
+                continue
+
+            # Get the actual IS-IS configuration (support both storage keys).
+            isis_config = device_info.get("isis_config", {}) or device_info.get("is_is_config", {})
+            if not isis_config:
+                logger.warning(f"[ISIS ROUTE POOLS] Warning: Device '{device_name}' does not have IS-IS configuration")
+                continue
+
+            selected_devices.append({
+                "device_name": device_name,
+                "device_info": device_info,
+                "isis_config": isis_config,
+                "address_family": neighbor_type,
+            })
+
+        if not selected_devices:
+            QMessageBox.warning(self.parent, "No Valid IS-IS Devices",
+                              "No valid IS-IS devices found in the selection.")
+            return
+
+        # Single-device path: reuse the shared AttachRoutePoolsDialog.
+        if len(selected_devices) == 1:
+            device_data = selected_devices[0]
+            device_name = device_data["device_name"]
+            isis_config = device_data["isis_config"]
+            address_family = device_data.get("address_family", "IPv4")
+
+            route_pools_dict = isis_config.get("route_pools", {})
+            if isinstance(route_pools_dict, list):
+                route_pools_dict = {"IPv4": route_pools_dict, "IPv6": []}
+            elif not isinstance(route_pools_dict, dict):
+                route_pools_dict = {}
+
+            attached_pool_names = route_pools_dict.get(address_family, [])
+            if not isinstance(attached_pool_names, list):
+                attached_pool_names = []
+
+            # AttachRoutePoolsDialog filters pools by the ipv4_enabled /
+            # ipv6_enabled hints — pass a synthetic config that flags the
+            # AF the operator picked, same shape the OSPF handler uses.
+            isis_config_for_dialog = {
+                "ipv4_enabled": address_family == "IPv4",
+                "ipv6_enabled": address_family == "IPv6",
+            }
+
+            from widgets.add_bgp_route_dialog import AttachRoutePoolsDialog
+            dialog = AttachRoutePoolsDialog(self.parent,
+                                            device_name=f"{device_name} ({address_family})",
+                                            available_pools=available_pools,
+                                            attached_pools=attached_pool_names,
+                                            bgp_config=isis_config_for_dialog)
+            if dialog.exec_() != dialog.Accepted:
+                return
+
+            selected_pools = dialog.get_attached_pools()
+
+            if "route_pools" not in isis_config or not isinstance(isis_config["route_pools"], dict):
+                existing_list = isis_config.get("route_pools", [])
+                if isinstance(existing_list, list):
+                    isis_config["route_pools"] = {"IPv4": existing_list if address_family == "IPv4" else [],
+                                                   "IPv6": existing_list if address_family == "IPv6" else []}
+                else:
+                    isis_config["route_pools"] = {"IPv4": [], "IPv6": []}
+
+            isis_config["route_pools"][address_family] = selected_pools
+
+            # Keep the legacy `is_is_config` mirror in sync so any code
+            # path that still reads it (see prompt_delete_isis line ~317)
+            # sees the same pool set.
+            device_data["device_info"]["isis_config"] = isis_config
+            device_data["device_info"]["is_is_config"] = isis_config
+            device_data["device_info"]["_needs_apply"] = True
+
+            self.parent.main_window.save_session()
+            self.update_isis_table()
+
+            total_routes = 0
+            for pool_name in selected_pools:
+                for pool in available_pools:
+                    if pool["name"] == pool_name:
+                        total_routes += pool["count"]
+                        break
+
+            logger.info(f"[ISIS ROUTE POOLS] Attached {len(selected_pools)} pool(s) ({total_routes} routes) to IS-IS device '{device_name}'")
+            QMessageBox.information(self.parent, "Route Pools Attached",
+                                  f"Attached {len(selected_pools)} route pool(s) to IS-IS device.\n\n"
+                                  f"Device: {device_name}\n"
+                                  f"Total routes to advertise: {total_routes}\n\n"
+                                  f"Click 'Apply IS-IS' to configure routes on server.")
+            return
+
+        # Multi-device path: bulk dialog grouped by AF.
+        from PyQt5.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QListWidget, QPushButton, QDialogButtonBox, QCheckBox, QGroupBox
+
+        address_families_in_selection = set()
+        devices_by_family = {}
+        for device_data in selected_devices:
+            address_family = device_data.get("address_family", "IPv4")
+            address_families_in_selection.add(address_family)
+            if address_family not in devices_by_family:
+                devices_by_family[address_family] = []
+            devices_by_family[address_family].append(device_data)
+
+        class BulkAttachRoutePoolsDialog(QDialog):
+            def __init__(self, parent, selected_devices, available_pools, address_families):
+                super().__init__(parent)
+                self.selected_devices = selected_devices
+                self.available_pools = available_pools
+                self.address_families = address_families
+                self.setWindowTitle("Attach Route Pools to Multiple IS-IS Configurations")
+                self.setFixedSize(650, 500)
+                self.setup_ui()
+
+            def setup_ui(self):
+                layout = QVBoxLayout(self)
+
+                devices_group = QGroupBox("Selected IS-IS Configurations")
+                devices_layout = QVBoxLayout(devices_group)
+
+                from collections import defaultdict
+                devices_by_family = defaultdict(list)
+                for device_data in self.selected_devices:
+                    device_name = device_data["device_name"]
+                    address_family = device_data.get("address_family", "IPv4")
+                    devices_by_family[device_name].append(address_family)
+
+                devices_text_parts = []
+                for device_name, families in sorted(devices_by_family.items()):
+                    families_str = ", ".join(sorted(set(families)))
+                    devices_text_parts.append(f"  • {device_name}: {families_str}")
+
+                devices_text = f"Selected {len(self.selected_devices)} IS-IS configuration(s):\n" + "\n".join(devices_text_parts)
+                devices_label = QLabel(devices_text)
+                devices_label.setWordWrap(True)
+                devices_layout.addWidget(devices_label)
+                layout.addWidget(devices_group)
+
+                filtered_pools = []
+                for pool in self.available_pools:
+                    pool_af = pool.get("address_family", "").lower()
+                    if not pool_af:
+                        subnet = pool.get("subnet", "")
+                        pool_af = "ipv6" if ":" in subnet else "ipv4"
+                    pool_af_isis = "IPv4" if pool_af == "ipv4" else "IPv6"
+                    if pool_af_isis in self.address_families:
+                        filtered_pools.append(pool)
+
+                pools_group = QGroupBox(f"Available Route Pools (for {', '.join(sorted(self.address_families))})")
+                pools_layout = QVBoxLayout(pools_group)
+
+                if not filtered_pools:
+                    no_pools_label = QLabel(f"No route pools available for {', '.join(sorted(self.address_families))}.\n\n"
+                                          f"Please create pools matching these address families first.")
+                    no_pools_label.setStyleSheet("color: #888; font-style: italic; padding: 20px;")
+                    no_pools_label.setAlignment(Qt.AlignCenter)
+                    pools_layout.addWidget(no_pools_label)
+                    self.pools_list = None
+                else:
+                    self.pools_list = QListWidget()
+                    self.pools_list.setSelectionMode(QListWidget.MultiSelection)
+                    for pool in filtered_pools:
+                        pool_af = pool.get("address_family", "").lower()
+                        if not pool_af:
+                            subnet = pool.get("subnet", "")
+                            pool_af = "ipv6" if ":" in subnet else "ipv4"
+                        pool_af_display = pool_af.upper()
+                        pool_item = f"{pool['name']} - {pool['subnet']} ({pool['count']} routes) [{pool_af_display}]"
+                        self.pools_list.addItem(pool_item)
+                    pools_layout.addWidget(self.pools_list)
+
+                layout.addWidget(pools_group)
+
+                self.summary_label = QLabel()
+                self.summary_label.setStyleSheet("background: #e8f4f8; padding: 10px; border-radius: 3px;")
+                if self.pools_list is not None:
+                    self.pools_list.itemSelectionChanged.connect(self.update_summary)
+                self.update_summary()
+                layout.addWidget(self.summary_label)
+
+                button_box = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+                if self.pools_list is None:
+                    button_box.button(QDialogButtonBox.Ok).setEnabled(False)
+                    button_box.button(QDialogButtonBox.Ok).setToolTip("No route pools available for selected address families")
+                else:
+                    button_box.button(QDialogButtonBox.Ok).setEnabled(True)
+                    button_box.button(QDialogButtonBox.Ok).setToolTip("Click OK to attach selected pools (or deselect all to remove pools)")
+                button_box.accepted.connect(self.accept)
+                button_box.rejected.connect(self.reject)
+                layout.addWidget(button_box)
+
+            def update_summary(self):
+                if self.pools_list is None:
+                    self.summary_label.setText("No pools available")
+                    return
+                selected_items = self.pools_list.selectedItems()
+                selected_count = len(selected_items)
+                total_routes = 0
+                for item in selected_items:
+                    text = item.text()
+                    parts = text.split(" (")
+                    if len(parts) >= 2:
+                        count_part = parts[1].split(" routes")[0]
+                        try:
+                            total_routes += int(count_part)
+                        except Exception:
+                            pass
+                if selected_count == 0:
+                    self.summary_label.setText("No pools selected (deselect all to remove pools)")
+                else:
+                    self.summary_label.setText(f"✅ Selected {selected_count} pool(s) → Total {total_routes} routes to advertise")
+
+            def get_selected_pools(self):
+                if self.pools_list is None:
+                    return []
+                selected_items = self.pools_list.selectedItems()
+                selected_pool_names = []
+                for item in selected_items:
+                    pool_name = item.text().split(" - ")[0]
+                    selected_pool_names.append(pool_name)
+                return selected_pool_names
+
+        dialog = BulkAttachRoutePoolsDialog(self.parent, selected_devices, available_pools, address_families_in_selection)
+        if dialog.exec_() != dialog.Accepted:
+            return
+
+        selected_pools = dialog.get_selected_pools()
+
+        if not selected_pools:
+            if dialog.pools_list is None:
+                address_families_str = ", ".join(sorted(address_families_in_selection))
+                QMessageBox.warning(self.parent, "No Pools Available",
+                                  f"No route pools are available for {address_families_str}.\n\n"
+                                  f"Please create pools matching these address families first.")
+                return
+            # User intentionally deselected all — treat as bulk detach.
+            removed_count = 0
+            ipv4_removed = 0
+            ipv6_removed = 0
+
+            for device_data in selected_devices:
+                device_name = device_data["device_name"]
+                isis_config = device_data["isis_config"]
+                address_family = device_data.get("address_family", "IPv4")
+
+                if "route_pools" not in isis_config or not isinstance(isis_config["route_pools"], dict):
+                    existing_list = isis_config.get("route_pools", [])
+                    if isinstance(existing_list, list):
+                        isis_config["route_pools"] = {"IPv4": existing_list if address_family == "IPv4" else [],
+                                                       "IPv6": existing_list if address_family == "IPv6" else []}
+                    else:
+                        isis_config["route_pools"] = {"IPv4": [], "IPv6": []}
+
+                existing_pools = isis_config["route_pools"].get(address_family, [])
+                if existing_pools:
+                    removed_count += 1
+                    if address_family == "IPv4":
+                        ipv4_removed += 1
+                    else:
+                        ipv6_removed += 1
+                    isis_config["route_pools"][address_family] = []
+                    device_data["device_info"]["isis_config"] = isis_config
+                    device_data["device_info"]["is_is_config"] = isis_config
+                    device_data["device_info"]["_needs_apply"] = True
+
+            if removed_count > 0:
+                self.parent.main_window.save_session()
+                self.update_isis_table()
+
+                removed_parts = []
+                if ipv4_removed > 0:
+                    removed_parts.append(f"IPv4: {ipv4_removed} configuration(s)")
+                if ipv6_removed > 0:
+                    removed_parts.append(f"IPv6: {ipv6_removed} configuration(s)")
+                removed_text = "\n".join(removed_parts) if removed_parts else "No configurations"
+
+                logger.info(f"[ISIS ROUTE POOLS] Removed all pools from {removed_count} IS-IS configuration(s): {removed_text}")
+                QMessageBox.information(self.parent, "Route Pools Removed",
+                                      f"Successfully removed all route pools from {removed_count} IS-IS configuration(s):\n\n"
+                                      f"{removed_text}\n\n"
+                                      f"Click 'Apply IS-IS' to update configuration on server.")
+            else:
+                QMessageBox.information(self.parent, "No Pools to Remove",
+                                      "No route pools were attached to the selected configurations.")
+            return
+
+        # Split selected pools by AF and push them into each device's
+        # matching AF slot.
+        pools_by_af = {"IPv4": [], "IPv6": []}
+        for pool_name in selected_pools:
+            for pool in available_pools:
+                if pool["name"] == pool_name:
+                    pool_af = pool.get("address_family", "").lower()
+                    if not pool_af:
+                        subnet = pool.get("subnet", "")
+                        pool_af = "ipv6" if ":" in subnet else "ipv4"
+                    pool_af_isis = "IPv4" if pool_af == "ipv4" else "IPv6"
+                    pools_by_af[pool_af_isis].append(pool_name)
+                    break
+
+        total_devices = 0
+        total_routes = 0
+        devices_by_name = {}
+        ipv4_count = 0
+        ipv6_count = 0
+
+        for device_data in selected_devices:
+            device_name = device_data["device_name"]
+            isis_config = device_data["isis_config"]
+            address_family = device_data.get("address_family", "IPv4")
+
+            pools_for_this_af = pools_by_af.get(address_family, [])
+            if not pools_for_this_af:
+                logger.info(f"[ISIS ROUTE POOLS] Skipping {device_name} ({address_family}) - no pools selected for this address family")
+                continue
+
+            if "route_pools" not in isis_config or not isinstance(isis_config["route_pools"], dict):
+                existing_list = isis_config.get("route_pools", [])
+                if isinstance(existing_list, list):
+                    isis_config["route_pools"] = {"IPv4": existing_list if address_family == "IPv4" else [],
+                                                   "IPv6": existing_list if address_family == "IPv6" else []}
+                else:
+                    isis_config["route_pools"] = {"IPv4": [], "IPv6": []}
+
+            isis_config["route_pools"][address_family] = pools_for_this_af
+            device_data["device_info"]["isis_config"] = isis_config
+            device_data["device_info"]["is_is_config"] = isis_config
+            device_data["device_info"]["_needs_apply"] = True
+
+            if device_name not in devices_by_name:
+                devices_by_name[device_name] = True
+                total_devices += 1
+
+            if address_family == "IPv4":
+                ipv4_count += 1
+            else:
+                ipv6_count += 1
+
+            for pool_name in pools_for_this_af:
+                for pool in available_pools:
+                    if pool["name"] == pool_name:
+                        total_routes += pool["count"]
+                        break
+
+        self.parent.main_window.save_session()
+        self.update_isis_table()
+
+        summary_parts = []
+        if ipv4_count > 0:
+            ipv4_pools = pools_by_af.get("IPv4", [])
+            if ipv4_pools:
+                summary_parts.append(f"IPv4: {len(ipv4_pools)} pool(s) to {ipv4_count} configuration(s)")
+        if ipv6_count > 0:
+            ipv6_pools = pools_by_af.get("IPv6", [])
+            if ipv6_pools:
+                summary_parts.append(f"IPv6: {len(ipv6_pools)} pool(s) to {ipv6_count} configuration(s)")
+
+        if not summary_parts:
+            QMessageBox.warning(self.parent, "No Pools Attached",
+                              "No route pools were attached.\n\n"
+                              "Please ensure you selected pools matching the address families of the selected configurations.")
+            return
+
+        summary_text = "\n".join(summary_parts)
+
+        logger.info(f"[ISIS ROUTE POOLS] Attached pools to {total_devices} IS-IS device(s): {summary_text}")
+        QMessageBox.information(self.parent, "Route Pools Attached",
+                              f"Successfully attached route pools to {total_devices} IS-IS configuration(s):\n\n"
+                              f"{summary_text}\n\n"
+                              f"Total routes to advertise: {total_routes}\n\n"
+                              f"Click 'Apply IS-IS' to configure routes on server.")
+
+
+    def prompt_detach_route_pools(self):
+        """Detach route pools from selected IS-IS configurations.
+
+        v0.5.213: ported from utils/devices_tab_ospf.py:prompt_detach_route_pools.
+        ISIS column layout: Neighbor Type is column 2 (OSPF has it at
+        column 3). Preserves the `is_is_config` legacy mirror.
+        """
+        selected_items = self.parent.isis_table.selectedItems()
+        if not selected_items:
+            total_rows = self.parent.isis_table.rowCount()
+            if total_rows > 0:
+                self.parent.isis_table.selectAll()
+                logger.info(f"[ISIS TABLE] All {total_rows} rows selected")
+                return
+            else:
+                QMessageBox.warning(self.parent, "No IS-IS Devices", "No IS-IS devices are configured.")
+                return
+
+        selected_devices = []
+        processed_devices = set()
+
+        for item in selected_items:
+            row = item.row()
+            device_name = self.parent.isis_table.item(row, 0).text()  # Device column
+            # Column 2 for Neighbor Type in ISIS table (OSPF uses col 3).
+            neighbor_type_item = self.parent.isis_table.item(row, 2)
+            neighbor_type = neighbor_type_item.text() if neighbor_type_item else "IPv4"
+
+            clean_device_name = device_name.split(" (")[0].strip()
+            if clean_device_name != device_name:
+                device_name = clean_device_name
+
+            device_key = f"{device_name}:{neighbor_type}"
+            if device_key in processed_devices:
+                continue
+            processed_devices.add(device_key)
+
+            device_info = self.parent._find_device_by_name(device_name)
+            if not device_info:
+                logger.warning(f"[ISIS ROUTE POOLS] Warning: Could not find device '{device_name}'")
+                continue
+
+            if not isinstance(device_info, dict):
+                logger.warning(f"[ISIS ROUTE POOLS] Warning: device_info is not a dict for '{device_name}', it's {type(device_info)}")
+                if isinstance(device_info, list) and len(device_info) > 0:
+                    device_info = device_info[0] if isinstance(device_info[0], dict) else None
+                    if device_info is None:
+                        continue
+                else:
+                    continue
+
+            if not isinstance(device_info, dict):
+                continue
+
+            protocols = device_info.get("protocols", [])
+            if isinstance(protocols, str):
+                try:
+                    import json
+                    protocols = json.loads(protocols)
+                except Exception:
+                    protocols = []
+
+            has_isis = False
+            if isinstance(protocols, list):
+                has_isis = "IS-IS" in protocols or "ISIS" in protocols
+            elif isinstance(protocols, dict):
+                has_isis = "IS-IS" in protocols or "ISIS" in protocols
+            if not has_isis:
+                logger.warning(f"[ISIS ROUTE POOLS] Warning: Device '{device_name}' does not have IS-IS configured")
+                continue
+
+            isis_config = device_info.get("isis_config", {}) or device_info.get("is_is_config", {})
+            if not isis_config:
+                logger.warning(f"[ISIS ROUTE POOLS] Warning: Device '{device_name}' does not have IS-IS configuration")
+                continue
+
+            route_pools_data = isis_config.get("route_pools", {})
+            has_pools = False
+            if isinstance(route_pools_data, dict):
+                pools_for_family = route_pools_data.get(neighbor_type, [])
+                has_pools = bool(pools_for_family and len(pools_for_family) > 0)
+            elif isinstance(route_pools_data, list):
+                has_pools = bool(neighbor_type == "IPv4" and route_pools_data and len(route_pools_data) > 0)
+
+            if not has_pools:
+                continue
+
+            selected_devices.append({
+                "device_name": device_name,
+                "device_info": device_info,
+                "isis_config": isis_config,
+                "address_family": neighbor_type,
+            })
+
+        if not selected_devices:
+            QMessageBox.information(self.parent, "No Route Pools",
+                                  "No route pools are attached to the selected IS-IS configurations.")
+            return
+
+        # Ask for confirmation
+        if len(selected_devices) == 1:
+            device_data = selected_devices[0]
+            device_name = device_data["device_name"]
+            address_family = device_data.get("address_family", "IPv4")
+
+            reply = QMessageBox.question(self.parent, "Detach Route Pools",
+                                        f"Detach all route pools from {device_name} ({address_family})?\n\n"
+                                        f"This will remove all attached route pools for this configuration.",
+                                        QMessageBox.Yes | QMessageBox.No,
+                                        QMessageBox.No)
+        else:
+            from collections import defaultdict
+            devices_by_family = defaultdict(list)
+            for device_data in selected_devices:
+                device_name = device_data["device_name"]
+                address_family = device_data.get("address_family", "IPv4")
+                devices_by_family[device_name].append(address_family)
+
+            summary_parts = []
+            for device_name, families in sorted(devices_by_family.items()):
+                families_str = ", ".join(sorted(set(families)))
+                summary_parts.append(f"  • {device_name}: {families_str}")
+
+            summary_text = "\n".join(summary_parts)
+
+            reply = QMessageBox.question(self.parent, "Detach Route Pools",
+                                        f"Detach all route pools from {len(selected_devices)} IS-IS configuration(s)?\n\n"
+                                        f"Selected configurations:\n{summary_text}\n\n"
+                                        f"This will remove all attached route pools for these configurations.",
+                                        QMessageBox.Yes | QMessageBox.No,
+                                        QMessageBox.No)
+
+        if reply != QMessageBox.Yes:
+            return
+
+        total_detached = 0
+        ipv4_count = 0
+        ipv6_count = 0
+
+        for device_data in selected_devices:
+            device_name = device_data["device_name"]
+            isis_config = device_data["isis_config"]
+            address_family = device_data.get("address_family", "IPv4")
+
+            if "route_pools" not in isis_config or not isinstance(isis_config["route_pools"], dict):
+                existing_list = isis_config.get("route_pools", [])
+                if isinstance(existing_list, list):
+                    isis_config["route_pools"] = {"IPv4": existing_list if address_family == "IPv4" else [],
+                                                   "IPv6": existing_list if address_family == "IPv6" else []}
+                else:
+                    isis_config["route_pools"] = {"IPv4": [], "IPv6": []}
+
+            if address_family in isis_config["route_pools"]:
+                pools_count = len(isis_config["route_pools"][address_family])
+                isis_config["route_pools"][address_family] = []
+                total_detached += 1
+
+                if address_family == "IPv4":
+                    ipv4_count += 1
+                else:
+                    ipv6_count += 1
+
+                logger.info(f"[ISIS ROUTE POOLS] Detached {pools_count} pool(s) from {device_name} ({address_family})")
+
+            device_data["device_info"]["isis_config"] = isis_config
+            device_data["device_info"]["is_is_config"] = isis_config
+            device_data["device_info"]["_needs_apply"] = True
+
+        self.parent.main_window.save_session()
+        self.update_isis_table()
+
+        summary_parts = []
+        if ipv4_count > 0:
+            summary_parts.append(f"IPv4: {ipv4_count} configuration(s)")
+        if ipv6_count > 0:
+            summary_parts.append(f"IPv6: {ipv6_count} configuration(s)")
+
+        summary_text = "\n".join(summary_parts) if summary_parts else "No configurations"
+
+        logger.info(f"[ISIS ROUTE POOLS] Detached route pools from {total_detached} IS-IS configuration(s): {summary_text}")
+        QMessageBox.information(self.parent, "Route Pools Detached",
+                              f"Successfully detached route pools from {total_detached} IS-IS configuration(s):\n\n"
+                              f"{summary_text}\n\n"
+                              f"Click 'Apply IS-IS' to update configuration on server.")
 
 
     def prompt_add_isis(self):
