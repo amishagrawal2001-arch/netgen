@@ -2,6 +2,63 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.206] - 2026-08-23
+
+**OSPF status stops lying green when the FRR container is
+gone.**
+
+Operator report on JNPR-MAC-HWXVX1 2026-08-23: `sudo docker ps`
+on srv06 showed no `device_*` container for the OSPF-configured
+device, but the netgen client still displayed a green OSPF row
+with `10.254.0.102 Full/Backup`, priority 128, dead-timer ~33s
+counting down, uptime ~49s — a completely live-looking
+adjacency that hadn't existed for minutes/hours.
+
+Root cause: the client polls
+`/api/ospf/status/database/<device_id>`, which reads the DB
+snapshot written by `OSPFStatusMonitor`. Pre-fix
+`_check_single_device_ospf_status` returned `None` when the
+underlying `/api/ospf/status/<id>` endpoint returned 404
+(container missing), and `_check_ospf_status_batch` silently
+skipped the DB update on None (`if ospf_status: ... else:
+logger.info(...)`). So the last-known Full/Backup snapshot
+stayed frozen in the DB indefinitely, and the client faithfully
+displayed it.
+
+ISIS monitor (`utils/isis_monitor.py:180-206`) already handles
+this case correctly — writes an all-down snapshot when the
+container is missing. OSPF was the parity gap.
+
+Fix: on 404, `_check_single_device_ospf_status` now returns a
+synthesized "all down" status dict (`ospf_established=False`,
+`ospf_state='Down'`, `neighbors=[]`, all `*_running` and
+`*_established` flags False, uptimes None). The caller writes
+that through to the DB via `_update_device_ospf_status`, and
+the UI shows Down within one monitor cycle (~10s). Transient
+5xx / network errors still return None (skip the update) so the
+UI doesn't flap on brief server stumbles.
+
+BGP monitor was checked: it already writes an all-down state
+when the container is missing (its status endpoint returns 200
+with an empty neighbors array rather than 404, so the existing
+200-parse path produces the correct empty write). No change
+needed there.
+
+Files touched:
+- `utils/ospf_monitor.py:_check_single_device_ospf_status` —
+  404 branch now synthesizes an all-down status dict.
+
+Tests: `tests/test_v05206_ospf_monitor_clear_stale.py` — 5
+tests (404 returns synthesized down not None, 404 flows
+through to DB clear, non-404-non-200 still returns None, 200
+with real status passes through unchanged, source-level
+lock-in).
+
+**Operator note:** After upgrading the server on srv06 and
+restarting, the stale OSPF row will clear on the next monitor
+tick (~10s). No client-side change required for this fix — the
+client just reads whatever the DB says.
+
 ## [0.5.205] - 2026-08-23
 
 **Add OSPF now honors the AF the user picked; Delete OSPF is

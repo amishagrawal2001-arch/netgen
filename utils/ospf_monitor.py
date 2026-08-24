@@ -197,9 +197,33 @@ class OSPFStatusMonitor:
                 logger.info(f"[OSPF MONITOR] Extracted OSPF status: {ospf_status}")
                 return ospf_status
             elif response.status_code == 404:
-                # Device not found or container doesn't exist - this is normal for deleted devices
-                logger.info(f"[OSPF MONITOR] Device {device_id} not found or container missing (404)")
-                return None
+                # v0.5.206: FRR container missing → return a
+                # synthesized "all down" status rather than
+                # None. Pre-fix the caller silently skipped
+                # the DB update on None, so the last
+                # non-empty snapshot stayed frozen — operator
+                # report on JNPR-MAC-HWXVX1 2026-08-23:
+                # `docker ps` showed no device container but
+                # netgen still displayed 10.254.0.102
+                # Full/Backup with a live-looking dead-timer
+                # counter. ISIS monitor already does this
+                # (utils/isis_monitor.py around line 180);
+                # OSPF and BGP were the parity gap.
+                logger.info(
+                    f"[OSPF MONITOR] Device {device_id} container missing "
+                    f"(404) — synthesizing all-down status to clear stale DB"
+                )
+                return {
+                    'ospf_established': False,
+                    'ospf_state': 'Down',
+                    'neighbors': [],
+                    'ospf_ipv4_running': False,
+                    'ospf_ipv6_running': False,
+                    'ospf_ipv4_established': False,
+                    'ospf_ipv6_established': False,
+                    'ospf_ipv4_uptime': None,
+                    'ospf_ipv6_uptime': None,
+                }
             else:
                 logger.warning(f"[OSPF MONITOR] Failed to get OSPF status for device {device_id}: HTTP {response.status_code}")
                 return None
