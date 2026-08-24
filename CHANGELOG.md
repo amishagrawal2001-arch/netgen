@@ -2,6 +2,63 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.204] - 2026-08-23
+
+**Paid licenses stop getting silently invalidated on every VPN
+toggle / WiFi/Ethernet switch.**
+
+Operator report on JNPR-MAC-HWXVX1 2026-08-23: activated a paid
+JWT, worked once, then every subsequent client restart dropped
+straight back to the activation screen even though
+`~/.netgen/license.jwt` was still on disk with a valid RS256
+signature. Root cause: `machine_fingerprint()` mixed in
+`uuid.getnode()`, which returns whichever NIC's MAC Python
+happens to sample at import time. On macOS/Linux with WiFi +
+Ethernet + VPN utun* the "sampled" NIC rotates whenever the
+active interface changes, so the fingerprint the JWT was bound
+to (`7c1e1671…`) stopped matching what the client computed
+(`54f7e766…`) and verify_jwt returned `license is bound to a
+different machine`. From the operator's perspective the license
+just "gets lost every restart".
+
+Fixes:
+
+1. **Drop `_stable_mac()` from `machine_fingerprint()` inputs.**
+   The stable inputs are now `socket.gethostname()`,
+   `platform.node()`, `platform.machine()`, and the persistent
+   `~/.netgen/fingerprint.salt` (16 random bytes generated on
+   first launch). Salt was already load-bearing for uniqueness
+   across installs — dropping the MAC doesn't cost anything on
+   that front, and the salt survives reboots, package reinstalls,
+   VPN toggles, and NIC swaps.
+2. **Add `_legacy_machine_fingerprint()`.** Preserves the exact
+   old MAC-inclusive algorithm — verify_jwt accepts EITHER, so
+   paid JWTs minted against the old algorithm keep working while
+   the operator re-issues against the new stable fingerprint.
+   Two-rung migration; no hard cut-over.
+3. Server-side `device_fingerprint_hash` validation is a
+   64-char hex regex only (tlink-license-server
+   `users.js:359`) — the content is entirely client-defined,
+   so this change is compatible with existing mint code.
+
+Files touched:
+- `utils/license.py` — `machine_fingerprint()` (drop MAC),
+  new `_legacy_machine_fingerprint()`, `verify_jwt` fingerprint
+  check accepts both.
+
+Tests: `tests/test_v05204_stable_fingerprint.py` — 6 tests
+(stability under `_stable_mac` drift, legacy still MAC-varying,
+salt still load-bearing, verify_jwt accepts new AND legacy AND
+rejects random).
+
+**Operator note:** After upgrading, get the new stable
+fingerprint with `venv/bin/python -c "from utils import license;
+print(license.machine_fingerprint())"` and re-issue the paid JWT
+against it via tlink-license-server. Until you do, the current
+JWT still verifies as long as your current MAC matches the one
+captured when it was minted (that's what the legacy accept is
+for).
+
 ## [0.5.203] - 2026-08-23
 
 **Add OSPF / Add ISIS now show up in the protocol table

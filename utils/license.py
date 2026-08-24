@@ -176,21 +176,51 @@ class License:
 def machine_fingerprint() -> str:
     """Return a 64-char hex SHA-256 fingerprint of this machine.
 
-    Server validates fingerprints against a 64-char hex regex only
-    (users.js:359) — the CONTENT is entirely client-defined. This
-    algorithm hashes over:
-      * MAC address (stable within a boot; can change on re-image)
-      * Hostname
-      * Platform node (usually the same as hostname on modern OSes)
-      * Machine architecture
-      * `~/.netgen/fingerprint.salt` — persisted random bytes so a
-        reinstall on the same box produces a stable fingerprint
-        even if the MAC or hostname changes.
+    v0.5.204: dropped `uuid.getnode()` from the input set. The MAC
+    that `getnode()` returns is whichever interface Python happens
+    to sample at import time — on macOS/Linux with multiple
+    interfaces (WiFi + Ethernet + VPN utun*) this rotates as the
+    active NIC changes, silently invalidating every paid JWT the
+    moment the operator toggled a VPN or plugged in an Ethernet
+    cable. Operator report on JNPR-MAC-HWXVX1 2026-08-23: paid
+    JWT bound to fingerprint 7c1e1671..., machine reports
+    54f7e766... after VPN change; every restart hit the
+    activation screen. Now the fingerprint mixes only inputs that
+    are stable across network state:
+      * `socket.gethostname()` — user-configurable but doesn't
+        change without an explicit rename
+      * `platform.node()` — same as hostname on most OSes;
+        included to keep the payload shape identical to prior
+        legacy runs so migration diagnostics can compute both
+      * `platform.machine()` — CPU architecture; never changes
+      * `~/.netgen/fingerprint.salt` — 16 random bytes generated
+        on first launch and preserved; the load-bearing piece
 
-    Deliberately does NOT include disk serial / CPU serial — those
-    require platform-specific ioctls / vendor tools that don't
-    ship on stripped-down lab hosts.
+    Server validates fingerprints against a 64-char hex regex
+    only (users.js:359) — the CONTENT is entirely client-defined,
+    so this change is compatible with existing tlink-license-
+    server mint / verify code.
+
+    For backward-compat with paid JWTs minted against the OLD
+    algorithm, `verify_jwt` also accepts the legacy fingerprint
+    (see `_legacy_machine_fingerprint`).
     """
+    parts: List[str] = [
+        socket.gethostname(),
+        platform.node(),
+        platform.machine(),
+        _persistent_salt(),
+    ]
+    payload = "|".join(parts).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _legacy_machine_fingerprint() -> str:
+    """Pre-v0.5.204 fingerprint that included `uuid.getnode()`.
+    Kept ONLY so `verify_jwt` can still accept a JWT bound to
+    the old fingerprint while the operator hasn't re-issued
+    against the new stable one yet. Removed in a future release
+    once every deployed JWT has cycled."""
     parts: List[str] = [
         _stable_mac(),
         socket.gethostname(),
@@ -413,8 +443,16 @@ def _check_payload(payload: Dict[str, Any],
         return f"entitlement expired on {end_date.isoformat()}"
     fingerprint = payload.get("device_fingerprint_hash")
     if fingerprint and not allow_fingerprint_mismatch:
+        # v0.5.204: accept BOTH the new stable fingerprint AND the
+        # legacy (MAC-inclusive) fingerprint. Pre-fix a paid JWT
+        # bound to the legacy fingerprint was silently invalidated
+        # every time `uuid.getnode()` returned a different NIC's
+        # MAC (VPN toggle, WiFi/Ethernet switch); with the dual
+        # accept the JWT keeps working while the operator schedules
+        # a re-issue against the new stable fingerprint.
         local = machine_fingerprint()
-        if fingerprint != local:
+        legacy = _legacy_machine_fingerprint()
+        if fingerprint not in (local, legacy):
             return (
                 "license is bound to a different machine — the "
                 f"fingerprint in the token doesn't match this "
