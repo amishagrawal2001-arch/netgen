@@ -2,6 +2,75 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.215] - 2026-08-23
+
+**Device Status column transitions from "Starting..." to
+"Running" reliably; refresh reflects DB truth even on client-
+side timeout.**
+
+Operator report on JNPR-MAC-HWXVX1 2026-08-23 (Devices tab):
+"stopped device using stop selected device, as expected all
+protocols status showing stopped. When started device, all
+protocol came up fine after sometime, however device status
+still showing starting. When clicked refresh device, status
+moved to stop, though protocol status looks green."
+
+Two overlapping bugs kept the client's Status column stale:
+
+1. **`DeviceOperationWorker` didn't sync in-memory Status
+   before emitting the row-update signal.** It emitted
+   `device_status_updated(row, "Starting", ...)` but didn't
+   flip `device_info["Status"]` to match. Meanwhile
+   `poll_device_status` (line ~10058) only refreshes rows
+   whose in-memory Status is "Running" or "Starting" — if
+   Status was still "Stopped" from the prior stop, the poll
+   skipped the row and the yellow "Starting..." dot lingered
+   forever.
+2. **`_on_device_operation_finished` gated the DB refresh on
+   `if successful_count > 0`.** On a 30 s client-side timeout
+   the POST raised → failed_count++, successful_count stayed
+   0 → NO `_refresh_device_table_from_database` call → the
+   row never got to see the true DB state.
+
+Fixes:
+- `DeviceOperationWorker.run()` sets `device_info["Status"]`
+  to `"Starting"` / `"Stopping"` synchronously BEFORE the
+  emit (safe — device_info is a shared dict).
+- `poll_device_status` also picks up `"Stopping"` (not just
+  "Starting" / "Running") so both transients get refreshed
+  each tick.
+- `_on_device_operation_finished` always kicks the DB
+  refresh (`QTimer.singleShot(200, ...)`), success or fail.
+  Protocol-tab + DHCP refreshes still gated on success — no
+  point re-drawing OSPF/BGP tables when nothing meaningful
+  changed on the client.
+
+Files touched:
+- `widgets/devices_tab.py` — `DeviceOperationWorker.run()`
+  start + stop branches, `poll_device_status`,
+  `_on_device_operation_finished`.
+
+Tests: `tests/test_v05215_device_status_transitions.py` — 4
+source-level lock-ins (start-worker Status write before emit,
+stop-worker same, poll includes "Stopping", DB refresh
+before success-gate).
+
+**Client-side fix** — install new wheel on macOS client. No
+server change needed. After upgrade the yellow "Starting..."
+dot should flip to a real Running/Stopped state within one
+poll tick (~5-30 s depending on cadence, immediately on
+manual Refresh).
+
+**If Symptom 2 persists (Refresh shows "Stopped" while
+protocols are green):** that means the SERVER's DB is
+actually holding "Stopped" — client is faithfully reflecting
+it. The likely culprit is that `/api/device/start` on the
+server never wrote `"Running"` for that device (possibly a
+missing device_id in the payload). Grab the DB state with
+`curl -s http://localhost:5050/api/device/database/devices/
+<device_id> | grep status` on srv06 to confirm, and I'll
+ship a v0.5.216 server fix.
+
 ## [0.5.214] - 2026-08-23
 
 **ISIS Apply now shows a QProgressDialog and runs in a

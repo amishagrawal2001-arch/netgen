@@ -71,6 +71,19 @@ class DeviceOperationWorker(QThread):
                 if self.operation_type == 'start':
                     # Start device (light start - just bring up interface)
                     self.progress.emit(device_name, "Starting...")
+                    # v0.5.215: also flip in-memory Status BEFORE the
+                    # UI emit. `poll_device_status` (line ~10058)
+                    # picks rows to refresh based on
+                    # `device_info["Status"]` — if it still reads
+                    # "Stopped" from the previous stop, the poll
+                    # skips this row and the "Starting..." text
+                    # gets stuck. Symptom operator reported on
+                    # JNPR-MAC-HWXVX1 2026-08-23: after Start
+                    # Selected Devices, all protocols came up but
+                    # device row stayed on the yellow "Starting..."
+                    # dot indefinitely. Only manual Refresh (which
+                    # reads the DB) revealed the true state.
+                    device_info["Status"] = "Starting"
                     # Immediately reflect starting state in UI
                     self.device_status_updated.emit(row, "Starting", "Device Starting...")
                     
@@ -122,6 +135,10 @@ class DeviceOperationWorker(QThread):
                 elif self.operation_type == 'stop':
                     # Stop device
                     self.progress.emit(device_name, "Stopping...")
+                    # v0.5.215: mirror the start branch — flip
+                    # in-memory Status BEFORE the UI emit so the
+                    # poll picks up the row for its DB refresh.
+                    device_info["Status"] = "Stopping"
                     # Immediately reflect stopping state in UI
                     self.device_status_updated.emit(row, "Stopping", "Device Stopping...")
                     
@@ -3399,12 +3416,20 @@ class DevicesTab(QWidget):
                 logger.info(f"  {result}")
             logger.debug(f"{'='*60}\n")
         
-        # Refresh protocol tabs if needed (deferred to avoid UI hang)
+        # v0.5.215: always refresh the device table from DB after
+        # any start/stop attempt, success or fail. Pre-fix the
+        # refresh was gated on `if successful_count > 0` — so on
+        # a client-side timeout (30s POST) or partial failure,
+        # the row's "Starting..." text lingered because nothing
+        # ever re-read the DB to reveal the true state. The
+        # server may have completed the start and written
+        # "Running" but the client never asked.
+        # Protocol-tab + DHCP refreshes still gated on success
+        # (no point re-drawing OSPF/BGP tables when nothing
+        # meaningful changed on the client's understanding).
+        QTimer.singleShot(200, lambda: self._refresh_device_table_from_database(selected_rows))
         if successful_count > 0:
             QTimer.singleShot(100, lambda: self._refresh_protocols_for_selected_devices(selected_rows))
-            # Refresh device table from database for all operations to get current ARP status
-            # This ensures ARP status is updated after start/stop/apply operations
-            QTimer.singleShot(200, lambda: self._refresh_device_table_from_database(selected_rows))
             if hasattr(self, "dhcp_handler") and self.dhcp_handler:
                 QTimer.singleShot(250, self.dhcp_handler.refresh_dhcp_status)
 
@@ -10077,7 +10102,14 @@ class DevicesTab(QWidget):
                 if status == "Running":
                     running_count += 1
                     rows_to_refresh.append(row)
-                elif status == "Starting":
+                elif status in ("Starting", "Stopping"):
+                    # v0.5.215: include transient "Stopping" too.
+                    # Pre-fix the poll only refreshed Starting/
+                    # Running, so a device that got wedged in
+                    # Stopping (or was told Stopping by the worker
+                    # but the DB says Running/Stopped) stayed on
+                    # the transient dot forever until the operator
+                    # clicked a manual refresh.
                     rows_to_refresh.append(row)
 
             # Adjust polling cadence depending on activity
