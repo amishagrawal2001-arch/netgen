@@ -96,28 +96,28 @@ def _configure_ospf_body() -> str:
     src = (REPO / "run_tgen_server.py").read_text()
     idx = src.find("def configure_ospf_route_advertisement")
     assert idx >= 0
-    return src[idx:idx + 8000]
+    return src[idx:idx + 12000]
 
 
 def _cleanup_ospf_body() -> str:
     src = (REPO / "run_tgen_server.py").read_text()
     idx = src.find("def cleanup_ospf_route_advertisement")
     assert idx >= 0
-    return src[idx:idx + 8000]
+    return src[idx:idx + 12000]
 
 
 def _configure_isis_body() -> str:
     src = (REPO / "run_tgen_server.py").read_text()
     idx = src.find("def configure_isis_route_advertisement")
     assert idx >= 0
-    return src[idx:idx + 8000]
+    return src[idx:idx + 12000]
 
 
 def _cleanup_isis_body() -> str:
     src = (REPO / "run_tgen_server.py").read_text()
     idx = src.find("def cleanup_isis_route_advertisement")
     assert idx >= 0
-    return src[idx:idx + 8000]
+    return src[idx:idx + 12000]
 
 
 def test_configure_ospf_uses_vrf_suffix_on_router():

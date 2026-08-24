@@ -2,6 +2,69 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.212] - 2026-08-23
+
+**OSPF / IS-IS route-pool advertisement now filters correctly
+— per-protocol pool attachments no longer leak into each
+other.**
+
+Operator report on JNPR-MAC-HWXVX1 2026-08-23 (following
+v0.5.211's VRF-scope fix): attached distinct route pools to
+OSPF and BGP on the same device. Both protocols advertised
+routes from BOTH pools — OSPF picked up BGP's pool routes and
+vice versa. Static routes for both pools land in the same
+VRF's static-RIB (that's just how FRR works); the per-protocol
+prefix-list filter is what's supposed to keep them scoped.
+
+Root cause — two bugs stacked in
+`configure_ospf_route_advertisement` and
+`configure_isis_route_advertisement`:
+
+1. **Wildcard prefix-list base entry.** `ip prefix-list PL-
+   OSPF-EXPORT seq 5 permit 0.0.0.0/0 le 32` (and the `::/0 le
+   128` v6 twin) at the top of the prefix-list matched EVERY
+   prefix. The per-pool seq-110+ entries were pure decoration
+   — every route matched seq 5 first.
+2. **`permit 20` catch-all in the route-map.** `route-map RM-
+   OSPF-EXPORT permit 20` with no `match` clause is a permit-
+   anything override. Even if the prefix-list had filtered,
+   this clause let unmatched routes through anyway.
+
+Both existed in OSPF v4/v6 and IS-IS v4/v6 route-adv. BGP was
+already fine — the v0.5.200 audit fixed BGP's equivalent bugs
+but didn't reach OSPF/ISIS (parity gap).
+
+Fix:
+- Drop the seq-5 wildcard prefix-list entry. Only per-pool
+  prefixes get added.
+- Drop the `permit 20` catch-all route-map clause. Implicit
+  deny at the end correctly rejects unmatched routes.
+- Explicit `no ip prefix-list …` + `no route-map …` before
+  rebuild so re-apply always produces a deterministic filter
+  (same wipe-and-rebuild pattern BGP has used since v0.5.200).
+- Reorder: prefix-list entries land in the pool loop while
+  we're in global-config mode; route-map creation happens
+  AFTER the loop so vtysh mode transitions stay clean.
+
+Files touched:
+- `run_tgen_server.py:configure_ospf_route_advertisement` —
+  wipe + rebuild without wildcards or permit-20.
+- `run_tgen_server.py:configure_isis_route_advertisement` —
+  same shape.
+
+Tests: `tests/test_v05212_route_adv_pool_filter.py` — 10
+source-level lock-ins (OSPF/ISIS: no wildcards, no permit-20,
+explicit wipe, permit-10 match preserved; BGP regression
+guard for both classes since v0.5.200 already fixed BGP).
+
+**Server-side fix** — netgen-server restart on srv06 required.
+Existing FRR containers with the buggy config need one of:
+(a) restart the FRR container so it re-reads config from
+scratch, or (b) after upgrade re-Apply route pools; the new
+`no ip prefix-list` / `no route-map` wipe at the start of the
+apply will scrub the stale wildcard + permit-20 entries and
+rebuild cleanly.
+
 ## [0.5.211] - 2026-08-23
 
 **OSPF / IS-IS route-pool advertisement now lands on the

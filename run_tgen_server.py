@@ -8315,29 +8315,38 @@ def configure_ospf_route_advertisement(device_id, device_name, area_id, route_po
             "configure terminal",
         ]
         
+        # v0.5.212: wipe the old prefix-list + route-map first.
+        # Static routes and per-pool prefix-list entries get
+        # added in the pool loop below. The route-map is
+        # rebuilt AFTER the loop (see below) so we're always in
+        # a clean global-config mode when adding entries — same
+        # ordering discipline as configure_bgp_route_
+        # advertisement.
+        # Pre-fix two bugs together made the per-pool filter
+        # useless:
+        #   1. `seq 5 permit 0.0.0.0/0 le 32` (v4) / `::/0 le
+        #      128` (v6) at the top of PL-OSPF-EXPORT matched
+        #      EVERY prefix — the per-pool seq-110+ entries
+        #      were pure decoration.
+        #   2. `route-map RM-OSPF-EXPORT permit 20` with no
+        #      match clause = permit-anything catch-all — even
+        #      if the prefix-list had filtered, this clause
+        #      would let unmatched routes through.
+        # Operator report on JNPR-MAC-HWXVX1 2026-08-23:
+        # attached distinct pools to OSPF and BGP; OSPF picked
+        # up BGP's static routes too because `redistribute
+        # static` in the shared VRF RIB saw everything and the
+        # filter was a no-op. Wipe-and-rebuild gives a
+        # deterministic result on every apply.
         if is_ipv6:
-            # IPv6 prefix-list for redistribution (base permit all)
             vtysh_commands.extend([
-                "ipv6 prefix-list PL-OSPF6-EXPORT seq 5 permit ::/0 le 128",
-            ])
-            
-            # IPv6 route-map for redistribution
-            vtysh_commands.extend([
-                "route-map RM-OSPF6-EXPORT permit 10",
-                " match ipv6 address prefix-list PL-OSPF6-EXPORT",
-                "route-map RM-OSPF6-EXPORT permit 20",
+                "no ipv6 prefix-list PL-OSPF6-EXPORT",
+                "no route-map RM-OSPF6-EXPORT",
             ])
         else:
-            # IPv4 prefix-list for redistribution (base permit all)
             vtysh_commands.extend([
-                "ip prefix-list PL-OSPF-EXPORT seq 5 permit 0.0.0.0/0 le 32",
-            ])
-            
-            # IPv4 route-map for redistribution
-            vtysh_commands.extend([
-                "route-map RM-OSPF-EXPORT permit 10",
-                " match ip address prefix-list PL-OSPF-EXPORT",
-                "route-map RM-OSPF-EXPORT permit 20",
+                "no ip prefix-list PL-OSPF-EXPORT",
+                "no route-map RM-OSPF-EXPORT",
             ])
         
         # Generate and add static routes for each pool
@@ -8390,7 +8399,23 @@ def configure_ospf_route_advertisement(device_id, device_name, area_id, route_po
             except Exception as e:
                 logging.error(f"[OSPF ROUTE ADV] Error processing pool {pool_name}: {e}")
                 continue
-        
+
+        # v0.5.212: build the route-map AFTER the prefix-list
+        # entries are in place. No wildcard seq-5 base entry,
+        # no `permit 20` catch-all — implicit deny at the end
+        # correctly rejects routes that don't match one of the
+        # per-pool prefixes added above.
+        if is_ipv6:
+            vtysh_commands.extend([
+                "route-map RM-OSPF6-EXPORT permit 10",
+                " match ipv6 address prefix-list PL-OSPF6-EXPORT",
+            ])
+        else:
+            vtysh_commands.extend([
+                "route-map RM-OSPF-EXPORT permit 10",
+                " match ip address prefix-list PL-OSPF-EXPORT",
+            ])
+
         # v0.5.211: bind the redistribute to the device's VRF-
         # scoped OSPF instance. Devices run in a per-device
         # Linux VRF (`vrf-{device_id}`) — FRR/zebra promotes
@@ -8810,29 +8835,20 @@ def configure_isis_route_advertisement(device_id, device_name, area_id, route_po
             "configure terminal",
         ]
         
+        # v0.5.212: wipe old prefix-list + route-map first;
+        # rebuild after the pool loop (see below). Parity with
+        # the OSPF fix — pre-fix `seq 5 permit 0.0.0.0/0 le 32`
+        # wildcard + `route-map permit 20` catch-all together
+        # made the per-pool filter a no-op.
         if is_ipv6:
-            # IPv6 prefix-list for redistribution (base permit all)
             vtysh_commands.extend([
-                "ipv6 prefix-list PL-ISIS6-EXPORT seq 5 permit ::/0 le 128",
-            ])
-            
-            # IPv6 route-map for redistribution
-            vtysh_commands.extend([
-                "route-map RM-ISIS6-EXPORT permit 10",
-                " match ipv6 address prefix-list PL-ISIS6-EXPORT",
-                "route-map RM-ISIS6-EXPORT permit 20",
+                "no ipv6 prefix-list PL-ISIS6-EXPORT",
+                "no route-map RM-ISIS6-EXPORT",
             ])
         else:
-            # IPv4 prefix-list for redistribution (base permit all)
             vtysh_commands.extend([
-                "ip prefix-list PL-ISIS-EXPORT seq 5 permit 0.0.0.0/0 le 32",
-            ])
-            
-            # IPv4 route-map for redistribution
-            vtysh_commands.extend([
-                "route-map RM-ISIS-EXPORT permit 10",
-                " match ip address prefix-list PL-ISIS-EXPORT",
-                "route-map RM-ISIS-EXPORT permit 20",
+                "no ip prefix-list PL-ISIS-EXPORT",
+                "no route-map RM-ISIS-EXPORT",
             ])
         
         # Generate and add static routes for each pool
@@ -8885,7 +8901,23 @@ def configure_isis_route_advertisement(device_id, device_name, area_id, route_po
             except Exception as e:
                 logging.error(f"[ISIS ROUTE ADV] Error processing pool {pool_name}: {e}")
                 continue
-        
+
+        # v0.5.212: build the route-map AFTER the prefix-list
+        # entries are in place. No wildcard base entry, no
+        # `permit 20` catch-all — implicit deny at the end
+        # correctly rejects routes that don't match one of the
+        # per-pool prefixes.
+        if is_ipv6:
+            vtysh_commands.extend([
+                "route-map RM-ISIS6-EXPORT permit 10",
+                " match ipv6 address prefix-list PL-ISIS6-EXPORT",
+            ])
+        else:
+            vtysh_commands.extend([
+                "route-map RM-ISIS-EXPORT permit 10",
+                " match ip address prefix-list PL-ISIS-EXPORT",
+            ])
+
         # v0.5.211: bind the redistribute to the device's VRF-
         # scoped ISIS instance — same class as the OSPF fix
         # (`router isis CORE` alone lands on the default-VRF
