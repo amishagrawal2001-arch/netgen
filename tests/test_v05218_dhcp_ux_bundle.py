@@ -546,7 +546,16 @@ def test_all_changed_files_still_parse():
 
 
 def test_version_bumped():
+    # v0.5.219: relaxed from `== 0.5.218` to `>= 0.5.218` — mirrors
+    # the same relaxation v0.5.218 applied to v0.5.217's version
+    # test. A strict pin here breaks on every subsequent bump for
+    # no useful reason (the fix landed in v0.5.218, and every later
+    # release inherits it).
+    import re as _re
     py = (REPO / "pyproject.toml").read_text()
-    assert 'version = "0.5.218"' in py, (
-        "pyproject.toml version not bumped to 0.5.218"
+    m = _re.search(r'^version\s*=\s*"([^"]+)"', py, _re.MULTILINE)
+    assert m, "pyproject.toml version line not found"
+    parts = tuple(int(p) for p in m.group(1).split("."))
+    assert parts >= (0, 5, 218), (
+        f"pyproject version {m.group(1)!r} is below expected 0.5.218"
     )

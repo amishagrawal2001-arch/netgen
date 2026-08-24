@@ -997,12 +997,22 @@ class DHCPHandler:
                 return
             if err == "cancelled":
                 return
-            try:
-                self._populate_dhcp_table(devices)
-            except Exception as exc:
-                logging.error(
-                    f"[DHCP UI] Failed to populate DHCP table: {exc}"
-                )
+
+            # v0.5.219 (audit fix C5): defer the table populate to
+            # the next event-loop tick so it runs AFTER the QThread's
+            # finished signal has fully unwound. Matches the deferred-
+            # exec pattern applied to _run_dhcp_pool_post; keeps the
+            # PyQt5 5.15.11 + Python 3.14 SIGABRT surface consistent
+            # across all three v0.5.218-touched finish handlers
+            # (Refresh, Attach, Apply).
+            def _do_populate():
+                try:
+                    self._populate_dhcp_table(devices)
+                except Exception as exc:
+                    logging.error(
+                        f"[DHCP UI] Failed to populate DHCP table: {exc}"
+                    )
+            QTimer.singleShot(0, _do_populate)
 
         worker.finished.connect(_on_finished)
         worker.start()
@@ -1442,6 +1452,38 @@ class DHCPHandler:
             except Exception:
                 pass
 
+            # v0.5.219 (audit fix C5): defer any modal dialog exec_()
+            # to the next event-loop iteration via QTimer.singleShot.
+            # Pre-fix, the modal ran inline while the QThread's
+            # finished signal was still unwinding — under PyQt5
+            # 5.15.11 + Python 3.14 this ordering has bitten the
+            # codebase enough to require SIGABRT guards elsewhere
+            # (see the _dhcp_workers keepalive above, and the same
+            # deferred-exec pattern already used in OSPF/BGP/ISIS
+            # apply finish handlers).
+            def _show_modal(dlg_title, dlg_msg, entries, level, do_refresh):
+                try:
+                    from widgets.devices_tab import MultiDeviceResultsDialog
+                    MultiDeviceResultsDialog(
+                        dlg_title, dlg_msg, entries, self.parent,
+                    ).exec_()
+                except Exception:
+                    if level == "warning":
+                        QMessageBox.warning(self.parent, dlg_title, dlg_msg)
+                    else:
+                        QMessageBox.information(self.parent, dlg_title, dlg_msg)
+                if do_refresh:
+                    try:
+                        self.refresh_dhcp_status()
+                    except Exception:
+                        pass
+                    if operation == "apply":
+                        try:
+                            from widgets.preflight_bar import kick_refresh
+                            kick_refresh(self.parent)
+                        except Exception:
+                            pass
+
             if not ok:
                 if operation == "attach":
                     title = ("DHCP Detach Failed" if detach_all
@@ -1453,23 +1495,17 @@ class DHCPHandler:
                 else:
                     title = "DHCP Apply Failed"
                     default_msg = "Failed to apply DHCP server pools."
-                # Prefer MultiDeviceResultsDialog for consistency
-                # with the other apply paths.
-                try:
-                    from widgets.devices_tab import MultiDeviceResultsDialog
-                    MultiDeviceResultsDialog(
-                        title,
-                        f"{operation.title()} failed for device {device_id}",
-                        [f"❌ {device_id}: {err or default_msg}"],
-                        self.parent,
-                    ).exec_()
-                except Exception:
-                    QMessageBox.warning(
-                        self.parent, title, err or default_msg,
-                    )
+                fail_msg = err or default_msg
+                QTimer.singleShot(0, lambda t=title, m=fail_msg: _show_modal(
+                    t,
+                    f"{operation.title()} failed for device {device_id}",
+                    [f"❌ {device_id}: {m}"],
+                    "warning",
+                    False,
+                ))
                 return
 
-            # Success — success dialog + refresh.
+            # Success — success dialog + refresh (deferred).
             if operation == "attach":
                 if detach_all:
                     title = "DHCP Pools Detached"
@@ -1480,25 +1516,9 @@ class DHCPHandler:
             else:
                 title = "DHCP Pools Applied"
                 msg = "Attached DHCP pools have been applied to the server."
-            try:
-                from widgets.devices_tab import MultiDeviceResultsDialog
-                MultiDeviceResultsDialog(
-                    title, msg,
-                    [f"✅ {device_id}: {msg}"],
-                    self.parent,
-                ).exec_()
-            except Exception:
-                QMessageBox.information(self.parent, title, msg)
-
-            # Refresh the DHCP table + kick preflight bar (only on
-            # apply — matches the pre-fix apply_dhcp_pools tail).
-            self.refresh_dhcp_status()
-            if operation == "apply":
-                try:
-                    from widgets.preflight_bar import kick_refresh
-                    kick_refresh(self.parent)
-                except Exception:
-                    pass
+            QTimer.singleShot(0, lambda t=title, m=msg: _show_modal(
+                t, m, [f"✅ {device_id}: {m}"], "info", True,
+            ))
 
         worker.finished.connect(_on_finished)
         worker.start()

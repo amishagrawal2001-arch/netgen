@@ -6166,15 +6166,33 @@ def stop_device():
         if dhcp_mode in ("client", "server") and iface_name:
             try:
                 logging.info(f"[DHCP] Stopping DHCP {dhcp_mode} for device {device_id} on {iface_name}")
-                stop_dhcp_services(
+                # v0.5.219 (audit fix C4): capture the result so we
+                # can surface per-step failures to the client. Pre-fix,
+                # the return dict from stop_dhcp_services (which
+                # aggregates failures from stop_dhcp_server since
+                # v0.5.217 fix D) was discarded, so an operator saw
+                # "success" while dnsmasq may still have been serving
+                # leases in the container.
+                _dhcp_stop = stop_dhcp_services(
                     device_db,
                     device_id,
                     iface_name,
                     dhcp_mode,
                     remove_container=False,
                 )
+                if isinstance(_dhcp_stop, dict) and _dhcp_stop.get("success") is False:
+                    dhcp_failures = _dhcp_stop.get("failures") or []
+                    if not dhcp_failures and _dhcp_stop.get("error"):
+                        dhcp_failures = [str(_dhcp_stop.get("error"))]
+                    result["dhcp_stop_failures"] = dhcp_failures
+                    logging.warning(
+                        "[DHCP] stop_dhcp_services reported %d failure(s) for %s: %s",
+                        len(dhcp_failures), device_id,
+                        "; ".join(dhcp_failures),
+                    )
             except Exception as dhcp_error:
                 logging.warning(f"[DHCP] Failed to stop DHCP services: {dhcp_error}")
+                result["dhcp_stop_failures"] = [f"exception: {dhcp_error}"]
         
         # Stop FRR container (this stops all protocols automatically)
         try:
@@ -6304,6 +6322,13 @@ def remove_device():
     if not device_id:
         return jsonify({"error": "Missing device_id"}), 400
 
+    # v0.5.219 (audit fix C4): threaded through to the final jsonify
+    # so operators can see when stop_dhcp_services reported partial
+    # failure during a device remove (dnsmasq still running, VRF
+    # route still installed, etc.). Populated inside the dhcp stop
+    # block further down.
+    dhcp_remove_failures: List[str] = []
+
     try:
         # Get device info from database before removing it (needed for cleanup)
         device_info = None
@@ -6408,15 +6433,36 @@ def remove_device():
                 if dhcp_mode_remove in ("client", "server") and iface_name:
                     try:
                         logging.info(f"[DHCP] Stopping DHCP {dhcp_mode_remove} before removing device {device_id}")
-                        stop_dhcp_services(
+                        # v0.5.219 (audit fix C4): capture the
+                        # stop_dhcp_services return dict so the
+                        # /api/device/remove response can surface any
+                        # aggregated failures. Pre-fix, the return
+                        # value was thrown away — the remove path
+                        # reported success even when dnsmasq /
+                        # dhclient / VRF routes were still around.
+                        _dhcp_stop = stop_dhcp_services(
                             device_db,
                             device_id,
                             iface_name,
                             dhcp_mode_remove,
                             remove_container=True,
                         )
+                        if isinstance(_dhcp_stop, dict) and _dhcp_stop.get("success") is False:
+                            _dhcp_failures = _dhcp_stop.get("failures") or []
+                            if not _dhcp_failures and _dhcp_stop.get("error"):
+                                _dhcp_failures = [str(_dhcp_stop.get("error"))]
+                            # dhcp_remove_failures is initialised at
+                            # the top of remove_device and threaded
+                            # into the final jsonify response.
+                            dhcp_remove_failures.extend(_dhcp_failures)
+                            logging.warning(
+                                "[DHCP] stop_dhcp_services reported %d failure(s) during remove of %s: %s",
+                                len(_dhcp_failures), device_id,
+                                "; ".join(_dhcp_failures),
+                            )
                     except Exception as dhcp_error:
                         logging.warning(f"[DHCP] Failed to stop DHCP during device removal: {dhcp_error}")
+                        dhcp_remove_failures.append(f"exception: {dhcp_error}")
         except Exception as e:
             logging.warning(f"[DEVICE REMOVE] Failed to get device info from database: {e}")
         
@@ -6534,13 +6580,21 @@ def remove_device():
             device_name=device_name,
             db_removed=bool(db_removed),
         )
-        return jsonify({
+        # v0.5.219 (audit fix C4): surface DHCP stop failures picked
+        # up by the block above (populates dhcp_remove_failures).
+        # MultiDeviceResultsDialog on the client can render this
+        # list so an operator sees exactly which cleanup step
+        # didn't complete instead of a blanket success.
+        _payload = {
             "status": "removed" if db_removed else "partial",
             "details": result,
             "mappings_cleaned": len(keys_to_remove),
             "container_removed": container_removed,
-            "database_removed": db_removed
-        }), 200
+            "database_removed": db_removed,
+        }
+        if dhcp_remove_failures:
+            _payload["dhcp_stop_failures"] = dhcp_remove_failures
+        return jsonify(_payload), 200
 
     except Exception as e:
         logging.error(f"[REMOVE ERROR] {e}")
@@ -6976,6 +7030,11 @@ def attach_dhcp_pools_to_server():
         saved_gateway = dhcp_cfg.get("gateway", "")
 
         # Stop DHCP server if no pools remain (before clearing config)
+        # v0.5.219 (audit fix C4): capture stop_dhcp_server's return
+        # dict (populated by v0.5.217 fix D). Pre-fix, the return
+        # value was discarded, so a partial cleanup (dnsmasq still
+        # running, a route left over) was invisible on the response.
+        detach_all_failures: List[str] = []
         try:
             interface = saved_interface
             if interface:
@@ -6986,9 +7045,21 @@ def attach_dhcp_pools_to_server():
                     dhcp_cfg["pool_networks"] = saved_pool_networks
                 if saved_gateway_routes:
                     dhcp_cfg["gateway_route_normalized"] = saved_gateway_routes
-                stop_dhcp_server(device_db, device_id, interface, container=container)
+                _detach_stop = stop_dhcp_server(
+                    device_db, device_id, interface, container=container,
+                )
+                if isinstance(_detach_stop, dict) and _detach_stop.get("success") is False:
+                    _fs = _detach_stop.get("failures") or []
+                    if not _fs and _detach_stop.get("error"):
+                        _fs = [str(_detach_stop.get("error"))]
+                    detach_all_failures.extend(_fs)
+                    logging.warning(
+                        "[DHCP API] stop_dhcp_server reported %d failure(s) during detach_all for %s: %s",
+                        len(_fs), device_id, "; ".join(_fs),
+                    )
         except Exception as exc:
             logging.warning(f"[DHCP API] Failed to stop DHCP server after detach: {exc}")
+            detach_all_failures.append(f"exception: {exc}")
 
         # Clear pool-related fields but keep other DHCP config (after stopping server)
         dhcp_cfg.pop("pool_name", None)
@@ -7012,7 +7083,17 @@ def attach_dhcp_pools_to_server():
         except Exception:
             updated_device = device
 
-        return jsonify({"status": "success", "message": "All DHCP pools detached", "device": updated_device}), 200
+        # v0.5.219 (audit fix C4): thread detach_all_failures back
+        # so the client dialog can show cleanup problems instead of
+        # a plain "success".
+        _resp = {
+            "status": "success",
+            "message": "All DHCP pools detached",
+            "device": updated_device,
+        }
+        if detach_all_failures:
+            _resp["dhcp_stop_failures"] = detach_all_failures
+        return jsonify(_resp), 200
 
     if not primary_pool_name:
         return jsonify({"error": "primary_pool is required (or set detach_all=true)"}), 400

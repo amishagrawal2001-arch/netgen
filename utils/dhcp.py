@@ -10,7 +10,7 @@ import shlex
 import subprocess
 import time
 from datetime import datetime, timezone
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 from types import SimpleNamespace
 
 import docker
@@ -567,6 +567,159 @@ def _add_route_and_vrf_copy(
         )
 
 
+def _remove_route_and_vrf_copy(
+    net: str,
+    *,
+    gateway: str = "",
+    interface: str = "",
+    family: str = "ipv4",
+    vrf_name: Optional[str] = None,
+    container=None,
+    log_prefix: str = "[DHCP]",
+    label: str = "route",
+) -> List[str]:
+    """Remove a route from the main table AND the device's VRF mirror.
+
+    v0.5.219 (audit fix C1): the v0.5.218 ``_add_route_and_vrf_copy``
+    installed every server-mode DHCP route into BOTH the main table
+    and the per-device VRF table. ``stop_dhcp_server`` was only
+    calling ``ip route del`` against the main table — so on device
+    Remove or Stop-then-Start with a different pool, the VRF-side
+    copy of the old subnet stayed behind and dnsmasq clients on the
+    far side kept seeing return traffic land on the wrong VRF next.
+
+    This helper is the removal counterpart to
+    ``_add_route_and_vrf_copy``: it issues ``ip route del`` in both
+    the ``<net>`` and ``<net> via <gw>`` forms against the main
+    table (mirroring the two shapes that stop_dhcp_server had to
+    try pre-fix, because the add path uses either form depending on
+    whether a gateway was supplied), then mirrors the same delete
+    into the VRF table when one exists. Legacy no-VRF deployments
+    pass vrf_name=None and only the main-table cleanup runs, so
+    behaviour is identical to pre-fix for them.
+
+    Returns a list of human-readable failure strings (one per
+    subcommand whose exception was not "no such route"). Callers
+    that thread failure info back to the operator (via
+    ``stop_dhcp_server``'s ``failures`` accumulator) can append
+    directly.
+    """
+    ip_flag = "-6" if family == "ipv6" else "-4"
+    failures: List[str] = []
+
+    def _try_del(cmd_extra):
+        cmd = ["ip", ip_flag, "route", "del", str(net)] + cmd_extra
+        try:
+            _run_command(cmd, timeout=5, container=container)
+        except Exception as exc:
+            # Bubble up so the caller can decide — but only the
+            # "with gateway" try-then-fall-back-to-bare path treats
+            # a failure as fatal; the bare form is the safety net.
+            raise exc
+
+    # Main table: try `<net> via <gw>` first if we have a gateway,
+    # then fall back to bare `<net>` (mirrors the pre-fix add path
+    # which switched shapes based on whether a gateway was set).
+    if gateway:
+        try:
+            _try_del(["via", gateway])
+            logger.info(
+                "%s Removed %s %s via %s",
+                log_prefix, label, str(net), gateway,
+            )
+        except Exception as exc:
+            # Silently fall through — bare form below.
+            logger.debug(
+                "%s Failed to remove %s %s via %s (falling through): %s",
+                log_prefix, label, str(net), gateway, exc,
+            )
+    try:
+        _try_del([])
+        logger.info(
+            "%s Removed %s %s (bare)", log_prefix, label, str(net),
+        )
+    except Exception as exc:
+        # Try the `dev <iface>` form as a last resort — mirrors
+        # the pre-fix "alternative route deletion" fallback that
+        # stop_dhcp_server did for routes created with dev
+        # interface.
+        removed_with_dev = False
+        if interface:
+            try:
+                _try_del(["dev", interface])
+                logger.info(
+                    "%s Removed %s %s dev %s",
+                    log_prefix, label, str(net), interface,
+                )
+                removed_with_dev = True
+            except Exception as dev_exc:
+                logger.debug(
+                    "%s Also failed with dev %s: %s",
+                    log_prefix, str(net), interface, dev_exc,
+                )
+        if not removed_with_dev:
+            logger.warning(
+                "%s Failed to remove %s %s: %s",
+                log_prefix, label, str(net), exc,
+            )
+            failures.append(f"remove {family} {label} {net}: {exc}")
+
+    # VRF-scoped mirror (v0.5.219) — only when the device sits in a VRF.
+    if not vrf_name:
+        return failures
+
+    def _try_del_vrf(cmd_extra):
+        cmd = ["ip", ip_flag, "route", "del", str(net)] + cmd_extra + ["vrf", vrf_name]
+        try:
+            _run_command(cmd, timeout=5, container=container)
+        except Exception as exc:
+            raise exc
+
+    if gateway:
+        try:
+            _try_del_vrf(["via", gateway])
+            logger.info(
+                "%s Removed %s %s via %s from vrf %s",
+                log_prefix, label, str(net), gateway, vrf_name,
+            )
+        except Exception as exc:
+            logger.debug(
+                "%s Failed to remove %s %s via %s from vrf %s (falling through): %s",
+                log_prefix, label, str(net), gateway, vrf_name, exc,
+            )
+    try:
+        _try_del_vrf([])
+        logger.info(
+            "%s Removed %s %s from vrf %s",
+            log_prefix, label, str(net), vrf_name,
+        )
+    except Exception as exc:
+        removed_with_dev = False
+        if interface:
+            try:
+                _try_del_vrf(["dev", interface])
+                logger.info(
+                    "%s Removed %s %s dev %s from vrf %s",
+                    log_prefix, label, str(net), interface, vrf_name,
+                )
+                removed_with_dev = True
+            except Exception as dev_exc:
+                logger.debug(
+                    "%s Also failed with dev %s in vrf %s: %s",
+                    log_prefix, str(net), interface, vrf_name, dev_exc,
+                )
+        if not removed_with_dev:
+            logger.warning(
+                "%s Failed to remove %s %s from vrf %s: %s",
+                log_prefix, label, str(net), vrf_name, exc,
+            )
+            failures.append(
+                f"remove {family} {label} {net} vrf {vrf_name}: {exc}"
+            )
+
+    return failures
+
+
 def _ensure_ipv6_address(interface: str, address: str, prefix: str, container=None) -> bool:
     """Ensure the interface has the specified IPv6 address configured."""
     if not interface or not address or prefix is None:
@@ -1002,6 +1155,25 @@ def start_dhcp_client(
 
     Returns a status dict with success flag and metadata.
     """
+    # v0.5.219 (audit fix C3): explicitly clear dhcp_manual_override
+    # here so an operator-initiated Stop->Start doesn't leave the DHCP
+    # monitor blind for up to 120s. Pre-fix, ``stop_dhcp_services``
+    # stamped ``dhcp_manual_override=True`` at every stop but no start
+    # path ever cleared it, so if a subsequent Start silently failed
+    # (dhclient exited before lease, etc.) the monitor's 120s guard
+    # kept skipping the device instead of noticing and writing
+    # dhcp_state="Failed". Writing the clear here — before we even
+    # attempt the start — closes that window.
+    if device_id:
+        _update_device_db(
+            device_db,
+            device_id,
+            {
+                "dhcp_manual_override": False,
+                "dhcp_manual_override_time": None,
+            },
+        )
+
     # Verify interface exists before proceeding
     if not _verify_interface_exists(interface, container=container):
         error_msg = f"Interface {interface} not found in container/host. Cannot start DHCP client."
@@ -1285,6 +1457,21 @@ def start_dhcp_server(
     container=None,
 ) -> Dict:
     """Start a dnsmasq DHCP server bound to interface."""
+    # v0.5.219 (audit fix C3): mirror the client-path clear — see
+    # start_dhcp_client's block for the full rationale. Any explicit
+    # server Start supersedes the manual_override guard that
+    # stop_dhcp_services stamped, so the monitor can observe the new
+    # dnsmasq (or its failure) immediately instead of after 120s.
+    if device_id:
+        _update_device_db(
+            device_db,
+            device_id,
+            {
+                "dhcp_manual_override": False,
+                "dhcp_manual_override_time": None,
+            },
+        )
+
     if not _verify_interface_exists(interface, container=container):
         error_msg = f"Interface {interface} not found in container/host. Cannot start DHCP server."
         logger.error(f"[DHCP] {error_msg}")
@@ -1859,89 +2046,59 @@ def stop_dhcp_server(device_db, device_id: str, interface: str, container=None) 
         logger.warning("[DHCP] Failed to remove dnsmasq config: %s", exc)
         failures.append(f"remove dnsmasq config: {exc}")
 
-    # Remove routes from container (regardless of gateway, since gateway_routes may not have gateway)
+    # v0.5.219 (audit fix C1): resolve the device's VRF once so the
+    # route removals below can also clean up the VRF-scoped mirror
+    # copies that ``_add_route_and_vrf_copy`` installed in v0.5.218.
+    # Pre-fix, ``stop_dhcp_server`` only touched the main table, so
+    # every VRF-scoped route leaked past Stop / Remove.
+    vrf_name = _resolve_device_vrf(device_id)
+    interface_from_cfg = (dhcp_cfg.get("interface") if device else None) or interface
+
+    # Remove IPv4 routes from container (regardless of gateway, since gateway_routes may not have gateway)
     if networks and container:
         for net in networks:
-            try:
-                # Try to remove route with gateway first (if gateway exists)
-                if gateway:
-                    _run_command(
-                        ["ip", "route", "del", str(net), "via", gateway],
-                        timeout=5,
-                        container=container,
-                    )
-                # Also try without gateway (for routes created without gateway)
-                _run_command(
-                    ["ip", "route", "del", str(net)],
-                    timeout=5,
+            failures.extend(
+                _remove_route_and_vrf_copy(
+                    str(net),
+                    gateway=gateway,
+                    interface=interface_from_cfg or "",
+                    family="ipv4",
+                    vrf_name=vrf_name,
                     container=container,
+                    log_prefix="[DHCP]",
+                    label="static route",
                 )
-                logger.info("[DHCP] Removed static route %s from DHCP container", net)
-            except Exception as route_exc:
-                # Try alternative route deletion (route might have been created with dev interface)
-                try:
-                    interface_from_cfg = dhcp_cfg.get("interface") if device else None
-                    if interface_from_cfg:
-                        if gateway:
-                            _run_command(
-                                ["ip", "route", "del", str(net), "via", gateway, "dev", interface_from_cfg],
-                                timeout=5,
-                                container=container,
-                            )
-                        _run_command(
-                            ["ip", "route", "del", str(net), "dev", interface_from_cfg],
-                            timeout=5,
-                            container=container,
-                        )
-                        logger.info("[DHCP] Removed static route %s (with dev) from DHCP container", net)
-                except Exception:
-                    # v0.5.217 (audit fix D): warn + track.
-                    logger.warning(
-                        "[DHCP] Failed to remove static route %s: %s", net, route_exc
-                    )
-                    failures.append(f"remove IPv4 route {net}: {route_exc}")
+            )
 
     if container and ipv6_gateway_routes:
         for route in ipv6_gateway_routes:
-            try:
-                if ipv6_gateway:
-                    _run_command(
-                        ["ip", "-6", "route", "del", route, "via", ipv6_gateway],
-                        timeout=5,
-                        container=container,
-                    )
-                _run_command(
-                    ["ip", "-6", "route", "del", route],
-                    timeout=5,
-                    container=container,
-                )
-                logger.info("[DHCP] Removed IPv6 gateway route %s from DHCP container", route)
-            except Exception as route_exc:
-                # v0.5.217 (audit fix D): warn + track.
-                logger.warning(
-                    "[DHCP] Failed to remove IPv6 gateway route %s: %s",
+            failures.extend(
+                _remove_route_and_vrf_copy(
                     route,
-                    route_exc,
+                    gateway=ipv6_gateway,
+                    interface=interface_from_cfg or "",
+                    family="ipv6",
+                    vrf_name=vrf_name,
+                    container=container,
+                    log_prefix="[DHCP]",
+                    label="IPv6 gateway route",
                 )
-                failures.append(f"remove IPv6 gateway route {route}: {route_exc}")
+            )
 
     if container and ipv6_gateway and ipv6_subnets:
         for subnet in ipv6_subnets:
-            try:
-                _run_command(
-                    ["ip", "-6", "route", "del", subnet, "via", ipv6_gateway],
-                    timeout=5,
-                    container=container,
-                )
-                logger.info("[DHCP] Removed IPv6 static route %s via %s from DHCP container", subnet, ipv6_gateway)
-            except Exception as route_exc:
-                # v0.5.217 (audit fix D): warn + track.
-                logger.warning(
-                    "[DHCP] Failed to remove IPv6 static route %s: %s",
+            failures.extend(
+                _remove_route_and_vrf_copy(
                     subnet,
-                    route_exc,
+                    gateway=ipv6_gateway,
+                    interface=interface_from_cfg or "",
+                    family="ipv6",
+                    vrf_name=vrf_name,
+                    container=container,
+                    log_prefix="[DHCP]",
+                    label="IPv6 static route",
                 )
-                failures.append(f"remove IPv6 static route {subnet}: {route_exc}")
+            )
 
     if ipv6_server_ip and ipv6_prefix:
         _remove_ipv6_address(interface, ipv6_server_ip, ipv6_prefix, container=container)

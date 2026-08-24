@@ -32,6 +32,53 @@ from .dhcp import ensure_dhcp_services
 logger = logging.getLogger(__name__)
 
 
+# v0.5.219 (audit fix C2): shared argv-parse pgrep helper so the
+# server-mode probe stops false-matching ``dnsmasq ... eth10`` when
+# the interface is ``eth1``. Bug M (v0.5.218) applied this pattern
+# to ``_is_dhclient_running`` but overlooked the server-mode fallback
+# ``pgrep -f 'dnsmasq.*{interface}'`` here — same substring collision.
+# Prefer the more-specific conffile match when the caller supplies one.
+def _pgrep_matching_argv(binary: str, needle: str,
+                         *, container=None) -> bool:
+    """True if any ``binary`` process has ``needle`` as a WHOLE
+    argv token (interface name) OR as a substring of a filesystem
+    path token (e.g. a conffile path). The mixed match is deliberate:
+    interface names have to be exact tokens (eth1 must not match
+    eth10), but conf-file paths like ``/etc/dnsmasq.d/ostg-eth1.conf``
+    are unique enough that a substring match is safe.
+    """
+    if not binary or not needle:
+        return False
+    try:
+        result = dhcp_utils._run_command(
+            ["pgrep", "-a", "-f", binary],
+            timeout=5, container=container,
+        )
+        if result.returncode not in (0, 1):
+            return False
+        needle_str = str(needle)
+        for line in (result.stdout or "").splitlines():
+            parts = line.strip().split(None, 1)
+            if len(parts) < 2:
+                continue
+            argv = parts[1].split()
+            for tok in argv:
+                # Exact whole-token match (interface names).
+                if tok == needle_str:
+                    return True
+                # File path containing the needle — safe because
+                # the caller only passes uniquely-named paths.
+                if ("/" in tok or "\\" in tok) and needle_str in tok:
+                    return True
+        return False
+    except Exception as exc:
+        logger.debug(
+            "[DHCP MONITOR] pgrep argv scan for %s (needle=%s) failed: %s",
+            binary, needle, exc,
+        )
+        return False
+
+
 # v0.5.217 (audit fix G): how long a manual-override blocks the
 # monitor before it takes over again. Matches the BGP monitor's
 # window (see utils/bgp_monitor.py:273).
@@ -280,15 +327,23 @@ class DHCPClientMonitor:
             conffile = f"/etc/dnsmasq.d/ostg-{interface}.conf"
             pidfile = f"/var/run/dnsmasq/dnsmasq-{interface}.pid"
             try:
-                pgrep = dhcp_utils._run_command(
-                    ["/bin/sh", "-c",
-                     f"pgrep -f 'dnsmasq.*{conffile}' || pgrep -f 'dnsmasq.*{interface}' || true"],
-                    container=container,
-                    timeout=5,
-                )
-                if pgrep.stdout.strip():
+                # v0.5.219 (audit fix C2): argv-parse pgrep. Pre-fix,
+                # the fallback was ``pgrep -f 'dnsmasq.*{interface}'``
+                # — an unanchored substring match that would return
+                # true for a dnsmasq bound to ``eth10`` when the
+                # interface here is ``eth1``. Now we scan the pgrep
+                # output ourselves via _pgrep_matching_argv, which
+                # accepts a whole-token match on the interface name
+                # OR a substring match inside a path token (so the
+                # conffile path — which is uniquely named per
+                # interface — still matches). See bug M in v0.5.218
+                # for the same fix applied to _is_dhclient_running.
+                if _pgrep_matching_argv("dnsmasq", conffile, container=container):
                     running = True
-                    detail = "pgrep matched"
+                    detail = "pgrep matched conffile"
+                elif _pgrep_matching_argv("dnsmasq", interface, container=container):
+                    running = True
+                    detail = "pgrep matched interface argv token"
                 else:
                     # Try the pid file next.
                     pidout = dhcp_utils._run_command(

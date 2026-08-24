@@ -2,6 +2,296 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.219] - 2026-08-24
+
+**DHCP collateral bundle — five follow-ups to v0.5.217 (A-H)
+and v0.5.218 (I-N), plus three coverage gaps the prior lock-in
+tests missed. Adversarial re-review of the two prior diffs
+turned these up; nothing new operator-facing beyond the
+correctness fixes, but three of the five are severe enough
+to warrant a same-day server restart.**
+
+**C1. Fix L asymmetric — VRF-scoped routes leak on Stop /
+Remove / Stop-then-Start-with-different-pool.**
+v0.5.218's fix L wired `_add_route_and_vrf_copy` so
+`start_dhcp_server` installs every gateway / static / IPv6
+route into BOTH the main table AND the per-device VRF
+(`vrf-<device_id>`) table. But `stop_dhcp_server` was still
+issuing `ip route del` against the main table only. On
+device Remove or a Stop-then-Start with a different pool
+subnet, the mirrored VRF-scoped copy of the OLD subnet stayed
+behind — dnsmasq clients on the far side kept seeing return
+traffic land on the wrong route until the FRR container was
+recreated. This is the direct symmetry-break of fix L and it
+regressed every VRF-mode server-mode DHCP device.
+Fix:
+- New `_remove_route_and_vrf_copy(net, *, gateway,
+  interface, family, vrf_name, container, log_prefix,
+  label)` helper in `utils/dhcp.py`, sitting next to
+  `_add_route_and_vrf_copy`. Mirror-symmetric with the add
+  helper: issues `ip route del` in the `<net> via <gw>` and
+  bare `<net>` forms against the main table (matching the
+  two shapes the add path could have installed), then does
+  the same in the VRF table when `vrf_name` is set. Legacy
+  no-VRF deployments pass `vrf_name=None` and only the
+  main-table cleanup runs — identical to pre-fix behaviour.
+  Returns a `List[str]` of per-subcommand failures so
+  callers can extend their own `failures` accumulator (fix
+  D pattern).
+- `stop_dhcp_server` now:
+  * resolves the device's VRF once via `_resolve_device_vrf`
+    (same helper the add path uses),
+  * rewires every IPv4 pool network, IPv6 gateway route,
+    and IPv6 static subnet cleanup through
+    `_remove_route_and_vrf_copy`,
+  * deletes the raw `ip route del` blocks (they only
+    touched the main table and had bespoke fallback
+    shapes that the helper now handles centrally).
+Files: `utils/dhcp.py`.
+
+**C2. `_check_server_device` fallback pgrep reintroduces
+bug M's substring collision — but for dnsmasq instead of
+dhclient.**
+v0.5.218's fix M killed the unanchored
+`pgrep -f 'dhclient.*{interface}'` pattern in
+`_is_dhclient_running` (`eth1` matching `eth10`). The same
+class of pattern lived one file over in
+`utils/dhcp_monitor.py::_check_server_device` as a
+fallback probe:
+```
+pgrep -f 'dnsmasq.*{conffile}' || pgrep -f 'dnsmasq.*{interface}' || true
+```
+The conffile match happens to be safe (unique per interface),
+but the `dnsmasq.*{interface}` fallback has the exact same
+`eth1` vs `eth10` false-positive as bug M — leaving the
+monitor thinking a stopped dnsmasq was still running, and
+never restarting it.
+Fix:
+- New `_pgrep_matching_argv(binary, needle, *, container)`
+  helper at module scope in `utils/dhcp_monitor.py`. Runs
+  `pgrep -a -f <binary>`, parses each row's argv, and
+  matches `needle` either as a whole argv token (interface
+  names — the tight rule from fix M) OR as a substring of a
+  path-shaped argv token (conffiles, which are uniquely
+  named and safe to substring-match).
+- `_check_server_device` rewired: first tries
+  `_pgrep_matching_argv("dnsmasq", conffile, ...)` (specific
+  match), then falls back to
+  `_pgrep_matching_argv("dnsmasq", interface, ...)` (exact
+  token match against argv — no more eth1/eth10 collision),
+  then the existing pidfile / kill -0 probe as the last
+  resort. The buggy `pgrep -f 'dnsmasq.*{interface}'`
+  shell-string is gone.
+Files: `utils/dhcp_monitor.py`.
+
+**C3. Fix G leaves the DHCP monitor blind for up to 120s
+after an operator Stop->Start.**
+`stop_dhcp_services` writes
+`dhcp_manual_override=True` + `_time=now` at every stop
+(fix G, so the monitor doesn't resurrect a service the
+operator explicitly stopped). But no start path (neither
+`start_dhcp_client` nor `start_dhcp_server`) ever cleared
+the override. Operator symptom: after a Stop->Start
+sequence, if the Start silently failed (dhclient exited
+before the lease, dnsmasq bind conflict, container
+teardown race), the monitor's `_manual_override_active`
+guard kept skipping the device for the full 120s window
+— nobody wrote `dhcp_state="Failed"` and nobody tried to
+recover — before the guard expired. Effective monitoring
+delay: up to 2 minutes on every failed Start.
+Fix: at the very top of both `start_dhcp_client` and
+`start_dhcp_server` (right after the device_id guard),
+explicitly write `dhcp_manual_override=False` +
+`dhcp_manual_override_time=None` to the DB via the same
+`_update_device_db` path the existing status writes use.
+The clear happens BEFORE any interface-verify /
+container-start work, so a subsequent silent-fail exit
+leaves the device in a state the monitor can immediately
+observe and act on.
+Files: `utils/dhcp.py`.
+
+**C4. Fix D produces failure data that no caller consumes.**
+v0.5.217's fix D made `stop_dhcp_server` return
+`{"success": False, "error": "...", "failures": [...]}`
+on partial failure. The three call sites in
+`run_tgen_server.py` (device stop ~L6169, device remove
+~L6411, DHCP-pool detach_all ~L6989) all discarded the
+return value — they wrapped the call in
+`try/except Exception: logging.warning(...)` and never
+inspected the dict. The operator saw a green "success"
+response even when dnsmasq was still serving leases or a
+static route was still installed. Fix D was a tree-fell-
+in-the-forest.
+Fix:
+- Device stop handler: capture the return, extract
+  `failures` (falling back to a single-item list from
+  `error`), stash it on the `result` dict under
+  `dhcp_stop_failures`. The existing `return jsonify({
+  "status": "stopped", "details": result})` now carries
+  the failure trail down into `MultiDeviceResultsDialog`
+  on the client.
+- `/api/device/remove` handler: same pattern — new
+  `dhcp_remove_failures: List[str]` accumulator declared
+  at the top of the function; every DHCP stop attempt
+  extends it on failure; the final `jsonify` conditionally
+  adds `dhcp_stop_failures` to the response payload when
+  the list is non-empty.
+- `/api/device/dhcp/server/attach_pools` detach_all
+  branch: new `detach_all_failures` accumulator, threaded
+  into the response payload the same way.
+- Where the exception handler around the DHCP stop call
+  fires (network / docker / lookup errors), the exception
+  string is now also appended to the accumulator so the
+  operator sees "exception: <err>" rather than a silent
+  eaten log line.
+Files: `run_tgen_server.py`.
+
+**C5. `MultiDeviceResultsDialog.exec_()` inside worker-
+finished slots risks SIGABRT on PyQt5 5.15.11 + Python
+3.14.**
+v0.5.218 fix J's three finish handlers (`refresh_dhcp_
+status::_on_finished`, `_run_dhcp_pool_post::_on_finished`
+handling both attach + apply) opened a modal dialog
+directly inside the QThread `finished` slot. Under PyQt5
+5.15.11 + Python 3.14 that ordering (modal exec_() while
+the worker's finished signal is still unwinding, before
+the QThread has begun teardown) has bitten the codebase
+enough times to warrant SIGABRT guards elsewhere (see
+the `_dhcp_workers` keepalive from fix J itself, and the
+same `QTimer.singleShot(0, ...)` defer pattern OSPF/BGP/
+ISIS Apply already use).
+Fix: every dialog `exec_()` and heavy UI update inside a
+`_on_finished` slot in `utils/devices_tab_dhcp.py` is now
+deferred one event-loop tick via `QTimer.singleShot(0, ...)`.
+- `_run_dhcp_pool_post::_on_finished` — both the failure
+  branch (bad HTTP / RequestException) and the success
+  branch route through a nested `_show_modal` helper that
+  runs on the next tick. The helper picks
+  `MultiDeviceResultsDialog` when importable and
+  `QMessageBox.warning/.information` as a fallback,
+  matching the pre-fix behaviour. Post-success refresh
+  (`self.refresh_dhcp_status()` + `preflight_bar.kick_
+  refresh` on apply) rides inside the same deferred
+  callback.
+- `refresh_dhcp_status::_on_finished` — table populate is
+  now inside a deferred `_do_populate` callback. Refresh
+  doesn't open a modal, but the table rebuild is heavy
+  enough (rendered rows, filter reapply, tooltip flush)
+  that the same SIGABRT-window applies.
+Files: `utils/devices_tab_dhcp.py`.
+
+**Coverage-gap tests added (T1-T3).**
+The v0.5.217 / v0.5.218 lock-in suites are entirely
+source-level greps — they catch reworded lines but not
+runtime behaviour changes. Three real mock-driven runtime
+tests fill the gaps:
+
+- **T1** — `test_T1_migration_from_pre_v05217_schema`.
+  Seeds a temp SQLite file with the pre-v0.5.217 devices
+  + device_stats schema (via a `_seed_pre_v05217_schema`
+  helper that pulls the CREATE TABLE straight out of the
+  source and pre-adds every pre-v0.5.217 migration
+  column so an unrelated migration-order bug doesn't
+  abort the run — see the helper's docstring for the
+  ospf_ipv4_uptime workaround rationale). Constructs
+  `DeviceDatabase(db_path=...)`, then asserts:
+  * `PRAGMA table_info(devices)` now lists both new
+    columns (`dhcp_manual_override` +
+    `dhcp_manual_override_time`),
+  * the seeded row survived unchanged,
+  * the new columns default to False / NULL for the
+    pre-existing row. Locks in that the v0.5.217
+    schema migration is idempotent and non-destructive.
+
+- **T2** — `test_T2_is_dhclient_running_*` (four cases).
+  Mocks `subprocess.run` to return crafted pgrep stdout:
+  * `1234 dhclient eth10\n` with query `eth1` → False
+    (the exact eth1-vs-eth10 collision fix M closed),
+  * `1234 dhclient eth1\n` with query `eth1` → True,
+  * `1234 dhclient -6 -nw eth1\n` (multi-arg form) →
+    True,
+  * empty stdout with returncode=1 → False (no match).
+  Locks in fix M's argv-parse contract at runtime.
+
+- **T3** — `test_T3_start_dhcp_server_mirrors_*` (three
+  cases, IPv4 + IPv6 + legacy-no-VRF). Records every
+  `_run_command(["ip", ...])` invocation via a
+  `_RunCommandRecorder` mock, drives `start_dhcp_server`
+  with `_resolve_device_vrf` patched to return
+  `"vrf-devT3"`, then asserts:
+  * every IPv4 pool net that got installed into the VRF
+    also has a matching plain (main-table) install —
+    mirror MUST be both tables,
+  * same for IPv6 pool nets,
+  * with `_resolve_device_vrf` patched to return None,
+    NO `vrf` argument appears in any `ip route replace`
+    call (legacy no-VRF deployments behave exactly as
+    pre-fix).
+  Locks in fix L at runtime, IPv4 + IPv6 both.
+
+**Source-level lock-ins for C1-C5.**
+Same audit-check pattern established by v0.5.207-v0.5.218
+— grep assertions on the fix site so future regressions
+remain visible:
+- C1: `_remove_route_and_vrf_copy` helper defined with
+  the same VRF-aware kwargs as `_add_route_and_vrf_copy`;
+  `stop_dhcp_server` routes every route removal through
+  it AND resolves the VRF via `_resolve_device_vrf`
+  (no stray bare `["ip", "route", "del"...]` lists
+  remain).
+- C2: `_check_server_device` no longer contains the
+  substring shell patterns; goes through
+  `_pgrep_matching_argv`; helper itself is defined at
+  module scope. Comment-stripping helper on the test
+  side keeps historical references in fix comments from
+  false-positiving the assertion.
+- C3: `start_dhcp_client` and `start_dhcp_server` both
+  write `dhcp_manual_override: False` and null
+  `dhcp_manual_override_time`.
+- C4: Every one of the three run_tgen_server.py sites
+  captures the stop_dhcp_services (or stop_dhcp_server)
+  return dict and the response payload key
+  `dhcp_stop_failures` is present.
+- C5: `_run_dhcp_pool_post::_on_finished` and
+  `refresh_dhcp_status::_on_finished` both call
+  `QTimer.singleShot`.
+
+**Version-test relaxation.**
+`tests/test_v05218_dhcp_ux_bundle.py::test_version_bumped`
+was a strict `== 0.5.218` pin — the same style v0.5.218
+relaxed on v0.5.217's version test for exactly this
+reason. Relaxed to `>= 0.5.218` so future bumps don't
+retrigger it.
+
+**Deploy notes.**
+- C1, C2, C3, C4: server-side. `netgen-server` restart on
+  srv06 required.
+- C5: client-side. New wheel install on the macOS client.
+- Recommended ordering: server first (so C2's argv-parse
+  probe and C3's manual-override clear are in place when
+  the client starts pushing Refresh / Apply through the
+  new deferred-dialog path), then client.
+
+**Files touched.**
+- `utils/dhcp.py` — C1 (new `_remove_route_and_vrf_copy`
+  helper + `stop_dhcp_server` rewire), C3 (manual-override
+  clear at top of both start_* paths). Plus `List` added
+  to the `typing` import.
+- `utils/dhcp_monitor.py` — C2 (new `_pgrep_matching_argv`
+  helper + `_check_server_device` rewire).
+- `run_tgen_server.py` — C4 (three call sites now capture
+  the return dict and thread `dhcp_stop_failures` into
+  their jsonify response).
+- `utils/devices_tab_dhcp.py` — C5 (QTimer defers on
+  refresh + attach + apply finish handlers).
+- `tests/test_v05219_dhcp_runtime.py` — new file, 20 tests
+  (5 C1-C5 source-level lock-ins + 3 T1-T3 runtime tests
+  broken out into per-scenario cases, plus a version-bump
+  lock-in).
+- `tests/test_v05218_dhcp_ux_bundle.py` — relaxed strict
+  `== 0.5.218` version pin to `>= 0.5.218`.
+- `pyproject.toml` — 0.5.218 → 0.5.219.
+
 ## [0.5.218] - 2026-08-24
 
 **DHCP UX + server-state bundle — bugs I-N off the DHCP
