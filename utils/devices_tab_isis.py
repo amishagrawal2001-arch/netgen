@@ -292,7 +292,28 @@ class ISISHandler:
 
 
     def prompt_delete_isis(self):
-        """Delete ISIS configuration for selected device."""
+        """Delete ISIS configuration for the row-selected device / AF.
+
+        v0.5.207: parity with the OSPF v0.5.205 fix. Pre-fix
+        the handler read only column 0 (device name) and always
+        fired `/api/isis/cleanup` for the whole device, so a
+        click on the IPv6 topology row also tore down the IPv4
+        adjacency. ISIS multi-topology emits one row per AF
+        (utils/devices_tab_isis.py `update_isis_table` around
+        line 856-861) so this bug hits exactly like the OSPF
+        one did.
+
+        New semantics:
+          * If both AFs are enabled and only one row is being
+            deleted: flip that AF's `*_enabled` flag off, save
+            session, refresh table. `/api/isis/cleanup` is
+            SKIPPED — whole-device cleanup would drop the
+            surviving AF's adjacency too. Next Apply ISIS
+            Configuration reconciles via the v0.5.200 cleanup-
+            then-configure path.
+          * Last enabled AF being deleted: full removal, same
+            shape as pre-fix.
+        """
         selected_items = self.parent.isis_table.selectedItems()
         if not selected_items:
             QMessageBox.warning(self.parent, "No Selection", "Please select an ISIS configuration to delete.")
@@ -300,68 +321,117 @@ class ISISHandler:
 
         row = selected_items[0].row()
         device_name = self.parent.isis_table.item(row, 0).text()  # Device column
-        
-        # Confirm deletion
-        reply = QMessageBox.question(self.parent, "Confirm Deletion", 
-                                   f"Are you sure you want to delete ISIS configuration for '{device_name}'?",
-                                   QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        
-        if reply != QMessageBox.Yes:
-            return
-        
+        # Column 2 is Neighbor Type (IPv4 / IPv6) — see
+        # `isis_headers` at line 39. A blank cell (older session
+        # / mid-rebuild race) falls through to full-removal so
+        # nothing gets silently orphaned.
+        protocol_type_item = self.parent.isis_table.item(row, 2)
+        protocol_type = protocol_type_item.text() if protocol_type_item else ""
+
         # Find the device in all_devices using safe helper
         device_info = self.parent._find_device_by_name(device_name)
-        
-        if device_info and "protocols" in device_info and "IS-IS" in device_info["protocols"]:
-            # Check if ISIS is already marked for removal
-            isis_config = device_info.get("isis_config", {}) or device_info.get("is_is_config", {})
-            if isinstance(isis_config, dict) and isis_config.get("_marked_for_removal"):
-                QMessageBox.information(self.parent, "Already Marked for Removal", 
-                                      f"ISIS configuration for '{device_name}' is already marked for removal. Click 'Apply ISIS Configuration' to remove it from the server.")
+
+        if not (device_info and "protocols" in device_info
+                and "IS-IS" in device_info["protocols"]):
+            QMessageBox.warning(self.parent, "No ISIS Configuration",
+                                f"No ISIS configuration found for device '{device_name}'.")
+            return
+
+        # Check if ISIS is already marked for removal
+        isis_config = device_info.get("isis_config", {}) or device_info.get("is_is_config", {}) or {}
+        if isinstance(isis_config, dict) and isis_config.get("_marked_for_removal"):
+            QMessageBox.information(self.parent, "Already Marked for Removal",
+                                    f"ISIS configuration for '{device_name}' is already marked for removal. Click 'Apply ISIS Configuration' to remove it from the server.")
+            return
+
+        # Determine current AF state — mirror the fallback in
+        # update_isis_table so behavior is consistent across
+        # legacy (no flags) and v0.5.207+ (explicit flags) configs.
+        device_ipv4 = bool(device_info.get("ipv4_address") or
+                           device_info.get("IPv4 Address") or
+                           (device_info.get("IPv4", "") or "").strip())
+        device_ipv6 = bool(device_info.get("ipv6_address") or
+                           device_info.get("IPv6 Address") or
+                           (device_info.get("IPv6", "") or "").strip())
+        ipv4_enabled = isis_config.get("ipv4_enabled")
+        if ipv4_enabled is None:
+            ipv4_enabled = device_ipv4
+        ipv6_enabled = isis_config.get("ipv6_enabled")
+        if ipv6_enabled is None:
+            ipv6_enabled = device_ipv6
+        both_enabled = bool(ipv4_enabled) and bool(ipv6_enabled)
+
+        # Per-AF disable path — only when BOTH AFs are enabled
+        # and the operator clicked exactly one of the two rows.
+        if both_enabled and protocol_type in ("IPv4", "IPv6"):
+            reply = QMessageBox.question(
+                self.parent, "Confirm Deletion",
+                f"Disable {protocol_type} IS-IS for '{device_name}'?\n\n"
+                f"The other address family will keep running.\n"
+                f"Click 'Apply ISIS Configuration' after to sync.",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if reply != QMessageBox.Yes:
                 return
-            
-            device_id = device_info.get("device_id")
-            
-            if device_id:
-                # Remove ISIS configuration from server first
-                server_url = self.parent.get_server_url()
-                if server_url:
-                    try:
-                        # Call server ISIS cleanup endpoint
-                        response = requests.post(f"{server_url}/api/isis/cleanup", 
-                                               json={"device_id": device_id}, 
-                                               timeout=10)
-                        
-                        if response.status_code == 200:
-                            logger.info(f"ISIS configuration removed from server for {device_name}")
-                        else:
-                            error_msg = response.json().get("error", "Unknown error")
-                            logger.error(f"Server ISIS cleanup failed for {device_name}: {error_msg}")
-                            # Continue with client-side cleanup even if server fails
-                    except requests.exceptions.RequestException as e:
-                        logger.warning(f"Network error removing ISIS from server for {device_name}: {str(e)}")
-                        # Continue with client-side cleanup even if server fails
-                else:
-                    logger.warning("No server URL available, removing ISIS configuration locally only")
-            
-            # Mark ISIS for removal instead of immediately deleting it
-            # This allows the user to apply the changes to the server later
-            if isinstance(device_info["protocols"], dict):
-                device_info["protocols"]["IS-IS"] = {"_marked_for_removal": True}
+            new_config = dict(isis_config)
+            if protocol_type == "IPv4":
+                new_config["ipv4_enabled"] = False
             else:
-                device_info["isis_config"] = {"_marked_for_removal": True}
-            
-            # Update the ISIS table to show the device as marked for removal
+                new_config["ipv6_enabled"] = False
+            device_info["isis_config"] = new_config
+            # Backward-compat mirror (`is_is_config` is used by
+            # some legacy code paths — see line 317).
+            device_info["is_is_config"] = new_config
+
             self.update_isis_table()
-            
-            # Save session
             if hasattr(self.parent.main_window, "save_session"):
                 self.parent.main_window.save_session()
-            
-            QMessageBox.information(self.parent, "ISIS Configuration Marked for Removal", 
-                                  f"ISIS configuration for '{device_name}' has been marked for removal. Click 'Apply ISIS Configuration' to remove it from the server.")
+
+            QMessageBox.information(
+                self.parent, f"{protocol_type} IS-IS Disabled",
+                f"{protocol_type} IS-IS for '{device_name}' has been "
+                f"disabled. Click 'Apply ISIS Configuration' to sync "
+                f"the change to the server."
+            )
+            return
+
+        # Full removal path — deleting the last enabled AF, or
+        # a row with no AF scope info. Same shape as pre-fix.
+        reply = QMessageBox.question(
+            self.parent, "Confirm Deletion",
+            f"Are you sure you want to delete ISIS configuration for '{device_name}'?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+
+        device_id = device_info.get("device_id")
+        if device_id:
+            server_url = self.parent.get_server_url()
+            if server_url:
+                try:
+                    response = requests.post(f"{server_url}/api/isis/cleanup",
+                                             json={"device_id": device_id},
+                                             timeout=10)
+                    if response.status_code == 200:
+                        logger.info(f"ISIS configuration removed from server for {device_name}")
+                    else:
+                        error_msg = response.json().get("error", "Unknown error")
+                        logger.error(f"Server ISIS cleanup failed for {device_name}: {error_msg}")
+                except requests.exceptions.RequestException as e:
+                    logger.warning(f"Network error removing ISIS from server for {device_name}: {str(e)}")
+            else:
+                logger.warning("No server URL available, removing ISIS configuration locally only")
+
+        if isinstance(device_info["protocols"], dict):
+            device_info["protocols"]["IS-IS"] = {"_marked_for_removal": True}
         else:
-            QMessageBox.warning(self.parent, "No ISIS Configuration", f"No ISIS configuration found for device '{device_name}'.")
+            device_info["isis_config"] = {"_marked_for_removal": True}
+
+        self.update_isis_table()
+        if hasattr(self.parent.main_window, "save_session"):
+            self.parent.main_window.save_session()
+
+        QMessageBox.information(self.parent, "ISIS Configuration Marked for Removal",
+                                f"ISIS configuration for '{device_name}' has been marked for removal. Click 'Apply ISIS Configuration' to remove it from the server.")
 
 
     def apply_isis_configurations(self):
@@ -816,25 +886,25 @@ class ISISHandler:
                     # Get ISIS status from database
                     isis_status_data = self.parent._get_isis_status_from_database(device_id)
                     
-                    # Get ISIS configuration flags
-                    # Default to True if not set, to ensure rows are shown (can be inferred from device IPs)
+                    # Get ISIS configuration flags.
+                    # v0.5.207: fixed the fallback. Pre-fix the
+                    # `else` limbs also set True unconditionally
+                    # ("Default to True to ensure rows are shown"),
+                    # so single-stack devices got phantom rows for
+                    # the AF they couldn't run. New (v0.5.207+)
+                    # ISIS configs always carry explicit flags
+                    # from the dialog; this fallback only fires
+                    # for legacy configs, where inferring from
+                    # device address presence matches reality.
                     ipv4_enabled = isis_config.get("ipv4_enabled") if isis_config else None
                     if ipv4_enabled is None:
-                        # Try to infer from device's IP addresses
-                        if device.get("ipv4_address") or device.get("IPv4 Address"):
-                            ipv4_enabled = True
-                        else:
-                            # Default to True to ensure rows are shown
-                            ipv4_enabled = True
-                    
+                        ipv4_enabled = bool(device.get("ipv4_address") or
+                                            device.get("IPv4 Address"))
+
                     ipv6_enabled = isis_config.get("ipv6_enabled") if isis_config else None
                     if ipv6_enabled is None:
-                        # Try to infer from device's IP addresses
-                        if device.get("ipv6_address") or device.get("IPv6 Address"):
-                            ipv6_enabled = True
-                        else:
-                            # Default to True to ensure rows are shown
-                            ipv6_enabled = True
+                        ipv6_enabled = bool(device.get("ipv6_address") or
+                                            device.get("IPv6 Address"))
                     
                     # Get device VLAN interface from ISIS config
                     device_interface = isis_config.get("interface", iface)

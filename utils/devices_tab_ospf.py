@@ -2736,9 +2736,36 @@ class OSPFHandler:
                     self.parent.ospf_table.cellChanged.disconnect()
                 except Exception:
                     pass  # Signal might not be connected
-                
+
+                # v0.5.207: bundle refresh + reconnect. Pre-fix
+                # the disconnect() above wiped every slot and
+                # this closure only called update_ospf_table —
+                # cellChanged was left with ZERO connections, so
+                # inline edits to any OSPF row silently dropped
+                # until something else re-wired the signal
+                # (Add/Delete via _update_device_protocol did,
+                # but nothing else in the Apply flow). Same
+                # class as the v0.5.202 BGP inline-edit bug.
+                def _refresh_and_rewire():
+                    try:
+                        self.update_ospf_table()
+                    finally:
+                        # DevicesTab-level pass-only stub — kept
+                        # for parity with _update_device_protocol.
+                        try:
+                            self.parent.ospf_table.cellChanged.connect(
+                                self.parent.on_ospf_table_cell_changed)
+                        except Exception:
+                            pass
+                        # OSPFHandler's REAL edit write-back.
+                        try:
+                            self.parent.ospf_table.cellChanged.connect(
+                                self.on_ospf_table_cell_changed)
+                        except Exception:
+                            pass
+
                 # Defer table update to prevent UI blocking
-                QTimer.singleShot(0, self.update_ospf_table)
+                QTimer.singleShot(0, _refresh_and_rewire)
             except Exception as e:
                 logger.error(f"[OSPF APPLY ERROR] Error in deferred reload and update: {e}")
         

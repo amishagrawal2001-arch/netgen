@@ -2,6 +2,117 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.207] - 2026-08-23
+
+**Cross-protocol audit bundle — four bugs adjacent to the
+v0.5.202/v0.5.203/v0.5.205 work.**
+
+After the v0.5.205 OSPF fix, a targeted audit across BGP,
+OSPF, and ISIS turned up parity gaps and one lingering
+disconnect-without-reconnect. All four fixes ship together.
+
+### 1. BGP delete no longer nukes the whole device on a
+single-neighbor click (highest blast radius)
+
+Pre-fix `utils/devices_tab_bgp.py:prompt_delete_bgp` read only
+column 0 (device name) and fired `/api/bgp/cleanup` for the
+entire device — so clicking Delete on any of the N per-neighbor
+rows in the BGP table dropped **every** BGP session on that
+router (both AFs, every peer). The BGP table shows one row per
+neighbor per AF (`bgp_headers` at line 41), so this was worse
+per-click than the analogous OSPF v0.5.205 case.
+
+Fix: read column 2 (Neighbor Type: IPv4/IPv6) and column 3
+(Neighbor IP). Remove ONLY that specific neighbor from the AF's
+comma-separated `bgp_neighbor_ipv4` / `bgp_neighbor_ipv6`
+string. `/api/bgp/cleanup` is SKIPPED (would nuke all other
+peers); next Apply BGP reconciles via the v0.5.199 cleanup-
+then-configure path. If the removal empties one AF's list, the
+`*_enabled` flag flips off so the table + apply pipeline treat
+that AF as retired. Only when BOTH lists become empty does the
+handler fall through to full-device removal (fires
+`/api/bgp/cleanup` like pre-fix).
+
+### 2. ISIS delete no longer conflates the two topologies
+
+Same shape as the OSPF v0.5.205 bug. Pre-fix
+`utils/devices_tab_isis.py:prompt_delete_isis` ignored column 2
+(Neighbor Type) and always tore down both topologies. ISIS
+multi-topology in this codebase emits one row per AF
+(`update_isis_table` around line 856-861), so a click on the
+IPv6 row also dropped the IPv4 adjacency.
+
+Fix: read column 2, per-AF `*_enabled` flip when both AFs
+enabled (`/api/isis/cleanup` skipped), full-device removal only
+when the last AF is being deleted.
+
+### 3. ISIS add dialog now has Address Families checkboxes
+
+Pre-fix `widgets/add_isis_dialog.py:get_values()` returned no
+`ipv4_enabled` / `ipv6_enabled` at all, and the
+`update_isis_table` fallback defaulted BOTH AFs to True
+unconditionally — including for single-stack devices, which is
+arguably worse than the OSPF pre-v0.5.205 behavior that at
+least gated on device address presence. Result: every ISIS Add
+produced two rows per device regardless of what the user
+wanted, and a v4-only device got a phantom v6 row.
+
+Fixes:
+- Add `Address Families` `QGroupBox` with `Enable IPv4` /
+  `Enable IPv6` checkboxes (both default checked).
+- `get_values()` emits the flags in Add mode; hides the group
+  and omits the flags in Edit mode (so the merge in
+  `_update_device_protocol` preserves stored state).
+- `_validate()` rejects zero-AF with a helpful dialog.
+- Also fixed the `update_isis_table` fallback: legacy configs
+  with no flags now infer from device address presence
+  (parity with OSPF), rather than the dead-code `else: True`
+  that flipped both AFs True regardless.
+
+### 4. OSPF Apply → inline edits no longer silently drop
+
+Pre-fix `utils/devices_tab_ospf.py` around line 2734 (the
+Apply-time deferred-reload closure) disconnected
+`ospf_table.cellChanged` with no-arg (wipes ALL slots),
+`QTimer.singleShot(0, self.update_ospf_table)` — and NEVER
+reconnected. After Apply OSPF, inline OSPF edits (timers, area,
+graceful-restart) silently no-op'd until something else re-
+wired the signal. Same class as the v0.5.202 BGP inline-edit
+bug.
+
+Fix: bundle refresh + reconnect in a single `_refresh_and_
+rewire` closure that runs under `QTimer.singleShot(0, ...)` and
+reconnects BOTH the DevicesTab pass-only stub AND the
+`OSPFHandler.on_ospf_table_cell_changed` real write-back
+handler after the refresh.
+
+### Verified non-bugs (audit cleared)
+
+- BGP add dialog — already emits AF flags.
+- BGP monitor — 200-with-empty on container-missing correctly
+  clears the DB (see v0.5.206 changelog for the trace).
+- ISIS monitor — explicit `NotFound` clear at
+  `utils/isis_monitor.py:180-206`.
+- `_update_device_protocol` dispatch in `widgets/devices_tab
+  .py:9450-9494` — all three protocol branches OK.
+- Manual-override 2-min TTL — no stuck-ON path.
+
+Files touched:
+- `utils/devices_tab_bgp.py:prompt_delete_bgp`
+- `utils/devices_tab_isis.py:prompt_delete_isis` +
+  `update_isis_table` fallback
+- `widgets/add_isis_dialog.py` (Address Families group +
+  get_values + _validate)
+- `utils/devices_tab_ospf.py` around line 2734 (Apply-time
+  refresh_and_rewire closure)
+
+Tests: `tests/test_v05207_protocol_audit_bundle.py` — 15 tests
+(BGP per-neighbor scoping across AFs + full-cleanup on last
+peer + AF flag flip; ISIS per-AF disable for both v4 and v6 +
+last-AF cleanup; ISIS add-dialog default + v4-only + zero-AF
+rejection + edit-mode hide; source-level lock-ins for all four
+fixes). 182 total BGP/OSPF/ISIS tests pass, 0 regressions.
+
 ## [0.5.206] - 2026-08-23
 
 **OSPF status stops lying green when the FRR container is

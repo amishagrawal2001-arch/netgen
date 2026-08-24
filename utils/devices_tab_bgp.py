@@ -1422,7 +1422,36 @@ class BGPHandler:
 
 
     def prompt_delete_bgp(self):
-        """Delete BGP configuration for selected device."""
+        """Delete BGP configuration for the row-selected device / neighbor.
+
+        v0.5.207: parity with OSPF v0.5.205, adapted for BGP's
+        per-neighbor row model. Pre-fix the handler read only
+        column 0 (device name) and always fired
+        `/api/bgp/cleanup` for the whole device — so a click on
+        ANY neighbor row nuked EVERY BGP session on that router
+        (both AFs, every peer). BGP's blast radius per click was
+        worse than OSPF's because the BGP table shows one row
+        per neighbor per AF (`bgp_headers` at line 41), so a
+        device with 4 peers had 4 rows and any one Delete
+        wiped all four.
+
+        New semantics:
+          * Read the row's Neighbor Type (col 2) + Neighbor IP
+            (col 3). Remove ONLY that specific neighbor IP from
+            the AF's comma-separated `bgp_neighbor_ipv4` or
+            `bgp_neighbor_ipv6` string. `/api/bgp/cleanup` is
+            SKIPPED — whole-device cleanup would drop all other
+            peers too. Save + refresh; next Apply BGP
+            Configuration reconciles via the v0.5.199 cleanup-
+            then-configure path.
+          * If BOTH neighbor lists become empty after the
+            removal, this was the last peer → full-device
+            removal, same shape as pre-fix (marks bgp_config for
+            removal and fires `/api/bgp/cleanup`).
+          * Row with no scope info (blank Neighbor IP or a
+            transitional cell) falls through to full removal so
+            nothing gets silently orphaned.
+        """
         selected_items = self.parent.bgp_table.selectedItems()
         if not selected_items:
             QMessageBox.warning(self.parent, "No Selection", "Please select a BGP configuration to delete.")
@@ -1430,61 +1459,138 @@ class BGPHandler:
 
         row = selected_items[0].row()
         device_name = self.parent.bgp_table.item(row, 0).text()  # Device column
-        
-        # Confirm deletion
-        reply = QMessageBox.question(self.parent, "Confirm Deletion", 
-                                   f"Are you sure you want to delete BGP configuration for '{device_name}'?",
-                                   QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
-        
-        if reply != QMessageBox.Yes:
-            return
-        
+        # Column 2 = Neighbor Type, Column 3 = Neighbor IP.
+        # See `bgp_headers` at line 41 of this file.
+        neighbor_type_item = self.parent.bgp_table.item(row, 2)
+        neighbor_ip_item = self.parent.bgp_table.item(row, 3)
+        neighbor_type = neighbor_type_item.text().strip() if neighbor_type_item else ""
+        neighbor_ip = neighbor_ip_item.text().strip() if neighbor_ip_item else ""
+
         # Find the device in all_devices using safe helper
         device_info = self.parent._find_device_by_name(device_name)
-        
-        if device_info and "protocols" in device_info and "BGP" in device_info["protocols"]:
-            device_id = device_info.get("device_id")
-            
-            if device_id:
-                # Remove BGP configuration from server first
-                server_url = self.parent.get_server_url()
-                if server_url:
-                    try:
-                        # Call server BGP cleanup endpoint
-                        response = requests.post(f"{server_url}/api/bgp/cleanup", 
-                                               json={"device_id": device_id}, 
-                                               timeout=10)
-                        
-                        if response.status_code == 200:
-                            logger.info(f"BGP configuration removed from server for {device_name}")
-                        else:
-                            error_msg = response.json().get("error", "Unknown error")
-                            logger.error(f"Server BGP cleanup failed for {device_name}: {error_msg}")
-                            # Continue with client-side cleanup even if server fails
-                    except requests.exceptions.RequestException as e:
-                        logger.warning(f"Network error removing BGP from server for {device_name}: {str(e)}")
-                        # Continue with client-side cleanup even if server fails
-                else:
-                    logger.warning("No server URL available, removing BGP configuration locally only")
-            
-            # Mark BGP for removal instead of immediately deleting it
-            # This allows the user to apply the changes to the server later
-            if isinstance(device_info["protocols"], dict):
-                device_info["protocols"]["BGP"] = {"_marked_for_removal": True}
-            else:
-                device_info["bgp_config"] = {"_marked_for_removal": True}
-            
-            # Update the BGP table to show the device as marked for removal
-            self.parent.update_bgp_table()
-            
-            # Save session
-            if hasattr(self.parent.main_window, "save_session"):
-                self.parent.main_window.save_session()
-            
-            QMessageBox.information(self.parent, "BGP Configuration Marked for Removal", 
-                                  f"BGP configuration for '{device_name}' has been marked for removal. Click 'Apply BGP Configuration' to remove it from the server.")
+
+        if not (device_info and "protocols" in device_info
+                and "BGP" in device_info["protocols"]):
+            QMessageBox.warning(self.parent, "No BGP Configuration",
+                                f"No BGP configuration found for device '{device_name}'.")
+            return
+
+        # Extract current bgp_config in a format-agnostic way
+        # (handles both old dict `protocols["BGP"]` layout and
+        # new list layout with sibling `bgp_config`).
+        if isinstance(device_info["protocols"], dict):
+            bgp_config = device_info["protocols"].get("BGP", {}) or {}
         else:
-            QMessageBox.warning(self.parent, "No BGP Configuration", f"No BGP configuration found for device '{device_name}'.")
+            bgp_config = device_info.get("bgp_config", {}) or {}
+
+        # Peel out the current per-AF neighbor lists. Comma-
+        # separated strings per `on_bgp_table_cell_changed` at
+        # ~line 1516-1520.
+        def _split(csv):
+            return [ip.strip() for ip in (csv or "").split(",") if ip.strip()]
+        ipv4_ips = _split(bgp_config.get("bgp_neighbor_ipv4", ""))
+        ipv6_ips = _split(bgp_config.get("bgp_neighbor_ipv6", ""))
+
+        # Per-neighbor removal — only when the row provides both
+        # scope pieces AND the neighbor is actually in the
+        # config's list AND removing it leaves at least one
+        # other neighbor. Otherwise fall through to full-removal.
+        can_scope = (
+            neighbor_type in ("IPv4", "IPv6")
+            and neighbor_ip
+            and (
+                (neighbor_type == "IPv4" and neighbor_ip in ipv4_ips)
+                or (neighbor_type == "IPv6" and neighbor_ip in ipv6_ips)
+            )
+        )
+
+        if can_scope:
+            # Compute post-removal state.
+            new_ipv4 = [ip for ip in ipv4_ips if ip != neighbor_ip] \
+                if neighbor_type == "IPv4" else list(ipv4_ips)
+            new_ipv6 = [ip for ip in ipv6_ips if ip != neighbor_ip] \
+                if neighbor_type == "IPv6" else list(ipv6_ips)
+
+            if new_ipv4 or new_ipv6:
+                # At least one peer survives → per-neighbor path.
+                reply = QMessageBox.question(
+                    self.parent, "Confirm Deletion",
+                    f"Remove {neighbor_type} BGP neighbor {neighbor_ip} "
+                    f"from '{device_name}'?\n\n"
+                    f"Other BGP peers on this device will keep running.\n"
+                    f"Click 'Apply BGP Configuration' after to sync.",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+                if reply != QMessageBox.Yes:
+                    return
+                bgp_config["bgp_neighbor_ipv4"] = ",".join(new_ipv4)
+                bgp_config["bgp_neighbor_ipv6"] = ",".join(new_ipv6)
+                # If the AF lost its last peer, flip its enable
+                # flag off so the table + apply pipeline treat
+                # the AF as retired.
+                if neighbor_type == "IPv4" and not new_ipv4 and \
+                        "ipv4_enabled" in bgp_config:
+                    bgp_config["ipv4_enabled"] = False
+                if neighbor_type == "IPv6" and not new_ipv6 and \
+                        "ipv6_enabled" in bgp_config:
+                    bgp_config["ipv6_enabled"] = False
+                # Persist back through whichever layout the
+                # protocols field uses.
+                if isinstance(device_info["protocols"], dict):
+                    device_info["protocols"]["BGP"] = bgp_config
+                else:
+                    device_info["bgp_config"] = bgp_config
+
+                self.parent.update_bgp_table()
+                if hasattr(self.parent.main_window, "save_session"):
+                    self.parent.main_window.save_session()
+
+                QMessageBox.information(
+                    self.parent, "BGP Neighbor Removed",
+                    f"{neighbor_type} BGP neighbor {neighbor_ip} "
+                    f"removed from '{device_name}'. Click 'Apply BGP "
+                    f"Configuration' to sync the change to the server."
+                )
+                return
+            # else: neighbor list would be empty → fall through
+            # to full-device removal below.
+
+        # Full removal path — original semantics.
+        reply = QMessageBox.question(
+            self.parent, "Confirm Deletion",
+            f"Are you sure you want to delete BGP configuration for '{device_name}'?",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if reply != QMessageBox.Yes:
+            return
+
+        device_id = device_info.get("device_id")
+        if device_id:
+            server_url = self.parent.get_server_url()
+            if server_url:
+                try:
+                    response = requests.post(f"{server_url}/api/bgp/cleanup",
+                                             json={"device_id": device_id},
+                                             timeout=10)
+                    if response.status_code == 200:
+                        logger.info(f"BGP configuration removed from server for {device_name}")
+                    else:
+                        error_msg = response.json().get("error", "Unknown error")
+                        logger.error(f"Server BGP cleanup failed for {device_name}: {error_msg}")
+                except requests.exceptions.RequestException as e:
+                    logger.warning(f"Network error removing BGP from server for {device_name}: {str(e)}")
+            else:
+                logger.warning("No server URL available, removing BGP configuration locally only")
+
+        if isinstance(device_info["protocols"], dict):
+            device_info["protocols"]["BGP"] = {"_marked_for_removal": True}
+        else:
+            device_info["bgp_config"] = {"_marked_for_removal": True}
+
+        self.parent.update_bgp_table()
+        if hasattr(self.parent.main_window, "save_session"):
+            self.parent.main_window.save_session()
+
+        QMessageBox.information(self.parent, "BGP Configuration Marked for Removal",
+                                f"BGP configuration for '{device_name}' has been marked for removal. Click 'Apply BGP Configuration' to remove it from the server.")
 
 
     def on_bgp_table_cell_changed(self, row, column):
