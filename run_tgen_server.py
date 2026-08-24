@@ -252,6 +252,40 @@ def _strict_true(value):
     return value is True
 
 
+def _router_vrf_suffix(device_id=None):
+    """Return " vrf <vrf-name>" when the device has a live per-
+    device Linux VRF iface on the host, else "".
+
+    v0.5.211: shared with `_bgp_router_clause` in spirit. OSPF /
+    OSPF6 / ISIS route-advertisement emit `router ospf` etc.
+    without any VRF qualifier — but when the device is wired
+    into a per-device VRF, that lands on the phantom default-
+    VRF instance (no interfaces, no neighbors) instead of the
+    real one. Operator report on JNPR-MAC-HWXVX1 2026-08-23:
+    `vtysh -c 'show run'` showed the working
+    `router ospf vrf vrf-889abd63d40` (no redistribute) AND a
+    useless `router ospf` (with the redistribute we tried to
+    add). Suffix this on the router-mode line so the
+    redistribute lands on the right instance. Falls back to
+    empty suffix on single-device / legacy deployments so
+    default-VRF behaviour still works.
+    """
+    try:
+        if device_id:
+            from utils.frr_docker import FRRDockerManager
+            vrf_name = FRRDockerManager().vrf_name_for_device(device_id)
+            if vrf_name:
+                check = subprocess.run(
+                    ["ip", "-o", "link", "show", vrf_name],
+                    capture_output=True, text=True, timeout=2,
+                )
+                if check.returncode == 0 and (check.stdout or "").strip():
+                    return f" vrf {vrf_name}"
+    except Exception as exc:
+        logging.debug(f"[VRF] router-clause VRF lookup failed for {device_id}: {exc}")
+    return ""
+
+
 def _bgp_router_clause(asn, device_id=None):
     """Return the right `router bgp <asn>` line for vtysh based on
     whether the device is wired into a per-device Linux VRF.
@@ -8357,16 +8391,31 @@ def configure_ospf_route_advertisement(device_id, device_name, area_id, route_po
                 logging.error(f"[OSPF ROUTE ADV] Error processing pool {pool_name}: {e}")
                 continue
         
-        # Configure OSPF/OSPF6 redistribution AFTER all static routes and prefix-list entries are added
+        # v0.5.211: bind the redistribute to the device's VRF-
+        # scoped OSPF instance. Devices run in a per-device
+        # Linux VRF (`vrf-{device_id}`) — FRR/zebra promotes
+        # any OSPF instance whose interface is in that VRF to
+        # `router ospf vrf vrf-{device_id}`. Pre-fix this code
+        # emitted plain `router ospf` (default VRF), which
+        # FRR treated as a SEPARATE new instance with no
+        # interfaces and no neighbors. Redistribute-static
+        # landed there and generated zero LSAs. Operator ran
+        # `vtysh -c 'show run'` on JNPR-MAC-HWXVX1
+        # 2026-08-23 and saw TWO router-ospf blocks — the
+        # working one (`router ospf vrf vrf-889abd63d40`)
+        # without redistribute, and the useless one
+        # (`router ospf`) with it. Adding the VRF suffix
+        # places the redistribute on the right router.
+        _vrf_suffix = _router_vrf_suffix(device_id)
         if is_ipv6:
             vtysh_commands.extend([
-                "router ospf6",
+                f"router ospf6{_vrf_suffix}",
                 f" redistribute static route-map RM-OSPF6-EXPORT",
                 "exit"
             ])
         else:
             vtysh_commands.extend([
-                "router ospf",
+                f"router ospf{_vrf_suffix}",
                 f" redistribute static route-map RM-OSPF-EXPORT",
                 "exit"
             ])
@@ -8484,15 +8533,26 @@ def cleanup_ospf_route_advertisement(device_id, device_name, area_id, af_type=No
         
         # Remove OSPF redistribution based on AF
         if not is_ipv6_only:
+            # v0.5.211: VRF-scoped router — see configure_ospf_
+            # route_advertisement for the full context. Removing
+            # `redistribute static` from the default-VRF router
+            # ospf (pre-fix) was a no-op because the redistribute
+            # was never really being applied there in a
+            # meaningful way; but it also failed to remove the
+            # (broken) config we did land on the default-VRF
+            # router. Post-fix cleanup targets the same VRF-
+            # scoped router the configure path uses.
+            _vrf_suffix_c = _router_vrf_suffix(device_id)
             cleanup_commands.extend([
-                "router ospf",
+                f"router ospf{_vrf_suffix_c}",
                 " no redistribute static route-map RM-OSPF-EXPORT",
                 "exit"
             ])
-        
+
         if not is_ipv4_only:
+            _vrf_suffix_c = _router_vrf_suffix(device_id)
             cleanup_commands.extend([
-                "router ospf6",
+                f"router ospf6{_vrf_suffix_c}",
                 " no redistribute static route-map RM-OSPF6-EXPORT",
                 "exit"
             ])
@@ -8826,17 +8886,21 @@ def configure_isis_route_advertisement(device_id, device_name, area_id, route_po
                 logging.error(f"[ISIS ROUTE ADV] Error processing pool {pool_name}: {e}")
                 continue
         
-        # Configure ISIS redistribution AFTER all static routes and prefix-list entries are added
+        # v0.5.211: bind the redistribute to the device's VRF-
+        # scoped ISIS instance — same class as the OSPF fix
+        # (`router isis CORE` alone lands on the default-VRF
+        # instance which has no interfaces).
+        _vrf_suffix = _router_vrf_suffix(device_id)
         vtysh_commands.extend([
-            "router isis CORE",
+            f"router isis CORE{_vrf_suffix}",
         ])
-        
+
         # Add address-family specific redistribution based on AF type
         if is_ipv6:
             vtysh_commands.append(" redistribute ipv6 static level-2 route-map RM-ISIS6-EXPORT")
         else:
             vtysh_commands.append(" redistribute ipv4 static level-2 route-map RM-ISIS-EXPORT")
-        
+
         vtysh_commands.append("exit")
         
         # Use vtysh with here document to execute all commands at once
@@ -8936,8 +9000,16 @@ def cleanup_isis_route_advertisement(device_id, device_name, area_id, af_type=No
                 "no route-map RM-ISIS6-EXPORT",
             ])
         
-        cleanup_commands.append("router isis CORE")
-        
+        # v0.5.211: VRF-scoped ISIS router (parity with the
+        # configure path above). Removing redistribute from the
+        # default-VRF `router isis CORE` was a no-op — the
+        # broken config landed on the VRF-scoped router (which
+        # doesn't have redistribute) or the default-VRF router
+        # (which has no interfaces). Post-fix cleanup targets
+        # the same instance the configure path uses.
+        _vrf_suffix_c = _router_vrf_suffix(device_id)
+        cleanup_commands.append(f"router isis CORE{_vrf_suffix_c}")
+
         # Remove AF-specific redistribution based on af_type
         if not is_ipv6_only:
             cleanup_commands.append(" no redistribute ipv4 static level-2 route-map RM-ISIS-EXPORT")

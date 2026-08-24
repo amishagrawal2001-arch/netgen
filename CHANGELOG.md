@@ -2,6 +2,82 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.211] - 2026-08-23
+
+**OSPF / IS-IS route-pool advertisement now lands on the
+device's VRF-scoped router — routes actually advertise to the
+peer.**
+
+Operator report on JNPR-MAC-HWXVX1 2026-08-23: attached route
+pools to OSPF v4 and v6, applied, config looked fine — but
+`run show route protocol ospf` / `ospf3` on the peer switch
+returned nothing except the OSPF multicast address. FRR
+`show running-config` on the device container showed the smoking
+gun:
+
+```
+router ospf vrf vrf-889abd63d40    ← real one, has the neighbor
+ ospf router-id 192.255.0.1
+ network 192.168.0.0/24 area 0.0.0.0
+!
+router ospf                         ← phantom default-VRF, no interfaces
+ redistribute static route-map RM-OSPF-EXPORT   ← redistribute is HERE
+```
+
+Two separate `router ospf` instances. The one with the working
+neighbor didn't have `redistribute static`. The one with
+`redistribute static` had no neighbors — so zero type-5 LSAs
+generated, zero external routes advertised.
+
+Root cause: `configure_ospf_route_advertisement` and
+`configure_isis_route_advertisement` emitted `router ospf` /
+`router ospf6` / `router isis CORE` without any VRF qualifier.
+Devices run in a per-device Linux VRF (`vrf-<device_id>`); FRR/
+zebra auto-scopes any router whose interface is in that VRF to
+`router X vrf vrf-<device_id>`. A subsequent bare `router X`
+command creates a SEPARATE default-VRF instance. Static routes
+were correctly placed in the VRF's RIB, but the redistribute
+was on the wrong router.
+
+BGP was already fine — it uses the existing
+`_bgp_router_clause(asn, device_id)` helper (shipped for
+v0.5.193's shutdown noop) which suffixes `vrf <name>` when the
+device's VRF interface exists on the host. OSPF/ISIS didn't
+have an analogous helper.
+
+Fix:
+- New helper `_router_vrf_suffix(device_id)` returns `" vrf
+  <vrf-name>"` when the per-device Linux VRF is live on the
+  host, else `""`. Same host-check pattern as
+  `_bgp_router_clause`, so legacy single-device deployments
+  keep working with the default VRF.
+- `configure_ospf_route_advertisement` — v4 (`router ospf`) and
+  v6 (`router ospf6`) redistribute now go on the VRF-scoped
+  router.
+- `cleanup_ospf_route_advertisement` — same VRF suffix on both
+  v4 and v6 cleanup.
+- `configure_isis_route_advertisement` — `router isis CORE`
+  gets the VRF suffix.
+- `cleanup_isis_route_advertisement` — same.
+
+Files touched:
+- `run_tgen_server.py` — new `_router_vrf_suffix` helper +
+  four route-adv call sites updated.
+
+Tests: `tests/test_v05211_route_adv_vrf_suffix.py` — 6 source-
+level lock-ins (helper exists, OSPF/OSPF6 configure/cleanup use
+it, ISIS configure/cleanup use it, legacy no-VRF returns bare
+suffix).
+
+**Server-side fix** — netgen-server restart required on srv06
+to pick up the new helper. Existing broken redistribute-static
+entries on the default-VRF `router ospf` / `router ospf6` will
+persist until you either (a) restart the device container so
+FRR re-reads config from scratch, or (b) manually clean them
+via `vtysh -c 'no router ospf'` (won't touch the VRF-scoped one).
+After the fix, re-apply route pools and routes will actually
+advertise.
+
 ## [0.5.210] - 2026-08-23
 
 **OSPFv3 no longer silently fails on freshly created FRR
