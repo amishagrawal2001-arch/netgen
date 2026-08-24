@@ -9386,6 +9386,23 @@ class DevicesTab(QWidget):
                                     merged_config["ipv4_enabled"] = existing_config["ipv4_enabled"]
                                 if "ipv6_enabled" not in config and "ipv6_enabled" in existing_config:
                                     merged_config["ipv6_enabled"] = existing_config["ipv6_enabled"]
+                                # v0.5.209: additive Add — a fresh
+                                # Add IS-IS call must not silently
+                                # disable an AF that's already up.
+                                # Pre-fix: user opens Add IS-IS,
+                                # unchecks IPv4 (to indicate "only
+                                # add v6, please"), clicks Add — and
+                                # the merged_config.update(config)
+                                # above set ipv4_enabled=False,
+                                # losing the existing IPv4 IS-IS
+                                # topology. Now: if existing had it
+                                # enabled, it stays enabled — to
+                                # remove an AF, use the Delete
+                                # button on that row (v0.5.207).
+                                if existing_config.get("ipv4_enabled"):
+                                    merged_config["ipv4_enabled"] = True
+                                if existing_config.get("ipv6_enabled"):
+                                    merged_config["ipv6_enabled"] = True
                             # For OSPF config, ensure area_id_ipv4 and area_id_ipv6 are preserved if not in update
                             elif protocol == "OSPF":
                                 # CRITICAL: Only preserve fields that are NOT being updated
@@ -9416,6 +9433,26 @@ class DevicesTab(QWidget):
                                     merged_config["p2p_ipv6"] = existing_config["p2p_ipv6"]
                                 if "p2p" not in config and "p2p" in existing_config:
                                     merged_config["p2p"] = existing_config["p2p"]  # For backward compatibility
+                                # v0.5.209: additive Add — same
+                                # shape as the ISIS branch above.
+                                # Operator report on JNPR-MAC-
+                                # HWXVX1 2026-08-23: "tried to add
+                                # ospf ipv6, it overwritten the
+                                # existing ipv4 ospf in the ospf
+                                # table". Root cause: the
+                                # `merged_config.update(config)`
+                                # above overwrites `ipv4_enabled`
+                                # with the dialog's False when the
+                                # operator only checks IPv6 for the
+                                # new Add. Additive-preserve keeps
+                                # the existing True sticky — Add
+                                # only adds AFs, never removes them.
+                                # To remove an AF, use the per-AF
+                                # Delete on that row (v0.5.205).
+                                if existing_config.get("ipv4_enabled"):
+                                    merged_config["ipv4_enabled"] = True
+                                if existing_config.get("ipv6_enabled"):
+                                    merged_config["ipv6_enabled"] = True
                             device[config_key] = merged_config
                             # For ISIS, also update isis_config for backward compatibility
                             if protocol in ["IS-IS", "ISIS"]:

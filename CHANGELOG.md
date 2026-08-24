@@ -2,6 +2,45 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.209] - 2026-08-23
+
+**Add OSPF / Add IS-IS is now additive on address families —
+adding IPv6 no longer silently disables an existing IPv4
+adjacency.**
+
+Operator report on JNPR-MAC-HWXVX1 2026-08-23 (immediately
+after v0.5.208): device had IPv4 OSPF up (green Full/Backup).
+Operator opened Add OSPF, unchecked IPv4 and checked IPv6
+(intending "add IPv6"), clicked Add. The IPv4 row disappeared —
+existing v4 got silently disabled.
+
+Root cause: `widgets/devices_tab.py:_update_device_protocol`
+merges the new config with existing via `merged_config.update
+(config)`. Post-v0.5.205 the Add OSPF dialog ALWAYS emits
+`ipv4_enabled` / `ipv6_enabled` from its checkboxes, so
+update() overwrites the existing True with the dialog's False.
+The OSPF branch preserved `area_id_ipv4/6`,
+`graceful_restart_ipv4/6`, `route_pools`, `p2p_ipv4/6` — but
+NOT the enable flags. Same shape in the IS-IS branch post-
+v0.5.207.
+
+Fix: additive-preserve. If `existing_config` had an AF
+enabled, the merged config keeps it enabled regardless of what
+the dialog said. Add only enables AFs; it never disables them.
+To disable an AF, use the per-AF Delete button on that row
+(v0.5.205 for OSPF, v0.5.207 for ISIS).
+
+Files touched:
+- `widgets/devices_tab.py:_update_device_protocol` — OSPF and
+  IS-IS branches gain the additive-preserve pair.
+
+Tests: `tests/test_v05209_add_protocol_additive.py` — 8 tests
+(OSPF add-v6-preserves-v4 as reported; symmetric add-v4-
+preserves-v6; default both checked still enables both on a
+fresh device; ISIS parity in both directions; Edit-mode
+omitted-flags don't disable; source-level lock-ins for both
+branches).
+
 ## [0.5.208] - 2026-08-23
 
 **OSPF table's Interface column no longer reads "Unknown" when
