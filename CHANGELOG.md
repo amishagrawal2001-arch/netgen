@@ -2,6 +2,53 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.210] - 2026-08-23
+
+**OSPFv3 no longer silently fails on freshly created FRR
+containers.**
+
+Operator report on JNPR-MAC-HWXVX1 2026-08-23: added a new
+device with BGP v4+v6 and OSPF v4+v6 all enabled up-front.
+OSPFv3 (IPv6) didn't come up on FRR. Selecting the v6 row in
+the OSPF table and clicking Apply worked — by the time the
+second apply ran, `ospf6d` was fully initialized.
+
+Root cause: `configure_ospf_neighbor` in `utils/ospf.py` had a
+readiness retry loop that only tested `vtysh -c 'show ip ospf'`
+(the v4 daemon, `ospfd`). On a freshly-created container
+`ospf6d` takes longer to initialize than `ospfd`. If the vtysh
+heredoc batch ran while `ospf6d` was still starting, the v6
+commands (`router ospf6 …`, `interface X\n ipv6 ospf6 area …`)
+were silently rejected — but vtysh returns exit_code 0 for the
+whole batch based on parser success, not per-command success.
+`configure_ospf_neighbor` returned True, the client saw
+"success", and OSPFv3 was quietly not configured. A later
+manual apply hit a fully-ready `ospf6d` and worked.
+
+Fix:
+- The readiness loop now gates on BOTH `ospfd` and `ospf6d`.
+  Break only when both required daemons respond.
+- `want_ipv6` peeks at `ospf_config["ipv6_enabled"]` (or the
+  `ipv6` payload arg) so v4-only applies don't stall waiting
+  for `ospf6d`.
+- Respects `_apply_address_families` — a manual partial-apply
+  scoped to `["IPv4"]` skips the ospf6d wait.
+- Failure warning names both daemons so the ospf6d flavor of
+  this bug is grep-able in server logs.
+
+Files touched:
+- `utils/ospf.py` — `configure_ospf_neighbor` readiness loop.
+
+Tests: `tests/test_v05210_ospf6_daemon_readiness.py` — 6
+source-level lock-ins (ospf6d probed, ospfd still probed,
+want_ipv6 gate, partial-apply narrowing, break requires both
+daemons, warning names both).
+
+**Server-side fix** — netgen-server restart required on srv06
+to pick up the new readiness gate. Existing devices are
+unaffected (their containers are already warm). Fresh Add
+Device flows will no longer skip OSPFv3.
+
 ## [0.5.209] - 2026-08-23
 
 **Add OSPF / Add IS-IS is now additive on address families —

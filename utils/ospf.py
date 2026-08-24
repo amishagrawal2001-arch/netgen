@@ -179,29 +179,69 @@ def configure_ospf_neighbor(
             else:
                 return result[0]
         
+        # v0.5.210: peek at ipv4_enabled/ipv6_enabled from the
+        # payload BEFORE the readiness loop so we can gate on
+        # both daemons (ospfd + ospf6d) when both AFs will be
+        # configured. Pre-fix the loop only tested `show ip
+        # ospf` — on a freshly created container ospf6d takes
+        # longer to initialize than ospfd, and if the vtysh
+        # heredoc ran while ospf6d was still starting the v6
+        # commands got silently rejected ("ospf6d not running")
+        # while vtysh returned exit_code 0 for the whole batch,
+        # so configure_ospf_neighbor returned True and the
+        # client saw "success". Operator symptom on JNPR-MAC-
+        # HWXVX1 2026-08-23: new device with BGP+OSPF v4+v6
+        # → OSPFv3 didn't come up until they re-applied the v6
+        # row manually (by which time ospf6d was fully ready).
+        # This peek doesn't compute the final flags — that
+        # happens at ~line 277 below with the full inference
+        # chain — it only checks whether we should also gate
+        # on ospf6d.
+        want_ipv4 = ospf_config.get("ipv4_enabled", True)
+        want_ipv6 = ospf_config.get("ipv6_enabled", False) or bool(ipv6)
+        # Honor partial-apply: if the caller scoped this apply
+        # to specific AFs, only wait for the matching daemons.
+        _peek_partial = ospf_config.get("_apply_address_families") or []
+        if _peek_partial:
+            want_ipv4 = want_ipv4 and "IPv4" in _peek_partial
+            want_ipv6 = want_ipv6 and "IPv6" in _peek_partial
+
+        ospf6d_ready = not want_ipv6  # skip the v6 check if we don't need it
+
+        def _daemon_ready(cmd: str, missing_marker: str) -> bool:
+            """Return True when `vtysh -c cmd` returns success or
+            an output that doesn't say the daemon is missing."""
+            try:
+                r = exec_run_with_timeout(cmd, timeout_sec=3)
+                if not r:
+                    return False
+                output = r.output.decode('utf-8') if isinstance(r.output, bytes) else str(r.output)
+                return r.exit_code == 0 or missing_marker not in output
+            except Exception:
+                return False
+
         for attempt in range(max_retries):
             try:
-                # Check if ospfd is ready by running an OSPF-specific command (like BGP does)
-                # This ensures ospfd is actually ready to accept configuration commands
-                check_result = exec_run_with_timeout("vtysh -c 'show ip ospf'", timeout_sec=3)
-                check_output = check_result.output.decode('utf-8') if isinstance(check_result.output, bytes) else str(check_result.output) if check_result else ""
-                
-                if check_result and (check_result.exit_code == 0 or "ospfd is not running" not in check_output):
-                    ospfd_ready = True
-                    logging.info(f"[OSPF CONFIGURE] Container and FRR daemons ready for {device_name} (attempt {attempt + 1})")
+                if not ospfd_ready:
+                    ospfd_ready = _daemon_ready(
+                        "vtysh -c 'show ip ospf'", "ospfd is not running")
+                if want_ipv6 and not ospf6d_ready:
+                    ospf6d_ready = _daemon_ready(
+                        "vtysh -c 'show ipv6 ospf6'", "ospf6d is not running")
+
+                if ospfd_ready and ospf6d_ready:
+                    logging.info(f"[OSPF CONFIGURE] Container and FRR daemons ready for {device_name} (attempt {attempt + 1}, ipv4={ospfd_ready}, ipv6={ospf6d_ready if want_ipv6 else 'n/a'})")
                     break
                 else:
-                    # OSPF daemon not ready yet or timeout
-                    logging.debug(f"[OSPF CONFIGURE] OSPF daemon not ready yet (attempt {attempt + 1}/{max_retries})")
+                    logging.debug(f"[OSPF CONFIGURE] Daemons not fully ready yet (attempt {attempt + 1}/{max_retries}, ospfd={ospfd_ready}, ospf6d={ospf6d_ready})")
             except Exception as e:
-                # Container exec failed
                 logging.debug(f"[OSPF CONFIGURE] Container exec failed (attempt {attempt + 1}/{max_retries}): {e}")
-            
+
             if attempt < max_retries - 1:
                 time.sleep(retry_delay)
             else:
-                if not ospfd_ready:
-                    logging.warning(f"[OSPF CONFIGURE] OSPF daemon not ready after {max_retries} attempts for {device_name}, proceeding anyway (may fail)")
+                if not (ospfd_ready and ospf6d_ready):
+                    logging.warning(f"[OSPF CONFIGURE] Daemons not fully ready after {max_retries} attempts for {device_name} (ospfd={ospfd_ready}, ospf6d={ospf6d_ready}), proceeding anyway (may fail — the v6 commands can be silently rejected by a not-yet-ready ospf6d, in which case a follow-up apply will succeed)")
         
         # Extract OSPF configuration
         # Support separate area IDs for IPv4 and IPv6, with backward compatibility
