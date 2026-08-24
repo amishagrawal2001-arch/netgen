@@ -5,6 +5,7 @@ DHCP client/server lifecycle helpers for OSTG devices.
 import json
 import logging
 import os
+import re
 import shlex
 import subprocess
 import time
@@ -462,6 +463,110 @@ def _migrate_dhcp_route_to_vrf(
     return True
 
 
+def _resolve_device_vrf(device_id: str) -> Optional[str]:
+    """Return the VRF name for a device if one exists on the host.
+
+    v0.5.218 (audit fix L): mirrors the VRF-lookup half of
+    ``_migrate_dhcp_route_to_vrf`` so the server-mode route-install
+    path can reuse it without pulling in the client-path migration
+    logic. Returns None if no FRR manager is available, the device
+    isn't wired to a VRF, or the VRF interface isn't present on the
+    host (legacy single-device / no-VRF deployments).
+    """
+    if not device_id:
+        return None
+    try:
+        from utils.frr_docker import FRRDockerManager
+        vrf_name = FRRDockerManager().vrf_name_for_device(device_id)
+        if not vrf_name:
+            return None
+        check = subprocess.run(
+            ["ip", "-o", "link", "show", vrf_name],
+            capture_output=True, text=True, timeout=2,
+        )
+        if check.returncode != 0 or not (check.stdout or "").strip():
+            return None
+        return vrf_name
+    except Exception as exc:
+        logger.debug(
+            "[DHCP VRF] could not look up VRF for device %s: %s",
+            device_id, exc,
+        )
+        return None
+
+
+def _add_route_and_vrf_copy(
+    net: str,
+    *,
+    gateway: str = "",
+    interface: str = "",
+    family: str = "ipv4",
+    vrf_name: Optional[str] = None,
+    container=None,
+    log_prefix: str = "[DHCP]",
+    label: str = "route",
+) -> None:
+    """Install a route into the main table, and mirror it into the
+    device's VRF table when a VRF exists.
+
+    v0.5.218 (audit fix L): the server-mode DHCP path used to only
+    run ``ip route replace`` against host tables. When the DHCP
+    server's interface is enslaved to a per-device VRF
+    (``vrf-<device_id>``), routes in the main table are invisible to
+    VRF-bound sockets and dnsmasq clients on the far side never see
+    the return traffic. The client path handles this via
+    ``_migrate_dhcp_route_to_vrf``; this helper is the server-path
+    equivalent that gets called for each pool + gateway + static
+    route so both the main table AND the VRF table hold the route.
+    Legacy no-VRF deployments early-return harmlessly (vrf_name is
+    None) and only the main-table route is installed — mirrors the
+    pre-fix behaviour.
+    """
+    ip_flag = "-6" if family == "ipv6" else "-4"
+    # Main table (unchanged pre-fix behaviour).
+    try:
+        cmd = ["ip", ip_flag, "route", "replace", str(net)]
+        if gateway:
+            cmd.extend(["via", gateway])
+        if interface:
+            cmd.extend(["dev", interface])
+        _run_command(cmd, timeout=5, container=container)
+        logger.info(
+            "%s Added %s %s%s%s",
+            log_prefix, label, str(net),
+            f" via {gateway}" if gateway else "",
+            f" dev {interface}" if interface else "",
+        )
+    except Exception as route_exc:
+        logger.warning(
+            "%s Failed to add %s %s: %s",
+            log_prefix, label, str(net), route_exc,
+        )
+
+    # VRF-scoped mirror (v0.5.218) — only when the device sits in a VRF.
+    if not vrf_name:
+        return
+    try:
+        vrf_cmd = ["ip", ip_flag, "route", "replace", str(net)]
+        if gateway:
+            vrf_cmd.extend(["via", gateway])
+        if interface:
+            vrf_cmd.extend(["dev", interface])
+        vrf_cmd.extend(["vrf", vrf_name])
+        _run_command(vrf_cmd, timeout=5, container=container)
+        logger.info(
+            "%s Added %s %s in vrf %s%s%s",
+            log_prefix, label, str(net), vrf_name,
+            f" via {gateway}" if gateway else "",
+            f" dev {interface}" if interface else "",
+        )
+    except Exception as vrf_exc:
+        logger.warning(
+            "%s Failed to add %s %s to vrf %s: %s",
+            log_prefix, label, str(net), vrf_name, vrf_exc,
+        )
+
+
 def _ensure_ipv6_address(interface: str, address: str, prefix: str, container=None) -> bool:
     """Ensure the interface has the specified IPv6 address configured."""
     if not interface or not address or prefix is None:
@@ -537,16 +642,47 @@ def _verify_interface_exists(interface: str, container=None) -> bool:
 
 
 def _is_dhclient_running(interface: str, container=None) -> bool:
-    """Check whether a dhclient process is running for the given interface."""
+    """Check whether a dhclient process is running for the given interface.
+
+    v0.5.218 (audit fix M): pre-fix used
+    ``pgrep -f 'dhclient.*{interface}'`` — an unanchored substring
+    match. That returned true for ``dhclient eth10`` when
+    ``interface="eth1"``, producing a false-positive "running"
+    reading that skewed ``needs_restart`` in the monitor. Fix:
+    parse ``pgrep -a -f dhclient`` output ourselves and compare
+    each row's argv against the interface name as an *exact*
+    whitespace-separated token — no more prefix collisions.
+    """
+    if not interface:
+        return False
     try:
-        # Prefer pgrep if available; fall back to ps/grep
-        cmd = f"pgrep -f 'dhclient.*{interface}' || ps -eo pid,cmd | grep 'dhclient' | grep -v grep | grep -q '{interface}'"
-        result = _run_command(["/bin/sh", "-c", cmd], timeout=5, container=container)
-        if result.returncode == 0 and result.stdout is not None:
-            return True
-        return result.returncode == 0 and (result.stdout or "").strip() == ""
+        # -a prints "PID cmd argv..." per matching process.
+        result = _run_command(
+            ["pgrep", "-a", "-f", "dhclient"],
+            timeout=5, container=container,
+        )
+        if result.returncode not in (0, 1):
+            # pgrep returns 1 when there are no matches; anything
+            # else is an unexpected error — fall through to False.
+            return False
+        for line in (result.stdout or "").splitlines():
+            # Split off the leading PID, then match argv tokens.
+            parts = line.strip().split(None, 1)
+            if len(parts) < 2:
+                continue
+            argv = parts[1].split()
+            # Only match if `interface` appears as a WHOLE token
+            # in argv — this rules out ``eth1`` matching ``eth10``
+            # and any file-path token that merely contains the name
+            # as a substring.
+            if interface in argv:
+                return True
+        return False
     except Exception as exc:
-        logger.debug("[DHCP] Failed to determine dhclient status for %s: %s", interface, exc)
+        logger.debug(
+            "[DHCP] Failed to determine dhclient status for %s: %s",
+            interface, exc,
+        )
         return False
 
 
@@ -1059,13 +1195,60 @@ def start_dhcp_client(
 
 
 def stop_dhcp_client(device_db, device_id: str, interface: str, container=None) -> Dict:
-    """Stop a running DHCP client on the interface."""
+    """Stop a running DHCP client on the interface.
+
+    v0.5.218 (audit fix K): pre-fix this only issued
+    ``dhclient -4 -r`` and wiped IPv4 DB fields. The matching
+    IPv6 daemons (``dhcp6c`` on containers where it's installed,
+    or ``dhclient -6`` on the fallback path in start_dhcp_client)
+    were never terminated. Symptom: after "Stop DHCP" the DHCPv6
+    daemon kept its lease active on the interface indefinitely,
+    the IPv6 address stuck around, and the next Start DHCP
+    spawned a second daemon that fought the first. Fix: release
+    both v4 and v6 dhclient PID files, kill any lingering
+    ``dhcp6c`` bound to this interface (anchored pattern —
+    ``re.escape`` on the interface name to avoid the "eth1
+    matches eth10" collision we track separately in bug M),
+    flush non-link-local IPv6 addresses via _flush_ipv6, and
+    clear the IPv6-side DB fields (ipv6_address / ipv6_mask /
+    ipv6_gateway) alongside the IPv4 ones so the row's IPv6
+    columns don't retain the stale lease info.
+    """
+    # v4 release (unchanged, keeps the pre-fix pidfile shape).
     pidfile = os.path.join(DHCLIENT_PID_DIR, f"dhclient-{interface}.pid")
     try:
         _run_command(["dhclient", "-4", "-r", "-pf", pidfile, interface], timeout=5, container=container)
     except Exception as exc:
         logger.debug("[DHCP] dhclient release error: %s", exc)
+
+    # v0.5.218: v6 dhclient release — mirrors the pidfile shape
+    # start_dhcp_client uses on the dhclient -6 fallback path.
+    pidfile_v6 = os.path.join(DHCLIENT_PID_DIR, f"dhclient-{interface}-ipv6.pid")
+    try:
+        _run_command(
+            ["dhclient", "-6", "-r", "-pf", pidfile_v6, interface],
+            timeout=5, container=container,
+        )
+    except Exception as exc:
+        logger.debug("[DHCP] dhclient -6 release error: %s", exc)
+
+    # v0.5.218: kill any wide-DHCPv6 dhcp6c bound to this
+    # interface. pkill -f pattern is anchored on the interface
+    # name via re.escape (see bug M) — otherwise "eth1" would
+    # match "dhcp6c ... eth10".
+    try:
+        _run_command(
+            ["pkill", "-f", f"dhcp6c.*(^|\\s){re.escape(interface)}(\\s|$)"],
+            timeout=5, container=container,
+        )
+    except Exception as exc:
+        logger.debug("[DHCP] dhcp6c pkill error (safe to ignore): %s", exc)
+
     _flush_ipv4(interface, container=container)
+    # v0.5.218: also flush non-link-local IPv6 addresses so a
+    # stale lease doesn't stick around on the interface.
+    _flush_ipv6(interface, container=container)
+
     _update_device_db(
         device_db,
         device_id,
@@ -1081,6 +1264,13 @@ def stop_dhcp_client(device_db, device_id: str, interface: str, container=None) 
             "ipv4_address": "",
             "ipv4_mask": "",
             "ipv4_gateway": "",
+            # v0.5.218 (audit fix K): clear the IPv6 side too —
+            # the pre-fix DB write left ipv6_address/mask/gateway
+            # holding the stale lease, and the UI kept showing
+            # the DHCPv6 address on a "Stopped" row.
+            "ipv6_address": "",
+            "ipv6_mask": "",
+            "ipv6_gateway": "",
             "last_dhcp_check": datetime.now(timezone.utc).isoformat(),
         },
     )
@@ -1346,6 +1536,12 @@ def start_dhcp_server(
             route_seen.add(key)
             route_networks.append(net)
 
+        # v0.5.218 (audit fix L): resolve the device's VRF once,
+        # then mirror every server-mode ``ip route replace`` into
+        # the VRF table. Legacy no-VRF deployments get vrf_name=None
+        # and behave exactly as pre-fix.
+        vrf_name = _resolve_device_vrf(device_id)
+
         if gateway_routes:
             if gateway and interface:
                 try:
@@ -1357,40 +1553,36 @@ def start_dhcp_server(
                         "[DHCP] Could not add host route to gateway (may already exist): %s",
                         gateway_route_exc,
                     )
+                # v0.5.218: mirror the gateway /32 into the VRF too.
+                if vrf_name:
+                    try:
+                        vrf_host_cmd = ["ip", "route", "replace", f"{gateway}/32",
+                                        "dev", interface, "vrf", vrf_name]
+                        _run_command(vrf_host_cmd, timeout=5, container=container)
+                        logger.debug(
+                            "[DHCP VRF] Added host route to gateway %s on %s in vrf %s",
+                            gateway, interface, vrf_name,
+                        )
+                    except Exception as vrf_host_exc:
+                        logger.debug(
+                            "[DHCP VRF] Could not add host route to gateway in vrf (may already exist): %s",
+                            vrf_host_exc,
+                        )
 
             for net in gateway_routes:
-                try:
-                    if gateway:
-                        route_cmd = ["ip", "route", "replace", str(net), "via", gateway]
-                    else:
-                        route_cmd = ["ip", "route", "replace", str(net)]
-                    if interface:
-                        route_cmd.extend(["dev", interface])
-                    _run_command(route_cmd, timeout=5, container=container)
-                    logger.info(
-                        "[DHCP] Added gateway route %s%s%s",
-                        str(net),
-                        f" via {gateway}" if gateway else "",
-                        f" dev {interface}" if interface else "",
-                    )
-                except Exception as route_exc:
-                    logger.warning("[DHCP] Failed to add gateway route %s: %s", net, route_exc)
+                _add_route_and_vrf_copy(
+                    str(net), gateway=gateway, interface=interface or "",
+                    family="ipv4", vrf_name=vrf_name, container=container,
+                    log_prefix="[DHCP]", label="gateway route",
+                )
 
         if gateway and pool_networks_unique:
             for net in pool_networks_unique:
-                try:
-                    route_cmd = ["ip", "route", "replace", str(net), "via", gateway]
-                    if interface:
-                        route_cmd.extend(["dev", interface])
-                    _run_command(route_cmd, timeout=5, container=container)
-                    logger.info(
-                        "[DHCP] Added static route %s via %s%s",
-                        net,
-                        gateway,
-                        f" dev {interface}" if interface else "",
-                    )
-                except Exception as route_exc:
-                    logger.warning("[DHCP] Failed to add static route %s via %s: %s", net, gateway, route_exc)
+                _add_route_and_vrf_copy(
+                    str(net), gateway=gateway, interface=interface or "",
+                    family="ipv4", vrf_name=vrf_name, container=container,
+                    log_prefix="[DHCP]", label="static route",
+                )
 
     ipv6_subnets = []
     if ipv6_enabled:
@@ -1406,39 +1598,34 @@ def start_dhcp_server(
                     exc,
                 )
 
+        # v0.5.218 (audit fix L): IPv6 side of the VRF-scope mirror.
+        # ipv6_vrf_name reuses the ipv4 vrf_name if we already
+        # resolved one; otherwise resolves it now (the ipv4 branch
+        # is skipped when ipv4 is disabled).
+        try:
+            _local_vrf_name = vrf_name  # noqa: F821 (defined in ipv4 branch)
+        except NameError:
+            _local_vrf_name = _resolve_device_vrf(device_id)
+
         if ipv6_gateway_routes:
             for route in ipv6_gateway_routes:
-                try:
-                    route_cmd = ["ip", "-6", "route", "replace", route]
-                    if ipv6_gateway:
-                        route_cmd.extend(["via", ipv6_gateway])
-                    if interface:
-                        route_cmd.extend(["dev", interface])
-                    _run_command(route_cmd, timeout=5, container=container)
-                    logger.info(
-                        "[DHCP] Added IPv6 gateway route %s%s%s",
-                        route,
-                        f" via {ipv6_gateway}" if ipv6_gateway else "",
-                        f" dev {interface}" if interface else "",
-                    )
-                except Exception as route_exc:
-                    logger.warning("[DHCP] Failed to add IPv6 gateway route %s: %s", route, route_exc)
+                _add_route_and_vrf_copy(
+                    route, gateway=ipv6_gateway or "",
+                    interface=interface or "",
+                    family="ipv6", vrf_name=_local_vrf_name,
+                    container=container,
+                    log_prefix="[DHCP]", label="IPv6 gateway route",
+                )
 
         if ipv6_gateway and ipv6_subnets:
             for subnet in ipv6_subnets:
-                try:
-                    route_cmd = ["ip", "-6", "route", "replace", subnet, "via", ipv6_gateway]
-                    if interface:
-                        route_cmd.extend(["dev", interface])
-                    _run_command(route_cmd, timeout=5, container=container)
-                    logger.info(
-                        "[DHCP] Added IPv6 static route %s via %s%s",
-                        subnet,
-                        ipv6_gateway,
-                        f" dev {interface}" if interface else "",
-                    )
-                except Exception as route_exc:
-                    logger.warning("[DHCP] Failed to add IPv6 static route %s via %s: %s", subnet, ipv6_gateway, route_exc)
+                _add_route_and_vrf_copy(
+                    subnet, gateway=ipv6_gateway,
+                    interface=interface or "",
+                    family="ipv6", vrf_name=_local_vrf_name,
+                    container=container,
+                    log_prefix="[DHCP]", label="IPv6 static route",
+                )
 
     try:
         config_for_db = dict(dhcp_config)

@@ -741,6 +741,22 @@ class DHCPHandler:
 
         # v0.2.95: Delete-key shortcut + right-click context menu.
         # Closes the cross-tab keyboard/mouse-RMB consistency sweep.
+        # v0.5.218 (audit fix I): pre-fix the Delete-key shortcut
+        # was `.connect(self.delete_selected_pool)` — but that
+        # method only exists on ManageDHCPPoolsDialog, not on
+        # DHCPHandler. The connect raised AttributeError at wiring
+        # time, the outer bare `except Exception: pass` swallowed
+        # it, and everything below (setContextMenuPolicy + the
+        # customContextMenuRequested wire-up) never ran. Symptom:
+        # Delete key did nothing on the DHCP subtab, right-click
+        # showed no context menu. Fix: wire to a real handler on
+        # DHCPHandler (`delete_selected_dhcp_row`, which detaches
+        # all pools from the selected device — the sensible per-
+        # row "delete" for a DHCP status table), point the menu
+        # entry at the same method, and upgrade the outer except
+        # to log at ERROR so a future missing-symbol regression
+        # surfaces in the logs instead of silently disabling the
+        # whole shortcut+menu block.
         try:
             from PyQt5.QtWidgets import QShortcut, QMenu
             from PyQt5.QtGui import QKeySequence
@@ -749,7 +765,7 @@ class DHCPHandler:
                 QKeySequence(_Qt.Key_Delete), self.parent.dhcp_table,
             )
             _dhcp_del.setContext(_Qt.WidgetShortcut)
-            _dhcp_del.activated.connect(self.delete_selected_pool)
+            _dhcp_del.activated.connect(self.delete_selected_dhcp_row)
 
             self.parent.dhcp_table.setContextMenuPolicy(_Qt.CustomContextMenu)
             def _on_dhcp_ctx(pos):
@@ -757,20 +773,31 @@ class DHCPHandler:
                 act_refresh = menu.addAction("Refresh DHCP status")
                 act_apply   = menu.addAction("Apply DHCP pools")
                 menu.addSeparator()
-                act_delete  = menu.addAction("Delete selected pool")
+                act_delete  = menu.addAction("Detach pools from selected device")
                 act = menu.exec_(self.parent.dhcp_table.viewport().mapToGlobal(pos))
                 if act is act_refresh:
                     try: self.refresh_dhcp_status()
-                    except Exception: pass
+                    except Exception as _rc_exc:
+                        logging.error(f"[DHCP UI] context-menu Refresh failed: {_rc_exc}")
                 elif act is act_apply:
                     try: self.apply_dhcp_pools()
-                    except Exception: pass
+                    except Exception as _ap_exc:
+                        logging.error(f"[DHCP UI] context-menu Apply failed: {_ap_exc}")
                 elif act is act_delete:
-                    try: self.delete_selected_pool()
-                    except Exception: pass
+                    try: self.delete_selected_dhcp_row()
+                    except Exception as _dl_exc:
+                        logging.error(f"[DHCP UI] context-menu Detach failed: {_dl_exc}")
             self.parent.dhcp_table.customContextMenuRequested.connect(_on_dhcp_ctx)
-        except Exception:
-            pass
+        except Exception as _wire_exc:
+            # v0.5.218: log at ERROR so a future missing-symbol wiring
+            # regression is visible in logs (the whole shortcut+menu
+            # block used to silently disappear). We still `pass`
+            # afterwards to keep the app usable — losing keyboard
+            # shortcuts on one subtab is not worth crashing over.
+            logging.error(
+                f"[DHCP UI] failed to wire Delete-key shortcut + context menu: "
+                f"{_wire_exc}"
+            )
 
         # DHCP action bar — unified chrome with Devices + BGP + OSPF
         # + ISIS + VXLAN.
@@ -863,33 +890,136 @@ class DHCPHandler:
         Same pattern as the ARP / BGP / OSPF / ISIS refresh buttons.
         Failure of the force-check is non-fatal — we still render
         whatever is in the DB.
+
+        v0.5.218 (audit fix J): the force-check + status fetch each
+        do `requests` with 5-15s timeouts and were being called
+        synchronously on the UI thread. On a slow / offline server
+        every Refresh click froze the client for up to 20s.
+        Wrapped in a QThread + indeterminate QProgressDialog.
+        Refresh has no server-side side-effects → Cancel is
+        enabled and safe (worker checks _should_stop between the
+        force-check and the status GET). Worker keepalive on
+        `self._dhcp_workers` mirrors the OSPF/BGP/ISIS SIGABRT
+        guard against "QThread: Destroyed while thread is still
+        running" on PyQt5 5.15.11 + Python 3.14.
         """
-        try:
-            server_url = self.parent.get_server_url(silent=True)
-            if not server_url:
-                logging.debug("[DHCP UI] No server URL configured")
-                return
+        server_url = self.parent.get_server_url(silent=True)
+        if not server_url:
+            logging.debug("[DHCP UI] No server URL configured")
+            return
 
-            # Step 1 — server-side force-check.
+        from PyQt5.QtCore import QThread, pyqtSignal
+        from PyQt5.QtWidgets import QProgressDialog
+
+        class RefreshDHCPWorker(QThread):
+            # emits: (devices_list, error_string) — error empty on OK.
+            finished = pyqtSignal(list, str)
+
+            def __init__(self, url):
+                super().__init__()
+                self.url = url
+                self._should_stop = False
+
+            def stop(self):
+                self._should_stop = True
+
+            def run(self):
+                # Step 1 — server-side force-check (non-fatal).
+                try:
+                    fc = requests.post(
+                        f"{self.url}/api/dhcp/monitor/force-check",
+                        timeout=15,
+                    )
+                    if fc.status_code == 200:
+                        logging.info("[DHCP UI] force-check OK")
+                    else:
+                        logging.warning(
+                            f"[DHCP UI] force-check returned HTTP {fc.status_code}"
+                        )
+                except Exception as fc_exc:
+                    logging.warning(
+                        f"[DHCP UI] force-check failed "
+                        f"(will show cached state): {fc_exc}"
+                    )
+
+                if self._should_stop:
+                    self.finished.emit([], "cancelled")
+                    return
+
+                # Step 2 — read (now-fresh) status from server.
+                try:
+                    response = requests.get(
+                        f"{self.url}/api/device/dhcp/status", timeout=5,
+                    )
+                    if response.status_code != 200:
+                        err = (
+                            f"HTTP {response.status_code}: "
+                            f"{response.text}"
+                        )
+                        logging.warning(
+                            f"[DHCP UI] Failed to fetch status: {err}"
+                        )
+                        self.finished.emit([], err)
+                        return
+                    payload = response.json()
+                    devices = payload.get("devices", []) or []
+                    self.finished.emit(devices, "")
+                except Exception as exc:
+                    logging.error(
+                        f"[DHCP UI] Exception refreshing DHCP status: {exc}"
+                    )
+                    self.finished.emit([], str(exc))
+
+        progress = QProgressDialog(
+            "Refreshing DHCP status...", "Cancel", 0, 0, self.parent,
+        )
+        progress.setWindowModality(2)  # Qt.WindowModal
+        progress.setMinimumDuration(0)
+        progress.show()
+
+        worker = RefreshDHCPWorker(server_url)
+        worker.setParent(self.parent)
+
+        def _on_cancel():
+            worker.stop()
+            progress.setLabelText(
+                "Cancelling — waiting for current request to finish..."
+            )
+        progress.canceled.connect(_on_cancel)
+
+        def _on_finished(devices, err):
             try:
-                fc = requests.post(f"{server_url}/api/dhcp/monitor/force-check", timeout=15)
-                if fc.status_code == 200:
-                    logging.info("[DHCP UI] force-check OK")
-                else:
-                    logging.warning(f"[DHCP UI] force-check returned HTTP {fc.status_code}")
-            except Exception as fc_exc:
-                logging.warning(f"[DHCP UI] force-check failed (will show cached state): {fc_exc}")
-
-            # Step 2 — read the (now-fresh) status from the server.
-            response = requests.get(f"{server_url}/api/device/dhcp/status", timeout=5)
-            if response.status_code != 200:
-                logging.warning(f"[DHCP UI] Failed to fetch status: {response.status_code} {response.text}")
+                progress.close()
+            except Exception:
+                pass
+            if err and err != "cancelled":
+                # Non-fatal — leave the table alone. Log already emitted.
                 return
-            payload = response.json()
-            devices = payload.get("devices", [])
-            self._populate_dhcp_table(devices)
-        except Exception as exc:
-            logging.error(f"[DHCP UI] Exception refreshing DHCP status: {exc}")
+            if err == "cancelled":
+                return
+            try:
+                self._populate_dhcp_table(devices)
+            except Exception as exc:
+                logging.error(
+                    f"[DHCP UI] Failed to populate DHCP table: {exc}"
+                )
+
+        worker.finished.connect(_on_finished)
+        worker.start()
+
+        # SIGABRT guard — same pattern OSPF/BGP/ISIS/Ping use.
+        if not hasattr(self, "_dhcp_workers"):
+            self._dhcp_workers = []
+        self._dhcp_workers.append(worker)
+
+        def _still_running(w):
+            try:
+                return w.isRunning()
+            except RuntimeError:
+                return False
+        self._dhcp_workers = [
+            w for w in self._dhcp_workers if _still_running(w)
+        ]
 
     def _populate_dhcp_table(self, rows: List[Dict]):
         """Populate the DHCP table with rows."""
@@ -1002,6 +1132,96 @@ class DHCPHandler:
         metadata = dict(metadata)
         metadata["row"] = row_index
         return metadata
+
+    def delete_selected_dhcp_row(self):
+        """Detach all DHCP pools from the device on the currently
+        selected row.
+
+        v0.5.218 (audit fix I): the Delete-key shortcut + context
+        menu now route to this method. Pre-fix they pointed at
+        `self.delete_selected_pool`, which only exists on the
+        modal ManageDHCPPoolsDialog — the wire-up raised
+        AttributeError and the whole shortcut+menu block silently
+        disabled itself. For a device-oriented status table
+        "Delete" naturally means "detach all pools from this
+        device"; this is the same effect as opening Attach and
+        confirming the detach-all prompt with no selection.
+        """
+        metadata = self._get_selected_metadata()
+        if not metadata:
+            QMessageBox.information(
+                self.parent, "Select Device",
+                "Select a DHCP row first.",
+            )
+            return
+
+        mode = (metadata.get("mode") or "").lower()
+        if mode != "server":
+            QMessageBox.warning(
+                self.parent, "Invalid Selection",
+                "Only DHCP server rows have pools to detach.\n"
+                "Client-mode devices manage their own leases.",
+            )
+            return
+
+        server_url = self.parent.get_server_url(silent=True)
+        if not server_url:
+            QMessageBox.warning(
+                self.parent, "Server Unavailable",
+                "No server is currently configured.",
+            )
+            return
+
+        device_id = metadata.get("device_id")
+        if not device_id:
+            QMessageBox.warning(
+                self.parent, "Error",
+                "Unable to determine the selected device ID.",
+            )
+            return
+
+        entry = metadata.get("entry", {}) or {}
+        device_name = entry.get("device_name") or device_id
+        reply = QMessageBox.question(
+            self.parent, "Detach DHCP Pools",
+            f"Detach all DHCP pools from '{device_name}'?\n\n"
+            f"This will stop the DHCP server on that device.",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        payload = {"device_id": device_id, "detach_all": True}
+        try:
+            response = requests.post(
+                f"{server_url}/api/device/dhcp/server/attach_pools",
+                json=payload, timeout=20,
+            )
+        except requests.RequestException as exc:
+            logging.error(
+                "[DHCP UI] Detach-all failed for %s: %s",
+                device_id, exc,
+            )
+            QMessageBox.warning(self.parent, "Request Failed", str(exc))
+            return
+
+        if response.status_code != 200:
+            error_message = response.text
+            try:
+                error_message = response.json().get("error", error_message)
+            except ValueError:
+                pass
+            QMessageBox.warning(
+                self.parent, "DHCP Detach Failed",
+                error_message or "Failed to detach DHCP pools.",
+            )
+            return
+
+        QMessageBox.information(
+            self.parent, "DHCP Pools Detached",
+            f"All DHCP pools detached from '{device_name}'.",
+        )
+        self.refresh_dhcp_status()
 
     def manage_dhcp_pools(self):
         """Open the DHCP pool management dialog."""
@@ -1132,42 +1352,169 @@ class DHCPHandler:
             if selection.get("gateway_override"):
                 payload["gateway"] = selection["gateway_override"]
 
-        try:
-            response = requests.post(
-                f"{server_url}/api/device/dhcp/server/attach_pools",
-                json=payload,
-                timeout=20,
-            )
-        except requests.RequestException as exc:
-            logging.error("[DHCP UI] Failed to attach DHCP pools for %s: %s", device_id, exc)
-            QMessageBox.warning(self.parent, "Request Failed", str(exc))
-            return
+        # v0.5.218 (audit fix J): wrap the attach POST (up to 20s
+        # per click) in a QThread + indeterminate QProgressDialog.
+        # Attach mutates server-side dnsmasq state, so Cancel is
+        # DISABLED — matches OSPF/BGP/ISIS Apply policy against
+        # interrupting partial applies. Results surface through
+        # MultiDeviceResultsDialog on completion.
+        self._run_dhcp_pool_post(
+            server_url=server_url,
+            device_id=device_id,
+            payload=payload,
+            operation="attach",
+            detach_all=bool(selection.get("detach_all")),
+        )
 
-        if response.status_code != 200:
-            error_message = response.text
-            try:
-                error_json = response.json()
-                error_message = error_json.get("error", error_message)
-            except ValueError:
-                pass
-            title = "DHCP Detach Failed" if selection.get("detach_all") else "DHCP Pool Update Failed"
-            message = error_message or ("Failed to detach DHCP pools." if selection.get("detach_all") else "Failed to update DHCP server pools.")
-            QMessageBox.warning(self.parent, title, message)
-            return
+    def _run_dhcp_pool_post(self, server_url, device_id, payload,
+                            operation, detach_all=False):
+        """Common worker-driven POST for attach_dhcp_pools and
+        apply_dhcp_pools.
 
-        if selection.get("detach_all"):
-            QMessageBox.information(
-                self.parent,
-                "DHCP Pools Detached",
-                "All DHCP pools have been detached from the server.",
-            )
+        v0.5.218 (audit fix J): the pre-fix code did
+        `requests.post(..., timeout=20)` on the UI thread. On a
+        slow / partially-hung server the whole client froze for
+        up to 20s per click. Cancel is disabled (matches OSPF/
+        BGP/ISIS Apply); a keepalive on `self._dhcp_workers`
+        guards against PyQt5 5.15.11 + Python 3.14 SIGABRT on
+        premature QThread GC.
+        """
+        from PyQt5.QtCore import QThread, pyqtSignal
+        from PyQt5.QtWidgets import QProgressDialog
+
+        class DHCPPoolPostWorker(QThread):
+            # emits: (ok, http_status, error_message, results_json_or_none)
+            finished = pyqtSignal(bool, int, str, object)
+
+            def __init__(self, url, body):
+                super().__init__()
+                self.url = url
+                self.body = body
+
+            def run(self):
+                try:
+                    response = requests.post(
+                        f"{self.url}/api/device/dhcp/server/attach_pools",
+                        json=self.body, timeout=20,
+                    )
+                except requests.RequestException as exc:
+                    self.finished.emit(False, 0, str(exc), None)
+                    return
+                if response.status_code != 200:
+                    err = response.text
+                    try:
+                        err = response.json().get("error", err)
+                    except ValueError:
+                        pass
+                    self.finished.emit(
+                        False, response.status_code, err or "", None,
+                    )
+                    return
+                try:
+                    data = response.json()
+                except ValueError:
+                    data = None
+                self.finished.emit(True, 200, "", data)
+
+        if operation == "attach":
+            if detach_all:
+                label = "Detaching DHCP pools..."
+            else:
+                label = "Attaching DHCP pools..."
         else:
-            QMessageBox.information(
-                self.parent,
-                "DHCP Pools Attached",
-                "The selected DHCP pools have been attached successfully.",
-            )
-        self.refresh_dhcp_status()
+            label = "Applying DHCP pools..."
+
+        # Indeterminate; Cancel disabled — same policy as OSPF/BGP/
+        # ISIS Apply (interrupting a partial pool apply leaves
+        # dnsmasq in a half-configured state).
+        progress = QProgressDialog(label, "Cancel", 0, 0, self.parent)
+        progress.setWindowModality(2)  # Qt.WindowModal
+        progress.setCancelButton(None)
+        progress.setMinimumDuration(0)
+        progress.show()
+
+        worker = DHCPPoolPostWorker(server_url, payload)
+        worker.setParent(self.parent)
+
+        def _on_finished(ok, http_status, err, data):
+            try:
+                progress.close()
+            except Exception:
+                pass
+
+            if not ok:
+                if operation == "attach":
+                    title = ("DHCP Detach Failed" if detach_all
+                             else "DHCP Pool Update Failed")
+                    default_msg = (
+                        "Failed to detach DHCP pools." if detach_all
+                        else "Failed to update DHCP server pools."
+                    )
+                else:
+                    title = "DHCP Apply Failed"
+                    default_msg = "Failed to apply DHCP server pools."
+                # Prefer MultiDeviceResultsDialog for consistency
+                # with the other apply paths.
+                try:
+                    from widgets.devices_tab import MultiDeviceResultsDialog
+                    MultiDeviceResultsDialog(
+                        title,
+                        f"{operation.title()} failed for device {device_id}",
+                        [f"❌ {device_id}: {err or default_msg}"],
+                        self.parent,
+                    ).exec_()
+                except Exception:
+                    QMessageBox.warning(
+                        self.parent, title, err or default_msg,
+                    )
+                return
+
+            # Success — success dialog + refresh.
+            if operation == "attach":
+                if detach_all:
+                    title = "DHCP Pools Detached"
+                    msg = "All DHCP pools detached from the server."
+                else:
+                    title = "DHCP Pools Attached"
+                    msg = "The selected DHCP pools have been attached."
+            else:
+                title = "DHCP Pools Applied"
+                msg = "Attached DHCP pools have been applied to the server."
+            try:
+                from widgets.devices_tab import MultiDeviceResultsDialog
+                MultiDeviceResultsDialog(
+                    title, msg,
+                    [f"✅ {device_id}: {msg}"],
+                    self.parent,
+                ).exec_()
+            except Exception:
+                QMessageBox.information(self.parent, title, msg)
+
+            # Refresh the DHCP table + kick preflight bar (only on
+            # apply — matches the pre-fix apply_dhcp_pools tail).
+            self.refresh_dhcp_status()
+            if operation == "apply":
+                try:
+                    from widgets.preflight_bar import kick_refresh
+                    kick_refresh(self.parent)
+                except Exception:
+                    pass
+
+        worker.finished.connect(_on_finished)
+        worker.start()
+
+        if not hasattr(self, "_dhcp_workers"):
+            self._dhcp_workers = []
+        self._dhcp_workers.append(worker)
+
+        def _still_running(w):
+            try:
+                return w.isRunning()
+            except RuntimeError:
+                return False
+        self._dhcp_workers = [
+            w for w in self._dhcp_workers if _still_running(w)
+        ]
 
     def apply_dhcp_pools(self):
         """Reapply the currently attached DHCP pools for the selected server."""
@@ -1253,44 +1600,28 @@ class DHCPHandler:
         if not isinstance(additional_pools, (list, tuple, set)):
             additional_pools = []
 
-        # Handle case where no pools are attached - ensure DHCP server is stopped
+        # v0.5.218 (audit fix J): the two POST tails below used to
+        # each block the UI thread on requests.post(..., timeout=20).
+        # Route both through the shared _run_dhcp_pool_post worker
+        # (indeterminate progress dialog, Cancel disabled to match
+        # OSPF/BGP/ISIS Apply policy). preflight_bar.kick_refresh
+        # (v0.2.85) is now handled by the worker's finished handler
+        # for the "apply" operation.
+
+        # Handle case where no pools are attached — ensure DHCP
+        # server is stopped by sending detach_all.
         if not primary_pool:
-            # Send detach_all request to ensure server is stopped
             payload = {
                 "device_id": device_id,
                 "detach_all": True,
             }
-            try:
-                response = requests.post(
-                    f"{server_url}/api/device/dhcp/server/attach_pools",
-                    json=payload,
-                    timeout=20,
-                )
-            except requests.RequestException as exc:
-                logging.error("[DHCP UI] Failed to stop DHCP server for %s: %s", device_id, exc)
-                QMessageBox.warning(self.parent, "Request Failed", str(exc))
-                return
-
-            if response.status_code != 200:
-                error_message = response.text
-                try:
-                    error_json = response.json()
-                    error_message = error_json.get("error", error_message)
-                except ValueError:
-                    pass
-                QMessageBox.warning(
-                    self.parent,
-                    "DHCP Server Stop Failed",
-                    error_message or "Failed to stop DHCP server.",
-                )
-                return
-
-            QMessageBox.information(
-                self.parent,
-                "DHCP Server Stopped",
-                "No pools are attached. DHCP server has been stopped.",
+            self._run_dhcp_pool_post(
+                server_url=server_url,
+                device_id=device_id,
+                payload=payload,
+                operation="apply",
+                detach_all=True,
             )
-            self.refresh_dhcp_status()
             return
 
         payload = {
@@ -1308,44 +1639,11 @@ class DHCPHandler:
         if gateway_value:
             payload["gateway"] = gateway_value
 
-        try:
-            response = requests.post(
-                f"{server_url}/api/device/dhcp/server/attach_pools",
-                json=payload,
-                timeout=20,
-            )
-        except requests.RequestException as exc:
-            logging.error("[DHCP UI] Failed to apply DHCP pools for %s: %s", device_id, exc)
-            QMessageBox.warning(self.parent, "Request Failed", str(exc))
-            return
-
-        if response.status_code != 200:
-            error_message = response.text
-            try:
-                error_json = response.json()
-                error_message = error_json.get("error", error_message)
-            except ValueError:
-                pass
-            QMessageBox.warning(
-                self.parent,
-                "DHCP Apply Failed",
-                error_message or "Failed to apply DHCP server pools.",
-            )
-            return
-
-        QMessageBox.information(
-            self.parent,
-            "DHCP Pools Applied",
-            "Attached DHCP pools have been applied to the server.",
+        self._run_dhcp_pool_post(
+            server_url=server_url,
+            device_id=device_id,
+            payload=payload,
+            operation="apply",
+            detach_all=False,
         )
-        self.refresh_dhcp_status()
-        # v0.2.85: kick the preflight bar so it repaints immediately
-        # after a DHCP edit (DUPLICATE_IPV4 finding state can flip
-        # when a DHCP-assigned address collides with a static one).
-        # Every other apply path does this; DHCP was the odd one out.
-        try:
-            from widgets.preflight_bar import kick_refresh
-            kick_refresh(self.parent)
-        except Exception:
-            pass
 

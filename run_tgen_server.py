@@ -5418,10 +5418,24 @@ def apply_device():
                         update_data["dhcp_mode"] = dhcp_config.get("mode") if isinstance(dhcp_config, dict) else ""
                         logging.info(f"[DEVICE APPLY] Updating DHCP config for device {device_name}: mode={dhcp_config.get('mode')}")
                     elif existing_device.get("dhcp_mode") and ("DHCP" not in protocols):
+                        # v0.5.218 (audit fix N): pre-fix only cleared
+                        # dhcp_config/mode/state/running — the
+                        # dhcp_lease_* columns kept the stale lease
+                        # forever, so the UI showed a leased IP for
+                        # a disabled device. Explicitly wipe every
+                        # dhcp_lease_* column and the last_dhcp_check
+                        # timestamp so the disabled row renders clean.
                         update_data["dhcp_config"] = {}
                         update_data["dhcp_mode"] = ""
                         update_data["dhcp_state"] = "Disabled"
                         update_data["dhcp_running"] = False
+                        update_data["dhcp_lease_ip"] = ""
+                        update_data["dhcp_lease_mask"] = ""
+                        update_data["dhcp_lease_gateway"] = ""
+                        update_data["dhcp_lease_server"] = ""
+                        update_data["dhcp_lease_expires"] = None
+                        update_data["dhcp_lease_subnet"] = ""
+                        update_data["last_dhcp_check"] = datetime.now(timezone.utc).isoformat()
                     
                     # Always update VXLAN fields if VXLAN protocol is present or config provided
                     if ("VXLAN" in protocols) or vxlan_config or existing_device.get("vxlan_config"):

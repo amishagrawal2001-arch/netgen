@@ -2,6 +2,210 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.218] - 2026-08-24
+
+**DHCP UX + server-state bundle — bugs I-N off the DHCP
+walkthrough. v0.5.217 shipped A-H; this release finishes the
+audit. Two client-side UX fixes (I, J) and four server-side
+correctness fixes (K, L, M, N) round out the DHCP surface.**
+
+**I. Delete-key + right-click context menu on the DHCP
+subtab silently disable themselves.**
+Pre-fix, `utils/devices_tab_dhcp.py:setup_dhcp_subtab`
+had `_dhcp_del.activated.connect(self.delete_selected_pool)`
+— but `DHCPHandler` has no `delete_selected_pool` method
+(that name only exists on `ManageDHCPPoolsDialog`). The
+`.connect()` raised `AttributeError` at wiring time; the
+outer bare `except Exception: pass` swallowed it; and every
+statement below that line (`setContextMenuPolicy`,
+`customContextMenuRequested.connect`, the whole nested
+`_on_dhcp_ctx` handler) never executed. Operator symptom:
+Delete key on the DHCP subtab did nothing, right-click
+showed no context menu, and the failure was invisible
+because the outer except also ate the log line. This
+regressed the v0.2.95 cross-tab keyboard/RMB-consistency
+sweep — the DHCP subtab was the only one it silently missed.
+Fix:
+- New `DHCPHandler.delete_selected_dhcp_row` method — for
+  a device-oriented status table, "Delete" naturally means
+  "detach all pools from this device", the same effect as
+  running Attach with an empty selection and confirming the
+  detach-all prompt. Same server API (`/api/device/dhcp/
+  server/attach_pools` with `detach_all: True`).
+- Delete-key shortcut + context-menu Delete entry both
+  point at the new method; the menu label is now "Detach
+  pools from selected device" so the effect is unambiguous.
+- The outer `except Exception:` now captures into
+  `_wire_exc` and emits `logging.error("[DHCP UI] failed
+  to wire ...")` — the block still `pass`es afterwards so
+  the app stays usable, but a future missing-symbol
+  regression is visible in server logs. The three
+  per-menu-item excepts inside `_on_dhcp_ctx` were also
+  upgraded from `pass` to `logging.error`.
+
+**J. DHCP Apply / Attach / Refresh block the UI thread for
+5-20s per click.**
+Pre-fix, `refresh_dhcp_status`, `attach_dhcp_pools`, and
+`apply_dhcp_pools` all called `requests.get`/`requests.post`
+synchronously on the Qt UI thread, with timeouts of 5-20s.
+On a slow / partially-hung server every click froze the
+whole client. Same footgun OSPF/BGP/ISIS Apply and Ping had
+until v0.5.214-v0.5.216 wrapped them in QThread + progress
+dialogs; DHCP was the last unblocked path.
+Fix:
+- `refresh_dhcp_status` — new nested `RefreshDHCPWorker
+  (QThread)` runs the force-check + status GET off-thread,
+  with an indeterminate `QProgressDialog(0, 0)`. Refresh
+  has no server-side side-effects → Cancel enabled and
+  safe (worker checks `_should_stop` between the force-
+  check and the status GET). Finished handler closes the
+  dialog and calls `_populate_dhcp_table` on the UI
+  thread.
+- `attach_dhcp_pools` + `apply_dhcp_pools` — both now
+  dispatch their final `requests.post(..., timeout=20)`
+  through a shared `_run_dhcp_pool_post` helper. That
+  helper runs a `DHCPPoolPostWorker(QThread)` behind an
+  indeterminate `QProgressDialog`. Cancel is DISABLED
+  (`setCancelButton(None)`) — matches the OSPF/BGP/ISIS
+  Apply policy against interrupting a partial dnsmasq
+  apply. Both operations' finished dialogs use
+  `MultiDeviceResultsDialog` for chrome parity with the
+  other protocol Apply paths.
+- All three paths hold their worker on `self._dhcp_workers`
+  — the PyQt5 5.15.11 + Python 3.14 SIGABRT guard against
+  "QThread: Destroyed while thread is still running" that
+  OSPF/BGP/ISIS/Ping all use.
+- `preflight_bar.kick_refresh` (v0.2.85) is now called
+  from the worker's finished handler on the `apply`
+  operation only — pre-fix `apply_dhcp_pools`' inline
+  tail was the caller.
+
+**K. `stop_dhcp_client` leaks IPv6 dhclient/dhcp6c.**
+Pre-fix, `utils/dhcp.py:stop_dhcp_client` only issued
+`dhclient -4 -r`. The matching IPv6 daemons — `dhcp6c` on
+containers where it's installed, or `dhclient -6` on the
+fallback path in `start_dhcp_client` — were never
+terminated, so the DHCPv6 daemon kept its lease active on
+the interface indefinitely and the IPv6 address stayed
+put. The next Start DHCP spawned a second daemon that
+fought the first over the same interface. The DB write
+also only cleared the IPv4 fields, leaving `ipv6_address`
+/ `ipv6_mask` / `ipv6_gateway` holding the stale lease
+info so the UI kept rendering the leased IPv6 on a
+"Stopped" row.
+Fix:
+- Release the v6 dhclient PID file via `dhclient -6 -r`
+  (mirrors the pidfile shape `start_dhcp_client` uses on
+  the dhclient -6 fallback path: `dhclient-<iface>-ipv6.
+  pid`).
+- `pkill -f 'dhcp6c.*(^|\s)<iface>(\s|$)'` — anchored via
+  `re.escape(interface)` to avoid the "eth1 matches
+  eth10" collision we track separately in bug M.
+- `_flush_ipv6` non-link-local addresses on the interface.
+- Extend the DB write to clear `ipv6_address` / `ipv6_
+  mask` / `ipv6_gateway` alongside the existing IPv4
+  fields.
+
+**L. VRF-scope mismatch on server-mode routes.**
+Pre-fix, `utils/dhcp.py:start_dhcp_server` ran
+`ip route replace <net> via <gw> dev <iface>` against host
+tables only. When the DHCP server's interface is enslaved
+to a per-device VRF (`vrf-<device_id>`), routes in the
+main table are invisible to VRF-bound sockets — dnsmasq's
+container-side pool clients never saw the return traffic.
+The client path already handled this via `_migrate_dhcp_
+route_to_vrf` (dhcp.py:386); the server path was the
+symmetry gap.
+Fix:
+- New `_resolve_device_vrf(device_id)` helper — returns
+  the VRF name from `FRRDockerManager().vrf_name_for_
+  device()` if the vrf-<id> link actually exists on the
+  host, else None. Legacy no-VRF deployments harmlessly
+  early-return None so the pre-fix single-table behaviour
+  is preserved.
+- New `_add_route_and_vrf_copy(net, gateway=, interface=,
+  family=, vrf_name=, ...)` helper — installs the route
+  into the main table (unchanged), then mirrors it into
+  the VRF table when `vrf_name` is set. Handles both IPv4
+  and IPv6 via the `family` arg.
+- `start_dhcp_server` resolves the device's VRF once at
+  the top of the route-install block, then routes every
+  gateway/static/IPv6 route through `_add_route_and_vrf_
+  copy`. The gateway /32 host-route also gets a VRF-scoped
+  mirror.
+
+**M. `_is_dhclient_running` regex substring collision.**
+Pre-fix, `utils/dhcp.py:539` used `pgrep -f 'dhclient
+.*{interface}'` — an unanchored substring match. When
+`interface="eth1"`, that returned true for a running
+`dhclient eth10`, producing a false-positive "running"
+reading that skewed `needs_restart` in the monitor and
+made "eth1 has dhclient, eth10 does not" flap
+indistinguishably.
+Fix: run `pgrep -a -f dhclient` (which prints "PID
+argv..." per matching process) and split each row's argv
+tokens by whitespace, matching `interface` as a *whole*
+argv element (`if interface in argv`). Rules out the eth1
+/ eth10 collision and any file-path token that happens to
+contain the name as a substring.
+
+**N. Disabling DHCP leaves stale lease fields in the UI.**
+Pre-fix, `run_tgen_server.py:5420-5424`'s DHCP-disable
+branch (`elif existing_device.get("dhcp_mode") and
+"DHCP" not in protocols`) only cleared `dhcp_config`,
+`dhcp_mode`, `dhcp_state="Disabled"`, and
+`dhcp_running=False`. The six `dhcp_lease_*` columns
+(`dhcp_lease_ip` / `_mask` / `_gateway` / `_server` /
+`_expires` / `_subnet`) kept the stale lease forever, so
+the DHCP subtab kept rendering a leased IP on a disabled
+row.
+Fix: extend the `update_data` payload with explicit
+clears for every `dhcp_lease_*` column plus a fresh
+`last_dhcp_check = now(UTC).isoformat()` — matches the
+shape `stop_dhcp_client` uses for its own DB write.
+
+**Files touched:**
+- `utils/devices_tab_dhcp.py` — Delete-key + context-menu
+  rewire (fix I), Refresh/Attach/Apply QThread + progress
+  dialogs + `_run_dhcp_pool_post` helper (fix J), new
+  `delete_selected_dhcp_row` method.
+- `utils/dhcp.py` — `stop_dhcp_client` IPv6 daemon
+  release + DB IPv6 clears (fix K), new
+  `_resolve_device_vrf` + `_add_route_and_vrf_copy`
+  helpers + `start_dhcp_server` VRF-mirror wiring (fix
+  L), `_is_dhclient_running` argv-token match (fix M),
+  `re` import.
+- `run_tgen_server.py` — DHCP-disable branch clears all
+  `dhcp_lease_*` columns (fix N).
+- `tests/test_v05217_dhcp_bundle.py` — relax
+  `test_version_bumped` from `== 0.5.217` to `>= 0.5.217`
+  so a v0.5.218 bump doesn't break the v0.5.217 test.
+
+**Tests:** `tests/test_v05218_dhcp_ux_bundle.py` — 20
+source-level lock-ins across all six bugs (Delete-key
+wiring points at a real DHCPHandler method + context-menu
+setup follows the wire + outer except logs at ERROR;
+Refresh/Attach/Apply each define a QThread worker with a
+`QProgressDialog` and hold `_dhcp_workers` keepalive,
+mutating ops disable Cancel while Refresh keeps it
+enabled; `stop_dhcp_client` releases `dhclient -6`, kills
+anchored `dhcp6c`, flushes IPv6, and clears the three
+IPv6 DB fields; `_resolve_device_vrf` +
+`_add_route_and_vrf_copy` helpers exist and
+`start_dhcp_server` calls both; `_is_dhclient_running`
+uses `pgrep -a -f dhclient` and checks `interface in
+argv`; the disable-DHCP branch clears every
+`dhcp_lease_*` column).
+
+**Deploy note:** Client-side fixes (I, J) require the new
+wheel installed on the macOS client. Server-side fixes
+(K, L, M, N) require `netgen-server` restart on srv06.
+All six land in the same wheel; the recommended ordering
+is server upgrade + restart first, then client upgrade
+so the corrected `_is_dhclient_running`/VRF-mirror
+behaviour is present the moment the client starts pushing
+Apply/Refresh calls through the new worker path.
+
 ## [0.5.217] - 2026-08-23
 
 **DHCP audit bundle — 8 bugs off the DHCP walkthrough that

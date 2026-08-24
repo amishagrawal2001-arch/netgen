@@ -419,5 +419,15 @@ def test_all_changed_files_still_parse():
 
 
 def test_version_bumped():
+    """v0.5.217 must have shipped — accepts 0.5.217 or any later
+    release (post-bumps to 0.5.218+ would otherwise break this
+    test forever).
+    """
     py = (REPO / "pyproject.toml").read_text()
-    assert 'version = "0.5.217"' in py, "pyproject.toml version not bumped"
+    m = re.search(r'version\s*=\s*"(\d+)\.(\d+)\.(\d+)"', py)
+    assert m, "pyproject.toml has no parseable version line"
+    major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    assert (major, minor, patch) >= (0, 5, 217), (
+        f"pyproject.toml version {major}.{minor}.{patch} is below "
+        f"the v0.5.217 audit ship — this bundle never landed"
+    )
