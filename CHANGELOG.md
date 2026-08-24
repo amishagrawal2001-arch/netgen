@@ -2,6 +2,173 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.220] - 2026-08-24
+
+**Migration ordering regression — fresh netgen-server install could
+not add ANY device (DHCP-server, DHCP-client, BGP, OSPF, IS-IS)
+because `_run_migrations` aborted mid-way and left `add_device`
+targeting columns that had never been created.**
+
+**Operator symptom** — reported on srv06 after upgrading netgen-server
+to v0.5.219:
+
+> "tried to add dhcp server device on the server, it does not seem
+> to be working"
+
+No error surfaced to the client — /api/device/apply returned HTTP
+200 with `{"status": "applied"}` — but the device row never landed
+in the database, dnsmasq never started, and the DHCP subtab stayed
+empty. On the server, the netgen-server journal held two smoking
+guns from the very first request against a fresh DB:
+
+    [DEVICE DB] Migration failed: duplicate column name: ospf_ipv4_uptime
+    [DEVICE DB] Failed to add device dev-…-01: table devices has
+                no column named loopback_ipv4
+
+The second line was the immediate cause — `add_device`'s
+`INSERT INTO devices (…, loopback_ipv4, loopback_ipv6, …)` SQL
+referenced columns the migration hadn't added yet. The first line
+was the root cause: `_run_migrations` had raised half-way through
+and the outer `try/except` at line ~741 swallowed everything after.
+
+**R1. Root cause — stale `columns` / `stats_columns` list at the
+"OSPF uptime" blocks.**
+
+`_run_migrations` reads `PRAGMA table_info(devices)` once at line
+~468 into a local `columns` list, then again at line ~516 into
+`stats_columns` for the stats table. It does NOT refresh those
+lists as it adds columns, so any later `if 'X' not in columns`
+check that runs after a block that added `X` is querying stale
+data.
+
+Two "separate check" blocks were fingered:
+
+- `if 'ospf_ipv4_uptime' not in columns:` at line ~556 — devices
+  table. Runs AFTER the `ospf_ipv4_running` block at line ~542
+  which already adds `ospf_ipv4_uptime` on a fresh DB. The stale
+  `columns` list still says the column is missing, so the check
+  passes, `ALTER TABLE ADD COLUMN ospf_ipv4_uptime` runs a second
+  time, SQLite raises `duplicate column name: ospf_ipv4_uptime`,
+  the outer `try/except` catches it, and every migration block
+  AFTER line ~561 is silently skipped:
+  - `device_stats.ospf_ipv4_uptime` / `_ipv6_uptime` (line ~580)
+  - `isis_config` on devices (line ~590)
+  - `device_type`, `container_id`, `connection_*` columns (line ~597)
+  - full ISIS status column set + `isis_manual_override` (line ~610)
+  - full ISIS stats column set (line ~629)
+  - `address_family`, `increment_type` on route_pools (line ~649)
+  - `gateway`, `lease_time`, `gateway_routes`, `description`,
+    `created_at`, `updated_at` on dhcp_pools (line ~662)
+  - `loopback_ipv4` / `loopback_ipv6` on devices (line ~690) ←
+    the one `add_device` blows up on
+  - the whole dhcp_* column set on devices when it entered via
+    the else branch (line ~703)
+  - `dhcp_lease_subnet` on devices (line ~719)
+  - v0.5.217 fix G's `dhcp_manual_override` + `_time` (line ~725)
+
+- `if 'ospf_ipv4_uptime' not in stats_columns:` at line ~580 —
+  device_stats table. Identical footgun: the `ospf_ipv4_running`
+  stats block at line ~566 already added `ospf_ipv4_uptime`, but
+  `stats_columns` from line ~516 is stale. If the devices block
+  above didn't abort first (or was fixed in isolation), this
+  block would abort instead — same effect: every subsequent
+  migration silently skipped.
+
+The v0.5.219 audit's coverage-gap test T1
+(`test_T1_migration_from_pre_v05217_schema` in
+`tests/test_v05219_dhcp_runtime.py`) had to WORK AROUND this bug
+to test v0.5.217 fix G at all — its constant
+`_ALL_PRE_V05217_STATS_MIGRATION_COLUMNS` docstring says:
+
+> `ospf_ipv4_running` ... MUST be pre-populated, otherwise the
+> migration's separate ospf_ipv4_uptime "already exists?" check
+> reads a stale columns list and re-adds it → duplicate column
+> name → migration aborts.
+
+The comment made the bug visible without fixing it — the
+workaround masked the symptom in the test suite, so nobody
+noticed that a genuinely-fresh netgen-server install could not
+add a single device.
+
+**Blast radius.** Existing srv06-style deployments that have been
+through many prior migrations already have `ospf_ipv4_uptime` etc.
+in place from earlier upgrades, so both check-blocks skip cleanly
+and the abort doesn't fire. But any FRESH install — new lab
+server, container-based deploy, or a wiped `/opt/netgen/database.db`
+— hits this on the very first startup and stays broken until
+something manually adds the missing columns.
+
+**R1. Fix — refresh `columns` / `stats_columns` from
+PRAGMA before the two "OSPF uptime separate check" blocks.**
+`utils/device_database.py`:
+
+- Line ~554-561 (devices): read `PRAGMA table_info(devices)`
+  immediately before the `if 'ospf_ipv4_uptime' not in columns:`
+  check. The refreshed `columns` now correctly reflects the
+  ospf_ipv4_uptime add from the block just above, so the check
+  short-circuits and no duplicate-add is attempted.
+- Line ~578-585 (device_stats): same shape. `PRAGMA
+  table_info(device_stats)` before the stats-side uptime check.
+
+No new helper method, no refactor of other ALTER TABLE call
+sites (kept the diff surgical — every other block already sits
+after either the initial PRAGMA read or a later refresh at
+line ~685-688, and none of them are exposed to the same "the
+block above me added my target column" ordering). Existing
+srv06-style deployments hit no behaviour change: both refreshed
+PRAGMAs return `columns`/`stats_columns` lists that already
+contain `ospf_ipv4_uptime`, the checks skip, and the pre-fix
+`else` branch's info log fires exactly as before.
+
+**Tests.** `tests/test_v05220_dhcp_server_add_regression.py`:
+
+- `test_R1_migration_completes_on_truly_fresh_db` — build a
+  fresh SQLite DB with ONLY the source `CREATE TABLE` statements
+  (no pre-populated migration columns, matching a first-time
+  install), open it via `DeviceDatabase(db_path=…)`, and assert
+  every column the pre-fix migration would have silently skipped
+  is present post-open: `ospf_ipv4_uptime`, `loopback_ipv4`,
+  `loopback_ipv6`, `dhcp_lease_subnet`, `dhcp_manual_override`,
+  `dhcp_manual_override_time`, `isis_manual_override`,
+  `isis_manual_override_time`, `device_type`, `connection_host`.
+  This would fail pre-fix (migration aborts, columns missing).
+- `test_R1_add_device_works_on_fresh_db` — after the same fresh
+  open, call `add_device` with a full device payload including
+  `loopback_ipv4` and a DHCP-server `dhcp_config`; assert it
+  returns True and `get_device` returns the row. This is exactly
+  the operator's failing path: pre-fix, `add_device` raises
+  "no such column: loopback_ipv4" internally and returns False.
+- `test_R1_start_dhcp_server_c3_write_works_on_fresh_db` —
+  same fresh DB, add a device, then simulate v0.5.219 fix C3's
+  `_update_device_db(..., {"dhcp_manual_override": False,
+  "dhcp_manual_override_time": None})`. Pre-fix, the column
+  doesn't exist so the write silently drops (caught by
+  `_update_device_db`'s `except`) and the monitor's 120s override
+  guard could not be cleared. Post-fix, both columns exist and
+  the write lands.
+- Source-level lock-in
+  `test_R1_migration_refreshes_columns_before_ospf_uptime_check`
+  — greps `utils/device_database.py` for a fresh
+  `PRAGMA table_info(devices)` read within a few lines above the
+  `if 'ospf_ipv4_uptime' not in columns:` check, and similarly
+  for the stats-table pair. Guards against a future refactor
+  that reintroduces the stale-list ordering.
+
+Full-suite regression check: `pytest -k "dhcp or v05217 or
+v05218 or v05219 or v05220"` — 72 passed, 0 new failures
+against the v0.5.219 baseline.
+
+**Deploy.** Server-side only. Restart netgen-server on srv06
+after installing the wheel. Existing DBs are unaffected —
+migration behaviour is identical to pre-fix for them. Fresh
+installs that were broken pre-fix will complete the migration
+end-to-end on next startup.
+
+**Files touched.** `utils/device_database.py` (2 blocks, ~20
+lines added between them for the refresh + fix comments),
+`tests/test_v05220_dhcp_server_add_regression.py` (new),
+`pyproject.toml` (version bump), `CHANGELOG.md` (this entry).
+
 ## [0.5.219] - 2026-08-24
 
 **DHCP collateral bundle — five follow-ups to v0.5.217 (A-H)

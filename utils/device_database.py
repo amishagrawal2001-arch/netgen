@@ -553,6 +553,24 @@ class DeviceDatabase:
                 logger.info("[DEVICE DB] OSPF IPv4/IPv6 specific columns already exist in devices table")
                 
             # Check if OSPF uptime columns exist in devices table (separate check)
+            # v0.5.220 (audit fix R1): refresh `columns` from PRAGMA so we
+            # don't try to re-add ospf_ipv4_uptime/_ipv6_uptime after the
+            # 'ospf_ipv4_running' block above already added them. Pre-fix,
+            # this block relied on the stale `columns` list from line ~468
+            # and on a genuinely fresh DB it would try ALTER TABLE ADD
+            # COLUMN a second time → "duplicate column name: ospf_ipv4_uptime"
+            # → caught by the top-level try/except at line ~741 → migration
+            # ABORTS mid-way → every subsequent ADD COLUMN block (loopback,
+            # dhcp_manual_override, isis_*, dhcp_lease_subnet, and the whole
+            # dhcp column set on installs that entered here without them)
+            # was silently SKIPPED. Symptom: on a fresh netgen-server
+            # install, `add_device` fails with "table devices has no column
+            # named loopback_ipv4", so *any* Add-Device (BGP/OSPF/ISIS/DHCP-
+            # server/client) silently fails at the DB step. This matches the
+            # operator's "Add DHCP-server device does not seem to be
+            # working" report on a freshly-provisioned netgen server.
+            cursor = conn.execute("PRAGMA table_info(devices)")
+            columns = [column[1] for column in cursor.fetchall()]
             if 'ospf_ipv4_uptime' not in columns:
                 logger.info("[DEVICE DB] Adding OSPF uptime columns to devices table")
                 conn.execute("ALTER TABLE devices ADD COLUMN ospf_ipv4_uptime TEXT")
@@ -577,6 +595,15 @@ class DeviceDatabase:
                 logger.info("[DEVICE DB] OSPF IPv4/IPv6 specific columns already exist in device_stats table")
                 
             # Check if OSPF uptime columns exist in device_stats table (separate check)
+            # v0.5.220 (audit fix R1): same footgun as the devices-table
+            # block above — refresh `stats_columns` from PRAGMA so the
+            # ospf_ipv4_uptime add from the 'ospf_ipv4_running' block
+            # (line ~566) isn't attempted a second time on a fresh DB.
+            # Pre-fix this raised "duplicate column name: ospf_ipv4_uptime"
+            # on any freshly-created device_stats table and aborted every
+            # subsequent migration step.
+            cursor = conn.execute("PRAGMA table_info(device_stats)")
+            stats_columns = [column[1] for column in cursor.fetchall()]
             if 'ospf_ipv4_uptime' not in stats_columns:
                 logger.info("[DEVICE DB] Adding OSPF uptime columns to device_stats table")
                 conn.execute("ALTER TABLE device_stats ADD COLUMN ospf_ipv4_uptime TEXT")
