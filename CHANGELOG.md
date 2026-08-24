@@ -2,6 +2,194 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.217] - 2026-08-23
+
+**DHCP audit bundle — 8 bugs off the DHCP walkthrough that
+followed the v0.5.207 protocol audit. Client-side fixes (A,
+B) tighten Edit-Device and Add-Device dialog behaviour;
+server-side fixes (C, D, E, F, G, H) plug leaks and blind
+spots in `run_tgen_server`, `utils/dhcp.py` and
+`utils/dhcp_monitor.py`.**
+
+**A. Edit Device silently corrupts DHCP config.**
+Pre-fix, `widgets/devices_tab.py` only pre-populated
+`dhcp_enable_checkbox` from the stored `dhcp_config`. The
+mode combo defaulted to "Server", the pool inputs stayed on
+their placeholder literals ("192.168.30.10", "…30.200"),
+and the Save handler wrote the whole blob back with
+`device_info["dhcp_config"] = dhcp_config`. Opening Edit on
+a CLIENT-mode device and clicking Save silently flipped it
+to SERVER mode with pool 192.168.30.10-200 (and clobbered
+any `additional_pools` / `pool_names` / `gateway_route`
+lists the operator or server had populated).
+Fix: pre-fill the dialog's mode combo, IPv4/IPv6 AF
+checkboxes, IPv4 pool start/end + lease + gateway route,
+and IPv6 pool start/end + prefix + server IP + gateway +
+routes + lease, from the stored config. On Save, run the
+dialog's returned config through the existing
+`_merge_dhcp_configs(existing, new)` helper (widgets/
+devices_tab.py:7823) so server-populated arrays survive.
+
+**B. DHCP-client mode silently wipes BGP config.**
+Pre-fix, `widgets/add_device_dialog.py:get_values()` had
+`if dhcp_mode_text == "client": ... bgp_config = {}`.
+Downstream treats empty-dict as "no BGP" and the protocol
+never gets configured. If an operator enabled both DHCP-
+client (for the interface address) and BGP (on the leased
+address or a static loopback), BGP silently vanished on
+Save with no warning.
+Fix: keep `bgp_config` populated. If both DHCP-client and
+BGP are on, that's the operator's explicit intent — show a
+`QMessageBox.warning` explaining the interaction (BGP will
+be configured against DHCP-leased addresses; make sure the
+neighbor and local addresses are reachable once the lease
+arrives) and let them decide.
+
+**C. Device Remove leaks dnsmasq/container when top-level
+`dhcp_mode` column is blank.**
+Pre-fix, `run_tgen_server.py:6374` re-computed
+`dhcp_mode_remove = (device_info.get("dhcp_mode") or "")
+.lower()`, silently overwriting the correct fallback at
+line 6333 which reads `dhcp_cfg.get("mode")` first. Devices
+whose mode only ever lived in `dhcp_config` JSON (not in
+the top-level column) matched "" and skipped the
+`stop_dhcp_services` call entirely — dnsmasq kept running
+and the DHCP container was orphaned past device removal.
+Fix: mirror line 6333 — parse `dhcp_config` locally and
+prefer `dhcp_cfg.get("mode")` before falling back to the
+column.
+
+**D. `stop_dhcp_server` unconditionally returns success.**
+Pre-fix, `utils/dhcp.py:1679` returned
+`{"success": True}` regardless of what happened. Sub-steps
+(kill dnsmasq PID, rm conf, del IPv4/IPv6 routes, remove
+IPv6 address) each caught their own exception at
+`logger.debug` level and moved on. Callers
+(`stop_dhcp_services`, /api/device/remove, the DHCP
+monitor) recorded "cleanup OK" while the container held
+stale routes and dnsmasq kept its config file.
+Fix: collect failures in a list, return
+`{"success": False, "error": "; ".join(failures),
+"failures": [...]}` when any sub-step failed. Upgraded the
+individual log lines from `debug` to `warning` so
+operators can actually see them in server logs.
+
+**E. DHCP monitor never polls server-mode devices.**
+Pre-fix, `utils/dhcp_monitor.py:_get_client_devices`
+filtered `dhcp_mode == "client"` only. A dnsmasq crash on a
+server-mode device stayed invisible until the next full
+server restart — the DB kept the last "Server Running"
+reading from a prior start forever.
+Fix: rename to `_get_dhcp_devices`, include both modes.
+New `_check_server_device` verifies dnsmasq is running
+(via `pgrep -f 'dnsmasq.*<conffile>'` first, then the
+pidfile with a `kill -0` liveness check), writes
+`dhcp_state="Server Running"` / `"Server Down"` and
+`dhcp_running` accordingly, and restarts via
+`ensure_dhcp_services` when down (subject to the same
+backoff gate as the client path). A back-compat
+`_get_client_devices` shim remains for any external caller.
+
+**F. `start_dhcp_server` error paths never write
+`dhcp_state="Failed"`.**
+Pre-fix, `utils/dhcp.py` returned `{"success": False,
+"error": ...}` from four failure branches (interface
+missing, no IPv4/IPv6 pool configured, dnsmasq config
+write failed, dnsmasq launch failed) but never touched
+the device DB — the last "Server Running" reading from a
+prior successful start stayed pinned. The UI showed a
+green DHCP pill even though dnsmasq never launched.
+Fix: mirror `start_dhcp_client` (dhcp.py:869-878) — write
+`{"dhcp_mode": "server", "dhcp_state": "Failed",
+"dhcp_running": False, "last_dhcp_check": now}` via
+`_update_device_db` before every `return {"success":
+False}` in `start_dhcp_server`.
+
+**G. No `dhcp_manual_override` — monitor resurrects
+manually stopped DHCP within 60s.**
+Pre-fix, when `stop_dhcp_services` wrote
+`dhcp_state="Stopped"`, the very next monitor tick
+observed `state != "Leased"`, called
+`ensure_dhcp_services(force_client_restart=True)`, and
+brought the device back up ~60 s after the operator
+explicitly stopped it. Same footgun BGP/OSPF/ISIS all had
+until their manual_override columns landed.
+Fix: mirror the BGP pattern (utils/bgp_monitor.py:262-
+279 for the reference implementation).
+- `utils/device_database.py`: add `dhcp_manual_override`
+  (BOOLEAN DEFAULT FALSE) + `dhcp_manual_override_time`
+  (TIMESTAMP) columns via an idempotent ALTER TABLE
+  migration; add them to `update_device`'s field_mapping.
+- `utils/dhcp.py`: `stop_dhcp_services` now stamps
+  `dhcp_manual_override=True` +
+  `dhcp_manual_override_time=now(UTC).isoformat()` on
+  every exit.
+- `utils/dhcp_monitor.py`: new `_manual_override_active`
+  reads both fields at the top of each device iteration.
+  If the flag is set AND the timestamp is within 120 s,
+  skip with a log line. If older, clear the override in
+  place and let the check proceed. The client-mode
+  snapshot write and the server-mode probe write also
+  clear both fields when the monitor takes over — so a
+  successful restart cycles the override off explicitly.
+
+**H. Restart-storm without backoff.**
+Pre-fix, `utils/dhcp_monitor.py:153-171` restarted any
+non-"Leased" client on every 60 s tick,
+`force_client_restart=True`, forever. A device with no
+reachable DHCP server churned indefinitely, pinning CPU
+and log volume.
+Fix: per-device `_dhcp_restart_attempts` dict on the
+monitor instance (`{device_id: {"count": N,
+"last_attempt": epoch}}`). After 3 restart attempts within
+5 minutes, gate further attempts on
+`check_interval * 2^(attempts-threshold+1)`, capped at 30
+minutes. A successful "Leased" observation
+(`_note_leased`) clears the counter. Backoff decisions
+log at INFO with attempts count and remaining wait, so
+operators can see why a device isn't being restarted.
+
+**Files touched:**
+- `widgets/devices_tab.py` — Edit-Device DHCP pre-fill +
+  merge on Save (fix A).
+- `widgets/add_device_dialog.py` — keep bgp_config in
+  DHCP-client mode + warning dialog (fix B).
+- `run_tgen_server.py` — device-remove dhcp_mode fallback
+  (fix C).
+- `utils/dhcp.py` — `stop_dhcp_server` failure tracking
+  (fix D), `start_dhcp_server` failure-state writes (fix
+  F), `stop_dhcp_services` manual_override stamp (fix G),
+  `_remove_ipv6_address` debug->warning.
+- `utils/dhcp_monitor.py` — rewritten around
+  `_get_dhcp_devices`, `_check_server_device`,
+  `_manual_override_active`, `_backoff_gate` /
+  `_note_restart_attempt` / `_note_leased` (fixes E, G,
+  H).
+- `utils/device_database.py` — schema migration for
+  `dhcp_manual_override` + `dhcp_manual_override_time`,
+  field_mapping additions (fix G).
+
+**Tests:** `tests/test_v05217_dhcp_bundle.py` — 16 source-
+level lock-ins across all eight bugs (Edit-Device calls
+`_merge_dhcp_configs`, dialog pre-fill touches mode +
+pools + AF checkboxes, DHCP-client no longer sets
+`bgp_config = {}`, warning references BGP, `dhcp_mode_
+remove` uses the dhcp_config fallback, `stop_dhcp_server`
+collects failures + returns them, `_get_dhcp_devices`
+includes both modes, `_check_server_device` exists,
+`start_dhcp_server` writes "Failed" before every failure
+return, `dhcp_manual_override` write in stop path, 120s
+guard, clear-on-takeover, `_dhcp_restart_attempts` dict +
+backoff calc + "Leased" reset).
+
+**Deploy note:** Server-side fixes (C, D, E, F, G, H)
+require `netgen-server` restart on srv06. Client-side
+fixes (A, B) require the new wheel installed on the macOS
+client. All eight land in the same wheel; the ordering is
+`server upgrade + restart` first, then `client upgrade` so
+the `dhcp_manual_override` column exists before any client
+Edit-Save can round-trip through it.
+
 ## [0.5.216] - 2026-08-23
 
 **Ping test (Devices tab) now shows a per-device progress

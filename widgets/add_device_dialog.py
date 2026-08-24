@@ -1893,7 +1893,33 @@ class AddDeviceDialog(QDialog):
                 ipv6_mask = ""
                 ipv4_gateway = ""
                 ipv6_gateway = ""
-                bgp_config = {}
+                # v0.5.217 (audit fix B): do NOT wipe bgp_config just
+                # because DHCP-client is on. Pre-fix, `bgp_config = {}`
+                # silently dropped whatever BGP config the operator
+                # enabled alongside DHCP-client — downstream treats
+                # empty-dict as "no BGP" and the protocol never comes
+                # up, matching a real complaint on JNPR-MAC-HWXVX1.
+                # If both are checked, that's the operator's explicit
+                # intent (DHCP for the interface address, static
+                # loopbacks + BGP over the leased link). Surface a
+                # warning so they see the interaction rather than
+                # silently losing config.
+                if bgp_config:
+                    try:
+                        from PyQt5.QtWidgets import QMessageBox
+                        QMessageBox.warning(
+                            self,
+                            "DHCP-client + BGP",
+                            "This device has both DHCP-client mode and BGP "
+                            "enabled. The interface IPv4/IPv6 addresses will "
+                            "be leased from DHCP, but BGP will still be "
+                            "configured against those leased addresses. Ensure "
+                            "the BGP neighbor and local addresses are "
+                            "reachable once the lease arrives.",
+                        )
+                    except Exception:
+                        # Non-GUI test paths — best effort only.
+                        pass
                 if ospf_config:
                     # Preserve intent to run OSPF even though address will arrive via DHCP
                     ospf_config["ipv4_enabled"] = self.ospf_toggle_ipv4.isChecked() if hasattr(self, "ospf_toggle_ipv4") else True

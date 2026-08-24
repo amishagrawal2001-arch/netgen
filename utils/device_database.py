@@ -721,7 +721,23 @@ class DeviceDatabase:
                     conn.execute("ALTER TABLE devices ADD COLUMN dhcp_lease_subnet TEXT")
                     conn.commit()
                     logger.info("[DEVICE DB] Successfully added dhcp_lease_subnet column to devices table")
-            
+
+            # v0.5.217 (audit fix G): manual-override flag + timestamp
+            # for DHCP, mirroring bgp_manual_override / ospf /
+            # isis_manual_override. Prevents the DHCP monitor from
+            # resurrecting a DHCP service the operator explicitly
+            # stopped within the last 120 s.
+            cursor = conn.execute("PRAGMA table_info(devices)")
+            columns = [column[1] for column in cursor.fetchall()]
+            if 'dhcp_manual_override' not in columns:
+                logger.info("[DEVICE DB] Adding dhcp_manual_override column to devices table")
+                conn.execute("ALTER TABLE devices ADD COLUMN dhcp_manual_override BOOLEAN DEFAULT FALSE")
+                conn.commit()
+            if 'dhcp_manual_override_time' not in columns:
+                logger.info("[DEVICE DB] Adding dhcp_manual_override_time column to devices table")
+                conn.execute("ALTER TABLE devices ADD COLUMN dhcp_manual_override_time TIMESTAMP")
+                conn.commit()
+
         except Exception as e:
             logger.error(f"[DEVICE DB] Migration failed: {e}")
             # Don't raise the exception to avoid breaking the database initialization
@@ -922,6 +938,9 @@ class DeviceDatabase:
                     'last_isis_check': 'last_isis_check',
                     'isis_manual_override': 'isis_manual_override',
                     'isis_manual_override_time': 'isis_manual_override_time',
+                    # v0.5.217 (audit fix G): DHCP manual-override flag.
+                    'dhcp_manual_override': 'dhcp_manual_override',
+                    'dhcp_manual_override_time': 'dhcp_manual_override_time',
                     'vxlan_config': 'vxlan_config',
                     'vxlan_state': 'vxlan_state',
                     'vxlan_interface': 'vxlan_interface',

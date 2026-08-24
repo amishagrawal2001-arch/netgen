@@ -509,7 +509,11 @@ def _remove_ipv6_address(interface: str, address: str, prefix: str, container=No
         )
         logger.info("[DHCP] Removed IPv6 address %s/%s from %s", address, prefix, interface)
     except Exception as exc:
-        logger.debug(
+        # v0.5.217 (audit fix D): upgrade debug->warning so operators
+        # can see the swallowed failure in server logs. The caller
+        # can still ignore it (this helper returns None), but the
+        # trail is now visible.
+        logger.warning(
             "[DHCP] Failed to remove IPv6 address %s/%s from %s: %s",
             address,
             prefix,
@@ -1094,6 +1098,21 @@ def start_dhcp_server(
     if not _verify_interface_exists(interface, container=container):
         error_msg = f"Interface {interface} not found in container/host. Cannot start DHCP server."
         logger.error(f"[DHCP] {error_msg}")
+        # v0.5.217 (audit fix F): mirror start_dhcp_client — write
+        # dhcp_state="Failed" + dhcp_running=False before every
+        # failure return. Pre-fix, the DB kept the previous
+        # "Server Running" reading and the UI showed a green DHCP
+        # pill even though dnsmasq never launched.
+        _update_device_db(
+            device_db,
+            device_id,
+            {
+                "dhcp_mode": "server",
+                "dhcp_state": "Failed",
+                "dhcp_running": False,
+                "last_dhcp_check": datetime.now(timezone.utc).isoformat(),
+            },
+        )
         return {"success": False, "error": error_msg}
 
     _ensure_paths(container=container)
@@ -1159,6 +1178,17 @@ def start_dhcp_server(
         ipv6_enabled = False
 
     if not ipv4_enabled and not ipv6_enabled:
+        # v0.5.217 (audit fix F): mark as Failed before returning.
+        _update_device_db(
+            device_db,
+            device_id,
+            {
+                "dhcp_mode": "server",
+                "dhcp_state": "Failed",
+                "dhcp_running": False,
+                "last_dhcp_check": datetime.now(timezone.utc).isoformat(),
+            },
+        )
         return {
             "success": False,
             "error": "DHCP server requires at least one of IPv4 or IPv6 pool to be configured",
@@ -1226,6 +1256,17 @@ def start_dhcp_server(
                 fh.write("\n".join(config_lines) + "\n")
     except Exception as exc:
         logger.error("[DHCP] Failed to write dnsmasq config %s: %s", conffile, exc)
+        # v0.5.217 (audit fix F): mark as Failed before returning.
+        _update_device_db(
+            device_db,
+            device_id,
+            {
+                "dhcp_mode": "server",
+                "dhcp_state": "Failed",
+                "dhcp_running": False,
+                "last_dhcp_check": datetime.now(timezone.utc).isoformat(),
+            },
+        )
         return {"success": False, "error": str(exc)}
 
     try:
@@ -1251,9 +1292,31 @@ def start_dhcp_server(
         result = _run_command(cmd, timeout=10, container=container)
         if result.returncode != 0:
             logger.error("[DHCP] dnsmasq failed: %s", result.stderr)
+            # v0.5.217 (audit fix F): mark as Failed before returning.
+            _update_device_db(
+                device_db,
+                device_id,
+                {
+                    "dhcp_mode": "server",
+                    "dhcp_state": "Failed",
+                    "dhcp_running": False,
+                    "last_dhcp_check": datetime.now(timezone.utc).isoformat(),
+                },
+            )
             return {"success": False, "error": result.stderr.strip()}
     except Exception as exc:
         logger.error("[DHCP] dnsmasq launch error: %s", exc)
+        # v0.5.217 (audit fix F): mark as Failed before returning.
+        _update_device_db(
+            device_db,
+            device_id,
+            {
+                "dhcp_mode": "server",
+                "dhcp_state": "Failed",
+                "dhcp_running": False,
+                "last_dhcp_check": datetime.now(timezone.utc).isoformat(),
+            },
+        )
         return {"success": False, "error": str(exc)}
 
     pool_networks_unique = []
@@ -1454,6 +1517,16 @@ def start_dhcp_server(
 
 def stop_dhcp_server(device_db, device_id: str, interface: str, container=None) -> Dict:
     """Stop dnsmasq instance bound to interface."""
+    # v0.5.217 (audit fix D): collect per-step failures instead of
+    # returning {"success": True} unconditionally. Individual sub-
+    # steps (kill dnsmasq PID, rm conf, del IPv4/IPv6 routes,
+    # remove IPv6 address) previously swallowed exceptions at debug
+    # level and the function still reported success, so callers
+    # (stop_dhcp_services, /api/device/remove) recorded "cleanup OK"
+    # while the container held stale routes and dnsmasq kept its
+    # config file. Track everything that failed and return it.
+    failures: List[str] = []
+
     pidfile = os.path.join(DNSMASQ_PID_DIR, f"dnsmasq-{interface}.pid")
     conffile = os.path.join(DNSMASQ_CONF_DIR, f"ostg-{interface}.conf")
     gateway = ""
@@ -1578,7 +1651,9 @@ def stop_dhcp_server(device_db, device_id: str, interface: str, container=None) 
                     if pid:
                         _run_command(["kill", pid], timeout=5)
     except Exception as exc:
-        logger.debug("[DHCP] Failed to stop dnsmasq: %s", exc)
+        # v0.5.217 (audit fix D): upgrade debug->warning + record.
+        logger.warning("[DHCP] Failed to stop dnsmasq: %s", exc)
+        failures.append(f"stop dnsmasq: {exc}")
     try:
         if container:
             # Remove config file
@@ -1593,7 +1668,9 @@ def stop_dhcp_server(device_db, device_id: str, interface: str, container=None) 
             if os.path.exists(conffile):
                 os.remove(conffile)
     except Exception as exc:
-        logger.debug("[DHCP] Failed to remove dnsmasq config: %s", exc)
+        # v0.5.217 (audit fix D): upgrade debug->warning + record.
+        logger.warning("[DHCP] Failed to remove dnsmasq config: %s", exc)
+        failures.append(f"remove dnsmasq config: {exc}")
 
     # Remove routes from container (regardless of gateway, since gateway_routes may not have gateway)
     if networks and container:
@@ -1631,7 +1708,11 @@ def stop_dhcp_server(device_db, device_id: str, interface: str, container=None) 
                         )
                         logger.info("[DHCP] Removed static route %s (with dev) from DHCP container", net)
                 except Exception:
-                    logger.debug("[DHCP] Failed to remove static route %s: %s", net, route_exc)
+                    # v0.5.217 (audit fix D): warn + track.
+                    logger.warning(
+                        "[DHCP] Failed to remove static route %s: %s", net, route_exc
+                    )
+                    failures.append(f"remove IPv4 route {net}: {route_exc}")
 
     if container and ipv6_gateway_routes:
         for route in ipv6_gateway_routes:
@@ -1649,7 +1730,13 @@ def stop_dhcp_server(device_db, device_id: str, interface: str, container=None) 
                 )
                 logger.info("[DHCP] Removed IPv6 gateway route %s from DHCP container", route)
             except Exception as route_exc:
-                logger.debug("[DHCP] Failed to remove IPv6 gateway route %s: %s", route, route_exc)
+                # v0.5.217 (audit fix D): warn + track.
+                logger.warning(
+                    "[DHCP] Failed to remove IPv6 gateway route %s: %s",
+                    route,
+                    route_exc,
+                )
+                failures.append(f"remove IPv6 gateway route {route}: {route_exc}")
 
     if container and ipv6_gateway and ipv6_subnets:
         for subnet in ipv6_subnets:
@@ -1661,7 +1748,13 @@ def stop_dhcp_server(device_db, device_id: str, interface: str, container=None) 
                 )
                 logger.info("[DHCP] Removed IPv6 static route %s via %s from DHCP container", subnet, ipv6_gateway)
             except Exception as route_exc:
-                logger.debug("[DHCP] Failed to remove IPv6 static route %s: %s", subnet, route_exc)
+                # v0.5.217 (audit fix D): warn + track.
+                logger.warning(
+                    "[DHCP] Failed to remove IPv6 static route %s: %s",
+                    subnet,
+                    route_exc,
+                )
+                failures.append(f"remove IPv6 static route {subnet}: {route_exc}")
 
     if ipv6_server_ip and ipv6_prefix:
         _remove_ipv6_address(interface, ipv6_server_ip, ipv6_prefix, container=container)
@@ -1676,6 +1769,15 @@ def stop_dhcp_server(device_db, device_id: str, interface: str, container=None) 
             "last_dhcp_check": datetime.now(timezone.utc).isoformat(),
         },
     )
+    # v0.5.217 (audit fix D): surface aggregated failures instead of
+    # blanket success. Callers previously had no way to know that
+    # dnsmasq is still running or that a route is still installed.
+    if failures:
+        return {
+            "success": False,
+            "error": "; ".join(failures),
+            "failures": failures,
+        }
     return {"success": True}
 
 
@@ -1701,6 +1803,23 @@ def stop_dhcp_services(
         _stop_dhcp_container(device_id, mode=dhcp_mode, remove=remove_container)
     elif remove_container:
         _stop_dhcp_container(device_id, mode=dhcp_mode, remove=True)
+
+    # v0.5.217 (audit fix G): whenever an explicit stop reaches this
+    # entry point, stamp dhcp_manual_override=True so the DHCP
+    # monitor doesn't turn around on its next tick and restart the
+    # service the operator just asked us to stop. Mirrors the
+    # BGP/OSPF/ISIS manual_override pattern. The override auto-
+    # expires after 120 s inside the monitor (see
+    # utils/dhcp_monitor.py) or the moment the monitor observes a
+    # successful "Leased" state after taking over.
+    _update_device_db(
+        device_db,
+        device_id,
+        {
+            "dhcp_manual_override": True,
+            "dhcp_manual_override_time": datetime.now(timezone.utc).isoformat(),
+        },
+    )
 
     return result
 

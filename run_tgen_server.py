@@ -6371,7 +6371,26 @@ def remove_device():
                             logging.info(f"[DEVICE REMOVE] Successfully cleaned up VXLAN for device {device_id}")
                     except Exception as vxlan_exc:
                         logging.warning(f"[DEVICE REMOVE] Failed to tear down VXLAN for {device_id}: {vxlan_exc}")
-                dhcp_mode_remove = (device_info.get("dhcp_mode") or "").lower()
+                # v0.5.217 (audit fix C): mirror the fallback logic at
+                # line 6333 — the top-level `dhcp_mode` column is often
+                # blank on devices whose mode was only ever written into
+                # dhcp_config JSON. Reading only `device_info["dhcp_mode"]`
+                # here left the check as "" for those devices, so
+                # stop_dhcp_services was never called and the dnsmasq /
+                # dhclient container leaked past device removal.
+                dhcp_cfg_for_remove = device_info.get("dhcp_config") or {}
+                if isinstance(dhcp_cfg_for_remove, str):
+                    try:
+                        dhcp_cfg_for_remove = json.loads(dhcp_cfg_for_remove) if dhcp_cfg_for_remove else {}
+                    except Exception:
+                        dhcp_cfg_for_remove = {}
+                if not isinstance(dhcp_cfg_for_remove, dict):
+                    dhcp_cfg_for_remove = {}
+                dhcp_mode_remove = (
+                    dhcp_cfg_for_remove.get("mode")
+                    or device_info.get("dhcp_mode")
+                    or ""
+                ).lower()
                 if dhcp_mode_remove in ("client", "server") and iface_name:
                     try:
                         logging.info(f"[DHCP] Stopping DHCP {dhcp_mode_remove} before removing device {device_id}")

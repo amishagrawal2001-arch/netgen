@@ -7252,6 +7252,102 @@ class DevicesTab(QWidget):
             if hasattr(dialog, "dhcp_enable_checkbox"):
                 dialog.dhcp_enable_checkbox.setChecked(dhcp_on)
 
+            # v0.5.217 (audit fix A): pre-fill the DHCP mode combo,
+            # pool inputs, IPv4/IPv6 AF checkboxes, IPv6 pool fields,
+            # and gateway route from the stored dhcp_config. Pre-fix,
+            # only `dhcp_enable_checkbox` was pre-populated; the mode
+            # combo defaulted to "Server" and pool inputs stayed on
+            # the placeholder literals ("192.168.30.10", etc.). The
+            # Save handler then wrote the whole blob back with those
+            # defaults — opening Edit on a CLIENT-mode device and
+            # clicking Save silently converted it to a SERVER with
+            # a bogus pool. Mirror the actual stored state so the
+            # returned dhcp_config reflects reality.
+            if dhcp_on and hasattr(dialog, "dhcp_mode_combo"):
+                stored_mode_raw = str(
+                    existing_dhcp.get("mode")
+                    or device_info.get("dhcp_mode")
+                    or "client"
+                ).strip().lower()
+                combo_text = "Client" if stored_mode_raw == "client" else "Server"
+                idx = dialog.dhcp_mode_combo.findText(combo_text)
+                if idx >= 0:
+                    dialog.dhcp_mode_combo.setCurrentIndex(idx)
+
+                if hasattr(dialog, "dhcp_ipv4_enabled_checkbox"):
+                    dialog.dhcp_ipv4_enabled_checkbox.setChecked(
+                        bool(existing_dhcp.get("ipv4_enabled", True))
+                    )
+                if hasattr(dialog, "dhcp_ipv6_enabled_checkbox"):
+                    dialog.dhcp_ipv6_enabled_checkbox.setChecked(
+                        bool(existing_dhcp.get("ipv6_enabled", False))
+                    )
+
+                # IPv4 pool + gateway route
+                if hasattr(dialog, "dhcp_pool_start_input"):
+                    v4_start = existing_dhcp.get("pool_start")
+                    if v4_start:
+                        dialog.dhcp_pool_start_input.setText(str(v4_start))
+                if hasattr(dialog, "dhcp_pool_end_input"):
+                    v4_end = existing_dhcp.get("pool_end")
+                    if v4_end:
+                        dialog.dhcp_pool_end_input.setText(str(v4_end))
+                if hasattr(dialog, "dhcp_lease_time_input"):
+                    lease = existing_dhcp.get("lease_time") or existing_dhcp.get("lease_hours")
+                    if lease not in (None, ""):
+                        dialog.dhcp_lease_time_input.setText(str(lease))
+                if hasattr(dialog, "dhcp_gateway_route_input"):
+                    gw_route = existing_dhcp.get("gateway_route")
+                    if isinstance(gw_route, (list, tuple)):
+                        gw_route = ",".join(str(x) for x in gw_route if x)
+                    if gw_route:
+                        dialog.dhcp_gateway_route_input.setText(str(gw_route))
+
+                # IPv6 pool + prefix + server IP + gateway + routes + lease
+                if hasattr(dialog, "dhcp6_pool_start_input"):
+                    v6_start = (
+                        existing_dhcp.get("ipv6_pool_start")
+                        or existing_dhcp.get("pool_start_v6")
+                    )
+                    if v6_start:
+                        dialog.dhcp6_pool_start_input.setText(str(v6_start))
+                if hasattr(dialog, "dhcp6_pool_end_input"):
+                    v6_end = (
+                        existing_dhcp.get("ipv6_pool_end")
+                        or existing_dhcp.get("pool_end_v6")
+                    )
+                    if v6_end:
+                        dialog.dhcp6_pool_end_input.setText(str(v6_end))
+                if hasattr(dialog, "dhcp6_prefix_input"):
+                    v6_prefix = (
+                        existing_dhcp.get("ipv6_prefix")
+                        or existing_dhcp.get("ipv6_prefix_length")
+                        or existing_dhcp.get("ipv6_prefix_len")
+                    )
+                    if v6_prefix not in (None, ""):
+                        dialog.dhcp6_prefix_input.setText(str(v6_prefix))
+                if hasattr(dialog, "dhcp6_server_ip_input"):
+                    v6_srv = existing_dhcp.get("ipv6_server_ip") or existing_dhcp.get("ipv6_server")
+                    if v6_srv:
+                        dialog.dhcp6_server_ip_input.setText(str(v6_srv))
+                if hasattr(dialog, "dhcp6_gateway_input"):
+                    v6_gw = existing_dhcp.get("ipv6_gateway")
+                    if v6_gw:
+                        dialog.dhcp6_gateway_input.setText(str(v6_gw))
+                if hasattr(dialog, "dhcp6_gateway_route_input"):
+                    v6_routes = (
+                        existing_dhcp.get("ipv6_gateway_route")
+                        or existing_dhcp.get("ipv6_gateway_routes")
+                    )
+                    if isinstance(v6_routes, (list, tuple)):
+                        v6_routes = ",".join(str(x) for x in v6_routes if x)
+                    if v6_routes:
+                        dialog.dhcp6_gateway_route_input.setText(str(v6_routes))
+                if hasattr(dialog, "dhcp6_lease_time_input"):
+                    v6_lease = existing_dhcp.get("ipv6_lease_time") or existing_dhcp.get("lease_time_v6")
+                    if v6_lease not in (None, ""):
+                        dialog.dhcp6_lease_time_input.setText(str(v6_lease))
+
             # Pre-fill BGP fields from the stored config so the user
             # sees the actual ASN / neighbor IPs they configured.
             if bgp_on:
@@ -7423,8 +7519,34 @@ class DevicesTab(QWidget):
             def _dhcp_extra_cleanup():
                 device_info.pop("dhcp_mode", None)
             if dhcp_config:
-                device_info["dhcp_config"] = dhcp_config
-                device_info["dhcp_mode"] = (dhcp_config.get("mode") or "client").lower()
+                # v0.5.217 (audit fix A): merge the dialog's returned
+                # dhcp_config on top of the existing config rather than
+                # whole-blob overwriting. Pre-fix, `device_info[
+                # "dhcp_config"] = dhcp_config` clobbered
+                # additional_pools, pool_names, gateway_route lists and
+                # any other server-populated metadata the dialog didn't
+                # know about. Combined with the pool inputs staying on
+                # placeholder literals when the dialog opened (also
+                # fixed above), a plain Save on a CLIENT device could
+                # silently flip it to SERVER with 192.168.30.10-200.
+                # _merge_dhcp_configs preserves server-provided arrays
+                # and biases toward the dialog's fresh values for
+                # scalars.
+                existing_dhcp_for_merge = device_info.get("dhcp_config") or {}
+                if isinstance(existing_dhcp_for_merge, str):
+                    try:
+                        existing_dhcp_for_merge = json.loads(existing_dhcp_for_merge)
+                    except Exception:
+                        existing_dhcp_for_merge = {}
+                merged_dhcp = self._merge_dhcp_configs(
+                    existing_dhcp_for_merge, dhcp_config
+                )
+                device_info["dhcp_config"] = merged_dhcp
+                device_info["dhcp_mode"] = (
+                    merged_dhcp.get("mode")
+                    or dhcp_config.get("mode")
+                    or "client"
+                ).lower()
                 if "DHCP" not in protocols_list:
                     protocols_list.append("DHCP")
             else:
