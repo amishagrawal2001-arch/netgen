@@ -761,6 +761,154 @@ def _remove_route_and_vrf_copy(
     return failures
 
 
+def _iface_has_ipv4_in_subnet(interface: str, subnet, container=None) -> bool:
+    """True when `interface` has any IPv4 address that falls inside `subnet`."""
+    try:
+        result = _run_command(
+            ["ip", "-o", "-4", "addr", "show", "dev", interface],
+            timeout=5, container=container,
+        )
+        if result.returncode != 0:
+            return False
+        for line in (result.stdout or "").splitlines():
+            parts = line.split()
+            if "inet" not in parts:
+                continue
+            idx = parts.index("inet")
+            if idx + 1 >= len(parts):
+                continue
+            cidr = parts[idx + 1]
+            try:
+                addr = ipaddress.IPv4Interface(cidr)
+                if addr.ip in ipaddress.IPv4Network(subnet, strict=False):
+                    return True
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return False
+
+
+def _ensure_ipv4_address(
+    interface: str,
+    pool_start: str,
+    pool_end: str,
+    gateway: str = "",
+    ipv4_mask: str = "",
+    container=None,
+) -> Optional[str]:
+    """Ensure the interface has an IPv4 address in the pool's subnet.
+
+    v0.5.222: pre-fix ``start_dhcp_server`` had ``_ensure_ipv6_address``
+    for the v6 side but nothing for v4. If the VLAN interface had no
+    IPv4 in the pool's subnet, dnsmasq's launch failed with "no
+    interface with matching address" and the operator saw
+    ``dhcp_state="Failed"`` with the actual error hidden in server
+    logs. Root cause on operator's srv06 setup: DHCP-server device
+    added with pool ``192.168.30.10-192.168.30.200`` but no
+    ``IPv4`` field set on the device (only the gateway subnet was
+    known implicitly via the pool), so ``vlan200`` came up bare.
+
+    Logic:
+    - Prefer ``gateway`` when the operator provided one and it falls
+      inside the pool subnet — that's the dnsmasq default GW anyway.
+    - Otherwise, derive a ``.1`` in the pool's subnet. Not the pool
+      range itself (want to leave that free for clients).
+    - Skip if the interface already has an IPv4 in the pool subnet
+      (idempotent).
+
+    Returns the IPv4 address assigned (or the pre-existing one), or
+    None if the caller must fail loudly. Callers should surface the
+    None case into ``dhcp_last_error`` so operators see it.
+    """
+    if not interface or not pool_start or not pool_end:
+        return None
+    try:
+        # Find the SUPERNET (smallest prefix that covers both
+        # pool_start and pool_end in one contiguous block).
+        # ``summarize_address_range`` returns the minimal set of
+        # exact fragments — for 192.168.30.10-200 that's a bunch
+        # of /27/28/29 pieces, and .1 wouldn't be inside any of
+        # them. What we actually want is the classful/CIDR
+        # supernet the operator implicitly means (a /24 for a
+        # typical .10-.200 pool). Walk prefix lengths from /32
+        # down to /8 and take the first one where both endpoints
+        # land in the same subnet.
+        start = ipaddress.IPv4Address(pool_start)
+        end = ipaddress.IPv4Address(pool_end)
+        if ipv4_mask:
+            pool_network = ipaddress.IPv4Network(
+                f"{pool_start}/{int(ipv4_mask)}", strict=False,
+            )
+            if end not in pool_network:
+                # Operator's mask doesn't actually cover the pool
+                # end; fall through to auto-derive so we don't
+                # anchor to a bogus subnet.
+                pool_network = None
+        else:
+            pool_network = None
+        if pool_network is None:
+            pool_network = None
+            for prefixlen in range(32, 7, -1):
+                candidate = ipaddress.IPv4Network(
+                    f"{pool_start}/{prefixlen}", strict=False,
+                )
+                if end in candidate:
+                    pool_network = candidate
+                    break
+            if pool_network is None:
+                return None
+    except Exception as exc:
+        logger.warning("[DHCP] Cannot derive subnet from pool %s-%s: %s",
+                       pool_start, pool_end, exc)
+        return None
+
+    # Already have a usable IPv4? Idempotent.
+    if _iface_has_ipv4_in_subnet(interface, pool_network, container=container):
+        logger.debug("[DHCP] Interface %s already has IPv4 in %s", interface, pool_network)
+        return None
+
+    # Pick an address: gateway if it fits, else `.1` of the pool subnet.
+    server_ip = ""
+    if gateway:
+        try:
+            if ipaddress.IPv4Address(gateway) in pool_network:
+                server_ip = gateway
+        except Exception:
+            pass
+    if not server_ip:
+        # `.1` of the pool network — avoids the pool range itself.
+        try:
+            server_ip = str(list(pool_network.hosts())[0])
+        except Exception:
+            return None
+
+    mask_bits = ipv4_mask or str(pool_network.prefixlen)
+    try:
+        result = _run_command(
+            ["ip", "-4", "addr", "add", f"{server_ip}/{mask_bits}", "dev", interface],
+            timeout=5, container=container,
+        )
+        if result.returncode == 0:
+            logger.info("[DHCP] Assigned IPv4 %s/%s to %s for dnsmasq bind",
+                        server_ip, mask_bits, interface)
+            return server_ip
+        # `File exists` = already assigned; treat as success.
+        stderr = (result.stderr or "").lower()
+        if "file exists" in stderr or "already assigned" in stderr:
+            return server_ip
+        logger.warning(
+            "[DHCP] Failed to assign IPv4 %s/%s to %s: %s",
+            server_ip, mask_bits, interface, result.stderr,
+        )
+    except Exception as exc:
+        logger.warning(
+            "[DHCP] Exception assigning IPv4 %s/%s to %s: %s",
+            server_ip, mask_bits, interface, exc,
+        )
+    return None
+
+
 def _ensure_ipv6_address(interface: str, address: str, prefix: str, container=None) -> bool:
     """Ensure the interface has the specified IPv6 address configured."""
     if not interface or not address or prefix is None:
@@ -1551,6 +1699,7 @@ def start_dhcp_server(
                 "dhcp_mode": "server",
                 "dhcp_state": "Failed",
                 "dhcp_running": False,
+                "dhcp_last_error": error_msg,  # v0.5.222: surface to UI
                 "last_dhcp_check": datetime.now(timezone.utc).isoformat(),
             },
         )
@@ -1620,6 +1769,7 @@ def start_dhcp_server(
 
     if not ipv4_enabled and not ipv6_enabled:
         # v0.5.217 (audit fix F): mark as Failed before returning.
+        err = "DHCP server requires at least one of IPv4 or IPv6 pool to be configured"
         _update_device_db(
             device_db,
             device_id,
@@ -1627,6 +1777,7 @@ def start_dhcp_server(
                 "dhcp_mode": "server",
                 "dhcp_state": "Failed",
                 "dhcp_running": False,
+                "dhcp_last_error": err,  # v0.5.222: surface to UI
                 "last_dhcp_check": datetime.now(timezone.utc).isoformat(),
             },
         )
@@ -1634,6 +1785,27 @@ def start_dhcp_server(
             "success": False,
             "error": "DHCP server requires at least one of IPv4 or IPv6 pool to be configured",
         }
+
+    # v0.5.222: ensure the interface actually has an IPv4 address
+    # in the pool's subnet before launching dnsmasq. dnsmasq's
+    # ``bind-interfaces`` + ``dhcp-range`` requires a matching
+    # address on the interface; without one it exits with "no
+    # interface with address ..." and start_dhcp_server writes
+    # dhcp_state="Failed". Pre-fix this only worked when the
+    # operator had explicitly set an IPv4 on the device via Add
+    # Device, or when a prior apply had assigned one. Now
+    # start_dhcp_server owns the assignment: prefer the operator's
+    # gateway (if it fits in the pool subnet), else use the pool
+    # subnet's ``.1``.
+    if ipv4_enabled and pool_start and pool_end:
+        assigned = _ensure_ipv4_address(
+            interface, pool_start, pool_end,
+            gateway=gateway, ipv4_mask="",
+            container=container,
+        )
+        if assigned:
+            logger.info("[DHCP] Server-mode IPv4 anchor on %s: %s",
+                        interface, assigned)
 
     if ipv6_enabled and ipv6_server_ip and ipv6_prefix:
         _ensure_ipv6_address(interface, ipv6_server_ip, ipv6_prefix, container=container)
@@ -1705,6 +1877,7 @@ def start_dhcp_server(
                 "dhcp_mode": "server",
                 "dhcp_state": "Failed",
                 "dhcp_running": False,
+                "dhcp_last_error": f"Config write failed: {exc}",  # v0.5.222
                 "last_dhcp_check": datetime.now(timezone.utc).isoformat(),
             },
         )
@@ -1734,6 +1907,7 @@ def start_dhcp_server(
         if result.returncode != 0:
             logger.error("[DHCP] dnsmasq failed: %s", result.stderr)
             # v0.5.217 (audit fix F): mark as Failed before returning.
+            stderr_short = (result.stderr or "").strip()[:400]
             _update_device_db(
                 device_db,
                 device_id,
@@ -1741,6 +1915,7 @@ def start_dhcp_server(
                     "dhcp_mode": "server",
                     "dhcp_state": "Failed",
                     "dhcp_running": False,
+                    "dhcp_last_error": f"dnsmasq: {stderr_short}",  # v0.5.222
                     "last_dhcp_check": datetime.now(timezone.utc).isoformat(),
                 },
             )
@@ -1755,6 +1930,7 @@ def start_dhcp_server(
                 "dhcp_mode": "server",
                 "dhcp_state": "Failed",
                 "dhcp_running": False,
+                "dhcp_last_error": f"dnsmasq launch: {exc}",  # v0.5.222
                 "last_dhcp_check": datetime.now(timezone.utc).isoformat(),
             },
         )
@@ -1941,6 +2117,7 @@ def start_dhcp_server(
             "dhcp_mode": "server",
             "dhcp_state": "Server Running",
             "dhcp_running": True,
+            "dhcp_last_error": "",  # v0.5.222: clear on success
             "dhcp_lease_ip": "",
             "dhcp_lease_mask": "",
             "dhcp_lease_gateway": gateway if ipv4_enabled else ipv6_gateway,

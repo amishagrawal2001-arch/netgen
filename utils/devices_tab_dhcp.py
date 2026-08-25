@@ -1050,6 +1050,19 @@ class DHCPHandler:
             self._set_item(row, "Mode", (entry.get("mode") or "").title())
             self._set_item(row, "Pools", self._format_pool_names(entry))
             self._set_item(row, "State", entry.get("state", "Unknown"))
+            # v0.5.222: when state is Failed, attach the server-side
+            # error message as the State cell's tooltip so operators
+            # see the actual dnsmasq stderr / config error on hover
+            # instead of having to grep netgen-server logs.
+            _last_err = (entry.get("last_error") or "").strip()
+            if _last_err:
+                try:
+                    state_item = self.parent.dhcp_table.item(
+                        row, self.parent.DHCP_COL["State"])
+                    if state_item is not None:
+                        state_item.setToolTip(_last_err)
+                except Exception:
+                    pass
             self._set_item(row, "Lease IP", entry.get("lease_ip", ""))
             self._set_item(row, "Gateway", entry.get("lease_gateway", ""))
             self._set_item(row, "Last Check", str(entry.get("last_check") or ""))

@@ -765,6 +765,17 @@ class DeviceDatabase:
                 conn.execute("ALTER TABLE devices ADD COLUMN dhcp_manual_override_time TIMESTAMP")
                 conn.commit()
 
+            # v0.5.222: surface DHCP start-failure reason to the UI.
+            # Pre-fix, dnsmasq stderr / config-write errors / missing-
+            # interface errors landed only in netgen-server logs and
+            # the operator saw dhcp_state="Failed" with no hint why.
+            # Cleared on the next successful start.
+            columns_now = [c[1] for c in conn.execute("PRAGMA table_info(devices)").fetchall()]
+            if 'dhcp_last_error' not in columns_now:
+                logger.info("[DEVICE DB] Adding dhcp_last_error column to devices table")
+                conn.execute("ALTER TABLE devices ADD COLUMN dhcp_last_error TEXT")
+                conn.commit()
+
         except Exception as e:
             logger.error(f"[DEVICE DB] Migration failed: {e}")
             # Don't raise the exception to avoid breaking the database initialization
@@ -968,6 +979,8 @@ class DeviceDatabase:
                     # v0.5.217 (audit fix G): DHCP manual-override flag.
                     'dhcp_manual_override': 'dhcp_manual_override',
                     'dhcp_manual_override_time': 'dhcp_manual_override_time',
+                    # v0.5.222: last DHCP-start error (dnsmasq stderr etc.)
+                    'dhcp_last_error': 'dhcp_last_error',
                     'vxlan_config': 'vxlan_config',
                     'vxlan_state': 'vxlan_state',
                     'vxlan_interface': 'vxlan_interface',

@@ -2,6 +2,87 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.222] - 2026-08-24
+
+**DHCP server no longer stuck on "Failed" — assigns an IPv4
+to its interface before launching dnsmasq, and surfaces the
+actual dnsmasq error into the UI.**
+
+Operator report on JNPR-MAC-HWXVX1 2026-08-24 (after
+v0.5.221's interface-name fix moved state from "Server Down"
+to "Failed"): DHCP-server device on `vlan200` stayed at
+`dhcp_state="Failed"` after Apply. Root cause: pre-fix
+`start_dhcp_server` had `_ensure_ipv6_address` for the v6
+side but nothing analogous for v4. If the operator didn't
+set an `IPv4` on the device in the Add Device dialog (only
+the pool + gateway in the DHCP wizard), the VLAN sub-
+interface came up bare. dnsmasq's launch failed with "no
+interface with matching address …" because `bind-interfaces`
++ `dhcp-range` require a matching address on the interface.
+The stderr was captured only in netgen-server logs; the UI
+showed `Failed` with no hint why.
+
+Fixes:
+
+1. **New `_ensure_ipv4_address` helper** in `utils/dhcp.py`.
+   Called from `start_dhcp_server` before dnsmasq launches.
+   - Prefers the operator's gateway when it falls inside the
+     pool subnet (matches dnsmasq's default GW anyway).
+   - Otherwise assigns `.1` of the pool's supernet. Derives
+     the supernet by walking prefix lengths from /32 down to
+     /8 and taking the first one that contains both
+     `pool_start` and `pool_end` in one contiguous block —
+     handles typical /24 pools as well as /22, /28, etc.
+   - Idempotent: skips if the interface already has an IPv4
+     in the subnet (checked via new
+     `_iface_has_ipv4_in_subnet` helper).
+2. **New `dhcp_last_error` DB column** in `utils/
+   device_database.py`. Populated from the actual dnsmasq
+   stderr / config-write error / interface-missing error on
+   every `dhcp_state="Failed"` return in `start_dhcp_server`.
+   Cleared to empty string on `dhcp_state="Server Running"`.
+3. **`/api/device/dhcp/status`** endpoint returns
+   `last_error` per device (`run_tgen_server.py:6795`).
+4. **DHCP subtab widget** attaches `last_error` as the State
+   cell's tooltip when the state is Failed — operators hover
+   the "Failed" cell to see the actual dnsmasq stderr instead
+   of grepping `journalctl -u netgen-server`.
+
+Files touched:
+- `utils/dhcp.py` — new `_iface_has_ipv4_in_subnet` and
+  `_ensure_ipv4_address` helpers; `start_dhcp_server`
+  invokes the latter before dnsmasq launch; all 5 Failed
+  paths now populate `dhcp_last_error`; Server Running
+  clears it.
+- `utils/device_database.py` — `ADD COLUMN dhcp_last_error
+  TEXT` migration + field_mapping entry.
+- `run_tgen_server.py` — DHCP status endpoint returns
+  `last_error`.
+- `utils/devices_tab_dhcp.py` — State cell tooltip.
+
+Tests: `tests/test_v05222_dhcp_server_iface_ipv4.py` — 11
+tests (4 runtime helper: prefers-gateway-in-pool, derives-
+dot1, idempotent, gateway-outside-pool-fallback; 7 source-
+level: start-server calls ensure_ipv4, column migration,
+field_mapping, all Failed writes populate last_error, Server
+Running clears it, status endpoint returns it, widget
+attaches it as tooltip).
+
+93 DHCP-scoped tests pass, 0 regressions.
+
+**Server-side + client-side** — `netgen-server` restart on
+srv06 for the ensure-IPv4 helper + last_error column
+migration + status-endpoint payload; new wheel on macOS
+client for the tooltip surface. After upgrade:
+- Re-Apply the DHCP-server device. The interface gets `.1`
+  of the pool subnet (or your gateway) assigned, dnsmasq
+  binds, monitor flips to "Server Running" within one 60s
+  tick.
+- If it still shows Failed, hover the State cell — the
+  tooltip now shows the actual dnsmasq stderr / other
+  error, so you (and I) can see WHY without grepping
+  server logs.
+
 ## [0.5.221] - 2026-08-24
 
 **DHCP server never actually starts on VLAN devices — dnsmasq

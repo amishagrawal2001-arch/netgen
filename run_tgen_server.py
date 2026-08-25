@@ -6793,6 +6793,10 @@ def get_dhcp_status():
                 "lease_server": device.get("dhcp_lease_server"),
                 "lease_expires": device.get("dhcp_lease_expires"),
                 "last_check": device.get("last_dhcp_check"),
+                # v0.5.222: surface last DHCP start-failure reason
+                # so operators don't have to grep server logs to see
+                # WHY a device is in state=Failed.
+                "last_error": device.get("dhcp_last_error") or "",
                 "pool_names": pool_names,
                 "default_pool": default_pool,
             })
