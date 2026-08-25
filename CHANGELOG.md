@@ -2,6 +2,95 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.221] - 2026-08-24
+
+**DHCP server never actually starts on VLAN devices — dnsmasq
+exits on ENODEV because the interface name is passed in
+display form (`vlan200@ens2f0np0`) instead of kernel form
+(`vlan200`).**
+
+Operator report on JNPR-MAC-HWXVX1 2026-08-24: added a
+DHCP-server device (device2, interface `ens2f0np0`, VLAN 200,
+pool `192.168.30.10-192.168.30.200`). DHCP status table showed
+`dhcp_state="Server Down"` even though `docker ps` reported
+the DHCP container as `Up (healthy)`. The healthcheck (`exit
+0`) doesn't verify dnsmasq is running; the monitor's
+`_check_server_device` (v0.5.217 fix E) pgrep-ed for dnsmasq
+inside the container and found nothing → wrote "Server Down".
+Meanwhile the DHCP-client (device3, `ens2f1np1`, VLAN 200) got
+`192.168.30.2` — outside device2's pool, meaning the lease
+came from an upstream DHCP server on VLAN 200, not from
+device2.
+
+Root cause: `apply_device` in `run_tgen_server.py` (line
+~5537) and `start_device` (line ~2645) pass `iface_name` to
+`ensure_dhcp_services`. For VLAN devices `iface_name` is the
+DISPLAY form `vlan200@ens2f0np0` (see the pair with
+`iface_name_for_commands = "vlan200"` at
+run_tgen_server.py:4375-4379). The `@parent` suffix is what
+`ip link show` prints to indicate a VLAN sub-interface's
+parent NIC — it is NOT the kernel interface name. The display
+string exceeds `IFNAMSIZ` (16 bytes including NUL), so
+`if_nametoindex()` inside dnsmasq returns ENODEV, dnsmasq's
+`bind-interfaces` fails to attach the raw socket, and dnsmasq
+exits immediately after launch. The parent process already
+forked (returncode 0), so `_run_command`'s exit-code check at
+utils/dhcp.py:1249-1254 sees success and start_dhcp_server
+returns True — but no dnsmasq is left running. Same failure
+mode for `dhclient <iface>` on the client side.
+
+Fix: add `_normalize_iface_name(interface)` boundary helper
+in `utils/dhcp.py` that strips the `@parent` suffix. Call it
+at the top of every entry point: `start_dhcp_client`,
+`start_dhcp_server`, `stop_dhcp_client`, `stop_dhcp_server`.
+Fixes both directions (start + stop) so pidfile / conffile /
+leasefile paths all agree with what the actual dhclient /
+dnsmasq processes are bound to. No-op for correctly-formed
+inputs, so any caller that already passes the kernel form
+keeps working unchanged.
+
+Files touched:
+- `utils/dhcp.py` — new `_normalize_iface_name` helper + one
+  call at the top of each of the four entry points.
+
+Tests: `tests/test_v05221_dhcp_iface_normalize.py` — 9 tests
+(runtime: strip @parent, noop on kernel form, noop on empty,
+tolerant of multi-@; source-level: helper exists, each of the
+four entry points calls it).
+
+**Server-side fix** — netgen-server restart on srv06
+required. After restart:
+- Re-Apply the DHCP server device. dnsmasq should now launch
+  successfully; monitor should flip `dhcp_state="Server
+  Running"` on the next 60s tick (or immediately via the
+  monitor's force-check).
+- The DHCP-client's `192.168.30.2` lease is from the upstream
+  DHCP server (not device2) — that's a lab-topology reality
+  (device2 on `ens2f0np0` and device3 on `ens2f1np1` are two
+  different NICs; even with dnsmasq up on device2, no L2 path
+  reaches device3 without cross-cabling or a switch VLAN
+  bridging the two ports). If you want device3 to lease from
+  device2, either (a) recreate both devices on the SAME
+  interface, (b) cross-cable ens2f0np0 ↔ ens2f1np1, or (c)
+  use a local Linux bridge + veth pair (see below).
+
+**Local-loopback lab bridge** (run once on srv06 to enable
+same-host DHCP client/server testing):
+```bash
+sudo ip link add name dhcp-lab-br type bridge
+sudo ip link add dhcp-srv-veth type veth peer name dhcp-srv-br
+sudo ip link add dhcp-cli-veth type veth peer name dhcp-cli-br
+sudo ip link set dhcp-srv-br master dhcp-lab-br
+sudo ip link set dhcp-cli-br master dhcp-lab-br
+sudo ip link set dhcp-lab-br up
+sudo ip link set dhcp-srv-veth up ; sudo ip link set dhcp-srv-br up
+sudo ip link set dhcp-cli-veth up ; sudo ip link set dhcp-cli-br up
+```
+Then in netgen: recreate the DHCP-server device on interface
+`dhcp-srv-veth` and the DHCP-client on `dhcp-cli-veth`. Bridge
+forwards DHCPDISCOVER/OFFER between them without touching any
+physical NIC.
+
 ## [0.5.220] - 2026-08-24
 
 **Migration ordering regression — fresh netgen-server install could

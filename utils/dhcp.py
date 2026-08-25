@@ -52,6 +52,47 @@ def _resolve_dhcp_image():
 DHCP_DOCKER_IMAGE = _resolve_dhcp_image()
 
 
+def _normalize_iface_name(interface: str) -> str:
+    """Strip the ``@parent`` display suffix from an interface name.
+
+    v0.5.221: several callers in ``run_tgen_server.py`` (notably
+    ``apply_device`` at ~line 5537 and ``start_device`` at ~line
+    2645) pass the DISPLAY form ``vlan200@ens2f0np0`` — that's the
+    string ``ip link show`` prints for VLAN sub-interfaces, NOT the
+    kernel interface name. The kernel form is just ``vlan200``,
+    stored in ``iface_name_for_commands`` (see the pair at
+    run_tgen_server.py:4375-4379). The display form exceeds
+    ``IFNAMSIZ`` (16 bytes including NUL) and any
+    ``if_nametoindex()`` lookup returns ``ENODEV`` — so dnsmasq's
+    ``bind-interfaces`` fails to attach the raw socket and dnsmasq
+    exits immediately after launch (returncode still 0 because the
+    parent forked before the child died). Same failure mode for
+    ``dhclient <iface>``.
+
+    Fixing every call site would be 5+ edits scattered across
+    apply_device / start_device / two /api/dhcp endpoints and would
+    leave the entry points brittle to any future caller. Normalize
+    at the boundary (``start_dhcp_client`` / ``start_dhcp_server`` /
+    ``stop_dhcp_client`` / ``stop_dhcp_server``) so all callers are
+    safe regardless of which form they pass. No-op for correctly-
+    formed inputs.
+
+    Operator symptom on JNPR-MAC-HWXVX1 2026-08-24: DHCP-server
+    device on VLAN 200 showed ``dhcp_state="Server Down"`` in the
+    DHCP status table even though ``docker ps`` reported the
+    container as ``(healthy)``. The healthcheck (``exit 0``) doesn't
+    know whether dnsmasq is alive; the monitor's per-container
+    pgrep found no dnsmasq process because the launch had exited on
+    ENODEV.
+    """
+    if not interface:
+        return interface
+    at_idx = interface.find("@")
+    if at_idx > 0:
+        return interface[:at_idx]
+    return interface
+
+
 def _ensure_paths(container=None) -> None:
     """Ensure filesystem paths exist for PID/config/lease files."""
     paths = [
@@ -1155,6 +1196,22 @@ def start_dhcp_client(
 
     Returns a status dict with success flag and metadata.
     """
+    # v0.5.221: normalize the interface string BEFORE any OS call.
+    # Several callers in run_tgen_server.py (`apply_device`,
+    # `start_device`) pass the DISPLAY form ``vlan200@ens2f0np0``
+    # instead of the kernel form ``vlan200`` (see the pair
+    # ``iface_name`` / ``iface_name_for_commands`` at line ~4375-4379
+    # of run_tgen_server.py). The display form exceeds Linux
+    # IFNAMSIZ (16 bytes including NUL) and ``if_nametoindex()``
+    # returns ENODEV — so dhclient/dnsmasq silently fail to bind,
+    # exit, and the operator sees ``dhcp_state="Failed"`` (client)
+    # or the monitor writes ``dhcp_state="Server Down"`` (server)
+    # while ``docker ps`` still shows the DHCP container as
+    # ``(healthy)`` (the healthcheck is just ``exit 0``).
+    # Fixing every call site would be 5+ edits and would leave the
+    # entry-points brittle to new callers — normalise at the
+    # boundary instead.
+    interface = _normalize_iface_name(interface)
     # v0.5.219 (audit fix C3): explicitly clear dhcp_manual_override
     # here so an operator-initiated Stop->Start doesn't leave the DHCP
     # monitor blind for up to 120s. Pre-fix, ``stop_dhcp_services``
@@ -1386,6 +1443,8 @@ def stop_dhcp_client(device_db, device_id: str, interface: str, container=None) 
     ipv6_gateway) alongside the IPv4 ones so the row's IPv6
     columns don't retain the stale lease info.
     """
+    # v0.5.221: normalize display form vlan200@ens2f0np0 → vlan200.
+    interface = _normalize_iface_name(interface)
     # v4 release (unchanged, keeps the pre-fix pidfile shape).
     pidfile = os.path.join(DHCLIENT_PID_DIR, f"dhclient-{interface}.pid")
     try:
@@ -1457,6 +1516,11 @@ def start_dhcp_server(
     container=None,
 ) -> Dict:
     """Start a dnsmasq DHCP server bound to interface."""
+    # v0.5.221: normalize interface — see start_dhcp_client's
+    # equivalent block for the full rationale (display form
+    # vlan200@ens2f0np0 exceeds IFNAMSIZ, if_nametoindex fails,
+    # dnsmasq silently exits, monitor writes Server Down).
+    interface = _normalize_iface_name(interface)
     # v0.5.219 (audit fix C3): mirror the client-path clear — see
     # start_dhcp_client's block for the full rationale. Any explicit
     # server Start supersedes the manual_override guard that
@@ -1901,6 +1965,8 @@ def stop_dhcp_server(device_db, device_id: str, interface: str, container=None) 
     # config file. Track everything that failed and return it.
     failures: List[str] = []
 
+    # v0.5.221: normalize display form vlan200@ens2f0np0 → vlan200.
+    interface = _normalize_iface_name(interface)
     pidfile = os.path.join(DNSMASQ_PID_DIR, f"dnsmasq-{interface}.pid")
     conffile = os.path.join(DNSMASQ_CONF_DIR, f"ostg-{interface}.conf")
     gateway = ""
