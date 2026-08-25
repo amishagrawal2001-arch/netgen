@@ -265,12 +265,22 @@ def test_F_start_dhcp_server_marks_failed_on_every_error_return():
     ]
     assert fail_returns, "start_dhcp_server has no failure returns to check"
     for pos in fail_returns:
-        # Look back up to 500 chars for a "Failed" state marker.
+        # Look back up to 500 chars for a state marker. v0.5.223
+        # refined the "no pool" branch to write dhcp_state="No Pool"
+        # instead of "Failed" so operators can distinguish
+        # config-incomplete from real dnsmasq crashes. Either
+        # state satisfies bug F's original invariant (some state
+        # gets written before the failure return; DB doesn't
+        # linger on a stale prior reading).
         window = body[max(0, pos - 500):pos]
-        assert '"dhcp_state": "Failed"' in window, (
+        assert (
+            '"dhcp_state": "Failed"' in window
+            or '"dhcp_state": "No Pool"' in window
+        ), (
             "start_dhcp_server has a `return {\"success\": False}` "
-            "without a preceding `dhcp_state=\"Failed\"` DB write — "
-            "Bug F is back (window near offset %d)" % pos
+            "without a preceding `dhcp_state=\"Failed\"` or "
+            "\"No Pool\" DB write — Bug F is back "
+            "(window near offset %d)" % pos
         )
 
 

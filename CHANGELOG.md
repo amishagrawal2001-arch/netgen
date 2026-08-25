@@ -2,6 +2,51 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.223] - 2026-08-25
+
+**DHCP server state "No Pool" replaces "Failed" when no pool
+is attached — operators can now tell config-incomplete apart
+from actual dnsmasq crashes.**
+
+Operator report on JNPR-MAC-HWXVX1 2026-08-25: DHCP server
+device showed `dhcp_state="Failed"` with an empty Pools
+column. Root cause was that the Delete-key shortcut on the
+DHCP subtab (v0.5.218 fix I) had at some point detached all
+pools from the device while leaving `dhcp_mode="server"`
+intact. Next Apply hit `start_dhcp_server`'s "no ipv4/ipv6
+pool" branch which wrote `dhcp_state="Failed"` — the same
+state as an actual dnsmasq launch failure (interface missing,
+config error, bind conflict, etc.). Operators couldn't tell
+"just needs a pool attached" apart from "something's actually
+broken".
+
+Fix: rename that specific branch's state write from `"Failed"`
+to `"No Pool"`. The `dhcp_last_error` message becomes
+actionable — "No DHCP pool attached — attach a pool via the
+Attach Route Pools button, or Edit the device to set a
+pool_start/pool_end range." Real dnsmasq crashes still write
+`"Failed"`.
+
+Files touched:
+- `utils/dhcp.py` — one branch: the `if not ipv4_enabled and
+  not ipv6_enabled` guard in `start_dhcp_server`.
+- `tests/test_v05217_dhcp_bundle.py` — bug F's "every failure
+  return writes Failed" invariant loosened to accept either
+  "Failed" or "No Pool" (the underlying property — some state
+  gets written before the failure return — still holds).
+
+Tests: `tests/test_v05223_dhcp_no_pool_state.py` — 5 tests
+(no-pool branch writes "No Pool", last_error message
+actionable, real dnsmasq launch failure still writes "Failed",
+config write failure still writes "Failed", interface missing
+still writes "Failed").
+
+**Server-side + client-side** — `netgen-server` restart on
+srv06 for the state string change; also the new wheel on
+macOS client is nice-to-have (the State cell already displays
+whatever string the server writes, so the client works
+unchanged, but the tooltip text is updated).
+
 ## [0.5.222] - 2026-08-24
 
 **DHCP server no longer stuck on "Failed" — assigns an IPv4

@@ -1768,14 +1768,25 @@ def start_dhcp_server(
         ipv6_enabled = False
 
     if not ipv4_enabled and not ipv6_enabled:
-        # v0.5.217 (audit fix F): mark as Failed before returning.
-        err = "DHCP server requires at least one of IPv4 or IPv6 pool to be configured"
+        # v0.5.223: distinguish "no pool attached" from actual
+        # dnsmasq crashes. Pre-fix this branch wrote
+        # dhcp_state="Failed" — indistinguishable from a real
+        # launch failure (dnsmasq crashed, interface missing,
+        # etc.), so operators couldn't tell config-incomplete
+        # apart from a real bug. "No Pool" reads correctly:
+        # nothing failed, the device just has no pool attached
+        # (common after the v0.5.218 Delete-key detach action).
+        err = (
+            "No DHCP pool attached — attach a pool via the "
+            "Attach Route Pools button, or Edit the device to "
+            "set a pool_start/pool_end range."
+        )
         _update_device_db(
             device_db,
             device_id,
             {
                 "dhcp_mode": "server",
-                "dhcp_state": "Failed",
+                "dhcp_state": "No Pool",
                 "dhcp_running": False,
                 "dhcp_last_error": err,  # v0.5.222: surface to UI
                 "last_dhcp_check": datetime.now(timezone.utc).isoformat(),
