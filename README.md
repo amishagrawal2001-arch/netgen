@@ -52,6 +52,10 @@ See [CHANGELOG.md](CHANGELOG.md) for the full diff. Highlights:
 A quick tour of what the client looks like. Full-size images live in
 [`docs/images/`](docs/images/).
 
+### Streams subtab — per-interface stream definitions, live send/receive rate, Start / Stop / Pause
+
+![Streams subtab](docs/images/streams-tab.png)
+
 ### Devices tab — device inventory, ARP status, per-row Apply / Start / Stop / Ping
 
 ![Devices tab](docs/images/devices-tab.png)
