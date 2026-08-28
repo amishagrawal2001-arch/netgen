@@ -54,6 +54,18 @@ A quick tour of what the client looks like. Full-size images live in
 
 ![Streams subtab](docs/images/streams-tab.png)
 
+### Add / Edit Stream dialog — protocol stack builder (VLAN / L2 / L3 / L4 / Payload / Encap), Variable Fields, Stream Control, Packet View, PCAP Replay
+
+![Add Stream dialog](docs/images/add-stream.png)
+
+### Stream Statistics — per-stream TX / RX pps + bit rate, DPDK vs Scapy engine, latency and loss columns
+
+![Stream Statistics](docs/images/stream-statistics.png)
+
+### Live Chart — aggregate TX bit rate over the last 60s, one line per active interface
+
+![Live Chart](docs/images/live-chart.png)
+
 ### Devices tab — device inventory, ARP status, per-row Apply / Start / Stop / Ping
 
 ![Devices tab](docs/images/devices-tab.png)
@@ -77,6 +89,18 @@ A quick tour of what the client looks like. Full-size images live in
 ### DHCP subtab — client + server rows side by side, State cell tooltip surfacing dnsmasq errors
 
 ![DHCP subtab](docs/images/dhcp-tab.png)
+
+### Topology tab — auto-laid-out device cards, per-protocol status pills, click-to-inspect side panel
+
+![Topology tab](docs/images/topology-tab.png)
+
+### L2 Emulation tab — per-interface protocol runner (LACP / BFD / LLDP / etc.), session ID + uptime
+
+![L2 Emulation tab](docs/images/l2emulation-tab.png)
+
+### Stateful TCP tab — client + server session runner, per-session conns / bytes / avg-RTT columns
+
+![Stateful TCP tab](docs/images/stateful-tcp-tab.png)
 
 ## Table of Contents
 
