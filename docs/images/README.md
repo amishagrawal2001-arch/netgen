@@ -7,6 +7,7 @@ GitHub Pages site.
 
 | Filename | Suggested content |
 |---|---|
+| `streams-tab.png` | Streams subtab with a few running streams — Interface / Frame Type / Fixed size / VLAN / L2 / L3 columns populated and the running-count pill (`N running · N total`) visible. |
 | `devices-tab.png` | Devices tab with a few rows, one Running (green), one Starting (yellow), one Stopped (red). Shows the toolbar (Add / Edit / Delete / Apply / Start / Stop / Ping / ARP / Refresh). |
 | `add-device.png` | Add Device wizard mid-way — MAC + IPv4/IPv6 + VLAN fields visible, with the DHCP or BGP checkbox ticked to show a protocol path. |
 | `ospf-tab.png` | OSPF subtab with a real Full/Backup neighbor row, both IPv4 + IPv6, showing the Route Pools column and Attach/Detach buttons. |
