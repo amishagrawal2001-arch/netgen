@@ -8,12 +8,18 @@ GitHub Pages site.
 | Filename | Suggested content |
 |---|---|
 | `streams-tab.png` | Streams subtab with a few running streams — Interface / Frame Type / Fixed size / VLAN / L2 / L3 columns populated and the running-count pill (`N running · N total`) visible. |
+| `add-stream.png` | Add/Edit Traffic Stream dialog with the six-tab bar visible (Protocol Selection / Protocol Data / Variable Fields / Stream Control / Packet View / PCAP Replay) and the Protocol Stack section (VLAN / L2 / L3 / L4 / Payload / Encap) populated. |
+| `stream-statistics.png` | Bottom-panel Stream Statistics tab with a few running streams — Engine (Scapy vs DPDK ×N), TX/RX pps, TX/RX bit rate, latency, loss, Status columns. |
+| `live-chart.png` | Bottom-panel Live Chart tab, Aggregate TX Bit Rate over the last 60s, one series per active interface. |
 | `devices-tab.png` | Devices tab with a few rows, one Running (green), one Starting (yellow), one Stopped (red). Shows the toolbar (Add / Edit / Delete / Apply / Start / Stop / Ping / ARP / Refresh). |
 | `add-device.png` | Add Device wizard mid-way — MAC + IPv4/IPv6 + VLAN fields visible, with the DHCP or BGP checkbox ticked to show a protocol path. |
 | `ospf-tab.png` | OSPF subtab with a real Full/Backup neighbor row, both IPv4 + IPv6, showing the Route Pools column and Attach/Detach buttons. |
 | `bgp-tab.png` | BGP subtab with one Established neighbor, per-AF row split, and the Neighbor IP / Source IP / Local AS columns populated. |
 | `isis-tab.png` | IS-IS subtab with a Level-2 adjacency, Route Pools column populated, Apply progress dialog optional (screenshot mid-apply is nice). |
 | `dhcp-tab.png` | DHCP subtab with a Client row (Leased state, lease IP populated) and a Server row (Server Running or Failed with the tooltip visible). |
+| `topology-tab.png` | Topology tab with a couple of device cards laid out on the canvas, per-protocol status pills visible on each card, and the legend + Properties panel on the right. |
+| `l2emulation-tab.png` | L2 Emulation tab showing the Start / Stop / Refresh toolbar and the empty session table with column headers (Protocol / Interface / VLAN / Frames TX / Uptime / Session ID / Last Error). |
+| `stateful-tcp-tab.png` | Stateful TCP tab showing the Start session / Stop / Refresh toolbar and the empty session table with column headers (Role / Protocol / Target / Conns / Bytes TX / RX / Avg RTT / Uptime). |
 
 ## How to capture on macOS
 
