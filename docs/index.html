@@ -406,6 +406,41 @@
   @media (max-width: 760px) {
     .usecases { grid-template-columns: 1fr; }
   }
+
+  /* Gallery */
+  .gallery {
+    display: grid; gap: 18px;
+    grid-template-columns: repeat(3, 1fr);
+  }
+  .gallery figure {
+    margin: 0;
+    border: 1px solid var(--line); border-radius: 10px;
+    overflow: hidden; background: white;
+    transition: box-shadow 0.15s ease, transform 0.15s ease,
+                border-color 0.15s ease;
+  }
+  .gallery figure:hover {
+    box-shadow: 0 8px 24px rgba(15,23,42,0.10);
+    border-color: var(--line-strong);
+    transform: translateY(-2px);
+  }
+  .gallery figure a { display: block; line-height: 0; }
+  .gallery figure img {
+    width: 100%; height: auto; display: block;
+    background: var(--bg-soft);
+  }
+  .gallery figure figcaption {
+    padding: 12px 14px;
+    font-size: 13px; color: var(--gray);
+    border-top: 1px solid var(--line);
+  }
+  .gallery figure figcaption strong {
+    display: block;
+    color: var(--ink); font-size: 14px;
+    margin-bottom: 3px; font-weight: 600;
+  }
+  @media (max-width: 900px) { .gallery { grid-template-columns: repeat(2, 1fr); } }
+  @media (max-width: 600px) { .gallery { grid-template-columns: 1fr; } }
 </style>
 </head>
 <body>
@@ -415,6 +450,7 @@
     <div class="brand">Net<span class="dot">·</span>gen</div>
     <nav>
       <a href="#features">Features</a>
+      <a href="#gallery">Gallery</a>
       <a href="#usecases">Use cases</a>
       <a href="#protocols">Protocols</a>
       <a href="#whats-new">What's new</a>
@@ -619,6 +655,149 @@
          <code>/api/health</code> stays exempt so k8s / HAProxy
          probes don't need credentials.</p>
     </div>
+  </div>
+</section>
+
+<!-- Gallery -->
+<section class="block quickstart" id="gallery">
+  <h2>See it in action.</h2>
+  <p>Captured from the running client against a live lab — real BGP
+     peerings, real IS-IS Level-2 areas, real dnsmasq lease state,
+     DPDK workers pushing ~100 Gbps a piece. Click any tile for the
+     full-resolution image.</p>
+
+  <div class="gallery">
+
+    <figure>
+      <a href="images/streams-tab.png" target="_blank" rel="noopener">
+        <img src="images/streams-tab.png" alt="Streams subtab — per-interface stream definitions with live send/receive rate" loading="lazy" />
+      </a>
+      <figcaption>
+        <strong>Streams subtab</strong>
+        Per-interface stream table with live send-rate, Start / Stop / Pause controls.
+      </figcaption>
+    </figure>
+
+    <figure>
+      <a href="images/live-chart.png" target="_blank" rel="noopener">
+        <img src="images/live-chart.png" alt="Live Chart — aggregate TX bit rate over the last 60s" loading="lazy" />
+      </a>
+      <figcaption>
+        <strong>Live Chart</strong>
+        Rolling 60-second aggregate TX bit-rate plot, one line per active interface.
+      </figcaption>
+    </figure>
+
+    <figure>
+      <a href="images/stream-statistics.png" target="_blank" rel="noopener">
+        <img src="images/stream-statistics.png" alt="Stream Statistics — per-stream TX/RX pps, bit rate, latency, loss" loading="lazy" />
+      </a>
+      <figcaption>
+        <strong>Stream Statistics</strong>
+        Per-stream Scapy vs DPDK ×N engine, TX/RX pps, bit rate, latency, loss.
+      </figcaption>
+    </figure>
+
+    <figure>
+      <a href="images/add-stream.png" target="_blank" rel="noopener">
+        <img src="images/add-stream.png" alt="Add/Edit Traffic Stream dialog with the full protocol-stack builder" loading="lazy" />
+      </a>
+      <figcaption>
+        <strong>Add / Edit Stream</strong>
+        Six-tab builder: Protocol Selection, Protocol Data, Variable Fields, Stream Control, Packet View, PCAP Replay.
+      </figcaption>
+    </figure>
+
+    <figure>
+      <a href="images/devices-tab.png" target="_blank" rel="noopener">
+        <img src="images/devices-tab.png" alt="Devices tab — device inventory, ARP status, per-row Apply/Start/Stop/Ping" loading="lazy" />
+      </a>
+      <figcaption>
+        <strong>Devices tab</strong>
+        Emulated-device inventory with ARP status and per-row Apply / Start / Stop / Ping.
+      </figcaption>
+    </figure>
+
+    <figure>
+      <a href="images/add-device.png" target="_blank" rel="noopener">
+        <img src="images/add-device.png" alt="Add/Edit Device dialog with MAC, IPv4/IPv6, VLAN, protocol picker" loading="lazy" />
+      </a>
+      <figcaption>
+        <strong>Add / Edit Device</strong>
+        MAC, IPv4/IPv6, VLAN, loopback, protocol picker (BGP / OSPF / IS-IS / DHCP) and batch-increment options.
+      </figcaption>
+    </figure>
+
+    <figure>
+      <a href="images/topology-tab.png" target="_blank" rel="noopener">
+        <img src="images/topology-tab.png" alt="Topology tab — auto-laid-out device cards with per-protocol status pills" loading="lazy" />
+      </a>
+      <figcaption>
+        <strong>Topology</strong>
+        Auto-laid-out device cards, per-protocol status pills, right-side Properties panel.
+      </figcaption>
+    </figure>
+
+    <figure>
+      <a href="images/ospf-tab.png" target="_blank" rel="noopener">
+        <img src="images/ospf-tab.png" alt="OSPF subtab — per-AF neighbor rows, Attach Route Pools" loading="lazy" />
+      </a>
+      <figcaption>
+        <strong>OSPF subtab</strong>
+        Per-AF neighbor rows, inline edit of hello / dead / area, Attach Route Pools button.
+      </figcaption>
+    </figure>
+
+    <figure>
+      <a href="images/bgp-tab.png" target="_blank" rel="noopener">
+        <img src="images/bgp-tab.png" alt="BGP subtab — per-neighbor rows, per-AF partial-apply" loading="lazy" />
+      </a>
+      <figcaption>
+        <strong>BGP subtab</strong>
+        Per-neighbor rows, per-AF partial-apply, route-pool attachment, hold/keepalive editors.
+      </figcaption>
+    </figure>
+
+    <figure>
+      <a href="images/isis-tab.png" target="_blank" rel="noopener">
+        <img src="images/isis-tab.png" alt="IS-IS subtab — Level-1/2 adjacency, per-AF pool attachment" loading="lazy" />
+      </a>
+      <figcaption>
+        <strong>IS-IS subtab</strong>
+        Level-1 / Level-2 adjacency, per-AF pool attachment, System ID + Area editors.
+      </figcaption>
+    </figure>
+
+    <figure>
+      <a href="images/dhcp-tab.png" target="_blank" rel="noopener">
+        <img src="images/dhcp-tab.png" alt="DHCP subtab — client and server rows, State tooltip surfaces dnsmasq errors" loading="lazy" />
+      </a>
+      <figcaption>
+        <strong>DHCP subtab</strong>
+        Client + server rows side by side, State cell tooltip surfaces dnsmasq errors.
+      </figcaption>
+    </figure>
+
+    <figure>
+      <a href="images/l2emulation-tab.png" target="_blank" rel="noopener">
+        <img src="images/l2emulation-tab.png" alt="L2 Emulation tab — per-interface protocol runner" loading="lazy" />
+      </a>
+      <figcaption>
+        <strong>L2 Emulation</strong>
+        Per-interface L2 protocol runner (LACP / BFD / LLDP), session ID + uptime columns.
+      </figcaption>
+    </figure>
+
+    <figure>
+      <a href="images/stateful-tcp-tab.png" target="_blank" rel="noopener">
+        <img src="images/stateful-tcp-tab.png" alt="Stateful TCP tab — client and server session runner" loading="lazy" />
+      </a>
+      <figcaption>
+        <strong>Stateful TCP</strong>
+        Client + server session runner, per-session conns / bytes / Avg RTT / uptime.
+      </figcaption>
+    </figure>
+
   </div>
 </section>
 
