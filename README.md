@@ -45,8 +45,38 @@ See [CHANGELOG.md](CHANGELOG.md) for the full diff. Highlights:
   echo / TLS / HTTP framing / VRF degrade / TCP_INFO degrade /
   dead-target, plus all legacy helpers.
 
+## Screenshots
+
+A quick tour of what the client looks like. Full-size images live in
+[`docs/images/`](docs/images/).
+
+### Devices tab — device inventory, ARP status, per-row Apply / Start / Stop / Ping
+
+![Devices tab](docs/images/devices-tab.png)
+
+### Add / Edit Device dialog — MAC, IPv4/IPv6, VLAN, protocol picker (BGP / OSPF / IS-IS / DHCP)
+
+![Add Device dialog](docs/images/add-device.png)
+
+### OSPF subtab — per-AF neighbor rows, Attach Route Pools, inline edit of hello / dead / area
+
+![OSPF subtab](docs/images/ospf-tab.png)
+
+### BGP subtab — per-neighbor rows, per-AF partial-apply, route-pool attachment
+
+![BGP subtab](docs/images/bgp-tab.png)
+
+### IS-IS subtab — Level-1/Level-2 adjacency, per-AF pool attachment, Apply progress dialog
+
+![IS-IS subtab](docs/images/isis-tab.png)
+
+### DHCP subtab — client + server rows side by side, State cell tooltip surfacing dnsmasq errors
+
+![DHCP subtab](docs/images/dhcp-tab.png)
+
 ## Table of Contents
 
+- [Screenshots](#screenshots)
 - [Installation](#installation)
 - [Build Scripts](#build-scripts)
 - [Deployment Scripts](#deployment-scripts)
