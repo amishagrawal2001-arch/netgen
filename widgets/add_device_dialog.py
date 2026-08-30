@@ -2362,7 +2362,10 @@ class AddDeviceDialog(QDialog):
         # supplied a peer list — otherwise we can't compare.
         if self._existing_devices:
             try:
-                from utils.address_collision import find_conflict
+                from utils.address_collision import (
+                    find_conflict,
+                    find_iface_vlan_conflict,
+                )
                 loopback_ipv4_val = self.loopback_ipv4_input.text().strip()
                 loopback_ipv6_val = (
                     self.loopback_ipv6_input.text().strip()
@@ -2377,6 +2380,30 @@ class AddDeviceDialog(QDialog):
                 if ":" in _iface_val:
                     _iface_val = _iface_val.rsplit(":", 1)[-1].strip()
                 _iface_val = _iface_val.split()[-1] if _iface_val.split() else _iface_val
+                # (interface, vlan) collision check — mirrors the server
+                # gate at run_tgen_server.py:4265-4301. Two devices on
+                # the same NIC + same VLAN would share the same L2/L3
+                # segment and collide on BGP TCP/179, OSPF raw sockets,
+                # and ISIS PF_PACKET binds.
+                _iface_vlan_hit = find_iface_vlan_conflict(
+                    _iface_val, _vlan_val, self._existing_devices,
+                    exclude_id=self._exclude_device_id,
+                )
+                if _iface_vlan_hit:
+                    _peer_id, _peer_name = _iface_vlan_hit
+                    QMessageBox.warning(
+                        self,
+                        "Duplicate Interface + VLAN",
+                        f"Interface '{_iface_val}' with VLAN "
+                        f"'{_vlan_val or '0'}' is already in use by "
+                        f"device '{_peer_name or _peer_id}'.\n\n"
+                        f"Two devices can share a physical NIC only via "
+                        f"different VLAN tags — same (interface, VLAN) "
+                        f"would collide on BGP TCP/179, OSPF raw sockets, "
+                        f"and ISIS PF_PACKET binds. Change the VLAN tag "
+                        f"or pick a different interface.",
+                    )
+                    return
                 _dup_checks = [
                     ("loopback_ipv4", loopback_ipv4_val, None, None),
                     ("loopback_ipv6", loopback_ipv6_val, None, None),

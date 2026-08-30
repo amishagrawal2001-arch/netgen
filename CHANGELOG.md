@@ -81,6 +81,29 @@ no client-side collision warning). Server 409 gate applies
 regardless of client version — old clients still get the
 protection.
 
+**Also: client-side `(interface, vlan)` collision check —
+mirrors the existing server gate.** Operator note
+2026-08-30: two devices on `eth0 vlan100` weren't caught
+until the server 409 came back. The server has had the
+tuple-collision gate since forever
+(`run_tgen_server.py:4265-4301`), but the client accepted
+the Save and only surfaced the error after the round-trip.
+Added `utils/address_collision.find_iface_vlan_conflict()`
+(shared shape with the server) and wired it into
+`AddDeviceDialog.validate_and_accept` so the operator sees
+a "Duplicate Interface + VLAN" MessageBox before the API
+call. Server gate unchanged — still the backstop for old
+clients.
+
+Tests: 9 additional tests in
+`tests/test_v05224_address_collision.py` — exact match,
+different-vlan miss, different-iface miss, exclude-self,
+display-form (`vlan100@ens2f0np0`) normalization, UI-label
+(`TG 0 - Port: ens2f0np0`) normalization, untagged-vs-'0'
+equivalence, empty peer list, and the operator's exact
+sample (device1 eth0 vlan100 + device2 eth0 vlan100).
+31/31 collision tests pass.
+
 ## [0.5.223] - 2026-08-25
 
 **DHCP server state "No Pool" replaces "Failed" when no pool

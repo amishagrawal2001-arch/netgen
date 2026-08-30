@@ -19,6 +19,7 @@ helper, so a green (1) means the same decisions land in both places.
 
 from utils.address_collision import (
     find_conflict,
+    find_iface_vlan_conflict,
     next_available_loopback_ipv4,
     next_available_loopback_ipv6,
 )
@@ -250,3 +251,107 @@ def test_srv06_two_device_ospf_router_id_collision():
         interface="ens2f0np0", vlan_id="200",
     )
     assert other_ip_hit is None
+
+
+# --- find_iface_vlan_conflict: (interface, vlan) tuple uniqueness ----------
+
+def test_iface_vlan_conflict_exact_match_hits():
+    """device2 tries to grab ens2f0np0 + vlan100 while device1 is
+    already there. Same L2 segment — must be rejected."""
+    devs = [{
+        "device_id": "d1", "device_name": "device1",
+        "interface": "ens2f0np0", "vlan": "100",
+    }]
+    hit = find_iface_vlan_conflict("ens2f0np0", "100", devs)
+    assert hit == ("d1", "device1")
+
+
+def test_iface_vlan_different_vlan_no_hit():
+    """Same interface, different VLAN — that's the whole point of VLANs
+    (each device gets its own vlan<N> subinterface)."""
+    devs = [{
+        "device_id": "d1", "device_name": "device1",
+        "interface": "ens2f0np0", "vlan": "100",
+    }]
+    hit = find_iface_vlan_conflict("ens2f0np0", "200", devs)
+    assert hit is None
+
+
+def test_iface_vlan_different_iface_no_hit():
+    """Different NIC — separate broadcast domain — no collision."""
+    devs = [{
+        "device_id": "d1", "device_name": "device1",
+        "interface": "ens2f0np0", "vlan": "100",
+    }]
+    hit = find_iface_vlan_conflict("ens2f1np1", "100", devs)
+    assert hit is None
+
+
+def test_iface_vlan_exclude_self():
+    """Edit path: re-submitting the same device with the same iface+vlan
+    must not self-collide."""
+    devs = [{
+        "device_id": "d1", "device_name": "device1",
+        "interface": "ens2f0np0", "vlan": "100",
+    }]
+    hit = find_iface_vlan_conflict(
+        "ens2f0np0", "100", devs, exclude_id="d1",
+    )
+    assert hit is None
+
+
+def test_iface_vlan_display_form_normalized():
+    """Peer stored as `vlan100@ens2f0np0` (display form after apply)
+    must still match a bare `ens2f0np0` incoming request."""
+    devs = [{
+        "device_id": "d1", "device_name": "device1",
+        "interface": "vlan100@ens2f0np0", "vlan": "100",
+    }]
+    hit = find_iface_vlan_conflict("ens2f0np0", "100", devs)
+    assert hit == ("d1", "device1")
+
+
+def test_iface_vlan_ui_label_normalized():
+    """Incoming interface may come from the dialog as
+    `TG 0 - Port: ens2f0np0`; peer is stored as bare `ens2f0np0`.
+    Both should normalize to the same base and collide."""
+    devs = [{
+        "device_id": "d1", "device_name": "device1",
+        "interface": "ens2f0np0", "vlan": "100",
+    }]
+    hit = find_iface_vlan_conflict(
+        "TG 0 - Port: ens2f0np0", "100", devs,
+    )
+    assert hit == ("d1", "device1")
+
+
+def test_iface_vlan_untagged_vs_zero():
+    """Empty VLAN and '0' are the same untagged L2 segment. Collision."""
+    devs = [{
+        "device_id": "d1", "device_name": "device1",
+        "interface": "ens2f0np0", "vlan": "0",
+    }]
+    hit = find_iface_vlan_conflict("ens2f0np0", "", devs)
+    assert hit == ("d1", "device1")
+
+
+def test_iface_vlan_no_devices_no_hit():
+    assert find_iface_vlan_conflict("ens2f0np0", "100", []) is None
+    assert find_iface_vlan_conflict("ens2f0np0", "100", None) is None
+
+
+def test_iface_vlan_matches_server_gate_shape():
+    """The server gate at run_tgen_server.py:4265-4301 uses the
+    same normalization (strip `vlanNN@` prefix; treat empty vlan
+    as '0'). This test is the tuple sample the operator described:
+    device1 eth0 vlan100, device2 eth0 vlan100 → not allowed."""
+    devs = [{
+        "device_id": "d1", "device_name": "device1",
+        "interface": "eth0", "vlan": "100",
+    }]
+    # device2 attempt: same eth0, same vlan100 → collision
+    hit = find_iface_vlan_conflict("eth0", "100", devs)
+    assert hit == ("d1", "device1")
+    # device2 attempt: eth0, vlan200 → allowed
+    hit2 = find_iface_vlan_conflict("eth0", "200", devs)
+    assert hit2 is None

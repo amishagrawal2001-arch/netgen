@@ -104,6 +104,62 @@ def find_conflict(
     return None
 
 
+def find_iface_vlan_conflict(
+    interface: str,
+    vlan_id,
+    devices: Iterable[dict],
+    exclude_id: Optional[str] = None,
+) -> Optional[Tuple[str, str]]:
+    """Return (device_id, device_name) of an existing device already
+    bound to the same (interface, vlan_id) tuple, or None.
+
+    Two devices sharing the same physical NIC MUST use different
+    VLAN tags — each ends up on its own vlan<N> subinterface which
+    can then be moved into its own Linux VRF for protocol isolation.
+    Two devices on the exact same (interface, vlan) would share the
+    same L2/L3 segment and collide on TCP/179 (BGP), OSPF raw
+    sockets, and ISIS PF_PACKET binds. The server already gates on
+    this at run_tgen_server.py:4265-4301 (HTTP 409); this helper is
+    the client-side companion so the operator sees the error before
+    the round-trip. Both sides normalize the `vlanNN@base` display
+    form to bare `base` before comparing, so cached devices with
+    the display-form interface don't mask a real collision.
+    """
+    iface_norm = _normalize_base_iface(interface)
+    if not iface_norm:
+        return None
+    vlan_norm = str(vlan_id or "0").strip() or "0"
+    for dev in devices or ():
+        if exclude_id and dev.get("device_id") == exclude_id:
+            continue
+        peer_iface = _normalize_base_iface(dev.get("interface") or "")
+        if peer_iface != iface_norm:
+            continue
+        peer_vlan = str(
+            dev.get("vlan") or dev.get("vlan_id") or "0"
+        ).strip() or "0"
+        if peer_vlan != vlan_norm:
+            continue
+        return (dev.get("device_id") or "", dev.get("device_name") or "")
+    return None
+
+
+def _normalize_base_iface(iface: str) -> str:
+    """Strip UI display prefixes ("TG 0 - Port: X") and vlan-alias
+    prefixes ("vlanNN@X") down to the bare kernel interface name."""
+    if not iface:
+        return ""
+    s = str(iface).strip().strip('"').rstrip(",")
+    if " - " in s:
+        s = s.split(" - ", 1)[-1].strip()
+    if ":" in s:
+        s = s.rsplit(":", 1)[-1].strip()
+    if "@" in s:
+        s = s.split("@", 1)[-1].strip()
+    parts = s.split()
+    return parts[-1] if parts else ""
+
+
 def _used_ipv4(devices: Iterable[dict], field: str) -> set:
     used = set()
     for dev in devices or ():
