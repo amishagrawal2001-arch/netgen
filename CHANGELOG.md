@@ -81,57 +81,6 @@ no client-side collision warning). Server 409 gate applies
 regardless of client version — old clients still get the
 protection.
 
----
-
-**Also: OSPF network-type defaults to point-to-point — the
-srv06 "OSPF stuck in Init/DROther even with a single device"
-trap is closed.**
-
-Continuation of the same srv06 debug session. After the
-loopback-collision fix landed and the operator removed both
-devices to test with a fresh single device, OSPF stayed
-down — this time not because of router-id collision (only
-one device now), but because peer's Hello neighbor list was
-empty while ours listed peer. tcpdump `-vv` showed peer's
-OSPFv2 Hello carried `[External, LLS]` options; ours carried
-`[External]`. The mismatch that mattered wasn't LLS — it was
-**network type**. QFX5130 uplink configures its subif as
-OSPF point-to-point; our netgen default was broadcast. Peer
-discards our broadcast-format Hellos before ever putting us
-in its neighbor list. Verified live: adding `ip ospf network
-point-to-point` + `ipv6 ospf6 network point-to-point` in the
-container flipped both v4 and v6 to Full inside 60 seconds.
-
-Fix: flip the server default in `utils/ospf.py:273/279/281`
-so `p2p_ipv4` / `p2p_ipv6` / generic `p2p` all default True
-instead of False. Matches the ISIS precedent already in this
-codebase (`utils/isis.py:413` unconditionally emits `isis
-network point-to-point` on every interface). Broadcast is
-still available: any config explicitly setting `p2p_ipv4=False`
-or `p2p_ipv6=False` still deploys broadcast — the guard
-`if "p2p_ipv4" in ospf_config:` is unchanged so the .get()'s
-default only fires when the key is absent.
-
-UI parity: the P2P checkbox column in the OSPF subtab
-(`utils/devices_tab_ospf.py:667/669`) previously defaulted
-to unchecked when the DB didn't have an explicit value.
-Now defaults to ticked so the operator sees the box match
-what the server actually deploys. Toggling to unchecked and
-Apply-OSPF still deploys broadcast for that device — no
-change in override semantics.
-
-Tests: `tests/test_v05224_ospf_p2p_default.py` — 5 tests.
-Verify `.get("p2p_ipv4", True)`, `.get("p2p_ipv6", True)`,
-and both `.get("p2p", True)` fallbacks resolve to True; UI
-checkbox default matches; the guard structure that honors
-explicit `p2p_ipv4=False` is unchanged.
-
-Verified on srv06 2026-08-30: live hot-patch of
-`ip ospf network point-to-point` inside the FRR container
-flipped OSPFv4 (Init/DROther → Full) and OSPFv6 (Init/DROther
-→ Full/PointToPoint) inside 60 seconds; the code fix applies
-the same commands automatically on the next Apply.
-
 ## [0.5.223] - 2026-08-25
 
 **DHCP server state "No Pool" replaces "Failed" when no pool
