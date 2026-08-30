@@ -38,6 +38,26 @@ logger = logging.getLogger(__name__)
 # to ``_is_dhclient_running`` but overlooked the server-mode fallback
 # ``pgrep -f 'dnsmasq.*{interface}'`` here — same substring collision.
 # Prefer the more-specific conffile match when the caller supplies one.
+def _has_dhcp_pool(dhcp_config: dict) -> bool:
+    """v0.5.227: distinguish "no pool attached" from "server crashed".
+
+    A server-mode device is INCAPABLE of running dnsmasq if the
+    config doesn't carry an IPv4 pool (``pool_start`` +
+    ``pool_end``) OR an IPv6 pool (``pool6_start`` + ``pool6_end``).
+    The monitor uses this to write "No Pool" (config-incomplete)
+    instead of "Server Down" (dnsmasq should be running but
+    isn't) — and to skip the futile ensure_dhcp_services restart
+    that would just re-hit the same no-pool refusal on every poll.
+    """
+    if not isinstance(dhcp_config, dict):
+        return False
+    v4 = (str(dhcp_config.get("pool_start") or "").strip() != "" and
+          str(dhcp_config.get("pool_end") or "").strip() != "")
+    v6 = (str(dhcp_config.get("pool6_start") or "").strip() != "" and
+          str(dhcp_config.get("pool6_end") or "").strip() != "")
+    return v4 or v6
+
+
 def _pgrep_matching_argv(binary: str, needle: str,
                          *, container=None) -> bool:
     """True if any ``binary`` process has ``needle`` as a WHOLE
@@ -370,9 +390,25 @@ class DHCPClientMonitor:
             except Exception as exc:
                 detail = f"probe error: {exc}"
 
-        new_state = "Server Running" if running else "Server Down"
+        # v0.5.227: preserve the "No Pool" state that
+        # start_dhcp_server writes at Apply time (v0.5.223) when the
+        # config is missing pool_start/pool_end. Pre-fix, the
+        # monitor's next poll would overwrite "No Pool" with
+        # "Server Down" (line 373 was unconditional), so the UI
+        # showed a state that mismatched dhcp_last_error and made
+        # operators think dnsmasq had crashed. Now: if the config
+        # has no pool, dnsmasq CAN'T run and "Server Down" is the
+        # wrong word — write "No Pool" and let the operator see the
+        # matching last-error tooltip.
+        has_pool = _has_dhcp_pool(dhcp_config)
+        if running:
+            new_state = "Server Running"
+        elif not has_pool:
+            new_state = "No Pool"
+        else:
+            new_state = "Server Down"
         try:
-            self.device_db.update_device(device_id, {
+            update_payload = {
                 "dhcp_state": new_state,
                 "dhcp_running": running,
                 "last_dhcp_check": datetime.now(timezone.utc).isoformat(),
@@ -380,7 +416,18 @@ class DHCPClientMonitor:
                 # over this device.
                 "dhcp_manual_override": False,
                 "dhcp_manual_override_time": None,
-            })
+            }
+            # Keep dhcp_last_error in sync with the state we're
+            # writing: "No Pool" carries an actionable last-error
+            # message so the operator sees the same guidance
+            # start_dhcp_server would have written at Apply time.
+            if new_state == "No Pool":
+                update_payload["dhcp_last_error"] = (
+                    "No DHCP pool attached — attach a pool via the "
+                    "Attach Route Pools button, or Edit the device "
+                    "to set a pool_start/pool_end range."
+                )
+            self.device_db.update_device(device_id, update_payload)
             logger.info(
                 "[DHCP MONITOR] Server-mode probe for %s: %s (%s)",
                 device_id, new_state, detail,
@@ -393,6 +440,14 @@ class DHCPClientMonitor:
 
         if running:
             self._note_leased(device_id)
+            return
+
+        # v0.5.227: skip the auto-restart when the config has no
+        # pool. ensure_dhcp_services would just re-run the same
+        # "no pool" refusal every 5s, spamming logs and looking
+        # like a real crash loop in the audit. The state is
+        # already "No Pool" — wait for the operator to attach one.
+        if not has_pool:
             return
 
         # Server is down — restart via ensure_dhcp_services, subject

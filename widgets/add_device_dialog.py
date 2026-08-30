@@ -2547,5 +2547,70 @@ class AddDeviceDialog(QDialog):
                 # Fail-open on validator errors — server 409 remains.
                 pass
 
+        # v0.5.227: DHCP-server mode requires a pool range. Pre-fix,
+        # Save+Apply of a Server-mode device with the pool fields
+        # blank (or with the DHCP IPv4 subcheckbox off but mode still
+        # Server) landed a config with no pool_start/pool_end. dnsmasq
+        # refused to launch, the "No Pool" state kicked in, and the
+        # operator wondered why the server was down (Server Down /
+        # No Pool distinction from v0.5.223 didn't help if the client
+        # let a fundamentally unbootable config through). Catch it
+        # here so the operator sees the actual problem before submit.
+        if (hasattr(self, "dhcp_enable_checkbox")
+                and self.dhcp_enable_checkbox.isChecked()
+                and hasattr(self, "dhcp_mode_combo")
+                and self.dhcp_mode_combo.currentText().strip().lower() == "server"):
+            v4_on = (
+                hasattr(self, "dhcp_ipv4_enabled_checkbox")
+                and self.dhcp_ipv4_enabled_checkbox.isChecked()
+            )
+            v6_on = (
+                hasattr(self, "dhcp_ipv6_enabled_checkbox")
+                and self.dhcp_ipv6_enabled_checkbox.isChecked()
+            )
+            if not v4_on and not v6_on:
+                QMessageBox.warning(
+                    self, "DHCP Server: no address family",
+                    "DHCP mode is Server but neither IPv4 nor IPv6 is "
+                    "enabled — dnsmasq needs at least one pool to serve.\n\n"
+                    "Tick 'IPv4' or 'IPv6' under DHCP and set a pool range.",
+                )
+                return
+            v4_ok = True
+            if v4_on:
+                pool_start = self.dhcp_pool_start_input.text().strip()
+                pool_end = self.dhcp_pool_end_input.text().strip()
+                v4_ok = bool(pool_start and pool_end)
+                if not v4_ok:
+                    QMessageBox.warning(
+                        self, "DHCP Server: pool range required",
+                        "DHCP IPv4 is enabled on a Server-mode device "
+                        "but Pool Start / Pool End is blank — dnsmasq "
+                        "will refuse to launch and the device will "
+                        "sit in 'No Pool' state.\n\n"
+                        "Set both Pool Start and Pool End (e.g. "
+                        "172.16.30.10 and 172.16.30.200) before Save.",
+                    )
+                    return
+            if v6_on:
+                pool6_start = (
+                    self.dhcp6_pool_start_input.text().strip()
+                    if hasattr(self, "dhcp6_pool_start_input") else ""
+                )
+                pool6_end = (
+                    self.dhcp6_pool_end_input.text().strip()
+                    if hasattr(self, "dhcp6_pool_end_input") else ""
+                )
+                if not (pool6_start and pool6_end):
+                    QMessageBox.warning(
+                        self, "DHCP Server: IPv6 pool range required",
+                        "DHCP IPv6 is enabled on a Server-mode device "
+                        "but IPv6 Pool Start / End is blank — dnsmasq "
+                        "will refuse to launch.\n\n"
+                        "Set both IPv6 Pool Start and Pool End before "
+                        "Save.",
+                    )
+                    return
+
         # All validations passed
         self.accept()

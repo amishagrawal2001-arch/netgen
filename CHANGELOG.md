@@ -2,6 +2,64 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.227] - 2026-08-30
+
+**DHCP monitor stops overwriting "No Pool" with "Server Down"
++ client rejects a Server-mode Save with no pool range.**
+
+Operator on srv06 2026-08-30: added device3 in DHCP-server
+mode; the UI showed `State = Server Down`, `Pools = (empty)`.
+Looked like dnsmasq had crashed. Actual state (per the DB):
+`dhcp_state = "Server Down"`, `dhcp_last_error = "No DHCP
+pool attached — attach a pool via the Attach Route Pools
+button, or Edit the device to set a pool_start/pool_end
+range."` — i.e., the last-error message told the truth (no
+pool in the config, dnsmasq refused to launch, v0.5.222 gate
+did its job, v0.5.223 wrote `dhcp_state = "No Pool"` at
+Apply time), but the DHCP monitor's very next 5s poll wrote
+`dhcp_state = "Server Down"` unconditionally
+(`utils/dhcp_monitor.py:373`) — clobbering v0.5.223's
+correct state and making it look like a real dnsmasq crash.
+
+Two layers fixed, plus a third belt-and-braces:
+
+- `utils/dhcp_monitor.py` — new module-level `_has_dhcp_pool()`
+  helper. Before writing "Server Down" the monitor now checks
+  the config: no pool present → write "No Pool" + the same
+  actionable `dhcp_last_error` that `start_dhcp_server` would
+  have written, and RETURN early. Skips the futile
+  `ensure_dhcp_services` restart that would just re-hit the
+  same no-pool refusal every 5s (log spam eliminated).
+- `widgets/add_device_dialog.py` — `validate_and_accept`
+  refuses Save when DHCP mode is Server and either no address
+  family is enabled, or an enabled AF has blank pool_start /
+  pool_end (or blank IPv6 pool endpoints). Was letting the
+  bad config through and relying on the server for a proper
+  refusal; now the operator sees a clear MessageBox with
+  copy-paste-ready example values (172.16.30.10 /
+  172.16.30.200) before submit.
+
+Result: the UI now shows `State = "No Pool"` for the
+config-incomplete case (matches v0.5.223 semantics), the
+tooltip and state agree, and the log doesn't fill with
+restart-retry noise. Fresh Add-flow with Server mode + blank
+pool bounces at Save with an actionable message.
+
+Tests: `tests/test_v05227_dhcp_no_pool_monitor.py` — 15
+pass. `_has_dhcp_pool()` on v4-only / v6-only / dual-stack /
+empty / missing-half / whitespace-only / non-dict inputs;
+monitor writes "No Pool" branch in the right tri-state
+order (Running > No Pool > Server Down); monitor writes the
+actionable last_error; ensure_dhcp_services restart is
+guarded by `if not has_pool: return`; client rejects the
+three bad-config Save cases (no AF, blank v4 pool, blank
+v6 pool). Broader DHCP sweep: 124 pass.
+
+Also relaxes the `test_v05225_dhcp_template_subnet.py`
+version-pin check from an exact-equal to `>= 0.5.225` — the
+ship-time bump was verified at v0.5.225; keeping the exact
+pin would break the moment the next release lands.
+
 ## [0.5.226] - 2026-08-30
 
 **Upstream-router config hints — Juniper, Cisco IOS, Arista EOS.**

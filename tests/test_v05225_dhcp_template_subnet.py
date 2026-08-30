@@ -107,6 +107,16 @@ def test_summary_mentions_isolation_rationale():
 
 # --- Version bump -----------------------------------------------------------
 
-def test_pyproject_version_bumped():
+def test_pyproject_version_at_or_beyond_225():
+    """This test verifies the ship-time bump happened. Once we move on
+    to 0.5.226+, the exact-version pin becomes stale — check that we
+    didn't accidentally regress BELOW 0.5.225 instead."""
     src = (REPO / "pyproject.toml").read_text()
-    assert 'version = "0.5.225"' in src
+    import re
+    m = re.search(r'^version = "(\d+)\.(\d+)\.(\d+)"', src, re.MULTILINE)
+    assert m, f"could not find version in pyproject.toml"
+    major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    assert (major, minor, patch) >= (0, 5, 225), (
+        f"pyproject version {major}.{minor}.{patch} is below 0.5.225 "
+        "— the v0.5.225 DHCP-template ship must have regressed."
+    )
