@@ -2,6 +2,62 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.228] - 2026-08-30
+
+**DHCP subtab toolbar gets visible text labels — "Attach Pool"
+is now discoverable.**
+
+Operator on srv06 2026-08-30: after device3 showed
+`State = "No Pool"` and the tooltip said "attach a pool via
+the Attach Route Pools button", the operator asked "how to
+attach pool, I don't see any way to attach the pool". Two
+problems:
+
+1. The DHCP subtab toolbar had four **icon-only** buttons
+   (28×24 px each) with tooltip-only labels — Manage Pools,
+   Attach Pool, Apply, Refresh. Operators had no way to see
+   what each did without hovering, and in practice missed
+   "Attach Pool" entirely.
+2. The "Attach Route Pools" wording in the last-error / tooltip
+   was BGP terminology — no button with that label exists in
+   the DHCP subtab. Compounded #1.
+
+Fixes:
+- `utils/devices_tab_dhcp.py` — all four toolbar buttons now
+  carry visible text labels ("Manage Pools", "Attach Pool",
+  "Apply", "Refresh") next to their icons. `_dhcp_btn()`
+  signature widens from `(icon, tooltip[, style])` to
+  `(icon, label, tooltip[, style])`; all four callers updated
+  in the same commit.
+- `utils/dhcp.py start_dhcp_server()` — the `dhcp_last_error`
+  message now names "'Attach Pool'" (matching the visible
+  button) and says "in the DHCP subtab toolbar" so the
+  operator knows where to look.
+- `utils/dhcp_monitor.py _check_server_device()` — the same
+  message when the monitor writes "No Pool" (v0.5.227 fix
+  chain). Both sites in lockstep.
+- `AttachDHCPPoolsDialog` — the "No DHCP pools found"
+  MessageBox now says "Click the 'Manage Pools' button in
+  the DHCP subtab toolbar to create a named pool first,
+  then come back to 'Attach Pool'" — names both sibling
+  buttons directly.
+
+Tests: `tests/test_v05228_dhcp_toolbar_labels.py` — 10 pass.
+Verify each button carries its text label, verify tooltip
+message matches the actual button label, verify the empty-
+pools dialog points at the correct sibling button, guard
+against future icon-only regressions. Also touched two v0.5.223
+/ v0.5.227 tests to accept the new "'Attach Pool'" wording
+(both formerly pinned the old "Attach Route Pools" string).
+Broader DHCP sweep: 134 pass.
+
+Not addressed in v0.5.228: WHY device3's original Apply
+didn't carry pool_start / pool_end in dhcp_config even
+though the operator says they set it. The v0.5.227
+Save-time reject prevents future recurrence, and the fresh
+labeled toolbar gives them the "Attach Pool" path to recover
+this specific device.
+
 ## [0.5.227] - 2026-08-30
 
 **DHCP monitor stops overwriting "No Pool" with "Server Down"

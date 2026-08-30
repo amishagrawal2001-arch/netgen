@@ -1776,10 +1776,14 @@ def start_dhcp_server(
         # apart from a real bug. "No Pool" reads correctly:
         # nothing failed, the device just has no pool attached
         # (common after the v0.5.218 Delete-key detach action).
+        # v0.5.228: name the visible button ("Attach Pool" in the DHCP
+        # subtab toolbar) — pre-fix this named a button label that
+        # didn't exist in the UI, and the buttons were icon-only
+        # anyway, so operators had no way to find it.
         err = (
-            "No DHCP pool attached — attach a pool via the "
-            "Attach Route Pools button, or Edit the device to "
-            "set a pool_start/pool_end range."
+            "No DHCP pool attached — click the 'Attach Pool' button in "
+            "the DHCP subtab toolbar to attach a named pool, or Edit "
+            "the device to set a Pool Start / Pool End range directly."
         )
         _update_device_db(
             device_db,

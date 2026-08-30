@@ -126,10 +126,12 @@ def test_monitor_writes_actionable_last_error_on_no_pool():
     """Keep the last-error message in sync with what
     start_dhcp_server writes at Apply time, so the operator sees
     the same guidance whether the monitor or the Apply landed
-    the state first."""
+    the state first. v0.5.228 renamed the referenced button
+    from 'Attach Route Pools' to 'Attach Pool' (matching the new
+    labeled toolbar) — this test now checks for the current name."""
     src = _monitor_source()
     assert 'No DHCP pool attached' in src
-    assert 'Attach Route Pools' in src
+    assert "'Attach Pool'" in src
 
 
 def test_monitor_skips_restart_when_no_pool():
@@ -176,9 +178,11 @@ def _dialog_source() -> str:
 
 # --- Version bump -----------------------------------------------------------
 
-def test_pyproject_version_bumped():
+def test_pyproject_version_at_or_beyond_227():
     from pathlib import Path
-    src = (
-        Path(__file__).resolve().parents[1] / "pyproject.toml"
-    ).read_text()
-    assert 'version = "0.5.227"' in src
+    import re
+    src = (Path(__file__).resolve().parents[1] / "pyproject.toml").read_text()
+    m = re.search(r'^version = "(\d+)\.(\d+)\.(\d+)"', src, re.MULTILINE)
+    assert m
+    major, minor, patch = int(m.group(1)), int(m.group(2)), int(m.group(3))
+    assert (major, minor, patch) >= (0, 5, 227)

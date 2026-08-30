@@ -53,14 +53,18 @@ def test_no_pool_branch_writes_no_pool_not_failed():
 
 
 def test_no_pool_last_error_message_actionable():
-    """The last_error message should point operators to Attach
-    Route Pools, not just say 'no pool'."""
+    """The last_error message should point operators to the actual
+    toolbar button ('Attach Pool' since v0.5.228, previously worded
+    as 'Attach Route Pools' in v0.5.223) — not just say 'no pool'."""
     src = _dhcp_src()
     idx = src.find("if not ipv4_enabled and not ipv6_enabled:")
     body = src[idx:idx + 2000]
-    assert "Attach Route Pools" in body or "attach a pool" in body.lower(), (
-        "no-pool last_error doesn't tell operators HOW to fix it"
-    )
+    lowered = body.lower()
+    assert (
+        "'attach pool'" in lowered
+        or "attach route pools" in lowered
+        or "attach a pool" in lowered
+    ), "no-pool last_error doesn't tell operators HOW to fix it"
 
 
 def test_real_dnsmasq_failure_still_writes_failed():

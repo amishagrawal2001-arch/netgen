@@ -480,7 +480,9 @@ class AttachDHCPPoolsDialog(QDialog):
             QMessageBox.information(
                 self,
                 "No DHCP Pools",
-                "No DHCP pools found.\nUse 'Manage DHCP Pools' to create pools before attaching.",
+                "No DHCP pools found.\n\nClick the 'Manage Pools' button "
+                "in the DHCP subtab toolbar to create a named pool first, "
+                "then come back to 'Attach Pool' to hang it on this device.",
             )
             self.reject()
 
@@ -834,29 +836,54 @@ class DHCPHandler:
             "QPushButton:hover { background-color: #eff6ff; border-color: #1d4ed8; }"
             "QPushButton:pressed { background-color: #dbeafe; }"
         )
-        BTN_W, BTN_H, ICON_PX = 28, 24, 14
+        # v0.5.228: icon-ONLY buttons here were undiscoverable — operators
+        # had no way to see what each 28x24 icon did without hovering, and
+        # in practice they missed "Attach DHCP Pools" entirely. Now
+        # icon + label, sized to fit the text.
+        BTN_H, ICON_PX = 26, 14
 
         def load_icon(filename: str):
             from utils.qicon_loader import qicon
             return qicon("resources", f"icons/{filename}")
 
-        def _dhcp_btn(icon_name, tooltip, style=BTN_BASE):
-            b = QPushButton()
+        def _dhcp_btn(icon_name, label, tooltip, style=BTN_BASE):
+            b = QPushButton(label)
             b.setIcon(load_icon(icon_name))
             b.setIconSize(QSize(ICON_PX, ICON_PX))
-            b.setFixedSize(BTN_W, BTN_H)
+            b.setMinimumHeight(BTN_H)
             b.setCursor(Qt.PointingHandCursor)
             b.setToolTip(tooltip)
-            b.setStyleSheet(style)
+            # Small horizontal padding so the icon doesn't kiss the text.
+            padded = style.replace(
+                "  padding: 0px;",
+                "  padding: 2px 10px;",
+            )
+            b.setStyleSheet(padded)
             return b
 
-        # Config group (left)
-        self.parent.dhcp_manage_button  = _dhcp_btn("edit.png",  "Manage DHCP Pools")
-        self.parent.dhcp_attach_button  = _dhcp_btn("readd.png", "Attach DHCP pools to the selected server")
+        # Config group (left) — these are what turns "State: No Pool"
+        # into a serving DHCP box. "Manage" defines named pools;
+        # "Attach" hangs them off the selected server device.
+        self.parent.dhcp_manage_button  = _dhcp_btn(
+            "edit.png",  "Manage Pools",
+            "Create, edit, or delete named DHCP pools (reusable across devices).",
+        )
+        self.parent.dhcp_attach_button  = _dhcp_btn(
+            "readd.png", "Attach Pool",
+            "Attach one or more named DHCP pools to the selected server device. "
+            "Use this when the device shows State='No Pool'.",
+        )
 
         # Runtime group (right)
-        self.parent.dhcp_apply_button   = _dhcp_btn("apply.png",   "Apply attached DHCP pools on the selected server", style=BTN_APPLY)
-        self.parent.dhcp_refresh_button = _dhcp_btn("refresh.png", "Refresh DHCP status")
+        self.parent.dhcp_apply_button   = _dhcp_btn(
+            "apply.png",   "Apply",
+            "Apply attached DHCP pools on the selected server (writes dnsmasq config and restarts).",
+            style=BTN_APPLY,
+        )
+        self.parent.dhcp_refresh_button = _dhcp_btn(
+            "refresh.png", "Refresh",
+            "Refresh DHCP status for all rows.",
+        )
 
         self.parent.dhcp_manage_button.clicked.connect(self.manage_dhcp_pools)
         self.parent.dhcp_attach_button.clicked.connect(self.attach_dhcp_pools)

@@ -422,10 +422,14 @@ class DHCPClientMonitor:
             # message so the operator sees the same guidance
             # start_dhcp_server would have written at Apply time.
             if new_state == "No Pool":
+                # v0.5.228: mirror the message from
+                # utils/dhcp.start_dhcp_server so tooltip content stays
+                # consistent whether the monitor or Apply wrote first.
                 update_payload["dhcp_last_error"] = (
-                    "No DHCP pool attached — attach a pool via the "
-                    "Attach Route Pools button, or Edit the device "
-                    "to set a pool_start/pool_end range."
+                    "No DHCP pool attached — click the 'Attach Pool' "
+                    "button in the DHCP subtab toolbar to attach a "
+                    "named pool, or Edit the device to set a Pool Start "
+                    "/ Pool End range directly."
                 )
             self.device_db.update_device(device_id, update_payload)
             logger.info(
