@@ -2,6 +2,64 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.226] - 2026-08-30
+
+**Upstream-router config hints — Juniper, Cisco IOS, Arista EOS.**
+
+Every netgen device peers with SOMETHING on the wire (usually
+the lab's ToR or a router farther upstream), and rewriting the
+matching interface + BGP-neighbor + OSPF/IS-IS stanzas in the
+right vendor syntax eats ~30 minutes per device. v0.5.226 adds
+a "Upstream Config Hint…" button to the Add / Edit Device
+dialog. Click it, get a 3-tab modal (Juniper JunOS `set`
+syntax, Cisco IOS, Arista EOS) with a monospaced view of
+paste-ready config and a "Copy to clipboard" button per tab.
+
+The snippet is generated live from whatever the operator has
+typed into the dialog so far — works pre- and post-Save. It
+covers:
+- Interface stanza (VLAN tag, IPv4/IPv6 address on the
+  upstream side, ISO family for IS-IS).
+- BGP: peer-as, hold-time, keepalive, v4 + v6 neighbors,
+  address-family activation. iBGP vs eBGP picked automatically
+  from ASN comparison.
+- OSPF: area interface, hello/dead intervals, `p2p_ipv4` /
+  `p2p_ipv6` → `interface-type p2p` / `ip ospf network
+  point-to-point`. OSPFv3 mirrored.
+- IS-IS: level (level-1 / level-1-2 / level-2-only), NET
+  (auto-derived from loopback IPv4 when the device didn't
+  set one explicitly), area, point-to-point network.
+- The upstream physical iface is a placeholder
+  (`ge-0/0/0` / `GigabitEthernet0/0` / `Ethernet1`); the
+  operator edits it before commit — the header of the
+  snippet calls this out.
+
+Files added:
+- `utils/upstream_hints.py` — `render_juniper()`,
+  `render_cisco()`, `render_arista()`, `render_all()`. Handles
+  both DB-key (`ipv4_address`, `device_name`) and display-key
+  (`IPv4`, `Device Name`) dicts so it works from either the
+  client cache or the server's `/api/device/database/devices`.
+- `widgets/upstream_hint_dialog.py` — the 3-tab modal with
+  Copy-to-Clipboard.
+- `widgets/add_device_dialog.py` — new `Upstream Config Hint…`
+  button in the button bar (ActionRole, doesn't fire submit),
+  a `_snapshot_for_upstream_hint()` helper that reads live
+  dialog state into a device_data dict, and
+  `_open_upstream_hint_dialog()` that opens the modal.
+
+Tests: `tests/test_v05226_upstream_hints.py` — 24 pass.
+Header markers per vendor (`#` for Juniper, `!` for Cisco/
+Arista), iface stanzas, BGP internal-vs-external picking,
+OSPF P2P interface-type emission, IS-IS NET synth from
+loopback, alternate-key resolution (`Device Name` and
+`device_name` both work), sections omitted when the
+corresponding config is empty, bare-device iface still
+renders.
+
+No UI-only regression risk to the release: the new button
+is additive — no existing widget changed behavior.
+
 ## [0.5.225] - 2026-08-30
 
 **DHCP-server template defaults move from 192.168.30.0/24 to

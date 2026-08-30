@@ -92,10 +92,23 @@ class AddDeviceDialog(QDialog):
         ok_label = "Update Device" if self.mode == "edit" else "Add Device"
         self.ok_button = self.button_box.addButton(ok_label, QDialogButtonBox.AcceptRole)
         self.cancel_button = self.button_box.addButton("Cancel", QDialogButtonBox.RejectRole)
-        
+        # v0.5.226: upstream router config hint. Opens a modal with
+        # Juniper / Cisco IOS / Arista tabs rendering paste-ready
+        # config for whichever router is on the other end of the
+        # link. Reads live from whatever the operator has entered so
+        # far, so it works pre- or post-Save.
+        self.upstream_hint_button = self.button_box.addButton(
+            "Upstream Config Hint…", QDialogButtonBox.ActionRole,
+        )
+        self.upstream_hint_button.setToolTip(
+            "Show Juniper / Cisco IOS / Arista config snippets to paste "
+            "onto the upstream router that this device is peering with."
+        )
+
         self.ok_button.clicked.connect(self.validate_and_accept)
         self.cancel_button.clicked.connect(self.reject)
-        
+        self.upstream_hint_button.clicked.connect(self._open_upstream_hint_dialog)
+
         self.main_layout.addWidget(self.button_box)
         self.setLayout(self.main_layout)
 
@@ -2140,6 +2153,96 @@ class AddDeviceDialog(QDialog):
         except (ipaddress.AddressValueError, ValueError) as e:
             return False, f"Invalid IP address or network configuration: {e}"
     
+    def _open_upstream_hint_dialog(self):
+        """Snapshot the dialog's current state into a device_data dict
+        and open the Juniper / Cisco IOS / Arista hint modal.
+
+        Reads live — the operator gets whatever they've typed so far,
+        even if it hasn't been saved yet. Works pre- and post-Save.
+        """
+        try:
+            device_data = self._snapshot_for_upstream_hint()
+        except Exception:
+            device_data = {}
+        try:
+            from widgets.upstream_hint_dialog import UpstreamHintDialog
+        except Exception as exc:
+            try:
+                QMessageBox.warning(
+                    self, "Upstream Hint",
+                    f"Could not load upstream-hint dialog: {exc}",
+                )
+            finally:
+                return
+        UpstreamHintDialog(device_data, self).exec_()
+
+    def _snapshot_for_upstream_hint(self) -> dict:
+        """Read every field the hint renderer needs. Silent about
+        fields the dialog doesn't have — the renderer's alternate-
+        key lookup treats missing keys as empty."""
+        def txt(name):
+            w = getattr(self, name, None)
+            try:
+                return w.text().strip() if w is not None else ""
+            except Exception:
+                return ""
+
+        def checked(name):
+            w = getattr(self, name, None)
+            try:
+                return bool(w.isChecked()) if w is not None else False
+            except Exception:
+                return False
+
+        ipv4_on = checked("ipv4_checkbox")
+        ipv6_on = checked("ipv6_checkbox")
+
+        data = {
+            "device_name":     txt("device_name_input"),
+            "interface":       txt("iface_input"),
+            "vlan":            txt("vlan_input"),
+            "mac_address":     txt("mac_input"),
+            "ipv4_address":    txt("ipv4_input") if ipv4_on else "",
+            "ipv4_mask":       txt("ipv4_mask_input") or "24",
+            "ipv4_gateway":    txt("ipv4_gateway_input") if ipv4_on else "",
+            "ipv6_address":    txt("ipv6_input") if ipv6_on else "",
+            "ipv6_mask":       txt("ipv6_mask_input") or "64",
+            "ipv6_gateway":    txt("ipv6_gateway_input") if ipv6_on else "",
+            "loopback_ipv4":   txt("loopback_ipv4_input"),
+            "loopback_ipv6":   txt("loopback_ipv6_input"),
+        }
+
+        if checked("bgp_enable_checkbox"):
+            data["bgp_config"] = {
+                "bgp_local_as":  txt("bgp_local_as_input"),
+                "bgp_remote_asn": txt("bgp_remote_as_input"),
+                "bgp_hold_time": txt("bgp_hold_time_input") or "90",
+                "bgp_keepalive": txt("bgp_keepalive_input") or "30",
+                "ipv4_enabled":  ipv4_on,
+                "ipv6_enabled":  ipv6_on,
+            }
+
+        if checked("ospf_enable_checkbox"):
+            data["ospf_config"] = {
+                "area_id":        txt("ospf_area_id_input") or "0.0.0.0",
+                "hello_interval": txt("ospf_hello_interval_input") or "10",
+                "dead_interval":  txt("ospf_dead_interval_input") or "40",
+                "ipv4_enabled":   ipv4_on,
+                "ipv6_enabled":   ipv6_on,
+            }
+
+        if checked("isis_enable_checkbox"):
+            data["isis_config"] = {
+                "isis_area":  txt("isis_area_input") or "CORE",
+                "isis_net":   txt("isis_net_input"),
+                "isis_level": (
+                    self.isis_level_combo.currentText()
+                    if hasattr(self, "isis_level_combo") else "level-2-only"
+                ),
+            }
+
+        return data
+
     def validate_and_accept(self):
         """Validate the form data before accepting the dialog."""
         # Get form values
