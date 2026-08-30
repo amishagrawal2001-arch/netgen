@@ -873,20 +873,25 @@ class AddDeviceDialog(QDialog):
         dhcp_left_layout = QFormLayout()
         dhcp_left_layout.setSpacing(8)
 
-        self.dhcp_pool_start_input = QLineEdit("192.168.30.10")
+        # DHCP server defaults live in the 172.16.30.0/24 range (v0.5.225).
+        # This is a deliberate offset from the regular device-interface
+        # default (192.168.0.0/24) so a DHCP-server device doesn't share
+        # a subnet with regular BGP/OSPF devices — makes the "which /24
+        # is the DHCP subnet" question unambiguous in the lab.
+        self.dhcp_pool_start_input = QLineEdit("172.16.30.10")
         self.dhcp_pool_start_input.setPlaceholderText("Pool Start")
         self.dhcp_pool_start_input.setEnabled(False)
         dhcp_left_layout.addRow("Pool Start:", self.dhcp_pool_start_input)
 
-        self.dhcp_gateway_route_input = QLineEdit("192.168.30.0/24")
-        self.dhcp_gateway_route_input.setPlaceholderText("Gateway Route CIDR (e.g. 192.168.30.0/24)")
+        self.dhcp_gateway_route_input = QLineEdit("172.16.30.0/24")
+        self.dhcp_gateway_route_input.setPlaceholderText("Gateway Route CIDR (e.g. 172.16.30.0/24)")
         self.dhcp_gateway_route_input.setEnabled(False)
         dhcp_left_layout.addRow("Gateway Route:", self.dhcp_gateway_route_input)
 
         dhcp_right_layout = QFormLayout()
         dhcp_right_layout.setSpacing(8)
 
-        self.dhcp_pool_end_input = QLineEdit("192.168.30.200")
+        self.dhcp_pool_end_input = QLineEdit("172.16.30.200")
         self.dhcp_pool_end_input.setPlaceholderText("Pool End")
         self.dhcp_pool_end_input.setEnabled(False)
         dhcp_right_layout.addRow("Pool End:", self.dhcp_pool_end_input)
@@ -1487,14 +1492,17 @@ class AddDeviceDialog(QDialog):
         for widget in (self.dhcp_pool_start_input, self.dhcp_pool_end_input, self.dhcp_lease_time_input, self.dhcp_gateway_route_input):
             widget.setEnabled(enable_server_fields)
         if enable_server_fields:
+            # DHCP server template subnet — 172.16.30.0/24 (v0.5.225).
+            # Kept in lockstep with the constructor defaults above; both
+            # sites populate empty fields with the same values.
             if not self.dhcp_pool_start_input.text().strip():
-                self.dhcp_pool_start_input.setText("192.168.30.10")
+                self.dhcp_pool_start_input.setText("172.16.30.10")
             if not self.dhcp_pool_end_input.text().strip():
-                self.dhcp_pool_end_input.setText("192.168.30.200")
+                self.dhcp_pool_end_input.setText("172.16.30.200")
             if not self.dhcp_gateway_route_input.text().strip():
-                self.dhcp_gateway_route_input.setText("192.168.30.0/24")
+                self.dhcp_gateway_route_input.setText("172.16.30.0/24")
             if hasattr(self, "ipv4_gateway_input") and not self.ipv4_gateway_input.text().strip():
-                self.ipv4_gateway_input.setText("192.168.30.1")
+                self.ipv4_gateway_input.setText("172.16.30.1")
         if hasattr(self, "ipv4_checkbox") and hasattr(self, "ipv6_checkbox"):
             if is_client and self.dhcp_mode_combo.isEnabled():
                 self._dhcp_prev_ipv4_checked = self.ipv4_checkbox.isChecked()

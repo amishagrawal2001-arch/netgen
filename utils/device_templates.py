@@ -219,20 +219,32 @@ _TEMPLATES: List[_Template] = [
 
     _Template(
         key="dhcp_server",
-        title="DHCP server (pool 192.168.30.10-200)",
-        summary="dnsmasq inside the device VRF. Pool 192.168.30.10–200, "
-                "gateway 192.168.30.0/24, 1-hour lease. Useful for "
-                "stressing DHCP relay / IPAM / client churn paths.",
+        title="DHCP server (pool 172.16.30.10-200)",
+        summary="dnsmasq inside the device VRF. Interface + pool land on "
+                "172.16.30.0/24 (device at .1, pool .10–.200), 1-hour "
+                "lease. The DHCP server template uses the 172.16/12 "
+                "private range so a DHCP-server device stays isolated "
+                "from regular BGP/OSPF devices (default 192.168.0.0/24) "
+                "and doesn't overlap on-wire. Useful for stressing DHCP "
+                "relay / IPAM / client churn paths.",
         protocols=["DHCP"],
         fields={
             "ipv4_checkbox": True,
             "ipv6_checkbox": False,
             "vlan_input": "10",
             "dhcp_mode_combo": "Server",
+            # Device sits at .1 of the DHCP subnet so dnsmasq listens on
+            # the same broadcast domain as the pool. Without this override
+            # the interface would inherit the 192.168.0.2/24 widget
+            # default and dnsmasq would refuse to serve pool addresses
+            # (v0.5.222: "no address in subnet on interface").
+            "ipv4_input": "172.16.30.1",
+            "ipv4_mask_input": "24",
+            "ipv4_gateway_input": "172.16.30.1",
             # DHCP server widgets are at lines 845-863
-            "dhcp_pool_start_input": "192.168.30.10",
-            "dhcp_pool_end_input": "192.168.30.200",
-            "dhcp_gateway_route_input": "192.168.30.0/24",
+            "dhcp_pool_start_input": "172.16.30.10",
+            "dhcp_pool_end_input": "172.16.30.200",
+            "dhcp_gateway_route_input": "172.16.30.0/24",
             "dhcp_lease_time_input": "3600",
         },
     ),

@@ -2,6 +2,50 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.225] - 2026-08-30
+
+**DHCP-server template defaults move from 192.168.30.0/24 to
+172.16.30.0/24, and pin the interface IP to the pool subnet.**
+
+Operator ask 2026-08-30: DHCP-server template should use its
+own private range instead of sharing 192.168.x.x with regular
+BGP/OSPF devices, so the "which /24 is the DHCP subnet"
+question is unambiguous in the lab. Bonus fix: the one-click
+template didn't override the interface IP, so a DHCP-server
+device inherited the widget's 192.168.0.2/24 default — pool
+subnet and interface subnet were on different /24s, and
+dnsmasq refused to serve pool addresses (same v0.5.222 shape:
+"no interface with matching address in the pool subnet"). The
+new template pins `ipv4_input=172.16.30.1/24` so interface and
+pool land together.
+
+Changes:
+- `widgets/add_device_dialog.py` — six DHCP-server field
+  defaults (constructor at ~876/881/889 + reset handler at
+  ~1491/1493/1495/1497) flip from `192.168.30.x` to
+  `172.16.30.x`. Both sites are kept in lockstep (v0.5.217-era
+  bug class: one-of-two updated during a rename).
+- `utils/device_templates.py` — DHCP-server one-click template:
+  title, summary, `dhcp_pool_start_input`, `dhcp_pool_end_input`,
+  `dhcp_gateway_route_input` all move to `172.16.30.x`; new
+  fields `ipv4_input="172.16.30.1"`, `ipv4_mask_input="24"`,
+  `ipv4_gateway_input="172.16.30.1"` pin the interface subnet
+  so it matches the pool.
+
+Backward compatibility: the placeholder text change only
+affects fresh Add flows and the DHCP-server one-click
+template. Devices already created with the old 192.168.30.x
+values keep their stored config — no auto-migration, no
+silent flip on next Apply. Operators who want the old subnet
+can still type it in manually.
+
+Tests: `tests/test_v05225_dhcp_template_subnet.py` — 11 pass.
+Verify constructor + reset defaults are 172.16.30.x
+(nothing 192.168.30.x left in the dialog), template title +
+summary + all fields, interface IP is pinned to `172.16.30.1/24`
+to prevent the v0.5.222 pool/interface mismatch, and pyproject
+is bumped to 0.5.225. Full DHCP + template sweep: 193 pass.
+
 ## [0.5.224] - 2026-08-30
 
 **Duplicate loopback / interface IP / MAC across devices is now
