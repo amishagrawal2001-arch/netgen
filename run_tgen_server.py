@@ -4300,6 +4300,51 @@ def apply_device():
             logging.warning(f"[DEVICE APPLY] (iface, vlan) gate skipped: {_gate_exc}")
         # ----------------------------------------------------------------
 
+        # --- Duplicate loopback / interface-IP / MAC gate ---------------
+        # Loopback IPs are globally unique (FRR derives OSPF router-id
+        # from loopback_ipv4; two speakers with the same router-id on
+        # the same segment can't form OSPF adjacency). Interface IPs
+        # and MAC are unique per (interface, vlan) L2 segment — same
+        # broadcast domain = ARP collision. Gateways are deliberately
+        # shared, so we don't check them.
+        try:
+            from utils.address_collision import find_conflict
+            from utils.device_database import DeviceDatabase
+            _all_devs = DeviceDatabase().get_all_devices()
+            _checks = [
+                ("loopback_ipv4", loopback_ipv4, None, None),
+                ("loopback_ipv6", loopback_ipv6, None, None),
+                ("ipv4_address",  ipv4,          interface_normalized, vlan),
+                ("ipv6_address",  ipv6,          interface_normalized, vlan),
+            ]
+            for _field, _val, _iface, _vlan in _checks:
+                if not _val:
+                    continue
+                _hit = find_conflict(
+                    _field, _val, _all_devs,
+                    exclude_id=device_id,
+                    interface=_iface, vlan_id=_vlan,
+                )
+                if _hit:
+                    _peer_id, _peer_name = _hit
+                    _label = _field.replace("_", " ")
+                    _msg = (
+                        f"{_label} '{_val}' is already in use by device "
+                        f"'{_peer_name or _peer_id}'. Pick a different "
+                        f"{_label} — duplicate loopback IPs break OSPF "
+                        f"adjacency (both speakers get the same router-id) "
+                        f"and duplicate interface IPs cause ARP collisions."
+                    )
+                    logging.warning(f"[DEVICE APPLY] Rejected duplicate {_field}: {_msg}")
+                    return jsonify({"error": _msg}), 409
+        except Exception as _dup_exc:
+            # Fail-open — same rationale as the (iface, vlan) gate.
+            # A collision that slips through will still surface as a
+            # protocol-down downstream; better than blocking a valid
+            # apply on a DB lookup hiccup.
+            logging.warning(f"[DEVICE APPLY] duplicate-address gate skipped: {_dup_exc}")
+        # ----------------------------------------------------------------
+
         result = {
             "device_id": device_id,
             "device": device_name,

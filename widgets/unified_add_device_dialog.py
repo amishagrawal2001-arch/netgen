@@ -59,13 +59,18 @@ class UnifiedAddDeviceDialog(QDialog):
     Provides AI-assisted device discovery and configuration
     """
     
-    def __init__(self, parent=None, default_iface=""):
+    def __init__(self, parent=None, default_iface="", existing_devices=None):
         super().__init__(parent)
         self.setWindowTitle("Add Device")
         self.setMinimumSize(900, 700)
         self.resize(1000, 750)
-        
+
         self.default_iface = default_iface
+        # Peer list for the inner FRR dialog's duplicate-loopback gate.
+        # None → gate disabled (falls back to server 409). Callers that
+        # want the client-side pre-fill + inline warning should pass
+        # the flattened DB-key device list.
+        self._existing_devices = existing_devices
         self.device_type = "frr_container"  # Default
         self.server_url = getattr(parent, 'server_url', 'http://localhost:5051') if parent else 'http://localhost:5051'
         self.discovered_devices = []
@@ -316,7 +321,10 @@ class UnifiedAddDeviceDialog(QDialog):
         if self.device_type == "frr_container":
             # Use existing FRR dialog
             if not self.frr_dialog:
-                self.frr_dialog = AddDeviceDialog(self, default_iface=self.default_iface)
+                self.frr_dialog = AddDeviceDialog(
+                    self, default_iface=self.default_iface,
+                    existing_devices=self._existing_devices,
+                )
             
             if self.frr_dialog.exec_() == QDialog.Accepted:
                 self.device_data = {

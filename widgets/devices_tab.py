@@ -6225,7 +6225,14 @@ class DevicesTab(QWidget):
         port_name = selected_items[0].text(0).replace("• ", "").strip()  # Remove bullet prefix
         iface = f"{tg_id} - {port_name}"  # Match server tree format
 
-        dialog = AddDeviceDialog(self, default_iface=iface)
+        # Peer list for duplicate-address detection (loopback + interface
+        # IP + MAC). Flatten main_window.all_devices (display-key format)
+        # into the DB-key format the collision helper expects.
+        existing_devices = self._collect_existing_devices_for_collision()
+
+        dialog = AddDeviceDialog(
+            self, default_iface=iface, existing_devices=existing_devices,
+        )
         if dialog.exec_() != dialog.Accepted:
             return
 
@@ -7192,8 +7199,16 @@ class DevicesTab(QWidget):
 
         # mode="edit" makes the dialog title read "Edit Device" and
         # the OK button label read "Update Device" instead of the
-        # default "Add Device" — clearer user intent.
-        dialog = AddDeviceDialog(self, default_iface=iface, mode="edit")
+        # default "Add Device" — clearer user intent. existing_devices
+        # + exclude_device_id gate duplicate-address detection: warn
+        # if the operator edits into a collision with a peer, but
+        # never flag the value they're editing as colliding with itself.
+        _existing = self._collect_existing_devices_for_collision()
+        _self_id = device_info.get("device_id") or device_info.get("Device ID") or ""
+        dialog = AddDeviceDialog(
+            self, default_iface=iface, mode="edit",
+            existing_devices=_existing, exclude_device_id=_self_id,
+        )
 
         # Pre-fill basics
         dialog.device_name_input.setText(device_name)
@@ -7764,6 +7779,41 @@ class DevicesTab(QWidget):
                 pass
 
         return normalized
+
+    def _collect_existing_devices_for_collision(self):
+        """Return every known device in the DB-key format the
+        `utils.address_collision.find_conflict` helper expects. The
+        client caches devices in `main_window.all_devices` keyed by
+        display labels ("Loopback IPv4", "Device Name", …); the
+        helper — shared with the server gate in run_tgen_server.py —
+        speaks DB-key names ("loopback_ipv4", "device_name", …). We
+        translate here so both surfaces answer collision questions
+        the same way.
+        """
+        out = []
+        try:
+            buckets = getattr(self.main_window, "all_devices", {}) or {}
+            for _iface_key, dev_list in buckets.items():
+                if not isinstance(dev_list, list):
+                    continue
+                for d in dev_list:
+                    if not isinstance(d, dict):
+                        continue
+                    out.append({
+                        "device_id":     d.get("device_id") or d.get("Device ID") or "",
+                        "device_name":   d.get("Device Name") or d.get("device_name") or "",
+                        "interface":     d.get("Interface") or d.get("interface") or "",
+                        "vlan":          d.get("VLAN") or d.get("vlan") or d.get("vlan_id") or "",
+                        "loopback_ipv4": d.get("Loopback IPv4") or d.get("loopback_ipv4") or "",
+                        "loopback_ipv6": d.get("Loopback IPv6") or d.get("loopback_ipv6") or "",
+                        "ipv4_address":  d.get("IPv4") or d.get("ipv4_address") or "",
+                        "ipv6_address":  d.get("IPv6") or d.get("ipv6_address") or "",
+                        "mac_address":   d.get("MAC Address") or d.get("mac_address") or "",
+                    })
+        except Exception:
+            # Fail-open — the server 409 gate is still authoritative.
+            return []
+        return out
 
     def _normalize_vxlan_config(self, vxlan_config):
         """Normalize VXLAN configuration payloads."""

@@ -21,7 +21,8 @@ import ipaddress
 
 
 class AddDeviceDialog(QDialog):
-    def __init__(self, parent=None, default_iface="", mode="add"):
+    def __init__(self, parent=None, default_iface="", mode="add",
+                 existing_devices=None, exclude_device_id=None):
         """AddDeviceDialog also serves as the Edit dialog (same form,
         same fields). `mode` controls user-facing labels:
 
@@ -30,9 +31,23 @@ class AddDeviceDialog(QDialog):
 
         Behavior is identical otherwise; the caller is responsible
         for pre-filling fields when editing.
+
+        `existing_devices` (optional) is a list of device dicts from
+        the server (usually the caller's cached device list). When
+        provided in "add" mode, the loopback IPv4/IPv6 fields seed to
+        the next-available value instead of the static default, so
+        the user doesn't accidentally reuse device1's loopback for
+        device2 and break OSPF adjacency. In both modes, validate_
+        and_accept refuses to submit a collision. `exclude_device_id`
+        is the device_id to skip during collision detection (self on
+        edit — otherwise the dialog would flag the value being edited
+        as a collision with itself).
         """
         super().__init__(parent)
         self.mode = (mode or "add").lower()
+        # Kept for validate_and_accept and pre-fill helpers.
+        self._existing_devices = list(existing_devices or [])
+        self._exclude_device_id = exclude_device_id
         if self.mode == "edit":
             self.setWindowTitle("Edit Device")
         else:
@@ -260,14 +275,30 @@ class AddDeviceDialog(QDialog):
         ipv6_layout.addStretch()  # Add stretch to align with IP Version
         ip_layout.addRow("", ipv6_layout)
         
-        # Loopback IP fields
+        # Loopback IP fields — on Add with known peers, seed to the
+        # next-available value to prevent duplicate router-ids. Falls
+        # back to the classic defaults on Edit or with no peer list.
         loopback_layout = QHBoxLayout()
-        self.loopback_ipv4_input = QLineEdit("192.255.0.1")
+        _lb4_default = "192.255.0.1"
+        _lb6_default = "2001:ff00::1"
+        if self.mode != "edit" and self._existing_devices:
+            try:
+                from utils.address_collision import (
+                    next_available_loopback_ipv4,
+                    next_available_loopback_ipv6,
+                )
+                _lb4_default = next_available_loopback_ipv4(self._existing_devices)
+                _lb6_default = next_available_loopback_ipv6(self._existing_devices)
+            except Exception:
+                # Fail-open to the static default so a bad import
+                # never blocks opening the dialog.
+                pass
+        self.loopback_ipv4_input = QLineEdit(_lb4_default)
         self.loopback_ipv4_input.setPlaceholderText("e.g., 192.255.0.1")
         self.loopback_ipv4_input.setMinimumWidth(120)
         self.loopback_ipv4_input.setMaximumWidth(150)
-        
-        self.loopback_ipv6_input = QLineEdit("2001:ff00::1")
+
+        self.loopback_ipv6_input = QLineEdit(_lb6_default)
         self.loopback_ipv6_input.setPlaceholderText("e.g., 2001:ff00::1")
         self.loopback_ipv6_input.setEnabled(False)
         self.loopback_ipv6_input.setMinimumWidth(200)
@@ -2325,5 +2356,58 @@ class AddDeviceDialog(QDialog):
                         )
                         return
         
+        # Duplicate-address gate. Advisory on the client (the server
+        # rejects with HTTP 409 as the backstop) so the operator sees
+        # the error before the round-trip. Only fires when the caller
+        # supplied a peer list — otherwise we can't compare.
+        if self._existing_devices:
+            try:
+                from utils.address_collision import find_conflict
+                loopback_ipv4_val = self.loopback_ipv4_input.text().strip()
+                loopback_ipv6_val = (
+                    self.loopback_ipv6_input.text().strip()
+                    if self.loopback_ipv6_input.isEnabled() else ""
+                )
+                _vlan_val = self.vlan_input.text().strip() if hasattr(self, "vlan_input") else ""
+                _iface_val = iface.strip()
+                # normalize "TG 0 - Port: ensXfYnpZ" → "ensXfYnpZ" so
+                # the L2-scoped check matches how the server stores it.
+                if " - " in _iface_val:
+                    _iface_val = _iface_val.split(" - ", 1)[-1].strip()
+                if ":" in _iface_val:
+                    _iface_val = _iface_val.rsplit(":", 1)[-1].strip()
+                _iface_val = _iface_val.split()[-1] if _iface_val.split() else _iface_val
+                _dup_checks = [
+                    ("loopback_ipv4", loopback_ipv4_val, None, None),
+                    ("loopback_ipv6", loopback_ipv6_val, None, None),
+                    ("ipv4_address",  ipv4,              _iface_val, _vlan_val),
+                    ("ipv6_address",  ipv6,              _iface_val, _vlan_val),
+                ]
+                for _field, _val, _if, _vl in _dup_checks:
+                    if not _val:
+                        continue
+                    _hit = find_conflict(
+                        _field, _val, self._existing_devices,
+                        exclude_id=self._exclude_device_id,
+                        interface=_if, vlan_id=_vl,
+                    )
+                    if _hit:
+                        _peer_id, _peer_name = _hit
+                        _label = _field.replace("_", " ")
+                        QMessageBox.warning(
+                            self,
+                            "Duplicate Address",
+                            f"{_label} '{_val}' is already in use by "
+                            f"device '{_peer_name or _peer_id}'.\n\n"
+                            f"Duplicate loopback IPs break OSPF adjacency "
+                            f"(both routers get the same router-id) and "
+                            f"duplicate interface IPs cause ARP collisions. "
+                            f"Pick a different {_label}.",
+                        )
+                        return
+            except Exception:
+                # Fail-open on validator errors — server 409 remains.
+                pass
+
         # All validations passed
         self.accept()

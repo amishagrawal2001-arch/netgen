@@ -2,6 +2,85 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.224] - 2026-08-30
+
+**Duplicate loopback / interface IP / MAC across devices is now
+rejected before it lands — the srv06 "device2 broke device1's
+OSPF" trap is closed.**
+
+Operator report on srv06 2026-08-30: added a second device via
+Add Device with OSPF+BGP v4+v6, and device1's OSPF v4/v6 both
+went from Full to Not Established. Root cause turned out to
+have nothing to do with the OSPF handler code — both devices
+had ended up with `loopback_ipv4=192.255.0.1` because the Add
+Device dialog hard-codes that value regardless of what's
+already on the server. FRR derives OSPF router-id from the
+loopback, so both routers had router-id `192.255.0.1`, saw
+each other's Hellos, mistook them for their own, and stuck
+in Init/DROther. BGP survived because TCP + peer-IP + AS is
+what identifies a BGP session — router-id is only informational
+there.
+
+Fix is three-layer, all wired through one helper:
+
+- `utils/address_collision.py` — new. `find_conflict()` and
+  `next_available_loopback_ipv4/ipv6()`. Loopbacks are globally
+  unique (must be, per OSPF router-id semantics); interface
+  IPs and MACs are scoped per `(interface, vlan_id)` L2
+  segment (ARP collision domain); gateways are deliberately
+  shared and not checked.
+
+- `run_tgen_server.py` `/api/device/apply` — new gate right
+  after the existing `(iface, vlan)` collision gate. Returns
+  HTTP 409 with `"loopback ipv4 '192.255.0.1' is already in
+  use by device 'device1'..."` when the incoming payload
+  would collide with an existing device. Fail-open on DB
+  lookup errors — same rationale as the sibling gate; a
+  collision that slips through still surfaces downstream.
+
+- `widgets/add_device_dialog.py` — the constructor gained
+  `existing_devices` (peer list) and `exclude_device_id` (skip
+  self on edit). On Add with peers, loopback IPv4/IPv6 fields
+  seed to `next_available_*()` instead of the static default,
+  so the operator gets `.2` after `.1` is used, `.3` after
+  `.2` is used, etc. `validate_and_accept` runs
+  `find_conflict` on all four checked fields before submitting
+  — a MessageBox surfaces the collision with the peer name
+  before the server round-trip. Server 409 remains the
+  authoritative backstop.
+
+Callers wired at three sites (all three places the FRR Add
+Device dialog is instantiated in the client):
+- `widgets/devices_tab.py:6228` (Add flow) — passes
+  `existing_devices` via a new helper
+  `_collect_existing_devices_for_collision()` that translates
+  `main_window.all_devices` from display-key format
+  (`"Loopback IPv4"`) to the DB-key format the helper expects
+  (`loopback_ipv4`).
+- `widgets/devices_tab.py:7196` (Edit flow) — same helper +
+  `exclude_device_id=self` so the value being edited doesn't
+  self-collide.
+- `widgets/unified_add_device_dialog.py` — constructor accepts
+  `existing_devices` and forwards to the inner FRR dialog.
+
+Tests: `tests/test_v05224_address_collision.py` — 22 tests.
+`next_available_*()` (empty list, max-plus-one, .0/.255 skip,
+malformed peer, srv06 repro); `find_conflict` on loopbacks
+(hit, miss, whitespace-tolerant, exclude-self, empty peer);
+`find_conflict` on L2-scoped fields (same L2 hits, different
+VLAN misses, different iface misses, iface-required guard,
+`vlan200@ens2f0np0` display-form base-name match, MAC).
+Ends with the exact srv06 two-device reproducer: pre-fill
+now suggests `.2` when `.1` is taken, and the collision
+helper flags `.1` if the operator overrides.
+
+Backward compatibility: `existing_devices` and
+`exclude_device_id` default to `None`; callers that don't
+pass them keep the pre-v0.5.224 behavior (static default,
+no client-side collision warning). Server 409 gate applies
+regardless of client version — old clients still get the
+protection.
+
 ## [0.5.223] - 2026-08-25
 
 **DHCP server state "No Pool" replaces "Failed" when no pool
