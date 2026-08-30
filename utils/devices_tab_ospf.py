@@ -660,13 +660,24 @@ class OSPFHandler:
                             graceful_restart_checkbox.stateChanged.connect(lambda state, cb=graceful_restart_checkbox: self.on_graceful_restart_checkbox_changed(cb, state))
                             self.parent.ospf_table.setCellWidget(row, 10, graceful_restart_checkbox)
                             
-                            # P2P (column 11) - Checkbox for point-to-point network type
+                            # P2P (column 11) - Checkbox for point-to-point network type.
+                            # Default True (v0.5.224): every emulated device sits on
+                            # a VLAN subinterface, and upstream routers/switches almost
+                            # always configure those subifs as OSPF point-to-point.
+                            # Broadcast-mode default sticks OSPF at Init/DROther on
+                            # such uplinks (peer discards our Hellos due to network-
+                            # type mismatch). Server default was flipped in
+                            # utils/ospf.py at the same time — this keeps the UI
+                            # visibly in sync so the operator sees the box pre-ticked.
                             p2p_checkbox = QCheckBox()
                             # Get P2P setting for this address family
                             if protocol_type == "IPv6":
-                                p2p_enabled = ospf_config.get("p2p_ipv6", False) if ospf_config else False
+                                p2p_enabled = ospf_config.get("p2p_ipv6", True) if ospf_config else True
                             else:
-                                p2p_enabled = ospf_config.get("p2p_ipv4", False) or ospf_config.get("p2p", False) if ospf_config else False
+                                p2p_enabled = (
+                                    ospf_config.get("p2p_ipv4", ospf_config.get("p2p", True))
+                                    if ospf_config else True
+                                )
                             p2p_checkbox.setChecked(p2p_enabled)
                             p2p_checkbox.setToolTip(f"Enable point-to-point network type for {protocol_type}")
                             # Store device info in checkbox for later reference

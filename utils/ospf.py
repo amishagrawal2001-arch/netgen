@@ -267,18 +267,26 @@ def configure_ospf_neighbor(
         else:
             graceful_restart_ipv6 = graceful_restart  # Fall back to generic graceful_restart
         
-        # Support separate P2P (point-to-point) network type for IPv4 and IPv6
+        # Support separate P2P (point-to-point) network type for IPv4 and IPv6.
+        # Default is True (v0.5.224) — every emulated netgen device sits on
+        # its own VLAN subinterface, and upstream routers/switches configure
+        # those subifs as OSPF point-to-point (matching how ISIS is set
+        # unconditionally in this codebase). Broadcast-mode adjacency would
+        # stick at Init/DROther against a P2P peer (peer discards our
+        # Hellos due to network-type mismatch, we never advance past Init).
+        # Callers who genuinely need broadcast can pass p2p_ipv4=False /
+        # p2p_ipv6=False (or use the P2P checkbox in the OSPF subtab).
         # For IPv4: use p2p_ipv4 if it exists, otherwise fall back to p2p
         if "p2p_ipv4" in ospf_config:
-            p2p_ipv4 = ospf_config.get("p2p_ipv4", False)
+            p2p_ipv4 = ospf_config.get("p2p_ipv4", True)
         else:
-            p2p_ipv4 = ospf_config.get("p2p", False)  # Fall back to generic p2p
-        
+            p2p_ipv4 = ospf_config.get("p2p", True)  # Fall back to generic p2p
+
         # For IPv6: use p2p_ipv6 if it exists, otherwise fall back to p2p
         if "p2p_ipv6" in ospf_config:
-            p2p_ipv6 = ospf_config.get("p2p_ipv6", False)
+            p2p_ipv6 = ospf_config.get("p2p_ipv6", True)
         else:
-            p2p_ipv6 = ospf_config.get("p2p", False)  # Fall back to generic p2p
+            p2p_ipv6 = ospf_config.get("p2p", True)  # Fall back to generic p2p
         
         # Parse IPv4/IPv6 values supplied directly in the request payload (if any)
         ipv4_payload_addr = None
