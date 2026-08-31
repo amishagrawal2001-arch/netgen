@@ -201,8 +201,20 @@ class DHCPClientMonitor:
                     or ""
                 )
                 dhcp_mode = str(mode_raw).lower()
-                if dhcp_mode in ("client", "server"):
-                    result.append(device)
+                if dhcp_mode not in ("client", "server"):
+                    continue
+                # v0.5.229 (audit U monitor-5): skip devices whose
+                # top-level status is Stopped. Pre-fix, once the
+                # 120s dhcp_manual_override timer expired,
+                # ensure_dhcp_services would be called on a device
+                # the operator deliberately stopped — the "Stop
+                # DHCP" action was not durable past 120s. Now
+                # Stopped stays stopped until the operator brings
+                # the device back up via Start / Apply.
+                _status = str(device.get("status") or "").lower()
+                if _status == "stopped":
+                    continue
+                result.append(device)
             return result
         except Exception as exc:
             logger.error("[DHCP MONITOR] Failed to fetch devices: %s", exc)
@@ -431,11 +443,38 @@ class DHCPClientMonitor:
                     "named pool, or Edit the device to set a Pool Start "
                     "/ Pool End range directly."
                 )
+            elif new_state == "Server Running":
+                # v0.5.229 (audit U monitor-2): clear the stale
+                # dhcp_last_error message when we recover. Pre-fix
+                # a previous poll's failure string ("dnsmasq: no
+                # address...", "Config write failed: ...") stuck
+                # around forever after dnsmasq came back — the
+                # tooltip lied. start_dhcp_server clears it on the
+                # happy path; the monitor now does the same.
+                update_payload["dhcp_last_error"] = ""
             self.device_db.update_device(device_id, update_payload)
             logger.info(
                 "[DHCP MONITOR] Server-mode probe for %s: %s (%s)",
                 device_id, new_state, detail,
             )
+            # v0.5.229 (audit U monitor-3): record server-mode state
+            # transitions to the history timeline. Pre-fix, only
+            # _check_clients wrote add_state_transition — Server
+            # Down → Server Running never showed up in the Ctrl+H
+            # timeline. De-dup'd by add_state_transition itself.
+            try:
+                self.device_db.add_state_transition(
+                    device_id,
+                    "dhcp",
+                    new_state,
+                    detail={"running": running, "probe_detail": detail},
+                )
+            except Exception as _hist_exc:
+                logger.debug(
+                    "[DHCP MONITOR] server-mode state-history insert "
+                    "skipped for %s: %s",
+                    device_id, _hist_exc,
+                )
         except Exception as exc:
             logger.error(
                 "[DHCP MONITOR] Failed to write server-mode DHCP state for %s: %s",
@@ -567,6 +606,26 @@ class DHCPClientMonitor:
 
                     if snapshot.get("dhcp_state") == "Leased" and snapshot.get("dhcp_running"):
                         self._note_leased(device_id)
+                        continue
+
+                    # v0.5.229 (audit B1): don't tear down a dhclient
+                    # that's legitimately in DHCP DORA (Requesting /
+                    # Renewing) — the previous unconditional
+                    # `needs_restart = True` restarted every poll if
+                    # the state wasn't "Leased", so a DHCP DORA that
+                    # took > 60 s (relay networks, slow servers)
+                    # never converged. If dhclient IS running and
+                    # its state indicates it's mid-handshake, let it
+                    # finish on its own; only intervene when it's
+                    # truly stopped or has fallen off the container.
+                    _state = snapshot.get("dhcp_state") or ""
+                    _running = bool(snapshot.get("dhcp_running"))
+                    _mid_handshake = _state in ("Requesting", "Renewing", "Rebinding")
+                    if _running and _mid_handshake:
+                        logger.debug(
+                            "[DHCP MONITOR] Skipping restart for %s: dhclient is running and in %s (DORA in flight)",
+                            device_id, _state,
+                        )
                         continue
 
                     needs_restart = True

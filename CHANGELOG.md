@@ -2,6 +2,133 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.229] - 2026-08-30
+
+**DHCP audit bundle — 15 of 35 findings fixed (5 blockers +
+10 user-visible).** Remaining 20 (mostly UX rescue paths +
+paper-cuts) tracked for v0.5.230.
+
+The audit was surveyed by three parallel Explore agents covering
+server-side (utils/dhcp.py + run_tgen_server.py DHCP endpoints),
+client-UI (widgets/add_device_dialog.py + utils/devices_tab_dhcp.py),
+and monitor+persistence (utils/dhcp_monitor.py + utils/device_
+database.py). This ship closes the 5 blockers and the 10 highest-
+impact user-visible ones.
+
+**Blockers (all 5 fixed):**
+- B1 `dhcp_monitor.py`: dhclient in Requesting / Renewing /
+  Rebinding is legitimately mid-handshake — pre-fix
+  `needs_restart = True` was unconditional so a slow DHCP relay
+  taking > 60 s never converged (client got torn down each poll).
+- B2 `dhcp.py`: v4 dhclient release used pidfile `dhclient-{iface}.
+  pid` while start writes `dhclient-{iface}-ipv4.pid`. `dhclient
+  -4 -r` silently failed → server-side lease DB stayed leased
+  until expiry → collision on any Start against a fresh device.
+- B3 `add_device_dialog.py`: IPv4 pool + gateway_route + lease_
+  time had zero validation (IPv6 side had all three). Save
+  accepted `pool_start > pool_end`, `pool_start="abc"`, malformed
+  CIDR; dnsmasq refused later with opaque State=Failed.
+- B4 `devices_tab.py _merge_dhcp_configs`: `gateway_route` and
+  `pool_names.additional` UNIONED — operator could add but never
+  remove. Cleanup workflow was broken. Now REPLACES.
+- B5 `add_device_dialog.py`: cleared scalar fields
+  (pool_start, lease_time, ipv6_prefix, etc.) silently
+  ignored — dialog didn't emit empty keys and merge fell
+  back to stored. Dialog now emits every scalar; merge
+  overwrites even with empty (explicit clear).
+
+**User-visible (10 fixed):**
+- Server-2: `stop_dhcp_server` NameError when DB lookup raises
+  → the entire stop path aborted before route/anchor cleanup.
+  Pre-init `device` and `dhcp_cfg` before the try.
+- Server-3: `ra-param={iface},0,0` set RA router lifetime = 0,
+  which per RFC 4861 means "NOT a default router" — every
+  IPv6 client refused to install a default route via the DHCP
+  box no matter what `ipv6_gateway` said. Now only emitted
+  when the operator opts in with `ipv6_gateway="none"`.
+- Server-4: additional-pool `lease_time` and `gateway`
+  silently ignored — clients in extra-pool subnets got the
+  PRIMARY pool's default gateway, i.e., the wrong router.
+  Now emitted per-pool via `set:tag` scoped `dhcp-option`.
+- Server-5: Apply with empty `dhcp_config` resurrected the
+  stored config from DB as long as "DHCP" was still in
+  `protocols`. Partial-payload re-applies from stale UIs
+  silently re-enabled DHCP. Now only falls back when the
+  operator explicitly still wants DHCP.
+- Server-6: `ensure_dhcp_services` on a mode flip
+  (server → client) never stopped the previous mode's
+  daemons — both dnsmasq and dhclient ended up bound to
+  the same interface. Now stops the other side first.
+- Server-7: `/api/device/dhcp/server/pool` accepted opaque
+  strings for `pool_start`/`pool_end`/`gateway`/
+  `gateway_route`. Failures surfaced later as obscure
+  dnsmasq stderr. Now validates and returns HTTP 400 with
+  the actual problem.
+- Server-8: elif-clear branch scrubbed the DB row to
+  Disabled but never called `stop_dhcp_services` — dnsmasq
+  kept handing out leases while the UI showed "Disabled".
+  Now stops the daemons too, and clears `dhcp_last_error`.
+- Monitor-2: `dhcp_last_error` never cleared on the
+  Server Down → Server Running transition — stale error
+  string stuck in the tooltip forever. Now cleared on
+  recovery.
+- Monitor-3: server-mode state transitions never recorded
+  to `device_state_history` (Ctrl+H timeline). Only client
+  side wrote. Now both sides write with de-dup.
+- Monitor-4: `"Server Running"` wasn't in
+  `topology_tab.UP_STATES` — healthy DHCP-server chip
+  rendered red on the Topology canvas. Added.
+- Monitor-5: monitor probed and restarted
+  `status="Stopped"` devices — "Stop DHCP" was not
+  durable past the 120s dhcp_manual_override TTL. Now
+  Stopped devices are skipped entirely.
+- Monitor-9: fresh-DB CREATE TABLE was missing
+  `dhcp_lease_subnet`, `dhcp_manual_override`,
+  `dhcp_manual_override_time`, `dhcp_last_error`. Present
+  only via later migration — if the migration aborted
+  (see v0.5.220 footgun history), fresh installs landed
+  with schema drift and silent write failures on those
+  columns. Now in CREATE TABLE for fresh installs;
+  migration ADD-COLUMN block is a no-op when they're
+  already there.
+- Client-6: disabling DHCP via Edit popped only
+  `dhcp_mode` from cached device_info — stale
+  `dhcp_lease_ip`/`_gateway`/`dhcp_state`/`dhcp_last_error`/
+  `pool_names` reappeared in the DHCP subtab until refresh.
+  Now scrubs everything the server-side scrub scrubs.
+- Client-13: Lease IP / Gateway columns rendered the
+  same DHCP-client-mode `dhcp_lease_*` fields regardless
+  of the device's mode — server-mode rows showed blank
+  or stale client-side data. Now server rows show the
+  device's interface IPv4 (what dnsmasq is bound to) +
+  the served gateway (`dhcp_config.gateway`); client
+  rows unchanged.
+
+**Deferred to v0.5.230 (17 findings):**
+
+- U client-5 (`_on_dhcp_mode_changed` ignores IPv4 sub-checkbox)
+- U client-7 (named pools IPv4-only)
+- U client-8 (`DHCPPoolDialog.gateway_edit` never validated)
+- U client-9 (subtab shows only IPv4 `default_pool`)
+- U client-10 (Attach dialog Gateway Override can't be cleared)
+- U client-11 (no rescue path — no "Restart dnsmasq" / "Release
+  lease" buttons)
+- U monitor-6 (three "off" strings — Stopped / No Lease /
+  Requesting — need normalization)
+- P server-9/10/11/12 (/31 /32 pool None, IPv6 auto-derive,
+  fe80 mask, re-entrancy guard)
+- P monitor-7/8/10/11 (backoff cap, dict pruning, post-restart
+  lease detection, transition-after-restart)
+- P client-12 (`refresh_dhcp_status` swallows fetch errors)
+
+Tests: `tests/test_v05229_dhcp_audit_bundle.py` — 20 pass,
+pins the shape of each fix in code so a future refactor
+that regresses one gets caught by CI. Two v0.5.219 /
+v0.5.220 seed-shape sanity tests updated (`dhcp_manual_
+override` is now in CREATE TABLE by design, no longer
+"should be added by migration"). Broader DHCP sweep:
+154 pass.
+
 ## [0.5.228] - 2026-08-30
 
 **DHCP subtab toolbar gets visible text labels — "Attach Pool"

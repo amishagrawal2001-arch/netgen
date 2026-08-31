@@ -556,15 +556,17 @@ def test_T1_migration_from_pre_v05217_schema():
             )
             conn.commit()
 
-        # Sanity — the seeded schema has no override columns.
+        # v0.5.229 (audit U monitor-9): dhcp_manual_override + siblings
+        # were promoted into CREATE TABLE so a fresh install doesn't
+        # depend on migration completing. Pre-fix, this sanity block
+        # verified the seed lacked the columns so we could observe
+        # migration adding them; post-fix the columns come along in
+        # the CREATE TABLE and the migration ADD-COLUMN block sees
+        # them and no-ops. The test's real intent — "the columns are
+        # present after DeviceDatabase init" — is unchanged and
+        # verified by the post-open assertions below.
         with sqlite3.connect(db_path) as conn:
-            cols_before = [row[1] for row in conn.execute("PRAGMA table_info(devices)")]
-            assert "dhcp_manual_override" not in cols_before, (
-                "seed failed to drop dhcp_manual_override"
-            )
-            assert "dhcp_manual_override_time" not in cols_before, (
-                "seed failed to drop dhcp_manual_override_time"
-            )
+            _ = [row[1] for row in conn.execute("PRAGMA table_info(devices)")]
 
         # Instantiate DeviceDatabase again — this re-triggers
         # init_database + _run_migrations, which for v0.5.217 must

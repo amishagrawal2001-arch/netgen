@@ -7532,7 +7532,30 @@ class DevicesTab(QWidget):
             _set_protocol("IS-IS", isis_config, "isis_config")
 
             def _dhcp_extra_cleanup():
-                device_info.pop("dhcp_mode", None)
+                # v0.5.229 (audit U client-6): pre-fix, disabling DHCP
+                # via Edit popped only dhcp_mode from the cached
+                # device_info — the stale dhcp_lease_ip / _gateway /
+                # dhcp_state / dhcp_last_error / pool_names lingered
+                # on the in-memory copy and reappeared in the DHCP
+                # subtab until a full refresh. Match the server-side
+                # scrub (run_tgen_server.py elif-clear branch, v0.5.218
+                # audit fix N) so both sides read the same disabled
+                # state without waiting for a poll.
+                for _k in (
+                    "dhcp_mode",
+                    "dhcp_state",
+                    "dhcp_running",
+                    "dhcp_last_error",
+                    "dhcp_lease_ip",
+                    "dhcp_lease_mask",
+                    "dhcp_lease_gateway",
+                    "dhcp_lease_server",
+                    "dhcp_lease_expires",
+                    "dhcp_lease_subnet",
+                    "pool_names",
+                    "default_pool",
+                ):
+                    device_info.pop(_k, None)
             if dhcp_config:
                 # v0.5.217 (audit fix A): merge the dialog's returned
                 # dhcp_config on top of the existing config rather than
@@ -7993,7 +8016,26 @@ class DevicesTab(QWidget):
         return merged
 
     def _merge_dhcp_configs(self, db_config: dict, existing_config: dict) -> dict:
-        """Merge DHCP configs while preserving server-provided arrays."""
+        """Merge DHCP configs while preserving server-provided arrays.
+
+        v0.5.229 (audit B4 + B5): the Edit dialog's ``existing_config``
+        is now treated as AUTHORITATIVE for keys it explicitly emits.
+        Pre-fix, unset scalars (cleared pool_start, blank lease_time)
+        silently fell back to the stored value, and gateway_route /
+        pool_names.additional UNIONED — the operator could add but
+        never remove. Now:
+
+        - Scalars in ``existing_config`` REPLACE the stored value,
+          including empty-string / None → clear the field.
+        - ``gateway_route`` and ``pool_names`` REPLACE when present
+          (dialog owns them; server never adds items behind the
+          operator's back). If the operator clears the field,
+          the stored list is cleared too.
+        - ``additional_pools`` continues to UNION — the server
+          builds these as a side effect of Attach Pools, so the
+          Edit dialog must not blow them away just because it
+          doesn't display them.
+        """
         if not db_config and not existing_config:
             return {}
         if not db_config:
@@ -8009,6 +8051,10 @@ class DevicesTab(QWidget):
                     merged.get("additional_pools"), value
                 )
             elif key == "pool_names":
+                # v0.5.229 (audit B4): dialog value REPLACES stored value.
+                # If the operator cleared the primary pool AND additional
+                # list, the merged pool_names is empty {} — the correct
+                # "detached" state, not "keep the old attachment forever".
                 existing_pool_names = value
                 if isinstance(existing_pool_names, str):
                     try:
@@ -8017,52 +8063,55 @@ class DevicesTab(QWidget):
                         existing_pool_names = {}
                 if not isinstance(existing_pool_names, dict):
                     existing_pool_names = {}
-
-                merged_pool_names = merged.get("pool_names", {})
-                if isinstance(merged_pool_names, str):
-                    try:
-                        merged_pool_names = json.loads(merged_pool_names)
-                    except Exception:
-                        merged_pool_names = {}
-                if not isinstance(merged_pool_names, dict):
-                    merged_pool_names = {}
-
-                primary = existing_pool_names.get("primary") or merged_pool_names.get("primary")
-                additional_merged = []
-                seen_additional = set()
-
-                for source in (
-                    merged_pool_names.get("additional"),
-                    existing_pool_names.get("additional"),
-                ):
-                    if not source:
-                        continue
-                    if isinstance(source, str):
-                        source_iter = [source]
-                    elif isinstance(source, (list, tuple, set)):
-                        source_iter = source
-                    else:
-                        source_iter = [str(source)]
-                    for name in source_iter:
-                        name_str = str(name).strip()
-                        if (
-                            name_str
-                            and name_str != primary
-                            and name_str not in seen_additional
-                        ):
-                            seen_additional.add(name_str)
-                            additional_merged.append(name_str)
-
-                merged_pool_names = {
-                    "primary": primary,
-                    "additional": additional_merged,
+                additional = existing_pool_names.get("additional") or []
+                if not isinstance(additional, (list, tuple, set)):
+                    additional = [additional]
+                # De-dup & drop the primary from additional if it snuck in.
+                primary = existing_pool_names.get("primary") or ""
+                seen_add = set()
+                clean_additional = []
+                for name in additional:
+                    n = str(name).strip()
+                    if n and n != primary and n not in seen_add:
+                        seen_add.add(n)
+                        clean_additional.append(n)
+                merged["pool_names"] = {
+                    "primary": primary or None,
+                    "additional": clean_additional,
                 }
-                merged["pool_names"] = merged_pool_names
             elif key == "gateway_route":
-                merged["gateway_route"] = self._merge_gateway_routes(
-                    merged.get("gateway_route"), value
-                )
+                # v0.5.229 (audit B4): dialog value REPLACES. Operator
+                # can remove routes by editing them out of the field;
+                # pre-fix _merge_gateway_routes UNIONED so removal was
+                # impossible.
+                if isinstance(value, str):
+                    if not value.strip():
+                        routes = []
+                    else:
+                        routes = [
+                            r.strip() for r in value.replace(";", ",").split(",")
+                            if r.strip()
+                        ]
+                elif isinstance(value, (list, tuple, set)):
+                    seen = set()
+                    routes = []
+                    for r in value:
+                        rs = str(r).strip()
+                        if rs and rs not in seen:
+                            seen.add(rs)
+                            routes.append(rs)
+                else:
+                    routes = []
+                merged["gateway_route"] = routes
             else:
+                # v0.5.229 (audit B5): scalar keys the dialog explicitly
+                # emitted REPLACE the stored value — including empty
+                # string. Pre-fix, blank pool_start/lease_time/etc.
+                # from the dialog silently fell back to the stored
+                # value because the dialog omitted the key entirely
+                # when the field was empty. Once the dialog emits the
+                # key (even as ""), THIS overwrite is what makes
+                # clear-and-Save actually clear.
                 merged[key] = value
 
         return merged

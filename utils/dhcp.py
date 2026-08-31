@@ -1593,12 +1593,23 @@ def stop_dhcp_client(device_db, device_id: str, interface: str, container=None) 
     """
     # v0.5.221: normalize display form vlan200@ens2f0np0 → vlan200.
     interface = _normalize_iface_name(interface)
-    # v4 release (unchanged, keeps the pre-fix pidfile shape).
-    pidfile = os.path.join(DHCLIENT_PID_DIR, f"dhclient-{interface}.pid")
-    try:
-        _run_command(["dhclient", "-4", "-r", "-pf", pidfile, interface], timeout=5, container=container)
-    except Exception as exc:
-        logger.debug("[DHCP] dhclient release error: %s", exc)
+    # v0.5.229 (audit B2): pidfile shape mismatch. start_dhcp_client
+    # writes `dhclient-{iface}-ipv4.pid` (line 1399); the release
+    # here previously read `dhclient-{iface}.pid` (no suffix), so
+    # `dhclient -4 -r` couldn't find the running client and
+    # silently failed to release the lease. The subsequent
+    # _flush_ipv4 yanked the address unilaterally, leaving the
+    # server-side lease DB "leased" until natural expiry — a
+    # subsequent Start on ANY host would collide until then.
+    # Also try the pre-fix path as a fallback for lingering
+    # dhclients started before this fix landed.
+    pidfile_v4_suffixed = os.path.join(DHCLIENT_PID_DIR, f"dhclient-{interface}-ipv4.pid")
+    pidfile_v4_legacy   = os.path.join(DHCLIENT_PID_DIR, f"dhclient-{interface}.pid")
+    for _pf in (pidfile_v4_suffixed, pidfile_v4_legacy):
+        try:
+            _run_command(["dhclient", "-4", "-r", "-pf", _pf, interface], timeout=5, container=container)
+        except Exception as exc:
+            logger.debug("[DHCP] dhclient -4 release error (pf=%s): %s", _pf, exc)
 
     # v0.5.218: v6 dhclient release — mirrors the pidfile shape
     # start_dhcp_client uses on the dhclient -6 fallback path.
@@ -1841,11 +1852,27 @@ def start_dhcp_server(
     if ipv4_enabled:
         if pool_start and pool_end:
             config_lines.append(f"dhcp-range={pool_start},{pool_end},{lease_seconds}s")
+        # v0.5.229 (audit U server-4): honor per-pool lease_time and
+        # gateway on additional pools. Pre-fix, both were normalized
+        # into the pool dict at line 242-244 and then thrown away
+        # here — clients in additional-pool subnets ended up with
+        # the primary pool's lease and default gateway, which for a
+        # different /24 is the wrong router.
         for pool in additional_pools:
             extra_start = pool.get("pool_start")
             extra_end = pool.get("pool_end")
             if extra_start and extra_end:
-                config_lines.append(f"dhcp-range={extra_start},{extra_end},{lease_seconds}s")
+                extra_lease = pool.get("lease_time") or lease_seconds
+                config_lines.append(f"dhcp-range={extra_start},{extra_end},{extra_lease}s")
+                extra_gw = pool.get("gateway")
+                if extra_gw:
+                    # dnsmasq lets you tag options to a specific range
+                    # via a set:tag. Use the pool's numeric endpoint as
+                    # the tag suffix so each additional pool gets its
+                    # own scoped default gateway advertisement.
+                    _tag = f"pool_{extra_start.replace('.', '_')}"
+                    config_lines.append(f"dhcp-range=set:{_tag},{extra_start},{extra_end},{extra_lease}s")
+                    config_lines.append(f"dhcp-option=tag:{_tag},3,{extra_gw}")
         if gateway:
             config_lines.append("dhcp-option=3," + gateway)
 
@@ -1856,7 +1883,24 @@ def start_dhcp_server(
         config_lines.append(
             f"dhcp-range={ipv6_pool_start},{ipv6_pool_end},{ipv6_prefix},{ipv6_lease_seconds}s"
         )
-        config_lines.append(f"ra-param={interface},0,0")
+        # v0.5.229 (audit U server-3): the second field of ra-param is
+        # the RA router lifetime in seconds; RFC 4861 says 0 means
+        # "NOT a default router". Pre-fix, every RA told clients not
+        # to install a default route via this box regardless of what
+        # the operator put in ipv6_gateway. Emit `enable-ra` alone
+        # (dnsmasq defaults to 1800s lifetime when ra-param is
+        # omitted) unless the operator explicitly opted out via
+        # ipv6_gateway="none".
+        _v6_gw = (ipv6_gateway or "").strip().lower()
+        if _v6_gw == "none":
+            # Explicit "do not advertise self as router" — keep the
+            # legacy lifetime=0 form so the operator can still get
+            # this behavior if they need it.
+            config_lines.append(f"ra-param={interface},0,0")
+        # else: leave enable-ra with the default 1800s lifetime; the
+        # kernel will advertise the interface's link-local as the
+        # default router, which is what clients need to install a
+        # default route.
         if ipv6_routes_raw:
             if isinstance(ipv6_routes_raw, str):
                 ipv6_gateway_routes = [
@@ -2169,6 +2213,15 @@ def stop_dhcp_server(device_db, device_id: str, interface: str, container=None) 
     ipv6_server_ip = ""
     ipv6_prefix = ""
     ipv6_subnets = []
+    # v0.5.229 (audit U server-2): pre-initialize `device` / `dhcp_cfg`
+    # so the downstream `interface_from_cfg = ...if device else...`
+    # at ~line 2324 doesn't NameError when the DB lookup raises
+    # (transient sqlite lock, corrupt row) — pre-fix that inverse
+    # crash aborted the entire stop path before removing routes or
+    # the IPv6 anchor, the exact leak audit fix D was supposed to
+    # close.
+    device = None
+    dhcp_cfg: Dict = {}
     try:
         device = device_db.get_device(device_id) if device_db else None
         if device:
@@ -2444,12 +2497,49 @@ def ensure_dhcp_services(
     if not dhcp_config:
         return {"success": False, "error": "No DHCP configuration provided"}
     mode = (dhcp_config.get("mode") or "").lower()
-    
+
+    # v0.5.229 (audit U server-6): stop the OTHER mode's daemons
+    # before starting this mode. Pre-fix, flipping server→client
+    # called start_dhcp_client but never stopped the still-running
+    # dnsmasq from the previous server mode, so both daemons ended
+    # up bound to the same interface and clients could get leases
+    # from either. Query the stored mode; if it differs from the
+    # incoming request, stop the other side first.
+    try:
+        _prev = device_db.get_device(device_id) if device_db else None
+        _prev_mode = (
+            (_prev or {}).get("dhcp_mode")
+            or ((_prev or {}).get("dhcp_config") or {}).get("mode")
+            or ""
+        )
+        _prev_mode = str(_prev_mode).lower()
+        if _prev_mode and _prev_mode != mode:
+            logger.info(
+                "[DHCP] Mode transition on %s: %s → %s. Stopping the previous mode's daemons.",
+                device_id, _prev_mode, mode,
+            )
+            try:
+                if _prev_mode == "server":
+                    stop_dhcp_server(device_db, device_id, interface,
+                                     container=_ensure_dhcp_container(device_id, mode="server"))
+                elif _prev_mode == "client":
+                    stop_dhcp_client(device_db, device_id, interface,
+                                     container=_ensure_dhcp_container(device_id, mode="client"),
+                                     dhcp_config=_prev.get("dhcp_config") if _prev else None)
+            except Exception as _trans_exc:
+                logger.warning(
+                    "[DHCP] Mode-transition stop for %s (%s → %s) raised: %s "
+                    "(continuing with the new-mode start regardless).",
+                    device_id, _prev_mode, mode, _trans_exc,
+                )
+    except Exception as _prev_exc:
+        logger.debug("[DHCP] Mode-transition gate: prev-mode lookup failed: %s", _prev_exc)
+
     # For server mode, always create a separate DHCP container (don't use passed container)
     # This allows DHCP server devices to have both FRR and DHCP containers
     # For client mode, use passed container if available, otherwise create one
     managed_container = container
-    
+
     # Server mode: always create separate DHCP container (ignore passed container)
     if mode == "server":
         logger.info(f"[DHCP] Server mode detected for device {device_id}, creating separate DHCP container")

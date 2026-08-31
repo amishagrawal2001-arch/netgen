@@ -1880,6 +1880,12 @@ class AddDeviceDialog(QDialog):
                 ipv4_enabled = dhcp_config["ipv4_enabled"]
                 ipv6_enabled = dhcp_config["ipv6_enabled"]
 
+                # v0.5.229 (audit B5): emit ALL scalar keys the dialog
+                # owns even when empty. Pre-fix, blank fields didn't
+                # reach the merge, so "cleared field" silently fell
+                # back to the stored value. Now empty → explicit clear
+                # (widgets/devices_tab._merge_dhcp_configs writes the
+                # empty value through).
                 if ipv4_enabled:
                     pool_start = self.dhcp_pool_start_input.text().strip()
                     pool_end = self.dhcp_pool_end_input.text().strip()
@@ -1887,18 +1893,14 @@ class AddDeviceDialog(QDialog):
                     gateway_value = ipv4_gateway or ""
                     gateway_route_value = self.dhcp_gateway_route_input.text().strip()
 
-                    if pool_start:
-                        dhcp_config["pool_start"] = pool_start
-                    if pool_end:
-                        dhcp_config["pool_end"] = pool_end
-                    if pool_start and pool_end:
-                        dhcp_config["pool_range"] = f"{pool_start}-{pool_end}"
-                    if lease_time:
-                        dhcp_config["lease_time"] = lease_time
-                    if gateway_value:
-                        dhcp_config["gateway"] = gateway_value
-                    if gateway_route_value:
-                        dhcp_config["gateway_route"] = gateway_route_value
+                    dhcp_config["pool_start"] = pool_start
+                    dhcp_config["pool_end"] = pool_end
+                    dhcp_config["pool_range"] = (
+                        f"{pool_start}-{pool_end}" if pool_start and pool_end else ""
+                    )
+                    dhcp_config["lease_time"] = lease_time
+                    dhcp_config["gateway"] = gateway_value
+                    dhcp_config["gateway_route"] = gateway_route_value
 
                 if ipv6_enabled:
                     pool6_start = self.dhcp6_pool_start_input.text().strip()
@@ -1909,28 +1911,25 @@ class AddDeviceDialog(QDialog):
                     gateway6 = self.dhcp6_gateway_input.text().strip()
                     routes6_text = self.dhcp6_gateway_route_input.text().strip()
 
-                    if pool6_start:
-                        dhcp_config["ipv6_pool_start"] = pool6_start
-                    if pool6_end:
-                        dhcp_config["ipv6_pool_end"] = pool6_end
-                    if prefix6:
-                        dhcp_config["ipv6_prefix"] = prefix6
-                    if pool6_start and pool6_end:
-                        dhcp_config["ipv6_pool_range"] = f"{pool6_start}-{pool6_end}"
-                    if lease6:
-                        dhcp_config["ipv6_lease_time"] = lease6
-                    if server6:
-                        dhcp_config["ipv6_server_ip"] = server6
-                    if gateway6:
-                        dhcp_config["ipv6_gateway"] = gateway6
+                    dhcp_config["ipv6_pool_start"] = pool6_start
+                    dhcp_config["ipv6_pool_end"] = pool6_end
+                    dhcp_config["ipv6_prefix"] = prefix6
+                    dhcp_config["ipv6_pool_range"] = (
+                        f"{pool6_start}-{pool6_end}" if pool6_start and pool6_end else ""
+                    )
+                    dhcp_config["ipv6_lease_time"] = lease6
+                    dhcp_config["ipv6_server_ip"] = server6
+                    dhcp_config["ipv6_gateway"] = gateway6
                     if routes6_text:
                         routes_tokens = [
                             token.strip()
                             for token in routes6_text.replace(";", ",").split(",")
                             if token.strip()
                         ]
-                        if routes_tokens:
-                            dhcp_config["ipv6_gateway_route"] = routes_tokens
+                        dhcp_config["ipv6_gateway_route"] = routes_tokens
+                    else:
+                        # explicit clear
+                        dhcp_config["ipv6_gateway_route"] = []
             else:
                 # Allow hostname hint for dhclient; fall back to device name
                 hostname = self.device_name_input.text().strip()
@@ -2400,6 +2399,65 @@ class AddDeviceDialog(QDialog):
             except ValueError:
                 QMessageBox.warning(self, "Validation Error", "VXLAN UDP port must be between 1 and 65535.")
                 return
+
+        # v0.5.229 (audit B3): IPv4 pool + gateway-route validation
+        # (parity with the IPv6 block below — pre-fix IPv6 had all
+        # three checks, IPv4 had zero). Rejects pool_start="abc",
+        # pool_start > pool_end, and malformed gateway_route CIDR
+        # so dnsmasq doesn't crash opaquely later with device stuck
+        # in State=Failed.
+        if (
+            self.dhcp_enable_checkbox.isChecked()
+            and self.dhcp_mode_combo.currentText().strip().lower() == "server"
+            and self.dhcp_ipv4_enabled_checkbox.isChecked()
+        ):
+            v4_pool_start = self.dhcp_pool_start_input.text().strip()
+            v4_pool_end = self.dhcp_pool_end_input.text().strip()
+            v4_gw_route = self.dhcp_gateway_route_input.text().strip()
+            v4_lease = self.dhcp_lease_time_input.text().strip()
+            if v4_pool_start and v4_pool_end:
+                try:
+                    _s = ipaddress.IPv4Address(v4_pool_start)
+                    _e = ipaddress.IPv4Address(v4_pool_end)
+                    if int(_s) > int(_e):
+                        QMessageBox.warning(
+                            self, "Validation Error",
+                            f"DHCP IPv4 Pool Start ({v4_pool_start}) must be ≤ "
+                            f"Pool End ({v4_pool_end}). dnsmasq refuses to launch "
+                            "with an inverted range.",
+                        )
+                        return
+                except ipaddress.AddressValueError:
+                    QMessageBox.warning(
+                        self, "Validation Error",
+                        f"Invalid DHCP IPv4 pool address "
+                        f"(start='{v4_pool_start}', end='{v4_pool_end}').",
+                    )
+                    return
+            if v4_gw_route:
+                try:
+                    ipaddress.ip_network(v4_gw_route, strict=False)
+                except ValueError as exc:
+                    QMessageBox.warning(
+                        self, "Validation Error",
+                        f"DHCP IPv4 Gateway Route '{v4_gw_route}' is not a "
+                        f"valid CIDR: {exc}",
+                    )
+                    return
+            if v4_lease:
+                # v0.5.229 (audit U client-2): reject non-int / non-
+                # positive lease times before dnsmasq gets them.
+                try:
+                    _lt = int(v4_lease)
+                    if _lt < 60 or _lt > 4294967295:
+                        raise ValueError("out of range")
+                except ValueError:
+                    QMessageBox.warning(
+                        self, "Validation Error",
+                        f"DHCP IPv4 Lease Time '{v4_lease}' must be a "
+                        "positive integer between 60 and 4294967295 seconds.",
+                    )
+                    return
 
         if (
             self.dhcp_enable_checkbox.isChecked()

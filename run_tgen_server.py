@@ -5474,6 +5474,7 @@ def apply_device():
                         update_data["dhcp_mode"] = ""
                         update_data["dhcp_state"] = "Disabled"
                         update_data["dhcp_running"] = False
+                        update_data["dhcp_last_error"] = ""
                         update_data["dhcp_lease_ip"] = ""
                         update_data["dhcp_lease_mask"] = ""
                         update_data["dhcp_lease_gateway"] = ""
@@ -5481,6 +5482,40 @@ def apply_device():
                         update_data["dhcp_lease_expires"] = None
                         update_data["dhcp_lease_subnet"] = ""
                         update_data["last_dhcp_check"] = datetime.now(timezone.utc).isoformat()
+                        # v0.5.229 (audit U server-8): actually STOP
+                        # the daemons. Pre-fix, this branch scrubbed
+                        # the DB row to look Disabled but never called
+                        # stop_dhcp_services — dnsmasq/dhclient kept
+                        # running in the container and clients kept
+                        # getting leases while the UI showed
+                        # "Disabled". Do it as best-effort; the row is
+                        # already scrubbed regardless.
+                        try:
+                            from utils import dhcp as _dhcp
+                            _prev_mode = str(existing_device.get("dhcp_mode") or "").lower()
+                            _prev_cfg = existing_device.get("dhcp_config") or {}
+                            if isinstance(_prev_cfg, str):
+                                try:
+                                    _prev_cfg = json.loads(_prev_cfg)
+                                except Exception:
+                                    _prev_cfg = {}
+                            if _prev_mode == "server":
+                                _dhcp.stop_dhcp_server(
+                                    device_db, device_id, interface_normalized,
+                                    container=_dhcp._ensure_dhcp_container(device_id, mode="server"),
+                                )
+                            elif _prev_mode == "client":
+                                _dhcp.stop_dhcp_client(
+                                    device_db, device_id, interface_normalized,
+                                    container=_dhcp._ensure_dhcp_container(device_id, mode="client"),
+                                    dhcp_config=_prev_cfg,
+                                )
+                        except Exception as _dhcp_stop_exc:
+                            logging.warning(
+                                f"[DEVICE APPLY] Disable-DHCP: stop daemons for "
+                                f"{device_id} raised: {_dhcp_stop_exc} "
+                                f"(DB row is still scrubbed to Disabled)"
+                            )
                     
                     # Always update VXLAN fields if VXLAN protocol is present or config provided
                     if ("VXLAN" in protocols) or vxlan_config or existing_device.get("vxlan_config"):
@@ -5526,10 +5561,23 @@ def apply_device():
         elif isinstance(dhcp_config, dict):
             if len(dhcp_config) == 0 or not dhcp_config.get("mode"):
                 dhcp_config_empty = True
-        
+
         logging.info(f"[DHCP APPLY] Initial check for device {device_id}: dhcp_config={dhcp_config}, empty={dhcp_config_empty}")
-        
-        if dhcp_config_empty:
+
+        # v0.5.229 (audit U server-5): only fall back to the stored
+        # DHCP config when the operator explicitly asked to keep DHCP
+        # in this Apply — i.e., "DHCP" is still in `protocols`. Pre-
+        # fix, an Apply with an empty dhcp_config resurrected the
+        # previous mode/pool from the DB and re-launched dnsmasq /
+        # dhclient even when the operator had cleared the intent
+        # (e.g., a partial re-apply from a stale UI where protocols
+        # still listed DHCP but the config was blanked). The
+        # elif-clear branch at 5465 handles the "DHCP fully
+        # removed" case; here we gate on `dhcp_still_wanted` so an
+        # empty payload with DHCP still in protocols means "leave
+        # what's on disk" rather than "resurrect from stored".
+        _dhcp_still_wanted = "DHCP" in (protocols or [])
+        if dhcp_config_empty and _dhcp_still_wanted:
             try:
                 existing_device = device_db.get_device(device_id) if device_id else None
                 if existing_device:
@@ -6844,6 +6892,15 @@ def get_dhcp_status():
                 "last_error": device.get("dhcp_last_error") or "",
                 "pool_names": pool_names,
                 "default_pool": default_pool,
+                # v0.5.229 (audit U client-13): expose enough of
+                # dhcp_config for the client to render the correct
+                # per-mode data in the Lease IP / Gateway columns —
+                # server rows now show the SERVED gateway
+                # (dhcp_config.gateway) and the DEVICE's own
+                # interface IP (ipv4_address) instead of the always-
+                # blank client-mode lease fields.
+                "dhcp_config": dhcp_cfg,
+                "server_interface_ip": device.get("ipv4_address") or "",
             })
         return jsonify({"devices": rows}), 200
     except Exception as e:
@@ -6885,6 +6942,34 @@ def update_dhcp_server_pool():
 
     if not device_id or not pool_start or not pool_end:
         return jsonify({"error": "device_id, pool_start, and pool_end are required"}), 400
+
+    # v0.5.229 (audit U server-7): validate pool_start / pool_end
+    # server-side. Pre-fix, opaque strings passed through and the
+    # failure only surfaced as an obscure dnsmasq launch stderr
+    # later. Reject explicitly with a helpful 400 so the client
+    # (and any curl-from-a-CI-job caller) sees the actual problem.
+    import ipaddress as _ipaddr
+    try:
+        _start_addr = _ipaddr.IPv4Address(pool_start)
+        _end_addr = _ipaddr.IPv4Address(pool_end)
+    except _ipaddr.AddressValueError as exc:
+        return jsonify({"error": f"Invalid IPv4 pool address: {exc}"}), 400
+    if int(_start_addr) > int(_end_addr):
+        return jsonify({
+            "error": f"pool_start ({pool_start}) must be ≤ pool_end ({pool_end})"
+        }), 400
+    if gateway_override:
+        try:
+            _ipaddr.IPv4Address(gateway_override)
+        except _ipaddr.AddressValueError as exc:
+            return jsonify({"error": f"Invalid gateway address: {exc}"}), 400
+    for _route in gateway_routes_to_add:
+        try:
+            _ipaddr.ip_network(_route, strict=False)
+        except ValueError as exc:
+            return jsonify({
+                "error": f"Invalid gateway_route CIDR '{_route}': {exc}"
+            }), 400
 
     try:
         device = device_db.get_device(device_id)

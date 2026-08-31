@@ -81,7 +81,16 @@ CHIP_PALETTE: Dict[str, Tuple[str, str, str]] = {
 
 # Up-state strings every protocol uses (broad enough to catch FRR,
 # legacy OSTG, and ARP variants).
-UP_STATES = {"established", "full", "up", "resolved", "leased", "running"}
+UP_STATES = {
+    "established", "full", "up", "resolved", "leased", "running",
+    # v0.5.229 (audit U monitor-4): DHCP server-mode healthy state is
+    # "Server Running" (see utils/dhcp.py:2133 and
+    # utils/dhcp_monitor.py) — case-lowered here to match `_is_state_up`
+    # which lowercases both operands. Pre-fix, a healthy DHCP server
+    # chip rendered red on the Topology canvas because "server running"
+    # wasn't recognised as up.
+    "server running",
+}
 
 
 # ====================================================================

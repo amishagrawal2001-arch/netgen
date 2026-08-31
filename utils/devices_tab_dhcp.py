@@ -1090,8 +1090,41 @@ class DHCPHandler:
                         state_item.setToolTip(_last_err)
                 except Exception:
                     pass
-            self._set_item(row, "Lease IP", entry.get("lease_ip", ""))
-            self._set_item(row, "Gateway", entry.get("lease_gateway", ""))
+            # v0.5.229 (audit U client-13): the Lease IP + Gateway
+            # columns previously ALWAYS read dhcp_lease_* fields —
+            # correct for client-mode rows (dhclient wrote them),
+            # meaningless for server-mode rows (the server device
+            # HAS no lease from anyone else; dhcp_lease_* stays blank
+            # or holds stale client-mode data from before the mode
+            # flip). For server-mode rows, render the SERVED gateway
+            # and its own interface IP instead. Then the operator can
+            # read the columns at a glance: client rows show what the
+            # dhclient obtained, server rows show what the device is
+            # advertising to others.
+            _mode = (entry.get("mode") or "").lower()
+            if _mode == "server":
+                # For server rows, "Lease IP" is meaningless; show
+                # the server's own interface IPv4 (the address dnsmasq
+                # is bound to). "Gateway" shows what the server hands
+                # out to clients.
+                _dhcp_cfg = entry.get("dhcp_config") or {}
+                if isinstance(_dhcp_cfg, str):
+                    try:
+                        import json as _json
+                        _dhcp_cfg = _json.loads(_dhcp_cfg) if _dhcp_cfg else {}
+                    except Exception:
+                        _dhcp_cfg = {}
+                _server_ip = (
+                    entry.get("server_interface_ip")
+                    or _dhcp_cfg.get("server_ip")
+                    or ""
+                )
+                _served_gw = _dhcp_cfg.get("gateway") or ""
+                self._set_item(row, "Lease IP", _server_ip)
+                self._set_item(row, "Gateway", _served_gw)
+            else:
+                self._set_item(row, "Lease IP", entry.get("lease_ip", ""))
+                self._set_item(row, "Gateway", entry.get("lease_gateway", ""))
             self._set_item(row, "Last Check", str(entry.get("last_check") or ""))
 
             metadata = {

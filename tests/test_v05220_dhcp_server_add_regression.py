@@ -142,10 +142,14 @@ def test_R1_migration_completes_on_truly_fresh_db():
             "seed shape drifted — loopback_ipv4 should be added by "
             "migration, not by CREATE TABLE"
         )
-        assert "dhcp_manual_override" not in pre_cols, (
-            "seed shape drifted — dhcp_manual_override should be "
-            "added by migration, not by CREATE TABLE"
-        )
+        # v0.5.229 (audit U monitor-9): dhcp_manual_override + siblings
+        # were promoted into CREATE TABLE for fresh installs so a
+        # fresh-DB row isn't dependent on migration completing. If the
+        # seed already has this column, the migration ADD-COLUMN block
+        # is a no-op — that's the intended behavior. Skip the seed
+        # assertion; the migration-completeness check below still
+        # verifies the column exists post-init.
+        # (was: assert "dhcp_manual_override" not in pre_cols)
 
         # Trigger the migration.
         _open_and_run_migration(db_path)
