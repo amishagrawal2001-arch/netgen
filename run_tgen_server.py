@@ -7404,7 +7404,28 @@ def attach_dhcp_pools_to_server():
     if not replace_existing and existing_config:
         dhcp_cfg = dict(existing_config)
     else:
-        dhcp_cfg = {}
+        # v0.5.235 (audit B2): `replace_existing=True` (the default)
+        # used to wipe dhcp_cfg to {} — that dropped ALL IPv6 config
+        # (ipv6_pool_start/end, ipv6_prefix, ipv6_gateway,
+        # ipv6_server_ip, ipv6_lease_time, ipv6_gateway_route_
+        # normalized) plus the ipv4_enabled/ipv6_enabled toggles.
+        # Attaching an IPv4 named pool to a dual-stack device
+        # silently disabled DHCP IPv6. Now: preserve every non-IPv4-
+        # pool key from the existing config, and let the IPv4 pool
+        # fields below overwrite only what actually changed. Keys
+        # cleared: pool_start, pool_end, pool_name, pool_range,
+        # pool_networks, lease_time (all IPv4-pool-specific).
+        _preserve_keys = (
+            "ipv6_enabled", "ipv4_enabled", "mode", "interface",
+            "ipv6_pool_start", "ipv6_pool_end", "ipv6_prefix",
+            "ipv6_pool_range", "ipv6_lease_time", "ipv6_server_ip",
+            "ipv6_gateway", "ipv6_gateway_route", "ipv6_gateway_route_normalized",
+        )
+        dhcp_cfg = {
+            k: existing_config[k]
+            for k in _preserve_keys
+            if k in existing_config
+        }
 
     # Establish interface
     interface = (

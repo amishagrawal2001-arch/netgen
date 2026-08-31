@@ -2,6 +2,57 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.235] - 2026-08-31
+
+**DHCP server audit #3 — 2 blockers + 1 user-visible from the
+post-closeout audit surveyed 2026-08-31 (9 findings total, top
+3 shipped here, 6 queued for v0.5.236).**
+
+- **B1 `utils/dhcp.py:1892` — multi-subnet server anchoring.**
+  Pre-fix, `_ensure_ipv4_address` only anchored the primary
+  pool's `.1`; additional_pools on DIFFERENT subnets got no
+  interface IP and dnsmasq refused those ranges with "no address
+  range available". Devices with ONLY additional_pools skipped
+  the anchor entirely. Now: iterate `additional_pools` and anchor
+  each pool's subnet, de-duping subnets already anchored by the
+  primary.
+
+- **B2 `run_tgen_server.py:7404` — attach_pools IPv6 wipe.**
+  Pre-fix, `replace_existing=True` (the default) set
+  `dhcp_cfg = {}` and only re-populated the IPv4 pool fields —
+  every `ipv6_pool_start/end/prefix/gateway/server_ip/lease_time`
+  plus both `ipv4_enabled`/`ipv6_enabled` toggles got dropped.
+  Attaching an IPv4 named pool silently disabled IPv6 DHCP on
+  dual-stack devices. Now: `dhcp_cfg` starts as a filtered dict
+  that preserves every non-IPv4-pool key (14 keys explicitly
+  preserved), letting only the IPv4 pool fields get replaced.
+
+- **U1 `utils/dhcp.py:2544` — IPv4 anchor leak on stop.**
+  Operator on srv06 2026-08-31 saw vlan10 carrying
+  `192.168.30.1/24 AND 172.16.30.2/24` after rotating pools —
+  every pool the interface got anchored to accumulated
+  permanently because stop_dhcp_server had no IPv4 remove path
+  (IPv6 side had `_remove_ipv6_address` since v0.5.222). New
+  helper `_remove_ipv4_address` mirrors the IPv6 shape. Stop
+  path iterates the stored `pool_networks` and removes each
+  anchor, de-dup'd and skipping /31/32 pools that never got
+  anchored (per v0.5.230 P server-9's guard).
+
+Deferred to v0.5.236 (6 findings):
+- U2 monitor pidfile path drift (`/var/run/dnsmasq/…` vs `/run/…`)
+- U3 `/server/pool` clears join table before ensure — leaves
+  broken state on dnsmasq failure
+- U4 `/server/pool` doesn't validate gateway is INSIDE pool subnet
+- P1 no dedupe between primary_pool and additional_pools →
+  duplicate dhcp-range lines
+- P2 server-stop `pkill -f 'dnsmasq.*{iface}'` substring class
+  bug (v0.5.218 fix M never applied here)
+- P3 `_ensure_ipv4_address` ignores device's declared ipv4_mask,
+  auto-derives from pool size
+
+Tests: `tests/test_v05235_dhcp_server_bundle3.py` — 8 pass.
+Broader dhcp sweep: 195 pass.
+
 ## [0.5.234] - 2026-08-31
 
 **Manage DHCP Pools window: hide auto-generated device-defaults

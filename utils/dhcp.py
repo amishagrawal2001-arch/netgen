@@ -974,6 +974,34 @@ def _ensure_ipv6_address(interface: str, address: str, prefix: str, container=No
     return False
 
 
+def _remove_ipv4_address(interface: str, address: str, prefix: str, container=None) -> None:
+    """v0.5.235 (audit U1): mirror of _remove_ipv6_address. Called
+    on stop_dhcp_server so the IPv4 anchor that _ensure_ipv4_address
+    added at start doesn't leak. Pre-fix, every pool rotation
+    accumulated another /24 on the interface — operator saw two,
+    three, four stale IPs on vlan10 after a few attach/detach
+    cycles.
+    """
+    if not interface or not address:
+        return
+    _pfx = str(prefix) if prefix is not None else "24"
+    try:
+        _run_command(
+            ["ip", "-4", "addr", "del", f"{address}/{_pfx}", "dev", interface],
+            timeout=5,
+            container=container,
+        )
+        logger.info("[DHCP] Removed IPv4 address %s/%s from %s", address, _pfx, interface)
+    except Exception as exc:
+        # Match _remove_ipv6_address logging shape — warning level so
+        # operators see the swallowed failure but the caller can
+        # still ignore it (this helper returns None).
+        logger.warning(
+            "[DHCP] Failed to remove IPv4 address %s/%s from %s: %s",
+            address, _pfx, interface, exc,
+        )
+
+
 def _remove_ipv6_address(interface: str, address: str, prefix: str, container=None) -> None:
     """Remove an IPv6 address from an interface."""
     if not interface or not address or prefix is None:
@@ -1871,6 +1899,48 @@ def start_dhcp_server(
             logger.info("[DHCP] Server-mode IPv4 anchor on %s: %s",
                         interface, assigned)
 
+    # v0.5.235 (audit B1): anchor EACH additional pool's subnet too.
+    # Pre-fix, only the primary pool got an interface IP —
+    # additional_pools on DIFFERENT subnets never got the anchor,
+    # dnsmasq refused to serve those ranges with "no address range
+    # available for..." Devices with ONLY additional_pools (no
+    # primary) skipped the anchor entirely (guard was `pool_start
+    # and pool_end`). Iterate over additional_pools and anchor each.
+    # De-dup: skip a pool whose subnet already got anchored above
+    # (e.g. additional pool in the same /24 as the primary).
+    if ipv4_enabled and additional_pools:
+        _anchored_subnets = set()
+        if pool_start and pool_end:
+            try:
+                _p = ipaddress.ip_network(f"{pool_start}/24", strict=False)
+                _anchored_subnets.add(str(_p))
+            except (ValueError, ipaddress.AddressValueError):
+                pass
+        for _add_pool in additional_pools:
+            _add_start = _add_pool.get("pool_start")
+            _add_end = _add_pool.get("pool_end")
+            if not (_add_start and _add_end):
+                continue
+            try:
+                _add_net = ipaddress.ip_network(f"{_add_start}/24", strict=False)
+            except (ValueError, ipaddress.AddressValueError):
+                continue
+            _add_key = str(_add_net)
+            if _add_key in _anchored_subnets:
+                continue
+            _anchored_subnets.add(_add_key)
+            _add_gw = _add_pool.get("gateway") or ""
+            _add_assigned = _ensure_ipv4_address(
+                interface, _add_start, _add_end,
+                gateway=_add_gw, ipv4_mask="",
+                container=container,
+            )
+            if _add_assigned:
+                logger.info(
+                    "[DHCP] Server-mode IPv4 additional-pool anchor on %s: %s (pool=%s-%s)",
+                    interface, _add_assigned, _add_start, _add_end,
+                )
+
     if ipv6_enabled and ipv6_prefix:
         # v0.5.230 (audit P server-10): auto-derive IPv6 server IP
         # from the pool subnet when the operator didn't supply one,
@@ -2514,6 +2584,44 @@ def stop_dhcp_server(device_db, device_id: str, interface: str, container=None) 
 
     if ipv6_server_ip and ipv6_prefix:
         _remove_ipv6_address(interface, ipv6_server_ip, ipv6_prefix, container=container)
+
+    # v0.5.235 (audit U1): remove the IPv4 anchor that
+    # _ensure_ipv4_address added at start. Pre-fix, only the IPv6
+    # side had a paired remove — rotating pools accumulated stale
+    # /24 addresses on the interface (operator on 2026-08-31 saw
+    # vlan10 carrying 192.168.30.1/24 AND 172.16.30.2/24 both
+    # after a 172.16.30 pool replaced a 192.168.30 pool).
+    # Derive the anchor from the stored pool_networks in
+    # dhcp_cfg — same source stop uses for route cleanup. For
+    # each pool subnet, the anchor is `.1` (per
+    # _ensure_ipv4_address's derivation).
+    try:
+        _stored_nets = dhcp_cfg.get("pool_networks") or [] if dhcp_cfg else []
+        _seen_anchors = set()
+        for _net_str in _stored_nets:
+            try:
+                _net = ipaddress.ip_network(str(_net_str), strict=False)
+            except (ValueError, ipaddress.AddressValueError):
+                continue
+            if not isinstance(_net, ipaddress.IPv4Network):
+                continue
+            # Skip /31 and /32 that have no usable host — they
+            # never got an anchor added.
+            _hosts = list(_net.hosts())
+            if not _hosts:
+                continue
+            _anchor = str(_hosts[0])
+            if _anchor in _seen_anchors:
+                continue
+            _seen_anchors.add(_anchor)
+            _remove_ipv4_address(
+                interface, _anchor, str(_net.prefixlen), container=container,
+            )
+    except Exception as _cleanup_exc:
+        logger.debug(
+            "[DHCP] Failed IPv4 anchor cleanup on stop for %s: %s",
+            device_id, _cleanup_exc,
+        )
 
     _update_device_db(
         device_db,
