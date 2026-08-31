@@ -913,7 +913,29 @@ def _ensure_ipv4_address(
             )
             return None
 
-    mask_bits = ipv4_mask or str(pool_network.prefixlen)
+    # v0.5.236 (audit P3): honor the device's declared mask over
+    # the pool-size derivation. Pre-fix, callers passed
+    # ipv4_mask="" and mask_bits fell back to pool_network.prefixlen
+    # (e.g. /29 for a narrow .100-.107 pool). Anchoring `.1/29` on
+    # an interface the operator declared /24 makes off-pool hosts on
+    # the /24 unreachable via the connected route. Prefer the mask
+    # already on the interface if one is present.
+    _existing_mask = ""
+    if not ipv4_mask:
+        try:
+            _probe = _run_command(
+                ["/bin/sh", "-c",
+                 f"ip -4 -o addr show dev {interface} 2>/dev/null | "
+                 f"awk '{{for (i=1;i<=NF;i++) if ($i==\"inet\") print $(i+1)}}' | "
+                 f"head -1"],
+                container=container, timeout=5,
+            )
+            _existing_cidr = (_probe.stdout or "").strip()
+            if "/" in _existing_cidr:
+                _existing_mask = _existing_cidr.split("/", 1)[1].strip()
+        except Exception:
+            _existing_mask = ""
+    mask_bits = ipv4_mask or _existing_mask or str(pool_network.prefixlen)
     try:
         result = _run_command(
             ["ip", "-4", "addr", "add", f"{server_ip}/{mask_bits}", "dev", interface],
@@ -2494,9 +2516,25 @@ def stop_dhcp_server(device_db, device_id: str, interface: str, container=None) 
             ).stdout.strip()
             if pid_read:
                 _run_command(["kill", pid_read], timeout=5, container=container)
-            # Also try to kill any dnsmasq process on this interface
+            # v0.5.236 (audit P2): anchor the interface match. Pre-fix
+            # `pkill -f 'dnsmasq.*{interface}'` with interface="vlan1"
+            # matched processes with `ostg-vlan10.conf` in their argv
+            # (dnsmasq for vlan10) — same substring-collision class
+            # v0.5.218 fix M closed for _is_dhclient_running, never
+            # applied to server stop. Use argv-token match on the
+            # conffile path (unique per interface) as the primary,
+            # and only fall back to a word-boundary interface match.
+            import re as _re
+            _iface_re = _re.escape(interface)
+            # Match `--conf-file=/etc/dnsmasq.d/ostg-<iface>.conf`
+            # OR a whole-word interface token like `interface=vlan1`
+            # (the vlan10 case: \b vlan1 \b won't match vlan10).
+            _pat = f"(ostg-{_iface_re}\\.conf|=\\s*{_iface_re}(\\s|$)|\\b{_iface_re}\\b)"
             _run_command(
-                ["/bin/sh", "-c", f"pkill -f 'dnsmasq.*{interface}' || true"],
+                ["/bin/sh", "-c",
+                 f"pgrep -af '^dnsmasq|/dnsmasq ' 2>/dev/null | "
+                 f"grep -E '{_pat}' | awk '{{print $1}}' | "
+                 f"xargs -r kill 2>/dev/null || true"],
                 container=container,
                 timeout=5,
             )

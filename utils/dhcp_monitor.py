@@ -389,7 +389,15 @@ class DHCPClientMonitor:
         detail = "container missing"
         if container is not None:
             conffile = f"/etc/dnsmasq.d/ostg-{interface}.conf"
-            pidfile = f"/var/run/dnsmasq/dnsmasq-{interface}.pid"
+            # v0.5.236 (audit U2): use the same pidfile path that
+            # utils/dhcp.py writes (DNSMASQ_PID_DIR="/run"). Pre-fix
+            # the monitor looked under `/var/run/dnsmasq/` (the
+            # subdirectory `dnsmasq/` invented here), which never
+            # matched — so pgrep was the ONLY fallback. In images
+            # where procps is stripped, or in tight PID namespaces,
+            # pgrep can miss and dnsmasq is reported "Server Down"
+            # even when it's alive.
+            pidfile = f"/run/dnsmasq-{interface}.pid"
             try:
                 # v0.5.219 (audit fix C2): argv-parse pgrep. Pre-fix,
                 # the fallback was ``pgrep -f 'dnsmasq.*{interface}'``

@@ -2,6 +2,60 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.236] - 2026-08-31
+
+**DHCP audit close-out #2 — remaining 6 findings + interface-IP-
+leak on Edit. Audit total: 9/9 shipped.**
+
+- **U2 `utils/dhcp_monitor.py:392` — pidfile path drift.** Writer
+  is `/run/dnsmasq-{iface}.pid` (`DNSMASQ_PID_DIR="/run"`); monitor
+  was reading `/var/run/dnsmasq/dnsmasq-{iface}.pid` (subdirectory
+  `dnsmasq/` invented). The pidfile probe always missed → only
+  pgrep saved it, and where procps is stripped or PID ns tight,
+  a live dnsmasq flipped to "Server Down" spuriously.
+- **U3 `run_tgen_server.py:7167` — join table cleared BEFORE
+  ensure.** Pre-fix, `/server/pool` called `remove_device_dhcp_pools`
+  before `ensure_dhcp_services`. On dnsmasq launch failure, the
+  device was left with empty attachment table + stale inline
+  `dhcp_config` + no dnsmasq — an inconsistent "half-detached"
+  state. Now the clear happens ONLY after ensure returns success.
+- **U4 `run_tgen_server.py:7096` — gateway-in-pool-subnet check.**
+  Pre-fix, `/server/pool` validated the gateway was a legal IPv4
+  but not that it fell inside the pool subnet. An out-of-subnet
+  gateway silently fell through to `.1` derivation, and dnsmasq
+  advertised a gateway clients couldn't ARP. Now the API returns
+  400 with an actionable message.
+- **P1 `run_tgen_server.py:7284` — dedup primary vs additional
+  pools.** Same pool name in both fields produced duplicate
+  `dhcp-range=` lines in dnsmasq config. Now filtered before
+  the payload is built.
+- **P2 `utils/dhcp.py:2498` — server-stop pkill substring bug.**
+  Pre-fix, `pkill -f 'dnsmasq.*{interface}'` with interface=vlan1
+  matched processes with `ostg-vlan10.conf` in their argv — the
+  exact substring-collision class v0.5.218 fix M closed for
+  client-mode, never applied to server-stop. Now uses pgrep +
+  grep -E with re.escape'd interface, anchored to the unique
+  conffile path OR a word-boundary token match.
+- **P3 `utils/dhcp.py:916` — `_ensure_ipv4_address` honors mask.**
+  Pre-fix, `ipv4_mask=""` fell back to `pool_network.prefixlen`
+  — a narrow `.100-.107` pool auto-derived /29 anchor, breaking
+  off-pool /24 hosts. Now probes the interface's existing mask
+  and prefers that over the pool-derived one.
+
+**Plus — new operator-observed bug:**
+
+- **Interface-IP-leak on Edit (`run_tgen_server.py:4643`) —**
+  when apply_device changed a device's ipv4_address (e.g.
+  operator edits .2 → .1 on same subnet), the old address stayed
+  on the interface. Result on operator's srv06: vlan10 had both
+  172.16.30.1/24 AND 172.16.30.2/24. Now: enumerate every IPv4 on
+  the interface and remove same-subnet strays that don't match
+  the new one. Cross-subnet addresses (DHCP pool anchors) left
+  alone so `_ensure_ipv4_address` doesn't have to re-add them.
+
+Tests: `tests/test_v05236_dhcp_bundle4.py` — 9 pass. Broader
+dhcp sweep: 204 pass.
+
 ## [0.5.235] - 2026-08-31
 
 **DHCP server audit #3 — 2 blockers + 1 user-visible from the

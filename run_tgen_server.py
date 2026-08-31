@@ -4643,10 +4643,65 @@ def apply_device():
         # Step 4: Configure IPv4 address
         if ipv4 and ipv4_mask:
             try:
-                # Remove existing IPv4 address if any
-                subprocess.run(["ip", "addr", "del", f"{ipv4}/{ipv4_mask}", "dev", iface_name_for_commands], 
+                # v0.5.236: enumerate every IPv4 on the interface and
+                # remove any that lives in the SAME /prefix as the
+                # new one but is a different host. Pre-fix, only
+                # `ip addr del {new_ipv4}` ran — no-op when a stale
+                # address like 172.16.30.2/24 was already there and
+                # the operator was setting 172.16.30.1/24. Result:
+                # both .1 and .2 on the interface, breaking ARP
+                # responder behavior + confusing operators. Cross-
+                # subnet addresses (e.g. DHCP pool anchors on
+                # 192.168.30.0/24) are LEFT alone so
+                # _ensure_ipv4_address doesn't have to re-add them.
+                try:
+                    import ipaddress as _ipa
+                    _new_net = _ipa.IPv4Network(f"{ipv4}/{ipv4_mask}", strict=False)
+                    _probe = subprocess.run(
+                        ["ip", "-4", "-o", "addr", "show", "dev", iface_name_for_commands],
+                        capture_output=True, text=True, timeout=5,
+                    )
+                    for _ln in (_probe.stdout or "").splitlines():
+                        # awk-style extract of "inet <addr>/<prefix>"
+                        _toks = _ln.split()
+                        _i = 0
+                        while _i < len(_toks) - 1:
+                            if _toks[_i] == "inet":
+                                _cidr = _toks[_i + 1]
+                                break
+                            _i += 1
+                        else:
+                            continue
+                        if "/" not in _cidr:
+                            continue
+                        _addr_str, _mask_str = _cidr.split("/", 1)
+                        # Skip the exact new address — no need to remove
+                        if _addr_str == ipv4 and _mask_str == str(ipv4_mask):
+                            continue
+                        try:
+                            _existing_net = _ipa.IPv4Network(_cidr, strict=False)
+                        except ValueError:
+                            continue
+                        # Only remove same-subnet strays; leave cross-
+                        # subnet addresses (pool anchors, etc.) alone
+                        if _existing_net.network_address == _new_net.network_address \
+                                and _existing_net.prefixlen == _new_net.prefixlen:
+                            logging.info(
+                                f"[DEVICE APPLY] Removing stale same-subnet IPv4 "
+                                f"{_cidr} on {iface_name_for_commands} before "
+                                f"setting {ipv4}/{ipv4_mask}"
+                            )
+                            subprocess.run(
+                                ["ip", "addr", "del", _cidr, "dev", iface_name_for_commands],
+                                capture_output=True, text=True, timeout=5,
+                            )
+                except Exception as _clean_exc:
+                    logging.debug(f"[DEVICE APPLY] Same-subnet stale-IP cleanup skipped: {_clean_exc}")
+
+                # Remove existing IPv4 address if any (idempotent)
+                subprocess.run(["ip", "addr", "del", f"{ipv4}/{ipv4_mask}", "dev", iface_name_for_commands],
                              capture_output=True, text=True, timeout=5)
-                
+
                 # Add new IPv4 address
                 ipv4_result = subprocess.run([
                     "ip", "addr", "add", f"{ipv4}/{ipv4_mask}", "dev", iface_name_for_commands
@@ -7095,9 +7150,37 @@ def update_dhcp_server_pool():
         }), 400
     if gateway_override:
         try:
-            _ipaddr.IPv4Address(gateway_override)
+            _gw_addr = _ipaddr.IPv4Address(gateway_override)
         except _ipaddr.AddressValueError as exc:
             return jsonify({"error": f"Invalid gateway address: {exc}"}), 400
+        # v0.5.236 (audit U4): gateway must be inside the pool's
+        # subnet. Pre-fix, an out-of-subnet gateway passed
+        # validation, and _ensure_ipv4_address silently fell through
+        # to `.1` of the pool subnet — dnsmasq then advertised a
+        # gateway clients couldn't ARP for. Better to reject at the
+        # API layer so the operator sees the mismatch immediately.
+        try:
+            _pool_net = None
+            for _prefix in range(32, 7, -1):
+                _candidate = _ipaddr.IPv4Network(f"{pool_start}/{_prefix}", strict=False)
+                if _end_addr in _candidate and _start_addr in _candidate:
+                    _pool_net = _candidate
+                    break
+            if _pool_net is None:
+                _pool_net = _ipaddr.IPv4Network(f"{pool_start}/24", strict=False)
+            if _gw_addr not in _pool_net:
+                return jsonify({
+                    "error": (
+                        f"gateway '{gateway_override}' is not inside the pool "
+                        f"subnet ({_pool_net}). Clients would receive a gateway "
+                        f"they can't ARP for. Use a gateway within {_pool_net} "
+                        f"or clear the override to let the server derive it."
+                    )
+                }), 400
+        except (_ipaddr.AddressValueError, ValueError):
+            # If we can't compute the pool network, skip this check
+            # rather than block a legitimate request on our failure.
+            pass
     for _route in gateway_routes_to_add:
         try:
             _ipaddr.ip_network(_route, strict=False)
@@ -7134,11 +7217,14 @@ def update_dhcp_server_pool():
     if not interface:
         return jsonify({"error": "Unable to determine interface for DHCP server"}), 400
 
-    # Manual override detaches existing named pool associations
-    try:
-        device_db.remove_device_dhcp_pools(device_id)
-    except Exception as exc:
-        logging.debug(f"[DHCP API] Failed to clear DHCP pool attachments for {device_id}: {exc}")
+    # v0.5.236 (audit U3): DEFERRED — do NOT clear the named-pool
+    # join table until we know ensure_dhcp_services succeeded. Pre-
+    # fix, the clear happened here (before ensure), so a dnsmasq
+    # launch failure left the device with an empty attachment
+    # table + stale inline dhcp_config + no running dnsmasq —
+    # inconsistent "half-detached" state the UI couldn't recover
+    # from without a full re-Apply. The clear now happens after
+    # a successful ensure at line ~7260 (see below).
 
     additional_pools = dhcp_cfg.get("additional_pools") or []
     if isinstance(additional_pools, str):
@@ -7229,6 +7315,19 @@ def update_dhcp_server_pool():
     if not result.get("success"):
         return jsonify({"error": result.get("error", "Failed to update DHCP server")}), 500
 
+    # v0.5.236 (audit U3): ensure_dhcp_services succeeded — NOW it's
+    # safe to clear the named-pool join table. If we'd cleared it
+    # upfront (pre-fix) and ensure then failed, the device would be
+    # left with no attachments + a broken dnsmasq — the two-state
+    # inconsistency this reorder eliminates.
+    try:
+        device_db.remove_device_dhcp_pools(device_id)
+    except Exception as exc:
+        logging.debug(
+            f"[DHCP API] Failed to clear DHCP pool attachments post-ensure "
+            f"for {device_id}: {exc}"
+        )
+
     try:
         updated_device = device_db.get_device(device_id) or {}
     except Exception as exc:
@@ -7260,6 +7359,21 @@ def attach_dhcp_pools_to_server():
         for name in additional_pool_names
         if str(name).strip()
     ]
+    # v0.5.236 (audit P1): drop the primary pool from additional_pools
+    # if the client sent the same name in both. Pre-fix, dnsmasq got
+    # two identical `dhcp-range=...` lines and complained
+    # ("duplicate range"). Also de-dup within additional_pools itself
+    # in case the same name appears twice.
+    _seen = set()
+    _deduped_additional = []
+    for _n in additional_pool_names:
+        if _n == primary_pool_name:
+            continue
+        if _n in _seen:
+            continue
+        _seen.add(_n)
+        _deduped_additional.append(_n)
+    additional_pool_names = _deduped_additional
 
     if not device_id:
         return jsonify({"error": "device_id is required"}), 400
