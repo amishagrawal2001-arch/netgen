@@ -4147,6 +4147,31 @@ def configure_isis():
         import traceback
         logging.error(f"[ISIS CONFIGURE ERROR] Traceback: {traceback.format_exc()}")
         return jsonify({"error": str(e)}), 500
+# v0.5.231 (audit P server-12): per-device apply lock. Two rapid
+# Apply POSTs for the same device_id used to race through DHCP
+# config-write, pidfile kill, and dnsmasq relaunch — an orphan
+# dnsmasq from the losing racer could persist bound to the
+# interface. `_APPLY_LOCKS` is a module-level dict of per-device
+# threading.Locks; the guard below tries a short non-blocking
+# acquire and 409s the second request rather than serializing
+# them (a serialized second Apply is almost always operator
+# error — a double-click on Apply — so surfacing it is more
+# helpful than silently running twice).
+import threading as _threading
+_APPLY_LOCKS: Dict[str, _threading.Lock] = {}
+_APPLY_LOCKS_META_LOCK = _threading.Lock()
+
+
+def _get_apply_lock(device_id: str) -> _threading.Lock:
+    """Get (or lazily create) the per-device Apply lock."""
+    with _APPLY_LOCKS_META_LOCK:
+        lock = _APPLY_LOCKS.get(device_id)
+        if lock is None:
+            lock = _threading.Lock()
+            _APPLY_LOCKS[device_id] = lock
+        return lock
+
+
 @app.route("/api/device/apply", methods=["POST"])
 @require_role("operator")
 def apply_device():
@@ -4154,6 +4179,25 @@ def apply_device():
     data = request.get_json()
     if not data:
         return jsonify({"error": "Missing device configuration"}), 400
+
+    # v0.5.231 (audit P server-12): re-entrancy guard. Non-blocking
+    # acquire — a second Apply for the same device while the first
+    # is still running gets HTTP 409 rather than racing.
+    _lock_device_id = data.get("device_id") or ""
+    _apply_lock = _get_apply_lock(_lock_device_id) if _lock_device_id else None
+    if _apply_lock is not None:
+        if not _apply_lock.acquire(blocking=False):
+            logging.warning(
+                f"[DEVICE APPLY] Rejected concurrent Apply for {_lock_device_id} "
+                f"— an earlier request is still in flight."
+            )
+            return jsonify({
+                "error": (
+                    f"Another Apply for device '{_lock_device_id}' is "
+                    f"still in flight. Wait for it to finish, or Refresh "
+                    f"the Devices tab to see the outcome, before retrying."
+                )
+            }), 409
 
     try:
         device_id = data.get("device_id")
@@ -5667,6 +5711,18 @@ def apply_device():
             error=str(e),
         )
         return jsonify({"error": str(e)}), 500
+    finally:
+        # v0.5.231 (audit P server-12): always release the per-device
+        # Apply lock, whether the body succeeded or exception'd.
+        # Skipped when we never acquired one (empty device_id).
+        if _apply_lock is not None:
+            try:
+                _apply_lock.release()
+            except RuntimeError:
+                # Not owned by this thread — shouldn't happen since
+                # acquire() and release() are on the same request
+                # handler thread, but be safe.
+                pass
 
 @app.route("/api/device/ospf/configure", methods=["POST"])
 @require_role("operator")
@@ -6917,6 +6973,74 @@ def get_dhcp_status():
     except Exception as e:
         logging.error(f"[DHCP STATUS] Failed to gather DHCP status: {e}")
         return jsonify({"error": str(e)}), 500
+
+
+@app.route("/api/device/dhcp/restart", methods=["POST"])
+@require_role("operator")
+def restart_dhcp_service():
+    """v0.5.231 (audit U client-11): rescue path. Force-restart the
+    DHCP daemon (dnsmasq for server-mode, dhclient for client-mode)
+    for a stuck device. This is what the operator wants when a
+    device is in State=Failed / Server Down / Stopped and re-Apply
+    doesn't feel needed — just kick the daemon.
+
+    Body: ``{"device_id": "<id>"}``. Returns 200 on success with
+    the current dhcp_state / lease info in the payload, 4xx on
+    invalid input, 500 on internal error.
+    """
+    try:
+        payload = request.get_json(silent=True) or {}
+    except Exception:
+        payload = {}
+    device_id = (payload.get("device_id") or "").strip()
+    if not device_id:
+        return jsonify({"error": "device_id is required"}), 400
+    try:
+        device = device_db.get_device(device_id)
+    except Exception as exc:
+        return jsonify({"error": str(exc)}), 500
+    if not device:
+        return jsonify({"error": "Device not found"}), 404
+    dhcp_cfg = device.get("dhcp_config") or {}
+    if isinstance(dhcp_cfg, str):
+        try:
+            dhcp_cfg = json.loads(dhcp_cfg) if dhcp_cfg else {}
+        except Exception:
+            dhcp_cfg = {}
+    mode = (dhcp_cfg.get("mode") or device.get("dhcp_mode") or "").lower()
+    if mode not in ("server", "client"):
+        return jsonify({
+            "error": f"Device '{device.get('device_name') or device_id}' "
+                     f"has no DHCP mode configured — nothing to restart."
+        }), 400
+    interface = device.get("interface") or dhcp_cfg.get("interface") or ""
+    if not interface:
+        return jsonify({"error": "Device has no interface — cannot restart DHCP."}), 400
+    try:
+        from utils import dhcp as _dhcp
+        result = _dhcp.ensure_dhcp_services(
+            device_db, device_id, interface, dhcp_cfg,
+            force_client_restart=True,
+        )
+        if isinstance(result, dict) and not result.get("success", True):
+            return jsonify({
+                "error": result.get("error") or "Restart failed"
+            }), 500
+        # Return the fresh state so the client can update its row
+        # without waiting for the next monitor poll.
+        try:
+            fresh = device_db.get_device(device_id) or {}
+        except Exception:
+            fresh = {}
+        return jsonify({
+            "status": "restarted",
+            "dhcp_state": fresh.get("dhcp_state"),
+            "dhcp_running": bool(fresh.get("dhcp_running")),
+            "dhcp_last_error": fresh.get("dhcp_last_error") or "",
+        }), 200
+    except Exception as exc:
+        logging.error(f"[DHCP RESTART] Failed for {device_id}: {exc}")
+        return jsonify({"error": str(exc)}), 500
 
 
 @app.route("/api/device/dhcp/server/pool", methods=["POST"])

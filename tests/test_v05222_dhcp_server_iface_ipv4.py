@@ -213,6 +213,15 @@ def test_client_widget_attaches_error_tooltip_to_state_cell():
     assert 'entry.get("last_error"' in src, (
         "client widget doesn't read last_error from status entry"
     )
-    assert 'setToolTip(_last_err)' in src or 'setToolTip(_last_err' in src, (
-        "client widget doesn't attach last_error as tooltip on the State cell"
+    # v0.5.231 (audit U monitor-6): the last_error tooltip attach
+    # was refactored — last_error is now combined with the state-
+    # disambiguation hint (from _state_hint_tooltip) into
+    # _tooltip_parts and set together via `setToolTip("\n\n".join(...))`.
+    # The invariant "last_error surfaces on the State cell" still
+    # holds; verify via the intermediate variable.
+    assert '_tooltip_parts.append(_last_err)' in src, (
+        "client widget no longer feeds last_error into the State cell tooltip"
+    )
+    assert 'setToolTip("\\n\\n".join(_tooltip_parts))' in src, (
+        "client widget dropped the combined-tooltip setToolTip call"
     )

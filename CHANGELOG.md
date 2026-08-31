@@ -2,6 +2,64 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.231] - 2026-08-30
+
+**DHCP audit bundle #3 — closes the last 4 of 35 findings. Audit
+complete (35/35).**
+
+- **P server-12: `apply_device` re-entrancy guard.** Module-level
+  `_APPLY_LOCKS: Dict[str, threading.Lock]` keyed by device_id;
+  the /api/device/apply handler tries a non-blocking acquire and
+  returns HTTP 409 on contention (double-click race, script that
+  retries too eagerly, etc.). `finally:` block releases regardless
+  of outcome. Pre-fix, two rapid Applies for the same device_id
+  raced through DHCP config-write, pidfile kill, and dnsmasq
+  relaunch — the losing racer could leave an orphan dnsmasq bound
+  to the interface.
+
+- **U monitor-6: client-mode "off" state string disambiguation.**
+  Three overlapping strings (Stopped / No Lease / Requesting) plus
+  three server-mode failure modes (No Pool / Server Down / Failed)
+  now carry per-state plain-English tooltips explaining what each
+  means. New module-level `_state_hint_tooltip(state, mode)` in
+  `utils/devices_tab_dhcp.py`; wired into the State column render.
+  Combined with the existing `dhcp_last_error` message via
+  `"\n\n".join(_tooltip_parts)` so operators see both the reason
+  and the specific error on hover.
+
+- **U client-11: rescue path — Restart DHCP button + backend
+  endpoint.** New `POST /api/device/dhcp/restart` — takes a
+  device_id, calls `ensure_dhcp_services` with
+  `force_client_restart=True`, returns the fresh dhcp_state /
+  running flag. New "Restart DHCP" button in the DHCP subtab
+  toolbar (blue accent, next to Apply) with confirmation-free
+  action for the highlighted row. Refreshes the table 500ms
+  after success so the operator sees the new state without
+  a manual Refresh.
+
+- **U client-7: named DHCP pools IPv6 parity.** `DHCPPoolDialog`
+  now has optional IPv6 fields: Pool Start, Pool End, Prefix
+  Length. Validation is all-or-none (any of the three → all three
+  required) with IPv6Address parsing, pool-order check
+  (start ≤ end), and prefix in 0..128. Payload sends
+  `pool6_start` / `pool6_end` / `prefix6` verbatim; consumers
+  that don't understand the keys ignore them safely. Pre-fix,
+  IPv6 DHCP servers could only be built from the Add Device
+  inline block — never as reusable named pools.
+
+Tests: `tests/test_v05231_dhcp_audit_final.py` — 10 pass.
+Also touched `test_v05222_dhcp_server_iface_ipv4.py`'s
+tooltip-attach assertion to match the v0.5.231 combined-tooltip
+refactor (invariant "last_error surfaces on State cell" still
+holds). Broader dhcp sweep: 177 pass.
+
+**Audit close-out:**
+- v0.5.229 fixed 15/35 (all 5 blockers + 10 user-visible)
+- v0.5.230 fixed 12/35 (5 user-visible + 7 paper-cuts)
+- v0.5.231 fixed 4/35 (last 3 user-visible + 1 paper-cut)
+- **35/35 closed.** Ordered by three parallel Explore agents
+  surveying server / client-UI / monitor+persistence on 2026-08-30.
+
 ## [0.5.230] - 2026-08-30
 
 **DHCP audit bundle #2 — 12 more findings from the 35-audit

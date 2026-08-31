@@ -28,6 +28,45 @@ from PyQt5.QtWidgets import (
 )
 
 
+# v0.5.231 (audit U monitor-6): plain-English disambiguation for
+# the DHCP state strings. Client-mode has 3 overlapping "off"
+# strings (Stopped / No Lease / Requesting); server-mode has 3
+# failure modes (No Pool / Server Down / Failed). Operators saw
+# the same label for meaningfully different states — this helper
+# gives the State column tooltip a one-line explanation for each.
+_DHCP_STATE_HINTS_CLIENT = {
+    "stopped":    "Client container is DOWN — start the device to bring dhclient up.",
+    "no lease":   "dhclient is running but hasn't offered a lease yet — check the DHCP server is reachable.",
+    "requesting": "dhclient is mid-DORA — solicited a DHCPOFFER and waiting for the ACK. Legitimate transient state.",
+    "renewing":   "dhclient is inside the lease-time renewal window, talking to the server that first gave it the lease.",
+    "rebinding":  "Renewal to the original server failed; dhclient is broadcasting to any DHCP server that will answer.",
+    "leased":     "Client holds a valid DHCP lease — see the Lease IP / Gateway columns.",
+    "failed":     "dhclient exited or refused to launch — check dhcp_last_error for the specific reason.",
+}
+_DHCP_STATE_HINTS_SERVER = {
+    "server running": "dnsmasq is up and answering DHCP requests.",
+    "server down":    "dnsmasq should be running but isn't (crashed or was killed) — monitor will attempt to restart with backoff.",
+    "no pool":        "Server-mode device has no pool_start/pool_end attached — dnsmasq refuses to launch. Click 'Attach Pool' or Edit the device to set a pool range.",
+    "failed":         "dnsmasq refused to launch for a reason OTHER than a missing pool — check dhcp_last_error for the specific cause.",
+    "disabled":       "DHCP is not enabled on this device.",
+}
+
+
+def _state_hint_tooltip(state_str: str, mode: str) -> str:
+    """Return a human-readable one-line explanation for a DHCP state
+    label, keyed by the device's mode. Empty string when there's
+    no hint (unknown state / mode). Used to decorate the State
+    column tooltip so operators aren't left guessing what "No Lease"
+    means vs "Stopped" vs "Requesting"."""
+    key = str(state_str or "").strip().lower()
+    if not key:
+        return ""
+    if mode == "server":
+        return _DHCP_STATE_HINTS_SERVER.get(key, "")
+    # Default to client-mode hints (also covers empty mode).
+    return _DHCP_STATE_HINTS_CLIENT.get(key, "")
+
+
 class DHCPPoolDialog(QDialog):
     """Dialog to create or edit a DHCP pool definition."""
 
@@ -78,6 +117,30 @@ class DHCPPoolDialog(QDialog):
         self.gateway_route_edit.setPlaceholderText("Comma-separated CIDRs (optional)")
         form.addRow("Gateway Route(s):", self.gateway_route_edit)
 
+        # v0.5.231 (audit U client-7): named-pool IPv6 fields.
+        # Pre-fix, DHCPPoolDialog was IPv4-only — IPv6 DHCP servers
+        # could only be built via the Add Device inline block,
+        # never as reusable named pools. All three IPv6 fields are
+        # optional; a pool with only IPv4 stays IPv4-only.
+        form.addRow(QLabel("<b>IPv6 (optional)</b>"))
+        self.pool6_start_edit = QLineEdit(
+            self.defaults.get("pool6_start") or self.defaults.get("ipv6_pool_start") or ""
+        )
+        self.pool6_start_edit.setPlaceholderText("e.g. 2001:db8:50::100")
+        form.addRow("IPv6 Pool Start:", self.pool6_start_edit)
+
+        self.pool6_end_edit = QLineEdit(
+            self.defaults.get("pool6_end") or self.defaults.get("ipv6_pool_end") or ""
+        )
+        self.pool6_end_edit.setPlaceholderText("e.g. 2001:db8:50::1ff")
+        form.addRow("IPv6 Pool End:", self.pool6_end_edit)
+
+        self.prefix6_edit = QLineEdit(
+            str(self.defaults.get("prefix6") or self.defaults.get("ipv6_prefix") or "")
+        )
+        self.prefix6_edit.setPlaceholderText("Prefix length (e.g. 64)")
+        form.addRow("IPv6 Prefix:", self.prefix6_edit)
+
         self.description_edit = QLineEdit(self.defaults.get("description", ""))
         self.description_edit.setPlaceholderText("Friendly description (optional)")
         form.addRow("Description:", self.description_edit)
@@ -117,6 +180,35 @@ class DHCPPoolDialog(QDialog):
             except ValueError as exc:
                 return f"Invalid gateway address '{gateway_val}': {exc}"
 
+        # v0.5.231 (audit U client-7): validate the new optional
+        # IPv6 pool fields (parity with IPv4 v0.5.229 checks).
+        pool6_start = self.pool6_start_edit.text().strip()
+        pool6_end = self.pool6_end_edit.text().strip()
+        prefix6 = self.prefix6_edit.text().strip()
+        if pool6_start or pool6_end or prefix6:
+            # All three are required if any is set.
+            if not (pool6_start and pool6_end and prefix6):
+                return (
+                    "IPv6 pool needs Pool Start, Pool End, AND Prefix "
+                    "Length. Leave all three blank for an IPv4-only pool."
+                )
+            try:
+                _s6 = ipaddress.IPv6Address(pool6_start)
+                _e6 = ipaddress.IPv6Address(pool6_end)
+                if int(_s6) > int(_e6):
+                    return (
+                        f"IPv6 Pool Start ({pool6_start}) must be ≤ "
+                        f"Pool End ({pool6_end})."
+                    )
+            except ValueError as exc:
+                return f"Invalid IPv6 pool address: {exc}"
+            try:
+                _p6 = int(prefix6)
+                if _p6 < 0 or _p6 > 128:
+                    return "IPv6 Prefix must be between 0 and 128."
+            except ValueError:
+                return f"IPv6 Prefix '{prefix6}' must be a positive integer."
+
         routes_text = self.gateway_route_edit.text().strip()
         if routes_text:
             for token in routes_text.replace(";", ",").split(","):
@@ -151,6 +243,14 @@ class DHCPPoolDialog(QDialog):
             "gateway": self.gateway_edit.text().strip(),
             "gateway_routes": routes,
             "description": self.description_edit.text().strip(),
+            # v0.5.231 (audit U client-7): optional IPv6 fields. Sent
+            # verbatim; empty strings mean "IPv4-only pool" and the
+            # server persists them as empty. Named-pool consumers on
+            # the server side that don't understand these keys will
+            # ignore them safely.
+            "pool6_start": self.pool6_start_edit.text().strip(),
+            "pool6_end": self.pool6_end_edit.text().strip(),
+            "prefix6": self.prefix6_edit.text().strip(),
         }
         lease_time = int(self.lease_time_spin.value())
         if lease_time > 0:
@@ -921,10 +1021,26 @@ class DHCPHandler:
             "Refresh DHCP status for all rows.",
         )
 
+        # v0.5.231 (audit U client-11): rescue path — force-restart
+        # dnsmasq / dhclient for a stuck device. Pre-fix, a device in
+        # State=Failed / Server Down with a pool attached had no
+        # client-side retry — only Refresh (read-only). The Restart
+        # button POSTs /api/device/dhcp/restart which calls
+        # ensure_dhcp_services with force_client_restart=True.
+        self.parent.dhcp_restart_button = _dhcp_btn(
+            "reload.png" if False else "refresh.png",  # icon fallback
+            "Restart DHCP",
+            "Force-restart dnsmasq (server-mode) or dhclient (client-"
+            "mode) on the selected device. Use this to kick a stuck "
+            "DHCP daemon without re-Applying the whole device config.",
+            style=BTN_APPLY,
+        )
+
         self.parent.dhcp_manage_button.clicked.connect(self.manage_dhcp_pools)
         self.parent.dhcp_attach_button.clicked.connect(self.attach_dhcp_pools)
         self.parent.dhcp_apply_button.clicked.connect(self.apply_dhcp_pools)
         self.parent.dhcp_refresh_button.clicked.connect(self.refresh_dhcp_status)
+        self.parent.dhcp_restart_button.clicked.connect(self.restart_dhcp_service)
 
         for b in (self.parent.dhcp_manage_button, self.parent.dhcp_attach_button):
             controls.addWidget(b)
@@ -936,7 +1052,11 @@ class DHCPHandler:
         controls.addWidget(sep)
         controls.addSpacing(4)
 
-        for b in (self.parent.dhcp_apply_button, self.parent.dhcp_refresh_button):
+        for b in (
+            self.parent.dhcp_apply_button,
+            self.parent.dhcp_restart_button,
+            self.parent.dhcp_refresh_button,
+        ):
             controls.addWidget(b)
 
         controls.addStretch(1)
@@ -1138,12 +1258,25 @@ class DHCPHandler:
             # see the actual dnsmasq stderr / config error on hover
             # instead of having to grep netgen-server logs.
             _last_err = (entry.get("last_error") or "").strip()
+            # v0.5.231 (audit U monitor-6): three client-mode "off"
+            # strings (Stopped, No Lease, Requesting) look the same
+            # to operators — "why isn't this device leased?". Attach
+            # a tooltip that disambiguates. Same for the two server-
+            # mode failure modes (No Pool vs Server Down vs Failed).
+            _state_str = str(entry.get("state") or "").strip()
+            _tooltip_parts = []
             if _last_err:
+                _tooltip_parts.append(_last_err)
+            _mode = (entry.get("mode") or "").lower()
+            _explain = _state_hint_tooltip(_state_str, _mode)
+            if _explain:
+                _tooltip_parts.append(_explain)
+            if _tooltip_parts:
                 try:
                     state_item = self.parent.dhcp_table.item(
                         row, self.parent.DHCP_COL["State"])
                     if state_item is not None:
-                        state_item.setToolTip(_last_err)
+                        state_item.setToolTip("\n\n".join(_tooltip_parts))
                 except Exception:
                     pass
             # v0.5.229 (audit U client-13): the Lease IP + Gateway
@@ -1385,6 +1518,81 @@ class DHCPHandler:
 
         dialog = ManageDHCPPoolsDialog(self.parent, server_url)
         dialog.exec_()
+
+    def restart_dhcp_service(self):
+        """v0.5.231 (audit U client-11): rescue path — force-restart
+        dnsmasq (server-mode) or dhclient (client-mode) on the
+        selected device via POST /api/device/dhcp/restart.
+
+        UX: no confirm prompt for the restart itself (the operator
+        clicked the button); on completion, refresh the DHCP table
+        so the new state / lease info shows up immediately.
+        """
+        metadata = self._get_selected_metadata()
+        if not metadata:
+            QMessageBox.information(
+                self.parent, "Select Device",
+                "Select a DHCP row first — Restart operates on the "
+                "highlighted device.",
+            )
+            return
+        device_id = metadata.get("device_id")
+        if not device_id:
+            QMessageBox.warning(
+                self.parent, "Error",
+                "Unable to determine the selected device ID.",
+            )
+            return
+        server_url = self.parent.get_server_url(silent=True)
+        if not server_url:
+            QMessageBox.warning(
+                self.parent, "Server Unavailable",
+                "No server is currently configured — connect first.",
+            )
+            return
+        try:
+            resp = requests.post(
+                f"{server_url}/api/device/dhcp/restart",
+                json={"device_id": device_id},
+                timeout=10,
+            )
+        except requests.RequestException as exc:
+            QMessageBox.warning(
+                self.parent, "Restart Failed",
+                f"Could not reach the server:\n{exc}",
+            )
+            return
+        if resp.status_code != 200:
+            _err_body = ""
+            try:
+                _err_body = (resp.json() or {}).get("error") or resp.text
+            except Exception:
+                _err_body = resp.text
+            QMessageBox.warning(
+                self.parent, "Restart Failed",
+                f"HTTP {resp.status_code}: {_err_body}",
+            )
+            return
+        # Success — nudge the table to refresh so the operator sees
+        # the new state (Server Running / Leased / etc.) right away.
+        try:
+            body = resp.json() or {}
+        except Exception:
+            body = {}
+        _new_state = body.get("dhcp_state") or "(unknown)"
+        try:
+            _sb = getattr(self.parent, "statusBar", None)
+            if callable(_sb):
+                _bar = _sb()
+                if _bar is not None:
+                    _bar.showMessage(
+                        f"DHCP restart succeeded — new state: {_new_state}",
+                        4000,
+                    )
+        except Exception:
+            pass
+        # Kick a refresh so table + State column reflect reality.
+        QTimer.singleShot(500, self.refresh_dhcp_status)
 
     def attach_dhcp_pools(self):
         """Attach DHCP pools from the shared catalog to the selected server."""
