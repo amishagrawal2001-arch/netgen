@@ -283,13 +283,21 @@ class ManageDHCPPoolsDialog(QDialog):
         info_label.setStyleSheet("color: #555; background: #f3f3f3; padding: 6px; border-radius: 3px;")
         layout.addWidget(info_label)
 
-        self.table = QTableWidget(0, 9)
+        # v0.5.234: expose IPv6 pool columns. Pre-fix, the dialog
+        # (DHCPPoolDialog) accepted IPv6 fields since v0.5.231 but
+        # this list view didn't surface them at all — operators
+        # couldn't see their own IPv6 pool definitions from Manage
+        # DHCP Pools.
+        self.table = QTableWidget(0, 12)
         self.table.setHorizontalHeaderLabels(
             [
                 "Name",
                 "Pool Start",
                 "Pool End",
                 "Gateway",
+                "IPv6 Pool Start",
+                "IPv6 Pool End",
+                "IPv6 Prefix",
                 "Gateway Routes",
                 "Lease Time (s)",
                 "Description",
@@ -299,10 +307,8 @@ class ManageDHCPPoolsDialog(QDialog):
         )
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        for idx in range(1, 7):
+        for idx in range(1, 12):
             header.setSectionResizeMode(idx, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(7, QHeaderView.ResizeToContents)
-        header.setSectionResizeMode(8, QHeaderView.ResizeToContents)
         self.table.setSelectionBehavior(QTableWidget.SelectRows)
         self.table.setSelectionMode(QTableWidget.SingleSelection)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
@@ -414,8 +420,21 @@ class ManageDHCPPoolsDialog(QDialog):
         return default_entries
 
     def populate_table(self):
+        # v0.5.234: hide auto-generated device-default entries from
+        # the shared catalog. Pre-fix, every device with pool_start /
+        # pool_end in its dhcp_config had a "Default pool for device
+        # '<name>'" entry synthesized into THIS list, mixing named-
+        # pool definitions with per-device snapshots. Operators saw
+        # a device's inconsistent auto-default (e.g. pool from an
+        # earlier attach + gateway from the current template) and
+        # thought Manage Pools was showing corrupt data. Device-
+        # defaults are still visible per-device in the DHCP subtab's
+        # Pools column — this list stays focused on reusable named
+        # pools the operator explicitly created.
         self.table.setRowCount(0)
         for pool in self.pools:
+            if pool.get("__source") == "device-default":
+                continue
             row = self.table.rowCount()
             self.table.insertRow(row)
             display = [
@@ -423,6 +442,11 @@ class ManageDHCPPoolsDialog(QDialog):
                 pool.get("pool_start", ""),
                 pool.get("pool_end", ""),
                 pool.get("gateway", "") or "",
+                # v0.5.234: IPv6 columns — dialog has had these
+                # since v0.5.231; list view was missing them.
+                pool.get("pool6_start", "") or pool.get("ipv6_pool_start", "") or "",
+                pool.get("pool6_end", "") or pool.get("ipv6_pool_end", "") or "",
+                str(pool.get("prefix6") or pool.get("ipv6_prefix") or ""),
                 ", ".join(pool.get("gateway_routes") or []),
                 str(pool.get("lease_time") or ""),
                 pool.get("description", "") or "",
@@ -432,11 +456,6 @@ class ManageDHCPPoolsDialog(QDialog):
             for col, value in enumerate(display):
                 item = QTableWidgetItem(value)
                 item.setData(Qt.UserRole, pool)
-                if pool.get("__source") == "device-default":
-                    tooltip = "Default DHCP pool derived from device configuration."
-                    if pool.get("__device_name"):
-                        tooltip += f" Device: {pool['__device_name']}"
-                    item.setToolTip(tooltip)
                 self.table.setItem(row, col, item)
 
     def _selected_pool(self) -> Optional[Dict]:

@@ -2,6 +2,39 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.234] - 2026-08-31
+
+**Manage DHCP Pools window: hide auto-generated device-defaults
++ surface IPv6 columns.**
+
+Operator screenshot on 2026-08-31: Manage DHCP Pools listed
+two rows — "p1" (a legit named pool) and "device3" (auto-
+generated from a device's dhcp_config snapshot). The auto-
+generated entry had `pool_start=192.168.30.10` +
+`gateway=172.16.30.1` — inconsistent because it merged an
+earlier attach's pool (192.168.30.x) with the v0.5.225
+template's gateway (172.16.30.1). The list looked corrupt.
+
+Also: v0.5.231 added optional IPv6 fields (pool6_start /
+pool6_end / prefix6) to `DHCPPoolDialog`, but the LIST view
+had no columns for them — operators couldn't see IPv6 pool
+definitions from Manage DHCP Pools at all.
+
+Two fixes in `utils/devices_tab_dhcp.py`:
+
+- `populate_table` skips entries with `__source == "device-
+  default"`. The catalog is now focused on reusable named
+  pools the operator explicitly created. Per-device defaults
+  still surface in the DHCP subtab's Pools column
+  (v0.5.230's `default_pool` render) — that's the right
+  place to see them.
+- Table gains three new columns: IPv6 Pool Start, IPv6 Pool
+  End, IPv6 Prefix. Column count 9 → 12. Sits between
+  Gateway and Gateway Routes so operators reading L→R see
+  v4 pool → v4 gateway → v6 pool → shared routes/lease.
+
+Tests: `tests/test_v05234_manage_pools_ui.py` — 6 pass.
+
 ## [0.5.233] - 2026-08-30
 
 **Follow-up to v0.5.232 — exclude lo + disable DNS in dnsmasq
