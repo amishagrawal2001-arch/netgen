@@ -564,18 +564,59 @@ def _add_route_and_vrf_copy(
     pre-fix behaviour.
     """
     ip_flag = "-6" if family == "ipv6" else "-4"
+
+    # v0.5.238: strip `via <gateway>` when the gateway is a LOCAL
+    # IP on the target interface. Pre-fix, if the DHCP pool's
+    # gateway == the server device's own interface IP (the common
+    # case where the DHCP server IS the gateway for its clients),
+    # `ip route add 172.16.30.0/24 via 172.16.30.1 dev vlan10`
+    # was installed — asking the kernel to reach 172.16.30.x by
+    # ARP'ing for its own IP 172.16.30.1, which gets its own MAC
+    # back, and the packet loops. Symptom: server receives ICMP
+    # echoes but can't reply (no packet leaves), and pinging OUT
+    # from the server to a legit client fails too. Detect the
+    # local-gateway case and emit a connected route (no `via`).
+    _effective_gateway = gateway
+    if gateway and interface and family == "ipv4":
+        try:
+            _probe = _run_command(
+                ["/bin/sh", "-c",
+                 f"ip -4 -o addr show dev {interface} 2>/dev/null | "
+                 f"awk '{{for (i=1;i<=NF;i++) if ($i==\"inet\") "
+                 f"print $(i+1)}}'"],
+                container=container, timeout=5,
+            )
+            _own_ips = set()
+            for _cidr in (_probe.stdout or "").split():
+                _cidr = _cidr.strip()
+                if "/" in _cidr:
+                    _own_ips.add(_cidr.split("/", 1)[0])
+            if gateway in _own_ips:
+                logger.info(
+                    "%s Route %s: gateway %s is a LOCAL IP on %s — "
+                    "dropping `via %s` (connected-route only) so the "
+                    "kernel doesn't ARP-loop.",
+                    log_prefix, str(net), gateway, interface, gateway,
+                )
+                _effective_gateway = ""
+        except Exception as _probe_exc:
+            logger.debug(
+                "%s local-gateway probe failed for %s on %s: %s",
+                log_prefix, gateway, interface, _probe_exc,
+            )
+
     # Main table (unchanged pre-fix behaviour).
     try:
         cmd = ["ip", ip_flag, "route", "replace", str(net)]
-        if gateway:
-            cmd.extend(["via", gateway])
+        if _effective_gateway:
+            cmd.extend(["via", _effective_gateway])
         if interface:
             cmd.extend(["dev", interface])
         _run_command(cmd, timeout=5, container=container)
         logger.info(
             "%s Added %s %s%s%s",
             log_prefix, label, str(net),
-            f" via {gateway}" if gateway else "",
+            f" via {_effective_gateway}" if _effective_gateway else "",
             f" dev {interface}" if interface else "",
         )
     except Exception as route_exc:
@@ -589,8 +630,12 @@ def _add_route_and_vrf_copy(
         return
     try:
         vrf_cmd = ["ip", ip_flag, "route", "replace", str(net)]
-        if gateway:
-            vrf_cmd.extend(["via", gateway])
+        # v0.5.238: same local-gateway strip as the main-table
+        # branch above — the ARP-loop issue applies inside the VRF
+        # too (the VRF's routing table also lists 172.16.30.1 as
+        # local via the VRF's connected route on vlan10).
+        if _effective_gateway:
+            vrf_cmd.extend(["via", _effective_gateway])
         if interface:
             vrf_cmd.extend(["dev", interface])
         vrf_cmd.extend(["vrf", vrf_name])
@@ -598,7 +643,7 @@ def _add_route_and_vrf_copy(
         logger.info(
             "%s Added %s %s in vrf %s%s%s",
             log_prefix, label, str(net), vrf_name,
-            f" via {gateway}" if gateway else "",
+            f" via {_effective_gateway}" if _effective_gateway else "",
             f" dev {interface}" if interface else "",
         )
     except Exception as vrf_exc:

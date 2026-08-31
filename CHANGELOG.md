@@ -2,6 +2,42 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.238] - 2026-08-31
+
+**DHCP route installer no longer ARP-loops when pool gateway ==
+server's own IP.**
+
+Operator on srv06 2026-08-31: pings from DHCP clients arrived
+at the server (tcpdump saw ICMP echo requests) but no reply
+left. `ip vrf exec <vrf> ping -c 2 <client>` from the server
+also failed 100%. Root cause: `_add_route_and_vrf_copy`
+installed pool-network routes as
+```
+ip route add 172.16.30.0/24 via 172.16.30.1 dev vlan10
+ip route add 172.16.30.10/31 via 172.16.30.1 dev vlan10
+... (each pool fragment) ...
+```
+`172.16.30.1` was the server's OWN interface IP (the common
+case where the DHCP server IS the gateway for its clients).
+Kernel then ARP'd for its own IP to reach 172.16.30.x → got
+its own MAC → packet looped back to itself, never left the
+box. Both directions failed (ICMP in with no reply out AND
+outbound ping from the server both had the same problem).
+
+Fix in `utils/dhcp.py._add_route_and_vrf_copy`: probe the
+target interface's IPv4 addresses via `ip -4 -o addr show
+dev <iface>`. If the requested gateway matches one of them,
+drop `via <gw>` from the ip route command — the connected
+/24 route already covers the pool subnet. Applied to BOTH
+the main-table branch AND the VRF-mirror branch (the VRF's
+own routing table had the same bogus routes).
+
+Also fixes the log-info lines to report `_effective_gateway`
+instead of the raw `gateway` so the log matches what actually
+got installed.
+
+Tests: `tests/test_v05238_dhcp_route_loop.py` — 5 pass.
+
 ## [0.5.237] - 2026-08-31
 
 **API_GUIDE.md — DHCP endpoints get proper contracts.**
