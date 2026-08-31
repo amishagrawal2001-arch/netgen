@@ -1069,6 +1069,148 @@ def _remove_ipv4_address(interface: str, address: str, prefix: str, container=No
         )
 
 
+def _collect_ipv4_anchor_candidates(dhcp_cfg: Optional[Dict]) -> set:
+    """v0.5.239 (audit U-teardown-2): return the set of `(ip, prefix)`
+    tuples that _ensure_ipv4_address COULD have added on behalf of
+    this DHCP config, across every metadata source we track. Used
+    by stop_dhcp_server and by the /api/device/remove sweep so a
+    cleared `pool_networks` list (a prior Detach) doesn't leak the
+    anchor past device removal.
+
+    Sources scanned:
+    - ``dhcp_cfg["pool_networks"]`` — the primary source (already
+      resolved to CIDR strings).
+    - ``dhcp_cfg["additional_pools"]`` — for each pool's
+      pool_start/pool_end, derive the supernet the same way
+      _ensure_ipv4_address does (smallest prefix that spans both).
+    - ``dhcp_cfg["pool_start"]/[pool_end]`` — the top-level primary
+      pool (may be empty if the operator only used additional_pools).
+    - ``dhcp_cfg["gateway"]`` — the operator may have picked a
+      gateway outside .1 (e.g., .254); include a /24 candidate for
+      it so we don't miss the anchor when gateway ≠ .1.
+
+    Returns anchors as ``{(ip_str, prefix_len_str), ...}``.
+    """
+    if not dhcp_cfg:
+        return set()
+    anchors: set = set()
+
+    def _add_from_network(net):
+        try:
+            if not isinstance(net, ipaddress.IPv4Network):
+                return
+            hosts = list(net.hosts())
+            if not hosts:
+                return
+            anchors.add((str(hosts[0]), str(net.prefixlen)))
+        except Exception:
+            pass
+
+    def _derive_supernet(pool_start, pool_end):
+        try:
+            start = ipaddress.IPv4Address(str(pool_start))
+            end = ipaddress.IPv4Address(str(pool_end))
+        except Exception:
+            return None
+        for prefixlen in range(32, 7, -1):
+            candidate = ipaddress.IPv4Network(f"{start}/{prefixlen}", strict=False)
+            if end in candidate:
+                return candidate
+        return None
+
+    for net_str in (dhcp_cfg.get("pool_networks") or []):
+        try:
+            _add_from_network(ipaddress.ip_network(str(net_str), strict=False))
+        except Exception:
+            continue
+
+    _primary_net = _derive_supernet(dhcp_cfg.get("pool_start"), dhcp_cfg.get("pool_end"))
+    if _primary_net is not None:
+        _add_from_network(_primary_net)
+
+    for _pool in _normalize_additional_pools(dhcp_cfg.get("additional_pools")):
+        _add_pool_net = _derive_supernet(_pool.get("pool_start"), _pool.get("pool_end"))
+        if _add_pool_net is not None:
+            _add_from_network(_add_pool_net)
+
+    # gateway fallback: use its /24 supernet (matches
+    # _ensure_ipv4_address's classful assumption).
+    _gw = dhcp_cfg.get("gateway") or dhcp_cfg.get("server_interface_ip")
+    if _gw:
+        try:
+            _gw_net = ipaddress.IPv4Network(f"{_gw}/24", strict=False)
+            _add_from_network(_gw_net)
+            # Also add the gateway itself as a candidate — the operator
+            # may have picked a non-.1 gateway that _ensure_ipv4_address
+            # honored via ``server_ip = gateway``.
+            anchors.add((str(_gw), "24"))
+        except Exception:
+            pass
+
+    return anchors
+
+
+def _iface_ipv4_addresses(interface: str, container=None) -> List[tuple]:
+    """v0.5.239: enumerate ``[(ip, prefix), ...]`` currently assigned
+    to `interface` (IPv4 only). Used by the anchor sweep so we only
+    ``ip addr del`` addresses that actually exist on the wire.
+    """
+    if not interface:
+        return []
+    try:
+        _probe = _run_command(
+            ["/bin/sh", "-c",
+             f"ip -4 -o addr show dev {interface} 2>/dev/null | "
+             f"awk '{{for (i=1;i<=NF;i++) if ($i==\"inet\") print $(i+1)}}'"],
+            container=container, timeout=5,
+        )
+    except Exception:
+        return []
+    out = []
+    for cidr in (getattr(_probe, "stdout", "") or "").split():
+        if "/" not in cidr:
+            continue
+        ip, _, pfx = cidr.partition("/")
+        if ip and pfx:
+            out.append((ip, pfx))
+    return out
+
+
+def _remove_matching_ipv4_anchors(
+    interface: str, candidates: set, container=None,
+) -> List[str]:
+    """v0.5.239: remove each `(ip, prefix)` in `candidates` from
+    `interface`, but only when the address actually exists on the
+    interface's assigned list. Returns the list of anchors removed
+    (for logging). The intersection gate keeps this safe against
+    over-broad candidate sets — an anchor we didn't add on this
+    interface stays untouched.
+    """
+    if not interface or not candidates:
+        return []
+    _current = {(ip, pfx) for ip, pfx in _iface_ipv4_addresses(interface, container=container)}
+    if not _current:
+        return []
+    _removed: List[str] = []
+    for anchor_ip, anchor_pfx in list(candidates):
+        # Match either exact-prefix (168.30.1/24 candidate ↔ /24
+        # assignment) or ip-only (in case the assigned mask differs
+        # from what we guessed — e.g., operator picked a /23 pool).
+        _match = None
+        if (anchor_ip, anchor_pfx) in _current:
+            _match = (anchor_ip, anchor_pfx)
+        else:
+            for _cur_ip, _cur_pfx in _current:
+                if _cur_ip == anchor_ip:
+                    _match = (_cur_ip, _cur_pfx)
+                    break
+        if not _match:
+            continue
+        _remove_ipv4_address(interface, _match[0], _match[1], container=container)
+        _removed.append(f"{_match[0]}/{_match[1]}")
+    return _removed
+
+
 def _remove_ipv6_address(interface: str, address: str, prefix: str, container=None) -> None:
     """Remove an IPv6 address from an interface."""
     if not interface or not address or prefix is None:
@@ -2674,32 +2816,27 @@ def stop_dhcp_server(device_db, device_id: str, interface: str, container=None) 
     # /24 addresses on the interface (operator on 2026-08-31 saw
     # vlan10 carrying 192.168.30.1/24 AND 172.16.30.2/24 both
     # after a 172.16.30 pool replaced a 192.168.30 pool).
-    # Derive the anchor from the stored pool_networks in
-    # dhcp_cfg — same source stop uses for route cleanup. For
-    # each pool subnet, the anchor is `.1` (per
-    # _ensure_ipv4_address's derivation).
+    #
+    # v0.5.239 (audit U-teardown-2): expand the anchor source list.
+    # Pre-fix, this only read `pool_networks`. If a prior Detach
+    # cleared pool_networks but the DHCP daemon (or a preceding
+    # attach) had already assigned an anchor IP, stop couldn't
+    # find the anchor and it leaked past device Remove — operator
+    # on 2026-08-31 saw vlan10 STILL carrying 192.168.30.1/24
+    # AFTER the DHCP server device was fully removed. Now also
+    # derive candidate anchors from `additional_pools`,
+    # `pool_start/pool_end`, the primary/additional pools'
+    # gateway fields, and then intersect against the interface's
+    # CURRENT IPv4 addresses so we only touch what actually
+    # lives on the wire (never blindly ip addr del a mask we
+    # didn't add). The intersection gate is the safety net — an
+    # IP not there is a no-op, an IP that's there but outside
+    # every candidate stays put.
     try:
-        _stored_nets = dhcp_cfg.get("pool_networks") or [] if dhcp_cfg else []
-        _seen_anchors = set()
-        for _net_str in _stored_nets:
-            try:
-                _net = ipaddress.ip_network(str(_net_str), strict=False)
-            except (ValueError, ipaddress.AddressValueError):
-                continue
-            if not isinstance(_net, ipaddress.IPv4Network):
-                continue
-            # Skip /31 and /32 that have no usable host — they
-            # never got an anchor added.
-            _hosts = list(_net.hosts())
-            if not _hosts:
-                continue
-            _anchor = str(_hosts[0])
-            if _anchor in _seen_anchors:
-                continue
-            _seen_anchors.add(_anchor)
-            _remove_ipv4_address(
-                interface, _anchor, str(_net.prefixlen), container=container,
-            )
+        _candidate_anchors = _collect_ipv4_anchor_candidates(dhcp_cfg)
+        _remove_matching_ipv4_anchors(
+            interface, _candidate_anchors, container=container,
+        )
     except Exception as _cleanup_exc:
         logger.debug(
             "[DHCP] Failed IPv4 anchor cleanup on stop for %s: %s",

@@ -89,21 +89,36 @@ def test_u1_remove_ipv4_address_helper_exists():
 
 def test_u1_stop_iterates_stored_pool_networks_for_cleanup():
     """The stop path derives each anchor from stored pool_networks
-    (which the start path saves) and calls _remove_ipv4_address."""
+    (which the start path saves) and calls _remove_ipv4_address.
+
+    v0.5.239 promoted the inline pool_networks loop into the shared
+    `_collect_ipv4_anchor_candidates` helper (which reads
+    pool_networks + additional_pools + gateway + pool_start/end)
+    and pairs it with `_remove_matching_ipv4_anchors`. Same effect
+    (anchors get removed on stop) — just source-set-of-record moved.
+    """
     idx = DHCP.find("if ipv6_server_ip and ipv6_prefix:")
-    body = DHCP[idx:idx + 3000]
-    assert "_stored_nets = dhcp_cfg.get(\"pool_networks\")" in body
-    assert "_remove_ipv4_address(" in body
+    body = DHCP[idx:idx + 3500]
+    # v0.5.239: multi-source sweep helpers.
+    assert "_collect_ipv4_anchor_candidates(dhcp_cfg)" in body
+    assert "_remove_matching_ipv4_anchors(" in body
+    # And the helper itself must still read pool_networks (backward-compat).
+    assert 'dhcp_cfg.get("pool_networks")' in DHCP
 
 
 def test_u1_skips_tiny_pools_that_have_no_anchor():
     """/31 and /32 pools never got an anchor (start path guarded
     via v0.5.230 P server-9 fix) — stop must skip them too or
-    it'll try to remove an address that was never added."""
-    idx = DHCP.find("_stored_nets = dhcp_cfg.get(\"pool_networks\")")
-    body = DHCP[idx:idx + 2000]
-    assert "_hosts = list(_net.hosts())" in body
-    assert "if not _hosts:" in body
+    it'll try to remove an address that was never added.
+
+    v0.5.239: the .hosts() empty-skip moved into
+    _collect_ipv4_anchor_candidates. Test the helper directly.
+    """
+    idx = DHCP.find("def _collect_ipv4_anchor_candidates(")
+    end = DHCP.find("\ndef ", idx + 1)
+    body = DHCP[idx:end if end > 0 else idx + 4000]
+    assert "hosts = list(net.hosts())" in body
+    assert "if not hosts:" in body
 
 
 # --- Version bump --------------------------------------------------------

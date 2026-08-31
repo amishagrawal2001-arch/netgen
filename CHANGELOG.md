@@ -2,6 +2,67 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.239] - 2026-08-31
+
+**DHCP teardown leaks: dhcp-client container survives Edit-disable
+and pool anchor IP survives device Remove.**
+
+Operator on srv06 2026-08-31 (post-v0.5.238) reported two teardown
+bugs that survived the entire 35-finding DHCP audit + follow-on
+9-finding audit:
+
+1. Disabling DHCP via Edit (uncheck "DHCP" from the device's
+   protocols list + Apply) stopped dnsmasq / dhclient inside the
+   container but did NOT remove the container itself. `docker ps`
+   showed `dhcp-client-0c70829b-...` still `(healthy)` an hour
+   after the operator disabled DHCP.
+
+2. Removing a DHCP server device left the pool anchor IPv4
+   address (`192.168.30.1/24`) permanently on the vlan interface
+   — even though v0.5.235's `_remove_ipv4_address` was wired into
+   `stop_dhcp_server`. Root cause: the anchor sweep only read
+   `dhcp_cfg.get("pool_networks")`. When the operator Detached
+   the pool before Remove (a very common flow), Detach's cleanup
+   scrubbed `pool_networks` from dhcp_config, so the anchor sweep
+   had no addresses to try and the IP leaked past device removal.
+
+Fixes:
+
+- **run_tgen_server.py disable-DHCP branch** (Apply-time edit
+  that drops "DHCP" from `protocols`): after `stop_dhcp_server`
+  / `stop_dhcp_client`, now calls
+  `_stop_dhcp_container(remove=True)` for the previous mode.
+  Matches `/api/device/remove`'s behavior so Edit and Remove
+  leave identical clean state.
+
+- **utils/dhcp.py new helpers** —
+  `_collect_ipv4_anchor_candidates(dhcp_cfg)` derives the set of
+  `(ip, prefix)` anchors that `_ensure_ipv4_address` could have
+  added across EVERY known metadata source: `pool_networks`,
+  `additional_pools`, `pool_start/pool_end`, and `gateway`. Paired
+  with `_iface_ipv4_addresses(interface)` (enumerates the
+  interface's CURRENT IPv4 assignments) and
+  `_remove_matching_ipv4_anchors(interface, candidates)` (removes
+  only anchors that intersect with what's actually on the
+  interface — safety net against over-broad candidate sets).
+
+- **`stop_dhcp_server` anchor cleanup**: replaces v0.5.235's
+  single-source `pool_networks` loop with the new multi-source
+  sweep. Now handles the "Detach then Remove" flow (pool_networks
+  empty but additional_pools/gateway still hint at the anchor).
+
+- **`/api/device/remove` defensive sweep**: post-stop, also
+  enumerates the interface's CURRENT `.1/24` IPv4 addresses and
+  feeds them as candidates through the same
+  `_remove_matching_ipv4_anchors` helper. Any deterministic
+  anchor pattern (`.1` on a /24) still on the interface at
+  Remove time gets swept even when every dhcp_cfg field is empty.
+
+Tests: `tests/test_v05239_dhcp_teardown_leaks.py` — 7 pass.
+`tests/test_v05235_dhcp_server_bundle3.py` updated for the
+helper move (v0.5.235's inline loop is now inside
+`_collect_ipv4_anchor_candidates`) — all 8 still pass.
+
 ## [0.5.238] - 2026-08-31
 
 **DHCP route installer no longer ARP-loops when pool gateway ==

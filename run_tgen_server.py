@@ -5609,6 +5609,31 @@ def apply_device():
                                     container=_dhcp._ensure_dhcp_container(device_id, mode="client"),
                                     dhcp_config=_prev_cfg,
                                 )
+                            # v0.5.239 (audit U-teardown-1): remove the
+                            # DHCP container too. Pre-fix, this branch
+                            # (Edit → uncheck DHCP protocol) called
+                            # stop_dhcp_server/client to halt the
+                            # daemon but left the `dhcp-client-<uuid>`
+                            # / `dhcp-server-<uuid>` container running
+                            # forever. Operator on 2026-08-31 saw a
+                            # ``dhcp-client-0c70829b-...`` container
+                            # still ``(healthy)`` in ``docker ps`` an
+                            # hour after disabling DHCP on the device.
+                            # /api/device/remove already removes the
+                            # container via ``remove_container=True``;
+                            # match that behavior here so Edit and
+                            # Remove leave the same clean state.
+                            if _prev_mode in ("server", "client"):
+                                try:
+                                    _dhcp._stop_dhcp_container(
+                                        device_id, mode=_prev_mode, remove=True,
+                                    )
+                                except Exception as _ctr_exc:
+                                    logging.warning(
+                                        f"[DEVICE APPLY] Disable-DHCP: remove "
+                                        f"{_prev_mode} container for {device_id} "
+                                        f"raised: {_ctr_exc}"
+                                    )
                         except Exception as _dhcp_stop_exc:
                             logging.warning(
                                 f"[DEVICE APPLY] Disable-DHCP: stop daemons for "
@@ -6667,6 +6692,65 @@ def remove_device():
                     except Exception as dhcp_error:
                         logging.warning(f"[DHCP] Failed to stop DHCP during device removal: {dhcp_error}")
                         dhcp_remove_failures.append(f"exception: {dhcp_error}")
+
+                    # v0.5.239 (audit U-teardown-3): defensive anchor
+                    # sweep. stop_dhcp_server already tries to strip the
+                    # IPv4 anchor via _remove_matching_ipv4_anchors, but
+                    # that sweep is gated on the SAME dhcp_cfg that
+                    # /api/device/dhcp/server/pool clears on Detach. If
+                    # an operator Detached a pool before Remove — a very
+                    # common flow — pool_networks/additional_pools are
+                    # already gone from the DB by the time Remove reads
+                    # dhcp_cfg, so the anchor slipped past cleanup and
+                    # leaked onto the interface indefinitely. Do a final
+                    # sweep at Remove time using the interface's CURRENT
+                    # IPv4 addresses vs a HISTORICAL candidate set built
+                    # from every DHCP-related metadata blob we still
+                    # have (may be empty — that's fine, the intersection
+                    # gate in _remove_matching_ipv4_anchors makes this
+                    # safe against overshooting).
+                    if dhcp_mode_remove == "server" and iface_name:
+                        try:
+                            from utils import dhcp as _dhcp
+                            _candidates = _dhcp._collect_ipv4_anchor_candidates(dhcp_cfg_for_remove)
+                            # Cast a wider net at Remove time: also
+                            # enumerate current interface IPs ending in
+                            # `.1` on a /24 (the deterministic anchor
+                            # pattern _ensure_ipv4_address emits), and
+                            # add them as candidates too. Only removed
+                            # when they actually match a candidate the
+                            # intersection allows through — which now
+                            # includes themselves, so the effect is
+                            # "any .1/24 on this interface at Remove
+                            # time gets swept". Sane because the vlan
+                            # interface at that point has no legitimate
+                            # DHCP anchor left (device is going away)
+                            # and the operator's static IPv4 assignment
+                            # (device.ipv4) doesn't end in .1 by
+                            # convention — but even if it did, the
+                            # device row itself is being deleted next,
+                            # so an over-broad sweep here has no
+                            # downstream consequence.
+                            for _ip, _pfx in _dhcp._iface_ipv4_addresses(iface_name):
+                                try:
+                                    _addr = ipaddress.IPv4Address(_ip)
+                                    if _addr.packed[-1] == 1:
+                                        _candidates.add((_ip, _pfx))
+                                except Exception:
+                                    continue
+                            _swept = _dhcp._remove_matching_ipv4_anchors(
+                                iface_name, _candidates,
+                            )
+                            if _swept:
+                                logging.info(
+                                    "[DHCP REMOVE] Swept %d stray anchor(s) from %s: %s",
+                                    len(_swept), iface_name, ", ".join(_swept),
+                                )
+                        except Exception as _sweep_exc:
+                            logging.warning(
+                                "[DHCP REMOVE] Anchor sweep raised for %s: %s",
+                                iface_name, _sweep_exc,
+                            )
         except Exception as e:
             logging.warning(f"[DEVICE REMOVE] Failed to get device info from database: {e}")
         
