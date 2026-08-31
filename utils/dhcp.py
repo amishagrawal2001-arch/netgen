@@ -8,6 +8,7 @@ import os
 import re
 import shlex
 import subprocess
+import threading
 import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
@@ -298,17 +299,69 @@ def _collect_gateway_routes(dhcp_config: Dict, additional_pools: list) -> list:
 
 
 def _run_command(cmd, timeout: int = 10, check: bool = False, container=None):
-    """Run a subprocess command (optionally inside a container) and capture output."""
+    """Run a subprocess command (optionally inside a container) and capture output.
+
+    v0.5.241: container path now enforces `timeout`. Pre-fix, the
+    subprocess.run branch below honored `timeout` but the
+    container.exec_run branch had NO timeout enforcement at all —
+    docker-py's exec_run blocks until the exec finishes, and a
+    hanging dhclient/dnsmasq/pkill inside the container would
+    freeze the entire request thread indefinitely. That's why
+    `/api/device/remove` for a DHCP-mode device hung 90+ seconds
+    on srv06 (2026-08-31), never got to the `device_db.remove_device`
+    call, and the operator's UI kept showing the "removed" row
+    because the DB row was never actually deleted.
+
+    Root cause: dhclient's `-r` release attempts to send DHCPRELEASE.
+    If the DHCP server is unreachable (never-leased stuck-in-
+    Requesting client), dhclient can wait indefinitely for the ACK.
+
+    Fix: run the exec in a thread and enforce the timeout on
+    thread.join(). If the exec doesn't finish in time, return a
+    non-zero "timed out" result and let the caller move on. The
+    lingering exec inside the container still runs to completion
+    on its own (docker-py leaks the API socket, but the container
+    is usually being removed right after in the callers we care
+    about — and even if it isn't, one leaked exec per timeout is
+    a tiny cost compared to hanging the whole request forever).
+    """
     cmd_display = cmd if isinstance(cmd, str) else " ".join(cmd)
     if container:
         logger.debug("[DHCP CMD][container %s] %s", container.name, cmd_display)
         exec_cmd = cmd if isinstance(cmd, (list, tuple)) else ["/bin/sh", "-c", cmd]
-        exec_result = container.exec_run(
-            exec_cmd,
-            stdout=True,
-            stderr=True,
-            demux=True,
-        )
+        _holder: Dict = {}
+
+        def _do_exec():
+            try:
+                _holder["result"] = container.exec_run(
+                    exec_cmd,
+                    stdout=True,
+                    stderr=True,
+                    demux=True,
+                )
+            except Exception as _exc:
+                _holder["exc"] = _exc
+
+        _t = threading.Thread(target=_do_exec, name=f"dhcp-exec-{container.name}", daemon=True)
+        _t.start()
+        _t.join(timeout=max(1, int(timeout)))
+        if _t.is_alive():
+            logger.warning(
+                "[DHCP CMD][container %s] TIMEOUT after %ds: %s "
+                "(exec continues in background, thread abandoned)",
+                container.name, timeout, cmd_display,
+            )
+            result = SimpleNamespace(
+                returncode=124,  # Conventional shell "timed out" exit code.
+                stdout="",
+                stderr=f"docker exec timed out after {timeout}s",
+            )
+            if check:
+                raise subprocess.TimeoutExpired(exec_cmd, timeout)
+            return result
+        if "exc" in _holder:
+            raise _holder["exc"]
+        exec_result = _holder["result"]
         stdout, stderr = exec_result.output if isinstance(exec_result.output, tuple) else (exec_result.output, b"")
         stdout = stdout.decode() if isinstance(stdout, (bytes, bytearray)) else (stdout or "")
         stderr = stderr.decode() if isinstance(stderr, (bytes, bytearray)) else (stderr or "")

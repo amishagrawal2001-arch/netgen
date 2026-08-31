@@ -6154,7 +6154,12 @@ class DevicesTab(QWidget):
                 "device_name": device_name,
             }
             logger.debug(f"Calling cleanup API with payload: {cleanup_payload}")
-            cleanup_resp = requests.post(f"{server_url}/api/device/cleanup", json=cleanup_payload, timeout=10)
+            # v0.5.241 (audit U remove-hang): timeout bumped 10 → 60.
+            # Cleanup can span multiple in-container `ip addr del`
+            # subprocess calls each with its own 5–10s guard; a
+            # 10s client-side ceiling times out spuriously the
+            # moment the server hits any hiccup.
+            cleanup_resp = requests.post(f"{server_url}/api/device/cleanup", json=cleanup_payload, timeout=60)
             if cleanup_resp.status_code == 200:
                 removed_ips = cleanup_resp.json().get("removed_ips", [])
                 logger.debug(f"Successfully cleaned up IPs: {removed_ips}")
@@ -6179,14 +6184,79 @@ class DevicesTab(QWidget):
                 "protocols": protocol_list,
             }
             logger.debug(f"Calling remove API with payload: {remove_payload}")
-            remove_resp = requests.post(f"{server_url}/api/device/remove", json=remove_payload, timeout=10)
+            # v0.5.241 (audit U remove-hang): timeout bumped 10 → 60.
+            # /api/device/remove for a DHCP device runs stop_dhcp_*
+            # (which used to hang forever pre-v0.5.241 because
+            # container.exec_run had no timeout), plus FRR container
+            # stop, VXLAN cleanup, route-pool cleanup, and finally
+            # the DB delete. Even with the v0.5.241 exec-timeout fix,
+            # a slow docker daemon or a large device can push the
+            # total past 30s. Pre-fix, the operator saw the row
+            # DISAPPEAR from the table (optimistic UI removal), then
+            # REAPPEAR on the next DHCP-tab refresh because the DB
+            # row never got deleted server-side — silent data loss
+            # for the operator.
+            remove_resp = requests.post(f"{server_url}/api/device/remove", json=remove_payload, timeout=60)
             if remove_resp.status_code == 200:
-                logger.debug(f"Successfully removed device '{device_name}' from server")
+                # v0.5.241: also verify status:"removed" (server sets
+                # "partial" when DB delete failed even if HTTP=200).
+                try:
+                    _body = remove_resp.json() or {}
+                except Exception:
+                    _body = {}
+                _status = _body.get("status")
+                _db_removed = bool(_body.get("database_removed"))
+                if _status == "removed" and _db_removed:
+                    logger.debug(f"Successfully removed device '{device_name}' from server")
+                else:
+                    logger.warning(
+                        f"Remove API returned HTTP 200 but server reported partial "
+                        f"removal for '{device_name}': status={_status!r}, "
+                        f"database_removed={_db_removed}. The row may reappear "
+                        f"in the DHCP tab on refresh — the DB row was not deleted."
+                    )
+                    from PyQt5.QtWidgets import QMessageBox
+                    QMessageBox.warning(
+                        self, "Partial Removal",
+                        f"Server reported partial removal for '{device_name}':\n"
+                        f"status={_status!r}, database_removed={_db_removed}\n\n"
+                        f"The DB row was not deleted — the device will reappear "
+                        f"on the next DHCP-tab refresh. Check server logs."
+                    )
             else:
-                logger.debug(f"Remove API failed: {remove_resp.status_code} - {remove_resp.text}")
+                logger.warning(
+                    f"Remove API failed for '{device_name}': "
+                    f"{remove_resp.status_code} - {remove_resp.text}"
+                )
+                from PyQt5.QtWidgets import QMessageBox
+                QMessageBox.warning(
+                    self, "Remove Failed",
+                    f"Failed to remove '{device_name}' from server:\n"
+                    f"HTTP {remove_resp.status_code}: {remove_resp.text}\n\n"
+                    f"The row will reappear on refresh."
+                )
 
+        except requests.exceptions.Timeout as exc:
+            # v0.5.241: surface remove-hang timeouts. Pre-fix, a
+            # timeout landed in logger.error and vanished into a
+            # log file the operator never checks; the row silently
+            # reappeared on refresh with no explanation.
+            logger.error(f"Timeout removing device '{device_name}' from server: {exc}")
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self, "Remove Timed Out",
+                f"Server took longer than 60s to remove '{device_name}':\n{exc}\n\n"
+                f"The row will reappear on refresh — the DB row was likely not "
+                f"deleted. Check server logs for a hanging DHCP or container-stop step."
+            )
         except Exception as exc:
             logger.error(f"Failed to remove device '{device_name}' from server: {exc}")
+            from PyQt5.QtWidgets import QMessageBox
+            QMessageBox.warning(
+                self, "Remove Failed",
+                f"Failed to remove '{device_name}' from server:\n{exc}\n\n"
+                f"The row may reappear on refresh."
+            )
 
     def prompt_add_device(self):
         """Open AddDeviceDialog, persist to model, refresh table."""

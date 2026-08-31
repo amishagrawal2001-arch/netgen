@@ -2,6 +2,59 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.241] - 2026-08-31
+
+**Remove hangs forever on DHCP-mode devices; row disappears then
+reappears on refresh.**
+
+Operator on srv06 2026-08-31 reported: after clicking Remove on a
+DHCP client row, the row disappeared briefly then came back on the
+next DHCP-tab refresh. Same behavior for DHCP server devices.
+
+Trace on srv06:
+
+    23:19:37 POST /api/device/remove from client
+    23:19:37 [DEVICE REMOVE] Successfully cleaned up VXLAN
+    23:19:37 [DHCP] Stopping DHCP client before removing device …
+    (…never returns…)
+
+`stop_dhcp_client` hung indefinitely. The client's 10 s HTTP
+timeout gave up, but the server thread kept blocking. The
+`device_db.remove_device` call at the END of `remove_device()`
+was NEVER reached, so the DB row survived. The client optimistically
+removed the row from the table on click, then the next
+`refresh_dhcp_status` fetched the DB (row still there) and put it
+back in the UI. Silent data loss.
+
+**Root cause** (utils/dhcp.py `_run_command`): the container path
+called `container.exec_run()` with NO timeout enforcement. The
+`timeout` parameter was only honored on the `subprocess.run()`
+branch. When dhclient's `-r` release blocks (e.g., waiting for
+DHCPRELEASE ack from an unreachable server on a stuck-in-Requesting
+client), the entire request thread freezes.
+
+Fixes:
+
+- **utils/dhcp.py `_run_command` container path**: runs
+  `container.exec_run()` in a `threading.Thread`, enforces
+  `timeout` via `thread.join(timeout=…)`. On expiry, returns
+  `exit_code=124` (shell's conventional "timeout" convention)
+  so callers can move on. The lingering exec inside the
+  container keeps running — cheap cost vs. a hung request
+  thread. `check=True` callers get `subprocess.TimeoutExpired`.
+
+- **widgets/devices_tab.py `_remove_device_from_server`**:
+  timeouts on both `/api/device/cleanup` and `/api/device/remove`
+  bumped 10 s → 60 s. HTTP-error path, `requests.Timeout`, and
+  server-reported `status:"partial"` / `database_removed:False`
+  now surface a QMessageBox instead of silent `logger.debug` —
+  the operator sees WHY the row reappeared, not just that it did.
+
+Same bug affected **DHCP server Remove** (same `_run_command`
+container path, same missing timeout, same behavior).
+
+Tests: `tests/test_v05241_remove_hang.py` — 9 pass.
+
 ## [0.5.240] - 2026-08-31
 
 **DHCP buttons actually work: Restart no longer times out, dhclient
