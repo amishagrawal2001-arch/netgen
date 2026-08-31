@@ -2,6 +2,33 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.233] - 2026-08-30
+
+**Follow-up to v0.5.232 — exclude lo + disable DNS in dnsmasq
+config, so the VRF-wrapped dnsmasq doesn't try to bind lo's
+per-device loopback IPs.**
+
+Operator retest after v0.5.232 hit a new `Address not available`
+— but this time on `192.255.10.3`, not the pool's IP. That's a
+netgen-assigned per-device loopback address on `lo`. With
+`interface=vlan10` and `bind-interfaces`, dnsmasq bound the DHCP
+socket only to vlan10 — but it ALSO opened its DNS resolver
+which iterates ALL addresses on lo and tries to bind each one.
+Since the whole process is wrapped in `ip vrf exec vrf-<device>`
+(v0.5.232), lo's addresses (which live in the default VRF's
+routing table) aren't reachable → EADDRNOTAVAIL → dnsmasq
+exits, State=Failed.
+
+Two dnsmasq config lines close it:
+- `except-interface=lo` — dnsmasq skips lo entirely. We don't
+  want DHCP served on lo anyway.
+- `port=0` — disables the DNS resolver entirely. netgen uses
+  dnsmasq strictly for DHCP; no reason for a DNS port per
+  device, and removing DNS eliminates the second bind() code
+  path that was scanning lo addresses.
+
+Tests: `tests/test_v05233_dhcp_lo_exclude.py` — 5 pass.
+
 ## [0.5.232] - 2026-08-30
 
 **dnsmasq now launches inside the device's VRF so `bind()` can

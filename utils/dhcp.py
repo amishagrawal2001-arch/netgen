@@ -1908,7 +1908,23 @@ def start_dhcp_server(
 
     config_lines = [
         f"interface={interface}",
+        # v0.5.233: skip loopback binding. Even with
+        # bind-interfaces + interface=vlan10, dnsmasq's DNS resolver
+        # tries to bind to lo's addresses (127.0.0.1 + any other
+        # globally-scoped IPs on lo — netgen assigns per-device
+        # loopback IPs like 192.255.10.3 to lo). When the whole
+        # process is wrapped in `ip vrf exec vrf-<device>` (v0.5.232),
+        # those loopback addresses aren't reachable from the VRF's
+        # routing table, so bind() returns EADDRNOTAVAIL and dnsmasq
+        # exits. Explicitly excluding lo (which we don't want DHCP
+        # serving on anyway) sidesteps the whole problem.
+        "except-interface=lo",
         "bind-interfaces",
+        # v0.5.233: disable the DNS resolver entirely. netgen uses
+        # dnsmasq strictly for DHCP; there's no reason for a DNS
+        # port to be open per device, and it removes a second source
+        # of bind-address confusion.
+        "port=0",
         "dhcp-authoritative",
         f"dhcp-leasefile={leasefile}",
         f"pid-file={pidfile}",
