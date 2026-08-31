@@ -877,10 +877,40 @@ def _ensure_ipv4_address(
         except Exception:
             pass
     if not server_ip:
-        # `.1` of the pool network — avoids the pool range itself.
+        # v0.5.230 (audit P server-9): pool_network.hosts() is empty
+        # on /31 (RFC 3021 point-to-point, 0 usable hosts by the
+        # default iterator) and /32 (single host, iterator returns
+        # nothing). Pre-fix, `list(...)[0]` raised IndexError which
+        # got swallowed by the bare `except Exception: return None`
+        # so the operator saw no last_error explaining WHY the
+        # server couldn't derive an IP. Fall through to using the
+        # first address of the network (or the network address on
+        # /32) explicitly, and if the pool truly is that small
+        # return None with a clear log line — the caller writes it
+        # to dhcp_last_error via _handle_start_failure.
         try:
-            server_ip = str(list(pool_network.hosts())[0])
-        except Exception:
+            hosts_iter = list(pool_network.hosts())
+            if hosts_iter:
+                server_ip = str(hosts_iter[0])
+            elif pool_network.prefixlen == 32:
+                # /32 = pool of exactly one host; use it.
+                server_ip = str(pool_network.network_address)
+            elif pool_network.prefixlen == 31:
+                # /31 = two hosts; hosts() returns [] but both
+                # addresses are valid endpoints.
+                server_ip = str(pool_network.network_address)
+            else:
+                logger.warning(
+                    "[DHCP] Pool network %s has no usable host for the "
+                    "server IP — pool is too small (prefix=%d).",
+                    pool_network, pool_network.prefixlen,
+                )
+                return None
+        except Exception as exc:
+            logger.warning(
+                "[DHCP] Could not derive server IP from pool %s: %s",
+                pool_network, exc,
+            )
             return None
 
     mask_bits = ipv4_mask or str(pool_network.prefixlen)
@@ -1134,8 +1164,16 @@ def _flush_ipv6(interface: str, container=None) -> None:
                 if "/" not in cidr:
                     continue
                 ip, prefix = cidr.split("/", 1)
-                # Skip link-local addresses (fe80::/10)
-                if ip.startswith("fe80:"):
+                # v0.5.230 (audit P server-11): link-local is
+                # fe80::/10, which covers fe80:: through febf::. The
+                # pre-fix `startswith("fe80:")` only matched addresses
+                # in the fe80::/16 sub-range, missing fe81..febf.
+                # Use ipaddress.IPv6Address.is_link_local so the check
+                # matches the actual scope the intent describes.
+                try:
+                    if ipaddress.IPv6Address(ip).is_link_local:
+                        continue
+                except (ipaddress.AddressValueError, ValueError):
                     continue
                 # Remove the address
                 try:
@@ -1833,8 +1871,35 @@ def start_dhcp_server(
             logger.info("[DHCP] Server-mode IPv4 anchor on %s: %s",
                         interface, assigned)
 
-    if ipv6_enabled and ipv6_server_ip and ipv6_prefix:
-        _ensure_ipv6_address(interface, ipv6_server_ip, ipv6_prefix, container=container)
+    if ipv6_enabled and ipv6_prefix:
+        # v0.5.230 (audit P server-10): auto-derive IPv6 server IP
+        # from the pool subnet when the operator didn't supply one,
+        # matching the IPv4-side v0.5.222 fix. Pre-fix, an IPv6-only
+        # pool with no explicit server_ip failed to bind with the
+        # same "no interface with matching address" that IPv4 was
+        # fixed to avoid.
+        _v6_ip = ipv6_server_ip
+        if not _v6_ip and ipv6_pool_start:
+            try:
+                _v6_net = ipaddress.IPv6Network(
+                    f"{ipv6_pool_start}/{ipv6_prefix}", strict=False,
+                )
+                _hosts6 = list(_v6_net.hosts())
+                if _hosts6:
+                    _v6_ip = str(_hosts6[0])
+                else:
+                    _v6_ip = str(_v6_net.network_address)
+                logger.info(
+                    "[DHCP] Derived IPv6 server IP %s from pool %s (no explicit ipv6_server_ip)",
+                    _v6_ip, _v6_net,
+                )
+            except (ipaddress.AddressValueError, ValueError) as _v6_exc:
+                logger.warning(
+                    "[DHCP] Could not derive IPv6 server IP from pool %s/%s: %s",
+                    ipv6_pool_start, ipv6_prefix, _v6_exc,
+                )
+        if _v6_ip:
+            _ensure_ipv6_address(interface, _v6_ip, ipv6_prefix, container=container)
 
     pidfile = os.path.join(DNSMASQ_PID_DIR, f"dnsmasq-{interface}.pid")
     leasefile = os.path.join(DNSMASQ_LEASE_DIR, f"dnsmasq-{interface}.leases")

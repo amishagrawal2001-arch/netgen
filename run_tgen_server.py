@@ -6864,12 +6864,23 @@ def get_dhcp_status():
             if dhcp_mode == "server" and not pool_names["primary"] and not pool_names["additional"]:
                 pool_start = dhcp_cfg.get("pool_start")
                 pool_end = dhcp_cfg.get("pool_end")
+                # v0.5.230 (audit U client-9): also surface IPv6 pool.
+                # Pre-fix, an IPv6-only server row displayed blank
+                # "Pools" (State could be Server Running with no pool
+                # text — very confusing).
+                pool6_start = dhcp_cfg.get("ipv6_pool_start")
+                pool6_end = dhcp_cfg.get("ipv6_pool_end")
+                default_pool = {}
                 if pool_start and pool_end:
-                    default_pool = {
-                        "pool_start": pool_start,
-                        "pool_end": pool_end,
-                        "pool_range": f"{pool_start}-{pool_end}",
-                    }
+                    default_pool["pool_start"] = pool_start
+                    default_pool["pool_end"] = pool_end
+                    default_pool["pool_range"] = f"{pool_start}-{pool_end}"
+                if pool6_start and pool6_end:
+                    default_pool["pool6_start"] = pool6_start
+                    default_pool["pool6_end"] = pool6_end
+                    default_pool["pool6_range"] = f"{pool6_start}-{pool6_end}"
+                if not default_pool:
+                    default_pool = None
 
             rows.append({
                 "device_id": device_id,

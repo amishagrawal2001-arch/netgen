@@ -1501,7 +1501,20 @@ class AddDeviceDialog(QDialog):
             mode = self.dhcp_mode_combo.currentText() if hasattr(self, "dhcp_mode_combo") else "Client"
         is_server = mode.lower() == "server"
         is_client = mode.lower() == "client"
-        enable_server_fields = is_server and self.dhcp_mode_combo.isEnabled()
+        # v0.5.230 (audit U client-5): honor the DHCP IPv4 sub-checkbox
+        # when Server mode is selected. Pre-fix, switching combo to
+        # Server blanket-enabled the IPv4 pool fields even when
+        # dhcp_ipv4_enabled_checkbox was off — the operator ended up
+        # with pool fields that couldn't actually take effect.
+        _ipv4_af_on = (
+            self.dhcp_ipv4_enabled_checkbox.isChecked()
+            if hasattr(self, "dhcp_ipv4_enabled_checkbox") else True
+        )
+        enable_server_fields = (
+            is_server
+            and self.dhcp_mode_combo.isEnabled()
+            and _ipv4_af_on
+        )
         for widget in (self.dhcp_pool_start_input, self.dhcp_pool_end_input, self.dhcp_lease_time_input, self.dhcp_gateway_route_input):
             widget.setEnabled(enable_server_fields)
         if enable_server_fields:

@@ -106,6 +106,17 @@ class DHCPPoolDialog(QDialog):
         except ValueError as exc:
             return f"Invalid pool address: {exc}"
 
+        # v0.5.230 (audit U client-8): validate the gateway address.
+        # Pre-fix, arbitrary strings were accepted and saved to the
+        # server → dnsmasq refused to launch later with an opaque
+        # config error.
+        gateway_val = self.gateway_edit.text().strip()
+        if gateway_val:
+            try:
+                ipaddress.IPv4Address(gateway_val)
+            except ValueError as exc:
+                return f"Invalid gateway address '{gateway_val}': {exc}"
+
         routes_text = self.gateway_route_edit.text().strip()
         if routes_text:
             for token in routes_text.replace(";", ",").split(","):
@@ -463,10 +474,14 @@ class ManageDHCPPoolsDialog(QDialog):
 class AttachDHCPPoolsDialog(QDialog):
     """Dialog to attach one or more DHCP pools to a device."""
 
-    def __init__(self, parent, server_url: str, device_name: str, existing_selection: Optional[Dict] = None):
+    def __init__(self, parent, server_url: str, device_name: str, existing_selection: Optional[Dict] = None, device: Optional[Dict] = None):
         super().__init__(parent)
         self.server_url = server_url
         self.device_name = device_name
+        # v0.5.230 (audit U client-10): the parent now passes the
+        # full device dict so we can pre-populate the gateway
+        # override field with the current stored value.
+        self.device = device or {}
         self.existing_selection = existing_selection or {"primary": None, "additional": []}
         self.pools: List[Dict] = []
         self.selection: Optional[Dict] = None
@@ -528,9 +543,30 @@ class AttachDHCPPoolsDialog(QDialog):
         options_layout.addSpacing(20)
         options_layout.addWidget(QLabel("Gateway Override:"))
         self.gateway_override_edit = QLineEdit()
-        self.gateway_override_edit.setPlaceholderText("Leave blank to use pool-defined gateway")
-        self.gateway_override_edit.setFixedWidth(220)
+        # v0.5.230 (audit U client-10): pre-populate with the current
+        # stored gateway (from dhcp_config.gateway) so the operator can
+        # see + edit + BLANK it. Pre-fix, the field was always empty
+        # and the get_payload path only sent the value when truthy —
+        # meaning the operator could never CLEAR a previously-set
+        # override. Now empty = explicit clear (see get_payload edit
+        # below for the paired sender change).
+        _current_gw = ""
+        try:
+            _current_gw = str(
+                (self.device or {}).get("dhcp_config", {}).get("gateway") or ""
+            )
+        except Exception:
+            _current_gw = ""
+        self.gateway_override_edit.setText(_current_gw)
+        self.gateway_override_edit.setPlaceholderText(
+            "Blank = clear override; enter an IP to override the pool-defined gateway"
+        )
+        self.gateway_override_edit.setFixedWidth(240)
         options_layout.addWidget(self.gateway_override_edit)
+        _clear_btn = QPushButton("Clear")
+        _clear_btn.setToolTip("Clear the gateway override — device will use each pool's own gateway.")
+        _clear_btn.clicked.connect(lambda: self.gateway_override_edit.setText(""))
+        options_layout.addWidget(_clear_btn)
         options_layout.addStretch()
         layout.addLayout(options_layout)
 
@@ -1020,7 +1056,27 @@ class DHCPHandler:
             except Exception:
                 pass
             if err and err != "cancelled":
-                # Non-fatal — leave the table alone. Log already emitted.
+                # v0.5.230 (audit P client-12): pre-fix, refresh errors
+                # were silently logged and the table stayed with stale
+                # data — the operator had no way to know why the row
+                # counts didn't update. Now surface a status-bar
+                # message (non-modal, doesn't block workflow) so the
+                # user sees the failure.
+                try:
+                    _msg = f"DHCP status refresh failed: {err}"
+                    _sb = getattr(self.parent, "statusBar", None)
+                    if callable(_sb):
+                        _bar = _sb()
+                        if _bar is not None:
+                            _bar.showMessage(_msg, 5000)
+                    elif hasattr(self.parent, "main_window"):
+                        _mw = self.parent.main_window
+                        if _mw is not None and hasattr(_mw, "statusBar"):
+                            _bar = _mw.statusBar()
+                            if _bar is not None:
+                                _bar.showMessage(_msg, 5000)
+                except Exception:
+                    pass
                 return
             if err == "cancelled":
                 return
@@ -1182,6 +1238,16 @@ class DHCPHandler:
                 )
                 if pool_range:
                     display_parts.append(f"{pool_range} (default)")
+                # v0.5.230 (audit U client-9): also render IPv6 pool.
+                # Pre-fix, an IPv6-only server row's Pools column was
+                # blank because only the IPv4 default_pool was checked.
+                pool6_range = default_pool.get("pool6_range") or (
+                    f"{default_pool.get('pool6_start', '')}-{default_pool.get('pool6_end', '')}"
+                    if default_pool.get("pool6_start") and default_pool.get("pool6_end")
+                    else ""
+                )
+                if pool6_range:
+                    display_parts.append(f"{pool6_range} (v6 default)")
 
         return ", ".join(display_parts) if display_parts else ""
 
@@ -1411,6 +1477,10 @@ class DHCPHandler:
             server_url,
             metadata.get("entry", {}).get("device_name") or device_data.get("device_name") or "Selected Device",
             existing_selection=existing_selection,
+            # v0.5.230 (audit U client-10): pass the full device entry
+            # so the Gateway Override field can pre-populate with the
+            # currently-stored override value.
+            device=metadata.get("entry") or device_data,
         )
         if attach_dialog.exec_() != QDialog.Accepted:
             return

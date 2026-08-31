@@ -215,6 +215,24 @@ class DHCPClientMonitor:
                 if _status == "stopped":
                     continue
                 result.append(device)
+            # v0.5.230 (audit P monitor-8): prune restart-attempt
+            # counters for device_ids that no longer exist in the
+            # DB. Pre-fix, deleting a device from the UI left its
+            # entry in _dhcp_restart_attempts for the process's
+            # lifetime — no functional bug, but the dict grew
+            # unbounded across long-running sessions.
+            _live_ids = {d.get("device_id") for d in devices}
+            _orphaned = [
+                did for did in list(self._dhcp_restart_attempts.keys())
+                if did not in _live_ids
+            ]
+            for _did in _orphaned:
+                self._dhcp_restart_attempts.pop(_did, None)
+            if _orphaned:
+                logger.debug(
+                    "[DHCP MONITOR] Pruned %d orphan restart-attempt entries: %s",
+                    len(_orphaned), _orphaned,
+                )
             return result
         except Exception as exc:
             logger.error("[DHCP MONITOR] Failed to fetch devices: %s", exc)
@@ -310,11 +328,25 @@ class DHCPClientMonitor:
         return False
 
     def _note_restart_attempt(self, device_id: str) -> None:
+        # v0.5.230 (audit P monitor-7): pre-fix, if the last attempt
+        # was older than _BACKOFF_WINDOW_SECONDS (300s), the counter
+        # was zeroed on the next attempt — so the effective delay
+        # cap was ~240–480s (count 4–5) even though
+        # _BACKOFF_MAX_SECONDS advertised 30 min. That defeated
+        # the "escalating backoff for chronic failures" intent —
+        # a device that failed steadily every ~5 min would restart
+        # forever at the low delay tier. Now: window expiry
+        # PARTIALLY resets — decrement by 1 (or halve) instead of
+        # zeroing — so a genuinely fixed device with an accidental
+        # blip still eventually resets via _note_leased, but a
+        # chronic failure keeps escalating.
         now = time.time()
         state = self._dhcp_restart_attempts.get(device_id)
         if state and (now - float(state.get("last_attempt") or 0.0)) > _BACKOFF_WINDOW_SECONDS:
-            # Window expired — reset before recording this attempt.
-            state = None
+            # Window expired — decay the counter by half instead of
+            # zeroing so the escalating cap remains reachable.
+            _decayed = max(0, int(state.get("count") or 0) // 2)
+            state = {"count": _decayed, "last_attempt": 0.0}
         if not state:
             state = {"count": 0, "last_attempt": 0.0}
         state["count"] = int(state.get("count") or 0) + 1
@@ -660,8 +692,40 @@ class DHCPClientMonitor:
                                         refreshed.get("dhcp_state"),
                                         refreshed.get("dhcp_lease_ip"),
                                     )
-                                    if refreshed.get("dhcp_state") == "Leased":
+                                    # v0.5.230 (audit P monitor-10):
+                                    # match the pre-restart check at
+                                    # line 625 — require state=Leased
+                                    # AND dhcp_running. Pre-fix, a
+                                    # partial refresh where dhcp_running
+                                    # was stale (dhclient still bringing
+                                    # the lease live) prematurely
+                                    # cleared the backoff counter and
+                                    # the next real failure hit a fresh
+                                    # counter (skipping the escalating
+                                    # backoff).
+                                    if (
+                                        refreshed.get("dhcp_state") == "Leased"
+                                        and refreshed.get("dhcp_running")
+                                    ):
                                         self._note_leased(device_id)
+                                        # v0.5.230 (audit P monitor-11):
+                                        # record the recovery
+                                        # transition to history — pre-
+                                        # fix the monitor-driven restart
+                                        # → Leased jump was never
+                                        # written to device_state_history
+                                        # so the Ctrl+H timeline showed
+                                        # only the pre-restart failure.
+                                        try:
+                                            self.device_db.add_state_transition(
+                                                device_id, "dhcp", "Leased",
+                                                detail={
+                                                    "restart_recovery": True,
+                                                    "lease_ip": refreshed.get("dhcp_lease_ip"),
+                                                },
+                                            )
+                                        except Exception:
+                                            pass
                         except Exception as restart_exc:
                             logger.error(
                                 "[DHCP MONITOR] Failed to restart dhclient for %s: %s",

@@ -2,6 +2,103 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.230] - 2026-08-30
+
+**DHCP audit bundle #2 — 12 more findings from the 35-audit
+(v0.5.229 fixed 15). Remaining 4 are heavier lifts queued for
+v0.5.231.**
+
+Server-side:
+- P server-9: `_ensure_ipv4_address` on /31 (RFC 3021 p2p) or
+  /32 pools — `pool_network.hosts()` returns [] on both, and
+  the pre-fix `list(...)[0]` raised IndexError swallowed by
+  a bare `except`. Operator saw no `dhcp_last_error` for the
+  root cause. Now explicit handling for /31 (uses network
+  address) and /32 (single host), plus a clear log line if
+  the pool truly is unusable.
+- P server-10: `_ensure_ipv6_address` auto-derivation.
+  Pre-fix, an IPv6-only pool with no explicit `ipv6_server_ip`
+  failed to bind with "no interface with matching address" —
+  the same v0.5.222 shape but on the v6 side. Now derives the
+  first host of the IPv6 pool subnet when server_ip is absent,
+  matching the IPv4 auto-derivation.
+- P server-11: `_flush_ipv6` link-local skip. Pre-fix,
+  `ip.startswith("fe80:")` only matched fe80::/16, missing
+  fe80::/10's fe81..febf range. Now `IPv6Address.is_link_local`
+  which matches the actual scope.
+
+Monitor:
+- P monitor-7: Backoff counter previously ZEROED after 300s of
+  idle, so the effective delay cap was ~240–480s (count 4–5)
+  even though `_BACKOFF_MAX_SECONDS` advertised 30 min. A
+  device failing steadily every ~5 min would restart forever
+  at the low delay tier. Now HALVES the counter on window
+  expiry so the escalating cap remains reachable.
+- P monitor-8: `_dhcp_restart_attempts` dict never pruned
+  when a device was deleted from the DB — orphan entries
+  lived for the process's lifetime. Now pruned each poll.
+- P monitor-10: Post-restart lease-detection previously
+  only checked `state=="Leased"`, but the pre-restart branch
+  checked `state=="Leased" AND dhcp_running`. A partial
+  refresh where `dhcp_running` was stale prematurely cleared
+  the backoff counter. Now matches the pre-restart check.
+- P monitor-11: Monitor-driven restart → Leased recovery
+  was never recorded to `device_state_history`. Ctrl+H
+  timeline only showed the pre-restart failure. Now written
+  with a `restart_recovery: True` detail flag.
+
+Client UI:
+- U client-5: `_on_dhcp_mode_changed` blanket-enabled IPv4
+  pool fields regardless of `dhcp_ipv4_enabled_checkbox`
+  state. Operator ended up with pool fields that couldn't
+  take effect. Now respects the AF sub-checkbox.
+- U client-8: `DHCPPoolDialog._validate` now validates the
+  gateway address (was accepted as arbitrary string, saved
+  to server, dnsmasq refused later with opaque config error).
+- U client-9: DHCP subtab "Pools" column now renders IPv6
+  default_pool too. Pre-fix, IPv6-only server rows had a
+  blank Pools column while State could be "Server Running"
+  — confusing. New format: `172.16.30.10-200 (default),
+  2001:db8::100-1ff (v6 default)`.
+- U client-10: Attach DHCP Pools dialog's Gateway Override
+  field now pre-populates with the current stored value
+  and includes a Clear button. Pre-fix, the field was
+  always empty on open and empty-string wasn't sent as
+  explicit-clear — operator could never remove a
+  previously-set override without editing the DB.
+- P client-12: `refresh_dhcp_status` fetch errors now
+  surface via the status bar (5s timeout). Pre-fix, the
+  handler logged and returned silently — table stayed
+  with stale data and the operator got no visible
+  indication of the failure.
+
+Deferred to v0.5.231 (4 heavier lifts):
+
+- U client-7: named DHCP pools are IPv4-only.
+  `DHCPPoolDialog` has no IPv6 pool_start/pool_end/prefix
+  fields, so IPv6 DHCP servers can only be built via the
+  Add Device inline block, never as reusable named pools.
+- U client-11: no rescue path — DHCP subtab has no
+  "Restart dnsmasq" or "Release lease" button. A device
+  stuck in State=Failed with a primary_pool set has
+  only Refresh (read-only) — no client-side retry.
+  Needs new toolbar buttons + backend endpoints.
+- U monitor-6: three overlapping "off" strings for
+  client-mode DHCP (Stopped / No Lease / Requesting)
+  with no operator-facing normalization. Widget code
+  doesn't disambiguate; operators see three labels for
+  what reads as one state. Needs a helper + UI
+  disambiguation.
+- P server-12: no re-entrancy guard on `apply_device`
+  for the same device_id. Two rapid Apply POSTs can race
+  through DHCP config-write, pidfile kill, and dnsmasq
+  relaunch; an orphan dnsmasq from the losing racer can
+  persist bound to the interface. Needs a per-device
+  threading lock (module-level dict).
+
+Tests: `tests/test_v05230_dhcp_audit_bundle2.py` — 13
+pass. Broader DHCP sweep: 167 pass.
+
 ## [0.5.229] - 2026-08-30
 
 **DHCP audit bundle — 15 of 35 findings fixed (5 blockers +
