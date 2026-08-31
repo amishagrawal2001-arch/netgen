@@ -249,9 +249,125 @@ Aggregated status of every background monitor (ARP / BGP / OSPF / ISIS / DHCP). 
 | GET | `/api/device/frr/status/<device_id>` | FRR status for device. |
 | GET | `/api/device/frr/neighbors/<device_id>` | FRR neighbors. |
 | GET | `/api/device/frr/routes/<device_id>` | FRR routes. |
-| GET | `/api/device/dhcp/status` | DHCP status. |
-| POST | `/api/device/dhcp/server/pool` | Create/update DHCP server pool. |
-| POST | `/api/device/dhcp/server/attach_pools` | Attach DHCP pools to device. |
+| GET | `/api/device/dhcp/status` | DHCP status for every device (client + server rows). |
+| POST | `/api/device/dhcp/server/pool` | Update the inline DHCP pool on an existing DHCP-server device. |
+| POST | `/api/device/dhcp/server/attach_pools` | Attach one or more named DHCP pools (from `/api/dhcp/pools`) to a DHCP-server device. |
+| POST | `/api/device/dhcp/restart` | v0.5.231: force-restart dnsmasq (server-mode) or dhclient (client-mode) on a stuck device. |
+
+### DHCP endpoint contracts
+
+All four endpoints return JSON. Errors come back as `{"error": "..."}` with the appropriate HTTP status.
+
+**`GET /api/device/dhcp/status`**
+
+Response shape (per row):
+```json
+{
+  "devices": [{
+    "device_id": "...",
+    "device_name": "device3",
+    "interface": "ens2f0np0",
+    "vlan": "10",
+    "mode": "server",
+    "state": "Server Running",
+    "running": true,
+    "lease_ip": "",
+    "lease_mask": "",
+    "lease_gateway": "",
+    "lease_server": "",
+    "lease_expires": null,
+    "last_check": "2026-08-31T...",
+    "last_error": "",
+    "pool_names": {"primary": "p1", "additional": []},
+    "default_pool": {
+      "pool_start": "172.16.30.10",
+      "pool_end":   "172.16.30.200",
+      "pool_range": "172.16.30.10-172.16.30.200",
+      "pool6_start": null, "pool6_end": null, "pool6_range": null
+    },
+    "dhcp_config":         { /* full stored DHCP config */ },
+    "server_interface_ip": "172.16.30.1"
+  }]
+}
+```
+`dhcp_config` + `server_interface_ip` were added in v0.5.229 so the client can render per-mode columns (server rows show the device's own interface IPv4 in the Lease IP column and the served gateway in the Gateway column). `default_pool.pool6_*` fields were added in v0.5.230 for IPv6-only server rows.
+
+**`POST /api/device/dhcp/server/pool`** — inline pool config
+```json
+{
+  "device_id":      "<uuid>",
+  "pool_start":     "172.16.30.10",
+  "pool_end":       "172.16.30.200",
+  "gateway":        "172.16.30.1",    // optional; must be inside pool subnet
+  "gateway_route":  ["172.16.30.0/24"],
+  "replace_existing": true
+}
+```
+Validation (v0.5.229 + v0.5.236): rejects with `400` if pool addresses are malformed, `pool_start > pool_end`, gateway is not a legal IPv4, gateway is outside the pool subnet, or any gateway route CIDR is malformed. Returns `404` if `device_id` isn't found. Returns `200` with the freshly-updated device state on success.
+
+**`POST /api/device/dhcp/server/attach_pools`** — named pool attach
+```json
+{
+  "device_id":         "<uuid>",
+  "primary_pool":      "p1",
+  "additional_pools":  ["p2", "p3"],
+  "replace_existing":  true,
+  "gateway":           "",             // optional gateway override; blank = clear
+  "detach_all":        false
+}
+```
+- `primary_pool` and each `additional_pools` entry must exist in `/api/dhcp/pools`.
+- v0.5.236: `primary_pool` is dropped from `additional_pools` if the same name appears in both (no duplicate `dhcp-range` lines).
+- v0.5.235: `replace_existing=true` preserves ALL IPv6 config (`ipv6_pool_start/end/prefix/gateway/server_ip/lease_time`) — attaching an IPv4 pool no longer disables IPv6 DHCP on a dual-stack device.
+- v0.5.236: named-pool join table is cleared ONLY after `ensure_dhcp_services` succeeds, so a launch failure doesn't leave the device in a half-detached state.
+- Set `detach_all: true` (all other fields optional) to remove every named pool from the device.
+
+**`POST /api/device/dhcp/restart`** — rescue path (v0.5.231)
+```json
+{ "device_id": "<uuid>" }
+```
+Response:
+```json
+{
+  "status":           "restarted",
+  "dhcp_state":       "Server Running",
+  "dhcp_running":     true,
+  "dhcp_last_error":  ""
+}
+```
+Force-restarts the DHCP daemon via `ensure_dhcp_services(force_client_restart=True)`. Returns `400` if the device has no DHCP mode configured or no interface, `404` if not found, `500` with the underlying error on restart failure. Use this instead of a full `/api/device/apply` when the operator just needs to kick a stuck daemon.
+
+### Related concurrency guard (v0.5.231)
+
+`POST /api/device/apply` acquires a **per-device** lock (module-level `threading.Lock` in `_APPLY_LOCKS`, keyed by `device_id`). Two rapid Apply POSTs for the same device return `HTTP 409` with `"Another Apply for device '...' is still in flight."` instead of racing through DHCP config-write + pidfile-kill + dnsmasq-relaunch. The `finally:` block always releases the lock — even on 4xx / 5xx failures.
+
+### Related endpoints — named pool catalog
+
+The named pools that `attach_pools` references live in the shared catalog:
+
+| Method | Path | Description |
+|--------|------|-------------|
+| GET    | `/api/dhcp/pools` | List every named pool. |
+| POST   | `/api/dhcp/pools` | Create a new named pool. |
+| GET    | `/api/dhcp/pools/<pool_name>` | Fetch a specific pool. |
+| PUT    | `/api/dhcp/pools/<pool_name>` | Update a pool in place. |
+| DELETE | `/api/dhcp/pools/<pool_name>` | Delete a pool from the catalog. |
+
+Pool payload (v0.5.231 added IPv6 fields):
+```json
+{
+  "name":            "p1",
+  "pool_start":      "172.16.30.10",
+  "pool_end":        "172.16.30.200",
+  "gateway":         "172.16.30.1",
+  "gateway_routes":  ["172.16.30.0/24"],
+  "lease_time":      3600,
+  "description":     "Lab pool #1",
+  "pool6_start":     "2001:db8:50::100",   // optional; all-or-none with the two below
+  "pool6_end":       "2001:db8:50::1ff",
+  "prefix6":         "64"
+}
+```
 
 ---
 

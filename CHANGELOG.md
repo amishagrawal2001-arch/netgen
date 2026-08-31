@@ -2,6 +2,40 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.237] - 2026-08-31
+
+**API_GUIDE.md — DHCP endpoints get proper contracts.**
+
+Pre-fix, the DHCP section had three one-line rows and zero
+details on request/response bodies. `POST /api/device/dhcp/
+restart` (added in v0.5.231) wasn't listed at all, and 15
+patches of DHCP work (v0.5.222 → v0.5.236) had accumulated
+without a docs pass.
+
+Rewritten section covers:
+- All four DHCP endpoints listed (was 3 of 4 — restart was
+  missing).
+- Full request + response contracts for each, including:
+  - `GET /status` response shape with the v0.5.229
+    `dhcp_config` + `server_interface_ip` fields, and the
+    v0.5.230 `pool6_*` fields on `default_pool`.
+  - `POST /server/pool` validation errors (v0.5.229 pool
+    address checks + v0.5.236 gateway-in-subnet check).
+  - `POST /server/attach_pools` v0.5.235 IPv6-preserve
+    semantics on `replace_existing=true` and v0.5.236
+    primary/additional dedup.
+  - `POST /restart` (v0.5.231) request body, success
+    response shape, and 400/404/500 error codes.
+- The v0.5.231 per-device Apply lock (`_APPLY_LOCKS`) →
+  HTTP 409 on concurrent Apply.
+- Named-pool catalog endpoints (`/api/dhcp/pools*`) with
+  the v0.5.231 IPv6 pool fields (`pool6_start` /
+  `pool6_end` / `prefix6`).
+
+Tests: `tests/test_v05237_api_guide_dhcp.py` — 8 pass. Pin the
+shape of the documentation so a future refactor that removes
+one of these endpoints without updating the guide gets caught.
+
 ## [0.5.236] - 2026-08-31
 
 **DHCP audit close-out #2 — remaining 6 findings + interface-IP-
