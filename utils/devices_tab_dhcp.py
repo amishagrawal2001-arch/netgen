@@ -8,6 +8,7 @@ from typing import List, Dict, Optional, Any
 import requests
 from PyQt5.QtCore import Qt, QSize, QTimer
 from PyQt5.QtWidgets import (
+    QApplication,
     QButtonGroup,
     QCheckBox,
     QDialog,
@@ -19,6 +20,7 @@ from PyQt5.QtWidgets import (
     QLabel,
     QLineEdit,
     QMessageBox,
+    QProgressDialog,
     QPushButton,
     QRadioButton,
     QSpinBox,
@@ -1569,18 +1571,41 @@ class DHCPHandler:
                 "No server is currently configured — connect first.",
             )
             return
+        # v0.5.240 (audit U client-restart): timeout bumped 10 → 60
+        # so the full server-side cycle fits: stop old daemon (≤5s),
+        # sweep stray dhclients (~1s), start dhclient, wait up to
+        # `lease_timeout` (default 20s) for the lease to appear.
+        # Pre-fix, the operator saw "Read timed out" on every
+        # Restart click even though the server-side restart WAS
+        # in progress — the button felt dead.
+        _prog = QProgressDialog(
+            "Restarting DHCP daemon on the selected device…\n"
+            "(kill old dhclient/dnsmasq, spawn fresh, wait for lease)",
+            None,  # No Cancel button — the server-side cycle can't
+                   # be interrupted mid-way without leaving daemons
+                   # in a half-torn-down state.
+            0, 0, self.parent,
+        )
+        _prog.setWindowTitle("Restart DHCP")
+        _prog.setWindowModality(Qt.WindowModal)
+        _prog.setMinimumDuration(0)
+        _prog.show()
+        QApplication.processEvents()
         try:
             resp = requests.post(
                 f"{server_url}/api/device/dhcp/restart",
                 json={"device_id": device_id},
-                timeout=10,
+                timeout=60,
             )
         except requests.RequestException as exc:
+            _prog.close()
             QMessageBox.warning(
                 self.parent, "Restart Failed",
                 f"Could not reach the server:\n{exc}",
             )
             return
+        finally:
+            _prog.close()
         if resp.status_code != 200:
             _err_body = ""
             try:

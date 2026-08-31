@@ -2,6 +2,66 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.240] - 2026-08-31
+
+**DHCP buttons actually work: Restart no longer times out, dhclient
+processes no longer leak.**
+
+Operator on srv06 2026-08-31 reported two visible problems with the
+DHCP subtab buttons:
+
+1. **Restart DHCP** → "Could not reach the server: Read timed out
+   (read timeout=10)". The button felt dead — every click surfaced
+   a timeout even though the server-side restart was still in
+   progress in the background.
+
+2. **No periodic DHCP request packets** visible on tcpdump for
+   clients stuck in `Requesting`. Inspection on srv06 showed **3
+   concurrent dhclient processes** on the same `vlan30` interface
+   in the client container — all in various backoff states,
+   fighting each other for the lease, all failing.
+
+Root causes:
+
+- **dhclient process leak on Restart / Apply**. `dhclient -r -pf
+  <pidfile>` reads ONE pidfile and only kills that one PID. Every
+  stale-pidfile / mismatched-pidfile-name / orphaned-fork path
+  leaked the old dhclient; after a few Restart cycles the operator
+  accumulated N concurrent dhclients bound to the same interface,
+  all issuing RELEASE against each other's leases. No lease ever
+  settled.
+
+- **Client-side 10 s timeout** on `POST /api/device/dhcp/restart`.
+  The server-side cycle is stop old daemon (≤5 s) + sweep strays
+  (~1 s) + start dhclient + wait `lease_timeout` (default 20 s)
+  for the lease = up to ~25 s. 10 s wasn't enough; the operator
+  saw a spurious timeout on every click.
+
+Fixes:
+
+- **utils/dhcp.py new helper** `_kill_stale_dhclients(interface,
+  container)`: enumerates every `dhclient` bound to `interface`
+  via `pgrep -a -f dhclient` + Python-side argv-token comparison
+  (same anti-collision pattern as v0.5.218 fix M — `eth1` never
+  matches `eth10`). TERMs the whole batch, briefly settles, then
+  SIGKILLs any TERM-refuser.
+
+- Wired into `stop_dhcp_client` (after the `-r` release attempts,
+  before `_flush_ipv4` so a stray dhclient can't re-apply an
+  address on the interface after we flushed it) AND
+  `start_dhcp_client`'s IPv4 spawn path (before we spawn the new
+  dhclient, so it doesn't race the leftover ones).
+
+- **utils/devices_tab_dhcp.py Restart DHCP button**: timeout
+  bumped 10 → 60 s. Added a modal `QProgressDialog` so the UI
+  doesn't freeze silently for 25 s while the server-side cycle
+  runs, and a `finally: _prog.close()` guarantees the dialog
+  closes on every exit path (success, HTTP error, connection
+  exception). `QApplication` / `QProgressDialog` imports added
+  at module top.
+
+Tests: `tests/test_v05240_dhcp_button_working.py` — 9 pass.
+
 ## [0.5.239] - 2026-08-31
 
 **DHCP teardown leaks: dhcp-client container survives Edit-disable

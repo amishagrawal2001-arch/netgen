@@ -1250,6 +1250,93 @@ def _verify_interface_exists(interface: str, container=None) -> bool:
         return False
 
 
+def _kill_stale_dhclients(interface: str, container=None) -> int:
+    """v0.5.240 (audit U client-restart): sweep every dhclient bound
+    to `interface` and kill it. Complement to `dhclient -r -pf <pf>`
+    release, which reads a SINGLE pidfile and only takes down that
+    one dhclient. On a stale-pidfile / mismatched-pidfile-name /
+    orphaned-process path, `-r` silently misses the old dhclient
+    and the next Start spawns a SECOND concurrent dhclient. After
+    a few Apply/Restart cycles the operator ends up with 3+
+    dhclient processes fighting each other for the same interface,
+    all in various backoff states — no lease ever settles because
+    the daemons RELEASE each other's leases and the DHCP monitor
+    sees "Requesting" forever.
+
+    Observed on srv06 2026-08-31:
+        68 dhclient -4 -nw -pf /run/dhclient-vlan30-ipv4.pid ... vlan30
+        97482 dhclient -4 -nw -pf /run/dhclient-vlan30-ipv4.pid ... vlan30
+        102165 dhclient -4 -nw -pf /run/dhclient-vlan30-ipv4.pid ... vlan30
+    (three processes with the SAME pidfile — dhclient forks and the
+    parent's pidfile only records the latest child.)
+
+    Uses `_is_dhclient_running`'s same argv-token match logic — the
+    interface name has to appear as a whole argv token (anchored
+    via ``pgrep -a -f dhclient`` + Python-side split, exactly like
+    v0.5.218 fix M), so `eth1` doesn't match `eth10`.
+
+    Returns the count killed (for logging).
+    """
+    if not interface:
+        return 0
+    try:
+        _probe = _run_command(
+            ["pgrep", "-a", "-f", "dhclient"],
+            timeout=5, container=container,
+        )
+    except Exception as exc:
+        logger.debug("[DHCP] pgrep dhclient failed: %s", exc)
+        return 0
+    if _probe.returncode not in (0, 1):
+        return 0
+    _pids: List[str] = []
+    for line in (_probe.stdout or "").splitlines():
+        parts = line.strip().split(None, 1)
+        if len(parts) < 2:
+            continue
+        argv = parts[1].split()
+        # Same guard as _is_dhclient_running: whole-token match
+        # rules out prefix collisions (eth1 ≠ eth10).
+        if interface in argv:
+            _pids.append(parts[0])
+    if not _pids:
+        return 0
+    logger.info(
+        "[DHCP] Sweeping %d stray dhclient(s) on %s: pids=%s",
+        len(_pids), interface, ",".join(_pids),
+    )
+    for _pid in _pids:
+        try:
+            _run_command(["kill", _pid], timeout=3, container=container)
+        except Exception as exc:
+            logger.debug("[DHCP] kill %s failed: %s", _pid, exc)
+    # A brief settle so the next start's spawn doesn't race a still-
+    # exiting parent — dhclient's argv-owning parent takes a moment
+    # to reap after SIGTERM.
+    time.sleep(0.3)
+    # SIGKILL any survivor. dhclient normally exits on SIGTERM in
+    # under 100ms; a leftover here means the process refused TERM.
+    try:
+        _probe2 = _run_command(
+            ["pgrep", "-a", "-f", "dhclient"],
+            timeout=5, container=container,
+        )
+        if _probe2.returncode == 0:
+            for line in (_probe2.stdout or "").splitlines():
+                parts = line.strip().split(None, 1)
+                if len(parts) < 2:
+                    continue
+                argv = parts[1].split()
+                if interface in argv:
+                    try:
+                        _run_command(["kill", "-9", parts[0]], timeout=3, container=container)
+                    except Exception:
+                        pass
+    except Exception:
+        pass
+    return len(_pids)
+
+
 def _is_dhclient_running(interface: str, container=None) -> bool:
     """Check whether a dhclient process is running for the given interface.
 
@@ -1694,6 +1781,15 @@ def start_dhcp_client(
         except Exception as exc:
             logger.debug("[DHCP] dhclient release error (safe to ignore): %s", exc)
 
+        # v0.5.240 (audit U client-restart): sweep any surviving
+        # dhclient bound to this interface before spawning a fresh
+        # one. `dhclient -r` only touches the pidfile's ONE PID;
+        # a stale / mismatched pidfile leaves stragglers that would
+        # fight the new dhclient for the same interface. Without
+        # this sweep, `Restart DHCP` doesn't actually restart —
+        # it accumulates. See _kill_stale_dhclients() for detail.
+        _kill_stale_dhclients(interface, container=container)
+
         cmd_v4 = ["dhclient", "-4", "-nw", "-pf", pidfile_v4, "-lf", leasefile_v4]
         if dhcp_config and "timeout" in dhcp_config:
             cmd_v4.extend(["-timeout", str(lease_timeout)])
@@ -1908,6 +2004,16 @@ def stop_dhcp_client(device_db, device_id: str, interface: str, container=None) 
         )
     except Exception as exc:
         logger.debug("[DHCP] dhcp6c pkill error (safe to ignore): %s", exc)
+
+    # v0.5.240 (audit U client-restart): defensive sweep after the
+    # per-pidfile release. dhclient -r reads ONE pidfile and only
+    # kills that entry; stale-pidfile / mismatched-pidfile-name /
+    # orphaned-fork paths leak the old dhclient. Without this sweep,
+    # the next Start (or Restart) spawns a second concurrent
+    # dhclient and they fight until neither can lease. See
+    # _kill_stale_dhclients() for the full context (srv06 observed
+    # 3 duplicate dhclients on vlan30 after ~3 restart cycles).
+    _kill_stale_dhclients(interface, container=container)
 
     _flush_ipv4(interface, container=container)
     # v0.5.218: also flush non-link-local IPv6 addresses so a
