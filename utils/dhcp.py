@@ -2025,7 +2025,27 @@ def start_dhcp_server(
     except Exception as exc:
         logger.debug("[DHCP] Failed to stop existing dnsmasq: %s", exc)
 
-    cmd = ["dnsmasq", f"--conf-file={conffile}"]
+    # v0.5.232: launch dnsmasq inside the device's VRF so bind() can
+    # find the pool's server IP on a VRF-scoped interface. Pre-fix,
+    # a VRF-scoped vlan interface (vlan<N>@base master vrf-<id>) has
+    # its IPv4 addresses globally visible via `ip addr show`, but a
+    # bind() call from a process running in the default VRF context
+    # returns EADDRNOTAVAIL ("Address not available") because the
+    # kernel searches only the default routing table for the source
+    # IP. Wrapping dnsmasq in `ip vrf exec <vrf>` puts the process
+    # in the VRF's context so bind() succeeds. When the device has
+    # no VRF (rare — older devices without VRF isolation), skip the
+    # wrapper and launch dnsmasq directly.
+    _dnsmasq_vrf = _resolve_device_vrf(device_id)
+    if _dnsmasq_vrf:
+        cmd = ["ip", "vrf", "exec", _dnsmasq_vrf,
+               "dnsmasq", f"--conf-file={conffile}"]
+        logger.info(
+            "[DHCP] Launching dnsmasq inside VRF %s for device %s",
+            _dnsmasq_vrf, device_id,
+        )
+    else:
+        cmd = ["dnsmasq", f"--conf-file={conffile}"]
     try:
         result = _run_command(cmd, timeout=10, container=container)
         if result.returncode != 0:

@@ -2,6 +2,47 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.232] - 2026-08-30
+
+**dnsmasq now launches inside the device's VRF so `bind()` can
+find the pool's server IP on a VRF-scoped interface.**
+
+Operator on srv06 2026-08-30: attaching a named DHCP pool on
+device3 (interface vlan10 in vrf-6f4c03646a1) failed with
+`dnsmasq: failed to create listening socket for 192.168.30.1:
+Address not available`. Root cause: v0.5.222's
+`_ensure_ipv4_address` correctly added 192.168.30.1/24 to
+vlan10 before launch, and `ip addr show` from any netns saw
+the address. But dnsmasq itself was launched with a bare
+`dnsmasq --conf-file=...` command from the DHCP container
+(host netns, default VRF context) — and the kernel's bind()
+searches only the DEFAULT routing table for a locally-assigned
+source IP. On a VRF-scoped interface, the address is only
+locally-assigned in the VRF's routing table, so bind() returns
+EADDRNOTAVAIL despite the address being visible.
+
+Fix: wrap the dnsmasq launch with `ip vrf exec <vrf>` when the
+device has a resolved VRF (`_resolve_device_vrf(device_id)`).
+This puts the dnsmasq process in the VRF's context so bind()
+finds the pool's server IP. When the device has no VRF (older
+non-VRF devices), launch dnsmasq directly as before — no
+wrapper, no regression.
+
+Files touched:
+- `utils/dhcp.py` (single spot): the launch line at ~2028
+  becomes conditional on VRF presence. New log-info line
+  when running inside a VRF so operators can grep for it.
+
+Everything downstream stays the same — pidfile shape,
+pgrep-based process detection in the monitor
+(`_pgrep_matching_argv("dnsmasq", …)`), and the v0.5.219
+argv-anchored match all continue to find the process
+because it still exec()s as `dnsmasq` (`ip vrf exec` execs
+the target, doesn't fork).
+
+Tests: `tests/test_v05232_dhcp_vrf_launch.py` — 5 pass.
+Broader dhcp sweep: 182 pass.
+
 ## [0.5.231] - 2026-08-30
 
 **DHCP audit bundle #3 — closes the last 4 of 35 findings. Audit
