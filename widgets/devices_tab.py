@@ -5985,16 +5985,24 @@ class DevicesTab(QWidget):
                 "protocol_data": device_info.get("protocol_data", {}),
                 "vxlan_config": device_info.get("vxlan_config", {}),
             }
-            
+            # v0.5.242: propagate an operator "Force Apply" opt-in via
+            # device_info["_force_apply"] into the request payload.
+            # When true, the server-side (iface, vlan) collision gate
+            # PURGES the stale peer row instead of rejecting with 409.
+            if device_info.get("_force_apply"):
+                basic_payload["force"] = True
+
             # Apply basic device configuration
             logger.debug(f"Calling /api/device/apply with payload: {basic_payload}")
             response = requests.post(f"{server_url}/api/device/apply", json=basic_payload, timeout=30)
             if response.status_code != 200:
                 error_msg = f"HTTP {response.status_code}"
+                error_details = {}
                 try:
                     error_data = response.json()
                     if isinstance(error_data, dict) and "error" in error_data:
                         error_msg = error_data["error"]
+                        error_details = error_data
                     elif isinstance(error_data, str):
                         error_msg = error_data
                 except Exception:
@@ -6003,6 +6011,13 @@ class DevicesTab(QWidget):
                 logger.error(f"Response status: {response.status_code}, body: {response.text[:500]}")
                 # Store error message for display to user
                 device_info["_apply_error"] = error_msg
+                # v0.5.242: preserve the structured error so the finish
+                # handler can render a "Force Apply" button when the
+                # server-reported `code` supports it. Without this the
+                # only signal the caller has is the human-readable
+                # `error` string, which the operator would have to
+                # keyword-match on.
+                device_info["_apply_error_details"] = error_details
                 return False
             
             logger.info(f"Basic device configuration applied for {device_name}")
@@ -9531,6 +9546,71 @@ class DevicesTab(QWidget):
                     except Exception as _dlg_exc:
                         logger.warning(f"Could not show apply-failure dialog: {_dlg_exc}")
             
+            # v0.5.242 (audit U force-apply): collect devices that failed
+            # with a `force_supported` server-side error (currently
+            # duplicate iface+VLAN, duplicate loopback/IP). Offer a
+            # single "Force Apply" prompt to purge stale peer rows
+            # and retry — sidesteps the "row disappeared then reappeared"
+            # class of issue where a botched Remove left a DB row that
+            # blocks re-Add. Only surfaces when the operator hasn't
+            # already forced this batch (guards against a retry loop).
+            _force_retry_candidates = []
+            if failed_count > 0 and hasattr(self, "multi_device_apply_worker"):
+                try:
+                    for _row, _dev_info in self.multi_device_apply_worker.devices_to_apply:
+                        _details = _dev_info.get("_apply_error_details") or {}
+                        if not isinstance(_details, dict):
+                            continue
+                        if not _details.get("force_supported"):
+                            continue
+                        if _dev_info.get("_force_apply"):
+                            # Already forced — a second offer would loop.
+                            continue
+                        _force_retry_candidates.append((_row, _dev_info, _details))
+                except Exception as _scan_exc:
+                    logger.debug(f"[FORCE APPLY] scan failed: {_scan_exc}")
+            if _force_retry_candidates:
+                _peer_lines = []
+                for _r, _d, _det in _force_retry_candidates:
+                    _peer = _det.get("conflicting_device_name") or _det.get("conflicting_device_id") or "?"
+                    _peer_lines.append(
+                        f"  • {_d.get('Device Name') or '?'} — conflicts with stale peer '{_peer}'"
+                    )
+                _msg = (
+                    f"{len(_force_retry_candidates)} device(s) failed to apply because a "
+                    f"stale peer row still occupies the same (interface, VLAN) tuple:\n\n"
+                    + "\n".join(_peer_lines) + "\n\n"
+                    "Force Apply will purge the stale peer row(s) from the server DB "
+                    "and re-Apply the failed device(s). Use this when the peer device "
+                    "was already removed from the UI but the DB row survived a failed "
+                    "cleanup (e.g. a Remove that timed out mid-way).\n\n"
+                    "Continue?"
+                )
+                _reply = QMessageBox.question(
+                    self, "Force Apply — purge stale peers?",
+                    _msg,
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No,
+                )
+                if _reply == QMessageBox.Yes:
+                    _force_rows = set()
+                    for _row, _dev_info, _det in _force_retry_candidates:
+                        _dev_info["_force_apply"] = True
+                        _dev_info.pop("_apply_error", None)
+                        _dev_info.pop("_apply_error_details", None)
+                        _dev_info["_needs_apply"] = True
+                        _force_rows.add(_row)
+                    try:
+                        self.devices_table.clearSelection()
+                        for _r in _force_rows:
+                            self.devices_table.selectRow(_r)
+                        # Give the worker cleanup below a beat to run
+                        # (finish handler is still executing) before
+                        # firing the next apply on the same worker slot.
+                        QTimer.singleShot(200, self.apply_selected_device_silent)
+                    except Exception as _retry_exc:
+                        logger.error(f"[FORCE APPLY] retry launch failed: {_retry_exc}")
+
             # Check if any applied devices had VXLAN configuration (before worker is deleted)
             vxlan_applied = False
             if successful_count > 0 and hasattr(self, 'multi_device_apply_worker'):

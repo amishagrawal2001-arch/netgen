@@ -2,6 +2,58 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.242] - 2026-09-01
+
+**Force Apply: let the operator recover from stale-peer collisions
+without hand-editing the DB.**
+
+Operator on srv06 2026-09-01: after a botched Remove left a stale
+DB row (see v0.5.241 root cause — `_run_command`'s container path
+hung indefinitely, so Remove returned before `device_db.remove_device`
+ran), every re-Apply of the "same" device hit:
+
+    ❌ device4: Failed to apply to server -
+    Interface 'ens2f1np1' with VLAN '30' is already in use by
+    device 'device4'. …give each device a different VLAN tag.
+
+The peer device was already gone from the UI, but its DB row
+survived and blocked every re-Apply. The v0.5.241 fix stops NEW
+Removes from leaking rows, but a database with rows LEFT BEHIND
+by older versions is still on the shelf. Operator needed a way
+to say "the peer is stale, purge it and let me continue."
+
+Fixes:
+
+- **run_tgen_server.py** — `/api/device/apply` accepts `force: true`
+  in the payload. On the (iface, vlan) collision gate: enumerates
+  every peer row on the same (iface, vlan), deletes them from the
+  DB via `device_db.remove_device(...)`, then continues with the
+  apply. Loud audit log for the destructive step. On the
+  loopback/IP collision gate: skips the check entirely on force.
+  Both gates now return the 409 with structured fields — `code`,
+  `conflicting_device_id`, `conflicting_device_name`,
+  `force_supported: true` — so the client can render a
+  "Force Apply" prompt without string-matching the error.
+
+- **widgets/devices_tab.py** — `_apply_device_to_server_sync`
+  preserves the full JSON error body as
+  `device_info["_apply_error_details"]` and propagates
+  `device_info["_force_apply"]` into the request payload as
+  `force: true`. `_on_multi_device_apply_finished` scans failed
+  devices for `force_supported`, and if any, shows a modal
+  QMessageBox listing the stale peers and asks whether to Force
+  Apply. On Yes: sets `_force_apply=True` on those device_infos
+  and re-fires `apply_selected_device_silent`. Guarded against
+  retry loops — a device that already forced this batch is
+  skipped from the offer.
+
+Tests: `tests/test_v05242_force_apply.py` — 10 pass.
+
+Note on the v0.5.241 → v0.5.242 gap on already-broken lab servers:
+if you have stale DB rows from BEFORE v0.5.241 (i.e., rows that
+leaked back when Remove hung), the Force Apply prompt is how you
+clean them up without editing the DB manually.
+
 ## [0.5.241] - 2026-08-31
 
 **Remove hangs forever on DHCP-mode devices; row disappears then

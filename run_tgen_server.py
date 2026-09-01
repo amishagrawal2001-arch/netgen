@@ -4313,12 +4313,25 @@ def apply_device():
         # the same L2/L3 segment and would collide on TCP/179, OSPF
         # raw sockets, and ISIS PF_PACKET binds. Reject up-front so
         # the user gets a clear error instead of a silent BGP-down.
+        #
+        # v0.5.242 (audit U force-apply): a stale peer row can persist
+        # in the DB when a prior /api/device/remove failed halfway or
+        # never completed (see v0.5.241 — pre-fix `_run_command` hung
+        # forever on stop_dhcp_client → DB delete never ran). The
+        # operator sees "already in use by device X" for a device that
+        # no longer exists on the wire. Now honors `force: true` in
+        # the apply payload: instead of rejecting, DELETE the stale
+        # peer row(s) first, then continue with the apply. Logged
+        # loudly so an accidental force still leaves an audit trail.
+        _force_apply = bool(data.get("force") or data.get("force_apply"))
         try:
             from utils.device_database import DeviceDatabase
             _vlan_norm = str(vlan or "0").strip() or "0"
             _existing = DeviceDatabase().get_devices_by_interface(
                 interface_normalized, include_vlans=True
             )
+            _stale_peer_ids: List[str] = []
+            _peer_conflict = None  # (peer_id, peer_name)
             for _peer in _existing:
                 if _peer.get("device_id") == device_id:
                     continue  # same device being re-applied — fine
@@ -4328,15 +4341,64 @@ def apply_device():
                 # vlanN@base format) AND the same VLAN tag.
                 _peer_base = _peer_iface.split("@", 1)[-1] if "@" in _peer_iface else _peer_iface
                 if _peer_base == interface_normalized and _peer_vlan == _vlan_norm:
-                    _msg = (
-                        f"Interface '{interface_normalized}' with VLAN '{_vlan_norm}' "
-                        f"is already in use by device "
-                        f"'{_peer.get('device_name') or _peer.get('device_id')}'. "
-                        f"To run multiple devices on the same physical interface, "
-                        f"give each device a different VLAN tag."
+                    _peer_conflict = (
+                        _peer.get("device_id"),
+                        _peer.get("device_name") or _peer.get("device_id"),
                     )
-                    logging.warning(f"[DEVICE APPLY] Rejected duplicate (iface, vlan): {_msg}")
-                    return jsonify({"error": _msg}), 409
+                    _stale_peer_ids.append(_peer.get("device_id"))
+            if _peer_conflict and not _force_apply:
+                _peer_id, _peer_name = _peer_conflict
+                _msg = (
+                    f"Interface '{interface_normalized}' with VLAN '{_vlan_norm}' "
+                    f"is already in use by device '{_peer_name}'. "
+                    f"To run multiple devices on the same physical interface, "
+                    f"give each device a different VLAN tag. "
+                    f"If '{_peer_name}' is stale (removed from the UI but the "
+                    f"DB row survived a failed cleanup), re-Apply with "
+                    f"force=true to purge the stale row and continue."
+                )
+                logging.warning(f"[DEVICE APPLY] Rejected duplicate (iface, vlan): {_msg}")
+                # v0.5.242: extra fields let the client render a
+                # "Force Apply" button without having to string-match
+                # the error text.
+                return jsonify({
+                    "error": _msg,
+                    "code": "duplicate_iface_vlan",
+                    "conflicting_device_id": _peer_id,
+                    "conflicting_device_name": _peer_name,
+                    "force_supported": True,
+                }), 409
+            if _peer_conflict and _force_apply and _stale_peer_ids:
+                # Purge every stale peer occupying this (iface, vlan)
+                # tuple. Use the SAME code path /api/device/remove
+                # uses so container / DHCP / VXLAN cleanup runs too.
+                logging.warning(
+                    "[DEVICE APPLY] force=true: purging %d stale peer(s) "
+                    "on (iface=%s, vlan=%s): %s",
+                    len(_stale_peer_ids), interface_normalized,
+                    _vlan_norm, ",".join(_stale_peer_ids),
+                )
+                for _stale_id in _stale_peer_ids:
+                    if not _stale_id:
+                        continue
+                    try:
+                        # Best-effort DB row delete — the container
+                        # /interface cleanup is not attempted here
+                        # (it hangs on unreachable DHCP servers per
+                        # v0.5.241 root cause; we only need the DB
+                        # slot free). If the operator wants full
+                        # cleanup they should still use Remove.
+                        _rem = DeviceDatabase().remove_device(_stale_id)
+                        logging.warning(
+                            "[DEVICE APPLY] force=true: DB delete for stale "
+                            "peer %s: %s", _stale_id,
+                            "removed" if _rem else "not-found",
+                        )
+                    except Exception as _rem_exc:
+                        logging.error(
+                            "[DEVICE APPLY] force=true: failed to purge "
+                            "stale peer %s: %s", _stale_id, _rem_exc,
+                        )
         except Exception as _gate_exc:
             # Fail-open on validator errors — don't block a valid
             # apply just because the DB lookup hiccuped. The collision
@@ -4351,6 +4413,16 @@ def apply_device():
         # and MAC are unique per (interface, vlan) L2 segment — same
         # broadcast domain = ARP collision. Gateways are deliberately
         # shared, so we don't check them.
+        #
+        # v0.5.242 (audit U force-apply): honor `force=true` here too.
+        # A stale peer occupying the same loopback_ipv4 for a device
+        # that no longer runs blocks a re-Apply the same way; the
+        # (iface, vlan) gate above already purged the peer row on
+        # force, so `find_conflict` here won't re-hit that peer, but
+        # a DIFFERENT device with the same loopback (rare — usually a
+        # copy-paste mistake) is still worth flagging normally.
+        # Force skips this gate too so an operator recovering from
+        # a botched cleanup only has to click Force once.
         try:
             from utils.address_collision import find_conflict
             from utils.device_database import DeviceDatabase
@@ -4372,6 +4444,13 @@ def apply_device():
                 if _hit:
                     _peer_id, _peer_name = _hit
                     _label = _field.replace("_", " ")
+                    if _force_apply:
+                        logging.warning(
+                            "[DEVICE APPLY] force=true: skipping duplicate-%s "
+                            "check (peer %s='%s')",
+                            _field, _peer_id, _peer_name,
+                        )
+                        continue
                     _msg = (
                         f"{_label} '{_val}' is already in use by device "
                         f"'{_peer_name or _peer_id}'. Pick a different "
@@ -4380,7 +4459,13 @@ def apply_device():
                         f"and duplicate interface IPs cause ARP collisions."
                     )
                     logging.warning(f"[DEVICE APPLY] Rejected duplicate {_field}: {_msg}")
-                    return jsonify({"error": _msg}), 409
+                    return jsonify({
+                        "error": _msg,
+                        "code": f"duplicate_{_field}",
+                        "conflicting_device_id": _peer_id,
+                        "conflicting_device_name": _peer_name,
+                        "force_supported": True,
+                    }), 409
         except Exception as _dup_exc:
             # Fail-open — same rationale as the (iface, vlan) gate.
             # A collision that slips through will still surface as a
