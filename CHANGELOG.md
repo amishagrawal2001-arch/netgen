@@ -2,6 +2,40 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.247] - 2026-09-02
+
+**Startup reaper for orphan DHCP containers.**
+
+Operator on srv06 2026-09-02: `docker ps` showed TWO `dhcp-client-*`
+containers when only one device existed in the DB. The extra one
+(`dhcp-client-7f539da4-…`) was left behind by a pre-v0.5.241
+`/api/device/remove` that hung indefinitely in `stop_dhcp_client`
+— before v0.5.241 landed the `container.exec_run` timeout fix,
+Remove would freeze partway through, the container_removed step
+never ran, and the DB row was cleaned by some later path but
+the container was never touched.
+
+v0.5.241 stops NEW Removes from leaking, but any container that
+was ALREADY orphaned by an older leak sits there forever.
+
+Fix: `utils/dhcp.py` gets a new `reap_orphan_dhcp_containers(device_db)`
+that enumerates every container matching one of the three DHCP
+prefixes (`dhcp-client-`, `dhcp-server-`, `dhcp-frr-`), extracts
+the device_id suffix, and force-removes any container whose
+device_id is not in the current DB snapshot. Returns a structured
+`{"scanned", "orphans_reaped", "orphan_names", "errors"}` dict
+for logging. Safe against docker-daemon-down, None device_db, and
+concurrent add/remove (single snapshot of known-ids).
+
+Wired into `run_tgen_server.py` `main()` alongside the existing
+tx_worker orphan sweep. Best-effort — any exception is swallowed
+with a warning log so a docker hiccup can't block server bootup.
+The operator's next service restart inherits a clean container
+state even for orphans predating v0.5.241.
+
+Tests: `tests/test_v05247_orphan_reap.py` — 10 pass. All 245
+DHCP-related tests in the suite still pass.
+
 ## [0.5.246] - 2026-09-02
 
 **dnsmasq dhcp-range emitter: no more duplicate lines + always

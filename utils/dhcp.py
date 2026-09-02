@@ -1770,6 +1770,93 @@ def _stop_dhcp_container(device_id: str, mode: Optional[str] = None, remove: boo
         return False
 
 
+def reap_orphan_dhcp_containers(device_db) -> Dict:
+    """v0.5.247 (audit U orphan-container-reap): find and kill DHCP
+    containers whose device_id is no longer in the DB.
+
+    Failed / hung / timed-out /api/device/remove calls (a common
+    class pre-v0.5.241 when _run_command's container path had no
+    timeout enforcement — see v0.5.241 CHANGELOG) left orphan
+    `dhcp-client-<uuid>` / `dhcp-server-<uuid>` / `dhcp-frr-<uuid>`
+    containers running forever. The DB row eventually got cleared
+    (either the operator re-tried the Remove, or the row was
+    scrubbed some other way), but nothing ever went back to kill
+    the container. Operator on srv06 2026-09-02 saw two
+    `dhcp-client-*` containers where only one device existed in
+    the DB.
+
+    This helper is safe to call at any time: it enumerates every
+    container matching the three DHCP prefixes, extracts the
+    device_id suffix, checks the DB, and force-removes any
+    container whose device_id is absent. Returns a summary dict
+    for logging: `{"scanned": N, "orphans_reaped": M, "errors": [...]}`.
+
+    Prefixes we own: `dhcp-client-`, `dhcp-server-`, `dhcp-frr-`
+    (see DHCP_CLIENT_PREFIX / DHCP_SERVER_PREFIX plus the
+    frr-companion container the DHCP layer uses).
+    """
+    result = {"scanned": 0, "orphans_reaped": 0, "orphan_names": [], "errors": []}
+    if device_db is None:
+        result["errors"].append("device_db is None; skipping orphan reap")
+        return result
+
+    _prefixes = (
+        f"{DHCP_CLIENT_PREFIX}-",
+        f"{DHCP_SERVER_PREFIX}-",
+        "dhcp-frr-",
+    )
+    # Snapshot the current set of known device_ids ONCE — we don't
+    # want to race with concurrent device add/remove while iterating.
+    try:
+        _devs = device_db.get_all_devices() or []
+        _known = {d.get("device_id") for d in _devs if d.get("device_id")}
+    except Exception as exc:
+        result["errors"].append(f"get_all_devices failed: {exc}")
+        return result
+
+    try:
+        client = docker.from_env()
+    except Exception as exc:
+        result["errors"].append(f"docker.from_env failed: {exc}")
+        return result
+
+    try:
+        _containers = client.containers.list(all=True)
+    except Exception as exc:
+        result["errors"].append(f"docker containers.list failed: {exc}")
+        return result
+
+    for c in _containers:
+        name = c.name or ""
+        _pfx = None
+        for p in _prefixes:
+            if name.startswith(p):
+                _pfx = p
+                break
+        if _pfx is None:
+            continue
+        result["scanned"] += 1
+        _did = name[len(_pfx):]
+        if _did in _known:
+            continue  # legitimate; leave it alone.
+        # Orphan.
+        try:
+            logger.warning(
+                "[DHCP REAP] Orphan container %s — device_id %s not in "
+                "DB. Force-removing.",
+                name, _did,
+            )
+            c.remove(force=True)
+            result["orphans_reaped"] += 1
+            result["orphan_names"].append(name)
+        except Exception as exc:
+            result["errors"].append(f"{name}: remove failed: {exc}")
+            logger.warning(
+                "[DHCP REAP] Failed to remove orphan %s: %s", name, exc,
+            )
+    return result
+
+
 def start_dhcp_client(
     device_db,
     device_id: str,

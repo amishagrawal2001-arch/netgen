@@ -26318,6 +26318,43 @@ def main(argv=None):
     except Exception as e:
         logging.warning(f"[STARTUP CLEANUP] Orphan tx_worker sweep failed: {e}")
 
+    # v0.5.247 (audit U orphan-container-reap): sweep DHCP containers
+    # whose device_id no longer exists in the DB. Pre-v0.5.241, hung
+    # /api/device/remove calls left orphan `dhcp-client-<uuid>` /
+    # `dhcp-server-<uuid>` / `dhcp-frr-<uuid>` containers behind
+    # (Remove got stuck in stop_dhcp_* before container_removed and
+    # device_db.remove_device ran). Operator on srv06 2026-09-02 saw
+    # two dhcp-client-* containers where only one device existed in
+    # the DB. This reap runs at startup so the operator inherits a
+    # clean state on the next service restart even if the leak
+    # predates the v0.5.241 timeout fix. Best-effort — swallow
+    # exceptions to avoid blocking server bootup.
+    try:
+        from utils import dhcp as _dhcp
+        _reap = _dhcp.reap_orphan_dhcp_containers(device_db)
+        if _reap.get("orphans_reaped", 0) > 0:
+            logging.warning(
+                "[STARTUP CLEANUP] DHCP orphan reap removed %d container(s): %s "
+                "(scanned %d total, errors: %s)",
+                _reap["orphans_reaped"],
+                ", ".join(_reap.get("orphan_names") or []),
+                _reap.get("scanned", 0),
+                _reap.get("errors") or "none",
+            )
+        else:
+            logging.info(
+                "[STARTUP CLEANUP] DHCP orphan reap: %d container(s) scanned, "
+                "0 orphans (errors: %s)",
+                _reap.get("scanned", 0),
+                _reap.get("errors") or "none",
+            )
+    except Exception as _reap_exc:
+        logging.warning(
+            "[STARTUP CLEANUP] DHCP orphan reap failed: %s "
+            "(non-fatal, server continues)",
+            _reap_exc,
+        )
+
     # Self-heal: deploy FRR Dockerfile + ostg_docker/ from the wheel to
     # /opt/netgen/. Wheel-only upgrades (Install Guide §9a) don't touch
     # /opt/netgen/, so these files can stay missing or stale. When the
