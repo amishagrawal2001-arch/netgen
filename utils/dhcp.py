@@ -2417,8 +2417,36 @@ def start_dhcp_server(
         f"log-facility={logfile}",
     ]
     if ipv4_enabled:
+        # v0.5.246 (audit U dnsmasq-range): helper to derive the
+        # netmask that covers [start, end] as one supernet — same
+        # logic _ensure_ipv4_address uses. dnsmasq REQUIRES an
+        # explicit netmask when the dhcp-range's subnet isn't on
+        # any local interface, which is exactly the case in
+        # v0.5.245 relay mode (we skip the anchor by design). For
+        # direct-attached pools the netmask is redundant but
+        # harmless — dnsmasq will accept it either way.
+        def _pool_netmask(_start: str, _end: str) -> Optional[str]:
+            try:
+                _s = ipaddress.IPv4Address(_start)
+                _e = ipaddress.IPv4Address(_end)
+            except (ValueError, ipaddress.AddressValueError):
+                return None
+            for _prefixlen in range(32, 7, -1):
+                _cand = ipaddress.IPv4Network(f"{_start}/{_prefixlen}", strict=False)
+                if _e in _cand:
+                    return str(_cand.netmask)
+            return None
+
         if pool_start and pool_end:
-            config_lines.append(f"dhcp-range={pool_start},{pool_end},{lease_seconds}s")
+            _pri_mask = _pool_netmask(pool_start, pool_end)
+            if _pri_mask:
+                config_lines.append(
+                    f"dhcp-range={pool_start},{pool_end},{_pri_mask},{lease_seconds}s"
+                )
+            else:
+                config_lines.append(
+                    f"dhcp-range={pool_start},{pool_end},{lease_seconds}s"
+                )
         # v0.5.229 (audit U server-4): honor per-pool lease_time and
         # gateway on additional pools. Pre-fix, both were normalized
         # into the pool dict at line 242-244 and then thrown away
@@ -2428,18 +2456,45 @@ def start_dhcp_server(
         for pool in additional_pools:
             extra_start = pool.get("pool_start")
             extra_end = pool.get("pool_end")
-            if extra_start and extra_end:
-                extra_lease = pool.get("lease_time") or lease_seconds
-                config_lines.append(f"dhcp-range={extra_start},{extra_end},{extra_lease}s")
-                extra_gw = pool.get("gateway")
-                if extra_gw:
-                    # dnsmasq lets you tag options to a specific range
-                    # via a set:tag. Use the pool's numeric endpoint as
-                    # the tag suffix so each additional pool gets its
-                    # own scoped default gateway advertisement.
-                    _tag = f"pool_{extra_start.replace('.', '_')}"
-                    config_lines.append(f"dhcp-range=set:{_tag},{extra_start},{extra_end},{extra_lease}s")
-                    config_lines.append(f"dhcp-option=tag:{_tag},3,{extra_gw}")
+            if not (extra_start and extra_end):
+                continue
+            extra_lease = pool.get("lease_time") or lease_seconds
+            extra_gw = pool.get("gateway")
+            _extra_mask = _pool_netmask(extra_start, extra_end)
+            # v0.5.246 (audit U dnsmasq-range): emit EITHER a tagged
+            # dhcp-range (when the pool has its own gateway that
+            # differs from the global option-3) OR an untagged
+            # dhcp-range — NEVER BOTH. Pre-fix, both lines were
+            # appended for a gateway-carrying pool, and dnsmasq
+            # rejects two dhcp-range statements that cover the
+            # exact same subnet as an outright config error (or
+            # serves the last-wins one and ignores the tag). This
+            # caused the second pool to silently mis-serve leases
+            # with the wrong (global) gateway even when the pool
+            # had a per-pool gateway configured. dnsmasq's
+            # per-range option scoping only works when the range
+            # itself carries the tag, so choose the tagged form
+            # for gateway-bearing pools.
+            if extra_gw:
+                _tag = f"pool_{extra_start.replace('.', '_')}"
+                if _extra_mask:
+                    config_lines.append(
+                        f"dhcp-range=set:{_tag},{extra_start},{extra_end},{_extra_mask},{extra_lease}s"
+                    )
+                else:
+                    config_lines.append(
+                        f"dhcp-range=set:{_tag},{extra_start},{extra_end},{extra_lease}s"
+                    )
+                config_lines.append(f"dhcp-option=tag:{_tag},3,{extra_gw}")
+            else:
+                if _extra_mask:
+                    config_lines.append(
+                        f"dhcp-range={extra_start},{extra_end},{_extra_mask},{extra_lease}s"
+                    )
+                else:
+                    config_lines.append(
+                        f"dhcp-range={extra_start},{extra_end},{extra_lease}s"
+                    )
         if gateway:
             config_lines.append("dhcp-option=3," + gateway)
 

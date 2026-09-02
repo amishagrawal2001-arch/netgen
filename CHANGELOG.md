@@ -2,6 +2,56 @@
 
 All notable changes to OSTG / Netgen Traffic Generator will be documented in this file.
 
+## [0.5.246] - 2026-09-02
+
+**dnsmasq dhcp-range emitter: no more duplicate lines + always
+carries explicit netmask.**
+
+Operator on srv06 2026-09-02 attached a second pool to a DHCP server
+device and saw dnsmasq config emit TWO `dhcp-range` lines for the same
+subnet:
+
+```
+dhcp-range=172.16.30.20,172.16.30.250,86400s
+dhcp-range=set:pool_172_16_30_20,172.16.30.20,172.16.30.250,86400s
+dhcp-option=tag:pool_172_16_30_20,3,172.16.30.10
+```
+
+dnsmasq rejects two `dhcp-range` statements covering the same
+subnet as a config error (or serves last-wins and drops the
+scoping). Root cause: v0.5.229's per-pool-gateway emitter
+appended BOTH the untagged and tagged forms when the pool had
+a gateway.
+
+Second latent issue exposed by v0.5.245 (relay mode): when the
+pool's subnet is NOT on any local interface (v0.5.245's
+deliberate design in relay mode — no anchor), dnsmasq REQUIRES
+an explicit netmask in the `dhcp-range` line to figure out the
+network. Pre-fix, `dhcp-range=start,end,lease` lines omitted the
+netmask entirely, so dnsmasq guessed or refused to serve the
+relay-mode range.
+
+Fix:
+
+- **utils/dhcp.py** — new inline `_pool_netmask(start, end)`
+  helper walks prefix lengths 32 → 8 (same logic as
+  `_ensure_ipv4_address`) and returns `str(net.netmask)` for
+  the tightest supernet containing both endpoints.
+- Primary pool `dhcp-range` now emits netmask (fallback to
+  no-netmask only if derivation returns None — never for
+  well-formed IPv4 pools).
+- Additional pool emits EITHER a tagged `dhcp-range=set:tag,...`
+  (when the pool has its own gateway) OR an untagged
+  `dhcp-range=...` — NEVER BOTH. dnsmasq's per-range option
+  scoping only works when the range itself carries the tag,
+  so gateway-bearing pools use the tagged form and inherit
+  the tag on `dhcp-option=tag:X,3,<gw>`. No-gateway pools
+  inherit the global `dhcp-option=3` and use an untagged
+  range. Both variants now carry the explicit netmask too.
+
+Tests: `tests/test_v05246_dnsmasq_range.py` — 6 pass. All 243
+DHCP-related tests in the suite still pass.
+
 ## [0.5.245] - 2026-09-02
 
 **DHCP relay mode: server can serve clients behind a DHCP relay
